@@ -71,10 +71,41 @@ fn wanted(since: &Option<Mark>, last_change: Option<&JournalRef>) -> bool {
     }
 }
 
-/// Every record of one book a read answers, with its stream key.
-pub fn items_of(key: &str, book: &Book, since: &Option<Mark>) -> Result<Vec<(StreamKey, Item)>> {
+/// Whether an execution answers a read filtering by `state` (contract v23,
+/// W11.17): every one for none; for unmatched, those still waiting for an
+/// answer, neither superseded nor a bust; otherwise those in the state.
+pub fn execution_answers(held: &orders::ExecutionHeld, state: i32) -> bool {
+    use meridian_domain::v1::ExecutionState;
+    match state {
+        0 => true,
+        unmatched if unmatched == ExecutionState::Unmatched as i32 => held.waiting(),
+        other => held.execution.state == other,
+    }
+}
+
+/// Every record of one book a read answers, with its stream key. Filtered
+/// by an execution's state, the read answers executions alone.
+pub fn items_of(
+    key: &str,
+    book: &Book,
+    since: &Option<Mark>,
+    execution_state: i32,
+) -> Result<Vec<(StreamKey, Item)>> {
     let ledger = &book.ledger;
     let mut out = Vec::new();
+    if execution_state != 0 {
+        for (id, held) in &ledger.executions {
+            if execution_answers(held, execution_state)
+                && wanted(since, held.execution.last_change.as_ref())
+            {
+                out.push((
+                    (2, key.to_string(), id.clone()),
+                    Item::Execution(held.execution.clone()),
+                ));
+            }
+        }
+        return Ok(out);
+    }
     for (id, held) in &ledger.orders {
         if wanted(since, held.last_change.as_ref()) {
             out.push((

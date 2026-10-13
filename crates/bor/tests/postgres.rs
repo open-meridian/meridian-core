@@ -669,6 +669,7 @@ async fn an_order_reaches_its_fill_through_postgres_and_a_rebuild_reproduces_its
                 since: None,
                 limit: 500,
                 cursor: String::new(),
+                execution_state: 0,
             })
             .unwrap()
     };
@@ -687,6 +688,7 @@ async fn an_order_reaches_its_fill_through_postgres_and_a_rebuild_reproduces_its
                 since: None,
                 limit: 100,
                 cursor: String::new(),
+                execution_state: 0,
             })
             .unwrap()
     };
@@ -707,6 +709,7 @@ async fn an_order_reaches_its_fill_through_postgres_and_a_rebuild_reproduces_its
                     since: None,
                     limit: 1,
                     cursor: cursor.clone(),
+                    execution_state: 0,
                 })
                 .unwrap()
         });
@@ -873,4 +876,143 @@ async fn instructions_stand_in_their_partitions_and_a_day_order_comes_due() {
     assert!(due(later)
         .iter()
         .any(|(held, id)| *id == order.order_id && *held == account));
+}
+
+/// Contract v23 (W11.11, W11.17, W11.23, W11.24): fills on no placement kept
+/// unmatched, found by their IDs alone for an accept or a DK, listed by
+/// state in SQL -- a busted fill and its bust left out, a corrected one
+/// listed as its correction -- and rebuilt from the journal alike.
+#[tokio::test(flavor = "multi_thread")]
+async fn unmatched_fills_are_found_by_id_listed_by_state_and_rebuilt() {
+    use meridian_bor::order_service::*;
+    let (bus, store) = wired();
+    meridian_domain::money::learn("USD", "INS-CASH-USD");
+    let account = unique("ACC-v23");
+    let scope = Some(vec![account.clone()]);
+    let fill = |quantity: &str, supersedes: &str| ReportExecutionRequest {
+        account_id: account.clone(),
+        venue_account_code: "SNAP-1".into(),
+        venue_execution_id: unique("v23"),
+        kind: ExecutionKind::VenueReported as i32,
+        quantity: d(quantity),
+        price: usd("227.41"),
+        trade_date: "2026-10-13".into(),
+        settlement_date: if quantity == "0" {
+            String::new()
+        } else {
+            "2026-10-14".into()
+        },
+        instrument_id: "INS-AAPL".into(),
+        side: Side::Buy as i32,
+        venue_order_id: "ALP-1".into(),
+        supersedes: supersedes.into(),
+        ..Default::default()
+    };
+    let mut kept = Vec::new();
+    for _ in 0..4 {
+        let reply = send_order(&bus, REPORT_EXECUTION, &fill("5", ""), None, scope.clone())
+            .await
+            .unwrap();
+        let execution = FactReply::decode(&reply[..]).unwrap().execution.unwrap();
+        assert_eq!(execution.state, ExecutionState::Unmatched as i32);
+        kept.push(execution.execution_id);
+    }
+    // A bust of the first; a correction of the second.
+    send_order(
+        &bus,
+        REPORT_EXECUTION,
+        &fill("0", &kept[0]),
+        None,
+        scope.clone(),
+    )
+    .await
+    .unwrap();
+    let corrected = FactReply::decode(
+        &send_order(
+            &bus,
+            REPORT_EXECUTION,
+            &fill("6", &kept[1]),
+            None,
+            scope.clone(),
+        )
+        .await
+        .unwrap()[..],
+    )
+    .unwrap()
+    .execution
+    .unwrap()
+    .execution_id;
+    // The third accepted to a new order; the fourth answered DK.
+    let accepted = AcceptExecutionReply::decode(
+        &send_order(
+            &bus,
+            ACCEPT_EXECUTION,
+            &AcceptExecutionRequest {
+                execution_ids: vec![kept[2].clone()],
+                matched_order: Some(accept_execution_request::MatchedOrder::NewOrder(
+                    NewOrderFromExecutions::default(),
+                )),
+                note: String::new(),
+            },
+            Some(PERSON),
+            scope.clone(),
+        )
+        .await
+        .unwrap()[..],
+    )
+    .unwrap();
+    assert_eq!(
+        accepted.order.unwrap().origin,
+        OrderOrigin::AcceptedExecution as i32
+    );
+    send_order(
+        &bus,
+        DONT_KNOW_EXECUTION,
+        &DontKnowExecutionRequest {
+            execution_ids: vec![kept[3].clone()],
+            reason: DkReason::NoMatchingOrder as i32,
+            text: String::new(),
+        },
+        Some(PERSON),
+        scope.clone(),
+    )
+    .await
+    .unwrap();
+    let listed = |store: &PostgresStore, state: ExecutionState| {
+        let page = store
+            .orders(&meridian_bor::store::OrdersRead {
+                scope: Scope::Within([account.clone()].into_iter().collect()),
+                account_id: account.clone(),
+                since: None,
+                limit: 100,
+                cursor: String::new(),
+                execution_state: state as i32,
+            })
+            .unwrap();
+        assert!(page.orders.is_empty() && page.placements.is_empty() && page.unplaced.is_empty());
+        let mut ids: Vec<String> = page
+            .executions
+            .into_iter()
+            .map(|execution| execution.execution_id)
+            .collect();
+        ids.sort();
+        ids
+    };
+    let check = |store: &PostgresStore| {
+        assert_eq!(
+            listed(store, ExecutionState::Unmatched),
+            vec![corrected.clone()]
+        );
+        assert_eq!(
+            listed(store, ExecutionState::Matched),
+            vec![kept[2].clone()]
+        );
+        assert_eq!(
+            listed(store, ExecutionState::DontKnow),
+            vec![kept[3].clone()]
+        );
+    };
+    blocking(|| check(&store));
+    blocking(|| store.rebuild().unwrap());
+    blocking(|| check(&store));
 }

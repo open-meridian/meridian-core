@@ -281,6 +281,13 @@ monies! {
     PlacementUpdatedEvent { placement }
     ExecutionRecordedEvent { execution }
     ListOrdersReply { orders, placements, executions }
+    // Venue-originated fills and the lake's outcomes (contract v23).
+    AcceptExecutionReply { executions, order, placement }
+    DontKnowExecutionReply { executions }
+    Outcome { settlement_value }
+    RecordOutcomesRequest { outcomes }
+    OutcomesRecordedEvent { outcome }
+    ListOutcomesReply { outcomes }
 }
 
 impl Monies for crate::v1::ChangeRequest {

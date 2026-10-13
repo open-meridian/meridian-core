@@ -337,6 +337,7 @@ fn order_now(w: &Wired, order_id: &str) -> Order {
             since: None,
             limit: 500,
             cursor: String::new(),
+            execution_state: 0,
         })
         .unwrap()
         .orders
@@ -540,6 +541,7 @@ async fn a_telephoned_order_is_the_oms_s_for_a_user_and_its_venue_order_id_recor
             since: None,
             limit: 100,
             cursor: String::new(),
+            execution_state: 0,
         })
         .unwrap()
         .unplaced
@@ -1328,6 +1330,7 @@ async fn a_fact_the_book_cannot_place_is_kept_and_placed_when_a_later_record_cla
             since: None,
             limit: 100,
             cursor: String::new(),
+            execution_state: 0,
         })
         .unwrap();
     assert!(scoped
@@ -1342,6 +1345,7 @@ async fn a_fact_the_book_cannot_place_is_kept_and_placed_when_a_later_record_cla
         since: None,
         limit: 100,
         cursor: String::new(),
+        execution_state: 0,
     };
     let alone = w.store.orders(&none(Scope::Everything)).unwrap();
     assert_eq!(
@@ -1663,6 +1667,7 @@ async fn the_journal_replays_to_the_same_order_records() {
                 since: None,
                 limit: 500,
                 cursor: String::new(),
+                execution_state: 0,
             })
             .unwrap()
     };
@@ -1822,4 +1827,606 @@ async fn the_upgrade_records_once_that_every_account_held_waits_for_compliance()
     let last = journal.last().unwrap();
     assert_eq!(last.meta.kind, "waits-for-compliance-backfilled");
     assert!(last.body.attributes.as_ref().unwrap().waits_for_compliance);
+}
+
+// ── Contract v23: venue-originated fills (W11.11, W11.23, W11.24) ───────────
+
+/// A venue's fill on no order and no placement, its account stamped from the
+/// `ems`'s map.
+fn unmatched(quantity: &str, venue_id: &str, side: Side) -> ReportExecutionRequest {
+    ReportExecutionRequest {
+        placement_id: String::new(),
+        instrument_id: AAPL.into(),
+        side: side as i32,
+        venue_order_id: "ALP-77310-004".into(),
+        venue_client_order_id: "CL-77310-004".into(),
+        ..fill("", quantity, venue_id)
+    }
+}
+
+async fn accept(
+    w: &Wired,
+    execution_ids: &[&str],
+    matched_order: Option<accept_execution_request::MatchedOrder>,
+    from: &As,
+) -> Result<AcceptExecutionReply, String> {
+    send_from(
+        &w.bus,
+        ACCEPT_EXECUTION,
+        "meridian.v1.AcceptExecutionRequest",
+        &AcceptExecutionRequest {
+            execution_ids: execution_ids.iter().map(|id| id.to_string()).collect(),
+            matched_order,
+            note: "Confirmed with the client by phone".into(),
+        },
+        from,
+    )
+    .await
+    .map(|reply| AcceptExecutionReply::decode(&reply[..]).unwrap())
+}
+
+fn to_new_order(sleeve: &str) -> Option<accept_execution_request::MatchedOrder> {
+    Some(accept_execution_request::MatchedOrder::NewOrder(
+        NewOrderFromExecutions {
+            sleeve: sleeve.into(),
+            note: "Sold in the broker's app on Monday".into(),
+        },
+    ))
+}
+
+fn to_order(order_id: &str) -> Option<accept_execution_request::MatchedOrder> {
+    Some(accept_execution_request::MatchedOrder::OrderId(
+        order_id.into(),
+    ))
+}
+
+async fn dont_know(
+    w: &Wired,
+    execution_ids: &[&str],
+    reason: DkReason,
+    text: &str,
+    from: &As,
+) -> Result<DontKnowExecutionReply, String> {
+    send_from(
+        &w.bus,
+        DONT_KNOW_EXECUTION,
+        "meridian.v1.DontKnowExecutionRequest",
+        &DontKnowExecutionRequest {
+            execution_ids: execution_ids.iter().map(|id| id.to_string()).collect(),
+            reason: reason as i32,
+            text: text.into(),
+        },
+        from,
+    )
+    .await
+    .map(|reply| DontKnowExecutionReply::decode(&reply[..]).unwrap())
+}
+
+fn listed(w: &Wired, state: ExecutionState) -> crate::store::OrdersPage {
+    w.store
+        .orders(&OrdersRead {
+            scope: Scope::Everything,
+            account_id: String::new(),
+            since: None,
+            limit: 500,
+            cursor: String::new(),
+            execution_state: state as i32,
+        })
+        .unwrap()
+}
+
+fn listed_ids(w: &Wired, state: ExecutionState) -> Vec<String> {
+    listed(w, state)
+        .executions
+        .into_iter()
+        .map(|execution| execution.execution_id)
+        .collect()
+}
+
+fn aapl_position(w: &Wired, business_date: &str, at: Option<crate::store::Mark>) -> String {
+    let positions = w
+        .store
+        .positions(&crate::store::PositionsRead {
+            scope: Scope::Everything,
+            account_id: ACC.into(),
+            since: None,
+            business_date: business_date.into(),
+            at,
+            limit: 100,
+            cursor: String::new(),
+        })
+        .unwrap();
+    positions
+        .records
+        .iter()
+        .find(|position| position.instrument_id == AAPL)
+        .map(|position| read(&position.trade_date_quantity))
+        .unwrap_or_else(|| "none".into())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fill_on_no_placement_is_unmatched_names_its_venue_order_and_moves_nothing() {
+    let w = wired();
+    let mut recorded = w.bus.subscribe(EXECUTION_RECORDED);
+    let mut positions = w.bus.subscribe("platform.book.event.position-changed");
+    // Each of the instrument, the side and the venue's order ID is required,
+    // refused by name (ruling 9).
+    for (field, mut request) in [
+        ("instrument_id", unmatched("20", "V:0", Side::Sell)),
+        ("side", unmatched("20", "V:0", Side::Sell)),
+        ("venue_order_id", unmatched("20", "V:0", Side::Sell)),
+    ] {
+        match field {
+            "instrument_id" => request.instrument_id = String::new(),
+            "side" => request.side = Side::Unspecified as i32,
+            _ => request.venue_order_id = String::new(),
+        }
+        let refused = execute(&w, &request).await.unwrap_err();
+        assert_eq!(
+            status_of(&refused),
+            Some((
+                meridian_bus::RefusalStatus::InvalidArgument,
+                vec![field.to_string()]
+            )),
+            "{field}"
+        );
+    }
+    let kept = execute(&w, &unmatched("20", "V:1", Side::Buy))
+        .await
+        .unwrap();
+    let execution = kept.execution.unwrap();
+    assert!(execution.execution_id.starts_with("EXE-"));
+    assert_eq!(execution.state, ExecutionState::Unmatched as i32);
+    assert_eq!(execution.venue_order_id, "ALP-77310-004");
+    assert_eq!(execution.account_id, ACC);
+    assert!(execution.order_id.is_empty() && execution.placement_id.is_empty());
+    assert!(kept.order.is_none() && kept.placement.is_none());
+    let heard = ExecutionRecordedEvent::decode(&next(&mut recorded).await.envelope.payload[..])
+        .unwrap()
+        .execution
+        .unwrap();
+    assert_eq!(heard.state, ExecutionState::Unmatched as i32);
+    assert_eq!(
+        heard.raw_record.unwrap().instance_id,
+        ME,
+        "the connectivity plugin that reported it hears it by its raw record"
+    );
+    // Positions don't move for an unmatched fill (ruling 5).
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), positions.recv())
+            .await
+            .is_err(),
+        "an unmatched fill moves no position"
+    );
+    assert_eq!(aapl_position(&w, "", None), "none");
+    // The venue account code and client order ID it came with are kept with
+    // it in the journal, for the placement an accept creates.
+    let journal = w.store.journal(ACC).unwrap();
+    let kept_act = journal
+        .last()
+        .unwrap()
+        .body
+        .acts
+        .iter()
+        .find_map(|act| match act {
+            crate::orders::Act::Executed {
+                venue_account_code,
+                venue_client_order_id,
+                ..
+            } => Some((venue_account_code.clone(), venue_client_order_id.clone())),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        kept_act,
+        ("SNAP-ACCT-9F2".to_string(), "CL-77310-004".to_string())
+    );
+    // Listed and counted as unmatched, and the same fact again applied once.
+    assert_eq!(
+        listed_ids(&w, ExecutionState::Unmatched),
+        vec![execution.execution_id.clone()]
+    );
+    let page = listed(&w, ExecutionState::Unmatched);
+    assert!(page.orders.is_empty() && page.placements.is_empty() && page.unplaced.is_empty());
+    let entries = w.store.journal(ACC).unwrap().len();
+    execute(&w, &unmatched("20", "V:1", Side::Buy))
+        .await
+        .unwrap();
+    assert_eq!(w.store.journal(ACC).unwrap().len(), entries);
+    // An unmapped code is still kept unplaced (ruling 1).
+    let mut unmapped = unmatched("5", "V:2", Side::Buy);
+    unmapped.account_id = String::new();
+    let kept = execute(&w, &unmapped).await.unwrap().unplaced.unwrap();
+    assert_eq!(kept.reason, UnplacedReason::UnmappedVenueAccount as i32);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bust_closes_an_unmatched_fill_and_a_correction_is_answered_in_its_place() {
+    let w = wired();
+    let first = execute(&w, &unmatched("20", "V:1", Side::Buy))
+        .await
+        .unwrap()
+        .execution
+        .unwrap();
+    let second = execute(&w, &unmatched("10", "V:2", Side::Buy))
+        .await
+        .unwrap()
+        .execution
+        .unwrap();
+    // A bust (H): it names the fill and carries nothing else; the fill stays
+    // unmatched, superseded, and neither it nor the bust is listed (e6).
+    let bust = ReportExecutionRequest {
+        instrument_id: String::new(),
+        side: Side::Unspecified as i32,
+        venue_order_id: String::new(),
+        supersedes: first.execution_id.clone(),
+        settlement_date: String::new(),
+        computed_settlement_date: String::new(),
+        ..unmatched("0", "V:1-bust", Side::Buy)
+    };
+    let busted = execute(&w, &bust).await.unwrap().execution.unwrap();
+    assert_eq!(busted.state, ExecutionState::Unmatched as i32);
+    assert_eq!(busted.instrument_id, AAPL, "taken from the fill it busts");
+    // A correction (G) supersedes the second and is unmatched in its place
+    // (e5).
+    let correction = ReportExecutionRequest {
+        supersedes: second.execution_id.clone(),
+        ..unmatched("12", "V:2-correction", Side::Buy)
+    };
+    let corrected = execute(&w, &correction).await.unwrap().execution.unwrap();
+    assert_eq!(corrected.state, ExecutionState::Unmatched as i32);
+    assert_eq!(
+        listed_ids(&w, ExecutionState::Unmatched),
+        vec![corrected.execution_id.clone()],
+        "a busted fill and its bust are left out; a corrected one is counted once, as its \
+         correction (gap 2)"
+    );
+    // Neither the busted fill, its bust, nor the corrected one is answered.
+    for id in [
+        &first.execution_id,
+        &busted.execution_id,
+        &second.execution_id,
+    ] {
+        let refused = accept(&w, &[id], to_new_order(""), &person(TRADER))
+            .await
+            .unwrap_err();
+        assert_eq!(code(&refused), Some(RefusalReason::ExecutionState), "{id}");
+        let refused = dont_know(&w, &[id], DkReason::NoMatchingOrder, "", &person(TRADER))
+            .await
+            .unwrap_err();
+        assert_eq!(code(&refused), Some(RefusalReason::ExecutionState), "{id}");
+    }
+    accept(
+        &w,
+        &[&corrected.execution_id],
+        to_new_order(""),
+        &person(TRADER),
+    )
+    .await
+    .unwrap();
+    assert!(listed_ids(&w, ExecutionState::Unmatched).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_accept_to_a_new_order_makes_it_filled_with_the_ems_s_placement_as_of_the_trade_date() {
+    let w = wired();
+    let mut ordered = w.bus.subscribe(ORDER_UPDATED);
+    let mut placed = w.bus.subscribe(PLACEMENT_UPDATED);
+    // Two prints of one venue order, traded on Friday 9 October.
+    let prints: Vec<Execution> = {
+        let mut kept = Vec::new();
+        for (quantity, id) in [("20", "V:1"), ("10", "V:2")] {
+            let mut print = unmatched(quantity, id, Side::Buy);
+            print.trade_date = "2026-10-09".into();
+            print.venue_id = "VEN-XNAS".into();
+            kept.push(execute(&w, &print).await.unwrap().execution.unwrap());
+        }
+        kept
+    };
+    let ids: Vec<&str> = prints.iter().map(|e| e.execution_id.as_str()).collect();
+    let before = w.store.heads().unwrap();
+    // No user behind it: refused, nothing changed.
+    let refused = accept(&w, &ids, to_new_order("core"), &venue())
+        .await
+        .unwrap_err();
+    assert_eq!(code(&refused), Some(RefusalReason::ActorRequired));
+    // Neither arm of matched_order: refused naming it.
+    let refused = accept(&w, &ids, None, &person(TRADER)).await.unwrap_err();
+    assert_eq!(
+        status_of(&refused),
+        Some((
+            meridian_bus::RefusalStatus::InvalidArgument,
+            vec!["matched_order".to_string()]
+        ))
+    );
+    let done = accept(&w, &ids, to_new_order("core"), &person(TRADER))
+        .await
+        .unwrap();
+    let order = done.order.unwrap();
+    assert_eq!(order.origin, OrderOrigin::AcceptedExecution as i32);
+    assert_eq!(order.order_type, OrderType::Market as i32);
+    assert_eq!(order.time_in_force, TimeInForce::Day as i32);
+    assert_eq!(order.side, Side::Buy as i32);
+    assert_eq!(order.sleeve, "core");
+    assert_eq!(order.venue_order_id, "ALP-77310-004");
+    assert_eq!(state(&order), OrderState::Filled);
+    assert_eq!(read(&quantities(&order).ordered), "30");
+    assert_eq!(read(&quantities(&order).reported_filled), "30");
+    assert!(order.person_roles.as_ref().unwrap().entered_by.is_some());
+    assert!(
+        !holds(&order, OrderCondition::AwaitingCheck),
+        "never gated (ruling 4)"
+    );
+    let placement = done.placement.unwrap();
+    assert_eq!(
+        placement.status.unwrap().state,
+        PlacementState::Filled as i32
+    );
+    assert_eq!(placement.routed_at_ns, 0);
+    assert_eq!(placement.ems_instance_id, ME);
+    assert_eq!(placement.connectivity_instance_id, ME);
+    assert_eq!(placement.venue_account_code, "SNAP-ACCT-9F2");
+    assert_eq!(placement.venue_order_id, "ALP-77310-004");
+    assert_eq!(placement.destination, "VEN-XNAS");
+    assert_eq!(read(&placement.quantity), "30");
+    for execution in &done.executions {
+        assert_eq!(execution.state, ExecutionState::Matched as i32);
+        assert_eq!(execution.order_id, order.order_id);
+        assert_eq!(execution.placement_id, placement.placement_id);
+        assert_eq!(execution.sleeve, "core");
+    }
+    // Compliance hears the order created after the trade, and the
+    // connectivity plugin the placement it sends BN Accepted on.
+    let heard = OrderUpdatedEvent::decode(&next(&mut ordered).await.envelope.payload[..]).unwrap();
+    assert_eq!(
+        heard.order.unwrap().origin,
+        OrderOrigin::AcceptedExecution as i32
+    );
+    let heard =
+        PlacementUpdatedEvent::decode(&next(&mut placed).await.envelope.payload[..]).unwrap();
+    assert_eq!(heard.placement.unwrap().connectivity_instance_id, ME);
+    // As of the trade date, by an entry recorded at the accept (ruling 13).
+    let entry = w.store.journal(ACC).unwrap().last().unwrap().clone();
+    assert_eq!(entry.meta.kind, "execution-accepted");
+    assert_eq!(entry.meta.effective_date, "2026-10-09");
+    assert_eq!(entry.meta.reason, "Confirmed with the client by phone");
+    let sleeve_position = |business_date: &str, at| {
+        w.store
+            .positions(&crate::store::PositionsRead {
+                scope: Scope::Everything,
+                account_id: ACC.into(),
+                since: None,
+                business_date: business_date.into(),
+                at,
+                limit: 100,
+                cursor: String::new(),
+            })
+            .unwrap()
+            .records
+            .into_iter()
+            .find(|position| position.instrument_id == AAPL && position.sleeve == "core")
+            .map(|position| read(&position.trade_date_quantity))
+            .unwrap_or_else(|| "none".into())
+    };
+    assert_eq!(sleeve_position("2026-10-09", None), "30");
+    assert_eq!(sleeve_position("2026-10-08", None), "none");
+    assert_eq!(
+        sleeve_position("2026-10-09", Some(before)),
+        "none",
+        "a point-in-time read from before the accept shows no position"
+    );
+    // Answered once, never again.
+    let refused = accept(&w, &ids, to_new_order("core"), &person(TRADER))
+        .await
+        .unwrap_err();
+    assert_eq!(code(&refused), Some(RefusalReason::ExecutionState));
+    // The journal replays to the same records.
+    let replayed = crate::Book::replay(ACC, "P0", &w.store.journal(ACC).unwrap()).unwrap();
+    assert_eq!(
+        replayed.ledger.order_record(&order.order_id, true).unwrap(),
+        order_now(&w, &order.order_id)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_accept_to_an_existing_order_is_held_to_its_state_quantity_side_and_account() {
+    let w = wired();
+    let order = released(&w, "10").await;
+    let a = execute(&w, &unmatched("4", "V:1", Side::Buy))
+        .await
+        .unwrap()
+        .execution
+        .unwrap();
+    let big = execute(&w, &unmatched("40", "V:2", Side::Buy))
+        .await
+        .unwrap()
+        .execution
+        .unwrap();
+    let sold = execute(&w, &unmatched("3", "V:3", Side::Sell))
+        .await
+        .unwrap()
+        .execution
+        .unwrap();
+    let mut elsewhere = unmatched("2", "V:4", Side::Buy);
+    elsewhere.account_id = OTHER.into();
+    let other = execute(&w, &elsewhere).await.unwrap().execution.unwrap();
+
+    // Past the order's ordered quantity (ruling 10).
+    let refused = accept(
+        &w,
+        &[&big.execution_id],
+        to_order(&order.order_id),
+        &person(TRADER),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(code(&refused), Some(RefusalReason::QuantityExceedsOrder));
+    // A fill's side the order's opposite; fills of two sides; two accounts.
+    for (ids, why) in [
+        (vec![sold.execution_id.as_str()], "the wrong side"),
+        (
+            vec![a.execution_id.as_str(), sold.execution_id.as_str()],
+            "mixed sides",
+        ),
+        (
+            vec![a.execution_id.as_str(), other.execution_id.as_str()],
+            "mixed accounts",
+        ),
+    ] {
+        let refused = accept(&w, &ids, to_order(&order.order_id), &person(TRADER))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            code(&refused),
+            Some(RefusalReason::ExecutionsDiffer),
+            "{why}"
+        );
+    }
+    // Accepted to the working order: its placement created at filled.
+    let done = accept(
+        &w,
+        &[&a.execution_id],
+        to_order(&order.order_id),
+        &person(TRADER),
+    )
+    .await
+    .unwrap();
+    let after = done.order.unwrap();
+    assert_eq!(after.order_id, order.order_id);
+    assert_eq!(state(&after), OrderState::Working);
+    assert_eq!(read(&quantities(&after).reported_filled), "4");
+    assert_eq!(
+        done.placement.unwrap().status.unwrap().state,
+        PlacementState::Filled as i32
+    );
+    assert_eq!(aapl_position(&w, "", None), "4");
+    // An order ended takes no accept.
+    order_command(
+        &w,
+        REQUEST_ORDER_CHANGE,
+        "meridian.v1.RequestOrderChangeRequest",
+        &RequestOrderChangeRequest {
+            order_id: order.order_id.clone(),
+            change: Some(OrderChange {
+                kind: OrderChangeKind::Cancel as i32,
+                ..Default::default()
+            }),
+            reason: "done for today".into(),
+            ..Default::default()
+        },
+        &person(TRADER),
+    )
+    .await
+    .unwrap();
+    let small = execute(&w, &unmatched("1", "V:5", Side::Buy))
+        .await
+        .unwrap()
+        .execution
+        .unwrap();
+    let refused = accept(
+        &w,
+        &[&small.execution_id],
+        to_order(&order.order_id),
+        &person(TRADER),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(code(&refused), Some(RefusalReason::OrderState));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dk_closes_a_fill_moving_nothing_and_a_later_fill_of_the_venue_order_waits_again() {
+    let w = wired();
+    let mut recorded = w.bus.subscribe(EXECUTION_RECORDED);
+    let fill = execute(&w, &unmatched("20", "V:1", Side::Buy))
+        .await
+        .unwrap()
+        .execution
+        .unwrap();
+    next(&mut recorded).await;
+    let id = fill.execution_id.as_str();
+    // Other without text: refused naming text, as FIX requires Text (58).
+    let refused = dont_know(&w, &[id], DkReason::Other, " ", &person(TRADER))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        status_of(&refused),
+        Some((
+            meridian_bus::RefusalStatus::InvalidArgument,
+            vec!["text".to_string()]
+        ))
+    );
+    let refused = dont_know(&w, &[id], DkReason::UnknownInstrument, "", &venue())
+        .await
+        .unwrap_err();
+    assert_eq!(code(&refused), Some(RefusalReason::ActorRequired));
+    let done = dont_know(&w, &[id], DkReason::Other, "Not our trade", &person(TRADER))
+        .await
+        .unwrap();
+    let answered = &done.executions[0];
+    assert_eq!(answered.state, ExecutionState::DontKnow as i32);
+    assert_eq!(answered.dk_reason, DkReason::Other as i32);
+    assert_eq!(answered.dk_text, "Not our trade");
+    // The connectivity plugin that reported it hears it (ruling 15).
+    let heard = ExecutionRecordedEvent::decode(&next(&mut recorded).await.envelope.payload[..])
+        .unwrap()
+        .execution
+        .unwrap();
+    assert_eq!(heard.state, ExecutionState::DontKnow as i32);
+    assert_eq!(heard.raw_record.unwrap().instance_id, ME);
+    assert_eq!(aapl_position(&w, "", None), "none");
+    assert_eq!(
+        listed_ids(&w, ExecutionState::DontKnow),
+        vec![id.to_string()]
+    );
+    // Answered once, never again.
+    let refused = dont_know(&w, &[id], DkReason::Other, "again", &person(TRADER))
+        .await
+        .unwrap_err();
+    assert_eq!(code(&refused), Some(RefusalReason::ExecutionState));
+    let refused = accept(&w, &[id], to_new_order(""), &person(TRADER))
+        .await
+        .unwrap_err();
+    assert_eq!(code(&refused), Some(RefusalReason::ExecutionState));
+    // A later fill for the same venue order arrives unmatched on its own (e7).
+    let later = execute(&w, &unmatched("5", "V:2", Side::Buy))
+        .await
+        .unwrap()
+        .execution
+        .unwrap();
+    assert_eq!(later.state, ExecutionState::Unmatched as i32);
+    assert_eq!(later.venue_order_id, fill.venue_order_id);
+    assert_eq!(
+        listed_ids(&w, ExecutionState::Unmatched),
+        vec![later.execution_id.clone()]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bust_after_an_accept_reverses_its_own_fill_alone() {
+    let w = wired();
+    let mut kept = Vec::new();
+    for (quantity, id) in [("20", "V:1"), ("10", "V:2")] {
+        kept.push(
+            execute(&w, &unmatched(quantity, id, Side::Buy))
+                .await
+                .unwrap()
+                .execution
+                .unwrap(),
+        );
+    }
+    let ids: Vec<&str> = kept.iter().map(|e| e.execution_id.as_str()).collect();
+    let done = accept(&w, &ids, to_new_order(""), &person(TRADER))
+        .await
+        .unwrap();
+    let placement = done.placement.unwrap();
+    assert_eq!(aapl_position(&w, "", None), "30");
+    // The venue busts the second print, on the placement the accept created.
+    let mut bust = fill(&placement.placement_id, "0", "V:2-bust");
+    bust.supersedes = kept[1].execution_id.clone();
+    bust.computed_settlement_date = String::new();
+    let busted = execute(&w, &bust).await.unwrap();
+    assert_eq!(aapl_position(&w, "", None), "20");
+    let order = busted.order.unwrap();
+    assert_eq!(read(&quantities(&order).reported_filled), "20");
 }

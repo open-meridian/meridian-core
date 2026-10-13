@@ -363,6 +363,7 @@ impl Store for MemoryStore {
                 Record::Placement => book.ledger.placements.contains_key(id),
                 Record::ChangeRequest => book.ledger.changes.contains_key(id),
                 Record::Locate => book.ledger.locates.contains_key(id),
+                Record::Execution => book.ledger.executions.contains_key(id),
             })
             .map(|(account, _)| account.clone()))
     }
@@ -373,7 +374,12 @@ impl Store for MemoryStore {
         let mut items = Vec::new();
         for (key, book) in &state.books {
             if order_reads::book_answers(&read.scope, &read.account_id, key) {
-                items.extend(order_reads::items_of(key, book, &read.since)?);
+                items.extend(order_reads::items_of(
+                    key,
+                    book,
+                    &read.since,
+                    read.execution_state,
+                )?);
             }
         }
         order_reads::orders_page(items, read, state.heads.clone())

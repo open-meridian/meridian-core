@@ -127,11 +127,36 @@ pub enum Act {
         report: ReportPlacementRequest,
     },
     /// An execution recorded (W11.11), never edited, and the instance that
-    /// reported it.
+    /// reported it. From contract v23 a fill on no placement keeps the venue
+    /// account code and the venue's client order ID it came with, which the
+    /// Execution does not carry: the code is what the placement an accept
+    /// creates names (W11.23).
     Executed {
         #[serde(with = "pb")]
         execution: Execution,
         sender: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        venue_account_code: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        venue_client_order_id: String,
+    },
+    /// Unmatched executions accepted by an `ems` (W11.23, contract v23):
+    /// each linked to the order and to the placement the accept created,
+    /// matched (transition e3). `line_counts` is how many of the entry's
+    /// movement lines each execution moved, in order, so a later bust
+    /// reverses its own and no other.
+    Accepted {
+        execution_ids: Vec<String>,
+        order_id: String,
+        placement_id: String,
+        line_counts: Vec<usize>,
+    },
+    /// Unmatched executions answered don't know (W11.24, contract v23):
+    /// closed, never moving a position (transition e4).
+    DontKnow {
+        execution_ids: Vec<String>,
+        reason: i32,
+        text: String,
     },
     /// A fee with no fill (W11.12).
     Charged {
@@ -225,6 +250,37 @@ pub struct ExecutionHeld {
     pub entry_id: String,
     pub sender: String,
     pub superseded_by: Option<String>,
+    /// The venue account code a fill on no placement came with (contract
+    /// v23), for the placement an accept creates.
+    pub venue_account_code: String,
+    pub venue_client_order_id: String,
+    /// Where an accept moved its position: the accept's entry, and the first
+    /// of its lines and how many (W11.23). None where the entry that
+    /// recorded it moved it, or nothing did.
+    pub accepted_lines: Option<(String, usize, usize)>,
+}
+
+impl ExecutionHeld {
+    /// A bust: a superseding fact of no quantity.
+    pub fn is_bust(&self) -> bool {
+        !self.execution.supersedes.is_empty()
+            && self
+                .execution
+                .quantity
+                .as_ref()
+                .and_then(|quantity| Exact::from_wire(quantity).ok())
+                .is_none_or(|quantity| quantity.is_zero())
+    }
+
+    /// Unmatched and still waiting for an answer (W11.17): neither
+    /// superseded nor a bust. A busted unmatched fill stays unmatched with
+    /// nothing to answer (transition e6); a corrected one is answered as its
+    /// correction (e5).
+    pub fn waiting(&self) -> bool {
+        self.execution.state == ExecutionState::Unmatched as i32
+            && self.superseded_by.is_none()
+            && !self.is_bust()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -399,6 +455,23 @@ impl Ledger {
                     push_once(&mut touched.placements, &report.placement_id);
                     if let Some(held) = self.placements.get(&report.placement_id) {
                         push_once(&mut touched.orders, &held.placement.order_id);
+                    }
+                }
+                Act::Accepted {
+                    execution_ids,
+                    order_id,
+                    placement_id,
+                    ..
+                } => {
+                    for id in execution_ids {
+                        push_once(&mut touched.executions, id);
+                    }
+                    push_once(&mut touched.placements, placement_id);
+                    push_once(&mut touched.orders, order_id);
+                }
+                Act::DontKnow { execution_ids, .. } => {
+                    for id in execution_ids {
+                        push_once(&mut touched.executions, id);
                     }
                 }
                 Act::Executed { execution, .. } => {
@@ -587,7 +660,12 @@ impl Ledger {
             }
             Act::PlacementRefused { .. } => {}
             Act::PlacementReported { report } => self.reported(report),
-            Act::Executed { execution, sender } => {
+            Act::Executed {
+                execution,
+                sender,
+                venue_account_code,
+                venue_client_order_id,
+            } => {
                 let id = execution.execution_id.clone();
                 if !execution.supersedes.is_empty() {
                     if let Some(earlier) = self.executions.get_mut(&execution.supersedes) {
@@ -609,13 +687,16 @@ impl Ledger {
                         .insert(venue_key(sender, execution), id.clone());
                 }
                 // Its state is derived, never stored (contract v23,
-                // decisions/035 as amended): every execution the book records
-                // today is on a placement or, done away, on its order --
-                // matched (transition e1). An unmatched one is v23's build.
+                // decisions/035 as amended): on a placement or, done away, on
+                // its order, matched (transition e1); on neither, unmatched
+                // (e2), and so is what supersedes it (e5, e6).
                 let mut execution = execution.clone();
-                if execution.state == ExecutionState::Unspecified as i32 {
-                    execution.state = ExecutionState::Matched as i32;
-                }
+                execution.state =
+                    if execution.order_id.is_empty() && execution.placement_id.is_empty() {
+                        ExecutionState::Unmatched as i32
+                    } else {
+                        ExecutionState::Matched as i32
+                    };
                 self.executions.insert(
                     id,
                     ExecutionHeld {
@@ -623,8 +704,58 @@ impl Ledger {
                         entry_id: entry_id.to_string(),
                         sender: sender.clone(),
                         superseded_by: None,
+                        venue_account_code: venue_account_code.clone(),
+                        venue_client_order_id: venue_client_order_id.clone(),
+                        accepted_lines: None,
                     },
                 );
+            }
+            Act::Accepted {
+                execution_ids,
+                order_id,
+                placement_id,
+                line_counts,
+            } => {
+                let sleeve = self
+                    .orders
+                    .get(order_id)
+                    .map(|held| held.order.sleeve.clone())
+                    .unwrap_or_default();
+                let mut start = 0;
+                for (index, id) in execution_ids.iter().enumerate() {
+                    let count = line_counts.get(index).copied().unwrap_or(0);
+                    if let Some(held) = self.executions.get_mut(id) {
+                        held.execution.order_id = order_id.clone();
+                        held.execution.placement_id = placement_id.clone();
+                        held.execution.sleeve = sleeve.clone();
+                        held.execution.state = ExecutionState::Matched as i32;
+                        held.accepted_lines = Some((entry_id.to_string(), start, count));
+                    }
+                    start += count;
+                    if let Some(placement) = self.placements.get_mut(placement_id) {
+                        if !placement.executions.contains(id) {
+                            placement.executions.push(id.clone());
+                        }
+                    }
+                    if let Some(order) = self.orders.get_mut(order_id) {
+                        if !order.executions.contains(id) {
+                            order.executions.push(id.clone());
+                        }
+                    }
+                }
+            }
+            Act::DontKnow {
+                execution_ids,
+                reason,
+                text,
+            } => {
+                for id in execution_ids {
+                    if let Some(held) = self.executions.get_mut(id) {
+                        held.execution.state = ExecutionState::DontKnow as i32;
+                        held.execution.dk_reason = *reason;
+                        held.execution.dk_text = text.clone();
+                    }
+                }
             }
             Act::Charged { charge } => {
                 let id = charge.charge_id.clone();
@@ -896,7 +1027,7 @@ impl Ledger {
 
     /// What an execution counts toward its order: its quantity, or for an
     /// order for an amount, its quantity at its price.
-    fn counted(&self, order: Option<&OrderHeld>, execution: &Execution) -> Result<Exact> {
+    pub fn counted(&self, order: Option<&OrderHeld>, execution: &Execution) -> Result<Exact> {
         let quantity = numbers::required("execution.quantity", execution.quantity.as_ref())?;
         let by_amount = order.is_some_and(|held| held.order.quantity.is_none());
         if !by_amount {

@@ -20,16 +20,17 @@ use std::time::Duration;
 
 use meridian_bus::{Bus, Envelope};
 use meridian_domain::v1::{
-    unplaced_fact, AcknowledgeFlagRequest, CreatePlacementRequest, DecideApprovalRequest,
-    ExecutionRecordedEvent, FactReply, ListLocatesReply, ListLocatesRequest, ListOrdersReply,
-    ListOrdersRequest, ListTradingInstructionsReply, ListTradingInstructionsRequest, LocateReply,
-    LocateUpdatedEvent, OrderHistoryReply, OrderHistoryRequest, OrderReply, OrderUpdatedEvent,
-    PlacementReply, PlacementUpdatedEvent, ProposeOrderRequest, RecordCheckRequest,
-    RecordLocateRequest, RecordLocateUseRequest, RecordOrderRequest, ReleaseOrderRequest,
-    ReportChargeRequest, ReportExecutionRequest, ReportPlacementRequest, RequestOrderChangeRequest,
-    RequestPlacementChangeRequest, SetTradingInstructionRequest, SetWorkingConditionRequest,
-    TradingInstructionChangedEvent, TradingInstructionReply, UnplacedFactRecordedEvent,
-    UnplacedReason,
+    unplaced_fact, AcceptExecutionReply, AcceptExecutionRequest, AcknowledgeFlagRequest,
+    CreatePlacementRequest, DecideApprovalRequest, DontKnowExecutionReply,
+    DontKnowExecutionRequest, ExecutionRecordedEvent, FactReply, ListLocatesReply,
+    ListLocatesRequest, ListOrdersReply, ListOrdersRequest, ListTradingInstructionsReply,
+    ListTradingInstructionsRequest, LocateReply, LocateUpdatedEvent, OrderHistoryReply,
+    OrderHistoryRequest, OrderReply, OrderUpdatedEvent, PlacementReply, PlacementUpdatedEvent,
+    ProposeOrderRequest, RecordCheckRequest, RecordLocateRequest, RecordLocateUseRequest,
+    RecordOrderRequest, ReleaseOrderRequest, ReportChargeRequest, ReportExecutionRequest,
+    ReportPlacementRequest, RequestOrderChangeRequest, RequestPlacementChangeRequest,
+    SetTradingInstructionRequest, SetWorkingConditionRequest, TradingInstructionChangedEvent,
+    TradingInstructionReply, UnplacedFactRecordedEvent, UnplacedReason,
 };
 use meridian_pb::bounds;
 use prost::Message;
@@ -58,6 +59,8 @@ pub const ACKNOWLEDGE_FLAG: &str = "platform.book.command.acknowledge-flag";
 pub const SET_TRADING_INSTRUCTION: &str = "platform.book.command.set-trading-instruction";
 pub const RECORD_LOCATE: &str = "platform.book.command.record-locate";
 pub const RECORD_LOCATE_USE: &str = "platform.book.command.record-locate-use";
+pub const ACCEPT_EXECUTION: &str = "platform.book.command.accept-execution";
+pub const DONT_KNOW_EXECUTION: &str = "platform.book.command.dont-know-execution";
 
 pub const ORDER_UPDATED: &str = "platform.book.event.order-updated";
 pub const PLACEMENT_UPDATED: &str = "platform.book.event.placement-updated";
@@ -230,6 +233,41 @@ fn fact_reply(made: &Made) -> Vec<u8> {
     reply.encode_to_vec()
 }
 
+/// The executions a command named, as they stand after it, in its order.
+fn executions_of(made: &Made, ids: &[String]) -> Vec<meridian_domain::v1::Execution> {
+    ids.iter()
+        .filter_map(|id| made.book.ledger.executions.get(id))
+        .map(|held| held.execution.clone())
+        .collect()
+}
+
+/// An accept's answer (W11.23): each execution matched, the order and the
+/// placement it linked them to.
+fn accept_reply(made: &Made, ids: &[String]) -> Vec<u8> {
+    let (order_id, placement_id) = made
+        .entry
+        .body
+        .acts
+        .iter()
+        .find_map(|act| match act {
+            crate::orders::Act::Accepted {
+                order_id,
+                placement_id,
+                ..
+            } => Some((order_id.clone(), placement_id.clone())),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let mut reply = AcceptExecutionReply {
+        executions: executions_of(made, ids),
+        order: made.book.ledger.order_record(&order_id, false).ok(),
+        placement: made.book.ledger.placement_record(&placement_id).ok(),
+        journal: Some(made.changes.first.clone()),
+    };
+    meridian_domain::money::fill_known(&mut reply);
+    reply.encode_to_vec()
+}
+
 fn locate_reply(made: &Made) -> Vec<u8> {
     LocateReply {
         locate: made.changes.locates.first().cloned(),
@@ -260,6 +298,7 @@ fn record_named(record: Record) -> &'static str {
         Record::Placement => "placement",
         Record::ChangeRequest => "change request",
         Record::Locate => "locate",
+        Record::Execution => "execution",
     }
 }
 
@@ -1013,6 +1052,110 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
         });
     }
 
+    // W11.23 and W11.24 (contract v23): the `ems`'s answers to unmatched
+    // executions, named by their IDs alone, decided in the first one's
+    // account and held to the write scope the sidecar stamped.
+    {
+        let (bus2, store, clock) = (bus.clone(), store.clone(), clock.clone());
+        bus.serve(ACCEPT_EXECUTION, move |envelope| {
+            let request: AcceptExecutionRequest =
+                decode(&envelope, "meridian.v1.AcceptExecutionRequest")?;
+            let ctx = context_of(&envelope, clock.as_ref());
+            let account = owner_of(
+                store.as_ref(),
+                Record::Execution,
+                request
+                    .execution_ids
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or_default(),
+            )
+            .map_err(|f| f.on_the_bus())?;
+            // Where each execution named is, read before the account's lock
+            // is taken: an execution in another account is never in this
+            // account's book.
+            let owners: std::collections::BTreeMap<String, String> = request
+                .execution_ids
+                .iter()
+                .filter_map(|id| {
+                    store
+                        .owner(Record::Execution, id)
+                        .ok()
+                        .flatten()
+                        .map(|account| (id.clone(), account))
+                })
+                .collect();
+            let elsewhere = |id: &str| owners.get(id).cloned();
+            act(
+                &bus2,
+                store.as_ref(),
+                &envelope,
+                ctx,
+                &account,
+                "",
+                "meridian.v1.AcceptExecutionReply",
+                &|book, head, ctx| {
+                    let made = orders::accept_execution(book, head, ctx, &request, &elsewhere)?;
+                    let reply = accept_reply(&made, &request.execution_ids);
+                    Ok((made, reply))
+                },
+                None,
+            )
+        });
+    }
+    {
+        let (bus2, store, clock) = (bus.clone(), store.clone(), clock.clone());
+        bus.serve(DONT_KNOW_EXECUTION, move |envelope| {
+            let request: DontKnowExecutionRequest =
+                decode(&envelope, "meridian.v1.DontKnowExecutionRequest")?;
+            let ctx = context_of(&envelope, clock.as_ref());
+            let account = owner_of(
+                store.as_ref(),
+                Record::Execution,
+                request
+                    .execution_ids
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or_default(),
+            )
+            .map_err(|f| f.on_the_bus())?;
+            // Where each execution named is, read before the account's lock
+            // is taken: an execution in another account is never in this
+            // account's book.
+            let owners: std::collections::BTreeMap<String, String> = request
+                .execution_ids
+                .iter()
+                .filter_map(|id| {
+                    store
+                        .owner(Record::Execution, id)
+                        .ok()
+                        .flatten()
+                        .map(|account| (id.clone(), account))
+                })
+                .collect();
+            let elsewhere = |id: &str| owners.get(id).cloned();
+            act(
+                &bus2,
+                store.as_ref(),
+                &envelope,
+                ctx,
+                &account,
+                "",
+                "meridian.v1.DontKnowExecutionReply",
+                &|book, head, ctx| {
+                    let made = orders::dont_know_execution(book, head, ctx, &request, &elsewhere)?;
+                    let mut reply = DontKnowExecutionReply {
+                        executions: executions_of(&made, &request.execution_ids),
+                        journal: Some(made.changes.first.clone()),
+                    };
+                    meridian_domain::money::fill_known(&mut reply);
+                    Ok((made, reply.encode_to_vec()))
+                },
+                None,
+            )
+        });
+    }
+
     let reading = store.clone();
     bus.serve(LIST_ORDERS, move |envelope| {
         let request: ListOrdersRequest = decode(&envelope, "meridian.v1.ListOrdersRequest")?;
@@ -1026,19 +1169,17 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
                     bounds::LIST_ORDERS_REQUEST_PAGE_SIZE_RANGE,
                 ),
                 cursor: request.cursor.clone(),
+                // Contract v23 (W11.17): only the executions in the state
+                // asked for, filtered where the page is made.
+                execution_state: request.execution_state,
             })
             .map_err(|failed| failed.on_the_bus())?;
-        // Contract v23 (W11.17): only the executions in the state asked for.
-        let mut executions = page.executions;
-        if request.execution_state != 0 {
-            executions.retain(|execution| execution.state == request.execution_state);
-        }
         let mut reply = ListOrdersReply {
             orders: page.orders,
             as_of: Some(watermark_of(&page.as_of)),
             next_cursor: page.next_cursor,
             placements: page.placements,
-            executions,
+            executions: page.executions,
             unplaced_facts: page.unplaced,
         };
         meridian_domain::money::fill_known(&mut reply);

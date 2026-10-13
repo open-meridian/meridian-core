@@ -504,11 +504,13 @@ fn project_orders(tx: &mut Transaction<'_>, account_id: &str, changes: &Changes)
         tx.execute(
             "INSERT INTO book_execution
                     (account_id, execution_id, order_id, placement_id, partition, sequence,
-                     quantity, price, trade_date, supersedes, record)
-             VALUES ($1, $2, $3, $4, $5, $6, $7::text::numeric, $8::text::numeric, $9, $10, $11)
+                     quantity, price, trade_date, supersedes, record, state)
+             VALUES ($1, $2, $3, $4, $5, $6, $7::text::numeric, $8::text::numeric, $9, $10, $11,
+                     $12)
              ON CONFLICT (account_id, execution_id) DO UPDATE
                 SET partition = EXCLUDED.partition, sequence = EXCLUDED.sequence,
-                    record = EXCLUDED.record",
+                    order_id = EXCLUDED.order_id, placement_id = EXCLUDED.placement_id,
+                    state = EXCLUDED.state, record = EXCLUDED.record",
             &[
                 &account_id,
                 &record.execution_id,
@@ -524,6 +526,7 @@ fn project_orders(tx: &mut Transaction<'_>, account_id: &str, changes: &Changes)
                 &record.trade_date,
                 &record.supersedes,
                 &record.encode_to_vec(),
+                &record.state,
             ],
         )
         .map_err(unavailable)?;
@@ -1191,6 +1194,7 @@ impl Store for PostgresStore {
                 "SELECT account_id FROM book_change_request WHERE change_request_id = $1"
             }
             Record::Locate => "SELECT account_id FROM book_locate WHERE locate_record_id = $1",
+            Record::Execution => "SELECT account_id FROM book_execution WHERE execution_id = $1",
         };
         Ok(self
             .conn()?
@@ -1219,12 +1223,29 @@ impl Store for PostgresStore {
             ("book_unplaced", "unplaced_id"),
         ];
         let scope = scope_param(&read.scope);
+        // Contract v23 (W11.17): filtered by an execution's state, the read
+        // answers executions alone; unmatched, those still waiting for an
+        // answer -- neither superseded nor a bust.
+        let state_filter = match read.execution_state {
+            0 => String::new(),
+            1 => "AND state = 1
+                  AND NOT (supersedes <> '' AND COALESCE(quantity, 0) = 0)
+                  AND NOT EXISTS (SELECT 1 FROM book_execution s
+                                   WHERE s.account_id = book_execution.account_id
+                                     AND s.supersedes = book_execution.execution_id)"
+                .to_string(),
+            state => format!("AND state = {state}"),
+        };
         self.reading(|tx| {
             let mut items = Vec::new();
             for (kind, (table, id)) in tables.iter().enumerate() {
                 if kind < after.0 {
                     continue;
                 }
+                if read.execution_state != 0 && kind != 2 {
+                    continue;
+                }
+                let state_filter = if kind == 2 { state_filter.as_str() } else { "" };
                 let (from_account, from_id) = if kind == after.0 && !read.cursor.is_empty() {
                     (after.1.clone(), after.2.clone())
                 } else {
@@ -1237,6 +1258,7 @@ impl Store for PostgresStore {
                               WHERE ($1::text[] IS NULL OR account_id = ANY($1))
                                 AND ($2 = '' OR account_id = $2)
                                 AND {filter}
+                                {state_filter}
                                 AND (account_id COLLATE \"C\", {id} COLLATE \"C\")
                                     > ($5 COLLATE \"C\", $6 COLLATE \"C\")
                               ORDER BY account_id COLLATE \"C\", {id} COLLATE \"C\"

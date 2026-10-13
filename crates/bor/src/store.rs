@@ -191,6 +191,8 @@ pub enum Record {
     Placement,
     ChangeRequest,
     Locate,
+    /// An execution, which an accept or a DK names (contract v23).
+    Execution,
 }
 
 /// Whose accounts a read answers for (W4.11).
@@ -320,6 +322,9 @@ pub struct OrdersRead {
     pub since: Option<Mark>,
     pub limit: usize,
     pub cursor: String,
+    /// Contract v23 (W11.17): only executions in this state, 0 for every
+    /// record; unmatched answers those still waiting for an answer.
+    pub execution_state: i32,
 }
 
 /// A page of them: each kind in its own list, paged as one stream in the

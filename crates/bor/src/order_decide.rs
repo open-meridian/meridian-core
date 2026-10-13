@@ -20,18 +20,19 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use meridian_domain::exact::Exact;
 use meridian_domain::v1::{
-    actor, change_request, unplaced_fact, AcknowledgeFlagRequest, Actor, ApprovalDecision,
-    ChangeRequest, ChangeRequestOutcome, Charge, Check, CheckVerdict, Claimant,
-    CreatePlacementRequest, DecideApprovalRequest, Execution, ExecutionKind, HoldingSide,
-    LocateUseKind, LotReliefMethod, LotSource, LotTerms, Money, MovementLine, Order, OrderChange,
-    OrderChangeKind, OrderCondition, OrderLinkKind, OrderOrigin, OrderState, OrderType,
-    PersonRoles, Placement, PlacementChange, PlacementChangeKind, PlacementEvent, PlacementState,
-    ProposeOrderRequest, RecordCheckRequest, RecordLocateRequest, RecordLocateUseRequest,
-    RecordOrderRequest, ReleaseOrderRequest, ReportChargeRequest, ReportExecutionRequest,
-    ReportPlacementRequest, RequestOrderChangeRequest, RequestPlacementChangeRequest,
-    SetTradingInstructionRequest, SetWorkingConditionRequest, SetterLevel, SettlementBucket, Side,
-    StandingOrderCondition, TieOutReason, TimeInForce, TradingInstruction,
-    TradingInstructionTarget, TradingInstructionValue, UnplacedFact, UnplacedReason, VenueActor,
+    accept_execution_request, actor, change_request, unplaced_fact, AcceptExecutionRequest,
+    AcknowledgeFlagRequest, Actor, ApprovalDecision, ChangeRequest, ChangeRequestOutcome, Charge,
+    Check, CheckVerdict, Claimant, CreatePlacementRequest, DecideApprovalRequest, DkReason,
+    DontKnowExecutionRequest, Execution, ExecutionKind, ExecutionState, HoldingSide, LocateUseKind,
+    LotReliefMethod, LotSource, LotTerms, Money, MovementLine, Order, OrderChange, OrderChangeKind,
+    OrderCondition, OrderLinkKind, OrderOrigin, OrderState, OrderType, PersonRoles, Placement,
+    PlacementChange, PlacementChangeKind, PlacementEvent, PlacementState, ProposeOrderRequest,
+    RecordCheckRequest, RecordLocateRequest, RecordLocateUseRequest, RecordOrderRequest,
+    ReleaseOrderRequest, ReportChargeRequest, ReportExecutionRequest, ReportPlacementRequest,
+    RequestOrderChangeRequest, RequestPlacementChangeRequest, SetTradingInstructionRequest,
+    SetWorkingConditionRequest, SetterLevel, SettlementBucket, Side, StandingOrderCondition,
+    TieOutReason, TimeInForce, TradingInstruction, TradingInstructionTarget,
+    TradingInstructionValue, UnplacedFact, UnplacedReason, VenueActor,
 };
 use meridian_pb::v1::RefusalReason;
 
@@ -42,7 +43,7 @@ use crate::journal::Body;
 use crate::numbers;
 use crate::orders::{self, key_of, Act, OrderHeld};
 use crate::store::{is_account, Result, StoreError};
-use crate::transitions::{From, To, Transition, TRANSITIONS};
+use crate::transitions::{From, To, Transition, EXECUTION_TRANSITIONS, TRANSITIONS};
 
 // ── The table (decisions/035) ───────────────────────────────────────────────
 
@@ -2084,12 +2085,24 @@ fn reversal_lines(book: &Book, superseded: &str) -> Result<Vec<MovementLine>> {
     if held.superseded_by.is_some() {
         return Ok(Vec::new());
     }
-    let Some(entry) = book.entry(&held.entry_id) else {
+    // An accepted execution moved its position by the accept's entry, its
+    // own lines alone of the several the accept may have moved (W11.23).
+    let (entry_id, range) = match &held.accepted_lines {
+        Some((entry_id, start, count)) => (entry_id, Some((*start, *count))),
+        None => (&held.entry_id, None),
+    };
+    let Some(entry) = book.entry(entry_id) else {
         return Ok(Vec::new());
     };
-    Ok(entry
-        .body
-        .lines
+    let lines: &[MovementLine] = match range {
+        Some((start, count)) => entry
+            .body
+            .lines
+            .get(start..start + count)
+            .unwrap_or_default(),
+        None => &entry.body.lines,
+    };
+    Ok(lines
         .iter()
         .map(|line| {
             let mut negated = line.clone();
@@ -2213,22 +2226,99 @@ pub fn report_execution(
                 )
             }
         }
+    } else if !entered {
+        // A venue's fill on no order and no placement (contract v23).
+        return report_unmatched(book, head, ctx, request, bust);
     } else {
         return Err(malformed(
             &["placement_id"],
-            "an execution names its placement, or, done away, its order",
+            "an entered execution names its placement, or, done away, its order",
         ));
     };
     let order = held(book, &order_id)?;
     let sender = ctx.instance_id.clone();
     let mut execution = Execution {
-        execution_id: ctx.mint(ids::EXECUTION),
         order_id: order_id.clone(),
         placement_id: placement_id.clone(),
-        account_id: book.account_id.clone(),
         instrument_id: order.order.instrument_id.clone(),
         sleeve: order.order.sleeve.clone(),
         side: order.order.side,
+        ..execution_of(book, ctx, request, entered)
+    };
+    // A repeat of a fact already applied, by the venue's identifiers, is
+    // recognised and answered as it stands (requirement 14).
+    if !execution.venue_execution_id.is_empty() {
+        let seen = orders::venue_key(&sender, &execution);
+        if let Some(earlier) = book.ledger.venue_facts.get(&seen) {
+            let held = &book.ledger.executions[earlier];
+            execution = held.execution.clone();
+            return Err(StoreError::Repeated(repeated_fact(book, &execution)?));
+        }
+    }
+    let from = state_of(book, &order_id)?;
+    let mut lines = Vec::new();
+    if !execution.supersedes.is_empty() {
+        lines.extend(reversal_lines(book, &execution.supersedes)?);
+    }
+    if !bust && orders::moves_position(&execution) {
+        let own = trade_lines(book, ctx, &order_id, &execution, &lines)?;
+        lines.extend(own);
+    }
+    let mut acts = vec![Act::Executed {
+        execution: execution.clone(),
+        sender: sender.clone(),
+        venue_account_code: request.venue_account_code.clone(),
+        venue_client_order_id: request.venue_client_order_id.clone(),
+    }];
+    // A fill after the order ended: accepted, recorded, late fact (row 12).
+    if ended(from) {
+        acts.push(condition(
+            &order_id,
+            true,
+            StandingOrderCondition {
+                condition: OrderCondition::LateFact as i32,
+                reason: format!(
+                    "execution {} arrived after the order was {}",
+                    execution.execution_id,
+                    state_named(from)
+                ),
+                actor: Some(fact_actor(ctx)),
+                ..Default::default()
+            },
+        ));
+    }
+    acts.extend(claimed_unplaced(book, &sender, &execution));
+    let mut plan =
+        Plan::new("execution-recorded", fact_actor(ctx), acts).key(&request.idempotency_key);
+    plan.lines = lines;
+    plan.effective_date = if !request.effective_date.is_empty() {
+        request.effective_date.clone()
+    } else {
+        request.trade_date.clone()
+    };
+    let made = finish(book, head, ctx, plan)?;
+    fact_reached(
+        &made,
+        &order_id,
+        &["10", "11", "12", "13", "17", "27", "28", "29", "30", "31"],
+        from,
+    );
+    Ok(made)
+}
+
+/// An execution as the request reports it, minted, on no order or placement
+/// yet: the caller places it.
+fn execution_of(
+    book: &Book,
+    ctx: &Context,
+    request: &ReportExecutionRequest,
+    entered: bool,
+) -> Execution {
+    Execution {
+        execution_id: ctx.mint(ids::EXECUTION),
+        account_id: book.account_id.clone(),
+        instrument_id: request.instrument_id.clone(),
+        side: request.side,
         quantity: request.quantity,
         price: request.price.clone(),
         trade_time_ns: request.trade_time_ns,
@@ -2258,75 +2348,195 @@ pub fn report_execution(
         counterparty: request.counterparty.clone(),
         liquidity_indicator: request.liquidity_indicator,
         uti_generated_by: request.uti_generated_by.clone(),
+        // The venue's order ID as the venue states it (contract v23).
+        venue_order_id: request.venue_order_id.clone(),
         ..Default::default()
+    }
+}
+
+/// A later record claiming an unplaced fact of the same venue execution.
+fn claimed_unplaced(book: &Book, sender: &str, execution: &Execution) -> Option<Act> {
+    if execution.venue_execution_id.is_empty() {
+        return None;
+    }
+    book.ledger
+        .unplaced_executions
+        .get(&key_of(&[sender, &execution.venue_execution_id]))
+        .map(|unplaced_id| Act::Placed {
+            unplaced_id: unplaced_id.clone(),
+        })
+}
+
+/// A row of the execution's transitions (matrix/transitions.tsv's e-rows),
+/// by its key.
+pub fn execution_row(id: &str) -> &'static Transition<ExecutionState> {
+    EXECUTION_TRANSITIONS
+        .iter()
+        .find(|row| row.row == id)
+        .unwrap_or_else(|| panic!("the transition table names no execution row {id}"))
+}
+
+/// Whether an execution's row starts from `from` (None: one being recorded).
+pub fn execution_starts_from(
+    row: &Transition<ExecutionState>,
+    from: Option<ExecutionState>,
+) -> bool {
+    row.from.iter().any(|held| match held {
+        From::Any => true,
+        From::None => from.is_none(),
+        From::State(state) => Some(*state) == from,
+    })
+}
+
+/// Whether an execution's row takes `from` to `to`.
+pub fn execution_admits(
+    row: &Transition<ExecutionState>,
+    from: Option<ExecutionState>,
+    to: ExecutionState,
+) -> bool {
+    execution_starts_from(row, from)
+        && row.to.iter().any(|held| match held {
+            To::Unchanged => Some(to) == from,
+            To::State(state) => *state == to,
+        })
+}
+
+pub fn execution_state_named(state: ExecutionState) -> &'static str {
+    match state {
+        ExecutionState::Unmatched => "unmatched",
+        ExecutionState::Matched => "matched",
+        ExecutionState::DontKnow => "answered DK",
+        ExecutionState::Unspecified => "unknown to the book",
+    }
+}
+
+/// A venue's fact on an execution held to its rows, logged where it does not
+/// fit and never refused for it (requirement 12).
+fn execution_fact_reached(
+    made: &Made,
+    execution_id: &str,
+    rows: &[&str],
+    from: Option<ExecutionState>,
+) {
+    let Some(to) = made
+        .book
+        .ledger
+        .executions
+        .get(execution_id)
+        .and_then(|held| ExecutionState::try_from(held.execution.state).ok())
+    else {
+        return;
     };
-    // A repeat of a fact already applied, by the venue's identifiers, is
-    // recognised and answered as it stands (requirement 14).
+    if rows
+        .iter()
+        .any(|id| execution_admits(execution_row(id), from, to))
+    {
+        return;
+    }
+    tracing::warn!(
+        execution_id,
+        to = execution_state_named(to),
+        rows = rows.join(","),
+        "a venue's fact took an execution where the table does not; recorded, never refused"
+    );
+}
+
+/// W11.11 from contract v23 (rulings 1, 8, 9, 18): a venue's fill on no
+/// order and no placement, its account stamped from the `ems`'s map,
+/// recorded as an unmatched execution moving nothing (transition e2) until
+/// an `ems` accepts it (W11.23) or answers it DK (W11.24). It names its
+/// instrument, its side and the venue's order ID, each refused
+/// INVALID_ARGUMENT by name when missing; a bust takes them from the fill it
+/// busts. A correction of an unmatched fill supersedes it and is unmatched
+/// in its place (e5); a bust supersedes it, which stays unmatched with
+/// nothing to answer (e6). One superseding a fill on a placement names that
+/// placement, as in v22.
+fn report_unmatched(
+    book: &Book,
+    head: u64,
+    ctx: &Context,
+    request: &ReportExecutionRequest,
+    bust: bool,
+) -> Result<Made> {
+    let superseded = (!request.supersedes.is_empty())
+        .then(|| book.ledger.executions.get(&request.supersedes))
+        .flatten();
+    if superseded.is_some_and(|held| held.execution.state == ExecutionState::Matched as i32) {
+        return Err(malformed(
+            &["placement_id"],
+            format!(
+                "execution {} is on a placement: a bust or correction of it names that placement",
+                request.supersedes
+            ),
+        ));
+    }
+    let sender = ctx.instance_id.clone();
+    let mut execution = execution_of(book, ctx, request, false);
+    if bust {
+        if let Some(held) = superseded {
+            if execution.instrument_id.is_empty() {
+                execution.instrument_id = held.execution.instrument_id.clone();
+            }
+            if execution.side == Side::Unspecified as i32 {
+                execution.side = held.execution.side;
+            }
+            if execution.venue_order_id.is_empty() {
+                execution.venue_order_id = held.execution.venue_order_id.clone();
+            }
+        }
+    }
+    let mut missing = Vec::new();
+    if execution.instrument_id.is_empty() {
+        missing.push("instrument_id");
+    }
+    if execution.side == Side::Unspecified as i32 || Side::try_from(execution.side).is_err() {
+        missing.push("side");
+    }
+    if execution.venue_order_id.is_empty() {
+        missing.push("venue_order_id");
+    }
+    if !missing.is_empty() {
+        return Err(malformed(
+            &missing,
+            format!(
+                "a fill on no placement names its instrument, its side and the venue's order ID \
+                 (contract v23); this left out {}",
+                missing.join(", ")
+            ),
+        ));
+    }
     if !execution.venue_execution_id.is_empty() {
         let seen = orders::venue_key(&sender, &execution);
         if let Some(earlier) = book.ledger.venue_facts.get(&seen) {
-            let held = &book.ledger.executions[earlier];
-            execution = held.execution.clone();
-            return Err(StoreError::Repeated(repeated_fact(book, &execution)?));
+            let held = book.ledger.executions[earlier].execution.clone();
+            return Err(StoreError::Repeated(repeated_fact(book, &held)?));
         }
     }
-    let from = state_of(book, &order_id)?;
-    let mut lines = Vec::new();
-    if !execution.supersedes.is_empty() {
-        lines.extend(reversal_lines(book, &execution.supersedes)?);
-    }
-    if !bust && orders::moves_position(&execution) {
-        let own = trade_lines(book, ctx, &order_id, &execution, &lines)?;
-        lines.extend(own);
-    }
+    let from = superseded.and_then(|held| ExecutionState::try_from(held.execution.state).ok());
+    let execution_id = execution.execution_id.clone();
     let mut acts = vec![Act::Executed {
         execution: execution.clone(),
         sender: sender.clone(),
+        venue_account_code: request.venue_account_code.clone(),
+        venue_client_order_id: request.venue_client_order_id.clone(),
     }];
-    // A fill after the order ended: accepted, recorded, late fact (row 12).
-    if ended(from) {
-        acts.push(condition(
-            &order_id,
-            true,
-            StandingOrderCondition {
-                condition: OrderCondition::LateFact as i32,
-                reason: format!(
-                    "execution {} arrived after the order was {}",
-                    execution.execution_id,
-                    state_named(from)
-                ),
-                actor: Some(fact_actor(ctx)),
-                ..Default::default()
-            },
-        ));
-    }
-    // A later record claims an unplaced fact of the same venue execution.
-    if !execution.venue_execution_id.is_empty() {
-        if let Some(unplaced_id) = book
-            .ledger
-            .unplaced_executions
-            .get(&key_of(&[&sender, &execution.venue_execution_id]))
-        {
-            acts.push(Act::Placed {
-                unplaced_id: unplaced_id.clone(),
-            });
-        }
-    }
+    acts.extend(claimed_unplaced(book, &sender, &execution));
     let mut plan =
         Plan::new("execution-recorded", fact_actor(ctx), acts).key(&request.idempotency_key);
-    plan.lines = lines;
     plan.effective_date = if !request.effective_date.is_empty() {
         request.effective_date.clone()
     } else {
         request.trade_date.clone()
     };
     let made = finish(book, head, ctx, plan)?;
-    fact_reached(
-        &made,
-        &order_id,
-        &["10", "11", "12", "13", "17", "27", "28", "29", "30", "31"],
-        from,
-    );
+    match from {
+        None => execution_fact_reached(&made, &execution_id, &["e2"], None),
+        Some(_) => {
+            let superseded_id = request.supersedes.as_str();
+            let rows: &[&str] = if bust { &["e6", "e7"] } else { &["e5", "e7"] };
+            execution_fact_reached(&made, superseded_id, rows, from);
+        }
+    }
     Ok(made)
 }
 
@@ -2844,6 +3054,436 @@ pub fn record_locate_use(
     )
     .key(&request.idempotency_key);
     finish(book, head, ctx, plan)
+}
+
+// ── W11.23, W11.24: the `ems` answers an unmatched execution ───────────────
+
+/// The executions an accept or a DK names, each held in this account's book,
+/// within the write scope the command was sent with: 1 to 500, each once.
+/// One the book holds in another account is REFUSAL_REASON_EXECUTIONS_DIFFER
+/// on an accept (one account per accept), and named as not held otherwise.
+fn executions_named<'a>(
+    book: &'a Book,
+    ctx: &Context,
+    ids: &[String],
+    bound: meridian_pb::bounds::Count,
+    elsewhere: &dyn Fn(&str) -> Option<String>,
+    differ: bool,
+) -> Result<Vec<&'a orders::ExecutionHeld>> {
+    if ids.len() < bound.least || ids.len() > bound.most {
+        return Err(malformed(
+            &["execution_ids"],
+            format!(
+                "names {} executions; it names {} to {}",
+                ids.len(),
+                bound.least,
+                bound.most
+            ),
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    let mut held = Vec::new();
+    for (index, id) in ids.iter().enumerate() {
+        if !seen.insert(id.as_str()) {
+            return Err(malformed(
+                &[&format!("execution_ids[{index}]")],
+                format!("names execution {id} twice"),
+            ));
+        }
+        match book.ledger.executions.get(id) {
+            Some(found) => held.push(found),
+            None => {
+                if let Some(account) = elsewhere(id) {
+                    if differ {
+                        return Err(StoreError::refused(
+                            RefusalReason::ExecutionsDiffer,
+                            format!(
+                                "execution {id} is in account {account} and {} is in {}: one \
+                                 accept answers the executions of one account, instrument and \
+                                 side",
+                                ids[0], book.account_id
+                            ),
+                        ));
+                    }
+                    return Err(StoreError::Invalid(format!(
+                        "execution {id} is in account {account}, not {}: one command answers \
+                         the executions of one account",
+                        book.account_id
+                    )));
+                }
+                return Err(StoreError::Invalid(format!(
+                    "the book holds no execution {id}"
+                )));
+            }
+        }
+    }
+    in_scope(ctx, &book.account_id)?;
+    Ok(held)
+}
+
+/// An execution held to the row an answer takes it by: unmatched and still
+/// waiting, never superseded by a bust or a correction, nor a bust itself
+/// (transitions e3 to e6; the four points' (c)).
+fn answerable(held: &orders::ExecutionHeld, row_id: &str, what: &str) -> Result<()> {
+    let row = execution_row(row_id);
+    let state =
+        ExecutionState::try_from(held.execution.state).unwrap_or(ExecutionState::Unspecified);
+    let id = &held.execution.execution_id;
+    let why = if !execution_starts_from(row, Some(state)) {
+        format!("it is {}", execution_state_named(state))
+    } else if let Some(by) = &held.superseded_by {
+        format!("execution {by} supersedes it")
+    } else if held.is_bust() {
+        "it is a bust, with nothing to answer".to_string()
+    } else {
+        return Ok(());
+    };
+    Err(StoreError::refused(
+        RefusalReason::ExecutionState,
+        format!(
+            "{what} of execution {id} is refused: {why} (the transition table's row {}: {})",
+            row.row, row.cause
+        ),
+    ))
+}
+
+/// A fill's side as an order's: a buy matches a buy, and any sell the
+/// order's sell, the venue's marking kept on the execution (ruling 10).
+fn sells(side: i32) -> bool {
+    matches!(
+        Side::try_from(side),
+        Ok(Side::Sell | Side::SellShort | Side::SellShortExempt)
+    )
+}
+
+fn same_side(a: i32, b: i32) -> bool {
+    a == b || (sells(a) && sells(b))
+}
+
+fn differ(words: String) -> StoreError {
+    StoreError::refused(RefusalReason::ExecutionsDiffer, words)
+}
+
+/// W11.23 (contract v23; rulings 4, 6, 10 to 14): an `ems` accepts 1 to 500
+/// unmatched executions of one account, instrument and side, for a person or
+/// its service account, to an existing order it may place against --
+/// released, working or filled, never ended -- or to a new order made from
+/// them, filled and never gated (ORDER_ORIGIN_ACCEPTED_EXECUTION, market and
+/// day). The book creates the accepting `ems`'s placement at filled, routed
+/// at 0, naming the connectivity plugin that reported the fills, and links
+/// the executions to it, each matched (transition e3); the trade-date
+/// position moves as of the fills' trade date, by this entry.
+pub fn accept_execution(
+    book: &Book,
+    head: u64,
+    ctx: &Context,
+    request: &AcceptExecutionRequest,
+    elsewhere: &dyn Fn(&str) -> Option<String>,
+) -> Result<Made> {
+    let named = executions_named(
+        book,
+        ctx,
+        &request.execution_ids,
+        meridian_pb::bounds::ACCEPT_EXECUTION_REQUEST_EXECUTION_IDS_COUNT,
+        elsewhere,
+        true,
+    )?;
+    user_required(ctx, "accepting an execution")?;
+    for held in &named {
+        answerable(held, "e3", "an accept")?;
+    }
+    let first = named[0];
+    for held in &named[1..] {
+        let (a, b) = (&first.execution, &held.execution);
+        if a.instrument_id != b.instrument_id {
+            return Err(differ(format!(
+                "execution {} is of {} and {} of {}: one accept answers the executions of one \
+                 account, instrument and side",
+                a.execution_id, a.instrument_id, b.execution_id, b.instrument_id
+            )));
+        }
+        if !same_side(a.side, b.side) {
+            return Err(differ(format!(
+                "executions {} and {} are on opposite sides: one accept answers the executions \
+                 of one account, instrument and side",
+                a.execution_id, b.execution_id
+            )));
+        }
+        if held.sender != first.sender {
+            return Err(differ(format!(
+                "execution {} was reported by {} and {} by {}: the placement an accept creates \
+                 names the one connectivity plugin that reported its fills",
+                a.execution_id, first.sender, b.execution_id, held.sender
+            )));
+        }
+    }
+    // The accepted quantity, in shares, and in the order's terms below.
+    let mut accepted = Exact::ZERO;
+    for held in &named {
+        let quantity = numbers::required("quantity", held.execution.quantity.as_ref())?;
+        accepted = numbers::add("accepted quantity", accepted, quantity)?;
+    }
+    let mut acts = Vec::new();
+    let order_id = match request.matched_order.as_ref() {
+        None => {
+            return Err(malformed(
+                &["matched_order"],
+                "an accept names an existing order (matched_order.order_id) or asks for a new \
+                 one (matched_order.new_order)",
+            ))
+        }
+        Some(accept_execution_request::MatchedOrder::OrderId(order_id)) => {
+            if order_id.is_empty() {
+                return Err(malformed(
+                    &["matched_order.order_id"],
+                    "an accept to an existing order names it",
+                ));
+            }
+            let order = book.ledger.orders.get(order_id).ok_or_else(|| {
+                StoreError::Invalid(format!(
+                    "account {} holds no order {order_id}",
+                    book.account_id
+                ))
+            })?;
+            let state = state_of(book, order_id)?;
+            if !matches!(
+                state,
+                OrderState::Released | OrderState::Working | OrderState::Filled
+            ) {
+                return Err(StoreError::refused(
+                    RefusalReason::OrderState,
+                    format!(
+                        "an accept to order {order_id} is refused: it is {}, and an execution \
+                         is accepted to an order released, working or filled, never ended or \
+                         still proposed (the transition table's row e3)",
+                        state_named(state)
+                    ),
+                ));
+            }
+            if order.order.instrument_id != first.execution.instrument_id {
+                return Err(differ(format!(
+                    "order {order_id} is of {} and the executions of {}",
+                    order.order.instrument_id, first.execution.instrument_id
+                )));
+            }
+            if !same_side(order.order.side, first.execution.side) {
+                return Err(differ(format!(
+                    "order {order_id} is on the other side of the executions: a buy fill \
+                     matches a buy order, and any sell the order's sell"
+                )));
+            }
+            let ordered = book.ledger.ordered(order);
+            let (filled, _, _) = book.ledger.filled(order_id)?;
+            let mut counted = Exact::ZERO;
+            for held in &named {
+                counted = numbers::add(
+                    "accepted",
+                    counted,
+                    book.ledger.counted(Some(order), &held.execution)?,
+                )?;
+            }
+            let after = numbers::add("filled", filled, counted)?;
+            if after > ordered {
+                return Err(StoreError::refused(
+                    RefusalReason::QuantityExceedsOrder,
+                    format!(
+                        "an accept of {counted} to order {order_id} is refused: it is filled \
+                         {filled} of {ordered} ordered, and the accept would take it to \
+                         {after}; accept to a new order instead, or have portfolio change the \
+                         ordered quantity first"
+                    ),
+                ));
+            }
+            order_id.clone()
+        }
+        Some(accept_execution_request::MatchedOrder::NewOrder(new_order)) => {
+            let order = Order {
+                order_id: ctx.mint(ids::ORDER),
+                account_id: book.account_id.clone(),
+                instrument_id: first.execution.instrument_id.clone(),
+                sleeve: new_order.sleeve.clone(),
+                side: first.execution.side,
+                quantity: numbers::wire(accepted),
+                order_type: OrderType::Market as i32,
+                time_in_force: TimeInForce::Day as i32,
+                origin: OrderOrigin::AcceptedExecution as i32,
+                venue_order_id: first.execution.venue_order_id.clone(),
+                person_roles: Some(PersonRoles {
+                    entered_by: Some(ctx.actor()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let order_id = order.order_id.clone();
+            acts.push(Act::Opened {
+                order,
+                released: true,
+            });
+            order_id
+        }
+    };
+    let sleeve = match request.matched_order.as_ref() {
+        Some(accept_execution_request::MatchedOrder::NewOrder(new_order)) => {
+            new_order.sleeve.clone()
+        }
+        _ => book.ledger.orders[&order_id].order.sleeve.clone(),
+    };
+    let time_in_force = match request.matched_order.as_ref() {
+        Some(accept_execution_request::MatchedOrder::NewOrder(_)) => TimeInForce::Day as i32,
+        _ => book.ledger.orders[&order_id].order.time_in_force,
+    };
+    let mut venue_order_ids: Vec<String> = Vec::new();
+    for held in &named {
+        let id = &held.execution.venue_order_id;
+        if !id.is_empty() && !venue_order_ids.contains(id) {
+            venue_order_ids.push(id.clone());
+        }
+    }
+    let placement = Placement {
+        placement_id: ctx.mint(ids::PLACEMENT),
+        order_id: order_id.clone(),
+        account_id: book.account_id.clone(),
+        ems_instance_id: ctx.instance_id.clone(),
+        connectivity_instance_id: first.sender.clone(),
+        venue_account_code: first.venue_account_code.clone(),
+        quantity: numbers::wire(accepted),
+        time_in_force,
+        destination: first.execution.venue_id.clone(),
+        venue_order_id: first.execution.venue_order_id.clone(),
+        venue_order_ids,
+        // routed_at_ns stays 0: the platform never routed it (ruling 12).
+        person_roles: Some(PersonRoles {
+            executed_by: Some(ctx.actor()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let placement_id = placement.placement_id.clone();
+    acts.push(Act::PlacementOpened { placement });
+    // Each fill's lines, as of its trade date, on the order's sleeve.
+    let mut lines: Vec<MovementLine> = Vec::new();
+    let mut line_counts = Vec::new();
+    let mut trade_dates = BTreeSet::new();
+    for held in &named {
+        let mut execution = held.execution.clone();
+        execution.order_id = order_id.clone();
+        execution.placement_id = placement_id.clone();
+        execution.sleeve = sleeve.clone();
+        trade_dates.insert(execution.trade_date.clone());
+        let own = if orders::moves_position(&execution) {
+            trade_lines(book, ctx, &order_id, &execution, &lines)?
+        } else {
+            Vec::new()
+        };
+        line_counts.push(own.len());
+        lines.extend(own);
+    }
+    acts.push(Act::Accepted {
+        execution_ids: named
+            .iter()
+            .map(|held| held.execution.execution_id.clone())
+            .collect(),
+        order_id: order_id.clone(),
+        placement_id,
+        line_counts,
+    });
+    let mut plan = Plan::new("execution-accepted", ctx.actor(), acts).reason(&request.note);
+    plan.lines = lines;
+    // As of the fills' trade date (ruling 13); an accept of fills of more
+    // than one trade date is journalled at the first of them.
+    plan.effective_date = trade_dates
+        .into_iter()
+        .find(|date| !date.is_empty())
+        .unwrap_or_default();
+    let made = finish(book, head, ctx, plan)?;
+    for id in &request.execution_ids {
+        let to = made
+            .book
+            .ledger
+            .executions
+            .get(id)
+            .and_then(|held| ExecutionState::try_from(held.execution.state).ok())
+            .unwrap_or(ExecutionState::Unspecified);
+        if !execution_admits(execution_row("e3"), Some(ExecutionState::Unmatched), to) {
+            return Err(StoreError::Unavailable(format!(
+                "an accept left execution {id} {}, which the table's row e3 does not reach",
+                execution_state_named(to)
+            )));
+        }
+    }
+    Ok(made)
+}
+
+/// W11.24 (contract v23; rulings 3, 5, 6, 10): an `ems` answers 1 to 500
+/// unmatched executions don't know, for a person or its service account,
+/// with a reason from the closed list mirroring FIX's DKReason (127) and
+/// text, required with DK_REASON_OTHER. Each is closed at DK, moving no
+/// position (transition e4); the connectivity plugin that reported it hears
+/// it, and a later fill for the same venue order arrives unmatched on its
+/// own (e7).
+pub fn dont_know_execution(
+    book: &Book,
+    head: u64,
+    ctx: &Context,
+    request: &DontKnowExecutionRequest,
+    elsewhere: &dyn Fn(&str) -> Option<String>,
+) -> Result<Made> {
+    let named = executions_named(
+        book,
+        ctx,
+        &request.execution_ids,
+        meridian_pb::bounds::DONT_KNOW_EXECUTION_REQUEST_EXECUTION_IDS_COUNT,
+        elsewhere,
+        false,
+    )?;
+    let reason = DkReason::try_from(request.reason).unwrap_or(DkReason::Unspecified);
+    if reason == DkReason::Unspecified {
+        return Err(malformed(
+            &["reason"],
+            "a DK says why, by a reason from the closed list",
+        ));
+    }
+    if reason == DkReason::Other && request.text.trim().is_empty() {
+        return Err(malformed(
+            &["text"],
+            "a DK whose reason is other says why in its text, as FIX requires Text (58) when \
+             DKReason is Other",
+        ));
+    }
+    user_required(ctx, "answering an execution DK")?;
+    for held in &named {
+        answerable(held, "e4", "a DK")?;
+    }
+    let plan = Plan::new(
+        "execution-dont-know",
+        ctx.actor(),
+        vec![Act::DontKnow {
+            execution_ids: named
+                .iter()
+                .map(|held| held.execution.execution_id.clone())
+                .collect(),
+            reason: reason as i32,
+            text: request.text.clone(),
+        }],
+    )
+    .reason(&request.text);
+    let made = finish(book, head, ctx, plan)?;
+    for id in &request.execution_ids {
+        let to = made
+            .book
+            .ledger
+            .executions
+            .get(id)
+            .and_then(|held| ExecutionState::try_from(held.execution.state).ok())
+            .unwrap_or(ExecutionState::Unspecified);
+        if !execution_admits(execution_row("e4"), Some(ExecutionState::Unmatched), to) {
+            return Err(StoreError::Unavailable(format!(
+                "a DK left execution {id} {}, which the table's row e4 does not reach",
+                execution_state_named(to)
+            )));
+        }
+    }
+    Ok(made)
 }
 
 /// What an order type is called, for words.
