@@ -34,8 +34,12 @@ stop cancels each placement it is working at once, reporting each cancel as a
 fact naming the stop's entry (W11.9; v21's Q17), then the venue's
 confirmation. It serves:
 
-  /resolve?symbol=S               resolves its symbol (W3.1), minting the
-                                  deployment's record, answering its ID;
+  /resolve?symbol=S[&figi=F]      resolves its symbol, with the FIGI beside it
+                                  where given (W3.1), minting the deployment's
+                                  record, answering its ID;
+  /settle?instrument=&trade=      asks the date read for the instrument's
+                                  settlement date from a trade date (W3.20),
+                                  answering the date, outcome and rule;
   /heard                          the placements heard, by ID, and what it did;
   /astray?code=                   an execution naming a placement nobody
                                   holds, for the book to keep unplaced.
@@ -378,9 +382,19 @@ class Venue(Plugin):
         if path == "/resolve":
             # The venue's symbol, resolved at the edge by the fact's date
             # (W3.1, granted to connectivity in v22), minting the record.
-            found = await self.call("ResolveIdentifier", ops.ResolveIdentifierParams(
-                identifiers=[ops.Identifier(scheme="symbol", value=one(query, "symbol"), source="sim")]))
+            identifiers = [ops.Identifier(scheme="symbol", value=one(query, "symbol"), source="sim")]
+            if one(query, "figi"):
+                identifiers.append(ops.Identifier(scheme="figi", value=one(query, "figi")))
+            found = await self.call("ResolveIdentifier",
+                                    ops.ResolveIdentifierParams(identifiers=identifiers))
             return {"instrument_id": found.instrument_id}
+        if path == "/settle":
+            answered = await self.call("ComputeDate", ops.ComputeDateParams(
+                settlement=ops.SettlementDateInputs(instrument_id=one(query, "instrument"),
+                                                    trade_date=one(query, "trade"))))
+            rule = answered.basis.rule
+            return {"date": answered.date, "outcome": ops.DateOutcome.Name(answered.outcome),
+                    "rule": f"{rule.subject} v{rule.version}" if rule.subject else ""}
         if path == "/heard":
             return {"heard": self.heard, "halted": self.halted, "working": sorted(self.worked)}
         if path == "/astray":

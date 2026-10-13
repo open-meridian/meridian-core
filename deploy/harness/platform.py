@@ -18,7 +18,18 @@ rule -- and on a refresh only versions after `after_version`: the US dollar's
 funds settlement-date rule, T+2 from 5 September 2017 and T+1 from 28 May
 2024. Seed data for tests, covering 2026 and 2027, each day citing its
 public primary source; nothing here is a deployment's claim about any
-market."""
+market.
+
+From contract v22 it also serves the two US equity venues its trading
+calendar names, XNYS and XNAS, each in the shape of the platform's venue
+master record (W1.16, W3.14: its MIC under `iso10383` from its creation
+date, the vendor's code beside it, country US, New York's zone), pulled by
+its MIC (W3.15); and a test equity, answered by its FIGI with its listing
+venue, XNAS (Apple Inc. lists on Nasdaq), and that venue (W3.3), so a
+deployment's record minted for it and asked of the platform names a listing
+venue in the US, and a settlement date worked out for it is T+1 on the US
+securities settlement calendar."""
+import datetime
 import http.server
 import json
 import os
@@ -120,6 +131,49 @@ def us_equity(version, lag, effective):
 
 RULES = [us_equity(1, 2, "2017-09-05"), us_equity(2, 1, "2024-05-28")]
 
+# Contract v22: the US equity venues, each as the platform's venue master
+# keeps it (meridian-platform's venue_records: the ISO 10383 row's name and
+# country, the curated kind and zone, the MIC from its creation date, and the
+# vendor's code its venue-codes list holds).
+def created(date):
+    """Midnight UTC of an ISO date, in nanoseconds."""
+    day = datetime.datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=datetime.timezone.utc)
+    return int(day.timestamp()) * 1_000_000_000
+
+
+def venue(venue_id, mic, name, since, alpaca):
+    return {
+        "venue_id": venue_id, "name": name, "country_code": "US", "kind": "VENUE_KIND_EXCHANGE",
+        "identifiers": [
+            {"scheme": "iso10383", "value": mic, "source": "", "valid_from_ns": created(since),
+             "valid_until_ns": 0},
+            {"scheme": "symbol", "value": alpaca, "source": "alpaca", "valid_from_ns": created(since),
+             "valid_until_ns": 0},
+        ],
+        "operating_venue_id": "", "time_zone": "America/New_York", "version": 1,
+        "valid_from_ns": created(since), "record_time_ns": READ_AT,
+        "lifecycle_state": "INSTRUMENT_LIFECYCLE_STATE_ACTIVE",
+    }
+
+
+XNYS = venue("VEN-01JAE0000000000000000XNYS", "XNYS", "NEW YORK STOCK EXCHANGE, INC.", "2005-05-23", "N")
+XNAS = venue("VEN-01JAE0000000000000000XNAS", "XNAS", "NASDAQ - ALL MARKETS", "2005-06-27", "Q")
+VENUES = {"XNYS": XNYS, "XNAS": XNAS}
+
+# A test equity, by its FIGI: Apple Inc., listed on Nasdaq (XNAS).
+EQUITIES = {
+    "BBG000B9XRY4": {
+        "instrument_id": "INS-01JAAPL0000000000000000001",
+        "identifiers": [{"scheme": "figi", "value": "BBG000B9XRY4", "source": ""}],
+        "asset_class": "ASSET_CLASS_EQUITY",
+        "currency": "USD",
+        "description": "Apple Inc.",
+        "listing_venue_id": XNAS["venue_id"],
+        "lifecycle_state": "INSTRUMENT_LIFECYCLE_STATE_ACTIVE",
+        "version": 1,
+    },
+}
+
 
 def calendars_for(one, many):
     """The seed answer to a pull by its one subject; versions after
@@ -158,6 +212,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 and one("scheme") == "iso4217" and code in NAMES):
             time.sleep(SLOW.get(code, 0))
             body = json.dumps({"found": True, "instrument": record(code), "venues": []}).encode()
+            self.send_response(200)
+        elif (url.path == "/api/v1/reference/identifiers/resolve"
+                and one("scheme") == "iso10383" and code in VENUES):
+            # A venue by its MIC: the one venue, and no instrument (W3.15).
+            body = json.dumps({"found": True, "venues": [VENUES[code]]}).encode()
+            self.send_response(200)
+        elif (url.path == "/api/v1/reference/identifiers/resolve"
+                and one("scheme") == "figi" and one("value") in EQUITIES):
+            # The equity with the venue it is listed on (W3.3).
+            body = json.dumps({"found": True, "instrument": EQUITIES[one("value")],
+                               "venues": [XNAS]}).encode()
             self.send_response(200)
         else:
             body = json.dumps({"found": False}).encode()

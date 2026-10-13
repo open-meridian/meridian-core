@@ -11,7 +11,11 @@ that would break a plugin's e2e breaks core's gate first.
 **It is a development deployment, for a test, and never a way to run one.** It
 has a stand-in for the platform's master holding a handful of currencies
 (`platform.py`, contract v20): a currency is pulled from it, never minted, and
-a slow or absent master mints nothing. Every other record is the deployment's
+a slow or absent master mints nothing. From contract v22 it also holds seed
+settlement calendars and the US equities rule, the XNYS and XNAS venue
+records, and one test equity, Apple Inc., answered by its FIGI with XNAS as
+its listing venue, so a record asked of it (`instrument --ask-platform`) can be given a
+settlement date. Every other record is the deployment's
 own (contract v10), so every other row a plugin records names a record the
 deployment minted, completed by the
 runner as a deployment admin does at the dashboard's Instruments page; its dashboard runs with `MERIDIAN_DEVELOPMENT`,

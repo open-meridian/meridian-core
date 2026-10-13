@@ -5,7 +5,10 @@ harness (contract v22, W11; plans/an-order-reaches-a-venue-through-the-book,
 no brokerage, no paper account, no trading API of any kind is reached.
 
 1. Set up: an account granted to the desk's ems, another granted to none of
-   the desk's roles, each role's grant, and the instrument completed.
+   the desk's roles, each role's grant, and the instrument completed, the
+   platform asked about it: listed on XNAS, its settlement date from Friday
+   9 October 2026 is Tuesday 13 October, T+1 past Columbus Day on the US
+   securities settlement calendar (W3.20).
 2. Waiting for compliance: a new account waits; a release stays proposed,
    awaiting check, until compliance answers, and is released by its verdict.
    The portfolio plugin's release is refused by its sidecar, naming no
@@ -153,10 +156,19 @@ def run():
     runner("grant", "--instance", "venue", "--level", "admin", "--role", "connectivity")
     runner("grant", "--instance", "venue", "--level", "admin", "--role", "connectivity",
            "--to", "ben")
-    aapl = page("venue", "write", "/resolve?symbol=AAPL")["instrument_id"]
+    aapl = page("venue", "write", "/resolve?symbol=AAPL&figi=BBG000B9XRY4")["instrument_id"]
     must(aapl, "step 1, AAPL resolved")
     runner("instrument", aapl, "asset_class=equity", "currency=USD", "source=e2e",
-           "description=Apple Inc.")
+           "description=Apple Inc.", "--ask-platform")
+    # The platform named its listing venue, XNAS in the US: a settlement date
+    # is worked out by the US equities rule, the rule and its calendar pulled
+    # on the first miss (W3.18) and the read asked again.
+    settled = until(90, lambda: (lambda said: said if said["outcome"] == "DATE_OUTCOME_COMPUTED"
+                                 else None)(
+        page("venue", "write", f"/settle?instrument={aapl}&trade=2026-10-09")),
+        "step 1, AAPL's settlement date computed")
+    must(settled["date"] == "2026-10-13" and settled["rule"] == "US/equity v2",
+         f"step 1, AAPL settles T+1 on Tuesday 13 October by US/equity v2: {settled}")
 
     # 2. Waiting for compliance (W11.6; step 5's Q5).
     first = page("pm", "write", f"/propose?account={account}&instrument={aapl}&quantity=10&key=o1")

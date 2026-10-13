@@ -112,12 +112,15 @@ the same image with the list on stdin:
       --expect, waits until it lists N.
 
   instrument (ID | --identifier TEXT) asset_class=CLASS currency=CODE
-             [description=TEXT] source=TEXT [note=TEXT] [--seconds N]
+             [description=TEXT] source=TEXT [note=TEXT] [--ask-platform] [--seconds N]
       Completes one record on its page, as the deployment admin does (W3.10):
       the record named by its ID, or the first listed whose identifiers say
       TEXT (`symbol: AAPL`), waiting for it to be listed. CLASS is one of
       equity, debt, fund, derivative, crypto_asset, event_contract, cash; each
       value goes with the source given, and the dashboard stamps the admin.
+      With --ask-platform, first asks the platform about it from its page
+      (W3.3), as the admin's button does, so what the platform answers -- a
+      listing venue, contract v18 -- is kept on it.
 
   mcp connect [--covers everything | --covers deployment_admin] [--covers INSTANCE[:ROLE]:LEVEL ...]
               [--client NAME] [--check-consent] [--consent-says TEXT ...]
@@ -935,6 +938,9 @@ def instruments(args):
 def instrument(args):
     by_identifier = option(args, "--identifier", None)
     seconds = number(args, "--seconds", 60)
+    ask_platform = "--ask-platform" in args
+    if ask_platform:
+        args.remove("--ask-platform")
     asked = dict(pairs(args))
     named = args.pop(0) if args else None
     if args or (named is None) == (by_identifier is None):
@@ -951,6 +957,15 @@ def instrument(args):
         raise Failed(f"no record listed is {named or by_identifier!r}")
 
     instrument_id = until(seconds, found, "the record was never listed")
+    if ask_platform:
+        shown = admin.get(f"/admin/instruments/{urllib.parse.quote(instrument_id)}")
+        if shown.status != 200:
+            raise Failed(f"{instrument_id}'s page: {shown.status} {sentence(shown)}")
+        answered = admin.post(f"/admin/instruments/{urllib.parse.quote(instrument_id)}/ask",
+                              {"form_token": form_token(shown)})
+        if answered.status != 200:
+            raise Failed(f"{instrument_id}: the platform was not asked: "
+                         f"{answered.status} {sentence(answered)}")
     page = admin.get(f"/admin/instruments/{urllib.parse.quote(instrument_id)}")
     version = re.search(r'name="against_version" value="(\d+)"', page.body)
     if page.status != 200 or version is None:
