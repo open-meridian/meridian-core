@@ -28,7 +28,7 @@ use meridian_domain::v1::{
     CalendarDayKind, CalendarRecord, CalendarSubject, ComputeDateReply, ComputeDateRequest,
     DateOutcome, DateRuleVersion, HeldCalendar, HeldDateRule, ListCalendarsReply,
     ListCalendarsRequest, MissingCalendarDetectedEvent, ReadCalendarReply, ReadCalendarRequest,
-    SettlementDateRule, SpotDateRule, TenorUnit, Weekday,
+    SettlementDateRule, SpotCountingMode, SpotDateRule, TenorUnit, Weekday,
 };
 use meridian_pb::v1::{CalendarRef, DateBasis, DateRuleKind, DateRuleRef};
 
@@ -457,7 +457,11 @@ fn trade_date_at(rule: &SpotDateRule, at_ns: i64) -> Result<Date, String> {
 }
 
 /// A pair's spot date from a trade date: counted by the lag on the counting
-/// calendars, then rolled forward to a day good on the spot calendars.
+/// calendars, then rolled forward to a day good on the spot calendars. From
+/// contract v23 the rule's counting mode says how the lag counts: jointly, a
+/// day counting only if good on every counting calendar (unspecified, v22's
+/// way), or each currency on its own calendars, the later of the two spots
+/// rolled forward to a day good on both and on the spot calendars.
 fn spot_from(
     held: &Held,
     rule: &SpotDateRule,
@@ -465,8 +469,11 @@ fn spot_from(
 ) -> Result<(Date, Vec<CalendarRef>), Stop> {
     let counting = Set::of(held, &rule.counting_calendars)?;
     let spot = Set::of(held, &rule.spot_calendars)?;
-    let counted = count_forward(&counting, trade, i64::from(rule.lag_days))?;
-    let date = step(&spot, counted, 1)?;
+    let lag = i64::from(rule.lag_days);
+    let date = match each_currency(rule, &counting, &spot, trade, lag)? {
+        Some(date) => date,
+        None => step(&spot, count_forward(&counting, trade, lag)?, 1)?,
+    };
     let mut refs = counting.refs();
     for held in spot.refs() {
         if !refs.contains(&held) {
@@ -474,6 +481,61 @@ fn spot_from(
         }
     }
     Ok((date, refs))
+}
+
+/// A cross's spot counted per currency (SPOT_COUNTING_MODE_EACH_CURRENCY):
+/// each currency's spot on the counting calendars that are its own, or name
+/// no currency, the later of them rolled forward to a day good on every
+/// counting and spot calendar. None for a rule counting jointly, or one whose
+/// counting calendars name neither currency, which counts jointly.
+fn each_currency(
+    rule: &SpotDateRule,
+    counting: &Set,
+    spot: &Set,
+    trade: Date,
+    lag: i64,
+) -> Result<Option<Date>, Stop> {
+    if rule.counting_mode != SpotCountingMode::EachCurrency as i32 {
+        return Ok(None);
+    }
+    let mut later: Option<Date> = None;
+    for currency in &rule.pair {
+        if !counting
+            .calendars
+            .iter()
+            .any(|calendar| calendar.instrument_id == *currency)
+        {
+            continue;
+        }
+        let own = Set {
+            calendars: counting
+                .calendars
+                .iter()
+                .filter(|calendar| {
+                    calendar.instrument_id == *currency || calendar.instrument_id.is_empty()
+                })
+                .copied()
+                .collect(),
+        };
+        let date = count_forward(&own, trade, lag)?;
+        later = Some(later.map_or(date, |held| held.max(date)));
+    }
+    let Some(later) = later else {
+        return Ok(None);
+    };
+    let mut both = Set {
+        calendars: counting.calendars.clone(),
+    };
+    for calendar in &spot.calendars {
+        if !both
+            .calendars
+            .iter()
+            .any(|held| held.calendar_id == calendar.calendar_id)
+        {
+            both.calendars.push(calendar);
+        }
+    }
+    step(&both, later, 1).map(Some)
 }
 
 /// W3.20: one way to work out a date. A malformed input is the refusal's
@@ -832,8 +894,32 @@ pub fn read(
 pub const LIST_MOST: usize = 200;
 pub const LIST_DEFAULT: usize = 25;
 
+/// Whether a calendar answers a list's kind and text (W3.21; contract v23):
+/// unspecified is every kind, and the text matches, ignoring case, its name
+/// or its subject's codes -- an identifier others use (an ISO 4217 code, a
+/// business centre) or the settlement system's name and country.
+fn listed(record: &CalendarRecord, request: &ListCalendarsRequest) -> bool {
+    if request.kind != 0 && record.kind != request.kind {
+        return false;
+    }
+    let query = request.query.trim().to_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+    let mut codes: Vec<&str> = vec![record.name.as_str()];
+    codes.extend(record.identifiers.iter().map(|held| held.value.as_str()));
+    if let Some(system) = &record.settlement_system {
+        codes.push(system.name.as_str());
+        codes.push(system.country_code.as_str());
+    }
+    codes
+        .iter()
+        .any(|code| code.to_lowercase().contains(&query))
+}
+
 /// W3.21: the calendars the deployment holds, one line each, at their latest
-/// versions, paged by ID; and the rules held, on the first page.
+/// versions, paged by ID, from contract v23 each with its subject and
+/// filtered by kind and text; and the rules held, on the first page.
 pub fn list(
     calendars: &[KeptCalendar],
     rules: &[KeptDateRule],
@@ -863,6 +949,7 @@ pub fn list(
     let mut lines: Vec<HeldCalendar> = latest
         .values()
         .filter(|kept| kept.record.calendar_id.as_str() > request.cursor.as_str())
+        .filter(|kept| listed(&kept.record, request))
         .map(|kept| HeldCalendar {
             calendar_id: kept.record.calendar_id.clone(),
             name: kept.record.name.clone(),
@@ -875,6 +962,9 @@ pub fn list(
                 .map(|coverage| coverage.to_date.clone())
                 .unwrap_or_default(),
             refreshed_at_ns: kept.kept_at_ns,
+            instrument_id: kept.record.instrument_id.clone(),
+            venue_ids: kept.record.venue_ids.clone(),
+            settlement_system: kept.record.settlement_system.clone(),
         })
         .collect();
     let next_cursor = if lines.len() > size {

@@ -1028,12 +1028,17 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
                 cursor: request.cursor.clone(),
             })
             .map_err(|failed| failed.on_the_bus())?;
+        // Contract v23 (W11.17): only the executions in the state asked for.
+        let mut executions = page.executions;
+        if request.execution_state != 0 {
+            executions.retain(|execution| execution.state == request.execution_state);
+        }
         let mut reply = ListOrdersReply {
             orders: page.orders,
             as_of: Some(watermark_of(&page.as_of)),
             next_cursor: page.next_cursor,
             placements: page.placements,
-            executions: page.executions,
+            executions,
             unplaced_facts: page.unplaced,
         };
         meridian_domain::money::fill_known(&mut reply);

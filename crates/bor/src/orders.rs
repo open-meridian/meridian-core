@@ -22,8 +22,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use meridian_domain::exact::Exact;
 use meridian_domain::v1::{
-    ChangeRequest, ChangeRequestOutcome, Charge, Check, Execution, FinalityLevel, JournalRef,
-    Locate, LocateAnswer, LocateUse, LocateUseKind, Order, OrderCondition, OrderOrigin,
+    ChangeRequest, ChangeRequestOutcome, Charge, Check, Execution, ExecutionState, FinalityLevel,
+    JournalRef, Locate, LocateAnswer, LocateUse, LocateUseKind, Order, OrderCondition, OrderOrigin,
     OrderQuantities, OrderState, OrderStatus, Placement, PlacementChangeKind, PlacementCondition,
     PlacementEvent, PlacementState, PlacementStatus, ReportPlacementRequest,
     StandingOrderCondition, StandingPlacementCondition, TieOutReason, TradingInstruction,
@@ -608,10 +608,18 @@ impl Ledger {
                     self.venue_facts
                         .insert(venue_key(sender, execution), id.clone());
                 }
+                // Its state is derived, never stored (contract v23,
+                // decisions/035 as amended): every execution the book records
+                // today is on a placement or, done away, on its order --
+                // matched (transition e1). An unmatched one is v23's build.
+                let mut execution = execution.clone();
+                if execution.state == ExecutionState::Unspecified as i32 {
+                    execution.state = ExecutionState::Matched as i32;
+                }
                 self.executions.insert(
                     id,
                     ExecutionHeld {
-                        execution: execution.clone(),
+                        execution,
                         entry_id: entry_id.to_string(),
                         sender: sender.clone(),
                         superseded_by: None,

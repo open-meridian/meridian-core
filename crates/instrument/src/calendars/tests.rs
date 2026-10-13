@@ -3,9 +3,9 @@
 //! source, and the calendar read's and the list's.
 
 use meridian_domain::v1::{
-    compute_date_request::Inputs, BusinessDayInputs, CalendarCoverage, CalendarDay, CalendarSource,
-    CalendarWeekend, DayCut, ListCalendarsRequest, RollInputs, SettlementDateInputs,
-    SpotDateInputs, Tenor, TenorDateInputs, TenorDateRule,
+    compute_date_request::Inputs, BusinessDayInputs, CalendarCoverage, CalendarDay, CalendarKind,
+    CalendarSource, CalendarWeekend, DayCut, Identifier, ListCalendarsRequest, RollInputs,
+    SettlementDateInputs, SettlementSystem, SpotDateInputs, Tenor, TenorDateInputs, TenorDateRule,
 };
 
 use super::*;
@@ -109,6 +109,7 @@ fn spot_rule(
                     end_of_month: true,
                 }),
                 effective_from_date: "2016-01-01".into(),
+                counting_mode: 0,
             })),
             ..Default::default()
         },
@@ -610,6 +611,7 @@ fn the_calendars_held_are_listed_one_line_each_with_the_rules() {
         &ListCalendarsRequest {
             page_size: 2,
             cursor: String::new(),
+            ..Default::default()
         },
     )
     .unwrap();
@@ -625,6 +627,7 @@ fn the_calendars_held_are_listed_one_line_each_with_the_rules() {
         &ListCalendarsRequest {
             page_size: 2,
             cursor: first.next_cursor.clone(),
+            ..Default::default()
         },
     )
     .unwrap();
@@ -636,7 +639,8 @@ fn the_calendars_held_are_listed_one_line_each_with_the_rules() {
         &rules,
         &ListCalendarsRequest {
             page_size: 201,
-            cursor: String::new()
+            cursor: String::new(),
+            ..Default::default()
         }
     )
     .is_err());
@@ -647,4 +651,104 @@ fn every_subject_held_is_named_for_the_conductor_to_refresh() {
     let (calendars, rules) = seed();
     let subjects = held_subjects(&calendars, &rules, KEPT);
     assert_eq!(subjects.len(), 5 + 4);
+}
+
+// ── Contract v23 ──
+
+#[test]
+fn a_cross_counted_per_currency_takes_each_currencys_spot_and_the_later() {
+    // EUR/GBP traded Thursday 30 April 2026: 1 May a TARGET closing day, 4
+    // May England's Early May bank holiday. Per currency: EUR's T+2 on
+    // TARGET is Tuesday 5 May, GBP's on its own calendar Tuesday 5 May too;
+    // jointly, a day counting only if good on both, Wednesday 6 May.
+    const GBP: &str = "CAL-01JAE000000000000000GBP1";
+    const CASH_GBP: &str = "INS-01J8XQ4M7K00000000CASHGBP";
+    let mut eur = calendar(EUR, 1, &[("2026-05-01", "Labour Day")]);
+    eur.instrument_id = CASH_EUR.into();
+    let mut gbp = calendar(GBP, 1, &[("2026-05-04", "Early May bank holiday")]);
+    gbp.instrument_id = CASH_GBP.into();
+    let calendars = vec![kept(eur, KEPT), kept(gbp, KEPT)];
+    let mut joint = spot_rule("EUR/GBP", [CASH_EUR, CASH_GBP], 2, &[EUR, GBP], &[EUR, GBP]);
+    let joint_held = Held::as_of(&calendars, &[joint.clone()], 0);
+    let answer = ask(&joint_held, spot([CASH_EUR, CASH_GBP], "2026-04-30"));
+    assert_eq!(
+        answer.reply.date, "2026-05-06",
+        "unspecified counts jointly"
+    );
+    if let Some(date_rule_version::Parameters::Spot(rule)) = joint.rule.parameters.as_mut() {
+        rule.counting_mode = SpotCountingMode::EachCurrency as i32;
+    }
+    let each = Held::as_of(&calendars, &[joint], 0);
+    let answer = ask(&each, spot([CASH_EUR, CASH_GBP], "2026-04-30"));
+    assert_eq!(answer.reply.date, "2026-05-05");
+    assert_eq!(
+        calendars_of(&answer),
+        vec![(EUR.to_string(), 1), (GBP.to_string(), 1)]
+    );
+}
+
+#[test]
+fn a_calendar_line_carries_its_subject_and_the_list_filters_by_kind_and_text() {
+    let (mut calendars, rules) = seed();
+    for held in &mut calendars {
+        if held.record.calendar_id == USSS {
+            held.record.kind = CalendarKind::SecuritiesSettlement as i32;
+            held.record.settlement_system = Some(SettlementSystem {
+                name: "DTC".into(),
+                country_code: "US".into(),
+            });
+        }
+        if held.record.calendar_id == EUR {
+            held.record.kind = CalendarKind::Currency as i32;
+            held.record.instrument_id = CASH_EUR.into();
+            held.record.identifiers = vec![Identifier {
+                scheme: "iso4217".into(),
+                value: "EUR".into(),
+                ..Default::default()
+            }];
+        }
+    }
+    let everything = list(&calendars, &rules, &ListCalendarsRequest::default()).unwrap();
+    let eur = everything
+        .calendars
+        .iter()
+        .find(|line| line.calendar_id == EUR)
+        .unwrap();
+    assert_eq!(eur.instrument_id, CASH_EUR);
+    let settlement = list(
+        &calendars,
+        &rules,
+        &ListCalendarsRequest {
+            kind: CalendarKind::SecuritiesSettlement as i32,
+            query: "us".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(settlement.calendars.len(), 1);
+    assert_eq!(settlement.calendars[0].calendar_id, USSS);
+    assert_eq!(
+        settlement.calendars[0]
+            .settlement_system
+            .as_ref()
+            .map(|system| system.name.as_str()),
+        Some("DTC")
+    );
+    let by_code = list(
+        &calendars,
+        &rules,
+        &ListCalendarsRequest {
+            query: "eur".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        by_code
+            .calendars
+            .iter()
+            .map(|line| line.calendar_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![EUR]
+    );
 }
