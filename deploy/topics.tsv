@@ -122,7 +122,7 @@ platform.lake.{dataset}.event.quotes-recorded	event	lake	signal,ems
 platform.lake.{dataset}.event.trades-recorded	event	lake	signal,ems
 platform.reference.command.complete-instruments	command	dashboard	instrument
 platform.reference.command.merge-instruments	command	dashboard	instrument
-platform.reference.event.calendar-applied	event	instrument	dashboard
+platform.reference.event.calendar-applied	event	instrument	dashboard,lake
 platform.reference.event.calendar-missing	event	instrument	conductor
 platform.reference.event.calendar-pulled	event	conductor	instrument
 platform.reference.event.instrument-applied	event	instrument	dashboard
@@ -134,7 +134,7 @@ platform.reference.query.ask-platform-for-instrument	query	dashboard,instrument	
 platform.reference.query.compute-date	query	compliance,confirmation,connectivity,custody,data,ems,oms,operations,portfolio,reporting,servicing,settlement,signal	instrument
 platform.reference.query.list-calendars	query	dashboard	instrument
 platform.reference.query.list-instruments-to-complete	query	dashboard	instrument
-platform.reference.query.read-calendar	query	compliance,confirmation,connectivity,custody,data,ems,oms,operations,portfolio,reporting,servicing,settlement,signal,dashboard	instrument
+platform.reference.query.read-calendar	query	compliance,confirmation,connectivity,custody,data,ems,oms,operations,portfolio,reporting,servicing,settlement,signal,dashboard,lake	instrument
 platform.reference.query.read-instrument-history	query	dashboard	instrument
 platform.reference.query.resolve-identifier	query	custody,data,lake,street,bor,reporting,connectivity	instrument
 platform.reference.query.resolve-instrument	query	street,bor,portfolio,reporting,compliance,oms,operations,conductor,lake,data,ems,connectivity	instrument
