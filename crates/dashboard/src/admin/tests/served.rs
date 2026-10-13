@@ -910,10 +910,9 @@ fn lake_listing() -> meridian_domain::v1::ListDatasetsReply {
                 unconverted_count: (n * 3 + k) as u64 * 7,
                 miss_count: (n + k) as u64,
                 // Contract v23: closed days, and some outside coverage, so
-                // the browser sees the badge beside a count.
+                // the browser sees both in the one cell.
                 closed_day_count: (n * 2 + k) as u64 * 11,
                 outside_coverage_count: if k == 1 { (n + 1) as u64 * 3 } else { 0 },
-                ..Default::default()
             });
             if n < 2 || (n == 2 && k == 0) {
                 for reader in ["sample-reporting-1", "board-1", "compliance-1"] {
