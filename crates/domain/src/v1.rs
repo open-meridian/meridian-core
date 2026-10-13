@@ -7569,13 +7569,13 @@ pub struct AcceptExecutionRequest {
     /// Kept on the accept's entry.
     #[prost(string, tag = "4")]
     pub note: ::prost::alloc::string::String,
-    #[prost(oneof = "accept_execution_request::Order", tags = "2, 3")]
-    pub order: ::core::option::Option<accept_execution_request::Order>,
+    #[prost(oneof = "accept_execution_request::MatchedOrder", tags = "2, 3")]
+    pub matched_order: ::core::option::Option<accept_execution_request::MatchedOrder>,
 }
 /// Nested message and enum types in `AcceptExecutionRequest`.
 pub mod accept_execution_request {
     #[derive(Clone, PartialEq, ::prost::Oneof)]
-    pub enum Order {
+    pub enum MatchedOrder {
         /// An order the accepting `ems` may place against: released, working or
         /// filled, never ended.
         #[prost(string, tag = "2")]
