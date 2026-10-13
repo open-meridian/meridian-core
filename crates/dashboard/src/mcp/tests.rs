@@ -2045,6 +2045,8 @@ async fn the_data_sources_tools_are_a_deployment_admins_noted_stamped_and_stale_
             }),
             unconverted_count: 2,
             miss_count: 1,
+            closed_day_count: 4,
+            outside_coverage_count: 1,
             ..Default::default()
         }],
         entitlements: vec![DatasetEntitlement {
@@ -2160,6 +2162,10 @@ async fn the_data_sources_tools_are_a_deployment_admins_noted_stamped_and_stale_
     let dataset = &structured(&said)["data"]["datasets"][0];
     assert_eq!(dataset["unconverted_count"], 2, "{said}");
     assert_eq!(dataset["miss_count"], 1);
+    // Contract v23: the closed-day counts, and a read answering `unchanged`.
+    assert_eq!(dataset["closed_day_count"], 4);
+    assert_eq!(dataset["outside_coverage_count"], 1);
+    assert_eq!(structured(&said)["outcome"], "unchanged");
     assert_eq!(dataset["licence"]["set_by_the_deployment"], false);
     assert_eq!(dataset["licence"]["retention_days"], 30);
     assert_eq!(dataset["catalogue_entry"]["modes"][0], "pull");
@@ -2176,6 +2182,7 @@ async fn the_data_sources_tools_are_a_deployment_admins_noted_stamped_and_stale_
     .await;
     let priority = &structured(&said)["data"]["priorities"][0];
     assert_eq!(priority["kind"], "close", "{said}");
+    assert_eq!(structured(&said)["outcome"], "unchanged");
     assert_eq!(priority["updated_at_ns"], 5);
 
     // Each change: refused without a note and not sent; with one, stamped.

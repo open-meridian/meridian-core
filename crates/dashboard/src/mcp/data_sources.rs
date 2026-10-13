@@ -72,8 +72,10 @@ pub static SPECS: &[Spec] = &[
 aggregator, data types, modes, cadence, history, its business day's time zone and end, its venue), \
 the licence enforced -- the deployment's, or the catalogue's default until one is set -- the \
 plugins entitled to it, how many of its values were left unconverted and how many identifiers \
-and venues its plugin reported missing, and a warning where its terms are one person's and more \
-than one person holds read on a plugin entitled to it. Never a price.",
+and venues its plugin reported missing, how many of its daily values are dated on a closed day of \
+its calendar and how many outside the calendar's coverage, and a warning where its terms are one \
+person's and more than one person holds read on a plugin entitled to it. Never a price. Answers \
+`unchanged`, as every read does (`read` before contract v23).",
         true,
         nothing_schema,
     ),
@@ -102,7 +104,8 @@ entitlement as recorded.",
         "List source priorities",
         "each priority a default read takes: for a data type and, for prices, a kind, the \
 datasets first to last, with who set it, when, through which delegation and client, and why. \
-Its updated_at_ns is what a change is sent against.",
+Its updated_at_ns is what a change is sent against. Answers `unchanged`, as every read does \
+(`read` before contract v23).",
         true,
         nothing_schema,
     ),
@@ -342,11 +345,15 @@ async fn list_datasets(app: &App, caller: &Caller, arguments: &Value) -> Value {
                 "entitlements": row.entitled.iter().map(entitlement_json).collect::<Vec<_>>(),
                 "unconverted_count": row.dataset.unconverted_count,
                 "miss_count": row.dataset.miss_count,
+                "closed_day_count": row.dataset.closed_day_count,
+                "outside_coverage_count": row.dataset.outside_coverage_count,
                 "one_person_warning": row.warning(&records),
             })
         })
         .collect();
-    json!({"outcome": "read", "data": {"datasets": datasets}})
+    // Contract v23 (the lake plan's vL1c, item 13): `unchanged`, as core's
+    // other reads answer; `read` until v23.
+    json!({"outcome": "unchanged", "data": {"datasets": datasets}})
 }
 
 async fn set_licence(app: &App, caller: &Caller, arguments: &Value) -> Value {
@@ -461,7 +468,7 @@ async fn list_priorities(app: &App, caller: &Caller, arguments: &Value) -> Value
     .await;
     match reply {
         Err(failed) => bus_refused(failed, ""),
-        Ok(reply) => json!({"outcome": "read", "data": {
+        Ok(reply) => json!({"outcome": "unchanged", "data": {
             "priorities": reply.priorities.iter().map(priority_json).collect::<Vec<_>>(),
         }}),
     }

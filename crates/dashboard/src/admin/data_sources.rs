@@ -9,7 +9,9 @@
 //!   the deployment's, or the catalogue's default until one is set -- the
 //!   plugins entitled to it, and the lake's counts of values left
 //!   unconverted and of identifiers and venues its instance reported
-//!   missing. A dataset whose terms are one person's (`personal_use`) is
+//!   missing, and from contract v23 of its daily values dated on a closed
+//!   day of its calendar, those outside the calendar's coverage beside
+//!   them, apart (W10.9). A dataset whose terms are one person's (`personal_use`) is
 //!   flagged where more than one person holds read on a plugin entitled to
 //!   it (Q16): derived here from the records, with no field of its own.
 //! - **Entitlements**: each plugin instance entitled to a dataset, all
@@ -334,6 +336,7 @@ fn datasets_tab(rows: &[Row], records: &AccessRecords, token: &str) -> (String, 
                  <td class=\"wide\" title=\"{entitled_all}\" data-entitled=\"{n}\">{n}</td>\
                  <td class=\"wide num\" data-unconverted>{unconverted}</td>\
                  <td class=\"wide num\" data-misses>{misses}</td>\
+                 <td class=\"wide num\" data-closed-days title=\"{closed_said}\">{closed}</td>\
                  <td class=\"actions\"><button type=\"button\" class=\"wide\" data-dialog-open=\"licence\" \
                  data-title=\"Licence {id}\" data-fill=\"{fill}\">Licence</button> \
                  <button type=\"button\" data-dialog-open=\"entitle\" data-title=\"Entitle a plugin to {id}\" \
@@ -354,6 +357,19 @@ fn datasets_tab(rows: &[Row], records: &AccessRecords, token: &str) -> (String, 
                 n = entitled.len(),
                 unconverted = thousands(d.unconverted_count),
                 misses = thousands(d.miss_count),
+                closed = if d.outside_coverage_count == 0 {
+                    thousands(d.closed_day_count)
+                } else {
+                    format!(
+                        "{} <span class=\"badge warn\" data-outside-coverage>{} outside</span>",
+                        thousands(d.closed_day_count),
+                        thousands(d.outside_coverage_count)
+                    )
+                },
+                closed_said = escape(&format!(
+                    "{} dated on a closed day of its calendar; {} outside its coverage",
+                    d.closed_day_count, d.outside_coverage_count
+                )),
             )
         })
         .collect();
@@ -368,6 +384,7 @@ fn datasets_tab(rows: &[Row], records: &AccessRecords, token: &str) -> (String, 
              <th>Licence</th><th class=\"wide count\" title=\"Plugins entitled\">Entitled</th>\
              <th class=\"wide num\" title=\"Values left unconverted\">Unconverted</th>\
              <th class=\"wide num\" title=\"Identifiers and venues reported missing\">Misses</th>\
+             <th class=\"wide num\" title=\"Daily values dated on a closed day of its calendar, and outside its coverage\">Closed days</th>\
              <th class=\"actions\"></th></tr></thead><tbody>{lines}</tbody></table></om-pager>",
             n = rows.len()
         )
@@ -670,6 +687,8 @@ mod tests {
                 }),
                 unconverted_count: 2,
                 miss_count: 1,
+                closed_day_count: 3,
+                outside_coverage_count: 1,
                 ..Default::default()
             }],
             licences: vec![],
@@ -703,6 +722,10 @@ mod tests {
         );
         assert!(body.contains("data-datasets=\"1\""), "{body}");
         assert!(body.contains("<td class=\"wide num\" data-unconverted>2</td>"));
+        assert!(body.contains("data-closed-days"));
+        assert!(
+            body.contains(">3 <span class=\"badge warn\" data-outside-coverage>1 outside</span>")
+        );
         assert!(body.contains("<td class=\"wide num\" data-misses>1</td>"));
         assert!(
             body.contains("the catalogue&#39;s default")

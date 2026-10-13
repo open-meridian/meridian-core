@@ -142,7 +142,7 @@ def call(tool, arguments, outcome):
 
 
 def datasets_listed():
-    return {d["dataset"]: d for d in call("dashboard__list_datasets", {}, "read")["data"]["datasets"]}
+    return {d["dataset"]: d for d in call("dashboard__list_datasets", {}, "unchanged")["data"]["datasets"]}
 
 
 def run():
@@ -271,7 +271,7 @@ def run():
     must("RECORD_CHANGED" in stale.get("reason", "") and
          any(f.get("path") == "against_updated_at_ns" for f in stale.get("fields", [])),
          f"step 7, a change against an older read is refused as changed: {stale}")
-    read = call("dashboard__list_source_priorities", {}, "read")["data"]["priorities"]
+    read = call("dashboard__list_source_priorities", {}, "unchanged")["data"]["priorities"]
     close = [p for p in read if p["kind"] == "close"]
     must(close and close[0]["datasets"] == ["coin:daily"] and close[0]["note"],
          f"step 7, the priority as listed: {read}")
