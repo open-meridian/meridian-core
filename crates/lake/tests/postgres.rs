@@ -352,3 +352,84 @@ fn an_outcomes_every_version_is_read_after_a_watermark() {
     let after = When::After([(dataset.clone(), 1)].into_iter().collect());
     assert_eq!(versions(store.read(&query(after, 0)).unwrap()), vec![2, 3]);
 }
+
+/// Contract v23 (W10.4, W10.9): a row's closed-day flag kept with it and
+/// counted; a re-check journalled beside it, read as of when it was known,
+/// never a new version.
+#[test]
+fn a_closed_day_flag_is_counted_and_amended_beside_its_row() {
+    use meridian_domain::v1::{DateCheck, DateCheckReason};
+    use meridian_lake::store::ClosedDayAmendment;
+    let store = store();
+    let dataset = unique("coinbase-1:daily");
+    let subject = unique("LCL-BTC");
+    let flagged = |row_key: &str, date: &str, reason: Option<DateCheckReason>| {
+        let mut row = close(&dataset, row_key, &subject, date, 10);
+        row.meta_mut().closed_day = reason.map(|reason| DateCheck {
+            date: date.into(),
+            reason: reason as i32,
+            ..Default::default()
+        });
+        row
+    };
+    let done = store
+        .record(
+            &dataset,
+            vec![
+                flagged("sat", "2026-10-10", Some(DateCheckReason::Weekend)),
+                flagged("tue", "2026-10-13", None),
+                flagged("late", "2027-03-01", Some(DateCheckReason::OutsideCoverage)),
+            ],
+            1_000,
+        )
+        .unwrap();
+    assert_eq!(store.closed_day_counts().unwrap()[&dataset], (1, 1));
+    assert_eq!(
+        store.dated_range(&dataset).unwrap(),
+        Some(("2026-10-10".to_string(), "2027-03-01".to_string()))
+    );
+    let tuesday = done.rows[1].meta().sequence;
+    store
+        .amend_closed_day(&[ClosedDayAmendment {
+            dataset: dataset.clone(),
+            sequence: tuesday,
+            closed_day: Some(DateCheck {
+                date: "2026-10-13".into(),
+                reason: DateCheckReason::Holiday as i32,
+                holiday_name: "A closure".into(),
+                ..Default::default()
+            }),
+            why: "calendar CAL-USSS version 2 applied".into(),
+            at_ns: 2_000,
+        }])
+        .unwrap();
+    assert_eq!(store.closed_day_counts().unwrap()[&dataset], (2, 1));
+    let on = store
+        .dated_on(&dataset, &["2026-10-13".to_string()])
+        .unwrap();
+    assert_eq!(on.len(), 1);
+    assert_eq!(
+        on[0].meta().closed_day.as_ref().unwrap().holiday_name,
+        "A closure"
+    );
+    let query = |as_of_ns: i64| Query {
+        datasets: vec![dataset.clone()],
+        subjects: vec![subject.clone()],
+        data_type: DataType::Price,
+        kinds: vec![],
+        interval_ns: 0,
+        when: When::BusinessDate(Date::parse("2026-10-13").unwrap()),
+        as_of_ns,
+    };
+    assert!(store.read(&query(1_500)).unwrap()[0]
+        .meta()
+        .closed_day
+        .is_none());
+    let now = store.read(&query(0)).unwrap();
+    assert_eq!(
+        now[0].meta().closed_day.as_ref().unwrap().reason,
+        DateCheckReason::Holiday as i32
+    );
+    assert_eq!(now[0].meta().version, 1, "never a new version");
+    assert_eq!(store.heads().unwrap()[&dataset], 3);
+}

@@ -82,6 +82,10 @@ pub const VENUE_MISSING: &str = "platform.reference.event.venue-missing";
 pub const RESOLVE_INSTRUMENT: &str = "platform.reference.query.resolve-instrument";
 pub const RESOLVE_IDENTIFIER: &str = "platform.reference.query.resolve-identifier";
 pub const PLUGIN_CATALOGUE: &str = "platform.config.query.plugin-catalogue";
+/// A dataset's calendar, read for the closed-day flag (W3.19, W10.4).
+pub const READ_CALENDAR: &str = "platform.reference.query.read-calendar";
+/// A calendar's new version, heard to re-check the flag (W3.17, W10.4).
+pub const CALENDAR_APPLIED: &str = "platform.reference.event.calendar-applied";
 
 /// A dataset's subject for a data type's recorded rows.
 pub fn recorded_topic(dataset: &str, data_type: DataType) -> String {
@@ -536,6 +540,7 @@ impl Lake {
             meta.sequence = 0;
             meta.previous_sequence = 0;
             meta.recorded_at_ns = 0;
+            meta.closed_day = None;
             by_dataset
                 .entry(source.dataset.clone())
                 .or_default()
@@ -574,8 +579,9 @@ impl Lake {
         let mut reply = RecordObservationsReply::default();
         let mut datasets = BTreeSet::new();
         let mut subjects = Vec::new();
-        for (dataset, rows) in by_dataset {
+        for (dataset, mut rows) in by_dataset {
             datasets.insert(dataset.clone());
+            self.flag_closed_days(&dataset, &mut rows);
             let done = if config.licence(&dataset).kept {
                 self.store.record(&dataset, rows, now)
             } else {
@@ -631,6 +637,169 @@ impl Lake {
             );
         }
         Ok(reply)
+    }
+
+    /// Contract v23 (W10.4; the lake plan's vL1c, items 8 to 11): each row
+    /// with a business date -- a daily price or bar -- dated on a closed day
+    /// of its dataset's calendar (DatasetDeclaration.calendar_id), or
+    /// outside its coverage, carries the flag, decided here and recorded as
+    /// reported, never refused. A calendar not held, or a read not answered,
+    /// leaves the rows unflagged: the instrument store reports a calendar it
+    /// does not hold on the read itself (W3.18), and CalendarApplied
+    /// re-checks the rows once it lands.
+    fn flag_closed_days(&self, dataset: &str, rows: &mut [Observation]) {
+        let config = self.config();
+        let Some(calendar_id) = config
+            .declaration(dataset)
+            .map(|declaration| declaration.calendar_id.clone())
+            .filter(|id| !id.is_empty())
+        else {
+            return;
+        };
+        let dates: Vec<Date> = rows
+            .iter()
+            .filter(|row| row.data_type().dated())
+            .filter_map(|row| Date::parse(&row.meta().business_date).ok())
+            .collect();
+        let (Some(first), Some(last)) = (dates.iter().min(), dates.iter().max()) else {
+            return;
+        };
+        let reply = match self.read_calendar(&calendar_id, *first, *last) {
+            Ok(reply) => reply,
+            Err(failed) => {
+                tracing::warn!(dataset, calendar_id, %failed, "the dataset's calendar was not read; recorded unflagged");
+                return;
+            }
+        };
+        if !reply.found {
+            tracing::info!(
+                dataset,
+                calendar_id,
+                "the dataset's calendar is not held; recorded unflagged and reported missing"
+            );
+            return;
+        }
+        for row in rows.iter_mut() {
+            if !row.data_type().dated() {
+                continue;
+            }
+            let Ok(date) = Date::parse(&row.meta().business_date) else {
+                continue;
+            };
+            row.meta_mut().closed_day = lake::closed_day(&reply, date);
+        }
+    }
+
+    fn read_calendar(
+        &self,
+        calendar_id: &str,
+        from: Date,
+        to: Date,
+    ) -> Result<meridian_domain::v1::ReadCalendarReply, String> {
+        self.ask(
+            READ_CALENDAR,
+            "meridian.v1.ReadCalendarRequest",
+            meridian_domain::v1::ReadCalendarRequest {
+                calendar_id: calendar_id.to_string(),
+                from_date: from.to_string(),
+                to_date: to.to_string(),
+                as_of_ns: 0,
+            },
+        )
+    }
+
+    /// Contract v23 (W10.4; the lake plan's vL1c, item 10): a calendar's new
+    /// version re-checks the kept rows of every dataset following it, and a
+    /// row whose day the version changes -- closed, open, outside coverage,
+    /// or a holiday renamed -- has the re-check journalled beside it as an
+    /// amendment, never a new version: the source restated nothing.
+    pub fn recheck(&self, event: &meridian_domain::v1::CalendarAppliedEvent) {
+        if event.calendar_id.is_empty() {
+            return;
+        }
+        let config = self.config();
+        let now = self.clock.now_ns();
+        for (dataset, held) in &config.datasets {
+            let follows = held
+                .declaration
+                .as_ref()
+                .is_some_and(|declaration| declaration.calendar_id == event.calendar_id);
+            if !follows {
+                continue;
+            }
+            if let Err(failed) = self.recheck_dataset(dataset, event, now) {
+                tracing::warn!(dataset, calendar_id = event.calendar_id, %failed, "the closed-day flag was not re-checked");
+            }
+        }
+    }
+
+    fn recheck_dataset(
+        &self,
+        dataset: &str,
+        event: &meridian_domain::v1::CalendarAppliedEvent,
+        now: i64,
+    ) -> Result<usize, String> {
+        let Some((first, last)) = self
+            .store
+            .dated_range(dataset)
+            .map_err(|failed| failed.to_string())?
+        else {
+            return Ok(0);
+        };
+        let (first, last) = (
+            Date::parse(&first).map_err(|failed| failed.to_string())?,
+            Date::parse(&last).map_err(|failed| failed.to_string())?,
+        );
+        let reply = self.read_calendar(&event.calendar_id, first, last)?;
+        if !reply.found {
+            return Ok(0);
+        }
+        let mut dates = Vec::new();
+        let mut day = Some(first);
+        while let Some(date) = day.filter(|date| *date <= last) {
+            dates.push(date.to_string());
+            day = date.next();
+        }
+        let rows = self
+            .store
+            .dated_on(dataset, &dates)
+            .map_err(|failed| failed.to_string())?;
+        let status = |flag: Option<&meridian_domain::v1::DateCheck>| {
+            flag.map(|check| (check.reason, check.holiday_name.clone()))
+        };
+        let amendments: Vec<crate::store::ClosedDayAmendment> = rows
+            .iter()
+            .filter(|row| row.data_type().dated())
+            .filter_map(|row| {
+                let date = Date::parse(&row.meta().business_date).ok()?;
+                let now_flag = lake::closed_day(&reply, date);
+                (status(now_flag.as_ref()) != status(row.meta().closed_day.as_ref())).then(|| {
+                    crate::store::ClosedDayAmendment {
+                        dataset: dataset.to_string(),
+                        sequence: row.meta().sequence,
+                        closed_day: now_flag,
+                        why: format!(
+                            "calendar {} version {} applied",
+                            event.calendar_id, reply.version
+                        ),
+                        at_ns: now,
+                    }
+                })
+            })
+            .collect();
+        if !amendments.is_empty() {
+            self.store
+                .amend_closed_day(&amendments)
+                .map_err(|failed| failed.to_string())?;
+            tracing::info!(
+                dataset,
+                calendar_id = event.calendar_id,
+                version = reply.version,
+                amended = amendments.len(),
+                "the closed-day flag re-checked on a calendar's new version"
+            );
+        }
+        Ok(amendments.len())
     }
 
     fn publish(&self, dataset: &str, row: &Observation) {
@@ -1440,6 +1609,10 @@ impl Lake {
             .store
             .miss_counts()
             .map_err(|failed| failed.to_string())?;
+        let flagged = self
+            .store
+            .closed_day_counts()
+            .map_err(|failed| failed.to_string())?;
         let mut reply = ListDatasetsReply::default();
         for (dataset, held) in &config.datasets {
             // A data plugin learns its own datasets' licences (contract v20,
@@ -1452,6 +1625,10 @@ impl Lake {
             reply.datasets.push(DatasetRef {
                 unconverted_count: counts.get(dataset).map_or(0, |c| c.1),
                 miss_count: misses.get(&held.instance).copied().unwrap_or(0),
+                // Contract v23 (W10.9): the rows flagged on a closed day, and
+                // those outside the calendar's coverage, counted apart.
+                closed_day_count: flagged.get(dataset).map_or(0, |c| c.0),
+                outside_coverage_count: flagged.get(dataset).map_or(0, |c| c.1),
                 ..held.clone()
             });
             match &reader {
@@ -2187,6 +2364,7 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
     let mut replaced = bus.subscribe(INSTRUMENT_REPLACED);
     let mut instrument_missing = bus.subscribe(INSTRUMENT_MISSING);
     let mut venue_missing = bus.subscribe(VENUE_MISSING);
+    let mut calendar_applied = bus.subscribe(CALENDAR_APPLIED);
     let hearing = Arc::clone(&lake);
     tokio::spawn(async move {
         loop {
@@ -2195,6 +2373,7 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
                 Some(d) = replaced.recv() => d,
                 Some(d) = instrument_missing.recv() => d,
                 Some(d) = venue_missing.recv() => d,
+                Some(d) = calendar_applied.recv() => d,
                 else => return,
             };
             let lake = Arc::clone(&hearing);
@@ -2267,6 +2446,12 @@ impl Lake {
             "meridian.v1.MissingVenueDetectedEvent" => {
                 if let Ok(event) = MissingVenueDetectedEvent::decode(&envelope.payload[..]) {
                     self.miss(&event.publisher_instance_id, now);
+                }
+            }
+            "meridian.v1.CalendarAppliedEvent" => {
+                match meridian_domain::v1::CalendarAppliedEvent::decode(&envelope.payload[..]) {
+                    Ok(event) => self.recheck(&event),
+                    Err(failed) => tracing::warn!(%failed, "a calendar applied did not read"),
                 }
             }
             _ => {}

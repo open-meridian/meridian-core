@@ -8,7 +8,9 @@
 use std::collections::BTreeMap;
 
 use meridian_domain::date::Date;
-use meridian_domain::v1::{EntitlementsChangedEvent, ObservationsWantedEvent, SourcePriority};
+use meridian_domain::v1::{
+    DateCheck, DateCheckReason, EntitlementsChangedEvent, ObservationsWantedEvent, SourcePriority,
+};
 
 use crate::row::{DataType, Observation};
 
@@ -140,6 +142,64 @@ pub struct Removal {
     pub at_ns: i64,
 }
 
+/// A kept row's closed-day flag re-checked on a later version of its
+/// dataset's calendar (contract v23, W10.4; the lake plan's vL1c, item 10):
+/// journalled beside the row as a backfilled record is (decisions/031),
+/// never a new version, since the source restated nothing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClosedDayAmendment {
+    pub dataset: String,
+    pub sequence: u64,
+    /// The flag as re-checked; None where the day is no longer closed.
+    pub closed_day: Option<DateCheck>,
+    /// Why: the calendar version applied.
+    pub why: String,
+    pub at_ns: i64,
+}
+
+/// A flag's reason, as a store keeps it beside the row: 0 for none.
+pub fn closed_reason(flag: Option<&DateCheck>) -> i16 {
+    flag.map_or(0, |check| check.reason as i16)
+}
+
+/// Each row's closed-day flag as known at a recorded time (0 for now): the
+/// latest amendment of it at or before then, else the flag it was recorded
+/// with (a point-in-time read shows the flag as known then).
+pub fn as_flagged(rows: &mut [Observation], amendments: &[ClosedDayAmendment], as_of_ns: i64) {
+    if amendments.is_empty() {
+        return;
+    }
+    let mut latest: BTreeMap<(&str, u64), &ClosedDayAmendment> = BTreeMap::new();
+    for amendment in amendments {
+        if as_of_ns != 0 && amendment.at_ns > as_of_ns {
+            continue;
+        }
+        let key = (amendment.dataset.as_str(), amendment.sequence);
+        match latest.get(&key) {
+            Some(held) if held.at_ns > amendment.at_ns => {}
+            _ => {
+                latest.insert(key, amendment);
+            }
+        }
+    }
+    for row in rows.iter_mut() {
+        let key = (row.dataset().to_string(), row.meta().sequence);
+        if let Some(amendment) = latest.get(&(key.0.as_str(), key.1)) {
+            row.meta_mut().closed_day = amendment.closed_day.clone();
+        }
+    }
+}
+
+/// Whether a flag counts as a closed day (a weekend or a holiday) or as
+/// outside coverage, for the Data sources page (W10.9).
+pub fn counted(reason: i16) -> (u64, u64) {
+    match reason {
+        r if r == DateCheckReason::Weekend as i16 || r == DateCheckReason::Holiday as i16 => (1, 0),
+        r if r == DateCheckReason::OutsideCoverage as i16 => (0, 1),
+        _ => (0, 0),
+    }
+}
+
 /// A priority set against one read whose `updated_at_ns` has moved since:
 /// the one standing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,6 +286,26 @@ pub trait Store: Send + Sync {
 
     /// The data configuration as last heard.
     fn keep_configuration(&self, event: &EntitlementsChangedEvent) -> Result<()>;
+
+    // ── The closed-day flag (contract v23, W10.4, W10.9) ──
+
+    /// The first and last business date a dataset's kept rows name.
+    fn dated_range(&self, dataset: &str) -> Result<Option<(String, String)>>;
+
+    /// Every kept row of a dataset, every version, dated on one of `dates`,
+    /// each with its flag as known now.
+    fn dated_on(&self, dataset: &str, dates: &[String]) -> Result<Vec<Observation>>;
+
+    /// Journal re-checks beside their rows.
+    fn amend_closed_day(&self, amendments: &[ClosedDayAmendment]) -> Result<()>;
+
+    /// Every re-check journalled, in order.
+    fn closed_day_amendments(&self) -> Result<Vec<ClosedDayAmendment>>;
+
+    /// Per dataset: the kept rows flagged on a closed day (a weekend or a
+    /// holiday), and those flagged outside coverage, by the flag as known
+    /// now.
+    fn closed_day_counts(&self) -> Result<BTreeMap<String, (u64, u64)>>;
 
     fn configuration(&self) -> Result<Option<EntitlementsChangedEvent>>;
 }

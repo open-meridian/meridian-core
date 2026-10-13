@@ -23,8 +23,8 @@ use crate::memory::{as_of, number, served_of};
 use crate::migrations;
 use crate::row::Observation;
 use crate::store::{
-    Query, Recorded, Removal, Result, Served, Stale, Store, StoreError, WantChange, WantChangeKind,
-    When,
+    as_flagged, closed_reason, ClosedDayAmendment, Query, Recorded, Removal, Result, Served, Stale,
+    Store, StoreError, WantChange, WantChangeKind, When,
 };
 
 type Pool = r2d2::Pool<PostgresConnectionManager<NoTls>>;
@@ -131,6 +131,34 @@ fn latest_of(
         .transpose()
 }
 
+/// Every closed-day re-check of the datasets named, in order (contract v23).
+fn amendments_of(
+    client: &mut impl GenericClient,
+    datasets: &[String],
+) -> Result<Vec<ClosedDayAmendment>> {
+    let rows = client
+        .query(
+            "SELECT dataset, sequence, closed_day, why, at_ns FROM lake_closed_day
+              WHERE dataset = ANY($1) ORDER BY amendment_id",
+            &[&datasets],
+        )
+        .map_err(unavailable)?;
+    rows.iter().map(amendment_of).collect()
+}
+
+fn amendment_of(row: &postgres::Row) -> Result<ClosedDayAmendment> {
+    let body: Option<Vec<u8>> = row.get(2);
+    Ok(ClosedDayAmendment {
+        dataset: row.get(0),
+        sequence: row.get::<_, i64>(1) as u64,
+        closed_day: body
+            .map(|body| meridian_domain::v1::DateCheck::decode(&body[..]).map_err(unreadable))
+            .transpose()?,
+        why: row.get(3),
+        at_ns: row.get(4),
+    })
+}
+
 fn previous_of(client: &mut impl GenericClient, dataset: &str, row: &Observation) -> Result<u64> {
     let found: Option<i64> = client
         .query_one(
@@ -150,9 +178,9 @@ fn insert(tx: &mut Transaction<'_>, dataset: &str, row: &Observation) -> Result<
         "INSERT INTO lake_row
                 (dataset, sequence, data_type, row_key, version, subject, subjects, kind,
                  interval_ns, venue_id, valid_from_ns, valid_until_ns, business_date,
-                 recorded_at_ns, previous_sequence, unconverted, body)
+                 recorded_at_ns, previous_sequence, unconverted, body, closed_reason)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::text::date, $14, $15,
-                 $16, $17)",
+                 $16, $17, $18)",
         &[
             &dataset,
             &(meta.sequence as i64),
@@ -171,6 +199,7 @@ fn insert(tx: &mut Transaction<'_>, dataset: &str, row: &Observation) -> Result<
             &(meta.previous_sequence as i64),
             &!meta.unconverted.is_empty(),
             &row.encode(),
+            &closed_reason(meta.closed_day.as_ref()),
         ],
     )
     .map_err(unavailable)?;
@@ -298,11 +327,15 @@ impl Store for PostgresStore {
                 let body: Vec<u8> = row.get(0);
                 out.push(Observation::decode(query.data_type, &body).map_err(unreadable)?);
             }
+            let amendments = amendments_of(&mut tx, &query.datasets)?;
             tx.commit().map_err(unavailable)?;
-            if crate::store::every_version(query) {
-                return Ok(crate::store::recorded_by(out, query.as_of_ns));
-            }
-            return Ok(as_of(out, query.as_of_ns));
+            let mut out = if crate::store::every_version(query) {
+                crate::store::recorded_by(out, query.as_of_ns)
+            } else {
+                as_of(out, query.as_of_ns)
+            };
+            as_flagged(&mut out, &amendments, query.as_of_ns);
+            return Ok(out);
         }
         let kinds: Vec<i16> = query.kinds.iter().map(|k| *k as i16).collect();
         let cut_off = if query.as_of_ns == 0 {
@@ -355,8 +388,11 @@ impl Store for PostgresStore {
             let body: Vec<u8> = row.get(0);
             out.push(Observation::decode(query.data_type, &body).map_err(unreadable)?);
         }
+        let amendments = amendments_of(&mut tx, &query.datasets)?;
         tx.commit().map_err(unavailable)?;
-        Ok(as_of(out, query.as_of_ns))
+        let mut out = as_of(out, query.as_of_ns);
+        as_flagged(&mut out, &amendments, query.as_of_ns);
+        Ok(out)
     }
 
     fn heads(&self) -> Result<BTreeMap<String, u64>> {
@@ -668,6 +704,116 @@ impl Store for PostgresStore {
                 EntitlementsChangedEvent::decode(&body[..]).map_err(unreadable)
             })
             .transpose()
+    }
+
+    fn dated_range(&self, dataset: &str) -> Result<Option<(String, String)>> {
+        let row = self
+            .conn()?
+            .query_one(
+                "SELECT min(business_date)::text, max(business_date)::text FROM lake_row
+                  WHERE dataset = $1 AND business_date IS NOT NULL",
+                &[&dataset],
+            )
+            .map_err(unavailable)?;
+        let first: Option<String> = row.get(0);
+        let last: Option<String> = row.get(1);
+        Ok(first.zip(last))
+    }
+
+    fn dated_on(&self, dataset: &str, dates: &[String]) -> Result<Vec<Observation>> {
+        let mut conn = self.conn()?;
+        let mut tx = conn
+            .build_transaction()
+            .isolation_level(IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .map_err(unavailable)?;
+        let rows = tx
+            .query(
+                "SELECT data_type, body FROM lake_row
+                  WHERE dataset = $1 AND business_date = ANY($2::text[]::date[])
+                  ORDER BY sequence",
+                &[&dataset, &dates],
+            )
+            .map_err(unavailable)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let code: i16 = row.get(0);
+            let body: Vec<u8> = row.get(1);
+            let data_type = crate::row::DataType::from_code(code)
+                .ok_or_else(|| StoreError::Unavailable(format!("data type {code} unknown")))?;
+            out.push(Observation::decode(data_type, &body).map_err(unreadable)?);
+        }
+        let amendments = amendments_of(&mut tx, &[dataset.to_string()])?;
+        tx.commit().map_err(unavailable)?;
+        as_flagged(&mut out, &amendments, 0);
+        Ok(out)
+    }
+
+    fn amend_closed_day(&self, amendments: &[ClosedDayAmendment]) -> Result<()> {
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        for amendment in amendments {
+            tx.execute(
+                "INSERT INTO lake_closed_day (dataset, sequence, reason, closed_day, why, at_ns)
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+                &[
+                    &amendment.dataset,
+                    &(amendment.sequence as i64),
+                    &closed_reason(amendment.closed_day.as_ref()),
+                    &amendment
+                        .closed_day
+                        .as_ref()
+                        .map(|check| check.encode_to_vec()),
+                    &amendment.why,
+                    &amendment.at_ns,
+                ],
+            )
+            .map_err(unavailable)?;
+        }
+        tx.commit().map_err(unavailable)?;
+        Ok(())
+    }
+
+    fn closed_day_amendments(&self) -> Result<Vec<ClosedDayAmendment>> {
+        self.conn()?
+            .query(
+                "SELECT dataset, sequence, closed_day, why, at_ns FROM lake_closed_day
+                  ORDER BY amendment_id",
+                &[],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(amendment_of)
+            .collect()
+    }
+
+    fn closed_day_counts(&self) -> Result<BTreeMap<String, (u64, u64)>> {
+        // Each row's flag as known now: its latest re-check, else the reason
+        // it was recorded with.
+        Ok(self
+            .conn()?
+            .query(
+                "SELECT r.dataset,
+                        count(*) FILTER (WHERE coalesce(a.reason, r.closed_reason) IN (1, 2)),
+                        count(*) FILTER (WHERE coalesce(a.reason, r.closed_reason) = 3)
+                   FROM lake_row r
+                   LEFT JOIN LATERAL (
+                        SELECT c.reason FROM lake_closed_day c
+                         WHERE c.dataset = r.dataset AND c.sequence = r.sequence
+                         ORDER BY c.amendment_id DESC LIMIT 1) a ON true
+                  GROUP BY r.dataset",
+                &[],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|r| {
+                (
+                    r.get::<_, String>(0),
+                    (r.get::<_, i64>(1) as u64, r.get::<_, i64>(2) as u64),
+                )
+            })
+            .collect())
     }
 }
 

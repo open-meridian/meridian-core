@@ -7,7 +7,10 @@ use std::sync::Mutex;
 use meridian_domain::v1::{EntitlementsChangedEvent, SourcePriority};
 
 use crate::row::Observation;
-use crate::store::{matches, Query, Recorded, Removal, Result, Served, Stale, Store, WantChange};
+use crate::store::{
+    as_flagged, closed_reason, counted, matches, ClosedDayAmendment, Query, Recorded, Removal,
+    Result, Served, Stale, Store, WantChange,
+};
 
 #[derive(Default)]
 struct Held {
@@ -20,6 +23,7 @@ struct Held {
     misses: BTreeMap<String, u64>,
     aliases: BTreeMap<String, String>,
     configuration: Option<EntitlementsChangedEvent>,
+    amendments: Vec<ClosedDayAmendment>,
 }
 
 #[derive(Default)]
@@ -188,10 +192,13 @@ impl Store for MemoryStore {
             })
             .cloned()
             .collect::<Vec<_>>();
-        if crate::store::every_version(query) {
-            return Ok(crate::store::recorded_by(rows, query.as_of_ns));
-        }
-        Ok(as_of(rows, query.as_of_ns))
+        let mut out = if crate::store::every_version(query) {
+            crate::store::recorded_by(rows, query.as_of_ns)
+        } else {
+            as_of(rows, query.as_of_ns)
+        };
+        as_flagged(&mut out, &held.amendments, query.as_of_ns);
+        Ok(out)
     }
 
     fn heads(&self) -> Result<BTreeMap<String, u64>> {
@@ -324,6 +331,55 @@ impl Store for MemoryStore {
 
     fn configuration(&self) -> Result<Option<EntitlementsChangedEvent>> {
         Ok(self.lock().configuration.clone())
+    }
+
+    fn dated_range(&self, dataset: &str) -> Result<Option<(String, String)>> {
+        let held = self.lock();
+        let dates: Vec<&str> = held
+            .rows
+            .iter()
+            .filter(|row| row.dataset() == dataset && !row.meta().business_date.is_empty())
+            .map(|row| row.meta().business_date.as_str())
+            .collect();
+        Ok(match (dates.iter().min(), dates.iter().max()) {
+            (Some(first), Some(last)) => Some((first.to_string(), last.to_string())),
+            _ => None,
+        })
+    }
+
+    fn dated_on(&self, dataset: &str, dates: &[String]) -> Result<Vec<Observation>> {
+        let held = self.lock();
+        let mut rows: Vec<Observation> = held
+            .rows
+            .iter()
+            .filter(|row| row.dataset() == dataset && dates.contains(&row.meta().business_date))
+            .cloned()
+            .collect();
+        as_flagged(&mut rows, &held.amendments, 0);
+        Ok(rows)
+    }
+
+    fn amend_closed_day(&self, amendments: &[ClosedDayAmendment]) -> Result<()> {
+        self.lock().amendments.extend(amendments.iter().cloned());
+        Ok(())
+    }
+
+    fn closed_day_amendments(&self) -> Result<Vec<ClosedDayAmendment>> {
+        Ok(self.lock().amendments.clone())
+    }
+
+    fn closed_day_counts(&self) -> Result<BTreeMap<String, (u64, u64)>> {
+        let held = self.lock();
+        let mut rows = held.rows.clone();
+        as_flagged(&mut rows, &held.amendments, 0);
+        let mut counts: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+        for row in &rows {
+            let (closed, outside) = counted(closed_reason(row.meta().closed_day.as_ref()));
+            let count = counts.entry(row.dataset().to_string()).or_default();
+            count.0 += closed;
+            count.1 += outside;
+        }
+        Ok(counts)
     }
 }
 

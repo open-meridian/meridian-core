@@ -697,3 +697,154 @@ mod tests {
         assert_eq!(dataset_id("coinbase-1", "daily"), "coinbase-1:daily");
     }
 }
+
+/// A daily value's business date checked on its dataset's calendar as a
+/// read of it answered (contract v23, W10.4; the lake plan's vL1c, items 8
+/// and 9): None for a business day; else the date, the calendar at its
+/// version, and why it is closed -- a holiday listed with its name, a
+/// weekend day not listed open, or outside the calendar's coverage, which
+/// is never a business day by default. A calendar not held checks nothing.
+pub fn closed_day(
+    reply: &crate::v1::ReadCalendarReply,
+    date: crate::date::Date,
+) -> Option<crate::v1::DateCheck> {
+    use crate::date::Date;
+    use crate::v1::{CalendarDayKind, DateCheck, DateCheckReason};
+    use meridian_pb::v1::CalendarRef;
+    if !reply.found {
+        return None;
+    }
+    let check = |reason: DateCheckReason, holiday_name: &str| DateCheck {
+        date: date.to_string(),
+        calendars: vec![CalendarRef {
+            calendar_id: reply.calendar_id.clone(),
+            version: reply.version,
+        }],
+        reason: reason as i32,
+        holiday_name: holiday_name.to_string(),
+    };
+    let covered = reply.coverage.as_ref().is_some_and(|coverage| {
+        match (
+            Date::parse(&coverage.from_date),
+            Date::parse(&coverage.to_date),
+        ) {
+            (Ok(from), Ok(to)) => date >= from && date <= to,
+            _ => false,
+        }
+    });
+    if !covered {
+        return Some(check(DateCheckReason::OutsideCoverage, ""));
+    }
+    let text = date.to_string();
+    if let Some(day) = reply.days.iter().find(|day| day.date == text) {
+        if day.kind == CalendarDayKind::Closed as i32 {
+            return Some(check(DateCheckReason::Holiday, &day.name));
+        }
+        if day.kind == CalendarDayKind::Open as i32 {
+            return None;
+        }
+    }
+    let weekend = reply
+        .weekends
+        .iter()
+        .filter_map(|weekend| {
+            Date::parse(&weekend.valid_from_date)
+                .ok()
+                .filter(|from| *from <= date)
+                .map(|from| (from, weekend))
+        })
+        .max_by_key(|(from, _)| *from)
+        .map(|(_, weekend)| weekend);
+    let Some(weekend) = weekend else {
+        // Before any weekend it dates: not known, never a business day.
+        return Some(check(DateCheckReason::OutsideCoverage, ""));
+    };
+    // 1970-01-01 was a Thursday; Weekday counts Monday as 1.
+    let weekday = (date.days_since_epoch() + 3).rem_euclid(7) as i32 + 1;
+    weekend
+        .weekdays
+        .contains(&weekday)
+        .then(|| check(DateCheckReason::Weekend, ""))
+}
+
+#[cfg(test)]
+mod closed_day_tests {
+    use super::closed_day;
+    use crate::date::Date;
+    use crate::v1::{
+        CalendarCoverage, CalendarDay, CalendarDayKind, CalendarWeekend, DateCheckReason,
+        ReadCalendarReply, Weekday,
+    };
+
+    fn reply() -> ReadCalendarReply {
+        ReadCalendarReply {
+            found: true,
+            calendar_id: "CAL-USSS".into(),
+            version: 4,
+            days: vec![
+                CalendarDay {
+                    date: "2026-10-12".into(),
+                    kind: CalendarDayKind::Closed as i32,
+                    name: "Columbus Day".into(),
+                    source: String::new(),
+                },
+                CalendarDay {
+                    date: "2026-10-17".into(),
+                    kind: CalendarDayKind::Open as i32,
+                    name: String::new(),
+                    source: String::new(),
+                },
+            ],
+            weekends: vec![CalendarWeekend {
+                weekdays: vec![Weekday::Saturday as i32, Weekday::Sunday as i32],
+                valid_from_date: "2000-01-01".into(),
+            }],
+            coverage: Some(CalendarCoverage {
+                from_date: "2026-01-01".into(),
+                to_date: "2027-02-01".into(),
+            }),
+            sources: vec![],
+        }
+    }
+
+    fn reason(date: &str) -> Option<(i32, String, String)> {
+        closed_day(&reply(), Date::parse(date).unwrap()).map(|check| {
+            (
+                check.reason,
+                check.holiday_name,
+                format!(
+                    "{}@{}",
+                    check.calendars[0].calendar_id, check.calendars[0].version
+                ),
+            )
+        })
+    }
+
+    #[test]
+    fn a_date_is_checked_on_the_calendar_as_read() {
+        assert_eq!(reason("2026-10-13"), None, "a Tuesday");
+        assert_eq!(
+            reason("2026-10-12"),
+            Some((
+                DateCheckReason::Holiday as i32,
+                "Columbus Day".into(),
+                "CAL-USSS@4".into()
+            ))
+        );
+        assert_eq!(
+            reason("2026-10-18").map(|r| r.0),
+            Some(DateCheckReason::Weekend as i32),
+            "a Sunday"
+        );
+        assert_eq!(reason("2026-10-17"), None, "a Saturday listed open");
+        assert_eq!(
+            reason("2027-02-02").map(|r| r.0),
+            Some(DateCheckReason::OutsideCoverage as i32)
+        );
+        let missing = ReadCalendarReply {
+            found: false,
+            ..reply()
+        };
+        assert!(closed_day(&missing, Date::parse("2026-10-18").unwrap()).is_none());
+    }
+}

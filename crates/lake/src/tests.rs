@@ -1638,3 +1638,289 @@ async fn an_outcome_is_refused_naming_its_field() {
         .unwrap_err()
         .contains("1 to 500"));
 }
+
+// ── Contract v23: the closed-day flag (W10.4, W10.9) ────────────────────────
+
+/// The 1a's configuration, coinbase-1:daily following CAL-USSS.
+fn calendar_configuration() -> EntitlementsChangedEvent {
+    let mut c = configuration(true, &[]);
+    for dataset in c.datasets.iter_mut() {
+        if dataset.dataset == "coinbase-1:daily" {
+            dataset.declaration.as_mut().unwrap().calendar_id = "CAL-USSS".into();
+        }
+    }
+    c
+}
+
+/// The instrument store's ReadCalendar, stood in: CAL-USSS at the version
+/// `held` says (0: not held), Columbus Day closed, its coverage to
+/// 2027-02-01, and from version 2 an ad hoc closure on 2026-10-14.
+fn calendar_held(h: &Harness) -> Arc<std::sync::atomic::AtomicI64> {
+    use meridian_domain::v1::{
+        CalendarCoverage, CalendarDay, CalendarDayKind, CalendarWeekend, ReadCalendarReply,
+        ReadCalendarRequest, Weekday,
+    };
+    let held = Arc::new(std::sync::atomic::AtomicI64::new(1));
+    let version = held.clone();
+    h.bus.serve(service::READ_CALENDAR, move |envelope| {
+        let asked = ReadCalendarRequest::decode(&envelope.payload[..]).unwrap();
+        let at = version.load(std::sync::atomic::Ordering::SeqCst);
+        let day = |date: &str, name: &str| CalendarDay {
+            date: date.into(),
+            kind: CalendarDayKind::Closed as i32,
+            name: name.into(),
+            source: String::new(),
+        };
+        let mut days = vec![day("2026-10-12", "Columbus Day")];
+        if at >= 2 {
+            days.push(day("2026-10-14", "A national day of mourning"));
+        }
+        let reply = ReadCalendarReply {
+            found: at > 0 && asked.calendar_id == "CAL-USSS",
+            calendar_id: asked.calendar_id.clone(),
+            version: at,
+            days,
+            weekends: vec![CalendarWeekend {
+                weekdays: vec![Weekday::Saturday as i32, Weekday::Sunday as i32],
+                valid_from_date: "2000-01-01".into(),
+            }],
+            coverage: Some(CalendarCoverage {
+                from_date: "2026-01-01".into(),
+                to_date: "2027-02-01".into(),
+            }),
+            sources: vec![],
+        };
+        Ok((
+            "meridian.v1.ReadCalendarReply".into(),
+            reply.encode_to_vec(),
+        ))
+    });
+    held
+}
+
+fn flags(rows: &[Observation]) -> Vec<(String, i32, String)> {
+    let mut out: Vec<(String, i32, String)> = rows
+        .iter()
+        .map(|row| {
+            let meta = row.meta();
+            let check = meta.closed_day.clone().unwrap_or_default();
+            (meta.business_date.clone(), check.reason, check.holiday_name)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+fn kept_rows(h: &Harness, as_of_ns: i64) -> Vec<Observation> {
+    h.store
+        .read(&crate::store::Query {
+            datasets: vec!["coinbase-1:daily".into()],
+            subjects: vec![BTC.into()],
+            data_type: DataType::Price,
+            kinds: vec![],
+            interval_ns: 0,
+            when: crate::store::When::Range {
+                from_ns: 0,
+                until_ns: 0,
+            },
+            as_of_ns,
+        })
+        .unwrap()
+}
+
+fn counts(h: &Harness) -> (u64, u64) {
+    let listed = tokio::task::block_in_place(|| {
+        h.lake
+            .list_datasets(&envelope("dashboard-1", false, ""))
+            .unwrap()
+    });
+    let held = listed
+        .datasets
+        .iter()
+        .find(|d| d.dataset == "coinbase-1:daily")
+        .unwrap();
+    (held.closed_day_count, held.outside_coverage_count)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daily_value_on_a_closed_day_is_recorded_flagged_and_counted() {
+    use meridian_domain::v1::DateCheckReason as R;
+    let h = harness();
+    h.lake.configured(&calendar_configuration());
+    calendar_held(&h);
+    // A plugin's own flag is never its word: the lake decides it.
+    let mut claimed = close("coinbase-1", "tue", BTC, "2026-10-13", "62000");
+    claimed.meta.as_mut().unwrap().closed_day = Some(meridian_domain::v1::DateCheck {
+        reason: R::Holiday as i32,
+        ..Default::default()
+    });
+    let done = record(
+        &h,
+        "coinbase-1",
+        vec![
+            claimed,
+            close("coinbase-1", "sat", BTC, "2026-10-10", "62001"),
+            close("coinbase-1", "columbus", BTC, "2026-10-12", "62002"),
+            close("coinbase-1", "late", BTC, "2027-03-01", "62003"),
+        ],
+        "",
+    )
+    .unwrap();
+    assert_eq!(done.recorded, 4, "recorded as reported, never refused");
+    assert_eq!(
+        flags(&kept_rows(&h, 0)),
+        vec![
+            ("2026-10-10".into(), R::Weekend as i32, String::new()),
+            (
+                "2026-10-12".into(),
+                R::Holiday as i32,
+                "Columbus Day".into()
+            ),
+            ("2026-10-13".into(), 0, String::new()),
+            (
+                "2027-03-01".into(),
+                R::OutsideCoverage as i32,
+                String::new()
+            ),
+        ]
+    );
+    let columbus = kept_rows(&h, 0)
+        .into_iter()
+        .find(|row| row.meta().business_date == "2026-10-12")
+        .unwrap();
+    let check = columbus.meta().closed_day.clone().unwrap();
+    assert_eq!(check.date, "2026-10-12");
+    assert_eq!(
+        (
+            check.calendars[0].calendar_id.as_str(),
+            check.calendars[0].version
+        ),
+        ("CAL-USSS", 1)
+    );
+    assert_eq!(
+        counts(&h),
+        (2, 1),
+        "closed days, and outside coverage apart"
+    );
+    // A reader reads the flag; reads are otherwise unchanged.
+    let answer = read(
+        &h,
+        "reporting-1",
+        &[BTC],
+        "2026-10-12",
+        SourceChoice::default(),
+        0,
+    );
+    assert_eq!(answer.rows.len(), 1);
+    assert_eq!(
+        answer.rows[0].meta().closed_day.as_ref().unwrap().reason,
+        R::Holiday as i32
+    );
+    // A dataset naming no calendar flags nothing.
+    record(
+        &h,
+        "kraken-1",
+        vec![close("kraken-1", "sat", BTC, "2026-10-10", "1")],
+        "",
+    )
+    .unwrap();
+    let kraken = h
+        .store
+        .read(&crate::store::Query {
+            datasets: vec!["kraken-1:daily".into()],
+            subjects: vec![BTC.into()],
+            data_type: DataType::Price,
+            kinds: vec![],
+            interval_ns: 0,
+            when: crate::store::When::Range {
+                from_ns: 0,
+                until_ns: 0,
+            },
+            as_of_ns: 0,
+        })
+        .unwrap();
+    assert!(kraken[0].meta().closed_day.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_calendar_applied_re_checks_the_rows_it_changes_as_amendments_never_versions() {
+    use meridian_domain::v1::DateCheckReason as R;
+    let h = harness();
+    h.lake.configured(&calendar_configuration());
+    let held = calendar_held(&h);
+    // The calendar not held yet: recorded unflagged.
+    held.store(0, std::sync::atomic::Ordering::SeqCst);
+    record(
+        &h,
+        "coinbase-1",
+        vec![
+            close("coinbase-1", "columbus", BTC, "2026-10-12", "62002"),
+            close("coinbase-1", "tue", BTC, "2026-10-13", "62000"),
+            close("coinbase-1", "wed", BTC, "2026-10-14", "62005"),
+        ],
+        "",
+    )
+    .unwrap();
+    assert!(kept_rows(&h, 0)
+        .iter()
+        .all(|row| row.meta().closed_day.is_none()));
+    let head = h.store.heads().unwrap()["coinbase-1:daily"];
+    // Version 1 lands: Columbus Day is re-checked, the rest unchanged.
+    h.clock.advance(1_000);
+    let before_first = h.clock.now_ns() - 1;
+    held.store(1, std::sync::atomic::Ordering::SeqCst);
+    let applied = |version: i64| meridian_domain::v1::CalendarAppliedEvent {
+        calendar_id: "CAL-USSS".into(),
+        version,
+        rule: None,
+        applied_at_ns: 0,
+    };
+    tokio::task::block_in_place(|| h.lake.recheck(&applied(1)));
+    assert_eq!(h.store.closed_day_amendments().unwrap().len(), 1);
+    // Version 2 announces a closure on the 14th: that row alone.
+    h.clock.advance(1_000);
+    let before_second = h.clock.now_ns() - 1;
+    held.store(2, std::sync::atomic::Ordering::SeqCst);
+    tokio::task::block_in_place(|| h.lake.recheck(&applied(2)));
+    let amendments = h.store.closed_day_amendments().unwrap();
+    assert_eq!(
+        amendments.len(),
+        2,
+        "only the rows whose day the version changes"
+    );
+    assert!(amendments[1].why.contains("version 2"));
+    assert_eq!(
+        flags(&kept_rows(&h, 0)),
+        vec![
+            (
+                "2026-10-12".into(),
+                R::Holiday as i32,
+                "Columbus Day".into()
+            ),
+            ("2026-10-13".into(), 0, String::new()),
+            (
+                "2026-10-14".into(),
+                R::Holiday as i32,
+                "A national day of mourning".into()
+            ),
+        ]
+    );
+    // A point-in-time read shows the flag as it was known then.
+    assert!(kept_rows(&h, before_first)
+        .iter()
+        .all(|row| row.meta().closed_day.is_none()));
+    assert_eq!(
+        flags(&kept_rows(&h, before_second))
+            .iter()
+            .filter(|(_, reason, _)| *reason != 0)
+            .count(),
+        1
+    );
+    // Never a new version: nothing numbered, every row at version 1.
+    assert_eq!(h.store.heads().unwrap()["coinbase-1:daily"], head);
+    assert!(kept_rows(&h, 0).iter().all(|row| row.meta().version == 1));
+    assert_eq!(counts(&h), (2, 0));
+    // The same version again amends nothing.
+    tokio::task::block_in_place(|| h.lake.recheck(&applied(2)));
+    assert_eq!(h.store.closed_day_amendments().unwrap().len(), 2);
+}

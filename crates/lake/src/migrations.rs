@@ -16,11 +16,18 @@ pub struct Migration {
 }
 
 /// In order, and never reordered or edited after release.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "lake",
-    sql: include_str!("../migrations/0001_lake.sql"),
-}];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "lake",
+        sql: include_str!("../migrations/0001_lake.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "closed_day",
+        sql: include_str!("../migrations/0002_closed_day.sql"),
+    },
+];
 
 pub const HISTORY: &str = "\
 CREATE TABLE IF NOT EXISTS lake_schema_migration (
