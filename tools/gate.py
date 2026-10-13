@@ -15,7 +15,7 @@ Disk is read where Docker keeps it: `df` of the root of a container, which is
 Docker's own filesystem, on a Docker Desktop VM and a CI runner alike.
 
     gate.py start --make-pid PID --floor-start GB --floor-stop GB
-                  --budgets "stage=GB ..." --enforce yes|no --images "..."
+                  --budgets "stage=GB ..." --images "..."
     gate.py begin STAGE
     gate.py end STAGE [--drop IMAGE ...]
     gate.py finish
@@ -228,7 +228,7 @@ def start(args: argparse.Namespace) -> int:
         images[ref] = docker("image", "inspect", "--format", "{{.Id}}", ref).stdout.strip()
     (STATE / "run.json").write_text(json.dumps({
         "make_pid": args.make_pid, "floor_start_kb": floor_start_kb,
-        "floor_stop_kb": floor_stop_kb, "budgets": budgets, "enforce": args.enforce == "yes",
+        "floor_stop_kb": floor_stop_kb, "budgets": budgets,
         "start_free_kb": kb, "started": time.time(), "images": images,
     }))
     record(kb)
@@ -314,14 +314,21 @@ def end(args: argparse.Namespace) -> int:
         print(f"gate: FAILED -- stage {stage} has no budget in GATE_BUDGETS", file=sys.stderr)
         return 1
     if over:
-        print(f"gate: {'FAILED' if run['enforce'] else 'warning'} -- stage {stage} held "
-              f"{gb(peak_kb)} GB above where the gate started, over its {budget:g} GB budget "
-              f"(GATE_BUDGETS in the Makefile).\n"
+        print(f"gate: FAILED -- stage {stage} held {gb(peak_kb)} GB above where the gate started, "
+              f"over its {budget:g} GB budget (GATE_BUDGETS_LOCAL or GATE_BUDGETS_CI in the "
+              f"Makefile).\n"
               f"  A stage that needs more disk than it did is a finding: free what it builds "
               f"before the next stage, split it, or raise its budget in the same commit that "
-              f"says why.", file=sys.stderr)
-        return 1 if run["enforce"] else 0
+              f"says why.\n"
+              f"  measured so far: {measured()}", file=sys.stderr)
+        return 1
     return 0
+
+
+def measured() -> str:
+    """Each stage's peak so far as a budget row, ready to paste into the Makefile."""
+    rows = [line.split("\t") for line in (STATE / "stages").read_text().splitlines()]
+    return " ".join(f"{row[0]}={row[1]}" for row in rows)
 
 
 def finish(_: argparse.Namespace) -> int:
@@ -335,6 +342,7 @@ def finish(_: argparse.Namespace) -> int:
               f"freed to {after:>5}  {int(secs) // 60:>3}m{int(secs) % 60:02d}s  {verdict}")
     worst = max(rows, key=lambda r: float(r[1]))
     print(f"gate: the most it held at once was {worst[1]} GB, in {worst[0]}")
+    print(f"gate: measured peaks, a budget row before headroom: {measured()}")
     docker("rm", "-f", PROBE)
     (STATE / "run.json").unlink()
     return 0
@@ -348,7 +356,6 @@ def main() -> int:
     s.add_argument("--floor-start", required=True)
     s.add_argument("--floor-stop", required=True)
     s.add_argument("--budgets", required=True)
-    s.add_argument("--enforce", choices=("yes", "no"), default="yes")
     s.add_argument("--images", default="")
     s.add_argument("--cache-days", default="14")
     b = sub.add_parser("begin")

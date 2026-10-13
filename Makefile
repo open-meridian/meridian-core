@@ -54,36 +54,43 @@ help:
 # image -- and the largest single stage, not the sum of them all. Before it
 # starts it refuses under GATE_DISK_START GB free on Docker's own filesystem;
 # while it runs it stops itself under GATE_DISK_STOP; and a stage holding more
-# than its budget, in GB above where the gate started, fails it. The budgets
-# are the peaks of a run from cold caches with up to 2 GB of headroom
-# (2026-10-12: 0.0, 2.2, 7.1, 7.5, 5.3, 5.2, 5.2, 5.1, 5.6 and 5.3 GB, in
-# this order): a stage that outgrows its budget is a finding, and raising it
-# says why in its commit.
+# than its budget, in GB above where the gate started, fails it -- here and on
+# CI alike, so growth cannot reach main by a push that skipped the hook.
 #
-# A CI runner shares its disk with nobody, and starts with none of the images
-# a developer's machine already holds, which a stage then pulls: there the
-# floors only let the gate say the disk is full before it is, and a budget
-# overrun is reported, not failed. The pre-push gate is where it is held.
+# The budgets are one table, a row each for a developer's machine and for
+# GitHub's runner, which pulls every image fresh where a laptop holds them
+# already, and shares its disk with nobody, so its floors are low. The local
+# row is the peaks of a run from cold caches with up to 2 GB of headroom
+# (2026-10-12: 0.0, 2.2, 7.1, 7.5, 5.3, 5.2, 5.2, 5.1, 5.6 and 5.3 GB, in
+# stage order). The CI row is an estimate until the runner has been measured:
+# those peaks, plus every image a fresh runner has pulled by the end of each
+# stage (rust 0.8, node and debian 0.3, then postgres, nats, openldap and
+# Playwright's Chromium 2.9, python 0.2, postgres 17 0.3, helm 0.1 GB), plus
+# 3 GB or more. The gate prints each stage's peak as it ends and the whole row
+# at the end, ready to paste: a stage that outgrows its budget is a finding,
+# and raising a budget, or recalibrating the CI row from a run, says why in
+# its commit.
 #
 # The order is the targets' order before the stages, but e2e-settings-page,
 # which ran on its own between the plugin page and the harness, now runs
 # beside the other targets that use the compile's test binaries, so those are
 # freed once and not built twice.
 GATE := $(PY) tools/gate.py
-#              stage=GB: the most each stage may hold above where the gate started
-GATE_BUDGETS ?= checks=1 runtime=4 compile=9 tests=10 sdk=7 dashboards=7 harness=7 first-run=7 image=7 lint=7
+#                    stage=GB: the most each stage may hold above where the gate started
+GATE_BUDGETS_LOCAL ?= checks=1 runtime=4 compile=9  tests=10 sdk=7  dashboards=7  harness=7  first-run=7  image=7  lint=7
+GATE_BUDGETS_CI    ?= checks=2 runtime=7 compile=12 tests=15 sdk=13 dashboards=13 harness=13 first-run=13 image=14 lint=13
 # The cargo caches kept between runs: a run starts them again once they are
 # this many days old, so what cargo built for a dependency nothing uses any
 # more does not stay on the disk for good.
 GATE_CACHE_DAYS ?= 14
 ifeq ($(GITHUB_ACTIONS),true)
+GATE_BUDGETS    ?= $(GATE_BUDGETS_CI)
 GATE_DISK_START ?= 4
 GATE_DISK_STOP  ?= 2
-GATE_ENFORCE    ?= no
 else
+GATE_BUDGETS    ?= $(GATE_BUDGETS_LOCAL)
 GATE_DISK_START ?= 20
 GATE_DISK_STOP  ?= 16
-GATE_ENFORCE    ?= yes
 endif
 
 ci-local: gate-start stage-checks stage-runtime stage-compile stage-tests stage-sdk stage-dashboards stage-harness stage-first-run stage-image stage-lint
@@ -114,7 +121,7 @@ stage-lint:       gate-begin-lint lint
 
 gate-start:
 	@$(GATE) start --make-pid $$PPID --floor-start $(GATE_DISK_START) --floor-stop $(GATE_DISK_STOP) \
-		--budgets "$(GATE_BUDGETS)" --enforce $(GATE_ENFORCE) --cache-days $(GATE_CACHE_DAYS) \
+		--budgets "$(GATE_BUDGETS)" --cache-days $(GATE_CACHE_DAYS) \
 		--images "$(RUNTIME_IMAGE) $(HARNESS_IMAGE) meridian-python-interop $(SETTINGS_PAGE_IMAGE) $(SETTINGS_BROWSER_IMAGE)"
 
 gate-begin-%:
