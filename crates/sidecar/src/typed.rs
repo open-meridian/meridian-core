@@ -139,30 +139,6 @@ pub(crate) const BY_ID_ALONE: [&str; 13] = [
     "meridian.v1.DontKnowExecutionRequest",
 ];
 
-/// Contract v23's rows whose store behaviour is not built yet: the `ems`'s
-/// accept and DK of a venue-originated fill (W11.23, W11.24), and a data
-/// plugin's outcomes recorded and a reader's read of them (W10.4, W10.6).
-/// The sidecar admits their operations on the grant and answers them
-/// UNIMPLEMENTED, rather than sending what no store serves; v23's build
-/// takes each off this list as its store answers it.
-pub(crate) const NOT_BUILT: [&str; 4] = [
-    "platform.book.command.accept-execution",
-    "platform.book.command.dont-know-execution",
-    "platform.lake.command.record-outcomes",
-    "platform.lake.query.list-outcomes",
-];
-
-/// UNIMPLEMENTED for a row on [`NOT_BUILT`], after its grant is checked.
-#[allow(clippy::result_large_err)]
-fn not_built(topic: &str) -> Result<(), Status> {
-    if NOT_BUILT.contains(&topic) {
-        return Err(Status::unimplemented(format!(
-            "{topic} is contract v23's, and this runtime does not serve it yet"
-        )));
-    }
-    Ok(())
-}
-
 /// The venue facts stamped from the venue account map (matrix/stamped.tsv's
 /// `venue-account-map`, contract v22), each with the topic it is sent on.
 const VENUE_FACTS: [(&str, &str); 2] = [
@@ -474,7 +450,6 @@ impl Sidecar {
     ) -> Result<Response<R>, Status> {
         let topic = self.own_topic(topic);
         self.granted(&topic)?;
-        not_built(&topic)?;
         self.dates_stand(payload_type, &message.encode_to_vec())?;
         let mut stamp = if AS_ITSELF.contains(&topic.as_str()) {
             Stamp::default()
@@ -550,7 +525,6 @@ impl Sidecar {
     ) -> Result<Response<R>, Status> {
         let topic = self.own_topic(topic);
         self.granted(&topic)?;
-        not_built(&topic)?;
         let message = self.kept_at_the_edge(payload_type, message)?;
         self.statement_stands(payload_type, &message.encode_to_vec())?;
         self.dates_stand(payload_type, &message.encode_to_vec())?;
