@@ -35,7 +35,17 @@ no brokerage, no paper account, no trading API of any kind is reached.
 8. Unplaced facts: an execution naming a placement nobody holds, kept in
    the account its code maps to; one whose code nobody mapped, kept naming
    no account and counted on the venue's admin view.
-9. `store book` prints the orders, placements, executions and positions,
+9. Venue-originated fills (contract v23; W11.11, W11.23, W11.24): the venue
+   reports two fills of orders placed in its own app, on no order and no
+   placement; each waits unmatched in the account its code maps to, on the
+   desk's Unmatched fills; the desk accepts one to a new order, filled with
+   its placement at filled, routed at 0, naming the venue; and answers the
+   other DK through its MCP tool, dk_execution. The venue hears each answer.
+   A later fill of the DK'd venue order waits unmatched on its own, and the
+   DK'd fill is answered no more. And the date read's spot date for
+   EUR/USD traded Friday 9 October 2026 is Tuesday 13 October, Columbus Day
+   counted on EUR alone.
+10. `store book` prints the orders, placements, executions and positions,
    and `meridian-bor rebuild` reproduces it line for line.
 
 Run from the repository's root by the Makefile, which builds the images and
@@ -58,6 +68,10 @@ ENV = dict(os.environ, MERIDIAN_HARNESS_PEOPLE=PEOPLE,
            MERIDIAN_HARNESS_STAND_IN=os.path.abspath("e2e/orders"))
 INSTANCES = ("pm", "desk", "comp", "venue", "venue2")
 CODE = "SIM-ACCT-1"
+# The cash instruments of the platform's stand-in (deploy/harness/platform.py),
+# by the IDs its EUR/USD spot-date rule names.
+PLATFORM_EUR = "INS-01JEUR" + "0" * 19 + "1"
+PLATFORM_USD = "INS-01JUSD" + "0" * 19 + "1"
 
 
 class Failed(Exception):
@@ -280,18 +294,65 @@ def run():
          f"step 8, kept naming no account: {nobody}")
     runner("summary", "--instance", "venue", "--until", "Unplaced facts", "--seconds", "90")
 
-    # 9. The book printed, and rebuilt from its journal line for line.
+    # 9. Venue-originated fills (contract v23).
+    own = lambda quantity, order: page(
+        "venue", "write",
+        f"/originate?code={CODE}&instrument={aapl}&quantity={quantity}&side=buy&order={order}")
+    first, second = own(5, "SIM-OWN-1"), own(3, "SIM-OWN-2")
+    for fill, order in ((first, "SIM-OWN-1"), (second, "SIM-OWN-2")):
+        must(fill["state"] == "EXECUTION_STATE_UNMATCHED" and fill["account_id"] == account
+             and fill["venue_order_id"] == order and not fill["placement_id"],
+             f"step 9, a fill on no placement waits unmatched in its mapped account: {fill}")
+    ids = (first["execution_id"], second["execution_id"])
+    waiting = page("desk", "write", f"/unmatched?account={account}")["fills"]
+    must({f["execution_id"] for f in waiting} == set(ids),
+         f"step 9, the desk lists the two unmatched fills: {waiting}")
+    accepted = page("desk", "write", f"/accept?executions={ids[0]}&new=1")
+    placed = accepted["placement"]
+    must(accepted["order"]["state"] == "ORDER_STATE_FILLED"
+         and placed["state"] == "PLACEMENT_STATE_FILLED" and placed["routed_at_ns"] == 0
+         and placed["connectivity"] == "venue"
+         and accepted["executions"][0]["state"] == "EXECUTION_STATE_MATCHED",
+         f"step 9, accepted to a new order, filled, its placement at filled: {accepted}")
+    runner("mcp", "connect", "--covers", "desk:ems:write", "--client", "desk agent")
+    runner("mcp", "list", "--expect", "desk__accept_execution", "--expect", "desk__dk_execution",
+           "--expect", "desk__read_unmatched_fills", "--client", "desk agent")
+    runner("mcp", "call", "desk__dk_execution",
+           json.dumps({"execution_ids": [ids[1]], "reason": "no_matching_order"}),
+           "--expect-outcome", "made", "--client", "desk agent")
+    heard = until(60, lambda: (lambda said: said if {(a.get("execution_id"), a.get("state"))
+                                                     for a in said} >= {
+        (ids[0], "EXECUTION_STATE_MATCHED"), (ids[1], "EXECUTION_STATE_DONT_KNOW")} else None)(
+        page("venue", "write", "/answers")["answers"]), "step 9, the venue heard each answer")
+    must(not any(a.get("not_ours") for a in heard), f"step 9, it heard only its own: {heard}")
+    later = own(2, "SIM-OWN-2")
+    must(later["state"] == "EXECUTION_STATE_UNMATCHED",
+         f"step 9, a later fill of the DK'd venue order waits on its own: {later}")
+    left = page("desk", "write", f"/unmatched?account={account}")["fills"]
+    must([f["execution_id"] for f in left] == [later["execution_id"]],
+         f"step 9, only the later fill waits: {left}")
+    again = refusal(page("desk", "write", f"/dk?executions={ids[1]}&reason=other&text=again"))
+    must(again.get("reason") == "REFUSAL_REASON_EXECUTION_STATE",
+         f"step 9, a DK'd fill is answered no more: {again}")
+    spot = until(90, lambda: (lambda said: said if said["outcome"] == "DATE_OUTCOME_COMPUTED"
+                              else None)(
+        page("venue", "write", f"/spot?pair={PLATFORM_EUR},{PLATFORM_USD}&trade=2026-10-09")),
+        "step 9, EUR/USD's spot date computed")
+    must(spot["date"] == "2026-10-13" and spot["rule"] == "EUR/USD v1",
+         f"step 9, EUR/USD traded Friday 9 October spots Tuesday 13 October: {spot}")
+
+    # 10. The book printed, and rebuilt from its journal line for line.
     before = store_book()
     for wanted in ("order|Orders fund|", "placement|Orders fund|", "execution|Orders fund|",
                    "unplaced||execution|2|venue|false", "instruction|control|3|1"):
-        must(wanted in before, f"step 9, store book prints {wanted!r}: {before[-2000:]}")
+        must(wanted in before, f"step 10, store book prints {wanted!r}: {before[-2000:]}")
     compose("stop", "bor")
     compose("run", "--rm", "--no-deps", "-T", "bor",
             "set -e; db=$(cat /secrets/postgres); "
             "export MERIDIAN_BOR_DATABASE_URL=postgres://meridian:$db@postgres:5432/meridian; "
             "exec meridian-bor rebuild")
     after = store_book()
-    must(before == after, "step 9, meridian-bor rebuild did not reproduce the book")
+    must(before == after, "step 10, meridian-bor rebuild did not reproduce the book")
     took = int(time.time() - started)
     print(f"{NAME} OK in {took}s: on the plugin harness against core's stand-ins and a simulated "
           "venue, an order proposed, held at proposed awaiting compliance and released by its "
@@ -302,8 +363,11 @@ def run():
           "released within its parent, its fill the parent's; a release outside the desk's write "
           "scope denied with no code; a stop's cancel reported by the venue at once and recorded, "
           "a placement under it held back by the venue, a plugin admin refused All accounts; two "
-          "unplaced facts, one naming no account and counted on the venue's admin view; and "
-          "meridian-bor rebuild reproducing the book line for line")
+          "unplaced facts, one naming no account and counted on the venue's admin view; two "
+          "venue-originated fills waiting unmatched, one accepted to a new order at filled, one "
+          "answered DK by the ems's tool, the venue hearing both, a later fill waiting on its own; "
+          "EUR/USD's spot date Tuesday 13 October; and meridian-bor rebuild reproducing the book "
+          "line for line")
 
 
 def main():

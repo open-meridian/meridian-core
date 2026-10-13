@@ -21,6 +21,17 @@ STAND_IN_ORDERS=desk holds `oms` and `ems`:
   /map?account=&code=&connectivity=             MapVenueAccount, at admin
   /orders, /heard                               what it reads and hears
 
+From contract v23 the desk is the ems's page for venue-originated fills
+(W11.23, W11.24): /fills is the page a person opens, the unmatched fills in
+its accounts on the kit, one line each on its pager, each with Accept (to an
+order, or to a new order with its sleeve) and DK (a reason from the closed
+list, text with "other"), and "the venue is not told" before a DK where the
+fill's venue takes no acknowledgement; posted, each acts for the person.
+Under parity its tools are the ems's, accept_execution and dk_execution,
+and the page's read read_unmatched_fills, each at write on `ems`. For the
+run: /unmatched, /accept?executions=&order=|&new=1[&sleeve=],
+/dk?executions=&reason=[&text=].
+
 STAND_IN_ORDERS=comp is `compliance`: /check?order=&verdict=pass|block|refuse.
 
 STAND_IN_ORDERS=venue is a connectivity plugin, the simulated venue. It hears
@@ -42,7 +53,16 @@ confirmation. It serves:
                                   answering the date, outcome and rule;
   /heard                          the placements heard, by ID, and what it did;
   /astray?code=                   an execution naming a placement nobody
-                                  holds, for the book to keep unplaced.
+                                  holds, for the book to keep unplaced;
+  /originate?code=&instrument=&quantity=&side=&order=
+                                  a fill on no order and no placement, as a
+                                  broker reports one placed in its own app
+                                  (contract v23, W11.11), answering the
+                                  execution's ID and state;
+  /answers                        each execution it reported, as it heard
+                                  it answered: matched or DK (ruling 15);
+  /spot?pair=INS-..,INS-..&trade= a pair's spot date from a trade date
+                                  (W3.20), answering the date and rule.
 """
 import asyncio
 import base64
@@ -54,6 +74,8 @@ import time
 import urllib.parse
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+
+import html
 
 import grpc
 import meridian
@@ -129,6 +151,90 @@ def order_json(order):
 
 def one(query, name, default=""):
     return query.get(name, [default])[0]
+
+
+def split(text):
+    return [part for part in text.replace(" ", "").split(",") if part]
+
+
+def fill_json(execution):
+    return {"execution_id": execution.execution_id, "account_id": execution.account_id,
+            "instrument_id": execution.instrument_id, "side": ops.Side.Name(execution.side),
+            "quantity": number(execution.quantity) if execution.HasField("quantity") else "",
+            "state": ops.ExecutionState.Name(execution.state),
+            "venue_order_id": execution.venue_order_id, "order_id": execution.order_id,
+            "placement_id": execution.placement_id, "trade_date": execution.trade_date,
+            "dk_reason": ops.DkReason.Name(execution.dk_reason)}
+
+
+# ── Contract v23: the ems's page for venue-originated fills ────────────────
+
+KIT = "/.meridian/ui/0.9.0/"
+CODE_MAPPED = "SIM-ACCT-1"
+DK_REASONS = [
+    ("unknown_instrument", "Unknown instrument"), ("wrong_side", "Wrong side"),
+    ("quantity_exceeds_order", "Quantity exceeds order"),
+    ("no_matching_order", "No matching order"), ("price_exceeds_limit", "Price exceeds limit"),
+    ("calculation_difference", "Calculation difference"), ("other", "Other"),
+]
+
+
+def fills_html(fills, told, said, code):
+    """The unmatched fills on the kit: one line each on its pager, Accept and
+    DK in dialogs, the page fitting one screen at a desk and on a phone."""
+    e = html.escape
+    rows = "".join(
+        f"<tr data-id=\"{e(f.execution_id)}\"><td title=\"{e(f.execution_id)}\">{e(f.execution_id)}</td>"
+        f"<td class=\"wide\">{e(f.account_id)}</td>"
+        f"<td title=\"{e(f.instrument_id)}\">{e(f.instrument_id)}</td>"
+        f"<td>{e(ops.Side.Name(f.side).removeprefix('SIDE_').replace('_', ' ').lower())}</td>"
+        f"<td class=\"num\">{e(number(f.quantity))}</td>"
+        f"<td class=\"wide\">{e(f.venue_order_id)}</td><td class=\"wide\">{e(f.trade_date)}</td>"
+        f"<td class=\"actions\"><button type=\"button\" data-dialog-open=\"accept\" "
+        f"data-title=\"Accept {e(f.execution_id)}\" data-fill=\"{e(json.dumps({'execution_ids': f.execution_id}))}\">Accept</button> "
+        f"<button type=\"button\" data-dialog-open=\"dk\" data-title=\"DK {e(f.execution_id)}\" "
+        f"data-fill=\"{e(json.dumps({'execution_ids': f.execution_id}))}\">DK</button></td></tr>"
+        for f in fills)
+    table = (
+        "<p class=\"empty\" data-fills=\"0\">No unmatched fill: a fill your venues report on no "
+        "order and no placement waits here for you to accept it or answer it DK.</p>"
+        if not fills else
+        f"<om-pager search=\"Search fills\"><table class=\"list one-line\" data-fills=\"{len(fills)}\">"
+        "<thead><tr><th>Execution</th><th class=\"wide\">Account</th><th>Instrument</th><th>Side</th>"
+        "<th class=\"num\">Quantity</th><th class=\"wide\">Venue order</th><th class=\"wide\">Traded</th>"
+        f"<th class=\"actions\"></th></tr></thead><tbody>{rows}</tbody></table></om-pager>")
+    reasons = "".join(f"<option value=\"{v}\">{e(label)}</option>" for v, label in DK_REASONS)
+    not_told = "" if told else (
+        "<p class=\"hint\" data-not-told>The venue is not told: it takes no acknowledgement of "
+        "a fill it originated.</p>")
+    notice = f"<p class=\"notice\" role=\"status\">{e(said)}</p>" if said else ""
+    state = "warn" if fills else "ok"
+    return (
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+        f"<title>Unmatched fills</title><link rel=\"stylesheet\" href=\"{KIT}meridian.css\">"
+        f"<script src=\"{KIT}meridian.js\"></script></head><body><main class=\"page\">"
+        "<header class=\"page-head\"><div><h1>Unmatched fills</h1></div>"
+        f"<om-status data-om-header state=\"{state}\" label=\"{len(fills)} unmatched\"></om-status></header>"
+        f"{notice}{table}"
+        "<dialog id=\"accept\" aria-labelledby=\"accept-title\"><form method=\"post\" action=\"/fills/accept\">"
+        "<div class=\"dialog-head\"><h2 id=\"accept-title\">Accept</h2></div><div class=\"dialog-body\">"
+        "<input type=\"hidden\" name=\"execution_ids\">"
+        "<label class=\"check\"><input type=\"radio\" name=\"to\" value=\"new\" checked> To a new order</label>"
+        "<label class=\"check\"><input type=\"radio\" name=\"to\" value=\"order\"> To an order of yours</label>"
+        "<label data-om-applies-when=\"to\" data-om-one-of=\"order\">Order <input name=\"order_id\" placeholder=\"ORD-...\"></label>"
+        "<label data-om-applies-when=\"to\" data-om-one-of=\"new\">Sleeve <input name=\"sleeve\" placeholder=\"The account's unsleeved part\"></label>"
+        "<label>Note <input name=\"note\" maxlength=\"2000\" placeholder=\"Why\"></label></div>"
+        "<div class=\"dialog-foot\"><button type=\"button\" data-dialog-close>Cancel</button>"
+        "<button type=\"submit\" class=\"primary\">Accept</button></div></form></dialog>"
+        "<dialog id=\"dk\" aria-labelledby=\"dk-title\"><form method=\"post\" action=\"/fills/dk\">"
+        "<div class=\"dialog-head\"><h2 id=\"dk-title\">DK</h2></div><div class=\"dialog-body\">"
+        "<input type=\"hidden\" name=\"execution_ids\">"
+        f"<label>Reason <select name=\"reason\" required>{reasons}</select></label>"
+        "<label data-om-applies-when=\"reason\" data-om-one-of=\"other\">Text <input name=\"text\" maxlength=\"2000\" placeholder=\"Why, as the venue reads it\"></label>"
+        f"{not_told}</div><div class=\"dialog-foot\"><button type=\"button\" data-dialog-close>Cancel</button>"
+        "<button type=\"submit\" class=\"primary\">DK</button></div></form></dialog>"
+        "</main></body></html>")
 
 
 class Plugin:
@@ -264,7 +370,96 @@ class Desk(Plugin):
             return await self.orders(query)
         if path == "/heard":
             return {"instructions": self.instructions}
+        # Contract v23 (W11.23, W11.24): the unmatched fills, answered.
+        if path == "/unmatched":
+            return {"fills": [fill_json(e) for e in await self.unmatched(one(query, "account"))]}
+        if path == "/accept":
+            return await self.accept(split(one(query, "executions")), one(query, "order"),
+                                     bool(one(query, "new")), one(query, "sleeve"),
+                                     one(query, "note"), caller)
+        if path == "/dk":
+            return await self.dont_know(split(one(query, "executions")), one(query, "reason"),
+                                        one(query, "text"), caller)
         return {"page": "the oms and ems stand-in"}
+
+    async def unmatched(self, account=""):
+        listed = await self.call("ListOrders", ops.ListOrdersParams(
+            account_id=account, page_size=500,
+            execution_state=ops.ExecutionState.EXECUTION_STATE_UNMATCHED))
+        return list(listed.executions)
+
+    async def accept(self, ids, order, new, sleeve, note, caller):
+        params = ops.AcceptExecutionParams(execution_ids=ids, note=note, acting_for=caller)
+        if new or not order:
+            params.new_order.CopyFrom(ops.NewOrderFromExecutions(sleeve=sleeve))
+        else:
+            params.order_id = order
+        done = await self.call("AcceptExecution", params)
+        return {"order": order_json(done.order),
+                "placement": {"placement_id": done.placement.placement_id,
+                              "state": ops.PlacementState.Name(done.placement.status.state),
+                              "routed_at_ns": done.placement.routed_at_ns,
+                              "connectivity": done.placement.connectivity_instance_id},
+                "executions": [fill_json(e) for e in done.executions]}
+
+    async def dont_know(self, ids, reason, text, caller):
+        done = await self.call("DontKnowExecution", ops.DontKnowExecutionParams(
+            execution_ids=ids, reason=ops.DkReason.Value("DK_REASON_" + (reason or "other").upper()),
+            text=text, acting_for=caller))
+        return {"executions": [fill_json(e) for e in done.executions]}
+
+    async def venue_told(self, connectivity, code):
+        """Whether the fill's venue takes an acknowledgement, by its catalogue
+        (W11.20): unspecified, or none published, reads as none."""
+        try:
+            read = await self.call("ReadVenueCatalogue", ops.ReadVenueCatalogueParams(
+                connectivity_instance_id=connectivity, venue_account_code=code))
+        except Refusal:
+            return False
+        said = read.catalogue.execution_acknowledgement
+        return said in (ops.ExecutionAcknowledgement.EXECUTION_ACKNOWLEDGEMENT_BN,
+                        ops.ExecutionAcknowledgement.EXECUTION_ACKNOWLEDGEMENT_DONT_KNOW_TRADE)
+
+    async def fills_page(self, caller, said=""):
+        fills = await self.unmatched()
+        told = await self.venue_told("venue", CODE_MAPPED) if fills else False
+        return fills_html(fills, told, said, CODE_MAPPED)
+
+    async def tool(self, path, asked, caller):
+        """A tool's call (W6.20, contract v12): its arguments as JSON, its
+        answer typed, outcome made, unchanged or refused."""
+        try:
+            if path == "/fills/read":
+                return {"outcome": "unchanged", "data": {
+                    "fills": [fill_json(e) for e in await self.unmatched(asked.get("account_id", ""))]}}
+            ids = asked.get("execution_ids") or []
+            if path == "/fills/accept":
+                new = asked.get("new_order")
+                done = await self.accept(ids, asked.get("order_id", ""), new is not None,
+                                         (new or {}).get("sleeve", ""), asked.get("note", ""), caller)
+            else:
+                done = await self.dont_know(ids, asked.get("reason", ""), asked.get("text", ""), caller)
+            return {"outcome": "made", "data": done}
+        except Refusal as failed:
+            said = failed.said["refused"]
+            return {"outcome": "refused", "reason": said.get("reason", "refused").lower(),
+                    "fields": [{"path": field} for field in said.get("fields", [])],
+                    "detail": said.get("words", "")}
+
+    async def form(self, path, fields, caller):
+        """The page's forms, posted by a person."""
+        ids = split(fields.get("execution_ids", ""))
+        try:
+            if path == "/fills/accept":
+                await self.accept(ids, fields.get("order_id", ""), fields.get("to") == "new",
+                                  fields.get("sleeve", ""), fields.get("note", ""), caller)
+                said = f"Accepted {', '.join(ids)}."
+            else:
+                await self.dont_know(ids, fields.get("reason", ""), fields.get("text", ""), caller)
+                said = f"Answered {', '.join(ids)} DK."
+        except Refusal as failed:
+            said = "Refused: " + failed.said["refused"].get("words", "")
+        return await self.fills_page(caller, said)
 
 
 # ── compliance ──────────────────────────────────────────────────────────────
@@ -299,6 +494,16 @@ class Venue(Plugin):
         self.worked = {}
         self.halted = None
         self.sent = 0
+        self.answers = []
+
+    async def on_execution(self, heard):
+        """Each execution it reported, as the book answered it (ruling 15):
+        delivered at this instance by its raw record alone."""
+        execution = heard.message.execution
+        if execution.raw_record.instance_id != self.me:
+            self.answers.append({"execution_id": execution.execution_id, "not_ours": True})
+            return
+        self.answers.append(fill_json(execution))
 
     def raw(self, key):
         return self.plugin.raw_record(key)
@@ -397,6 +602,41 @@ class Venue(Plugin):
                     "rule": f"{rule.subject} v{rule.version}" if rule.subject else ""}
         if path == "/heard":
             return {"heard": self.heard, "halted": self.halted, "working": sorted(self.worked)}
+        if path == "/answers":
+            return {"answers": self.answers}
+        if path == "/spot":
+            # Contract v23: a pair's spot date (W3.20), by the two cash
+            # instruments' IDs the platform's rule names. Until the one-ID
+            # revision a deployment keeps a currency under a local ID with the
+            # platform's beside it (the 2026-10-11 ruling), and a rule pulled
+            # for a pair names the platform's.
+            pair = split(one(query, "pair"))
+            answered = await self.call("ComputeDate", ops.ComputeDateParams(
+                spot=ops.SpotDateInputs(pair=pair, trade_date=one(query, "trade"))))
+            rule = answered.basis.rule
+            return {"date": answered.date, "outcome": ops.DateOutcome.Name(answered.outcome),
+                    "rule": f"{rule.subject} v{rule.version}" if rule.subject else ""}
+        if path == "/originate":
+            # Contract v23 (W11.11): a fill of an order placed in the broker's
+            # own app, on no order and no placement, its account stamped from
+            # the ems's map.
+            today = datetime.now(timezone.utc).date()
+            venue_order = one(query, "order")
+            self.sent += 1
+            done = await self.call("ReportExecution", ops.ReportExecutionParams(
+                venue_account_code=one(query, "code"),
+                venue_execution_id=f"SIM-OWN-{venue_order}:{self.sent}",
+                kind=ops.ExecutionKind.EXECUTION_KIND_VENUE_REPORTED,
+                source=ops.ExecutionSource.EXECUTION_SOURCE_PRIMARY,
+                quantity=decimal(one(query, "quantity")), price=usd(PRICE),
+                trade_time_ns=time.time_ns(), trade_date=today.isoformat(),
+                finality=ops.Finality(level=ops.FinalityLevel.FINALITY_LEVEL_FINAL, at_ns=time.time_ns()),
+                settlement_date=settles(today).isoformat(),
+                instrument_id=one(query, "instrument"),
+                side=ops.Side.Value("SIDE_" + one(query, "side", "buy").upper()),
+                venue_order_id=venue_order, venue_client_order_id=f"CL-{venue_order}",
+                raw_record=self.raw(f"fills/own/{venue_order}/{self.sent}")))
+            return fill_json(done.execution)
         if path == "/astray":
             today = datetime.now(timezone.utc).date()
             done = await self.call("ReportExecution", ops.ReportExecutionParams(
@@ -417,9 +657,45 @@ class Venue(Plugin):
 
 def serve(served):
     class Handler(http.server.BaseHTTPRequestHandler):
+        def answer_html(self, page):
+            data = page.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_POST(self):
+            # The desk's page (contract v23): a person's form, or a tool's call.
+            parsed = urllib.parse.urlparse(self.path)
+            caller = assertion(self.headers.get("Meridian-Caller"))
+            sent = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            if not isinstance(served, Desk) or parsed.path not in ("/fills/accept", "/fills/dk", "/fills/read"):
+                self.send_response(404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if self.headers.get("Content-Type", "").startswith("application/json"):
+                asked = json.loads(sent or b"{}")
+                future = asyncio.run_coroutine_threadsafe(served.tool(parsed.path, asked, caller), LOOP)
+                data = json.dumps(future.result(timeout=60)).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            fields = {name: values[0] for name, values in urllib.parse.parse_qs(sent.decode()).items()}
+            future = asyncio.run_coroutine_threadsafe(served.form(parsed.path, fields, caller), LOOP)
+            self.answer_html(future.result(timeout=60))
+
         def do_GET(self):
             parsed = urllib.parse.urlparse(self.path)
             caller = assertion(self.headers.get("Meridian-Caller"))
+            if isinstance(served, Desk) and parsed.path == "/fills":
+                future = asyncio.run_coroutine_threadsafe(served.fills_page(caller), LOOP)
+                self.answer_html(future.result(timeout=60))
+                return
             future = asyncio.run_coroutine_threadsafe(
                 served.answer(parsed.path, urllib.parse.parse_qs(parsed.query), caller), LOOP)
             try:
@@ -441,6 +717,50 @@ def serve(served):
     http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
 
 
+class DeskInterface(Interface):
+    """The desk's interface, with the ems's tools beside its pages (W6.20,
+    contract v12): under parity, each act of the Unmatched fills page and its
+    read, at write on `ems`."""
+
+    def _tools(self):
+        write = sidecar_pb2.ACCESS_LEVEL_WRITE
+        ids = {"type": "array", "minItems": 1, "maxItems": 500, "items": {"type": "string"},
+               "description": "the unmatched executions' EXE- IDs, of one account, instrument and side"}
+        accept = {"type": "object", "properties": {
+            "execution_ids": ids,
+            "order_id": {"type": "string", "description": "an order the ems may place against; or new_order"},
+            "new_order": {"type": "object", "properties": {"sleeve": {"type": "string"}, "note": {"type": "string"}},
+                          "additionalProperties": False},
+            "note": {"type": "string", "maxLength": 2000}},
+            "required": ["execution_ids"], "additionalProperties": False}
+        dk = {"type": "object", "properties": {
+            "execution_ids": ids,
+            "reason": {"type": "string", "enum": [v for v, _ in DK_REASONS]},
+            "text": {"type": "string", "maxLength": 2000, "description": "required with other"}},
+            "required": ["execution_ids", "reason"], "additionalProperties": False}
+        read = {"type": "object", "properties": {"account_id": {"type": "string"}},
+                "additionalProperties": False}
+
+        def tool(name, title, description, path, schema, reads=False):
+            return sidecar_pb2.ToolDeclaration(
+                name=name, title=title, description=description, method="POST", path=path,
+                levels=[write], reads=reads, input_schema=json.dumps(schema),
+                output_schema=json.dumps({"type": "object"}) if reads else "", roles=["ems"])
+
+        return [
+            tool("read_unmatched_fills", "Read unmatched fills",
+                 "the fills your venues reported on no order and no placement, waiting for an answer",
+                 "/fills/read", read, reads=True),
+            tool("accept_execution", "Accept unmatched fills",
+                 "accept unmatched fills of one account, instrument and side to an order, or to a new "
+                 "order made from them, for the person; the book creates the placement at filled",
+                 "/fills/accept", accept),
+            tool("dk_execution", "Answer unmatched fills DK",
+                 "answer unmatched fills don't know, with a reason, and text with other, for the person",
+                 "/fills/dk", dk),
+        ]
+
+
 async def main():
     title, kind, levels = {
         "pm": ("Portfolio stand-in", Pm, ["write", "admin"]),
@@ -449,14 +769,20 @@ async def main():
         "venue": ("Simulated venue", Venue, ["write", "admin"]),
     }[KIND]
     roles = {"desk": ["oms", "ems"]}.get(KIND, [])
-    plugin = await meridian.connect(
-        interface=Interface(PORT, title, pages=[Page("/", title, levels=levels, roles=roles)]))
+    pages = [Page("/", title, levels=levels, roles=roles)]
+    interface = Interface(PORT, title, pages=pages)
+    if KIND == "desk":
+        # Contract v23: the ems's page for unmatched fills, and its tools.
+        pages.append(Page("/fills", "Unmatched fills", levels=["write"], roles=["ems"]))
+        interface = DeskInterface(PORT, title, pages=pages)
+    plugin = await meridian.connect(interface=interface)
     served = kind(plugin)
     # Heard through the SDK's receive (W4.3): seeded by one read at start,
     # nothing handed on for it, then each change in order.
     if KIND == "venue":
         asyncio.ensure_future(plugin.receive(placement_updated=served.on_placement,
                                              trading_instruction_changed=served.on_instruction,
+                                             execution_recorded=served.on_execution,
                                              seed=False))
     elif KIND == "desk":
         asyncio.ensure_future(plugin.receive(trading_instruction_changed=served.on_instruction,
