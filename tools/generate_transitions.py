@@ -4,7 +4,10 @@ transition table, in the contract, every language's copy generated from it).
 
 The book enforces the table and no other copy of it exists in core: a
 command meeting a row's from-state it is not allowed in is refused with that
-row's code, and a venue's fact is held to it only to be recorded. This writes
+row's code, and a venue's fact is held to it only to be recorded. From
+contract v23 the table holds an execution's rows too (keyed e1 onward, their
+states the schema's `execution_states`, ExecutionState values), written as a
+second table beside the order's: the same row type over the other state. This writes
 crates/bor/src/transitions.rs; `make codegen` runs it from the schema at the
 revision Cargo.toml pins, and `make check-codegen` fails when the vendored
 file differs from a fresh generation.
@@ -24,13 +27,14 @@ HEADER = """\
 //
 // {transitions_are}
 
-use meridian_domain::v1::OrderState;
+use meridian_domain::v1::{{ExecutionState, OrderState}};
 use meridian_pb::v1::RefusalReason;
 
-/// A row's from: a state, any state, or none (a record being created).
+/// A row's from: a state, any state, or none (a record being created). An
+/// order's row by default; an execution's over ExecutionState.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum From {{
-    State(OrderState),
+pub enum From<S: 'static = OrderState> {{
+    State(S),
     Any,
     None,
 }}
@@ -38,19 +42,20 @@ pub enum From {{
 /// A row's to: a state the transition reaches or the fold decides among, or
 /// the state left as it was.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum To {{
-    State(OrderState),
+pub enum To<S: 'static = OrderState> {{
+    State(S),
     Unchanged,
 }}
 
-/// One row of the table.
+/// One row of the table: an order's by default, an execution's over
+/// ExecutionState.
 #[derive(Debug, Clone, Copy)]
-pub struct Transition {{
+pub struct Transition<S: 'static = OrderState> {{
     pub row: &'static str,
-    pub from: &'static [From],
+    pub from: &'static [From<S>],
     pub cause: &'static str,
     pub caused_by: &'static [&'static str],
-    pub to: &'static [To],
+    pub to: &'static [To<S>],
     pub refusal: &'static [RefusalReason],
 }}
 
@@ -58,9 +63,20 @@ pub struct Transition {{
 pub const STATES: [OrderState; {state_count}] = [
 {states}];
 
-/// Every row, in the table's order.
+/// Every order's row, in the table's order.
 pub const TRANSITIONS: &[Transition] = &[
 """
+
+EXECUTION_HEADER = """
+/// An execution's states, in the contract's order (contract v23).
+pub const EXECUTION_STATES: [ExecutionState; {state_count}] = [
+{states}];
+
+/// Every execution's row, in the table's order (contract v23).
+pub const EXECUTION_TRANSITIONS: &[Transition<ExecutionState>] = &[
+"""
+
+EXECUTION_ROW = re.compile(r"^e\d+$")
 
 
 def camel(enum_value, prefix):
@@ -73,8 +89,33 @@ def state(value):
     return f"OrderState::{camel(value, 'ORDER_STATE_')}"
 
 
+def execution_state(value):
+    return f"ExecutionState::{camel(value, 'EXECUTION_STATE_')}"
+
+
 def rust_str(text):
     return json.dumps(text, ensure_ascii=False)
+
+
+def emit(out, row, named, states):
+    for held in row["from"] + row["to"]:
+        if held not in ("any", "none", "unchanged") and held not in states:
+            raise ValueError(f"row {row['row']} names {held}, not one of its table's states")
+    froms = []
+    for held in row["from"]:
+        froms.append({"any": "From::Any", "none": "From::None"}.get(held) or f"From::State({named(held)})")
+    tos = []
+    for held in row["to"]:
+        tos.append("To::Unchanged" if held == "unchanged" else f"To::State({named(held)})")
+    refusals = [f"RefusalReason::{camel(code, 'REFUSAL_REASON_')}" for code in row["refusal"]]
+    out.append("    Transition {\n")
+    out.append(f"        row: {rust_str(row['row'])},\n")
+    out.append(f"        from: &[{', '.join(froms)}],\n")
+    out.append(f"        cause: {rust_str(row['cause'])},\n")
+    out.append(f"        caused_by: &[{', '.join(rust_str(who) for who in row['caused_by'])}],\n")
+    out.append(f"        to: &[{', '.join(tos)}],\n")
+    out.append(f"        refusal: &[{', '.join(refusals)}],\n")
+    out.append("    },\n")
 
 
 def generate(table):
@@ -83,22 +124,20 @@ def generate(table):
         state_count=len(table["states"]),
         states="".join(f"    {state(value)},\n" for value in table["states"]),
     )]
+    executions = table.get("execution_states", [])
+    execution_rows = [row for row in table["transitions"] if EXECUTION_ROW.match(row["row"])]
+    if execution_rows and not executions:
+        raise ValueError("the table has an execution's rows and no execution_states")
     for row in table["transitions"]:
-        froms = []
-        for held in row["from"]:
-            froms.append({"any": "From::Any", "none": "From::None"}.get(held) or f"From::State({state(held)})")
-        tos = []
-        for held in row["to"]:
-            tos.append("To::Unchanged" if held == "unchanged" else f"To::State({state(held)})")
-        refusals = [f"RefusalReason::{camel(code, 'REFUSAL_REASON_')}" for code in row["refusal"]]
-        out.append("    Transition {\n")
-        out.append(f"        row: {rust_str(row['row'])},\n")
-        out.append(f"        from: &[{', '.join(froms)}],\n")
-        out.append(f"        cause: {rust_str(row['cause'])},\n")
-        out.append(f"        caused_by: &[{', '.join(rust_str(who) for who in row['caused_by'])}],\n")
-        out.append(f"        to: &[{', '.join(tos)}],\n")
-        out.append(f"        refusal: &[{', '.join(refusals)}],\n")
-        out.append("    },\n")
+        if not EXECUTION_ROW.match(row["row"]):
+            emit(out, row, state, table["states"])
+    out.append("];\n")
+    out.append(EXECUTION_HEADER.format(
+        state_count=len(executions),
+        states="".join(f"    {execution_state(value)},\n" for value in executions),
+    ))
+    for row in execution_rows:
+        emit(out, row, execution_state, executions)
     out.append("];\n")
     return "".join(out)
 
@@ -116,8 +155,19 @@ def self_test():
             "to": ["ORDER_STATE_REFUSED"], "refusal": [],
         }],
     }
+    table["execution_states"] = ["EXECUTION_STATE_UNMATCHED", "EXECUTION_STATE_MATCHED"]
+    table["transitions"].append({
+        "row": "e3", "from": ["EXECUTION_STATE_UNMATCHED"], "cause": "an accept",
+        "caused_by": ["ems"], "to": ["EXECUTION_STATE_MATCHED"],
+        "refusal": ["REFUSAL_REASON_EXECUTION_STATE"],
+    })
     text = generate(table)
     assert "// a test table" in text, text
+    assert "pub const EXECUTION_STATES: [ExecutionState; 2]" in text, text
+    assert "from: &[From::State(ExecutionState::Unmatched)]" in text, text
+    assert "to: &[To::State(ExecutionState::Matched)]" in text, text
+    assert text.index("row: \"e3\"") > text.index("EXECUTION_TRANSITIONS"), text
+    assert text.index("row: \"i2\"") < text.index("EXECUTION_TRANSITIONS"), text
     assert "From::State(OrderState::Proposed)" in text, text
     assert "cause: \"a \\\"release\\\"\"" in text, text
     assert "refusal: &[RefusalReason::OrderState]" in text, text
@@ -129,6 +179,13 @@ def self_test():
         pass
     else:
         raise AssertionError("a value outside OrderState was accepted")
+    wrong = dict(table, transitions=[dict(table["transitions"][2], to=["ORDER_STATE_REFUSED"])])
+    try:
+        generate(wrong)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an execution's row naming an order's state was accepted")
     print("generate_transitions self-test OK")
 
 
