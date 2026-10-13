@@ -179,17 +179,60 @@ DK_REASONS = [
 ]
 
 
+# Each column sized so a row's actions keep both buttons on one line; the
+# kit's `wide-only` columns step aside at a phone's width.
+FILLS_CSS = (
+    "table.fills th.side{width:3.75rem}table.fills th.num{width:5rem}"
+    "table.fills th.actions{width:9rem}table.fills td.actions{text-align:right;overflow:visible}"
+)
+
+
+# The dialogs and the fields shown on a selection, the page's own: the kit
+# draws the pager and the status, and opens no dialog of a plugin's.
+FILLS_JS = """
+document.addEventListener("click", function (event) {
+  var opener = event.target.closest("[data-dialog-open]");
+  if (opener) {
+    var dialog = document.getElementById(opener.dataset.dialogOpen);
+    var fill = JSON.parse(opener.dataset.fill || "{}");
+    Object.keys(fill).forEach(function (name) {
+      var field = dialog.querySelector('[name="' + name + '"]');
+      if (field) { field.value = fill[name]; }
+    });
+    var title = dialog.querySelector("h2");
+    if (title && opener.dataset.title) { title.textContent = opener.dataset.title; }
+    shown(dialog);
+    dialog.showModal();
+  }
+  var closer = event.target.closest("[data-dialog-close]");
+  if (closer) { closer.closest("dialog").close(); }
+});
+function shown(root) {
+  root.querySelectorAll("[data-om-applies-when]").forEach(function (label) {
+    var form = label.closest("form");
+    var name = label.dataset.omAppliesWhen;
+    var chosen = form.querySelector('[name="' + name + '"]:checked') ||
+      form.querySelector('select[name="' + name + '"]');
+    var value = chosen ? chosen.value : "";
+    label.hidden = label.dataset.omOneOf.split(",").indexOf(value) < 0;
+  });
+}
+document.addEventListener("change", function () { shown(document); });
+shown(document);
+"""
+
+
 def fills_html(fills, told, said, code):
     """The unmatched fills on the kit: one line each on its pager, Accept and
     DK in dialogs, the page fitting one screen at a desk and on a phone."""
     e = html.escape
     rows = "".join(
         f"<tr data-id=\"{e(f.execution_id)}\"><td title=\"{e(f.execution_id)}\">{e(f.execution_id)}</td>"
-        f"<td class=\"wide\">{e(f.account_id)}</td>"
-        f"<td title=\"{e(f.instrument_id)}\">{e(f.instrument_id)}</td>"
+        f"<td class=\"wide-only\">{e(f.account_id)}</td>"
+        f"<td class=\"wide-only\" title=\"{e(f.instrument_id)}\">{e(f.instrument_id)}</td>"
         f"<td>{e(ops.Side.Name(f.side).removeprefix('SIDE_').replace('_', ' ').lower())}</td>"
         f"<td class=\"num\">{e(number(f.quantity))}</td>"
-        f"<td class=\"wide\">{e(f.venue_order_id)}</td><td class=\"wide\">{e(f.trade_date)}</td>"
+        f"<td class=\"wide-only\">{e(f.venue_order_id)}</td><td class=\"wide-only\">{e(f.trade_date)}</td>"
         f"<td class=\"actions\"><button type=\"button\" data-dialog-open=\"accept\" "
         f"data-title=\"Accept {e(f.execution_id)}\" data-fill=\"{e(json.dumps({'execution_ids': f.execution_id}))}\">Accept</button> "
         f"<button type=\"button\" data-dialog-open=\"dk\" data-title=\"DK {e(f.execution_id)}\" "
@@ -199,9 +242,9 @@ def fills_html(fills, told, said, code):
         "<p class=\"empty\" data-fills=\"0\">No unmatched fill: a fill your venues report on no "
         "order and no placement waits here for you to accept it or answer it DK.</p>"
         if not fills else
-        f"<om-pager search=\"Search fills\"><table class=\"list one-line\" data-fills=\"{len(fills)}\">"
-        "<thead><tr><th>Execution</th><th class=\"wide\">Account</th><th>Instrument</th><th>Side</th>"
-        "<th class=\"num\">Quantity</th><th class=\"wide\">Venue order</th><th class=\"wide\">Traded</th>"
+        f"<om-pager search=\"Search fills\"><table class=\"list one-line fills\" data-fills=\"{len(fills)}\">"
+        "<thead><tr><th class=\"id\">Execution</th><th class=\"wide-only\">Account</th><th class=\"wide-only\">Instrument</th><th class=\"side\">Side</th>"
+        "<th class=\"num\">Quantity</th><th class=\"wide-only\">Venue order</th><th class=\"wide-only\">Traded</th>"
         f"<th class=\"actions\"></th></tr></thead><tbody>{rows}</tbody></table></om-pager>")
     reasons = "".join(f"<option value=\"{v}\">{e(label)}</option>" for v, label in DK_REASONS)
     not_told = "" if told else (
@@ -213,7 +256,7 @@ def fills_html(fills, told, said, code):
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
         f"<title>Unmatched fills</title><link rel=\"stylesheet\" href=\"{KIT}meridian.css\">"
-        f"<script src=\"{KIT}meridian.js\"></script></head><body><main class=\"page\">"
+        f"<script src=\"{KIT}meridian.js\"></script><style>{FILLS_CSS}</style></head><body><main class=\"page\">"
         "<header class=\"page-head\"><div><h1>Unmatched fills</h1></div>"
         f"<om-status data-om-header state=\"{state}\" label=\"{len(fills)} unmatched\"></om-status></header>"
         f"{notice}{table}"
@@ -234,7 +277,7 @@ def fills_html(fills, told, said, code):
         "<label data-om-applies-when=\"reason\" data-om-one-of=\"other\">Text <input name=\"text\" maxlength=\"2000\" placeholder=\"Why, as the venue reads it\"></label>"
         f"{not_told}</div><div class=\"dialog-foot\"><button type=\"button\" data-dialog-close>Cancel</button>"
         "<button type=\"submit\" class=\"primary\">DK</button></div></form></dialog>"
-        "</main></body></html>")
+        f"<script>{FILLS_JS}</script></main></body></html>")
 
 
 class Plugin:
