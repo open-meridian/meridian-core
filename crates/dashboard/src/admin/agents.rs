@@ -430,10 +430,10 @@ pub fn accounts_section(
         String::new()
     };
     format!(
-        "<section class=\"panel padded\" id=\"accounts\"><h2>Accounts it may link to</h2>\
+        "<section class=\"panel padded\" id=\"accounts\"><h2>Accounts it may link or map to</h2>\
          <p class=\"hint\">A deployment admin grants the accounts this plugin's admins may link \
-         its external accounts to. A grant lets them link; it gives nobody anything to read or \
-         write.</p>{grant}{body}{by}</section>"
+         its external accounts to and, for an ems, map to venue account codes. A grant lets them \
+         link or map; it gives nobody anything to read or write.</p>{grant}{body}{by}</section>"
     )
 }
 

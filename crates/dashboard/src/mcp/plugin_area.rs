@@ -229,7 +229,7 @@ pub static SPECS: &[Spec] = &[
     spec(
         "read_linkable_accounts",
         "Read the accounts a plugin may link to",
-        "the admin portal's Accounts tab, read only (contract v20): the accounts a deployment admin granted the instance to link its external accounts to -- nothing by default -- with who last changed the grant and when. A grant lets its admins link; it gives nobody anything to read or write. No tool sets it.",
+        "the admin portal's Accounts tab, read only (contract v20): the accounts a deployment admin granted the instance to link its external accounts to and, for an ems, to map to venue account codes (W6.30) -- nothing by default -- with who last changed the grant and when. A grant lets its admins link or map; it gives nobody anything to read or write. No tool sets it.",
         true,
         Gate::AdminOrDeployment,
         instance_schema,
