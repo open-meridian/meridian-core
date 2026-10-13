@@ -211,7 +211,7 @@ def run():
          "step 4, the security pending to its settlement date")
 
     # 5. Child orders: released at once where the account does not wait.
-    runner("attribute", account, "waits=false", "reason=The desk's compliance is post-trade.")
+    runner("attribute", account, "waits=false", "note=The desk's compliance is post-trade.")
     second = page("pm", "write", f"/propose?account={account}&instrument={aapl}&quantity=10&key=o2")
     order2 = second["order_id"]
     released = page("desk", "write", f"/release?order={order2}")
@@ -245,7 +245,7 @@ def run():
     page("desk", "write", f"/place?order={order4}&quantity=200&connectivity=venue&code={CODE}")
     until(60, lambda: page("venue", "write", "/heard")["working"], "step 7, the venue is working it")
     runner("instruction", "stop", "--plugin", "venue",
-           "reason=Halt the simulated venue; cancel its working placements.")
+           "note=Halt the simulated venue; cancel its working placements.")
     stopped = until(60, lambda: (lambda o: o if o["state"] == "ORDER_STATE_RELEASED" else None)(
         order_of(orders(), order4)), "step 7, the stop's cancel was not recorded")
     must(stopped["committed"] == "0", f"step 7, nothing committed after the stop: {stopped}")
@@ -257,7 +257,7 @@ def run():
                        if h["placement_id"] == held["placement_id"] and "held back" in h.get("done", "")],
           "step 7, the venue held the new placement back")
     runner("instruction", "active", "--all", "--as", "ben",
-           "--expect-refused", "plugin's admin", "reason=Lift it.")
+           "--expect-refused", "plugin's admin", "note=Lift it.")
 
     # 8. Unplaced facts.
     astray = page("venue", "write", f"/astray?code={CODE}")["unplaced"]

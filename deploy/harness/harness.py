@@ -246,14 +246,14 @@ the same image with the list on stdin:
       ems's admin does, on its view's Overview.
 
   instruction VALUE (--all | --account ID | --plugin ID | --person SUBJECT |
-                     --service-account SA) [--within PLUGIN] reason=TEXT
+                     --service-account SA) [--within PLUGIN] note=TEXT
                      [--expect-refused TEXT]
       From contract v22 (W11.15): sets active, pause or stop at the Trading
       instructions page, as the person acting does: a deployment admin on
       any target, a plugin's admin within their plugin (--within, or the
       plugin itself). Prints what the page then lists for it.
 
-  attribute ACCOUNT waits=true|false reason=TEXT [--expect-refused TEXT]
+  attribute ACCOUNT waits=true|false note=TEXT [--expect-refused TEXT]
       From contract v22 (W9.13): whether the account's releases wait for
       compliance, at the Accounts tab's book part, as a deployment admin
       sets it.
@@ -2267,7 +2267,7 @@ def connectivity(args):
 
 def instruction(args):
     """`instruction VALUE (--all|--account|--plugin|--person|--service-account
-    ID) [--within PLUGIN] reason=TEXT`: the Trading instructions page (W11.15,
+    ID) [--within PLUGIN] note=TEXT`: the Trading instructions page (W11.15,
     contract v22)."""
     refusal = option(args, "--expect-refused", None)
     within = option(args, "--within", "")
@@ -2283,7 +2283,7 @@ def instruction(args):
             if kind is not None:
                 raise Failed("instruction names one target")
             kind, named = said, given
-    reason = dict(pairs(args)).get("reason", "")
+    note = dict(pairs(args)).get("note", "")
     values = [a for a in args if "=" not in a]
     if kind is None or len(values) != 1 or values[0] not in ("active", "pause", "stop"):
         raise Failed("instruction takes active, pause or stop and one target")
@@ -2295,7 +2295,7 @@ def instruction(args):
     done = person.post("/admin/trading-instructions", {
         "form_token": form_token(page), "kind": kind,
         "id": "" if kind in ("all", "plugin") else named, "instance": instance,
-        "value": values[0], "reason": reason})
+        "value": values[0], "note": note})
     said = refused_or_done(done, refusal, f"the {values[0]} instruction")
     if said:
         print(f"instruction: {said}")
@@ -2306,7 +2306,7 @@ def instruction(args):
 
 
 def attribute(args):
-    """`attribute ACCOUNT waits=true|false reason=TEXT`: the Accounts tab's book
+    """`attribute ACCOUNT waits=true|false note=TEXT`: the Accounts tab's book
     part (W9.13, contract v22)."""
     refusal = option(args, "--expect-refused", None)
     given = dict(pairs(args))
@@ -2319,7 +2319,7 @@ def attribute(args):
         "form_token": form_token(page), "account_id": rest[0], "base_currency_code": "",
         "lot_relief_default": "0",
         "waits_for_compliance": "wait" if given["waits"] == "true" else "no-wait",
-        "reason": given.get("reason", "")})
+        "note": given.get("note", "")})
     said = refused_or_done(done, refusal, "the attribute")
     print(f"attribute: {said or rest[0] + ' waits ' + given['waits']}")
 

@@ -158,7 +158,7 @@ pub fn book_form(token: &str) -> String {
          <div class=\"pair\"><label>Releases <select name=\"waits_for_compliance\">\
          <option value=\"{WAITS}\">Wait for compliance</option>\
          <option value=\"{DOES_NOT_WAIT}\">Do not wait</option></select></label></div>\
-         <div class=\"pair save\"><label>Reason <input name=\"reason\" required></label>\
+         <div class=\"pair save\"><label>Why <input name=\"note\" required></label>\
          <button type=\"submit\" class=\"primary\">Save</button></div></div></form>"
     )
 }
@@ -226,7 +226,7 @@ pub fn requests(
 pub fn arguments(request: &SetAccountAttributeRequest) -> serde_json::Value {
     let mut arguments = serde_json::json!({
         "account_id": request.account_id,
-        "reason": request.reason,
+        "note": request.reason,
     });
     match &request.attribute {
         Some(set_account_attribute_request::Attribute::BaseCurrencyCode(code)) => {
@@ -369,7 +369,7 @@ mod tests {
         assert!(silent.of("ACC-1").is_none());
         let form = book_form("");
         assert!(form.contains("action=\"/admin/accounts/book#accounts\""));
-        assert!(form.contains("name=\"reason\" required") && form.contains("data-edit-only"));
+        assert!(form.contains("name=\"note\" required") && form.contains("data-edit-only"));
         assert!(form.contains("name=\"waits_for_compliance\""));
         assert!(waits(&books, "ACC-2"), "a new account waits");
         assert!(

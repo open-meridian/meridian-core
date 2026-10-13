@@ -97,3 +97,32 @@ fn a_deployment_admin_reaches_all_four_and_a_plugins_admin_the_instructions_alon
         assert!(!spec.area.open_to(&meridian_access::Access::default()));
     }
 }
+
+#[test]
+fn a_change_takes_a_note_and_a_read_answers_unchanged() {
+    // The core-tools page's two rules (the product owner, 2026-10-12): a
+    // change's why is `note`, kept as the book entry's reason; a read's
+    // outcome is "unchanged", as every other core read's.
+    for spec in SPECS {
+        let schema = (spec.input_schema)();
+        let properties = schema["properties"].as_object().unwrap();
+        assert!(!properties.contains_key("reason"), "{}", spec.name);
+        if spec.reads {
+            assert!(properties.is_empty(), "{}", spec.name);
+        } else {
+            assert!(properties.contains_key("note"), "{}", spec.name);
+            assert!(
+                schema["required"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|name| name == "note"),
+                "{}",
+                spec.name
+            );
+        }
+    }
+    let source = include_str!("../book.rs");
+    assert!(!source.contains("\"outcome\": \"read\""));
+    assert_eq!(source.matches("\"outcome\": \"unchanged\"").count(), 2);
+}

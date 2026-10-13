@@ -1845,7 +1845,7 @@ async fn set_book(
                 field(&fields, "base_currency_code"),
                 field(&fields, "lot_relief_default"),
                 field(&fields, "waits_for_compliance"),
-                field(&fields, "reason"),
+                field(&fields, "note"),
                 held,
             )
         }
@@ -3015,7 +3015,7 @@ async fn set_trading_instruction(
     .and_then(|target| {
         let value = trading::value_of(field(&fields, "value"))
             .ok_or_else(|| format!("{:?} is not active, pause or stop", field(&fields, "value")))?;
-        trading::request(&access, target, value, field(&fields, "reason"))
+        trading::request(&access, target, value, field(&fields, "note"))
     });
     let request = match asked {
         Ok(request) => request,

@@ -532,7 +532,7 @@ async fn the_accounts_tab_shows_each_accounts_attributes_and_offers_a_search() {
         "name=\"owner\" value=\"\" maxlength=\"200\"",
         "name=\"note\" rows=\"2\" maxlength=\"2000\"></textarea>",
         "name=\"base_currency_code\" maxlength=\"3\"",
-        "name=\"reason\" required",
+        "name=\"note\" required",
     ] {
         assert!(dialog.contains(field), "{field} is not in {dialog}");
     }

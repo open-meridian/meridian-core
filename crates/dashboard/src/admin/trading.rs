@@ -345,7 +345,7 @@ pub fn arguments(request: &SetTradingInstructionRequest) -> serde_json::Value {
     serde_json::json!({
         "target": target_json(&request.target.clone().unwrap_or_default()),
         "value": value_word(request.value),
-        "reason": request.reason,
+        "note": request.reason,
     })
 }
 
@@ -372,7 +372,7 @@ pub fn page(
                     "id": id,
                     "instance": target.instance_id,
                     "value": value_word(instruction.value),
-                    "reason": "",
+                    "note": "",
                 } });
                 let set_by = instruction
                     .entry
@@ -482,7 +482,7 @@ pub fn page(
          <label>Account, person or service account <input name=\"id\" maxlength=\"200\" \
          placeholder=\"Its ID, or a person's login\"></label>\
          <label>Instruction <select name=\"value\">{values}</select></label>\
-         <label>Why <input name=\"reason\" maxlength=\"2000\" required placeholder=\"Kept with the instruction\"></label>\
+         <label>Why <input name=\"note\" maxlength=\"2000\" required placeholder=\"Kept with the instruction\"></label>\
          <p class=\"hint\">The most restrictive in force governs: stop over pause over active. \
          An instruction is lifted only at the level that set it. The book refuses and cancels \
          nothing for it: each plugin honours it.</p></div>\

@@ -7,7 +7,8 @@
 //!   `set_account_attribute` (SetAccountAttribute): the book's account
 //!   attributes, a deployment admin's -- the base currency, the lot-relief
 //!   default and whether releases wait for compliance -- one attribute an
-//!   act, with its reason.
+//!   act, with a note saying why, which the book keeps as the entry's
+//!   reason.
 //! - `list_trading_instructions` (ListTradingInstructions) and
 //!   `set_trading_instruction` (SetTradingInstruction): active, pause or
 //!   stop, for a deployment admin on any target and for a plugin's admin
@@ -71,7 +72,7 @@ opening balance stands for. No account's positions or orders.",
     spec(
         "set_account_attribute",
         "Set an account attribute",
-        "set one attribute of an account in the book of record, with a reason: its base currency \
+        "set one attribute of an account in the book of record, with a note saying why: its base currency \
 (three capital letters), its lot-relief default, or whether releases wait for compliance (false \
 lets a release pass the gate without a compliance verdict). Each is its own record. Answers the \
 attributes as they stand.",
@@ -92,7 +93,7 @@ every one for a deployment admin, those naming a plugin they administer for a pl
     spec(
         "set_trading_instruction",
         "Set a trading instruction",
-        "set active, pause or stop on a target, with a reason: a deployment admin on an account, \
+        "set active, pause or stop on a target, with a note saying why: a deployment admin on an account, \
 All accounts, a plugin, a person or a service account; a plugin's admin on their plugin, or a \
 person, service account or account within it, naming the plugin. The level is the setter's; an \
 instruction is lifted only at the level that set it, and the most restrictive in force governs. \
@@ -118,8 +119,8 @@ fn nothing_schema() -> Value {
     json!({"type": "object", "properties": {}, "additionalProperties": false})
 }
 
-fn reason() -> Value {
-    json!({"type": "string", "minLength": 1, "maxLength": 2000, "description": "why, kept with the change's record"})
+fn note() -> Value {
+    json!({"type": "string", "minLength": 1, "maxLength": 2000, "description": "why, kept with the change's record as its reason"})
 }
 
 fn attribute_schema() -> Value {
@@ -130,9 +131,9 @@ fn attribute_schema() -> Value {
             "base_currency_code": {"type": "string", "pattern": "^[A-Z]{3}$"},
             "lot_relief_default": {"type": "string", "enum": ["first_in_first_out", "last_in_first_out", "highest_cost", "lowest_cost", "average_cost"]},
             "waits_for_compliance": {"type": "boolean"},
-            "reason": reason(),
+            "note": note(),
         },
-        "required": ["account_id", "reason"],
+        "required": ["account_id", "note"],
         "description": "exactly one of base_currency_code, lot_relief_default and waits_for_compliance",
         "additionalProperties": false,
     })
@@ -154,9 +155,9 @@ fn instruction_schema() -> Value {
                 "additionalProperties": false,
             },
             "value": {"type": "string", "enum": ["active", "pause", "stop"]},
-            "reason": reason(),
+            "note": note(),
         },
-        "required": ["target", "value", "reason"],
+        "required": ["target", "value", "note"],
         "additionalProperties": false,
     })
 }
@@ -223,7 +224,7 @@ async fn list_attributes(app: &App, caller: &Caller, arguments: &Value) -> Value
         }
         cursor = page.next_cursor;
     }
-    json!({"outcome": "read", "data": {"accounts": found}})
+    json!({"outcome": "unchanged", "data": {"accounts": found}})
 }
 
 async fn set_attribute(app: &App, caller: &Caller, arguments: &Value) -> Value {
@@ -238,13 +239,13 @@ async fn set_attribute(app: &App, caller: &Caller, arguments: &Value) -> Value {
             "base_currency_code",
             "lot_relief_default",
             "waits_for_compliance",
-            "reason",
+            "note",
         ],
         "",
         &mut problems,
     );
     let account_id = text(top, "account_id", "", true, &mut problems);
-    let reason = text(top, "reason", "", true, &mut problems);
+    let reason = text(top, "note", "", true, &mut problems);
     let mut attributes = Vec::new();
     let currency = text(top, "base_currency_code", "", false, &mut problems);
     if !currency.is_empty() {
@@ -361,7 +362,7 @@ async fn list_instructions(app: &App, caller: &Caller, arguments: &Value) -> Val
         }
         cursor = page.next_cursor;
     }
-    json!({"outcome": "read", "data": {
+    json!({"outcome": "unchanged", "data": {
         "instructions": found,
         "control_sequence": control_sequence,
     }})
@@ -410,14 +411,14 @@ async fn set_instruction(app: &App, caller: &Caller, arguments: &Value) -> Value
     let Some(top) = object(arguments, "", &mut problems) else {
         return problems.refusal();
     };
-    only(top, &["target", "value", "reason"], "", &mut problems);
+    only(top, &["target", "value", "note"], "", &mut problems);
     let target = target_of(top, &mut problems);
     let value_said = text(top, "value", "", true, &mut problems);
     let value = trading::value_of(&value_said);
     if value.is_none() && !value_said.is_empty() {
         problems.add("value", "one of active, pause, stop");
     }
-    let reason = text(top, "reason", "", true, &mut problems);
+    let reason = text(top, "note", "", true, &mut problems);
     if !problems.is_empty() {
         return problems.refusal();
     }

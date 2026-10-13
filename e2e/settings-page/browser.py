@@ -560,7 +560,7 @@ def the_accounts_tab_holds_the_book(browser, prefix):
         page.screenshot(path=os.path.join(OUT, f"{prefix}-account-edit-{size}.png"))
         if size == "desktop" and PASS != "fit":
             page.fill("dialog#account [name=base_currency_code]", "EUR")
-            page.fill("dialog#account [name=reason]", "The plan reports in euros")
+            page.fill("dialog#account form[data-edit-only] [name=note]", "The plan reports in euros")
             page.click("dialog#account form[data-edit-only] button[type=submit]")
             settled(page)
             row = page.inner_text("#accounts-table tr[data-name='Credit Suisse 401(k)']")
