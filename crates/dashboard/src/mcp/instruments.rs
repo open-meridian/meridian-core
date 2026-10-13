@@ -1188,6 +1188,7 @@ async fn list_calendars(app: &App, caller: &Caller, arguments: &Value) -> Value 
         meridian_domain::v1::ListCalendarsRequest {
             page_size: page_size as i32,
             cursor,
+            ..Default::default()
         },
         WAIT,
     )

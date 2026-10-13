@@ -22,7 +22,8 @@ use meridian_domain::v1::{
     date_rule_version, AssetClass, BusinessDayConvention, CalendarCoverage, CalendarDay,
     CalendarDayKind, CalendarKind, CalendarRecord, CalendarSource, CalendarWeekend,
     DateRuleVersion, DayCut, Identifier, InstrumentLifecycleState, MissingCalendarDetectedEvent,
-    PullCalendarReply, SettlementDateRule, SettlementSystem, SpotDateRule, TenorDateRule, Weekday,
+    PullCalendarReply, SettlementDateRule, SettlementSystem, SpotCountingMode, SpotDateRule,
+    TenorDateRule, Weekday,
 };
 use prost::Message;
 use serde_json::Value;
@@ -454,6 +455,11 @@ fn rule(value: &Value) -> Result<DateRuleVersion, String> {
                 })
                 .transpose()?,
             effective_from_date: text(spot, "effective_from_date"),
+            // Contract v23: absent from a rule the platform wrote before,
+            // which reads as unspecified, joint.
+            counting_mode: named(spot, "counting_mode", |n| {
+                SpotCountingMode::from_str_name(n).map(|m| m as i32)
+            })?,
         }))
     } else {
         None

@@ -1118,6 +1118,9 @@ enum OrderOrigin {
   reserved "ORDER_ORIGIN_VENUE";
   // A telephoned or outside order, recorded by the `oms` for a person.
   ORDER_ORIGIN_TELEPHONED = 2;
+  // An order made from venue-originated fills the `ems` accepted (W11.23;
+  // contract v23): entered after the trade, filled, never gated.
+  ORDER_ORIGIN_ACCEPTED_EXECUTION = 3;
 }
 
 // A precision a time was stated in (the order-path plan's refresh, Q38).
@@ -1192,6 +1195,36 @@ enum ExecutionSource {
   EXECUTION_SOURCE_PRIMARY = 1;
   // Deduplicated against the primary on the venue's identifiers.
   EXECUTION_SOURCE_DROP_COPY = 2;
+}
+
+// Where an execution stands between the venue and the `ems` (W11.11, W11.23,
+// W11.24; decisions/035 as amended at contract v23): derived from the
+// journal as an order's status is, never stored; its transitions are the
+// transition table's e-rows.
+enum ExecutionState {
+  EXECUTION_STATE_UNSPECIFIED = 0;
+  // A fill on no order and no placement, its account mapped, waiting for
+  // the `ems` to accept it or answer it DK; one a bust or a correction
+  // supersedes stays unmatched, and is answered no more.
+  EXECUTION_STATE_UNMATCHED = 1;
+  // On a placement: every fill v22 records, and an accepted one.
+  EXECUTION_STATE_MATCHED = 2;
+  // Answered don't know: recorded and closed, never moving a position.
+  EXECUTION_STATE_DONT_KNOW = 3;
+}
+
+// Why the `ems` does not know a fill, mirroring FIX's DKReason (127)
+// (W11.24; contract v23).
+enum DkReason {
+  DK_REASON_UNSPECIFIED = 0;
+  DK_REASON_UNKNOWN_INSTRUMENT = 1;
+  DK_REASON_WRONG_SIDE = 2;
+  DK_REASON_QUANTITY_EXCEEDS_ORDER = 3;
+  DK_REASON_NO_MATCHING_ORDER = 4;
+  DK_REASON_PRICE_EXCEEDS_LIMIT = 5;
+  DK_REASON_CALCULATION_DIFFERENCE = 6;
+  // With text, as FIX requires Text (58) when DKReason is Other.
+  DK_REASON_OTHER = 7;
 }
 
 // A level with a time per step; a venue with no steps reports final at once.
@@ -1887,6 +1920,16 @@ message Execution {
   LiquidityIndicator liquidity_indicator = 34;
   // Who generated the UTI.
   string uti_generated_by = 35;
+
+  // Contract v23 (W11.11, W11.23, W11.24). Its state, derived from the
+  // journal.
+  ExecutionState state = 36;
+  // The venue's order ID (FIX 37), as the venue states it: set on a fill
+  // reported on no placement, so the plugin can answer its venue.
+  string venue_order_id = 37;
+  // On a DK: the reason, and the text the `ems` sent.
+  DkReason dk_reason = 38;
+  string dk_text = 39;
 }
 
 // An execution's finality: a level, and when it reached it.
@@ -2230,6 +2273,15 @@ message ReportExecutionRequest {
   Party counterparty = 29;
   LiquidityIndicator liquidity_indicator = 30;
   string uti_generated_by = 31;
+
+  // Contract v23 (W11.11): a fill on no order and no placement names its
+  // instrument, its side and the venue's order ID (FIX 37), each required
+  // when no placement is named; and the venue's client order ID (FIX 11)
+  // where the venue sent one, which FIX requires back on BN and Q.
+  string instrument_id = 32;
+  Side side = 33;
+  string venue_order_id = 34;
+  string venue_client_order_id = 35;
 }
 
 // W11.12.
@@ -2285,6 +2337,38 @@ message RecordLocateUseRequest {
   string idempotency_key = 3;
 }
 
+// W11.23 (contract v23). By the `ems`, for a person or its service account:
+// 1 to 500 unmatched executions of one account, instrument and side,
+// accepted to an existing order or to a new order made from them.
+message AcceptExecutionRequest {
+  repeated string execution_ids = 1;
+  oneof order {
+    // An order the accepting `ems` may place against: released, working or
+    // filled, never ended.
+    string order_id = 2;
+    // A new order made from the fills, at filled, never gated.
+    NewOrderFromExecutions new_order = 3;
+  }
+  // Kept on the accept's entry.
+  string note = 4;
+}
+
+// What the accept adds to the order the fills make (W11.23): the rest is
+// the fills'.
+message NewOrderFromExecutions {
+  string sleeve = 1;
+  string note = 2;
+}
+
+// W11.24 (contract v23). By the `ems`, for a person or its service account:
+// 1 to 500 unmatched executions answered don't know, with a reason, and
+// text when the reason is DK_REASON_OTHER.
+message DontKnowExecutionRequest {
+  repeated string execution_ids = 1;
+  DkReason reason = 2;
+  string text = 3;
+}
+
 // ── Their answers, after commit ──
 
 message OrderReply {
@@ -2311,6 +2395,21 @@ message FactReply {
   UnplacedFact unplaced = 5;
   EntryMeta entry = 6;
   JournalRef journal = 7;
+}
+
+// An accept's answer (W11.23): each execution matched, the order and the
+// placement it linked them to.
+message AcceptExecutionReply {
+  repeated Execution executions = 1;
+  Order order = 2;
+  Placement placement = 3;
+  JournalRef journal = 4;
+}
+
+// A DK's answer (W11.24).
+message DontKnowExecutionReply {
+  repeated Execution executions = 1;
+  JournalRef journal = 2;
 }
 
 message TradingInstructionReply {
@@ -2386,6 +2485,10 @@ message ListOrdersRequest {
   Watermark since = 2;
   int32 page_size = 3;
   string cursor = 4;
+  // Contract v23 (W11.17): only executions in this state; unspecified,
+  // every one. Unmatched leaves out an execution a later one supersedes,
+  // and a bust.
+  ExecutionState execution_state = 5;
 }
 
 // Each kind of record the order path delivers, in its own list, so a

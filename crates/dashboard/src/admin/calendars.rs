@@ -64,6 +64,7 @@ pub async fn held(bus: &meridian_bus::Bus) -> Result<ListCalendarsReply, String>
             ListCalendarsRequest {
                 page_size: 200,
                 cursor: cursor.clone(),
+                ..Default::default()
             },
         )
         .await?;
@@ -328,6 +329,7 @@ mod tests {
                 version: 4,
                 coverage_to_date: "2028-12-31".into(),
                 refreshed_at_ns: 1_760_400_000_000_000_000,
+                ..Default::default()
             }],
             next_cursor: String::new(),
             rules: vec![HeldDateRule {

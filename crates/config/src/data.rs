@@ -95,6 +95,8 @@ pub fn datasets(snapshot: &Snapshot) -> Vec<DatasetRef> {
                 declaration: Some(declared),
                 unconverted_count: 0,
                 miss_count: 0,
+                closed_day_count: 0,
+                outside_coverage_count: 0,
             });
         }
     }

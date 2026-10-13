@@ -5,7 +5,9 @@
 // and plans/the-lake-prices-the-book, accepted 2026-10-03 and refreshed
 // 2026-10-09 and 2026-10-10): contract v18, the lake's 1a -- prices and bars,
 // the catalogue, licences and entitlements, source priority, and wants -- and
-// contract v19, the lake's 1b: trades and quotes. Every message here traces
+// contract v19, the lake's 1b: trades and quotes; and contract v23, the
+// lake's 1c: an event contract's outcome, and the flag of a daily value
+// dated on a closed day of its dataset's calendar. Every message here traces
 // to a matrix row; see matrix/matrix.tsv.
 //
 // The lake is append-only and bitemporal. A data plugin records rows in batches; the
@@ -27,6 +29,9 @@ import "meridian/v1/sidecar.proto";
 import "meridian/v1/amounts.proto";
 // A point in a store's record.
 import "meridian/v1/journal.proto";
+// The date read's check of a date (DateCheck), reused for the closed-day
+// flag (contract v23).
+import "meridian/v1/book.proto";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // The envelope
@@ -87,6 +92,12 @@ message ObservationMeta {
   // Each vendor value that failed conversion, beside a field left not
   // known: 0 to 16.
   repeated AsReported unconverted = 14;
+
+  // Contract v23 (W10.4): set only when a daily value's business date is a
+  // closed day of its dataset's calendar, or outside its coverage -- the
+  // date, each calendar with its version, the reason and the holiday's
+  // name. Recorded as reported, never refused. Decided by the lake.
+  DateCheck closed_day = 15;
 }
 
 // One entity a row is about.
@@ -165,6 +176,13 @@ message DatasetRef {
   // in a read's answer and on an entitlements change.
   uint64 unconverted_count = 6;
   uint64 miss_count = 7;
+
+  // Contract v23 (W10.9): the rows the lake keeps of the dataset flagged on
+  // a closed day of its calendar, a weekend or a holiday; and those flagged
+  // outside its coverage, counted apart. 0 in a read's answer and on an
+  // entitlements change.
+  uint64 closed_day_count = 8;
+  uint64 outside_coverage_count = 9;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -381,6 +399,56 @@ enum QuoteCharacteristic {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// The data type of the lake's 1c (contract v23)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// An event contract's outcome, as its venue determined it, at one stage
+// (W10.4; the lake plan's "vL1c"). One row key per contract: each change of
+// stage is a new version under it. Valid from the determination's time, an
+// event SourceTime, with no business date: an outcome is not a daily value.
+message Outcome {
+  ObservationMeta meta = 1;
+
+  // What the instrument pays, in the platform's words.
+  OutcomeDetermination determination = 2;
+
+  // The venue's stage of the determination.
+  OutcomeStage stage = 3;
+
+  // What one contract settles at, in the payout asset: always set.
+  Money settlement_value = 4;
+
+  // When the venue paid out; 0 until then.
+  int64 settled_at_ns = 5;
+
+  // The venue's own word for the determination, as reported.
+  AsReported determination_as_reported = 6;
+}
+
+// What an event contract's instrument pays (the lake plan's "vL1c", item 1).
+enum OutcomeDetermination {
+  // Refused.
+  OUTCOME_DETERMINATION_UNSPECIFIED = 0;
+  // Its full payout.
+  OUTCOME_DETERMINATION_PAYS = 1;
+  OUTCOME_DETERMINATION_PAYS_NOTHING = 2;
+  // Part of its payout: a scalar result, or a resolution at half.
+  OUTCOME_DETERMINATION_PAYS_PART = 3;
+}
+
+// The venue's stage of a determination (item 2).
+enum OutcomeStage {
+  // Refused.
+  OUTCOME_STAGE_UNSPECIFIED = 0;
+  // Proposed and open to challenge.
+  OUTCOME_STAGE_PROPOSED = 1;
+  // Determined; an amended determination is a new version here.
+  OUTCOME_STAGE_DETERMINED = 2;
+  OUTCOME_STAGE_DISPUTED = 3;
+  OUTCOME_STAGE_FINAL = 4;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // W10.4, W10.5 — a data plugin records; the lake records and publishes
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -424,6 +492,12 @@ message RecordQuotesRequest {
   string want_id = 2;
 }
 
+// A batch of outcomes, recorded whole or refused naming the item and field:
+// 1 to 500 (contract v23).
+message RecordOutcomesRequest {
+  repeated Outcome outcomes = 1;
+}
+
 // What a batch did, once it committed.
 message RecordObservationsReply {
   // Rows recorded for the first time.
@@ -464,6 +538,13 @@ message TradesRecordedEvent {
 // asset (conflated).
 message QuotesRecordedEvent {
   Quote quote = 1;
+}
+
+// An outcome the lake recorded, on its dataset's subject (contract v23).
+// Never conflated: every version is delivered, and a reader that lost some
+// catches up from the lake by the watermark it last saw (ListOutcomes).
+message OutcomesRecordedEvent {
+  Outcome outcome = 1;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -662,6 +743,27 @@ message ListQuotesReply {
   repeated DatasetRef datasets = 3;
   Watermark watermark = 4;
   string next_cursor = 5;
+}
+
+// Outcomes for event contracts' instruments (contract v23): the version in
+// force of each, or as of a recorded time before a restatement; or the
+// versions recorded after a watermark, whatever their valid time, which is
+// how a reader that lost some catches up. No business date is asked.
+message ListOutcomesRequest {
+  // 1 to 500.
+  repeated SubjectRef subjects = 1;
+
+  // The watermark the reader last saw: the versions each dataset partition
+  // it names recorded after its sequence there.
+  Watermark after_watermark = 2;
+
+  // The recorded-time cut-off, 0 for now: what the lake knew then.
+  int64 as_of_ns = 3;
+}
+
+message ListOutcomesReply {
+  repeated Outcome outcomes = 1;
+  Watermark watermark = 2;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

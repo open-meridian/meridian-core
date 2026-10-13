@@ -3,10 +3,12 @@
 # Who publishes and who subscribes, which is what decides a component's broker
 # permissions. Regenerate from meridian-design with `make component-topics`.
 topic	kind	publisher	subscriber
+platform.book.command.accept-execution	command	ems	bor
 platform.book.command.acknowledge-flag	command	oms,operations	bor
 platform.book.command.close-breaks-as-cleared	command	operations	bor
 platform.book.command.create-placement	command	ems	bor
 platform.book.command.decide-approval	command	compliance,oms	bor
+platform.book.command.dont-know-execution	command	ems	bor
 platform.book.command.handle-break	command	operations	bor
 platform.book.command.propose-order	command	portfolio,oms,ems	bor
 platform.book.command.record-account-figures	command	operations	bor
@@ -30,7 +32,7 @@ platform.book.command.set-working-condition	command	ems,oms	bor
 platform.book.event.account-attribute-changed	event	bor	portfolio,reporting,compliance,oms,operations,ems,connectivity,dashboard
 platform.book.event.account-figures-recorded	event	bor	operations,portfolio,compliance,reporting
 platform.book.event.break-changed	event	bor	operations,oms,compliance,portfolio,reporting
-platform.book.event.execution-recorded	event	bor	oms,ems,compliance,portfolio,operations,reporting
+platform.book.event.execution-recorded	event	bor	oms,ems,compliance,portfolio,operations,reporting,connectivity
 platform.book.event.locate-updated	event	bor	compliance,oms,portfolio
 platform.book.event.order-updated	event	bor	oms,ems,compliance,portfolio,operations,reporting
 platform.book.event.placement-updated	event	bor	connectivity,ems,oms,compliance
@@ -99,6 +101,7 @@ platform.deployment.event.component-report	event	street,bor	conductor
 platform.deployment.event.plugin-report	event	sidecar	dashboard,conductor
 platform.lake.command.decline-want	command	data	lake
 platform.lake.command.record-bars	command	data	lake
+platform.lake.command.record-outcomes	command	data	lake
 platform.lake.command.record-prices	command	data	lake
 platform.lake.command.record-quotes	command	data	lake
 platform.lake.command.record-trades	command	data	lake
@@ -107,11 +110,13 @@ platform.lake.event.observations-wanted	event	lake	data
 platform.lake.event.want-withdrawn	event	lake	data
 platform.lake.query.list-bars	query	reporting,portfolio,compliance,signal	lake
 platform.lake.query.list-datasets	query	reporting,portfolio,compliance,signal,ems,dashboard,data	lake
+platform.lake.query.list-outcomes	query	reporting,portfolio,compliance,signal,operations	lake
 platform.lake.query.list-prices	query	reporting,portfolio,compliance,signal	lake
 platform.lake.query.list-quotes	query	signal,ems	lake
 platform.lake.query.list-source-priorities	query	dashboard	lake
 platform.lake.query.list-trades	query	signal,ems,data	lake
 platform.lake.{dataset}.event.bars-recorded	event	lake	reporting,portfolio,compliance,signal
+platform.lake.{dataset}.event.outcomes-recorded	event	lake	reporting,portfolio,compliance,signal,operations
 platform.lake.{dataset}.event.prices-recorded	event	lake	reporting,portfolio,compliance,signal
 platform.lake.{dataset}.event.quotes-recorded	event	lake	signal,ems
 platform.lake.{dataset}.event.trades-recorded	event	lake	signal,ems

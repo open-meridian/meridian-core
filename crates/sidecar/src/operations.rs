@@ -774,6 +774,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.known("kind", message.kind, domain::ExecutionKind::try_from(message.kind).is_ok())?;
         self.known("source", message.source, domain::ExecutionSource::try_from(message.source).is_ok())?;
         self.known("liquidity_indicator", message.liquidity_indicator, domain::LiquidityIndicator::try_from(message.liquidity_indicator).is_ok())?;
+        self.known("side", message.side, domain::Side::try_from(message.side).is_ok())?;
         message.account_id = self.venue_mapped_account("meridian.v1.ReportExecutionRequest", &message.venue_account_code, &message.account_id).await?;
         let stamped0 = message.counterparty.get_or_insert_with(Default::default);
         for stamped1 in stamped0.identifiers.iter_mut() {
@@ -829,6 +830,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         request: Request<plugin::ListOrdersParams>,
     ) -> Result<Response<plugin::ListOrdersResult>, Status> {
         let message: domain::ListOrdersRequest = self.as_domain(request.into_inner())?;
+        self.known("execution_state", message.execution_state, domain::ExecutionState::try_from(message.execution_state).is_ok())?;
         let account = Some(message.account_id.clone());
         self.call_typed("platform.book.query.list-orders", "meridian.v1.ListOrdersRequest", message, account, None).await
     }
@@ -909,6 +911,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
             for (i1, held1) in held0.eligibility.iter().enumerate() {
                 self.known(&format!("catalogue.eligibility[{i1}].borrow_status"), held1.borrow_status, domain::BorrowStatus::try_from(held1.borrow_status).is_ok())?;
             }
+            self.known("catalogue.execution_acknowledgement", held0.execution_acknowledgement, domain::ExecutionAcknowledgement::try_from(held0.execution_acknowledgement).is_ok())?;
         }
         message.publisher_instance_id = self.instance_id().to_string();
         self.publish_typed("platform.config.event.venue-catalogue", "meridian.v1.VenueCatalogueEvent", message).await
@@ -937,6 +940,31 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         message.ems_instance_id = self.instance_id().to_string();
         let account = Some(message.account_id.clone());
         self.command_typed("platform.config.command.map-venue-account", "meridian.v1.MapVenueAccountRequest", message, account, acting_for).await
+    }
+
+    /// W11.23: `platform.book.command.accept-execution` (preview).
+    async fn accept_execution(
+        &self,
+        request: Request<plugin::AcceptExecutionParams>,
+    ) -> Result<Response<plugin::AcceptExecutionResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let message: domain::AcceptExecutionRequest = self.as_domain(params)?;
+        let account = None;
+        self.command_typed("platform.book.command.accept-execution", "meridian.v1.AcceptExecutionRequest", message, account, acting_for).await
+    }
+
+    /// W11.24: `platform.book.command.dont-know-execution` (preview).
+    async fn dont_know_execution(
+        &self,
+        request: Request<plugin::DontKnowExecutionParams>,
+    ) -> Result<Response<plugin::DontKnowExecutionResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let message: domain::DontKnowExecutionRequest = self.as_domain(params)?;
+        self.known("reason", message.reason, domain::DkReason::try_from(message.reason).is_ok())?;
+        let account = None;
+        self.command_typed("platform.book.command.dont-know-execution", "meridian.v1.DontKnowExecutionRequest", message, account, acting_for).await
     }
 
     /// W3.14: `platform.reference.query.resolve-venue` (preview).
@@ -1020,6 +1048,9 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
                 for (i2, held2) in held1.source_times.iter().enumerate() {
                     self.known(&format!("prices[{i0}].meta.source_times[{i2}].kind"), held2.kind, domain::SourceTimeKind::try_from(held2.kind).is_ok())?;
                 }
+                if let Some(held2) = held1.closed_day.as_ref() {
+                    self.known(&format!("prices[{i0}].meta.closed_day.reason"), held2.reason, domain::DateCheckReason::try_from(held2.reason).is_ok())?;
+                }
             }
             self.known(&format!("prices[{i0}].kind"), held0.kind, domain::PriceKind::try_from(held0.kind).is_ok())?;
             self.exact_money(&format!("prices[{i0}].price"), held0.price.as_ref())?;
@@ -1062,6 +1093,9 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
             if let Some(held1) = held0.meta.as_ref() {
                 for (i2, held2) in held1.source_times.iter().enumerate() {
                     self.known(&format!("bars[{i0}].meta.source_times[{i2}].kind"), held2.kind, domain::SourceTimeKind::try_from(held2.kind).is_ok())?;
+                }
+                if let Some(held2) = held1.closed_day.as_ref() {
+                    self.known(&format!("bars[{i0}].meta.closed_day.reason"), held2.reason, domain::DateCheckReason::try_from(held2.reason).is_ok())?;
                 }
             }
             self.exact_money(&format!("bars[{i0}].open"), held0.open.as_ref())?;
@@ -1108,6 +1142,9 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
             if let Some(held1) = held0.meta.as_ref() {
                 for (i2, held2) in held1.source_times.iter().enumerate() {
                     self.known(&format!("trades[{i0}].meta.source_times[{i2}].kind"), held2.kind, domain::SourceTimeKind::try_from(held2.kind).is_ok())?;
+                }
+                if let Some(held2) = held1.closed_day.as_ref() {
+                    self.known(&format!("trades[{i0}].meta.closed_day.reason"), held2.reason, domain::DateCheckReason::try_from(held2.reason).is_ok())?;
                 }
             }
             self.exact_money(&format!("trades[{i0}].price"), held0.price.as_ref())?;
@@ -1169,6 +1206,9 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
                 for (i2, held2) in held1.source_times.iter().enumerate() {
                     self.known(&format!("quotes[{i0}].meta.source_times[{i2}].kind"), held2.kind, domain::SourceTimeKind::try_from(held2.kind).is_ok())?;
                 }
+                if let Some(held2) = held1.closed_day.as_ref() {
+                    self.known(&format!("quotes[{i0}].meta.closed_day.reason"), held2.reason, domain::DateCheckReason::try_from(held2.reason).is_ok())?;
+                }
             }
             self.exact_money(&format!("quotes[{i0}].bid"), held0.bid.as_ref())?;
             self.exact_money(&format!("quotes[{i0}].ask"), held0.ask.as_ref())?;
@@ -1190,6 +1230,52 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         }
         let account = None;
         self.command_typed("platform.lake.command.record-quotes", "meridian.v1.RecordQuotesRequest", message, account, acting_for).await
+    }
+
+    /// W10.4: `platform.lake.command.record-outcomes` (preview).
+    async fn record_outcomes(
+        &self,
+        request: Request<plugin::RecordOutcomesParams>,
+    ) -> Result<Response<plugin::RecordOutcomesResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let mut message: domain::RecordOutcomesRequest = self.as_domain(params)?;
+        let bound = meridian_pb::bounds::RECORD_OUTCOMES_REQUEST_OUTCOMES_COUNT;
+        if !bound.admits(message.outcomes.len()) {
+            let refusal = format!(
+                "outcomes holds {} rows; a batch is {} to {}",
+                message.outcomes.len(),
+                bound.least,
+                bound.most
+            );
+            self.note_refusal(&refusal);
+            return Err(Status::invalid_argument(refusal));
+        }
+        for (i0, held0) in message.outcomes.iter().enumerate() {
+            if let Some(held1) = held0.meta.as_ref() {
+                for (i2, held2) in held1.source_times.iter().enumerate() {
+                    self.known(&format!("outcomes[{i0}].meta.source_times[{i2}].kind"), held2.kind, domain::SourceTimeKind::try_from(held2.kind).is_ok())?;
+                }
+                if let Some(held2) = held1.closed_day.as_ref() {
+                    self.known(&format!("outcomes[{i0}].meta.closed_day.reason"), held2.reason, domain::DateCheckReason::try_from(held2.reason).is_ok())?;
+                }
+            }
+            self.known(&format!("outcomes[{i0}].determination"), held0.determination, domain::OutcomeDetermination::try_from(held0.determination).is_ok())?;
+            self.known(&format!("outcomes[{i0}].stage"), held0.stage, domain::OutcomeStage::try_from(held0.stage).is_ok())?;
+            self.exact_money(&format!("outcomes[{i0}].settlement_value"), held0.settlement_value.as_ref())?;
+        }
+        for stamped0 in message.outcomes.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            let stamped2 = stamped1.source.get_or_insert_with(Default::default);
+            stamped2.instance = self.instance_id().to_string();
+            stamped2.plugin_version = Default::default();
+        }
+        for stamped0 in message.outcomes.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            stamped1.sent_at_ns = Default::default();
+        }
+        let account = None;
+        self.command_typed("platform.lake.command.record-outcomes", "meridian.v1.RecordOutcomesRequest", message, account, acting_for).await
     }
 
     /// W10.6: `platform.lake.query.list-prices` (preview).
@@ -1233,6 +1319,16 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         let message: domain::ListQuotesRequest = self.as_domain(request.into_inner())?;
         let account = None;
         self.call_typed("platform.lake.query.list-quotes", "meridian.v1.ListQuotesRequest", message, account, None).await
+    }
+
+    /// W10.6: `platform.lake.query.list-outcomes` (preview).
+    async fn list_outcomes(
+        &self,
+        request: Request<plugin::ListOutcomesParams>,
+    ) -> Result<Response<plugin::ListOutcomesResult>, Status> {
+        let message: domain::ListOutcomesRequest = self.as_domain(request.into_inner())?;
+        let account = None;
+        self.call_typed("platform.lake.query.list-outcomes", "meridian.v1.ListOutcomesRequest", message, account, None).await
     }
 
     /// W10.7: `platform.lake.command.decline-want` (preview).
@@ -1427,6 +1523,13 @@ pub(crate) const DELIVERED: &[crate::receive::Row] = &[
         topic: "platform.config.event.venue-catalogue",
         payload_type: "meridian.v1.VenueCatalogueEvent",
         read: report_venue_catalogue,
+    },
+    crate::receive::Row {
+        name: "OutcomesRecorded",
+        step: "W10.5",
+        topic: "platform.lake.{dataset}.event.outcomes-recorded",
+        payload_type: "meridian.v1.OutcomesRecordedEvent",
+        read: outcomes_recorded,
     },
 ];
 
@@ -1639,7 +1742,7 @@ fn execution_recorded(payload: &[u8]) -> Result<crate::receive::Read, prost::Dec
     let message = plugin::ExecutionRecordedEvent::decode(payload)?;
     Ok(crate::receive::Read {
         account: Some(message.execution.as_ref().map(|held| held.account_id.clone()).unwrap_or_default()),
-        directed: Vec::new(),
+        directed: vec![("connectivity", message.execution.as_ref().and_then(|held| held.raw_record.as_ref()).map(|held| held.instance_id.clone()).unwrap_or_default())],
         journal: message.journal.clone(),
         cause: message.cause.clone(),
         item: plugin::delivery::Item::ExecutionRecorded(message),
@@ -1691,5 +1794,17 @@ fn report_venue_catalogue(payload: &[u8]) -> Result<crate::receive::Read, prost:
         journal: None,
         cause: None,
         item: plugin::delivery::Item::ReportVenueCatalogue(message),
+    })
+}
+
+/// W10.5: a OutcomesRecordedEvent, unconflated, unscoped.
+fn outcomes_recorded(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeError> {
+    let message = plugin::OutcomesRecordedEvent::decode(payload)?;
+    Ok(crate::receive::Read {
+        account: None,
+        directed: Vec::new(),
+        journal: None,
+        cause: None,
+        item: plugin::delivery::Item::OutcomesRecorded(message),
     })
 }

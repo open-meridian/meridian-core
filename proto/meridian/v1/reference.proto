@@ -1608,6 +1608,20 @@ message SpotDateRule {
   DayCut cut = 5;
   TenorDateRule tenor_rule = 6;
   string effective_from_date = 7;
+  // Contract v23 (W1.22, W3.20): how the counting calendars count the lag;
+  // unspecified means joint, v22's way, so every rule held keeps its dates.
+  SpotCountingMode counting_mode = 8;
+}
+
+// How a spot-date rule counts its lag (W1.22; contract v23).
+enum SpotCountingMode {
+  // Joint, v22's way.
+  SPOT_COUNTING_MODE_UNSPECIFIED = 0;
+  // A day counts only if it is a business day on every counting calendar.
+  SPOT_COUNTING_MODE_JOINT = 1;
+  // Each currency's own spot on its own calendar, the later of the two,
+  // then rolled to a day good on both: the convention for a cross.
+  SPOT_COUNTING_MODE_EACH_CURRENCY = 2;
 }
 
 // One rule version, as the platform keeps and publishes it.
@@ -1821,6 +1835,11 @@ message BusinessDayInputs {
 message ListCalendarsRequest {
   int32 page_size = 1;
   string cursor = 2;
+  // Contract v23: unspecified lists every kind.
+  CalendarKind kind = 3;
+  // Contract v23: a text match on the name and the subject's codes; empty
+  // matches every calendar.
+  string query = 4;
 }
 
 message ListCalendarsReply {
@@ -1838,6 +1857,13 @@ message HeldCalendar {
   // ISO 8601: its coverage's last date.
   string coverage_to_date = 5;
   int64 refreshed_at_ns = 6;
+  // Contract v23: its subject, as CalendarRecord carries it -- a
+  // currency's cash instrument by its `INS-` ID, the venues that follow it
+  // by their `VEN-` IDs, or a settlement system -- shown resolved on the
+  // page.
+  string instrument_id = 7;
+  repeated string venue_ids = 8;
+  SettlementSystem settlement_system = 9;
 }
 
 // One date rule the deployment holds, one line.

@@ -909,6 +909,7 @@ fn lake_listing() -> meridian_domain::v1::ListDatasetsReply {
                 }),
                 unconverted_count: (n * 3 + k) as u64 * 7,
                 miss_count: (n + k) as u64,
+                ..Default::default()
             });
             if n < 2 || (n == 2 && k == 0) {
                 for reader in ["sample-reporting-1", "board-1", "compliance-1"] {
@@ -982,6 +983,7 @@ fn held_calendars() -> meridian_domain::v1::ListCalendarsReply {
             version: 3,
             coverage_to_date: "2027-12-31".into(),
             refreshed_at_ns: 1_791_417_600_000_000_000,
+            ..Default::default()
         },
         HeldCalendar {
             calendar_id: "CAL-01JAE000000000000000XNYS".into(),
@@ -990,6 +992,7 @@ fn held_calendars() -> meridian_domain::v1::ListCalendarsReply {
             version: 7,
             coverage_to_date: "2027-12-31".into(),
             refreshed_at_ns: 1_791_417_600_000_000_000,
+            ..Default::default()
         },
         HeldCalendar {
             calendar_id: "CAL-01JAE0000000000000000USSS".into(),
@@ -998,6 +1001,7 @@ fn held_calendars() -> meridian_domain::v1::ListCalendarsReply {
             version: 4,
             coverage_to_date: "2028-12-31".into(),
             refreshed_at_ns: 1_791_417_600_000_000_000,
+            ..Default::default()
         },
     ];
     for n in 0..30 {
@@ -1008,6 +1012,7 @@ fn held_calendars() -> meridian_domain::v1::ListCalendarsReply {
             version: 1,
             coverage_to_date: "2027-12-31".into(),
             refreshed_at_ns: 1_791_417_600_000_000_000,
+            ..Default::default()
         });
     }
     meridian_domain::v1::ListCalendarsReply {

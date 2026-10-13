@@ -746,6 +746,24 @@ message VenueCatalogue {
   repeated VenueOrderType order_types = 3;
   repeated VenueStrategy strategies = 4;
   repeated VenueEligibility eligibility = 5;
+  // Contract v23 (W11.20, W11.23, W11.24): what the connectivity plugin
+  // sends its venue when the `ems` accepts a venue-originated fill or
+  // answers it DK. Unspecified, as a v22 catalogue is, reads as none.
+  ExecutionAcknowledgement execution_acknowledgement = 6;
+}
+
+// The acknowledgement a venue takes of an execution it originated (W11.20;
+// contract v23). Never a record of one sent: FIX answers BN with nothing.
+enum ExecutionAcknowledgement {
+  // Not said: read as EXECUTION_ACKNOWLEDGEMENT_NONE, the venue not told.
+  EXECUTION_ACKNOWLEDGEMENT_UNSPECIFIED = 0;
+  // The venue takes neither message: nothing is sent at an accept or a DK.
+  EXECUTION_ACKNOWLEDGEMENT_NONE = 1;
+  // FIX's ExecutionAcknowledgement (35=BN): ExecAckStatus (1036) Accepted
+  // at an accept, Don't know / Rejected with DKReason (127) at a DK.
+  EXECUTION_ACKNOWLEDGEMENT_BN = 2;
+  // FIX's DontKnowTrade (35=Q) at a DK, and nothing at an accept.
+  EXECUTION_ACKNOWLEDGEMENT_DONT_KNOW_TRADE = 3;
 }
 
 // An order type the venue offers, with the times in force it takes.
