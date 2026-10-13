@@ -493,6 +493,14 @@ def main():
     print("F: wiped, as a reset of the cluster wipes it; the node's directory is left", flush=True)
     run("helm", "uninstall", RELEASE, "--namespace", NAMESPACE, "--wait")
     run("kubectl", "delete", "namespace", NAMESPACE, "--wait", "--timeout=300s")
+    held_pv = run("kubectl", "get", "pv", f"{NAMESPACE}-{FULL}-backup", check=False).returncode == 0
+    if held_pv:
+        left = cli(workdir, "restore", files[0], "--identity", "identity.txt",
+                   "-n", NAMESPACE, "--chart", "/chart", "--yes")
+        s.check(left.returncode == 1 and f"kubectl delete pv {NAMESPACE}-{FULL}-backup" in left.stderr,
+                "a backup volume the deleted namespace left is named before anything changes")
+        s.check(run("kubectl", "get", "namespace", NAMESPACE, check=False).returncode != 0,
+                "and nothing was made")
     run("kubectl", "delete", "pv", f"{NAMESPACE}-{FULL}-backup", "--ignore-not-found", "--wait")
     s.check(run("kubectl", "get", "namespace", NAMESPACE, check=False).returncode != 0,
             "the namespace and everything in it are gone")
@@ -501,10 +509,18 @@ def main():
     print("G: restored by `meridian restore`", flush=True)
     wrong = cli(workdir, "restore", files[0], "-n", NAMESPACE, "--chart", "/chart")
     s.check(wrong.returncode == 2 and "--identity" in wrong.stderr, "without an identity it asks for one")
+    asked = cli(workdir, "restore", files[0], "--identity", "identity.txt",
+                "-n", NAMESPACE, "--chart", "/chart")
+    s.check(asked.returncode == 1 and "not approved, so nothing was changed" in asked.stderr
+            and "Restoring " in asked.stderr,
+            "without a terminal and without --yes it shows the plan and changes nothing")
+    s.check(run("kubectl", "get", "namespace", NAMESPACE, check=False).returncode != 0,
+            "and the namespace was not made")
     done = cli(workdir, "restore", files[0], "--identity", "identity.txt",
-               "-n", NAMESPACE, "--chart", "/chart", "--timeout", "10m")
+               "-n", NAMESPACE, "--chart", "/chart", "--timeout", "10m", "--yes")
     s.check(done.returncode == 0, f"meridian restore: exit {done.returncode}")
     s.check("every count as backed up" in done.stdout, "every table's row count as backed up")
+    s.check("    config: " in done.stdout and "    book: " in done.stdout, "the counts by store")
     s.check(SECRET_VALUE not in done.stdout + done.stderr, "and it printed no secret")
     again = cli(workdir, "restore", files[0], "--identity", "identity.txt",
                 "-n", NAMESPACE, "--chart", "/chart")
