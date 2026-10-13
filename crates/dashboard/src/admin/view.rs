@@ -600,11 +600,18 @@ pub fn render(view: &View) -> String {
         .area
         .as_deref()
         .map(|area| {
-            // And its trading instructions, which its admin sets within it
-            // (W11.15, contract v22).
+            // And its trading instructions, which its admin sets within it,
+            // where it holds a role that honours them (W11.15, contract v22).
+            let instructions = if super::trading::honoured_by(view.records, &line.instance) {
+                format!(
+                    "<a class=\"button\" href=\"{}\">Trading instructions</a>",
+                    super::trading::PATH
+                )
+            } else {
+                String::new()
+            };
             format!(
-                "<div class=\"actions\"><a class=\"button\" href=\"{}\" data-area>Its pages</a>\
-                 <a class=\"button\" href=\"/admin/trading-instructions\">Trading instructions</a></div>",
+                "<div class=\"actions\"><a class=\"button\" href=\"{}\" data-area>Its pages</a>{instructions}</div>",
                 escape(area)
             )
         })

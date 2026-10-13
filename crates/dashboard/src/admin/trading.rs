@@ -37,6 +37,17 @@ pub const PATH: &str = "/admin/trading-instructions";
 
 const WAIT: Duration = Duration::from_secs(5);
 
+/// The roles that hear the instructions and honour them (roles.json's
+/// TradingInstructionChanged): a plugin holding none has none to honour.
+pub const HEARD_BY: [&str; 5] = ["portfolio", "oms", "ems", "compliance", "connectivity"];
+
+/// Whether `instance` holds a role that honours an instruction: its page
+/// links to the trading instructions only then.
+pub fn honoured_by(records: &AccessRecords, instance: &str) -> bool {
+    meridian_access::known_roles(records, instance)
+        .is_some_and(|roles| roles.iter().any(|role| HEARD_BY.contains(&role.as_str())))
+}
+
 /// The values, by the word the form and the tool use.
 pub const VALUES: [(TradingInstructionValue, &str, &str); 3] = [
     (TradingInstructionValue::Active, "active", "Active"),
@@ -510,6 +521,26 @@ mod tests {
             deployment_admin: true,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_plugin_links_to_the_instructions_when_a_role_of_it_honours_them() {
+        let records = AccessRecords {
+            known_plugins: vec![
+                KnownPluginRoles {
+                    plugin_instance_id: "desk-1".into(),
+                    roles: vec!["custody".into(), "oms".into()],
+                },
+                KnownPluginRoles {
+                    plugin_instance_id: "ops-1".into(),
+                    roles: vec!["operations".into(), "custody".into()],
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(honoured_by(&records, "desk-1"));
+        assert!(!honoured_by(&records, "ops-1"));
+        assert!(!honoured_by(&records, "unknown-1"));
     }
 
     #[test]
