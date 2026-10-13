@@ -416,6 +416,36 @@ fn a_rule_or_a_calendar_not_held_says_so_and_is_reported_by_its_subject() {
         "CAL-NOT-HELD"
     );
 
+    // An instrument whose market is not known -- no listing venue, so no
+    // country: rule not held, and reported missing as a calendar is, by the
+    // asset class it has and the country it lacks.
+    let unlisted = compute(
+        &latest(),
+        &ComputeDateRequest {
+            inputs: Some(settlement("2026-10-09")),
+            as_of_ns: 0,
+        },
+        |_| {
+            Some(Market {
+                asset_class: AssetClass::Equity as i32,
+                country_code: String::new(),
+                venue_id: String::new(),
+            })
+        },
+        KEPT + 1,
+    )
+    .unwrap();
+    assert_eq!(unlisted.reply.outcome, DateOutcome::RuleNotHeld as i32);
+    assert!(unlisted.reply.date.is_empty());
+    let missing = unlisted.missing.expect("reported missing");
+    assert_eq!(missing.kind, DateRuleKind::Settlement as i32);
+    assert_eq!(missing.observed_at_ns, KEPT + 1);
+    let subject = missing.subject.unwrap();
+    assert_eq!(
+        (subject.country_code.as_str(), subject.asset_class),
+        ("", AssetClass::Equity as i32)
+    );
+
     // A settlement rule not held for the market: reported by its market.
     let (calendars, _) = seed();
     let none = Held::as_of(&calendars, &[], 0);

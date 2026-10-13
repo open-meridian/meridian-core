@@ -547,9 +547,11 @@ pub fn compute(
                 ..Default::default()
             };
             if market.country_code.is_empty() || market.asset_class == 0 {
-                // Its market is not known: no rule can be named for it, and
-                // nothing is guessed.
-                return Ok(answered(DateOutcome::RuleNotHeld, DateBasis::default()));
+                // Its market is not known -- no listing venue's country, or no
+                // asset class: no rule can be named for it, and nothing is
+                // guessed. Reported missing as a calendar is (W3.18; the
+                // dictionary's "rule not held"), by what is known of it.
+                return Ok(rule_not_held(subject, DateRuleKind::Settlement, now_ns));
             }
             let matches = |rule: &DateRuleVersion, venue: &str| match &rule.parameters {
                 Some(date_rule_version::Parameters::Settlement(held)) => {
