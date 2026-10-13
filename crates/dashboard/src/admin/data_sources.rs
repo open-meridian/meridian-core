@@ -357,18 +357,12 @@ fn datasets_tab(rows: &[Row], records: &AccessRecords, token: &str) -> (String, 
                 n = entitled.len(),
                 unconverted = thousands(d.unconverted_count),
                 misses = thousands(d.miss_count),
-                closed = if d.outside_coverage_count == 0 {
-                    thousands(d.closed_day_count)
-                } else {
-                    format!(
-                        "{} <span class=\"badge warn\" data-outside-coverage>{} outside</span>",
-                        thousands(d.closed_day_count),
-                        thousands(d.outside_coverage_count)
-                    )
-                },
+                closed = closed_cell(d.closed_day_count, d.outside_coverage_count),
                 closed_said = escape(&format!(
-                    "{} dated on a closed day of its calendar; {} outside its coverage",
-                    d.closed_day_count, d.outside_coverage_count
+                    "{}: {} dated on a closed day of its calendar, {} outside its coverage",
+                    closed_cell(d.closed_day_count, d.outside_coverage_count),
+                    d.closed_day_count,
+                    d.outside_coverage_count
                 )),
             )
         })
@@ -662,6 +656,16 @@ pub fn page(
     )
 }
 
+/// A dataset's closed-day count as its cell says it, those outside the
+/// calendar's coverage beside it, apart (W10.9).
+fn closed_cell(closed: u64, outside: u64) -> String {
+    if outside == 0 {
+        thousands(closed)
+    } else {
+        format!("{} ({} outside)", thousands(closed), thousands(outside))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -723,9 +727,10 @@ mod tests {
         assert!(body.contains("data-datasets=\"1\""), "{body}");
         assert!(body.contains("<td class=\"wide num\" data-unconverted>2</td>"));
         assert!(body.contains("data-closed-days"));
-        assert!(
-            body.contains(">3 <span class=\"badge warn\" data-outside-coverage>1 outside</span>")
-        );
+        assert!(body.contains(
+            " data-closed-days title=\"3 (1 outside): 3 dated on a closed day of its calendar, \
+             1 outside its coverage\">3 (1 outside)</td>"
+        ));
         assert!(body.contains("<td class=\"wide num\" data-misses>1</td>"));
         assert!(
             body.contains("the catalogue&#39;s default")
