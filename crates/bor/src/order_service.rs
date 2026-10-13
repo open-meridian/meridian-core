@@ -335,10 +335,9 @@ fn no_account(
     code: &str,
     raw: Option<meridian_pb::v1::RawRecordRef>,
 ) -> Result<(String, Vec<u8>), String> {
-    // Answered in the row's own reply: a recorded order's an OrderReply and
-    // a locate's a LocateReply, naming the entry that kept it and no record.
+    // Answered in the row's own reply: a locate's a LocateReply, naming the
+    // entry that kept it and no record.
     let reply_type = match &fact {
-        unplaced_fact::Fact::Order(_) => "meridian.v1.OrderReply",
         unplaced_fact::Fact::Locate(_) => "meridian.v1.LocateReply",
         _ => "meridian.v1.FactReply",
     };
@@ -468,24 +467,14 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
                 clock.now_ns(),
             );
             let mut ctx = context_of(&envelope, clock.as_ref());
+            // The oms's command for a user (W11.2): a connectivity plugin
+            // records no order (ruled 2026-10-13), so none is kept unplaced.
             if request.account_id.is_empty() {
-                if !ctx.acting_for.is_empty() {
-                    return Err(StoreError::Malformed {
-                        fields: vec!["account_id".into()],
-                        words: "a telephoned order names its account".into(),
-                    }
-                    .on_the_bus());
+                return Err(StoreError::Malformed {
+                    fields: vec!["account_id".into()],
+                    words: "a recorded order names its account".into(),
                 }
-                return no_account(
-                    &bus2,
-                    store.as_ref(),
-                    &envelope,
-                    ctx,
-                    unplaced_fact::Fact::Order(request.clone()),
-                    UnplacedReason::UnmappedVenueAccount,
-                    &request.venue_account_code,
-                    request.raw_record.clone(),
-                );
+                .on_the_bus());
             }
             let found = references(
                 &bus2,

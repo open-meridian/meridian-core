@@ -2,7 +2,8 @@
 //! against the contract compiled into this runtime: a service account's
 //! algorithm checked and stamped; a command naming its record by ID alone
 //! stamped with the write scope it is held to; a venue fact's account from
-//! the venue account map; the venue's catalogue read as the plugin itself;
+//! the venue account map; a connectivity plugin's RecordOrder and
+//! CreatePlacement refused; the venue's catalogue read as the plugin itself;
 //! a code mapped twice refused before the conductor.
 
 use std::sync::{Arc, Mutex};
@@ -15,7 +16,7 @@ use meridian_domain::v1::{
 use meridian_pb::plugin::v1::plugin_operations_server::PluginOperations;
 use meridian_pb::plugin::v1::{
     Decimal, MapVenueAccountParams, ProposeOrderParams, ReadVenueCatalogueParams,
-    RecordOrderParams, ReleaseOrderParams,
+    RecordOrderParams, ReleaseOrderParams, ReportExecutionParams,
 };
 use meridian_pb::v1::sidecar_service_server::SidecarService;
 use meridian_pb::v1::{
@@ -390,31 +391,90 @@ async fn a_connectivity_plugins_venue_fact_takes_the_account_its_ems_mapped_or_n
         ],
     };
     let p = plugin("fix-1", &["connectivity"], Some(map)).await;
-    let order = |code: &str| RecordOrderParams {
+    hears_fills(&p);
+    let fill = |code: &str| ReportExecutionParams {
+        placement_id: "PLC-1".into(),
         venue_account_code: code.into(),
         // Whatever the plugin names, the map decides.
         account_id: "ACC-3".into(),
         quantity: one(),
-        venue_order_id: "V-1".into(),
         ..Default::default()
     };
     p.sidecar
-        .record_order(Request::new(order("ACCT-7")))
+        .report_execution(Request::new(fill("ACCT-7")))
         .await
         .unwrap();
     let (_, body) = p.heard.lock().unwrap().last().cloned().unwrap();
-    let sent = meridian_domain::v1::RecordOrderRequest::decode(&body[..]).unwrap();
+    let sent = meridian_domain::v1::ReportExecutionRequest::decode(&body[..]).unwrap();
     assert_eq!(sent.account_id, "ACC-1");
 
     // A code nobody mapped on this plugin is sent with no account, never
     // refused: the book keeps the fact unplaced.
     p.sidecar
-        .record_order(Request::new(order("ACCT-8")))
+        .report_execution(Request::new(fill("ACCT-8")))
         .await
         .unwrap();
     let (_, body) = p.heard.lock().unwrap().last().cloned().unwrap();
-    let sent = meridian_domain::v1::RecordOrderRequest::decode(&body[..]).unwrap();
+    let sent = meridian_domain::v1::ReportExecutionRequest::decode(&body[..]).unwrap();
     assert!(sent.account_id.is_empty());
+}
+
+/// The book's stand-in for a reported fill, keeping what it heard.
+fn hears_fills(p: &Plugin) {
+    let keeping = Arc::clone(&p.heard);
+    p.bus
+        .serve("platform.book.command.report-execution", move |envelope| {
+            keeping
+                .lock()
+                .unwrap()
+                .push((envelope.meta.clone().unwrap_or_default(), envelope.payload));
+            Ok((
+                "meridian.v1.FactReply".into(),
+                meridian_domain::v1::FactReply::default().encode_to_vec(),
+            ))
+        });
+}
+
+#[tokio::test]
+async fn a_connectivity_plugin_records_no_order_and_creates_no_placement() {
+    // Ruled 2026-10-13: the venue-originated path is v23's. Its sidecar
+    // refuses both rows as any row its role is not granted, naming no grant,
+    // and the book hears nothing.
+    use meridian_pb::plugin::v1::CreatePlacementParams;
+    let c = plugin("fix-1", &["connectivity"], None).await;
+    let refused = c
+        .sidecar
+        .record_order(Request::new(RecordOrderParams {
+            account_id: "ACC-1".into(),
+            quantity: one(),
+            venue_order_id: "V-1".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), Code::PermissionDenied);
+    assert!(
+        refused.message().contains(RECORD_ORDER),
+        "{}",
+        refused.message()
+    );
+    let refused = c
+        .sidecar
+        .create_placement(Request::new(CreatePlacementParams {
+            order_id: "ORD-1".into(),
+            connectivity_instance_id: "fix-1".into(),
+            quantity: one(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), Code::PermissionDenied);
+    assert!(
+        refused.message().contains(CREATE_PLACEMENT),
+        "{}",
+        refused.message()
+    );
+    assert!(c.heard.lock().unwrap().is_empty(), "the book heard nothing");
 }
 
 #[tokio::test]
@@ -488,7 +548,7 @@ fn a_placement_reaches_a_connectivity_plugin_only_at_the_instance_it_names() {
 
 #[tokio::test]
 async fn a_plugin_holding_custody_and_connectivity_takes_the_map_never_its_links() {
-    // Q42: custody does not send a venue's order, so only the map stamps it,
+    // Q42: custody does not send a venue's fill, so only the map stamps it,
     // whatever account the plugin names and whether or not it names a code.
     let map = VenueAccountMap {
         ems_instance_id: "ems-1".into(),
@@ -499,19 +559,20 @@ async fn a_plugin_holding_custody_and_connectivity_takes_the_map_never_its_links
         }],
     };
     let p = plugin("snap-1", &["custody", "connectivity"], Some(map)).await;
+    hears_fills(&p);
     for (code, expected) in [("SNAP-A", "ACC-1"), ("", "")] {
         p.sidecar
-            .record_order(Request::new(RecordOrderParams {
+            .report_execution(Request::new(ReportExecutionParams {
+                placement_id: "PLC-1".into(),
                 venue_account_code: code.into(),
                 account_id: "ACC-3".into(),
                 quantity: one(),
-                venue_order_id: "V-1".into(),
                 ..Default::default()
             }))
             .await
             .unwrap();
         let (_, body) = p.heard.lock().unwrap().last().cloned().unwrap();
-        let sent = meridian_domain::v1::RecordOrderRequest::decode(&body[..]).unwrap();
+        let sent = meridian_domain::v1::ReportExecutionRequest::decode(&body[..]).unwrap();
         assert_eq!(sent.account_id, expected, "code {code:?}");
     }
 }
@@ -569,32 +630,6 @@ async fn a_placement_says_whether_its_connectivity_plugin_is_one_the_caller_may_
         !allowed(&p),
         "the plugin as itself names nobody who may route"
     );
-
-    // A connectivity plugin's own direct order: allowed where the claims
-    // name its own instance.
-    let c = plugin("fix-1", &["connectivity"], None).await;
-    let own = |routes: &[&str]| {
-        routed(
-            &c.key,
-            "fix-1",
-            "connectivity",
-            AccessLevel::Write,
-            &["ACC-1"],
-            None,
-            "",
-            routes,
-        )
-    };
-    c.sidecar
-        .create_placement(Request::new(place("fix-1", Some(own(&["fix-1"])))))
-        .await
-        .unwrap();
-    assert!(allowed(&c));
-    c.sidecar
-        .create_placement(Request::new(place("fix-1", Some(own(&[])))))
-        .await
-        .unwrap();
-    assert!(!allowed(&c), "withdrawn, or not among its users");
 }
 
 // ── The order path's rules the sidecar holds (contract v22) ─────────────────

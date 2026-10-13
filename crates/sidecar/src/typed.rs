@@ -138,11 +138,7 @@ pub(crate) const BY_ID_ALONE: [&str; 11] = [
 
 /// The venue facts stamped from the venue account map (matrix/stamped.tsv's
 /// `venue-account-map`, contract v22), each with the topic it is sent on.
-const VENUE_FACTS: [(&str, &str); 3] = [
-    (
-        "meridian.v1.RecordOrderRequest",
-        "platform.book.command.record-order",
-    ),
+const VENUE_FACTS: [(&str, &str); 2] = [
     (
         "meridian.v1.ReportExecutionRequest",
         "platform.book.command.report-execution",
@@ -641,8 +637,8 @@ impl Sidecar {
         }
         // A placement (contract v22, W11.8): whether the connectivity plugin
         // it names is one the claims say the caller may route through from
-        // this plugin -- linked, available, its users naming them -- an ems's
-        // placement and a connectivity plugin's own direct order alike. The
+        // this ems -- linked, available, its users naming them. A
+        // connectivity plugin creates no placement (ruled 2026-10-13). The
         // book refuses and records CONNECTIVITY_NOT_ALLOWED by it.
         let routed = (payload_type == CREATE_PLACEMENT).then(|| {
             let named = domain::CreatePlacementRequest::decode(message.encode_to_vec().as_slice())
@@ -660,8 +656,8 @@ impl Sidecar {
 
     /// A venue fact the book kept unplaced naming no account, counted for the
     /// plugin's admin view (contract v22, W11.13): a report's answer naming an
-    /// unplaced fact with no account, or a recorded order or locate sent
-    /// with no account mapped and kept.
+    /// unplaced fact with no account, or a locate sent with no account mapped
+    /// and kept.
     fn count_unplaced(&self, payload_type: &str, unmapped: bool, reply: &[u8]) {
         let kept = match payload_type {
             "meridian.v1.ReportExecutionRequest"
@@ -670,13 +666,6 @@ impl Sidecar {
                 .ok()
                 .and_then(|reply| reply.unplaced)
                 .is_some_and(|fact| fact.account_id.is_empty()),
-            "meridian.v1.RecordOrderRequest" => {
-                unmapped
-                    && domain::OrderReply::decode(reply)
-                        .ok()
-                        .and_then(|reply| reply.entry)
-                        .is_some_and(|entry| entry.kind == UNPLACED_KIND)
-            }
             "meridian.v1.RecordLocateRequest" => {
                 unmapped
                     && domain::LocateReply::decode(reply)

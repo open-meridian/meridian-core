@@ -601,12 +601,12 @@ pub async fn link(
 /// The connectivity plugins `subject` -- a person, or a service account by
 /// its SA- ID -- in `user_group_ids` may route through from `instance`
 /// (contract v22; W11.8, W11.21; the product owner, 2026-10-12): for an
-/// ems, each linked to it; for a connectivity plugin's own placement (a
-/// direct order), itself while it is linked to an ems; in either case only
-/// while available, and only where its users name the subject, the
-/// service account or one of the user groups. What the claims carry as
-/// connectivity_instance_ids, which the plugin's sidecar holds a placement
-/// to and stamps connectivity_allowed by.
+/// ems, each linked to it, only while available, and only where its users
+/// name the subject, the service account or one of the user groups; for
+/// any other plugin none, a connectivity plugin creating no placement
+/// (ruled 2026-10-13). What the claims carry as connectivity_instance_ids,
+/// which the ems's sidecar holds a placement to and stamps
+/// connectivity_allowed by.
 pub fn routes(
     records: &AccessRecords,
     instance: &str,
@@ -617,9 +617,7 @@ pub fn routes(
         .connectivity_links
         .iter()
         .filter(|link| link.available && !link.ems_instance_id.is_empty())
-        .filter(|link| {
-            link.ems_instance_id == instance || link.connectivity_instance_id == instance
-        })
+        .filter(|link| link.ems_instance_id == instance)
         .filter(|link| {
             link.users.iter().any(|user| match &user.user {
                 Some(connectivity_user::User::Subject(named)) => named == subject,
@@ -918,11 +916,9 @@ mod tests {
         );
         // A non-member named nowhere: none.
         assert!(routes(&records, "ems-1", "local|ben", &groups(&["UG-2"])).is_empty());
-        // A connectivity plugin's own direct order: itself, on the same terms.
-        assert_eq!(
-            routes(&records, "fix-1", "local|ada", &groups(&[])),
-            vec!["fix-1"]
-        );
+        // A connectivity plugin routes through nothing, itself included: it
+        // creates no placement (ruled 2026-10-13).
+        assert!(routes(&records, "fix-1", "local|ada", &groups(&[])).is_empty());
         assert!(routes(&records, "fix-4", "local|ada", &groups(&[])).is_empty());
     }
 }

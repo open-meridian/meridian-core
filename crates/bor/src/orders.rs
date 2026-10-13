@@ -23,10 +23,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use meridian_domain::exact::Exact;
 use meridian_domain::v1::{
     ChangeRequest, ChangeRequestOutcome, Charge, Check, Execution, FinalityLevel, JournalRef,
-    Locate, LocateAnswer, LocateUse, LocateUseKind, Order, OrderCondition, OrderQuantities,
-    OrderState, OrderStatus, Placement, PlacementChangeKind, PlacementCondition, PlacementEvent,
-    PlacementState, PlacementStatus, ReportPlacementRequest, StandingOrderCondition,
-    StandingPlacementCondition, TieOutReason, TradingInstruction, UnplacedFact,
+    Locate, LocateAnswer, LocateUse, LocateUseKind, Order, OrderCondition, OrderOrigin,
+    OrderQuantities, OrderState, OrderStatus, Placement, PlacementChangeKind, PlacementCondition,
+    PlacementEvent, PlacementState, PlacementStatus, ReportPlacementRequest,
+    StandingOrderCondition, StandingPlacementCondition, TieOutReason, TradingInstruction,
+    UnplacedFact,
 };
 use serde::{Deserialize, Serialize};
 
@@ -460,6 +461,14 @@ impl Ledger {
                             parent.children.push(order_id.clone());
                         }
                     }
+                }
+                // A recorded order's venue order ID, so a second recording it
+                // is refused (W11.2).
+                if order.origin != OrderOrigin::Unspecified as i32
+                    && !order.venue_order_id.is_empty()
+                {
+                    self.venue_facts
+                        .insert(recorded_order_key(&order.venue_order_id), order_id.clone());
                 }
                 let held = self.orders.entry(order_id.clone()).or_default();
                 held.order = order.clone();
@@ -1188,6 +1197,14 @@ impl Ledger {
                 conditions: self.placement_conditions(placement_id),
             }),
             checks: held.checks.clone(),
+            // Its own change requests, each with its PlacementChange and
+            // outcome, so its connectivity plugin hears each on the
+            // placement (W11.9; approved 2026-10-13).
+            change_requests: held
+                .change_requests
+                .iter()
+                .filter_map(|id| self.changes.get(id).cloned())
+                .collect(),
             last_change: held.last_change.clone(),
             ..held.placement.clone()
         })
@@ -1353,6 +1370,12 @@ pub fn due_at(held: &OrderHeld) -> Option<i64> {
 /// The dedup key of a venue's execution: the instance that sent it and the
 /// venue's identifiers, with what it supersedes and its finality, so a
 /// finality move or a correction is a fact of its own and a repeat is not.
+/// A recorded order's venue or broker order ID, kept in its account's book
+/// so a second order recording it is refused (W11.2).
+pub fn recorded_order_key(venue_order_id: &str) -> String {
+    key_of(&["order", venue_order_id])
+}
+
 pub fn venue_key(sender: &str, execution: &Execution) -> String {
     key_of(&[
         sender,

@@ -377,7 +377,7 @@ fn every_row_the_book_names_is_in_the_generated_table() {
         Some(OrderState::Working),
         OrderState::Released
     ));
-    // A venue-originated order is a record being created.
+    // A recorded order is a record being created.
     let recorded = crate::order_decide::row("23a");
     assert!(crate::order_decide::starts_from(recorded, None));
 }
@@ -464,6 +464,212 @@ async fn a_proposal_is_proposed_entered_by_its_user_and_names_what_its_instrumen
     .await
     .unwrap_err();
     assert_eq!(code(&nobody), Some(RefusalReason::ActorRequired));
+}
+
+// ── W11.2: record an order the book did not create ──────────────────────────
+
+fn telephoned(venue_order_id: &str) -> RecordOrderRequest {
+    RecordOrderRequest {
+        account_id: ACC.into(),
+        instrument_id: AAPL.into(),
+        side: Side::Sell as i32,
+        quantity: d("4"),
+        order_type: OrderType::Market as i32,
+        venue_order_id: venue_order_id.into(),
+        origin: OrderOrigin::Telephoned as i32,
+        ..Default::default()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_telephoned_order_is_the_oms_s_for_a_user_and_its_venue_order_id_recorded_once() {
+    let w = wired();
+    let record = |request: RecordOrderRequest, from: As| {
+        let bus = w.bus.clone();
+        async move {
+            send_from(
+                &bus,
+                RECORD_ORDER,
+                "meridian.v1.RecordOrderRequest",
+                &request,
+                &from,
+            )
+            .await
+            .map(|reply| OrderReply::decode(&reply[..]).unwrap())
+        }
+    };
+    let recorded = record(telephoned("ALP-55021-889"), person(TRADER))
+        .await
+        .unwrap();
+    let order = recorded.order.unwrap();
+    assert_eq!(state(&order), OrderState::Released);
+    assert_eq!(order.origin, OrderOrigin::Telephoned as i32);
+    assert_eq!(order.account_id, ACC);
+    let actor = recorded.entry.unwrap().actor.unwrap();
+    assert!(matches!(actor.kind, Some(actor::Kind::Person(ref who)) if who.subject == TRADER));
+
+    // Sent for no one: a recorded order is a user's act, never a venue's
+    // fact (ruled 2026-10-13), so nothing is kept unplaced.
+    let nobody = record(telephoned("ALP-55021-890"), venue())
+        .await
+        .unwrap_err();
+    assert_eq!(code(&nobody), Some(RefusalReason::ActorRequired));
+    // Naming no account: refused naming the field.
+    let mut unnamed = telephoned("ALP-55021-891");
+    unnamed.account_id = String::new();
+    let refused = record(unnamed, person(TRADER)).await.unwrap_err();
+    assert_eq!(
+        status_of(&refused).unwrap().1,
+        vec!["account_id".to_string()]
+    );
+    // The same venue order ID again: refused, the first kept.
+    let again = record(telephoned("ALP-55021-889"), person(TRADER))
+        .await
+        .unwrap_err();
+    assert_eq!(code(&again), Some(RefusalReason::IdentifierInUse));
+    // An instrument whose record is incomplete: refused naming what it lacks.
+    let mut incomplete = telephoned("ALP-55021-892");
+    incomplete.instrument_id = NOCCY.into();
+    let lacking = record(incomplete, person(TRADER)).await.unwrap_err();
+    assert_eq!(code(&lacking), Some(RefusalReason::Incomplete));
+    assert!(w
+        .store
+        .orders(&OrdersRead {
+            scope: Scope::Everything,
+            account_id: crate::store::NO_ACCOUNT.into(),
+            since: None,
+            limit: 100,
+            cursor: String::new(),
+        })
+        .unwrap()
+        .unplaced
+        .is_empty());
+}
+
+// ── W11.9: a placement's change requests ────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_placement_carries_its_own_change_requests_to_its_connectivity_plugin() {
+    let w = wired();
+    let order = released(&w, "10").await;
+    // At another connectivity instance than this bus's, so the requests
+    // below are the ems's and the oms's, never the venue's own.
+    let placement = send_from(
+        &w.bus,
+        CREATE_PLACEMENT,
+        "meridian.v1.CreatePlacementRequest",
+        &CreatePlacementRequest {
+            order_id: order.order_id.clone(),
+            connectivity_instance_id: "fix-1".into(),
+            venue_account_code: "SNAP-ACCT-9F2".into(),
+            quantity: d("10"),
+            limit_price: usd("227.50"),
+            ..Default::default()
+        },
+        &person(TRADER),
+    )
+    .await
+    .map(|reply| PlacementReply::decode(&reply[..]).unwrap())
+    .unwrap()
+    .placement
+    .unwrap();
+    assert!(placement.change_requests.is_empty());
+    let mut placed = w.bus.subscribe(PLACEMENT_UPDATED);
+    let replaced = send_from(
+        &w.bus,
+        REQUEST_PLACEMENT_CHANGE,
+        "meridian.v1.RequestPlacementChangeRequest",
+        &RequestPlacementChangeRequest {
+            placement_id: placement.placement_id.clone(),
+            change: Some(PlacementChange {
+                kind: PlacementChangeKind::Replace as i32,
+                quantity: d("8"),
+                limit_price: usd("227.80"),
+                time_in_force: TimeInForce::Day as i32,
+            }),
+            ..Default::default()
+        },
+        &person(TRADER),
+    )
+    .await
+    .map(|reply| PlacementReply::decode(&reply[..]).unwrap())
+    .unwrap()
+    .placement
+    .unwrap();
+    let asked = |placement: &Placement| -> Vec<(i32, Option<String>, i32)> {
+        placement
+            .change_requests
+            .iter()
+            .map(|request| {
+                let Some(change_request::Change::PlacementChange(change)) = &request.change else {
+                    panic!("a placement's change request carries its PlacementChange");
+                };
+                (
+                    change.kind,
+                    change.limit_price.as_ref().map(|limit| read(&limit.amount)),
+                    request.outcome,
+                )
+            })
+            .collect()
+    };
+    let replace = (
+        PlacementChangeKind::Replace as i32,
+        Some("227.80".to_string()),
+        ChangeRequestOutcome::Pending as i32,
+    );
+    assert_eq!(asked(&replaced), vec![replace.clone()]);
+    assert_eq!(
+        replaced.change_requests[0].placement_id,
+        placement.placement_id
+    );
+    // Heard on the placement, as its connectivity plugin hears it.
+    let heard =
+        PlacementUpdatedEvent::decode(&next(&mut placed).await.envelope.payload[..]).unwrap();
+    assert_eq!(asked(&heard.placement.unwrap()), vec![replace.clone()]);
+
+    // An order cancel carries a cancel to the placement, beside the replace;
+    // the order's own request stays on the order.
+    let cancelled = order_command(
+        &w,
+        REQUEST_ORDER_CHANGE,
+        "meridian.v1.RequestOrderChangeRequest",
+        &RequestOrderChangeRequest {
+            order_id: order.order_id.clone(),
+            change: Some(OrderChange {
+                kind: OrderChangeKind::Cancel as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        &person(TRADER),
+    )
+    .await
+    .unwrap()
+    .order
+    .unwrap();
+    assert!(cancelled
+        .change_requests
+        .iter()
+        .all(|request| request.placement_id.is_empty()));
+    let heard = loop {
+        let event =
+            PlacementUpdatedEvent::decode(&next(&mut placed).await.envelope.payload[..]).unwrap();
+        let now = event.placement.unwrap();
+        if now.change_requests.len() == 2 {
+            break now;
+        }
+    };
+    assert_eq!(
+        asked(&heard),
+        vec![
+            replace,
+            (
+                PlacementChangeKind::Cancel as i32,
+                None,
+                ChangeRequestOutcome::Pending as i32
+            )
+        ]
+    );
 }
 
 // ── W11.6: the gate ─────────────────────────────────────────────────────────

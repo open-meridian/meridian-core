@@ -1112,9 +1112,10 @@ enum OrderDirection {
 enum OrderOrigin {
   // An order the book created: proposed (W11.1).
   ORDER_ORIGIN_UNSPECIFIED = 0;
-  // A venue-originated order: a liquidation, auto-deleveraging, one a drop
-  // copy shows; actor the venue.
-  ORDER_ORIGIN_VENUE = 1;
+  // A connectivity plugin records no order (ruled 2026-10-13): a
+  // venue-originated fill is v23's.
+  reserved 1;
+  reserved "ORDER_ORIGIN_VENUE";
   // A telephoned or outside order, recorded by the `oms` for a person.
   ORDER_ORIGIN_TELEPHONED = 2;
 }
@@ -1332,11 +1333,12 @@ enum UnplacedReason {
   // It names a placement the book does not hold.
   UNPLACED_REASON_UNKNOWN_PLACEMENT = 1;
   // Its venue account code maps to no account on the sending connectivity
-  // plugin (W11.2, W11.22).
+  // plugin (W11.22).
   UNPLACED_REASON_UNMAPPED_VENUE_ACCOUNT = 2;
-  // Its instrument's record is incomplete (W11.2; the order-path plan's
-  // Q18).
-  UNPLACED_REASON_INSTRUMENT_INCOMPLETE = 3;
+  // A venue's recorded order on an incomplete record, gone with the
+  // venue-originated path (ruled 2026-10-13).
+  reserved 3;
+  reserved "UNPLACED_REASON_INSTRUMENT_INCOMPLETE";
 }
 
 // The standard execution instructions (step 6's requirement 12; FIX's
@@ -1791,6 +1793,11 @@ message Placement {
   // Every venue order ID it has had, in order, the current last
   // (requirement 34): external references, never keys.
   repeated string venue_order_ids = 25;
+
+  // Its own change requests, each with its PlacementChange and tracked to
+  // its outcome (W11.9; approved 2026-10-13), so its connectivity plugin
+  // hears each on the placement. The order's stay on the order.
+  repeated ChangeRequest change_requests = 26;
 }
 
 // A placement's status, derived.
@@ -1918,7 +1925,7 @@ message UnplacedFact {
   // Empty where its venue account code maps to no account: delivered to no
   // plugin, counted on its connectivity plugin's admin view.
   string account_id = 2;
-  // The kind of fact, as data: `execution`, `placement`, `charge`, `order`.
+  // The kind of fact, as data: `execution`, `placement`, `charge`, `locate`.
   string fact_kind = 3;
   UnplacedReason reason = 4;
   RawRecordRef raw_record = 5;
@@ -1928,9 +1935,12 @@ message UnplacedFact {
     ReportExecutionRequest execution = 7;
     ReportPlacementRequest placement = 8;
     ReportChargeRequest charge = 9;
-    RecordOrderRequest order = 10;
     RecordLocateRequest locate = 11;
   }
+  // A venue's recorded order, gone with the venue-originated path (ruled
+  // 2026-10-13).
+  reserved 10;
+  reserved "order";
   // The entry that placed it, once a later record claimed it.
   JournalRef placed_by = 12;
   // Its latest entry: the one that kept it, or the one that placed it.
@@ -2053,14 +2063,14 @@ message ProposeOrderRequest {
   repeated ExecutionInstruction execution_instructions = 34;
 }
 
-// W11.2. A fact: never through the gate. By a connectivity plugin, its
-// account stamped by the sidecar from the `ems`'s map
-// (`venue-account-map`); or by the `oms`, for a person, naming the account.
+// W11.2. A fact: never through the gate. By the `oms`, for a user, naming
+// the account: a telephoned or outside order. A connectivity plugin records
+// no order (ruled 2026-10-13).
 message RecordOrderRequest {
-  // Stamped from venue_account_code on a connectivity plugin's; empty,
-  // never refused, where none is mapped, so the fact is kept unplaced.
   string account_id = 1;
-  string venue_account_code = 2;
+  // A venue's recorded order's, gone with the venue-originated path.
+  reserved 2;
+  reserved "venue_account_code";
   string instrument_id = 3;
   string sleeve = 4;
   Side side = 5;
@@ -2070,7 +2080,9 @@ message RecordOrderRequest {
   TimeInForce time_in_force = 9;
   string venue_order_id = 10;
   OrderOrigin origin = 11;
-  RawRecordRef raw_record = 12;
+  // As venue_account_code: a venue's, gone with it.
+  reserved 12;
+  reserved "raw_record";
   string idempotency_key = 13;
 }
 
@@ -2122,7 +2134,7 @@ message SetWorkingConditionRequest {
   string idempotency_key = 5;
 }
 
-// W11.8. By the `ems`; or by a connectivity plugin, a direct order's.
+// W11.8. By the `ems` alone (ruled 2026-10-13).
 message CreatePlacementRequest {
   string order_id = 1;
   // One linked to the placing `ems` and made available to the user the
@@ -2184,8 +2196,9 @@ message ReportExecutionRequest {
   string placement_id = 1;
   // A done-away execution's order.
   string order_id = 2;
-  // Stamped from venue_account_code on a connectivity plugin's, as
-  // RecordOrderRequest's is.
+  // Stamped from venue_account_code on a connectivity plugin's
+  // (`venue-account-map`); empty, never refused, where none is mapped, so
+  // the fact is kept unplaced. Named on an entry for a person.
   string account_id = 3;
   string venue_account_code = 4;
   string venue_execution_id = 5;

@@ -1118,9 +1118,9 @@ pub(crate) struct Opening {
     pub level: AccessLevel,
     /// The connectivity plugins the caller may route through from this
     /// plugin (contract v22, W11.8, W11.21): for an ems, those linked to it
-    /// and available whose users name the caller; for a connectivity plugin,
-    /// itself on the same terms. In the claims as connectivity_instance_ids,
-    /// which the plugin's sidecar holds a placement to.
+    /// and available whose users name the caller; for any other plugin none.
+    /// In the claims as connectivity_instance_ids, which the ems's sidecar
+    /// holds a placement to.
     pub connectivity_instance_ids: Vec<String>,
 }
 

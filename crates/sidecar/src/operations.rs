@@ -596,14 +596,13 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
     ) -> Result<Response<plugin::RecordOrderResult>, Status> {
         let mut params = request.into_inner();
         let acting_for = params.acting_for.take();
-        let mut message: domain::RecordOrderRequest = self.as_domain(params)?;
+        let message: domain::RecordOrderRequest = self.as_domain(params)?;
         self.exact("quantity", message.quantity.as_ref())?;
         self.exact_money("limit_price", message.limit_price.as_ref())?;
         self.known("side", message.side, domain::Side::try_from(message.side).is_ok())?;
         self.known("order_type", message.order_type, domain::OrderType::try_from(message.order_type).is_ok())?;
         self.known("time_in_force", message.time_in_force, domain::TimeInForce::try_from(message.time_in_force).is_ok())?;
         self.known("origin", message.origin, domain::OrderOrigin::try_from(message.origin).is_ok())?;
-        message.account_id = self.venue_mapped_account("meridian.v1.RecordOrderRequest", &message.venue_account_code, &message.account_id).await?;
         let account = Some(message.account_id.clone());
         self.command_typed("platform.book.command.record-order", "meridian.v1.RecordOrderRequest", message, account, acting_for).await
     }

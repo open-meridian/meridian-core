@@ -634,17 +634,17 @@ pub fn propose_order(
 
 // ── W11.2: record an order the book did not create ──────────────────────────
 
-/// A venue-originated order, a drop copy's, or a telephoned order: a fact
-/// (row 23a), never through the gate. A venue's that the book cannot place
-/// is kept unplaced; an `oms`'s for a person is a command, refused naming
-/// what it lacks.
+/// A telephoned or outside order, recorded by the `oms` for a user: a fact
+/// (row 23a), never through the gate, and a command, refused naming what it
+/// lacks. A connectivity plugin records no order (ruled 2026-10-13): its
+/// sidecar refuses the row before it reaches the book.
 pub fn record_order(
     book: &Book,
     head: u64,
     ctx: &Context,
     request: &RecordOrderRequest,
 ) -> Result<Made> {
-    let by_a_person = !ctx.acting_for.is_empty();
+    user_required(ctx, "recording an order")?;
     if request.instrument_id.is_empty() {
         return Err(malformed(
             &["instrument_id"],
@@ -666,46 +666,30 @@ pub fn record_order(
     ctx.references_answered()?;
     let missing = ctx.instrument_missing("", &request.instrument_id);
     if !missing.is_empty() {
-        if by_a_person {
-            return Err(StoreError::incomplete(
-                "the order's instrument",
-                missing
-                    .into_iter()
-                    .map(|field| field.trim_start_matches('.').to_string())
-                    .collect(),
-            ));
-        }
-        return unplaced(
-            book,
-            head,
-            ctx,
-            unplaced_fact::Fact::Order(request.clone()),
-            UnplacedReason::InstrumentIncomplete,
-            &request.venue_account_code,
-            request.raw_record.clone(),
-        );
+        return Err(StoreError::incomplete(
+            "the order's instrument",
+            missing
+                .into_iter()
+                .map(|field| field.trim_start_matches('.').to_string())
+                .collect(),
+        ));
     }
     if !request.venue_order_id.is_empty() {
-        let seen = key_of(&[&ctx.instance_id, "order", &request.venue_order_id]);
-        if let Some(order_id) = book.ledger.venue_facts.get(&seen) {
-            if by_a_person {
-                return Err(StoreError::refused(
-                    RefusalReason::IdentifierInUse,
-                    format!(
-                        "venue order {} is recorded already, as order {order_id}",
-                        request.venue_order_id
-                    ),
-                ));
-            }
-            return Err(StoreError::Repeated(Vec::new()));
+        if let Some(order_id) = book
+            .ledger
+            .venue_facts
+            .get(&orders::recorded_order_key(&request.venue_order_id))
+        {
+            return Err(StoreError::refused(
+                RefusalReason::IdentifierInUse,
+                format!(
+                    "venue order {} is recorded already, as order {order_id}",
+                    request.venue_order_id
+                ),
+            ));
         }
     }
-    let origin = match OrderOrigin::try_from(request.origin) {
-        Ok(OrderOrigin::Unspecified) | Err(_) if by_a_person => OrderOrigin::Telephoned,
-        Ok(OrderOrigin::Unspecified) | Err(_) => OrderOrigin::Venue,
-        Ok(origin) => origin,
-    };
-    let actor = fact_actor(ctx);
+    let actor = ctx.actor();
     let order = Order {
         order_id: ctx.mint(ids::ORDER),
         account_id: book.account_id.clone(),
@@ -716,7 +700,7 @@ pub fn record_order(
         order_type: request.order_type,
         limit_price: request.limit_price.clone(),
         time_in_force: request.time_in_force,
-        origin: origin as i32,
+        origin: OrderOrigin::Telephoned as i32,
         venue_order_id: request.venue_order_id.clone(),
         person_roles: Some(PersonRoles {
             entered_by: Some(actor.clone()),
@@ -734,11 +718,6 @@ pub fn record_order(
     )
     .key(&request.idempotency_key);
     finish(book, head, ctx, plan)
-}
-
-/// Remember a recorded order's venue identifier, so a repeat is recognised.
-pub fn venue_order_key(sender: &str, venue_order_id: &str) -> String {
-    key_of(&[sender, "order", venue_order_id])
 }
 
 // ── W11.3: ask for a change to an order ─────────────────────────────────────
@@ -2461,7 +2440,6 @@ pub fn unplaced(
         unplaced_fact::Fact::Execution(_) => "execution",
         unplaced_fact::Fact::Placement(_) => "placement",
         unplaced_fact::Fact::Charge(_) => "charge",
-        unplaced_fact::Fact::Order(_) => "order",
         unplaced_fact::Fact::Locate(_) => "locate",
     };
     // A repeat of an unplaced execution is the same fact, kept once.

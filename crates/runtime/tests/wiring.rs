@@ -660,7 +660,7 @@ fn ems_admin(key: &SigningKey, instance: &str) -> CallerAssertion {
 /// operation, acting for its admin; the ems's scope stream carries its
 /// plugin and its map; and the connectivity plugin, started on the same
 /// store, has its link and the mapped account as its scope, and a venue's
-/// order it records takes that account from the map. No stand-in answers for
+/// fill it reports takes that account from the map. No stand-in answers for
 /// the conductor.
 #[tokio::test]
 async fn a_connectivity_plugin_linked_to_its_ems_reaches_the_accounts_the_ems_mapped() {
@@ -804,12 +804,13 @@ async fn a_connectivity_plugin_linked_to_its_ems_reaches_the_accounts_the_ems_ma
     let fix_bus = serve("fix-1");
     let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
     let keeping = Arc::clone(&recorded);
-    fix_bus.serve("platform.book.command.record-order", move |envelope| {
-        let order = meridian_domain::v1::RecordOrderRequest::decode(&envelope.payload[..]).unwrap();
-        keeping.lock().unwrap().push(order.account_id);
+    fix_bus.serve("platform.book.command.report-execution", move |envelope| {
+        let fill =
+            meridian_domain::v1::ReportExecutionRequest::decode(&envelope.payload[..]).unwrap();
+        keeping.lock().unwrap().push(fill.account_id);
         Ok((
-            "meridian.v1.OrderReply".into(),
-            meridian_domain::v1::OrderReply::default().encode_to_vec(),
+            "meridian.v1.FactReply".into(),
+            meridian_domain::v1::FactReply::default().encode_to_vec(),
         ))
     });
     let fix = Sidecar::new(
@@ -827,18 +828,21 @@ async fn a_connectivity_plugin_linked_to_its_ems_reaches_the_accounts_the_ems_ma
     assert_eq!(told.connectivity_link.unwrap().ems_instance_id, "ems-1");
     assert_eq!(told.read_account_ids, vec![account.account_id.clone()]);
 
-    fix.record_order(Request::new(meridian_pb::plugin::v1::RecordOrderParams {
-        venue_account_code: "ACCT-7".into(),
-        venue_order_id: "V-1".into(),
-        quantity: Some(Decimal {
-            high: 0,
-            low: 5,
-            scale: 0,
-        }),
-        ..Default::default()
-    }))
+    fix.report_execution(Request::new(
+        meridian_pb::plugin::v1::ReportExecutionParams {
+            placement_id: "PLC-1".into(),
+            venue_account_code: "ACCT-7".into(),
+            venue_execution_id: "V-1".into(),
+            quantity: Some(Decimal {
+                high: 0,
+                low: 5,
+                scale: 0,
+            }),
+            ..Default::default()
+        },
+    ))
     .await
-    .expect("the venue's order is sent");
+    .expect("the venue's fill is sent");
     assert_eq!(recorded.lock().unwrap().as_slice(), [account.account_id]);
 }
 
