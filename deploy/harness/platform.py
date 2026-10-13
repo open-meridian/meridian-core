@@ -28,7 +28,16 @@ its MIC (W3.15); and a test equity, answered by its FIGI with its listing
 venue, XNAS (Apple Inc. lists on Nasdaq), and that venue (W3.3), so a
 deployment's record minted for it and asked of the platform names a listing
 venue in the US, and a settlement date worked out for it is T+1 on the US
-securities settlement calendar."""
+securities settlement calendar.
+
+From contract v23 it also serves the euro's TARGET calendar (the ECB's
+TARGET closing days) and a EUR/USD spot-date rule, as the platform keeps
+them: lag 2, counted on TARGET alone, as the market counts a USD pair --
+the US dollar's holidays do not count against the lag -- the spot date good
+on TARGET and the US dollar's calendar, cut 17:00 New York, modified
+following with end of month. A pull names the pair by its two cash
+instruments, either order. So EUR/USD traded Friday 9 October 2026 spots on
+Tuesday 13 October, Columbus Day on the Monday counted on EUR alone."""
 import datetime
 import http.server
 import json
@@ -87,9 +96,21 @@ NYSE_CLOSED = [
     ("2027-07-05", "Independence Day"), ("2027-09-06", "Labor Day"),
     ("2027-11-25", "Thanksgiving Day"), ("2027-12-24", "Christmas Day"),
 ]
+ECB = {"source_id": "ecb-target", "name": "ECB: TARGET closing days",
+       "address": "https://www.ecb.europa.eu/paym/target/target-professional-use-documents-links/target_closing_days/html/index.en.html",
+       "read_at_ns": READ_AT}
+# The weekdays TARGET is closed (1 January, Good Friday, Easter Monday, 1 May,
+# 25 and 26 December); those on a weekend need no line.
+TARGET_CLOSED = [
+    ("2026-01-01", "New Year's Day"), ("2026-04-03", "Good Friday"),
+    ("2026-04-06", "Easter Monday"), ("2026-05-01", "Labour Day"),
+    ("2026-12-25", "Christmas Day"), ("2027-01-01", "New Year's Day"),
+    ("2027-03-26", "Good Friday"), ("2027-03-29", "Easter Monday"),
+]
 USD_CALENDAR = "CAL-01JAE000000000000000USD1"
 XNYS_CALENDAR = "CAL-01JAE000000000000000XNYS"
 USSS_CALENDAR = "CAL-01JAE0000000000000000USSS"
+EUR_CALENDAR = "CAL-01JAE000000000000000EUR1"
 
 
 def calendar(calendar_id, name, kind, closed, source, **subject):
@@ -114,6 +135,8 @@ CALENDARS = [
              venue_ids=["VEN-01JAE0000000000000000XNYS", "VEN-01JAE0000000000000000XNAS"]),
     calendar(USSS_CALENDAR, "US securities settlement", "CALENDAR_KIND_SECURITIES_SETTLEMENT",
              FED_CLOSED, FED, settlement_system={"name": "DTC", "country_code": "US"}),
+    calendar(EUR_CALENDAR, "Euro (TARGET)", "CALENDAR_KIND_CURRENCY", TARGET_CLOSED, ECB,
+             instrument_id=record("EUR")["instrument_id"]),
 ]
 SEC = {"source_id": "sec-t1", "name": "SEC: the T+1 settlement cycle",
        "address": "https://www.sec.gov/newsroom/press-releases/2023-29", "read_at_ns": READ_AT}
@@ -130,6 +153,22 @@ def us_equity(version, lag, effective):
 
 
 RULES = [us_equity(1, 2, "2017-09-05"), us_equity(2, 1, "2024-05-28")]
+
+# Contract v23: EUR/USD's spot-date rule (see the module's note).
+SPOT_SOURCE = {"source_id": "fx-spot", "name": "Foreign exchange date conventions",
+               "address": "https://en.wikipedia.org/wiki/Foreign_exchange_date_conventions",
+               "read_at_ns": READ_AT}
+SPOT_RULES = [{
+    "kind": "DATE_RULE_KIND_SPOT", "subject": "EUR/USD", "version": 1,
+    "spot": {"pair": [record("EUR")["instrument_id"], record("USD")["instrument_id"]],
+             "lag_days": 2, "counting_calendars": [EUR_CALENDAR],
+             "spot_calendars": [EUR_CALENDAR, USD_CALENDAR],
+             "cut": {"local_time": "17:00", "time_zone": "America/New_York"},
+             "tenor_rule": {"convention": "BUSINESS_DAY_CONVENTION_MODIFIED_FOLLOWING",
+                            "end_of_month": True},
+             "effective_from_date": "2016-01-01"},
+    "sources": [SPOT_SOURCE], "record_time_ns": READ_AT + 100_000_000_000,
+}]
 
 # Contract v22: the US equity venues, each as the platform's venue master
 # keeps it (meridian-platform's venue_records: the ISO 10383 row's name and
@@ -186,6 +225,13 @@ def calendars_for(one, many):
         calendars = [c for c in CALENDARS if c.get("instrument_id") == one("instrument_id")]
     elif one("venue_id"):
         calendars = [c for c in CALENDARS if one("venue_id") in c.get("venue_ids", [])]
+    elif one("kind") == "DATE_RULE_KIND_SPOT":
+        pair = sorted(many("pair"))
+        rules = [r for r in SPOT_RULES if sorted(r["spot"]["pair"]) == pair]
+        named = {c for r in rules
+                 for c in r["spot"]["counting_calendars"] + r["spot"]["spot_calendars"]}
+        rules = [r for r in rules if r["version"] > after]
+        calendars = [c for c in CALENDARS if c["calendar_id"] in named]
     elif one("kind") == "DATE_RULE_KIND_SETTLEMENT":
         rules = [r for r in RULES
                  if r["settlement"]["country_code"] == one("country_code")
