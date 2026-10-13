@@ -656,8 +656,9 @@ def the_connectivity_part_and_the_calendars_tab(browser, prefix):
     """Contract v22 (W11.21, W11.22, W3.21): a connectivity plugin's Access
     tab says whether it is available, the ems it is linked to and who may
     route, one line, its dialogs within the viewport, withdrawn and made
-    available again from its dialog; an ems's says its connectivity plugins
-    and its venue account map, one line a mapping behind the kit's pager,
+    available again from its dialog; an ems's says its connectivity plugins,
+    its admin linking one there from a dialog within the viewport that
+    returns to it (W11.21), and its venue account map, one line a mapping behind the kit's pager,
     read-only; the Instruments page's Calendars tab lists the calendars held
     one line each and shows a calendar's year -- each fitting one screen at
     both sizes."""
@@ -715,8 +716,38 @@ def the_connectivity_part_and_the_calendars_tab(browser, prefix):
         mapped = page.get_attribute("[data-mapped]", "data-mapped")
         check((mapped or "0").isdigit() and int(mapped or "0") >= 6,
               f"at {size} an ems's venue account map lists its mappings: {mapped!r}")
-        check(page.locator("#connectivity form").count() == 0,
+        check(page.locator("#connectivity form:not([action$='/connectivity/link'])").count() == 0,
               f"at {size} an ems's map is read-only here, set on its own page")
+        # W11.21: the ems's admin links its connectivity plugins here, on the
+        # ems's page, and the change returns here.
+        opener = page.locator("#connectivity tr[data-connectivity=fix-1] button[data-dialog-open]")
+        if not opener.count():
+            check(False, f"at {size} the ems's admin is offered fix-1's link on the ems's page")
+        else:
+            dialog = opener.get_attribute("data-dialog-open")
+            opener.click()
+            page.wait_for_timeout(300)
+            boxed = inside_the_viewport(page)
+            check(not boxed, f"at {size} the ems's link dialog stays within the viewport{': ' + boxed if boxed else ''}")
+            spilled = page.evaluate(INSIDE)
+            check(not spilled, f"at {size} nothing in the ems's link dialog reaches past it"
+                  f"{': ' + '; '.join(spilled[:4]) if spilled else ''}")
+            chosen = page.locator(f"dialog#{dialog} input[name=user]:checked").count()
+            check(chosen >= 1, f"at {size} its dialog has who may route through fix-1 chosen: {chosen}")
+            page.screenshot(path=os.path.join(OUT, f"{prefix}-ems-link-{size}.png"))
+            if size == "desktop" and PASS != "fit":
+                page.fill(f"dialog#{dialog} [name=note]", "Kept as it is, saved from the ems")
+                page.click(f"dialog#{dialog} button[type=submit]")
+                settled(page)
+                check("/admin/plugins/ems-1" in page.url,
+                      f"saved from the ems's page, it returns there: {page.url}")
+                page.goto(f"{BASE}/admin/plugins/ems-1?tab=access#part-connectivity")
+                settled(page)
+                linked = page.get_attribute("[data-linked]", "data-linked")
+                check(linked == "1", f"and fix-1 is still linked to ems-1: {linked!r}")
+            else:
+                page.click(f"dialog#{dialog} [data-dialog-close]")
+                page.wait_for_timeout(200)
         tall = page.evaluate("""() => [...document.querySelectorAll('[data-mapped] tbody tr')]
           .filter((r) => r.offsetParent !== null && r.getBoundingClientRect().height > 64).length""")
         check(not tall, f"at {size} each mapping is one line: {tall} taller")

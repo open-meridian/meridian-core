@@ -136,9 +136,114 @@ pub fn part(
         ));
     }
     if holds(records, instance, "ems") {
-        out.push_str(&ems_part(records, instance));
+        out.push_str(&ems_part(records, instance, viewer, accounts, token));
     }
     out
+}
+
+/// Who may route through `link`, as the searched picker named `id` offers
+/// them -- user groups, people and service accounts -- with its users chosen.
+fn users_picker(
+    records: &AccessRecords,
+    link: &ConnectivityLink,
+    accounts: &[(String, String)],
+    id: &str,
+) -> String {
+    let chosen: Vec<String> = link.users.iter().map(user_key).collect();
+    let mut offered: Vec<(String, String)> = records
+        .user_groups
+        .iter()
+        .map(|group| {
+            (
+                format!("group:{}", group.user_group_id),
+                format!("{} (user group)", group.name),
+            )
+        })
+        .collect();
+    offered.extend(records.people.iter().map(|person| {
+        (
+            format!("person:{}", person.subject),
+            if person.display_name.is_empty() {
+                person.subject.clone()
+            } else {
+                person.display_name.clone()
+            },
+        )
+    }));
+    offered.extend(
+        accounts
+            .iter()
+            .map(|(id, name)| (format!("account:{id}"), format!("{name} (service account)"))),
+    );
+    // The dashboard's searched picker (the product owner, 2026-09-30:
+    // "should have search boxes"), as a user group's people are chosen.
+    let choices: Vec<super::picker::Choice> = offered
+        .iter()
+        .map(|(key, label)| super::picker::Choice {
+            value: key.clone(),
+            label: label.clone(),
+            detail: key
+                .split_once(':')
+                .map(|(_, id)| id.to_string())
+                .unwrap_or_default(),
+            ..Default::default()
+        })
+        .collect();
+    let picked: std::collections::HashSet<&str> = chosen.iter().map(String::as_str).collect();
+    super::picker::many(
+        id,
+        "user",
+        "Who may route through it",
+        "people, service accounts and user groups",
+        &choices,
+        &picked,
+    )
+}
+
+/// A link's dialog: its `id` and `title`; `ems`, the select's options,
+/// already HTML; `from_ems` when it opens on the ems's own page, which the
+/// change returns to.
+struct LinkDialog<'a> {
+    id: &'a str,
+    title: &'a str,
+    ems: &'a str,
+    from_ems: bool,
+}
+
+/// The dialog linking `link`'s connectivity plugin to an ems.
+fn link_dialog(
+    records: &AccessRecords,
+    link: &ConnectivityLink,
+    accounts: &[(String, String)],
+    token: &str,
+    dialog: LinkDialog,
+) -> String {
+    let LinkDialog {
+        id,
+        title,
+        ems,
+        from_ems,
+    } = dialog;
+    let instance = escape(&link.connectivity_instance_id);
+    let boxes = users_picker(records, link, accounts, &format!("{id}-users"));
+    let back = if from_ems {
+        "<input type=\"hidden\" name=\"back\" value=\"ems\">"
+    } else {
+        ""
+    };
+    format!(
+        "<dialog id=\"{id}\" aria-labelledby=\"{id}-title\">\
+         <form method=\"post\" action=\"/admin/plugins/{instance}/connectivity/link\">{token}{back}\
+         <div class=\"dialog-head\"><h2 id=\"{id}-title\">{title}</h2></div>\
+         <div class=\"dialog-body\"><label>The ems <select name=\"ems_instance_id\">{ems}</select></label>\
+         {boxes}\
+         <label>Why <input name=\"note\" maxlength=\"{NOTE_MOST}\"></label>\
+         <p class=\"hint\">Each connectivity plugin is linked to one ems. A placement for anyone \
+         not chosen is refused and recorded. Unlinking leaves the placements already made as they \
+         are.</p></div><div class=\"dialog-foot\"><button type=\"button\" data-dialog-close>Cancel</button>\
+         <button type=\"submit\" class=\"primary\">Save</button></div></form></dialog>",
+        title = escape(title),
+    )
 }
 
 fn connectivity_part(
@@ -212,70 +317,20 @@ fn connectivity_part(
                 )
             })
             .collect();
-        let chosen: Vec<String> = link.users.iter().map(user_key).collect();
-        let mut offered: Vec<(String, String)> = records
-            .user_groups
-            .iter()
-            .map(|group| {
-                (
-                    format!("group:{}", group.user_group_id),
-                    format!("{} (user group)", group.name),
-                )
-            })
-            .collect();
-        offered.extend(records.people.iter().map(|person| {
-            (
-                format!("person:{}", person.subject),
-                if person.display_name.is_empty() {
-                    person.subject.clone()
-                } else {
-                    person.display_name.clone()
-                },
-            )
-        }));
-        offered.extend(
-            accounts
-                .iter()
-                .map(|(id, name)| (format!("account:{id}"), format!("{name} (service account)"))),
-        );
-        // The dashboard's searched picker (the product owner, 2026-09-30:
-        // "should have search boxes"), as a user group's people are chosen.
-        let choices: Vec<super::picker::Choice> = offered
-            .iter()
-            .map(|(key, label)| super::picker::Choice {
-                value: key.clone(),
-                label: label.clone(),
-                detail: key
-                    .split_once(':')
-                    .map(|(_, id)| id.to_string())
-                    .unwrap_or_default(),
-                ..Default::default()
-            })
-            .collect();
-        let picked: std::collections::HashSet<&str> = chosen.iter().map(String::as_str).collect();
-        let boxes = super::picker::many(
-            "connectivity-users",
-            "user",
-            "Who may route through it",
-            "people, service accounts and user groups",
-            &choices,
-            &picked,
-        );
         actions.push_str(
             "<button type=\"button\" data-dialog-open=\"connectivity-link\">Edit link</button>",
         );
-        dialogs.push_str(&format!(
-            "<dialog id=\"connectivity-link\" aria-labelledby=\"connectivity-link-title\">\
-             <form method=\"post\" action=\"/admin/plugins/{id}/connectivity/link\">{token}\
-             <div class=\"dialog-head\"><h2 id=\"connectivity-link-title\">Link {id} to an ems</h2></div>\
-             <div class=\"dialog-body\"><label>The ems <select name=\"ems_instance_id\">\
-             <option value=\"\">None (unlink)</option>{options}</select></label>\
-             {boxes}\
-             <label>Why <input name=\"note\" maxlength=\"{NOTE_MOST}\"></label>\
-             <p class=\"hint\">Each connectivity plugin is linked to one ems. A placement for anyone \
-             not chosen is refused and recorded. Unlinking leaves the placements already made as they \
-             are.</p></div><div class=\"dialog-foot\"><button type=\"button\" data-dialog-close>Cancel</button>\
-             <button type=\"submit\" class=\"primary\">Save</button></div></form></dialog>"
+        dialogs.push_str(&link_dialog(
+            records,
+            &link,
+            accounts,
+            token,
+            LinkDialog {
+                id: "connectivity-link",
+                title: &format!("Link {instance} to an ems"),
+                ems: &format!("<option value=\"\">None (unlink)</option>{options}"),
+                from_ems: false,
+            },
         ));
     }
     format!(
@@ -297,12 +352,74 @@ fn connectivity_part(
     )
 }
 
-fn ems_part(records: &AccessRecords, instance: &str) -> String {
+/// An ems's part: the connectivity plugins linked to it and its venue
+/// account map. Its admin links one here, as W11.21 has it: each plugin
+/// linked to it, to change who routes through it or to unlink it, and each
+/// a deployment admin made available and nothing links yet.
+fn ems_part(
+    records: &AccessRecords,
+    instance: &str,
+    viewer: &Viewer,
+    accounts: &[(String, String)],
+    token: &str,
+) -> String {
     let links: Vec<&ConnectivityLink> = records
         .connectivity_links
         .iter()
         .filter(|link| link.ems_instance_id == instance)
         .collect();
+    let admin = (viewer.administers_ems)(instance);
+    // Available and linked to no ems: its admin's to link (W11.21).
+    let open: Vec<ConnectivityLink> = if admin {
+        records
+            .known_plugins
+            .iter()
+            .filter(|known| known.roles.iter().any(|role| role == "connectivity"))
+            .map(|known| link_of(records, &known.plugin_instance_id))
+            .filter(|link| link.available && link.ems_instance_id.is_empty())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let ems = escape(instance);
+    let mut dialogs = String::new();
+    let mut action = |n: usize, link: &ConnectivityLink, linked: bool| -> String {
+        if !admin {
+            return String::new();
+        }
+        let id = format!("ems-link-{n}");
+        let (label, title, options) = if linked {
+            (
+                "Edit",
+                format!("{}'s link to {instance}", link.connectivity_instance_id),
+                format!(
+                    "<option value=\"{ems}\" selected>{ems}</option>\
+                     <option value=\"\">None (unlink)</option>"
+                ),
+            )
+        } else {
+            (
+                "Link",
+                format!("Link {} to {instance}", link.connectivity_instance_id),
+                format!("<option value=\"{ems}\" selected>{ems}</option>"),
+            )
+        };
+        dialogs.push_str(&link_dialog(
+            records,
+            link,
+            accounts,
+            token,
+            LinkDialog {
+                id: &id,
+                title: &title,
+                ems: &options,
+                from_ems: true,
+            },
+        ));
+        format!(
+            "<td class=\"actions\"><button type=\"button\" data-dialog-open=\"{id}\">{label}</button></td>"
+        )
+    };
     let account_name = |id: &str| {
         records
             .accounts
@@ -311,26 +428,33 @@ fn ems_part(records: &AccessRecords, instance: &str) -> String {
             .map(|account| account.name.clone())
             .unwrap_or_else(|| id.to_string())
     };
-    let link_rows: String = links
-        .iter()
-        .map(|link| {
-            format!(
-                "<tr><td><a href=\"{href}\">{c}</a></td><td>{available}</td><td>{users}</td></tr>",
-                href = escape(&super::view::path(&link.connectivity_instance_id)),
-                c = escape(&link.connectivity_instance_id),
-                available = if link.available { "Yes" } else { "Withdrawn" },
-                users = link.users.len(),
-            )
-        })
-        .collect();
+    let row = |link: &ConnectivityLink, users: String, action: String| {
+        format!(
+            "<tr data-connectivity=\"{c}\"><td><a href=\"{href}\">{c}</a></td><td>{available}</td>\
+             <td>{users}</td>{action}</tr>",
+            href = escape(&super::view::path(&link.connectivity_instance_id)),
+            c = escape(&link.connectivity_instance_id),
+            available = if link.available { "Yes" } else { "Withdrawn" },
+        )
+    };
+    let mut link_rows = String::new();
+    for (n, link) in links.iter().enumerate() {
+        let act = action(n, link, true);
+        link_rows.push_str(&row(link, link.users.len().to_string(), act));
+    }
+    for (n, link) in open.iter().enumerate() {
+        let act = action(links.len() + n, link, false);
+        link_rows.push_str(&row(link, "Not linked".into(), act));
+    }
     let plugins = if link_rows.is_empty() {
         "<p class=\"empty\" data-linked=\"0\">No connectivity plugin is linked to it yet.</p>"
             .to_string()
     } else {
         format!(
             "<table class=\"list one-line\" data-linked=\"{n}\"><thead><tr><th>Connectivity plugin</th>\
-             <th>Available</th><th>Users</th></tr></thead><tbody>{link_rows}</tbody></table>",
-            n = links.len()
+             <th>Available</th><th>Users</th>{act}</tr></thead><tbody>{link_rows}</tbody></table>",
+            n = links.len(),
+            act = if admin { "<th class=\"actions\"></th>" } else { "" },
         )
     };
     let mappings: Vec<_> = records
@@ -360,9 +484,11 @@ fn ems_part(records: &AccessRecords, instance: &str) -> String {
             n = mappings.len()
         )
     };
+    // Its admin's Link and Edit say what they do in their dialogs: the part
+    // keeps to one screen on a phone.
     format!(
         "<h2>Its connectivity plugins</h2><p class=\"hint\">The map is set on this ems's own \
-         page.</p>{plugins}<h3>Venue account map</h3>{map}"
+         page.</p>{plugins}<h3>Venue account map</h3>{map}{dialogs}"
     )
 }
 
@@ -429,6 +555,12 @@ pub async fn link(
     // An admin of the ems linked to, or of the one it is linked to now when
     // unlinking; an admin of another role is refused (W11.21).
     let deciding = if ems.is_empty() { &standing } else { &ems };
+    // Opened on the ems's own page (W11.21), the change returns there.
+    let back = if field(&fields, "back") == "ems" && !deciding.is_empty() {
+        super::view::tab_href(deciding, super::view::ACCESS)
+    } else {
+        back
+    };
     if deciding.is_empty() || !access.plugin(deciding).administers("ems") {
         return super::after_to(
             Err(format!(
@@ -679,6 +811,53 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(user_of("group:").is_none() && user_of("planet:x").is_none());
+    }
+
+    #[test]
+    fn an_ems_admin_links_a_connectivity_plugin_on_the_ems_page() {
+        // W11.21: the ems's admin links, without holding the connectivity
+        // plugin's admin; a deployment admin's availability bounds it.
+        let mut records = records();
+        for (instance, available) in [("fix-2", true), ("fix-3", false)] {
+            records.known_plugins.push(KnownPluginRoles {
+                plugin_instance_id: instance.into(),
+                roles: vec!["connectivity".into()],
+            });
+            records.connectivity_links.push(ConnectivityLink {
+                connectivity_instance_id: instance.into(),
+                available,
+                ..Default::default()
+            });
+        }
+        let ems_admin = |ems: &str| ems == "ems-1";
+        let desk = Viewer {
+            deployment_admin: false,
+            administers_ems: &ems_admin,
+        };
+        let page = part(&records, "ems-1", &desk, &[], "<token>");
+        // Its linked plugin: changed or unlinked, its users chosen, back here.
+        assert!(page.contains("data-linked=\"1\""));
+        assert!(page.contains("action=\"/admin/plugins/fix-1/connectivity/link\""));
+        assert!(page.contains("value=\"group:UG-1\" checked"));
+        assert!(page.contains("None (unlink)"));
+        assert!(page.contains("name=\"back\" value=\"ems\""));
+        // The available one nothing links: offered; the withdrawn one: not.
+        assert!(page.contains("action=\"/admin/plugins/fix-2/connectivity/link\""));
+        assert!(page.contains("Not linked"));
+        assert!(!page.contains("fix-3"));
+        // Another ems's admin, or a deployment admin alone, links nothing here.
+        let other = |ems: &str| ems == "ems-2";
+        let page = part(
+            &records,
+            "ems-1",
+            &Viewer {
+                deployment_admin: true,
+                administers_ems: &other,
+            },
+            &[],
+            "",
+        );
+        assert!(!page.contains("<form") && !page.contains("fix-2"));
     }
 
     #[test]
