@@ -2190,6 +2190,9 @@ async fn an_accept_to_a_new_order_makes_it_filled_with_the_ems_s_placement_as_of
     assert_eq!(entry.meta.kind, "execution-accepted");
     assert_eq!(entry.meta.effective_date, "2026-10-09");
     assert_eq!(entry.meta.reason, "Confirmed with the client by phone");
+    assert!(entry.body.acts.iter().any(|act| matches!(act,
+        crate::orders::Act::Accepted { new_order_note, .. }
+            if new_order_note == "Sold in the broker's app on Monday")));
     let sleeve_position = |business_date: &str, at| {
         w.store
             .positions(&crate::store::PositionsRead {

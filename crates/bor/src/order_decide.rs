@@ -3386,6 +3386,12 @@ pub fn accept_execution(
         order_id: order_id.clone(),
         placement_id,
         line_counts,
+        new_order_note: match request.matched_order.as_ref() {
+            Some(accept_execution_request::MatchedOrder::NewOrder(new_order)) => {
+                new_order.note.clone()
+            }
+            _ => String::new(),
+        },
     });
     let mut plan = Plan::new("execution-accepted", ctx.actor(), acts).reason(&request.note);
     plan.lines = lines;

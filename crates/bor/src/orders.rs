@@ -150,6 +150,10 @@ pub enum Act {
         order_id: String,
         placement_id: String,
         line_counts: Vec<usize>,
+        /// A new order's note (NewOrderFromExecutions.note), kept with the
+        /// act that made it: the Order has no field for it.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        new_order_note: String,
     },
     /// Unmatched executions answered don't know (W11.24, contract v23):
     /// closed, never moving a position (transition e4).
@@ -715,6 +719,7 @@ impl Ledger {
                 order_id,
                 placement_id,
                 line_counts,
+                ..
             } => {
                 let sleeve = self
                     .orders
