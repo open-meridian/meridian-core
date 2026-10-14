@@ -28,3 +28,7 @@ so a plugin you write stays yours. Start with `meridian plugin new`; see
 ## For the team
 
 Run `make ci-local` before pushing; `make install-hooks` makes that automatic.
+A change goes on a branch, whose push runs that gate, and lands through one
+pull request per version, its summary the change log. CI runs once, on the
+pull request, and it merges when green, up to date with `main`, as a merge
+commit: that keeps the branch's commit SHAs, which other repositories pin.

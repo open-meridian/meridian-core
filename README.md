@@ -73,8 +73,9 @@ platform can scale, move and be redirected without anything here changing.
 
 ## Releases
 
-Every commit on `main` that passes CI is published: the image
-`ghcr.io/open-meridian/meridian-runtime`, tagged by commit and `latest`, for
+Every merge to `main` is published, its pull request's CI having passed on the
+same tree: the image `ghcr.io/open-meridian/meridian-runtime`, tagged by the
+merged branch's commit and `latest`, for
 amd64 and arm64, and beside it the chart,
 `oci://ghcr.io/open-meridian/charts/meridian-runtime`, versioned `0.1.<n>` and
 naming that image. The image carries every binary -- street, instrument,
