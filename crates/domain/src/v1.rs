@@ -7013,7 +7013,8 @@ pub struct UnplacedFact {
     /// plugin, counted on its connectivity plugin's admin view.
     #[prost(string, tag = "2")]
     pub account_id: ::prost::alloc::string::String,
-    /// The kind of fact, as data: `execution`, `placement`, `charge`, `locate`.
+    /// The kind of fact, as data: `execution`, `placement`, `charge`,
+    /// `locate`, and from contract v23 `value-date-roll`.
     #[prost(string, tag = "3")]
     pub fact_kind: ::prost::alloc::string::String,
     #[prost(enumeration = "UnplacedReason", tag = "4")]
@@ -7029,7 +7030,7 @@ pub struct UnplacedFact {
     #[prost(message, optional, tag = "13")]
     pub last_change: ::core::option::Option<JournalRef>,
     /// The fact as it arrived, named by fact_kind.
-    #[prost(oneof = "unplaced_fact::Fact", tags = "7, 8, 9, 11")]
+    #[prost(oneof = "unplaced_fact::Fact", tags = "7, 8, 9, 11, 14")]
     pub fact: ::core::option::Option<unplaced_fact::Fact>,
 }
 /// Nested message and enum types in `UnplacedFact`.
@@ -7045,6 +7046,10 @@ pub mod unplaced_fact {
         Charge(super::ReportChargeRequest),
         #[prost(message, tag = "11")]
         Locate(super::RecordLocateRequest),
+        /// A value-date roll on a code no ems mapped, or meeting no pending line
+        /// to move (W11.25, contract v23).
+        #[prost(message, tag = "14")]
+        ValueDateRoll(super::ReportValueDateRollRequest),
     }
 }
 /// A trading instruction (W11.15): recorded with its setter's level, a
@@ -9505,6 +9510,11 @@ pub enum UnplacedReason {
     /// Its venue account code maps to no account on the sending connectivity
     /// plugin (W11.22).
     UnmappedVenueAccount = 2,
+    /// A value-date roll meeting no pending line on its from date that the
+    /// sending connectivity plugin's fills or rolls on the code put there
+    /// (W11.25, contract v23): kept in the account, so operations sees the
+    /// venue's position and the book's differ.
+    NothingPending = 4,
 }
 impl UnplacedReason {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -9516,6 +9526,7 @@ impl UnplacedReason {
             Self::Unspecified => "UNPLACED_REASON_UNSPECIFIED",
             Self::UnknownPlacement => "UNPLACED_REASON_UNKNOWN_PLACEMENT",
             Self::UnmappedVenueAccount => "UNPLACED_REASON_UNMAPPED_VENUE_ACCOUNT",
+            Self::NothingPending => "UNPLACED_REASON_NOTHING_PENDING",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -9524,6 +9535,7 @@ impl UnplacedReason {
             "UNPLACED_REASON_UNSPECIFIED" => Some(Self::Unspecified),
             "UNPLACED_REASON_UNKNOWN_PLACEMENT" => Some(Self::UnknownPlacement),
             "UNPLACED_REASON_UNMAPPED_VENUE_ACCOUNT" => Some(Self::UnmappedVenueAccount),
+            "UNPLACED_REASON_NOTHING_PENDING" => Some(Self::NothingPending),
             _ => None,
         }
     }

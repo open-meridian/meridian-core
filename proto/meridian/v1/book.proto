@@ -1377,6 +1377,11 @@ enum UnplacedReason {
   // venue-originated path (ruled 2026-10-13).
   reserved 3;
   reserved "UNPLACED_REASON_INSTRUMENT_INCOMPLETE";
+  // A value-date roll meeting no pending line on its from date that the
+  // sending connectivity plugin's fills or rolls on the code put there
+  // (W11.25, contract v23): kept in the account, so operations sees the
+  // venue's position and the book's differ.
+  UNPLACED_REASON_NOTHING_PENDING = 4;
 }
 
 // The standard execution instructions (step 6's requirement 12; FIX's
@@ -1981,7 +1986,8 @@ message UnplacedFact {
   // Empty where its venue account code maps to no account: delivered to no
   // plugin, counted on its connectivity plugin's admin view.
   string account_id = 2;
-  // The kind of fact, as data: `execution`, `placement`, `charge`, `locate`.
+  // The kind of fact, as data: `execution`, `placement`, `charge`,
+  // `locate`, and from contract v23 `value-date-roll`.
   string fact_kind = 3;
   UnplacedReason reason = 4;
   RawRecordRef raw_record = 5;
@@ -1992,6 +1998,9 @@ message UnplacedFact {
     ReportPlacementRequest placement = 8;
     ReportChargeRequest charge = 9;
     RecordLocateRequest locate = 11;
+    // A value-date roll on a code no ems mapped, or meeting no pending line
+    // to move (W11.25, contract v23).
+    ReportValueDateRollRequest value_date_roll = 14;
   }
   // A venue's recorded order, gone with the venue-originated path (ruled
   // 2026-10-13).
