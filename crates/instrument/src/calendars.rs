@@ -923,8 +923,14 @@ pub const LIST_DEFAULT: usize = 25;
 /// Whether a calendar answers a list's kind and text (W3.21; contract v23):
 /// unspecified is every kind, and the text matches, ignoring case, its name
 /// or its subject's codes -- an identifier others use (an ISO 4217 code, a
-/// business centre) or the settlement system's name and country.
-fn listed(record: &CalendarRecord, request: &ListCalendarsRequest) -> bool {
+/// business centre), the settlement system's name and country, and what
+/// `subject_codes` knows of its subject from the deployment's own records:
+/// its currency's ISO 4217 code, each venue's MIC and name.
+fn listed(
+    record: &CalendarRecord,
+    request: &ListCalendarsRequest,
+    subject_codes: &dyn Fn(&CalendarRecord) -> Vec<String>,
+) -> bool {
     if request.kind != 0 && record.kind != request.kind {
         return false;
     }
@@ -932,12 +938,13 @@ fn listed(record: &CalendarRecord, request: &ListCalendarsRequest) -> bool {
     if query.is_empty() {
         return true;
     }
-    let mut codes: Vec<&str> = vec![record.name.as_str()];
-    codes.extend(record.identifiers.iter().map(|held| held.value.as_str()));
+    let mut codes: Vec<String> = vec![record.name.clone()];
+    codes.extend(record.identifiers.iter().map(|held| held.value.clone()));
     if let Some(system) = &record.settlement_system {
-        codes.push(system.name.as_str());
-        codes.push(system.country_code.as_str());
+        codes.push(system.name.clone());
+        codes.push(system.country_code.clone());
     }
+    codes.extend(subject_codes(record));
     codes
         .iter()
         .any(|code| code.to_lowercase().contains(&query))
@@ -950,6 +957,17 @@ pub fn list(
     calendars: &[KeptCalendar],
     rules: &[KeptDateRule],
     request: &ListCalendarsRequest,
+) -> Result<ListCalendarsReply, String> {
+    list_with(calendars, rules, request, &|_| Vec::new())
+}
+
+/// The same, the text also matched on what the deployment's records say of
+/// each calendar's subject (its currency's code, its venues' MICs and names).
+pub fn list_with(
+    calendars: &[KeptCalendar],
+    rules: &[KeptDateRule],
+    request: &ListCalendarsRequest,
+    subject_codes: &dyn Fn(&CalendarRecord) -> Vec<String>,
 ) -> Result<ListCalendarsReply, String> {
     if request.page_size < 0 || request.page_size as usize > LIST_MOST {
         return Err(format!(
@@ -975,7 +993,7 @@ pub fn list(
     let mut lines: Vec<HeldCalendar> = latest
         .values()
         .filter(|kept| kept.record.calendar_id.as_str() > request.cursor.as_str())
-        .filter(|kept| listed(&kept.record, request))
+        .filter(|kept| listed(&kept.record, request, subject_codes))
         .map(|kept| HeldCalendar {
             calendar_id: kept.record.calendar_id.clone(),
             name: kept.record.name.clone(),

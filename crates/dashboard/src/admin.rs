@@ -2308,7 +2308,15 @@ async fn instruments_page(
     let listed = instruments::list(&app.bus, "").await;
     // The Calendars tab (W3.21, contract v22): what is held, and the year of
     // the calendar chosen, this year by default.
-    let held = calendars::held(&app.bus).await;
+    let filter = calendars::Filter::from_page(
+        field(&query, "calendar_kind"),
+        field(&query, "calendar_query"),
+    );
+    let held = calendars::held(&app.bus, &filter).await;
+    let codes = match &held {
+        Ok(listed) => calendars::currency_codes(&app.bus, listed).await,
+        Err(_) => Default::default(),
+    };
     let chosen = field(&query, "calendar");
     let year = field(&query, "year")
         .parse::<u16>()
@@ -2318,7 +2326,12 @@ async fn instruments_page(
     } else {
         Some(calendars::year(&app.bus, chosen, year).await)
     };
-    let tab = calendars::tab(&held, read.as_ref().map(|read| (chosen, year, read)));
+    let tab = calendars::tab(
+        &held,
+        &filter,
+        &codes,
+        read.as_ref().map(|read| (chosen, year, read)),
+    );
     let body =
         instruments::list_page_with(&listed, &token_input(&session), field(&query, "done"), &tab);
     Html(page_with(

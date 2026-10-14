@@ -661,7 +661,10 @@ def the_connectivity_part_and_the_calendars_tab(browser, prefix):
     returns to it (W11.21), and its venue account map, one line a mapping behind the kit's pager,
     read-only; the Instruments page's Calendars tab lists the calendars held
     one line each and shows a calendar's year -- each fitting one screen at
-    both sizes."""
+    both sizes. From contract v23 (W3.21) each line shows its subject -- the
+    currency's ISO 4217 code, the venues by their IDs, the settlement
+    system's name and country -- and the tab is filtered by kind and searched
+    by text, its one form a GET that sets nothing."""
     for size, width, height in SIZES:
         ctx = context(browser, width, height)
         page = ctx.new_page()
@@ -758,6 +761,7 @@ def the_connectivity_part_and_the_calendars_tab(browser, prefix):
 
         for name, url, marker in [
             ("calendars", f"{BASE}/admin/instruments#calendars", "[data-calendars]"),
+            ("calendars-searched", f"{BASE}/admin/instruments?calendar_kind=CALENDAR_KIND_SECURITIES_SETTLEMENT&calendar_query=dtc#calendars", "[data-calendars]"),
             ("calendar-year", f"{BASE}/admin/instruments?calendar=CAL-01JAE000000000000000USD1&year=2026#calendars", "[data-days]"),
         ]:
             page.goto(url)
@@ -766,7 +770,25 @@ def the_connectivity_part_and_the_calendars_tab(browser, prefix):
             tall = page.evaluate(f"""() => [...document.querySelectorAll('{marker} tbody tr')]
               .filter((r) => r.offsetParent !== null && r.getBoundingClientRect().height > 64).length""")
             check(not tall, f"at {size} each line of {name} is one line: {tall} taller")
-            check(page.locator("#calendars form").count() == 0, f"at {size} the {name} view sets nothing")
+            check(page.locator("#calendars form:not([method=get])").count() == 0,
+                  f"at {size} the {name} view sets nothing")
+            if name == "calendars":
+                usd = page.locator("tr[data-calendar=CAL-01JAE000000000000000USD1] td[data-subject]")
+                check(usd.count() == 1 and usd.inner_text().strip() == "USD",
+                      f"at {size} the US dollar's subject is its ISO 4217 code: "
+                      f"{usd.inner_text() if usd.count() else None!r}")
+                venues = page.locator("tr[data-calendar=CAL-01JAE000000000000000XNYS] td[data-subject]")
+                check(venues.count() == 1 and "VEN-" in venues.inner_text(),
+                      f"at {size} a trading calendar's venues are named by their IDs")
+                check(page.locator("#calendars form select[name=calendar_kind]").count() == 1
+                      and page.locator("#calendars form input[name=calendar_query]").count() == 1,
+                      f"at {size} the tab is filtered by kind and searched by text")
+            if name == "calendars-searched":
+                shown = page.get_attribute("[data-calendars]", "data-calendars")
+                subject = page.locator("td[data-subject]")
+                check(shown == "1" and subject.count() == 1 and subject.inner_text().strip() == "DTC, US",
+                      f"at {size} the settlement calendars searched for dtc are one, its system "
+                      f"and country its subject: {shown!r}")
             problems = page.evaluate(FIT)
             check(not problems, f"the {name} view at {size} fits one screen"
                   f"{': ' + '; '.join(problems) if problems else ''}")

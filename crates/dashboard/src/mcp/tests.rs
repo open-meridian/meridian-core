@@ -667,6 +667,81 @@ async fn cores_completion_is_sent_stamped_with_the_delegation_and_refused_withou
 }
 
 #[tokio::test]
+async fn list_calendars_takes_a_kind_and_a_text_and_answers_each_lines_subject() {
+    // Contract v23 (W3.21; function parity with the Calendars tab).
+    let h = harness(true).await;
+    let token = token(&h.app, covering(&[], true), Resource::Mcp).await;
+    let asked: Arc<Mutex<Vec<meridian_domain::v1::ListCalendarsRequest>>> = Arc::default();
+    let heard = Arc::clone(&asked);
+    h.app
+        .bus
+        .serve(crate::admin::calendars::LIST_CALENDARS, move |envelope| {
+            let request =
+                meridian_domain::v1::ListCalendarsRequest::decode(&envelope.payload[..]).unwrap();
+            heard.lock().unwrap().push(request);
+            Ok((
+                "meridian.v1.ListCalendarsReply".to_string(),
+                meridian_domain::v1::ListCalendarsReply {
+                    calendars: vec![meridian_domain::v1::HeldCalendar {
+                        calendar_id: "CAL-USSS".into(),
+                        name: "US securities settlement".into(),
+                        kind: meridian_domain::v1::CalendarKind::SecuritiesSettlement as i32,
+                        settlement_system: Some(meridian_domain::v1::SettlementSystem {
+                            name: "DTC".into(),
+                            country_code: "US".into(),
+                        }),
+                        venue_ids: vec!["VEN-XNYS".into()],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            ))
+        });
+    let (_, said, _) = rpc(
+        &h.app,
+        Some(&token),
+        &[],
+        call(
+            "dashboard__list_calendars",
+            json!({"kind": "CALENDAR_KIND_SECURITIES_SETTLEMENT", "query": "dtc"}),
+        ),
+    )
+    .await;
+    let answered = structured(&said);
+    assert_eq!(answered["outcome"], "unchanged", "{said}");
+    let line = &answered["data"]["calendars"][0];
+    assert_eq!(line["settlement_system"]["name"], "DTC");
+    assert_eq!(line["settlement_system"]["country_code"], "US");
+    assert_eq!(line["venue_ids"][0], "VEN-XNYS");
+    assert_eq!(line["instrument_id"], "");
+    let sent = asked.lock().unwrap().clone();
+    assert_eq!(
+        sent[0].kind,
+        meridian_domain::v1::CalendarKind::SecuritiesSettlement as i32
+    );
+    assert_eq!(sent[0].query, "dtc");
+
+    for kind in ["CALENDAR_KIND_UNSPECIFIED", "NOT_A_KIND"] {
+        let (_, said, _) = rpc(
+            &h.app,
+            Some(&token),
+            &[],
+            call("dashboard__list_calendars", json!({"kind": kind})),
+        )
+        .await;
+        let refused = structured(&said);
+        assert_eq!(refused["outcome"], "refused", "{said}");
+        assert_eq!(refused["fields"][0]["path"], "kind");
+    }
+    assert_eq!(
+        asked.lock().unwrap().len(),
+        1,
+        "a refused kind asks nothing"
+    );
+}
+
+#[tokio::test]
 async fn initialize_ping_a_notification_and_a_batch() {
     let h = harness(false).await;
     let token = token(&h.app, covering(&["write"], false), Resource::Mcp).await;

@@ -4,11 +4,21 @@
 //! and a calendar shown one year at a time. A deployment edits no calendar
 //! (the spec's Q3): a disagreement goes to the platform. The same reads are
 //! `dashboard__list_calendars` and `dashboard__read_calendar`.
+//!
+//! From contract v23 (W3.21; v23's Q14 and Q15) each line shows its subject
+//! resolved -- a currency's ISO 4217 code, from the deployment's record
+//! carrying the platform's ID; a settlement system's name and country; the
+//! venues by their `VEN-` IDs until the dashboard may read a venue by its ID
+//! -- and the tab is filtered by kind and searched by text on the store's
+//! side, so it searches rather than pages.
+
+use std::collections::BTreeMap;
 
 use std::time::Duration;
 
 use meridian_domain::v1::{
-    CalendarDayKind, CalendarKind, ListCalendarsReply, ListCalendarsRequest, ReadCalendarReply,
+    CalendarDayKind, CalendarKind, HeldCalendar, ListCalendarsReply, ListCalendarsRequest,
+    ListInstrumentsToCompleteReply, ListInstrumentsToCompleteRequest, ReadCalendarReply,
     ReadCalendarRequest, Weekday,
 };
 use prost::Message;
@@ -52,8 +62,42 @@ async fn ask<R: Message + Default>(
     R::decode(&bytes[..]).map_err(|failed| format!("the answer did not read: {failed}"))
 }
 
-/// Every calendar held, every page read, and the rules.
-pub async fn held(bus: &meridian_bus::Bus) -> Result<ListCalendarsReply, String> {
+/// What the tab is filtered by (contract v23): a kind, unspecified for
+/// every kind, and a text the store matches on the name and the subject's
+/// codes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Filter {
+    pub kind: i32,
+    pub query: String,
+}
+
+impl Filter {
+    /// From the page's query: `calendar_kind`, the kind's enum name, and
+    /// `calendar_query`. A kind the schema does not define is every kind.
+    pub fn from_page(kind: &str, query: &str) -> Self {
+        Self {
+            kind: CalendarKind::from_str_name(kind)
+                .map(|kind| kind as i32)
+                .unwrap_or_default(),
+            query: query.trim().chars().take(QUERY_MOST).collect(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.kind == 0 && self.query.is_empty()
+    }
+}
+
+/// The scheme a record carries the platform's ID under (meridian-symbology's
+/// GLOBAL_ID, which the dashboard does not link).
+const GLOBAL_ID: &str = "open_meridian";
+
+/// The longest text the tab searches by.
+const QUERY_MOST: usize = 100;
+
+/// Every calendar held that answers the filter, every page read, and the
+/// rules.
+pub async fn held(bus: &meridian_bus::Bus, filter: &Filter) -> Result<ListCalendarsReply, String> {
     let mut all = ListCalendarsReply::default();
     let mut cursor = String::new();
     loop {
@@ -64,7 +108,8 @@ pub async fn held(bus: &meridian_bus::Bus) -> Result<ListCalendarsReply, String>
             ListCalendarsRequest {
                 page_size: 200,
                 cursor: cursor.clone(),
-                ..Default::default()
+                kind: filter.kind,
+                query: filter.query.clone(),
             },
         )
         .await?;
@@ -75,6 +120,131 @@ pub async fn held(bus: &meridian_bus::Bus) -> Result<ListCalendarsReply, String>
         }
         cursor = page.next_cursor;
     }
+}
+
+/// The ISO 4217 code of each currency a line names by its platform `INS-`
+/// ID, from the deployment's record carrying that ID (its `iso4217`
+/// identifier, else its currency); an ID no record carries is left out, and
+/// the line shows the ID itself.
+pub async fn currency_codes(
+    bus: &meridian_bus::Bus,
+    listed: &ListCalendarsReply,
+) -> BTreeMap<String, String> {
+    let mut codes = BTreeMap::new();
+    for id in listed
+        .calendars
+        .iter()
+        .map(|calendar| calendar.instrument_id.as_str())
+        .filter(|id| !id.is_empty())
+    {
+        if codes.contains_key(id) {
+            continue;
+        }
+        let found: Result<ListInstrumentsToCompleteReply, String> = ask(
+            bus,
+            super::instruments::LIST_INSTRUMENTS_TO_COMPLETE,
+            "meridian.v1.ListInstrumentsToCompleteRequest",
+            ListInstrumentsToCompleteRequest {
+                include_complete: true,
+                instrument_id: String::new(),
+                page_size: 10,
+                cursor: String::new(),
+                search: id.to_string(),
+            },
+        )
+        .await;
+        let code = found.ok().and_then(|found| {
+            found
+                .instruments
+                .iter()
+                .filter_map(|each| each.instrument.as_ref())
+                .find(|record| {
+                    record.instrument_id == id
+                        || record
+                            .identifiers
+                            .iter()
+                            .any(|held| held.scheme == GLOBAL_ID && held.value == id)
+                })
+                .and_then(|record| {
+                    record
+                        .identifiers
+                        .iter()
+                        .find(|held| held.scheme == "iso4217" && held.valid_until_ns == 0)
+                        .map(|held| held.value.clone())
+                        .or_else(|| (!record.currency.is_empty()).then(|| record.currency.clone()))
+                })
+        });
+        if let Some(code) = code {
+            codes.insert(id.to_string(), code);
+        }
+    }
+    codes
+}
+
+/// A line's subject as a person reads it: the currency's ISO 4217 code (its
+/// platform ID where no record carries it), each venue by its `VEN-` ID,
+/// the settlement system's name and country.
+fn subject_words(calendar: &HeldCalendar, codes: &BTreeMap<String, String>) -> String {
+    let mut words = Vec::new();
+    if !calendar.instrument_id.is_empty() {
+        words.push(
+            codes
+                .get(&calendar.instrument_id)
+                .cloned()
+                .unwrap_or_else(|| calendar.instrument_id.clone()),
+        );
+    }
+    if !calendar.venue_ids.is_empty() {
+        words.push(format!("venues {}", calendar.venue_ids.join(", ")));
+    }
+    if let Some(system) = calendar.settlement_system.as_ref() {
+        words.push(if system.country_code.is_empty() {
+            system.name.clone()
+        } else {
+            format!("{}, {}", system.name, system.country_code)
+        });
+    }
+    if words.is_empty() {
+        "—".into()
+    } else {
+        words.join("; ")
+    }
+}
+
+/// The filter's form: a kind and a text, sent to the store.
+fn filter_form(filter: &Filter) -> String {
+    let options: String = [
+        (CalendarKind::Unspecified, "Every kind"),
+        (CalendarKind::Currency, "Currency"),
+        (CalendarKind::Trading, "Trading"),
+        (CalendarKind::SecuritiesSettlement, "Securities settlement"),
+    ]
+    .iter()
+    .map(|(kind, words)| {
+        let value = if *kind == CalendarKind::Unspecified {
+            ""
+        } else {
+            kind.as_str_name()
+        };
+        format!(
+            "<option value=\"{value}\"{chosen}>{words}</option>",
+            chosen = if *kind as i32 == filter.kind {
+                " selected"
+            } else {
+                ""
+            },
+        )
+    })
+    .collect();
+    format!(
+        "<form class=\"filter-row calendar-filter\" method=\"get\" \
+         action=\"/admin/instruments#calendars\"><label>Kind<select name=\"calendar_kind\">\
+         {options}</select></label><input class=\"filter\" type=\"search\" \
+         name=\"calendar_query\" maxlength=\"{QUERY_MOST}\" value=\"{query}\" \
+         placeholder=\"Name, ISO code or system\" aria-label=\"Search calendars\">\
+         <button type=\"submit\">Show</button></form>",
+        query = escape(&filter.query),
+    )
 }
 
 /// One calendar's year: its days listed from 1 January to 31 December.
@@ -127,9 +297,12 @@ fn weekday_words(day: i32) -> &'static str {
     }
 }
 
-/// The tab: the calendars and rules held, and the year of the one chosen.
+/// The tab: the calendars and rules held that answer the filter, each with
+/// its subject, and the year of the one chosen.
 pub fn tab(
     listed: &Result<ListCalendarsReply, String>,
+    filter: &Filter,
+    codes: &BTreeMap<String, String>,
     shown: Option<(&str, u16, &Result<ReadCalendarReply, String>)>,
 ) -> String {
     let head = "<div class=\"section-head\"><div><h2>Calendars</h2><p class=\"hint\">The \
@@ -153,30 +326,37 @@ pub fn tab(
         .map(|calendar| {
             format!(
                 "<tr data-calendar=\"{id}\"><td title=\"{name}\"><a href=\"/admin/instruments?calendar={id}#calendars\">{name}</a> \
-                 <span class=\"id\">{id}</span></td><td>{kind}</td><td>{version}</td>\
+                 <span class=\"id\">{id}</span></td><td>{kind}</td>\
+                 <td title=\"{subject}\" data-subject>{subject}</td><td>{version}</td>\
                  <td>{coverage}</td><td class=\"wide\">{refreshed}</td></tr>",
                 id = escape(&calendar.calendar_id),
                 name = escape(&calendar.name),
                 kind = kind_words(calendar.kind),
+                subject = escape(&subject_words(calendar, codes)),
                 version = calendar.version,
                 coverage = escape(&calendar.coverage_to_date),
                 refreshed = escape(&crate::custody::utc(calendar.refreshed_at_ns)),
             )
         })
         .collect();
-    let calendars = if rows.is_empty() {
+    let calendars = if rows.is_empty() && !filter.is_empty() {
+        "<p class=\"empty\" data-calendars=\"0\">No calendar held answers this kind and \
+         text.</p>"
+            .to_string()
+    } else if rows.is_empty() {
         "<p class=\"empty\" data-calendars=\"0\">None yet: a calendar is pulled when a \
          currency, a venue or a date read first needs it.</p>"
             .to_string()
     } else {
         format!(
-            "<om-pager search=\"Search calendars\"><table class=\"list one-line\" \
-             data-calendars=\"{n}\"><thead><tr><th>Calendar</th><th>Kind</th><th>Version</th>\
-             <th>Coverage to</th><th class=\"wide\">Last refreshed</th></tr></thead>\
-             <tbody>{rows}</tbody></table></om-pager>",
+            "<om-pager><table class=\"list one-line\" \
+             data-calendars=\"{n}\"><thead><tr><th>Calendar</th><th>Kind</th><th>Subject</th>\
+             <th>Version</th><th>Coverage to</th><th class=\"wide\">Last refreshed</th></tr>\
+             </thead><tbody>{rows}</tbody></table></om-pager>",
             n = listed.calendars.len()
         )
     };
+    let calendars = format!("{}{calendars}", filter_form(filter));
     let rule_rows: String = listed
         .rules
         .iter()
@@ -363,21 +543,106 @@ mod tests {
                 ..Default::default()
             }],
         });
-        let page = tab(&listed, Some(("CAL-USSS", 2026, &read)));
+        let none = BTreeMap::new();
+        let page = tab(
+            &listed,
+            &Filter::default(),
+            &none,
+            Some(("CAL-USSS", 2026, &read)),
+        );
         assert!(page.contains("Columbus Day") && page.contains("Federal Reserve holidays"));
         // The year in place of the lists, which a Close returns to.
         assert!(!page.contains("data-calendars="));
-        let lists = tab(&listed, None);
+        let lists = tab(&listed, &Filter::default(), &none, None);
         assert!(lists.contains("US &lt;securities&gt; settlement"));
         assert!(lists.contains("Securities settlement"));
         assert!(lists.contains("data-calendars=\"1\""));
         assert!(lists.contains("US/equity"));
         assert!(page.contains("Saturday and Sunday from 2016-01-01"));
         assert!(page.contains("year=2025") && page.contains("year=2027"));
-        // Nothing in the tab sets a calendar.
+        // Nothing in the tab sets a calendar: its one form is the filter's GET.
         assert!(!page.contains("<form"));
-        let empty = tab(&Ok(ListCalendarsReply::default()), None);
+        assert_eq!(lists.matches("<form").count(), 1);
+        assert!(lists.contains("method=\"get\""));
+        let empty = tab(
+            &Ok(ListCalendarsReply::default()),
+            &Filter::default(),
+            &none,
+            None,
+        );
         assert!(empty.contains("data-calendars=\"0\"") && empty.contains("data-rules=\"0\""));
-        assert!(tab(&Err("no handler".into()), None).contains("not answering"));
+        assert!(empty.contains("None yet"));
+        assert!(
+            tab(&Err("no handler".into()), &Filter::default(), &none, None)
+                .contains("not answering")
+        );
+    }
+
+    #[test]
+    fn each_line_shows_its_subject_resolved_and_the_tab_is_filtered_by_kind_and_text() {
+        use meridian_domain::v1::SettlementSystem;
+        let listed = Ok(ListCalendarsReply {
+            calendars: vec![
+                HeldCalendar {
+                    calendar_id: "CAL-USD".into(),
+                    name: "US dollar".into(),
+                    kind: CalendarKind::Currency as i32,
+                    instrument_id: "INS-USD".into(),
+                    ..Default::default()
+                },
+                HeldCalendar {
+                    calendar_id: "CAL-CHF".into(),
+                    name: "Swiss franc".into(),
+                    kind: CalendarKind::Currency as i32,
+                    instrument_id: "INS-CHF".into(),
+                    ..Default::default()
+                },
+                HeldCalendar {
+                    calendar_id: "CAL-XNYS".into(),
+                    name: "US equity venues".into(),
+                    kind: CalendarKind::Trading as i32,
+                    venue_ids: vec!["VEN-XNYS".into(), "VEN-XNAS".into()],
+                    ..Default::default()
+                },
+                HeldCalendar {
+                    calendar_id: "CAL-USSS".into(),
+                    name: "US securities settlement".into(),
+                    kind: CalendarKind::SecuritiesSettlement as i32,
+                    settlement_system: Some(SettlementSystem {
+                        name: "DTC <&>".into(),
+                        country_code: "US".into(),
+                    }),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+        let codes = BTreeMap::from([("INS-USD".to_string(), "USD".to_string())]);
+        let filter = Filter::from_page("CALENDAR_KIND_CURRENCY", "  dollar ");
+        assert_eq!(
+            filter,
+            Filter {
+                kind: CalendarKind::Currency as i32,
+                query: "dollar".into()
+            }
+        );
+        let page = tab(&listed, &filter, &codes, None);
+        assert!(page.contains("<th>Subject</th>"));
+        assert!(page.contains("data-subject>USD</td>"), "the ISO 4217 code");
+        assert!(
+            page.contains("data-subject>INS-CHF</td>"),
+            "a currency no record carries is shown by its platform ID"
+        );
+        assert!(page.contains("venues VEN-XNYS, VEN-XNAS"));
+        assert!(page.contains("DTC &lt;&amp;&gt;, US"));
+        assert!(page.contains("<option value=\"CALENDAR_KIND_CURRENCY\" selected>"));
+        assert!(page.contains("name=\"calendar_query\" maxlength=\"100\" value=\"dollar\""));
+        // A filter that matched nothing says so, not "none yet".
+        let none = tab(&Ok(ListCalendarsReply::default()), &filter, &codes, None);
+        assert!(none.contains("No calendar held answers"));
+        // A kind the schema does not define is every kind; a long text is cut.
+        let loose = Filter::from_page("CALENDAR_KIND_NOT_A_KIND", &"x".repeat(300));
+        assert_eq!(loose.kind, 0);
+        assert_eq!(loose.query.chars().count(), 100);
     }
 }

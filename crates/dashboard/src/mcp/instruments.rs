@@ -109,7 +109,7 @@ pub static SPECS: &[Spec] = &[
     Spec {
         name: "list_calendars",
         title: "List the calendars held",
-        description: "the settlement calendars the deployment holds, one line each at its latest version (its name, kind, version, coverage's last date and when it was last refreshed), and the date rules held (kind, subject, version); paged by cursor. Read-only: a calendar is the platform's, pulled as a date read needs it.",
+        description: "the settlement calendars the deployment holds, one line each at its latest version (its name, kind, subject, version, coverage's last date and when it was last refreshed), and the date rules held (kind, subject, version); filtered by kind and searched by text on the name and the subject's codes (an ISO 4217 code, a venue's MIC or name, a settlement system's name or country), as the Calendars tab is; paged by cursor. A calendar's subject is its currency's cash instrument by its platform INS- ID, the venues that follow it by their VEN- IDs, or its settlement system. Read-only: a calendar is the platform's, pulled as a date read needs it.",
         reads: true,
         open_world: false,
         area: Area::Instruments,
@@ -132,6 +132,12 @@ fn calendars_schema() -> Value {
         "properties": {
             "cursor": {"type": "string", "description": "next_cursor from the page before"},
             "page_size": {"type": "integer", "minimum": 1, "maximum": 200},
+            "kind": enum_names(&[
+                "CALENDAR_KIND_CURRENCY",
+                "CALENDAR_KIND_TRADING",
+                "CALENDAR_KIND_SECURITIES_SETTLEMENT",
+            ]),
+            "query": {"type": "string", "description": "a text matched, ignoring case, on the name and the subject's codes; absent or empty matches every calendar"},
         },
         "additionalProperties": false,
     })
@@ -1171,12 +1177,34 @@ async fn list_calendars(app: &App, caller: &Caller, arguments: &Value) -> Value 
     let Some(top) = object(arguments, "", &mut problems) else {
         return problems.refusal();
     };
-    only(top, &["cursor", "page_size"], "", &mut problems);
+    only(
+        top,
+        &["cursor", "page_size", "kind", "query"],
+        "",
+        &mut problems,
+    );
     let cursor = text(top, "cursor", "", false, &mut problems);
     let page_size = integer(top, "page_size", "", false, &mut problems);
     if !(0..=200).contains(&page_size) {
         problems.add("page_size", "from 1 to 200");
     }
+    let kind = match top.get("kind") {
+        None | Some(Value::Null) => 0,
+        Some(said) => match enum_of(
+            said,
+            "kind",
+            meridian_domain::v1::CalendarKind::from_str_name,
+            &mut problems,
+        ) {
+            Some(meridian_domain::v1::CalendarKind::Unspecified) => {
+                problems.add("kind", "names a kind; leave it out for every kind");
+                0
+            }
+            Some(kind) => kind as i32,
+            None => 0,
+        },
+    };
+    let query = text(top, "query", "", false, &mut problems);
     if !problems.is_empty() {
         return problems.refusal();
     }
@@ -1188,7 +1216,8 @@ async fn list_calendars(app: &App, caller: &Caller, arguments: &Value) -> Value 
         meridian_domain::v1::ListCalendarsRequest {
             page_size: page_size as i32,
             cursor,
-            ..Default::default()
+            kind,
+            query,
         },
         WAIT,
     )
@@ -1206,6 +1235,12 @@ async fn list_calendars(app: &App, caller: &Caller, arguments: &Value) -> Value 
                     "version": calendar.version,
                     "coverage_to_date": calendar.coverage_to_date,
                     "refreshed_at_ns": calendar.refreshed_at_ns,
+                    "instrument_id": calendar.instrument_id,
+                    "venue_ids": calendar.venue_ids,
+                    "settlement_system": calendar.settlement_system.as_ref().map(|system| json!({
+                        "name": system.name,
+                        "country_code": system.country_code,
+                    })),
                 })).collect::<Vec<_>>(),
                 "rules": reply.rules.iter().map(|rule| json!({
                     "kind": meridian_pb::v1::DateRuleKind::try_from(rule.kind)

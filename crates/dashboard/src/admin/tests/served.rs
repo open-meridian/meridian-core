@@ -974,10 +974,20 @@ fn connectivity_link<'a>(
         .unwrap()
 }
 
-/// The calendars the stand-in instrument store holds: three seed calendars
-/// and the US equities rule, and thirty more currencies so the tab pages.
-fn held_calendars() -> meridian_domain::v1::ListCalendarsReply {
-    use meridian_domain::v1::{CalendarKind, HeldCalendar, HeldDateRule};
+/// The platform's ID of the US dollar's cash instrument, which the
+/// stand-in store's US dollar calendar names, and the deployment's record
+/// carrying it beside its ISO 4217 code (contract v23, W3.21).
+const PLATFORM_USD: &str = "INS-01JUSD0000000000000000001";
+const LOCAL_USD: &str = "LCL-01JUSD0000000000000000001";
+
+/// The calendars the stand-in instrument store holds: three seed calendars,
+/// each with its subject (contract v23), and the US equities rule, and
+/// thirty more currencies so the tab pages; filtered by kind and by text on
+/// the name and the subject's codes, as the store answers.
+fn held_calendars(
+    asked: &meridian_domain::v1::ListCalendarsRequest,
+) -> meridian_domain::v1::ListCalendarsReply {
+    use meridian_domain::v1::{CalendarKind, HeldCalendar, HeldDateRule, SettlementSystem};
     let mut calendars = vec![
         HeldCalendar {
             calendar_id: "CAL-01JAE000000000000000USD1".into(),
@@ -986,6 +996,7 @@ fn held_calendars() -> meridian_domain::v1::ListCalendarsReply {
             version: 3,
             coverage_to_date: "2027-12-31".into(),
             refreshed_at_ns: 1_791_417_600_000_000_000,
+            instrument_id: PLATFORM_USD.into(),
             ..Default::default()
         },
         HeldCalendar {
@@ -995,6 +1006,10 @@ fn held_calendars() -> meridian_domain::v1::ListCalendarsReply {
             version: 7,
             coverage_to_date: "2027-12-31".into(),
             refreshed_at_ns: 1_791_417_600_000_000_000,
+            venue_ids: vec![
+                "VEN-01JAE00000000000000XNYS".into(),
+                "VEN-01JAE00000000000000XNAS".into(),
+            ],
             ..Default::default()
         },
         HeldCalendar {
@@ -1004,6 +1019,10 @@ fn held_calendars() -> meridian_domain::v1::ListCalendarsReply {
             version: 4,
             coverage_to_date: "2028-12-31".into(),
             refreshed_at_ns: 1_791_417_600_000_000_000,
+            settlement_system: Some(SettlementSystem {
+                name: "DTC".into(),
+                country_code: "US".into(),
+            }),
             ..Default::default()
         },
     ];
@@ -1018,6 +1037,33 @@ fn held_calendars() -> meridian_domain::v1::ListCalendarsReply {
             ..Default::default()
         });
     }
+    let query = asked.query.trim().to_lowercase();
+    calendars.retain(|calendar| {
+        let codes = [
+            calendar.name.clone(),
+            if calendar.instrument_id == PLATFORM_USD {
+                "USD".into()
+            } else {
+                String::new()
+            },
+            calendar
+                .venue_ids
+                .iter()
+                .map(|id| id[id.len() - 4..].to_string())
+                .collect::<Vec<_>>()
+                .join(" "),
+            calendar
+                .settlement_system
+                .as_ref()
+                .map(|system| format!("{} {}", system.name, system.country_code))
+                .unwrap_or_default(),
+        ];
+        (asked.kind == 0 || calendar.kind == asked.kind)
+            && (query.is_empty()
+                || codes
+                    .iter()
+                    .any(|code| code.to_lowercase().contains(&query)))
+    });
     meridian_domain::v1::ListCalendarsReply {
         calendars,
         next_cursor: String::new(),
@@ -1234,11 +1280,40 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
                     asked.include_complete || incomplete(id)
                 }
             };
-            let instruments = (1..=250)
+            let mut instruments: Vec<InstrumentToComplete> = (1..=250)
                 .map(instrument_id)
                 .filter(wanted)
                 .map(instrument_listed)
                 .collect();
+            // The US dollar's record, kept from the platform's under the
+            // deployment's own ID (contract v20), found by the platform's.
+            if !search.is_empty() && PLATFORM_USD.to_lowercase().contains(&search) {
+                instruments.push(InstrumentToComplete {
+                    instrument: Some(InstrumentRecord {
+                        instrument_id: LOCAL_USD.into(),
+                        identifiers: vec![
+                            Identifier {
+                                scheme: "iso4217".into(),
+                                value: "USD".into(),
+                                ..Default::default()
+                            },
+                            Identifier {
+                                scheme: "open_meridian".into(),
+                                value: PLATFORM_USD.into(),
+                                ..Default::default()
+                            },
+                        ],
+                        asset_class: meridian_domain::v1::AssetClass::Cash as i32,
+                        currency: "USD".into(),
+                        description: "US dollar".into(),
+                        version: 1,
+                        ..Default::default()
+                    }),
+                    complete_for_book: true,
+                    complete: true,
+                    ..Default::default()
+                });
+            }
             Ok((
                 "".into(),
                 ListInstrumentsToCompleteReply {
@@ -1291,8 +1366,10 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
         );
     }
     // The instrument store's calendars (W3.19, W3.21, contract v22).
-    bus.serve(crate::admin::calendars::LIST_CALENDARS, |_| {
-        Ok(("".into(), held_calendars().encode_to_vec()))
+    bus.serve(crate::admin::calendars::LIST_CALENDARS, |envelope| {
+        let asked = meridian_domain::v1::ListCalendarsRequest::decode(&envelope.payload[..])
+            .map_err(|e| e.to_string())?;
+        Ok(("".into(), held_calendars(&asked).encode_to_vec()))
     });
     bus.serve(crate::admin::calendars::READ_CALENDAR, |envelope| {
         let asked = meridian_domain::v1::ReadCalendarRequest::decode(&envelope.payload[..])

@@ -754,6 +754,57 @@ fn a_calendar_line_carries_its_subject_and_the_list_filters_by_kind_and_text() {
 }
 
 #[test]
+fn the_lists_text_also_matches_a_venues_mic_and_name_from_the_deployments_records() {
+    // Contract v23 (W3.21): "the subject's codes" include what the
+    // deployment's own records say of a calendar's subject: a venue's MIC
+    // and name, found from its VEN- ID.
+    let (mut calendars, rules) = seed();
+    for held in &mut calendars {
+        if held.record.calendar_id == USD {
+            held.record.kind = CalendarKind::Trading as i32;
+            held.record.venue_ids = vec!["VEN-XNYS".into()];
+        }
+    }
+    let codes = |record: &CalendarRecord| {
+        if record.venue_ids.contains(&"VEN-XNYS".to_string()) {
+            vec!["XNYS".to_string(), "New York Stock Exchange".to_string()]
+        } else {
+            Vec::new()
+        }
+    };
+    let asked = |query: &str| {
+        list_with(
+            &calendars,
+            &rules,
+            &ListCalendarsRequest {
+                query: query.into(),
+                ..Default::default()
+            },
+            &codes,
+        )
+        .unwrap()
+        .calendars
+        .iter()
+        .map(|line| line.calendar_id.clone())
+        .collect::<Vec<_>>()
+    };
+    assert_eq!(asked("xnys"), vec![USD.to_string()]);
+    assert_eq!(asked("stock exchange"), vec![USD.to_string()]);
+    assert!(asked("XLON").is_empty());
+    // Without what the records say, the MIC matches nothing.
+    let bare = list(
+        &calendars,
+        &rules,
+        &ListCalendarsRequest {
+            query: "xnys".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(bare.calendars.is_empty());
+}
+
+#[test]
 fn a_spot_read_by_the_deployments_own_currency_ids_reads_the_platforms_rule() {
     // A deployment keeps EUR and USD under its own LCL- IDs with the
     // platform's beside them (approved 2026-10-13): the read translates each

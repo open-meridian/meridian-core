@@ -844,6 +844,41 @@ fn market_of(store: &dyn Store, instrument_id: &str) -> Option<crate::calendars:
     })
 }
 
+/// What the deployment's own records say of a calendar's subject, for the
+/// list's text match (W3.21, contract v23): the ISO 4217 code of the record
+/// carrying its currency's platform ID, and each venue's MICs and name.
+fn subject_codes(
+    store: &dyn Store,
+    venues: &[meridian_domain::v1::VenueRecord],
+    record: &meridian_domain::v1::CalendarRecord,
+    now_ns: i64,
+) -> Vec<String> {
+    let mut codes = Vec::new();
+    if !record.instrument_id.is_empty() {
+        for held in store
+            .matching(crate::GLOBAL_ID, &record.instrument_id, "", now_ns)
+            .unwrap_or_default()
+        {
+            codes.extend(
+                held.held_now()
+                    .filter(|identifier| identifier.scheme == "iso4217")
+                    .map(|identifier| identifier.value.clone()),
+            );
+            if !held.currency.is_empty() {
+                codes.push(held.currency.clone());
+            }
+        }
+    }
+    for venue in venues
+        .iter()
+        .filter(|venue| record.venue_ids.contains(&venue.venue_id))
+    {
+        codes.push(venue.name.clone());
+        codes.extend(venue.identifiers.iter().map(|held| held.value.clone()));
+    }
+    codes
+}
+
 /// The platform's ID of a record this deployment holds: its own where it is
 /// one, else the `open_meridian` identifier it holds now, of the record a
 /// merged one became. None for a record with none, or none held.
@@ -935,7 +970,7 @@ fn serve_calendars(bus: &Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>)
         });
     }
     {
-        let store = store.clone();
+        let (store, clock) = (store.clone(), clock.clone());
         bus.serve(LIST_CALENDARS, move |envelope| {
             let request: meridian_domain::v1::ListCalendarsRequest =
                 decode(&envelope, "meridian.v1.ListCalendarsRequest")?;
@@ -945,7 +980,16 @@ fn serve_calendars(bus: &Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>)
             let rules = store
                 .date_rule_versions()
                 .map_err(|failed| failed.to_string())?;
-            let reply = crate::calendars::list(&calendars, &rules, &request)?;
+            let venues = if request.query.trim().is_empty() {
+                Vec::new()
+            } else {
+                store.venues().map_err(|failed| failed.to_string())?
+            };
+            let now_ns = clock.now_ns();
+            let codes = |record: &meridian_domain::v1::CalendarRecord| {
+                subject_codes(store.as_ref(), &venues, record, now_ns)
+            };
+            let reply = crate::calendars::list_with(&calendars, &rules, &request, &codes)?;
             Ok((
                 "meridian.v1.ListCalendarsReply".to_string(),
                 reply.encode_to_vec(),
