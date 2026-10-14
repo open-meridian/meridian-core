@@ -141,7 +141,7 @@ pub(crate) const BY_ID_ALONE: [&str; 13] = [
 
 /// The venue facts stamped from the venue account map (matrix/stamped.tsv's
 /// `venue-account-map`, contract v22), each with the topic it is sent on.
-const VENUE_FACTS: [(&str, &str); 2] = [
+const VENUE_FACTS: [(&str, &str); 3] = [
     (
         "meridian.v1.ReportExecutionRequest",
         "platform.book.command.report-execution",
@@ -149,6 +149,11 @@ const VENUE_FACTS: [(&str, &str); 2] = [
     (
         "meridian.v1.RecordLocateRequest",
         "platform.book.command.record-locate",
+    ),
+    // Contract v23 (W11.25): a venue's value-date roll.
+    (
+        "meridian.v1.ReportValueDateRollRequest",
+        "platform.book.command.report-value-date-roll",
     ),
 ];
 

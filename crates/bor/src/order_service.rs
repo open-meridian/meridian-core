@@ -1,6 +1,7 @@
 //! Where the order path meets the bus (W11, contract v22).
 //!
-//! Fourteen commands and facts in, four reads, six events out beside W9's
+//! Fourteen commands and facts in (from contract v23 the accept, the DK and
+//! a value-date roll besides), four reads, six events out beside W9's
 //! PositionChanged and AccountAttributeChanged; and two acts of the book's
 //! own: expiring an order by the deployment's clock (W11.13), and, once at
 //! the upgrade, recording that every account it held waits for compliance
@@ -28,9 +29,10 @@ use meridian_domain::v1::{
     OrderHistoryRequest, OrderReply, OrderUpdatedEvent, PlacementReply, PlacementUpdatedEvent,
     ProposeOrderRequest, RecordCheckRequest, RecordLocateRequest, RecordLocateUseRequest,
     RecordOrderRequest, ReleaseOrderRequest, ReportChargeRequest, ReportExecutionRequest,
-    ReportPlacementRequest, RequestOrderChangeRequest, RequestPlacementChangeRequest,
-    SetTradingInstructionRequest, SetWorkingConditionRequest, TradingInstructionChangedEvent,
-    TradingInstructionReply, UnplacedFactRecordedEvent, UnplacedReason,
+    ReportPlacementRequest, ReportValueDateRollRequest, RequestOrderChangeRequest,
+    RequestPlacementChangeRequest, SetTradingInstructionRequest, SetWorkingConditionRequest,
+    TradingInstructionChangedEvent, TradingInstructionReply, UnplacedFactRecordedEvent,
+    UnplacedReason,
 };
 use meridian_pb::bounds;
 use prost::Message;
@@ -61,6 +63,7 @@ pub const RECORD_LOCATE: &str = "platform.book.command.record-locate";
 pub const RECORD_LOCATE_USE: &str = "platform.book.command.record-locate-use";
 pub const ACCEPT_EXECUTION: &str = "platform.book.command.accept-execution";
 pub const DONT_KNOW_EXECUTION: &str = "platform.book.command.dont-know-execution";
+pub const REPORT_VALUE_DATE_ROLL: &str = "platform.book.command.report-value-date-roll";
 
 pub const ORDER_UPDATED: &str = "platform.book.event.order-updated";
 pub const PLACEMENT_UPDATED: &str = "platform.book.event.placement-updated";
@@ -916,6 +919,44 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
                     Ok((made, reply))
                 },
                 Some((fact.clone(), String::new(), request.raw_record.clone())),
+            )
+        });
+    }
+    {
+        // W11.25 (contract v23): a venue's roll of a spot position, its
+        // account stamped from the venue account map.
+        let (bus2, store, clock) = (bus.clone(), store.clone(), clock.clone());
+        bus.serve(REPORT_VALUE_DATE_ROLL, move |envelope| {
+            let request: ReportValueDateRollRequest =
+                decode(&envelope, "meridian.v1.ReportValueDateRollRequest")?;
+            let ctx = context_of(&envelope, clock.as_ref());
+            if request.account_id.is_empty() {
+                // W11.25 keeps it unplaced, UNPLACED_REASON_UNMAPPED_VENUE_
+                // ACCOUNT; an UnplacedFact has no arm for a roll and its
+                // fact_kind no value. Open with v23's build: refused, nothing
+                // kept, until one is named.
+                return Err(StoreError::Invalid(format!(
+                    "venue account code {:?} maps to no account on {}: a roll on an unmapped \
+                     code is not kept yet (an open point of contract v23); have the ems map \
+                     the code and report the roll again",
+                    request.venue_account_code, ctx.instance_id
+                ))
+                .on_the_bus());
+            }
+            act(
+                &bus2,
+                store.as_ref(),
+                &envelope,
+                ctx,
+                &request.account_id,
+                &request.idempotency_key,
+                "meridian.v1.FactReply",
+                &|book, head, ctx| {
+                    let made = orders::report_value_date_roll(book, head, ctx, &request)?;
+                    let reply = fact_reply(&made);
+                    Ok((made, reply))
+                },
+                None,
             )
         });
     }

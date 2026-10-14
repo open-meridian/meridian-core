@@ -28,6 +28,9 @@ const NOCCY: &str = "INS-01J8XQ4M7K00000000NOCCY";
 /// The order tests' cash, in a currency no other test of this process
 /// resolves: the code's instrument is learned process-wide (contract v18).
 const CHF: &str = "INS-01J8XQ4M7K00000000CASHCHF";
+/// The base currency of the FX tests' pair, EUR/CHF (contract v23): a cash
+/// instrument named by its ID alone, never by a code another test resolves.
+const EUR: &str = "INS-01J8XQ4M7K00000000CASHEUR";
 /// The bus's own instance: in these tests the `ems`, the `oms` and the
 /// connectivity plugin at once.
 const ME: &str = "oems-1";
@@ -59,6 +62,7 @@ fn wired() -> Wired {
             AAPL => Some(record(AssetClass::Equity, "CHF")),
             NOCCY => Some(record(AssetClass::Equity, "")),
             CHF => Some(record(AssetClass::Cash, "CHF")),
+            EUR => Some(record(AssetClass::Cash, "EUR")),
             _ => None,
         };
         Ok((
@@ -2432,4 +2436,452 @@ async fn a_bust_after_an_accept_reverses_its_own_fill_alone() {
     assert_eq!(aapl_position(&w, "", None), "20");
     let order = busted.order.unwrap();
     assert_eq!(read(&quantities(&order).reported_filled), "20");
+}
+
+// ── Contract v23: the accept's refusals as built, approved 2026-10-13 ───────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_accept_s_fills_share_a_trade_date_and_a_claimed_order_is_the_claimant_s() {
+    let w = wired();
+    let order = released(&w, "10").await;
+    let monday = execute(&w, &unmatched("2", "V:1", Side::Buy))
+        .await
+        .unwrap()
+        .execution
+        .unwrap();
+    // The venue's client order ID is copied onto the execution (FIX 11, back
+    // on BN and Q).
+    assert_eq!(monday.venue_client_order_id, "CL-77310-004");
+    let mut late = unmatched("3", "V:2", Side::Buy);
+    late.trade_date = "2026-10-14".into();
+    late.computed_settlement_date = "2026-10-15".into();
+    let tuesday = execute(&w, &late).await.unwrap().execution.unwrap();
+    // Two trade dates in one accept: one placement, one trade date.
+    let refused = accept(
+        &w,
+        &[&monday.execution_id, &tuesday.execution_id],
+        to_new_order(""),
+        &person(TRADER),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(code(&refused), Some(RefusalReason::ExecutionsDiffer));
+    // An execution named twice is malformed, naming the second.
+    let refused = accept(
+        &w,
+        &[&monday.execution_id, &monday.execution_id],
+        to_new_order(""),
+        &person(TRADER),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        status_of(&refused),
+        Some((
+            meridian_bus::RefusalStatus::InvalidArgument,
+            vec!["execution_ids[1]".to_string()]
+        ))
+    );
+    // Claimed by the trader: another user's accept onto it is refused.
+    order_command(
+        &w,
+        SET_WORKING_CONDITION,
+        "meridian.v1.SetWorkingConditionRequest",
+        &SetWorkingConditionRequest {
+            order_id: order.order_id.clone(),
+            condition: OrderCondition::Claimed as i32,
+            set: true,
+            ..Default::default()
+        },
+        &person(TRADER),
+    )
+    .await
+    .unwrap();
+    let refused = accept(
+        &w,
+        &[&monday.execution_id],
+        to_order(&order.order_id),
+        &person(PM),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(code(&refused), Some(RefusalReason::Claimed));
+    assert_eq!(
+        listed_ids(&w, ExecutionState::Unmatched).len(),
+        2,
+        "a refused accept changes nothing"
+    );
+    // The claimant's is accepted, the client order ID kept.
+    let done = accept(
+        &w,
+        &[&monday.execution_id],
+        to_order(&order.order_id),
+        &person(TRADER),
+    )
+    .await
+    .unwrap();
+    assert_eq!(done.executions[0].venue_client_order_id, "CL-77310-004");
+    assert_eq!(done.executions[0].state, ExecutionState::Matched as i32);
+}
+
+// ── Contract v23: financing and commission (the OANDA batch's item 2) ───────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn financing_and_commission_are_fee_kinds_each_its_own_cash_line() {
+    let w = wired();
+    let order = released(&w, "10").await;
+    let placement = place(&w, &order.order_id, "10", &person(TRADER))
+        .await
+        .unwrap()
+        .placement
+        .unwrap();
+    let mut filled = fill(&placement.placement_id, "10", "V:1");
+    filled.fees = vec![Fee {
+        kind: FeeKind::Commission as i32,
+        amount: usd("0.35"),
+    }];
+    let reply = execute(&w, &filled).await.unwrap();
+    assert_eq!(
+        reply.execution.unwrap().fees[0].kind,
+        FeeKind::Commission as i32
+    );
+    let charged = send_from(
+        &w.bus,
+        REPORT_CHARGE,
+        "meridian.v1.ReportChargeRequest",
+        &ReportChargeRequest {
+            placement_id: placement.placement_id.clone(),
+            fee: Some(Fee {
+                kind: FeeKind::Financing as i32,
+                amount: usd("1.37"),
+            }),
+            trade_date: "2026-10-14".into(),
+            settlement_date: "2026-10-14".into(),
+            raw_record: Some(meridian_pb::v1::RawRecordRef {
+                instance_id: ME.into(),
+                key: "transactions/6311:trades/6290".into(),
+            }),
+        },
+        &venue(),
+    )
+    .await
+    .map(|reply| FactReply::decode(&reply[..]).unwrap())
+    .unwrap();
+    let charge = charged.charge.unwrap();
+    assert_eq!(charge.fee.unwrap().kind, FeeKind::Financing as i32);
+    // The cash: the notional and the commission pending to the fill's date,
+    // the financing to its own.
+    let cash = chf_position(&w);
+    let pending: Vec<(String, String)> = cash
+        .pending
+        .iter()
+        .map(|line| (line.value_date.clone(), read(&line.quantity)))
+        .collect();
+    assert_eq!(
+        pending,
+        vec![("2026-10-14".to_string(), "-2275.82".to_string())]
+    );
+}
+
+// ── Contract v23: an FX order's quote currency (W11.1) ──────────────────────
+
+fn fx_market(quote: &str) -> ProposeOrderRequest {
+    ProposeOrderRequest {
+        account_id: ACC.into(),
+        instrument_id: EUR.into(),
+        side: Side::Buy as i32,
+        quantity: d("10000"),
+        order_type: OrderType::Market as i32,
+        dealt_currency: EUR.into(),
+        quote_currency: quote.into(),
+        time_in_force: TimeInForce::Day as i32,
+        ..Default::default()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_fx_order_names_its_quote_currency_and_a_limit_or_stop_is_in_it() {
+    let w = wired();
+    // A market order names its pair through its instrument and the field.
+    let order = propose(&w, &fx_market(CHF)).await.unwrap();
+    assert_eq!(order.quote_currency, CHF);
+    assert_eq!(order.instrument_id, EUR);
+    // Its own instrument as the quote currency: a pair is two currencies.
+    let refused = propose(&w, &fx_market(EUR)).await.unwrap_err();
+    assert_eq!(
+        status_of(&refused),
+        Some((
+            meridian_bus::RefusalStatus::InvalidArgument,
+            vec!["quote_currency".to_string()]
+        ))
+    );
+    // A limit, or a stop, priced in another currency.
+    let other = "INS-01J8XQ4M7K00000000CASHGBP";
+    let priced_in = |instrument: &str| {
+        Some(Money {
+            amount: d("0.8600"),
+            currency_code: String::new(),
+            instrument_id: instrument.into(),
+        })
+    };
+    let mut limit = fx_market(other);
+    limit.order_type = OrderType::Limit as i32;
+    limit.limit_price = usd("0.93");
+    let refused = propose(&w, &limit).await.unwrap_err();
+    assert_eq!(status_of(&refused).unwrap().1, vec!["limit_price"]);
+    let mut stop = fx_market(other);
+    stop.order_type = OrderType::Stop as i32;
+    stop.stop_price = usd("0.93");
+    let refused = propose(&w, &stop).await.unwrap_err();
+    assert_eq!(status_of(&refused).unwrap().1, vec!["stop_price"]);
+    // In the quote currency, by code or by instrument: proposed.
+    let mut by_code = fx_market(CHF);
+    by_code.order_type = OrderType::Limit as i32;
+    by_code.limit_price = usd("0.93");
+    assert_eq!(propose(&w, &by_code).await.unwrap().quote_currency, CHF);
+    limit.limit_price = priced_in(other);
+    assert_eq!(propose(&w, &limit).await.unwrap().quote_currency, other);
+    // No quote currency: checked as before.
+    assert!(propose(&w, &buy("10")).await.is_ok());
+}
+
+// ── Contract v23: a value-date roll (W11.25) ────────────────────────────────
+
+fn position(w: &Wired, instrument: &str, side: HoldingSide) -> Option<BookPosition> {
+    w.store
+        .positions(&crate::store::PositionsRead {
+            scope: Scope::Everything,
+            account_id: ACC.into(),
+            since: None,
+            business_date: String::new(),
+            at: None,
+            limit: 100,
+            cursor: String::new(),
+        })
+        .unwrap()
+        .records
+        .into_iter()
+        .find(|held| held.instrument_id == instrument && held.side == side as i32)
+}
+
+fn chf_position(w: &Wired) -> BookPosition {
+    position(w, CHF, HoldingSide::Long).unwrap()
+}
+
+fn pending_of(held: &BookPosition) -> Vec<(String, String)> {
+    held.pending
+        .iter()
+        .map(|line| (line.value_date.clone(), read(&line.quantity)))
+        .collect()
+}
+
+fn roll(from: &str, to: &str, key: &str) -> ReportValueDateRollRequest {
+    ReportValueDateRollRequest {
+        account_id: ACC.into(),
+        venue_account_code: "SNAP-ACCT-9F2".into(),
+        pair: vec![EUR.into(), CHF.into()],
+        from_value_date: from.into(),
+        to_value_date: to.into(),
+        value_date_basis: Some(meridian_pb::v1::DateBasis {
+            rule: Some(meridian_pb::v1::DateRuleRef {
+                kind: meridian_pb::v1::DateRuleKind::Spot as i32,
+                subject: "EUR/CHF".into(),
+                version: 1,
+            }),
+            ..Default::default()
+        }),
+        rolled_at_ns: NOW + 27_000_000_000_000,
+        charge_ids: vec![],
+        raw_record: Some(meridian_pb::v1::RawRecordRef {
+            instance_id: ME.into(),
+            key: format!("transactions/{key}"),
+        }),
+        idempotency_key: format!("roll:{key}"),
+    }
+}
+
+async fn report_roll(w: &Wired, request: &ReportValueDateRollRequest) -> Result<FactReply, String> {
+    send_from(
+        &w.bus,
+        REPORT_VALUE_DATE_ROLL,
+        "meridian.v1.ReportValueDateRollRequest",
+        request,
+        &venue(),
+    )
+    .await
+    .map(|reply| FactReply::decode(&reply[..]).unwrap())
+}
+
+/// An FX buy of EUR against CHF, placed at this instance on the code and
+/// filled, pending to `value_date`.
+async fn fx_filled(w: &Wired, quantity: &str, venue_id: &str, value_date: &str) {
+    waits(w, ACC, false).await;
+    let mut request = fx_market(CHF);
+    request.quantity = d(quantity);
+    let order = propose(w, &request).await.unwrap();
+    release(w, &order.order_id).await.unwrap();
+    let placement = place(w, &order.order_id, quantity, &person(TRADER))
+        .await
+        .unwrap()
+        .placement
+        .unwrap();
+    let mut filled = fill(&placement.placement_id, quantity, venue_id);
+    filled.price = usd("0.93");
+    filled.computed_settlement_date = value_date.into();
+    execute(w, &filled).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_roll_moves_the_pending_lines_in_the_pair_to_the_next_value_date_and_nothing_else() {
+    let w = wired();
+    fx_filled(&w, "10000", "V:1", "2026-10-15").await;
+    let eur_before = position(&w, EUR, HoldingSide::Long).unwrap();
+    assert_eq!(
+        pending_of(&eur_before),
+        vec![("2026-10-15".into(), "10000".into())]
+    );
+    assert_eq!(
+        pending_of(&chf_position(&w)),
+        vec![("2026-10-15".into(), "-9300.00".into())]
+    );
+
+    // Malformed, naming the field, changing nothing.
+    for (field, change) in [
+        (
+            "to_value_date",
+            Box::new(|r: &mut ReportValueDateRollRequest| {
+                r.to_value_date.clear();
+                r.value_date_basis = None;
+            }) as Box<dyn Fn(&mut ReportValueDateRollRequest)>,
+        ),
+        (
+            "from_value_date",
+            Box::new(|r: &mut ReportValueDateRollRequest| r.from_value_date.clear()),
+        ),
+        (
+            "to_value_date",
+            Box::new(|r: &mut ReportValueDateRollRequest| r.to_value_date = "2026-10-15".into()),
+        ),
+        (
+            "pair",
+            Box::new(|r: &mut ReportValueDateRollRequest| r.pair.truncate(1)),
+        ),
+        (
+            "value_date_basis",
+            Box::new(|r: &mut ReportValueDateRollRequest| r.value_date_basis = None),
+        ),
+        (
+            "rolled_at_ns",
+            Box::new(|r: &mut ReportValueDateRollRequest| r.rolled_at_ns = 0),
+        ),
+        (
+            "raw_record",
+            Box::new(|r: &mut ReportValueDateRollRequest| r.raw_record = None),
+        ),
+    ] {
+        let mut request = roll("2026-10-15", "2026-10-16", "6311");
+        change(&mut request);
+        let refused = report_roll(&w, &request).await.unwrap_err();
+        assert_eq!(
+            status_of(&refused),
+            Some((
+                meridian_bus::RefusalStatus::InvalidArgument,
+                vec![field.to_string()]
+            )),
+            "{field}"
+        );
+    }
+
+    // Tuesday's roll: one entry, the pending lines moved, a PositionChanged
+    // for each position.
+    let mut moved = w.bus.subscribe("platform.book.event.position-changed");
+    let before = w.store.journal(ACC).unwrap().len();
+    let reply = report_roll(&w, &roll("2026-10-15", "2026-10-16", "6311"))
+        .await
+        .unwrap();
+    let entry = reply.entry.unwrap();
+    assert_eq!(entry.kind, "value-date-rolled");
+    assert!(reply.journal.is_some());
+    assert!(reply.execution.is_none() && reply.order.is_none() && reply.placement.is_none());
+    let journal = w.store.journal(ACC).unwrap();
+    assert_eq!(journal.len(), before + 1);
+    assert_eq!(journal.last().unwrap().body.lines.len(), 4);
+    let mut heard = Vec::new();
+    for _ in 0..2 {
+        let event =
+            PositionChangedEvent::decode(&next(&mut moved).await.envelope.payload[..]).unwrap();
+        heard.push(event.position.unwrap().instrument_id);
+    }
+    heard.sort();
+    assert_eq!(heard, vec![CHF.to_string(), EUR.to_string()]);
+    let eur = position(&w, EUR, HoldingSide::Long).unwrap();
+    assert_eq!(
+        pending_of(&eur),
+        vec![("2026-10-16".into(), "10000".into())]
+    );
+    assert_eq!(
+        pending_of(&chf_position(&w)),
+        vec![("2026-10-16".into(), "-9300.00".into())]
+    );
+    // The trade-date quantity and the lots are untouched.
+    assert_eq!(read(&eur.trade_date_quantity), "10000");
+    assert_eq!(eur.lots, eur_before.lots);
+
+    // The same report again is applied once.
+    report_roll(&w, &roll("2026-10-15", "2026-10-16", "6311"))
+        .await
+        .unwrap();
+    assert_eq!(w.store.journal(ACC).unwrap().len(), before + 1);
+
+    // Wednesday's, over the weekend: moved again, the earlier roll counted.
+    report_roll(&w, &roll("2026-10-16", "2026-10-19", "6340"))
+        .await
+        .unwrap();
+    assert_eq!(
+        pending_of(&position(&w, EUR, HoldingSide::Long).unwrap()),
+        vec![("2026-10-19".into(), "10000".into())]
+    );
+
+    // A fill booked after the venue rolled its trade pends to its recorded
+    // date; the catch-up roll moves it, and only it, to the current one.
+    fx_filled(&w, "5000", "V:2", "2026-10-15").await;
+    assert_eq!(
+        pending_of(&position(&w, EUR, HoldingSide::Long).unwrap()),
+        vec![
+            ("2026-10-15".into(), "5000".into()),
+            ("2026-10-19".into(), "10000".into())
+        ]
+    );
+    report_roll(&w, &roll("2026-10-15", "2026-10-19", "6340:catch-up:6290"))
+        .await
+        .unwrap();
+    let eur = position(&w, EUR, HoldingSide::Long).unwrap();
+    assert_eq!(
+        pending_of(&eur),
+        vec![("2026-10-19".into(), "15000".into())]
+    );
+    assert_eq!(
+        pending_of(&chf_position(&w)),
+        vec![("2026-10-19".into(), "-13950.00".into())]
+    );
+
+    // Open with v23's build, not kept: a roll meeting no pending line, and
+    // one on a code no ems mapped.
+    let before = w.store.journal(ACC).unwrap().len();
+    assert!(report_roll(&w, &roll("2026-10-15", "2026-10-16", "6400"))
+        .await
+        .is_err());
+    let mut unmapped = roll("2026-10-19", "2026-10-20", "6401");
+    unmapped.account_id = String::new();
+    unmapped.venue_account_code = "101-001-UNMAPPED".into();
+    assert!(report_roll(&w, &unmapped).await.is_err());
+    assert_eq!(w.store.journal(ACC).unwrap().len(), before);
+
+    // The journal replays to the same positions.
+    let before = (position(&w, EUR, HoldingSide::Long), chf_position(&w));
+    w.store.rebuild().unwrap();
+    assert_eq!(
+        before,
+        (position(&w, EUR, HoldingSide::Long), chf_position(&w))
+    );
 }

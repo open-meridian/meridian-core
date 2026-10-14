@@ -26,8 +26,8 @@ use meridian_domain::v1::{
     JournalRef, Locate, LocateAnswer, LocateUse, LocateUseKind, Order, OrderCondition, OrderOrigin,
     OrderQuantities, OrderState, OrderStatus, Placement, PlacementChangeKind, PlacementCondition,
     PlacementEvent, PlacementState, PlacementStatus, ReportPlacementRequest,
-    StandingOrderCondition, StandingPlacementCondition, TieOutReason, TradingInstruction,
-    UnplacedFact,
+    ReportValueDateRollRequest, StandingOrderCondition, StandingPlacementCondition, TieOutReason,
+    TradingInstruction, UnplacedFact,
 };
 use serde::{Deserialize, Serialize};
 
@@ -161,6 +161,15 @@ pub enum Act {
         execution_ids: Vec<String>,
         reason: i32,
         text: String,
+    },
+    /// A venue's roll of a spot position to the next value date (W11.25,
+    /// contract v23), as the connectivity plugin reported it, and the instance
+    /// that reported it: the entry's lines move the pending lines; no order,
+    /// placement or execution changes.
+    ValueDateRolled {
+        #[serde(with = "pb")]
+        roll: ReportValueDateRollRequest,
+        sender: String,
     },
     /// A fee with no fill (W11.12).
     Charged {
@@ -490,6 +499,8 @@ impl Ledger {
                     push_once(&mut touched.placements, &charge.placement_id);
                     push_once(&mut touched.orders, &charge.order_id);
                 }
+                // Its positions are its lines'; no order-path record.
+                Act::ValueDateRolled { .. } => {}
                 Act::Unplaced { fact, .. } => push_once(&mut touched.unplaced, &fact.unplaced_id),
                 Act::Placed { unplaced_id } => push_once(&mut touched.unplaced, unplaced_id),
                 Act::LocateOpened { locate } => {
@@ -695,6 +706,9 @@ impl Ledger {
                 // its order, matched (transition e1); on neither, unmatched
                 // (e2), and so is what supersedes it (e5, e6).
                 let mut execution = execution.clone();
+                if execution.venue_client_order_id.is_empty() {
+                    execution.venue_client_order_id = venue_client_order_id.clone();
+                }
                 execution.state =
                     if execution.order_id.is_empty() && execution.placement_id.is_empty() {
                         ExecutionState::Unmatched as i32
@@ -785,7 +799,7 @@ impl Ledger {
                 }
                 self.unplaced.insert(fact.unplaced_id.clone(), fact.clone());
             }
-            Act::Placed { .. } => {}
+            Act::Placed { .. } | Act::ValueDateRolled { .. } => {}
             Act::LocateOpened { locate } => {
                 self.locates.insert(
                     locate.locate_record_id.clone(),

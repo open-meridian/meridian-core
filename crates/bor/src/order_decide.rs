@@ -29,10 +29,10 @@ use meridian_domain::v1::{
     PlacementChange, PlacementChangeKind, PlacementEvent, PlacementState, ProposeOrderRequest,
     RecordCheckRequest, RecordLocateRequest, RecordLocateUseRequest, RecordOrderRequest,
     ReleaseOrderRequest, ReportChargeRequest, ReportExecutionRequest, ReportPlacementRequest,
-    RequestOrderChangeRequest, RequestPlacementChangeRequest, SetTradingInstructionRequest,
-    SetWorkingConditionRequest, SetterLevel, SettlementBucket, Side, StandingOrderCondition,
-    TieOutReason, TimeInForce, TradingInstruction, TradingInstructionTarget,
-    TradingInstructionValue, UnplacedFact, UnplacedReason, VenueActor,
+    ReportValueDateRollRequest, RequestOrderChangeRequest, RequestPlacementChangeRequest,
+    SetTradingInstructionRequest, SetWorkingConditionRequest, SetterLevel, SettlementBucket, Side,
+    StandingOrderCondition, TieOutReason, TimeInForce, TradingInstruction,
+    TradingInstructionTarget, TradingInstructionValue, UnplacedFact, UnplacedReason, VenueActor,
 };
 use meridian_pb::v1::RefusalReason;
 
@@ -499,6 +499,7 @@ pub fn propose_order(
     if request.side == Side::Unspecified as i32 || Side::try_from(request.side).is_err() {
         return Err(malformed(&["side"], "an order names its side"));
     }
+    quote_currency_holds(request)?;
     let child = request
         .link
         .as_ref()
@@ -536,6 +537,7 @@ pub fn propose_order(
         limit_price: request.limit_price.clone(),
         stop_price: request.stop_price.clone(),
         dealt_currency: request.dealt_currency.clone(),
+        quote_currency: request.quote_currency.clone(),
         legs: request.legs.clone(),
         allocation_instruction: request.allocation_instruction.clone(),
         time_in_force: request.time_in_force,
@@ -631,6 +633,47 @@ pub fn propose_order(
     )
     .key(&request.idempotency_key);
     finish(book, head, ctx, plan)
+}
+
+/// An FX order's quote currency (W11.1, contract v23; approved 2026-10-13):
+/// with the order's instrument, the base currency's cash instrument, it names
+/// the pair, and a limit or stop is priced in it. One naming the order's own
+/// instrument is refused INVALID_ARGUMENT naming `quote_currency`; a limit or
+/// stop in another currency INVALID_ARGUMENT naming `limit_price` or
+/// `stop_price`. No new refusal code.
+fn quote_currency_holds(request: &ProposeOrderRequest) -> Result<()> {
+    let quote = request.quote_currency.as_str();
+    if quote.is_empty() {
+        return Ok(());
+    }
+    if quote == request.instrument_id {
+        return Err(malformed(
+            &["quote_currency"],
+            format!(
+                "quote_currency names {quote}, the order's own instrument: a pair is two \
+                 currencies, the order's instrument the base and quote_currency the other"
+            ),
+        ));
+    }
+    for (field, price) in [
+        ("limit_price", request.limit_price.as_ref()),
+        ("stop_price", request.stop_price.as_ref()),
+    ] {
+        let Some(price) = price else {
+            continue;
+        };
+        let priced_in = cash_instrument(price)?;
+        if priced_in != quote {
+            return Err(malformed(
+                &[field],
+                format!(
+                    "{field} is priced in {priced_in}, and an FX order's limit or stop is in its \
+                     quote currency, {quote}"
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 // ── W11.2: record an order the book did not create ──────────────────────────
@@ -2472,6 +2515,9 @@ fn report_unmatched(
     }
     let sender = ctx.instance_id.clone();
     let mut execution = execution_of(book, ctx, request, false);
+    // The venue's client order ID (FIX 11), which FIX requires back on BN and
+    // Q (approved 2026-10-13).
+    execution.venue_client_order_id = request.venue_client_order_id.clone();
     if bust {
         if let Some(held) = superseded {
             if execution.instrument_id.is_empty() {
@@ -2630,6 +2676,196 @@ pub fn report_charge(
     );
     plan.lines = vec![fee_line("fee", &fee, &value_date, &order.order.sleeve)?];
     plan.effective_date = request.trade_date.clone();
+    finish(book, head, ctx, plan)
+}
+
+// ── W11.25: a value-date roll ───────────────────────────────────────────────
+
+/// The entry kind a roll is journalled under (W9.8; approved 2026-10-13).
+pub const VALUE_DATE_ROLLED: &str = "value-date-rolled";
+
+/// Whether an entry's lines are this connectivity instance's on this venue
+/// account code: a fill it reported on a placement naming the code, an accept
+/// of fills it reported on the code, or a roll it reported on the code.
+fn rolls_with(book: &Book, acts: &[Act], instance: &str, code: &str) -> bool {
+    let placed_here = |placement_id: &str| {
+        book.ledger
+            .placements
+            .get(placement_id)
+            .is_some_and(|held| {
+                held.placement.connectivity_instance_id == instance
+                    && held.placement.venue_account_code == code
+            })
+    };
+    acts.iter().any(|act| match act {
+        Act::Executed { execution, .. } => placed_here(&execution.placement_id),
+        Act::Accepted { placement_id, .. } => placed_here(placement_id),
+        Act::ValueDateRolled { roll, sender } => {
+            sender == instance && roll.venue_account_code == code
+        }
+        _ => false,
+    })
+}
+
+/// W11.25 (contract v23; the OANDA batch's item 1, approved 2026-10-13): a
+/// connectivity plugin reports that its venue rolled an account's open spot
+/// position in a pair from one value date to the next. One entry,
+/// `value-date-rolled`, moves the account's pending lines in the pair's two
+/// cash instruments on the old value date -- those fills this instance
+/// reported on the code put there, or an earlier roll it reported moved
+/// there -- to the new one, each with its quantity and sleeve; trade-date
+/// quantities, lots, executions and orders are untouched. The new date is
+/// the date read's answer the plugin carries with its basis: the book never
+/// works one out, nor moves a date by itself. A catch-up roll, for a fill
+/// booked after the venue rolled its trade, is a roll like any other.
+pub fn report_value_date_roll(
+    book: &Book,
+    head: u64,
+    ctx: &Context,
+    request: &ReportValueDateRollRequest,
+) -> Result<Made> {
+    if request.venue_account_code.is_empty() {
+        return Err(malformed(
+            &["venue_account_code"],
+            "a roll names the venue account code whose position rolled",
+        ));
+    }
+    let pair: BTreeSet<&str> = request.pair.iter().map(String::as_str).collect();
+    if request.pair.len() != 2 || pair.len() != 2 || pair.contains("") {
+        return Err(malformed(
+            &["pair"],
+            "a roll names its pair's two cash instruments, as the date read's spot inputs do",
+        ));
+    }
+    if request.from_value_date.is_empty() {
+        return Err(malformed(
+            &["from_value_date"],
+            "a roll names the value date the pending lines leave",
+        ));
+    }
+    date_field("from_value_date", &request.from_value_date)?;
+    if request.to_value_date.is_empty() {
+        return Err(malformed(
+            &["to_value_date"],
+            "a roll names the value date it moves to, the date read's answer: ask it and \
+             send again, never a guessed date",
+        ));
+    }
+    date_field("to_value_date", &request.to_value_date)?;
+    if request.to_value_date <= request.from_value_date {
+        return Err(malformed(
+            &["to_value_date"],
+            format!(
+                "to_value_date {} is not after from_value_date {}: a roll moves a value date \
+                 forward",
+                request.to_value_date, request.from_value_date
+            ),
+        ));
+    }
+    if request.value_date_basis.is_none() {
+        return Err(malformed(
+            &["value_date_basis"],
+            "a roll carries the date read's basis for its new value date",
+        ));
+    }
+    if request.rolled_at_ns == 0 {
+        return Err(malformed(
+            &["rolled_at_ns"],
+            "a roll says when the venue rolled",
+        ));
+    }
+    if request.raw_record.is_none() {
+        return Err(malformed(
+            &["raw_record"],
+            "a roll references the raw record it was converted from",
+        ));
+    }
+    // What this instance's fills and rolls on the code left pending on the
+    // old date, by position, held to what each position has pending there.
+    let mut owed: BTreeMap<Key, Exact> = BTreeMap::new();
+    for entry in &book.entries {
+        if !rolls_with(
+            book,
+            &entry.body.acts,
+            &ctx.instance_id,
+            &request.venue_account_code,
+        ) {
+            continue;
+        }
+        for line in &entry.body.lines {
+            if line.bucket != SettlementBucket::Pending as i32
+                || line.value_date != request.from_value_date
+                || !pair.contains(line.instrument_id.as_str())
+            {
+                continue;
+            }
+            let quantity = numbers::required("quantity", line.quantity.as_ref())?;
+            let key: Key = (line.instrument_id.clone(), line.side, line.sleeve.clone());
+            let held = owed.entry(key).or_insert(Exact::ZERO);
+            *held = numbers::add("pending.quantity", *held, quantity)?;
+        }
+    }
+    let mut lines = Vec::new();
+    for (key, quantity) in owed {
+        let there = book
+            .positions
+            .get(&key)
+            .and_then(|position| position.pending.get(&request.from_value_date))
+            .map(|(quantity, _)| *quantity)
+            .unwrap_or(Exact::ZERO);
+        // Never more than is there, nor against its sign.
+        let moved = if quantity.is_zero()
+            || there.is_zero()
+            || quantity.is_negative() != there.is_negative()
+        {
+            continue;
+        } else if quantity.is_negative() {
+            if quantity < there {
+                there
+            } else {
+                quantity
+            }
+        } else if quantity > there {
+            there
+        } else {
+            quantity
+        };
+        let line = |value_date: &str, quantity: Exact| MovementLine {
+            instrument_id: key.0.clone(),
+            side: key.1,
+            bucket: SettlementBucket::Pending as i32,
+            value_date: value_date.to_string(),
+            quantity: numbers::wire(quantity),
+            sleeve: key.2.clone(),
+            ..Default::default()
+        };
+        lines.push(line(&request.from_value_date, moved.negated()));
+        lines.push(line(&request.to_value_date, moved));
+    }
+    if lines.is_empty() {
+        // W11.25 has such a roll recorded, moving nothing; an entry here is
+        // numbered by the records it changes, and this changes none. Open
+        // with v23's build: not kept until it is settled.
+        return Err(StoreError::Invalid(format!(
+            "the roll of {} from {} meets no pending line this instance's fills or rolls on \
+             {} left there; a roll that moves nothing is not journalled yet (an open point of \
+             contract v23), and the custodian's difference stays a break for operations",
+            request.pair.join("/"),
+            request.from_value_date,
+            request.venue_account_code
+        )));
+    }
+    let mut plan = Plan::new(
+        VALUE_DATE_ROLLED,
+        venue_actor(ctx),
+        vec![Act::ValueDateRolled {
+            roll: request.clone(),
+            sender: ctx.instance_id.clone(),
+        }],
+    )
+    .key(&request.idempotency_key);
+    plan.lines = lines;
+    plan.effective_date = crate::dates::date_of(request.rolled_at_ns);
     finish(book, head, ctx, plan)
 }
 
@@ -3165,7 +3401,8 @@ fn differ(words: String) -> StoreError {
 }
 
 /// W11.23 (contract v23; rulings 4, 6, 10 to 14): an `ems` accepts 1 to 500
-/// unmatched executions of one account, instrument and side, for a person or
+/// unmatched executions of one account, instrument, side, connectivity plugin
+/// and trade date (approved 2026-10-13), for a person or
 /// its service account, to an existing order it may place against --
 /// released, working or filled, never ended -- or to a new order made from
 /// them, filled and never gated (ORDER_ORIGIN_ACCEPTED_EXECUTION, market and
@@ -3216,6 +3453,14 @@ pub fn accept_execution(
                 a.execution_id, first.sender, b.execution_id, held.sender
             )));
         }
+        // One trade date (approved 2026-10-13): the position moves as of it.
+        if a.trade_date != b.trade_date {
+            return Err(differ(format!(
+                "execution {} traded on {} and {} on {}: one accept answers the executions of \
+                 one trade date, the position moving as of it; accept each date's separately",
+                a.execution_id, a.trade_date, b.execution_id, b.trade_date
+            )));
+        }
     }
     // The accepted quantity, in shares, and in the order's terms below.
     let mut accepted = Exact::ZERO;
@@ -3259,6 +3504,11 @@ pub fn accept_execution(
                         state_named(state)
                     ),
                 ));
+            }
+            // Only the claimant works a claimed order (W11.7; approved
+            // 2026-10-13): an accept onto one another claims is refused.
+            if !claim_allows(order, ctx) {
+                return Err(claim_refused(order));
             }
             if order.order.instrument_id != first.execution.instrument_id {
                 return Err(differ(format!(
@@ -3395,8 +3645,7 @@ pub fn accept_execution(
     });
     let mut plan = Plan::new("execution-accepted", ctx.actor(), acts).reason(&request.note);
     plan.lines = lines;
-    // As of the fills' trade date (ruling 13); an accept of fills of more
-    // than one trade date is journalled at the first of them.
+    // As of the fills' trade date (ruling 13), one per accept.
     plan.effective_date = trade_dates
         .into_iter()
         .find(|date| !date.is_empty())
