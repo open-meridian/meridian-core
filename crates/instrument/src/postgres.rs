@@ -45,6 +45,7 @@ const SCHEMA: &[&str] = &[
     include_str!("../migrations/0007_identity_never_reused.sql"),
     include_str!("../migrations/0008_prepared_call.sql"),
     include_str!("../migrations/0009_settlement_calendars.sql"),
+    include_str!("../migrations/0010_an_offer_keeps_its_provenance.sql"),
 ];
 
 /// A table the newest file makes. A database that has it has them all, so a
@@ -315,6 +316,7 @@ impl PostgresStore {
                     instance_id: String::new(),
                     offered_at_ns: record.record_time_ns,
                     valid_until_ns: 0,
+                    provenance: Vec::new(),
                 });
             }
             let entry = Version {
@@ -452,7 +454,7 @@ impl PostgresStore {
         for row in conn
             .query(
                 "SELECT instrument_id, field, scheme, namespace, value, source, instance_id,
-                        offered_at_ns, valid_until_ns
+                        offered_at_ns, valid_until_ns, provenance
                    FROM instrument_offer
                   WHERE instrument_id = ANY($1)
                   ORDER BY instrument_id, offered_at_ns, field, value",
@@ -474,6 +476,7 @@ impl PostgresStore {
                     instance_id: row.get(6),
                     offered_at_ns: row.get(7),
                     valid_until_ns: row.get(8),
+                    provenance: row.get(9),
                 });
             }
         }
@@ -545,8 +548,8 @@ impl PostgresStore {
             tx.execute(
                 "INSERT INTO instrument_offer
                         (instrument_id, field, scheme, namespace, value, source, instance_id,
-                         offered_at_ns, valid_until_ns)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                         offered_at_ns, valid_until_ns, provenance)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                  ON CONFLICT DO NOTHING",
                 &[
                     id,
@@ -558,6 +561,7 @@ impl PostgresStore {
                     &offer.instance_id,
                     &offer.offered_at_ns,
                     &offer.valid_until_ns,
+                    &offer.provenance,
                 ],
             )
             .map_err(unavailable)?;

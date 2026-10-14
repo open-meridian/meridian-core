@@ -38,7 +38,7 @@
 
 use meridian_domain::v1::{
     ExternalAccountsEvent, MissingInstrumentDetectedEvent, RecordHoldingRequest,
-    RecordHoldingsStatementRequest,
+    RecordHoldingsStatementRequest, ResolveIdentifierRequest,
 };
 use meridian_pb::bounds::{
     Length, ALGORITHM_DECLARATION_DESCRIPTION_LENGTH, AS_REPORTED_CODE_LENGTH,
@@ -50,8 +50,9 @@ use meridian_pb::bounds::{
     PROVENANCE_RULE_LENGTH, PROVENANCE_SOURCE_LENGTH, RAW_RECORD_KIND_LABEL_LENGTH,
     RAW_RECORD_KIND_NAME_LENGTH, RAW_RECORD_KIND_WINDOW_DAYS_RANGE, RAW_RECORD_REF_KEY_LENGTH,
     RECORD_HOLDINGS_STATEMENT_REQUEST_PROVENANCE_COUNT, RECORD_HOLDING_REQUEST_PENDING_COUNT,
-    RECORD_HOLDING_REQUEST_PROVENANCE_COUNT, STORAGE_DECLARATION_RECORD_KINDS_COUNT,
-    STORAGE_DECLARATION_RETENTION_DAYS_RANGE, STORED_SPAN_RECORD_KIND_LENGTH,
+    RECORD_HOLDING_REQUEST_PROVENANCE_COUNT, RESOLVE_IDENTIFIER_REQUEST_PROVENANCE_COUNT,
+    STORAGE_DECLARATION_RECORD_KINDS_COUNT, STORAGE_DECLARATION_RETENTION_DAYS_RANGE,
+    STORED_SPAN_RECORD_KIND_LENGTH,
 };
 use meridian_pb::v1::{
     AsReported, Backfill, NotCarriedReason, NotCarriedSeen, PluginDeclaration, Provenance,
@@ -68,6 +69,10 @@ const EXTERNAL_ACCOUNTS: &str = "meridian.v1.ExternalAccountsEvent";
 const MISSING_INSTRUMENT: &str = "meridian.v1.MissingInstrumentDetectedEvent";
 const STATEMENT: &str = "meridian.v1.RecordHoldingsStatementRequest";
 const HOLDING: &str = "meridian.v1.RecordHoldingRequest";
+const RESOLVE: &str = "meridian.v1.ResolveIdentifierRequest";
+
+/// The one value a resolve's provenance is for (contract v23, W3.1).
+const STATED_CURRENCY: &str = "stated_currency";
 
 impl Sidecar {
     /// The message as it may leave: what the edge keeps checked, and each
@@ -133,6 +138,11 @@ impl Sidecar {
                 }
                 backfill(row.backfill.as_ref())?;
                 Some(row.encode_to_vec())
+            }
+            RESOLVE => {
+                let mut request = read::<ResolveIdentifierRequest>(&message)?;
+                resolve_provenance(&mut request, &instance)?;
+                Some(request.encode_to_vec())
             }
             _ => None,
         };
@@ -272,6 +282,29 @@ pub(crate) fn provenance(
             held.raw_record.as_mut(),
             instance,
         )?;
+    }
+    Ok(())
+}
+
+/// A resolve's provenance (contract v23, W3.1): each entry as on a holding
+/// row, and for the security's currency alone, since nothing else a resolve
+/// states is closed by the plugin.
+pub(crate) fn resolve_provenance(
+    request: &mut ResolveIdentifierRequest,
+    instance: &str,
+) -> Result<(), Status> {
+    provenance(
+        &mut request.provenance,
+        RESOLVE_IDENTIFIER_REQUEST_PROVENANCE_COUNT.most,
+        instance,
+    )?;
+    for (i, held) in request.provenance.iter().enumerate() {
+        if held.field != STATED_CURRENCY {
+            return Err(refuse(format!(
+                "provenance[{i}].field is {}; a resolve's provenance is for {STATED_CURRENCY}",
+                held.field
+            )));
+        }
     }
     Ok(())
 }
@@ -654,6 +687,62 @@ mod tests {
         assert!(refused.message().contains("names another"));
         let mut keyless = RawRecordRef::default();
         assert!(own_record("raw_record", Some(&mut keyless), "snaptrade-1").is_err());
+    }
+
+    #[test]
+    fn a_resolves_provenance_is_for_its_currency_alone_and_names_its_kind() {
+        let supplied = Provenance {
+            field: STATED_CURRENCY.into(),
+            kind: ProvenanceKind::Supplied as i32,
+            person: "local|admin".into(),
+            ..Default::default()
+        };
+        let mut request = ResolveIdentifierRequest {
+            stated_currency: "USD".into(),
+            provenance: vec![supplied.clone()],
+            ..Default::default()
+        };
+        assert!(resolve_provenance(&mut request, "custody-1").is_ok());
+
+        request.provenance = vec![Provenance {
+            kind: ProvenanceKind::Unspecified as i32,
+            ..supplied.clone()
+        }];
+        let refused = resolve_provenance(&mut request, "custody-1").unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+        assert_eq!(refused.message(), "provenance[0].kind is unspecified");
+
+        request.provenance = vec![Provenance {
+            field: "stated_description".into(),
+            kind: ProvenanceKind::Derived as i32,
+            rule: "the symbol's name".into(),
+            ..Default::default()
+        }];
+        let refused = resolve_provenance(&mut request, "custody-1").unwrap_err();
+        assert_eq!(
+            refused.message(),
+            "provenance[0].field is stated_description; a resolve's provenance is for stated_currency"
+        );
+
+        // Reported from another of the plugin's records: its own, filled.
+        request.provenance = vec![Provenance {
+            field: STATED_CURRENCY.into(),
+            kind: ProvenanceKind::Reported as i32,
+            raw_record: Some(RawRecordRef {
+                instance_id: String::new(),
+                key: "accounts/SNAP-ACC-1".into(),
+            }),
+            ..Default::default()
+        }];
+        resolve_provenance(&mut request, "custody-1").unwrap();
+        assert_eq!(
+            request.provenance[0]
+                .raw_record
+                .as_ref()
+                .unwrap()
+                .instance_id,
+            "custody-1"
+        );
     }
 
     #[test]

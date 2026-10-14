@@ -776,7 +776,11 @@ fn qualifies(record: &Instrument, identifier: &Asked, request: &ResolveIdentifie
 }
 
 /// What the plugin's source stated, as offers (the spec's Q6). Only what it
-/// can be: a class the enum defines, a currency that is a code.
+/// can be: a class the enum defines, a currency that is a code. The currency
+/// keeps its provenance (contract v23, W3.1): an entry the plugin sent for
+/// `stated_currency` is kept with the offer, encoded as it arrived, and the
+/// offer's words say how it came -- supplied by the person, derived by the
+/// rule -- never presenting it as the source's.
 fn stated(request: &ResolveIdentifierRequest, instance_id: &str, now_ns: i64) -> Vec<Offer> {
     let words = format!("stated by {instance_id}");
     let offer = |field: Field, value: String| Offer {
@@ -787,6 +791,7 @@ fn stated(request: &ResolveIdentifierRequest, instance_id: &str, now_ns: i64) ->
         instance_id: instance_id.to_string(),
         offered_at_ns: now_ns,
         valid_until_ns: 0,
+        provenance: Vec::new(),
     };
     let mut offers = Vec::new();
     if let Ok(class) = AssetClass::try_from(request.stated_asset_class) {
@@ -796,7 +801,16 @@ fn stated(request: &ResolveIdentifierRequest, instance_id: &str, now_ns: i64) ->
     }
     let currency = request.stated_currency.trim();
     if is_currency(currency) {
-        offers.push(offer(Field::Currency, currency.to_string()));
+        let mut stated = offer(Field::Currency, currency.to_string());
+        if let Some(entry) = request
+            .provenance
+            .iter()
+            .find(|entry| entry.field == STATED_CURRENCY)
+        {
+            stated.source = provenance_words(entry, instance_id);
+            stated.provenance = prost::Message::encode_to_vec(entry);
+        }
+        offers.push(stated);
     }
     let description = request.stated_description.trim();
     if !description.is_empty() {
@@ -816,6 +830,32 @@ fn stated(request: &ResolveIdentifierRequest, instance_id: &str, now_ns: i64) ->
         }
     }
     offers
+}
+
+/// The path of the one value a resolve's provenance is for (contract v23).
+pub const STATED_CURRENCY: &str = "stated_currency";
+
+/// How a currency the plugin closed came to be, in words a person reads
+/// beside the offer: the person who supplied it, the rule that derived it, or
+/// the source and record it was read from.
+fn provenance_words(entry: &meridian_pb::v1::Provenance, instance_id: &str) -> String {
+    use meridian_pb::v1::ProvenanceKind;
+    match ProvenanceKind::try_from(entry.kind) {
+        Ok(ProvenanceKind::Supplied) => {
+            format!("supplied by {} on {instance_id}'s page", entry.person)
+        }
+        Ok(ProvenanceKind::Derived) => format!("derived by {instance_id}'s rule: {}", entry.rule),
+        Ok(ProvenanceKind::SecondSource) => {
+            format!("stated by {}, {instance_id}'s second source", entry.source)
+        }
+        Ok(ProvenanceKind::Reported) => match entry.raw_record.as_ref() {
+            Some(record) if !record.key.is_empty() => {
+                format!("stated by {instance_id}, in its record {}", record.key)
+            }
+            _ => format!("stated by {instance_id}"),
+        },
+        _ => format!("stated by {instance_id}"),
+    }
 }
 
 /// Keep each offer that says something the record does not, in place of what
@@ -839,10 +879,13 @@ pub(crate) fn keep_offers(record: &mut Instrument, offers: Vec<Offer>) -> bool {
             continue;
         }
         if offer.field != Field::Identifier {
+            // A plugin's later offer for a field replaces its earlier one,
+            // however it said the value came (contract v23); the platform's
+            // offers, under no instance, are told apart by their words.
             record.offers.retain(|held| {
                 !(held.field == offer.field
                     && held.instance_id == offer.instance_id
-                    && held.source == offer.source)
+                    && (!offer.instance_id.is_empty() || held.source == offer.source))
             });
         }
         record.offers.push(offer);
@@ -1254,6 +1297,114 @@ mod tests {
             .changed
             .unwrap();
         assert!(minted.offers.is_empty());
+    }
+
+    fn currency_provenance(
+        kind: meridian_pb::v1::ProvenanceKind,
+        person: &str,
+        rule: &str,
+    ) -> meridian_pb::v1::Provenance {
+        meridian_pb::v1::Provenance {
+            field: STATED_CURRENCY.into(),
+            kind: kind as i32,
+            person: person.into(),
+            rule: rule.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_supplied_or_derived_currency_is_offered_with_its_provenance_and_says_how() {
+        use meridian_pb::v1::ProvenanceKind;
+        let store = MemoryStore::new();
+        let mut supplied = request(vec![asked("symbol", "TRD1", "tradier")]);
+        supplied.stated_currency = "USD".into();
+        let entry = currency_provenance(ProvenanceKind::Supplied, "local|admin", "");
+        supplied.provenance = vec![entry.clone()];
+        let minted = resolve_identifier(&store, &supplied, "custody-tradier-1", NOW)
+            .unwrap()
+            .changed
+            .unwrap();
+        assert!(minted.currency.is_empty(), "offered, never in force");
+        let offer = minted
+            .offers
+            .iter()
+            .find(|offer| offer.field == Field::Currency)
+            .unwrap();
+        assert_eq!(offer.value, "USD");
+        assert_eq!(
+            offer.source,
+            "supplied by local|admin on custody-tradier-1's page"
+        );
+        assert_eq!(offer.provenance, prost::Message::encode_to_vec(&entry));
+
+        // Said again the same way, nothing changes; derived by a rule now,
+        // the plugin's offer is replaced, never kept beside the first.
+        let again = resolve_identifier(&store, &supplied, "custody-tradier-1", NOW + 1).unwrap();
+        assert!(again.changed.is_none());
+        let mut derived = supplied.clone();
+        derived.provenance = vec![currency_provenance(
+            ProvenanceKind::Derived,
+            "",
+            "the account's only cash currency",
+        )];
+        let changed = resolve_identifier(&store, &derived, "custody-tradier-1", NOW + 2)
+            .unwrap()
+            .changed
+            .unwrap();
+        let currencies: Vec<_> = changed
+            .offers
+            .iter()
+            .filter(|offer| offer.field == Field::Currency)
+            .collect();
+        assert_eq!(currencies.len(), 1);
+        assert_eq!(
+            currencies[0].source,
+            "derived by custody-tradier-1's rule: the account's only cash currency"
+        );
+    }
+
+    #[test]
+    fn a_currency_stated_carries_no_provenance_and_one_stated_elsewhere_names_its_record() {
+        use meridian_pb::v1::{ProvenanceKind, RawRecordRef};
+        let store = MemoryStore::new();
+        let mut stated = request(vec![asked("symbol", "SNAP3", "snaptrade")]);
+        stated.stated_currency = "USD".into();
+        let minted = resolve_identifier(&store, &stated, "custody-snaptrade-1", NOW)
+            .unwrap()
+            .changed
+            .unwrap();
+        let offer = minted
+            .offers
+            .iter()
+            .find(|o| o.field == Field::Currency)
+            .unwrap();
+        assert_eq!(offer.source, "stated by custody-snaptrade-1");
+        assert!(offer.provenance.is_empty());
+
+        let mut elsewhere = request(vec![asked("symbol", "SNAP4", "snaptrade")]);
+        elsewhere.stated_currency = "USD".into();
+        elsewhere.provenance = vec![meridian_pb::v1::Provenance {
+            raw_record: Some(RawRecordRef {
+                instance_id: "custody-snaptrade-1".into(),
+                key: "accounts/SNAP-ACC-1".into(),
+            }),
+            ..currency_provenance(ProvenanceKind::Reported, "", "")
+        }];
+        let minted = resolve_identifier(&store, &elsewhere, "custody-snaptrade-1", NOW)
+            .unwrap()
+            .changed
+            .unwrap();
+        let offer = minted
+            .offers
+            .iter()
+            .find(|o| o.field == Field::Currency)
+            .unwrap();
+        assert_eq!(
+            offer.source,
+            "stated by custody-snaptrade-1, in its record accounts/SNAP-ACC-1"
+        );
+        assert!(!offer.provenance.is_empty());
     }
 
     #[test]

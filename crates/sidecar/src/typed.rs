@@ -445,7 +445,7 @@ impl Sidecar {
     /// `account` outside it is refused here, first (W4.4, W4.11); `account`
     /// is `None` for a query matrix/scoped.tsv declares unscoped, and empty
     /// for one naming none, which the store answers for the whole scope.
-    pub(crate) async fn call_typed<D: Message, R: Message + Default>(
+    pub(crate) async fn call_typed<D: Message + Default, R: Message + Default>(
         &self,
         topic: &str,
         payload_type: &str,
@@ -455,6 +455,7 @@ impl Sidecar {
     ) -> Result<Response<R>, Status> {
         let topic = self.own_topic(topic);
         self.granted(&topic)?;
+        let message = self.kept_at_the_edge(payload_type, message)?;
         self.dates_stand(payload_type, &message.encode_to_vec())?;
         let mut stamp = if AS_ITSELF.contains(&topic.as_str()) {
             Stamp::default()

@@ -259,6 +259,7 @@ fn derived(field: Field, value: String, instrument: &Instrument) -> Offer {
         instance_id: String::new(),
         offered_at_ns: instrument.record_time_ns,
         valid_until_ns: 0,
+        provenance: Vec::new(),
     }
 }
 

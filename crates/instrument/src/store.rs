@@ -168,16 +168,25 @@ pub struct Offer {
     /// in force once a person accepts it. 0 for an offer to add one, and for
     /// every other field.
     pub valid_until_ns: i64,
+
+    /// Where a plugin's stated value came from, where the plugin closed it
+    /// rather than read it from the security's own record (contract v23,
+    /// W3.1): the resolve's Provenance entry for the field, encoded as the
+    /// plugin sent it. Empty for a value the source stated, and for every
+    /// offer of the platform's.
+    pub provenance: Vec<u8>,
 }
 
 impl Offer {
-    /// Two offers are one when they offer the same value from the same place.
+    /// Two offers are one when they offer the same value from the same place,
+    /// said to have come the same way.
     pub fn same_as(&self, other: &Offer) -> bool {
         self.field == other.field
             && self.value == other.value
             && self.identifier == other.identifier
             && self.instance_id == other.instance_id
             && self.valid_until_ns == other.valid_until_ns
+            && self.provenance == other.provenance
     }
 }
 

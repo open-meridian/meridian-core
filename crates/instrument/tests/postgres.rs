@@ -103,6 +103,7 @@ fn record(instrument_id: &str, identifiers: Vec<Identifier>) -> Instrument {
             instance_id: "custody-1".into(),
             offered_at_ns: 100,
             valid_until_ns: 0,
+            provenance: Vec::new(),
         }],
     }
 }
@@ -156,6 +157,54 @@ fn a_minted_record_comes_back_whole_with_its_sources_offers_and_history() {
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].operation, "mint");
     assert_eq!(history[0].changes[0].after, "SNAP1");
+}
+
+#[test]
+fn a_currency_offer_keeps_the_provenance_it_came_with() {
+    // Contract v23 (W3.1): a currency the plugin's admin supplied is offered
+    // with its Provenance entry, kept encoded as it arrived and read back
+    // whole; an offer with none reads back with none.
+    let store = store();
+    let mut held = minted(&store, "CCY");
+    let entry_bytes = prost::Message::encode_to_vec(&meridian_pb::v1::Provenance {
+        field: "stated_currency".into(),
+        kind: meridian_pb::v1::ProvenanceKind::Supplied as i32,
+        person: "local|admin".into(),
+        ..Default::default()
+    });
+    held.offers.push(Offer {
+        field: Field::Currency,
+        value: "USD".into(),
+        identifier: None,
+        source: "supplied by local|admin on custody-1's page".into(),
+        instance_id: "custody-1".into(),
+        offered_at_ns: 200,
+        valid_until_ns: 0,
+        provenance: entry_bytes.clone(),
+    });
+    held.version = 2;
+    let id = held.instrument_id.clone();
+    assert_eq!(
+        store.write(held, 1, entry(&id, 2, "resolve")).unwrap(),
+        Written::Stored
+    );
+    let back = store.by_id(&id).unwrap().unwrap();
+    let currency = back
+        .offers
+        .iter()
+        .find(|offer| offer.field == Field::Currency)
+        .expect("the currency's offer is kept");
+    assert_eq!(currency.provenance, entry_bytes);
+    assert_eq!(
+        currency.source,
+        "supplied by local|admin on custody-1's page"
+    );
+    let class = back
+        .offers
+        .iter()
+        .find(|offer| offer.field == Field::AssetClass)
+        .unwrap();
+    assert!(class.provenance.is_empty(), "a stated value carries none");
 }
 
 #[test]
@@ -576,6 +625,7 @@ fn a_closed_window_an_ended_offer_a_contract_and_a_conflicts_reason_are_kept() {
         instance_id: String::new(),
         offered_at_ns: 400,
         valid_until_ns: 450,
+        provenance: Vec::new(),
     });
     held.version = 2;
     assert_eq!(
