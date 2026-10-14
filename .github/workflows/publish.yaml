@@ -4,9 +4,14 @@
 # questions. `ci` says whether the commit is sound and blocks a merge. This
 # takes a commit that already passed and makes it something a customer can pull.
 #
-# It runs after `ci` succeeds on `main`, so nothing is ever published that the
-# gates have not seen. A workflow_run trigger rather than a push trigger is what
-# enforces that ordering; a push trigger would race the gates and sometimes win.
+# It runs on the merge to `main`, and `ci` does not run again first (the product
+# owner, 2026-10-14). A change lands through a pull request whose `ci` checks
+# are required, whose branch must be up to date with main, and which merges
+# with a merge commit, so the merge's tree is the tree those checks passed.
+# Each job checks out the commit the branch carried, the merge's second parent,
+# and refuses a merge whose tree differs from it: the tags below then name the
+# commit other repositories pin, and nothing is published that the gates have
+# not seen. A run by hand publishes the commit it is given.
 #
 # Two architectures, built natively rather than emulated. This runs in a
 # customer's cluster, and that cluster is as likely to be arm64 as not: Graviton,
@@ -20,9 +25,7 @@
 name: publish
 
 on:
-  workflow_run:
-    workflows: [ci]
-    types: [completed]
+  push:
     branches: [main]
   workflow_dispatch:
 
@@ -39,9 +42,6 @@ env:
 
 jobs:
   build:
-    if: >
-      github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.conclusion == 'success'
     strategy:
       fail-fast: false
       matrix:
@@ -54,7 +54,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          # The merge commit and both its parents, for the step below.
+          fetch-depth: 2
+
+      # The commit the branch carried, rather than the merge commit (see the
+      # header): its tree is the merge's, and its SHA is the one other
+      # repositories pin.
+      - name: The commit the branch carried
+        run: |
+          set -euo pipefail
+          if git rev-parse -q --verify 'HEAD^2' >/dev/null; then
+            if [ "$(git rev-parse 'HEAD^{tree}')" != "$(git rev-parse 'HEAD^2^{tree}')" ]; then
+              echo "::error::merge $(git rev-parse --short HEAD) holds a tree its branch never had: the branch was not up to date with main, so no pull-request check passed on this tree"
+              exit 1
+            fi
+            git checkout -q --detach 'HEAD^2'
+          fi
+          echo "publishing $(git rev-parse HEAD)"
 
       # Before anything builds an image: the runner's preinstalled toolsets
       # and preloaded images (tools/free-runner-disk.sh).
@@ -116,7 +132,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          # The merge commit and both its parents, for the step below.
+          fetch-depth: 2
+
+      # The commit the branch carried, rather than the merge commit (see the
+      # header): its tree is the merge's, and its SHA is the one other
+      # repositories pin.
+      - name: The commit the branch carried
+        run: |
+          set -euo pipefail
+          if git rev-parse -q --verify 'HEAD^2' >/dev/null; then
+            if [ "$(git rev-parse 'HEAD^{tree}')" != "$(git rev-parse 'HEAD^2^{tree}')" ]; then
+              echo "::error::merge $(git rev-parse --short HEAD) holds a tree its branch never had: the branch was not up to date with main, so no pull-request check passed on this tree"
+              exit 1
+            fi
+            git checkout -q --detach 'HEAD^2'
+          fi
+          echo "publishing $(git rev-parse HEAD)"
 
       - uses: actions/download-artifact@v4
         with:
@@ -184,7 +216,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          # The merge commit and both its parents, for the step below.
+          fetch-depth: 2
+
+      # The commit the branch carried, rather than the merge commit (see the
+      # header): its tree is the merge's, and its SHA is the one other
+      # repositories pin.
+      - name: The commit the branch carried
+        run: |
+          set -euo pipefail
+          if git rev-parse -q --verify 'HEAD^2' >/dev/null; then
+            if [ "$(git rev-parse 'HEAD^{tree}')" != "$(git rev-parse 'HEAD^2^{tree}')" ]; then
+              echo "::error::merge $(git rev-parse --short HEAD) holds a tree its branch never had: the branch was not up to date with main, so no pull-request check passed on this tree"
+              exit 1
+            fi
+            git checkout -q --detach 'HEAD^2'
+          fi
+          echo "publishing $(git rev-parse HEAD)"
 
       # Before anything builds an image: the runner's preinstalled toolsets
       # and preloaded images (tools/free-runner-disk.sh).
@@ -243,7 +291,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          # The merge commit and both its parents, for the step below.
+          fetch-depth: 2
+
+      # The commit the branch carried, rather than the merge commit (see the
+      # header): its tree is the merge's, and its SHA is the one other
+      # repositories pin.
+      - name: The commit the branch carried
+        run: |
+          set -euo pipefail
+          if git rev-parse -q --verify 'HEAD^2' >/dev/null; then
+            if [ "$(git rev-parse 'HEAD^{tree}')" != "$(git rev-parse 'HEAD^2^{tree}')" ]; then
+              echo "::error::merge $(git rev-parse --short HEAD) holds a tree its branch never had: the branch was not up to date with main, so no pull-request check passed on this tree"
+              exit 1
+            fi
+            git checkout -q --detach 'HEAD^2'
+          fi
+          echo "publishing $(git rev-parse HEAD)"
 
       # Before anything builds an image: the runner's preinstalled toolsets
       # and preloaded images (tools/free-runner-disk.sh).
@@ -296,7 +360,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          # The merge commit and both its parents, for the step below.
+          fetch-depth: 2
+
+      # The commit the branch carried, rather than the merge commit (see the
+      # header): its tree is the merge's, and its SHA is the one other
+      # repositories pin.
+      - name: The commit the branch carried
+        run: |
+          set -euo pipefail
+          if git rev-parse -q --verify 'HEAD^2' >/dev/null; then
+            if [ "$(git rev-parse 'HEAD^{tree}')" != "$(git rev-parse 'HEAD^2^{tree}')" ]; then
+              echo "::error::merge $(git rev-parse --short HEAD) holds a tree its branch never had: the branch was not up to date with main, so no pull-request check passed on this tree"
+              exit 1
+            fi
+            git checkout -q --detach 'HEAD^2'
+          fi
+          echo "publishing $(git rev-parse HEAD)"
 
       - id: version
         run: |

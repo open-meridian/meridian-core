@@ -7,9 +7,12 @@
 # fails the build rather than quietly escaping local reproduction.
 name: ci
 
+# On the pull request and by hand, and not again on main. A change lands
+# through a pull request that must be up to date with main and merges with a
+# merge commit, so the tree this run passed is the tree the merge puts on
+# main, and `publish` runs on that merge without repeating it (the product
+# owner, 2026-10-14).
 on:
-  push:
-    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -55,13 +58,11 @@ jobs:
         run: |
           case "${{ github.event_name }}" in
             pull_request) base="${{ github.event.pull_request.base.sha }}" ;;
-            push)         base="${{ github.event.before }}" ;;
             *)            base="" ;;
           esac
-          # A branch's first push reports an all-zero "before", and a manual run
-          # has no range at all. HEAD against itself inspects nothing, which is
-          # the right answer there: nothing arrived to inspect.
-          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+          # A manual run has no range at all. HEAD against itself inspects
+          # nothing, which is the right answer there: nothing arrived to inspect.
+          if [ -z "$base" ]; then
             base="$(git rev-parse HEAD)"
           fi
           echo "CONTRACT_DIFF_BASE=$base" >> "$GITHUB_ENV"
@@ -101,16 +102,15 @@ jobs:
   # job above had passed -- one of them published, because `publish` waited
   # on this workflow and this workflow had never installed a chart.
   #
-  # Part of `ci` rather than a workflow of its own for exactly that reason:
-  # `publish` runs on a green `ci`, so a red run here publishes nothing.
-  #
-  # After ci-local, and only on main or by hand. They need a cluster and the
-  # platform, which is private: a pull request from a fork gets no secret to
-  # check it out with, and a commit ci-local has refused is not worth a
-  # cluster. One job per run, so a failure names its half.
+  # So they run on every pull request, after ci-local, and each is a required
+  # check: `publish` runs on the merge without CI again, so a red run here
+  # keeps the change off main and publishes nothing. They need a cluster and
+  # the platform, which is private: a pull request from a fork gets no secret
+  # to check it out with, fails at the credentials step below, and is closed
+  # by outside-pull-requests anyway. A commit ci-local has refused is not
+  # worth a cluster. One job per run, so a failure names its half.
   e2e-cluster-k3d:
     needs: ci-local
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
