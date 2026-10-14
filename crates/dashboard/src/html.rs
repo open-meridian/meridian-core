@@ -274,6 +274,8 @@ animation:status-turn 1.4s linear infinite}@keyframes status-turn{to{transform:r
 input.filter{display:block;width:min(100%,26rem);margin:0 0 .9rem}table.plugins td:first-child{white-space:nowrap}\
 .filter-row{display:flex;align-items:center;gap:.75rem;flex-wrap:wrap;margin:0 0 .9rem}.filter-row input.filter{margin:0}\
 .filter-count{color:var(--ink-faint);font-size:.84rem}\
+.calendar-filter{flex-wrap:nowrap}.calendar-filter select{flex:0 1 auto;max-width:40%;width:auto;margin:0}\
+.calendar-filter input.filter{flex:1 1 auto;min-width:0;width:auto}.calendar-filter button{flex:0 0 auto;margin:0}\
 th button.sort{margin:0;padding:0;border:0;background:none;font:inherit;color:inherit;letter-spacing:inherit;text-transform:inherit;cursor:pointer}\
 th[aria-sort=ascending] button.sort::after{content:\" \\2191\"}th[aria-sort=descending] button.sort::after{content:\" \\2193\"}\
 .more{color:var(--ink-faint)}\

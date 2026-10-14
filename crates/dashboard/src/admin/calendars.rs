@@ -238,8 +238,8 @@ fn filter_form(filter: &Filter) -> String {
     .collect();
     format!(
         "<form class=\"filter-row calendar-filter\" method=\"get\" \
-         action=\"/admin/instruments#calendars\"><label>Kind<select name=\"calendar_kind\">\
-         {options}</select></label><input class=\"filter\" type=\"search\" \
+         action=\"/admin/instruments#calendars\"><select name=\"calendar_kind\" \
+         aria-label=\"Kind\">{options}</select><input class=\"filter\" type=\"search\" \
          name=\"calendar_query\" maxlength=\"{QUERY_MOST}\" value=\"{query}\" \
          placeholder=\"Name, ISO code or system\" aria-label=\"Search calendars\">\
          <button type=\"submit\">Show</button></form>",
