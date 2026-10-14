@@ -298,6 +298,32 @@ fn month_end(set: &Set, date: Date) -> Result<Date, Stop> {
     step(set, last, -1)
 }
 
+/// A spot or tenor read's pair by the platform's IDs (the order-path plan's
+/// "v23 also", approved 2026-10-13): a deployment keeps a currency under its
+/// own ID with the platform's beside it, as `open_meridian`, and a spot rule
+/// pulled from the platform names the platform's; each member is read by
+/// `platform_id`, and one with none is kept as asked, so the rule is not held
+/// and the miss names it honestly, never a guess. Until the one-ID revision
+/// removes the translation everywhere.
+pub fn pair_on_the_platform(
+    request: &ComputeDateRequest,
+    platform_id: impl Fn(&str) -> Option<String>,
+) -> ComputeDateRequest {
+    use compute_date_request::Inputs;
+    let mut request = request.clone();
+    let pair = match request.inputs.as_mut() {
+        Some(Inputs::Spot(asked)) => &mut asked.pair,
+        Some(Inputs::Tenor(asked)) => &mut asked.pair,
+        _ => return request,
+    };
+    for member in pair.iter_mut() {
+        if let Some(platform) = platform_id(member.trim()) {
+            *member = platform;
+        }
+    }
+    request
+}
+
 /// A pair, its two cash instruments in either order, as a rule's subject
 /// names it.
 fn same_pair(rule: &[String], asked: &[String]) -> bool {

@@ -61,8 +61,11 @@ confirmation. It serves:
                                   execution's ID and state;
   /answers                        each execution it reported, as it heard
                                   it answered: matched or DK (ruling 15);
-  /spot?pair=INS-..,INS-..&trade= a pair's spot date from a trade date
-                                  (W3.20), answering the date and rule.
+  /spot?pair=..,..&trade=         a pair's spot date from a trade date
+                                  (W3.20), by the platform's INS- IDs or the
+                                  deployment's own LCL- ones, answering the
+                                  date and rule;
+  /resolve?iso4217=               a currency's record by its ISO 4217 code.
 """
 import asyncio
 import base64
@@ -631,6 +634,10 @@ class Venue(Plugin):
             # The venue's symbol, resolved at the edge by the fact's date
             # (W3.1, granted to connectivity in v22), minting the record.
             identifiers = [ops.Identifier(scheme="symbol", value=one(query, "symbol"), source="sim")]
+            if one(query, "iso4217"):
+                # A currency by its ISO 4217 code: the deployment's own record,
+                # the platform's ID beside it (contract v20, W3.1).
+                identifiers = [ops.Identifier(scheme="iso4217", value=one(query, "iso4217"))]
             if one(query, "figi"):
                 identifiers.append(ops.Identifier(scheme="figi", value=one(query, "figi")))
             found = await self.call("ResolveIdentifier",
@@ -649,10 +656,11 @@ class Venue(Plugin):
             return {"answers": self.answers}
         if path == "/spot":
             # Contract v23: a pair's spot date (W3.20), by the two cash
-            # instruments' IDs the platform's rule names. Until the one-ID
-            # revision a deployment keeps a currency under a local ID with the
-            # platform's beside it (the 2026-10-11 ruling), and a rule pulled
-            # for a pair names the platform's.
+            # instruments' IDs: the platform's, or the deployment's own. Until
+            # the one-ID revision a deployment keeps a currency under a local
+            # ID with the platform's beside it (the 2026-10-11 ruling), a rule
+            # pulled for a pair names the platform's, and the read translates
+            # the deployment's (approved 2026-10-13).
             pair = split(one(query, "pair"))
             answered = await self.call("ComputeDate", ops.ComputeDateParams(
                 spot=ops.SpotDateInputs(pair=pair, trade_date=one(query, "trade"))))

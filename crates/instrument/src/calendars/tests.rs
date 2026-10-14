@@ -752,3 +752,71 @@ fn a_calendar_line_carries_its_subject_and_the_list_filters_by_kind_and_text() {
         vec![EUR]
     );
 }
+
+#[test]
+fn a_spot_read_by_the_deployments_own_currency_ids_reads_the_platforms_rule() {
+    // A deployment keeps EUR and USD under its own LCL- IDs with the
+    // platform's beside them (approved 2026-10-13): the read translates each
+    // member and computes the date the platform's rule gives.
+    const LOCAL_EUR: &str = "LCL-01JAE0000000000000000EUR";
+    const LOCAL_USD: &str = "LCL-01JAE0000000000000000USD";
+    let platform = |id: &str| match id {
+        LOCAL_EUR => Some(CASH_EUR.to_string()),
+        LOCAL_USD => Some(CASH_USD.to_string()),
+        _ => None,
+    };
+    let local = ComputeDateRequest {
+        inputs: Some(spot([LOCAL_EUR, LOCAL_USD], "2026-10-09")),
+        as_of_ns: 0,
+    };
+    let translated = pair_on_the_platform(&local, platform);
+    let answer = compute(&latest(), &translated, us_equity, KEPT + 1).unwrap();
+    assert_eq!(answer.reply.outcome, DateOutcome::Computed as i32);
+    let by_platform = ask(&latest(), spot([CASH_EUR, CASH_USD], "2026-10-09"));
+    assert_eq!(answer.reply.date, by_platform.reply.date);
+
+    // Untranslated, the LCL- pair meets no rule: the bug this fixes.
+    let untranslated = compute(&latest(), &local, us_equity, KEPT + 1).unwrap();
+    assert_eq!(untranslated.reply.outcome, DateOutcome::RuleNotHeld as i32);
+
+    // A member with no platform ID is kept as asked: the rule is not held and
+    // the miss names it honestly, the other member by the platform's ID.
+    let stub = ComputeDateRequest {
+        inputs: Some(spot(["LCL-NOPLATFORMID", LOCAL_USD], "2026-10-09")),
+        as_of_ns: 0,
+    };
+    let answer = compute(
+        &latest(),
+        &pair_on_the_platform(&stub, platform),
+        us_equity,
+        KEPT + 1,
+    )
+    .unwrap();
+    assert_eq!(answer.reply.outcome, DateOutcome::RuleNotHeld as i32);
+    assert_eq!(
+        answer.missing.unwrap().subject.unwrap().pair,
+        vec!["LCL-NOPLATFORMID".to_string(), CASH_USD.to_string()]
+    );
+
+    // A tenor's pair is translated too; any other question is left alone.
+    let tenor = ComputeDateRequest {
+        inputs: Some(Inputs::Tenor(TenorDateInputs {
+            pair: vec![LOCAL_EUR.into(), LOCAL_USD.into()],
+            trade_date: "2026-10-09".into(),
+            tenor: None,
+        })),
+        as_of_ns: 0,
+    };
+    let Some(Inputs::Tenor(read)) = pair_on_the_platform(&tenor, platform).inputs else {
+        panic!("a tenor stays a tenor");
+    };
+    assert_eq!(read.pair, vec![CASH_EUR.to_string(), CASH_USD.to_string()]);
+    let business = ComputeDateRequest {
+        inputs: Some(Inputs::BusinessDay(BusinessDayInputs {
+            date: "2026-10-09".into(),
+            calendars: vec![USD.into()],
+        })),
+        as_of_ns: 0,
+    };
+    assert_eq!(pair_on_the_platform(&business, platform), business);
+}

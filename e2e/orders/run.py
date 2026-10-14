@@ -340,6 +340,16 @@ def run():
         "step 9, EUR/USD's spot date computed")
     must(spot["date"] == "2026-10-13" and spot["rule"] == "EUR/USD v1",
          f"step 9, EUR/USD traded Friday 9 October spots Tuesday 13 October: {spot}")
+    # The same read by the deployment's own currency records, as a fill's
+    # value date asks it: each LCL- ID translated to the platform's.
+    local = [page("venue", "write", f"/resolve?iso4217={code}")["instrument_id"]
+             for code in ("EUR", "USD")]
+    must(all(one.startswith("LCL-") for one in local),
+         f"step 9, the deployment keeps each currency under its own ID: {local}")
+    by_local = page("venue", "write", f"/spot?pair={local[0]},{local[1]}&trade=2026-10-09")
+    must(by_local["outcome"] == "DATE_OUTCOME_COMPUTED" and by_local["date"] == "2026-10-13"
+         and by_local["rule"] == "EUR/USD v1",
+         f"step 9, EUR/USD's spot read by the deployment's own IDs gets its date: {by_local}")
 
     # 10. The book printed, and rebuilt from its journal line for line.
     before = store_book()
@@ -366,7 +376,8 @@ def run():
           "unplaced facts, one naming no account and counted on the venue's admin view; two "
           "venue-originated fills waiting unmatched, one accepted to a new order at filled, one "
           "answered DK by the ems's tool, the venue hearing both, a later fill waiting on its own; "
-          "EUR/USD's spot date Tuesday 13 October; and meridian-bor rebuild reproducing the book "
+          "EUR/USD's spot date Tuesday 13 October, by the platform's IDs and the deployment's own; "
+          "and meridian-bor rebuild reproducing the book "
           "line for line")
 
 

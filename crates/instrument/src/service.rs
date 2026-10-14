@@ -844,6 +844,22 @@ fn market_of(store: &dyn Store, instrument_id: &str) -> Option<crate::calendars:
     })
 }
 
+/// The platform's ID of a record this deployment holds: its own where it is
+/// one, else the `open_meridian` identifier it holds now, of the record a
+/// merged one became. None for a record with none, or none held.
+fn platform_id(store: &dyn Store, instrument_id: &str) -> Option<String> {
+    if instrument_id.starts_with("INS-") {
+        return None;
+    }
+    let became = crate::replace::current(store, instrument_id).ok()?;
+    let instrument = store.by_id(&became).ok().flatten()?;
+    let platform = instrument
+        .held_now()
+        .find(|held| held.scheme == crate::GLOBAL_ID && held.value.starts_with("INS-"))
+        .map(|held| held.value.clone());
+    platform
+}
+
 /// A calendar or a rule not held, reported by its subject for the
 /// conductor to pull (W3.18).
 fn report_missing(
@@ -900,6 +916,9 @@ fn serve_calendars(bus: &Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>)
                 decode(&envelope, "meridian.v1.ComputeDateRequest")?;
             let now_ns = clock.now_ns();
             let held = held(store.as_ref(), request.as_of_ns)?;
+            let request = crate::calendars::pair_on_the_platform(&request, |instrument| {
+                platform_id(store.as_ref(), instrument)
+            });
             let answered = crate::calendars::compute(
                 &held,
                 &request,
