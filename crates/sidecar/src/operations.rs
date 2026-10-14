@@ -228,6 +228,14 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         request: Request<plugin::ResolveIdentifierParams>,
     ) -> Result<Response<plugin::ResolveIdentifierResult>, Status> {
         let mut message: domain::ResolveIdentifierRequest = self.as_domain(request.into_inner())?;
+        for (i0, held0) in message.provenance.iter().enumerate() {
+            self.known(&format!("provenance[{i0}].kind"), held0.kind, meridian_pb::v1::ProvenanceKind::try_from(held0.kind).is_ok())?;
+            if let Some(held1) = held0.date_basis.as_ref() {
+                if let Some(held2) = held1.rule.as_ref() {
+                    self.known(&format!("provenance[{i0}].date_basis.rule.kind"), held2.kind, meridian_pb::v1::DateRuleKind::try_from(held2.kind).is_ok())?;
+                }
+            }
+        }
         self.known("stated_asset_class", message.stated_asset_class, domain::AssetClass::try_from(message.stated_asset_class).is_ok())?;
         self.known("stated_instrument_type", message.stated_instrument_type, domain::InstrumentType::try_from(message.stated_instrument_type).is_ok())?;
         for stamped0 in message.identifiers.iter_mut() {

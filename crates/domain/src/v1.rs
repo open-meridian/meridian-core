@@ -888,7 +888,8 @@ pub struct ResolveIdentifierRequest {
     /// accepts them (W3.1, contract v10). Unspecified, or empty, is not stated.
     #[prost(enumeration = "AssetClass", tag = "5")]
     pub stated_asset_class: i32,
-    /// An ISO 4217 code.
+    /// An ISO 4217 code: the source's, or, with its entry in provenance, one
+    /// derived by a named rule or supplied by a person (contract v23).
     #[prost(string, tag = "6")]
     pub stated_currency: ::prost::alloc::string::String,
     #[prost(string, tag = "7")]
@@ -897,6 +898,15 @@ pub struct ResolveIdentifierRequest {
     /// v11): a custodian's sweep fund is a money market fund.
     #[prost(enumeration = "InstrumentType", tag = "8")]
     pub stated_instrument_type: i32,
+    /// Where the security's currency came from, where the plugin closed it
+    /// rather than read it from the security's own record (contract v23,
+    /// W3.1): one entry, `stated_currency` by its path, supplied by a named
+    /// person on the plugin's page (the linked account's currency its admin
+    /// set), derived by a named rule, or reported from another of the source's
+    /// records. None where the source stated it. Kept with the offer; a
+    /// currency supplied or derived never narrows a symbol match.
+    #[prost(message, repeated, tag = "9")]
+    pub provenance: ::prost::alloc::vec::Vec<::meridian_pb::v1::Provenance>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ResolveIdentifierReply {

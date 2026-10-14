@@ -938,12 +938,22 @@ message ResolveIdentifierRequest {
   // offers with the instance as their source, in force only when a person
   // accepts them (W3.1, contract v10). Unspecified, or empty, is not stated.
   AssetClass stated_asset_class = 5;
-  // An ISO 4217 code.
+  // An ISO 4217 code: the source's, or, with its entry in provenance, one
+  // derived by a named rule or supplied by a person (contract v23).
   string stated_currency = 6;
   string stated_description = 7;
   // Its type within the stated class, where the source says it (contract
   // v11): a custodian's sweep fund is a money market fund.
   InstrumentType stated_instrument_type = 8;
+
+  // Where the security's currency came from, where the plugin closed it
+  // rather than read it from the security's own record (contract v23,
+  // W3.1): one entry, `stated_currency` by its path, supplied by a named
+  // person on the plugin's page (the linked account's currency its admin
+  // set), derived by a named rule, or reported from another of the source's
+  // records. None where the source stated it. Kept with the offer; a
+  // currency supplied or derived never narrows a symbol match.
+  repeated Provenance provenance = 9;
 }
 
 message ResolveIdentifierReply {
