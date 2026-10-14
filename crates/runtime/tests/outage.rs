@@ -45,6 +45,9 @@ fn the_store_keeps_answering_while_the_platform_is_away() {
             ..Default::default()
         }],
         as_of_ns: stamp,
+        // The minimum a record needs (contract v24, W3.7).
+        stated_description: "a security nobody has seen".into(),
+        currency: "USD".into(),
         ..Default::default()
     };
     let instrument_id = resolve_identifier(&store, &asking, "outage", now_ns())
@@ -104,6 +107,8 @@ fn a_holding_nobody_has_seen_is_recorded_against_a_record_minted_while_the_platf
                 ..Default::default()
             }],
             as_of_ns: stamp,
+            stated_description: "a security nobody has seen".into(),
+            currency: "USD".into(),
             ..Default::default()
         },
         "outage",

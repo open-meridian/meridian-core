@@ -1771,6 +1771,11 @@ pub fn set_attribute(
 /// v10). v8 and v9 journalled `placeholder-moved`, which stands as recorded.
 pub const INSTRUMENT_MERGED: &str = "instrument-merged";
 
+/// The kind of entry that moves what a provisional record held onto the
+/// `INS-` record it resolved to (contract v24, the one-ID spec's
+/// requirement 3, W9.9).
+pub const INSTRUMENT_RESOLVED: &str = "instrument-resolved";
+
 /// Move what the account holds under `placeholder`, a record merged into
 /// another (or before v10 a placeholder replaced by its INS- ID), onto
 /// `instrument`: lines closing each bucket and lot under the one and opening
@@ -1785,6 +1790,7 @@ pub fn follow_replacement(
     ctx: &Context,
     placeholder: &str,
     instrument: &str,
+    resolved: bool,
 ) -> Result<Option<Made>> {
     let mut lines = Vec::new();
     let mut tombstones = Vec::new();
@@ -1911,7 +1917,11 @@ pub fn follow_replacement(
         ctx,
         Draft {
             entry_id: ctx.mint(ids::ENTRY),
-            kind: INSTRUMENT_MERGED,
+            kind: if resolved {
+                INSTRUMENT_RESOLVED
+            } else {
+                INSTRUMENT_MERGED
+            },
             effective_date: ctx.today(),
             reason: String::new(),
             break_ids,

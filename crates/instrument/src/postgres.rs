@@ -46,17 +46,18 @@ const SCHEMA: &[&str] = &[
     include_str!("../migrations/0008_prepared_call.sql"),
     include_str!("../migrations/0009_settlement_calendars.sql"),
     include_str!("../migrations/0010_an_offer_keeps_its_provenance.sql"),
+    include_str!("../migrations/0011_one_id.sql"),
 ];
 
 /// A table the newest file makes. A database that has it has them all, so a
 /// start can check for this one and refuse a database an older release
 /// migrated, rather than failing later on the first record.
-const NEWEST_TABLE: &str = "instrument_date_rule_version";
+const NEWEST_TABLE: &str = "instrument_state";
 
 /// And the column the newest file adds (0008, contract v20: the prepared
 /// change a version was made from), with its table, which a table check
 /// cannot see.
-const NEWEST_COLUMN: (&str, &str) = ("instrument_version", "prepared_call_id");
+const NEWEST_COLUMN: (&str, &str) = ("instrument_replacement", "sequence");
 
 /// Names the schema lock. An arbitrary constant, and it only has to be the same
 /// one in every process that creates this schema.
@@ -362,7 +363,7 @@ impl PostgresStore {
                 "SELECT instrument_id, asset_class, currency, exchange_mic, description,
                         lifecycle_state, version, valid_from_ns, record_time_ns,
                         instrument_type, money_market_fund, listing_venue_id,
-                        binary_event_contract
+                        binary_event_contract, one_id
                    FROM instrument
                   WHERE instrument_id = ANY($1)
                   ORDER BY instrument_id",
@@ -389,6 +390,7 @@ impl PostgresStore {
                 binary_event_contract: row.get(12),
                 sources: Vec::new(),
                 offers: Vec::new(),
+                local: crate::store::Local::from_text(row.get::<_, &str>(13)),
             })
             .collect();
         let index: std::collections::HashMap<String, usize> = instruments
@@ -740,8 +742,8 @@ impl Store for PostgresStore {
                                          description, lifecycle_state, version, valid_from_ns,
                                          record_time_ns, mint_key, instrument_type,
                                          money_market_fund, listing_venue_id,
-                                         binary_event_contract)
-                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                                         binary_event_contract, one_id)
+                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
                  ON CONFLICT (mint_key) WHERE mint_key IS NOT NULL DO NOTHING",
                 &[
                     &candidate.instrument_id,
@@ -758,6 +760,7 @@ impl Store for PostgresStore {
                     &candidate.money_market_fund,
                     &candidate.listing_venue_id,
                     &candidate.binary_event_contract,
+                    &candidate.local.to_text(),
                 ],
             )
             .map_err(unavailable)?
@@ -790,7 +793,7 @@ impl Store for PostgresStore {
                     SET asset_class = $2, currency = $3, exchange_mic = $4, description = $5,
                         lifecycle_state = $6, version = $7, valid_from_ns = $8,
                         record_time_ns = $9, instrument_type = $11, money_market_fund = $12,
-                        listing_venue_id = $13, binary_event_contract = $14
+                        listing_venue_id = $13, binary_event_contract = $14, one_id = $15
                   WHERE instrument_id = $1 AND version = $10",
                 &[
                     &record.instrument_id,
@@ -807,6 +810,7 @@ impl Store for PostgresStore {
                     &record.money_market_fund,
                     &record.listing_venue_id,
                     &record.binary_event_contract,
+                    &record.local.to_text(),
                 ],
             )
             .map_err(unavailable)?;
@@ -943,33 +947,190 @@ impl Store for PostgresStore {
             .collect())
     }
 
-    fn replace(&self, replaced_id: &str, replaced_by: &str, now_ns: i64) -> Result<Replaced> {
+    fn replace_because(
+        &self,
+        replaced_id: &str,
+        replaced_by: &str,
+        cause: i32,
+        now_ns: i64,
+    ) -> Result<Replaced> {
         let mut conn = self.conn()?;
-
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        // One writer numbers at a time, so the sequence has no holes a
+        // reader would take for a loss (W3.22).
+        tx.execute(
+            "LOCK TABLE instrument_replacement IN SHARE ROW EXCLUSIVE MODE",
+            &[],
+        )
+        .map_err(unavailable)?;
         // Conditional, so a redelivery and a race both land on the first
         // pairing: one statement, decided under the primary key.
-        let recorded = conn
+        let recorded = tx
             .execute(
-                "INSERT INTO instrument_replacement (replaced_id, replaced_by, replaced_at_ns)
-                 VALUES ($1, $2, $3)
+                "INSERT INTO instrument_replacement
+                        (replaced_id, replaced_by, replaced_at_ns, cause, sequence)
+                 VALUES ($1, $2, $3, $4,
+                         (SELECT COALESCE(max(sequence), 0) + 1 FROM instrument_replacement))
                  ON CONFLICT (replaced_id) DO NOTHING",
-                &[&replaced_id, &replaced_by, &now_ns],
+                &[&replaced_id, &replaced_by, &now_ns, &cause],
             )
             .map_err(unavailable)?
             == 1;
-
         if recorded {
+            tx.commit().map_err(unavailable)?;
             return Ok(Replaced::Recorded);
         }
-
-        let held: String = conn
+        let held: String = tx
             .query_one(
                 "SELECT replaced_by FROM instrument_replacement WHERE replaced_id = $1",
                 &[&replaced_id],
             )
             .map_err(unavailable)?
             .get(0);
+        tx.commit().map_err(unavailable)?;
         Ok(Replaced::AlreadyRecorded { replaced_by: held })
+    }
+
+    fn replacement_record(
+        &self,
+        replaced_id: &str,
+    ) -> Result<Option<crate::store::ReplacementKept>> {
+        Ok(self
+            .conn()?
+            .query_opt(
+                "SELECT replaced_id, replaced_by, replaced_at_ns, cause, COALESCE(sequence, 0),
+                        backfilled
+                   FROM instrument_replacement WHERE replaced_id = $1",
+                &[&replaced_id],
+            )
+            .map_err(unavailable)?
+            .map(|row| crate::store::ReplacementKept {
+                replaced_id: row.get(0),
+                replaced_by: row.get(1),
+                replaced_at_ns: row.get(2),
+                cause: row.get(3),
+                sequence: row.get(4),
+                backfilled: row.get(5),
+            }))
+    }
+
+    fn replacements_after(
+        &self,
+        sequence: i64,
+        limit: usize,
+    ) -> Result<Vec<crate::store::ReplacementKept>> {
+        Ok(self
+            .conn()?
+            .query(
+                "SELECT replaced_id, replaced_by, replaced_at_ns, cause, sequence, backfilled
+                   FROM instrument_replacement
+                  WHERE sequence > $1
+                  ORDER BY sequence
+                  LIMIT $2",
+                &[&sequence, &(limit as i64)],
+            )
+            .map_err(unavailable)?
+            .into_iter()
+            .map(|row| crate::store::ReplacementKept {
+                replaced_id: row.get(0),
+                replaced_by: row.get(1),
+                replaced_at_ns: row.get(2),
+                cause: row.get(3),
+                sequence: row.get(4),
+                backfilled: row.get(5),
+            })
+            .collect())
+    }
+
+    fn keep_template(
+        &self,
+        template: &meridian_domain::v1::SecurityTemplate,
+        now_ns: i64,
+    ) -> Result<bool> {
+        use prost::Message;
+        Ok(self
+            .conn()?
+            .execute(
+                "INSERT INTO instrument_template (template_id, template_version, record, kept_at_ns)
+                 VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+                &[
+                    &template.template_id,
+                    &template.template_version,
+                    &template.encode_to_vec(),
+                    &now_ns,
+                ],
+            )
+            .map_err(unavailable)?
+            == 1)
+    }
+
+    fn templates(&self) -> Result<Vec<meridian_domain::v1::SecurityTemplate>> {
+        use prost::Message;
+        self.conn()?
+            .query(
+                "SELECT record FROM instrument_template ORDER BY template_id, template_version",
+                &[],
+            )
+            .map_err(unavailable)?
+            .into_iter()
+            .map(|row| {
+                let bytes: Vec<u8> = row.get(0);
+                meridian_domain::v1::SecurityTemplate::decode(bytes.as_slice())
+                    .map_err(|failed| StoreError::Unavailable(failed.to_string()))
+            })
+            .collect()
+    }
+
+    fn keep_licence_list(
+        &self,
+        list: &meridian_domain::v1::LicenceList,
+        now_ns: i64,
+    ) -> Result<bool> {
+        use prost::Message;
+        Ok(self
+            .conn()?
+            .execute(
+                "INSERT INTO instrument_licence_list (version, record, kept_at_ns)
+                 VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+                &[&list.version, &list.encode_to_vec(), &now_ns],
+            )
+            .map_err(unavailable)?
+            == 1)
+    }
+
+    fn licence_list(&self) -> Result<Option<meridian_domain::v1::LicenceList>> {
+        use prost::Message;
+        self.conn()?
+            .query_opt(
+                "SELECT record FROM instrument_licence_list ORDER BY version DESC LIMIT 1",
+                &[],
+            )
+            .map_err(unavailable)?
+            .map(|row| {
+                let bytes: Vec<u8> = row.get(0);
+                meridian_domain::v1::LicenceList::decode(bytes.as_slice())
+                    .map_err(|failed| StoreError::Unavailable(failed.to_string()))
+            })
+            .transpose()
+    }
+
+    fn state(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn()?
+            .query_opt("SELECT value FROM instrument_state WHERE key = $1", &[&key])
+            .map_err(unavailable)?
+            .map(|row| row.get(0)))
+    }
+
+    fn set_state(&self, key: &str, value: &str) -> Result<()> {
+        self.conn()?
+            .execute(
+                "INSERT INTO instrument_state (key, value) VALUES ($1, $2)
+                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                &[&key, &value],
+            )
+            .map_err(unavailable)?;
+        Ok(())
     }
 
     fn replacement_of(&self, instrument_id: &str) -> Result<Option<String>> {

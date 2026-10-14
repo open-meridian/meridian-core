@@ -373,8 +373,9 @@ fn settle(book: &Book, acts: Vec<Act>) -> Result<Vec<Act>> {
 
 /// The entry made: its consequences settled, a new account's first
 /// attributes stated (W9.13), numbered and replayed.
-pub(crate) fn finish(book: &Book, head: u64, ctx: &Context, plan: Plan) -> Result<Made> {
-    let acts = settle(book, plan.acts)?;
+pub(crate) fn finish(book: &Book, head: u64, ctx: &Context, mut plan: Plan) -> Result<Made> {
+    let acts = settle(book, std::mem::take(&mut plan.acts))?;
+    plan.lines = landed(book, std::mem::take(&mut plan.lines));
     let trade = !plan.lines.is_empty();
     let first = first_attributes(book) && is_account(&book.account_id);
     let draft = Draft {
@@ -399,6 +400,37 @@ pub(crate) fn finish(book: &Book, head: u64, ctx: &Context, plan: Plan) -> Resul
         },
     };
     made(book, head, ctx, draft)
+}
+
+/// Each line naming a replaced record lands on the record it became
+/// (contract v24, W11's invariant, W9.9), unless the account still holds a
+/// position under the ID named -- the replacement not yet followed here --
+/// which then moves with it when it is.
+pub(crate) fn landed(book: &Book, lines: Vec<MovementLine>) -> Vec<MovementLine> {
+    lines
+        .into_iter()
+        .map(|mut line| {
+            line.instrument_id = landing(book, &line.instrument_id);
+            line
+        })
+        .collect()
+}
+
+/// The record a write naming `instrument` lands on (see [`landed`]).
+pub(crate) fn landing(book: &Book, instrument: &str) -> String {
+    let became = crate::became::current(instrument);
+    if became == instrument {
+        return became;
+    }
+    let still_held = book
+        .positions
+        .iter()
+        .any(|((held, _, _), position)| held == instrument && !position.removed);
+    if still_held {
+        instrument.to_string()
+    } else {
+        became
+    }
 }
 
 /// The state an order is in, by the fold.
@@ -594,7 +626,7 @@ pub fn propose_order(
     // instrument and side and no allocation instruction of its own;
     // released on creation within the parent, no gate and no wait again.
     let parent = held(book, &link.parent_order_id)?;
-    if request.instrument_id != parent.order.instrument_id {
+    if !crate::became::same(&request.instrument_id, &parent.order.instrument_id) {
         return Err(malformed(
             &["instrument_id"],
             format!(
@@ -2262,7 +2294,7 @@ fn trade_lines(
         execution.settlement_date.clone()
     };
     let sleeve = execution.sleeve.clone();
-    let instrument = execution.instrument_id.clone();
+    let instrument = landing(book, &execution.instrument_id);
     let line = |side: HoldingSide, quantity: Exact| MovementLine {
         instrument_id: instrument.clone(),
         side: side as i32,
@@ -3988,7 +4020,7 @@ pub fn accept_execution(
     crate::booking::local_record_allowed(ctx, &first.execution.instrument_id, "the accept")?;
     for held in &named[1..] {
         let (a, b) = (&first.execution, &held.execution);
-        if a.instrument_id != b.instrument_id {
+        if !crate::became::same(&a.instrument_id, &b.instrument_id) {
             return Err(differ(format!(
                 "execution {} is of {} and {} of {}: one accept answers the executions of one \
                  account, instrument and side",
@@ -4066,7 +4098,7 @@ pub fn accept_execution(
             if !claim_allows(order, ctx) {
                 return Err(claim_refused(order));
             }
-            if order.order.instrument_id != first.execution.instrument_id {
+            if !crate::became::same(&order.order.instrument_id, &first.execution.instrument_id) {
                 return Err(differ(format!(
                     "order {order_id} is of {} and the executions of {}",
                     order.order.instrument_id, first.execution.instrument_id

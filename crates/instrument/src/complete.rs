@@ -845,8 +845,8 @@ pub fn merge_as(
 }
 
 /// W3.5. Keep the platform's answer to a person's ask on the record it names:
-/// its INS- ID joins as an identifier, and its values are offers. The record
-/// at its new version, when anything changed.
+/// its values are offers (until contract v24 its INS- ID joined as an
+/// identifier too). The record at its new version, when anything changed.
 pub fn keep_platform_answer(
     store: &dyn Store,
     for_instrument_id: &str,
@@ -862,41 +862,12 @@ pub fn keep_platform_answer(
         answer.instrument_id, answer.version
     );
     let mut record = held.clone();
-    let mut changes = Vec::new();
 
-    if !answer.instrument_id.is_empty() {
-        let global = Asked {
-            scheme: GLOBAL_ID.into(),
-            value: answer.instrument_id.clone(),
-            source: String::new(),
-        };
-        let others = held_elsewhere(store, &global, &record.instrument_id)?;
-        let keyed_elsewhere = store.by_id(&answer.instrument_id)?.is_some()
-            && current(store, &answer.instrument_id)? != record.instrument_id;
-        if !others.is_empty() || keyed_elsewhere {
-            let mut ids = vec![record.instrument_id.clone()];
-            ids.extend(others);
-            if keyed_elsewhere {
-                ids.push(current(store, &answer.instrument_id)?);
-            }
-            note_conflict(store, vec![global], ids, now_ns)?;
-        } else if !record.holds(&global) {
-            record.identifiers.push(window_for(store, &global)?);
-            record.set_source(Source {
-                acting_through_delegation: String::new(),
-                client_name: String::new(),
-                prepared_call_id: String::new(),
-                field: Field::Identifier,
-                identifier: Some(global.clone()),
-                source: words.clone(),
-                person: String::new(),
-                instance_id: String::new(),
-                recorded_at_ns: now_ns,
-                note: String::new(),
-            });
-            changes.push(identifier_change(&global, &words));
-        }
-    }
+    // From contract v24 the platform's ID is no longer written as an
+    // `open_meridian` identifier (the spec's requirement 2): a provisional
+    // record is resolved to it instead (W3.8), and a record kept before v24
+    // has the values offered, its link made by its migration line (W3.26).
+    let mut changes: Vec<crate::store::Change> = Vec::new();
 
     let offer = |field: Field, value: String, identifier: Option<Asked>| Offer {
         field,
@@ -1113,6 +1084,9 @@ mod tests {
                     ..Default::default()
                 }],
                 as_of_ns: NOW,
+                // The minimum a record needs (contract v24, W3.7).
+                stated_description: "a security reported".into(),
+                currency: "USD".into(),
                 ..Default::default()
             },
             "custody-snaptrade-1",
@@ -1495,7 +1469,12 @@ mod tests {
         );
         assert!(accepted.refusal.is_none());
         assert!(
-            accepted.instrument.unwrap().offers.is_empty(),
+            accepted
+                .instrument
+                .unwrap()
+                .offers
+                .iter()
+                .all(|offer| !offer.instance_id.is_empty()),
             "accepted offers are offers no longer"
         );
     }
@@ -1619,9 +1598,11 @@ mod tests {
     }
 
     #[test]
-    fn the_platforms_answer_adds_its_id_and_offers_the_rest_without_changing_the_key() {
-        // decisions/030, choice 2: the backfill adds the INS- ID and changes
-        // no key; a person's value stands beside a differing platform value.
+    fn the_platforms_answer_offers_its_values_without_changing_the_key() {
+        // decisions/030, choice 2: no key changes; a person's value stands
+        // beside a differing platform value. From contract v24 the INS- ID
+        // is no longer written as an open_meridian identifier (requirement
+        // 2): a provisional record is resolved by the reactor instead.
         let store = MemoryStore::new();
         let id = minted(&store, "iso4217", "USD", "");
         one(
@@ -1657,7 +1638,7 @@ mod tests {
             kept.instrument_id, id,
             "the key is the deployment's for life"
         );
-        assert!(kept.carries(&Asked {
+        assert!(!kept.carries(&Asked {
             scheme: GLOBAL_ID.into(),
             value: answer.instrument_id.clone(),
             source: String::new(),
@@ -1694,6 +1675,8 @@ mod tests {
             &ResolveIdentifierRequest {
                 identifiers: vec![crate::record::asked_to_wire(&ticker())],
                 as_of_ns,
+                stated_description: "a security reported".into(),
+                currency: "USD".into(),
                 ..Default::default()
             },
             "custody-snaptrade-1",
@@ -1729,17 +1712,18 @@ mod tests {
         };
         // The platform's ended identifier is offered only where the record
         // holds it: this record holds the brokerage symbol, not the ticker.
-        let kept = keep_platform_answer(&store, &first, &answer, NOW + 11)
-            .unwrap()
-            .unwrap();
-        assert!(!kept.offers.iter().any(|offer| offer.valid_until_ns > 0));
+        let kept = keep_platform_answer(&store, &first, &answer, NOW + 11).unwrap();
+        assert!(kept
+            .as_ref()
+            .is_none_or(|kept| !kept.offers.iter().any(|offer| offer.valid_until_ns > 0)));
+        let at = kept.map(|kept| kept.version).unwrap_or(1);
 
         // A person ends the symbol, as an accepted end would.
         let ended = one(
             &store,
             &completing(
                 &first,
-                kept.version,
+                at,
                 vec![value(
                     instrument_value::Value::Identifier(PbIdentifier {
                         valid_until_ns: left,

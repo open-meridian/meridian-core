@@ -46,7 +46,8 @@ use meridian_domain::asset_class;
 use meridian_domain::v1::{
     AssetClass, ClaimCodePurpose, DiagnosticBundle, DiagnosticBundleReceipt,
     EscalateInstrumentReply, EscalateInstrumentRequest, Identifier as PbIdentifier,
-    InstrumentRecord as PbInstrument, RedeemClaimCodeReply, VenueRecord,
+    InstrumentRecord as PbInstrument, LicenceList, LicencePace, RedeemClaimCodeReply,
+    ReplacementFeedEntry, SecurityTemplate, VenueRecord,
 };
 use serde::Deserialize;
 
@@ -404,7 +405,7 @@ impl Platform {
         let body = serde_json::to_vec(&escalation_body(request))
             .map_err(|failed| PlatformError::Malformed(failed.to_string()))?;
         let response = self
-            .call(
+            .v24_call(
                 Method::Post,
                 "/api/v1/reference/escalate-instrument",
                 Some(body),
@@ -419,6 +420,71 @@ impl Platform {
             near_match: reply.near_match.unwrap_or(false),
             pending_review: reply.pending_review.unwrap_or(false),
         })
+    }
+
+    /// A route contract v24 added (W3.4, W3.24, W3.25, W3.27, W3.28). A
+    /// platform without it answers 404 -- or 405, 410 or 501 -- and is
+    /// treated as unreachable, never as an answer (the build plan's step 4):
+    /// the store keeps a provisional record, nothing is sent, and the ask is
+    /// tried again on reconnecting.
+    async fn v24_call(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Vec<u8>>,
+        now_ns: i64,
+    ) -> Result<Response, PlatformError> {
+        let response = self.call(method, path, body, now_ns).await?;
+        if matches!(response.status, 404 | 405 | 410 | 501) {
+            return Err(PlatformError::Unreachable {
+                attempts: 1,
+                last: format!(
+                    "the platform does not serve {path} (HTTP {}): a release before contract v24",
+                    response.status
+                ),
+            });
+        }
+        Ok(response)
+    }
+
+    /// W3.24 (contract v24): the template catalogue, only versions after
+    /// `after_version` where one is held. Nothing of the deployment is sent.
+    pub async fn pull_templates(
+        &self,
+        after_version: i64,
+        now_ns: i64,
+    ) -> Result<Vec<SecurityTemplate>, PlatformError> {
+        let path = if after_version > 0 {
+            format!("/api/v1/reference/templates?after_version={after_version}")
+        } else {
+            "/api/v1/reference/templates".to_string()
+        };
+        let response = self.v24_call(Method::Get, &path, None, now_ns).await?;
+        let value = json_of(&response)?;
+        templates_from_json(&value).map_err(PlatformError::Malformed)
+    }
+
+    /// W3.25 (contract v24): the licence list -- the schemes whose
+    /// identifiers a deployment may send, and the pace it sends them at.
+    pub async fn pull_licence_list(&self, now_ns: i64) -> Result<LicenceList, PlatformError> {
+        let response = self
+            .v24_call(Method::Get, "/api/v1/reference/licence-list", None, now_ns)
+            .await?;
+        let value = json_of(&response)?;
+        licence_from_json(&value).map_err(PlatformError::Malformed)
+    }
+
+    /// W3.27 (contract v24): the platform's replacements and decommissions
+    /// after a sequence, the same for every deployment, at most a thousand.
+    pub async fn pull_replacements(
+        &self,
+        after_sequence: i64,
+        now_ns: i64,
+    ) -> Result<Vec<ReplacementFeedEntry>, PlatformError> {
+        let path = format!("/api/v1/reference/replacements?after_sequence={after_sequence}");
+        let response = self.v24_call(Method::Get, &path, None, now_ns).await?;
+        let value = json_of(&response)?;
+        replacements_from_json(&value).map_err(PlatformError::Malformed)
     }
 
     /// W5.19. What this deployment is running, as its components describe
@@ -670,6 +736,152 @@ impl Platform {
     }
 }
 
+/// A 2xx answer's JSON.
+fn json_of(response: &Response) -> Result<serde_json::Value, PlatformError> {
+    if !(200..300).contains(&response.status) {
+        return Err(PlatformError::Refused {
+            status: response.status,
+        });
+    }
+    serde_json::from_slice(&response.body)
+        .map_err(|failed| PlatformError::Malformed(failed.to_string()))
+}
+
+/// A JSON number or a string holding one: the platform writes int64 as a
+/// string (proto3 JSON).
+fn int_of(value: Option<&serde_json::Value>) -> i64 {
+    match value {
+        Some(serde_json::Value::Number(number)) => number.as_i64().unwrap_or(0),
+        Some(serde_json::Value::String(text)) => text.trim().parse().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn text_of(value: Option<&serde_json::Value>) -> String {
+    match value {
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(serde_json::Value::Number(number)) => number.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// The catalogue as the platform's JSON spells it (W3.24): each template's
+/// class and type by the ruled spelling, an unknown one refused.
+pub fn templates_from_json(value: &serde_json::Value) -> Result<Vec<SecurityTemplate>, String> {
+    let mut out = Vec::new();
+    for item in value
+        .get("templates")
+        .and_then(|templates| templates.as_array())
+        .ok_or("the answer carries no templates")?
+    {
+        let template_id = text_of(item.get("template_id"));
+        if !template_id.starts_with("TPL-") {
+            return Err(format!(
+                "a template arrived as {template_id:?}, not the platform's"
+            ));
+        }
+        let class = text_of(item.get("asset_class"));
+        let asset_class = asset_class::read(&class).ok_or_else(|| {
+            format!("{template_id} names asset class {class:?}, which the schema does not define")
+        })?;
+        let kind = text_of(item.get("instrument_type"));
+        let instrument_type = meridian_domain::instrument_type::read(&kind).ok_or_else(|| {
+            format!("{template_id} names type {kind:?}, which the schema does not define")
+        })?;
+        out.push(SecurityTemplate {
+            template_version: text_of(item.get("template_version")),
+            name: text_of(item.get("name")),
+            asset_class: asset_class as i32,
+            instrument_type: instrument_type as i32,
+            base: item
+                .get("base")
+                .and_then(|base| base.as_bool())
+                .unwrap_or(false),
+            calculation: text_of(item.get("calculation")),
+            fields: item
+                .get("fields")
+                .and_then(|fields| fields.as_array())
+                .map(|fields| {
+                    fields
+                        .iter()
+                        .map(|field| meridian_domain::v1::TemplateField {
+                            path: text_of(field.get("path")),
+                            r#type: text_of(field.get("type")),
+                            required: field
+                                .get("required")
+                                .and_then(|r| r.as_bool())
+                                .unwrap_or(false),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            match_rule: item
+                .get("match_rule")
+                .and_then(|rule| rule.as_array())
+                .map(|rule| rule.iter().map(|scheme| text_of(Some(scheme))).collect())
+                .unwrap_or_default(),
+            template_id,
+        });
+    }
+    Ok(out)
+}
+
+/// The licence list as the platform's JSON spells it (W3.25). A list naming
+/// the deployment-only scheme is refused: it never leaves a deployment.
+pub fn licence_from_json(value: &serde_json::Value) -> Result<LicenceList, String> {
+    let schemes: Vec<String> = value
+        .get("schemes")
+        .and_then(|schemes| schemes.as_array())
+        .ok_or("the answer carries no schemes")?
+        .iter()
+        .map(|scheme| text_of(Some(scheme)))
+        .filter(|scheme| !scheme.is_empty())
+        .collect();
+    if schemes.iter().any(|scheme| scheme == "open_meridian_local") {
+        return Err(
+            "a licence list naming open_meridian_local, which never leaves a deployment".into(),
+        );
+    }
+    let pace = value.get("pace");
+    Ok(LicenceList {
+        version: int_of(value.get("version")),
+        schemes,
+        pace: Some(LicencePace {
+            batch_size: (int_of(pace.and_then(|pace| pace.get("batch_size"))) as i32).clamp(0, 100),
+            batches_per_minute: int_of(pace.and_then(|pace| pace.get("batches_per_minute"))) as i32,
+        }),
+    })
+}
+
+/// The replacement feed as the platform's JSON spells it (W3.27).
+pub fn replacements_from_json(
+    value: &serde_json::Value,
+) -> Result<Vec<ReplacementFeedEntry>, String> {
+    value
+        .get("entries")
+        .and_then(|entries| entries.as_array())
+        .ok_or_else(|| "the answer carries no entries".to_string())?
+        .iter()
+        .map(|entry| {
+            let instrument_id = text_of(entry.get("instrument_id"));
+            if !instrument_id.starts_with("INS-") {
+                return Err(format!(
+                    "a replacement names {instrument_id:?}, not a platform record"
+                ));
+            }
+            Ok(ReplacementFeedEntry {
+                sequence: int_of(entry.get("sequence")),
+                instrument_id,
+                replaced_by: text_of(entry.get("replaced_by")),
+                decommissioned: entry
+                    .get("decommissioned")
+                    .and_then(|d| d.as_bool())
+                    .unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
 /// EscalateInstrument's request as the platform's JSON spells it (W3.4,
 /// contract v24): the asset class in lower case without its prefix (ruled
 /// 2026-10-14), each offered field by its path with its source's words.
@@ -789,6 +1001,11 @@ struct WireRecord {
     valid_from_ns: i64,
     #[serde(default)]
     record_time_ns: i64,
+    /// Contract v24 (W1.25, W3.4): the template it was minted from.
+    #[serde(default)]
+    template_id: String,
+    #[serde(default)]
+    template_version: String,
 }
 
 /// meridian.v1.BinaryEventContract as the platform's answer carries it.
@@ -1065,6 +1282,8 @@ fn into_record(record: WireRecord) -> Result<PbInstrument, PlatformError> {
         version: record.version,
         valid_from_ns: record.valid_from_ns,
         record_time_ns: record.record_time_ns,
+        template_id: record.template_id,
+        template_version: record.template_version,
         ..Default::default()
     })
 }
@@ -1252,6 +1471,18 @@ pub(crate) mod tests {
 
         pub(crate) fn calls(&self) -> usize {
             self.seen.lock().unwrap().len()
+        }
+
+        /// Each request's body, as text.
+        pub(crate) fn bodies(&self) -> Vec<String> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|request| {
+                    String::from_utf8_lossy(request.body.as_deref().unwrap_or_default()).to_string()
+                })
+                .collect()
         }
 
         /// The claims of the note sent on one request.

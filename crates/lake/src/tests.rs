@@ -45,13 +45,16 @@ fn harness() -> Harness {
     // The instrument store, stood in: four records, USD by its code.
     bus.serve(service::RESOLVE_INSTRUMENT, |envelope| {
         let asked = ResolveInstrumentRequest::decode(&envelope.payload[..]).unwrap();
-        let found = [BTC, USD, USDC, AAPL, "LCL-OLD"].contains(&asked.instrument_id.as_str());
+        let found =
+            [BTC, USD, USDC, AAPL, "LCL-OLD", LOCAL].contains(&asked.instrument_id.as_str());
         Ok((
             "meridian.v1.ResolveInstrumentReply".into(),
             ResolveInstrumentReply {
                 found,
                 instrument: found.then(|| InstrumentRecord {
                     instrument_id: asked.instrument_id.clone(),
+                    // A provisional record (contract v24): a local line.
+                    provisional: asked.instrument_id == LOCAL,
                     ..Default::default()
                 }),
             }
@@ -573,6 +576,43 @@ async fn a_read_not_answered_is_wanted_once_for_two_readers_answered_and_a_decli
         again.unanswered[0].reason,
         UnansweredReason::NotCovered as i32
     );
+}
+
+/// A provisional record (contract v24).
+const LOCAL: &str = "LCL-01J8LOCAL0000000000000000";
+
+/// Contract v24 (W10.6, W10.7): a local line is never priced, so its
+/// subject is never wanted; another subject in the same read still is.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_local_lines_subject_is_never_wanted() {
+    let h = harness();
+    let mut wanted = h.bus.subscribe(service::OBSERVATIONS_WANTED);
+    read(
+        &h,
+        "reporting-1",
+        &[LOCAL],
+        "2026-10-07",
+        SourceChoice::default(),
+        0,
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(150), wanted.recv())
+            .await
+            .is_err(),
+        "nothing wanted for a provisional record"
+    );
+    read(
+        &h,
+        "reporting-1",
+        &[LOCAL, BTC],
+        "2026-10-07",
+        SourceChoice::default(),
+        0,
+    );
+    let want = ObservationsWantedEvent::decode(&wanted.recv().await.unwrap().envelope.payload[..])
+        .unwrap();
+    let subjects: Vec<&str> = want.subjects.iter().map(|s| s.entity_id.as_str()).collect();
+    assert_eq!(subjects, vec![BTC]);
 }
 
 #[tokio::test(flavor = "multi_thread")]

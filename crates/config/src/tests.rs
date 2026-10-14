@@ -107,11 +107,15 @@ fn harness_keyed(instance: &str, key: SettingsKey) -> Harness {
     bus.serve(RESOLVE_INSTRUMENT, |envelope| {
         let asked =
             meridian_domain::v1::ResolveInstrumentRequest::decode(&envelope.payload[..]).unwrap();
-        let found = asked.instrument_id.starts_with("INS-");
+        // A local record resolved (contract v24): LCL-RSLV-n became INS-n.
+        let resolved = asked.instrument_id.strip_prefix("LCL-RSLV-");
+        let found = asked.instrument_id.starts_with("INS-") || resolved.is_some();
         let reply = meridian_domain::v1::ResolveInstrumentReply {
             found,
             instrument: found.then(|| meridian_domain::v1::InstrumentRecord {
-                instrument_id: asked.instrument_id.clone(),
+                instrument_id: resolved
+                    .map(|n| format!("INS-{n}"))
+                    .unwrap_or_else(|| asked.instrument_id.clone()),
                 ..Default::default()
             }),
         };
@@ -2065,6 +2069,56 @@ async fn a_table_cell_names_an_account_the_plugin_reported_or_links_and_an_instr
         .await
         .unwrap_err();
     assert!(refused.contains("plan_code_links[1].account"), "{refused}");
+}
+
+/// Contract v24 (the one-ID spec's requirement 10, W3.26): an instrument
+/// cell naming a replaced record is re-pointed by core, a recorded settings
+/// change whose "who" is the resolution rule naming the replacement.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_instrument_cell_naming_a_replaced_record_is_re_pointed_as_a_recorded_change() {
+    let h = harness("dashboard-1");
+    let mut declared = declared();
+    declared.push(plan_codes());
+    reported(&h, true, declared, 1).await;
+    linked(&h, &["st-1", "st-2"]);
+    let table = r#"[{"account":"st-1","code":"OQKR","instrument":"LCL-RSLV-7"},{"account":"st-2","code":"ABCD","instrument":"INS-8"}]"#;
+    set(&h, "oms-1", &[("plan_code_links", table)], &[])
+        .await
+        .unwrap();
+
+    let (bus, store) = (Arc::clone(&h.bus), h.store.clone() as Arc<dyn Store>);
+    let upstream = h.platform.clone() as Arc<dyn Upstream>;
+    let moved = tokio::task::spawn_blocking(move || {
+        crate::service::repoint_now(
+            bus,
+            store,
+            Arc::new(FixedClock),
+            upstream,
+            Arc::new(SettingsKey::holding(&[7u8; 32])),
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(moved, 1);
+    let record = records(&h)
+        .await
+        .plugin_settings
+        .into_iter()
+        .find(|record| record.plugin_instance_id == "oms-1")
+        .unwrap();
+    let rows = rows_of(&record);
+    assert_eq!(rows[0].cells["instrument"], "INS-7");
+    assert!(
+        rows[0].changed_by.contains("the resolution rule"),
+        "{:?}",
+        rows[0]
+    );
+    assert_eq!(
+        rows[1].cells["instrument"], "INS-8",
+        "an unreplaced cell stays"
+    );
+    assert!(!rows[1].changed_by.contains("resolution rule"));
 }
 
 #[tokio::test]

@@ -814,12 +814,16 @@ pub async fn follow_one(
         .instrument
         .map(|record| record.instrument_id)
         .unwrap_or_default();
+    // Every same-instrument check compares the record each ID became
+    // (contract v24, W11's invariant).
+    crate::became::record(&event.replaced_instrument_id, &instrument);
     let meta = envelope.meta.clone().unwrap_or_default();
     move_accounts(
         bus,
         store,
         &event.replaced_instrument_id,
         &instrument,
+        resolved_by(event.cause),
         &meta.correlation_id,
         &meta.message_id,
     )
@@ -830,10 +834,20 @@ pub async fn follow_one(
 /// and follow each one replaced, as the event would have.
 pub async fn sweep_replacements(bus: &Arc<Bus>, store: &Arc<dyn Store>) -> Result<usize, String> {
     let listing = Arc::clone(store);
-    let placeholders = tokio::task::spawn_blocking(move || listing.instruments_held())
-        .await
-        .map_err(|failed| format!("the sweep task failed: {failed}"))?
-        .map_err(|failed| failed.to_string())?;
+    // What the book holds, and from contract v24 what its open orders name:
+    // an open order's later fill compares through the replacement.
+    let placeholders = tokio::task::spawn_blocking(move || {
+        let mut named = listing.instruments_held()?;
+        for instrument in listing.live_order_instruments()? {
+            if !named.contains(&instrument) {
+                named.push(instrument);
+            }
+        }
+        crate::store::Result::Ok(named)
+    })
+    .await
+    .map_err(|failed| format!("the sweep task failed: {failed}"))?
+    .map_err(|failed| failed.to_string())?;
     let mut moved = 0;
     for placeholder in placeholders {
         let (payload_type, payload) = bus
@@ -859,7 +873,22 @@ pub async fn sweep_replacements(bus: &Arc<Bus>, store: &Arc<dyn Store>) -> Resul
         if record.instrument_id == placeholder || record.instrument_id.is_empty() {
             continue;
         }
-        moved += move_accounts(bus, store, &placeholder, &record.instrument_id, "", "").await?;
+        crate::became::record(&placeholder, &record.instrument_id);
+        // A resolution carries the provisional record's ID under
+        // open_meridian_local (contract v24, W3.8); anything else a merge.
+        let resolved = record.identifiers.iter().any(|identifier| {
+            identifier.scheme == "open_meridian_local" && identifier.value == placeholder
+        });
+        moved += move_accounts(
+            bus,
+            store,
+            &placeholder,
+            &record.instrument_id,
+            resolved,
+            "",
+            "",
+        )
+        .await?;
     }
     Ok(moved)
 }
@@ -877,11 +906,18 @@ pub async fn sweep_forever(bus: Arc<Bus>, store: Arc<dyn Store>, every: Duration
 
 /// W9.9's one path, for the event and the sweep: each account holding the
 /// replaced record moved in its own entry, in its own partition.
+/// Whether a replacement is a provisional record resolved (contract v24,
+/// `REPLACEMENT_CAUSE_RESOLVED`), journalled `instrument-resolved`.
+fn resolved_by(cause: i32) -> bool {
+    cause == meridian_domain::v1::ReplacementCause::Resolved as i32
+}
+
 async fn move_accounts(
     bus: &Arc<Bus>,
     store: &Arc<dyn Store>,
     placeholder: &str,
     instrument: &str,
+    resolved: bool,
     correlation: &str,
     causation: &str,
 ) -> Result<usize, String> {
@@ -908,7 +944,14 @@ async fn move_accounts(
                 ..Default::default()
             };
             let acted = moving.act(&account, "", "", &[], &mut |book, head| {
-                match decide::follow_replacement(book, head, &ctx, &placeholder, &instrument)? {
+                match decide::follow_replacement(
+                    book,
+                    head,
+                    &ctx,
+                    &placeholder,
+                    &instrument,
+                    resolved,
+                )? {
                     Some(made) => {
                         let reply = entry_reply(&made).encode_to_vec();
                         Ok(decided(made, reply))

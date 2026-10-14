@@ -234,8 +234,23 @@ fn run() -> Result<(), String> {
             clock(),
         );
         tokio::spawn(Arc::clone(&calendars).start());
+        // Contract v24 (W3.24, W3.25, W3.27): the licence list, the template
+        // catalogue and the replacement feed, pulled on start, daily and on
+        // reconnecting, for the instrument store; the list is what every
+        // ask sends by.
+        let licence: meridian_conductor::reference::Licence = Arc::default();
+        tokio::spawn(
+            Arc::new(meridian_conductor::reference::ReferencePuller::new(
+                Arc::clone(&bus),
+                Arc::clone(&platform),
+                clock(),
+                Arc::clone(&licence),
+            ))
+            .start(),
+        );
         Conductor::new(Arc::clone(&bus), Arc::clone(&platform), clock())
             .with_calendars(Arc::clone(&calendars))
+            .with_licence(licence)
             .serve();
 
         // W3.15 (contract v18): a venue a plugin reported missing, asked of

@@ -92,8 +92,92 @@ impl Store for MemoryStore {
         Ok(self.read()?.conflicts())
     }
 
-    fn replace(&self, replaced_id: &str, replaced_by: &str, now_ns: i64) -> Result<Replaced> {
-        Ok(self.write_lock()?.replace(replaced_id, replaced_by, now_ns))
+    fn replace_because(
+        &self,
+        replaced_id: &str,
+        replaced_by: &str,
+        cause: i32,
+        now_ns: i64,
+    ) -> Result<Replaced> {
+        Ok(self
+            .write_lock()?
+            .replace(replaced_id, replaced_by, cause, now_ns))
+    }
+
+    fn replacement_record(
+        &self,
+        replaced_id: &str,
+    ) -> Result<Option<crate::store::ReplacementKept>> {
+        Ok(self
+            .read()?
+            .replacement_log
+            .iter()
+            .find(|kept| kept.replaced_id == replaced_id)
+            .cloned())
+    }
+
+    fn replacements_after(
+        &self,
+        sequence: i64,
+        limit: usize,
+    ) -> Result<Vec<crate::store::ReplacementKept>> {
+        Ok(self
+            .read()?
+            .replacement_log
+            .iter()
+            .filter(|kept| kept.sequence > sequence)
+            .take(limit)
+            .cloned()
+            .collect())
+    }
+
+    fn keep_template(
+        &self,
+        template: &meridian_domain::v1::SecurityTemplate,
+        _now_ns: i64,
+    ) -> Result<bool> {
+        let key = (
+            template.template_id.clone(),
+            template.template_version.clone(),
+        );
+        let mut held = self.write_lock()?;
+        if held.templates.contains_key(&key) {
+            return Ok(false);
+        }
+        held.templates.insert(key, template.clone());
+        Ok(true)
+    }
+
+    fn templates(&self) -> Result<Vec<meridian_domain::v1::SecurityTemplate>> {
+        Ok(self.read()?.templates.values().cloned().collect())
+    }
+
+    fn keep_licence_list(
+        &self,
+        list: &meridian_domain::v1::LicenceList,
+        _now_ns: i64,
+    ) -> Result<bool> {
+        let mut held = self.write_lock()?;
+        if held.licence_lists.contains_key(&list.version) {
+            return Ok(false);
+        }
+        held.licence_lists.insert(list.version, list.clone());
+        Ok(true)
+    }
+
+    fn licence_list(&self) -> Result<Option<meridian_domain::v1::LicenceList>> {
+        Ok(self.read()?.licence_lists.values().last().cloned())
+    }
+
+    fn state(&self, key: &str) -> Result<Option<String>> {
+        Ok(self.read()?.state.get(key).cloned())
+    }
+
+    fn set_state(&self, key: &str, value: &str) -> Result<()> {
+        self.write_lock()?
+            .state
+            .insert(key.to_string(), value.to_string());
+        Ok(())
     }
 
     fn replacement_of(&self, instrument_id: &str) -> Result<Option<String>> {
@@ -199,6 +283,7 @@ mod tests {
             listing_venue_id: String::new(),
             sources: Vec::new(),
             offers: Vec::new(),
+            ..Default::default()
         }
     }
 

@@ -450,6 +450,139 @@ impl Context {
         self.store.snapshot().map_err(|failed| failed.to_string())
     }
 
+    /// What the instrument store says a record became (contract v24, W3.8):
+    /// its own ID where it was not replaced; `None` where it holds none.
+    fn instrument_became(&self, instrument_id: &str) -> Result<Option<String>, String> {
+        let handle = tokio::runtime::Handle::try_current().map_err(|failed| failed.to_string())?;
+        let (payload_type, payload) = handle
+            .block_on(
+                self.bus.call(
+                    RESOLVE_INSTRUMENT,
+                    "meridian.v1.ResolveInstrumentRequest",
+                    ResolveInstrumentRequest {
+                        instrument_id: instrument_id.to_string(),
+                        as_of_ns: self.clock.now_ns(),
+                    }
+                    .encode_to_vec(),
+                    None,
+                    Some(INSTRUMENT_WAIT),
+                ),
+            )
+            .map_err(|failed| failed.to_string())?;
+        if payload_type != "meridian.v1.ResolveInstrumentReply" {
+            return Err(format!("the instrument store answered {payload_type}"));
+        }
+        let reply =
+            ResolveInstrumentReply::decode(&payload[..]).map_err(|failed| failed.to_string())?;
+        Ok(reply
+            .instrument
+            .filter(|_| reply.found)
+            .map(|record| record.instrument_id))
+    }
+
+    /// Re-point every instrument cell of a plugin's settings tables naming a
+    /// replaced record (contract v24, the one-ID spec's requirement 10;
+    /// W3.26): each table changed is a recorded settings change, its "who"
+    /// the resolution rule naming the replacement, its rows stamped so; the
+    /// page and the plugin then show one ID. Answers how many tables.
+    pub(crate) fn repoint_settings(&self) -> Result<usize, String> {
+        let before = self.snapshot()?;
+        let now = self.clock.now_ns();
+        let mut became: BTreeMap<String, Option<String>> = BTreeMap::new();
+        let mut changed_tables = 0;
+        let plugins: Vec<String> = before.declared_settings.keys().cloned().collect();
+        for plugin in plugins {
+            let mut changes = Vec::new();
+            let mut said = Vec::new();
+            for (declaration, held) in declared_and_stored(&before, &plugin) {
+                if !setting_table::is_table(declaration) {
+                    continue;
+                }
+                let columns: Vec<&str> = declaration
+                    .columns
+                    .iter()
+                    .filter(|column| {
+                        SettingColumnType::try_from(column.r#type)
+                            == Ok(SettingColumnType::Instrument)
+                    })
+                    .map(|column| column.name.as_str())
+                    .collect();
+                if columns.is_empty() {
+                    continue;
+                }
+                let Some(Held::Plain(text)) = held_reading(declaration, held, &plugin) else {
+                    continue;
+                };
+                let Ok(rows) = setting_table::parse(text) else {
+                    continue;
+                };
+                let mut cells: Vec<_> = rows.iter().map(|row| row.cells.clone()).collect();
+                let mut moved = Vec::new();
+                for row in cells.iter_mut() {
+                    for column in &columns {
+                        let Some(value) = row.get(*column).map(|v| v.trim().to_string()) else {
+                            continue;
+                        };
+                        if value.is_empty() {
+                            continue;
+                        }
+                        let now_is = match became.get(&value) {
+                            Some(known) => known.clone(),
+                            None => {
+                                let known = self.instrument_became(&value)?;
+                                became.insert(value.clone(), known.clone());
+                                known
+                            }
+                        };
+                        if let Some(now_is) = now_is.filter(|now_is| *now_is != value) {
+                            row.insert(column.to_string(), now_is.clone());
+                            moved.push(format!("{value} became {now_is}"));
+                        }
+                    }
+                }
+                if moved.is_empty() {
+                    continue;
+                }
+                let by = format!("the resolution rule: {}", moved.join(", "));
+                changes.push(SettingChange {
+                    name: declaration.name.clone(),
+                    held: Some(Held::Plain(setting_table::written(
+                        &setting_table::stamped(&cells, &rows, &by, now),
+                    ))),
+                    hint: String::new(),
+                });
+                said.extend(moved);
+            }
+            if changes.is_empty() {
+                continue;
+            }
+            let author = SettingsAuthor {
+                by: "the resolution rule".into(),
+                delegation: String::new(),
+                client: String::new(),
+                note: format!(
+                    "re-pointed by core, the record each named having been replaced \
+                     (contract v24, W3.8): {}",
+                    said.join("; ")
+                ),
+                prepared_call_id: String::new(),
+            };
+            self.store
+                .put_plugin_settings(&plugin, &changes, &author, now)
+                .map_err(|failed| failed.to_string())?;
+            changed_tables += changes.len();
+            tracing::info!(
+                plugin,
+                tables = changes.len(),
+                "settings cells re-pointed to the records they became"
+            );
+        }
+        if changed_tables > 0 {
+            self.announce(&before)?;
+        }
+        Ok(changed_tables)
+    }
+
     /// Whether the instrument store holds a record by this ID, asked from a
     /// handler's blocking thread; or why it could not be told.
     fn instrument_held(&self, instrument_id: &str) -> Result<bool, String> {
@@ -793,6 +926,30 @@ pub fn serve(
     )
 }
 
+/// One sweep of settings cells naming a replaced record (requirement 10),
+/// for a test to drive without waiting for the hourly one.
+#[cfg(test)]
+pub(crate) fn repoint_now(
+    bus: Arc<Bus>,
+    store: Arc<dyn Store>,
+    clock: Arc<dyn Clock>,
+    upstream: Arc<dyn Upstream>,
+    key: Arc<SettingsKey>,
+) -> Result<usize, String> {
+    Context {
+        bus,
+        store,
+        clock,
+        upstream,
+        key,
+        reported: Mutex::new(BTreeMap::new()),
+        grant: crate::archive::ArchiveGrant::default(),
+        kinds: Mutex::new(BTreeMap::new()),
+        registered: Mutex::new(BTreeSet::new()),
+    }
+    .repoint_settings()
+}
+
 /// [`serve`], for a deployment whose install named where archives are kept
 /// (W7.1, W8.7, contract v16): what a write-once hold is refused against.
 pub fn serve_with(
@@ -818,6 +975,25 @@ pub fn serve_with(
     // Links made before an account held one external account at most are
     // kept, and said, for a deployment admin to separate (W6.4). Off the
     // runtime, since the store blocks on its socket.
+    // Settings cells naming a replaced record, re-pointed (contract v24,
+    // requirement 10): swept soon after a start and then hourly, since the
+    // conductor hears no replacement itself.
+    let sweeping = Arc::clone(&context);
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        loop {
+            let cx = Arc::clone(&sweeping);
+            match tokio::task::spawn_blocking(move || cx.repoint_settings()).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(failed)) => {
+                    tracing::info!(%failed, "settings were not re-pointed this time")
+                }
+                Err(failed) => tracing::warn!(%failed, "the settings sweep failed"),
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        }
+    });
+
     let reading = Arc::clone(&context);
     tokio::task::spawn_blocking(move || {
         if let Ok(snapshot) = reading.snapshot() {

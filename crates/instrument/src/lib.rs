@@ -27,7 +27,9 @@ pub mod calendars;
 pub mod complete;
 pub mod ids;
 pub mod list;
+pub mod one_id;
 pub mod postgres;
+pub mod reask;
 pub mod record;
 pub mod replace;
 pub mod resolve;
@@ -84,6 +86,14 @@ impl InstrumentService {
             self.store.clone(),
             self.clock.clone(),
         );
+        // What the conductor pulled of the platform's reference data
+        // (contract v24, W3.24, W3.25, W3.27), subscribed before anything
+        // is in place.
+        let reference = service::keep_reference_forever(
+            Arc::clone(&self.bus),
+            self.store.clone(),
+            self.clock.clone(),
+        );
         let writing = Arc::new(Mutex::new(()));
         service::serve_all(
             &self.bus,
@@ -91,10 +101,19 @@ impl InstrumentService {
             self.clock.clone(),
             writing.clone(),
         );
+        let reference = reference(writing.clone());
+        // Asking the platform again, and the upgrade's migration (W3.4,
+        // W3.25, W3.26), at the licence list's pace.
+        let asking = service::ask_again_forever(
+            Arc::clone(&self.bus),
+            self.store.clone(),
+            self.clock.clone(),
+            writing.clone(),
+        );
         let reactor =
             Reactor::sharing(self.bus, self.store, self.clock, writing).consume(pulled, missing);
         async move {
-            tokio::join!(reactor, calendars);
+            tokio::join!(reactor, calendars, reference, asking);
         }
     }
 }

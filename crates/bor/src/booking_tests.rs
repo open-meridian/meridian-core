@@ -981,3 +981,64 @@ async fn the_base_currency_is_a_balance_and_every_other_currency_opens_lots() {
     );
     assert_eq!(paid.lots.len(), 1);
 }
+
+/// Contract v24 (W11's invariant, the one-ID spec's requirement 8): an open
+/// order on a local record, the record resolved before its fill -- the fill
+/// lands on the `INS-` record, the order keeping its ID; a child naming the
+/// record it became is under the same instrument as its parent.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_open_orders_fill_after_its_record_resolved_lands_on_the_record_it_became() {
+    let w = wired();
+    account(&w, ACC).await;
+    let mut request = buy("5");
+    request.instrument_id = RESOLVING.into();
+    let order = propose(&w, &request).await.unwrap();
+    order_command(
+        &w,
+        RELEASE_ORDER,
+        "meridian.v1.ReleaseOrderRequest",
+        &ReleaseOrderRequest {
+            order_id: order.order_id.clone(),
+            idempotency_key: String::new(),
+        },
+        &anywhere(TRADER),
+    )
+    .await
+    .unwrap();
+    let placement = place(&w, &order.order_id, "5", &anywhere(TRADER))
+        .await
+        .unwrap()
+        .placement
+        .unwrap();
+    // The platform answers: the local record is replaced (W3.8).
+    crate::became::record(RESOLVING, RESOLVED);
+    let reply = send_from(
+        &w.bus,
+        REPORT_EXECUTION,
+        "meridian.v1.ReportExecutionRequest",
+        &fill(&placement.placement_id, "5", "RSLV-1"),
+        &As {
+            person: None,
+            scope: None,
+            allowed: false,
+        },
+    )
+    .await
+    .unwrap();
+    let execution = FactReply::decode(&reply[..]).unwrap().execution.unwrap();
+    assert_eq!(execution.instrument_id, RESOLVING, "kept as named");
+    let held = positions_of(&w, ACC);
+    assert!(held
+        .iter()
+        .any(|p| p.instrument_id == RESOLVED && read(&p.trade_date_quantity) == "5"));
+    assert!(!held.iter().any(|p| p.instrument_id == RESOLVING));
+    // A child naming the record it became is the parent's instrument.
+    let mut child = buy("1");
+    child.instrument_id = RESOLVED.into();
+    child.link = Some(meridian_domain::v1::OrderLink {
+        parent_order_id: order.order_id.clone(),
+        ..Default::default()
+    });
+    let refused = propose(&w, &child).await.err().unwrap_or_default();
+    assert!(!refused.contains("instrument"), "{refused}");
+}

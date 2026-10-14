@@ -34,6 +34,10 @@ const EUR: &str = "INS-01J8XQ4M7K00000000CASHEUR";
 /// A local record (contract v24, W3.7): provisional, an order on it the
 /// escape hatch (W11's invariant).
 const LOCAL: &str = "LCL-01J8XQ4M7K0000000000LOCL";
+/// A local record the platform later answers (contract v24, W3.8), and
+/// the `INS-` record it resolves to.
+const RESOLVING: &str = "LCL-01J8XQ4M7K0000000000RSLV";
+const RESOLVED: &str = "INS-01J8XQ4M7K0000000000RSLV";
 /// The bus's own instance: in these tests the `ems`, the `oms` and the
 /// connectivity plugin at once.
 const ME: &str = "oems-1";
@@ -66,10 +70,11 @@ fn wired() -> Wired {
             NOCCY => Some(record(AssetClass::Equity, "")),
             CHF => Some(record(AssetClass::Cash, "CHF")),
             EUR => Some(record(AssetClass::Cash, "EUR")),
-            LOCAL => Some(InstrumentRecord {
+            LOCAL | RESOLVING => Some(InstrumentRecord {
                 provisional: true,
                 ..record(AssetClass::Equity, "CHF")
             }),
+            RESOLVED => Some(record(AssetClass::Equity, "CHF")),
             _ => None,
         };
         Ok((

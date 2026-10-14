@@ -93,6 +93,11 @@ pub fn list_to_complete(
             )
         });
         found
+    } else if request.provisional {
+        // Contract v24 (W3.11): the provisional records, complete or not.
+        live.iter()
+            .filter(|record| record.local.provisional)
+            .collect()
     } else if request.instrument_id.is_empty() {
         live.iter()
             .filter(|record| request.include_complete || !complete(record))
@@ -129,7 +134,11 @@ pub fn list_to_complete(
                 .collect(),
             complete_for_book: complete_for_book(record),
             complete: complete(record),
-            provisional_reason: 0,
+            provisional_reason: if record.local.provisional {
+                record.local.reason
+            } else {
+                0
+            },
         })
         .collect();
     let next_cursor = if start + page.len() < chosen.len() {
@@ -173,8 +182,8 @@ pub fn list_to_complete(
         incomplete_for_book,
         incomplete,
         licensed_identifiers,
-        migration_counts: None,
-        backfill_counts: Vec::new(),
+        migration_counts: crate::reask::migration_counts(store, &live)?,
+        backfill_counts: crate::reask::backfill_counts(store, &live),
     })
 }
 
@@ -262,6 +271,9 @@ mod tests {
                     ..Default::default()
                 }],
                 as_of_ns: NOW,
+                // The minimum a record needs (contract v24, W3.7).
+                stated_description: "a security reported".into(),
+                currency: "USD".into(),
                 ..Default::default()
             },
             "custody-1",

@@ -623,7 +623,7 @@ fn booking_lines(
     let fills = fill_lots(book, execution_ids);
     let method = method_of(book);
     let buy = buys(executed.side);
-    let instrument = executed.instrument_id.clone();
+    let instrument = crate::order_decide::landing(book, &executed.instrument_id);
     let sleeve = executed.sleeve.clone();
     let date = executed.value_date.clone();
     for allocation in allocations {
@@ -1064,7 +1064,7 @@ pub fn book_order(
             });
         }
         if let Some(first) = first {
-            let differs = if first.instrument_id != execution.instrument_id {
+            let differs = if !crate::became::same(&first.instrument_id, &execution.instrument_id) {
                 Some("instrument")
             } else if first.side != execution.side {
                 Some("side")
@@ -1455,7 +1455,7 @@ pub fn child_moves(book: &Book, booking_id: &str, ctx: &Context) -> Result<Vec<C
             from_account: book.account_id.clone(),
             allocation,
             member_order_id,
-            instrument_id: executed.instrument_id.clone(),
+            instrument_id: crate::became::current(&executed.instrument_id),
             side: executed.side,
             trade_date: executed.trade_date.clone(),
             value_date: executed.value_date.clone(),
@@ -1729,7 +1729,7 @@ pub fn record_sleeve_cross(
                     format!("account {} holds no order {order_id}", book.account_id),
                 )
             })?;
-            if order.order.instrument_id != cross.instrument_id {
+            if !crate::became::same(&order.order.instrument_id, &cross.instrument_id) {
                 return Err(malformed(
                     &["sleeve_cross.order_ids"],
                     format!("order {order_id} is not of {}", cross.instrument_id),
@@ -2044,7 +2044,7 @@ pub fn block_holds(
                 &format!("naming order {member}, which is not released, in a block"),
             ));
         }
-        if view.instrument_id != instrument_id {
+        if !crate::became::same(&view.instrument_id, instrument_id) {
             return Err(malformed(
                 &[&field],
                 format!(
