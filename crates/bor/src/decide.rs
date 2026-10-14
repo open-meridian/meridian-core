@@ -89,16 +89,30 @@ pub struct Context {
     pub account_scope: Option<BTreeSet<String>>,
     /// The sidecar's verdict on a placement's connectivity plugin (W11.8).
     pub connectivity_allowed: bool,
+    /// Contract v24 (W11.27): the attributes of each account a booking names,
+    /// as the service read them before the lock -- which are marked error
+    /// or allocation accounts (W9.13).
+    pub account_marks: BTreeMap<String, AccountAttributes>,
+    /// Contract v24 (W11.1): a block order's members, read from their own
+    /// accounts before the lock (no act writes two partitions).
+    pub members: BTreeMap<String, crate::booking::MemberView>,
+    /// Contract v24 (W11.36): the escape hatch's setting in force, read from
+    /// the control partition; `None` reads as on, the default.
+    pub local_record_orders: Option<bool>,
 }
 
 /// What an instrument's record says that the book requires (W9.1, contract
 /// v10): an asset class and a currency in force, and whether its class is
-/// cash, which takes away the lots requirement.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// cash; from contract v24 the currency's code, which with the account's base
+/// currency decides whether lots apply (W9.1, option (c)), and whether the
+/// record is provisional, a local record (W3.7, W11's escape hatch).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RecordSays {
     pub asset_class: bool,
     pub currency: bool,
     pub cash: bool,
+    pub code: String,
+    pub provisional: bool,
 }
 
 impl Context {
@@ -150,7 +164,7 @@ impl Context {
     /// Each instrument field the book requires that `instrument`'s record
     /// lacks, by its path under `field` (W9.1, contract v10).
     pub(crate) fn instrument_missing(&self, field: &str, instrument: &str) -> Vec<String> {
-        let says = self.records.get(instrument).copied().unwrap_or_default();
+        let says = self.records.get(instrument).cloned().unwrap_or_default();
         let mut missing = Vec::new();
         if !says.asset_class {
             missing.push(format!("{field}.instrument.asset_class"));
@@ -398,7 +412,7 @@ pub fn opening_balance(
         _ => {}
     }
     ctx.references_answered()?;
-    let missing = opening_missing(ctx, request);
+    let missing = opening_missing(book, ctx, request);
     if !missing.is_empty() {
         return Err(StoreError::incomplete("the opening balance", missing));
     }
@@ -459,10 +473,20 @@ pub fn opening_balance(
 /// position, its instrument with its record's asset class and currency
 /// (contract v10), side and quantity, its settled quantity, each pending
 /// quantity with its value date, the whole quantity settled or pending on a
-/// date, and its lots -- but on cash -- each with its quantity, cost and
+/// date, and its lots -- but on the account's base currency (contract v24,
+/// option (c); until then but on cash) -- each with its quantity, cost and
 /// acquisition date. A value present but malformed is not missing: it is
 /// refused with its words when the lines are made.
-fn opening_missing(ctx: &Context, request: &RecordOpeningBalanceRequest) -> Vec<String> {
+fn opening_missing(
+    book: &Book,
+    ctx: &Context,
+    request: &RecordOpeningBalanceRequest,
+) -> Vec<String> {
+    let base = book
+        .attributes
+        .as_ref()
+        .map(|held| held.base_currency_code.clone())
+        .unwrap_or_default();
     let mut missing = Vec::new();
     if request.as_of_date.trim().is_empty() {
         missing.push("as_of_date".to_string());
@@ -515,11 +539,18 @@ fn opening_missing(ctx: &Context, request: &RecordOpeningBalanceRequest) -> Vec<
         if rest().is_some_and(|rest| !rest.is_zero()) {
             missing.push(format!("{field}.pending"));
         }
-        // Whether lots apply is the record's to say: cash has none. A record
-        // with no class is refused naming its class above, and asked for its
-        // lots once it says.
-        let says = ctx.records.get(&position.instrument_id).copied();
-        if position.lots.is_empty() && says.is_some_and(|says| says.asset_class && !says.cash) {
+        // Whether lots apply is the record's and the account's to say: from
+        // contract v24 the account's base currency alone has none (W9.1,
+        // option (c), ruled 2026-10-13; question 38 narrowed the 2026-10-02
+        // list), every other currency carrying lots with its base-currency
+        // cost, and an account with no base currency set has none excepted
+        // (question 23). A record with no class is refused naming its class
+        // above, and asked for its lots once it says.
+        let says = ctx.records.get(&position.instrument_id).cloned();
+        let lots_apply = says.as_ref().is_some_and(|says| {
+            says.asset_class && !(says.cash && !base.is_empty() && says.code == base)
+        });
+        if position.lots.is_empty() && lots_apply {
             missing.push(format!("{field}.lots"));
         }
         for (at, lot) in position.lots.iter().enumerate() {

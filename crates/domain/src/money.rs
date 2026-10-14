@@ -288,6 +288,17 @@ monies! {
     RecordOutcomesRequest { outcomes }
     OutcomesRecordedEvent { outcome }
     ListOutcomesReply { outcomes }
+    // Booking (contract v24).
+    Allocation { average_price, gross_amount, fees, net_amount }
+    Booking { allocations }
+    SleeveCross { cross_price }
+    BookOrderRequest { allocations }
+    CorrectBookingRequest { allocations }
+    RecordSleeveCrossRequest { sleeve_cross }
+    BookingReply { booking }
+    SleeveCrossReply { sleeve_cross }
+    BookingUpdatedEvent { booking }
+    ListBookingsReply { bookings }
 }
 
 impl Monies for crate::v1::ChangeRequest {
@@ -364,6 +375,16 @@ pub fn known(code: &str) -> Option<String> {
         .read()
         .ok()
         .and_then(|held| held.instrument(code).map(str::to_string))
+}
+
+/// The code a cash instrument was resolved from here, where it was: the
+/// reverse of [`known`], what the book reads an account's base currency's
+/// cash instrument by (contract v24, W11.13).
+pub fn code_of(instrument: &str) -> Option<String> {
+    resolved()
+        .read()
+        .ok()
+        .and_then(|held| held.code(instrument).map(str::to_string))
 }
 
 /// Every amount a message carries filled with what this process has

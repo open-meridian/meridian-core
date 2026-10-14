@@ -76,7 +76,7 @@ pub fn admits(row: &Transition, from: Option<OrderState>, to: OrderState) -> boo
 }
 
 /// A command refused for the state its order is in, by its row.
-fn state_refused(row: &Transition, state: OrderState, what: &str) -> StoreError {
+pub(crate) fn state_refused(row: &Transition, state: OrderState, what: &str) -> StoreError {
     StoreError::refused(
         RefusalReason::OrderState,
         format!(
@@ -121,7 +121,7 @@ fn ended(state: OrderState) -> bool {
 
 /// A command other than a fact report needs a user: a person or a service
 /// account (W11's invariants; REFUSAL_REASON_ACTOR_REQUIRED).
-fn user_required(ctx: &Context, what: &str) -> Result<()> {
+pub(crate) fn user_required(ctx: &Context, what: &str) -> Result<()> {
     if ctx.acting_for.is_empty() {
         return Err(StoreError::refused(
             RefusalReason::ActorRequired,
@@ -132,7 +132,7 @@ fn user_required(ctx: &Context, what: &str) -> Result<()> {
 }
 
 /// An approval or an override is a person's (W11.5).
-fn person_required(ctx: &Context, what: &str) -> Result<()> {
+pub(crate) fn person_required(ctx: &Context, what: &str) -> Result<()> {
     if ctx.acting_for.is_empty()
         || ctx.acting_for_kind == meridian_pb::v1::SubjectKind::ServiceAccount as i32
     {
@@ -147,7 +147,7 @@ fn person_required(ctx: &Context, what: &str) -> Result<()> {
 /// A command naming its record by ID alone is held to the write scope the
 /// sidecar stamped on it (W4.9; the order-path plan's protos, point 8):
 /// PERMISSION_DENIED with no reason code, nothing changed.
-fn in_scope(ctx: &Context, account_id: &str) -> Result<()> {
+pub(crate) fn in_scope(ctx: &Context, account_id: &str) -> Result<()> {
     match &ctx.account_scope {
         Some(scope) if !scope.contains(account_id) => Err(StoreError::Denied(format!(
             "the record is in account {account_id}, which is outside the write scope this \
@@ -159,13 +159,13 @@ fn in_scope(ctx: &Context, account_id: &str) -> Result<()> {
 
 /// Whether a fact's account is within the sender's scope, where one was
 /// stamped: a venue's fact outside it is kept unplaced, never placed.
-fn fact_in_scope(ctx: &Context, account_id: &str) -> bool {
+pub(crate) fn fact_in_scope(ctx: &Context, account_id: &str) -> bool {
     ctx.account_scope
         .as_ref()
         .is_none_or(|scope| scope.contains(account_id))
 }
 
-fn malformed(fields: &[&str], words: impl Into<String>) -> StoreError {
+pub(crate) fn malformed(fields: &[&str], words: impl Into<String>) -> StoreError {
     StoreError::Malformed {
         fields: fields.iter().map(|field| field.to_string()).collect(),
         words: words.into(),
@@ -174,7 +174,7 @@ fn malformed(fields: &[&str], words: impl Into<String>) -> StoreError {
 
 /// The venue, through the connectivity plugin reporting it (W11.10): a
 /// fact's actor, never a person's act.
-fn venue_actor(ctx: &Context) -> Actor {
+pub(crate) fn venue_actor(ctx: &Context) -> Actor {
     Actor {
         kind: Some(actor::Kind::Venue(VenueActor {
             instance_id: ctx.instance_id.clone(),
@@ -185,7 +185,7 @@ fn venue_actor(ctx: &Context) -> Actor {
 
 /// A fact's actor: the user the command was sent for where there is one
 /// (an entered execution, a telephoned order), else the venue.
-fn fact_actor(ctx: &Context) -> Actor {
+pub(crate) fn fact_actor(ctx: &Context) -> Actor {
     if ctx.acting_for.is_empty() {
         venue_actor(ctx)
     } else {
@@ -216,7 +216,7 @@ fn condition(order_id: &str, set: bool, standing: StandingOrderCondition) -> Act
 }
 
 /// The order a command names, in this account's book.
-fn held<'a>(book: &'a Book, order_id: &str) -> Result<&'a OrderHeld> {
+pub(crate) fn held<'a>(book: &'a Book, order_id: &str) -> Result<&'a OrderHeld> {
     book.ledger.orders.get(order_id).ok_or_else(|| {
         StoreError::Invalid(format!(
             "account {} holds no order {order_id}",
@@ -264,14 +264,17 @@ fn claim_refused(held: &OrderHeld) -> StoreError {
     )
 }
 
-fn decimal(field: &str, wire: Option<&meridian_pb::v1::Decimal>) -> Result<Option<Exact>> {
+pub(crate) fn decimal(
+    field: &str,
+    wire: Option<&meridian_pb::v1::Decimal>,
+) -> Result<Option<Exact>> {
     wire.map(|wire| {
         Exact::from_wire(wire).map_err(|out| malformed(&[field], format!("{field} {out}")))
     })
     .transpose()
 }
 
-fn amount_of(money: Option<&Money>) -> Option<Exact> {
+pub(crate) fn amount_of(money: Option<&Money>) -> Option<Exact> {
     money
         .and_then(|money| money.amount.as_ref())
         .and_then(|amount| Exact::from_wire(amount).ok())
@@ -280,18 +283,18 @@ fn amount_of(money: Option<&Money>) -> Option<Exact> {
 // ── Making an entry ─────────────────────────────────────────────────────────
 
 /// What an order-path entry is, before its consequences are worked out.
-struct Plan {
-    kind: &'static str,
-    actor: Actor,
-    acts: Vec<Act>,
-    lines: Vec<MovementLine>,
-    reason: String,
-    idempotency_key: String,
-    effective_date: String,
+pub(crate) struct Plan {
+    pub(crate) kind: &'static str,
+    pub(crate) actor: Actor,
+    pub(crate) acts: Vec<Act>,
+    pub(crate) lines: Vec<MovementLine>,
+    pub(crate) reason: String,
+    pub(crate) idempotency_key: String,
+    pub(crate) effective_date: String,
 }
 
 impl Plan {
-    fn new(kind: &'static str, actor: Actor, acts: Vec<Act>) -> Plan {
+    pub(crate) fn new(kind: &'static str, actor: Actor, acts: Vec<Act>) -> Plan {
         Plan {
             kind,
             actor,
@@ -303,12 +306,12 @@ impl Plan {
         }
     }
 
-    fn reason(mut self, reason: &str) -> Plan {
+    pub(crate) fn reason(mut self, reason: &str) -> Plan {
         self.reason = reason.to_string();
         self
     }
 
-    fn key(mut self, key: &str) -> Plan {
+    pub(crate) fn key(mut self, key: &str) -> Plan {
         self.idempotency_key = key.to_string();
         self
     }
@@ -370,7 +373,7 @@ fn settle(book: &Book, acts: Vec<Act>) -> Result<Vec<Act>> {
 
 /// The entry made: its consequences settled, a new account's first
 /// attributes stated (W9.13), numbered and replayed.
-fn finish(book: &Book, head: u64, ctx: &Context, plan: Plan) -> Result<Made> {
+pub(crate) fn finish(book: &Book, head: u64, ctx: &Context, plan: Plan) -> Result<Made> {
     let acts = settle(book, plan.acts)?;
     let trade = !plan.lines.is_empty();
     let first = first_attributes(book) && is_account(&book.account_id);
@@ -399,7 +402,7 @@ fn finish(book: &Book, head: u64, ctx: &Context, plan: Plan) -> Result<Made> {
 }
 
 /// The state an order is in, by the fold.
-fn state_of(book: &Book, order_id: &str) -> Result<OrderState> {
+pub(crate) fn state_of(book: &Book, order_id: &str) -> Result<OrderState> {
     book.ledger.state(order_id)
 }
 
@@ -455,6 +458,9 @@ pub fn propose_order(
     request: &ProposeOrderRequest,
 ) -> Result<Made> {
     user_required(ctx, "proposing an order")?;
+    if !request.block_member_order_ids.is_empty() {
+        return propose_block(book, head, ctx, request);
+    }
     match (request.quantity.is_some(), request.cash_quantity.is_some()) {
         (true, true) | (false, false) => {
             return Err(malformed(
@@ -523,6 +529,9 @@ pub fn propose_order(
                 .collect(),
         ));
     }
+    // The escape hatch (contract v24, W11's invariant, row 23b): an order on
+    // a local record, refused while the deployment's setting is off.
+    crate::booking::local_record_allowed(ctx, &request.instrument_id, "the proposal")?;
 
     let mut order = Order {
         order_id: ctx.mint(ids::ORDER),
@@ -623,6 +632,103 @@ pub fn propose_order(
         return Err(claim_refused(parent));
     }
     order.sleeve = parent.order.sleeve.clone();
+    let plan = Plan::new(
+        "order-proposed",
+        ctx.actor(),
+        vec![Act::Opened {
+            order,
+            released: true,
+        }],
+    )
+    .key(&request.idempotency_key);
+    finish(book, head, ctx, plan)
+}
+
+/// A block order (W11.1, contract v24; the order-path plan's v24 item 6):
+/// the `oms`'s, in the allocation account, naming its members -- released
+/// orders of one instrument and side, each in no other live block -- its
+/// quantity the sum of their idle quantities, released on creation as a split
+/// child is, never through the gate again. Its executions move this account;
+/// booking allocates them to the members' accounts (W11.27).
+fn propose_block(
+    book: &Book,
+    head: u64,
+    ctx: &Context,
+    request: &ProposeOrderRequest,
+) -> Result<Made> {
+    if request.instrument_id.is_empty() {
+        return Err(malformed(
+            &["instrument_id"],
+            "an order names its instrument",
+        ));
+    }
+    if request.side == Side::Unspecified as i32 || Side::try_from(request.side).is_err() {
+        return Err(malformed(&["side"], "an order names its side"));
+    }
+    if request.cash_quantity.is_some() {
+        return Err(malformed(
+            &["cash_quantity"],
+            "a block's quantity is the sum of its members' idle quantities",
+        ));
+    }
+    if request.link.is_some() {
+        return Err(malformed(
+            &["link"],
+            "a block names its members, and no parent",
+        ));
+    }
+    ctx.references_answered()?;
+    crate::booking::local_record_allowed(ctx, &request.instrument_id, "the block")?;
+    let quantity = crate::booking::block_holds(
+        ctx,
+        &request.instrument_id,
+        request.side,
+        &request.block_member_order_ids,
+    )?;
+    if let Some(stated) = decimal("quantity", request.quantity.as_ref())? {
+        if stated != quantity {
+            return Err(malformed(
+                &["quantity"],
+                format!(
+                    "a block's quantity is the sum of its members' idle quantities, {quantity}, \
+                     and this states {stated}"
+                ),
+            ));
+        }
+    }
+    if quantity.is_zero() {
+        return Err(malformed(
+            &["block_member_order_ids"],
+            "the members have nothing idle to work",
+        ));
+    }
+    let order = Order {
+        order_id: ctx.mint(ids::ORDER),
+        account_id: book.account_id.clone(),
+        instrument_id: request.instrument_id.clone(),
+        sleeve: request.sleeve.clone(),
+        side: request.side,
+        quantity: numbers::wire(quantity),
+        order_type: request.order_type,
+        limit_price: request.limit_price.clone(),
+        stop_price: request.stop_price.clone(),
+        quote_currency: request.quote_currency.clone(),
+        time_in_force: request.time_in_force,
+        expire_date: request.expire_date.clone(),
+        expire_time_ns: request.expire_time_ns,
+        execution_instructions: request.execution_instructions.clone(),
+        lot_relief_method: request.lot_relief_method,
+        capacity: request.capacity,
+        direction: request.direction,
+        handling_instructions: request.handling_instructions.clone(),
+        person_roles: Some(PersonRoles {
+            entered_by: Some(ctx.actor()),
+            executed_by: None,
+            decided_by: request.decided_by.clone(),
+        }),
+        block_member_order_ids: request.block_member_order_ids.clone(),
+        ..Default::default()
+    };
     let plan = Plan::new(
         "order-proposed",
         ctx.actor(),
@@ -1828,17 +1934,17 @@ pub fn report_placement(
 // ── W11.11: an execution ────────────────────────────────────────────────────
 
 /// One open lot as a sale may relieve it.
-struct LotView {
-    lot_id: String,
-    open: Exact,
-    acquired_date: String,
-    unit_cost: Option<Exact>,
-    ordinal: u64,
+pub(crate) struct LotView {
+    pub(crate) lot_id: String,
+    pub(crate) open: Exact,
+    pub(crate) acquired_date: String,
+    pub(crate) unit_cost: Option<Exact>,
+    pub(crate) ordinal: u64,
 }
 
 /// A position's open lots, by magnitude, with the lines already in this
 /// entry applied (a superseded execution's reversal).
-fn open_lots(book: &Book, key: &Key, earlier: &[MovementLine]) -> Result<Vec<LotView>> {
+pub(crate) fn open_lots(book: &Book, key: &Key, earlier: &[MovementLine]) -> Result<Vec<LotView>> {
     let mut views: BTreeMap<String, LotView> = BTreeMap::new();
     if let Some(position) = book.positions.get(key) {
         for state in position.lots.values() {
@@ -1903,7 +2009,7 @@ fn open_lots(book: &Book, key: &Key, earlier: &[MovementLine]) -> Result<Vec<Lot
 /// W11.13), first in first out where neither names one. Average cost
 /// relieves in acquisition order: its cost is the average, its lots are not
 /// chosen by it.
-fn relief(
+pub(crate) fn relief(
     mut lots: Vec<LotView>,
     mut quantity: Exact,
     method: LotReliefMethod,
@@ -1947,7 +2053,7 @@ fn relief(
 /// The cash instrument an amount is in: the one it names, or its code's as
 /// the book resolved it (contract v18). Unresolved, the fact cannot be
 /// checked, and is refused to be sent again.
-fn cash_instrument(money: &Money) -> Result<String> {
+pub(crate) fn cash_instrument(money: &Money) -> Result<String> {
     if !money.instrument_id.is_empty() {
         return Ok(money.instrument_id.clone());
     }
@@ -1965,7 +2071,7 @@ fn cash_instrument(money: &Money) -> Result<String> {
 
 /// The lot relief method a fill on `order_id` relieves by: its own, its
 /// parents', or the account's default.
-fn relief_method(book: &Book, order_id: &str) -> (LotReliefMethod, Vec<String>) {
+pub(crate) fn relief_method(book: &Book, order_id: &str) -> (LotReliefMethod, Vec<String>) {
     let mut current = order_id.to_string();
     let mut seen = BTreeSet::new();
     while let Some(held) = book.ledger.orders.get(&current) {
@@ -1990,6 +2096,146 @@ fn relief_method(book: &Book, order_id: &str) -> (LotReliefMethod, Vec<String>) 
             .unwrap_or(LotReliefMethod::Unspecified),
         Vec::new(),
     )
+}
+
+/// A movement of a currency, signed -- received positive, paid negative --
+/// as the account's lines (contract v24, W11.13; the order-path plan's v24
+/// item 19, option (c)). The account's base currency is a balance: one line,
+/// pending to the value date, a payment beyond what it holds a negative sign,
+/// never a short lot; lots it held before its base was set are relieved
+/// first and none opens in it after (question 24). Every other currency -- and
+/// every currency while no base is set (question 23) -- opens or relieves
+/// lots as any instrument's: a receipt covers a short first and opens a lot
+/// for the rest, with its cost in the base currency where `basis` states it
+/// and unknown otherwise (the book converts nothing, W9.13); a payment
+/// relieves lots by the method, the lots `named` first, and opens a short for
+/// what it pays beyond them.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn currency_lines(
+    book: &Book,
+    ctx: &Context,
+    instrument: &str,
+    amount: Exact,
+    value_date: &str,
+    sleeve: &str,
+    acquired_date: &str,
+    basis: Option<Money>,
+    method: LotReliefMethod,
+    named: &[String],
+    earlier: &[MovementLine],
+) -> Result<Vec<MovementLine>> {
+    let bucket = if value_date.is_empty() {
+        SettlementBucket::Settled
+    } else {
+        SettlementBucket::Pending
+    };
+    let line = |side: HoldingSide, quantity: Exact| MovementLine {
+        instrument_id: instrument.to_string(),
+        side: side as i32,
+        bucket: bucket as i32,
+        value_date: value_date.to_string(),
+        quantity: numbers::wire(quantity),
+        sleeve: sleeve.to_string(),
+        ..Default::default()
+    };
+    if amount.is_zero() {
+        return Ok(Vec::new());
+    }
+    let long_key: Key = (
+        instrument.to_string(),
+        HoldingSide::Long as i32,
+        sleeve.to_string(),
+    );
+    let mut lines = Vec::new();
+    if book.is_base(instrument) {
+        let mut rest = amount;
+        if amount.is_negative() {
+            let held = open_lots(book, &long_key, earlier)?;
+            for (lot_id, take) in relief(held, amount.negated(), method, named)? {
+                let mut relieving = line(HoldingSide::Long, take.negated());
+                relieving.lot_id = lot_id;
+                lines.push(relieving);
+                rest = numbers::add("relief", rest, take)?;
+            }
+        }
+        if !rest.is_zero() {
+            lines.push(line(HoldingSide::Long, rest));
+        }
+        return Ok(lines);
+    }
+    let opening = |side: HoldingSide, magnitude: Exact| -> MovementLine {
+        let mut opened = line(
+            side,
+            if side == HoldingSide::Short {
+                magnitude.negated()
+            } else {
+                magnitude
+            },
+        );
+        opened.lot_id = ctx.mint(ids::LOT);
+        opened.opens_lot = Some(LotTerms {
+            unit_cost: None,
+            cost: basis.clone(),
+            acquired_date: acquired_date.to_string(),
+            holding_period_start: String::new(),
+            settlement_date: value_date.to_string(),
+            source: LotSource::Execution as i32,
+        });
+        opened
+    };
+    if !amount.is_negative() {
+        let short_key: Key = (
+            instrument.to_string(),
+            HoldingSide::Short as i32,
+            sleeve.to_string(),
+        );
+        let mut rest = amount;
+        for (lot_id, take) in relief(open_lots(book, &short_key, earlier)?, amount, method, named)?
+        {
+            let mut covering = line(HoldingSide::Short, take);
+            covering.lot_id = lot_id;
+            lines.push(covering);
+            rest = numbers::add("cover", rest, take.negated())?;
+        }
+        if !rest.is_zero() {
+            lines.push(opening(HoldingSide::Long, rest));
+        }
+    } else {
+        let paid = amount.negated();
+        let mut rest = paid;
+        for (lot_id, take) in relief(open_lots(book, &long_key, earlier)?, paid, method, named)? {
+            let mut relieving = line(HoldingSide::Long, take.negated());
+            relieving.lot_id = lot_id;
+            lines.push(relieving);
+            rest = numbers::add("relief", rest, take.negated())?;
+        }
+        if !rest.is_zero() {
+            lines.push(opening(HoldingSide::Short, rest));
+        }
+    }
+    Ok(lines)
+}
+
+/// Whether an instrument is a currency's cash instrument, as this process
+/// resolved one (contract v24): a currency's lot carries its cost in the
+/// account's base currency, so its cost in another currency is unknown.
+pub(crate) fn is_currency(instrument: &str) -> bool {
+    meridian_domain::money::code_of(instrument).is_some()
+}
+
+/// The base currency's amount as a Money naming its code, for a currency
+/// lot's cost basis (contract v24, W11.13).
+pub(crate) fn base_money(book: &Book, amount: Exact) -> Option<Money> {
+    let code = book
+        .attributes
+        .as_ref()
+        .map(|held| held.base_currency_code.clone())
+        .filter(|code| !code.is_empty())?;
+    Some(Money {
+        amount: numbers::wire(amount),
+        currency_code: code.clone(),
+        instrument_id: meridian_domain::money::known(&code).unwrap_or_default(),
+    })
 }
 
 /// What a reported fill moves (W11.13; the order-path plan's Q15): a buy
@@ -2036,12 +2282,25 @@ fn trade_lines(
             },
         );
         opened.lot_id = ctx.mint(ids::LOT);
+        // A currency's lot carries its cost in the account's base currency
+        // (contract v24, option (c)): known where the fill is priced in the
+        // base, unknown otherwise; every other lot its cost in the fill's
+        // currency, as before.
+        let priced_in_base = book.is_base(&cash_instrument(&price)?);
+        let (unit_cost, cost) = if is_currency(&instrument) && !priced_in_base {
+            (None, None)
+        } else {
+            (
+                Some(price.clone()),
+                Some(Money {
+                    amount: numbers::wire(orders::multiply("cost", magnitude, unit)?),
+                    ..price.clone()
+                }),
+            )
+        };
         opened.opens_lot = Some(LotTerms {
-            unit_cost: Some(price.clone()),
-            cost: Some(Money {
-                amount: numbers::wire(orders::multiply("cost", magnitude, unit)?),
-                ..price.clone()
-            }),
+            unit_cost,
+            cost,
             acquired_date: execution.trade_date.clone(),
             holding_period_start: String::new(),
             settlement_date: value_date.clone(),
@@ -2052,7 +2311,19 @@ fn trade_lines(
     let side = Side::try_from(execution.side).unwrap_or(Side::Unspecified);
     let (method, named) = relief_method(book, order_id);
     let mut lines = Vec::new();
+    // The account's base currency bought or sold is its balance, never a lot
+    // (contract v24, W11.13): an FX fill's legs follow the account.
+    let instrument_is_base = book.is_base(&instrument);
     match side {
+        Side::Unspecified => return Err(malformed(&["side"], "the order names no side")),
+        _ if instrument_is_base => {
+            let signed = if side == Side::Buy {
+                quantity
+            } else {
+                quantity.negated()
+            };
+            lines.push(line(HoldingSide::Long, signed));
+        }
         Side::Buy => {
             let short_key: Key = (
                 instrument.clone(),
@@ -2088,9 +2359,11 @@ fn trade_lines(
         Side::SellShort | Side::SellShortExempt => {
             lines.push(opening(HoldingSide::Short, quantity)?)
         }
-        Side::Unspecified => return Err(malformed(&["side"], "the order names no side")),
     }
-    // The cash, pending to the value date: paid on a buy, received on a sale.
+    // The cash, pending to the value date: paid on a buy, received on a sale
+    // -- the account's base currency a balance, any other opening or
+    // relieving lots (contract v24, option (c)), a receipt's lot costed in
+    // the base where the fill's other leg is the base currency itself.
     let notional = orders::multiply("cash", quantity, unit)?;
     let cash = cash_instrument(&price)?;
     let signed = if side == Side::Buy {
@@ -2098,22 +2371,52 @@ fn trade_lines(
     } else {
         notional
     };
-    lines.push(MovementLine {
-        instrument_id: cash,
-        side: HoldingSide::Long as i32,
-        bucket: SettlementBucket::Pending as i32,
-        value_date: value_date.clone(),
-        quantity: numbers::wire(signed),
-        sleeve: sleeve.clone(),
-        ..Default::default()
-    });
+    let basis = if instrument_is_base {
+        base_money(book, quantity)
+    } else {
+        None
+    };
+    let account_method = LotReliefMethod::try_from(attributes_of(book).lot_relief_default)
+        .unwrap_or(LotReliefMethod::Unspecified);
+    let mut earlier_and_own: Vec<MovementLine> = earlier.to_vec();
+    earlier_and_own.extend(lines.iter().cloned());
+    let moved = currency_lines(
+        book,
+        ctx,
+        &cash,
+        signed,
+        &value_date,
+        &sleeve,
+        &execution.trade_date,
+        basis,
+        account_method,
+        &[],
+        &earlier_and_own,
+    )?;
+    earlier_and_own.extend(moved.iter().cloned());
+    lines.extend(moved);
     for (index, fee) in execution.fees.iter().enumerate() {
-        lines.push(fee_line(
-            &format!("fees[{index}]"),
-            fee,
+        let field = format!("fees[{index}]");
+        let amount = fee
+            .amount
+            .as_ref()
+            .ok_or_else(|| malformed(&[&field], "a fee states its amount"))?;
+        let value = numbers::amount(&field, amount)?;
+        let moved = currency_lines(
+            book,
+            ctx,
+            &cash_instrument(amount)?,
+            value.negated(),
             &value_date,
             &sleeve,
-        )?);
+            &execution.trade_date,
+            None,
+            account_method,
+            &[],
+            &earlier_and_own,
+        )?;
+        earlier_and_own.extend(moved.iter().cloned());
+        lines.extend(moved);
     }
     Ok(lines)
 }
@@ -2148,7 +2451,7 @@ fn fee_line(
 
 /// A superseded execution's lines, negated: the position it moved reversed
 /// by the superseding entry (W11.13).
-fn reversal_lines(book: &Book, superseded: &str) -> Result<Vec<MovementLine>> {
+pub(crate) fn reversal_lines(book: &Book, superseded: &str) -> Result<Vec<MovementLine>> {
     let Some(held) = book.ledger.executions.get(superseded) else {
         return Ok(Vec::new());
     };
@@ -2197,12 +2500,82 @@ fn reversal_lines(book: &Book, superseded: &str) -> Result<Vec<MovementLine>> {
         .collect())
 }
 
+/// Lines relieving a lot no longer open by as much -- a fill's lot booking
+/// re-stated at the allocation's price (contract v24, W11.27), or one sold
+/// since -- relieve what is open on it and the rest from the position's other
+/// open lots, by the account's method: a bust or a correction after booking
+/// is a fact, never refused for the lots it names (W11.11, row b5).
+pub(crate) fn reroute_reliefs(book: &Book, lines: Vec<MovementLine>) -> Result<Vec<MovementLine>> {
+    let method = LotReliefMethod::try_from(attributes_of(book).lot_relief_default)
+        .unwrap_or(LotReliefMethod::Unspecified);
+    let mut out: Vec<MovementLine> = Vec::new();
+    for line in lines {
+        if line.lot_id.is_empty() || line.opens_lot.is_some() {
+            out.push(line);
+            continue;
+        }
+        let quantity = numbers::required("line.quantity", line.quantity.as_ref())?;
+        let short = line.side == HoldingSide::Short as i32;
+        let relieves = if short {
+            !quantity.is_negative() && !quantity.is_zero()
+        } else {
+            quantity.is_negative()
+        };
+        if !relieves {
+            out.push(line);
+            continue;
+        }
+        let magnitude = if quantity.is_negative() {
+            quantity.negated()
+        } else {
+            quantity
+        };
+        let key: Key = (line.instrument_id.clone(), line.side, line.sleeve.clone());
+        let views = open_lots(book, &key, &out)?;
+        let on_named = views
+            .iter()
+            .find(|view| view.lot_id == line.lot_id)
+            .map(|view| view.open)
+            .unwrap_or(Exact::ZERO);
+        if on_named >= magnitude {
+            out.push(line);
+            continue;
+        }
+        let signed = |value: Exact| if short { value } else { value.negated() };
+        let mut rest = magnitude;
+        if !on_named.is_zero() {
+            let mut part = line.clone();
+            part.quantity = numbers::wire(signed(on_named));
+            out.push(part);
+            rest = numbers::add("relief", rest, on_named.negated())?;
+        }
+        let others: Vec<LotView> = views
+            .into_iter()
+            .filter(|view| view.lot_id != line.lot_id)
+            .collect();
+        for (lot_id, take) in relief(others, rest, method, &[])? {
+            let mut part = line.clone();
+            part.lot_id = lot_id;
+            part.quantity = numbers::wire(signed(take));
+            out.push(part);
+            rest = numbers::add("relief", rest, take.negated())?;
+        }
+        if !rest.is_zero() {
+            let mut part = line.clone();
+            part.lot_id = String::new();
+            part.quantity = numbers::wire(signed(rest));
+            out.push(part);
+        }
+    }
+    Ok(out)
+}
+
 /// Where the value-date rolls after entry `at` took a pending line: each
 /// later roll whose entry moved the line's position off the date it then
 /// held takes it on to the roll's new date (W11.25). A roll moves only what
 /// its instance's fills and rolls on the code left there, so a roll that
 /// moved the position from the line's date moved the line.
-fn rolled_to(book: &Book, at: usize, line: &MovementLine) -> String {
+pub(crate) fn rolled_to(book: &Book, at: usize, line: &MovementLine) -> String {
     let mut date = line.value_date.clone();
     for later in book.entries.iter().skip(at + 1) {
         for act in &later.body.acts {
@@ -2368,7 +2741,10 @@ pub fn report_execution(
     let from = state_of(book, &order_id)?;
     let mut lines = Vec::new();
     if !execution.supersedes.is_empty() {
-        lines.extend(reversal_lines(book, &execution.supersedes)?);
+        lines.extend(reroute_reliefs(
+            book,
+            reversal_lines(book, &execution.supersedes)?,
+        )?);
     }
     if !bust && orders::moves_position(&execution) {
         let own = trade_lines(book, ctx, &order_id, &execution, &lines)?;
@@ -2398,6 +2774,25 @@ pub fn report_execution(
         ));
     }
     acts.extend(claimed_unplaced(book, &sender, &execution));
+    // A fact after booking (contract v24, rows b5 and b9): each live booking
+    // of the order held, or after its hand-off touched so `operations`
+    // hears it; never refused.
+    let why = if bust {
+        format!(
+            "execution {} was busted after booking",
+            execution.supersedes
+        )
+    } else if !execution.supersedes.is_empty() {
+        format!(
+            "execution {} was corrected after booking",
+            execution.supersedes
+        )
+    } else {
+        format!("execution {} arrived after booking", execution.execution_id)
+    };
+    let after = crate::booking::after_facts(book, &order_id, &why);
+    acts.extend(crate::booking::held_alerts_for(ctx, book, &after));
+    acts.extend(after);
     let mut plan =
         Plan::new("execution-recorded", fact_actor(ctx), acts).key(&request.idempotency_key);
     plan.lines = lines;
@@ -2736,12 +3131,47 @@ pub fn report_charge(
         settlement_date: request.settlement_date.clone(),
         raw_record: request.raw_record.clone(),
     };
-    let mut plan = Plan::new(
-        "charge-recorded",
-        venue_actor(ctx),
-        vec![Act::Charged { charge }],
+    let mut acts = vec![Act::Charged { charge }];
+    // A fee reported after booking holds it (contract v24, rows b5, b9).
+    let after = crate::booking::after_facts(
+        book,
+        &placed.placement.order_id,
+        &format!(
+            "a charge on placement {} arrived after booking",
+            request.placement_id
+        ),
     );
-    plan.lines = vec![fee_line("fee", &fee, &value_date, &order.order.sleeve)?];
+    acts.extend(crate::booking::held_alerts_for(ctx, book, &after));
+    acts.extend(after);
+    let mut plan = Plan::new("charge-recorded", venue_actor(ctx), acts);
+    // A fee in a currency is a cash line in it, opening or relieving lots
+    // by option (c)'s rule (contract v24, W11.13).
+    let amount = fee
+        .amount
+        .as_ref()
+        .ok_or_else(|| malformed(&["fee"], "a fee states its amount"))?;
+    let value = numbers::amount("fee", amount)?;
+    let bucket_date = if fee_line("fee", &fee, &value_date, &order.order.sleeve)?.bucket
+        == SettlementBucket::Pending as i32
+    {
+        value_date.clone()
+    } else {
+        String::new()
+    };
+    plan.lines = currency_lines(
+        book,
+        ctx,
+        &cash_instrument(amount)?,
+        value.negated(),
+        &bucket_date,
+        &order.order.sleeve,
+        &request.trade_date,
+        None,
+        LotReliefMethod::try_from(attributes_of(book).lot_relief_default)
+            .unwrap_or(LotReliefMethod::Unspecified),
+        &[],
+        &[],
+    )?;
     plan.effective_date = request.trade_date.clone();
     finish(book, head, ctx, plan)
 }
@@ -3553,6 +3983,9 @@ pub fn accept_execution(
         answerable(held, "e3", "an accept")?;
     }
     let first = named[0];
+    // The escape hatch (contract v24, row e3): an accept of a fill on a local
+    // record is refused while the setting is off, the fill staying unmatched.
+    crate::booking::local_record_allowed(ctx, &first.execution.instrument_id, "the accept")?;
     for held in &named[1..] {
         let (a, b) = (&first.execution, &held.execution);
         if a.instrument_id != b.instrument_id {

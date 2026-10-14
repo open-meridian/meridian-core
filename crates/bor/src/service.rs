@@ -127,6 +127,9 @@ pub(crate) fn context_of(envelope: &Envelope, clock: &dyn Clock) -> Context {
         records: Default::default(),
         reference_unavailable: false,
         control_sequence: 0,
+        account_marks: Default::default(),
+        members: Default::default(),
+        local_record_orders: None,
     }
 }
 
@@ -161,6 +164,8 @@ fn record_says(record: &meridian_domain::v1::InstrumentRecord) -> RecordSays {
         asset_class: class != meridian_domain::v1::AssetClass::Unspecified,
         currency: !record.currency.trim().is_empty(),
         cash: class == meridian_domain::v1::AssetClass::Cash,
+        code: record.currency.trim().to_string(),
+        provisional: record.provisional,
     }
 }
 
@@ -747,6 +752,9 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
     });
 
     crate::order_service::serve(bus.clone(), store.clone(), clock.clone());
+    // Contract v24: booking, the alert and the escape hatch (W11.26 to
+    // W11.37).
+    crate::booking_service::serve(bus.clone(), store.clone(), clock.clone());
 
     let reading = store;
     bus.serve(LIST_ACCOUNT_ATTRIBUTES, move |envelope| {

@@ -276,3 +276,43 @@ pub fn expiring_of(key: &str, book: &Book, now_ns: i64) -> Result<Vec<(String, S
     }
     Ok(out)
 }
+
+/// One book's bookings a read answers (W11.31, contract v24).
+pub fn bookings_of(
+    key: &str,
+    book: &Book,
+    read: &crate::store::BookingsRead,
+) -> Result<Vec<meridian_domain::v1::Booking>> {
+    if !book_answers(&read.scope, &read.account_id, key) || !is_account(key) {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for (id, held) in &book.ledger.bookings {
+        if read.state != 0 && held.state as i32 != read.state {
+            continue;
+        }
+        if wanted(&read.since, held.booking.last_change.as_ref()) {
+            out.push(book.ledger.booking_record(id)?);
+        }
+    }
+    Ok(out)
+}
+
+/// One book's alerts a read answers (W11.35, contract v24).
+pub fn alerts_of(
+    key: &str,
+    book: &Book,
+    read: &crate::store::AlertsRead,
+) -> Vec<meridian_domain::v1::Alert> {
+    if !book_answers(&read.scope, &read.account_id, key) || !is_account(key) {
+        return Vec::new();
+    }
+    book.ledger
+        .alerts
+        .values()
+        .filter(|alert| read.state == 0 || alert.state == read.state)
+        .filter(|alert| read.kind == 0 || alert.kind == read.kind)
+        .filter(|alert| wanted(&read.since, alert.last_change.as_ref()))
+        .cloned()
+        .collect()
+}

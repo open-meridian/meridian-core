@@ -364,6 +364,8 @@ impl Store for MemoryStore {
                 Record::ChangeRequest => book.ledger.changes.contains_key(id),
                 Record::Locate => book.ledger.locates.contains_key(id),
                 Record::Execution => book.ledger.executions.contains_key(id),
+                Record::Booking => book.ledger.bookings.contains_key(id),
+                Record::Alert => book.ledger.alerts.contains_key(id),
             })
             .map(|(account, _)| account.clone()))
     }
@@ -443,6 +445,68 @@ impl Store for MemoryStore {
         let mut out = Vec::new();
         for (key, book) in &state.books {
             out.extend(order_reads::expiring_of(key, book, now_ns)?);
+        }
+        Ok(out)
+    }
+
+    fn bookings(
+        &self,
+        read: &crate::store::BookingsRead,
+    ) -> Result<Page<meridian_domain::v1::Booking>> {
+        read.scope.admit(&read.account_id)?;
+        let state = self.state();
+        let mut records = Vec::new();
+        for (key, book) in &state.books {
+            for booking in order_reads::bookings_of(key, book, read)? {
+                records.push((format!("{key}\u{1f}{}", booking.booking_id), booking));
+            }
+        }
+        order_reads::keyed_page(records, &read.cursor, read.limit, state.heads.clone())
+    }
+
+    fn alerts(&self, read: &crate::store::AlertsRead) -> Result<Page<meridian_domain::v1::Alert>> {
+        read.scope.admit(&read.account_id)?;
+        let state = self.state();
+        let mut records = Vec::new();
+        for (key, book) in &state.books {
+            for alert in order_reads::alerts_of(key, book, read) {
+                records.push((format!("{key}\u{1f}{}", alert.alert_id), alert));
+            }
+        }
+        order_reads::keyed_page(records, &read.cursor, read.limit, state.heads.clone())
+    }
+
+    fn blocks_naming(&self, member_order_id: &str) -> Result<Vec<(String, String)>> {
+        let state = self.state();
+        let mut out = Vec::new();
+        for (key, book) in &state.books {
+            for (id, held) in &book.ledger.orders {
+                if held
+                    .order
+                    .block_member_order_ids
+                    .iter()
+                    .any(|member| member == member_order_id)
+                    && book.ledger.order_live(id)?
+                {
+                    out.push((key.clone(), id.clone()));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn live_order_instruments(&self) -> Result<Vec<String>> {
+        let state = self.state();
+        let mut out = Vec::new();
+        for (key, book) in &state.books {
+            if !is_account(key) {
+                continue;
+            }
+            for (id, held) in &book.ledger.orders {
+                if book.ledger.order_live(id)? {
+                    out.push(held.order.instrument_id.clone());
+                }
+            }
         }
         Ok(out)
     }

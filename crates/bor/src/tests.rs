@@ -121,11 +121,23 @@ fn opening() -> RecordOpeningBalanceRequest {
                     }),
                 }],
             },
+            // From contract v24 a currency carries lots unless it is the
+            // account's base (W9.1, option (c)); this account has none set,
+            // so its dollars carry theirs.
             OpeningPosition {
                 instrument_id: USD.into(),
                 side: HoldingSide::Long as i32,
                 trade_date_quantity: d("1000.00"),
                 settled_quantity: d("1000.00"),
+                lots: vec![OpeningLot {
+                    quantity: d("1000.00"),
+                    terms: Some(LotTerms {
+                        cost: usd("1000.00"),
+                        acquired_date: "2026-09-01".into(),
+                        source: LotSource::OpeningBalance as i32,
+                        ..Default::default()
+                    }),
+                }],
                 ..Default::default()
             },
         ],
@@ -133,6 +145,27 @@ fn opening() -> RecordOpeningBalanceRequest {
         replaces_entry_id: String::new(),
         idempotency_key: "opening-balance:ACC-1:STMT-1".into(),
     }
+}
+
+/// The account's base currency, USD, set first: from contract v24 the base
+/// currency alone carries no lots (W9.1, option (c)), and an account with
+/// none set has every currency carry them.
+async fn base_usd(bus: &Bus) {
+    send(
+        bus,
+        SET_ACCOUNT_ATTRIBUTE,
+        "meridian.v1.SetAccountAttributeRequest",
+        &SetAccountAttributeRequest {
+            account_id: ACC.into(),
+            attribute: Some(set_account_attribute_request::Attribute::BaseCurrencyCode(
+                "USD".into(),
+            )),
+            reason: "the account's functional currency".into(),
+        },
+        Some(PERSON),
+    )
+    .await
+    .unwrap();
 }
 
 async fn open(bus: &Bus) -> BookEntryReply {
@@ -293,7 +326,13 @@ async fn an_opening_balance_opens_every_position_and_lot_from_zero() {
 
     let usd = position(&reply, USD);
     assert_eq!(usd.last_change, journal("P0", 2, 1));
-    assert!(usd.lots.is_empty(), "cash has no lots");
+    // From contract v24 a currency other than the account's base carries its
+    // lots (W9.1, option (c)); with no base set, every currency does.
+    assert_eq!(
+        usd.lots.len(),
+        1,
+        "a currency not the base carries its lots"
+    );
 
     let held = reply.attributes.as_ref().unwrap();
     let standing = held.opening_balance.as_ref().unwrap();
@@ -512,14 +551,19 @@ async fn a_lot_without_its_cost_or_date_and_a_pending_without_its_date_are_refus
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_complete_opening_balance_is_recorded_and_cash_needs_no_lots() {
+async fn a_complete_opening_balance_is_recorded_and_the_base_currency_needs_no_lots() {
+    // Contract v24 (W9.1, option (c); question 38): the account's base
+    // currency alone is a balance with no lots.
     let (bus, _) = wired_with_records();
+    base_usd(&bus).await;
+    let mut request = opening();
+    request.positions[1].lots.clear();
     let reply = BookEntryReply::decode(
         &send(
             &bus,
             RECORD_OPENING_BALANCE,
             "meridian.v1.RecordOpeningBalanceRequest",
-            &opening(),
+            &request,
             Some(PERSON),
         )
         .await
@@ -530,6 +574,18 @@ async fn a_complete_opening_balance_is_recorded_and_cash_needs_no_lots() {
     assert!(usd.lots.is_empty());
     assert_eq!(read(&usd.settled_quantity), "1000.00");
     assert_eq!(read(&usd.not_stated_quantity), "0");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_currency_not_the_base_is_refused_without_its_lots() {
+    // Contract v24 (W9.1, option (c)): with no base set, or another, a
+    // currency's position is named missing its lots.
+    let (bus, _) = wired_with_records();
+    let mut request = opening();
+    request.positions[1].lots.clear();
+    let refused = opening_refused(&bus, &request).await;
+    assert_eq!(code(&refused), Some(RefusalReason::Incomplete), "{refused}");
+    assert_eq!(fields(&refused), vec!["positions[1].lots".to_string()]);
 }
 
 #[tokio::test(flavor = "multi_thread")]

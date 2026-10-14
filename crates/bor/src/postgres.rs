@@ -603,6 +603,60 @@ fn project_orders(tx: &mut Transaction<'_>, account_id: &str, changes: &Changes)
         )
         .map_err(unavailable)?;
     }
+    // Contract v24: bookings, alerts and a block's members (W11.1, W11.30,
+    // W11.35).
+    for record in &changes.bookings {
+        let change = record.last_change.clone().unwrap_or_default();
+        tx.execute(
+            "INSERT INTO book_booking
+                    (account_id, booking_id, partition, sequence, state, order_id, record)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT (account_id, booking_id) DO UPDATE
+                SET partition = EXCLUDED.partition, sequence = EXCLUDED.sequence,
+                    state = EXCLUDED.state, record = EXCLUDED.record",
+            &[
+                &account_id,
+                &record.booking_id,
+                &change.partition,
+                &(change.sequence as i64),
+                &record.state,
+                &record.order_id,
+                &record.encode_to_vec(),
+            ],
+        )
+        .map_err(unavailable)?;
+    }
+    for record in &changes.alerts {
+        let change = record.last_change.clone().unwrap_or_default();
+        tx.execute(
+            "INSERT INTO book_alert
+                    (account_id, alert_id, partition, sequence, state, kind, record)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT (account_id, alert_id) DO UPDATE
+                SET partition = EXCLUDED.partition, sequence = EXCLUDED.sequence,
+                    state = EXCLUDED.state, record = EXCLUDED.record",
+            &[
+                &account_id,
+                &record.alert_id,
+                &change.partition,
+                &(change.sequence as i64),
+                &record.state,
+                &record.kind,
+                &record.encode_to_vec(),
+            ],
+        )
+        .map_err(unavailable)?;
+    }
+    for (record, _) in &changes.orders {
+        for member in &record.block_member_order_ids {
+            tx.execute(
+                "INSERT INTO book_block_member (block_order_id, member_order_id, account_id)
+                 VALUES ($1, $2, $3) ON CONFLICT (block_order_id, member_order_id) DO NOTHING",
+                &[&record.order_id, member, &account_id],
+            )
+            .map_err(unavailable)?;
+        }
+    }
     for (change_request_id, order_id, placement_id) in &changes.change_requests {
         tx.execute(
             "INSERT INTO book_change_request (change_request_id, account_id, order_id, placement_id)
@@ -675,6 +729,10 @@ fn all_changes(book: &Book) -> Result<Changes> {
         changes.locates.push(ledger.locate_record(id)?);
     }
     changes.instructions = ledger.instructions.values().cloned().collect();
+    for id in ledger.bookings.keys() {
+        changes.bookings.push(ledger.booking_record(id)?);
+    }
+    changes.alerts = ledger.alerts.values().cloned().collect();
     changes.change_requests = ledger
         .changes
         .values()
@@ -1132,7 +1190,8 @@ impl Store for PostgresStore {
              DELETE FROM book_break; DELETE FROM book_figures; DELETE FROM book_attributes;
              DELETE FROM book_order; DELETE FROM book_placement; DELETE FROM book_execution;
              DELETE FROM book_unplaced; DELETE FROM book_locate; DELETE FROM book_instruction;
-             DELETE FROM book_change_request; DELETE FROM book_order_entry;",
+             DELETE FROM book_change_request; DELETE FROM book_order_entry;
+             DELETE FROM book_booking; DELETE FROM book_alert; DELETE FROM book_block_member;",
         )
         .map_err(unavailable)?;
         let accounts: Vec<(String, String)> = tx
@@ -1195,6 +1254,8 @@ impl Store for PostgresStore {
             }
             Record::Locate => "SELECT account_id FROM book_locate WHERE locate_record_id = $1",
             Record::Execution => "SELECT account_id FROM book_execution WHERE execution_id = $1",
+            Record::Booking => "SELECT account_id FROM book_booking WHERE booking_id = $1",
+            Record::Alert => "SELECT account_id FROM book_alert WHERE alert_id = $1",
         };
         Ok(self
             .conn()?
@@ -1412,6 +1473,139 @@ impl Store for PostgresStore {
             .map_err(unavailable)?
             .into_iter()
             .map(|row| (row.get(0), row.get(1)))
+            .collect())
+    }
+
+    fn bookings(
+        &self,
+        read: &crate::store::BookingsRead,
+    ) -> Result<Page<meridian_domain::v1::Booking>> {
+        read.scope.admit(&read.account_id)?;
+        let (partitions, sequences) = mark_params(&read.since.clone().unwrap_or_default());
+        let filter = if read.since.is_some() {
+            ABOVE
+        } else {
+            UNUSED_MARK
+        };
+        let scope = scope_param(&read.scope);
+        self.reading(|tx| {
+            let rows = tx
+                .query(
+                    &format!(
+                        "SELECT account_id, booking_id, record FROM book_booking
+                          WHERE ($1::text[] IS NULL OR account_id = ANY($1))
+                            AND ($2 = '' OR account_id = $2)
+                            AND account_id NOT LIKE '~%'
+                            AND ($5 = 0 OR state = $5)
+                            AND {filter}"
+                    ),
+                    &[
+                        &scope,
+                        &read.account_id,
+                        &partitions,
+                        &sequences,
+                        &read.state,
+                    ],
+                )
+                .map_err(unavailable)?;
+            let mut records = Vec::new();
+            for row in rows {
+                let account: String = row.get(0);
+                let id: String = row.get(1);
+                let bytes: Vec<u8> = row.get(2);
+                records.push((
+                    format!("{account}\u{1f}{id}"),
+                    meridian_domain::v1::Booking::decode(bytes.as_slice()).map_err(unreadable)?,
+                ));
+            }
+            order_reads::keyed_page(records, &read.cursor, read.limit, heads_of(tx)?)
+        })
+    }
+
+    fn alerts(&self, read: &crate::store::AlertsRead) -> Result<Page<meridian_domain::v1::Alert>> {
+        read.scope.admit(&read.account_id)?;
+        let (partitions, sequences) = mark_params(&read.since.clone().unwrap_or_default());
+        let filter = if read.since.is_some() {
+            ABOVE
+        } else {
+            UNUSED_MARK
+        };
+        let scope = scope_param(&read.scope);
+        self.reading(|tx| {
+            let rows = tx
+                .query(
+                    &format!(
+                        "SELECT account_id, alert_id, record FROM book_alert
+                          WHERE ($1::text[] IS NULL OR account_id = ANY($1))
+                            AND ($2 = '' OR account_id = $2)
+                            AND account_id NOT LIKE '~%'
+                            AND ($5 = 0 OR state = $5)
+                            AND ($6 = 0 OR kind = $6)
+                            AND {filter}"
+                    ),
+                    &[
+                        &scope,
+                        &read.account_id,
+                        &partitions,
+                        &sequences,
+                        &read.state,
+                        &read.kind,
+                    ],
+                )
+                .map_err(unavailable)?;
+            let mut records = Vec::new();
+            for row in rows {
+                let account: String = row.get(0);
+                let id: String = row.get(1);
+                let bytes: Vec<u8> = row.get(2);
+                records.push((
+                    format!("{account}\u{1f}{id}"),
+                    meridian_domain::v1::Alert::decode(bytes.as_slice()).map_err(unreadable)?,
+                ));
+            }
+            order_reads::keyed_page(records, &read.cursor, read.limit, heads_of(tx)?)
+        })
+    }
+
+    fn blocks_naming(&self, member_order_id: &str) -> Result<Vec<(String, String)>> {
+        Ok(self
+            .conn()?
+            .query(
+                "SELECT m.account_id, m.block_order_id
+                   FROM book_block_member m
+                   JOIN book_order o ON o.order_id = m.block_order_id
+                  WHERE m.member_order_id = $1 AND o.state = ANY($2)
+                  ORDER BY 2",
+                &[
+                    &member_order_id,
+                    &vec![
+                        meridian_domain::v1::OrderState::Proposed as i32,
+                        meridian_domain::v1::OrderState::Released as i32,
+                        meridian_domain::v1::OrderState::Working as i32,
+                    ],
+                ],
+            )
+            .map_err(unavailable)?
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect())
+    }
+
+    fn live_order_instruments(&self) -> Result<Vec<String>> {
+        Ok(self
+            .conn()?
+            .query(
+                "SELECT instrument_id FROM book_order
+                  WHERE account_id NOT LIKE '~%' AND state = ANY($1)",
+                &[&vec![
+                    meridian_domain::v1::OrderState::Proposed as i32,
+                    meridian_domain::v1::OrderState::Released as i32,
+                    meridian_domain::v1::OrderState::Working as i32,
+                ]],
+            )
+            .map_err(unavailable)?
+            .into_iter()
+            .map(|row| row.get(0))
             .collect())
     }
 
