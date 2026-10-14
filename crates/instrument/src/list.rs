@@ -129,6 +129,7 @@ pub fn list_to_complete(
                 .collect(),
             complete_for_book: complete_for_book(record),
             complete: complete(record),
+            provisional_reason: 0,
         })
         .collect();
     let next_cursor = if start + page.len() < chosen.len() {
@@ -172,6 +173,8 @@ pub fn list_to_complete(
         incomplete_for_book,
         incomplete,
         licensed_identifiers,
+        migration_counts: None,
+        backfill_counts: Vec::new(),
     })
 }
 

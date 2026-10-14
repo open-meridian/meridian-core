@@ -45,8 +45,8 @@ use std::time::Duration;
 use meridian_domain::asset_class;
 use meridian_domain::v1::{
     AssetClass, ClaimCodePurpose, DiagnosticBundle, DiagnosticBundleReceipt,
-    EscalateInstrumentRequest, Identifier as PbIdentifier, InstrumentRecord as PbInstrument,
-    RedeemClaimCodeReply, VenueRecord,
+    EscalateInstrumentReply, EscalateInstrumentRequest, Identifier as PbIdentifier,
+    InstrumentRecord as PbInstrument, RedeemClaimCodeReply, VenueRecord,
 };
 use serde::Deserialize;
 
@@ -385,46 +385,24 @@ impl Platform {
         found_or_nothing(response)
     }
 
-    /// W3.4. The platform's surface for pairing a deployment's ID with an
-    /// instrument, or minting a stub its staff complete. A deployment does not
-    /// call it from contract v10 (decisions/030: its records are its own); it
-    /// stays the client of a route the platform serves, for
-    /// design/reconciling-locally-minted-identity.
+    /// W3.4, from contract v24 (decisions/037; the one-ID spec's requirement
+    /// 7): the store's matching and minting request, carried as it came --
+    /// what to look for, the template and its version, what the record's
+    /// sources state, offered, and a request key -- and nothing else. It never
+    /// names the deployment or its `LCL-` record: the deployment is the signed
+    /// note's, which says who may ask, and the pairing stays here (W3.8).
     ///
-    /// `None` when the platform declined. Nothing here can mint, and nothing
-    /// here retries a decline.
+    /// The platform's answer whole: a match, a mint from its own source, a
+    /// near-match minted and flagged, or the request queued for its staff
+    /// (`pending_review`). A refusal or an unreadable answer is the caller's
+    /// to absorb: the store keeps a provisional record and asks again.
     pub async fn escalate(
         &self,
         request: &EscalateInstrumentRequest,
         now_ns: i64,
-    ) -> Result<Option<PbInstrument>, PlatformError> {
-        let request = EscalateInstrumentRequest {
-            requesting_deployment_id: self.config.deployment_id.clone(),
-            ..request.clone()
-        };
-
-        let body = serde_json::to_vec(&serde_json::json!({
-            "source": request.source,
-            // The enum's name, as the platform spells a lifecycle state; empty
-            // when the publisher did not know the class.
-            "asset_class": asset_class::name(
-                AssetClass::try_from(request.asset_class).unwrap_or(AssetClass::Unspecified)
-            ),
-            "identifiers": request
-                .identifiers
-                .iter()
-                .map(|identifier| serde_json::json!({
-                    "scheme": identifier.scheme,
-                    "value": identifier.value,
-                    "source": identifier.source,
-                }))
-                .collect::<Vec<_>>(),
-            "as_of_ns": request.as_of_ns,
-            "requesting_deployment_id": request.requesting_deployment_id,
-            "placeholder_instrument_id": request.placeholder_instrument_id,
-        }))
-        .map_err(|failed| PlatformError::Malformed(failed.to_string()))?;
-
+    ) -> Result<EscalateInstrumentReply, PlatformError> {
+        let body = serde_json::to_vec(&escalation_body(request))
+            .map_err(|failed| PlatformError::Malformed(failed.to_string()))?;
         let response = self
             .call(
                 Method::Post,
@@ -433,19 +411,14 @@ impl Platform {
                 now_ns,
             )
             .await?;
-
-        if response.status == 404 {
-            return Ok(None);
-        }
         let reply: WireReply = read(&response)?;
-        // A conflict pairs nothing: staff decide, and the placeholder stays in
-        // use. `minted: false` with a record is a pairing with an instrument
-        // the platform already held, applied exactly as a minted one is
-        // (EscalateInstrumentReply). Without a record it is a decline.
-        if reply.conflict.unwrap_or(false) {
-            return Ok(None);
-        }
-        reply.instrument.map(into_record).transpose()
+        Ok(EscalateInstrumentReply {
+            instrument: reply.instrument.map(into_record).transpose()?,
+            minted: reply.minted.unwrap_or(false),
+            conflict: reply.conflict.unwrap_or(false),
+            near_match: reply.near_match.unwrap_or(false),
+            pending_review: reply.pending_review.unwrap_or(false),
+        })
     }
 
     /// W5.19. What this deployment is running, as its components describe
@@ -697,6 +670,46 @@ impl Platform {
     }
 }
 
+/// EscalateInstrument's request as the platform's JSON spells it (W3.4,
+/// contract v24): the asset class in lower case without its prefix (ruled
+/// 2026-10-14), each offered field by its path with its source's words.
+/// Never `requesting_deployment_id` or `placeholder_instrument_id`, retired
+/// with v9's shape: the platform refuses either.
+pub fn escalation_body(request: &EscalateInstrumentRequest) -> serde_json::Value {
+    serde_json::json!({
+        "source": request.source,
+        "asset_class": asset_class::lower(
+            AssetClass::try_from(request.asset_class).unwrap_or(AssetClass::Unspecified)
+        ),
+        "identifiers": request
+            .identifiers
+            .iter()
+            .map(|identifier| serde_json::json!({
+                "scheme": identifier.scheme,
+                "value": identifier.value,
+                "source": identifier.source,
+            }))
+            .collect::<Vec<_>>(),
+        "as_of_ns": request.as_of_ns,
+        "template_id": request.template_id,
+        "template_version": request.template_version,
+        "fields": request
+            .fields
+            .iter()
+            .map(|field| serde_json::json!({
+                "path": field.path,
+                "value": field.value,
+                "source": field
+                    .provenance
+                    .as_ref()
+                    .map(|provenance| provenance.source.clone())
+                    .unwrap_or_default(),
+            }))
+            .collect::<Vec<_>>(),
+        "request_key": request.request_key,
+    })
+}
+
 /// A reply from the platform, in the shape of the contract's messages.
 ///
 /// Unknown fields are ignored, matching protobuf. What is not ignored is a
@@ -704,9 +717,14 @@ impl Platform {
 #[derive(Debug, Deserialize)]
 struct WireReply {
     found: Option<bool>,
-    #[allow(dead_code)]
     minted: Option<bool>,
     conflict: Option<bool>,
+    /// Contract v24 (W1.25, W3.4): minted and flagged for review.
+    #[serde(default)]
+    near_match: Option<bool>,
+    /// Contract v24 (W1.25, W3.4): queued for the platform's staff.
+    #[serde(default)]
+    pending_review: Option<bool>,
     instrument: Option<WireRecord>,
     /// The venues the answer names (contract v18).
     #[serde(default)]
@@ -1505,8 +1523,14 @@ pub(crate) mod tests {
                 },
             ],
             as_of_ns: AS_OF,
-            requesting_deployment_id: String::new(),
-            placeholder_instrument_id: "LCL-01J8XQ4M7K0000000000ZZTP".into(),
+            template_id: "TPL-equity".into(),
+            template_version: "1".into(),
+            fields: vec![meridian_domain::v1::TemplateFieldValue {
+                path: "description".into(),
+                value: "ZZ Top Holdings Inc. common stock".into(),
+                provenance: None,
+            }],
+            request_key: "01JB2N7Q0000000000000000RK".into(),
         }
     }
 
@@ -1899,37 +1923,56 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn an_escalation_names_this_deployment_and_its_id() {
+    async fn an_escalation_never_names_the_deployment_or_its_local_record() {
+        // W3.4, contract v24 (the one-ID spec's requirement 7): what to look
+        // for, the template, the offered fields and a request key; never the
+        // deployment's LCL- ID or its name, which v9's shape sent.
         let transport = Fake::new(vec![Ok(reply(
             201,
-            &record_json("INS-01J8XQ4M7K0000000000ZZTP"),
+            &serde_json::json!({
+                "instrument": serde_json::from_str::<serde_json::Value>(
+                    &record_json("INS-01J8XQ4M7K0000000000ZZTP")
+                ).unwrap()["instrument"],
+                "minted": true, "near_match": false, "pending_review": false, "conflict": false,
+            })
+            .to_string(),
         ))]);
-        platform(transport.clone())
+        let answer = platform(transport.clone())
             .escalate(&escalation(), NOW)
             .await
             .unwrap();
+        assert!(answer.minted && !answer.pending_review);
+        assert_eq!(
+            answer.instrument.unwrap().instrument_id,
+            "INS-01J8XQ4M7K0000000000ZZTP"
+        );
         let body = transport.seen.lock().unwrap()[0].body.clone().unwrap();
         let sent: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(sent.get("placeholder_instrument_id").is_none());
+        assert!(sent.get("requesting_deployment_id").is_none());
+        assert!(!String::from_utf8_lossy(&body).contains("LCL-"));
+        assert!(!String::from_utf8_lossy(&body).contains(DEPLOYMENT));
         assert_eq!(
-            sent["placeholder_instrument_id"],
-            "LCL-01J8XQ4M7K0000000000ZZTP"
+            sent["asset_class"], "equity",
+            "lower case, as ruled for the JSON"
         );
-        assert_eq!(sent["requesting_deployment_id"], DEPLOYMENT);
+        assert_eq!(sent["template_id"], "TPL-equity");
+        assert_eq!(sent["request_key"], "01JB2N7Q0000000000000000RK");
+        assert_eq!(sent["fields"][0]["path"], "description");
     }
 
     #[tokio::test]
-    async fn a_conflict_or_a_decline_pairs_nothing() {
-        for answer in [
-            "{\"minted\": false, \"conflict\": true, \"instrument\": null}",
-            "{\"minted\": false}",
-        ] {
-            let transport = Fake::new(vec![Ok(reply(200, answer))]);
-            assert!(platform(transport)
-                .escalate(&escalation(), NOW)
-                .await
-                .unwrap()
-                .is_none());
-        }
+    async fn a_request_queued_for_staff_is_said_and_carries_no_record() {
+        let transport = Fake::new(vec![Ok(reply(
+            200,
+            "{\"minted\": false, \"pending_review\": true, \"near_match\": false, \"instrument\": null}",
+        ))]);
+        let answer = platform(transport)
+            .escalate(&escalation(), NOW)
+            .await
+            .unwrap();
+        assert!(answer.pending_review && !answer.minted);
+        assert!(answer.instrument.is_none());
     }
 
     #[tokio::test]

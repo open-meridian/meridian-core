@@ -1318,6 +1318,7 @@ mod tests {
                         ..Default::default()
                     }),
                     detail: String::new(),
+                    ..Default::default()
                 }
                 .encode_to_vec(),
             ))
@@ -1415,6 +1416,7 @@ mod tests {
                         ..Default::default()
                     }),
                     detail: String::new(),
+                    ..Default::default()
                 }
                 .encode_to_vec(),
             ))

@@ -1701,6 +1701,16 @@ pub fn set_attribute(
         Some(set_account_attribute_request::Attribute::WaitsForCompliance(waits)) => {
             attributes.waits_for_compliance = waits;
         }
+        // Contract v24 (W9.13; the order-path plan's v24 items 7 and 10): a
+        // deployment admin's marks, each change its own entry with its
+        // reason. Unmarking is recorded and never refused; past allocations
+        // keep their flag, since an allocation carries its own cause.
+        Some(set_account_attribute_request::Attribute::ErrorAccount(marked)) => {
+            attributes.error_account = marked;
+        }
+        Some(set_account_attribute_request::Attribute::AllocationAccount(marked)) => {
+            attributes.allocation_account = marked;
+        }
         None => return Err(StoreError::Invalid("the request sets no attribute".into())),
     }
     made(

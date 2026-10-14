@@ -1017,6 +1017,7 @@ async fn list_one(
             page_size: 1,
             cursor: String::new(),
             search: String::new(),
+            provisional: false,
         },
         WAIT,
     )
@@ -1071,6 +1072,7 @@ async fn list(app: &App, caller: &Caller, arguments: &Value) -> Value {
                 page_size as i32
             },
             cursor,
+            provisional: false,
         },
         WAIT,
     )
@@ -1572,6 +1574,7 @@ async fn ask_platform(app: &App, caller: &Caller, arguments: &Value) -> Value {
             instrument_id: record.instrument_id.clone(),
             identifiers: record.identifiers.clone(),
             as_of_ns: 0,
+            match_or_mint: None,
         },
         Duration::from_secs(12),
     )

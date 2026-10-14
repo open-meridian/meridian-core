@@ -753,6 +753,7 @@ fn instrument_listed(id: String) -> InstrumentToComplete {
         },
         complete: !lacking,
         complete_for_book: !lacking,
+        ..Default::default()
     }
 }
 

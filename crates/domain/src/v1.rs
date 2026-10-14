@@ -180,6 +180,30 @@ pub struct InstrumentRecord {
     /// record whose type is binary event contract.
     #[prost(message, optional, tag = "17")]
     pub binary_event_contract: ::core::option::Option<BinaryEventContract>,
+    /// Contract v24 (W3.7; decisions/037, point 2 as amended 2026-10-14; the
+    /// one-ID model): the deployment's own local record -- the platform
+    /// unreachable, the request waiting for its staff, or, at the current
+    /// stage, no open identifier to ask by. It names its template, may be
+    /// incomplete, is a local line in the book, never priced, and an order on
+    /// it the escape hatch (W9.1, W11). False on a record named by the
+    /// platform's INS- ID, or keyed before v10.
+    #[prost(bool, tag = "18")]
+    pub provisional: bool,
+    /// Contract v24 (W3.7, W3.24): the platform's template the record is held
+    /// to, a class's base template where its type has none; empty on a record
+    /// kept before v24 and not yet migrated, and on one whose source stated no
+    /// class ("class needed").
+    #[prost(string, tag = "19")]
+    pub template_id: ::prost::alloc::string::String,
+    /// A published version, immutable; empty where template_id is.
+    #[prost(string, tag = "20")]
+    pub template_version: ::prost::alloc::string::String,
+    /// Contract v24 (W3.7): each required field of its template the record
+    /// does not hold, by its path in the template (TemplateField.path); empty
+    /// on a complete record and on every INS- record the platform minted.
+    /// Never a gate on asking the platform.
+    #[prost(string, repeated, tag = "21")]
+    pub missing_fields: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// One value for a deployment's record, set or offered, with where it came
 /// from (W3.10, W3.1, W3.3).
@@ -797,6 +821,17 @@ pub struct MissEntry {
     pub class_note: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "12")]
     pub class_set_by: ::core::option::Option<ChangeActor>,
+    /// Contract v24 (W1.13, W1.25; ruled 2026-10-14, the platform build's
+    /// Q4): a request in the staff's queue, its source not confirming it, as
+    /// the platform answered EscalateInstrumentReply.pending_review; false on
+    /// a plain miss.
+    #[prost(bool, tag = "13")]
+    pub pending_review: bool,
+    /// Why it waits, the platform's own string -- not_confirmed,
+    /// wants_template, class_needed, no_match_identifier, met_a_stub -- as
+    /// ChangelogEntry.operation's are; empty on a plain miss.
+    #[prost(string, tag = "14")]
+    pub review_reason: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ListMissesRequest {
@@ -923,6 +958,13 @@ pub struct ResolveIdentifierReply {
     /// record, and is not minted. Until v10, true meant a placeholder.
     #[prost(bool, tag = "4")]
     pub minted: bool,
+    /// Contract v24 (W3.1, W3.7; decisions/037, point 2 as amended): the
+    /// record answered is the deployment's provisional LCL- record -- the
+    /// platform not reached within the bounded ask, its staff to review the
+    /// request, or no open identifier to ask by -- naming its template, asked
+    /// again on reconnect or once it has an open identifier.
+    #[prost(bool, tag = "5")]
+    pub provisional: bool,
 }
 /// Forward resolution: an instrument identifier to its record.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1015,11 +1057,14 @@ pub struct PullIdentifierReply {
     #[prost(message, repeated, tag = "4")]
     pub venues: ::prost::alloc::vec::Vec<VenueRecord>,
 }
-/// The platform's surface for pairing a deployment's ID with an instrument
-/// (W3.4), which a deployment does not call from contract v10: one sharing an
-/// identifier in force on the date, or a stub minted from these identifiers
-/// for an administrator to complete. Idempotent per deployment ID: asking
-/// again answers the same pairing.
+/// The deployment's matching and minting request (W3.4), the conductor's,
+/// from contract v24 (decisions/037; the one-ID spec's requirement 7): it
+/// says what to look for, and the platform verifies the security against its
+/// own source and mints from that source's values (option (c), the one-ID
+/// model). Only identifiers in schemes on the licence list (W3.25). It never
+/// carries the deployment's LCL- ID or its name. Until v24, the platform's
+/// surface for pairing a deployment's ID, which a deployment did not call
+/// from contract v10.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct EscalateInstrumentRequest {
     #[prost(string, tag = "1")]
@@ -1030,11 +1075,19 @@ pub struct EscalateInstrumentRequest {
     pub identifiers: ::prost::alloc::vec::Vec<Identifier>,
     #[prost(int64, tag = "4")]
     pub as_of_ns: i64,
-    #[prost(string, tag = "5")]
-    pub requesting_deployment_id: ::prost::alloc::string::String,
-    /// The deployment's ID for these identifiers.
-    #[prost(string, tag = "6")]
-    pub placeholder_instrument_id: ::prost::alloc::string::String,
+    /// Contract v24: the template the record names, and its version.
+    #[prost(string, tag = "8")]
+    pub template_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "9")]
+    pub template_version: ::prost::alloc::string::String,
+    /// What the record's sources state, each with its source: offers to the
+    /// platform's curation, never the master's record.
+    #[prost(message, repeated, tag = "10")]
+    pub fields: ::prost::alloc::vec::Vec<TemplateFieldValue>,
+    /// Only for retrying an answer that was lost: the platform answers a
+    /// repeat with the answer it stored for the key; a new ask is a new key.
+    #[prost(string, tag = "11")]
+    pub request_key: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct EscalateInstrumentReply {
@@ -1045,14 +1098,23 @@ pub struct EscalateInstrumentReply {
     /// either way; this is for the operator.
     #[prost(bool, tag = "2")]
     pub minted: bool,
-    /// The deployment's ID it pairs with, echoed from the request.
-    #[prost(string, tag = "3")]
-    pub replaces_instrument_id: ::prost::alloc::string::String,
     /// True when the identifiers point at more than one instrument, or agree on
     /// one identifier and contradict another of the same scheme. Nothing is
-    /// paired or minted, instrument is empty, and staff decide.
+    /// paired or minted, instrument is empty, and staff decide. From contract
+    /// v24 never answered true: such a request is a near-match, minted and
+    /// flagged (near_match); kept, never renumbered, deprecated at the next
+    /// floor.
     #[prost(bool, tag = "4")]
     pub conflict: bool,
+    /// Contract v24 (W1.25, W3.4): minted, and flagged for the platform's
+    /// staff to review as a near-match.
+    #[prost(bool, tag = "5")]
+    pub near_match: bool,
+    /// Contract v24 (W1.25, W3.4): the request is in the staff's queue, its
+    /// source not confirming it; nothing matched or minted, and the deployment
+    /// keeps a provisional record and asks again.
+    #[prost(bool, tag = "6")]
+    pub pending_review: bool,
 }
 /// A record of the deployment's reached a new version (W3.5): minted, joined
 /// by an identifier, completed, merged, or answered by the platform.
@@ -1071,6 +1133,10 @@ pub struct InstrumentAppliedEvent {
 /// placeholder by its INS- ID. Stores keyed by instrument move what they hold
 /// under it onto the one that stays (W3.9, W9.9); records of what was
 /// reported keep it.
+///
+/// From contract v24 also a provisional record resolved and a platform merge,
+/// each with its cause, heard by every role (W3.8) and caught up by
+/// ListReplacements (W3.22).
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct InstrumentReplacedEvent {
     /// The record replaced.
@@ -1081,6 +1147,14 @@ pub struct InstrumentReplacedEvent {
     pub instrument: ::core::option::Option<InstrumentRecord>,
     #[prost(int64, tag = "3")]
     pub replaced_at_ns: i64,
+    /// Contract v24 (W3.8): why it was replaced; unspecified only on a
+    /// replacement recorded before v24 and not yet backfilled.
+    #[prost(enumeration = "ReplacementCause", tag = "4")]
+    pub cause: i32,
+    /// Contract v24 (W3.22): monotonic per deployment; ListReplacements reads
+    /// after it. Zero only on a replacement recorded before v24.
+    #[prost(int64, tag = "5")]
+    pub sequence: i64,
 }
 /// One record's values, set against the version it was read at (W3.10).
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1148,6 +1222,9 @@ pub struct ListInstrumentsToCompleteRequest {
     /// characters.
     #[prost(string, tag = "5")]
     pub search: ::prost::alloc::string::String,
+    /// Contract v24 (W3.11): only provisional records.
+    #[prost(bool, tag = "6")]
+    pub provisional: bool,
 }
 /// A record and what it lacks (W3.11).
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1164,6 +1241,10 @@ pub struct InstrumentToComplete {
     /// Complete for the book, a description, and a symbol where one exists.
     #[prost(bool, tag = "4")]
     pub complete: bool,
+    /// Contract v24 (W3.7, W3.11): why the record is provisional; unspecified
+    /// on a record that is not.
+    #[prost(enumeration = "ProvisionalReason", tag = "5")]
+    pub provisional_reason: i32,
 }
 /// Identifiers that met more than one record, or an identifier another record
 /// carries (W3.1, W3.2, W3.10): not a match, and listed until a merge
@@ -1218,6 +1299,49 @@ pub struct ListInstrumentsToCompleteReply {
     pub incomplete: i64,
     #[prost(message, repeated, tag = "6")]
     pub licensed_identifiers: ::prost::alloc::vec::Vec<LicensedIdentifierCount>,
+    /// Contract v24 (W3.11): the upgrade's migration run (W3.26), and per
+    /// scheme being backfilled its backfill (W3.25). Counts, never a holding.
+    #[prost(message, optional, tag = "7")]
+    pub migration_counts: ::core::option::Option<MigrationCounts>,
+    #[prost(message, repeated, tag = "8")]
+    pub backfill_counts: ::prost::alloc::vec::Vec<BackfillCount>,
+}
+/// What the upgrade's migration run found (W3.11, W3.26; contract v24).
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct MigrationCounts {
+    /// Already carrying the platform's ID.
+    #[prost(int64, tag = "1")]
+    pub already_held: i64,
+    #[prost(int64, tag = "2")]
+    pub matched: i64,
+    #[prost(int64, tag = "3")]
+    pub minted: i64,
+    #[prost(int64, tag = "4")]
+    pub near_match: i64,
+    #[prost(int64, tag = "5")]
+    pub awaiting_staff: i64,
+    /// No open identifier.
+    #[prost(int64, tag = "6")]
+    pub kept_local: i64,
+    #[prost(int64, tag = "7")]
+    pub unreachable: i64,
+    #[prost(int64, tag = "8")]
+    pub held_back: i64,
+    /// Still to send.
+    #[prost(int64, tag = "9")]
+    pub remaining: i64,
+}
+/// One scheme's backfill (W3.11, W3.25; contract v24).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BackfillCount {
+    #[prost(string, tag = "1")]
+    pub scheme: ::prost::alloc::string::String,
+    #[prost(int64, tag = "2")]
+    pub matched: i64,
+    #[prost(int64, tag = "3")]
+    pub awaiting_person: i64,
+    #[prost(int64, tag = "4")]
+    pub remaining: i64,
 }
 /// W3.12.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1341,6 +1465,11 @@ pub struct AskPlatformForInstrumentRequest {
     /// The date the record's identifiers are asked about. Zero means now.
     #[prost(int64, tag = "3")]
     pub as_of_ns: i64,
+    /// Contract v24 (W3.4; the order-path plan's v24 question 30): the
+    /// instrument store's matching and minting request, which the conductor
+    /// sends the platform as EscalateInstrument, within its bounded ask.
+    #[prost(message, optional, tag = "4")]
+    pub match_or_mint: ::core::option::Option<EscalateInstrumentRequest>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AskPlatformForInstrumentReply {
@@ -1357,6 +1486,9 @@ pub struct AskPlatformForInstrumentReply {
     pub instrument: ::core::option::Option<InstrumentRecord>,
     #[prost(string, tag = "4")]
     pub detail: ::prost::alloc::string::String,
+    /// Contract v24 (W3.4): the platform's reply to match_or_mint.
+    #[prost(message, optional, tag = "5")]
+    pub match_or_mint_answer: ::core::option::Option<EscalateInstrumentReply>,
 }
 /// A calendar's weekend, dated, so a change of weekend takes effect on its
 /// day.
@@ -1968,6 +2100,223 @@ pub struct HeldDateRule {
     #[prost(int64, tag = "4")]
     pub refreshed_at_ns: i64,
 }
+/// W3.22: the replacements the instrument store recorded after a sequence,
+/// unscoped reference data every plugin role reads.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ListReplacementsRequest {
+    /// The last sequence the reader saw; zero reads every replacement.
+    #[prost(int64, tag = "1")]
+    pub after_sequence: i64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListReplacementsReply {
+    /// Each as its instrument-replaced delivery carried it, in sequence.
+    #[prost(message, repeated, tag = "1")]
+    pub replacements: ::prost::alloc::vec::Vec<InstrumentReplacedEvent>,
+    /// The next read's after_sequence: the sequence asked after, when none
+    /// since.
+    #[prost(int64, tag = "2")]
+    pub sequence: i64,
+}
+/// W3.23: a `reference` plugin's offer of a record's template fields.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OfferTemplateFieldsRequest {
+    /// A record the deployment holds, followed through its replacement.
+    #[prost(string, tag = "1")]
+    pub instrument_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub template_id: ::prost::alloc::string::String,
+    /// A version the catalogue holds; one it does not is refused naming it.
+    #[prost(string, tag = "3")]
+    pub template_version: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "4")]
+    pub fields: ::prost::alloc::vec::Vec<TemplateFieldValue>,
+}
+/// A value at a template field's path, with its provenance (W3.4, W3.23).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TemplateFieldValue {
+    /// The field's path in the template; one the template lacks is refused
+    /// naming it.
+    #[prost(string, tag = "1")]
+    pub path: ::prost::alloc::string::String,
+    /// As the template's field type writes it.
+    #[prost(string, tag = "2")]
+    pub value: ::prost::alloc::string::String,
+    /// The source it was reconciled from; unset, the plugin's own source.
+    #[prost(message, optional, tag = "3")]
+    pub provenance: ::core::option::Option<::meridian_pb::v1::Provenance>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OfferTemplateFieldsReply {
+    /// At its new version, the values kept as offers.
+    #[prost(message, optional, tag = "1")]
+    pub instrument: ::core::option::Option<InstrumentRecord>,
+}
+/// W3.24: the templates the store holds, unscoped reference data.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ListTemplatesRequest {
+    /// Unspecified lists every class.
+    #[prost(enumeration = "AssetClass", tag = "1")]
+    pub asset_class: i32,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListTemplatesReply {
+    /// Each at its latest version.
+    #[prost(message, repeated, tag = "1")]
+    pub templates: ::prost::alloc::vec::Vec<SecurityTemplate>,
+}
+/// W3.24: one template, at a version.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReadTemplateRequest {
+    #[prost(string, tag = "1")]
+    pub template_id: ::prost::alloc::string::String,
+    /// Empty reads the latest.
+    #[prost(string, tag = "2")]
+    pub template_version: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReadTemplateReply {
+    #[prost(message, optional, tag = "1")]
+    pub template: ::core::option::Option<SecurityTemplate>,
+}
+/// A security template (W1.24, W3.24; the intent's "security template"): the
+/// platform authors, versions and publishes it, and a deployment's store
+/// holds every version and never changes one.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SecurityTemplate {
+    /// `TPL-`, the platform's, never a deployment's.
+    #[prost(string, tag = "1")]
+    pub template_id: ::prost::alloc::string::String,
+    /// Published and immutable; a change is a new version.
+    #[prost(string, tag = "2")]
+    pub template_version: ::prost::alloc::string::String,
+    /// The platform's words for it.
+    #[prost(string, tag = "3")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(enumeration = "AssetClass", tag = "4")]
+    pub asset_class: i32,
+    /// Unspecified for a class's base template.
+    #[prost(enumeration = "InstrumentType", tag = "5")]
+    pub instrument_type: i32,
+    /// True for the one template per asset class carrying identifiers, a
+    /// description and a currency; the platform mints no INS- record under it.
+    #[prost(bool, tag = "6")]
+    pub base: bool,
+    /// Its calculation package: the slot defined and empty until the template
+    /// calculations (row 6i').
+    #[prost(string, tag = "7")]
+    pub calculation: ::prost::alloc::string::String,
+    /// Each by its path, its type and whether it is required.
+    #[prost(message, repeated, tag = "8")]
+    pub fields: ::prost::alloc::vec::Vec<TemplateField>,
+    /// The identifier schemes it matches on, each by its scheme's spelling,
+    /// share_class_figi first.
+    #[prost(string, repeated, tag = "9")]
+    pub match_rule: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// One field of a template (W3.24).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TemplateField {
+    /// As an offer (TemplateFieldValue.path) and a missing field name it.
+    #[prost(string, tag = "1")]
+    pub path: ::prost::alloc::string::String,
+    /// One of the contract's types, as a dictionary entry's type is written.
+    #[prost(string, tag = "2")]
+    pub r#type: ::prost::alloc::string::String,
+    /// A record without it is incomplete, its missing fields listed (W3.7).
+    #[prost(bool, tag = "3")]
+    pub required: bool,
+}
+/// W3.24: the platform's answer to a pull of its template catalogue, the
+/// versions after the highest held, handed to the instrument store on the
+/// bus as it came (`platform.reference.event.templates-pulled`).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PullTemplatesReply {
+    #[prost(message, repeated, tag = "1")]
+    pub templates: ::prost::alloc::vec::Vec<SecurityTemplate>,
+}
+/// W3.25: the identifier schemes the platform may receive, by family, and
+/// the pace a migration's or a backfill's batches are sent at; pulled by the
+/// conductor and handed to the store
+/// (`platform.reference.event.licence-list-pulled`). open_meridian_local and
+/// the LCL- ID are never on it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LicenceList {
+    #[prost(int64, tag = "1")]
+    pub version: i64,
+    #[prost(string, repeated, tag = "2")]
+    pub schemes: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// The pace a migration's or a backfill's batches are sent at.
+    #[prost(message, optional, tag = "3")]
+    pub pace: ::core::option::Option<LicencePace>,
+}
+/// A pace, as OpenFIGI states its own limits (W3.25).
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct LicencePace {
+    /// Requests in one batch.
+    #[prost(int32, tag = "1")]
+    pub batch_size: i32,
+    #[prost(int32, tag = "2")]
+    pub batches_per_minute: i32,
+}
+/// W3.27: the platform's replacements and decommissions after a sequence,
+/// the same for every deployment, handed to the store as it came
+/// (`platform.reference.event.replacements-pulled`).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PullReplacementsReply {
+    #[prost(message, repeated, tag = "1")]
+    pub entries: ::prost::alloc::vec::Vec<ReplacementFeedEntry>,
+}
+/// One merge or decommission on the platform's master (W1.27, W3.27).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReplacementFeedEntry {
+    #[prost(int64, tag = "1")]
+    pub sequence: i64,
+    /// The INS- record merged or decommissioned.
+    #[prost(string, tag = "2")]
+    pub instrument_id: ::prost::alloc::string::String,
+    /// The record it was merged into; empty on a decommission.
+    #[prost(string, tag = "3")]
+    pub replaced_by: ::prost::alloc::string::String,
+    #[prost(bool, tag = "4")]
+    pub decommissioned: bool,
+}
+/// W3.28: the deployment's usage statistics, counts only -- never a value, a
+/// holding, a quantity or an account -- sent weekly and once after the
+/// migration, unless the deployment admin turned the report off.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct IdentifierUsageReport {
+    /// ISO 8601 dates, the period the counts cover.
+    #[prost(string, tag = "1")]
+    pub period_start: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub period_end: ::prost::alloc::string::String,
+    /// The scheme names the deployment declares it is licensed for.
+    #[prost(string, repeated, tag = "3")]
+    pub licensed_schemes: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(message, repeated, tag = "4")]
+    pub scheme_counts: ::prost::alloc::vec::Vec<SchemeUsageCount>,
+}
+/// One identifier scheme's counts over the period (W3.28).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SchemeUsageCount {
+    #[prost(string, tag = "1")]
+    pub scheme: ::prost::alloc::string::String,
+    /// Instruments carrying it.
+    #[prost(int64, tag = "2")]
+    pub instruments_carrying: i64,
+    /// Instruments that resolve only through it.
+    #[prost(int64, tag = "3")]
+    pub instruments_only_by: i64,
+    /// Misses that arrived with it as their only identifier.
+    #[prost(int64, tag = "4")]
+    pub misses_only_by: i64,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ReportIdentifierUsageReply {
+    #[prost(bool, tag = "1")]
+    pub received: bool,
+}
 /// Lifecycle. The transition verbs are the commands; nothing sets this directly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -2456,6 +2805,90 @@ impl MissReason {
             "MISS_REASON_UNSPECIFIED" => Some(Self::Unspecified),
             "MISS_REASON_NOT_FOUND" => Some(Self::NotFound),
             "MISS_REASON_AMBIGUOUS" => Some(Self::Ambiguous),
+            _ => None,
+        }
+    }
+}
+/// Why a record was replaced (W3.8, contract v24).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ReplacementCause {
+    /// A replacement before v24 whose facts are missing, recorded as a gap.
+    Unspecified = 0,
+    /// A person merged the record into the one that stays (W3.13).
+    Merged = 1,
+    /// A provisional record resolved to the platform's INS- record.
+    Resolved = 2,
+    /// The platform merged two INS- records, followed from the replacement
+    /// feed (W3.27).
+    PlatformMerged = 3,
+}
+impl ReplacementCause {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "REPLACEMENT_CAUSE_UNSPECIFIED",
+            Self::Merged => "REPLACEMENT_CAUSE_MERGED",
+            Self::Resolved => "REPLACEMENT_CAUSE_RESOLVED",
+            Self::PlatformMerged => "REPLACEMENT_CAUSE_PLATFORM_MERGED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "REPLACEMENT_CAUSE_UNSPECIFIED" => Some(Self::Unspecified),
+            "REPLACEMENT_CAUSE_MERGED" => Some(Self::Merged),
+            "REPLACEMENT_CAUSE_RESOLVED" => Some(Self::Resolved),
+            "REPLACEMENT_CAUSE_PLATFORM_MERGED" => Some(Self::PlatformMerged),
+            _ => None,
+        }
+    }
+}
+/// Why a deployment's record is provisional (W3.7, W3.11; contract v24).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ProvisionalReason {
+    Unspecified = 0,
+    /// The platform not reached within the bounded ask.
+    Unreachable = 1,
+    /// Incomplete against its template, its missing_fields listed: the
+    /// incomplete or offline state, a thin record with no open identifier
+    /// whose terms are incomplete among them.
+    Incomplete = 2,
+    /// Its request in the platform's staff's queue.
+    AwaitingStaff = 3,
+    /// No asset class stated, so no template named.
+    ClassNeeded = 4,
+    /// Held back by the deployment admin at the migration (W3.26).
+    HeldBack = 5,
+}
+impl ProvisionalReason {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "PROVISIONAL_REASON_UNSPECIFIED",
+            Self::Unreachable => "PROVISIONAL_REASON_UNREACHABLE",
+            Self::Incomplete => "PROVISIONAL_REASON_INCOMPLETE",
+            Self::AwaitingStaff => "PROVISIONAL_REASON_AWAITING_STAFF",
+            Self::ClassNeeded => "PROVISIONAL_REASON_CLASS_NEEDED",
+            Self::HeldBack => "PROVISIONAL_REASON_HELD_BACK",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "PROVISIONAL_REASON_UNSPECIFIED" => Some(Self::Unspecified),
+            "PROVISIONAL_REASON_UNREACHABLE" => Some(Self::Unreachable),
+            "PROVISIONAL_REASON_INCOMPLETE" => Some(Self::Incomplete),
+            "PROVISIONAL_REASON_AWAITING_STAFF" => Some(Self::AwaitingStaff),
+            "PROVISIONAL_REASON_CLASS_NEEDED" => Some(Self::ClassNeeded),
+            "PROVISIONAL_REASON_HELD_BACK" => Some(Self::HeldBack),
             _ => None,
         }
     }
@@ -6289,6 +6722,18 @@ pub struct AccountAttributes {
     /// states it, so false is a deployment admin's act with its reason.
     #[prost(bool, tag = "6")]
     pub waits_for_compliance: bool,
+    /// Contract v24 (W9.13; the order-path plan's v24 item 10): a booking may
+    /// allocate to it without the instruction naming it, each allocation
+    /// carrying its reason and ErrorCause and raising an alert (W11.27,
+    /// W11.34). A deployment admin's mark; unmarking is recorded, and past
+    /// allocations keep their flag.
+    #[prost(bool, tag = "7")]
+    pub error_account: bool,
+    /// Contract v24 (W9.13; the order-path plan's v24 item 7): a block order's
+    /// account, with no statement to reconcile against, flat once booked; a
+    /// balance left after booking holds the booking (W11.28).
+    #[prost(bool, tag = "8")]
+    pub allocation_account: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SetAccountAttributeRequest {
@@ -6296,7 +6741,7 @@ pub struct SetAccountAttributeRequest {
     pub account_id: ::prost::alloc::string::String,
     #[prost(string, tag = "4")]
     pub reason: ::prost::alloc::string::String,
-    #[prost(oneof = "set_account_attribute_request::Attribute", tags = "2, 3, 5")]
+    #[prost(oneof = "set_account_attribute_request::Attribute", tags = "2, 3, 5, 6, 7")]
     pub attribute: ::core::option::Option<set_account_attribute_request::Attribute>,
 }
 /// Nested message and enum types in `SetAccountAttributeRequest`.
@@ -6311,6 +6756,12 @@ pub mod set_account_attribute_request {
         /// dashboard__set_account_attribute (the order-path plan's refresh, Q44).
         #[prost(bool, tag = "5")]
         WaitsForCompliance(bool),
+        /// Contract v24 (W9.13): a deployment admin's, each change its own
+        /// record with its reason.
+        #[prost(bool, tag = "6")]
+        ErrorAccount(bool),
+        #[prost(bool, tag = "7")]
+        AllocationAccount(bool),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -6487,6 +6938,15 @@ pub struct Order {
     pub charges: ::prost::alloc::vec::Vec<Charge>,
     #[prost(message, optional, tag = "39")]
     pub last_change: ::core::option::Option<JournalRef>,
+    /// Contract v24 (W11.1; the order-path plan's v24 item 6): on a block
+    /// order, its members as proposed -- released orders of one instrument and
+    /// side, each in no other live block. Empty on any other order.
+    #[prost(string, repeated, tag = "45")]
+    pub block_member_order_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Contract v24 (W11.33): each sleeve cross that filled the order; its
+    /// filled quantity counts each, and no execution is minted for one.
+    #[prost(string, repeated, tag = "46")]
+    pub sleeve_cross_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// An order's status: its state, its conditions and its quantities, each
 /// derived.
@@ -6971,6 +7431,10 @@ pub struct Execution {
     /// and Q.
     #[prost(string, tag = "40")]
     pub venue_client_order_id: ::prost::alloc::string::String,
+    /// Contract v24 (W11.32): each prime's answer to a give-up of the
+    /// execution, in the order recorded; a rejection moves no position.
+    #[prost(message, repeated, tag = "41")]
+    pub give_up_answers: ::prost::alloc::vec::Vec<GiveUpRecord>,
 }
 /// An execution's finality: a level, and when it reached it.
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
@@ -6988,6 +7452,11 @@ pub struct Fee {
     /// Signed; a rebate negative.
     #[prost(message, optional, tag = "2")]
     pub amount: ::core::option::Option<Money>,
+    /// Contract v24 (W11.27; the order-path plan's v24 item 4): the `oms`'s
+    /// choice by its policy. A capitalised fee enters the lot's cost on a buy;
+    /// every fee stays its own cash line either way.
+    #[prost(bool, tag = "3")]
+    pub capitalised: bool,
 }
 /// A fee with no fill, on its placement (W11.12): it moves cash, pending to
 /// its settlement date, and counts toward no quantity.
@@ -7245,6 +7714,13 @@ pub struct ProposeOrderRequest {
     /// another currency INVALID_ARGUMENT naming `limit_price` or `stop_price`.
     #[prost(string, tag = "35")]
     pub quote_currency: ::prost::alloc::string::String,
+    /// Contract v24 (W11.1; the order-path plan's v24 item 6): the `oms`'s
+    /// block order, in the allocation account, naming its members, each a
+    /// released order of one instrument and side in no other live block
+    /// (REFUSAL_REASON_ORDER_STATE). Released on creation, its quantity the
+    /// sum of its members' idle quantities.
+    #[prost(string, repeated, tag = "36")]
+    pub block_member_order_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// W11.2. A fact: never through the gate. By the `oms`, for a user, naming
 /// the account: a telephoned or outside order. A connectivity plugin records
@@ -7931,6 +8407,417 @@ pub struct ListLocatesReply {
     #[prost(string, tag = "3")]
     pub next_cursor: ::prost::alloc::string::String,
 }
+/// A booking of an order's executions to their accounts (W11.27 to W11.30).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Booking {
+    /// `BKG-` and a ULID, minted by the book, never reused (decisions/035,
+    /// point 7); the reference the street echoes back.
+    #[prost(string, tag = "1")]
+    pub booking_id: ::prost::alloc::string::String,
+    /// The order's `ORD-` ID; a child's executions are booked as its parent's.
+    #[prost(string, tag = "2")]
+    pub order_id: ::prost::alloc::string::String,
+    /// The order's account, whose partition the booking is in; the allocation
+    /// account for a block.
+    #[prost(string, tag = "3")]
+    pub account_id: ::prost::alloc::string::String,
+    /// An explicit list on one order, sharing instrument, side, trade date and
+    /// settlement date, as FIX's AllocationInstruction (J) requires of NoExecs.
+    #[prost(string, repeated, tag = "4")]
+    pub execution_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// One per account, summing exactly to the executions booked in quantity,
+    /// gross and each fee kind.
+    #[prost(message, repeated, tag = "5")]
+    pub allocations: ::prost::alloc::vec::Vec<Allocation>,
+    /// Derived from its journal, never stored.
+    #[prost(enumeration = "BookingState", tag = "6")]
+    pub state: i32,
+    /// The book's words for what moved executed away from allocated, as FIX
+    /// keeps a rejection's reason in AllocRejCode (88); empty unless held.
+    #[prost(string, tag = "7")]
+    pub held_reason: ::prost::alloc::string::String,
+    /// Its latest entry, which a catch-up reads it by (W4.3).
+    #[prost(message, optional, tag = "8")]
+    pub last_change: ::core::option::Option<JournalRef>,
+}
+/// One account's part of a booking (W11.27).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Allocation {
+    /// `ALC-` and a ULID, minted by the book even for one account, never
+    /// reused (FIX IndividualAllocID, 467); empty on a command.
+    #[prost(string, tag = "1")]
+    pub allocation_id: ::prost::alloc::string::String,
+    /// An account the allocation instruction names, or one marked an error
+    /// account (W9.13).
+    #[prost(string, tag = "2")]
+    pub account_id: ::prost::alloc::string::String,
+    /// The instruction line's sleeve, the order's own the default; empty for
+    /// the account's unsleeved part.
+    #[prost(string, tag = "3")]
+    pub sleeve: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "4")]
+    pub quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// The price the account's confirmation states.
+    #[prost(message, optional, tag = "5")]
+    pub average_price: ::core::option::Option<Money>,
+    /// Quantity times average price, as the `oms` rounds it; the residual on a
+    /// named allocation.
+    #[prost(message, optional, tag = "6")]
+    pub gross_amount: ::core::option::Option<Money>,
+    /// Each kind summing exactly to the executions' fees of that kind.
+    #[prost(message, repeated, tag = "7")]
+    pub fees: ::prost::alloc::vec::Vec<Fee>,
+    /// Derived from gross and fees, not checked by the book.
+    #[prost(message, optional, tag = "8")]
+    pub net_amount: ::core::option::Option<Money>,
+    /// The date `operations` reconciles the allocation by, superseding the
+    /// fill's.
+    #[prost(string, tag = "9")]
+    pub intended_settlement_date: ::prost::alloc::string::String,
+    /// Priced at the average, as the SEC's average-price notation marks a
+    /// confirmation.
+    #[prost(bool, tag = "10")]
+    pub average_priced: bool,
+    /// The receiving account's own lots to relieve; empty, by the method.
+    #[prost(string, repeated, tag = "11")]
+    pub relieve_lot_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// A person's words, required on an error-account allocation
+    /// (REFUSAL_REASON_REASON_REQUIRED).
+    #[prost(string, tag = "12")]
+    pub reason: ::prost::alloc::string::String,
+    /// Unspecified unless the allocation is to an error account.
+    #[prost(enumeration = "ErrorCause", tag = "13")]
+    pub error_cause: i32,
+    /// Required with ERROR_CAUSE_OTHER (INVALID_ARGUMENT naming it), as FIX's
+    /// Text (58).
+    #[prost(string, tag = "14")]
+    pub error_text: ::prost::alloc::string::String,
+    /// Each prime's answer to a give-up of the allocation, in the order
+    /// recorded (W11.32).
+    #[prost(message, repeated, tag = "15")]
+    pub give_up_answers: ::prost::alloc::vec::Vec<GiveUpRecord>,
+}
+/// A prime's answer to a give-up (W11.32), its own record, as FIX sends each
+/// AllocationReport (AS) as its own message.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GiveUpRecord {
+    #[prost(enumeration = "GiveUpAnswer", tag = "1")]
+    pub answer: i32,
+    /// As reported, FIX's SecondaryAllocID (793).
+    #[prost(string, tag = "2")]
+    pub prime_reference: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub reason: ::prost::alloc::string::String,
+    /// Its entry in the account's partition.
+    #[prost(message, optional, tag = "4")]
+    pub entry: ::core::option::Option<EntryMeta>,
+}
+/// A cross between two sleeves of one account (W11.33), its tax and
+/// performance layers; no execution is minted for it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SleeveCross {
+    /// `SXC-` and a ULID, minted by the book, never reused.
+    #[prost(string, tag = "1")]
+    pub sleeve_cross_id: ::prost::alloc::string::String,
+    /// One account; a cross between accounts is an internal cross, a real
+    /// trade.
+    #[prost(string, tag = "2")]
+    pub account_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub instrument_id: ::prost::alloc::string::String,
+    /// Empty for the account's unsleeved part.
+    #[prost(string, tag = "4")]
+    pub giving_sleeve: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub receiving_sleeve: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "6")]
+    pub quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// The plugin's choice (mid, last or close): each moved lot's performance
+    /// cost, never its tax basis.
+    #[prost(message, optional, tag = "7")]
+    pub cross_price: ::core::option::Option<Money>,
+    /// Which price and when, the plugin's words.
+    #[prost(string, tag = "8")]
+    pub price_source: ::prost::alloc::string::String,
+    /// Each order's filled quantity counts the cross.
+    #[prost(string, repeated, tag = "9")]
+    pub order_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, tag = "10")]
+    pub reason: ::prost::alloc::string::String,
+}
+/// A post-trade alert in an account's partition (W11.34), raised,
+/// acknowledged or cleared, never deleted; landed in the compliance spec's
+/// shape.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Alert {
+    /// `ALR-` and a ULID, minted by the book, never reused.
+    #[prost(string, tag = "1")]
+    pub alert_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub account_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "AlertKind", tag = "3")]
+    pub kind: i32,
+    #[prost(enumeration = "AlertState", tag = "4")]
+    pub state: i32,
+    /// The book's words or `compliance`'s.
+    #[prost(string, tag = "5")]
+    pub reason: ::prost::alloc::string::String,
+    /// What it is about.
+    #[prost(message, optional, tag = "6")]
+    pub subject: ::core::option::Option<AlertSubject>,
+    /// A held booking's: the moment the `operations` plugin's
+    /// affirmation_deadline falls on the trade date, in the deployment's time
+    /// zone; zero otherwise.
+    #[prost(int64, tag = "7")]
+    pub due_by: i64,
+    /// Its latest entry, which a catch-up reads it by (W4.3).
+    #[prost(message, optional, tag = "8")]
+    pub last_change: ::core::option::Option<JournalRef>,
+}
+/// What an alert is about: a booking and its allocation, or for
+/// `compliance`'s own an order or a position.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AlertSubject {
+    #[prost(string, tag = "1")]
+    pub order_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub booking_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub allocation_id: ::prost::alloc::string::String,
+    /// An instrument and a side in the account, as a break names one (W9.4).
+    #[prost(message, optional, tag = "4")]
+    pub position: ::core::option::Option<PositionKey>,
+}
+/// W11.26: an order's allocation instruction amended, with a reason;
+/// answered with OrderReply.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SetAllocationInstructionRequest {
+    #[prost(string, tag = "1")]
+    pub order_id: ::prost::alloc::string::String,
+    /// The whole instruction; refused REFUSAL_REASON_ORDER_STATE where an
+    /// account's amount falls below what its live bookings allocate.
+    #[prost(message, optional, tag = "2")]
+    pub allocation_instruction: ::core::option::Option<AllocationInstruction>,
+    #[prost(string, tag = "3")]
+    pub reason: ::prost::alloc::string::String,
+}
+/// W11.27: book an explicit list of executions on one order.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BookOrderRequest {
+    #[prost(string, tag = "1")]
+    pub order_id: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "2")]
+    pub execution_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(message, repeated, tag = "3")]
+    pub allocations: ::prost::alloc::vec::Vec<Allocation>,
+    /// Handed off in the same act where the check passes, and booked where it
+    /// does not, as FIX's Ready-To-Book (AllocType, 626) in one step.
+    #[prost(bool, tag = "4")]
+    pub hand_off: bool,
+}
+/// W11.28: hand a booked or held booking off to `operations`, or close a
+/// client's booking the firm does not settle.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct HandOffBookingRequest {
+    #[prost(string, tag = "1")]
+    pub booking_id: ::prost::alloc::string::String,
+    /// The client's allocations close, any error-account allocation on it
+    /// handed off to the firm's operations in the same act.
+    #[prost(bool, tag = "2")]
+    pub close: bool,
+}
+/// W11.29: cancel a booking before its hand-off, or replace its allocations
+/// after it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CorrectBookingRequest {
+    /// As FIX's RefAllocID (72) names the allocation it replaces.
+    #[prost(string, tag = "1")]
+    pub booking_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "BookingCorrectionKind", tag = "2")]
+    pub kind: i32,
+    /// The whole set on a replace, as FIX's allocation Replace carries it;
+    /// empty on a cancel.
+    #[prost(message, repeated, tag = "3")]
+    pub allocations: ::prost::alloc::vec::Vec<Allocation>,
+    /// Empty: the trade date; empty on a cancel.
+    #[prost(string, tag = "4")]
+    pub effective_date: ::prost::alloc::string::String,
+    /// As FIX's AllocCancReplaceReason (796) records why.
+    #[prost(string, tag = "5")]
+    pub reason: ::prost::alloc::string::String,
+}
+/// W11.32: a prime's answer to a give-up, from `connectivity` or
+/// `confirmation`; a fact, answered with FactReply.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReportGiveUpRequest {
+    /// One the book does not hold keeps the fact unplaced.
+    #[prost(string, tag = "1")]
+    pub execution_id: ::prost::alloc::string::String,
+    /// Empty where no allocation is booked.
+    #[prost(string, tag = "2")]
+    pub allocation_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "GiveUpAnswer", tag = "3")]
+    pub answer: i32,
+    #[prost(string, tag = "4")]
+    pub prime_reference: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub reason: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "6")]
+    pub raw_record: ::core::option::Option<::meridian_pb::v1::RawRecordRef>,
+}
+/// W11.33: a cross between two sleeves of one account, the `oms`'s.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RecordSleeveCrossRequest {
+    #[prost(message, optional, tag = "1")]
+    pub sleeve_cross: ::core::option::Option<SleeveCross>,
+}
+/// W11.34: `compliance`'s own alert.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RaiseAlertRequest {
+    #[prost(string, tag = "1")]
+    pub account_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "AlertKind", tag = "2")]
+    pub kind: i32,
+    #[prost(string, tag = "3")]
+    pub reason: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "4")]
+    pub subject: ::core::option::Option<AlertSubject>,
+}
+/// W11.34: an alert acknowledged, for a person, with a reason.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AcknowledgeAlertRequest {
+    #[prost(string, tag = "1")]
+    pub alert_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub reason: ::prost::alloc::string::String,
+}
+/// W11.36: the deployment admin's setting for orders on local records, kept
+/// in the control partition, each change its own entry.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SetLocalRecordOrdersRequest {
+    /// Shown "Allow orders on local records"; true by default.
+    #[prost(bool, tag = "1")]
+    pub allows_local_record_orders: bool,
+    #[prost(string, tag = "2")]
+    pub reason: ::prost::alloc::string::String,
+}
+/// W11.37: the setting read.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ReadLocalRecordOrdersRequest {}
+/// The escape hatch's setting in force (W11.36, W11.37).
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct LocalRecordOrdersSetting {
+    #[prost(bool, tag = "1")]
+    pub allows_local_record_orders: bool,
+    /// Orders not ended whose instrument's record is provisional, as of the
+    /// answer, for the deployment: a count naming no account and no order.
+    #[prost(int64, tag = "2")]
+    pub open_order_count: i64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BookingReply {
+    #[prost(message, optional, tag = "1")]
+    pub booking: ::core::option::Option<Booking>,
+    #[prost(message, optional, tag = "2")]
+    pub entry: ::core::option::Option<EntryMeta>,
+    #[prost(message, optional, tag = "3")]
+    pub journal: ::core::option::Option<JournalRef>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SleeveCrossReply {
+    #[prost(message, optional, tag = "1")]
+    pub sleeve_cross: ::core::option::Option<SleeveCross>,
+    #[prost(message, optional, tag = "2")]
+    pub journal: ::core::option::Option<JournalRef>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AlertReply {
+    #[prost(message, optional, tag = "1")]
+    pub alert: ::core::option::Option<Alert>,
+    #[prost(message, optional, tag = "2")]
+    pub journal: ::core::option::Option<JournalRef>,
+}
+/// W11.30: to `operations`, `oms`, `compliance`, `portfolio` and `reporting`
+/// within scope, by the account the booking is in.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BookingUpdatedEvent {
+    /// Its whole new state, safe to apply twice.
+    #[prost(message, optional, tag = "1")]
+    pub booking: ::core::option::Option<Booking>,
+    #[prost(message, optional, tag = "2")]
+    pub entry: ::core::option::Option<EntryMeta>,
+    #[prost(message, optional, tag = "3")]
+    pub journal: ::core::option::Option<JournalRef>,
+    #[prost(message, optional, tag = "4")]
+    pub cause: ::core::option::Option<ChangeCause>,
+}
+/// W11.35: to `compliance`, `reporting`, `oms` and `operations` within scope.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AlertChangedEvent {
+    #[prost(message, optional, tag = "1")]
+    pub alert: ::core::option::Option<Alert>,
+    #[prost(message, optional, tag = "2")]
+    pub journal: ::core::option::Option<JournalRef>,
+    #[prost(message, optional, tag = "3")]
+    pub cause: ::core::option::Option<ChangeCause>,
+}
+/// W11.31: the bookings in the reader's scope, as of now or changed since a
+/// watermark, filtered by state.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListBookingsRequest {
+    /// Empty: every account in the reader's scope.
+    #[prost(string, tag = "1")]
+    pub account_id: ::prost::alloc::string::String,
+    /// Only records whose last change is above it (W4.3).
+    #[prost(message, optional, tag = "2")]
+    pub since: ::core::option::Option<Watermark>,
+    /// Unspecified: every state.
+    #[prost(enumeration = "BookingState", tag = "3")]
+    pub state: i32,
+    #[prost(int32, tag = "4")]
+    pub page_size: i32,
+    #[prost(string, tag = "5")]
+    pub cursor: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListBookingsReply {
+    #[prost(message, repeated, tag = "1")]
+    pub bookings: ::prost::alloc::vec::Vec<Booking>,
+    #[prost(message, optional, tag = "2")]
+    pub as_of: ::core::option::Option<Watermark>,
+    #[prost(string, tag = "3")]
+    pub next_cursor: ::prost::alloc::string::String,
+}
+/// W11.35: the alerts in the reader's scope, as of now or changed since a
+/// watermark, filtered by state and kind.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListAlertsRequest {
+    /// Empty: every account in the reader's scope.
+    #[prost(string, tag = "1")]
+    pub account_id: ::prost::alloc::string::String,
+    /// Unspecified: every state.
+    #[prost(enumeration = "AlertState", tag = "2")]
+    pub state: i32,
+    /// Only records whose last change is above it (W4.3).
+    #[prost(message, optional, tag = "3")]
+    pub since: ::core::option::Option<Watermark>,
+    #[prost(int32, tag = "4")]
+    pub page_size: i32,
+    #[prost(string, tag = "5")]
+    pub cursor: ::prost::alloc::string::String,
+    /// Unspecified: every kind.
+    #[prost(enumeration = "AlertKind", tag = "6")]
+    pub kind: i32,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListAlertsReply {
+    #[prost(message, repeated, tag = "1")]
+    pub alerts: ::prost::alloc::vec::Vec<Alert>,
+    #[prost(message, optional, tag = "2")]
+    pub as_of: ::core::option::Option<Watermark>,
+    #[prost(string, tag = "3")]
+    pub next_cursor: ::prost::alloc::string::String,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum SettlementBucket {
@@ -8142,6 +9029,11 @@ pub enum BreakCategory {
     /// available and not available against the book's position, or an
     /// encumbrance against the book's of that kind, location and pledgee.
     Figure = 7,
+    /// Contract v24 (W9.3; the one-ID model, ruled 2026-10-14): a statement row
+    /// the street kept unresolved because its source is thinner than an
+    /// instrument record's minimum (W3.7). No instrument and no position: the
+    /// break names the street record by value. ISO 15022/20022's DSEC.
+    UnrecognizedSecurity = 8,
 }
 impl BreakCategory {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -8158,6 +9050,7 @@ impl BreakCategory {
             Self::BookOnly => "BREAK_CATEGORY_BOOK_ONLY",
             Self::StreetOnly => "BREAK_CATEGORY_STREET_ONLY",
             Self::Figure => "BREAK_CATEGORY_FIGURE",
+            Self::UnrecognizedSecurity => "BREAK_CATEGORY_UNRECOGNIZED_SECURITY",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -8171,6 +9064,7 @@ impl BreakCategory {
             "BREAK_CATEGORY_BOOK_ONLY" => Some(Self::BookOnly),
             "BREAK_CATEGORY_STREET_ONLY" => Some(Self::StreetOnly),
             "BREAK_CATEGORY_FIGURE" => Some(Self::Figure),
+            "BREAK_CATEGORY_UNRECOGNIZED_SECURITY" => Some(Self::UnrecognizedSecurity),
             _ => None,
         }
     }
@@ -9858,6 +10752,239 @@ impl LocateUseKind {
             "LOCATE_USE_KIND_RESERVE" => Some(Self::Reserve),
             "LOCATE_USE_KIND_GIVE_BACK" => Some(Self::GiveBack),
             "LOCATE_USE_KIND_CONSUME" => Some(Self::Consume),
+            _ => None,
+        }
+    }
+}
+/// A booking's state (W11.30), derived from its journal, never stored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum BookingState {
+    Unspecified = 0,
+    /// Booked, its allocations tying out, not yet handed off or closed.
+    Booked = 1,
+    /// Executed no longer equals allocated -- a bust, a correction, a late
+    /// fill or a later fee since booking -- or a hand-off's check failed; its
+    /// reason in held_reason, and a held-booking alert raised.
+    Held = 2,
+    /// Handed off to `operations`, which owns each allocation's post-trade
+    /// life.
+    HandedOff = 3,
+    /// A client's booking the firm does not settle, closed, its error-account
+    /// allocations handed off.
+    Closed = 4,
+    /// Cancelled by the `oms` before the hand-off, so its executions may be
+    /// booked again.
+    Cancelled = 5,
+}
+impl BookingState {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "BOOKING_STATE_UNSPECIFIED",
+            Self::Booked => "BOOKING_STATE_BOOKED",
+            Self::Held => "BOOKING_STATE_HELD",
+            Self::HandedOff => "BOOKING_STATE_HANDED_OFF",
+            Self::Closed => "BOOKING_STATE_CLOSED",
+            Self::Cancelled => "BOOKING_STATE_CANCELLED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "BOOKING_STATE_UNSPECIFIED" => Some(Self::Unspecified),
+            "BOOKING_STATE_BOOKED" => Some(Self::Booked),
+            "BOOKING_STATE_HELD" => Some(Self::Held),
+            "BOOKING_STATE_HANDED_OFF" => Some(Self::HandedOff),
+            "BOOKING_STATE_CLOSED" => Some(Self::Closed),
+            "BOOKING_STATE_CANCELLED" => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
+}
+/// A booking's correction (W11.29), as FIX's AllocTransType (71).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum BookingCorrectionKind {
+    Unspecified = 0,
+    /// The `oms`'s, before the hand-off or closing.
+    Cancel = 1,
+    /// `operations`', after it, with the full new allocation set: a new
+    /// version, the state kept.
+    Replace = 2,
+}
+impl BookingCorrectionKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "BOOKING_CORRECTION_KIND_UNSPECIFIED",
+            Self::Cancel => "BOOKING_CORRECTION_KIND_CANCEL",
+            Self::Replace => "BOOKING_CORRECTION_KIND_REPLACE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "BOOKING_CORRECTION_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "BOOKING_CORRECTION_KIND_CANCEL" => Some(Self::Cancel),
+            "BOOKING_CORRECTION_KIND_REPLACE" => Some(Self::Replace),
+            _ => None,
+        }
+    }
+}
+/// Why an allocation is to an error account (W11.27; the order-path plan's
+/// v24 item 10). FIX has no standard list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ErrorCause {
+    /// Not an error-account allocation.
+    Unspecified = 0,
+    /// The venue filled more than ordered; the excess booked to the error
+    /// account.
+    Overfill = 1,
+    ClientReneged = 2,
+    /// A venue-originated fill accepted to the wrong order (W11.23).
+    WrongAccept = 3,
+    /// The firm's own booking error.
+    BookingError = 4,
+    /// Another cause, which error_text says.
+    Other = 5,
+}
+impl ErrorCause {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "ERROR_CAUSE_UNSPECIFIED",
+            Self::Overfill => "ERROR_CAUSE_OVERFILL",
+            Self::ClientReneged => "ERROR_CAUSE_CLIENT_RENEGED",
+            Self::WrongAccept => "ERROR_CAUSE_WRONG_ACCEPT",
+            Self::BookingError => "ERROR_CAUSE_BOOKING_ERROR",
+            Self::Other => "ERROR_CAUSE_OTHER",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "ERROR_CAUSE_UNSPECIFIED" => Some(Self::Unspecified),
+            "ERROR_CAUSE_OVERFILL" => Some(Self::Overfill),
+            "ERROR_CAUSE_CLIENT_RENEGED" => Some(Self::ClientReneged),
+            "ERROR_CAUSE_WRONG_ACCEPT" => Some(Self::WrongAccept),
+            "ERROR_CAUSE_BOOKING_ERROR" => Some(Self::BookingError),
+            "ERROR_CAUSE_OTHER" => Some(Self::Other),
+            _ => None,
+        }
+    }
+}
+/// A prime's answer to a give-up (W11.32), as FIX's AllocStatus (87).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum GiveUpAnswer {
+    Unspecified = 0,
+    Accepted = 1,
+    /// The trade stays with the executing side; no position moves.
+    Rejected = 2,
+}
+impl GiveUpAnswer {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "GIVE_UP_ANSWER_UNSPECIFIED",
+            Self::Accepted => "GIVE_UP_ANSWER_ACCEPTED",
+            Self::Rejected => "GIVE_UP_ANSWER_REJECTED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "GIVE_UP_ANSWER_UNSPECIFIED" => Some(Self::Unspecified),
+            "GIVE_UP_ANSWER_ACCEPTED" => Some(Self::Accepted),
+            "GIVE_UP_ANSWER_REJECTED" => Some(Self::Rejected),
+            _ => None,
+        }
+    }
+}
+/// An alert's state (W11.34); nothing is deleted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum AlertState {
+    Unspecified = 0,
+    /// Raised, by the book or by `compliance`.
+    Raised = 1,
+    /// Acknowledged by `compliance` for a person, with a reason; never
+    /// clearing it.
+    Acknowledged = 2,
+    /// Cleared by the book: a held booking handed off or closed.
+    Cleared = 3,
+}
+impl AlertState {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "ALERT_STATE_UNSPECIFIED",
+            Self::Raised => "ALERT_STATE_RAISED",
+            Self::Acknowledged => "ALERT_STATE_ACKNOWLEDGED",
+            Self::Cleared => "ALERT_STATE_CLEARED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "ALERT_STATE_UNSPECIFIED" => Some(Self::Unspecified),
+            "ALERT_STATE_RAISED" => Some(Self::Raised),
+            "ALERT_STATE_ACKNOWLEDGED" => Some(Self::Acknowledged),
+            "ALERT_STATE_CLEARED" => Some(Self::Cleared),
+            _ => None,
+        }
+    }
+}
+/// What an alert is about (W11.34); v26 adds rule results to the same record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum AlertKind {
+    Unspecified = 0,
+    /// An allocation to an error account, raised by the book on each.
+    ErrorAccountBooking = 1,
+    /// A booking held, raised by the book and cleared by it at the hand-off
+    /// or closing.
+    BookingHeld = 2,
+    /// `compliance`'s own, through RaiseAlert.
+    Compliance = 3,
+}
+impl AlertKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "ALERT_KIND_UNSPECIFIED",
+            Self::ErrorAccountBooking => "ALERT_KIND_ERROR_ACCOUNT_BOOKING",
+            Self::BookingHeld => "ALERT_KIND_BOOKING_HELD",
+            Self::Compliance => "ALERT_KIND_COMPLIANCE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "ALERT_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "ALERT_KIND_ERROR_ACCOUNT_BOOKING" => Some(Self::ErrorAccountBooking),
+            "ALERT_KIND_BOOKING_HELD" => Some(Self::BookingHeld),
+            "ALERT_KIND_COMPLIANCE" => Some(Self::Compliance),
             _ => None,
         }
     }
@@ -12283,6 +13410,40 @@ pub struct ReadVenueCatalogueRequest {
 pub struct ReadVenueCatalogueReply {
     #[prost(message, optional, tag = "1")]
     pub catalogue: ::core::option::Option<VenueCatalogue>,
+}
+/// A deployment admin turns the report on or off, with a reason.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SetReportsUsageRequest {
+    #[prost(bool, tag = "1")]
+    pub reports_usage: bool,
+    #[prost(string, tag = "2")]
+    pub reason: ::prost::alloc::string::String,
+}
+/// The setting in force.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ReportsUsageSetting {
+    #[prost(bool, tag = "1")]
+    pub reports_usage: bool,
+}
+/// The reports the conductor sent.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ListUsageReportsRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListUsageReportsReply {
+    #[prost(message, repeated, tag = "1")]
+    pub reports: ::prost::alloc::vec::Vec<SentUsageReport>,
+}
+/// A usage report the conductor sent, kept on the deployment as its own
+/// record.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SentUsageReport {
+    #[prost(int64, tag = "1")]
+    pub sent_at_ns: i64,
+    /// Whether the platform received it.
+    #[prost(bool, tag = "2")]
+    pub received: bool,
+    #[prost(message, optional, tag = "3")]
+    pub report: ::core::option::Option<IdentifierUsageReport>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]

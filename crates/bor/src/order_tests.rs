@@ -2539,6 +2539,7 @@ async fn financing_and_commission_are_fee_kinds_each_its_own_cash_line() {
     filled.fees = vec![Fee {
         kind: FeeKind::Commission as i32,
         amount: usd("0.35"),
+        ..Default::default()
     }];
     let reply = execute(&w, &filled).await.unwrap();
     assert_eq!(
@@ -2554,6 +2555,7 @@ async fn financing_and_commission_are_fee_kinds_each_its_own_cash_line() {
             fee: Some(Fee {
                 kind: FeeKind::Financing as i32,
                 amount: usd("1.37"),
+                ..Default::default()
             }),
             trade_date: "2026-10-14".into(),
             settlement_date: "2026-10-14".into(),

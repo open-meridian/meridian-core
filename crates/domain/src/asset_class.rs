@@ -71,9 +71,37 @@ pub fn name(class: AssetClass) -> &'static str {
     }
 }
 
+/// The class as the platform's JSON spells it from contract v24: the enum's
+/// name without its prefix, in lower case (`equity`, `crypto_asset`), as the
+/// product owner ruled for the JSON on 2026-09-30
+/// (sdk-contract/asset-class-is-an-enum, "make the JSON lower case too");
+/// empty for no class. [`read`] takes it back.
+pub fn lower(class: AssetClass) -> String {
+    match class {
+        AssetClass::Unspecified => String::new(),
+        class => class
+            .as_str_name()
+            .trim_start_matches("ASSET_CLASS_")
+            .to_ascii_lowercase(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_lower_case_spelling_reads_back() {
+        for class in [
+            AssetClass::Equity,
+            AssetClass::CryptoAsset,
+            AssetClass::EventContract,
+        ] {
+            assert_eq!(read(&lower(class)), Some(class));
+        }
+        assert_eq!(lower(AssetClass::Fund), "fund");
+        assert_eq!(lower(AssetClass::Unspecified), "");
+    }
 
     #[test]
     fn the_enums_name_and_the_ruled_spelling_are_read() {

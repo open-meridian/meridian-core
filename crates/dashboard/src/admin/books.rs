@@ -238,6 +238,13 @@ pub fn arguments(request: &SetAccountAttributeRequest) -> serde_json::Value {
         Some(set_account_attribute_request::Attribute::WaitsForCompliance(waits)) => {
             arguments["waits_for_compliance"] = (*waits).into();
         }
+        // Contract v24 (W9.13): the error and allocation account marks.
+        Some(set_account_attribute_request::Attribute::ErrorAccount(marked)) => {
+            arguments["error_account"] = (*marked).into();
+        }
+        Some(set_account_attribute_request::Attribute::AllocationAccount(marked)) => {
+            arguments["allocation_account"] = (*marked).into();
+        }
         None => {}
     }
     arguments

@@ -283,6 +283,29 @@ message InstrumentRecord {
   // record whose type is binary event contract.
   BinaryEventContract binary_event_contract = 17;
 
+  // Contract v24 (W3.7; decisions/037, point 2 as amended 2026-10-14; the
+  // one-ID model): the deployment's own local record -- the platform
+  // unreachable, the request waiting for its staff, or, at the current
+  // stage, no open identifier to ask by. It names its template, may be
+  // incomplete, is a local line in the book, never priced, and an order on
+  // it the escape hatch (W9.1, W11). False on a record named by the
+  // platform's INS- ID, or keyed before v10.
+  bool provisional = 18;
+
+  // Contract v24 (W3.7, W3.24): the platform's template the record is held
+  // to, a class's base template where its type has none; empty on a record
+  // kept before v24 and not yet migrated, and on one whose source stated no
+  // class ("class needed").
+  string template_id = 19;
+  // A published version, immutable; empty where template_id is.
+  string template_version = 20;
+
+  // Contract v24 (W3.7): each required field of its template the record
+  // does not hold, by its path in the template (TemplateField.path); empty
+  // on a complete record and on every INS- record the platform minted.
+  // Never a gate on asking the platform.
+  repeated string missing_fields = 21;
+
   // Once a string, and free text; retired for the enum
   // (sdk-contract/asset-class-is-an-enum). The name carries on above.
   reserved 3;
@@ -840,6 +863,16 @@ message MissEntry {
   string class_note = 11;
   ChangeActor class_set_by = 12;
 
+  // Contract v24 (W1.13, W1.25; ruled 2026-10-14, the platform build's
+  // Q4): a request in the staff's queue, its source not confirming it, as
+  // the platform answered EscalateInstrumentReply.pending_review; false on
+  // a plain miss.
+  bool pending_review = 13;
+  // Why it waits, the platform's own string -- not_confirmed,
+  // wants_template, class_needed, no_match_identifier, met_a_stub -- as
+  // ChangelogEntry.operation's are; empty on a plain miss.
+  string review_reason = 14;
+
   // Once a string, and free text; retired for the enum
   // (sdk-contract/asset-class-is-an-enum). The name carries on above.
   reserved 3;
@@ -967,6 +1000,13 @@ message ResolveIdentifierReply {
   // alongside it. A later resolve of the same identifiers matches the
   // record, and is not minted. Until v10, true meant a placeholder.
   bool minted = 4;
+
+  // Contract v24 (W3.1, W3.7; decisions/037, point 2 as amended): the
+  // record answered is the deployment's provisional LCL- record -- the
+  // platform not reached within the bounded ask, its staff to review the
+  // request, or no open identifier to ask by -- naming its template, asked
+  // again on reconnect or once it has an open identifier.
+  bool provisional = 5;
 }
 
 // Forward resolution: an instrument identifier to its record.
@@ -1059,24 +1099,37 @@ message PullIdentifierReply {
   repeated VenueRecord venues = 4;
 }
 
-// The platform's surface for pairing a deployment's ID with an instrument
-// (W3.4), which a deployment does not call from contract v10: one sharing an
-// identifier in force on the date, or a stub minted from these identifiers
-// for an administrator to complete. Idempotent per deployment ID: asking
-// again answers the same pairing.
+// The deployment's matching and minting request (W3.4), the conductor's,
+// from contract v24 (decisions/037; the one-ID spec's requirement 7): it
+// says what to look for, and the platform verifies the security against its
+// own source and mints from that source's values (option (c), the one-ID
+// model). Only identifiers in schemes on the licence list (W3.25). It never
+// carries the deployment's LCL- ID or its name. Until v24, the platform's
+// surface for pairing a deployment's ID, which a deployment did not call
+// from contract v10.
 message EscalateInstrumentRequest {
   string source = 1;
   AssetClass asset_class = 7;
   repeated Identifier identifiers = 3;
   int64 as_of_ns = 4;
-  string requesting_deployment_id = 5;
 
-  // The deployment's ID for these identifiers.
-  string placeholder_instrument_id = 6;
+  // Contract v24: the template the record names, and its version.
+  string template_id = 8;
+  string template_version = 9;
+  // What the record's sources state, each with its source: offers to the
+  // platform's curation, never the master's record.
+  repeated TemplateFieldValue fields = 10;
+  // Only for retrying an answer that was lost: the platform answers a
+  // repeat with the answer it stored for the key; a new ask is a new key.
+  string request_key = 11;
 
   // Once a string, and free text; retired for the enum
   // (sdk-contract/asset-class-is-an-enum). The name carries on above.
   reserved 2;
+  // The deployment's ID and its LCL- record's ID, W3.4's v9 shape: retired
+  // at v24, since the request never names the deployment or its LCL- ID.
+  reserved 5, 6;
+  reserved "requesting_deployment_id", "placeholder_instrument_id";
 }
 
 message EscalateInstrumentReply {
@@ -1087,13 +1140,26 @@ message EscalateInstrumentReply {
   // either way; this is for the operator.
   bool minted = 2;
 
-  // The deployment's ID it pairs with, echoed from the request.
-  string replaces_instrument_id = 3;
-
   // True when the identifiers point at more than one instrument, or agree on
   // one identifier and contradict another of the same scheme. Nothing is
-  // paired or minted, instrument is empty, and staff decide.
+  // paired or minted, instrument is empty, and staff decide. From contract
+  // v24 never answered true: such a request is a near-match, minted and
+  // flagged (near_match); kept, never renumbered, deprecated at the next
+  // floor.
   bool conflict = 4;
+
+  // Contract v24 (W1.25, W3.4): minted, and flagged for the platform's
+  // staff to review as a near-match.
+  bool near_match = 5;
+
+  // Contract v24 (W1.25, W3.4): the request is in the staff's queue, its
+  // source not confirming it; nothing matched or minted, and the deployment
+  // keeps a provisional record and asks again.
+  bool pending_review = 6;
+
+  // The deployment's ID echoed from the request: retired at v24 with it.
+  reserved 3;
+  reserved "replaces_instrument_id";
 }
 
 // A record of the deployment's reached a new version (W3.5): minted, joined
@@ -1112,6 +1178,10 @@ message InstrumentAppliedEvent {
 // placeholder by its INS- ID. Stores keyed by instrument move what they hold
 // under it onto the one that stays (W3.9, W9.9); records of what was
 // reported keep it.
+//
+// From contract v24 also a provisional record resolved and a platform merge,
+// each with its cause, heard by every role (W3.8) and caught up by
+// ListReplacements (W3.22).
 message InstrumentReplacedEvent {
   // The record replaced.
   string replaced_instrument_id = 1;
@@ -1120,6 +1190,27 @@ message InstrumentReplacedEvent {
   InstrumentRecord instrument = 2;
 
   int64 replaced_at_ns = 3;
+
+  // Contract v24 (W3.8): why it was replaced; unspecified only on a
+  // replacement recorded before v24 and not yet backfilled.
+  ReplacementCause cause = 4;
+
+  // Contract v24 (W3.22): monotonic per deployment; ListReplacements reads
+  // after it. Zero only on a replacement recorded before v24.
+  int64 sequence = 5;
+}
+
+// Why a record was replaced (W3.8, contract v24).
+enum ReplacementCause {
+  // A replacement before v24 whose facts are missing, recorded as a gap.
+  REPLACEMENT_CAUSE_UNSPECIFIED = 0;
+  // A person merged the record into the one that stays (W3.13).
+  REPLACEMENT_CAUSE_MERGED = 1;
+  // A provisional record resolved to the platform's INS- record.
+  REPLACEMENT_CAUSE_RESOLVED = 2;
+  // The platform merged two INS- records, followed from the replacement
+  // feed (W3.27).
+  REPLACEMENT_CAUSE_PLATFORM_MERGED = 3;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1185,6 +1276,9 @@ message ListInstrumentsToCompleteRequest {
   // the instrument picker searches; empty for the list. At most 100
   // characters.
   string search = 5;
+
+  // Contract v24 (W3.11): only provisional records.
+  bool provisional = 6;
 }
 
 // A record and what it lacks (W3.11).
@@ -1200,6 +1294,27 @@ message InstrumentToComplete {
 
   // Complete for the book, a description, and a symbol where one exists.
   bool complete = 4;
+
+  // Contract v24 (W3.7, W3.11): why the record is provisional; unspecified
+  // on a record that is not.
+  ProvisionalReason provisional_reason = 5;
+}
+
+// Why a deployment's record is provisional (W3.7, W3.11; contract v24).
+enum ProvisionalReason {
+  PROVISIONAL_REASON_UNSPECIFIED = 0;
+  // The platform not reached within the bounded ask.
+  PROVISIONAL_REASON_UNREACHABLE = 1;
+  // Incomplete against its template, its missing_fields listed: the
+  // incomplete or offline state, a thin record with no open identifier
+  // whose terms are incomplete among them.
+  PROVISIONAL_REASON_INCOMPLETE = 2;
+  // Its request in the platform's staff's queue.
+  PROVISIONAL_REASON_AWAITING_STAFF = 3;
+  // No asset class stated, so no template named.
+  PROVISIONAL_REASON_CLASS_NEEDED = 4;
+  // Held back by the deployment admin at the migration (W3.26).
+  PROVISIONAL_REASON_HELD_BACK = 5;
 }
 
 // Identifiers that met more than one record, or an identifier another record
@@ -1246,6 +1361,35 @@ message ListInstrumentsToCompleteReply {
   int64 incomplete_for_book = 4;
   int64 incomplete = 5;
   repeated LicensedIdentifierCount licensed_identifiers = 6;
+
+  // Contract v24 (W3.11): the upgrade's migration run (W3.26), and per
+  // scheme being backfilled its backfill (W3.25). Counts, never a holding.
+  MigrationCounts migration_counts = 7;
+  repeated BackfillCount backfill_counts = 8;
+}
+
+// What the upgrade's migration run found (W3.11, W3.26; contract v24).
+message MigrationCounts {
+  // Already carrying the platform's ID.
+  int64 already_held = 1;
+  int64 matched = 2;
+  int64 minted = 3;
+  int64 near_match = 4;
+  int64 awaiting_staff = 5;
+  // No open identifier.
+  int64 kept_local = 6;
+  int64 unreachable = 7;
+  int64 held_back = 8;
+  // Still to send.
+  int64 remaining = 9;
+}
+
+// One scheme's backfill (W3.11, W3.25; contract v24).
+message BackfillCount {
+  string scheme = 1;
+  int64 matched = 2;
+  int64 awaiting_person = 3;
+  int64 remaining = 4;
 }
 
 // W3.12.
@@ -1353,6 +1497,11 @@ message AskPlatformForInstrumentRequest {
 
   // The date the record's identifiers are asked about. Zero means now.
   int64 as_of_ns = 3;
+
+  // Contract v24 (W3.4; the order-path plan's v24 question 30): the
+  // instrument store's matching and minting request, which the conductor
+  // sends the platform as EscalateInstrument, within its bounded ask.
+  EscalateInstrumentRequest match_or_mint = 4;
 }
 
 message AskPlatformForInstrumentReply {
@@ -1368,6 +1517,9 @@ message AskPlatformForInstrumentReply {
   InstrumentRecord instrument = 3;
 
   string detail = 4;
+
+  // Contract v24 (W3.4): the platform's reply to match_or_mint.
+  EscalateInstrumentReply match_or_mint_answer = 5;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1882,4 +2034,183 @@ message HeldDateRule {
   string subject = 2;
   int64 version = 3;
   int64 refreshed_at_ns = 4;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W3.22 to W3.28 — one ID: replacements, templates, the licence list, the
+// replacement feed and usage statistics, contract v24
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// sdk-contract/an-execution-is-booked-to-its-accounts-contract, its one-ID
+// track (spec/the-platform-master-mints-every-instrument-from-a-template,
+// requirements 1 to 26; decisions/037), every name approved 2026-10-13 and
+// 2026-10-14.
+
+// W3.22: the replacements the instrument store recorded after a sequence,
+// unscoped reference data every plugin role reads.
+message ListReplacementsRequest {
+  // The last sequence the reader saw; zero reads every replacement.
+  int64 after_sequence = 1;
+}
+
+message ListReplacementsReply {
+  // Each as its instrument-replaced delivery carried it, in sequence.
+  repeated InstrumentReplacedEvent replacements = 1;
+  // The next read's after_sequence: the sequence asked after, when none
+  // since.
+  int64 sequence = 2;
+}
+
+// W3.23: a `reference` plugin's offer of a record's template fields.
+message OfferTemplateFieldsRequest {
+  // A record the deployment holds, followed through its replacement.
+  string instrument_id = 1;
+  string template_id = 2;
+  // A version the catalogue holds; one it does not is refused naming it.
+  string template_version = 3;
+  repeated TemplateFieldValue fields = 4;
+}
+
+// A value at a template field's path, with its provenance (W3.4, W3.23).
+message TemplateFieldValue {
+  // The field's path in the template; one the template lacks is refused
+  // naming it.
+  string path = 1;
+  // As the template's field type writes it.
+  string value = 2;
+  // The source it was reconciled from; unset, the plugin's own source.
+  Provenance provenance = 3;
+}
+
+message OfferTemplateFieldsReply {
+  // At its new version, the values kept as offers.
+  InstrumentRecord instrument = 1;
+}
+
+// W3.24: the templates the store holds, unscoped reference data.
+message ListTemplatesRequest {
+  // Unspecified lists every class.
+  AssetClass asset_class = 1;
+}
+
+message ListTemplatesReply {
+  // Each at its latest version.
+  repeated SecurityTemplate templates = 1;
+}
+
+// W3.24: one template, at a version.
+message ReadTemplateRequest {
+  string template_id = 1;
+  // Empty reads the latest.
+  string template_version = 2;
+}
+
+message ReadTemplateReply {
+  SecurityTemplate template = 1;
+}
+
+// A security template (W1.24, W3.24; the intent's "security template"): the
+// platform authors, versions and publishes it, and a deployment's store
+// holds every version and never changes one.
+message SecurityTemplate {
+  // `TPL-`, the platform's, never a deployment's.
+  string template_id = 1;
+  // Published and immutable; a change is a new version.
+  string template_version = 2;
+  // The platform's words for it.
+  string name = 3;
+  AssetClass asset_class = 4;
+  // Unspecified for a class's base template.
+  InstrumentType instrument_type = 5;
+  // True for the one template per asset class carrying identifiers, a
+  // description and a currency; the platform mints no INS- record under it.
+  bool base = 6;
+  // Its calculation package: the slot defined and empty until the template
+  // calculations (row 6i').
+  string calculation = 7;
+  // Each by its path, its type and whether it is required.
+  repeated TemplateField fields = 8;
+  // The identifier schemes it matches on, each by its scheme's spelling,
+  // share_class_figi first.
+  repeated string match_rule = 9;
+}
+
+// One field of a template (W3.24).
+message TemplateField {
+  // As an offer (TemplateFieldValue.path) and a missing field name it.
+  string path = 1;
+  // One of the contract's types, as a dictionary entry's type is written.
+  string type = 2;
+  // A record without it is incomplete, its missing fields listed (W3.7).
+  bool required = 3;
+}
+
+// W3.24: the platform's answer to a pull of its template catalogue, the
+// versions after the highest held, handed to the instrument store on the
+// bus as it came (`platform.reference.event.templates-pulled`).
+message PullTemplatesReply {
+  repeated SecurityTemplate templates = 1;
+}
+
+// W3.25: the identifier schemes the platform may receive, by family, and
+// the pace a migration's or a backfill's batches are sent at; pulled by the
+// conductor and handed to the store
+// (`platform.reference.event.licence-list-pulled`). open_meridian_local and
+// the LCL- ID are never on it.
+message LicenceList {
+  int64 version = 1;
+  repeated string schemes = 2;
+  // The pace a migration's or a backfill's batches are sent at.
+  LicencePace pace = 3;
+}
+
+// A pace, as OpenFIGI states its own limits (W3.25).
+message LicencePace {
+  // Requests in one batch.
+  int32 batch_size = 1;
+  int32 batches_per_minute = 2;
+}
+
+// W3.27: the platform's replacements and decommissions after a sequence,
+// the same for every deployment, handed to the store as it came
+// (`platform.reference.event.replacements-pulled`).
+message PullReplacementsReply {
+  repeated ReplacementFeedEntry entries = 1;
+}
+
+// One merge or decommission on the platform's master (W1.27, W3.27).
+message ReplacementFeedEntry {
+  int64 sequence = 1;
+  // The INS- record merged or decommissioned.
+  string instrument_id = 2;
+  // The record it was merged into; empty on a decommission.
+  string replaced_by = 3;
+  bool decommissioned = 4;
+}
+
+// W3.28: the deployment's usage statistics, counts only -- never a value, a
+// holding, a quantity or an account -- sent weekly and once after the
+// migration, unless the deployment admin turned the report off.
+message IdentifierUsageReport {
+  // ISO 8601 dates, the period the counts cover.
+  string period_start = 1;
+  string period_end = 2;
+  // The scheme names the deployment declares it is licensed for.
+  repeated string licensed_schemes = 3;
+  repeated SchemeUsageCount scheme_counts = 4;
+}
+
+// One identifier scheme's counts over the period (W3.28).
+message SchemeUsageCount {
+  string scheme = 1;
+  // Instruments carrying it.
+  int64 instruments_carrying = 2;
+  // Instruments that resolve only through it.
+  int64 instruments_only_by = 3;
+  // Misses that arrived with it as their only identifier.
+  int64 misses_only_by = 4;
+}
+
+message ReportIdentifierUsageReply {
+  bool received = 1;
 }

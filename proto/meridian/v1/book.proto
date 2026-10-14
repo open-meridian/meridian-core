@@ -470,6 +470,11 @@ enum BreakCategory {
   // available and not available against the book's position, or an
   // encumbrance against the book's of that kind, location and pledgee.
   BREAK_CATEGORY_FIGURE = 7;
+  // Contract v24 (W9.3; the one-ID model, ruled 2026-10-14): a statement row
+  // the street kept unresolved because its source is thinner than an
+  // instrument record's minimum (W3.7). No instrument and no position: the
+  // break names the street record by value. ISO 15022/20022's DSEC.
+  BREAK_CATEGORY_UNRECOGNIZED_SECURITY = 8;
 }
 
 enum BreakCauseCategory {
@@ -904,6 +909,16 @@ message AccountAttributes {
   // held at the upgrade, recorded so (decisions/031); the book always
   // states it, so false is a deployment admin's act with its reason.
   bool waits_for_compliance = 6;
+  // Contract v24 (W9.13; the order-path plan's v24 item 10): a booking may
+  // allocate to it without the instruction naming it, each allocation
+  // carrying its reason and ErrorCause and raising an alert (W11.27,
+  // W11.34). A deployment admin's mark; unmarking is recorded, and past
+  // allocations keep their flag.
+  bool error_account = 7;
+  // Contract v24 (W9.13; the order-path plan's v24 item 7): a block order's
+  // account, with no statement to reconcile against, flat once booked; a
+  // balance left after booking holds the booking (W11.28).
+  bool allocation_account = 8;
 }
 
 message SetAccountAttributeRequest {
@@ -914,6 +929,10 @@ message SetAccountAttributeRequest {
     // Contract v22 (W9.13): a deployment admin's, from the dashboard or
     // dashboard__set_account_attribute (the order-path plan's refresh, Q44).
     bool waits_for_compliance = 5;
+    // Contract v24 (W9.13): a deployment admin's, each change its own
+    // record with its reason.
+    bool error_account = 6;
+    bool allocation_account = 7;
   }
   string reason = 4;
 }
@@ -1591,6 +1610,15 @@ message Order {
   repeated Charge charges = 38;
 
   JournalRef last_change = 39;
+
+  // Contract v24 (W11.1; the order-path plan's v24 item 6): on a block
+  // order, its members as proposed -- released orders of one instrument and
+  // side, each in no other live block. Empty on any other order.
+  repeated string block_member_order_ids = 45;
+
+  // Contract v24 (W11.33): each sleeve cross that filled the order; its
+  // filled quantity counts each, and no execution is minted for one.
+  repeated string sleeve_cross_ids = 46;
 }
 
 // An order's status: its state, its conditions and its quantities, each
@@ -1948,6 +1976,9 @@ message Execution {
   // on no placement where the venue sent one, which FIX requires back on BN
   // and Q.
   string venue_client_order_id = 40;
+  // Contract v24 (W11.32): each prime's answer to a give-up of the
+  // execution, in the order recorded; a rejection moves no position.
+  repeated GiveUpRecord give_up_answers = 41;
 }
 
 // An execution's finality: a level, and when it reached it.
@@ -1961,6 +1992,10 @@ message Fee {
   FeeKind kind = 1;
   // Signed; a rebate negative.
   Money amount = 2;
+  // Contract v24 (W11.27; the order-path plan's v24 item 4): the `oms`'s
+  // choice by its policy. A capitalised fee enters the lot's cost on a buy;
+  // every fee stays its own cash line either way.
+  bool capitalised = 3;
 }
 
 // A fee with no fill, on its placement (W11.12): it moves cash, pending to
@@ -2131,6 +2166,12 @@ message ProposeOrderRequest {
   // INVALID_ARGUMENT naming `quote_currency`; a limit or stop priced in
   // another currency INVALID_ARGUMENT naming `limit_price` or `stop_price`.
   string quote_currency = 35;
+  // Contract v24 (W11.1; the order-path plan's v24 item 6): the `oms`'s
+  // block order, in the allocation account, naming its members, each a
+  // released order of one instrument and side in no other live block
+  // (REFUSAL_REASON_ORDER_STATE). Released on creation, its quantity the
+  // sum of its members' idle quantities.
+  repeated string block_member_order_ids = 36;
 }
 
 // W11.2. A fact: never through the gate. By the `oms`, for a user, naming
@@ -2600,6 +2641,395 @@ message ListLocatesRequest {
 
 message ListLocatesReply {
   repeated Locate locates = 1;
+  Watermark as_of = 2;
+  string next_cursor = 3;
+}
+
+// ── W11.26 to W11.37: booking, the alert and the escape hatch (contract v24) ──
+//
+// sdk-contract/an-execution-is-booked-to-its-accounts-contract, its booking
+// track: the order-path plan's "v24: booking (slice B)", items 1 to 24, and
+// its "v24's text", every name approved 2026-10-13 and 2026-10-14. A booking
+// is in the partition of its order's account; each allocation's movement in
+// another account is a child entry in that account's own partition
+// (decisions/024). Its states are matrix/transitions.tsv's rows b1 to b9
+// (decisions/035 as amended at v24).
+
+// A booking's state (W11.30), derived from its journal, never stored.
+enum BookingState {
+  BOOKING_STATE_UNSPECIFIED = 0;
+  // Booked, its allocations tying out, not yet handed off or closed.
+  BOOKING_STATE_BOOKED = 1;
+  // Executed no longer equals allocated -- a bust, a correction, a late
+  // fill or a later fee since booking -- or a hand-off's check failed; its
+  // reason in held_reason, and a held-booking alert raised.
+  BOOKING_STATE_HELD = 2;
+  // Handed off to `operations`, which owns each allocation's post-trade
+  // life.
+  BOOKING_STATE_HANDED_OFF = 3;
+  // A client's booking the firm does not settle, closed, its error-account
+  // allocations handed off.
+  BOOKING_STATE_CLOSED = 4;
+  // Cancelled by the `oms` before the hand-off, so its executions may be
+  // booked again.
+  BOOKING_STATE_CANCELLED = 5;
+}
+
+// A booking's correction (W11.29), as FIX's AllocTransType (71).
+enum BookingCorrectionKind {
+  BOOKING_CORRECTION_KIND_UNSPECIFIED = 0;
+  // The `oms`'s, before the hand-off or closing.
+  BOOKING_CORRECTION_KIND_CANCEL = 1;
+  // `operations`', after it, with the full new allocation set: a new
+  // version, the state kept.
+  BOOKING_CORRECTION_KIND_REPLACE = 2;
+}
+
+// Why an allocation is to an error account (W11.27; the order-path plan's
+// v24 item 10). FIX has no standard list.
+enum ErrorCause {
+  // Not an error-account allocation.
+  ERROR_CAUSE_UNSPECIFIED = 0;
+  // The venue filled more than ordered; the excess booked to the error
+  // account.
+  ERROR_CAUSE_OVERFILL = 1;
+  ERROR_CAUSE_CLIENT_RENEGED = 2;
+  // A venue-originated fill accepted to the wrong order (W11.23).
+  ERROR_CAUSE_WRONG_ACCEPT = 3;
+  // The firm's own booking error.
+  ERROR_CAUSE_BOOKING_ERROR = 4;
+  // Another cause, which error_text says.
+  ERROR_CAUSE_OTHER = 5;
+}
+
+// A prime's answer to a give-up (W11.32), as FIX's AllocStatus (87).
+enum GiveUpAnswer {
+  GIVE_UP_ANSWER_UNSPECIFIED = 0;
+  GIVE_UP_ANSWER_ACCEPTED = 1;
+  // The trade stays with the executing side; no position moves.
+  GIVE_UP_ANSWER_REJECTED = 2;
+}
+
+// An alert's state (W11.34); nothing is deleted.
+enum AlertState {
+  ALERT_STATE_UNSPECIFIED = 0;
+  // Raised, by the book or by `compliance`.
+  ALERT_STATE_RAISED = 1;
+  // Acknowledged by `compliance` for a person, with a reason; never
+  // clearing it.
+  ALERT_STATE_ACKNOWLEDGED = 2;
+  // Cleared by the book: a held booking handed off or closed.
+  ALERT_STATE_CLEARED = 3;
+}
+
+// What an alert is about (W11.34); v26 adds rule results to the same record.
+enum AlertKind {
+  ALERT_KIND_UNSPECIFIED = 0;
+  // An allocation to an error account, raised by the book on each.
+  ALERT_KIND_ERROR_ACCOUNT_BOOKING = 1;
+  // A booking held, raised by the book and cleared by it at the hand-off
+  // or closing.
+  ALERT_KIND_BOOKING_HELD = 2;
+  // `compliance`'s own, through RaiseAlert.
+  ALERT_KIND_COMPLIANCE = 3;
+}
+
+// A booking of an order's executions to their accounts (W11.27 to W11.30).
+message Booking {
+  // `BKG-` and a ULID, minted by the book, never reused (decisions/035,
+  // point 7); the reference the street echoes back.
+  string booking_id = 1;
+  // The order's `ORD-` ID; a child's executions are booked as its parent's.
+  string order_id = 2;
+  // The order's account, whose partition the booking is in; the allocation
+  // account for a block.
+  string account_id = 3;
+  // An explicit list on one order, sharing instrument, side, trade date and
+  // settlement date, as FIX's AllocationInstruction (J) requires of NoExecs.
+  repeated string execution_ids = 4;
+  // One per account, summing exactly to the executions booked in quantity,
+  // gross and each fee kind.
+  repeated Allocation allocations = 5;
+  // Derived from its journal, never stored.
+  BookingState state = 6;
+  // The book's words for what moved executed away from allocated, as FIX
+  // keeps a rejection's reason in AllocRejCode (88); empty unless held.
+  string held_reason = 7;
+  // Its latest entry, which a catch-up reads it by (W4.3).
+  JournalRef last_change = 8;
+}
+
+// One account's part of a booking (W11.27).
+message Allocation {
+  // `ALC-` and a ULID, minted by the book even for one account, never
+  // reused (FIX IndividualAllocID, 467); empty on a command.
+  string allocation_id = 1;
+  // An account the allocation instruction names, or one marked an error
+  // account (W9.13).
+  string account_id = 2;
+  // The instruction line's sleeve, the order's own the default; empty for
+  // the account's unsleeved part.
+  string sleeve = 3;
+  Decimal quantity = 4;
+  // The price the account's confirmation states.
+  Money average_price = 5;
+  // Quantity times average price, as the `oms` rounds it; the residual on a
+  // named allocation.
+  Money gross_amount = 6;
+  // Each kind summing exactly to the executions' fees of that kind.
+  repeated Fee fees = 7;
+  // Derived from gross and fees, not checked by the book.
+  Money net_amount = 8;
+  // The date `operations` reconciles the allocation by, superseding the
+  // fill's.
+  string intended_settlement_date = 9;
+  // Priced at the average, as the SEC's average-price notation marks a
+  // confirmation.
+  bool average_priced = 10;
+  // The receiving account's own lots to relieve; empty, by the method.
+  repeated string relieve_lot_ids = 11;
+  // A person's words, required on an error-account allocation
+  // (REFUSAL_REASON_REASON_REQUIRED).
+  string reason = 12;
+  // Unspecified unless the allocation is to an error account.
+  ErrorCause error_cause = 13;
+  // Required with ERROR_CAUSE_OTHER (INVALID_ARGUMENT naming it), as FIX's
+  // Text (58).
+  string error_text = 14;
+  // Each prime's answer to a give-up of the allocation, in the order
+  // recorded (W11.32).
+  repeated GiveUpRecord give_up_answers = 15;
+}
+
+// A prime's answer to a give-up (W11.32), its own record, as FIX sends each
+// AllocationReport (AS) as its own message.
+message GiveUpRecord {
+  GiveUpAnswer answer = 1;
+  // As reported, FIX's SecondaryAllocID (793).
+  string prime_reference = 2;
+  string reason = 3;
+  // Its entry in the account's partition.
+  EntryMeta entry = 4;
+}
+
+// A cross between two sleeves of one account (W11.33), its tax and
+// performance layers; no execution is minted for it.
+message SleeveCross {
+  // `SXC-` and a ULID, minted by the book, never reused.
+  string sleeve_cross_id = 1;
+  // One account; a cross between accounts is an internal cross, a real
+  // trade.
+  string account_id = 2;
+  string instrument_id = 3;
+  // Empty for the account's unsleeved part.
+  string giving_sleeve = 4;
+  string receiving_sleeve = 5;
+  Decimal quantity = 6;
+  // The plugin's choice (mid, last or close): each moved lot's performance
+  // cost, never its tax basis.
+  Money cross_price = 7;
+  // Which price and when, the plugin's words.
+  string price_source = 8;
+  // Each order's filled quantity counts the cross.
+  repeated string order_ids = 9;
+  string reason = 10;
+}
+
+// A post-trade alert in an account's partition (W11.34), raised,
+// acknowledged or cleared, never deleted; landed in the compliance spec's
+// shape.
+message Alert {
+  // `ALR-` and a ULID, minted by the book, never reused.
+  string alert_id = 1;
+  string account_id = 2;
+  AlertKind kind = 3;
+  AlertState state = 4;
+  // The book's words or `compliance`'s.
+  string reason = 5;
+  // What it is about.
+  AlertSubject subject = 6;
+  // A held booking's: the moment the `operations` plugin's
+  // affirmation_deadline falls on the trade date, in the deployment's time
+  // zone; zero otherwise.
+  int64 due_by = 7;
+  // Its latest entry, which a catch-up reads it by (W4.3).
+  JournalRef last_change = 8;
+}
+
+// What an alert is about: a booking and its allocation, or for
+// `compliance`'s own an order or a position.
+message AlertSubject {
+  string order_id = 1;
+  string booking_id = 2;
+  string allocation_id = 3;
+  // An instrument and a side in the account, as a break names one (W9.4).
+  PositionKey position = 4;
+}
+
+// W11.26: an order's allocation instruction amended, with a reason;
+// answered with OrderReply.
+message SetAllocationInstructionRequest {
+  string order_id = 1;
+  // The whole instruction; refused REFUSAL_REASON_ORDER_STATE where an
+  // account's amount falls below what its live bookings allocate.
+  AllocationInstruction allocation_instruction = 2;
+  string reason = 3;
+}
+
+// W11.27: book an explicit list of executions on one order.
+message BookOrderRequest {
+  string order_id = 1;
+  repeated string execution_ids = 2;
+  repeated Allocation allocations = 3;
+  // Handed off in the same act where the check passes, and booked where it
+  // does not, as FIX's Ready-To-Book (AllocType, 626) in one step.
+  bool hand_off = 4;
+}
+
+// W11.28: hand a booked or held booking off to `operations`, or close a
+// client's booking the firm does not settle.
+message HandOffBookingRequest {
+  string booking_id = 1;
+  // The client's allocations close, any error-account allocation on it
+  // handed off to the firm's operations in the same act.
+  bool close = 2;
+}
+
+// W11.29: cancel a booking before its hand-off, or replace its allocations
+// after it.
+message CorrectBookingRequest {
+  // As FIX's RefAllocID (72) names the allocation it replaces.
+  string booking_id = 1;
+  BookingCorrectionKind kind = 2;
+  // The whole set on a replace, as FIX's allocation Replace carries it;
+  // empty on a cancel.
+  repeated Allocation allocations = 3;
+  // Empty: the trade date; empty on a cancel.
+  string effective_date = 4;
+  // As FIX's AllocCancReplaceReason (796) records why.
+  string reason = 5;
+}
+
+// W11.32: a prime's answer to a give-up, from `connectivity` or
+// `confirmation`; a fact, answered with FactReply.
+message ReportGiveUpRequest {
+  // One the book does not hold keeps the fact unplaced.
+  string execution_id = 1;
+  // Empty where no allocation is booked.
+  string allocation_id = 2;
+  GiveUpAnswer answer = 3;
+  string prime_reference = 4;
+  string reason = 5;
+  RawRecordRef raw_record = 6;
+}
+
+// W11.33: a cross between two sleeves of one account, the `oms`'s.
+message RecordSleeveCrossRequest {
+  SleeveCross sleeve_cross = 1;
+}
+
+// W11.34: `compliance`'s own alert.
+message RaiseAlertRequest {
+  string account_id = 1;
+  AlertKind kind = 2;
+  string reason = 3;
+  AlertSubject subject = 4;
+}
+
+// W11.34: an alert acknowledged, for a person, with a reason.
+message AcknowledgeAlertRequest {
+  string alert_id = 1;
+  string reason = 2;
+}
+
+// W11.36: the deployment admin's setting for orders on local records, kept
+// in the control partition, each change its own entry.
+message SetLocalRecordOrdersRequest {
+  // Shown "Allow orders on local records"; true by default.
+  bool allows_local_record_orders = 1;
+  string reason = 2;
+}
+
+// W11.37: the setting read.
+message ReadLocalRecordOrdersRequest {}
+
+// The escape hatch's setting in force (W11.36, W11.37).
+message LocalRecordOrdersSetting {
+  bool allows_local_record_orders = 1;
+  // Orders not ended whose instrument's record is provisional, as of the
+  // answer, for the deployment: a count naming no account and no order.
+  int64 open_order_count = 2;
+}
+
+message BookingReply {
+  Booking booking = 1;
+  EntryMeta entry = 2;
+  JournalRef journal = 3;
+}
+
+message SleeveCrossReply {
+  SleeveCross sleeve_cross = 1;
+  JournalRef journal = 2;
+}
+
+message AlertReply {
+  Alert alert = 1;
+  JournalRef journal = 2;
+}
+
+// W11.30: to `operations`, `oms`, `compliance`, `portfolio` and `reporting`
+// within scope, by the account the booking is in.
+message BookingUpdatedEvent {
+  // Its whole new state, safe to apply twice.
+  Booking booking = 1;
+  EntryMeta entry = 2;
+  JournalRef journal = 3;
+  ChangeCause cause = 4;
+}
+
+// W11.35: to `compliance`, `reporting`, `oms` and `operations` within scope.
+message AlertChangedEvent {
+  Alert alert = 1;
+  JournalRef journal = 2;
+  ChangeCause cause = 3;
+}
+
+// W11.31: the bookings in the reader's scope, as of now or changed since a
+// watermark, filtered by state.
+message ListBookingsRequest {
+  // Empty: every account in the reader's scope.
+  string account_id = 1;
+  // Only records whose last change is above it (W4.3).
+  Watermark since = 2;
+  // Unspecified: every state.
+  BookingState state = 3;
+  int32 page_size = 4;
+  string cursor = 5;
+}
+
+message ListBookingsReply {
+  repeated Booking bookings = 1;
+  Watermark as_of = 2;
+  string next_cursor = 3;
+}
+
+// W11.35: the alerts in the reader's scope, as of now or changed since a
+// watermark, filtered by state and kind.
+message ListAlertsRequest {
+  // Empty: every account in the reader's scope.
+  string account_id = 1;
+  // Unspecified: every state.
+  AlertState state = 2;
+  // Only records whose last change is above it (W4.3).
+  Watermark since = 3;
+  int32 page_size = 4;
+  string cursor = 5;
+  // Unspecified: every kind.
+  AlertKind kind = 6;
+}
+
+message ListAlertsReply {
+  repeated Alert alerts = 1;
   Watermark as_of = 2;
   string next_cursor = 3;
 }

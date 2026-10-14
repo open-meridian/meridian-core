@@ -179,6 +179,7 @@ pub async fn search(
             page_size: limit.clamp(1, 50) as i32,
             cursor: String::new(),
             search: words.chars().take(100).collect(),
+            provisional: false,
         },
         None,
         WAIT,
@@ -226,6 +227,7 @@ pub async fn list(
             page_size: 1000,
             cursor: String::new(),
             search: String::new(),
+            provisional: false,
         },
         None,
         WAIT,
@@ -259,6 +261,7 @@ pub async fn every_record(bus: &meridian_bus::Bus) -> Result<Vec<(String, String
             page_size: 1000,
             cursor: String::new(),
             search: String::new(),
+            provisional: false,
         },
         None,
         WAIT,
@@ -359,6 +362,7 @@ pub async fn ask_platform(
             instrument_id: record.instrument_id.clone(),
             identifiers: record.identifiers.clone(),
             as_of_ns: 0,
+            match_or_mint: None,
         },
         None,
         ASKING,
@@ -1604,6 +1608,7 @@ mod tests {
             ],
             complete_for_book: false,
             complete: false,
+            ..Default::default()
         }
     }
 

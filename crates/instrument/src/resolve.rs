@@ -956,6 +956,7 @@ fn resolved(instrument_id: String, minted: bool) -> ResolveIdentifierReply {
         instrument_id,
         miss_reason: MissReason::Unspecified as i32,
         minted,
+        provisional: false,
     }
 }
 
@@ -965,6 +966,7 @@ fn missed(reason: MissReason) -> ResolveIdentifierReply {
         instrument_id: String::new(),
         miss_reason: reason as i32,
         minted: false,
+        provisional: false,
     }
 }
 

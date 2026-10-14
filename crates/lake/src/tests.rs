@@ -68,6 +68,7 @@ fn harness() -> Harness {
                 instrument_id: if usd { USD.into() } else { String::new() },
                 miss_reason: if usd { 0 } else { 1 },
                 minted: false,
+                ..Default::default()
             }
             .encode_to_vec(),
         ))
@@ -854,6 +855,7 @@ async fn a_merged_record_is_followed_by_alias_and_retention_removes_rows_recordi
                 ..Default::default()
             }),
             replaced_at_ns: NOW,
+            ..Default::default()
         }
         .encode_to_vec(),
     });

@@ -102,6 +102,7 @@ impl Conductor {
                 found: false,
                 instrument: None,
                 detail: "the record carries no open identifier to ask by".into(),
+                match_or_mint_answer: None,
             };
         }
         let now_ns = self.clock.now_ns();
@@ -127,6 +128,7 @@ impl Conductor {
                     found: false,
                     instrument: None,
                     detail: "the platform holds no record by these identifiers".into(),
+                    match_or_mint_answer: None,
                 }
             }
             Ok(Ok(Some(record))) => record,
@@ -159,6 +161,7 @@ impl Conductor {
             found: true,
             instrument: Some(record),
             detail: String::new(),
+            match_or_mint_answer: None,
         }
     }
 }
@@ -205,6 +208,7 @@ fn unreachable(detail: String) -> AskPlatformForInstrumentReply {
         found: false,
         instrument: None,
         detail,
+        match_or_mint_answer: None,
     }
 }
 
@@ -377,6 +381,7 @@ mod tests {
             instrument_id: "LCL-USD".into(),
             identifiers,
             as_of_ns: NOW,
+            ..Default::default()
         }
     }
 

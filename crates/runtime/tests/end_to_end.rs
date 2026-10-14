@@ -200,13 +200,14 @@ fn a_record_minted_here_is_backfilled_with_the_global_id_and_no_key_changes() {
                     source: "snaptrade".into(),
                     identifiers: identifiers.clone(),
                     as_of_ns: now_ns(),
-                    placeholder_instrument_id: local.clone(),
+                    request_key: format!("end-to-end-{}", now_ns()),
                     ..Default::default()
                 },
                 now_ns(),
             )
             .await
             .expect("the platform did not answer")
+            .instrument
             .expect("the platform held nothing and minted nothing");
         assert!(
             held.instrument_id.starts_with("INS-"),
@@ -223,6 +224,7 @@ fn a_record_minted_here_is_backfilled_with_the_global_id_and_no_key_changes() {
                 instrument_id: local.clone(),
                 identifiers: identifiers.clone(),
                 as_of_ns: now_ns(),
+                ..Default::default()
             },
         )
         .await;
@@ -334,12 +336,13 @@ fn keeping_the_same_answer_twice_changes_nothing() {
                 source: "snaptrade".into(),
                 identifiers,
                 as_of_ns: now_ns(),
-                placeholder_instrument_id: minted.clone(),
+                request_key: format!("end-to-end-{}", now_ns()),
                 ..Default::default()
             },
             now_ns(),
         ))
         .unwrap()
+        .instrument
         .expect("the platform held nothing and minted nothing");
 
     assert!(keep_platform_answer(&store, &minted, &record, now_ns())

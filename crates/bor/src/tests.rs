@@ -1545,6 +1545,7 @@ async fn a_merged_record_is_followed_its_lots_keeping_their_identifiers() {
                 ..Default::default()
             }),
             replaced_at_ns: 1,
+            ..Default::default()
         }
         .encode_to_vec(),
         Some("CORR-REPLACED"),

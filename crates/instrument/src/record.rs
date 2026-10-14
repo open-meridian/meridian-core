@@ -52,6 +52,7 @@ pub fn to_wire(instrument: &Instrument) -> PbInstrument {
         ),
         // The venue master's ID (contract v18).
         listing_venue_id: instrument.listing_venue_id.clone(),
+        ..Default::default()
     }
 }
 
