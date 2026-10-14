@@ -3,7 +3,7 @@
 -- per priority, per want change, per serving of a dataset not kept, per
 -- removal, per instance's misses and per alias:
 --
---   row|dataset|price, bar, trade or quote|sequence|row key|version|subject|kind or interval ns|venue|business date|previous sequence|unconverted
+--   row|dataset|price, bar, trade, quote or outcome (contract v23)|sequence|row key|version|subject|kind or interval ns|venue|business date|previous sequence|unconverted
 --   priority|data type|kind|changes
 --   want|dataset|asked, answered, declined or withdrawn|subjects|reason
 --   served|dataset|first sequence|last sequence|subjects|fields|readers
@@ -16,7 +16,8 @@
 -- is the lake's, so a line names its dataset and subjects instead.
 SELECT line FROM (
     SELECT 'row|' || dataset || '|' || CASE data_type WHEN 1 THEN 'price' WHEN 2 THEN 'bar'
-                                                         WHEN 3 THEN 'trade' WHEN 4 THEN 'quote' ELSE '?' END
+                                                         WHEN 3 THEN 'trade' WHEN 4 THEN 'quote'
+                                                         WHEN 5 THEN 'outcome' ELSE '?' END
         || '|' || sequence || '|' || row_key || '|' || version || '|' || subject || '|'
         || CASE data_type WHEN 2 THEN interval_ns::text ELSE kind::text END || '|' || venue_id || '|'
         || COALESCE(business_date::text, '') || '|' || previous_sequence || '|' || unconverted AS line
