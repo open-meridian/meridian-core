@@ -62,9 +62,11 @@ help:
 # already, and shares its disk with nobody, so its floors are low. The local
 # row is the peaks of a run from cold caches with up to 2 GB of headroom
 # (2026-10-12: 0.0, 2.2, 7.1, 7.5, 5.3, 5.2, 5.2, 5.1, 5.6 and 5.3 GB, in
-# stage order). The CI row is an estimate until the runner has been measured:
-# those peaks, plus every image a fresh runner has pulled by the end of each
-# stage (rust 0.8, node and debian 0.3, then postgres, nats, openldap and
+# stage order). The tests stage's budget was raised from 10 to 13 GB on
+# 2026-10-13, approved by the product owner, after a run from cold caches
+# measured it at 10.8 GB. The CI row is an estimate until the runner has been
+# measured: those peaks, plus every image a fresh runner has pulled by the end
+# of each stage (rust 0.8, node and debian 0.3, then postgres, nats, openldap and
 # Playwright's Chromium 2.9, python 0.2, postgres 17 0.3, helm 0.1 GB), plus
 # 3 GB or more. The gate prints each stage's peak as it ends and the whole row
 # at the end, ready to paste: a stage that outgrows its budget is a finding,
@@ -77,7 +79,7 @@ help:
 # freed once and not built twice.
 GATE := $(PY) tools/gate.py
 #                    stage=GB: the most each stage may hold above where the gate started
-GATE_BUDGETS_LOCAL ?= checks=1 runtime=4 compile=9  tests=10 sdk=7  dashboards=7  harness=7  first-run=7  image=7  lint=7
+GATE_BUDGETS_LOCAL ?= checks=1 runtime=4 compile=9  tests=13 sdk=7  dashboards=7  harness=7  first-run=7  image=7  lint=7
 GATE_BUDGETS_CI    ?= checks=2 runtime=7 compile=12 tests=15 sdk=13 dashboards=13 harness=13 first-run=13 image=14 lint=13
 # The cargo caches kept between runs: a run starts them again once they are
 # this many days old, so what cargo built for a dependency nothing uses any
