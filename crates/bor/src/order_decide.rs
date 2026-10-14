@@ -676,6 +676,32 @@ fn quote_currency_holds(request: &ProposeOrderRequest) -> Result<()> {
     Ok(())
 }
 
+/// An FX order's amended limit (W11.3, contract v23; approved 2026-10-13):
+/// on an order naming its quote currency, a change's limit priced in any
+/// other currency is refused INVALID_ARGUMENT naming `change.limit_price`.
+/// An OrderChange carries no stop price, so nothing names
+/// `change.stop_price`.
+fn change_quote_currency_holds(order: &Order, change: &OrderChange) -> Result<()> {
+    let quote = order.quote_currency.as_str();
+    if quote.is_empty() {
+        return Ok(());
+    }
+    let Some(price) = change.limit_price.as_ref() else {
+        return Ok(());
+    };
+    let priced_in = cash_instrument(price)?;
+    if priced_in != quote {
+        return Err(malformed(
+            &["change.limit_price"],
+            format!(
+                "change.limit_price is priced in {priced_in}, and an FX order's limit is in its \
+                 quote currency, {quote}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 // ── W11.2: record an order the book did not create ──────────────────────────
 
 /// A telephoned or outside order, recorded by the `oms` for a user: a fact
@@ -878,6 +904,7 @@ pub fn request_order_change(
         .clone()
         .ok_or_else(|| malformed(&["change"], "a change request says what it asks"))?;
     let kind = OrderChangeKind::try_from(change.kind).unwrap_or(OrderChangeKind::Unspecified);
+    change_quote_currency_holds(&order.order, &change)?;
     let state = state_of(book, &request.order_id)?;
     let order_id = request.order_id.clone();
     let crq = ctx.mint(ids::CHANGE_REQUEST);
@@ -2134,9 +2161,14 @@ fn reversal_lines(book: &Book, superseded: &str) -> Result<Vec<MovementLine>> {
         Some((entry_id, start, count)) => (entry_id, Some((*start, *count))),
         None => (&held.entry_id, None),
     };
-    let Some(entry) = book.entry(entry_id) else {
+    let Some(at) = book
+        .entries
+        .iter()
+        .position(|held| &held.entry_id == entry_id)
+    else {
         return Ok(Vec::new());
     };
+    let entry = &book.entries[at];
     let lines: &[MovementLine] = match range {
         Some((start, count)) => entry
             .body
@@ -2150,6 +2182,11 @@ fn reversal_lines(book: &Book, superseded: &str) -> Result<Vec<MovementLine>> {
         .map(|line| {
             let mut negated = line.clone();
             negated.opens_lot = None;
+            // A pending line a roll moved since is reversed where it is now
+            // (W11.25; approved 2026-10-13).
+            if line.bucket == SettlementBucket::Pending as i32 {
+                negated.value_date = rolled_to(book, at, line);
+            }
             negated.quantity = line.quantity.as_ref().map(|quantity| {
                 Exact::from_wire(quantity)
                     .map(|value| value.negated().to_wire())
@@ -2158,6 +2195,36 @@ fn reversal_lines(book: &Book, superseded: &str) -> Result<Vec<MovementLine>> {
             negated
         })
         .collect())
+}
+
+/// Where the value-date rolls after entry `at` took a pending line: each
+/// later roll whose entry moved the line's position off the date it then
+/// held takes it on to the roll's new date (W11.25). A roll moves only what
+/// its instance's fills and rolls on the code left there, so a roll that
+/// moved the position from the line's date moved the line.
+fn rolled_to(book: &Book, at: usize, line: &MovementLine) -> String {
+    let mut date = line.value_date.clone();
+    for later in book.entries.iter().skip(at + 1) {
+        for act in &later.body.acts {
+            let Act::ValueDateRolled { roll, .. } = act else {
+                continue;
+            };
+            if roll.from_value_date != date || !roll.pair.contains(&line.instrument_id) {
+                continue;
+            }
+            let moved = later.body.lines.iter().any(|moved| {
+                moved.bucket == SettlementBucket::Pending as i32
+                    && moved.instrument_id == line.instrument_id
+                    && moved.side == line.side
+                    && moved.sleeve == line.sleeve
+                    && moved.value_date == roll.from_value_date
+            });
+            if moved {
+                date = roll.to_value_date.clone();
+            }
+        }
+    }
+    date
 }
 
 fn date_field(field: &str, text: &str) -> Result<()> {
@@ -2724,62 +2791,8 @@ pub fn report_value_date_roll(
     ctx: &Context,
     request: &ReportValueDateRollRequest,
 ) -> Result<Made> {
-    if request.venue_account_code.is_empty() {
-        return Err(malformed(
-            &["venue_account_code"],
-            "a roll names the venue account code whose position rolled",
-        ));
-    }
+    roll_holds(ctx, request)?;
     let pair: BTreeSet<&str> = request.pair.iter().map(String::as_str).collect();
-    if request.pair.len() != 2 || pair.len() != 2 || pair.contains("") {
-        return Err(malformed(
-            &["pair"],
-            "a roll names its pair's two cash instruments, as the date read's spot inputs do",
-        ));
-    }
-    if request.from_value_date.is_empty() {
-        return Err(malformed(
-            &["from_value_date"],
-            "a roll names the value date the pending lines leave",
-        ));
-    }
-    date_field("from_value_date", &request.from_value_date)?;
-    if request.to_value_date.is_empty() {
-        return Err(malformed(
-            &["to_value_date"],
-            "a roll names the value date it moves to, the date read's answer: ask it and \
-             send again, never a guessed date",
-        ));
-    }
-    date_field("to_value_date", &request.to_value_date)?;
-    if request.to_value_date <= request.from_value_date {
-        return Err(malformed(
-            &["to_value_date"],
-            format!(
-                "to_value_date {} is not after from_value_date {}: a roll moves a value date \
-                 forward",
-                request.to_value_date, request.from_value_date
-            ),
-        ));
-    }
-    if request.value_date_basis.is_none() {
-        return Err(malformed(
-            &["value_date_basis"],
-            "a roll carries the date read's basis for its new value date",
-        ));
-    }
-    if request.rolled_at_ns == 0 {
-        return Err(malformed(
-            &["rolled_at_ns"],
-            "a roll says when the venue rolled",
-        ));
-    }
-    if request.raw_record.is_none() {
-        return Err(malformed(
-            &["raw_record"],
-            "a roll references the raw record it was converted from",
-        ));
-    }
     // What this instance's fills and rolls on the code left pending on the
     // old date, by position, held to what each position has pending there.
     let mut owed: BTreeMap<Key, Exact> = BTreeMap::new();
@@ -2843,17 +2856,21 @@ pub fn report_value_date_roll(
         lines.push(line(&request.to_value_date, moved));
     }
     if lines.is_empty() {
-        // W11.25 has such a roll recorded, moving nothing; an entry here is
-        // numbered by the records it changes, and this changes none. Open
-        // with v23's build: not kept until it is settled.
-        return Err(StoreError::Invalid(format!(
-            "the roll of {} from {} meets no pending line this instance's fills or rolls on \
-             {} left there; a roll that moves nothing is not journalled yet (an open point of \
-             contract v23), and the custodian's difference stays a break for operations",
-            request.pair.join("/"),
-            request.from_value_date,
-            request.venue_account_code
-        )));
+        // Nothing this instance left pending there to move: kept unplaced
+        // in the account, UNPLACED_REASON_NOTHING_PENDING, so operations
+        // hears that the venue's position and the book's differ; a venue's
+        // fact is never refused for its state, nor dropped (W11.25; approved
+        // 2026-10-13).
+        return kept_unplaced(
+            book,
+            head,
+            ctx,
+            unplaced_fact::Fact::ValueDateRoll(request.clone()),
+            UnplacedReason::NothingPending,
+            &request.venue_account_code,
+            request.raw_record.clone(),
+            &request.idempotency_key,
+        );
     }
     let mut plan = Plan::new(
         VALUE_DATE_ROLLED,
@@ -2869,6 +2886,84 @@ pub fn report_value_date_roll(
     finish(book, head, ctx, plan)
 }
 
+/// A value-date roll's shape (W11.25), held before it is applied or kept
+/// unplaced: refused INVALID_ARGUMENT naming the field. Its pair is two cash
+/// instruments by their records (approved 2026-10-13), so the instrument
+/// store is asked first and a store that did not answer is refused to be
+/// tried again.
+pub fn roll_holds(ctx: &Context, request: &ReportValueDateRollRequest) -> Result<()> {
+    if request.venue_account_code.is_empty() {
+        return Err(malformed(
+            &["venue_account_code"],
+            "a roll names the venue account code whose position rolled",
+        ));
+    }
+    let pair: BTreeSet<&str> = request.pair.iter().map(String::as_str).collect();
+    if request.pair.len() != 2 || pair.len() != 2 || pair.contains("") {
+        return Err(malformed(
+            &["pair"],
+            "a roll names its pair's two cash instruments, as the date read's spot inputs do",
+        ));
+    }
+    if request.from_value_date.is_empty() {
+        return Err(malformed(
+            &["from_value_date"],
+            "a roll names the value date the pending lines leave",
+        ));
+    }
+    date_field("from_value_date", &request.from_value_date)?;
+    if request.to_value_date.is_empty() {
+        return Err(malformed(
+            &["to_value_date"],
+            "a roll names the value date it moves to, the date read's answer: ask it and \
+             send again, never a guessed date",
+        ));
+    }
+    date_field("to_value_date", &request.to_value_date)?;
+    if request.to_value_date <= request.from_value_date {
+        return Err(malformed(
+            &["to_value_date"],
+            format!(
+                "to_value_date {} is not after from_value_date {}: a roll moves a value date \
+                 forward",
+                request.to_value_date, request.from_value_date
+            ),
+        ));
+    }
+    if request.value_date_basis.is_none() {
+        return Err(malformed(
+            &["value_date_basis"],
+            "a roll carries the date read's basis for its new value date",
+        ));
+    }
+    if request.rolled_at_ns == 0 {
+        return Err(malformed(
+            &["rolled_at_ns"],
+            "a roll says when the venue rolled",
+        ));
+    }
+    if request.raw_record.is_none() {
+        return Err(malformed(
+            &["raw_record"],
+            "a roll references the raw record it was converted from",
+        ));
+    }
+    // Two cash instruments, by their records (approved 2026-10-13).
+    ctx.references_answered()?;
+    for instrument in &request.pair {
+        if !ctx.records.get(instrument).is_some_and(|says| says.cash) {
+            return Err(malformed(
+                &["pair"],
+                format!(
+                    "{instrument} is not a cash instrument by its record: a roll's pair is two \
+                     currencies' cash instruments, as the date read's spot inputs name them"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 // ── W11.13: an unplaced fact; expiry ────────────────────────────────────────
 
 /// A well-formed fact the book cannot place, kept with its reason, never
@@ -2882,11 +2977,38 @@ pub fn unplaced(
     venue_account_code: &str,
     raw_record: Option<meridian_pb::v1::RawRecordRef>,
 ) -> Result<Made> {
+    kept_unplaced(
+        book,
+        head,
+        ctx,
+        fact,
+        reason,
+        venue_account_code,
+        raw_record,
+        "",
+    )
+}
+
+/// An unplaced fact kept under the report's idempotency key, where it has
+/// one, so a retry is answered as first kept.
+#[allow(clippy::too_many_arguments)]
+fn kept_unplaced(
+    book: &Book,
+    head: u64,
+    ctx: &Context,
+    fact: unplaced_fact::Fact,
+    reason: UnplacedReason,
+    venue_account_code: &str,
+    raw_record: Option<meridian_pb::v1::RawRecordRef>,
+    idempotency_key: &str,
+) -> Result<Made> {
     let fact_kind = match &fact {
         unplaced_fact::Fact::Execution(_) => "execution",
         unplaced_fact::Fact::Placement(_) => "placement",
         unplaced_fact::Fact::Charge(_) => "charge",
         unplaced_fact::Fact::Locate(_) => "locate",
+        // Contract v23 (W11.25; approved 2026-10-13).
+        unplaced_fact::Fact::ValueDateRoll(_) => "value-date-roll",
     };
     // A repeat of an unplaced execution is the same fact, kept once.
     if let unplaced_fact::Fact::Execution(execution) = &fact {
@@ -2932,7 +3054,8 @@ pub fn unplaced(
             fact: record,
             sender: ctx.instance_id.clone(),
         }],
-    );
+    )
+    .key(idempotency_key);
     finish(book, head, ctx, plan)
 }
 

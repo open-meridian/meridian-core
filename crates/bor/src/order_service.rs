@@ -929,19 +929,28 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
         bus.serve(REPORT_VALUE_DATE_ROLL, move |envelope| {
             let request: ReportValueDateRollRequest =
                 decode(&envelope, "meridian.v1.ReportValueDateRollRequest")?;
-            let ctx = context_of(&envelope, clock.as_ref());
+            let mut ctx = context_of(&envelope, clock.as_ref());
+            // The pair's records, so a pair that is not two cash
+            // instruments is refused (approved 2026-10-13).
+            let found = references(&bus2, &request.pair, ctx.received_at_ns);
+            ctx.reference_versions = found.versions;
+            ctx.records = found.records;
+            ctx.reference_unavailable = found.unavailable;
             if request.account_id.is_empty() {
-                // W11.25 keeps it unplaced, UNPLACED_REASON_UNMAPPED_VENUE_
-                // ACCOUNT; an UnplacedFact has no arm for a roll and its
-                // fact_kind no value. Open with v23's build: refused, nothing
-                // kept, until one is named.
-                return Err(StoreError::Invalid(format!(
-                    "venue account code {:?} maps to no account on {}: a roll on an unmapped \
-                     code is not kept yet (an open point of contract v23); have the ems map \
-                     the code and report the roll again",
-                    request.venue_account_code, ctx.instance_id
-                ))
-                .on_the_bus());
+                // Held to its shape, then kept unplaced naming no account,
+                // UNPLACED_REASON_UNMAPPED_VENUE_ACCOUNT, as an execution on
+                // the code is (W11.25; approved 2026-10-13).
+                orders::roll_holds(&ctx, &request).map_err(|f| f.on_the_bus())?;
+                return no_account(
+                    &bus2,
+                    store.as_ref(),
+                    &envelope,
+                    ctx,
+                    unplaced_fact::Fact::ValueDateRoll(request.clone()),
+                    UnplacedReason::UnmappedVenueAccount,
+                    &request.venue_account_code,
+                    request.raw_record.clone(),
+                );
             }
             act(
                 &bus2,
