@@ -967,6 +967,24 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.command_typed("platform.book.command.dont-know-execution", "meridian.v1.DontKnowExecutionRequest", message, account, acting_for).await
     }
 
+    /// W11.25: `platform.book.command.report-value-date-roll` (preview).
+    async fn report_value_date_roll(
+        &self,
+        request: Request<plugin::ReportValueDateRollParams>,
+    ) -> Result<Response<plugin::ReportValueDateRollResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let mut message: domain::ReportValueDateRollRequest = self.as_domain(params)?;
+        if let Some(held0) = message.value_date_basis.as_ref() {
+            if let Some(held1) = held0.rule.as_ref() {
+                self.known("value_date_basis.rule.kind", held1.kind, meridian_pb::v1::DateRuleKind::try_from(held1.kind).is_ok())?;
+            }
+        }
+        message.account_id = self.venue_mapped_account("meridian.v1.ReportValueDateRollRequest", &message.venue_account_code, &message.account_id).await?;
+        let account = Some(message.account_id.clone());
+        self.command_typed("platform.book.command.report-value-date-roll", "meridian.v1.ReportValueDateRollRequest", message, account, acting_for).await
+    }
+
     /// W3.14: `platform.reference.query.resolve-venue` (preview).
     async fn resolve_venue(
         &self,

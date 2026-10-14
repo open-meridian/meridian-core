@@ -23,6 +23,7 @@ platform.book.command.release-order	command	oms	bor
 platform.book.command.report-charge	command	connectivity	bor
 platform.book.command.report-execution	command	connectivity,ems,oms	bor
 platform.book.command.report-placement	command	connectivity	bor
+platform.book.command.report-value-date-roll	command	connectivity	bor
 platform.book.command.request-order-change	command	portfolio,oms,ems	bor
 platform.book.command.request-placement-change	command	ems,oms,connectivity	bor
 platform.book.command.resolve-break	command	operations	bor

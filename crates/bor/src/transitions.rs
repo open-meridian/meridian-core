@@ -398,10 +398,10 @@ pub const EXECUTION_TRANSITIONS: &[Transition<ExecutionState>] = &[
     Transition {
         row: "e3",
         from: &[From::State(ExecutionState::Unmatched)],
-        cause: "an accept to an existing order the accepting ems may place against, or to a new order made from the fills: the placement created at filled, the position moved as of the trade date; one naming an execution superseded by a bust or a correction is refused REFUSAL_REASON_EXECUTION_STATE",
+        cause: "an accept to an existing order the accepting ems may place against, or to a new order made from the fills: the placement created at filled, the position moved as of the trade date; one naming an execution superseded by a bust or a correction is refused REFUSAL_REASON_EXECUTION_STATE; fills of more than one account, instrument, side, connectivity plugin or trade date REFUSAL_REASON_EXECUTIONS_DIFFER; an existing order claimed by another REFUSAL_REASON_CLAIMED",
         caused_by: &["ems"],
         to: &[To::State(ExecutionState::Matched)],
-        refusal: &[RefusalReason::ActorRequired, RefusalReason::OrderState, RefusalReason::QuantityExceedsOrder, RefusalReason::ExecutionState, RefusalReason::ExecutionsDiffer],
+        refusal: &[RefusalReason::ActorRequired, RefusalReason::OrderState, RefusalReason::Claimed, RefusalReason::QuantityExceedsOrder, RefusalReason::ExecutionState, RefusalReason::ExecutionsDiffer],
     },
     Transition {
         row: "e4",

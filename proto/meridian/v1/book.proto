@@ -1248,6 +1248,11 @@ enum FeeKind {
   FEE_KIND_CANCEL = 2;
   // Gas, on an on-chain venue.
   FEE_KIND_NETWORK = 3;
+  // Contract v23 (the OANDA batch's item 2): a rolling position's financing,
+  // charged at each roll (W11.12); and the broker's commission on a fill, as
+  // FIX keeps it apart in Commission (12) and CommType (13).
+  FEE_KIND_FINANCING = 4;
+  FEE_KIND_COMMISSION = 5;
 }
 
 // ── Checks, approvals and changes ──
@@ -1501,6 +1506,10 @@ message Order {
 
   // On a pair: the dealt currency, by its cash instrument's ID.
   string dealt_currency = 11;
+  // Contract v23 (W11.1): on an FX order, the pair's quote currency by its
+  // cash instrument's ID, so with the order's instrument, the base
+  // currency's, it names the pair; a limit or stop is in it.
+  string quote_currency = 44;
 
   // A slot of optional legs (FX swaps, spreads; step 5's Q26).
   repeated Leg legs = 12;
@@ -1930,6 +1939,10 @@ message Execution {
   // On a DK: the reason, and the text the `ems` sent.
   DkReason dk_reason = 38;
   string dk_text = 39;
+  // The venue's client order ID (FIX 11), copied from the report of a fill
+  // on no placement where the venue sent one, which FIX requires back on BN
+  // and Q.
+  string venue_client_order_id = 40;
 }
 
 // An execution's finality: a level, and when it reached it.
@@ -2104,6 +2117,11 @@ message ProposeOrderRequest {
   string expire_date = 32;
   int64 expire_time_ns = 33;
   repeated ExecutionInstruction execution_instructions = 34;
+  // Contract v23 (W11.1): an FX order's quote currency, by its cash
+  // instrument's ID. One naming the order's own instrument is refused
+  // INVALID_ARGUMENT naming `quote_currency`; a limit or stop priced in
+  // another currency INVALID_ARGUMENT naming `limit_price` or `stop_price`.
+  string quote_currency = 35;
 }
 
 // W11.2. A fact: never through the gate. By the `oms`, for a user, naming
@@ -2367,6 +2385,29 @@ message DontKnowExecutionRequest {
   repeated string execution_ids = 1;
   DkReason reason = 2;
   string text = 3;
+}
+
+// W11.25 (contract v23). By a connectivity plugin whose venue rolls a spot
+// position at its daily cut: the account's pending lines in the pair move
+// from one value date to the next by one entry, `value-date-rolled`;
+// answered with FactReply.
+message ReportValueDateRollRequest {
+  // Stamped from venue_account_code (`venue-account-map`); empty, never
+  // refused, where none is mapped, so the fact is kept unplaced.
+  string account_id = 1;
+  string venue_account_code = 2;
+  // The pair's two cash instruments, as the date read's spot inputs name it.
+  repeated string pair = 3;
+  // ISO 8601: the value date left, and the date read's answer moved to,
+  // with its basis.
+  string from_value_date = 4;
+  string to_value_date = 5;
+  DateBasis value_date_basis = 6;
+  int64 rolled_at_ns = 7;
+  // The `CHG-` IDs of the roll's financing charges, each reported first.
+  repeated string charge_ids = 8;
+  RawRecordRef raw_record = 9;
+  string idempotency_key = 10;
 }
 
 // ── Their answers, after commit ──
