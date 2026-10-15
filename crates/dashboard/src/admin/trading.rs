@@ -35,6 +35,12 @@ pub const SET_TRADING_INSTRUCTION: &str = "platform.book.command.set-trading-ins
 pub const LIST_TRADING_INSTRUCTIONS: &str = "platform.book.query.list-trading-instructions";
 pub const PATH: &str = "/admin/trading-instructions";
 
+/// W11.36, W11.37 (contract v24): the escape hatch's setting.
+pub const SET_LOCAL_RECORD_ORDERS: &str = "platform.book.command.set-local-record-orders";
+pub const READ_LOCAL_RECORD_ORDERS: &str = "platform.book.query.read-local-record-orders";
+/// Where its form posts.
+pub const LOCAL_RECORDS_PATH: &str = "/admin/trading-instructions/local-records";
+
 const WAIT: Duration = Duration::from_secs(5);
 
 /// The roles that hear the instructions and honour them (roles.json's
@@ -323,6 +329,35 @@ pub async fn read(bus: &meridian_bus::Bus) -> Result<Vec<TradingInstruction>, St
     }
 }
 
+/// The escape hatch's setting in force and the count of live orders on
+/// local records (W11.37), read as the dashboard.
+pub async fn read_local_record_orders(
+    bus: &meridian_bus::Bus,
+) -> Result<meridian_domain::v1::LocalRecordOrdersSetting, String> {
+    let (_, bytes) = bus
+        .call(
+            READ_LOCAL_RECORD_ORDERS,
+            "meridian.v1.ReadLocalRecordOrdersRequest",
+            meridian_domain::v1::ReadLocalRecordOrdersRequest {}.encode_to_vec(),
+            None,
+            Some(WAIT),
+        )
+        .await
+        .map_err(|failed| failed.to_string())?;
+    meridian_domain::v1::LocalRecordOrdersSetting::decode(&bytes[..])
+        .map_err(|failed| format!("the book's answer did not read: {failed}"))
+}
+
+/// The setting as a tool answers it.
+pub fn local_record_orders_json(
+    setting: &meridian_domain::v1::LocalRecordOrdersSetting,
+) -> serde_json::Value {
+    serde_json::json!({
+        "allows_local_record_orders": setting.allows_local_record_orders,
+        "open_order_count": setting.open_order_count,
+    })
+}
+
 /// The request a setter's form or a tool's arguments make, the level
 /// stamped from the setter's access.
 pub fn request(
@@ -347,6 +382,70 @@ pub fn arguments(request: &SetTradingInstructionRequest) -> serde_json::Value {
         "value": value_word(request.value),
         "note": request.reason,
     })
+}
+
+/// The page with, for a deployment admin, the escape hatch's setting
+/// (contract v24, W11.36, W11.37): "Allow orders on local records", on by
+/// default, the live orders on local records counted, a change saying why.
+pub fn page_with(
+    instructions: &Result<Vec<TradingInstruction>, String>,
+    records: &AccessRecords,
+    access: &Access,
+    token: &str,
+    notice: &str,
+    local: Option<&Result<meridian_domain::v1::LocalRecordOrdersSetting, String>>,
+) -> String {
+    let drawn = page(instructions, records, access, token, notice);
+    let Some(local) = local else {
+        return drawn;
+    };
+    let section = local_records_section(local, token);
+    // Before the dialog, after the instructions in force.
+    match drawn.find("<dialog id=\"instruction\"") {
+        Some(at) => format!("{}{section}{}", &drawn[..at], &drawn[at..]),
+        None => format!("{drawn}{section}"),
+    }
+}
+
+/// The escape hatch's section of the page.
+pub fn local_records_section(
+    local: &Result<meridian_domain::v1::LocalRecordOrdersSetting, String>,
+    token: &str,
+) -> String {
+    let body = match local {
+        Err(why) => format!(
+            "<p class=\"refused\">The book of record is not answering: {}</p>",
+            escape(why)
+        ),
+        Ok(setting) => {
+            let (now, flip, flip_label) = if setting.allows_local_record_orders {
+                ("On", "off", "Turn off")
+            } else {
+                ("Off", "on", "Turn on")
+            };
+            let n = setting.open_order_count;
+            format!(
+                "<p class=\"facts-line\" data-allows-local-record-orders=\"{allows}\" \
+                 data-open-order-count=\"{n}\"><span class=\"pill\">{now}</span> \
+                 {n} live order{s} on local records, not priced.</p>\
+                 <form method=\"post\" action=\"{LOCAL_RECORDS_PATH}\" class=\"inline-form\" \
+                 id=\"local-records-form\">{token}<input type=\"hidden\" name=\"allows\" value=\"{flip}\">\
+                 <label>Why <input name=\"note\" required maxlength=\"2000\"></label>\
+                 <button type=\"submit\" name=\"prepare\" value=\"1\" data-prepare>Prepare</button>\
+                 <button type=\"submit\" class=\"primary\">{flip_label}</button></form>",
+                allows = setting.allows_local_record_orders,
+                s = if n == 1 { "" } else { "s" },
+            )
+        }
+    };
+    format!(
+        "<section class=\"admin-section\" id=\"local-records\"><div class=\"section-head\"><div>\
+         <h2>Allow orders on local records</h2><p class=\"hint\">An order may name a local record, \
+         one the platform has not answered for yet, while this is on, as it is by default: it is \
+         marked \"local record: not priced\". Off, a new order on one is refused; orders already \
+         working continue, and a telephoned order is recorded whatever this says.</p></div></div>\
+         {body}</section>"
+    )
 }
 
 /// The page whole: the instructions the viewer may see, one line each, and
@@ -601,5 +700,60 @@ mod tests {
         let theirs = page(&Ok(held), &records, &Access::default(), "<t>", "");
         assert!(theirs.contains("No instruction is set"));
         assert!(!theirs.contains("All accounts</option>"));
+    }
+}
+
+#[cfg(test)]
+mod local_records_tests {
+    use super::*;
+
+    #[test]
+    fn the_escape_hatch_is_drawn_on_with_its_count_and_offers_to_turn_off() {
+        let on = local_records_section(
+            &Ok(meridian_domain::v1::LocalRecordOrdersSetting {
+                allows_local_record_orders: true,
+                open_order_count: 2,
+            }),
+            "<t>",
+        );
+        assert!(on.contains("Allow orders on local records"));
+        assert!(on.contains("data-allows-local-record-orders=\"true\""));
+        assert!(on.contains("2 live orders on local records"));
+        assert!(on.contains("name=\"allows\" value=\"off\""));
+        assert!(on.contains(">Turn off</button>"));
+        assert!(on.contains("name=\"prepare\""));
+        let off = local_records_section(
+            &Ok(meridian_domain::v1::LocalRecordOrdersSetting {
+                allows_local_record_orders: false,
+                open_order_count: 1,
+            }),
+            "<t>",
+        );
+        assert!(off.contains("1 live order on local records"));
+        assert!(off.contains(">Turn on</button>"));
+        let away = local_records_section(&Err("timed out".into()), "<t>");
+        assert!(away.contains("not answering"));
+        // Drawn for a deployment admin before the dialog; not otherwise.
+        let page = page_with(
+            &Ok(Vec::new()),
+            &AccessRecords::default(),
+            &Access {
+                deployment_admin: true,
+                ..Default::default()
+            },
+            "<t>",
+            "",
+            Some(&Ok(Default::default())),
+        );
+        assert!(page.find("id=\"local-records\"") < page.find("<dialog id=\"instruction\""));
+        let plain = page_with(
+            &Ok(Vec::new()),
+            &AccessRecords::default(),
+            &Access::default(),
+            "<t>",
+            "",
+            None,
+        );
+        assert!(!plain.contains("local-records"));
     }
 }

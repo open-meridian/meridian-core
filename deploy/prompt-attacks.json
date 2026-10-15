@@ -1,5 +1,5 @@
 {
- "about": "Vendored from meridian-design evals/prompt-attacks at 078eb05 by make prompt-attacks; never edited here.",
+ "about": "Vendored from meridian-design evals/prompt-attacks at 8f7fd2b by make prompt-attacks; never edited here.",
  "channels": {
   "escalation": {
    "reader": "platform",
@@ -485,10 +485,10 @@
       ],
       "expect": {
        "status": 200,
-       "changelog_source_starts": "escalation from DEP-"
+       "changelog_source_starts": "escalation from a deployment"
       }
      },
-     "server_note": "A venue's upper-case MIC is a namespace X4 allows (XNAS), so the join is stored, and the stub's changelog says which deployment added it.",
+     "server_note": "A venue's upper-case MIC is a namespace X4 allows (XNAS), so the join is stored, and the stub's changelog says a deployment added it, never which: from contract v24 the platform keeps no asker (decisions/037, point 4; W1.25).",
      "curator": "Complete set given explicitly. ZZZZ is dropped unless EDGAR confirms it."
     }
    },

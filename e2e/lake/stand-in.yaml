@@ -29,8 +29,10 @@ services:
       - ${MERIDIAN_HARNESS_STAND_IN}:/stand-in:ro
     environment:
       STAND_IN_LAKE: desk
-  # The harness's master answers JPY seven seconds late, past a sidecar's five-second call (contract v20; the 2026-10-11
-  # ruling): a slow master mints nothing, and a later resolve finds it.
+  # The harness's master answers JPY nine seconds late, past the resolve's eight-second bounded ask and within the
+  # conductor's ten-second request (contract v24;
+  # v20's five-second sidecar call before it; the 2026-10-11 ruling): a slow master mints nothing, and a later
+  # resolve finds it.
   platform:
     environment:
-      HARNESS_PLATFORM_SLOW: JPY=7
+      HARNESS_PLATFORM_SLOW: JPY=9

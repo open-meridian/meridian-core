@@ -46,7 +46,13 @@ no brokerage, no paper account, no trading API of any kind is reached.
    EUR/USD traded Friday 9 October 2026 is Tuesday 13 October, Columbus Day
    counted on EUR alone.
 10. `store book` prints the orders, placements, executions and positions,
-   and `meridian-bor rebuild` reproduces it line for line.
+   and `meridian-bor rebuild` reproduces it line for line -- after step 11.
+11. Booking (contract v24; W11.1, W11.27, W11.29): a block across two funds
+   in the allocation account, booked to them and handed off, each member
+   filled by its allocation and the allocation account netting to zero; an
+   overfill's excess booked to the error account with its cause; and
+   operations' correction by replace after the hand-off, each fund holding
+   the corrected allocation.
 
 Run from the repository's root by the Makefile, which builds the images and
 copies the harness out first; standard library only.
@@ -66,7 +72,7 @@ COMPOSE = ["docker", "compose", "-p", PROJECT, "-f", ".harness/compose.yaml",
            "-f", ".harness/plugins.yaml", "-f", "e2e/orders/stand-in.yaml"]
 ENV = dict(os.environ, MERIDIAN_HARNESS_PEOPLE=PEOPLE,
            MERIDIAN_HARNESS_STAND_IN=os.path.abspath("e2e/orders"))
-INSTANCES = ("pm", "desk", "comp", "venue", "venue2")
+INSTANCES = ("pm", "desk", "comp", "venue", "venue2", "ops")
 CODE = "SIM-ACCT-1"
 # The cash instruments of the platform's stand-in (deploy/harness/platform.py),
 # by the IDs its EUR/USD spot-date rule names.
@@ -172,8 +178,11 @@ def run():
            "--to", "ben")
     aapl = page("venue", "write", "/resolve?symbol=AAPL&figi=BBG000B9XRY4")["instrument_id"]
     must(aapl, "step 1, AAPL resolved")
-    runner("instrument", aapl, "asset_class=equity", "currency=USD", "source=e2e",
-           "description=Apple Inc.", "--ask-platform")
+    # From contract v24 the platform matched it (W3.4): the deployment's
+    # record is the platform's, kept complete under its INS- ID, and a
+    # person's ask refreshes what the platform offers and its venue.
+    must(aapl.startswith("INS-"), f"step 1, AAPL is the platform's record: {aapl}")
+    runner("instrument", aapl, "--ask-platform")
     # The platform named its listing venue, XNAS in the US: a settlement date
     # is worked out by the US equities rule, the rule and its calendar pulled
     # on the first miss (W3.18) and the read asked again.
@@ -341,20 +350,106 @@ def run():
     must(spot["date"] == "2026-10-13" and spot["rule"] == "EUR/USD v1",
          f"step 9, EUR/USD traded Friday 9 October spots Tuesday 13 October: {spot}")
     # The same read by the deployment's own currency records, as a fill's
-    # value date asks it: each LCL- ID translated to the platform's.
+    # value date asks it: from contract v24 the deployment keeps each under
+    # the platform's own INS- ID (W3.1, requirement 19), matched directly.
     local = [page("venue", "write", f"/resolve?iso4217={code}")["instrument_id"]
              for code in ("EUR", "USD")]
-    must(all(one.startswith("LCL-") for one in local),
-         f"step 9, the deployment keeps each currency under its own ID: {local}")
+    must(local == [PLATFORM_EUR, PLATFORM_USD],
+         f"step 9, the deployment keeps each currency under the platform's ID: {local}")
     by_local = page("venue", "write", f"/spot?pair={local[0]},{local[1]}&trade=2026-10-09")
     must(by_local["outcome"] == "DATE_OUTCOME_COMPUTED" and by_local["date"] == "2026-10-13"
          and by_local["rule"] == "EUR/USD v1",
-         f"step 9, EUR/USD's spot read by the deployment's own IDs gets its date: {by_local}")
+         f"step 9, EUR/USD's spot read by the deployment's own records gets its date: {by_local}")
+
+    # 11. Booking (contract v24; W11.1, W11.27, W11.29; the task's "Done
+    # when"): a block across two funds booked to them and handed off, each
+    # member filled by its allocation; an overfill's excess booked to the
+    # error account; and operations' correction by replace after the
+    # hand-off.
+    # Step 7's stop lifted, at the level that set it, so the venue fills.
+    runner("instruction", "active", "--plugin", "venue", "note=The venue trades again.")
+    funds = [runner("account", name, "--instance", "desk").strip().splitlines()[-1]
+             for name in ("Fund A", "Fund B", "Block", "Errors")]
+    fund_a, fund_b, block_account, errors = funds
+    for marked, mark in ((block_account, "allocation"), (errors, "error")):
+        runner("core-form", "/admin", "/admin/accounts/book", f"account_id={marked}",
+               "lot_relief_default=0", f"account_mark={mark}", f"note=The firm's {mark} account")
+    every = ",".join([account] + funds)
+    for role in ("oms", "ems"):
+        runner("grant", "--instance", "desk", "--level", "write", "--role", role, "--accounts", every)
+    runner("grant", "--instance", "ops", "--level", "write", "--role", "operations", "--accounts", every)
+    for held in funds:
+        runner("attribute", held, "waits=false", "note=Post-trade compliance.")
+    page("desk", "admin", f"/map?account={block_account}&code=SIM-BLOCK-1&connectivity=venue")
+    members = []
+    for fund, quantity, key in ((fund_a, 6, "b1"), (fund_b, 4, "b2")):
+        member = page("pm", "write", f"/propose?account={fund}&instrument={aapl}&quantity={quantity}&key={key}")
+        page("desk", "write", f"/release?order={member['order_id']}")
+        members.append(member["order_id"])
+    block = page("desk", "write",
+                 f"/block?account={block_account}&instrument={aapl}&members={','.join(members)}")
+    must(block.get("state") == "ORDER_STATE_RELEASED", f"step 11, the block released on creation: {block}")
+    page("desk", "write", f"/claim?order={block['order_id']}")
+    page("desk", "write", f"/place?order={block['order_id']}&quantity=10&connectivity=venue&code=SIM-BLOCK-1")
+    until(60, lambda: (lambda o: o if o["state"] == "ORDER_STATE_FILLED" else None)(
+        order_of(orders("desk"), block["order_id"])), "step 11, the block was not filled")
+    fills = page("desk", "write", f"/executions?account={block_account}&order={block['order_id']}")["executions"]
+    gross = {"6": "1364.46", "4": "909.64"}
+    booked = page("desk", "write",
+                  f"/book?order={block['order_id']}&executions={','.join(f['execution_id'] for f in fills)}"
+                  f"&alloc={fund_a}:6:{gross['6']},{fund_b}:4:{gross['4']}&handoff=1")
+    must(booked.get("state") == "BOOKING_STATE_HANDED_OFF", f"step 11, booked and handed off: {booked}")
+    for member in members:
+        must(order_of(orders(), member)["state"] == "ORDER_STATE_FILLED",
+             f"step 11, each member filled by its allocation: {member}")
+    book = store_book()
+    held = lambda name: [line.split("|")[4] for line in book.splitlines()
+                         if line.startswith(f"position|{name}|") and "AAPL" in line]
+    must(held("Fund A") == ["6"] and held("Fund B") == ["4"],
+         f"step 11, each fund holds its allocation: {held('Fund A')}, {held('Fund B')}")
+    must(held("Block") in ([], ["0"]), f"step 11, the allocation account nets to zero: {held('Block')}")
+
+    # The overfill: ten ordered and filled, two more from the venue's own
+    # app accepted to it; the excess booked to the error account.
+    page("desk", "admin", f"/map?account={account}&code=SIM-ACCT-OVER&connectivity=venue")
+    over = page("pm", "write", f"/propose?account={account}&instrument={aapl}&quantity=10&key=o11")
+    page("desk", "write", f"/release?order={over['order_id']}")
+    page("desk", "write", f"/claim?order={over['order_id']}")
+    page("desk", "write", f"/place?order={over['order_id']}&quantity=10&connectivity=venue&code=SIM-ACCT-OVER")
+    fills = until(60, lambda: (lambda f: f if len(f) == 3 else None)(page(
+        "desk", "write", f"/executions?account={account}&order={over['order_id']}")["executions"]),
+        "step 11, the venue did not fill two more than placed")
+    before_over = held("Orders fund")
+    excess = page("desk", "write",
+                  f"/book?order={over['order_id']}&executions={','.join(f['execution_id'] for f in fills)}"
+                  f"&alloc={account}:10:2274.10,{errors}:2:454.82:error&handoff=1")
+    must(excess.get("state") == "BOOKING_STATE_HANDED_OFF"
+         and any(a["error_cause"] == "ERROR_CAUSE_OVERFILL" for a in excess["allocations"]),
+         f"step 11, the excess booked to the error account with its cause: {excess}")
+    book = store_book()
+    must(held("Errors") == ["2"], f"step 11, the error account holds the excess: {held('Errors')}")
+
+    # Operations corrects the block's booking by replace after the hand-off.
+    corrected = page("ops", "write",
+                     f"/correct?booking={booked['booking_id']}&alloc={fund_a}:5:1137.05,{fund_b}:5:1137.05"
+                     "&reason=The+allocation+was+five+and+five")
+    must(corrected.get("state") == "BOOKING_STATE_HANDED_OFF"
+         and sorted(a["quantity"] for a in corrected["allocations"]) == ["5", "5"],
+         f"step 11, replaced, a new version, the state kept: {corrected}")
+    book = store_book()
+    must(held("Fund A") == ["5"] and held("Fund B") == ["5"],
+         f"step 11, each fund holds the corrected allocation: {held('Fund A')}, {held('Fund B')}")
+    # The booking is the block's, in the allocation account it was booked in.
+    listed = page("ops", "write", f"/bookings?account={block_account}")["bookings"]
+    must([b["booking_id"] for b in listed] == [booked["booking_id"]],
+         f"step 11, operations reads the booking: {listed}")
+    del before_over
 
     # 10. The book printed, and rebuilt from its journal line for line.
     before = store_book()
     for wanted in ("order|Orders fund|", "placement|Orders fund|", "execution|Orders fund|",
-                   "unplaced||execution|2|venue|false", "instruction|control|3|1"):
+                   # The stop, lifted to active at step 11.
+                   "unplaced||execution|2|venue|false", "instruction|control|1|1"):
         must(wanted in before, f"step 10, store book prints {wanted!r}: {before[-2000:]}")
     compose("stop", "bor")
     compose("run", "--rm", "--no-deps", "-T", "bor",
@@ -376,8 +471,10 @@ def run():
           "unplaced facts, one naming no account and counted on the venue's admin view; two "
           "venue-originated fills waiting unmatched, one accepted to a new order at filled, one "
           "answered DK by the ems's tool, the venue hearing both, a later fill waiting on its own; "
-          "EUR/USD's spot date Tuesday 13 October, by the platform's IDs and the deployment's own; "
-          "and meridian-bor rebuild reproducing the book "
+          "EUR/USD's spot date Tuesday 13 October, by the platform's IDs, the deployment's own; "
+          "a block across two funds booked and handed off, each member filled by its allocation; "
+          "an overfill's excess booked to the error account; a correction by replace after the "
+          "hand-off; and meridian-bor rebuild reproducing the book "
           "line for line")
 
 

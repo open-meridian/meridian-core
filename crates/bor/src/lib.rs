@@ -43,7 +43,10 @@
 //! derived from its dates by whoever reads it. Every quantity is an exact
 //! decimal, summed and never rounded (decisions/023).
 
+pub mod became;
 pub mod book;
+pub mod booking;
+pub mod booking_service;
 pub mod cash;
 pub mod dates;
 pub mod decide;

@@ -542,7 +542,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.call_typed("platform.book.query.list-account-attributes", "meridian.v1.ListAccountAttributesRequest", message, account, None).await
     }
 
-    /// W11.1: `platform.book.command.propose-order` (preview).
+    /// W11.1: `platform.book.command.propose-order` (stable).
     async fn propose_order(
         &self,
         request: Request<plugin::ProposeOrderParams>,
@@ -597,7 +597,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.command_typed("platform.book.command.propose-order", "meridian.v1.ProposeOrderRequest", message, account, acting_for).await
     }
 
-    /// W11.2: `platform.book.command.record-order` (preview).
+    /// W11.2: `platform.book.command.record-order` (stable).
     async fn record_order(
         &self,
         request: Request<plugin::RecordOrderParams>,
@@ -615,7 +615,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.command_typed("platform.book.command.record-order", "meridian.v1.RecordOrderRequest", message, account, acting_for).await
     }
 
-    /// W11.3: `platform.book.command.request-order-change` (preview).
+    /// W11.3: `platform.book.command.request-order-change` (stable).
     async fn request_order_change(
         &self,
         request: Request<plugin::RequestOrderChangeParams>,
@@ -642,7 +642,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.command_typed("platform.book.command.request-order-change", "meridian.v1.RequestOrderChangeRequest", message, account, acting_for).await
     }
 
-    /// W11.4: `platform.book.command.record-check` (preview).
+    /// W11.4: `platform.book.command.record-check` (stable).
     async fn record_check(
         &self,
         request: Request<plugin::RecordCheckParams>,
@@ -655,7 +655,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.command_typed("platform.book.command.record-check", "meridian.v1.RecordCheckRequest", message, account, acting_for).await
     }
 
-    /// W11.5: `platform.book.command.decide-approval` (preview).
+    /// W11.5: `platform.book.command.decide-approval` (stable).
     async fn decide_approval(
         &self,
         request: Request<plugin::DecideApprovalParams>,
@@ -668,7 +668,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.command_typed("platform.book.command.decide-approval", "meridian.v1.DecideApprovalRequest", message, account, acting_for).await
     }
 
-    /// W11.6: `platform.book.command.release-order` (preview).
+    /// W11.6: `platform.book.command.release-order` (stable).
     async fn release_order(
         &self,
         request: Request<plugin::ReleaseOrderParams>,
@@ -680,7 +680,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.command_typed("platform.book.command.release-order", "meridian.v1.ReleaseOrderRequest", message, account, acting_for).await
     }
 
-    /// W11.7: `platform.book.command.set-working-condition` (preview).
+    /// W11.7: `platform.book.command.set-working-condition` (stable).
     async fn set_working_condition(
         &self,
         request: Request<plugin::SetWorkingConditionParams>,
@@ -693,7 +693,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.command_typed("platform.book.command.set-working-condition", "meridian.v1.SetWorkingConditionRequest", message, account, acting_for).await
     }
 
-    /// W11.8: `platform.book.command.create-placement` (preview).
+    /// W11.8: `platform.book.command.create-placement` (stable).
     async fn create_placement(
         &self,
         request: Request<plugin::CreatePlacementParams>,
@@ -717,7 +717,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.command_typed("platform.book.command.create-placement", "meridian.v1.CreatePlacementRequest", message, account, acting_for).await
     }
 
-    /// W11.9: `platform.book.command.request-placement-change` (preview).
+    /// W11.9: `platform.book.command.request-placement-change` (stable).
     async fn request_placement_change(
         &self,
         request: Request<plugin::RequestPlacementChangeParams>,
@@ -735,7 +735,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.command_typed("platform.book.command.request-placement-change", "meridian.v1.RequestPlacementChangeRequest", message, account, acting_for).await
     }
 
-    /// W11.10: `platform.book.command.report-placement` (preview).
+    /// W11.10: `platform.book.command.report-placement` (stable).
     async fn report_placement(
         &self,
         request: Request<plugin::ReportPlacementParams>,
@@ -754,7 +754,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.command_typed("platform.book.command.report-placement", "meridian.v1.ReportPlacementRequest", message, account, acting_for).await
     }
 
-    /// W11.11: `platform.book.command.report-execution` (preview).
+    /// W11.11: `platform.book.command.report-execution` (stable).
     async fn report_execution(
         &self,
         request: Request<plugin::ReportExecutionParams>,
@@ -793,7 +793,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.command_typed("platform.book.command.report-execution", "meridian.v1.ReportExecutionRequest", message, account, acting_for).await
     }
 
-    /// W11.12: `platform.book.command.report-charge` (preview).
+    /// W11.12: `platform.book.command.report-charge` (stable).
     async fn report_charge(
         &self,
         request: Request<plugin::ReportChargeParams>,
@@ -809,7 +809,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.command_typed("platform.book.command.report-charge", "meridian.v1.ReportChargeRequest", message, account, acting_for).await
     }
 
-    /// W11.14: `platform.book.command.acknowledge-flag` (preview).
+    /// W11.14: `platform.book.command.acknowledge-flag` (stable).
     async fn acknowledge_flag(
         &self,
         request: Request<plugin::AcknowledgeFlagParams>,
@@ -822,7 +822,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.command_typed("platform.book.command.acknowledge-flag", "meridian.v1.AcknowledgeFlagRequest", message, account, acting_for).await
     }
 
-    /// W11.16: `platform.book.query.list-trading-instructions` (preview).
+    /// W11.16: `platform.book.query.list-trading-instructions` (stable).
     async fn list_trading_instructions(
         &self,
         request: Request<plugin::ListTradingInstructionsParams>,
@@ -832,7 +832,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.call_typed("platform.book.query.list-trading-instructions", "meridian.v1.ListTradingInstructionsRequest", message, account, None).await
     }
 
-    /// W11.17: `platform.book.query.list-orders` (preview).
+    /// W11.17: `platform.book.query.list-orders` (stable).
     async fn list_orders(
         &self,
         request: Request<plugin::ListOrdersParams>,
@@ -843,7 +843,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.call_typed("platform.book.query.list-orders", "meridian.v1.ListOrdersRequest", message, account, None).await
     }
 
-    /// W11.17: `platform.book.query.order-history` (preview).
+    /// W11.17: `platform.book.query.order-history` (stable).
     async fn read_order_history(
         &self,
         request: Request<plugin::ReadOrderHistoryParams>,
@@ -853,7 +853,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.call_typed("platform.book.query.order-history", "meridian.v1.OrderHistoryRequest", message, account, None).await
     }
 
-    /// W11.18: `platform.book.command.record-locate` (preview).
+    /// W11.18: `platform.book.command.record-locate` (stable).
     async fn record_locate(
         &self,
         request: Request<plugin::RecordLocateParams>,
@@ -871,7 +871,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.command_typed("platform.book.command.record-locate", "meridian.v1.RecordLocateRequest", message, account, acting_for).await
     }
 
-    /// W11.18: `platform.book.query.list-locates` (preview).
+    /// W11.18: `platform.book.query.list-locates` (stable).
     async fn list_locates(
         &self,
         request: Request<plugin::ListLocatesParams>,
@@ -881,7 +881,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.call_typed("platform.book.query.list-locates", "meridian.v1.ListLocatesRequest", message, account, None).await
     }
 
-    /// W11.19: `platform.book.command.record-locate-use` (preview).
+    /// W11.19: `platform.book.command.record-locate-use` (stable).
     async fn record_locate_use(
         &self,
         request: Request<plugin::RecordLocateUseParams>,
@@ -897,7 +897,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.command_typed("platform.book.command.record-locate-use", "meridian.v1.RecordLocateUseRequest", message, account, acting_for).await
     }
 
-    /// W11.20: `platform.config.event.venue-catalogue` (preview).
+    /// W11.20: `platform.config.event.venue-catalogue` (stable).
     async fn report_venue_catalogue(
         &self,
         request: Request<plugin::ReportVenueCatalogueParams>,
@@ -925,7 +925,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.publish_typed("platform.config.event.venue-catalogue", "meridian.v1.VenueCatalogueEvent", message).await
     }
 
-    /// W11.20: `platform.config.query.venue-catalogue` (preview).
+    /// W11.20: `platform.config.query.venue-catalogue` (stable).
     async fn read_venue_catalogue(
         &self,
         request: Request<plugin::ReadVenueCatalogueParams>,
@@ -937,7 +937,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.call_typed("platform.config.query.venue-catalogue", "meridian.v1.ReadVenueCatalogueRequest", message, account, acting_for).await
     }
 
-    /// W11.22: `platform.config.command.map-venue-account` (preview).
+    /// W11.22: `platform.config.command.map-venue-account` (stable).
     async fn map_venue_account(
         &self,
         request: Request<plugin::MapVenueAccountParams>,
@@ -950,7 +950,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.command_typed("platform.config.command.map-venue-account", "meridian.v1.MapVenueAccountRequest", message, account, acting_for).await
     }
 
-    /// W11.23: `platform.book.command.accept-execution` (preview).
+    /// W11.23: `platform.book.command.accept-execution` (stable).
     async fn accept_execution(
         &self,
         request: Request<plugin::AcceptExecutionParams>,
@@ -962,7 +962,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.command_typed("platform.book.command.accept-execution", "meridian.v1.AcceptExecutionRequest", message, account, acting_for).await
     }
 
-    /// W11.24: `platform.book.command.dont-know-execution` (preview).
+    /// W11.24: `platform.book.command.dont-know-execution` (stable).
     async fn dont_know_execution(
         &self,
         request: Request<plugin::DontKnowExecutionParams>,
@@ -991,6 +991,181 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         message.account_id = self.venue_mapped_account("meridian.v1.ReportValueDateRollRequest", &message.venue_account_code, &message.account_id).await?;
         let account = Some(message.account_id.clone());
         self.command_typed("platform.book.command.report-value-date-roll", "meridian.v1.ReportValueDateRollRequest", message, account, acting_for).await
+    }
+
+    /// W11.26: `platform.book.command.set-allocation-instruction` (preview).
+    async fn set_allocation_instruction(
+        &self,
+        request: Request<plugin::SetAllocationInstructionParams>,
+    ) -> Result<Response<plugin::SetAllocationInstructionResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let message: domain::SetAllocationInstructionRequest = self.as_domain(params)?;
+        if let Some(held0) = message.allocation_instruction.as_ref() {
+            for (i1, held1) in held0.lines.iter().enumerate() {
+                self.exact(&format!("allocation_instruction.lines[{i1}].quantity"), held1.quantity.as_ref())?;
+                self.exact(&format!("allocation_instruction.lines[{i1}].weight"), held1.weight.as_ref())?;
+            }
+        }
+        let account = None;
+        self.command_typed("platform.book.command.set-allocation-instruction", "meridian.v1.SetAllocationInstructionRequest", message, account, acting_for).await
+    }
+
+    /// W11.27: `platform.book.command.book-order` (preview).
+    async fn book_order(
+        &self,
+        request: Request<plugin::BookOrderParams>,
+    ) -> Result<Response<plugin::BookOrderResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let message: domain::BookOrderRequest = self.as_domain(params)?;
+        for (i0, held0) in message.allocations.iter().enumerate() {
+            self.exact(&format!("allocations[{i0}].quantity"), held0.quantity.as_ref())?;
+            self.exact_money(&format!("allocations[{i0}].average_price"), held0.average_price.as_ref())?;
+            self.exact_money(&format!("allocations[{i0}].gross_amount"), held0.gross_amount.as_ref())?;
+            for (i1, held1) in held0.fees.iter().enumerate() {
+                self.known(&format!("allocations[{i0}].fees[{i1}].kind"), held1.kind, domain::FeeKind::try_from(held1.kind).is_ok())?;
+                self.exact_money(&format!("allocations[{i0}].fees[{i1}].amount"), held1.amount.as_ref())?;
+            }
+            self.exact_money(&format!("allocations[{i0}].net_amount"), held0.net_amount.as_ref())?;
+            self.known(&format!("allocations[{i0}].error_cause"), held0.error_cause, domain::ErrorCause::try_from(held0.error_cause).is_ok())?;
+            for (i1, held1) in held0.give_up_answers.iter().enumerate() {
+                self.known(&format!("allocations[{i0}].give_up_answers[{i1}].answer"), held1.answer, domain::GiveUpAnswer::try_from(held1.answer).is_ok())?;
+            }
+        }
+        let account = None;
+        self.command_typed("platform.book.command.book-order", "meridian.v1.BookOrderRequest", message, account, acting_for).await
+    }
+
+    /// W11.28: `platform.book.command.hand-off-booking` (preview).
+    async fn hand_off_booking(
+        &self,
+        request: Request<plugin::HandOffBookingParams>,
+    ) -> Result<Response<plugin::HandOffBookingResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let message: domain::HandOffBookingRequest = self.as_domain(params)?;
+        let account = None;
+        self.command_typed("platform.book.command.hand-off-booking", "meridian.v1.HandOffBookingRequest", message, account, acting_for).await
+    }
+
+    /// W11.29: `platform.book.command.correct-booking` (preview).
+    async fn correct_booking(
+        &self,
+        request: Request<plugin::CorrectBookingParams>,
+    ) -> Result<Response<plugin::CorrectBookingResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let message: domain::CorrectBookingRequest = self.as_domain(params)?;
+        for (i0, held0) in message.allocations.iter().enumerate() {
+            self.exact(&format!("allocations[{i0}].quantity"), held0.quantity.as_ref())?;
+            self.exact_money(&format!("allocations[{i0}].average_price"), held0.average_price.as_ref())?;
+            self.exact_money(&format!("allocations[{i0}].gross_amount"), held0.gross_amount.as_ref())?;
+            for (i1, held1) in held0.fees.iter().enumerate() {
+                self.known(&format!("allocations[{i0}].fees[{i1}].kind"), held1.kind, domain::FeeKind::try_from(held1.kind).is_ok())?;
+                self.exact_money(&format!("allocations[{i0}].fees[{i1}].amount"), held1.amount.as_ref())?;
+            }
+            self.exact_money(&format!("allocations[{i0}].net_amount"), held0.net_amount.as_ref())?;
+            self.known(&format!("allocations[{i0}].error_cause"), held0.error_cause, domain::ErrorCause::try_from(held0.error_cause).is_ok())?;
+            for (i1, held1) in held0.give_up_answers.iter().enumerate() {
+                self.known(&format!("allocations[{i0}].give_up_answers[{i1}].answer"), held1.answer, domain::GiveUpAnswer::try_from(held1.answer).is_ok())?;
+            }
+        }
+        self.known("kind", message.kind, domain::BookingCorrectionKind::try_from(message.kind).is_ok())?;
+        let account = None;
+        self.command_typed("platform.book.command.correct-booking", "meridian.v1.CorrectBookingRequest", message, account, acting_for).await
+    }
+
+    /// W11.31: `platform.book.query.list-bookings` (preview).
+    async fn list_bookings(
+        &self,
+        request: Request<plugin::ListBookingsParams>,
+    ) -> Result<Response<plugin::ListBookingsResult>, Status> {
+        let message: domain::ListBookingsRequest = self.as_domain(request.into_inner())?;
+        self.known("state", message.state, domain::BookingState::try_from(message.state).is_ok())?;
+        let account = Some(message.account_id.clone());
+        self.call_typed("platform.book.query.list-bookings", "meridian.v1.ListBookingsRequest", message, account, None).await
+    }
+
+    /// W11.32: `platform.book.command.report-give-up` (preview).
+    async fn report_give_up(
+        &self,
+        request: Request<plugin::ReportGiveUpParams>,
+    ) -> Result<Response<plugin::ReportGiveUpResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let message: domain::ReportGiveUpRequest = self.as_domain(params)?;
+        self.known("answer", message.answer, domain::GiveUpAnswer::try_from(message.answer).is_ok())?;
+        let account = None;
+        self.command_typed("platform.book.command.report-give-up", "meridian.v1.ReportGiveUpRequest", message, account, acting_for).await
+    }
+
+    /// W11.33: `platform.book.command.record-sleeve-cross` (preview).
+    async fn record_sleeve_cross(
+        &self,
+        request: Request<plugin::RecordSleeveCrossParams>,
+    ) -> Result<Response<plugin::RecordSleeveCrossResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let message: domain::RecordSleeveCrossRequest = self.as_domain(params)?;
+        if let Some(held0) = message.sleeve_cross.as_ref() {
+            self.exact("sleeve_cross.quantity", held0.quantity.as_ref())?;
+            self.exact_money("sleeve_cross.cross_price", held0.cross_price.as_ref())?;
+        }
+        let account = None;
+        self.command_typed("platform.book.command.record-sleeve-cross", "meridian.v1.RecordSleeveCrossRequest", message, account, acting_for).await
+    }
+
+    /// W11.34: `platform.book.command.raise-alert` (preview).
+    async fn raise_alert(
+        &self,
+        request: Request<plugin::RaiseAlertParams>,
+    ) -> Result<Response<plugin::RaiseAlertResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let message: domain::RaiseAlertRequest = self.as_domain(params)?;
+        if let Some(held0) = message.subject.as_ref() {
+            if let Some(held1) = held0.position.as_ref() {
+                self.known("subject.position.side", held1.side, domain::HoldingSide::try_from(held1.side).is_ok())?;
+            }
+        }
+        self.known("kind", message.kind, domain::AlertKind::try_from(message.kind).is_ok())?;
+        let account = Some(message.account_id.clone());
+        self.command_typed("platform.book.command.raise-alert", "meridian.v1.RaiseAlertRequest", message, account, acting_for).await
+    }
+
+    /// W11.34: `platform.book.command.acknowledge-alert` (preview).
+    async fn acknowledge_alert(
+        &self,
+        request: Request<plugin::AcknowledgeAlertParams>,
+    ) -> Result<Response<plugin::AcknowledgeAlertResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let message: domain::AcknowledgeAlertRequest = self.as_domain(params)?;
+        let account = None;
+        self.command_typed("platform.book.command.acknowledge-alert", "meridian.v1.AcknowledgeAlertRequest", message, account, acting_for).await
+    }
+
+    /// W11.35: `platform.book.query.list-alerts` (preview).
+    async fn list_alerts(
+        &self,
+        request: Request<plugin::ListAlertsParams>,
+    ) -> Result<Response<plugin::ListAlertsResult>, Status> {
+        let message: domain::ListAlertsRequest = self.as_domain(request.into_inner())?;
+        self.known("state", message.state, domain::AlertState::try_from(message.state).is_ok())?;
+        self.known("kind", message.kind, domain::AlertKind::try_from(message.kind).is_ok())?;
+        let account = Some(message.account_id.clone());
+        self.call_typed("platform.book.query.list-alerts", "meridian.v1.ListAlertsRequest", message, account, None).await
+    }
+
+    /// W11.37: `platform.book.query.read-local-record-orders` (preview).
+    async fn read_local_record_orders(
+        &self,
+        request: Request<plugin::ReadLocalRecordOrdersParams>,
+    ) -> Result<Response<plugin::ReadLocalRecordOrdersResult>, Status> {
+        let message: domain::ReadLocalRecordOrdersRequest = self.as_domain(request.into_inner())?;
+        let account = None;
+        self.call_typed("platform.book.query.read-local-record-orders", "meridian.v1.ReadLocalRecordOrdersRequest", message, account, None).await
     }
 
     /// W3.14: `platform.reference.query.resolve-venue` (preview).
@@ -1048,6 +1223,59 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         }
         let account = None;
         self.call_typed("platform.reference.query.compute-date", "meridian.v1.ComputeDateRequest", message, account, None).await
+    }
+
+    /// W3.22: `platform.reference.query.list-replacements` (preview).
+    async fn list_replacements(
+        &self,
+        request: Request<plugin::ListReplacementsParams>,
+    ) -> Result<Response<plugin::ListReplacementsResult>, Status> {
+        let message: domain::ListReplacementsRequest = self.as_domain(request.into_inner())?;
+        let account = None;
+        self.call_typed("platform.reference.query.list-replacements", "meridian.v1.ListReplacementsRequest", message, account, None).await
+    }
+
+    /// W3.23: `platform.reference.command.offer-template-fields` (preview).
+    async fn offer_template_fields(
+        &self,
+        request: Request<plugin::OfferTemplateFieldsParams>,
+    ) -> Result<Response<plugin::OfferTemplateFieldsResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let message: domain::OfferTemplateFieldsRequest = self.as_domain(params)?;
+        for (i0, held0) in message.fields.iter().enumerate() {
+            if let Some(held1) = held0.provenance.as_ref() {
+                self.known(&format!("fields[{i0}].provenance.kind"), held1.kind, meridian_pb::v1::ProvenanceKind::try_from(held1.kind).is_ok())?;
+                if let Some(held2) = held1.date_basis.as_ref() {
+                    if let Some(held3) = held2.rule.as_ref() {
+                        self.known(&format!("fields[{i0}].provenance.date_basis.rule.kind"), held3.kind, meridian_pb::v1::DateRuleKind::try_from(held3.kind).is_ok())?;
+                    }
+                }
+            }
+        }
+        let account = None;
+        self.command_typed("platform.reference.command.offer-template-fields", "meridian.v1.OfferTemplateFieldsRequest", message, account, acting_for).await
+    }
+
+    /// W3.24: `platform.reference.query.list-templates` (preview).
+    async fn list_templates(
+        &self,
+        request: Request<plugin::ListTemplatesParams>,
+    ) -> Result<Response<plugin::ListTemplatesResult>, Status> {
+        let message: domain::ListTemplatesRequest = self.as_domain(request.into_inner())?;
+        self.known("asset_class", message.asset_class, domain::AssetClass::try_from(message.asset_class).is_ok())?;
+        let account = None;
+        self.call_typed("platform.reference.query.list-templates", "meridian.v1.ListTemplatesRequest", message, account, None).await
+    }
+
+    /// W3.24: `platform.reference.query.read-template` (preview).
+    async fn read_template(
+        &self,
+        request: Request<plugin::ReadTemplateParams>,
+    ) -> Result<Response<plugin::ReadTemplateResult>, Status> {
+        let message: domain::ReadTemplateRequest = self.as_domain(request.into_inner())?;
+        let account = None;
+        self.call_typed("platform.reference.query.read-template", "meridian.v1.ReadTemplateRequest", message, account, None).await
     }
 
     /// W10.4: `platform.lake.command.record-prices` (preview).
@@ -1557,6 +1785,27 @@ pub(crate) const DELIVERED: &[crate::receive::Row] = &[
         payload_type: "meridian.v1.OutcomesRecordedEvent",
         read: outcomes_recorded,
     },
+    crate::receive::Row {
+        name: "ReplaceMergedInstrument",
+        step: "W3.8",
+        topic: "platform.reference.event.instrument-replaced",
+        payload_type: "meridian.v1.InstrumentReplacedEvent",
+        read: replace_merged_instrument,
+    },
+    crate::receive::Row {
+        name: "BookingUpdated",
+        step: "W11.30",
+        topic: "platform.book.event.booking-updated",
+        payload_type: "meridian.v1.BookingUpdatedEvent",
+        read: booking_updated,
+    },
+    crate::receive::Row {
+        name: "AlertChanged",
+        step: "W11.35",
+        topic: "platform.book.event.alert-changed",
+        payload_type: "meridian.v1.AlertChangedEvent",
+        read: alert_changed,
+    },
 ];
 
 /// W2.5: a StatementRecordedEvent, its account at `account_id`.
@@ -1832,5 +2081,41 @@ fn outcomes_recorded(payload: &[u8]) -> Result<crate::receive::Read, prost::Deco
         journal: None,
         cause: None,
         item: plugin::delivery::Item::OutcomesRecorded(message),
+    })
+}
+
+/// W3.8: a InstrumentReplacedEvent, sequenced, unscoped.
+fn replace_merged_instrument(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeError> {
+    let message = plugin::InstrumentReplacedEvent::decode(payload)?;
+    Ok(crate::receive::Read {
+        account: None,
+        directed: Vec::new(),
+        journal: None,
+        cause: None,
+        item: plugin::delivery::Item::ReplaceMergedInstrument(message),
+    })
+}
+
+/// W11.30: a BookingUpdatedEvent, its account at `booking.account_id`.
+fn booking_updated(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeError> {
+    let message = plugin::BookingUpdatedEvent::decode(payload)?;
+    Ok(crate::receive::Read {
+        account: Some(message.booking.as_ref().map(|held| held.account_id.clone()).unwrap_or_default()),
+        directed: Vec::new(),
+        journal: message.journal.clone(),
+        cause: message.cause.clone(),
+        item: plugin::delivery::Item::BookingUpdated(message),
+    })
+}
+
+/// W11.35: a AlertChangedEvent, its account at `alert.account_id`.
+fn alert_changed(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeError> {
+    let message = plugin::AlertChangedEvent::decode(payload)?;
+    Ok(crate::receive::Read {
+        account: Some(message.alert.as_ref().map(|held| held.account_id.clone()).unwrap_or_default()),
+        directed: Vec::new(),
+        journal: message.journal.clone(),
+        cause: message.cause.clone(),
+        item: plugin::delivery::Item::AlertChanged(message),
     })
 }

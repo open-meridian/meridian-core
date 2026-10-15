@@ -150,6 +150,7 @@ pub async fn currency_codes(
                 page_size: 10,
                 cursor: String::new(),
                 search: id.to_string(),
+                provisional: false,
             },
         )
         .await;

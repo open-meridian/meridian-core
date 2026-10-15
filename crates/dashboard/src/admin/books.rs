@@ -127,6 +127,20 @@ pub(super) fn waits_word(waits: bool) -> &'static str {
     }
 }
 
+/// An account's mark (contract v24, W9.13): an error account, an
+/// allocation account, or neither, by the form's word.
+pub(super) fn mark_word(books: &Books, account_id: &str) -> &'static str {
+    match books.of(account_id) {
+        Some(a) if a.error_account => ERROR_ACCOUNT,
+        Some(a) if a.allocation_account => ALLOCATION_ACCOUNT,
+        _ => NEITHER,
+    }
+}
+
+const NEITHER: &str = "neither";
+const ERROR_ACCOUNT: &str = "error";
+const ALLOCATION_ACCOUNT: &str = "allocation";
+
 const WAITS: &str = "wait";
 const DOES_NOT_WAIT: &str = "no-wait";
 
@@ -157,7 +171,10 @@ pub fn book_form(token: &str) -> String {
          <label>Lot relief, when a sale names none <select name=\"lot_relief_default\">{methods}</select></label></div>\
          <div class=\"pair\"><label>Releases <select name=\"waits_for_compliance\">\
          <option value=\"{WAITS}\">Wait for compliance</option>\
-         <option value=\"{DOES_NOT_WAIT}\">Do not wait</option></select></label></div>\
+         <option value=\"{DOES_NOT_WAIT}\">Do not wait</option></select></label>\
+         <label>Marked <select name=\"account_mark\"><option value=\"{NEITHER}\">Neither</option>\
+         <option value=\"{ERROR_ACCOUNT}\">An error account</option>\
+         <option value=\"{ALLOCATION_ACCOUNT}\">An allocation account</option></select></label></div>\
          <div class=\"pair save\"><label>Why <input name=\"note\" required></label>\
          <button type=\"submit\" class=\"primary\">Save</button></div></div></form>"
     )
@@ -165,11 +182,35 @@ pub fn book_form(token: &str) -> String {
 
 /// What the form asks the book to set: each attribute that differs from what
 /// it holds, each its own act with the reason given (W9.13).
+#[cfg(test)]
 pub fn requests(
     account_id: &str,
     base_currency_code: &str,
     lot_relief_default: &str,
     waits_for_compliance: &str,
+    reason: &str,
+    held: Option<&AccountAttributes>,
+) -> Result<Vec<SetAccountAttributeRequest>, String> {
+    requests_marked(
+        account_id,
+        base_currency_code,
+        lot_relief_default,
+        waits_for_compliance,
+        "",
+        reason,
+        held,
+    )
+}
+
+/// [`requests`], with the account's mark (contract v24, W9.13): an error
+/// account or an allocation account, each change its own act; one mark
+/// cleared before the other is set.
+pub fn requests_marked(
+    account_id: &str,
+    base_currency_code: &str,
+    lot_relief_default: &str,
+    waits_for_compliance: &str,
+    account_mark: &str,
     reason: &str,
     held: Option<&AccountAttributes>,
 ) -> Result<Vec<SetAccountAttributeRequest>, String> {
@@ -208,6 +249,37 @@ pub fn requests(
             ))
         }
     }
+    let (error_now, allocation_now) = held
+        .map(|a| (a.error_account, a.allocation_account))
+        .unwrap_or((false, false));
+    let wanted = match account_mark {
+        "" => None,
+        NEITHER => Some((false, false)),
+        ERROR_ACCOUNT => Some((true, false)),
+        ALLOCATION_ACCOUNT => Some((false, true)),
+        other => return Err(format!("{other:?} is no mark an account takes")),
+    };
+    if let Some((error, allocation)) = wanted {
+        // A mark cleared first, so the account never holds both.
+        if error_now && !error {
+            asked.push(set_account_attribute_request::Attribute::ErrorAccount(
+                false,
+            ));
+        }
+        if allocation_now && !allocation {
+            asked.push(set_account_attribute_request::Attribute::AllocationAccount(
+                false,
+            ));
+        }
+        if error && !error_now {
+            asked.push(set_account_attribute_request::Attribute::ErrorAccount(true));
+        }
+        if allocation && !allocation_now {
+            asked.push(set_account_attribute_request::Attribute::AllocationAccount(
+                true,
+            ));
+        }
+    }
     if asked.is_empty() {
         return Err("nothing changed: the book holds these already".into());
     }
@@ -237,6 +309,13 @@ pub fn arguments(request: &SetAccountAttributeRequest) -> serde_json::Value {
         }
         Some(set_account_attribute_request::Attribute::WaitsForCompliance(waits)) => {
             arguments["waits_for_compliance"] = (*waits).into();
+        }
+        // Contract v24 (W9.13): the error and allocation account marks.
+        Some(set_account_attribute_request::Attribute::ErrorAccount(marked)) => {
+            arguments["error_account"] = (*marked).into();
+        }
+        Some(set_account_attribute_request::Attribute::AllocationAccount(marked)) => {
+            arguments["allocation_account"] = (*marked).into();
         }
         None => {}
     }
@@ -376,5 +455,34 @@ mod tests {
             form.contains("<output name=\"since\">"),
             "shown, never posted"
         );
+    }
+}
+
+#[cfg(test)]
+mod mark_tests {
+    use super::*;
+
+    #[test]
+    fn a_mark_is_set_and_cleared_each_its_own_act_never_both() {
+        let held = AccountAttributes {
+            account_id: "ACC-1".into(),
+            error_account: true,
+            ..Default::default()
+        };
+        let asked =
+            requests_marked("ACC-1", "", "0", "", "allocation", "why", Some(&held)).unwrap();
+        assert_eq!(
+            asked
+                .iter()
+                .map(|r| r.attribute.clone().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                set_account_attribute_request::Attribute::ErrorAccount(false),
+                set_account_attribute_request::Attribute::AllocationAccount(true),
+            ]
+        );
+        assert!(requests_marked("ACC-1", "", "0", "", "error", "why", Some(&held)).is_err());
+        assert!(requests_marked("ACC-1", "", "0", "", "other", "why", None).is_err());
+        assert_eq!(arguments(&asked[1])["allocation_account"], true);
     }
 }

@@ -35,6 +35,9 @@ import "meridian/v1/lake.proto";
 // The order path's order types, times in force and strategy kinds (W11,
 // contract v22), which a venue's catalogue lists.
 import "meridian/v1/book.proto";
+// IdentifierUsageReport: a usage report the conductor sent (W3.28, contract
+// v24).
+import "meridian/v1/reference.proto";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // W6.1 — who has signed in
@@ -167,6 +170,18 @@ message DefineAccountRequest {
 
 message CloseAccountRequest {
   string account_id = 1;
+
+  // Contract v24 (W6.3): "Unlink all and close". The conductor withdraws
+  // every grant of the account to a plugin instance (W6.30), each its own
+  // record, and closes it, in one step. A link (W6.4) or an ems's mapping
+  // (W11.22) still standing is undone at its plugin's page: the closure is
+  // refused naming each, and nothing is withdrawn or closed. Without it, an
+  // account anything is still attached to is refused the same way.
+  bool unlink_attached = 2;
+
+  // Why, at most 2,000 characters, on each grant's withdrawal; required
+  // through a delegation (approved 2026-10-15).
+  string note = 3;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -861,4 +876,44 @@ message ReadVenueCatalogueRequest {
 
 message ReadVenueCatalogueReply {
   VenueCatalogue catalogue = 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W3.28 — the deployment's identifier usage report, contract v24
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The deployment admin's setting `reports_usage`, shown "Report identifier
+// usage", on by default and kept by the conductor, each change recorded as
+// any setting's; the reports the conductor sent, kept on the deployment as
+// its own records (the platform-master intent's ruling 15).
+
+// A deployment admin turns the report on or off, with a reason.
+message SetReportsUsageRequest {
+  bool reports_usage = 1;
+  string reason = 2;
+}
+
+// The setting in force.
+message ReportsUsageSetting {
+  bool reports_usage = 1;
+}
+
+// The reports the conductor sent.
+message ListUsageReportsRequest {}
+
+message ListUsageReportsReply {
+  repeated SentUsageReport reports = 1;
+
+  // The setting in force (`reports_usage`), so the page says whether the
+  // report is on.
+  bool reports_usage = 2;
+}
+
+// A usage report the conductor sent, kept on the deployment as its own
+// record.
+message SentUsageReport {
+  int64 sent_at_ns = 1;
+  // Whether the platform received it.
+  bool received = 2;
+  IdentifierUsageReport report = 3;
 }

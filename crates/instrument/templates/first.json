@@ -1,0 +1,411 @@
+{
+ "about": "The platform's first templates and each asset class's base template, at their published version 1, shipped with each core release so a deployment names a record's template and its missing fields before its first pull and while the platform cannot be reached (W3.24; ruled 2026-10-14). Mirrors meridian-platform platform_site/domain/templates.py (FIRST and BASES) as published at platform c343559. A pull adds the versions after.",
+ "templates": [
+  {
+   "template_id": "TPL-cash",
+   "asset_class": "cash",
+   "instrument_type": "",
+   "name": "Cash and currency",
+   "fields": [
+    {
+     "path": "identifiers",
+     "type": "identifier",
+     "required": true
+    },
+    {
+     "path": "description",
+     "type": "text",
+     "required": true
+    },
+    {
+     "path": "currency",
+     "type": "text",
+     "required": true
+    }
+   ],
+   "match_rule": [
+    "iso4217"
+   ],
+   "base": false,
+   "template_version": "1",
+   "calculation": ""
+  },
+  {
+   "template_id": "TPL-crypto-asset",
+   "asset_class": "crypto_asset",
+   "instrument_type": "",
+   "name": "Crypto asset",
+   "fields": [
+    {
+     "path": "identifiers",
+     "type": "identifier",
+     "required": true
+    },
+    {
+     "path": "description",
+     "type": "text",
+     "required": true
+    }
+   ],
+   "match_rule": [
+    "caip19"
+   ],
+   "base": false,
+   "template_version": "1",
+   "calculation": ""
+  },
+  {
+   "template_id": "TPL-equity",
+   "asset_class": "equity",
+   "instrument_type": "",
+   "name": "Equity",
+   "fields": [
+    {
+     "path": "identifiers",
+     "type": "identifier",
+     "required": true
+    },
+    {
+     "path": "description",
+     "type": "text",
+     "required": true
+    },
+    {
+     "path": "currency",
+     "type": "text",
+     "required": true
+    },
+    {
+     "path": "listing_venue_id",
+     "type": "identifier",
+     "required": false
+    }
+   ],
+   "match_rule": [
+    "share_class_figi",
+    "composite_figi",
+    "figi",
+    "ticker"
+   ],
+   "base": false,
+   "template_version": "1",
+   "calculation": ""
+  },
+  {
+   "template_id": "TPL-fund",
+   "asset_class": "fund",
+   "instrument_type": "",
+   "name": "ETF and mutual fund",
+   "fields": [
+    {
+     "path": "identifiers",
+     "type": "identifier",
+     "required": true
+    },
+    {
+     "path": "description",
+     "type": "text",
+     "required": true
+    },
+    {
+     "path": "currency",
+     "type": "text",
+     "required": true
+    },
+    {
+     "path": "listing_venue_id",
+     "type": "identifier",
+     "required": false
+    }
+   ],
+   "match_rule": [
+    "share_class_figi",
+    "composite_figi",
+    "figi",
+    "ticker",
+    "sec_series",
+    "sec_class"
+   ],
+   "base": false,
+   "template_version": "1",
+   "calculation": ""
+  },
+  {
+   "template_id": "TPL-money-market-fund",
+   "asset_class": "fund",
+   "instrument_type": "money_market_fund",
+   "name": "Money market fund",
+   "fields": [
+    {
+     "path": "identifiers",
+     "type": "identifier",
+     "required": true
+    },
+    {
+     "path": "description",
+     "type": "text",
+     "required": true
+    },
+    {
+     "path": "currency",
+     "type": "text",
+     "required": true
+    },
+    {
+     "path": "listing_venue_id",
+     "type": "identifier",
+     "required": false
+    },
+    {
+     "path": "money_market_fund",
+     "type": "message",
+     "required": false
+    }
+   ],
+   "match_rule": [
+    "share_class_figi",
+    "composite_figi",
+    "figi",
+    "ticker",
+    "sec_series",
+    "sec_class"
+   ],
+   "base": false,
+   "template_version": "1",
+   "calculation": ""
+  },
+  {
+   "template_id": "TPL-binary-event-contract",
+   "asset_class": "event_contract",
+   "instrument_type": "binary_event_contract",
+   "name": "Binary event contract",
+   "fields": [
+    {
+     "path": "identifiers",
+     "type": "identifier",
+     "required": true
+    },
+    {
+     "path": "description",
+     "type": "text",
+     "required": true
+    },
+    {
+     "path": "currency",
+     "type": "text",
+     "required": true
+    },
+    {
+     "path": "listing_venue_id",
+     "type": "identifier",
+     "required": true
+    },
+    {
+     "path": "instrument_type",
+     "type": "enum",
+     "required": true
+    },
+    {
+     "path": "binary_event_contract.payout",
+     "type": "Money",
+     "required": true
+    },
+    {
+     "path": "binary_event_contract.closes_at_ns",
+     "type": "moment",
+     "required": false
+    }
+   ],
+   "match_rule": [
+    "ticker"
+   ],
+   "base": false,
+   "template_version": "1",
+   "calculation": ""
+  },
+  {
+   "template_id": "TPL-equity-base",
+   "asset_class": "equity",
+   "instrument_type": "",
+   "name": "Equity, base",
+   "fields": [
+    {
+     "path": "identifiers",
+     "type": "identifier",
+     "required": true
+    },
+    {
+     "path": "description",
+     "type": "text",
+     "required": true
+    },
+    {
+     "path": "currency",
+     "type": "text",
+     "required": true
+    }
+   ],
+   "match_rule": [],
+   "base": true,
+   "template_version": "1",
+   "calculation": ""
+  },
+  {
+   "template_id": "TPL-debt-base",
+   "asset_class": "debt",
+   "instrument_type": "",
+   "name": "Debt, base",
+   "fields": [
+    {
+     "path": "identifiers",
+     "type": "identifier",
+     "required": true
+    },
+    {
+     "path": "description",
+     "type": "text",
+     "required": true
+    },
+    {
+     "path": "currency",
+     "type": "text",
+     "required": true
+    }
+   ],
+   "match_rule": [],
+   "base": true,
+   "template_version": "1",
+   "calculation": ""
+  },
+  {
+   "template_id": "TPL-fund-base",
+   "asset_class": "fund",
+   "instrument_type": "",
+   "name": "Fund, base",
+   "fields": [
+    {
+     "path": "identifiers",
+     "type": "identifier",
+     "required": true
+    },
+    {
+     "path": "description",
+     "type": "text",
+     "required": true
+    },
+    {
+     "path": "currency",
+     "type": "text",
+     "required": true
+    }
+   ],
+   "match_rule": [],
+   "base": true,
+   "template_version": "1",
+   "calculation": ""
+  },
+  {
+   "template_id": "TPL-derivative-base",
+   "asset_class": "derivative",
+   "instrument_type": "",
+   "name": "Derivative, base",
+   "fields": [
+    {
+     "path": "identifiers",
+     "type": "identifier",
+     "required": true
+    },
+    {
+     "path": "description",
+     "type": "text",
+     "required": true
+    },
+    {
+     "path": "currency",
+     "type": "text",
+     "required": true
+    }
+   ],
+   "match_rule": [],
+   "base": true,
+   "template_version": "1",
+   "calculation": ""
+  },
+  {
+   "template_id": "TPL-crypto-asset-base",
+   "asset_class": "crypto_asset",
+   "instrument_type": "",
+   "name": "Crypto asset, base",
+   "fields": [
+    {
+     "path": "identifiers",
+     "type": "identifier",
+     "required": true
+    },
+    {
+     "path": "description",
+     "type": "text",
+     "required": true
+    }
+   ],
+   "match_rule": [],
+   "base": true,
+   "template_version": "1",
+   "calculation": ""
+  },
+  {
+   "template_id": "TPL-event-contract-base",
+   "asset_class": "event_contract",
+   "instrument_type": "",
+   "name": "Event contract, base",
+   "fields": [
+    {
+     "path": "identifiers",
+     "type": "identifier",
+     "required": true
+    },
+    {
+     "path": "description",
+     "type": "text",
+     "required": true
+    },
+    {
+     "path": "currency",
+     "type": "text",
+     "required": true
+    }
+   ],
+   "match_rule": [],
+   "base": true,
+   "template_version": "1",
+   "calculation": ""
+  },
+  {
+   "template_id": "TPL-cash-base",
+   "asset_class": "cash",
+   "instrument_type": "",
+   "name": "Cash, base",
+   "fields": [
+    {
+     "path": "identifiers",
+     "type": "identifier",
+     "required": true
+    },
+    {
+     "path": "description",
+     "type": "text",
+     "required": true
+    },
+    {
+     "path": "currency",
+     "type": "text",
+     "required": true
+    }
+   ],
+   "match_rule": [],
+   "base": true,
+   "template_version": "1",
+   "calculation": ""
+  }
+ ]
+}

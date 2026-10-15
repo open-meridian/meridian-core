@@ -109,6 +109,88 @@ pub fn define_account(snapshot: &Snapshot, request: &DefineAccountRequest) -> Ve
     Ok(())
 }
 
+/// What still holds an account (approved 2026-10-14): a plugin's link of
+/// an external account to it, a plugin's grant of it, an `ems`'s venue
+/// account mapping to it. A closure leaves none dangling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Attached {
+    Link {
+        plugin: String,
+        external_account: String,
+    },
+    Grant {
+        plugin: String,
+    },
+    Mapping {
+        ems: String,
+        connectivity: String,
+        code: String,
+    },
+}
+
+impl Attached {
+    pub fn plugin(&self) -> &str {
+        match self {
+            Attached::Link { plugin, .. } | Attached::Grant { plugin } => plugin,
+            Attached::Mapping { ems, .. } => ems,
+        }
+    }
+
+    pub fn words(&self) -> String {
+        match self {
+            Attached::Link {
+                plugin,
+                external_account,
+            } => {
+                format!("unlink {external_account} from {plugin} first")
+            }
+            Attached::Grant { plugin } => format!("withdraw {plugin}'s grant of it first"),
+            Attached::Mapping {
+                ems,
+                connectivity,
+                code,
+            } => {
+                format!("remove {ems}'s mapping of {code} at {connectivity} first")
+            }
+        }
+    }
+}
+
+/// Everything attached to an account, links first, then grants, then
+/// mappings.
+pub fn attached(snapshot: &Snapshot, account_id: &str) -> Vec<Attached> {
+    let mut out: Vec<Attached> = snapshot
+        .links
+        .iter()
+        .filter(|link| link.account_id == account_id)
+        .map(|link| Attached::Link {
+            plugin: link.plugin_instance_id.clone(),
+            external_account: link.external_account_id.clone(),
+        })
+        .collect();
+    out.extend(
+        snapshot
+            .linkable
+            .iter()
+            .filter(|(_, linkable)| linkable.account_ids.iter().any(|id| id == account_id))
+            .map(|(plugin, _)| Attached::Grant {
+                plugin: plugin.clone(),
+            }),
+    );
+    out.extend(
+        snapshot
+            .venue_mappings
+            .iter()
+            .filter(|held| held.mapping.account_id == account_id)
+            .map(|held| Attached::Mapping {
+                ems: held.ems_instance_id.clone(),
+                connectivity: held.mapping.connectivity_instance_id.clone(),
+                code: held.mapping.venue_account_code.clone(),
+            }),
+    );
+    out
+}
+
 pub fn close_account(snapshot: &Snapshot, account_id: &str) -> Verdict {
     exists(
         &snapshot.records.accounts,

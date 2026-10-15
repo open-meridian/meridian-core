@@ -284,6 +284,12 @@ services:
     entrypoint: ["python", "-u", "/harness/platform.py"]
     environment:
       HARNESS_PLATFORM_SLOW: ${HARNESS_PLATFORM_SLOW:-}
+      # Contract v24 (W3.4, W3.24 to W3.28): 0 serves none of the one-ID
+      # routes, as a platform before v24; the licence list's schemes, and
+      # the FIGIs its source confirms and mints from.
+      HARNESS_PLATFORM_V24: ${HARNESS_PLATFORM_V24:-1}
+      HARNESS_LICENCE: ${HARNESS_LICENCE:-}
+      HARNESS_PLATFORM_MINTS: ${HARNESS_PLATFORM_MINTS:-}
     volumes:
       - ./platform.py:/harness/platform.py:ro
     networks: [harness]

@@ -190,8 +190,82 @@ impl Offer {
     }
 }
 
-/// One of the deployment's records.
+/// A record's one-ID state (contract v24; decisions/037; W3.7, W3.11):
+/// whether it is the deployment's provisional record and why, the template
+/// it is held to, what of that template it lacks, a decommission the
+/// platform's feed said, and when the platform was last asked about it.
+/// Kept whole beside the record.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct Local {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub provisional: bool,
+    /// A `ProvisionalReason`; 0 where it is not provisional, or none fits.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub reason: i32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub template_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub template_version: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_fields: Vec<String>,
+    /// The type the source stated where the catalogue has no template for
+    /// it, kept as proposed (W3.1, requirement 16).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub proposed_type: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub decommissioned: bool,
+    /// When the platform was last asked about it, its request key then
+    /// (W3.4: a new ask is a new key).
+    #[serde(default, skip_serializing_if = "is_zero_ns")]
+    pub asked_at_ns: i64,
+    /// The migration's line for it (W3.26): its section, and whether the
+    /// deployment admin held it back.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub migration: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub migration_answer: String,
+}
+
+fn is_zero(value: &i32) -> bool {
+    *value == 0
+}
+
+fn is_zero_ns(value: &i64) -> bool {
+    *value == 0
+}
+
+impl Local {
+    /// As the column keeps it: empty for a record with nothing to say.
+    pub fn to_text(&self) -> String {
+        if *self == Local::default() {
+            return String::new();
+        }
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    pub fn from_text(text: &str) -> Local {
+        if text.trim().is_empty() {
+            return Local::default();
+        }
+        serde_json::from_str(text).unwrap_or_default()
+    }
+}
+
+/// A replacement as the store keeps it (W3.8, W3.22; contract v24): why,
+/// numbered in one sequence, and whether it was backfilled.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplacementKept {
+    pub replaced_id: String,
+    pub replaced_by: String,
+    pub replaced_at_ns: i64,
+    /// A `ReplacementCause`.
+    pub cause: i32,
+    pub sequence: i64,
+    pub backfilled: bool,
+}
+
+/// One of the deployment's records.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Instrument {
     /// The record's key for life, and the only thing a position or an order
     /// ever stores. Never reused: an identifier retired here is not later
@@ -239,6 +313,9 @@ pub struct Instrument {
 
     /// What plugins and the platform offer beside them.
     pub offers: Vec<Offer>,
+
+    /// Its one-ID state (contract v24).
+    pub local: Local,
 }
 
 impl Instrument {
@@ -573,8 +650,58 @@ pub trait Store: Send + Sync {
     /// Every conflict listed, ordered by when it was first seen.
     fn conflicts(&self) -> Result<Vec<Conflict>>;
 
-    /// Record that `replaced_id` is now `replaced_by`. W3.8.
-    fn replace(&self, replaced_id: &str, replaced_by: &str, now_ns: i64) -> Result<Replaced>;
+    /// Record that `replaced_id` is now `replaced_by`, a person's merge. W3.8.
+    fn replace(&self, replaced_id: &str, replaced_by: &str, now_ns: i64) -> Result<Replaced> {
+        self.replace_because(
+            replaced_id,
+            replaced_by,
+            meridian_domain::v1::ReplacementCause::Merged as i32,
+            now_ns,
+        )
+    }
+
+    /// Record that `replaced_id` is now `replaced_by`, with why, numbered in
+    /// the store's sequence (contract v24, W3.8, W3.22).
+    fn replace_because(
+        &self,
+        replaced_id: &str,
+        replaced_by: &str,
+        cause: i32,
+        now_ns: i64,
+    ) -> Result<Replaced>;
+
+    /// The replacement of `replaced_id`, as kept, where there is one.
+    fn replacement_record(&self, replaced_id: &str) -> Result<Option<ReplacementKept>>;
+
+    /// The replacements numbered after `sequence`, in sequence, at most
+    /// `limit` (W3.22).
+    fn replacements_after(&self, sequence: i64, limit: usize) -> Result<Vec<ReplacementKept>>;
+
+    /// Keep a template version the platform published (W3.24), unless held:
+    /// true when it was not.
+    fn keep_template(
+        &self,
+        template: &meridian_domain::v1::SecurityTemplate,
+        now_ns: i64,
+    ) -> Result<bool>;
+
+    /// Every template version held, ordered by ID and version.
+    fn templates(&self) -> Result<Vec<meridian_domain::v1::SecurityTemplate>>;
+
+    /// Keep a licence list read (W3.25), each version its own record: true
+    /// when it was not held.
+    fn keep_licence_list(
+        &self,
+        list: &meridian_domain::v1::LicenceList,
+        now_ns: i64,
+    ) -> Result<bool>;
+
+    /// The licence list read last, by its version: `None` before any.
+    fn licence_list(&self) -> Result<Option<meridian_domain::v1::LicenceList>>;
+
+    /// What the store keeps of its own runs, by key (W3.26, W3.27).
+    fn state(&self, key: &str) -> Result<Option<String>>;
+    fn set_state(&self, key: &str, value: &str) -> Result<()>;
 
     /// What `instrument_id` was replaced by, if it was.
     fn replacement_of(&self, instrument_id: &str) -> Result<Option<String>>;
@@ -641,6 +768,13 @@ pub(crate) struct Held {
 
     /// Replaced ID to what replaced it, and when.
     pub(crate) replacements: HashMap<String, (String, i64)>,
+
+    /// Contract v24: each replacement's cause and sequence.
+    pub(crate) replacement_log: Vec<ReplacementKept>,
+    pub(crate) templates:
+        std::collections::BTreeMap<(String, String), meridian_domain::v1::SecurityTemplate>,
+    pub(crate) licence_lists: std::collections::BTreeMap<i64, meridian_domain::v1::LicenceList>,
+    pub(crate) state: std::collections::BTreeMap<String, String>,
 
     /// The venues kept, by ID (contract v18).
     pub(crate) venues: std::collections::BTreeMap<String, meridian_domain::v1::VenueRecord>,
@@ -789,6 +923,7 @@ impl Held {
         &mut self,
         replaced_id: &str,
         replaced_by: &str,
+        cause: i32,
         now_ns: i64,
     ) -> Replaced {
         if let Some((held, _)) = self.replacements.get(replaced_id) {
@@ -798,6 +933,15 @@ impl Held {
         }
         self.replacements
             .insert(replaced_id.to_string(), (replaced_by.to_string(), now_ns));
+        let sequence = self.replacement_log.len() as i64 + 1;
+        self.replacement_log.push(ReplacementKept {
+            replaced_id: replaced_id.to_string(),
+            replaced_by: replaced_by.to_string(),
+            replaced_at_ns: now_ns,
+            cause,
+            sequence,
+            backfilled: false,
+        });
         Replaced::Recorded
     }
 }

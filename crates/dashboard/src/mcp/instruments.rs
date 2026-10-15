@@ -43,7 +43,7 @@ pub static SPECS: &[Spec] = &[
     Spec {
         name: "list_instruments_to_complete",
         title: "List the records to complete",
-        description: "the deployment's instrument records the book cannot use first (no asset class or no currency), then those lacking a description, a symbol, a money market fund's attributes or a binary event contract's payout and close; each with what it lacks, its identifiers with their windows (one that left the record kept, valid_until_ns set) and who reported them, the values offered, and its version; the conflicts for a merge, each with its reason (MISS_REASON_AMBIGUOUS where a plugin's resolve met several records); the counts and the licensed identifiers per scheme. Paged by cursor.",
+        description: "the deployment's instrument records the book cannot use first (no asset class or no currency), then those lacking a description, a symbol, a money market fund's attributes or a binary event contract's payout and close; each with what it lacks, its identifiers with their windows (one that left the record kept, valid_until_ns set) and who reported them, the values offered, and its version; the conflicts for a merge, each with its reason (MISS_REASON_AMBIGUOUS where a plugin's resolve met several records); the counts and the licensed identifiers per scheme; from contract v24 each record's provisional state, template and missing fields, provisional ones alone with `provisional` and each with its reason, and the migration's and each backfill's counts. Paged by cursor.",
         reads: true,
         open_world: false,
         area: Area::Instruments,
@@ -124,7 +124,54 @@ pub static SPECS: &[Spec] = &[
         area: Area::Instruments,
         input_schema: calendar_schema,
     },
+    // Contract v24 (W3.28, W6.20): the usage statistics' setting.
+    Spec {
+        name: "set_reports_usage",
+        title: "Set the usage report",
+        description: "turn \"Report identifier usage\" on or off, with a note saying why (contract v24, W3.28): while on, as it is by default, the conductor sends the platform the deployment's usage statistics weekly -- per identifier scheme, how many records carry it, resolve only through it and missed with it alone -- counts only, never a value, a holding, a quantity or an account. Each change its own record. Answers the setting in force.",
+        reads: false,
+        open_world: false,
+        area: Area::Instruments,
+        input_schema: reports_usage_schema,
+    },
+    // Contract v24 (W3.26, W6.20; the names approved 2026-10-15): making the
+    // migration's lines, preparable, agents' level "prepare only" by
+    // default.
+    Spec {
+        name: "apply_migration",
+        title: "Make the migration's lines",
+        description: "make the upgrade's migration lines (contract v24, W3.26), with a note saying why: each LCL- record named in instrument_ids is replaced by the INS- record the platform answered its line with (list_instruments_to_complete with provisional true names it, answered_instrument_id, and its migration_section); each in held_back_ids keeps its LCL- ID, provisional and held back, nothing minted for it, until a later change makes it. The exact lines are one change, each uncertain line its own: two records answered by one INS- ID are a duplicate line, made together. Made together or refused whole, naming each line that is none the platform answered (awaiting its staff, kept local, unreachable) by its path; a line already made is unchanged. At most 500 in each list: more exact lines are successive changes, in order. Answers the migration's counts after.",
+        reads: false,
+        open_world: false,
+        area: Area::Instruments,
+        input_schema: apply_migration_schema,
+    },
 ];
+
+fn apply_migration_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "instrument_ids": {"type": "array", "maxItems": 500, "items": {"type": "string", "pattern": "^LCL-"}, "description": "the LCL- records whose lines are made, each replaced by the INS- record its line answered"},
+            "held_back_ids": {"type": "array", "maxItems": 500, "items": {"type": "string", "pattern": "^LCL-"}, "description": "the LCL- records whose lines are held back, each keeping its LCL- ID, provisional, nothing minted"},
+            "note": {"type": "string", "minLength": 1, "maxLength": 2000, "description": "why, kept on each record's version"},
+        },
+        "required": ["note"],
+        "additionalProperties": false,
+    })
+}
+
+fn reports_usage_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "reports_usage": {"type": "boolean"},
+            "note": {"type": "string", "minLength": 1, "maxLength": MOST_TEXT, "description": "why, kept with the change's record"},
+        },
+        "required": ["reports_usage", "note"],
+        "additionalProperties": false,
+    })
+}
 
 fn calendars_schema() -> Value {
     json!({
@@ -176,6 +223,7 @@ fn list_schema() -> Value {
             "cursor": {"type": "string", "description": "next_cursor from the page before"},
             "page_size": {"type": "integer", "minimum": 1, "maximum": 500},
             "include_complete": {"type": "boolean", "description": "complete records as well"},
+            "provisional": {"type": "boolean", "description": "the provisional records alone, complete or not, each with why it is provisional (contract v24)"},
         },
         "additionalProperties": false,
     })
@@ -453,6 +501,59 @@ pub(super) fn integer(
             0
         }
     }
+}
+
+/// The largest integer a JSON number carries exactly (2^53): an
+/// optimistic lock's nanosecond stamp is far above it, so it travels as a
+/// decimal string (found 2026-10-14, the build plan's O3).
+pub(super) const EXACT_IN_JSON: i64 = 1 << 53;
+
+/// A `*_ns` optimistic-lock field (contract v24's string fix, O3): a decimal
+/// string; an integer only where it is at most 2^53, otherwise refused
+/// naming the field, since a JSON number above it has lost its digits.
+pub(super) fn stamp_ns(
+    object: &Map<String, Value>,
+    name: &str,
+    path: &str,
+    required: bool,
+    problems: &mut Problems,
+) -> i64 {
+    let at = join(path, name);
+    match object.get(name) {
+        None | Some(Value::Null) => {
+            if required {
+                problems.add(&at, "required");
+            }
+            0
+        }
+        Some(Value::String(text)) => match text.trim().parse::<i64>() {
+            Ok(stamp) if stamp >= 0 && text.trim().bytes().all(|b| b.is_ascii_digit()) => stamp,
+            _ => {
+                problems.add(&at, "a decimal string of nanoseconds, as read");
+                0
+            }
+        },
+        Some(Value::Number(n)) => match n.as_i64() {
+            Some(stamp) if (0..=EXACT_IN_JSON).contains(&stamp) => stamp,
+            _ => {
+                problems.add(
+                    &at,
+                    "a decimal string: a JSON number above 2^53 loses its last digits, so send \
+                     the stamp as read, as a string",
+                );
+                0
+            }
+        },
+        Some(_) => {
+            problems.add(&at, "a decimal string of nanoseconds, as read");
+            0
+        }
+    }
+}
+
+/// A `*_ns` optimistic lock as a tool answers it: a decimal string (O3).
+pub fn stamp_said(stamp: i64) -> Value {
+    Value::String(stamp.to_string())
 }
 
 fn enum_of<T>(
@@ -842,6 +943,12 @@ pub fn record_json(record: &InstrumentRecord) -> Value {
             "value": o.value.as_ref().map(value_json),
             "instance_id": o.instance_id,
         })).collect::<Vec<_>>(),
+        // Contract v24 (W3.7): provisional until resolved, its template and
+        // what of it the record lacks.
+        "provisional": record.provisional,
+        "template_id": record.template_id,
+        "template_version": record.template_version,
+        "missing_fields": record.missing_fields,
     })
 }
 
@@ -859,6 +966,23 @@ fn to_complete_json(item: &InstrumentToComplete) -> Value {
         .into();
     out["complete_for_book"] = item.complete_for_book.into();
     out["complete"] = item.complete.into();
+    if item.provisional_reason != 0 {
+        out["provisional_reason"] =
+            enum_name::<meridian_domain::v1::ProvisionalReason>(item.provisional_reason, |v| {
+                v.as_str_name()
+            });
+    }
+    // The migration's line (contract v24, W3.26): its section and the record
+    // the platform answered it with.
+    if item.migration_section != 0 {
+        out["migration_section"] =
+            enum_name::<meridian_domain::v1::MigrationSection>(item.migration_section, |v| {
+                v.as_str_name()
+            });
+    }
+    if !item.answered_instrument_id.is_empty() {
+        out["answered_instrument_id"] = item.answered_instrument_id.clone().into();
+    }
     out
 }
 
@@ -994,6 +1118,8 @@ pub async fn call(app: &App, caller: &Caller, spec: &Spec, arguments: Value) -> 
         "ask_platform_for_instrument" => ask_platform(app, caller, &arguments).await,
         "list_calendars" => list_calendars(app, caller, &arguments).await,
         "read_calendar" => read_calendar(app, caller, &arguments).await,
+        "set_reports_usage" => set_reports_usage(app, caller, &arguments).await,
+        "apply_migration" => apply_migration(app, caller, &arguments).await,
         other => refused("not_listed", &format!("no tool {other}"), Vec::new()),
     }
 }
@@ -1017,6 +1143,7 @@ async fn list_one(
             page_size: 1,
             cursor: String::new(),
             search: String::new(),
+            provisional: false,
         },
         WAIT,
     )
@@ -1036,7 +1163,7 @@ async fn list(app: &App, caller: &Caller, arguments: &Value) -> Value {
     };
     only(
         top,
-        &["cursor", "page_size", "include_complete"],
+        &["cursor", "page_size", "include_complete", "provisional"],
         "",
         &mut problems,
     );
@@ -1050,6 +1177,14 @@ async fn list(app: &App, caller: &Caller, arguments: &Value) -> Value {
         Some(Value::Bool(b)) => *b,
         Some(_) => {
             problems.add("include_complete", "true or false");
+            false
+        }
+    };
+    let provisional = match top.get("provisional") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => {
+            problems.add("provisional", "true or false");
             false
         }
     };
@@ -1071,6 +1206,7 @@ async fn list(app: &App, caller: &Caller, arguments: &Value) -> Value {
                 page_size as i32
             },
             cursor,
+            provisional,
         },
         WAIT,
     )
@@ -1091,6 +1227,25 @@ async fn list(app: &App, caller: &Caller, arguments: &Value) -> Value {
                 "incomplete_for_book": reply.incomplete_for_book,
                 "incomplete": reply.incomplete,
                 "licensed_identifiers": reply.licensed_identifiers.iter().map(|l| json!({"scheme": l.scheme, "count": l.count})).collect::<Vec<_>>(),
+                // Contract v24 (W3.11): the migration's and each backfill's
+                // counts, counts only.
+                "migration_counts": reply.migration_counts.as_ref().map(|m| json!({
+                    "already_held": m.already_held,
+                    "matched": m.matched,
+                    "minted": m.minted,
+                    "near_match": m.near_match,
+                    "awaiting_staff": m.awaiting_staff,
+                    "kept_local": m.kept_local,
+                    "unreachable": m.unreachable,
+                    "held_back": m.held_back,
+                    "remaining": m.remaining,
+                })),
+                "backfill_counts": reply.backfill_counts.iter().map(|b| json!({
+                    "scheme": b.scheme,
+                    "matched": b.matched,
+                    "awaiting_person": b.awaiting_person,
+                    "remaining": b.remaining,
+                })).collect::<Vec<_>>(),
             },
         }),
     }
@@ -1168,6 +1323,113 @@ async fn history(app: &App, caller: &Caller, arguments: &Value) -> Value {
                 "next_cursor": reply.next_cursor,
             },
         }),
+    }
+}
+
+/// W3.28 (contract v24): the usage report's setting, sent to the conductor.
+async fn set_reports_usage(app: &App, caller: &Caller, arguments: &Value) -> Value {
+    let mut problems = Problems::default();
+    let Some(top) = object(arguments, "", &mut problems) else {
+        return problems.refusal();
+    };
+    only(top, &["reports_usage", "note"], "", &mut problems);
+    let on = match top.get("reports_usage") {
+        Some(Value::Bool(on)) => *on,
+        None | Some(Value::Null) => {
+            problems.add("reports_usage", "required");
+            false
+        }
+        Some(_) => {
+            problems.add("reports_usage", "true or false");
+            false
+        }
+    };
+    let reason = text(top, "note", "", true, &mut problems);
+    if !problems.is_empty() {
+        return problems.refusal();
+    }
+    let reply: Result<meridian_domain::v1::ReportsUsageSetting, _> = ask(
+        app,
+        caller,
+        page::SET_REPORTS_USAGE,
+        "meridian.v1.SetReportsUsageRequest",
+        meridian_domain::v1::SetReportsUsageRequest {
+            reports_usage: on,
+            reason,
+        },
+        WAIT,
+    )
+    .await;
+    match reply {
+        Err(failed) => bus_refused(failed, ""),
+        Ok(reply) => json!({"outcome": "made", "data": {"reports_usage": reply.reports_usage}}),
+    }
+}
+
+/// The ids a list names, each by its path where it is not text.
+fn ids(top: &serde_json::Map<String, Value>, name: &str, problems: &mut Problems) -> Vec<String> {
+    match top.get(name) {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(items)) => {
+            if items.len() > 500 {
+                problems.add(name, "at most 500");
+            }
+            items
+                .iter()
+                .enumerate()
+                .filter_map(|(n, item)| match item.as_str() {
+                    Some(id) if !id.trim().is_empty() => Some(id.trim().to_string()),
+                    _ => {
+                        problems.add(&format!("{name}[{n}]"), "a record's ID");
+                        None
+                    }
+                })
+                .collect()
+        }
+        Some(_) => {
+            problems.add(name, "a list of records' IDs");
+            Vec::new()
+        }
+    }
+}
+
+/// W3.26 (contract v24): the migration's lines made, a deployment admin's.
+async fn apply_migration(app: &App, caller: &Caller, arguments: &Value) -> Value {
+    let mut problems = Problems::default();
+    let Some(top) = object(arguments, "", &mut problems) else {
+        return problems.refusal();
+    };
+    only(
+        top,
+        &["instrument_ids", "held_back_ids", "note"],
+        "",
+        &mut problems,
+    );
+    let request = meridian_domain::v1::ApplyInstrumentMigrationRequest {
+        instrument_ids: ids(top, "instrument_ids", &mut problems),
+        held_back_ids: ids(top, "held_back_ids", &mut problems),
+        note: text(top, "note", "", true, &mut problems),
+    };
+    if request.instrument_ids.is_empty() && request.held_back_ids.is_empty() {
+        problems.add("instrument_ids", "a line to make or hold back");
+    }
+    if !problems.is_empty() {
+        return problems.refusal();
+    }
+    let reply: Result<meridian_domain::v1::MigrationCounts, _> = ask(
+        app,
+        caller,
+        page::APPLY_INSTRUMENT_MIGRATION,
+        "meridian.v1.ApplyInstrumentMigrationRequest",
+        request,
+        CHANGING,
+    )
+    .await;
+    match reply {
+        Err(failed) => bus_refused(failed, ""),
+        Ok(counts) => {
+            json!({"outcome": "made", "data": {"migration_counts": page::migration_counts_json(&counts)}})
+        }
     }
 }
 
@@ -1572,6 +1834,7 @@ async fn ask_platform(app: &App, caller: &Caller, arguments: &Value) -> Value {
             instrument_id: record.instrument_id.clone(),
             identifiers: record.identifiers.clone(),
             as_of_ns: 0,
+            match_or_mint: None,
         },
         Duration::from_secs(12),
     )

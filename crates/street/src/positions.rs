@@ -622,6 +622,7 @@ mod tests {
                     ..Default::default()
                 }),
                 replaced_at_ns: NOW,
+                ..Default::default()
             },
             &at(NOW),
         )

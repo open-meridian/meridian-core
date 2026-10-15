@@ -56,6 +56,7 @@ pub fn replaced(replaced_id: &str, stays: &Instrument, now_ns: i64) -> Instrumen
         replaced_instrument_id: replaced_id.to_string(),
         instrument: Some(to_wire(stays)),
         replaced_at_ns: now_ns,
+        ..Default::default()
     }
 }
 

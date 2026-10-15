@@ -100,6 +100,31 @@ pub const REFRESH_FIRST_AFTER: std::time::Duration = std::time::Duration::from_s
 /// W3.12. A record's history.
 pub const READ_INSTRUMENT_HISTORY: &str = "platform.reference.query.read-instrument-history";
 
+/// W3.22 (contract v24). The replacements after a sequence, for a role
+/// that missed the events.
+pub const LIST_REPLACEMENTS: &str = "platform.reference.query.list-replacements";
+
+/// W3.23 (contract v24). A `reference` plugin offering a record's template
+/// fields.
+pub const OFFER_TEMPLATE_FIELDS: &str = "platform.reference.command.offer-template-fields";
+
+/// W3.26 (contract v24). The deployment admin making the migration's lines.
+pub const APPLY_INSTRUMENT_MIGRATION: &str =
+    "platform.reference.command.apply-instrument-migration";
+
+/// W3.28 (contract v24). The conductor asking for the usage report's counts.
+pub const LIST_IDENTIFIER_USAGE: &str = "platform.reference.query.list-identifier-usage";
+
+/// W3.24 (contract v24). The template catalogue the store holds.
+pub const LIST_TEMPLATES: &str = "platform.reference.query.list-templates";
+pub const READ_TEMPLATE: &str = "platform.reference.query.read-template";
+
+/// W3.24, W3.25, W3.27 (contract v24). What the conductor pulled from the
+/// platform, for the store to keep and follow.
+pub const TEMPLATES_PULLED: &str = "platform.reference.event.templates-pulled";
+pub const LICENCE_LIST_PULLED: &str = "platform.reference.event.licence-list-pulled";
+pub const REPLACEMENTS_PULLED: &str = "platform.reference.event.replacements-pulled";
+
 /// Where the time comes from: the deployment's one clock (decisions/024),
 /// given by whoever wires this up.
 pub use meridian_clock::Clock;
@@ -112,8 +137,30 @@ pub fn serve_queries(bus: &Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock
     serve_all(bus, store, clock, Arc::new(Mutex::new(())));
 }
 
+/// [`serve_queries`] with the bounded ask shortened, for a test that shows
+/// what a slow platform does without waiting the eight seconds.
+pub fn serve_queries_within(
+    bus: &Arc<Bus>,
+    store: Arc<dyn Store>,
+    clock: Arc<dyn Clock>,
+    bound: std::time::Duration,
+) {
+    serve_all_within(bus, store, clock, Arc::new(Mutex::new(())), bound);
+}
+
 /// As [`serve_queries`], sharing `writing` with the [`Reactor`].
 pub fn serve_all(bus: &Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>, writing: Writing) {
+    serve_all_within(bus, store, clock, writing, BOUNDED_ASK);
+}
+
+/// [`serve_all`], a resolve waiting on the platform no longer than `bound`.
+pub fn serve_all_within(
+    bus: &Arc<Bus>,
+    store: Arc<dyn Store>,
+    clock: Arc<dyn Clock>,
+    writing: Writing,
+    bound: std::time::Duration,
+) {
     {
         let (store, clock, writing, announcing) = (
             store.clone(),
@@ -121,8 +168,11 @@ pub fn serve_all(bus: &Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>, w
             writing.clone(),
             Arc::clone(bus),
         );
-        let asking = Arc::new(Asking::new(Arc::clone(bus)));
+        let asking = Arc::new(Asking::waiting(Arc::clone(bus), bound));
         bus.serve(RESOLVE_IDENTIFIER, move |envelope| {
+            // One bounded ask for the whole resolve (the spec's requirement
+            // 15): a currency's pull and the matching request share it.
+            let started = std::time::Instant::now();
             let request: ResolveIdentifierRequest =
                 decode(&envelope, "meridian.v1.ResolveIdentifierRequest")?;
             let instance = envelope
@@ -177,19 +227,101 @@ pub fn serve_all(bus: &Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>, w
                 }
                 _ => None,
             };
-            let resolution = {
+            let matched = {
                 let _held = writing.lock().map_err(|_| "the write lock is poisoned")?;
-                crate::resolve::resolve_identifier_pulled(
-                    store.as_ref(),
-                    &request,
-                    &instance,
-                    now_ns,
-                    pulled.as_ref(),
-                )
-                .map_err(|failed| failed.to_string())?
+                match pulled.as_ref() {
+                    // The master's currency, kept under its own ID (W3.1,
+                    // W3.5; from v24 the `INS-` record is the deployment's).
+                    Some(master) => crate::resolve::Matched::Answered(Box::new(
+                        crate::resolve::resolve_matched(
+                            store.as_ref(),
+                            &request,
+                            &instance,
+                            now_ns,
+                        )
+                        .and_then(|matched| match matched {
+                            crate::resolve::Matched::Unmatched(asked) => {
+                                crate::resolve::resolve_unmatched(
+                                    store.as_ref(),
+                                    &request,
+                                    asked,
+                                    &instance,
+                                    now_ns,
+                                    crate::resolve::PlatformSaid::Record(Box::new(master.clone())),
+                                )
+                            }
+                            crate::resolve::Matched::Answered(answered) => Ok(*answered),
+                        })
+                        .map_err(|failed| failed.to_string())?,
+                    )),
+                    None => {
+                        crate::resolve::resolve_matched(store.as_ref(), &request, &instance, now_ns)
+                            .map_err(|failed| failed.to_string())?
+                    }
+                }
             };
+            let mut resolution = match matched {
+                crate::resolve::Matched::Answered(resolution) => *resolution,
+                crate::resolve::Matched::Unmatched(asked) => {
+                    // Nothing matched (contract v24, W3.4): the platform
+                    // asked to match or mint by what is sendable, within
+                    // the bounded ask; a later answer resolves the
+                    // provisional record minted meanwhile.
+                    let template = crate::resolve::stated_template(store.as_ref(), &request);
+                    let asking_for = crate::one_id::escalation(
+                        &asked,
+                        &request,
+                        template.as_ref().map(|(template, _)| template),
+                        &crate::one_id::licence(store.as_ref()),
+                        &instance,
+                        now_ns,
+                    );
+                    let said = match asking_for {
+                        None => crate::resolve::PlatformSaid::NotAsked,
+                        Some(asking_for) => {
+                            let late = late_answer(
+                                Arc::clone(&announcing),
+                                store.clone(),
+                                clock.clone(),
+                                writing.clone(),
+                                request.clone(),
+                                asked.clone(),
+                                instance.clone(),
+                            );
+                            asking.match_or_mint(asking_for, late, started)
+                        }
+                    };
+                    let _held = writing.lock().map_err(|_| "the write lock is poisoned")?;
+                    let now_ns = clock.now_ns();
+                    crate::resolve::resolve_unmatched(
+                        store.as_ref(),
+                        &request,
+                        asked,
+                        &instance,
+                        now_ns,
+                        said,
+                    )
+                    .map_err(|failed| failed.to_string())?
+                }
+            };
+            // A currency pulled from the platform's master is its record,
+            // found and never minted, however the pull's timing fell (W3.1;
+            // approved 2026-10-15).
+            if pulled.is_some() {
+                resolution.reply.minted = false;
+            }
             if let Some(changed) = &resolution.changed {
                 announce(&announcing, changed, &envelope, now_ns);
+            }
+            // A miss leaves no record: counted for the usage report (W3.28),
+            // against its one scheme, never its value.
+            if resolution.reply.miss_reason != 0 {
+                let _held = writing.lock().map_err(|_| "the write lock is poisoned")?;
+                if let Err(failed) =
+                    crate::usage::note_miss(store.as_ref(), &request.identifiers, now_ns)
+                {
+                    tracing::warn!(%failed, "a miss could not be counted for the usage report");
+                }
             }
             Ok((
                 "meridian.v1.ResolveIdentifierReply".to_string(),
@@ -265,8 +397,12 @@ pub fn serve_all(bus: &Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>, w
         });
     }
     {
-        let (store, clock, writing, announcing) =
-            (store.clone(), clock.clone(), writing, Arc::clone(bus));
+        let (store, clock, writing, announcing) = (
+            store.clone(),
+            clock.clone(),
+            writing.clone(),
+            Arc::clone(bus),
+        );
         bus.serve(MERGE_INSTRUMENTS, move |envelope| {
             let request: MergeInstrumentsRequest =
                 decode(&envelope, "meridian.v1.MergeInstrumentsRequest")?;
@@ -296,7 +432,20 @@ pub fn serve_all(bus: &Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>, w
             if let Err(failed) = announcing.publish(
                 INSTRUMENT_REPLACED,
                 "meridian.v1.InstrumentReplacedEvent",
-                replaced(&merged.merged.instrument_id, &merged.stays, now_ns).encode_to_vec(),
+                {
+                    // Its cause and its place in the deployment's sequence
+                    // (contract v24, W3.8, W3.22).
+                    let mut event = replaced(&merged.merged.instrument_id, &merged.stays, now_ns);
+                    event.cause = meridian_domain::v1::ReplacementCause::Merged as i32;
+                    event.sequence = store
+                        .replacement_record(&merged.merged.instrument_id)
+                        .ok()
+                        .flatten()
+                        .map(|kept| kept.sequence)
+                        .unwrap_or_default();
+                    event
+                }
+                .encode_to_vec(),
                 meta.map(|meta| meta.correlation_id.as_str()),
                 meta.map(|meta| meta.message_id.as_str()),
             ) {
@@ -332,6 +481,7 @@ pub fn serve_all(bus: &Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>, w
             ))
         });
     }
+    serve_one_id(bus, store.clone(), clock.clone(), writing.clone());
     bus.serve(READ_INSTRUMENT_HISTORY, move |envelope| {
         let request: ReadInstrumentHistoryRequest =
             decode(&envelope, "meridian.v1.ReadInstrumentHistoryRequest")?;
@@ -341,6 +491,312 @@ pub fn serve_all(bus: &Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>, w
             reply.encode_to_vec(),
         ))
     });
+}
+
+/// The one-ID queries and command (contract v24, W3.22 to W3.24).
+fn serve_one_id(bus: &Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>, writing: Writing) {
+    {
+        let store = store.clone();
+        bus.serve(LIST_REPLACEMENTS, move |envelope| {
+            let request: meridian_domain::v1::ListReplacementsRequest =
+                decode(&envelope, "meridian.v1.ListReplacementsRequest")?;
+            let reply = crate::one_id::list_replacements(store.as_ref(), request.after_sequence)
+                .map_err(|failed| failed.to_string())?;
+            Ok((
+                "meridian.v1.ListReplacementsReply".to_string(),
+                reply.encode_to_vec(),
+            ))
+        });
+    }
+    {
+        let (store, clock, writing, announcing) = (
+            store.clone(),
+            clock.clone(),
+            writing.clone(),
+            Arc::clone(bus),
+        );
+        bus.serve(APPLY_INSTRUMENT_MIGRATION, move |envelope| {
+            let request: meridian_domain::v1::ApplyInstrumentMigrationRequest =
+                decode(&envelope, "meridian.v1.ApplyInstrumentMigrationRequest")?;
+            let actor = actor_of(&envelope);
+            let now_ns = clock.now_ns();
+            let (made, counts) = {
+                let _held = writing.lock().map_err(|_| "the write lock is poisoned")?;
+                let made = crate::reask::apply_migration(store.as_ref(), &request, &actor, now_ns)
+                    .map_err(|failed| failed.to_string())?
+                    .map_err(|refused| match refused {
+                        crate::reask::LinesRefused::ActorRequired => meridian_bus::refusal(
+                            meridian_pb::v1::RefusalReason::ActorRequired as i32,
+                            "a person makes the migration's lines, and none was named",
+                        ),
+                        crate::reask::LinesRefused::NoteRequired => meridian_bus::refusal(
+                            meridian_pb::v1::RefusalReason::ReasonRequired as i32,
+                            "through a delegation a change to the migration's lines says why",
+                        ),
+                        crate::reask::LinesRefused::TooMany(field) => {
+                            meridian_bus::refusal_with_status(
+                                meridian_bus::RefusalStatus::InvalidArgument,
+                                std::slice::from_ref(&field),
+                                if field == "note" {
+                                    format!("note: at most {} characters", crate::reask::MOST_NOTE)
+                                } else {
+                                    format!(
+                                        "{field}: at most {} lines in one change",
+                                        crate::reask::MOST_LINES
+                                    )
+                                },
+                            )
+                        }
+                        crate::reask::LinesRefused::NotALine { path, words } => {
+                            meridian_bus::refusal_naming(
+                                meridian_pb::v1::RefusalReason::Unspecified as i32,
+                                &[path],
+                                words,
+                            )
+                        }
+                    })?;
+                let mut live = Vec::new();
+                for record in store.all().map_err(|failed| failed.to_string())? {
+                    if store
+                        .replacement_of(&record.instrument_id)
+                        .map_err(|failed| failed.to_string())?
+                        .is_none()
+                    {
+                        live.push(record);
+                    }
+                }
+                let counts = crate::reask::migration_counts(store.as_ref(), &live)
+                    .map_err(|failed| failed.to_string())?
+                    .unwrap_or_default();
+                (made, counts)
+            };
+            for applied in &made.applied {
+                publish_applied(&announcing, applied, now_ns);
+            }
+            for held in &made.held_back {
+                announce(&announcing, held, &envelope, now_ns);
+            }
+            tracing::info!(
+                by = actor.person,
+                made = made.applied.len(),
+                held_back = made.held_back.len(),
+                "the migration's lines made"
+            );
+            Ok((
+                "meridian.v1.MigrationCounts".to_string(),
+                counts.encode_to_vec(),
+            ))
+        });
+    }
+    {
+        let store = store.clone();
+        bus.serve(LIST_IDENTIFIER_USAGE, move |envelope| {
+            let request: meridian_domain::v1::ListIdentifierUsageRequest =
+                decode(&envelope, "meridian.v1.ListIdentifierUsageRequest")?;
+            let reply = crate::usage::list_identifier_usage(store.as_ref(), &request)
+                .map_err(|failed| failed.to_string())?
+                .map_err(|(field, words)| {
+                    meridian_bus::refusal_with_status(
+                        meridian_bus::RefusalStatus::InvalidArgument,
+                        std::slice::from_ref(&field),
+                        format!("{field}: {words}"),
+                    )
+                })?;
+            Ok((
+                "meridian.v1.ListIdentifierUsageReply".to_string(),
+                reply.encode_to_vec(),
+            ))
+        });
+    }
+    {
+        let store = store.clone();
+        bus.serve(LIST_TEMPLATES, move |envelope| {
+            let request: meridian_domain::v1::ListTemplatesRequest =
+                decode(&envelope, "meridian.v1.ListTemplatesRequest")?;
+            let templates = crate::one_id::latest(&crate::one_id::catalogue(store.as_ref()))
+                .into_iter()
+                .filter(|template| {
+                    request.asset_class == 0 || template.asset_class == request.asset_class
+                })
+                .collect();
+            Ok((
+                "meridian.v1.ListTemplatesReply".to_string(),
+                meridian_domain::v1::ListTemplatesReply { templates }.encode_to_vec(),
+            ))
+        });
+    }
+    {
+        let store = store.clone();
+        bus.serve(READ_TEMPLATE, move |envelope| {
+            let request: meridian_domain::v1::ReadTemplateRequest =
+                decode(&envelope, "meridian.v1.ReadTemplateRequest")?;
+            if request.template_id.trim().is_empty() {
+                return Err(meridian_bus::refusal_naming(
+                    meridian_pb::v1::RefusalReason::Unspecified as i32,
+                    &["template_id".to_string()],
+                    "template_id: the template to read",
+                ));
+            }
+            let template = crate::one_id::read_template(
+                &crate::one_id::catalogue(store.as_ref()),
+                request.template_id.trim(),
+                request.template_version.trim(),
+            );
+            Ok((
+                "meridian.v1.ReadTemplateReply".to_string(),
+                meridian_domain::v1::ReadTemplateReply { template }.encode_to_vec(),
+            ))
+        });
+    }
+    {
+        let (store, announcing) = (store, Arc::clone(bus));
+        bus.serve(OFFER_TEMPLATE_FIELDS, move |envelope| {
+            let request: meridian_domain::v1::OfferTemplateFieldsRequest =
+                decode(&envelope, "meridian.v1.OfferTemplateFieldsRequest")?;
+            let instance = envelope
+                .meta
+                .as_ref()
+                .map(|meta| meta.publisher_instance_id.clone())
+                .unwrap_or_default();
+            let now_ns = clock.now_ns();
+            let offered = {
+                let _held = writing.lock().map_err(|_| "the write lock is poisoned")?;
+                crate::one_id::offer_template_fields(store.as_ref(), &request, &instance, now_ns)
+                    .map_err(|failed| failed.to_string())?
+            };
+            match offered {
+                Ok(record) => {
+                    announce(&announcing, &record, &envelope, now_ns);
+                    Ok((
+                        "meridian.v1.OfferTemplateFieldsReply".to_string(),
+                        meridian_domain::v1::OfferTemplateFieldsReply {
+                            instrument: Some(to_wire(&record)),
+                        }
+                        .encode_to_vec(),
+                    ))
+                }
+                Err((field, words)) => Err(meridian_bus::refusal_naming(
+                    meridian_pb::v1::RefusalReason::Unspecified as i32,
+                    std::slice::from_ref(&field),
+                    format!("{field}: {words}"),
+                )),
+            }
+        });
+    }
+}
+
+/// Subscribe to what the conductor pulls (contract v24) now, and hand back
+/// what consumes it once the write lock is known.
+pub fn keep_reference_forever(
+    bus: Arc<Bus>,
+    store: Arc<dyn Store>,
+    clock: Arc<dyn Clock>,
+) -> impl FnOnce(Writing) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    let mut templates = bus.subscribe(TEMPLATES_PULLED);
+    let mut licence = bus.subscribe(LICENCE_LIST_PULLED);
+    let mut replacements = bus.subscribe(REPLACEMENTS_PULLED);
+    move |writing: Writing| {
+        Box::pin(async move {
+            loop {
+                let delivery = tokio::select! {
+                    next = templates.recv() => next,
+                    next = licence.recv() => next,
+                    next = replacements.recv() => next,
+                };
+                let Some(delivery) = delivery else { return };
+                let (bus2, store2, writing2) = (Arc::clone(&bus), store.clone(), writing.clone());
+                let now_ns = clock.now_ns();
+                let handled = tokio::task::spawn_blocking(move || {
+                    keep_reference(
+                        &bus2,
+                        store2.as_ref(),
+                        &writing2,
+                        &delivery.envelope,
+                        now_ns,
+                    )
+                })
+                .await;
+                match handled {
+                    Ok(Handled::Ignored(why)) => tracing::warn!(why, "ignored reference data"),
+                    Ok(other) => tracing::debug!(?other, "kept the platform's reference data"),
+                    Err(failed) => tracing::warn!(%failed, "keeping reference data failed"),
+                }
+            }
+        })
+    }
+}
+
+/// What the conductor pulled from the platform, kept and followed (contract
+/// v24): the catalogue's new versions (W3.24), the licence list read last
+/// (W3.25; a scheme it adds is backfilled by the re-ask), and the
+/// replacement feed (W3.27), each replacement announced to every role.
+pub fn keep_reference(
+    bus: &Bus,
+    store: &dyn Store,
+    writing: &Writing,
+    envelope: &Envelope,
+    now_ns: i64,
+) -> Handled {
+    match envelope.payload_type.as_str() {
+        "meridian.v1.PullTemplatesReply" => {
+            let Ok(reply) = meridian_domain::v1::PullTemplatesReply::decode(&envelope.payload[..])
+            else {
+                return Handled::Ignored("undecodable templates".into());
+            };
+            let mut kept = false;
+            for template in &reply.templates {
+                match store.keep_template(template, now_ns) {
+                    Ok(new) => kept |= new,
+                    Err(failed) => return Handled::Ignored(failed.to_string()),
+                }
+            }
+            Handled::Kept(kept)
+        }
+        "meridian.v1.LicenceList" => {
+            let Ok(list) = meridian_domain::v1::LicenceList::decode(&envelope.payload[..]) else {
+                return Handled::Ignored("undecodable licence list".into());
+            };
+            // Never a scheme that names the deployment's own records.
+            if list
+                .schemes
+                .iter()
+                .any(|scheme| scheme == crate::one_id::LOCAL_SCHEME)
+            {
+                return Handled::Ignored("a licence list naming open_meridian_local".into());
+            }
+            match store.keep_licence_list(&list, now_ns) {
+                Ok(kept) => {
+                    if kept {
+                        let _ =
+                            store.set_state(crate::one_id::LICENCE_KEPT_AT, &now_ns.to_string());
+                    }
+                    Handled::Kept(kept)
+                }
+                Err(failed) => Handled::Ignored(failed.to_string()),
+            }
+        }
+        "meridian.v1.PullReplacementsReply" => {
+            let Ok(reply) =
+                meridian_domain::v1::PullReplacementsReply::decode(&envelope.payload[..])
+            else {
+                return Handled::Ignored("undecodable replacements".into());
+            };
+            let applied = {
+                let Ok(_held) = writing.lock() else {
+                    return Handled::Ignored("the write lock is poisoned".into());
+                };
+                match crate::one_id::apply_feed(store, &reply.entries, now_ns) {
+                    Ok(applied) => applied,
+                    Err(failed) => return Handled::Ignored(failed.to_string()),
+                }
+            };
+            for each in &applied {
+                publish_applied(bus, each, now_ns);
+            }
+            Handled::Kept(!applied.is_empty())
+        }
+        other => Handled::Ignored(format!("payload type {other}")),
+    }
 }
 
 /// W3.5. Announce a record's new version, in the chain that caused it. A
@@ -377,9 +833,14 @@ pub const MINTING_ROLES: [&str; 2] = ["custody", "data"];
 const LAUNCHES_FOR_NS: i64 = 300 * 1_000_000_000;
 const UNKNOWN_AGAIN_NS: i64 = 30 * 1_000_000_000;
 const NOT_HELD_AGAIN_NS: i64 = 600 * 1_000_000_000;
-/// How long a resolve waits on the master for a currency: well under the
-/// five seconds a sidecar gives a resolve (the coordinator, 2026-10-11).
-pub const CURRENCY_WAIT: std::time::Duration = std::time::Duration::from_millis(2500);
+/// The bounded ask (the one-ID spec's requirement 15, W3.1: "8 seconds
+/// today, as v20's currency pull does, never longer"): the longest a resolve
+/// waits on the platform, a currency's pull and the matching request
+/// together. The conductor bounds its own call to the platform the same
+/// (its ASKING), and a plugin's sidecar gives a resolve longer than this.
+pub const BOUNDED_ASK: std::time::Duration = std::time::Duration::from_secs(8);
+/// The name v20 gave it.
+pub const CURRENCY_WAIT: std::time::Duration = BOUNDED_ASK;
 /// How long the pull itself may take in the background.
 const CURRENCY_PULL_WITHIN: std::time::Duration = std::time::Duration::from_secs(20);
 /// After the master could not be reached, a currency is asked again no
@@ -630,6 +1091,321 @@ impl Asking {
     }
 }
 
+/// What to do with an answer that came after the resolve stopped waiting.
+pub type Late = Box<dyn FnOnce(crate::resolve::PlatformSaid) + Send + 'static>;
+
+/// How long the conductor's ask may take in the background: its own bound,
+/// 8 seconds today (the spec's requirement 15), and the bus's way back.
+const MATCH_OR_MINT_WITHIN: std::time::Duration = std::time::Duration::from_secs(12);
+
+impl Asking {
+    /// W3.4 (contract v24): the platform asked, through the conductor, to
+    /// match or mint what a resolve found nothing for, waiting no longer
+    /// than what is left of the bounded ask begun at `started`; an answer
+    /// after that goes to `late`, which keeps it on the
+    /// provisional record minted meanwhile. A platform without v24's routes
+    /// answers as unreachable (the conductor's rule).
+    pub fn match_or_mint(
+        &self,
+        asking_for: meridian_domain::v1::EscalateInstrumentRequest,
+        late: Late,
+        started: std::time::Instant,
+    ) -> crate::resolve::PlatformSaid {
+        use crate::resolve::PlatformSaid;
+        let within = self.wait.saturating_sub(started.elapsed());
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return PlatformSaid::Unreachable;
+        };
+        let request = meridian_domain::v1::AskPlatformForInstrumentRequest {
+            identifiers: asking_for.identifiers.clone(),
+            as_of_ns: asking_for.as_of_ns,
+            match_or_mint: Some(asking_for),
+            ..Default::default()
+        };
+        // Who takes the answer: the resolve while it waits, `late` after.
+        let taker: Arc<Mutex<Option<std::sync::mpsc::Sender<PlatformSaid>>>> =
+            Arc::new(Mutex::new(None));
+        let (done, heard) = std::sync::mpsc::channel::<PlatformSaid>();
+        if let Ok(mut held) = taker.lock() {
+            *held = Some(done);
+        }
+        let (bus, taking) = (Arc::clone(&self.bus), Arc::clone(&taker));
+        handle.spawn(async move {
+            let asked = bus
+                .call(
+                    ASK_PLATFORM_FOR_INSTRUMENT,
+                    "meridian.v1.AskPlatformForInstrumentRequest",
+                    request.encode_to_vec(),
+                    None,
+                    Some(MATCH_OR_MINT_WITHIN),
+                )
+                .await
+                .map_err(|failed| failed.to_string())
+                .and_then(|(_, bytes)| {
+                    meridian_domain::v1::AskPlatformForInstrumentReply::decode(&bytes[..])
+                        .map_err(|failed| failed.to_string())
+                });
+            let said = said_of(asked);
+            let waiting = taking.lock().ok().and_then(|mut held| held.take());
+            match waiting {
+                Some(resolve) => {
+                    let _ = resolve.send(said);
+                }
+                None => {
+                    // The resolve answered already: kept on its record.
+                    let _ = tokio::task::spawn_blocking(move || late(said)).await;
+                }
+            }
+        });
+        match heard.recv_timeout(within) {
+            Ok(said) => said,
+            Err(_) => {
+                // Taken back, unless the answer is in hand this instant.
+                let gone = taker.lock().ok().and_then(|mut held| held.take());
+                match gone {
+                    Some(_) => PlatformSaid::Unreachable,
+                    None => heard
+                        .recv_timeout(std::time::Duration::from_millis(50))
+                        .unwrap_or(PlatformSaid::Unreachable),
+                }
+            }
+        }
+    }
+}
+
+/// The conductor's reply, read with which answer a record was (W3.4).
+pub fn answer_of(
+    asked: Result<meridian_domain::v1::AskPlatformForInstrumentReply, String>,
+) -> crate::reask::Answer {
+    let (minted, near_match) = asked
+        .as_ref()
+        .ok()
+        .and_then(|reply| reply.match_or_mint_answer.as_ref())
+        .map(|answer| (answer.minted, answer.near_match))
+        .unwrap_or((false, false));
+    crate::reask::Answer {
+        said: said_of(asked),
+        minted,
+        near_match,
+    }
+}
+
+/// The conductor asked from a blocking thread, for the re-ask and the
+/// migration (W3.4, W3.26).
+pub struct BusAsk {
+    pub bus: Arc<Bus>,
+}
+
+impl crate::reask::Ask for BusAsk {
+    fn ask(&self, request: meridian_domain::v1::EscalateInstrumentRequest) -> crate::reask::Answer {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return crate::resolve::PlatformSaid::Unreachable.into();
+        };
+        let request = meridian_domain::v1::AskPlatformForInstrumentRequest {
+            identifiers: request.identifiers.clone(),
+            as_of_ns: request.as_of_ns,
+            match_or_mint: Some(request),
+            ..Default::default()
+        };
+        let asked = handle
+            .block_on(self.bus.call(
+                ASK_PLATFORM_FOR_INSTRUMENT,
+                "meridian.v1.AskPlatformForInstrumentRequest",
+                request.encode_to_vec(),
+                None,
+                Some(MATCH_OR_MINT_WITHIN),
+            ))
+            .map_err(|failed| failed.to_string())
+            .and_then(|(_, bytes)| {
+                meridian_domain::v1::AskPlatformForInstrumentReply::decode(&bytes[..])
+                    .map_err(|failed| failed.to_string())
+            });
+        answer_of(asked)
+    }
+}
+
+/// Ask again and migrate, forever, at the licence list's pace (W3.4, W3.25,
+/// W3.26): one batch per beat, `batch_size` records at most, never more
+/// than `batches_per_minute` beats a minute.
+pub async fn ask_again_forever(
+    bus: Arc<Bus>,
+    store: Arc<dyn Store>,
+    clock: Arc<dyn Clock>,
+    writing: Writing,
+) {
+    let asked = Arc::new(Mutex::new(std::collections::HashMap::<String, i64>::new()));
+    let mut beat = std::time::Duration::from_secs(10);
+    loop {
+        let (bus2, store2, clock2, writing2, asked2) = (
+            Arc::clone(&bus),
+            store.clone(),
+            clock.clone(),
+            writing.clone(),
+            Arc::clone(&asked),
+        );
+        // The store's reads block: every one on the blocking pool, the
+        // licence list's pace among them.
+        let ran = tokio::task::spawn_blocking(move || {
+            let pace = crate::one_id::licence(store2.as_ref())
+                .pace
+                .unwrap_or_default();
+            let batch = pace.batch_size.clamp(1, 100) as usize;
+            let beat =
+                std::time::Duration::from_secs(60 / pace.batches_per_minute.clamp(1, 60) as u64);
+            let ask = BusAsk {
+                bus: Arc::clone(&bus2),
+            };
+            let now_ns = clock2.now_ns();
+            let (sent, changed) =
+                crate::reask::migrate(store2.as_ref(), &ask, &writing2, batch, now_ns)?;
+            for record in &changed {
+                publish_applied(
+                    &bus2,
+                    &crate::one_id::Applied {
+                        replaced: None,
+                        changed: vec![record.clone()],
+                    },
+                    now_ns,
+                );
+            }
+            let left = batch.saturating_sub(sent);
+            let mut asked = asked2
+                .lock()
+                .map_err(|_| crate::store::StoreError::Unavailable("the asked list".into()))?;
+            let applied = crate::reask::ask_again(
+                store2.as_ref(),
+                &ask,
+                &writing2,
+                &mut asked,
+                left,
+                now_ns,
+            )?;
+            for each in &applied {
+                publish_applied(&bus2, each, now_ns);
+            }
+            crate::Result::Ok(beat)
+        })
+        .await;
+        match ran {
+            Ok(Err(failed)) => {
+                tracing::warn!(%failed, "asking the platform again failed; next beat")
+            }
+            Err(failed) => tracing::warn!(%failed, "asking the platform again failed; next beat"),
+            Ok(Ok(paced)) => beat = paced,
+        }
+        tokio::time::sleep(beat.max(std::time::Duration::from_secs(10))).await;
+    }
+}
+
+/// The conductor's reply, read: a record, the staff's queue, or not reached.
+pub fn said_of(
+    asked: Result<meridian_domain::v1::AskPlatformForInstrumentReply, String>,
+) -> crate::resolve::PlatformSaid {
+    use crate::resolve::PlatformSaid;
+    match asked {
+        Ok(reply) if reply.reachable => match reply.match_or_mint_answer {
+            Some(answer) => match answer.instrument {
+                Some(record) if record.instrument_id.starts_with("INS-") => {
+                    PlatformSaid::Record(Box::new(record))
+                }
+                _ if answer.pending_review => PlatformSaid::Pending,
+                _ => PlatformSaid::Unreachable,
+            },
+            None => match reply.instrument {
+                Some(record) if reply.found && record.instrument_id.starts_with("INS-") => {
+                    PlatformSaid::Record(Box::new(record))
+                }
+                _ => PlatformSaid::Unreachable,
+            },
+        },
+        Ok(reply) => {
+            tracing::info!(detail = reply.detail, "the platform was not reached to match or mint; a provisional record, asked again later");
+            PlatformSaid::Unreachable
+        }
+        Err(failed) => {
+            tracing::info!(%failed, "the conductor did not answer to match or mint; a provisional record, asked again later");
+            PlatformSaid::Unreachable
+        }
+    }
+}
+
+/// A late answer for a resolve's set, kept (W3.4, W3.8): the provisional
+/// record minted meanwhile resolved to the platform's, or marked as waiting
+/// for its staff; where nothing was minted (a source below the minimum), the
+/// platform's record kept for the set.
+fn late_answer(
+    bus: Arc<Bus>,
+    store: Arc<dyn Store>,
+    clock: Arc<dyn Clock>,
+    writing: Writing,
+    request: ResolveIdentifierRequest,
+    asked: Vec<crate::store::Asked>,
+    instance: String,
+) -> Late {
+    Box::new(move |said| {
+        let Ok(_held) = writing.lock() else { return };
+        let now_ns = clock.now_ns();
+        let found = crate::resolve::resolve_identifier_read_only(store.as_ref(), &request, now_ns)
+            .ok()
+            .filter(|found| found.reply.found)
+            .map(|found| found.reply.instrument_id);
+        let applied = match (found, &said) {
+            (Some(instrument_id), _) => {
+                crate::one_id::apply_answer(store.as_ref(), &instrument_id, &said, now_ns)
+            }
+            (None, crate::resolve::PlatformSaid::Record(_)) => crate::resolve::resolve_unmatched(
+                store.as_ref(),
+                &request,
+                asked,
+                &instance,
+                now_ns,
+                said,
+            )
+            .map(|resolution| crate::one_id::Applied {
+                replaced: None,
+                changed: resolution.changed.into_iter().collect(),
+            }),
+            (None, _) => Ok(crate::one_id::Applied::default()),
+        };
+        match applied {
+            Ok(applied) => publish_applied(&bus, &applied, now_ns),
+            Err(failed) => tracing::warn!(%failed, "a late answer was not kept; asked again later"),
+        }
+    })
+}
+
+/// Announce what keeping the platform's answer did: the replacement first,
+/// heard by every role (W3.8, W3.9), then each record's new version.
+pub fn publish_applied(bus: &Bus, applied: &crate::one_id::Applied, now_ns: i64) {
+    if let Some(event) = &applied.replaced {
+        if let Err(failed) = bus.publish(
+            INSTRUMENT_REPLACED,
+            "meridian.v1.InstrumentReplacedEvent",
+            event.encode_to_vec(),
+            None,
+            None,
+        ) {
+            tracing::warn!(%failed, "a replacement could not be announced; the feed and the sweeps find it");
+        }
+    }
+    for changed in &applied.changed {
+        if let Err(failed) = bus.publish(
+            INSTRUMENT_APPLIED,
+            "meridian.v1.InstrumentAppliedEvent",
+            InstrumentAppliedEvent {
+                instrument: Some(to_wire(changed)),
+                applied: true,
+                applied_at_ns: now_ns,
+            }
+            .encode_to_vec(),
+            None,
+            None,
+        ) {
+            tracing::warn!(%failed, instrument = changed.instrument_id, "a record's new version could not be announced");
+        }
+    }
+}
+
 /// Who a command was sent for, as the dashboard stamped them: the person,
 /// and the delegation and client they acted through, if any (W4.9).
 fn actor_of(envelope: &Envelope) -> crate::complete::Actor {
@@ -781,11 +1557,47 @@ impl Reactor {
                         "an answer naming no record of the deployment's".into(),
                     );
                 }
-                let (store, writing) = (self.store.clone(), self.writing.clone());
+                let (store, writing, bus) = (
+                    self.store.clone(),
+                    self.writing.clone(),
+                    Arc::clone(&self.bus),
+                );
                 let kept = tokio::task::spawn_blocking(move || {
                     let _held = writing
                         .lock()
                         .map_err(|_| "the write lock is poisoned".to_string())?;
+                    // A provisional record the platform holds is resolved to
+                    // its record (contract v24, W3.8); one awaiting its
+                    // migration line waits for the deployment admin.
+                    let became = crate::replace::current(store.as_ref(), &reply.for_instrument_id)
+                        .map_err(|failed| failed.to_string())?;
+                    let provisional = store
+                        .by_id(&became)
+                        .map_err(|failed| failed.to_string())?
+                        .is_some_and(|held| {
+                            held.local.provisional && !crate::reask::awaits_its_line(&held)
+                        });
+                    if provisional && record.instrument_id.starts_with("INS-") {
+                        let applied = crate::one_id::apply_answer(
+                            store.as_ref(),
+                            &became,
+                            &crate::resolve::PlatformSaid::Record(Box::new(record.clone())),
+                            now_ns,
+                        )
+                        .map_err(|failed| failed.to_string())?;
+                        // The replacement, and the replaced record's new
+                        // version; the record that stays is announced below.
+                        let stays = applied.changed.first().cloned();
+                        publish_applied(
+                            &bus,
+                            &crate::one_id::Applied {
+                                replaced: applied.replaced.clone(),
+                                changed: applied.changed.iter().skip(1).cloned().collect(),
+                            },
+                            now_ns,
+                        );
+                        return Ok(stays);
+                    }
                     keep_platform_answer(store.as_ref(), &reply.for_instrument_id, &record, now_ns)
                         .map_err(|failed| failed.to_string())
                 })
@@ -855,10 +1667,20 @@ fn subject_codes(
 ) -> Vec<String> {
     let mut codes = Vec::new();
     if !record.instrument_id.is_empty() {
-        for held in store
-            .matching(crate::GLOBAL_ID, &record.instrument_id, "", now_ns)
-            .unwrap_or_default()
-        {
+        // The record the calendar names, matched directly: from contract v24
+        // the currency's record is the deployment's under its `INS-` ID
+        // (requirement 19). The `open_meridian` lookup stays, read only, for
+        // a record kept under an `LCL-` key until its migration line is made.
+        let direct = store
+            .by_id(&record.instrument_id)
+            .ok()
+            .flatten()
+            .into_iter();
+        for held in direct.chain(
+            store
+                .matching(crate::GLOBAL_ID, &record.instrument_id, "", now_ns)
+                .unwrap_or_default(),
+        ) {
             codes.extend(
                 held.held_now()
                     .filter(|identifier| identifier.scheme == "iso4217")
@@ -880,13 +1702,19 @@ fn subject_codes(
 }
 
 /// The platform's ID of a record this deployment holds: its own where it is
-/// one, else the `open_meridian` identifier it holds now, of the record a
-/// merged one became. None for a record with none, or none held.
+/// one, the `INS-` record it was resolved into, else the `open_meridian`
+/// identifier it holds now, of the record a merged one became. None for a record with none, or none held.
 fn platform_id(store: &dyn Store, instrument_id: &str) -> Option<String> {
     if instrument_id.starts_with("INS-") {
         return None;
     }
+    // One rule (contract v24, requirement 19): follow the replacement -- a
+    // resolved record is the `INS-` record it became.
     let became = crate::replace::current(store, instrument_id).ok()?;
+    if became.starts_with("INS-") {
+        return Some(became);
+    }
+    // Read only, for a record still under its `LCL-` key.
     let instrument = store.by_id(&became).ok().flatten()?;
     let platform = instrument
         .held_now()
@@ -1318,6 +2146,7 @@ mod tests {
                         ..Default::default()
                     }),
                     detail: String::new(),
+                    ..Default::default()
                 }
                 .encode_to_vec(),
             ))
@@ -1336,15 +2165,23 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(!reply.minted, "found, not minted");
+        // Kept under the platform's own ID from the start (contract v24,
+        // W3.1, W3.5): the master's record, found and not minted.
+        assert!(
+            !reply.minted && reply.instrument_id.starts_with("INS-") && !reply.provisional,
+            "{reply:?}"
+        );
         let record = store.by_id(&reply.instrument_id).unwrap().unwrap();
         assert_eq!(record.asset_class, "ASSET_CLASS_CASH");
         assert_eq!(record.currency, "CHF");
         assert_eq!(record.description, "Swiss franc");
-        assert!(record
-            .identifiers
-            .iter()
-            .any(|i| i.scheme == meridian_symbology::GLOBAL_ID));
+        assert!(
+            !record
+                .identifiers
+                .iter()
+                .any(|i| i.scheme == meridian_symbology::GLOBAL_ID),
+            "open_meridian is no longer written (requirement 2)"
+        );
         // Held now: asked no more.
         let again: ResolveIdentifierReply = ask(
             &plugin_bus,
@@ -1367,7 +2204,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(stub.minted);
+        assert!(stub.minted && stub.provisional, "{stub:?}");
     }
 
     /// The 2026-10-11 ruling: a master slow past the wait, or not reached,
@@ -1415,14 +2252,17 @@ mod tests {
                         ..Default::default()
                     }),
                     detail: String::new(),
+                    ..Default::default()
                 }
                 .encode_to_vec(),
             ))
         });
-        serve_queries(
+        // The bounded ask shortened to 2.5 seconds for the test.
+        serve_queries_within(
             &store_bus,
             store.clone(),
             Arc::new(meridian_clock::ManualClock::at(NOW)),
+            std::time::Duration::from_millis(2500),
         );
         let resolve = |code: &'static str| {
             let plugin_bus = plugin_bus.clone();
@@ -1442,7 +2282,7 @@ mod tests {
         let first = resolve("USD").await;
         assert!(
             started.elapsed() < std::time::Duration::from_millis(3200),
-            "a resolve waits on the master no longer than {CURRENCY_WAIT:?}: {:?}",
+            "a resolve waits on the master no longer than its bound: {:?}",
             started.elapsed()
         );
         assert!(
@@ -1453,7 +2293,10 @@ mod tests {
         // The pull finishes in the background; the next resolve finds it.
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
         let later = resolve("USD").await;
-        assert!(!later.minted, "found, not minted: {later:?}");
+        assert!(
+            !later.minted && later.instrument_id.starts_with("INS-"),
+            "the platform's record, found and not minted: {later:?}"
+        );
         let record = store.by_id(&later.instrument_id).unwrap().unwrap();
         assert_eq!(record.description, "US dollar");
         // A master not reached: a miss, nothing minted, asked again later.
@@ -1473,6 +2316,9 @@ mod tests {
                 ..Default::default()
             }],
             as_of_ns: NOW,
+            // The minimum a record needs (contract v24, W3.7).
+            stated_description: "Snap One".into(),
+            currency: "USD".into(),
             ..Default::default()
         }
     }
@@ -1690,10 +2536,32 @@ mod tests {
                 .await,
             Handled::Kept(true)
         );
-        assert_eq!(store.count().unwrap(), 1, "no record of the platform's own");
-        let held = store.by_id(&minted.instrument_id).unwrap().unwrap();
-        assert!(held.identifiers.iter().any(|i| i.value == "INS-SNAP"));
-        assert!(held.asset_class.is_empty());
+        // Contract v24 (W3.8): the provisional record resolved to the
+        // platform's, which starts from it and carries its LCL- ID under
+        // open_meridian_local; never an open_meridian identifier.
+        assert!(minted.provisional);
+        assert_eq!(
+            store
+                .replacement_of(&minted.instrument_id)
+                .unwrap()
+                .as_deref(),
+            Some("INS-SNAP")
+        );
+        let stays = store.by_id("INS-SNAP").unwrap().unwrap();
+        assert!(stays
+            .held_now()
+            .any(|i| i.scheme == crate::one_id::LOCAL_SCHEME && i.value == minted.instrument_id));
+        assert!(!stays
+            .identifiers
+            .iter()
+            .any(|i| i.scheme == meridian_symbology::GLOBAL_ID));
+        assert!(!stays.local.provisional);
+        let gone = store.by_id(&minted.instrument_id).unwrap().unwrap();
+        assert_eq!(
+            gone.held_now().count(),
+            0,
+            "its identifiers left it, kept closed"
+        );
     }
 
     /// Contract v18: a venue the platform answered by its codes arrives with

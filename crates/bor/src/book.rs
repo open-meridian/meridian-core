@@ -47,10 +47,15 @@ pub enum Chain {
     Unplaced = 7,
     Locate = 8,
     Instruction = 9,
+    // Booking's rows (W11.30, W11.35; contract v24), each chained of its own.
+    Booking = 10,
+    Alert = 11,
+    /// The control partition's settings (W11.36).
+    Setting = 12,
 }
 
 /// How many rows an account's changes are chained per.
-const CHAINS: usize = 10;
+const CHAINS: usize = 13;
 
 /// A position's key within its account: instrument, side and, from contract
 /// v22, sleeve (W9's invariants; empty for the account's unsleeved part).
@@ -269,6 +274,9 @@ pub struct Changes {
     pub unplaced: Vec<UnplacedFact>,
     pub locates: Vec<Locate>,
     pub instructions: Vec<TradingInstruction>,
+    /// Contract v24: the bookings and alerts the entry changed, whole.
+    pub bookings: Vec<meridian_domain::v1::Booking>,
+    pub alerts: Vec<meridian_domain::v1::Alert>,
     /// When each order changed may expire by the deployment's clock, None
     /// where it cannot or is ending already (W11.13).
     pub order_expiries: BTreeMap<String, Option<i64>>,
@@ -288,6 +296,8 @@ struct ActRefs {
     unplaced: Vec<(String, JournalRef)>,
     locates: Vec<(String, JournalRef)>,
     instructions: Vec<(String, JournalRef)>,
+    bookings: Vec<(String, JournalRef)>,
+    alerts: Vec<(String, JournalRef)>,
 }
 
 /// One account's book.
@@ -507,6 +517,19 @@ impl Book {
             .iter()
             .map(|id| (id.clone(), take(self, Chain::Instruction)))
             .collect();
+        let booking_refs: Vec<(String, JournalRef)> = touched
+            .bookings
+            .iter()
+            .map(|id| (id.clone(), take(self, Chain::Booking)))
+            .collect();
+        let alert_refs: Vec<(String, JournalRef)> = touched
+            .alerts
+            .iter()
+            .map(|id| (id.clone(), take(self, Chain::Alert)))
+            .collect();
+        for _ in &touched.settings {
+            take(self, Chain::Setting);
+        }
         let Some(first) = first else {
             return Err(StoreError::Invalid(
                 "an entry that changes no record changes nothing; nothing was journalled".into(),
@@ -712,6 +735,8 @@ impl Book {
                 unplaced: unplaced_refs,
                 locates: locate_refs,
                 instructions: instruction_refs,
+                bookings: booking_refs,
+                alerts: alert_refs,
             },
         )?;
         if body.states_waits {
@@ -773,8 +798,40 @@ impl Book {
             .map(|(id, reference)| (id.clone(), reference.sequence))
             .collect();
         for act in &entry.body.acts {
+            // A give-up's answer names its entry (W11.32).
+            let stamped;
+            let act = match act {
+                crate::orders::Act::GiveUpRecorded {
+                    execution_id,
+                    booking_id,
+                    allocation_id,
+                    record,
+                } => {
+                    stamped = crate::orders::Act::GiveUpRecorded {
+                        execution_id: execution_id.clone(),
+                        booking_id: booking_id.clone(),
+                        allocation_id: allocation_id.clone(),
+                        record: meridian_domain::v1::GiveUpRecord {
+                            entry: Some(entry.meta.clone()),
+                            ..record.clone()
+                        },
+                    };
+                    &stamped
+                }
+                other => other,
+            };
             self.ledger.apply(act, &entry.entry_id, &versions);
             match act {
+                crate::orders::Act::BookingOpened { booking, .. } => {
+                    if let Some(held) = self.ledger.bookings.get_mut(&booking.booking_id) {
+                        held.booked_at = entry.first_sequence;
+                    }
+                }
+                crate::orders::Act::BookingReplaced { booking_id, .. } => {
+                    if let Some(held) = self.ledger.bookings.get_mut(booking_id) {
+                        held.booked_at = entry.first_sequence;
+                    }
+                }
                 // Whose own order it is, and when it opened: the instance
                 // that sent it, as its sidecar stamped it.
                 crate::orders::Act::Opened { order, .. } => {
@@ -868,7 +925,45 @@ impl Book {
                 changes.instructions.push(held.clone());
             }
         }
+        for (id, reference) in &refs.bookings {
+            if let Some(held) = self.ledger.bookings.get_mut(id) {
+                held.booking.last_change = Some(reference.clone());
+                changes.bookings.push(self.ledger.booking_record(id)?);
+            }
+        }
+        for (id, reference) in &refs.alerts {
+            if let Some(held) = self.ledger.alerts.get_mut(id) {
+                held.last_change = Some(reference.clone());
+                changes.alerts.push(held.clone());
+            }
+        }
         Ok(())
+    }
+
+    /// The account's base currency's cash instrument, where its attributes
+    /// name a base currency this process has resolved (W9.13; contract v24):
+    /// the one currency that is a balance, every other opening lots.
+    pub fn base_cash_instrument(&self) -> Option<String> {
+        let code = self
+            .attributes
+            .as_ref()
+            .map(|held| held.base_currency_code.clone())
+            .filter(|code| !code.is_empty())?;
+        meridian_domain::money::known(&code)
+    }
+
+    /// Whether `instrument_id` is the account's base currency (W11.13).
+    pub fn is_base(&self, instrument_id: &str) -> bool {
+        let Some(code) = self
+            .attributes
+            .as_ref()
+            .map(|held| held.base_currency_code.clone())
+            .filter(|code| !code.is_empty())
+        else {
+            return false;
+        };
+        meridian_domain::money::known(&code).as_deref() == Some(instrument_id)
+            || meridian_domain::money::code_of(instrument_id).as_deref() == Some(code.as_str())
     }
 
     /// A lot of this account held under another position, whose record a
@@ -909,9 +1004,12 @@ impl Book {
                 }
             };
             // A fill's cash may go below what the account holds: a fact is
-            // never refused for it (W11's invariants).
+            // never refused for it (W11's invariants). From contract v24 the
+            // account's base currency is a signed balance whatever lots it
+            // held before its base was set (W9's invariant, W11.13).
+            let base = self.is_base(&key.0);
             let cash_of_a_trade =
-                body.trade && position.lots.is_empty() && !lot_lines.contains(&key);
+                (body.trade && position.lots.is_empty() && !lot_lines.contains(&key)) || base;
             if !on_its_side(trade) && !cash_of_a_trade {
                 return Err(StoreError::Invalid(format!(
                     "the entry leaves {} on the {} side at {trade}; a position's quantity is \
@@ -930,7 +1028,7 @@ impl Book {
                     )));
                 }
             }
-            if position.has_open_lots() || lot_lines.contains(&key) {
+            if !base && (position.has_open_lots() || lot_lines.contains(&key)) {
                 let lots = position.open_lots()?;
                 if lots != trade {
                     return Err(StoreError::refused(

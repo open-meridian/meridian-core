@@ -20,6 +20,7 @@ launcher	component
 oms	role
 operations	role
 portfolio	role
+reference	role
 reporting	role
 servicing	role
 settlement	role

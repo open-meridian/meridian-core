@@ -193,6 +193,10 @@ pub enum Record {
     Locate,
     /// An execution, which an accept or a DK names (contract v23).
     Execution,
+    /// A booking and an alert, which a hand-off, a correction or an
+    /// acknowledgement names (contract v24).
+    Booking,
+    Alert,
 }
 
 /// Whose accounts a read answers for (W4.11).
@@ -359,6 +363,32 @@ pub struct LocatesRead {
     pub cursor: String,
 }
 
+/// W11.31: the bookings, as of now or changed since a watermark, filtered by
+/// state (contract v24).
+#[derive(Debug, Clone)]
+pub struct BookingsRead {
+    pub scope: Scope,
+    pub account_id: String,
+    pub since: Option<Mark>,
+    /// 0 for every state.
+    pub state: i32,
+    pub limit: usize,
+    pub cursor: String,
+}
+
+/// W11.35: the alerts, as of now or changed since a watermark, filtered by
+/// state and kind (contract v24).
+#[derive(Debug, Clone)]
+pub struct AlertsRead {
+    pub scope: Scope,
+    pub account_id: String,
+    pub since: Option<Mark>,
+    pub state: i32,
+    pub kind: i32,
+    pub limit: usize,
+    pub cursor: String,
+}
+
 /// W11.16: the trading instructions in force, whatever the reader's scope.
 #[derive(Debug, Clone)]
 pub struct InstructionsRead {
@@ -470,4 +500,17 @@ pub trait Store: Send + Sync {
     /// Each live order whose own time in force ended at or before `now_ns`
     /// and is not yet ending, with its account (W11.13).
     fn expiring(&self, now_ns: i64) -> Result<Vec<(String, String)>>;
+
+    // ── Booking (W11.26 to W11.37, contract v24) ──
+
+    fn bookings(&self, read: &BookingsRead) -> Result<Page<meridian_domain::v1::Booking>>;
+    fn alerts(&self, read: &AlertsRead) -> Result<Page<meridian_domain::v1::Alert>>;
+
+    /// The live block orders naming `member_order_id`, each with its account
+    /// (W11.1): a member in one is refused another.
+    fn blocks_naming(&self, member_order_id: &str) -> Result<Vec<(String, String)>>;
+
+    /// Every live order with its instrument, across the deployment: what the
+    /// escape hatch's count reads (W11.37), naming no account to its reader.
+    fn live_order_instruments(&self) -> Result<Vec<String>>;
 }

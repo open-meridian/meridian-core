@@ -38,6 +38,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "venue_originated_fills",
         sql: include_str!("../migrations/0004_venue_originated_fills.sql"),
     },
+    Migration {
+        version: 5,
+        name: "booking",
+        sql: include_str!("../migrations/0005_booking.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

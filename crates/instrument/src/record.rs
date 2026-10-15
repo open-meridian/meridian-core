@@ -52,6 +52,12 @@ pub fn to_wire(instrument: &Instrument) -> PbInstrument {
         ),
         // The venue master's ID (contract v18).
         listing_venue_id: instrument.listing_venue_id.clone(),
+        // Contract v24 (W3.7): provisional until resolved, its template and
+        // what of it the record lacks.
+        provisional: instrument.local.provisional,
+        template_id: instrument.local.template_id.clone(),
+        template_version: instrument.local.template_version.clone(),
+        missing_fields: instrument.local.missing_fields.clone(),
     }
 }
 
@@ -320,6 +326,7 @@ mod tests {
             listing_venue_id: String::new(),
             sources: Vec::new(),
             offers: Vec::new(),
+            ..Default::default()
         }
     }
 

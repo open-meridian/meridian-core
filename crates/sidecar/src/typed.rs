@@ -122,7 +122,7 @@ const MAP_VENUE_ACCOUNT: &str = "platform.config.command.map-venue-account";
 /// to the person's write access where it acts for one, which the book checks
 /// the record's account against. The generated operations hand these no
 /// account; a test holds this list to them.
-pub(crate) const BY_ID_ALONE: [&str; 13] = [
+pub(crate) const BY_ID_ALONE: [&str; 20] = [
     "meridian.v1.RequestOrderChangeRequest",
     "meridian.v1.RecordCheckRequest",
     "meridian.v1.DecideApprovalRequest",
@@ -137,6 +137,17 @@ pub(crate) const BY_ID_ALONE: [&str; 13] = [
     // Contract v23 (W11.23, W11.24): executions named by their IDs alone.
     "meridian.v1.AcceptExecutionRequest",
     "meridian.v1.DontKnowExecutionRequest",
+    // Contract v24 (W11.26 to W11.34): an order's instruction and its
+    // booking named by the order, a booking by its ID, a give-up's answer by
+    // its execution, a sleeve cross by the account its record names, and an
+    // alert by its ID.
+    "meridian.v1.SetAllocationInstructionRequest",
+    "meridian.v1.BookOrderRequest",
+    "meridian.v1.HandOffBookingRequest",
+    "meridian.v1.CorrectBookingRequest",
+    "meridian.v1.ReportGiveUpRequest",
+    "meridian.v1.RecordSleeveCrossRequest",
+    "meridian.v1.AcknowledgeAlertRequest",
 ];
 
 /// The venue facts stamped from the venue account map (matrix/stamped.tsv's
@@ -490,6 +501,11 @@ impl Sidecar {
             }
         }
         stamp.account_scope = Some(scope);
+        // A resolve may wait the instrument store's bounded ask on the
+        // platform, eight seconds (contract v24, the one-ID spec's
+        // requirement 15): given longer than that, every other call the
+        // bus's default.
+        let within = (topic == RESOLVE_IDENTIFIER).then_some(RESOLVE_WITHIN);
         let (_, payload) = self
             .bus
             .call_stamped(
@@ -497,7 +513,7 @@ impl Sidecar {
                 payload_type,
                 message.encode_to_vec(),
                 None,
-                None,
+                within,
                 &stamp,
             )
             .await
@@ -1370,3 +1386,8 @@ pub(crate) fn refused(failed: BusError) -> Status {
 
 #[cfg(test)]
 mod tests;
+
+/// W3.1's row, which may wait on the platform (contract v24).
+const RESOLVE_IDENTIFIER: &str = "platform.reference.query.resolve-identifier";
+/// Longer than the instrument store's bounded ask, eight seconds.
+const RESOLVE_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);

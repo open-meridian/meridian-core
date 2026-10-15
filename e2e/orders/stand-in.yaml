@@ -34,3 +34,11 @@ services:
       - ${MERIDIAN_HARNESS_STAND_IN}:/stand-in:ro
     environment:
       STAND_IN_ORDERS: venue
+  # Contract v24: operations, which corrects a booking by replace after
+  # the hand-off (W11.29).
+  ops:
+    entrypoint: ["python", "-u", "/stand-in/stand_in.py"]
+    volumes:
+      - ${MERIDIAN_HARNESS_STAND_IN}:/stand-in:ro
+    environment:
+      STAND_IN_ORDERS: ops

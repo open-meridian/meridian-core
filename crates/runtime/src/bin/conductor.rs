@@ -234,8 +234,34 @@ fn run() -> Result<(), String> {
             clock(),
         );
         tokio::spawn(Arc::clone(&calendars).start());
+        // Contract v24 (W3.24, W3.25, W3.27): the licence list, the template
+        // catalogue and the replacement feed, pulled on start, daily and on
+        // reconnecting, for the instrument store; the list is what every
+        // ask sends by.
+        let licence: meridian_conductor::reference::Licence = Arc::default();
+        tokio::spawn(
+            Arc::new(meridian_conductor::reference::ReferencePuller::new(
+                Arc::clone(&bus),
+                Arc::clone(&platform),
+                clock(),
+                Arc::clone(&licence),
+            ))
+            .start(),
+        );
+        // W3.28 (contract v24): the weekly usage report, the store's counts,
+        // unless the deployment admin turned it off.
+        tokio::spawn(
+            Arc::new(meridian_conductor::usage::UsageSender::new(
+                Arc::clone(&bus),
+                Arc::clone(&platform),
+                clock(),
+                Arc::new(UsageBook(Arc::clone(&store))),
+            ))
+            .start(),
+        );
         Conductor::new(Arc::clone(&bus), Arc::clone(&platform), clock())
             .with_calendars(Arc::clone(&calendars))
+            .with_licence(licence)
             .serve();
 
         // W3.15 (contract v18): a venue a plugin reported missing, asked of
@@ -460,6 +486,26 @@ async fn enrol_with_code(
 /// Never fatal. A deployment that cannot write this is a deployment somebody
 /// recovers with a claim code, and refusing to start would take away the
 /// dashboard they would redeem it in.
+/// The conductor's own store, where the usage report's setting and the
+/// reports sent are kept (W3.28).
+struct UsageBook(Arc<dyn meridian_config::Store>);
+
+impl meridian_conductor::usage::UsageBook for UsageBook {
+    fn reports_usage(&self) -> Result<bool, String> {
+        self.0.reports_usage().map_err(|failed| failed.to_string())
+    }
+    fn sent(&self, limit: usize) -> Result<Vec<meridian_domain::v1::SentUsageReport>, String> {
+        self.0
+            .usage_reports(limit)
+            .map_err(|failed| failed.to_string())
+    }
+    fn record(&self, sent: &meridian_domain::v1::SentUsageReport) -> Result<(), String> {
+        self.0
+            .record_usage_report(sent)
+            .map_err(|failed| failed.to_string())
+    }
+}
+
 fn install_named_administrator(store: &dyn meridian_config::Store) {
     let group = var("MERIDIAN_ADMINISTRATOR_DIRECTORY_GROUP").unwrap_or_default();
     let login = var("MERIDIAN_ADMINISTRATOR_LOGIN").unwrap_or_default();

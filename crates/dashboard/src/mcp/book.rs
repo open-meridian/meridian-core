@@ -29,8 +29,8 @@ use crate::web::App;
 use meridian_domain::v1::{
     set_account_attribute_request, AccountAttributeReply, AccountAttributes,
     ListAccountAttributesReply, ListAccountAttributesRequest, ListTradingInstructionsReply,
-    ListTradingInstructionsRequest, SetAccountAttributeRequest, TradingInstructionReply,
-    TradingInstructionTarget,
+    ListTradingInstructionsRequest, LocalRecordOrdersSetting, SetAccountAttributeRequest,
+    SetLocalRecordOrdersRequest, TradingInstructionReply, TradingInstructionTarget,
 };
 
 const WAIT: Duration = Duration::from_secs(5);
@@ -59,6 +59,23 @@ const fn spec(
 }
 
 pub static SPECS: &[Spec] = &[
+    // Contract v24 (W6.3, W6.20; the name approved 2026-10-15): closing an
+    // account, a deployment admin's, preparable, "may not" for agents until
+    // loosened.
+    spec(
+        "close_account",
+        "Close an account",
+        "close an account, with a note saying why (W6.3): closed, never deleted, its holdings and \
+history still readable. Refused naming account_id and each thing still attached to it -- an \
+external account's link, a plugin instance's grant, an ems's mapping -- and nothing is closed. A \
+link or a mapping is undone at its plugin's page. unlink_attached asks the conductor to withdraw \
+each grant and close in one step, but no tool sets a grant (W6.30): while the account still has \
+one it is refused by name, and a person withdraws it at the page or with the Close dialog's \
+\"Unlink all and close\". Answers the account's record.",
+        false,
+        Area::Accounts,
+        close_account_schema,
+    ),
     spec(
         "list_account_attributes",
         "List account attributes",
@@ -73,8 +90,9 @@ opening balance stands for. No account's positions or orders.",
         "set_account_attribute",
         "Set an account attribute",
         "set one attribute of an account in the book of record, with a note saying why: its base currency \
-(three capital letters), its lot-relief default, or whether releases wait for compliance (false \
-lets a release pass the gate without a compliance verdict). Each is its own record. Answers the \
+(three capital letters), its lot-relief default, whether releases wait for compliance (false \
+lets a release pass the gate without a compliance verdict), or from contract v24 whether it is an \
+error account or an allocation account (W9.13, W11.27). Each is its own record. Answers the \
 attributes as they stand.",
         false,
         Area::Accounts,
@@ -102,6 +120,18 @@ in v22.",
         false,
         Area::Trading,
         instruction_schema,
+    ),
+    spec(
+        "set_local_record_orders",
+        "Allow orders on local records",
+        "turn the escape hatch on or off, with a note saying why (contract v24, W11.36): while on, \
+as it is by default, an order may name a provisional record, a local record not priced; while off, \
+a proposal naming one and an accept of a venue's fill on one are refused \
+(REFUSAL_REASON_LOCAL_RECORD_NOT_ALLOWED), orders already working continuing. Each change its own \
+record. Answers the setting and the count of live orders on local records, naming no account.",
+        false,
+        Area::Trading,
+        local_record_orders_schema,
     ),
 ];
 
@@ -131,10 +161,24 @@ fn attribute_schema() -> Value {
             "base_currency_code": {"type": "string", "pattern": "^[A-Z]{3}$"},
             "lot_relief_default": {"type": "string", "enum": ["first_in_first_out", "last_in_first_out", "highest_cost", "lowest_cost", "average_cost"]},
             "waits_for_compliance": {"type": "boolean"},
+            "error_account": {"type": "boolean", "description": "an error account, where a booking's overfill and errors are booked (contract v24)"},
+            "allocation_account": {"type": "boolean", "description": "an allocation account, a block's account until its allocations are booked out (contract v24)"},
             "note": note(),
         },
         "required": ["account_id", "note"],
-        "description": "exactly one of base_currency_code, lot_relief_default and waits_for_compliance",
+        "description": "exactly one of base_currency_code, lot_relief_default, waits_for_compliance, error_account and allocation_account",
+        "additionalProperties": false,
+    })
+}
+
+fn local_record_orders_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "allows_local_record_orders": {"type": "boolean"},
+            "note": note(),
+        },
+        "required": ["allows_local_record_orders", "note"],
         "additionalProperties": false,
     })
 }
@@ -170,7 +214,22 @@ fn attributes_json(a: &AccountAttributes) -> Value {
         "base_currency_code": a.base_currency_code,
         "lot_relief_default": crate::admin::books_method_value(a.lot_relief_default),
         "waits_for_compliance": a.waits_for_compliance,
+        "error_account": a.error_account,
+        "allocation_account": a.allocation_account,
         "opening_balance_as_of": a.opening_balance.as_ref().map(|opening| opening.as_of_date.clone()).unwrap_or_default(),
+    })
+}
+
+fn close_account_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "account_id": {"type": "string", "minLength": 1},
+            "unlink_attached": {"type": "boolean", "description": "withdraw each grant and close in one step; refused while a grant stands, since no tool sets a grant"},
+            "note": {"type": "string", "minLength": 1, "maxLength": 2000, "description": "why, kept with each record the closure writes"},
+        },
+        "required": ["account_id", "note"],
+        "additionalProperties": false,
     })
 }
 
@@ -183,6 +242,8 @@ pub async fn call(app: &App, caller: &Caller, spec: &Spec, arguments: Value) -> 
         "set_account_attribute" => set_attribute(app, caller, &arguments).await,
         "list_trading_instructions" => list_instructions(app, caller, &arguments).await,
         "set_trading_instruction" => set_instruction(app, caller, &arguments).await,
+        "set_local_record_orders" => set_local_record_orders(app, caller, &arguments).await,
+        "close_account" => close_account(app, caller, &arguments).await,
         other => refused("not_listed", &format!("no tool {other}"), Vec::new()),
     }
 }
@@ -239,6 +300,8 @@ async fn set_attribute(app: &App, caller: &Caller, arguments: &Value) -> Value {
             "base_currency_code",
             "lot_relief_default",
             "waits_for_compliance",
+            "error_account",
+            "allocation_account",
             "note",
         ],
         "",
@@ -276,10 +339,27 @@ async fn set_attribute(app: &App, caller: &Caller, arguments: &Value) -> Value {
         }
         Some(_) => problems.add("waits_for_compliance", "true or false"),
     }
+    for (name, mark) in [
+        (
+            "error_account",
+            set_account_attribute_request::Attribute::ErrorAccount as fn(bool) -> _,
+        ),
+        (
+            "allocation_account",
+            set_account_attribute_request::Attribute::AllocationAccount,
+        ),
+    ] {
+        match top.get(name) {
+            None | Some(Value::Null) => {}
+            Some(Value::Bool(marked)) => attributes.push(mark(*marked)),
+            Some(_) => problems.add(name, "true or false"),
+        }
+    }
     if attributes.len() != 1 {
         problems.add(
             "",
-            "exactly one of base_currency_code, lot_relief_default and waits_for_compliance",
+            "exactly one of base_currency_code, lot_relief_default, waits_for_compliance, \
+             error_account and allocation_account",
         );
     }
     if !problems.is_empty() {
@@ -362,9 +442,13 @@ async fn list_instructions(app: &App, caller: &Caller, arguments: &Value) -> Val
         }
         cursor = page.next_cursor;
     }
+    // Contract v24 (W11.37): the escape hatch's setting beside them, read
+    // as the page shows it; a count, naming no account.
+    let local = trading::read_local_record_orders(&app.bus).await.ok();
     json!({"outcome": "unchanged", "data": {
         "instructions": found,
         "control_sequence": control_sequence,
+        "local_record_orders": local.as_ref().map(trading::local_record_orders_json),
     }})
 }
 
@@ -447,6 +531,145 @@ async fn set_instruction(app: &App, caller: &Caller, arguments: &Value) -> Value
     }
 }
 
+/// W11.36 (contract v24): the escape hatch's setting, a deployment admin's.
+async fn set_local_record_orders(app: &App, caller: &Caller, arguments: &Value) -> Value {
+    let mut problems = Problems::default();
+    let Some(top) = object(arguments, "", &mut problems) else {
+        return problems.refusal();
+    };
+    only(
+        top,
+        &["allows_local_record_orders", "note"],
+        "",
+        &mut problems,
+    );
+    let allows = match top.get("allows_local_record_orders") {
+        Some(Value::Bool(allows)) => *allows,
+        None | Some(Value::Null) => {
+            problems.add("allows_local_record_orders", "required");
+            false
+        }
+        Some(_) => {
+            problems.add("allows_local_record_orders", "true or false");
+            false
+        }
+    };
+    let reason = text(top, "note", "", true, &mut problems);
+    if !problems.is_empty() {
+        return problems.refusal();
+    }
+    let (_, access) = match access_of(app, caller) {
+        Ok(held) => held,
+        Err(refusal) => return refusal,
+    };
+    if !access.deployment_admin {
+        return refused(
+            "not_permitted",
+            "the escape hatch's setting is a deployment admin's",
+            Vec::new(),
+        );
+    }
+    let reply: Result<LocalRecordOrdersSetting, _> = ask(
+        app,
+        caller,
+        trading::SET_LOCAL_RECORD_ORDERS,
+        "meridian.v1.SetLocalRecordOrdersRequest",
+        SetLocalRecordOrdersRequest {
+            allows_local_record_orders: allows,
+            reason,
+        },
+        CHANGING,
+    )
+    .await;
+    match reply {
+        Err(failed) => bus_refused(failed, ""),
+        Ok(reply) => json!({"outcome": "made", "data": trading::local_record_orders_json(&reply)}),
+    }
+}
+
+/// W6.3 (contract v24): an account closed, a deployment admin's. No tool
+/// sets a grant (W6.30), so "Unlink all and close" is refused while one
+/// stands, naming it: a person withdraws it at the page.
+async fn close_account(app: &App, caller: &Caller, arguments: &Value) -> Value {
+    let mut problems = Problems::default();
+    let Some(top) = object(arguments, "", &mut problems) else {
+        return problems.refusal();
+    };
+    only(
+        top,
+        &["account_id", "unlink_attached", "note"],
+        "",
+        &mut problems,
+    );
+    let account_id = text(top, "account_id", "", true, &mut problems);
+    let unlink = match top.get("unlink_attached") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(unlink)) => *unlink,
+        Some(_) => {
+            problems.add("unlink_attached", "true or false");
+            false
+        }
+    };
+    let note = text(top, "note", "", true, &mut problems);
+    if !problems.is_empty() {
+        return problems.refusal();
+    }
+    let (records, access) = match access_of(app, caller) {
+        Ok(held) => held,
+        Err(refusal) => return refusal,
+    };
+    if !access.deployment_admin {
+        return refused(
+            "not_permitted",
+            "closing an account is a deployment admin's",
+            Vec::new(),
+        );
+    }
+    if unlink {
+        let grants: Vec<String> = crate::admin::overview::attached(&records, &account_id)
+            .into_iter()
+            .filter(|item| item.withdrawable)
+            .map(|item| item.words)
+            .collect();
+        if !grants.is_empty() {
+            return refused(
+                "not_permitted",
+                &format!(
+                    "no tool sets a grant (W6.30), and {account_id} still has one: {}. A person \
+                     withdraws it at the page or with the Close dialog's \"Unlink all and close\"; \
+                     nothing was sent",
+                    grants.join("; ")
+                ),
+                vec![json!({"path": "unlink_attached"})],
+            );
+        }
+    }
+    let reply: Result<meridian_domain::v1::AccountRecord, _> = ask(
+        app,
+        caller,
+        "platform.config.command.close-account",
+        "meridian.v1.CloseAccountRequest",
+        meridian_domain::v1::CloseAccountRequest {
+            account_id,
+            unlink_attached: unlink,
+            note,
+        },
+        CHANGING,
+    )
+    .await;
+    match reply {
+        Err(failed) => bus_refused(failed, ""),
+        Ok(account) => json!({"outcome": "made", "data": {"account": {
+            "account_id": account.account_id,
+            "name": account.name,
+            "state": meridian_domain::v1::AccountState::try_from(account.state)
+                .map(|state| state.as_str_name())
+                .unwrap_or("ACCOUNT_STATE_UNSPECIFIED"),
+            "created_at_ns": account.created_at_ns.to_string(),
+        }}}),
+    }
+}
+
 /// The routes the order path's pages draw, each against the tool that
 /// reaches it (W6.20; the plan's parity check). [`tests`] fails the build
 /// where a changing route has none.
@@ -456,9 +679,10 @@ pub const PARITY: &[(&str, &str)] = &[
         "list_account_attributes set_account_attribute",
     ),
     ("/admin/accounts/book", "set_account_attribute"),
+    ("/admin/accounts/close", "close_account"),
     (
         "/admin/trading-instructions",
-        "list_trading_instructions set_trading_instruction",
+        "list_trading_instructions set_trading_instruction set_local_record_orders",
     ),
 ];
 

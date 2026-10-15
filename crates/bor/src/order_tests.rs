@@ -31,6 +31,13 @@ const CHF: &str = "INS-01J8XQ4M7K00000000CASHCHF";
 /// The base currency of the FX tests' pair, EUR/CHF (contract v23): a cash
 /// instrument named by its ID alone, never by a code another test resolves.
 const EUR: &str = "INS-01J8XQ4M7K00000000CASHEUR";
+/// A local record (contract v24, W3.7): provisional, an order on it the
+/// escape hatch (W11's invariant).
+const LOCAL: &str = "LCL-01J8XQ4M7K0000000000LOCL";
+/// A local record the platform later answers (contract v24, W3.8), and
+/// the `INS-` record it resolves to.
+const RESOLVING: &str = "LCL-01J8XQ4M7K0000000000RSLV";
+const RESOLVED: &str = "INS-01J8XQ4M7K0000000000RSLV";
 /// The bus's own instance: in these tests the `ems`, the `oms` and the
 /// connectivity plugin at once.
 const ME: &str = "oems-1";
@@ -63,6 +70,11 @@ fn wired() -> Wired {
             NOCCY => Some(record(AssetClass::Equity, "")),
             CHF => Some(record(AssetClass::Cash, "CHF")),
             EUR => Some(record(AssetClass::Cash, "EUR")),
+            LOCAL | RESOLVING => Some(InstrumentRecord {
+                provisional: true,
+                ..record(AssetClass::Equity, "CHF")
+            }),
+            RESOLVED => Some(record(AssetClass::Equity, "CHF")),
             _ => None,
         };
         Ok((
@@ -75,6 +87,31 @@ fn wired() -> Wired {
         ))
     });
     meridian_domain::money::learn("CHF", CHF);
+    // The account's base currency, CHF, so its francs are a balance and every
+    // other currency opens lots (contract v24, W11.13, option (c)).
+    let ctx = crate::decide::Context {
+        acting_for: ADMIN.into(),
+        received_at_ns: NOW,
+        committed_at_ns: NOW,
+        ..Default::default()
+    };
+    store
+        .act(ACC, "", "", &[], &mut |book, head| {
+            let made = crate::decide::set_attribute(
+                book,
+                head,
+                &ctx,
+                &SetAccountAttributeRequest {
+                    account_id: ACC.into(),
+                    attribute: Some(set_account_attribute_request::Attribute::BaseCurrencyCode(
+                        "CHF".into(),
+                    )),
+                    reason: "the account's functional currency".into(),
+                },
+            )?;
+            Ok(crate::service::decided(made, Vec::new()))
+        })
+        .unwrap();
     Wired { bus, store, clock }
 }
 
@@ -2539,6 +2576,7 @@ async fn financing_and_commission_are_fee_kinds_each_its_own_cash_line() {
     filled.fees = vec![Fee {
         kind: FeeKind::Commission as i32,
         amount: usd("0.35"),
+        ..Default::default()
     }];
     let reply = execute(&w, &filled).await.unwrap();
     assert_eq!(
@@ -2554,6 +2592,7 @@ async fn financing_and_commission_are_fee_kinds_each_its_own_cash_line() {
             fee: Some(Fee {
                 kind: FeeKind::Financing as i32,
                 amount: usd("1.37"),
+                ..Default::default()
             }),
             trade_date: "2026-10-14".into(),
             settlement_date: "2026-10-14".into(),
@@ -3064,3 +3103,8 @@ async fn an_fx_orders_amended_limit_stays_in_its_quote_currency() {
     .await
     .unwrap();
 }
+
+// ── Contract v24: booking, the alert and the escape hatch ──────────────────
+
+#[path = "booking_tests.rs"]
+mod booking;

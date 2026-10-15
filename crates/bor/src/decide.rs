@@ -22,10 +22,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use meridian_domain::exact::Exact;
 use meridian_domain::v1::{
-    actor, basis_adjustment, break_cause, record_break_request, resolve_break_request,
+    actor, basis_adjustment, break_cause, break_value, record_break_request, resolve_break_request,
     set_account_attribute_request, AccountAttributes, AccountFigures, Actor, BasisAdjustment,
-    Break, BreakCategory, BreakCauseCategory, BreakResolution, BreakState, ChangeCause,
-    CloseBreaksAsClearedRequest, Encumbrance, EncumbranceKind, EntryMeta, FigureKey,
+    Break, BreakCategory, BreakCauseCategory, BreakDifference, BreakResolution, BreakState,
+    ChangeCause, CloseBreaksAsClearedRequest, Encumbrance, EncumbranceKind, EntryMeta, FigureKey,
     HandleBreakRequest, HoldingSide, LotReliefMethod, LotSource, MovementLine, OpeningBalance,
     OpeningPosition, PersonActor, PositionKey, RecordAccountFiguresRequest, RecordBreakRequest,
     RecordEncumbrancesRequest, RecordOpeningBalanceRequest, ReferenceVersion, ResolveBreakRequest,
@@ -89,16 +89,30 @@ pub struct Context {
     pub account_scope: Option<BTreeSet<String>>,
     /// The sidecar's verdict on a placement's connectivity plugin (W11.8).
     pub connectivity_allowed: bool,
+    /// Contract v24 (W11.27): the attributes of each account a booking names,
+    /// as the service read them before the lock -- which are marked error
+    /// or allocation accounts (W9.13).
+    pub account_marks: BTreeMap<String, AccountAttributes>,
+    /// Contract v24 (W11.1): a block order's members, read from their own
+    /// accounts before the lock (no act writes two partitions).
+    pub members: BTreeMap<String, crate::booking::MemberView>,
+    /// Contract v24 (W11.36): the escape hatch's setting in force, read from
+    /// the control partition; `None` reads as on, the default.
+    pub local_record_orders: Option<bool>,
 }
 
 /// What an instrument's record says that the book requires (W9.1, contract
 /// v10): an asset class and a currency in force, and whether its class is
-/// cash, which takes away the lots requirement.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// cash; from contract v24 the currency's code, which with the account's base
+/// currency decides whether lots apply (W9.1, option (c)), and whether the
+/// record is provisional, a local record (W3.7, W11's escape hatch).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RecordSays {
     pub asset_class: bool,
     pub currency: bool,
     pub cash: bool,
+    pub code: String,
+    pub provisional: bool,
 }
 
 impl Context {
@@ -150,7 +164,7 @@ impl Context {
     /// Each instrument field the book requires that `instrument`'s record
     /// lacks, by its path under `field` (W9.1, contract v10).
     pub(crate) fn instrument_missing(&self, field: &str, instrument: &str) -> Vec<String> {
-        let says = self.records.get(instrument).copied().unwrap_or_default();
+        let says = self.records.get(instrument).cloned().unwrap_or_default();
         let mut missing = Vec::new();
         if !says.asset_class {
             missing.push(format!("{field}.instrument.asset_class"));
@@ -398,7 +412,7 @@ pub fn opening_balance(
         _ => {}
     }
     ctx.references_answered()?;
-    let missing = opening_missing(ctx, request);
+    let missing = opening_missing(book, ctx, request);
     if !missing.is_empty() {
         return Err(StoreError::incomplete("the opening balance", missing));
     }
@@ -459,10 +473,20 @@ pub fn opening_balance(
 /// position, its instrument with its record's asset class and currency
 /// (contract v10), side and quantity, its settled quantity, each pending
 /// quantity with its value date, the whole quantity settled or pending on a
-/// date, and its lots -- but on cash -- each with its quantity, cost and
+/// date, and its lots -- but on the account's base currency (contract v24,
+/// option (c); until then but on cash) -- each with its quantity, cost and
 /// acquisition date. A value present but malformed is not missing: it is
 /// refused with its words when the lines are made.
-fn opening_missing(ctx: &Context, request: &RecordOpeningBalanceRequest) -> Vec<String> {
+fn opening_missing(
+    book: &Book,
+    ctx: &Context,
+    request: &RecordOpeningBalanceRequest,
+) -> Vec<String> {
+    let base = book
+        .attributes
+        .as_ref()
+        .map(|held| held.base_currency_code.clone())
+        .unwrap_or_default();
     let mut missing = Vec::new();
     if request.as_of_date.trim().is_empty() {
         missing.push("as_of_date".to_string());
@@ -515,11 +539,18 @@ fn opening_missing(ctx: &Context, request: &RecordOpeningBalanceRequest) -> Vec<
         if rest().is_some_and(|rest| !rest.is_zero()) {
             missing.push(format!("{field}.pending"));
         }
-        // Whether lots apply is the record's to say: cash has none. A record
-        // with no class is refused naming its class above, and asked for its
-        // lots once it says.
-        let says = ctx.records.get(&position.instrument_id).copied();
-        if position.lots.is_empty() && says.is_some_and(|says| says.asset_class && !says.cash) {
+        // Whether lots apply is the record's and the account's to say: from
+        // contract v24 the account's base currency alone has none (W9.1,
+        // option (c), ruled 2026-10-13; question 38 narrowed the 2026-10-02
+        // list), every other currency carrying lots with its base-currency
+        // cost, and an account with no base currency set has none excepted
+        // (question 23). A record with no class is refused naming its class
+        // above, and asked for its lots once it says.
+        let says = ctx.records.get(&position.instrument_id).cloned();
+        let lots_apply = says.as_ref().is_some_and(|says| {
+            says.asset_class && !(says.cash && !base.is_empty() && says.code == base)
+        });
+        if position.lots.is_empty() && lots_apply {
             missing.push(format!("{field}.lots"));
         }
         for (at, lot) in position.lots.iter().enumerate() {
@@ -744,20 +775,44 @@ pub fn record_break(
 ) -> Result<Made> {
     opening_required(book)?;
     date("business_date", &request.business_date)?;
-    let subject = request
-        .subject
-        .clone()
-        .ok_or_else(|| StoreError::Invalid("a break names a position or a figure".into()))?;
-    let subject = match subject {
-        record_break_request::Subject::Position(key) => {
+    // An unrecognized security (contract v24, W9.3, W9.4) names neither a
+    // position nor a figure: the street record alone, by value. Every other
+    // category names one.
+    let unrecognized = request.category == BreakCategory::UnrecognizedSecurity as i32;
+    let subject = match request.subject.clone() {
+        Some(record_break_request::Subject::Position(key)) => {
             check_position_key(&key)?;
-            meridian_domain::v1::r#break::Subject::Position(key)
+            Some(meridian_domain::v1::r#break::Subject::Position(key))
         }
-        record_break_request::Subject::Figure(key) => {
+        Some(record_break_request::Subject::Figure(key)) => {
             check_figure_key(&key)?;
-            meridian_domain::v1::r#break::Subject::Figure(key)
+            Some(meridian_domain::v1::r#break::Subject::Figure(key))
+        }
+        None if unrecognized => {
+            if request.street.is_none() {
+                return Err(StoreError::Malformed {
+                    fields: vec!["street".into()],
+                    words: "an unrecognized security's break names the street record it was \
+                            seen in"
+                        .into(),
+                });
+            }
+            None
+        }
+        None => {
+            return Err(StoreError::Invalid(
+                "a break names a position or a figure".into(),
+            ))
         }
     };
+    if unrecognized && subject.is_some() {
+        return Err(StoreError::Malformed {
+            fields: vec!["subject".into()],
+            words: "an unrecognized security's break names no instrument and no figure, only the \
+                    street record"
+                .into(),
+        });
+    }
     if request.category == BreakCategory::Unspecified as i32
         || BreakCategory::try_from(request.category).is_err()
     {
@@ -772,11 +827,35 @@ pub fn record_break(
         check_cause(&format!("candidate_causes[{index}]"), cause)?;
     }
 
-    let record = if request.break_id.is_empty() {
+    // An unrecognized security still open is brought up to date, never
+    // recorded twice (W9.4): one unknown security keeps one break that ages
+    // across statements until resolved, matched by its category, the account
+    // (the book's own) and the identifiers the custodian states, scheme and
+    // value in any order; never by the statement or any per-statement field
+    // (the product owner, 2026-10-15).
+    let stated = if unrecognized {
+        Some(stated_identifiers(&request.differences)?)
+    } else {
+        None
+    };
+    let matched = stated
+        .as_ref()
+        .filter(|_| request.break_id.is_empty())
+        .and_then(|stated| {
+            book.breaks.values().find(|held| {
+                held.state == BreakState::Open as i32
+                    && held.category == request.category
+                    && held.subject.is_none()
+                    && stated_identifiers(&held.differences).ok().as_ref() == Some(stated)
+            })
+        })
+        .map(|held| held.break_id.clone());
+    let break_id = matched.unwrap_or_else(|| request.break_id.clone());
+    let record = if break_id.is_empty() {
         Break {
             break_id: ctx.mint(ids::BREAK),
             account_id: book.account_id.clone(),
-            subject: Some(subject),
+            subject,
             category: request.category,
             differences: request.differences.clone(),
             book_watermark: request.book_watermark.clone(),
@@ -789,12 +868,11 @@ pub fn record_break(
             ..Default::default()
         }
     } else {
-        let held = open_break(book, &request.break_id)?;
-        if held.subject.as_ref() != Some(&subject) || held.category != request.category {
+        let held = open_break(book, &break_id)?;
+        if held.subject != subject || held.category != request.category {
             return Err(StoreError::Invalid(format!(
-                "break {} is of another subject or category; a difference of its own is a \
-                 break of its own",
-                request.break_id
+                "break {break_id} is of another subject or category; a difference of its own \
+                 is a break of its own"
             )));
         }
         Break {
@@ -1701,6 +1779,16 @@ pub fn set_attribute(
         Some(set_account_attribute_request::Attribute::WaitsForCompliance(waits)) => {
             attributes.waits_for_compliance = waits;
         }
+        // Contract v24 (W9.13; the order-path plan's v24 items 7 and 10): a
+        // deployment admin's marks, each change its own entry with its
+        // reason. Unmarking is recorded and never refused; past allocations
+        // keep their flag, since an allocation carries its own cause.
+        Some(set_account_attribute_request::Attribute::ErrorAccount(marked)) => {
+            attributes.error_account = marked;
+        }
+        Some(set_account_attribute_request::Attribute::AllocationAccount(marked)) => {
+            attributes.allocation_account = marked;
+        }
         None => return Err(StoreError::Invalid("the request sets no attribute".into())),
     }
     made(
@@ -1730,6 +1818,11 @@ pub fn set_attribute(
 /// v10). v8 and v9 journalled `placeholder-moved`, which stands as recorded.
 pub const INSTRUMENT_MERGED: &str = "instrument-merged";
 
+/// The kind of entry that moves what a provisional record held onto the
+/// `INS-` record it resolved to (contract v24, the one-ID spec's
+/// requirement 3, W9.9).
+pub const INSTRUMENT_RESOLVED: &str = "instrument-resolved";
+
 /// Move what the account holds under `placeholder`, a record merged into
 /// another (or before v10 a placeholder replaced by its INS- ID), onto
 /// `instrument`: lines closing each bucket and lot under the one and opening
@@ -1744,6 +1837,7 @@ pub fn follow_replacement(
     ctx: &Context,
     placeholder: &str,
     instrument: &str,
+    resolved: bool,
 ) -> Result<Option<Made>> {
     let mut lines = Vec::new();
     let mut tombstones = Vec::new();
@@ -1870,7 +1964,11 @@ pub fn follow_replacement(
         ctx,
         Draft {
             entry_id: ctx.mint(ids::ENTRY),
-            kind: INSTRUMENT_MERGED,
+            kind: if resolved {
+                INSTRUMENT_RESOLVED
+            } else {
+                INSTRUMENT_MERGED
+            },
             effective_date: ctx.today(),
             reason: String::new(),
             break_ids,
@@ -1905,4 +2003,75 @@ pub fn instruments_named(lines: &[MovementLine], positions: &[OpeningPosition]) 
             .map(|position| position.instrument_id.clone()),
     );
     named.into_iter().filter(|id| !id.is_empty()).collect()
+}
+
+/// The identifiers an unrecognized security's custodian states (W9.3: "the
+/// street record by value with the raw identifiers it carries"), carried as
+/// its street-only differences by the street row's own field,
+/// `unresolved_identifiers[n].scheme` and `unresolved_identifiers[n].value`
+/// (RecordHoldingRequest.unresolved_identifiers, W2.4), each a text. The set
+/// is the break's match key, so the order they are sent in never matters.
+/// At least one is required, each with both parts; refused otherwise, naming
+/// the difference or `differences`.
+fn stated_identifiers(differences: &[BreakDifference]) -> Result<BTreeSet<(String, String)>> {
+    let mut parts: BTreeMap<String, (Option<String>, Option<String>)> = BTreeMap::new();
+    for (index, difference) in differences.iter().enumerate() {
+        let Some(rest) = difference.field.strip_prefix("unresolved_identifiers[") else {
+            continue;
+        };
+        let (position, part) = rest.split_once("].").unwrap_or((rest, ""));
+        let text = match difference
+            .street
+            .as_ref()
+            .and_then(|value| value.value.as_ref())
+        {
+            Some(break_value::Value::Text(text)) if !text.trim().is_empty() => text.trim(),
+            _ => {
+                return Err(StoreError::Malformed {
+                    fields: vec![format!("differences[{index}].street")],
+                    words: "an unrecognized security's identifier is the custodian's text".into(),
+                })
+            }
+        };
+        if position.is_empty() || !position.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(StoreError::Malformed {
+                fields: vec![format!("differences[{index}].field")],
+                words: "an identifier's field is unresolved_identifiers[n].scheme or .value".into(),
+            });
+        }
+        let held = parts.entry(position.to_string()).or_default();
+        match part {
+            "scheme" => held.0 = Some(text.to_string()),
+            "value" => held.1 = Some(text.to_string()),
+            _ => {
+                return Err(StoreError::Malformed {
+                    fields: vec![format!("differences[{index}].field")],
+                    words: "an identifier's field is unresolved_identifiers[n].scheme or .value"
+                        .into(),
+                })
+            }
+        }
+    }
+    let mut stated = BTreeSet::new();
+    for (position, held) in parts {
+        match held {
+            (Some(scheme), Some(value)) => {
+                stated.insert((scheme, value));
+            }
+            _ => {
+                return Err(StoreError::Malformed {
+                    fields: vec![format!("unresolved_identifiers[{position}]")],
+                    words: "an identifier names its scheme and its value".into(),
+                })
+            }
+        }
+    }
+    if stated.is_empty() {
+        return Err(StoreError::Malformed {
+            fields: vec!["differences".into()],
+            words: "an unrecognized security's break carries the identifiers the custodian states"
+                .into(),
+        });
+    }
+    Ok(stated)
 }

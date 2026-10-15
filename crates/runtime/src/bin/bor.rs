@@ -154,6 +154,29 @@ fn run() -> Result<(), String> {
             meridian_bor::order_service::EXPIRE_EVERY,
         ));
 
+        // Booking (W11.30, contract v24): the child entries every booking
+        // owes the other accounts it allocates to, swept for on start and
+        // every quarter hour; and, once at the upgrade, the escape hatch for
+        // orders on local records recorded on by default (W11.36,
+        // decisions/031).
+        let backfilling = bus.clone();
+        let held = Arc::clone(&store);
+        match tokio::task::spawn_blocking(move || {
+            meridian_bor::booking_service::backfill_local_record_orders(&backfilling, held.as_ref())
+        })
+        .await
+        {
+            Ok(Ok(true)) => tracing::info!("orders on local records are allowed, by default"),
+            Ok(Ok(false)) => {}
+            Ok(Err(why)) => tracing::warn!(why, "the escape hatch's default could not be recorded"),
+            Err(failed) => tracing::warn!(%failed, "the escape hatch's backfill failed"),
+        }
+        tokio::spawn(meridian_bor::booking_service::sweep_forever(
+            bus.clone(),
+            Arc::clone(&store),
+            meridian_bor::booking_service::SWEEP_EVERY,
+        ));
+
         // W5.20, said on the bus for the instrument store to carry outward.
         let reporting = bus.clone();
         let schema = meridian_bor::migrations::latest();

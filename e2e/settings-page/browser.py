@@ -969,6 +969,156 @@ def the_icon_is_linked_and_served(browser):
         shown.close()
 
 
+# Contract v24's pages and the folded fix, at the sizes the build plan names
+# (375x812, 582x1432, 1280x800): each with no horizontal scroll, how far it
+# scrolls down recorded, the kit's check said, and a screenshot of each.
+V24_SIZES = [("375x812", 375, 812), ("582x1432", 582, 1432), ("1280x800", 1280, 800)]
+MEASURE = """() => ({
+  wide: document.documentElement.scrollWidth - innerWidth,
+  tall: document.documentElement.scrollHeight - innerHeight,
+})"""
+
+
+def measured(page, label, shot):
+    m = page.evaluate(MEASURE)
+    problems = page.evaluate(FIT)
+    print(f"MEASURE {label}: horizontal={m['wide']} vertical={m['tall']} "
+          f"fit={'ok' if not problems else '; '.join(problems)}", flush=True)
+    check(m["wide"] <= 0, f"{label} scrolls no wider than the screen: {m['wide']}px over")
+    page.screenshot(path=os.path.join(OUT, shot), full_page=True)
+    return problems
+
+
+def the_v24_pages(browser, prefix):
+    """Contract v24: the Instruments page's provisional records and the
+    usage report's setting; the home page's counts; the escape hatch's
+    setting; the account Close's dialog (approved 2026-10-14); and a
+    plugin's Summary of five figures at phone width (the build plan's O8)."""
+    for size, width, height in V24_SIZES:
+        ctx = context(browser, width, height)
+        page = ctx.new_page()
+        errors = []
+        page.on("pageerror", lambda e: errors.append(str(e)))
+
+        page.goto(f"{BASE}/admin/instruments#provisional")
+        settled(page)
+        rows = page.eval_on_selector_all("#provisional-table tbody tr", "rows => rows.map(r => r.dataset.reason)")
+        check(len(rows) == 19, f"at {size} the provisional records are listed, each with why: {rows}")
+        # Its text whole: the kit's pager hides the rows past a screen.
+        why = page.evaluate("() => document.querySelector('#provisional').textContent")
+        check("with the platform's staff" in why and "class needed" in why and "Matched: 118" in " ".join(why.split()),
+              f"at {size} their reasons and the migration's counts are said")
+        measured(page, f"Instruments, provisional, at {size}", f"v24-instruments-provisional-{size}.png")
+        # Contract v24 (W3.26): the migration's lines, each dialog from a
+        # fresh page -- the exact lines as one change, each held back by its
+        # box; the uncertain lines, one chosen at a time.
+        for which, opener, attr, lines, table in (
+                ("exact", "button[data-exact-lines]", "data-exact-lines", "12", "#exact-lines-table"),
+                ("uncertain", "button[data-uncertain-lines]", "data-uncertain-lines", "2",
+                 "#uncertain-lines-table")):
+            page.goto(f"{BASE}/admin/instruments#provisional")
+            settled(page)
+            said = page.get_attribute(opener, attr)
+            check(said == lines, f"at {size} the {which} lines are counted: {said}")
+            page.click(opener)
+            page.wait_for_timeout(300)
+            listed = page.eval_on_selector_all(f"dialog[open] {table} tbody tr", "rows => rows.length")
+            check(str(listed) == lines, f"at {size} the {which} lines' dialog lists each: {listed}")
+            buttons = page.eval_on_selector_all("dialog[open] .dialog-foot button",
+                                                "bs => bs.map(b => b.textContent.trim())")
+            check("Prepare" in buttons and "Cancel" in buttons,
+                  f"at {size} the {which} lines are prepared or made: {buttons}")
+            if which == "exact":
+                boxes = page.eval_on_selector_all("dialog[open] input[name=hold]", "bs => bs.length")
+                check(boxes == 12, f"at {size} each exact line can be held back: {boxes}")
+            else:
+                check("Hold back" in buttons, f"at {size} an uncertain line can be held back: {buttons}")
+            boxed = inside_the_viewport(page)
+            check(not boxed, f"at {size} the {which} lines' dialog stays within the viewport"
+                  f"{': ' + boxed if boxed else ''}")
+            spilled = page.evaluate(INSIDE)
+            check(not spilled, f"at {size} nothing in the {which} lines' dialog reaches past it"
+                  f"{': ' + '; '.join(spilled[:4]) if spilled else ''}")
+            m = page.evaluate(MEASURE)
+            print(f"MEASURE Lines dialog, {which}, at {size}: horizontal={m['wide']} vertical={m['tall']}",
+                  flush=True)
+            page.screenshot(path=os.path.join(OUT, f"v24-lines-{which}-{size}.png"))
+            page.click("dialog[open] [data-dialog-close]")
+            page.wait_for_timeout(200)
+        page.goto(f"{BASE}/admin/instruments#licensed")
+        settled(page)
+        check(page.locator("form#usage-form select[name=reports_usage]").count() == 1,
+              f"at {size} Report identifier usage is set at the Instruments page")
+        measured(page, f"Instruments, usage report, at {size}", f"v24-instruments-usage-{size}.png")
+
+        page.goto(f"{BASE}/")
+        settled(page)
+        provisional = page.get_attribute("#provisional-records", "data-provisional")
+        orders = page.get_attribute("#local-record-orders", "data-open-order-count")
+        check(provisional == "19" and orders == "3",
+              f"at {size} the home page counts the provisional records and the orders on local records: {provisional}, {orders}")
+        measured(page, f"Home, at {size}", f"v24-home-{size}.png")
+
+        page.goto(f"{BASE}/admin/trading-instructions#local-records")
+        settled(page)
+        said = page.get_attribute("[data-allows-local-record-orders]", "data-allows-local-record-orders")
+        check(said in ("true", "false"), f"at {size} the escape hatch's setting is drawn: {said}")
+        measured(page, f"Trading instructions, local records, at {size}", f"v24-local-records-{size}.png")
+
+        for name, offers in (("Credit Suisse 401(k)", False), ("Joint taxable", True)):
+            # Each from a fresh page, its row's page of the pager turned to.
+            page.goto(ADMIN_PAGE + "#accounts")
+            settled(page)
+            on_its_page(page, f"#accounts-table tr[data-name='{name}']")
+            page.click(f"#accounts-table tr[data-name='{name}'] button[data-attached]")
+            page.wait_for_timeout(300)
+            items = page.eval_on_selector_all("dialog[open] [data-attached-list] li a", "as => as.map(a => a.getAttribute('href'))")
+            buttons = page.eval_on_selector_all("dialog[open] .dialog-foot button", "bs => bs.map(b => b.textContent.trim())")
+            check(items and all(href.startswith("/admin/plugins/") for href in items),
+                  f"at {size} Close on {name} lists what is attached, each linking to its plugin's page: {items}")
+            check(("Unlink all and close" in buttons) == offers and "Cancel" in buttons,
+                  f"at {size} Close on {name} offers {buttons}")
+            boxed = inside_the_viewport(page)
+            check(not boxed, f"at {size} the Close dialog for {name} stays within the viewport{': ' + boxed if boxed else ''}")
+            spilled = page.evaluate(INSIDE)
+            check(not spilled, f"at {size} nothing in the Close dialog for {name} reaches past it"
+                  f"{': ' + '; '.join(spilled[:4]) if spilled else ''}")
+            m = page.evaluate(MEASURE)
+            print(f"MEASURE Close dialog, {name}, at {size}: horizontal={m['wide']} vertical={m['tall']}", flush=True)
+            page.screenshot(path=os.path.join(OUT, f"v24-close-{'granted' if offers else 'attached'}-{size}.png"))
+            page.click("dialog[open] [data-dialog-close]")
+            page.wait_for_timeout(200)
+        page.goto(ADMIN_PAGE + "#accounts")
+        settled(page)
+        on_its_page(page, "#accounts-table tr[data-name='Kalshi']")
+        confirm = page.get_attribute("#accounts-table tr[data-name='Kalshi'] form[data-confirm]", "data-confirm")
+        check(bool(confirm), f"at {size} an account attached to nothing asks the usual confirmation: {confirm!r}")
+
+        page.goto(SUMMARY)
+        settled(page)
+        figures = page.eval_on_selector_all("section.figures .figure", "fs => fs.length")
+        check(figures == 5, f"at {size} the Summary draws its five figures: {figures}")
+        spill = page.evaluate("""() => [...document.querySelectorAll('section.figures .figure')]
+          .filter((f) => f.scrollWidth > f.clientWidth + 1 || f.getBoundingClientRect().right > innerWidth + 0.5)
+          .map((f) => f.dataset.figure)""")
+        check(not spill, f"at {size} no figure overflows its tile or the screen: {spill}")
+        measured(page, f"Summary of five figures, at {size}", f"v24-summary-{size}.png")
+
+        check(not errors, f"the v24 pages at {size} ran without a script error: {errors}")
+        ctx.close()
+    if PASS != "fit":
+        ctx = context(browser)
+        page = ctx.new_page()
+        page.goto(f"{BASE}/admin/trading-instructions#local-records")
+        settled(page)
+        page.fill("form#local-records-form [name=note]", "orders only on the platform's records")
+        page.click("form#local-records-form button.primary")
+        settled(page)
+        said = page.get_attribute("[data-allows-local-record-orders]", "data-allows-local-record-orders")
+        check(said == "false", f"turned off from its form, the page says so: {said}")
+        ctx.close()
+
+
 with sync_playwright() as playwright:
     browser = playwright.chromium.launch()
     prefix = "development" if PASS == "fit" else "settings"
@@ -993,6 +1143,7 @@ with sync_playwright() as playwright:
     ]:
         fits(browser, name, url, prefix)
     a_secret_says_where_it_stands(browser, prefix)
+    the_v24_pages(browser, prefix)
     browser.close()
 
 if failures:

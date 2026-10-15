@@ -7,7 +7,9 @@ command meeting a row's from-state it is not allowed in is refused with that
 row's code, and a venue's fact is held to it only to be recorded. From
 contract v23 the table holds an execution's rows too (keyed e1 onward, their
 states the schema's `execution_states`, ExecutionState values), written as a
-second table beside the order's: the same row type over the other state. This writes
+second table beside the order's: the same row type over the other state. From
+contract v24 it holds a booking's rows too (keyed b1 onward, their states the
+schema's `booking_states`, BookingState values), a third table. This writes
 crates/bor/src/transitions.rs; `make codegen` runs it from the schema at the
 revision Cargo.toml pins, and `make check-codegen` fails when the vendored
 file differs from a fresh generation.
@@ -27,7 +29,7 @@ HEADER = """\
 //
 // {transitions_are}
 
-use meridian_domain::v1::{{ExecutionState, OrderState}};
+use meridian_domain::v1::{{BookingState, ExecutionState, OrderState}};
 use meridian_pb::v1::RefusalReason;
 
 /// A row's from: a state, any state, or none (a record being created). An
@@ -76,7 +78,17 @@ pub const EXECUTION_STATES: [ExecutionState; {state_count}] = [
 pub const EXECUTION_TRANSITIONS: &[Transition<ExecutionState>] = &[
 """
 
+BOOKING_HEADER = """
+/// A booking's states, in the contract's order (contract v24).
+pub const BOOKING_STATES: [BookingState; {state_count}] = [
+{states}];
+
+/// Every booking's row, in the table's order (contract v24).
+pub const BOOKING_TRANSITIONS: &[Transition<BookingState>] = &[
+"""
+
 EXECUTION_ROW = re.compile(r"^e\d+$")
+BOOKING_ROW = re.compile(r"^b\d+$")
 
 
 def camel(enum_value, prefix):
@@ -91,6 +103,10 @@ def state(value):
 
 def execution_state(value):
     return f"ExecutionState::{camel(value, 'EXECUTION_STATE_')}"
+
+
+def booking_state(value):
+    return f"BookingState::{camel(value, 'BOOKING_STATE_')}"
 
 
 def rust_str(text):
@@ -128,8 +144,12 @@ def generate(table):
     execution_rows = [row for row in table["transitions"] if EXECUTION_ROW.match(row["row"])]
     if execution_rows and not executions:
         raise ValueError("the table has an execution's rows and no execution_states")
+    bookings = table.get("booking_states", [])
+    booking_rows = [row for row in table["transitions"] if BOOKING_ROW.match(row["row"])]
+    if booking_rows and not bookings:
+        raise ValueError("the table has a booking's rows and no booking_states")
     for row in table["transitions"]:
-        if not EXECUTION_ROW.match(row["row"]):
+        if not EXECUTION_ROW.match(row["row"]) and not BOOKING_ROW.match(row["row"]):
             emit(out, row, state, table["states"])
     out.append("];\n")
     out.append(EXECUTION_HEADER.format(
@@ -138,6 +158,13 @@ def generate(table):
     ))
     for row in execution_rows:
         emit(out, row, execution_state, executions)
+    out.append("];\n")
+    out.append(BOOKING_HEADER.format(
+        state_count=len(bookings),
+        states="".join(f"    {booking_state(value)},\n" for value in bookings),
+    ))
+    for row in booking_rows:
+        emit(out, row, booking_state, bookings)
     out.append("];\n")
     return "".join(out)
 
@@ -161,8 +188,17 @@ def self_test():
         "caused_by": ["ems"], "to": ["EXECUTION_STATE_MATCHED"],
         "refusal": ["REFUSAL_REASON_EXECUTION_STATE"],
     })
+    table["booking_states"] = ["BOOKING_STATE_BOOKED", "BOOKING_STATE_HELD"]
+    table["transitions"].append({
+        "row": "b4", "from": ["BOOKING_STATE_BOOKED"], "cause": "a failed hand-off",
+        "caused_by": ["oms"], "to": ["BOOKING_STATE_HELD"], "refusal": [],
+    })
     text = generate(table)
     assert "// a test table" in text, text
+    assert "pub const BOOKING_STATES: [BookingState; 2]" in text, text
+    assert "from: &[From::State(BookingState::Booked)]" in text, text
+    assert text.index("row: \"b4\"") > text.index("BOOKING_TRANSITIONS"), text
+    assert text.index("row: \"e3\"") < text.index("BOOKING_TRANSITIONS"), text
     assert "pub const EXECUTION_STATES: [ExecutionState; 2]" in text, text
     assert "from: &[From::State(ExecutionState::Unmatched)]" in text, text
     assert "to: &[To::State(ExecutionState::Matched)]" in text, text
@@ -186,6 +222,13 @@ def self_test():
         pass
     else:
         raise AssertionError("an execution's row naming an order's state was accepted")
+    wrong = dict(table, transitions=[dict(table["transitions"][3], to=["EXECUTION_STATE_MATCHED"])])
+    try:
+        generate(wrong)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a booking's row naming an execution's state was accepted")
     print("generate_transitions self-test OK")
 
 

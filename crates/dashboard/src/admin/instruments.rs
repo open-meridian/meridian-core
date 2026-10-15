@@ -36,6 +36,12 @@ pub const MERGE_INSTRUMENTS: &str = "platform.reference.command.merge-instrument
 pub const LIST_INSTRUMENTS_TO_COMPLETE: &str =
     "platform.reference.query.list-instruments-to-complete";
 pub const READ_INSTRUMENT_HISTORY: &str = "platform.reference.query.read-instrument-history";
+/// W3.28 (contract v24): the usage report's setting, and the reports sent.
+pub const SET_REPORTS_USAGE: &str = "platform.config.command.set-reports-usage";
+pub const LIST_USAGE_REPORTS: &str = "platform.config.query.list-usage-reports";
+/// W3.26 (contract v24): the deployment admin making the migration's lines.
+pub const APPLY_INSTRUMENT_MIGRATION: &str =
+    "platform.reference.command.apply-instrument-migration";
 pub const ASK_PLATFORM_FOR_INSTRUMENT: &str =
     "platform.reference.query.ask-platform-for-instrument";
 
@@ -179,6 +185,7 @@ pub async fn search(
             page_size: limit.clamp(1, 50) as i32,
             cursor: String::new(),
             search: words.chars().take(100).collect(),
+            provisional: false,
         },
         None,
         WAIT,
@@ -226,11 +233,133 @@ pub async fn list(
             page_size: 1000,
             cursor: String::new(),
             search: String::new(),
+            provisional: false,
         },
         None,
         WAIT,
     )
     .await
+}
+
+/// The provisional records (contract v24, W3.11): each with why, complete or
+/// not.
+pub async fn provisional(
+    bus: &meridian_bus::Bus,
+) -> Result<ListInstrumentsToCompleteReply, String> {
+    ask(
+        bus,
+        LIST_INSTRUMENTS_TO_COMPLETE,
+        "meridian.v1.ListInstrumentsToCompleteRequest",
+        ListInstrumentsToCompleteRequest {
+            include_complete: true,
+            page_size: 1000,
+            provisional: true,
+            ..Default::default()
+        },
+        None,
+        WAIT,
+    )
+    .await
+}
+
+/// The usage reports the conductor sent (W3.28), newest first.
+pub async fn usage_reports(
+    bus: &meridian_bus::Bus,
+) -> Result<meridian_domain::v1::ListUsageReportsReply, String> {
+    ask(
+        bus,
+        LIST_USAGE_REPORTS,
+        "meridian.v1.ListUsageReportsRequest",
+        meridian_domain::v1::ListUsageReportsRequest {},
+        None,
+        WAIT,
+    )
+    .await
+}
+
+/// The migration's counts, as the tools answer them (W3.11, W3.26).
+pub fn migration_counts_json(m: &meridian_domain::v1::MigrationCounts) -> serde_json::Value {
+    serde_json::json!({
+        "already_held": m.already_held,
+        "matched": m.matched,
+        "minted": m.minted,
+        "near_match": m.near_match,
+        "awaiting_staff": m.awaiting_staff,
+        "kept_local": m.kept_local,
+        "unreachable": m.unreachable,
+        "held_back": m.held_back,
+        "remaining": m.remaining,
+    })
+}
+
+/// Why a record is provisional, in the page's words (W3.7, W3.11).
+pub fn reason_words(reason: i32) -> &'static str {
+    use meridian_domain::v1::ProvisionalReason;
+    match ProvisionalReason::try_from(reason) {
+        Ok(ProvisionalReason::Unreachable) => {
+            "the platform not reached; asked again on reconnecting"
+        }
+        // INCOMPLETE is the incomplete or offline state: a record kept
+        // local with nothing on the licence list to look for among them.
+        Ok(ProvisionalReason::Incomplete) => {
+            "incomplete or offline: its template's fields, or nothing to look for yet"
+        }
+        Ok(ProvisionalReason::AwaitingStaff) => "with the platform's staff; asked again daily",
+        Ok(ProvisionalReason::ClassNeeded) => "class needed: no asset class stated",
+        Ok(ProvisionalReason::HeldBack) => "held back at the migration",
+        _ => "not said",
+    }
+}
+
+/// When a record was first recorded, from its earliest source: its age.
+pub fn first_recorded_ns(record: &InstrumentRecord) -> i64 {
+    record
+        .sources
+        .iter()
+        .map(|source| source.recorded_at_ns)
+        .filter(|at| *at > 0)
+        .min()
+        .unwrap_or(record.record_time_ns)
+}
+
+/// An age in a person's words: "3 days", "5 hours", "under an hour".
+pub fn age_words(age_ns: i64) -> String {
+    let hours = age_ns.max(0) / 3_600_000_000_000;
+    match hours {
+        0 => "under an hour".into(),
+        1..=47 => format!("{hours} hour{}", if hours == 1 { "" } else { "s" }),
+        _ => format!("{} days", hours / 24),
+    }
+}
+
+/// The home page's line for the provisional records (contract v24, W3.11):
+/// how many, and the oldest's age. Nothing when none.
+pub fn home_provisional(listed: Option<&ListInstrumentsToCompleteReply>, now_ns: i64) -> String {
+    let Some(listed) = listed else {
+        return String::new();
+    };
+    let records: Vec<&InstrumentRecord> = listed
+        .instruments
+        .iter()
+        .filter_map(|item| item.instrument.as_ref())
+        .filter(|record| record.provisional)
+        .collect();
+    if records.is_empty() {
+        return String::new();
+    }
+    let oldest = records
+        .iter()
+        .map(|record| first_recorded_ns(record))
+        .min()
+        .unwrap_or(now_ns);
+    let n = records.len();
+    format!(
+        "<p class=\"notice\" id=\"provisional-records\" data-provisional=\"{n}\">{n} provisional \
+         instrument record{s}, the oldest {age}: local records, not priced, until the platform \
+         answers. <a href=\"/admin/instruments#provisional\">See why</a></p>",
+        s = if n == 1 { "" } else { "s" },
+        age = age_words(now_ns - oldest),
+    )
 }
 
 /// Whether the deployment holds a record by this ID, asked by the ID rather
@@ -259,6 +388,7 @@ pub async fn every_record(bus: &meridian_bus::Bus) -> Result<Vec<(String, String
             page_size: 1000,
             cursor: String::new(),
             search: String::new(),
+            provisional: false,
         },
         None,
         WAIT,
@@ -359,6 +489,7 @@ pub async fn ask_platform(
             instrument_id: record.instrument_id.clone(),
             identifiers: record.identifiers.clone(),
             as_of_ns: 0,
+            match_or_mint: None,
         },
         None,
         ASKING,
@@ -732,6 +863,384 @@ pub fn list_page_with(
     notice: &str,
     calendars: &str,
 ) -> String {
+    list_page_full(listed, None, None, token, notice, calendars, 0)
+}
+
+/// The provisional tab (contract v24, W3.11): the migration's and each
+/// backfill's counts, and each provisional record with why, its template
+/// and what of it it lacks.
+fn provisional_tab(
+    listed: &ListInstrumentsToCompleteReply,
+    token: &str,
+    now_ns: i64,
+) -> (usize, String) {
+    let counts = listed.migration_counts.as_ref().map(|m| {
+        format!(
+            "<ul class=\"counts tight\" id=\"migration-counts\"><li>Already held: <strong>{}</strong></li>\
+             <li>Matched: <strong>{}</strong></li><li>Minted: <strong>{}</strong></li>\
+             <li>Near match: <strong>{}</strong></li><li>With the platform's staff: <strong>{}</strong></li>\
+             <li>Kept local: <strong>{}</strong></li><li>Not reached: <strong>{}</strong></li>\
+             <li>Held back: <strong>{}</strong></li><li>Still to send: <strong>{}</strong></li></ul>",
+            m.already_held,
+            m.matched,
+            m.minted,
+            m.near_match,
+            m.awaiting_staff,
+            m.kept_local,
+            m.unreachable,
+            m.held_back,
+            m.remaining
+        )
+    });
+    let backfill: String = listed
+        .backfill_counts
+        .iter()
+        .map(|b| {
+            format!(
+                "<li>{}: <strong>{}</strong> linked, <strong>{}</strong> for a person, \
+                 <strong>{}</strong> still to send</li>",
+                escape(&b.scheme.to_ascii_uppercase()),
+                b.matched,
+                b.awaiting_person,
+                b.remaining
+            )
+        })
+        .collect();
+    let rows: Vec<String> = listed
+        .instruments
+        .iter()
+        .filter_map(|item| item.instrument.as_ref().map(|record| (item, record)))
+        .filter(|(_, record)| record.provisional)
+        .map(|(item, record)| {
+            let template = if record.template_id.is_empty() {
+                "none yet".to_string()
+            } else {
+                format!("{} v{}", record.template_id, record.template_version)
+            };
+            let missing = record.missing_fields.join(", ");
+            format!(
+                "<tr data-id=\"{id}\" data-reason=\"{reason_n}\"><td><a href=\"/admin/instruments/{id}\">{id}</a></td>\
+                 <td class=\"wide\" title=\"{description}\">{description}</td><td title=\"{why}\">{why}</td>\
+                 <td class=\"wide\">{template}</td><td class=\"wide\" title=\"{missing}\">{missing}</td>\
+                 <td>{age}</td></tr>",
+                id = escape(&record.instrument_id),
+                description = escape(&record.description),
+                reason_n = item.provisional_reason,
+                why = escape(reason_words(item.provisional_reason)),
+                template = escape(&template),
+                missing = escape(if missing.is_empty() { "—" } else { &missing }),
+                age = escape(&age_words(now_ns - first_recorded_ns(record))),
+            )
+        })
+        .collect();
+    let n = rows.len();
+    let table = if rows.is_empty() {
+        "<p class=\"empty\" data-provisional=\"0\">None: every record is the platform's.</p>"
+            .to_string()
+    } else {
+        format!(
+            "<om-pager search=\"Search provisional records\"><table class=\"list one-line provisional\" \
+             id=\"provisional-table\" data-provisional=\"{n}\"><thead><tr><th>Record</th>\
+             <th class=\"wide\">Description</th><th>Why</th><th class=\"wide\">Template</th>\
+             <th class=\"wide\">Missing</th><th>Age</th></tr></thead><tbody>{}</tbody></table></om-pager>",
+            rows.concat()
+        )
+    };
+    let (line_buttons, line_dialogs) = lines_controls(listed, token);
+    let body = format!(
+        "<section class=\"admin-section\" id=\"provisional\"><div class=\"section-head\"><div>\
+         <h2>Provisional records</h2><p class=\"hint\">Local records, not priced, until the \
+         platform answers with its record; each resolves on its own, its history reading across \
+         the link.</p></div>{line_buttons}</div>{counts}{backfill}{table}{line_dialogs}</section>",
+        counts = counts
+            .map(|counts| format!("<h3>The upgrade's migration</h3>{counts}"))
+            .unwrap_or_default(),
+        backfill = if backfill.is_empty() {
+            String::new()
+        } else {
+            format!("<h3>Backfills</h3><ul class=\"counts tight\" id=\"backfill-counts\">{backfill}</ul>")
+        },
+    );
+    (n, body)
+}
+
+/// The most lines one change names (W3.26): more exact lines are made as
+/// successive changes, in order (approved 2026-10-15).
+pub const MOST_LINES: usize = 500;
+
+/// Where the migration's lines are made or prepared.
+pub const LINES_PATH: &str = "/admin/instruments/migration";
+
+/// One uncertain line (W3.26): its records, the record the platform
+/// answered, and why it is not exact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UncertainLine {
+    pub instrument_ids: Vec<String>,
+    pub answered: String,
+    pub why: &'static str,
+}
+
+/// The migration's lines still to make, from the provisional records (W3.26;
+/// the sections and answers approved 2026-10-15): the exact lines in order,
+/// and each uncertain line on its own -- two records answered by one INS- ID
+/// (a duplicate line), a record an identifier meeting another names, or a
+/// line held back, made later on its own.
+pub fn migration_lines(
+    listed: &ListInstrumentsToCompleteReply,
+) -> (Vec<String>, Vec<UncertainLine>) {
+    use meridian_domain::v1::MigrationSection as S;
+    use std::collections::{BTreeMap, BTreeSet};
+    let conflicted: BTreeSet<&str> = listed
+        .conflicts
+        .iter()
+        .flat_map(|conflict| conflict.instrument_ids.iter().map(String::as_str))
+        .collect();
+    let mut by_answer: BTreeMap<&str, Vec<(&str, bool)>> = BTreeMap::new();
+    for item in &listed.instruments {
+        let Some(record) = item.instrument.as_ref() else {
+            continue;
+        };
+        let section = S::try_from(item.migration_section).unwrap_or(S::Unspecified);
+        let line = matches!(
+            section,
+            S::AlreadyHeld | S::Matched | S::Minted | S::NearMatch | S::HeldBack
+        );
+        if !record.provisional || !line || !item.answered_instrument_id.starts_with("INS-") {
+            continue;
+        }
+        by_answer
+            .entry(item.answered_instrument_id.as_str())
+            .or_default()
+            .push((record.instrument_id.as_str(), section == S::HeldBack));
+    }
+    let mut exact = Vec::new();
+    let mut uncertain = Vec::new();
+    for (answered, records) in by_answer {
+        if records.len() > 1 {
+            uncertain.push(UncertainLine {
+                instrument_ids: records.iter().map(|(id, _)| id.to_string()).collect(),
+                answered: answered.to_string(),
+                why: "a duplicate: two records answered by one",
+            });
+            continue;
+        }
+        let (id, held_back) = records[0];
+        if held_back {
+            uncertain.push(UncertainLine {
+                instrument_ids: vec![id.to_string()],
+                answered: answered.to_string(),
+                why: "held back",
+            });
+        } else if conflicted.contains(id) {
+            uncertain.push(UncertainLine {
+                instrument_ids: vec![id.to_string()],
+                answered: answered.to_string(),
+                why: "an identifier meets another record",
+            });
+        } else {
+            exact.push(id.to_string());
+        }
+    }
+    exact.sort();
+    (exact, uncertain)
+}
+
+/// The buttons opening the lines' dialogs, and the dialogs: the exact lines
+/// as one change (at most 500 at a time, each line held back by its box),
+/// and the uncertain lines, one chosen at a time. Prepared or made, with a
+/// note saying why (W3.26, W6.26, W6.27).
+fn lines_controls(listed: &ListInstrumentsToCompleteReply, token: &str) -> (String, String) {
+    let (exact, uncertain) = migration_lines(listed);
+    if exact.is_empty() && uncertain.is_empty() {
+        return (String::new(), String::new());
+    }
+    let answered: std::collections::BTreeMap<&str, &str> = listed
+        .instruments
+        .iter()
+        .filter_map(|item| {
+            item.instrument.as_ref().map(|record| {
+                (
+                    record.instrument_id.as_str(),
+                    item.answered_instrument_id.as_str(),
+                )
+            })
+        })
+        .collect();
+    let batch: Vec<&String> = exact.iter().take(MOST_LINES).collect();
+    let foot = |make: &str| {
+        format!(
+            "<label class=\"why\">Why <input name=\"note\" required maxlength=\"2000\"></label>\
+             <div class=\"dialog-foot\"><button type=\"button\" data-dialog-close>Cancel</button>\
+             <button type=\"submit\" name=\"prepare\" value=\"1\" data-prepare>Prepare</button>{make}</div>"
+        )
+    };
+    let mut buttons = String::from("<div class=\"head-actions\">");
+    let mut dialogs = String::new();
+    if !batch.is_empty() {
+        let rows: String = batch
+            .iter()
+            .map(|id| {
+                format!(
+                    "<tr data-line=\"{id}\"><td>{id}<input type=\"hidden\" name=\"line\" value=\"{id}\"></td>\
+                     <td>{answer}</td><td><label class=\"inline\"><input type=\"checkbox\" name=\"hold\" \
+                     value=\"{id}\"> Hold back</label></td></tr>",
+                    id = escape(id),
+                    answer = escape(answered.get(id.as_str()).copied().unwrap_or("")),
+                )
+            })
+            .collect();
+        let more = if exact.len() > batch.len() {
+            format!(
+                " The first {} of {}; the rest are the next changes, in order.",
+                batch.len(),
+                exact.len()
+            )
+        } else {
+            String::new()
+        };
+        buttons.push_str(&format!(
+            "<button type=\"button\" data-dialog-open=\"exact-lines\" data-exact-lines=\"{}\">Exact lines ({})</button>",
+            exact.len(),
+            exact.len()
+        ));
+        dialogs.push_str(&format!(
+            "<dialog id=\"exact-lines\" aria-labelledby=\"exact-lines-title\">\
+             <form method=\"post\" action=\"{LINES_PATH}\">{token}\
+             <div class=\"dialog-head\"><h2 id=\"exact-lines-title\">The exact lines</h2></div>\
+             <div class=\"dialog-body\"><p class=\"hint\">Made together as one change: each record \
+             replaced by the platform's, its history reading across the link. A line held back \
+             keeps its local ID, and nothing is minted for it.{more}</p>\
+             <om-pager search=\"Search lines\"><table class=\"list one-line\" id=\"exact-lines-table\">\
+             <thead><tr><th>Record</th><th>Becomes</th><th></th></tr></thead><tbody>{rows}</tbody>\
+             </table></om-pager>{foot}</div></form></dialog>",
+            foot = foot("<button type=\"submit\" class=\"primary\">Make the lines</button>"),
+        ));
+    }
+    if !uncertain.is_empty() {
+        let rows: String = uncertain
+            .iter()
+            .enumerate()
+            .map(|(n, line)| {
+                let ids = line.instrument_ids.join(",");
+                format!(
+                    "<tr data-uncertain=\"{ids}\"><td><label class=\"inline\"><input type=\"radio\" \
+                     name=\"group\" value=\"{ids}\" required{checked}> {shown}</label></td><td>{answer}</td>\
+                     <td title=\"{why}\">{why}</td></tr>",
+                    ids = escape(&ids),
+                    shown = escape(&line.instrument_ids.join(", ")),
+                    checked = if n == 0 { " checked" } else { "" },
+                    answer = escape(&line.answered),
+                    why = escape(line.why),
+                )
+            })
+            .collect();
+        buttons.push_str(&format!(
+            "<button type=\"button\" data-dialog-open=\"uncertain-lines\" data-uncertain-lines=\"{}\">Uncertain lines ({})</button>",
+            uncertain.len(),
+            uncertain.len()
+        ));
+        dialogs.push_str(&format!(
+            "<dialog id=\"uncertain-lines\" aria-labelledby=\"uncertain-lines-title\">\
+             <form method=\"post\" action=\"{LINES_PATH}\">{token}\
+             <div class=\"dialog-head\"><h2 id=\"uncertain-lines-title\">Uncertain lines</h2></div>\
+             <div class=\"dialog-body\"><p class=\"hint\">Each line its own change: choose one, then \
+             make it or hold it back. A duplicate's records both become the one record, the book \
+             summing them.</p>\
+             <om-pager search=\"Search lines\"><table class=\"list one-line\" id=\"uncertain-lines-table\">\
+             <thead><tr><th>Records</th><th>Becomes</th><th>Why</th></tr></thead><tbody>{rows}</tbody>\
+             </table></om-pager>{foot}</div></form></dialog>",
+            foot = foot(
+                "<button type=\"submit\" name=\"hold_all\" value=\"1\">Hold back</button>\
+                 <button type=\"submit\" class=\"primary\">Make the line</button>"
+            ),
+        ));
+    }
+    buttons.push_str("</div>");
+    (buttons, dialogs)
+}
+
+/// The usage report's setting and the reports sent (contract v24, W3.28).
+fn usage_section(
+    reports: &Result<meridian_domain::v1::ListUsageReportsReply, String>,
+    token: &str,
+) -> String {
+    let sent = match reports {
+        Err(_) => {
+            "<p class=\"refused\">The conductor did not say which reports it sent.</p>".to_string()
+        }
+        Ok(reports) if reports.reports.is_empty() => {
+            "<p class=\"empty\" data-usage-reports=\"0\">None sent yet.</p>".to_string()
+        }
+        Ok(reports) => format!(
+            "<ul class=\"counts\" data-usage-reports=\"{}\">{}</ul>",
+            reports.reports.len(),
+            reports
+                .reports
+                .iter()
+                .take(5)
+                .map(|sent| {
+                    let report = sent.report.clone().unwrap_or_default();
+                    format!(
+                        "<li>{} to {}: {} scheme{}, {}</li>",
+                        escape(&report.period_start),
+                        escape(&report.period_end),
+                        report.scheme_counts.len(),
+                        if report.scheme_counts.len() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        },
+                        if sent.received {
+                            "received"
+                        } else {
+                            "not received"
+                        }
+                    )
+                })
+                .collect::<String>()
+        ),
+    };
+    // The setting in force, as the reports read answers it (contract v24,
+    // ListUsageReportsReply.reports_usage); on where it was not read, the
+    // default.
+    let on = reports
+        .as_ref()
+        .map(|reports| reports.reports_usage)
+        .unwrap_or(true);
+    let (on_selected, off_selected) = if on {
+        (" selected", "")
+    } else {
+        ("", " selected")
+    };
+    format!(
+        "<h3>Report identifier usage</h3><p class=\"hint\">Weekly counts per scheme, on by default: \
+         never a value, a holding, a quantity or an account.</p>\
+         <form method=\"post\" action=\"{USAGE_PATH}\" class=\"inline-form\" id=\"usage-form\" \
+         data-reports-usage=\"{}\">{token}\
+         <label>Report identifier usage <select name=\"reports_usage\">\
+         <option value=\"on\"{on_selected}>On</option>\
+         <option value=\"off\"{off_selected}>Off</option></select></label>\
+         <label>Why <input name=\"note\" required maxlength=\"2000\"></label>\
+         <button type=\"submit\" name=\"prepare\" value=\"1\" data-prepare>Prepare</button>\
+         <button type=\"submit\" class=\"primary\">Set</button></form>{sent}",
+        if on { "on" } else { "off" }
+    )
+}
+
+/// Where the usage report's form posts.
+pub const USAGE_PATH: &str = "/admin/instruments/usage";
+
+/// The Instruments page whole, from contract v24 with its provisional tab
+/// and the usage report's setting.
+pub fn list_page_full(
+    listed: &Result<ListInstrumentsToCompleteReply, String>,
+    provisional: Option<&Result<ListInstrumentsToCompleteReply, String>>,
+    usage: Option<&Result<meridian_domain::v1::ListUsageReportsReply, String>>,
+    token: &str,
+    notice: &str,
+    calendars: &str,
+    now_ns: i64,
+) -> String {
     let notice = if notice.is_empty() {
         String::new()
     } else {
@@ -778,16 +1287,34 @@ pub fn list_page_with(
             )
         })
         .collect();
+    // From contract v24 the counts alone are reported (W3.28), never the
+    // values, unless the deployment admin turns the report off.
     let licensed = format!(
         "<section class=\"admin-section\" id=\"licensed\"><div class=\"section-head\"><div>\
          <h2>Licensed identifiers held</h2><p class=\"hint\">What your plugins reported, kept \
-         here under your own licence and never sent anywhere.</p></div></div>{}</section>",
+         here under your own licence: never sent anywhere, only how many are counted in the \
+         usage report.</p></div></div>{}{}</section>",
         if licensed.is_empty() {
             "<p class=\"empty\">None.</p>".to_string()
         } else {
             format!("<ul class=\"facts\">{}</ul>", licensed.concat())
-        }
+        },
+        usage
+            .map(|usage| usage_section(usage, token))
+            .unwrap_or_default(),
     );
+    let (provisional_n, provisional_tab) = match provisional {
+        Some(Ok(provisional)) => provisional_tab(provisional, token, now_ns),
+        Some(Err(why)) => (
+            0,
+            format!(
+                "<section class=\"admin-section\" id=\"provisional\"><p class=\"refused\">The \
+                 instrument store did not list the provisional records: {}</p></section>",
+                escape(why)
+            ),
+        ),
+        None => (0, String::new()),
+    };
 
     let conflict_rows: String = listed
         .conflicts
@@ -939,18 +1466,23 @@ pub fn list_page_with(
          the book cannot use is refused until it is complete.</p></div></div>{notice}\
          <nav class=\"tabs\"><a href=\"#to-complete\" data-tab=\"to-complete\">To complete</a>\
          <a href=\"#conflicts\" data-tab=\"conflicts\">Conflicts ({conflicts_n})</a>\
-         <a href=\"#licensed\" data-tab=\"licensed\">Licensed identifiers</a>{calendars_tab}</nav>\
+         {provisional_link}<a href=\"#licensed\" data-tab=\"licensed\">Licensed identifiers</a>{calendars_tab}</nav>\
          <section class=\"admin-section\" id=\"to-complete\"><div class=\"section-head\"><div>\
          <h2>Records to complete</h2>{counts}</div></div>{table}</section>\
          <section class=\"admin-section\" id=\"conflicts\"><div class=\"section-head\"><div>\
          <h2>Conflicts</h2><p class=\"hint\">Identifiers that meet two records. Merge them if \
          they are one security; the positions held under the one merged move onto the one that \
-         stays.</p></div></div>{conflicts}</section>{licensed}{calendars}</div>\
+         stays.</p></div></div>{conflicts}</section>{provisional_tab}{licensed}{calendars}</div>\
          <script>{}{}{}</script>",
         super::overview::SCRIPT_START,
         super::overview::SCRIPT_END,
         super::data_sources::PAGER_SCRIPT,
         conflicts_n = listed.conflicts.len(),
+        provisional_link = if provisional.is_some() {
+            format!("<a href=\"#provisional\" data-tab=\"provisional\">Provisional ({provisional_n})</a>")
+        } else {
+            String::new()
+        },
         calendars_tab = if calendars.is_empty() {
             ""
         } else {
@@ -1604,6 +2136,7 @@ mod tests {
             ],
             complete_for_book: false,
             complete: false,
+            ..Default::default()
         }
     }
 
@@ -1906,5 +2439,179 @@ mod tests {
         assert!(page.contains("data-reason=\"ambiguous\""));
         assert!(page.contains("data-dialog-open=\"merge-0\""));
         assert!(page.contains("<dialog id=\"merge-0\""));
+    }
+}
+
+#[cfg(test)]
+mod provisional_tests {
+    use super::*;
+    use meridian_domain::v1::{InstrumentValueSource, MigrationCounts, ProvisionalReason};
+
+    const NOW: i64 = 1_790_380_800_000_000_000;
+    const DAY: i64 = 86_400_000_000_000;
+
+    fn listed() -> ListInstrumentsToCompleteReply {
+        let record = |id: &str, at: i64| InstrumentRecord {
+            instrument_id: id.into(),
+            description: "ZZ Top Holdings".into(),
+            provisional: true,
+            template_id: "TPL-equity".into(),
+            template_version: "1".into(),
+            missing_fields: vec!["currency".into()],
+            sources: vec![InstrumentValueSource {
+                recorded_at_ns: at,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        ListInstrumentsToCompleteReply {
+            instruments: vec![
+                InstrumentToComplete {
+                    instrument: Some(record("LCL-ONE", NOW - 3 * DAY)),
+                    provisional_reason: ProvisionalReason::AwaitingStaff as i32,
+                    ..Default::default()
+                },
+                InstrumentToComplete {
+                    instrument: Some(record("LCL-TWO", NOW - DAY / 2)),
+                    provisional_reason: ProvisionalReason::Unreachable as i32,
+                    ..Default::default()
+                },
+            ],
+            migration_counts: Some(MigrationCounts {
+                matched: 4,
+                kept_local: 2,
+                remaining: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_provisional_records_are_drawn_with_why_their_template_and_age() {
+        let (n, tab) = provisional_tab(&listed(), "", NOW);
+        assert_eq!(n, 2);
+        assert!(
+            tab.contains("with the platform&#39;s staff; asked again daily")
+                || tab.contains("with the platform's staff; asked again daily"),
+            "{tab}"
+        );
+        assert!(tab.contains("TPL-equity v1"));
+        assert!(tab.contains(">currency<"));
+        assert!(tab.contains(">3 days<"));
+        assert!(tab.contains("Matched: <strong>4</strong>"));
+        assert!(tab.contains("Still to send: <strong>1</strong>"));
+        let home = home_provisional(Some(&listed()), NOW);
+        assert!(home.contains("data-provisional=\"2\""));
+        assert!(home.contains("the oldest 3 days"));
+        assert!(home_provisional(Some(&ListInstrumentsToCompleteReply::default()), NOW).is_empty());
+        // The page carries its tab and the usage report's form.
+        let page = list_page_full(
+            &Ok(ListInstrumentsToCompleteReply::default()),
+            Some(&Ok(listed())),
+            Some(&Ok(Default::default())),
+            "<t>",
+            "",
+            "",
+            NOW,
+        );
+        assert!(page.contains("Provisional (2)"));
+        assert!(page.contains("action=\"/admin/instruments/usage\""));
+        assert!(page.contains("Report identifier usage"));
+        assert!(page.contains("None sent yet."));
+    }
+
+    /// W3.26 (contract v24; approved 2026-10-15): the exact lines one
+    /// change, a duplicate line and a held-back line each their own.
+    #[test]
+    fn the_lines_are_exact_or_uncertain_and_drawn_as_two_dialogs() {
+        use meridian_domain::v1::{InstrumentConflict, MigrationSection as S};
+        let line = |id: &str, section: S, answered: &str| InstrumentToComplete {
+            instrument: Some(InstrumentRecord {
+                instrument_id: id.into(),
+                provisional: true,
+                ..Default::default()
+            }),
+            migration_section: section as i32,
+            answered_instrument_id: answered.into(),
+            ..Default::default()
+        };
+        let listed = ListInstrumentsToCompleteReply {
+            instruments: vec![
+                line("LCL-A", S::Matched, "INS-A"),
+                line("LCL-B", S::Minted, "INS-B"),
+                line("LCL-USD1", S::AlreadyHeld, "INS-USD"),
+                line("LCL-USD2", S::Matched, "INS-USD"),
+                line("LCL-GBTC", S::HeldBack, "INS-GBTC"),
+                line("LCL-C", S::NearMatch, "INS-C"),
+                line("LCL-STAFF", S::AwaitingStaff, ""),
+                line("LCL-LOCAL", S::KeptLocal, ""),
+            ],
+            conflicts: vec![InstrumentConflict {
+                instrument_ids: vec!["LCL-C".into(), "LCL-OTHER".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let (exact, uncertain) = migration_lines(&listed);
+        assert_eq!(exact, vec!["LCL-A".to_string(), "LCL-B".to_string()]);
+        let named: Vec<(Vec<String>, &str)> = uncertain
+            .iter()
+            .map(|line| (line.instrument_ids.clone(), line.answered.as_str()))
+            .collect();
+        assert!(named.contains(&(vec!["LCL-USD1".into(), "LCL-USD2".into()], "INS-USD")));
+        assert!(named.contains(&(vec!["LCL-GBTC".into()], "INS-GBTC")));
+        assert!(named.contains(&(vec!["LCL-C".into()], "INS-C")));
+        assert_eq!(
+            uncertain.len(),
+            3,
+            "awaiting staff and kept local are no lines"
+        );
+        let (buttons, dialogs) = lines_controls(&listed, "");
+        assert!(buttons.contains("Exact lines (2)") && buttons.contains("Uncertain lines (3)"));
+        assert!(dialogs.contains("name=\"line\" value=\"LCL-A\""));
+        assert!(dialogs.contains("name=\"hold\" value=\"LCL-B\""));
+        assert!(dialogs.contains("value=\"LCL-USD1,LCL-USD2\""));
+        assert!(dialogs.contains("action=\"/admin/instruments/migration\""));
+        assert!(dialogs.contains("data-prepare"));
+    }
+
+    #[test]
+    fn more_than_500_exact_lines_are_successive_changes() {
+        use meridian_domain::v1::MigrationSection as S;
+        let listed = ListInstrumentsToCompleteReply {
+            instruments: (0..501)
+                .map(|n| InstrumentToComplete {
+                    instrument: Some(InstrumentRecord {
+                        instrument_id: format!("LCL-{n:04}"),
+                        provisional: true,
+                        ..Default::default()
+                    }),
+                    migration_section: S::Matched as i32,
+                    answered_instrument_id: format!("INS-{n:04}"),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let (_, dialogs) = lines_controls(&listed, "");
+        assert_eq!(dialogs.matches("name=\"line\"").count(), 500);
+        assert!(dialogs.contains("The first 500 of 501"));
+        assert!(
+            !dialogs.contains("LCL-0500"),
+            "the 501st is the next change"
+        );
+    }
+
+    #[test]
+    fn apply_migration_is_prepare_only_and_close_account_may_not_for_agents() {
+        use crate::prepared::levels::{default_for, Level};
+        assert_eq!(
+            default_for("dashboard__apply_migration"),
+            Level::PrepareOnly
+        );
+        assert_eq!(default_for("dashboard__close_account"), Level::MayNot);
+        assert!(crate::prepared::CORE_PREPARABLE.contains(&"dashboard__apply_migration"));
+        assert!(crate::prepared::CORE_PREPARABLE.contains(&"dashboard__close_account"));
     }
 }

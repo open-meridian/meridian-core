@@ -95,6 +95,9 @@ pub const ACCESS_RECORDS: &str = "platform.config.query.access-records";
 pub const REDEEM_CLAIM_CODE: &str = "platform.config.command.redeem-claim-code";
 pub const DEFINE_ACCOUNT: &str = "platform.config.command.define-account";
 pub const CLOSE_ACCOUNT: &str = "platform.config.command.close-account";
+/// W3.28 (contract v24): the usage statistics' setting, and the reports sent.
+pub const SET_REPORTS_USAGE: &str = "platform.config.command.set-reports-usage";
+pub const LIST_USAGE_REPORTS: &str = "platform.config.query.list-usage-reports";
 pub const LINK_EXTERNAL_ACCOUNT: &str = "platform.config.command.link-external-account";
 pub const ACCOUNTS: &str = "platform.config.query.accounts";
 pub const SET_LINKABLE_ACCOUNTS: &str = "platform.config.command.set-linkable-accounts";
@@ -450,6 +453,139 @@ impl Context {
         self.store.snapshot().map_err(|failed| failed.to_string())
     }
 
+    /// What the instrument store says a record became (contract v24, W3.8):
+    /// its own ID where it was not replaced; `None` where it holds none.
+    fn instrument_became(&self, instrument_id: &str) -> Result<Option<String>, String> {
+        let handle = tokio::runtime::Handle::try_current().map_err(|failed| failed.to_string())?;
+        let (payload_type, payload) = handle
+            .block_on(
+                self.bus.call(
+                    RESOLVE_INSTRUMENT,
+                    "meridian.v1.ResolveInstrumentRequest",
+                    ResolveInstrumentRequest {
+                        instrument_id: instrument_id.to_string(),
+                        as_of_ns: self.clock.now_ns(),
+                    }
+                    .encode_to_vec(),
+                    None,
+                    Some(INSTRUMENT_WAIT),
+                ),
+            )
+            .map_err(|failed| failed.to_string())?;
+        if payload_type != "meridian.v1.ResolveInstrumentReply" {
+            return Err(format!("the instrument store answered {payload_type}"));
+        }
+        let reply =
+            ResolveInstrumentReply::decode(&payload[..]).map_err(|failed| failed.to_string())?;
+        Ok(reply
+            .instrument
+            .filter(|_| reply.found)
+            .map(|record| record.instrument_id))
+    }
+
+    /// Re-point every instrument cell of a plugin's settings tables naming a
+    /// replaced record (contract v24, the one-ID spec's requirement 10;
+    /// W3.26): each table changed is a recorded settings change, its "who"
+    /// the resolution rule naming the replacement, its rows stamped so; the
+    /// page and the plugin then show one ID. Answers how many tables.
+    pub(crate) fn repoint_settings(&self) -> Result<usize, String> {
+        let before = self.snapshot()?;
+        let now = self.clock.now_ns();
+        let mut became: BTreeMap<String, Option<String>> = BTreeMap::new();
+        let mut changed_tables = 0;
+        let plugins: Vec<String> = before.declared_settings.keys().cloned().collect();
+        for plugin in plugins {
+            let mut changes = Vec::new();
+            let mut said = Vec::new();
+            for (declaration, held) in declared_and_stored(&before, &plugin) {
+                if !setting_table::is_table(declaration) {
+                    continue;
+                }
+                let columns: Vec<&str> = declaration
+                    .columns
+                    .iter()
+                    .filter(|column| {
+                        SettingColumnType::try_from(column.r#type)
+                            == Ok(SettingColumnType::Instrument)
+                    })
+                    .map(|column| column.name.as_str())
+                    .collect();
+                if columns.is_empty() {
+                    continue;
+                }
+                let Some(Held::Plain(text)) = held_reading(declaration, held, &plugin) else {
+                    continue;
+                };
+                let Ok(rows) = setting_table::parse(text) else {
+                    continue;
+                };
+                let mut cells: Vec<_> = rows.iter().map(|row| row.cells.clone()).collect();
+                let mut moved = Vec::new();
+                for row in cells.iter_mut() {
+                    for column in &columns {
+                        let Some(value) = row.get(*column).map(|v| v.trim().to_string()) else {
+                            continue;
+                        };
+                        if value.is_empty() {
+                            continue;
+                        }
+                        let now_is = match became.get(&value) {
+                            Some(known) => known.clone(),
+                            None => {
+                                let known = self.instrument_became(&value)?;
+                                became.insert(value.clone(), known.clone());
+                                known
+                            }
+                        };
+                        if let Some(now_is) = now_is.filter(|now_is| *now_is != value) {
+                            row.insert(column.to_string(), now_is.clone());
+                            moved.push(format!("{value} became {now_is}"));
+                        }
+                    }
+                }
+                if moved.is_empty() {
+                    continue;
+                }
+                let by = format!("the resolution rule: {}", moved.join(", "));
+                changes.push(SettingChange {
+                    name: declaration.name.clone(),
+                    held: Some(Held::Plain(setting_table::written(
+                        &setting_table::stamped(&cells, &rows, &by, now),
+                    ))),
+                    hint: String::new(),
+                });
+                said.extend(moved);
+            }
+            if changes.is_empty() {
+                continue;
+            }
+            let author = SettingsAuthor {
+                by: "the resolution rule".into(),
+                delegation: String::new(),
+                client: String::new(),
+                note: format!(
+                    "re-pointed by core, the record each named having been replaced \
+                     (contract v24, W3.8): {}",
+                    said.join("; ")
+                ),
+                prepared_call_id: String::new(),
+            };
+            self.store
+                .put_plugin_settings(&plugin, &changes, &author, now)
+                .map_err(|failed| failed.to_string())?;
+            changed_tables += changes.len();
+            tracing::info!(
+                plugin,
+                tables = changes.len(),
+                "settings cells re-pointed to the records they became"
+            );
+        }
+        if changed_tables > 0 {
+            self.announce(&before)?;
+        }
+        Ok(changed_tables)
+    }
+
     /// Whether the instrument store holds a record by this ID, asked from a
     /// handler's blocking thread; or why it could not be told.
     fn instrument_held(&self, instrument_id: &str) -> Result<bool, String> {
@@ -793,6 +929,30 @@ pub fn serve(
     )
 }
 
+/// One sweep of settings cells naming a replaced record (requirement 10),
+/// for a test to drive without waiting for the hourly one.
+#[cfg(test)]
+pub(crate) fn repoint_now(
+    bus: Arc<Bus>,
+    store: Arc<dyn Store>,
+    clock: Arc<dyn Clock>,
+    upstream: Arc<dyn Upstream>,
+    key: Arc<SettingsKey>,
+) -> Result<usize, String> {
+    Context {
+        bus,
+        store,
+        clock,
+        upstream,
+        key,
+        reported: Mutex::new(BTreeMap::new()),
+        grant: crate::archive::ArchiveGrant::default(),
+        kinds: Mutex::new(BTreeMap::new()),
+        registered: Mutex::new(BTreeSet::new()),
+    }
+    .repoint_settings()
+}
+
 /// [`serve`], for a deployment whose install named where archives are kept
 /// (W7.1, W8.7, contract v16): what a write-once hold is refused against.
 pub fn serve_with(
@@ -818,6 +978,25 @@ pub fn serve_with(
     // Links made before an account held one external account at most are
     // kept, and said, for a deployment admin to separate (W6.4). Off the
     // runtime, since the store blocks on its socket.
+    // Settings cells naming a replaced record, re-pointed (contract v24,
+    // requirement 10): swept soon after a start and then hourly, since the
+    // conductor hears no replacement itself.
+    let sweeping = Arc::clone(&context);
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        loop {
+            let cx = Arc::clone(&sweeping);
+            match tokio::task::spawn_blocking(move || cx.repoint_settings()).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(failed)) => {
+                    tracing::info!(%failed, "settings were not re-pointed this time")
+                }
+                Err(failed) => tracing::warn!(%failed, "the settings sweep failed"),
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        }
+    });
+
     let reading = Arc::clone(&context);
     tokio::task::spawn_blocking(move || {
         if let Ok(snapshot) = reading.snapshot() {
@@ -1194,6 +1373,51 @@ pub fn serve_with(
         |cx, request: CloseAccountRequest, envelope| {
             let before = cx.snapshot()?;
             rules::close_account(&before, &request.account_id)?;
+            // Why, on each grant's withdrawal; through a delegation required
+            // (approved 2026-10-15).
+            let note = request.note.trim();
+            if let Some(refused) = crate::store::note_refused(note) {
+                return Err(refused);
+            }
+            if note.is_empty() && !delegation(envelope).is_empty() {
+                return Err(meridian_bus::refusal(
+                    meridian_pb::v1::RefusalReason::ReasonRequired as i32,
+                    "through a delegation closing an account says why",
+                ));
+            }
+            // Never left dangling (approved 2026-10-14): an account still
+            // linked, granted or mapped is refused, naming each. "Unlink all
+            // and close" (contract v24, W6.3) withdraws the grants in the
+            // same step; a link or an ems's mapping is undone at its
+            // plugin's own page, so while one stands nothing is withdrawn
+            // or closed.
+            let attached = rules::attached(&before, &request.account_id);
+            let standing: Vec<&rules::Attached> = attached
+                .iter()
+                .filter(|item| {
+                    !(request.unlink_attached && matches!(item, rules::Attached::Grant { .. }))
+                })
+                .collect();
+            if !standing.is_empty() {
+                return Err(meridian_bus::refusal_naming(
+                    meridian_pb::v1::RefusalReason::Unspecified as i32,
+                    &["account_id".to_string()],
+                    format!(
+                        "account {} is still attached, and nothing was {}: {}",
+                        request.account_id,
+                        if request.unlink_attached {
+                            "withdrawn or closed"
+                        } else {
+                            "closed"
+                        },
+                        standing
+                            .iter()
+                            .map(|item| item.words())
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    ),
+                ));
+            }
             let mut account = before
                 .records
                 .accounts
@@ -1202,7 +1426,35 @@ pub fn serve_with(
                 .cloned()
                 .expect("the rule checked it exists");
             account.state = AccountState::Closed as i32;
-            cx.store.put_account(&account).map_err(|f| f.to_string())?;
+            if attached.is_empty() {
+                cx.store.put_account(&account).map_err(|f| f.to_string())?;
+            } else {
+                let withdrawn_from = cx
+                    .store
+                    .close_account_withdrawing_grants(
+                        &account,
+                        &Author {
+                            note: if note.is_empty() {
+                                "withdrawn with the account's closure: Unlink all and close (W6.3)"
+                                    .into()
+                            } else {
+                                format!(
+                                    "withdrawn with the account's closure: Unlink all and close \
+                                     (W6.3): {note}"
+                                )
+                            },
+                            ..author(envelope)
+                        },
+                        cx.clock.now_ns(),
+                    )
+                    .map_err(|f| f.to_string())?;
+                tracing::info!(
+                    account = account.account_id,
+                    withdrawn = withdrawn_from.len(),
+                    by = subject(envelope),
+                    "grants withdrawn with the account's closure"
+                );
+            }
             tracing::info!(
                 account = account.account_id,
                 by = subject(envelope),
@@ -1210,6 +1462,73 @@ pub fn serve_with(
             );
             cx.announce(&before)?;
             Ok(account)
+        },
+    );
+
+    // W3.28 (contract v24): "Report identifier usage", the deployment
+    // admin's, on by default, each change its own record.
+    answer(
+        &context,
+        SET_REPORTS_USAGE,
+        (
+            "meridian.v1.SetReportsUsageRequest",
+            "meridian.v1.ReportsUsageSetting",
+        ),
+        |cx, request: meridian_domain::v1::SetReportsUsageRequest, envelope| {
+            let by = subject(envelope);
+            if by.is_empty() {
+                return Err(
+                    "the usage report's setting is a deployment admin's, and this is sent for nobody"
+                        .into(),
+                );
+            }
+            if request.reason.trim().is_empty() {
+                return Err(meridian_bus::refusal_naming(
+                    meridian_pb::v1::RefusalReason::ReasonRequired as i32,
+                    &["reason".to_string()],
+                    "reason: a change to the usage report's setting says why",
+                ));
+            }
+            if request.reason.chars().count() > 4_000 {
+                return Err("reason: at most 4,000 characters".into());
+            }
+            if cx.store.reports_usage().map_err(|f| f.to_string())? != request.reports_usage {
+                cx.store
+                    .set_reports_usage(
+                        request.reports_usage,
+                        &Author {
+                            note: request.reason.trim().to_string(),
+                            ..author(envelope)
+                        },
+                        cx.clock.now_ns(),
+                    )
+                    .map_err(|f| f.to_string())?;
+                tracing::info!(
+                    on = request.reports_usage,
+                    by,
+                    "the usage report's setting changed"
+                );
+            }
+            Ok(meridian_domain::v1::ReportsUsageSetting {
+                reports_usage: cx.store.reports_usage().map_err(|f| f.to_string())?,
+            })
+        },
+    );
+
+    answer(
+        &context,
+        LIST_USAGE_REPORTS,
+        (
+            "meridian.v1.ListUsageReportsRequest",
+            "meridian.v1.ListUsageReportsReply",
+        ),
+        |cx, _request: meridian_domain::v1::ListUsageReportsRequest, _| {
+            Ok(meridian_domain::v1::ListUsageReportsReply {
+                reports: cx.store.usage_reports(52).map_err(|f| f.to_string())?,
+                // The setting in force, so the page says whether the report
+                // is on (W3.28, contract v24).
+                reports_usage: cx.store.reports_usage().map_err(|f| f.to_string())?,
+            })
         },
     );
 

@@ -195,16 +195,28 @@ class Dgm:
         return f"{self.plugin.identity.instance_id}:{key}"
 
     async def resolve(self):
+        # Each with what the venue states of it: from contract v24 a source
+        # stating less than an identifier and a description (a crypto asset
+        # is its own unit, so no currency) is no record (W3.7).
         asked = {
-            "btc": ([ops.Identifier(scheme="symbol", value="BTC", source="coinbase")], "crypto_asset"),
-            "usdc": ([ops.Identifier(scheme="symbol", value="USDC", source="coinbase")], "crypto_asset"),
-            "eur": ([ops.Identifier(scheme="iso4217", value="EUR")], None),
+            # Each by its CAIP-19 ID beside the venue's symbol, so the
+            # platform's master answers it: a provisional local record is
+            # not priced (W10.6).
+            "btc": ([ops.Identifier(scheme="symbol", value="BTC", source="coinbase"),
+                     ops.Identifier(scheme="caip19",
+                                    value="bip122:000000000019d6689c085ae165831e93/slip44:0")],
+                    "crypto_asset", "Bitcoin"),
+            "usdc": ([ops.Identifier(scheme="symbol", value="USDC", source="coinbase"),
+                      ops.Identifier(scheme="caip19",
+                                     value="eip155:1/erc20:0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48")],
+                     "crypto_asset", "USD Coin"),
+            "eur": ([ops.Identifier(scheme="iso4217", value="EUR")], None, ""),
         }
-        for name, (identifiers, stated) in asked.items():
+        for name, (identifiers, stated, described) in asked.items():
             if name in self.ids:
                 continue
             found = await self.plugin.resolve_identifier(
-                identifiers=identifiers, stated_asset_class=stated)
+                identifiers=identifiers, stated_asset_class=stated, stated_description=described)
             if not found.instrument_id:
                 raise RuntimeError(f"{name} did not resolve: {found}")
             self.ids[name] = found.instrument_id
@@ -388,19 +400,26 @@ class Dgm:
 
     async def resolve_as_of(self, query):
         one = lambda name: query.get(name, [""])[0]
+        # A security with the name and currency the venue states (from
+        # contract v24 a source stating less is no record, W3.7); a
+        # currency's own code states both.
+        stated = ({} if one("scheme") == "iso4217" else
+                  {"stated_description": f"{one('value')}, as the venue names it",
+                   "stated_currency": "USD"})
         found = await self.plugin._operations().ResolveIdentifier(ops.ResolveIdentifierParams(
             identifiers=[ops.Identifier(scheme=one("scheme"), value=one("value"), source=one("source"))],
-            as_of_ns=int(one("as_of") or 0)))
+            as_of_ns=int(one("as_of") or 0), **stated))
         return {"found": found.found, "instrument_id": found.instrument_id,
                 "miss_reason": ops.MissReason.Name(found.miss_reason), "minted": found.minted}
 
     async def identity(self):
         symbol = ops.Identifier(scheme="symbol", value="ZZAMB", source="coinbase")
         figi = ops.Identifier(scheme="figi", value="BBG000ZZAMB1")
+        stated = {"stated_description": "ZZAMB, as the venue names it", "stated_currency": "USD"}
         first = await self.plugin._operations().ResolveIdentifier(
-            ops.ResolveIdentifierParams(identifiers=[symbol]))
+            ops.ResolveIdentifierParams(identifiers=[symbol], **stated))
         second = await self.plugin._operations().ResolveIdentifier(
-            ops.ResolveIdentifierParams(identifiers=[figi]))
+            ops.ResolveIdentifierParams(identifiers=[figi], **stated))
         both = await self.plugin._operations().ResolveIdentifier(
             ops.ResolveIdentifierParams(identifiers=[symbol, figi]))
         said = {"symbol": first.instrument_id, "figi": second.instrument_id,

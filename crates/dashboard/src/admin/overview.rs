@@ -864,6 +864,7 @@ pub fn render(
         note_most = ACCOUNT_RECORD_NOTE_LENGTH.most,
     );
     let mut rows = String::new();
+    let mut close_dialogs = String::new();
     for (row, a) in accounts_sorted.iter().enumerate() {
         let closed = a.state == AccountState::Closed as i32;
         let (currency, method, since) = super::books::in_book(books, &a.account_id);
@@ -880,16 +881,17 @@ pub fn render(
                 "base_currency_code": currency,
                 "lot_relief_default": method.to_string(),
                 "waits_for_compliance": super::books::waits_word(super::books::waits(books, &a.account_id)),
+                "account_mark": super::books::mark_word(books, &a.account_id),
                 "since": if since.is_empty() { "not yet".to_string() } else { since.clone() },
                 "reason": "",
             } });
+            // The Close, its dialog where something is still attached
+            // (approved 2026-10-14).
+            let (close, dialog) = close_control(records, a, row, token);
+            close_dialogs.push_str(&dialog);
             format!(
-                "{edit}<form method=\"post\" action=\"/admin/accounts/close#accounts\" \
-                 data-confirm=\"Close {name}? A closed account is kept, and nobody works in it.\">{token}\
-                 <input type=\"hidden\" name=\"account_id\" value=\"{id}\"><button type=\"submit\">Close</button></form>",
+                "{edit}{close}",
                 edit = edit_button("account", &format!("Edit {}", a.name), &fill),
-                name = escape(&a.name),
-                id = escape(&a.account_id),
             )
         };
         // The note, whole under the name, which is how it reads without
@@ -957,7 +959,7 @@ pub fn render(
          </div></form>{book}\
          <div class=\"dialog-foot\"><button type=\"button\" data-dialog-close>Cancel</button></div></dialog>",
         book = super::books::book_form(token),
-    );
+    ) + &close_dialogs;
     let not_answering = match books {
         super::books::Books::NotAnswering(why) => format!(
             "<p class=\"refused\">The book of record is not answering: {}</p>",
@@ -1348,3 +1350,173 @@ pub(super) const SCRIPT_END: &str = r##"
     }
   });
 })();"##;
+
+/// What still holds an account (approved 2026-10-14): a plugin's link of an
+/// external account to it, a plugin's grant of it, an `ems`'s venue
+/// account mapping to it -- each with the plugin's page it is undone at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attached {
+    pub plugin: String,
+    pub words: String,
+    /// A grant the dashboard withdraws itself (W6.30); a link and a mapping
+    /// are undone at the plugin's own page.
+    pub withdrawable: bool,
+}
+
+/// Everything attached to an account, links first, then grants, then
+/// mappings, as the conductor names them when it refuses the closure.
+pub fn attached(records: &AccessRecords, account_id: &str) -> Vec<Attached> {
+    let mut out: Vec<Attached> = records
+        .links
+        .iter()
+        .filter(|link| link.account_id == account_id)
+        .map(|link| Attached {
+            plugin: link.plugin_instance_id.clone(),
+            words: format!(
+                "{} links its external account {} to it",
+                link.plugin_instance_id, link.external_account_id
+            ),
+            withdrawable: false,
+        })
+        .collect();
+    out.extend(
+        records
+            .linkable_accounts
+            .iter()
+            .filter(|granted| granted.account_ids.iter().any(|id| id == account_id))
+            .map(|granted| Attached {
+                plugin: granted.plugin_instance_id.clone(),
+                words: format!("{} is granted it", granted.plugin_instance_id),
+                withdrawable: true,
+            }),
+    );
+    out.extend(records.venue_account_maps.iter().flat_map(|map| {
+        map.mappings
+            .iter()
+            .filter(|mapping| mapping.account_id == account_id)
+            .map(|mapping| Attached {
+                plugin: map.ems_instance_id.clone(),
+                words: format!(
+                    "{} maps {} at {} to it",
+                    map.ems_instance_id,
+                    mapping.venue_account_code,
+                    mapping.connectivity_instance_id
+                ),
+                withdrawable: false,
+            })
+    }));
+    out
+}
+
+/// The Close for an account (approved 2026-10-14): the usual confirmation
+/// where nothing is attached; otherwise a dialog listing everything
+/// attached, each linking to its plugin's page, with "Unlink all and close"
+/// -- one confirmation, each unlink its own record, then the closure -- and
+/// "Cancel". A link or an `ems`'s mapping is undone at its plugin's page:
+/// the dialog says so, and the closure waits for it.
+pub fn close_control(
+    records: &AccessRecords,
+    account: &AccountRecord,
+    row: usize,
+    token: &str,
+) -> (String, String) {
+    let attached = attached(records, &account.account_id);
+    let name = escape(&account.name);
+    let id = escape(&account.account_id);
+    if attached.is_empty() {
+        return (
+            format!(
+                "<form method=\"post\" action=\"/admin/accounts/close#accounts\" \
+                 data-confirm=\"Close {name}? A closed account is kept, and nobody works in it.\">{token}\
+                 <input type=\"hidden\" name=\"account_id\" value=\"{id}\"><button type=\"submit\">Close</button></form>"
+            ),
+            String::new(),
+        );
+    }
+    let items: String = attached
+        .iter()
+        .map(|item| {
+            format!(
+                "<li><a href=\"/admin/plugins/{plugin}\">{words}</a></li>",
+                plugin = escape(&item.plugin),
+                words = escape(&item.words),
+            )
+        })
+        .collect();
+    let all_withdrawable = attached.iter().all(|item| item.withdrawable);
+    let (foot, hint) = if all_withdrawable {
+        (
+            "<button type=\"submit\" class=\"primary\" name=\"unlink_all\" value=\"1\">Unlink all and close</button>",
+            "Each is withdrawn as its own record, and then the account is closed.",
+        )
+    } else {
+        (
+            "",
+            "A link and an ems's mapping are undone at the plugin's own page: open each, undo it, \
+             and close the account then.",
+        )
+    };
+    let button = format!(
+        "<button type=\"button\" data-dialog-open=\"close-account-{row}\" \
+         data-attached=\"{n}\">Close</button>",
+        n = attached.len(),
+    );
+    let dialog = format!(
+        "<dialog id=\"close-account-{row}\" aria-labelledby=\"close-account-{row}-title\">\
+         <form method=\"post\" action=\"/admin/accounts/close#accounts\">{token}\
+         <input type=\"hidden\" name=\"account_id\" value=\"{id}\">\
+         <div class=\"dialog-head\"><h2 id=\"close-account-{row}-title\">Close {name}</h2></div>\
+         <div class=\"dialog-body\"><p>Still attached to it:</p><ul class=\"attached-list\" data-attached-list>{items}</ul>\
+         <p class=\"hint\">{hint} A closed account is kept, and nobody works in it.</p></div>\
+         <div class=\"dialog-foot\"><button type=\"button\" data-dialog-close>Cancel</button>{foot}</div>\
+         </form></dialog>"
+    );
+    (button, dialog)
+}
+
+#[cfg(test)]
+mod close_tests {
+    use super::*;
+    use meridian_domain::v1::{ExternalAccountLink, LinkableAccounts};
+
+    fn account() -> AccountRecord {
+        AccountRecord {
+            account_id: "ACC-1".into(),
+            name: "Primary".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn close_lists_what_is_attached_and_offers_unlink_all_only_where_it_can() {
+        let mut records = AccessRecords::default();
+        let (button, dialog) = close_control(&records, &account(), 0, "<t>");
+        assert!(button.contains("data-confirm=\"Close Primary?"), "{button}");
+        assert!(dialog.is_empty());
+
+        records.linkable_accounts.push(LinkableAccounts {
+            plugin_instance_id: "oanda-1".into(),
+            account_ids: vec!["ACC-1".into()],
+            ..Default::default()
+        });
+        let (button, dialog) = close_control(&records, &account(), 0, "<t>");
+        assert!(button.contains("data-dialog-open=\"close-account-0\""));
+        assert!(dialog.contains("href=\"/admin/plugins/oanda-1\""));
+        assert!(dialog.contains(">Unlink all and close</button>"));
+        assert!(dialog.contains(">Cancel</button>"));
+
+        records.links.push(ExternalAccountLink {
+            plugin_instance_id: "oanda-1".into(),
+            external_account_id: "101-001-1".into(),
+            account_id: "ACC-1".into(),
+        });
+        let (_, dialog) = close_control(&records, &account(), 0, "<t>");
+        assert!(dialog.contains("101-001-1"));
+        assert!(
+            !dialog.contains("Unlink all and close"),
+            "a link is undone at its plugin's page"
+        );
+        assert!(dialog.contains(">Cancel</button>"));
+        assert_eq!(attached(&records, "ACC-1").len(), 2);
+    }
+}

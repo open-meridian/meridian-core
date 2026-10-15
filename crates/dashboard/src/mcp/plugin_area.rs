@@ -55,7 +55,9 @@ use meridian_pb::v1::{
 };
 use serde_json::{json, Map, Value};
 
-use super::instruments::{ask, bus_refused, integer, object, only, text, Problems};
+use super::instruments::{
+    ask, bus_refused, integer, object, only, stamp_ns, stamp_said, text, Problems,
+};
 use super::{others_json, others_words, refused, Caller};
 use crate::admin::settings::{self, AGAINST_FIELD, CLEAR_FIELD, TABLE_FIELD, VALUE_FIELD};
 use crate::admin::{Fields, SettingsRefused};
@@ -288,7 +290,7 @@ fn set_settings_schema() -> Value {
                 "items": {"type": "object", "additionalProperties": {"type": "string"}},
             }},
             "clear": {"type": "object", "description": "clear.<name>: true clears the setting, a secret included", "additionalProperties": {"type": "boolean", "const": true}},
-            "against_updated_at_ns": {"type": "integer", "description": "updated_at_ns as read: 0 for settings never saved, refused once any are"},
+            "against_updated_at_ns": {"type": ["string", "integer"], "pattern": "^[0-9]+$", "description": "updated_at_ns as read, a decimal string (an integer only up to 2^53): \"0\" for settings never saved, refused once any are"},
             "note": note_schema(),
         },
         "required": ["plugin_instance_id", "against_updated_at_ns", "note"],
@@ -378,7 +380,7 @@ fn archive_json(archive: &PluginArchive) -> Value {
         "allowed": archive.allowed,
         "most_bytes": archive.most_bytes,
         "updated_by": archive.updated_by,
-        "updated_at_ns": archive.updated_at_ns,
+        "updated_at_ns": stamp_said(archive.updated_at_ns),
         "acting_through_delegation": archive.acting_through_delegation,
         "client_name": archive.client_name,
         "note": others_words(&archive.note),
@@ -391,7 +393,7 @@ fn hold_json(hold: &Hold) -> Value {
         "days": hold.days,
         "write_once": hold.write_once,
         "updated_by": hold.updated_by,
-        "updated_at_ns": hold.updated_at_ns,
+        "updated_at_ns": stamp_said(hold.updated_at_ns),
         "acting_through_delegation": hold.acting_through_delegation,
         "client_name": hold.client_name,
         "note": others_words(&hold.note),
@@ -611,7 +613,7 @@ fn settings_json(
         "plugin_instance_id": record.plugin_instance_id,
         "values": values,
         "secrets_set": record.secrets_set,
-        "updated_at_ns": record.updated_at_ns,
+        "updated_at_ns": stamp_said(record.updated_at_ns),
         "updated_by": record.updated_by,
         "changes": record.changes.iter().filter(|c| !hidden.contains(c.name.as_str())).map(last_change_json).collect::<Vec<_>>(),
         "declared_settings": declared,
@@ -1197,7 +1199,7 @@ impl Context<'_> {
         let note = text(top, "note", "", true, &mut problems);
         // Required (contract v18, W6.11; v17's security review, I1): the
         // conductor reads 0 as "against settings never saved".
-        let against = integer(top, "against_updated_at_ns", "", true, &mut problems);
+        let against = stamp_ns(top, "against_updated_at_ns", "", true, &mut problems);
         let instance = text(top, "plugin_instance_id", "", true, &mut problems);
         if instance.is_empty() {
             return (problems.refusal(), String::new());
@@ -1698,7 +1700,7 @@ impl Context<'_> {
                 "plugin_instance_id": instance,
                 "accounts": accounts,
                 "updated_by": granted.updated_by,
-                "updated_at_ns": granted.updated_at_ns,
+                "updated_at_ns": stamp_said(granted.updated_at_ns),
                 "acting_through_delegation": granted.acting_through_delegation,
                 "client_name": granted.client_name,
             }}),

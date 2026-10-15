@@ -222,6 +222,8 @@ async fn a_connector_resolving_a_set_nothing_matches_is_answered_a_minted_record
         }],
         as_of_ns: NOW,
         stated_currency: "USD".into(),
+        // The minimum a record needs (contract v24, W3.7).
+        stated_description: "ZZ Top Holdings".into(),
         ..Default::default()
     };
     let resolved = sidecar
@@ -236,6 +238,10 @@ async fn a_connector_resolving_a_set_nothing_matches_is_answered_a_minted_record
         "the plugin's mirror dropped the minted flag"
     );
     assert!(resolved.instrument_id.starts_with("LCL-"));
+    assert!(
+        resolved.provisional,
+        "a local record, provisional (contract v24)"
+    );
 
     let again = sidecar
         .resolve_identifier(Request::new(unknown))
@@ -541,12 +547,17 @@ fn the_contract_admits_each_role_to_exactly_its_own_work() {
     assert!(dashboard.may_publish(meridian_bor::service::SET_ACCOUNT_ATTRIBUTE));
     assert!(!operations.may_publish(meridian_bor::service::SET_ACCOUNT_ATTRIBUTE));
 
-    // Several roles hold the union; a role the contract gives nothing holds
-    // nothing, and adds nothing to another.
+    // Several roles hold the union. From contract v24 confirmation reports
+    // a give-up's answer (W11.32), and adds nothing else to custody.
     let with_confirmation = contract
         .grants_for(&roles(&["custody", "confirmation"]))
         .unwrap();
-    assert_eq!(with_confirmation, custody);
+    let give_up = "platform.book.command.report-give-up";
+    assert!(with_confirmation.may_publish(give_up));
+    assert!(!custody.may_publish(give_up));
+    let mut without = with_confirmation.clone();
+    without.publish.retain(|topic| topic != give_up);
+    assert_eq!(without, custody);
 
     // The lake's 1b (contract v19): ems reads and hears trades and quotes,
     // and the datasets it may read; reporting hears neither (the plan's Q9

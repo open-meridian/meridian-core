@@ -22,12 +22,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use meridian_domain::exact::Exact;
 use meridian_domain::v1::{
-    ChangeRequest, ChangeRequestOutcome, Charge, Check, Execution, ExecutionState, FinalityLevel,
+    Alert, AlertKind, AlertState, Allocation, Booking, BookingState, ChangeRequest,
+    ChangeRequestOutcome, Charge, Check, Execution, ExecutionState, FinalityLevel, GiveUpRecord,
     JournalRef, Locate, LocateAnswer, LocateUse, LocateUseKind, Order, OrderCondition, OrderOrigin,
     OrderQuantities, OrderState, OrderStatus, Placement, PlacementChangeKind, PlacementCondition,
     PlacementEvent, PlacementState, PlacementStatus, ReportPlacementRequest,
-    ReportValueDateRollRequest, StandingOrderCondition, StandingPlacementCondition, TieOutReason,
-    TradingInstruction, UnplacedFact,
+    ReportValueDateRollRequest, SleeveCross, StandingOrderCondition, StandingPlacementCondition,
+    TieOutReason, TradingInstruction, UnplacedFact,
 };
 use serde::{Deserialize, Serialize};
 
@@ -52,6 +53,35 @@ mod pb {
         let text = String::deserialize(input)?;
         let bytes = STANDARD.decode(text).map_err(serde::de::Error::custom)?;
         M::decode(bytes.as_slice()).map_err(serde::de::Error::custom)
+    }
+}
+
+/// A list of proto messages kept as their encodings, as [`pb`] keeps one.
+mod pb_vec {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    use prost::Message;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<M: Message, S: Serializer>(messages: &[M], out: S) -> Result<S::Ok, S::Error> {
+        out.collect_seq(
+            messages
+                .iter()
+                .map(|message| STANDARD.encode(message.encode_to_vec())),
+        )
+    }
+
+    pub fn deserialize<'de, M: Message + Default, D: Deserializer<'de>>(
+        input: D,
+    ) -> Result<Vec<M>, D::Error> {
+        let texts = Vec::<String>::deserialize(input)?;
+        texts
+            .iter()
+            .map(|text| {
+                let bytes = STANDARD.decode(text).map_err(serde::de::Error::custom)?;
+                M::decode(bytes.as_slice()).map_err(serde::de::Error::custom)
+            })
+            .collect()
     }
 }
 
@@ -209,6 +239,83 @@ pub enum Act {
         #[serde(with = "pb")]
         instruction: TradingInstruction,
     },
+
+    // ── Booking (W11.26 to W11.37, contract v24) ──
+    /// A booking opened (W11.27, rows b1 and b2), its allocations whole, in
+    /// the order's account. `lines` is where its own movement lines are in
+    /// the entry -- the first and how many -- so a cancel or a replace
+    /// reverses those and no other.
+    BookingOpened {
+        #[serde(with = "pb")]
+        booking: Booking,
+        lines: (usize, usize),
+    },
+    /// Held with its reason (rows b4, b5), and a hand-off tried again while
+    /// held: the reason kept, the state unchanged.
+    BookingHeld { booking_id: String, reason: String },
+    /// Handed off to `operations` (row b3).
+    BookingHandedOff { booking_id: String },
+    /// A client's booking closed, its error-account allocations handed off
+    /// in the same act (row b3).
+    BookingClosed { booking_id: String },
+    /// Cancelled by the `oms` before the hand-off (row b6).
+    BookingCancelled { booking_id: String, reason: String },
+    /// Replaced by `operations` after the hand-off (row b7): a new version,
+    /// the state kept, its lines where `lines` says.
+    BookingReplaced {
+        booking_id: String,
+        #[serde(with = "pb_vec")]
+        allocations: Vec<Allocation>,
+        effective_date: String,
+        reason: String,
+        lines: (usize, usize),
+    },
+    /// Its executions moved by a fact after the hand-off or closing (row b9):
+    /// the state kept, heard so `operations` corrects it.
+    BookingMoved { booking_id: String, reason: String },
+    /// An allocation of another account's booking received here, a child
+    /// entry naming the booking (W11.30): its lines where `lines` says, and
+    /// the block's member order in this account it fills, where one.
+    AllocationReceived {
+        booking_id: String,
+        from_account: String,
+        #[serde(with = "pb")]
+        allocation: Allocation,
+        member_order_id: String,
+        lines: (usize, usize),
+    },
+    /// An allocation received here withdrawn by its booking's cancel or
+    /// replace: its lines reversed by this entry.
+    AllocationWithdrawn {
+        booking_id: String,
+        allocation_id: String,
+    },
+    /// A prime's answer to a give-up (W11.32, row b8), on the execution and,
+    /// where one is booked, the allocation.
+    GiveUpRecorded {
+        execution_id: String,
+        booking_id: String,
+        allocation_id: String,
+        #[serde(with = "pb")]
+        record: GiveUpRecord,
+    },
+    /// A cross between two sleeves of the account (W11.33).
+    SleeveCrossed {
+        #[serde(with = "pb")]
+        cross: SleeveCross,
+    },
+    /// An alert raised (W11.34): the book's own, or `compliance`'s.
+    AlertRaised {
+        #[serde(with = "pb")]
+        alert: Alert,
+    },
+    /// An alert acknowledged for a person, with a reason; a held booking's
+    /// is recorded and never clears it (ruled 2026-10-14).
+    AlertAcknowledged { alert_id: String, reason: String },
+    /// A held booking's alert cleared by the book.
+    AlertCleared { alert_id: String },
+    /// The escape hatch's setting (W11.36), in the control partition.
+    LocalRecordOrdersSet { allows: bool },
 }
 
 /// An order as the book holds it: its terms, and what its journal says.
@@ -302,6 +409,36 @@ pub struct LocateHeld {
     pub uses: Vec<LocateUse>,
 }
 
+/// A booking as the book holds it (W11.27 to W11.30): its terms as the
+/// latest version states them, and what its journal says.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct BookingHeld {
+    pub booking: Booking,
+    pub state: BookingState,
+    pub held_reason: String,
+    /// Where the current version's lines are: the entry, the first, how many.
+    pub lines: (String, usize, usize),
+    /// Each version's number; 1 when booked, one more for each replace.
+    pub version: u32,
+    /// The held-booking alert standing against it, where one is raised.
+    pub held_alert: String,
+    /// The entry it was booked or last replaced in, whose sequence a later
+    /// fact is compared with.
+    pub booked_at: u64,
+}
+
+/// An allocation of another account's booking this account received, a
+/// child entry (W11.30).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ReceivedHeld {
+    pub booking_id: String,
+    pub from_account: String,
+    pub allocation: Allocation,
+    pub member_order_id: String,
+    pub lines: (String, usize, usize),
+    pub withdrawn: bool,
+}
+
 /// The order path's records in one account's book.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Ledger {
@@ -321,6 +458,16 @@ pub struct Ledger {
     pub unplaced_executions: BTreeMap<String, String>,
     /// The entry each record last changed in, for an order's history.
     pub order_entries: BTreeMap<String, Vec<String>>,
+    /// Contract v24 (W11.27 to W11.35): the bookings of this account's
+    /// orders, the allocations of other accounts' bookings received here
+    /// (by booking and allocation), the sleeve crosses and the alerts.
+    pub bookings: BTreeMap<String, BookingHeld>,
+    pub received: BTreeMap<(String, String), ReceivedHeld>,
+    pub sleeve_crosses: BTreeMap<String, SleeveCross>,
+    pub alerts: BTreeMap<String, Alert>,
+    /// The escape hatch's setting, where the control partition states it
+    /// (W11.36): `None` before any entry has.
+    pub local_record_orders: Option<bool>,
 }
 
 /// The records an entry's acts change, each once, in the order they are
@@ -333,6 +480,11 @@ pub struct Touched {
     pub unplaced: Vec<String>,
     pub locates: Vec<String>,
     pub instructions: Vec<String>,
+    /// Contract v24.
+    pub bookings: Vec<String>,
+    pub alerts: Vec<String>,
+    /// The control partition's settings an entry states (W11.36).
+    pub settings: Vec<String>,
 }
 
 fn push_once(list: &mut Vec<String>, id: &str) {
@@ -513,6 +665,54 @@ impl Ledger {
                     locate_record_id, ..
                 } => push_once(&mut touched.locates, locate_record_id),
                 Act::Instructed { key, .. } => push_once(&mut touched.instructions, key),
+                Act::BookingOpened { booking, .. } => {
+                    push_once(&mut touched.bookings, &booking.booking_id)
+                }
+                Act::BookingHeld { booking_id, .. }
+                | Act::BookingHandedOff { booking_id }
+                | Act::BookingClosed { booking_id }
+                | Act::BookingCancelled { booking_id, .. }
+                | Act::BookingReplaced { booking_id, .. }
+                | Act::BookingMoved { booking_id, .. } => {
+                    push_once(&mut touched.bookings, booking_id)
+                }
+                // A child entry: the block's member order it fills.
+                Act::AllocationReceived {
+                    member_order_id, ..
+                } => push_once(&mut touched.orders, member_order_id),
+                Act::AllocationWithdrawn {
+                    booking_id,
+                    allocation_id,
+                } => {
+                    if let Some(held) = self
+                        .received
+                        .get(&(booking_id.clone(), allocation_id.clone()))
+                    {
+                        push_once(&mut touched.orders, &held.member_order_id);
+                    }
+                }
+                Act::GiveUpRecorded {
+                    execution_id,
+                    booking_id,
+                    ..
+                } => {
+                    push_once(&mut touched.executions, execution_id);
+                    push_once(&mut touched.bookings, booking_id);
+                }
+                Act::SleeveCrossed { cross } => {
+                    for order_id in &cross.order_ids {
+                        push_once(&mut touched.orders, order_id);
+                    }
+                }
+                Act::AlertRaised { alert } => push_once(&mut touched.alerts, &alert.alert_id),
+                Act::AlertAcknowledged { alert_id, .. } | Act::AlertCleared { alert_id } => {
+                    push_once(&mut touched.alerts, alert_id)
+                }
+                // The control partition's setting, chained of its own
+                // (W11.36).
+                Act::LocalRecordOrdersSet { .. } => {
+                    push_once(&mut touched.settings, "local-record-orders")
+                }
             }
         }
         // Each touched order's parents, up to the top.
@@ -829,6 +1029,158 @@ impl Ledger {
             Act::Instructed { key, instruction } => {
                 self.instructions.insert(key.clone(), instruction.clone());
             }
+            Act::BookingOpened { booking, lines } => {
+                self.bookings.insert(
+                    booking.booking_id.clone(),
+                    BookingHeld {
+                        booking: booking.clone(),
+                        state: BookingState::Booked,
+                        held_reason: String::new(),
+                        lines: (entry_id.to_string(), lines.0, lines.1),
+                        version: 1,
+                        held_alert: String::new(),
+                        booked_at: 0,
+                    },
+                );
+            }
+            Act::BookingHeld { booking_id, reason } => {
+                if let Some(held) = self.bookings.get_mut(booking_id) {
+                    if held.state == BookingState::Booked {
+                        held.state = BookingState::Held;
+                    }
+                    held.held_reason = reason.clone();
+                }
+            }
+            Act::BookingHandedOff { booking_id } => {
+                if let Some(held) = self.bookings.get_mut(booking_id) {
+                    held.state = BookingState::HandedOff;
+                    held.held_reason.clear();
+                }
+            }
+            Act::BookingClosed { booking_id } => {
+                if let Some(held) = self.bookings.get_mut(booking_id) {
+                    held.state = BookingState::Closed;
+                    held.held_reason.clear();
+                }
+            }
+            Act::BookingCancelled { booking_id, .. } => {
+                if let Some(held) = self.bookings.get_mut(booking_id) {
+                    held.state = BookingState::Cancelled;
+                    held.held_reason.clear();
+                }
+            }
+            Act::BookingReplaced {
+                booking_id,
+                allocations,
+                lines,
+                ..
+            } => {
+                if let Some(held) = self.bookings.get_mut(booking_id) {
+                    held.booking.allocations = allocations.clone();
+                    held.lines = (entry_id.to_string(), lines.0, lines.1);
+                    held.version += 1;
+                }
+            }
+            Act::BookingMoved { .. } => {}
+            Act::AllocationReceived {
+                booking_id,
+                from_account,
+                allocation,
+                member_order_id,
+                lines,
+            } => {
+                self.received.insert(
+                    (booking_id.clone(), allocation.allocation_id.clone()),
+                    ReceivedHeld {
+                        booking_id: booking_id.clone(),
+                        from_account: from_account.clone(),
+                        allocation: allocation.clone(),
+                        member_order_id: member_order_id.clone(),
+                        lines: (entry_id.to_string(), lines.0, lines.1),
+                        withdrawn: false,
+                    },
+                );
+            }
+            Act::AllocationWithdrawn {
+                booking_id,
+                allocation_id,
+            } => {
+                if let Some(held) = self
+                    .received
+                    .get_mut(&(booking_id.clone(), allocation_id.clone()))
+                {
+                    held.withdrawn = true;
+                }
+            }
+            Act::GiveUpRecorded {
+                execution_id,
+                booking_id,
+                allocation_id,
+                record,
+            } => {
+                if let Some(held) = self.executions.get_mut(execution_id) {
+                    held.execution.give_up_answers.push(record.clone());
+                }
+                if let Some(held) = self.bookings.get_mut(booking_id) {
+                    if let Some(allocation) = held
+                        .booking
+                        .allocations
+                        .iter_mut()
+                        .find(|allocation| &allocation.allocation_id == allocation_id)
+                    {
+                        allocation.give_up_answers.push(record.clone());
+                    }
+                }
+            }
+            Act::SleeveCrossed { cross } => {
+                self.sleeve_crosses
+                    .insert(cross.sleeve_cross_id.clone(), cross.clone());
+                for order_id in &cross.order_ids {
+                    if let Some(held) = self.orders.get_mut(order_id) {
+                        if !held.order.sleeve_cross_ids.contains(&cross.sleeve_cross_id) {
+                            held.order
+                                .sleeve_cross_ids
+                                .push(cross.sleeve_cross_id.clone());
+                        }
+                    }
+                }
+            }
+            Act::AlertRaised { alert } => {
+                self.alerts.insert(alert.alert_id.clone(), alert.clone());
+                if AlertKind::try_from(alert.kind) == Ok(AlertKind::BookingHeld) {
+                    if let Some(subject) = &alert.subject {
+                        if let Some(held) = self.bookings.get_mut(&subject.booking_id) {
+                            held.held_alert = alert.alert_id.clone();
+                        }
+                    }
+                }
+            }
+            Act::AlertAcknowledged { alert_id, reason } => {
+                if let Some(held) = self.alerts.get_mut(alert_id) {
+                    // A held booking's alert clears only by the book's own
+                    // act: an acknowledgement is recorded beside it, never
+                    // clearing it (ruled 2026-10-14).
+                    if AlertKind::try_from(held.kind) != Ok(AlertKind::BookingHeld)
+                        && held.state == AlertState::Raised as i32
+                    {
+                        held.state = AlertState::Acknowledged as i32;
+                        let _ = reason;
+                    }
+                }
+            }
+            Act::AlertCleared { alert_id } => {
+                if let Some(held) = self.alerts.get_mut(alert_id) {
+                    held.state = AlertState::Cleared as i32;
+                }
+                for booking in self.bookings.values_mut() {
+                    if &booking.held_alert == alert_id {
+                        booking.held_alert.clear();
+                    }
+                }
+            }
+            Act::LocalRecordOrdersSet { allows } => {
+                self.local_record_orders = Some(*allows);
+            }
         }
     }
 
@@ -1093,7 +1445,72 @@ impl Ledger {
             final_sum = numbers::add("final_filled", final_sum, f)?;
             awaiting = numbers::add("awaiting_acceptance", awaiting, a)?;
         }
+        // Contract v24: a block's member is filled by its allocations (step
+        // 5's Q22, W11.27), and an order a sleeve cross stands in for by the
+        // cross (W11.33), neither minting an execution.
+        let mut also = Exact::ZERO;
+        for received in self.received.values() {
+            if received.member_order_id == order_id && !received.withdrawn {
+                let quantity = numbers::required(
+                    "allocation.quantity",
+                    received.allocation.quantity.as_ref(),
+                )?;
+                also = numbers::add("allocated", also, quantity)?;
+            }
+        }
+        for cross in self.sleeve_crosses.values() {
+            if cross.order_ids.iter().any(|id| id == order_id) {
+                let quantity = numbers::required("sleeve_cross.quantity", cross.quantity.as_ref())?;
+                also = numbers::add("crossed", also, quantity)?;
+            }
+        }
+        reported_sum = numbers::add("reported_filled", reported_sum, also)?;
+        final_sum = numbers::add("final_filled", final_sum, also)?;
         Ok((reported_sum, final_sum, awaiting))
+    }
+
+    /// The quantity of an order's live bookings allocated to accounts marked
+    /// error accounts (W11.27): what an overfill booked there takes off its
+    /// does-not-tie-out (W11.14).
+    pub fn error_booked(&self, order_id: &str) -> Result<Exact> {
+        let mut total = Exact::ZERO;
+        for held in self.bookings.values() {
+            if held.booking.order_id != order_id || held.state == BookingState::Cancelled {
+                continue;
+            }
+            for allocation in &held.booking.allocations {
+                if allocation.error_cause != 0 {
+                    let quantity =
+                        numbers::required("allocation.quantity", allocation.quantity.as_ref())?;
+                    total = numbers::add("error booked", total, quantity)?;
+                }
+            }
+        }
+        Ok(total)
+    }
+
+    /// A booking whole, its state and held reason derived (W11.30).
+    pub fn booking_record(&self, booking_id: &str) -> Result<Booking> {
+        let held = self.bookings.get(booking_id).ok_or_else(|| {
+            StoreError::Invalid(format!("the book holds no booking {booking_id}"))
+        })?;
+        Ok(Booking {
+            state: held.state as i32,
+            held_reason: held.held_reason.clone(),
+            ..held.booking.clone()
+        })
+    }
+
+    /// Whether an execution is in a live booking -- any not cancelled.
+    pub fn booked_in(&self, execution_id: &str) -> Option<&BookingHeld> {
+        self.bookings.values().find(|held| {
+            held.state != BookingState::Cancelled
+                && held
+                    .booking
+                    .execution_ids
+                    .iter()
+                    .any(|id| id == execution_id)
+        })
     }
 
     /// A placement's reported filled, in its order's terms.
@@ -1305,6 +1722,9 @@ impl Ledger {
         }
         let ordered = self.ordered(held);
         let (filled, _, _) = self.filled(order_id)?;
+        // An overfill's excess booked to an error account clears it (W11.14,
+        // W11.27; contract v24).
+        let filled = sub("filled", filled, self.error_booked(order_id)?)?;
         if !ordered.is_zero()
             && filled > ordered
             && !conditions.contains_key(&(OrderCondition::DoesNotTieOut as i32))
@@ -1616,6 +2036,8 @@ pub fn order_changed(before: Option<&Order>, after: &Order) -> Vec<String> {
         link,
         origin,
         venue_order_id,
+        block_member_order_ids,
+        sleeve_cross_ids,
         status,
         checks,
         change_requests,

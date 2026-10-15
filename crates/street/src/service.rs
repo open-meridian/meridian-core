@@ -591,6 +591,7 @@ pub async fn sweep_replacements(
                 replaced_instrument_id: placeholder,
                 instrument: Some(instrument),
                 replaced_at_ns: now_ns,
+                ..Default::default()
             },
             &cause,
             None,
@@ -1070,6 +1071,7 @@ mod tests {
                     ..Default::default()
                 }),
                 replaced_at_ns: NOW,
+                ..Default::default()
             }
             .encode_to_vec(),
             Some("CORR-REPLACED"),

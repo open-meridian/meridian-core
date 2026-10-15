@@ -47,8 +47,9 @@
 //! offered or listed (W3.1).
 
 use meridian_domain::v1::{
-    AssetClass, MissReason, MissingInstrumentDetectedEvent, ResolveIdentifierReply,
-    ResolveIdentifierRequest, ResolveInstrumentReply, ResolveInstrumentRequest,
+    AssetClass, MissReason, MissingInstrumentDetectedEvent, ProvisionalReason,
+    ResolveIdentifierReply, ResolveIdentifierRequest, ResolveInstrumentReply,
+    ResolveInstrumentRequest,
 };
 
 use meridian_symbology::rank;
@@ -73,7 +74,8 @@ pub struct Resolution {
 }
 
 /// W3.1 — which record this identifier set meant, on that date; or, when
-/// nothing did, a record minted for it (W3.7).
+/// nothing did, a provisional record minted for it (W3.7), the platform not
+/// asked -- as a deployment that cannot reach it answers.
 ///
 /// `instance_id` is the plugin instance asking, the source of every
 /// identifier it joins and every value it offers. `now_ns` is when, passed in
@@ -84,32 +86,117 @@ pub fn resolve_identifier(
     instance_id: &str,
     now_ns: i64,
 ) -> Result<Resolution> {
-    resolve(store, request, instance_id, now_ns, false, None)
-}
-
-/// [`resolve_identifier`], with the master's record for a currency the
-/// deployment does not hold, where the store asked the platform for it
-/// (contract v20, W3.1): kept as the deployment's record and answered, found
-/// and not minted. `None` where the master was not asked or could not be
-/// reached: minted as before.
-pub fn resolve_identifier_pulled(
-    store: &dyn Store,
-    request: &ResolveIdentifierRequest,
-    instance_id: &str,
-    now_ns: i64,
-    pulled: Option<&meridian_domain::v1::InstrumentRecord>,
-) -> Result<Resolution> {
-    resolve(store, request, instance_id, now_ns, false, pulled)
+    match resolve_matched(store, request, instance_id, now_ns)? {
+        Matched::Answered(resolution) => Ok(*resolution),
+        Matched::Unmatched(asked) => {
+            let list = crate::one_id::licence(store);
+            let said = if crate::one_id::sendable(&asked, &list).is_empty() {
+                PlatformSaid::NotAsked
+            } else {
+                PlatformSaid::Unreachable
+            };
+            resolve_unmatched(store, request, asked, instance_id, now_ns, said)
+        }
+    }
 }
 
 /// The ISO 4217 code a resolve names a currency by, where it names one: the
-/// one miss the store asks the platform's master about itself (W3.1).
+/// miss the store asks the platform's master about by W3.3 before anything
+/// is matched or minted (W3.1, contract v20).
 pub fn currency_code(request: &ResolveIdentifierRequest) -> Option<String> {
     request
         .identifiers
         .iter()
         .find(|identifier| identifier.scheme == "iso4217" && !identifier.value.trim().is_empty())
         .map(|identifier| identifier.value.trim().to_uppercase())
+}
+
+/// What the platform said of a set nothing matched (contract v24, W3.4).
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlatformSaid {
+    /// Its `INS-` record: a match, a mint from its own source, or a
+    /// near-match minted and flagged for its staff.
+    Record(Box<meridian_domain::v1::InstrumentRecord>),
+    /// The request queued for its staff's review, nothing matched or minted.
+    Pending,
+    /// Not reached within the bounded ask.
+    Unreachable,
+    /// Not asked: nothing on the record is in a scheme the licence list
+    /// names (W3.25), the current stage's local record.
+    NotAsked,
+}
+
+/// A resolve's first half: a record matched, a miss, or nothing matched.
+#[derive(Debug, Clone)]
+pub enum Matched {
+    Answered(Box<Resolution>),
+    /// Nothing matched: the set, for the platform to be asked about (W3.4)
+    /// before [`resolve_unmatched`] keeps its answer or mints.
+    Unmatched(Vec<Asked>),
+}
+
+/// W3.1 up to the platform: a match joined, a miss listed, or nothing
+/// matched -- the store's lock need not be held across the platform's ask.
+pub fn resolve_matched(
+    store: &dyn Store,
+    request: &ResolveIdentifierRequest,
+    instance_id: &str,
+    now_ns: i64,
+) -> Result<Matched> {
+    resolve(store, request, instance_id, now_ns, false)
+}
+
+/// W3.1's second half, from contract v24 (the spec's requirements 15 to 17;
+/// W3.4, W3.7): the platform's `INS-` record kept from the start and
+/// answered; otherwise, the source stating the minimum, a provisional `LCL-`
+/// record minted naming its template, its reason said; below the minimum,
+/// not found and nothing minted.
+pub fn resolve_unmatched(
+    store: &dyn Store,
+    request: &ResolveIdentifierRequest,
+    asked: Vec<Asked>,
+    instance_id: &str,
+    now_ns: i64,
+    said: PlatformSaid,
+) -> Result<Resolution> {
+    let template = stated_template(store, request);
+    if let PlatformSaid::Record(master) = &said {
+        let (record, minted) = crate::one_id::keep_platform_record(
+            store,
+            &asked,
+            master,
+            template.as_ref().map(|(template, _)| template),
+            stated(request, instance_id, now_ns),
+            now_ns,
+        )?;
+        return Ok(Resolution {
+            reply: answered(&record, minted),
+            changed: Some(record),
+        });
+    }
+    if !crate::one_id::meets_minimum(request) {
+        return Ok(unchanged(missed(MissReason::NotFound)));
+    }
+    let reason = match said {
+        PlatformSaid::Pending => ProvisionalReason::AwaitingStaff,
+        PlatformSaid::Unreachable => ProvisionalReason::Unreachable,
+        _ => ProvisionalReason::Unspecified,
+    };
+    mint(store, request, asked, instance_id, now_ns, template, reason)
+}
+
+/// The template a resolve's statement names (requirement 16): its class's,
+/// its type's where the type is stated under that class.
+pub fn stated_template(
+    store: &dyn Store,
+    request: &ResolveIdentifierRequest,
+) -> Option<(meridian_domain::v1::SecurityTemplate, bool)> {
+    let class = AssetClass::try_from(request.stated_asset_class).unwrap_or(AssetClass::Unspecified);
+    let kind = meridian_domain::v1::InstrumentType::try_from(request.stated_instrument_type)
+        .ok()
+        .filter(|kind| meridian_domain::instrument_type::class_of(*kind) == Some(class))
+        .unwrap_or(meridian_domain::v1::InstrumentType::Unspecified);
+    crate::one_id::pick(&crate::one_id::catalogue(store), class, kind)
 }
 
 /// W3.1 asked read-only (contract v19, approved 2026-10-10): the record the
@@ -121,7 +208,10 @@ pub fn resolve_identifier_read_only(
     request: &ResolveIdentifierRequest,
     now_ns: i64,
 ) -> Result<Resolution> {
-    resolve(store, request, "", now_ns, true, None)
+    match resolve(store, request, "", now_ns, true)? {
+        Matched::Answered(resolution) => Ok(*resolution),
+        Matched::Unmatched(_) => Ok(unchanged(missed(MissReason::NotFound))),
+    }
 }
 
 fn resolve(
@@ -130,8 +220,7 @@ fn resolve(
     instance_id: &str,
     now_ns: i64,
     read_only: bool,
-    pulled: Option<&meridian_domain::v1::InstrumentRecord>,
-) -> Result<Resolution> {
+) -> Result<Matched> {
     let asked: Vec<Asked> = IdentifierSet::new(
         request
             .identifiers
@@ -142,7 +231,9 @@ fn resolve(
     .members()
     .to_vec();
     if asked.is_empty() {
-        return Ok(unchanged(missed(MissReason::NotFound)));
+        return Ok(Matched::Answered(Box::new(unchanged(missed(
+            MissReason::NotFound,
+        )))));
     }
 
     let mut tiers: Vec<usize> = asked.iter().map(rank_of).collect();
@@ -171,21 +262,27 @@ fn resolve(
             }
         }
 
-        match candidates.len() {
+        let answered = match candidates.len() {
             0 => continue,
-            1 if read_only => return Ok(unchanged(resolved(candidates.remove(0), false))),
-            _ if read_only => return Ok(unchanged(missed(MissReason::Ambiguous))),
-            1 => {
-                return joined(
-                    store,
-                    request,
-                    &asked,
-                    candidates.remove(0),
-                    meeting,
-                    instance_id,
-                    now_ns,
-                )
+            1 if read_only => {
+                let found = candidates.remove(0);
+                let provisional = store
+                    .by_id(&found)?
+                    .is_some_and(|record| record.local.provisional);
+                let mut reply = resolved(found, false);
+                reply.provisional = provisional;
+                unchanged(reply)
             }
+            _ if read_only => unchanged(missed(MissReason::Ambiguous)),
+            1 => joined(
+                store,
+                request,
+                &asked,
+                candidates.remove(0),
+                meeting,
+                instance_id,
+                now_ns,
+            )?,
             _ => {
                 // A resolve that met several records: flagged for the
                 // deployment's own person, never escalated (W3.4, W3.11).
@@ -197,134 +294,12 @@ fn resolve(
                     now_ns,
                     MissReason::Ambiguous,
                 )?;
-                return Ok(unchanged(missed(MissReason::Ambiguous)));
+                unchanged(missed(MissReason::Ambiguous))
             }
-        }
+        };
+        return Ok(Matched::Answered(Box::new(answered)));
     }
-
-    if read_only {
-        return Ok(unchanged(missed(MissReason::NotFound)));
-    }
-    if let Some(master) = pulled {
-        return keep_the_masters(store, asked, master, now_ns);
-    }
-    mint(store, request, asked, instance_id, now_ns)
-}
-
-/// A currency the master holds, kept as the deployment's record (contract
-/// v20, W3.1, W3.5): its identifiers, the asked ones and the master's open
-/// ones with its global ID, and its class, currency and description in
-/// force, each sourced to the platform's record -- curated reference data,
-/// with no person asked. Keyed by the asked set, so two racing resolves keep
-/// one record.
-fn keep_the_masters(
-    store: &dyn Store,
-    asked: Vec<Asked>,
-    master: &meridian_domain::v1::InstrumentRecord,
-    now_ns: i64,
-) -> Result<Resolution> {
-    use crate::record::{asked_from_wire, asset_class_name};
-    let words = format!(
-        "the platform, record {} version {}",
-        master.instrument_id, master.version
-    );
-    let set = IdentifierSet::new(asked.clone());
-    let mut identifiers: Vec<Asked> = asked.clone();
-    if master.instrument_id.starts_with("INS-") {
-        identifiers.push(Asked {
-            scheme: meridian_symbology::GLOBAL_ID.into(),
-            value: master.instrument_id.clone(),
-            source: String::new(),
-        });
-    }
-    for identifier in &master.identifiers {
-        let one = asked_from_wire(identifier);
-        if one.source.is_empty()
-            && identifier.valid_until_ns == 0
-            && meridian_symbology::OPEN.contains(&one.scheme.as_str())
-            && !identifiers.contains(&one)
-        {
-            identifiers.push(one);
-        }
-    }
-    let instrument_id = ids::local(now_ns);
-    let source = |field: Field, identifier: Option<Asked>| Source {
-        acting_through_delegation: String::new(),
-        client_name: String::new(),
-        prepared_call_id: String::new(),
-        field,
-        identifier,
-        source: words.clone(),
-        person: String::new(),
-        instance_id: String::new(),
-        recorded_at_ns: now_ns,
-        note: String::new(),
-    };
-    let class = asset_class_name(master.asset_class);
-    let mut sources: Vec<Source> = identifiers
-        .iter()
-        .map(|identifier| source(Field::Identifier, Some(identifier.clone())))
-        .collect();
-    for (field, value) in [
-        (Field::AssetClass, &class),
-        (Field::Currency, &master.currency),
-        (Field::Description, &master.description),
-    ] {
-        if !value.trim().is_empty() {
-            sources.push(source(field, None));
-        }
-    }
-    let candidate = Instrument {
-        instrument_id: instrument_id.clone(),
-        identifiers: identifiers
-            .iter()
-            .map(|identifier| window_for(store, identifier))
-            .collect::<Result<Vec<_>>>()?,
-        asset_class: class.clone(),
-        currency: master.currency.clone(),
-        exchange_mic: String::new(),
-        description: master.description.trim().to_string(),
-        lifecycle_state: "INSTRUMENT_LIFECYCLE_STATE_ACTIVE".into(),
-        version: 1,
-        valid_from_ns: 0,
-        record_time_ns: now_ns,
-        instrument_type: String::new(),
-        money_market_fund: String::new(),
-        binary_event_contract: String::new(),
-        listing_venue_id: String::new(),
-        sources,
-        offers: Vec::new(),
-    };
-    let first = Version {
-        acting_through_delegation: String::new(),
-        client_name: String::new(),
-        prepared_call_id: String::new(),
-        instrument_id: instrument_id.clone(),
-        version: 1,
-        operation: "platform".into(),
-        changes: identifiers
-            .iter()
-            .map(|identifier| identifier_change(identifier, &words))
-            .collect(),
-        person: String::new(),
-        instance_id: String::new(),
-        note: "a currency the deployment did not hold, pulled from the platform's master \
-               with no person asking (contract v20)"
-            .into(),
-        merged_instrument_id: String::new(),
-        record_time_ns: now_ns,
-    };
-    let (record, stood) = store.mint(candidate, &set.key(), first)?;
-    match stood {
-        Stood::Minted => Ok(Resolution {
-            reply: resolved(record.instrument_id.clone(), false),
-            changed: Some(record),
-        }),
-        Stood::AlreadyHeld => {
-            let became = current(store, &record.instrument_id)?;
-            Ok(unchanged(resolved(became, false)))
-        }
-    }
+    Ok(Matched::Unmatched(asked))
 }
 
 /// An identifier joining a record (contract v19, W3.5): its window opens
@@ -532,7 +507,7 @@ fn joined(
     }
     let offered = keep_offers(&mut record, stated(request, instance_id, now_ns));
     if joining.is_empty() && !offered {
-        return Ok(unchanged(resolved(found, false)));
+        return Ok(unchanged(answered(&record, false)));
     }
 
     record.version = expected + 1;
@@ -553,23 +528,26 @@ fn joined(
     };
     match store.write(record.clone(), expected, entry)? {
         Written::Stored => Ok(Resolution {
-            reply: resolved(found, false),
+            reply: answered(&record, false),
             changed: Some(record),
         }),
         // Somebody wrote it in between: the match stands, and the identifiers
         // join on the next report rather than over a version not read.
-        Written::Stale { .. } | Written::Missing => Ok(unchanged(resolved(found, false))),
+        Written::Stale { .. } | Written::Missing => Ok(unchanged(answered(&record, false))),
     }
 }
 
-/// W3.7 — nothing matched: mint a record for the set, or answer the one
-/// minted for it already.
+/// W3.7 — nothing matched and no `INS-` record answered: mint a provisional
+/// record for the set naming its template, or answer the one minted for it
+/// already.
 fn mint(
     store: &dyn Store,
     request: &ResolveIdentifierRequest,
     asked: Vec<Asked>,
     instance_id: &str,
     now_ns: i64,
+    template: Option<(meridian_domain::v1::SecurityTemplate, bool)>,
+    reason: ProvisionalReason,
 ) -> Result<Resolution> {
     let set = IdentifierSet::new(asked.clone());
     let instrument_id = ids::local(now_ns);
@@ -607,8 +585,19 @@ fn mint(
             })
             .collect(),
         offers: Vec::new(),
+        ..Default::default()
     };
     keep_offers(&mut candidate, stated(request, instance_id, now_ns));
+    let proposed = match &template {
+        Some((_, true)) => {
+            meridian_domain::v1::InstrumentType::try_from(request.stated_instrument_type)
+                .map(|kind| meridian_domain::instrument_type::name(kind).to_string())
+                .unwrap_or_default()
+        }
+        _ => String::new(),
+    };
+    candidate.local =
+        crate::one_id::provisional_state(&candidate, template.as_ref(), reason, &proposed, now_ns);
     let first = Version {
         acting_through_delegation: String::new(),
         client_name: String::new(),
@@ -644,12 +633,16 @@ fn mint(
     let (record, stood) = store.mint(candidate, &key, first)?;
     match stood {
         Stood::Minted => Ok(Resolution {
-            reply: resolved(record.instrument_id.clone(), true),
+            reply: answered(&record, true),
             changed: Some(record),
         }),
         Stood::AlreadyHeld => {
             let became = current(store, &record.instrument_id)?;
-            Ok(unchanged(resolved(became, false)))
+            let mut reply = resolved(became.clone(), false);
+            reply.provisional = store
+                .by_id(&became)?
+                .is_some_and(|held| held.local.provisional);
+            Ok(unchanged(reply))
         }
     }
 }
@@ -781,7 +774,11 @@ fn qualifies(record: &Instrument, identifier: &Asked, request: &ResolveIdentifie
 /// `stated_currency` is kept with the offer, encoded as it arrived, and the
 /// offer's words say how it came -- supplied by the person, derived by the
 /// rule -- never presenting it as the source's.
-fn stated(request: &ResolveIdentifierRequest, instance_id: &str, now_ns: i64) -> Vec<Offer> {
+pub(crate) fn stated(
+    request: &ResolveIdentifierRequest,
+    instance_id: &str,
+    now_ns: i64,
+) -> Vec<Offer> {
     let words = format!("stated by {instance_id}");
     let offer = |field: Field, value: String| Offer {
         field,
@@ -950,12 +947,20 @@ fn unchanged(reply: ResolveIdentifierReply) -> Resolution {
     }
 }
 
+/// The answer for a record held: provisional where it is (contract v24).
+fn answered(record: &Instrument, minted: bool) -> ResolveIdentifierReply {
+    let mut reply = resolved(record.instrument_id.clone(), minted);
+    reply.provisional = record.local.provisional;
+    reply
+}
+
 fn resolved(instrument_id: String, minted: bool) -> ResolveIdentifierReply {
     ResolveIdentifierReply {
         found: true,
         instrument_id,
         miss_reason: MissReason::Unspecified as i32,
         minted,
+        provisional: false,
     }
 }
 
@@ -965,6 +970,7 @@ fn missed(reason: MissReason) -> ResolveIdentifierReply {
         instrument_id: String::new(),
         miss_reason: reason as i32,
         minted: false,
+        provisional: false,
     }
 }
 
@@ -1002,6 +1008,8 @@ mod tests {
             as_of_ns: AS_OF,
             exchange_mic: "XNAS".into(),
             currency: "USD".into(),
+            // The minimum a record needs (contract v24, W3.7).
+            stated_description: "a security reported".into(),
             ..Default::default()
         }
     }
@@ -1038,6 +1046,7 @@ mod tests {
             listing_venue_id: String::new(),
             sources: Vec::new(),
             offers: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -1296,7 +1305,10 @@ mod tests {
             .unwrap()
             .changed
             .unwrap();
-        assert!(minted.offers.is_empty());
+        assert!(minted
+            .offers
+            .iter()
+            .all(|offer| offer.field != Field::Currency));
     }
 
     fn currency_provenance(
@@ -1447,7 +1459,15 @@ mod tests {
         let record = reply.instrument.unwrap();
         assert_eq!(record.version, 1);
         assert_eq!(record.sources.len(), 1);
-        assert_eq!(record.offers.len(), 2, "ISO 4217 offers cash in USD");
+        assert_eq!(
+            record
+                .offers
+                .iter()
+                .filter(|offer| offer.instance_id.is_empty())
+                .count(),
+            2,
+            "ISO 4217 offers cash in USD"
+        );
 
         hold(&store, platform_record("LCL-KEPT", vec![]));
         store
@@ -1515,6 +1535,8 @@ mod tests {
             as_of_ns: 1,
             stated_asset_class: AssetClass::Fund as i32,
             stated_instrument_type: meridian_domain::v1::InstrumentType::MoneyMarketFund as i32,
+            stated_description: "a sweep fund".into(),
+            currency: "USD".into(),
             ..Default::default()
         };
         let minted = resolve_identifier(&store, &stating, "custody-snaptrade-1", 1)
@@ -1557,7 +1579,10 @@ mod tests {
         assert!(found.changed.is_none());
         let held = store.by_id(&eur).unwrap().unwrap();
         assert_eq!(held.identifiers.len(), 1, "nothing joined");
-        assert!(held.offers.is_empty() || held.offers.iter().all(|o| o.source == "ISO 4217"));
+        assert!(
+            held.offers.iter().all(|o| o.value != "Euro"),
+            "nothing offered from a read-only statement"
+        );
 
         let none = resolve_identifier_read_only(
             &store,

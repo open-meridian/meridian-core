@@ -155,6 +155,8 @@ pub fn announce(say: &dyn Fn(&str, &str, Vec<u8>), decided: &Decided) {
             .encode_to_vec(),
         );
     }
+    // Contract v24: each booking and alert changed (W11.30, W11.35).
+    crate::booking_service::announce(say, decided);
     for instruction in &changes.instructions {
         say(
             TRADING_INSTRUCTION_CHANGED,
@@ -302,6 +304,8 @@ fn record_named(record: Record) -> &'static str {
         Record::ChangeRequest => "change request",
         Record::Locate => "locate",
         Record::Execution => "execution",
+        Record::Booking => "booking",
+        Record::Alert => "alert",
     }
 }
 
@@ -443,6 +447,15 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
             ctx.reference_versions = found.versions;
             ctx.records = found.records;
             ctx.reference_unavailable = found.unavailable;
+            // Contract v24: the escape hatch's setting (W11.36), and a
+            // block's members read from their own accounts (W11.1).
+            ctx.local_record_orders = crate::booking_service::local_record_orders(store.as_ref());
+            if !request.block_member_order_ids.is_empty() {
+                ctx.members = crate::booking_service::member_views(
+                    store.as_ref(),
+                    &request.block_member_order_ids,
+                );
+            }
             if request.account_id.is_empty() {
                 return Err(StoreError::Malformed {
                     fields: vec!["account_id".into()],
@@ -1110,7 +1123,7 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
         bus.serve(ACCEPT_EXECUTION, move |envelope| {
             let request: AcceptExecutionRequest =
                 decode(&envelope, "meridian.v1.AcceptExecutionRequest")?;
-            let ctx = context_of(&envelope, clock.as_ref());
+            let mut ctx = context_of(&envelope, clock.as_ref());
             let account = owner_of(
                 store.as_ref(),
                 Record::Execution,
@@ -1136,6 +1149,22 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
                 })
                 .collect();
             let elsewhere = |id: &str| owners.get(id).cloned();
+            // Contract v24 (row e3): the fills' instrument's record, read for
+            // whether it is a local record, and the escape hatch's setting.
+            let instrument = execution_instrument(
+                store.as_ref(),
+                &account,
+                request
+                    .execution_ids
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or_default(),
+            );
+            if let Some(instrument) = instrument {
+                let found = references(&bus2, &[instrument], ctx.received_at_ns);
+                ctx.records = found.records;
+            }
+            ctx.local_record_orders = crate::booking_service::local_record_orders(store.as_ref());
             act(
                 &bus2,
                 store.as_ref(),
@@ -1318,6 +1347,19 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
             .encode_to_vec(),
         ))
     });
+}
+
+/// The instrument an execution is of, read from its account's journal
+/// before the lock (contract v24, row e3).
+fn execution_instrument(store: &dyn Store, account: &str, execution_id: &str) -> Option<String> {
+    let entries = store.journal(account).ok()?;
+    let book =
+        crate::book::Book::replay(account, crate::store::first_partition_of(account), &entries)
+            .ok()?;
+    book.ledger
+        .executions
+        .get(execution_id)
+        .map(|held| held.execution.instrument_id.clone())
 }
 
 /// The book's own expiry (W11.13, row i4): every order whose time in force

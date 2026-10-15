@@ -45,9 +45,12 @@ stop cancels each placement it is working at once, reporting each cancel as a
 fact naming the stop's entry (W11.9; v21's Q17), then the venue's
 confirmation. It serves:
 
-  /resolve?symbol=S[&figi=F]      resolves its symbol, with the FIGI beside it
-                                  where given (W3.1), minting the deployment's
-                                  record, answering its ID;
+  /resolve?symbol=S[&figi=F][&cusip=C][&description=D][&thin=1]
+                                  resolves its symbol, with the FIGI and a
+                                  CUSIP beside it where given (W3.1), stating
+                                  a description and USD unless thin (from
+                                  v24 the minimum a record needs), answering
+                                  its ID and whether it is provisional;
   /settle?instrument=&trade=      asks the date read for the instrument's
                                   settlement date from a trade date (W3.20),
                                   answering the date, outcome and rule;
@@ -406,6 +409,42 @@ class Desk(Plugin):
                                    parent_order_id=one(query, "parent")),
                 acting_for=caller))
             return order_json(done.order)
+        if path == "/block":
+            # Contract v24 (W11.1): a block order in the allocation account,
+            # its members the funds' released orders, released on creation.
+            done = await self.call("ProposeOrder", ops.ProposeOrderParams(
+                account_id=one(query, "account"), instrument_id=one(query, "instrument"),
+                side=ops.Side.SIDE_BUY, order_type=ops.OrderType.ORDER_TYPE_LIMIT,
+                limit_price=usd("230.00"), time_in_force=ops.TimeInForce.TIME_IN_FORCE_DAY,
+                block_member_order_ids=split(one(query, "members")), acting_for=caller))
+            return order_json(done.order)
+        if path == "/book":
+            # Contract v24 (W11.27): an order's executions booked to their
+            # accounts, each allocation ACCOUNT:QUANTITY:GROSS[:error], and
+            # handed off where asked.
+            allocations = []
+            for said in split(one(query, "alloc")):
+                account, quantity, gross, *error = said.split(":")
+                allocation = ops.Allocation(account_id=account, quantity=decimal(quantity),
+                                            average_price=usd(one(query, "price", PRICE)),
+                                            gross_amount=usd(gross))
+                if error:
+                    allocation.error_cause = ops.ErrorCause.ERROR_CAUSE_OVERFILL
+                    allocation.reason = "the venue filled more than ordered"
+                allocations.append(allocation)
+            done = await self.call("BookOrder", ops.BookOrderParams(
+                order_id=order, execution_ids=split(one(query, "executions")),
+                allocations=allocations, hand_off=bool(one(query, "handoff")), acting_for=caller))
+            return booking_json(done.booking)
+        if path == "/handoff":
+            done = await self.call("HandOffBooking", ops.HandOffBookingParams(
+                booking_id=one(query, "booking"), acting_for=caller))
+            return booking_json(done.booking)
+        if path == "/executions":
+            listed = await self.call("ListOrders", ops.ListOrdersParams(
+                account_id=one(query, "account"), page_size=500))
+            return {"executions": [fill_json(e) for e in listed.executions
+                                   if not order or e.order_id == order]}
         if path == "/map":
             await self.call("MapVenueAccount", ops.MapVenueAccountParams(
                 connectivity_instance_id=one(query, "connectivity"),
@@ -601,6 +640,10 @@ class Venue(Plugin):
                 first = (quantity * Decimal("0.4")).quantize(Decimal(1))
                 await self.fill(placement, first, first)
                 await self.fill(placement, quantity - first, quantity)
+                if placement.venue_account_code.endswith("-OVER"):
+                    # Contract v24's run: a venue that fills two more than
+                    # placed, the excess for the error account (W11.27).
+                    await self.fill(placement, Decimal(2), quantity + 2)
                 held["done"] = "filled"
             else:
                 held["done"] = "working"
@@ -640,9 +683,21 @@ class Venue(Plugin):
                 identifiers = [ops.Identifier(scheme="iso4217", value=one(query, "iso4217"))]
             if one(query, "figi"):
                 identifiers.append(ops.Identifier(scheme="figi", value=one(query, "figi")))
-            found = await self.call("ResolveIdentifier",
-                                    ops.ResolveIdentifierParams(identifiers=identifiers))
-            return {"instrument_id": found.instrument_id}
+            if one(query, "cusip"):
+                # A licensed scheme (contract v24, W3.25): kept in the
+                # deployment, never sent to the platform.
+                identifiers.append(ops.Identifier(scheme="cusip", value=one(query, "cusip")))
+            # What the venue states of it: from contract v24 a record needs an
+            # identifier, a description and a currency (W3.7), and a source
+            # thinner than that is not found, nothing minted.
+            thin = bool(one(query, "thin"))
+            found = await self.call("ResolveIdentifier", ops.ResolveIdentifierParams(
+                identifiers=identifiers,
+                stated_description="" if thin else one(
+                    query, "description", f"{one(query, 'symbol')} on the simulated venue"),
+                stated_currency="" if thin or one(query, "iso4217") else one(query, "currency", "USD")))
+            return {"instrument_id": found.instrument_id, "found": found.found,
+                    "minted": found.minted, "provisional": getattr(found, "provisional", False)}
         if path == "/settle":
             answered = await self.call("ComputeDate", ops.ComputeDateParams(
                 settlement=ops.SettlementDateInputs(instrument_id=one(query, "instrument"),
@@ -768,6 +823,38 @@ def serve(served):
     http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
 
 
+def booking_json(booking):
+    return {"booking_id": booking.booking_id, "order_id": booking.order_id,
+            "state": ops.BookingState.Name(booking.state),
+            "allocations": [{"account_id": a.account_id, "quantity": number(a.quantity),
+                             "error_cause": ops.ErrorCause.Name(a.error_cause)}
+                            for a in booking.allocations]}
+
+
+class Ops(Plugin):
+    """Contract v24: `operations`' correction by replace after the hand-off
+    (W11.29), each allocation ACCOUNT:QUANTITY:GROSS; and the bookings read
+    (W11.31)."""
+
+    async def answer(self, path, query, caller):
+        if path == "/correct":
+            allocations = [ops.Allocation(account_id=a, quantity=decimal(q),
+                                          average_price=usd(one(query, "price", PRICE)),
+                                          gross_amount=usd(g))
+                           for a, q, g in (said.split(":") for said in split(one(query, "alloc")))]
+            done = await self.call("CorrectBooking", ops.CorrectBookingParams(
+                booking_id=one(query, "booking"),
+                kind=ops.BookingCorrectionKind.BOOKING_CORRECTION_KIND_REPLACE,
+                allocations=allocations, effective_date=one(query, "effective"),
+                reason=one(query, "reason", "the allocation was corrected"), acting_for=caller))
+            return booking_json(done.booking)
+        if path == "/bookings":
+            listed = await self.call("ListBookings", ops.ListBookingsParams(
+                account_id=one(query, "account"), page_size=500))
+            return {"bookings": [booking_json(b) for b in listed.bookings]}
+        raise Refusal({"words": f"no page {path}"})
+
+
 class DeskInterface(Interface):
     """The desk's interface, with the ems's tools beside its pages (W6.20,
     contract v12): under parity, each act of the Unmatched fills page and its
@@ -818,6 +905,7 @@ async def main():
         "desk": ("Desk stand-in", Desk, ["write", "admin"]),
         "comp": ("Compliance stand-in", Comp, ["write", "admin"]),
         "venue": ("Simulated venue", Venue, ["write", "admin"]),
+        "ops": ("Operations stand-in", Ops, ["write", "admin"]),
     }[KIND]
     roles = {"desk": ["oms", "ems"]}.get(KIND, [])
     pages = [Page("/", title, levels=levels, roles=roles)]

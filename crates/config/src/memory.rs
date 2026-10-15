@@ -32,6 +32,9 @@ pub struct MemoryStore {
     /// Each hold's and each archive's change, its own record, in order, with
     /// its note (W6.25, W8.7; the note from contract v17).
     holds: Mutex<Vec<(Hold, String)>>,
+    /// Contract v24 (W3.28): the usage setting's changes, and the reports.
+    reports_usage: Mutex<Vec<(bool, Author, i64)>>,
+    usage_reports: Mutex<Vec<meridian_domain::v1::SentUsageReport>>,
     archives: Mutex<Vec<(PluginArchive, String)>>,
     /// Each launch's and stop's note, in order (contract v17).
     launch_notes: Mutex<Vec<LaunchNote>>,
@@ -67,6 +70,8 @@ impl MemoryStore {
             changes: Mutex::new(Vec::new()),
             access_changes: Mutex::new(Vec::new()),
             holds: Mutex::new(Vec::new()),
+            reports_usage: Mutex::new(Vec::new()),
+            usage_reports: Mutex::new(Vec::new()),
             archives: Mutex::new(Vec::new()),
             launch_notes: Mutex::new(Vec::new()),
             moves: Mutex::new(Vec::new()),
@@ -780,6 +785,47 @@ impl Store for MemoryStore {
         ))
     }
 
+    fn close_account_withdrawing_grants(
+        &self,
+        account: &AccountRecord,
+        author: &Author,
+        at_ns: i64,
+    ) -> Result<Vec<String>> {
+        let mut state = self.state.lock().expect("store lock poisoned");
+        let mut changes = self.linkable_changes.lock().expect("store lock poisoned");
+        let mut withdrawn_from = Vec::new();
+        for (instance, held) in state.linkable.iter_mut() {
+            let Some(at) = held
+                .account_ids
+                .iter()
+                .position(|a| *a == account.account_id)
+            else {
+                continue;
+            };
+            held.account_ids.remove(at);
+            held.updated_by = author.by.clone();
+            held.updated_at_ns = at_ns;
+            held.acting_through_delegation = author.delegation.clone();
+            held.client_name = author.client.clone();
+            changes.push(LinkableAccountsChange {
+                plugin_instance_id: instance.clone(),
+                granted: Vec::new(),
+                withdrawn: vec![account.account_id.clone()],
+                by: author.by.clone(),
+                delegation: author.delegation.clone(),
+                client: author.client.clone(),
+                at_ns,
+                note: author.note.clone(),
+            });
+            withdrawn_from.push(instance.clone());
+        }
+        withdrawn_from.sort();
+        upsert(&mut state.records.accounts, account, |a| {
+            a.account_id == account.account_id
+        });
+        Ok(withdrawn_from)
+    }
+
     fn set_linkable_accounts(
         &self,
         plugin_instance_id: &str,
@@ -992,5 +1038,42 @@ impl Store for MemoryStore {
                 held.connectivity_instance_id == instance_id && held.venue_account_code == code
             })
             .map(|(_, held)| held.clone()))
+    }
+
+    fn set_reports_usage(&self, reports_usage: bool, author: &Author, at_ns: i64) -> Result<()> {
+        self.reports_usage
+            .lock()
+            .expect("store lock poisoned")
+            .push((reports_usage, author.clone(), at_ns));
+        Ok(())
+    }
+
+    fn reports_usage(&self) -> Result<bool> {
+        Ok(self
+            .reports_usage
+            .lock()
+            .expect("store lock poisoned")
+            .last()
+            .is_none_or(|(on, _, _)| *on))
+    }
+
+    fn record_usage_report(&self, report: &meridian_domain::v1::SentUsageReport) -> Result<()> {
+        self.usage_reports
+            .lock()
+            .expect("store lock poisoned")
+            .push(report.clone());
+        Ok(())
+    }
+
+    fn usage_reports(&self, limit: usize) -> Result<Vec<meridian_domain::v1::SentUsageReport>> {
+        Ok(self
+            .usage_reports
+            .lock()
+            .expect("store lock poisoned")
+            .iter()
+            .rev()
+            .take(limit)
+            .cloned()
+            .collect())
     }
 }

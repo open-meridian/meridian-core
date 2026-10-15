@@ -93,13 +93,21 @@ pub fn list_to_complete(
             )
         });
         found
+    } else if request.provisional {
+        // Contract v24 (W3.11): the provisional records, complete or not.
+        live.iter()
+            .filter(|record| record.local.provisional)
+            .collect()
     } else if request.instrument_id.is_empty() {
         live.iter()
             .filter(|record| request.include_complete || !complete(record))
             .collect()
     } else {
+        // A replaced record answers the one it became (W3.6, W3.8): a
+        // resolved LCL- ID reads its INS- record, the link on it.
+        let became = current(store, &request.instrument_id)?;
         live.iter()
-            .filter(|record| record.instrument_id == request.instrument_id)
+            .filter(|record| record.instrument_id == became)
             .collect()
     };
     if search.is_empty() {
@@ -129,6 +137,23 @@ pub fn list_to_complete(
                 .collect(),
             complete_for_book: complete_for_book(record),
             complete: complete(record),
+            provisional_reason: if record.local.provisional {
+                record.local.reason
+            } else {
+                0
+            },
+            // The migration's line (W3.26): its section, and the record the
+            // platform answered it with, while the line is still to make.
+            migration_section: if record.local.provisional {
+                crate::reask::section_to_wire(&record.local.migration) as i32
+            } else {
+                0
+            },
+            answered_instrument_id: if record.local.provisional {
+                record.local.migration_answer.clone()
+            } else {
+                String::new()
+            },
         })
         .collect();
     let next_cursor = if start + page.len() < chosen.len() {
@@ -172,6 +197,8 @@ pub fn list_to_complete(
         incomplete_for_book,
         incomplete,
         licensed_identifiers,
+        migration_counts: crate::reask::migration_counts(store, &live)?,
+        backfill_counts: crate::reask::backfill_counts(store, &live),
     })
 }
 
@@ -259,6 +286,9 @@ mod tests {
                     ..Default::default()
                 }],
                 as_of_ns: NOW,
+                // The minimum a record needs (contract v24, W3.7).
+                stated_description: "a security reported".into(),
+                currency: "USD".into(),
                 ..Default::default()
             },
             "custody-1",

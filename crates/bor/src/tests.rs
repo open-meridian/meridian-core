@@ -121,11 +121,23 @@ fn opening() -> RecordOpeningBalanceRequest {
                     }),
                 }],
             },
+            // From contract v24 a currency carries lots unless it is the
+            // account's base (W9.1, option (c)); this account has none set,
+            // so its dollars carry theirs.
             OpeningPosition {
                 instrument_id: USD.into(),
                 side: HoldingSide::Long as i32,
                 trade_date_quantity: d("1000.00"),
                 settled_quantity: d("1000.00"),
+                lots: vec![OpeningLot {
+                    quantity: d("1000.00"),
+                    terms: Some(LotTerms {
+                        cost: usd("1000.00"),
+                        acquired_date: "2026-09-01".into(),
+                        source: LotSource::OpeningBalance as i32,
+                        ..Default::default()
+                    }),
+                }],
                 ..Default::default()
             },
         ],
@@ -133,6 +145,27 @@ fn opening() -> RecordOpeningBalanceRequest {
         replaces_entry_id: String::new(),
         idempotency_key: "opening-balance:ACC-1:STMT-1".into(),
     }
+}
+
+/// The account's base currency, USD, set first: from contract v24 the base
+/// currency alone carries no lots (W9.1, option (c)), and an account with
+/// none set has every currency carry them.
+async fn base_usd(bus: &Bus) {
+    send(
+        bus,
+        SET_ACCOUNT_ATTRIBUTE,
+        "meridian.v1.SetAccountAttributeRequest",
+        &SetAccountAttributeRequest {
+            account_id: ACC.into(),
+            attribute: Some(set_account_attribute_request::Attribute::BaseCurrencyCode(
+                "USD".into(),
+            )),
+            reason: "the account's functional currency".into(),
+        },
+        Some(PERSON),
+    )
+    .await
+    .unwrap();
 }
 
 async fn open(bus: &Bus) -> BookEntryReply {
@@ -293,7 +326,13 @@ async fn an_opening_balance_opens_every_position_and_lot_from_zero() {
 
     let usd = position(&reply, USD);
     assert_eq!(usd.last_change, journal("P0", 2, 1));
-    assert!(usd.lots.is_empty(), "cash has no lots");
+    // From contract v24 a currency other than the account's base carries its
+    // lots (W9.1, option (c)); with no base set, every currency does.
+    assert_eq!(
+        usd.lots.len(),
+        1,
+        "a currency not the base carries its lots"
+    );
 
     let held = reply.attributes.as_ref().unwrap();
     let standing = held.opening_balance.as_ref().unwrap();
@@ -512,14 +551,19 @@ async fn a_lot_without_its_cost_or_date_and_a_pending_without_its_date_are_refus
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_complete_opening_balance_is_recorded_and_cash_needs_no_lots() {
+async fn a_complete_opening_balance_is_recorded_and_the_base_currency_needs_no_lots() {
+    // Contract v24 (W9.1, option (c); question 38): the account's base
+    // currency alone is a balance with no lots.
     let (bus, _) = wired_with_records();
+    base_usd(&bus).await;
+    let mut request = opening();
+    request.positions[1].lots.clear();
     let reply = BookEntryReply::decode(
         &send(
             &bus,
             RECORD_OPENING_BALANCE,
             "meridian.v1.RecordOpeningBalanceRequest",
-            &opening(),
+            &request,
             Some(PERSON),
         )
         .await
@@ -530,6 +574,18 @@ async fn a_complete_opening_balance_is_recorded_and_cash_needs_no_lots() {
     assert!(usd.lots.is_empty());
     assert_eq!(read(&usd.settled_quantity), "1000.00");
     assert_eq!(read(&usd.not_stated_quantity), "0");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_currency_not_the_base_is_refused_without_its_lots() {
+    // Contract v24 (W9.1, option (c)): with no base set, or another, a
+    // currency's position is named missing its lots.
+    let (bus, _) = wired_with_records();
+    let mut request = opening();
+    request.positions[1].lots.clear();
+    let refused = opening_refused(&bus, &request).await;
+    assert_eq!(code(&refused), Some(RefusalReason::Incomplete), "{refused}");
+    assert_eq!(fields(&refused), vec!["positions[1].lots".to_string()]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1545,6 +1601,7 @@ async fn a_merged_record_is_followed_its_lots_keeping_their_identifiers() {
                 ..Default::default()
             }),
             replaced_at_ns: 1,
+            ..Default::default()
         }
         .encode_to_vec(),
         Some("CORR-REPLACED"),
@@ -1783,4 +1840,162 @@ async fn a_lots_cost_is_answered_naming_its_cash_instrument() {
     let kept = store.cash_instruments().unwrap();
     assert_eq!(kept.len(), 1);
     assert_eq!(kept[0].instrument_id, USD);
+}
+
+/// A street-only difference stating one of the custodian's identifiers, by
+/// the street row's field (`unresolved_identifiers[n].scheme` / `.value`).
+fn stated(position: usize, part: &str, text: &str) -> BreakDifference {
+    BreakDifference {
+        field: format!("unresolved_identifiers[{position}].{part}"),
+        book: None,
+        street: Some(BreakValue {
+            value: Some(break_value::Value::Text(text.into())),
+        }),
+    }
+}
+
+/// An unrecognized security's break as a reconciliation sends it: no
+/// subject, the statement it was seen in, and the identifiers stated.
+fn unrecognized_break(
+    statement: &str,
+    date: &str,
+    identifiers: &[(&str, &str)],
+) -> RecordBreakRequest {
+    RecordBreakRequest {
+        account_id: ACC.into(),
+        subject: None,
+        category: BreakCategory::UnrecognizedSecurity as i32,
+        differences: identifiers
+            .iter()
+            .enumerate()
+            .flat_map(|(n, (scheme, value))| {
+                [stated(n, "scheme", scheme), stated(n, "value", value)]
+            })
+            .collect(),
+        street: Some(StreetRecordRef {
+            statement_id: statement.into(),
+            as_of_date: date.into(),
+            ..Default::default()
+        }),
+        business_date: date.into(),
+        ..Default::default()
+    }
+}
+
+/// Contract v24 (W9.3, W9.4): an unrecognized security's break names no
+/// position and no figure, only the street record by value with the
+/// identifiers it carries; every other category still names its subject.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unrecognized_security_is_a_break_naming_only_the_street_record() {
+    let (bus, _store) = wired();
+    open(&bus).await;
+    let thin = unrecognized_break("ST-THIN-1", "2026-09-09", &[("custodian", "ZZQ9")]);
+    let first = record_break(&bus, &thin).await.unwrap();
+    let [record] = first.breaks.as_slice() else {
+        panic!("one break")
+    };
+    assert!(
+        record.subject.is_none(),
+        "names no instrument and no figure"
+    );
+    assert_eq!(record.category, BreakCategory::UnrecognizedSecurity as i32);
+    // Without the street record: refused naming it.
+    let mut blind = thin.clone();
+    blind.street = None;
+    let refused = record_break(&bus, &blind).await.unwrap_err();
+    assert!(refused.contains("street"), "{refused}");
+    // With no identifier stated, only its description, or half of one:
+    // refused.
+    let mut bare = thin.clone();
+    bare.differences = vec![BreakDifference {
+        field: "description".into(),
+        book: None,
+        street: Some(BreakValue {
+            value: Some(break_value::Value::Text("ZZQ9 HOLDINGS".into())),
+        }),
+    }];
+    let refused = record_break(&bus, &bare).await.unwrap_err();
+    assert!(refused.contains("differences"), "{refused}");
+    let mut half = thin.clone();
+    half.differences.truncate(1);
+    let refused = record_break(&bus, &half).await.unwrap_err();
+    assert!(refused.contains("unresolved_identifiers[0]"), "{refused}");
+    // With a position named: refused naming `subject`.
+    let mut named = thin.clone();
+    named.subject = aapl_break().subject;
+    let refused = record_break(&bus, &named).await.unwrap_err();
+    assert!(refused.contains("subject"), "{refused}");
+    // Any other category still names its position or figure.
+    let mut other = aapl_break();
+    other.subject = None;
+    let refused = record_break(&bus, &other).await.unwrap_err();
+    assert!(
+        refused.contains("a break names a position or a figure"),
+        "{refused}"
+    );
+}
+
+/// The product owner, 2026-10-15: one unknown security keeps one break that
+/// ages across statements until resolved, matched on category, account and
+/// the identifiers the custodian states (scheme and value, in any order),
+/// never the statement; updating by break_id stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_same_unknown_security_on_a_later_statement_updates_the_same_break() {
+    let (bus, _store) = wired();
+    open(&bus).await;
+    let first = unrecognized_break(
+        "ST-THIN-1",
+        "2026-09-09",
+        &[("custodian", "ZZQ9"), ("cusip-like", "99999Z999")],
+    );
+    let id = record_break(&bus, &first).await.unwrap().breaks[0]
+        .break_id
+        .clone();
+    // A later statement, its identifiers stated in the other order.
+    let later = unrecognized_break(
+        "ST-THIN-2",
+        "2026-09-10",
+        &[("cusip-like", "99999Z999"), ("custodian", "ZZQ9")],
+    );
+    let updated = record_break(&bus, &later).await.unwrap();
+    assert_eq!(updated.breaks[0].break_id, id, "the same break, aged");
+    assert_eq!(updated.breaks[0].last_seen_date, "2026-09-10");
+    assert_eq!(updated.breaks[0].first_seen_date, "2026-09-09");
+    // By its break_id as well.
+    let mut by_id = unrecognized_break(
+        "ST-THIN-3",
+        "2026-09-11",
+        &[("custodian", "ZZQ9"), ("cusip-like", "99999Z999")],
+    );
+    by_id.break_id = id.clone();
+    let updated = record_break(&bus, &by_id).await.unwrap();
+    assert_eq!(updated.breaks[0].break_id, id);
+    assert_eq!(updated.breaks[0].last_seen_date, "2026-09-11");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn different_identifiers_open_a_new_unrecognized_security_break() {
+    let (bus, _store) = wired();
+    open(&bus).await;
+    let first = unrecognized_break("ST-THIN-1", "2026-09-09", &[("custodian", "ZZQ9")]);
+    let id = record_break(&bus, &first).await.unwrap().breaks[0]
+        .break_id
+        .clone();
+    // Another value under the same scheme, on the same statement.
+    let other = unrecognized_break("ST-THIN-1", "2026-09-09", &[("custodian", "ZZQ8")]);
+    let second = record_break(&bus, &other).await.unwrap().breaks[0]
+        .break_id
+        .clone();
+    assert_ne!(second, id);
+    // One more identifier stated is another set, so another break.
+    let wider = unrecognized_break(
+        "ST-THIN-2",
+        "2026-09-10",
+        &[("custodian", "ZZQ9"), ("isin-like", "XX0000000000")],
+    );
+    let third = record_break(&bus, &wider).await.unwrap().breaks[0]
+        .break_id
+        .clone();
+    assert_ne!(third, id);
+    assert_ne!(third, second);
 }
