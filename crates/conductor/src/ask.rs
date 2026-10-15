@@ -30,8 +30,12 @@ pub const ASK_PLATFORM_FOR_INSTRUMENT: &str =
 pub const INSTRUMENT_PULLED: &str = "platform.reference.event.instrument-pulled";
 
 /// How long one ask may take before the person is told the platform did not
-/// answer. Within the dashboard's own wait for the reply.
-const ASKING: Duration = Duration::from_secs(8);
+/// answer. Within the dashboard's own wait for the reply (12 s), and longer
+/// than a resolve's bounded ask (8 s, the one-ID spec's requirement 15), so
+/// a platform slower than a resolve waits is still heard in the background:
+/// a currency pulled for the next resolve (the 2026-10-11 ruling), a late
+/// match-or-mint answer resolving the provisional record (W3.4).
+const ASKING: Duration = Duration::from_secs(11);
 
 /// Where the time comes from: the deployment's one clock (decisions/024),
 /// given by whoever wires this up.

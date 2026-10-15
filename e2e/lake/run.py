@@ -409,19 +409,25 @@ def run():
          f"step 12, the franc found, not minted: {franc}")
     record = call("dashboard__read_instrument", {"instrument_id": franc["instrument_id"]},
                   "unchanged")["data"]
+    # From contract v24 kept under the master's own INS- key (W3.1; the
+    # one-ID spec's requirement 19), not under a new LCL- key carrying it.
     must(record["description"] == "Swiss franc" and record["currency"] == "CHF"
-         and any(i["value"] == "INS-01JCHF00000000000000000001" for i in record["identifiers"]),
+         and record["instrument_id"] == "INS-01JCHF00000000000000000001"
+         and franc["instrument_id"] == "INS-01JCHF00000000000000000001"
+         and not record["provisional"],
          f"step 12, the master's record kept as the deployment's: {record}")
     # A master slower than a resolve waits mints nothing (the 2026-10-11
     # ruling): the resolve is a miss, and once the pull brings the record a
-    # later resolve finds it. JPY is answered seven seconds late, past the
-    # sidecar's five-second call; a stopped master is a name that resolves nowhere.
+    # later resolve finds it. JPY is answered nine seconds late, past the
+    # resolve's bounded ask of eight and within the conductor's ten-second request (contract v24, the one-ID spec's
+    # requirement 15; until then the sidecar's five-second call); a stopped
+    # master is a name that resolves nowhere.
     started_at = time.time()
     yen = page("coin", "admin", "/resolve-as-of?scheme=iso4217&value=JPY")
     must(not yen["found"] and not yen["minted"] and not yen["instrument_id"],
          f"step 12, a slow master: a miss, nothing minted: {yen}")
-    must(time.time() - started_at < 4.5, f"step 12, the resolve did not wait on the master: "
-         f"{time.time() - started_at:.1f}s")
+    must(time.time() - started_at < 9.5, f"step 12, the resolve waited on the master past its "
+         f"eight-second bound: {time.time() - started_at:.1f}s")
     yen = {}
     for _ in range(20):
         time.sleep(1)
