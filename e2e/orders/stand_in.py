@@ -426,6 +426,7 @@ class Desk(Plugin):
             for said in split(one(query, "alloc")):
                 account, quantity, gross, *error = said.split(":")
                 allocation = ops.Allocation(account_id=account, quantity=decimal(quantity),
+                                            average_price=usd(one(query, "price", PRICE)),
                                             gross_amount=usd(gross))
                 if error:
                     allocation.error_cause = ops.ErrorCause.ERROR_CAUSE_OVERFILL
@@ -639,6 +640,10 @@ class Venue(Plugin):
                 first = (quantity * Decimal("0.4")).quantize(Decimal(1))
                 await self.fill(placement, first, first)
                 await self.fill(placement, quantity - first, quantity)
+                if placement.venue_account_code.endswith("-OVER"):
+                    # Contract v24's run: a venue that fills two more than
+                    # placed, the excess for the error account (W11.27).
+                    await self.fill(placement, Decimal(2), quantity + 2)
                 held["done"] = "filled"
             else:
                 held["done"] = "working"
@@ -833,7 +838,9 @@ class Ops(Plugin):
 
     async def answer(self, path, query, caller):
         if path == "/correct":
-            allocations = [ops.Allocation(account_id=a, quantity=decimal(q), gross_amount=usd(g))
+            allocations = [ops.Allocation(account_id=a, quantity=decimal(q),
+                                          average_price=usd(one(query, "price", PRICE)),
+                                          gross_amount=usd(g))
                            for a, q, g in (said.split(":") for said in split(one(query, "alloc")))]
             done = await self.call("CorrectBooking", ops.CorrectBookingParams(
                 booking_id=one(query, "booking"),

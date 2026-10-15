@@ -1004,8 +1004,9 @@ def the_v24_pages(browser, prefix):
         settled(page)
         rows = page.eval_on_selector_all("#provisional-table tbody tr", "rows => rows.map(r => r.dataset.reason)")
         check(len(rows) == 4, f"at {size} the provisional records are listed, each with why: {rows}")
-        why = page.inner_text("#provisional")
-        check("with the platform's staff" in why and "class needed" in why and "Matched: 118" in why.replace("\n", " "),
+        # Its text whole: the kit's pager hides the rows past a screen.
+        why = page.evaluate("() => document.querySelector('#provisional').textContent")
+        check("with the platform's staff" in why and "class needed" in why and "Matched: 118" in " ".join(why.split()),
               f"at {size} their reasons and the migration's counts are said")
         measured(page, f"Instruments, provisional, at {size}", f"v24-instruments-provisional-{size}.png")
         page.goto(f"{BASE}/admin/instruments#licensed")

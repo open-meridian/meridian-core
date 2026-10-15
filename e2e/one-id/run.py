@@ -188,8 +188,8 @@ def run():
     listing = runner("core-page", "/admin/instruments")
     must("Provisional (" in listing and pending["instrument_id"] in listing,
          "step 2, the Instruments page lists the provisional records")
-    must("awaiting" in listing.lower() or "platform&#39;s staff" in listing or "platform's staff" in listing,
-         "step 2, the record waiting for the platform's staff says so")
+    must(f'data-id="{pending["instrument_id"]}" data-reason="3"' in listing,
+         "step 2, the record waiting for the platform's staff says so (PROVISIONAL_REASON_AWAITING_STAFF)")
 
     # 3. The licence-list filter.
     sent = escalations()
@@ -208,7 +208,12 @@ def run():
     until(180, lambda: CUSIP in json.dumps(escalations()),
           "step 3, the licensed-only record is sent once the platform lists CUSIP")
 
-    # 4. The escape hatch.
+    # 4. The escape hatch. A person completes the local record first, as
+    # the book needs its class and currency in force (W9.1); it stays the
+    # deployment's local record until the platform answers for it.
+    runner("instrument", pending["instrument_id"], "asset_class=equity", "currency=USD",
+           "description=ZZQ Holdings, as our statement names it", "source=e2e",
+           "note=named as the statement does")
     local = page("pm", "write", f"/propose?account={account}&instrument={pending['instrument_id']}&quantity=5&key=l1")
     must(local.get("order_id"), f"step 4, an order on a local record is proposed: {local}")
     runner("core-page", "/", "--expect", 'data-open-order-count="1"')
@@ -222,11 +227,6 @@ def run():
            "allows=on", "note=The escape hatch, back on")
 
     # 5 and 6. A person's value; the order opened before the resolution.
-    runner("instrument", pending["instrument_id"], "asset_class=equity", "currency=USD",
-           "description=ZZQ Holdings, as our statement names it", "source=e2e",
-           "note=named as the statement does")
-    # A completed record is still the deployment's local one until the
-    # platform answers for it.
     page("desk", "write", f"/release?order={local['order_id']}")
     platform("/e2e/confirm", {"figis": [PENDING]})
     runner("instrument", pending["instrument_id"], "--ask-platform")

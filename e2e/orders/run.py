@@ -178,8 +178,11 @@ def run():
            "--to", "ben")
     aapl = page("venue", "write", "/resolve?symbol=AAPL&figi=BBG000B9XRY4")["instrument_id"]
     must(aapl, "step 1, AAPL resolved")
-    runner("instrument", aapl, "asset_class=equity", "currency=USD", "source=e2e",
-           "description=Apple Inc.", "--ask-platform")
+    # From contract v24 the platform matched it (W3.4): the deployment's
+    # record is the platform's, kept complete under its INS- ID, and a
+    # person's ask refreshes what the platform offers and its venue.
+    must(aapl.startswith("INS-"), f"step 1, AAPL is the platform's record: {aapl}")
+    runner("instrument", aapl, "--ask-platform")
     # The platform named its listing venue, XNAS in the US: a settlement date
     # is worked out by the US equities rule, the rule and its calendar pulled
     # on the first miss (W3.18) and the read asked again.
@@ -363,6 +366,8 @@ def run():
     # member filled by its allocation; an overfill's excess booked to the
     # error account; and operations' correction by replace after the
     # hand-off.
+    # Step 7's stop lifted, at the level that set it, so the venue fills.
+    runner("instruction", "active", "--plugin", "venue", "note=The venue trades again.")
     funds = [runner("account", name, "--instance", "desk").strip().splitlines()[-1]
              for name in ("Fund A", "Fund B", "Block", "Errors")]
     fund_a, fund_b, block_account, errors = funds
@@ -406,15 +411,14 @@ def run():
 
     # The overfill: ten ordered and filled, two more from the venue's own
     # app accepted to it; the excess booked to the error account.
+    page("desk", "admin", f"/map?account={account}&code=SIM-ACCT-OVER&connectivity=venue")
     over = page("pm", "write", f"/propose?account={account}&instrument={aapl}&quantity=10&key=o11")
     page("desk", "write", f"/release?order={over['order_id']}")
     page("desk", "write", f"/claim?order={over['order_id']}")
-    page("desk", "write", f"/place?order={over['order_id']}&quantity=10&connectivity=venue&code={CODE}")
-    until(60, lambda: (lambda o: o if o["state"] == "ORDER_STATE_FILLED" else None)(
-        order_of(orders(), over["order_id"])), "step 11, the order to overfill was not filled")
-    extra = own(2, "SIM-OVER-1")
-    page("desk", "write", f"/accept?executions={extra['execution_id']}&order={over['order_id']}")
-    fills = page("desk", "write", f"/executions?account={account}&order={over['order_id']}")["executions"]
+    page("desk", "write", f"/place?order={over['order_id']}&quantity=10&connectivity=venue&code=SIM-ACCT-OVER")
+    fills = until(60, lambda: (lambda f: f if len(f) == 3 else None)(page(
+        "desk", "write", f"/executions?account={account}&order={over['order_id']}")["executions"]),
+        "step 11, the venue did not fill two more than placed")
     before_over = held("Orders fund")
     excess = page("desk", "write",
                   f"/book?order={over['order_id']}&executions={','.join(f['execution_id'] for f in fills)}"
@@ -435,14 +439,17 @@ def run():
     book = store_book()
     must(held("Fund A") == ["5"] and held("Fund B") == ["5"],
          f"step 11, each fund holds the corrected allocation: {held('Fund A')}, {held('Fund B')}")
-    listed = page("ops", "write", f"/bookings?account={fund_a}")["bookings"]
-    must(listed, f"step 11, operations reads the bookings: {listed}")
+    # The booking is the block's, in the allocation account it was booked in.
+    listed = page("ops", "write", f"/bookings?account={block_account}")["bookings"]
+    must([b["booking_id"] for b in listed] == [booked["booking_id"]],
+         f"step 11, operations reads the booking: {listed}")
     del before_over
 
     # 10. The book printed, and rebuilt from its journal line for line.
     before = store_book()
     for wanted in ("order|Orders fund|", "placement|Orders fund|", "execution|Orders fund|",
-                   "unplaced||execution|2|venue|false", "instruction|control|3|1"):
+                   # The stop, lifted to active at step 11.
+                   "unplaced||execution|2|venue|false", "instruction|control|1|1"):
         must(wanted in before, f"step 10, store book prints {wanted!r}: {before[-2000:]}")
     compose("stop", "bor")
     compose("run", "--rm", "--no-deps", "-T", "bor",

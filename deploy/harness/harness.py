@@ -862,6 +862,10 @@ def grant(args):
     def post(path, fields):
         token = form_token(admin.get("/admin"))
         done = admin.send("POST", path, fields + [("form_token", token)])
+        # Granted again with its accounts changed: the group is edited and
+        # the permission stands as it was.
+        if path == "/admin/permissions" and "already granted" in sentence(done):
+            return
         if done.status != 303:
             raise Failed(f"{path}: {done.status} {sentence(done)}")
 
@@ -963,6 +967,10 @@ def instrument(args):
         for instrument_id, identifiers, _ in instrument_rows(admin):
             if instrument_id == named or (by_identifier and by_identifier in identifiers):
                 return instrument_id
+        # A complete record is not listed to complete (contract v24: the
+        # platform's record, kept complete): its own page answers it.
+        if named and admin.get(f"/admin/instruments/{urllib.parse.quote(named)}").status == 200:
+            return named
         raise Failed(f"no record listed is {named or by_identifier!r}")
 
     instrument_id = until(seconds, found, "the record was never listed")
