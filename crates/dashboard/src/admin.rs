@@ -91,6 +91,7 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/admin/instruments/merge", post(merge_instruments))
         .route("/admin/instruments/search", get(search_instruments))
         .route(instruments::USAGE_PATH, post(set_reports_usage))
+        .route(instruments::LINES_PATH, post(apply_migration_lines))
         .route("/admin/instruments/{instrument}", get(instrument_page))
         .route(
             "/admin/instruments/{instrument}/ask",
@@ -457,7 +458,7 @@ pub mod connectivity;
 pub mod data_sources;
 pub mod holds;
 pub mod instruments;
-mod overview;
+pub(crate) mod overview;
 pub(crate) use overview::listing;
 pub mod people;
 pub(crate) mod picker;
@@ -1892,53 +1893,24 @@ async fn close_account(
 ) -> Response {
     admin_form!(app, headers, fields, session, {
         let account_id = field(&fields, "account_id").to_string();
-        // "Unlink all and close" (approved 2026-10-14): each grant withdrawn
-        // as its own record, then the closure, one confirmation. A link or
-        // an ems's mapping is undone at its plugin's page; the conductor
+        // "Unlink all and close" (approved 2026-10-14; contract v24's
+        // CloseAccountRequest.unlink_attached): the conductor withdraws each
+        // grant as its own record and closes, in one step. A link or an
+        // ems's mapping is undone at its plugin's page; the conductor
         // refuses the closure, naming each, while one stands.
-        let mut withdrawn = Ok(());
-        if field(&fields, "unlink_all") == "1" {
-            match app.records.current(app.clock.now_ns()) {
-                Err(stale) => withdrawn = Err(stale.to_string()),
-                Ok(records) => {
-                    for item in overview::attached(&records, &account_id)
-                        .into_iter()
-                        .filter(|item| item.withdrawable)
-                    {
-                        let request = meridian_domain::v1::SetLinkableAccountsRequest {
-                            plugin_instance_id: item.plugin.clone(),
-                            withdraw_account_ids: vec![account_id.clone()],
-                            note: format!("withdrawn to close account {account_id}"),
-                            ..Default::default()
-                        };
-                        if let Err(failed) = command::<meridian_domain::v1::LinkableAccounts>(
-                            &app,
-                            &session,
-                            "platform.config.command.set-linkable-accounts",
-                            "meridian.v1.SetLinkableAccountsRequest",
-                            request,
-                        )
-                        .await
-                        {
-                            withdrawn = Err(failed);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        match withdrawn {
-            Err(failed) => Err(failed),
-            Ok(()) => command::<meridian_domain::v1::AccountRecord>(
-                &app,
-                &session,
-                "platform.config.command.close-account",
-                "meridian.v1.CloseAccountRequest",
-                CloseAccountRequest { account_id },
-            )
-            .await
-            .map(|_| ()),
-        }
+        command::<meridian_domain::v1::AccountRecord>(
+            &app,
+            &session,
+            "platform.config.command.close-account",
+            "meridian.v1.CloseAccountRequest",
+            CloseAccountRequest {
+                account_id,
+                unlink_attached: field(&fields, "unlink_all") == "1",
+                note: field(&fields, "note").trim().to_string(),
+            },
+        )
+        .await
+        .map(|_| ())
     })
 }
 
@@ -3282,6 +3254,102 @@ async fn set_reports_usage(
 
 /// The usage report's act on the surface (W6.20, contract v24).
 const SET_REPORTS_USAGE_TOOL: &str = "dashboard__set_reports_usage";
+
+/// W3.26 (contract v24): the migration's lines made from the Provisional
+/// tab -- the exact lines as one change, a line held back by its box, or one
+/// uncertain line made or held back -- with a note saying why; or prepared
+/// for someone to make (W6.26, W6.27).
+async fn apply_migration_lines(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Form(pairs): Form<Vec<(String, String)>>,
+) -> Response {
+    let fields = once(&pairs);
+    let (session, _) = match gate(&app, &headers, true) {
+        Ok(gated) => gated,
+        Err(response) => return *response,
+    };
+    if let Err(response) = form_token_matches(&session, &fields) {
+        return *response;
+    }
+    let back = "/admin/instruments#provisional";
+    let note = field(&fields, "note").trim().to_string();
+    if note.is_empty() {
+        return not_done("say why the lines are made", back);
+    }
+    // The exact lines' dialog names each line and the boxes ticked; the
+    // uncertain lines' names one line, its records together.
+    let held: Vec<String> = every(&pairs, "hold");
+    let (instrument_ids, held_back_ids): (Vec<String>, Vec<String>) =
+        match field(&fields, "group").trim() {
+            "" => {
+                let lines = every(&pairs, "line");
+                let made = lines
+                    .iter()
+                    .filter(|id| !held.contains(id))
+                    .cloned()
+                    .collect();
+                let kept = lines.into_iter().filter(|id| held.contains(id)).collect();
+                (made, kept)
+            }
+            group => {
+                let ids: Vec<String> = group
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                if field(&fields, "hold_all") == "1" {
+                    (Vec::new(), ids)
+                } else {
+                    (ids, Vec::new())
+                }
+            }
+        };
+    if instrument_ids.is_empty() && held_back_ids.is_empty() {
+        return not_done("choose a line to make or hold back", back);
+    }
+    let arguments = serde_json::json!({
+        "instrument_ids": instrument_ids,
+        "held_back_ids": held_back_ids,
+        "note": note,
+    });
+    let posted = prepare_or_gate(&app, &session, &fields, APPLY_MIGRATION_TOOL, || {
+        Ok(arguments.clone())
+    })
+    .await;
+    if let Some(response) = posted_to(posted, back) {
+        return response;
+    }
+    let made = instrument_ids.len();
+    let kept = held_back_ids.len();
+    let outcome = app
+        .bus
+        .call_for(
+            instruments::APPLY_INSTRUMENT_MIGRATION,
+            "meridian.v1.ApplyInstrumentMigrationRequest",
+            meridian_domain::v1::ApplyInstrumentMigrationRequest {
+                instrument_ids,
+                held_back_ids,
+                note,
+            }
+            .encode_to_vec(),
+            None,
+            Some(Duration::from_secs(30)),
+            &session.subject,
+        )
+        .await
+        .map(|_| ())
+        .map_err(said_of_refusal);
+    after_to(
+        outcome,
+        &format!("/admin/instruments?done={made}+made,+{kept}+held+back#provisional"),
+        back,
+    )
+}
+
+/// Making the migration's lines on the surface (W6.20, contract v24).
+const APPLY_MIGRATION_TOOL: &str = "dashboard__apply_migration";
 
 // ── The Data sources page ───────────────────────────────────────────────────
 

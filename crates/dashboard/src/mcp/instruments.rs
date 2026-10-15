@@ -134,7 +134,32 @@ pub static SPECS: &[Spec] = &[
         area: Area::Instruments,
         input_schema: reports_usage_schema,
     },
+    // Contract v24 (W3.26, W6.20; the names approved 2026-10-15): making the
+    // migration's lines, preparable, agents' level "prepare only" by
+    // default.
+    Spec {
+        name: "apply_migration",
+        title: "Make the migration's lines",
+        description: "make the upgrade's migration lines (contract v24, W3.26), with a note saying why: each LCL- record named in instrument_ids is replaced by the INS- record the platform answered its line with (list_instruments_to_complete with provisional true names it, answered_instrument_id, and its migration_section); each in held_back_ids keeps its LCL- ID, provisional and held back, nothing minted for it, until a later change makes it. The exact lines are one change, each uncertain line its own: two records answered by one INS- ID are a duplicate line, made together. Made together or refused whole, naming each line that is none the platform answered (awaiting its staff, kept local, unreachable) by its path; a line already made is unchanged. At most 500 in each list: more exact lines are successive changes, in order. Answers the migration's counts after.",
+        reads: false,
+        open_world: false,
+        area: Area::Instruments,
+        input_schema: apply_migration_schema,
+    },
 ];
+
+fn apply_migration_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "instrument_ids": {"type": "array", "maxItems": 500, "items": {"type": "string", "pattern": "^LCL-"}, "description": "the LCL- records whose lines are made, each replaced by the INS- record its line answered"},
+            "held_back_ids": {"type": "array", "maxItems": 500, "items": {"type": "string", "pattern": "^LCL-"}, "description": "the LCL- records whose lines are held back, each keeping its LCL- ID, provisional, nothing minted"},
+            "note": {"type": "string", "minLength": 1, "maxLength": 2000, "description": "why, kept on each record's version"},
+        },
+        "required": ["note"],
+        "additionalProperties": false,
+    })
+}
 
 fn reports_usage_schema() -> Value {
     json!({
@@ -947,6 +972,17 @@ fn to_complete_json(item: &InstrumentToComplete) -> Value {
                 v.as_str_name()
             });
     }
+    // The migration's line (contract v24, W3.26): its section and the record
+    // the platform answered it with.
+    if item.migration_section != 0 {
+        out["migration_section"] =
+            enum_name::<meridian_domain::v1::MigrationSection>(item.migration_section, |v| {
+                v.as_str_name()
+            });
+    }
+    if !item.answered_instrument_id.is_empty() {
+        out["answered_instrument_id"] = item.answered_instrument_id.clone().into();
+    }
     out
 }
 
@@ -1083,6 +1119,7 @@ pub async fn call(app: &App, caller: &Caller, spec: &Spec, arguments: Value) -> 
         "list_calendars" => list_calendars(app, caller, &arguments).await,
         "read_calendar" => read_calendar(app, caller, &arguments).await,
         "set_reports_usage" => set_reports_usage(app, caller, &arguments).await,
+        "apply_migration" => apply_migration(app, caller, &arguments).await,
         other => refused("not_listed", &format!("no tool {other}"), Vec::new()),
     }
 }
@@ -1326,6 +1363,73 @@ async fn set_reports_usage(app: &App, caller: &Caller, arguments: &Value) -> Val
     match reply {
         Err(failed) => bus_refused(failed, ""),
         Ok(reply) => json!({"outcome": "made", "data": {"reports_usage": reply.reports_usage}}),
+    }
+}
+
+/// The ids a list names, each by its path where it is not text.
+fn ids(top: &serde_json::Map<String, Value>, name: &str, problems: &mut Problems) -> Vec<String> {
+    match top.get(name) {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(items)) => {
+            if items.len() > 500 {
+                problems.add(name, "at most 500");
+            }
+            items
+                .iter()
+                .enumerate()
+                .filter_map(|(n, item)| match item.as_str() {
+                    Some(id) if !id.trim().is_empty() => Some(id.trim().to_string()),
+                    _ => {
+                        problems.add(&format!("{name}[{n}]"), "a record's ID");
+                        None
+                    }
+                })
+                .collect()
+        }
+        Some(_) => {
+            problems.add(name, "a list of records' IDs");
+            Vec::new()
+        }
+    }
+}
+
+/// W3.26 (contract v24): the migration's lines made, a deployment admin's.
+async fn apply_migration(app: &App, caller: &Caller, arguments: &Value) -> Value {
+    let mut problems = Problems::default();
+    let Some(top) = object(arguments, "", &mut problems) else {
+        return problems.refusal();
+    };
+    only(
+        top,
+        &["instrument_ids", "held_back_ids", "note"],
+        "",
+        &mut problems,
+    );
+    let request = meridian_domain::v1::ApplyInstrumentMigrationRequest {
+        instrument_ids: ids(top, "instrument_ids", &mut problems),
+        held_back_ids: ids(top, "held_back_ids", &mut problems),
+        note: text(top, "note", "", true, &mut problems),
+    };
+    if request.instrument_ids.is_empty() && request.held_back_ids.is_empty() {
+        problems.add("instrument_ids", "a line to make or hold back");
+    }
+    if !problems.is_empty() {
+        return problems.refusal();
+    }
+    let reply: Result<meridian_domain::v1::MigrationCounts, _> = ask(
+        app,
+        caller,
+        page::APPLY_INSTRUMENT_MIGRATION,
+        "meridian.v1.ApplyInstrumentMigrationRequest",
+        request,
+        CHANGING,
+    )
+    .await;
+    match reply {
+        Err(failed) => bus_refused(failed, ""),
+        Ok(counts) => {
+            json!({"outcome": "made", "data": {"migration_counts": page::migration_counts_json(&counts)}})
+        }
     }
 }
 

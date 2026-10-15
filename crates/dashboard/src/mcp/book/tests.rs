@@ -74,8 +74,9 @@ fn the_four_tools_are_named_preparable_where_they_change_and_may_not_for_agents(
         }
     }
     // The four approved in v22, and from contract v24 the escape hatch's
-    // setting (W11.36, approved 2026-10-14).
-    assert_eq!(SPECS.len(), 5, "the five approved tools");
+    // setting (W11.36, approved 2026-10-14) and closing an account (W6.3,
+    // approved 2026-10-15).
+    assert_eq!(SPECS.len(), 6, "the six approved tools");
 }
 
 #[test]
@@ -127,4 +128,23 @@ fn a_change_takes_a_note_and_a_read_answers_unchanged() {
     let source = include_str!("../book.rs");
     assert!(!source.contains("\"outcome\": \"read\""));
     assert_eq!(source.matches("\"outcome\": \"unchanged\"").count(), 2);
+}
+
+/// Contract v24 (W6.3, W6.30): "Unlink all and close" through the surface is
+/// refused while a grant stands, since no tool sets a grant; nothing is sent.
+#[test]
+fn close_account_takes_a_note_and_asks_nothing_of_grants() {
+    let spec = SPECS
+        .iter()
+        .find(|spec| spec.name == "close_account")
+        .expect("close_account is listed");
+    let schema = (spec.input_schema)();
+    let required: Vec<&str> = schema["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(required, vec!["account_id", "note"]);
+    assert!(spec.description.contains("no tool sets a grant"));
 }

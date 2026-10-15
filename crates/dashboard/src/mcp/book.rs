@@ -59,6 +59,23 @@ const fn spec(
 }
 
 pub static SPECS: &[Spec] = &[
+    // Contract v24 (W6.3, W6.20; the name approved 2026-10-15): closing an
+    // account, a deployment admin's, preparable, "may not" for agents until
+    // loosened.
+    spec(
+        "close_account",
+        "Close an account",
+        "close an account, with a note saying why (W6.3): closed, never deleted, its holdings and \
+history still readable. Refused naming account_id and each thing still attached to it -- an \
+external account's link, a plugin instance's grant, an ems's mapping -- and nothing is closed. A \
+link or a mapping is undone at its plugin's page. unlink_attached asks the conductor to withdraw \
+each grant and close in one step, but no tool sets a grant (W6.30): while the account still has \
+one it is refused by name, and a person withdraws it at the page or with the Close dialog's \
+\"Unlink all and close\". Answers the account's record.",
+        false,
+        Area::Accounts,
+        close_account_schema,
+    ),
     spec(
         "list_account_attributes",
         "List account attributes",
@@ -203,6 +220,19 @@ fn attributes_json(a: &AccountAttributes) -> Value {
     })
 }
 
+fn close_account_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "account_id": {"type": "string", "minLength": 1},
+            "unlink_attached": {"type": "boolean", "description": "withdraw each grant and close in one step; refused while a grant stands, since no tool sets a grant"},
+            "note": {"type": "string", "minLength": 1, "maxLength": 2000, "description": "why, kept with each record the closure writes"},
+        },
+        "required": ["account_id", "note"],
+        "additionalProperties": false,
+    })
+}
+
 // ── Calling ─────────────────────────────────────────────────────────────
 
 /// The tool, called: its arguments read, the row sent, the answer typed.
@@ -213,6 +243,7 @@ pub async fn call(app: &App, caller: &Caller, spec: &Spec, arguments: Value) -> 
         "list_trading_instructions" => list_instructions(app, caller, &arguments).await,
         "set_trading_instruction" => set_instruction(app, caller, &arguments).await,
         "set_local_record_orders" => set_local_record_orders(app, caller, &arguments).await,
+        "close_account" => close_account(app, caller, &arguments).await,
         other => refused("not_listed", &format!("no tool {other}"), Vec::new()),
     }
 }
@@ -556,6 +587,89 @@ async fn set_local_record_orders(app: &App, caller: &Caller, arguments: &Value) 
     }
 }
 
+/// W6.3 (contract v24): an account closed, a deployment admin's. No tool
+/// sets a grant (W6.30), so "Unlink all and close" is refused while one
+/// stands, naming it: a person withdraws it at the page.
+async fn close_account(app: &App, caller: &Caller, arguments: &Value) -> Value {
+    let mut problems = Problems::default();
+    let Some(top) = object(arguments, "", &mut problems) else {
+        return problems.refusal();
+    };
+    only(
+        top,
+        &["account_id", "unlink_attached", "note"],
+        "",
+        &mut problems,
+    );
+    let account_id = text(top, "account_id", "", true, &mut problems);
+    let unlink = match top.get("unlink_attached") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(unlink)) => *unlink,
+        Some(_) => {
+            problems.add("unlink_attached", "true or false");
+            false
+        }
+    };
+    let note = text(top, "note", "", true, &mut problems);
+    if !problems.is_empty() {
+        return problems.refusal();
+    }
+    let (records, access) = match access_of(app, caller) {
+        Ok(held) => held,
+        Err(refusal) => return refusal,
+    };
+    if !access.deployment_admin {
+        return refused(
+            "not_permitted",
+            "closing an account is a deployment admin's",
+            Vec::new(),
+        );
+    }
+    if unlink {
+        let grants: Vec<String> = crate::admin::overview::attached(&records, &account_id)
+            .into_iter()
+            .filter(|item| item.withdrawable)
+            .map(|item| item.words)
+            .collect();
+        if !grants.is_empty() {
+            return refused(
+                "not_permitted",
+                &format!(
+                    "no tool sets a grant (W6.30), and {account_id} still has one: {}. A person \
+                     withdraws it at the page or with the Close dialog's \"Unlink all and close\"; \
+                     nothing was sent",
+                    grants.join("; ")
+                ),
+                vec![json!({"path": "unlink_attached"})],
+            );
+        }
+    }
+    let reply: Result<meridian_domain::v1::AccountRecord, _> = ask(
+        app,
+        caller,
+        "platform.config.command.close-account",
+        "meridian.v1.CloseAccountRequest",
+        meridian_domain::v1::CloseAccountRequest {
+            account_id,
+            unlink_attached: unlink,
+            note,
+        },
+        CHANGING,
+    )
+    .await;
+    match reply {
+        Err(failed) => bus_refused(failed, ""),
+        Ok(account) => json!({"outcome": "made", "data": {"account": {
+            "account_id": account.account_id,
+            "name": account.name,
+            "state": meridian_domain::v1::AccountState::try_from(account.state)
+                .map(|state| state.as_str_name())
+                .unwrap_or("ACCOUNT_STATE_UNSPECIFIED"),
+            "created_at_ns": account.created_at_ns.to_string(),
+        }}}),
+    }
+}
+
 /// The routes the order path's pages draw, each against the tool that
 /// reaches it (W6.20; the plan's parity check). [`tests`] fails the build
 /// where a changing route has none.
@@ -565,6 +679,7 @@ pub const PARITY: &[(&str, &str)] = &[
         "list_account_attributes set_account_attribute",
     ),
     ("/admin/accounts/book", "set_account_attribute"),
+    ("/admin/accounts/close", "close_account"),
     (
         "/admin/trading-instructions",
         "list_trading_instructions set_trading_instruction set_local_record_orders",

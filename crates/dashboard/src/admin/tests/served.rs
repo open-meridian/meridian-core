@@ -1298,6 +1298,7 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
         Ok((
             "".into(),
             meridian_domain::v1::ListUsageReportsReply {
+                reports_usage: true,
                 reports: vec![meridian_domain::v1::SentUsageReport {
                     sent_at_ns: 1_791_417_600_000_000_000,
                     received: true,
