@@ -260,7 +260,7 @@ pub fn serve_all_within(
                     }
                 }
             };
-            let resolution = match matched {
+            let mut resolution = match matched {
                 crate::resolve::Matched::Answered(resolution) => *resolution,
                 crate::resolve::Matched::Unmatched(asked) => {
                     // Nothing matched (contract v24, W3.4): the platform
@@ -304,6 +304,12 @@ pub fn serve_all_within(
                     .map_err(|failed| failed.to_string())?
                 }
             };
+            // A currency pulled from the platform's master is its record,
+            // found and never minted, however the pull's timing fell (W3.1;
+            // approved 2026-10-15).
+            if pulled.is_some() {
+                resolution.reply.minted = false;
+            }
             if let Some(changed) = &resolution.changed {
                 announce(&announcing, changed, &envelope, now_ns);
             }
@@ -2160,9 +2166,9 @@ mod tests {
         .await
         .unwrap();
         // Kept under the platform's own ID from the start (contract v24,
-        // W3.1, W3.5): the deployment's record, created by this resolve.
+        // W3.1, W3.5): the master's record, found and not minted.
         assert!(
-            reply.minted && reply.instrument_id.starts_with("INS-") && !reply.provisional,
+            !reply.minted && reply.instrument_id.starts_with("INS-") && !reply.provisional,
             "{reply:?}"
         );
         let record = store.by_id(&reply.instrument_id).unwrap().unwrap();
@@ -2288,8 +2294,8 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
         let later = resolve("USD").await;
         assert!(
-            later.minted && later.instrument_id.starts_with("INS-"),
-            "the platform's record, kept by this resolve: {later:?}"
+            !later.minted && later.instrument_id.starts_with("INS-"),
+            "the platform's record, found and not minted: {later:?}"
         );
         let record = store.by_id(&later.instrument_id).unwrap().unwrap();
         assert_eq!(record.description, "US dollar");
