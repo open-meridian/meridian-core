@@ -446,7 +446,9 @@ fn fill_lots(book: &Book, execution_ids: &[String]) -> Vec<String> {
             None => &entry.body.lines,
         };
         for line in lines {
-            if line.opens_lot.is_some() && line.instrument_id == held.execution.instrument_id {
+            if line.opens_lot.is_some()
+                && crate::became::same(&line.instrument_id, &held.execution.instrument_id)
+            {
                 lots.push(line.lot_id.clone());
             }
         }

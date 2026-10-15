@@ -1837,7 +1837,7 @@ fn provisional_listed() -> ListInstrumentsToCompleteReply {
                     "TPL-debt-base",
                     &["identifiers"],
                 ),
-                ProvisionalReason::Unspecified,
+                ProvisionalReason::Incomplete,
             ),
             listed(
                 record(2, "ZZ Top Holdings Inc. common stock", "TPL-equity", &[]),

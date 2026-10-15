@@ -501,6 +501,11 @@ impl Sidecar {
             }
         }
         stamp.account_scope = Some(scope);
+        // A resolve may wait the instrument store's bounded ask on the
+        // platform, eight seconds (contract v24, the one-ID spec's
+        // requirement 15): given longer than that, every other call the
+        // bus's default.
+        let within = (topic == RESOLVE_IDENTIFIER).then_some(RESOLVE_WITHIN);
         let (_, payload) = self
             .bus
             .call_stamped(
@@ -508,7 +513,7 @@ impl Sidecar {
                 payload_type,
                 message.encode_to_vec(),
                 None,
-                None,
+                within,
                 &stamp,
             )
             .await
@@ -1381,3 +1386,8 @@ pub(crate) fn refused(failed: BusError) -> Status {
 
 #[cfg(test)]
 mod tests;
+
+/// W3.1's row, which may wait on the platform (contract v24).
+const RESOLVE_IDENTIFIER: &str = "platform.reference.query.resolve-identifier";
+/// Longer than the instrument store's bounded ask, eight seconds.
+const RESOLVE_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);

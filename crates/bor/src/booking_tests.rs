@@ -542,6 +542,27 @@ async fn a_block_is_booked_across_two_funds_and_each_member_is_filled_by_its_all
         francs(BLOCK)
     );
 
+    // Operations replaces it after the hand-off, five and five: the funds'
+    // accounts are the block's instructed ones still.
+    let replaced = correct(
+        &w,
+        &CorrectBookingRequest {
+            booking_id: booking.booking_id.clone(),
+            kind: BookingCorrectionKind::Replace as i32,
+            allocations: vec![
+                allocation(FUND1, "5", "1137.05"),
+                allocation(FUND2, "5", "1137.05"),
+            ],
+            reason: "the allocation was five and five".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(booking_state(&replaced), BookingState::HandedOff);
+    assert_eq!(read(&aapl_in(&w, FUND1).unwrap().trade_date_quantity), "5");
+    assert_eq!(read(&aapl_in(&w, FUND2).unwrap().trade_date_quantity), "5");
+
     // Read back and caught up (W11.31).
     let page = w
         .store
@@ -1032,6 +1053,18 @@ async fn an_open_orders_fill_after_its_record_resolved_lands_on_the_record_it_be
         .iter()
         .any(|p| p.instrument_id == RESOLVED && read(&p.trade_date_quantity) == "5"));
     assert!(!held.iter().any(|p| p.instrument_id == RESOLVING));
+    // Booked after the resolution: its lots found on the record it became,
+    // re-stated there.
+    let booking = book(
+        &w,
+        &order.order_id,
+        std::slice::from_ref(&execution.execution_id),
+        vec![allocation(ACC, "5", "1137.05")],
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(booking_state(&booking), BookingState::Booked);
     // A child naming the record it became is the parent's instrument.
     let mut child = buy("1");
     child.instrument_id = RESOLVED.into();

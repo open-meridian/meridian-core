@@ -130,8 +130,30 @@ pub fn serve_queries(bus: &Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock
     serve_all(bus, store, clock, Arc::new(Mutex::new(())));
 }
 
+/// [`serve_queries`] with the bounded ask shortened, for a test that shows
+/// what a slow platform does without waiting the eight seconds.
+pub fn serve_queries_within(
+    bus: &Arc<Bus>,
+    store: Arc<dyn Store>,
+    clock: Arc<dyn Clock>,
+    bound: std::time::Duration,
+) {
+    serve_all_within(bus, store, clock, Arc::new(Mutex::new(())), bound);
+}
+
 /// As [`serve_queries`], sharing `writing` with the [`Reactor`].
 pub fn serve_all(bus: &Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>, writing: Writing) {
+    serve_all_within(bus, store, clock, writing, BOUNDED_ASK);
+}
+
+/// [`serve_all`], a resolve waiting on the platform no longer than `bound`.
+pub fn serve_all_within(
+    bus: &Arc<Bus>,
+    store: Arc<dyn Store>,
+    clock: Arc<dyn Clock>,
+    writing: Writing,
+    bound: std::time::Duration,
+) {
     {
         let (store, clock, writing, announcing) = (
             store.clone(),
@@ -139,8 +161,11 @@ pub fn serve_all(bus: &Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>, w
             writing.clone(),
             Arc::clone(bus),
         );
-        let asking = Arc::new(Asking::new(Arc::clone(bus)));
+        let asking = Arc::new(Asking::waiting(Arc::clone(bus), bound));
         bus.serve(RESOLVE_IDENTIFIER, move |envelope| {
+            // One bounded ask for the whole resolve (the spec's requirement
+            // 15): a currency's pull and the matching request share it.
+            let started = std::time::Instant::now();
             let request: ResolveIdentifierRequest =
                 decode(&envelope, "meridian.v1.ResolveIdentifierRequest")?;
             let instance = envelope
@@ -256,7 +281,7 @@ pub fn serve_all(bus: &Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>, w
                                 asked.clone(),
                                 instance.clone(),
                             );
-                            asking.match_or_mint(asking_for, late)
+                            asking.match_or_mint(asking_for, late, started)
                         }
                     };
                     let _held = writing.lock().map_err(|_| "the write lock is poisoned")?;
@@ -685,9 +710,14 @@ pub const MINTING_ROLES: [&str; 2] = ["custody", "data"];
 const LAUNCHES_FOR_NS: i64 = 300 * 1_000_000_000;
 const UNKNOWN_AGAIN_NS: i64 = 30 * 1_000_000_000;
 const NOT_HELD_AGAIN_NS: i64 = 600 * 1_000_000_000;
-/// How long a resolve waits on the master for a currency: well under the
-/// five seconds a sidecar gives a resolve (the coordinator, 2026-10-11).
-pub const CURRENCY_WAIT: std::time::Duration = std::time::Duration::from_millis(2500);
+/// The bounded ask (the one-ID spec's requirement 15, W3.1: "8 seconds
+/// today, as v20's currency pull does, never longer"): the longest a resolve
+/// waits on the platform, a currency's pull and the matching request
+/// together. The conductor bounds its own call to the platform the same
+/// (its ASKING), and a plugin's sidecar gives a resolve longer than this.
+pub const BOUNDED_ASK: std::time::Duration = std::time::Duration::from_secs(8);
+/// The name v20 gave it.
+pub const CURRENCY_WAIT: std::time::Duration = BOUNDED_ASK;
 /// How long the pull itself may take in the background.
 const CURRENCY_PULL_WITHIN: std::time::Duration = std::time::Duration::from_secs(20);
 /// After the master could not be reached, a currency is asked again no
@@ -948,16 +978,18 @@ const MATCH_OR_MINT_WITHIN: std::time::Duration = std::time::Duration::from_secs
 impl Asking {
     /// W3.4 (contract v24): the platform asked, through the conductor, to
     /// match or mint what a resolve found nothing for, waiting no longer
-    /// than the resolve can (well under the five seconds a plugin's call
-    /// gives it); an answer after that goes to `late`, which keeps it on the
+    /// than what is left of the bounded ask begun at `started`; an answer
+    /// after that goes to `late`, which keeps it on the
     /// provisional record minted meanwhile. A platform without v24's routes
     /// answers as unreachable (the conductor's rule).
     pub fn match_or_mint(
         &self,
         asking_for: meridian_domain::v1::EscalateInstrumentRequest,
         late: Late,
+        started: std::time::Instant,
     ) -> crate::resolve::PlatformSaid {
         use crate::resolve::PlatformSaid;
+        let within = self.wait.saturating_sub(started.elapsed());
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return PlatformSaid::Unreachable;
         };
@@ -1002,7 +1034,7 @@ impl Asking {
                 }
             }
         });
-        match heard.recv_timeout(self.wait) {
+        match heard.recv_timeout(within) {
             Ok(said) => said,
             Err(_) => {
                 // Taken back, unless the answer is in hand this instant.
@@ -1079,11 +1111,8 @@ pub async fn ask_again_forever(
     writing: Writing,
 ) {
     let asked = Arc::new(Mutex::new(std::collections::HashMap::<String, i64>::new()));
+    let mut beat = std::time::Duration::from_secs(10);
     loop {
-        let list = crate::one_id::licence(store.as_ref());
-        let pace = list.pace.unwrap_or_default();
-        let batch = pace.batch_size.clamp(1, 100) as usize;
-        let beat = std::time::Duration::from_secs(60 / pace.batches_per_minute.clamp(1, 60) as u64);
         let (bus2, store2, clock2, writing2, asked2) = (
             Arc::clone(&bus),
             store.clone(),
@@ -1091,7 +1120,15 @@ pub async fn ask_again_forever(
             writing.clone(),
             Arc::clone(&asked),
         );
+        // The store's reads block: every one on the blocking pool, the
+        // licence list's pace among them.
         let ran = tokio::task::spawn_blocking(move || {
+            let pace = crate::one_id::licence(store2.as_ref())
+                .pace
+                .unwrap_or_default();
+            let batch = pace.batch_size.clamp(1, 100) as usize;
+            let beat =
+                std::time::Duration::from_secs(60 / pace.batches_per_minute.clamp(1, 60) as u64);
             let ask = BusAsk {
                 bus: Arc::clone(&bus2),
             };
@@ -1123,7 +1160,7 @@ pub async fn ask_again_forever(
             for each in &applied {
                 publish_applied(&bus2, each, now_ns);
             }
-            crate::Result::Ok(())
+            crate::Result::Ok(beat)
         })
         .await;
         match ran {
@@ -1131,7 +1168,7 @@ pub async fn ask_again_forever(
                 tracing::warn!(%failed, "asking the platform again failed; next beat")
             }
             Err(failed) => tracing::warn!(%failed, "asking the platform again failed; next beat"),
-            Ok(Ok(())) => {}
+            Ok(Ok(paced)) => beat = paced,
         }
         tokio::time::sleep(beat.max(std::time::Duration::from_secs(10))).await;
     }
@@ -2097,10 +2134,12 @@ mod tests {
                 .encode_to_vec(),
             ))
         });
-        serve_queries(
+        // The bounded ask shortened to 2.5 seconds for the test.
+        serve_queries_within(
             &store_bus,
             store.clone(),
             Arc::new(meridian_clock::ManualClock::at(NOW)),
+            std::time::Duration::from_millis(2500),
         );
         let resolve = |code: &'static str| {
             let plugin_bus = plugin_bus.clone();
@@ -2120,7 +2159,7 @@ mod tests {
         let first = resolve("USD").await;
         assert!(
             started.elapsed() < std::time::Duration::from_millis(3200),
-            "a resolve waits on the master no longer than {CURRENCY_WAIT:?}: {:?}",
+            "a resolve waits on the master no longer than its bound: {:?}",
             started.elapsed()
         );
         assert!(

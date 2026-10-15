@@ -281,11 +281,15 @@ pub fn reason_words(reason: i32) -> &'static str {
         Ok(ProvisionalReason::Unreachable) => {
             "the platform not reached; asked again on reconnecting"
         }
-        Ok(ProvisionalReason::Incomplete) => "incomplete against its template",
+        // INCOMPLETE is the incomplete or offline state: a record kept
+        // local with nothing on the licence list to look for among them.
+        Ok(ProvisionalReason::Incomplete) => {
+            "incomplete or offline: its template's fields, or nothing to look for yet"
+        }
         Ok(ProvisionalReason::AwaitingStaff) => "with the platform's staff; asked again daily",
         Ok(ProvisionalReason::ClassNeeded) => "class needed: no asset class stated",
         Ok(ProvisionalReason::HeldBack) => "held back at the migration",
-        _ => "kept local: nothing on the licence list to look for",
+        _ => "not said",
     }
 }
 

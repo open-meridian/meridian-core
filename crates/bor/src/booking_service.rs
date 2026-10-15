@@ -631,6 +631,11 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
             )?;
             ctx.account_marks =
                 account_marks(store.as_ref(), allocation_accounts(&request.allocations));
+            // A block's members, read from their own accounts, as its booking
+            // read them: a replace allocates to the same instructed accounts.
+            let order_id = booking_order(store.as_ref(), &account, &request.booking_id);
+            let members = block_members(store.as_ref(), &account, &order_id);
+            ctx.members = member_views(store.as_ref(), &members);
             let decided_ctx = ctx.clone();
             let corrected = std::sync::Mutex::new(None::<(Book, Book)>);
             let answer = act(
@@ -947,6 +952,22 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
 }
 
 /// A block's members, where the order is one (W11.1).
+/// The order a booking books, from its account's journal.
+fn booking_order(store: &dyn Store, account: &str, booking_id: &str) -> String {
+    let Ok(entries) = store.journal(account) else {
+        return String::new();
+    };
+    let Ok(book) = Book::replay(account, crate::store::first_partition_of(account), &entries)
+    else {
+        return String::new();
+    };
+    book.ledger
+        .bookings
+        .get(booking_id)
+        .map(|held| held.booking.order_id.clone())
+        .unwrap_or_default()
+}
+
 fn block_members(store: &dyn Store, account: &str, order_id: &str) -> Vec<String> {
     let Ok(entries) = store.journal(account) else {
         return Vec::new();

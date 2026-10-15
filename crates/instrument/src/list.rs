@@ -103,8 +103,11 @@ pub fn list_to_complete(
             .filter(|record| request.include_complete || !complete(record))
             .collect()
     } else {
+        // A replaced record answers the one it became (W3.6, W3.8): a
+        // resolved LCL- ID reads its INS- record, the link on it.
+        let became = current(store, &request.instrument_id)?;
         live.iter()
-            .filter(|record| record.instrument_id == request.instrument_id)
+            .filter(|record| record.instrument_id == became)
             .collect()
     };
     if search.is_empty() {

@@ -679,12 +679,28 @@ pub fn provisional_state(
         ),
         None => (String::new(), String::new(), Vec::new()),
     };
-    let reason = if template.is_none() {
-        ProvisionalReason::ClassNeeded
-    } else if reason == ProvisionalReason::Unspecified && !missing.is_empty() {
-        ProvisionalReason::Incomplete
-    } else {
+    // What the platform said comes first: a record sent and queued for its
+    // staff, or not reached, says so whatever it lacks (W3.1: sent with no
+    // template where no class is stated); otherwise "class needed" where no
+    // class names a template, and "incomplete" where its template's fields
+    // are missing.
+    let platform_said = matches!(
+        reason,
+        ProvisionalReason::AwaitingStaff | ProvisionalReason::Unreachable
+    );
+    let reason = if platform_said {
         reason
+    } else if template.is_none() {
+        ProvisionalReason::ClassNeeded
+    } else if reason == ProvisionalReason::HeldBack {
+        reason
+    } else {
+        // The contract's five reasons and no sixth (W3.7, W3.11): a record
+        // kept local -- nothing on the licence list to look for, the
+        // current stage -- or one incomplete against its template is
+        // INCOMPLETE, "the incomplete or offline state", its missing
+        // fields listed where it lacks any.
+        ProvisionalReason::Incomplete
     };
     Local {
         provisional: true,
@@ -1495,9 +1511,15 @@ mod tests {
         // No class stated: "class needed", naming no template.
         let mut classless = equity_figi("BBG00NOCLASS");
         classless.stated_asset_class = 0;
-        let none = unmatched(&store, &classless, PlatformSaid::Unreachable);
+        let none = unmatched(&store, &classless, PlatformSaid::NotAsked);
         let held = store.by_id(&none.reply.instrument_id).unwrap().unwrap();
         assert_eq!(held.local.reason, ProvisionalReason::ClassNeeded as i32);
+        assert!(held.local.template_id.is_empty());
+        // Sent all the same and queued: the platform's answer is its reason.
+        classless.identifiers[0].value = "BBG00NOCLASS2".into();
+        let queued = unmatched(&store, &classless, PlatformSaid::Pending);
+        let held = store.by_id(&queued.reply.instrument_id).unwrap().unwrap();
+        assert_eq!(held.local.reason, ProvisionalReason::AwaitingStaff as i32);
         assert!(held.local.template_id.is_empty());
 
         // Thinner than the minimum: not found, nothing minted.
@@ -1801,6 +1823,11 @@ mod tests {
             (1, 1, 1, 0, 0)
         );
         assert!(store.state(crate::reask::MIGRATED).unwrap().is_some());
+        // Kept local, nothing to look for: the contract's INCOMPLETE, no
+        // sixth reason.
+        let cusip = store.by_id("LCL-CUSIP").unwrap().unwrap();
+        assert_eq!(cusip.local.migration, crate::reask::section::KEPT_LOCAL);
+        assert_eq!(cusip.local.reason, ProvisionalReason::Incomplete as i32);
     }
 
     #[test]
