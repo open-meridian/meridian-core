@@ -1842,37 +1842,55 @@ async fn a_lots_cost_is_answered_naming_its_cash_instrument() {
     assert_eq!(kept[0].instrument_id, USD);
 }
 
+/// A street-only difference stating one of the custodian's identifiers, by
+/// the street row's field (`unresolved_identifiers[n].scheme` / `.value`).
+fn stated(position: usize, part: &str, text: &str) -> BreakDifference {
+    BreakDifference {
+        field: format!("unresolved_identifiers[{position}].{part}"),
+        book: None,
+        street: Some(BreakValue {
+            value: Some(break_value::Value::Text(text.into())),
+        }),
+    }
+}
+
+/// An unrecognized security's break as a reconciliation sends it: no
+/// subject, the statement it was seen in, and the identifiers stated.
+fn unrecognized_break(
+    statement: &str,
+    date: &str,
+    identifiers: &[(&str, &str)],
+) -> RecordBreakRequest {
+    RecordBreakRequest {
+        account_id: ACC.into(),
+        subject: None,
+        category: BreakCategory::UnrecognizedSecurity as i32,
+        differences: identifiers
+            .iter()
+            .enumerate()
+            .flat_map(|(n, (scheme, value))| {
+                [stated(n, "scheme", scheme), stated(n, "value", value)]
+            })
+            .collect(),
+        street: Some(StreetRecordRef {
+            statement_id: statement.into(),
+            as_of_date: date.into(),
+            ..Default::default()
+        }),
+        business_date: date.into(),
+        ..Default::default()
+    }
+}
+
 /// Contract v24 (W9.3, W9.4): an unrecognized security's break names no
-/// position and no figure, only the street record by value; brought up to
-/// date while it persists, matched by its category and the street record;
-/// every other category still names its subject.
+/// position and no figure, only the street record by value with the
+/// identifiers it carries; every other category still names its subject.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unrecognized_security_is_a_break_naming_only_the_street_record() {
     let (bus, _store) = wired();
     open(&bus).await;
-    let street = StreetRecordRef {
-        statement_id: "ST-THIN-1".into(),
-        as_of_date: "2026-09-09".into(),
-        ..Default::default()
-    };
-    let unrecognized = RecordBreakRequest {
-        account_id: ACC.into(),
-        subject: None,
-        category: BreakCategory::UnrecognizedSecurity as i32,
-        differences: vec![BreakDifference {
-            field: "identifiers".into(),
-            book: None,
-            street: Some(BreakValue {
-                value: Some(break_value::Value::Text(
-                    "symbol ZZQ9 at the custodian".into(),
-                )),
-            }),
-        }],
-        street: Some(street.clone()),
-        business_date: "2026-09-09".into(),
-        ..Default::default()
-    };
-    let first = record_break(&bus, &unrecognized).await.unwrap();
+    let thin = unrecognized_break("ST-THIN-1", "2026-09-09", &[("custodian", "ZZQ9")]);
+    let first = record_break(&bus, &thin).await.unwrap();
     let [record] = first.breaks.as_slice() else {
         panic!("one break")
     };
@@ -1881,18 +1899,32 @@ async fn an_unrecognized_security_is_a_break_naming_only_the_street_record() {
         "names no instrument and no figure"
     );
     assert_eq!(record.category, BreakCategory::UnrecognizedSecurity as i32);
-    // Sent again for the same street record: the open break brought up to
-    // date, never a second.
-    let mut again = unrecognized.clone();
-    again.business_date = "2026-09-10".into();
-    let updated = record_break(&bus, &again).await.unwrap();
-    assert_eq!(updated.breaks[0].break_id, record.break_id);
-    assert_eq!(updated.breaks[0].last_seen_date, "2026-09-10");
     // Without the street record: refused naming it.
-    let mut blind = unrecognized.clone();
+    let mut blind = thin.clone();
     blind.street = None;
     let refused = record_break(&bus, &blind).await.unwrap_err();
     assert!(refused.contains("street"), "{refused}");
+    // With no identifier stated, only its description, or half of one:
+    // refused.
+    let mut bare = thin.clone();
+    bare.differences = vec![BreakDifference {
+        field: "description".into(),
+        book: None,
+        street: Some(BreakValue {
+            value: Some(break_value::Value::Text("ZZQ9 HOLDINGS".into())),
+        }),
+    }];
+    let refused = record_break(&bus, &bare).await.unwrap_err();
+    assert!(refused.contains("differences"), "{refused}");
+    let mut half = thin.clone();
+    half.differences.truncate(1);
+    let refused = record_break(&bus, &half).await.unwrap_err();
+    assert!(refused.contains("unresolved_identifiers[0]"), "{refused}");
+    // With a position named: refused naming `subject`.
+    let mut named = thin.clone();
+    named.subject = aapl_break().subject;
+    let refused = record_break(&bus, &named).await.unwrap_err();
+    assert!(refused.contains("subject"), "{refused}");
     // Any other category still names its position or figure.
     let mut other = aapl_break();
     other.subject = None;
@@ -1903,39 +1935,67 @@ async fn an_unrecognized_security_is_a_break_naming_only_the_street_record() {
     );
 }
 
-/// An unrecognized security names no subject: one sent with a position is
-/// refused naming `subject`, and an update by its break_id holds it to the
-/// same street record's kind.
+/// The product owner, 2026-10-15: one unknown security keeps one break that
+/// ages across statements until resolved, matched on category, account and
+/// the identifiers the custodian states (scheme and value, in any order),
+/// never the statement; updating by break_id stays.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_unrecognized_security_names_no_subject_and_updates_by_its_id() {
+async fn the_same_unknown_security_on_a_later_statement_updates_the_same_break() {
     let (bus, _store) = wired();
     open(&bus).await;
-    let mut named = aapl_break();
-    named.category = BreakCategory::UnrecognizedSecurity as i32;
-    named.street = Some(StreetRecordRef {
-        statement_id: "ST-THIN-2".into(),
-        as_of_date: "2026-09-09".into(),
-        ..Default::default()
-    });
-    let refused = record_break(&bus, &named).await.unwrap_err();
-    assert!(refused.contains("subject"), "{refused}");
-    let mut thin = named.clone();
-    thin.subject = None;
-    let first = record_break(&bus, &thin).await.unwrap();
-    let id = first.breaks[0].break_id.clone();
-    let mut by_id = thin.clone();
+    let first = unrecognized_break(
+        "ST-THIN-1",
+        "2026-09-09",
+        &[("custodian", "ZZQ9"), ("cusip-like", "99999Z999")],
+    );
+    let id = record_break(&bus, &first).await.unwrap().breaks[0]
+        .break_id
+        .clone();
+    // A later statement, its identifiers stated in the other order.
+    let later = unrecognized_break(
+        "ST-THIN-2",
+        "2026-09-10",
+        &[("cusip-like", "99999Z999"), ("custodian", "ZZQ9")],
+    );
+    let updated = record_break(&bus, &later).await.unwrap();
+    assert_eq!(updated.breaks[0].break_id, id, "the same break, aged");
+    assert_eq!(updated.breaks[0].last_seen_date, "2026-09-10");
+    assert_eq!(updated.breaks[0].first_seen_date, "2026-09-09");
+    // By its break_id as well.
+    let mut by_id = unrecognized_break(
+        "ST-THIN-3",
+        "2026-09-11",
+        &[("custodian", "ZZQ9"), ("cusip-like", "99999Z999")],
+    );
     by_id.break_id = id.clone();
-    by_id.business_date = "2026-09-11".into();
     let updated = record_break(&bus, &by_id).await.unwrap();
     assert_eq!(updated.breaks[0].break_id, id);
     assert_eq!(updated.breaks[0].last_seen_date, "2026-09-11");
-    // A different street record is a different unrecognized security.
-    let mut other = thin.clone();
-    other.street = Some(StreetRecordRef {
-        statement_id: "ST-THIN-3".into(),
-        as_of_date: "2026-09-09".into(),
-        ..Default::default()
-    });
-    let second = record_break(&bus, &other).await.unwrap();
-    assert_ne!(second.breaks[0].break_id, id);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn different_identifiers_open_a_new_unrecognized_security_break() {
+    let (bus, _store) = wired();
+    open(&bus).await;
+    let first = unrecognized_break("ST-THIN-1", "2026-09-09", &[("custodian", "ZZQ9")]);
+    let id = record_break(&bus, &first).await.unwrap().breaks[0]
+        .break_id
+        .clone();
+    // Another value under the same scheme, on the same statement.
+    let other = unrecognized_break("ST-THIN-1", "2026-09-09", &[("custodian", "ZZQ8")]);
+    let second = record_break(&bus, &other).await.unwrap().breaks[0]
+        .break_id
+        .clone();
+    assert_ne!(second, id);
+    // One more identifier stated is another set, so another break.
+    let wider = unrecognized_break(
+        "ST-THIN-2",
+        "2026-09-10",
+        &[("custodian", "ZZQ9"), ("isin-like", "XX0000000000")],
+    );
+    let third = record_break(&bus, &wider).await.unwrap().breaks[0]
+        .break_id
+        .clone();
+    assert_ne!(third, id);
+    assert_ne!(third, second);
 }

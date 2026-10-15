@@ -22,10 +22,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use meridian_domain::exact::Exact;
 use meridian_domain::v1::{
-    actor, basis_adjustment, break_cause, record_break_request, resolve_break_request,
+    actor, basis_adjustment, break_cause, break_value, record_break_request, resolve_break_request,
     set_account_attribute_request, AccountAttributes, AccountFigures, Actor, BasisAdjustment,
-    Break, BreakCategory, BreakCauseCategory, BreakResolution, BreakState, ChangeCause,
-    CloseBreaksAsClearedRequest, Encumbrance, EncumbranceKind, EntryMeta, FigureKey,
+    Break, BreakCategory, BreakCauseCategory, BreakDifference, BreakResolution, BreakState,
+    ChangeCause, CloseBreaksAsClearedRequest, Encumbrance, EncumbranceKind, EntryMeta, FigureKey,
     HandleBreakRequest, HoldingSide, LotReliefMethod, LotSource, MovementLine, OpeningBalance,
     OpeningPosition, PersonActor, PositionKey, RecordAccountFiguresRequest, RecordBreakRequest,
     RecordEncumbrancesRequest, RecordOpeningBalanceRequest, ReferenceVersion, ResolveBreakRequest,
@@ -827,19 +827,28 @@ pub fn record_break(
         check_cause(&format!("candidate_causes[{index}]"), cause)?;
     }
 
-    // An unrecognized security still open for the same street record is
-    // brought up to date, never recorded twice (W9.4): matched by its
-    // category and the street record, the only key it has.
-    let matched = (request.break_id.is_empty() && unrecognized)
-        .then(|| {
+    // An unrecognized security still open is brought up to date, never
+    // recorded twice (W9.4): one unknown security keeps one break that ages
+    // across statements until resolved, matched by its category, the account
+    // (the book's own) and the identifiers the custodian states, scheme and
+    // value in any order; never by the statement or any per-statement field
+    // (the product owner, 2026-10-15).
+    let stated = if unrecognized {
+        Some(stated_identifiers(&request.differences)?)
+    } else {
+        None
+    };
+    let matched = stated
+        .as_ref()
+        .filter(|_| request.break_id.is_empty())
+        .and_then(|stated| {
             book.breaks.values().find(|held| {
                 held.state == BreakState::Open as i32
                     && held.category == request.category
                     && held.subject.is_none()
-                    && held.street == request.street
+                    && stated_identifiers(&held.differences).ok().as_ref() == Some(stated)
             })
         })
-        .flatten()
         .map(|held| held.break_id.clone());
     let break_id = matched.unwrap_or_else(|| request.break_id.clone());
     let record = if break_id.is_empty() {
@@ -1994,4 +2003,75 @@ pub fn instruments_named(lines: &[MovementLine], positions: &[OpeningPosition]) 
             .map(|position| position.instrument_id.clone()),
     );
     named.into_iter().filter(|id| !id.is_empty()).collect()
+}
+
+/// The identifiers an unrecognized security's custodian states (W9.3: "the
+/// street record by value with the raw identifiers it carries"), carried as
+/// its street-only differences by the street row's own field,
+/// `unresolved_identifiers[n].scheme` and `unresolved_identifiers[n].value`
+/// (RecordHoldingRequest.unresolved_identifiers, W2.4), each a text. The set
+/// is the break's match key, so the order they are sent in never matters.
+/// At least one is required, each with both parts; refused otherwise, naming
+/// the difference or `differences`.
+fn stated_identifiers(differences: &[BreakDifference]) -> Result<BTreeSet<(String, String)>> {
+    let mut parts: BTreeMap<String, (Option<String>, Option<String>)> = BTreeMap::new();
+    for (index, difference) in differences.iter().enumerate() {
+        let Some(rest) = difference.field.strip_prefix("unresolved_identifiers[") else {
+            continue;
+        };
+        let (position, part) = rest.split_once("].").unwrap_or((rest, ""));
+        let text = match difference
+            .street
+            .as_ref()
+            .and_then(|value| value.value.as_ref())
+        {
+            Some(break_value::Value::Text(text)) if !text.trim().is_empty() => text.trim(),
+            _ => {
+                return Err(StoreError::Malformed {
+                    fields: vec![format!("differences[{index}].street")],
+                    words: "an unrecognized security's identifier is the custodian's text".into(),
+                })
+            }
+        };
+        if position.is_empty() || !position.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(StoreError::Malformed {
+                fields: vec![format!("differences[{index}].field")],
+                words: "an identifier's field is unresolved_identifiers[n].scheme or .value".into(),
+            });
+        }
+        let held = parts.entry(position.to_string()).or_default();
+        match part {
+            "scheme" => held.0 = Some(text.to_string()),
+            "value" => held.1 = Some(text.to_string()),
+            _ => {
+                return Err(StoreError::Malformed {
+                    fields: vec![format!("differences[{index}].field")],
+                    words: "an identifier's field is unresolved_identifiers[n].scheme or .value"
+                        .into(),
+                })
+            }
+        }
+    }
+    let mut stated = BTreeSet::new();
+    for (position, held) in parts {
+        match held {
+            (Some(scheme), Some(value)) => {
+                stated.insert((scheme, value));
+            }
+            _ => {
+                return Err(StoreError::Malformed {
+                    fields: vec![format!("unresolved_identifiers[{position}]")],
+                    words: "an identifier names its scheme and its value".into(),
+                })
+            }
+        }
+    }
+    if stated.is_empty() {
+        return Err(StoreError::Malformed {
+            fields: vec!["differences".into()],
+            words: "an unrecognized security's break carries the identifiers the custodian states"
+                .into(),
+        });
+    }
+    Ok(stated)
 }
