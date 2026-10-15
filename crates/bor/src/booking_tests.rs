@@ -588,6 +588,10 @@ async fn a_block_is_booked_across_two_funds_and_each_member_is_filled_by_its_all
         })
         .unwrap();
     assert!(none_since.records.is_empty());
+    // The sweep, one account at a time (approved 2026-10-15): each fund
+    // received its allocation already, so nothing is owed and nothing made.
+    let store: &dyn crate::store::Store = w.store.as_ref();
+    assert_eq!(crate::booking_service::sweep_children(&w.bus, store), Ok(0));
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -203,6 +203,19 @@ bor:
   database:
     existingSecret: ""
     key: ""
+  # The book replays an account's journal for each command and each dated
+  # read, so it needs more room than the other components (approved
+  # 2026-10-15, after a development pod at 256Mi was OOMKilled). Replaces
+  # the shared `resources` for the book alone.
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+  # glibc's allocator arenas, at most this many: a burst of requests answered
+  # on many threads otherwise keeps an arena's memory per thread resident.
+  mallocArenaMax: 2
 
 # The lake (W10, contract v18). One replica: every batch takes its dataset's
 # head in Postgres, so a second would wait rather than help, and the rollout

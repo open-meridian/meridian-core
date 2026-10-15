@@ -63,6 +63,10 @@ spec:
               value: {{ include "meridian-runtime.fullname" . }}-bor
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
+            {{- with .Values.bor.mallocArenaMax }}
+            - name: MALLOC_ARENA_MAX
+              value: {{ . | quote }}
+            {{- end }}
             - name: MERIDIAN_BOR_DATABASE_URL
               valueFrom:
                 secretKeyRef:
@@ -78,6 +82,6 @@ spec:
           volumeMounts:
             {{- include "meridian-runtime.readyMount" . | nindent 12 }}
           resources:
-            {{- toYaml .Values.resources | nindent 12 }}
+            {{- toYaml (.Values.bor.resources | default .Values.resources) | nindent 12 }}
       volumes:
         {{- include "meridian-runtime.readyVolume" . | nindent 8 }}

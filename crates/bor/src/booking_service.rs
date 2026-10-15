@@ -16,7 +16,7 @@
 //! the block (W11.1). Both are read here, before the lock, as the accept reads
 //! where each execution is: no decision reads two partitions under one lock.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -320,22 +320,32 @@ fn said(
 /// a live booking received by its account, and each received allocation its
 /// booking no longer carries withdrawn. Says how many it made.
 pub fn sweep_children(bus: &Bus, store: &dyn Store) -> Result<usize, String> {
+    // One account replayed at a time, its book dropped before the next
+    // (approved 2026-10-15, after the book's pod was OOMKilled): what the
+    // cross-account checks need is kept as keys alone -- the allocations
+    // each account received, and those each live booking carries.
     let accounts = store.accounts().map_err(|failed| failed.to_string())?;
-    let mut books = BTreeMap::new();
+    let mut moves = Vec::new();
+    let mut received_by: BTreeSet<(String, String, String)> = BTreeSet::new();
+    let mut carried_by: BTreeSet<(String, String, String)> = BTreeSet::new();
+    let mut receiving: Vec<(String, String, String, String)> = Vec::new();
     for account in &accounts {
         let entries = store
             .journal(account)
             .map_err(|failed| failed.to_string())?;
         let book = Book::replay(account, crate::store::first_partition_of(account), &entries)
             .map_err(|failed| failed.to_string())?;
-        books.insert(account.clone(), book);
-    }
-    let mut moves = Vec::new();
-    let mut withdrawals = Vec::new();
-    for book in books.values() {
+        drop(entries);
         for (id, held) in &book.ledger.bookings {
             if held.state == meridian_domain::v1::BookingState::Cancelled {
                 continue;
+            }
+            for allocation in &held.booking.allocations {
+                carried_by.insert((
+                    account.clone(),
+                    id.clone(),
+                    allocation.allocation_id.clone(),
+                ));
             }
             let members: Vec<String> = book
                 .ledger
@@ -347,43 +357,34 @@ pub fn sweep_children(bus: &Bus, store: &dyn Store) -> Result<usize, String> {
                 members: member_views(store, &members),
                 ..Default::default()
             };
-            for moved in booking::child_moves(book, id, &ctx).map_err(|f| f.to_string())? {
-                let received = books
-                    .get(&moved.allocation.account_id)
-                    .is_some_and(|other| {
-                        other.ledger.received.contains_key(&(
-                            moved.booking_id.clone(),
-                            moved.allocation.allocation_id.clone(),
-                        ))
-                    });
-                if !received {
-                    moves.push(moved);
-                }
-            }
+            moves.extend(booking::child_moves(&book, id, &ctx).map_err(|f| f.to_string())?);
         }
         for ((booking_id, allocation_id), received) in &book.ledger.received {
-            if received.withdrawn {
-                continue;
-            }
-            let carried = books.get(&received.from_account).is_some_and(|from| {
-                from.ledger.bookings.get(booking_id).is_some_and(|held| {
-                    held.state != meridian_domain::v1::BookingState::Cancelled
-                        && held
-                            .booking
-                            .allocations
-                            .iter()
-                            .any(|allocation| &allocation.allocation_id == allocation_id)
-                })
-            });
-            if !carried {
-                withdrawals.push((
-                    book.account_id.clone(),
+            received_by.insert((account.clone(), booking_id.clone(), allocation_id.clone()));
+            if !received.withdrawn {
+                receiving.push((
+                    account.clone(),
                     booking_id.clone(),
                     allocation_id.clone(),
+                    received.from_account.clone(),
                 ));
             }
         }
     }
+    moves.retain(|moved| {
+        !received_by.contains(&(
+            moved.allocation.account_id.clone(),
+            moved.booking_id.clone(),
+            moved.allocation.allocation_id.clone(),
+        ))
+    });
+    let withdrawals: Vec<(String, String, String)> = receiving
+        .into_iter()
+        .filter(|(_, booking_id, allocation_id, from)| {
+            !carried_by.contains(&(from.clone(), booking_id.clone(), allocation_id.clone()))
+        })
+        .map(|(account, booking_id, allocation_id, _)| (account, booking_id, allocation_id))
+        .collect();
     Ok(make_children(bus, store, &moves, &withdrawals, None, None))
 }
 
