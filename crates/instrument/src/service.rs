@@ -108,6 +108,13 @@ pub const LIST_REPLACEMENTS: &str = "platform.reference.query.list-replacements"
 /// fields.
 pub const OFFER_TEMPLATE_FIELDS: &str = "platform.reference.command.offer-template-fields";
 
+/// W3.26 (contract v24). The deployment admin making the migration's lines.
+pub const APPLY_INSTRUMENT_MIGRATION: &str =
+    "platform.reference.command.apply-instrument-migration";
+
+/// W3.28 (contract v24). The conductor asking for the usage report's counts.
+pub const LIST_IDENTIFIER_USAGE: &str = "platform.reference.query.list-identifier-usage";
+
 /// W3.24 (contract v24). The template catalogue the store holds.
 pub const LIST_TEMPLATES: &str = "platform.reference.query.list-templates";
 pub const READ_TEMPLATE: &str = "platform.reference.query.read-template";
@@ -300,6 +307,16 @@ pub fn serve_all_within(
             if let Some(changed) = &resolution.changed {
                 announce(&announcing, changed, &envelope, now_ns);
             }
+            // A miss leaves no record: counted for the usage report (W3.28),
+            // against its one scheme, never its value.
+            if resolution.reply.miss_reason != 0 {
+                let _held = writing.lock().map_err(|_| "the write lock is poisoned")?;
+                if let Err(failed) =
+                    crate::usage::note_miss(store.as_ref(), &request.identifiers, now_ns)
+                {
+                    tracing::warn!(%failed, "a miss could not be counted for the usage report");
+                }
+            }
             Ok((
                 "meridian.v1.ResolveIdentifierReply".to_string(),
                 resolution.reply.encode_to_vec(),
@@ -481,6 +498,106 @@ fn serve_one_id(bus: &Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>, wr
                 .map_err(|failed| failed.to_string())?;
             Ok((
                 "meridian.v1.ListReplacementsReply".to_string(),
+                reply.encode_to_vec(),
+            ))
+        });
+    }
+    {
+        let (store, clock, writing, announcing) = (
+            store.clone(),
+            clock.clone(),
+            writing.clone(),
+            Arc::clone(bus),
+        );
+        bus.serve(APPLY_INSTRUMENT_MIGRATION, move |envelope| {
+            let request: meridian_domain::v1::ApplyInstrumentMigrationRequest =
+                decode(&envelope, "meridian.v1.ApplyInstrumentMigrationRequest")?;
+            let actor = actor_of(&envelope);
+            let now_ns = clock.now_ns();
+            let (made, counts) = {
+                let _held = writing.lock().map_err(|_| "the write lock is poisoned")?;
+                let made = crate::reask::apply_migration(store.as_ref(), &request, &actor, now_ns)
+                    .map_err(|failed| failed.to_string())?
+                    .map_err(|refused| match refused {
+                        crate::reask::LinesRefused::ActorRequired => meridian_bus::refusal(
+                            meridian_pb::v1::RefusalReason::ActorRequired as i32,
+                            "a person makes the migration's lines, and none was named",
+                        ),
+                        crate::reask::LinesRefused::NoteRequired => meridian_bus::refusal(
+                            meridian_pb::v1::RefusalReason::ReasonRequired as i32,
+                            "through a delegation a change to the migration's lines says why",
+                        ),
+                        crate::reask::LinesRefused::TooMany(field) => {
+                            meridian_bus::refusal_with_status(
+                                meridian_bus::RefusalStatus::InvalidArgument,
+                                std::slice::from_ref(&field),
+                                if field == "note" {
+                                    format!("note: at most {} characters", crate::reask::MOST_NOTE)
+                                } else {
+                                    format!(
+                                        "{field}: at most {} lines in one change",
+                                        crate::reask::MOST_LINES
+                                    )
+                                },
+                            )
+                        }
+                        crate::reask::LinesRefused::NotALine { path, words } => {
+                            meridian_bus::refusal_naming(
+                                meridian_pb::v1::RefusalReason::Unspecified as i32,
+                                &[path],
+                                words,
+                            )
+                        }
+                    })?;
+                let mut live = Vec::new();
+                for record in store.all().map_err(|failed| failed.to_string())? {
+                    if store
+                        .replacement_of(&record.instrument_id)
+                        .map_err(|failed| failed.to_string())?
+                        .is_none()
+                    {
+                        live.push(record);
+                    }
+                }
+                let counts = crate::reask::migration_counts(store.as_ref(), &live)
+                    .map_err(|failed| failed.to_string())?
+                    .unwrap_or_default();
+                (made, counts)
+            };
+            for applied in &made.applied {
+                publish_applied(&announcing, applied, now_ns);
+            }
+            for held in &made.held_back {
+                announce(&announcing, held, &envelope, now_ns);
+            }
+            tracing::info!(
+                by = actor.person,
+                made = made.applied.len(),
+                held_back = made.held_back.len(),
+                "the migration's lines made"
+            );
+            Ok((
+                "meridian.v1.MigrationCounts".to_string(),
+                counts.encode_to_vec(),
+            ))
+        });
+    }
+    {
+        let store = store.clone();
+        bus.serve(LIST_IDENTIFIER_USAGE, move |envelope| {
+            let request: meridian_domain::v1::ListIdentifierUsageRequest =
+                decode(&envelope, "meridian.v1.ListIdentifierUsageRequest")?;
+            let reply = crate::usage::list_identifier_usage(store.as_ref(), &request)
+                .map_err(|failed| failed.to_string())?
+                .map_err(|(field, words)| {
+                    meridian_bus::refusal_with_status(
+                        meridian_bus::RefusalStatus::InvalidArgument,
+                        std::slice::from_ref(&field),
+                        format!("{field}: {words}"),
+                    )
+                })?;
+            Ok((
+                "meridian.v1.ListIdentifierUsageReply".to_string(),
                 reply.encode_to_vec(),
             ))
         });

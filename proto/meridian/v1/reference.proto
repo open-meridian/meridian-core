@@ -1298,6 +1298,14 @@ message InstrumentToComplete {
   // Contract v24 (W3.7, W3.11): why the record is provisional; unspecified
   // on a record that is not.
   ProvisionalReason provisional_reason = 5;
+
+  // Contract v24 (W3.26; the names approved 2026-10-15): the migration's
+  // section for this record's line, and the INS- record the platform
+  // answered it with -- set for a line matched, minted, a near-match,
+  // already held or held back, empty otherwise. Two records answered by
+  // one INS- ID are a duplicate line: making both replaces each by it.
+  MigrationSection migration_section = 6;
+  string answered_instrument_id = 7;
 }
 
 // Why a deployment's record is provisional (W3.7, W3.11; contract v24).
@@ -1307,7 +1315,9 @@ enum ProvisionalReason {
   PROVISIONAL_REASON_UNREACHABLE = 1;
   // Incomplete against its template, its missing_fields listed: the
   // incomplete or offline state, a thin record with no open identifier
-  // whose terms are incomplete among them.
+  // whose terms are incomplete among them. Also a migration's line the
+  // platform answered -- matched, minted, a near-match or already held --
+  // until the deployment admin makes it (W3.26).
   PROVISIONAL_REASON_INCOMPLETE = 2;
   // Its request in the platform's staff's queue.
   PROVISIONAL_REASON_AWAITING_STAFF = 3;
@@ -1315,6 +1325,22 @@ enum ProvisionalReason {
   PROVISIONAL_REASON_CLASS_NEEDED = 4;
   // Held back by the deployment admin at the migration (W3.26).
   PROVISIONAL_REASON_HELD_BACK = 5;
+}
+
+// W3.26 (contract v24; approved 2026-10-15): the section a migration's
+// line is in, as MigrationCounts counts them.
+enum MigrationSection {
+  MIGRATION_SECTION_UNSPECIFIED = 0;
+  // Already carrying the platform's ID.
+  MIGRATION_SECTION_ALREADY_HELD = 1;
+  MIGRATION_SECTION_MATCHED = 2;
+  MIGRATION_SECTION_MINTED = 3;
+  MIGRATION_SECTION_NEAR_MATCH = 4;
+  MIGRATION_SECTION_AWAITING_STAFF = 5;
+  // No open identifier: nothing the licence list lets it send.
+  MIGRATION_SECTION_KEPT_LOCAL = 6;
+  MIGRATION_SECTION_UNREACHABLE = 7;
+  MIGRATION_SECTION_HELD_BACK = 8;
 }
 
 // Identifiers that met more than one record, or an identifier another record
@@ -2171,6 +2197,26 @@ message LicencePace {
   int32 batches_per_minute = 2;
 }
 
+// W3.26: the deployment admin makes the migration's lines -- the exact lines
+// as one change, each uncertain line its own -- from the Instruments page's
+// provisional records, a prepared change made (W6.26, W6.27). Each record in
+// instrument_ids is replaced by the INS- record its line answered (W3.8,
+// REPLACEMENT_CAUSE_RESOLVED); each in held_back_ids keeps its LCL- ID,
+// provisional with PROVISIONAL_REASON_HELD_BACK, and nothing is minted for
+// it. Made together or refused whole, naming each line by its path. Answered
+// with the run's counts after (MigrationCounts).
+message ApplyInstrumentMigrationRequest {
+  // The LCL- records whose lines are made. At most 500.
+  repeated string instrument_ids = 1;
+
+  // The LCL- records whose lines are held back. At most 500.
+  repeated string held_back_ids = 2;
+
+  // Why, at most 2,000 characters, on each record's version; required
+  // through a delegation (approved 2026-10-15).
+  string note = 3;
+}
+
 // W3.27: the platform's replacements and decommissions after a sequence,
 // the same for every deployment, handed to the store as it came
 // (`platform.reference.event.replacements-pulled`).
@@ -2213,4 +2259,21 @@ message SchemeUsageCount {
 
 message ReportIdentifierUsageReply {
   bool received = 1;
+}
+
+// W3.28: the conductor asks the instrument store for the counts its report
+// carries, weekly and once after the migration
+// (`platform.reference.query.list-identifier-usage`). Counts only: never a
+// value, a holding, a quantity or an account.
+message ListIdentifierUsageRequest {
+  // ISO 8601 dates, the period the counts cover.
+  string period_start = 1;
+  string period_end = 2;
+}
+
+message ListIdentifierUsageReply {
+  // One per identifier scheme: the instruments carrying it and those
+  // resolving only through it, as the period ends, and the misses that
+  // arrived with it as their only identifier within the period.
+  repeated SchemeUsageCount scheme_counts = 1;
 }

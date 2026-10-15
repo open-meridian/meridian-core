@@ -170,6 +170,18 @@ message DefineAccountRequest {
 
 message CloseAccountRequest {
   string account_id = 1;
+
+  // Contract v24 (W6.3): "Unlink all and close". The conductor withdraws
+  // every grant of the account to a plugin instance (W6.30), each its own
+  // record, and closes it, in one step. A link (W6.4) or an ems's mapping
+  // (W11.22) still standing is undone at its plugin's page: the closure is
+  // refused naming each, and nothing is withdrawn or closed. Without it, an
+  // account anything is still attached to is refused the same way.
+  bool unlink_attached = 2;
+
+  // Why, at most 2,000 characters, on each grant's withdrawal; required
+  // through a delegation (approved 2026-10-15).
+  string note = 3;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -891,6 +903,10 @@ message ListUsageReportsRequest {}
 
 message ListUsageReportsReply {
   repeated SentUsageReport reports = 1;
+
+  // The setting in force (`reports_usage`), so the page says whether the
+  // report is on.
+  bool reports_usage = 2;
 }
 
 // A usage report the conductor sent, kept on the deployment as its own

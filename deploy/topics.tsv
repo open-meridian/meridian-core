@@ -137,6 +137,7 @@ platform.lake.{dataset}.event.outcomes-recorded	event	lake	reporting,portfolio,c
 platform.lake.{dataset}.event.prices-recorded	event	lake	reporting,portfolio,compliance,signal
 platform.lake.{dataset}.event.quotes-recorded	event	lake	signal,ems
 platform.lake.{dataset}.event.trades-recorded	event	lake	signal,ems
+platform.reference.command.apply-instrument-migration	command	dashboard	instrument
 platform.reference.command.complete-instruments	command	dashboard	instrument
 platform.reference.command.merge-instruments	command	dashboard	instrument
 platform.reference.command.offer-template-fields	command	reference	instrument
@@ -154,6 +155,7 @@ platform.reference.event.venue-missing	event	data,connectivity	instrument,conduc
 platform.reference.query.ask-platform-for-instrument	query	dashboard,instrument	conductor
 platform.reference.query.compute-date	query	compliance,confirmation,connectivity,custody,data,ems,oms,operations,portfolio,reference,reporting,servicing,settlement,signal	instrument
 platform.reference.query.list-calendars	query	dashboard	instrument
+platform.reference.query.list-identifier-usage	query	conductor	instrument
 platform.reference.query.list-instruments-to-complete	query	dashboard	instrument
 platform.reference.query.list-replacements	query	compliance,confirmation,connectivity,custody,data,ems,oms,operations,portfolio,reference,reporting,servicing,settlement,signal	instrument
 platform.reference.query.list-templates	query	compliance,confirmation,connectivity,custody,data,ems,oms,operations,portfolio,reference,reporting,servicing,settlement,signal,dashboard	instrument

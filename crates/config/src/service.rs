@@ -1373,17 +1373,44 @@ pub fn serve_with(
         |cx, request: CloseAccountRequest, envelope| {
             let before = cx.snapshot()?;
             rules::close_account(&before, &request.account_id)?;
+            // Why, on each grant's withdrawal; through a delegation required
+            // (approved 2026-10-15).
+            let note = request.note.trim();
+            if let Some(refused) = crate::store::note_refused(note) {
+                return Err(refused);
+            }
+            if note.is_empty() && !delegation(envelope).is_empty() {
+                return Err(meridian_bus::refusal(
+                    meridian_pb::v1::RefusalReason::ReasonRequired as i32,
+                    "through a delegation closing an account says why",
+                ));
+            }
             // Never left dangling (approved 2026-10-14): an account still
-            // linked, granted or mapped is refused, naming each.
+            // linked, granted or mapped is refused, naming each. "Unlink all
+            // and close" (contract v24, W6.3) withdraws the grants in the
+            // same step; a link or an ems's mapping is undone at its
+            // plugin's own page, so while one stands nothing is withdrawn
+            // or closed.
             let attached = rules::attached(&before, &request.account_id);
-            if !attached.is_empty() {
+            let standing: Vec<&rules::Attached> = attached
+                .iter()
+                .filter(|item| {
+                    !(request.unlink_attached && matches!(item, rules::Attached::Grant { .. }))
+                })
+                .collect();
+            if !standing.is_empty() {
                 return Err(meridian_bus::refusal_naming(
                     meridian_pb::v1::RefusalReason::Unspecified as i32,
                     &["account_id".to_string()],
                     format!(
-                        "account {} is still attached, and nothing was closed: {}",
+                        "account {} is still attached, and nothing was {}: {}",
                         request.account_id,
-                        attached
+                        if request.unlink_attached {
+                            "withdrawn or closed"
+                        } else {
+                            "closed"
+                        },
+                        standing
                             .iter()
                             .map(|item| item.words())
                             .collect::<Vec<_>>()
@@ -1399,7 +1426,35 @@ pub fn serve_with(
                 .cloned()
                 .expect("the rule checked it exists");
             account.state = AccountState::Closed as i32;
-            cx.store.put_account(&account).map_err(|f| f.to_string())?;
+            if attached.is_empty() {
+                cx.store.put_account(&account).map_err(|f| f.to_string())?;
+            } else {
+                let withdrawn_from = cx
+                    .store
+                    .close_account_withdrawing_grants(
+                        &account,
+                        &Author {
+                            note: if note.is_empty() {
+                                "withdrawn with the account's closure: Unlink all and close (W6.3)"
+                                    .into()
+                            } else {
+                                format!(
+                                    "withdrawn with the account's closure: Unlink all and close \
+                                     (W6.3): {note}"
+                                )
+                            },
+                            ..author(envelope)
+                        },
+                        cx.clock.now_ns(),
+                    )
+                    .map_err(|f| f.to_string())?;
+                tracing::info!(
+                    account = account.account_id,
+                    withdrawn = withdrawn_from.len(),
+                    by = subject(envelope),
+                    "grants withdrawn with the account's closure"
+                );
+            }
             tracing::info!(
                 account = account.account_id,
                 by = subject(envelope),
@@ -1470,6 +1525,9 @@ pub fn serve_with(
         |cx, _request: meridian_domain::v1::ListUsageReportsRequest, _| {
             Ok(meridian_domain::v1::ListUsageReportsReply {
                 reports: cx.store.usage_reports(52).map_err(|f| f.to_string())?,
+                // The setting in force, so the page says whether the report
+                // is on (W3.28, contract v24).
+                reports_usage: cx.store.reports_usage().map_err(|f| f.to_string())?,
             })
         },
     );

@@ -1525,6 +1525,72 @@ impl Store for PostgresStore {
         Ok((licences, entitlements))
     }
 
+    fn close_account_withdrawing_grants(
+        &self,
+        account: &AccountRecord,
+        author: &Author,
+        at_ns: i64,
+    ) -> Result<Vec<String>> {
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        let instances: Vec<String> = tx
+            .query(
+                "SELECT plugin_instance_id FROM config_linkable_account WHERE account_id = $1
+                  ORDER BY plugin_instance_id",
+                &[&account.account_id],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        let mut withdrawn_from = Vec::new();
+        for instance in &instances {
+            // Each instance's grants in turn, as a grant's change takes them.
+            tx.execute(
+                "SELECT pg_advisory_xact_lock(hashtext('config_linkable_account:' || $1))",
+                &[instance],
+            )
+            .map_err(unavailable)?;
+            let removed = tx
+                .execute(
+                    "DELETE FROM config_linkable_account
+                      WHERE plugin_instance_id = $1 AND account_id = $2",
+                    &[instance, &account.account_id],
+                )
+                .map_err(unavailable)?;
+            if removed != 1 {
+                continue;
+            }
+            let withdrawn = vec![account.account_id.clone()];
+            let granted: Vec<String> = Vec::new();
+            tx.execute(
+                "INSERT INTO config_linkable_accounts_change
+                        (plugin_instance_id, granted, withdrawn, changed_by, through_delegation,
+                         client_name, changed_at_ns, note)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                &[
+                    instance,
+                    &granted,
+                    &withdrawn,
+                    &author.by,
+                    &author.delegation,
+                    &author.client,
+                    &at_ns,
+                    &author.note,
+                ],
+            )
+            .map_err(unavailable)?;
+            withdrawn_from.push(instance.clone());
+        }
+        tx.execute(
+            "UPDATE config_account SET state = $2 WHERE account_id = $1",
+            &[&account.account_id, &(account.state as i16)],
+        )
+        .map_err(unavailable)?;
+        tx.commit().map_err(unavailable)?;
+        Ok(withdrawn_from)
+    }
+
     fn set_linkable_accounts(
         &self,
         plugin_instance_id: &str,

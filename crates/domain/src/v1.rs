@@ -1245,6 +1245,15 @@ pub struct InstrumentToComplete {
     /// on a record that is not.
     #[prost(enumeration = "ProvisionalReason", tag = "5")]
     pub provisional_reason: i32,
+    /// Contract v24 (W3.26; the names approved 2026-10-15): the migration's
+    /// section for this record's line, and the INS- record the platform
+    /// answered it with -- set for a line matched, minted, a near-match,
+    /// already held or held back, empty otherwise. Two records answered by
+    /// one INS- ID are a duplicate line: making both replaces each by it.
+    #[prost(enumeration = "MigrationSection", tag = "6")]
+    pub migration_section: i32,
+    #[prost(string, tag = "7")]
+    pub answered_instrument_id: ::prost::alloc::string::String,
 }
 /// Identifiers that met more than one record, or an identifier another record
 /// carries (W3.1, W3.2, W3.10): not a match, and listed until a merge
@@ -2259,6 +2268,27 @@ pub struct LicencePace {
     #[prost(int32, tag = "2")]
     pub batches_per_minute: i32,
 }
+/// W3.26: the deployment admin makes the migration's lines -- the exact lines
+/// as one change, each uncertain line its own -- from the Instruments page's
+/// provisional records, a prepared change made (W6.26, W6.27). Each record in
+/// instrument_ids is replaced by the INS- record its line answered (W3.8,
+/// REPLACEMENT_CAUSE_RESOLVED); each in held_back_ids keeps its LCL- ID,
+/// provisional with PROVISIONAL_REASON_HELD_BACK, and nothing is minted for
+/// it. Made together or refused whole, naming each line by its path. Answered
+/// with the run's counts after (MigrationCounts).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ApplyInstrumentMigrationRequest {
+    /// The LCL- records whose lines are made. At most 500.
+    #[prost(string, repeated, tag = "1")]
+    pub instrument_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// The LCL- records whose lines are held back. At most 500.
+    #[prost(string, repeated, tag = "2")]
+    pub held_back_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Why, at most 2,000 characters, on each record's version; required
+    /// through a delegation (approved 2026-10-15).
+    #[prost(string, tag = "3")]
+    pub note: ::prost::alloc::string::String,
+}
 /// W3.27: the platform's replacements and decommissions after a sequence,
 /// the same for every deployment, handed to the store as it came
 /// (`platform.reference.event.replacements-pulled`).
@@ -2316,6 +2346,26 @@ pub struct SchemeUsageCount {
 pub struct ReportIdentifierUsageReply {
     #[prost(bool, tag = "1")]
     pub received: bool,
+}
+/// W3.28: the conductor asks the instrument store for the counts its report
+/// carries, weekly and once after the migration
+/// (`platform.reference.query.list-identifier-usage`). Counts only: never a
+/// value, a holding, a quantity or an account.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListIdentifierUsageRequest {
+    /// ISO 8601 dates, the period the counts cover.
+    #[prost(string, tag = "1")]
+    pub period_start: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub period_end: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListIdentifierUsageReply {
+    /// One per identifier scheme: the instruments carrying it and those
+    /// resolving only through it, as the period ends, and the misses that
+    /// arrived with it as their only identifier within the period.
+    #[prost(message, repeated, tag = "1")]
+    pub scheme_counts: ::prost::alloc::vec::Vec<SchemeUsageCount>,
 }
 /// Lifecycle. The transition verbs are the commands; nothing sets this directly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
@@ -2856,7 +2906,9 @@ pub enum ProvisionalReason {
     Unreachable = 1,
     /// Incomplete against its template, its missing_fields listed: the
     /// incomplete or offline state, a thin record with no open identifier
-    /// whose terms are incomplete among them.
+    /// whose terms are incomplete among them. Also a migration's line the
+    /// platform answered -- matched, minted, a near-match or already held --
+    /// until the deployment admin makes it (W3.26).
     Incomplete = 2,
     /// Its request in the platform's staff's queue.
     AwaitingStaff = 3,
@@ -2889,6 +2941,57 @@ impl ProvisionalReason {
             "PROVISIONAL_REASON_AWAITING_STAFF" => Some(Self::AwaitingStaff),
             "PROVISIONAL_REASON_CLASS_NEEDED" => Some(Self::ClassNeeded),
             "PROVISIONAL_REASON_HELD_BACK" => Some(Self::HeldBack),
+            _ => None,
+        }
+    }
+}
+/// W3.26 (contract v24; approved 2026-10-15): the section a migration's
+/// line is in, as MigrationCounts counts them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum MigrationSection {
+    Unspecified = 0,
+    /// Already carrying the platform's ID.
+    AlreadyHeld = 1,
+    Matched = 2,
+    Minted = 3,
+    NearMatch = 4,
+    AwaitingStaff = 5,
+    /// No open identifier: nothing the licence list lets it send.
+    KeptLocal = 6,
+    Unreachable = 7,
+    HeldBack = 8,
+}
+impl MigrationSection {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "MIGRATION_SECTION_UNSPECIFIED",
+            Self::AlreadyHeld => "MIGRATION_SECTION_ALREADY_HELD",
+            Self::Matched => "MIGRATION_SECTION_MATCHED",
+            Self::Minted => "MIGRATION_SECTION_MINTED",
+            Self::NearMatch => "MIGRATION_SECTION_NEAR_MATCH",
+            Self::AwaitingStaff => "MIGRATION_SECTION_AWAITING_STAFF",
+            Self::KeptLocal => "MIGRATION_SECTION_KEPT_LOCAL",
+            Self::Unreachable => "MIGRATION_SECTION_UNREACHABLE",
+            Self::HeldBack => "MIGRATION_SECTION_HELD_BACK",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "MIGRATION_SECTION_UNSPECIFIED" => Some(Self::Unspecified),
+            "MIGRATION_SECTION_ALREADY_HELD" => Some(Self::AlreadyHeld),
+            "MIGRATION_SECTION_MATCHED" => Some(Self::Matched),
+            "MIGRATION_SECTION_MINTED" => Some(Self::Minted),
+            "MIGRATION_SECTION_NEAR_MATCH" => Some(Self::NearMatch),
+            "MIGRATION_SECTION_AWAITING_STAFF" => Some(Self::AwaitingStaff),
+            "MIGRATION_SECTION_KEPT_LOCAL" => Some(Self::KeptLocal),
+            "MIGRATION_SECTION_UNREACHABLE" => Some(Self::Unreachable),
+            "MIGRATION_SECTION_HELD_BACK" => Some(Self::HeldBack),
             _ => None,
         }
     }
@@ -12691,6 +12794,18 @@ pub struct DefineAccountRequest {
 pub struct CloseAccountRequest {
     #[prost(string, tag = "1")]
     pub account_id: ::prost::alloc::string::String,
+    /// Contract v24 (W6.3): "Unlink all and close". The conductor withdraws
+    /// every grant of the account to a plugin instance (W6.30), each its own
+    /// record, and closes it, in one step. A link (W6.4) or an ems's mapping
+    /// (W11.22) still standing is undone at its plugin's page: the closure is
+    /// refused naming each, and nothing is withdrawn or closed. Without it, an
+    /// account anything is still attached to is refused the same way.
+    #[prost(bool, tag = "2")]
+    pub unlink_attached: bool,
+    /// Why, at most 2,000 characters, on each grant's withdrawal; required
+    /// through a delegation (approved 2026-10-15).
+    #[prost(string, tag = "3")]
+    pub note: ::prost::alloc::string::String,
 }
 /// Links an external account a plugin reported, or removes its link.
 /// Names an existing account, or a new account's name for the conductor to
@@ -13432,6 +13547,10 @@ pub struct ListUsageReportsRequest {}
 pub struct ListUsageReportsReply {
     #[prost(message, repeated, tag = "1")]
     pub reports: ::prost::alloc::vec::Vec<SentUsageReport>,
+    /// The setting in force (`reports_usage`), so the page says whether the
+    /// report is on.
+    #[prost(bool, tag = "2")]
+    pub reports_usage: bool,
 }
 /// A usage report the conductor sent, kept on the deployment as its own
 /// record.

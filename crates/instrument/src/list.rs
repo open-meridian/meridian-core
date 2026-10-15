@@ -142,6 +142,18 @@ pub fn list_to_complete(
             } else {
                 0
             },
+            // The migration's line (W3.26): its section, and the record the
+            // platform answered it with, while the line is still to make.
+            migration_section: if record.local.provisional {
+                crate::reask::section_to_wire(&record.local.migration) as i32
+            } else {
+                0
+            },
+            answered_instrument_id: if record.local.provisional {
+                record.local.migration_answer.clone()
+            } else {
+                String::new()
+            },
         })
         .collect();
     let next_cursor = if start + page.len() < chosen.len() {

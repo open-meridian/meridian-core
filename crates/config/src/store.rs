@@ -907,6 +907,18 @@ pub trait Store: Send + Sync {
         at_ns: i64,
     ) -> Result<LinkableAccounts>;
 
+    /// Atomic (W6.3, contract v24, "Unlink all and close"): every grant of
+    /// the account to a plugin instance withdrawn, each instance's
+    /// withdrawal its own record (W6.30, decisions/031), and the account
+    /// closed, in one step, so nothing is left half-done. Answers the
+    /// instances whose grant was withdrawn, in order.
+    fn close_account_withdrawing_grants(
+        &self,
+        account: &AccountRecord,
+        author: &Author,
+        at_ns: i64,
+    ) -> Result<Vec<String>>;
+
     /// Every grant and withdrawal of one instance's linkable accounts, the
     /// upgrade's included, in the order recorded.
     fn linkable_accounts_changes(

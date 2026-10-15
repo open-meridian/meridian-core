@@ -438,6 +438,7 @@ async fn an_account_is_defined_renamed_and_closed_and_never_deleted() {
         "meridian.v1.CloseAccountRequest",
         CloseAccountRequest {
             account_id: created.account_id.clone(),
+            ..Default::default()
         },
     )
     .await
@@ -1062,6 +1063,7 @@ async fn a_link_needs_a_plugin_that_has_reported_and_an_open_account() {
         "meridian.v1.CloseAccountRequest",
         CloseAccountRequest {
             account_id: open.account_id.clone(),
+            ..Default::default()
         },
     )
     .await
@@ -3414,6 +3416,7 @@ async fn an_account_still_linked_granted_or_mapped_is_not_closed_and_each_is_nam
             "meridian.v1.CloseAccountRequest",
             CloseAccountRequest {
                 account_id: open.account_id.clone(),
+                ..Default::default()
             },
         )
         .await
@@ -3480,4 +3483,122 @@ async fn the_usage_report_is_on_until_a_deployment_admin_turns_it_off_saying_why
     .await
     .unwrap();
     assert!(listed.reports.is_empty());
+}
+
+/// Contract v24 (W6.3, CloseAccountRequest.unlink_attached): "Unlink all
+/// and close" withdraws every grant, each instance's its own record with
+/// the note, and closes in the same step; a link still standing refuses the
+/// whole, naming it, and nothing is withdrawn or closed.
+#[tokio::test]
+async fn unlink_all_and_close_withdraws_each_grant_and_closes_or_changes_nothing() {
+    let h = harness("dashboard-1");
+    let open = account(&h, "Primary").await;
+    h.store
+        .set_linkable_accounts(
+            "oms-2",
+            std::slice::from_ref(&open.account_id),
+            &[],
+            &crate::store::Author::default(),
+            1,
+        )
+        .unwrap();
+    h.store
+        .put_link(&ExternalAccountLink {
+            plugin_instance_id: "oms-1".into(),
+            external_account_id: "101-001-1".into(),
+            account_id: open.account_id.clone(),
+        })
+        .unwrap();
+    let (hh, id) = (&h, open.account_id.clone());
+    let close = |unlink: bool| {
+        let id = id.clone();
+        async move {
+            ask::<_, AccountRecord>(
+                hh,
+                CLOSE_ACCOUNT,
+                "meridian.v1.CloseAccountRequest",
+                CloseAccountRequest {
+                    account_id: id,
+                    unlink_attached: unlink,
+                    note: "the custodian closed it".into(),
+                },
+            )
+            .await
+        }
+    };
+    // A link stands: refused naming it, the grants untouched.
+    let refused = close(true).await.unwrap_err();
+    assert!(
+        refused.contains("unlink 101-001-1 from oms-1 first"),
+        "{refused}"
+    );
+    assert!(!refused.contains("grant"), "{refused}");
+    assert!(
+        refused.contains("nothing was withdrawn or closed"),
+        "{refused}"
+    );
+    assert!(h
+        .store
+        .linkable_accounts_changes("oms-2")
+        .unwrap()
+        .iter()
+        .all(|change| change.withdrawn.is_empty()));
+    assert_eq!(
+        records(&h).await.accounts[0].state,
+        AccountState::Open as i32
+    );
+
+    h.store
+        .put_link(&ExternalAccountLink {
+            plugin_instance_id: "oms-1".into(),
+            external_account_id: "101-001-1".into(),
+            account_id: String::new(),
+        })
+        .unwrap();
+    // Without unlink_attached the grants still refuse it.
+    let refused = close(false).await.unwrap_err();
+    assert!(
+        refused.contains("withdraw oms-2's grant of it first"),
+        "{refused}"
+    );
+    // With it: each grant withdrawn, its own record, and closed.
+    assert_eq!(
+        close(true).await.unwrap().state,
+        AccountState::Closed as i32
+    );
+    for instance in ["dashboard-1", "oms-2"] {
+        let changes = h.store.linkable_accounts_changes(instance).unwrap();
+        let last = changes.last().expect("a withdrawal recorded");
+        assert_eq!(last.withdrawn, vec![open.account_id.clone()], "{instance}");
+        assert!(
+            last.note.contains("the custodian closed it"),
+            "{}",
+            last.note
+        );
+    }
+    assert_eq!(
+        records(&h).await.accounts[0].state,
+        AccountState::Closed as i32
+    );
+}
+
+/// W3.28 (contract v24): the reports read says whether the report is on.
+#[tokio::test]
+async fn the_reports_read_answers_the_setting_in_force() {
+    let h = harness("dashboard-1");
+    let read = || async {
+        ask::<_, meridian_domain::v1::ListUsageReportsReply>(
+            &h,
+            crate::service::LIST_USAGE_REPORTS,
+            "meridian.v1.ListUsageReportsRequest",
+            meridian_domain::v1::ListUsageReportsRequest {},
+        )
+        .await
+        .unwrap()
+    };
+    assert!(read().await.reports_usage, "on by default");
+    h.store
+        .set_reports_usage(false, &crate::store::Author::default(), 1)
+        .unwrap();
+    assert!(!read().await.reports_usage);
 }

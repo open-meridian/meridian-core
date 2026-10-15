@@ -785,6 +785,47 @@ impl Store for MemoryStore {
         ))
     }
 
+    fn close_account_withdrawing_grants(
+        &self,
+        account: &AccountRecord,
+        author: &Author,
+        at_ns: i64,
+    ) -> Result<Vec<String>> {
+        let mut state = self.state.lock().expect("store lock poisoned");
+        let mut changes = self.linkable_changes.lock().expect("store lock poisoned");
+        let mut withdrawn_from = Vec::new();
+        for (instance, held) in state.linkable.iter_mut() {
+            let Some(at) = held
+                .account_ids
+                .iter()
+                .position(|a| *a == account.account_id)
+            else {
+                continue;
+            };
+            held.account_ids.remove(at);
+            held.updated_by = author.by.clone();
+            held.updated_at_ns = at_ns;
+            held.acting_through_delegation = author.delegation.clone();
+            held.client_name = author.client.clone();
+            changes.push(LinkableAccountsChange {
+                plugin_instance_id: instance.clone(),
+                granted: Vec::new(),
+                withdrawn: vec![account.account_id.clone()],
+                by: author.by.clone(),
+                delegation: author.delegation.clone(),
+                client: author.client.clone(),
+                at_ns,
+                note: author.note.clone(),
+            });
+            withdrawn_from.push(instance.clone());
+        }
+        withdrawn_from.sort();
+        upsert(&mut state.records.accounts, account, |a| {
+            a.account_id == account.account_id
+        });
+        Ok(withdrawn_from)
+    }
+
     fn set_linkable_accounts(
         &self,
         plugin_instance_id: &str,

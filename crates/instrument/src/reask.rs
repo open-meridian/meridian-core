@@ -15,8 +15,9 @@
 //! own version (decisions/031). The record is marked provisional, its
 //! reason said, and stays as it is until the deployment admin makes its
 //! line: the run is a view of the store, so it resumes where it stopped.
-//! Applying a line waits on the act the design names for it (see the
-//! report's question); the run's counts are the Instruments page's.
+//! The admin makes the lines with `ApplyInstrumentMigration` (W3.26, the
+//! names approved 2026-10-15): the exact lines as one prepared change, each
+//! uncertain line its own; the run's counts are the Instruments page's.
 
 use std::collections::HashMap;
 
@@ -71,6 +72,22 @@ pub mod section {
     pub const KEPT_LOCAL: &str = "kept_local";
     pub const UNREACHABLE: &str = "unreachable";
     pub const HELD_BACK: &str = "held_back";
+}
+
+/// A line's section as the wire names it (MigrationSection, contract v24).
+pub fn section_to_wire(kept: &str) -> meridian_domain::v1::MigrationSection {
+    use meridian_domain::v1::MigrationSection as S;
+    match kept {
+        section::ALREADY_HELD => S::AlreadyHeld,
+        section::MATCHED => S::Matched,
+        section::MINTED => S::Minted,
+        section::NEAR_MATCH => S::NearMatch,
+        section::AWAITING_STAFF => S::AwaitingStaff,
+        section::KEPT_LOCAL => S::KeptLocal,
+        section::UNREACHABLE => S::Unreachable,
+        section::HELD_BACK => S::HeldBack,
+        _ => S::Unspecified,
+    }
 }
 
 /// Whether a record is the migration's, its line not yet made: never
@@ -235,6 +252,11 @@ pub fn migrate(
                 .unwrap_or(meridian_domain::v1::InstrumentType::Unspecified),
         );
         let mut local = one_id::provisional_state(&record, template.as_ref(), reason, "", now_ns);
+        // Answered but not yet made (ruled 2026-10-15; W3.11, W3.26): the
+        // record stays provisional, INCOMPLETE, until a change makes it.
+        if answered(section) {
+            local.reason = ProvisionalReason::Incomplete as i32;
+        }
         local.migration = section.to_string();
         local.migration_answer = answer;
         line.local = local;
@@ -371,4 +393,214 @@ pub fn backfill_counts(store: &dyn Store, live: &[Instrument]) -> Vec<BackfillCo
             }
         })
         .collect()
+}
+
+/// A line the platform answered with an `INS-` record: matched, minted, a
+/// near-match, or already held (W3.26).
+pub fn answered(section: &str) -> bool {
+    matches!(
+        section,
+        section::ALREADY_HELD | section::MATCHED | section::MINTED | section::NEAR_MATCH
+    )
+}
+
+/// The most lines either list of one change names.
+pub const MOST_LINES: usize = 500;
+
+/// The longest a change's note may be, as a note on an instrument record.
+pub const MOST_NOTE: usize = 2_000;
+
+/// Why a change to the migration's lines was refused: the person missing,
+/// a list past its bound, or a line that is none the platform answered,
+/// each named by its path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinesRefused {
+    ActorRequired,
+    /// Through a delegation a change says why (approved 2026-10-15).
+    NoteRequired,
+    /// A field past its bound: a list of lines, or the note.
+    TooMany(String),
+    NotALine {
+        path: String,
+        words: String,
+    },
+}
+
+/// What making the lines did: each replacement to announce with the records
+/// at their new versions, the records held back, and the run's counts after.
+#[derive(Debug, Clone, Default)]
+pub struct LinesMade {
+    pub applied: Vec<Applied>,
+    pub held_back: Vec<Instrument>,
+}
+
+/// W3.26: make the migration's lines a deployment admin names -- each in
+/// `instrument_ids` replaced by the `INS-` record its line answered (W3.8,
+/// `REPLACEMENT_CAUSE_RESOLVED`), each in `held_back_ids` kept under its
+/// `LCL-` ID, provisional and HELD_BACK, nothing minted -- together or not
+/// at all: every line is checked before any is made. A line already made is
+/// unchanged. Called under the store's write lock.
+pub fn apply_migration(
+    store: &dyn Store,
+    request: &meridian_domain::v1::ApplyInstrumentMigrationRequest,
+    by: &crate::complete::Actor,
+    now_ns: i64,
+) -> Result<std::result::Result<LinesMade, LinesRefused>> {
+    if by.person.is_empty() {
+        return Ok(Err(LinesRefused::ActorRequired));
+    }
+    for (field, ids) in [
+        ("instrument_ids", &request.instrument_ids),
+        ("held_back_ids", &request.held_back_ids),
+    ] {
+        if ids.len() > MOST_LINES {
+            return Ok(Err(LinesRefused::TooMany(field.to_string())));
+        }
+    }
+    let note = request.note.trim();
+    if note.chars().count() > MOST_NOTE {
+        return Ok(Err(LinesRefused::TooMany("note".into())));
+    }
+    if note.is_empty() && !by.delegation.is_empty() {
+        return Ok(Err(LinesRefused::NoteRequired));
+    }
+    let said = if note.is_empty() {
+        String::new()
+    } else {
+        format!(": {note}")
+    };
+    // Checked whole first: the lines are made together or not at all.
+    let mut to_make = Vec::new();
+    let mut to_hold = Vec::new();
+    for (index, id) in request.instrument_ids.iter().enumerate() {
+        let path = format!("instrument_ids[{index}]");
+        if request.instrument_ids[..index].contains(id) {
+            return Ok(Err(LinesRefused::NotALine {
+                path,
+                words: format!("{id} is named twice"),
+            }));
+        }
+        if store.replacement_of(id)?.is_some() {
+            continue; // made already: unchanged, as a replacement recorded is
+        }
+        let record = line_of(store, id, &path)?;
+        match record {
+            Ok(record) => to_make.push(record),
+            Err(refused) => return Ok(Err(refused)),
+        }
+    }
+    for (index, id) in request.held_back_ids.iter().enumerate() {
+        let path = format!("held_back_ids[{index}]");
+        if request.instrument_ids.contains(id) || request.held_back_ids[..index].contains(id) {
+            return Ok(Err(LinesRefused::NotALine {
+                path,
+                words: format!("{id} is named twice: a line is made or held back"),
+            }));
+        }
+        if store.replacement_of(id)?.is_some() {
+            return Ok(Err(LinesRefused::NotALine {
+                path,
+                words: format!("{id}'s line is made already, and a made line is not held back"),
+            }));
+        }
+        match line_of(store, id, &path)? {
+            Ok(record) => to_hold.push(record),
+            Err(refused) => return Ok(Err(refused)),
+        }
+    }
+
+    let mut made = LinesMade::default();
+    for record in to_hold {
+        if record.local.migration == section::HELD_BACK {
+            continue;
+        }
+        let mut held = record.clone();
+        held.local.migration = section::HELD_BACK.to_string();
+        held.local.reason = ProvisionalReason::HeldBack as i32;
+        held.version = record.version + 1;
+        held.record_time_ns = now_ns;
+        let entry = crate::store::Version {
+            acting_through_delegation: by.delegation.clone(),
+            client_name: by.client.clone(),
+            prepared_call_id: by.prepared_call_id.clone(),
+            instrument_id: record.instrument_id.clone(),
+            version: held.version,
+            operation: "hold-back".into(),
+            changes: Vec::new(),
+            person: by.person.clone(),
+            instance_id: String::new(),
+            note: format!(
+                "the deployment admin held back this record's line (W3.26): it keeps its \
+                 LCL- ID, provisional, and nothing is minted for it; answered {}{said}",
+                record.local.migration_answer
+            ),
+            merged_instrument_id: String::new(),
+            record_time_ns: now_ns,
+        };
+        if store.write(held.clone(), record.version, entry)? == Written::Stored {
+            made.held_back.push(held);
+        }
+    }
+    for record in to_make {
+        let master = meridian_domain::v1::InstrumentRecord {
+            instrument_id: record.local.migration_answer.clone(),
+            ..Default::default()
+        };
+        let Some(resolved) = one_id::resolve_to_as(
+            store,
+            &record.instrument_id,
+            &master,
+            meridian_domain::v1::ReplacementCause::Resolved,
+            by,
+            note,
+            now_ns,
+        )?
+        else {
+            continue;
+        };
+        let mut changed = vec![resolved.stays.clone()];
+        if let Some(gone) = store.by_id(&record.instrument_id)? {
+            changed.push(gone);
+        }
+        made.applied.push(Applied {
+            replaced: Some(resolved.event),
+            changed,
+        });
+    }
+    Ok(Ok(made))
+}
+
+/// The record a line names, refused by its path unless it is an `LCL-`
+/// record the platform answered with an `INS-` record (or one held back
+/// from such a line).
+fn line_of(
+    store: &dyn Store,
+    id: &str,
+    path: &str,
+) -> Result<std::result::Result<Instrument, LinesRefused>> {
+    let Some(record) = store.by_id(id)? else {
+        return Ok(Err(LinesRefused::NotALine {
+            path: path.to_string(),
+            words: format!("the deployment holds no record {id}"),
+        }));
+    };
+    let section = record.local.migration.as_str();
+    let made_from = answered(section) || section == section::HELD_BACK;
+    if !id.starts_with(crate::ids::LOCAL_PREFIX)
+        || !made_from
+        || !record.local.migration_answer.starts_with("INS-")
+    {
+        let what = match section {
+            "" => "is no line of the migration".to_string(),
+            other => format!(
+                "is {}, no line the platform answered",
+                other.replace('_', " ")
+            ),
+        };
+        return Ok(Err(LinesRefused::NotALine {
+            path: path.to_string(),
+            words: format!("{id} {what}; nothing changed"),
+        }));
+    }
+    Ok(Ok(record))
 }

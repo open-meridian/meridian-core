@@ -508,6 +508,45 @@ impl Platform {
         replacements_from_json(&value).map_err(PlatformError::Malformed)
     }
 
+    /// W3.28 (contract v24): the deployment's usage statistics, counts per
+    /// scheme only -- never a value, a holding, a quantity or an account --
+    /// answered with whether the platform received them.
+    pub async fn report_identifier_usage(
+        &self,
+        report: &meridian_domain::v1::IdentifierUsageReport,
+        now_ns: i64,
+    ) -> Result<bool, PlatformError> {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "period_start": report.period_start,
+            "period_end": report.period_end,
+            "licensed_schemes": report.licensed_schemes,
+            "scheme_counts": report
+                .scheme_counts
+                .iter()
+                .map(|count| serde_json::json!({
+                    "scheme": count.scheme,
+                    "instruments_carrying": count.instruments_carrying,
+                    "instruments_only_by": count.instruments_only_by,
+                    "misses_only_by": count.misses_only_by,
+                }))
+                .collect::<Vec<_>>(),
+        }))
+        .map_err(|failed| PlatformError::Malformed(failed.to_string()))?;
+        let response = self
+            .v24_call(
+                Method::Post,
+                "/api/v1/reference/usage-reports",
+                Some(body),
+                now_ns,
+            )
+            .await?;
+        let value = json_of(&response)?;
+        Ok(value
+            .get("received")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false))
+    }
+
     /// W5.19. What this deployment is running, as its components describe
     /// themselves.
     ///

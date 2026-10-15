@@ -740,6 +740,40 @@ pub fn resolve_to(
     cause: ReplacementCause,
     now_ns: i64,
 ) -> Result<Option<Resolved>> {
+    resolve_to_as(
+        store,
+        replaced_id,
+        master,
+        cause,
+        &crate::complete::Actor::default(),
+        "",
+        now_ns,
+    )
+}
+
+/// [`resolve_to`], each version it writes naming who made it: the person,
+/// the delegation and client they acted through, and the prepared change
+/// (W6.27), as a migration's line made by the deployment admin is (W3.26),
+/// and why they said they made it, where they said.
+pub fn resolve_to_as(
+    store: &dyn Store,
+    replaced_id: &str,
+    master: &InstrumentRecord,
+    cause: ReplacementCause,
+    by: &crate::complete::Actor,
+    why: &str,
+    now_ns: i64,
+) -> Result<Option<Resolved>> {
+    let stamp = |mut version: Version| {
+        if !why.is_empty() {
+            version.note = format!("{}: {why}", version.note);
+        }
+        version.person = by.person.clone();
+        version.acting_through_delegation = by.delegation.clone();
+        version.client_name = by.client.clone();
+        version.prepared_call_id = by.prepared_call_id.clone();
+        version
+    };
     if store.replacement_of(replaced_id)?.is_some() || replaced_id == master.instrument_id {
         return Ok(None);
     }
@@ -841,7 +875,7 @@ pub fn resolve_to(
                 stays.listing_venue_id = master.listing_venue_id.clone();
             }
             crate::resolve::keep_offers(&mut stays, offers);
-            let mut first = version_of(&stays, "resolve", Vec::new(), &note, now_ns);
+            let mut first = stamp(version_of(&stays, "resolve", Vec::new(), &note, now_ns));
             first.merged_instrument_id = replaced_id.to_string();
             if local_link {
                 first.changes = vec![identifier_change(&local_id, &note)];
@@ -914,7 +948,7 @@ pub fn resolve_to(
             crate::resolve::keep_offers(&mut held, offers);
             held.version = expected + 1;
             held.record_time_ns = now_ns;
-            let mut entry = version_of(&held, "resolve", changes, &note, now_ns);
+            let mut entry = stamp(version_of(&held, "resolve", changes, &note, now_ns));
             entry.merged_instrument_id = replaced_id.to_string();
             match store.write(held.clone(), expected, entry)? {
                 Written::Stored => (held, false),
@@ -945,7 +979,7 @@ pub fn resolve_to(
     gone.local.provisional = false;
     gone.version = replaced.version + 1;
     gone.record_time_ns = now_ns;
-    let mut entry = version_of(&gone, "resolved-into", left, &note, now_ns);
+    let mut entry = stamp(version_of(&gone, "resolved-into", left, &note, now_ns));
     entry.merged_instrument_id = master.instrument_id.clone();
     let _ = store.write(gone, replaced.version, entry)?;
     let replaced_at =
@@ -1869,5 +1903,195 @@ mod tests {
             .identifiers
             .iter()
             .all(|i| !i.value.starts_with("LCL-") && i.scheme != LOCAL_SCHEME));
+    }
+
+    /// W3.26 (contract v24; the names approved 2026-10-15): the admin makes
+    /// the lines -- the exact ones together, a duplicate line's two records
+    /// replaced by the one INS- record, one held back keeping its LCL- ID --
+    /// all or nothing, each version naming the person and the change.
+    #[test]
+    fn the_admin_makes_the_lines_together_or_not_at_all() {
+        use crate::complete::Actor;
+        use crate::reask::{apply_migration, LinesRefused};
+        use meridian_domain::v1::ApplyInstrumentMigrationRequest as Apply;
+        let store = MemoryStore::new();
+        kept_before_v24(&store, "LCL-A", "share_class_figi", "BBG000000AAA");
+        kept_before_v24(&store, "LCL-B", "share_class_figi", "BBG000000BBB");
+        kept_before_v24(&store, "LCL-C", "share_class_figi", "BBG000000CCC");
+        kept_before_v24(&store, "LCL-CUSIP", "cusip", "037833100");
+        let answer = |figi: &str, ins: &str| {
+            (
+                figi.to_string(),
+                crate::reask::Answer {
+                    said: PlatformSaid::Record(Box::new(master(ins, figi))),
+                    minted: false,
+                    near_match: false,
+                },
+            )
+        };
+        let says = Says(
+            std::sync::Mutex::new(vec![
+                answer("BBG000000AAA", "INS-ONE"),
+                // The same security kept twice: a duplicate line.
+                answer("BBG000000BBB", "INS-ONE"),
+                answer("BBG000000CCC", "INS-TWO"),
+            ]),
+            std::sync::Mutex::new(Vec::new()),
+        );
+        let writing = std::sync::Mutex::new(());
+        crate::reask::migrate(&store, &says, &writing, 100, NOW).unwrap();
+        // Answered, not yet made: INCOMPLETE, still provisional (ruled
+        // 2026-10-15).
+        for id in ["LCL-A", "LCL-B", "LCL-C"] {
+            let line = store.by_id(id).unwrap().unwrap();
+            assert_eq!(
+                line.local.reason,
+                ProvisionalReason::Incomplete as i32,
+                "{id}"
+            );
+            assert_eq!(line.local.migration, crate::reask::section::MATCHED, "{id}");
+            assert!(line.local.provisional);
+        }
+        let admin = Actor {
+            person: "admin@firm".into(),
+            prepared_call_id: "PREP-1".into(),
+            ..Actor::default()
+        };
+        // A record that is no line the platform answered: refused by its
+        // path, and nothing changes.
+        let refused = apply_migration(
+            &store,
+            &Apply {
+                instrument_ids: vec!["LCL-A".into(), "LCL-CUSIP".into()],
+                ..Apply::default()
+            },
+            &admin,
+            NOW + 1,
+        )
+        .unwrap()
+        .unwrap_err();
+        assert!(
+            matches!(&refused, LinesRefused::NotALine { path, .. } if path == "instrument_ids[1]"),
+            "{refused:?}"
+        );
+        assert_eq!(crate::replace::current(&store, "LCL-A").unwrap(), "LCL-A");
+        // Who: a person, and through a delegation a note; at most 500.
+        assert_eq!(
+            apply_migration(&store, &Apply::default(), &Actor::default(), NOW)
+                .unwrap()
+                .unwrap_err(),
+            LinesRefused::ActorRequired
+        );
+        let through = Actor {
+            delegation: "DLG-1".into(),
+            ..admin.clone()
+        };
+        assert_eq!(
+            apply_migration(&store, &Apply::default(), &through, NOW)
+                .unwrap()
+                .unwrap_err(),
+            LinesRefused::NoteRequired
+        );
+        let many = Apply {
+            held_back_ids: (0..501).map(|n| format!("LCL-{n}")).collect(),
+            ..Apply::default()
+        };
+        assert_eq!(
+            apply_migration(&store, &many, &admin, NOW)
+                .unwrap()
+                .unwrap_err(),
+            LinesRefused::TooMany("held_back_ids".into())
+        );
+
+        // The exact lines made, one held back.
+        let made = apply_migration(
+            &store,
+            &Apply {
+                instrument_ids: vec!["LCL-A".into(), "LCL-B".into()],
+                held_back_ids: vec!["LCL-C".into()],
+                note: "the exact lines".into(),
+            },
+            &admin,
+            NOW + 2,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(made.applied.len(), 2);
+        assert_eq!(crate::replace::current(&store, "LCL-A").unwrap(), "INS-ONE");
+        assert_eq!(crate::replace::current(&store, "LCL-B").unwrap(), "INS-ONE");
+        let event = made.applied[0].replaced.as_ref().unwrap();
+        assert_eq!(event.cause, ReplacementCause::Resolved as i32);
+        let history = store.history("INS-ONE").unwrap();
+        assert!(history.iter().all(|version| version.person == "admin@firm"
+            && version.prepared_call_id == "PREP-1"
+            && version.note.ends_with(": the exact lines")));
+        let held = store.by_id("LCL-C").unwrap().unwrap();
+        assert_eq!(held.local.reason, ProvisionalReason::HeldBack as i32);
+        assert_eq!(held.local.migration, crate::reask::section::HELD_BACK);
+        assert!(held.local.provisional, "keeps its LCL- ID");
+        assert!(
+            store.by_id("INS-TWO").unwrap().is_none(),
+            "nothing minted for it"
+        );
+        let live: Vec<_> = store
+            .all()
+            .unwrap()
+            .into_iter()
+            .filter(|record| {
+                store
+                    .replacement_of(&record.instrument_id)
+                    .unwrap()
+                    .is_none()
+            })
+            .collect();
+        let counts = crate::reask::migration_counts(&store, &live)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (counts.matched, counts.held_back, counts.kept_local),
+            (0, 1, 1)
+        );
+
+        // A line made already: unchanged. A made line is not held back.
+        let again = apply_migration(
+            &store,
+            &Apply {
+                instrument_ids: vec!["LCL-A".into()],
+                ..Apply::default()
+            },
+            &admin,
+            NOW + 3,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(again.applied.is_empty() && again.held_back.is_empty());
+        let refused = apply_migration(
+            &store,
+            &Apply {
+                held_back_ids: vec!["LCL-B".into()],
+                ..Apply::default()
+            },
+            &admin,
+            NOW + 3,
+        )
+        .unwrap()
+        .unwrap_err();
+        assert!(
+            matches!(&refused, LinesRefused::NotALine { path, .. } if path == "held_back_ids[0]")
+        );
+        // The held-back line made later, as any line is.
+        let later = apply_migration(
+            &store,
+            &Apply {
+                instrument_ids: vec!["LCL-C".into()],
+                ..Apply::default()
+            },
+            &admin,
+            NOW + 4,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(later.applied.len(), 1);
+        assert_eq!(crate::replace::current(&store, "LCL-C").unwrap(), "INS-TWO");
     }
 }
