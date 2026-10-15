@@ -1841,3 +1841,101 @@ async fn a_lots_cost_is_answered_naming_its_cash_instrument() {
     assert_eq!(kept.len(), 1);
     assert_eq!(kept[0].instrument_id, USD);
 }
+
+/// Contract v24 (W9.3, W9.4): an unrecognized security's break names no
+/// position and no figure, only the street record by value; brought up to
+/// date while it persists, matched by its category and the street record;
+/// every other category still names its subject.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unrecognized_security_is_a_break_naming_only_the_street_record() {
+    let (bus, _store) = wired();
+    open(&bus).await;
+    let street = StreetRecordRef {
+        statement_id: "ST-THIN-1".into(),
+        as_of_date: "2026-09-09".into(),
+        ..Default::default()
+    };
+    let unrecognized = RecordBreakRequest {
+        account_id: ACC.into(),
+        subject: None,
+        category: BreakCategory::UnrecognizedSecurity as i32,
+        differences: vec![BreakDifference {
+            field: "identifiers".into(),
+            book: None,
+            street: Some(BreakValue {
+                value: Some(break_value::Value::Text(
+                    "symbol ZZQ9 at the custodian".into(),
+                )),
+            }),
+        }],
+        street: Some(street.clone()),
+        business_date: "2026-09-09".into(),
+        ..Default::default()
+    };
+    let first = record_break(&bus, &unrecognized).await.unwrap();
+    let [record] = first.breaks.as_slice() else {
+        panic!("one break")
+    };
+    assert!(
+        record.subject.is_none(),
+        "names no instrument and no figure"
+    );
+    assert_eq!(record.category, BreakCategory::UnrecognizedSecurity as i32);
+    // Sent again for the same street record: the open break brought up to
+    // date, never a second.
+    let mut again = unrecognized.clone();
+    again.business_date = "2026-09-10".into();
+    let updated = record_break(&bus, &again).await.unwrap();
+    assert_eq!(updated.breaks[0].break_id, record.break_id);
+    assert_eq!(updated.breaks[0].last_seen_date, "2026-09-10");
+    // Without the street record: refused naming it.
+    let mut blind = unrecognized.clone();
+    blind.street = None;
+    let refused = record_break(&bus, &blind).await.unwrap_err();
+    assert!(refused.contains("street"), "{refused}");
+    // Any other category still names its position or figure.
+    let mut other = aapl_break();
+    other.subject = None;
+    let refused = record_break(&bus, &other).await.unwrap_err();
+    assert!(
+        refused.contains("a break names a position or a figure"),
+        "{refused}"
+    );
+}
+
+/// An unrecognized security names no subject: one sent with a position is
+/// refused naming `subject`, and an update by its break_id holds it to the
+/// same street record's kind.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unrecognized_security_names_no_subject_and_updates_by_its_id() {
+    let (bus, _store) = wired();
+    open(&bus).await;
+    let mut named = aapl_break();
+    named.category = BreakCategory::UnrecognizedSecurity as i32;
+    named.street = Some(StreetRecordRef {
+        statement_id: "ST-THIN-2".into(),
+        as_of_date: "2026-09-09".into(),
+        ..Default::default()
+    });
+    let refused = record_break(&bus, &named).await.unwrap_err();
+    assert!(refused.contains("subject"), "{refused}");
+    let mut thin = named.clone();
+    thin.subject = None;
+    let first = record_break(&bus, &thin).await.unwrap();
+    let id = first.breaks[0].break_id.clone();
+    let mut by_id = thin.clone();
+    by_id.break_id = id.clone();
+    by_id.business_date = "2026-09-11".into();
+    let updated = record_break(&bus, &by_id).await.unwrap();
+    assert_eq!(updated.breaks[0].break_id, id);
+    assert_eq!(updated.breaks[0].last_seen_date, "2026-09-11");
+    // A different street record is a different unrecognized security.
+    let mut other = thin.clone();
+    other.street = Some(StreetRecordRef {
+        statement_id: "ST-THIN-3".into(),
+        as_of_date: "2026-09-09".into(),
+        ..Default::default()
+    });
+    let second = record_break(&bus, &other).await.unwrap();
+    assert_ne!(second.breaks[0].break_id, id);
+}

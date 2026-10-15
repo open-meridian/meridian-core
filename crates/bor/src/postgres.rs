@@ -219,7 +219,8 @@ fn subject_named(record: &Break) -> (String, String) {
                 }
             ),
         ),
-        None => (String::new(), String::new()),
+        // An unrecognized security names neither (contract v24, W9.3).
+        None => (String::new(), "unrecognized security".into()),
     }
 }
 

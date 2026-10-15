@@ -775,20 +775,44 @@ pub fn record_break(
 ) -> Result<Made> {
     opening_required(book)?;
     date("business_date", &request.business_date)?;
-    let subject = request
-        .subject
-        .clone()
-        .ok_or_else(|| StoreError::Invalid("a break names a position or a figure".into()))?;
-    let subject = match subject {
-        record_break_request::Subject::Position(key) => {
+    // An unrecognized security (contract v24, W9.3, W9.4) names neither a
+    // position nor a figure: the street record alone, by value. Every other
+    // category names one.
+    let unrecognized = request.category == BreakCategory::UnrecognizedSecurity as i32;
+    let subject = match request.subject.clone() {
+        Some(record_break_request::Subject::Position(key)) => {
             check_position_key(&key)?;
-            meridian_domain::v1::r#break::Subject::Position(key)
+            Some(meridian_domain::v1::r#break::Subject::Position(key))
         }
-        record_break_request::Subject::Figure(key) => {
+        Some(record_break_request::Subject::Figure(key)) => {
             check_figure_key(&key)?;
-            meridian_domain::v1::r#break::Subject::Figure(key)
+            Some(meridian_domain::v1::r#break::Subject::Figure(key))
+        }
+        None if unrecognized => {
+            if request.street.is_none() {
+                return Err(StoreError::Malformed {
+                    fields: vec!["street".into()],
+                    words: "an unrecognized security's break names the street record it was \
+                            seen in"
+                        .into(),
+                });
+            }
+            None
+        }
+        None => {
+            return Err(StoreError::Invalid(
+                "a break names a position or a figure".into(),
+            ))
         }
     };
+    if unrecognized && subject.is_some() {
+        return Err(StoreError::Malformed {
+            fields: vec!["subject".into()],
+            words: "an unrecognized security's break names no instrument and no figure, only the \
+                    street record"
+                .into(),
+        });
+    }
     if request.category == BreakCategory::Unspecified as i32
         || BreakCategory::try_from(request.category).is_err()
     {
@@ -803,11 +827,26 @@ pub fn record_break(
         check_cause(&format!("candidate_causes[{index}]"), cause)?;
     }
 
-    let record = if request.break_id.is_empty() {
+    // An unrecognized security still open for the same street record is
+    // brought up to date, never recorded twice (W9.4): matched by its
+    // category and the street record, the only key it has.
+    let matched = (request.break_id.is_empty() && unrecognized)
+        .then(|| {
+            book.breaks.values().find(|held| {
+                held.state == BreakState::Open as i32
+                    && held.category == request.category
+                    && held.subject.is_none()
+                    && held.street == request.street
+            })
+        })
+        .flatten()
+        .map(|held| held.break_id.clone());
+    let break_id = matched.unwrap_or_else(|| request.break_id.clone());
+    let record = if break_id.is_empty() {
         Break {
             break_id: ctx.mint(ids::BREAK),
             account_id: book.account_id.clone(),
-            subject: Some(subject),
+            subject,
             category: request.category,
             differences: request.differences.clone(),
             book_watermark: request.book_watermark.clone(),
@@ -820,12 +859,11 @@ pub fn record_break(
             ..Default::default()
         }
     } else {
-        let held = open_break(book, &request.break_id)?;
-        if held.subject.as_ref() != Some(&subject) || held.category != request.category {
+        let held = open_break(book, &break_id)?;
+        if held.subject != subject || held.category != request.category {
             return Err(StoreError::Invalid(format!(
-                "break {} is of another subject or category; a difference of its own is a \
-                 break of its own",
-                request.break_id
+                "break {break_id} is of another subject or category; a difference of its own \
+                 is a break of its own"
             )));
         }
         Break {
