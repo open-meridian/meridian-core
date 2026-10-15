@@ -7,6 +7,11 @@ the platform would. The note's claims are checked (issuer, subject, audience,
 expiry) but not its signature: this stand-in holds no registered public key,
 and the platform's verification is the platform's to test.
 
+From contract v24 it also answers the one-ID routes the conductor reaches
+without a person (W3.4, W3.24, W3.25, W3.27, W3.28): the licence list, an
+empty catalogue and feed, every matching request queued for its staff, and
+each usage report received.
+
 GET /e2e/redemptions lists every redemption attempt, for the runner's
 evidence; GET /e2e/requests lists every request that reached it, its method,
 path and body, so a run can say what did not (contract v13: nothing of a
@@ -24,6 +29,19 @@ CODE = os.environ["E2E_CLAIM_CODE"]
 DEPLOYMENT = os.environ["E2E_DEPLOYMENT_ID"]
 ADDRESS = os.environ["E2E_PLATFORM_ADDRESS"]
 REDEEM = "/api/v1/reference/deployments/claim-codes/redeem"
+
+# Contract v24 (W3.24, W3.25, W3.27): what the conductor pulls for every
+# deployment -- the licence list, no template beyond those a release ships,
+# and an empty replacement feed.
+V24_READS = {
+    "/api/v1/reference/licence-list": {
+        "version": "1",
+        "schemes": ["figi", "lei", "ticker_and_venue", "caip19", "iso4217", "sec_series", "sec_class"],
+        "pace": {"batch_size": 100, "batches_per_minute": 6},
+    },
+    "/api/v1/reference/templates": {"templates": []},
+    "/api/v1/reference/replacements": {"entries": []},
+}
 
 lock = threading.Lock()
 spent = False
@@ -71,6 +89,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(200, {"requests": heard})
         with lock:
             heard.append({"method": "GET", "path": self.path, "body": ""})
+        path = self.path.split("?", 1)[0]
+        if path in V24_READS:
+            return self.reply(200, V24_READS[path])
         self.reply(404, {"detail": "not served by the stand-in platform"})
 
     def do_POST(self):
@@ -79,6 +100,12 @@ class Handler(BaseHTTPRequestHandler):
         with lock:
             heard.append({"method": "POST", "path": self.path,
                           "body": raw.decode("utf-8", errors="replace")})
+        if self.path == "/api/v1/reference/escalate-instrument":
+            # Contract v24 (W3.4): nothing here is confirmed by a source of
+            # the stand-in's, so every request is its staff's to review.
+            return self.reply(200, {"minted": False, "pending_review": True})
+        if self.path == "/api/v1/reference/usage-reports":
+            return self.reply(200, {"received": True})
         if self.path != REDEEM:
             return self.reply(404, {"detail": "not served by the stand-in platform"})
         claims, refusal = note_claims(self.headers.get("Authorization"))

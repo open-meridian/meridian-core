@@ -8,7 +8,7 @@ DOCKER := DOCKER_BUILDKIT=1 docker
 .PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check licence-check-test gate-start \
         stage-checks stage-runtime stage-compile stage-tests stage-sdk stage-dashboards stage-harness stage-first-run stage-image stage-lint \
         e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external e2e-cluster-backup \
-        test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-service-account e2e-lake e2e-recorded e2e-orders \
+        test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-service-account e2e-lake e2e-recorded e2e-orders e2e-one-id \
         build test test-store check-image-version chart-check check-crate-boundaries check-one-clock check-test-targets check-local-storage \
         interop e2e-book prompt-attacks lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-first-run
 
@@ -34,6 +34,7 @@ help:
 	@echo "  make e2e-lake       the lake's 1a on the harness: recorded, heard, restated, read as of, entitled, wanted"
 	@echo "  make e2e-recorded   the same on the recorded exchanges RECORDED names, a developer's, never committed"
 	@echo "  make e2e-orders     the order path on the harness: proposed, released, placed, filled at a simulated venue, refused"
+	@echo "  make e2e-one-id     one ID on the harness: matched, minted or provisional, the licence list, the escape hatch, a resolution"
 	@echo "  make e2e-book       the book of record, written, read and heard through the SDK, then rebuilt"
 	@echo "  make up             bring up Postgres and the runtime"
 	@echo "  make down           take them down, keeping nothing"
@@ -112,7 +113,7 @@ stage-sdk:        gate-begin-sdk interop e2e-book
 	@$(GATE) end sdk
 stage-dashboards: gate-begin-dashboards e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page
 	@$(GATE) end dashboards
-stage-harness:    gate-begin-harness harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-service-account e2e-lake e2e-orders
+stage-harness:    gate-begin-harness harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-service-account e2e-lake e2e-orders e2e-one-id
 	@$(GATE) end harness --drop meridian-python-interop $(HARNESS_IMAGE)
 stage-first-run:  gate-begin-first-run e2e-first-run e2e-first-run-brought e2e-first-run-oidc
 	@$(GATE) end first-run
@@ -1352,6 +1353,17 @@ e2e-orders:
 		|| { echo "no SDK at $(SDK); set SDK=<path to meridian-python>" >&2; exit 1; }
 	@$(E2E_ORDERS_SETUP) || { echo "e2e-orders FAILED: the images or the harness did not build" >&2; exit 1; }
 	@MERIDIAN_RUNTIME_IMAGE=$(RUNTIME_IMAGE) $(PY) e2e/orders/run.py
+
+# One ID (contract v24; decisions/037; the one-ID spec's requirement 26) on
+# e2e-orders' harness, images and stand-ins, against the harness's platform
+# stand-in and its v24 routes (e2e/one-id/run.py says what it proves). No
+# image of its own: the runtime, the harness and the SDK's interop image,
+# built as e2e-orders builds them, cached when it ran first.
+e2e-one-id:
+	@test -d "$(SDK)" \
+		|| { echo "no SDK at $(SDK); set SDK=<path to meridian-python>" >&2; exit 1; }
+	@$(E2E_ORDERS_SETUP) || { echo "e2e-one-id FAILED: the images or the harness did not build" >&2; exit 1; }
+	@MERIDIAN_RUNTIME_IMAGE=$(RUNTIME_IMAGE) $(PY) e2e/one-id/run.py
 
 test-directory: network
 	@# Recreated, with a fresh volume, every time. The image keeps its data in

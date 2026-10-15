@@ -18,7 +18,9 @@ narrowed as the plan's tests ask, through `/mcp` alone:
    saying whether she may set it and, for the one serving both roles, why
    not; sets a window against the version read, with a note, and replaces
    the table's rows; a change against the version it read before is refused
-   naming against_updated_at_ns, and so is one naming none (contract v18);
+   naming against_updated_at_ns, and so is one naming none (contract v18),
+   and from contract v24 (O3) its stamp, above 2^53, is a decimal string, a
+   JSON integer above 2^53 refused naming the field;
    a cell naming no instrument is refused at
    table.plan_code_links[0].instrument, the setting serving operations too
    at value.poll_minutes; and the admin portal's Settings form says she last
@@ -211,6 +213,17 @@ def run():
     must(keyed and keyed[0]["changed_by"] == "local|harness" and keyed[0]["client_name"] == "",
          f"step 1, the secret's last change, by whom and when, set in a browser: {keyed}")
     version = read["updated_at_ns"]
+    # The string fix (found 2026-10-14, O3): an optimistic lock's real
+    # nanosecond stamp, above 2^53, travels as a decimal string; sent as a
+    # JSON integer it has lost its last digits in most clients, and is
+    # refused naming the field.
+    must(isinstance(version, str) and int(version) > 2 ** 53,
+         f"step 1, updated_at_ns is a decimal string of a real stamp: {version!r}")
+    lossy = call(*as_cat, "dashboard__set_plugin_settings",
+                 {"plugin_instance_id": INSTANCE, "value": {"activity_window_days": 2600},
+                  "against_updated_at_ns": int(version), "note": "As a number."}, "refused")
+    must(refused_at(lossy, "against_updated_at_ns"),
+         f"step 1, a stamp above 2^53 as a JSON integer is refused naming the field: {lossy}")
     call(*as_cat, "dashboard__set_plugin_settings",
          {"plugin_instance_id": INSTANCE, "value": {"activity_window_days": 2600},
           "against_updated_at_ns": version, "note": "Keep activity a little past seven years."},

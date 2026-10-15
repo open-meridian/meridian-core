@@ -37,7 +37,13 @@ the US dollar's holidays do not count against the lag -- the spot date good
 on TARGET and the US dollar's calendar, cut 17:00 New York, modified
 following with end of month. A pull names the pair by its two cash
 instruments, either order. So EUR/USD traded Friday 9 October 2026 spots on
-Tuesday 13 October, Columbus Day on the Monday counted on EUR alone."""
+Tuesday 13 October, Columbus Day on the Monday counted on EUR alone.
+
+From contract v24 it serves the one-ID routes (W3.4, W3.24, W3.25, W3.27,
+W3.28): the matching and minting request, answered by what it holds -- the
+test equity and the currencies a match, a FIGI it can confirm a mint, and
+anything else its staff's queue; the template catalogue; the licence list;
+the replacement feed; and the usage statistics. See V24 below."""
 import datetime
 import http.server
 import json
@@ -243,12 +249,119 @@ def calendars_for(one, many):
     return {"calendars": calendars, "rules": rules}
 
 
+# ── Contract v24 (W3.4, W3.24, W3.25, W3.27, W3.28) ─────────────────────────
+#
+# The one-ID routes, as the platform builds them: the matching and minting
+# request, the template catalogue, the licence list, the replacement feed
+# and the usage statistics. `HARNESS_PLATFORM_V24=0` serves none of them, as
+# a platform before v24 does (404), so a deployment shows it treats that as
+# unreachable. What each request carried is kept for a run to read on
+# GET /e2e/heard -- the identifiers sent, never anything else of the
+# deployment -- and a run changes the licence list and the feed by
+# POST /e2e/licence and POST /e2e/replacements, as the platform's staff would.
+
+V24 = os.environ.get("HARNESS_PLATFORM_V24", "1") != "0"
+LICENCE = {
+    "version": 1,
+    "schemes": [s for s in (os.environ.get("HARNESS_LICENCE")
+                            or "figi,lei,ticker_and_venue,caip19,iso4217,sec_series,sec_class").split(",") if s],
+    "pace": {"batch_size": 100, "batches_per_minute": 6},
+}
+TEMPLATES = [
+    {"template_id": "TPL-equity", "template_version": "1", "name": "Equity", "asset_class": "equity",
+     "instrument_type": "", "base": False, "calculation": "",
+     "fields": [{"path": "identifiers", "type": "identifier", "required": True},
+                {"path": "description", "type": "text", "required": True},
+                {"path": "currency", "type": "currency", "required": True},
+                {"path": "listing_venue_id", "type": "venue", "required": False}],
+     "match_rule": ["share_class_figi", "figi", "composite_figi", "ticker"]},
+    {"template_id": "TPL-cash", "template_version": "1", "name": "Cash and currency",
+     "asset_class": "cash", "instrument_type": "", "base": False, "calculation": "",
+     "fields": [{"path": "identifiers", "type": "identifier", "required": True}],
+     "match_rule": ["iso4217"]},
+]
+# FIGIs the platform's source confirms and mints from, and those it cannot:
+# a near match, minted and flagged; anything else, its staff's queue.
+MINTS = {f for f in (os.environ.get("HARNESS_PLATFORM_MINTS") or "BBG00NEWMINT1,BBG00NEWMINT2").split(",") if f}
+REPLACEMENTS = []
+ANSWERS = {}
+HEARD = []
+MINTED = {}
+
+
+def minted_record(figi):
+    """A record the platform mints from its own source for `figi`."""
+    if figi not in MINTED:
+        n = len(MINTED) + 1
+        MINTED[figi] = {
+            "instrument_id": f"INS-01JMINT{n:019d}",
+            "identifiers": [{"scheme": "share_class_figi", "value": figi, "source": ""}],
+            "asset_class": "ASSET_CLASS_EQUITY",
+            "currency": "USD",
+            "description": f"Minted from the platform's source for {figi}",
+            "lifecycle_state": "INSTRUMENT_LIFECYCLE_STATE_DEFINE",
+            "version": 1,
+            "template_id": "TPL-equity",
+            "template_version": "1",
+        }
+    return MINTED[figi]
+
+
+def match_or_mint(asked):
+    """The platform's answer to a matching request (W3.4): a match, a mint
+    from its own source, or its staff's queue; a retry of a request key
+    answered as first answered."""
+    key = asked.get("request_key", "")
+    if key and key in ANSWERS:
+        return ANSWERS[key]
+    answer = {"minted": False, "pending_review": True}
+    for identifier in asked.get("identifiers", []):
+        scheme, value = identifier.get("scheme", ""), identifier.get("value", "")
+        if scheme in ("figi", "share_class_figi", "composite_figi") and value in EQUITIES:
+            answer = {"minted": False, "instrument": EQUITIES[value], "venues": [XNAS]}
+            break
+        if scheme == "iso4217" and value.upper() in NAMES:
+            answer = {"minted": False, "instrument": record(value.upper())}
+            break
+        if scheme in ("figi", "share_class_figi") and value in MINTS:
+            answer = {"minted": True, "instrument": minted_record(value)}
+            break
+    if key:
+        ANSWERS[key] = answer
+    return answer
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
+    def answer(self, status, body):
+        data = json.dumps(body).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def do_GET(self):
         url = urllib.parse.urlparse(self.path)
         asked = urllib.parse.parse_qs(url.query)
         one = lambda name: asked.get(name, [""])[0]
         code = one("value").upper()
+        if url.path == "/e2e/heard":
+            return self.answer(200, {"heard": HEARD})
+        if url.path in ("/api/v1/reference/templates", "/api/v1/reference/licence-list",
+                        "/api/v1/reference/replacements"):
+            HEARD.append({"method": "GET", "path": self.path})
+            if not V24:
+                return self.answer(404, {"detail": "Not Found"})
+            if url.path.endswith("/templates"):
+                after = int(one("after_version") or 0)
+                return self.answer(200, {"templates": [t for t in TEMPLATES
+                                                       if int(t["template_version"]) > after]})
+            if url.path.endswith("/licence-list"):
+                return self.answer(200, {**LICENCE, "version": str(LICENCE["version"])})
+            after = int(one("after_sequence") or 0)
+            return self.answer(200, {"entries": [
+                {**entry, "sequence": str(entry["sequence"])}
+                for entry in REPLACEMENTS if entry["sequence"] > after][:1000]})
         if url.path == "/api/v1/reference/calendars":
             answer = calendars_for(one, lambda name: asked.get(name, []))
             found = answer["calendars"] or answer["rules"]
@@ -265,6 +378,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = json.dumps({"found": True, "venues": [VENUES[code]]}).encode()
             self.send_response(200)
         elif (url.path == "/api/v1/reference/identifiers/resolve"
+                and one("scheme") in ("figi", "share_class_figi") and one("value") in MINTS and V24):
+            # A security its source now confirms (contract v24): its record,
+            # minted on first asking, as a person's ask finds it (W3.3).
+            body = json.dumps({"found": True, "instrument": minted_record(one("value")),
+                               "venues": []}).encode()
+            self.send_response(200)
+        elif (url.path == "/api/v1/reference/identifiers/resolve"
                 and one("scheme") == "figi" and one("value") in EQUITIES):
             # The equity with the venue it is listed on (W3.3).
             body = json.dumps({"found": True, "instrument": EQUITIES[one("value")],
@@ -279,6 +399,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
+        url = urllib.parse.urlparse(self.path)
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            asked = json.loads(self.rfile.read(length) or b"{}")
+        except ValueError:
+            return self.answer(400, {"detail": "not JSON"})
+        if url.path == "/e2e/licence":
+            LICENCE["schemes"] = asked.get("schemes", LICENCE["schemes"])
+            LICENCE["version"] += 1
+            return self.answer(200, LICENCE)
+        if url.path == "/e2e/confirm":
+            # The platform's source now confirms a security its staff held.
+            MINTS.update(asked.get("figis", []))
+            return self.answer(200, {"mints": sorted(MINTS)})
+        if url.path == "/e2e/replacements":
+            REPLACEMENTS.extend(asked.get("entries", []))
+            return self.answer(200, {"entries": REPLACEMENTS})
+        if url.path in ("/api/v1/reference/escalate-instrument", "/api/v1/reference/usage-reports"):
+            HEARD.append({"method": "POST", "path": url.path, "body": asked})
+            if not V24:
+                return self.answer(404, {"detail": "Not Found"})
+            if url.path.endswith("/usage-reports"):
+                return self.answer(200, {"received": True})
+            return self.answer(200, match_or_mint(asked))
         self.send_response(404)
         self.send_header("Content-Length", "0")
         self.end_headers()

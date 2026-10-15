@@ -457,10 +457,14 @@ fn records() -> AccessRecords {
     }];
     records.venue_account_maps = vec![meridian_pb::v1::VenueAccountMap {
         ems_instance_id: "ems-1".into(),
+        // The first four accounts, two codes each: the last two mapped by
+        // none, so the Close of one only granted, and of one attached to
+        // nothing, are drawn too (approved 2026-10-14).
         mappings: records
             .accounts
             .iter()
-            .take(40)
+            .take(4)
+            .flat_map(|account| [account.clone(), account.clone()])
             .enumerate()
             .map(|(n, account)| meridian_pb::v1::VenueAccountMapping {
                 connectivity_instance_id: "fix-1".into(),
@@ -469,6 +473,23 @@ fn records() -> AccessRecords {
             })
             .collect(),
     }];
+    // "Joint taxable", granted to SnapTrade and attached to nothing else.
+    if let Some(joint) = records.accounts.get(4).map(|a| a.account_id.clone()) {
+        match records
+            .linkable_accounts
+            .iter_mut()
+            .find(|granted| granted.plugin_instance_id == INSTANCE)
+        {
+            Some(granted) => granted.account_ids.push(joint),
+            None => records
+                .linkable_accounts
+                .push(meridian_domain::v1::LinkableAccounts {
+                    plugin_instance_id: INSTANCE.into(),
+                    account_ids: vec![joint],
+                    ..Default::default()
+                }),
+        }
+    }
     // The holds a deployment admin set (contract v16, W6.25).
     records.holds = vec![
         meridian_domain::v1::Hold {
@@ -520,6 +541,13 @@ fn report(now: i64) -> meridian_domain::v1::PluginReport {
                 "Last read",
                 plugin_figure::Value::AtNs(now - 300_000_000_000),
             ),
+            // Five figures, as alpaca 0.8.0's Summary has at phone width
+            // (the build plan's O8, found 2026-10-14).
+            figure(
+                "Buying power",
+                plugin_figure::Value::Text("USD 1,234,567,890.12".into()),
+            ),
+            figure("Orders working", plugin_figure::Value::Count(12_345)),
         ],
         declaration: Some(PluginDeclaration {
             algorithms: Default::default(),
@@ -1264,11 +1292,73 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
             },
         );
     }
+    // Contract v24 (W3.11, W3.28, W11.36, W11.37): the provisional records,
+    // the usage reports sent, and the escape hatch's setting.
+    bus.serve(crate::admin::instruments::LIST_USAGE_REPORTS, |_| {
+        Ok((
+            "".into(),
+            meridian_domain::v1::ListUsageReportsReply {
+                reports: vec![meridian_domain::v1::SentUsageReport {
+                    sent_at_ns: 1_791_417_600_000_000_000,
+                    received: true,
+                    report: Some(meridian_domain::v1::IdentifierUsageReport {
+                        period_start: "2026-10-05".into(),
+                        period_end: "2026-10-11".into(),
+                        licensed_schemes: vec!["cusip".into()],
+                        scheme_counts: vec![meridian_domain::v1::SchemeUsageCount {
+                            scheme: "cusip".into(),
+                            instruments_carrying: 412,
+                            instruments_only_by: 37,
+                            misses_only_by: 4,
+                        }],
+                    }),
+                }],
+            }
+            .encode_to_vec(),
+        ))
+    });
+    bus.serve(crate::admin::instruments::SET_REPORTS_USAGE, |envelope| {
+        let asked = meridian_domain::v1::SetReportsUsageRequest::decode(&envelope.payload[..])
+            .map_err(|e| e.to_string())?;
+        Ok((
+            "".into(),
+            meridian_domain::v1::ReportsUsageSetting {
+                reports_usage: asked.reports_usage,
+            }
+            .encode_to_vec(),
+        ))
+    });
+    {
+        let local = Arc::new(Mutex::new(meridian_domain::v1::LocalRecordOrdersSetting {
+            allows_local_record_orders: true,
+            open_order_count: 3,
+        }));
+        let reading = Arc::clone(&local);
+        bus.serve(crate::admin::trading::READ_LOCAL_RECORD_ORDERS, move |_| {
+            Ok(("".into(), reading.lock().unwrap().encode_to_vec()))
+        });
+        bus.serve(
+            crate::admin::trading::SET_LOCAL_RECORD_ORDERS,
+            move |envelope| {
+                let asked =
+                    meridian_domain::v1::SetLocalRecordOrdersRequest::decode(&envelope.payload[..])
+                        .map_err(|e| e.to_string())?;
+                let mut held = local.lock().unwrap();
+                held.allows_local_record_orders = asked.allows_local_record_orders;
+                Ok(("".into(), held.encode_to_vec()))
+            },
+        );
+    }
     bus.serve(
         crate::admin::instruments::LIST_INSTRUMENTS_TO_COMPLETE,
         |envelope| {
             let asked = ListInstrumentsToCompleteRequest::decode(&envelope.payload[..])
                 .map_err(|e| e.to_string())?;
+            // Contract v24 (W3.11): the provisional records, each with why,
+            // and the migration's counts.
+            if asked.provisional {
+                return Ok(("".into(), provisional_listed().encode_to_vec()));
+            }
             // The picker's search (contract v20, W3.11): by the record's ID,
             // complete ones included, as the store answers it.
             let search = asked.search.trim().to_lowercase();
@@ -1708,4 +1798,76 @@ fn service_accounts() -> crate::service_accounts::ServiceAccounts {
         )
         .expect("kept");
     crate::service_accounts::ServiceAccounts::keeping(std::sync::Arc::new(store))
+}
+
+/// The provisional records the stand-in instrument store lists (contract
+/// v24, W3.11): one per reason, with the migration's counts.
+fn provisional_listed() -> ListInstrumentsToCompleteReply {
+    use meridian_domain::v1::{InstrumentValueSource, MigrationCounts, ProvisionalReason};
+    let at = 1_791_331_200_000_000_000;
+    let record = |n: usize, description: &str, template: &str, missing: &[&str]| InstrumentRecord {
+        instrument_id: format!("LCL-01JB2N7Q00000000000000{n:04}"),
+        description: description.into(),
+        provisional: true,
+        template_id: template.into(),
+        template_version: if template.is_empty() {
+            String::new()
+        } else {
+            "1".into()
+        },
+        missing_fields: missing.iter().map(|m| m.to_string()).collect(),
+        sources: vec![InstrumentValueSource {
+            recorded_at_ns: at - (n as i64) * 86_400_000_000_000,
+            ..Default::default()
+        }],
+        version: 1,
+        ..Default::default()
+    };
+    let listed = |record: InstrumentRecord, reason: ProvisionalReason| InstrumentToComplete {
+        instrument: Some(record),
+        provisional_reason: reason as i32,
+        ..Default::default()
+    };
+    ListInstrumentsToCompleteReply {
+        instruments: vec![
+            listed(
+                record(
+                    1,
+                    "Municipal bond, Commonwealth of Massachusetts 5% 2041",
+                    "TPL-debt-base",
+                    &["identifiers"],
+                ),
+                ProvisionalReason::Unspecified,
+            ),
+            listed(
+                record(2, "ZZ Top Holdings Inc. common stock", "TPL-equity", &[]),
+                ProvisionalReason::AwaitingStaff,
+            ),
+            listed(
+                record(3, "A position with no class stated", "", &[]),
+                ProvisionalReason::ClassNeeded,
+            ),
+            listed(
+                record(
+                    4,
+                    "Sweep fund",
+                    "TPL-money-market-fund",
+                    &["money_market_fund.nav"],
+                ),
+                ProvisionalReason::Unreachable,
+            ),
+        ],
+        migration_counts: Some(MigrationCounts {
+            already_held: 3,
+            matched: 118,
+            minted: 9,
+            near_match: 1,
+            awaiting_staff: 2,
+            kept_local: 14,
+            unreachable: 0,
+            held_back: 1,
+            remaining: 0,
+        }),
+        ..Default::default()
+    }
 }

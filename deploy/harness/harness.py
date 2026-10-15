@@ -143,6 +143,11 @@ the same image with the list on stdin:
       One of core's own pages as the person signed in, its status and body
       printed; fails unless it says each TEXT.
 
+  core-form PAGE POST FIELD=VALUE... [--expect-refused TEXT]
+      One of core's own forms as the deployment admin: PAGE read for its
+      form token, POST sent with the fields; fails unless done, or refused
+      saying TEXT.
+
   mcp list [--expect NAME ...]
       Prints the tools the connected delegation reaches, one name per line,
       and fails unless each NAME --expect gives is among them.
@@ -946,7 +951,11 @@ def instrument(args):
     if args or (named is None) == (by_identifier is None):
         raise Failed("instrument takes an ID or --identifier TEXT, and NAME=VALUE")
     source = asked.get("source", "")
-    if asked.get("asset_class") not in CLASSES or not asked.get("currency") or not source:
+    # `--ask-platform` alone asks and completes nothing (contract v24: a
+    # provisional record the platform holds is resolved by the ask, W3.8).
+    ask_only = ask_platform and not asked
+    if not ask_only and (asked.get("asset_class") not in CLASSES or not asked.get("currency")
+                         or not source):
         raise Failed(f"instrument takes asset_class={'|'.join(CLASSES)}, currency=CODE and source=TEXT")
     admin = signed_in()
 
@@ -966,6 +975,9 @@ def instrument(args):
         if answered.status != 200:
             raise Failed(f"{instrument_id}: the platform was not asked: "
                          f"{answered.status} {sentence(answered)}")
+        if ask_only:
+            print(f"instrument: the platform asked about {instrument_id}")
+            return
     page = admin.get(f"/admin/instruments/{urllib.parse.quote(instrument_id)}")
     version = re.search(r'name="against_version" value="(\d+)"', page.body)
     if page.status != 200 or version is None:
@@ -2339,6 +2351,24 @@ def attribute(args):
     print(f"attribute: {said or rest[0] + ' waits ' + given['waits']}")
 
 
+def core_form(args):
+    """`core-form PAGE POST FIELD=VALUE... [--expect-refused TEXT]`: one of
+    core's own forms, as the deployment admin signed in: PAGE read for its
+    form token, POST sent with the fields given (contract v24: the escape
+    hatch's setting, the usage report's, an account's Close)."""
+    refusal = option(args, "--expect-refused", None)
+    fields = dict(pairs(args))
+    rest = [a for a in args if "=" not in a]
+    if len(rest) != 2:
+        raise Failed("core-form takes the page it is on and the path it posts to")
+    person = signed_in()
+    page = person.get(rest[0])
+    fields["form_token"] = form_token(page)
+    done = person.post(rest[1], fields)
+    said = refused_or_done(done, refusal, rest[1])
+    print(f"core-form: {said or 'done'}")
+
+
 COMMANDS = {"ready": ready, "settings": settings, "hold": hold, "archive": archive,
             "summary": summary, "view": view, "account": account, "page": page,
             "form": form, "unlinked": unlinked, "grant": grant, "compose": compose,
@@ -2348,7 +2378,7 @@ COMMANDS = {"ready": ready, "settings": settings, "hold": hold, "archive": archi
             "prepared-form": prepared_form, "prepare-settings": prepare_settings,
             "agents": agents, "linkable": linkable, "core-page": core_page,
             "service-account": service_account, "connectivity": connectivity,
-            "instruction": instruction, "attribute": attribute}
+            "instruction": instruction, "attribute": attribute, "core-form": core_form}
 
 
 def main(argv):
