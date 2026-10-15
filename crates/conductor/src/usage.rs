@@ -57,6 +57,16 @@ pub fn last_week(today: Date) -> (Date, Date) {
     (start, end)
 }
 
+/// The store's reads and writes block: each on the blocking pool, never on
+/// the runtime driving the bus (a Postgres store panics there).
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|failed| format!("the conductor's store: {failed}"))?
+}
+
 /// Sends the week's report once it is due.
 pub struct UsageSender {
     bus: Arc<Bus>,
@@ -120,18 +130,22 @@ impl UsageSender {
             received,
             report: Some(report),
         };
-        self.book.record(&sent)?;
+        let (book, kept) = (Arc::clone(&self.book), sent.clone());
+        blocking(move || book.record(&kept)).await?;
         Ok(sent)
     }
 
     /// The last whole week's report, unless it was sent already or the
     /// report is off. Answers what was sent, if anything.
     pub async fn send_if_due(&self) -> Result<Option<SentUsageReport>, String> {
-        if !self.book.reports_usage()? {
+        let book = Arc::clone(&self.book);
+        if !blocking(move || book.reports_usage()).await? {
             return Ok(None);
         }
         let (start, end) = last_week(Date::of_utc_instant(self.clock.now_ns()));
-        let covered = self.book.sent(1)?.first().and_then(|last| {
+        let book = Arc::clone(&self.book);
+        let sent = blocking(move || book.sent(1)).await?;
+        let covered = sent.first().and_then(|last| {
             last.report
                 .as_ref()
                 .and_then(|report| Date::parse(&report.period_end).ok())
