@@ -1350,6 +1350,19 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
             },
         );
     }
+    // Contract v24 (W3.26): the migration's lines made, answered with the
+    // counts after.
+    bus.serve(
+        crate::admin::instruments::APPLY_INSTRUMENT_MIGRATION,
+        |envelope| {
+            let asked =
+                meridian_domain::v1::ApplyInstrumentMigrationRequest::decode(&envelope.payload[..])
+                    .map_err(|e| e.to_string())?;
+            let mut counts = provisional_listed().migration_counts.unwrap_or_default();
+            counts.held_back += asked.held_back_ids.len() as i64;
+            Ok(("".into(), counts.encode_to_vec()))
+        },
+    );
     bus.serve(
         crate::admin::instruments::LIST_INSTRUMENTS_TO_COMPLETE,
         |envelope| {
@@ -1801,6 +1814,60 @@ fn service_accounts() -> crate::service_accounts::ServiceAccounts {
     crate::service_accounts::ServiceAccounts::keeping(std::sync::Arc::new(store))
 }
 
+/// The migration's lines (contract v24, W3.26): a dozen exact ones, two
+/// records answered by one INS- ID (a duplicate line) and one held back.
+fn migration_lines(
+    record: &dyn Fn(usize, &str, &str, &[&str]) -> InstrumentRecord,
+) -> Vec<InstrumentToComplete> {
+    use meridian_domain::v1::{MigrationSection, ProvisionalReason};
+    let line = |n: usize, description: &str, section: MigrationSection, answered: String| {
+        InstrumentToComplete {
+            instrument: Some(record(n, description, "TPL-equity", &[])),
+            provisional_reason: if section == MigrationSection::HeldBack {
+                ProvisionalReason::HeldBack
+            } else {
+                ProvisionalReason::Incomplete
+            } as i32,
+            migration_section: section as i32,
+            answered_instrument_id: answered,
+            ..Default::default()
+        }
+    };
+    let mut lines: Vec<InstrumentToComplete> = (0..12)
+        .map(|k| {
+            line(
+                10 + k,
+                &format!("Kept since v10, line {}", k + 1),
+                if k % 3 == 0 {
+                    MigrationSection::Minted
+                } else {
+                    MigrationSection::Matched
+                },
+                format!("INS-01JB2N7QEXACT00000000{k:04}"),
+            )
+        })
+        .collect();
+    lines.push(line(
+        30,
+        "US dollar, a v20 statement",
+        MigrationSection::AlreadyHeld,
+        "INS-01JUSD0000000000000000000001".into(),
+    ));
+    lines.push(line(
+        31,
+        "USD cash, another custodian",
+        MigrationSection::Matched,
+        "INS-01JUSD0000000000000000000001".into(),
+    ));
+    lines.push(line(
+        32,
+        "Grayscale Bitcoin Trust",
+        MigrationSection::HeldBack,
+        "INS-01JB2N7QGBTC000000000000001".into(),
+    ));
+    lines
+}
+
 /// The provisional records the stand-in instrument store lists (contract
 /// v24, W3.11): one per reason, with the migration's counts.
 fn provisional_listed() -> ListInstrumentsToCompleteReply {
@@ -1857,7 +1924,10 @@ fn provisional_listed() -> ListInstrumentsToCompleteReply {
                 ),
                 ProvisionalReason::Unreachable,
             ),
-        ],
+        ]
+        .into_iter()
+        .chain(migration_lines(&record))
+        .collect(),
         migration_counts: Some(MigrationCounts {
             already_held: 3,
             matched: 118,

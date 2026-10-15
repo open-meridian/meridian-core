@@ -1003,12 +1003,48 @@ def the_v24_pages(browser, prefix):
         page.goto(f"{BASE}/admin/instruments#provisional")
         settled(page)
         rows = page.eval_on_selector_all("#provisional-table tbody tr", "rows => rows.map(r => r.dataset.reason)")
-        check(len(rows) == 4, f"at {size} the provisional records are listed, each with why: {rows}")
+        check(len(rows) == 19, f"at {size} the provisional records are listed, each with why: {rows}")
         # Its text whole: the kit's pager hides the rows past a screen.
         why = page.evaluate("() => document.querySelector('#provisional').textContent")
         check("with the platform's staff" in why and "class needed" in why and "Matched: 118" in " ".join(why.split()),
               f"at {size} their reasons and the migration's counts are said")
         measured(page, f"Instruments, provisional, at {size}", f"v24-instruments-provisional-{size}.png")
+        # Contract v24 (W3.26): the migration's lines, each dialog from a
+        # fresh page -- the exact lines as one change, each held back by its
+        # box; the uncertain lines, one chosen at a time.
+        for which, opener, attr, lines, table in (
+                ("exact", "button[data-exact-lines]", "data-exact-lines", "12", "#exact-lines-table"),
+                ("uncertain", "button[data-uncertain-lines]", "data-uncertain-lines", "2",
+                 "#uncertain-lines-table")):
+            page.goto(f"{BASE}/admin/instruments#provisional")
+            settled(page)
+            said = page.get_attribute(opener, attr)
+            check(said == lines, f"at {size} the {which} lines are counted: {said}")
+            page.click(opener)
+            page.wait_for_timeout(300)
+            listed = page.eval_on_selector_all(f"dialog[open] {table} tbody tr", "rows => rows.length")
+            check(str(listed) == lines, f"at {size} the {which} lines' dialog lists each: {listed}")
+            buttons = page.eval_on_selector_all("dialog[open] .dialog-foot button",
+                                                "bs => bs.map(b => b.textContent.trim())")
+            check("Prepare" in buttons and "Cancel" in buttons,
+                  f"at {size} the {which} lines are prepared or made: {buttons}")
+            if which == "exact":
+                boxes = page.eval_on_selector_all("dialog[open] input[name=hold]", "bs => bs.length")
+                check(boxes == 12, f"at {size} each exact line can be held back: {boxes}")
+            else:
+                check("Hold back" in buttons, f"at {size} an uncertain line can be held back: {buttons}")
+            boxed = inside_the_viewport(page)
+            check(not boxed, f"at {size} the {which} lines' dialog stays within the viewport"
+                  f"{': ' + boxed if boxed else ''}")
+            spilled = page.evaluate(INSIDE)
+            check(not spilled, f"at {size} nothing in the {which} lines' dialog reaches past it"
+                  f"{': ' + '; '.join(spilled[:4]) if spilled else ''}")
+            m = page.evaluate(MEASURE)
+            print(f"MEASURE Lines dialog, {which}, at {size}: horizontal={m['wide']} vertical={m['tall']}",
+                  flush=True)
+            page.screenshot(path=os.path.join(OUT, f"v24-lines-{which}-{size}.png"))
+            page.click("dialog[open] [data-dialog-close]")
+            page.wait_for_timeout(200)
         page.goto(f"{BASE}/admin/instruments#licensed")
         settled(page)
         check(page.locator("form#usage-form select[name=reports_usage]").count() == 1,
@@ -1019,7 +1055,7 @@ def the_v24_pages(browser, prefix):
         settled(page)
         provisional = page.get_attribute("#provisional-records", "data-provisional")
         orders = page.get_attribute("#local-record-orders", "data-open-order-count")
-        check(provisional == "4" and orders == "3",
+        check(provisional == "19" and orders == "3",
               f"at {size} the home page counts the provisional records and the orders on local records: {provisional}, {orders}")
         measured(page, f"Home, at {size}", f"v24-home-{size}.png")
 

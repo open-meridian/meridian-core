@@ -145,8 +145,8 @@ the same image with the list on stdin:
 
   core-form PAGE POST FIELD=VALUE... [--expect-refused TEXT]
       One of core's own forms as the deployment admin: PAGE read for its
-      form token, POST sent with the fields; fails unless done, or refused
-      saying TEXT.
+      form token, POST sent with the fields, a FIELD given more than once
+      sent once for each; fails unless done, or refused saying TEXT.
 
   mcp list [--expect NAME ...]
       Prints the tools the connected delegation reaches, one name per line,
@@ -2363,15 +2363,17 @@ def core_form(args):
     """`core-form PAGE POST FIELD=VALUE... [--expect-refused TEXT]`: one of
     core's own forms, as the deployment admin signed in: PAGE read for its
     form token, POST sent with the fields given (contract v24: the escape
-    hatch's setting, the usage report's, an account's Close)."""
+    hatch's setting, the usage report's, an account's Close; the migration's
+    lines, a FIELD given more than once sent once for each, as a form's
+    repeated field is)."""
     refusal = option(args, "--expect-refused", None)
-    fields = dict(pairs(args))
+    fields = pairs(args)
     rest = [a for a in args if "=" not in a]
     if len(rest) != 2:
         raise Failed("core-form takes the page it is on and the path it posts to")
     person = signed_in()
     page = person.get(rest[0])
-    fields["form_token"] = form_token(page)
+    fields.append(("form_token", form_token(page)))
     done = person.post(rest[1], fields)
     said = refused_or_done(done, refusal, rest[1])
     print(f"core-form: {said or 'done'}")

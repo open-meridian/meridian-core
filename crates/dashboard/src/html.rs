@@ -319,7 +319,7 @@ dialog{width:min(32rem,calc(100vw - 2rem));padding:0;border:1px solid var(--line
 background:var(--card);color:var(--ink);box-shadow:var(--shadow-pop)}\
 dialog::backdrop{background:var(--backdrop)}\
 .dialog-head{padding:1rem 1.25rem .25rem}.dialog-head h2{margin:0}.dialog-body{padding:.5rem 1.25rem}\
-.dialog-foot{display:flex;justify-content:flex-end;gap:.5rem;padding:.75rem 1.25rem;border-top:1px solid var(--line-soft)}\
+.dialog-foot{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:.5rem;padding:.75rem 1.25rem;border-top:1px solid var(--line-soft)}\
 .dialog-foot button{margin:0}\
 fieldset.checks{border:1px solid var(--line);border-radius:var(--radius);padding:.5rem .75rem;margin:0 0 .9rem;\
 max-height:14rem;overflow:auto}fieldset.checks legend{font-size:.84rem;font-weight:550;padding:0 .25rem}\

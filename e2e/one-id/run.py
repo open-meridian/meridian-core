@@ -27,9 +27,15 @@ brokerage and no trading API of any kind is reached.
 6. An order opened on the local record before the resolution, placed and
    filled after it: the fill lands on the INS- record's position (W11's
    invariant, W9.9).
-7. A platform without v24's routes (404): a new security is a provisional
+7. The upgrade's migration (W3.26): records kept before v24 -- two LCL-
+   currencies for one code and a third -- sent and answered, INCOMPLETE
+   until made; made from the Provisional tab: a record that is no line
+   refuses the change whole, the exact lines made with CHF held back
+   (keeping its LCL- ID, HELD_BACK), the duplicate GBP line made as one --
+   both records becoming the one INS- record -- and the held-back line made
+   later.
+8. A platform without v24's routes (404): a new security is a provisional
    record, the platform reached for nothing (the build plan's step 4).
-8. `store book` prints the positions under the INS- IDs.
 
 Run from the repository's root by the Makefile, which builds the images and
 copies the harness out first; standard library only.
@@ -53,6 +59,12 @@ INSTANCES = ("pm", "desk", "comp", "venue")
 CODE = "SIM-ACCT-1"
 CUSIP = "037833100"
 PENDING = "BBG00PENDING01"
+# Kept before v24 (W3.26), as the stand-in platform answers their codes.
+KEPT_BEFORE_V24 = (("LCL-01J8XQ4M7K0000000000GBP1", "GBP", "Pound sterling, a v20 statement"),
+                   ("LCL-01J8XQ4M7K0000000000GBP2", "GBP", "GBP cash, another custodian"),
+                   ("LCL-01J8XQ4M7K0000000000CHF1", "CHF", "Swiss franc, a v20 statement"))
+GBP = f"INS-01JGBP{'0' * 19}1"
+CHF = f"INS-01JCHF{'0' * 19}1"
 
 
 class Failed(Exception):
@@ -258,7 +270,59 @@ def run():
                  for line in book.splitlines()),
          "step 6, nothing held under the resolved LCL- ID")
 
-    # 7. A platform without v24's routes.
+    # 7. The upgrade's migration (W3.26): records kept before v24, as a v20
+    # deployment held them -- two LCL- currencies for one code, a duplicate
+    # line, and a third its admin holds back -- sent and answered, then made
+    # from the Provisional tab.
+    seed = ("INSERT INTO instrument (instrument_id, asset_class, currency, description, "
+            "lifecycle_state, version, valid_from_ns, record_time_ns) VALUES "
+            + ", ".join(f"('{lcl}', 'ASSET_CLASS_CASH', '{code}', '{words}', "
+                        "'INSTRUMENT_LIFECYCLE_STATE_ACTIVE', 1, 0, 1)"
+                        for lcl, code, words in KEPT_BEFORE_V24)
+            + "; INSERT INTO instrument_identifier (instrument_id, scheme, value, source, "
+            "valid_from_ns) VALUES "
+            + ", ".join(f"('{lcl}', 'iso4217', '{code}', '', 0)" for lcl, code, _ in KEPT_BEFORE_V24)
+            + ";")
+    compose("exec", "-T", "postgres", "psql", "-U", "meridian", "-d", "meridian",
+            "-v", "ON_ERROR_STOP=1", "-c", seed)
+    gbp1, gbp2, chf = (lcl for lcl, _, _ in KEPT_BEFORE_V24)
+    tab = until(240, lambda: (lambda said: said if f'data-uncertain="{gbp1},{gbp2}"' in said
+                              and f'name="line" value="{chf}"' in said else None)(
+        runner("core-page", "/admin/instruments")),
+        "step 7, the migration's answers drawn as lines: the GBP pair one uncertain line, CHF exact")
+    must(f'data-id="{gbp1}" data-reason="2"' in tab,
+         "step 7, a line answered but not made is PROVISIONAL_REASON_INCOMPLETE (ruled 2026-10-15)")
+    runner("core-form", "/admin/instruments", "/admin/instruments/migration",
+           f"line={licensed['instrument_id']}", "note=not a line",
+           "--expect-refused", "no line")
+    must(licensed["instrument_id"] in runner("core-page", "/admin/instruments"),
+         "step 7, a record that is no line refuses the change whole")
+    # The exact lines, CHF held back by its box.
+    runner("core-form", "/admin/instruments", "/admin/instruments/migration",
+           f"line={chf}", f"hold={chf}", "note=CHF waits for its custodian's statement")
+    held = until(60, lambda: (lambda said: said if f'data-id="{chf}" data-reason="5"' in said else None)(
+        runner("core-page", "/admin/instruments")), "step 7, CHF held back, keeping its LCL- ID")
+    must(f'data-uncertain="{chf}"' in held, "step 7, a held-back line is made later on its own")
+    # The duplicate: both GBP records become the one INS- record.
+    runner("core-form", "/admin/instruments", "/admin/instruments/migration",
+           f"group={gbp1},{gbp2}", "note=one pound sterling, kept twice before v24")
+    gbp = until(60, lambda: (lambda said: said if gbp1 in said and gbp2 in said else None)(
+        runner("core-page", f"/admin/instruments/{GBP}")),
+        "step 7, the duplicate line made: both LCL- records carried on the INS- record")
+    must("open_meridian_local" in gbp, "step 7, each LCL- ID under open_meridian_local")
+    for lcl in (gbp1, gbp2):
+        must(GBP in runner("core-page", f"/admin/instruments/{lcl}"),
+             f"step 7, {lcl} answers the record it became")
+    # The held-back line, made later.
+    runner("core-form", "/admin/instruments", "/admin/instruments/migration",
+           f"group={chf}", "note=the custodian confirmed CHF")
+    until(60, lambda: (lambda said: said if chf in said else None)(
+        runner("core-page", f"/admin/instruments/{CHF}")), "step 7, the held-back line made later")
+    listing = runner("core-page", "/admin/instruments")
+    must(f'data-id="{chf}"' not in listing and f'data-id="{gbp1}"' not in listing,
+         "step 7, made lines leave the provisional records")
+
+    # 8. A platform without v24's routes.
     old = dict(ENV, HARNESS_PLATFORM_V24="0")
     compose("up", "-d", "--force-recreate", "platform", env=old)
     away = page("venue", "write", "/resolve?symbol=AWAY&figi=BBG00AWAY0001")
@@ -272,8 +336,10 @@ def run():
           "provisional, a source thinner than the minimum not found; only listed schemes sent, never "
           "an LCL- ID or open_meridian_local, CUSIP sent once listed; the escape hatch counted, off "
           "refusing, on again; a person's value kept through the resolution, the LCL- ID under "
-          "open_meridian_local; an order opened before it filled onto the INS- record; a platform "
-          "without v24's routes unreachable")
+          "open_meridian_local; an order opened before it filled onto the INS- record; the "
+          "migration's lines made from the Provisional tab, two LCL- currencies for one code as one "
+          "duplicate line and a held-back line made later; a platform without v24's routes "
+          "unreachable")
 
 
 if __name__ == "__main__":
