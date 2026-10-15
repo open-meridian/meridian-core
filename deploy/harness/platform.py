@@ -220,6 +220,27 @@ EQUITIES = {
 }
 
 
+# Crypto assets the platform's master holds, by their CAIP-19 IDs (contract
+# v24): what e2e-lake prices, a record of the platform's rather than a
+# provisional local one, which is not priced (W10.6).
+BTC_CAIP19 = "bip122:000000000019d6689c085ae165831e93/slip44:0"
+USDC_CAIP19 = "eip155:1/erc20:0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+CRYPTO = {
+    caip19: {
+        "instrument_id": instrument_id,
+        "identifiers": [{"scheme": "caip19", "value": caip19, "source": ""}],
+        "asset_class": "ASSET_CLASS_CRYPTO_ASSET",
+        "description": description,
+        "lifecycle_state": "INSTRUMENT_LIFECYCLE_STATE_ACTIVE",
+        "version": 1,
+    }
+    for caip19, instrument_id, description in (
+        (BTC_CAIP19, f"INS-01JBTC{'0' * 19}1", "Bitcoin"),
+        (USDC_CAIP19, f"INS-01JUSDC{'0' * 18}1", "USD Coin"),
+    )
+}
+
+
 def calendars_for(one, many):
     """The seed answer to a pull by its one subject; versions after
     `after_version` only, on a refresh."""
@@ -319,6 +340,9 @@ def match_or_mint(asked):
         scheme, value = identifier.get("scheme", ""), identifier.get("value", "")
         if scheme in ("figi", "share_class_figi", "composite_figi") and value in EQUITIES:
             answer = {"minted": False, "instrument": EQUITIES[value], "venues": [XNAS]}
+            break
+        if scheme == "caip19" and value in CRYPTO:
+            answer = {"minted": False, "instrument": CRYPTO[value]}
             break
         if scheme == "iso4217" and value.upper() in NAMES:
             answer = {"minted": False, "instrument": record(value.upper())}

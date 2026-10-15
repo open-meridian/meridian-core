@@ -1816,9 +1816,11 @@ fn service_accounts() -> crate::service_accounts::ServiceAccounts {
 
 /// The migration's lines (contract v24, W3.26): a dozen exact ones, two
 /// records answered by one INS- ID (a duplicate line) and one held back.
-fn migration_lines(
-    record: &dyn Fn(usize, &str, &str, &[&str]) -> InstrumentRecord,
-) -> Vec<InstrumentToComplete> {
+/// How the stand-in draws a record: its number, description, template and
+/// what it lacks.
+type DrawRecord<'a> = &'a dyn Fn(usize, &str, &str, &[&str]) -> InstrumentRecord;
+
+fn migration_lines(record: DrawRecord<'_>) -> Vec<InstrumentToComplete> {
     use meridian_domain::v1::{MigrationSection, ProvisionalReason};
     let line = |n: usize, description: &str, section: MigrationSection, answered: String| {
         InstrumentToComplete {

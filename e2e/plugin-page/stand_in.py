@@ -515,11 +515,12 @@ def symbol(value):
 SOURCE = "stand-in"
 STATEMENT_ROWS = [
     {"identifiers": [figi("BBG000HARNES"), symbol("HRN")], "side": "long",
-     "quantity": "12.5", "settle": "10", "value": "1250.00"},
+     "quantity": "12.5", "settle": "10", "value": "1250.00",
+     "description": "HARNESS HOLDINGS INC"},
     {"identifiers": [symbol("SHRT")], "side": "short", "quantity": "-40",
-     "value": "-800.00", "assumed": True},
+     "value": "-800.00", "assumed": True, "description": "SHORTED STAND-IN CORP"},
     {"identifiers": [symbol("MMF")], "side": "long", "quantity": "500.00",
-     "value": "500.00", "in_cash": True},
+     "value": "500.00", "in_cash": True, "description": "STAND-IN MONEY MARKET (MMF)"},
     {"identifiers": [operations_pb2.Identifier(scheme="iso4217", value="USD")], "side": "long",
      "quantity": "1523.45", "settle": "1020.35", "value": "1523.45"},
 ]
@@ -533,9 +534,14 @@ def record_statement(external_account_id):
     ops = operations_pb2_grpc.PluginOperationsStub(grpc.insecure_channel(SIDECAR))
     resolved = []
     for row in STATEMENT_ROWS:
+        # What the source states of each security beside its identifiers:
+        # its name and the currency it is valued in (from contract v24 a
+        # source stating less is no record, W3.7, and the row a placeholder).
+        stated = ({"stated_description": row["description"], "stated_currency": "USD"}
+                  if "description" in row else {})
         found = ops.ResolveIdentifier(
             operations_pb2.ResolveIdentifierParams(
-                identifiers=row["identifiers"], as_of_ns=time.time_ns()),
+                identifiers=row["identifiers"], as_of_ns=time.time_ns(), **stated),
             timeout=10)
         resolved.append(found.instrument_id)
     opened = ops.RecordHoldingsStatement(

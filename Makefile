@@ -1126,7 +1126,11 @@ harness-check:
 	restarts="$$($(DOCKER) inspect -f '{{.RestartCount}}' "$$($(HARNESS) ps -q restarted)")"; \
 	[ "$${restarts:-0}" -ge 1 ] || fail "the plugin that failed first registered without being restarted ($$restarts), so the check proves nothing"; \
 	$(HARNESS_STORE) book >.harness/book 2>>.e2e-harness.log || fail "store book did not print the book"; \
-	[ ! -s .harness/book ] || fail "the book holds something nobody wrote: $$(head -3 .harness/book)"; \
+	backfill='^entry|~control|local-record-orders-backfilled|[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}|instance bor-1$$'; \
+	[ "$$(grep -c "$$backfill" .harness/book || true)" = 1 ] \
+		|| fail "the book does not hold contract v24's escape-hatch record exactly once, on its control partition, written by bor (W11.36, decisions/031): $$(head -3 .harness/book)"; \
+	grep -v "$$backfill" .harness/book >.harness/book-written || true; \
+	[ ! -s .harness/book-written ] || fail "the book holds something nobody wrote: $$(head -3 .harness/book-written)"; \
 	$(HARNESS_STORE) ledger >/dev/null 2>&1 && fail "store printed a store it does not have"; \
 	$(HARNESS) exec -T -u 65532 custody python -c 'import os, pathlib; pathlib.Path(os.environ["MERIDIAN_STORAGE_DIR"], "kept").write_text("a raw record")' \
 		|| fail "the custody plugin could not write its storage as a user that is not root"; \
