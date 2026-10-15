@@ -180,8 +180,8 @@ font-size:.86rem;font-weight:600;line-height:1.4;white-space:nowrap}\
 .plugin-area .area-title h1{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}\
 .plugin-area .area-drawn>*+*{margin-top:1.25rem}\
 .figures{display:grid;grid-template-columns:repeat(auto-fill,minmax(11rem,1fr));gap:.75rem}.figures:empty{display:none}\
-@media (max-width:640px){.figures{grid-template-columns:minmax(0,1fr);gap:.4rem}\
-.figures .figure{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;column-gap:.75rem;padding:.5rem .85rem}\
+@media (max-width:640px){.figures{grid-template-columns:minmax(0,1fr);gap:.25rem}\
+.figures .figure{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;column-gap:.75rem;padding:.3rem .8rem}\
 .figures .figure-head{flex:1 1 auto;min-width:0}.figures .figure .figure-value,.figures .figure[data-kind=text] .figure-value,\
 .figures .figure[data-kind=time] .figure-value{flex:0 1 auto;min-width:0;margin:0;font-size:1rem;text-align:right}\
 .figures .figure-as-of,.figures .figure .noted{flex-basis:100%;margin:.15rem 0 0}}\

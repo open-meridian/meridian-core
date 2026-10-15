@@ -1029,9 +1029,11 @@ def the_v24_pages(browser, prefix):
         check(said in ("true", "false"), f"at {size} the escape hatch's setting is drawn: {said}")
         measured(page, f"Trading instructions, local records, at {size}", f"v24-local-records-{size}.png")
 
-        page.goto(ADMIN_PAGE + "#accounts")
-        settled(page)
-        for name, offers in (("Joint taxable", True), ("Credit Suisse 401(k)", False)):
+        for name, offers in (("Credit Suisse 401(k)", False), ("Joint taxable", True)):
+            # Each from a fresh page, its row's page of the pager turned to.
+            page.goto(ADMIN_PAGE + "#accounts")
+            settled(page)
+            on_its_page(page, f"#accounts-table tr[data-name='{name}']")
             page.click(f"#accounts-table tr[data-name='{name}'] button[data-attached]")
             page.wait_for_timeout(300)
             items = page.eval_on_selector_all("dialog[open] [data-attached-list] li a", "as => as.map(a => a.getAttribute('href'))")
@@ -1050,6 +1052,9 @@ def the_v24_pages(browser, prefix):
             page.screenshot(path=os.path.join(OUT, f"v24-close-{'granted' if offers else 'attached'}-{size}.png"))
             page.click("dialog[open] [data-dialog-close]")
             page.wait_for_timeout(200)
+        page.goto(ADMIN_PAGE + "#accounts")
+        settled(page)
+        on_its_page(page, "#accounts-table tr[data-name='Kalshi']")
         confirm = page.get_attribute("#accounts-table tr[data-name='Kalshi'] form[data-confirm]", "data-confirm")
         check(bool(confirm), f"at {size} an account attached to nothing asks the usual confirmation: {confirm!r}")
 
