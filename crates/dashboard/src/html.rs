@@ -180,8 +180,8 @@ font-size:.86rem;font-weight:600;line-height:1.4;white-space:nowrap}\
 .plugin-area .area-title h1{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}\
 .plugin-area .area-drawn>*+*{margin-top:1.25rem}\
 .figures{display:grid;grid-template-columns:repeat(auto-fill,minmax(11rem,1fr));gap:.75rem}.figures:empty{display:none}\
-@media (max-width:640px){.figures{grid-template-columns:minmax(0,1fr);gap:.25rem}\
-.figures .figure{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;column-gap:.75rem;padding:.3rem .8rem}\
+@media (max-width:640px){.figures{grid-template-columns:minmax(0,1fr);gap:.2rem}\
+.figures .figure{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;column-gap:.75rem;padding:.2rem .8rem}\
 .figures .figure-head{flex:1 1 auto;min-width:0}.figures .figure .figure-value,.figures .figure[data-kind=text] .figure-value,\
 .figures .figure[data-kind=time] .figure-value{flex:0 1 auto;min-width:0;margin:0;font-size:1rem;text-align:right}\
 .figures .figure-as-of,.figures .figure .noted{flex-basis:100%;margin:.15rem 0 0}}\
@@ -225,6 +225,9 @@ overflow-wrap:anywhere}.figure[data-kind=text] .figure-value,.figure[data-kind=t
 .figure-as-of{margin:.3rem 0 0;color:var(--ink-faint);font-size:.8rem}.figure .noted{display:block;margin:.35rem 0 0}\
 .counts{display:grid;grid-template-columns:repeat(auto-fill,minmax(10rem,1fr));gap:.2rem 1rem;margin:.5rem 0 .75rem;\
 padding-left:1.1rem;font-size:.9rem}.counts li{overflow-wrap:anywhere}\
+.counts.tight{display:flex;flex-wrap:wrap;gap:.1rem .9rem;padding-left:0;list-style:none;font-size:.85rem;margin:.35rem 0 .5rem}\
+.inline-form{display:flex;flex-wrap:wrap;align-items:flex-end;gap:.5rem .75rem;margin:.5rem 0}\
+.inline-form label{flex:1 1 9rem;min-width:0}\
 @media (max-width:640px){table.provisional .wide{display:none}}\
 .attached-list{margin:.25rem 0 .6rem;padding-left:1.1rem}.attached-list li{margin:.2rem 0;overflow-wrap:anywhere}\
 .reserved{margin:.75rem 0 0;padding:.55rem .8rem;border:1px dashed var(--line-strong);border-radius:var(--radius);\

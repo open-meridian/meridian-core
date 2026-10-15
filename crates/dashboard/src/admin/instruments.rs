@@ -854,7 +854,7 @@ pub fn list_page_with(
 fn provisional_tab(listed: &ListInstrumentsToCompleteReply, now_ns: i64) -> (usize, String) {
     let counts = listed.migration_counts.as_ref().map(|m| {
         format!(
-            "<ul class=\"counts\" id=\"migration-counts\"><li>Already held: <strong>{}</strong></li>\
+            "<ul class=\"counts tight\" id=\"migration-counts\"><li>Already held: <strong>{}</strong></li>\
              <li>Matched: <strong>{}</strong></li><li>Minted: <strong>{}</strong></li>\
              <li>Near match: <strong>{}</strong></li><li>With the platform's staff: <strong>{}</strong></li>\
              <li>Kept local: <strong>{}</strong></li><li>Not reached: <strong>{}</strong></li>\
@@ -935,7 +935,7 @@ fn provisional_tab(listed: &ListInstrumentsToCompleteReply, now_ns: i64) -> (usi
         backfill = if backfill.is_empty() {
             String::new()
         } else {
-            format!("<h3>Backfills</h3><ul class=\"counts\" id=\"backfill-counts\">{backfill}</ul>")
+            format!("<h3>Backfills</h3><ul class=\"counts tight\" id=\"backfill-counts\">{backfill}</ul>")
         },
     );
     (n, body)
@@ -983,8 +983,7 @@ fn usage_section(
         ),
     };
     format!(
-        "<h3>Report identifier usage</h3><p class=\"hint\">On by default: weekly, per scheme, how \
-         many records carry it, resolve only through it and missed with it alone -- counts only, \
+        "<h3>Report identifier usage</h3><p class=\"hint\">Weekly counts per scheme, on by default: \
          never a value, a holding, a quantity or an account.</p>\
          <form method=\"post\" action=\"{USAGE_PATH}\" class=\"inline-form\" id=\"usage-form\">{token}\
          <label>Report identifier usage <select name=\"reports_usage\"><option value=\"on\">On</option>\
