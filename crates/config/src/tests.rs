@@ -179,6 +179,20 @@ async fn account(h: &Harness, name: &str) -> AccountRecord {
     account
 }
 
+/// The harness's grant of an account withdrawn, so it may close (approved
+/// 2026-10-14: an account still granted is refused).
+fn ungranted(h: &Harness, account_id: &str) {
+    h.store
+        .set_linkable_accounts(
+            h.bus.instance_id(),
+            &[],
+            &[account_id.to_string()],
+            &crate::store::Author::default(),
+            2,
+        )
+        .unwrap();
+}
+
 #[tokio::test]
 async fn a_link_names_only_an_account_granted_its_instance_and_the_accounts_read_are_those() {
     // W6.30, contract v20 (the product owner, 2026-10-10): nothing by default.
@@ -417,6 +431,7 @@ async fn an_account_is_defined_renamed_and_closed_and_never_deleted() {
     assert_eq!(renamed.account_id, created.account_id);
     assert_eq!(renamed.created_at_ns, created.created_at_ns);
 
+    ungranted(&h, &created.account_id);
     let closed: AccountRecord = ask(
         &h,
         CLOSE_ACCOUNT,
@@ -1040,6 +1055,7 @@ async fn a_link_needs_a_plugin_that_has_reported_and_an_open_account() {
 
     let h = harness("oms-1");
     let open = account(&h, "Growth").await;
+    ungranted(&h, &open.account_id);
     let _: AccountRecord = ask(
         &h,
         CLOSE_ACCOUNT,
@@ -1243,17 +1259,15 @@ async fn the_deployments_accounts_are_read_for_a_deployment_admin_with_what_desc
             1,
         )
         .unwrap();
+    // Closed before contract v24, its grant left standing (a closure since
+    // is refused while granted): still read, closed.
     let old = account(&h, "Old income").await;
-    let _: AccountRecord = ask(
-        &h,
-        CLOSE_ACCOUNT,
-        "meridian.v1.CloseAccountRequest",
-        CloseAccountRequest {
-            account_id: old.account_id.clone(),
-        },
-    )
-    .await
-    .unwrap();
+    h.store
+        .put_account(&AccountRecord {
+            state: AccountState::Closed as i32,
+            ..old.clone()
+        })
+        .unwrap();
     let read: Accounts = ask(
         &h,
         ACCOUNTS,
@@ -3378,4 +3392,92 @@ async fn a_change_against_a_never_saved_read_is_made_only_while_nothing_is_saved
     set_through(&fresh, &[("poll_minutes", "30")], &[], "First.", 0)
         .await
         .unwrap();
+}
+
+/// Approved 2026-10-14: closing an account still linked, granted or mapped
+/// is refused, naming each; never left dangling.
+#[tokio::test]
+async fn an_account_still_linked_granted_or_mapped_is_not_closed_and_each_is_named() {
+    let h = harness("dashboard-1");
+    let open = account(&h, "Primary").await;
+    h.store
+        .put_link(&ExternalAccountLink {
+            plugin_instance_id: "oms-1".into(),
+            external_account_id: "101-001-1".into(),
+            account_id: open.account_id.clone(),
+        })
+        .unwrap();
+    let close = || async {
+        ask::<_, AccountRecord>(
+            &h,
+            CLOSE_ACCOUNT,
+            "meridian.v1.CloseAccountRequest",
+            CloseAccountRequest {
+                account_id: open.account_id.clone(),
+            },
+        )
+        .await
+    };
+    let refused = close().await.unwrap_err();
+    assert!(
+        refused.contains("unlink 101-001-1 from oms-1 first"),
+        "{refused}"
+    );
+    assert!(
+        refused.contains("withdraw dashboard-1's grant of it first"),
+        "{refused}"
+    );
+    assert!(refused.contains("fields=account_id"), "{refused}");
+    assert_eq!(
+        records(&h).await.accounts[0].state,
+        AccountState::Open as i32
+    );
+
+    // Each undone, its own record; then it closes.
+    h.store
+        .put_link(&ExternalAccountLink {
+            plugin_instance_id: "oms-1".into(),
+            external_account_id: "101-001-1".into(),
+            account_id: String::new(),
+        })
+        .unwrap();
+    ungranted(&h, &open.account_id);
+    assert_eq!(close().await.unwrap().state, AccountState::Closed as i32);
+}
+
+/// W3.28 (contract v24): the usage report is on by default; turning it off
+/// says why and is its own record; the reports sent are listed.
+#[tokio::test]
+async fn the_usage_report_is_on_until_a_deployment_admin_turns_it_off_saying_why() {
+    let h = harness("dashboard-1");
+    let set = |on: bool, reason: &str| {
+        ask::<_, meridian_domain::v1::ReportsUsageSetting>(
+            &h,
+            crate::service::SET_REPORTS_USAGE,
+            "meridian.v1.SetReportsUsageRequest",
+            meridian_domain::v1::SetReportsUsageRequest {
+                reports_usage: on,
+                reason: reason.into(),
+            },
+        )
+    };
+    assert!(h.store.reports_usage().unwrap());
+    let refused = set(false, "").await.unwrap_err();
+    assert!(refused.contains("fields=reason"), "{refused}");
+    assert!(
+        !set(false, "the firm reports nothing outward")
+            .await
+            .unwrap()
+            .reports_usage
+    );
+    assert!(!h.store.reports_usage().unwrap());
+    let listed: meridian_domain::v1::ListUsageReportsReply = ask(
+        &h,
+        crate::service::LIST_USAGE_REPORTS,
+        "meridian.v1.ListUsageReportsRequest",
+        meridian_domain::v1::ListUsageReportsRequest {},
+    )
+    .await
+    .unwrap();
+    assert!(listed.reports.is_empty());
 }

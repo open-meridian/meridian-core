@@ -25,7 +25,9 @@ use std::time::Duration;
 
 use serde_json::{json, Map, Value};
 
-use super::instruments::{ask, bus_refused, integer, object, only, text, Problems};
+use super::instruments::{
+    ask, bus_refused, integer, object, only, stamp_ns, stamp_said, text, Problems,
+};
 use super::{others_words, refused, Area, Caller, Spec};
 use crate::admin::data_sources::{self as page, kind_of, kind_word, type_word};
 use crate::web::App;
@@ -183,7 +185,7 @@ fn priority_schema() -> Value {
             "data_type": {"type": "string", "enum": lake::PRIORITISED},
             "kind": {"type": "string", "enum": ["close", "last", "nav", "settlement"], "description": "for prices only"},
             "datasets": {"type": "array", "minItems": 1, "maxItems": MOST_DATASETS, "items": {"type": "string"}, "description": "first to last"},
-            "against_updated_at_ns": {"type": "integer", "description": "the priority's updated_at_ns as it was read; 0 when none is set"},
+            "against_updated_at_ns": {"type": ["string", "integer"], "pattern": "^[0-9]+$", "description": "the priority's updated_at_ns as it was read, a decimal string (an integer only up to 2^53); \"0\" when none is set"},
             "note": note(),
         },
         "required": ["data_type", "datasets", "against_updated_at_ns", "note"],
@@ -249,7 +251,7 @@ fn licence_json(licence: &DatasetLicence, set: bool) -> Value {
         "default_fields": licence.default_fields,
         "personal_use": licence.personal_use,
         "updated_by": licence.updated_by,
-        "updated_at_ns": licence.updated_at_ns,
+        "updated_at_ns": stamp_said(licence.updated_at_ns),
         "acting_through_delegation": licence.acting_through_delegation,
         "client_name": licence.client_name,
         "note": others_words(&licence.note),
@@ -263,7 +265,7 @@ fn entitlement_json(e: &DatasetEntitlement) -> Value {
         "allowed": e.allowed,
         "fields": e.fields,
         "updated_by": e.updated_by,
-        "updated_at_ns": e.updated_at_ns,
+        "updated_at_ns": stamp_said(e.updated_at_ns),
         "acting_through_delegation": e.acting_through_delegation,
         "client_name": e.client_name,
         "note": others_words(&e.note),
@@ -276,7 +278,7 @@ fn priority_json(p: &SourcePriority) -> Value {
         "kind": match kind_word(p.kind) { "" => Value::Null, word => word.into() },
         "datasets": p.datasets,
         "updated_by": p.updated_by,
-        "updated_at_ns": p.updated_at_ns,
+        "updated_at_ns": stamp_said(p.updated_at_ns),
         "acting_through_delegation": p.acting_through_delegation,
         "client_name": p.client_name,
         "note": others_words(&p.note),
@@ -527,7 +529,7 @@ async fn set_priority(app: &App, caller: &Caller, arguments: &Value) -> Value {
         kind: kind as i32,
         datasets,
         // The stale guard (contract v17): required, 0 when none is set.
-        against_updated_at_ns: integer(top, "against_updated_at_ns", "", true, &mut problems),
+        against_updated_at_ns: stamp_ns(top, "against_updated_at_ns", "", true, &mut problems),
         note: text(top, "note", "", true, &mut problems),
     };
     if !problems.is_empty() {

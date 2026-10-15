@@ -180,7 +180,11 @@ font-size:.86rem;font-weight:600;line-height:1.4;white-space:nowrap}\
 .plugin-area .area-title h1{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}\
 .plugin-area .area-drawn>*+*{margin-top:1.25rem}\
 .figures{display:grid;grid-template-columns:repeat(auto-fill,minmax(11rem,1fr));gap:.75rem}.figures:empty{display:none}\
-@media (max-width:640px){.figures{grid-template-columns:repeat(2,minmax(0,1fr))}}\
+@media (max-width:640px){.figures{grid-template-columns:minmax(0,1fr);gap:.4rem}\
+.figures .figure{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;column-gap:.75rem;padding:.5rem .85rem}\
+.figures .figure-head{flex:1 1 auto;min-width:0}.figures .figure .figure-value,.figures .figure[data-kind=text] .figure-value,\
+.figures .figure[data-kind=time] .figure-value{flex:0 1 auto;min-width:0;margin:0;font-size:1rem;text-align:right}\
+.figures .figure-as-of,.figures .figure .noted{flex-basis:100%;margin:.15rem 0 0}}\
 div.records-head,div.moves-head{flex-wrap:wrap;gap:.5rem 1rem}\
 table.kinds th:first-child{width:15%}table.kinds th.wide{width:21%}table.kinds th.num{width:14%}\
 table.holds th.actions{width:8.5rem}table.holds td.actions{text-align:right}\
@@ -219,6 +223,10 @@ box-shadow:var(--shadow)}.figure-head{display:flex;align-items:center;justify-co
 .figure-value{margin:.35rem 0 0;font-size:1.45rem;font-weight:650;line-height:1.2;font-variant-numeric:tabular-nums;\
 overflow-wrap:anywhere}.figure[data-kind=text] .figure-value,.figure[data-kind=time] .figure-value{font-size:1.05rem}\
 .figure-as-of{margin:.3rem 0 0;color:var(--ink-faint);font-size:.8rem}.figure .noted{display:block;margin:.35rem 0 0}\
+.counts{display:grid;grid-template-columns:repeat(auto-fill,minmax(10rem,1fr));gap:.2rem 1rem;margin:.5rem 0 .75rem;\
+padding-left:1.1rem;font-size:.9rem}.counts li{overflow-wrap:anywhere}\
+@media (max-width:640px){table.provisional .wide{display:none}}\
+.attached-list{margin:.25rem 0 .6rem;padding-left:1.1rem}.attached-list li{margin:.2rem 0;overflow-wrap:anywhere}\
 .reserved{margin:.75rem 0 0;padding:.55rem .8rem;border:1px dashed var(--line-strong);border-radius:var(--radius);\
 color:var(--ink-faint);font-size:.88rem}\
 .plugin-area .area-title{grid-area:title;display:flex;align-items:center;gap:.45rem;min-width:0;min-height:2.5rem}\

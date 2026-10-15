@@ -402,6 +402,19 @@ impl Platform {
         request: &EscalateInstrumentRequest,
         now_ns: i64,
     ) -> Result<EscalateInstrumentReply, PlatformError> {
+        self.escalate_with_venues(request, now_ns)
+            .await
+            .map(|(reply, _)| reply)
+    }
+
+    /// [`Platform::escalate`], with the venue master's records the answer
+    /// names -- its record's listing venue -- as W3.3's answer carries them
+    /// (contract v18), for the instrument store to keep.
+    pub async fn escalate_with_venues(
+        &self,
+        request: &EscalateInstrumentRequest,
+        now_ns: i64,
+    ) -> Result<(EscalateInstrumentReply, Vec<VenueRecord>), PlatformError> {
         let body = serde_json::to_vec(&escalation_body(request))
             .map_err(|failed| PlatformError::Malformed(failed.to_string()))?;
         let response = self
@@ -413,13 +426,21 @@ impl Platform {
             )
             .await?;
         let reply: WireReply = read(&response)?;
-        Ok(EscalateInstrumentReply {
-            instrument: reply.instrument.map(into_record).transpose()?,
-            minted: reply.minted.unwrap_or(false),
-            conflict: reply.conflict.unwrap_or(false),
-            near_match: reply.near_match.unwrap_or(false),
-            pending_review: reply.pending_review.unwrap_or(false),
-        })
+        let venues = reply
+            .venues
+            .into_iter()
+            .map(into_venue)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((
+            EscalateInstrumentReply {
+                instrument: reply.instrument.map(into_record).transpose()?,
+                minted: reply.minted.unwrap_or(false),
+                conflict: reply.conflict.unwrap_or(false),
+                near_match: reply.near_match.unwrap_or(false),
+                pending_review: reply.pending_review.unwrap_or(false),
+            },
+            venues,
+        ))
     }
 
     /// A route contract v24 added (W3.4, W3.24, W3.25, W3.27, W3.28). A

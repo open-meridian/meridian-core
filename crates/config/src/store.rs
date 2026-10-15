@@ -953,4 +953,17 @@ pub trait Store: Send + Sync {
 
     /// The latest catalogue a plugin published for a code, if any.
     fn venue_catalogue(&self, instance_id: &str, code: &str) -> Result<Option<VenueCatalogue>>;
+
+    /// The usage statistics' setting changed, its own record (contract v24,
+    /// W3.28, decisions/031): who, through what, when and why.
+    fn set_reports_usage(&self, reports_usage: bool, author: &Author, at_ns: i64) -> Result<()>;
+
+    /// The setting in force: on until a deployment admin turns it off.
+    fn reports_usage(&self) -> Result<bool>;
+
+    /// A report sent, its own record (W3.28).
+    fn record_usage_report(&self, report: &meridian_domain::v1::SentUsageReport) -> Result<()>;
+
+    /// The reports sent, newest first, at most `limit`.
+    fn usage_reports(&self, limit: usize) -> Result<Vec<meridian_domain::v1::SentUsageReport>>;
 }

@@ -77,6 +77,7 @@ pub fn routes() -> Router<Arc<App>> {
             "/admin/trading-instructions",
             get(trading_page).post(set_trading_instruction),
         )
+        .route(trading::LOCAL_RECORDS_PATH, post(set_local_record_orders))
         .route("/admin/data-sources", get(data_sources_page))
         .route("/admin/data-sources/licence", post(set_dataset_licence))
         .route(
@@ -89,6 +90,7 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/admin/instruments/accept", post(accept_offers))
         .route("/admin/instruments/merge", post(merge_instruments))
         .route("/admin/instruments/search", get(search_instruments))
+        .route(instruments::USAGE_PATH, post(set_reports_usage))
         .route("/admin/instruments/{instrument}", get(instrument_page))
         .route(
             "/admin/instruments/{instrument}/ask",
@@ -1111,7 +1113,8 @@ pub(crate) fn settings_args(instance: &str, fields: &Fields) -> Result<serde_jso
     let against: i64 = field(fields, settings::AGAINST_FIELD).parse().unwrap_or(0);
     let mut args = json!({
         "plugin_instance_id": instance,
-        "against_updated_at_ns": against,
+        // A decimal string: a stamp above 2^53 loses digits as a number (O3).
+        "against_updated_at_ns": against.to_string(),
         "note": field(fields, "note"),
     });
     if !value.is_empty() {
@@ -1840,11 +1843,12 @@ async fn set_book(
         }
         books::Books::Read(held) => {
             let held = held.iter().find(|a| a.account_id == account_id);
-            books::requests(
+            books::requests_marked(
                 account_id,
                 field(&fields, "base_currency_code"),
                 field(&fields, "lot_relief_default"),
                 field(&fields, "waits_for_compliance"),
+                field(&fields, "account_mark"),
                 field(&fields, "note"),
                 held,
             )
@@ -1887,18 +1891,54 @@ async fn close_account(
     Form(fields): Form<Fields>,
 ) -> Response {
     admin_form!(app, headers, fields, session, {
-        let request = CloseAccountRequest {
-            account_id: field(&fields, "account_id").into(),
-        };
-        command::<meridian_domain::v1::AccountRecord>(
-            &app,
-            &session,
-            "platform.config.command.close-account",
-            "meridian.v1.CloseAccountRequest",
-            request,
-        )
-        .await
-        .map(|_| ())
+        let account_id = field(&fields, "account_id").to_string();
+        // "Unlink all and close" (approved 2026-10-14): each grant withdrawn
+        // as its own record, then the closure, one confirmation. A link or
+        // an ems's mapping is undone at its plugin's page; the conductor
+        // refuses the closure, naming each, while one stands.
+        let mut withdrawn = Ok(());
+        if field(&fields, "unlink_all") == "1" {
+            match app.records.current(app.clock.now_ns()) {
+                Err(stale) => withdrawn = Err(stale.to_string()),
+                Ok(records) => {
+                    for item in overview::attached(&records, &account_id)
+                        .into_iter()
+                        .filter(|item| item.withdrawable)
+                    {
+                        let request = meridian_domain::v1::SetLinkableAccountsRequest {
+                            plugin_instance_id: item.plugin.clone(),
+                            withdraw_account_ids: vec![account_id.clone()],
+                            note: format!("withdrawn to close account {account_id}"),
+                            ..Default::default()
+                        };
+                        if let Err(failed) = command::<meridian_domain::v1::LinkableAccounts>(
+                            &app,
+                            &session,
+                            "platform.config.command.set-linkable-accounts",
+                            "meridian.v1.SetLinkableAccountsRequest",
+                            request,
+                        )
+                        .await
+                        {
+                            withdrawn = Err(failed);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        match withdrawn {
+            Err(failed) => Err(failed),
+            Ok(()) => command::<meridian_domain::v1::AccountRecord>(
+                &app,
+                &session,
+                "platform.config.command.close-account",
+                "meridian.v1.CloseAccountRequest",
+                CloseAccountRequest { account_id },
+            )
+            .await
+            .map(|_| ()),
+        }
     })
 }
 
@@ -2332,8 +2372,19 @@ async fn instruments_page(
         &codes,
         read.as_ref().map(|read| (chosen, year, read)),
     );
-    let body =
-        instruments::list_page_with(&listed, &token_input(&session), field(&query, "done"), &tab);
+    // Contract v24 (W3.11, W3.28): the provisional records, and the usage
+    // report's setting with the reports sent.
+    let provisional = instruments::provisional(&app.bus).await;
+    let usage = instruments::usage_reports(&app.bus).await;
+    let body = instruments::list_page_full(
+        &listed,
+        Some(&provisional),
+        Some(&usage),
+        &token_input(&session),
+        field(&query, "done"),
+        &tab,
+        app.clock.now_ns(),
+    );
     Html(page_with(
         "Instruments",
         &body,
@@ -2989,12 +3040,20 @@ async fn trading_page(
         Err(response) => return *response,
     };
     let held = trading::read(&app.bus).await;
-    let body = trading::page(
+    // Contract v24 (W11.36, W11.37): the escape hatch's setting, a
+    // deployment admin's, and the live orders on local records.
+    let local = if access.deployment_admin {
+        Some(trading::read_local_record_orders(&app.bus).await)
+    } else {
+        None
+    };
+    let body = trading::page_with(
         &held,
         &records,
         &access,
         &token_input(&session),
         field(&query, "done"),
+        local.as_ref(),
     );
     Html(page_with(
         "Trading instructions",
@@ -3076,6 +3135,153 @@ async fn set_trading_instruction(
 
 /// The trading instruction's act on the surface (W6.20, contract v22).
 const SET_TRADING_INSTRUCTION_TOOL: &str = "dashboard__set_trading_instruction";
+
+/// The words a refusal from the bus is shown in.
+fn said_of_refusal(failed: BusError) -> String {
+    match failed {
+        BusError::HandlerFailed { detail, .. } => {
+            match meridian_bus::read_refusal_status(&detail) {
+                Some((_, _, words)) => words.to_string(),
+                None => refusal_words(detail),
+            }
+        }
+        other => other.to_string(),
+    }
+}
+
+/// W11.36 (contract v24): "Allow orders on local records", a deployment
+/// admin's, with a reason; or prepared for someone to make.
+async fn set_local_record_orders(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Form(fields): Form<Fields>,
+) -> Response {
+    let (session, _) = match gate(&app, &headers, true) {
+        Ok(gated) => gated,
+        Err(response) => return *response,
+    };
+    if let Err(response) = form_token_matches(&session, &fields) {
+        return *response;
+    }
+    let allows = match field(&fields, "allows") {
+        "on" => true,
+        "off" => false,
+        other => return not_done(&format!("{other:?} is neither on nor off"), trading::PATH),
+    };
+    let note = field(&fields, "note").trim().to_string();
+    if note.is_empty() {
+        return not_done("say why the setting changes", trading::PATH);
+    }
+    let posted = prepare_or_gate(
+        &app,
+        &session,
+        &fields,
+        SET_LOCAL_RECORD_ORDERS_TOOL,
+        || Ok(serde_json::json!({"allows_local_record_orders": allows, "note": note})),
+    )
+    .await;
+    if let Some(response) = posted_to(posted, trading::PATH) {
+        return response;
+    }
+    let outcome = app
+        .bus
+        .call_for(
+            trading::SET_LOCAL_RECORD_ORDERS,
+            "meridian.v1.SetLocalRecordOrdersRequest",
+            meridian_domain::v1::SetLocalRecordOrdersRequest {
+                allows_local_record_orders: allows,
+                reason: note.clone(),
+            }
+            .encode_to_vec(),
+            None,
+            Some(Duration::from_secs(10)),
+            &session.subject,
+        )
+        .await
+        .map(|_| ())
+        .map_err(said_of_refusal);
+    after_to(
+        outcome,
+        &format!(
+            "{}?done={}",
+            trading::PATH,
+            if allows {
+                "Orders+on+local+records+allowed"
+            } else {
+                "Orders+on+local+records+refused"
+            }
+        ),
+        trading::PATH,
+    )
+}
+
+/// The escape hatch's act on the surface (W6.20, contract v24).
+const SET_LOCAL_RECORD_ORDERS_TOOL: &str = "dashboard__set_local_record_orders";
+
+/// W3.28 (contract v24): "Report identifier usage", a deployment admin's,
+/// with a reason; or prepared for someone to make.
+async fn set_reports_usage(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Form(fields): Form<Fields>,
+) -> Response {
+    let (session, _) = match gate(&app, &headers, true) {
+        Ok(gated) => gated,
+        Err(response) => return *response,
+    };
+    if let Err(response) = form_token_matches(&session, &fields) {
+        return *response;
+    }
+    let back = "/admin/instruments#licensed";
+    let on = match field(&fields, "reports_usage") {
+        "on" => true,
+        "off" => false,
+        other => return not_done(&format!("{other:?} is neither on nor off"), back),
+    };
+    let note = field(&fields, "note").trim().to_string();
+    if note.is_empty() {
+        return not_done("say why the setting changes", back);
+    }
+    let posted = prepare_or_gate(&app, &session, &fields, SET_REPORTS_USAGE_TOOL, || {
+        Ok(serde_json::json!({"reports_usage": on, "note": note}))
+    })
+    .await;
+    if let Some(response) = posted_to(posted, back) {
+        return response;
+    }
+    let outcome = app
+        .bus
+        .call_for(
+            instruments::SET_REPORTS_USAGE,
+            "meridian.v1.SetReportsUsageRequest",
+            meridian_domain::v1::SetReportsUsageRequest {
+                reports_usage: on,
+                reason: note.clone(),
+            }
+            .encode_to_vec(),
+            None,
+            Some(Duration::from_secs(10)),
+            &session.subject,
+        )
+        .await
+        .map(|_| ())
+        .map_err(said_of_refusal);
+    after_to(
+        outcome,
+        &format!(
+            "/admin/instruments?done={}#licensed",
+            if on {
+                "Identifier+usage+is+reported"
+            } else {
+                "Identifier+usage+is+not+reported"
+            }
+        ),
+        back,
+    )
+}
+
+/// The usage report's act on the surface (W6.20, contract v24).
+const SET_REPORTS_USAGE_TOOL: &str = "dashboard__set_reports_usage";
 
 // ── The Data sources page ───────────────────────────────────────────────────
 
@@ -3306,7 +3512,7 @@ async fn set_source_priority(
             let mut args = serde_json::json!({
                 "data_type": field(&fields, "data_type"),
                 "datasets": lines(&fields, "datasets"),
-                "against_updated_at_ns": against,
+                "against_updated_at_ns": against.to_string(),
                 "note": field(&fields, "note"),
             });
             if !kind.is_empty() {

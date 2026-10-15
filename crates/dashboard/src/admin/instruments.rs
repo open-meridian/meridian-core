@@ -36,6 +36,9 @@ pub const MERGE_INSTRUMENTS: &str = "platform.reference.command.merge-instrument
 pub const LIST_INSTRUMENTS_TO_COMPLETE: &str =
     "platform.reference.query.list-instruments-to-complete";
 pub const READ_INSTRUMENT_HISTORY: &str = "platform.reference.query.read-instrument-history";
+/// W3.28 (contract v24): the usage report's setting, and the reports sent.
+pub const SET_REPORTS_USAGE: &str = "platform.config.command.set-reports-usage";
+pub const LIST_USAGE_REPORTS: &str = "platform.config.query.list-usage-reports";
 pub const ASK_PLATFORM_FOR_INSTRUMENT: &str =
     "platform.reference.query.ask-platform-for-instrument";
 
@@ -233,6 +236,108 @@ pub async fn list(
         WAIT,
     )
     .await
+}
+
+/// The provisional records (contract v24, W3.11): each with why, complete or
+/// not.
+pub async fn provisional(
+    bus: &meridian_bus::Bus,
+) -> Result<ListInstrumentsToCompleteReply, String> {
+    ask(
+        bus,
+        LIST_INSTRUMENTS_TO_COMPLETE,
+        "meridian.v1.ListInstrumentsToCompleteRequest",
+        ListInstrumentsToCompleteRequest {
+            include_complete: true,
+            page_size: 1000,
+            provisional: true,
+            ..Default::default()
+        },
+        None,
+        WAIT,
+    )
+    .await
+}
+
+/// The usage reports the conductor sent (W3.28), newest first.
+pub async fn usage_reports(
+    bus: &meridian_bus::Bus,
+) -> Result<meridian_domain::v1::ListUsageReportsReply, String> {
+    ask(
+        bus,
+        LIST_USAGE_REPORTS,
+        "meridian.v1.ListUsageReportsRequest",
+        meridian_domain::v1::ListUsageReportsRequest {},
+        None,
+        WAIT,
+    )
+    .await
+}
+
+/// Why a record is provisional, in the page's words (W3.7, W3.11).
+pub fn reason_words(reason: i32) -> &'static str {
+    use meridian_domain::v1::ProvisionalReason;
+    match ProvisionalReason::try_from(reason) {
+        Ok(ProvisionalReason::Unreachable) => {
+            "the platform not reached; asked again on reconnecting"
+        }
+        Ok(ProvisionalReason::Incomplete) => "incomplete against its template",
+        Ok(ProvisionalReason::AwaitingStaff) => "with the platform's staff; asked again daily",
+        Ok(ProvisionalReason::ClassNeeded) => "class needed: no asset class stated",
+        Ok(ProvisionalReason::HeldBack) => "held back at the migration",
+        _ => "kept local: nothing on the licence list to look for",
+    }
+}
+
+/// When a record was first recorded, from its earliest source: its age.
+pub fn first_recorded_ns(record: &InstrumentRecord) -> i64 {
+    record
+        .sources
+        .iter()
+        .map(|source| source.recorded_at_ns)
+        .filter(|at| *at > 0)
+        .min()
+        .unwrap_or(record.record_time_ns)
+}
+
+/// An age in a person's words: "3 days", "5 hours", "under an hour".
+pub fn age_words(age_ns: i64) -> String {
+    let hours = age_ns.max(0) / 3_600_000_000_000;
+    match hours {
+        0 => "under an hour".into(),
+        1..=47 => format!("{hours} hour{}", if hours == 1 { "" } else { "s" }),
+        _ => format!("{} days", hours / 24),
+    }
+}
+
+/// The home page's line for the provisional records (contract v24, W3.11):
+/// how many, and the oldest's age. Nothing when none.
+pub fn home_provisional(listed: Option<&ListInstrumentsToCompleteReply>, now_ns: i64) -> String {
+    let Some(listed) = listed else {
+        return String::new();
+    };
+    let records: Vec<&InstrumentRecord> = listed
+        .instruments
+        .iter()
+        .filter_map(|item| item.instrument.as_ref())
+        .filter(|record| record.provisional)
+        .collect();
+    if records.is_empty() {
+        return String::new();
+    }
+    let oldest = records
+        .iter()
+        .map(|record| first_recorded_ns(record))
+        .min()
+        .unwrap_or(now_ns);
+    let n = records.len();
+    format!(
+        "<p class=\"notice\" id=\"provisional-records\" data-provisional=\"{n}\">{n} provisional \
+         instrument record{s}, the oldest {age}: local records, not priced, until the platform \
+         answers. <a href=\"/admin/instruments#provisional\">See why</a></p>",
+        s = if n == 1 { "" } else { "s" },
+        age = age_words(now_ns - oldest),
+    )
 }
 
 /// Whether the deployment holds a record by this ID, asked by the ID rather
@@ -736,6 +841,170 @@ pub fn list_page_with(
     notice: &str,
     calendars: &str,
 ) -> String {
+    list_page_full(listed, None, None, token, notice, calendars, 0)
+}
+
+/// The provisional tab (contract v24, W3.11): the migration's and each
+/// backfill's counts, and each provisional record with why, its template
+/// and what of it it lacks.
+fn provisional_tab(listed: &ListInstrumentsToCompleteReply, now_ns: i64) -> (usize, String) {
+    let counts = listed.migration_counts.as_ref().map(|m| {
+        format!(
+            "<ul class=\"counts\" id=\"migration-counts\"><li>Already held: <strong>{}</strong></li>\
+             <li>Matched: <strong>{}</strong></li><li>Minted: <strong>{}</strong></li>\
+             <li>Near match: <strong>{}</strong></li><li>With the platform's staff: <strong>{}</strong></li>\
+             <li>Kept local: <strong>{}</strong></li><li>Not reached: <strong>{}</strong></li>\
+             <li>Held back: <strong>{}</strong></li><li>Still to send: <strong>{}</strong></li></ul>",
+            m.already_held,
+            m.matched,
+            m.minted,
+            m.near_match,
+            m.awaiting_staff,
+            m.kept_local,
+            m.unreachable,
+            m.held_back,
+            m.remaining
+        )
+    });
+    let backfill: String = listed
+        .backfill_counts
+        .iter()
+        .map(|b| {
+            format!(
+                "<li>{}: <strong>{}</strong> linked, <strong>{}</strong> for a person, \
+                 <strong>{}</strong> still to send</li>",
+                escape(&b.scheme.to_ascii_uppercase()),
+                b.matched,
+                b.awaiting_person,
+                b.remaining
+            )
+        })
+        .collect();
+    let rows: Vec<String> = listed
+        .instruments
+        .iter()
+        .filter_map(|item| item.instrument.as_ref().map(|record| (item, record)))
+        .filter(|(_, record)| record.provisional)
+        .map(|(item, record)| {
+            let template = if record.template_id.is_empty() {
+                "none yet".to_string()
+            } else {
+                format!("{} v{}", record.template_id, record.template_version)
+            };
+            let missing = record.missing_fields.join(", ");
+            format!(
+                "<tr data-id=\"{id}\" data-reason=\"{reason_n}\"><td><a href=\"/admin/instruments/{id}\">{id}</a></td>\
+                 <td class=\"wide\" title=\"{description}\">{description}</td><td title=\"{why}\">{why}</td>\
+                 <td class=\"wide\">{template}</td><td class=\"wide\" title=\"{missing}\">{missing}</td>\
+                 <td>{age}</td></tr>",
+                id = escape(&record.instrument_id),
+                description = escape(&record.description),
+                reason_n = item.provisional_reason,
+                why = escape(reason_words(item.provisional_reason)),
+                template = escape(&template),
+                missing = escape(if missing.is_empty() { "—" } else { &missing }),
+                age = escape(&age_words(now_ns - first_recorded_ns(record))),
+            )
+        })
+        .collect();
+    let n = rows.len();
+    let table = if rows.is_empty() {
+        "<p class=\"empty\" data-provisional=\"0\">None: every record is the platform's.</p>"
+            .to_string()
+    } else {
+        format!(
+            "<om-pager search=\"Search provisional records\"><table class=\"list one-line provisional\" \
+             id=\"provisional-table\" data-provisional=\"{n}\"><thead><tr><th>Record</th>\
+             <th class=\"wide\">Description</th><th>Why</th><th class=\"wide\">Template</th>\
+             <th class=\"wide\">Missing</th><th>Age</th></tr></thead><tbody>{}</tbody></table></om-pager>",
+            rows.concat()
+        )
+    };
+    let body = format!(
+        "<section class=\"admin-section\" id=\"provisional\"><div class=\"section-head\"><div>\
+         <h2>Provisional records</h2><p class=\"hint\">Local records, not priced, until the \
+         platform answers with its record; each resolves on its own, its history reading across \
+         the link.</p></div></div>{counts}{backfill}{table}</section>",
+        counts = counts
+            .map(|counts| format!("<h3>The upgrade's migration</h3>{counts}"))
+            .unwrap_or_default(),
+        backfill = if backfill.is_empty() {
+            String::new()
+        } else {
+            format!("<h3>Backfills</h3><ul class=\"counts\" id=\"backfill-counts\">{backfill}</ul>")
+        },
+    );
+    (n, body)
+}
+
+/// The usage report's setting and the reports sent (contract v24, W3.28).
+fn usage_section(
+    reports: &Result<meridian_domain::v1::ListUsageReportsReply, String>,
+    token: &str,
+) -> String {
+    let sent = match reports {
+        Err(_) => {
+            "<p class=\"refused\">The conductor did not say which reports it sent.</p>".to_string()
+        }
+        Ok(reports) if reports.reports.is_empty() => {
+            "<p class=\"empty\" data-usage-reports=\"0\">None sent yet.</p>".to_string()
+        }
+        Ok(reports) => format!(
+            "<ul class=\"counts\" data-usage-reports=\"{}\">{}</ul>",
+            reports.reports.len(),
+            reports
+                .reports
+                .iter()
+                .take(5)
+                .map(|sent| {
+                    let report = sent.report.clone().unwrap_or_default();
+                    format!(
+                        "<li>{} to {}: {} scheme{}, {}</li>",
+                        escape(&report.period_start),
+                        escape(&report.period_end),
+                        report.scheme_counts.len(),
+                        if report.scheme_counts.len() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        },
+                        if sent.received {
+                            "received"
+                        } else {
+                            "not received"
+                        }
+                    )
+                })
+                .collect::<String>()
+        ),
+    };
+    format!(
+        "<h3>Report identifier usage</h3><p class=\"hint\">On by default: weekly, per scheme, how \
+         many records carry it, resolve only through it and missed with it alone -- counts only, \
+         never a value, a holding, a quantity or an account.</p>\
+         <form method=\"post\" action=\"{USAGE_PATH}\" class=\"inline-form\" id=\"usage-form\">{token}\
+         <label>Report identifier usage <select name=\"reports_usage\"><option value=\"on\">On</option>\
+         <option value=\"off\">Off</option></select></label>\
+         <label>Why <input name=\"note\" required maxlength=\"2000\"></label>\
+         <button type=\"submit\" name=\"prepare\" value=\"1\" data-prepare>Prepare</button>\
+         <button type=\"submit\" class=\"primary\">Set</button></form>{sent}"
+    )
+}
+
+/// Where the usage report's form posts.
+pub const USAGE_PATH: &str = "/admin/instruments/usage";
+
+/// The Instruments page whole, from contract v24 with its provisional tab
+/// and the usage report's setting.
+pub fn list_page_full(
+    listed: &Result<ListInstrumentsToCompleteReply, String>,
+    provisional: Option<&Result<ListInstrumentsToCompleteReply, String>>,
+    usage: Option<&Result<meridian_domain::v1::ListUsageReportsReply, String>>,
+    token: &str,
+    notice: &str,
+    calendars: &str,
+    now_ns: i64,
+) -> String {
     let notice = if notice.is_empty() {
         String::new()
     } else {
@@ -782,16 +1051,34 @@ pub fn list_page_with(
             )
         })
         .collect();
+    // From contract v24 the counts alone are reported (W3.28), never the
+    // values, unless the deployment admin turns the report off.
     let licensed = format!(
         "<section class=\"admin-section\" id=\"licensed\"><div class=\"section-head\"><div>\
          <h2>Licensed identifiers held</h2><p class=\"hint\">What your plugins reported, kept \
-         here under your own licence and never sent anywhere.</p></div></div>{}</section>",
+         here under your own licence: never sent anywhere, only how many are counted in the \
+         usage report.</p></div></div>{}{}</section>",
         if licensed.is_empty() {
             "<p class=\"empty\">None.</p>".to_string()
         } else {
             format!("<ul class=\"facts\">{}</ul>", licensed.concat())
-        }
+        },
+        usage
+            .map(|usage| usage_section(usage, token))
+            .unwrap_or_default(),
     );
+    let (provisional_n, provisional_tab) = match provisional {
+        Some(Ok(provisional)) => provisional_tab(provisional, now_ns),
+        Some(Err(why)) => (
+            0,
+            format!(
+                "<section class=\"admin-section\" id=\"provisional\"><p class=\"refused\">The \
+                 instrument store did not list the provisional records: {}</p></section>",
+                escape(why)
+            ),
+        ),
+        None => (0, String::new()),
+    };
 
     let conflict_rows: String = listed
         .conflicts
@@ -943,18 +1230,23 @@ pub fn list_page_with(
          the book cannot use is refused until it is complete.</p></div></div>{notice}\
          <nav class=\"tabs\"><a href=\"#to-complete\" data-tab=\"to-complete\">To complete</a>\
          <a href=\"#conflicts\" data-tab=\"conflicts\">Conflicts ({conflicts_n})</a>\
-         <a href=\"#licensed\" data-tab=\"licensed\">Licensed identifiers</a>{calendars_tab}</nav>\
+         {provisional_link}<a href=\"#licensed\" data-tab=\"licensed\">Licensed identifiers</a>{calendars_tab}</nav>\
          <section class=\"admin-section\" id=\"to-complete\"><div class=\"section-head\"><div>\
          <h2>Records to complete</h2>{counts}</div></div>{table}</section>\
          <section class=\"admin-section\" id=\"conflicts\"><div class=\"section-head\"><div>\
          <h2>Conflicts</h2><p class=\"hint\">Identifiers that meet two records. Merge them if \
          they are one security; the positions held under the one merged move onto the one that \
-         stays.</p></div></div>{conflicts}</section>{licensed}{calendars}</div>\
+         stays.</p></div></div>{conflicts}</section>{provisional_tab}{licensed}{calendars}</div>\
          <script>{}{}{}</script>",
         super::overview::SCRIPT_START,
         super::overview::SCRIPT_END,
         super::data_sources::PAGER_SCRIPT,
         conflicts_n = listed.conflicts.len(),
+        provisional_link = if provisional.is_some() {
+            format!("<a href=\"#provisional\" data-tab=\"provisional\">Provisional ({provisional_n})</a>")
+        } else {
+            String::new()
+        },
         calendars_tab = if calendars.is_empty() {
             ""
         } else {
@@ -1911,5 +2203,85 @@ mod tests {
         assert!(page.contains("data-reason=\"ambiguous\""));
         assert!(page.contains("data-dialog-open=\"merge-0\""));
         assert!(page.contains("<dialog id=\"merge-0\""));
+    }
+}
+
+#[cfg(test)]
+mod provisional_tests {
+    use super::*;
+    use meridian_domain::v1::{InstrumentValueSource, MigrationCounts, ProvisionalReason};
+
+    const NOW: i64 = 1_790_380_800_000_000_000;
+    const DAY: i64 = 86_400_000_000_000;
+
+    fn listed() -> ListInstrumentsToCompleteReply {
+        let record = |id: &str, at: i64| InstrumentRecord {
+            instrument_id: id.into(),
+            description: "ZZ Top Holdings".into(),
+            provisional: true,
+            template_id: "TPL-equity".into(),
+            template_version: "1".into(),
+            missing_fields: vec!["currency".into()],
+            sources: vec![InstrumentValueSource {
+                recorded_at_ns: at,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        ListInstrumentsToCompleteReply {
+            instruments: vec![
+                InstrumentToComplete {
+                    instrument: Some(record("LCL-ONE", NOW - 3 * DAY)),
+                    provisional_reason: ProvisionalReason::AwaitingStaff as i32,
+                    ..Default::default()
+                },
+                InstrumentToComplete {
+                    instrument: Some(record("LCL-TWO", NOW - DAY / 2)),
+                    provisional_reason: ProvisionalReason::Unreachable as i32,
+                    ..Default::default()
+                },
+            ],
+            migration_counts: Some(MigrationCounts {
+                matched: 4,
+                kept_local: 2,
+                remaining: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_provisional_records_are_drawn_with_why_their_template_and_age() {
+        let (n, tab) = provisional_tab(&listed(), NOW);
+        assert_eq!(n, 2);
+        assert!(
+            tab.contains("with the platform&#39;s staff; asked again daily")
+                || tab.contains("with the platform's staff; asked again daily"),
+            "{tab}"
+        );
+        assert!(tab.contains("TPL-equity v1"));
+        assert!(tab.contains(">currency<"));
+        assert!(tab.contains(">3 days<"));
+        assert!(tab.contains("Matched: <strong>4</strong>"));
+        assert!(tab.contains("Still to send: <strong>1</strong>"));
+        let home = home_provisional(Some(&listed()), NOW);
+        assert!(home.contains("data-provisional=\"2\""));
+        assert!(home.contains("the oldest 3 days"));
+        assert!(home_provisional(Some(&ListInstrumentsToCompleteReply::default()), NOW).is_empty());
+        // The page carries its tab and the usage report's form.
+        let page = list_page_full(
+            &Ok(ListInstrumentsToCompleteReply::default()),
+            Some(&Ok(listed())),
+            Some(&Ok(Default::default())),
+            "<t>",
+            "",
+            "",
+            NOW,
+        );
+        assert!(page.contains("Provisional (2)"));
+        assert!(page.contains("action=\"/admin/instruments/usage\""));
+        assert!(page.contains("Report identifier usage"));
+        assert!(page.contains("None sent yet."));
     }
 }

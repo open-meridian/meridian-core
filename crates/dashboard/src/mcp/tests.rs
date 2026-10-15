@@ -1447,7 +1447,8 @@ async fn a_custody_admin_reads_and_sets_their_settings_and_is_refused_one_servin
         data["changes"][0]["note"],
         "Rotated after the vendor's notice."
     );
-    assert_eq!(data["updated_at_ns"], 5);
+    // An optimistic lock's stamp travels as a decimal string (O3).
+    assert_eq!(data["updated_at_ns"], "5");
     let (_, said, _) = rpc(
         &app,
         Some(&custody),
@@ -2258,7 +2259,7 @@ async fn the_data_sources_tools_are_a_deployment_admins_noted_stamped_and_stale_
     let priority = &structured(&said)["data"]["priorities"][0];
     assert_eq!(priority["kind"], "close", "{said}");
     assert_eq!(structured(&said)["outcome"], "unchanged");
-    assert_eq!(priority["updated_at_ns"], 5);
+    assert_eq!(priority["updated_at_ns"], "5");
 
     // Each change: refused without a note and not sent; with one, stamped.
     for (tool, arguments, topic) in [
@@ -2341,6 +2342,48 @@ async fn the_data_sources_tools_are_a_deployment_admins_noted_stamped_and_stale_
         "{said}"
     );
     assert_eq!(refusal["fields"][0]["path"], "against_updated_at_ns");
+    // O3 (found 2026-10-14): a real stamp, above 2^53, as an integer has
+    // lost its digits and is refused naming the field; as a string it reads.
+    let real: i64 = 1_790_380_800_000_000_123;
+    let (_, said, _) = rpc(
+        &app,
+        Some(&token),
+        &[],
+        call(
+            "dashboard__set_source_priority",
+            json!({"data_type": "meridian.v1.Price", "kind": "close",
+                   "datasets": ["coinbase-1:daily"], "against_updated_at_ns": real, "note": "Why."}),
+        ),
+    )
+    .await;
+    let refusal = structured(&said);
+    assert_eq!(refusal["outcome"], "refused", "{said}");
+    assert_eq!(
+        refusal["fields"][0]["path"], "against_updated_at_ns",
+        "{said}"
+    );
+    assert!(said.to_string().contains("2^53"), "{said}");
+    let (_, said, _) = rpc(
+        &app,
+        Some(&token),
+        &[],
+        call(
+            "dashboard__set_source_priority",
+            json!({"data_type": "meridian.v1.Price", "kind": "close",
+                   "datasets": ["coinbase-1:daily"], "against_updated_at_ns": real.to_string(), "note": "Why."}),
+        ),
+    )
+    .await;
+    // Read, and sent as read: the book's stand-in answers it changed since
+    // (it stands at 5), naming the field -- never a digit lost.
+    let refusal = structured(&said);
+    assert!(
+        refusal["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("RECORD_CHANGED"),
+        "{said}"
+    );
     // A bar's priority names no kind.
     let (_, said, _) = rpc(
         &app,

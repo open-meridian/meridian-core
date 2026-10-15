@@ -770,7 +770,9 @@ fn the_one_id_state_is_kept_whole_and_each_replacement_numbered() {
     held.version = 2;
     let id = held.instrument_id.clone();
     assert_eq!(
-        store.write(held.clone(), 1, entry(&id, 2, "provisional")).unwrap(),
+        store
+            .write(held.clone(), 1, entry(&id, 2, "provisional"))
+            .unwrap(),
         Written::Stored
     );
     assert_eq!(store.by_id(&id).unwrap().unwrap().local, held.local);
@@ -778,17 +780,34 @@ fn the_one_id_state_is_kept_whole_and_each_replacement_numbered() {
     let first = unique("LCL");
     let second = unique("LCL");
     store
-        .replace_because(&first, "INS-ONE", meridian_domain::v1::ReplacementCause::Resolved as i32, 10)
+        .replace_because(
+            &first,
+            "INS-ONE",
+            meridian_domain::v1::ReplacementCause::Resolved as i32,
+            10,
+        )
         .unwrap();
     store.replace(&second, "INS-ONE", 20).unwrap();
     let a = store.replacement_record(&first).unwrap().unwrap();
     let b = store.replacement_record(&second).unwrap().unwrap();
-    assert_eq!(a.cause, meridian_domain::v1::ReplacementCause::Resolved as i32);
-    assert_eq!(b.cause, meridian_domain::v1::ReplacementCause::Merged as i32);
-    assert_eq!(b.sequence, a.sequence + 1, "one sequence, numbered in order");
+    assert_eq!(
+        a.cause,
+        meridian_domain::v1::ReplacementCause::Resolved as i32
+    );
+    assert_eq!(
+        b.cause,
+        meridian_domain::v1::ReplacementCause::Merged as i32
+    );
+    assert_eq!(
+        b.sequence,
+        a.sequence + 1,
+        "one sequence, numbered in order"
+    );
     let after = store.replacements_after(a.sequence - 1, 1000).unwrap();
     assert!(after.iter().any(|kept| kept.replaced_id == first));
-    assert!(after.windows(2).all(|pair| pair[0].sequence < pair[1].sequence));
+    assert!(after
+        .windows(2)
+        .all(|pair| pair[0].sequence < pair[1].sequence));
 
     let template = meridian_domain::v1::SecurityTemplate {
         template_id: unique("TPL-test"),
@@ -798,7 +817,10 @@ fn the_one_id_state_is_kept_whole_and_each_replacement_numbered() {
         ..Default::default()
     };
     assert!(store.keep_template(&template, 5).unwrap());
-    assert!(!store.keep_template(&template, 6).unwrap(), "a version is kept once");
+    assert!(
+        !store.keep_template(&template, 6).unwrap(),
+        "a version is kept once"
+    );
     assert!(store.templates().unwrap().contains(&template));
 
     let list = meridian_domain::v1::LicenceList {

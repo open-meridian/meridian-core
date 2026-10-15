@@ -29,8 +29,8 @@ use crate::web::App;
 use meridian_domain::v1::{
     set_account_attribute_request, AccountAttributeReply, AccountAttributes,
     ListAccountAttributesReply, ListAccountAttributesRequest, ListTradingInstructionsReply,
-    ListTradingInstructionsRequest, SetAccountAttributeRequest, TradingInstructionReply,
-    TradingInstructionTarget,
+    ListTradingInstructionsRequest, LocalRecordOrdersSetting, SetAccountAttributeRequest,
+    SetLocalRecordOrdersRequest, TradingInstructionReply, TradingInstructionTarget,
 };
 
 const WAIT: Duration = Duration::from_secs(5);
@@ -73,8 +73,9 @@ opening balance stands for. No account's positions or orders.",
         "set_account_attribute",
         "Set an account attribute",
         "set one attribute of an account in the book of record, with a note saying why: its base currency \
-(three capital letters), its lot-relief default, or whether releases wait for compliance (false \
-lets a release pass the gate without a compliance verdict). Each is its own record. Answers the \
+(three capital letters), its lot-relief default, whether releases wait for compliance (false \
+lets a release pass the gate without a compliance verdict), or from contract v24 whether it is an \
+error account or an allocation account (W9.13, W11.27). Each is its own record. Answers the \
 attributes as they stand.",
         false,
         Area::Accounts,
@@ -102,6 +103,18 @@ in v22.",
         false,
         Area::Trading,
         instruction_schema,
+    ),
+    spec(
+        "set_local_record_orders",
+        "Allow orders on local records",
+        "turn the escape hatch on or off, with a note saying why (contract v24, W11.36): while on, \
+as it is by default, an order may name a provisional record, a local record not priced; while off, \
+a proposal naming one and an accept of a venue's fill on one are refused \
+(REFUSAL_REASON_LOCAL_RECORD_NOT_ALLOWED), orders already working continuing. Each change its own \
+record. Answers the setting and the count of live orders on local records, naming no account.",
+        false,
+        Area::Trading,
+        local_record_orders_schema,
     ),
 ];
 
@@ -131,10 +144,24 @@ fn attribute_schema() -> Value {
             "base_currency_code": {"type": "string", "pattern": "^[A-Z]{3}$"},
             "lot_relief_default": {"type": "string", "enum": ["first_in_first_out", "last_in_first_out", "highest_cost", "lowest_cost", "average_cost"]},
             "waits_for_compliance": {"type": "boolean"},
+            "error_account": {"type": "boolean", "description": "an error account, where a booking's overfill and errors are booked (contract v24)"},
+            "allocation_account": {"type": "boolean", "description": "an allocation account, a block's account until its allocations are booked out (contract v24)"},
             "note": note(),
         },
         "required": ["account_id", "note"],
-        "description": "exactly one of base_currency_code, lot_relief_default and waits_for_compliance",
+        "description": "exactly one of base_currency_code, lot_relief_default, waits_for_compliance, error_account and allocation_account",
+        "additionalProperties": false,
+    })
+}
+
+fn local_record_orders_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "allows_local_record_orders": {"type": "boolean"},
+            "note": note(),
+        },
+        "required": ["allows_local_record_orders", "note"],
         "additionalProperties": false,
     })
 }
@@ -170,6 +197,8 @@ fn attributes_json(a: &AccountAttributes) -> Value {
         "base_currency_code": a.base_currency_code,
         "lot_relief_default": crate::admin::books_method_value(a.lot_relief_default),
         "waits_for_compliance": a.waits_for_compliance,
+        "error_account": a.error_account,
+        "allocation_account": a.allocation_account,
         "opening_balance_as_of": a.opening_balance.as_ref().map(|opening| opening.as_of_date.clone()).unwrap_or_default(),
     })
 }
@@ -183,6 +212,7 @@ pub async fn call(app: &App, caller: &Caller, spec: &Spec, arguments: Value) -> 
         "set_account_attribute" => set_attribute(app, caller, &arguments).await,
         "list_trading_instructions" => list_instructions(app, caller, &arguments).await,
         "set_trading_instruction" => set_instruction(app, caller, &arguments).await,
+        "set_local_record_orders" => set_local_record_orders(app, caller, &arguments).await,
         other => refused("not_listed", &format!("no tool {other}"), Vec::new()),
     }
 }
@@ -239,6 +269,8 @@ async fn set_attribute(app: &App, caller: &Caller, arguments: &Value) -> Value {
             "base_currency_code",
             "lot_relief_default",
             "waits_for_compliance",
+            "error_account",
+            "allocation_account",
             "note",
         ],
         "",
@@ -276,10 +308,27 @@ async fn set_attribute(app: &App, caller: &Caller, arguments: &Value) -> Value {
         }
         Some(_) => problems.add("waits_for_compliance", "true or false"),
     }
+    for (name, mark) in [
+        (
+            "error_account",
+            set_account_attribute_request::Attribute::ErrorAccount as fn(bool) -> _,
+        ),
+        (
+            "allocation_account",
+            set_account_attribute_request::Attribute::AllocationAccount,
+        ),
+    ] {
+        match top.get(name) {
+            None | Some(Value::Null) => {}
+            Some(Value::Bool(marked)) => attributes.push(mark(*marked)),
+            Some(_) => problems.add(name, "true or false"),
+        }
+    }
     if attributes.len() != 1 {
         problems.add(
             "",
-            "exactly one of base_currency_code, lot_relief_default and waits_for_compliance",
+            "exactly one of base_currency_code, lot_relief_default, waits_for_compliance, \
+             error_account and allocation_account",
         );
     }
     if !problems.is_empty() {
@@ -362,9 +411,13 @@ async fn list_instructions(app: &App, caller: &Caller, arguments: &Value) -> Val
         }
         cursor = page.next_cursor;
     }
+    // Contract v24 (W11.37): the escape hatch's setting beside them, read
+    // as the page shows it; a count, naming no account.
+    let local = trading::read_local_record_orders(&app.bus).await.ok();
     json!({"outcome": "unchanged", "data": {
         "instructions": found,
         "control_sequence": control_sequence,
+        "local_record_orders": local.as_ref().map(trading::local_record_orders_json),
     }})
 }
 
@@ -447,6 +500,62 @@ async fn set_instruction(app: &App, caller: &Caller, arguments: &Value) -> Value
     }
 }
 
+/// W11.36 (contract v24): the escape hatch's setting, a deployment admin's.
+async fn set_local_record_orders(app: &App, caller: &Caller, arguments: &Value) -> Value {
+    let mut problems = Problems::default();
+    let Some(top) = object(arguments, "", &mut problems) else {
+        return problems.refusal();
+    };
+    only(
+        top,
+        &["allows_local_record_orders", "note"],
+        "",
+        &mut problems,
+    );
+    let allows = match top.get("allows_local_record_orders") {
+        Some(Value::Bool(allows)) => *allows,
+        None | Some(Value::Null) => {
+            problems.add("allows_local_record_orders", "required");
+            false
+        }
+        Some(_) => {
+            problems.add("allows_local_record_orders", "true or false");
+            false
+        }
+    };
+    let reason = text(top, "note", "", true, &mut problems);
+    if !problems.is_empty() {
+        return problems.refusal();
+    }
+    let (_, access) = match access_of(app, caller) {
+        Ok(held) => held,
+        Err(refusal) => return refusal,
+    };
+    if !access.deployment_admin {
+        return refused(
+            "not_permitted",
+            "the escape hatch's setting is a deployment admin's",
+            Vec::new(),
+        );
+    }
+    let reply: Result<LocalRecordOrdersSetting, _> = ask(
+        app,
+        caller,
+        trading::SET_LOCAL_RECORD_ORDERS,
+        "meridian.v1.SetLocalRecordOrdersRequest",
+        SetLocalRecordOrdersRequest {
+            allows_local_record_orders: allows,
+            reason,
+        },
+        CHANGING,
+    )
+    .await;
+    match reply {
+        Err(failed) => bus_refused(failed, ""),
+        Ok(reply) => json!({"outcome": "made", "data": trading::local_record_orders_json(&reply)}),
+    }
+}
+
 /// The routes the order path's pages draw, each against the tool that
 /// reaches it (W6.20; the plan's parity check). [`tests`] fails the build
 /// where a changing route has none.
@@ -458,7 +567,7 @@ pub const PARITY: &[(&str, &str)] = &[
     ("/admin/accounts/book", "set_account_attribute"),
     (
         "/admin/trading-instructions",
-        "list_trading_instructions set_trading_instruction",
+        "list_trading_instructions set_trading_instruction set_local_record_orders",
     ),
 ];
 

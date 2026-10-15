@@ -218,14 +218,34 @@ impl Conductor {
             ..asking.clone()
         };
         let now_ns = self.clock.now_ns();
-        let answered = tokio::time::timeout(ASKING, self.platform.escalate(&asking, now_ns)).await;
-        let answer = match answered {
+        let answered =
+            tokio::time::timeout(ASKING, self.platform.escalate_with_venues(&asking, now_ns)).await;
+        let (answer, venues) = match answered {
             Err(_) => return unreachable("the platform did not answer in time".into()),
             Ok(Err(failed)) => return unreachable(failed.to_string()),
             Ok(Ok(answer)) => answer,
         };
+        // The venues the answer names, for the store to keep (W3.5, contract
+        // v18): published as a venue's pull is, naming no record.
+        if !venues.is_empty() {
+            if let Err(failed) = self.bus.publish(
+                INSTRUMENT_PULLED,
+                "meridian.v1.PullInstrumentReply",
+                PullInstrumentReply {
+                    found: false,
+                    instrument: None,
+                    for_instrument_id: String::new(),
+                    venues: venues.clone(),
+                }
+                .encode_to_vec(),
+                Some(correlation).filter(|c| !c.is_empty()),
+                Some(causation).filter(|c| !c.is_empty()),
+            ) {
+                tracing::warn!(%failed, "the venues the platform named could not be published");
+            }
+        }
         if let (Some(calendars), Some(record)) = (&self.calendars, answer.instrument.as_ref()) {
-            pull_calendars_with(calendars, Some(record), &[], correlation, causation).await;
+            pull_calendars_with(calendars, Some(record), &venues, correlation, causation).await;
         }
         AskPlatformForInstrumentReply {
             reachable: true,

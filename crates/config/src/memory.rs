@@ -32,6 +32,9 @@ pub struct MemoryStore {
     /// Each hold's and each archive's change, its own record, in order, with
     /// its note (W6.25, W8.7; the note from contract v17).
     holds: Mutex<Vec<(Hold, String)>>,
+    /// Contract v24 (W3.28): the usage setting's changes, and the reports.
+    reports_usage: Mutex<Vec<(bool, Author, i64)>>,
+    usage_reports: Mutex<Vec<meridian_domain::v1::SentUsageReport>>,
     archives: Mutex<Vec<(PluginArchive, String)>>,
     /// Each launch's and stop's note, in order (contract v17).
     launch_notes: Mutex<Vec<LaunchNote>>,
@@ -67,6 +70,8 @@ impl MemoryStore {
             changes: Mutex::new(Vec::new()),
             access_changes: Mutex::new(Vec::new()),
             holds: Mutex::new(Vec::new()),
+            reports_usage: Mutex::new(Vec::new()),
+            usage_reports: Mutex::new(Vec::new()),
             archives: Mutex::new(Vec::new()),
             launch_notes: Mutex::new(Vec::new()),
             moves: Mutex::new(Vec::new()),
@@ -992,5 +997,42 @@ impl Store for MemoryStore {
                 held.connectivity_instance_id == instance_id && held.venue_account_code == code
             })
             .map(|(_, held)| held.clone()))
+    }
+
+    fn set_reports_usage(&self, reports_usage: bool, author: &Author, at_ns: i64) -> Result<()> {
+        self.reports_usage
+            .lock()
+            .expect("store lock poisoned")
+            .push((reports_usage, author.clone(), at_ns));
+        Ok(())
+    }
+
+    fn reports_usage(&self) -> Result<bool> {
+        Ok(self
+            .reports_usage
+            .lock()
+            .expect("store lock poisoned")
+            .last()
+            .is_none_or(|(on, _, _)| *on))
+    }
+
+    fn record_usage_report(&self, report: &meridian_domain::v1::SentUsageReport) -> Result<()> {
+        self.usage_reports
+            .lock()
+            .expect("store lock poisoned")
+            .push(report.clone());
+        Ok(())
+    }
+
+    fn usage_reports(&self, limit: usize) -> Result<Vec<meridian_domain::v1::SentUsageReport>> {
+        Ok(self
+            .usage_reports
+            .lock()
+            .expect("store lock poisoned")
+            .iter()
+            .rev()
+            .take(limit)
+            .cloned()
+            .collect())
     }
 }

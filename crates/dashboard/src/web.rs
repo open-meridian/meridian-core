@@ -402,6 +402,25 @@ async fn home(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
         body.push_str(&crate::admin::instruments::home_notice(
             crate::admin::instruments::incomplete_for_book(&app.bus).await,
         ));
+        // Contract v24 (W3.11, W11.37): the provisional records with the
+        // oldest's age, and the live orders on local records -- counts,
+        // naming no account.
+        let provisional = crate::admin::instruments::provisional(&app.bus).await.ok();
+        body.push_str(&crate::admin::instruments::home_provisional(
+            provisional.as_ref(),
+            app.clock.now_ns(),
+        ));
+        if let Ok(local) = crate::admin::trading::read_local_record_orders(&app.bus).await {
+            let n = local.open_order_count;
+            if n > 0 {
+                body.push_str(&format!(
+                    "<p class=\"notice\" id=\"local-record-orders\" data-open-order-count=\"{n}\">\
+                     {n} live order{s} on local records, not priced. \
+                     <a href=\"/admin/trading-instructions#local-records\">Orders on local records</a></p>",
+                    s = if n == 1 { "" } else { "s" },
+                ));
+            }
+        }
     }
     if listed.is_empty() {
         body.push_str(

@@ -1928,6 +1928,67 @@ impl Store for PostgresStore {
             })
             .transpose()
     }
+
+    fn set_reports_usage(&self, reports_usage: bool, author: &Author, at_ns: i64) -> Result<()> {
+        self.conn()?
+            .execute(
+                "INSERT INTO config_reports_usage_change
+                        (reports_usage, changed_by, through_delegation, client_name,
+                         prepared_call_id, changed_at_ns, note)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                &[
+                    &reports_usage,
+                    &author.by,
+                    &author.delegation,
+                    &author.client,
+                    &author.prepared_call_id,
+                    &at_ns,
+                    &author.note,
+                ],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
+    fn reports_usage(&self) -> Result<bool> {
+        Ok(self
+            .conn()?
+            .query_opt(
+                "SELECT reports_usage FROM config_reports_usage_change
+                  ORDER BY change_id DESC LIMIT 1",
+                &[],
+            )
+            .map_err(unavailable)?
+            .is_none_or(|row| row.get::<_, bool>(0)))
+    }
+
+    fn record_usage_report(&self, report: &meridian_domain::v1::SentUsageReport) -> Result<()> {
+        use prost::Message;
+        self.conn()?
+            .execute(
+                "INSERT INTO config_usage_report (sent_at_ns, report) VALUES ($1, $2)",
+                &[&report.sent_at_ns, &report.encode_to_vec()],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
+    fn usage_reports(&self, limit: usize) -> Result<Vec<meridian_domain::v1::SentUsageReport>> {
+        use prost::Message;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.conn()?
+            .query(
+                "SELECT report FROM config_usage_report ORDER BY report_id DESC LIMIT $1",
+                &[&limit],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| {
+                let bytes: Vec<u8> = row.get(0);
+                meridian_domain::v1::SentUsageReport::decode(&bytes[..]).map_err(unavailable)
+            })
+            .collect()
+    }
 }
 
 /// An account's optional text as its column holds it: NULL for none, so an

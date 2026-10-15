@@ -135,6 +135,12 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0018_a_connectivity_plugin_reaches_its_ems.sql"),
         then: Some(contract_v22),
     },
+    Migration {
+        version: 19,
+        name: "identifier_usage_is_reported",
+        sql: include_str!("../migrations/0019_identifier_usage_is_reported.sql"),
+        then: None,
+    },
 ];
 
 /// Migration 18 (contract v22; W11.21, decisions/031): each instance holding

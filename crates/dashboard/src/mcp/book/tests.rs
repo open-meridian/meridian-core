@@ -73,7 +73,9 @@ fn the_four_tools_are_named_preparable_where_they_change_and_may_not_for_agents(
             );
         }
     }
-    assert_eq!(SPECS.len(), 4, "the four approved tools");
+    // The four approved in v22, and from contract v24 the escape hatch's
+    // setting (W11.36, approved 2026-10-14).
+    assert_eq!(SPECS.len(), 5, "the five approved tools");
 }
 
 #[test]

@@ -95,6 +95,9 @@ pub const ACCESS_RECORDS: &str = "platform.config.query.access-records";
 pub const REDEEM_CLAIM_CODE: &str = "platform.config.command.redeem-claim-code";
 pub const DEFINE_ACCOUNT: &str = "platform.config.command.define-account";
 pub const CLOSE_ACCOUNT: &str = "platform.config.command.close-account";
+/// W3.28 (contract v24): the usage statistics' setting, and the reports sent.
+pub const SET_REPORTS_USAGE: &str = "platform.config.command.set-reports-usage";
+pub const LIST_USAGE_REPORTS: &str = "platform.config.query.list-usage-reports";
 pub const LINK_EXTERNAL_ACCOUNT: &str = "platform.config.command.link-external-account";
 pub const ACCOUNTS: &str = "platform.config.query.accounts";
 pub const SET_LINKABLE_ACCOUNTS: &str = "platform.config.command.set-linkable-accounts";
@@ -1370,6 +1373,24 @@ pub fn serve_with(
         |cx, request: CloseAccountRequest, envelope| {
             let before = cx.snapshot()?;
             rules::close_account(&before, &request.account_id)?;
+            // Never left dangling (approved 2026-10-14): an account still
+            // linked, granted or mapped is refused, naming each.
+            let attached = rules::attached(&before, &request.account_id);
+            if !attached.is_empty() {
+                return Err(meridian_bus::refusal_naming(
+                    meridian_pb::v1::RefusalReason::Unspecified as i32,
+                    &["account_id".to_string()],
+                    format!(
+                        "account {} is still attached, and nothing was closed: {}",
+                        request.account_id,
+                        attached
+                            .iter()
+                            .map(|item| item.words())
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    ),
+                ));
+            }
             let mut account = before
                 .records
                 .accounts
@@ -1386,6 +1407,70 @@ pub fn serve_with(
             );
             cx.announce(&before)?;
             Ok(account)
+        },
+    );
+
+    // W3.28 (contract v24): "Report identifier usage", the deployment
+    // admin's, on by default, each change its own record.
+    answer(
+        &context,
+        SET_REPORTS_USAGE,
+        (
+            "meridian.v1.SetReportsUsageRequest",
+            "meridian.v1.ReportsUsageSetting",
+        ),
+        |cx, request: meridian_domain::v1::SetReportsUsageRequest, envelope| {
+            let by = subject(envelope);
+            if by.is_empty() {
+                return Err(
+                    "the usage report's setting is a deployment admin's, and this is sent for nobody"
+                        .into(),
+                );
+            }
+            if request.reason.trim().is_empty() {
+                return Err(meridian_bus::refusal_naming(
+                    meridian_pb::v1::RefusalReason::ReasonRequired as i32,
+                    &["reason".to_string()],
+                    "reason: a change to the usage report's setting says why",
+                ));
+            }
+            if request.reason.chars().count() > 4_000 {
+                return Err("reason: at most 4,000 characters".into());
+            }
+            if cx.store.reports_usage().map_err(|f| f.to_string())? != request.reports_usage {
+                cx.store
+                    .set_reports_usage(
+                        request.reports_usage,
+                        &Author {
+                            note: request.reason.trim().to_string(),
+                            ..author(envelope)
+                        },
+                        cx.clock.now_ns(),
+                    )
+                    .map_err(|f| f.to_string())?;
+                tracing::info!(
+                    on = request.reports_usage,
+                    by,
+                    "the usage report's setting changed"
+                );
+            }
+            Ok(meridian_domain::v1::ReportsUsageSetting {
+                reports_usage: cx.store.reports_usage().map_err(|f| f.to_string())?,
+            })
+        },
+    );
+
+    answer(
+        &context,
+        LIST_USAGE_REPORTS,
+        (
+            "meridian.v1.ListUsageReportsRequest",
+            "meridian.v1.ListUsageReportsReply",
+        ),
+        |cx, _request: meridian_domain::v1::ListUsageReportsRequest, _| {
+            Ok(meridian_domain::v1::ListUsageReportsReply {
+                reports: cx.store.usage_reports(52).map_err(|f| f.to_string())?,
+            })
         },
     );
 

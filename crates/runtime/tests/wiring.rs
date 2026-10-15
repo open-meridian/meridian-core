@@ -238,7 +238,10 @@ async fn a_connector_resolving_a_set_nothing_matches_is_answered_a_minted_record
         "the plugin's mirror dropped the minted flag"
     );
     assert!(resolved.instrument_id.starts_with("LCL-"));
-    assert!(resolved.provisional, "a local record, provisional (contract v24)");
+    assert!(
+        resolved.provisional,
+        "a local record, provisional (contract v24)"
+    );
 
     let again = sidecar
         .resolve_identifier(Request::new(unknown))
