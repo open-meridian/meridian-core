@@ -2243,3 +2243,95 @@ fn a_link_a_mapping_and_a_catalogue_are_kept_each_change_its_own_record() {
     );
     assert_eq!(store.venue_catalogue("fix-1", "ACCT-9").unwrap(), None);
 }
+
+#[test]
+fn the_registries_state_is_kept_whole() {
+    // Contract v25 (W8.10 to W8.12, W5.19).
+    use meridian_config::store::HeldCatalogue;
+    use meridian_domain::v1::{
+        PluginListing, PluginPull, PluginUsageReport, PullAcknowledgement, SentPluginUsageReport,
+    };
+    let store = store("registries");
+    assert_eq!(store.registry_catalogue().unwrap(), None);
+    let held = HeldCatalogue {
+        listings: vec![PluginListing {
+            listing: "open-meridian/snaptrade".into(),
+            stars: 3,
+            ..Default::default()
+        }],
+        sequence: 42,
+        key_status: r#"{"issued_at_ns":1,"keys":[],"signature":"x"}"#.into(),
+        pulled_at_ns: 7,
+    };
+    store.put_registry_catalogue(&held).unwrap();
+    let mut later = held.clone();
+    later.sequence = 43;
+    store.put_registry_catalogue(&later).unwrap();
+    assert_eq!(store.registry_catalogue().unwrap(), Some(later));
+
+    let mut listed = version("open-meridian/snaptrade", "1.4.0");
+    listed.source_registry = "community".into();
+    listed.listing = "open-meridian/snaptrade".into();
+    assert!(store
+        .record_listed_version(&listed, &[], "{\"payloadType\":\"x\"}")
+        .unwrap());
+    assert!(
+        !store.record_listed_version(&listed, &[], "{}").unwrap(),
+        "never replaced"
+    );
+    assert_eq!(
+        store
+            .listing_statement("open-meridian/snaptrade", "1.4.0")
+            .unwrap(),
+        "{\"payloadType\":\"x\"}"
+    );
+    assert_eq!(store.listing_statement("snaptrade", "9").unwrap(), "");
+
+    let mut running = launch("snaptrade-1");
+    running.name = "open-meridian/snaptrade".into();
+    running.version = "1.4.0".into();
+    assert!(store.begin_launch(&running, "").unwrap());
+    let acknowledgement = PullAcknowledgement {
+        pull: Some(PluginPull {
+            listing: "open-meridian/snaptrade".into(),
+            version: "1.4.0".into(),
+            pulled_at_ns: 9,
+            ..Default::default()
+        }),
+        acknowledged_by: "local|ada".into(),
+        acknowledged_at_ns: 10,
+        note: "Kept.".into(),
+        ..Default::default()
+    };
+    let kept = store
+        .acknowledge_pull("snaptrade-1", &acknowledgement)
+        .unwrap()
+        .unwrap();
+    assert_eq!(kept.pull_acknowledgement, Some(acknowledgement.clone()));
+    let read = store.snapshot().unwrap().catalogue.launches;
+    assert_eq!(read[0].pull_acknowledgement, Some(acknowledgement));
+    assert!(store
+        .acknowledge_pull("nothing-1", &PullAcknowledgement::default())
+        .unwrap()
+        .is_none());
+
+    assert!(store.reports_plugin_usage().unwrap(), "on by default");
+    store
+        .set_reports_plugin_usage(false, &meridian_config::store::Author::default(), 11)
+        .unwrap();
+    assert!(!store.reports_plugin_usage().unwrap());
+    for at in [12, 13] {
+        store
+            .record_plugin_usage_report(&SentPluginUsageReport {
+                sent_at_ns: at,
+                received: true,
+                report: Some(PluginUsageReport::default()),
+            })
+            .unwrap();
+    }
+    let sent = store.plugin_usage_reports(5).unwrap();
+    assert_eq!(
+        sent.iter().map(|r| r.sent_at_ns).collect::<Vec<_>>(),
+        [13, 12]
+    );
+}

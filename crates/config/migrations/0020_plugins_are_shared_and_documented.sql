@@ -55,3 +55,50 @@ CREATE TABLE IF NOT EXISTS config_plugin_documentation (
     PRIMARY KEY (name, version, section),
     FOREIGN KEY (name, version) REFERENCES config_plugin_version
 );
+
+-- A registry version's listing statement (W8.10, W8.3; contract v25), the
+-- platform's DSSE envelope as the resolution answered it, kept with the
+-- version for the verification again at launch. Empty for a local version.
+ALTER TABLE config_plugin_version
+    ADD COLUMN IF NOT EXISTS listing_statement text NOT NULL DEFAULT '';
+
+-- A deployment admin keeping an instance whose version was pulled (W8.12):
+-- the PullAcknowledgement, encoded, kept on its launch. NULL while none.
+ALTER TABLE config_plugin_launch
+    ADD COLUMN IF NOT EXISTS pull_acknowledgement bytea;
+
+-- The conductor's latest copy of the platform's catalogue (W8.10): one row,
+-- replaced at each pull -- the listings (a PullCatalogueReply's, encoded),
+-- the sequence the next pull reads after, the signing keys' status as the
+-- platform signed it (its JSON) and when it was pulled.
+CREATE TABLE IF NOT EXISTS config_registry_catalogue (
+    id           smallint PRIMARY KEY CHECK (id = 1),
+    listings     bytea    NOT NULL,
+    sequence     bigint   NOT NULL,
+    key_status   text     NOT NULL,
+    pulled_at_ns bigint   NOT NULL
+);
+
+-- The plugin usage report's setting (W5.19, contract v25), each change its
+-- own record (decisions/031): on or off, who, through which delegation and
+-- client, when and why. None is "on", the default. Never updated, never
+-- deleted.
+CREATE TABLE IF NOT EXISTS config_reports_plugin_usage_change (
+    change_id            bigserial PRIMARY KEY,
+    reports_plugin_usage boolean   NOT NULL,
+    changed_by           text      NOT NULL DEFAULT '',
+    through_delegation   text      NOT NULL DEFAULT '',
+    client_name          text      NOT NULL DEFAULT '',
+    prepared_call_id     text      NOT NULL DEFAULT '',
+    changed_at_ns        bigint    NOT NULL,
+    note                 text      NOT NULL DEFAULT ''
+);
+
+-- Each plugin usage report sent, its own record (SentPluginUsageReport,
+-- encoded): the counts, when, and whether the platform received it. Never
+-- updated, never deleted.
+CREATE TABLE IF NOT EXISTS config_plugin_usage_report (
+    report_id  bigserial PRIMARY KEY,
+    sent_at_ns bigint    NOT NULL,
+    report     bytea     NOT NULL
+);

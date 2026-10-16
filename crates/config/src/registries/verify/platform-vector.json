@@ -1,0 +1,24 @@
+{
+ "public_key": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEWBznifatGK0OszC/uKwSCzNL8Rr6\n9b1w2PmaakPpBJ5mbnkSXKOLxK0NSacCmJPXyB2VLQIMvMfVWUIiNAev7w==\n-----END PUBLIC KEY-----\n",
+ "key_status": {
+  "issued_at_ns": 1790380800000000000,
+  "keys": [
+   {
+    "key_id": "SGK-01",
+    "organisation": "open-meridian",
+    "name": "\u00dcn\u00efcode key \u2028 \ud83d\ude00",
+    "public_key": "ssh-ed25519 AAAA",
+    "fingerprint": "SHA256:abc",
+    "registered_at_ns": 1,
+    "registered_by_person_id": "",
+    "revoked_at_ns": 0,
+    "revoked_by_person_id": "",
+    "revoke_reason": "",
+    "not_trusted_after_ns": 0
+   }
+  ],
+  "signature": "MEUCIG0n6M14WFWAYz+O+/7YlF3FPiXRjs/bAHZMLRA8ILonAiEAjUWH598EIHh1AaUtqFOjsoZ8XOjJzq4wSQoPXMdcWcg="
+ },
+ "listing_statement": "{\"payload\":\"eyJfdHlwZSI6Imh0dHBzOi8vaW4tdG90by5pby9TdGF0ZW1lbnQvdjEiLCJwcmVkaWNhdGUiOnsiY29tbWl0IjoiY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjYyIsImZsb29yIjoidjI1IiwibGlzdGVkX2F0IjoiMjAyNi0xMC0xNlQxMjowMDowMC4xMjM0NTYrMDA6MDAiLCJsaXN0aW5nIjoib3Blbi1tZXJpZGlhbi9zbmFwdHJhZGUiLCJyZWdpc3RyeSI6ImNvbW11bml0eSIsInJlcG9zaXRvcnkiOiJvcGVuLW1lcmlkaWFuL3BsdWdpbi1zbmFwdHJhZGUiLCJyb2xlcyI6WyJjdXN0b2R5Il0sInNpZ25lcl9rZXkiOiJTSEEyNTY6YWJjIiwidGFnIjoidjEuNC4wIiwidmVyc2lvbiI6IjEuNC4wIn0sInByZWRpY2F0ZVR5cGUiOiJodHRwczovL29wZW4tbWVyaWRpYW4uZGV2L2F0dGVzdGF0aW9uL3BsdWdpbi1saXN0aW5nL3YxIiwic3ViamVjdCI6W3siZGlnZXN0Ijp7InNoYTI1NiI6ImFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWIifSwibmFtZSI6ImdoY3IuaW8vb3Blbi1tZXJpZGlhbi9wbHVnaW5zL29wZW4tbWVyaWRpYW4vc25hcHRyYWRlIn1dfQ==\",\"payloadType\":\"application/vnd.in-toto+json\",\"signatures\":[{\"keyid\":\"k\",\"sig\":\"MEYCIQDz5kiiw/Sz7nyzBVrkzzzXxUvntJAWv+f6rwvUDdWPDwIhANYF2mlIkPFYPRTZBF49JsUemCfQEtKl0uR5XDtRyNNN\"}]}",
+ "digest": "sha256:abababababababababababababababababababababababababababababababab"
+}

@@ -58,6 +58,12 @@ pub struct MemoryStore {
     licensed_schemes: Mutex<Vec<(Vec<String>, Author, i64)>>,
     /// Who retired each version, through what (W8.15, contract v25).
     retirements: Mutex<std::collections::BTreeMap<(String, String), Author>>,
+    /// The registries (contract v25): the catalogue's copy, each listed
+    /// version's statement, the usage setting's changes and the reports.
+    registry: Mutex<Option<crate::store::HeldCatalogue>>,
+    statements: Mutex<std::collections::BTreeMap<(String, String), String>>,
+    reports_plugin_usage: Mutex<Vec<(bool, Author, i64)>>,
+    plugin_usage_reports: Mutex<Vec<meridian_domain::v1::SentPluginUsageReport>>,
 }
 
 impl MemoryStore {
@@ -80,6 +86,10 @@ impl MemoryStore {
             holds: Mutex::new(Vec::new()),
             reports_usage: Mutex::new(Vec::new()),
             usage_reports: Mutex::new(Vec::new()),
+            registry: Mutex::new(None),
+            statements: Mutex::new(Default::default()),
+            reports_plugin_usage: Mutex::new(Vec::new()),
+            plugin_usage_reports: Mutex::new(Vec::new()),
             archives: Mutex::new(Vec::new()),
             launch_notes: Mutex::new(Vec::new()),
             moves: Mutex::new(Vec::new()),
@@ -1157,6 +1167,104 @@ impl Store for MemoryStore {
     fn usage_reports(&self, limit: usize) -> Result<Vec<meridian_domain::v1::SentUsageReport>> {
         Ok(self
             .usage_reports
+            .lock()
+            .expect("store lock poisoned")
+            .iter()
+            .rev()
+            .take(limit)
+            .cloned()
+            .collect())
+    }
+
+    fn registry_catalogue(&self) -> Result<Option<crate::store::HeldCatalogue>> {
+        Ok(self.registry.lock().expect("store lock poisoned").clone())
+    }
+
+    fn put_registry_catalogue(&self, held: &crate::store::HeldCatalogue) -> Result<()> {
+        *self.registry.lock().expect("store lock poisoned") = Some(held.clone());
+        Ok(())
+    }
+
+    fn record_listed_version(
+        &self,
+        version: &PluginVersion,
+        documentation: &[meridian_domain::v1::DocumentationText],
+        listing_statement: &str,
+    ) -> Result<bool> {
+        let recorded = self.record_plugin_version_documented(version, documentation)?;
+        if recorded {
+            let metadata = version.metadata.clone().unwrap_or_default();
+            self.statements.lock().expect("store lock poisoned").insert(
+                (metadata.name, metadata.version),
+                listing_statement.to_string(),
+            );
+        }
+        Ok(recorded)
+    }
+
+    fn listing_statement(&self, name: &str, version: &str) -> Result<String> {
+        Ok(self
+            .statements
+            .lock()
+            .expect("store lock poisoned")
+            .get(&(name.to_string(), version.to_string()))
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn acknowledge_pull(
+        &self,
+        instance_id: &str,
+        acknowledgement: &meridian_domain::v1::PullAcknowledgement,
+    ) -> Result<Option<PluginLaunch>> {
+        let mut state = self.state.lock().expect("store lock poisoned");
+        Ok(state
+            .catalogue
+            .launches
+            .iter_mut()
+            .find(|held| {
+                held.instance_id == instance_id && held.state == PluginLaunchState::Launched as i32
+            })
+            .map(|launch| {
+                launch.pull_acknowledgement = Some(acknowledgement.clone());
+                launch.clone()
+            }))
+    }
+
+    fn set_reports_plugin_usage(&self, on: bool, author: &Author, at_ns: i64) -> Result<()> {
+        self.reports_plugin_usage
+            .lock()
+            .expect("store lock poisoned")
+            .push((on, author.clone(), at_ns));
+        Ok(())
+    }
+
+    fn reports_plugin_usage(&self) -> Result<bool> {
+        Ok(self
+            .reports_plugin_usage
+            .lock()
+            .expect("store lock poisoned")
+            .last()
+            .is_none_or(|(on, _, _)| *on))
+    }
+
+    fn record_plugin_usage_report(
+        &self,
+        report: &meridian_domain::v1::SentPluginUsageReport,
+    ) -> Result<()> {
+        self.plugin_usage_reports
+            .lock()
+            .expect("store lock poisoned")
+            .push(report.clone());
+        Ok(())
+    }
+
+    fn plugin_usage_reports(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<meridian_domain::v1::SentPluginUsageReport>> {
+        Ok(self
+            .plugin_usage_reports
             .lock()
             .expect("store lock poisoned")
             .iter()

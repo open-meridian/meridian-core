@@ -31,6 +31,7 @@ pub mod ids;
 pub mod migrations;
 pub mod plugins;
 pub mod postgres;
+pub mod registries;
 pub mod rules;
 pub mod sealing;
 pub mod service;
@@ -43,7 +44,7 @@ pub use memory::MemoryStore;
 pub use meridian_access::DEPLOYMENT_ADMIN;
 pub use plugins::serve_plugins;
 pub use plugins::serve_plugins_with;
-pub use plugins::{serve_plugins_reaching, LocalRegistry};
+pub use plugins::{serve_plugins_and_registries, serve_plugins_reaching, LocalRegistry};
 pub use postgres::PostgresStore;
 pub use sealing::SettingsKey;
 pub use service::{

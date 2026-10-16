@@ -1,0 +1,471 @@
+//! The registries against a stand-in platform: its catalogue, resolutions
+//! and referrers made and signed here as the platform makes them.
+
+use std::sync::Mutex;
+
+use serde_json::{json, Value};
+
+use super::verify::tests::TestSigner;
+use super::verify::{LISTING_PREDICATE, METADATA_PREDICATE, PROVENANCE_PREDICATE};
+use super::*;
+use crate::MemoryStore;
+
+pub(crate) const LISTING: &str = "open-meridian/snaptrade";
+pub(crate) const FINGERPRINT: &str = "SHA256:tagkey";
+
+pub(crate) fn digest(n: u8) -> String {
+    format!("sha256:{}", format!("{n:02x}").repeat(32))
+}
+
+struct At(i64);
+impl Clock for At {
+    fn now_ns(&self) -> i64 {
+        self.0
+    }
+}
+
+/// What the stand-in answers, changed by each test.
+pub(crate) struct Platform {
+    pub(crate) signer: TestSigner,
+    pub(crate) catalogue: Mutex<Value>,
+    pub(crate) resolution: Mutex<Value>,
+    pub(crate) referrers: Mutex<Vec<String>>,
+    pub(crate) asked: Mutex<Vec<String>>,
+}
+
+/// The stand-in plugin's one section, which its declaration names by
+/// digest and size.
+pub(crate) const OVERVIEW: &str = "Reads accounts.";
+
+fn declaration() -> Value {
+    use sha2::Digest;
+    json!({"secret_settings": ["consumer_key"], "not_carried": [], "storage": null,
+           "documentation": [{"name": "overview",
+               "digest": format!("sha256:{}", hex::encode(sha2::Sha256::digest(OVERVIEW))),
+               "bytes": OVERVIEW.len()}]})
+}
+
+pub(crate) fn metadata(roles: &[&str]) -> Value {
+    json!({"name": "snaptrade", "version": "1.4.0", "roles": roles, "interface": true,
+           "sdk_version": "0.29.0", "declaration": declaration()})
+}
+
+impl Platform {
+    pub(crate) fn new() -> Arc<Platform> {
+        let signer = TestSigner::new();
+        let image = digest(0xab);
+        let statement = signer.statement(
+            LISTING_PREDICATE,
+            &image,
+            json!({"listing": LISTING, "version": "1.4.0", "registry": "community",
+                   "listed_at": "2026-10-16T12:00:00Z", "signer_key": FINGERPRINT,
+                   "roles": ["custody"], "floor": "v25"}),
+        );
+        let key_status = signer.sign_document(json!({
+            "issued_at_ns": 1_792_000_000_000_000_000i64,
+            "keys": [{"key_id": "SGK-1", "organisation": "open-meridian", "name": "release",
+                      "public_key": "ssh-ed25519 AAAA", "fingerprint": FINGERPRINT,
+                      "registered_at_ns": 1, "registered_by_person_id": "", "revoked_at_ns": 0,
+                      "revoked_by_person_id": "", "revoke_reason": "", "not_trusted_after_ns": 0}],
+        }));
+        let catalogue = json!({
+            "listings": [{
+                "listing": LISTING,
+                "repository": "https://github.com/open-meridian/plugin-snaptrade",
+                "versions": [{
+                    "listing": LISTING, "version": "1.4.0", "registry": "community",
+                    "image_digest": image, "metadata": metadata(&["custody"]),
+                    "approved_roles": [], "schema_version": "v25",
+                    "build": {"signer_fingerprint": FINGERPRINT}, "listed_at_ns": 1,
+                    "withdrawn_at_ns": 0, "sequence": 7, "listing_statement": statement,
+                }],
+                "regions": ["US"], "asset_classes": ["equity"], "support_contact": "",
+                "stars": 2, "installs": 0, "instances": 0, "counts_shown": false,
+            }],
+            "sequence": 7,
+            "key_status": key_status,
+        });
+        let resolution = json!({
+            "image_digest": image,
+            "pull_from": "ghcr.io/open-meridian/plugins/open-meridian/snaptrade",
+            "pull_token": "", "pull_token_expires_at_ns": 0,
+            "listing_statement": statement,
+        });
+        let referrers = vec![
+            signer.statement(
+                PROVENANCE_PREDICATE,
+                &image,
+                json!({"repository": "open-meridian/plugin-snaptrade", "tag": "v1.4.0",
+                       "commit": "c".repeat(40), "signer": FINGERPRINT}),
+            ),
+            signer.statement(
+                METADATA_PREDICATE,
+                &image,
+                json!({"metadata": metadata(&["custody"]), "schema_version": "v25",
+                       "documentation": [{"name": "overview", "text": "Reads accounts."}]}),
+            ),
+        ];
+        Arc::new(Platform {
+            signer,
+            catalogue: Mutex::new(catalogue),
+            resolution: Mutex::new(resolution),
+            referrers: Mutex::new(referrers),
+            asked: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+impl Registries for Platform {
+    fn pull_catalogue(&self, after: u64) -> Fut<'_, Result<Value, String>> {
+        self.asked
+            .lock()
+            .unwrap()
+            .push(format!("catalogue after {after}"));
+        let answer = self.catalogue.lock().unwrap().clone();
+        Box::pin(async move { Ok(answer) })
+    }
+    fn resolve<'a>(
+        &'a self,
+        listing: &'a str,
+        version: &'a str,
+        registry: &'a str,
+    ) -> Fut<'a, Result<Value, String>> {
+        self.asked
+            .lock()
+            .unwrap()
+            .push(format!("resolve {listing} {version} {registry}"));
+        let answer = self.resolution.lock().unwrap().clone();
+        Box::pin(async move { Ok(answer) })
+    }
+    fn copy<'a>(
+        &'a self,
+        from: &'a str,
+        _token: &'a str,
+        digest: &'a str,
+        repository: &'a str,
+    ) -> Fut<'a, Result<Vec<String>, String>> {
+        self.asked
+            .lock()
+            .unwrap()
+            .push(format!("copy {from}@{digest} into {repository}"));
+        let answer = self.referrers.lock().unwrap().clone();
+        Box::pin(async move { Ok(answer) })
+    }
+    fn referrers<'a>(
+        &'a self,
+        repository: &'a str,
+        _digest: &'a str,
+    ) -> Fut<'a, Result<Vec<String>, String>> {
+        self.asked
+            .lock()
+            .unwrap()
+            .push(format!("referrers of {repository}"));
+        let answer = self.referrers.lock().unwrap().clone();
+        Box::pin(async move { Ok(answer) })
+    }
+    fn report_usage<'a>(&'a self, _report: &'a PluginUsageReport) -> Fut<'a, Result<bool, String>> {
+        Box::pin(async move { Ok(true) })
+    }
+}
+
+fn hold(platform: &Arc<Platform>) -> Hold {
+    Hold::new(
+        Arc::clone(platform) as Arc<dyn Registries>,
+        platform.signer.keys(),
+        Arc::new(MemoryStore::new()),
+        Arc::new(At(1_792_200_000_000_000_000)),
+    )
+}
+
+#[tokio::test]
+async fn the_catalogue_is_pulled_after_its_sequence_and_kept_with_its_signed_key_status() {
+    let platform = Platform::new();
+    let held = hold(&platform);
+    let kept = held.pull().await.unwrap();
+    assert_eq!(kept.sequence, 7);
+    assert_eq!(kept.listings[0].listing, LISTING);
+    assert_eq!(kept.pulled_at_ns, 1_792_200_000_000_000_000);
+    assert_eq!(held.key_status().unwrap().keys[0].fingerprint, FINGERPRINT);
+    // The next pull reads after what it holds; a listing changed replaces
+    // the copy's whole.
+    platform.catalogue.lock().unwrap()["listings"][0]["stars"] = json!(5);
+    let kept = held.pull().await.unwrap();
+    assert_eq!(kept.listings.len(), 1);
+    assert_eq!(kept.listings[0].stars, 5);
+    assert_eq!(platform.asked.lock().unwrap()[1], "catalogue after 7");
+    // A key status signed by another key changes nothing.
+    let forged = TestSigner::new().sign_document(json!({"issued_at_ns": 1, "keys": []}));
+    platform.catalogue.lock().unwrap()["key_status"] = forged;
+    platform.catalogue.lock().unwrap()["listings"][0]["stars"] = json!(9);
+    assert!(held
+        .pull()
+        .await
+        .unwrap_err()
+        .contains("not the platform's"));
+    assert_eq!(held.held().unwrap().unwrap().listings[0].stars, 5);
+}
+
+#[tokio::test]
+async fn browse_reads_the_copy_searched_and_filtered() {
+    let platform = Platform::new();
+    let held = hold(&platform);
+    let request = |search: &str, registry: &str, role: &str| ListRegistryPluginsRequest {
+        search: search.into(),
+        registry: registry.into(),
+        role: role.into(),
+        ..Default::default()
+    };
+    // Nothing pulled: nothing listed, the platform not asked.
+    assert!(held
+        .list(&request("", "", ""))
+        .await
+        .unwrap()
+        .listings
+        .is_empty());
+    assert!(platform.asked.lock().unwrap().is_empty());
+    let pulled = held
+        .list(&ListRegistryPluginsRequest {
+            pull_now: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(pulled.listings.len(), 1);
+    assert!(pulled.catalogue_pulled_at_ns > 0);
+    assert_eq!(
+        held.list(&request("snaptrade", "", ""))
+            .await
+            .unwrap()
+            .listings
+            .len(),
+        1
+    );
+    assert_eq!(
+        held.list(&request("US", "community", "custody"))
+            .await
+            .unwrap()
+            .listings
+            .len(),
+        1
+    );
+    assert!(held
+        .list(&request("kraken", "", ""))
+        .await
+        .unwrap()
+        .listings
+        .is_empty());
+    assert!(held
+        .list(&request("", "verified", ""))
+        .await
+        .unwrap()
+        .listings
+        .is_empty());
+    assert!(held
+        .list(&request("", "", "oms"))
+        .await
+        .unwrap()
+        .listings
+        .is_empty());
+}
+
+#[tokio::test]
+async fn a_version_is_fetched_verified_and_named_by_its_listing() {
+    let platform = Platform::new();
+    let held = hold(&platform);
+    held.pull().await.unwrap();
+    let fetched = held.fetch(LISTING, "1.4.0", "community").await.unwrap();
+    let metadata = fetched.version.metadata.clone().unwrap();
+    assert_eq!(
+        metadata.name, LISTING,
+        "a registry version is named by its listing"
+    );
+    assert_eq!(metadata.roles, ["custody"]);
+    assert_eq!(fetched.version.source_registry, "community");
+    assert_eq!(fetched.version.listing, LISTING);
+    assert_eq!(fetched.documentation[0].markdown, "Reads accounts.");
+    let asked = platform.asked.lock().unwrap().clone();
+    assert!(asked.contains(&format!(
+        "copy ghcr.io/open-meridian/plugins/open-meridian/snaptrade@{} into plugins/{LISTING}",
+        digest(0xab)
+    )));
+    held.reverify(&fetched.version, &fetched.statement)
+        .await
+        .unwrap();
+}
+
+/// Each check refuses, naming it; there is no fallback and no override.
+#[tokio::test]
+async fn each_check_that_fails_refuses_the_version_naming_it() {
+    type Spoil = fn(&Platform);
+    let cases: Vec<(&str, Spoil, &str)> = vec![
+        (
+            "pulled",
+            |p| {
+                p.catalogue.lock().unwrap()["listings"][0]["versions"][0]["pull"] = json!({"listing": LISTING, "version": "1.4.0", "kind": "PULL_REASON_KIND_TERMS_BREACH",
+                       "reason": "malware", "pulled_at_ns": 5, "restored_at_ns": 0});
+            },
+            "not offered: it was pulled",
+        ),
+        (
+            "withdrawn",
+            |p| {
+                p.catalogue.lock().unwrap()["listings"][0]["versions"][0]["withdrawn_at_ns"] =
+                    json!(5);
+            },
+            "withdrawn by its vendor",
+        ),
+        (
+            "the floor",
+            |p| {
+                p.catalogue.lock().unwrap()["listings"][0]["versions"][0]["schema_version"] =
+                    json!("v99");
+            },
+            "the floor",
+        ),
+        (
+            "another digest",
+            |p| {
+                p.resolution.lock().unwrap()["image_digest"] = json!(digest(0xcd));
+            },
+            "the digest",
+        ),
+        (
+            "no statement",
+            |p| {
+                p.resolution.lock().unwrap()["listing_statement"] = json!("");
+            },
+            "the resolution carried none",
+        ),
+        (
+            "a statement other than the catalogue's",
+            |p| {
+                let other = p.signer.statement(
+                    LISTING_PREDICATE,
+                    &digest(0xab),
+                    json!({"listing": LISTING, "version": "1.4.0", "registry": "community",
+                       "signer_key": FINGERPRINT, "roles": ["custody", "oms"]}),
+                );
+                p.resolution.lock().unwrap()["listing_statement"] = json!(other);
+            },
+            "not the catalogue's",
+        ),
+        (
+            "a statement by another key",
+            |p| {
+                let forged = TestSigner::new().statement(LISTING_PREDICATE, &digest(0xab),
+                json!({"listing": LISTING, "version": "1.4.0", "registry": "community", "signer_key": FINGERPRINT}));
+                p.resolution.lock().unwrap()["listing_statement"] = json!(forged.clone());
+                p.catalogue.lock().unwrap()["listings"][0]["versions"][0]["listing_statement"] =
+                    json!(forged);
+            },
+            "the listing statement: no signature on it is the platform's",
+        ),
+        (
+            "no provenance",
+            |p| {
+                p.referrers.lock().unwrap().remove(0);
+            },
+            "the provenance",
+        ),
+        (
+            "a provenance naming another signer",
+            |p| {
+                let other = p.signer.statement(
+                    PROVENANCE_PREDICATE,
+                    &digest(0xab),
+                    json!({"signer": "SHA256:other"}),
+                );
+                p.referrers.lock().unwrap()[0] = other;
+            },
+            "names the signer key",
+        ),
+        (
+            "another declaration in the image",
+            |p| {
+                let mut meta = metadata(&["custody"]);
+                meta["declaration"]["secret_settings"] = json!(["other"]);
+                let other = p.signer.statement(
+                    METADATA_PREDICATE,
+                    &digest(0xab),
+                    json!({"metadata": meta}),
+                );
+                p.referrers.lock().unwrap()[1] = other;
+            },
+            "the declaration",
+        ),
+        (
+            "other roles in the image",
+            |p| {
+                let other = p.signer.statement(
+                    METADATA_PREDICATE,
+                    &digest(0xab),
+                    json!({"metadata": metadata(&["custody", "oms"])}),
+                );
+                p.referrers.lock().unwrap()[1] = other;
+            },
+            "the roles",
+        ),
+        (
+            "a revoked signer",
+            |p| {
+                let revoked = p.signer.sign_document(json!({
+                "issued_at_ns": 2, "keys": [{"key_id": "SGK-1", "organisation": "open-meridian",
+                "fingerprint": FINGERPRINT, "registered_at_ns": 1, "revoked_at_ns": 3,
+                "not_trusted_after_ns": 3}]}));
+                p.catalogue.lock().unwrap()["key_status"] = revoked;
+            },
+            "the signing key",
+        ),
+    ];
+    for (case, spoil, says) in cases {
+        let platform = Platform::new();
+        spoil(&platform);
+        let held = hold(&platform);
+        held.pull().await.unwrap();
+        let refused = held.fetch(LISTING, "1.4.0", "").await.unwrap_err();
+        assert!(refused.contains(says), "{case}: {refused}");
+    }
+}
+
+#[tokio::test]
+async fn a_verified_version_s_roles_are_its_review_s() {
+    let platform = Platform::new();
+    {
+        let image = digest(0xab);
+        let statement = platform.signer.statement(
+            LISTING_PREDICATE,
+            &image,
+            json!({"listing": LISTING, "version": "1.4.0", "registry": "verified",
+                   "listed_at": "2026-10-16T12:00:00Z", "signer_key": FINGERPRINT,
+                   "roles": ["custody"], "approved_roles": ["custody"], "review_id": "RV-1"}),
+        );
+        let mut catalogue = platform.catalogue.lock().unwrap();
+        catalogue["listings"][0]["versions"][0]["registry"] = json!("verified");
+        catalogue["listings"][0]["versions"][0]["approved_roles"] = json!(["custody"]);
+        catalogue["listings"][0]["versions"][0]["listing_statement"] = json!(statement.clone());
+        platform.resolution.lock().unwrap()["listing_statement"] = json!(statement);
+        // The image declares more than the review approved.
+        platform.referrers.lock().unwrap()[1] = platform.signer.statement(
+            METADATA_PREDICATE,
+            &image,
+            json!({"metadata": metadata(&["custody", "operations"])}),
+        );
+        catalogue["listings"][0]["versions"][0]["metadata"] = metadata(&["custody", "operations"]);
+    }
+    let held = hold(&platform);
+    held.pull().await.unwrap();
+    let fetched = held.fetch(LISTING, "1.4.0", "verified").await.unwrap();
+    assert_eq!(fetched.version.metadata.unwrap().roles, ["custody"]);
+}
+
+#[test]
+fn semver_orders_releases_above_their_pre_releases() {
+    use std::cmp::Ordering::*;
+    assert_eq!(semver_cmp("1.10.0", "1.9.9"), Some(Greater));
+    assert_eq!(semver_cmp("1.0.0", "1.0.0-rc.1"), Some(Greater));
+    assert_eq!(semver_cmp("1.0.0-rc.2", "1.0.0-rc.10"), Some(Less));
+    assert_eq!(semver_cmp("1.0.0-alpha", "1.0.0-alpha.1"), Some(Less));
+    assert_eq!(semver_cmp("1.0.0+build", "1.0.0"), Some(Equal));
+    assert_eq!(semver_cmp("1.0", "1.0.0"), None);
+    assert!(is_prerelease("2.0.0-beta") && !is_prerelease("2.0.0+meta"));
+}

@@ -98,7 +98,16 @@ struct Plugins {
     /// The deployment's own registry as the conductor reaches it, where it
     /// does (contract v25): a retired version's image released there.
     local: Option<Arc<dyn LocalRegistry>>,
+    /// The community and verified registries, where the deployment reaches
+    /// them (contract v25, W8.10 to W8.12).
+    registries: Option<Arc<crate::registries::Hold>>,
 }
+
+mod registry;
+pub use registry::{
+    ACKNOWLEDGE_PULL, INSTALL_PLUGIN, LIST_PLUGIN_USAGE_REPORTS, REGISTRY_PLUGINS,
+    SET_REPORTS_PLUGIN_USAGE, UPDATE_PLUGIN,
+};
 
 // ── The rules ───────────────────────────────────────────────────────────────
 
@@ -602,6 +611,25 @@ impl Plugins {
         if let Some(refusal) = note_refused(&request.note) {
             return Err(refusal);
         }
+        // A registry version is verified again at launch (W8.3; the spec's
+        // requirement 24): its kept listing statement, the referrers in the
+        // deployment's own registry and the newest key status held.
+        if !version.listing.is_empty() {
+            let hold = self.registries.as_ref().ok_or_else(|| {
+                format!(
+                    "{} {} came from a registry, and this deployment reaches none to verify it \
+                     again",
+                    request.name, request.version
+                )
+            })?;
+            let statement = self
+                .store
+                .listing_statement(&request.name, &request.version)
+                .map_err(|failed| failed.to_string())?;
+            tokio::runtime::Handle::current()
+                .block_on(hold.reverify(version, &statement))
+                .map_err(|why| format!("the verification at launch: {why}"))?;
+        }
         let metadata = version.metadata.clone().expect("found by it");
         // Stamped as every change is: the person, and the delegation and
         // client they acted through (W8.3, contract v17).
@@ -684,9 +712,13 @@ impl Plugins {
         let metadata = version.metadata.clone().unwrap_or_default();
         CreatePluginRequest {
             instance_id: instance_id.to_string(),
+            // plugins/{name} for a local version, plugins/{listing} for one
+            // from a registry (W8.10).
             image: format!(
-                "{}/plugins/{}@{}",
-                self.registry, metadata.name, version.image_digest
+                "{}/{}@{}",
+                self.registry,
+                repository_of(version),
+                version.image_digest
             ),
             roles: metadata.roles.clone(),
             interface: metadata.interface,
@@ -1139,6 +1171,23 @@ pub fn serve_plugins_reaching(
     archive: ArchiveGrant,
     local: Option<Arc<dyn LocalRegistry>>,
 ) {
+    serve_plugins_and_registries(bus, store, clock, registry, archive, local, None)
+}
+
+/// [`serve_plugins_reaching`], reaching the community and verified
+/// registries too (contract v25, W8.10 to W8.12, W5.19): Browse's copy of
+/// the catalogue, installs, updates, pull acknowledgements and the plugin
+/// usage report's setting. Without them those rows answer that the
+/// deployment reaches no registry.
+pub fn serve_plugins_and_registries(
+    bus: Arc<Bus>,
+    store: Arc<dyn Store>,
+    clock: Arc<dyn Clock>,
+    registry: String,
+    archive: ArchiveGrant,
+    local: Option<Arc<dyn LocalRegistry>>,
+    registries: Option<Arc<crate::registries::Hold>>,
+) {
     let plugins = Arc::new(Plugins {
         bus: Arc::clone(&bus),
         store,
@@ -1146,7 +1195,68 @@ pub fn serve_plugins_reaching(
         registry,
         archive,
         local,
+        registries,
     });
+    answer_on(
+        &bus,
+        &plugins,
+        REGISTRY_PLUGINS,
+        (
+            "meridian.v1.ListRegistryPluginsRequest",
+            "meridian.v1.ListRegistryPluginsReply",
+        ),
+        |plugins, request, _| plugins.list_registry_plugins(request),
+    );
+    answer_on(
+        &bus,
+        &plugins,
+        INSTALL_PLUGIN,
+        (
+            "meridian.v1.InstallPluginRequest",
+            "meridian.v1.PluginVersion",
+        ),
+        |plugins, request, envelope| plugins.install(request, envelope),
+    );
+    answer_on(
+        &bus,
+        &plugins,
+        UPDATE_PLUGIN,
+        (
+            "meridian.v1.UpdatePluginRequest",
+            "meridian.v1.PluginLaunch",
+        ),
+        |plugins, request, envelope| plugins.update(request, envelope),
+    );
+    answer_on(
+        &bus,
+        &plugins,
+        ACKNOWLEDGE_PULL,
+        (
+            "meridian.v1.AcknowledgePullRequest",
+            "meridian.v1.PullAcknowledgement",
+        ),
+        |plugins, request, envelope| plugins.acknowledge_pull(request, envelope),
+    );
+    answer_on(
+        &bus,
+        &plugins,
+        SET_REPORTS_PLUGIN_USAGE,
+        (
+            "meridian.v1.SetReportsPluginUsageRequest",
+            "meridian.v1.ReportsPluginUsageSetting",
+        ),
+        |plugins, request, envelope| plugins.set_reports_plugin_usage(request, envelope),
+    );
+    answer_on(
+        &bus,
+        &plugins,
+        LIST_PLUGIN_USAGE_REPORTS,
+        (
+            "meridian.v1.ListPluginUsageReportsRequest",
+            "meridian.v1.ListPluginUsageReportsReply",
+        ),
+        |plugins, request, _| plugins.list_plugin_usage_reports(request),
+    );
     answer_on(
         &bus,
         &plugins,

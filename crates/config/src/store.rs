@@ -1027,4 +1027,67 @@ pub trait Store: Send + Sync {
 
     /// The reports sent, newest first, at most `limit`.
     fn usage_reports(&self, limit: usize) -> Result<Vec<meridian_domain::v1::SentUsageReport>>;
+
+    // ── The registries (contract v25; W8.10 to W8.12, W5.19) ─────────────
+
+    /// The conductor's latest copy of the platform's catalogue, none before
+    /// its first pull.
+    fn registry_catalogue(&self) -> Result<Option<HeldCatalogue>>;
+
+    /// The catalogue as pulled, replacing the last copy whole.
+    fn put_registry_catalogue(&self, held: &HeldCatalogue) -> Result<()>;
+
+    /// A version installed from a registry, with its documentation and its
+    /// listing statement kept beside it for launch (W8.10, W8.3), never
+    /// replaced: nothing is written when the version is recorded already.
+    fn record_listed_version(
+        &self,
+        version: &PluginVersion,
+        documentation: &[meridian_domain::v1::DocumentationText],
+        listing_statement: &str,
+    ) -> Result<bool>;
+
+    /// A version's kept listing statement; empty for a local version, or
+    /// one not recorded.
+    fn listing_statement(&self, name: &str, version: &str) -> Result<String>;
+
+    /// A deployment admin keeps an instance whose version was pulled
+    /// (W8.12): the acknowledgement kept on its live launch, its own
+    /// record; None when no launch of it is live.
+    fn acknowledge_pull(
+        &self,
+        instance_id: &str,
+        acknowledgement: &meridian_domain::v1::PullAcknowledgement,
+    ) -> Result<Option<PluginLaunch>>;
+
+    /// The plugin usage report's setting changed (W5.19, contract v25), its
+    /// own record.
+    fn set_reports_plugin_usage(&self, on: bool, author: &Author, at_ns: i64) -> Result<()>;
+
+    /// The setting in force: on until a deployment admin turns it off.
+    fn reports_plugin_usage(&self) -> Result<bool>;
+
+    /// A plugin usage report sent, its own record.
+    fn record_plugin_usage_report(
+        &self,
+        report: &meridian_domain::v1::SentPluginUsageReport,
+    ) -> Result<()>;
+
+    /// The plugin usage reports sent, newest first, at most `limit`.
+    fn plugin_usage_reports(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<meridian_domain::v1::SentPluginUsageReport>>;
+}
+
+/// The conductor's latest copy of the platform's catalogue (W8.10): every
+/// listing as last pulled, the sequence the next pull reads after, the
+/// signing keys' status as the platform signed it (its JSON, so its
+/// signature can be checked again), and when it was pulled.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HeldCatalogue {
+    pub listings: Vec<meridian_domain::v1::PluginListing>,
+    pub sequence: u64,
+    pub key_status: String,
+    pub pulled_at_ns: i64,
 }
