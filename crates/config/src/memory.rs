@@ -50,6 +50,8 @@ pub struct MemoryStore {
     link_changes: Mutex<Vec<ConnectivityLinkChange>>,
     map_changes: Mutex<Vec<VenueAccountMapChange>>,
     catalogues: Mutex<Vec<(i64, VenueCatalogue)>>,
+    /// Each declaration of the licensed schemes, in order (W3.28, v25).
+    licensed_schemes: Mutex<Vec<(Vec<String>, Author, i64)>>,
     /// Who retired each version, through what (W8.15, contract v25).
     retirements: Mutex<std::collections::BTreeMap<(String, String), Author>>,
 }
@@ -84,6 +86,7 @@ impl MemoryStore {
             map_changes: Mutex::new(Vec::new()),
             catalogues: Mutex::new(Vec::new()),
             retirements: Mutex::new(Default::default()),
+            licensed_schemes: Mutex::new(Vec::new()),
         }
     }
 
@@ -1096,6 +1099,24 @@ impl Store for MemoryStore {
             .expect("store lock poisoned")
             .last()
             .is_none_or(|(on, _, _)| *on))
+    }
+
+    fn set_licensed_schemes(&self, schemes: &[String], author: &Author, at_ns: i64) -> Result<()> {
+        self.licensed_schemes
+            .lock()
+            .expect("store lock poisoned")
+            .push((schemes.to_vec(), author.clone(), at_ns));
+        Ok(())
+    }
+
+    fn licensed_schemes(&self) -> Result<Vec<String>> {
+        Ok(self
+            .licensed_schemes
+            .lock()
+            .expect("store lock poisoned")
+            .last()
+            .map(|(schemes, _, _)| schemes.clone())
+            .unwrap_or_default())
     }
 
     fn record_usage_report(&self, report: &meridian_domain::v1::SentUsageReport) -> Result<()> {

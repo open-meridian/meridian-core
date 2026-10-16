@@ -652,6 +652,7 @@ pub async fn shutdown() {
 pub struct PlatformUpstream {
     platform: Arc<Platform>,
     runtime: tokio::runtime::Handle,
+    licence: Option<meridian_conductor::reference::Licence>,
 }
 
 impl PlatformUpstream {
@@ -660,7 +661,14 @@ impl PlatformUpstream {
         Self {
             platform,
             runtime: tokio::runtime::Handle::current(),
+            licence: None,
         }
+    }
+
+    /// With the licence list the conductor keeps (contract v25, W3.28).
+    pub fn with_licence(mut self, licence: meridian_conductor::reference::Licence) -> Self {
+        self.licence = Some(licence);
+        self
     }
 }
 
@@ -682,6 +690,15 @@ impl meridian_config::Upstream for PlatformUpstream {
         self.runtime
             .block_on(self.platform.submit_diagnostic_bundle(bundle, now_ns()))
             .map_err(|failed| format!("the platform could not be sent the bundle: {failed}"))
+    }
+
+    fn licence_schemes(&self) -> Option<Vec<String>> {
+        let licence = self.licence.as_ref()?;
+        let held = licence.read().ok()?.clone();
+        Some(
+            held.unwrap_or_else(meridian_conductor::reference::default_licence)
+                .schemes,
+        )
     }
 }
 

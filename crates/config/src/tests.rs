@@ -64,6 +64,15 @@ impl Upstream for FakePlatform {
             retain_until_ns: 2,
         })
     }
+
+    fn licence_schemes(&self) -> Option<Vec<String>> {
+        Some(vec![
+            "figi".into(),
+            "isin".into(),
+            "cusip".into(),
+            "sedol".into(),
+        ])
+    }
 }
 
 struct Harness {
@@ -3519,6 +3528,53 @@ async fn the_usage_report_is_on_until_a_deployment_admin_turns_it_off_saying_why
     .await
     .unwrap();
     assert!(listed.reports.is_empty());
+}
+
+/// W3.28 (contract v25): the deployment admin declares the licensed schemes,
+/// the whole list each time, each one the licence list names, saying why;
+/// each change its own record; the setting and the reports read answer them.
+#[tokio::test]
+async fn the_licensed_schemes_are_declared_from_the_licence_list_saying_why() {
+    let h = harness("dashboard-1");
+    let set = |schemes: &[&str], reason: &str| {
+        ask::<_, meridian_domain::v1::ReportsUsageSetting>(
+            &h,
+            crate::service::SET_LICENSED_SCHEMES,
+            "meridian.v1.SetLicensedSchemesRequest",
+            meridian_domain::v1::SetLicensedSchemesRequest {
+                licensed_schemes: schemes.iter().map(|s| s.to_string()).collect(),
+                reason: reason.into(),
+            },
+        )
+    };
+    assert!(h.store.licensed_schemes().unwrap().is_empty());
+    let refused = set(&["cusip"], "").await.unwrap_err();
+    assert!(refused.contains("fields=reason"), "{refused}");
+    let refused = set(&["cusip", "ric"], "licensed").await.unwrap_err();
+    assert!(refused.contains("fields=licensed_schemes[1]"), "{refused}");
+    let refused = set(&["cusip", "CUSIP"], "licensed").await.unwrap_err();
+    assert!(refused.contains("named twice"), "{refused}");
+    let setting = set(&[" CUSIP ", "sedol"], "the firm's licences")
+        .await
+        .unwrap();
+    assert_eq!(setting.licensed_schemes, vec!["cusip", "sedol"]);
+    assert!(setting.reports_usage);
+    assert_eq!(h.store.licensed_schemes().unwrap(), vec!["cusip", "sedol"]);
+    let listed: meridian_domain::v1::ListUsageReportsReply = ask(
+        &h,
+        crate::service::LIST_USAGE_REPORTS,
+        "meridian.v1.ListUsageReportsRequest",
+        meridian_domain::v1::ListUsageReportsRequest {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(listed.licensed_schemes, vec!["cusip", "sedol"]);
+    // None declared again is a change too.
+    assert!(set(&[], "the licence lapsed")
+        .await
+        .unwrap()
+        .licensed_schemes
+        .is_empty());
 }
 
 /// Contract v24 (W6.3, CloseAccountRequest.unlink_attached): "Unlink all

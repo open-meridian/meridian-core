@@ -23,3 +23,20 @@ ALTER TABLE config_plugin_version
     ADD COLUMN IF NOT EXISTS retired_through_delegation text   NOT NULL DEFAULT '',
     ADD COLUMN IF NOT EXISTS retired_client_name        text   NOT NULL DEFAULT '',
     ADD COLUMN IF NOT EXISTS retired_prepared_call_id   text   NOT NULL DEFAULT '';
+
+-- The identifier schemes the deployment declares it is licensed for (W3.28),
+-- each declaration its own record (decisions/031): the whole list, who,
+-- through which delegation and client, from which prepared change, when and
+-- why. None is "none declared", which v24's reports sent; nothing was
+-- declared before v25, so nothing is owed to the past. Never updated, never
+-- deleted.
+CREATE TABLE IF NOT EXISTS config_licensed_schemes_change (
+    change_id          bigserial PRIMARY KEY,
+    licensed_schemes   text[]    NOT NULL DEFAULT '{}',
+    changed_by         text      NOT NULL DEFAULT '',
+    through_delegation text      NOT NULL DEFAULT '',
+    client_name        text      NOT NULL DEFAULT '',
+    prepared_call_id   text      NOT NULL DEFAULT '',
+    changed_at_ns      bigint    NOT NULL,
+    note               text      NOT NULL DEFAULT ''
+);

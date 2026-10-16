@@ -993,6 +993,15 @@ pub trait Store: Send + Sync {
     /// The setting in force: on until a deployment admin turns it off.
     fn reports_usage(&self) -> Result<bool>;
 
+    /// The identifier schemes the deployment declares it is licensed for,
+    /// the whole list replacing the last, its own record (contract v25,
+    /// W3.28, decisions/031): who, through what, when and why.
+    fn set_licensed_schemes(&self, schemes: &[String], author: &Author, at_ns: i64) -> Result<()>;
+
+    /// The schemes declared, in order; none until a deployment admin
+    /// declares one.
+    fn licensed_schemes(&self) -> Result<Vec<String>>;
+
     /// A report sent, its own record (W3.28).
     fn record_usage_report(&self, report: &meridian_domain::v1::SentUsageReport) -> Result<()>;
 

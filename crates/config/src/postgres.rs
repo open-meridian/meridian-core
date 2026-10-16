@@ -2106,6 +2106,40 @@ impl Store for PostgresStore {
             .is_none_or(|row| row.get::<_, bool>(0)))
     }
 
+    fn set_licensed_schemes(&self, schemes: &[String], author: &Author, at_ns: i64) -> Result<()> {
+        self.conn()?
+            .execute(
+                "INSERT INTO config_licensed_schemes_change
+                        (licensed_schemes, changed_by, through_delegation, client_name,
+                         prepared_call_id, changed_at_ns, note)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                &[
+                    &schemes,
+                    &author.by,
+                    &author.delegation,
+                    &author.client,
+                    &author.prepared_call_id,
+                    &at_ns,
+                    &author.note,
+                ],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
+    fn licensed_schemes(&self) -> Result<Vec<String>> {
+        Ok(self
+            .conn()?
+            .query_opt(
+                "SELECT licensed_schemes FROM config_licensed_schemes_change
+                  ORDER BY change_id DESC LIMIT 1",
+                &[],
+            )
+            .map_err(unavailable)?
+            .map(|row| row.get::<_, Vec<String>>(0))
+            .unwrap_or_default())
+    }
+
     fn record_usage_report(&self, report: &meridian_domain::v1::SentUsageReport) -> Result<()> {
         use prost::Message;
         self.conn()?

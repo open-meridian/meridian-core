@@ -11,7 +11,8 @@
 //! other component's store (decisions/011). Each report sent is the
 //! deployment's own record, received or not; one not received is not sent
 //! again, the next week's replacing it on the platform. `licensed_schemes`
-//! is empty until the deployment can declare them (v25; ruled 2026-10-15).
+//! are those the deployment admin declares (contract v25; until v25 the
+//! report sent them empty, ruled 2026-10-15).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,6 +44,11 @@ pub trait UsageBook: Send + Sync {
     fn sent(&self, limit: usize) -> Result<Vec<SentUsageReport>, String>;
     /// A report sent, its own record.
     fn record(&self, sent: &SentUsageReport) -> Result<(), String>;
+    /// The schemes the deployment admin declares it is licensed for
+    /// (contract v25, W3.28); none until one is declared.
+    fn licensed_schemes(&self) -> Result<Vec<String>, String> {
+        Ok(Vec::new())
+    }
 }
 
 /// The week a report covers: the last whole one, Monday to Sunday, before
@@ -111,10 +117,12 @@ impl UsageSender {
             .map_err(|failed| format!("the instrument store's counts: {failed}"))?;
         let counts = ListIdentifierUsageReply::decode(bytes.as_slice())
             .map_err(|failed| format!("the instrument store's counts: {failed}"))?;
+        let book = Arc::clone(&self.book);
+        let licensed_schemes = blocking(move || book.licensed_schemes()).await?;
         let report = IdentifierUsageReport {
             period_start: start.to_string(),
             period_end: end.to_string(),
-            licensed_schemes: Vec::new(),
+            licensed_schemes,
             scheme_counts: counts.scheme_counts,
         };
         let now = self.clock.now_ns();
@@ -184,6 +192,7 @@ mod tests {
     struct Book {
         off: bool,
         sent: Mutex<Vec<SentUsageReport>>,
+        licensed: Vec<String>,
     }
 
     impl UsageBook for Book {
@@ -204,6 +213,9 @@ mod tests {
         fn record(&self, sent: &SentUsageReport) -> Result<(), String> {
             self.sent.lock().unwrap().push(sent.clone());
             Ok(())
+        }
+        fn licensed_schemes(&self) -> Result<Vec<String>, String> {
+            Ok(self.licensed.clone())
         }
     }
 
@@ -245,7 +257,7 @@ mod tests {
         assert!(sent.received);
         let report = sent.report.unwrap();
         assert_eq!(report.period_end, "2026-10-11");
-        assert!(report.licensed_schemes.is_empty(), "v25 declares them");
+        assert!(report.licensed_schemes.is_empty(), "none declared");
         // Counts and scheme names only, as the platform reads them.
         let body: serde_json::Value = serde_json::from_str(&fake.bodies()[0]).unwrap();
         let keys: Vec<&str> = body
@@ -305,6 +317,27 @@ mod tests {
         assert_eq!(
             (start.to_string(), end.to_string()),
             ("2026-09-28".into(), "2026-10-04".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn the_report_carries_the_schemes_the_deployment_admin_declares() {
+        // Contract v25 (W3.28).
+        let book = Arc::new(Book {
+            licensed: vec!["cusip".into(), "sedol".into()],
+            ..Default::default()
+        });
+        let fake = Fake::new(vec![Ok(reply(200, "{\"received\": true}"))]);
+        let sender = wired(book, fake.clone());
+        let sent = sender.send_if_due().await.unwrap().expect("due");
+        assert_eq!(
+            sent.report.unwrap().licensed_schemes,
+            vec!["cusip", "sedol"]
+        );
+        let body: serde_json::Value = serde_json::from_str(&fake.bodies()[0]).unwrap();
+        assert_eq!(
+            body["licensed_schemes"],
+            serde_json::json!(["cusip", "sedol"])
         );
     }
 }

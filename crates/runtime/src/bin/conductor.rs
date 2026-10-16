@@ -197,13 +197,20 @@ fn run() -> Result<(), String> {
             &var("MERIDIAN_ARCHIVE_LOCKS").unwrap_or_default(),
         )?;
 
+        // The licence list the conductor keeps (contract v24, W3.25), made
+        // here so the config domain holds a declaration of the licensed
+        // schemes to it (contract v25, W3.28); read below as before.
+        let licence: meridian_conductor::reference::Licence = Arc::default();
+
         // The config domain: registered and subscribed before the loop
         // starts, so nothing the dashboard or a sidecar asks is missed.
         meridian_config::serve_with(
             Arc::clone(&bus),
             Arc::clone(&store),
             clock(),
-            Arc::new(PlatformUpstream::new(Arc::clone(&platform))),
+            Arc::new(
+                PlatformUpstream::new(Arc::clone(&platform)).with_licence(Arc::clone(&licence)),
+            ),
             // Read when first needed and kept once found, so the Job
             // finishing after this starts needs no restart.
             Arc::new(meridian_config::SettingsKey::at(
@@ -251,7 +258,6 @@ fn run() -> Result<(), String> {
         // catalogue and the replacement feed, pulled on start, daily and on
         // reconnecting, for the instrument store; the list is what every
         // ask sends by.
-        let licence: meridian_conductor::reference::Licence = Arc::default();
         tokio::spawn(
             Arc::new(meridian_conductor::reference::ReferencePuller::new(
                 Arc::clone(&bus),
@@ -515,6 +521,11 @@ impl meridian_conductor::usage::UsageBook for UsageBook {
     fn record(&self, sent: &meridian_domain::v1::SentUsageReport) -> Result<(), String> {
         self.0
             .record_usage_report(sent)
+            .map_err(|failed| failed.to_string())
+    }
+    fn licensed_schemes(&self) -> Result<Vec<String>, String> {
+        self.0
+            .licensed_schemes()
             .map_err(|failed| failed.to_string())
     }
 }

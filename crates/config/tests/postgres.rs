@@ -474,6 +474,25 @@ fn a_version_is_retired_once_its_row_kept_and_who_did_it_recorded() {
 }
 
 #[test]
+fn the_licensed_schemes_are_the_latest_declaration_each_its_own_row() {
+    // Contract v25 (W3.28).
+    let store = store("licensed");
+    assert!(store.licensed_schemes().unwrap().is_empty());
+    let author = meridian_config::Author {
+        by: "local|ada".into(),
+        note: "the firm's licences".into(),
+        ..Default::default()
+    };
+    store
+        .set_licensed_schemes(&["cusip".into(), "sedol".into()], &author, 1)
+        .unwrap();
+    store
+        .set_licensed_schemes(&["cusip".into()], &author, 2)
+        .unwrap();
+    assert_eq!(store.licensed_schemes().unwrap(), vec!["cusip".to_string()]);
+}
+
+#[test]
 fn one_live_launch_per_instance_and_it_ends_once() {
     let store = store("launches");
     store

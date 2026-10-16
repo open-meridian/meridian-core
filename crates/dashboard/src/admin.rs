@@ -91,6 +91,10 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/admin/instruments/merge", post(merge_instruments))
         .route("/admin/instruments/search", get(search_instruments))
         .route(instruments::USAGE_PATH, post(set_reports_usage))
+        .route(
+            instruments::LICENSED_SCHEMES_PATH,
+            post(set_licensed_schemes),
+        )
         .route(instruments::LINES_PATH, post(apply_migration_lines))
         .route("/admin/instruments/{instrument}", get(instrument_page))
         .route(
@@ -3254,6 +3258,61 @@ async fn set_reports_usage(
 
 /// The usage report's act on the surface (W6.20, contract v24).
 const SET_REPORTS_USAGE_TOOL: &str = "dashboard__set_reports_usage";
+
+/// W3.28 (contract v25): the licensed schemes declared, a deployment
+/// admin's, the whole list with a note; or prepared for someone to make.
+async fn set_licensed_schemes(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Form(pairs): Form<Vec<(String, String)>>,
+) -> Response {
+    let fields = once(&pairs);
+    let (session, _) = match gate(&app, &headers, true) {
+        Ok(gated) => gated,
+        Err(response) => return *response,
+    };
+    if let Err(response) = form_token_matches(&session, &fields) {
+        return *response;
+    }
+    let back = "/admin/instruments#licensed";
+    let note = field(&fields, "note").trim().to_string();
+    if note.is_empty() {
+        return not_done("say why the licensed schemes change", back);
+    }
+    let schemes: Vec<String> = every(&pairs, "licensed_scheme");
+    let posted = prepare_or_gate(&app, &session, &fields, SET_LICENSED_SCHEMES_TOOL, || {
+        Ok(serde_json::json!({"licensed_schemes": schemes, "note": note}))
+    })
+    .await;
+    if let Some(response) = posted_to(posted, back) {
+        return response;
+    }
+    let outcome = app
+        .bus
+        .call_for(
+            instruments::SET_LICENSED_SCHEMES,
+            "meridian.v1.SetLicensedSchemesRequest",
+            meridian_domain::v1::SetLicensedSchemesRequest {
+                licensed_schemes: schemes.clone(),
+                reason: note.clone(),
+            }
+            .encode_to_vec(),
+            None,
+            Some(Duration::from_secs(10)),
+            &session.subject,
+        )
+        .await
+        .map(|_| ())
+        .map_err(said_of_refusal);
+    after_to(
+        outcome,
+        "/admin/instruments?done=The+licensed+schemes+are+set#licensed",
+        back,
+    )
+}
+
+/// The licensed schemes' act on the surface (W6.20, contract v25).
+const SET_LICENSED_SCHEMES_TOOL: &str = "dashboard__set_licensed_schemes";
 
 /// W3.26 (contract v24): the migration's lines made from the Provisional
 /// tab -- the exact lines as one change, a line held back by its box, or one

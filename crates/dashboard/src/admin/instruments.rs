@@ -38,6 +38,8 @@ pub const LIST_INSTRUMENTS_TO_COMPLETE: &str =
 pub const READ_INSTRUMENT_HISTORY: &str = "platform.reference.query.read-instrument-history";
 /// W3.28 (contract v24): the usage report's setting, and the reports sent.
 pub const SET_REPORTS_USAGE: &str = "platform.config.command.set-reports-usage";
+/// W3.28 (contract v25): the identifier schemes declared as licensed.
+pub const SET_LICENSED_SCHEMES: &str = "platform.config.command.set-licensed-schemes";
 pub const LIST_USAGE_REPORTS: &str = "platform.config.query.list-usage-reports";
 /// W3.26 (contract v24): the deployment admin making the migration's lines.
 pub const APPLY_INSTRUMENT_MIGRATION: &str =
@@ -1223,10 +1225,62 @@ fn usage_section(
          <option value=\"off\"{off_selected}>Off</option></select></label>\
          <label>Why <input name=\"note\" required maxlength=\"2000\"></label>\
          <button type=\"submit\" name=\"prepare\" value=\"1\" data-prepare>Prepare</button>\
-         <button type=\"submit\" class=\"primary\">Set</button></form>{sent}",
-        if on { "on" } else { "off" }
+         <button type=\"submit\" class=\"primary\">Set</button></form>{licensed}{sent}",
+        if on { "on" } else { "off" },
+        licensed = licensed_form(reports, token),
     )
 }
+
+/// The schemes the deployment declares it is licensed for (contract v25,
+/// W3.28), sent with the weekly report: one box per scheme a deployment holds
+/// under licence, and any declared beside them; the conductor holds the
+/// choice to the platform's licence list. One line, a note and Set.
+fn licensed_form(
+    reports: &Result<meridian_domain::v1::ListUsageReportsReply, String>,
+    token: &str,
+) -> String {
+    let declared: Vec<String> = reports
+        .as_ref()
+        .map(|reports| reports.licensed_schemes.clone())
+        .unwrap_or_default();
+    let mut offered: Vec<String> = ["cusip", "isin", "sedol"]
+        .iter()
+        .map(|scheme| scheme.to_string())
+        .collect();
+    for scheme in &declared {
+        if !offered.contains(scheme) {
+            offered.push(scheme.clone());
+        }
+    }
+    let boxes: String = offered
+        .iter()
+        .map(|scheme| {
+            format!(
+                "<label class=\"check\"><input type=\"checkbox\" name=\"licensed_scheme\" \
+                 value=\"{value}\"{checked}> {shown}</label>",
+                value = escape(scheme),
+                checked = if declared.contains(scheme) {
+                    " checked"
+                } else {
+                    ""
+                },
+                shown = escape(&scheme.to_ascii_uppercase()),
+            )
+        })
+        .collect();
+    format!(
+        "<form method=\"post\" action=\"{LICENSED_SCHEMES_PATH}\" class=\"inline-form\" \
+         id=\"licensed-schemes-form\" data-licensed-schemes=\"{}\">{token}\
+         <span class=\"label\">Licensed for</span>{boxes}\
+         <label>Why <input name=\"note\" required maxlength=\"2000\"></label>\
+         <button type=\"submit\" name=\"prepare\" value=\"1\" data-prepare>Prepare</button>\
+         <button type=\"submit\" class=\"primary\">Set</button></form>",
+        escape(&declared.join(",")),
+    )
+}
+
+/// Where the licensed schemes' form posts (contract v25).
+pub const LICENSED_SCHEMES_PATH: &str = "/admin/instruments/licensed-schemes";
 
 /// Where the usage report's form posts.
 pub const USAGE_PATH: &str = "/admin/instruments/usage";
@@ -2614,5 +2668,32 @@ mod provisional_tests {
         assert_eq!(default_for("dashboard__close_account"), Level::MayNot);
         assert!(crate::prepared::CORE_PREPARABLE.contains(&"dashboard__apply_migration"));
         assert!(crate::prepared::CORE_PREPARABLE.contains(&"dashboard__close_account"));
+    }
+
+    /// Contract v25 (W3.28): the licensed schemes' form ticks those declared
+    /// and offers the licensed schemes a deployment holds, one line; its act
+    /// is preparable and at may not for agents by default.
+    #[test]
+    fn the_licensed_schemes_form_ticks_those_declared() {
+        let reports = Ok(meridian_domain::v1::ListUsageReportsReply {
+            reports_usage: true,
+            licensed_schemes: vec!["cusip".into(), "wkn".into()],
+            ..Default::default()
+        });
+        let form = licensed_form(&reports, "");
+        assert!(form.contains(&format!("action=\"{LICENSED_SCHEMES_PATH}\"")));
+        assert!(form.contains("value=\"cusip\" checked"));
+        assert!(form.contains("value=\"isin\">"));
+        assert!(
+            form.contains("value=\"wkn\" checked"),
+            "a declared one beyond the three"
+        );
+        assert!(form.contains("data-licensed-schemes=\"cusip,wkn\""));
+        assert!(usage_section(&reports, "").contains("id=\"licensed-schemes-form\""));
+        assert!(crate::prepared::CORE_PREPARABLE.contains(&"dashboard__set_licensed_schemes"));
+        assert_eq!(
+            crate::prepared::levels::default_for("dashboard__set_licensed_schemes"),
+            crate::prepared::levels::Level::MayNot
+        );
     }
 }
