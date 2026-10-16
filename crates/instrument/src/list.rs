@@ -154,6 +154,7 @@ pub fn list_to_complete(
             } else {
                 String::new()
             },
+            contradicted_fields: Vec::new(),
         })
         .collect();
     let next_cursor = if start + page.len() < chosen.len() {

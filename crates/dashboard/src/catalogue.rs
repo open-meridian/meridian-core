@@ -539,6 +539,7 @@ async fn upload(
             declaration,
         }),
         image_digest: upload.image_digest,
+        documentation: Vec::new(),
     };
     let recorded: Result<PluginVersion, String> = ask(
         &app,

@@ -780,6 +780,7 @@ mod tests {
                 ..Default::default()
             }),
             catalogue: None,
+            ..Default::default()
         };
         assert_eq!(declaration_refused(&declaration, &settings, &custody), None);
         assert!(

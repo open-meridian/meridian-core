@@ -3471,6 +3471,8 @@ fn kept_unplaced(
         unplaced_fact::Fact::Locate(_) => "locate",
         // Contract v23 (W11.25; approved 2026-10-13).
         unplaced_fact::Fact::ValueDateRoll(_) => "value-date-roll",
+        // Contract v25 (W11.32): a give-up naming nothing the book holds.
+        unplaced_fact::Fact::GiveUp(_) => "give-up",
     };
     // A repeat of an unplaced execution is the same fact, kept once.
     if let unplaced_fact::Fact::Execution(execution) = &fact {

@@ -576,6 +576,7 @@ fn report(now: i64) -> meridian_domain::v1::PluginReport {
                 ],
             }),
             catalogue: None,
+            ..Default::default()
         }),
         stored: vec![
             StoredSpan {
@@ -1299,6 +1300,7 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
             "".into(),
             meridian_domain::v1::ListUsageReportsReply {
                 reports_usage: true,
+                licensed_schemes: vec!["cusip".into()],
                 reports: vec![meridian_domain::v1::SentUsageReport {
                     sent_at_ns: 1_791_417_600_000_000_000,
                     received: true,
@@ -1325,6 +1327,7 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
             "".into(),
             meridian_domain::v1::ReportsUsageSetting {
                 reports_usage: asked.reports_usage,
+                licensed_schemes: Vec::new(),
             }
             .encode_to_vec(),
         ))

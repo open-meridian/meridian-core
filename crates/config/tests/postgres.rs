@@ -382,11 +382,14 @@ fn version(name: &str, version: &str) -> PluginVersion {
                     ..Default::default()
                 }),
                 catalogue: None,
+                ..Default::default()
             }),
         }),
         image_digest: format!("sha256:{}", "a".repeat(64)),
         uploaded_by: "local|ada".into(),
         uploaded_at_ns: 1,
+        source_registry: "local".into(),
+        ..Default::default()
     }
 }
 

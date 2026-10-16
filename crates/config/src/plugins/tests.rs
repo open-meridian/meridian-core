@@ -99,6 +99,7 @@ fn snaptrade(version: &str) -> RecordPluginUploadRequest {
             declaration: None,
         }),
         image_digest: DIGEST.into(),
+        documentation: Vec::new(),
     }
 }
 

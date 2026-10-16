@@ -107,6 +107,7 @@ mod tests {
                 ..Default::default()
             }],
             as_of_ns,
+            venue_id: String::new(),
         }
     }
 

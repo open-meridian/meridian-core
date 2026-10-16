@@ -208,8 +208,15 @@ pub const CONTRACT_FLOOR: u32 = 2;
 /// acknowledged and read; whether an order may name a local record; and, for
 /// every role, an instrument replaced heard and caught up on, and the template
 /// catalogue read. The order path's rows are stable from v24, booking's in
-/// preview. A plugin built before sends and hears none of them.
-pub const CONTRACT_CURRENT: u32 = 24;
+/// preview. A plugin built before sends and hears none of them. v25 is
+/// plugins shared through registries and carrying their own documentation
+/// (sdk-contract/plugins-are-shared-and-documented-contract): a version's
+/// declaration carries its settings, interface, tools and documentation by
+/// digest, and a plugin declaring v25 registers what its version declared;
+/// a break's unresolved identifiers; a give-up kept unplaced; a venue
+/// resolved by its ID; and a listing identifier's trading currency. A plugin
+/// built before sends none of them and is admitted unchecked.
+pub const CONTRACT_CURRENT: u32 = 25;
 
 /// The contract version a plugin registered with, as a number: what the
 /// rules for a plugin built before an addition read. Zero for one that does
@@ -457,7 +464,7 @@ mod tests {
             admit("v1"),
             Err(
                 "the plugin was built against contract v1, older than this sidecar accepts \
-                 (v2 through v24); rebuild it against v2 or later"
+                 (v2 through v25); rebuild it against v2 or later"
                     .into()
             )
         );
@@ -466,11 +473,11 @@ mod tests {
     #[test]
     fn a_contract_newer_than_this_sidecar_is_refused_naming_both_halves() {
         assert_eq!(
-            admit("v25"),
+            admit("v26"),
             Err(
-                "the plugin was built against contract v25, newer than this sidecar \
-                 (v2 through v24); upgrade the runtime, or rebuild the plugin against \
-                 v24 or earlier"
+                "the plugin was built against contract v26, newer than this sidecar \
+                 (v2 through v25); upgrade the runtime, or rebuild the plugin against \
+                 v25 or earlier"
                     .into()
             )
         );
@@ -481,7 +488,7 @@ mod tests {
         assert_eq!(
             admit(""),
             Err(
-                "the plugin declared no contract version; this sidecar accepts v2 through v24"
+                "the plugin declared no contract version; this sidecar accepts v2 through v25"
                     .into()
             )
         );

@@ -371,6 +371,8 @@ impl Plugins {
             image_digest: request.image_digest,
             uploaded_by: subject(envelope),
             uploaded_at_ns: self.clock.now_ns(),
+            source_registry: "local".to_string(),
+            ..PluginVersion::default()
         };
         if !self
             .store

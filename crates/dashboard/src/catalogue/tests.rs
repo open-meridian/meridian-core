@@ -157,6 +157,8 @@ fn conductor(bus: &Bus) {
                 image_digest: request.image_digest,
                 uploaded_by: envelope.meta.unwrap_or_default().acting_for_subject,
                 uploaded_at_ns: T0,
+                source_registry: "local".into(),
+                ..Default::default()
             }
             .encode_to_vec(),
         ))

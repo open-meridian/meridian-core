@@ -1114,6 +1114,7 @@ impl WireIdentifier {
             source: self.source,
             valid_from_ns: self.valid_from_ns,
             valid_until_ns: self.valid_until_ns,
+            trading_currency: String::new(),
         }
     }
 }

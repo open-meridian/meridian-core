@@ -176,9 +176,12 @@ message MovementLine {
   // Signed as the position's quantity is, and added to it.
   Decimal quantity = 5;
   // The lot it adds to or relieves. Empty on a line that opens a lot, whose
-  // identifier the book mints, and on cash, which has no lots.
+  // identifier the book mints, and on the account's base currency, which has
+  // no lots: from v24 every other currency opens lots with base-currency
+  // basis (option (c), W11.13).
   string lot_id = 6;
-  // Set on the line that opens a lot, and only there.
+  // Set on the line that opens a lot, and only there: unset on a line that
+  // adds to or relieves a lot, or on the account's base currency.
   LotTerms opens_lot = 7;
   // A pending line's fail, where its source reports one.
   PendingState pending_state = 8;
@@ -632,6 +635,11 @@ message Break {
   BreakResolution resolution = 15;
   Actor recorded_by = 16;
   JournalRef last_change = 17;
+  // An unrecognized security's identifiers, as the street row carries them
+  // (W9.3, contract v25): what an open break of that category is matched
+  // on, scheme and value in any order, with its category and account.
+  // Empty on every other break.
+  repeated Identifier unresolved_identifiers = 18;
 }
 
 // W9.4. A new break, or an open one brought up to date.
@@ -654,6 +662,11 @@ message RecordBreakRequest {
   // The plugin's key for this command, derived from its source (Q12):
   // answered with the first's reply when it is sent again.
   string idempotency_key = 11;
+  // For BREAK_CATEGORY_UNRECOGNIZED_SECURITY, the street row's
+  // unresolved_identifiers (W9.3, contract v25), at least one; refused on
+  // any other category. Until v25 they rode as the break's street-only
+  // differences.
+  repeated Identifier unresolved_identifiers = 12;
 }
 
 // W9.6. For a person.
@@ -2022,7 +2035,8 @@ message UnplacedFact {
   // plugin, counted on its connectivity plugin's admin view.
   string account_id = 2;
   // The kind of fact, as data: `execution`, `placement`, `charge`,
-  // `locate`, and from contract v23 `value-date-roll`.
+  // `locate`, from contract v23 `value-date-roll`, and from contract v25
+  // `give-up`.
   string fact_kind = 3;
   UnplacedReason reason = 4;
   RawRecordRef raw_record = 5;
@@ -2036,6 +2050,9 @@ message UnplacedFact {
     // A value-date roll on a code no ems mapped, or meeting no pending line
     // to move (W11.25, contract v23).
     ReportValueDateRollRequest value_date_roll = 14;
+    // A give-up's answer naming no execution or allocation the book holds
+    // (W11.32, contract v25), its fact_kind `give-up`.
+    ReportGiveUpRequest give_up = 15;
   }
   // A venue's recorded order, gone with the venue-originated path (ruled
   // 2026-10-13).

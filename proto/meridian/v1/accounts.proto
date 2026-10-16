@@ -67,6 +67,12 @@ enum StaffCapability {
   // recorded, because a bundle is the one place a deployment's content leaves
   // it.
   STAFF_CAPABILITY_READ_DIAGNOSTIC_BUNDLES = 4;
+
+  // Review and pull plugins (contract v25, W8.9, W8.12, W8.13, W5.28): review
+  // verified versions, pull listings, grant publisher status, check an LEI,
+  // and work copyright notices and the copyright switch. One capability
+  // until the team grows (item 79).
+  STAFF_CAPABILITY_REVIEW_PLUGINS = 5;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -109,6 +115,88 @@ message OrganisationRecord {
   int64 reopened_at_ns = 8;
   string reopened_by_person_id = 9;
   string reopen_reason = 10;
+
+  // The organisation part of its listings (contract v25, W5.29): a
+  // lower-case DNS label, at most 39 characters; editable until its first
+  // publish, then fixed. `open-meridian` is reserved for first-party
+  // plugins. Empty until set.
+  string slug = 11;
+
+  // Whether it may publish, and to which registries (W5.28), granted by
+  // staff, each grant its own record.
+  PublisherStatus publisher_status = 12;
+
+  // A verified publisher's legal entity identifier (W5.29), entered by the
+  // organisation and checked by staff against GLEIF, with the check's time;
+  // 0 until checked.
+  string lei = 13;
+  int64 lei_checked_at_ns = 14;
+
+  // The person named its Account Holder (W5.29), who has accepted the
+  // vendor terms, and when they accepted them.
+  string account_holder = 15;
+  int64 vendor_terms_accepted_at_ns = 16;
+}
+
+// Whether an organisation may publish plugins (contract v25, W5.28): none,
+// community, or verified, which also needs a checked LEI and an Account
+// Holder.
+enum PublisherStatus {
+  PUBLISHER_STATUS_UNSPECIFIED = 0;
+  PUBLISHER_STATUS_NONE = 1;
+  PUBLISHER_STATUS_COMMUNITY = 2;
+  PUBLISHER_STATUS_VERIFIED = 3;
+}
+
+// Staff grant or revoke an organisation's publisher status (W5.28).
+message SetPublisherStatusRequest {
+  string organisation_id = 1;
+  PublisherStatus publisher_status = 2;
+  // Why, shown to the organisation; a revocation for repeat infringement
+  // cites the notices (W8.13).
+  string reason = 3;
+}
+
+// Staff check an organisation's LEI against GLEIF (W5.28).
+message CheckOrganisationLeiRequest {
+  string organisation_id = 1;
+}
+
+// Staff give the first party's slug, `open-meridian`, to the operating
+// company's organisation (W5.28); no other organisation may take it.
+message GiveFirstPartySlugRequest {
+  string organisation_id = 1;
+  string note = 2;
+}
+
+// Staff set a slug aside as confusable with an existing one (W5.28), so no
+// organisation may take it.
+message SetAsideSlugRequest {
+  string slug = 1;
+  string reason = 2;
+}
+
+message SetAsideSlugReply {
+  string slug = 1;
+  int64 set_aside_at_ns = 2;
+}
+
+// An Owner or Admin gives the organisation's slug (W5.29), until its first
+// publish.
+message SetOrganisationSlugRequest {
+  string organisation_id = 1;
+  string slug = 2;
+}
+
+// An Owner or Admin gives what verified needs (W5.29): the LEI, and the
+// Account Holder, a person in the organisation. Naming another person
+// clears the acceptance; the Account Holder accepts the vendor terms
+// themselves, sending this with accept_vendor_terms.
+message SetVerifiedDetailsRequest {
+  string organisation_id = 1;
+  string lei = 2;
+  string account_holder = 3;
+  bool accept_vendor_terms = 4;
 }
 
 // Whether an organisation is open for business.
@@ -836,6 +924,18 @@ message DelegationRecord {
   int64 revoked_at_ns = 8;
   int64 last_used_at_ns = 9;
   ResearchScope scope = 10;
+  // Contract v25 (W5.26; item 140): a delegation of the person's own
+  // standing in the plugin registry rather than of a staff capability;
+  // capability is then unspecified.
+  DelegationScope delegation_scope = 11;
+}
+
+// What a delegation carries besides a staff capability (contract v25).
+enum DelegationScope {
+  DELEGATION_SCOPE_UNSPECIFIED = 0;
+  // "Use the plugin registry as you": the catalogue's reads, stars and the
+  // vendor's tools, each at the person's own standing, read at every call.
+  DELEGATION_SCOPE_PLUGIN_REGISTRY = 1;
 }
 
 message ListDelegationsRequest {

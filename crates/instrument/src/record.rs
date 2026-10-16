@@ -70,6 +70,7 @@ pub fn identifier_to_wire(identifier: &Identifier) -> PbIdentifier {
         source: identifier.source.clone(),
         valid_from_ns: identifier.valid_from_ns,
         valid_until_ns: identifier.valid_to_ns.unwrap_or(0),
+        trading_currency: String::new(),
     }
 }
 

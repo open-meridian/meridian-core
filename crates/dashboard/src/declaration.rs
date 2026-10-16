@@ -210,6 +210,7 @@ pub fn from_json(declared: &Declared) -> Result<PluginDeclaration, String> {
                 description: algorithm.description.clone(),
             })
             .collect(),
+        ..PluginDeclaration::default()
     })
 }
 
@@ -482,6 +483,7 @@ mod tests {
                 algorithm_id: "rebalance-drift".into(),
                 description: "Rebalances <a> sleeve past its drift band".into(),
             }],
+            ..Default::default()
         };
         let seen = [NotCarriedSeen {
             scheme: "snaptrade:position".into(),

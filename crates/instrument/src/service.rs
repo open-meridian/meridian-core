@@ -2598,6 +2598,7 @@ mod tests {
         let asked = ResolveVenueRequest {
             identifiers: vec![mic],
             as_of_ns: NOW,
+            venue_id: String::new(),
         };
         let missed: ResolveVenueReply = ask(
             &bus,

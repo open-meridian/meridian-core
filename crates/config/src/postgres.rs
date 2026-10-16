@@ -392,6 +392,8 @@ impl Store for PostgresStore {
                 image_digest: row.get(5),
                 uploaded_by: row.get(6),
                 uploaded_at_ns: row.get(7),
+                source_registry: "local".to_string(),
+                ..PluginVersion::default()
             });
         }
 
@@ -2134,6 +2136,7 @@ fn launch_from(row: &postgres::Row) -> PluginLaunch {
         stopped_note: row.get(17),
         prepared_call_id: row.get(18),
         stopped_prepared_call_id: row.get(19),
+        pull_acknowledgement: None,
     }
 }
 

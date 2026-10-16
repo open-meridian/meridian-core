@@ -336,7 +336,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
     ) -> Result<Response<plugin::RecordBreakResult>, Status> {
         let mut params = request.into_inner();
         let acting_for = params.acting_for.take();
-        let message: domain::RecordBreakRequest = self.as_domain(params)?;
+        let mut message: domain::RecordBreakRequest = self.as_domain(params)?;
         if let Some(domain::record_break_request::Subject::Position(held0)) = message.subject.as_ref() {
             self.known("position.side", held0.side, domain::HoldingSide::try_from(held0.side).is_ok())?;
         }
@@ -368,6 +368,10 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
             }
         }
         self.known("category", message.category, domain::BreakCategory::try_from(message.category).is_ok())?;
+        for stamped0 in message.unresolved_identifiers.iter_mut() {
+            stamped0.valid_from_ns = Default::default();
+            stamped0.valid_until_ns = Default::default();
+        }
         let account = Some(message.account_id.clone());
         self.command_typed("platform.book.command.record-break", "meridian.v1.RecordBreakRequest", message, account, acting_for).await
     }

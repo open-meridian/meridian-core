@@ -196,6 +196,13 @@ message Identifier {
   // both empty.
   int64 valid_from_ns = 4;
   int64 valid_until_ns = 5;
+
+  // For a listing identifier -- an exchange-level or composite FIGI on a
+  // security's record -- the ISO 4217 currency that listing trades in
+  // (W3.1, contract v25), as the platform's master holds it per listing;
+  // empty on every other identifier, and where the master holds none. The
+  // record's own currency stays the security's.
+  string trading_currency = 6;
 }
 
 // The canonical instrument record.
@@ -548,12 +555,18 @@ message SearchVenuesRequest {
 // W3.14: which venue a set of identifiers names on a date, in the venues the
 // deployment holds.
 message ResolveVenueRequest {
-  // At least one: a MIC under `iso10383`, or a vendor's code as a `symbol`
-  // with its source.
+  // At least one, unless venue_id is set: a MIC under `iso10383`, or a
+  // vendor's code as a `symbol` with its source.
   repeated Identifier identifiers = 1;
 
   // Reference time. Zero means now.
   int64 as_of_ns = 2;
+
+  // A venue held by its ID (W3.14, contract v25; D9): answered with its
+  // record, so the dashboard shows a calendar's venue by its MIC and name.
+  // Set instead of identifiers; a request carrying both is refused naming
+  // venue_id. Empty: resolved by identifiers.
+  string venue_id = 3;
 }
 
 message ResolveVenueReply {
@@ -1306,6 +1319,11 @@ message InstrumentToComplete {
   // one INS- ID are a duplicate line: making both replaces each by it.
   MigrationSection migration_section = 6;
   string answered_instrument_id = 7;
+
+  // Contract v25 (W3.26): the values the platform's answer contradicts that
+  // a person set or accepted on this record -- an uncertain line of its
+  // own, made only by the deployment admin. Empty where none is.
+  repeated InstrumentField contradicted_fields = 8;
 }
 
 // Why a deployment's record is provisional (W3.7, W3.11; contract v24).

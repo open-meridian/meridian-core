@@ -693,6 +693,7 @@ pub fn completion(filled: &Filled) -> Result<CompleteInstrumentsRequest, String>
                 source: text("namespace"),
                 valid_from_ns: 0,
                 valid_until_ns: said["until"].as_i64().unwrap_or(0),
+                trading_currency: String::new(),
             })),
             source: text("source"),
         });

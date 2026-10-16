@@ -307,6 +307,7 @@ fn told(snapshot: &Snapshot, plugin_instance_id: &str) -> PluginConfiguration {
         connectivity_link: connectivity.connectivity_link,
         connectivity_links: connectivity.connectivity_links,
         venue_account_map: connectivity.venue_account_map,
+        declaration: None,
     }
 }
 
@@ -1511,6 +1512,7 @@ pub fn serve_with(
             }
             Ok(meridian_domain::v1::ReportsUsageSetting {
                 reports_usage: cx.store.reports_usage().map_err(|f| f.to_string())?,
+                licensed_schemes: Vec::new(),
             })
         },
     );
@@ -1528,6 +1530,7 @@ pub fn serve_with(
                 // The setting in force, so the page says whether the report
                 // is on (W3.28, contract v24).
                 reports_usage: cx.store.reports_usage().map_err(|f| f.to_string())?,
+                licensed_schemes: Vec::new(),
             })
         },
     );

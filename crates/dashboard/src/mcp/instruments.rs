@@ -744,6 +744,7 @@ fn value(
                 source: text(id, "source", &at, false, problems),
                 valid_from_ns: 0,
                 valid_until_ns: integer(id, "valid_until_ns", &at, false, problems),
+                trading_currency: String::new(),
             })
         }
     };
