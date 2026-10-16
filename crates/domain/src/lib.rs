@@ -14,14 +14,20 @@
 //! [`text`], the characters a ticket's text may hold, which a plugin's
 //! sidecar and the dashboard both refuse alike (W4.12, W6.21). And
 //! [`setting_table`], a table setting's rows, which the dashboard and the
-//! conductor check alike, cell by cell (W6.11, contract v14).
+//! conductor check alike, cell by cell (W6.11, contract v14). And
+//! [`declaration`], a version's declaration as the SDK prints it in JSON
+//! ([`protojson`] for the messages registration sends), which the dashboard
+//! reads from an upload and a harness's sidecar from its file alike (W8.1,
+//! W4.1, contract v25).
 
 pub mod asset_class;
 pub mod date;
+pub mod declaration;
 pub mod exact;
 pub mod instrument_type;
 pub mod lake;
 pub mod money;
+pub mod protojson;
 pub mod setting_table;
 pub mod text;
 pub mod zones;

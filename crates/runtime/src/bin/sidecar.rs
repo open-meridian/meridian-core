@@ -37,6 +37,18 @@ fn main() {
     }
 }
 
+/// The SDK's declaration JSON in `path`, read as an upload's is.
+fn declaration_from(path: &str) -> Result<meridian_pb::v1::PluginDeclaration, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|failed| format!("MERIDIAN_PLUGIN_DECLARATION {path}: {failed}"))?;
+    let declared: meridian_domain::declaration::Declared =
+        serde_json::from_str(&text).map_err(|failed| {
+            format!("MERIDIAN_PLUGIN_DECLARATION {path} is not a declaration: {failed}")
+        })?;
+    meridian_domain::declaration::from_json(&declared)
+        .map_err(|why| format!("MERIDIAN_PLUGIN_DECLARATION {path}: {why}"))
+}
+
 fn run() -> Result<(), String> {
     let deployment_id = required("MERIDIAN_DEPLOYMENT_ID")?;
 
@@ -113,6 +125,14 @@ fn run() -> Result<(), String> {
             let mut sidecar = Sidecar::new(bus, &deployment_id, identity);
             if let Some(verifier) = verifier {
                 sidecar = sidecar.with_verifier(verifier);
+            }
+            // A harness's sidecar, which no launch made, holds its plugin's
+            // registration to the declaration an upload would carry (W4.1,
+            // contract v25): the SDK's JSON, as `meridian-declaration`
+            // prints it. The launcher never sets it.
+            if let Some(path) = var("MERIDIAN_PLUGIN_DECLARATION") {
+                sidecar = sidecar.held_to(declaration_from(&path)?);
+                tracing::info!(path, "registration held to the declaration in this file");
             }
             let sidecar = Arc::new(sidecar);
 

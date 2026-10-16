@@ -1,0 +1,15 @@
+# The SDK's scaffold, `meridian plugin new`'s reference plugin, as two plugins
+# declaring contract v25 whose sidecars hold registration to a declaration
+# (W4.1, contract v25), for `make harness-check`: `declared` given the one
+# `meridian-declaration` prints from the same image, which it registers;
+# `mismatched` given that one with a tool added, which its sidecar refuses,
+# naming the first difference. Run where its docs/ are, as in its own image.
+x-scaffold: &scaffold
+  entrypoint: ["reference-plugin"]
+  working_dir: /w/template
+
+services:
+  declared:
+    <<: *scaffold
+  mismatched:
+    <<: *scaffold

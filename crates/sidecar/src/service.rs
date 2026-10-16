@@ -166,6 +166,13 @@ pub struct Sidecar {
     /// The keys this instance filed a new ticket under within the hour, for
     /// its rate (W4.12, [`crate::tickets`]).
     pub(crate) filed: crate::tickets::Filed,
+
+    /// The declaration a sidecar no launch made holds its plugin's
+    /// registration to (W4.1, contract v25): a test harness's, given the
+    /// declaration an upload would carry, so its plugin is held as a
+    /// launched one is. Only ever a stricter check: a catalogue launch's
+    /// declaration, from the conductor, wins.
+    pub(crate) harnessed: Option<meridian_pb::v1::PluginDeclaration>,
 }
 
 impl Sidecar {
@@ -226,7 +233,15 @@ impl Sidecar {
             changed: Arc::default(),
             verifier: None,
             filed: Arc::default(),
+            harnessed: None,
         }
+    }
+
+    /// Hold registration to `declaration` where no launch is known
+    /// ([`Sidecar::harnessed`]).
+    pub fn held_to(mut self, declaration: meridian_pb::v1::PluginDeclaration) -> Self {
+        self.harnessed = Some(declaration);
+        self
     }
 
     /// Verifying the person a command is sent for with the dashboard's keys,
@@ -342,7 +357,12 @@ impl SidecarService for Sidecar {
                 }
             };
             let difference = match (&configuration.declaration, configuration.launched) {
-                (_, false) => None,
+                // A harness's sidecar, given the declaration an upload carries.
+                (_, false) => self.harnessed.as_ref().and_then(|uploaded| {
+                    crate::held::difference(&req, uploaded).map(|first| {
+                        format!("{first}, unlike the declaration its version was uploaded with")
+                    })
+                }),
                 (None, true) => Some(
                     "its version was uploaded with no declaration, so a plugin declaring v25 \
                      cannot be held to it; upload the version again with a CLI that sends \
@@ -360,6 +380,10 @@ impl SidecarService for Sidecar {
                         "a live instance differing from its version: {difference}"
                     ));
                 } else {
+                    tracing::warn!(
+                        instance = self.identity.instance_id,
+                        "registration refused: {difference}"
+                    );
                     return Ok(Response::new(RegisterReply {
                         admitted: false,
                         refusal_reason: difference,
@@ -956,6 +980,43 @@ mod tests {
         };
         assert!(
             reply(&configured(harnessed), v25(uploaded()))
+                .await
+                .admitted
+        );
+    }
+
+    /// A harness's sidecar (contract v25): no launch, its registration held
+    /// to the declaration it was given, as a launched one's is.
+    #[tokio::test]
+    async fn a_harnessed_sidecar_holds_registration_to_the_declaration_it_was_given() {
+        let harnessed = meridian_domain::v1::PluginConfiguration {
+            plugin_instance_id: "custody-snaptrade-1".into(),
+            ..Default::default()
+        };
+        let held = || configured(harnessed.clone()).held_to(uploaded());
+        assert!(reply(&held(), v25(uploaded())).await.admitted);
+        let mut more = uploaded();
+        more.reads_external_accounts = true;
+        let refused = reply(&held(), v25(more)).await;
+        assert!(!refused.admitted);
+        assert!(
+            refused
+                .refusal_reason
+                .contains("a declaration whose reads_external_accounts differs"),
+            "{}",
+            refused.refusal_reason
+        );
+        // A catalogue launch's declaration wins over the one it was given.
+        let launch = meridian_domain::v1::PluginConfiguration {
+            plugin_instance_id: "custody-snaptrade-1".into(),
+            declaration: Some(uploaded()),
+            launched: true,
+            ..Default::default()
+        };
+        let mut given = uploaded();
+        given.secret_settings = vec!["other".into()];
+        assert!(
+            reply(&configured(launch).held_to(given), v25(uploaded()))
                 .await
                 .admitted
         );

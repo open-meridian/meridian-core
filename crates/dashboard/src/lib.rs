@@ -26,7 +26,6 @@ pub mod catalogue;
 pub mod clock;
 pub mod custody;
 pub mod database;
-pub mod declaration;
 pub mod delegation;
 pub mod directory;
 pub mod documentation;
@@ -41,7 +40,6 @@ pub mod notice;
 pub mod oidc;
 pub mod plugins;
 pub mod prepared;
-pub mod protojson;
 pub mod records;
 pub mod service_accounts;
 pub mod session;
@@ -49,6 +47,9 @@ pub mod signing;
 pub mod terminal;
 pub mod tickets;
 pub mod web;
+
+/// A version's declaration as the SDK prints it, the domain's (contract v25).
+pub use meridian_domain::{declaration, protojson};
 
 pub use clock::Clock;
 pub use first_run::WizardSession;

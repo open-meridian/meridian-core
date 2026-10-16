@@ -146,9 +146,7 @@ fn declaration(registered: &PluginDeclaration, uploaded: &PluginDeclaration) -> 
         ),
     ];
     let (field, _) = differs.iter().find(|(_, differs)| *differs)?;
-    Some(format!(
-        "its declaration's {field} differs from the one its version was uploaded with"
-    ))
+    Some(format!("it registers a declaration whose {field} differs"))
 }
 
 #[cfg(test)]
@@ -271,7 +269,7 @@ mod tests {
             ),
             (
                 |r| r.declaration.as_mut().unwrap().documentation.clear(),
-                "its declaration's documentation differs",
+                "it registers a declaration whose documentation differs",
             ),
         ];
         for (change, says) in cases {

@@ -1042,7 +1042,8 @@ HARNESS_FILES := README.md activity.sql book.sql compose.yaml harness.py lake.sq
 HARNESS_SECRET := sk-test-harness-not-a-real-key
 HARNESS := MERIDIAN_RUNTIME_IMAGE=$(RUNTIME_IMAGE) \
 	MERIDIAN_HARNESS_STAND_IN="$(CURDIR)/e2e/plugin-page" \
-	$(COMPOSE) -p meridian-core-harness -f .harness/compose.yaml -f .harness/plugins.yaml -f e2e/harness/stand-in.yaml
+	$(COMPOSE) -p meridian-core-harness -f .harness/compose.yaml -f .harness/plugins.yaml -f e2e/harness/stand-in.yaml \
+	-f e2e/harness/declared.yaml
 HARNESS_RUN := $(HARNESS) run --rm -T runner
 HARNESS_STORE := $(HARNESS) run --rm -T store
 
@@ -1066,9 +1067,22 @@ harness-check:
 		|| { echo "harness-check FAILED: the harness image carries nothing at /harness" >&2; exit 1; }
 	@held="$$(ls -A .harness | LC_ALL=C sort | tr '\n' ' ')"; [ "$$held" = "$(HARNESS_FILES) " ] \
 		|| { echo "harness-check FAILED: the harness image holds $$held; it holds $(HARNESS_FILES) and nothing else" >&2; exit 1; }
-	@$(DOCKER) run --rm -i -v "$(CURDIR)/.harness":/harness:ro python:3.12-alpine python /harness/harness.py compose \
-		<e2e/harness/plugins.json >.harness/plugins.yaml \
-		|| { echo "harness-check FAILED: the harness's compose did not write the plugins from e2e/harness/plugins.json" >&2; exit 1; }
+	@# Contract v25 (W4.1): the scaffold's declaration as an upload carries
+	@# it, printed from the SDK's image, and one differing from what it
+	@# registers, for the two plugins of e2e/harness/declared.json.
+	@$(DOCKER) run --rm --network none -w /w/template --entrypoint meridian-declaration meridian-python-interop \
+		reference_plugin.declaration:DECLARATION >.harness/declared.json \
+		|| { echo "harness-check FAILED: meridian-declaration did not print the scaffold's declaration" >&2; exit 1; }
+	@$(PY) -c 'import json; d = json.load(open(".harness/declared.json")); d["reads_external_accounts"] = not d.get("reads_external_accounts", False); json.dump(d, open(".harness/mismatched.json", "w"))'
+	@$(PY) -c 'import json; print(json.dumps(json.load(open("e2e/harness/plugins.json")) + json.load(open("e2e/harness/declared.json"))))' \
+		| $(DOCKER) run --rm -i -v "$(CURDIR)/.harness":/harness:ro python:3.12-alpine python /harness/harness.py compose >.harness/plugins.yaml \
+		|| { echo "harness-check FAILED: the harness's compose did not write the plugins from e2e/harness/plugins.json and declared.json" >&2; exit 1; }
+	@grep -q '"MERIDIAN_PLUGIN_DECLARATION": "/declaration/declaration.json"' .harness/plugins.yaml \
+		&& grep -q '"./declared.json:/declaration/declaration.json:ro"' .harness/plugins.yaml \
+		|| { echo "harness-check FAILED: the compose file does not hold the declared plugin's sidecar to its declaration" >&2; exit 1; }
+	@! printf '[{"instance": "odd", "image": "x", "roles": [], "declaration": "a b.json"}]' \
+		| $(DOCKER) run --rm -i -v "$(CURDIR)/.harness":/harness:ro python:3.12-alpine python /harness/harness.py compose >/dev/null 2>&1 \
+		|| { echo "harness-check FAILED: the harness's compose took a declaration path with a space" >&2; exit 1; }
 	@! printf '[{"instance": "nats", "image": "x", "roles": []}]' \
 		| $(DOCKER) run --rm -i -v "$(CURDIR)/.harness":/harness:ro python:3.12-alpine python /harness/harness.py compose >/dev/null 2>&1 \
 		|| { echo "harness-check FAILED: the harness's compose wrote a plugin named as one of its own services" >&2; exit 1; }
@@ -1082,6 +1096,14 @@ harness-check:
 		$(HARNESS) --profile runner down -v --remove-orphans >/dev/null 2>&1; exit 1; }; \
 	$(HARNESS) up -d >>.e2e-harness.log 2>&1 || fail "the harness did not start"; \
 	$(HARNESS_RUN) ready || fail "the plugin never registered"; \
+	$(HARNESS_RUN) ready --instance declared >/dev/null \
+		|| fail "the plugin declaring v25 whose sidecar holds the declaration it was uploaded with never registered (W4.1)"; \
+	refused=; for i in $$(seq 1 60); do \
+		$(HARNESS) logs --no-color sidecar-mismatched mismatched 2>/dev/null \
+			| grep -q "unlike the declaration its version was uploaded with" && { refused=1; break; }; \
+		sleep 1; \
+	done; \
+	[ -n "$$refused" ] || fail "the plugin registering other than the declaration it was uploaded with was not refused naming the first difference (W4.1)"; \
 	$(HARNESS_RUN) settings api_key=$(HARNESS_SECRET) poll_minutes=15 || fail "its settings were not saved"; \
 	$(HARNESS_RUN) page --level admin /settings --until '"missing_required": []' >/dev/null \
 		|| fail "the plugin never held its settings"; \
@@ -1146,7 +1168,7 @@ harness-check:
 	done; \
 	$(HARNESS) logs --no-color >>.e2e-harness.log 2>&1; \
 	$(HARNESS) --profile runner down -v --remove-orphans >>.e2e-harness.log 2>&1; \
-	echo "harness-check OK in $$(( $$(date +%s) - started ))s: the plugin harness is its own image, files only, and the runtime image carries none of it; no fixed password or hash is in its files; its compose writes three plugins, each beside its sidecar, one started again after failing first ($$restarts restart); its runner signs in with the password drawn for the run, sets a plugin's settings, defines an account and links it through the plugin's own form, taking what the page offered from the page; store street prints as expected, the dollar pulled from the master and the three other records it names listed as ones the book cannot use and one completed at the Instruments page, an MCP client connected on a delegation covering the deployment admin alone lists core's tools and no plugin's, is refused a completion without a note by path, completes a record through dashboard__complete_instruments whose history names the person and the client, and Connected clients lists its calls; nothing for the account left unlinked, which the dashboard counts ($$unlinked); a second plugin is opened at write once the admin is granted it, and store book prints the book empty; the custody plugin writes its storage as a user that is not root and finds it again in a new container, and the plugins holding no edge role have none"
+	echo "harness-check OK in $$(( $$(date +%s) - started ))s: the plugin harness is its own image, files only, and the runtime image carries none of it; no fixed password or hash is in its files; its compose writes five plugins, each beside its sidecar, one started again after failing first ($$restarts restart), one declaring v25 registering the declaration its sidecar holds it to and one differing refused naming the difference; its runner signs in with the password drawn for the run, sets a plugin's settings, defines an account and links it through the plugin's own form, taking what the page offered from the page; store street prints as expected, the dollar pulled from the master and the three other records it names listed as ones the book cannot use and one completed at the Instruments page, an MCP client connected on a delegation covering the deployment admin alone lists core's tools and no plugin's, is refused a completion without a note by path, completes a record through dashboard__complete_instruments whose history names the person and the client, and Connected clients lists its calls; nothing for the account left unlinked, which the dashboard counts ($$unlinked); a second plugin is opened at write once the admin is granted it, and store book prints the book empty; the custody plugin writes its storage as a user that is not root and finds it again in a new container, and the plugins holding no edge role have none"
 
 # Tickets inside a deployment (contract v13), end to end on the plugin
 # harness: core's stand-in as custody, operations and a plugin holding no

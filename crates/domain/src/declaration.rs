@@ -1,6 +1,8 @@
-//! A version's declaration (W8.1, W4.8, contract v11): as the CLI sends it
-//! with an upload, as the catalogue lists it, and as a plugin's Summary
-//! draws it beside the names not carried it saw.
+//! A version's declaration (W8.1, W4.8, contract v11): as the SDK prints it
+//! and the CLI sends it with an upload, as the catalogue lists it, and as a
+//! harness's sidecar reads it from a file to hold registration to it (W4.1,
+//! contract v25). The dashboard draws it on the Documentation tab's
+//! Reference.
 //!
 //! What a version still declares beside its roles
 //! (spec/vendor-differences-have-a-place-in-the-contract, requirements 16, 19

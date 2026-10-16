@@ -28,6 +28,14 @@ the same image with the list on stdin:
       archive beside it (contract v16): a volume of its own at the path
       MERIDIAN_ARCHIVE_DIR names, as the launcher gives an allowed instance
       its directory of a local archive. The first is the runner's plugin.
+      One listed with `"declaration": PATH` -- the SDK's JSON as
+      `meridian-declaration <module:attr>` prints it from the plugin's image,
+      what an upload carries -- has its registration held to it, as a
+      launched plugin's is to its version's (W4.1, contract v25): its sidecar
+      refuses a registration differing from it, naming the first difference.
+      PATH is a file as compose reads a bind mount's source, relative to the
+      directory of the first compose file. A plugin declaring v25 without
+      one registers unchecked, as on any sidecar no launch made.
 
   ready [--seconds N]
       Until the plugin has registered with its sidecar and the dashboard lists
@@ -1094,11 +1102,16 @@ def plugins_listed(text):
     for at, plugin in enumerate(listed):
         where = f"plugin {at + 1}"
         if not isinstance(plugin, dict) or not {"instance", "image", "roles"} <= set(plugin) \
-                or set(plugin) - {"instance", "image", "roles", "archive"}:
-            raise Failed(f"{where} is an object of instance, image and roles, and archive where it "
-                         "is allowed one, and nothing else")
+                or set(plugin) - {"instance", "image", "roles", "archive", "declaration"}:
+            raise Failed(f"{where} is an object of instance, image and roles, archive where it "
+                         "is allowed one and declaration where it is held to one, and nothing else")
         if "archive" in plugin and plugin["archive"] is not True:
             raise Failed(f"{where}'s archive is true where it is allowed one, and absent otherwise")
+        if "declaration" in plugin and (not isinstance(plugin["declaration"], str)
+                                        or not plugin["declaration"]
+                                        or re.search(r"[\s$:]", plugin["declaration"])):
+            raise Failed(f"{where}'s declaration is the path of the SDK's declaration JSON, "
+                         "with no space, colon or $")
         name, image, roles = plugin["instance"], plugin["image"], plugin["roles"]
         if not isinstance(name, str) or not INSTANCE_NAME.fullmatch(name):
             raise Failed(f"{where}'s instance {name!r} is not lower case letters, digits and inner hyphens, "
@@ -1176,6 +1189,17 @@ def compose(args):
             "volumes": ["keys:/keys:ro", "secrets:/secrets:ro"],
             "networks": ["harness"],
         }
+        # Its registration held to the declaration an upload carries (W4.1,
+        # contract v25), where it is given one.
+        if plugin.get("declaration"):
+            # A bind mount: compose reads a bare name as a named volume.
+            source = plugin["declaration"]
+            if not source.startswith(("/", "./", "../")):
+                source = "./" + source
+            services[f"sidecar-{name}"]["volumes"].append(
+                f"{source}:/declaration/declaration.json:ro")
+            services[f"sidecar-{name}"]["environment"]["MERIDIAN_PLUGIN_DECLARATION"] = \
+                "/declaration/declaration.json"
         # The plugin, in its sidecar's network namespace as a plugin is in
         # its sidecar's pod, and started again when it exits failing, as a
         # pod's container is: a plugin whose first call comes before the
