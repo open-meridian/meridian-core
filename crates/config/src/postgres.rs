@@ -1123,10 +1123,15 @@ impl Store for PostgresStore {
             .collect()
     }
 
-    fn record_plugin_version(&self, version: &PluginVersion) -> Result<bool> {
+    fn record_plugin_version_documented(
+        &self,
+        version: &PluginVersion,
+        documentation: &[meridian_domain::v1::DocumentationText],
+    ) -> Result<bool> {
         let metadata = version.metadata.clone().unwrap_or_default();
-        let written = self
-            .conn()?
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        let written = tx
             .execute(
                 "INSERT INTO config_plugin_version
                         (name, version, roles, interface, sdk_version, image_digest,
@@ -1154,7 +1159,48 @@ impl Store for PostgresStore {
                 ],
             )
             .map_err(unavailable)?;
-        Ok(written == 1)
+        if written != 1 {
+            return Ok(false);
+        }
+        // The vendor's texts, in the order given, with the version (W8.1,
+        // contract v25); never replaced, since the version is not.
+        for (ordinal, text) in documentation.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO config_plugin_documentation (name, version, section, ordinal, markdown)
+                 VALUES ($1, $2, $3, $4, $5)",
+                &[
+                    &metadata.name,
+                    &metadata.version,
+                    &text.section,
+                    &(ordinal as i32),
+                    &text.markdown,
+                ],
+            )
+            .map_err(unavailable)?;
+        }
+        tx.commit().map_err(unavailable)?;
+        Ok(true)
+    }
+
+    fn plugin_documentation(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<Vec<meridian_domain::v1::DocumentationText>> {
+        Ok(self
+            .conn()?
+            .query(
+                "SELECT section, markdown FROM config_plugin_documentation
+                  WHERE name = $1 AND version = $2 ORDER BY ordinal",
+                &[&name, &version],
+            )
+            .map_err(unavailable)?
+            .into_iter()
+            .map(|row| meridian_domain::v1::DocumentationText {
+                section: row.get(0),
+                markdown: row.get(1),
+            })
+            .collect())
     }
 
     fn retire_plugin_version(

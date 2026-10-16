@@ -424,6 +424,52 @@ fn a_version_is_recorded_once_and_read_back_whole() {
 }
 
 #[test]
+fn a_versions_documentation_is_written_with_it_in_order_and_never_replaced() {
+    // Contract v25 (W8.1): the texts in the same transaction as the version.
+    use meridian_domain::v1::DocumentationText;
+    let store = store("documentation");
+    let text = |section: &str, markdown: &str| DocumentationText {
+        section: section.into(),
+        markdown: markdown.into(),
+    };
+    let texts = vec![
+        text("overview", "# SnapTrade\n\nReads brokerage accounts."),
+        text("setup", "Enter the client id."),
+        text("terms", "SnapTrade's terms apply."),
+    ];
+    assert!(store
+        .record_plugin_version_documented(&version("snaptrade", "0.1.0"), &texts)
+        .unwrap());
+    assert_eq!(
+        store.plugin_documentation("snaptrade", "0.1.0").unwrap(),
+        texts
+    );
+    assert!(!store
+        .record_plugin_version_documented(
+            &version("snaptrade", "0.1.0"),
+            &[text("overview", "Other words.")]
+        )
+        .unwrap());
+    assert_eq!(
+        store.plugin_documentation("snaptrade", "0.1.0").unwrap(),
+        texts,
+        "a version's texts are never replaced"
+    );
+    // A version with none, and one never recorded, read none.
+    assert!(store
+        .record_plugin_version(&version("snaptrade", "0.2.0"))
+        .unwrap());
+    assert!(store
+        .plugin_documentation("snaptrade", "0.2.0")
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .plugin_documentation("snaptrade", "9.9.9")
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
 fn a_version_is_retired_once_its_row_kept_and_who_did_it_recorded() {
     // Contract v25 (W8.15): the retirement written once beside the version.
     let store = store("retire");

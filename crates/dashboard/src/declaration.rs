@@ -38,6 +38,30 @@ pub struct Declared {
     /// from a version declaring none.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub affirmation_deadline: u32,
+    /// From contract v25 (W8.1) what registration sends, as protobuf's JSON
+    /// of its messages ([`crate::protojson`]): every setting, the interface
+    /// and its tools, and whether it reads external accounts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub settings: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reads_external_accounts: bool,
+    /// Each section of the vendor's documentation, by its fixed name, its
+    /// digest and its size (contract v25); the texts travel beside it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub documentation: Vec<DeclaredSection>,
+}
+
+/// One section of the vendor's documentation as an upload's declaration
+/// names it (W8.1, contract v25).
+#[derive(Debug, Default, Clone, serde::Deserialize, serde::Serialize)]
+pub struct DeclaredSection {
+    pub name: String,
+    pub digest: String,
+    pub bytes: u64,
 }
 
 fn is_zero(value: &u32) -> bool {
@@ -220,7 +244,37 @@ pub fn from_json(declared: &Declared) -> Result<PluginDeclaration, String> {
             })
             .collect(),
         affirmation_deadline: declared.affirmation_deadline,
-        ..PluginDeclaration::default()
+        // Contract v25 (W8.1): the whole of what registration sends, and the
+        // documentation's sections by digest.
+        settings: declared
+            .settings
+            .iter()
+            .enumerate()
+            .map(|(n, setting)| {
+                crate::protojson::setting_from(setting, &format!("declaration.settings[{n}]"))
+            })
+            .collect::<Result<_, _>>()?,
+        interface: declared
+            .interface
+            .as_ref()
+            .map(|interface| crate::protojson::interface_from(interface, "declaration.interface"))
+            .transpose()?,
+        tools: declared
+            .tools
+            .iter()
+            .enumerate()
+            .map(|(n, tool)| crate::protojson::tool_from(tool, &format!("declaration.tools[{n}]")))
+            .collect::<Result<_, _>>()?,
+        reads_external_accounts: declared.reads_external_accounts,
+        documentation: declared
+            .documentation
+            .iter()
+            .map(|section| meridian_pb::v1::DocumentationSection {
+                name: section.name.clone(),
+                digest: section.digest.clone(),
+                bytes: section.bytes,
+            })
+            .collect(),
     })
 }
 
@@ -316,6 +370,17 @@ pub fn to_json(declaration: &PluginDeclaration) -> serde_json::Value {
         })).collect::<Vec<_>>(),
         // Contract v25 (W11.34): minutes after midnight, 0 for none.
         "affirmation_deadline": declaration.affirmation_deadline,
+        // Contract v25 (W8.1): what registration sends, as protobuf's JSON,
+        // and the documentation's sections by digest.
+        "settings": declaration.settings.iter().map(crate::protojson::setting_json).collect::<Vec<_>>(),
+        "interface": declaration.interface.as_ref().map(crate::protojson::interface_json),
+        "tools": declaration.tools.iter().map(crate::protojson::tool_json).collect::<Vec<_>>(),
+        "reads_external_accounts": declaration.reads_external_accounts,
+        "documentation": declaration.documentation.iter().map(|section| serde_json::json!({
+            "name": section.name,
+            "digest": section.digest,
+            "bytes": section.bytes,
+        })).collect::<Vec<_>>(),
     })
 }
 

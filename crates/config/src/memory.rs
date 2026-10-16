@@ -50,6 +50,10 @@ pub struct MemoryStore {
     link_changes: Mutex<Vec<ConnectivityLinkChange>>,
     map_changes: Mutex<Vec<VenueAccountMapChange>>,
     catalogues: Mutex<Vec<(i64, VenueCatalogue)>>,
+    /// Each version's documentation as uploaded (W8.1, contract v25).
+    documentation: Mutex<
+        std::collections::BTreeMap<(String, String), Vec<meridian_domain::v1::DocumentationText>>,
+    >,
     /// Each declaration of the licensed schemes, in order (W3.28, v25).
     licensed_schemes: Mutex<Vec<(Vec<String>, Author, i64)>>,
     /// Who retired each version, through what (W8.15, contract v25).
@@ -87,6 +91,7 @@ impl MemoryStore {
             catalogues: Mutex::new(Vec::new()),
             retirements: Mutex::new(Default::default()),
             licensed_schemes: Mutex::new(Vec::new()),
+            documentation: Mutex::new(Default::default()),
         }
     }
 
@@ -559,7 +564,11 @@ impl Store for MemoryStore {
             .collect())
     }
 
-    fn record_plugin_version(&self, version: &PluginVersion) -> Result<bool> {
+    fn record_plugin_version_documented(
+        &self,
+        version: &PluginVersion,
+        documentation: &[meridian_domain::v1::DocumentationText],
+    ) -> Result<bool> {
         let mut state = self.state.lock().expect("store lock poisoned");
         let metadata = version.metadata.clone().unwrap_or_default();
         let recorded = state.catalogue.versions.iter().any(|held| {
@@ -571,7 +580,25 @@ impl Store for MemoryStore {
             return Ok(false);
         }
         state.catalogue.versions.push(version.clone());
+        self.documentation
+            .lock()
+            .expect("store lock poisoned")
+            .insert((metadata.name, metadata.version), documentation.to_vec());
         Ok(true)
+    }
+
+    fn plugin_documentation(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<Vec<meridian_domain::v1::DocumentationText>> {
+        Ok(self
+            .documentation
+            .lock()
+            .expect("store lock poisoned")
+            .get(&(name.to_string(), version.to_string()))
+            .cloned()
+            .unwrap_or_default())
     }
 
     fn retire_plugin_version(

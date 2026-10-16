@@ -150,6 +150,24 @@ fn conductor(bus: &Bus) {
         if metadata.roles.iter().any(|r| r == "dashboard") {
             return Err("`dashboard` is one of the deployment's own components".into());
         }
+        // Contract v25: the SDK's declaration read whole, and the texts
+        // carried beside it for the conductor to hold to its digests.
+        if metadata.version == "0.5.0" {
+            let declaration = metadata.declaration.clone().unwrap_or_default();
+            let carried = declaration.settings.len() == 1
+                && declaration.settings[0].name == "region"
+                && declaration.interface.as_ref().map(|i| i.loopback_port) == Some(8000)
+                && declaration.tools.len() == 1
+                && declaration.reads_external_accounts
+                && declaration.documentation.len() == 1
+                && declaration.documentation[0].bytes == 5
+                && request.documentation.len() == 1
+                && request.documentation[0].section == "overview"
+                && request.documentation[0].markdown == "# Hi\n";
+            if !carried {
+                return Err(format!("not carried whole: {request:?}"));
+            }
+        }
         Ok((
             "meridian.v1.PluginVersion".into(),
             PluginVersion {
@@ -559,6 +577,47 @@ async fn an_upload_is_recorded_for_the_admin_once_its_image_is_there() {
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // Contract v25: the declaration as the SDK prints it (protobuf's JSON
+    // for its settings, interface and tools) and the texts from its docs/.
+    let mut documented: serde_json::Value =
+        serde_json::from_str(&upload_body("0.5.0", DIGEST, &["custody"])).unwrap();
+    documented["declaration"] = serde_json::json!({
+        "secret_settings": [],
+        "settings": [{"name": "region", "label": "Region", "type": "SETTING_TYPE_STRING"}],
+        "interface": {"loopback_port": 8000, "title": "SnapTrade",
+                      "pages": [{"path": "/admin/connections", "title": "Connections",
+                                 "levels": ["ACCESS_LEVEL_ADMIN"]}]},
+        "tools": [{"name": "read_connections", "title": "Read the connections",
+                   "description": "Each connection.", "method": "GET",
+                   "path": "/admin/connections", "levels": ["ACCESS_LEVEL_ADMIN"],
+                   "reads": true}],
+        "reads_external_accounts": true,
+        "documentation": [{"name": "overview",
+            "digest": format!("sha256:{}", "c".repeat(64)), "bytes": 5}],
+    });
+    documented["documentation"] =
+        serde_json::json!([{"section": "overview", "markdown": "# Hi\n"}]);
+    let (status, _, body) = send(
+        &h,
+        "POST",
+        "/terminal/plugins",
+        Some(&h.ada),
+        &documented.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    // A text naming a field the CLI never sends is refused, not dropped.
+    documented["documentation"][0]["html"] = serde_json::json!("<p>Hi</p>");
+    let (status, _, body) = send(
+        &h,
+        "POST",
+        "/terminal/plugins",
+        Some(&h.ada),
+        &documented.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -366,8 +366,36 @@ fn told(snapshot: &Snapshot, plugin_instance_id: &str) -> PluginConfiguration {
         connectivity_link: connectivity.connectivity_link,
         connectivity_links: connectivity.connectivity_links,
         venue_account_map: connectivity.venue_account_map,
-        declaration: None,
+        declaration: launched_declaration(snapshot, plugin_instance_id),
+        launched: snapshot
+            .catalogue
+            .launches
+            .iter()
+            .any(|launch| launch.instance_id == plugin_instance_id),
     }
+}
+
+/// The declaration the instance's launched version was uploaded with (W4.1,
+/// contract v25), which its sidecar holds the plugin's registration to;
+/// none for an instance not launched from the catalogue, or a version
+/// uploaded with none.
+fn launched_declaration(
+    snapshot: &Snapshot,
+    plugin_instance_id: &str,
+) -> Option<meridian_pb::v1::PluginDeclaration> {
+    let launch = snapshot
+        .catalogue
+        .launches
+        .iter()
+        .find(|launch| launch.instance_id == plugin_instance_id)?;
+    snapshot
+        .catalogue
+        .versions
+        .iter()
+        .filter_map(|version| version.metadata.as_ref())
+        .find(|metadata| metadata.name == launch.name && metadata.version == launch.version)?
+        .declaration
+        .clone()
 }
 
 /// What a sidecar is told about its plugin, derived from one snapshot:
@@ -2405,4 +2433,43 @@ pub fn serve_with(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod declaration_tests {
+    use meridian_domain::v1::{PluginLaunch, PluginMetadata, PluginVersion};
+    use meridian_pb::v1::PluginDeclaration;
+
+    use super::*;
+
+    /// W4.1 (contract v25): a sidecar is told the declaration of the version
+    /// its instance was launched from, and no other version's.
+    #[test]
+    fn a_sidecar_is_told_its_launched_versions_declaration() {
+        let version = |version: &str, secret: &str| PluginVersion {
+            metadata: Some(PluginMetadata {
+                name: "snaptrade".into(),
+                version: version.into(),
+                declaration: Some(PluginDeclaration {
+                    secret_settings: vec![secret.into()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut snapshot = Snapshot::default();
+        snapshot.catalogue.versions = vec![version("0.1.0", "old"), version("0.2.0", "new")];
+        snapshot.catalogue.launches = vec![PluginLaunch {
+            instance_id: "snaptrade-1".into(),
+            name: "snaptrade".into(),
+            version: "0.2.0".into(),
+            ..Default::default()
+        }];
+        let launched = told(&snapshot, "snaptrade-1");
+        assert!(launched.launched);
+        assert_eq!(launched.declaration.unwrap().secret_settings, ["new"]);
+        let harnessed = told(&snapshot, "other-1");
+        assert!(!harnessed.launched && harnessed.declaration.is_none());
+    }
 }

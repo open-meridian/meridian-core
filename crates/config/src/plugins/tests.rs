@@ -899,3 +899,202 @@ async fn an_affirmation_deadline_is_operations_and_a_time_of_day() {
     );
     upload(&bus, with(&["custody"], 0, "0.1.3")).await.unwrap();
 }
+
+/// A version naming its documentation, with the texts the CLI read.
+fn documented(version: &str, texts: &[(&str, &str)]) -> RecordPluginUploadRequest {
+    use sha2::Digest;
+    let mut request = snaptrade(version);
+    request.metadata.as_mut().unwrap().declaration = Some(meridian_pb::v1::PluginDeclaration {
+        documentation: texts
+            .iter()
+            .map(
+                |(section, markdown)| meridian_pb::v1::DocumentationSection {
+                    name: section.to_string(),
+                    digest: format!(
+                        "sha256:{}",
+                        hex::encode(sha2::Sha256::digest(markdown.as_bytes()))
+                    ),
+                    bytes: markdown.len() as u64,
+                },
+            )
+            .collect(),
+        ..Default::default()
+    });
+    request.documentation = texts
+        .iter()
+        .map(
+            |(section, markdown)| meridian_domain::v1::DocumentationText {
+                section: section.to_string(),
+                markdown: markdown.to_string(),
+            },
+        )
+        .collect();
+    request
+}
+
+async fn documentation(
+    bus: &Bus,
+    version: &str,
+) -> Result<meridian_domain::v1::ReadPluginDocumentationReply, String> {
+    ask(
+        bus,
+        PLUGIN_DOCUMENTATION,
+        "meridian.v1.ReadPluginDocumentationRequest",
+        meridian_domain::v1::ReadPluginDocumentationRequest {
+            name: "snaptrade".into(),
+            version: version.into(),
+        },
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_versions_documentation_is_kept_with_it_and_read_before_launch() {
+    let (bus, _) = harness();
+    let mut request = documented(
+        "0.1.0",
+        &[
+            ("overview", "# SnapTrade\n\nReads your brokerage accounts."),
+            ("setup", "Enter the client id."),
+        ],
+    );
+    // Sent out of order: kept in the declaration's.
+    request.documentation.reverse();
+    upload(&bus, request).await.unwrap();
+    let read = documentation(&bus, "0.1.0").await.unwrap();
+    assert_eq!(read.uploaded_by, ADA);
+    assert_eq!(read.uploaded_at_ns, 1_790_380_800_000_000_000);
+    assert_eq!(read.declaration.unwrap().documentation.len(), 2);
+    let sections: Vec<&str> = read
+        .documentation
+        .iter()
+        .map(|t| t.section.as_str())
+        .collect();
+    assert_eq!(sections, ["overview", "setup"]);
+    assert_eq!(read.documentation[1].markdown, "Enter the client id.");
+    // Never replaced: the same version again is refused and the texts stand.
+    let again = upload(&bus, documented("0.1.0", &[("overview", "Other words.")]))
+        .await
+        .unwrap_err();
+    assert!(again.contains("already recorded"), "{again}");
+    assert_eq!(
+        documentation(&bus, "0.1.0")
+            .await
+            .unwrap()
+            .documentation
+            .len(),
+        2
+    );
+    // A version that carried none reads none; one not recorded is refused.
+    upload(&bus, snaptrade("0.2.0")).await.unwrap();
+    let none = documentation(&bus, "0.2.0").await.unwrap();
+    assert!(none.documentation.is_empty() && none.declaration.is_none());
+    let missing = documentation(&bus, "9.9.9").await.unwrap_err();
+    assert!(missing.contains("not in the catalogue"), "{missing}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_uploads_texts_are_held_to_what_its_declaration_names() {
+    let (bus, _) = harness();
+    let big = "x".repeat(65_536);
+    let cases: Vec<(&str, Breaking)> = vec![
+        (
+            "not one of the sections",
+            Box::new(|r| {
+                *r = documented("0.1.0", &[("readme", "Hello.")]);
+            }),
+        ),
+        (
+            "named twice",
+            Box::new(|r| {
+                *r = documented("0.1.0", &[("setup", "A."), ("setup", "B.")]);
+            }),
+        ),
+        (
+            "is not what the declaration names",
+            Box::new(|r| r.documentation[0].markdown.push('!')),
+        ),
+        (
+            "which the declaration does not name",
+            Box::new(|r| {
+                r.documentation
+                    .push(meridian_domain::v1::DocumentationText {
+                        section: "terms".into(),
+                        markdown: "No warranty.".into(),
+                    })
+            }),
+        ),
+        (
+            "sent twice",
+            Box::new(|r| {
+                let first = r.documentation[0].clone();
+                r.documentation.push(first);
+            }),
+        ),
+        ("sent no text for it", Box::new(|r| r.documentation.clear())),
+        (
+            "not `sha256:<hex>`",
+            Box::new(|r| {
+                r.metadata
+                    .as_mut()
+                    .unwrap()
+                    .declaration
+                    .as_mut()
+                    .unwrap()
+                    .documentation[0]
+                    .digest = "md5:abc".into()
+            }),
+        ),
+        (
+            "a section is 1 to 65536",
+            Box::new(|r| {
+                r.metadata
+                    .as_mut()
+                    .unwrap()
+                    .declaration
+                    .as_mut()
+                    .unwrap()
+                    .documentation[0]
+                    .bytes = 65_537
+            }),
+        ),
+        (
+            "at most 262144",
+            Box::new(move |r| {
+                let big = "x".repeat(65_536);
+                *r = documented(
+                    "0.1.0",
+                    &[
+                        ("overview", &big),
+                        ("setup", &big),
+                        ("troubleshooting", &big),
+                        ("terms", &big),
+                        ("pages", "y"),
+                    ],
+                );
+            }),
+        ),
+    ];
+    for (says, breaking) in cases {
+        let mut request = documented("0.1.0", &[("overview", "What it does.")]);
+        breaking(&mut request);
+        let refused = upload(&bus, request).await.unwrap_err();
+        assert!(refused.contains(says), "{says}: {refused}");
+    }
+    assert!(catalogue(&bus).await.versions.is_empty());
+    // Every section at its most, 256 KiB in all, is admitted.
+    upload(
+        &bus,
+        documented(
+            "0.1.0",
+            &[
+                ("overview", &big),
+                ("setup", &big),
+                ("troubleshooting", &big),
+                ("terms", &big),
+            ],
+        ),
+    )
+    .await
+    .unwrap();
+}

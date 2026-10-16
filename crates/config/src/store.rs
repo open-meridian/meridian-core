@@ -814,7 +814,27 @@ pub trait Store: Send + Sync {
     /// Record an uploaded version, unless that name and version is recorded
     /// already: false then, and the recorded one stands. An uploaded version
     /// is never replaced (W8).
-    fn record_plugin_version(&self, version: &PluginVersion) -> Result<bool>;
+    fn record_plugin_version(&self, version: &PluginVersion) -> Result<bool> {
+        self.record_plugin_version_documented(version, &[])
+    }
+
+    /// [`Store::record_plugin_version`], keeping the vendor's documentation
+    /// with it in the same step (W8.1, contract v25), in the order given,
+    /// never replaced: nothing is written when the version is recorded
+    /// already.
+    fn record_plugin_version_documented(
+        &self,
+        version: &PluginVersion,
+        documentation: &[meridian_domain::v1::DocumentationText],
+    ) -> Result<bool>;
+
+    /// A version's documentation as uploaded, in the order kept; none for a
+    /// version that carried none, or one not recorded.
+    fn plugin_documentation(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<Vec<meridian_domain::v1::DocumentationText>>;
 
     /// Retire a recorded version (W8.15, contract v25): its record kept,
     /// marked once with who retired it, through which delegation and client,

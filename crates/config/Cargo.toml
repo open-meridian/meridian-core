@@ -22,6 +22,10 @@ meridian-pb.workspace = true
 # (decisions/020), compiled in as the sidecar's are.
 meridian-sidecar = { path = "../sidecar" }
 prost.workspace = true
+# A version's documentation held to the digests its declaration names (W8.1,
+# contract v25). Already in the tree.
+sha2.workspace = true
+hex.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 postgres.workspace = true

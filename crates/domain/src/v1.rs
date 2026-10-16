@@ -14634,6 +14634,12 @@ pub struct PluginConfiguration {
     /// with none.
     #[prost(message, optional, tag = "12")]
     pub declaration: ::core::option::Option<::meridian_pb::v1::PluginDeclaration>,
+    /// The conductor holds a launch of this instance, live or not (W8.3,
+    /// contract v25): its sidecar refuses a plugin declaring v25 whose version
+    /// was uploaded with no declaration (W4.1). False only for a sidecar no
+    /// launch made, as a test harness starts one.
+    #[prost(bool, tag = "13")]
+    pub launched: bool,
 }
 /// Something in a plugin's configuration changed; its sidecar asks again.
 /// Carries no setting, so every sidecar may hear it.

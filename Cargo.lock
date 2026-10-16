@@ -1786,6 +1786,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chacha20poly1305",
+ "hex",
  "meridian-access",
  "meridian-bus",
  "meridian-clock",
@@ -1798,6 +1799,7 @@ dependencies = [
  "r2d2",
  "r2d2_postgres",
  "rand 0.8.8",
+ "sha2 0.10.9",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

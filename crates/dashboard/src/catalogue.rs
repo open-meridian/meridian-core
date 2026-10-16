@@ -476,6 +476,19 @@ struct Upload {
     /// (W8.1, contract v11); none from a CLI or a plugin before v11.
     #[serde(default)]
     declaration: Option<crate::declaration::Declared>,
+    /// The vendor's texts from the image's `docs/` (W8.1, contract v25),
+    /// each held by the conductor to the digest and size its declaration
+    /// names; none from a CLI before v25.
+    #[serde(default)]
+    documentation: Vec<UploadedSection>,
+}
+
+/// One section's text as the CLI read it from the built image.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UploadedSection {
+    section: String,
+    markdown: String,
 }
 
 async fn upload(
@@ -546,7 +559,14 @@ async fn upload(
             declaration,
         }),
         image_digest: upload.image_digest,
-        documentation: Vec::new(),
+        documentation: upload
+            .documentation
+            .into_iter()
+            .map(|text| meridian_domain::v1::DocumentationText {
+                section: text.section,
+                markdown: text.markdown,
+            })
+            .collect(),
     };
     let recorded: Result<PluginVersion, String> = ask(
         &app,

@@ -40,3 +40,18 @@ CREATE TABLE IF NOT EXISTS config_licensed_schemes_change (
     changed_at_ns      bigint    NOT NULL,
     note               text      NOT NULL DEFAULT ''
 );
+
+-- A version's documentation as uploaded (W8.1, contract v25; the plan's
+-- `config_plugin_documentation`): each section the vendor wrote, its
+-- Markdown exactly as the image's docs/ held it, in the declaration's order,
+-- written with the version and never replaced; the declaration names each
+-- by digest and size. No version before v25 carried any.
+CREATE TABLE IF NOT EXISTS config_plugin_documentation (
+    name     text    NOT NULL,
+    version  text    NOT NULL,
+    section  text    NOT NULL CHECK (section IN ('overview', 'setup', 'troubleshooting', 'terms', 'pages')),
+    ordinal  integer NOT NULL,
+    markdown text    NOT NULL,
+    PRIMARY KEY (name, version, section),
+    FOREIGN KEY (name, version) REFERENCES config_plugin_version
+);

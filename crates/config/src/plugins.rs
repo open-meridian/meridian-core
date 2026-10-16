@@ -21,8 +21,9 @@ use meridian_bus::{Bus, Envelope};
 use meridian_domain::v1::{
     AllowArchiveRequest, CreatePluginReply, CreatePluginRequest, LaunchPluginRequest,
     PluginArchive, PluginCatalogue, PluginCatalogueRequest, PluginLaunch, PluginLaunchState,
-    PluginMetadata, PluginVersion, RecordPluginUploadRequest, RemovePluginReply,
-    RemovePluginRequest, RetirePluginVersionRequest, StopPluginRequest, WithdrawArchiveRequest,
+    PluginMetadata, PluginVersion, ReadPluginDocumentationReply, ReadPluginDocumentationRequest,
+    RecordPluginUploadRequest, RemovePluginReply, RemovePluginRequest, RetirePluginVersionRequest,
+    StopPluginRequest, WithdrawArchiveRequest,
 };
 use meridian_pb::v1::PluginDeclaration;
 use meridian_sidecar::Contract;
@@ -43,6 +44,8 @@ pub const CREATE_PLUGIN: &str = "platform.deployment.command.create-plugin";
 pub const REMOVE_PLUGIN: &str = "platform.deployment.command.remove-plugin";
 /// W8.15 (contract v25): a version retired from the catalogue.
 pub const RETIRE_PLUGIN_VERSION: &str = "platform.config.command.retire-plugin-version";
+/// W8.2 (contract v25): one version's declaration and documentation.
+pub const PLUGIN_DOCUMENTATION: &str = "platform.config.query.plugin-documentation";
 
 /// What the conductor asks of the deployment's own registry, as it reaches it
 /// inside the cluster (spec/the-local-plugin-registry): from contract v25,
@@ -178,6 +181,16 @@ pub fn upload(
     if let Some(declaration) = &metadata.declaration {
         declared(declaration, &metadata.roles)?;
     }
+    // The vendor's documentation (W8.1, contract v25): the texts held to
+    // the sections the declaration names, by digest and size.
+    documented(
+        metadata
+            .declaration
+            .as_ref()
+            .map(|declaration| declaration.documentation.as_slice())
+            .unwrap_or_default(),
+        &request.documentation,
+    )?;
     if !is_digest(&request.image_digest) {
         return Err(format!(
             "`{}` is not an image digest; a version is recorded by `sha256:<hex>`",
@@ -185,6 +198,107 @@ pub fn upload(
         ));
     }
     Ok(metadata)
+}
+
+/// The fixed sections of a version's documentation, in the order it is
+/// drawn (W8.1, contract v25): each `docs/<name>.md`.
+pub const SECTIONS: [&str; 5] = ["overview", "setup", "troubleshooting", "terms", "pages"];
+
+/// The most bytes a version's documentation holds in all (W8.1).
+pub const MOST_DOCUMENTATION_BYTES: u64 = 262_144;
+
+/// A version's documentation held to its declaration (W8.1, contract v25):
+/// each section a fixed one, named once, 1 to 64 KiB, the bundle at most
+/// 256 KiB; each text sent for a section the declaration names, its SHA-256
+/// and size the declaration's; and every section named sent. Refused naming
+/// the section.
+fn documented(
+    sections: &[meridian_pb::v1::DocumentationSection],
+    texts: &[meridian_domain::v1::DocumentationText],
+) -> Result<(), String> {
+    use meridian_pb::bounds::{
+        DOCUMENTATION_SECTION_BYTES_RANGE, PLUGIN_DECLARATION_DOCUMENTATION_COUNT,
+    };
+    use sha2::Digest;
+    if !PLUGIN_DECLARATION_DOCUMENTATION_COUNT.admits(sections.len()) {
+        return Err(format!(
+            "declaration.documentation names {} sections; at most {}",
+            sections.len(),
+            PLUGIN_DECLARATION_DOCUMENTATION_COUNT.most
+        ));
+    }
+    let mut total = 0u64;
+    for (n, section) in sections.iter().enumerate() {
+        if !SECTIONS.contains(&section.name.as_str()) {
+            return Err(format!(
+                "declaration.documentation[{n}] is {:?}, not one of the sections {}",
+                section.name,
+                SECTIONS.join(", ")
+            ));
+        }
+        if sections[..n].iter().any(|held| held.name == section.name) {
+            return Err(format!(
+                "declaration.documentation[{n}]: the section {} is named twice",
+                section.name
+            ));
+        }
+        if !is_digest(&section.digest) {
+            return Err(format!(
+                "declaration.documentation[{n}].digest is not `sha256:<hex>`"
+            ));
+        }
+        if !DOCUMENTATION_SECTION_BYTES_RANGE.admits(section.bytes as i64) {
+            return Err(format!(
+                "the section {} is {} bytes; a section is 1 to {} (64 KiB)",
+                section.name, section.bytes, DOCUMENTATION_SECTION_BYTES_RANGE.most
+            ));
+        }
+        total += section.bytes;
+    }
+    if total > MOST_DOCUMENTATION_BYTES {
+        return Err(format!(
+            "the documentation holds {total} bytes in all; at most {MOST_DOCUMENTATION_BYTES} \
+             (256 KiB)"
+        ));
+    }
+    for (n, text) in texts.iter().enumerate() {
+        let Some(section) = sections.iter().find(|held| held.name == text.section) else {
+            return Err(format!(
+                "documentation[{n}] is the section {:?}, which the declaration does not name",
+                text.section
+            ));
+        };
+        if texts[..n].iter().any(|held| held.section == text.section) {
+            return Err(format!(
+                "documentation[{n}]: the section {} is sent twice",
+                text.section
+            ));
+        }
+        let digest = format!(
+            "sha256:{}",
+            hex::encode(sha2::Sha256::digest(text.markdown.as_bytes()))
+        );
+        if digest != section.digest || text.markdown.len() as u64 != section.bytes {
+            return Err(format!(
+                "the section {}'s text is not what the declaration names: {} bytes, {digest}, \
+                 where it names {} bytes, {}",
+                text.section,
+                text.markdown.len(),
+                section.bytes,
+                section.digest
+            ));
+        }
+    }
+    if let Some(missing) = sections
+        .iter()
+        .find(|section| !texts.iter().any(|text| text.section == section.name))
+    {
+        return Err(format!(
+            "the declaration names the section {} and the upload sent no text for it",
+            missing.name
+        ));
+    }
+    Ok(())
 }
 
 /// A version's declaration (W8.1, contract v11): what it does not carry
@@ -443,9 +557,24 @@ impl Plugins {
             source_registry: "local".to_string(),
             ..PluginVersion::default()
         };
+        // The texts in the declaration's order, kept with the version in the
+        // same step, never replaced (contract v25).
+        let declared_order: Vec<String> = metadata
+            .declaration
+            .as_ref()
+            .map(|declaration| {
+                declaration
+                    .documentation
+                    .iter()
+                    .map(|s| s.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut texts = request.documentation.clone();
+        texts.sort_by_key(|text| declared_order.iter().position(|name| *name == text.section));
         if !self
             .store
-            .record_plugin_version(&version)
+            .record_plugin_version_documented(&version, &texts)
             .map_err(|f| f.to_string())?
         {
             return Err(format!(
@@ -826,6 +955,39 @@ impl Plugins {
         Ok(stopped)
     }
 
+    /// W8.2 (contract v25): one version's declaration and the vendor's texts,
+    /// launched or not, retired or not.
+    fn documentation(
+        &self,
+        request: ReadPluginDocumentationRequest,
+    ) -> Result<ReadPluginDocumentationReply, String> {
+        let snapshot = self.snapshot()?;
+        let held = snapshot
+            .catalogue
+            .versions
+            .iter()
+            .find(|held| {
+                held.metadata
+                    .as_ref()
+                    .is_some_and(|m| m.name == request.name && m.version == request.version)
+            })
+            .ok_or_else(|| {
+                format!(
+                    "{} {} is not in the catalogue",
+                    request.name, request.version
+                )
+            })?;
+        Ok(ReadPluginDocumentationReply {
+            declaration: held.metadata.as_ref().and_then(|m| m.declaration.clone()),
+            documentation: self
+                .store
+                .plugin_documentation(&request.name, &request.version)
+                .map_err(|f| f.to_string())?,
+            uploaded_by: held.uploaded_by.clone(),
+            uploaded_at_ns: held.uploaded_at_ns,
+        })
+    }
+
     /// W8.15 (contract v25; decision 59): retire a version no instance runs
     /// or ran and no record names, with a note -- recorded, its image then
     /// released from the deployment's own registry.
@@ -1034,6 +1196,16 @@ pub fn serve_plugins_reaching(
             catalogue.versions.retain(|held| held.retired_at_ns == 0);
             Ok(catalogue)
         },
+    );
+    answer_on(
+        &bus,
+        &plugins,
+        PLUGIN_DOCUMENTATION,
+        (
+            "meridian.v1.ReadPluginDocumentationRequest",
+            "meridian.v1.ReadPluginDocumentationReply",
+        ),
+        |plugins, request: ReadPluginDocumentationRequest, _| plugins.documentation(request),
     );
     answer_on(
         &bus,
