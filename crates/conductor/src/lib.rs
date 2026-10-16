@@ -45,6 +45,7 @@
 pub mod assertions;
 pub mod calendars;
 pub mod local_registry;
+pub mod oci;
 pub mod platform;
 pub mod reference;
 pub mod usage;

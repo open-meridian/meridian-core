@@ -1983,7 +1983,18 @@ chart-check:
 	done; \
 	! $(HELM) template check deploy/chart $$base --set backup.recipient=age1check --set backup.path=/b --set backup.database=maybe >/dev/null 2>&1 \
 		|| { echo "chart-check FAILED: backup.database=maybe rendered; it takes true, false or nothing" >&2; exit 1; }
-	@echo "chart-check OK: four components, the dashboard and the three ways it signs people in, the key and the settings key on the conductor alone, both key paths, refusals, migrations, no pinned uid, a plugin held to its side of the pod, its front door open to the dashboard alone, an Ingress only when asked for and HTTPS alone unless plain HTTP is, development only when asked for, the live shape there alone, a backup only when sealed and placed, and nothing an upgrade leaves behind"
+	@# Contract v25 (W8.10): the platform's keys reach the conductor alone,
+	@# as files it verifies against; none, and the registries are not reached.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
+	keyed="$$($(HELM) template check deploy/chart $$base --set-string 'registries.platformKeys[0]=-----BEGIN PUBLIC KEY-----' 2>/dev/null)" \
+		|| { echo "chart-check FAILED: the chart does not render with a platform key" >&2; exit 1; }; \
+	echo "$$keyed" | grep -q 'key-0.pem: |' \
+		|| { echo "chart-check FAILED: a platform key renders no ConfigMap entry" >&2; exit 1; }; \
+	[ "$$(echo "$$keyed" | grep -c 'name: MERIDIAN_PLATFORM_KEYS_DIR')" = 1 ] \
+		|| { echo "chart-check FAILED: the platform's keys reach other than the conductor alone" >&2; exit 1; }; \
+	! $(HELM) template check deploy/chart $$base 2>/dev/null | grep -q 'MERIDIAN_PLATFORM_KEYS_DIR\|platform-keys' \
+		|| { echo "chart-check FAILED: no platform key still renders the keys' volume or variable" >&2; exit 1; }
+	@echo "chart-check OK: the platform's keys on the conductor alone, as files, only where the chart carries some; four components, the dashboard and the three ways it signs people in, the key and the settings key on the conductor alone, both key paths, refusals, migrations, no pinned uid, a plugin held to its side of the pod, its front door open to the dashboard alone, an Ingress only when asked for and HTTPS alone unless plain HTTP is, development only when asked for, the live shape there alone, a backup only when sealed and placed, and nothing an upgrade leaves behind"
 
 lint:
 	@$(DOCKER) build -f Dockerfile.rust --target lint $(VERDICT) . >/dev/null 2>&1 \

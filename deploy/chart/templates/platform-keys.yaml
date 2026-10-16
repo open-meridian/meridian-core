@@ -1,0 +1,20 @@
+{{- include "meridian-runtime.require" . -}}
+{{- if and .Values.registry.enabled .Values.registries.platformKeys }}
+{{/*
+  The platform's public keys (contract v25; the spec's requirement 23), for
+  the conductor to verify what it installs from a registry, offline: the
+  listing statement, the provenance, the image's metadata and the signing
+  keys' status. Public halves only; nothing here is a secret.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "meridian-runtime.fullname" . }}-platform-keys
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+data:
+  {{- range $n, $key := .Values.registries.platformKeys }}
+  key-{{ $n }}.pem: |
+    {{- $key | trim | nindent 4 }}
+  {{- end }}
+{{- end }}

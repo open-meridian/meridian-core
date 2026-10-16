@@ -29,7 +29,8 @@ use meridian_config::PostgresStore;
 use meridian_domain::v1::{EnrolWithCodeRequest, EnrolmentState};
 use meridian_runtime::{
     bus_from_env, clock, key_at, now_ns, on_runtime, platform_from_env, report_forever, required,
-    shutdown, var, wait_for_store, PlatformUpstream, Ready, RegistryRelease, Wait,
+    shutdown, var, wait_for_store, PlatformRegistries, PlatformUpstream, Ready, RegistryRelease,
+    Wait,
 };
 
 fn main() {
@@ -234,13 +235,31 @@ fn run() -> Result<(), String> {
                 }
                 None => None,
             };
-        meridian_config::serve_plugins_reaching(
+        // Contract v25 (W8.10 to W8.12, W5.19): the community and verified
+        // registries, where the chart carries the platform's keys and the
+        // deployment's own registry is reached: the catalogue pulled hourly,
+        // installs verified against those keys, and the weekly plugin usage
+        // report.
+        let registries = registries_from_env(&platform, &store);
+        if let Some(hold) = &registries {
+            tokio::spawn(meridian_config::registries::usage::pull_hourly(Arc::clone(
+                hold,
+            )));
+            tokio::spawn(
+                Arc::new(meridian_config::registries::usage::UsageSender::new(
+                    Arc::clone(hold),
+                ))
+                .start(Arc::clone(&bus)),
+            );
+        }
+        meridian_config::serve_plugins_and_registries(
             Arc::clone(&bus),
             Arc::clone(&store),
             clock(),
             var("MERIDIAN_REGISTRY_ADDRESS").unwrap_or_else(|| "localhost:5000".into()),
             archive,
             local_registry,
+            registries,
         );
 
         // W3.3: a person's ask about a record, from the dashboard. Nothing
@@ -313,6 +332,51 @@ fn run() -> Result<(), String> {
         tracing::info!("stopping");
         Ok(())
     })
+}
+
+/// The registries' hold, where the chart carries the platform's keys
+/// (`MERIDIAN_PLATFORM_KEYS_DIR`, each `*.pem`) and the deployment's own
+/// registry is reached (`MERIDIAN_REGISTRY_UPSTREAM`); none otherwise, said
+/// once, and the registry rows answer that the deployment reaches none.
+fn registries_from_env(
+    platform: &Arc<meridian_conductor::Platform>,
+    store: &Arc<dyn meridian_config::Store>,
+) -> Option<Arc<meridian_config::registries::Hold>> {
+    let (Some(dir), Some(upstream)) = (
+        var("MERIDIAN_PLATFORM_KEYS_DIR"),
+        var("MERIDIAN_REGISTRY_UPSTREAM"),
+    ) else {
+        tracing::info!("no platform keys or no registry: the community and verified registries are not reached");
+        return None;
+    };
+    let keys = meridian_runtime::platform_keys_at(&dir)
+        .and_then(|pems| meridian_config::registries::verify::PlatformKeys::from_pems(&pems));
+    let keys = match keys {
+        Ok(keys) if !keys.is_empty() => keys,
+        Ok(_) => {
+            tracing::warn!(
+                dir,
+                "the chart carries no platform key: the registries are not reached"
+            );
+            return None;
+        }
+        Err(failed) => {
+            tracing::warn!(%failed, "the platform's keys did not read: the registries are not reached");
+            return None;
+        }
+    };
+    match PlatformRegistries::new(Arc::clone(platform), &upstream) {
+        Ok(registries) => Some(Arc::new(meridian_config::registries::Hold::new(
+            Arc::new(registries),
+            keys,
+            Arc::clone(store),
+            clock(),
+        ))),
+        Err(failed) => {
+            tracing::warn!(%failed, "the registries are not reached");
+            None
+        }
+    }
 }
 
 /// Answer what the wizard shows before anything is redeemed.

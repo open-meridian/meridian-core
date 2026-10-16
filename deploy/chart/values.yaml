@@ -388,6 +388,17 @@ registry:
   # Unique on a cluster: two deployments on one cluster need two ports.
   hostPort: 5000
 
+# The community and verified registries (contract v25,
+# spec/plugins-are-shared-through-registries). What a deployment installs
+# from them is verified offline by the conductor against the platform's
+# public keys, carried here by each chart release: the current one and the
+# next, so the platform's key can rotate without a gap (requirement 23). Each
+# an ECDSA P-256 public key as PEM. Empty, nothing is installed from a
+# registry: the Browse tab says the deployment reaches none. The release
+# fills them; an install changes them only to follow a published rotation.
+registries:
+  platformKeys: []
+
 # What launches the plugins a deployment admin uploads and approves (W8.3),
 # creating each a Deployment in the chart's plugin shape and nothing else
 # (decisions/019). On with the registry it launches from, and with the broker

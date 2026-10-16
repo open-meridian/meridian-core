@@ -21,6 +21,7 @@
 //! which the conductor's binary implements over HTTPS; everything decided
 //! is decided here.
 
+pub mod usage;
 pub mod verify;
 pub mod wire;
 

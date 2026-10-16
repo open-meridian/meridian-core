@@ -20,6 +20,9 @@ ed25519-dalek.workspace = true
 base64.workspace = true
 rand.workspace = true
 reqwest.workspace = true
+# A listed version's bytes checked against their digests as they are copied
+# (oci.rs, contract v25). Already in the tree.
+sha2.workspace = true
 async-trait.workspace = true
 tokio = { workspace = true }
 

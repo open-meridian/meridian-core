@@ -119,6 +119,12 @@ spec:
             # where a retired version's image is released (W8.15).
             - name: MERIDIAN_REGISTRY_UPSTREAM
               value: {{ printf "http://%s-registry.%s.svc.cluster.local:5000" (include "meridian-runtime.fullname" .) .Release.Namespace | quote }}
+            {{- if .Values.registries.platformKeys }}
+            # The platform's public keys (platform-keys.yaml): what is
+            # installed from a registry is verified against them (W8.10).
+            - name: MERIDIAN_PLATFORM_KEYS_DIR
+              value: /etc/meridian/platform-keys
+            {{- end }}
             {{- end }}
             - name: MERIDIAN_INSTANCE_ID
               value: {{ include "meridian-runtime.fullname" . }}-conductor
@@ -167,6 +173,11 @@ spec:
             - name: settings-key
               mountPath: /run/meridian/settings-key
               readOnly: true
+            {{- if and .Values.registry.enabled .Values.registries.platformKeys }}
+            - name: platform-keys
+              mountPath: /etc/meridian/platform-keys
+              readOnly: true
+            {{- end }}
             {{- include "meridian-runtime.readyMount" . | nindent 12 }}
             {{- if include "meridian-runtime.generatedKey" . }}
             # The key this component made, in a volume only it mounts. Writable,
@@ -179,6 +190,11 @@ spec:
             {{- toYaml .Values.resources | nindent 12 }}
       volumes:
         {{- include "meridian-runtime.readyVolume" . | nindent 8 }}
+        {{- if and .Values.registry.enabled .Values.registries.platformKeys }}
+        - name: platform-keys
+          configMap:
+            name: {{ include "meridian-runtime.fullname" . }}-platform-keys
+        {{- end }}
         {{- if include "meridian-runtime.generatedKey" . }}
         - name: key
           persistentVolumeClaim:
