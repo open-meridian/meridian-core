@@ -980,7 +980,7 @@ pub const LINES_PATH: &str = "/admin/instruments/migration";
 pub struct UncertainLine {
     pub instrument_ids: Vec<String>,
     pub answered: String,
-    pub why: &'static str,
+    pub why: String,
 }
 
 /// The migration's lines still to make, from the provisional records (W3.26;
@@ -999,6 +999,9 @@ pub fn migration_lines(
         .flat_map(|conflict| conflict.instrument_ids.iter().map(String::as_str))
         .collect();
     let mut by_answer: BTreeMap<&str, Vec<(&str, bool)>> = BTreeMap::new();
+    // What the platform's answer contradicts of a person's (contract v25):
+    // each field with the person's value, which the line shows.
+    let mut contradicted: BTreeMap<&str, Vec<String>> = BTreeMap::new();
     for item in &listed.instruments {
         let Some(record) = item.instrument.as_ref() else {
             continue;
@@ -1015,6 +1018,50 @@ pub fn migration_lines(
             .entry(item.answered_instrument_id.as_str())
             .or_default()
             .push((record.instrument_id.as_str(), section == S::HeldBack));
+        let fields: Vec<String> = item
+            .contradicted_fields
+            .iter()
+            .map(|field| {
+                let (name, value) = match meridian_domain::v1::InstrumentField::try_from(*field) {
+                    Ok(meridian_domain::v1::InstrumentField::AssetClass) => (
+                        "asset class",
+                        meridian_domain::v1::AssetClass::try_from(record.asset_class)
+                            .map(|class| {
+                                class
+                                    .as_str_name()
+                                    .trim_start_matches("ASSET_CLASS_")
+                                    .to_ascii_lowercase()
+                            })
+                            .unwrap_or_default(),
+                    ),
+                    Ok(meridian_domain::v1::InstrumentField::Currency) => {
+                        ("currency", record.currency.clone())
+                    }
+                    Ok(meridian_domain::v1::InstrumentField::Description) => {
+                        ("description", record.description.clone())
+                    }
+                    Ok(meridian_domain::v1::InstrumentField::InstrumentType) => (
+                        "type",
+                        meridian_domain::v1::InstrumentType::try_from(record.instrument_type)
+                            .map(|kind| {
+                                kind.as_str_name()
+                                    .trim_start_matches("INSTRUMENT_TYPE_")
+                                    .to_ascii_lowercase()
+                            })
+                            .unwrap_or_default(),
+                    ),
+                    _ => ("a field", String::new()),
+                };
+                if value.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{name} {value}")
+                }
+            })
+            .collect();
+        if !fields.is_empty() {
+            contradicted.insert(record.instrument_id.as_str(), fields);
+        }
     }
     let mut exact = Vec::new();
     let mut uncertain = Vec::new();
@@ -1023,7 +1070,7 @@ pub fn migration_lines(
             uncertain.push(UncertainLine {
                 instrument_ids: records.iter().map(|(id, _)| id.to_string()).collect(),
                 answered: answered.to_string(),
-                why: "a duplicate: two records answered by one",
+                why: "a duplicate: two records answered by one".into(),
             });
             continue;
         }
@@ -1032,13 +1079,25 @@ pub fn migration_lines(
             uncertain.push(UncertainLine {
                 instrument_ids: vec![id.to_string()],
                 answered: answered.to_string(),
-                why: "held back",
+                why: "held back".into(),
             });
         } else if conflicted.contains(id) {
             uncertain.push(UncertainLine {
                 instrument_ids: vec![id.to_string()],
                 answered: answered.to_string(),
-                why: "an identifier meets another record",
+                why: "an identifier meets another record".into(),
+            });
+        } else if let Some(fields) = contradicted.get(id) {
+            // Contract v25 (W3.26): the platform's answer contradicts what a
+            // person set or accepted -- a line of its own, the person's
+            // value shown.
+            uncertain.push(UncertainLine {
+                instrument_ids: vec![id.to_string()],
+                answered: answered.to_string(),
+                why: format!(
+                    "the platform's answer contradicts what a person set: {}",
+                    fields.join(", ")
+                ),
             });
         } else {
             exact.push(id.to_string());
@@ -1133,7 +1192,7 @@ fn lines_controls(listed: &ListInstrumentsToCompleteReply, token: &str) -> (Stri
                     shown = escape(&line.instrument_ids.join(", ")),
                     checked = if n == 0 { " checked" } else { "" },
                     answer = escape(&line.answered),
-                    why = escape(line.why),
+                    why = escape(&line.why),
                 )
             })
             .collect();
@@ -2629,6 +2688,49 @@ mod provisional_tests {
         assert!(dialogs.contains("value=\"LCL-USD1,LCL-USD2\""));
         assert!(dialogs.contains("action=\"/admin/instruments/migration\""));
         assert!(dialogs.contains("data-prepare"));
+    }
+
+    /// Contract v25 (W3.26): a line whose platform answer contradicts what a
+    /// person set is uncertain, its own, the person's value shown.
+    #[test]
+    fn a_platform_value_contradicting_a_persons_is_an_uncertain_line_of_its_own() {
+        use meridian_domain::v1::{InstrumentField, MigrationSection as S};
+        let listed = ListInstrumentsToCompleteReply {
+            instruments: vec![
+                InstrumentToComplete {
+                    instrument: Some(InstrumentRecord {
+                        instrument_id: "LCL-A".into(),
+                        provisional: true,
+                        ..Default::default()
+                    }),
+                    migration_section: S::Matched as i32,
+                    answered_instrument_id: "INS-A".into(),
+                    ..Default::default()
+                },
+                InstrumentToComplete {
+                    instrument: Some(InstrumentRecord {
+                        instrument_id: "LCL-GBP".into(),
+                        provisional: true,
+                        currency: "GBP".into(),
+                        ..Default::default()
+                    }),
+                    migration_section: S::Matched as i32,
+                    answered_instrument_id: "INS-GBP".into(),
+                    contradicted_fields: vec![InstrumentField::Currency as i32],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let (exact, uncertain) = migration_lines(&listed);
+        assert_eq!(exact, vec!["LCL-A".to_string()]);
+        assert_eq!(uncertain.len(), 1);
+        assert_eq!(uncertain[0].instrument_ids, vec!["LCL-GBP".to_string()]);
+        assert!(
+            uncertain[0].why.contains("currency GBP"),
+            "{}",
+            uncertain[0].why
+        );
     }
 
     #[test]

@@ -1007,6 +1007,18 @@ fn to_complete_json(item: &InstrumentToComplete) -> Value {
     if !item.answered_instrument_id.is_empty() {
         out["answered_instrument_id"] = item.answered_instrument_id.clone().into();
     }
+    // Contract v25 (W3.26): what the platform's answer contradicts of a
+    // person's, an uncertain line of its own.
+    if !item.contradicted_fields.is_empty() {
+        out["contradicted_fields"] = item
+            .contradicted_fields
+            .iter()
+            .map(|field| {
+                enum_name::<meridian_domain::v1::InstrumentField>(*field, |v| v.as_str_name())
+            })
+            .collect::<Vec<_>>()
+            .into();
+    }
     out
 }
 

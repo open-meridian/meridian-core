@@ -229,6 +229,12 @@ pub struct Local {
     pub migration: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub migration_answer: String,
+    /// The fields a person set or accepted on the record that the
+    /// platform's answer contradicts (contract v25, W3.26), by their names:
+    /// an uncertain line of its own, the person's value shown beside the
+    /// platform's. Empty where none is.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contradicted_fields: Vec<String>,
 }
 
 fn is_zero(value: &i32) -> bool {

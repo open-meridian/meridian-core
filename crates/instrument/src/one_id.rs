@@ -487,6 +487,24 @@ fn sourced(field: Field, identifier: Option<Asked>, words: &str, now_ns: i64) ->
 }
 
 /// The values a platform record states, by field.
+/// The fields a person set or accepted on `record` that the platform's
+/// answer `master` contradicts (contract v25, W3.26): its value in force
+/// sourced to a person, and the platform's non-empty and different. In the
+/// order the master's values are read.
+pub fn contradicted_fields(record: &Instrument, master: &InstrumentRecord) -> Vec<Field> {
+    master_values(master)
+        .into_iter()
+        .filter(|(field, said)| {
+            let held = record.value(*field).trim();
+            let by_a_person = record
+                .source_of(*field, None)
+                .is_some_and(|source| !source.person.is_empty());
+            by_a_person && !said.is_empty() && !held.is_empty() && held != said
+        })
+        .map(|(field, _)| field)
+        .collect()
+}
+
 fn master_values(master: &InstrumentRecord) -> Vec<(Field, String)> {
     vec![
         (Field::AssetClass, asset_class_name(master.asset_class)),
@@ -1509,6 +1527,37 @@ mod tests {
             }
             Matched::Answered(answered) => *answered,
         }
+    }
+
+    #[test]
+    fn a_platform_value_contradicting_a_persons_is_named() {
+        // Contract v25 (W3.26): a value in force a person set or accepted,
+        // and the platform's non-empty and different.
+        let platform = master("INS-01J8ZZTP", "BBG001S5N8V8");
+        let mut record = Instrument {
+            instrument_id: "LCL-1".into(),
+            currency: "GBP".into(),
+            description: "ZZ TOP HOLDINGS INC".into(),
+            ..Default::default()
+        };
+        let mut by_person = sourced(Field::Currency, None, "set by a person", 1);
+        by_person.person = "local|ada".into();
+        record.set_source(by_person);
+        record.set_source(sourced(
+            Field::Description,
+            None,
+            "reported by custody-1",
+            1,
+        ));
+        assert_eq!(
+            contradicted_fields(&record, &platform),
+            vec![Field::Currency]
+        );
+        // The same value is no contradiction; nor is a plugin's report.
+        record.currency = "USD".into();
+        assert!(contradicted_fields(&record, &platform).is_empty());
+        record.description = "SOMETHING ELSE".into();
+        assert!(contradicted_fields(&record, &platform).is_empty());
     }
 
     #[test]
