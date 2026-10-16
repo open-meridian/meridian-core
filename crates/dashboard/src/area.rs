@@ -186,6 +186,15 @@ pub fn tabs_by_role(
             .unwrap_or("Home");
         tabs.push(Tab::page(slug(title), title, "/"));
     }
+    // Its version's documentation, the dashboard's, last at every level
+    // (W6.9, contract v25; the documentation plan's Q8).
+    let key = unique(crate::documentation::TAB.into(), &tabs);
+    tabs.push(Tab {
+        key,
+        title: "Documentation".into(),
+        path: String::new(),
+        drawn: true,
+    });
     tabs
 }
 
@@ -512,14 +521,14 @@ mod tests {
             ],
             &[],
         );
-        assert_eq!(titles(open), ["Balances", "Holdings"]);
+        assert_eq!(titles(open), ["Balances", "Holdings", "Documentation"]);
         let manage = tabs_by_role(
             Some(&report),
             AccessLevel::Admin,
             &[("operations".into(), AccessLevel::Admin)],
             &[],
         );
-        assert_eq!(titles(manage), ["Summary", "Settings"]);
+        assert_eq!(titles(manage), ["Summary", "Settings", "Documentation"]);
         let custody_admin = tabs_by_role(
             Some(&report),
             AccessLevel::Admin,
@@ -528,7 +537,7 @@ mod tests {
         );
         assert_eq!(
             titles(custody_admin),
-            ["Summary", "Settings", "Account links"]
+            ["Summary", "Settings", "Account links", "Documentation"]
         );
     }
 
@@ -553,25 +562,34 @@ mod tests {
                 "summary ",
                 "settings ",
                 "connections /admin/connections",
-                "account-links /admin/accounts"
+                "account-links /admin/accounts",
+                "documentation "
             ]
         );
         let manage = tabs(Some(&snaptrade), AccessLevel::Admin, &[]);
         assert!(manage[0].drawn && manage[0].title == "Summary");
         assert!(manage[1].drawn && manage[1].title == "Settings");
-        assert!(manage[2..].iter().all(|tab| !tab.drawn));
+        let (last, pages) = manage[2..].split_last().unwrap();
+        assert!(pages.iter().all(|tab| !tab.drawn));
+        assert!(
+            last.drawn && last.title == "Documentation",
+            "last at every level"
+        );
         assert!(
             [AccessLevel::Write, AccessLevel::Read]
                 .into_iter()
                 .all(|level| tabs(Some(&snaptrade), level, &[])
                     .iter()
-                    .all(|tab| !tab.drawn)),
-            "no Summary or Settings under Open or View"
+                    .all(|tab| !tab.drawn || tab.key == crate::documentation::TAB)),
+            "no Summary or Settings under Open or View: the Documentation tab alone is drawn there"
         );
-        assert_eq!(titles(AccessLevel::Write), ["statements /statements"]);
+        assert_eq!(
+            titles(AccessLevel::Write),
+            ["statements /statements", "documentation "]
+        );
         assert_eq!(
             titles(AccessLevel::Read),
-            ["statements /statements"],
+            ["statements /statements", "documentation "],
             "one URL for Open and View"
         );
     }
@@ -581,7 +599,7 @@ mod tests {
     ) {
         let only_admin = report(&[("/admin", "Admin", ADMIN)]);
         let open = tabs(Some(&only_admin), AccessLevel::Write, &[]);
-        assert_eq!(open.len(), 1);
+        assert_eq!(open.len(), 2, "its root and the Documentation tab");
         assert_eq!(
             (open[0].path.as_str(), open[0].title.as_str()),
             ("/", "SnapTrade")
@@ -593,7 +611,11 @@ mod tests {
             .collect();
         assert_eq!(
             keys,
-            [(SUMMARY.to_string(), true), (SETTINGS.to_string(), true)]
+            [
+                (SUMMARY.to_string(), true),
+                (SETTINGS.to_string(), true),
+                (crate::documentation::TAB.to_string(), true)
+            ]
         );
         assert_eq!(tabs(None, AccessLevel::Read, &[])[0].path, "/");
     }
@@ -605,7 +627,7 @@ mod tests {
             ..report(&[])
         };
         let manage = tabs(Some(&older), AccessLevel::Admin, &[]);
-        assert_eq!(manage.len(), 3);
+        assert_eq!(manage.len(), 4, "with the Documentation tab last");
         assert!(manage[0].drawn && manage[1].drawn);
         assert_eq!(
             (manage[2].path.as_str(), manage[2].title.as_str()),
@@ -617,7 +639,7 @@ mod tests {
         };
         let manage = tabs(Some(&newer), AccessLevel::Admin, &[]);
         assert!(
-            manage.len() == 2 && manage.iter().all(|tab| tab.drawn),
+            manage.len() == 3 && manage.iter().all(|tab| tab.drawn),
             "the dashboard's tabs alone"
         );
     }
@@ -645,7 +667,8 @@ mod tests {
                 "settings",
                 "settings-2",
                 "settings-3",
-                "summary-2"
+                "summary-2",
+                "documentation"
             ]
         );
     }
@@ -790,12 +813,19 @@ mod tests {
                     "Account links".to_string(),
                     false
                 ),
+                (
+                    "documentation".to_string(),
+                    "Documentation".to_string(),
+                    true
+                ),
             ]
         );
+        // No table's tab under Open or View: the Documentation tab alone is
+        // drawn there (contract v25).
         for level in [AccessLevel::Write, AccessLevel::Read] {
             assert!(tabs(Some(&report), level, &tables)
                 .iter()
-                .all(|tab| !tab.drawn));
+                .all(|tab| !tab.drawn || tab.key == crate::documentation::TAB));
         }
     }
 
@@ -840,7 +870,9 @@ mod tests {
              <a href=\"/plugins/snaptrade?level=admin&amp;tab=connections\" data-tab=\"connections\" \
              data-page=\"/admin/connections\">Connections</a>\
              <a href=\"/plugins/snaptrade?level=admin&amp;tab=account-links\" data-tab=\"account-links\" \
-             data-page=\"/admin/accounts\">Account links</a>"
+             data-page=\"/admin/accounts\">Account links</a>\
+             <a href=\"/plugins/snaptrade?level=admin&amp;tab=documentation\" data-tab=\"documentation\" \
+             data-drawn>Documentation</a>"
         );
         assert!(page.contains(
             "<div class=\"tab-body\" data-current=\"summary\"><div class=\"area-drawn\" id=\"plugin-page\">\

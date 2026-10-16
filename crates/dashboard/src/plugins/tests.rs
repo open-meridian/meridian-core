@@ -1802,7 +1802,8 @@ async fn under_manage_the_dashboard_draws_summary_then_settings_opens_on_summary
                 "summary".into(),
                 "settings".into(),
                 "connections".into(),
-                "account-links".into()
+                "account-links".into(),
+                "documentation".into()
             ],
             "summary".into()
         )
@@ -2576,4 +2577,204 @@ fn the_claims_carry_each_roles_level_and_accounts_as_positions() {
         .iter()
         .all(|r| r.level == AccessLevel::Read as i32 && r.write_positions.is_empty()));
     assert!(opening(&access, INSTANCE, AccessLevel::Admin).is_none());
+}
+
+/// The launched version's documentation, as the conductor answers it.
+fn serving_documentation(h: &Harness) {
+    h.app.bus.serve(crate::documentation::READ, |_| {
+        Ok((
+            "meridian.v1.ReadPluginDocumentationReply".into(),
+            meridian_domain::v1::ReadPluginDocumentationReply {
+                declaration: Some(meridian_pb::v1::PluginDeclaration {
+                    tools: vec![meridian_pb::v1::ToolDeclaration {
+                        name: "read_connections".into(),
+                        title: "Read the connections".into(),
+                        reads: true,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                documentation: vec![meridian_domain::v1::DocumentationText {
+                    section: "overview".into(),
+                    markdown: "# SnapTrade\n\nReads <script>alert(1)</script> your accounts. \
+                               ![pixel](https://evil.example/p.png) [Docs](https://docs.snaptrade.com/)"
+                        .into(),
+                }],
+                uploaded_by: ADA.into(),
+                uploaded_at_ns: 1_790_380_800_000_000_000,
+            }
+            .encode_to_vec(),
+        ))
+    });
+}
+
+/// W6.9 (contract v25): the Documentation tab at any level, the vendor's
+/// text drawn safely under the documentation's security policy; and a
+/// stopped instance keeps its area with the dashboard's own tabs alone, its
+/// Summary saying it is stopped.
+#[tokio::test]
+async fn a_reader_reads_the_documentation_tab_and_a_stopped_instance_keeps_its_own_tabs() {
+    let h = harness(&[INSTANCE]).await;
+    let mut held = records(&[INSTANCE, "stopped-1"]);
+    held.access_groups[0].entries[1].level = AccessLevel::Admin as i32;
+    h.app.records.store(held, h.app.clock.now_ns());
+    snaptrade_reporting(&h);
+    serving_launched(&h);
+    serving_documentation(&h);
+
+    let view = get(
+        &h.app,
+        DASHBOARD,
+        &format!("/plugins/{INSTANCE}?level=read&tab=documentation"),
+        &[dashboard_cookie(&h)],
+    )
+    .await;
+    assert_eq!(view.status, StatusCode::OK, "{}", view.body);
+    assert_eq!(tab_row(&view.body).1, "documentation");
+    let policy = view.headers["content-security-policy"].to_str().unwrap();
+    assert!(
+        policy.starts_with("default-src 'self'; script-src 'self' 'sha256-"),
+        "{policy}"
+    );
+    // Every inline script the page carries is one the policy names.
+    for script in view.body.split("<script>").skip(1) {
+        let script = script.split("</script>").next().unwrap();
+        use base64::Engine;
+        use sha2::Digest;
+        let hash = base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(script));
+        assert!(
+            policy.contains(&hash),
+            "an inline script the policy does not name"
+        );
+    }
+    let body = view.body.split("</header>").nth(1).unwrap();
+    assert!(body.contains("<h2>SnapTrade</h2>"), "{body}");
+    assert!(
+        body.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+        "{body}"
+    );
+    assert!(body.contains("[image not shown: pixel]") && !body.contains("evil.example"));
+    assert!(body.contains("(docs.snaptrade.com)"), "{body}");
+    assert!(body.contains("Local and community plugins are unsupervised."));
+    let reference = get(
+        &h.app,
+        DASHBOARD,
+        &format!("/plugins/{INSTANCE}?level=read&tab=documentation&section=reference&part=tools"),
+        &[dashboard_cookie(&h)],
+    )
+    .await;
+    assert!(
+        reference.body.contains("data-tool=\"read_connections\""),
+        "{}",
+        reference.body
+    );
+    // Another tab is not under the documentation's policy.
+    let framed = get(
+        &h.app,
+        DASHBOARD,
+        &format!("/plugins/{INSTANCE}?level=read"),
+        &[dashboard_cookie(&h)],
+    )
+    .await;
+    assert_eq!(
+        framed.headers["content-security-policy"],
+        "frame-ancestors 'self'"
+    );
+
+    // Stopped: Summary, Settings and Documentation, all the dashboard's.
+    let stopped = get(
+        &h.app,
+        DASHBOARD,
+        "/plugins/stopped-1?level=admin",
+        &[dashboard_cookie(&h)],
+    )
+    .await;
+    assert_eq!(stopped.status, StatusCode::OK, "{}", stopped.body);
+    assert_eq!(
+        tab_row(&stopped.body).0,
+        ["summary", "settings", "documentation"]
+    );
+    assert!(stopped.body.contains("data-stopped"), "{}", stopped.body);
+    assert!(!stopped.body.contains("<iframe"), "{}", stopped.body);
+    // An instance the catalogue never launched is still no plugin.
+    let none = get(
+        &h.app,
+        DASHBOARD,
+        "/plugins/never-1?level=read",
+        &[dashboard_cookie(&h)],
+    )
+    .await;
+    assert_ne!(none.status, StatusCode::OK);
+}
+
+/// W8.2 (contract v25): the portal lists every uploaded version, each
+/// linking its Documentation page, readable before a launch; a deployment
+/// admin's alone.
+#[tokio::test]
+async fn a_deployment_admin_reads_a_versions_documentation_before_launching_it() {
+    let h = harness(&[]).await;
+    h.app.records.store(admin_records(), h.app.clock.now_ns());
+    serving_documentation(&h);
+    h.app.bus.serve(crate::catalogue::PLUGIN_CATALOGUE, |_| {
+        Ok((
+            "meridian.v1.PluginCatalogue".into(),
+            meridian_domain::v1::PluginCatalogue {
+                versions: vec![meridian_domain::v1::PluginVersion {
+                    metadata: Some(meridian_domain::v1::PluginMetadata {
+                        name: "snaptrade".into(),
+                        version: "0.1.0".into(),
+                        roles: vec!["custody".into()],
+                        ..Default::default()
+                    }),
+                    uploaded_at_ns: 1_790_380_800_000_000_000,
+                    ..Default::default()
+                }],
+                launches: vec![],
+            }
+            .encode_to_vec(),
+        ))
+    });
+    let listed = get(
+        &h.app,
+        DASHBOARD,
+        "/admin/plugins/versions",
+        &[dashboard_cookie(&h)],
+    )
+    .await;
+    assert_eq!(listed.status, StatusCode::OK, "{}", listed.body);
+    assert!(
+        listed.body.contains(
+            "<a href=\"/admin/plugins/versions/snaptrade/0.1.0/documentation\">snaptrade</a>"
+        ),
+        "{}",
+        listed.body
+    );
+    assert!(listed
+        .body
+        .contains("Naming a plugin here is not an endorsement"));
+    let page = get(
+        &h.app,
+        DASHBOARD,
+        "/admin/plugins/versions/snaptrade/0.1.0/documentation?section=reference",
+        &[dashboard_cookie(&h)],
+    )
+    .await;
+    assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+    assert!(page.headers["content-security-policy"]
+        .to_str()
+        .unwrap()
+        .contains("script-src 'self' 'sha256-"));
+    assert!(page.body.contains("<code>custody</code>"), "{}", page.body);
+
+    // A person who is no deployment admin is refused both.
+    let mut reader = records(&[INSTANCE]);
+    reader.user_groups[0].logins = vec![ADA.into()];
+    h.app.records.store(reader, h.app.clock.now_ns());
+    for path in [
+        "/admin/plugins/versions",
+        "/admin/plugins/versions/snaptrade/0.1.0/documentation",
+    ] {
+        let refused = get(&h.app, DASHBOARD, path, &[dashboard_cookie(&h)]).await;
+        assert_ne!(refused.status, StatusCode::OK, "{path}");
+    }
 }

@@ -120,6 +120,7 @@ fn every_route_of_a_plugins_area_its_holds_and_its_lifecycle_names_its_tool_or_i
         include_str!("../../archive.rs"),
         include_str!("../../area.rs"),
         include_str!("../../plugins.rs"),
+        include_str!("../../documentation.rs"),
     ];
     let mut checked = 0;
     for path in sources.iter().flat_map(|source| routes(source)) {
@@ -154,8 +155,9 @@ fn every_tool_parity_names_is_one_and_every_tool_is_named() {
         );
     }
     // v17's thirteen, v20's read of the accounts an instance may link, and
-    // v25's retirement of a version (W8.15).
-    assert_eq!(SPECS.len(), 15, "the fifteen approved tools");
+    // v25's retirement of a version (W8.15) and read of a version's
+    // documentation (W6.20).
+    assert_eq!(SPECS.len(), 16, "the sixteen approved tools");
 }
 
 /// Contract v25 (W6.20, W6.26, W8.15): retiring a version is a deployment

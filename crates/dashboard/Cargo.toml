@@ -33,6 +33,7 @@ thiserror.workspace = true
 tracing.workspace = true
 tokio = { workspace = true }
 unicode-normalization.workspace = true
+pulldown-cmark.workspace = true
 
 [dev-dependencies]
 # The real sidecar's front door, so a test proves what it verifies.

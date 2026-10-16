@@ -421,7 +421,8 @@ async fn has_manifest(registry: &Registry, name: &str, digest: &str) -> Result<b
 
 // ── The catalogue ───────────────────────────────────────────────────────────
 
-async fn catalogue(app: &App) -> Result<PluginCatalogue, String> {
+/// The whole catalogue, every version and every launch, live or ended.
+pub(crate) async fn catalogue(app: &App) -> Result<PluginCatalogue, String> {
     catalogue_within(app, Duration::from_secs(10)).await
 }
 

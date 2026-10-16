@@ -10,11 +10,8 @@
 
 use meridian_pb::v1::{
     AlgorithmDeclaration, Catalogue, DatasetDeclaration, DatasetLicence, NotCarried,
-    NotCarriedReason, NotCarriedSeen, ObservationMode, PluginDeclaration, RawRecordKind,
-    StorageDeclaration,
+    NotCarriedReason, ObservationMode, PluginDeclaration, RawRecordKind, StorageDeclaration,
 };
-
-use crate::html::escape;
 
 /// The declaration as the CLI sends it, in JSON.
 #[derive(Debug, Default, Clone, serde::Deserialize, serde::Serialize)]
@@ -392,93 +389,6 @@ fn reason_words(reason: i32) -> &'static str {
     }
 }
 
-/// The declaration on a plugin's Summary, with how often each name not
-/// carried was seen: a section of its own, or nothing from a plugin before
-/// v11.
-pub fn summary(declaration: Option<&PluginDeclaration>, seen: &[NotCarriedSeen]) -> String {
-    let Some(declaration) = declaration else {
-        return String::new();
-    };
-    let secrets = if declaration.secret_settings.is_empty() {
-        "none".to_string()
-    } else {
-        declaration
-            .secret_settings
-            .iter()
-            .map(|name| escape(name))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    let storage = match &declaration.storage {
-        None => "none".to_string(),
-        Some(storage) if storage.record_kinds.is_empty() => format!(
-            "its own, for its raw records, kept {} days",
-            storage.retention_days
-        ),
-        // Each kind's window and what is kept of it are drawn in the
-        // records panel (contract v16).
-        Some(storage) => format!(
-            "its own, for {} kinds of raw record, each kept for its window",
-            storage.record_kinds.len()
-        ),
-    };
-    let rows: String = declaration
-        .not_carried
-        .iter()
-        .map(|held| {
-            let count = seen
-                .iter()
-                .find(|seen| seen.scheme == held.scheme && seen.name == held.name)
-                .map(|seen| seen.count)
-                .unwrap_or(0);
-            let why = match NotCarriedReason::try_from(held.reason) {
-                Ok(NotCarriedReason::NoContractMeaning) => "no meaning in the contract yet",
-                Ok(NotCarriedReason::NotConverted) => "not yet converted",
-                _ => "",
-            };
-            format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{why}</td><td>{count}</td></tr>",
-                escape(&held.role),
-                escape(&held.scheme),
-                escape(&held.name),
-            )
-        })
-        .collect();
-    let table = if rows.is_empty() {
-        "<p class=\"hint\">It declares nothing it receives and does not carry.</p>".to_string()
-    } else {
-        format!(
-            "<table class=\"list one-line\"><thead><tr><th>Role</th><th>Scheme</th><th>Name</th>\
-             <th>Why</th><th>Seen</th></tr></thead><tbody>{rows}</tbody></table>"
-        )
-    };
-    // The algorithms its autonomous work may name (contract v22), each by
-    // its identifier with what it is; plain text, escaped.
-    let algorithms = if declaration.algorithms.is_empty() {
-        "none".to_string()
-    } else {
-        declaration
-            .algorithms
-            .iter()
-            .map(|algorithm| {
-                format!(
-                    "{} ({})",
-                    escape(&algorithm.algorithm_id),
-                    escape(&algorithm.description)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    format!(
-        "<section class=\"admin-section\"><div class=\"section-head\"><div><h2>What it declares</h2>\
-         <p class=\"hint\">Its secret settings: {secrets}. Its storage: {storage}. The algorithms \
-         its autonomous work may name: {algorithms}. What it receives \
-         and does not carry, by name only, with how often it saw each since it started; the \
-         counts stay in this deployment.</p></div></div>{table}</section>"
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,41 +449,5 @@ mod tests {
         assert!(from_json(&bad)
             .unwrap_err()
             .contains("catalogue.datasets[0].modes[0]"));
-    }
-
-    #[test]
-    fn the_summary_draws_names_and_counts_never_a_value() {
-        let declaration = PluginDeclaration {
-            secret_settings: vec!["consumer_key".into()],
-            not_carried: vec![NotCarried {
-                role: "custody".into(),
-                scheme: "snaptrade:position".into(),
-                name: "open_pnl".into(),
-                reason: NotCarriedReason::NoContractMeaning as i32,
-            }],
-            storage: Some(StorageDeclaration {
-                retention_days: 30,
-                ..Default::default()
-            }),
-            catalogue: None,
-            algorithms: vec![AlgorithmDeclaration {
-                algorithm_id: "rebalance-drift".into(),
-                description: "Rebalances <a> sleeve past its drift band".into(),
-            }],
-            ..Default::default()
-        };
-        let seen = [NotCarriedSeen {
-            scheme: "snaptrade:position".into(),
-            name: "open_pnl".into(),
-            count: 42,
-        }];
-        let page = summary(Some(&declaration), &seen);
-        assert!(
-            page.contains("consumer_key") && page.contains("open_pnl") && page.contains(">42<")
-        );
-        assert!(page.contains("kept 30 days"));
-        // An algorithm by its identifier and description, escaped.
-        assert!(page.contains("rebalance-drift (Rebalances &lt;a&gt; sleeve past its drift band)"));
-        assert_eq!(summary(None, &seen), "");
     }
 }

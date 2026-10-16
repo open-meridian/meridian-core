@@ -622,6 +622,23 @@ pub const MODE_COOKIE: &str = "meridian_mode";
 /// Before first paint: the person's mode on `<html>`, as the kit reads it;
 /// and `data-script`, which says the page's script runs, so what the chrome's
 /// script shows in a note ([`noted_badge`]) is not also a line of the page.
+/// The page's own inline scripts by their SHA-256, as a content security
+/// policy names them (`'sha256-…'`): what a page under
+/// [`crate::documentation::policy`] may run besides the kit's modules.
+pub fn inline_script_hashes() -> Vec<String> {
+    use base64::Engine;
+    use sha2::Digest;
+    [HEAD_SCRIPT, CHROME_SCRIPT, INBOX_SCRIPT]
+        .iter()
+        .map(|script| {
+            format!(
+                "'sha256-{}'",
+                base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(script))
+            )
+        })
+        .collect()
+}
+
 const HEAD_SCRIPT: &str = "(function(){var r=document.documentElement;\
 r.setAttribute(\"data-script\",\"\");try{var m=document.cookie.match(\
 /(?:^|;\\s*)(?:__Host-)?meridian_mode=(light|dark)(?:;|$)/);\

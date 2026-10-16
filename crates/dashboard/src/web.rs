@@ -133,6 +133,7 @@ pub fn router(app: Arc<App>) -> Router {
         .merge(reset::routes())
         .merge(crate::catalogue::routes())
         .merge(crate::admin::routes())
+        .merge(crate::documentation::routes())
         .merge(crate::first_run::routes())
         .route("/plugins/{instance}", get(crate::plugins::frame))
         // Its archive, a deployment admin's to allow and withdraw from its

@@ -30,6 +30,11 @@ tokio-stream = "0.1"
 # bounds need; the rules themselves are plain matchers, with no regular
 # expression crate. Already in the tree through the URL parser.
 unicode-normalization = "0.1"
+# CommonMark for a plugin's documentation (W6.9, contract v25;
+# plans/a-plugin-carries-its-own-documentation, "The safe subset"): a parser
+# only, its events drawn by the dashboard's own writer, which emits the
+# subset's elements and nothing else; no HTML writer, no binary.
+pulldown-cmark = { version = "0.13", default-features = false }
 
 # The broker the bus runs on, per decision 010. Pinned to a minor version like
 # every other dependency a customer inherits.
