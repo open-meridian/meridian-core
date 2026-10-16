@@ -685,6 +685,32 @@ impl meridian_config::Upstream for PlatformUpstream {
     }
 }
 
+/// The deployment's own registry, as the configuration store's plugin
+/// handlers need it (contract v25, W8.15): a retired version's image
+/// released. Blocking on the runtime it was made on, as [`PlatformUpstream`]
+/// does, from a handler's blocking thread.
+pub struct RegistryRelease {
+    registry: meridian_conductor::local_registry::LocalRegistry,
+}
+
+impl RegistryRelease {
+    pub fn new(base: &str) -> Result<Self, String> {
+        Ok(Self {
+            registry: meridian_conductor::local_registry::LocalRegistry::new(base)?,
+        })
+    }
+}
+
+impl meridian_config::LocalRegistry for RegistryRelease {
+    fn release<'a>(
+        &'a self,
+        repository: &'a str,
+        digest: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(self.registry.release(repository, digest))
+    }
+}
+
 pub fn var(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()

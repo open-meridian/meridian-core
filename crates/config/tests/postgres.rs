@@ -424,6 +424,56 @@ fn a_version_is_recorded_once_and_read_back_whole() {
 }
 
 #[test]
+fn a_version_is_retired_once_its_row_kept_and_who_did_it_recorded() {
+    // Contract v25 (W8.15): the retirement written once beside the version.
+    let store = store("retire");
+    store
+        .record_plugin_version(&version("snaptrade", "0.1.0"))
+        .unwrap();
+    let author = meridian_config::Author {
+        by: "local|ada".into(),
+        delegation: "DLG-1".into(),
+        client: "Claude".into(),
+        note: "never launched".into(),
+        prepared_call_id: String::new(),
+    };
+    let retired = store
+        .retire_plugin_version("snaptrade", "0.1.0", &author, 7)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            retired.retired_by.as_str(),
+            retired.retired_at_ns,
+            retired.retired_note.as_str()
+        ),
+        ("local|ada", 7, "never launched")
+    );
+    assert_eq!(retired.source_registry, "local");
+    assert_eq!(
+        store.retirement("snaptrade", "0.1.0").unwrap(),
+        Some(author.clone())
+    );
+    assert!(
+        store
+            .retire_plugin_version("snaptrade", "0.1.0", &author, 8)
+            .unwrap()
+            .is_none(),
+        "written once"
+    );
+    assert!(store
+        .retire_plugin_version("snaptrade", "9.9.9", &author, 8)
+        .unwrap()
+        .is_none());
+    assert!(store.retirement("snaptrade", "9.9.9").unwrap().is_none());
+    // The row is kept: the name and version stay taken.
+    assert_eq!(store.snapshot().unwrap().catalogue.versions.len(), 1);
+    assert!(!store
+        .record_plugin_version(&version("snaptrade", "0.1.0"))
+        .unwrap());
+}
+
+#[test]
 fn one_live_launch_per_instance_and_it_ends_once() {
     let store = store("launches");
     store

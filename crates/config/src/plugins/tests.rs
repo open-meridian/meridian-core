@@ -704,3 +704,157 @@ async fn core_names_are_reserved_and_an_instance_id_names_one_plugin() {
         .await
         .unwrap();
 }
+
+// ── Retiring a version (W8.15, contract v25) ────────────────────────────────
+
+/// A stand-in for the deployment's own registry, keeping what it released.
+#[derive(Default)]
+struct Releasing(Mutex<Vec<(String, String)>>);
+
+impl LocalRegistry for Releasing {
+    fn release<'a>(
+        &'a self,
+        repository: &'a str,
+        digest: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        self.0
+            .lock()
+            .unwrap()
+            .push((repository.to_string(), digest.to_string()));
+        Box::pin(async { Ok(()) })
+    }
+}
+
+fn harness_releasing() -> (Arc<Bus>, Arc<Releasing>, Arc<MemoryStore>) {
+    let bus = Arc::new(Bus::single(
+        "conductor-1",
+        Arc::new(MemoryBackend::new()),
+        Arc::new(meridian_clock::SystemClock),
+    ));
+    let store = Arc::new(MemoryStore::new());
+    let released = Arc::new(Releasing::default());
+    serve_plugins_reaching(
+        Arc::clone(&bus),
+        store.clone(),
+        Arc::new(At(1_790_380_800_000_000_000)),
+        "localhost:5000".into(),
+        ArchiveGrant::default(),
+        Some(released.clone()),
+    );
+    bus.serve(CREATE_PLUGIN, move |envelope| {
+        let request = CreatePluginRequest::decode(&envelope.payload[..]).unwrap();
+        Ok((
+            "meridian.v1.CreatePluginReply".into(),
+            CreatePluginReply {
+                workload: format!("plugin-{}", request.instance_id),
+            }
+            .encode_to_vec(),
+        ))
+    });
+    bus.serve(REMOVE_PLUGIN, move |_| {
+        Ok((
+            "meridian.v1.RemovePluginReply".into(),
+            RemovePluginReply { removed: true }.encode_to_vec(),
+        ))
+    });
+    (bus, released, store)
+}
+
+async fn retire(bus: &Bus, version: &str, note: &str) -> Result<PluginVersion, String> {
+    ask(
+        bus,
+        RETIRE_PLUGIN_VERSION,
+        "meridian.v1.RetirePluginVersionRequest",
+        meridian_domain::v1::RetirePluginVersionRequest {
+            name: "snaptrade".into(),
+            version: version.into(),
+            note: note.into(),
+        },
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_version_no_instance_ran_is_retired_its_record_kept_and_its_image_released() {
+    let (bus, released, store) = harness_releasing();
+    upload(&bus, snaptrade("0.1.0")).await.unwrap();
+    let mut other = snaptrade("0.2.0");
+    other.image_digest = format!("sha256:{}", "b".repeat(64));
+    upload(&bus, other).await.unwrap();
+
+    let retired = retire(&bus, "0.2.0", "never launched").await.unwrap();
+    assert_eq!(retired.retired_by, ADA);
+    assert_eq!(retired.retired_note, "never launched");
+    assert!(retired.retired_at_ns > 0);
+    // No longer listed, its record kept, and its image released.
+    let listed = catalogue(&bus).await;
+    assert_eq!(listed.versions.len(), 1);
+    assert_eq!(
+        listed.versions[0].metadata.as_ref().unwrap().version,
+        "0.1.0"
+    );
+    assert_eq!(store.snapshot().unwrap().catalogue.versions.len(), 2);
+    assert_eq!(
+        released.0.lock().unwrap().clone(),
+        vec![(
+            "plugins/snaptrade".to_string(),
+            format!("sha256:{}", "b".repeat(64))
+        )]
+    );
+    assert_eq!(
+        store
+            .retirement("snaptrade", "0.2.0")
+            .unwrap()
+            .unwrap()
+            .note,
+        "never launched"
+    );
+    // Never launchable, never replaced, never retired twice.
+    let mut asked = launching("snaptrade-2", &["custody"]);
+    asked.version = "0.2.0".into();
+    let refused = launch(&bus, asked).await.unwrap_err();
+    assert!(refused.contains("retired"), "{refused}");
+    let again = upload(&bus, snaptrade("0.2.0")).await.unwrap_err();
+    assert!(again.contains("already recorded"), "{again}");
+    let twice = retire(&bus, "0.2.0", "again").await.unwrap_err();
+    assert!(twice.contains("retired already"), "{twice}");
+    let unknown = retire(&bus, "9.9.9", "x").await.unwrap_err();
+    assert!(unknown.contains("not in the catalogue"), "{unknown}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_version_an_instance_runs_or_ran_is_refused_naming_each() {
+    let (bus, released, _) = harness_releasing();
+    upload(&bus, snaptrade("0.1.0")).await.unwrap();
+    launch(&bus, launching("snaptrade-1", &["custody"]))
+        .await
+        .unwrap();
+    let running = retire(&bus, "0.1.0", "tidy").await.unwrap_err();
+    assert!(running.contains("snaptrade-1 (running)"), "{running}");
+    // Stopped, its launch is still kept in history and names it.
+    ask::<_, PluginLaunch>(
+        &bus,
+        STOP_PLUGIN,
+        "meridian.v1.StopPluginRequest",
+        StopPluginRequest {
+            instance_id: "snaptrade-1".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let stopped = retire(&bus, "0.1.0", "tidy").await.unwrap_err();
+    assert!(stopped.contains("snaptrade-1 (stopped)"), "{stopped}");
+    assert!(released.0.lock().unwrap().is_empty());
+    assert_eq!(catalogue(&bus).await.versions.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_image_another_version_still_runs_is_not_released() {
+    let (bus, released, _) = harness_releasing();
+    upload(&bus, snaptrade("0.1.0")).await.unwrap();
+    // The same image recorded under a second version.
+    upload(&bus, snaptrade("0.1.1")).await.unwrap();
+    retire(&bus, "0.1.1", "a duplicate").await.unwrap();
+    assert!(released.0.lock().unwrap().is_empty());
+}

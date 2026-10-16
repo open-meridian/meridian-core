@@ -366,7 +366,8 @@ impl Store for PostgresStore {
         for row in tx
             .query(
                 "SELECT name, version, roles, interface, sdk_version, image_digest,
-                        uploaded_by, uploaded_at_ns, declaration
+                        uploaded_by, uploaded_at_ns, declaration, source_registry, listing,
+                        key_status_issued_at_ns, retired_by, retired_at_ns, retired_note
                    FROM config_plugin_version ORDER BY name, version",
                 &[],
             )
@@ -392,8 +393,12 @@ impl Store for PostgresStore {
                 image_digest: row.get(5),
                 uploaded_by: row.get(6),
                 uploaded_at_ns: row.get(7),
-                source_registry: "local".to_string(),
-                ..PluginVersion::default()
+                source_registry: row.get(9),
+                listing: row.get(10),
+                key_status_issued_at_ns: row.get(11),
+                retired_by: row.get(12),
+                retired_at_ns: row.get(13),
+                retired_note: row.get(14),
             });
         }
 
@@ -1125,8 +1130,9 @@ impl Store for PostgresStore {
             .execute(
                 "INSERT INTO config_plugin_version
                         (name, version, roles, interface, sdk_version, image_digest,
-                         uploaded_by, uploaded_at_ns, declaration)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                         uploaded_by, uploaded_at_ns, declaration, source_registry, listing,
+                         key_status_issued_at_ns)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
                  ON CONFLICT (name, version) DO NOTHING",
                 &[
                     &metadata.name,
@@ -1138,10 +1144,80 @@ impl Store for PostgresStore {
                     &version.uploaded_by,
                     &version.uploaded_at_ns,
                     &metadata.declaration.as_ref().map(Message::encode_to_vec),
+                    &if version.source_registry.is_empty() {
+                        "local"
+                    } else {
+                        version.source_registry.as_str()
+                    },
+                    &version.listing,
+                    &version.key_status_issued_at_ns,
                 ],
             )
             .map_err(unavailable)?;
         Ok(written == 1)
+    }
+
+    fn retire_plugin_version(
+        &self,
+        name: &str,
+        version: &str,
+        author: &Author,
+        at_ns: i64,
+    ) -> Result<Option<PluginVersion>> {
+        // Written once: a version retired already is left as it is.
+        let written = self
+            .conn()?
+            .execute(
+                "UPDATE config_plugin_version
+                    SET retired_by = $3, retired_at_ns = $4, retired_note = $5,
+                        retired_through_delegation = $6, retired_client_name = $7,
+                        retired_prepared_call_id = $8
+                  WHERE name = $1 AND version = $2 AND retired_at_ns = 0",
+                &[
+                    &name,
+                    &version,
+                    &author.by,
+                    &at_ns,
+                    &author.note,
+                    &author.delegation,
+                    &author.client,
+                    &author.prepared_call_id,
+                ],
+            )
+            .map_err(unavailable)?;
+        if written != 1 {
+            return Ok(None);
+        }
+        Ok(self
+            .snapshot()?
+            .catalogue
+            .versions
+            .into_iter()
+            .find(|held| {
+                held.metadata
+                    .as_ref()
+                    .is_some_and(|m| m.name == name && m.version == version)
+            }))
+    }
+
+    fn retirement(&self, name: &str, version: &str) -> Result<Option<Author>> {
+        Ok(self
+            .conn()?
+            .query_opt(
+                "SELECT retired_by, retired_through_delegation, retired_client_name,
+                        retired_note, retired_prepared_call_id
+                   FROM config_plugin_version
+                  WHERE name = $1 AND version = $2 AND retired_at_ns <> 0",
+                &[&name, &version],
+            )
+            .map_err(unavailable)?
+            .map(|row| Author {
+                by: row.get(0),
+                delegation: row.get(1),
+                client: row.get(2),
+                note: row.get(3),
+                prepared_call_id: row.get(4),
+            }))
     }
 
     fn begin_launch(&self, launch: &PluginLaunch, note: &str) -> Result<bool> {

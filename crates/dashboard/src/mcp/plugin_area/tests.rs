@@ -153,8 +153,33 @@ fn every_tool_parity_names_is_one_and_every_tool_is_named() {
             spec.name
         );
     }
-    // v17's thirteen, and v20's read of the accounts an instance may link.
-    assert_eq!(SPECS.len(), 14, "the fourteen approved tools");
+    // v17's thirteen, v20's read of the accounts an instance may link, and
+    // v25's retirement of a version (W8.15).
+    assert_eq!(SPECS.len(), 15, "the fifteen approved tools");
+}
+
+/// Contract v25 (W6.20, W6.26, W8.15): retiring a version is a deployment
+/// admin's act with a note, preparable, at may not for agents by default.
+#[test]
+fn retiring_a_version_takes_a_note_is_preparable_and_may_not_by_default() {
+    let spec = SPECS
+        .iter()
+        .find(|spec| spec.name == "retire_plugin_version")
+        .expect("retire_plugin_version");
+    assert!(!spec.reads);
+    let schema = (spec.input_schema)();
+    let required: Vec<&str> = schema["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(required, vec!["name", "version", "note"]);
+    assert!(crate::prepared::CORE_PREPARABLE.contains(&"dashboard__retire_plugin_version"));
+    assert_eq!(
+        crate::prepared::levels::default_for("dashboard__retire_plugin_version"),
+        crate::prepared::levels::Level::MayNot
+    );
 }
 
 /// What changes who holds access: no tool's (the ruling of 2026-10-01).

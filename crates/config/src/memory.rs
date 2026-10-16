@@ -50,6 +50,8 @@ pub struct MemoryStore {
     link_changes: Mutex<Vec<ConnectivityLinkChange>>,
     map_changes: Mutex<Vec<VenueAccountMapChange>>,
     catalogues: Mutex<Vec<(i64, VenueCatalogue)>>,
+    /// Who retired each version, through what (W8.15, contract v25).
+    retirements: Mutex<std::collections::BTreeMap<(String, String), Author>>,
 }
 
 impl MemoryStore {
@@ -81,6 +83,7 @@ impl MemoryStore {
             link_changes: Mutex::new(Vec::new()),
             map_changes: Mutex::new(Vec::new()),
             catalogues: Mutex::new(Vec::new()),
+            retirements: Mutex::new(Default::default()),
         }
     }
 
@@ -566,6 +569,44 @@ impl Store for MemoryStore {
         }
         state.catalogue.versions.push(version.clone());
         Ok(true)
+    }
+
+    fn retire_plugin_version(
+        &self,
+        name: &str,
+        version: &str,
+        author: &Author,
+        at_ns: i64,
+    ) -> Result<Option<PluginVersion>> {
+        let mut state = self.state.lock().expect("store lock poisoned");
+        let Some(held) = state.catalogue.versions.iter_mut().find(|held| {
+            held.metadata
+                .as_ref()
+                .is_some_and(|m| m.name == name && m.version == version)
+        }) else {
+            return Ok(None);
+        };
+        if held.retired_at_ns != 0 {
+            return Ok(None);
+        }
+        held.retired_by = author.by.clone();
+        held.retired_at_ns = at_ns;
+        held.retired_note = author.note.clone();
+        let retired = held.clone();
+        self.retirements
+            .lock()
+            .expect("store lock poisoned")
+            .insert((name.to_string(), version.to_string()), author.clone());
+        Ok(Some(retired))
+    }
+
+    fn retirement(&self, name: &str, version: &str) -> Result<Option<Author>> {
+        Ok(self
+            .retirements
+            .lock()
+            .expect("store lock poisoned")
+            .get(&(name.to_string(), version.to_string()))
+            .cloned())
     }
 
     fn begin_launch(&self, launch: &PluginLaunch, note: &str) -> Result<bool> {

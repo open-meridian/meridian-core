@@ -221,6 +221,14 @@ pub static SPECS: &[Spec] = &[
         stop_schema,
     ),
     spec(
+        "retire_plugin_version",
+        "Retire a plugin version",
+        "retire a version from the catalogue (contract v25, W8.15), with a note: it is no longer listed or launchable and its image is released from the deployment's own registry, its record kept. Refused, naming each, while an instance runs it or a launch kept in history names it.",
+        false,
+        Gate::DeploymentAdmin,
+        retire_schema,
+    ),
+    spec(
         "read_plugin_access",
         "Read who holds access to a plugin",
         "the admin portal's Access tab, read only: the access groups naming the instance, each entry's role and level, the permissions to them, and the user and account groups they join; and, for each of its acts, what agents may do with it (agents_may: may_make, prepare_only or may_not; the ceiling where it caps; each access group's stricter level) and whether it needs a second pair of eyes (contract v20); and each role's runs_as, the service account its autonomous work runs as and the level, or none (contract v21). No tool changes who holds access, sets a level, or chooses what a role runs as.",
@@ -354,6 +362,19 @@ fn stop_schema() -> Value {
     withdraw_archive_schema()
 }
 
+fn retire_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "version": {"type": "string"},
+            "note": note_schema(),
+        },
+        "required": ["name", "version", "note"],
+        "additionalProperties": false,
+    })
+}
+
 // ── Answers as JSON: each row's message by its own field names ──────────
 
 fn enum_or_null(name: Option<&'static str>) -> Value {
@@ -471,6 +492,13 @@ fn version_json(version: &PluginVersion) -> Value {
         "image_digest": version.image_digest,
         "uploaded_by": version.uploaded_by,
         "uploaded_at_ns": version.uploaded_at_ns,
+        // Contract v25 (W8.10, W8.15): where it came from, and a retirement.
+        "source_registry": version.source_registry,
+        "listing": version.listing,
+        "key_status_issued_at_ns": version.key_status_issued_at_ns,
+        "retired_by": version.retired_by,
+        "retired_at_ns": version.retired_at_ns,
+        "retired_note": others_words(&version.retired_note),
     })
 }
 
@@ -799,6 +827,7 @@ pub async fn call(app: &App, caller: &Caller, spec: &Spec, arguments: Value) -> 
         "read_plugin_catalogue" => at.read_plugin_catalogue(&arguments).await,
         "launch_plugin" => at.launch_plugin(&arguments).await,
         "stop_plugin" => at.stop_plugin(&arguments).await,
+        "retire_plugin_version" => at.retire_plugin_version(&arguments).await,
         "read_plugin_access" => at.read_plugin_access(&arguments).await,
         "read_linkable_accounts" => at.read_linkable_accounts(&arguments),
         other => (
@@ -1663,6 +1692,39 @@ impl Context<'_> {
         }
     }
 
+    /// W8.15 (contract v25): a version retired, with its note.
+    async fn retire_plugin_version(&self, arguments: &Value) -> (Value, String) {
+        let mut problems = Problems::default();
+        let Some(top) = top(arguments, &["name", "version", "note"], &mut problems) else {
+            return (problems.refusal(), DEPLOYMENT_ADMIN.into());
+        };
+        let name = text(top, "name", "", true, &mut problems);
+        let version = text(top, "version", "", true, &mut problems);
+        let note = text(top, "note", "", true, &mut problems);
+        if !problems.is_empty() {
+            return (problems.refusal(), DEPLOYMENT_ADMIN.into());
+        }
+        match self
+            .deployment_act::<PluginVersion>(
+                crate::catalogue::RETIRE_PLUGIN_VERSION,
+                "meridian.v1.RetirePluginVersionRequest",
+                meridian_domain::v1::RetirePluginVersionRequest {
+                    name,
+                    version,
+                    note,
+                },
+                RESTARTING,
+            )
+            .await
+        {
+            Ok(version) => (
+                json!({"outcome": "made", "data": version_json(&version)}),
+                DEPLOYMENT_ADMIN.into(),
+            ),
+            Err(refusal) => (refusal, DEPLOYMENT_ADMIN.into()),
+        }
+    }
+
     /// The Access tab, read only: the records naming the instance, by their
     /// own fields (AccessRecords). Nothing here changes any of it.
     fn read_linkable_accounts(&self, arguments: &Value) -> (Value, String) {
@@ -1926,6 +1988,8 @@ pub const PARITY: &[(&str, &str)] = &[
     ),
     ("/terminal/plugins/launch", "launch_plugin"),
     ("/terminal/plugins/stop", "stop_plugin"),
+    // Contract v25 (W8.15): the Installed list's Retire.
+    ("retire a version", "retire_plugin_version"),
     (
         "/terminal/plugins/{instance}/dev/{what}",
         "exception: live development, outside the plugin area",

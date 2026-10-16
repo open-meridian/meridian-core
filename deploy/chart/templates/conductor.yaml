@@ -115,6 +115,10 @@ spec:
             # launched plugin's image is named from (W8.3).
             - name: MERIDIAN_REGISTRY_ADDRESS
               value: {{ printf "localhost:%v" .Values.registry.hostPort | quote }}
+            # And the registry itself, inside the cluster (contract v25):
+            # where a retired version's image is released (W8.15).
+            - name: MERIDIAN_REGISTRY_UPSTREAM
+              value: {{ printf "http://%s-registry.%s.svc.cluster.local:5000" (include "meridian-runtime.fullname" .) .Release.Namespace | quote }}
             {{- end }}
             - name: MERIDIAN_INSTANCE_ID
               value: {{ include "meridian-runtime.fullname" . }}-conductor

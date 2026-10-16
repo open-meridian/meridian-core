@@ -35,6 +35,8 @@ pub const RECORD_PLUGIN_UPLOAD: &str = "platform.config.command.record-plugin-up
 pub const PLUGIN_CATALOGUE: &str = "platform.config.query.plugin-catalogue";
 pub const LAUNCH_PLUGIN: &str = "platform.config.command.launch-plugin";
 pub const STOP_PLUGIN: &str = "platform.config.command.stop-plugin";
+/// W8.15 (contract v25): a version retired from the catalogue.
+pub const RETIRE_PLUGIN_VERSION: &str = "platform.config.command.retire-plugin-version";
 
 /// The deployment's registry, as this pod reaches it inside the cluster.
 pub struct Registry {

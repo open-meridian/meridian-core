@@ -29,7 +29,7 @@ use meridian_config::PostgresStore;
 use meridian_domain::v1::{EnrolWithCodeRequest, EnrolmentState};
 use meridian_runtime::{
     bus_from_env, clock, key_at, now_ns, on_runtime, platform_from_env, report_forever, required,
-    shutdown, var, wait_for_store, PlatformUpstream, Ready, Wait,
+    shutdown, var, wait_for_store, PlatformUpstream, Ready, RegistryRelease, Wait,
 };
 
 fn main() {
@@ -215,12 +215,25 @@ fn run() -> Result<(), String> {
         // W8: the plugin catalogue, and launching from it. Every launch
         // runs an image from the deployment's own registry as each node
         // reaches it, by digest (spec/the-local-plugin-registry).
-        meridian_config::serve_plugins_with(
+        // From contract v25 (W8.15) it reaches the registry inside the
+        // cluster too, where the chart names it, to release a retired
+        // version's image.
+        let local_registry: Option<Arc<dyn meridian_config::LocalRegistry>> =
+            match var("MERIDIAN_REGISTRY_UPSTREAM").map(|base| RegistryRelease::new(&base)) {
+                Some(Ok(release)) => Some(Arc::new(release)),
+                Some(Err(failed)) => {
+                    tracing::warn!(%failed, "the registry is not reached; retired images stay");
+                    None
+                }
+                None => None,
+            };
+        meridian_config::serve_plugins_reaching(
             Arc::clone(&bus),
             Arc::clone(&store),
             clock(),
             var("MERIDIAN_REGISTRY_ADDRESS").unwrap_or_else(|| "localhost:5000".into()),
             archive,
+            local_registry,
         );
 
         // W3.3: a person's ask about a record, from the dashboard. Nothing

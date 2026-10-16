@@ -96,13 +96,15 @@ impl Level {
 /// The order path's two core acts, at may not for agents until the
 /// deployment admin loosens them (contract v22; the order-path plan's
 /// refresh, Q44).
-pub const MAY_NOT_UNTIL_LOOSENED: [&str; 4] = [
+pub const MAY_NOT_UNTIL_LOOSENED: [&str; 5] = [
     "dashboard__set_account_attribute",
     "dashboard__set_trading_instruction",
     // Contract v24 (W11.36): as the trading instruction is.
     "dashboard__set_local_record_orders",
     // Contract v24 (W6.3, W6.20; approved 2026-10-15).
     "dashboard__close_account",
+    // Contract v25 (W6.20): v24's follow-ups, at may not by default.
+    "dashboard__retire_plugin_version",
 ];
 
 /// Core acts an agent may prepare but not make until the deployment admin

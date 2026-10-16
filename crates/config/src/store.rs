@@ -816,6 +816,26 @@ pub trait Store: Send + Sync {
     /// is never replaced (W8).
     fn record_plugin_version(&self, version: &PluginVersion) -> Result<bool>;
 
+    /// Retire a recorded version (W8.15, contract v25): its record kept,
+    /// marked once with who retired it, through which delegation and client,
+    /// from which prepared change, when (`at_ns`) and why (`author.note`) --
+    /// the retirement its own record. The version as retired; None, and
+    /// nothing written, when no such version is recorded or it is retired
+    /// already. A retired version is never replaced: its name and version
+    /// stay taken.
+    fn retire_plugin_version(
+        &self,
+        name: &str,
+        version: &str,
+        author: &Author,
+        at_ns: i64,
+    ) -> Result<Option<PluginVersion>>;
+
+    /// Who retired a version, through what: the delegation, the client and
+    /// the prepared change, beside the version's own `retired_*` fields; None
+    /// for one not retired.
+    fn retirement(&self, name: &str, version: &str) -> Result<Option<Author>>;
+
     /// Record a launch as live, unless its instance has a live launch
     /// already: false then. Checked and written in one step, so two launches
     /// of one instance cannot both pass. Who launched it, through which

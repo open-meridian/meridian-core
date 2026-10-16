@@ -141,6 +141,12 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0019_identifier_usage_is_reported.sql"),
         then: None,
     },
+    Migration {
+        version: 20,
+        name: "plugins_are_shared_and_documented",
+        sql: include_str!("../migrations/0020_plugins_are_shared_and_documented.sql"),
+        then: None,
+    },
 ];
 
 /// Migration 18 (contract v22; W11.21, decisions/031): each instance holding
