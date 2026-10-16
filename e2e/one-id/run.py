@@ -162,7 +162,7 @@ def store_book():
 
 def run():
     started = time.time()
-    compose("down", "-v", "--remove-orphans", check=False)
+    compose("--profile", "runner", "down", "-v", "--remove-orphans", check=False)
     compose("up", "-d")
     for instance in INSTANCES:
         runner("ready", "--instance", instance)
@@ -346,7 +346,7 @@ if __name__ == "__main__":
     open(LOG, "w").close()
     try:
         run()
-        compose("down", "-v", "--remove-orphans", check=False)
+        compose("--profile", "runner", "down", "-v", "--remove-orphans", check=False)
     except (Failed, subprocess.TimeoutExpired) as failed:
         print(f"{NAME} FAILED: {failed}", file=sys.stderr)
         print(f"the whole run is in {LOG}; the deployment is left up as {PROJECT}", file=sys.stderr)

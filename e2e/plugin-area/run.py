@@ -169,7 +169,7 @@ def setting(data, name):
 
 def run():
     started = time.time()
-    compose("down", "-v", "--remove-orphans", check=False)
+    compose("--profile", "runner", "down", "-v", "--remove-orphans", check=False)
     compose("up", "-d")
     runner("ready")
     # The accounts its connection reaches, said again now the dashboard
@@ -423,11 +423,11 @@ def main():
         run()
     except (Failed, subprocess.TimeoutExpired, KeyError, ValueError, IndexError, TypeError) as failed:
         compose("logs", "--no-color", check=False)
-        compose("down", "-v", "--remove-orphans", check=False)
+        compose("--profile", "runner", "down", "-v", "--remove-orphans", check=False)
         print(f"e2e-plugin-area FAILED: {failed}; the run is in {LOG}", file=sys.stderr)
         return 1
     compose("logs", "--no-color", check=False)
-    compose("down", "-v", "--remove-orphans", check=False)
+    compose("--profile", "runner", "down", "-v", "--remove-orphans", check=False)
     return 0
 
 

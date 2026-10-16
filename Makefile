@@ -1075,11 +1075,11 @@ harness-check:
 	@$(PY) e2e/harness/known_passwords.py .harness/* \
 		|| { echo "harness-check FAILED: a fixed password or hash is in the harness's files (above, by line)" >&2; exit 1; }
 	@: >.e2e-harness.log
-	@$(HARNESS) down -v --remove-orphans >>.e2e-harness.log 2>&1 || true
+	@$(HARNESS) --profile runner down -v --remove-orphans >>.e2e-harness.log 2>&1 || true
 	@started=$$(date +%s); \
 	fail() { echo "harness-check FAILED: $$1; the components' logs are in .e2e-harness.log" >&2; \
 		$(HARNESS) logs --no-color >>.e2e-harness.log 2>&1; \
-		$(HARNESS) down -v --remove-orphans >/dev/null 2>&1; exit 1; }; \
+		$(HARNESS) --profile runner down -v --remove-orphans >/dev/null 2>&1; exit 1; }; \
 	$(HARNESS) up -d >>.e2e-harness.log 2>&1 || fail "the harness did not start"; \
 	$(HARNESS_RUN) ready || fail "the plugin never registered"; \
 	$(HARNESS_RUN) settings api_key=$(HARNESS_SECRET) poll_minutes=15 || fail "its settings were not saved"; \
@@ -1145,7 +1145,7 @@ harness-check:
 			|| fail "$$inner, holding no edge role, was given storage"; \
 	done; \
 	$(HARNESS) logs --no-color >>.e2e-harness.log 2>&1; \
-	$(HARNESS) down -v --remove-orphans >>.e2e-harness.log 2>&1; \
+	$(HARNESS) --profile runner down -v --remove-orphans >>.e2e-harness.log 2>&1; \
 	echo "harness-check OK in $$(( $$(date +%s) - started ))s: the plugin harness is its own image, files only, and the runtime image carries none of it; no fixed password or hash is in its files; its compose writes three plugins, each beside its sidecar, one started again after failing first ($$restarts restart); its runner signs in with the password drawn for the run, sets a plugin's settings, defines an account and links it through the plugin's own form, taking what the page offered from the page; store street prints as expected, the dollar pulled from the master and the three other records it names listed as ones the book cannot use and one completed at the Instruments page, an MCP client connected on a delegation covering the deployment admin alone lists core's tools and no plugin's, is refused a completion without a note by path, completes a record through dashboard__complete_instruments whose history names the person and the client, and Connected clients lists its calls; nothing for the account left unlinked, which the dashboard counts ($$unlinked); a second plugin is opened at write once the admin is granted it, and store book prints the book empty; the custody plugin writes its storage as a user that is not root and finds it again in a new container, and the plugins holding no edge role have none"
 
 # Tickets inside a deployment (contract v13), end to end on the plugin

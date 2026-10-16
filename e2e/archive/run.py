@@ -119,7 +119,7 @@ def summary(until_said, seconds=60):
 
 def run():
     started = time.time()
-    compose("down", "-v", "--remove-orphans", check=False)
+    compose("--profile", "runner", "down", "-v", "--remove-orphans", check=False)
     compose("up", "-d")
     runner("ready")
     runner("ready", instance="keeper")
@@ -225,11 +225,11 @@ def main():
         run()
     except (Failed, subprocess.TimeoutExpired, KeyError, ValueError, IndexError) as failed:
         compose("logs", "--no-color", check=False)
-        compose("down", "-v", "--remove-orphans", check=False)
+        compose("--profile", "runner", "down", "-v", "--remove-orphans", check=False)
         print(f"e2e-archive FAILED: {failed}; the run is in {LOG}", file=sys.stderr)
         return 1
     compose("logs", "--no-color", check=False)
-    compose("down", "-v", "--remove-orphans", check=False)
+    compose("--profile", "runner", "down", "-v", "--remove-orphans", check=False)
     return 0
 
 

@@ -354,7 +354,7 @@ line:
         python /harness/harness.py compose <e2e/plugins.json >.e2e/harness/plugins.yaml
     export MERIDIAN_RUNTIME_IMAGE=$RUNTIME_IMAGE
     H="docker compose -p <plugin>-e2e -f .e2e/harness/compose.yaml -f .e2e/harness/plugins.yaml"
-    $H down -v --remove-orphans
+    $H --profile runner down -v --remove-orphans
     $H up -d
     $H run --rm -T runner ready
     $H run --rm -T runner settings <name>=<value>
@@ -364,7 +364,7 @@ line:
     diff -u e2e/expected.street .e2e/street
     $H run --rm -T runner unlinked --expect <n>
     $H logs --no-color > .e2e/components.log   # on a failure, before tearing down
-    $H down -v --remove-orphans
+    $H --profile runner down -v --remove-orphans
 
 A setting changed and a link made each wake a plugin that reads on them, so wait
 for a complete statement rather than for any row, or the diff can catch one

@@ -148,7 +148,7 @@ def refused_naming(done, *words):
 
 def run():
     started = time.time()
-    compose("down", "-v", "--remove-orphans", check=False)
+    compose("--profile", "runner", "down", "-v", "--remove-orphans", check=False)
     compose("up", "-d")
     runner("ready")
 
@@ -360,11 +360,11 @@ def main():
         run()
     except (Failed, subprocess.TimeoutExpired, KeyError, ValueError, IndexError) as failed:
         compose("logs", "--no-color", check=False)
-        compose("down", "-v", "--remove-orphans", check=False)
+        compose("--profile", "runner", "down", "-v", "--remove-orphans", check=False)
         print(f"e2e-access-per-role FAILED: {failed}; the run is in {LOG}", file=sys.stderr)
         return 1
     compose("logs", "--no-color", check=False)
-    compose("down", "-v", "--remove-orphans", check=False)
+    compose("--profile", "runner", "down", "-v", "--remove-orphans", check=False)
     return 0
 
 
