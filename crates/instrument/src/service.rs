@@ -1669,24 +1669,15 @@ fn subject_codes(
     store: &dyn Store,
     venues: &[meridian_domain::v1::VenueRecord],
     record: &meridian_domain::v1::CalendarRecord,
-    now_ns: i64,
 ) -> Vec<String> {
     let mut codes = Vec::new();
     if !record.instrument_id.is_empty() {
         // The record the calendar names, matched directly: from contract v24
         // the currency's record is the deployment's under its `INS-` ID
-        // (requirement 19). The `open_meridian` lookup stays, read only, for
-        // a record kept under an `LCL-` key until its migration line is made.
-        let direct = store
-            .by_id(&record.instrument_id)
-            .ok()
-            .flatten()
-            .into_iter();
-        for held in direct.chain(
-            store
-                .matching(crate::GLOBAL_ID, &record.instrument_id, "", now_ns)
-                .unwrap_or_default(),
-        ) {
+        // (requirement 19). From contract v25 nothing is looked up by an
+        // `open_meridian` identifier: a record kept under an `LCL-` key is
+        // matched once its migration line is made (W3.26).
+        if let Some(held) = store.by_id(&record.instrument_id).ok().flatten() {
             codes.extend(
                 held.held_now()
                     .filter(|identifier| identifier.scheme == "iso4217")
@@ -1707,26 +1698,16 @@ fn subject_codes(
     codes
 }
 
-/// The platform's ID of a record this deployment holds: its own where it is
-/// one, the `INS-` record it was resolved into, else the `open_meridian`
-/// identifier it holds now, of the record a merged one became. None for a record with none, or none held.
-fn platform_id(store: &dyn Store, instrument_id: &str) -> Option<String> {
+/// The `INS-` record a record this deployment holds became (contract v24,
+/// requirement 19, one rule: follow the replacement). None for an `INS-` ID,
+/// which is asked as it is, and for a record not resolved, which is kept as
+/// asked: from contract v25 no `open_meridian` identifier is read for it.
+fn became_platform(store: &dyn Store, instrument_id: &str) -> Option<String> {
     if instrument_id.starts_with("INS-") {
         return None;
     }
-    // One rule (contract v24, requirement 19): follow the replacement -- a
-    // resolved record is the `INS-` record it became.
     let became = crate::replace::current(store, instrument_id).ok()?;
-    if became.starts_with("INS-") {
-        return Some(became);
-    }
-    // Read only, for a record still under its `LCL-` key.
-    let instrument = store.by_id(&became).ok().flatten()?;
-    let platform = instrument
-        .held_now()
-        .find(|held| held.scheme == crate::GLOBAL_ID && held.value.starts_with("INS-"))
-        .map(|held| held.value.clone());
-    platform
+    became.starts_with("INS-").then_some(became)
 }
 
 /// A calendar or a rule not held, reported by its subject for the
@@ -1785,8 +1766,8 @@ fn serve_calendars(bus: &Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>)
                 decode(&envelope, "meridian.v1.ComputeDateRequest")?;
             let now_ns = clock.now_ns();
             let held = held(store.as_ref(), request.as_of_ns)?;
-            let request = crate::calendars::pair_on_the_platform(&request, |instrument| {
-                platform_id(store.as_ref(), instrument)
+            let request = crate::calendars::pair_followed(&request, |instrument| {
+                became_platform(store.as_ref(), instrument)
             });
             let answered = crate::calendars::compute(
                 &held,
@@ -1804,7 +1785,7 @@ fn serve_calendars(bus: &Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>)
         });
     }
     {
-        let (store, clock) = (store.clone(), clock.clone());
+        let store = store.clone();
         bus.serve(LIST_CALENDARS, move |envelope| {
             let request: meridian_domain::v1::ListCalendarsRequest =
                 decode(&envelope, "meridian.v1.ListCalendarsRequest")?;
@@ -1819,9 +1800,8 @@ fn serve_calendars(bus: &Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>)
             } else {
                 store.venues().map_err(|failed| failed.to_string())?
             };
-            let now_ns = clock.now_ns();
             let codes = |record: &meridian_domain::v1::CalendarRecord| {
-                subject_codes(store.as_ref(), &venues, record, now_ns)
+                subject_codes(store.as_ref(), &venues, record)
             };
             let reply = crate::calendars::list_with(&calendars, &rules, &request, &codes)?;
             Ok((

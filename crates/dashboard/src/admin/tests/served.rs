@@ -1006,9 +1006,9 @@ fn connectivity_link<'a>(
 
 /// The platform's ID of the US dollar's cash instrument, which the
 /// stand-in store's US dollar calendar names, and the deployment's record
-/// carrying it beside its ISO 4217 code (contract v23, W3.21).
+/// kept under it beside its ISO 4217 code (contract v23, W3.21; from v24
+/// requirement 19).
 const PLATFORM_USD: &str = "INS-01JUSD0000000000000000001";
-const LOCAL_USD: &str = "LCL-01JUSD0000000000000000001";
 
 /// The calendars the stand-in instrument store holds: three seed calendars,
 /// each with its subject (contract v23), and the US equities rule, and
@@ -1393,24 +1393,17 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
                 .filter(wanted)
                 .map(instrument_listed)
                 .collect();
-            // The US dollar's record, kept from the platform's under the
-            // deployment's own ID (contract v20), found by the platform's.
+            // The US dollar's record, kept under the platform's `INS-` ID
+            // (contract v24, requirement 19), found by it.
             if !search.is_empty() && PLATFORM_USD.to_lowercase().contains(&search) {
                 instruments.push(InstrumentToComplete {
                     instrument: Some(InstrumentRecord {
-                        instrument_id: LOCAL_USD.into(),
-                        identifiers: vec![
-                            Identifier {
-                                scheme: "iso4217".into(),
-                                value: "USD".into(),
-                                ..Default::default()
-                            },
-                            Identifier {
-                                scheme: "open_meridian".into(),
-                                value: PLATFORM_USD.into(),
-                                ..Default::default()
-                            },
-                        ],
+                        instrument_id: PLATFORM_USD.into(),
+                        identifiers: vec![Identifier {
+                            scheme: "iso4217".into(),
+                            value: "USD".into(),
+                            ..Default::default()
+                        }],
                         asset_class: meridian_domain::v1::AssetClass::Cash as i32,
                         currency: "USD".into(),
                         description: "US dollar".into(),

@@ -91,10 +91,6 @@ impl Filter {
     }
 }
 
-/// The scheme a record carries the platform's ID under (meridian-symbology's
-/// GLOBAL_ID, which the dashboard does not link).
-const GLOBAL_ID: &str = "open_meridian";
-
 /// The longest text the tab searches by.
 const QUERY_MOST: usize = 100;
 
@@ -162,13 +158,10 @@ pub async fn subject_codes(
                 .instruments
                 .iter()
                 .filter_map(|each| each.instrument.as_ref())
-                .find(|record| {
-                    record.instrument_id == id
-                        || record
-                            .identifiers
-                            .iter()
-                            .any(|held| held.scheme == GLOBAL_ID && held.value == id)
-                })
+                // The record under the `INS-` ID the calendar names (contract
+                // v24, requirement 19); from contract v25 no `open_meridian`
+                // identifier is matched for a record not yet migrated.
+                .find(|record| record.instrument_id == id)
                 .and_then(|record| {
                     record
                         .identifiers

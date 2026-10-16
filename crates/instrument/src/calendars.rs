@@ -298,16 +298,19 @@ fn month_end(set: &Set, date: Date) -> Result<Date, Stop> {
     step(set, last, -1)
 }
 
-/// A spot or tenor read's pair by the platform's IDs (the order-path plan's
-/// "v23 also", approved 2026-10-13): a deployment keeps a currency under its
-/// own ID with the platform's beside it, as `open_meridian`, and a spot rule
-/// pulled from the platform names the platform's; each member is read by
-/// `platform_id`, and one with none is kept as asked, so the rule is not held
-/// and the miss names it honestly, never a guess. Until the one-ID revision
-/// removes the translation everywhere.
-pub fn pair_on_the_platform(
+/// A spot or tenor read's pair, each member followed through its
+/// replacement (W3.20; the one-ID spec's requirement 19, one rule): a spot
+/// rule pulled from the platform names its `INS-` IDs, and so does the
+/// deployment's record, a resolved `LCL-` ID read as the `INS-` record it
+/// became (`became`). A member that became none is kept as asked, so the
+/// rule is not held and the miss names it honestly, never a guess. From
+/// contract v25 nothing is read from an `open_meridian` identifier: v23's
+/// translation, kept read only through v24 for a record not yet migrated,
+/// is gone, and such a record misses until its migration line is made
+/// (W3.26).
+pub fn pair_followed(
     request: &ComputeDateRequest,
-    platform_id: impl Fn(&str) -> Option<String>,
+    became: impl Fn(&str) -> Option<String>,
 ) -> ComputeDateRequest {
     use compute_date_request::Inputs;
     let mut request = request.clone();
@@ -317,7 +320,7 @@ pub fn pair_on_the_platform(
         _ => return request,
     };
     for member in pair.iter_mut() {
-        if let Some(platform) = platform_id(member.trim()) {
+        if let Some(platform) = became(member.trim()) {
             *member = platform;
         }
     }
