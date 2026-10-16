@@ -268,6 +268,7 @@ mod tests {
                 source: String::new(),
                 valid_from_ns: 0,
                 valid_to_ns: None,
+                trading_currency: String::new(),
             }],
             asset_class: String::new(),
             currency: String::new(),

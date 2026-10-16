@@ -320,6 +320,7 @@ pub(crate) fn window_for(store: &dyn Store, asked: &Asked) -> Result<Identifier>
         source: asked.source.clone(),
         valid_from_ns: from,
         valid_to_ns: None,
+        trading_currency: String::new(),
     })
 }
 
@@ -1030,6 +1031,7 @@ mod tests {
                     source: source.into(),
                     valid_from_ns: from,
                     valid_to_ns: None,
+                    trading_currency: String::new(),
                 })
                 .collect(),
             asset_class: "ASSET_CLASS_EQUITY".into(),

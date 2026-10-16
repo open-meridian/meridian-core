@@ -70,7 +70,7 @@ pub fn identifier_to_wire(identifier: &Identifier) -> PbIdentifier {
         source: identifier.source.clone(),
         valid_from_ns: identifier.valid_from_ns,
         valid_until_ns: identifier.valid_to_ns.unwrap_or(0),
-        trading_currency: String::new(),
+        trading_currency: identifier.trading_currency.clone(),
     }
 }
 
@@ -171,6 +171,7 @@ pub fn dated(asked: &Asked) -> Identifier {
         source: asked.source.clone(),
         valid_from_ns: 0,
         valid_to_ns: None,
+        trading_currency: String::new(),
     }
 }
 

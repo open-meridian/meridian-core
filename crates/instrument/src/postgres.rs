@@ -47,6 +47,7 @@ const SCHEMA: &[&str] = &[
     include_str!("../migrations/0009_settlement_calendars.sql"),
     include_str!("../migrations/0010_an_offer_keeps_its_provenance.sql"),
     include_str!("../migrations/0011_one_id.sql"),
+    include_str!("../migrations/0012_a_listing_trades_in_its_currency.sql"),
 ];
 
 /// A table the newest file makes. A database that has it has them all, so a
@@ -57,7 +58,7 @@ const NEWEST_TABLE: &str = "instrument_state";
 /// And the column the newest file adds (0008, contract v20: the prepared
 /// change a version was made from), with its table, which a table check
 /// cannot see.
-const NEWEST_COLUMN: (&str, &str) = ("instrument_replacement", "sequence");
+const NEWEST_COLUMN: (&str, &str) = ("instrument_identifier", "trading_currency");
 
 /// Names the schema lock. An arbitrary constant, and it only has to be the same
 /// one in every process that creates this schema.
@@ -401,7 +402,8 @@ impl PostgresStore {
 
         for row in conn
             .query(
-                "SELECT instrument_id, scheme, value, source, valid_from_ns, valid_to_ns
+                "SELECT instrument_id, scheme, value, source, valid_from_ns, valid_to_ns,
+                        trading_currency
                    FROM instrument_identifier
                   WHERE instrument_id = ANY($1)
                   ORDER BY instrument_id, scheme, source, value, valid_from_ns",
@@ -417,6 +419,7 @@ impl PostgresStore {
                     source: row.get(3),
                     valid_from_ns: row.get(4),
                     valid_to_ns: row.get(5),
+                    trading_currency: row.get(6),
                 });
             }
         }
@@ -502,18 +505,20 @@ impl PostgresStore {
             .map_err(unavailable)?;
         }
         for identifier in &record.identifiers {
-            let parameters: [&(dyn ToSql + Sync); 6] = [
+            let parameters: [&(dyn ToSql + Sync); 7] = [
                 id,
                 &identifier.scheme,
                 &identifier.value,
                 &identifier.source,
                 &identifier.valid_from_ns,
                 &identifier.valid_to_ns,
+                &identifier.trading_currency,
             ];
             tx.execute(
                 "INSERT INTO instrument_identifier
-                        (instrument_id, scheme, value, source, valid_from_ns, valid_to_ns)
-                 VALUES ($1, $2, $3, $4, $5, $6)",
+                        (instrument_id, scheme, value, source, valid_from_ns, valid_to_ns,
+                         trading_currency)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
                 &parameters,
             )
             .map_err(unavailable)?;
@@ -678,7 +683,7 @@ impl Store for PostgresStore {
         Ok(self
             .conn()?
             .query(
-                "SELECT instrument_id, valid_from_ns, valid_to_ns
+                "SELECT instrument_id, valid_from_ns, valid_to_ns, trading_currency
                    FROM instrument_identifier
                   WHERE scheme = $1 AND value = $2 AND source = $3
                   ORDER BY instrument_id, valid_from_ns",
@@ -695,6 +700,7 @@ impl Store for PostgresStore {
                         source: source.to_string(),
                         valid_from_ns: row.get(1),
                         valid_to_ns: row.get(2),
+                        trading_currency: row.get(3),
                     },
                 )
             })

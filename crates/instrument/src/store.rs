@@ -28,7 +28,7 @@ use std::collections::HashMap;
 /// Dated because identifiers are reused: a delisted instrument frees a ticker
 /// and somebody else is given it. A lookup without an as-of is a bug waiting for
 /// a reassignment.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Identifier {
     pub scheme: String,
     pub value: String,
@@ -41,6 +41,11 @@ pub struct Identifier {
 
     /// `None` while the mapping is still current.
     pub valid_to_ns: Option<i64>,
+
+    /// For a listing identifier, the ISO 4217 currency that listing trades
+    /// in, as the platform's master holds it (contract v25, W3.1); empty on
+    /// every other identifier.
+    pub trading_currency: String,
 }
 
 impl Identifier {

@@ -1104,6 +1104,10 @@ struct WireIdentifier {
     valid_from_ns: i64,
     #[serde(default)]
     valid_until_ns: i64,
+    /// A listing identifier's trading currency, ISO 4217, as the master
+    /// holds it per listing (contract v25, W3.1); absent on every other.
+    #[serde(default)]
+    trading_currency: String,
 }
 
 impl WireIdentifier {
@@ -1114,7 +1118,7 @@ impl WireIdentifier {
             source: self.source,
             valid_from_ns: self.valid_from_ns,
             valid_until_ns: self.valid_until_ns,
-            trading_currency: String::new(),
+            trading_currency: self.trading_currency,
         }
     }
 }
@@ -1917,7 +1921,9 @@ pub(crate) mod tests {
                     {"scheme": "ticker", "value": "KXFED-26NOV", "source": "",
                      "valid_from_ns": 5, "valid_until_ns": 0},
                     {"scheme": "ticker", "value": "KXFED-OLD", "source": "",
-                     "valid_from_ns": 1, "valid_until_ns": 5}
+                     "valid_from_ns": 1, "valid_until_ns": 5},
+                    {"scheme": "figi", "value": "BBG0KXFEDCAD", "source": "",
+                     "valid_from_ns": 5, "valid_until_ns": 0, "trading_currency": "CAD"}
                 ],
                 "asset_class": "ASSET_CLASS_EVENT_CONTRACT",
                 "instrument_type": "INSTRUMENT_TYPE_BINARY_EVENT_CONTRACT",
@@ -1944,6 +1950,10 @@ pub(crate) mod tests {
         assert_eq!(contract.closes_at_ns, 1_793_548_800_000_000_000);
         let payout = contract.payout.unwrap();
         assert_eq!(payout.currency_code, "USD");
+        // A listing's trading currency (contract v25, W3.1), and none on
+        // every other identifier.
+        assert_eq!(record.identifiers[2].trading_currency, "CAD");
+        assert!(record.identifiers[0].trading_currency.is_empty());
         assert_eq!(
             meridian_domain::exact::Exact::from_wire(&payout.amount.unwrap())
                 .unwrap()
