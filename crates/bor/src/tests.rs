@@ -295,8 +295,8 @@ fn journal(partition: &str, sequence: u64, previous: u64) -> Option<JournalRef> 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_opening_balance_opens_every_position_and_lot_from_zero() {
     let (bus, _) = wired();
-    let mut positions = bus.subscribe(POSITION_CHANGED);
-    let mut attributes = bus.subscribe(ACCOUNT_ATTRIBUTE_CHANGED);
+    let mut positions = bus.subscribe_every(POSITION_CHANGED);
+    let mut attributes = bus.subscribe_every(ACCOUNT_ATTRIBUTE_CHANGED);
 
     let reply = open(&bus).await;
 
@@ -359,7 +359,7 @@ async fn an_opening_balance_opens_every_position_and_lot_from_zero() {
 async fn the_same_command_again_is_applied_once_and_answered_as_the_first() {
     let (bus, store) = wired();
     let first = open(&bus).await;
-    let mut positions = bus.subscribe(POSITION_CHANGED);
+    let mut positions = bus.subscribe_every(POSITION_CHANGED);
 
     // A retry the sidecar gave a new message identifier, by its key (Q12).
     let again = open(&bus).await;
@@ -799,8 +799,8 @@ async fn lots_across_buckets_sum_to_both() {
 async fn a_break_is_a_finding_that_moves_nothing() {
     let (bus, store) = wired();
     open(&bus).await;
-    let mut breaks = bus.subscribe(BREAK_CHANGED);
-    let mut positions = bus.subscribe(POSITION_CHANGED);
+    let mut breaks = bus.subscribe_every(BREAK_CHANGED);
+    let mut positions = bus.subscribe_every(POSITION_CHANGED);
 
     let reply = record_break(&bus, &aapl_break()).await.unwrap();
     let [record] = reply.breaks.as_slice() else {
@@ -848,7 +848,7 @@ async fn a_cause_linking_the_custodians_activity_is_recorded_as_given() {
     // never heard of is recorded too, and nothing moves.
     let (bus, _) = wired();
     open(&bus).await;
-    let mut positions = bus.subscribe(POSITION_CHANGED);
+    let mut positions = bus.subscribe_every(POSITION_CHANGED);
     let reinvested = BreakCause {
         category: BreakCauseCategory::IncomeReinvested as i32,
         item: Some(break_cause::Item::Activity(ActivityRef {
@@ -989,7 +989,7 @@ async fn the_figures_are_kept_per_agreement() {
 async fn encumbrances_are_an_attribute_and_free_is_derived_from_them() {
     let (bus, store) = wired();
     open(&bus).await;
-    let mut positions = bus.subscribe(POSITION_CHANGED);
+    let mut positions = bus.subscribe_every(POSITION_CHANGED);
     let source = StreetRecordRef {
         statement_id: "STMT-2".into(),
         as_of_date: "2026-09-09".into(),
@@ -1191,7 +1191,7 @@ async fn a_break_is_closed_with_an_explanation_or_as_cleared_and_nothing_moves()
     let second = record_break(&bus, &other).await.unwrap().breaks[0]
         .break_id
         .clone();
-    let mut positions = bus.subscribe(POSITION_CHANGED);
+    let mut positions = bus.subscribe_every(POSITION_CHANGED);
 
     let closed = resolve(
         &bus,
@@ -1589,7 +1589,7 @@ async fn a_merged_record_is_followed_its_lots_keeping_their_identifiers() {
         .instruments_held()
         .unwrap()
         .contains(&placeholder.to_string()));
-    let mut positions = bus.subscribe(POSITION_CHANGED);
+    let mut positions = bus.subscribe_every(POSITION_CHANGED);
 
     bus.publish(
         INSTRUMENT_REPLACED,

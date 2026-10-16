@@ -178,7 +178,7 @@ async fn next(reports: &mut Subscription) -> meridian_bus::Delivery {
 #[tokio::test]
 async fn a_report_goes_out_at_start_and_again_at_once_when_the_plugin_registers() {
     let bus = memory();
-    let mut reports = bus.subscribe(PLUGIN_REPORT);
+    let mut reports = bus.subscribe_every(PLUGIN_REPORT);
     let sidecar = sidecar(Arc::clone(&bus));
     tokio::spawn(report_forever(Arc::clone(&sidecar)));
 
@@ -326,7 +326,7 @@ async fn a_refused_label_names_the_figure_the_field_and_the_bound() {
 #[tokio::test]
 async fn a_report_goes_out_at_once_when_the_figures_change_and_not_for_a_repeat() {
     let bus = memory();
-    let mut reports = bus.subscribe(PLUGIN_REPORT);
+    let mut reports = bus.subscribe_every(PLUGIN_REPORT);
     let sidecar = sidecar(Arc::clone(&bus));
     tokio::spawn(report_forever(Arc::clone(&sidecar)));
     next(&mut reports).await;

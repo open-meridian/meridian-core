@@ -206,7 +206,7 @@ pub fn kind_words(account: &ExternalAccount) -> String {
 /// returns, for the reason at-most-once delivery makes unforgiving: what
 /// arrives before a subscriber exists is dropped.
 pub fn listen(bus: &Bus, custody: Arc<Custody>) {
-    let mut accounts = bus.subscribe(EXTERNAL_ACCOUNTS);
+    let mut accounts = bus.subscribe_every(EXTERNAL_ACCOUNTS);
     let keeping = Arc::clone(&custody);
     tokio::spawn(async move {
         while let Some(delivery) = accounts.recv().await {
@@ -222,7 +222,7 @@ pub fn listen(bus: &Bus, custody: Arc<Custody>) {
         }
     });
 
-    let mut statuses = bus.subscribe(SYNC_STATUS);
+    let mut statuses = bus.subscribe_every(SYNC_STATUS);
     let keeping = Arc::clone(&custody);
     tokio::spawn(async move {
         while let Some(delivery) = statuses.recv().await {
@@ -236,7 +236,7 @@ pub fn listen(bus: &Bus, custody: Arc<Custody>) {
         }
     });
 
-    let mut refusals = bus.subscribe(UNLINKED_EXTERNAL_ACCOUNTS);
+    let mut refusals = bus.subscribe_every(UNLINKED_EXTERNAL_ACCOUNTS);
     tokio::spawn(async move {
         while let Some(delivery) = refusals.recv().await {
             match UnlinkedExternalAccountsEvent::decode(&delivery.envelope.payload[..]) {

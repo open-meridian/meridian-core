@@ -498,7 +498,7 @@ async fn a_block_is_booked_across_two_funds_and_each_member_is_filled_by_its_all
     .unwrap();
     assert_eq!(read(&aapl_in(&w, BLOCK).unwrap().trade_date_quantity), "10");
 
-    let mut updated = w.bus.subscribe(BOOKING_UPDATED);
+    let mut updated = w.bus.subscribe_every(BOOKING_UPDATED);
     let booking = book(
         &w,
         &block.order_id,

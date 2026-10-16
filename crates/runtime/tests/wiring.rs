@@ -886,8 +886,8 @@ async fn a_plugin_asks_for_a_date_and_is_answered_from_the_calendars_pulled() {
         Arc::new(MemoryBackend::new()),
         Arc::new(meridian_clock::SystemClock),
     ));
-    let mut applied = bus.subscribe("platform.reference.event.calendar-applied");
-    let mut missing = bus.subscribe("platform.reference.event.calendar-missing");
+    let mut applied = bus.subscribe_every("platform.reference.event.calendar-applied");
+    let mut missing = bus.subscribe_every("platform.reference.event.calendar-missing");
     tokio::spawn(
         meridian_instrument::InstrumentService::new(
             Arc::clone(&bus),

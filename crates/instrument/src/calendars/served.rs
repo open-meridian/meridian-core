@@ -77,8 +77,8 @@ async fn a_pulled_calendar_is_kept_announced_and_answered_and_a_miss_is_reported
         Arc::new(meridian_clock::ManualClock::at(1_760_400_000_000_000_000)),
     ));
     let store = Arc::new(MemoryStore::new());
-    let mut applied = bus.subscribe(CALENDAR_APPLIED);
-    let mut missing = bus.subscribe(CALENDAR_MISSING);
+    let mut applied = bus.subscribe_every(CALENDAR_APPLIED);
+    let mut missing = bus.subscribe_every(CALENDAR_MISSING);
     let running = InstrumentService::new(
         Arc::clone(&bus),
         store.clone() as Arc<dyn Store>,

@@ -506,7 +506,9 @@ async fn a_code_its_map_holds_for_another_account_is_refused_before_the_conducto
         }],
     };
     let p = plugin("ems-1", &["ems"], Some(map)).await;
-    let asked = p.bus.subscribe("platform.config.command.map-venue-account");
+    let asked = p
+        .bus
+        .subscribe_every("platform.config.command.map-venue-account");
     let admin = vouched(&p.key, "ems-1", "ems", AccessLevel::Admin, &[], None, "");
     let refused = p
         .sidecar

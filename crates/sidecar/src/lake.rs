@@ -71,7 +71,7 @@ impl Entitled {
         if self.watching.swap(true, Ordering::SeqCst) {
             return;
         }
-        let mut heard = bus.subscribe(ENTITLEMENTS_CHANGED);
+        let mut heard = bus.subscribe_every(ENTITLEMENTS_CHANGED);
         let entitled = self.clone();
         tokio::spawn(async move {
             while let Some(delivery) = heard.recv().await {

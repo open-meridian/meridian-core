@@ -133,7 +133,9 @@ impl CalendarAsker {
 
     /// Subscribe before returning; the loop that asks is what is left.
     pub fn start(self: Arc<Self>) -> impl std::future::Future<Output = ()> {
-        let mut missing = self.bus.subscribe(CALENDAR_MISSING);
+        let mut missing = self
+            .bus
+            .subscribe_shared(CALENDAR_MISSING, "calendar-asker");
         async move {
             while let Some(delivery) = missing.recv().await {
                 let Ok(event) =
@@ -604,7 +606,7 @@ mod tests {
             Arc::new(platform_with(fake.clone())),
             clock.clone(),
         );
-        let mut pulled = bus.subscribe(CALENDAR_PULLED);
+        let mut pulled = bus.subscribe_every(CALENDAR_PULLED);
         let market = Subject::Market("US".into(), AssetClass::Equity as i32);
         assert!(asker.pull(market.clone(), "", "").await);
         let delivery = tokio::time::timeout(Duration::from_secs(2), pulled.recv())

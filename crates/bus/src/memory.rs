@@ -23,12 +23,18 @@ const SUBSCRIBER_QUEUE: usize = 1024;
 
 struct Subscriber {
     pattern: String,
+    /// The group it shares messages with (contract v25), or none: every
+    /// subscriber hears every message.
+    group: Option<String>,
     tx: mpsc::Sender<Delivery>,
     dropped: DropCount,
 }
 
 pub struct MemoryBackend {
     subscribers: RwLock<Vec<Subscriber>>,
+    /// Each group's turn, by pattern and group: which of its open members
+    /// takes the next message.
+    turns: Mutex<HashMap<(String, String), usize>>,
     sequences: Mutex<HashMap<String, u64>>,
     dropped: AtomicU64,
 }
@@ -37,9 +43,25 @@ impl MemoryBackend {
     pub fn new() -> Self {
         Self {
             subscribers: RwLock::new(Vec::new()),
+            turns: Mutex::new(HashMap::new()),
             sequences: Mutex::new(HashMap::new()),
             dropped: AtomicU64::new(0),
         }
+    }
+
+    fn join(&self, pattern: &str, group: Option<String>) -> Subscription {
+        let (tx, rx) = mpsc::channel(SUBSCRIBER_QUEUE);
+        let dropped = DropCount::default();
+        self.subscribers
+            .write()
+            .expect("subscriber lock poisoned")
+            .push(Subscriber {
+                pattern: pattern.to_string(),
+                group,
+                tx,
+                dropped: dropped.clone(),
+            });
+        Subscription::new(rx, pattern, dropped)
     }
 
     fn next_sequence(&self, topic: &str) -> u64 {
@@ -73,9 +95,37 @@ impl Backend for MemoryBackend {
 
         {
             let subscribers = self.subscribers.read().expect("subscriber lock poisoned");
-            for subscriber in subscribers.iter() {
+            // One member of each group takes the message, in turn among its
+            // open members (contract v25), as a broker's queue group does.
+            let mut chosen: HashMap<(String, String), usize> = HashMap::new();
+            {
+                let mut members: HashMap<(String, String), Vec<usize>> = HashMap::new();
+                for (at, subscriber) in subscribers.iter().enumerate() {
+                    if let Some(group) = &subscriber.group {
+                        if topic::matches(&subscriber.pattern, topic) && !subscriber.tx.is_closed()
+                        {
+                            members
+                                .entry((subscriber.pattern.clone(), group.clone()))
+                                .or_default()
+                                .push(at);
+                        }
+                    }
+                }
+                let mut turns = self.turns.lock().expect("turn lock poisoned");
+                for (key, held) in members {
+                    let turn = turns.entry(key.clone()).or_insert(0);
+                    chosen.insert(key, held[*turn % held.len()]);
+                    *turn = turn.wrapping_add(1);
+                }
+            }
+            for (at, subscriber) in subscribers.iter().enumerate() {
                 if !topic::matches(&subscriber.pattern, topic) {
                     continue;
+                }
+                if let Some(group) = &subscriber.group {
+                    if chosen.get(&(subscriber.pattern.clone(), group.clone())) != Some(&at) {
+                        continue;
+                    }
                 }
                 match subscriber.tx.try_send(delivery.clone()) {
                     Ok(()) => {}
@@ -107,17 +157,11 @@ impl Backend for MemoryBackend {
     }
 
     fn subscribe(&self, pattern: &str) -> Subscription {
-        let (tx, rx) = mpsc::channel(SUBSCRIBER_QUEUE);
-        let dropped = DropCount::default();
-        self.subscribers
-            .write()
-            .expect("subscriber lock poisoned")
-            .push(Subscriber {
-                pattern: pattern.to_string(),
-                tx,
-                dropped: dropped.clone(),
-            });
-        Subscription::new(rx, pattern, dropped)
+        self.join(pattern, None)
+    }
+
+    fn subscribe_shared(&self, pattern: &str, group: &str) -> Subscription {
+        self.join(pattern, Some(group.to_string()))
     }
 
     fn dropped(&self) -> u64 {
@@ -128,6 +172,36 @@ impl Backend for MemoryBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_member_of_a_group_takes_each_message_and_plain_subscribers_every_one() {
+        // Contract v25 (Q15): as a broker's queue group does.
+        let backend = MemoryBackend::new();
+        let topic = "platform.street.event.work";
+        let mut a = backend.subscribe_shared(topic, "street.keeping");
+        let mut b = backend.subscribe_shared(topic, "street.keeping");
+        let mut other = backend.subscribe_shared(topic, "lake.keeping");
+        let mut every = backend.subscribe(topic);
+        for _ in 0..6 {
+            backend.publish(topic, envelope(topic)).unwrap();
+        }
+        let count = |s: &mut Subscription| {
+            let mut n = 0;
+            while s.try_recv().is_some() {
+                n += 1;
+            }
+            n
+        };
+        assert_eq!((count(&mut a), count(&mut b)), (3, 3), "in turn, once each");
+        assert_eq!(count(&mut other), 6, "another group hears each");
+        assert_eq!(count(&mut every), 6, "a plain subscriber hears each");
+        // A member gone, the other takes all.
+        drop(a);
+        for _ in 0..4 {
+            backend.publish(topic, envelope(topic)).unwrap();
+        }
+        assert_eq!(count(&mut b), 4);
+    }
     use meridian_pb::v1::MessageMeta;
 
     fn envelope(topic: &str) -> Envelope {

@@ -296,7 +296,8 @@ fn run() -> Result<(), String> {
             });
             // The data configuration (contract v18, W10.1): each launched
             // plugin's entitled datasets written for the broker.
-            let mut configuration = bus.subscribe("platform.config.event.entitlements-changed");
+            let mut configuration =
+                bus.subscribe_every("platform.config.event.entitlements-changed");
             let entitling = Arc::clone(&launcher);
             tokio::spawn(async move {
                 while let Some(heard) = configuration.recv().await {

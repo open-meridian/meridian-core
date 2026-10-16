@@ -2211,7 +2211,7 @@ pub fn serve_with(
     // do. Called on this task instead, the first sign-in panicked the
     // conductor with "Cannot start a runtime from within a runtime", and the
     // panic aborted it.
-    let mut sign_ins = bus.subscribe(PERSON_SIGNED_IN);
+    let mut sign_ins = bus.subscribe_shared(PERSON_SIGNED_IN, "sign-ins");
     let keeping = Arc::clone(&context);
     tokio::spawn(async move {
         while let Some(delivery) = sign_ins.recv().await {
@@ -2231,7 +2231,7 @@ pub fn serve_with(
 
     // The external accounts each custody instance reports, by the instance
     // its topic names, which the broker lets only that instance publish.
-    let mut accounts = bus.subscribe(EXTERNAL_ACCOUNTS);
+    let mut accounts = bus.subscribe_shared(EXTERNAL_ACCOUNTS, "external-accounts");
     let hearing = Arc::clone(&context);
     tokio::spawn(async move {
         while let Some(delivery) = accounts.recv().await {
@@ -2269,7 +2269,8 @@ pub fn serve_with(
 
     // W11.20: each venue catalogue a connectivity plugin publishes, kept
     // latest per plugin and code, a change its own record.
-    let mut catalogues = bus.subscribe(crate::connectivity::VENUE_CATALOGUE);
+    let mut catalogues =
+        bus.subscribe_shared(crate::connectivity::VENUE_CATALOGUE, "venue-catalogues");
     let cataloguing = Arc::clone(&context);
     tokio::spawn(async move {
         while let Some(delivery) = catalogues.recv().await {
@@ -2300,7 +2301,7 @@ pub fn serve_with(
         }
     });
 
-    let mut reports = bus.subscribe(PLUGIN_REPORT);
+    let mut reports = bus.subscribe_every(PLUGIN_REPORT);
     let noting = Arc::clone(&context);
     tokio::spawn(async move {
         while let Some(delivery) = reports.recv().await {

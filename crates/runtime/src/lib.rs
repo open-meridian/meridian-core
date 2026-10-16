@@ -475,7 +475,7 @@ pub fn collect_inward(bus: Arc<Bus>) -> Arc<Mutex<BTreeMap<String, ComponentRepo
     let heard: Arc<Mutex<BTreeMap<String, ComponentReport>>> =
         Arc::new(Mutex::new(BTreeMap::new()));
     let collecting = Arc::clone(&heard);
-    let mut inward = bus.subscribe(COMPONENT_REPORT_TOPIC);
+    let mut inward = bus.subscribe_every(COMPONENT_REPORT_TOPIC);
 
     tokio::spawn(async move {
         while let Some(delivery) = inward.recv().await {

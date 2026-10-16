@@ -713,9 +713,9 @@ pub fn keep_reference_forever(
     store: Arc<dyn Store>,
     clock: Arc<dyn Clock>,
 ) -> impl FnOnce(Writing) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-    let mut templates = bus.subscribe(TEMPLATES_PULLED);
-    let mut licence = bus.subscribe(LICENCE_LIST_PULLED);
-    let mut replacements = bus.subscribe(REPLACEMENTS_PULLED);
+    let mut templates = bus.subscribe_shared(TEMPLATES_PULLED, "reference");
+    let mut licence = bus.subscribe_shared(LICENCE_LIST_PULLED, "reference");
+    let mut replacements = bus.subscribe_shared(REPLACEMENTS_PULLED, "reference");
     move |writing: Writing| {
         Box::pin(async move {
             loop {
@@ -1837,7 +1837,7 @@ pub fn keep_calendars(
     store: Arc<dyn Store>,
     clock: Arc<dyn Clock>,
 ) -> impl std::future::Future<Output = ()> {
-    let mut pulled = bus.subscribe(CALENDAR_PULLED);
+    let mut pulled = bus.subscribe_shared(CALENDAR_PULLED, "calendars");
     async move {
         let refreshing = {
             let (bus, store, clock) = (Arc::clone(&bus), store.clone(), clock.clone());
@@ -2402,7 +2402,7 @@ mod tests {
     async fn a_minted_record_is_announced_completed_by_a_person_and_announced_again() {
         let bus = bus();
         let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
-        let mut applied = bus.subscribe(INSTRUMENT_APPLIED);
+        let mut applied = bus.subscribe_every(INSTRUMENT_APPLIED);
         serve_queries(&bus, store.clone(), bus.clock());
 
         let minted: ResolveIdentifierReply = ask(
@@ -2510,7 +2510,7 @@ mod tests {
     async fn a_merge_replaces_the_merged_record_and_says_so() {
         let bus = bus();
         let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
-        let mut replaced_heard = bus.subscribe(INSTRUMENT_REPLACED);
+        let mut replaced_heard = bus.subscribe_every(INSTRUMENT_REPLACED);
         serve_queries(&bus, store.clone(), bus.clock());
         let first: ResolveIdentifierReply = ask(
             &bus,

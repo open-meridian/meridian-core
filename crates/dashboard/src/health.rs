@@ -112,7 +112,7 @@ pub fn state(report: Option<&PluginReport>, now: i64) -> State {
 /// Subscribed before this returns: what arrives before a subscriber exists
 /// is not heard.
 pub fn listen(bus: &Bus, health: Arc<Health>) {
-    let mut reports = bus.subscribe(PLUGIN_REPORT);
+    let mut reports = bus.subscribe_every(PLUGIN_REPORT);
     tokio::spawn(async move {
         while let Some(delivery) = reports.recv().await {
             let publisher = delivery

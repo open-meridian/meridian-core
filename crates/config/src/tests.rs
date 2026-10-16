@@ -858,7 +858,7 @@ async fn a_reset_code_is_honoured_with_nobody_signed_in_and_makes_nobody_anythin
 #[tokio::test]
 async fn a_change_is_announced_to_the_plugins_it_moved_and_carries_no_setting() {
     let h = harness("dashboard-1");
-    let mut changes = h.bus.subscribe(PLUGIN_CONFIGURATION_CHANGED);
+    let mut changes = h.bus.subscribe_every(PLUGIN_CONFIGURATION_CHANGED);
     let traders = user_group(&h).await;
     let growth = account_group(&h, &[&account(&h, "Growth").await]).await;
     let trading = access_group(&h, vec![entry(AccessLevel::Write)])
@@ -988,7 +988,7 @@ async fn a_sidecar_is_told_the_accounts_its_links_name_and_when_one_is_renamed()
         "the account its link names, and no other"
     );
 
-    let mut announced = h.bus.subscribe(PLUGIN_CONFIGURATION_CHANGED);
+    let mut announced = h.bus.subscribe_every(PLUGIN_CONFIGURATION_CHANGED);
     let rename = |account_id: &str, name: &str| DefineAccountRequest {
         account_id: account_id.into(),
         name: name.into(),
@@ -1125,7 +1125,7 @@ async fn an_expected_link_refusal_carries_its_category_and_the_field() {
 async fn a_link_naming_a_new_account_creates_and_links_it_in_one_step() {
     // W6.4: from the plugin's own admin page, for the deployment admin.
     let h = harness("oms-1");
-    let mut announced = h.bus.subscribe(PLUGIN_CONFIGURATION_CHANGED);
+    let mut announced = h.bus.subscribe_every(PLUGIN_CONFIGURATION_CHANGED);
     let linked = link_for(&h, link_request("oms-1", "", "  Fidelity Brokerage "), ADA)
         .await
         .unwrap();
@@ -2360,7 +2360,7 @@ async fn a_value_held_is_cleared_when_its_setting_is_redeclared_with_another_typ
     set_as(&h, "local|mallory", &[("plan_code_links", FORGED)], &[])
         .await
         .unwrap();
-    let mut changes = h.bus.subscribe(PLUGIN_CONFIGURATION_CHANGED);
+    let mut changes = h.bus.subscribe_every(PLUGIN_CONFIGURATION_CHANGED);
 
     // A later version declares the name a table.
     let mut declared = declared();
@@ -3187,7 +3187,7 @@ async fn a_hold_reaches_the_sidecars_it_covers_and_holds_a_window_back() {
             0,
         )
         .unwrap();
-    let mut changed = h.bus.subscribe(PLUGIN_CONFIGURATION_CHANGED);
+    let mut changed = h.bus.subscribe_every(PLUGIN_CONFIGURATION_CHANGED);
     let set: meridian_domain::v1::Hold = ask(
         &h,
         crate::archive::SET_HOLD,

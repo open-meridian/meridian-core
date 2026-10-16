@@ -472,7 +472,7 @@ async fn a_plugin_missing_a_required_setting_is_reported_unhealthy_until_it_arri
     assert!(!missing.healthy);
     assert_eq!(missing.health_detail, "required setting api_key is not set");
 
-    let mut reports = bus.subscribe(PLUGIN_REPORT);
+    let mut reports = bus.subscribe_every(PLUGIN_REPORT);
     tokio::spawn(report_forever(Arc::clone(&sidecar)));
     let _ = tokio::time::timeout(Duration::from_secs(2), reports.recv()).await;
     held.lock().unwrap().settings = vec![value("api_key", "sk-123")];
@@ -524,7 +524,7 @@ async fn external_accounts_nobody_linked_are_reported_until_one_is() {
     assert_eq!(unlinked.accounts[0].external_account_id, "ext-9");
     assert_eq!(unlinked.accounts[0].refused_rows, 2);
 
-    let mut published = bus.subscribe(UNLINKED_EXTERNAL_ACCOUNTS);
+    let mut published = bus.subscribe_every(UNLINKED_EXTERNAL_ACCOUNTS);
     tokio::spawn(report_forever(Arc::clone(&sidecar)));
     let event = tokio::time::timeout(Duration::from_secs(2), published.recv())
         .await
