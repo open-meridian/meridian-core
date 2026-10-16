@@ -1731,6 +1731,53 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
         });
     }
 
+    // Contract v25: the catalogue holding SnapTrade's version, launched as
+    // INSTANCE, and its documentation as a vendor writes it (the SnapTrade
+    // draft's shape: headings, lists, a table, outside links), for the
+    // Documentation tab, the versions list and a version's page.
+    bus.serve(crate::catalogue::PLUGIN_CATALOGUE, |_| {
+        let version = |v: &str| meridian_domain::v1::PluginVersion {
+            metadata: Some(meridian_domain::v1::PluginMetadata {
+                name: "snaptrade".into(),
+                version: v.into(),
+                roles: vec!["custody".into()],
+                declaration: Some(documented_declaration()),
+                ..Default::default()
+            }),
+            uploaded_by: ADMIN.into(),
+            uploaded_at_ns: 1_790_380_800_000_000_000,
+            source_registry: "local".into(),
+            ..Default::default()
+        };
+        Ok((
+            "meridian.v1.PluginCatalogue".into(),
+            meridian_domain::v1::PluginCatalogue {
+                versions: (0..14).map(|n| version(&format!("0.{n}.0"))).collect(),
+                launches: vec![meridian_domain::v1::PluginLaunch {
+                    instance_id: INSTANCE.into(),
+                    name: "snaptrade".into(),
+                    version: "0.13.0".into(),
+                    roles: vec!["custody".into()],
+                    state: meridian_domain::v1::PluginLaunchState::Launched as i32,
+                    ..Default::default()
+                }],
+            }
+            .encode_to_vec(),
+        ))
+    });
+    bus.serve(crate::documentation::READ, |_| {
+        Ok((
+            "meridian.v1.ReadPluginDocumentationReply".into(),
+            meridian_domain::v1::ReadPluginDocumentationReply {
+                declaration: Some(documented_declaration()),
+                documentation: documentation_texts(),
+                uploaded_by: ADMIN.into(),
+                uploaded_at_ns: 1_790_380_800_000_000_000,
+            }
+            .encode_to_vec(),
+        ))
+    });
+
     let kit = crate::kit::Kit::at(
         std::env::var("MERIDIAN_UI_DIR").unwrap_or_else(|_| crate::kit::IN_IMAGE.into()),
     )
@@ -1967,4 +2014,102 @@ fn provisional_listed() -> ListInstrumentsToCompleteReply {
         }),
         ..Default::default()
     }
+}
+
+/// SnapTrade's declaration as its v25 upload carries it.
+fn documented_declaration() -> meridian_pb::v1::PluginDeclaration {
+    meridian_pb::v1::PluginDeclaration {
+        secret_settings: vec!["consumer_key".into()],
+        settings: declared(),
+        interface: Some(meridian_pb::v1::InterfaceDeclaration {
+            loopback_port: 8000,
+            title: "SnapTrade".into(),
+            pages: vec![
+                meridian_pb::v1::PageDeclaration {
+                    path: "/admin/connections".into(),
+                    title: "Connections".into(),
+                    levels: vec![meridian_pb::v1::AccessLevel::Admin as i32],
+                    roles: vec!["custody".into()],
+                },
+                meridian_pb::v1::PageDeclaration {
+                    path: "/statements".into(),
+                    title: "Statements".into(),
+                    levels: vec![
+                        meridian_pb::v1::AccessLevel::Write as i32,
+                        meridian_pb::v1::AccessLevel::Read as i32,
+                    ],
+                    roles: vec!["custody".into()],
+                },
+            ],
+        }),
+        tools: (0..9)
+            .map(|n| meridian_pb::v1::ToolDeclaration {
+                name: format!("read_connection_{n}"),
+                title: format!("Read connection {n}"),
+                description: "Each brokerage connection, its state and when it last read.".into(),
+                reads: n % 3 != 0,
+                levels: vec![meridian_pb::v1::AccessLevel::Admin as i32],
+                roles: vec!["custody".into()],
+                ..Default::default()
+            })
+            .collect(),
+        reads_external_accounts: true,
+        storage: Some(meridian_pb::v1::StorageDeclaration {
+            retention_days: 2555,
+            record_kinds: vec![meridian_pb::v1::RawRecordKind {
+                name: "activity".into(),
+                label: "Reported activity".into(),
+                window_days: 2555,
+                archivable: true,
+            }],
+        }),
+        ..Default::default()
+    }
+}
+
+/// SnapTrade's sections, the draft's shape and length.
+fn documentation_texts() -> Vec<meridian_domain::v1::DocumentationText> {
+    let text = |section: &str, markdown: &str| meridian_domain::v1::DocumentationText {
+        section: section.into(),
+        markdown: markdown.into(),
+    };
+    vec![
+        text(
+            "overview",
+            "# SnapTrade\n\nReads the holdings, balances and activity of brokerage accounts \
+             through [SnapTrade](https://snaptrade.com/), for people who keep their investments \
+             at several brokers.\n\n## What it reads\n\n- Each connection a person makes \
+             through SnapTrade's portal\n- The positions, cash and activity of each account it \
+             reaches\n- **Never** a password: SnapTrade holds the broker sign-in\n\n## What \
+             it records\n\nA statement per account per read, as the custody role records it, \
+             and its raw responses for 30 days. See [Setup](setup.md#before-you-start).",
+        ),
+        text(
+            "setup",
+            "## Before you start\n\nYou need a SnapTrade client ID and consumer key, from \
+             [the dashboard](https://dashboard.snaptrade.com/).\n\n## Enter the keys\n\n1. \
+             Open **Settings**.\n2. Enter the client ID and the consumer key.\n3. Save.\n\n\
+             | Setting | Where it comes from |\n|---|---|\n| Client ID | SnapTrade's dashboard |\n\
+             | Consumer key | SnapTrade's dashboard, shown once |\n\n## Link the accounts\n\n\
+             Each account SnapTrade reaches is listed on **Account links**; link each to one of \
+             this deployment's accounts.",
+        ),
+        text(
+            "troubleshooting",
+            "## A connection needs sign-in\n\nThe broker asked the person to sign in again. \
+             Open **Connections** and choose *Reconnect*.\n\n## Nothing arrives\n\nCheck the \
+             keys on **Settings**; a wrong consumer key reads as `401` in the health line.",
+        ),
+        text(
+            "terms",
+            "SnapTrade's [terms](https://snaptrade.com/terms) and \
+             [privacy policy](https://snaptrade.com/privacy) apply to the data it reads. The \
+             firm carries its own due diligence on SnapTrade as a vendor.",
+        ),
+        text(
+            "pages",
+            "- **Connections**: each connection and its state.\n- **Account links**: link each \
+             account it reaches.\n- **Statements**: what it recorded, per account.",
+        ),
+    ]
 }

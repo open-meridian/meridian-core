@@ -1023,6 +1023,50 @@ def the_v25_pages(browser, prefix):
             ctx.close()
 
 
+def the_documentation_pages(browser, prefix):
+    """Contract v25 (W6.9, W8.2): a version's documentation -- the plugin
+    area's Documentation tab, a section's part and the Reference's tables,
+    the portal's versions list and a version's page -- each on one screen at
+    the three sizes, in light and dark, the vendor's text drawn safely and
+    the supervision notice beside it."""
+    tab = f"{BASE}/plugins/{INSTANCE}?level=admin&tab=documentation"
+    pages = [
+        ("docs-overview", tab, "Reads the holdings"),
+        ("docs-setup-part", tab + "&section=setup&part=enter-the-keys", "Enter the client ID"),
+        ("docs-reference-settings", tab + "&section=reference&part=settings", "Consumer key"),
+        ("docs-reference-tools", tab + "&section=reference&part=tools", "read_connection_0"),
+        # The first rows: the kit's pager shows as many as fit.
+        ("versions", f"{BASE}/admin/plugins/versions", "0.0.0"),
+        ("version-page", f"{BASE}/admin/plugins/versions/snaptrade/0.13.0/documentation"
+                         "?section=troubleshooting", "A connection needs sign-in"),
+    ]
+    for scheme in ("light", "dark"):
+        for size, width, height in V24_SIZES:
+            ctx = context(browser, width, height, scheme=scheme)
+            page = ctx.new_page()
+            errors = []
+            page.on("pageerror", lambda e: errors.append(str(e)))
+            page.on("console", lambda m: errors.append(m.text) if "Content Security Policy" in m.text else None)
+            for name, url, says in pages:
+                answer = page.goto(url)
+                settled(page)
+                text = page.evaluate("() => document.body.innerText")
+                check(says in text, f"{name} at {size}, {scheme} says {says!r}")
+                if name.startswith("docs") or name == "version-page":
+                    policy = answer.headers.get("content-security-policy", "")
+                    check("script-src 'self' 'sha256-" in policy,
+                          f"{name} at {size} is under the documentation's policy: {policy}")
+                    check(page.locator("article.docs-vendor script, article.docs-vendor img").count() == 0,
+                          f"{name} at {size} draws no script or image of the vendor's")
+                    check("Naming a plugin here is not an endorsement" in page.content(),
+                          f"{name} at {size} carries the supervision notice")
+                m = page.evaluate(MEASURE)
+                measured(page, f"{name} at {size}, {scheme}", f"v25-{prefix}-{name}-{size}-{scheme}.png")
+                check(m["tall"] <= 0, f"{name} at {size}, {scheme} fits one screen: {m['tall']}px taller")
+            check(not errors, f"the documentation pages at {size}, {scheme} ran without an error: {errors}")
+            ctx.close()
+
+
 def the_v24_pages(browser, prefix):
     """Contract v24: the Instruments page's provisional records and the
     usage report's setting; the home page's counts; the escape hatch's
@@ -1179,6 +1223,7 @@ with sync_playwright() as playwright:
     a_secret_says_where_it_stands(browser, prefix)
     the_v24_pages(browser, prefix)
     the_v25_pages(browser, prefix)
+    the_documentation_pages(browser, prefix)
     browser.close()
 
 if failures:
