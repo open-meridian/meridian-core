@@ -2044,3 +2044,138 @@ async fn different_identifiers_open_a_new_unrecognized_security_break() {
     assert_ne!(third, id);
     assert_ne!(third, second);
 }
+
+/// Core's replay benchmark (contract v25, W9.10; item 122: the snapshot
+/// interval's default comes from it). Run by hand, never by the gate:
+///
+///     cargo test -p meridian-bor --lib replay_benchmark -- --ignored --nocapture
+///
+/// An operations plugin's day as the development deployment's journal held
+/// it (2026-10-15: figures and breaks re-recorded every few minutes), entry
+/// after entry on one account, and for each length: a full replay from the
+/// journal's rows (each entry's body decoded, as the Postgres store reads
+/// them), a snapshot's size and the time to write and to read it back, and
+/// one entry of tail applied -- with the most memory each held above where
+/// it began.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn replay_benchmark() {
+    use crate::book::Book;
+    use crate::journal::Entry;
+    use crate::snapshot::tests::{Counting, CHECK_EVERY_ACT};
+    use std::time::Instant;
+    CHECK_EVERY_ACT.store(false, std::sync::atomic::Ordering::Relaxed);
+    let (bus, store) = wired();
+    open(&bus).await;
+    let lengths = [250usize, 500, 1_000, 2_000, 4_000];
+    let mut made = 1;
+    let figures = |n: usize| RecordAccountFiguresRequest {
+        account_id: ACC.into(),
+        business_date: format!("2026-09-{:02}", 9 + (n % 20)),
+        source: None,
+        agreements: vec![AgreementFigures {
+            agreement: Some(MarginAgreementRef {
+                agreement: Some(margin_agreement_ref::Agreement::StatementSegment(
+                    StatementSegmentRef {
+                        external_account_id: "SNAP-ACC-1".into(),
+                        segment: String::new(),
+                        counterparty: "Interactive Brokers".into(),
+                    },
+                )),
+            }),
+            figures: Some(StatementFigures {
+                net_liquidation: usd(&format!("{}.00", 2_400_000 + n)),
+                ..Default::default()
+            }),
+            position_values: vec![ReportedPositionValue {
+                instrument_id: AAPL.into(),
+                side: HoldingSide::Long as i32,
+                market_value: usd(&format!("{}.50", 3_412 + n)),
+                margin_requirement: None,
+            }],
+        }],
+        idempotency_key: format!("figures:{n}"),
+    };
+    println!(
+        "entries | replay ms | replay peak MB | snapshot KB | encode ms | decode ms | decode peak MB | tail us/entry"
+    );
+    for length in lengths {
+        while made < length {
+            if made % 2 == 0 {
+                let mut update = aapl_break();
+                update.business_date = format!("2026-09-{:02}", 9 + (made % 20));
+                record_break(&bus, &update).await.unwrap();
+            } else {
+                send(
+                    &bus,
+                    RECORD_ACCOUNT_FIGURES,
+                    "meridian.v1.RecordAccountFiguresRequest",
+                    &figures(made),
+                    None,
+                )
+                .await
+                .unwrap();
+            }
+            made += 1;
+        }
+        let journal = store.journal(ACC).unwrap();
+        let rows: Vec<(Entry, Vec<u8>)> = journal
+            .iter()
+            .map(|entry| (entry.clone(), entry.body.to_bytes()))
+            .collect();
+        drop(journal);
+        // A full replay from the rows, as every command did until v25.
+        let base = Counting::reset_peak();
+        let started = Instant::now();
+        let entries: Vec<Entry> = rows
+            .iter()
+            .map(|(entry, body)| Entry {
+                body: crate::journal::Body::from_bytes(body).unwrap(),
+                ..entry.clone()
+            })
+            .collect();
+        let book = Book::replay(ACC, "P0", &entries).unwrap();
+        let replay = started.elapsed();
+        let replay_peak = Counting::peak() - base;
+        drop(entries);
+        // A snapshot written, and read back.
+        let started = Instant::now();
+        let bytes = crate::snapshot::encode(&book);
+        let encode = started.elapsed();
+        let base = Counting::reset_peak();
+        let started = Instant::now();
+        let kept = crate::snapshot::decode(&bytes).unwrap();
+        let decode = started.elapsed();
+        let decode_peak = Counting::peak() - base;
+        assert_eq!(kept, book);
+        // One entry of tail.
+        let (last, body) = rows.last().unwrap();
+        let tail = Entry {
+            body: crate::journal::Body::from_bytes(body).unwrap(),
+            ..last.clone()
+        };
+        let before = Book::replay(
+            ACC,
+            "P0",
+            &rows[..rows.len() - 1]
+                .iter()
+                .map(|(e, _)| e.clone())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let started = Instant::now();
+        let mut resumed = before;
+        resumed.apply(&tail, false).unwrap();
+        let tail_us = started.elapsed().as_micros();
+        println!(
+            "{length} | {:.1} | {:.1} | {} | {:.1} | {:.1} | {:.1} | {tail_us}",
+            replay.as_secs_f64() * 1e3,
+            replay_peak as f64 / 1e6,
+            bytes.len() / 1024,
+            encode.as_secs_f64() * 1e3,
+            decode.as_secs_f64() * 1e3,
+            decode_peak as f64 / 1e6,
+        );
+    }
+    CHECK_EVERY_ACT.store(true, std::sync::atomic::Ordering::Relaxed);
+}

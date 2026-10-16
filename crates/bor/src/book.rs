@@ -55,7 +55,7 @@ pub enum Chain {
 }
 
 /// How many rows an account's changes are chained per.
-const CHAINS: usize = 13;
+pub(crate) const CHAINS: usize = 13;
 
 /// A position's key within its account: instrument, side and, from contract
 /// v22, sleeve (W9's invariants; empty for the account's unsleeved part).
@@ -314,7 +314,7 @@ pub struct Book {
     /// Opening balances reversed, in order.
     pub reversed_openings: Vec<String>,
     pub entries: Vec<EntryIndex>,
-    chains: [u64; CHAINS],
+    pub(crate) chains: [u64; CHAINS],
     /// The order path's records (W11, contract v22).
     pub ledger: crate::orders::Ledger,
     /// Whether an entry has stated whether releases wait for compliance
@@ -386,6 +386,26 @@ impl Book {
             book.apply(entry, true)?;
         }
         Ok(book)
+    }
+
+    /// [`Book::as_of`] from a book already holding the entries up to some
+    /// point -- a snapshot (contract v25, W9.10) -- and the entries after it.
+    pub fn resume_as_of(
+        mut self,
+        entries: &[Entry],
+        at: Option<u64>,
+        until: Option<&str>,
+    ) -> Result<Book> {
+        for entry in entries {
+            if at.is_some_and(|at| entry.first_sequence > at) {
+                break;
+            }
+            if until.is_some_and(|until| entry.meta.effective_date.as_str() > until) {
+                continue;
+            }
+            self.apply(entry, true)?;
+        }
+        Ok(self)
     }
 
     pub fn entry(&self, entry_id: &str) -> Option<&EntryIndex> {

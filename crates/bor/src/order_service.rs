@@ -1352,10 +1352,7 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
 /// The instrument an execution is of, read from its account's journal
 /// before the lock (contract v24, row e3).
 fn execution_instrument(store: &dyn Store, account: &str, execution_id: &str) -> Option<String> {
-    let entries = store.journal(account).ok()?;
-    let book =
-        crate::book::Book::replay(account, crate::store::first_partition_of(account), &entries)
-            .ok()?;
+    let book = store.book(account).ok()?;
     book.ledger
         .executions
         .get(execution_id)

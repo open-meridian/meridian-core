@@ -166,14 +166,7 @@ pub fn member_views(store: &dyn Store, members: &[String]) -> BTreeMap<String, M
         let Ok(Some(account)) = store.owner(Record::Order, member) else {
             continue;
         };
-        let Ok(entries) = store.journal(&account) else {
-            continue;
-        };
-        let Ok(book) = Book::replay(
-            &account,
-            crate::store::first_partition_of(&account),
-            &entries,
-        ) else {
+        let Ok(book) = store.book(&account) else {
             continue;
         };
         let Some(held) = book.ledger.orders.get(member) else {
@@ -221,8 +214,7 @@ pub fn member_views(store: &dyn Store, members: &[String]) -> BTreeMap<String, M
 /// The escape hatch's setting in force (W11.36), read from the control
 /// partition: `None` before anything stated it, which reads as on.
 pub fn local_record_orders(store: &dyn Store) -> Option<bool> {
-    let entries = store.journal(CONTROL_ACCOUNT).ok()?;
-    let book = Book::replay(CONTROL_ACCOUNT, crate::store::CONTROL_PARTITION, &entries).ok()?;
+    let book = store.book(CONTROL_ACCOUNT).ok()?;
     book.ledger.local_record_orders
 }
 
@@ -330,12 +322,7 @@ pub fn sweep_children(bus: &Bus, store: &dyn Store) -> Result<usize, String> {
     let mut carried_by: BTreeSet<(String, String, String)> = BTreeSet::new();
     let mut receiving: Vec<(String, String, String, String)> = Vec::new();
     for account in &accounts {
-        let entries = store
-            .journal(account)
-            .map_err(|failed| failed.to_string())?;
-        let book = Book::replay(account, crate::store::first_partition_of(account), &entries)
-            .map_err(|failed| failed.to_string())?;
-        drop(entries);
+        let book = store.book(account).map_err(|failed| failed.to_string())?;
         for (id, held) in &book.ledger.bookings {
             if held.state == meridian_domain::v1::BookingState::Cancelled {
                 continue;
@@ -977,11 +964,7 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
 /// A block's members, where the order is one (W11.1).
 /// The order a booking books, from its account's journal.
 fn booking_order(store: &dyn Store, account: &str, booking_id: &str) -> String {
-    let Ok(entries) = store.journal(account) else {
-        return String::new();
-    };
-    let Ok(book) = Book::replay(account, crate::store::first_partition_of(account), &entries)
-    else {
+    let Ok(book) = store.book(account) else {
         return String::new();
     };
     book.ledger
@@ -992,11 +975,7 @@ fn booking_order(store: &dyn Store, account: &str, booking_id: &str) -> String {
 }
 
 fn block_members(store: &dyn Store, account: &str, order_id: &str) -> Vec<String> {
-    let Ok(entries) = store.journal(account) else {
-        return Vec::new();
-    };
-    let Ok(book) = Book::replay(account, crate::store::first_partition_of(account), &entries)
-    else {
+    let Ok(book) = store.book(account) else {
         return Vec::new();
     };
     book.ledger

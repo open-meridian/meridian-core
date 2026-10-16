@@ -91,6 +91,11 @@ impl Store for MemoryStore {
         let head = state.heads.get(&book.partition).copied().unwrap_or(0);
         let decided = decide(&book, head)?;
         let entry = decided.entry.clone();
+        // Every act any test makes holds the snapshot to the full replay
+        // (contract v25, W9.10): the book before it, through a snapshot's
+        // bytes, plus this entry, is the book after it.
+        #[cfg(test)]
+        crate::snapshot::tests::holds_across(&book, &entry, &decided.book);
         state
             .heads
             .insert(entry.partition.clone(), entry.last_sequence);
@@ -120,6 +125,16 @@ impl Store for MemoryStore {
             .books
             .insert(account_id.to_string(), decided.book.clone());
         Ok(Acted::Committed(Box::new(decided)))
+    }
+
+    fn book(&self, account_id: &str) -> Result<Book> {
+        // Every entry's book is kept, which is a snapshot at every entry.
+        Ok(self
+            .state()
+            .books
+            .get(account_id)
+            .cloned()
+            .unwrap_or_else(|| Book::new(account_id, first_partition_of(account_id))))
     }
 
     fn journal(&self, account_id: &str) -> Result<Vec<Entry>> {

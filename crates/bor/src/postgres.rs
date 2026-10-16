@@ -35,7 +35,7 @@ use crate::reads;
 use crate::store::{
     first_partition_of, Acted, AttributesRead, BreaksRead, Decide, FiguresRead, HistoryRead,
     InstructionsRead, LocatesRead, Mark, OrdersPage, OrdersRead, Page, PositionsRead, Record,
-    Result, Scope, Store, StoreError,
+    Result, Scope, Store, StoreError, FIRST_PARTITION,
 };
 
 type Pool = r2d2::Pool<PostgresConnectionManager<NoTls>>;
@@ -50,6 +50,9 @@ const PARTITION_LOCKS: i64 = 0x626f_6f6b_0000_0000_u64 as i64;
 
 pub struct PostgresStore {
     pool: Pool,
+    /// How many entries an account's journal grows by between snapshots
+    /// (contract v25, W9.10; the chart's `bor.snapshotInterval`).
+    snapshot_interval: u64,
 }
 
 impl PostgresStore {
@@ -60,7 +63,16 @@ impl PostgresStore {
             .max_size(pool_size.max(1))
             .build(manager)
             .map_err(unavailable)?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            snapshot_interval: crate::snapshot::DEFAULT_INTERVAL,
+        })
+    }
+
+    /// The same store, keeping a snapshot every `interval` entries (W9.10).
+    pub fn with_snapshot_interval(mut self, interval: u64) -> Self {
+        self.snapshot_interval = interval.max(1);
+        self
     }
 
     /// Apply every migration not yet recorded, under a lock. Run once per
@@ -148,6 +160,123 @@ fn journal_of(client: &mut impl GenericClient, account_id: &str) -> Result<Vec<E
         .iter()
         .map(entry_of)
         .collect()
+}
+
+/// The entries of an account's journal numbered above `after`, in order.
+fn journal_after(
+    client: &mut impl GenericClient,
+    account_id: &str,
+    after: u64,
+) -> Result<Vec<Entry>> {
+    client
+        .query(
+            &format!(
+                "SELECT {ENTRY_COLUMNS} FROM book_entry WHERE account_id = $1 AND first_sequence > $2
+                  ORDER BY first_sequence"
+            ),
+            &[&account_id, &(after as i64)],
+        )
+        .map_err(unavailable)?
+        .iter()
+        .map(entry_of)
+        .collect()
+}
+
+/// An account's latest usable snapshot (contract v25, W9.10): of this
+/// book's format, whose latest entry the journal still has there, at or
+/// below `at` where a read names a watermark, and holding no entry effective
+/// after `until` where it names a date. None where none is: the caller
+/// replays from the first entry. A snapshot that does not read is passed
+/// over, never trusted.
+fn snapshot_of(
+    client: &mut impl GenericClient,
+    account_id: &str,
+    at: Option<u64>,
+    until: Option<&str>,
+) -> Result<Option<Book>> {
+    let rows = client
+        .query(
+            "SELECT s.snapshot FROM book_snapshot s
+               JOIN book_entry e
+                 ON e.entry_id = s.last_entry_id AND e.first_sequence = s.last_sequence
+                AND e.account_id = s.account_id
+              WHERE s.account_id = $1 AND s.format = $2 AND s.last_sequence <= $3
+                AND ($4::text IS NULL OR s.latest_effective_date <= $4)
+              ORDER BY s.last_sequence DESC",
+            &[
+                &account_id,
+                &crate::snapshot::FORMAT,
+                &(at.map(|at| at as i64).unwrap_or(i64::MAX)),
+                &until,
+            ],
+        )
+        .map_err(unavailable)?;
+    for row in rows {
+        let bytes: Vec<u8> = row.get(0);
+        match crate::snapshot::decode(&bytes) {
+            Ok(book) => return Ok(Some(book)),
+            Err(failed) => {
+                tracing::warn!(account = account_id, %failed, "a snapshot passed over; replayed")
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// An account's book now: its latest snapshot and the journal's tail, or the
+/// whole journal; and how many entries were replayed for it.
+fn book_from(
+    client: &mut impl GenericClient,
+    account_id: &str,
+    partition: &str,
+) -> Result<(Book, usize)> {
+    match snapshot_of(client, account_id, None, None)? {
+        Some(kept) => {
+            let tail = journal_after(client, account_id, crate::snapshot::last_sequence(&kept))?;
+            let replayed = tail.len();
+            Ok((crate::snapshot::resume(kept, &tail)?, replayed))
+        }
+        None => {
+            let entries = journal_of(client, account_id)?;
+            let replayed = entries.len();
+            Ok((Book::replay(account_id, partition, &entries)?, replayed))
+        }
+    }
+}
+
+/// Keep a snapshot of an account's book as at its latest entry, and drop all
+/// but the latest few (W9.10).
+fn keep_snapshot(client: &mut impl GenericClient, book: &Book, taken_at_ns: i64) -> Result<()> {
+    let Some(last) = book.entries.last() else {
+        return Ok(());
+    };
+    client
+        .execute(
+            "INSERT INTO book_snapshot (account_id, last_sequence, last_entry_id, entries,
+                                        latest_effective_date, format, taken_at_ns, snapshot)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT (account_id, last_sequence) DO NOTHING",
+            &[
+                &book.account_id,
+                &(last.first.sequence as i64),
+                &last.entry_id,
+                &(book.entries.len() as i64),
+                &crate::snapshot::latest_effective_date(book),
+                &crate::snapshot::FORMAT,
+                &taken_at_ns,
+                &crate::snapshot::encode(book),
+            ],
+        )
+        .map_err(unavailable)?;
+    client
+        .execute(
+            "DELETE FROM book_snapshot WHERE account_id = $1 AND last_sequence NOT IN (
+                 SELECT last_sequence FROM book_snapshot WHERE account_id = $1
+                  ORDER BY last_sequence DESC LIMIT $2)",
+            &[&book.account_id, &(crate::snapshot::KEPT as i64)],
+        )
+        .map_err(unavailable)?;
+    Ok(())
 }
 
 fn heads_of(client: &mut impl GenericClient) -> Result<Mark> {
@@ -846,8 +975,9 @@ impl Store for PostgresStore {
             }
         }
 
-        let entries = journal_of(&mut tx, account_id)?;
-        let book = Book::replay(account_id, &partition, &entries)?;
+        // From its latest snapshot and the journal's tail (contract v25,
+        // W9.10), never the whole journal once one is kept.
+        let (book, replayed) = book_from(&mut tx, account_id, &partition)?;
         let decided = decide(&book, head.max(0) as u64)?;
         let entry = &decided.entry;
 
@@ -895,12 +1025,54 @@ impl Store for PostgresStore {
             entry.first_sequence,
             &decided.changes,
         )?;
+        // A snapshot once the tail since the last one reaches the interval,
+        // as at this entry, in the same transaction.
+        if replayed as u64 + 1 >= self.snapshot_interval {
+            keep_snapshot(&mut tx, &decided.book, entry.cause.committed_at_ns)?;
+        }
         tx.commit().map_err(unavailable)?;
         Ok(Acted::Committed(Box::new(decided)))
     }
 
     fn journal(&self, account_id: &str) -> Result<Vec<Entry>> {
         journal_of(&mut *self.conn()?, account_id)
+    }
+
+    fn book(&self, account_id: &str) -> Result<Book> {
+        let mut conn = self.conn()?;
+        let partition: String = conn
+            .query_opt(
+                "SELECT partition FROM book_account WHERE account_id = $1",
+                &[&account_id],
+            )
+            .map_err(unavailable)?
+            .map(|row| row.get(0))
+            .unwrap_or_else(|| first_partition_of(account_id).to_string());
+        Ok(book_from(&mut *conn, account_id, &partition)?.0)
+    }
+
+    fn book_as_of(&self, account_id: &str, at: &Mark, until: Option<&str>) -> Result<Book> {
+        let mut conn = self.conn()?;
+        let partition: String = conn
+            .query_opt(
+                "SELECT partition FROM book_account WHERE account_id = $1",
+                &[&account_id],
+            )
+            .map_err(unavailable)?
+            .map(|row| row.get(0))
+            .unwrap_or_else(|| FIRST_PARTITION.to_string());
+        let at = at.get(&partition).copied().unwrap_or(0);
+        match snapshot_of(&mut *conn, account_id, Some(at), until)? {
+            Some(kept) => {
+                let after = crate::snapshot::last_sequence(&kept);
+                let tail = journal_after(&mut *conn, account_id, after)?;
+                kept.resume_as_of(&tail, Some(at), until)
+            }
+            None => {
+                let entries = journal_of(&mut *conn, account_id)?;
+                Book::as_of(account_id, &partition, &entries, Some(at), until)
+            }
+        }
     }
 
     fn accounts(&self) -> Result<Vec<String>> {
@@ -1187,7 +1359,8 @@ impl Store for PostgresStore {
         tx.execute("SELECT 1 FROM book_partition_head FOR UPDATE", &[])
             .map_err(unavailable)?;
         tx.batch_execute(
-            "DELETE FROM book_position; DELETE FROM book_lot; DELETE FROM book_pending;
+            "DELETE FROM book_snapshot;
+             DELETE FROM book_position; DELETE FROM book_lot; DELETE FROM book_pending;
              DELETE FROM book_break; DELETE FROM book_figures; DELETE FROM book_attributes;
              DELETE FROM book_order; DELETE FROM book_placement; DELETE FROM book_execution;
              DELETE FROM book_unplaced; DELETE FROM book_locate; DELETE FROM book_instruction;
@@ -1207,6 +1380,15 @@ impl Store for PostgresStore {
             replayed += entries.len();
             let book = Book::replay(&account, &partition, &entries)?;
             project(&mut tx, &account, &all_changes(&book)?)?;
+            // Snapshots made again from the journal (contract v25, W9.10):
+            // as at the latest entry, where the journal reaches the interval.
+            if entries.len() as u64 >= self.snapshot_interval {
+                let taken = entries
+                    .last()
+                    .map(|entry| entry.cause.committed_at_ns)
+                    .unwrap_or_default();
+                keep_snapshot(&mut tx, &book, taken)?;
+            }
             // Each order's history, entry by entry, as the journal holds it.
             for (order_id, entry_ids) in &book.ledger.order_entries {
                 for entry in entries

@@ -42,6 +42,10 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let url = required("MERIDIAN_BOR_DATABASE_URL")?;
+    // How many entries an account's journal grows by between snapshots
+    // (contract v25, W9.10): the chart's `bor.snapshotInterval`.
+    let interval =
+        meridian_bor::snapshot::interval_from(var("MERIDIAN_BOR_SNAPSHOT_INTERVAL").as_deref())?;
 
     match std::env::args().nth(1).as_deref() {
         Some("migrate") => {
@@ -71,7 +75,9 @@ fn run() -> Result<(), String> {
             // The projections made again from the journal alone (W9.8): what
             // a replay test holds the book to, and what an operator runs
             // after restoring a journal.
-            let store = PostgresStore::connect(&url, 1).map_err(|failed| failed.to_string())?;
+            let store = PostgresStore::connect(&url, 1)
+                .map_err(|failed| failed.to_string())?
+                .with_snapshot_interval(interval);
             store.verify().map_err(|failed| failed.to_string())?;
             let replayed = meridian_bor::Store::rebuild(&store)
                 .map_err(|failed| format!("the book could not be rebuilt: {failed}"))?;
@@ -89,7 +95,11 @@ fn run() -> Result<(), String> {
     let store: Arc<dyn meridian_bor::Store> = Arc::new(wait_for_store(
         "the book's database",
         &url,
-        |url| PostgresStore::connect(url, 8).map_err(|failed| failed.to_string()),
+        |url| {
+            PostgresStore::connect(url, 8)
+                .map(|store| store.with_snapshot_interval(interval))
+                .map_err(|failed| failed.to_string())
+        },
         |store| {
             store.verify().map_err(|failed| match failed {
                 StoreError::SchemaAhead(_) => Wait::Refused(failed.to_string()),

@@ -2270,6 +2270,8 @@ async fn an_accept_to_a_new_order_makes_it_filled_with_the_ems_s_placement_as_of
         replayed.ledger.order_record(&order.order_id, true).unwrap(),
         order_now(&w, &order.order_id)
     );
+    // And from a snapshot at any of its entries (contract v25, W9.10).
+    crate::snapshot::tests::holds_at_every_split(ACC, "P0", &w.store.journal(ACC).unwrap());
 }
 
 #[tokio::test(flavor = "multi_thread")]

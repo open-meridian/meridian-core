@@ -290,6 +290,10 @@ async fn an_order_is_booked_to_its_account_and_its_lots_re_stated_at_the_average
     assert_eq!(booking_state(&handed), BookingState::HandedOff);
     let twice = hand_off(&w, &booking.booking_id, false).await.unwrap_err();
     assert_eq!(code(&twice), Some(RefusalReason::OrderState), "{twice}");
+    // A booked account's book from a snapshot at any entry (contract v25).
+    let journal = w.store.journal(ACC).unwrap();
+    let partition = journal[0].partition.clone();
+    crate::snapshot::tests::holds_at_every_split(ACC, &partition, &journal);
 }
 
 #[tokio::test(flavor = "multi_thread")]
