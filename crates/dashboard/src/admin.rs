@@ -2326,7 +2326,7 @@ async fn instruments_page(
     );
     let held = calendars::held(&app.bus, &filter).await;
     let codes = match &held {
-        Ok(listed) => calendars::currency_codes(&app.bus, listed).await,
+        Ok(listed) => calendars::subject_codes(&app.bus, listed).await,
         Err(_) => Default::default(),
     };
     let chosen = field(&query, "calendar");

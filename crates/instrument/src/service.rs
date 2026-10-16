@@ -335,8 +335,14 @@ pub fn serve_all_within(
         bus.serve(RESOLVE_VENUE, move |envelope| {
             let request: meridian_domain::v1::ResolveVenueRequest =
                 decode(&envelope, "meridian.v1.ResolveVenueRequest")?;
-            if request.identifiers.is_empty() {
-                return Err("identifiers: at least one names the venue".into());
+            // By its ID (contract v25, D9), set instead of identifiers.
+            if !request.venue_id.is_empty() && !request.identifiers.is_empty() {
+                return Err(
+                    "venue_id: set instead of identifiers, never beside them (W3.14)".into(),
+                );
+            }
+            if request.identifiers.is_empty() && request.venue_id.is_empty() {
+                return Err("identifiers: at least one names the venue, or venue_id".into());
             }
             let reply = crate::venues::resolve_venue(store.as_ref(), &request, clock.now_ns())
                 .map_err(|failed| failed.to_string())?;
@@ -2621,6 +2627,7 @@ mod tests {
                 .await,
             Handled::Kept(true)
         );
+        let asked_again = asked.clone();
         let found: ResolveVenueReply = ask(
             &bus,
             RESOLVE_VENUE,
@@ -2631,6 +2638,32 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(found.venue.unwrap().venue_id, "VEN-XNYS");
+        // By its ID (contract v25, D9), and never both ways at once.
+        let by_id: ResolveVenueReply = ask(
+            &bus,
+            RESOLVE_VENUE,
+            "meridian.v1.ResolveVenueRequest",
+            ResolveVenueRequest {
+                venue_id: "VEN-XNYS".into(),
+                ..Default::default()
+            },
+            "",
+        )
+        .await
+        .unwrap();
+        assert_eq!(by_id.venue.unwrap().name, "New York Stock Exchange");
+        let both = ask::<ResolveVenueReply>(
+            &bus,
+            RESOLVE_VENUE,
+            "meridian.v1.ResolveVenueRequest",
+            ResolveVenueRequest {
+                venue_id: "VEN-XNYS".into(),
+                ..asked_again.clone()
+            },
+            "",
+        )
+        .await;
+        assert!(both.is_err_and(|why| why.contains("venue_id")));
 
         let minted: ResolveIdentifierReply = ask(
             &bus,

@@ -1479,6 +1479,34 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
             .map_err(|e| e.to_string())?;
         Ok(("".into(), held_calendars(&asked).encode_to_vec()))
     });
+    // Contract v25 (D9): a calendar's venue read by its ID, shown by its MIC.
+    bus.serve(crate::admin::calendars::RESOLVE_VENUE, |envelope| {
+        let asked = meridian_domain::v1::ResolveVenueRequest::decode(&envelope.payload[..])
+            .map_err(|e| e.to_string())?;
+        let (mic, name) = match asked.venue_id.as_str() {
+            "VEN-01JAE00000000000000XNYS" => ("XNYS", "New York Stock Exchange"),
+            "VEN-01JAE00000000000000XNAS" => ("XNAS", "Nasdaq"),
+            _ => ("", ""),
+        };
+        Ok((
+            "".into(),
+            meridian_domain::v1::ResolveVenueReply {
+                found: !mic.is_empty(),
+                venue: (!mic.is_empty()).then(|| meridian_domain::v1::VenueRecord {
+                    venue_id: asked.venue_id.clone(),
+                    name: name.into(),
+                    identifiers: vec![meridian_domain::v1::Identifier {
+                        scheme: "iso10383".into(),
+                        value: mic.into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                miss_reason: 0,
+            }
+            .encode_to_vec(),
+        ))
+    });
     bus.serve(crate::admin::calendars::READ_CALENDAR, |envelope| {
         let asked = meridian_domain::v1::ReadCalendarRequest::decode(&envelope.payload[..])
             .map_err(|e| e.to_string())?;

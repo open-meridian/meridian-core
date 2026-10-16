@@ -8,8 +8,9 @@
 //! From contract v23 (W3.21; v23's Q14 and Q15) each line shows its subject
 //! resolved -- a currency's ISO 4217 code, from the deployment's record
 //! carrying the platform's ID; a settlement system's name and country; the
-//! venues by their `VEN-` IDs until the dashboard may read a venue by its ID
-//! -- and the tab is filtered by kind and searched by text on the store's
+//! venues by their `VEN-` IDs until the dashboard may read a venue by its ID,
+//! and from contract v25 (D9) each by its MIC with its name beside it -- and
+//! the tab is filtered by kind and searched by text on the store's
 //! side, so it searches rather than pages.
 
 use std::collections::BTreeMap;
@@ -19,7 +20,7 @@ use std::time::Duration;
 use meridian_domain::v1::{
     CalendarDayKind, CalendarKind, HeldCalendar, ListCalendarsReply, ListCalendarsRequest,
     ListInstrumentsToCompleteReply, ListInstrumentsToCompleteRequest, ReadCalendarReply,
-    ReadCalendarRequest, Weekday,
+    ReadCalendarRequest, ResolveVenueReply, ResolveVenueRequest, Weekday,
 };
 use prost::Message;
 
@@ -29,6 +30,8 @@ use crate::html::escape;
 pub const LIST_CALENDARS: &str = "platform.reference.query.list-calendars";
 /// W3.19: a calendar's days over a range.
 pub const READ_CALENDAR: &str = "platform.reference.query.read-calendar";
+/// W3.14: a venue held, read by its ID (contract v25, D9).
+pub const RESOLVE_VENUE: &str = "platform.reference.query.resolve-venue";
 
 const WAIT: Duration = Duration::from_secs(5);
 
@@ -122,11 +125,11 @@ pub async fn held(bus: &meridian_bus::Bus, filter: &Filter) -> Result<ListCalend
     }
 }
 
-/// The ISO 4217 code of each currency a line names by its platform `INS-`
-/// ID, from the deployment's record carrying that ID (its `iso4217`
+/// What each line's subject reads as: the ISO 4217 code of each currency a
+/// line names by its platform `INS-` ID, from the deployment's record carrying that ID (its `iso4217`
 /// identifier, else its currency); an ID no record carries is left out, and
 /// the line shows the ID itself.
-pub async fn currency_codes(
+pub async fn subject_codes(
     bus: &meridian_bus::Bus,
     listed: &ListCalendarsReply,
 ) -> BTreeMap<String, String> {
@@ -179,12 +182,56 @@ pub async fn currency_codes(
             codes.insert(id.to_string(), code);
         }
     }
+    // Each venue by its MIC, ISO 10383's code, with its name beside it
+    // (contract v25, D9): read by its `VEN-` ID from the venues held. A
+    // venue not held, or not read, is left out, and the line shows its ID.
+    let venue_ids: std::collections::BTreeSet<&str> = listed
+        .calendars
+        .iter()
+        .flat_map(|calendar| calendar.venue_ids.iter().map(String::as_str))
+        .collect();
+    for id in venue_ids {
+        let found: Result<ResolveVenueReply, String> = ask(
+            bus,
+            RESOLVE_VENUE,
+            "meridian.v1.ResolveVenueRequest",
+            ResolveVenueRequest {
+                venue_id: id.to_string(),
+                ..Default::default()
+            },
+        )
+        .await;
+        if let Some(words) = found
+            .ok()
+            .and_then(|found| found.venue)
+            .map(|venue| venue_words(&venue))
+        {
+            codes.insert(id.to_string(), words);
+        }
+    }
     codes
 }
 
+/// A venue as a person reads it: its MIC, the one in force, and its name;
+/// the name alone where it carries no MIC.
+fn venue_words(venue: &meridian_domain::v1::VenueRecord) -> String {
+    let mic = venue
+        .identifiers
+        .iter()
+        .find(|held| held.scheme == "iso10383" && held.valid_until_ns == 0)
+        .map(|held| held.value.as_str());
+    match (mic, venue.name.is_empty()) {
+        (Some(mic), false) => format!("{mic} ({})", venue.name),
+        (Some(mic), true) => mic.to_string(),
+        (None, false) => venue.name.clone(),
+        (None, true) => venue.venue_id.clone(),
+    }
+}
+
 /// A line's subject as a person reads it: the currency's ISO 4217 code (its
-/// platform ID where no record carries it), each venue by its `VEN-` ID,
-/// the settlement system's name and country.
+/// platform ID where no record carries it), each venue by its MIC and name
+/// (its `VEN-` ID where it was not read), the settlement system's name and
+/// country.
 fn subject_words(calendar: &HeldCalendar, codes: &BTreeMap<String, String>) -> String {
     let mut words = Vec::new();
     if !calendar.instrument_id.is_empty() {
@@ -196,7 +243,12 @@ fn subject_words(calendar: &HeldCalendar, codes: &BTreeMap<String, String>) -> S
         );
     }
     if !calendar.venue_ids.is_empty() {
-        words.push(format!("venues {}", calendar.venue_ids.join(", ")));
+        let venues: Vec<String> = calendar
+            .venue_ids
+            .iter()
+            .map(|id| codes.get(id).cloned().unwrap_or_else(|| id.clone()))
+            .collect();
+        words.push(format!("venues {}", venues.join(", ")));
     }
     if let Some(system) = calendar.settlement_system.as_ref() {
         words.push(if system.country_code.is_empty() {
@@ -618,7 +670,13 @@ mod tests {
             ],
             ..Default::default()
         });
-        let codes = BTreeMap::from([("INS-USD".to_string(), "USD".to_string())]);
+        let codes = BTreeMap::from([
+            ("INS-USD".to_string(), "USD".to_string()),
+            (
+                "VEN-XNYS".to_string(),
+                "XNYS (New York Stock Exchange)".to_string(),
+            ),
+        ]);
         let filter = Filter::from_page("CALENDAR_KIND_CURRENCY", "  dollar ");
         assert_eq!(
             filter,
@@ -634,7 +692,9 @@ mod tests {
             page.contains("data-subject>INS-CHF</td>"),
             "a currency no record carries is shown by its platform ID"
         );
-        assert!(page.contains("venues VEN-XNYS, VEN-XNAS"));
+        // A venue by its MIC and name (contract v25, D9); one not read by
+        // its ID.
+        assert!(page.contains("venues XNYS (New York Stock Exchange), VEN-XNAS"));
         assert!(page.contains("DTC &lt;&amp;&gt;, US"));
         assert!(page.contains("<option value=\"CALENDAR_KIND_CURRENCY\" selected>"));
         assert!(page.contains("name=\"calendar_query\" maxlength=\"100\" value=\"dollar\""));
@@ -645,5 +705,28 @@ mod tests {
         let loose = Filter::from_page("CALENDAR_KIND_NOT_A_KIND", &"x".repeat(300));
         assert_eq!(loose.kind, 0);
         assert_eq!(loose.query.chars().count(), 100);
+    }
+
+    #[test]
+    fn a_venue_reads_as_its_mic_and_name() {
+        use meridian_domain::v1::{Identifier, VenueRecord};
+        let mic = |value: &str, until: i64| Identifier {
+            scheme: "iso10383".into(),
+            value: value.into(),
+            valid_until_ns: until,
+            ..Default::default()
+        };
+        let venue = VenueRecord {
+            venue_id: "VEN-XNYS".into(),
+            name: "New York Stock Exchange".into(),
+            identifiers: vec![mic("XOLD", 5), mic("XNYS", 0)],
+            ..Default::default()
+        };
+        assert_eq!(venue_words(&venue), "XNYS (New York Stock Exchange)");
+        let unnamed = VenueRecord {
+            venue_id: "VEN-Q".into(),
+            ..Default::default()
+        };
+        assert_eq!(venue_words(&unnamed), "VEN-Q");
     }
 }
