@@ -375,6 +375,30 @@ fn an_execution_at_1730_new_york_takes_the_next_trade_date() {
 }
 
 #[test]
+fn a_trade_date_after_fridays_cut_rolls_past_the_weekend_and_never_a_holiday() {
+    // Contract v25 (decision 65, item 111): Friday 9 October 2026 at 21:30
+    // UTC is 17:30 in New York, after the cut. The trade date is Monday the
+    // 12th, never Saturday the 10th -- and stays the 12th though Columbus
+    // Day closes USD, a holiday moving no trade date. EUR/USD spot, two days
+    // counted on TARGET from Monday, is Wednesday the 14th. (Until v25 the
+    // trade date was Saturday, its spot Tuesday the 13th; a trade date moved
+    // past the holiday would give Thursday the 15th.)
+    let after = ask(
+        &latest(),
+        Inputs::Spot(SpotDateInputs {
+            pair: vec![CASH_EUR.into(), CASH_USD.into()],
+            trade_date: String::new(),
+            at_ns: 1_791_581_400_000_000_000,
+        }),
+    );
+    assert_eq!(after.reply.outcome, DateOutcome::Computed as i32);
+    assert_eq!(after.reply.date, "2026-10-14");
+    // The same spot asked by its trade date, Monday.
+    let by_date = ask(&latest(), spot([CASH_EUR, CASH_USD], "2026-10-12"));
+    assert_eq!(by_date.reply.date, after.reply.date);
+}
+
+#[test]
 fn a_date_past_coverage_is_not_computed_and_never_a_business_day_by_default() {
     let answer = ask(&latest(), settlement("2028-12-29"));
     // Friday the 29th: T+1 is Monday 1 January 2029, past the coverage.

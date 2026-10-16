@@ -448,8 +448,12 @@ fn calendars_field(field: &str, calendars: &[String]) -> Result<(), String> {
 }
 
 /// The trade date of an execution at `at_ns`: its date in the cut's zone,
-/// and the next day at or after the cut (the calendars spec's Q7).
-fn trade_date_at(rule: &SpotDateRule, at_ns: i64) -> Result<Date, String> {
+/// and the next day at or after the cut (the calendars spec's Q7), then
+/// rolled forward past the pair's weekend days (contract v25; decision 65,
+/// item 111): after Friday's cut the trade date is Monday, never Saturday.
+/// Weekends only: a holiday does not move a trade date, the dealing day the
+/// market keeps; the dates counted from it skip holidays.
+fn trade_date_at(held: &Held, rule: &SpotDateRule, at_ns: i64) -> Result<Date, String> {
     let cut = rule
         .cut
         .as_ref()
@@ -477,12 +481,45 @@ fn trade_date_at(rule: &SpotDateRule, at_ns: i64) -> Result<Date, String> {
     let (date, seconds) = zone
         .local(at_ns)
         .ok_or_else(|| "spot.at_ns: is outside the dates a calendar names".to_string())?;
-    if seconds >= hours * 3600 + minutes * 60 {
-        Date::from_days(date.days_since_epoch() + 1)
-            .ok_or_else(|| "spot.at_ns: is outside the dates a calendar names".to_string())
+    let outside = || "spot.at_ns: is outside the dates a calendar names".to_string();
+    let mut trade = if seconds >= hours * 3600 + minutes * 60 {
+        Date::from_days(date.days_since_epoch() + 1).ok_or_else(outside)?
     } else {
-        Ok(date)
+        date
+    };
+    // The pair's weekend: the weekend days in force on each calendar the
+    // rule counts or settles on, those held; none held, the date stands and
+    // the spot's read names the calendar not held.
+    for _ in 0..7 {
+        if !pair_weekend(held, rule, trade) {
+            break;
+        }
+        trade = Date::from_days(trade.days_since_epoch() + 1).ok_or_else(outside)?;
     }
+    Ok(trade)
+}
+
+/// Whether `date` is a weekend day of the pair: on any of the rule's
+/// counting or spot calendars held, by the weekend in force then, whatever
+/// the calendar lists for the day itself.
+fn pair_weekend(held: &Held, rule: &SpotDateRule, date: Date) -> bool {
+    rule.counting_calendars
+        .iter()
+        .chain(rule.spot_calendars.iter())
+        .filter_map(|id| held.calendars.get(id))
+        .any(|calendar| {
+            calendar
+                .weekends
+                .iter()
+                .filter_map(|weekend| {
+                    Date::parse(&weekend.valid_from_date)
+                        .ok()
+                        .filter(|from| *from <= date)
+                        .map(|from| (from, weekend))
+                })
+                .max_by_key(|(from, _)| *from)
+                .is_some_and(|(_, weekend)| weekend.weekdays.contains(&(weekday(date) as i32)))
+        })
 }
 
 /// A pair's spot date from a trade date: counted by the lag on the counting
@@ -708,7 +745,7 @@ pub fn compute(
                     else {
                         return Ok(rule_not_held(subject, DateRuleKind::Spot, now_ns));
                     };
-                    trade_date_at(parameters, asked.at_ns)?
+                    trade_date_at(held, parameters, asked.at_ns)?
                 }
             };
             let Some(rule) = held.rule(DateRuleKind::Spot, Some(trade), pair) else {
