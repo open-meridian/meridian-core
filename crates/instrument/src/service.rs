@@ -322,6 +322,21 @@ pub fn serve_all_within(
                 {
                     tracing::warn!(%failed, "a miss could not be counted for the usage report");
                 }
+                // A source thinner than the minimum, answered not found, is
+                // the store's own miss (contract v25, W3.2; item 81), by the
+                // identifiers asked; never sent. A plugin reports nothing for
+                // it, and a report of one is the same miss, a no-op.
+                if resolution.reply.miss_reason == meridian_domain::v1::MissReason::NotFound as i32
+                    && !crate::one_id::meets_minimum(&request)
+                {
+                    if let Err(failed) = crate::usage::note_below_minimum(
+                        store.as_ref(),
+                        &request.identifiers,
+                        now_ns,
+                    ) {
+                        tracing::warn!(%failed, "a below-minimum miss could not be recorded");
+                    }
+                }
             }
             Ok((
                 "meridian.v1.ResolveIdentifierReply".to_string(),
@@ -2307,6 +2322,80 @@ mod tests {
             currency: "USD".into(),
             ..Default::default()
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_source_below_the_minimum_is_the_stores_own_miss_and_a_report_of_it_changes_nothing()
+    {
+        // Contract v25 (W3.2; item 81): answered not found, nothing minted,
+        // recorded by the store as a miss by the identifiers asked, counted,
+        // and never sent; a plugin's report of it is the same miss.
+        let bus = bus();
+        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        serve_queries(&bus, store.clone(), bus.clock());
+        let mut thin = snap();
+        thin.stated_description.clear();
+        for _ in 0..2 {
+            let missed: ResolveIdentifierReply = ask(
+                &bus,
+                RESOLVE_IDENTIFIER,
+                "meridian.v1.ResolveIdentifierRequest",
+                thin.clone(),
+                "",
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                missed.miss_reason,
+                meridian_domain::v1::MissReason::NotFound as i32
+            );
+        }
+        assert_eq!(store.count().unwrap(), 0, "nothing minted");
+        let held = crate::usage::below_minimum_misses(store.as_ref()).unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].asked, 2);
+        assert_eq!(
+            held[0].identifiers,
+            vec![("symbol".into(), "SNAP1".into(), "snaptrade".into())]
+        );
+        // A report of it (MISS_REASON_NOT_FOUND) is a no-op.
+        let reactor = Reactor::new(bus.clone(), store.clone(), bus.clock());
+        let reported = reactor
+            .react(Delivery {
+                envelope: Envelope {
+                    meta: None,
+                    payload_type: "meridian.v1.MissingInstrumentDetectedEvent".into(),
+                    payload: meridian_domain::v1::MissingInstrumentDetectedEvent {
+                        identifiers: thin.identifiers.clone(),
+                        reason: meridian_domain::v1::MissReason::NotFound as i32,
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                },
+                sequence: 1,
+            })
+            .await;
+        assert!(matches!(reported, Handled::Listed(false)));
+        assert_eq!(
+            crate::usage::below_minimum_misses(store.as_ref()).unwrap(),
+            held
+        );
+        // A source meeting the minimum is no below-minimum miss.
+        let _: ResolveIdentifierReply = ask(
+            &bus,
+            RESOLVE_IDENTIFIER,
+            "meridian.v1.ResolveIdentifierRequest",
+            snap(),
+            "",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            crate::usage::below_minimum_misses(store.as_ref())
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
