@@ -33,6 +33,15 @@ pub struct Declared {
     /// contract v22): absent from a version declaring none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub algorithms: Vec<DeclaredAlgorithm>,
+    /// An operations plugin's affirmation deadline, minutes after midnight
+    /// in the deployment's time zone (W11.34, contract v25): absent or 0
+    /// from a version declaring none.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub affirmation_deadline: u32,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 /// One algorithm identifier as an upload carries it (contract v22).
@@ -210,6 +219,7 @@ pub fn from_json(declared: &Declared) -> Result<PluginDeclaration, String> {
                 description: algorithm.description.clone(),
             })
             .collect(),
+        affirmation_deadline: declared.affirmation_deadline,
         ..PluginDeclaration::default()
     })
 }
@@ -304,6 +314,8 @@ pub fn to_json(declaration: &PluginDeclaration) -> serde_json::Value {
             "algorithm_id": algorithm.algorithm_id,
             "description": algorithm.description,
         })).collect::<Vec<_>>(),
+        // Contract v25 (W11.34): minutes after midnight, 0 for none.
+        "affirmation_deadline": declaration.affirmation_deadline,
     })
 }
 

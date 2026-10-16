@@ -857,9 +857,11 @@ fn alert(
             state: AlertState::Raised as i32,
             reason,
             subject: Some(subject),
-            // The operations plugin's affirmation_deadline has no carrier in
-            // the contract yet, so a held booking's alert names no moment it
-            // is due by; zero, as the field reads for every other alert.
+            // From contract v25 the operations plugin's declaration carries
+            // its affirmation_deadline (W11.34), but no row brings a
+            // version's declaration to the book and the deployment names no
+            // time zone of its own, so a held booking's alert still names no
+            // moment it is due by: zero, as W11.34 reads it with none known.
             due_by: 0,
             last_change: None,
         },

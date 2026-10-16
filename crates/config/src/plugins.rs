@@ -243,6 +243,29 @@ fn declared(declaration: &PluginDeclaration, roles: &[String]) -> Result<(), Str
             ));
         }
     }
+    // An operations plugin's affirmation deadline (W11.28, W11.34; contract
+    // v25): minutes after midnight, 1 to 1440, 0 declaring none; refused on
+    // a version not holding operations.
+    if declaration.affirmation_deadline != 0 {
+        use meridian_pb::bounds::PLUGIN_DECLARATION_AFFIRMATION_DEADLINE_RANGE;
+        if !PLUGIN_DECLARATION_AFFIRMATION_DEADLINE_RANGE
+            .admits(i64::from(declaration.affirmation_deadline))
+        {
+            return Err(format!(
+                "declaration.affirmation_deadline is {}; minutes after midnight, 1 to {}, or 0 \
+                 for none",
+                declaration.affirmation_deadline,
+                PLUGIN_DECLARATION_AFFIRMATION_DEADLINE_RANGE.most
+            ));
+        }
+        if !roles.iter().any(|role| role == "operations") {
+            return Err(
+                "declaration.affirmation_deadline is declared by a version not holding \
+                 operations; only operations declares the firm's affirmation deadline"
+                    .into(),
+            );
+        }
+    }
     // A data plugin's catalogue (W8.1, contract v18), as `meridian plugin check`
     // says first and the sidecar again at registration.
     if let Some(catalogue) = &declaration.catalogue {

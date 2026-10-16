@@ -858,3 +858,44 @@ async fn an_image_another_version_still_runs_is_not_released() {
     retire(&bus, "0.1.1", "a duplicate").await.unwrap();
     assert!(released.0.lock().unwrap().is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_affirmation_deadline_is_operations_and_a_time_of_day() {
+    // Contract v25 (W8.1, W11.34): 1 to 1440 minutes after midnight, 0 for
+    // none, refused on a version not holding operations.
+    let (bus, _) = harness();
+    let with = |roles: &[&str], deadline: u32, version: &str| {
+        let mut upload = snaptrade(version);
+        let metadata = upload.metadata.as_mut().unwrap();
+        metadata.roles = roles.iter().map(|r| r.to_string()).collect();
+        metadata.declaration = Some(meridian_pb::v1::PluginDeclaration {
+            affirmation_deadline: deadline,
+            ..Default::default()
+        });
+        upload
+    };
+    let refused = upload(&bus, with(&["custody"], 1260, "0.1.0"))
+        .await
+        .unwrap_err();
+    assert!(refused.contains("not holding operations"), "{refused}");
+    let refused = upload(&bus, with(&["operations"], 1441, "0.1.1"))
+        .await
+        .unwrap_err();
+    assert!(
+        refused.contains("affirmation_deadline is 1441"),
+        "{refused}"
+    );
+    let recorded = upload(&bus, with(&["operations"], 1260, "0.1.2"))
+        .await
+        .unwrap();
+    assert_eq!(
+        recorded
+            .metadata
+            .unwrap()
+            .declaration
+            .unwrap()
+            .affirmation_deadline,
+        1260
+    );
+    upload(&bus, with(&["custody"], 0, "0.1.3")).await.unwrap();
+}
