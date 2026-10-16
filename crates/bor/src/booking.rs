@@ -1597,12 +1597,9 @@ pub fn held_alerts_for(ctx: &Context, book: &Book, acts: &[Act]) -> Vec<Act> {
 
 // ── W11.32: a give-up's answer ─────────────────────────────────────────────
 
-pub fn report_give_up(
-    book: &Book,
-    head: u64,
-    ctx: &Context,
-    request: &ReportGiveUpRequest,
-) -> Result<Made> {
+/// A give-up's answer held to its shape: accepted or rejected (W11.32); what
+/// a fact kept unplaced is held to as well (contract v25).
+pub fn give_up_holds(request: &ReportGiveUpRequest) -> Result<GiveUpAnswer> {
     let answer = GiveUpAnswer::try_from(request.answer).unwrap_or(GiveUpAnswer::Unspecified);
     if answer == GiveUpAnswer::Unspecified {
         return Err(malformed(
@@ -1610,6 +1607,16 @@ pub fn report_give_up(
             "a give-up's answer is accepted or rejected",
         ));
     }
+    Ok(answer)
+}
+
+pub fn report_give_up(
+    book: &Book,
+    head: u64,
+    ctx: &Context,
+    request: &ReportGiveUpRequest,
+) -> Result<Made> {
+    let answer = give_up_holds(request)?;
     let Some(execution) = book.ledger.executions.get(&request.execution_id) else {
         return Err(malformed(
             &["execution_id"],

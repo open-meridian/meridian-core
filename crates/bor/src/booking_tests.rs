@@ -807,6 +807,52 @@ async fn a_give_up_answer_is_recorded_on_the_execution_and_its_allocation() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_give_up_naming_nothing_held_is_kept_unplaced_whole() {
+    // Contract v25 (W11.32; decision 30): its own arm, fact kind `give-up`.
+    let w = wired();
+    account(&w, ACC).await;
+    let report = ReportGiveUpRequest {
+        execution_id: "EXE-NOT-HELD".into(),
+        allocation_id: String::new(),
+        answer: GiveUpAnswer::Accepted as i32,
+        prime_reference: "PB-1".into(),
+        reason: "accepted".into(),
+        raw_record: None,
+    };
+    let reply = send_from(
+        &w.bus,
+        REPORT_GIVE_UP,
+        "meridian.v1.ReportGiveUpRequest",
+        &report,
+        &As::default(),
+    )
+    .await
+    .unwrap();
+    let kept = FactReply::decode(&reply[..]).unwrap().unplaced.unwrap();
+    assert_eq!(kept.fact_kind, "give-up");
+    assert!(kept.account_id.is_empty(), "naming no account");
+    assert_eq!(
+        kept.fact,
+        Some(meridian_domain::v1::unplaced_fact::Fact::GiveUp(
+            report.clone()
+        ))
+    );
+    // Still held to its shape: an answer is accepted or rejected.
+    let mut unanswered = report.clone();
+    unanswered.answer = GiveUpAnswer::Unspecified as i32;
+    let refused = send_from(
+        &w.bus,
+        REPORT_GIVE_UP,
+        "meridian.v1.ReportGiveUpRequest",
+        &unanswered,
+        &As::default(),
+    )
+    .await
+    .unwrap_err();
+    assert!(refused.contains("accepted or rejected"), "{refused}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_sleeve_cross_fills_its_two_orders_moving_lots_between_sleeves() {
     let w = wired();
     account(&w, ACC).await;

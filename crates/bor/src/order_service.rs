@@ -371,7 +371,7 @@ fn act(
 
 /// A fact naming no account the book holds: kept unplaced, naming none.
 #[allow(clippy::too_many_arguments)]
-fn no_account(
+pub(crate) fn no_account(
     bus: &Bus,
     store: &dyn Store,
     envelope: &Envelope,

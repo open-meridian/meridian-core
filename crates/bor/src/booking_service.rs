@@ -714,6 +714,28 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
             let request: ReportGiveUpRequest =
                 decode(&envelope, "meridian.v1.ReportGiveUpRequest")?;
             let ctx = context_of(&envelope, clock.as_ref());
+            // A give-up naming no execution the book holds is kept as an
+            // unplaced fact, the report whole in its own arm, naming no
+            // account (contract v25, W11.32; decision 30), as an execution
+            // the book cannot place is (W11.13). Held to its shape first.
+            if !request.execution_id.is_empty()
+                && store
+                    .owner(Record::Execution, &request.execution_id)
+                    .map_err(|failed| failed.on_the_bus())?
+                    .is_none()
+            {
+                booking::give_up_holds(&request).map_err(|failed| failed.on_the_bus())?;
+                return crate::order_service::no_account(
+                    &bus2,
+                    store.as_ref(),
+                    &envelope,
+                    ctx,
+                    meridian_domain::v1::unplaced_fact::Fact::GiveUp(request.clone()),
+                    meridian_domain::v1::UnplacedReason::Unspecified,
+                    "",
+                    request.raw_record.clone(),
+                );
+            }
             let account = owner(
                 store.as_ref(),
                 Record::Execution,
