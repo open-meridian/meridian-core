@@ -32,9 +32,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use meridian_bus::BusError;
-use meridian_domain::v1::{
-    PluginVersion, ReadPluginDocumentationReply, ReadPluginDocumentationRequest,
-};
+use meridian_domain::v1::{ReadPluginDocumentationReply, ReadPluginDocumentationRequest};
 use meridian_pb::v1::{AccessLevel, PluginDeclaration, SettingType};
 use prost::Message;
 
@@ -80,11 +78,31 @@ pub const VERSIONS_PATH: &str = "/admin/plugins/versions";
 
 pub fn routes() -> Router<Arc<App>> {
     Router::new()
-        .route("/admin/plugins/versions", get(versions_page))
         .route(
             "/admin/plugins/versions/{name}/{version}/documentation",
             get(version_page),
         )
+        // A version installed from a registry, named by its listing,
+        // `organisation/plugin` (W8.10).
+        .route(
+            "/admin/plugins/versions/{organisation}/{plugin}/{version}/documentation",
+            get(listed_version_page),
+        )
+}
+
+async fn listed_version_page(
+    state: State<Arc<App>>,
+    Path((organisation, plugin, version)): Path<(String, String, String)>,
+    asked: Query<Asked>,
+    headers: HeaderMap,
+) -> Response {
+    version_page(
+        state,
+        Path((format!("{organisation}/{plugin}"), version)),
+        asked,
+        headers,
+    )
+    .await
 }
 
 /// One version's documentation, read as the person.
@@ -806,82 +824,7 @@ pub fn with_policy(html: String) -> Response {
     response
 }
 
-// ── The portal's pages ──────────────────────────────────────────────────
-
-/// Every version in the catalogue, none for a catalogue not read in time.
-pub(crate) async fn versions(app: &App) -> Result<Vec<PluginVersion>, String> {
-    crate::catalogue::catalogue(app)
-        .await
-        .map(|catalogue| catalogue.versions)
-}
-
-/// `GET /admin/plugins/versions`: each uploaded version on one line, a
-/// deployment admin's, each linking its Documentation page.
-async fn versions_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
-    let (session, _) = match crate::admin::gate(&app, &headers, true) {
-        Ok(gated) => gated,
-        Err(response) => return *response,
-    };
-    let listed = versions(&app).await;
-    let body = match listed {
-        Err(failed) => format!(
-            "<p class=\"error\" role=\"alert\">The catalogue could not be read: {}</p>",
-            escape(&failed)
-        ),
-        Ok(versions) => {
-            let rows: Vec<String> = versions
-                .iter()
-                .map(|v| {
-                    let m = v.metadata.clone().unwrap_or_default();
-                    let state = if v.retired_at_ns > 0 { "retired" } else { "listed" };
-                    let sections = m
-                        .declaration
-                        .as_ref()
-                        .map_or(0, |d| d.documentation.len());
-                    format!(
-                        "<tr data-version=\"{name}@{version}\"><td><a href=\"{href}\">{name}</a></td>\
-                         <td>{version}</td><td class=\"wide\">{roles}</td><td>{sections}</td>\
-                         <td class=\"wide\">{uploaded}</td><td>{state}</td></tr>",
-                        href = escape(&version_path(&m.name, &m.version)),
-                        name = escape(&m.name),
-                        version = escape(&m.version),
-                        roles = list_or(&m.roles, "none"),
-                        uploaded = &crate::terminal::rfc3339(v.uploaded_at_ns)[..10],
-                    )
-                })
-                .collect();
-            format!(
-                "{notice}{table}",
-                notice = crate::notice::folded(),
-                table = table(
-                    "versions",
-                    "Search versions",
-                    "<th>Plugin</th><th>Version</th><th class=\"wide\">Roles</th><th>Sections</th>\
-                     <th class=\"wide\">Uploaded</th><th>State</th>",
-                    &rows,
-                    "No version is uploaded yet: `meridian plugin upload` adds one.",
-                )
-            )
-        }
-    };
-    let body = format!(
-        "<section class=\"admin-section versions-page\"><div class=\"section-head\"><div>\
-         <h1>Uploaded versions</h1><p class=\"hint\">Each version in this deployment's catalogue, \
-         launched or not. Open one to read its documentation before you launch it.</p></div></div>{body}</section>"
-    );
-    with_policy(crate::html::page_with(
-        "Uploaded versions",
-        &body,
-        &crate::html::Chrome {
-            crumbs: format!(
-                "{}{}",
-                crate::html::crumb_link("/admin#plugins", "Plugins"),
-                crate::html::crumb_here("Uploaded versions", None)
-            ),
-            ..crate::admin::admin_chrome(&session)
-        },
-    ))
-}
+// ── The portal's version page ───────────────────────────────────────────
 
 #[derive(serde::Deserialize, Default)]
 struct Asked {
@@ -917,8 +860,9 @@ async fn version_page(
                 .into_response()
         }
     };
-    let roles = versions(&app)
+    let roles = crate::catalogue::catalogue(&app)
         .await
+        .map(|catalogue| catalogue.versions)
         .unwrap_or_default()
         .into_iter()
         .filter_map(|v| v.metadata)
@@ -944,8 +888,8 @@ async fn version_page(
         &crate::html::Chrome {
             crumbs: format!(
                 "{}{}{}",
-                crate::html::crumb_link("/admin#plugins", "Plugins"),
-                crate::html::crumb_link(VERSIONS_PATH, "Uploaded versions"),
+                crate::html::crumb_link("/admin", "Settings"),
+                crate::html::crumb_link(VERSIONS_PATH, "Plugins"),
                 crate::html::crumb_here(&format!("{name} {version}"), None)
             ),
             ..crate::admin::admin_chrome(&session)

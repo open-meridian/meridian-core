@@ -958,6 +958,7 @@ pub(crate) async fn frame(
                     None
                 },
                 stopped: launch.filter(|_| !running),
+                pulled: pulled_of(&app, &session.subject, launch, &catalogue).await,
                 version: launch.map(|launch| launch.version.as_str()),
                 session: &session,
                 notice,
@@ -1047,6 +1048,37 @@ pub(crate) async fn frame(
     } else {
         Html(page).into_response()
     }
+}
+
+/// An instance's pull warning (W8.12, contract v25): its version's pull in
+/// the catalogue's copy, where no deployment admin has kept it since.
+async fn pulled_of(
+    app: &App,
+    subject: &str,
+    launch: Option<&meridian_domain::v1::PluginLaunch>,
+    catalogue: &meridian_domain::v1::PluginCatalogue,
+) -> Option<meridian_domain::v1::PluginPull> {
+    let launch = launch?;
+    let version = catalogue.versions.iter().find(|v| {
+        v.metadata
+            .as_ref()
+            .is_some_and(|m| m.name == launch.name && m.version == launch.version)
+    })?;
+    if version.listing.is_empty() {
+        return None;
+    }
+    let listings = crate::registry::listings(
+        app,
+        subject,
+        meridian_domain::v1::ListRegistryPluginsRequest {
+            listing: version.listing.clone(),
+            ..Default::default()
+        },
+    )
+    .await
+    .ok()?
+    .listings;
+    crate::registry::pull_warning(launch, version, &listings)
 }
 
 /// The Documentation tab: the version the instance was launched from, its

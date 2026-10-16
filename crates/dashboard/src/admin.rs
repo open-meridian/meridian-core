@@ -1250,6 +1250,9 @@ pub(crate) struct Manage<'a> {
     /// Summary says so, and when, and draws nothing a running plugin
     /// reports.
     pub stopped: Option<&'a meridian_domain::v1::PluginLaunch>,
+    /// Its version's pull from the catalogue, where no deployment admin has
+    /// kept it since (W8.12, contract v25): one line heading the Summary.
+    pub pulled: Option<meridian_domain::v1::PluginPull>,
     pub session: &'a Session,
     pub notice: &'a str,
     pub now: i64,
@@ -1457,8 +1460,16 @@ pub(crate) fn summary_tab(manage: &Manage) -> String {
         &manage.session.directory_groups,
     )
     .deployment_admin;
+    let pulled = manage.pulled.as_ref().map_or(String::new(), |pull| {
+        format!(
+            "<p class=\"error\" role=\"alert\" data-pulled>Its version was pulled from the catalogue: {}. \
+             <a href=\"/admin/plugins/registry/acknowledge?instance={}\">Keep it</a> or stop it.</p>",
+            crate::registry::pull_kind(pull),
+            escape(manage.instance)
+        )
+    });
     format!(
-        "{notice}{parts}",
+        "{pulled}{notice}{parts}",
         notice = notice_line(manage.notice),
         parts = summary_parts(
             &SUMMARY_PART_KEYS

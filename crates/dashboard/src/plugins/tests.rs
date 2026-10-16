@@ -2778,3 +2778,328 @@ async fn a_deployment_admin_reads_a_versions_documentation_before_launching_it()
         assert_ne!(refused.status, StatusCode::OK, "{path}");
     }
 }
+
+/// A form posted as a browser posts it.
+async fn post_form_as(app: &Arc<App>, path: &str, cookies: &[String], body: &str) -> Answer {
+    let request = HttpRequest::builder()
+        .method(Method::POST)
+        .uri(path)
+        .header(HOST, DASHBOARD)
+        .header(COOKIE, cookies.join("; "))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let response = router(Arc::clone(app)).oneshot(request).await.unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    Answer {
+        status,
+        headers,
+        body: String::from_utf8_lossy(&body).into_owned(),
+    }
+}
+
+fn form_token(page: &str) -> String {
+    page.split("name=\"form_token\" value=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("a form token")
+        .to_string()
+}
+
+/// Each request the stand-in conductor heard: its topic and payload.
+type Asked = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+
+/// The registries' copy, the Registries tab and their acts, as the
+/// conductor answers them, each act's request kept.
+fn serving_registries(h: &Harness) -> Asked {
+    let asked: Asked = Arc::default();
+    let keep = |topic: &'static str, reply_type: &'static str, reply: Vec<u8>| {
+        let asked = Arc::clone(&asked);
+        h.app.bus.serve(topic, move |envelope| {
+            asked
+                .lock()
+                .unwrap()
+                .push((topic.to_string(), envelope.payload.clone()));
+            Ok((reply_type.into(), reply.clone()))
+        });
+    };
+    let version = |v: &str, pulled: bool| meridian_domain::v1::ListedVersion {
+        listing: "open-meridian/snaptrade".into(),
+        version: v.into(),
+        registry: "community".into(),
+        schema_version: "v25".into(),
+        metadata: Some(meridian_domain::v1::PluginMetadata {
+            name: "snaptrade".into(),
+            version: v.into(),
+            roles: vec!["custody".into()],
+            ..Default::default()
+        }),
+        pull: pulled.then(|| meridian_domain::v1::PluginPull {
+            kind: meridian_domain::v1::PullReasonKind::TermsBreach as i32,
+            pulled_at_ns: 5,
+            ..Default::default()
+        }),
+        build: Some(meridian_domain::v1::PluginBuild {
+            tag: format!("v{v}"),
+            commit: "c".repeat(40),
+            signer_fingerprint: "SHA256:tagkey".into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    keep(
+        crate::registry::REGISTRY_PLUGINS,
+        "meridian.v1.ListRegistryPluginsReply",
+        meridian_domain::v1::ListRegistryPluginsReply {
+            listings: vec![meridian_domain::v1::PluginListing {
+                listing: "open-meridian/snaptrade".into(),
+                repository: "https://github.com/open-meridian/plugin-snaptrade".into(),
+                regions: vec!["US".into()],
+                versions: vec![version("1.4.0", true), version("1.5.0", false)],
+                stars: 3,
+                installs: 1,
+                ..Default::default()
+            }],
+            next_cursor: String::new(),
+            catalogue_pulled_at_ns: 1_790_380_800_000_000_000,
+        }
+        .encode_to_vec(),
+    );
+    keep(
+        crate::registry::LIST_PLUGIN_USAGE_REPORTS,
+        "meridian.v1.ListPluginUsageReportsReply",
+        meridian_domain::v1::ListPluginUsageReportsReply {
+            reports_plugin_usage: true,
+            catalogue_pulled_at_ns: 1_790_380_800_000_000_000,
+            ..Default::default()
+        }
+        .encode_to_vec(),
+    );
+    keep(
+        crate::registry::INSTALL_PLUGIN,
+        "meridian.v1.PluginVersion",
+        meridian_domain::v1::PluginVersion {
+            metadata: Some(meridian_domain::v1::PluginMetadata {
+                name: "open-meridian/snaptrade".into(),
+                version: "1.5.0".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec(),
+    );
+    keep(
+        crate::registry::SET_REPORTS_PLUGIN_USAGE,
+        "meridian.v1.ReportsPluginUsageSetting",
+        meridian_domain::v1::ReportsPluginUsageSetting {
+            reports_plugin_usage: false,
+        }
+        .encode_to_vec(),
+    );
+    keep(
+        crate::catalogue::PLUGIN_CATALOGUE,
+        "meridian.v1.PluginCatalogue",
+        meridian_domain::v1::PluginCatalogue {
+            versions: vec![meridian_domain::v1::PluginVersion {
+                metadata: Some(meridian_domain::v1::PluginMetadata {
+                    name: "open-meridian/snaptrade".into(),
+                    version: "1.4.0".into(),
+                    roles: vec!["custody".into()],
+                    ..Default::default()
+                }),
+                source_registry: "community".into(),
+                listing: "open-meridian/snaptrade".into(),
+                ..Default::default()
+            }],
+            launches: vec![meridian_domain::v1::PluginLaunch {
+                instance_id: INSTANCE.into(),
+                name: "open-meridian/snaptrade".into(),
+                version: "1.4.0".into(),
+                roles: vec!["custody".into()],
+                state: meridian_domain::v1::PluginLaunchState::Launched as i32,
+                ..Default::default()
+            }],
+        }
+        .encode_to_vec(),
+    );
+    asked
+}
+
+/// W8.10 to W8.12, W5.19 (contract v25): the Plugins page's three tabs, a
+/// listing's page, the install sheet and its act, the Registries tab's
+/// acts, and the pull warning heading the Summary.
+#[tokio::test]
+async fn a_deployment_admin_browses_installs_and_keeps_from_the_plugins_page() {
+    let h = harness(&[INSTANCE]).await;
+    let mut held = admin_records();
+    held.access_groups = records(&[INSTANCE]).access_groups;
+    held.access_groups[0].entries[0].level = AccessLevel::Admin as i32;
+    held.permissions.extend(records(&[INSTANCE]).permissions);
+    h.app.records.store(held, h.app.clock.now_ns());
+    let asked = serving_registries(&h);
+    let cookie = [dashboard_cookie(&h)];
+
+    // Installed: the source registry, the update offered and the pull.
+    let installed = get(&h.app, DASHBOARD, "/admin/plugins/versions", &cookie).await;
+    assert_eq!(installed.status, StatusCode::OK, "{}", installed.body);
+    for said in [
+        "Community · Unsupervised",
+        "Update to 1.5.0",
+        "Pulled: a breach of the Platform Terms",
+        "Naming a plugin here is not an endorsement",
+    ] {
+        assert!(installed.body.contains(said), "{said}: {}", installed.body);
+    }
+    // Browse: one line a listing, its counts as words below three.
+    let browse = get(
+        &h.app,
+        DASHBOARD,
+        "/admin/plugins/versions?tab=browse&search=snap",
+        &cookie,
+    )
+    .await;
+    assert!(
+        browse
+            .body
+            .contains("data-listing=\"open-meridian/snaptrade\""),
+        "{}",
+        browse.body
+    );
+    assert!(browse.body.contains("Fewer than three deployments"));
+    // The listing's page: the notice in full, the build, the vendor's words.
+    let page = get(
+        &h.app,
+        DASHBOARD,
+        "/admin/plugins/registry/open-meridian/snaptrade",
+        &cookie,
+    )
+    .await;
+    assert!(
+        page.body
+            .contains("Local and community plugins are unsupervised."),
+        "{}",
+        page.body
+    );
+    assert!(page.body.contains("SHA256:tagkey") && page.body.contains("Stated by its vendor"));
+    let docs = get(
+        &h.app,
+        DASHBOARD,
+        "/admin/plugins/registry/open-meridian/snaptrade?tab=documentation",
+        &cookie,
+    )
+    .await;
+    assert!(docs.headers["content-security-policy"]
+        .to_str()
+        .unwrap()
+        .contains("script-src 'self' 'sha256-"));
+    // The install sheet: the notice first, the usage setting, the floor.
+    let sheet = get(
+        &h.app,
+        DASHBOARD,
+        "/admin/plugins/registry/open-meridian/snaptrade/install?version=1.5.0&registry=community",
+        &cookie,
+    )
+    .await;
+    assert!(
+        sheet.body.contains("Install open-meridian/snaptrade 1.5.0"),
+        "{}",
+        sheet.body
+    );
+    assert!(
+        sheet.body.contains("v25 · served here")
+            && sheet.body.contains("<dt>Usage report</dt><dd>on")
+    );
+    let token = form_token(&sheet.body);
+    let done = post_form_as(&h.app, "/admin/plugins/registry/install", &cookie,
+        &format!("form_token={token}&listing=open-meridian%2Fsnaptrade&version=1.5.0&registry=community&note=Newer")).await;
+    assert_eq!(done.status, StatusCode::SEE_OTHER, "{}", done.body);
+    assert!(done.headers["location"].to_str().unwrap().contains("done="));
+    let sent = asked
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(t, _)| t == crate::registry::INSTALL_PLUGIN)
+        .cloned()
+        .unwrap();
+    let install = meridian_domain::v1::InstallPluginRequest::decode(&sent.1[..]).unwrap();
+    assert_eq!(
+        (install.version.as_str(), install.note.as_str()),
+        ("1.5.0", "Newer")
+    );
+    // Not from the session: refused, nothing sent.
+    asked.lock().unwrap().clear();
+    let refused = post_form_as(
+        &h.app,
+        "/admin/plugins/registry/install",
+        &cookie,
+        "form_token=forged&listing=x&version=1&registry=community&note=n",
+    )
+    .await;
+    assert!(refused.headers["location"]
+        .to_str()
+        .unwrap()
+        .contains("failed="));
+    assert!(asked
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|(t, _)| t != crate::registry::INSTALL_PLUGIN));
+    // The Registries tab and its acts.
+    let tab = get(
+        &h.app,
+        DASHBOARD,
+        "/admin/plugins/versions?tab=registries",
+        &cookie,
+    )
+    .await;
+    assert!(
+        tab.body.contains("Report plugin usage") && tab.body.contains("Pull now"),
+        "{}",
+        tab.body
+    );
+    post_form_as(
+        &h.app,
+        "/admin/plugins/registry/pull",
+        &cookie,
+        &format!("form_token={token}"),
+    )
+    .await;
+    assert!(asked
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(t, p)| t == crate::registry::REGISTRY_PLUGINS
+            && meridian_domain::v1::ListRegistryPluginsRequest::decode(&p[..])
+                .unwrap()
+                .pull_now));
+    post_form_as(
+        &h.app,
+        "/admin/plugins/registry/usage",
+        &cookie,
+        &format!("form_token={token}&reason=Not+yet"),
+    )
+    .await;
+    let set = asked
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(t, _)| t == crate::registry::SET_REPORTS_PLUGIN_USAGE)
+        .cloned()
+        .unwrap();
+    assert!(
+        !meridian_domain::v1::SetReportsPluginUsageRequest::decode(&set.1[..])
+            .unwrap()
+            .reports_plugin_usage
+    );
+    // The pull heads the instance's Summary, one line.
+    let summary = get(
+        &h.app,
+        DASHBOARD,
+        &format!("/plugins/{INSTANCE}?level=admin"),
+        &cookie,
+    )
+    .await;
+    assert!(summary.body.contains("data-pulled"), "{}", summary.body);
+}

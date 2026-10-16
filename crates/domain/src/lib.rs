@@ -28,6 +28,7 @@ pub mod instrument_type;
 pub mod lake;
 pub mod money;
 pub mod protojson;
+pub mod semver;
 pub mod setting_table;
 pub mod text;
 pub mod zones;

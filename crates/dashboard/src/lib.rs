@@ -41,6 +41,7 @@ pub mod oidc;
 pub mod plugins;
 pub mod prepared;
 pub mod records;
+pub mod registry;
 pub mod service_accounts;
 pub mod session;
 pub mod signing;
