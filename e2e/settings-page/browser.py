@@ -79,9 +79,10 @@ def check(held, said):
         failures.append(said)
 
 
-def context(browser, width=1440, height=900, script=True):
+def context(browser, width=1440, height=900, script=True, scheme="light"):
     ctx = browser.new_context(
-        viewport={"width": width, "height": height}, java_script_enabled=script
+        viewport={"width": width, "height": height}, java_script_enabled=script,
+        color_scheme=scheme,
     )
     ctx.add_cookies([{"name": "meridian_session", "value": SESSION, "url": BASE}])
     return ctx
@@ -777,9 +778,12 @@ def the_connectivity_part_and_the_calendars_tab(browser, prefix):
                 check(usd.count() == 1 and usd.inner_text().strip() == "USD",
                       f"at {size} the US dollar's subject is its ISO 4217 code: "
                       f"{usd.inner_text() if usd.count() else None!r}")
+                # From contract v25 (D9) by each venue's MIC and name,
+                # where until then by its VEN- ID.
                 venues = page.locator("tr[data-calendar=CAL-01JAE000000000000000XNYS] td[data-subject]")
-                check(venues.count() == 1 and "VEN-" in venues.inner_text(),
-                      f"at {size} a trading calendar's venues are named by their IDs")
+                check(venues.count() == 1 and "XNYS (New York Stock Exchange)" in venues.inner_text()
+                      and "VEN-" not in venues.inner_text(),
+                      f"at {size} a trading calendar's venues are named by their MICs")
                 check(page.locator("#calendars form select[name=calendar_kind]").count() == 1
                       and page.locator("#calendars form input[name=calendar_query]").count() == 1,
                       f"at {size} the tab is filtered by kind and searched by text")
@@ -989,6 +993,36 @@ def measured(page, label, shot):
     return problems
 
 
+def the_v25_pages(browser, prefix):
+    """Contract v25's changes to core's pages, at the three sizes in light and
+    dark: the Calendars tab's venues by MIC and name (D9), and the Licensed
+    identifiers tab's licensed schemes (W3.28) beside the usage report."""
+    for scheme in ("light", "dark"):
+        for size, width, height in V24_SIZES:
+            ctx = context(browser, width, height, scheme=scheme)
+            page = ctx.new_page()
+            errors = []
+            page.on("pageerror", lambda e: errors.append(str(e)))
+            page.goto(f"{BASE}/admin/instruments?calendar_query=xnys#calendars")
+            settled(page)
+            venues = page.evaluate("() => document.querySelector('#calendars').textContent")
+            check("XNYS (New York Stock Exchange)" in venues and "XNAS (Nasdaq)" in venues,
+                  f"at {size}, {scheme}, a calendar's venues are shown by MIC and name")
+            measured(page, f"Instruments, calendars, at {size}, {scheme}",
+                     f"v25-calendars-{size}-{scheme}.png")
+            page.goto(f"{BASE}/admin/instruments#licensed")
+            settled(page)
+            boxes = page.eval_on_selector_all(
+                "form#licensed-schemes-form input[name=licensed_scheme]",
+                "bs => bs.map(b => b.value + (b.checked ? '+' : ''))")
+            check("cusip+" in boxes and "isin" in boxes and "sedol" in boxes,
+                  f"at {size}, {scheme}, the licensed schemes are boxes, those declared ticked: {boxes}")
+            measured(page, f"Instruments, licensed schemes, at {size}, {scheme}",
+                     f"v25-licensed-{size}-{scheme}.png")
+            check(not errors, f"the v25 pages at {size}, {scheme} ran without a script error: {errors}")
+            ctx.close()
+
+
 def the_v24_pages(browser, prefix):
     """Contract v24: the Instruments page's provisional records and the
     usage report's setting; the home page's counts; the escape hatch's
@@ -1144,6 +1178,7 @@ with sync_playwright() as playwright:
         fits(browser, name, url, prefix)
     a_secret_says_where_it_stands(browser, prefix)
     the_v24_pages(browser, prefix)
+    the_v25_pages(browser, prefix)
     browser.close()
 
 if failures:

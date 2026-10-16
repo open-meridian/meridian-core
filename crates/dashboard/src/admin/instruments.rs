@@ -1330,7 +1330,8 @@ fn licensed_form(
     format!(
         "<form method=\"post\" action=\"{LICENSED_SCHEMES_PATH}\" class=\"inline-form\" \
          id=\"licensed-schemes-form\" data-licensed-schemes=\"{}\">{token}\
-         <span class=\"label\">Licensed for</span>{boxes}\
+         <fieldset class=\"schemes\" aria-label=\"Licensed for\"><span class=\"schemes-label\">Licensed for\
+         </span>{boxes}</fieldset>\
          <label>Why <input name=\"note\" required maxlength=\"2000\"></label>\
          <button type=\"submit\" name=\"prepare\" value=\"1\" data-prepare>Prepare</button>\
          <button type=\"submit\" class=\"primary\">Set</button></form>",
@@ -1405,11 +1406,13 @@ pub fn list_page_full(
     // values, unless the deployment admin turns the report off.
     let licensed = format!(
         "<section class=\"admin-section\" id=\"licensed\"><div class=\"section-head\"><div>\
-         <h2>Licensed identifiers held</h2><p class=\"hint\">What your plugins reported, kept \
-         here under your own licence: never sent anywhere, only how many are counted in the \
-         usage report.</p></div></div>{}{}</section>",
+         <h2>Licensed identifiers held</h2><p class=\"hint\">What your plugins reported, under \
+         your own licence: never sent, only counted in the usage report.</p></div></div>{}{}\
+         </section>",
+        // One line where none is held (contract v25: the tab carries the
+        // licensed schemes' form too, and still fits one screen).
         if licensed.is_empty() {
-            "<p class=\"empty\">None.</p>".to_string()
+            "<p class=\"hint\" data-licensed-held=\"0\">None held.</p>".to_string()
         } else {
             format!("<ul class=\"facts\">{}</ul>", licensed.concat())
         },

@@ -228,6 +228,9 @@ padding-left:1.1rem;font-size:.9rem}.counts li{overflow-wrap:anywhere}\
 .counts.tight{display:flex;flex-wrap:wrap;gap:.1rem .9rem;padding-left:0;list-style:none;font-size:.85rem;margin:.35rem 0 .5rem}\
 .inline-form{display:flex;flex-wrap:wrap;align-items:flex-end;gap:.5rem .75rem;margin:.5rem 0}\
 .inline-form label{flex:1 1 9rem;min-width:0}\
+.inline-form fieldset.schemes{display:flex;flex-wrap:wrap;align-items:center;gap:.25rem .9rem;border:0;margin:0;\
+padding:0;min-width:0;flex:1 1 100%}.inline-form fieldset.schemes label.check{flex:0 0 auto;margin:0}\
+.inline-form fieldset.schemes .schemes-label{font-size:.84rem;font-weight:550}\
 @media (max-width:640px){table.provisional .wide{display:none}}\
 .attached-list{margin:.25rem 0 .6rem;padding-left:1.1rem}.attached-list li{margin:.2rem 0;overflow-wrap:anywhere}\
 .reserved{margin:.75rem 0 0;padding:.55rem .8rem;border:1px dashed var(--line-strong);border-radius:var(--radius);\
