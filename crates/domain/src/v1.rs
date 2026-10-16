@@ -14634,10 +14634,13 @@ pub struct PluginConfiguration {
     /// with none.
     #[prost(message, optional, tag = "12")]
     pub declaration: ::core::option::Option<::meridian_pb::v1::PluginDeclaration>,
-    /// The conductor holds a launch of this instance, live or not (W8.3,
-    /// contract v25): its sidecar refuses a plugin declaring v25 whose version
-    /// was uploaded with no declaration (W4.1). False only for a sidecar no
-    /// launch made, as a test harness starts one.
+    /// Whether the catalogue launched this instance (W4.1, W8.3, contract v25).
+    /// Registration is held to the uploaded declaration only for an instance
+    /// the catalogue launched, and a plugin declaring v25 whose version was
+    /// uploaded with none is refused. False for a sidecar no launch made --
+    /// the plugin harness, a developer's local run -- which admits
+    /// registration unchecked unless it was handed a declaration
+    /// (MERIDIAN_PLUGIN_DECLARATION), and then holds it to that one.
     #[prost(bool, tag = "13")]
     pub launched: bool,
 }

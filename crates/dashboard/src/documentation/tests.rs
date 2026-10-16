@@ -207,3 +207,48 @@ fn the_reference_carries_what_the_summary_drew_of_the_declaration() {
     let storage = page(&held, Some(REFERENCE), Some("storage"));
     assert!(storage.contains("kept 30 days at most"), "{storage}");
 }
+
+/// The red-team corpus's vendor-text cases (RT38 to RT46), replayed through
+/// the documentation's screen: a case marked benign -- the contract's own
+/// instruction terms (RT45) -- is not withheld; every other case pinned to
+/// one of the deployment's rules is, by that rule. The platform's own
+/// vendor-text rules (endorsement, verification, regulatory readiness,
+/// posing as Open Meridian, acting for the reader) are its screen's, at the
+/// catalogue; here such a section is drawn under the notice.
+#[test]
+fn the_corpus_s_vendor_text_is_withheld_but_for_a_benign_case() {
+    let corpus: serde_json::Value =
+        serde_json::from_str(include_str!("../../../../deploy/prompt-attacks.json")).unwrap();
+    let mut benign = 0;
+    let mut pinned = 0;
+    for case in corpus["cases"].as_array().unwrap() {
+        if case["channel"] != "vendor-text" {
+            continue;
+        }
+        let id = case["id"].as_str().unwrap();
+        let planted = case["planted"].as_str().unwrap();
+        let screened = screen(planted);
+        if case["benign"].as_bool() == Some(true) {
+            assert!(
+                !screened.suspect(),
+                "{id} is benign and was withheld: {screened:?}"
+            );
+            benign += 1;
+            continue;
+        }
+        let matched = case["expect"]["platform"]["server"]["expect"]["matched"]
+            .as_str()
+            .unwrap_or_default();
+        if crate::tickets::quarantine::RULES.contains(&matched) {
+            assert!(
+                screened.rules.iter().any(|rule| rule == matched),
+                "{id} is not withheld by {matched}: {screened:?}"
+            );
+            pinned += 1;
+        }
+    }
+    assert!(
+        benign >= 1 && pinned >= 2,
+        "benign {benign}, pinned {pinned}"
+    );
+}
