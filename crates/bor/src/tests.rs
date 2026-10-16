@@ -1973,6 +1973,51 @@ async fn the_same_unknown_security_on_a_later_statement_updates_the_same_break()
     assert_eq!(updated.breaks[0].last_seen_date, "2026-09-11");
 }
 
+/// Contract v25 (W9.3): the identifiers ride in their own field, kept on the
+/// break; a v24 plugin's street-only differences still match the same
+/// break; and no other category carries them.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unrecognized_securitys_identifiers_ride_in_their_own_field() {
+    let (bus, _store) = wired();
+    open(&bus).await;
+    let identifier = |scheme: &str, value: &str| meridian_domain::v1::Identifier {
+        scheme: scheme.into(),
+        value: value.into(),
+        ..Default::default()
+    };
+    let mut v25 = unrecognized_break("ST-THIN-1", "2026-09-09", &[]);
+    v25.differences = vec![BreakDifference {
+        field: "description".into(),
+        book: None,
+        street: Some(BreakValue {
+            value: Some(break_value::Value::Text("ZZQ9 HOLDINGS".into())),
+        }),
+    }];
+    v25.unresolved_identifiers = vec![identifier("custodian", "ZZQ9")];
+    let first = record_break(&bus, &v25).await.unwrap();
+    let record = &first.breaks[0];
+    assert_eq!(
+        record.unresolved_identifiers,
+        vec![identifier("custodian", "ZZQ9")]
+    );
+    // The same security from a plugin built before v25, by its differences:
+    // the same break, its identifiers kept.
+    let v24 = unrecognized_break("ST-THIN-2", "2026-09-10", &[("custodian", "ZZQ9")]);
+    let later = record_break(&bus, &v24).await.unwrap();
+    assert_eq!(later.breaks[0].break_id, record.break_id);
+    assert_eq!(later.breaks[0].unresolved_identifiers.len(), 1);
+    // Half an identifier is refused by its path; another category carries
+    // none.
+    let mut half = v25.clone();
+    half.unresolved_identifiers = vec![identifier("custodian", "")];
+    let refused = record_break(&bus, &half).await.unwrap_err();
+    assert!(refused.contains("unresolved_identifiers[0]"), "{refused}");
+    let mut other = aapl_break();
+    other.unresolved_identifiers = vec![identifier("custodian", "ZZQ9")];
+    let refused = record_break(&bus, &other).await.unwrap_err();
+    assert!(refused.contains("unresolved_identifiers"), "{refused}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn different_identifiers_open_a_new_unrecognized_security_break() {
     let (bus, _store) = wired();
