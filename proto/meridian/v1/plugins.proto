@@ -376,8 +376,8 @@ message PluginListing {
   // `organisation/plugin`: the organisation's slug and the plugin's name in
   // its `[tool.meridian]`, both fixed at the first publish.
   string listing = 1;
-  // The source repository it is built from, linked through the platform's
-  // GitHub App and fixed at the first publish.
+  // The source repository it is built from, as a URL, linked through the
+  // platform's GitHub App and fixed at the first publish.
   string repository = 2;
   // Its versions, every registry's, in SemVer order, pulled and withdrawn
   // ones marked.
@@ -397,8 +397,10 @@ message PluginListing {
   uint64 installs = 8;
   uint64 instances = 9;
   bool counts_shown = 10;
-  // The whole listing's pull, unset while it is not pulled.
-  PluginPull pull = 11;
+  // A whole listing is never pulled at once: each version is, by its own
+  // PullListing (W8.12), so the field that held a listing's pull is retired.
+  reserved 11;
+  reserved "pull";
 }
 
 // One version of a listing, in one registry.
@@ -432,11 +434,23 @@ message ListedVersion {
   // Its place in the catalogue's sequence, which a pull after a sequence
   // reads from.
   uint64 sequence = 12;
+  // The platform's signed listing statement (requirement 21), the same
+  // document the image carries as an OCI referrer: a DSSE envelope as JSON
+  // -- payloadType `application/vnd.in-toto+json`, payload the base64 of
+  // an in-toto statement whose subject is image_digest and whose predicate
+  // type is `https://open-meridian.dev/attestation/plugin-listing/v1`
+  // (the registry, the time, and for verified the review and its approved
+  // roles), and its signatures -- which the conductor verifies at download
+  // and again at launch against the platform's keys the chart carries.
+  // Empty only before the version is listed.
+  string listing_statement = 13;
 }
 
 // A build of a signed release tag by the platform's builder (W8.8; items 102,
 // 103), followed by the CLI until the version is listed, queued for review
-// or refused.
+// or refused. A refused build carries no text of its own: why is the
+// details of its findings at BUILD_FINDING_SEVERITY_BLOCKED. The repository
+// and the builder are URLs.
 message PluginBuild {
   string build_id = 1;
   string listing = 2;
@@ -556,7 +570,11 @@ message SigningKeyStatus {
   int64 issued_at_ns = 1;
   repeated SigningKeyRecord keys = 2;
   // The platform's signature over the document, checked against the
-  // platform's public keys each chart release carries.
+  // platform's public keys each chart release carries: base64 of an ECDSA
+  // P-256 signature over DSSE's pre-authentication encoding (PAE) of the
+  // payload type `application/vnd.open-meridian.signing-key-status+json`
+  // and the body, this record's canonical JSON without `signature` -- the
+  // DSSE convention in-toto and Sigstore use.
   string signature = 3;
 }
 
@@ -565,7 +583,7 @@ message SigningKeyStatus {
 // copies; it never removes one.
 message PluginPull {
   string listing = 1;
-  // Empty for the whole listing.
+  // The one version pulled; never empty (W8.12).
   string version = 2;
   PullReasonKind kind = 3;
   // The reason, in words, as deployments and organisations are told it.
@@ -671,8 +689,13 @@ message RecordBuildStartedRequest {
   string log_url = 3;
 }
 
-// The builder hands back what it built and what each check found; the
-// platform checks them, then lists, queues for review or refuses.
+// The builder hands back what it built and what each check found -- one
+// finding per check, the scan policy (plan Q4) applied in the builder -- and
+// the platform checks them, then lists, queues for review or refuses. The
+// provenance and the image's metadata are not in it: the platform reads
+// them from the image's OCI 1.1 referrers, the builder's SLSA provenance
+// and its plugin-metadata attestation
+// (`https://open-meridian.dev/attestation/plugin-metadata/v1`).
 message RecordBuildResultsRequest {
   string build_id = 1;
   string intake_nonce = 2;
@@ -686,8 +709,9 @@ message PublishPluginVersionRequest {
   string plugin = 2;
   // `community` or `verified`.
   string registry = 3;
-  // A repository linked through the platform's GitHub App; at a listing's
-  // first publish it becomes the listing's, fixed.
+  // A repository linked through the platform's GitHub App, as its URL or
+  // as owner/name; at a listing's first publish it becomes the listing's,
+  // fixed, and is answered as a URL.
   string repository = 4;
   // The release tag, `v` and the SemVer version, signed by a registered,
   // active key of the organisation.
@@ -786,7 +810,9 @@ message DecideRegistryProposalReply {
 
 message PullListingRequest {
   string listing = 1;
-  // Empty for the whole listing.
+  // One version, required: pulling a whole listing, or the several versions
+  // a copyright notice names, is one request per version, each its own
+  // record (decisions/031; W8.12, W8.13).
   string version = 2;
   PullReasonKind kind = 3;
   string reason = 4;
@@ -798,6 +824,10 @@ message StarPluginRequest {
   string listing = 1;
   // True stars it, once per organisation; false takes the star back.
   bool starred = 2;
+  // The organisation starring, one the person is an Owner or Admin of with
+  // an enrolled deployment: a person may belong to several, and a star is
+  // one per organisation.
+  string organisation_id = 3;
 }
 
 message StarPluginReply {

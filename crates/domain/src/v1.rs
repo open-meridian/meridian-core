@@ -11673,8 +11673,8 @@ pub struct PluginListing {
     /// its `\[tool.meridian\]`, both fixed at the first publish.
     #[prost(string, tag = "1")]
     pub listing: ::prost::alloc::string::String,
-    /// The source repository it is built from, linked through the platform's
-    /// GitHub App and fixed at the first publish.
+    /// The source repository it is built from, as a URL, linked through the
+    /// platform's GitHub App and fixed at the first publish.
     #[prost(string, tag = "2")]
     pub repository: ::prost::alloc::string::String,
     /// Its versions, every registry's, in SemVer order, pulled and withdrawn
@@ -11703,9 +11703,6 @@ pub struct PluginListing {
     pub instances: u64,
     #[prost(bool, tag = "10")]
     pub counts_shown: bool,
-    /// The whole listing's pull, unset while it is not pulled.
-    #[prost(message, optional, tag = "11")]
-    pub pull: ::core::option::Option<PluginPull>,
 }
 /// One version of a listing, in one registry.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -11751,10 +11748,23 @@ pub struct ListedVersion {
     /// reads from.
     #[prost(uint64, tag = "12")]
     pub sequence: u64,
+    /// The platform's signed listing statement (requirement 21), the same
+    /// document the image carries as an OCI referrer: a DSSE envelope as JSON
+    /// -- payloadType `application/vnd.in-toto+json`, payload the base64 of
+    /// an in-toto statement whose subject is image_digest and whose predicate
+    /// type is `<https://open-meridian.dev/attestation/plugin-listing/v1`>
+    /// (the registry, the time, and for verified the review and its approved
+    /// roles), and its signatures -- which the conductor verifies at download
+    /// and again at launch against the platform's keys the chart carries.
+    /// Empty only before the version is listed.
+    #[prost(string, tag = "13")]
+    pub listing_statement: ::prost::alloc::string::String,
 }
 /// A build of a signed release tag by the platform's builder (W8.8; items 102,
 /// 103), followed by the CLI until the version is listed, queued for review
-/// or refused.
+/// or refused. A refused build carries no text of its own: why is the
+/// details of its findings at BUILD_FINDING_SEVERITY_BLOCKED. The repository
+/// and the builder are URLs.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PluginBuild {
     #[prost(string, tag = "1")]
@@ -11883,7 +11893,11 @@ pub struct SigningKeyStatus {
     #[prost(message, repeated, tag = "2")]
     pub keys: ::prost::alloc::vec::Vec<SigningKeyRecord>,
     /// The platform's signature over the document, checked against the
-    /// platform's public keys each chart release carries.
+    /// platform's public keys each chart release carries: base64 of an ECDSA
+    /// P-256 signature over DSSE's pre-authentication encoding (PAE) of the
+    /// payload type `application/vnd.open-meridian.signing-key-status+json`
+    /// and the body, this record's canonical JSON without `signature` -- the
+    /// DSSE convention in-toto and Sigstore use.
     #[prost(string, tag = "3")]
     pub signature: ::prost::alloc::string::String,
 }
@@ -11894,7 +11908,7 @@ pub struct SigningKeyStatus {
 pub struct PluginPull {
     #[prost(string, tag = "1")]
     pub listing: ::prost::alloc::string::String,
-    /// Empty for the whole listing.
+    /// The one version pulled; never empty (W8.12).
     #[prost(string, tag = "2")]
     pub version: ::prost::alloc::string::String,
     #[prost(enumeration = "PullReasonKind", tag = "3")]
@@ -12011,8 +12025,13 @@ pub struct RecordBuildStartedRequest {
     #[prost(string, tag = "3")]
     pub log_url: ::prost::alloc::string::String,
 }
-/// The builder hands back what it built and what each check found; the
-/// platform checks them, then lists, queues for review or refuses.
+/// The builder hands back what it built and what each check found -- one
+/// finding per check, the scan policy (plan Q4) applied in the builder -- and
+/// the platform checks them, then lists, queues for review or refuses. The
+/// provenance and the image's metadata are not in it: the platform reads
+/// them from the image's OCI 1.1 referrers, the builder's SLSA provenance
+/// and its plugin-metadata attestation
+/// (`<https://open-meridian.dev/attestation/plugin-metadata/v1`>).
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RecordBuildResultsRequest {
     #[prost(string, tag = "1")]
@@ -12034,8 +12053,9 @@ pub struct PublishPluginVersionRequest {
     /// `community` or `verified`.
     #[prost(string, tag = "3")]
     pub registry: ::prost::alloc::string::String,
-    /// A repository linked through the platform's GitHub App; at a listing's
-    /// first publish it becomes the listing's, fixed.
+    /// A repository linked through the platform's GitHub App, as its URL or
+    /// as owner/name; at a listing's first publish it becomes the listing's,
+    /// fixed, and is answered as a URL.
     #[prost(string, tag = "4")]
     pub repository: ::prost::alloc::string::String,
     /// The release tag, `v` and the SemVer version, signed by a registered,
@@ -12165,7 +12185,9 @@ pub struct DecideRegistryProposalReply {
 pub struct PullListingRequest {
     #[prost(string, tag = "1")]
     pub listing: ::prost::alloc::string::String,
-    /// Empty for the whole listing.
+    /// One version, required: pulling a whole listing, or the several versions
+    /// a copyright notice names, is one request per version, each its own
+    /// record (decisions/031; W8.12, W8.13).
     #[prost(string, tag = "2")]
     pub version: ::prost::alloc::string::String,
     #[prost(enumeration = "PullReasonKind", tag = "3")]
@@ -12183,6 +12205,11 @@ pub struct StarPluginRequest {
     /// True stars it, once per organisation; false takes the star back.
     #[prost(bool, tag = "2")]
     pub starred: bool,
+    /// The organisation starring, one the person is an Owner or Admin of with
+    /// an enrolled deployment: a person may belong to several, and a star is
+    /// one per organisation.
+    #[prost(string, tag = "3")]
+    pub organisation_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct StarPluginReply {
