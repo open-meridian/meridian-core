@@ -462,6 +462,36 @@ pub trait Store: Send + Sync {
         crate::book::Book::replay(account_id, &partition, &entries)
     }
 
+    /// The book's health per account (W9.10, contract v25; ruling 155): its
+    /// journal's length, the entries a command replays after its latest
+    /// snapshot, and when that snapshot was taken -- `only` that account, or
+    /// the accounts after `after` in order, at most `limit`. A store keeping
+    /// no snapshots replays the whole journal, and says so.
+    fn book_health(
+        &self,
+        only: Option<&str>,
+        after: &str,
+        limit: usize,
+    ) -> Result<Vec<meridian_domain::v1::AccountBookHealth>> {
+        let mut out = Vec::new();
+        for account in self.accounts()? {
+            if account.as_str() <= after || only.is_some_and(|only| only != account) {
+                continue;
+            }
+            if out.len() == limit {
+                break;
+            }
+            let entries = self.journal(&account)?.len() as u64;
+            out.push(meridian_domain::v1::AccountBookHealth {
+                account_id: account,
+                journal_entries: entries,
+                entries_since_snapshot: entries,
+                last_snapshot_at_ns: 0,
+            });
+        }
+        Ok(out)
+    }
+
     /// An account's book at the end of a business date as known at a
     /// watermark (W9.10, Q22): the entries numbered at or below `at` on the
     /// account's partition, those effective on or before `until`, from the

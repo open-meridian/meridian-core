@@ -1038,6 +1038,45 @@ impl Store for PostgresStore {
         journal_of(&mut *self.conn()?, account_id)
     }
 
+    fn book_health(
+        &self,
+        only: Option<&str>,
+        after: &str,
+        limit: usize,
+    ) -> Result<Vec<meridian_domain::v1::AccountBookHealth>> {
+        // Each account's journal and its latest snapshot of this format, in
+        // the order accounts are listed.
+        Ok(self
+            .conn()?
+            .query(
+                "SELECT a.account_id,
+                        (SELECT count(*) FROM book_entry e WHERE e.account_id = a.account_id),
+                        (SELECT count(*) FROM book_entry e WHERE e.account_id = a.account_id
+                            AND e.first_sequence > COALESCE(s.last_sequence, -1)),
+                        COALESCE(s.taken_at_ns, 0)
+                   FROM book_account a
+                   LEFT JOIN LATERAL (
+                        SELECT last_sequence, taken_at_ns FROM book_snapshot
+                         WHERE account_id = a.account_id AND format = $3
+                         ORDER BY last_sequence DESC LIMIT 1) s ON true
+                  WHERE a.account_id NOT LIKE '~%'
+                    AND a.account_id COLLATE \"C\" > $1
+                    AND ($4::text IS NULL OR a.account_id = $4)
+                  ORDER BY a.account_id COLLATE \"C\"
+                  LIMIT $2",
+                &[&after, &(limit as i64), &crate::snapshot::FORMAT, &only],
+            )
+            .map_err(unavailable)?
+            .into_iter()
+            .map(|row| meridian_domain::v1::AccountBookHealth {
+                account_id: row.get(0),
+                journal_entries: row.get::<_, i64>(1).max(0) as u64,
+                entries_since_snapshot: row.get::<_, i64>(2).max(0) as u64,
+                last_snapshot_at_ns: row.get(3),
+            })
+            .collect())
+    }
+
     fn book(&self, account_id: &str) -> Result<Book> {
         let mut conn = self.conn()?;
         let partition: String = conn

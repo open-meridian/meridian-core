@@ -56,6 +56,8 @@ pub const ALERT_CHANGED: &str = "platform.book.event.alert-changed";
 pub const LIST_BOOKINGS: &str = "platform.book.query.list-bookings";
 pub const LIST_ALERTS: &str = "platform.book.query.list-alerts";
 pub const READ_LOCAL_RECORD_ORDERS: &str = "platform.book.query.read-local-record-orders";
+/// W9.10 (contract v25; ruling 155): the book's health per account.
+pub const READ_BOOK_HEALTH: &str = "platform.book.query.read-book-health";
 
 /// How often the child entries every booking owes are looked for.
 pub const SWEEP_EVERY: Duration = Duration::from_secs(15 * 60);
@@ -901,6 +903,39 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
         Ok((
             "meridian.v1.LocalRecordOrdersSetting".to_string(),
             local_record_orders_setting(&asking, reading.as_ref()).encode_to_vec(),
+        ))
+    });
+
+    // W9.10 (contract v25; ruling 155): the book's health per account, for
+    // a deployment admin through the dashboard, paged by account.
+    let reading = store.clone();
+    bus.serve(READ_BOOK_HEALTH, move |envelope| {
+        let request: meridian_domain::v1::ReadBookHealthRequest =
+            decode(&envelope, "meridian.v1.ReadBookHealthRequest")?;
+        let limit = match request.page_size {
+            n if n <= 0 => 100,
+            n => (n as usize).min(1_000),
+        };
+        let only = (!request.account_id.is_empty()).then_some(request.account_id.as_str());
+        let mut accounts = reading
+            .book_health(only, &request.cursor, limit + 1)
+            .map_err(|failed| failed.on_the_bus())?;
+        let next_cursor = if accounts.len() > limit {
+            accounts.truncate(limit);
+            accounts
+                .last()
+                .map(|last| last.account_id.clone())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let reply = meridian_domain::v1::ReadBookHealthReply {
+            accounts,
+            next_cursor,
+        };
+        Ok((
+            "meridian.v1.ReadBookHealthReply".to_string(),
+            reply.encode_to_vec(),
         ))
     });
 

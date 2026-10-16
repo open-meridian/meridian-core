@@ -2978,6 +2978,33 @@ message LocalRecordOrdersSetting {
   int64 open_order_count = 2;
 }
 
+// W9.10 (contract v25): the book's health per account, for a deployment
+// admin -- the dashboard's tool and the CLI's `meridian status` -- whatever
+// database the book runs on.
+message ReadBookHealthRequest {
+  // One account; empty for every account, paged.
+  string account_id = 1;
+  int32 page_size = 2;
+  string cursor = 3;
+}
+
+message ReadBookHealthReply {
+  repeated AccountBookHealth accounts = 1;
+  string next_cursor = 2;
+}
+
+// One account's journal and its last snapshot.
+message AccountBookHealth {
+  string account_id = 1;
+  // Every entry in the account's journal.
+  uint64 journal_entries = 2;
+  // The replay length: entries a command or a read replays after the last
+  // snapshot.
+  uint64 entries_since_snapshot = 3;
+  // When the last snapshot was taken; 0 where none is yet.
+  int64 last_snapshot_at_ns = 4;
+}
+
 message BookingReply {
   Booking booking = 1;
   EntryMeta entry = 2;

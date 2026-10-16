@@ -319,6 +319,53 @@ async fn only_a_deployment_admins_terminal_session_is_admitted() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn the_books_health_is_read_from_a_deployment_admins_terminal() {
+    // ReadBookHealthFromTerminal (contract v25; ruling 155): what `meridian
+    // status` reads, every page, a deployment admin's alone.
+    let h = harness().await;
+    h.app.bus.serve(READ_BOOK_HEALTH, |envelope| {
+        stamped(&envelope)?;
+        let asked =
+            meridian_domain::v1::ReadBookHealthRequest::decode(&envelope.payload[..]).unwrap();
+        let (accounts, next_cursor) = if asked.cursor.is_empty() {
+            (vec!["ACC-1"], "ACC-1")
+        } else {
+            (vec!["ACC-2"], "")
+        };
+        Ok((
+            "".into(),
+            meridian_domain::v1::ReadBookHealthReply {
+                accounts: accounts
+                    .into_iter()
+                    .map(|account| meridian_domain::v1::AccountBookHealth {
+                        account_id: account.into(),
+                        journal_entries: 2_400,
+                        entries_since_snapshot: 400,
+                        last_snapshot_at_ns: T0,
+                    })
+                    .collect(),
+                next_cursor: next_cursor.into(),
+            }
+            .encode_to_vec(),
+        ))
+    });
+    assert_eq!(
+        send(&h, "GET", "/terminal/book-health", Some(&h.bob), "")
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    let (status, _, body) = send(&h, "GET", "/terminal/book-health", Some(&h.ada), "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let read: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let accounts = read["accounts"].as_array().unwrap();
+    assert_eq!(accounts.len(), 2, "every page: {body}");
+    assert_eq!(accounts[1]["account_id"], "ACC-2");
+    assert_eq!(accounts[0]["entries_since_snapshot"], 400);
+    assert_eq!(accounts[0]["last_snapshot_at_ns"], T0.to_string());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_push_is_passed_through_step_by_step_and_its_location_kept_here() {
     let h = harness().await;
     let base = "/terminal/registry/v2/plugins/snaptrade";

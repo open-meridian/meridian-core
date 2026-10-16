@@ -37,6 +37,8 @@ pub const LAUNCH_PLUGIN: &str = "platform.config.command.launch-plugin";
 pub const STOP_PLUGIN: &str = "platform.config.command.stop-plugin";
 /// W8.15 (contract v25): a version retired from the catalogue.
 pub const RETIRE_PLUGIN_VERSION: &str = "platform.config.command.retire-plugin-version";
+/// W9.10 (contract v25; ruling 155): the book's health per account.
+pub const READ_BOOK_HEALTH: &str = "platform.book.query.read-book-health";
 
 /// The deployment's registry, as this pod reaches it inside the cluster.
 pub struct Registry {
@@ -68,6 +70,9 @@ pub fn routes() -> Router<Arc<App>> {
             any(pass_through),
         )
         .route("/terminal/plugins", get(list).post(upload))
+        // ReadBookHealthFromTerminal (contract v25; ruling 155): what
+        // `meridian status` reads of the book.
+        .route("/terminal/book-health", get(book_health))
         .route("/terminal/plugins/launch", post(launch))
         .route("/terminal/plugins/stop", post(stop))
         .route(
@@ -578,6 +583,44 @@ fn state_name(state: i32) -> &'static str {
         Ok(PluginLaunchState::Failed) => "failed",
         _ => "unknown",
     }
+}
+
+/// The book's health per account, every page read (W9.10, contract v25;
+/// ruling 155), for a deployment admin's terminal: each account's journal,
+/// the entries a command replays after its last snapshot, and when that was
+/// taken. A count about the book's own working, never an account's data.
+async fn book_health(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    let admin = match admin(&app, &headers).await {
+        Ok(admin) => admin,
+        Err(refusal) => return *refusal,
+    };
+    let mut accounts = Vec::new();
+    let mut cursor = String::new();
+    loop {
+        let page: meridian_domain::v1::ReadBookHealthReply = match ask(
+            &app,
+            &admin,
+            READ_BOOK_HEALTH,
+            "meridian.v1.ReadBookHealthRequest",
+            meridian_domain::v1::ReadBookHealthRequest {
+                account_id: String::new(),
+                page_size: 1_000,
+                cursor: cursor.clone(),
+            },
+            Duration::from_secs(20),
+        )
+        .await
+        {
+            Ok(page) => page,
+            Err(failed) => return refused(StatusCode::BAD_GATEWAY, failed),
+        };
+        accounts.extend(page.accounts.iter().map(crate::mcp::book::book_health_json));
+        if page.next_cursor.is_empty() || accounts.len() >= 100_000 {
+            break;
+        }
+        cursor = page.next_cursor;
+    }
+    json(StatusCode::OK, serde_json::json!({ "accounts": accounts }))
 }
 
 async fn list(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {

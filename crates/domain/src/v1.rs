@@ -9021,6 +9021,42 @@ pub struct LocalRecordOrdersSetting {
     #[prost(int64, tag = "2")]
     pub open_order_count: i64,
 }
+/// W9.10 (contract v25): the book's health per account, for a deployment
+/// admin -- the dashboard's tool and the CLI's `meridian status` -- whatever
+/// database the book runs on.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReadBookHealthRequest {
+    /// One account; empty for every account, paged.
+    #[prost(string, tag = "1")]
+    pub account_id: ::prost::alloc::string::String,
+    #[prost(int32, tag = "2")]
+    pub page_size: i32,
+    #[prost(string, tag = "3")]
+    pub cursor: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReadBookHealthReply {
+    #[prost(message, repeated, tag = "1")]
+    pub accounts: ::prost::alloc::vec::Vec<AccountBookHealth>,
+    #[prost(string, tag = "2")]
+    pub next_cursor: ::prost::alloc::string::String,
+}
+/// One account's journal and its last snapshot.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AccountBookHealth {
+    #[prost(string, tag = "1")]
+    pub account_id: ::prost::alloc::string::String,
+    /// Every entry in the account's journal.
+    #[prost(uint64, tag = "2")]
+    pub journal_entries: u64,
+    /// The replay length: entries a command or a read replays after the last
+    /// snapshot.
+    #[prost(uint64, tag = "3")]
+    pub entries_since_snapshot: u64,
+    /// When the last snapshot was taken; 0 where none is yet.
+    #[prost(int64, tag = "4")]
+    pub last_snapshot_at_ns: i64,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct BookingReply {
     #[prost(message, optional, tag = "1")]
@@ -12142,6 +12178,13 @@ pub struct DownloadListedVersionReply {
     pub pull_token: ::prost::alloc::string::String,
     #[prost(int64, tag = "4")]
     pub pull_token_expires_at_ns: i64,
+    /// The version's signed listing statement, as ListedVersion.listing_statement
+    /// carries it: a DSSE envelope as JSON. The conductor verifies it at
+    /// download and keeps it with the version for launch; the CLI's bundle
+    /// download verifies it and writes it into the bundle (W8.14), since a
+    /// verified version's statement is not a referrer the platform can push.
+    #[prost(string, tag = "5")]
+    pub listing_statement: ::prost::alloc::string::String,
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct ReportPluginUsageReply {

@@ -98,6 +98,19 @@ attributes as they stand.",
         Area::Accounts,
         attribute_schema,
     ),
+    // Contract v25 (W9.10; ruling 155): the book's health per account, the
+    // deployment admin's read, as `meridian status` reads it.
+    spec(
+        "read_book_health",
+        "Read the book's health",
+        "per account in the book of record, the journal's length, the replay length -- the \
+entries a command or a dated read replays after the account's latest snapshot -- and when that \
+snapshot was taken (0 where none is yet): the book's own working, never an account's positions \
+or orders. One account by account_id, or every account.",
+        true,
+        Area::Accounts,
+        book_health_schema,
+    ),
     spec(
         "list_trading_instructions",
         "List trading instructions",
@@ -244,8 +257,68 @@ pub async fn call(app: &App, caller: &Caller, spec: &Spec, arguments: Value) -> 
         "set_trading_instruction" => set_instruction(app, caller, &arguments).await,
         "set_local_record_orders" => set_local_record_orders(app, caller, &arguments).await,
         "close_account" => close_account(app, caller, &arguments).await,
+        "read_book_health" => read_book_health(app, caller, &arguments).await,
         other => refused("not_listed", &format!("no tool {other}"), Vec::new()),
     }
+}
+
+fn book_health_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {"account_id": {"type": "string"}},
+        "additionalProperties": false,
+    })
+}
+
+/// One account's book health as the tool and the terminal answer it.
+pub fn book_health_json(health: &meridian_domain::v1::AccountBookHealth) -> Value {
+    json!({
+        "account_id": health.account_id,
+        "journal_entries": health.journal_entries,
+        "entries_since_snapshot": health.entries_since_snapshot,
+        // As every time on the surface (O3): a decimal string.
+        "last_snapshot_at_ns": health.last_snapshot_at_ns.to_string(),
+    })
+}
+
+/// W9.10 (contract v25): every page of the book's health read.
+async fn read_book_health(app: &App, caller: &Caller, arguments: &Value) -> Value {
+    let mut problems = Problems::default();
+    let Some(top) = object(arguments, "", &mut problems) else {
+        return problems.refusal();
+    };
+    only(top, &["account_id"], "", &mut problems);
+    let account_id = text(top, "account_id", "", false, &mut problems);
+    if !problems.is_empty() {
+        return problems.refusal();
+    }
+    let mut found = Vec::new();
+    let mut cursor = String::new();
+    loop {
+        let reply: Result<meridian_domain::v1::ReadBookHealthReply, _> = ask(
+            app,
+            caller,
+            crate::catalogue::READ_BOOK_HEALTH,
+            "meridian.v1.ReadBookHealthRequest",
+            meridian_domain::v1::ReadBookHealthRequest {
+                account_id: account_id.clone(),
+                page_size: 1_000,
+                cursor: cursor.clone(),
+            },
+            WAIT,
+        )
+        .await;
+        let page = match reply {
+            Ok(page) => page,
+            Err(failed) => return bus_refused(failed, ""),
+        };
+        found.extend(page.accounts.iter().map(book_health_json));
+        if page.next_cursor.is_empty() {
+            break;
+        }
+        cursor = page.next_cursor;
+    }
+    json!({"outcome": "unchanged", "data": {"accounts": found}})
 }
 
 fn nothing(arguments: &Value) -> Option<Value> {
@@ -680,6 +753,8 @@ pub const PARITY: &[(&str, &str)] = &[
     ),
     ("/admin/accounts/book", "set_account_attribute"),
     ("/admin/accounts/close", "close_account"),
+    // Contract v25 (ruling 155): what `meridian status` reads of the book.
+    ("/terminal/book-health", "read_book_health"),
     (
         "/admin/trading-instructions",
         "list_trading_instructions set_trading_instruction set_local_record_orders",

@@ -776,6 +776,12 @@ message DownloadListedVersionReply {
   // bytes are pulled anonymously.
   string pull_token = 3;
   int64 pull_token_expires_at_ns = 4;
+  // The version's signed listing statement, as ListedVersion.listing_statement
+  // carries it: a DSSE envelope as JSON. The conductor verifies it at
+  // download and keeps it with the version for launch; the CLI's bundle
+  // download verifies it and writes it into the bundle (W8.14), since a
+  // verified version's statement is not a referrer the platform can push.
+  string listing_statement = 5;
 }
 
 message ReportPluginUsageReply {

@@ -61,6 +61,7 @@ platform.book.query.list-orders	query	oms,ems,compliance,portfolio,operations,re
 platform.book.query.list-positions	query	portfolio,reporting,compliance,oms,operations	bor
 platform.book.query.list-trading-instructions	query	oms,ems,connectivity,portfolio,compliance,dashboard	bor
 platform.book.query.order-history	query	compliance,reporting,operations,oms	bor
+platform.book.query.read-book-health	query	dashboard	bor
 platform.book.query.read-local-record-orders	query	oms,ems,portfolio,compliance,dashboard	bor
 platform.config.command.acknowledge-pull	command	dashboard	conductor
 platform.config.command.allow-archive	command	dashboard	conductor

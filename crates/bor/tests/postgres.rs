@@ -1082,6 +1082,13 @@ async fn a_snapshot_and_its_tail_answer_as_the_whole_journal_does() {
     );
     let journal = blocking(|| store.journal(&account)).unwrap();
     assert_eq!(journal.len(), 12);
+    // The book's health (ruling 155): the journal, the tail since the last
+    // snapshot, and when it was taken.
+    let health = blocking(|| store.book_health(Some(&account), "", 10)).unwrap();
+    assert_eq!(health.len(), 1);
+    assert_eq!(health[0].journal_entries, 12);
+    assert!(health[0].entries_since_snapshot < 3, "{health:?}");
+    assert!(health[0].last_snapshot_at_ns > 0);
     let whole = meridian_bor::Book::replay(&account, &journal[0].partition, &journal).unwrap();
     assert_eq!(blocking(|| store.book(&account)).unwrap(), whole);
     // A dated read at each watermark, from a snapshot where one fits.
@@ -1123,4 +1130,6 @@ async fn a_snapshot_and_its_tail_answer_as_the_whole_journal_does() {
             .get(0)
     });
     assert_eq!(meridian_bor::snapshot::decode(&rebuilt).unwrap(), whole);
+    let health = blocking(|| store.book_health(Some(&account), "", 10)).unwrap();
+    assert_eq!(health[0].entries_since_snapshot, 0, "{health:?}");
 }

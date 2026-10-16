@@ -58,7 +58,12 @@ fn the_four_tools_are_named_preparable_where_they_change_and_may_not_for_agents(
             spec.name
         );
         assert!(matches!(spec.area, Area::Accounts | Area::Trading));
-        assert_eq!(spec.reads, spec.name.starts_with("list_"), "{}", spec.name);
+        assert_eq!(
+            spec.reads,
+            spec.name.starts_with("list_") || spec.name.starts_with("read_"),
+            "{}",
+            spec.name
+        );
         let name = format!("dashboard__{}", spec.name);
         assert_eq!(
             crate::prepared::CORE_PREPARABLE.contains(&name.as_str()),
@@ -73,10 +78,10 @@ fn the_four_tools_are_named_preparable_where_they_change_and_may_not_for_agents(
             );
         }
     }
-    // The four approved in v22, and from contract v24 the escape hatch's
-    // setting (W11.36, approved 2026-10-14) and closing an account (W6.3,
-    // approved 2026-10-15).
-    assert_eq!(SPECS.len(), 6, "the six approved tools");
+    // The four approved in v22, from contract v24 the escape hatch's setting
+    // (W11.36, approved 2026-10-14) and closing an account (W6.3, approved
+    // 2026-10-15), and from contract v25 the book's health (ruling 155).
+    assert_eq!(SPECS.len(), 7, "the seven approved tools");
 }
 
 #[test]
@@ -111,7 +116,14 @@ fn a_change_takes_a_note_and_a_read_answers_unchanged() {
         let properties = schema["properties"].as_object().unwrap();
         assert!(!properties.contains_key("reason"), "{}", spec.name);
         if spec.reads {
-            assert!(properties.is_empty(), "{}", spec.name);
+            // A read takes no note; the book's health (contract v25) takes
+            // one account as a filter, nothing else.
+            assert!(!properties.contains_key("note"), "{}", spec.name);
+            assert!(
+                properties.keys().all(|key| key == "account_id"),
+                "{}",
+                spec.name
+            );
         } else {
             assert!(properties.contains_key("note"), "{}", spec.name);
             assert!(
@@ -127,7 +139,7 @@ fn a_change_takes_a_note_and_a_read_answers_unchanged() {
     }
     let source = include_str!("../book.rs");
     assert!(!source.contains("\"outcome\": \"read\""));
-    assert_eq!(source.matches("\"outcome\": \"unchanged\"").count(), 2);
+    assert_eq!(source.matches("\"outcome\": \"unchanged\"").count(), 3);
 }
 
 /// Contract v24 (W6.3, W6.30): "Unlink all and close" through the surface is
