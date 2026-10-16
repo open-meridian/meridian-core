@@ -152,16 +152,21 @@ impl Screen {
 }
 
 /// The rules whose match refuses a version's upload (ruling 176, the
-/// product owner, 2026-10-16): false claims or hostile text in a vendor's
-/// documentation or declaration. Every other match keeps the upload, the
-/// section shown to people marked "Screened" and withheld from agents.
-pub const REFUSING: [&str; 6] = [
+/// product owner, 2026-10-16, and its addendum under agreement A): false
+/// claims or hostile text in a vendor's documentation or declaration, as
+/// the platform's registry_text.py REFUSES lists them (4df7a9a). Every other
+/// match -- its WITHHOLDS, and core's own ticket verbs -- keeps the upload,
+/// the section shown to people marked "Screened" and withheld from agents.
+pub const REFUSING: [&str; 9] = [
     "override",
     "acts for the reader",
     "claims endorsement",
     "claims verification",
     "claims regulatory readiness",
     "poses as open meridian",
+    "exfiltration",
+    "concealment",
+    "claims authority",
 ];
 
 /// The refusing rules a vendor's text matched, by name; none when it is
