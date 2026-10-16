@@ -151,6 +151,81 @@ impl Screen {
     }
 }
 
+/// The rules whose match refuses a version's upload (ruling 176, the
+/// product owner, 2026-10-16): false claims or hostile text in a vendor's
+/// documentation or declaration. Every other match keeps the upload, the
+/// section shown to people marked "Screened" and withheld from agents.
+pub const REFUSING: [&str; 6] = [
+    "override",
+    "acts for the reader",
+    "claims endorsement",
+    "claims verification",
+    "claims regulatory readiness",
+    "poses as open meridian",
+];
+
+/// The refusing rules a vendor's text matched, by name; none when it is
+/// kept.
+pub fn refused_by(text: &str) -> Vec<String> {
+    screen(text)
+        .rules
+        .into_iter()
+        .filter(|rule| REFUSING.contains(&rule.as_str()))
+        .collect()
+}
+
+/// A version's upload held to ruling 176: each documentation section and
+/// every text in its declaration screened, the first that matches a
+/// refusing rule refused naming where and the rules.
+pub fn upload_refused(
+    documentation: &[meridian_domain::v1::DocumentationText],
+    declaration: Option<&PluginDeclaration>,
+) -> Option<String> {
+    for text in documentation {
+        let rules = refused_by(&text.markdown);
+        if !rules.is_empty() {
+            return Some(format!(
+                "documentation.{}: it matched the screen ({}), which refuses a version's \
+                 documentation; fix it in the version's docs/ and upload again",
+                text.section,
+                rules.join(", ")
+            ));
+        }
+    }
+    let declaration = declaration.map(crate::declaration::to_json)?;
+    let mut found = None;
+    walk(&declaration, "declaration", &mut |path, text| {
+        if found.is_none() {
+            let rules = refused_by(text);
+            if !rules.is_empty() {
+                found = Some(format!(
+                    "{path}: it matched the screen ({}), which refuses a version's declaration",
+                    rules.join(", ")
+                ));
+            }
+        }
+    });
+    found
+}
+
+/// Every string in a JSON value, with its path.
+fn walk(value: &serde_json::Value, path: &str, seen: &mut dyn FnMut(&str, &str)) {
+    match value {
+        serde_json::Value::String(text) => seen(path, text),
+        serde_json::Value::Array(items) => {
+            for (n, item) in items.iter().enumerate() {
+                walk(item, &format!("{path}[{n}]"), seen);
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for (name, item) in fields {
+                walk(item, &format!("{path}.{name}"), seen);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub fn screen(markdown: &str) -> Screen {
     let read = crate::markdown::screened_text(markdown);
     let matched = crate::tickets::quarantine::matched(&read);
@@ -306,8 +381,8 @@ fn vendor_section(page: &Page, section: &str, present: &[&str]) -> (String, Stri
     let screened = screen(text);
     let warning = if screened.suspect() {
         format!(
-            "<p class=\"docs-warning\" role=\"note\" data-suspect>This section is shown here and \
-             withheld from agents: {}.</p>",
+            "<p class=\"docs-warning\" role=\"note\" data-suspect><strong>Screened.</strong> This \
+             section is shown here and withheld from agents: {}.</p>",
             escape(&screened.why())
         )
     } else {

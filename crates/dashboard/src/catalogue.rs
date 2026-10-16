@@ -550,6 +550,22 @@ async fn upload(
         Some(Ok(declaration)) => Some(declaration),
         Some(Err(why)) => return refused(StatusCode::UNPROCESSABLE_ENTITY, why),
     };
+    let documentation: Vec<meridian_domain::v1::DocumentationText> = upload
+        .documentation
+        .into_iter()
+        .map(|text| meridian_domain::v1::DocumentationText {
+            section: text.section,
+            markdown: text.markdown,
+        })
+        .collect();
+    // Ruling 176: a false claim or hostile text in the vendor's
+    // documentation or declaration refuses the upload, naming the rule;
+    // every other match is kept, and screened where it is shown.
+    if let Some(refusal) =
+        crate::documentation::upload_refused(&documentation, declaration.as_ref())
+    {
+        return refused(StatusCode::UNPROCESSABLE_ENTITY, refusal);
+    }
     let request = RecordPluginUploadRequest {
         metadata: Some(PluginMetadata {
             name: upload.name,
@@ -560,14 +576,7 @@ async fn upload(
             declaration,
         }),
         image_digest: upload.image_digest,
-        documentation: upload
-            .documentation
-            .into_iter()
-            .map(|text| meridian_domain::v1::DocumentationText {
-                section: text.section,
-                markdown: text.markdown,
-            })
-            .collect(),
+        documentation,
     };
     let recorded: Result<PluginVersion, String> = ask(
         &app,

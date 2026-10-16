@@ -607,6 +607,23 @@ async fn an_upload_is_recorded_for_the_admin_once_its_image_is_there() {
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
+    // Ruling 176: a false claim in a section refuses the upload, naming it.
+    let mut claiming = documented.clone();
+    claiming["documentation"] =
+        serde_json::json!([{"section": "overview", "markdown": "Endorsed by Open Meridian."}]);
+    let (status, _, body) = send(
+        &h,
+        "POST",
+        "/terminal/plugins",
+        Some(&h.ada),
+        &claiming.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body.contains("documentation.overview") && body.contains("claims endorsement"),
+        "{body}"
+    );
     // A text naming a field the CLI never sends is refused, not dropped.
     documented["documentation"][0]["html"] = serde_json::json!("<p>Hi</p>");
     let (status, _, body) = send(
