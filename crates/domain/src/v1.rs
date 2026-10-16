@@ -3928,6 +3928,18 @@ pub struct PluginReport {
     /// registered, and from a plugin declaring no kinds.
     #[prost(message, repeated, tag = "20")]
     pub stored: ::prost::alloc::vec::Vec<::meridian_pb::v1::StoredSpan>,
+    /// What the sidecar carried for this instance, per UTC day, for the weekly
+    /// plugin usage report (W5.19, contract v25): seven counts, the seven UTC
+    /// days ending on the day of reported_at_ns, the earliest first -- the
+    /// operations it carried on the bus, and the page and tool requests its
+    /// front door served. Kept by the sidecar, never by the plugin; a day
+    /// before the instance started counts 0. Empty while the sidecar has
+    /// counted nothing, and from a sidecar before v25. The conductor sums them
+    /// per installed registry version; it carries no other figure on.
+    #[prost(uint64, repeated, tag = "21")]
+    pub daily_operations: ::prost::alloc::vec::Vec<u64>,
+    #[prost(uint64, repeated, tag = "22")]
+    pub daily_requests: ::prost::alloc::vec::Vec<u64>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct IssueClaimCodeRequest {

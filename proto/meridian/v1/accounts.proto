@@ -770,6 +770,17 @@ message PluginReport {
   // registered, and from a plugin declaring no kinds.
   repeated StoredSpan stored = 20;
 
+  // What the sidecar carried for this instance, per UTC day, for the weekly
+  // plugin usage report (W5.19, contract v25): seven counts, the seven UTC
+  // days ending on the day of reported_at_ns, the earliest first -- the
+  // operations it carried on the bus, and the page and tool requests its
+  // front door served. Kept by the sidecar, never by the plugin; a day
+  // before the instance started counts 0. Empty while the sidecar has
+  // counted nothing, and from a sidecar before v25. The conductor sums them
+  // per installed registry version; it carries no other figure on.
+  repeated uint64 daily_operations = 21;
+  repeated uint64 daily_requests = 22;
+
   // A single role, before a plugin could hold several.
   reserved 2;
   reserved "role";

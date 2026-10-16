@@ -173,6 +173,10 @@ pub struct Sidecar {
     /// launched one is. Only ever a stricter check: a catalogue launch's
     /// declaration, from the conductor, wins.
     pub(crate) harnessed: Option<meridian_pb::v1::PluginDeclaration>,
+
+    /// What it carried per UTC day, for the plugin usage report (W5.19,
+    /// contract v25).
+    pub(crate) daily: Arc<crate::daily::Daily>,
 }
 
 impl Sidecar {
@@ -234,6 +238,7 @@ impl Sidecar {
             verifier: None,
             filed: Arc::default(),
             harnessed: None,
+            daily: Arc::default(),
         }
     }
 

@@ -209,49 +209,54 @@ fn the_reference_carries_what_the_summary_drew_of_the_declaration() {
 }
 
 /// The red-team corpus's vendor-text cases (RT38 to RT46), replayed through
-/// the documentation's screen: a case marked benign -- the contract's own
-/// instruction terms (RT45) -- is not withheld; every other case pinned to
-/// one of the deployment's rules or the platform's claims rules is, by that
-/// rule, as the platform withholds it.
+/// the documentation's screen under ruling 176: a case marked benign -- the
+/// contract's own instruction terms (RT45) -- is not withheld; a case whose
+/// outcome is `refused` refuses the upload, naming its rule; one whose
+/// outcome is `withheld` is kept, screened and withheld from agents.
 #[test]
-fn the_corpus_s_vendor_text_is_withheld_but_for_a_benign_case() {
+fn the_corpus_s_vendor_text_is_refused_withheld_or_kept_as_it_pins() {
     let corpus: serde_json::Value =
         serde_json::from_str(include_str!("../../../../deploy/prompt-attacks.json")).unwrap();
-    let mut benign = 0;
-    let mut pinned = 0;
+    let (mut benign, mut refused, mut withheld) = (0, 0, 0);
     for case in corpus["cases"].as_array().unwrap() {
         if case["channel"] != "vendor-text" {
             continue;
         }
         let id = case["id"].as_str().unwrap();
         let planted = case["planted"].as_str().unwrap();
-        let screened = screen(planted);
+        let section = vec![meridian_domain::v1::DocumentationText {
+            section: "overview".into(),
+            markdown: planted.into(),
+        }];
         if case["benign"].as_bool() == Some(true) {
             assert!(
-                !screened.suspect(),
-                "{id} is benign and was withheld: {screened:?}"
+                !screen(planted).suspect(),
+                "{id} is benign and was screened"
             );
+            assert_eq!(upload_refused(&section, None), None, "{id}");
             benign += 1;
             continue;
         }
-        let matched = case["expect"]["platform"]["server"]["expect"]["matched"]
-            .as_str()
-            .unwrap_or_default();
-        if crate::tickets::quarantine::RULES.contains(&matched)
-            || crate::tickets::quarantine::VENDOR_CLAIMS.contains(&matched)
-        {
-            assert!(
-                screened.rules.iter().any(|rule| rule == matched),
-                "{id} is not withheld by {matched}: {screened:?}"
-            );
-            pinned += 1;
+        let expect = &case["expect"]["platform"]["server"]["expect"];
+        let rule = expect["matched"].as_str().unwrap_or_default();
+        match expect["outcome"].as_str() {
+            Some("refused") => {
+                let said = upload_refused(&section, None)
+                    .unwrap_or_else(|| panic!("{id} was not refused"));
+                assert!(said.contains(rule), "{id} refused, not by {rule}: {said}");
+                refused += 1;
+            }
+            Some("withheld") => {
+                assert_eq!(upload_refused(&section, None), None, "{id} was refused");
+                assert!(screen(planted).suspect(), "{id} was not screened");
+                withheld += 1;
+            }
+            other => panic!("{id}: an outcome the replay does not know, {other:?}"),
         }
     }
-    // RT39 to RT44 and RT46; RT38's registry tool name is the platform's
-    // list of its own tools, which core's tool-name rule matches by shape.
     assert!(
-        benign >= 1 && pinned >= 7,
-        "benign {benign}, pinned {pinned}"
+        benign >= 1 && refused >= 6 && withheld >= 2,
+        "benign {benign}, refused {refused}, withheld {withheld}"
     );
 }
 

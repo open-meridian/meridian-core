@@ -292,6 +292,9 @@ pub fn router(front_door: FrontDoor) -> Router {
 
 async fn pass(State(front_door): State<FrontDoor>, request: Request) -> Response {
     let now_ns = front_door.sidecar.clock.now_ns();
+    // A page or a tool request, counted for the usage report (W5.19,
+    // contract v25); nothing of it is kept.
+    front_door.sidecar.daily.request(now_ns);
     match through(&front_door, request, now_ns).await {
         Ok(response) => response,
         Err(refusal) => refusal.into_response(),
