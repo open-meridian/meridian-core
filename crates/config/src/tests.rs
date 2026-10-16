@@ -1077,6 +1077,42 @@ async fn a_link_needs_a_plugin_that_has_reported_and_an_open_account() {
 }
 
 #[tokio::test]
+async fn an_expected_link_refusal_carries_its_category_and_the_field() {
+    // Contract v25 (the v24 tutorial walk): never a handler's failure with
+    // no category, so the plugin reads a refusal naming the field.
+    let h = harness("oms-1");
+    let detail = |failed: String| {
+        let at = failed.find("[refusal-status").expect("a refusal's status");
+        failed[at..].to_string()
+    };
+    for (request, by, status, field) in [
+        (
+            link_request("oms-1", "ACC-NONE", ""),
+            ADA,
+            meridian_bus::RefusalStatus::InvalidArgument,
+            "account_id",
+        ),
+        (
+            link_request("oms-1", "ACC-1", "Both"),
+            ADA,
+            meridian_bus::RefusalStatus::InvalidArgument,
+            "account_id",
+        ),
+        (
+            link_request("other-1", "", "A new one"),
+            ADA,
+            meridian_bus::RefusalStatus::PermissionDenied,
+            "plugin_instance_id",
+        ),
+    ] {
+        let failed = detail(link_for(&h, request, by).await.unwrap_err());
+        let (said, fields, _) = meridian_bus::read_refusal_status(&failed).expect("readable");
+        assert_eq!(said, status, "{failed}");
+        assert_eq!(fields, vec![field.to_string()], "{failed}");
+    }
+}
+
+#[tokio::test]
 async fn a_link_naming_a_new_account_creates_and_links_it_in_one_step() {
     // W6.4: from the plugin's own admin page, for the deployment admin.
     let h = harness("oms-1");

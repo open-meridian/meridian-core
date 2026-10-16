@@ -1543,11 +1543,23 @@ pub fn serve_with(
             "meridian.v1.ExternalAccountLink",
         ),
         |cx, request: LinkExternalAccountRequest, envelope| {
-            let by = admin_acting(envelope, "a link")?;
+            // Expected refusals carry their category (contract v25), as the
+            // rules' do: a link sent for nobody, or naming another plugin.
+            let by = admin_acting(envelope, "a link").map_err(|words| {
+                meridian_bus::refusal_with_status(
+                    meridian_bus::RefusalStatus::PermissionDenied,
+                    &[],
+                    words,
+                )
+            })?;
             if publisher(envelope) != request.plugin_instance_id {
-                return Err(format!(
-                    "a plugin links only its own external accounts, and this names {}",
-                    request.plugin_instance_id
+                return Err(meridian_bus::refusal_with_status(
+                    meridian_bus::RefusalStatus::PermissionDenied,
+                    &["plugin_instance_id".to_string()],
+                    format!(
+                        "a plugin links only its own external accounts, and this names {}",
+                        request.plugin_instance_id
+                    ),
                 ));
             }
             let before = cx.snapshot()?;
