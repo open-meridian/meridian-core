@@ -211,10 +211,8 @@ fn the_reference_carries_what_the_summary_drew_of_the_declaration() {
 /// The red-team corpus's vendor-text cases (RT38 to RT46), replayed through
 /// the documentation's screen: a case marked benign -- the contract's own
 /// instruction terms (RT45) -- is not withheld; every other case pinned to
-/// one of the deployment's rules is, by that rule. The platform's own
-/// vendor-text rules (endorsement, verification, regulatory readiness,
-/// posing as Open Meridian, acting for the reader) are its screen's, at the
-/// catalogue; here such a section is drawn under the notice.
+/// one of the deployment's rules or the platform's claims rules is, by that
+/// rule, as the platform withholds it.
 #[test]
 fn the_corpus_s_vendor_text_is_withheld_but_for_a_benign_case() {
     let corpus: serde_json::Value =
@@ -239,7 +237,9 @@ fn the_corpus_s_vendor_text_is_withheld_but_for_a_benign_case() {
         let matched = case["expect"]["platform"]["server"]["expect"]["matched"]
             .as_str()
             .unwrap_or_default();
-        if crate::tickets::quarantine::RULES.contains(&matched) {
+        if crate::tickets::quarantine::RULES.contains(&matched)
+            || crate::tickets::quarantine::VENDOR_CLAIMS.contains(&matched)
+        {
             assert!(
                 screened.rules.iter().any(|rule| rule == matched),
                 "{id} is not withheld by {matched}: {screened:?}"
@@ -247,8 +247,10 @@ fn the_corpus_s_vendor_text_is_withheld_but_for_a_benign_case() {
             pinned += 1;
         }
     }
+    // RT39 to RT44 and RT46; RT38's registry tool name is the platform's
+    // list of its own tools, which core's tool-name rule matches by shape.
     assert!(
-        benign >= 1 && pinned >= 2,
+        benign >= 1 && pinned >= 7,
         "benign {benign}, pinned {pinned}"
     );
 }

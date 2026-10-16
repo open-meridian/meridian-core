@@ -152,9 +152,18 @@ impl Screen {
 }
 
 pub fn screen(markdown: &str) -> Screen {
-    let matched = crate::tickets::quarantine::matched(&crate::markdown::screened_text(markdown));
+    let read = crate::markdown::screened_text(markdown);
+    let matched = crate::tickets::quarantine::matched(&read);
+    // The platform's claims rules beside the deployment's own: a vendor's
+    // documentation is screened alike at the catalogue and here.
+    let mut rules = crate::tickets::quarantine::names(&matched);
+    rules.extend(
+        crate::tickets::quarantine::vendor_claims(&read)
+            .into_iter()
+            .map(String::from),
+    );
     Screen {
-        rules: crate::tickets::quarantine::names(&matched),
+        rules,
         hidden: crate::markdown::hidden(markdown),
     }
 }
