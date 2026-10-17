@@ -228,9 +228,11 @@ pub fn link(snapshot: &Snapshot, request: &LinkExternalAccountRequest) -> Verdic
     .map_err(|words| wrong("plugin_instance_id", words))?;
     if !request.new_account_name.is_empty() {
         if !request.account_id.is_empty() {
-            return Err(wrong(
-                "account_id",
-                "a link names an existing account or a new account's name, not both".into(),
+            // Both fields named: the link names one or the other.
+            return Err(meridian_bus::refusal_with_status(
+                meridian_bus::RefusalStatus::InvalidArgument,
+                &["account_id".to_string(), "new_account_name".to_string()],
+                "a link names an existing account or a new account's name, not both",
             ));
         }
         required(&request.new_account_name, "a new account's name")
@@ -375,17 +377,17 @@ fn one_external_account(snapshot: &Snapshot, request: &LinkExternalAccountReques
     });
     match held {
         None => Ok(()),
-        Some(held) => Err(meridian_bus::refusal_with_status(
-            meridian_bus::RefusalStatus::InvalidArgument,
-            &["account_id".to_string()],
-            format!(
-                "{} already has external account {} linked ({}); an account has one external \
-                 account: link {} to another account, or a new one",
-                request.account_id,
-                held.external_account_id,
-                held.plugin_instance_id,
-                request.external_account_id
-            ),
+        // ABORTED, as DESIGN25's link-external-account fixture gives it: a
+        // well-formed link refused for the state of the book, which a
+        // component's plain refusal is (the sidecar sends it aborted, its
+        // words whole), not a malformed argument.
+        Some(held) => Err(format!(
+            "{} already has external account {} linked ({}); an account has one external \
+             account: link {} to another account, or a new one",
+            request.account_id,
+            held.external_account_id,
+            held.plugin_instance_id,
+            request.external_account_id
         )),
     }
 }

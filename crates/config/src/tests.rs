@@ -1099,25 +1099,25 @@ async fn an_expected_link_refusal_carries_its_category_and_the_field() {
             link_request("oms-1", "ACC-NONE", ""),
             ADA,
             meridian_bus::RefusalStatus::InvalidArgument,
-            "account_id",
+            &["account_id"][..],
         ),
         (
             link_request("oms-1", "ACC-1", "Both"),
             ADA,
             meridian_bus::RefusalStatus::InvalidArgument,
-            "account_id",
+            &["account_id", "new_account_name"][..],
         ),
         (
             link_request("other-1", "", "A new one"),
             ADA,
             meridian_bus::RefusalStatus::PermissionDenied,
-            "plugin_instance_id",
+            &["plugin_instance_id"][..],
         ),
     ] {
         let failed = detail(link_for(&h, request, by).await.unwrap_err());
         let (said, fields, _) = meridian_bus::read_refusal_status(&failed).expect("readable");
         assert_eq!(said, status, "{failed}");
-        assert_eq!(fields, vec![field.to_string()], "{failed}");
+        assert_eq!(fields, field, "{failed}");
     }
 }
 
@@ -2874,6 +2874,9 @@ async fn an_account_has_one_external_account_and_two_of_one_connection_are_two_a
         )),
         "{refused}"
     );
+    // A component's plain refusal, which the sidecar sends ABORTED, as the
+    // link-external-account fixture gives this case.
+    assert!(!refused.contains("[refusal-status"), "{refused}");
     assert_eq!(records(&h).await.links.len(), 1, "nothing was linked");
 
     // Another external account of the same connection, to another account.

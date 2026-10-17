@@ -752,7 +752,9 @@ def main():
           f"an account it did not report is refused at the sidecar: {unreported}")
     both = link(manager, external_account_id="ext-e2e", account_id=account,
                 new_account_name="Two at once")
-    check(both.get("code") == "ABORTED" and "not both" in both.get("detail", ""),
+    # A malformed link, naming both fields (since 0e6ea1f a refusal with its
+    # status, INVALID_ARGUMENT; before, a handler's failure, sent ABORTED).
+    check(both.get("code") == "INVALID_ARGUMENT" and "not both" in both.get("detail", ""),
           f"naming both an account and a new one is refused by the conductor: {both}")
     linked = link(manager, external_account_id="ext-e2e", account_id=account)
     check(linked.get("ok") and linked.get("account_id") == account
