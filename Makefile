@@ -2121,12 +2121,8 @@ interop: network
 	@# leave a Bake-built container's image label empty and recreate it on the
 	@# next convergence (docker/compose#13047) -- and the suite would join the
 	@# new namespace, where 9191 answers and 9192 and 9193 never do.
-	@# The scaffold names its documentation "docs", relative to where it runs
-	@# (in its image, /plugin, its docs/ beside it); the suite runs it from
-	@# /w, so its docs/ is put beside it there, as its image has it. The
-	@# SDK's check that the folder is there is left as it is.
 	@MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE) run --rm --no-deps -T interop \
-		sh -c 'cp -R template/docs docs && exec python -m pytest -q tests/test_interop.py' >.interop.log 2>&1; \
+		python -m pytest -q tests/test_interop.py >.interop.log 2>&1; \
 		status=$$?; \
 		$(COMPOSE) exec -T postgres psql -U meridian -d meridian -At -v ON_ERROR_STOP=1 \
 			<deploy/harness/street.sql 2>>.interop.log \
