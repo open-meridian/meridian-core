@@ -3697,3 +3697,161 @@ async fn the_reports_read_answers_the_setting_in_force() {
         .unwrap();
     assert!(!read().await.reports_usage);
 }
+
+/// The path the dev deployment took on 2026-10-17, end to end in one
+/// conductor: a version uploaded as the CLI sends it (the dashboard's
+/// /terminal/plugins turns the printed declaration into its proto with
+/// `declaration::from_json`), launched from the catalogue on an instance
+/// launched before from an older version uploaded with none, and the
+/// configuration its sidecar asks for. Registration is held to the
+/// declaration the version now running was uploaded with -- not the one the
+/// instance was first launched from -- and a registration differing from it
+/// is refused naming the difference.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relaunched_instance_is_held_to_its_running_version_s_uploaded_declaration() {
+    use meridian_domain::v1::{
+        CreatePluginReply, LaunchPluginRequest, PluginLaunch, PluginMetadata, PluginVersion,
+        RecordPluginUploadRequest, RemovePluginReply, StopPluginRequest,
+    };
+    use meridian_pb::v1::RegisterRequest;
+
+    let h = harness("oms-1");
+    crate::serve_plugins_with(
+        Arc::clone(&h.bus),
+        h.store.clone() as Arc<dyn Store>,
+        Arc::new(FixedClock),
+        "localhost:5000".into(),
+        crate::ArchiveGrant::default(),
+    );
+    // The launcher, as told: every create and remove answered.
+    h.bus.serve(crate::plugins::CREATE_PLUGIN, |_| {
+        Ok((
+            "meridian.v1.CreatePluginReply".into(),
+            CreatePluginReply {
+                workload: "plugin-oms-1".into(),
+            }
+            .encode_to_vec(),
+        ))
+    });
+    h.bus.serve(crate::plugins::REMOVE_PLUGIN, |_| {
+        Ok((
+            "meridian.v1.RemovePluginReply".into(),
+            RemovePluginReply { removed: true }.encode_to_vec(),
+        ))
+    });
+    let digest = format!("sha256:{}", "3f".repeat(32));
+    let upload = |version: &str, declaration| RecordPluginUploadRequest {
+        metadata: Some(PluginMetadata {
+            name: "rebalancer".into(),
+            version: version.into(),
+            roles: vec!["oms".into()],
+            interface: false,
+            sdk_version: "0.29.0".into(),
+            declaration,
+        }),
+        image_digest: digest.clone(),
+        ..Default::default()
+    };
+    let launch = |version: &str| LaunchPluginRequest {
+        name: "rebalancer".into(),
+        version: version.into(),
+        instance_id: "oms-1".into(),
+        approved_roles: vec!["oms".into()],
+        note: "Run it.".into(),
+        ..Default::default()
+    };
+
+    // 0.1.0, uploaded before v11 with no declaration, launched and stopped.
+    let _: PluginVersion = ask(
+        &h,
+        crate::plugins::RECORD_PLUGIN_UPLOAD,
+        "meridian.v1.RecordPluginUploadRequest",
+        upload("0.1.0", None),
+    )
+    .await
+    .unwrap();
+    let _: PluginLaunch = ask(
+        &h,
+        crate::plugins::LAUNCH_PLUGIN,
+        "meridian.v1.LaunchPluginRequest",
+        launch("0.1.0"),
+    )
+    .await
+    .unwrap();
+    let _: PluginLaunch = ask(
+        &h,
+        crate::plugins::STOP_PLUGIN,
+        "meridian.v1.StopPluginRequest",
+        StopPluginRequest {
+            instance_id: "oms-1".into(),
+            note: "For 0.2.0.".into(),
+        },
+    )
+    .await
+    .unwrap();
+
+    // 0.2.0, uploaded as the CLI sends it: `meridian-declaration`'s JSON.
+    let printed: meridian_domain::declaration::Declared =
+        serde_json::from_value(serde_json::json!({
+            "secret_settings": [],
+            "settings": [{"name": "drift_bps", "label": "Drift", "type": "SETTING_TYPE_STRING"}],
+            "reads_external_accounts": false,
+        }))
+        .unwrap();
+    let declared = meridian_domain::declaration::from_json(&printed).unwrap();
+    let _: PluginVersion = ask(
+        &h,
+        crate::plugins::RECORD_PLUGIN_UPLOAD,
+        "meridian.v1.RecordPluginUploadRequest",
+        upload("0.2.0", Some(declared.clone())),
+    )
+    .await
+    .unwrap();
+    let _: PluginLaunch = ask(
+        &h,
+        crate::plugins::LAUNCH_PLUGIN,
+        "meridian.v1.LaunchPluginRequest",
+        launch("0.2.0"),
+    )
+    .await
+    .unwrap();
+
+    // What its sidecar asks for: the running version's declaration.
+    let configured: PluginConfiguration = ask(
+        &h,
+        PLUGIN_CONFIGURATION,
+        "meridian.v1.PluginConfigurationRequest",
+        PluginConfigurationRequest {},
+    )
+    .await
+    .unwrap();
+    assert!(configured.launched, "launched from the catalogue");
+    let uploaded = configured
+        .declaration
+        .expect("the declaration 0.2.0 was uploaded with, not 0.1.0's none");
+    assert_eq!(uploaded, declared);
+
+    // The sidecar's check against it: the same registration admitted, one
+    // registering another setting refused naming it.
+    let registering = |declaration: &meridian_pb::v1::PluginDeclaration| RegisterRequest {
+        schema_version: "v25".into(),
+        settings: declaration.settings.clone(),
+        interface: declaration.interface.clone(),
+        tools: declaration.tools.clone(),
+        reads_external_accounts: declaration.reads_external_accounts,
+        declaration: Some(declaration.clone()),
+    };
+    assert_eq!(
+        meridian_sidecar::held::difference(&registering(&declared), &uploaded),
+        None
+    );
+    let mut wider = declared.clone();
+    wider.settings.push(meridian_pb::v1::SettingDeclaration {
+        name: "venue".into(),
+        ..Default::default()
+    });
+    assert!(
+        meridian_sidecar::held::difference(&registering(&wider), &uploaded)
+            .is_some_and(|first| first.contains("venue")),
+    );
+}
