@@ -800,7 +800,15 @@ fn versions_tab(listing: &PluginListing) -> String {
 
 // ── The sheets and their acts ───────────────────────────────────────────
 
-fn sheet(title: &str, body: &str, action: &str, fields: &str, submit: &str, token: &str) -> String {
+fn sheet(
+    title: &str,
+    notice: &str,
+    body: &str,
+    action: &str,
+    fields: &str,
+    submit: &str,
+    token: &str,
+) -> String {
     format!(
         "<section class=\"sheet-dialog\" aria-labelledby=\"sheet-title\"><h1 id=\"sheet-title\">{title}</h1>\
          {notice}{body}<form method=\"post\" action=\"{action}\" class=\"sheet-act\">{token}{fields}\
@@ -808,9 +816,51 @@ fn sheet(title: &str, body: &str, action: &str, fields: &str, submit: &str, toke
          <div class=\"sheet-foot\"><a class=\"button\" href=\"{PLUGINS_PATH}\">Cancel</a>\
          <button type=\"submit\" class=\"primary\">{submit}</button></div></form></section>",
         title = escape(title),
-        notice = crate::notice::full(),
     )
 }
+
+/// Ruling 194 (the PO, 2026-10-16): the install and update sheets show the
+/// notice in full, word for word, as their own first step, at every width,
+/// and the form only after Continue -- so whoever accepts the risk reads it
+/// whole.
+fn notice_step(title: &str, next: &str) -> String {
+    format!(
+        "<section class=\"sheet-dialog notice-step\" aria-labelledby=\"sheet-title\"><h1 id=\"sheet-title\">{title}</h1>\
+         {notice}<div class=\"sheet-foot\"><a class=\"button\" href=\"{PLUGINS_PATH}\">Cancel</a>\
+         <a class=\"button primary\" data-continue href=\"{next}\">Continue</a></div></section>",
+        title = escape(title),
+        notice = crate::notice::html(),
+        next = escape(next),
+    )
+}
+
+/// The form step's address: the sheet's own, its step the form's.
+fn form_step(path: &str, asked: &[(&str, &str)]) -> String {
+    let mut url = reqwest::Url::parse("http://dashboard.invalid/").expect("fixed");
+    url.set_path(path);
+    for (name, value) in asked {
+        url.query_pairs_mut().append_pair(name, value);
+    }
+    url.query_pairs_mut().append_pair("step", "form");
+    format!("{}?{}", url.path(), url.query().unwrap_or_default())
+}
+
+/// Whether the sheet asked for is its form, past the notice (ruling 194).
+fn at_form(asked: &HashMap<String, String>) -> bool {
+    asked.get("step").is_some_and(|step| step == "form")
+}
+
+/// The form step's mark that the notice was passed through (ruling 194),
+/// which the install and update acts require.
+const NOTICE_READ: &str = "<input type=\"hidden\" name=\"notice\" value=\"read\">";
+
+fn notice_read(fields: &Fields) -> bool {
+    field(fields, "notice") == "read"
+}
+
+/// What an install or update posted without passing through the notice.
+const NOTICE_FIRST: &str =
+    "the notice comes first: open the sheet again, read it, and Continue to the form";
 
 fn hidden(name: &str, value: &str) -> String {
     format!(
@@ -851,6 +901,22 @@ async fn install_sheet(
         return Redirect::to(&format!("{PLUGINS_PATH}?tab=browse&failed=No+such+version"))
             .into_response();
     };
+    let title = format!("Install {name} {}", version.version);
+    if !at_form(&asked) {
+        let next = form_step(
+            &format!("/admin/plugins/registry/{organisation}/{plugin}/install"),
+            &[
+                ("version", &version.version),
+                ("registry", &version.registry),
+            ],
+        );
+        return Html(crate::html::page_with(
+            "Install",
+            &notice_step(&title, &next),
+            &chrome(&session, "Install"),
+        ))
+        .into_response();
+    }
     let usage = reports(&app, &session.subject, "")
         .await
         .map(|r| r.reports_plugin_usage)
@@ -871,11 +937,12 @@ async fn install_sheet(
         usage = if usage { "on" } else { "off" },
     );
     let mut page = sheet(
-        &format!("Install {name} {}", version.version),
+        &title,
+        &crate::notice::folded(),
         &body,
         "/admin/plugins/registry/install",
         &format!(
-            "{}{}{}",
+            "{NOTICE_READ}{}{}{}",
             hidden("listing", &name),
             hidden("version", &version.version),
             hidden("registry", &version.registry)
@@ -894,7 +961,7 @@ async fn install_sheet(
         for launch in moving {
             page.push_str(&format!(
                 "<form method=\"post\" action=\"/admin/plugins/registry/update\" class=\"sheet-act move\">{token}\
-                 {i}{l}{v}{roles}<p>{instance} runs the local {plugin} {running}.</p>\
+                 {NOTICE_READ}{i}{l}{v}{roles}<p>{instance} runs the local {plugin} {running}.</p>\
                  <label>Why <input type=\"text\" name=\"note\" required maxlength=\"2000\"></label>\
                  <button type=\"submit\">Move to this listing</button></form>",
                 i = hidden("instance_id", &launch.instance_id),
@@ -960,6 +1027,9 @@ async fn install(
             Err("this form did not come from your session".into()),
             "installed",
         );
+    }
+    if !notice_read(&fields) {
+        return back(Err(NOTICE_FIRST.into()), "installed");
     }
     let installed: Result<PluginVersion, String> = ask(
         &app,
@@ -1038,6 +1108,19 @@ async fn update_sheet(
         );
     };
     let wants = roles_of(target);
+    let title = format!("Update {instance} to {}", target.version);
+    if !at_form(&asked) {
+        let next = form_step(
+            "/admin/plugins/registry/update",
+            &[("instance", &instance), ("version", &target.version)],
+        );
+        return Html(crate::html::page_with(
+            "Update",
+            &notice_step(&title, &next),
+            &chrome(&session, "Update"),
+        ))
+        .into_response();
+    }
     let token = crate::admin::token_input(&session);
     let body = format!(
         "<dl class=\"facts\"><dt>Instance</dt><dd><code>{instance}</code></dd><dt>From</dt><dd>{from}</dd>\
@@ -1055,11 +1138,12 @@ async fn update_sheet(
         },
     );
     let page = sheet(
-        &format!("Update {instance} to {}", target.version),
+        &title,
+        &crate::notice::folded(),
         &body,
         "/admin/plugins/registry/update",
         &format!(
-            "{}{}{}{}",
+            "{NOTICE_READ}{}{}{}{}",
             hidden("instance_id", &instance),
             hidden("listing", &listing_name),
             hidden("version", &target.version),
@@ -1098,6 +1182,9 @@ async fn update(
             Err("this form did not come from your session".into()),
             "installed",
         );
+    }
+    if !notice_read(&fields) {
+        return back(Err(NOTICE_FIRST.into()), "installed");
     }
     let moved: Result<PluginLaunch, String> = ask(
         &app,
@@ -1143,6 +1230,7 @@ async fn acknowledge_sheet(
     );
     let page = sheet(
         &format!("Keep {instance}"),
+        &crate::notice::full(),
         &body,
         "/admin/plugins/registry/acknowledge",
         &hidden("instance_id", &instance),

@@ -46,8 +46,10 @@ narrowed as the plan's tests ask, through `/mcp` alone:
    with a key thrown away, the public half the conductor's platform key,
    and its OCI registry over TLS. The person pulls the catalogue on the
    Registries tab; the admin's agent lists both listings and reads the
-   pulled version's reason by its kind, and is listed no install; the
-   person installs 1.4.0 by digest from the listing's page, verified, and
+   pulled version's reason by its kind, and is listed no install; each
+   install passes through the sheet's notice, its own step with Continue
+   (ruling 194), and one posted past it is refused; the person installs
+   1.4.0 by digest, verified, its note kept with it, and
    is refused a version whose layer the registry serves altered (the
    digest), the pulled version, and a version built after its signer's key
    was revoked, each naming the check; the catalogue reads 1.4.0 from the
@@ -78,8 +80,10 @@ launcher.
 Run from the repository's root by the Makefile, which builds the images and
 copies the harness out first; standard library only.
 """
+import html
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -191,6 +195,20 @@ def version_read(person, client):
     names as against_updated_at_ns (contract v18, W6.11)."""
     return call(person, client, "dashboard__read_plugin_settings",
                 {"plugin_instance_id": INSTANCE}, "unchanged")["data"]["updated_at_ns"]
+
+
+def through_the_notice(listing_name, version):
+    """Ruling 194: the install sheet's first step is the notice, whole and
+    alone, with Continue; the form comes after it, and its act requires
+    having passed through (`notice=read`)."""
+    sheet = f"/admin/plugins/registry/{listing_name}/install?version={version}&registry=community"
+    page = runner("core-page", sheet, "--expect", "Naming a plugin here is not an endorsement",
+                  "--expect", "data-continue")
+    found = re.search(r'data-continue href="([^"]+)"', page)
+    must(found and 'action="/admin/plugins/registry/install"' not in page,
+         f"the notice is its own step, with Continue and no form: {page[-600:]}")
+    runner("core-page", html.unescape(found.group(1)), "--expect", 'name="notice" value="read"',
+           "--expect", f"Install {listing_name} {version}")
 
 
 def setting(data, name):
@@ -419,20 +437,29 @@ def run():
     pulled = [v for v in listing["versions"] if v["version"] == "1.3.0"]
     must(pulled and (pulled[0]["pull"] or {}).get("kind") == "PULL_REASON_KIND_TERMS_BREACH",
          f"step 6, the pulled version says why, by its kind: {pulled}")
+    through_the_notice(STAND_IN, "1.4.0")
+    skipped = runner("core-form", PLUGINS, INSTALL, f"listing={STAND_IN}", "version=1.4.0",
+                     "registry=community", "note=Past the notice.",
+                     "--expect-refused", "the notice comes first")
+    must("refused" in skipped, f"step 6, an install not passed through the notice is refused: {skipped}")
     said = runner("core-form", PLUGINS, INSTALL, f"listing={STAND_IN}", "version=1.4.0",
-                  "registry=community", "note=The stand-in, from the community registry.")
+                  "registry=community", "notice=read",
+                  "note=The stand-in, from the community registry.")
     must("is installed, verified" in said, f"step 6, 1.4.0 installed by digest, verified: {said}")
     for listing_name, version, refusal in [(STAND_IN, "1.6.0", "the digest"),
                                            (STAND_IN, "1.3.0", "pulled"),
                                            ("other-org/revoked", "1.0.0", "revoked")]:
+        through_the_notice(listing_name, version)
         runner("core-form", PLUGINS, INSTALL, f"listing={listing_name}", f"version={version}",
-               "registry=community", "note=Refused, it is to be.", "--expect-refused", refusal)
+               "registry=community", "notice=read", "note=Refused, it is to be.",
+               "--expect-refused", refusal)
     catalogue = call(*as_admin, "dashboard__read_plugin_catalogue", {}, "unchanged")["data"]
     installed = [v for v in catalogue["versions"] if v.get("listing") == STAND_IN]
     must(len(installed) == 1 and installed[0]["metadata"]["version"] == "1.4.0"
          and installed[0]["source_registry"] == "community"
          and installed[0]["image_digest"] == CASES["1.4.0"]
-         and installed[0]["uploaded_by"] == "local|harness",
+         and installed[0]["uploaded_by"] == "local|harness"
+         and installed[0]["uploaded_note"] == "The stand-in, from the community registry.",
          f"step 6, the catalogue holds 1.4.0 from the community registry by its digest: {installed}")
     must(not [v for v in catalogue["versions"] if v.get("listing") == "other-org/revoked"],
          "step 6, nothing refused is recorded")
@@ -454,8 +481,9 @@ def run():
          f"step 7, the Reference from the declaration: {read.get('reference')}")
     runner("core-page", f"/admin/plugins/versions/{STAND_IN}/1.4.0/documentation",
            "--expect", "Reads the holdings of the stand-in", "--expect", "not an endorsement")
+    through_the_notice(STAND_IN, "1.5.0")
     runner("core-form", PLUGINS, INSTALL, f"listing={STAND_IN}", "version=1.5.0",
-           "registry=community", "note=The newer stand-in.")
+           "registry=community", "notice=read", "note=The newer stand-in.")
     _, newer = documentation("1.5.0")
     must("the activity" in newer.get("overview", {}).get("vendor_markdown", ""),
          f"step 7, 1.5.0's changed overview: {newer}")

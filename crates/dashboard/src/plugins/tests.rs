@@ -2994,11 +2994,32 @@ async fn a_deployment_admin_browses_installs_and_keeps_from_the_plugins_page() {
         .to_str()
         .unwrap()
         .contains("script-src 'self' 'sha256-"));
-    // The install sheet: the notice first, the usage setting, the floor.
-    let sheet = get(
+    // The install sheet: the notice first, in full and alone, as its own
+    // step with Continue (ruling 194); then the form, with the usage
+    // setting and the floor.
+    let notice = get(
         &h.app,
         DASHBOARD,
         "/admin/plugins/registry/open-meridian/snaptrade/install?version=1.5.0&registry=community",
+        &cookie,
+    )
+    .await;
+    assert!(
+        notice.body.contains(&crate::notice::html())
+            && notice.body.contains("data-continue")
+            && !notice
+                .body
+                .contains("action=\"/admin/plugins/registry/install\""),
+        "{}",
+        notice.body
+    );
+    assert!(notice.body.contains(
+        "href=\"/admin/plugins/registry/open-meridian/snaptrade/install?version=1.5.0&amp;registry=community&amp;step=form\""
+    ));
+    let sheet = get(
+        &h.app,
+        DASHBOARD,
+        "/admin/plugins/registry/open-meridian/snaptrade/install?version=1.5.0&registry=community&step=form",
         &cookie,
     )
     .await;
@@ -3012,8 +3033,20 @@ async fn a_deployment_admin_browses_installs_and_keeps_from_the_plugins_page() {
             && sheet.body.contains("<dt>Usage report</dt><dd>on")
     );
     let token = form_token(&sheet.body);
-    let done = post_form_as(&h.app, "/admin/plugins/registry/install", &cookie,
+    // Posted without passing through the notice: refused, nothing sent.
+    let skipped = post_form_as(&h.app, "/admin/plugins/registry/install", &cookie,
         &format!("form_token={token}&listing=open-meridian%2Fsnaptrade&version=1.5.0&registry=community&note=Newer")).await;
+    assert!(skipped.headers["location"]
+        .to_str()
+        .unwrap()
+        .contains("failed=the+notice+comes+first"));
+    assert!(asked
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|(t, _)| t != crate::registry::INSTALL_PLUGIN));
+    let done = post_form_as(&h.app, "/admin/plugins/registry/install", &cookie,
+        &format!("form_token={token}&notice=read&listing=open-meridian%2Fsnaptrade&version=1.5.0&registry=community&note=Newer")).await;
     assert_eq!(done.status, StatusCode::SEE_OTHER, "{}", done.body);
     assert!(done.headers["location"].to_str().unwrap().contains("done="));
     let sent = asked

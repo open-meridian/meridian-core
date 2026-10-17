@@ -1070,7 +1070,8 @@ def the_documentation_pages(browser, prefix):
 def the_registry_pages(browser, prefix):
     """Contract v25 (W8.10 to W8.12, W5.19): the Plugins page's Installed,
     Browse and Registries tabs, a listing's Overview, Documentation and
-    Versions, and the install, update and keep-or-stop sheets, each on one
+    Versions, and the install, update and keep-or-stop sheets -- the install
+    and update sheets' notice their own first step (ruling 194) -- each on one
     screen at the three sizes, in light and dark, with no sideways scroll."""
     plugins = f"{BASE}/admin/plugins/versions?tab="
     listing = f"{BASE}/admin/plugins/registry/open-meridian/fx?tab="
@@ -1081,8 +1082,11 @@ def the_registry_pages(browser, prefix):
         ("listing-overview", listing + "overview", "open-meridian/fx"),
         ("listing-documentation", listing + "documentation", "open-meridian/fx"),
         ("listing-versions", listing + "versions", "1.5.0"),
-        ("install-sheet", f"{BASE}/admin/plugins/registry/open-meridian/fx/install?version=1.5.0", "1.5.0"),
-        ("update-sheet", f"{BASE}/admin/plugins/registry/update?instance=fx-1&version=1.5.0", "operations"),
+        # Ruling 194: the notice whole as each sheet's first step, then the form.
+        ("install-notice", f"{BASE}/admin/plugins/registry/open-meridian/fx/install?version=1.5.0", "Continue"),
+        ("install-sheet", f"{BASE}/admin/plugins/registry/open-meridian/fx/install?version=1.5.0&step=form", "1.5.0"),
+        ("update-notice", f"{BASE}/admin/plugins/registry/update?instance=fx-1&version=1.5.0", "Continue"),
+        ("update-sheet", f"{BASE}/admin/plugins/registry/update?instance=fx-1&version=1.5.0&step=form", "operations"),
         ("keep-or-stop-sheet", f"{BASE}/admin/plugins/registry/acknowledge?instance=fx-1", "fx-1"),
     ]
     for scheme in ("light", "dark"):
@@ -1099,6 +1103,13 @@ def the_registry_pages(browser, prefix):
                 if name in ("installed", "browse", "listing-overview", "install-sheet"):
                     check("Naming a plugin here is not an endorsement" in text,
                           f"{name} at {size}, {scheme} carries the supervision notice")
+                if name.endswith("-notice"):
+                    whole = page.locator("section.notice-step section.notice.supervision")
+                    check(whole.count() == 1 and whole.is_visible()
+                          and "Whoever installs one carries its risk." in whole.inner_text(),
+                          f"{name} at {size}, {scheme} shows the notice whole, not folded")
+                    check(page.locator("form.sheet-act").count() == 0,
+                          f"{name} at {size}, {scheme} has no form before Continue")
                 if name == "installed":
                     check(page.locator("[data-pulled]").count() == 1,
                           f"at {size}, {scheme} the pulled version's instance is warned")
