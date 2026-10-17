@@ -6,6 +6,14 @@
 # column, and a setting serving both roles (e2e/plugin-page/archiving.py's
 # area_registration); and reporting the account its connection reaches once
 # registered, which the table's account column offers.
+#
+# From contract v25 (spec/plugins-are-shared-through-registries, "What the
+# tests prove"), a stand-in platform's registries: the harness's platform
+# serves the catalogue and the resolutions e2e/plugin-area/registry holds,
+# and the OCI registry they name over TLS (its certificate drawn by
+# `registry-tls`, whose authority the conductor alone is given); the
+# deployment's own registry; and the conductor given the stand-in's public
+# key as the chart's platform key.
 services:
   area:
     entrypoint: ["python", "-u", "/stand-in/stand_in.py"]
@@ -15,3 +23,71 @@ services:
       STAND_IN_ARCHIVE: "1"
       STAND_IN_AREA: "1"
       STAND_IN_REPORTS_AT_START: "1"
+
+  # A certificate authority for the run alone and the stand-in registry's
+  # certificate under it, drawn once, kept as long as the volumes are.
+  registry-tls:
+    image: alpine/openssl:3.3.2
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -eu
+        cd /tls
+        [ -s platform.pem ] && exit 0
+        openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 \
+          -keyout ca-key.pem -out ca.pem -subj "/CN=e2e-plugin-area authority" \
+          -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign
+        openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+          -keyout platform-key.pem -out platform.csr -subj "/CN=platform"
+        printf 'subjectAltName=DNS:platform\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:FALSE\n' > ext
+        openssl x509 -req -in platform.csr -CA ca.pem -CAkey ca-key.pem -CAcreateserial \
+          -days 2 -extfile ext -out platform.pem
+        rm -f ca-key.pem platform.csr ext
+        chmod a+r *.pem
+    volumes:
+      - registry-tls:/tls
+    networks: [harness]
+
+  platform:
+    environment:
+      HARNESS_REGISTRY: /registry
+      HARNESS_REGISTRY_TLS: /registry-tls
+    depends_on:
+      registry-tls:
+        condition: service_completed_successfully
+    volumes:
+      - ${MERIDIAN_HARNESS_REGISTRY:?set MERIDIAN_HARNESS_REGISTRY to e2e/plugin-area/registry, absolute}:/registry:ro
+      - registry-tls:/registry-tls:ro
+
+  # The deployment's own registry, as the chart runs one.
+  registry:
+    image: registry:2.8.3
+    networks: [harness]
+
+  conductor:
+    environment:
+      MERIDIAN_PLATFORM_KEYS_DIR: /platform-keys
+      MERIDIAN_REGISTRY_UPSTREAM: http://registry:5000
+      MERIDIAN_REGISTRY_ADDRESS: registry:5000
+      SSL_CERT_FILE: /registry-tls/ca.pem
+    depends_on:
+      registry-tls:
+        condition: service_completed_successfully
+      registry:
+        condition: service_started
+    volumes:
+      - ${MERIDIAN_HARNESS_REGISTRY:?set MERIDIAN_HARNESS_REGISTRY to e2e/plugin-area/registry, absolute}/platform-key.pem:/platform-keys/platform.pem:ro
+      - registry-tls:/registry-tls:ro
+
+  # After install, 1.4.0's provenance taken out of the deployment's
+  # registry (registry/tamper.py), for the launch to refuse.
+  registry-tamper:
+    profiles: [runner]
+    image: python:3.12-alpine
+    entrypoint: ["python", "-u", "/registry/tamper.py"]
+    volumes:
+      - ${MERIDIAN_HARNESS_REGISTRY:?set MERIDIAN_HARNESS_REGISTRY to e2e/plugin-area/registry, absolute}:/registry:ro
+    networks: [harness]
+
+volumes:
+  registry-tls:

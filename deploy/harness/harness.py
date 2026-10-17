@@ -154,7 +154,9 @@ the same image with the list on stdin:
   core-form PAGE POST FIELD=VALUE... [--expect-refused TEXT]
       One of core's own forms as the deployment admin: PAGE read for its
       form token, POST sent with the fields, a FIELD given more than once
-      sent once for each; fails unless done, or refused saying TEXT.
+      sent once for each; fails unless done, or refused saying TEXT. A
+      page that goes back saying what became of it (`?done=`, `?failed=`)
+      is read there, and what it said printed.
 
   mcp list [--expect NAME ...]
       Prints the tools the connected delegation reaches, one name per line,
@@ -1809,7 +1811,18 @@ def said_pair(args, name, default=""):
 
 def refused_or_done(done, refusal, what):
     """A change posted: done, or refused saying `refusal` when one is
-    expected."""
+    expected. A page that answers by going back with what became of it
+    (contract v25's Plugins page: `?failed=` or `?done=`) is read there."""
+    said = urllib.parse.parse_qs(urllib.parse.urlsplit(done.location or "").query)
+    if done.status == 303 and "failed" in said:
+        failed = said["failed"][0]
+        if refusal is None:
+            raise Failed(f"{what} was refused: {failed}")
+        if refusal not in failed:
+            raise Failed(f"{what} was refused, not saying {refusal!r}: {failed}")
+        return f"refused: {failed}"
+    if done.status == 303 and refusal is None and "done" in said:
+        return said["done"][0]
     if refusal is not None:
         if done.status == 303:
             raise Failed(f"{what} was done, and was to be refused saying {refusal!r}")

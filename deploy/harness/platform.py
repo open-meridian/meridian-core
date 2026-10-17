@@ -43,11 +43,22 @@ From contract v24 it serves the one-ID routes (W3.4, W3.24, W3.25, W3.27,
 W3.28): the matching and minting request, answered by what it holds -- the
 test equity and the currencies a match, a FIGI it can confirm a mint, and
 anything else its staff's queue; the template catalogue; the licence list;
-the replacement feed; and the usage statistics. See V24 below."""
+the replacement feed; and the usage statistics. See V24 below.
+
+From contract v25, where `HARNESS_REGISTRY` names a directory (e2e-plugin-
+area's, e2e/plugin-area/registry, which its make.py wrote and signed), it
+serves the registries' rows (W8.10, W5.19) from it: the catalogue, each
+version's resolution, and the plugin usage reports, heard; and, over TLS on
+port 8443 with the certificate in `HARNESS_REGISTRY_TLS`, the OCI registry
+the resolutions name, read-only, by digest, with the referrers API. A
+version it lists with an altered layer is served altered, as a tampered
+registry would."""
 import datetime
 import http.server
 import json
 import os
+import ssl
+import threading
 import time
 import urllib.parse
 
@@ -355,6 +366,69 @@ def match_or_mint(asked):
     return answer
 
 
+REGISTRY = os.environ.get("HARNESS_REGISTRY", "")
+
+
+def registry_file(name):
+    with open(os.path.join(REGISTRY, name), encoding="utf-8") as held:
+        return json.load(held)
+
+
+def resolved(path):
+    """`/api/v1/registry/listings/{organisation}/{plugin}/versions/{version}/resolve`."""
+    parts = path.strip("/").split("/")
+    if len(parts) != 9 or parts[:4] != ["api", "v1", "registry", "listings"] \
+            or parts[6] != "versions" or parts[8] != "resolve":
+        return None
+    return registry_file("resolutions.json").get(f"{parts[4]}/{parts[5]}@{parts[7]}")
+
+
+class Oci(http.server.BaseHTTPRequestHandler):
+    """The OCI registry the resolutions name: manifests and blobs by digest,
+    and each image's referrers, read-only and anonymous."""
+
+    def sent(self, status, data=b"", media="application/json"):
+        self.send_response(status)
+        self.send_header("Content-Type", media)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/v2/":
+            return self.sent(200, b"{}")
+        index = registry_file("oci/index.json")
+        _, _, rest = path.partition("/v2/")
+        kind, digest = (rest.split("/")[-2:] + ["", ""])[:2] if "/" in rest else ("", "")
+        if kind == "referrers" and digest in index["referrers"]:
+            HEARD.append({"method": "GET", "path": path})
+            return self.sent(200, json.dumps(index["referrers"][digest]).encode(),
+                             "application/vnd.oci.image.index.v1+json")
+        hex_ = digest.partition("sha256:")[2]
+        held = os.path.join(REGISTRY, "oci", hex_)
+        if kind in ("manifests", "blobs") and len(hex_) == 64 and os.path.isfile(held):
+            with open(held, "rb") as kept:
+                data = kept.read()
+            media = index["media"].get(digest, "application/octet-stream") \
+                if kind == "manifests" else "application/octet-stream"
+            HEARD.append({"method": "GET", "path": path})
+            return self.sent(200, data, media)
+        self.sent(404, b'{"errors":[{"code":"NOT_FOUND"}]}')
+
+    def log_message(self, *_args):
+        pass
+
+
+def serve_oci():
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    tls = os.environ["HARNESS_REGISTRY_TLS"]
+    context.load_cert_chain(os.path.join(tls, "platform.pem"), os.path.join(tls, "platform-key.pem"))
+    server = http.server.ThreadingHTTPServer(("0.0.0.0", 8443), Oci)
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    server.serve_forever()
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def answer(self, status, body):
         data = json.dumps(body).encode()
@@ -371,6 +445,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         code = one("value").upper()
         if url.path == "/e2e/heard":
             return self.answer(200, {"heard": HEARD})
+        if url.path == "/api/v1/registry/catalogue" and REGISTRY:
+            HEARD.append({"method": "GET", "path": self.path})
+            return self.answer(200, registry_file("catalogue.json"))
         if url.path in ("/api/v1/reference/templates", "/api/v1/reference/licence-list",
                         "/api/v1/reference/replacements"):
             HEARD.append({"method": "GET", "path": self.path})
@@ -429,6 +506,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             asked = json.loads(self.rfile.read(length) or b"{}")
         except ValueError:
             return self.answer(400, {"detail": "not JSON"})
+        if REGISTRY and url.path == "/api/v1/registry/usage-reports":
+            HEARD.append({"method": "POST", "path": url.path, "body": asked})
+            return self.answer(200, {"received_at_ns": str(time.time_ns())})
+        if REGISTRY and url.path.startswith("/api/v1/registry/listings/"):
+            HEARD.append({"method": "POST", "path": url.path, "body": asked})
+            answer = resolved(url.path)
+            return self.answer(200, answer) if answer else self.answer(404, {"detail": "Not Found"})
         if url.path == "/e2e/licence":
             LICENCE["schemes"] = asked.get("schemes", LICENCE["schemes"])
             LICENCE["version"] += 1
@@ -455,4 +539,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass
 
 
+if REGISTRY:
+    threading.Thread(target=serve_oci, daemon=True).start()
 http.server.ThreadingHTTPServer(("0.0.0.0", 8000), Handler).serve_forever()
