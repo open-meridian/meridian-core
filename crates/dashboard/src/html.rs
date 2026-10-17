@@ -78,6 +78,9 @@ ol.notes,ol.notices{list-style:none;margin:0;padding:0}\
 ol.notes>li,ol.notices>li{padding:.7rem 0;border-top:1px solid var(--line-soft)}\
 ol.notes>li:first-child,ol.notices>li:first-child{border-top:0}\
 table.notices tr[data-unread] a{font-weight:650}\
+.notice-narrow{display:none}.notice-narrow>details.notice>summary{cursor:pointer;color:var(--ink-soft);font-size:.85rem}\
+@media (max-width:37.5rem){.notice-wide{display:none}.notice-narrow{display:block}}\
+@media (min-width:60.01rem){.listing-overview{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(0,1fr);column-gap:1.5rem;align-items:start}.listing-overview>.notice-wide{grid-row:1 / span 2}}\
 dl.ticket-facts{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:.3rem 1rem;margin:.8rem 0 0}\
 dl.ticket-facts dt{color:var(--ink-soft)}dl.ticket-facts dd{margin:0;overflow-wrap:anywhere}\
 ul.references{margin:0;padding-left:1.1rem}\

@@ -1067,6 +1067,50 @@ def the_documentation_pages(browser, prefix):
             ctx.close()
 
 
+def the_registry_pages(browser, prefix):
+    """Contract v25 (W8.10 to W8.12, W5.19): the Plugins page's Installed,
+    Browse and Registries tabs, a listing's Overview, Documentation and
+    Versions, and the install, update and keep-or-stop sheets, each on one
+    screen at the three sizes, in light and dark, with no sideways scroll."""
+    plugins = f"{BASE}/admin/plugins/versions?tab="
+    listing = f"{BASE}/admin/plugins/registry/open-meridian/fx?tab="
+    pages = [
+        ("installed", plugins + "installed", "0.0.0"),
+        ("browse", plugins + "browse", "open-meridian/fx"),
+        ("registries", plugins + "registries", "Report plugin usage"),
+        ("listing-overview", listing + "overview", "open-meridian/fx"),
+        ("listing-documentation", listing + "documentation", "open-meridian/fx"),
+        ("listing-versions", listing + "versions", "1.5.0"),
+        ("install-sheet", f"{BASE}/admin/plugins/registry/open-meridian/fx/install?version=1.5.0", "1.5.0"),
+        ("update-sheet", f"{BASE}/admin/plugins/registry/update?instance=fx-1&version=1.5.0", "operations"),
+        ("keep-or-stop-sheet", f"{BASE}/admin/plugins/registry/acknowledge?instance=fx-1", "fx-1"),
+    ]
+    for scheme in ("light", "dark"):
+        for size, width, height in V24_SIZES:
+            ctx = context(browser, width, height, scheme=scheme)
+            page = ctx.new_page()
+            errors = []
+            page.on("pageerror", lambda e: errors.append(str(e)))
+            for name, url, says in pages:
+                page.goto(url)
+                settled(page)
+                text = page.evaluate("() => document.body.textContent")
+                check(says in text, f"{name} at {size}, {scheme} says {says!r}")
+                if name in ("installed", "browse", "listing-overview", "install-sheet"):
+                    check("Naming a plugin here is not an endorsement" in text,
+                          f"{name} at {size}, {scheme} carries the supervision notice")
+                if name == "installed":
+                    check(page.locator("[data-pulled]").count() == 1,
+                          f"at {size}, {scheme} the pulled version's instance is warned")
+                    check("keys as of 2026-10-14" in text,
+                          f"at {size}, {scheme} a bundle's version shows its key status's age")
+                m = page.evaluate(MEASURE)
+                measured(page, f"{name} at {size}, {scheme}", f"v25-{prefix}-registry-{name}-{size}-{scheme}.png")
+                check(m["tall"] <= 0, f"{name} at {size}, {scheme} fits one screen: {m['tall']}px taller")
+            check(not errors, f"the registry pages at {size}, {scheme} ran without an error: {errors}")
+            ctx.close()
+
+
 def the_v24_pages(browser, prefix):
     """Contract v24: the Instruments page's provisional records and the
     usage report's setting; the home page's counts; the escape hatch's
@@ -1224,6 +1268,7 @@ with sync_playwright() as playwright:
     the_v24_pages(browser, prefix)
     the_v25_pages(browser, prefix)
     the_documentation_pages(browser, prefix)
+    the_registry_pages(browser, prefix)
     browser.close()
 
 if failures:

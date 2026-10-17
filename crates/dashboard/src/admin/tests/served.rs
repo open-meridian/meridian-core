@@ -1752,15 +1752,89 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
         Ok((
             "meridian.v1.PluginCatalogue".into(),
             meridian_domain::v1::PluginCatalogue {
-                versions: (0..14).map(|n| version(&format!("0.{n}.0"))).collect(),
-                launches: vec![meridian_domain::v1::PluginLaunch {
-                    instance_id: INSTANCE.into(),
-                    name: "snaptrade".into(),
-                    version: "0.13.0".into(),
-                    roles: vec!["custody".into()],
-                    state: meridian_domain::v1::PluginLaunchState::Launched as i32,
-                    ..Default::default()
-                }],
+                versions: (0..14)
+                    .map(|n| version(&format!("0.{n}.0")))
+                    .chain(registry_versions())
+                    .collect(),
+                launches: vec![
+                    meridian_domain::v1::PluginLaunch {
+                        instance_id: INSTANCE.into(),
+                        name: "snaptrade".into(),
+                        version: "0.13.0".into(),
+                        roles: vec!["custody".into()],
+                        state: meridian_domain::v1::PluginLaunchState::Launched as i32,
+                        ..Default::default()
+                    },
+                    // Contract v25: an instance of a listed version, pulled
+                    // since, with an update that widens its roles.
+                    meridian_domain::v1::PluginLaunch {
+                        instance_id: "fx-1".into(),
+                        name: "open-meridian/fx".into(),
+                        version: "1.4.0".into(),
+                        roles: vec!["custody".into()],
+                        state: meridian_domain::v1::PluginLaunchState::Launched as i32,
+                        ..Default::default()
+                    },
+                ],
+            }
+            .encode_to_vec(),
+        ))
+    });
+    // Contract v25 (W8.10 to W8.12, W5.19): the catalogue's copy Browse and
+    // a listing's page read, filtered as the conductor filters it, and the
+    // usage reports sent.
+    bus.serve(crate::registry::REGISTRY_PLUGINS, |envelope| {
+        let asked =
+            meridian_domain::v1::ListRegistryPluginsRequest::decode(&envelope.payload[..]).unwrap();
+        let listings = registry_listings()
+            .into_iter()
+            .filter(|l| asked.listing.is_empty() || l.listing == asked.listing)
+            .filter(|l| asked.search.is_empty() || l.listing.contains(&asked.search))
+            .collect();
+        Ok((
+            "meridian.v1.ListRegistryPluginsReply".into(),
+            meridian_domain::v1::ListRegistryPluginsReply {
+                listings,
+                next_cursor: String::new(),
+                catalogue_pulled_at_ns: 1_792_200_000_000_000_000,
+            }
+            .encode_to_vec(),
+        ))
+    });
+    bus.serve(crate::registry::LIST_PLUGIN_USAGE_REPORTS, |_| {
+        let count =
+            |listing: &str, version: &str, registry: &str| meridian_domain::v1::PluginUsageCount {
+                listing: listing.into(),
+                version: version.into(),
+                registry: registry.into(),
+                instances: 1,
+                people_read: 4,
+                people_write: 2,
+                people_admin: 1,
+                daily_operations: vec![120, 98, 143, 110, 0, 0, 131],
+                daily_requests: vec![40, 31, 52, 38, 0, 0, 44],
+            };
+        let reports = (0..3)
+            .map(|week| meridian_domain::v1::SentPluginUsageReport {
+                sent_at_ns: 1_792_200_000_000_000_000 - week * 604_800_000_000_000,
+                received: week != 1,
+                report: Some(meridian_domain::v1::PluginUsageReport {
+                    period_start: ["2026-10-05", "2026-09-28", "2026-09-21"][week as usize].into(),
+                    period_end: ["2026-10-11", "2026-10-04", "2026-09-27"][week as usize].into(),
+                    counts: vec![
+                        count("open-meridian/fx", "1.4.0", "community"),
+                        count("acme/rates", "2.0.0", "verified"),
+                    ],
+                }),
+            })
+            .collect();
+        Ok((
+            "meridian.v1.ListPluginUsageReportsReply".into(),
+            meridian_domain::v1::ListPluginUsageReportsReply {
+                reports,
+                next_cursor: String::new(),
+                reports_plugin_usage: true,
+                catalogue_pulled_at_ns: 1_792_200_000_000_000_000,
             }
             .encode_to_vec(),
         ))
@@ -2112,4 +2186,124 @@ fn documentation_texts() -> Vec<meridian_domain::v1::DocumentationText> {
              account it reaches.\n- **Statements**: what it recorded, per account.",
         ),
     ]
+}
+
+/// Contract v25: the versions installed from a registry -- one installed
+/// online from the community registry, one carried in by a bundle from the
+/// verified one, its key status's age shown.
+fn registry_versions() -> Vec<meridian_domain::v1::PluginVersion> {
+    let version = |name: &str, v: &str, registry: &str, key_status_issued_at_ns: i64| {
+        meridian_domain::v1::PluginVersion {
+            metadata: Some(meridian_domain::v1::PluginMetadata {
+                name: name.into(),
+                version: v.into(),
+                roles: vec!["custody".into()],
+                declaration: Some(documented_declaration()),
+                ..Default::default()
+            }),
+            image_digest: format!("sha256:{}", "ab".repeat(32)),
+            uploaded_by: ADMIN.into(),
+            uploaded_at_ns: 1_792_100_000_000_000_000,
+            source_registry: registry.into(),
+            listing: name.into(),
+            key_status_issued_at_ns,
+            ..Default::default()
+        }
+    };
+    vec![
+        version("open-meridian/fx", "1.4.0", "community", 0),
+        version("acme/rates", "2.0.0", "verified", 1_792_000_000_000_000_000),
+    ]
+}
+
+/// Contract v25: the catalogue's copy -- open-meridian/fx with its pulled
+/// 1.4.0 and a 1.5.0 asking a role more, acme/rates verified, and enough
+/// other listings that Browse pages.
+fn registry_listings() -> Vec<meridian_domain::v1::PluginListing> {
+    let listed = |listing: &str, version: &str, registry: &str, roles: &[&str]| {
+        meridian_domain::v1::ListedVersion {
+            listing: listing.into(),
+            version: version.into(),
+            registry: registry.into(),
+            image_digest: format!("sha256:{}", "cd".repeat(32)),
+            metadata: Some(meridian_domain::v1::PluginMetadata {
+                name: listing.rsplit('/').next().unwrap_or_default().into(),
+                version: version.into(),
+                roles: roles.iter().map(|r| r.to_string()).collect(),
+                declaration: Some(documented_declaration()),
+                ..Default::default()
+            }),
+            approved_roles: if registry == "verified" {
+                roles.iter().map(|r| r.to_string()).collect()
+            } else {
+                Vec::new()
+            },
+            schema_version: "v25".into(),
+            build: Some(meridian_domain::v1::PluginBuild {
+                repository: format!("https://github.com/{listing}"),
+                commit: "c".repeat(40),
+                tag: format!("v{version}"),
+                signer_fingerprint: "SHA256:release-key".into(),
+                ..Default::default()
+            }),
+            listed_at_ns: 1_792_000_000_000_000_000,
+            ..Default::default()
+        }
+    };
+    let listing = |name: &str, versions: Vec<meridian_domain::v1::ListedVersion>, stars: u64| {
+        meridian_domain::v1::PluginListing {
+            listing: name.into(),
+            repository: format!("https://github.com/{name}"),
+            versions,
+            regions: vec!["US".into()],
+            asset_classes: vec!["fx".into()],
+            support_contact: "support@example.com".into(),
+            stars,
+            installs: stars * 3,
+            instances: stars * 4,
+            counts_shown: stars >= 3,
+        }
+    };
+    let mut pulled = listed("open-meridian/fx", "1.4.0", "community", &["custody"]);
+    pulled.pull = Some(meridian_domain::v1::PluginPull {
+        listing: "open-meridian/fx".into(),
+        version: "1.4.0".into(),
+        kind: meridian_domain::v1::PullReasonKind::TermsBreach as i32,
+        reason: "It sent account numbers to a host it did not declare.".into(),
+        pulled_at_ns: 1_792_150_000_000_000_000,
+        ..Default::default()
+    });
+    let mut listings = vec![
+        listing(
+            "open-meridian/fx",
+            vec![
+                listed("open-meridian/fx", "1.3.0", "community", &["custody"]),
+                pulled,
+                listed(
+                    "open-meridian/fx",
+                    "1.5.0",
+                    "community",
+                    &["custody", "operations"],
+                ),
+            ],
+            12,
+        ),
+        listing(
+            "acme/rates",
+            vec![
+                listed("acme/rates", "2.0.0", "verified", &["custody"]),
+                listed("acme/rates", "2.1.0", "verified", &["custody"]),
+            ],
+            2,
+        ),
+    ];
+    for n in 0..30 {
+        let name = format!("vendor-{n:02}/plugin-{n:02}");
+        listings.push(listing(
+            &name,
+            vec![listed(&name, "0.1.0", "community", &["custody"])],
+            n,
+        ));
+    }
+    listings
 }

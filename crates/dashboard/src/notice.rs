@@ -74,6 +74,18 @@ pub fn folded() -> String {
     )
 }
 
+/// The notice in full where a page shows it in full (the spec's item 77: a
+/// listing's page and the dialogs), and at a phone's width by its title,
+/// opening the same full text in place, as the Documentation tab does, so
+/// the page still fits one screen.
+pub fn full() -> String {
+    format!(
+        "<div class=\"notice-wide\">{}</div><div class=\"notice-narrow\">{}</div>",
+        html(),
+        folded()
+    )
+}
+
 /// The notice in full as Markdown, for an agent's answer.
 pub fn markdown() -> String {
     let mut out = format!("**{TITLE}**\n\n");

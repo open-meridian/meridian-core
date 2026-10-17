@@ -710,7 +710,7 @@ fn overview(listing: &PluginListing, chosen: Option<&ListedVersion>) -> String {
          <dt>Repository</dt><dd>{repository}</dd><dt>Build</dt><dd>{tag} at <code>{commit}</code>, signed by \
          <code>{signer}</code></dd><dt>Floor</dt><dd>{floor}</dd><dt>Stars</dt><dd>{stars}</dd>\
          <dt>Installs</dt><dd>{installs}</dd></dl>{vendor}</div>",
-        notice = crate::notice::html(),
+        notice = crate::notice::full(),
         registry = chosen.map_or("", |v| registry_label(&v.registry)),
         repository = escape(&listing.repository),
         tag = escape(&build.tag),
@@ -807,7 +807,7 @@ fn sheet(title: &str, body: &str, action: &str, fields: &str, submit: &str, toke
          <div class=\"sheet-foot\"><a class=\"button\" href=\"{PLUGINS_PATH}\">Cancel</a>\
          <button type=\"submit\" class=\"primary\">{submit}</button></div></form></section>",
         title = escape(title),
-        notice = crate::notice::html(),
+        notice = crate::notice::full(),
     )
 }
 
