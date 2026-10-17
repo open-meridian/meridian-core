@@ -652,6 +652,7 @@ fn version_json(version: &PluginVersion) -> Value {
         "image_digest": version.image_digest,
         "uploaded_by": version.uploaded_by,
         "uploaded_at_ns": version.uploaded_at_ns,
+        "uploaded_note": others_words(&version.uploaded_note),
         // Contract v25 (W8.10, W8.15): where it came from, and a retirement.
         "source_registry": version.source_registry,
         "listing": version.listing,
@@ -1296,13 +1297,16 @@ impl Context<'_> {
             others_json(&mut said);
             said
         });
-        let roles = catalogue
-            .versions
-            .iter()
-            .filter_map(|v| v.metadata.as_ref())
-            .find(|m| m.name == name && m.version == version)
+        let held = catalogue.versions.iter().find(|v| {
+            v.metadata
+                .as_ref()
+                .is_some_and(|m| m.name == name && m.version == version)
+        });
+        let roles = held
+            .and_then(|v| v.metadata.as_ref())
             .map(|m| m.roles.clone())
             .unwrap_or_default();
+        let uploaded_note = held.map_or("", |v| v.uploaded_note.as_str());
         let page = if instance.is_empty() {
             crate::documentation::version_path(&name, &version)
         } else {
@@ -1315,6 +1319,7 @@ impl Context<'_> {
                 "roles": roles,
                 "uploaded_by": reply.uploaded_by,
                 "uploaded_at_ns": reply.uploaded_at_ns,
+                "uploaded_note": others_words(uploaded_note),
                 "notice": crate::notice::markdown(),
                 "sections": sections,
                 "reference": reference,

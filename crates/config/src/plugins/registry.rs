@@ -18,7 +18,7 @@ use meridian_domain::v1::{
 use super::{archive_allowed, documented, Plugins, CREATE_PLUGIN, REMOVE_PLUGIN};
 use crate::registries::{is_prerelease, offered, semver_cmp, Bundle, Hold};
 use crate::service::{author, subject};
-use crate::store::{note_refused, Ending};
+use crate::store::{note_refused, Author, Ending};
 
 /// W8.10: Browse's copy of the catalogue.
 pub const REGISTRY_PLUGINS: &str = "platform.config.query.registry-plugins";
@@ -79,6 +79,7 @@ impl Plugins {
         listing: &str,
         version: &str,
         registry: &str,
+        note: &str,
         envelope: &Envelope,
     ) -> Result<PluginVersion, String> {
         let hold = self.registries()?;
@@ -92,12 +93,19 @@ impl Plugins {
             .unwrap_or_default();
         documented(declared, &fetched.documentation)
             .map_err(|why| format!("the documentation: {why}"))?;
+        // The install is its own record (decisions/031): who, through what,
+        // and why, written once with the version.
+        let by = Author {
+            note: note.to_string(),
+            ..author(envelope)
+        };
         let mut recorded = fetched.version;
-        recorded.uploaded_by = subject(envelope);
+        recorded.uploaded_by = by.by.clone();
         recorded.uploaded_at_ns = self.clock.now_ns();
+        recorded.uploaded_note = by.note.clone();
         if !self
             .store
-            .record_listed_version(&recorded, &fetched.documentation, &fetched.statement)
+            .record_listed_version(&recorded, &fetched.documentation, &fetched.statement, &by)
             .map_err(|failed| failed.to_string())?
         {
             return Err(format!("{listing} {version} is installed already"));
@@ -175,7 +183,12 @@ impl Plugins {
         recorded.uploaded_at_ns = self.clock.now_ns();
         if !self
             .store
-            .record_listed_version(&recorded, &fetched.documentation, &fetched.statement)
+            .record_listed_version(
+                &recorded,
+                &fetched.documentation,
+                &fetched.statement,
+                &author(envelope),
+            )
             .map_err(|failed| failed.to_string())?
         {
             return Err(format!(
@@ -213,9 +226,9 @@ impl Plugins {
             &request.listing,
             &request.version,
             &request.registry,
+            &request.note,
             envelope,
         )?;
-        tracing::info!(note = request.note, "the install's note");
         Ok(installed)
     }
 
@@ -319,7 +332,13 @@ impl Plugins {
                     .map_err(|why| format!("the verification at launch: {why}"))?;
                 held
             }
-            None => self.install_version(&request.listing, &request.version, "", envelope)?,
+            None => self.install_version(
+                &request.listing,
+                &request.version,
+                "",
+                &request.note,
+                envelope,
+            )?,
         };
         let metadata = version.metadata.clone().unwrap_or_default();
         let approved: BTreeSet<&str> = request.approved_roles.iter().map(String::as_str).collect();

@@ -36,6 +36,7 @@ impl Clock for At {
 struct Harness {
     bus: Arc<Bus>,
     platform: Arc<Platform>,
+    store: Arc<dyn crate::Store>,
     created: Arc<Mutex<Vec<CreatePluginRequest>>>,
 }
 
@@ -56,7 +57,7 @@ fn harness() -> Harness {
     ));
     crate::serve_plugins_and_registries(
         Arc::clone(&bus),
-        store,
+        Arc::clone(&store),
         clock,
         "localhost:5000".into(),
         ArchiveGrant::default(),
@@ -85,6 +86,7 @@ fn harness() -> Harness {
     Harness {
         bus,
         platform,
+        store,
         created,
     }
 }
@@ -208,6 +210,25 @@ async fn a_listed_version_is_installed_launched_from_its_listing_s_repository_an
     assert_eq!(installed.uploaded_by, ADA);
     assert_eq!(installed.source_registry, "community");
     assert_eq!(installed.listing, LISTING);
+    // The install is its own record, its note kept with it and shown with
+    // the version (decisions/031), not only logged.
+    assert_eq!(
+        installed.uploaded_note,
+        "SnapTrade for the brokerage accounts."
+    );
+    let held = catalogue(&h).await;
+    assert_eq!(
+        held.versions[0].uploaded_note,
+        "SnapTrade for the brokerage accounts."
+    );
+    let store = Arc::clone(&h.store);
+    let by = tokio::task::spawn_blocking(move || store.installation(LISTING, "1.4.0"))
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("the install's record");
+    assert_eq!(by.by, ADA);
+    assert_eq!(by.note, "SnapTrade for the brokerage accounts.");
     assert!(install(&h, "1.4.0")
         .await
         .unwrap_err()

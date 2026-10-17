@@ -2272,13 +2272,43 @@ fn the_registries_state_is_kept_whole() {
     let mut listed = version("open-meridian/snaptrade", "1.4.0");
     listed.source_registry = "community".into();
     listed.listing = "open-meridian/snaptrade".into();
+    listed.uploaded_note = "FX rates for the treasury desk.".into();
+    let by = meridian_config::Author {
+        by: "local|ada".into(),
+        delegation: "DLG-1".into(),
+        client: "Ada's agent".into(),
+        note: "FX rates for the treasury desk.".into(),
+        prepared_call_id: "PC-7".into(),
+    };
     assert!(store
-        .record_listed_version(&listed, &[], "{\"payloadType\":\"x\"}")
+        .record_listed_version(&listed, &[], "{\"payloadType\":\"x\"}", &by)
         .unwrap());
     assert!(
-        !store.record_listed_version(&listed, &[], "{}").unwrap(),
+        !store
+            .record_listed_version(&listed, &[], "{}", &meridian_config::Author::default())
+            .unwrap(),
         "never replaced"
     );
+    // The install is its own record (decisions/031): who, through what, and
+    // why, read back whole; its note with the version in the catalogue.
+    let installed = store
+        .installation("open-meridian/snaptrade", "1.4.0")
+        .unwrap()
+        .expect("the install's record");
+    assert_eq!(installed.by, "local|ada");
+    assert_eq!(installed.delegation, "DLG-1");
+    assert_eq!(installed.client, "Ada's agent");
+    assert_eq!(installed.note, "FX rates for the treasury desk.");
+    assert_eq!(installed.prepared_call_id, "PC-7");
+    assert!(store.installation("snaptrade", "9").unwrap().is_none());
+    let held = store.snapshot().unwrap();
+    let noted = held
+        .catalogue
+        .versions
+        .iter()
+        .find(|v| v.listing == "open-meridian/snaptrade")
+        .unwrap();
+    assert_eq!(noted.uploaded_note, "FX rates for the treasury desk.");
     assert_eq!(
         store
             .listing_statement("open-meridian/snaptrade", "1.4.0")

@@ -56,6 +56,7 @@ fn page(reply: &ReadPluginDocumentationReply, section: Option<&str>, part: Optio
         version: "0.1.0",
         roles: &roles,
         reply,
+        note: "",
         section,
         part,
         href: &href,
@@ -345,4 +346,32 @@ fn an_upload_is_refused_for_a_false_claim_and_kept_for_a_shape() {
         None,
     );
     assert!(html.contains("<strong>Screened.</strong>"), "{html}");
+}
+
+#[test]
+fn a_registry_version_s_install_note_is_drawn_with_it_as_text() {
+    let reply = ReadPluginDocumentationReply {
+        uploaded_by: "local|ada".into(),
+        uploaded_at_ns: 1_792_200_000_000_000_000,
+        ..Default::default()
+    };
+    let href = |s: &str, p: &str| section_href("/docs", s, p);
+    let drawn = drawn(&Page {
+        name: "open-meridian/fx",
+        version: "1.4.0",
+        roles: &[],
+        reply: &reply,
+        note: "Rates for <the> desk",
+        section: None,
+        part: None,
+        href: &href,
+    });
+    assert!(
+        drawn.contains("Why: Rates for &lt;the&gt; desk"),
+        "the install's note, escaped: {drawn}"
+    );
+    assert!(
+        !page(&reply, None, None).contains("Why:"),
+        "none, nothing drawn"
+    );
 }

@@ -24,6 +24,18 @@ ALTER TABLE config_plugin_version
     ADD COLUMN IF NOT EXISTS retired_client_name        text   NOT NULL DEFAULT '',
     ADD COLUMN IF NOT EXISTS retired_prepared_call_id   text   NOT NULL DEFAULT '';
 
+-- An install from a registry is its own record (decisions/031; decided
+-- 2026-10-17 under agreement A): beside uploaded_by and uploaded_at_ns,
+-- the delegation and client the admin acted through, the prepared change
+-- it was made from, and the install's note, written once with the version.
+-- Empty for a local upload, and for every version recorded before v25,
+-- which carried no note.
+ALTER TABLE config_plugin_version
+    ADD COLUMN IF NOT EXISTS uploaded_through_delegation text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS uploaded_client_name        text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS uploaded_prepared_call_id   text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS uploaded_note               text NOT NULL DEFAULT '';
+
 -- The identifier schemes the deployment declares it is licensed for (W3.28),
 -- each declaration its own record (decisions/031): the whole list, who,
 -- through which delegation and client, from which prepared change, when and

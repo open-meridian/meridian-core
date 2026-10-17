@@ -760,6 +760,7 @@ fn listed_documentation(name: &str, version: &ListedVersion) -> String {
             version: &version.version,
             roles: &roles,
             reply: &reply,
+            note: "",
             section: Some(crate::documentation::REFERENCE),
             part: None,
             href: &href,

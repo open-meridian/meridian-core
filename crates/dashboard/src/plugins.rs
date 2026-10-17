@@ -1107,11 +1107,14 @@ async fn documentation_tab(
             )
         }
     };
-    let roles = catalogue
-        .versions
-        .iter()
-        .filter_map(|version| version.metadata.as_ref())
-        .find(|m| m.name == launch.name && m.version == launch.version)
+    let held = catalogue.versions.iter().find(|version| {
+        version
+            .metadata
+            .as_ref()
+            .is_some_and(|m| m.name == launch.name && m.version == launch.version)
+    });
+    let roles = held
+        .and_then(|version| version.metadata.as_ref())
         .map(|m| m.roles.clone())
         .unwrap_or_else(|| launch.roles.clone());
     let base = crate::area::href(instance, level, Some(crate::documentation::TAB));
@@ -1121,6 +1124,7 @@ async fn documentation_tab(
         version: &launch.version,
         roles: &roles,
         reply: &reply,
+        note: held.map_or("", |version| version.uploaded_note.as_str()),
         section: asked.get("section").map(String::as_str),
         part: asked.get("part").map(String::as_str),
         href: &href,

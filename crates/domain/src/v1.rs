@@ -11418,8 +11418,7 @@ pub struct RecordPluginUploadRequest {
     /// `community` or `verified`. The conductor verifies the bundle against
     /// the chart's keys, as at install, and records the version under its
     /// listing with the age of the key status it was checked against. All
-    /// four are empty for a local upload. <NAME?: the four fields' placement
-    /// here; each name is the one DESIGN25 gives it elsewhere>
+    /// four are empty for a local upload.
     #[prost(string, tag = "4")]
     pub listing: ::prost::alloc::string::String,
     #[prost(string, tag = "5")]
@@ -11485,6 +11484,12 @@ pub struct PluginVersion {
     pub retired_at_ns: i64,
     #[prost(string, tag = "10")]
     pub retired_note: ::prost::alloc::string::String,
+    /// An install's note (W8.10; decisions/031, decided 2026-10-17 under
+    /// agreement A): why a deployment admin installed it from a registry, kept
+    /// with the install's record beside uploaded_by and shown with it. Empty
+    /// for a local upload and a bundle's, which carry none.
+    #[prost(string, tag = "11")]
+    pub uploaded_note: ::prost::alloc::string::String,
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct PluginCatalogueRequest {}

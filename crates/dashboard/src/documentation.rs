@@ -273,6 +273,10 @@ pub struct Page<'a> {
     pub version: &'a str,
     pub roles: &'a [String],
     pub reply: &'a ReadPluginDocumentationReply,
+    /// Why it was installed from a registry (the install's note, its own
+    /// record with uploaded_by; decisions/031): another person's words,
+    /// drawn as text. Empty for a local upload.
+    pub note: &'a str,
     /// The section asked for: one of [`SECTIONS`] present, or [`REFERENCE`].
     pub section: Option<&'a str>,
     pub part: Option<&'a str>,
@@ -318,6 +322,14 @@ pub fn drawn(page: &Page) -> String {
     } else {
         String::new()
     };
+    let note = if page.note.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<span class=\"docs-note\" title=\"{note}\">Why: {note}</span>",
+            note = escape(page.note)
+        )
+    };
     let none = if present.is_empty() {
         "<p class=\"hint docs-none\">Its vendor wrote none for this version.</p>"
     } else {
@@ -325,7 +337,7 @@ pub fn drawn(page: &Page) -> String {
     };
     format!(
         "<div class=\"docs\" data-docs data-version=\"{version}\">\
-         <div class=\"docs-head\"><p class=\"docs-what\"><strong>{name}</strong> {version}{uploaded}</p>{folded}</div>\
+         <div class=\"docs-head\"><p class=\"docs-what\"><strong>{name}</strong> {version}{uploaded}{note}</p>{folded}</div>\
          {none}<nav class=\"tabs docs-sections\" aria-label=\"Its documentation\">{tabs}</nav>\
          <div class=\"docs-body\">{contents}<div class=\"docs-text\">{body}</div>\
          <aside class=\"docs-notice\" aria-label=\"{notice_title}\">{notice}</aside></div></div>",
@@ -860,15 +872,18 @@ async fn version_page(
                 .into_response()
         }
     };
-    let roles = crate::catalogue::catalogue(&app)
+    let held = crate::catalogue::catalogue(&app)
         .await
         .map(|catalogue| catalogue.versions)
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|v| v.metadata)
-        .find(|m| m.name == name && m.version == version)
-        .map(|m| m.roles)
+        .find(|v| {
+            v.metadata
+                .as_ref()
+                .is_some_and(|m| m.name == name && m.version == version)
+        })
         .unwrap_or_default();
+    let roles = held.metadata.map(|m| m.roles).unwrap_or_default();
     let base = version_path(&name, &version);
     let href = |section: &str, part: &str| section_href(&base, section, part);
     let body = drawn(&Page {
@@ -876,6 +891,7 @@ async fn version_page(
         version: &version,
         roles: &roles,
         reply: &reply,
+        note: &held.uploaded_note,
         section: asked.section.as_deref(),
         part: asked.part.as_deref(),
         href: &href,

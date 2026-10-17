@@ -1040,12 +1040,20 @@ pub trait Store: Send + Sync {
     /// A version installed from a registry, with its documentation and its
     /// listing statement kept beside it for launch (W8.10, W8.3), never
     /// replaced: nothing is written when the version is recorded already.
+    /// The install is its own record (decisions/031): who, through which
+    /// delegation and client, from which prepared change, and its note
+    /// (`version.uploaded_note`, the same as `by.note`).
     fn record_listed_version(
         &self,
         version: &PluginVersion,
         documentation: &[meridian_domain::v1::DocumentationText],
         listing_statement: &str,
+        by: &Author,
     ) -> Result<bool>;
+
+    /// Who installed a registry version, through what, and why; none for a
+    /// local version or one not recorded.
+    fn installation(&self, name: &str, version: &str) -> Result<Option<Author>>;
 
     /// A version's kept listing statement; empty for a local version, or
     /// one not recorded.

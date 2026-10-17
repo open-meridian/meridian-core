@@ -503,6 +503,7 @@ background:var(--card);border:1px solid var(--line);border-radius:var(--radius)}
 .docs-notice p{margin:0 0 .4rem}.docs-head details.notice>summary{cursor:pointer;color:var(--ink-soft);font-size:.85rem}\
 .docs-head details.notice[open]{flex-basis:100%;font-size:.82rem}.docs-head details.notice h3{display:none}\
 .docs-reference .hint{margin:0 0 .4rem}\
+.docs-note{display:block;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink-soft);font-size:.85rem}\
 @media (min-width:60.01rem){.docs-head details.notice{display:none}}\
 @media (max-width:60rem){.docs-body{grid-template-columns:minmax(0,1fr);grid-template-rows:auto minmax(0,1fr)}\
 .docs-notice{display:none}.docs-contents-menu>summary{display:block;cursor:pointer;color:var(--ink-soft);font-size:.85rem}\

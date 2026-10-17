@@ -58,6 +58,7 @@ pub struct MemoryStore {
     licensed_schemes: Mutex<Vec<(Vec<String>, Author, i64)>>,
     /// Who retired each version, through what (W8.15, contract v25).
     retirements: Mutex<std::collections::BTreeMap<(String, String), Author>>,
+    installations: Mutex<std::collections::BTreeMap<(String, String), Author>>,
     /// The registries (contract v25): the catalogue's copy, each listed
     /// version's statement, the usage setting's changes and the reports.
     registry: Mutex<Option<crate::store::HeldCatalogue>>,
@@ -100,6 +101,7 @@ impl MemoryStore {
             map_changes: Mutex::new(Vec::new()),
             catalogues: Mutex::new(Vec::new()),
             retirements: Mutex::new(Default::default()),
+            installations: Mutex::new(Default::default()),
             licensed_schemes: Mutex::new(Vec::new()),
             documentation: Mutex::new(Default::default()),
         }
@@ -1194,16 +1196,31 @@ impl Store for MemoryStore {
         version: &PluginVersion,
         documentation: &[meridian_domain::v1::DocumentationText],
         listing_statement: &str,
+        by: &Author,
     ) -> Result<bool> {
         let recorded = self.record_plugin_version_documented(version, documentation)?;
         if recorded {
             let metadata = version.metadata.clone().unwrap_or_default();
-            self.statements.lock().expect("store lock poisoned").insert(
-                (metadata.name, metadata.version),
-                listing_statement.to_string(),
-            );
+            let key = (metadata.name, metadata.version);
+            self.statements
+                .lock()
+                .expect("store lock poisoned")
+                .insert(key.clone(), listing_statement.to_string());
+            self.installations
+                .lock()
+                .expect("store lock poisoned")
+                .insert(key, by.clone());
         }
         Ok(recorded)
+    }
+
+    fn installation(&self, name: &str, version: &str) -> Result<Option<Author>> {
+        Ok(self
+            .installations
+            .lock()
+            .expect("store lock poisoned")
+            .get(&(name.to_string(), version.to_string()))
+            .cloned())
     }
 
     fn listing_statement(&self, name: &str, version: &str) -> Result<String> {

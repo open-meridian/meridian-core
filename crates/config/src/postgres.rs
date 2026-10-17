@@ -367,7 +367,8 @@ impl Store for PostgresStore {
             .query(
                 "SELECT name, version, roles, interface, sdk_version, image_digest,
                         uploaded_by, uploaded_at_ns, declaration, source_registry, listing,
-                        key_status_issued_at_ns, retired_by, retired_at_ns, retired_note
+                        key_status_issued_at_ns, retired_by, retired_at_ns, retired_note,
+                        uploaded_note
                    FROM config_plugin_version ORDER BY name, version",
                 &[],
             )
@@ -399,6 +400,7 @@ impl Store for PostgresStore {
                 retired_by: row.get(12),
                 retired_at_ns: row.get(13),
                 retired_note: row.get(14),
+                uploaded_note: row.get(15),
             });
         }
 
@@ -2267,6 +2269,7 @@ impl Store for PostgresStore {
         version: &PluginVersion,
         documentation: &[meridian_domain::v1::DocumentationText],
         listing_statement: &str,
+        by: &Author,
     ) -> Result<bool> {
         if !self.record_plugin_version_documented(version, documentation)? {
             return Ok(false);
@@ -2274,12 +2277,43 @@ impl Store for PostgresStore {
         let metadata = version.metadata.clone().unwrap_or_default();
         self.conn()?
             .execute(
-                "UPDATE config_plugin_version SET listing_statement = $3
+                "UPDATE config_plugin_version
+                    SET listing_statement = $3, uploaded_through_delegation = $4,
+                        uploaded_client_name = $5, uploaded_prepared_call_id = $6,
+                        uploaded_note = $7
                   WHERE name = $1 AND version = $2",
-                &[&metadata.name, &metadata.version, &listing_statement],
+                &[
+                    &metadata.name,
+                    &metadata.version,
+                    &listing_statement,
+                    &by.delegation,
+                    &by.client,
+                    &by.prepared_call_id,
+                    &by.note,
+                ],
             )
             .map_err(unavailable)?;
         Ok(true)
+    }
+
+    fn installation(&self, name: &str, version: &str) -> Result<Option<Author>> {
+        Ok(self
+            .conn()?
+            .query_opt(
+                "SELECT uploaded_by, uploaded_through_delegation, uploaded_client_name,
+                        uploaded_note, uploaded_prepared_call_id
+                   FROM config_plugin_version
+                  WHERE name = $1 AND version = $2 AND listing <> ''",
+                &[&name, &version],
+            )
+            .map_err(unavailable)?
+            .map(|row| Author {
+                by: row.get(0),
+                delegation: row.get(1),
+                client: row.get(2),
+                note: row.get(3),
+                prepared_call_id: row.get(4),
+            }))
     }
 
     fn listing_statement(&self, name: &str, version: &str) -> Result<String> {
