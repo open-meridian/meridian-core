@@ -485,6 +485,83 @@ impl Platform {
         templates_from_json(&value).map_err(PlatformError::Malformed)
     }
 
+    /// PullCatalogue (W8.10, contract v25): listings changed after the
+    /// sequence held, and the signing keys' status, as the platform wrote
+    /// them, for the config domain to read and verify.
+    pub async fn pull_registry_catalogue(
+        &self,
+        after_sequence: u64,
+        now_ns: i64,
+    ) -> Result<serde_json::Value, String> {
+        let path = format!("/api/v1/registry/catalogue?after_sequence={after_sequence}");
+        let response = self
+            .v24_call(Method::Get, &path, None, now_ns)
+            .await
+            .map_err(|failed| failed.to_string())?;
+        registry_json(&response)
+    }
+
+    /// DownloadListedVersion (W8.10, contract v25): one resolution request,
+    /// signed as the deployment and counted by the platform as an install.
+    pub async fn resolve_listed_version(
+        &self,
+        listing: &str,
+        version: &str,
+        registry: &str,
+        now_ns: i64,
+    ) -> Result<serde_json::Value, String> {
+        let (organisation, plugin) = listing
+            .split_once('/')
+            .ok_or_else(|| format!("{listing:?} is not organisation/plugin"))?;
+        let path =
+            format!("/api/v1/registry/listings/{organisation}/{plugin}/versions/{version}/resolve");
+        let body = serde_json::to_vec(&serde_json::json!({
+            "listing": listing, "version": version, "registry": registry,
+        }))
+        .map_err(|failed| failed.to_string())?;
+        let response = self
+            .v24_call(Method::Post, &path, Some(body), now_ns)
+            .await
+            .map_err(|failed| failed.to_string())?;
+        registry_json(&response)
+    }
+
+    /// ReportPluginUsage (W5.19, contract v25): the week's counts per
+    /// installed registry version, answered with whether the platform
+    /// received them.
+    pub async fn report_plugin_usage(
+        &self,
+        report: &meridian_domain::v1::PluginUsageReport,
+        now_ns: i64,
+    ) -> Result<bool, String> {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "period_start": report.period_start,
+            "period_end": report.period_end,
+            "counts": report.counts.iter().map(|count| serde_json::json!({
+                "listing": count.listing,
+                "version": count.version,
+                "registry": count.registry,
+                "instances": count.instances,
+                "people_read": count.people_read,
+                "people_write": count.people_write,
+                "people_admin": count.people_admin,
+                "daily_operations": count.daily_operations,
+                "daily_requests": count.daily_requests,
+            })).collect::<Vec<_>>(),
+        }))
+        .map_err(|failed| failed.to_string())?;
+        let response = self
+            .v24_call(
+                Method::Post,
+                "/api/v1/registry/usage-reports",
+                Some(body),
+                now_ns,
+            )
+            .await
+            .map_err(|failed| failed.to_string())?;
+        registry_json(&response).map(|_| true)
+    }
+
     /// W3.25 (contract v24): the licence list -- the schemes whose
     /// identifiers a deployment may send, and the pace it sends them at.
     pub async fn pull_licence_list(&self, now_ns: i64) -> Result<LicenceList, PlatformError> {
@@ -797,6 +874,23 @@ impl Platform {
 }
 
 /// A 2xx answer's JSON.
+/// A registry row's answer, or its refusal in the platform's own words.
+fn registry_json(response: &Response) -> Result<serde_json::Value, String> {
+    let value: Option<serde_json::Value> = serde_json::from_slice(&response.body).ok();
+    if !(200..300).contains(&response.status) {
+        let said = value
+            .as_ref()
+            .and_then(|v| v.get("error"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("no reason given");
+        return Err(format!(
+            "the platform refused it (HTTP {}): {said}",
+            response.status
+        ));
+    }
+    value.ok_or_else(|| "the platform's answer is not JSON".to_string())
+}
+
 fn json_of(response: &Response) -> Result<serde_json::Value, PlatformError> {
     if !(200..300).contains(&response.status) {
         return Err(PlatformError::Refused {
@@ -1104,6 +1198,10 @@ struct WireIdentifier {
     valid_from_ns: i64,
     #[serde(default)]
     valid_until_ns: i64,
+    /// A listing identifier's trading currency, ISO 4217, as the master
+    /// holds it per listing (contract v25, W3.1); absent on every other.
+    #[serde(default)]
+    trading_currency: String,
 }
 
 impl WireIdentifier {
@@ -1114,6 +1212,7 @@ impl WireIdentifier {
             source: self.source,
             valid_from_ns: self.valid_from_ns,
             valid_until_ns: self.valid_until_ns,
+            trading_currency: self.trading_currency,
         }
     }
 }
@@ -1916,7 +2015,9 @@ pub(crate) mod tests {
                     {"scheme": "ticker", "value": "KXFED-26NOV", "source": "",
                      "valid_from_ns": 5, "valid_until_ns": 0},
                     {"scheme": "ticker", "value": "KXFED-OLD", "source": "",
-                     "valid_from_ns": 1, "valid_until_ns": 5}
+                     "valid_from_ns": 1, "valid_until_ns": 5},
+                    {"scheme": "figi", "value": "BBG0KXFEDCAD", "source": "",
+                     "valid_from_ns": 5, "valid_until_ns": 0, "trading_currency": "CAD"}
                 ],
                 "asset_class": "ASSET_CLASS_EVENT_CONTRACT",
                 "instrument_type": "INSTRUMENT_TYPE_BINARY_EVENT_CONTRACT",
@@ -1943,6 +2044,10 @@ pub(crate) mod tests {
         assert_eq!(contract.closes_at_ns, 1_793_548_800_000_000_000);
         let payout = contract.payout.unwrap();
         assert_eq!(payout.currency_code, "USD");
+        // A listing's trading currency (contract v25, W3.1), and none on
+        // every other identifier.
+        assert_eq!(record.identifiers[2].trading_currency, "CAD");
+        assert!(record.identifiers[0].trading_currency.is_empty());
         assert_eq!(
             meridian_domain::exact::Exact::from_wire(&payout.amount.unwrap())
                 .unwrap()

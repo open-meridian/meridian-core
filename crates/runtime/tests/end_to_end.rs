@@ -162,13 +162,13 @@ fn a_record_minted_here_is_backfilled_with_the_global_id_and_no_key_changes() {
             Arc::new(MemoryBackend::new()),
             Arc::new(meridian_clock::SystemClock),
         ));
-        let mut applied = bus.subscribe(INSTRUMENT_APPLIED);
+        let mut applied = bus.subscribe_every(INSTRUMENT_APPLIED);
 
         // Wired as the two processes wire themselves.
         let writing = Arc::new(std::sync::Mutex::new(()));
         serve_all(&bus, store.clone(), bus.clock(), writing.clone());
-        let pulled = bus.subscribe(INSTRUMENT_PULLED);
-        let missing = bus.subscribe(INSTRUMENT_MISSING);
+        let pulled = bus.subscribe_every(INSTRUMENT_PULLED);
+        let missing = bus.subscribe_every(INSTRUMENT_MISSING);
         tokio::spawn(
             Reactor::sharing(bus.clone(), store.clone(), bus.clock(), writing)
                 .consume(pulled, missing),

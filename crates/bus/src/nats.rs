@@ -210,61 +210,7 @@ impl Backend for NatsBackend {
     }
 
     fn subscribe(&self, pattern: &str) -> Subscription {
-        let (tx, rx) = mpsc::channel(SUBSCRIBER_QUEUE);
-        let subject = Self::subject(pattern);
-        let client = self.client.clone();
-        let owned = pattern.to_string();
-        let dropped = DropCount::default();
-        let counted = dropped.clone();
-        let total = Arc::clone(&self.dropped);
-
-        self.handle.spawn(async move {
-            let mut messages = match client.subscribe(subject.clone()).await {
-                Ok(messages) => messages,
-                Err(failed) => {
-                    tracing::error!(pattern = owned, %failed, "could not subscribe at the broker");
-                    return;
-                }
-            };
-
-            let lose = || {
-                counted.add();
-                total.fetch_add(1, Ordering::Relaxed);
-            };
-
-            let mut sequence = 0u64;
-            while let Some(message) = futures_util::StreamExt::next(&mut messages).await {
-                let envelope = match Envelope::decode(message.payload) {
-                    Ok(envelope) => envelope,
-                    Err(failed) => {
-                        // Something on our subjects that is not ours. Dropped
-                        // and counted rather than passed up: a consumer cannot
-                        // do anything with bytes that are not an envelope.
-                        lose();
-                        tracing::warn!(pattern = owned, %failed, "undecodable message");
-                        continue;
-                    }
-                };
-
-                sequence += 1;
-                // Never waits for room. Waiting here backed the broker's
-                // stream up behind one slow consumer and lost nothing that
-                // anyone could count; dropping loses this message for this
-                // subscriber alone, and says so.
-                match tx.try_send(Delivery { envelope, sequence }) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        lose();
-                        tracing::warn!(pattern = owned, "subscriber queue full; message dropped");
-                    }
-                    // The subscription was dropped. Ending the task is what
-                    // unsubscribes at the broker, since the client goes with it.
-                    Err(mpsc::error::TrySendError::Closed(_)) => break,
-                }
-            }
-        });
-
-        Subscription::new(rx, pattern, dropped)
+        self.listen(pattern, None)
     }
 
     /// Ask whoever serves this topic, wherever they are.
@@ -341,13 +287,19 @@ impl Backend for NatsBackend {
     }
 
     /// Offer a local handler's answer to callers in other processes.
-    fn serve(&self, topic: &str, handler: Handler) {
-        self.offer(topic, handler, None);
+    fn serve(&self, topic: &str, group: &str, handler: Handler) {
+        self.offer(topic, group, handler, None);
     }
 
     /// The same, signalling once each answer is on the wire.
-    fn serve_delivered(&self, topic: &str, handler: Handler, delivered: Arc<Notify>) {
-        self.offer(topic, handler, Some(delivered));
+    fn serve_delivered(&self, topic: &str, group: &str, handler: Handler, delivered: Arc<Notify>) {
+        self.offer(topic, group, handler, Some(delivered));
+    }
+
+    /// One of a queue group at the broker (contract v25): each message to one
+    /// member of the group.
+    fn subscribe_shared(&self, pattern: &str, group: &str) -> Subscription {
+        self.listen(pattern, Some(group.to_string()))
     }
 
     fn dropped(&self) -> u64 {
@@ -356,13 +308,82 @@ impl Backend for NatsBackend {
 }
 
 impl NatsBackend {
-    fn offer(&self, topic: &str, handler: Handler, delivered: Option<Arc<Notify>>) {
+    /// A subscription at the broker: plain, every subscriber hearing every
+    /// message, or one of a queue group (contract v25).
+    fn listen(&self, pattern: &str, group: Option<String>) -> Subscription {
+        let (tx, rx) = mpsc::channel(SUBSCRIBER_QUEUE);
+        let subject = Self::subject(pattern);
+        let client = self.client.clone();
+        let owned = pattern.to_string();
+        let dropped = DropCount::default();
+        let counted = dropped.clone();
+        let total = Arc::clone(&self.dropped);
+
+        self.handle.spawn(async move {
+            let subscribed = match group {
+                None => client.subscribe(subject.clone()).await,
+                Some(group) => client.queue_subscribe(subject.clone(), group).await,
+            };
+            let mut messages = match subscribed {
+                Ok(messages) => messages,
+                Err(failed) => {
+                    tracing::error!(pattern = owned, %failed, "could not subscribe at the broker");
+                    return;
+                }
+            };
+
+            let lose = || {
+                counted.add();
+                total.fetch_add(1, Ordering::Relaxed);
+            };
+
+            let mut sequence = 0u64;
+            while let Some(message) = futures_util::StreamExt::next(&mut messages).await {
+                let envelope = match Envelope::decode(message.payload) {
+                    Ok(envelope) => envelope,
+                    Err(failed) => {
+                        // Something on our subjects that is not ours. Dropped
+                        // and counted rather than passed up: a consumer cannot
+                        // do anything with bytes that are not an envelope.
+                        lose();
+                        tracing::warn!(pattern = owned, %failed, "undecodable message");
+                        continue;
+                    }
+                };
+
+                sequence += 1;
+                // Never waits for room. Waiting here backed the broker's
+                // stream up behind one slow consumer and lost nothing that
+                // anyone could count; dropping loses this message for this
+                // subscriber alone, and says so.
+                match tx.try_send(Delivery { envelope, sequence }) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        lose();
+                        tracing::warn!(pattern = owned, "subscriber queue full; message dropped");
+                    }
+                    // The subscription was dropped. Ending the task is what
+                    // unsubscribes at the broker, since the client goes with it.
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                }
+            }
+        });
+
+        Subscription::new(rx, pattern, dropped)
+    }
+}
+
+impl NatsBackend {
+    fn offer(&self, topic: &str, group: &str, handler: Handler, delivered: Option<Arc<Notify>>) {
         let client = self.client.clone();
         let subject = topic.to_string();
         let answering = Arc::clone(&self.answering);
+        let group = group.to_string();
 
         self.handle.spawn(async move {
-            let mut requests = match client.subscribe(subject.clone()).await {
+            // One of the component's queue group (contract v25): each request
+            // reaches one copy of the component, which answers it.
+            let mut requests = match client.queue_subscribe(subject.clone(), group).await {
                 Ok(requests) => requests,
                 Err(failed) => {
                     tracing::error!(topic = subject, %failed, "could not offer a handler");

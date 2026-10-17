@@ -40,7 +40,31 @@ narrowed as the plan's tests ask, through `/mcp` alone:
    launcher, so no instance here was launched from the catalogue (core's
    unit tests launch and stop through a stand-in launcher, each record
    naming the delegation and client).
-6. No tool list read in the run holds an access change, and no answer
+6. The registries, against a stand-in platform (contract v25; spec/plugins-
+   are-shared-through-registries, "What the tests prove"): its catalogue
+   and resolutions from e2e/plugin-area/registry, which its make.py signed
+   with a key thrown away, the public half the conductor's platform key,
+   and its OCI registry over TLS. The person pulls the catalogue on the
+   Registries tab; the admin's agent lists both listings and reads the
+   pulled version's reason by its kind, and is listed no install; each
+   install passes through the sheet's notice, its own step with Continue
+   (ruling 194), and one posted past it is refused; the person installs
+   1.4.0 by digest, verified, its note kept with it, and
+   is refused a version whose layer the registry serves altered (the
+   digest), the pulled version, and a version built after its signer's key
+   was revoked, each naming the check; the catalogue reads 1.4.0 from the
+   community registry by its digest, and the Installed list shows it.
+7. Its documentation, from the image's verified metadata: the admin's agent
+   reads 1.4.0's sections, the troubleshooting's jailbreak withheld as
+   prompt talk, and its Reference; the version's page draws it with the
+   supervision notice; 1.5.0, installed, shows its changed overview while
+   1.4.0 keeps its own. The harness's instance was not launched from the
+   catalogue, so a custody admin's documentation read by instance says so.
+8. A launch of 1.4.0, verified again from the deployment's own registry,
+   reaches the launcher the harness does not have; with its provenance
+   taken out of that registry (registry/tamper.py) the next is refused by
+   the verification at launch, naming the provenance.
+9. No tool list read in the run holds an access change, and no answer
    carries the secret's value; `store moves` prints each change its own
    record, naming the person, the delegation, the client and the note.
 
@@ -56,8 +80,10 @@ launcher.
 Run from the repository's root by the Makefile, which builds the images and
 copies the harness out first; standard library only.
 """
+import html
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -68,7 +94,17 @@ LOG = ".e2e-plugin-area.log"
 COMPOSE = ["docker", "compose", "-p", PROJECT, "-f", ".harness/compose.yaml",
            "-f", ".harness/plugins.yaml", "-f", "e2e/plugin-area/stand-in.yaml"]
 ENV = dict(os.environ, MERIDIAN_HARNESS_PEOPLE=PEOPLE,
-           MERIDIAN_HARNESS_STAND_IN=os.path.abspath("e2e/plugin-page"))
+           MERIDIAN_HARNESS_STAND_IN=os.path.abspath("e2e/plugin-page"),
+           MERIDIAN_HARNESS_REGISTRY=os.path.abspath("e2e/plugin-area/registry"))
+with open("e2e/plugin-area/registry/cases.json", encoding="utf-8") as held:
+    CASES = json.load(held)
+STAND_IN = "open-meridian/stand-in"
+# The page a form is read from for its token: a path, no query, which
+# core-form would read as a field.
+PLUGINS = "/admin/plugins/versions"
+INSTALL = "/admin/plugins/registry/install"
+REGISTRY_READS = ["dashboard__search_registry_plugins", "dashboard__read_registry_plugin",
+                  "dashboard__read_registries"]
 INSTANCE = "area"
 # Typed at the Settings form by the admin, as only a person does: never in
 # an answer through /mcp.
@@ -113,7 +149,7 @@ def must(condition, why):
         raise Failed(why)
 
 
-# Every answer and every tool list read, for step 6.
+# Every answer and every tool list read, for step 9.
 ANSWERS = []
 LISTS = []
 
@@ -161,6 +197,20 @@ def version_read(person, client):
                 {"plugin_instance_id": INSTANCE}, "unchanged")["data"]["updated_at_ns"]
 
 
+def through_the_notice(listing_name, version):
+    """Ruling 194: the install sheet's first step is the notice, whole and
+    alone, with Continue; the form comes after it, and its act requires
+    having passed through (`notice=read`)."""
+    sheet = f"/admin/plugins/registry/{listing_name}/install?version={version}&registry=community"
+    page = runner("core-page", sheet, "--expect", "Naming a plugin here is not an endorsement",
+                  "--expect", "data-continue")
+    found = re.search(r'data-continue href="([^"]+)"', page)
+    must(found and 'action="/admin/plugins/registry/install"' not in page,
+         f"the notice is its own step, with Continue and no form: {page[-600:]}")
+    runner("core-page", html.unescape(found.group(1)), "--expect", 'name="notice" value="read"',
+           "--expect", f"Install {listing_name} {version}")
+
+
 def setting(data, name):
     found = [d for d in data["declared_settings"] if d["name"] == name]
     must(found, f"no setting {name} in {json.dumps(data)[:400]}")
@@ -169,7 +219,7 @@ def setting(data, name):
 
 def run():
     started = time.time()
-    compose("down", "-v", "--remove-orphans", check=False)
+    compose("--profile", "runner", "down", "-v", "--remove-orphans", check=False)
     compose("up", "-d")
     runner("ready")
     # The accounts its connection reaches, said again now the dashboard
@@ -199,8 +249,10 @@ def run():
                    "unchanged")["data"]
     must(any(s["record_kind"] == "activity" for s in summary.get("stored", [])),
          f"step 1, the Summary says what storage holds: {json.dumps(summary)[:500]}")
-    must("declared_tools" in summary and summary.get("declaration"),
-         "step 1, the Summary's own parts, for an admin of its roles")
+    # Contract v25: the declaration and the tools moved to the Documentation
+    # tab; the Summary answers neither.
+    must("declared_tools" not in summary and not summary.get("declaration"),
+         f"step 1, the Summary has no declaration or tools part: {json.dumps(summary)[:500]}")
     call(*as_cat, "dashboard__read_moves", {"plugin_instance_id": INSTANCE}, "unchanged")
     read = call(*as_cat, "dashboard__read_plugin_settings", {"plugin_instance_id": INSTANCE},
                 "unchanged")["data"]
@@ -368,12 +420,103 @@ def run():
     must("not in the catalogue" in launched.get("detail", ""),
          f"step 5, the conductor's answer to a launch: {launched}")
 
-    # 6. No access change listed, no secret answered, each change its record.
+    # 6. The registries, against the stand-in platform.
+    listed = tools(*as_admin)
+    for name in REGISTRY_READS + ["dashboard__read_plugin_documentation"]:
+        must(name in listed, f"step 6, {name} is listed to a deployment admin: {listed}")
+    must("dashboard__install_plugin" not in listed,
+         f"step 6, an install is a person's until the agents' levels loosen it: {listed}")
+    said = runner("core-form", PLUGINS, "/admin/plugins/registry/pull")
+    must("pulled" in said, f"step 6, the catalogue pulled on the Registries tab: {said}")
+    found = call(*as_admin, "dashboard__search_registry_plugins", {}, "unchanged")["data"]
+    names = sorted(line["listing"] for line in found["listings"])
+    must(names == [STAND_IN, "other-org/revoked"], f"step 6, Browse lists both listings: {names}")
+    must("not an endorsement" in found["notice"], f"step 6, the notice beside them: {found['notice'][:200]}")
+    listing = call(*as_admin, "dashboard__read_registry_plugin", {"listing": STAND_IN},
+                   "unchanged")["data"]
+    pulled = [v for v in listing["versions"] if v["version"] == "1.3.0"]
+    must(pulled and (pulled[0]["pull"] or {}).get("kind") == "PULL_REASON_KIND_TERMS_BREACH",
+         f"step 6, the pulled version says why, by its kind: {pulled}")
+    through_the_notice(STAND_IN, "1.4.0")
+    skipped = runner("core-form", PLUGINS, INSTALL, f"listing={STAND_IN}", "version=1.4.0",
+                     "registry=community", "note=Past the notice.",
+                     "--expect-refused", "the notice comes first")
+    must("refused" in skipped, f"step 6, an install not passed through the notice is refused: {skipped}")
+    said = runner("core-form", PLUGINS, INSTALL, f"listing={STAND_IN}", "version=1.4.0",
+                  "registry=community", "notice=read",
+                  "note=The stand-in, from the community registry.")
+    must("is installed, verified" in said, f"step 6, 1.4.0 installed by digest, verified: {said}")
+    for listing_name, version, refusal in [(STAND_IN, "1.6.0", "the digest"),
+                                           (STAND_IN, "1.3.0", "pulled"),
+                                           ("other-org/revoked", "1.0.0", "revoked")]:
+        through_the_notice(listing_name, version)
+        runner("core-form", PLUGINS, INSTALL, f"listing={listing_name}", f"version={version}",
+               "registry=community", "notice=read", "note=Refused, it is to be.",
+               "--expect-refused", refusal)
+    catalogue = call(*as_admin, "dashboard__read_plugin_catalogue", {}, "unchanged")["data"]
+    installed = [v for v in catalogue["versions"] if v.get("listing") == STAND_IN]
+    must(len(installed) == 1 and installed[0]["metadata"]["version"] == "1.4.0"
+         and installed[0]["source_registry"] == "community"
+         and installed[0]["image_digest"] == CASES["1.4.0"]
+         and installed[0]["uploaded_by"] == "local|harness"
+         and installed[0]["uploaded_note"] == "The stand-in, from the community registry.",
+         f"step 6, the catalogue holds 1.4.0 from the community registry by its digest: {installed}")
+    must(not [v for v in catalogue["versions"] if v.get("listing") == "other-org/revoked"],
+         "step 6, nothing refused is recorded")
+    runner("core-page", "/admin/plugins/versions?tab=installed", "--expect", STAND_IN)
+
+    # 7. Its documentation, from the image's verified metadata.
+    def documentation(version):
+        read = call(*as_admin, "dashboard__read_plugin_documentation",
+                    {"name": STAND_IN, "version": version}, "unchanged")["data"]
+        return read, {section["section"]: section for section in read["sections"]}
+
+    read, sections = documentation("1.4.0")
+    must("Reads the holdings of the stand-in's accounts." in
+         sections.get("overview", {}).get("vendor_markdown", ""),
+         f"step 7, 1.4.0's overview, the vendor's words: {sections}")
+    must("prompt talk" in sections.get("troubleshooting", {}).get("withheld", ""),
+         f"step 7, the troubleshooting's jailbreak withheld as prompt talk: {sections}")
+    must([s["name"] for s in (read.get("reference") or {}).get("settings", [])] == ["region"],
+         f"step 7, the Reference from the declaration: {read.get('reference')}")
+    runner("core-page", f"/admin/plugins/versions/{STAND_IN}/1.4.0/documentation",
+           "--expect", "Reads the holdings of the stand-in", "--expect", "not an endorsement")
+    through_the_notice(STAND_IN, "1.5.0")
+    runner("core-form", PLUGINS, INSTALL, f"listing={STAND_IN}", "version=1.5.0",
+           "registry=community", "notice=read", "note=The newer stand-in.")
+    _, newer = documentation("1.5.0")
+    must("the activity" in newer.get("overview", {}).get("vendor_markdown", ""),
+         f"step 7, 1.5.0's changed overview: {newer}")
+    _, kept = documentation("1.4.0")
+    must(kept.get("overview") == sections.get("overview"),
+         f"step 7, 1.4.0 keeps its own text: {kept}")
+    by_instance = call(*as_cat, "dashboard__read_plugin_documentation",
+                       {"plugin_instance_id": INSTANCE}, "refused")
+    must("not launched from the catalogue" in by_instance.get("detail", ""),
+         f"step 7, the harness's instance has no catalogue version to read: {by_instance}")
+
+    # 8. A launch verified again from the deployment's own registry.
+    reached = call(*as_admin, "dashboard__launch_plugin",
+                   {"name": STAND_IN, "version": "1.4.0", "instance_id": "stand-in-1",
+                    "approved_roles": ["custody"], "note": "The listed stand-in."}, "refused")
+    must("the launcher did not create" in reached.get("detail", "")
+         and "verification" not in reached.get("detail", ""),
+         f"step 8, verified again, the launch reaches the launcher, which the harness lacks: {reached}")
+    tampered = compose("--profile", "runner", "run", "--rm", "-T", "registry-tamper").stdout
+    must("the provenance is gone" in tampered, f"step 8, the provenance taken out: {tampered}")
+    refused = call(*as_admin, "dashboard__launch_plugin",
+                   {"name": STAND_IN, "version": "1.4.0", "instance_id": "stand-in-2",
+                    "approved_roles": ["custody"], "note": "The listed stand-in again."}, "refused")
+    must("the verification at launch" in refused.get("detail", "")
+         and "provenance" in refused.get("detail", ""),
+         f"step 8, the launch refused by its verification again, naming the provenance: {refused}")
+
+    # 9. No access change listed, no secret answered, each change its record.
     for names in LISTS:
         for name in names:
             must(not (name.startswith("dashboard__") and any(w in name for w in ACCESS_CHANGES)),
-                 f"step 6, {name} changes access")
-    must(not any(SECRET in answer for answer in ANSWERS), "step 6, an answer carried the secret")
+                 f"step 9, {name} changes access")
+    must(not any(SECRET in answer for answer in ANSWERS), "step 9, an answer carried the secret")
     store = compose("run", "--rm", "-T", "store", "moves").stdout.split("\n")
     settings = [line for line in store if line.startswith(f"setting|{INSTANCE}|")]
 
@@ -382,23 +525,23 @@ def run():
 
     must(recorded(f"setting|{INSTANCE}|activity_window_days|set|false|local|cat|{cat}|Cat's agent|",
                   "Keep activity a little past seven years."),
-         f"step 6, the window's change names Cat, her delegation, client and note: {settings}")
+         f"step 9, the window's change names Cat, her delegation, client and note: {settings}")
     must(recorded(f"setting|{INSTANCE}|plan_code_links|set|false|local|cat|{cat}|Cat's agent|",
-                  "The 401(k)'s money market fund code."), f"step 6, the table's change: {settings}")
+                  "The 401(k)'s money market fund code."), f"step 9, the table's change: {settings}")
     must(recorded(f"setting|{INSTANCE}|api_key|set|true|local|harness|||", ""),
-         f"step 6, the secret set in a browser, only as set: {settings}")
+         f"step 9, the secret set in a browser, only as set: {settings}")
     must(recorded(f"setting|{INSTANCE}|api_key|cleared|false|local|cat|{cat}|Cat's agent|",
-                  "cleared it."), f"step 6, the secret cleared through Cat's agent: {settings}")
-    must(not any(SECRET in line for line in store), "step 6, the store printed the secret")
+                  "cleared it."), f"step 9, the secret cleared through Cat's agent: {settings}")
+    must(not any(SECRET in line for line in store), "step 9, the store printed the secret")
     must(f"hold|custody|2190|false|local|harness|{admin}|Admin's agent|The records rule: six years."
-         in store, f"step 6, the hold names the admin, the delegation, the client and why: {store}")
+         in store, f"step 9, the hold names the admin, the delegation, the client and why: {store}")
     archives = [line for line in store if line.startswith(f"archive|{INSTANCE}|")]
     must(archives == sorted([
         f"archive|{INSTANCE}|true|{GIB_50}|local|harness|{admin}|Admin's agent|"
         "Seven years of activity, in the archive past its window.",
         f"archive|{INSTANCE}|false|{GIB_50}|local|harness|{admin}|Admin's agent|"
         "Not until the bucket is in place."]),
-         f"step 6, each archive change its own record: {archives}")
+         f"step 9, each archive change its own record: {archives}")
     must(ben, "Ben's delegation")
 
     took = int(time.time() - started)
@@ -414,7 +557,11 @@ def run():
           "catalogue, a stop and a launch answered by the conductor; no tool list held an access "
           "change, no answer the secret, and each change is its own record naming the person, the "
           "delegation, the client and the note; each consent page listed exactly what tools/list "
-          "then listed, and each change's note read back beside who made it")
+          "then listed, and each change's note read back beside who made it; against a stand-in "
+          "platform, the catalogue pulled, a version installed by digest and verified, a tampered "
+          "layer, a pulled version and a revoked signer refused, the documentation read from the "
+          "verified image with a shape withheld and each version keeping its own, and a launch "
+          "verified again and refused once its provenance left the deployment's registry")
 
 
 def main():
@@ -423,11 +570,11 @@ def main():
         run()
     except (Failed, subprocess.TimeoutExpired, KeyError, ValueError, IndexError, TypeError) as failed:
         compose("logs", "--no-color", check=False)
-        compose("down", "-v", "--remove-orphans", check=False)
+        compose("--profile", "runner", "down", "-v", "--remove-orphans", check=False)
         print(f"e2e-plugin-area FAILED: {failed}; the run is in {LOG}", file=sys.stderr)
         return 1
     compose("logs", "--no-color", check=False)
-    compose("down", "-v", "--remove-orphans", check=False)
+    compose("--profile", "runner", "down", "-v", "--remove-orphans", check=False)
     return 0
 
 

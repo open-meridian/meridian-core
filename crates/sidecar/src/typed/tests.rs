@@ -341,7 +341,7 @@ async fn a_plugin_cannot_set_what_the_sidecar_stamps() {
     // plugin-facing message has no such field, so they are not carried, and
     // the sidecar's own value is what reaches the bus.
     let (sidecar, bus, _) = registered(&["custody"]).await;
-    let mut listening = bus.subscribe(INSTRUMENT_MISSING);
+    let mut listening = bus.subscribe_every(INSTRUMENT_MISSING);
 
     let mut bytes = ReportMissingInstrumentParams {
         source: "snaptrade".into(),
@@ -378,7 +378,7 @@ async fn an_asset_class_the_contract_does_not_define_is_refused_naming_the_field
     // plugin that built its params by hand could otherwise put a class nobody
     // ruled on the bus. The SDK refuses it before sending; this is the door.
     let (sidecar, bus, _) = registered(&["custody"]).await;
-    let mut listening = bus.subscribe(INSTRUMENT_MISSING);
+    let mut listening = bus.subscribe_every(INSTRUMENT_MISSING);
 
     let refused = sidecar
         .report_missing_instrument(Request::new(ReportMissingInstrumentParams {
@@ -410,7 +410,7 @@ async fn an_asset_class_the_contract_does_not_define_is_refused_naming_the_field
 #[tokio::test]
 async fn a_sync_status_is_published_as_this_instance_and_its_account() {
     let (sidecar, bus, _) = registered(&["custody"]).await;
-    let mut listening = bus.subscribe("platform.custody.snaptrade-1.event.sync-status");
+    let mut listening = bus.subscribe_every("platform.custody.snaptrade-1.event.sync-status");
     sidecar
         .report_sync_status(Request::new(ReportSyncStatusParams {
             source: "snaptrade".into(),
@@ -432,7 +432,7 @@ async fn an_unlinked_accounts_sync_status_is_published_and_its_holdings_are_stil
     // link, with no account. Nothing is recorded against the account, and a
     // holding from it is refused exactly as before.
     let (sidecar, bus, recorded) = registered(&["custody"]).await;
-    let mut listening = bus.subscribe("platform.custody.snaptrade-1.event.sync-status");
+    let mut listening = bus.subscribe_every("platform.custody.snaptrade-1.event.sync-status");
     sidecar
         .report_sync_status(Request::new(ReportSyncStatusParams {
             source: "snaptrade".into(),
@@ -463,7 +463,7 @@ async fn an_unlinked_accounts_sync_status_is_published_and_its_holdings_are_stil
 #[tokio::test]
 async fn a_sync_status_carries_why_and_how_fresh_as_the_plugin_said() {
     let (sidecar, bus, _) = registered(&["custody"]).await;
-    let mut listening = bus.subscribe("platform.custody.snaptrade-1.event.sync-status");
+    let mut listening = bus.subscribe_every("platform.custody.snaptrade-1.event.sync-status");
     sidecar
         .report_sync_status(Request::new(ReportSyncStatusParams {
             source: "snaptrade".into(),
@@ -487,7 +487,7 @@ async fn the_accounts_a_connection_reaches_are_published_as_this_instance_unlink
     // W2.8: before anything is recorded, so nothing is refused for want of a
     // link. The instance is the topic's, which is the one a link names.
     let (sidecar, bus, _) = registered(&["custody"]).await;
-    let mut listening = bus.subscribe("platform.custody.snaptrade-1.event.external-accounts");
+    let mut listening = bus.subscribe_every("platform.custody.snaptrade-1.event.external-accounts");
     sidecar
         .report_external_accounts(Request::new(ReportExternalAccountsParams {
             accounts: vec![

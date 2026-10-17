@@ -134,6 +134,17 @@ pub static SPECS: &[Spec] = &[
         area: Area::Instruments,
         input_schema: reports_usage_schema,
     },
+    // Contract v25 (W3.28, W6.20): the licensed schemes declared,
+    // preparable, agents' level "may not" by default.
+    Spec {
+        name: "set_licensed_schemes",
+        title: "Set the licensed schemes",
+        description: "declare the identifier schemes the deployment is licensed for, the whole list replacing the last, with a note saying why (contract v25, W3.28): each a scheme the platform's licence list names, refused by its path otherwise; the weekly usage report carries them. Each change its own record. Answers the setting in force with the schemes declared.",
+        reads: false,
+        open_world: false,
+        area: Area::Instruments,
+        input_schema: licensed_schemes_schema,
+    },
     // Contract v24 (W3.26, W6.20; the names approved 2026-10-15): making the
     // migration's lines, preparable, agents' level "prepare only" by
     // default.
@@ -169,6 +180,18 @@ fn reports_usage_schema() -> Value {
             "note": {"type": "string", "minLength": 1, "maxLength": MOST_TEXT, "description": "why, kept with the change's record"},
         },
         "required": ["reports_usage", "note"],
+        "additionalProperties": false,
+    })
+}
+
+fn licensed_schemes_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "licensed_schemes": {"type": "array", "items": {"type": "string"}, "maxItems": 64},
+            "note": {"type": "string", "minLength": 1, "maxLength": MOST_TEXT, "description": "why, kept with the change's record"},
+        },
+        "required": ["licensed_schemes", "note"],
         "additionalProperties": false,
     })
 }
@@ -744,6 +767,7 @@ fn value(
                 source: text(id, "source", &at, false, problems),
                 valid_from_ns: 0,
                 valid_until_ns: integer(id, "valid_until_ns", &at, false, problems),
+                trading_currency: String::new(),
             })
         }
     };
@@ -983,6 +1007,18 @@ fn to_complete_json(item: &InstrumentToComplete) -> Value {
     if !item.answered_instrument_id.is_empty() {
         out["answered_instrument_id"] = item.answered_instrument_id.clone().into();
     }
+    // Contract v25 (W3.26): what the platform's answer contradicts of a
+    // person's, an uncertain line of its own.
+    if !item.contradicted_fields.is_empty() {
+        out["contradicted_fields"] = item
+            .contradicted_fields
+            .iter()
+            .map(|field| {
+                enum_name::<meridian_domain::v1::InstrumentField>(*field, |v| v.as_str_name())
+            })
+            .collect::<Vec<_>>()
+            .into();
+    }
     out
 }
 
@@ -1119,6 +1155,7 @@ pub async fn call(app: &App, caller: &Caller, spec: &Spec, arguments: Value) -> 
         "list_calendars" => list_calendars(app, caller, &arguments).await,
         "read_calendar" => read_calendar(app, caller, &arguments).await,
         "set_reports_usage" => set_reports_usage(app, caller, &arguments).await,
+        "set_licensed_schemes" => set_licensed_schemes(app, caller, &arguments).await,
         "apply_migration" => apply_migration(app, caller, &arguments).await,
         other => refused("not_listed", &format!("no tool {other}"), Vec::new()),
     }
@@ -1363,6 +1400,55 @@ async fn set_reports_usage(app: &App, caller: &Caller, arguments: &Value) -> Val
     match reply {
         Err(failed) => bus_refused(failed, ""),
         Ok(reply) => json!({"outcome": "made", "data": {"reports_usage": reply.reports_usage}}),
+    }
+}
+
+/// W3.28 (contract v25): the licensed schemes declared, sent to the
+/// conductor, which holds them to the licence list.
+async fn set_licensed_schemes(app: &App, caller: &Caller, arguments: &Value) -> Value {
+    let mut problems = Problems::default();
+    let Some(top) = object(arguments, "", &mut problems) else {
+        return problems.refusal();
+    };
+    only(top, &["licensed_schemes", "note"], "", &mut problems);
+    let mut schemes = Vec::new();
+    match top.get("licensed_schemes") {
+        Some(Value::Array(items)) => {
+            if items.len() > 64 {
+                problems.add("licensed_schemes", "at most 64");
+            }
+            for (n, item) in items.iter().enumerate() {
+                match item.as_str() {
+                    Some(scheme) => schemes.push(scheme.to_string()),
+                    None => problems.add(&format!("licensed_schemes[{n}]"), "a scheme's name"),
+                }
+            }
+        }
+        None | Some(Value::Null) => problems.add("licensed_schemes", "required: the whole list"),
+        Some(_) => problems.add("licensed_schemes", "a list of schemes"),
+    }
+    let reason = text(top, "note", "", true, &mut problems);
+    if !problems.is_empty() {
+        return problems.refusal();
+    }
+    let reply: Result<meridian_domain::v1::ReportsUsageSetting, _> = ask(
+        app,
+        caller,
+        page::SET_LICENSED_SCHEMES,
+        "meridian.v1.SetLicensedSchemesRequest",
+        meridian_domain::v1::SetLicensedSchemesRequest {
+            licensed_schemes: schemes,
+            reason,
+        },
+        WAIT,
+    )
+    .await;
+    match reply {
+        Err(failed) => bus_refused(failed, ""),
+        Ok(reply) => json!({"outcome": "made", "data": {
+            "reports_usage": reply.reports_usage,
+            "licensed_schemes": reply.licensed_schemes,
+        }}),
     }
 }
 

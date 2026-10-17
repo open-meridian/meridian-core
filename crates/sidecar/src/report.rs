@@ -182,6 +182,7 @@ impl Sidecar {
         let (refused_grants, last_refusal_reason) =
             self.refusals.lock().expect("refusal lock poisoned").clone();
         let registration = self.registration().filter(|r| !r.departed);
+        let (daily_operations, daily_requests) = self.daily.seven(now_ns);
         PluginReport {
             plugin_instance_id: self.identity.instance_id.clone(),
             roles: self.identity.roles.clone(),
@@ -244,6 +245,9 @@ impl Sidecar {
                 .as_ref()
                 .map(|r| r.tool_refusals.clone())
                 .unwrap_or_default(),
+            // What it carried per UTC day (W5.19, contract v25): counts only.
+            daily_operations,
+            daily_requests,
         }
     }
 }

@@ -61,6 +61,7 @@ pub mod orders;
 pub mod postgres;
 pub mod reads;
 pub mod service;
+pub mod snapshot;
 pub mod store;
 #[rustfmt::skip]
 pub mod transitions;
@@ -71,6 +72,12 @@ mod memory;
 mod order_tests;
 #[cfg(test)]
 mod tests;
+
+/// The test binary's allocator counts what it holds, for the replay
+/// benchmark (contract v25, W9.10).
+#[cfg(test)]
+#[global_allocator]
+static ALLOCATOR: snapshot::tests::Counting = snapshot::tests::Counting;
 
 pub use book::Book;
 pub use memory::MemoryStore;

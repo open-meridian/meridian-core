@@ -51,7 +51,6 @@ use meridian_domain::v1::{
 };
 use meridian_pb::v1::{
     MoveOutcome, PluginFigure, SettingColumnType, SettingDeclaration, SettingType, StoredSpan,
-    ToolDeclaration,
 };
 use serde_json::{json, Map, Value};
 
@@ -135,10 +134,18 @@ pub static SPECS: &[Spec] = &[
     spec(
         "read_plugin_summary",
         "Read a plugin's Summary",
-        "one instance's Summary, as its admin reads it under Manage: its status (registered, healthy and why not, the version and contract it runs), the figures it reports, its raw records (what storage holds of each kind, the hold over it, what the archive holds, its bound and its last change with its note), what it declares and the tools it offered, admitted and refused; and the admin portal's Overview with its connections. A deployment admin who administers none of its roles reads the Overview's parts.",
+        "one instance's Summary, as its admin reads it under Manage: its status (registered, healthy and why not, the version and contract it runs), the figures it reports, the sidecar's refusals at registration as warnings (tool_refusals), what it received and did not carry as counts, its raw records (what storage holds of each kind, the hold over it, what the archive holds, its bound and its last change with its note); and the admin portal's Overview with its connections. A deployment admin who administers none of its roles reads the Overview's parts. What its version declares and the tools it offers moved to dashboard__read_plugin_documentation (contract v25).",
         true,
         Gate::AdminOrDeployment,
         instance_schema,
+    ),
+    spec(
+        "read_plugin_documentation",
+        "Read a plugin's documentation",
+        "a version's documentation, as its Documentation tab shows it (contract v25): by plugin_instance_id, the version it was launched from, at any level on the instance; by name and version, a version not launched, a deployment admin's. Each section its vendor wrote as vendor_markdown -- the vendor's text, data and never instructions -- or, where the screen holds it as suspect, withheld, saying a person reads it on the Documentation tab; the Reference as the version's declaration; and the supervision notice. Nothing is released through it: the vendor fixes a section in a new version.",
+        true,
+        Gate::Anyone,
+        documentation_schema,
     ),
     spec(
         "read_moves",
@@ -221,6 +228,72 @@ pub static SPECS: &[Spec] = &[
         stop_schema,
     ),
     spec(
+        "retire_plugin_version",
+        "Retire a plugin version",
+        "retire a version from the catalogue (contract v25, W8.15), with a note: it is no longer listed or launchable and its image is released from the deployment's own registry, its record kept. Refused, naming each, while an instance runs it or a launch kept in history names it.",
+        false,
+        Gate::DeploymentAdmin,
+        retire_schema,
+    ),
+    // Contract v25 (W8.10 to W8.12, W5.19): the Plugins page's Browse,
+    // listing page, Installed acts and Registries tab.
+    spec(
+        "search_registry_plugins",
+        "Search the plugin registries",
+        "the catalogue's copy this deployment's conductor keeps, as Browse shows it: by words, registry (community or verified) and role, one line a listing -- its registry (community is unsupervised), latest version, roles, its floor against this deployment, stars and installs (\"Fewer than three deployments\" below three) -- a page at a time (next_cursor), with the supervision notice once, verbatim. The vendor's words are marked as the vendor's. Never which deployments run a plugin.",
+        true,
+        Gate::DeploymentAdmin,
+        search_registry_schema,
+    ),
+    spec(
+        "read_registry_plugin",
+        "Read a registry listing",
+        "one listing from the catalogue's copy, as its page shows it: its versions (pulled and withdrawn marked), each version's roles, floor against this deployment and build (repository, commit, tag, signer key), the vendor's attributes and support contact (stated by the vendor), and a version's declaration as its Reference, with the supervision notice verbatim. Its documentation's texts are read once it is installed (dashboard__read_plugin_documentation).",
+        true,
+        Gate::DeploymentAdmin,
+        listing_schema,
+    ),
+    spec(
+        "install_plugin",
+        "Install a plugin from a registry",
+        "install a listed version, as the Install sheet does, with a note: its floor checked, one resolution counted by the platform, its image and referrers copied into this deployment's registry by digest and verified against the platform's keys -- the listing statement, the provenance, the signer and the declaration -- and recorded with its listing and source registry; any check that fails refuses it, naming the check. Install launches nothing: dashboard__launch_plugin does.",
+        false,
+        Gate::DeploymentAdmin,
+        install_schema,
+    ),
+    spec(
+        "update_plugin",
+        "Update a registry plugin",
+        "move an instance to a newer version from its source registry, or a local version's instance to a listed version of the same plugin, as the Update sheet does, with a note; approved_roles exactly the new version's, refused otherwise. A version asking for more roles than the instance holds is a widening, a deployment admin's to approve, which a person approves at the page; a plugin's admin updates only where the roles are unchanged.",
+        false,
+        Gate::AdminOrDeployment,
+        update_schema,
+    ),
+    spec(
+        "acknowledge_pull",
+        "Keep an instance whose version was pulled",
+        "keep an instance running whose version was pulled from the catalogue, with a note, as the Keep sheet does: the warning ends, its own record kept on the launch. Stopping it is dashboard__stop_plugin.",
+        false,
+        Gate::DeploymentAdmin,
+        acknowledge_schema,
+    ),
+    spec(
+        "read_registries",
+        "Read the registries",
+        "the Registries tab: when the catalogue was last pulled (pulled first with pull_now), whether plugin usage is reported, and the plugin usage reports sent, each its week, its versions' counts and whether the platform received it, a page at a time (next_cursor).",
+        true,
+        Gate::DeploymentAdmin,
+        registries_schema,
+    ),
+    spec(
+        "set_reports_plugin_usage",
+        "Set whether plugin usage is reported",
+        "turn the weekly plugin usage report on or off (reports_plugin_usage), with a note, as the Registries tab does; its own record. The report names no person, account, instrument or local plugin.",
+        false,
+        Gate::DeploymentAdmin,
+        set_usage_schema,
+    ),
+    spec(
         "read_plugin_access",
         "Read who holds access to a plugin",
         "the admin portal's Access tab, read only: the access groups naming the instance, each entry's role and level, the permissions to them, and the user and account groups they join; and, for each of its acts, what agents may do with it (agents_may: may_make, prepare_only or may_not; the ceiling where it caps; each access group's stricter level) and whether it needs a second pair of eyes (contract v20); and each role's runs_as, the service account its autonomous work runs as and the level, or none (contract v21). No tool changes who holds access, sets a level, or chooses what a role runs as.",
@@ -258,6 +331,101 @@ fn instance_schema() -> Value {
         "type": "object",
         "properties": {"plugin_instance_id": {"type": "string"}},
         "required": ["plugin_instance_id"],
+        "additionalProperties": false,
+    })
+}
+
+fn documentation_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "plugin_instance_id": {"type": "string", "description": "an instance: its launched version's documentation"},
+            "name": {"type": "string", "description": "with version, a version not launched (a deployment admin's)"},
+            "version": {"type": "string"},
+        },
+        "additionalProperties": false,
+    })
+}
+
+fn search_registry_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "search": {"type": "string"},
+            "registry": {"type": "string", "enum": ["", "community", "verified"]},
+            "role": {"type": "string"},
+            "cursor": {"type": "string", "description": "next_cursor from the page before"},
+        },
+        "additionalProperties": false,
+    })
+}
+
+fn listing_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "listing": {"type": "string", "description": "organisation/plugin"},
+            "version": {"type": "string", "description": "the version whose Reference to answer; its latest otherwise"},
+        },
+        "required": ["listing"],
+        "additionalProperties": false,
+    })
+}
+
+fn install_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "listing": {"type": "string"},
+            "version": {"type": "string"},
+            "registry": {"type": "string", "enum": ["community", "verified"]},
+            "note": note_schema(),
+        },
+        "required": ["listing", "version", "registry", "note"],
+        "additionalProperties": false,
+    })
+}
+
+fn update_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "instance_id": {"type": "string"},
+            "listing": {"type": "string"},
+            "version": {"type": "string"},
+            "approved_roles": {"type": "array", "items": {"type": "string"}},
+            "note": note_schema(),
+        },
+        "required": ["instance_id", "listing", "version", "approved_roles", "note"],
+        "additionalProperties": false,
+    })
+}
+
+fn acknowledge_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {"instance_id": {"type": "string"}, "note": note_schema()},
+        "required": ["instance_id", "note"],
+        "additionalProperties": false,
+    })
+}
+
+fn registries_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "pull_now": {"type": "boolean"},
+            "cursor": {"type": "string"},
+        },
+        "additionalProperties": false,
+    })
+}
+
+fn set_usage_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {"reports_plugin_usage": {"type": "boolean"}, "note": note_schema()},
+        "required": ["reports_plugin_usage", "note"],
         "additionalProperties": false,
     })
 }
@@ -352,6 +520,19 @@ fn launch_schema() -> Value {
 
 fn stop_schema() -> Value {
     withdraw_archive_schema()
+}
+
+fn retire_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "version": {"type": "string"},
+            "note": note_schema(),
+        },
+        "required": ["name", "version", "note"],
+        "additionalProperties": false,
+    })
 }
 
 // ── Answers as JSON: each row's message by its own field names ──────────
@@ -471,6 +652,59 @@ fn version_json(version: &PluginVersion) -> Value {
         "image_digest": version.image_digest,
         "uploaded_by": version.uploaded_by,
         "uploaded_at_ns": version.uploaded_at_ns,
+        "uploaded_note": others_words(&version.uploaded_note),
+        // Contract v25 (W8.10, W8.15): where it came from, and a retirement.
+        "source_registry": version.source_registry,
+        "listing": version.listing,
+        "key_status_issued_at_ns": version.key_status_issued_at_ns,
+        "retired_by": version.retired_by,
+        "retired_at_ns": version.retired_at_ns,
+        "retired_note": others_words(&version.retired_note),
+    })
+}
+
+fn pull_json(pull: &meridian_domain::v1::PluginPull) -> Value {
+    json!({
+        "listing": pull.listing,
+        "version": pull.version,
+        "kind": enum_or_null(meridian_domain::v1::PullReasonKind::try_from(pull.kind).ok().map(|k| k.as_str_name())),
+        "reason": others_words(&pull.reason),
+        "pulled_at_ns": pull.pulled_at_ns,
+        "restored_at_ns": pull.restored_at_ns,
+    })
+}
+
+/// One line of Browse (the spec's requirement 50).
+fn listing_line_json(listing: &meridian_domain::v1::PluginListing) -> Value {
+    let best = crate::registry::latest(listing);
+    json!({
+        "listing": listing.listing,
+        "registry": best.map(|v| v.registry.clone()),
+        "label": best.map(|v| crate::registry::registry_label(&v.registry)),
+        "latest_version": best.map(|v| v.version.clone()),
+        "roles": best.and_then(|v| v.metadata.as_ref()).map(|m| m.roles.clone()).unwrap_or_default(),
+        "floor": best.map(|v| v.schema_version.clone()),
+        "floor_served_here": best.map(|v| crate::registry::floor_mark(v).0),
+        "stars": listing.stars,
+        "installs": crate::registry::installs(listing),
+    })
+}
+
+fn listed_version_json(version: &meridian_domain::v1::ListedVersion) -> Value {
+    let build = version.build.clone().unwrap_or_default();
+    json!({
+        "version": version.version,
+        "registry": version.registry,
+        "label": crate::registry::registry_label(&version.registry),
+        "image_digest": version.image_digest,
+        "roles": version.metadata.as_ref().map(|m| m.roles.clone()).unwrap_or_default(),
+        "approved_roles": version.approved_roles,
+        "floor": version.schema_version,
+        "floor_served_here": crate::registry::floor_mark(version).0,
+        "build": {"repository": build.repository, "commit": build.commit, "tag": build.tag, "signer_key": build.signer_fingerprint},
+        "listed_at_ns": version.listed_at_ns,
+        "withdrawn": version.withdrawn_at_ns != 0,
+        "pull": version.pull.as_ref().filter(|p| p.restored_at_ns == 0).map(pull_json),
     })
 }
 
@@ -496,17 +730,6 @@ fn figure_json(figure: &PluginFigure) -> Value {
         None => {}
     }
     out
-}
-
-fn tool_json(tool: &ToolDeclaration) -> Value {
-    json!({
-        "name": tool.name,
-        "title": others_words(&tool.title),
-        "description": others_words(&tool.description),
-        "levels": tool.levels.iter().map(|l| level_json(*l)).collect::<Vec<_>>(),
-        "reads": tool.reads,
-        "roles": tool.roles,
-    })
 }
 
 fn last_change_json(change: &SettingLastChange) -> Value {
@@ -789,6 +1012,7 @@ pub async fn call(app: &App, caller: &Caller, spec: &Spec, arguments: Value) -> 
     match spec.name {
         "list_plugins" => at.list_plugins(&arguments).await,
         "read_plugin_summary" => at.read_plugin_summary(&arguments).await,
+        "read_plugin_documentation" => at.read_plugin_documentation(&arguments).await,
         "read_moves" => at.read_moves(&arguments).await,
         "read_plugin_settings" => at.read_plugin_settings(&arguments).await,
         "set_plugin_settings" => at.set_plugin_settings(&arguments).await,
@@ -799,6 +1023,14 @@ pub async fn call(app: &App, caller: &Caller, spec: &Spec, arguments: Value) -> 
         "read_plugin_catalogue" => at.read_plugin_catalogue(&arguments).await,
         "launch_plugin" => at.launch_plugin(&arguments).await,
         "stop_plugin" => at.stop_plugin(&arguments).await,
+        "retire_plugin_version" => at.retire_plugin_version(&arguments).await,
+        "search_registry_plugins" => at.search_registry_plugins(&arguments).await,
+        "read_registry_plugin" => at.read_registry_plugin(&arguments).await,
+        "install_plugin" => at.install_plugin(&arguments).await,
+        "update_plugin" => at.update_plugin(&arguments).await,
+        "acknowledge_pull" => at.acknowledge_pull(&arguments).await,
+        "read_registries" => at.read_registries(&arguments).await,
+        "set_reports_plugin_usage" => at.set_reports_plugin_usage(&arguments).await,
         "read_plugin_access" => at.read_plugin_access(&arguments).await,
         "read_linkable_accounts" => at.read_linkable_accounts(&arguments),
         other => (
@@ -944,6 +1176,159 @@ impl Context<'_> {
         )
     }
 
+    /// W6.20 (contract v25): a version's documentation, as its tab shows it.
+    async fn read_plugin_documentation(&self, arguments: &Value) -> (Value, String) {
+        let mut problems = Problems::default();
+        let Some(top) = top(
+            arguments,
+            &["plugin_instance_id", "name", "version"],
+            &mut problems,
+        ) else {
+            return (problems.refusal(), String::new());
+        };
+        let instance = text(top, "plugin_instance_id", "", false, &mut problems);
+        let name = text(top, "name", "", false, &mut problems);
+        let version = text(top, "version", "", false, &mut problems);
+        if !problems.is_empty() {
+            return (problems.refusal(), String::new());
+        }
+        let catalogue = match crate::catalogue::catalogue(self.app).await {
+            Ok(catalogue) => catalogue,
+            Err(failed) => return (refused("unavailable", &failed, Vec::new()), String::new()),
+        };
+        let (name, version, level) = if !instance.is_empty() {
+            if !name.is_empty() || !version.is_empty() {
+                problems.add("name", "plugin_instance_id, or name and version: not both");
+                return (problems.refusal(), String::new());
+            }
+            // The tab's gate: any level on the instance, or a deployment
+            // admin.
+            let held = self.access.plugin(&instance);
+            let level = if self.access.deployment_admin && self.known.contains(&instance) {
+                "deployment admin".to_string()
+            } else if let Some(level) = held.union().levels().first() {
+                format!("{} on {instance}", meridian_access::level_name(*level))
+            } else {
+                let reaches = reached(Gate::Anyone, self.access, self.known);
+                return (
+                    refused(
+                        "not_listed",
+                        &format!(
+                            "This delegation holds nothing on {instance}. Through it the tool reaches: {}.",
+                            said_list(&reaches)
+                        ),
+                        vec![json!({"path": "plugin_instance_id"})],
+                    ),
+                    String::new(),
+                );
+            };
+            let Some(launch) = catalogue
+                .launches
+                .iter()
+                .filter(|launch| launch.instance_id == instance)
+                .max_by_key(|launch| {
+                    (
+                        launch.state == PluginLaunchState::Launched as i32,
+                        launch.launched_at_ns,
+                    )
+                })
+            else {
+                return (
+                    refused(
+                        "not_listed",
+                        &format!("{instance} was not launched from the catalogue, so no version's documentation is known"),
+                        vec![json!({"path": "plugin_instance_id"})],
+                    ),
+                    level,
+                );
+            };
+            (launch.name.clone(), launch.version.clone(), level)
+        } else {
+            if name.is_empty() || version.is_empty() {
+                problems.add(
+                    if name.is_empty() { "name" } else { "version" },
+                    "plugin_instance_id, or name and version",
+                );
+                return (problems.refusal(), String::new());
+            }
+            if !self.access.deployment_admin {
+                return (
+                    refused(
+                        "not_listed",
+                        "a version not launched is read by name and version only through a delegation covering the deployment admin's capabilities; by plugin_instance_id, an instance's",
+                        vec![json!({"path": "name"})],
+                    ),
+                    String::new(),
+                );
+            }
+            (name, version, DEPLOYMENT_ADMIN.to_string())
+        };
+        let reply =
+            match crate::documentation::read(self.app, &self.caller.subject, &name, &version).await
+            {
+                Ok(reply) => reply,
+                Err(failed) => {
+                    return (
+                        refused("not_listed", &failed, vec![json!({"path": "name"})]),
+                        level,
+                    )
+                }
+            };
+        let sections: Vec<Value> = crate::documentation::SECTIONS
+            .iter()
+            .filter_map(|(key, _)| reply.documentation.iter().find(|text| text.section == *key))
+            .map(|text| {
+                let screened = crate::documentation::screen(&text.markdown);
+                if screened.suspect() {
+                    json!({
+                        "section": text.section,
+                        "withheld": format!(
+                            "withheld: {}; a person reads it on the Documentation tab",
+                            screened.why()
+                        ),
+                    })
+                } else {
+                    json!({"section": text.section, "vendor_markdown": text.markdown})
+                }
+            })
+            .collect();
+        let reference = reply.declaration.as_ref().map_or(Value::Null, |declared| {
+            let mut said = crate::declaration::to_json(declared);
+            others_json(&mut said);
+            said
+        });
+        let held = catalogue.versions.iter().find(|v| {
+            v.metadata
+                .as_ref()
+                .is_some_and(|m| m.name == name && m.version == version)
+        });
+        let roles = held
+            .and_then(|v| v.metadata.as_ref())
+            .map(|m| m.roles.clone())
+            .unwrap_or_default();
+        let uploaded_note = held.map_or("", |v| v.uploaded_note.as_str());
+        let page = if instance.is_empty() {
+            crate::documentation::version_path(&name, &version)
+        } else {
+            format!("/plugins/{instance}?tab={}", crate::documentation::TAB)
+        };
+        (
+            json!({"outcome": "unchanged", "data": {
+                "name": name,
+                "version": version,
+                "roles": roles,
+                "uploaded_by": reply.uploaded_by,
+                "uploaded_at_ns": reply.uploaded_at_ns,
+                "uploaded_note": others_words(uploaded_note),
+                "notice": crate::notice::markdown(),
+                "sections": sections,
+                "reference": reference,
+                "page": page,
+            }}),
+            level,
+        )
+    }
+
     async fn read_plugin_summary(&self, arguments: &Value) -> (Value, String) {
         let mut problems = Problems::default();
         let Some(top) = top(arguments, &["plugin_instance_id"], &mut problems) else {
@@ -1020,25 +1405,10 @@ impl Context<'_> {
                 .map(figure_json)
                 .collect::<Vec<_>>()
                 .into();
-            data["declaration"] = report_or
-                .declaration
-                .as_ref()
-                .map(|declared| {
-                    let mut said = crate::declaration::to_json(declared);
-                    others_json(&mut said);
-                    said
-                })
-                .unwrap_or(Value::Null);
             data["not_carried_seen"] = report_or
                 .not_carried_seen
                 .iter()
                 .map(|seen| json!({"scheme": others_words(&seen.scheme), "name": others_words(&seen.name), "count": seen.count}))
-                .collect::<Vec<_>>()
-                .into();
-            data["declared_tools"] = report_or
-                .declared_tools
-                .iter()
-                .map(tool_json)
                 .collect::<Vec<_>>()
                 .into();
             data["tool_refusals"] = report_or
@@ -1663,6 +2033,390 @@ impl Context<'_> {
         }
     }
 
+    /// W8.15 (contract v25): a version retired, with its note.
+    async fn search_registry_plugins(&self, arguments: &Value) -> (Value, String) {
+        let mut problems = Problems::default();
+        let Some(top) = top(
+            arguments,
+            &["search", "registry", "role", "cursor"],
+            &mut problems,
+        ) else {
+            return (problems.refusal(), DEPLOYMENT_ADMIN.into());
+        };
+        let request = meridian_domain::v1::ListRegistryPluginsRequest {
+            search: text(top, "search", "", false, &mut problems),
+            registry: text(top, "registry", "", false, &mut problems),
+            role: text(top, "role", "", false, &mut problems),
+            cursor: text(top, "cursor", "", false, &mut problems),
+            page_size: 50,
+            ..Default::default()
+        };
+        if !problems.is_empty() {
+            return (problems.refusal(), DEPLOYMENT_ADMIN.into());
+        }
+        match crate::registry::listings(self.app, &self.caller.subject, request).await {
+            Ok(reply) => (
+                json!({"outcome": "unchanged", "data": {
+                    "notice": crate::notice::markdown(),
+                    "listings": reply.listings.iter().map(listing_line_json).collect::<Vec<_>>(),
+                    "next_cursor": reply.next_cursor,
+                    "catalogue_pulled_at_ns": reply.catalogue_pulled_at_ns,
+                }}),
+                DEPLOYMENT_ADMIN.into(),
+            ),
+            Err(failed) => (
+                refused("unavailable", &failed, Vec::new()),
+                DEPLOYMENT_ADMIN.into(),
+            ),
+        }
+    }
+
+    async fn read_registry_plugin(&self, arguments: &Value) -> (Value, String) {
+        let mut problems = Problems::default();
+        let Some(top) = top(arguments, &["listing", "version"], &mut problems) else {
+            return (problems.refusal(), DEPLOYMENT_ADMIN.into());
+        };
+        let listing = text(top, "listing", "", true, &mut problems);
+        let version = text(top, "version", "", false, &mut problems);
+        if !problems.is_empty() {
+            return (problems.refusal(), DEPLOYMENT_ADMIN.into());
+        }
+        let request = meridian_domain::v1::ListRegistryPluginsRequest {
+            listing: listing.clone(),
+            ..Default::default()
+        };
+        let held = match crate::registry::listings(self.app, &self.caller.subject, request).await {
+            Ok(reply) => reply.listings.into_iter().next(),
+            Err(failed) => {
+                return (
+                    refused("unavailable", &failed, Vec::new()),
+                    DEPLOYMENT_ADMIN.into(),
+                )
+            }
+        };
+        let Some(held) = held else {
+            return (
+                refused(
+                    "not_listed",
+                    &format!("No listing {listing} is in the catalogue this deployment holds."),
+                    vec![json!({"path": "listing"})],
+                ),
+                DEPLOYMENT_ADMIN.into(),
+            );
+        };
+        let chosen = held
+            .versions
+            .iter()
+            .find(|v| !version.is_empty() && v.version == version)
+            .or_else(|| crate::registry::latest(&held));
+        (
+            json!({"outcome": "unchanged", "data": {
+                "notice": crate::notice::markdown(),
+                "listing": listing_line_json(&held),
+                "vendor": {
+                    "stated_by": "vendor",
+                    "regions": held.regions.iter().map(|r| others_words(r)).collect::<Vec<_>>(),
+                    "asset_classes": held.asset_classes.iter().map(|a| others_words(a)).collect::<Vec<_>>(),
+                    "support_contact": others_words(&held.support_contact),
+                },
+                "repository": held.repository,
+                "versions": held.versions.iter().map(listed_version_json).collect::<Vec<_>>(),
+                "reference": chosen.and_then(|v| v.metadata.as_ref()).and_then(|m| m.declaration.as_ref()).map(|declared| {
+                    let mut said = crate::declaration::to_json(declared);
+                    others_json(&mut said);
+                    said
+                }),
+                "reference_version": chosen.map(|v| v.version.clone()),
+            }}),
+            DEPLOYMENT_ADMIN.into(),
+        )
+    }
+
+    async fn install_plugin(&self, arguments: &Value) -> (Value, String) {
+        let mut problems = Problems::default();
+        let Some(top) = top(
+            arguments,
+            &["listing", "version", "registry", "note"],
+            &mut problems,
+        ) else {
+            return (problems.refusal(), DEPLOYMENT_ADMIN.into());
+        };
+        let request = meridian_domain::v1::InstallPluginRequest {
+            listing: text(top, "listing", "", true, &mut problems),
+            version: text(top, "version", "", true, &mut problems),
+            registry: text(top, "registry", "", true, &mut problems),
+            note: text(top, "note", "", true, &mut problems),
+        };
+        if !problems.is_empty() {
+            return (problems.refusal(), DEPLOYMENT_ADMIN.into());
+        }
+        match self
+            .deployment_act::<PluginVersion>(
+                crate::registry::INSTALL_PLUGIN,
+                "meridian.v1.InstallPluginRequest",
+                request,
+                crate::registry::INSTALLING,
+            )
+            .await
+        {
+            Ok(version) => (
+                json!({"outcome": "made", "data": version_json(&version)}),
+                DEPLOYMENT_ADMIN.into(),
+            ),
+            Err(refusal) => (refusal, DEPLOYMENT_ADMIN.into()),
+        }
+    }
+
+    async fn update_plugin(&self, arguments: &Value) -> (Value, String) {
+        let mut problems = Problems::default();
+        let Some(top) = top(
+            arguments,
+            &[
+                "instance_id",
+                "listing",
+                "version",
+                "approved_roles",
+                "note",
+            ],
+            &mut problems,
+        ) else {
+            return (problems.refusal(), String::new());
+        };
+        let note = text(top, "note", "", true, &mut problems);
+        let listing = text(top, "listing", "", true, &mut problems);
+        let version = text(top, "version", "", true, &mut problems);
+        let approved: Vec<String> = match top.get("approved_roles") {
+            Some(Value::Array(items)) => items
+                .iter()
+                .filter_map(|item| item.as_str().map(String::from))
+                .collect(),
+            _ => {
+                problems.add(
+                    "approved_roles",
+                    "a list of the roles approved, exactly the new version's",
+                );
+                Vec::new()
+            }
+        };
+        let Some((instance, level)) = self.instance(top, "instance_id", &mut problems) else {
+            return (problems.refusal(), String::new());
+        };
+        if !problems.is_empty() {
+            return (problems.refusal(), level);
+        }
+        // A plugin's admin updates where the roles are unchanged; a widening
+        // is a deployment admin's (sdk-contract/a-plugin-has-admins point 6).
+        if !self.access.deployment_admin {
+            let running = crate::catalogue::catalogue(self.app)
+                .await
+                .ok()
+                .and_then(|held| {
+                    held.launches.into_iter().find(|l| {
+                        l.instance_id == instance && l.state == PluginLaunchState::Launched as i32
+                    })
+                });
+            let unchanged = running.is_some_and(|launch| {
+                let mut now = launch.roles.clone();
+                let mut asked = approved.clone();
+                now.sort();
+                asked.sort();
+                now == asked
+            });
+            if !unchanged {
+                return (
+                    refused(
+                        "not_listed",
+                        "the new version asks for roles other than the instance holds: a widening is a deployment admin's to approve, at the page",
+                        vec![json!({"path": "approved_roles"})],
+                    ),
+                    level,
+                );
+            }
+        }
+        match self
+            .deployment_act::<PluginLaunch>(
+                crate::registry::UPDATE_PLUGIN,
+                "meridian.v1.UpdatePluginRequest",
+                meridian_domain::v1::UpdatePluginRequest {
+                    instance_id: instance,
+                    listing,
+                    version,
+                    approved_roles: approved,
+                    note,
+                },
+                crate::registry::INSTALLING,
+            )
+            .await
+        {
+            Ok(launch) => (
+                json!({"outcome": "made", "data": launch_json(&launch)}),
+                level,
+            ),
+            Err(refusal) => (refusal, level),
+        }
+    }
+
+    async fn acknowledge_pull(&self, arguments: &Value) -> (Value, String) {
+        let mut problems = Problems::default();
+        let Some(top) = top(arguments, &["instance_id", "note"], &mut problems) else {
+            return (problems.refusal(), DEPLOYMENT_ADMIN.into());
+        };
+        let note = text(top, "note", "", true, &mut problems);
+        let Some((instance, level)) = self.instance(top, "instance_id", &mut problems) else {
+            return (problems.refusal(), DEPLOYMENT_ADMIN.into());
+        };
+        if !problems.is_empty() {
+            return (problems.refusal(), level);
+        }
+        match self
+            .deployment_act::<meridian_domain::v1::PullAcknowledgement>(
+                crate::registry::ACKNOWLEDGE_PULL,
+                "meridian.v1.AcknowledgePullRequest",
+                meridian_domain::v1::AcknowledgePullRequest {
+                    instance_id: instance,
+                    note,
+                },
+                WAIT,
+            )
+            .await
+        {
+            Ok(kept) => (
+                json!({"outcome": "made", "data": {
+                    "acknowledged_by": kept.acknowledged_by,
+                    "acknowledged_at_ns": kept.acknowledged_at_ns,
+                    "note": others_words(&kept.note),
+                    "pull": kept.pull.as_ref().map(pull_json),
+                }}),
+                level,
+            ),
+            Err(refusal) => (refusal, level),
+        }
+    }
+
+    async fn read_registries(&self, arguments: &Value) -> (Value, String) {
+        let mut problems = Problems::default();
+        let Some(top) = top(arguments, &["pull_now", "cursor"], &mut problems) else {
+            return (problems.refusal(), DEPLOYMENT_ADMIN.into());
+        };
+        let pull_now = boolean(top, "pull_now", &mut problems);
+        let cursor = text(top, "cursor", "", false, &mut problems);
+        if !problems.is_empty() {
+            return (problems.refusal(), DEPLOYMENT_ADMIN.into());
+        }
+        if pull_now {
+            if let Err(failed) = crate::registry::listings(
+                self.app,
+                &self.caller.subject,
+                meridian_domain::v1::ListRegistryPluginsRequest {
+                    pull_now: true,
+                    page_size: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            {
+                return (
+                    refused("unavailable", &failed, Vec::new()),
+                    DEPLOYMENT_ADMIN.into(),
+                );
+            }
+        }
+        match crate::registry::reports(self.app, &self.caller.subject, &cursor).await {
+            Ok(held) => (
+                json!({"outcome": "unchanged", "data": {
+                    "catalogue_pulled_at_ns": held.catalogue_pulled_at_ns,
+                    "reports_plugin_usage": held.reports_plugin_usage,
+                    "reports": held.reports.iter().map(|sent| {
+                        let report = sent.report.clone().unwrap_or_default();
+                        json!({
+                            "sent_at_ns": sent.sent_at_ns,
+                            "received": sent.received,
+                            "period_start": report.period_start,
+                            "period_end": report.period_end,
+                            "counts": report.counts.iter().map(|c| json!({
+                                "listing": c.listing, "version": c.version, "registry": c.registry,
+                                "instances": c.instances, "people_read": c.people_read,
+                                "people_write": c.people_write, "people_admin": c.people_admin,
+                                "daily_operations": c.daily_operations, "daily_requests": c.daily_requests,
+                            })).collect::<Vec<_>>(),
+                        })
+                    }).collect::<Vec<_>>(),
+                    "next_cursor": held.next_cursor,
+                }}),
+                DEPLOYMENT_ADMIN.into(),
+            ),
+            Err(failed) => (
+                refused("unavailable", &failed, Vec::new()),
+                DEPLOYMENT_ADMIN.into(),
+            ),
+        }
+    }
+
+    async fn set_reports_plugin_usage(&self, arguments: &Value) -> (Value, String) {
+        let mut problems = Problems::default();
+        let Some(top) = top(arguments, &["reports_plugin_usage", "note"], &mut problems) else {
+            return (problems.refusal(), DEPLOYMENT_ADMIN.into());
+        };
+        if !matches!(top.get("reports_plugin_usage"), Some(Value::Bool(_))) {
+            problems.add("reports_plugin_usage", "true or false");
+        }
+        let on = boolean(top, "reports_plugin_usage", &mut problems);
+        let note = text(top, "note", "", true, &mut problems);
+        if !problems.is_empty() {
+            return (problems.refusal(), DEPLOYMENT_ADMIN.into());
+        }
+        match self
+            .deployment_act::<meridian_domain::v1::ReportsPluginUsageSetting>(
+                crate::registry::SET_REPORTS_PLUGIN_USAGE,
+                "meridian.v1.SetReportsPluginUsageRequest",
+                meridian_domain::v1::SetReportsPluginUsageRequest {
+                    reports_plugin_usage: on,
+                    reason: note,
+                },
+                WAIT,
+            )
+            .await
+        {
+            Ok(set) => (
+                json!({"outcome": "made", "data": {"reports_plugin_usage": set.reports_plugin_usage}}),
+                DEPLOYMENT_ADMIN.into(),
+            ),
+            Err(refusal) => (refusal, DEPLOYMENT_ADMIN.into()),
+        }
+    }
+
+    async fn retire_plugin_version(&self, arguments: &Value) -> (Value, String) {
+        let mut problems = Problems::default();
+        let Some(top) = top(arguments, &["name", "version", "note"], &mut problems) else {
+            return (problems.refusal(), DEPLOYMENT_ADMIN.into());
+        };
+        let name = text(top, "name", "", true, &mut problems);
+        let version = text(top, "version", "", true, &mut problems);
+        let note = text(top, "note", "", true, &mut problems);
+        if !problems.is_empty() {
+            return (problems.refusal(), DEPLOYMENT_ADMIN.into());
+        }
+        match self
+            .deployment_act::<PluginVersion>(
+                crate::catalogue::RETIRE_PLUGIN_VERSION,
+                "meridian.v1.RetirePluginVersionRequest",
+                meridian_domain::v1::RetirePluginVersionRequest {
+                    name,
+                    version,
+                    note,
+                },
+                RESTARTING,
+            )
+            .await
+        {
+            Ok(version) => (
+                json!({"outcome": "made", "data": version_json(&version)}),
+                DEPLOYMENT_ADMIN.into(),
+            ),
+            Err(refusal) => (refusal, DEPLOYMENT_ADMIN.into()),
+        }
+    }
+
     /// The Access tab, read only: the records naming the instance, by their
     /// own fields (AccessRecords). Nothing here changes any of it.
     fn read_linkable_accounts(&self, arguments: &Value) -> (Value, String) {
@@ -1876,8 +2630,9 @@ pub const PARITY: &[(&str, &str)] = &[
     ("part setting-up", "read_plugin_summary"),
     ("part records", "read_plugin_summary"),
     ("part moves", "read_moves"),
-    ("part declared", "read_plugin_summary"),
-    ("part tools", "read_plugin_summary"),
+    // Contract v25: the Documentation tab at every level, and the
+    // portal's versions list and a version's page.
+    ("tab documentation", "read_plugin_documentation"),
     // The admin portal's view of the instance.
     ("view overview", "read_plugin_summary"),
     ("view settings", "read_plugin_settings set_plugin_settings"),
@@ -1925,7 +2680,33 @@ pub const PARITY: &[(&str, &str)] = &[
         "read_plugin_catalogue; exception: upload stays the CLI's (the plan's Q2)",
     ),
     ("/terminal/plugins/launch", "launch_plugin"),
+    ("/admin/plugins/versions", "read_plugin_catalogue search_registry_plugins read_registries"),
+    (
+        "/admin/plugins/versions/{name}/{version}/documentation",
+        "read_plugin_documentation",
+    ),
+    (
+        "/admin/plugins/versions/{organisation}/{plugin}/{version}/documentation",
+        "read_plugin_documentation",
+    ),
+    // Contract v25 (W8.10 to W8.12, W5.19): Browse, a listing's page, its
+    // sheets and their acts, the Registries tab's.
+    (
+        "/admin/plugins/registry/{organisation}/{plugin}",
+        "read_registry_plugin",
+    ),
+    (
+        "/admin/plugins/registry/{organisation}/{plugin}/install",
+        "read_registry_plugin install_plugin",
+    ),
+    ("/admin/plugins/registry/install", "install_plugin"),
+    ("/admin/plugins/registry/update", "update_plugin"),
+    ("/admin/plugins/registry/acknowledge", "acknowledge_pull"),
+    ("/admin/plugins/registry/pull", "read_registries"),
+    ("/admin/plugins/registry/usage", "set_reports_plugin_usage"),
     ("/terminal/plugins/stop", "stop_plugin"),
+    // Contract v25 (W8.15): the Installed list's Retire.
+    ("retire a version", "retire_plugin_version"),
     (
         "/terminal/plugins/{instance}/dev/{what}",
         "exception: live development, outside the plugin area",

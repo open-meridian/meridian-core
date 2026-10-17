@@ -576,6 +576,7 @@ fn report(now: i64) -> meridian_domain::v1::PluginReport {
                 ],
             }),
             catalogue: None,
+            ..Default::default()
         }),
         stored: vec![
             StoredSpan {
@@ -1005,9 +1006,9 @@ fn connectivity_link<'a>(
 
 /// The platform's ID of the US dollar's cash instrument, which the
 /// stand-in store's US dollar calendar names, and the deployment's record
-/// carrying it beside its ISO 4217 code (contract v23, W3.21).
+/// kept under it beside its ISO 4217 code (contract v23, W3.21; from v24
+/// requirement 19).
 const PLATFORM_USD: &str = "INS-01JUSD0000000000000000001";
-const LOCAL_USD: &str = "LCL-01JUSD0000000000000000001";
 
 /// The calendars the stand-in instrument store holds: three seed calendars,
 /// each with its subject (contract v23), and the US equities rule, and
@@ -1299,6 +1300,7 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
             "".into(),
             meridian_domain::v1::ListUsageReportsReply {
                 reports_usage: true,
+                licensed_schemes: vec!["cusip".into()],
                 reports: vec![meridian_domain::v1::SentUsageReport {
                     sent_at_ns: 1_791_417_600_000_000_000,
                     received: true,
@@ -1325,6 +1327,7 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
             "".into(),
             meridian_domain::v1::ReportsUsageSetting {
                 reports_usage: asked.reports_usage,
+                licensed_schemes: Vec::new(),
             }
             .encode_to_vec(),
         ))
@@ -1390,24 +1393,17 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
                 .filter(wanted)
                 .map(instrument_listed)
                 .collect();
-            // The US dollar's record, kept from the platform's under the
-            // deployment's own ID (contract v20), found by the platform's.
+            // The US dollar's record, kept under the platform's `INS-` ID
+            // (contract v24, requirement 19), found by it.
             if !search.is_empty() && PLATFORM_USD.to_lowercase().contains(&search) {
                 instruments.push(InstrumentToComplete {
                     instrument: Some(InstrumentRecord {
-                        instrument_id: LOCAL_USD.into(),
-                        identifiers: vec![
-                            Identifier {
-                                scheme: "iso4217".into(),
-                                value: "USD".into(),
-                                ..Default::default()
-                            },
-                            Identifier {
-                                scheme: "open_meridian".into(),
-                                value: PLATFORM_USD.into(),
-                                ..Default::default()
-                            },
-                        ],
+                        instrument_id: PLATFORM_USD.into(),
+                        identifiers: vec![Identifier {
+                            scheme: "iso4217".into(),
+                            value: "USD".into(),
+                            ..Default::default()
+                        }],
                         asset_class: meridian_domain::v1::AssetClass::Cash as i32,
                         currency: "USD".into(),
                         description: "US dollar".into(),
@@ -1475,6 +1471,34 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
         let asked = meridian_domain::v1::ListCalendarsRequest::decode(&envelope.payload[..])
             .map_err(|e| e.to_string())?;
         Ok(("".into(), held_calendars(&asked).encode_to_vec()))
+    });
+    // Contract v25 (D9): a calendar's venue read by its ID, shown by its MIC.
+    bus.serve(crate::admin::calendars::RESOLVE_VENUE, |envelope| {
+        let asked = meridian_domain::v1::ResolveVenueRequest::decode(&envelope.payload[..])
+            .map_err(|e| e.to_string())?;
+        let (mic, name) = match asked.venue_id.as_str() {
+            "VEN-01JAE00000000000000XNYS" => ("XNYS", "New York Stock Exchange"),
+            "VEN-01JAE00000000000000XNAS" => ("XNAS", "Nasdaq"),
+            _ => ("", ""),
+        };
+        Ok((
+            "".into(),
+            meridian_domain::v1::ResolveVenueReply {
+                found: !mic.is_empty(),
+                venue: (!mic.is_empty()).then(|| meridian_domain::v1::VenueRecord {
+                    venue_id: asked.venue_id.clone(),
+                    name: name.into(),
+                    identifiers: vec![meridian_domain::v1::Identifier {
+                        scheme: "iso10383".into(),
+                        value: mic.into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                miss_reason: 0,
+            }
+            .encode_to_vec(),
+        ))
     });
     bus.serve(crate::admin::calendars::READ_CALENDAR, |envelope| {
         let asked = meridian_domain::v1::ReadCalendarRequest::decode(&envelope.payload[..])
@@ -1706,6 +1730,127 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
             Ok(("".into(), priority.encode_to_vec()))
         });
     }
+
+    // Contract v25: the catalogue holding SnapTrade's version, launched as
+    // INSTANCE, and its documentation as a vendor writes it (the SnapTrade
+    // draft's shape: headings, lists, a table, outside links), for the
+    // Documentation tab, the versions list and a version's page.
+    bus.serve(crate::catalogue::PLUGIN_CATALOGUE, |_| {
+        let version = |v: &str| meridian_domain::v1::PluginVersion {
+            metadata: Some(meridian_domain::v1::PluginMetadata {
+                name: "snaptrade".into(),
+                version: v.into(),
+                roles: vec!["custody".into()],
+                declaration: Some(documented_declaration()),
+                ..Default::default()
+            }),
+            uploaded_by: ADMIN.into(),
+            uploaded_at_ns: 1_790_380_800_000_000_000,
+            source_registry: "local".into(),
+            ..Default::default()
+        };
+        Ok((
+            "meridian.v1.PluginCatalogue".into(),
+            meridian_domain::v1::PluginCatalogue {
+                versions: (0..14)
+                    .map(|n| version(&format!("0.{n}.0")))
+                    .chain(registry_versions())
+                    .collect(),
+                launches: vec![
+                    meridian_domain::v1::PluginLaunch {
+                        instance_id: INSTANCE.into(),
+                        name: "snaptrade".into(),
+                        version: "0.13.0".into(),
+                        roles: vec!["custody".into()],
+                        state: meridian_domain::v1::PluginLaunchState::Launched as i32,
+                        ..Default::default()
+                    },
+                    // Contract v25: an instance of a listed version, pulled
+                    // since, with an update that widens its roles.
+                    meridian_domain::v1::PluginLaunch {
+                        instance_id: "fx-1".into(),
+                        name: "open-meridian/fx".into(),
+                        version: "1.4.0".into(),
+                        roles: vec!["custody".into()],
+                        state: meridian_domain::v1::PluginLaunchState::Launched as i32,
+                        ..Default::default()
+                    },
+                ],
+            }
+            .encode_to_vec(),
+        ))
+    });
+    // Contract v25 (W8.10 to W8.12, W5.19): the catalogue's copy Browse and
+    // a listing's page read, filtered as the conductor filters it, and the
+    // usage reports sent.
+    bus.serve(crate::registry::REGISTRY_PLUGINS, |envelope| {
+        let asked =
+            meridian_domain::v1::ListRegistryPluginsRequest::decode(&envelope.payload[..]).unwrap();
+        let listings = registry_listings()
+            .into_iter()
+            .filter(|l| asked.listing.is_empty() || l.listing == asked.listing)
+            .filter(|l| asked.search.is_empty() || l.listing.contains(&asked.search))
+            .collect();
+        Ok((
+            "meridian.v1.ListRegistryPluginsReply".into(),
+            meridian_domain::v1::ListRegistryPluginsReply {
+                listings,
+                next_cursor: String::new(),
+                catalogue_pulled_at_ns: 1_792_200_000_000_000_000,
+            }
+            .encode_to_vec(),
+        ))
+    });
+    bus.serve(crate::registry::LIST_PLUGIN_USAGE_REPORTS, |_| {
+        let count =
+            |listing: &str, version: &str, registry: &str| meridian_domain::v1::PluginUsageCount {
+                listing: listing.into(),
+                version: version.into(),
+                registry: registry.into(),
+                instances: 1,
+                people_read: 4,
+                people_write: 2,
+                people_admin: 1,
+                daily_operations: vec![120, 98, 143, 110, 0, 0, 131],
+                daily_requests: vec![40, 31, 52, 38, 0, 0, 44],
+            };
+        let reports = (0..3)
+            .map(|week| meridian_domain::v1::SentPluginUsageReport {
+                sent_at_ns: 1_792_200_000_000_000_000 - week * 604_800_000_000_000,
+                received: week != 1,
+                report: Some(meridian_domain::v1::PluginUsageReport {
+                    period_start: ["2026-10-05", "2026-09-28", "2026-09-21"][week as usize].into(),
+                    period_end: ["2026-10-11", "2026-10-04", "2026-09-27"][week as usize].into(),
+                    counts: vec![
+                        count("open-meridian/fx", "1.4.0", "community"),
+                        count("acme/rates", "2.0.0", "verified"),
+                    ],
+                }),
+            })
+            .collect();
+        Ok((
+            "meridian.v1.ListPluginUsageReportsReply".into(),
+            meridian_domain::v1::ListPluginUsageReportsReply {
+                reports,
+                next_cursor: String::new(),
+                reports_plugin_usage: true,
+                catalogue_pulled_at_ns: 1_792_200_000_000_000_000,
+            }
+            .encode_to_vec(),
+        ))
+    });
+    bus.serve(crate::documentation::READ, |_| {
+        Ok((
+            "meridian.v1.ReadPluginDocumentationReply".into(),
+            meridian_domain::v1::ReadPluginDocumentationReply {
+                declaration: Some(documented_declaration()),
+                documentation: documentation_texts(),
+                uploaded_by: ADMIN.into(),
+                uploaded_at_ns: 1_790_380_800_000_000_000,
+            }
+            .encode_to_vec(),
+        ))
+    });
 
     let kit = crate::kit::Kit::at(
         std::env::var("MERIDIAN_UI_DIR").unwrap_or_else(|_| crate::kit::IN_IMAGE.into()),
@@ -1943,4 +2088,222 @@ fn provisional_listed() -> ListInstrumentsToCompleteReply {
         }),
         ..Default::default()
     }
+}
+
+/// SnapTrade's declaration as its v25 upload carries it.
+fn documented_declaration() -> meridian_pb::v1::PluginDeclaration {
+    meridian_pb::v1::PluginDeclaration {
+        secret_settings: vec!["consumer_key".into()],
+        settings: declared(),
+        interface: Some(meridian_pb::v1::InterfaceDeclaration {
+            loopback_port: 8000,
+            title: "SnapTrade".into(),
+            pages: vec![
+                meridian_pb::v1::PageDeclaration {
+                    path: "/admin/connections".into(),
+                    title: "Connections".into(),
+                    levels: vec![meridian_pb::v1::AccessLevel::Admin as i32],
+                    roles: vec!["custody".into()],
+                },
+                meridian_pb::v1::PageDeclaration {
+                    path: "/statements".into(),
+                    title: "Statements".into(),
+                    levels: vec![
+                        meridian_pb::v1::AccessLevel::Write as i32,
+                        meridian_pb::v1::AccessLevel::Read as i32,
+                    ],
+                    roles: vec!["custody".into()],
+                },
+            ],
+        }),
+        tools: (0..9)
+            .map(|n| meridian_pb::v1::ToolDeclaration {
+                name: format!("read_connection_{n}"),
+                title: format!("Read connection {n}"),
+                description: "Each brokerage connection, its state and when it last read.".into(),
+                reads: n % 3 != 0,
+                levels: vec![meridian_pb::v1::AccessLevel::Admin as i32],
+                roles: vec!["custody".into()],
+                ..Default::default()
+            })
+            .collect(),
+        reads_external_accounts: true,
+        storage: Some(meridian_pb::v1::StorageDeclaration {
+            retention_days: 2555,
+            record_kinds: vec![meridian_pb::v1::RawRecordKind {
+                name: "activity".into(),
+                label: "Reported activity".into(),
+                window_days: 2555,
+                archivable: true,
+            }],
+        }),
+        ..Default::default()
+    }
+}
+
+/// SnapTrade's sections, the draft's shape and length.
+fn documentation_texts() -> Vec<meridian_domain::v1::DocumentationText> {
+    let text = |section: &str, markdown: &str| meridian_domain::v1::DocumentationText {
+        section: section.into(),
+        markdown: markdown.into(),
+    };
+    vec![
+        text(
+            "overview",
+            "# SnapTrade\n\nReads the holdings, balances and activity of brokerage accounts \
+             through [SnapTrade](https://snaptrade.com/), for people who keep their investments \
+             at several brokers.\n\n## What it reads\n\n- Each connection a person makes \
+             through SnapTrade's portal\n- The positions, cash and activity of each account it \
+             reaches\n- **Never** a password: SnapTrade holds the broker sign-in\n\n## What \
+             it records\n\nA statement per account per read, as the custody role records it, \
+             and its raw responses for 30 days. See [Setup](setup.md#before-you-start).",
+        ),
+        text(
+            "setup",
+            "## Before you start\n\nYou need a SnapTrade client ID and consumer key, from \
+             [the dashboard](https://dashboard.snaptrade.com/).\n\n## Enter the keys\n\n1. \
+             Open **Settings**.\n2. Enter the client ID and the consumer key.\n3. Save.\n\n\
+             | Setting | Where it comes from |\n|---|---|\n| Client ID | SnapTrade's dashboard |\n\
+             | Consumer key | SnapTrade's dashboard, shown once |\n\n## Link the accounts\n\n\
+             Each account SnapTrade reaches is listed on **Account links**; link each to one of \
+             this deployment's accounts.",
+        ),
+        text(
+            "troubleshooting",
+            "## A connection needs sign-in\n\nThe broker asked the person to sign in again. \
+             Open **Connections** and choose *Reconnect*.\n\n## Nothing arrives\n\nCheck the \
+             keys on **Settings**; a wrong consumer key reads as `401` in the health line.",
+        ),
+        text(
+            "terms",
+            "SnapTrade's [terms](https://snaptrade.com/terms) and \
+             [privacy policy](https://snaptrade.com/privacy) apply to the data it reads. The \
+             firm carries its own due diligence on SnapTrade as a vendor.",
+        ),
+        text(
+            "pages",
+            "- **Connections**: each connection and its state.\n- **Account links**: link each \
+             account it reaches.\n- **Statements**: what it recorded, per account.",
+        ),
+    ]
+}
+
+/// Contract v25: the versions installed from a registry -- one installed
+/// online from the community registry, one carried in by a bundle from the
+/// verified one, its key status's age shown.
+fn registry_versions() -> Vec<meridian_domain::v1::PluginVersion> {
+    let version = |name: &str, v: &str, registry: &str, key_status_issued_at_ns: i64| {
+        meridian_domain::v1::PluginVersion {
+            metadata: Some(meridian_domain::v1::PluginMetadata {
+                name: name.into(),
+                version: v.into(),
+                roles: vec!["custody".into()],
+                declaration: Some(documented_declaration()),
+                ..Default::default()
+            }),
+            image_digest: format!("sha256:{}", "ab".repeat(32)),
+            uploaded_by: ADMIN.into(),
+            uploaded_at_ns: 1_792_100_000_000_000_000,
+            source_registry: registry.into(),
+            listing: name.into(),
+            key_status_issued_at_ns,
+            ..Default::default()
+        }
+    };
+    vec![
+        version("open-meridian/fx", "1.4.0", "community", 0),
+        version("acme/rates", "2.0.0", "verified", 1_792_000_000_000_000_000),
+    ]
+}
+
+/// Contract v25: the catalogue's copy -- open-meridian/fx with its pulled
+/// 1.4.0 and a 1.5.0 asking a role more, acme/rates verified, and enough
+/// other listings that Browse pages.
+fn registry_listings() -> Vec<meridian_domain::v1::PluginListing> {
+    let listed = |listing: &str, version: &str, registry: &str, roles: &[&str]| {
+        meridian_domain::v1::ListedVersion {
+            listing: listing.into(),
+            version: version.into(),
+            registry: registry.into(),
+            image_digest: format!("sha256:{}", "cd".repeat(32)),
+            metadata: Some(meridian_domain::v1::PluginMetadata {
+                name: listing.rsplit('/').next().unwrap_or_default().into(),
+                version: version.into(),
+                roles: roles.iter().map(|r| r.to_string()).collect(),
+                declaration: Some(documented_declaration()),
+                ..Default::default()
+            }),
+            approved_roles: if registry == "verified" {
+                roles.iter().map(|r| r.to_string()).collect()
+            } else {
+                Vec::new()
+            },
+            schema_version: "v25".into(),
+            build: Some(meridian_domain::v1::PluginBuild {
+                repository: format!("https://github.com/{listing}"),
+                commit: "c".repeat(40),
+                tag: format!("v{version}"),
+                signer_fingerprint: "SHA256:release-key".into(),
+                ..Default::default()
+            }),
+            listed_at_ns: 1_792_000_000_000_000_000,
+            ..Default::default()
+        }
+    };
+    let listing = |name: &str, versions: Vec<meridian_domain::v1::ListedVersion>, stars: u64| {
+        meridian_domain::v1::PluginListing {
+            listing: name.into(),
+            repository: format!("https://github.com/{name}"),
+            versions,
+            regions: vec!["US".into()],
+            asset_classes: vec!["fx".into()],
+            support_contact: "support@example.com".into(),
+            stars,
+            installs: stars * 3,
+            instances: stars * 4,
+            counts_shown: stars >= 3,
+        }
+    };
+    let mut pulled = listed("open-meridian/fx", "1.4.0", "community", &["custody"]);
+    pulled.pull = Some(meridian_domain::v1::PluginPull {
+        listing: "open-meridian/fx".into(),
+        version: "1.4.0".into(),
+        kind: meridian_domain::v1::PullReasonKind::TermsBreach as i32,
+        reason: "It sent account numbers to a host it did not declare.".into(),
+        pulled_at_ns: 1_792_150_000_000_000_000,
+        ..Default::default()
+    });
+    let mut listings = vec![
+        listing(
+            "open-meridian/fx",
+            vec![
+                listed("open-meridian/fx", "1.3.0", "community", &["custody"]),
+                pulled,
+                listed(
+                    "open-meridian/fx",
+                    "1.5.0",
+                    "community",
+                    &["custody", "operations"],
+                ),
+            ],
+            12,
+        ),
+        listing(
+            "acme/rates",
+            vec![
+                listed("acme/rates", "2.0.0", "verified", &["custody"]),
+                listed("acme/rates", "2.1.0", "verified", &["custody"]),
+            ],
+            2,
+        ),
+    ];
+    for n in 0..30 {
+        let name = format!("vendor-{n:02}/plugin-{n:02}");
+        listings.push(listing(
+            &name,
+            vec![listed(&name, "0.1.0", "community", &["custody"])],
+            n,
+        ));
+    }
+    listings
 }

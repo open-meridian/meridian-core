@@ -1802,7 +1802,8 @@ async fn under_manage_the_dashboard_draws_summary_then_settings_opens_on_summary
                 "summary".into(),
                 "settings".into(),
                 "connections".into(),
-                "account-links".into()
+                "account-links".into(),
+                "documentation".into()
             ],
             "summary".into()
         )
@@ -2576,4 +2577,562 @@ fn the_claims_carry_each_roles_level_and_accounts_as_positions() {
         .iter()
         .all(|r| r.level == AccessLevel::Read as i32 && r.write_positions.is_empty()));
     assert!(opening(&access, INSTANCE, AccessLevel::Admin).is_none());
+}
+
+/// The launched version's documentation, as the conductor answers it.
+fn serving_documentation(h: &Harness) {
+    h.app.bus.serve(crate::documentation::READ, |_| {
+        Ok((
+            "meridian.v1.ReadPluginDocumentationReply".into(),
+            meridian_domain::v1::ReadPluginDocumentationReply {
+                declaration: Some(meridian_pb::v1::PluginDeclaration {
+                    tools: vec![meridian_pb::v1::ToolDeclaration {
+                        name: "read_connections".into(),
+                        title: "Read the connections".into(),
+                        reads: true,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                documentation: vec![meridian_domain::v1::DocumentationText {
+                    section: "overview".into(),
+                    markdown: "# SnapTrade\n\nReads <script>alert(1)</script> your accounts. \
+                               ![pixel](https://evil.example/p.png) [Docs](https://docs.snaptrade.com/)"
+                        .into(),
+                }],
+                uploaded_by: ADA.into(),
+                uploaded_at_ns: 1_790_380_800_000_000_000,
+            }
+            .encode_to_vec(),
+        ))
+    });
+}
+
+/// W6.9 (contract v25): the Documentation tab at any level, the vendor's
+/// text drawn safely under the documentation's security policy; and a
+/// stopped instance keeps its area with the dashboard's own tabs alone, its
+/// Summary saying it is stopped.
+#[tokio::test]
+async fn a_reader_reads_the_documentation_tab_and_a_stopped_instance_keeps_its_own_tabs() {
+    let h = harness(&[INSTANCE]).await;
+    let mut held = records(&[INSTANCE, "stopped-1"]);
+    held.access_groups[0].entries[1].level = AccessLevel::Admin as i32;
+    h.app.records.store(held, h.app.clock.now_ns());
+    snaptrade_reporting(&h);
+    serving_launched(&h);
+    serving_documentation(&h);
+
+    let view = get(
+        &h.app,
+        DASHBOARD,
+        &format!("/plugins/{INSTANCE}?level=read&tab=documentation"),
+        &[dashboard_cookie(&h)],
+    )
+    .await;
+    assert_eq!(view.status, StatusCode::OK, "{}", view.body);
+    assert_eq!(tab_row(&view.body).1, "documentation");
+    let policy = view.headers["content-security-policy"].to_str().unwrap();
+    assert!(
+        policy.starts_with("default-src 'self'; script-src 'self' 'sha256-"),
+        "{policy}"
+    );
+    // Every inline script the page carries is one the policy names.
+    for script in view.body.split("<script>").skip(1) {
+        let script = script.split("</script>").next().unwrap();
+        use base64::Engine;
+        use sha2::Digest;
+        let hash = base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(script));
+        assert!(
+            policy.contains(&hash),
+            "an inline script the policy does not name"
+        );
+    }
+    let body = view.body.split("</header>").nth(1).unwrap();
+    assert!(body.contains("<h2>SnapTrade</h2>"), "{body}");
+    assert!(
+        body.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+        "{body}"
+    );
+    assert!(body.contains("[image not shown: pixel]") && !body.contains("evil.example"));
+    assert!(body.contains("(docs.snaptrade.com)"), "{body}");
+    assert!(body.contains("Local and community plugins are unsupervised."));
+    let reference = get(
+        &h.app,
+        DASHBOARD,
+        &format!("/plugins/{INSTANCE}?level=read&tab=documentation&section=reference&part=tools"),
+        &[dashboard_cookie(&h)],
+    )
+    .await;
+    assert!(
+        reference.body.contains("data-tool=\"read_connections\""),
+        "{}",
+        reference.body
+    );
+    // Another tab is not under the documentation's policy.
+    let framed = get(
+        &h.app,
+        DASHBOARD,
+        &format!("/plugins/{INSTANCE}?level=read"),
+        &[dashboard_cookie(&h)],
+    )
+    .await;
+    assert_eq!(
+        framed.headers["content-security-policy"],
+        "frame-ancestors 'self'"
+    );
+
+    // Stopped: Summary, Settings and Documentation, all the dashboard's.
+    let stopped = get(
+        &h.app,
+        DASHBOARD,
+        "/plugins/stopped-1?level=admin",
+        &[dashboard_cookie(&h)],
+    )
+    .await;
+    assert_eq!(stopped.status, StatusCode::OK, "{}", stopped.body);
+    assert_eq!(
+        tab_row(&stopped.body).0,
+        ["summary", "settings", "documentation"]
+    );
+    assert!(stopped.body.contains("data-stopped"), "{}", stopped.body);
+    assert!(!stopped.body.contains("<iframe"), "{}", stopped.body);
+    // An instance the catalogue never launched is still no plugin.
+    let none = get(
+        &h.app,
+        DASHBOARD,
+        "/plugins/never-1?level=read",
+        &[dashboard_cookie(&h)],
+    )
+    .await;
+    assert_ne!(none.status, StatusCode::OK);
+}
+
+/// W8.2 (contract v25): the portal lists every uploaded version, each
+/// linking its Documentation page, readable before a launch; a deployment
+/// admin's alone.
+#[tokio::test]
+async fn a_deployment_admin_reads_a_versions_documentation_before_launching_it() {
+    let h = harness(&[]).await;
+    h.app.records.store(admin_records(), h.app.clock.now_ns());
+    serving_documentation(&h);
+    h.app.bus.serve(crate::catalogue::PLUGIN_CATALOGUE, |_| {
+        Ok((
+            "meridian.v1.PluginCatalogue".into(),
+            meridian_domain::v1::PluginCatalogue {
+                versions: vec![meridian_domain::v1::PluginVersion {
+                    metadata: Some(meridian_domain::v1::PluginMetadata {
+                        name: "snaptrade".into(),
+                        version: "0.1.0".into(),
+                        roles: vec!["custody".into()],
+                        ..Default::default()
+                    }),
+                    uploaded_at_ns: 1_790_380_800_000_000_000,
+                    ..Default::default()
+                }],
+                launches: vec![],
+            }
+            .encode_to_vec(),
+        ))
+    });
+    let listed = get(
+        &h.app,
+        DASHBOARD,
+        "/admin/plugins/versions",
+        &[dashboard_cookie(&h)],
+    )
+    .await;
+    assert_eq!(listed.status, StatusCode::OK, "{}", listed.body);
+    assert!(
+        listed.body.contains(
+            "<a href=\"/admin/plugins/versions/snaptrade/0.1.0/documentation\">snaptrade</a>"
+        ),
+        "{}",
+        listed.body
+    );
+    assert!(listed
+        .body
+        .contains("Naming a plugin here is not an endorsement"));
+    let page = get(
+        &h.app,
+        DASHBOARD,
+        "/admin/plugins/versions/snaptrade/0.1.0/documentation?section=reference",
+        &[dashboard_cookie(&h)],
+    )
+    .await;
+    assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+    assert!(page.headers["content-security-policy"]
+        .to_str()
+        .unwrap()
+        .contains("script-src 'self' 'sha256-"));
+    assert!(page.body.contains("<code>custody</code>"), "{}", page.body);
+
+    // A person who is no deployment admin is refused both.
+    let mut reader = records(&[INSTANCE]);
+    reader.user_groups[0].logins = vec![ADA.into()];
+    h.app.records.store(reader, h.app.clock.now_ns());
+    for path in [
+        "/admin/plugins/versions",
+        "/admin/plugins/versions/snaptrade/0.1.0/documentation",
+    ] {
+        let refused = get(&h.app, DASHBOARD, path, &[dashboard_cookie(&h)]).await;
+        assert_ne!(refused.status, StatusCode::OK, "{path}");
+    }
+}
+
+/// A form posted as a browser posts it.
+async fn post_form_as(app: &Arc<App>, path: &str, cookies: &[String], body: &str) -> Answer {
+    let request = HttpRequest::builder()
+        .method(Method::POST)
+        .uri(path)
+        .header(HOST, DASHBOARD)
+        .header(COOKIE, cookies.join("; "))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let response = router(Arc::clone(app)).oneshot(request).await.unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    Answer {
+        status,
+        headers,
+        body: String::from_utf8_lossy(&body).into_owned(),
+    }
+}
+
+fn form_token(page: &str) -> String {
+    page.split("name=\"form_token\" value=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("a form token")
+        .to_string()
+}
+
+/// Each request the stand-in conductor heard: its topic and payload.
+type Asked = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+
+/// The registries' copy, the Registries tab and their acts, as the
+/// conductor answers them, each act's request kept.
+fn serving_registries(h: &Harness) -> Asked {
+    let asked: Asked = Arc::default();
+    let keep = |topic: &'static str, reply_type: &'static str, reply: Vec<u8>| {
+        let asked = Arc::clone(&asked);
+        h.app.bus.serve(topic, move |envelope| {
+            asked
+                .lock()
+                .unwrap()
+                .push((topic.to_string(), envelope.payload.clone()));
+            Ok((reply_type.into(), reply.clone()))
+        });
+    };
+    let version = |v: &str, pulled: bool| meridian_domain::v1::ListedVersion {
+        listing: "open-meridian/snaptrade".into(),
+        version: v.into(),
+        registry: "community".into(),
+        schema_version: "v25".into(),
+        metadata: Some(meridian_domain::v1::PluginMetadata {
+            name: "snaptrade".into(),
+            version: v.into(),
+            roles: vec!["custody".into()],
+            ..Default::default()
+        }),
+        pull: pulled.then(|| meridian_domain::v1::PluginPull {
+            kind: meridian_domain::v1::PullReasonKind::TermsBreach as i32,
+            pulled_at_ns: 5,
+            ..Default::default()
+        }),
+        build: Some(meridian_domain::v1::PluginBuild {
+            tag: format!("v{v}"),
+            commit: "c".repeat(40),
+            signer_fingerprint: "SHA256:tagkey".into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    keep(
+        crate::registry::REGISTRY_PLUGINS,
+        "meridian.v1.ListRegistryPluginsReply",
+        meridian_domain::v1::ListRegistryPluginsReply {
+            listings: vec![meridian_domain::v1::PluginListing {
+                listing: "open-meridian/snaptrade".into(),
+                repository: "https://github.com/open-meridian/plugin-snaptrade".into(),
+                regions: vec!["US".into()],
+                versions: vec![version("1.4.0", true), version("1.5.0", false)],
+                stars: 3,
+                installs: 1,
+                ..Default::default()
+            }],
+            next_cursor: String::new(),
+            catalogue_pulled_at_ns: 1_790_380_800_000_000_000,
+        }
+        .encode_to_vec(),
+    );
+    keep(
+        crate::registry::LIST_PLUGIN_USAGE_REPORTS,
+        "meridian.v1.ListPluginUsageReportsReply",
+        meridian_domain::v1::ListPluginUsageReportsReply {
+            reports_plugin_usage: true,
+            catalogue_pulled_at_ns: 1_790_380_800_000_000_000,
+            ..Default::default()
+        }
+        .encode_to_vec(),
+    );
+    keep(
+        crate::registry::INSTALL_PLUGIN,
+        "meridian.v1.PluginVersion",
+        meridian_domain::v1::PluginVersion {
+            metadata: Some(meridian_domain::v1::PluginMetadata {
+                name: "open-meridian/snaptrade".into(),
+                version: "1.5.0".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec(),
+    );
+    keep(
+        crate::registry::SET_REPORTS_PLUGIN_USAGE,
+        "meridian.v1.ReportsPluginUsageSetting",
+        meridian_domain::v1::ReportsPluginUsageSetting {
+            reports_plugin_usage: false,
+        }
+        .encode_to_vec(),
+    );
+    keep(
+        crate::catalogue::PLUGIN_CATALOGUE,
+        "meridian.v1.PluginCatalogue",
+        meridian_domain::v1::PluginCatalogue {
+            versions: vec![meridian_domain::v1::PluginVersion {
+                metadata: Some(meridian_domain::v1::PluginMetadata {
+                    name: "open-meridian/snaptrade".into(),
+                    version: "1.4.0".into(),
+                    roles: vec!["custody".into()],
+                    ..Default::default()
+                }),
+                source_registry: "community".into(),
+                listing: "open-meridian/snaptrade".into(),
+                ..Default::default()
+            }],
+            launches: vec![meridian_domain::v1::PluginLaunch {
+                instance_id: INSTANCE.into(),
+                name: "open-meridian/snaptrade".into(),
+                version: "1.4.0".into(),
+                roles: vec!["custody".into()],
+                state: meridian_domain::v1::PluginLaunchState::Launched as i32,
+                ..Default::default()
+            }],
+        }
+        .encode_to_vec(),
+    );
+    asked
+}
+
+/// W8.10 to W8.12, W5.19 (contract v25): the Plugins page's three tabs, a
+/// listing's page, the install sheet and its act, the Registries tab's
+/// acts, and the pull warning heading the Summary.
+#[tokio::test]
+async fn a_deployment_admin_browses_installs_and_keeps_from_the_plugins_page() {
+    let h = harness(&[INSTANCE]).await;
+    let mut held = admin_records();
+    held.access_groups = records(&[INSTANCE]).access_groups;
+    held.access_groups[0].entries[0].level = AccessLevel::Admin as i32;
+    held.permissions.extend(records(&[INSTANCE]).permissions);
+    h.app.records.store(held, h.app.clock.now_ns());
+    let asked = serving_registries(&h);
+    let cookie = [dashboard_cookie(&h)];
+
+    // Installed: the source registry, the update offered and the pull.
+    let installed = get(&h.app, DASHBOARD, "/admin/plugins/versions", &cookie).await;
+    assert_eq!(installed.status, StatusCode::OK, "{}", installed.body);
+    for said in [
+        "Community · Unsupervised",
+        "Update to 1.5.0",
+        "Pulled: a breach of the Platform Terms",
+        "Naming a plugin here is not an endorsement",
+    ] {
+        assert!(installed.body.contains(said), "{said}: {}", installed.body);
+    }
+    // Browse: one line a listing, its counts as words below three.
+    let browse = get(
+        &h.app,
+        DASHBOARD,
+        "/admin/plugins/versions?tab=browse&search=snap",
+        &cookie,
+    )
+    .await;
+    assert!(
+        browse
+            .body
+            .contains("data-listing=\"open-meridian/snaptrade\""),
+        "{}",
+        browse.body
+    );
+    assert!(browse.body.contains("Fewer than three deployments"));
+    // The listing's page: the notice in full, the build, the vendor's words.
+    let page = get(
+        &h.app,
+        DASHBOARD,
+        "/admin/plugins/registry/open-meridian/snaptrade",
+        &cookie,
+    )
+    .await;
+    assert!(
+        page.body
+            .contains("Local and community plugins are unsupervised."),
+        "{}",
+        page.body
+    );
+    assert!(page.body.contains("SHA256:tagkey") && page.body.contains("Stated by its vendor"));
+    let docs = get(
+        &h.app,
+        DASHBOARD,
+        "/admin/plugins/registry/open-meridian/snaptrade?tab=documentation",
+        &cookie,
+    )
+    .await;
+    assert!(docs.headers["content-security-policy"]
+        .to_str()
+        .unwrap()
+        .contains("script-src 'self' 'sha256-"));
+    // The install sheet: the notice first, in full and alone, as its own
+    // step with Continue (ruling 194); then the form, with the usage
+    // setting and the floor.
+    let notice = get(
+        &h.app,
+        DASHBOARD,
+        "/admin/plugins/registry/open-meridian/snaptrade/install?version=1.5.0&registry=community",
+        &cookie,
+    )
+    .await;
+    assert!(
+        notice.body.contains(&crate::notice::html())
+            && notice.body.contains("data-continue")
+            && !notice
+                .body
+                .contains("action=\"/admin/plugins/registry/install\""),
+        "{}",
+        notice.body
+    );
+    assert!(notice.body.contains(
+        "href=\"/admin/plugins/registry/open-meridian/snaptrade/install?version=1.5.0&amp;registry=community&amp;step=form\""
+    ));
+    let sheet = get(
+        &h.app,
+        DASHBOARD,
+        "/admin/plugins/registry/open-meridian/snaptrade/install?version=1.5.0&registry=community&step=form",
+        &cookie,
+    )
+    .await;
+    assert!(
+        sheet.body.contains("Install open-meridian/snaptrade 1.5.0"),
+        "{}",
+        sheet.body
+    );
+    assert!(
+        sheet.body.contains("v25 · served here")
+            && sheet.body.contains("<dt>Usage report</dt><dd>on")
+    );
+    let token = form_token(&sheet.body);
+    // Posted without passing through the notice: refused, nothing sent.
+    let skipped = post_form_as(&h.app, "/admin/plugins/registry/install", &cookie,
+        &format!("form_token={token}&listing=open-meridian%2Fsnaptrade&version=1.5.0&registry=community&note=Newer")).await;
+    assert!(skipped.headers["location"]
+        .to_str()
+        .unwrap()
+        .contains("failed=the+notice+comes+first"));
+    assert!(asked
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|(t, _)| t != crate::registry::INSTALL_PLUGIN));
+    let done = post_form_as(&h.app, "/admin/plugins/registry/install", &cookie,
+        &format!("form_token={token}&notice=read&listing=open-meridian%2Fsnaptrade&version=1.5.0&registry=community&note=Newer")).await;
+    assert_eq!(done.status, StatusCode::SEE_OTHER, "{}", done.body);
+    assert!(done.headers["location"].to_str().unwrap().contains("done="));
+    let sent = asked
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(t, _)| t == crate::registry::INSTALL_PLUGIN)
+        .cloned()
+        .unwrap();
+    let install = meridian_domain::v1::InstallPluginRequest::decode(&sent.1[..]).unwrap();
+    assert_eq!(
+        (install.version.as_str(), install.note.as_str()),
+        ("1.5.0", "Newer")
+    );
+    // Not from the session: refused, nothing sent.
+    asked.lock().unwrap().clear();
+    let refused = post_form_as(
+        &h.app,
+        "/admin/plugins/registry/install",
+        &cookie,
+        "form_token=forged&listing=x&version=1&registry=community&note=n",
+    )
+    .await;
+    assert!(refused.headers["location"]
+        .to_str()
+        .unwrap()
+        .contains("failed="));
+    assert!(asked
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|(t, _)| t != crate::registry::INSTALL_PLUGIN));
+    // The Registries tab and its acts.
+    let tab = get(
+        &h.app,
+        DASHBOARD,
+        "/admin/plugins/versions?tab=registries",
+        &cookie,
+    )
+    .await;
+    assert!(
+        tab.body.contains("Report plugin usage") && tab.body.contains("Pull now"),
+        "{}",
+        tab.body
+    );
+    post_form_as(
+        &h.app,
+        "/admin/plugins/registry/pull",
+        &cookie,
+        &format!("form_token={token}"),
+    )
+    .await;
+    assert!(asked
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(t, p)| t == crate::registry::REGISTRY_PLUGINS
+            && meridian_domain::v1::ListRegistryPluginsRequest::decode(&p[..])
+                .unwrap()
+                .pull_now));
+    post_form_as(
+        &h.app,
+        "/admin/plugins/registry/usage",
+        &cookie,
+        &format!("form_token={token}&reason=Not+yet"),
+    )
+    .await;
+    let set = asked
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(t, _)| t == crate::registry::SET_REPORTS_PLUGIN_USAGE)
+        .cloned()
+        .unwrap();
+    assert!(
+        !meridian_domain::v1::SetReportsPluginUsageRequest::decode(&set.1[..])
+            .unwrap()
+            .reports_plugin_usage
+    );
+    // The pull heads the instance's Summary, one line.
+    let summary = get(
+        &h.app,
+        DASHBOARD,
+        &format!("/plugins/{INSTANCE}?level=admin"),
+        &cookie,
+    )
+    .await;
+    assert!(summary.body.contains("data-pulled"), "{}", summary.body);
 }

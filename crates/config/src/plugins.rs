@@ -21,8 +21,9 @@ use meridian_bus::{Bus, Envelope};
 use meridian_domain::v1::{
     AllowArchiveRequest, CreatePluginReply, CreatePluginRequest, LaunchPluginRequest,
     PluginArchive, PluginCatalogue, PluginCatalogueRequest, PluginLaunch, PluginLaunchState,
-    PluginMetadata, PluginVersion, RecordPluginUploadRequest, RemovePluginReply,
-    RemovePluginRequest, StopPluginRequest, WithdrawArchiveRequest,
+    PluginMetadata, PluginVersion, ReadPluginDocumentationReply, ReadPluginDocumentationRequest,
+    RecordPluginUploadRequest, RemovePluginReply, RemovePluginRequest, RetirePluginVersionRequest,
+    StopPluginRequest, WithdrawArchiveRequest,
 };
 use meridian_pb::v1::PluginDeclaration;
 use meridian_sidecar::Contract;
@@ -41,6 +42,44 @@ pub const LAUNCH_PLUGIN: &str = "platform.config.command.launch-plugin";
 pub const STOP_PLUGIN: &str = "platform.config.command.stop-plugin";
 pub const CREATE_PLUGIN: &str = "platform.deployment.command.create-plugin";
 pub const REMOVE_PLUGIN: &str = "platform.deployment.command.remove-plugin";
+/// W8.15 (contract v25): a version retired from the catalogue.
+pub const RETIRE_PLUGIN_VERSION: &str = "platform.config.command.retire-plugin-version";
+/// W8.2 (contract v25): one version's declaration and documentation.
+pub const PLUGIN_DOCUMENTATION: &str = "platform.config.query.plugin-documentation";
+
+/// What the conductor asks of the deployment's own registry, as it reaches it
+/// inside the cluster (spec/the-local-plugin-registry): from contract v25,
+/// releasing a retired version's image (W8.15). The registry is reached by
+/// this release's own pods alone, and from outside only through the
+/// dashboard's upload, which deletes nothing.
+pub trait LocalRegistry: Send + Sync {
+    /// Release an image: its manifest, by digest, deleted from the
+    /// repository; its layers are the registry's to collect.
+    fn release<'a>(
+        &'a self,
+        repository: &'a str,
+        digest: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
+}
+
+/// The repository a version's image sits in, in the deployment's own
+/// registry: `plugins/{name}` for a local version, `plugins/{listing}` --
+/// `plugins/{organisation}/{plugin}` -- for one from a registry (W8.10), so
+/// the two never collide.
+pub fn repository_of(version: &PluginVersion) -> String {
+    if version.listing.is_empty() {
+        format!(
+            "plugins/{}",
+            version
+                .metadata
+                .as_ref()
+                .map(|m| m.name.as_str())
+                .unwrap_or_default()
+        )
+    } else {
+        format!("plugins/{}", version.listing)
+    }
+}
 
 /// How long the launcher has to make or remove a plugin's workload: it asks
 /// the cluster's API and waits for nothing to start.
@@ -56,7 +95,19 @@ struct Plugins {
     /// Where the deployment keeps archives, as its install named it (W7.1,
     /// W8.7, contract v16).
     archive: ArchiveGrant,
+    /// The deployment's own registry as the conductor reaches it, where it
+    /// does (contract v25): a retired version's image released there.
+    local: Option<Arc<dyn LocalRegistry>>,
+    /// The community and verified registries, where the deployment reaches
+    /// them (contract v25, W8.10 to W8.12).
+    registries: Option<Arc<crate::registries::Hold>>,
 }
+
+mod registry;
+pub use registry::{
+    ACKNOWLEDGE_PULL, INSTALL_PLUGIN, LIST_PLUGIN_USAGE_REPORTS, REGISTRY_PLUGINS,
+    SET_REPORTS_PLUGIN_USAGE, UPDATE_PLUGIN,
+};
 
 // ── The rules ───────────────────────────────────────────────────────────────
 
@@ -139,6 +190,16 @@ pub fn upload(
     if let Some(declaration) = &metadata.declaration {
         declared(declaration, &metadata.roles)?;
     }
+    // The vendor's documentation (W8.1, contract v25): the texts held to
+    // the sections the declaration names, by digest and size.
+    documented(
+        metadata
+            .declaration
+            .as_ref()
+            .map(|declaration| declaration.documentation.as_slice())
+            .unwrap_or_default(),
+        &request.documentation,
+    )?;
     if !is_digest(&request.image_digest) {
         return Err(format!(
             "`{}` is not an image digest; a version is recorded by `sha256:<hex>`",
@@ -146,6 +207,107 @@ pub fn upload(
         ));
     }
     Ok(metadata)
+}
+
+/// The fixed sections of a version's documentation, in the order it is
+/// drawn (W8.1, contract v25): each `docs/<name>.md`.
+pub const SECTIONS: [&str; 5] = ["overview", "setup", "troubleshooting", "terms", "pages"];
+
+/// The most bytes a version's documentation holds in all (W8.1).
+pub const MOST_DOCUMENTATION_BYTES: u64 = 262_144;
+
+/// A version's documentation held to its declaration (W8.1, contract v25):
+/// each section a fixed one, named once, 1 to 64 KiB, the bundle at most
+/// 256 KiB; each text sent for a section the declaration names, its SHA-256
+/// and size the declaration's; and every section named sent. Refused naming
+/// the section.
+fn documented(
+    sections: &[meridian_pb::v1::DocumentationSection],
+    texts: &[meridian_domain::v1::DocumentationText],
+) -> Result<(), String> {
+    use meridian_pb::bounds::{
+        DOCUMENTATION_SECTION_BYTES_RANGE, PLUGIN_DECLARATION_DOCUMENTATION_COUNT,
+    };
+    use sha2::Digest;
+    if !PLUGIN_DECLARATION_DOCUMENTATION_COUNT.admits(sections.len()) {
+        return Err(format!(
+            "declaration.documentation names {} sections; at most {}",
+            sections.len(),
+            PLUGIN_DECLARATION_DOCUMENTATION_COUNT.most
+        ));
+    }
+    let mut total = 0u64;
+    for (n, section) in sections.iter().enumerate() {
+        if !SECTIONS.contains(&section.name.as_str()) {
+            return Err(format!(
+                "declaration.documentation[{n}] is {:?}, not one of the sections {}",
+                section.name,
+                SECTIONS.join(", ")
+            ));
+        }
+        if sections[..n].iter().any(|held| held.name == section.name) {
+            return Err(format!(
+                "declaration.documentation[{n}]: the section {} is named twice",
+                section.name
+            ));
+        }
+        if !is_digest(&section.digest) {
+            return Err(format!(
+                "declaration.documentation[{n}].digest is not `sha256:<hex>`"
+            ));
+        }
+        if !DOCUMENTATION_SECTION_BYTES_RANGE.admits(section.bytes as i64) {
+            return Err(format!(
+                "the section {} is {} bytes; a section is 1 to {} (64 KiB)",
+                section.name, section.bytes, DOCUMENTATION_SECTION_BYTES_RANGE.most
+            ));
+        }
+        total += section.bytes;
+    }
+    if total > MOST_DOCUMENTATION_BYTES {
+        return Err(format!(
+            "the documentation holds {total} bytes in all; at most {MOST_DOCUMENTATION_BYTES} \
+             (256 KiB)"
+        ));
+    }
+    for (n, text) in texts.iter().enumerate() {
+        let Some(section) = sections.iter().find(|held| held.name == text.section) else {
+            return Err(format!(
+                "documentation[{n}] is the section {:?}, which the declaration does not name",
+                text.section
+            ));
+        };
+        if texts[..n].iter().any(|held| held.section == text.section) {
+            return Err(format!(
+                "documentation[{n}]: the section {} is sent twice",
+                text.section
+            ));
+        }
+        let digest = format!(
+            "sha256:{}",
+            hex::encode(sha2::Sha256::digest(text.markdown.as_bytes()))
+        );
+        if digest != section.digest || text.markdown.len() as u64 != section.bytes {
+            return Err(format!(
+                "the section {}'s text is not what the declaration names: {} bytes, {digest}, \
+                 where it names {} bytes, {}",
+                text.section,
+                text.markdown.len(),
+                section.bytes,
+                section.digest
+            ));
+        }
+    }
+    if let Some(missing) = sections
+        .iter()
+        .find(|section| !texts.iter().any(|text| text.section == section.name))
+    {
+        return Err(format!(
+            "the declaration names the section {} and the upload sent no text for it",
+            missing.name
+        ));
+    }
+    Ok(())
 }
 
 /// A version's declaration (W8.1, contract v11): what it does not carry
@@ -202,6 +364,29 @@ fn declared(declaration: &PluginDeclaration, roles: &[String]) -> Result<(), Str
             return Err(format!(
                 "declaration.not_carried[{i}].reason is unspecified; say why it is not carried"
             ));
+        }
+    }
+    // An operations plugin's affirmation deadline (W11.28, W11.34; contract
+    // v25): minutes after midnight, 1 to 1440, 0 declaring none; refused on
+    // a version not holding operations.
+    if declaration.affirmation_deadline != 0 {
+        use meridian_pb::bounds::PLUGIN_DECLARATION_AFFIRMATION_DEADLINE_RANGE;
+        if !PLUGIN_DECLARATION_AFFIRMATION_DEADLINE_RANGE
+            .admits(i64::from(declaration.affirmation_deadline))
+        {
+            return Err(format!(
+                "declaration.affirmation_deadline is {}; minutes after midnight, 1 to {}, or 0 \
+                 for none",
+                declaration.affirmation_deadline,
+                PLUGIN_DECLARATION_AFFIRMATION_DEADLINE_RANGE.most
+            ));
+        }
+        if !roles.iter().any(|role| role == "operations") {
+            return Err(
+                "declaration.affirmation_deadline is declared by a version not holding \
+                 operations; only operations declares the firm's affirmation deadline"
+                    .into(),
+            );
         }
     }
     // A data plugin's catalogue (W8.1, contract v18), as `meridian plugin check`
@@ -317,6 +502,13 @@ pub fn launch<'a>(
                 request.name, request.version
             )
         })?;
+    // A retired version is no longer launchable (W8.15, contract v25).
+    if version.retired_at_ns != 0 {
+        return Err(format!(
+            "{} {} was retired from the catalogue; launch a version it still offers",
+            request.name, request.version
+        ));
+    }
     let metadata = version.metadata.as_ref().expect("found by it");
     let (approved, declared) = (set(&request.approved_roles), set(&metadata.roles));
     if approved != declared {
@@ -365,16 +557,37 @@ impl Plugins {
         request: RecordPluginUploadRequest,
         envelope: &Envelope,
     ) -> Result<PluginVersion, String> {
+        // A plugin bundle names its listing (W8.14): verified as at install.
+        if !request.listing.is_empty() {
+            return self.carry(request, envelope);
+        }
         let metadata = upload(Contract::embedded(), &request)?;
         let version = PluginVersion {
             metadata: Some(metadata.clone()),
             image_digest: request.image_digest,
             uploaded_by: subject(envelope),
             uploaded_at_ns: self.clock.now_ns(),
+            source_registry: "local".to_string(),
+            ..PluginVersion::default()
         };
+        // The texts in the declaration's order, kept with the version in the
+        // same step, never replaced (contract v25).
+        let declared_order: Vec<String> = metadata
+            .declaration
+            .as_ref()
+            .map(|declaration| {
+                declaration
+                    .documentation
+                    .iter()
+                    .map(|s| s.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut texts = request.documentation.clone();
+        texts.sort_by_key(|text| declared_order.iter().position(|name| *name == text.section));
         if !self
             .store
-            .record_plugin_version(&version)
+            .record_plugin_version_documented(&version, &texts)
             .map_err(|f| f.to_string())?
         {
             return Err(format!(
@@ -401,6 +614,25 @@ impl Plugins {
         let version = launch(&snapshot, &request)?;
         if let Some(refusal) = note_refused(&request.note) {
             return Err(refusal);
+        }
+        // A registry version is verified again at launch (W8.3; the spec's
+        // requirement 24): its kept listing statement, the referrers in the
+        // deployment's own registry and the newest key status held.
+        if !version.listing.is_empty() {
+            let hold = self.registries.as_ref().ok_or_else(|| {
+                format!(
+                    "{} {} came from a registry, and this deployment reaches none to verify it \
+                     again",
+                    request.name, request.version
+                )
+            })?;
+            let statement = self
+                .store
+                .listing_statement(&request.name, &request.version)
+                .map_err(|failed| failed.to_string())?;
+            tokio::runtime::Handle::current()
+                .block_on(hold.reverify(version, &statement))
+                .map_err(|why| format!("the verification at launch: {why}"))?;
         }
         let metadata = version.metadata.clone().expect("found by it");
         // Stamped as every change is: the person, and the delegation and
@@ -484,9 +716,13 @@ impl Plugins {
         let metadata = version.metadata.clone().unwrap_or_default();
         CreatePluginRequest {
             instance_id: instance_id.to_string(),
+            // plugins/{name} for a local version, plugins/{listing} for one
+            // from a registry (W8.10).
             image: format!(
-                "{}/plugins/{}@{}",
-                self.registry, metadata.name, version.image_digest
+                "{}/{}@{}",
+                self.registry,
+                repository_of(version),
+                version.image_digest
             ),
             roles: metadata.roles.clone(),
             interface: metadata.interface,
@@ -754,6 +990,154 @@ impl Plugins {
         crate::data::publish(&self.bus, self.store.as_ref(), self.clock.now_ns());
         Ok(stopped)
     }
+
+    /// W8.2 (contract v25): one version's declaration and the vendor's texts,
+    /// launched or not, retired or not.
+    fn documentation(
+        &self,
+        request: ReadPluginDocumentationRequest,
+    ) -> Result<ReadPluginDocumentationReply, String> {
+        let snapshot = self.snapshot()?;
+        let held = snapshot
+            .catalogue
+            .versions
+            .iter()
+            .find(|held| {
+                held.metadata
+                    .as_ref()
+                    .is_some_and(|m| m.name == request.name && m.version == request.version)
+            })
+            .ok_or_else(|| {
+                format!(
+                    "{} {} is not in the catalogue",
+                    request.name, request.version
+                )
+            })?;
+        Ok(ReadPluginDocumentationReply {
+            declaration: held.metadata.as_ref().and_then(|m| m.declaration.clone()),
+            documentation: self
+                .store
+                .plugin_documentation(&request.name, &request.version)
+                .map_err(|f| f.to_string())?,
+            uploaded_by: held.uploaded_by.clone(),
+            uploaded_at_ns: held.uploaded_at_ns,
+        })
+    }
+
+    /// W8.15 (contract v25; decision 59): retire a version no instance runs
+    /// or ran and no record names, with a note -- recorded, its image then
+    /// released from the deployment's own registry.
+    fn retire(
+        &self,
+        request: RetirePluginVersionRequest,
+        envelope: &Envelope,
+    ) -> Result<PluginVersion, String> {
+        if request.name.is_empty() {
+            return Err("name: names the version's plugin".into());
+        }
+        if request.version.is_empty() {
+            return Err("version: names the version to retire".into());
+        }
+        if let Some(refusal) = note_refused(&request.note) {
+            return Err(refusal);
+        }
+        let snapshot = self.snapshot()?;
+        let held = snapshot
+            .catalogue
+            .versions
+            .iter()
+            .find(|held| {
+                held.metadata
+                    .as_ref()
+                    .is_some_and(|m| m.name == request.name && m.version == request.version)
+            })
+            .ok_or_else(|| {
+                format!(
+                    "{} {} is not in the catalogue",
+                    request.name, request.version
+                )
+            })?;
+        if held.retired_at_ns != 0 {
+            return Err(format!(
+                "{} {} was retired already, by {}",
+                request.name, request.version, held.retired_by
+            ));
+        }
+        // An instance, live or stopped, names it: its launch is kept in
+        // history, and the lake's rows and the book's entries it recorded
+        // name the version through it (the lake stamps each row's source
+        // with the version its instance was launched at).
+        let mut naming: Vec<String> = snapshot
+            .catalogue
+            .launches
+            .iter()
+            .filter(|launch| launch.name == request.name && launch.version == request.version)
+            .map(|launch| {
+                let state = match PluginLaunchState::try_from(launch.state) {
+                    Ok(PluginLaunchState::Launched) => "running",
+                    Ok(PluginLaunchState::Stopped) => "stopped",
+                    Ok(PluginLaunchState::Failed) => "failed to launch",
+                    _ => "launched",
+                };
+                format!("{} ({state})", launch.instance_id)
+            })
+            .collect();
+        naming.sort();
+        naming.dedup();
+        if !naming.is_empty() {
+            return Err(format!(
+                "{} {} is named by {}: an instance's launch is kept in history, and what it \
+                 recorded names the version, so it stays in the catalogue",
+                request.name,
+                request.version,
+                naming.join(", ")
+            ));
+        }
+        let mut by = author(envelope);
+        by.note = request.note.clone();
+        let retired = self
+            .store
+            .retire_plugin_version(&request.name, &request.version, &by, self.clock.now_ns())
+            .map_err(|f| f.to_string())?
+            .ok_or_else(|| format!("{} {} was retired already", request.name, request.version))?;
+        tracing::info!(
+            plugin = request.name,
+            version = request.version,
+            by = retired.retired_by,
+            "a plugin version retired"
+        );
+        // Its image released, unless a version still offered from the same
+        // repository runs the same image.
+        let repository = repository_of(&retired);
+        let shared = snapshot.catalogue.versions.iter().any(|other| {
+            other.retired_at_ns == 0
+                && other.image_digest == retired.image_digest
+                && repository_of(other) == repository
+                && other.metadata.as_ref().map(|m| m.version.as_str())
+                    != Some(request.version.as_str())
+        });
+        match (&self.local, shared) {
+            (Some(local), false) => {
+                let releasing = local.release(&repository, &retired.image_digest);
+                if let Err(failed) = tokio::runtime::Handle::current().block_on(releasing) {
+                    // Recorded either way: what stays in the registry is never
+                    // launched again, and a later retirement cannot repeat.
+                    tracing::warn!(
+                        plugin = request.name,
+                        version = request.version,
+                        %failed,
+                        "a retired version's image was not released"
+                    );
+                }
+            }
+            (None, false) => tracing::info!(
+                plugin = request.name,
+                "no registry to release a retired version's image from"
+            ),
+            (_, true) => {}
+        }
+        Ok(retired)
+    }
 }
 
 /// Serve W8's commands and query. `registry` is where a node reaches the
@@ -777,13 +1161,106 @@ pub fn serve_plugins_with(
     registry: String,
     archive: ArchiveGrant,
 ) {
+    serve_plugins_reaching(bus, store, clock, registry, archive, None)
+}
+
+/// [`serve_plugins_with`], reaching the deployment's own registry as the
+/// conductor does inside the cluster (contract v25): a retired version's
+/// image released there (W8.15).
+pub fn serve_plugins_reaching(
+    bus: Arc<Bus>,
+    store: Arc<dyn Store>,
+    clock: Arc<dyn Clock>,
+    registry: String,
+    archive: ArchiveGrant,
+    local: Option<Arc<dyn LocalRegistry>>,
+) {
+    serve_plugins_and_registries(bus, store, clock, registry, archive, local, None)
+}
+
+/// [`serve_plugins_reaching`], reaching the community and verified
+/// registries too (contract v25, W8.10 to W8.12, W5.19): Browse's copy of
+/// the catalogue, installs, updates, pull acknowledgements and the plugin
+/// usage report's setting. Without them those rows answer that the
+/// deployment reaches no registry.
+pub fn serve_plugins_and_registries(
+    bus: Arc<Bus>,
+    store: Arc<dyn Store>,
+    clock: Arc<dyn Clock>,
+    registry: String,
+    archive: ArchiveGrant,
+    local: Option<Arc<dyn LocalRegistry>>,
+    registries: Option<Arc<crate::registries::Hold>>,
+) {
     let plugins = Arc::new(Plugins {
         bus: Arc::clone(&bus),
         store,
         clock,
         registry,
         archive,
+        local,
+        registries,
     });
+    answer_on(
+        &bus,
+        &plugins,
+        REGISTRY_PLUGINS,
+        (
+            "meridian.v1.ListRegistryPluginsRequest",
+            "meridian.v1.ListRegistryPluginsReply",
+        ),
+        |plugins, request, _| plugins.list_registry_plugins(request),
+    );
+    answer_on(
+        &bus,
+        &plugins,
+        INSTALL_PLUGIN,
+        (
+            "meridian.v1.InstallPluginRequest",
+            "meridian.v1.PluginVersion",
+        ),
+        |plugins, request, envelope| plugins.install(request, envelope),
+    );
+    answer_on(
+        &bus,
+        &plugins,
+        UPDATE_PLUGIN,
+        (
+            "meridian.v1.UpdatePluginRequest",
+            "meridian.v1.PluginLaunch",
+        ),
+        |plugins, request, envelope| plugins.update(request, envelope),
+    );
+    answer_on(
+        &bus,
+        &plugins,
+        ACKNOWLEDGE_PULL,
+        (
+            "meridian.v1.AcknowledgePullRequest",
+            "meridian.v1.PullAcknowledgement",
+        ),
+        |plugins, request, envelope| plugins.acknowledge_pull(request, envelope),
+    );
+    answer_on(
+        &bus,
+        &plugins,
+        SET_REPORTS_PLUGIN_USAGE,
+        (
+            "meridian.v1.SetReportsPluginUsageRequest",
+            "meridian.v1.ReportsPluginUsageSetting",
+        ),
+        |plugins, request, envelope| plugins.set_reports_plugin_usage(request, envelope),
+    );
+    answer_on(
+        &bus,
+        &plugins,
+        LIST_PLUGIN_USAGE_REPORTS,
+        (
+            "meridian.v1.ListPluginUsageReportsRequest",
+            "meridian.v1.ListPluginUsageReportsReply",
+        ),
+        |plugins, request, _| plugins.list_plugin_usage_reports(request),
+    );
     answer_on(
         &bus,
         &plugins,
@@ -827,8 +1304,32 @@ pub fn serve_plugins_with(
             "meridian.v1.PluginCatalogue",
         ),
         |plugins, _: PluginCatalogueRequest, _| -> Result<PluginCatalogue, String> {
-            Ok(plugins.snapshot()?.catalogue)
+            // A retired version is no longer listed (W8.15, contract v25);
+            // its record is kept.
+            let mut catalogue = plugins.snapshot()?.catalogue;
+            catalogue.versions.retain(|held| held.retired_at_ns == 0);
+            Ok(catalogue)
         },
+    );
+    answer_on(
+        &bus,
+        &plugins,
+        PLUGIN_DOCUMENTATION,
+        (
+            "meridian.v1.ReadPluginDocumentationRequest",
+            "meridian.v1.ReadPluginDocumentationReply",
+        ),
+        |plugins, request: ReadPluginDocumentationRequest, _| plugins.documentation(request),
+    );
+    answer_on(
+        &bus,
+        &plugins,
+        RETIRE_PLUGIN_VERSION,
+        (
+            "meridian.v1.RetirePluginVersionRequest",
+            "meridian.v1.PluginVersion",
+        ),
+        |plugins, request: RetirePluginVersionRequest, envelope| plugins.retire(request, envelope),
     );
     answer_on(
         &bus,

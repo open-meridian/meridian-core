@@ -29,7 +29,8 @@ use meridian_config::PostgresStore;
 use meridian_domain::v1::{EnrolWithCodeRequest, EnrolmentState};
 use meridian_runtime::{
     bus_from_env, clock, key_at, now_ns, on_runtime, platform_from_env, report_forever, required,
-    shutdown, var, wait_for_store, PlatformUpstream, Ready, Wait,
+    shutdown, var, wait_for_store, PlatformRegistries, PlatformUpstream, Ready, RegistryRelease,
+    Wait,
 };
 
 fn main() {
@@ -197,13 +198,20 @@ fn run() -> Result<(), String> {
             &var("MERIDIAN_ARCHIVE_LOCKS").unwrap_or_default(),
         )?;
 
+        // The licence list the conductor keeps (contract v24, W3.25), made
+        // here so the config domain holds a declaration of the licensed
+        // schemes to it (contract v25, W3.28); read below as before.
+        let licence: meridian_conductor::reference::Licence = Arc::default();
+
         // The config domain: registered and subscribed before the loop
         // starts, so nothing the dashboard or a sidecar asks is missed.
         meridian_config::serve_with(
             Arc::clone(&bus),
             Arc::clone(&store),
             clock(),
-            Arc::new(PlatformUpstream::new(Arc::clone(&platform))),
+            Arc::new(
+                PlatformUpstream::new(Arc::clone(&platform)).with_licence(Arc::clone(&licence)),
+            ),
             // Read when first needed and kept once found, so the Job
             // finishing after this starts needs no restart.
             Arc::new(meridian_config::SettingsKey::at(
@@ -215,12 +223,43 @@ fn run() -> Result<(), String> {
         // W8: the plugin catalogue, and launching from it. Every launch
         // runs an image from the deployment's own registry as each node
         // reaches it, by digest (spec/the-local-plugin-registry).
-        meridian_config::serve_plugins_with(
+        // From contract v25 (W8.15) it reaches the registry inside the
+        // cluster too, where the chart names it, to release a retired
+        // version's image.
+        let local_registry: Option<Arc<dyn meridian_config::LocalRegistry>> =
+            match var("MERIDIAN_REGISTRY_UPSTREAM").map(|base| RegistryRelease::new(&base)) {
+                Some(Ok(release)) => Some(Arc::new(release)),
+                Some(Err(failed)) => {
+                    tracing::warn!(%failed, "the registry is not reached; retired images stay");
+                    None
+                }
+                None => None,
+            };
+        // Contract v25 (W8.10 to W8.12, W5.19): the community and verified
+        // registries, where the chart carries the platform's keys and the
+        // deployment's own registry is reached: the catalogue pulled hourly,
+        // installs verified against those keys, and the weekly plugin usage
+        // report.
+        let registries = registries_from_env(&platform, &store);
+        if let Some(hold) = &registries {
+            tokio::spawn(meridian_config::registries::usage::pull_hourly(Arc::clone(
+                hold,
+            )));
+            tokio::spawn(
+                Arc::new(meridian_config::registries::usage::UsageSender::new(
+                    Arc::clone(hold),
+                ))
+                .start(Arc::clone(&bus)),
+            );
+        }
+        meridian_config::serve_plugins_and_registries(
             Arc::clone(&bus),
             Arc::clone(&store),
             clock(),
             var("MERIDIAN_REGISTRY_ADDRESS").unwrap_or_else(|| "localhost:5000".into()),
             archive,
+            local_registry,
+            registries,
         );
 
         // W3.3: a person's ask about a record, from the dashboard. Nothing
@@ -238,7 +277,6 @@ fn run() -> Result<(), String> {
         // catalogue and the replacement feed, pulled on start, daily and on
         // reconnecting, for the instrument store; the list is what every
         // ask sends by.
-        let licence: meridian_conductor::reference::Licence = Arc::default();
         tokio::spawn(
             Arc::new(meridian_conductor::reference::ReferencePuller::new(
                 Arc::clone(&bus),
@@ -294,6 +332,51 @@ fn run() -> Result<(), String> {
         tracing::info!("stopping");
         Ok(())
     })
+}
+
+/// The registries' hold, where the chart carries the platform's keys
+/// (`MERIDIAN_PLATFORM_KEYS_DIR`, each `*.pem`) and the deployment's own
+/// registry is reached (`MERIDIAN_REGISTRY_UPSTREAM`); none otherwise, said
+/// once, and the registry rows answer that the deployment reaches none.
+fn registries_from_env(
+    platform: &Arc<meridian_conductor::Platform>,
+    store: &Arc<dyn meridian_config::Store>,
+) -> Option<Arc<meridian_config::registries::Hold>> {
+    let (Some(dir), Some(upstream)) = (
+        var("MERIDIAN_PLATFORM_KEYS_DIR"),
+        var("MERIDIAN_REGISTRY_UPSTREAM"),
+    ) else {
+        tracing::info!("no platform keys or no registry: the community and verified registries are not reached");
+        return None;
+    };
+    let keys = meridian_runtime::platform_keys_at(&dir)
+        .and_then(|pems| meridian_config::registries::verify::PlatformKeys::from_pems(&pems));
+    let keys = match keys {
+        Ok(keys) if !keys.is_empty() => keys,
+        Ok(_) => {
+            tracing::warn!(
+                dir,
+                "the chart carries no platform key: the registries are not reached"
+            );
+            return None;
+        }
+        Err(failed) => {
+            tracing::warn!(%failed, "the platform's keys did not read: the registries are not reached");
+            return None;
+        }
+    };
+    match PlatformRegistries::new(Arc::clone(platform), &upstream) {
+        Ok(registries) => Some(Arc::new(meridian_config::registries::Hold::new(
+            Arc::new(registries),
+            keys,
+            Arc::clone(store),
+            clock(),
+        ))),
+        Err(failed) => {
+            tracing::warn!(%failed, "the registries are not reached");
+            None
+        }
+    }
 }
 
 /// Answer what the wizard shows before anything is redeemed.
@@ -502,6 +585,11 @@ impl meridian_conductor::usage::UsageBook for UsageBook {
     fn record(&self, sent: &meridian_domain::v1::SentUsageReport) -> Result<(), String> {
         self.0
             .record_usage_report(sent)
+            .map_err(|failed| failed.to_string())
+    }
+    fn licensed_schemes(&self) -> Result<Vec<String>, String> {
+        self.0
+            .licensed_schemes()
             .map_err(|failed| failed.to_string())
     }
 }

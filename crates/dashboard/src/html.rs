@@ -78,6 +78,9 @@ ol.notes,ol.notices{list-style:none;margin:0;padding:0}\
 ol.notes>li,ol.notices>li{padding:.7rem 0;border-top:1px solid var(--line-soft)}\
 ol.notes>li:first-child,ol.notices>li:first-child{border-top:0}\
 table.notices tr[data-unread] a{font-weight:650}\
+.notice-narrow{display:none}.notice-narrow>details.notice>summary{cursor:pointer;color:var(--ink-soft);font-size:.85rem}\
+@media (max-width:37.5rem){.notice-wide{display:none}.notice-narrow{display:block}}\
+@media (min-width:60.01rem){.listing-overview{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(0,1fr);column-gap:1.5rem;align-items:start}.listing-overview>.notice-wide{grid-row:1 / span 2}}\
 dl.ticket-facts{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:.3rem 1rem;margin:.8rem 0 0}\
 dl.ticket-facts dt{color:var(--ink-soft)}dl.ticket-facts dd{margin:0;overflow-wrap:anywhere}\
 ul.references{margin:0;padding-left:1.1rem}\
@@ -228,6 +231,9 @@ padding-left:1.1rem;font-size:.9rem}.counts li{overflow-wrap:anywhere}\
 .counts.tight{display:flex;flex-wrap:wrap;gap:.1rem .9rem;padding-left:0;list-style:none;font-size:.85rem;margin:.35rem 0 .5rem}\
 .inline-form{display:flex;flex-wrap:wrap;align-items:flex-end;gap:.5rem .75rem;margin:.5rem 0}\
 .inline-form label{flex:1 1 9rem;min-width:0}\
+.inline-form fieldset.schemes{display:flex;flex-wrap:wrap;align-items:center;gap:.25rem .9rem;border:0;margin:0;\
+padding:0;min-width:0;flex:1 1 100%}.inline-form fieldset.schemes label.check{flex:0 0 auto;margin:0}\
+.inline-form fieldset.schemes .schemes-label{font-size:.84rem;font-weight:550}\
 @media (max-width:640px){table.provisional .wide{display:none}}\
 .attached-list{margin:.25rem 0 .6rem;padding-left:1.1rem}.attached-list li{margin:.2rem 0;overflow-wrap:anywhere}\
 .reserved{margin:.75rem 0 0;padding:.55rem .8rem;border:1px dashed var(--line-strong);border-radius:var(--radius);\
@@ -471,6 +477,43 @@ main.sheet:has(form.consent){margin:0;padding:.75rem 1rem}\
 form.consent section.summary{padding:.5rem .75rem}form.consent section.summary h2{display:none}\
 form.consent section.summary .hint{display:none}}";
 
+/// A version's documentation (W6.9, contract v25; [`crate::documentation`]):
+/// drawn only on a page holding it, so no other page carries its weight.
+const DOCS_STYLE: &str = "\
+.docs{display:flex;flex-direction:column;gap:.5rem;min-height:0}\
+.docs-head{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:.25rem 1rem}\
+.docs-what{margin:0;color:var(--ink-soft);font-size:.88rem;min-width:0;overflow-wrap:anywhere}\
+.docs nav.docs-sections{margin:0;flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none}\
+.docs-body{display:grid;grid-template-columns:11rem minmax(0,1fr) 15rem;gap:1rem;min-height:0;flex:1 1 0}\
+.docs-contents ol{list-style:none;margin:0;padding:0}.docs-contents li a{display:block;padding:.25rem .5rem;\
+border-radius:var(--radius);color:var(--ink-soft);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}\
+.docs-contents li a.here{background:var(--accent-wash);color:var(--accent);font-weight:600}\
+.docs-contents-menu>summary{display:none}\
+.docs-text{min-width:0;overflow:auto}.docs-by{margin:0 0 .4rem;color:var(--ink-faint);font-size:.8rem}\
+.docs-warning{margin:0 0 .5rem;padding:.4rem .6rem;border-radius:var(--radius);background:var(--warn-wash);color:var(--warn-ink)}\
+.docs-vendor h2{font-size:1.1rem;margin:.1rem 0 .4rem}.docs-vendor h3,.docs-vendor h4{font-size:1rem;margin:.6rem 0 .3rem}\
+.docs-vendor p,.docs-vendor ul,.docs-vendor ol{margin:.35rem 0}.docs-vendor pre{overflow-x:auto;padding:.5rem;\
+background:var(--card);border:1px solid var(--line);border-radius:var(--radius)}\
+.docs-vendor blockquote{margin:.4rem 0;padding-left:.75rem;border-left:3px solid var(--line-strong);color:var(--ink-soft)}\
+.docs-vendor .doc-table{overflow-x:auto}.docs-vendor table{border-collapse:collapse}\
+.docs-vendor th,.docs-vendor td{padding:.25rem .5rem;border-bottom:1px solid var(--line-soft);text-align:left}\
+.docs-vendor .doc-host{color:var(--ink-faint);font-size:.85em}.docs-vendor .doc-leaves{color:var(--ink-faint);margin-left:.1rem}\
+.docs-vendor .doc-image,.docs-vendor .doc-raw{color:var(--ink-faint)}.docs-vendor{overflow-wrap:anywhere}\
+.docs-notice{min-width:0;overflow:auto;font-size:.8rem;color:var(--ink-soft)}.docs-notice h3{font-size:.86rem;margin:0 0 .3rem}\
+.docs-notice p{margin:0 0 .4rem}.docs-head details.notice>summary{cursor:pointer;color:var(--ink-soft);font-size:.85rem}\
+.docs-head details.notice[open]{flex-basis:100%;font-size:.82rem}.docs-head details.notice h3{display:none}\
+.docs-reference .hint{margin:0 0 .4rem}\
+.docs-note{display:block;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink-soft);font-size:.85rem}\
+@media (min-width:60.01rem){.docs-head details.notice{display:none}}\
+@media (max-width:60rem){.docs-body{grid-template-columns:minmax(0,1fr);grid-template-rows:auto minmax(0,1fr)}\
+.docs-notice{display:none}.docs-contents-menu>summary{display:block;cursor:pointer;color:var(--ink-soft);font-size:.85rem}\
+.docs-contents-menu:not([open]) ol{display:none}.docs-contents ol{display:flex;flex-wrap:wrap;gap:.15rem}}\
+body:has(.docs){height:100vh;height:100dvh;min-height:0}\
+main:has(.docs){flex:1 1 0;min-height:0;display:flex;flex-direction:column;padding-bottom:var(--space-4)}\
+main:has(.docs)>.plugin-area,main:has(.docs)>.docs-page{flex:1 1 0;min-height:0;display:flex;flex-direction:column}\
+.plugin-area>.tab-body:has(.docs),.tab-body:has(.docs)>.area-drawn{flex:1 1 0;min-height:0;display:flex;flex-direction:column}\
+.docs-page>.docs{flex:1 1 0}.area-drawn>.docs{flex:1 1 0}.docs-title{margin:0 0 .4rem;font-size:1.2rem}";
+
 /// Whether this deployment was installed for development
 /// (spec/live-plugin-development, ruling 2). Process-wide, set once at start
 /// from the chart, and said on every page, since it is the one thing about a
@@ -619,6 +662,23 @@ pub const MODE_COOKIE: &str = "meridian_mode";
 /// Before first paint: the person's mode on `<html>`, as the kit reads it;
 /// and `data-script`, which says the page's script runs, so what the chrome's
 /// script shows in a note ([`noted_badge`]) is not also a line of the page.
+/// The page's own inline scripts by their SHA-256, as a content security
+/// policy names them (`'sha256-…'`): what a page under
+/// [`crate::documentation::policy`] may run besides the kit's modules.
+pub fn inline_script_hashes() -> Vec<String> {
+    use base64::Engine;
+    use sha2::Digest;
+    [HEAD_SCRIPT, CHROME_SCRIPT, INBOX_SCRIPT]
+        .iter()
+        .map(|script| {
+            format!(
+                "'sha256-{}'",
+                base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(script))
+            )
+        })
+        .collect()
+}
+
 const HEAD_SCRIPT: &str = "(function(){var r=document.documentElement;\
 r.setAttribute(\"data-script\",\"\");try{var m=document.cookie.match(\
 /(?:^|;\\s*)(?:__Host-)?meridian_mode=(light|dark)(?:;|$)/);\
@@ -1191,12 +1251,13 @@ fn document(title: &str, body: &str, chrome: &Chrome, development: bool) -> Stri
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <meta name=\"color-scheme\" content=\"light dark\">\
-         <title>{} · Open Meridian</title>{icon}<script>{HEAD_SCRIPT}</script>{kit}<style>{STYLE}</style></head><body>\n\
+         <title>{} · Open Meridian</title>{icon}<script>{HEAD_SCRIPT}</script>{kit}<style>{STYLE}{docs}</style></head><body>\n\
          {}\n{banner}\n<main class=\"{main}\">\n{}\n</main>\n<script>{CHROME_SCRIPT}</script>{inbox}\n</body></html>\n",
         escape(title),
         header(chrome),
         body,
         icon = crate::brand::LINKS,
+        docs = if body.contains("class=\"docs\"") { DOCS_STYLE } else { "" },
         inbox = if chrome.viewer.is_some() {
             format!("<script>{INBOX_SCRIPT}</script>")
         } else {

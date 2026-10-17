@@ -418,7 +418,7 @@ pub fn follow_sync_statuses(
     bus: Arc<Bus>,
     store: Arc<dyn Store>,
 ) -> impl std::future::Future<Output = ()> {
-    let mut statuses = bus.subscribe(SYNC_STATUS);
+    let mut statuses = bus.subscribe_shared(SYNC_STATUS, "sync-statuses");
 
     async move {
         while let Some(delivery) = statuses.recv().await {
@@ -480,7 +480,7 @@ pub fn follow_replacements(
     bus: Arc<Bus>,
     store: Arc<dyn Store>,
 ) -> impl std::future::Future<Output = ()> {
-    let mut replaced = bus.subscribe(INSTRUMENT_REPLACED);
+    let mut replaced = bus.subscribe_shared(INSTRUMENT_REPLACED, "follow-replacements");
 
     async move {
         while let Some(delivery) = replaced.recv().await {
@@ -791,7 +791,7 @@ mod tests {
     #[tokio::test]
     async fn a_moved_position_is_announced() {
         let (bus, _) = wired();
-        let mut announced = bus.subscribe(CUSTODIAL_POSITION_UPDATED);
+        let mut announced = bus.subscribe_every(CUSTODIAL_POSITION_UPDATED);
         let statement_id = open(&bus).await;
 
         record(&bus, row(&statement_id)).await;
@@ -810,7 +810,7 @@ mod tests {
     async fn an_unresolved_row_announces_nothing() {
         // The fixture's postcondition, over the wire this time.
         let (bus, _) = wired();
-        let mut announced = bus.subscribe(CUSTODIAL_POSITION_UPDATED);
+        let mut announced = bus.subscribe_every(CUSTODIAL_POSITION_UPDATED);
         let statement_id = open(&bus).await;
 
         let mut unresolved = row(&statement_id);
@@ -835,7 +835,7 @@ mod tests {
     #[tokio::test]
     async fn a_completed_statement_is_announced_over_the_bus() {
         let (bus, _) = wired();
-        let mut recorded = bus.subscribe(STATEMENT_RECORDED);
+        let mut recorded = bus.subscribe_every(STATEMENT_RECORDED);
         let statement_id = open(&bus).await;
 
         for n in 0..3 {
@@ -865,7 +865,7 @@ mod tests {
     #[tokio::test]
     async fn an_empty_statement_is_announced_when_it_opens() {
         let (bus, _) = wired();
-        let mut recorded = bus.subscribe(STATEMENT_RECORDED);
+        let mut recorded = bus.subscribe_every(STATEMENT_RECORDED);
 
         let (_, _payload) = bus
             .call(
@@ -1052,7 +1052,7 @@ mod tests {
         // replaced, and the position moves onto the INS- ID.
         let (bus, store) = wired();
         let store: Arc<dyn Store> = store;
-        let mut announced = bus.subscribe(CUSTODIAL_POSITION_UPDATED);
+        let mut announced = bus.subscribe_every(CUSTODIAL_POSITION_UPDATED);
         tokio::spawn(follow_replacements(bus.clone(), store.clone()));
 
         let statement_id = open(&bus).await;
@@ -1131,7 +1131,7 @@ mod tests {
         // moves the position exactly as the event would have.
         let (bus, store) = wired();
         let store: Arc<dyn Store> = store;
-        let mut announced = bus.subscribe(CUSTODIAL_POSITION_UPDATED);
+        let mut announced = bus.subscribe_every(CUSTODIAL_POSITION_UPDATED);
         instrument_store(&bus, Some("INS-01J8XQ4M7K0000000000ZZTP"));
 
         let statement_id = open(&bus).await;
@@ -1176,7 +1176,7 @@ mod tests {
     async fn a_sweep_of_records_not_replaced_moves_nothing() {
         let (bus, store) = wired();
         let store: Arc<dyn Store> = store;
-        let mut announced = bus.subscribe(CUSTODIAL_POSITION_UPDATED);
+        let mut announced = bus.subscribe_every(CUSTODIAL_POSITION_UPDATED);
         let asked = instrument_store(&bus, None);
 
         let statement_id = open(&bus).await;
@@ -1320,7 +1320,7 @@ mod tests {
     #[tokio::test]
     async fn an_activity_arrives_over_the_bus_and_is_announced_once() {
         let (bus, _) = wired();
-        let mut announced = bus.subscribe(ACTIVITY_RECORDED);
+        let mut announced = bus.subscribe_every(ACTIVITY_RECORDED);
         let request = reinvestment("a3f0");
 
         let first = record_activity_over(&bus, &request).await;
@@ -1363,7 +1363,7 @@ mod tests {
         let (bus, store) = wired();
         let store: Arc<dyn Store> = store;
         tokio::spawn(follow_sync_statuses(bus.clone(), store.clone()));
-        let mut announced = bus.subscribe(SYNC_STATUS_RECORDED);
+        let mut announced = bus.subscribe_every(SYNC_STATUS_RECORDED);
         let status = SyncStatusEvent {
             source: "snaptrade".into(),
             account_id: "ACC-1".into(),
@@ -1444,7 +1444,7 @@ mod tests {
     #[tokio::test]
     async fn a_re_resolution_arrives_over_the_bus_and_is_announced_once() {
         let (bus, _) = wired();
-        let mut announced = bus.subscribe(ACTIVITY_RE_RESOLVED);
+        let mut announced = bus.subscribe_every(ACTIVITY_RE_RESOLVED);
         let recorded = record_activity_over(&bus, &reinvestment("oqkr-1")).await;
         let request = ReResolveActivityRequest {
             account_id: "ACC-1".into(),
@@ -1538,7 +1538,7 @@ mod tests {
                 .encode_to_vec(),
             ))
         });
-        let mut announced = bus.subscribe(CUSTODIAL_POSITION_UPDATED);
+        let mut announced = bus.subscribe_every(CUSTODIAL_POSITION_UPDATED);
         let statement_id = open(&bus).await;
         let mut fiat = row(&statement_id);
         fiat.market_value = Some(Money {

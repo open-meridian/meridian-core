@@ -67,6 +67,10 @@ spec:
             - name: MALLOC_ARENA_MAX
               value: {{ . | quote }}
             {{- end }}
+            {{- with .Values.bor.snapshotInterval }}
+            - name: MERIDIAN_BOR_SNAPSHOT_INTERVAL
+              value: {{ . | quote }}
+            {{- end }}
             - name: MERIDIAN_BOR_DATABASE_URL
               valueFrom:
                 secretKeyRef:

@@ -28,7 +28,7 @@ use std::collections::HashMap;
 /// Dated because identifiers are reused: a delisted instrument frees a ticker
 /// and somebody else is given it. A lookup without an as-of is a bug waiting for
 /// a reassignment.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Identifier {
     pub scheme: String,
     pub value: String,
@@ -41,6 +41,11 @@ pub struct Identifier {
 
     /// `None` while the mapping is still current.
     pub valid_to_ns: Option<i64>,
+
+    /// For a listing identifier, the ISO 4217 currency that listing trades
+    /// in, as the platform's master holds it (contract v25, W3.1); empty on
+    /// every other identifier.
+    pub trading_currency: String,
 }
 
 impl Identifier {
@@ -224,6 +229,12 @@ pub struct Local {
     pub migration: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub migration_answer: String,
+    /// The fields a person set or accepted on the record that the
+    /// platform's answer contradicts (contract v25, W3.26), by their names:
+    /// an uncertain line of its own, the person's value shown beside the
+    /// platform's. Empty where none is.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contradicted_fields: Vec<String>,
 }
 
 fn is_zero(value: &i32) -> bool {

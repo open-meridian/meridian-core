@@ -654,7 +654,12 @@ async fn an_answer_is_announced_only_once_it_has_reached_the_broker() {
     let delivered = std::sync::Arc::new(tokio::sync::Notify::new());
     let handler: meridian_bus::Handler =
         std::sync::Arc::new(|_| Ok(("meridian.v1.Answer".to_string(), b"answered".to_vec())));
-    serving.serve_delivered(&subject, handler, std::sync::Arc::clone(&delivered));
+    serving.serve_delivered(
+        &subject,
+        "delivering",
+        handler,
+        std::sync::Arc::clone(&delivered),
+    );
     settle().await;
 
     // Nothing has been asked, so nothing can have been delivered.
@@ -780,5 +785,83 @@ async fn bytes_that_are_not_an_envelope_are_dropped_and_counted() {
             .await
             .is_err(),
         "something that was not an envelope was delivered"
+    );
+}
+
+// ── Queue groups (contract v25; Q15; kernel/the-bus-has-no-queue-groups) ──
+
+#[tokio::test]
+async fn two_copies_of_a_component_share_its_work_and_others_still_hear_each() {
+    // Two processes of one component, subscribed as one of us, see each
+    // message once between them; a plain subscriber elsewhere hears every
+    // one, and another component's copy too.
+    let publisher = bus("publisher").await;
+    let first = bus("street").await;
+    let second = bus("street").await;
+    let dashboard = bus("dashboard").await;
+    let topic = topic("event.work");
+
+    let mut a = first.subscribe_shared(&topic, "keeping");
+    let mut b = second.subscribe_shared(&topic, "keeping");
+    let mut every = dashboard.subscribe_every(&topic);
+    settle().await;
+
+    let sent = 20;
+    for n in 0..sent {
+        publisher
+            .publish(&topic, "meridian.test.Event", vec![n], None, None)
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let drain = |subscription: &mut Subscription| {
+        let mut seen = Vec::new();
+        while let Some(delivery) = subscription.try_recv() {
+            seen.push(delivery.envelope.payload[0]);
+        }
+        seen
+    };
+    let (mut shared, heard) = (drain(&mut a), drain(&mut every));
+    shared.extend(drain(&mut b));
+    shared.sort();
+    assert_eq!(
+        shared,
+        (0..sent).collect::<Vec<u8>>(),
+        "each once between the two"
+    );
+    assert_eq!(
+        heard.len(),
+        sent as usize,
+        "a plain subscriber hears every one"
+    );
+}
+
+#[tokio::test]
+async fn a_request_is_answered_once_by_one_copy_of_the_component() {
+    // Every copy serving a topic is one group: the request is handled once,
+    // not once per copy with the extra answers thrown away.
+    let asking = bus("asking").await;
+    let first = bus("conductor").await;
+    let second = bus("conductor").await;
+    let topic = topic("query.once");
+    let handled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    for copy in [&first, &second] {
+        let counting = Arc::clone(&handled);
+        copy.serve(&topic, move |_| {
+            counting.fetch_add(1, Ordering::SeqCst);
+            Ok(("meridian.test.Answer".to_string(), Vec::new()))
+        });
+    }
+    settle().await;
+    for _ in 0..10 {
+        asking
+            .call(&topic, "meridian.test.Question", Vec::new(), None, None)
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        handled.load(Ordering::SeqCst),
+        10,
+        "each request handled once"
     );
 }

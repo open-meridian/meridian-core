@@ -35,6 +35,10 @@ pub const RECORD_PLUGIN_UPLOAD: &str = "platform.config.command.record-plugin-up
 pub const PLUGIN_CATALOGUE: &str = "platform.config.query.plugin-catalogue";
 pub const LAUNCH_PLUGIN: &str = "platform.config.command.launch-plugin";
 pub const STOP_PLUGIN: &str = "platform.config.command.stop-plugin";
+/// W8.15 (contract v25): a version retired from the catalogue.
+pub const RETIRE_PLUGIN_VERSION: &str = "platform.config.command.retire-plugin-version";
+/// W9.10 (contract v25; ruling 155): the book's health per account.
+pub const READ_BOOK_HEALTH: &str = "platform.book.query.read-book-health";
 
 /// The deployment's registry, as this pod reaches it inside the cluster.
 pub struct Registry {
@@ -66,6 +70,9 @@ pub fn routes() -> Router<Arc<App>> {
             any(pass_through),
         )
         .route("/terminal/plugins", get(list).post(upload))
+        // ReadBookHealthFromTerminal (contract v25; ruling 155): what
+        // `meridian status` reads of the book.
+        .route("/terminal/book-health", get(book_health))
         .route("/terminal/plugins/launch", post(launch))
         .route("/terminal/plugins/stop", post(stop))
         .route(
@@ -221,6 +228,18 @@ fn step<'a>(method: &Method, rest: &'a str) -> Result<Step<'a>, StatusCode> {
     Err(StatusCode::METHOD_NOT_ALLOWED)
 }
 
+/// A path into plugins/{organisation}/{plugin} (W8.14): the repository and
+/// the rest after it, where the rest is no path of plugins/{organisation}
+/// itself and is one after the plugin's name.
+fn nested(method: &Method, organisation: &str, rest: &str) -> Option<(String, String)> {
+    if !matches!(step(method, rest), Err(StatusCode::NOT_FOUND)) {
+        return None;
+    }
+    let (plugin, after) = rest.split_once('/')?;
+    (is_name(plugin) && !matches!(step(method, after), Err(StatusCode::NOT_FOUND)))
+        .then(|| (format!("{organisation}/{plugin}"), after.to_string()))
+}
+
 /// The registry's Location, as the client must follow it: through here.
 fn rewritten(location: &str) -> String {
     let path = match location.find("/v2/") {
@@ -258,6 +277,12 @@ async fn pass_through(
     if !is_name(&name) {
         return refused(StatusCode::NOT_FOUND, "not a plugin's name");
     }
+    // A plugin bundle's repository is plugins/{organisation}/{plugin}
+    // (W8.14): the plugin's name is then the first part of the rest.
+    let (name, rest) = match nested(request.method(), &name, &rest) {
+        Some((repository, rest)) => (repository, rest),
+        None => (name, rest),
+    };
     match step(request.method(), &rest) {
         Err(status) => return refused(status, "not a step of pushing a plugin's image"),
         Ok(Step::Manifest(version)) => {
@@ -340,7 +365,11 @@ fn mounts_from_a_plugin(query: Option<&str>) -> bool {
             return true;
         };
         let from = from.replace("%2F", "/").replace("%2f", "/");
-        from.strip_prefix("plugins/").is_some_and(is_name)
+        from.strip_prefix("plugins/")
+            .is_some_and(|repository| match repository.split_once('/') {
+                Some((organisation, plugin)) => is_name(organisation) && is_name(plugin),
+                None => is_name(repository),
+            })
     })
 }
 
@@ -414,7 +443,8 @@ async fn has_manifest(registry: &Registry, name: &str, digest: &str) -> Result<b
 
 // ── The catalogue ───────────────────────────────────────────────────────────
 
-async fn catalogue(app: &App) -> Result<PluginCatalogue, String> {
+/// The whole catalogue, every version and every launch, live or ended.
+pub(crate) async fn catalogue(app: &App) -> Result<PluginCatalogue, String> {
     catalogue_within(app, Duration::from_secs(10)).await
 }
 
@@ -469,6 +499,55 @@ struct Upload {
     /// (W8.1, contract v11); none from a CLI or a plugin before v11.
     #[serde(default)]
     declaration: Option<crate::declaration::Declared>,
+    /// The vendor's texts from the image's `docs/` (W8.1, contract v25),
+    /// each held by the conductor to the digest and size its declaration
+    /// names; none from a CLI before v25.
+    #[serde(default)]
+    documentation: Vec<UploadedSection>,
+    /// A plugin bundle's (W8.14, contract v25): the listing,
+    /// `organisation/plugin`, whose image and referrers were pushed into
+    /// plugins/{organisation}/{plugin}; empty for a local upload.
+    #[serde(default)]
+    listing: String,
+    /// The registry it was listed in, `community` or `verified`.
+    #[serde(default)]
+    source_registry: String,
+    /// The bundle's dated SigningKeyStatus, as the platform signed it.
+    #[serde(default)]
+    key_status: Option<serde_json::Value>,
+    /// The listing statement, a DSSE envelope as JSON.
+    #[serde(default)]
+    listing_statement: String,
+}
+
+impl Upload {
+    /// Where the image was pushed: plugins/{listing} for a bundle,
+    /// plugins/{name} for a local upload; refused when a bundle's listing is
+    /// not `organisation/plugin` naming this plugin.
+    fn repository(&self) -> Result<&str, String> {
+        if self.listing.is_empty() {
+            return Ok(&self.name);
+        }
+        match self.listing.split_once('/') {
+            Some((organisation, plugin))
+                if is_name(organisation) && is_name(plugin) && plugin == self.name =>
+            {
+                Ok(&self.listing)
+            }
+            _ => Err(format!(
+                "`{}` is not organisation/plugin naming {}",
+                self.listing, self.name
+            )),
+        }
+    }
+}
+
+/// One section's text as the CLI read it from the built image.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UploadedSection {
+    section: String,
+    markdown: String,
 }
 
 async fn upload(
@@ -505,16 +584,28 @@ async fn upload(
             ),
         );
     }
+    let repository = match upload.repository() {
+        Ok(repository) => repository.to_string(),
+        Err(why) => return refused(StatusCode::UNPROCESSABLE_ENTITY, why),
+    };
+    if !upload.listing.is_empty()
+        && (upload.source_registry.is_empty() || upload.key_status.is_none())
+    {
+        return refused(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a plugin bundle names its source registry and carries its key status",
+        );
+    }
     // The image first: a version recorded for an image nobody pushed would be
     // a launch waiting to fail.
-    match has_manifest(registry, &upload.name, &upload.image_digest).await {
+    match has_manifest(registry, &repository, &upload.image_digest).await {
         Ok(true) => {}
         Ok(false) => {
             return refused(
                 StatusCode::CONFLICT,
                 format!(
-                    "{} is not a manifest in plugins/{}; push the image first",
-                    upload.image_digest, upload.name
+                    "{} is not a manifest in plugins/{repository}; push the image first",
+                    upload.image_digest
                 ),
             )
         }
@@ -529,6 +620,22 @@ async fn upload(
         Some(Ok(declaration)) => Some(declaration),
         Some(Err(why)) => return refused(StatusCode::UNPROCESSABLE_ENTITY, why),
     };
+    let documentation: Vec<meridian_domain::v1::DocumentationText> = upload
+        .documentation
+        .into_iter()
+        .map(|text| meridian_domain::v1::DocumentationText {
+            section: text.section,
+            markdown: text.markdown,
+        })
+        .collect();
+    // Ruling 176: a false claim or hostile text in the vendor's
+    // documentation or declaration refuses the upload, naming the rule;
+    // every other match is kept, and screened where it is shown.
+    if let Some(refusal) =
+        crate::documentation::upload_refused(&documentation, declaration.as_ref())
+    {
+        return refused(StatusCode::UNPROCESSABLE_ENTITY, refusal);
+    }
     let request = RecordPluginUploadRequest {
         metadata: Some(PluginMetadata {
             name: upload.name,
@@ -539,6 +646,14 @@ async fn upload(
             declaration,
         }),
         image_digest: upload.image_digest,
+        documentation,
+        listing: upload.listing,
+        source_registry: upload.source_registry,
+        key_status: upload
+            .key_status
+            .map(|status| status.to_string())
+            .unwrap_or_default(),
+        listing_statement: upload.listing_statement,
     };
     let recorded: Result<PluginVersion, String> = ask(
         &app,
@@ -575,6 +690,44 @@ fn state_name(state: i32) -> &'static str {
         Ok(PluginLaunchState::Failed) => "failed",
         _ => "unknown",
     }
+}
+
+/// The book's health per account, every page read (W9.10, contract v25;
+/// ruling 155), for a deployment admin's terminal: each account's journal,
+/// the entries a command replays after its last snapshot, and when that was
+/// taken. A count about the book's own working, never an account's data.
+async fn book_health(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    let admin = match admin(&app, &headers).await {
+        Ok(admin) => admin,
+        Err(refusal) => return *refusal,
+    };
+    let mut accounts = Vec::new();
+    let mut cursor = String::new();
+    loop {
+        let page: meridian_domain::v1::ReadBookHealthReply = match ask(
+            &app,
+            &admin,
+            READ_BOOK_HEALTH,
+            "meridian.v1.ReadBookHealthRequest",
+            meridian_domain::v1::ReadBookHealthRequest {
+                account_id: String::new(),
+                page_size: 1_000,
+                cursor: cursor.clone(),
+            },
+            Duration::from_secs(20),
+        )
+        .await
+        {
+            Ok(page) => page,
+            Err(failed) => return refused(StatusCode::BAD_GATEWAY, failed),
+        };
+        accounts.extend(page.accounts.iter().map(crate::mcp::book::book_health_json));
+        if page.next_cursor.is_empty() || accounts.len() >= 100_000 {
+            break;
+        }
+        cursor = page.next_cursor;
+    }
+    json(StatusCode::OK, serde_json::json!({ "accounts": accounts }))
 }
 
 async fn list(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {

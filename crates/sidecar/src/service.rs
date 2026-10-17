@@ -166,6 +166,17 @@ pub struct Sidecar {
     /// The keys this instance filed a new ticket under within the hour, for
     /// its rate (W4.12, [`crate::tickets`]).
     pub(crate) filed: crate::tickets::Filed,
+
+    /// The declaration a sidecar no launch made holds its plugin's
+    /// registration to (W4.1, contract v25): a test harness's, given the
+    /// declaration an upload would carry, so its plugin is held as a
+    /// launched one is. Only ever a stricter check: a catalogue launch's
+    /// declaration, from the conductor, wins.
+    pub(crate) harnessed: Option<meridian_pb::v1::PluginDeclaration>,
+
+    /// What it carried per UTC day, for the plugin usage report (W5.19,
+    /// contract v25).
+    pub(crate) daily: Arc<crate::daily::Daily>,
 }
 
 impl Sidecar {
@@ -226,7 +237,16 @@ impl Sidecar {
             changed: Arc::default(),
             verifier: None,
             filed: Arc::default(),
+            harnessed: None,
+            daily: Arc::default(),
         }
+    }
+
+    /// Hold registration to `declaration` where no launch is known
+    /// ([`Sidecar::harnessed`]).
+    pub fn held_to(mut self, declaration: meridian_pb::v1::PluginDeclaration) -> Self {
+        self.harnessed = Some(declaration);
+        self
     }
 
     /// Verifying the person a command is sent for with the dashboard's keys,
@@ -315,6 +335,67 @@ impl SidecarService for Sidecar {
                 refusal_reason,
                 ..Default::default()
             }));
+        }
+
+        // Held to the version (W4.1, contract v25): a plugin declaring v25 or
+        // later registers what the version it was launched from was uploaded
+        // with, or is refused naming the first difference, as a version out
+        // of range is; a version uploaded with no declaration cannot be held
+        // to it, and is refused naming that. A live instance on a development
+        // deployment differs by design: the difference is a warning on its
+        // Summary. A sidecar no launch made -- a test harness's -- holds
+        // nothing to compare.
+        let mut held_warning = None;
+        if crate::contract::declared(&req.schema_version) >= 25 {
+            let configuration = match self.configuration.current(self.clock.now_ns()).await {
+                Ok(configuration) => configuration,
+                Err(failed) => {
+                    return Ok(Response::new(RegisterReply {
+                        admitted: false,
+                        refusal_reason: format!(
+                            "the declaration its version was uploaded with could not be read \
+                             ({}); register again",
+                            failed.message()
+                        ),
+                        ..Default::default()
+                    }));
+                }
+            };
+            let difference = match (&configuration.declaration, configuration.launched) {
+                // A harness's sidecar, given the declaration an upload carries.
+                (_, false) => self.harnessed.as_ref().and_then(|uploaded| {
+                    crate::held::difference(&req, uploaded).map(|first| {
+                        format!("{first}, unlike the declaration its version was uploaded with")
+                    })
+                }),
+                (None, true) => Some(
+                    "its version was uploaded with no declaration, so a plugin declaring v25 \
+                     cannot be held to it; upload the version again with a CLI that sends \
+                     the declaration"
+                        .to_string(),
+                ),
+                (Some(uploaded), true) => crate::held::difference(&req, uploaded).map(|first| {
+                    format!("{first}, unlike the declaration its version was uploaded with")
+                }),
+            };
+            if let Some(difference) = difference {
+                if self.live.get().is_some() {
+                    tracing::warn!(instance = self.identity.instance_id, "{difference}");
+                    held_warning = Some(format!(
+                        "a live instance differing from its version: {difference}"
+                    ));
+                } else {
+                    tracing::warn!(
+                        instance = self.identity.instance_id,
+                        "registration refused: {difference}"
+                    );
+                    return Ok(Response::new(RegisterReply {
+                        admitted: false,
+                        refusal_reason: difference,
+                        ..Default::default()
+                    }));
+                }
+            }
         }
 
         // A page, if the plugin serves one, on a port that is a port. Refused
@@ -469,8 +550,9 @@ impl SidecarService for Sidecar {
         // the accounts it touches and the page it is made on, each refused
         // by name with the plugin admitted.
         let (tools, preparable_refusals) = crate::tools::preparable(tools, &pages);
-        let tool_refusals: Vec<String> = tool_refusals
+        let tool_refusals: Vec<String> = held_warning
             .into_iter()
+            .chain(tool_refusals)
             .chain(preparable_refusals)
             .collect();
         for refusal in &tool_refusals {
@@ -783,6 +865,166 @@ mod tests {
             schema_version: "v4".into(),
             ..Default::default()
         }
+    }
+
+    /// W4.1 (contract v25): a sidecar whose conductor answers the launch's
+    /// configuration as given.
+    fn configured(configuration: meridian_domain::v1::PluginConfiguration) -> Sidecar {
+        let sc = sidecar();
+        sc.bus
+            .serve(crate::configuration::PLUGIN_CONFIGURATION, move |_| {
+                Ok((
+                    "meridian.v1.PluginConfiguration".into(),
+                    prost::Message::encode_to_vec(&configuration),
+                ))
+            });
+        sc
+    }
+
+    fn uploaded() -> meridian_pb::v1::PluginDeclaration {
+        meridian_pb::v1::PluginDeclaration {
+            settings: vec![meridian_pb::v1::SettingDeclaration {
+                name: "region".into(),
+                label: "Region".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn v25(declaration: meridian_pb::v1::PluginDeclaration) -> RegisterRequest {
+        RegisterRequest {
+            schema_version: "v25".into(),
+            settings: declaration.settings.clone(),
+            declaration: Some(declaration),
+            ..Default::default()
+        }
+    }
+
+    async fn reply(sc: &Sidecar, request: RegisterRequest) -> RegisterReply {
+        sc.register(Request::new(request))
+            .await
+            .unwrap()
+            .into_inner()
+    }
+
+    #[tokio::test]
+    async fn a_v25_registration_is_held_to_the_declaration_its_version_was_uploaded_with() {
+        let launch = meridian_domain::v1::PluginConfiguration {
+            plugin_instance_id: "custody-snaptrade-1".into(),
+            declaration: Some(uploaded()),
+            launched: true,
+            ..Default::default()
+        };
+        // Equal: admitted.
+        assert!(
+            reply(&configured(launch.clone()), v25(uploaded()))
+                .await
+                .admitted
+        );
+        // A setting the version did not declare: refused naming it, with no
+        // RefusalReason code, as a version out of range is.
+        let mut more = uploaded();
+        more.settings.push(meridian_pb::v1::SettingDeclaration {
+            name: "extra".into(),
+            ..Default::default()
+        });
+        let refused = reply(&configured(launch.clone()), v25(more.clone())).await;
+        assert!(!refused.admitted);
+        assert!(
+            refused.refusal_reason.contains(
+                "registers the setting extra, which its version did not declare, unlike the \
+                 declaration its version was uploaded with"
+            ),
+            "{}",
+            refused.refusal_reason
+        );
+        // The same difference on a live instance: admitted, a warning on its
+        // Summary.
+        let live = configured(launch.clone());
+        live.go_live(Arc::new(crate::live::Live::new(
+            std::env::temp_dir(),
+            live.clock.clone(),
+        )));
+        assert!(reply(&live, v25(more)).await.admitted);
+        let warned = live.admitted().unwrap().tool_refusals;
+        assert!(
+            warned[0].starts_with(
+                "a live instance differing from its version: it registers the setting extra"
+            ),
+            "{warned:?}"
+        );
+        // A plugin declaring v24 is admitted unchecked against what it never declared.
+        let mut older = v25(uploaded());
+        older.schema_version = "v24".into();
+        older.settings.clear();
+        assert!(reply(&configured(launch), older).await.admitted);
+    }
+
+    #[tokio::test]
+    async fn a_v25_registration_of_a_version_uploaded_with_no_declaration_is_refused() {
+        let launch = meridian_domain::v1::PluginConfiguration {
+            plugin_instance_id: "custody-snaptrade-1".into(),
+            launched: true,
+            ..Default::default()
+        };
+        let refused = reply(&configured(launch), v25(uploaded())).await;
+        assert!(!refused.admitted);
+        assert!(
+            refused
+                .refusal_reason
+                .contains("uploaded with no declaration"),
+            "{}",
+            refused.refusal_reason
+        );
+        // A sidecar no launch made, as a test harness starts one, holds
+        // nothing to compare.
+        let harnessed = meridian_domain::v1::PluginConfiguration {
+            plugin_instance_id: "custody-snaptrade-1".into(),
+            ..Default::default()
+        };
+        assert!(
+            reply(&configured(harnessed), v25(uploaded()))
+                .await
+                .admitted
+        );
+    }
+
+    /// A harness's sidecar (contract v25): no launch, its registration held
+    /// to the declaration it was given, as a launched one's is.
+    #[tokio::test]
+    async fn a_harnessed_sidecar_holds_registration_to_the_declaration_it_was_given() {
+        let harnessed = meridian_domain::v1::PluginConfiguration {
+            plugin_instance_id: "custody-snaptrade-1".into(),
+            ..Default::default()
+        };
+        let held = || configured(harnessed.clone()).held_to(uploaded());
+        assert!(reply(&held(), v25(uploaded())).await.admitted);
+        let mut more = uploaded();
+        more.reads_external_accounts = true;
+        let refused = reply(&held(), v25(more)).await;
+        assert!(!refused.admitted);
+        assert!(
+            refused
+                .refusal_reason
+                .contains("a declaration whose reads_external_accounts differs"),
+            "{}",
+            refused.refusal_reason
+        );
+        // A catalogue launch's declaration wins over the one it was given.
+        let launch = meridian_domain::v1::PluginConfiguration {
+            plugin_instance_id: "custody-snaptrade-1".into(),
+            declaration: Some(uploaded()),
+            launched: true,
+            ..Default::default()
+        };
+        let mut given = uploaded();
+        given.secret_settings = vec!["other".into()];
+        assert!(
+            reply(&configured(launch).held_to(given), v25(uploaded()))
+                .await
+                .admitted
+        );
     }
 
     async fn admitted_sidecar() -> Sidecar {
@@ -1103,7 +1345,7 @@ mod tests {
 
     #[tokio::test]
     async fn admission_is_refused_for_a_contract_outside_the_range() {
-        for declared in ["v1", "v25"] {
+        for declared in ["v1", "v26"] {
             let sc = sidecar();
             let mut req = register_req();
             req.schema_version = declared.into();
@@ -1112,7 +1354,7 @@ mod tests {
             assert!(!reply.admitted, "{declared} was admitted");
             // Both halves: what was declared, and what would be accepted.
             assert!(reply.refusal_reason.contains(declared));
-            assert!(reply.refusal_reason.contains("v2 through v24"));
+            assert!(reply.refusal_reason.contains("v2 through v25"));
             assert!(sc.registration().is_none());
         }
     }

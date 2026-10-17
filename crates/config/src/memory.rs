@@ -50,6 +50,21 @@ pub struct MemoryStore {
     link_changes: Mutex<Vec<ConnectivityLinkChange>>,
     map_changes: Mutex<Vec<VenueAccountMapChange>>,
     catalogues: Mutex<Vec<(i64, VenueCatalogue)>>,
+    /// Each version's documentation as uploaded (W8.1, contract v25).
+    documentation: Mutex<
+        std::collections::BTreeMap<(String, String), Vec<meridian_domain::v1::DocumentationText>>,
+    >,
+    /// Each declaration of the licensed schemes, in order (W3.28, v25).
+    licensed_schemes: Mutex<Vec<(Vec<String>, Author, i64)>>,
+    /// Who retired each version, through what (W8.15, contract v25).
+    retirements: Mutex<std::collections::BTreeMap<(String, String), Author>>,
+    installations: Mutex<std::collections::BTreeMap<(String, String), Author>>,
+    /// The registries (contract v25): the catalogue's copy, each listed
+    /// version's statement, the usage setting's changes and the reports.
+    registry: Mutex<Option<crate::store::HeldCatalogue>>,
+    statements: Mutex<std::collections::BTreeMap<(String, String), String>>,
+    reports_plugin_usage: Mutex<Vec<(bool, Author, i64)>>,
+    plugin_usage_reports: Mutex<Vec<meridian_domain::v1::SentPluginUsageReport>>,
 }
 
 impl MemoryStore {
@@ -72,6 +87,10 @@ impl MemoryStore {
             holds: Mutex::new(Vec::new()),
             reports_usage: Mutex::new(Vec::new()),
             usage_reports: Mutex::new(Vec::new()),
+            registry: Mutex::new(None),
+            statements: Mutex::new(Default::default()),
+            reports_plugin_usage: Mutex::new(Vec::new()),
+            plugin_usage_reports: Mutex::new(Vec::new()),
             archives: Mutex::new(Vec::new()),
             launch_notes: Mutex::new(Vec::new()),
             moves: Mutex::new(Vec::new()),
@@ -81,6 +100,10 @@ impl MemoryStore {
             link_changes: Mutex::new(Vec::new()),
             map_changes: Mutex::new(Vec::new()),
             catalogues: Mutex::new(Vec::new()),
+            retirements: Mutex::new(Default::default()),
+            installations: Mutex::new(Default::default()),
+            licensed_schemes: Mutex::new(Vec::new()),
+            documentation: Mutex::new(Default::default()),
         }
     }
 
@@ -553,7 +576,11 @@ impl Store for MemoryStore {
             .collect())
     }
 
-    fn record_plugin_version(&self, version: &PluginVersion) -> Result<bool> {
+    fn record_plugin_version_documented(
+        &self,
+        version: &PluginVersion,
+        documentation: &[meridian_domain::v1::DocumentationText],
+    ) -> Result<bool> {
         let mut state = self.state.lock().expect("store lock poisoned");
         let metadata = version.metadata.clone().unwrap_or_default();
         let recorded = state.catalogue.versions.iter().any(|held| {
@@ -565,7 +592,63 @@ impl Store for MemoryStore {
             return Ok(false);
         }
         state.catalogue.versions.push(version.clone());
+        self.documentation
+            .lock()
+            .expect("store lock poisoned")
+            .insert((metadata.name, metadata.version), documentation.to_vec());
         Ok(true)
+    }
+
+    fn plugin_documentation(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<Vec<meridian_domain::v1::DocumentationText>> {
+        Ok(self
+            .documentation
+            .lock()
+            .expect("store lock poisoned")
+            .get(&(name.to_string(), version.to_string()))
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn retire_plugin_version(
+        &self,
+        name: &str,
+        version: &str,
+        author: &Author,
+        at_ns: i64,
+    ) -> Result<Option<PluginVersion>> {
+        let mut state = self.state.lock().expect("store lock poisoned");
+        let Some(held) = state.catalogue.versions.iter_mut().find(|held| {
+            held.metadata
+                .as_ref()
+                .is_some_and(|m| m.name == name && m.version == version)
+        }) else {
+            return Ok(None);
+        };
+        if held.retired_at_ns != 0 {
+            return Ok(None);
+        }
+        held.retired_by = author.by.clone();
+        held.retired_at_ns = at_ns;
+        held.retired_note = author.note.clone();
+        let retired = held.clone();
+        self.retirements
+            .lock()
+            .expect("store lock poisoned")
+            .insert((name.to_string(), version.to_string()), author.clone());
+        Ok(Some(retired))
+    }
+
+    fn retirement(&self, name: &str, version: &str) -> Result<Option<Author>> {
+        Ok(self
+            .retirements
+            .lock()
+            .expect("store lock poisoned")
+            .get(&(name.to_string(), version.to_string()))
+            .cloned())
     }
 
     fn begin_launch(&self, launch: &PluginLaunch, note: &str) -> Result<bool> {
@@ -1057,6 +1140,24 @@ impl Store for MemoryStore {
             .is_none_or(|(on, _, _)| *on))
     }
 
+    fn set_licensed_schemes(&self, schemes: &[String], author: &Author, at_ns: i64) -> Result<()> {
+        self.licensed_schemes
+            .lock()
+            .expect("store lock poisoned")
+            .push((schemes.to_vec(), author.clone(), at_ns));
+        Ok(())
+    }
+
+    fn licensed_schemes(&self) -> Result<Vec<String>> {
+        Ok(self
+            .licensed_schemes
+            .lock()
+            .expect("store lock poisoned")
+            .last()
+            .map(|(schemes, _, _)| schemes.clone())
+            .unwrap_or_default())
+    }
+
     fn record_usage_report(&self, report: &meridian_domain::v1::SentUsageReport) -> Result<()> {
         self.usage_reports
             .lock()
@@ -1076,4 +1177,134 @@ impl Store for MemoryStore {
             .cloned()
             .collect())
     }
+
+    fn registry_catalogue(&self) -> Result<Option<crate::store::HeldCatalogue>> {
+        #[cfg(test)]
+        blocks_like_postgres();
+        Ok(self.registry.lock().expect("store lock poisoned").clone())
+    }
+
+    fn put_registry_catalogue(&self, held: &crate::store::HeldCatalogue) -> Result<()> {
+        #[cfg(test)]
+        blocks_like_postgres();
+        *self.registry.lock().expect("store lock poisoned") = Some(held.clone());
+        Ok(())
+    }
+
+    fn record_listed_version(
+        &self,
+        version: &PluginVersion,
+        documentation: &[meridian_domain::v1::DocumentationText],
+        listing_statement: &str,
+        by: &Author,
+    ) -> Result<bool> {
+        let recorded = self.record_plugin_version_documented(version, documentation)?;
+        if recorded {
+            let metadata = version.metadata.clone().unwrap_or_default();
+            let key = (metadata.name, metadata.version);
+            self.statements
+                .lock()
+                .expect("store lock poisoned")
+                .insert(key.clone(), listing_statement.to_string());
+            self.installations
+                .lock()
+                .expect("store lock poisoned")
+                .insert(key, by.clone());
+        }
+        Ok(recorded)
+    }
+
+    fn installation(&self, name: &str, version: &str) -> Result<Option<Author>> {
+        Ok(self
+            .installations
+            .lock()
+            .expect("store lock poisoned")
+            .get(&(name.to_string(), version.to_string()))
+            .cloned())
+    }
+
+    fn listing_statement(&self, name: &str, version: &str) -> Result<String> {
+        Ok(self
+            .statements
+            .lock()
+            .expect("store lock poisoned")
+            .get(&(name.to_string(), version.to_string()))
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn acknowledge_pull(
+        &self,
+        instance_id: &str,
+        acknowledgement: &meridian_domain::v1::PullAcknowledgement,
+    ) -> Result<Option<PluginLaunch>> {
+        let mut state = self.state.lock().expect("store lock poisoned");
+        Ok(state
+            .catalogue
+            .launches
+            .iter_mut()
+            .find(|held| {
+                held.instance_id == instance_id && held.state == PluginLaunchState::Launched as i32
+            })
+            .map(|launch| {
+                launch.pull_acknowledgement = Some(acknowledgement.clone());
+                launch.clone()
+            }))
+    }
+
+    fn set_reports_plugin_usage(&self, on: bool, author: &Author, at_ns: i64) -> Result<()> {
+        self.reports_plugin_usage
+            .lock()
+            .expect("store lock poisoned")
+            .push((on, author.clone(), at_ns));
+        Ok(())
+    }
+
+    fn reports_plugin_usage(&self) -> Result<bool> {
+        Ok(self
+            .reports_plugin_usage
+            .lock()
+            .expect("store lock poisoned")
+            .last()
+            .is_none_or(|(on, _, _)| *on))
+    }
+
+    fn record_plugin_usage_report(
+        &self,
+        report: &meridian_domain::v1::SentPluginUsageReport,
+    ) -> Result<()> {
+        self.plugin_usage_reports
+            .lock()
+            .expect("store lock poisoned")
+            .push(report.clone());
+        Ok(())
+    }
+
+    fn plugin_usage_reports(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<meridian_domain::v1::SentPluginUsageReport>> {
+        Ok(self
+            .plugin_usage_reports
+            .lock()
+            .expect("store lock poisoned")
+            .iter()
+            .rev()
+            .take(limit)
+            .cloned()
+            .collect())
+    }
+}
+
+/// What the Postgres store does on a thread driving async tasks: its client
+/// starts a runtime of its own, which panics there. The registries' copy is
+/// read on async paths (the hourly pull, a fetch the bus's handler waits
+/// on), so the memory store does the same with it in core's tests, and a
+/// call that would block a runtime in production fails here first.
+#[cfg(test)]
+fn blocks_like_postgres() {
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("a runtime")
+        .block_on(async {});
 }

@@ -72,10 +72,11 @@ spec:
           env:
             - name: REGISTRY_HTTP_ADDR
               value: ":5000"
-            # Nothing uploaded is deleted through the registry's own API;
-            # removing a plugin is the conductor's, when it is designed.
+            # From contract v25 the conductor releases a retired version's
+            # image (W8.15), deleting its manifest by digest; nothing outside
+            # the cluster deletes, since the dashboard's upload refuses it.
             - name: REGISTRY_STORAGE_DELETE_ENABLED
-              value: "false"
+              value: "true"
           ports:
             - containerPort: 5000
           readinessProbe:

@@ -140,7 +140,7 @@ impl Configuration {
     /// Forget the configuration whenever the conductor says this plugin's
     /// changed, and wake whatever streams it.
     fn forget_on_change(&self) {
-        let mut changes = self.bus.subscribe(PLUGIN_CONFIGURATION_CHANGED);
+        let mut changes = self.bus.subscribe_every(PLUGIN_CONFIGURATION_CHANGED);
         let configuration = self.clone();
         let instance = self.instance.clone();
         tokio::spawn(async move {

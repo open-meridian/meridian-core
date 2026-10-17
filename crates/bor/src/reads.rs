@@ -10,10 +10,8 @@
 
 use meridian_domain::v1::{AccountAttributes, AccountFigures, BookPosition, Break, JournalRef};
 
-use crate::book::{agreement_key, Book};
-use crate::store::{
-    FiguresRead, Mark, Page, PositionsRead, Result, Store, StoreError, FIRST_PARTITION,
-};
+use crate::book::agreement_key;
+use crate::store::{FiguresRead, Mark, Page, PositionsRead, Result, Store, StoreError};
 
 fn prefixed(parts: &[&str]) -> String {
     parts
@@ -142,13 +140,8 @@ pub fn positions_as_of(store: &dyn Store, read: &PositionsRead) -> Result<Page<B
     };
     let mut records = Vec::new();
     for account in replayed_accounts(store, &read.scope, &read.account_id)? {
-        let entries = store.journal(&account)?;
-        let partition = entries
-            .first()
-            .map(|entry| entry.partition.clone())
-            .unwrap_or_else(|| FIRST_PARTITION.to_string());
-        let at = as_of.get(&partition).copied();
-        let book = Book::as_of(&account, &partition, &entries, Some(at.unwrap_or(0)), until)?;
+        // From the latest snapshot holding nothing later (contract v25).
+        let book = store.book_as_of(&account, &as_of, until)?;
         for position in book.positions.values() {
             if position.removed {
                 continue;
@@ -174,13 +167,7 @@ pub fn figures_as_of(store: &dyn Store, read: &FiguresRead) -> Result<Page<Accou
     let as_of = read.at.clone().unwrap_or_else(|| heads.clone());
     let mut records = Vec::new();
     for account in replayed_accounts(store, &read.scope, &read.account_id)? {
-        let entries = store.journal(&account)?;
-        let partition = entries
-            .first()
-            .map(|entry| entry.partition.clone())
-            .unwrap_or_else(|| FIRST_PARTITION.to_string());
-        let at = as_of.get(&partition).copied().unwrap_or(0);
-        let book = Book::as_of(&account, &partition, &entries, Some(at), None)?;
+        let book = store.book_as_of(&account, &as_of, None)?;
         records.extend(book.figures.into_values());
     }
     let mut records: Vec<AccountFigures> = records

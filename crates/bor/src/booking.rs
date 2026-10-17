@@ -857,9 +857,11 @@ fn alert(
             state: AlertState::Raised as i32,
             reason,
             subject: Some(subject),
-            // The operations plugin's affirmation_deadline has no carrier in
-            // the contract yet, so a held booking's alert names no moment it
-            // is due by; zero, as the field reads for every other alert.
+            // From contract v25 the operations plugin's declaration carries
+            // its affirmation_deadline (W11.34), but no row brings a
+            // version's declaration to the book and the deployment names no
+            // time zone of its own, so a held booking's alert still names no
+            // moment it is due by: zero, as W11.34 reads it with none known.
             due_by: 0,
             last_change: None,
         },
@@ -1597,12 +1599,9 @@ pub fn held_alerts_for(ctx: &Context, book: &Book, acts: &[Act]) -> Vec<Act> {
 
 // ── W11.32: a give-up's answer ─────────────────────────────────────────────
 
-pub fn report_give_up(
-    book: &Book,
-    head: u64,
-    ctx: &Context,
-    request: &ReportGiveUpRequest,
-) -> Result<Made> {
+/// A give-up's answer held to its shape: accepted or rejected (W11.32); what
+/// a fact kept unplaced is held to as well (contract v25).
+pub fn give_up_holds(request: &ReportGiveUpRequest) -> Result<GiveUpAnswer> {
     let answer = GiveUpAnswer::try_from(request.answer).unwrap_or(GiveUpAnswer::Unspecified);
     if answer == GiveUpAnswer::Unspecified {
         return Err(malformed(
@@ -1610,6 +1609,16 @@ pub fn report_give_up(
             "a give-up's answer is accepted or rejected",
         ));
     }
+    Ok(answer)
+}
+
+pub fn report_give_up(
+    book: &Book,
+    head: u64,
+    ctx: &Context,
+    request: &ReportGiveUpRequest,
+) -> Result<Made> {
+    let answer = give_up_holds(request)?;
     let Some(execution) = book.ledger.executions.get(&request.execution_id) else {
         return Err(malformed(
             &["execution_id"],

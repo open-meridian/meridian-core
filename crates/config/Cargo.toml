@@ -22,6 +22,16 @@ meridian-pb.workspace = true
 # (decisions/020), compiled in as the sidecar's are.
 meridian-sidecar = { path = "../sidecar" }
 prost.workspace = true
+# A version's documentation held to the digests its declaration names (W8.1,
+# contract v25). Already in the tree.
+sha2.workspace = true
+hex.workspace = true
+# What the conductor installs from a registry, verified offline against the
+# platform's keys (registries::verify, contract v25): ECDSA P-256 over DSSE,
+# the platform's canonical JSON. Each already in the tree.
+ring.workspace = true
+base64.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 postgres.workspace = true

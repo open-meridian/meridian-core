@@ -97,6 +97,53 @@ pub const DEFINE_ACCOUNT: &str = "platform.config.command.define-account";
 pub const CLOSE_ACCOUNT: &str = "platform.config.command.close-account";
 /// W3.28 (contract v24): the usage statistics' setting, and the reports sent.
 pub const SET_REPORTS_USAGE: &str = "platform.config.command.set-reports-usage";
+/// W3.28 (contract v25): the identifier schemes declared as licensed.
+pub const SET_LICENSED_SCHEMES: &str = "platform.config.command.set-licensed-schemes";
+
+/// A declaration of the licensed schemes held to its rules (W3.28, contract
+/// v25): each a scheme family the licence list names (`listed`; the list the
+/// deployment sends by where none is kept), named once, at most
+/// [`MOST_LICENSED_SCHEMES`]; refused naming the scheme by its path. In the
+/// order given, lower-cased and trimmed.
+pub fn licensed_schemes_held(
+    asked: &[String],
+    listed: Option<&[String]>,
+) -> Result<Vec<String>, String> {
+    if asked.len() > MOST_LICENSED_SCHEMES {
+        return Err(meridian_bus::refusal_with_status(
+            meridian_bus::RefusalStatus::InvalidArgument,
+            &["licensed_schemes".to_string()],
+            format!("at most {MOST_LICENSED_SCHEMES} schemes"),
+        ));
+    }
+    let mut held: Vec<String> = Vec::new();
+    for (index, scheme) in asked.iter().enumerate() {
+        let scheme = scheme.trim().to_ascii_lowercase();
+        let path = format!("licensed_schemes[{index}]");
+        let named = listed.is_none_or(|listed| listed.iter().any(|on| on == &scheme));
+        if scheme.is_empty() || !named {
+            return Err(meridian_bus::refusal_with_status(
+                meridian_bus::RefusalStatus::InvalidArgument,
+                &[path],
+                format!(
+                    "{scheme:?} is not a scheme the licence list names{}",
+                    listed
+                        .map(|listed| format!(" ({})", listed.join(", ")))
+                        .unwrap_or_default()
+                ),
+            ));
+        }
+        if held.contains(&scheme) {
+            return Err(meridian_bus::refusal_with_status(
+                meridian_bus::RefusalStatus::InvalidArgument,
+                &[path],
+                format!("{scheme} is named twice"),
+            ));
+        }
+        held.push(scheme);
+    }
+    Ok(held)
+}
 pub const LIST_USAGE_REPORTS: &str = "platform.config.query.list-usage-reports";
 pub const LINK_EXTERNAL_ACCOUNT: &str = "platform.config.command.link-external-account";
 pub const ACCOUNTS: &str = "platform.config.query.accounts";
@@ -145,7 +192,19 @@ pub trait Upstream: Send + Sync {
         &self,
         bundle: &DiagnosticBundle,
     ) -> Result<DiagnosticBundleReceipt, String>;
+
+    /// The scheme families the platform's licence list names (W3.25), which
+    /// a declaration of the licensed schemes is held to (contract v25,
+    /// W3.28): the conductor's latest copy, or before one is read, the list
+    /// the deployment sends by. None where the conductor keeps none.
+    fn licence_schemes(&self) -> Option<Vec<String>> {
+        None
+    }
 }
+
+/// The most schemes a declaration of the licensed schemes names, as the
+/// usage report carries at most.
+pub const MOST_LICENSED_SCHEMES: usize = 64;
 
 /// The built-in access group of the dashboard's own capabilities, as the
 /// store seeds it.
@@ -307,7 +366,36 @@ fn told(snapshot: &Snapshot, plugin_instance_id: &str) -> PluginConfiguration {
         connectivity_link: connectivity.connectivity_link,
         connectivity_links: connectivity.connectivity_links,
         venue_account_map: connectivity.venue_account_map,
+        declaration: launched_declaration(snapshot, plugin_instance_id),
+        launched: snapshot
+            .catalogue
+            .launches
+            .iter()
+            .any(|launch| launch.instance_id == plugin_instance_id),
     }
+}
+
+/// The declaration the instance's launched version was uploaded with (W4.1,
+/// contract v25), which its sidecar holds the plugin's registration to;
+/// none for an instance not launched from the catalogue, or a version
+/// uploaded with none.
+fn launched_declaration(
+    snapshot: &Snapshot,
+    plugin_instance_id: &str,
+) -> Option<meridian_pb::v1::PluginDeclaration> {
+    let launch = snapshot
+        .catalogue
+        .launches
+        .iter()
+        .find(|launch| launch.instance_id == plugin_instance_id)?;
+    snapshot
+        .catalogue
+        .versions
+        .iter()
+        .filter_map(|version| version.metadata.as_ref())
+        .find(|metadata| metadata.name == launch.name && metadata.version == launch.version)?
+        .declaration
+        .clone()
 }
 
 /// What a sidecar is told about its plugin, derived from one snapshot:
@@ -1511,6 +1599,61 @@ pub fn serve_with(
             }
             Ok(meridian_domain::v1::ReportsUsageSetting {
                 reports_usage: cx.store.reports_usage().map_err(|f| f.to_string())?,
+                licensed_schemes: cx.store.licensed_schemes().map_err(|f| f.to_string())?,
+            })
+        },
+    );
+
+    // W3.28 (contract v25): the identifier schemes the deployment declares
+    // it is licensed for, the deployment admin's, the whole list each time,
+    // each a scheme the licence list names, each change its own record.
+    answer(
+        &context,
+        SET_LICENSED_SCHEMES,
+        (
+            "meridian.v1.SetLicensedSchemesRequest",
+            "meridian.v1.ReportsUsageSetting",
+        ),
+        |cx, request: meridian_domain::v1::SetLicensedSchemesRequest, envelope| {
+            let by = subject(envelope);
+            if by.is_empty() {
+                return Err(
+                    "the licensed schemes are a deployment admin's, and this is sent for nobody"
+                        .into(),
+                );
+            }
+            if request.reason.trim().is_empty() {
+                return Err(meridian_bus::refusal_naming(
+                    meridian_pb::v1::RefusalReason::ReasonRequired as i32,
+                    &["reason".to_string()],
+                    "reason: a change to the licensed schemes says why",
+                ));
+            }
+            if request.reason.chars().count() > 4_000 {
+                return Err("reason: at most 4,000 characters".into());
+            }
+            let listed = cx.upstream.licence_schemes();
+            let schemes = licensed_schemes_held(&request.licensed_schemes, listed.as_deref())?;
+            if cx.store.licensed_schemes().map_err(|f| f.to_string())? != schemes {
+                cx.store
+                    .set_licensed_schemes(
+                        &schemes,
+                        &Author {
+                            note: request.reason.trim().to_string(),
+                            ..author(envelope)
+                        },
+                        cx.clock.now_ns(),
+                    )
+                    .map_err(|f| f.to_string())?;
+                tracing::info!(
+                    schemes = schemes.join(","),
+                    by,
+                    "the licensed schemes changed"
+                );
+            }
+            Ok(meridian_domain::v1::ReportsUsageSetting {
+                reports_usage: cx.store.reports_usage().map_err(|f| f.to_string())?,
+                licensed_schemes: schemes,
             })
         },
     );
@@ -1526,8 +1669,10 @@ pub fn serve_with(
             Ok(meridian_domain::v1::ListUsageReportsReply {
                 reports: cx.store.usage_reports(52).map_err(|f| f.to_string())?,
                 // The setting in force, so the page says whether the report
-                // is on (W3.28, contract v24).
+                // is on (W3.28, contract v24), and the schemes declared
+                // (contract v25).
                 reports_usage: cx.store.reports_usage().map_err(|f| f.to_string())?,
+                licensed_schemes: cx.store.licensed_schemes().map_err(|f| f.to_string())?,
             })
         },
     );
@@ -1540,11 +1685,23 @@ pub fn serve_with(
             "meridian.v1.ExternalAccountLink",
         ),
         |cx, request: LinkExternalAccountRequest, envelope| {
-            let by = admin_acting(envelope, "a link")?;
+            // Expected refusals carry their category (contract v25), as the
+            // rules' do: a link sent for nobody, or naming another plugin.
+            let by = admin_acting(envelope, "a link").map_err(|words| {
+                meridian_bus::refusal_with_status(
+                    meridian_bus::RefusalStatus::PermissionDenied,
+                    &[],
+                    words,
+                )
+            })?;
             if publisher(envelope) != request.plugin_instance_id {
-                return Err(format!(
-                    "a plugin links only its own external accounts, and this names {}",
-                    request.plugin_instance_id
+                return Err(meridian_bus::refusal_with_status(
+                    meridian_bus::RefusalStatus::PermissionDenied,
+                    &["plugin_instance_id".to_string()],
+                    format!(
+                        "a plugin links only its own external accounts, and this names {}",
+                        request.plugin_instance_id
+                    ),
                 ));
             }
             let before = cx.snapshot()?;
@@ -2082,7 +2239,7 @@ pub fn serve_with(
     // do. Called on this task instead, the first sign-in panicked the
     // conductor with "Cannot start a runtime from within a runtime", and the
     // panic aborted it.
-    let mut sign_ins = bus.subscribe(PERSON_SIGNED_IN);
+    let mut sign_ins = bus.subscribe_shared(PERSON_SIGNED_IN, "sign-ins");
     let keeping = Arc::clone(&context);
     tokio::spawn(async move {
         while let Some(delivery) = sign_ins.recv().await {
@@ -2102,7 +2259,7 @@ pub fn serve_with(
 
     // The external accounts each custody instance reports, by the instance
     // its topic names, which the broker lets only that instance publish.
-    let mut accounts = bus.subscribe(EXTERNAL_ACCOUNTS);
+    let mut accounts = bus.subscribe_shared(EXTERNAL_ACCOUNTS, "external-accounts");
     let hearing = Arc::clone(&context);
     tokio::spawn(async move {
         while let Some(delivery) = accounts.recv().await {
@@ -2140,7 +2297,8 @@ pub fn serve_with(
 
     // W11.20: each venue catalogue a connectivity plugin publishes, kept
     // latest per plugin and code, a change its own record.
-    let mut catalogues = bus.subscribe(crate::connectivity::VENUE_CATALOGUE);
+    let mut catalogues =
+        bus.subscribe_shared(crate::connectivity::VENUE_CATALOGUE, "venue-catalogues");
     let cataloguing = Arc::clone(&context);
     tokio::spawn(async move {
         while let Some(delivery) = catalogues.recv().await {
@@ -2171,7 +2329,7 @@ pub fn serve_with(
         }
     });
 
-    let mut reports = bus.subscribe(PLUGIN_REPORT);
+    let mut reports = bus.subscribe_every(PLUGIN_REPORT);
     let noting = Arc::clone(&context);
     tokio::spawn(async move {
         while let Some(delivery) = reports.recv().await {
@@ -2275,4 +2433,43 @@ pub fn serve_with(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod declaration_tests {
+    use meridian_domain::v1::{PluginLaunch, PluginMetadata, PluginVersion};
+    use meridian_pb::v1::PluginDeclaration;
+
+    use super::*;
+
+    /// W4.1 (contract v25): a sidecar is told the declaration of the version
+    /// its instance was launched from, and no other version's.
+    #[test]
+    fn a_sidecar_is_told_its_launched_versions_declaration() {
+        let version = |version: &str, secret: &str| PluginVersion {
+            metadata: Some(PluginMetadata {
+                name: "snaptrade".into(),
+                version: version.into(),
+                declaration: Some(PluginDeclaration {
+                    secret_settings: vec![secret.into()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut snapshot = Snapshot::default();
+        snapshot.catalogue.versions = vec![version("0.1.0", "old"), version("0.2.0", "new")];
+        snapshot.catalogue.launches = vec![PluginLaunch {
+            instance_id: "snaptrade-1".into(),
+            name: "snaptrade".into(),
+            version: "0.2.0".into(),
+            ..Default::default()
+        }];
+        let launched = told(&snapshot, "snaptrade-1");
+        assert!(launched.launched);
+        assert_eq!(launched.declaration.unwrap().secret_settings, ["new"]);
+        let harnessed = told(&snapshot, "other-1");
+        assert!(!harnessed.launched && harnessed.declaration.is_none());
+    }
 }

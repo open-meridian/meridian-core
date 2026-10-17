@@ -814,7 +814,47 @@ pub trait Store: Send + Sync {
     /// Record an uploaded version, unless that name and version is recorded
     /// already: false then, and the recorded one stands. An uploaded version
     /// is never replaced (W8).
-    fn record_plugin_version(&self, version: &PluginVersion) -> Result<bool>;
+    fn record_plugin_version(&self, version: &PluginVersion) -> Result<bool> {
+        self.record_plugin_version_documented(version, &[])
+    }
+
+    /// [`Store::record_plugin_version`], keeping the vendor's documentation
+    /// with it in the same step (W8.1, contract v25), in the order given,
+    /// never replaced: nothing is written when the version is recorded
+    /// already.
+    fn record_plugin_version_documented(
+        &self,
+        version: &PluginVersion,
+        documentation: &[meridian_domain::v1::DocumentationText],
+    ) -> Result<bool>;
+
+    /// A version's documentation as uploaded, in the order kept; none for a
+    /// version that carried none, or one not recorded.
+    fn plugin_documentation(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<Vec<meridian_domain::v1::DocumentationText>>;
+
+    /// Retire a recorded version (W8.15, contract v25): its record kept,
+    /// marked once with who retired it, through which delegation and client,
+    /// from which prepared change, when (`at_ns`) and why (`author.note`) --
+    /// the retirement its own record. The version as retired; None, and
+    /// nothing written, when no such version is recorded or it is retired
+    /// already. A retired version is never replaced: its name and version
+    /// stay taken.
+    fn retire_plugin_version(
+        &self,
+        name: &str,
+        version: &str,
+        author: &Author,
+        at_ns: i64,
+    ) -> Result<Option<PluginVersion>>;
+
+    /// Who retired a version, through what: the delegation, the client and
+    /// the prepared change, beside the version's own `retired_*` fields; None
+    /// for one not retired.
+    fn retirement(&self, name: &str, version: &str) -> Result<Option<Author>>;
 
     /// Record a launch as live, unless its instance has a live launch
     /// already: false then. Checked and written in one step, so two launches
@@ -973,9 +1013,89 @@ pub trait Store: Send + Sync {
     /// The setting in force: on until a deployment admin turns it off.
     fn reports_usage(&self) -> Result<bool>;
 
+    /// The identifier schemes the deployment declares it is licensed for,
+    /// the whole list replacing the last, its own record (contract v25,
+    /// W3.28, decisions/031): who, through what, when and why.
+    fn set_licensed_schemes(&self, schemes: &[String], author: &Author, at_ns: i64) -> Result<()>;
+
+    /// The schemes declared, in order; none until a deployment admin
+    /// declares one.
+    fn licensed_schemes(&self) -> Result<Vec<String>>;
+
     /// A report sent, its own record (W3.28).
     fn record_usage_report(&self, report: &meridian_domain::v1::SentUsageReport) -> Result<()>;
 
     /// The reports sent, newest first, at most `limit`.
     fn usage_reports(&self, limit: usize) -> Result<Vec<meridian_domain::v1::SentUsageReport>>;
+
+    // ── The registries (contract v25; W8.10 to W8.12, W5.19) ─────────────
+
+    /// The conductor's latest copy of the platform's catalogue, none before
+    /// its first pull.
+    fn registry_catalogue(&self) -> Result<Option<HeldCatalogue>>;
+
+    /// The catalogue as pulled, replacing the last copy whole.
+    fn put_registry_catalogue(&self, held: &HeldCatalogue) -> Result<()>;
+
+    /// A version installed from a registry, with its documentation and its
+    /// listing statement kept beside it for launch (W8.10, W8.3), never
+    /// replaced: nothing is written when the version is recorded already.
+    /// The install is its own record (decisions/031): who, through which
+    /// delegation and client, from which prepared change, and its note
+    /// (`version.uploaded_note`, the same as `by.note`).
+    fn record_listed_version(
+        &self,
+        version: &PluginVersion,
+        documentation: &[meridian_domain::v1::DocumentationText],
+        listing_statement: &str,
+        by: &Author,
+    ) -> Result<bool>;
+
+    /// Who installed a registry version, through what, and why; none for a
+    /// local version or one not recorded.
+    fn installation(&self, name: &str, version: &str) -> Result<Option<Author>>;
+
+    /// A version's kept listing statement; empty for a local version, or
+    /// one not recorded.
+    fn listing_statement(&self, name: &str, version: &str) -> Result<String>;
+
+    /// A deployment admin keeps an instance whose version was pulled
+    /// (W8.12): the acknowledgement kept on its live launch, its own
+    /// record; None when no launch of it is live.
+    fn acknowledge_pull(
+        &self,
+        instance_id: &str,
+        acknowledgement: &meridian_domain::v1::PullAcknowledgement,
+    ) -> Result<Option<PluginLaunch>>;
+
+    /// The plugin usage report's setting changed (W5.19, contract v25), its
+    /// own record.
+    fn set_reports_plugin_usage(&self, on: bool, author: &Author, at_ns: i64) -> Result<()>;
+
+    /// The setting in force: on until a deployment admin turns it off.
+    fn reports_plugin_usage(&self) -> Result<bool>;
+
+    /// A plugin usage report sent, its own record.
+    fn record_plugin_usage_report(
+        &self,
+        report: &meridian_domain::v1::SentPluginUsageReport,
+    ) -> Result<()>;
+
+    /// The plugin usage reports sent, newest first, at most `limit`.
+    fn plugin_usage_reports(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<meridian_domain::v1::SentPluginUsageReport>>;
+}
+
+/// The conductor's latest copy of the platform's catalogue (W8.10): every
+/// listing as last pulled, the sequence the next pull reads after, the
+/// signing keys' status as the platform signed it (its JSON, so its
+/// signature can be checked again), and when it was pulled.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HeldCatalogue {
+    pub listings: Vec<meridian_domain::v1::PluginListing>,
+    pub sequence: u64,
+    pub key_status: String,
+    pub pulled_at_ns: i64,
 }

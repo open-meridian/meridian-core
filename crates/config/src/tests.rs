@@ -64,6 +64,15 @@ impl Upstream for FakePlatform {
             retain_until_ns: 2,
         })
     }
+
+    fn licence_schemes(&self) -> Option<Vec<String>> {
+        Some(vec![
+            "figi".into(),
+            "isin".into(),
+            "cusip".into(),
+            "sedol".into(),
+        ])
+    }
 }
 
 struct Harness {
@@ -849,7 +858,7 @@ async fn a_reset_code_is_honoured_with_nobody_signed_in_and_makes_nobody_anythin
 #[tokio::test]
 async fn a_change_is_announced_to_the_plugins_it_moved_and_carries_no_setting() {
     let h = harness("dashboard-1");
-    let mut changes = h.bus.subscribe(PLUGIN_CONFIGURATION_CHANGED);
+    let mut changes = h.bus.subscribe_every(PLUGIN_CONFIGURATION_CHANGED);
     let traders = user_group(&h).await;
     let growth = account_group(&h, &[&account(&h, "Growth").await]).await;
     let trading = access_group(&h, vec![entry(AccessLevel::Write)])
@@ -979,7 +988,7 @@ async fn a_sidecar_is_told_the_accounts_its_links_name_and_when_one_is_renamed()
         "the account its link names, and no other"
     );
 
-    let mut announced = h.bus.subscribe(PLUGIN_CONFIGURATION_CHANGED);
+    let mut announced = h.bus.subscribe_every(PLUGIN_CONFIGURATION_CHANGED);
     let rename = |account_id: &str, name: &str| DefineAccountRequest {
         account_id: account_id.into(),
         name: name.into(),
@@ -1077,10 +1086,46 @@ async fn a_link_needs_a_plugin_that_has_reported_and_an_open_account() {
 }
 
 #[tokio::test]
+async fn an_expected_link_refusal_carries_its_category_and_the_field() {
+    // Contract v25 (the v24 tutorial walk): never a handler's failure with
+    // no category, so the plugin reads a refusal naming the field.
+    let h = harness("oms-1");
+    let detail = |failed: String| {
+        let at = failed.find("[refusal-status").expect("a refusal's status");
+        failed[at..].to_string()
+    };
+    for (request, by, status, field) in [
+        (
+            link_request("oms-1", "ACC-NONE", ""),
+            ADA,
+            meridian_bus::RefusalStatus::InvalidArgument,
+            &["account_id"][..],
+        ),
+        (
+            link_request("oms-1", "ACC-1", "Both"),
+            ADA,
+            meridian_bus::RefusalStatus::InvalidArgument,
+            &["account_id", "new_account_name"][..],
+        ),
+        (
+            link_request("other-1", "", "A new one"),
+            ADA,
+            meridian_bus::RefusalStatus::PermissionDenied,
+            &["plugin_instance_id"][..],
+        ),
+    ] {
+        let failed = detail(link_for(&h, request, by).await.unwrap_err());
+        let (said, fields, _) = meridian_bus::read_refusal_status(&failed).expect("readable");
+        assert_eq!(said, status, "{failed}");
+        assert_eq!(fields, field, "{failed}");
+    }
+}
+
+#[tokio::test]
 async fn a_link_naming_a_new_account_creates_and_links_it_in_one_step() {
     // W6.4: from the plugin's own admin page, for the deployment admin.
     let h = harness("oms-1");
-    let mut announced = h.bus.subscribe(PLUGIN_CONFIGURATION_CHANGED);
+    let mut announced = h.bus.subscribe_every(PLUGIN_CONFIGURATION_CHANGED);
     let linked = link_for(&h, link_request("oms-1", "", "  Fidelity Brokerage "), ADA)
         .await
         .unwrap();
@@ -2315,7 +2360,7 @@ async fn a_value_held_is_cleared_when_its_setting_is_redeclared_with_another_typ
     set_as(&h, "local|mallory", &[("plan_code_links", FORGED)], &[])
         .await
         .unwrap();
-    let mut changes = h.bus.subscribe(PLUGIN_CONFIGURATION_CHANGED);
+    let mut changes = h.bus.subscribe_every(PLUGIN_CONFIGURATION_CHANGED);
 
     // A later version declares the name a table.
     let mut declared = declared();
@@ -2829,6 +2874,9 @@ async fn an_account_has_one_external_account_and_two_of_one_connection_are_two_a
         )),
         "{refused}"
     );
+    // A component's plain refusal, which the sidecar sends ABORTED, as the
+    // link-external-account fixture gives this case.
+    assert!(!refused.contains("[refusal-status"), "{refused}");
     assert_eq!(records(&h).await.links.len(), 1, "nothing was linked");
 
     // Another external account of the same connection, to another account.
@@ -3142,7 +3190,7 @@ async fn a_hold_reaches_the_sidecars_it_covers_and_holds_a_window_back() {
             0,
         )
         .unwrap();
-    let mut changed = h.bus.subscribe(PLUGIN_CONFIGURATION_CHANGED);
+    let mut changed = h.bus.subscribe_every(PLUGIN_CONFIGURATION_CHANGED);
     let set: meridian_domain::v1::Hold = ask(
         &h,
         crate::archive::SET_HOLD,
@@ -3483,6 +3531,53 @@ async fn the_usage_report_is_on_until_a_deployment_admin_turns_it_off_saying_why
     .await
     .unwrap();
     assert!(listed.reports.is_empty());
+}
+
+/// W3.28 (contract v25): the deployment admin declares the licensed schemes,
+/// the whole list each time, each one the licence list names, saying why;
+/// each change its own record; the setting and the reports read answer them.
+#[tokio::test]
+async fn the_licensed_schemes_are_declared_from_the_licence_list_saying_why() {
+    let h = harness("dashboard-1");
+    let set = |schemes: &[&str], reason: &str| {
+        ask::<_, meridian_domain::v1::ReportsUsageSetting>(
+            &h,
+            crate::service::SET_LICENSED_SCHEMES,
+            "meridian.v1.SetLicensedSchemesRequest",
+            meridian_domain::v1::SetLicensedSchemesRequest {
+                licensed_schemes: schemes.iter().map(|s| s.to_string()).collect(),
+                reason: reason.into(),
+            },
+        )
+    };
+    assert!(h.store.licensed_schemes().unwrap().is_empty());
+    let refused = set(&["cusip"], "").await.unwrap_err();
+    assert!(refused.contains("fields=reason"), "{refused}");
+    let refused = set(&["cusip", "ric"], "licensed").await.unwrap_err();
+    assert!(refused.contains("fields=licensed_schemes[1]"), "{refused}");
+    let refused = set(&["cusip", "CUSIP"], "licensed").await.unwrap_err();
+    assert!(refused.contains("named twice"), "{refused}");
+    let setting = set(&[" CUSIP ", "sedol"], "the firm's licences")
+        .await
+        .unwrap();
+    assert_eq!(setting.licensed_schemes, vec!["cusip", "sedol"]);
+    assert!(setting.reports_usage);
+    assert_eq!(h.store.licensed_schemes().unwrap(), vec!["cusip", "sedol"]);
+    let listed: meridian_domain::v1::ListUsageReportsReply = ask(
+        &h,
+        crate::service::LIST_USAGE_REPORTS,
+        "meridian.v1.ListUsageReportsRequest",
+        meridian_domain::v1::ListUsageReportsRequest {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(listed.licensed_schemes, vec!["cusip", "sedol"]);
+    // None declared again is a change too.
+    assert!(set(&[], "the licence lapsed")
+        .await
+        .unwrap()
+        .licensed_schemes
+        .is_empty());
 }
 
 /// Contract v24 (W6.3, CloseAccountRequest.unlink_attached): "Unlink all

@@ -382,11 +382,14 @@ fn version(name: &str, version: &str) -> PluginVersion {
                     ..Default::default()
                 }),
                 catalogue: None,
+                ..Default::default()
             }),
         }),
         image_digest: format!("sha256:{}", "a".repeat(64)),
         uploaded_by: "local|ada".into(),
         uploaded_at_ns: 1,
+        source_registry: "local".into(),
+        ..Default::default()
     }
 }
 
@@ -418,6 +421,121 @@ fn a_version_is_recorded_once_and_read_back_whole() {
     );
     let catalogue = store.snapshot().unwrap().catalogue;
     assert_eq!(catalogue.versions, vec![version("snaptrade", "0.1.0")]);
+}
+
+#[test]
+fn a_versions_documentation_is_written_with_it_in_order_and_never_replaced() {
+    // Contract v25 (W8.1): the texts in the same transaction as the version.
+    use meridian_domain::v1::DocumentationText;
+    let store = store("documentation");
+    let text = |section: &str, markdown: &str| DocumentationText {
+        section: section.into(),
+        markdown: markdown.into(),
+    };
+    let texts = vec![
+        text("overview", "# SnapTrade\n\nReads brokerage accounts."),
+        text("setup", "Enter the client id."),
+        text("terms", "SnapTrade's terms apply."),
+    ];
+    assert!(store
+        .record_plugin_version_documented(&version("snaptrade", "0.1.0"), &texts)
+        .unwrap());
+    assert_eq!(
+        store.plugin_documentation("snaptrade", "0.1.0").unwrap(),
+        texts
+    );
+    assert!(!store
+        .record_plugin_version_documented(
+            &version("snaptrade", "0.1.0"),
+            &[text("overview", "Other words.")]
+        )
+        .unwrap());
+    assert_eq!(
+        store.plugin_documentation("snaptrade", "0.1.0").unwrap(),
+        texts,
+        "a version's texts are never replaced"
+    );
+    // A version with none, and one never recorded, read none.
+    assert!(store
+        .record_plugin_version(&version("snaptrade", "0.2.0"))
+        .unwrap());
+    assert!(store
+        .plugin_documentation("snaptrade", "0.2.0")
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .plugin_documentation("snaptrade", "9.9.9")
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn a_version_is_retired_once_its_row_kept_and_who_did_it_recorded() {
+    // Contract v25 (W8.15): the retirement written once beside the version.
+    let store = store("retire");
+    store
+        .record_plugin_version(&version("snaptrade", "0.1.0"))
+        .unwrap();
+    let author = meridian_config::Author {
+        by: "local|ada".into(),
+        delegation: "DLG-1".into(),
+        client: "Claude".into(),
+        note: "never launched".into(),
+        prepared_call_id: String::new(),
+    };
+    let retired = store
+        .retire_plugin_version("snaptrade", "0.1.0", &author, 7)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            retired.retired_by.as_str(),
+            retired.retired_at_ns,
+            retired.retired_note.as_str()
+        ),
+        ("local|ada", 7, "never launched")
+    );
+    assert_eq!(retired.source_registry, "local");
+    assert_eq!(
+        store.retirement("snaptrade", "0.1.0").unwrap(),
+        Some(author.clone())
+    );
+    assert!(
+        store
+            .retire_plugin_version("snaptrade", "0.1.0", &author, 8)
+            .unwrap()
+            .is_none(),
+        "written once"
+    );
+    assert!(store
+        .retire_plugin_version("snaptrade", "9.9.9", &author, 8)
+        .unwrap()
+        .is_none());
+    assert!(store.retirement("snaptrade", "9.9.9").unwrap().is_none());
+    // The row is kept: the name and version stay taken.
+    assert_eq!(store.snapshot().unwrap().catalogue.versions.len(), 1);
+    assert!(!store
+        .record_plugin_version(&version("snaptrade", "0.1.0"))
+        .unwrap());
+}
+
+#[test]
+fn the_licensed_schemes_are_the_latest_declaration_each_its_own_row() {
+    // Contract v25 (W3.28).
+    let store = store("licensed");
+    assert!(store.licensed_schemes().unwrap().is_empty());
+    let author = meridian_config::Author {
+        by: "local|ada".into(),
+        note: "the firm's licences".into(),
+        ..Default::default()
+    };
+    store
+        .set_licensed_schemes(&["cusip".into(), "sedol".into()], &author, 1)
+        .unwrap();
+    store
+        .set_licensed_schemes(&["cusip".into()], &author, 2)
+        .unwrap();
+    assert_eq!(store.licensed_schemes().unwrap(), vec!["cusip".to_string()]);
 }
 
 #[test]
@@ -2124,4 +2242,126 @@ fn a_link_a_mapping_and_a_catalogue_are_kept_each_change_its_own_record() {
         Some(catalogue)
     );
     assert_eq!(store.venue_catalogue("fix-1", "ACCT-9").unwrap(), None);
+}
+
+#[test]
+fn the_registries_state_is_kept_whole() {
+    // Contract v25 (W8.10 to W8.12, W5.19).
+    use meridian_config::store::HeldCatalogue;
+    use meridian_domain::v1::{
+        PluginListing, PluginPull, PluginUsageReport, PullAcknowledgement, SentPluginUsageReport,
+    };
+    let store = store("registries");
+    assert_eq!(store.registry_catalogue().unwrap(), None);
+    let held = HeldCatalogue {
+        listings: vec![PluginListing {
+            listing: "open-meridian/snaptrade".into(),
+            stars: 3,
+            ..Default::default()
+        }],
+        sequence: 42,
+        key_status: r#"{"issued_at_ns":1,"keys":[],"signature":"x"}"#.into(),
+        pulled_at_ns: 7,
+    };
+    store.put_registry_catalogue(&held).unwrap();
+    let mut later = held.clone();
+    later.sequence = 43;
+    store.put_registry_catalogue(&later).unwrap();
+    assert_eq!(store.registry_catalogue().unwrap(), Some(later));
+
+    let mut listed = version("open-meridian/snaptrade", "1.4.0");
+    listed.source_registry = "community".into();
+    listed.listing = "open-meridian/snaptrade".into();
+    listed.uploaded_note = "FX rates for the treasury desk.".into();
+    let by = meridian_config::Author {
+        by: "local|ada".into(),
+        delegation: "DLG-1".into(),
+        client: "Ada's agent".into(),
+        note: "FX rates for the treasury desk.".into(),
+        prepared_call_id: "PC-7".into(),
+    };
+    assert!(store
+        .record_listed_version(&listed, &[], "{\"payloadType\":\"x\"}", &by)
+        .unwrap());
+    assert!(
+        !store
+            .record_listed_version(&listed, &[], "{}", &meridian_config::Author::default())
+            .unwrap(),
+        "never replaced"
+    );
+    // The install is its own record (decisions/031): who, through what, and
+    // why, read back whole; its note with the version in the catalogue.
+    let installed = store
+        .installation("open-meridian/snaptrade", "1.4.0")
+        .unwrap()
+        .expect("the install's record");
+    assert_eq!(installed.by, "local|ada");
+    assert_eq!(installed.delegation, "DLG-1");
+    assert_eq!(installed.client, "Ada's agent");
+    assert_eq!(installed.note, "FX rates for the treasury desk.");
+    assert_eq!(installed.prepared_call_id, "PC-7");
+    assert!(store.installation("snaptrade", "9").unwrap().is_none());
+    let held = store.snapshot().unwrap();
+    let noted = held
+        .catalogue
+        .versions
+        .iter()
+        .find(|v| v.listing == "open-meridian/snaptrade")
+        .unwrap();
+    assert_eq!(noted.uploaded_note, "FX rates for the treasury desk.");
+    assert_eq!(
+        store
+            .listing_statement("open-meridian/snaptrade", "1.4.0")
+            .unwrap(),
+        "{\"payloadType\":\"x\"}"
+    );
+    assert_eq!(store.listing_statement("snaptrade", "9").unwrap(), "");
+
+    let mut running = launch("snaptrade-1");
+    running.name = "open-meridian/snaptrade".into();
+    running.version = "1.4.0".into();
+    assert!(store.begin_launch(&running, "").unwrap());
+    let acknowledgement = PullAcknowledgement {
+        pull: Some(PluginPull {
+            listing: "open-meridian/snaptrade".into(),
+            version: "1.4.0".into(),
+            pulled_at_ns: 9,
+            ..Default::default()
+        }),
+        acknowledged_by: "local|ada".into(),
+        acknowledged_at_ns: 10,
+        note: "Kept.".into(),
+        ..Default::default()
+    };
+    let kept = store
+        .acknowledge_pull("snaptrade-1", &acknowledgement)
+        .unwrap()
+        .unwrap();
+    assert_eq!(kept.pull_acknowledgement, Some(acknowledgement.clone()));
+    let read = store.snapshot().unwrap().catalogue.launches;
+    assert_eq!(read[0].pull_acknowledgement, Some(acknowledgement));
+    assert!(store
+        .acknowledge_pull("nothing-1", &PullAcknowledgement::default())
+        .unwrap()
+        .is_none());
+
+    assert!(store.reports_plugin_usage().unwrap(), "on by default");
+    store
+        .set_reports_plugin_usage(false, &meridian_config::store::Author::default(), 11)
+        .unwrap();
+    assert!(!store.reports_plugin_usage().unwrap());
+    for at in [12, 13] {
+        store
+            .record_plugin_usage_report(&SentPluginUsageReport {
+                sent_at_ns: at,
+                received: true,
+                report: Some(PluginUsageReport::default()),
+            })
+            .unwrap();
+    }
+    let sent = store.plugin_usage_reports(5).unwrap();
+    assert_eq!(
+        sent.iter().map(|r| r.sent_at_ns).collect::<Vec<_>>(),
+        [13, 12]
+    );
 }

@@ -38,6 +38,8 @@ pub const LIST_INSTRUMENTS_TO_COMPLETE: &str =
 pub const READ_INSTRUMENT_HISTORY: &str = "platform.reference.query.read-instrument-history";
 /// W3.28 (contract v24): the usage report's setting, and the reports sent.
 pub const SET_REPORTS_USAGE: &str = "platform.config.command.set-reports-usage";
+/// W3.28 (contract v25): the identifier schemes declared as licensed.
+pub const SET_LICENSED_SCHEMES: &str = "platform.config.command.set-licensed-schemes";
 pub const LIST_USAGE_REPORTS: &str = "platform.config.query.list-usage-reports";
 /// W3.26 (contract v24): the deployment admin making the migration's lines.
 pub const APPLY_INSTRUMENT_MIGRATION: &str =
@@ -693,6 +695,7 @@ pub fn completion(filled: &Filled) -> Result<CompleteInstrumentsRequest, String>
                 source: text("namespace"),
                 valid_from_ns: 0,
                 valid_until_ns: said["until"].as_i64().unwrap_or(0),
+                trading_currency: String::new(),
             })),
             source: text("source"),
         });
@@ -977,7 +980,7 @@ pub const LINES_PATH: &str = "/admin/instruments/migration";
 pub struct UncertainLine {
     pub instrument_ids: Vec<String>,
     pub answered: String,
-    pub why: &'static str,
+    pub why: String,
 }
 
 /// The migration's lines still to make, from the provisional records (W3.26;
@@ -996,6 +999,9 @@ pub fn migration_lines(
         .flat_map(|conflict| conflict.instrument_ids.iter().map(String::as_str))
         .collect();
     let mut by_answer: BTreeMap<&str, Vec<(&str, bool)>> = BTreeMap::new();
+    // What the platform's answer contradicts of a person's (contract v25):
+    // each field with the person's value, which the line shows.
+    let mut contradicted: BTreeMap<&str, Vec<String>> = BTreeMap::new();
     for item in &listed.instruments {
         let Some(record) = item.instrument.as_ref() else {
             continue;
@@ -1012,6 +1018,50 @@ pub fn migration_lines(
             .entry(item.answered_instrument_id.as_str())
             .or_default()
             .push((record.instrument_id.as_str(), section == S::HeldBack));
+        let fields: Vec<String> = item
+            .contradicted_fields
+            .iter()
+            .map(|field| {
+                let (name, value) = match meridian_domain::v1::InstrumentField::try_from(*field) {
+                    Ok(meridian_domain::v1::InstrumentField::AssetClass) => (
+                        "asset class",
+                        meridian_domain::v1::AssetClass::try_from(record.asset_class)
+                            .map(|class| {
+                                class
+                                    .as_str_name()
+                                    .trim_start_matches("ASSET_CLASS_")
+                                    .to_ascii_lowercase()
+                            })
+                            .unwrap_or_default(),
+                    ),
+                    Ok(meridian_domain::v1::InstrumentField::Currency) => {
+                        ("currency", record.currency.clone())
+                    }
+                    Ok(meridian_domain::v1::InstrumentField::Description) => {
+                        ("description", record.description.clone())
+                    }
+                    Ok(meridian_domain::v1::InstrumentField::InstrumentType) => (
+                        "type",
+                        meridian_domain::v1::InstrumentType::try_from(record.instrument_type)
+                            .map(|kind| {
+                                kind.as_str_name()
+                                    .trim_start_matches("INSTRUMENT_TYPE_")
+                                    .to_ascii_lowercase()
+                            })
+                            .unwrap_or_default(),
+                    ),
+                    _ => ("a field", String::new()),
+                };
+                if value.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{name} {value}")
+                }
+            })
+            .collect();
+        if !fields.is_empty() {
+            contradicted.insert(record.instrument_id.as_str(), fields);
+        }
     }
     let mut exact = Vec::new();
     let mut uncertain = Vec::new();
@@ -1020,7 +1070,7 @@ pub fn migration_lines(
             uncertain.push(UncertainLine {
                 instrument_ids: records.iter().map(|(id, _)| id.to_string()).collect(),
                 answered: answered.to_string(),
-                why: "a duplicate: two records answered by one",
+                why: "a duplicate: two records answered by one".into(),
             });
             continue;
         }
@@ -1029,13 +1079,25 @@ pub fn migration_lines(
             uncertain.push(UncertainLine {
                 instrument_ids: vec![id.to_string()],
                 answered: answered.to_string(),
-                why: "held back",
+                why: "held back".into(),
             });
         } else if conflicted.contains(id) {
             uncertain.push(UncertainLine {
                 instrument_ids: vec![id.to_string()],
                 answered: answered.to_string(),
-                why: "an identifier meets another record",
+                why: "an identifier meets another record".into(),
+            });
+        } else if let Some(fields) = contradicted.get(id) {
+            // Contract v25 (W3.26): the platform's answer contradicts what a
+            // person set or accepted -- a line of its own, the person's
+            // value shown.
+            uncertain.push(UncertainLine {
+                instrument_ids: vec![id.to_string()],
+                answered: answered.to_string(),
+                why: format!(
+                    "the platform's answer contradicts what a person set: {}",
+                    fields.join(", ")
+                ),
             });
         } else {
             exact.push(id.to_string());
@@ -1130,7 +1192,7 @@ fn lines_controls(listed: &ListInstrumentsToCompleteReply, token: &str) -> (Stri
                     shown = escape(&line.instrument_ids.join(", ")),
                     checked = if n == 0 { " checked" } else { "" },
                     answer = escape(&line.answered),
-                    why = escape(line.why),
+                    why = escape(&line.why),
                 )
             })
             .collect();
@@ -1222,10 +1284,63 @@ fn usage_section(
          <option value=\"off\"{off_selected}>Off</option></select></label>\
          <label>Why <input name=\"note\" required maxlength=\"2000\"></label>\
          <button type=\"submit\" name=\"prepare\" value=\"1\" data-prepare>Prepare</button>\
-         <button type=\"submit\" class=\"primary\">Set</button></form>{sent}",
-        if on { "on" } else { "off" }
+         <button type=\"submit\" class=\"primary\">Set</button></form>{licensed}{sent}",
+        if on { "on" } else { "off" },
+        licensed = licensed_form(reports, token),
     )
 }
+
+/// The schemes the deployment declares it is licensed for (contract v25,
+/// W3.28), sent with the weekly report: one box per scheme a deployment holds
+/// under licence, and any declared beside them; the conductor holds the
+/// choice to the platform's licence list. One line, a note and Set.
+fn licensed_form(
+    reports: &Result<meridian_domain::v1::ListUsageReportsReply, String>,
+    token: &str,
+) -> String {
+    let declared: Vec<String> = reports
+        .as_ref()
+        .map(|reports| reports.licensed_schemes.clone())
+        .unwrap_or_default();
+    let mut offered: Vec<String> = ["cusip", "isin", "sedol"]
+        .iter()
+        .map(|scheme| scheme.to_string())
+        .collect();
+    for scheme in &declared {
+        if !offered.contains(scheme) {
+            offered.push(scheme.clone());
+        }
+    }
+    let boxes: String = offered
+        .iter()
+        .map(|scheme| {
+            format!(
+                "<label class=\"check\"><input type=\"checkbox\" name=\"licensed_scheme\" \
+                 value=\"{value}\"{checked}> {shown}</label>",
+                value = escape(scheme),
+                checked = if declared.contains(scheme) {
+                    " checked"
+                } else {
+                    ""
+                },
+                shown = escape(&scheme.to_ascii_uppercase()),
+            )
+        })
+        .collect();
+    format!(
+        "<form method=\"post\" action=\"{LICENSED_SCHEMES_PATH}\" class=\"inline-form\" \
+         id=\"licensed-schemes-form\" data-licensed-schemes=\"{}\">{token}\
+         <fieldset class=\"schemes\" aria-label=\"Licensed for\"><span class=\"schemes-label\">Licensed for\
+         </span>{boxes}</fieldset>\
+         <label>Why <input name=\"note\" required maxlength=\"2000\"></label>\
+         <button type=\"submit\" name=\"prepare\" value=\"1\" data-prepare>Prepare</button>\
+         <button type=\"submit\" class=\"primary\">Set</button></form>",
+        escape(&declared.join(",")),
+    )
+}
+
+/// Where the licensed schemes' form posts (contract v25).
+pub const LICENSED_SCHEMES_PATH: &str = "/admin/instruments/licensed-schemes";
 
 /// Where the usage report's form posts.
 pub const USAGE_PATH: &str = "/admin/instruments/usage";
@@ -1291,11 +1406,13 @@ pub fn list_page_full(
     // values, unless the deployment admin turns the report off.
     let licensed = format!(
         "<section class=\"admin-section\" id=\"licensed\"><div class=\"section-head\"><div>\
-         <h2>Licensed identifiers held</h2><p class=\"hint\">What your plugins reported, kept \
-         here under your own licence: never sent anywhere, only how many are counted in the \
-         usage report.</p></div></div>{}{}</section>",
+         <h2>Licensed identifiers held</h2><p class=\"hint\">What your plugins reported, under \
+         your own licence: never sent, only counted in the usage report.</p></div></div>{}{}\
+         </section>",
+        // One line where none is held (contract v25: the tab carries the
+        // licensed schemes' form too, and still fits one screen).
         if licensed.is_empty() {
-            "<p class=\"empty\">None.</p>".to_string()
+            "<p class=\"hint\" data-licensed-held=\"0\">None held.</p>".to_string()
         } else {
             format!("<ul class=\"facts\">{}</ul>", licensed.concat())
         },
@@ -2576,6 +2693,49 @@ mod provisional_tests {
         assert!(dialogs.contains("data-prepare"));
     }
 
+    /// Contract v25 (W3.26): a line whose platform answer contradicts what a
+    /// person set is uncertain, its own, the person's value shown.
+    #[test]
+    fn a_platform_value_contradicting_a_persons_is_an_uncertain_line_of_its_own() {
+        use meridian_domain::v1::{InstrumentField, MigrationSection as S};
+        let listed = ListInstrumentsToCompleteReply {
+            instruments: vec![
+                InstrumentToComplete {
+                    instrument: Some(InstrumentRecord {
+                        instrument_id: "LCL-A".into(),
+                        provisional: true,
+                        ..Default::default()
+                    }),
+                    migration_section: S::Matched as i32,
+                    answered_instrument_id: "INS-A".into(),
+                    ..Default::default()
+                },
+                InstrumentToComplete {
+                    instrument: Some(InstrumentRecord {
+                        instrument_id: "LCL-GBP".into(),
+                        provisional: true,
+                        currency: "GBP".into(),
+                        ..Default::default()
+                    }),
+                    migration_section: S::Matched as i32,
+                    answered_instrument_id: "INS-GBP".into(),
+                    contradicted_fields: vec![InstrumentField::Currency as i32],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let (exact, uncertain) = migration_lines(&listed);
+        assert_eq!(exact, vec!["LCL-A".to_string()]);
+        assert_eq!(uncertain.len(), 1);
+        assert_eq!(uncertain[0].instrument_ids, vec!["LCL-GBP".to_string()]);
+        assert!(
+            uncertain[0].why.contains("currency GBP"),
+            "{}",
+            uncertain[0].why
+        );
+    }
+
     #[test]
     fn more_than_500_exact_lines_are_successive_changes() {
         use meridian_domain::v1::MigrationSection as S;
@@ -2613,5 +2773,32 @@ mod provisional_tests {
         assert_eq!(default_for("dashboard__close_account"), Level::MayNot);
         assert!(crate::prepared::CORE_PREPARABLE.contains(&"dashboard__apply_migration"));
         assert!(crate::prepared::CORE_PREPARABLE.contains(&"dashboard__close_account"));
+    }
+
+    /// Contract v25 (W3.28): the licensed schemes' form ticks those declared
+    /// and offers the licensed schemes a deployment holds, one line; its act
+    /// is preparable and at may not for agents by default.
+    #[test]
+    fn the_licensed_schemes_form_ticks_those_declared() {
+        let reports = Ok(meridian_domain::v1::ListUsageReportsReply {
+            reports_usage: true,
+            licensed_schemes: vec!["cusip".into(), "wkn".into()],
+            ..Default::default()
+        });
+        let form = licensed_form(&reports, "");
+        assert!(form.contains(&format!("action=\"{LICENSED_SCHEMES_PATH}\"")));
+        assert!(form.contains("value=\"cusip\" checked"));
+        assert!(form.contains("value=\"isin\">"));
+        assert!(
+            form.contains("value=\"wkn\" checked"),
+            "a declared one beyond the three"
+        );
+        assert!(form.contains("data-licensed-schemes=\"cusip,wkn\""));
+        assert!(usage_section(&reports, "").contains("id=\"licensed-schemes-form\""));
+        assert!(crate::prepared::CORE_PREPARABLE.contains(&"dashboard__set_licensed_schemes"));
+        assert_eq!(
+            crate::prepared::levels::default_for("dashboard__set_licensed_schemes"),
+            crate::prepared::levels::Level::MayNot
+        );
     }
 }

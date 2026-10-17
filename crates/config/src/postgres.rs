@@ -366,7 +366,9 @@ impl Store for PostgresStore {
         for row in tx
             .query(
                 "SELECT name, version, roles, interface, sdk_version, image_digest,
-                        uploaded_by, uploaded_at_ns, declaration
+                        uploaded_by, uploaded_at_ns, declaration, source_registry, listing,
+                        key_status_issued_at_ns, retired_by, retired_at_ns, retired_note,
+                        uploaded_note
                    FROM config_plugin_version ORDER BY name, version",
                 &[],
             )
@@ -392,6 +394,13 @@ impl Store for PostgresStore {
                 image_digest: row.get(5),
                 uploaded_by: row.get(6),
                 uploaded_at_ns: row.get(7),
+                source_registry: row.get(9),
+                listing: row.get(10),
+                key_status_issued_at_ns: row.get(11),
+                retired_by: row.get(12),
+                retired_at_ns: row.get(13),
+                retired_note: row.get(14),
+                uploaded_note: row.get(15),
             });
         }
 
@@ -1116,15 +1125,21 @@ impl Store for PostgresStore {
             .collect()
     }
 
-    fn record_plugin_version(&self, version: &PluginVersion) -> Result<bool> {
+    fn record_plugin_version_documented(
+        &self,
+        version: &PluginVersion,
+        documentation: &[meridian_domain::v1::DocumentationText],
+    ) -> Result<bool> {
         let metadata = version.metadata.clone().unwrap_or_default();
-        let written = self
-            .conn()?
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        let written = tx
             .execute(
                 "INSERT INTO config_plugin_version
                         (name, version, roles, interface, sdk_version, image_digest,
-                         uploaded_by, uploaded_at_ns, declaration)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                         uploaded_by, uploaded_at_ns, declaration, source_registry, listing,
+                         key_status_issued_at_ns)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
                  ON CONFLICT (name, version) DO NOTHING",
                 &[
                     &metadata.name,
@@ -1136,10 +1151,121 @@ impl Store for PostgresStore {
                     &version.uploaded_by,
                     &version.uploaded_at_ns,
                     &metadata.declaration.as_ref().map(Message::encode_to_vec),
+                    &if version.source_registry.is_empty() {
+                        "local"
+                    } else {
+                        version.source_registry.as_str()
+                    },
+                    &version.listing,
+                    &version.key_status_issued_at_ns,
                 ],
             )
             .map_err(unavailable)?;
-        Ok(written == 1)
+        if written != 1 {
+            return Ok(false);
+        }
+        // The vendor's texts, in the order given, with the version (W8.1,
+        // contract v25); never replaced, since the version is not.
+        for (ordinal, text) in documentation.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO config_plugin_documentation (name, version, section, ordinal, markdown)
+                 VALUES ($1, $2, $3, $4, $5)",
+                &[
+                    &metadata.name,
+                    &metadata.version,
+                    &text.section,
+                    &(ordinal as i32),
+                    &text.markdown,
+                ],
+            )
+            .map_err(unavailable)?;
+        }
+        tx.commit().map_err(unavailable)?;
+        Ok(true)
+    }
+
+    fn plugin_documentation(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<Vec<meridian_domain::v1::DocumentationText>> {
+        Ok(self
+            .conn()?
+            .query(
+                "SELECT section, markdown FROM config_plugin_documentation
+                  WHERE name = $1 AND version = $2 ORDER BY ordinal",
+                &[&name, &version],
+            )
+            .map_err(unavailable)?
+            .into_iter()
+            .map(|row| meridian_domain::v1::DocumentationText {
+                section: row.get(0),
+                markdown: row.get(1),
+            })
+            .collect())
+    }
+
+    fn retire_plugin_version(
+        &self,
+        name: &str,
+        version: &str,
+        author: &Author,
+        at_ns: i64,
+    ) -> Result<Option<PluginVersion>> {
+        // Written once: a version retired already is left as it is.
+        let written = self
+            .conn()?
+            .execute(
+                "UPDATE config_plugin_version
+                    SET retired_by = $3, retired_at_ns = $4, retired_note = $5,
+                        retired_through_delegation = $6, retired_client_name = $7,
+                        retired_prepared_call_id = $8
+                  WHERE name = $1 AND version = $2 AND retired_at_ns = 0",
+                &[
+                    &name,
+                    &version,
+                    &author.by,
+                    &at_ns,
+                    &author.note,
+                    &author.delegation,
+                    &author.client,
+                    &author.prepared_call_id,
+                ],
+            )
+            .map_err(unavailable)?;
+        if written != 1 {
+            return Ok(None);
+        }
+        Ok(self
+            .snapshot()?
+            .catalogue
+            .versions
+            .into_iter()
+            .find(|held| {
+                held.metadata
+                    .as_ref()
+                    .is_some_and(|m| m.name == name && m.version == version)
+            }))
+    }
+
+    fn retirement(&self, name: &str, version: &str) -> Result<Option<Author>> {
+        Ok(self
+            .conn()?
+            .query_opt(
+                "SELECT retired_by, retired_through_delegation, retired_client_name,
+                        retired_note, retired_prepared_call_id
+                   FROM config_plugin_version
+                  WHERE name = $1 AND version = $2 AND retired_at_ns <> 0",
+                &[&name, &version],
+            )
+            .map_err(unavailable)?
+            .map(|row| Author {
+                by: row.get(0),
+                delegation: row.get(1),
+                client: row.get(2),
+                note: row.get(3),
+                prepared_call_id: row.get(4),
+            }))
     }
 
     fn begin_launch(&self, launch: &PluginLaunch, note: &str) -> Result<bool> {
@@ -2028,6 +2154,40 @@ impl Store for PostgresStore {
             .is_none_or(|row| row.get::<_, bool>(0)))
     }
 
+    fn set_licensed_schemes(&self, schemes: &[String], author: &Author, at_ns: i64) -> Result<()> {
+        self.conn()?
+            .execute(
+                "INSERT INTO config_licensed_schemes_change
+                        (licensed_schemes, changed_by, through_delegation, client_name,
+                         prepared_call_id, changed_at_ns, note)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                &[
+                    &schemes,
+                    &author.by,
+                    &author.delegation,
+                    &author.client,
+                    &author.prepared_call_id,
+                    &at_ns,
+                    &author.note,
+                ],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
+    fn licensed_schemes(&self) -> Result<Vec<String>> {
+        Ok(self
+            .conn()?
+            .query_opt(
+                "SELECT licensed_schemes FROM config_licensed_schemes_change
+                  ORDER BY change_id DESC LIMIT 1",
+                &[],
+            )
+            .map_err(unavailable)?
+            .map(|row| row.get::<_, Vec<String>>(0))
+            .unwrap_or_default())
+    }
+
     fn record_usage_report(&self, report: &meridian_domain::v1::SentUsageReport) -> Result<()> {
         use prost::Message;
         self.conn()?
@@ -2055,6 +2215,206 @@ impl Store for PostgresStore {
             })
             .collect()
     }
+
+    fn registry_catalogue(&self) -> Result<Option<crate::store::HeldCatalogue>> {
+        use prost::Message;
+        let Some(row) = self
+            .conn()?
+            .query_opt(
+                "SELECT listings, sequence, key_status, pulled_at_ns
+                   FROM config_registry_catalogue WHERE id = 1",
+                &[],
+            )
+            .map_err(unavailable)?
+        else {
+            return Ok(None);
+        };
+        let listings: Vec<u8> = row.get(0);
+        let held =
+            meridian_domain::v1::PullCatalogueReply::decode(&listings[..]).map_err(unavailable)?;
+        Ok(Some(crate::store::HeldCatalogue {
+            listings: held.listings,
+            sequence: u64::try_from(row.get::<_, i64>(1)).unwrap_or_default(),
+            key_status: row.get(2),
+            pulled_at_ns: row.get(3),
+        }))
+    }
+
+    fn put_registry_catalogue(&self, held: &crate::store::HeldCatalogue) -> Result<()> {
+        use prost::Message;
+        let listings = meridian_domain::v1::PullCatalogueReply {
+            listings: held.listings.clone(),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        self.conn()?
+            .execute(
+                "INSERT INTO config_registry_catalogue (id, listings, sequence, key_status, pulled_at_ns)
+                 VALUES (1, $1, $2, $3, $4)
+                 ON CONFLICT (id) DO UPDATE SET listings = $1, sequence = $2, key_status = $3,
+                        pulled_at_ns = $4",
+                &[
+                    &listings,
+                    &i64::try_from(held.sequence).unwrap_or(i64::MAX),
+                    &held.key_status,
+                    &held.pulled_at_ns,
+                ],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
+    fn record_listed_version(
+        &self,
+        version: &PluginVersion,
+        documentation: &[meridian_domain::v1::DocumentationText],
+        listing_statement: &str,
+        by: &Author,
+    ) -> Result<bool> {
+        if !self.record_plugin_version_documented(version, documentation)? {
+            return Ok(false);
+        }
+        let metadata = version.metadata.clone().unwrap_or_default();
+        self.conn()?
+            .execute(
+                "UPDATE config_plugin_version
+                    SET listing_statement = $3, uploaded_through_delegation = $4,
+                        uploaded_client_name = $5, uploaded_prepared_call_id = $6,
+                        uploaded_note = $7
+                  WHERE name = $1 AND version = $2",
+                &[
+                    &metadata.name,
+                    &metadata.version,
+                    &listing_statement,
+                    &by.delegation,
+                    &by.client,
+                    &by.prepared_call_id,
+                    &by.note,
+                ],
+            )
+            .map_err(unavailable)?;
+        Ok(true)
+    }
+
+    fn installation(&self, name: &str, version: &str) -> Result<Option<Author>> {
+        Ok(self
+            .conn()?
+            .query_opt(
+                "SELECT uploaded_by, uploaded_through_delegation, uploaded_client_name,
+                        uploaded_note, uploaded_prepared_call_id
+                   FROM config_plugin_version
+                  WHERE name = $1 AND version = $2 AND listing <> ''",
+                &[&name, &version],
+            )
+            .map_err(unavailable)?
+            .map(|row| Author {
+                by: row.get(0),
+                delegation: row.get(1),
+                client: row.get(2),
+                note: row.get(3),
+                prepared_call_id: row.get(4),
+            }))
+    }
+
+    fn listing_statement(&self, name: &str, version: &str) -> Result<String> {
+        Ok(self
+            .conn()?
+            .query_opt(
+                "SELECT listing_statement FROM config_plugin_version
+                  WHERE name = $1 AND version = $2",
+                &[&name, &version],
+            )
+            .map_err(unavailable)?
+            .map(|row| row.get(0))
+            .unwrap_or_default())
+    }
+
+    fn acknowledge_pull(
+        &self,
+        instance_id: &str,
+        acknowledgement: &meridian_domain::v1::PullAcknowledgement,
+    ) -> Result<Option<PluginLaunch>> {
+        use prost::Message;
+        let row = self
+            .conn()?
+            .query_opt(
+                &format!(
+                    "UPDATE config_plugin_launch SET pull_acknowledgement = $2
+                      WHERE instance_id = $1 AND state = 1
+                  RETURNING {LAUNCH_COLUMNS}"
+                ),
+                &[&instance_id, &acknowledgement.encode_to_vec()],
+            )
+            .map_err(unavailable)?;
+        Ok(row.as_ref().map(launch_from))
+    }
+
+    fn set_reports_plugin_usage(&self, on: bool, author: &Author, at_ns: i64) -> Result<()> {
+        self.conn()?
+            .execute(
+                "INSERT INTO config_reports_plugin_usage_change
+                        (reports_plugin_usage, changed_by, through_delegation, client_name,
+                         prepared_call_id, changed_at_ns, note)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                &[
+                    &on,
+                    &author.by,
+                    &author.delegation,
+                    &author.client,
+                    &author.prepared_call_id,
+                    &at_ns,
+                    &author.note,
+                ],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
+    fn reports_plugin_usage(&self) -> Result<bool> {
+        Ok(self
+            .conn()?
+            .query_opt(
+                "SELECT reports_plugin_usage FROM config_reports_plugin_usage_change
+                  ORDER BY change_id DESC LIMIT 1",
+                &[],
+            )
+            .map_err(unavailable)?
+            .is_none_or(|row| row.get::<_, bool>(0)))
+    }
+
+    fn record_plugin_usage_report(
+        &self,
+        report: &meridian_domain::v1::SentPluginUsageReport,
+    ) -> Result<()> {
+        use prost::Message;
+        self.conn()?
+            .execute(
+                "INSERT INTO config_plugin_usage_report (sent_at_ns, report) VALUES ($1, $2)",
+                &[&report.sent_at_ns, &report.encode_to_vec()],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
+    fn plugin_usage_reports(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<meridian_domain::v1::SentPluginUsageReport>> {
+        use prost::Message;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.conn()?
+            .query(
+                "SELECT report FROM config_plugin_usage_report ORDER BY report_id DESC LIMIT $1",
+                &[&limit],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| {
+                let bytes: Vec<u8> = row.get(0);
+                meridian_domain::v1::SentPluginUsageReport::decode(&bytes[..]).map_err(unavailable)
+            })
+            .collect()
+    }
 }
 
 /// An account's optional text as its column holds it: NULL for none, so an
@@ -2066,7 +2426,8 @@ fn unless_empty(value: &str) -> Option<&str> {
 const LAUNCH_COLUMNS: &str = "instance_id, name, version, image_digest, roles, \
      launched_by, launched_at_ns, state, stopped_by, stopped_at_ns, failure, live, \
      launched_through_delegation, launched_client_name, stopped_through_delegation, \
-     stopped_client_name, launch_note, stop_note, prepared_call_id, stopped_prepared_call_id";
+     stopped_client_name, launch_note, stop_note, prepared_call_id, stopped_prepared_call_id, \
+     pull_acknowledgement";
 
 /// A hold change's columns, in the order [`hold_from`] reads them.
 const HOLD_COLUMNS: &str = "role, days, write_once, changed_by, changed_at_ns, \
@@ -2134,6 +2495,11 @@ fn launch_from(row: &postgres::Row) -> PluginLaunch {
         stopped_note: row.get(17),
         prepared_call_id: row.get(18),
         stopped_prepared_call_id: row.get(19),
+        // Kept on the launch when a deployment admin keeps an instance whose
+        // version was pulled (W8.12, contract v25).
+        pull_acknowledgement: row.get::<_, Option<Vec<u8>>>(20).and_then(|bytes| {
+            <meridian_domain::v1::PullAcknowledgement as prost::Message>::decode(&bytes[..]).ok()
+        }),
     }
 }
 

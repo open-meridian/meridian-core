@@ -199,6 +199,9 @@ pub fn migrate(
                     && identifier.value.starts_with("INS-")
             })
             .map(|identifier| identifier.value.clone());
+        // The fields a person set that the platform's answer contradicts
+        // (contract v25, W3.26): the line is then uncertain, its own.
+        let mut contradicted: Vec<String> = Vec::new();
         let (section, answer, reason) = if let Some(ins) = carried {
             (section::ALREADY_HELD, ins, ProvisionalReason::Unspecified)
         } else {
@@ -212,17 +215,23 @@ pub fn migrate(
                     sent += 1;
                     let answer = ask.ask(request);
                     match answer.said {
-                        PlatformSaid::Record(master) => (
-                            if answer.near_match {
-                                section::NEAR_MATCH
-                            } else if answer.minted {
-                                section::MINTED
-                            } else {
-                                section::MATCHED
-                            },
-                            master.instrument_id.clone(),
-                            ProvisionalReason::Unspecified,
-                        ),
+                        PlatformSaid::Record(master) => {
+                            contradicted = one_id::contradicted_fields(&record, &master)
+                                .into_iter()
+                                .map(|field| field.name().to_string())
+                                .collect();
+                            (
+                                if answer.near_match {
+                                    section::NEAR_MATCH
+                                } else if answer.minted {
+                                    section::MINTED
+                                } else {
+                                    section::MATCHED
+                                },
+                                master.instrument_id.clone(),
+                                ProvisionalReason::Unspecified,
+                            )
+                        }
                         PlatformSaid::Pending => (
                             section::AWAITING_STAFF,
                             String::new(),
@@ -259,6 +268,7 @@ pub fn migrate(
         }
         local.migration = section.to_string();
         local.migration_answer = answer;
+        local.contradicted_fields = contradicted;
         line.local = local;
         line.version = record.version + 1;
         line.record_time_ns = now_ns;

@@ -728,12 +728,16 @@ pub(crate) fn level_to_open(
 
 /// Who may open an instance's page from the dashboard, at which level, and
 /// the plugins that serve it; or the answer that refuses them. W6.9's
-/// checks, in its order.
+/// checks, in its order. `stopped_too`: an instance the catalogue launched
+/// and stopped is admitted as well, its area keeping the dashboard's own
+/// tabs (contract v25, the documentation plan's Q7); the last of the answer
+/// says whether it runs.
 async fn may_open<'a>(
     app: &'a App,
     instance: &str,
     headers: &HeaderMap,
     named: Option<&str>,
+    stopped_too: bool,
 ) -> Result<
     (
         String,
@@ -741,6 +745,7 @@ async fn may_open<'a>(
         meridian_access::Access,
         AccessLevel,
         &'a Plugins,
+        bool,
     ),
     Box<Response>,
 > {
@@ -772,14 +777,26 @@ async fn may_open<'a>(
         meridian_access::person_access(&records, &session.subject, &session.directory_groups);
     let level = level_to_open(&access.held(instance), named, instance)
         .map_err(|why| Box::new(said(StatusCode::FORBIDDEN, "No access", &why)))?;
-    if !plugins.runs(instance).await {
+    let running = plugins.runs(instance).await;
+    let launched = || async {
+        crate::catalogue::catalogue(app)
+            .await
+            .is_ok_and(|catalogue| {
+                catalogue
+                    .launches
+                    .iter()
+                    .any(|launch| launch.instance_id == instance)
+            })
+    };
+    let admitted = running || (stopped_too && launched().await);
+    if !admitted {
         return Err(Box::new(said(
             StatusCode::NOT_FOUND,
             "No such plugin",
             &format!("No plugin {instance} runs in this deployment."),
         )));
     }
-    Ok((key, session, access, level, plugins))
+    Ok((key, session, access, level, plugins, running))
 }
 
 /// `GET /plugins/{instance}?level=&tab=` on the dashboard: the plugin's
@@ -793,8 +810,8 @@ pub(crate) async fn frame(
     headers: HeaderMap,
 ) -> Response {
     let named = asked.get("level").map(String::as_str);
-    let (_, session, access, level, plugins) =
-        match may_open(&app, &instance, &headers, named).await {
+    let (_, session, access, level, plugins, running) =
+        match may_open(&app, &instance, &headers, named, true).await {
             Ok(allowed) => allowed,
             Err(refusal) => return *refusal,
         };
@@ -812,12 +829,17 @@ pub(crate) async fn frame(
                 .collect()
         })
         .unwrap_or_default();
-    let tabs = crate::area::tabs_by_role(
+    let mut tabs = crate::area::tabs_by_role(
         reports.get(&instance),
         level,
         &held_roles,
         &table_tabs(&app, &instance),
     );
+    // A stopped instance's pages are gone with its process: its area keeps
+    // the dashboard's own tabs (contract v25).
+    if !running {
+        tabs.retain(|tab| tab.drawn);
+    }
     // A path asked for directly is its tab's, or one of its own under the
     // level's pages; otherwise the tab asked for, or the first: under Manage,
     // the dashboard's own Summary, drawn here rather than framed. A path
@@ -856,16 +878,42 @@ pub(crate) async fn frame(
             return redirect(&entrance_from(&instance, path, level, &theme, &prepared));
         }
     }
-    let launches = crate::catalogue::launches(&app).await;
-    let launch = launches
+    let catalogue = crate::catalogue::catalogue(&app).await.unwrap_or_default();
+    // Its launch now, or, stopped, its latest.
+    let launch = catalogue
+        .launches
         .iter()
-        .find(|launch| launch.instance_id == instance);
+        .filter(|launch| launch.instance_id == instance)
+        .max_by_key(|launch| {
+            (
+                launch.state == meridian_domain::v1::PluginLaunchState::Launched as i32,
+                launch.launched_at_ns,
+            )
+        });
     let name = launch.map_or(instance.as_str(), |launch| launch.name.as_str());
+    // The Documentation tab is the last at every level ([`crate::area::tabs`]).
+    let on_documentation = asked_path.is_none()
+        && current
+            .is_some_and(|tab| tab.drawn && tabs.last().is_some_and(|last| last.key == tab.key));
     let shown = match &path {
         Some(path) => crate::area::Shown::Framed {
             src: entrance_from(&instance, path, level, &theme.clone().seamless(), &prepared),
             origin: plugins.origin(&instance),
         },
+        // Its launched version's documentation, at any level (W6.9,
+        // contract v25).
+        None if on_documentation => crate::area::Shown::Drawn(
+            documentation_tab(
+                &app,
+                &session.subject,
+                &instance,
+                level,
+                launch,
+                &catalogue,
+                &asked,
+            )
+            .await,
+        ),
         // The dashboard's Summary or Settings, under Manage alone: may_open
         // has held the session to a level the person holds, and only `admin`
         // has the tabs.
@@ -904,7 +952,13 @@ pub(crate) async fn frame(
                 instance: &instance,
                 choices: &choices,
                 records: &records,
-                report: reports.get(&instance),
+                report: if running {
+                    reports.get(&instance)
+                } else {
+                    None
+                },
+                stopped: launch.filter(|_| !running),
+                pulled: pulled_of(&app, &session.subject, launch, &catalogue).await,
                 version: launch.map(|launch| launch.version.as_str()),
                 session: &session,
                 notice,
@@ -947,7 +1001,14 @@ pub(crate) async fn frame(
     let held = access.held(&instance);
     // Under Manage, the plugin's health is the dot on every tab where no page
     // tells its own (the product owner, 2026-10-01: "yes, dot on every tab").
-    let health = crate::health::state(reports.get(&instance), app.clock.now_ns());
+    let health = crate::health::state(
+        if running {
+            reports.get(&instance)
+        } else {
+            None
+        },
+        app.clock.now_ns(),
+    );
     let body = crate::area::render(&crate::area::Area {
         instance: &instance,
         name,
@@ -964,7 +1025,7 @@ pub(crate) async fn frame(
         crate::html::crumb_link("/", "Home"),
         crate::html::crumb_here(name, Some(&instance)),
     );
-    Html(crate::html::page_with(
+    let page = crate::html::page_with(
         &format!("{name} · {}", button(level)),
         &body,
         &crate::html::Chrome {
@@ -979,8 +1040,95 @@ pub(crate) async fn frame(
             // The area's head carries it, with the plugin filled in.
             report: crate::html::Report::Omitted,
         },
-    ))
-    .into_response()
+    );
+    // The vendor's text is drawn under the documentation's policy: no script
+    // but the dashboard's own, no image from elsewhere.
+    if on_documentation {
+        crate::documentation::with_policy(page)
+    } else {
+        Html(page).into_response()
+    }
+}
+
+/// An instance's pull warning (W8.12, contract v25): its version's pull in
+/// the catalogue's copy, where no deployment admin has kept it since.
+async fn pulled_of(
+    app: &App,
+    subject: &str,
+    launch: Option<&meridian_domain::v1::PluginLaunch>,
+    catalogue: &meridian_domain::v1::PluginCatalogue,
+) -> Option<meridian_domain::v1::PluginPull> {
+    let launch = launch?;
+    let version = catalogue.versions.iter().find(|v| {
+        v.metadata
+            .as_ref()
+            .is_some_and(|m| m.name == launch.name && m.version == launch.version)
+    })?;
+    if version.listing.is_empty() {
+        return None;
+    }
+    let listings = crate::registry::listings(
+        app,
+        subject,
+        meridian_domain::v1::ListRegistryPluginsRequest {
+            listing: version.listing.clone(),
+            ..Default::default()
+        },
+    )
+    .await
+    .ok()?
+    .listings;
+    crate::registry::pull_warning(launch, version, &listings)
+}
+
+/// The Documentation tab: the version the instance was launched from, its
+/// sections and Reference ([`crate::documentation`]).
+async fn documentation_tab(
+    app: &App,
+    subject: &str,
+    instance: &str,
+    level: AccessLevel,
+    launch: Option<&meridian_domain::v1::PluginLaunch>,
+    catalogue: &meridian_domain::v1::PluginCatalogue,
+    asked: &HashMap<String, String>,
+) -> String {
+    let Some(launch) = launch else {
+        return "<p class=\"hint docs-none\">It was not launched from the catalogue, so there is no \
+                version whose documentation to show.</p>"
+            .into();
+    };
+    let reply = match crate::documentation::read(app, subject, &launch.name, &launch.version).await
+    {
+        Ok(reply) => reply,
+        Err(failed) => {
+            return format!(
+                "<p class=\"error\" role=\"alert\">Its documentation could not be read: {}</p>",
+                crate::html::escape(&failed)
+            )
+        }
+    };
+    let held = catalogue.versions.iter().find(|version| {
+        version
+            .metadata
+            .as_ref()
+            .is_some_and(|m| m.name == launch.name && m.version == launch.version)
+    });
+    let roles = held
+        .and_then(|version| version.metadata.as_ref())
+        .map(|m| m.roles.clone())
+        .unwrap_or_else(|| launch.roles.clone());
+    let base = crate::area::href(instance, level, Some(crate::documentation::TAB));
+    let href = |section: &str, part: &str| crate::documentation::section_href(&base, section, part);
+    crate::documentation::drawn(&crate::documentation::Page {
+        name: &launch.name,
+        version: &launch.version,
+        roles: &roles,
+        reply: &reply,
+        note: held.map_or("", |version| version.uploaded_note.as_str()),
+        section: asked.get("section").map(String::as_str),
+        part: asked.get("part").map(String::as_str),
+        href: &href,
+    })
 }
 
 /// The plugin's table settings as tabs of its area under Manage, each its
@@ -1049,10 +1197,11 @@ pub(crate) async fn open(
     headers: HeaderMap,
 ) -> Response {
     let named = asked.get("level").map(String::as_str);
-    let (key, _, _, level, plugins) = match may_open(&app, &instance, &headers, named).await {
-        Ok(allowed) => allowed,
-        Err(refusal) => return *refusal,
-    };
+    let (key, _, _, level, plugins, _) =
+        match may_open(&app, &instance, &headers, named, false).await {
+            Ok(allowed) => allowed,
+            Err(refusal) => return *refusal,
+        };
     let path = match asked.get("path") {
         Some(path) => path.clone(),
         None => first_page(&app, &instance, level),

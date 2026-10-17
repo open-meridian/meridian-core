@@ -56,6 +56,8 @@ pub const ALERT_CHANGED: &str = "platform.book.event.alert-changed";
 pub const LIST_BOOKINGS: &str = "platform.book.query.list-bookings";
 pub const LIST_ALERTS: &str = "platform.book.query.list-alerts";
 pub const READ_LOCAL_RECORD_ORDERS: &str = "platform.book.query.read-local-record-orders";
+/// W9.10 (contract v25; ruling 155): the book's health per account.
+pub const READ_BOOK_HEALTH: &str = "platform.book.query.read-book-health";
 
 /// How often the child entries every booking owes are looked for.
 pub const SWEEP_EVERY: Duration = Duration::from_secs(15 * 60);
@@ -166,14 +168,7 @@ pub fn member_views(store: &dyn Store, members: &[String]) -> BTreeMap<String, M
         let Ok(Some(account)) = store.owner(Record::Order, member) else {
             continue;
         };
-        let Ok(entries) = store.journal(&account) else {
-            continue;
-        };
-        let Ok(book) = Book::replay(
-            &account,
-            crate::store::first_partition_of(&account),
-            &entries,
-        ) else {
+        let Ok(book) = store.book(&account) else {
             continue;
         };
         let Some(held) = book.ledger.orders.get(member) else {
@@ -221,8 +216,7 @@ pub fn member_views(store: &dyn Store, members: &[String]) -> BTreeMap<String, M
 /// The escape hatch's setting in force (W11.36), read from the control
 /// partition: `None` before anything stated it, which reads as on.
 pub fn local_record_orders(store: &dyn Store) -> Option<bool> {
-    let entries = store.journal(CONTROL_ACCOUNT).ok()?;
-    let book = Book::replay(CONTROL_ACCOUNT, crate::store::CONTROL_PARTITION, &entries).ok()?;
+    let book = store.book(CONTROL_ACCOUNT).ok()?;
     book.ledger.local_record_orders
 }
 
@@ -330,12 +324,7 @@ pub fn sweep_children(bus: &Bus, store: &dyn Store) -> Result<usize, String> {
     let mut carried_by: BTreeSet<(String, String, String)> = BTreeSet::new();
     let mut receiving: Vec<(String, String, String, String)> = Vec::new();
     for account in &accounts {
-        let entries = store
-            .journal(account)
-            .map_err(|failed| failed.to_string())?;
-        let book = Book::replay(account, crate::store::first_partition_of(account), &entries)
-            .map_err(|failed| failed.to_string())?;
-        drop(entries);
+        let book = store.book(account).map_err(|failed| failed.to_string())?;
         for (id, held) in &book.ledger.bookings {
             if held.state == meridian_domain::v1::BookingState::Cancelled {
                 continue;
@@ -714,6 +703,28 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
             let request: ReportGiveUpRequest =
                 decode(&envelope, "meridian.v1.ReportGiveUpRequest")?;
             let ctx = context_of(&envelope, clock.as_ref());
+            // A give-up naming no execution the book holds is kept as an
+            // unplaced fact, the report whole in its own arm, naming no
+            // account (contract v25, W11.32; decision 30), as an execution
+            // the book cannot place is (W11.13). Held to its shape first.
+            if !request.execution_id.is_empty()
+                && store
+                    .owner(Record::Execution, &request.execution_id)
+                    .map_err(|failed| failed.on_the_bus())?
+                    .is_none()
+            {
+                booking::give_up_holds(&request).map_err(|failed| failed.on_the_bus())?;
+                return crate::order_service::no_account(
+                    &bus2,
+                    store.as_ref(),
+                    &envelope,
+                    ctx,
+                    meridian_domain::v1::unplaced_fact::Fact::GiveUp(request.clone()),
+                    meridian_domain::v1::UnplacedReason::Unspecified,
+                    "",
+                    request.raw_record.clone(),
+                );
+            }
             let account = owner(
                 store.as_ref(),
                 Record::Execution,
@@ -895,6 +906,39 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
         ))
     });
 
+    // W9.10 (contract v25; ruling 155): the book's health per account, for
+    // a deployment admin through the dashboard, paged by account.
+    let reading = store.clone();
+    bus.serve(READ_BOOK_HEALTH, move |envelope| {
+        let request: meridian_domain::v1::ReadBookHealthRequest =
+            decode(&envelope, "meridian.v1.ReadBookHealthRequest")?;
+        let limit = match request.page_size {
+            n if n <= 0 => 100,
+            n => (n as usize).min(1_000),
+        };
+        let only = (!request.account_id.is_empty()).then_some(request.account_id.as_str());
+        let mut accounts = reading
+            .book_health(only, &request.cursor, limit + 1)
+            .map_err(|failed| failed.on_the_bus())?;
+        let next_cursor = if accounts.len() > limit {
+            accounts.truncate(limit);
+            accounts
+                .last()
+                .map(|last| last.account_id.clone())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let reply = meridian_domain::v1::ReadBookHealthReply {
+            accounts,
+            next_cursor,
+        };
+        Ok((
+            "meridian.v1.ReadBookHealthReply".to_string(),
+            reply.encode_to_vec(),
+        ))
+    });
+
     let reading = store.clone();
     bus.serve(LIST_BOOKINGS, move |envelope| {
         let request: ListBookingsRequest = decode(&envelope, "meridian.v1.ListBookingsRequest")?;
@@ -955,11 +999,7 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
 /// A block's members, where the order is one (W11.1).
 /// The order a booking books, from its account's journal.
 fn booking_order(store: &dyn Store, account: &str, booking_id: &str) -> String {
-    let Ok(entries) = store.journal(account) else {
-        return String::new();
-    };
-    let Ok(book) = Book::replay(account, crate::store::first_partition_of(account), &entries)
-    else {
+    let Ok(book) = store.book(account) else {
         return String::new();
     };
     book.ledger
@@ -970,11 +1010,7 @@ fn booking_order(store: &dyn Store, account: &str, booking_id: &str) -> String {
 }
 
 fn block_members(store: &dyn Store, account: &str, order_id: &str) -> Vec<String> {
-    let Ok(entries) = store.journal(account) else {
-        return Vec::new();
-    };
-    let Ok(book) = Book::replay(account, crate::store::first_partition_of(account), &entries)
-    else {
+    let Ok(book) = store.book(account) else {
         return Vec::new();
     };
     book.ledger

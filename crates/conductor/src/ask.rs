@@ -351,7 +351,7 @@ impl VenueAsker {
 
     /// Subscribe before returning; the loop that asks is what is left.
     pub fn start(self) -> impl std::future::Future<Output = ()> {
-        let mut missing = self.bus.subscribe(VENUE_MISSING);
+        let mut missing = self.bus.subscribe_shared(VENUE_MISSING, "venue-asker");
         async move {
             let mut asked: std::collections::BTreeMap<(String, String, String), i64> =
                 std::collections::BTreeMap::new();
@@ -496,7 +496,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_answer_is_given_to_the_person_and_published_naming_the_record() {
         let bus = bus();
-        let mut pulled = bus.subscribe(INSTRUMENT_PULLED);
+        let mut pulled = bus.subscribe_every(INSTRUMENT_PULLED);
         let transport = Fake::new(vec![Ok(reply(200, &record_json("INS-USD")))]);
         let conductor =
             Conductor::new(bus.clone(), Arc::new(platform_with(transport)), bus.clock());
@@ -514,7 +514,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_platform_away_is_said_and_nothing_is_published() {
         let bus = bus();
-        let mut pulled = bus.subscribe(INSTRUMENT_PULLED);
+        let mut pulled = bus.subscribe_every(INSTRUMENT_PULLED);
         let transport = Fake::new(vec![
             failure("no route to host"),
             failure("no route to host"),
@@ -620,7 +620,7 @@ mod tests {
             bus.clock(),
             Arc::default(),
         );
-        let mut listed = bus.subscribe(crate::reference::LICENCE_LIST_PULLED);
+        let mut listed = bus.subscribe_every(crate::reference::LICENCE_LIST_PULLED);
         assert!(puller.pull_once().await.unwrap_err().is_outage());
         assert!(
             tokio::time::timeout(Duration::from_millis(100), listed.recv())

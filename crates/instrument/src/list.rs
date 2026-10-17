@@ -154,6 +154,19 @@ pub fn list_to_complete(
             } else {
                 String::new()
             },
+            // Contract v25 (W3.26): what the platform's answer contradicts
+            // of a person's, while the line is still to make.
+            contradicted_fields: if record.local.provisional {
+                record
+                    .local
+                    .contradicted_fields
+                    .iter()
+                    .filter_map(|name| crate::store::Field::parse(name))
+                    .map(|field| field_to_wire(field) as i32)
+                    .collect()
+            } else {
+                Vec::new()
+            },
         })
         .collect();
     let next_cursor = if start + page.len() < chosen.len() {

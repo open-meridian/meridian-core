@@ -286,7 +286,7 @@ impl Sidecar {
                 ));
                 continue;
             }
-            let subscription = self.bus.subscribe(row.topic);
+            let subscription = self.bus.subscribe_every(row.topic);
             tokio::spawn(forward(
                 row,
                 subscription,
@@ -359,7 +359,7 @@ async fn per_dataset(
                 let (first_stops, stopped) = watch::channel(());
                 tokio::spawn(forward(
                     row,
-                    bus.subscribe(&topic),
+                    bus.subscribe_every(&topic),
                     Arc::clone(&waiting),
                     configuration.clone(),
                     hearer.clone(),
@@ -377,7 +377,7 @@ async fn per_dataset(
                 );
                 tokio::spawn(async move {
                     tokio::time::sleep(ENTITLED_SETTLES).await;
-                    let again = bus.subscribe(&topic);
+                    let again = bus.subscribe_every(&topic);
                     drop(first_stops);
                     forward(
                         row,

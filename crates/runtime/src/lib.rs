@@ -475,7 +475,7 @@ pub fn collect_inward(bus: Arc<Bus>) -> Arc<Mutex<BTreeMap<String, ComponentRepo
     let heard: Arc<Mutex<BTreeMap<String, ComponentReport>>> =
         Arc::new(Mutex::new(BTreeMap::new()));
     let collecting = Arc::clone(&heard);
-    let mut inward = bus.subscribe(COMPONENT_REPORT_TOPIC);
+    let mut inward = bus.subscribe_every(COMPONENT_REPORT_TOPIC);
 
     tokio::spawn(async move {
         while let Some(delivery) = inward.recv().await {
@@ -652,6 +652,7 @@ pub async fn shutdown() {
 pub struct PlatformUpstream {
     platform: Arc<Platform>,
     runtime: tokio::runtime::Handle,
+    licence: Option<meridian_conductor::reference::Licence>,
 }
 
 impl PlatformUpstream {
@@ -660,7 +661,14 @@ impl PlatformUpstream {
         Self {
             platform,
             runtime: tokio::runtime::Handle::current(),
+            licence: None,
         }
+    }
+
+    /// With the licence list the conductor keeps (contract v25, W3.28).
+    pub fn with_licence(mut self, licence: meridian_conductor::reference::Licence) -> Self {
+        self.licence = Some(licence);
+        self
     }
 }
 
@@ -683,6 +691,126 @@ impl meridian_config::Upstream for PlatformUpstream {
             .block_on(self.platform.submit_diagnostic_bundle(bundle, now_ns()))
             .map_err(|failed| format!("the platform could not be sent the bundle: {failed}"))
     }
+
+    fn licence_schemes(&self) -> Option<Vec<String>> {
+        let licence = self.licence.as_ref()?;
+        let held = licence.read().ok()?.clone();
+        Some(
+            held.unwrap_or_else(meridian_conductor::reference::default_licence)
+                .schemes,
+        )
+    }
+}
+
+/// The deployment's own registry, as the configuration store's plugin
+/// handlers need it (contract v25, W8.15): a retired version's image
+/// released. Blocking on the runtime it was made on, as [`PlatformUpstream`]
+/// does, from a handler's blocking thread.
+pub struct RegistryRelease {
+    registry: meridian_conductor::local_registry::LocalRegistry,
+}
+
+impl RegistryRelease {
+    pub fn new(base: &str) -> Result<Self, String> {
+        Ok(Self {
+            registry: meridian_conductor::local_registry::LocalRegistry::new(base)?,
+        })
+    }
+}
+
+impl meridian_config::LocalRegistry for RegistryRelease {
+    fn release<'a>(
+        &'a self,
+        repository: &'a str,
+        digest: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(self.registry.release(repository, digest))
+    }
+}
+
+/// The platform's registry rows and the registries' bytes, as the
+/// configuration store's registry handlers need them (contract v25, W8.10
+/// to W8.12, W5.19): the platform signed as the deployment, the registries
+/// read by digest and the image copied into the deployment's own registry.
+pub struct PlatformRegistries {
+    platform: Arc<meridian_conductor::Platform>,
+    oci: meridian_conductor::oci::Oci,
+}
+
+impl PlatformRegistries {
+    pub fn new(platform: Arc<meridian_conductor::Platform>, local: &str) -> Result<Self, String> {
+        Ok(Self {
+            platform,
+            oci: meridian_conductor::oci::Oci::new(local)?,
+        })
+    }
+}
+
+impl meridian_config::registries::Registries for PlatformRegistries {
+    fn pull_catalogue(
+        &self,
+        after_sequence: u64,
+    ) -> meridian_config::registries::Fut<'_, Result<serde_json::Value, String>> {
+        Box::pin(
+            self.platform
+                .pull_registry_catalogue(after_sequence, now_ns()),
+        )
+    }
+
+    fn resolve<'a>(
+        &'a self,
+        listing: &'a str,
+        version: &'a str,
+        registry: &'a str,
+    ) -> meridian_config::registries::Fut<'a, Result<serde_json::Value, String>> {
+        Box::pin(
+            self.platform
+                .resolve_listed_version(listing, version, registry, now_ns()),
+        )
+    }
+
+    fn copy<'a>(
+        &'a self,
+        pull_from: &'a str,
+        token: &'a str,
+        digest: &'a str,
+        repository: &'a str,
+    ) -> meridian_config::registries::Fut<'a, Result<Vec<String>, String>> {
+        Box::pin(self.oci.copy(pull_from, token, digest, repository))
+    }
+
+    fn referrers<'a>(
+        &'a self,
+        repository: &'a str,
+        digest: &'a str,
+    ) -> meridian_config::registries::Fut<'a, Result<Vec<String>, String>> {
+        Box::pin(self.oci.referrers(repository, digest))
+    }
+
+    fn report_usage<'a>(
+        &'a self,
+        report: &'a meridian_domain::v1::PluginUsageReport,
+    ) -> meridian_config::registries::Fut<'a, Result<bool, String>> {
+        Box::pin(self.platform.report_plugin_usage(report, now_ns()))
+    }
+}
+
+/// The platform's public keys the chart carries (W8.10; the spec's
+/// requirement 23): each `*.pem` in the directory, the current and the
+/// next. None where the chart names no directory, or it holds none.
+pub fn platform_keys_at(dir: &str) -> Result<Vec<String>, String> {
+    let mut found: Vec<(String, String)> = std::fs::read_dir(dir)
+        .map_err(|failed| format!("the platform's keys at {dir}: {failed}"))?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|e| e == "pem"))
+        .filter_map(|entry| {
+            let path = entry.path();
+            let pem = std::fs::read_to_string(&path).ok()?;
+            Some((path.display().to_string(), pem))
+        })
+        .collect();
+    found.sort();
+    Ok(found.into_iter().map(|(_, pem)| pem).collect())
 }
 
 pub fn var(name: &str) -> Option<String> {

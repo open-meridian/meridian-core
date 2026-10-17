@@ -193,8 +193,23 @@ impl Bus {
         Ok(message_id)
     }
 
-    pub fn subscribe(&self, pattern: &str) -> Subscription {
+    /// Subscribe, every subscriber hearing every message: what a copy of a
+    /// component needs for itself -- a view it keeps, a cache, a plugin's
+    /// delivery -- whatever its other copies do. A caller says which it
+    /// means (contract v25): this, or [`Bus::subscribe_shared`].
+    pub fn subscribe_every(&self, pattern: &str) -> Subscription {
         self.backend_for(pattern).subscribe(pattern)
+    }
+
+    /// Subscribe as one of us (contract v25; Q15): each message reaches one
+    /// copy of this component among those subscribed for the same `work`, so
+    /// work that writes a shared store or asks the platform is done once, not
+    /// once per copy. The group is this bus's instance (its component) and
+    /// `work`, so two subscriptions of one process to one topic for
+    /// different work each hear it. At most once.
+    pub fn subscribe_shared(&self, pattern: &str, work: &str) -> Subscription {
+        let group = format!("{}.{work}", self.instance_id);
+        self.backend_for(pattern).subscribe_shared(pattern, &group)
     }
 
     /// Register a handler for request-reply on an exact topic.
@@ -213,9 +228,11 @@ impl Bus {
             .insert(topic.to_string(), Arc::clone(&handler));
 
         // And offered to other processes, where the backend has somewhere to
-        // offer it. The in-process backend does nothing here, because the map
-        // above is already the answer.
-        self.backend_for(topic).serve(topic, handler);
+        // offer it, every copy of this component one group (contract v25),
+        // so a request is answered once. The in-process backend does nothing
+        // here, because the map above is already the answer.
+        self.backend_for(topic)
+            .serve(topic, &self.instance_id, handler);
     }
 
     /// Register a handler, and signal once each answer has been delivered.
@@ -236,7 +253,7 @@ impl Bus {
             .insert(topic.to_string(), Arc::clone(&handler));
 
         self.backend_for(topic)
-            .serve_delivered(topic, handler, delivered);
+            .serve_delivered(topic, &self.instance_id, handler, delivered);
     }
 
     /// Ask a question and wait for the answer, bounded in time.
@@ -427,7 +444,7 @@ mod tests {
     async fn the_time_stamped_is_the_clocks_it_was_given() {
         let clock = Arc::new(ManualClock::at(NOW));
         let bus = Bus::single("core-1", Arc::new(MemoryBackend::new()), clock.clone());
-        let mut sub = bus.subscribe("platform.street.**");
+        let mut sub = bus.subscribe_every("platform.street.**");
 
         bus.publish(
             "platform.street.event.position-updated",
@@ -461,7 +478,7 @@ mod tests {
     #[tokio::test]
     async fn publish_stamps_identity_and_time() {
         let bus = bus();
-        let mut sub = bus.subscribe("platform.street.**");
+        let mut sub = bus.subscribe_every("platform.street.**");
         bus.publish(
             "platform.street.event.position-updated",
             "meridian.v1.PositionUpdatedEvent",
@@ -481,7 +498,7 @@ mod tests {
     #[tokio::test]
     async fn a_message_with_no_correlation_becomes_its_own_root() {
         let bus = bus();
-        let mut sub = bus.subscribe("platform.street.**");
+        let mut sub = bus.subscribe_every("platform.street.**");
         bus.publish(
             "platform.street.event.position-updated",
             "t",
@@ -499,7 +516,7 @@ mod tests {
     #[tokio::test]
     async fn correlation_and_causation_are_carried_through() {
         let bus = bus();
-        let mut sub = bus.subscribe("platform.street.**");
+        let mut sub = bus.subscribe_every("platform.street.**");
         bus.publish(
             "platform.street.event.position-updated",
             "t",

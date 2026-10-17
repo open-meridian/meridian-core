@@ -12,7 +12,7 @@ use meridian_access::AccessLevel;
 use meridian_domain::v1::{PluginReport, PluginSettingsRecord};
 use meridian_pb::v1::{SettingDeclaration, SettingType};
 
-use super::{PARITY, SPECS};
+use super::{Gate, PARITY, SPECS};
 
 /// What PARITY says of `key`, as a tool's name or an exception; a key
 /// ending `-*` stands for any of its kind.
@@ -120,6 +120,8 @@ fn every_route_of_a_plugins_area_its_holds_and_its_lifecycle_names_its_tool_or_i
         include_str!("../../archive.rs"),
         include_str!("../../area.rs"),
         include_str!("../../plugins.rs"),
+        include_str!("../../documentation.rs"),
+        include_str!("../../registry.rs"),
     ];
     let mut checked = 0;
     for path in sources.iter().flat_map(|source| routes(source)) {
@@ -153,8 +155,75 @@ fn every_tool_parity_names_is_one_and_every_tool_is_named() {
             spec.name
         );
     }
-    // v17's thirteen, and v20's read of the accounts an instance may link.
-    assert_eq!(SPECS.len(), 14, "the fourteen approved tools");
+    // v17's thirteen, v20's read of the accounts an instance may link, and
+    // v25's retirement of a version (W8.15), read of a version's
+    // documentation (W6.20) and the registries' seven (W8.10 to W8.12,
+    // W5.19).
+    assert_eq!(SPECS.len(), 23, "the twenty-three approved tools");
+}
+
+/// Contract v25 (W6.20, W6.26, W8.15): retiring a version is a deployment
+/// admin's act with a note, preparable, at may not for agents by default.
+#[test]
+fn retiring_a_version_takes_a_note_is_preparable_and_may_not_by_default() {
+    let spec = SPECS
+        .iter()
+        .find(|spec| spec.name == "retire_plugin_version")
+        .expect("retire_plugin_version");
+    assert!(!spec.reads);
+    let schema = (spec.input_schema)();
+    let required: Vec<&str> = schema["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(required, vec!["name", "version", "note"]);
+    assert!(crate::prepared::CORE_PREPARABLE.contains(&"dashboard__retire_plugin_version"));
+    assert_eq!(
+        crate::prepared::levels::default_for("dashboard__retire_plugin_version"),
+        crate::prepared::levels::Level::MayNot
+    );
+}
+
+/// Contract v25: the registries' reads at the deployment admin's level, and
+/// their acts each with a note, preparable, at may not until loosened.
+#[test]
+fn the_registries_tools_read_at_the_deployment_admins_level_and_act_at_may_not() {
+    for (name, reads, gate) in [
+        ("search_registry_plugins", true, Gate::DeploymentAdmin),
+        ("read_registry_plugin", true, Gate::DeploymentAdmin),
+        ("read_registries", true, Gate::DeploymentAdmin),
+        ("install_plugin", false, Gate::DeploymentAdmin),
+        ("update_plugin", false, Gate::AdminOrDeployment),
+        ("acknowledge_pull", false, Gate::DeploymentAdmin),
+        ("set_reports_plugin_usage", false, Gate::DeploymentAdmin),
+    ] {
+        let spec = SPECS.iter().find(|spec| spec.name == name).expect(name);
+        assert_eq!(spec.reads, reads, "{name}");
+        assert_eq!(spec.area, super::Area::Plugins(gate), "{name}");
+        if !reads {
+            let schema = (spec.input_schema)();
+            assert!(
+                schema["required"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|f| f == "note"),
+                "{name}"
+            );
+            let full = format!("dashboard__{name}");
+            assert!(
+                crate::prepared::CORE_PREPARABLE.contains(&full.as_str()),
+                "{name}"
+            );
+            assert_eq!(
+                crate::prepared::levels::default_for(&full),
+                crate::prepared::levels::Level::MayNot,
+                "{name}"
+            );
+        }
+    }
 }
 
 /// What changes who holds access: no tool's (the ruling of 2026-10-01).

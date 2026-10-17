@@ -290,6 +290,10 @@ async fn an_order_is_booked_to_its_account_and_its_lots_re_stated_at_the_average
     assert_eq!(booking_state(&handed), BookingState::HandedOff);
     let twice = hand_off(&w, &booking.booking_id, false).await.unwrap_err();
     assert_eq!(code(&twice), Some(RefusalReason::OrderState), "{twice}");
+    // A booked account's book from a snapshot at any entry (contract v25).
+    let journal = w.store.journal(ACC).unwrap();
+    let partition = journal[0].partition.clone();
+    crate::snapshot::tests::holds_at_every_split(ACC, &partition, &journal);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -494,7 +498,7 @@ async fn a_block_is_booked_across_two_funds_and_each_member_is_filled_by_its_all
     .unwrap();
     assert_eq!(read(&aapl_in(&w, BLOCK).unwrap().trade_date_quantity), "10");
 
-    let mut updated = w.bus.subscribe(BOOKING_UPDATED);
+    let mut updated = w.bus.subscribe_every(BOOKING_UPDATED);
     let booking = book(
         &w,
         &block.order_id,
@@ -804,6 +808,52 @@ async fn a_give_up_answer_is_recorded_on_the_execution_and_its_allocation() {
     assert_eq!(held[0].allocations[0].give_up_answers.len(), 1);
     // A rejection moves no position.
     assert_eq!(read(&aapl_in(&w, ACC).unwrap().trade_date_quantity), "10");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_give_up_naming_nothing_held_is_kept_unplaced_whole() {
+    // Contract v25 (W11.32; decision 30): its own arm, fact kind `give-up`.
+    let w = wired();
+    account(&w, ACC).await;
+    let report = ReportGiveUpRequest {
+        execution_id: "EXE-NOT-HELD".into(),
+        allocation_id: String::new(),
+        answer: GiveUpAnswer::Accepted as i32,
+        prime_reference: "PB-1".into(),
+        reason: "accepted".into(),
+        raw_record: None,
+    };
+    let reply = send_from(
+        &w.bus,
+        REPORT_GIVE_UP,
+        "meridian.v1.ReportGiveUpRequest",
+        &report,
+        &As::default(),
+    )
+    .await
+    .unwrap();
+    let kept = FactReply::decode(&reply[..]).unwrap().unplaced.unwrap();
+    assert_eq!(kept.fact_kind, "give-up");
+    assert!(kept.account_id.is_empty(), "naming no account");
+    assert_eq!(
+        kept.fact,
+        Some(meridian_domain::v1::unplaced_fact::Fact::GiveUp(
+            report.clone()
+        ))
+    );
+    // Still held to its shape: an answer is accepted or rejected.
+    let mut unanswered = report.clone();
+    unanswered.answer = GiveUpAnswer::Unspecified as i32;
+    let refused = send_from(
+        &w.bus,
+        REPORT_GIVE_UP,
+        "meridian.v1.ReportGiveUpRequest",
+        &unanswered,
+        &As::default(),
+    )
+    .await
+    .unwrap_err();
+    assert!(refused.contains("accepted or rejected"), "{refused}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

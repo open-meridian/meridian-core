@@ -78,8 +78,12 @@ impl InstrumentService {
     /// taken first: at-most-once delivery drops what arrives before a
     /// subscriber exists, and it drops it silently.
     pub fn start(self) -> impl std::future::Future<Output = ()> {
-        let pulled = self.bus.subscribe(service::INSTRUMENT_PULLED);
-        let missing = self.bus.subscribe(service::INSTRUMENT_MISSING);
+        let pulled = self
+            .bus
+            .subscribe_shared(service::INSTRUMENT_PULLED, "keeping");
+        let missing = self
+            .bus
+            .subscribe_shared(service::INSTRUMENT_MISSING, "keeping");
         // The calendars and rules the conductor pulled (W3.16, contract v22),
         // subscribed before anything else is in place, as the others are.
         let calendars = service::keep_calendars(

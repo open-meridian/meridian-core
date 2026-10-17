@@ -13,9 +13,11 @@
 //! above this layer.
 
 pub mod contract;
+pub mod daily;
 pub mod figures;
 pub mod front_door;
 pub mod grants;
+pub mod held;
 pub mod lake;
 pub mod legacy;
 pub mod live;

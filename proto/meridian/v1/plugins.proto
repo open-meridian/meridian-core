@@ -63,15 +63,82 @@ message RecordPluginUploadRequest {
   // The image manifest's digest, `sha256:<hex>`, in plugins/<name>. A launch
   // runs exactly this, never a tag that could move.
   string image_digest = 2;
+
+  // The vendor's documentation as uploaded (W8.1, contract v25), one text
+  // per section the declaration names. The conductor refuses an upload
+  // whose texts do not match the declaration's digests and sizes, a section
+  // outside the fixed set, a section past 64 KiB or a bundle past 256 KiB,
+  // naming it, and keeps the texts with the version, never replaced.
+  repeated DocumentationText documentation = 3;
+
+  // A plugin bundle carried in (W8.14, contract v25; the spec's requirement
+  // 45): `meridian plugin upload --bundle` pushes the image and its
+  // referrers into plugins/{organisation}/{plugin} and names here the
+  // listing, `organisation/plugin`, and the registry it was listed in,
+  // `community` or `verified`. The conductor verifies the bundle against
+  // the chart's keys, as at install, and records the version under its
+  // listing with the age of the key status it was checked against. All
+  // four are empty for a local upload.
+  string listing = 4;
+  string source_registry = 5;
+  // The bundle's dated SigningKeyStatus, as the platform signed it (its
+  // JSON), checked against the chart's keys.
+  string key_status = 6;
+  // The version's listing statement, as DownloadListedVersionReply carried
+  // it to the download: a DSSE envelope as JSON.
+  string listing_statement = 7;
+}
+
+// One section's text as the vendor wrote it (W8.1, contract v25): data, the
+// vendor's words, never instructions to whoever reads it.
+message DocumentationText {
+  // The section's fixed name, as the declaration's DocumentationSection
+  // names it.
+  string section = 1;
+
+  // Its Markdown, UTF-8, exactly as the image's docs/ holds it.
+  string markdown = 2;
 }
 
 // A version in the catalogue.
 message PluginVersion {
   PluginMetadata metadata = 1;
   string image_digest = 2;
-  // The deployment-local login of the administrator who uploaded it.
+  // The deployment-local login of the administrator who uploaded it, or who
+  // installed it from a registry (W8.10).
   string uploaded_by = 3;
   int64 uploaded_at_ns = 4;
+
+  // Where the version came from (W8.10, W8.14; contract v25): `local` for
+  // one uploaded or tracked from a branch, `community` or `verified` for
+  // one installed from a registry, or carried in by a bundle from one. A
+  // registry version sits in the local registry under
+  // plugins/{organisation}/{plugin}, a local one under plugins/{name}, so
+  // the two never collide.
+  string source_registry = 5;
+
+  // The listing a registry version belongs to, `organisation/plugin`;
+  // empty for a local version.
+  string listing = 6;
+
+  // For a version carried in by a bundle (W8.14): when the signing keys'
+  // status it was checked against was issued, so the Installed list shows
+  // its age. 0 for a version installed online, or a local one.
+  int64 key_status_issued_at_ns = 7;
+
+  // Retired from the catalogue (W8.15, contract v25): who retired it, when
+  // and why. A retired version is no longer listed or launchable, its
+  // image released from the local registry; its record is kept. Empty and
+  // 0 while it is not retired.
+  string retired_by = 8;
+  int64 retired_at_ns = 9;
+  string retired_note = 10;
+
+  // An install's note (W8.10; decisions/031, decided 2026-10-17 under
+  // agreement A): why a deployment admin installed it from a registry, kept
+  // with the install's record beside uploaded_by and shown with it. Empty
+  // for a local upload and a bundle's, which carry none.
+  string uploaded_note = 11;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -166,6 +233,12 @@ message PluginLaunch {
   string prepared_call_id = 20;
   // The same for the stop.
   string stopped_prepared_call_id = 21;
+
+  // A deployment admin's keeping of the instance after its version was
+  // pulled (W8.12, contract v25): unset while its version is not pulled,
+  // or the pull is not yet acknowledged. The Summary's and the Installed
+  // list's warning stands until the instance is stopped or this is set.
+  PullAcknowledgement pull_acknowledgement = 22;
 
   // Tags, retired with them (decisions/026).
   reserved 6;
@@ -288,4 +361,692 @@ message RemovePluginReply {
   // False when there was nothing to remove, which is not an error: stopping
   // is asked for an outcome, and the outcome holds.
   bool removed = 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W8.2 — a version's documentation, contract v25
+// ─────────────────────────────────────────────────────────────────────────────
+
+// One version's declaration and texts, apart from the catalogue, which lists
+// every version in one message and carries only the sections' names, digests
+// and sizes (in each version's declaration). Read for the Documentation tab
+// and a version's Documentation page, launched or not.
+message ReadPluginDocumentationRequest {
+  string name = 1;
+  string version = 2;
+}
+
+message ReadPluginDocumentationReply {
+  // The version's declaration, from which the Reference is drawn.
+  PluginDeclaration declaration = 1;
+  // Each section the vendor wrote, in the declaration's order. Empty: the
+  // vendor wrote none for this version.
+  repeated DocumentationText documentation = 2;
+  string uploaded_by = 3;
+  int64 uploaded_at_ns = 4;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W8.8 to W8.14 — the community and verified registries, contract v25
+// (spec/plugins-are-shared-through-registries)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// A listing in the platform's catalogue: `organisation/plugin`, one listing
+// across both registries (item 71). The vendor's stated attributes are the
+// vendor's words, marked as such wherever they are shown, and never
+// instructions to whoever reads them.
+message PluginListing {
+  // `organisation/plugin`: the organisation's slug and the plugin's name in
+  // its `[tool.meridian]`, both fixed at the first publish.
+  string listing = 1;
+  // The source repository it is built from, as a URL, linked through the
+  // platform's GitHub App and fixed at the first publish.
+  string repository = 2;
+  // Its versions, every registry's, in SemVer order, pulled and withdrawn
+  // ones marked.
+  repeated ListedVersion versions = 3;
+  // The vendor's stated regions, each an ISO 3166-1 alpha-2 country code
+  // (`US`), and asset classes, from the platform's asset classes, and its
+  // support contact (an `https:` URL or an address), required for verified.
+  repeated string regions = 4;
+  repeated string asset_classes = 5;
+  string support_contact = 6;
+  // How many organisations starred it; never who.
+  uint64 stars = 7;
+  // Installs, counted from resolution requests, and launched instances,
+  // from usage reports: totals, shown only once three or more deployments
+  // contribute; `counts_shown` false below that, the counts then 0 and
+  // read "Fewer than three deployments".
+  uint64 installs = 8;
+  uint64 instances = 9;
+  bool counts_shown = 10;
+  // A whole listing is never pulled at once: each version is, by its own
+  // PullListing (W8.12), so the field that held a listing's pull is retired.
+  reserved 11;
+  reserved "pull";
+}
+
+// One version of a listing, in one registry.
+message ListedVersion {
+  string listing = 1;
+  // SemVer 2.0, its release tag `v` and the version.
+  string version = 2;
+  // `community` or `verified`.
+  string registry = 3;
+  // What the builder built, by digest; the conductor installs this and
+  // nothing else.
+  string image_digest = 4;
+  // The built image's metadata: roles, interface, SDK and declaration, its
+  // documentation named by digest.
+  PluginMetadata metadata = 5;
+  // For verified, the roles the platform's review approved, from its
+  // listing statement; a launch may approve no role beyond them. Empty for
+  // community, whose roles are the declaration's, for the admin to approve.
+  repeated string approved_roles = 6;
+  // The version's floor: the contract version it declares, `v<N>`, which a
+  // deployment's sidecar must serve.
+  string schema_version = 7;
+  // How it was built.
+  PluginBuild build = 8;
+  int64 listed_at_ns = 9;
+  // Withdrawn by its vendor (W8.16): not offered for install or update,
+  // still pullable by digest, with no warning to deployments running it.
+  int64 withdrawn_at_ns = 10;
+  // Its pull, unset while it is not pulled.
+  PluginPull pull = 11;
+  // Its place in the catalogue's sequence, which a pull after a sequence
+  // reads from.
+  uint64 sequence = 12;
+  // The platform's signed listing statement (requirement 21), the same
+  // document the image carries as an OCI referrer: a DSSE envelope as JSON
+  // -- payloadType `application/vnd.in-toto+json`, payload the base64 of
+  // an in-toto statement whose subject is image_digest and whose predicate
+  // type is `https://open-meridian.dev/attestation/plugin-listing/v1`
+  // (the registry, the time, and for verified the review and its approved
+  // roles), and its signatures -- which the conductor verifies at download
+  // and again at launch against the platform's keys the chart carries.
+  // Empty only before the version is listed.
+  string listing_statement = 13;
+}
+
+// A build of a signed release tag by the platform's builder (W8.8; items 102,
+// 103), followed by the CLI until the version is listed, queued for review
+// or refused. A refused build carries no text of its own: why is the
+// details of its findings at BUILD_FINDING_SEVERITY_BLOCKED. The repository
+// and the builder are URLs.
+message PluginBuild {
+  string build_id = 1;
+  string listing = 2;
+  string version = 3;
+  // `community` or `verified`, as the publish asked.
+  string registry = 4;
+  PluginBuildState state = 5;
+  // What it was built from: the repository, the commit the tag pins, the
+  // tag, and the fingerprint of the key that signed it.
+  string repository = 6;
+  string commit = 7;
+  string tag = 8;
+  string signer_fingerprint = 9;
+  // The builder's identity, as its provenance names it.
+  string builder = 10;
+  // The image's digest once built; empty before.
+  string image_digest = 11;
+  // Each check's finding, in order: a refusal names the check that failed,
+  // a warning is shown with the version.
+  repeated BuildFinding findings = 12;
+  // For community, the build's public log; empty for verified.
+  string log_url = 13;
+  int64 requested_at_ns = 14;
+  int64 finished_at_ns = 15;
+}
+
+enum PluginBuildState {
+  PLUGIN_BUILD_STATE_UNSPECIFIED = 0;
+  // Asked for, waiting for the builder.
+  PLUGIN_BUILD_STATE_QUEUED = 1;
+  // Checked out, verified and building, or being checked.
+  PLUGIN_BUILD_STATE_BUILDING = 2;
+  // Every automatic check passed and, for community, listed.
+  PLUGIN_BUILD_STATE_LISTED = 3;
+  // Every automatic check passed; a verified version waiting for review.
+  PLUGIN_BUILD_STATE_IN_REVIEW = 4;
+  // A check failed, named in findings; nothing is listed.
+  PLUGIN_BUILD_STATE_REFUSED = 5;
+}
+
+// One automatic check's finding on a build (requirement 14).
+message BuildFinding {
+  // The check: the tag's signature, the repository and licence, the base
+  // image, the dependency screen, a scan, the conformance suite, a cap, or
+  // the declaration's and documentation's checks.
+  string check = 1;
+  BuildFindingSeverity severity = 2;
+  // What it found, in words.
+  string detail = 3;
+}
+
+enum BuildFindingSeverity {
+  BUILD_FINDING_SEVERITY_UNSPECIFIED = 0;
+  // Passed.
+  BUILD_FINDING_SEVERITY_PASSED = 1;
+  // Shown with the version; lists nothing less.
+  BUILD_FINDING_SEVERITY_WARNING = 2;
+  // Refused: nothing is listed.
+  BUILD_FINDING_SEVERITY_BLOCKED = 3;
+}
+
+// A person's review of a verified version (W8.9), its decision its own
+// record (decisions/031).
+message PluginReview {
+  string review_id = 1;
+  string listing = 2;
+  string version = 3;
+  // Short when its roles and floor match the last approved version's,
+  // full otherwise; never none.
+  bool full = 4;
+  PluginReviewDecision decision = 5;
+  // The reviewer, a staff member holding REVIEW_PLUGINS, and when.
+  string reviewer_person_id = 6;
+  int64 decided_at_ns = 7;
+  // What an approval approves: the roles and the floor.
+  repeated string approved_roles = 8;
+  string schema_version = 9;
+  // The reason sent to the vendor.
+  string reason = 10;
+}
+
+enum PluginReviewDecision {
+  PLUGIN_REVIEW_DECISION_UNSPECIFIED = 0;
+  // Waiting for a reviewer; an agent's proposal does not decide it.
+  PLUGIN_REVIEW_DECISION_PENDING = 1;
+  PLUGIN_REVIEW_DECISION_APPROVED = 2;
+  // Lists nothing; the vendor fixes it in a new version.
+  PLUGIN_REVIEW_DECISION_REFUSED = 3;
+}
+
+// An organisation's tag-signing key (W5.30): its public half only.
+message SigningKeyRecord {
+  string key_id = 1;
+  // The organisation's slug.
+  string organisation = 2;
+  // The organisation's name for the key.
+  string name = 3;
+  // The SSH public key, as `ssh-ed25519 AAAA...`, and its SHA-256
+  // fingerprint as git and GitHub show it.
+  string public_key = 4;
+  string fingerprint = 5;
+  int64 registered_at_ns = 6;
+  string registered_by_person_id = 7;
+  // A revocation: when, by whom, why, and the time after which nothing
+  // built is trusted (item 74). 0 while it is active.
+  int64 revoked_at_ns = 8;
+  string revoked_by_person_id = 9;
+  string revoke_reason = 10;
+  int64 not_trusted_after_ns = 11;
+}
+
+// Every organisation's tag-signing keys, active and revoked, as a document
+// the platform signs (requirement 26): the conductor pulls it with the
+// catalogue and checks a version's signer against the latest it holds, and
+// a bundle carries a dated copy.
+message SigningKeyStatus {
+  int64 issued_at_ns = 1;
+  repeated SigningKeyRecord keys = 2;
+  // The platform's signature over the document, checked against the
+  // platform's public keys each chart release carries: base64 of an ECDSA
+  // P-256 signature over DSSE's pre-authentication encoding (PAE) of the
+  // payload type `application/vnd.open-meridian.signing-key-status+json`
+  // and the body, this record's canonical JSON without `signature` -- the
+  // DSSE convention in-toto and Sigstore use.
+  string signature = 3;
+}
+
+// A pull of a listing or a version from the catalogue (W8.12), staff's act,
+// its own record. A pull stops new installs and updates and warns installed
+// copies; it never removes one.
+message PluginPull {
+  string listing = 1;
+  // The one version pulled; never empty (W8.12).
+  string version = 2;
+  PullReasonKind kind = 3;
+  // The reason, in words, as deployments and organisations are told it.
+  string reason = 4;
+  int64 pulled_at_ns = 5;
+  // For a copyright notice's pull, the notice (W8.13).
+  string notice_id = 6;
+  // A restoration after a counter-notice (W8.13): when; 0 while it stands.
+  int64 restored_at_ns = 7;
+}
+
+enum PullReasonKind {
+  PULL_REASON_KIND_UNSPECIFIED = 0;
+  // A breach of the Platform Terms.
+  PULL_REASON_KIND_TERMS_BREACH = 1;
+  // A copyright notice acted on (W8.13).
+  PULL_REASON_KIND_COPYRIGHT_NOTICE = 2;
+}
+
+// A copyright notice under 17 U.S.C. §512, recorded by staff against a
+// listing's versions (W8.13), with its counter-notice and what became of it.
+// The sender's contact details are kept for staff and the publishing
+// organisation alone.
+message CopyrightNotice {
+  string notice_id = 1;
+  string listing = 2;
+  // The versions, or digests, it names.
+  repeated string versions = 3;
+  repeated string image_digests = 4;
+  // The date received, ISO 8601.
+  string received_on = 5;
+  // Each §512(c)(3) element present, by its paragraph, `i` to `vi`; a
+  // notice missing one is incomplete and its sender told what is missing.
+  repeated string elements_present = 6;
+  bool complete = 7;
+  string sender_name = 8;
+  string sender_contact = 9;
+  CopyrightNoticeState state = 10;
+  // The counter-notice: the date received and each §512(g)(3) element
+  // present, by its paragraph, `A` to `D`.
+  string counter_received_on = 11;
+  repeated string counter_elements_present = 12;
+  // The restoration window, no sooner than 10 and no later than 14 business
+  // days after the counter-notice, ISO 8601 dates.
+  string restore_from = 13;
+  string restore_until = 14;
+  // A court action the sender filed, recorded by staff: the date, which
+  // keeps the versions pulled.
+  string court_action_on = 15;
+}
+
+enum CopyrightNoticeState {
+  COPYRIGHT_NOTICE_STATE_UNSPECIFIED = 0;
+  // Missing a §512(c)(3) element.
+  COPYRIGHT_NOTICE_STATE_INCOMPLETE = 1;
+  COPYRIGHT_NOTICE_STATE_RECORDED = 2;
+  // Its versions pulled.
+  COPYRIGHT_NOTICE_STATE_ACTED_ON = 3;
+  // A counter-notice recorded; the restoration window open.
+  COPYRIGHT_NOTICE_STATE_COUNTERED = 4;
+  COPYRIGHT_NOTICE_STATE_RESTORED = 5;
+}
+
+// The plugin usage report (W5.19's carve-out; requirement 47): counts about
+// each installed community or verified version, weekly. It names no person,
+// account, instrument or local plugin.
+message PluginUsageReport {
+  // The week it covers, ISO 8601 dates, inclusive.
+  string period_start = 1;
+  string period_end = 2;
+  repeated PluginUsageCount counts = 3;
+}
+
+// One installed registry version's counts over the week.
+message PluginUsageCount {
+  string listing = 1;
+  string version = 2;
+  string registry = 3;
+  // Instances launched at the period's end.
+  uint32 instances = 4;
+  // People holding each level on any of its roles, at the period's end.
+  uint32 people_read = 5;
+  uint32 people_write = 6;
+  uint32 people_admin = 7;
+  // Seven daily counts, the period's first day first: operations its
+  // sidecars carried, and page and tool requests.
+  repeated uint64 daily_operations = 8;
+  repeated uint64 daily_requests = 9;
+}
+
+// ── Platform HTTPS rows, CLI to platform (W8.8, W8.14, W5.30) ──────────────
+
+// ── Platform HTTPS rows, the builder to platform (W8.8; decisions/022 as
+// amended 2026-10-16, item 135): the builder presents its workflow's OIDC
+// token and the build's one-time intake nonce. ─────────────────────────────
+
+// The builder says it started: the build's public log, for community.
+message RecordBuildStartedRequest {
+  string build_id = 1;
+  // The nonce the platform gave the build when it was asked for; spent at
+  // the results.
+  string intake_nonce = 2;
+  string log_url = 3;
+}
+
+// The builder hands back what it built and what each check found -- one
+// finding per check, the scan policy (plan Q4) applied in the builder -- and
+// the platform checks them, then lists, queues for review or refuses. The
+// provenance and the image's metadata are not in it: the platform reads
+// them from the image's OCI 1.1 referrers, the builder's SLSA provenance
+// and its plugin-metadata attestation
+// (`https://open-meridian.dev/attestation/plugin-metadata/v1`).
+message RecordBuildResultsRequest {
+  string build_id = 1;
+  string intake_nonce = 2;
+  string image_digest = 3;
+  repeated BuildFinding findings = 4;
+}
+
+message PublishPluginVersionRequest {
+  // The organisation's slug and the plugin's name.
+  string organisation = 1;
+  string plugin = 2;
+  // `community` or `verified`.
+  string registry = 3;
+  // A repository linked through the platform's GitHub App, as its URL or
+  // as owner/name; at a listing's first publish it becomes the listing's,
+  // fixed, and is answered as a URL.
+  string repository = 4;
+  // The release tag, `v` and the SemVer version, signed by a registered,
+  // active key of the organisation.
+  string tag = 5;
+}
+
+message ReadPluginBuildRequest {
+  string organisation = 1;
+  string plugin = 2;
+  string build_id = 3;
+}
+
+message RegisterSigningKeyRequest {
+  string organisation = 1;
+  string name = 2;
+  string public_key = 3;
+}
+
+// The organisation's own keys, active and revoked (W5.30): its page and
+// `meridian plugin key list`.
+message ListSigningKeysRequest {
+  string organisation = 1;
+}
+
+message ListSigningKeysReply {
+  repeated SigningKeyRecord keys = 1;
+}
+
+message RevokeSigningKeyRequest {
+  string organisation = 1;
+  string key_id = 2;
+  // Nothing built after it is trusted; at most now.
+  int64 not_trusted_after_ns = 3;
+  string reason = 4;
+}
+
+// ── Platform HTTPS rows, conductor to platform (W8.10, W8.11, W5.19) ───────
+
+// The catalogue after a sequence: every listing changed since, with its
+// versions, pulls and withdrawals, and the signing keys' status.
+message PullCatalogueReply {
+  repeated PluginListing listings = 1;
+  // The latest sequence the answer holds, which the next pull reads after.
+  uint64 sequence = 2;
+  SigningKeyStatus key_status = 3;
+}
+
+// One resolution request per install or update (plan Q3), counted by the
+// platform; also the CLI's bundle download (W8.14).
+message DownloadListedVersionRequest {
+  string listing = 1;
+  string version = 2;
+  string registry = 3;
+}
+
+message DownloadListedVersionReply {
+  string image_digest = 1;
+  // Where to pull it by digest: the repository in the platform's public
+  // GitHub registry for community, in Artifact Registry for verified.
+  string pull_from = 2;
+  // For verified, a short-lived pull token; empty for community, whose
+  // bytes are pulled anonymously.
+  string pull_token = 3;
+  int64 pull_token_expires_at_ns = 4;
+  // The version's signed listing statement, as ListedVersion.listing_statement
+  // carries it: a DSSE envelope as JSON. The conductor verifies it at
+  // download and keeps it with the version for launch; the CLI's bundle
+  // download verifies it and writes it into the bundle (W8.14), since a
+  // verified version's statement is not a referrer the platform can push.
+  string listing_statement = 5;
+}
+
+message ReportPluginUsageReply {
+  int64 received_at_ns = 1;
+}
+
+// ── Platform HTTPS rows, a person or staff to platform (W8.9, W8.12, W8.13,
+// W8.16, W5.32) ────────────────────────────────────────────────────────────
+
+message ReviewPluginVersionRequest {
+  string review_id = 1;
+  PluginReviewDecision decision = 2;
+  // On an approval, the roles approved, no wider than the declaration's.
+  repeated string approved_roles = 3;
+  string reason = 4;
+}
+
+// A person holding REVIEW_PLUGINS accepts or rejects an agent's proposal --
+// a review, a pull, a copyright pull or a restoration (W8.9, W8.12, W8.13).
+// Accepting makes the act as that person, its own record.
+message DecideRegistryProposalRequest {
+  string proposal_id = 1;
+  bool accept = 2;
+  string note = 3;
+}
+
+message DecideRegistryProposalReply {
+  string proposal_id = 1;
+  bool accepted = 2;
+  int64 decided_at_ns = 3;
+}
+
+message PullListingRequest {
+  string listing = 1;
+  // One version, required: pulling a whole listing, or the several versions
+  // a copyright notice names, is one request per version, each its own
+  // record (decisions/031; W8.12, W8.13).
+  string version = 2;
+  PullReasonKind kind = 3;
+  string reason = 4;
+  // For a copyright notice's pull, the notice it acts on.
+  string notice_id = 5;
+}
+
+message StarPluginRequest {
+  string listing = 1;
+  // True stars it, once per organisation; false takes the star back.
+  bool starred = 2;
+  // The organisation starring, one the person is an Owner or Admin of with
+  // an enrolled deployment: a person may belong to several, and a star is
+  // one per organisation.
+  string organisation_id = 3;
+}
+
+message StarPluginReply {
+  // Whether this organisation's star stands, and the listing's count.
+  bool starred = 1;
+  uint64 stars = 2;
+}
+
+message SetPluginAttributesRequest {
+  string organisation = 1;
+  string plugin = 2;
+  repeated string regions = 3;
+  repeated string asset_classes = 4;
+  string support_contact = 5;
+}
+
+message WithdrawListedVersionRequest {
+  string organisation = 1;
+  string plugin = 2;
+  string version = 3;
+  string reason = 4;
+}
+
+message SetMayPublishRequest {
+  string organisation = 1;
+  string plugin = 2;
+  string person_id = 3;
+  // True grants the permission, false withdraws it.
+  bool may_publish = 4;
+}
+
+message SetMayPublishReply {
+  // Who holds it on the plugin now, beside the organisation's Owners and
+  // Admins.
+  repeated string person_ids = 1;
+}
+
+message RecordCopyrightNoticeRequest {
+  string listing = 1;
+  repeated string versions = 2;
+  repeated string image_digests = 3;
+  string received_on = 4;
+  repeated string elements_present = 5;
+  string sender_name = 6;
+  string sender_contact = 7;
+}
+
+message RecordCounterNoticeRequest {
+  string notice_id = 1;
+  string received_on = 2;
+  repeated string elements_present = 3;
+}
+
+message RecordCourtActionRequest {
+  string notice_id = 1;
+  string filed_on = 2;
+}
+
+message RestoreListedVersionRequest {
+  string notice_id = 1;
+  string reason = 2;
+}
+
+message SetCopyrightAgentFiledRequest {
+  // True turns the process on, which needs every detail below; false turns
+  // it off.
+  bool filed = 1;
+  string agent_name = 2;
+  string agent_address = 3;
+  string registration_number = 4;
+  string registration_date = 5;
+  string reason = 6;
+}
+
+message SetCopyrightAgentFiledReply {
+  bool filed = 1;
+  string agent_name = 2;
+  string agent_address = 3;
+  string registration_number = 4;
+  string registration_date = 5;
+  int64 changed_at_ns = 6;
+  string changed_by_person_id = 7;
+}
+
+// ── Deployment bus rows, dashboard to conductor (W8.10 to W8.12, W8.15,
+// W5.19) ────────────────────────────────────────────────────────────────────
+
+// Browse and a listing's page, read from the conductor's latest copy of the
+// catalogue, so the platform is never reached in a page's request.
+message ListRegistryPluginsRequest {
+  // Words matched against the listing's name and the vendor's text.
+  string search = 1;
+  // `community` or `verified`; empty for both.
+  string registry = 2;
+  // A role from matrix/roles.tsv; empty for any.
+  string role = 3;
+  // One listing, `organisation/plugin`, for its page; empty for the list.
+  string listing = 4;
+  int32 page_size = 5;
+  string cursor = 6;
+  // Pull the catalogue first ("Pull now"), then answer.
+  bool pull_now = 7;
+}
+
+message ListRegistryPluginsReply {
+  repeated PluginListing listings = 1;
+  string next_cursor = 2;
+  // When the conductor last pulled the catalogue.
+  int64 catalogue_pulled_at_ns = 3;
+}
+
+// A deployment admin installs a listed version: resolved, pulled by digest
+// into the local registry with its referrers, verified, and recorded. Install
+// launches nothing.
+message InstallPluginRequest {
+  string listing = 1;
+  string version = 2;
+  string registry = 3;
+  // Why, kept with the install's record. Through /mcp every install
+  // carries one.
+  string note = 4;
+}
+
+// Moves an instance to a newer version from its source registry, or a local
+// version's instance to a listed version of the same plugin (W8.11).
+message UpdatePluginRequest {
+  string instance_id = 1;
+  string listing = 2;
+  string version = 3;
+  // The roles as approved, exactly the version's (for verified, its
+  // platform-approved roles); a widening waits for this approval.
+  repeated string approved_roles = 4;
+  string note = 5;
+}
+
+// A deployment admin keeps an instance whose version was pulled (W8.12).
+message AcknowledgePullRequest {
+  string instance_id = 1;
+  string note = 2;
+}
+
+// Kept on the launch, its own record.
+message PullAcknowledgement {
+  // The pull it acknowledges.
+  PluginPull pull = 1;
+  string acknowledged_by = 2;
+  int64 acknowledged_at_ns = 3;
+  string acting_through_delegation = 4;
+  string client_name = 5;
+  string note = 6;
+}
+
+// A deployment admin retires an uploaded or installed version (W8.15): it
+// leaves the catalogue and its image is released, unless an instance runs it
+// or a record names it, which refuses it naming them.
+message RetirePluginVersionRequest {
+  string name = 1;
+  string version = 2;
+  string note = 3;
+}
+
+// The plugin usage report's setting (W5.19): on by default.
+message SetReportsPluginUsageRequest {
+  bool reports_plugin_usage = 1;
+  string reason = 2;
+}
+
+message ReportsPluginUsageSetting {
+  bool reports_plugin_usage = 1;
+}
+
+// The Registries tab: the reports sent, the setting in force and the
+// catalogue's age.
+message ListPluginUsageReportsRequest {
+  int32 page_size = 1;
+  string cursor = 2;
+}
+
+message ListPluginUsageReportsReply {
+  repeated SentPluginUsageReport reports = 1;
+  string next_cursor = 2;
+  bool reports_plugin_usage = 3;
+  int64 catalogue_pulled_at_ns = 4;
+}
+
+// A plugin usage report the conductor sent, kept on the deployment as its
+// own record.
+message SentPluginUsageReport {
+  int64 sent_at_ns = 1;
+  // Whether the platform received it.
+  bool received = 2;
+  PluginUsageReport report = 3;
 }

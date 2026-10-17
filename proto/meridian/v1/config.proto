@@ -630,6 +630,20 @@ message PluginConfiguration {
   ConnectivityLink connectivity_link = 9;
   repeated ConnectivityLink connectivity_links = 10;
   VenueAccountMap venue_account_map = 11;
+
+  // The launched version's declaration (W4.1, contract v25), so the sidecar
+  // holds the plugin's registration to it. Unset for a version uploaded
+  // with none.
+  PluginDeclaration declaration = 12;
+
+  // Whether the catalogue launched this instance (W4.1, W8.3, contract v25).
+  // Registration is held to the uploaded declaration only for an instance
+  // the catalogue launched, and a plugin declaring v25 whose version was
+  // uploaded with none is refused. False for a sidecar no launch made --
+  // the plugin harness, a developer's local run -- which admits
+  // registration unchecked unless it was handed a declaration
+  // (MERIDIAN_PLUGIN_DECLARATION), and then holds it to that one.
+  bool launched = 13;
 }
 
 // Something in a plugin's configuration changed; its sidecar asks again.
@@ -896,6 +910,20 @@ message SetReportsUsageRequest {
 // The setting in force.
 message ReportsUsageSetting {
   bool reports_usage = 1;
+
+  // The identifier schemes the deployment declares it is licensed for
+  // (W3.28, contract v25), as the report carries them; empty until a
+  // deployment admin declares one.
+  repeated string licensed_schemes = 2;
+}
+
+// The deployment admin declares the identifier schemes the deployment is
+// licensed for (W3.28, contract v25): the whole list, replacing the last,
+// each a scheme the licence list names. Each change is its own record, as
+// any setting's is.
+message SetLicensedSchemesRequest {
+  repeated string licensed_schemes = 1;
+  string reason = 2;
 }
 
 // The reports the conductor sent.
@@ -907,6 +935,9 @@ message ListUsageReportsReply {
   // The setting in force (`reports_usage`), so the page says whether the
   // report is on.
   bool reports_usage = 2;
+
+  // The schemes the deployment declares it is licensed for (contract v25).
+  repeated string licensed_schemes = 3;
 }
 
 // A usage report the conductor sent, kept on the deployment as its own

@@ -79,9 +79,10 @@ def check(held, said):
         failures.append(said)
 
 
-def context(browser, width=1440, height=900, script=True):
+def context(browser, width=1440, height=900, script=True, scheme="light"):
     ctx = browser.new_context(
-        viewport={"width": width, "height": height}, java_script_enabled=script
+        viewport={"width": width, "height": height}, java_script_enabled=script,
+        color_scheme=scheme,
     )
     ctx.add_cookies([{"name": "meridian_session", "value": SESSION, "url": BASE}])
     return ctx
@@ -777,9 +778,12 @@ def the_connectivity_part_and_the_calendars_tab(browser, prefix):
                 check(usd.count() == 1 and usd.inner_text().strip() == "USD",
                       f"at {size} the US dollar's subject is its ISO 4217 code: "
                       f"{usd.inner_text() if usd.count() else None!r}")
+                # From contract v25 (D9) by each venue's MIC and name,
+                # where until then by its VEN- ID.
                 venues = page.locator("tr[data-calendar=CAL-01JAE000000000000000XNYS] td[data-subject]")
-                check(venues.count() == 1 and "VEN-" in venues.inner_text(),
-                      f"at {size} a trading calendar's venues are named by their IDs")
+                check(venues.count() == 1 and "XNYS (New York Stock Exchange)" in venues.inner_text()
+                      and "VEN-" not in venues.inner_text(),
+                      f"at {size} a trading calendar's venues are named by their MICs")
                 check(page.locator("#calendars form select[name=calendar_kind]").count() == 1
                       and page.locator("#calendars form input[name=calendar_query]").count() == 1,
                       f"at {size} the tab is filtered by kind and searched by text")
@@ -989,6 +993,135 @@ def measured(page, label, shot):
     return problems
 
 
+def the_v25_pages(browser, prefix):
+    """Contract v25's changes to core's pages, at the three sizes in light and
+    dark: the Calendars tab's venues by MIC and name (D9), and the Licensed
+    identifiers tab's licensed schemes (W3.28) beside the usage report."""
+    for scheme in ("light", "dark"):
+        for size, width, height in V24_SIZES:
+            ctx = context(browser, width, height, scheme=scheme)
+            page = ctx.new_page()
+            errors = []
+            page.on("pageerror", lambda e: errors.append(str(e)))
+            page.goto(f"{BASE}/admin/instruments?calendar_query=xnys#calendars")
+            settled(page)
+            venues = page.evaluate("() => document.querySelector('#calendars').textContent")
+            check("XNYS (New York Stock Exchange)" in venues and "XNAS (Nasdaq)" in venues,
+                  f"at {size}, {scheme}, a calendar's venues are shown by MIC and name")
+            measured(page, f"Instruments, calendars, at {size}, {scheme}",
+                     f"v25-calendars-{size}-{scheme}.png")
+            page.goto(f"{BASE}/admin/instruments#licensed")
+            settled(page)
+            boxes = page.eval_on_selector_all(
+                "form#licensed-schemes-form input[name=licensed_scheme]",
+                "bs => bs.map(b => b.value + (b.checked ? '+' : ''))")
+            check("cusip+" in boxes and "isin" in boxes and "sedol" in boxes,
+                  f"at {size}, {scheme}, the licensed schemes are boxes, those declared ticked: {boxes}")
+            measured(page, f"Instruments, licensed schemes, at {size}, {scheme}",
+                     f"v25-licensed-{size}-{scheme}.png")
+            check(not errors, f"the v25 pages at {size}, {scheme} ran without a script error: {errors}")
+            ctx.close()
+
+
+def the_documentation_pages(browser, prefix):
+    """Contract v25 (W6.9, W8.2): a version's documentation -- the plugin
+    area's Documentation tab, a section's part and the Reference's tables,
+    the portal's versions list and a version's page -- each on one screen at
+    the three sizes, in light and dark, the vendor's text drawn safely and
+    the supervision notice beside it."""
+    tab = f"{BASE}/plugins/{INSTANCE}?level=admin&tab=documentation"
+    pages = [
+        ("docs-overview", tab, "Reads the holdings"),
+        ("docs-setup-part", tab + "&section=setup&part=enter-the-keys", "Enter the client ID"),
+        ("docs-reference-settings", tab + "&section=reference&part=settings", "Consumer key"),
+        ("docs-reference-tools", tab + "&section=reference&part=tools", "read_connection_0"),
+        # The first rows: the kit's pager shows as many as fit.
+        ("versions", f"{BASE}/admin/plugins/versions", "0.0.0"),
+        ("version-page", f"{BASE}/admin/plugins/versions/snaptrade/0.13.0/documentation"
+                         "?section=troubleshooting", "A connection needs sign-in"),
+    ]
+    for scheme in ("light", "dark"):
+        for size, width, height in V24_SIZES:
+            ctx = context(browser, width, height, scheme=scheme)
+            page = ctx.new_page()
+            errors = []
+            page.on("pageerror", lambda e: errors.append(str(e)))
+            page.on("console", lambda m: errors.append(m.text) if "Content Security Policy" in m.text else None)
+            for name, url, says in pages:
+                answer = page.goto(url)
+                settled(page)
+                text = page.evaluate("() => document.body.innerText")
+                check(says in text, f"{name} at {size}, {scheme} says {says!r}")
+                if name.startswith("docs") or name == "version-page":
+                    policy = answer.headers.get("content-security-policy", "")
+                    check("script-src 'self' 'sha256-" in policy,
+                          f"{name} at {size} is under the documentation's policy: {policy}")
+                    check(page.locator("article.docs-vendor script, article.docs-vendor img").count() == 0,
+                          f"{name} at {size} draws no script or image of the vendor's")
+                    check("Naming a plugin here is not an endorsement" in page.content(),
+                          f"{name} at {size} carries the supervision notice")
+                m = page.evaluate(MEASURE)
+                measured(page, f"{name} at {size}, {scheme}", f"v25-{prefix}-{name}-{size}-{scheme}.png")
+                check(m["tall"] <= 0, f"{name} at {size}, {scheme} fits one screen: {m['tall']}px taller")
+            check(not errors, f"the documentation pages at {size}, {scheme} ran without an error: {errors}")
+            ctx.close()
+
+
+def the_registry_pages(browser, prefix):
+    """Contract v25 (W8.10 to W8.12, W5.19): the Plugins page's Installed,
+    Browse and Registries tabs, a listing's Overview, Documentation and
+    Versions, and the install, update and keep-or-stop sheets -- the install
+    and update sheets' notice their own first step (ruling 194) -- each on one
+    screen at the three sizes, in light and dark, with no sideways scroll."""
+    plugins = f"{BASE}/admin/plugins/versions?tab="
+    listing = f"{BASE}/admin/plugins/registry/open-meridian/fx?tab="
+    pages = [
+        ("installed", plugins + "installed", "0.0.0"),
+        ("browse", plugins + "browse", "open-meridian/fx"),
+        ("registries", plugins + "registries", "Report plugin usage"),
+        ("listing-overview", listing + "overview", "open-meridian/fx"),
+        ("listing-documentation", listing + "documentation", "open-meridian/fx"),
+        ("listing-versions", listing + "versions", "1.5.0"),
+        # Ruling 194: the notice whole as each sheet's first step, then the form.
+        ("install-notice", f"{BASE}/admin/plugins/registry/open-meridian/fx/install?version=1.5.0", "Continue"),
+        ("install-sheet", f"{BASE}/admin/plugins/registry/open-meridian/fx/install?version=1.5.0&step=form", "1.5.0"),
+        ("update-notice", f"{BASE}/admin/plugins/registry/update?instance=fx-1&version=1.5.0", "Continue"),
+        ("update-sheet", f"{BASE}/admin/plugins/registry/update?instance=fx-1&version=1.5.0&step=form", "operations"),
+        ("keep-or-stop-sheet", f"{BASE}/admin/plugins/registry/acknowledge?instance=fx-1", "fx-1"),
+    ]
+    for scheme in ("light", "dark"):
+        for size, width, height in V24_SIZES:
+            ctx = context(browser, width, height, scheme=scheme)
+            page = ctx.new_page()
+            errors = []
+            page.on("pageerror", lambda e: errors.append(str(e)))
+            for name, url, says in pages:
+                page.goto(url)
+                settled(page)
+                text = page.evaluate("() => document.body.textContent")
+                check(says in text, f"{name} at {size}, {scheme} says {says!r}")
+                if name in ("installed", "browse", "listing-overview", "install-sheet"):
+                    check("Naming a plugin here is not an endorsement" in text,
+                          f"{name} at {size}, {scheme} carries the supervision notice")
+                if name.endswith("-notice"):
+                    whole = page.locator("section.notice-step section.notice.supervision")
+                    check(whole.count() == 1 and whole.is_visible()
+                          and "Whoever installs one carries its risk." in whole.inner_text(),
+                          f"{name} at {size}, {scheme} shows the notice whole, not folded")
+                    check(page.locator("form.sheet-act").count() == 0,
+                          f"{name} at {size}, {scheme} has no form before Continue")
+                if name == "installed":
+                    check(page.locator("[data-pulled]").count() == 1,
+                          f"at {size}, {scheme} the pulled version's instance is warned")
+                    check("keys as of 2026-10-14" in text,
+                          f"at {size}, {scheme} a bundle's version shows its key status's age")
+                m = page.evaluate(MEASURE)
+                measured(page, f"{name} at {size}, {scheme}", f"v25-{prefix}-registry-{name}-{size}-{scheme}.png")
+                check(m["tall"] <= 0, f"{name} at {size}, {scheme} fits one screen: {m['tall']}px taller")
+            check(not errors, f"the registry pages at {size}, {scheme} ran without an error: {errors}")
+            ctx.close()
+
+
 def the_v24_pages(browser, prefix):
     """Contract v24: the Instruments page's provisional records and the
     usage report's setting; the home page's counts; the escape hatch's
@@ -1144,6 +1277,9 @@ with sync_playwright() as playwright:
         fits(browser, name, url, prefix)
     a_secret_says_where_it_stands(browser, prefix)
     the_v24_pages(browser, prefix)
+    the_v25_pages(browser, prefix)
+    the_documentation_pages(browser, prefix)
+    the_registry_pages(browser, prefix)
     browser.close()
 
 if failures:

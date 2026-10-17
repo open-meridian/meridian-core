@@ -6,7 +6,7 @@ COMPOSE := docker compose
 DOCKER := DOCKER_BUILDKIT=1 docker
 
 .PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check licence-check-test gate-start \
-        stage-checks stage-runtime stage-compile stage-tests stage-sdk stage-dashboards stage-harness stage-first-run stage-image stage-lint \
+        gate-drop-tests-image stage-checks stage-runtime stage-compile stage-tests stage-sdk stage-dashboards stage-harness stage-first-run stage-image stage-lint \
         e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external e2e-cluster-backup \
         test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-service-account e2e-lake e2e-recorded e2e-orders e2e-one-id \
         build test test-store check-image-version chart-check check-crate-boundaries check-one-clock check-test-targets check-local-storage \
@@ -107,7 +107,7 @@ stage-runtime:    gate-begin-runtime check-nats-permissions check-codegen adviso
 	@$(GATE) end runtime
 stage-compile:    gate-begin-compile build test
 	@$(GATE) end compile
-stage-tests:      gate-begin-tests test-store test-broker test-directory e2e-settings-page
+stage-tests:      gate-begin-tests test-store test-broker test-directory gate-drop-tests-image e2e-settings-page
 	@$(GATE) end tests --drop compose:tests $(SETTINGS_PAGE_IMAGE) $(SETTINGS_BROWSER_IMAGE)
 stage-sdk:        gate-begin-sdk interop e2e-book
 	@$(GATE) end sdk
@@ -129,6 +129,16 @@ gate-start:
 
 gate-begin-%:
 	@$(GATE) begin $*
+
+# The tests stage's test binaries (compose's `tests`, 2.4 GB of debug test
+# binaries in a fresh run) freed once test-store, test-broker and
+# test-directory have run them, before e2e-settings-page builds the runtime
+# image's release build and pulls its browser: the stage then holds the
+# larger of its two halves, not their sum (v25's CI run held 15.5 GB of its
+# 15). e2e-settings-page takes the one binary it serves from
+# Dockerfile.rust's settings-binary, not from the whole set.
+gate-drop-tests-image:
+	@$(GATE) drop compose:tests
 
 ci-local-deep: ci-local
 
@@ -1042,7 +1052,8 @@ HARNESS_FILES := README.md activity.sql book.sql compose.yaml harness.py lake.sq
 HARNESS_SECRET := sk-test-harness-not-a-real-key
 HARNESS := MERIDIAN_RUNTIME_IMAGE=$(RUNTIME_IMAGE) \
 	MERIDIAN_HARNESS_STAND_IN="$(CURDIR)/e2e/plugin-page" \
-	$(COMPOSE) -p meridian-core-harness -f .harness/compose.yaml -f .harness/plugins.yaml -f e2e/harness/stand-in.yaml
+	$(COMPOSE) -p meridian-core-harness -f .harness/compose.yaml -f .harness/plugins.yaml -f e2e/harness/stand-in.yaml \
+	-f e2e/harness/declared.yaml
 HARNESS_RUN := $(HARNESS) run --rm -T runner
 HARNESS_STORE := $(HARNESS) run --rm -T store
 
@@ -1066,22 +1077,43 @@ harness-check:
 		|| { echo "harness-check FAILED: the harness image carries nothing at /harness" >&2; exit 1; }
 	@held="$$(ls -A .harness | LC_ALL=C sort | tr '\n' ' ')"; [ "$$held" = "$(HARNESS_FILES) " ] \
 		|| { echo "harness-check FAILED: the harness image holds $$held; it holds $(HARNESS_FILES) and nothing else" >&2; exit 1; }
-	@$(DOCKER) run --rm -i -v "$(CURDIR)/.harness":/harness:ro python:3.12-alpine python /harness/harness.py compose \
-		<e2e/harness/plugins.json >.harness/plugins.yaml \
-		|| { echo "harness-check FAILED: the harness's compose did not write the plugins from e2e/harness/plugins.json" >&2; exit 1; }
+	@# Contract v25 (W4.1): the scaffold's declaration as an upload carries
+	@# it, printed from the SDK's image, and one differing from what it
+	@# registers, for the two plugins of e2e/harness/declared.json.
+	@$(DOCKER) run --rm --network none -w /w/template --entrypoint meridian-declaration meridian-python-interop \
+		reference_plugin.declaration:DECLARATION >.harness/declared.json \
+		|| { echo "harness-check FAILED: meridian-declaration did not print the scaffold's declaration" >&2; exit 1; }
+	@$(PY) -c 'import json; d = json.load(open(".harness/declared.json")); d["reads_external_accounts"] = not d.get("reads_external_accounts", False); json.dump(d, open(".harness/mismatched.json", "w"))'
+	@$(PY) -c 'import json; print(json.dumps(json.load(open("e2e/harness/plugins.json")) + json.load(open("e2e/harness/declared.json"))))' \
+		| $(DOCKER) run --rm -i -v "$(CURDIR)/.harness":/harness:ro python:3.12-alpine python /harness/harness.py compose >.harness/plugins.yaml \
+		|| { echo "harness-check FAILED: the harness's compose did not write the plugins from e2e/harness/plugins.json and declared.json" >&2; exit 1; }
+	@grep -q '"MERIDIAN_PLUGIN_DECLARATION": "/declaration/declaration.json"' .harness/plugins.yaml \
+		&& grep -q '"./declared.json:/declaration/declaration.json:ro"' .harness/plugins.yaml \
+		|| { echo "harness-check FAILED: the compose file does not hold the declared plugin's sidecar to its declaration" >&2; exit 1; }
+	@! printf '[{"instance": "odd", "image": "x", "roles": [], "declaration": "a b.json"}]' \
+		| $(DOCKER) run --rm -i -v "$(CURDIR)/.harness":/harness:ro python:3.12-alpine python /harness/harness.py compose >/dev/null 2>&1 \
+		|| { echo "harness-check FAILED: the harness's compose took a declaration path with a space" >&2; exit 1; }
 	@! printf '[{"instance": "nats", "image": "x", "roles": []}]' \
 		| $(DOCKER) run --rm -i -v "$(CURDIR)/.harness":/harness:ro python:3.12-alpine python /harness/harness.py compose >/dev/null 2>&1 \
 		|| { echo "harness-check FAILED: the harness's compose wrote a plugin named as one of its own services" >&2; exit 1; }
 	@$(PY) e2e/harness/known_passwords.py .harness/* \
 		|| { echo "harness-check FAILED: a fixed password or hash is in the harness's files (above, by line)" >&2; exit 1; }
 	@: >.e2e-harness.log
-	@$(HARNESS) down -v --remove-orphans >>.e2e-harness.log 2>&1 || true
+	@$(HARNESS) --profile runner down -v --remove-orphans >>.e2e-harness.log 2>&1 || true
 	@started=$$(date +%s); \
 	fail() { echo "harness-check FAILED: $$1; the components' logs are in .e2e-harness.log" >&2; \
 		$(HARNESS) logs --no-color >>.e2e-harness.log 2>&1; \
-		$(HARNESS) down -v --remove-orphans >/dev/null 2>&1; exit 1; }; \
+		$(HARNESS) --profile runner down -v --remove-orphans >/dev/null 2>&1; exit 1; }; \
 	$(HARNESS) up -d >>.e2e-harness.log 2>&1 || fail "the harness did not start"; \
 	$(HARNESS_RUN) ready || fail "the plugin never registered"; \
+	$(HARNESS_RUN) ready --instance declared >/dev/null \
+		|| fail "the plugin declaring v25 whose sidecar holds the declaration it was uploaded with never registered (W4.1)"; \
+	refused=; for i in $$(seq 1 60); do \
+		$(HARNESS) logs --no-color sidecar-mismatched mismatched 2>/dev/null \
+			| grep -q "unlike the declaration its version was uploaded with" && { refused=1; break; }; \
+		sleep 1; \
+	done; \
+	[ -n "$$refused" ] || fail "the plugin registering other than the declaration it was uploaded with was not refused naming the first difference (W4.1)"; \
 	$(HARNESS_RUN) settings api_key=$(HARNESS_SECRET) poll_minutes=15 || fail "its settings were not saved"; \
 	$(HARNESS_RUN) page --level admin /settings --until '"missing_required": []' >/dev/null \
 		|| fail "the plugin never held its settings"; \
@@ -1145,8 +1177,8 @@ harness-check:
 			|| fail "$$inner, holding no edge role, was given storage"; \
 	done; \
 	$(HARNESS) logs --no-color >>.e2e-harness.log 2>&1; \
-	$(HARNESS) down -v --remove-orphans >>.e2e-harness.log 2>&1; \
-	echo "harness-check OK in $$(( $$(date +%s) - started ))s: the plugin harness is its own image, files only, and the runtime image carries none of it; no fixed password or hash is in its files; its compose writes three plugins, each beside its sidecar, one started again after failing first ($$restarts restart); its runner signs in with the password drawn for the run, sets a plugin's settings, defines an account and links it through the plugin's own form, taking what the page offered from the page; store street prints as expected, the dollar pulled from the master and the three other records it names listed as ones the book cannot use and one completed at the Instruments page, an MCP client connected on a delegation covering the deployment admin alone lists core's tools and no plugin's, is refused a completion without a note by path, completes a record through dashboard__complete_instruments whose history names the person and the client, and Connected clients lists its calls; nothing for the account left unlinked, which the dashboard counts ($$unlinked); a second plugin is opened at write once the admin is granted it, and store book prints the book empty; the custody plugin writes its storage as a user that is not root and finds it again in a new container, and the plugins holding no edge role have none"
+	$(HARNESS) --profile runner down -v --remove-orphans >>.e2e-harness.log 2>&1; \
+	echo "harness-check OK in $$(( $$(date +%s) - started ))s: the plugin harness is its own image, files only, and the runtime image carries none of it; no fixed password or hash is in its files; its compose writes five plugins, each beside its sidecar, one started again after failing first ($$restarts restart), one declaring v25 registering the declaration its sidecar holds it to and one differing refused naming the difference; its runner signs in with the password drawn for the run, sets a plugin's settings, defines an account and links it through the plugin's own form, taking what the page offered from the page; store street prints as expected, the dollar pulled from the master and the three other records it names listed as ones the book cannot use and one completed at the Instruments page, an MCP client connected on a delegation covering the deployment admin alone lists core's tools and no plugin's, is refused a completion without a note by path, completes a record through dashboard__complete_instruments whose history names the person and the client, and Connected clients lists its calls; nothing for the account left unlinked, which the dashboard counts ($$unlinked); a second plugin is opened at write once the admin is granted it, and store book prints the book empty; the custody plugin writes its storage as a user that is not root and finds it again in a new container, and the plugins holding no edge role have none"
 
 # Tickets inside a deployment (contract v13), end to end on the plugin
 # harness: core's stand-in as custody, operations and a plugin holding no
@@ -1961,7 +1993,18 @@ chart-check:
 	done; \
 	! $(HELM) template check deploy/chart $$base --set backup.recipient=age1check --set backup.path=/b --set backup.database=maybe >/dev/null 2>&1 \
 		|| { echo "chart-check FAILED: backup.database=maybe rendered; it takes true, false or nothing" >&2; exit 1; }
-	@echo "chart-check OK: four components, the dashboard and the three ways it signs people in, the key and the settings key on the conductor alone, both key paths, refusals, migrations, no pinned uid, a plugin held to its side of the pod, its front door open to the dashboard alone, an Ingress only when asked for and HTTPS alone unless plain HTTP is, development only when asked for, the live shape there alone, a backup only when sealed and placed, and nothing an upgrade leaves behind"
+	@# Contract v25 (W8.10): the platform's keys reach the conductor alone,
+	@# as files it verifies against; none, and the registries are not reached.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
+	keyed="$$($(HELM) template check deploy/chart $$base --set-string 'registries.platformKeys[0]=-----BEGIN PUBLIC KEY-----' 2>/dev/null)" \
+		|| { echo "chart-check FAILED: the chart does not render with a platform key" >&2; exit 1; }; \
+	echo "$$keyed" | grep -q 'key-0.pem: |' \
+		|| { echo "chart-check FAILED: a platform key renders no ConfigMap entry" >&2; exit 1; }; \
+	[ "$$(echo "$$keyed" | grep -c 'name: MERIDIAN_PLATFORM_KEYS_DIR')" = 1 ] \
+		|| { echo "chart-check FAILED: the platform's keys reach other than the conductor alone" >&2; exit 1; }; \
+	! $(HELM) template check deploy/chart $$base 2>/dev/null | grep -q 'MERIDIAN_PLATFORM_KEYS_DIR\|platform-keys' \
+		|| { echo "chart-check FAILED: no platform key still renders the keys' volume or variable" >&2; exit 1; }
+	@echo "chart-check OK: the platform's keys on the conductor alone, as files, only where the chart carries some; four components, the dashboard and the three ways it signs people in, the key and the settings key on the conductor alone, both key paths, refusals, migrations, no pinned uid, a plugin held to its side of the pod, its front door open to the dashboard alone, an Ingress only when asked for and HTTPS alone unless plain HTTP is, development only when asked for, the live shape there alone, a backup only when sealed and placed, and nothing an upgrade leaves behind"
 
 lint:
 	@$(DOCKER) build -f Dockerfile.rust --target lint $(VERDICT) . >/dev/null 2>&1 \

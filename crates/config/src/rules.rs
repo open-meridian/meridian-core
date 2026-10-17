@@ -205,28 +205,52 @@ pub fn close_account(snapshot: &Snapshot, account_id: &str) -> Verdict {
 /// both (W6.4). A new account's custodian, type, owner and note are held to
 /// W6.3's bounds; with no new account they are ignored, not refused.
 pub fn link(snapshot: &Snapshot, request: &LinkExternalAccountRequest) -> Verdict {
-    required(&request.plugin_instance_id, "the plugin")?;
-    required(&request.external_account_id, "the external account")?;
+    // Each expected refusal a refusal the plugin can read, naming the field
+    // it got wrong (contract v25; found by the v24 tutorial walk): before,
+    // these reached a plugin as a handler's failure with no category.
+    let wrong = |field: &str, words: String| {
+        meridian_bus::refusal_with_status(
+            meridian_bus::RefusalStatus::InvalidArgument,
+            &[field.to_string()],
+            words,
+        )
+    };
+    required(&request.plugin_instance_id, "the plugin")
+        .map_err(|words| wrong("plugin_instance_id", words))?;
+    required(&request.external_account_id, "the external account")
+        .map_err(|words| wrong("external_account_id", words))?;
     exists(
         &snapshot.plugins,
         &request.plugin_instance_id,
         |p| &p.plugin_instance_id,
         "plugin that has reported, named",
-    )?;
+    )
+    .map_err(|words| wrong("plugin_instance_id", words))?;
     if !request.new_account_name.is_empty() {
         if !request.account_id.is_empty() {
-            return Err(
-                "a link names an existing account or a new account's name, not both".into(),
-            );
+            // Both fields named: the link names one or the other.
+            return Err(meridian_bus::refusal_with_status(
+                meridian_bus::RefusalStatus::InvalidArgument,
+                &["account_id".to_string(), "new_account_name".to_string()],
+                "a link names an existing account or a new account's name, not both",
+            ));
         }
-        required(&request.new_account_name, "a new account's name")?;
+        required(&request.new_account_name, "a new account's name")
+            .map_err(|words| wrong("new_account_name", words))?;
         return account_attributes(
             "a new account's",
             &request.new_account_custodian,
             &request.new_account_type,
             &request.new_account_owner,
             &request.new_account_note,
-        );
+        )
+        .map_err(|words| {
+            meridian_bus::refusal_with_status(
+                meridian_bus::RefusalStatus::InvalidArgument,
+                &[],
+                words,
+            )
+        });
     }
     if request.account_id.is_empty() {
         return Ok(());
@@ -236,11 +260,19 @@ pub fn link(snapshot: &Snapshot, request: &LinkExternalAccountRequest) -> Verdic
         .accounts
         .iter()
         .find(|a| a.account_id == request.account_id)
-        .ok_or_else(|| format!("there is no account {}", request.account_id))?;
+        .ok_or_else(|| {
+            wrong(
+                "account_id",
+                format!("there is no account {}", request.account_id),
+            )
+        })?;
     if account.state == AccountState::Closed as i32 {
-        return Err(format!(
-            "account {} is closed, and nothing new is recorded against a closed account",
-            request.account_id
+        return Err(wrong(
+            "account_id",
+            format!(
+                "account {} is closed, and nothing new is recorded against a closed account",
+                request.account_id
+            ),
         ));
     }
     // Only an account the deployment admin granted this instance (W6.30,
@@ -345,6 +377,10 @@ fn one_external_account(snapshot: &Snapshot, request: &LinkExternalAccountReques
     });
     match held {
         None => Ok(()),
+        // ABORTED, as DESIGN25's link-external-account fixture gives it: a
+        // well-formed link refused for the state of the book, which a
+        // component's plain refusal is (the sidecar sends it aborted, its
+        // words whole), not a malformed argument.
         Some(held) => Err(format!(
             "{} already has external account {} linked ({}); an account has one external \
              account: link {} to another account, or a new one",

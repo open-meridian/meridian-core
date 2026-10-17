@@ -27,16 +27,18 @@ base64.workspace = true
 prost.workspace = true
 rand.workspace = true
 meridian-pb.workspace = true
+# The contract range a listed version's floor is marked against (W8.10).
+meridian-sidecar = { path = "../sidecar" }
 ed25519-dalek.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tokio = { workspace = true }
 unicode-normalization.workspace = true
+pulldown-cmark.workspace = true
 
 [dev-dependencies]
 # The real sidecar's front door, so a test proves what it verifies.
-meridian-sidecar = { path = "../sidecar" }
 tonic.workspace = true
 async-trait.workspace = true
 tower = { version = "0.5", features = ["util"] }

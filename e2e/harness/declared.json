@@ -1,0 +1,4 @@
+[
+  {"instance": "declared", "image": "meridian-python-interop", "roles": ["custody"], "declaration": "declared.json"},
+  {"instance": "mismatched", "image": "meridian-python-interop", "roles": ["custody"], "declaration": "mismatched.json"}
+]

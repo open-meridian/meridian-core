@@ -61,6 +61,7 @@ fn identifier(scheme: &str, value: &str, source: &str, valid_from_ns: i64) -> Id
         source: source.into(),
         valid_from_ns,
         valid_to_ns: None,
+        trading_currency: String::new(),
     }
 }
 
@@ -158,6 +159,24 @@ fn a_minted_record_comes_back_whole_with_its_sources_offers_and_history() {
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].operation, "mint");
     assert_eq!(history[0].changes[0].after, "SNAP1");
+}
+
+#[test]
+fn a_listing_identifiers_trading_currency_comes_back_with_it() {
+    // Contract v25 (W3.1).
+    let store = store();
+    let id = unique("INS");
+    let figi = unique("BBG");
+    let mut listing = identifier("figi", &figi, "", 0);
+    listing.trading_currency = "CAD".into();
+    let key = IdentifierSet::new([asked("figi", &figi, "")]).key();
+    let (held, _) = store
+        .mint(record(&id, vec![listing]), &key, entry(&id, 1, "mint"))
+        .unwrap();
+    let back = store.by_id(&held.instrument_id).unwrap().unwrap();
+    assert_eq!(back.identifiers[0].trading_currency, "CAD");
+    let matched = store.matching("figi", &figi, "", 1).unwrap();
+    assert_eq!(matched[0].identifiers[0].trading_currency, "CAD");
 }
 
 #[test]
@@ -823,8 +842,15 @@ fn the_one_id_state_is_kept_whole_and_each_replacement_numbered() {
     );
     assert!(store.templates().unwrap().contains(&template));
 
+    // A version no earlier run kept: the database outlives a run (test-store
+    // runs again against the same one), and a counter alone starts again at
+    // zero, so a second run's version was the first's and was not kept.
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64;
     let list = meridian_domain::v1::LicenceList {
-        version: 1_000_000 + (COUNTER.fetch_add(1, Ordering::SeqCst) as i64),
+        version: now_ns + (COUNTER.fetch_add(1, Ordering::SeqCst) as i64),
         schemes: vec!["figi".into(), "cusip".into()],
         pace: Some(meridian_domain::v1::LicencePace {
             batch_size: 100,

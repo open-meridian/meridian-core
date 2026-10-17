@@ -132,7 +132,7 @@ def breaks():
 
 def run():
     started = time.time()
-    compose("down", "-v", "--remove-orphans", check=False)
+    compose("--profile", "runner", "down", "-v", "--remove-orphans", check=False)
     compose("up", "-d")
     for instance in ["custody", "operations"]:
         runner("ready", instance=instance)
@@ -309,11 +309,11 @@ def main():
         run()
     except (Failed, subprocess.TimeoutExpired, KeyError, ValueError, IndexError, TypeError) as failed:
         compose("logs", "--no-color", check=False)
-        compose("down", "-v", "--remove-orphans", check=False)
+        compose("--profile", "runner", "down", "-v", "--remove-orphans", check=False)
         print(f"e2e-service-account FAILED: {failed}; the run is in {LOG}", file=sys.stderr)
         return 1
     compose("logs", "--no-color", check=False)
-    compose("down", "-v", "--remove-orphans", check=False)
+    compose("--profile", "runner", "down", "-v", "--remove-orphans", check=False)
     return 0
 
 

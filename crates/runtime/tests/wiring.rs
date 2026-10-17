@@ -590,6 +590,24 @@ fn the_contract_admits_each_role_to_exactly_its_own_work() {
     assert!(data.may_publish(meridian_lake::service::RECORD_TRADES));
     assert!(data.may_publish(meridian_lake::service::RECORD_QUOTES));
 
+    // Each store reports what it runs inward (W5.20); from contract v25 the
+    // instrument store's report is granted as the street's and the book's
+    // are, which its process already sent.
+    for store in ["street", "bor", "instrument"] {
+        assert!(
+            contract
+                .component(store)
+                .may_publish(meridian_runtime::COMPONENT_REPORT_TOPIC),
+            "{store}"
+        );
+    }
+    // Contract v25 (D9): the dashboard reads a venue by its ID; and (ruling
+    // 118) connectivity no longer reads the escape hatch's setting.
+    assert!(dashboard.may_publish(meridian_instrument::service::RESOLVE_VENUE));
+    let connectivity = contract.grants_for(&roles(&["connectivity"])).unwrap();
+    assert!(!connectivity.may_publish("platform.book.query.read-local-record-orders"));
+    assert!(ems.may_publish("platform.book.query.read-local-record-orders"));
+
     // Denial is by refusal for a name that is not a role, never by granting it
     // nothing and letting it register.
     assert!(contract.grants_for(&roles(&["not-a-role"])).is_err());
@@ -868,8 +886,8 @@ async fn a_plugin_asks_for_a_date_and_is_answered_from_the_calendars_pulled() {
         Arc::new(MemoryBackend::new()),
         Arc::new(meridian_clock::SystemClock),
     ));
-    let mut applied = bus.subscribe("platform.reference.event.calendar-applied");
-    let mut missing = bus.subscribe("platform.reference.event.calendar-missing");
+    let mut applied = bus.subscribe_every("platform.reference.event.calendar-applied");
+    let mut missing = bus.subscribe_every("platform.reference.event.calendar-missing");
     tokio::spawn(
         meridian_instrument::InstrumentService::new(
             Arc::clone(&bus),

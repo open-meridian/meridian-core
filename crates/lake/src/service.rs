@@ -2410,11 +2410,11 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
     );
 
     // Heard, subscribed before this returns.
-    let mut configuration = bus.subscribe(ENTITLEMENTS_CHANGED);
-    let mut replaced = bus.subscribe(INSTRUMENT_REPLACED);
-    let mut instrument_missing = bus.subscribe(INSTRUMENT_MISSING);
-    let mut venue_missing = bus.subscribe(VENUE_MISSING);
-    let mut calendar_applied = bus.subscribe(CALENDAR_APPLIED);
+    let mut configuration = bus.subscribe_every(ENTITLEMENTS_CHANGED);
+    let mut replaced = bus.subscribe_every(INSTRUMENT_REPLACED);
+    let mut instrument_missing = bus.subscribe_every(INSTRUMENT_MISSING);
+    let mut venue_missing = bus.subscribe_every(VENUE_MISSING);
+    let mut calendar_applied = bus.subscribe_every(CALENDAR_APPLIED);
     let hearing = Arc::clone(&lake);
     tokio::spawn(async move {
         loop {

@@ -77,6 +77,80 @@ pub fn note_miss(store: &dyn Store, identifiers: &[PbIdentifier], now_ns: i64) -
     store.set_state(&key, &text)
 }
 
+/// The below-minimum misses the store recorded itself (contract v25, W3.2;
+/// the registry batch's item 81), kept as JSON under this key.
+pub const BELOW_MINIMUM: &str = "misses_below_minimum";
+
+/// The most below-minimum misses kept, the longest unseen dropped first.
+pub const MOST_BELOW_MINIMUM: usize = 1_000;
+
+/// A source thinner than the minimum a record needs, answered not found
+/// (W3.1, W3.7): recorded by the store as a miss itself, by the identifiers
+/// asked, counted each time it is asked again, and never sent beyond the
+/// usage report's counts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BelowMinimumMiss {
+    /// The identifiers asked, each `scheme`, `value` and `source`, in order.
+    pub identifiers: Vec<(String, String, String)>,
+    pub first_asked_ns: i64,
+    pub last_asked_ns: i64,
+    pub asked: u64,
+}
+
+/// The below-minimum misses held, the latest asked first.
+pub fn below_minimum_misses(store: &dyn Store) -> Result<Vec<BelowMinimumMiss>> {
+    let mut held: Vec<BelowMinimumMiss> = store
+        .state(BELOW_MINIMUM)?
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default();
+    held.sort_by(|a, b| b.last_asked_ns.cmp(&a.last_asked_ns));
+    Ok(held)
+}
+
+/// Record a below-minimum not found (contract v25, W3.2): one miss per set of
+/// identifiers asked, in any order, its count raised when it is asked again;
+/// the usage report's count is [`note_miss`]'s, as for any miss. Called under
+/// the store's write lock.
+pub fn note_below_minimum(
+    store: &dyn Store,
+    identifiers: &[PbIdentifier],
+    now_ns: i64,
+) -> Result<()> {
+    let mut asked: Vec<(String, String, String)> = identifiers
+        .iter()
+        .filter(|identifier| !identifier.value.trim().is_empty())
+        .map(|identifier| {
+            (
+                identifier.scheme.trim().to_ascii_lowercase(),
+                identifier.value.trim().to_string(),
+                identifier.source.trim().to_string(),
+            )
+        })
+        .collect();
+    asked.sort();
+    asked.dedup();
+    if asked.is_empty() {
+        return Ok(());
+    }
+    let mut held = below_minimum_misses(store)?;
+    match held.iter_mut().find(|miss| miss.identifiers == asked) {
+        Some(miss) => {
+            miss.asked += 1;
+            miss.last_asked_ns = miss.last_asked_ns.max(now_ns);
+        }
+        None => held.push(BelowMinimumMiss {
+            identifiers: asked,
+            first_asked_ns: now_ns,
+            last_asked_ns: now_ns,
+            asked: 1,
+        }),
+    }
+    held.sort_by(|a, b| b.last_asked_ns.cmp(&a.last_asked_ns));
+    held.truncate(MOST_BELOW_MINIMUM);
+    let text = serde_json::to_string(&held).unwrap_or_default();
+    store.set_state(BELOW_MINIMUM, &text)
+}
+
 /// W3.28: the counts for a period, refused naming the field for a date that
 /// is none or a period that runs backwards or past a year.
 pub fn list_identifier_usage(
@@ -238,6 +312,35 @@ mod tests {
         // Never a value: the reply's text is scheme names and counts.
         let text = format!("{reply:?}");
         assert!(!text.contains("99999Z999") && !text.contains("XX0000000000"));
+    }
+
+    #[test]
+    fn a_below_minimum_not_found_is_one_miss_per_identifier_set_counted() {
+        // Contract v25 (item 81): recorded by the store itself.
+        let store = MemoryStore::default();
+        let thin = [
+            identifier("cusip", "99999Z999"),
+            identifier("isin", "XX0000000000"),
+        ];
+        note_below_minimum(&store, &thin, NOW).unwrap();
+        // The same set asked again, in the other order, is the same miss.
+        let again = [thin[1].clone(), thin[0].clone()];
+        note_below_minimum(&store, &again, NOW + 5).unwrap();
+        note_below_minimum(&store, &[identifier("cusip", "1")], NOW + 3).unwrap();
+        let held = below_minimum_misses(&store).unwrap();
+        assert_eq!(held.len(), 2);
+        assert_eq!(held[0].asked, 2, "{held:?}");
+        assert_eq!(
+            (held[0].first_asked_ns, held[0].last_asked_ns),
+            (NOW, NOW + 5)
+        );
+        assert_eq!(
+            held[1].identifiers,
+            vec![("cusip".into(), "1".into(), String::new())]
+        );
+        // Nothing asked, nothing recorded.
+        note_below_minimum(&store, &[identifier("cusip", " ")], NOW).unwrap();
+        assert_eq!(below_minimum_misses(&store).unwrap().len(), 2);
     }
 
     #[test]

@@ -322,6 +322,21 @@ pub fn serve_all_within(
                 {
                     tracing::warn!(%failed, "a miss could not be counted for the usage report");
                 }
+                // A source thinner than the minimum, answered not found, is
+                // the store's own miss (contract v25, W3.2; item 81), by the
+                // identifiers asked; never sent. A plugin reports nothing for
+                // it, and a report of one is the same miss, a no-op.
+                if resolution.reply.miss_reason == meridian_domain::v1::MissReason::NotFound as i32
+                    && !crate::one_id::meets_minimum(&request)
+                {
+                    if let Err(failed) = crate::usage::note_below_minimum(
+                        store.as_ref(),
+                        &request.identifiers,
+                        now_ns,
+                    ) {
+                        tracing::warn!(%failed, "a below-minimum miss could not be recorded");
+                    }
+                }
             }
             Ok((
                 "meridian.v1.ResolveIdentifierReply".to_string(),
@@ -335,8 +350,14 @@ pub fn serve_all_within(
         bus.serve(RESOLVE_VENUE, move |envelope| {
             let request: meridian_domain::v1::ResolveVenueRequest =
                 decode(&envelope, "meridian.v1.ResolveVenueRequest")?;
-            if request.identifiers.is_empty() {
-                return Err("identifiers: at least one names the venue".into());
+            // By its ID (contract v25, D9), set instead of identifiers.
+            if !request.venue_id.is_empty() && !request.identifiers.is_empty() {
+                return Err(
+                    "venue_id: set instead of identifiers, never beside them (W3.14)".into(),
+                );
+            }
+            if request.identifiers.is_empty() && request.venue_id.is_empty() {
+                return Err("identifiers: at least one names the venue, or venue_id".into());
             }
             let reply = crate::venues::resolve_venue(store.as_ref(), &request, clock.now_ns())
                 .map_err(|failed| failed.to_string())?;
@@ -692,9 +713,9 @@ pub fn keep_reference_forever(
     store: Arc<dyn Store>,
     clock: Arc<dyn Clock>,
 ) -> impl FnOnce(Writing) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-    let mut templates = bus.subscribe(TEMPLATES_PULLED);
-    let mut licence = bus.subscribe(LICENCE_LIST_PULLED);
-    let mut replacements = bus.subscribe(REPLACEMENTS_PULLED);
+    let mut templates = bus.subscribe_shared(TEMPLATES_PULLED, "reference");
+    let mut licence = bus.subscribe_shared(LICENCE_LIST_PULLED, "reference");
+    let mut replacements = bus.subscribe_shared(REPLACEMENTS_PULLED, "reference");
     move |writing: Writing| {
         Box::pin(async move {
             loop {
@@ -1663,24 +1684,15 @@ fn subject_codes(
     store: &dyn Store,
     venues: &[meridian_domain::v1::VenueRecord],
     record: &meridian_domain::v1::CalendarRecord,
-    now_ns: i64,
 ) -> Vec<String> {
     let mut codes = Vec::new();
     if !record.instrument_id.is_empty() {
         // The record the calendar names, matched directly: from contract v24
         // the currency's record is the deployment's under its `INS-` ID
-        // (requirement 19). The `open_meridian` lookup stays, read only, for
-        // a record kept under an `LCL-` key until its migration line is made.
-        let direct = store
-            .by_id(&record.instrument_id)
-            .ok()
-            .flatten()
-            .into_iter();
-        for held in direct.chain(
-            store
-                .matching(crate::GLOBAL_ID, &record.instrument_id, "", now_ns)
-                .unwrap_or_default(),
-        ) {
+        // (requirement 19). From contract v25 nothing is looked up by an
+        // `open_meridian` identifier: a record kept under an `LCL-` key is
+        // matched once its migration line is made (W3.26).
+        if let Some(held) = store.by_id(&record.instrument_id).ok().flatten() {
             codes.extend(
                 held.held_now()
                     .filter(|identifier| identifier.scheme == "iso4217")
@@ -1701,26 +1713,16 @@ fn subject_codes(
     codes
 }
 
-/// The platform's ID of a record this deployment holds: its own where it is
-/// one, the `INS-` record it was resolved into, else the `open_meridian`
-/// identifier it holds now, of the record a merged one became. None for a record with none, or none held.
-fn platform_id(store: &dyn Store, instrument_id: &str) -> Option<String> {
+/// The `INS-` record a record this deployment holds became (contract v24,
+/// requirement 19, one rule: follow the replacement). None for an `INS-` ID,
+/// which is asked as it is, and for a record not resolved, which is kept as
+/// asked: from contract v25 no `open_meridian` identifier is read for it.
+fn became_platform(store: &dyn Store, instrument_id: &str) -> Option<String> {
     if instrument_id.starts_with("INS-") {
         return None;
     }
-    // One rule (contract v24, requirement 19): follow the replacement -- a
-    // resolved record is the `INS-` record it became.
     let became = crate::replace::current(store, instrument_id).ok()?;
-    if became.starts_with("INS-") {
-        return Some(became);
-    }
-    // Read only, for a record still under its `LCL-` key.
-    let instrument = store.by_id(&became).ok().flatten()?;
-    let platform = instrument
-        .held_now()
-        .find(|held| held.scheme == crate::GLOBAL_ID && held.value.starts_with("INS-"))
-        .map(|held| held.value.clone());
-    platform
+    became.starts_with("INS-").then_some(became)
 }
 
 /// A calendar or a rule not held, reported by its subject for the
@@ -1779,8 +1781,8 @@ fn serve_calendars(bus: &Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>)
                 decode(&envelope, "meridian.v1.ComputeDateRequest")?;
             let now_ns = clock.now_ns();
             let held = held(store.as_ref(), request.as_of_ns)?;
-            let request = crate::calendars::pair_on_the_platform(&request, |instrument| {
-                platform_id(store.as_ref(), instrument)
+            let request = crate::calendars::pair_followed(&request, |instrument| {
+                became_platform(store.as_ref(), instrument)
             });
             let answered = crate::calendars::compute(
                 &held,
@@ -1798,7 +1800,7 @@ fn serve_calendars(bus: &Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>)
         });
     }
     {
-        let (store, clock) = (store.clone(), clock.clone());
+        let store = store.clone();
         bus.serve(LIST_CALENDARS, move |envelope| {
             let request: meridian_domain::v1::ListCalendarsRequest =
                 decode(&envelope, "meridian.v1.ListCalendarsRequest")?;
@@ -1813,9 +1815,8 @@ fn serve_calendars(bus: &Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>)
             } else {
                 store.venues().map_err(|failed| failed.to_string())?
             };
-            let now_ns = clock.now_ns();
             let codes = |record: &meridian_domain::v1::CalendarRecord| {
-                subject_codes(store.as_ref(), &venues, record, now_ns)
+                subject_codes(store.as_ref(), &venues, record)
             };
             let reply = crate::calendars::list_with(&calendars, &rules, &request, &codes)?;
             Ok((
@@ -1836,7 +1837,7 @@ pub fn keep_calendars(
     store: Arc<dyn Store>,
     clock: Arc<dyn Clock>,
 ) -> impl std::future::Future<Output = ()> {
-    let mut pulled = bus.subscribe(CALENDAR_PULLED);
+    let mut pulled = bus.subscribe_shared(CALENDAR_PULLED, "calendars");
     async move {
         let refreshing = {
             let (bus, store, clock) = (Arc::clone(&bus), store.clone(), clock.clone());
@@ -2324,10 +2325,84 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_source_below_the_minimum_is_the_stores_own_miss_and_a_report_of_it_changes_nothing()
+    {
+        // Contract v25 (W3.2; item 81): answered not found, nothing minted,
+        // recorded by the store as a miss by the identifiers asked, counted,
+        // and never sent; a plugin's report of it is the same miss.
+        let bus = bus();
+        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        serve_queries(&bus, store.clone(), bus.clock());
+        let mut thin = snap();
+        thin.stated_description.clear();
+        for _ in 0..2 {
+            let missed: ResolveIdentifierReply = ask(
+                &bus,
+                RESOLVE_IDENTIFIER,
+                "meridian.v1.ResolveIdentifierRequest",
+                thin.clone(),
+                "",
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                missed.miss_reason,
+                meridian_domain::v1::MissReason::NotFound as i32
+            );
+        }
+        assert_eq!(store.count().unwrap(), 0, "nothing minted");
+        let held = crate::usage::below_minimum_misses(store.as_ref()).unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].asked, 2);
+        assert_eq!(
+            held[0].identifiers,
+            vec![("symbol".into(), "SNAP1".into(), "snaptrade".into())]
+        );
+        // A report of it (MISS_REASON_NOT_FOUND) is a no-op.
+        let reactor = Reactor::new(bus.clone(), store.clone(), bus.clock());
+        let reported = reactor
+            .react(Delivery {
+                envelope: Envelope {
+                    meta: None,
+                    payload_type: "meridian.v1.MissingInstrumentDetectedEvent".into(),
+                    payload: meridian_domain::v1::MissingInstrumentDetectedEvent {
+                        identifiers: thin.identifiers.clone(),
+                        reason: meridian_domain::v1::MissReason::NotFound as i32,
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                },
+                sequence: 1,
+            })
+            .await;
+        assert!(matches!(reported, Handled::Listed(false)));
+        assert_eq!(
+            crate::usage::below_minimum_misses(store.as_ref()).unwrap(),
+            held
+        );
+        // A source meeting the minimum is no below-minimum miss.
+        let _: ResolveIdentifierReply = ask(
+            &bus,
+            RESOLVE_IDENTIFIER,
+            "meridian.v1.ResolveIdentifierRequest",
+            snap(),
+            "",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            crate::usage::below_minimum_misses(store.as_ref())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_minted_record_is_announced_completed_by_a_person_and_announced_again() {
         let bus = bus();
         let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
-        let mut applied = bus.subscribe(INSTRUMENT_APPLIED);
+        let mut applied = bus.subscribe_every(INSTRUMENT_APPLIED);
         serve_queries(&bus, store.clone(), bus.clock());
 
         let minted: ResolveIdentifierReply = ask(
@@ -2435,7 +2510,7 @@ mod tests {
     async fn a_merge_replaces_the_merged_record_and_says_so() {
         let bus = bus();
         let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
-        let mut replaced_heard = bus.subscribe(INSTRUMENT_REPLACED);
+        let mut replaced_heard = bus.subscribe_every(INSTRUMENT_REPLACED);
         serve_queries(&bus, store.clone(), bus.clock());
         let first: ResolveIdentifierReply = ask(
             &bus,
@@ -2598,6 +2673,7 @@ mod tests {
         let asked = ResolveVenueRequest {
             identifiers: vec![mic],
             as_of_ns: NOW,
+            venue_id: String::new(),
         };
         let missed: ResolveVenueReply = ask(
             &bus,
@@ -2620,6 +2696,7 @@ mod tests {
                 .await,
             Handled::Kept(true)
         );
+        let asked_again = asked.clone();
         let found: ResolveVenueReply = ask(
             &bus,
             RESOLVE_VENUE,
@@ -2630,6 +2707,32 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(found.venue.unwrap().venue_id, "VEN-XNYS");
+        // By its ID (contract v25, D9), and never both ways at once.
+        let by_id: ResolveVenueReply = ask(
+            &bus,
+            RESOLVE_VENUE,
+            "meridian.v1.ResolveVenueRequest",
+            ResolveVenueRequest {
+                venue_id: "VEN-XNYS".into(),
+                ..Default::default()
+            },
+            "",
+        )
+        .await
+        .unwrap();
+        assert_eq!(by_id.venue.unwrap().name, "New York Stock Exchange");
+        let both = ask::<ResolveVenueReply>(
+            &bus,
+            RESOLVE_VENUE,
+            "meridian.v1.ResolveVenueRequest",
+            ResolveVenueRequest {
+                venue_id: "VEN-XNYS".into(),
+                ..asked_again.clone()
+            },
+            "",
+        )
+        .await;
+        assert!(both.is_err_and(|why| why.contains("venue_id")));
 
         let minted: ResolveIdentifierReply = ask(
             &bus,

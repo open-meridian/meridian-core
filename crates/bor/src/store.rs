@@ -450,6 +450,68 @@ pub trait Store: Send + Sync {
     /// An account's journal, in order.
     fn journal(&self, account_id: &str) -> Result<Vec<Entry>>;
 
+    /// An account's book as its journal stands: from contract v25 (W9.10)
+    /// from its latest snapshot and the journal's tail where the store keeps
+    /// snapshots, else replayed whole.
+    fn book(&self, account_id: &str) -> Result<crate::book::Book> {
+        let entries = self.journal(account_id)?;
+        let partition = entries
+            .first()
+            .map(|entry| entry.partition.clone())
+            .unwrap_or_else(|| first_partition_of(account_id).to_string());
+        crate::book::Book::replay(account_id, &partition, &entries)
+    }
+
+    /// The book's health per account (W9.10, contract v25; ruling 155): its
+    /// journal's length, the entries a command replays after its latest
+    /// snapshot, and when that snapshot was taken -- `only` that account, or
+    /// the accounts after `after` in order, at most `limit`. A store keeping
+    /// no snapshots replays the whole journal, and says so.
+    fn book_health(
+        &self,
+        only: Option<&str>,
+        after: &str,
+        limit: usize,
+    ) -> Result<Vec<meridian_domain::v1::AccountBookHealth>> {
+        let mut out = Vec::new();
+        for account in self.accounts()? {
+            if account.as_str() <= after || only.is_some_and(|only| only != account) {
+                continue;
+            }
+            if out.len() == limit {
+                break;
+            }
+            let entries = self.journal(&account)?.len() as u64;
+            out.push(meridian_domain::v1::AccountBookHealth {
+                account_id: account,
+                journal_entries: entries,
+                entries_since_snapshot: entries,
+                last_snapshot_at_ns: 0,
+            });
+        }
+        Ok(out)
+    }
+
+    /// An account's book at the end of a business date as known at a
+    /// watermark (W9.10, Q22): the entries numbered at or below `at` on the
+    /// account's partition, those effective on or before `until`, from the
+    /// latest snapshot that holds none later where the store keeps them.
+    /// `at` is the partition's watermark as a read names it per partition.
+    fn book_as_of(
+        &self,
+        account_id: &str,
+        at: &Mark,
+        until: Option<&str>,
+    ) -> Result<crate::book::Book> {
+        let entries = self.journal(account_id)?;
+        let partition = entries
+            .first()
+            .map(|entry| entry.partition.clone())
+            .unwrap_or_else(|| FIRST_PARTITION.to_string());
+        let at = at.get(&partition).copied().unwrap_or(0);
+        crate::book::Book::as_of(account_id, &partition, &entries, Some(at), until)
+    }
+
     /// Every account the book holds an entry for.
     fn accounts(&self) -> Result<Vec<String>>;
 

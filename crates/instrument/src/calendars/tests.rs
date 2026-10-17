@@ -375,6 +375,30 @@ fn an_execution_at_1730_new_york_takes_the_next_trade_date() {
 }
 
 #[test]
+fn a_trade_date_after_fridays_cut_rolls_past_the_weekend_and_never_a_holiday() {
+    // Contract v25 (decision 65, item 111): Friday 9 October 2026 at 21:30
+    // UTC is 17:30 in New York, after the cut. The trade date is Monday the
+    // 12th, never Saturday the 10th -- and stays the 12th though Columbus
+    // Day closes USD, a holiday moving no trade date. EUR/USD spot, two days
+    // counted on TARGET from Monday, is Wednesday the 14th. (Until v25 the
+    // trade date was Saturday, its spot Tuesday the 13th; a trade date moved
+    // past the holiday would give Thursday the 15th.)
+    let after = ask(
+        &latest(),
+        Inputs::Spot(SpotDateInputs {
+            pair: vec![CASH_EUR.into(), CASH_USD.into()],
+            trade_date: String::new(),
+            at_ns: 1_791_581_400_000_000_000,
+        }),
+    );
+    assert_eq!(after.reply.outcome, DateOutcome::Computed as i32);
+    assert_eq!(after.reply.date, "2026-10-14");
+    // The same spot asked by its trade date, Monday.
+    let by_date = ask(&latest(), spot([CASH_EUR, CASH_USD], "2026-10-12"));
+    assert_eq!(by_date.reply.date, after.reply.date);
+}
+
+#[test]
 fn a_date_past_coverage_is_not_computed_and_never_a_business_day_by_default() {
     let answer = ask(&latest(), settlement("2028-12-29"));
     // Friday the 29th: T+1 is Monday 1 January 2029, past the coverage.
@@ -805,10 +829,11 @@ fn the_lists_text_also_matches_a_venues_mic_and_name_from_the_deployments_record
 }
 
 #[test]
-fn a_spot_read_by_the_deployments_own_currency_ids_reads_the_platforms_rule() {
-    // A deployment keeps EUR and USD under its own LCL- IDs with the
-    // platform's beside them (approved 2026-10-13): the read translates each
-    // member and computes the date the platform's rule gives.
+fn a_spot_read_by_resolved_local_currency_ids_reads_the_platforms_rule() {
+    // A deployment's EUR and USD records were minted under LCL- IDs and
+    // resolved into the platform's (contract v24, requirement 19): the read
+    // follows each member's replacement and computes the date the
+    // platform's rule gives.
     const LOCAL_EUR: &str = "LCL-01JAE0000000000000000EUR";
     const LOCAL_USD: &str = "LCL-01JAE0000000000000000USD";
     let platform = |id: &str| match id {
@@ -820,25 +845,26 @@ fn a_spot_read_by_the_deployments_own_currency_ids_reads_the_platforms_rule() {
         inputs: Some(spot([LOCAL_EUR, LOCAL_USD], "2026-10-09")),
         as_of_ns: 0,
     };
-    let translated = pair_on_the_platform(&local, platform);
+    let translated = pair_followed(&local, platform);
     let answer = compute(&latest(), &translated, us_equity, KEPT + 1).unwrap();
     assert_eq!(answer.reply.outcome, DateOutcome::Computed as i32);
     let by_platform = ask(&latest(), spot([CASH_EUR, CASH_USD], "2026-10-09"));
     assert_eq!(answer.reply.date, by_platform.reply.date);
 
-    // Untranslated, the LCL- pair meets no rule: the bug this fixes.
+    // Not followed, the LCL- pair meets no rule.
     let untranslated = compute(&latest(), &local, us_equity, KEPT + 1).unwrap();
     assert_eq!(untranslated.reply.outcome, DateOutcome::RuleNotHeld as i32);
 
-    // A member with no platform ID is kept as asked: the rule is not held and
-    // the miss names it honestly, the other member by the platform's ID.
+    // A member that became no platform record is kept as asked: the rule is
+    // not held and the miss names it honestly, the other member by the
+    // platform's ID.
     let stub = ComputeDateRequest {
         inputs: Some(spot(["LCL-NOPLATFORMID", LOCAL_USD], "2026-10-09")),
         as_of_ns: 0,
     };
     let answer = compute(
         &latest(),
-        &pair_on_the_platform(&stub, platform),
+        &pair_followed(&stub, platform),
         us_equity,
         KEPT + 1,
     )
@@ -849,7 +875,7 @@ fn a_spot_read_by_the_deployments_own_currency_ids_reads_the_platforms_rule() {
         vec!["LCL-NOPLATFORMID".to_string(), CASH_USD.to_string()]
     );
 
-    // A tenor's pair is translated too; any other question is left alone.
+    // A tenor's pair is followed too; any other question is left alone.
     let tenor = ComputeDateRequest {
         inputs: Some(Inputs::Tenor(TenorDateInputs {
             pair: vec![LOCAL_EUR.into(), LOCAL_USD.into()],
@@ -858,7 +884,7 @@ fn a_spot_read_by_the_deployments_own_currency_ids_reads_the_platforms_rule() {
         })),
         as_of_ns: 0,
     };
-    let Some(Inputs::Tenor(read)) = pair_on_the_platform(&tenor, platform).inputs else {
+    let Some(Inputs::Tenor(read)) = pair_followed(&tenor, platform).inputs else {
         panic!("a tenor stays a tenor");
     };
     assert_eq!(read.pair, vec![CASH_EUR.to_string(), CASH_USD.to_string()]);
@@ -869,5 +895,5 @@ fn a_spot_read_by_the_deployments_own_currency_ids_reads_the_platforms_rule() {
         })),
         as_of_ns: 0,
     };
-    assert_eq!(pair_on_the_platform(&business, platform), business);
+    assert_eq!(pair_followed(&business, platform), business);
 }

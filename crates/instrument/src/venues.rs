@@ -40,6 +40,27 @@ pub fn resolve_venue(
         now_ns
     };
     let held = store.venues()?;
+    // By its `VEN-` ID (contract v25; D9): the held record, as
+    // ResolveInstrument answers by `instrument_id` (W3.6), the latest
+    // version in force on the date.
+    if !request.venue_id.is_empty() {
+        let one = held
+            .iter()
+            .filter(|venue| venue.venue_id == request.venue_id && venue.valid_from_ns <= as_of)
+            .max_by_key(|venue| venue.version);
+        return Ok(match one {
+            Some(venue) => ResolveVenueReply {
+                found: true,
+                venue: Some(venue.clone()),
+                miss_reason: MissReason::Unspecified as i32,
+            },
+            None => ResolveVenueReply {
+                found: false,
+                venue: None,
+                miss_reason: MissReason::NotFound as i32,
+            },
+        });
+    }
     let mut found: Vec<&VenueRecord> = held
         .iter()
         .filter(|venue| {
@@ -107,6 +128,7 @@ mod tests {
                 ..Default::default()
             }],
             as_of_ns,
+            venue_id: String::new(),
         }
     }
 
@@ -130,5 +152,25 @@ mod tests {
         store.keep_venue(&venue("VEN-B", 1, "XNYS"), 1).unwrap();
         let both = resolve_venue(&store, &ask(ISO10383, "XNYS", "", 20), 30).unwrap();
         assert_eq!(both.miss_reason, MissReason::Ambiguous as i32);
+    }
+
+    #[test]
+    fn a_venue_held_is_answered_by_its_id() {
+        // Contract v25 (D9): the dashboard reads a calendar's venue by its ID.
+        let store = MemoryStore::new();
+        store.keep_venue(&venue("VEN-A", 2, "XNYS"), 1).unwrap();
+        let by_id = |id: &str, as_of_ns: i64| ResolveVenueRequest {
+            venue_id: id.into(),
+            as_of_ns,
+            ..Default::default()
+        };
+        let found = resolve_venue(&store, &by_id("VEN-A", 20), 30).unwrap();
+        let venue = found.venue.unwrap();
+        assert_eq!((venue.venue_id.as_str(), venue.version), ("VEN-A", 2));
+        assert!(venue.identifiers.iter().any(|i| i.value == "XNYS"));
+        let unheld = resolve_venue(&store, &by_id("VEN-Z", 20), 30).unwrap();
+        assert_eq!(unheld.miss_reason, MissReason::NotFound as i32);
+        let before = resolve_venue(&store, &by_id("VEN-A", 5), 30).unwrap();
+        assert!(!before.found, "not in force yet");
     }
 }

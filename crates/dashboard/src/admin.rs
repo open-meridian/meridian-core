@@ -91,6 +91,10 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/admin/instruments/merge", post(merge_instruments))
         .route("/admin/instruments/search", get(search_instruments))
         .route(instruments::USAGE_PATH, post(set_reports_usage))
+        .route(
+            instruments::LICENSED_SCHEMES_PATH,
+            post(set_licensed_schemes),
+        )
         .route(instruments::LINES_PATH, post(apply_migration_lines))
         .route("/admin/instruments/{instrument}", get(instrument_page))
         .route(
@@ -1242,6 +1246,13 @@ pub(crate) struct Manage<'a> {
     pub report: Option<&'a meridian_domain::v1::PluginReport>,
     /// The version the catalogue launched, where it launched the plugin.
     pub version: Option<&'a str>,
+    /// Its launch, where the instance is stopped (contract v25): the
+    /// Summary says so, and when, and draws nothing a running plugin
+    /// reports.
+    pub stopped: Option<&'a meridian_domain::v1::PluginLaunch>,
+    /// Its version's pull from the catalogue, where no deployment admin has
+    /// kept it since (W8.12, contract v25): one line heading the Summary.
+    pub pulled: Option<meridian_domain::v1::PluginPull>,
     pub session: &'a Session,
     pub notice: &'a str,
     pub now: i64,
@@ -1365,18 +1376,58 @@ pub(crate) fn summary_tab(manage: &Manage) -> String {
         manage.version,
         "not known: it was not launched from the catalogue",
     );
+    // A stopped instance (contract v25): stopped, by whom and when.
+    let stopped = manage.stopped.map_or(String::new(), |launch| {
+        format!(
+            "<dt>Stopped</dt><dd data-stopped>{} by {}</dd>",
+            &crate::terminal::rfc3339(launch.stopped_at_ns)[..16].replace('T', " "),
+            escape(&launch.stopped_by)
+        )
+    });
+    // The sidecar's refusals at registration -- a tool, a page, and on a
+    // live instance a difference from its version's declaration -- as
+    // warnings, one line each (W4.8, contract v25).
+    let warnings: String = manage
+        .report
+        .map(|report| report.tool_refusals.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .map(|why| format!("<li class=\"refused\" data-warning>{}</li>", escape(why)))
+        .collect();
+    let warnings = if warnings.is_empty() {
+        String::new()
+    } else {
+        format!("<ul class=\"warnings one-line\">{warnings}</ul>")
+    };
+    // What it received and did not carry since it started, as counts.
+    let seen: Vec<String> = manage
+        .report
+        .map(|report| report.not_carried_seen.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .filter(|seen| seen.count > 0)
+        .map(|seen| {
+            format!(
+                "{} {} ({})",
+                escape(&seen.scheme),
+                escape(&seen.name),
+                seen.count
+            )
+        })
+        .collect();
+    let seen = if seen.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<dt>Not carried</dt><dd data-not-carried-seen>{}</dd>",
+            seen.join(", ")
+        )
+    };
     let contract = said(
         manage.report.map(|report| report.contract_version.as_str()),
         "not said",
     );
     let figures = crate::figures::section(manage.report, manage.now);
-    let declared = crate::declaration::summary(
-        manage.report.and_then(|report| report.declaration.as_ref()),
-        manage
-            .report
-            .map(|report| report.not_carried_seen.as_slice())
-            .unwrap_or_default(),
-    );
     // Its raw records, storage's and the archive's, and its moves (W6.9,
     // contract v16), for a plugin at the edge keeping them.
     let (records, moves) = match manage.moves {
@@ -1399,7 +1450,7 @@ pub(crate) fn summary_tab(manage: &Manage) -> String {
     let status = format!(
         "<section class=\"panel padded\" id=\"status\"><div class=\"row\"><h2>Status</h2>{badge}</div>{why}\
          <dl class=\"facts\"><dt>Version</dt><dd data-version>{version}</dd>\
-         <dt>Contract</dt><dd data-contract>{contract}</dd></dl>\
+         <dt>Contract</dt><dd data-contract>{contract}</dd>{stopped}{seen}</dl>{warnings}\
          <p class=\"reserved\" data-reserved=\"lifecycle\">Restarting it, moving it to another version and \
          holding it at one will be here. They are not built yet.</p></section>{figures}"
     );
@@ -1409,8 +1460,16 @@ pub(crate) fn summary_tab(manage: &Manage) -> String {
         &manage.session.directory_groups,
     )
     .deployment_admin;
+    let pulled = manage.pulled.as_ref().map_or(String::new(), |pull| {
+        format!(
+            "<p class=\"error\" role=\"alert\" data-pulled>Its version was pulled from the catalogue: {}. \
+             <a href=\"/admin/plugins/registry/acknowledge?instance={}\">Keep it</a> or stop it.</p>",
+            crate::registry::pull_kind(pull),
+            escape(manage.instance)
+        )
+    });
     format!(
-        "{notice}{parts}",
+        "{pulled}{notice}{parts}",
         notice = notice_line(manage.notice),
         parts = summary_parts(
             &SUMMARY_PART_KEYS
@@ -1424,8 +1483,6 @@ pub(crate) fn summary_tab(manage: &Manage) -> String {
                     },
                     records,
                     moves,
-                    declared,
-                    tools_section(manage.report)
                 ])
                 .map(|((key, title), drawn)| (*key, *title, drawn))
                 .collect::<Vec<_>>()
@@ -1436,13 +1493,11 @@ pub(crate) fn summary_tab(manage: &Manage) -> String {
 /// The Summary's parts, by key and title, in the order drawn: each has a
 /// plugin-area tool reaching it (W6.20, contract v17; the parity check in
 /// [`crate::mcp::plugin_area`]).
-pub(crate) const SUMMARY_PART_KEYS: [(&str, &str); 6] = [
+pub(crate) const SUMMARY_PART_KEYS: [(&str, &str); 4] = [
     ("status", "Status"),
     ("setting-up", "Setting up"),
     ("records", "Raw records"),
     ("moves", "Moves"),
-    ("declared", "What it declares"),
-    ("tools", "Tools for agents"),
 ];
 
 /// The Summary's parts -- its status and figures, an edge plugin's raw
@@ -1507,47 +1562,6 @@ const SUMMARY_PARTS: &str = r#"(function () {
   window.addEventListener("hashchange", show);
   show();
 })();"#;
-
-/// The plugin's tools on the deployment's MCP surface (W4.8, W6.20, contract
-/// v12): those its sidecar admitted, reads and acts apart, and each refused
-/// with why (requirement 10). Nothing for a plugin declaring none.
-fn tools_section(report: Option<&meridian_domain::v1::PluginReport>) -> String {
-    let Some(report) = report else {
-        return String::new();
-    };
-    if report.declared_tools.is_empty() && report.tool_refusals.is_empty() {
-        return String::new();
-    }
-    let rows: String = report
-        .declared_tools
-        .iter()
-        .map(|tool| {
-            format!(
-                "<li data-tool=\"{name}\"><code>{name}</code> {title} ({kind}, {method} {path})</li>",
-                name = escape(&tool.name),
-                title = escape(&tool.title),
-                kind = if tool.reads { "reads" } else { "acts" },
-                method = escape(&tool.method),
-                path = escape(&tool.path),
-            )
-        })
-        .collect();
-    let refused: String = report
-        .tool_refusals
-        .iter()
-        .map(|why| {
-            format!(
-                "<li class=\"refused\" data-tool-refused>{}</li>",
-                escape(why)
-            )
-        })
-        .collect();
-    format!(
-        "<section class=\"panel padded\" id=\"tools\"><h2>Tools for agents</h2>\
-         <p class=\"hint\">What an agent a person delegated to may call on this deployment's \
-         MCP surface, each at its route's levels.</p><ul>{rows}{refused}</ul></section>"
-    )
-}
 
 /// The dashboard's Settings tab in a plugin's area under Manage (the product
 /// owner, 2026-10-01: "build Settings and the status panel under Manage"):
@@ -2326,7 +2340,7 @@ async fn instruments_page(
     );
     let held = calendars::held(&app.bus, &filter).await;
     let codes = match &held {
-        Ok(listed) => calendars::currency_codes(&app.bus, listed).await,
+        Ok(listed) => calendars::subject_codes(&app.bus, listed).await,
         Err(_) => Default::default(),
     };
     let chosen = field(&query, "calendar");
@@ -3254,6 +3268,61 @@ async fn set_reports_usage(
 
 /// The usage report's act on the surface (W6.20, contract v24).
 const SET_REPORTS_USAGE_TOOL: &str = "dashboard__set_reports_usage";
+
+/// W3.28 (contract v25): the licensed schemes declared, a deployment
+/// admin's, the whole list with a note; or prepared for someone to make.
+async fn set_licensed_schemes(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Form(pairs): Form<Vec<(String, String)>>,
+) -> Response {
+    let fields = once(&pairs);
+    let (session, _) = match gate(&app, &headers, true) {
+        Ok(gated) => gated,
+        Err(response) => return *response,
+    };
+    if let Err(response) = form_token_matches(&session, &fields) {
+        return *response;
+    }
+    let back = "/admin/instruments#licensed";
+    let note = field(&fields, "note").trim().to_string();
+    if note.is_empty() {
+        return not_done("say why the licensed schemes change", back);
+    }
+    let schemes: Vec<String> = every(&pairs, "licensed_scheme");
+    let posted = prepare_or_gate(&app, &session, &fields, SET_LICENSED_SCHEMES_TOOL, || {
+        Ok(serde_json::json!({"licensed_schemes": schemes, "note": note}))
+    })
+    .await;
+    if let Some(response) = posted_to(posted, back) {
+        return response;
+    }
+    let outcome = app
+        .bus
+        .call_for(
+            instruments::SET_LICENSED_SCHEMES,
+            "meridian.v1.SetLicensedSchemesRequest",
+            meridian_domain::v1::SetLicensedSchemesRequest {
+                licensed_schemes: schemes.clone(),
+                reason: note.clone(),
+            }
+            .encode_to_vec(),
+            None,
+            Some(Duration::from_secs(10)),
+            &session.subject,
+        )
+        .await
+        .map(|_| ())
+        .map_err(said_of_refusal);
+    after_to(
+        outcome,
+        "/admin/instruments?done=The+licensed+schemes+are+set#licensed",
+        back,
+    )
+}
+
+/// The licensed schemes' act on the surface (W6.20, contract v25).
+const SET_LICENSED_SCHEMES_TOOL: &str = "dashboard__set_licensed_schemes";
 
 /// W3.26 (contract v24): the migration's lines made from the Provisional
 /// tab -- the exact lines as one change, a line held back by its box, or one

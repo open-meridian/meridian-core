@@ -239,6 +239,12 @@ impl Subscription {
         self.rx.recv().await
     }
 
+    /// The next delivery already queued, without waiting; None when nothing
+    /// is.
+    pub fn try_recv(&mut self) -> Option<Delivery> {
+        self.rx.try_recv().ok()
+    }
+
     pub fn pattern(&self) -> &str {
         &self.pattern
     }
@@ -298,8 +304,17 @@ pub trait Backend: Send + Sync {
     /// that subscriber alone.
     fn publish(&self, topic: &str, envelope: Envelope) -> Result<u64, BusError>;
 
-    /// Subscribe to a topic pattern. See [`crate::topic`] for the grammar.
+    /// Subscribe to a topic pattern, every subscriber hearing every message
+    /// (contract v25: "every subscriber"). See [`crate::topic`] for the
+    /// grammar.
     fn subscribe(&self, pattern: &str) -> Subscription;
+
+    /// Subscribe as one of a group (contract v25; Q15; kernel/the-bus-has-no-
+    /// queue-groups): each message reaches one member of `group` -- one copy
+    /// of a component sharing the work with its others -- and every other
+    /// group and plain subscriber as usual. At most once, as everything on
+    /// this bus: a member that dies mid-work loses that message.
+    fn subscribe_shared(&self, pattern: &str, group: &str) -> Subscription;
 
     /// Ask a question of whoever serves this topic, wherever they are.
     ///
@@ -323,7 +338,11 @@ pub trait Backend: Send + Sync {
     ///
     /// Defaulted to nothing, because an in-process backend has nowhere else to
     /// offer it to: the router already holds the handler and answers locally.
-    fn serve(&self, _topic: &str, _handler: Handler) {}
+    ///
+    /// From contract v25 every copy of a component offering a topic shares
+    /// it as one `group` (the component's name), so each request is answered
+    /// once, not once per copy with all but the first answer thrown away.
+    fn serve(&self, _topic: &str, _group: &str, _handler: Handler) {}
 
     /// The same, and signal once an answer has actually reached the broker.
     ///
@@ -335,8 +354,8 @@ pub trait Backend: Send + Sync {
     /// cannot hold an answer in flight: the router answered from its own map
     /// before this was ever reached, so there is nothing left to wait for and
     /// a caller that waited would wait forever.
-    fn serve_delivered(&self, topic: &str, handler: Handler, delivered: Arc<Notify>) {
-        self.serve(topic, handler);
+    fn serve_delivered(&self, topic: &str, group: &str, handler: Handler, delivered: Arc<Notify>) {
+        self.serve(topic, group, handler);
         delivered.notify_one();
     }
 

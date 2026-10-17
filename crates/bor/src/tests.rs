@@ -295,8 +295,8 @@ fn journal(partition: &str, sequence: u64, previous: u64) -> Option<JournalRef> 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_opening_balance_opens_every_position_and_lot_from_zero() {
     let (bus, _) = wired();
-    let mut positions = bus.subscribe(POSITION_CHANGED);
-    let mut attributes = bus.subscribe(ACCOUNT_ATTRIBUTE_CHANGED);
+    let mut positions = bus.subscribe_every(POSITION_CHANGED);
+    let mut attributes = bus.subscribe_every(ACCOUNT_ATTRIBUTE_CHANGED);
 
     let reply = open(&bus).await;
 
@@ -359,7 +359,7 @@ async fn an_opening_balance_opens_every_position_and_lot_from_zero() {
 async fn the_same_command_again_is_applied_once_and_answered_as_the_first() {
     let (bus, store) = wired();
     let first = open(&bus).await;
-    let mut positions = bus.subscribe(POSITION_CHANGED);
+    let mut positions = bus.subscribe_every(POSITION_CHANGED);
 
     // A retry the sidecar gave a new message identifier, by its key (Q12).
     let again = open(&bus).await;
@@ -799,8 +799,8 @@ async fn lots_across_buckets_sum_to_both() {
 async fn a_break_is_a_finding_that_moves_nothing() {
     let (bus, store) = wired();
     open(&bus).await;
-    let mut breaks = bus.subscribe(BREAK_CHANGED);
-    let mut positions = bus.subscribe(POSITION_CHANGED);
+    let mut breaks = bus.subscribe_every(BREAK_CHANGED);
+    let mut positions = bus.subscribe_every(POSITION_CHANGED);
 
     let reply = record_break(&bus, &aapl_break()).await.unwrap();
     let [record] = reply.breaks.as_slice() else {
@@ -848,7 +848,7 @@ async fn a_cause_linking_the_custodians_activity_is_recorded_as_given() {
     // never heard of is recorded too, and nothing moves.
     let (bus, _) = wired();
     open(&bus).await;
-    let mut positions = bus.subscribe(POSITION_CHANGED);
+    let mut positions = bus.subscribe_every(POSITION_CHANGED);
     let reinvested = BreakCause {
         category: BreakCauseCategory::IncomeReinvested as i32,
         item: Some(break_cause::Item::Activity(ActivityRef {
@@ -989,7 +989,7 @@ async fn the_figures_are_kept_per_agreement() {
 async fn encumbrances_are_an_attribute_and_free_is_derived_from_them() {
     let (bus, store) = wired();
     open(&bus).await;
-    let mut positions = bus.subscribe(POSITION_CHANGED);
+    let mut positions = bus.subscribe_every(POSITION_CHANGED);
     let source = StreetRecordRef {
         statement_id: "STMT-2".into(),
         as_of_date: "2026-09-09".into(),
@@ -1191,7 +1191,7 @@ async fn a_break_is_closed_with_an_explanation_or_as_cleared_and_nothing_moves()
     let second = record_break(&bus, &other).await.unwrap().breaks[0]
         .break_id
         .clone();
-    let mut positions = bus.subscribe(POSITION_CHANGED);
+    let mut positions = bus.subscribe_every(POSITION_CHANGED);
 
     let closed = resolve(
         &bus,
@@ -1589,7 +1589,7 @@ async fn a_merged_record_is_followed_its_lots_keeping_their_identifiers() {
         .instruments_held()
         .unwrap()
         .contains(&placeholder.to_string()));
-    let mut positions = bus.subscribe(POSITION_CHANGED);
+    let mut positions = bus.subscribe_every(POSITION_CHANGED);
 
     bus.publish(
         INSTRUMENT_REPLACED,
@@ -1973,6 +1973,51 @@ async fn the_same_unknown_security_on_a_later_statement_updates_the_same_break()
     assert_eq!(updated.breaks[0].last_seen_date, "2026-09-11");
 }
 
+/// Contract v25 (W9.3): the identifiers ride in their own field, kept on the
+/// break; a v24 plugin's street-only differences still match the same
+/// break; and no other category carries them.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unrecognized_securitys_identifiers_ride_in_their_own_field() {
+    let (bus, _store) = wired();
+    open(&bus).await;
+    let identifier = |scheme: &str, value: &str| meridian_domain::v1::Identifier {
+        scheme: scheme.into(),
+        value: value.into(),
+        ..Default::default()
+    };
+    let mut v25 = unrecognized_break("ST-THIN-1", "2026-09-09", &[]);
+    v25.differences = vec![BreakDifference {
+        field: "description".into(),
+        book: None,
+        street: Some(BreakValue {
+            value: Some(break_value::Value::Text("ZZQ9 HOLDINGS".into())),
+        }),
+    }];
+    v25.unresolved_identifiers = vec![identifier("custodian", "ZZQ9")];
+    let first = record_break(&bus, &v25).await.unwrap();
+    let record = &first.breaks[0];
+    assert_eq!(
+        record.unresolved_identifiers,
+        vec![identifier("custodian", "ZZQ9")]
+    );
+    // The same security from a plugin built before v25, by its differences:
+    // the same break, its identifiers kept.
+    let v24 = unrecognized_break("ST-THIN-2", "2026-09-10", &[("custodian", "ZZQ9")]);
+    let later = record_break(&bus, &v24).await.unwrap();
+    assert_eq!(later.breaks[0].break_id, record.break_id);
+    assert_eq!(later.breaks[0].unresolved_identifiers.len(), 1);
+    // Half an identifier is refused by its path; another category carries
+    // none.
+    let mut half = v25.clone();
+    half.unresolved_identifiers = vec![identifier("custodian", "")];
+    let refused = record_break(&bus, &half).await.unwrap_err();
+    assert!(refused.contains("unresolved_identifiers[0]"), "{refused}");
+    let mut other = aapl_break();
+    other.unresolved_identifiers = vec![identifier("custodian", "ZZQ9")];
+    let refused = record_break(&bus, &other).await.unwrap_err();
+    assert!(refused.contains("unresolved_identifiers"), "{refused}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn different_identifiers_open_a_new_unrecognized_security_break() {
     let (bus, _store) = wired();
@@ -1998,4 +2043,139 @@ async fn different_identifiers_open_a_new_unrecognized_security_break() {
         .clone();
     assert_ne!(third, id);
     assert_ne!(third, second);
+}
+
+/// Core's replay benchmark (contract v25, W9.10; item 122: the snapshot
+/// interval's default comes from it). Run by hand, never by the gate:
+///
+///     cargo test -p meridian-bor --lib replay_benchmark -- --ignored --nocapture
+///
+/// An operations plugin's day as the development deployment's journal held
+/// it (2026-10-15: figures and breaks re-recorded every few minutes), entry
+/// after entry on one account, and for each length: a full replay from the
+/// journal's rows (each entry's body decoded, as the Postgres store reads
+/// them), a snapshot's size and the time to write and to read it back, and
+/// one entry of tail applied -- with the most memory each held above where
+/// it began.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn replay_benchmark() {
+    use crate::book::Book;
+    use crate::journal::Entry;
+    use crate::snapshot::tests::{Counting, CHECK_EVERY_ACT};
+    use std::time::Instant;
+    CHECK_EVERY_ACT.store(false, std::sync::atomic::Ordering::Relaxed);
+    let (bus, store) = wired();
+    open(&bus).await;
+    let lengths = [250usize, 500, 1_000, 2_000, 4_000];
+    let mut made = 1;
+    let figures = |n: usize| RecordAccountFiguresRequest {
+        account_id: ACC.into(),
+        business_date: format!("2026-09-{:02}", 9 + (n % 20)),
+        source: None,
+        agreements: vec![AgreementFigures {
+            agreement: Some(MarginAgreementRef {
+                agreement: Some(margin_agreement_ref::Agreement::StatementSegment(
+                    StatementSegmentRef {
+                        external_account_id: "SNAP-ACC-1".into(),
+                        segment: String::new(),
+                        counterparty: "Interactive Brokers".into(),
+                    },
+                )),
+            }),
+            figures: Some(StatementFigures {
+                net_liquidation: usd(&format!("{}.00", 2_400_000 + n)),
+                ..Default::default()
+            }),
+            position_values: vec![ReportedPositionValue {
+                instrument_id: AAPL.into(),
+                side: HoldingSide::Long as i32,
+                market_value: usd(&format!("{}.50", 3_412 + n)),
+                margin_requirement: None,
+            }],
+        }],
+        idempotency_key: format!("figures:{n}"),
+    };
+    println!(
+        "entries | replay ms | replay peak MB | snapshot KB | encode ms | decode ms | decode peak MB | tail us/entry"
+    );
+    for length in lengths {
+        while made < length {
+            if made % 2 == 0 {
+                let mut update = aapl_break();
+                update.business_date = format!("2026-09-{:02}", 9 + (made % 20));
+                record_break(&bus, &update).await.unwrap();
+            } else {
+                send(
+                    &bus,
+                    RECORD_ACCOUNT_FIGURES,
+                    "meridian.v1.RecordAccountFiguresRequest",
+                    &figures(made),
+                    None,
+                )
+                .await
+                .unwrap();
+            }
+            made += 1;
+        }
+        let journal = store.journal(ACC).unwrap();
+        let rows: Vec<(Entry, Vec<u8>)> = journal
+            .iter()
+            .map(|entry| (entry.clone(), entry.body.to_bytes()))
+            .collect();
+        drop(journal);
+        // A full replay from the rows, as every command did until v25.
+        let base = Counting::reset_peak();
+        let started = Instant::now();
+        let entries: Vec<Entry> = rows
+            .iter()
+            .map(|(entry, body)| Entry {
+                body: crate::journal::Body::from_bytes(body).unwrap(),
+                ..entry.clone()
+            })
+            .collect();
+        let book = Book::replay(ACC, "P0", &entries).unwrap();
+        let replay = started.elapsed();
+        let replay_peak = Counting::peak() - base;
+        drop(entries);
+        // A snapshot written, and read back.
+        let started = Instant::now();
+        let bytes = crate::snapshot::encode(&book);
+        let encode = started.elapsed();
+        let base = Counting::reset_peak();
+        let started = Instant::now();
+        let kept = crate::snapshot::decode(&bytes).unwrap();
+        let decode = started.elapsed();
+        let decode_peak = Counting::peak() - base;
+        assert_eq!(kept, book);
+        // One entry of tail.
+        let (last, body) = rows.last().unwrap();
+        let tail = Entry {
+            body: crate::journal::Body::from_bytes(body).unwrap(),
+            ..last.clone()
+        };
+        let before = Book::replay(
+            ACC,
+            "P0",
+            &rows[..rows.len() - 1]
+                .iter()
+                .map(|(e, _)| e.clone())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let started = Instant::now();
+        let mut resumed = before;
+        resumed.apply(&tail, false).unwrap();
+        let tail_us = started.elapsed().as_micros();
+        println!(
+            "{length} | {:.1} | {:.1} | {} | {:.1} | {:.1} | {:.1} | {tail_us}",
+            replay.as_secs_f64() * 1e3,
+            replay_peak as f64 / 1e6,
+            bytes.len() / 1024,
+            encode.as_secs_f64() * 1e3,
+            decode.as_secs_f64() * 1e3,
+            decode_peak as f64 / 1e6,
+        );
+    }
+    CHECK_EVERY_ACT.store(true, std::sync::atomic::Ordering::Relaxed);
 }

@@ -216,6 +216,11 @@ bor:
   # glibc's allocator arenas, at most this many: a burst of requests answered
   # on many threads otherwise keeps an arena's memory per thread resident.
   mallocArenaMax: 2
+  # How many entries an account's journal grows by between snapshots of its
+  # book (contract v25, W9.10): a command or a dated read replays the journal
+  # from the latest snapshot, never from the account's first entry. The
+  # default is from core's replay benchmark; 10 to 100000.
+  snapshotInterval: 1000
 
 # The lake (W10, contract v18). One replica: every batch takes its dataset's
 # head in Postgres, so a second would wait rather than help, and the rollout
@@ -382,6 +387,17 @@ registry:
   # what a launched plugin's image is named with: localhost:<hostPort>/...
   # Unique on a cluster: two deployments on one cluster need two ports.
   hostPort: 5000
+
+# The community and verified registries (contract v25,
+# spec/plugins-are-shared-through-registries). What a deployment installs
+# from them is verified offline by the conductor against the platform's
+# public keys, carried here by each chart release: the current one and the
+# next, so the platform's key can rotate without a gap (requirement 23). Each
+# an ECDSA P-256 public key as PEM. Empty, nothing is installed from a
+# registry: the Browse tab says the deployment reaches none. The release
+# fills them; an install changes them only to follow a published rotation.
+registries:
+  platformKeys: []
 
 # What launches the plugins a deployment admin uploads and approves (W8.3),
 # creating each a Deployment in the chart's plugin shape and nothing else

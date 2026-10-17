@@ -102,12 +102,32 @@ local deployment.
 
     [{"instance": "snaptrade", "image": "...", "roles": ["custody"], "archive": true}]
 
+From contract v25, a plugin declaring v25 registers the declaration its
+version was uploaded with, or its sidecar refuses it naming the first
+difference (W4.1). The harness performs no upload, so a plugin listed with
+`"declaration": PATH` has its sidecar hold it to that file instead: the
+SDK's JSON as `meridian-declaration` prints it from the plugin's own image,
+which is what `meridian plugin upload` sends. Print it before writing the
+compose file, beside it, from the image under test:
+
+    docker run --rm --network none --entrypoint meridian-declaration <image> \
+        <module:attribute> >.e2e/harness/declaration.json
+
+    [{"instance": "snaptrade", "image": "...", "roles": ["custody"], "declaration": "declaration.json"}]
+
+`<module:attribute>` is what `[tool.meridian]`'s `declaration` names. PATH
+is relative to the directory of the first compose file (`.e2e/harness/`), or
+absolute. A plugin listed without one registers unchecked, as on any
+sidecar no launch made; with one, an e2e proves that what it registers is
+what its upload would declare.
+
 - `instance` is lower case letters, digits and inner hyphens, at most 32,
   starting with a letter, and none of the names the harness already holds
   (its services, `storage` among them, `runtime`, `first-run`, `dashboard-1`,
   or `sidecar-...`).
 - `roles` is a list, empty for a plugin holding none.
 - `archive`, where given, is `true`, and only for a plugin holding an edge role.
+- `declaration`, where given, is a file's path with no space, colon or `$`.
 - The first plugin listed is the runner's, when a command names no
   `--instance`.
 
@@ -354,7 +374,7 @@ line:
         python /harness/harness.py compose <e2e/plugins.json >.e2e/harness/plugins.yaml
     export MERIDIAN_RUNTIME_IMAGE=$RUNTIME_IMAGE
     H="docker compose -p <plugin>-e2e -f .e2e/harness/compose.yaml -f .e2e/harness/plugins.yaml"
-    $H down -v --remove-orphans
+    $H --profile runner down -v --remove-orphans
     $H up -d
     $H run --rm -T runner ready
     $H run --rm -T runner settings <name>=<value>
@@ -364,7 +384,7 @@ line:
     diff -u e2e/expected.street .e2e/street
     $H run --rm -T runner unlinked --expect <n>
     $H logs --no-color > .e2e/components.log   # on a failure, before tearing down
-    $H down -v --remove-orphans
+    $H --profile runner down -v --remove-orphans
 
 A setting changed and a link made each wake a plugin that reads on them, so wait
 for a complete statement rather than for any row, or the diff can catch one

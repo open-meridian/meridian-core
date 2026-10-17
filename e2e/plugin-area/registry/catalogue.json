@@ -1,0 +1,360 @@
+{
+ "key_status": {
+  "issued_at_ns": 1792159200000000000,
+  "keys": [
+   {
+    "fingerprint": "SHA256:e2e-open-meridian-release",
+    "key_id": "SGK-om-1",
+    "name": "release",
+    "not_trusted_after_ns": 0,
+    "organisation": "open-meridian",
+    "public_key": "ssh-ed25519 AAAAe2e",
+    "registered_at_ns": 1792065600000000000,
+    "registered_by_person_id": "",
+    "revoke_reason": "",
+    "revoked_at_ns": 0,
+    "revoked_by_person_id": ""
+   },
+   {
+    "fingerprint": "SHA256:e2e-other-org-release",
+    "key_id": "SGK-oo-1",
+    "name": "release",
+    "not_trusted_after_ns": 1792148400000000000,
+    "organisation": "other-org",
+    "public_key": "ssh-ed25519 AAAAe2e",
+    "registered_at_ns": 1792065600000000000,
+    "registered_by_person_id": "",
+    "revoke_reason": "The laptop holding it was lost.",
+    "revoked_at_ns": 1792148400000000000,
+    "revoked_by_person_id": "PER-oo"
+   }
+  ],
+  "signature": "MEQCIEE3y2HgweC2KL5RPbIX5mT9Zh83z69jN5wuq5+04GKsAiAqXiTLacK2h753YWNJ7kXUYLPzKNKC+UNMvnP/WaiXxQ=="
+ },
+ "listings": [
+  {
+   "asset_classes": [
+    "equity"
+   ],
+   "counts_shown": false,
+   "installs": 0,
+   "instances": 0,
+   "listing": "open-meridian/stand-in",
+   "regions": [
+    "US"
+   ],
+   "repository": "https://github.com/open-meridian/plugin-stand-in",
+   "stars": 3,
+   "support_contact": "",
+   "versions": [
+    {
+     "approved_roles": [],
+     "build": {
+      "signer_fingerprint": "SHA256:e2e-open-meridian-release"
+     },
+     "image_digest": "sha256:f0fea24b22a52baff40b9aa31e0d9ee5ad809f0bc2ea38e179a172775b2a73d5",
+     "listed_at_ns": 1792152000000000000,
+     "listing": "open-meridian/stand-in",
+     "listing_statement": "{\"payload\":\"eyJfdHlwZSI6Imh0dHBzOi8vaW4tdG90by5pby9TdGF0ZW1lbnQvdjEiLCJwcmVkaWNhdGUiOnsiYXBwcm92ZWRfcm9sZXMiOltdLCJmbG9vciI6InYyNSIsImxpc3RlZF9hdCI6IjIwMjYtMTAtMTZUMTI6MDA6MDBaIiwibGlzdGluZyI6Im9wZW4tbWVyaWRpYW4vc3RhbmQtaW4iLCJyZWdpc3RyeSI6ImNvbW11bml0eSIsInJldmlld19pZCI6IiIsInJvbGVzIjpbImN1c3RvZHkiXSwic2lnbmVyX2tleSI6IlNIQTI1NjplMmUtb3Blbi1tZXJpZGlhbi1yZWxlYXNlIiwidmVyc2lvbiI6IjEuMy4wIn0sInByZWRpY2F0ZVR5cGUiOiJodHRwczovL29wZW4tbWVyaWRpYW4uZGV2L2F0dGVzdGF0aW9uL3BsdWdpbi1saXN0aW5nL3YxIiwic3ViamVjdCI6W3siZGlnZXN0Ijp7InNoYTI1NiI6ImYwZmVhMjRiMjJhNTJiYWZmNDBiOWFhMzFlMGQ5ZWU1YWQ4MDlmMGJjMmVhMzhlMTc5YTE3Mjc3NWIyYTczZDUifSwibmFtZSI6InBsYXRmb3JtOjg0NDMvcGx1Z2lucy94In1dfQ==\",\"payloadType\":\"application/vnd.in-toto+json\",\"signatures\":[{\"keyid\":\"e2e-platform\",\"sig\":\"MEQCIDm0YP2UFOKM+0V699fzEFwJSZ5PaDM6sKJRavhfRJ1dAiA8wbsZOUSlTkJ6SxvPcX/zmEWnJWQsUg+GpGMYpwBwSg==\"}]}",
+     "metadata": {
+      "declaration": {
+       "documentation": [
+        {
+         "bytes": 59,
+         "digest": "sha256:707e14aa4aa7bcc8c44da09ee270ce1c0e47350db93e3697ef2f9f7a2cf51531",
+         "name": "overview"
+        },
+        {
+         "bytes": 74,
+         "digest": "sha256:6507d2c3cff774bafa67a42fefb602a3df529beb3a0349b50148e7a58fd7b64c",
+         "name": "setup"
+        },
+        {
+         "bytes": 113,
+         "digest": "sha256:10e87cd889b9558936a4aae0fc5e34191444b0b38e0484968a04ac08152c131e",
+         "name": "troubleshooting"
+        }
+       ],
+       "not_carried": [],
+       "secret_settings": [
+        "api_key"
+       ],
+       "settings": [
+        {
+         "description": "Where the stand-in's accounts are held.",
+         "label": "Region",
+         "name": "region",
+         "type": "SETTING_TYPE_STRING"
+        }
+       ],
+       "storage": null
+      },
+      "interface": false,
+      "name": "stand-in",
+      "roles": [
+       "custody"
+      ],
+      "sdk_version": "0.29.0",
+      "version": "1.3.0"
+     },
+     "pull": {
+      "kind": "PULL_REASON_KIND_TERMS_BREACH",
+      "listing": "open-meridian/stand-in",
+      "notice_id": "",
+      "pulled_at_ns": 1792155600000000000,
+      "reason": "It sent account numbers to a host it did not declare.",
+      "restored_at_ns": 0,
+      "version": "1.3.0"
+     },
+     "registry": "community",
+     "schema_version": "v25",
+     "sequence": 4,
+     "version": "1.3.0",
+     "withdrawn_at_ns": 0
+    },
+    {
+     "approved_roles": [],
+     "build": {
+      "signer_fingerprint": "SHA256:e2e-open-meridian-release"
+     },
+     "image_digest": "sha256:353b48b2db40be02c4531d176bca350d0545dc5a843fdbfbb7073136930039ab",
+     "listed_at_ns": 1792152000000000000,
+     "listing": "open-meridian/stand-in",
+     "listing_statement": "{\"payload\":\"eyJfdHlwZSI6Imh0dHBzOi8vaW4tdG90by5pby9TdGF0ZW1lbnQvdjEiLCJwcmVkaWNhdGUiOnsiYXBwcm92ZWRfcm9sZXMiOltdLCJmbG9vciI6InYyNSIsImxpc3RlZF9hdCI6IjIwMjYtMTAtMTZUMTI6MDA6MDBaIiwibGlzdGluZyI6Im9wZW4tbWVyaWRpYW4vc3RhbmQtaW4iLCJyZWdpc3RyeSI6ImNvbW11bml0eSIsInJldmlld19pZCI6IiIsInJvbGVzIjpbImN1c3RvZHkiXSwic2lnbmVyX2tleSI6IlNIQTI1NjplMmUtb3Blbi1tZXJpZGlhbi1yZWxlYXNlIiwidmVyc2lvbiI6IjEuNC4wIn0sInByZWRpY2F0ZVR5cGUiOiJodHRwczovL29wZW4tbWVyaWRpYW4uZGV2L2F0dGVzdGF0aW9uL3BsdWdpbi1saXN0aW5nL3YxIiwic3ViamVjdCI6W3siZGlnZXN0Ijp7InNoYTI1NiI6IjM1M2I0OGIyZGI0MGJlMDJjNDUzMWQxNzZiY2EzNTBkMDU0NWRjNWE4NDNmZGJmYmI3MDczMTM2OTMwMDM5YWIifSwibmFtZSI6InBsYXRmb3JtOjg0NDMvcGx1Z2lucy94In1dfQ==\",\"payloadType\":\"application/vnd.in-toto+json\",\"signatures\":[{\"keyid\":\"e2e-platform\",\"sig\":\"MEUCIFrgHuQruSw4zjK7DgRUdt9UfxIAq/80FJQdbGK51LhjAiEA4Fxn8AZn7A8EPZLl4SBiHCNbw5AwaMBjUhb7sOvONd4=\"}]}",
+     "metadata": {
+      "declaration": {
+       "documentation": [
+        {
+         "bytes": 59,
+         "digest": "sha256:707e14aa4aa7bcc8c44da09ee270ce1c0e47350db93e3697ef2f9f7a2cf51531",
+         "name": "overview"
+        },
+        {
+         "bytes": 74,
+         "digest": "sha256:6507d2c3cff774bafa67a42fefb602a3df529beb3a0349b50148e7a58fd7b64c",
+         "name": "setup"
+        },
+        {
+         "bytes": 113,
+         "digest": "sha256:10e87cd889b9558936a4aae0fc5e34191444b0b38e0484968a04ac08152c131e",
+         "name": "troubleshooting"
+        }
+       ],
+       "not_carried": [],
+       "secret_settings": [
+        "api_key"
+       ],
+       "settings": [
+        {
+         "description": "Where the stand-in's accounts are held.",
+         "label": "Region",
+         "name": "region",
+         "type": "SETTING_TYPE_STRING"
+        }
+       ],
+       "storage": null
+      },
+      "interface": false,
+      "name": "stand-in",
+      "roles": [
+       "custody"
+      ],
+      "sdk_version": "0.29.0",
+      "version": "1.4.0"
+     },
+     "registry": "community",
+     "schema_version": "v25",
+     "sequence": 4,
+     "version": "1.4.0",
+     "withdrawn_at_ns": 0
+    },
+    {
+     "approved_roles": [],
+     "build": {
+      "signer_fingerprint": "SHA256:e2e-open-meridian-release"
+     },
+     "image_digest": "sha256:b347c9b9c14029c6232afdae56e76bad2d7102ed7502cbb7b141d068cf8f87e1",
+     "listed_at_ns": 1792152000000000000,
+     "listing": "open-meridian/stand-in",
+     "listing_statement": "{\"payload\":\"eyJfdHlwZSI6Imh0dHBzOi8vaW4tdG90by5pby9TdGF0ZW1lbnQvdjEiLCJwcmVkaWNhdGUiOnsiYXBwcm92ZWRfcm9sZXMiOltdLCJmbG9vciI6InYyNSIsImxpc3RlZF9hdCI6IjIwMjYtMTAtMTZUMTI6MDA6MDBaIiwibGlzdGluZyI6Im9wZW4tbWVyaWRpYW4vc3RhbmQtaW4iLCJyZWdpc3RyeSI6ImNvbW11bml0eSIsInJldmlld19pZCI6IiIsInJvbGVzIjpbImN1c3RvZHkiXSwic2lnbmVyX2tleSI6IlNIQTI1NjplMmUtb3Blbi1tZXJpZGlhbi1yZWxlYXNlIiwidmVyc2lvbiI6IjEuNS4wIn0sInByZWRpY2F0ZVR5cGUiOiJodHRwczovL29wZW4tbWVyaWRpYW4uZGV2L2F0dGVzdGF0aW9uL3BsdWdpbi1saXN0aW5nL3YxIiwic3ViamVjdCI6W3siZGlnZXN0Ijp7InNoYTI1NiI6ImIzNDdjOWI5YzE0MDI5YzYyMzJhZmRhZTU2ZTc2YmFkMmQ3MTAyZWQ3NTAyY2JiN2IxNDFkMDY4Y2Y4Zjg3ZTEifSwibmFtZSI6InBsYXRmb3JtOjg0NDMvcGx1Z2lucy94In1dfQ==\",\"payloadType\":\"application/vnd.in-toto+json\",\"signatures\":[{\"keyid\":\"e2e-platform\",\"sig\":\"MEUCIQD3Y4ypSIaPjsusB41D2WOPz1IyuFTRsHFa9io7+KJv1gIgL5s1tHURBDHHozSXxAmCxZD53O3CzwhjJT2izzhAQT4=\"}]}",
+     "metadata": {
+      "declaration": {
+       "documentation": [
+        {
+         "bytes": 76,
+         "digest": "sha256:44c4c63923b630e664f070f4a03b64906e7f5a312978f0fe47f0b3f93411a93b",
+         "name": "overview"
+        },
+        {
+         "bytes": 74,
+         "digest": "sha256:6507d2c3cff774bafa67a42fefb602a3df529beb3a0349b50148e7a58fd7b64c",
+         "name": "setup"
+        },
+        {
+         "bytes": 113,
+         "digest": "sha256:10e87cd889b9558936a4aae0fc5e34191444b0b38e0484968a04ac08152c131e",
+         "name": "troubleshooting"
+        }
+       ],
+       "not_carried": [],
+       "secret_settings": [
+        "api_key"
+       ],
+       "settings": [
+        {
+         "description": "Where the stand-in's accounts are held.",
+         "label": "Region",
+         "name": "region",
+         "type": "SETTING_TYPE_STRING"
+        }
+       ],
+       "storage": null
+      },
+      "interface": false,
+      "name": "stand-in",
+      "roles": [
+       "custody"
+      ],
+      "sdk_version": "0.29.0",
+      "version": "1.5.0"
+     },
+     "registry": "community",
+     "schema_version": "v25",
+     "sequence": 4,
+     "version": "1.5.0",
+     "withdrawn_at_ns": 0
+    },
+    {
+     "approved_roles": [],
+     "build": {
+      "signer_fingerprint": "SHA256:e2e-open-meridian-release"
+     },
+     "image_digest": "sha256:e14e09f4384d18af7c86bd9bbf9e658d208ac7481fa3e140cc4cebd877f6e793",
+     "listed_at_ns": 1792152000000000000,
+     "listing": "open-meridian/stand-in",
+     "listing_statement": "{\"payload\":\"eyJfdHlwZSI6Imh0dHBzOi8vaW4tdG90by5pby9TdGF0ZW1lbnQvdjEiLCJwcmVkaWNhdGUiOnsiYXBwcm92ZWRfcm9sZXMiOltdLCJmbG9vciI6InYyNSIsImxpc3RlZF9hdCI6IjIwMjYtMTAtMTZUMTI6MDA6MDBaIiwibGlzdGluZyI6Im9wZW4tbWVyaWRpYW4vc3RhbmQtaW4iLCJyZWdpc3RyeSI6ImNvbW11bml0eSIsInJldmlld19pZCI6IiIsInJvbGVzIjpbImN1c3RvZHkiXSwic2lnbmVyX2tleSI6IlNIQTI1NjplMmUtb3Blbi1tZXJpZGlhbi1yZWxlYXNlIiwidmVyc2lvbiI6IjEuNi4wIn0sInByZWRpY2F0ZVR5cGUiOiJodHRwczovL29wZW4tbWVyaWRpYW4uZGV2L2F0dGVzdGF0aW9uL3BsdWdpbi1saXN0aW5nL3YxIiwic3ViamVjdCI6W3siZGlnZXN0Ijp7InNoYTI1NiI6ImUxNGUwOWY0Mzg0ZDE4YWY3Yzg2YmQ5YmJmOWU2NThkMjA4YWM3NDgxZmEzZTE0MGNjNGNlYmQ4NzdmNmU3OTMifSwibmFtZSI6InBsYXRmb3JtOjg0NDMvcGx1Z2lucy94In1dfQ==\",\"payloadType\":\"application/vnd.in-toto+json\",\"signatures\":[{\"keyid\":\"e2e-platform\",\"sig\":\"MEYCIQDSg1yHzTX2TYIqqfHrXCPqrN80pR0B6CvsM4XYZOP0iQIhALI17zb8JCdEXsGxmoQ8mKwFZ4XQrEuJ4pJS8g540oOJ\"}]}",
+     "metadata": {
+      "declaration": {
+       "documentation": [
+        {
+         "bytes": 59,
+         "digest": "sha256:707e14aa4aa7bcc8c44da09ee270ce1c0e47350db93e3697ef2f9f7a2cf51531",
+         "name": "overview"
+        },
+        {
+         "bytes": 74,
+         "digest": "sha256:6507d2c3cff774bafa67a42fefb602a3df529beb3a0349b50148e7a58fd7b64c",
+         "name": "setup"
+        },
+        {
+         "bytes": 113,
+         "digest": "sha256:10e87cd889b9558936a4aae0fc5e34191444b0b38e0484968a04ac08152c131e",
+         "name": "troubleshooting"
+        }
+       ],
+       "not_carried": [],
+       "secret_settings": [
+        "api_key"
+       ],
+       "settings": [
+        {
+         "description": "Where the stand-in's accounts are held.",
+         "label": "Region",
+         "name": "region",
+         "type": "SETTING_TYPE_STRING"
+        }
+       ],
+       "storage": null
+      },
+      "interface": false,
+      "name": "stand-in",
+      "roles": [
+       "custody"
+      ],
+      "sdk_version": "0.29.0",
+      "version": "1.6.0"
+     },
+     "registry": "community",
+     "schema_version": "v25",
+     "sequence": 4,
+     "version": "1.6.0",
+     "withdrawn_at_ns": 0
+    }
+   ]
+  },
+  {
+   "asset_classes": [
+    "equity"
+   ],
+   "counts_shown": false,
+   "installs": 0,
+   "instances": 0,
+   "listing": "other-org/revoked",
+   "regions": [
+    "US"
+   ],
+   "repository": "https://github.com/other-org/plugin-revoked",
+   "stars": 3,
+   "support_contact": "",
+   "versions": [
+    {
+     "approved_roles": [],
+     "build": {
+      "signer_fingerprint": "SHA256:e2e-other-org-release"
+     },
+     "image_digest": "sha256:fee244acb9a548b637cf9868802b71fd7a02f53c2fbb4d2ff528f2c4d28a7043",
+     "listed_at_ns": 1792152000000000000,
+     "listing": "other-org/revoked",
+     "listing_statement": "{\"payload\":\"eyJfdHlwZSI6Imh0dHBzOi8vaW4tdG90by5pby9TdGF0ZW1lbnQvdjEiLCJwcmVkaWNhdGUiOnsiYXBwcm92ZWRfcm9sZXMiOltdLCJmbG9vciI6InYyNSIsImxpc3RlZF9hdCI6IjIwMjYtMTAtMTZUMTI6MDA6MDBaIiwibGlzdGluZyI6Im90aGVyLW9yZy9yZXZva2VkIiwicmVnaXN0cnkiOiJjb21tdW5pdHkiLCJyZXZpZXdfaWQiOiIiLCJyb2xlcyI6WyJjdXN0b2R5Il0sInNpZ25lcl9rZXkiOiJTSEEyNTY6ZTJlLW90aGVyLW9yZy1yZWxlYXNlIiwidmVyc2lvbiI6IjEuMC4wIn0sInByZWRpY2F0ZVR5cGUiOiJodHRwczovL29wZW4tbWVyaWRpYW4uZGV2L2F0dGVzdGF0aW9uL3BsdWdpbi1saXN0aW5nL3YxIiwic3ViamVjdCI6W3siZGlnZXN0Ijp7InNoYTI1NiI6ImZlZTI0NGFjYjlhNTQ4YjYzN2NmOTg2ODgwMmI3MWZkN2EwMmY1M2MyZmJiNGQyZmY1MjhmMmM0ZDI4YTcwNDMifSwibmFtZSI6InBsYXRmb3JtOjg0NDMvcGx1Z2lucy94In1dfQ==\",\"payloadType\":\"application/vnd.in-toto+json\",\"signatures\":[{\"keyid\":\"e2e-platform\",\"sig\":\"MEUCID+N9xsD72mFKyhWTukKWVrL8eha4wDhtuov6e8ANR0qAiEArAU3CbJCreSL791k5u9/rXnG3WJVcMZxpbQW/v8Yokg=\"}]}",
+     "metadata": {
+      "declaration": {
+       "documentation": [
+        {
+         "bytes": 59,
+         "digest": "sha256:707e14aa4aa7bcc8c44da09ee270ce1c0e47350db93e3697ef2f9f7a2cf51531",
+         "name": "overview"
+        },
+        {
+         "bytes": 74,
+         "digest": "sha256:6507d2c3cff774bafa67a42fefb602a3df529beb3a0349b50148e7a58fd7b64c",
+         "name": "setup"
+        },
+        {
+         "bytes": 113,
+         "digest": "sha256:10e87cd889b9558936a4aae0fc5e34191444b0b38e0484968a04ac08152c131e",
+         "name": "troubleshooting"
+        }
+       ],
+       "not_carried": [],
+       "secret_settings": [
+        "api_key"
+       ],
+       "settings": [
+        {
+         "description": "Where the stand-in's accounts are held.",
+         "label": "Region",
+         "name": "region",
+         "type": "SETTING_TYPE_STRING"
+        }
+       ],
+       "storage": null
+      },
+      "interface": false,
+      "name": "revoked",
+      "roles": [
+       "custody"
+      ],
+      "sdk_version": "0.29.0",
+      "version": "1.0.0"
+     },
+     "registry": "community",
+     "schema_version": "v25",
+     "sequence": 4,
+     "version": "1.0.0",
+     "withdrawn_at_ns": 0
+    }
+   ]
+  }
+ ],
+ "sequence": 4
+}

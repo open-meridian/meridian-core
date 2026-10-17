@@ -1775,6 +1775,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -1785,7 +1786,9 @@ name = "meridian-config"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "chacha20poly1305",
+ "hex",
  "meridian-access",
  "meridian-bus",
  "meridian-clock",
@@ -1798,6 +1801,9 @@ dependencies = [
  "r2d2",
  "r2d2_postgres",
  "rand 0.8.8",
+ "ring",
+ "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -1824,6 +1830,7 @@ dependencies = [
  "openidconnect",
  "postgres",
  "prost",
+ "pulldown-cmark",
  "r2d2",
  "r2d2_postgres",
  "rand 0.8.8",
@@ -1845,6 +1852,7 @@ version = "0.1.0"
 dependencies = [
  "meridian-pb",
  "prost",
+ "serde",
  "serde_json",
 ]
 
@@ -1910,7 +1918,7 @@ dependencies = [
 [[package]]
 name = "meridian-pb"
 version = "0.1.0"
-source = "git+https://github.com/open-meridian/meridian-schema.git?rev=a6a0af70a38eae19a12bc551d5aeb8514eb587b4#a6a0af70a38eae19a12bc551d5aeb8514eb587b4"
+source = "git+https://github.com/open-meridian/meridian-schema.git?rev=3983435ba7672df58a61a57644fd59ee070de474#3983435ba7672df58a61a57644fd59ee070de474"
 dependencies = [
  "prost",
  "tonic",
@@ -2135,7 +2143,7 @@ version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
 dependencies = [
- "base64 0.21.7",
+ "base64 0.22.1",
  "chrono",
  "getrandom 0.2.17",
  "http",
@@ -2522,6 +2530,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "pulldown-cmark"
+version = "0.13.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9f068eba8e7071c5f9511831b44f32c740d5adf574e990f946ddb53db2f314e"
+dependencies = [
+ "bitflags 2.13.2",
+ "memchr",
+ "unicase",
 ]
 
 [[package]]
@@ -3758,6 +3777,12 @@ name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
+
+[[package]]
+name = "unicase"
+version = "2.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "357cc3acc6a036009fd6c973ed009037c732d60d0b4f6c673e9041497482a28f"
 
 [[package]]
 name = "unicode-bidi"

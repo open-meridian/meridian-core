@@ -791,7 +791,7 @@ pub fn follow_replacements(
     bus: Arc<Bus>,
     store: Arc<dyn Store>,
 ) -> impl std::future::Future<Output = ()> {
-    let mut replaced = bus.subscribe(INSTRUMENT_REPLACED);
+    let mut replaced = bus.subscribe_shared(INSTRUMENT_REPLACED, "follow-replacements");
     async move {
         while let Some(delivery) = replaced.recv().await {
             match follow_one(&bus, &store, delivery).await {

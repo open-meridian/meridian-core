@@ -263,7 +263,7 @@ async fn a_close_is_recorded_heard_restated_and_read_as_of_before_its_restatemen
     let h = harness();
     let mut heard = h
         .bus
-        .subscribe("platform.lake.coinbase-1:daily.event.prices-recorded");
+        .subscribe_every("platform.lake.coinbase-1:daily.event.prices-recorded");
     let first = record(
         &h,
         "coinbase-1",
@@ -466,7 +466,7 @@ async fn a_reader_not_entitled_is_refused_per_dataset_and_a_field_it_may_not_rea
 #[tokio::test(flavor = "multi_thread")]
 async fn a_read_not_answered_is_wanted_once_for_two_readers_answered_and_a_decline_is_said() {
     let h = harness();
-    let mut wanted = h.bus.subscribe(service::OBSERVATIONS_WANTED);
+    let mut wanted = h.bus.subscribe_every(service::OBSERVATIONS_WANTED);
     let first = read(
         &h,
         "reporting-1",
@@ -586,7 +586,7 @@ const LOCAL: &str = "LCL-01J8LOCAL0000000000000000";
 #[tokio::test(flavor = "multi_thread")]
 async fn a_local_lines_subject_is_never_wanted() {
     let h = harness();
-    let mut wanted = h.bus.subscribe(service::OBSERVATIONS_WANTED);
+    let mut wanted = h.bus.subscribe_every(service::OBSERVATIONS_WANTED);
     read(
         &h,
         "reporting-1",
@@ -621,8 +621,8 @@ async fn a_standing_want_no_reader_asks_within_its_cadence_is_withdrawn() {
     let mut c = configuration(true, &[]);
     c.datasets[0].declaration.as_mut().unwrap().cadence = 60;
     h.lake.configured(&c);
-    let mut wanted = h.bus.subscribe(service::OBSERVATIONS_WANTED);
-    let mut withdrawn = h.bus.subscribe(service::WANT_WITHDRAWN);
+    let mut wanted = h.bus.subscribe_every(service::OBSERVATIONS_WANTED);
+    let mut withdrawn = h.bus.subscribe_every(service::WANT_WITHDRAWN);
     read(&h, "reporting-1", &[BTC], "", SourceChoice::default(), 0);
     let want = ObservationsWantedEvent::decode(&wanted.recv().await.unwrap().envelope.payload[..])
         .unwrap();
@@ -648,7 +648,7 @@ async fn a_dataset_not_kept_is_served_and_only_that_it_was_served_is_kept() {
     h.lake.configured(&configuration(false, &[]));
     let mut heard = h
         .bus
-        .subscribe("platform.lake.coinbase-1:daily.event.prices-recorded");
+        .subscribe_every("platform.lake.coinbase-1:daily.event.prices-recorded");
     let done = record(
         &h,
         "coinbase-1",
@@ -1115,7 +1115,7 @@ async fn trades_are_heard_every_one_and_a_loss_is_caught_up_by_watermark_late_pr
     h.lake.configured(&live_configuration());
     let mut heard = h
         .bus
-        .subscribe("platform.lake.coinbase-1:live.event.trades-recorded");
+        .subscribe_every("platform.lake.coinbase-1:live.event.trades-recorded");
     let first = record_rows(
         &h,
         "trades",
@@ -1365,7 +1365,7 @@ async fn the_latest_is_chosen_per_asset_for_prices_and_quotes() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_decline_stands_for_the_date_asked_only_and_a_streamed_latest_is_standing() {
     let h = harness();
-    let mut wanted = h.bus.subscribe(service::OBSERVATIONS_WANTED);
+    let mut wanted = h.bus.subscribe_every(service::OBSERVATIONS_WANTED);
     read(
         &h,
         "reporting-1",
@@ -1430,7 +1430,7 @@ async fn a_standing_want_is_delivered_again_under_its_id_so_a_restarted_data_plu
     // want already hears what it holds.
     let h = harness();
     h.lake.configured(&live_configuration());
-    let mut wanted = h.bus.subscribe(service::OBSERVATIONS_WANTED);
+    let mut wanted = h.bus.subscribe_every(service::OBSERVATIONS_WANTED);
     live_read(&h, DataType::Quote, (0, 0), 0, None).unwrap();
     let first = ObservationsWantedEvent::decode(&wanted.recv().await.unwrap().envelope.payload[..])
         .unwrap();
@@ -1571,7 +1571,7 @@ async fn an_outcome_is_restated_per_stage_every_version_heard_and_read_as_of_or_
     h.lake.configured(&outcomes_configuration());
     let mut heard = h
         .bus
-        .subscribe("platform.lake.kalshi-1:outcomes.event.outcomes-recorded");
+        .subscribe_every("platform.lake.kalshi-1:outcomes.event.outcomes-recorded");
     // Determined; then disputed and restated as version 2; then final.
     let first = record_outcomes(&h, vec![outcome(NOW, S::Determined, D::Pays, "1.00")]).unwrap();
     assert_eq!(first.recorded, 1);

@@ -422,6 +422,7 @@ impl Sidecar {
         payload_type: &str,
         message: D,
     ) -> Result<Response<plugin::Published>, Status> {
+        self.daily.operation(self.clock.now_ns());
         let topic = self.own_topic(topic);
         self.granted(&topic)?;
         let message = self.kept_at_the_edge(payload_type, message)?;
@@ -464,6 +465,7 @@ impl Sidecar {
         account: Option<String>,
         acting_for: Option<CallerAssertion>,
     ) -> Result<Response<R>, Status> {
+        self.daily.operation(self.clock.now_ns());
         let topic = self.own_topic(topic);
         self.granted(&topic)?;
         let message = self.kept_at_the_edge(payload_type, message)?;
@@ -545,6 +547,7 @@ impl Sidecar {
         account: Option<String>,
         acting_for: Option<CallerAssertion>,
     ) -> Result<Response<R>, Status> {
+        self.daily.operation(self.clock.now_ns());
         let topic = self.own_topic(topic);
         self.granted(&topic)?;
         let message = self.kept_at_the_edge(payload_type, message)?;

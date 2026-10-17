@@ -823,6 +823,16 @@ pub fn record_break(
             "a break records each differing field with both values".into(),
         ));
     }
+    // An unrecognized security's identifiers ride in their own field from
+    // contract v25 (W9.3), and on no other category.
+    if !unrecognized && !request.unresolved_identifiers.is_empty() {
+        return Err(StoreError::Malformed {
+            fields: vec!["unresolved_identifiers".into()],
+            words: "only an unrecognized security's break carries the identifiers the custodian \
+                    states"
+                .into(),
+        });
+    }
     for (index, cause) in request.candidate_causes.iter().enumerate() {
         check_cause(&format!("candidate_causes[{index}]"), cause)?;
     }
@@ -834,7 +844,10 @@ pub fn record_break(
     // value in any order; never by the statement or any per-statement field
     // (the product owner, 2026-10-15).
     let stated = if unrecognized {
-        Some(stated_identifiers(&request.differences)?)
+        Some(identifiers_stated(
+            &request.unresolved_identifiers,
+            &request.differences,
+        )?)
     } else {
         None
     };
@@ -846,10 +859,36 @@ pub fn record_break(
                 held.state == BreakState::Open as i32
                     && held.category == request.category
                     && held.subject.is_none()
-                    && stated_identifiers(&held.differences).ok().as_ref() == Some(stated)
+                    && identifiers_stated(&held.unresolved_identifiers, &held.differences)
+                        .ok()
+                        .as_ref()
+                        == Some(stated)
             })
         })
         .map(|held| held.break_id.clone());
+    // Kept on the break in their own field (contract v25): as sent, or, from
+    // a plugin built before v25, as its street-only differences named them.
+    let unresolved_identifiers: Vec<meridian_domain::v1::Identifier> = match &stated {
+        None => Vec::new(),
+        Some(_) if !request.unresolved_identifiers.is_empty() => request
+            .unresolved_identifiers
+            .iter()
+            .map(|identifier| meridian_domain::v1::Identifier {
+                scheme: identifier.scheme.trim().to_string(),
+                value: identifier.value.trim().to_string(),
+                source: identifier.source.trim().to_string(),
+                ..Default::default()
+            })
+            .collect(),
+        Some(stated) => stated
+            .iter()
+            .map(|(scheme, value)| meridian_domain::v1::Identifier {
+                scheme: scheme.clone(),
+                value: value.clone(),
+                ..Default::default()
+            })
+            .collect(),
+    };
     let break_id = matched.unwrap_or_else(|| request.break_id.clone());
     let record = if break_id.is_empty() {
         Break {
@@ -865,6 +904,7 @@ pub fn record_break(
             state: BreakState::Open as i32,
             candidate_causes: request.candidate_causes.clone(),
             recorded_by: Some(ctx.actor()),
+            unresolved_identifiers: unresolved_identifiers.clone(),
             ..Default::default()
         }
     } else {
@@ -881,6 +921,11 @@ pub fn record_break(
             street: request.street.clone(),
             last_seen_date: request.business_date.clone(),
             candidate_causes: request.candidate_causes.clone(),
+            unresolved_identifiers: if unresolved_identifiers.is_empty() {
+                held.unresolved_identifiers.clone()
+            } else {
+                unresolved_identifiers.clone()
+            },
             ..held.clone()
         }
     };
@@ -2003,6 +2048,31 @@ pub fn instruments_named(lines: &[MovementLine], positions: &[OpeningPosition]) 
             .map(|position| position.instrument_id.clone()),
     );
     named.into_iter().filter(|id| !id.is_empty()).collect()
+}
+
+/// The identifiers an unrecognized security's custodian states, as its match
+/// key: from contract v25 in their own field (`unresolved_identifiers`, W9.3,
+/// at least one, each with its scheme and value), and from a plugin built
+/// before, or a break recorded before, as its street-only differences.
+fn identifiers_stated(
+    field: &[meridian_domain::v1::Identifier],
+    differences: &[BreakDifference],
+) -> Result<BTreeSet<(String, String)>> {
+    if field.is_empty() {
+        return stated_identifiers(differences);
+    }
+    let mut stated = BTreeSet::new();
+    for (index, identifier) in field.iter().enumerate() {
+        let (scheme, value) = (identifier.scheme.trim(), identifier.value.trim());
+        if scheme.is_empty() || value.is_empty() {
+            return Err(StoreError::Malformed {
+                fields: vec![format!("unresolved_identifiers[{index}]")],
+                words: "an identifier names its scheme and its value".into(),
+            });
+        }
+        stated.insert((scheme.to_string(), value.to_string()));
+    }
+    Ok(stated)
 }
 
 /// The identifiers an unrecognized security's custodian states (W9.3: "the

@@ -1,6 +1,8 @@
-//! A version's declaration (W8.1, W4.8, contract v11): as the CLI sends it
-//! with an upload, as the catalogue lists it, and as a plugin's Summary
-//! draws it beside the names not carried it saw.
+//! A version's declaration (W8.1, W4.8, contract v11): as the SDK prints it
+//! and the CLI sends it with an upload, as the catalogue lists it, and as a
+//! harness's sidecar reads it from a file to hold registration to it (W4.1,
+//! contract v25). The dashboard draws it on the Documentation tab's
+//! Reference.
 //!
 //! What a version still declares beside its roles
 //! (spec/vendor-differences-have-a-place-in-the-contract, requirements 16, 19
@@ -10,11 +12,8 @@
 
 use meridian_pb::v1::{
     AlgorithmDeclaration, Catalogue, DatasetDeclaration, DatasetLicence, NotCarried,
-    NotCarriedReason, NotCarriedSeen, ObservationMode, PluginDeclaration, RawRecordKind,
-    StorageDeclaration,
+    NotCarriedReason, ObservationMode, PluginDeclaration, RawRecordKind, StorageDeclaration,
 };
-
-use crate::html::escape;
 
 /// The declaration as the CLI sends it, in JSON.
 #[derive(Debug, Default, Clone, serde::Deserialize, serde::Serialize)]
@@ -33,6 +32,39 @@ pub struct Declared {
     /// contract v22): absent from a version declaring none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub algorithms: Vec<DeclaredAlgorithm>,
+    /// An operations plugin's affirmation deadline, minutes after midnight
+    /// in the deployment's time zone (W11.34, contract v25): absent or 0
+    /// from a version declaring none.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub affirmation_deadline: u32,
+    /// From contract v25 (W8.1) what registration sends, as protobuf's JSON
+    /// of its messages ([`crate::protojson`]): every setting, the interface
+    /// and its tools, and whether it reads external accounts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub settings: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reads_external_accounts: bool,
+    /// Each section of the vendor's documentation, by its fixed name, its
+    /// digest and its size (contract v25); the texts travel beside it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub documentation: Vec<DeclaredSection>,
+}
+
+/// One section of the vendor's documentation as an upload's declaration
+/// names it (W8.1, contract v25).
+#[derive(Debug, Default, Clone, serde::Deserialize, serde::Serialize)]
+pub struct DeclaredSection {
+    pub name: String,
+    pub digest: String,
+    pub bytes: u64,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 /// One algorithm identifier as an upload carries it (contract v22).
@@ -210,6 +242,38 @@ pub fn from_json(declared: &Declared) -> Result<PluginDeclaration, String> {
                 description: algorithm.description.clone(),
             })
             .collect(),
+        affirmation_deadline: declared.affirmation_deadline,
+        // Contract v25 (W8.1): the whole of what registration sends, and the
+        // documentation's sections by digest.
+        settings: declared
+            .settings
+            .iter()
+            .enumerate()
+            .map(|(n, setting)| {
+                crate::protojson::setting_from(setting, &format!("declaration.settings[{n}]"))
+            })
+            .collect::<Result<_, _>>()?,
+        interface: declared
+            .interface
+            .as_ref()
+            .map(|interface| crate::protojson::interface_from(interface, "declaration.interface"))
+            .transpose()?,
+        tools: declared
+            .tools
+            .iter()
+            .enumerate()
+            .map(|(n, tool)| crate::protojson::tool_from(tool, &format!("declaration.tools[{n}]")))
+            .collect::<Result<_, _>>()?,
+        reads_external_accounts: declared.reads_external_accounts,
+        documentation: declared
+            .documentation
+            .iter()
+            .map(|section| meridian_pb::v1::DocumentationSection {
+                name: section.name.clone(),
+                digest: section.digest.clone(),
+                bytes: section.bytes,
+            })
+            .collect(),
     })
 }
 
@@ -303,6 +367,19 @@ pub fn to_json(declaration: &PluginDeclaration) -> serde_json::Value {
             "algorithm_id": algorithm.algorithm_id,
             "description": algorithm.description,
         })).collect::<Vec<_>>(),
+        // Contract v25 (W11.34): minutes after midnight, 0 for none.
+        "affirmation_deadline": declaration.affirmation_deadline,
+        // Contract v25 (W8.1): what registration sends, as protobuf's JSON,
+        // and the documentation's sections by digest.
+        "settings": declaration.settings.iter().map(crate::protojson::setting_json).collect::<Vec<_>>(),
+        "interface": declaration.interface.as_ref().map(crate::protojson::interface_json),
+        "tools": declaration.tools.iter().map(crate::protojson::tool_json).collect::<Vec<_>>(),
+        "reads_external_accounts": declaration.reads_external_accounts,
+        "documentation": declaration.documentation.iter().map(|section| serde_json::json!({
+            "name": section.name,
+            "digest": section.digest,
+            "bytes": section.bytes,
+        })).collect::<Vec<_>>(),
     })
 }
 
@@ -312,93 +389,6 @@ fn reason_words(reason: i32) -> &'static str {
         Ok(NotCarriedReason::NotConverted) => "not_converted",
         _ => "",
     }
-}
-
-/// The declaration on a plugin's Summary, with how often each name not
-/// carried was seen: a section of its own, or nothing from a plugin before
-/// v11.
-pub fn summary(declaration: Option<&PluginDeclaration>, seen: &[NotCarriedSeen]) -> String {
-    let Some(declaration) = declaration else {
-        return String::new();
-    };
-    let secrets = if declaration.secret_settings.is_empty() {
-        "none".to_string()
-    } else {
-        declaration
-            .secret_settings
-            .iter()
-            .map(|name| escape(name))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    let storage = match &declaration.storage {
-        None => "none".to_string(),
-        Some(storage) if storage.record_kinds.is_empty() => format!(
-            "its own, for its raw records, kept {} days",
-            storage.retention_days
-        ),
-        // Each kind's window and what is kept of it are drawn in the
-        // records panel (contract v16).
-        Some(storage) => format!(
-            "its own, for {} kinds of raw record, each kept for its window",
-            storage.record_kinds.len()
-        ),
-    };
-    let rows: String = declaration
-        .not_carried
-        .iter()
-        .map(|held| {
-            let count = seen
-                .iter()
-                .find(|seen| seen.scheme == held.scheme && seen.name == held.name)
-                .map(|seen| seen.count)
-                .unwrap_or(0);
-            let why = match NotCarriedReason::try_from(held.reason) {
-                Ok(NotCarriedReason::NoContractMeaning) => "no meaning in the contract yet",
-                Ok(NotCarriedReason::NotConverted) => "not yet converted",
-                _ => "",
-            };
-            format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{why}</td><td>{count}</td></tr>",
-                escape(&held.role),
-                escape(&held.scheme),
-                escape(&held.name),
-            )
-        })
-        .collect();
-    let table = if rows.is_empty() {
-        "<p class=\"hint\">It declares nothing it receives and does not carry.</p>".to_string()
-    } else {
-        format!(
-            "<table class=\"list one-line\"><thead><tr><th>Role</th><th>Scheme</th><th>Name</th>\
-             <th>Why</th><th>Seen</th></tr></thead><tbody>{rows}</tbody></table>"
-        )
-    };
-    // The algorithms its autonomous work may name (contract v22), each by
-    // its identifier with what it is; plain text, escaped.
-    let algorithms = if declaration.algorithms.is_empty() {
-        "none".to_string()
-    } else {
-        declaration
-            .algorithms
-            .iter()
-            .map(|algorithm| {
-                format!(
-                    "{} ({})",
-                    escape(&algorithm.algorithm_id),
-                    escape(&algorithm.description)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    format!(
-        "<section class=\"admin-section\"><div class=\"section-head\"><div><h2>What it declares</h2>\
-         <p class=\"hint\">Its secret settings: {secrets}. Its storage: {storage}. The algorithms \
-         its autonomous work may name: {algorithms}. What it receives \
-         and does not carry, by name only, with how often it saw each since it started; the \
-         counts stay in this deployment.</p></div></div>{table}</section>"
-    )
 }
 
 #[cfg(test)]
@@ -461,40 +451,5 @@ mod tests {
         assert!(from_json(&bad)
             .unwrap_err()
             .contains("catalogue.datasets[0].modes[0]"));
-    }
-
-    #[test]
-    fn the_summary_draws_names_and_counts_never_a_value() {
-        let declaration = PluginDeclaration {
-            secret_settings: vec!["consumer_key".into()],
-            not_carried: vec![NotCarried {
-                role: "custody".into(),
-                scheme: "snaptrade:position".into(),
-                name: "open_pnl".into(),
-                reason: NotCarriedReason::NoContractMeaning as i32,
-            }],
-            storage: Some(StorageDeclaration {
-                retention_days: 30,
-                ..Default::default()
-            }),
-            catalogue: None,
-            algorithms: vec![AlgorithmDeclaration {
-                algorithm_id: "rebalance-drift".into(),
-                description: "Rebalances <a> sleeve past its drift band".into(),
-            }],
-        };
-        let seen = [NotCarriedSeen {
-            scheme: "snaptrade:position".into(),
-            name: "open_pnl".into(),
-            count: 42,
-        }];
-        let page = summary(Some(&declaration), &seen);
-        assert!(
-            page.contains("consumer_key") && page.contains("open_pnl") && page.contains(">42<")
-        );
-        assert!(page.contains("kept 30 days"));
-        // An algorithm by its identifier and description, escaped.
-        assert!(page.contains("rebalance-drift (Rebalances &lt;a&gt; sleeve past its drift band)"));
-        assert_eq!(summary(None, &seen), "");
     }
 }

@@ -23,6 +23,22 @@ use prost::Message;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// A rebuild is the whole book's, every account's (W9.10): it clears every
+/// projection and snapshot and makes them again at its own store's snapshot
+/// interval. These tests share one database and run at once, so a rebuild
+/// by a store at the default interval (1,000) clears the snapshots the
+/// snapshot test's store (every 3) made for its account, and makes none
+/// again for its 12 entries -- the test then found none (`RowCount`, or 0
+/// kept). In a deployment one bor rebuilds, at one interval. The snapshot
+/// test holds this for its whole run, and every other rebuild takes it.
+static REBUILDS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// A rebuild made while no snapshot test is running.
+async fn rebuild(store: &Arc<PostgresStore>) -> usize {
+    let _alone = REBUILDS.lock().await;
+    blocking(|| store.rebuild()).unwrap()
+}
+
 const PERSON: &str = "https://directory.example.org|8812";
 
 fn unique(tag: &str) -> String {
@@ -59,12 +75,15 @@ fn blocking<T>(f: impl FnOnce() -> T) -> T {
 }
 
 fn wired() -> (Arc<Bus>, Arc<PostgresStore>) {
+    wired_with(blocking(store))
+}
+
+fn wired_with(store: Arc<PostgresStore>) -> (Arc<Bus>, Arc<PostgresStore>) {
     let bus = Arc::new(Bus::single(
         "operations-test-1",
         Arc::new(MemoryBackend::new()),
         Arc::new(meridian_clock::SystemClock),
     ));
-    let store = blocking(store);
     serve(bus.clone(), store.clone(), bus.clock());
     // An instrument store whose every record names an equity in US dollars:
     // from contract v10 the book requires each instrument's asset class and
@@ -406,7 +425,7 @@ async fn a_rebuild_reproduces_every_projection() {
     };
     let (before_positions, before_breaks) = blocking(|| (positions(&store), breaks(&store)));
     assert_eq!(read(&before_positions[0].trade_date_quantity), "15.0");
-    blocking(|| store.rebuild().unwrap());
+    rebuild(&store).await;
     assert_eq!(blocking(|| positions(&store)), before_positions);
     assert_eq!(blocking(|| breaks(&store)), before_breaks);
 
@@ -768,7 +787,7 @@ async fn an_order_reaches_its_fill_through_postgres_and_a_rebuild_reproduces_its
         (aapl.sleeve.as_str(), read(&aapl.trade_date_quantity)),
         ("core", "10".into())
     );
-    blocking(|| store.rebuild().unwrap());
+    rebuild(&store).await;
     let after = blocking(|| orders(&store));
     assert_eq!(before.orders, after.orders);
     assert_eq!(before.placements, after.placements);
@@ -1013,6 +1032,122 @@ async fn unmatched_fills_are_found_by_id_listed_by_state_and_rebuilt() {
         );
     };
     blocking(|| check(&store));
-    blocking(|| store.rebuild().unwrap());
+    rebuild(&store).await;
     blocking(|| check(&store));
+}
+
+/// Contract v25 (W9.10): every so many entries the book keeps the account's
+/// projection, a command and a dated read start from the latest and replay
+/// the tail, answering exactly what a full replay does; a snapshot that does
+/// not read is passed over; the latest few are kept; a rebuild makes them
+/// again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_snapshot_and_its_tail_answer_as_the_whole_journal_does() {
+    // No other test's rebuild while this one counts its snapshots.
+    let _alone = REBUILDS.lock().await;
+    let store = blocking(|| {
+        let store = PostgresStore::connect(&url(), 8)
+            .expect("could not reach the test database")
+            .with_snapshot_interval(3);
+        store.migrate(&meridian_clock::SystemClock).unwrap();
+        Arc::new(store)
+    });
+    let (bus, store) = wired_with(store);
+    let account = unique("ACC");
+    open(&bus, &account, "INS-AAPL").await;
+    let mut watermarks = Vec::new();
+    for day in 9..=19 {
+        let reply = BookEntryReply::decode(
+            &send(
+                &bus,
+                RECORD_BREAK,
+                &RecordBreakRequest {
+                    account_id: account.clone(),
+                    subject: Some(record_break_request::Subject::Position(PositionKey {
+                        instrument_id: "INS-AAPL".into(),
+                        side: HoldingSide::Long as i32,
+                    })),
+                    category: BreakCategory::TradeDateQuantity as i32,
+                    differences: vec![BreakDifference {
+                        field: "trade_date_quantity".into(),
+                        book: None,
+                        street: None,
+                    }],
+                    business_date: format!("2026-09-{day:02}"),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap()[..],
+        )
+        .unwrap();
+        watermarks.push(reply.journal.unwrap().sequence);
+    }
+    let client = || postgres::Client::connect(&url(), postgres::NoTls).unwrap();
+    let kept: i64 = blocking(|| {
+        client()
+            .query_one(
+                "SELECT count(*) FROM book_snapshot WHERE account_id = $1",
+                &[&account],
+            )
+            .unwrap()
+            .get(0)
+    });
+    assert!(
+        (1..=meridian_bor::snapshot::KEPT as i64).contains(&kept),
+        "{kept} kept"
+    );
+    let journal = blocking(|| store.journal(&account)).unwrap();
+    assert_eq!(journal.len(), 12);
+    // The book's health (ruling 155): the journal, the tail since the last
+    // snapshot, and when it was taken.
+    let health = blocking(|| store.book_health(Some(&account), "", 10)).unwrap();
+    assert_eq!(health.len(), 1);
+    assert_eq!(health[0].journal_entries, 12);
+    assert!(health[0].entries_since_snapshot < 3, "{health:?}");
+    assert!(health[0].last_snapshot_at_ns > 0);
+    let whole = meridian_bor::Book::replay(&account, &journal[0].partition, &journal).unwrap();
+    assert_eq!(blocking(|| store.book(&account)).unwrap(), whole);
+    // A dated read at each watermark, from a snapshot where one fits.
+    let partition = journal[0].partition.clone();
+    for (n, watermark) in watermarks.iter().enumerate() {
+        let at: meridian_bor::store::Mark = [(partition.clone(), *watermark)].into_iter().collect();
+        let date = format!("2026-09-{:02}", 9 + n);
+        let read = blocking(|| store.book_as_of(&account, &at, Some(&date))).unwrap();
+        let replayed = meridian_bor::Book::as_of(
+            &account,
+            &partition,
+            &journal,
+            Some(*watermark),
+            Some(&date),
+        )
+        .unwrap();
+        assert_eq!(read, replayed, "at {watermark}, {date}");
+    }
+    // A snapshot that does not read is passed over, and the book stands.
+    blocking(|| {
+        client()
+            .execute(
+                "UPDATE book_snapshot SET snapshot = 'not a snapshot' WHERE account_id = $1",
+                &[&account],
+            )
+            .unwrap()
+    });
+    assert_eq!(blocking(|| store.book(&account)).unwrap(), whole);
+    // A rebuild makes them again from the journal.
+    blocking(|| store.rebuild()).unwrap();
+    let rebuilt: Vec<u8> = blocking(|| {
+        client()
+            .query_one(
+                "SELECT snapshot FROM book_snapshot WHERE account_id = $1
+                  ORDER BY last_sequence DESC LIMIT 1",
+                &[&account],
+            )
+            .unwrap()
+            .get(0)
+    });
+    assert_eq!(meridian_bor::snapshot::decode(&rebuilt).unwrap(), whole);
+    let health = blocking(|| store.book_health(Some(&account), "", 10)).unwrap();
+    assert_eq!(health[0].entries_since_snapshot, 0, "{health:?}");
 }

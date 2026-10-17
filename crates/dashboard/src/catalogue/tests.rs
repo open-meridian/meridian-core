@@ -150,6 +150,37 @@ fn conductor(bus: &Bus) {
         if metadata.roles.iter().any(|r| r == "dashboard") {
             return Err("`dashboard` is one of the deployment's own components".into());
         }
+        // A plugin bundle (W8.14): its listing, source registry, key status
+        // and listing statement carried whole for the conductor to verify.
+        if !request.listing.is_empty() {
+            let status: serde_json::Value =
+                serde_json::from_str(&request.key_status).unwrap_or_default();
+            if request.listing != "open-meridian/snaptrade"
+                || request.source_registry != "community"
+                || status["issued_at_ns"] != 1_792_000_000_000_000_000i64
+                || request.listing_statement != "{\"payloadType\":\"x\"}"
+            {
+                return Err(format!("the bundle not carried whole: {request:?}"));
+            }
+        }
+        // Contract v25: the SDK's declaration read whole, and the texts
+        // carried beside it for the conductor to hold to its digests.
+        if metadata.version == "0.5.0" {
+            let declaration = metadata.declaration.clone().unwrap_or_default();
+            let carried = declaration.settings.len() == 1
+                && declaration.settings[0].name == "region"
+                && declaration.interface.as_ref().map(|i| i.loopback_port) == Some(8000)
+                && declaration.tools.len() == 1
+                && declaration.reads_external_accounts
+                && declaration.documentation.len() == 1
+                && declaration.documentation[0].bytes == 5
+                && request.documentation.len() == 1
+                && request.documentation[0].section == "overview"
+                && request.documentation[0].markdown == "# Hi\n";
+            if !carried {
+                return Err(format!("not carried whole: {request:?}"));
+            }
+        }
         Ok((
             "meridian.v1.PluginVersion".into(),
             PluginVersion {
@@ -157,6 +188,8 @@ fn conductor(bus: &Bus) {
                 image_digest: request.image_digest,
                 uploaded_by: envelope.meta.unwrap_or_default().acting_for_subject,
                 uploaded_at_ns: T0,
+                source_registry: "local".into(),
+                ..Default::default()
             }
             .encode_to_vec(),
         ))
@@ -314,6 +347,53 @@ async fn only_a_deployment_admins_terminal_session_is_admitted() {
         h.reached.lock().unwrap().is_empty(),
         "nothing reached the registry"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_books_health_is_read_from_a_deployment_admins_terminal() {
+    // ReadBookHealthFromTerminal (contract v25; ruling 155): what `meridian
+    // status` reads, every page, a deployment admin's alone.
+    let h = harness().await;
+    h.app.bus.serve(READ_BOOK_HEALTH, |envelope| {
+        stamped(&envelope)?;
+        let asked =
+            meridian_domain::v1::ReadBookHealthRequest::decode(&envelope.payload[..]).unwrap();
+        let (accounts, next_cursor) = if asked.cursor.is_empty() {
+            (vec!["ACC-1"], "ACC-1")
+        } else {
+            (vec!["ACC-2"], "")
+        };
+        Ok((
+            "".into(),
+            meridian_domain::v1::ReadBookHealthReply {
+                accounts: accounts
+                    .into_iter()
+                    .map(|account| meridian_domain::v1::AccountBookHealth {
+                        account_id: account.into(),
+                        journal_entries: 2_400,
+                        entries_since_snapshot: 400,
+                        last_snapshot_at_ns: T0,
+                    })
+                    .collect(),
+                next_cursor: next_cursor.into(),
+            }
+            .encode_to_vec(),
+        ))
+    });
+    assert_eq!(
+        send(&h, "GET", "/terminal/book-health", Some(&h.bob), "")
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    let (status, _, body) = send(&h, "GET", "/terminal/book-health", Some(&h.ada), "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let read: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let accounts = read["accounts"].as_array().unwrap();
+    assert_eq!(accounts.len(), 2, "every page: {body}");
+    assert_eq!(accounts[1]["account_id"], "ACC-2");
+    assert_eq!(accounts[0]["entries_since_snapshot"], 400);
+    assert_eq!(accounts[0]["last_snapshot_at_ns"], T0.to_string());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -510,6 +590,64 @@ async fn an_upload_is_recorded_for_the_admin_once_its_image_is_there() {
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // Contract v25: the declaration as the SDK prints it (protobuf's JSON
+    // for its settings, interface and tools) and the texts from its docs/.
+    let mut documented: serde_json::Value =
+        serde_json::from_str(&upload_body("0.5.0", DIGEST, &["custody"])).unwrap();
+    documented["declaration"] = serde_json::json!({
+        "secret_settings": [],
+        "settings": [{"name": "region", "label": "Region", "type": "SETTING_TYPE_STRING"}],
+        "interface": {"loopback_port": 8000, "title": "SnapTrade",
+                      "pages": [{"path": "/admin/connections", "title": "Connections",
+                                 "levels": ["ACCESS_LEVEL_ADMIN"]}]},
+        "tools": [{"name": "read_connections", "title": "Read the connections",
+                   "description": "Each connection.", "method": "GET",
+                   "path": "/admin/connections", "levels": ["ACCESS_LEVEL_ADMIN"],
+                   "reads": true}],
+        "reads_external_accounts": true,
+        "documentation": [{"name": "overview",
+            "digest": format!("sha256:{}", "c".repeat(64)), "bytes": 5}],
+    });
+    documented["documentation"] =
+        serde_json::json!([{"section": "overview", "markdown": "# Hi\n"}]);
+    let (status, _, body) = send(
+        &h,
+        "POST",
+        "/terminal/plugins",
+        Some(&h.ada),
+        &documented.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    // Ruling 176: a false claim in a section refuses the upload, naming it.
+    let mut claiming = documented.clone();
+    claiming["documentation"] =
+        serde_json::json!([{"section": "overview", "markdown": "Endorsed by Open Meridian."}]);
+    let (status, _, body) = send(
+        &h,
+        "POST",
+        "/terminal/plugins",
+        Some(&h.ada),
+        &claiming.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body.contains("documentation.overview") && body.contains("claims endorsement"),
+        "{body}"
+    );
+    // A text naming a field the CLI never sends is refused, not dropped.
+    documented["documentation"][0]["html"] = serde_json::json!("<p>Hi</p>");
+    let (status, _, body) = send(
+        &h,
+        "POST",
+        "/terminal/plugins",
+        Some(&h.ada),
+        &documented.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -586,5 +724,113 @@ fn a_blob_is_mounted_from_another_plugins_repository_alone() {
         "from=",
     ] {
         assert!(!mounts_from_a_plugin(Some(refused)), "{refused}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bundle_is_pushed_into_its_listing_s_repository_and_carried_whole() {
+    let h = harness().await;
+    // The image and its referrers, into plugins/{organisation}/{plugin}.
+    let base = "/terminal/registry/v2/plugins/open-meridian/snaptrade";
+    for (method, path, status) in [
+        ("HEAD", format!("{base}/blobs/{DIGEST}"), StatusCode::OK),
+        (
+            "POST",
+            format!("{base}/blobs/uploads/"),
+            StatusCode::ACCEPTED,
+        ),
+        (
+            "PATCH",
+            format!("{base}/blobs/uploads/u-1?_state=s"),
+            StatusCode::ACCEPTED,
+        ),
+        (
+            "PUT",
+            format!("{base}/manifests/1.4.0"),
+            StatusCode::CREATED,
+        ),
+        (
+            "PUT",
+            format!("{base}/manifests/sha256-{}", "3f".repeat(32)),
+            StatusCode::CREATED,
+        ),
+        (
+            "GET",
+            format!("{base}/manifests/1.4.0"),
+            StatusCode::METHOD_NOT_ALLOWED,
+        ),
+        (
+            "PUT",
+            format!("{base}/x/manifests/1.4.0"),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            "PUT",
+            format!("{base}/Snap_Trade/manifests/1"),
+            StatusCode::NOT_FOUND,
+        ),
+    ] {
+        assert_eq!(
+            send(&h, method, &path, Some(&h.ada), "").await.0,
+            status,
+            "{method} {path}"
+        );
+    }
+    {
+        let reached = h.reached.lock().unwrap();
+        assert_eq!(reached.len(), 5);
+        assert_eq!(
+            reached[0].1,
+            format!("/v2/plugins/open-meridian/snaptrade/blobs/{DIGEST}")
+        );
+        assert_eq!(
+            reached[3].1,
+            "/v2/plugins/open-meridian/snaptrade/manifests/1.4.0"
+        );
+    }
+    // The version recorded, its listing's repository checked for the image.
+    let mut bundle: serde_json::Value =
+        serde_json::from_str(&upload_body("1.4.0", DIGEST, &["custody"])).unwrap();
+    bundle["listing"] = serde_json::json!("open-meridian/snaptrade");
+    bundle["source_registry"] = serde_json::json!("community");
+    bundle["key_status"] = serde_json::json!({"issued_at_ns": 1_792_000_000_000_000_000i64,
+        "keys": [], "signature": "c2ln"});
+    bundle["listing_statement"] = serde_json::json!("{\"payloadType\":\"x\"}");
+    let (status, _, body) = send(
+        &h,
+        "POST",
+        "/terminal/plugins",
+        Some(&h.ada),
+        &bundle.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert!(h
+        .reached
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(method, path, _, _)| method == "HEAD"
+            && path == &format!("/v2/plugins/open-meridian/snaptrade/manifests/{DIGEST}")));
+    // A listing that is not organisation/plugin naming this plugin, or a
+    // bundle without its key status, is refused before the conductor hears.
+    for (field, value) in [
+        ("listing", serde_json::json!("open-meridian/kraken")),
+        ("listing", serde_json::json!("snaptrade")),
+        ("listing", serde_json::json!("Open_Meridian/snaptrade")),
+        ("key_status", serde_json::Value::Null),
+        ("source_registry", serde_json::json!("")),
+    ] {
+        let mut spoiled = bundle.clone();
+        spoiled[field] = value;
+        let (status, _, body) = send(
+            &h,
+            "POST",
+            "/terminal/plugins",
+            Some(&h.ada),
+            &spoiled.to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{field}: {body}");
     }
 }

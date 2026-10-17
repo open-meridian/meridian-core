@@ -464,7 +464,7 @@ async fn a_proposal_states_exactly_one_of_quantity_and_cash_quantity() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_proposal_is_proposed_entered_by_its_user_and_names_what_its_instrument_lacks() {
     let w = wired();
-    let mut ordered = w.bus.subscribe(ORDER_UPDATED);
+    let mut ordered = w.bus.subscribe_every(ORDER_UPDATED);
     let order = propose(&w, &buy("10")).await.unwrap();
     assert!(order.order_id.starts_with("ORD-"));
     assert_eq!(state(&order), OrderState::Proposed);
@@ -617,7 +617,7 @@ async fn a_placement_carries_its_own_change_requests_to_its_connectivity_plugin(
     .placement
     .unwrap();
     assert!(placement.change_requests.is_empty());
-    let mut placed = w.bus.subscribe(PLACEMENT_UPDATED);
+    let mut placed = w.bus.subscribe_every(PLACEMENT_UPDATED);
     let replaced = send_from(
         &w.bus,
         REQUEST_PLACEMENT_CHANGE,
@@ -893,8 +893,10 @@ async fn a_command_naming_its_record_by_id_outside_the_write_scope_is_denied_cha
 #[tokio::test(flavor = "multi_thread")]
 async fn an_order_is_placed_acknowledged_filled_in_two_and_moves_the_position() {
     let w = wired();
-    let mut positions = w.bus.subscribe("platform.book.event.position-changed");
-    let mut placed = w.bus.subscribe(PLACEMENT_UPDATED);
+    let mut positions = w
+        .bus
+        .subscribe_every("platform.book.event.position-changed");
+    let mut placed = w.bus.subscribe_every(PLACEMENT_UPDATED);
     let order = released(&w, "10").await;
     order_command(
         &w,
@@ -1010,7 +1012,7 @@ async fn a_placement_at_a_connectivity_plugin_the_caller_may_not_route_through_i
 ) {
     let w = wired();
     let order = released(&w, "10").await;
-    let mut ordered = w.bus.subscribe(ORDER_UPDATED);
+    let mut ordered = w.bus.subscribe_every(ORDER_UPDATED);
     let before = w.store.journal(ACC).unwrap().len();
     let not_allowed = As {
         allowed: false,
@@ -1333,7 +1335,7 @@ async fn a_fill_after_the_cancel_is_a_late_fact_and_an_overfill_does_not_tie_out
 #[tokio::test(flavor = "multi_thread")]
 async fn a_fact_the_book_cannot_place_is_kept_and_placed_when_a_later_record_claims_it() {
     let w = wired();
-    let mut unplaced = w.bus.subscribe(UNPLACED_FACT_RECORDED);
+    let mut unplaced = w.bus.subscribe_every(UNPLACED_FACT_RECORDED);
     let order = released(&w, "10").await;
     let placement = place(&w, &order.order_id, "10", &person(TRADER))
         .await
@@ -1411,7 +1413,7 @@ async fn a_fact_the_book_cannot_place_is_kept_and_placed_when_a_later_record_cla
 #[tokio::test(flavor = "multi_thread")]
 async fn trading_instructions_are_journalled_in_their_partitions_and_read_with_the_control_head() {
     let w = wired();
-    let mut heard = w.bus.subscribe(TRADING_INSTRUCTION_CHANGED);
+    let mut heard = w.bus.subscribe_every(TRADING_INSTRUCTION_CHANGED);
     let set = |target: TradingInstructionTarget, value: TradingInstructionValue, reason: &str| {
         // As the dashboard stamps it: here a plugin admin's names their
         // plugin, and every other is a deployment admin's.
@@ -1988,8 +1990,10 @@ fn aapl_position(w: &Wired, business_date: &str, at: Option<crate::store::Mark>)
 #[tokio::test(flavor = "multi_thread")]
 async fn a_fill_on_no_placement_is_unmatched_names_its_venue_order_and_moves_nothing() {
     let w = wired();
-    let mut recorded = w.bus.subscribe(EXECUTION_RECORDED);
-    let mut positions = w.bus.subscribe("platform.book.event.position-changed");
+    let mut recorded = w.bus.subscribe_every(EXECUTION_RECORDED);
+    let mut positions = w
+        .bus
+        .subscribe_every("platform.book.event.position-changed");
     // Each of the instrument, the side and the venue's order ID is required,
     // refused by name (ruling 9).
     for (field, mut request) in [
@@ -2151,8 +2155,8 @@ async fn a_bust_closes_an_unmatched_fill_and_a_correction_is_answered_in_its_pla
 #[tokio::test(flavor = "multi_thread")]
 async fn an_accept_to_a_new_order_makes_it_filled_with_the_ems_s_placement_as_of_the_trade_date() {
     let w = wired();
-    let mut ordered = w.bus.subscribe(ORDER_UPDATED);
-    let mut placed = w.bus.subscribe(PLACEMENT_UPDATED);
+    let mut ordered = w.bus.subscribe_every(ORDER_UPDATED);
+    let mut placed = w.bus.subscribe_every(PLACEMENT_UPDATED);
     // Two prints of one venue order, traded on Friday 9 October.
     let prints: Vec<Execution> = {
         let mut kept = Vec::new();
@@ -2270,6 +2274,8 @@ async fn an_accept_to_a_new_order_makes_it_filled_with_the_ems_s_placement_as_of
         replayed.ledger.order_record(&order.order_id, true).unwrap(),
         order_now(&w, &order.order_id)
     );
+    // And from a snapshot at any of its entries (contract v25, W9.10).
+    crate::snapshot::tests::holds_at_every_split(ACC, "P0", &w.store.journal(ACC).unwrap());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2381,7 +2387,7 @@ async fn an_accept_to_an_existing_order_is_held_to_its_state_quantity_side_and_a
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dk_closes_a_fill_moving_nothing_and_a_later_fill_of_the_venue_order_waits_again() {
     let w = wired();
-    let mut recorded = w.bus.subscribe(EXECUTION_RECORDED);
+    let mut recorded = w.bus.subscribe_every(EXECUTION_RECORDED);
     let fill = execute(&w, &unmatched("20", "V:1", Side::Buy))
         .await
         .unwrap()
@@ -2852,7 +2858,9 @@ async fn a_roll_moves_the_pending_lines_in_the_pair_to_the_next_value_date_and_n
 
     // Tuesday's roll: one entry, the pending lines moved, a PositionChanged
     // for each position.
-    let mut moved = w.bus.subscribe("platform.book.event.position-changed");
+    let mut moved = w
+        .bus
+        .subscribe_every("platform.book.event.position-changed");
     let before = w.store.journal(ACC).unwrap().len();
     let reply = report_roll(&w, &roll("2026-10-15", "2026-10-16", "6311"))
         .await
@@ -2926,7 +2934,7 @@ async fn a_roll_moves_the_pending_lines_in_the_pair_to_the_next_value_date_and_n
     // Kept unplaced, never refused nor dropped (approved 2026-10-13): a roll
     // meeting no pending line, in the account, heard by operations; one on
     // a code no ems mapped, naming no account. Neither moves a line.
-    let mut unplaced = w.bus.subscribe(UNPLACED_FACT_RECORDED);
+    let mut unplaced = w.bus.subscribe_every(UNPLACED_FACT_RECORDED);
     let pending_before = (
         pending_of(&position(&w, EUR, HoldingSide::Long).unwrap()),
         pending_of(&chf_position(&w)),

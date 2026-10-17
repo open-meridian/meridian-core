@@ -487,6 +487,24 @@ fn sourced(field: Field, identifier: Option<Asked>, words: &str, now_ns: i64) ->
 }
 
 /// The values a platform record states, by field.
+/// The fields a person set or accepted on `record` that the platform's
+/// answer `master` contradicts (contract v25, W3.26): its value in force
+/// sourced to a person, and the platform's non-empty and different. In the
+/// order the master's values are read.
+pub fn contradicted_fields(record: &Instrument, master: &InstrumentRecord) -> Vec<Field> {
+    master_values(master)
+        .into_iter()
+        .filter(|(field, said)| {
+            let held = record.value(*field).trim();
+            let by_a_person = record
+                .source_of(*field, None)
+                .is_some_and(|source| !source.person.is_empty());
+            by_a_person && !said.is_empty() && !held.is_empty() && held != said
+        })
+        .map(|(field, _)| field)
+        .collect()
+}
+
 fn master_values(master: &InstrumentRecord) -> Vec<(Field, String)> {
     vec![
         (Field::AssetClass, asset_class_name(master.asset_class)),
@@ -514,6 +532,32 @@ fn master_identifiers(master: &InstrumentRecord) -> Vec<Asked> {
             asked.scheme != LOCAL_SCHEME && asked.scheme != meridian_symbology::GLOBAL_ID
         })
         .collect()
+}
+
+/// Each listing identifier's trading currency, as the platform's master holds
+/// it per listing (contract v25, W3.1), set on the record's open identifier
+/// it names; an identifier the master gives none keeps none. True when one
+/// changed.
+pub fn take_trading_currencies(record: &mut Instrument, master: &InstrumentRecord) -> bool {
+    let mut changed = false;
+    for held in record.identifiers.iter_mut().filter(|held| held.open()) {
+        let said = master
+            .identifiers
+            .iter()
+            .filter(|identifier| identifier.valid_until_ns == 0)
+            .find(|identifier| {
+                identifier.scheme == held.scheme
+                    && identifier.value == held.value
+                    && identifier.source == held.source
+            })
+            .map(|identifier| identifier.trading_currency.trim().to_ascii_uppercase())
+            .unwrap_or_default();
+        if !said.is_empty() && held.trading_currency != said {
+            held.trading_currency = said;
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// The platform's record, kept as the deployment's under its `INS-` ID (W3.1,
@@ -550,7 +594,8 @@ pub fn keep_platform_record(
             changes.push(identifier_change(identifier, &words));
         }
         let offered = crate::resolve::keep_offers(&mut held, offers);
-        if changes.is_empty() && !offered {
+        let listed = take_trading_currencies(&mut held, master);
+        if changes.is_empty() && !offered && !listed {
             return Ok((held, false));
         }
         held.version = expected + 1;
@@ -604,6 +649,7 @@ pub fn keep_platform_record(
             sources.push(sourced(field, None, &words, now_ns));
         }
     }
+    take_trading_currencies(&mut candidate, master);
     if let Some(contract) = &master.binary_event_contract {
         candidate.binary_event_contract =
             meridian_domain::instrument_type::contract_to_text(contract);
@@ -823,6 +869,7 @@ pub fn resolve_to_as(
             };
             // Only what is on the record now travels; windows kept.
             stays.identifiers.retain(|identifier| identifier.open());
+            take_trading_currencies(&mut stays, master);
             // The open_meridian identifier stops being written (requirement 2).
             for identifier in stays.identifiers.iter_mut() {
                 if identifier.scheme == meridian_symbology::GLOBAL_ID {
@@ -836,6 +883,7 @@ pub fn resolve_to_as(
                     source: String::new(),
                     valid_from_ns: minted_at,
                     valid_to_ns: None,
+                    trading_currency: String::new(),
                 });
                 stays.set_source(sourced(
                     Field::Identifier,
@@ -895,6 +943,7 @@ pub fn resolve_to_as(
                     source: String::new(),
                     valid_from_ns: minted_at,
                     valid_to_ns: None,
+                    trading_currency: String::new(),
                 });
                 held.set_source(sourced(
                     Field::Identifier,
@@ -1481,6 +1530,76 @@ mod tests {
     }
 
     #[test]
+    fn a_platform_value_contradicting_a_persons_is_named() {
+        // Contract v25 (W3.26): a value in force a person set or accepted,
+        // and the platform's non-empty and different.
+        let platform = master("INS-01J8ZZTP", "BBG001S5N8V8");
+        let mut record = Instrument {
+            instrument_id: "LCL-1".into(),
+            currency: "GBP".into(),
+            description: "ZZ TOP HOLDINGS INC".into(),
+            ..Default::default()
+        };
+        let mut by_person = sourced(Field::Currency, None, "set by a person", 1);
+        by_person.person = "local|ada".into();
+        record.set_source(by_person);
+        record.set_source(sourced(
+            Field::Description,
+            None,
+            "reported by custody-1",
+            1,
+        ));
+        assert_eq!(
+            contradicted_fields(&record, &platform),
+            vec![Field::Currency]
+        );
+        // The same value is no contradiction; nor is a plugin's report.
+        record.currency = "USD".into();
+        assert!(contradicted_fields(&record, &platform).is_empty());
+        record.description = "SOMETHING ELSE".into();
+        assert!(contradicted_fields(&record, &platform).is_empty());
+    }
+
+    #[test]
+    fn a_listing_identifier_keeps_the_currency_its_listing_trades_in() {
+        // Contract v25 (W3.1): a Canadian cross-listing reads CAD beside the
+        // security's USD; the record's own currency stays the security's.
+        let store = MemoryStore::new();
+        let mut platform = master("INS-01J8ZZTP", "BBG001S5N8V8");
+        platform.identifiers.push(PbIdentifier {
+            scheme: "figi".into(),
+            value: "BBG001S5TSX1".into(),
+            trading_currency: "cad".into(),
+            ..Default::default()
+        });
+        unmatched(
+            &store,
+            &equity_figi("BBG001S5N8V8"),
+            PlatformSaid::Record(Box::new(platform.clone())),
+        );
+        let held = store.by_id("INS-01J8ZZTP").unwrap().unwrap();
+        assert_eq!(held.currency, "USD");
+        let listing = held
+            .identifiers
+            .iter()
+            .find(|identifier| identifier.value == "BBG001S5TSX1")
+            .unwrap();
+        assert_eq!(listing.trading_currency, "CAD");
+        let share_class = held
+            .identifiers
+            .iter()
+            .find(|identifier| identifier.value == "BBG001S5N8V8")
+            .unwrap();
+        assert!(share_class.trading_currency.is_empty());
+        let wire = crate::record::to_wire(&held);
+        assert!(wire
+            .identifiers
+            .iter()
+            .any(|identifier| identifier.value == "BBG001S5TSX1"
+                && identifier.trading_currency == "CAD"));
+    }
+
+    #[test]
     fn the_platforms_record_is_kept_under_its_own_id_from_the_start() {
         let store = MemoryStore::new();
         let request = equity_figi("BBG001S5N8V8");
@@ -1753,6 +1872,7 @@ mod tests {
                 source: String::new(),
                 valid_from_ns: 0,
                 valid_to_ns: None,
+                trading_currency: String::new(),
             }],
             asset_class: "ASSET_CLASS_EQUITY".into(),
             currency: "USD".into(),
