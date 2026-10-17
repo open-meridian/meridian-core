@@ -168,6 +168,12 @@ impl Registries for Platform {
     }
 }
 
+/// A call to the store from a test's own async body, as a blocking caller
+/// makes it: the memory store, like Postgres's, refuses to block a runtime.
+fn blocking<T>(work: impl FnOnce() -> T) -> T {
+    tokio::task::block_in_place(work)
+}
+
 fn hold(platform: &Arc<Platform>) -> Hold {
     Hold::new(
         Arc::clone(platform) as Arc<dyn Registries>,
@@ -177,7 +183,7 @@ fn hold(platform: &Arc<Platform>) -> Hold {
     )
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn the_catalogue_is_pulled_after_its_sequence_and_kept_with_its_signed_key_status() {
     let platform = Platform::new();
     let held = hold(&platform);
@@ -185,7 +191,10 @@ async fn the_catalogue_is_pulled_after_its_sequence_and_kept_with_its_signed_key
     assert_eq!(kept.sequence, 7);
     assert_eq!(kept.listings[0].listing, LISTING);
     assert_eq!(kept.pulled_at_ns, 1_792_200_000_000_000_000);
-    assert_eq!(held.key_status().unwrap().keys[0].fingerprint, FINGERPRINT);
+    assert_eq!(
+        blocking(|| held.key_status()).unwrap().keys[0].fingerprint,
+        FINGERPRINT
+    );
     // The next pull reads after what it holds; a listing changed replaces
     // the copy's whole.
     platform.catalogue.lock().unwrap()["listings"][0]["stars"] = json!(5);
@@ -202,7 +211,10 @@ async fn the_catalogue_is_pulled_after_its_sequence_and_kept_with_its_signed_key
         .await
         .unwrap_err()
         .contains("not the platform's"));
-    assert_eq!(held.held().unwrap().unwrap().listings[0].stars, 5);
+    assert_eq!(
+        blocking(|| held.held()).unwrap().unwrap().listings[0].stars,
+        5
+    );
 }
 
 #[tokio::test]
@@ -493,7 +505,7 @@ fn bundle<'a>(key_status: &'a str, statement: &'a str) -> Bundle<'a> {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_bundle_is_verified_against_the_chart_s_keys_with_nothing_asked_of_the_platform() {
     let platform = Platform::new();
     let held = hold(&platform);
@@ -526,13 +538,16 @@ async fn a_bundle_is_verified_against_the_chart_s_keys_with_nothing_asked_of_the
         [format!("referrers of plugins/{LISTING}")]
     );
     // The bundle's key status is the newest held, for the launch's check.
-    let kept = held.held().unwrap().unwrap();
+    let kept = blocking(|| held.held()).unwrap().unwrap();
     assert_eq!(kept.pulled_at_ns, 0, "no catalogue was pulled");
     assert!(kept.listings.is_empty());
-    assert_eq!(held.key_status().unwrap().keys[0].fingerprint, FINGERPRINT);
+    assert_eq!(
+        blocking(|| held.key_status()).unwrap().keys[0].fingerprint,
+        FINGERPRINT
+    );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_bundle_that_does_not_verify_is_refused_naming_the_check_and_keeps_nothing() {
     let platform = Platform::new();
     let held = hold(&platform);
@@ -587,10 +602,13 @@ async fn a_bundle_that_does_not_verify_is_refused_naming_the_check_and_keeps_not
         .await
         .unwrap_err();
     assert!(refused.contains("the provenance"), "{refused}");
-    assert!(held.held().unwrap().is_none(), "a refusal keeps nothing");
+    assert!(
+        blocking(|| held.held()).unwrap().is_none(),
+        "a refusal keeps nothing"
+    );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_bundle_s_signer_is_checked_against_the_newer_key_status_held() {
     let platform = Platform::new();
     let held = hold(&platform);
@@ -607,12 +625,13 @@ async fn a_bundle_s_signer_is_checked_against_the_newer_key_status_held() {
                   "revoked_at_ns": 2, "revoked_by_person_id": "", "revoke_reason": "lost",
                   "not_trusted_after_ns": 2}],
     }));
-    held.store()
-        .put_registry_catalogue(&HeldCatalogue {
+    blocking(|| {
+        held.store().put_registry_catalogue(&HeldCatalogue {
             key_status: revoked.to_string(),
             ..Default::default()
         })
-        .unwrap();
+    })
+    .unwrap();
     let refused = held
         .carried(&Bundle {
             digest: &image,
@@ -639,7 +658,7 @@ async fn a_bundle_s_signer_is_checked_against_the_newer_key_status_held() {
         1_792_150_000_000_000_000
     );
     assert_eq!(
-        held.key_status().unwrap().issued_at_ns,
+        blocking(|| held.key_status()).unwrap().issued_at_ns,
         1_792_150_000_000_000_000
     );
 }

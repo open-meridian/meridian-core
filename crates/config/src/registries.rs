@@ -129,6 +129,37 @@ fn organisation_of(listing: &str) -> &str {
         .map_or(listing, |(organisation, _)| organisation)
 }
 
+/// One listed version from a copy of the catalogue.
+fn listed_in(
+    held: Option<HeldCatalogue>,
+    listing: &str,
+    version: &str,
+    registry: &str,
+) -> Result<(PluginListing, ListedVersion), String> {
+    let held = held.ok_or("the catalogue has not been pulled yet; pull it first")?;
+    let found = held
+        .listings
+        .into_iter()
+        .find(|held| held.listing == listing)
+        .ok_or_else(|| format!("no listing {listing} is in the catalogue"))?;
+    let chosen = found
+        .versions
+        .iter()
+        .find(|held| held.version == version && (registry.is_empty() || held.registry == registry))
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "{listing} has no {}version {version}",
+                if registry.is_empty() {
+                    String::new()
+                } else {
+                    format!("{registry} ")
+                }
+            )
+        })?;
+    Ok((found, chosen))
+}
+
 impl Hold {
     pub fn new(
         upstream: Arc<dyn Registries>,
@@ -153,11 +184,39 @@ impl Hold {
         &self.upstream
     }
 
-    /// The copy held, none before the first pull.
+    /// The copy held, none before the first pull. For a caller on a thread
+    /// that may block; the async paths below read it through `read_held`,
+    /// since the store blocks.
     pub fn held(&self) -> Result<Option<HeldCatalogue>, String> {
         self.store
             .registry_catalogue()
             .map_err(|failed| failed.to_string())
+    }
+
+    /// The copy held, read on a blocking thread: the store blocks, and an
+    /// async task -- the hourly pull, a fetch the bus's handler waits on --
+    /// must not block its runtime's.
+    async fn read_held(&self) -> Result<Option<HeldCatalogue>, String> {
+        let store = Arc::clone(&self.store);
+        tokio::task::spawn_blocking(move || {
+            store
+                .registry_catalogue()
+                .map_err(|failed| failed.to_string())
+        })
+        .await
+        .map_err(|failed| format!("the catalogue's copy could not be read: {failed}"))?
+    }
+
+    /// The copy kept, written on a blocking thread, as `read_held` reads.
+    async fn keep(&self, kept: HeldCatalogue) -> Result<(), String> {
+        let store = Arc::clone(&self.store);
+        tokio::task::spawn_blocking(move || {
+            store
+                .put_registry_catalogue(&kept)
+                .map_err(|failed| failed.to_string())
+        })
+        .await
+        .map_err(|failed| format!("the catalogue's copy could not be kept: {failed}"))?
     }
 
     /// Pull the catalogue after the sequence held, merge what changed --
@@ -165,7 +224,7 @@ impl Hold {
     /// against the chart's keys first. A pull that fails changes nothing.
     pub async fn pull(&self) -> Result<HeldCatalogue, String> {
         let _one = self.pulling.lock().await;
-        let held = self.held()?.unwrap_or_default();
+        let held = self.read_held().await?.unwrap_or_default();
         let answered = self.upstream.pull_catalogue(held.sequence).await?;
         let reply = wire::catalogue(&answered)
             .map_err(|why| format!("the catalogue did not read: {why}"))?;
@@ -197,16 +256,18 @@ impl Hold {
             key_status,
             pulled_at_ns: self.clock.now_ns(),
         };
-        self.store
-            .put_registry_catalogue(&kept)
-            .map_err(|failed| failed.to_string())?;
+        self.keep(kept.clone()).await?;
         Ok(kept)
     }
 
     /// The newest key status held, its signature checked again.
     pub fn key_status(&self) -> Result<SigningKeyStatus, String> {
-        let held = self
-            .held()?
+        self.key_status_of(self.held()?)
+    }
+
+    fn key_status_of(&self, held: Option<HeldCatalogue>) -> Result<SigningKeyStatus, String> {
+        let held = held
+            .filter(|held| !held.key_status.is_empty())
             .ok_or("the signing key: no key status is held; pull the catalogue first")?;
         let document: Value = serde_json::from_str(&held.key_status)
             .map_err(|_| "the signing key: the key status held does not read".to_string())?;
@@ -222,32 +283,7 @@ impl Hold {
         version: &str,
         registry: &str,
     ) -> Result<(PluginListing, ListedVersion), String> {
-        let held = self
-            .held()?
-            .ok_or("the catalogue has not been pulled yet; pull it first")?;
-        let found = held
-            .listings
-            .into_iter()
-            .find(|held| held.listing == listing)
-            .ok_or_else(|| format!("no listing {listing} is in the catalogue"))?;
-        let chosen = found
-            .versions
-            .iter()
-            .find(|held| {
-                held.version == version && (registry.is_empty() || held.registry == registry)
-            })
-            .cloned()
-            .ok_or_else(|| {
-                format!(
-                    "{listing} has no {}version {version}",
-                    if registry.is_empty() {
-                        String::new()
-                    } else {
-                        format!("{registry} ")
-                    }
-                )
-            })?;
-        Ok((found, chosen))
+        listed_in(self.held()?, listing, version, registry)
     }
 
     /// ListRegistryPlugins (W8.10): Browse and a listing's page, from the
@@ -259,7 +295,7 @@ impl Hold {
         let held = if request.pull_now {
             self.pull().await?
         } else {
-            self.held()?.unwrap_or_default()
+            self.read_held().await?.unwrap_or_default()
         };
         let words: Vec<String> = request
             .search
@@ -331,7 +367,8 @@ impl Hold {
         version: &str,
         registry: &str,
     ) -> Result<Fetched, String> {
-        let (_, chosen) = self.listed(listing, version, registry)?;
+        let held = self.read_held().await?;
+        let (_, chosen) = listed_in(held.clone(), listing, version, registry)?;
         if !offered(&chosen) {
             return Err(format!(
                 "{listing} {version} is not offered: it was {}",
@@ -383,7 +420,7 @@ impl Hold {
                 &repository,
             )
             .await?;
-        let key_status = self.key_status()?;
+        let key_status = self.key_status_of(held)?;
         self.verified(
             Asked {
                 listing,
@@ -441,7 +478,7 @@ impl Hold {
                 )
             })?;
         }
-        let held = self.held()?;
+        let held = self.read_held().await?;
         let newest_held = held
             .as_ref()
             .filter(|held| !held.key_status.is_empty())
@@ -474,9 +511,7 @@ impl Hold {
         if checked.issued_at_ns == carried.issued_at_ns {
             let mut kept = held.unwrap_or_default();
             kept.key_status = document.to_string();
-            self.store
-                .put_registry_catalogue(&kept)
-                .map_err(|failed| failed.to_string())?;
+            self.keep(kept).await?;
         }
         Ok(fetched)
     }
@@ -618,7 +653,7 @@ impl Hold {
             .await?;
         let attested = self.attestations(&envelopes, &version.image_digest, &listed)?;
         verify::signer_trusted(
-            &self.key_status()?,
+            &self.key_status_of(self.read_held().await?)?,
             organisation_of(&version.listing),
             &listed.signer_key,
             attested.built_at_ns.unwrap_or(listed.listed_at_ns),

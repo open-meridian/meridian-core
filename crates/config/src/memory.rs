@@ -1177,10 +1177,14 @@ impl Store for MemoryStore {
     }
 
     fn registry_catalogue(&self) -> Result<Option<crate::store::HeldCatalogue>> {
+        #[cfg(test)]
+        blocks_like_postgres();
         Ok(self.registry.lock().expect("store lock poisoned").clone())
     }
 
     fn put_registry_catalogue(&self, held: &crate::store::HeldCatalogue) -> Result<()> {
+        #[cfg(test)]
+        blocks_like_postgres();
         *self.registry.lock().expect("store lock poisoned") = Some(held.clone());
         Ok(())
     }
@@ -1273,4 +1277,17 @@ impl Store for MemoryStore {
             .cloned()
             .collect())
     }
+}
+
+/// What the Postgres store does on a thread driving async tasks: its client
+/// starts a runtime of its own, which panics there. The registries' copy is
+/// read on async paths (the hourly pull, a fetch the bus's handler waits
+/// on), so the memory store does the same with it in core's tests, and a
+/// call that would block a runtime in production fails here first.
+#[cfg(test)]
+fn blocks_like_postgres() {
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("a runtime")
+        .block_on(async {});
 }
