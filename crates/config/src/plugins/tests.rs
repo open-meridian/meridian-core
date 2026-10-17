@@ -100,6 +100,7 @@ fn snaptrade(version: &str) -> RecordPluginUploadRequest {
         }),
         image_digest: DIGEST.into(),
         documentation: Vec::new(),
+        ..Default::default()
     }
 }
 
@@ -157,6 +158,17 @@ async fn a_version_is_recorded_once_with_who_uploaded_it() {
 
 /// One way to spoil an upload.
 type Breaking = Box<dyn Fn(&mut RecordPluginUploadRequest)>;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bundle_is_refused_where_the_chart_carries_no_platform_key() {
+    let (bus, _) = harness();
+    let mut bundle = snaptrade("1.4.0");
+    bundle.listing = "open-meridian/snaptrade".into();
+    bundle.source_registry = "community".into();
+    let refused = upload(&bus, bundle).await.unwrap_err();
+    assert!(refused.contains("carries none"), "{refused}");
+    assert!(catalogue(&bus).await.versions.is_empty());
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_upload_is_held_to_the_vocabulary_whatever_the_cli_checked() {

@@ -10,13 +10,13 @@ use meridian_bus::Envelope;
 use meridian_domain::v1::{
     AcknowledgePullRequest, CreatePluginReply, InstallPluginRequest, ListPluginUsageReportsReply,
     ListPluginUsageReportsRequest, ListRegistryPluginsReply, ListRegistryPluginsRequest,
-    PluginLaunch, PluginLaunchState, PluginVersion, PullAcknowledgement, RemovePluginReply,
-    RemovePluginRequest, ReportsPluginUsageSetting, SetReportsPluginUsageRequest,
-    UpdatePluginRequest,
+    PluginLaunch, PluginLaunchState, PluginVersion, PullAcknowledgement, RecordPluginUploadRequest,
+    RemovePluginReply, RemovePluginRequest, ReportsPluginUsageSetting,
+    SetReportsPluginUsageRequest, UpdatePluginRequest,
 };
 
 use super::{archive_allowed, documented, Plugins, CREATE_PLUGIN, REMOVE_PLUGIN};
-use crate::registries::{is_prerelease, offered, semver_cmp, Hold};
+use crate::registries::{is_prerelease, offered, semver_cmp, Bundle, Hold};
 use crate::service::{author, subject};
 use crate::store::{note_refused, Ending};
 
@@ -108,6 +108,88 @@ impl Plugins {
             registry = recorded.source_registry,
             by = recorded.uploaded_by,
             "a version installed from a registry"
+        );
+        Ok(recorded)
+    }
+
+    /// RecordPluginUpload carrying a plugin bundle (W8.14; the spec's
+    /// requirement 45): the image and its referrers are in plugins/{listing}
+    /// already; verified against the chart's keys as at install, and
+    /// recorded under its listing with its source registry, its listing
+    /// statement for launch and the age of the key status it was checked
+    /// against. What the CLI read from the bundle -- the declaration, the
+    /// texts -- must be what the built image attests.
+    pub(super) fn carry(
+        &self,
+        request: RecordPluginUploadRequest,
+        envelope: &Envelope,
+    ) -> Result<PluginVersion, String> {
+        let hold = self.registries.as_ref().ok_or(
+            "a plugin bundle is verified against the platform's keys, and this deployment's \
+             chart carries none",
+        )?;
+        let version = request
+            .metadata
+            .as_ref()
+            .map(|m| m.version.clone())
+            .unwrap_or_default();
+        if self.recorded(&request.listing, &version)?.is_some() {
+            return Err(format!(
+                "{} {version} is already recorded; a recorded version is never replaced",
+                request.listing
+            ));
+        }
+        let fetched = self.block_on(hold.carried(&Bundle {
+            listing: &request.listing,
+            version: &version,
+            registry: &request.source_registry,
+            digest: &request.image_digest,
+            key_status: &request.key_status,
+            listing_statement: &request.listing_statement,
+        }))?;
+        let attested = fetched.version.metadata.clone().unwrap_or_default();
+        if request
+            .metadata
+            .as_ref()
+            .is_some_and(|m| m.declaration.is_some() && m.declaration != attested.declaration)
+        {
+            return Err(
+                "the declaration: the bundle's is not the one the built image carries".into(),
+            );
+        }
+        if !request.documentation.is_empty() && request.documentation != fetched.documentation {
+            return Err(
+                "the documentation: the bundle's texts are not the ones the built image attests"
+                    .into(),
+            );
+        }
+        let declared = attested
+            .declaration
+            .as_ref()
+            .map(|d| d.documentation.as_slice())
+            .unwrap_or_default();
+        documented(declared, &fetched.documentation)
+            .map_err(|why| format!("the documentation: {why}"))?;
+        let mut recorded = fetched.version;
+        recorded.uploaded_by = subject(envelope);
+        recorded.uploaded_at_ns = self.clock.now_ns();
+        if !self
+            .store
+            .record_listed_version(&recorded, &fetched.documentation, &fetched.statement)
+            .map_err(|failed| failed.to_string())?
+        {
+            return Err(format!(
+                "{} {version} is already recorded; a recorded version is never replaced",
+                request.listing
+            ));
+        }
+        tracing::info!(
+            listing = request.listing,
+            version,
+            registry = recorded.source_registry,
+            key_status_issued_at_ns = recorded.key_status_issued_at_ns,
+            by = recorded.uploaded_by,
+            "a version carried in by a plugin bundle"
         );
         Ok(recorded)
     }

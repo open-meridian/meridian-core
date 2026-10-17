@@ -557,6 +557,10 @@ impl Plugins {
         request: RecordPluginUploadRequest,
         envelope: &Envelope,
     ) -> Result<PluginVersion, String> {
+        // A plugin bundle names its listing (W8.14): verified as at install.
+        if !request.listing.is_empty() {
+            return self.carry(request, envelope);
+        }
         let metadata = upload(Contract::embedded(), &request)?;
         let version = PluginVersion {
             metadata: Some(metadata.clone()),

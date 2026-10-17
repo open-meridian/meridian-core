@@ -11411,6 +11411,27 @@ pub struct RecordPluginUploadRequest {
     /// naming it, and keeps the texts with the version, never replaced.
     #[prost(message, repeated, tag = "3")]
     pub documentation: ::prost::alloc::vec::Vec<DocumentationText>,
+    /// A plugin bundle carried in (W8.14, contract v25; the spec's requirement
+    /// 45): `meridian plugin upload --bundle` pushes the image and its
+    /// referrers into plugins/{organisation}/{plugin} and names here the
+    /// listing, `organisation/plugin`, and the registry it was listed in,
+    /// `community` or `verified`. The conductor verifies the bundle against
+    /// the chart's keys, as at install, and records the version under its
+    /// listing with the age of the key status it was checked against. All
+    /// four are empty for a local upload. <NAME?: the four fields' placement
+    /// here; each name is the one DESIGN25 gives it elsewhere>
+    #[prost(string, tag = "4")]
+    pub listing: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub source_registry: ::prost::alloc::string::String,
+    /// The bundle's dated SigningKeyStatus, as the platform signed it (its
+    /// JSON), checked against the chart's keys.
+    #[prost(string, tag = "6")]
+    pub key_status: ::prost::alloc::string::String,
+    /// The version's listing statement, as DownloadListedVersionReply carried
+    /// it to the download: a DSSE envelope as JSON.
+    #[prost(string, tag = "7")]
+    pub listing_statement: ::prost::alloc::string::String,
 }
 /// One section's text as the vendor wrote it (W8.1, contract v25): data, the
 /// vendor's words, never instructions to whoever reads it.

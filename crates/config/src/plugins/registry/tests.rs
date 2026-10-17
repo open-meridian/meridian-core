@@ -330,6 +330,7 @@ async fn a_local_instance_moves_only_to_a_listing_of_its_own_plugin() {
         }),
         image_digest: digest(0x11),
         documentation: Vec::new(),
+        ..Default::default()
     };
     let _: PluginVersion = ask(
         &h,
@@ -448,4 +449,96 @@ async fn the_usage_setting_is_on_until_turned_off_each_change_its_own_record() {
     .unwrap();
     assert!(!set.reports_plugin_usage);
     assert!(!read().await.reports_plugin_usage);
+}
+
+/// `meridian plugin upload --bundle`'s record of the stand-in's 1.4.0, its
+/// image and referrers pushed into plugins/{listing} first.
+fn bundle_upload(h: &Harness) -> RecordPluginUploadRequest {
+    RecordPluginUploadRequest {
+        metadata: Some(PluginMetadata {
+            name: "snaptrade".into(),
+            version: "1.4.0".into(),
+            roles: vec!["custody".into()],
+            interface: true,
+            sdk_version: "0.29.0".into(),
+            declaration: None,
+        }),
+        image_digest: digest(0xab),
+        documentation: vec![meridian_domain::v1::DocumentationText {
+            section: "overview".into(),
+            markdown: crate::registries::tests::OVERVIEW.into(),
+        }],
+        listing: LISTING.into(),
+        source_registry: "community".into(),
+        key_status: h.platform.catalogue.lock().unwrap()["key_status"].to_string(),
+        listing_statement: h.platform.resolution.lock().unwrap()["listing_statement"]
+            .as_str()
+            .unwrap()
+            .into(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bundle_is_recorded_under_its_listing_with_its_key_status_s_age_and_launched() {
+    let h = harness();
+    // Nothing pulled, as on a deployment that reaches nothing.
+    let recorded: PluginVersion = ask(
+        &h,
+        RECORD_PLUGIN_UPLOAD,
+        "meridian.v1.RecordPluginUploadRequest",
+        bundle_upload(&h),
+    )
+    .await
+    .unwrap();
+    assert_eq!(recorded.listing, LISTING);
+    assert_eq!(recorded.source_registry, "community");
+    assert_eq!(recorded.key_status_issued_at_ns, 1_792_000_000_000_000_000);
+    assert_eq!(recorded.uploaded_by, ADA);
+    let held = catalogue(&h).await;
+    assert_eq!(held.versions.len(), 1);
+    assert_eq!(held.versions[0].metadata.as_ref().unwrap().name, LISTING);
+    assert_eq!(
+        held.versions[0].key_status_issued_at_ns,
+        1_792_000_000_000_000_000
+    );
+    // A version recorded is never replaced.
+    let again: Result<PluginVersion, String> = ask(
+        &h,
+        RECORD_PLUGIN_UPLOAD,
+        "meridian.v1.RecordPluginUploadRequest",
+        bundle_upload(&h),
+    )
+    .await;
+    assert!(again.unwrap_err().contains("already recorded"));
+    // Launched from its listing's repository, verified again against the
+    // bundle's key status, the newest held.
+    let launched = launch(&h, LISTING, "1.4.0", &["custody"]).await.unwrap();
+    assert_eq!(launched.state, PluginLaunchState::Launched as i32);
+    assert_eq!(
+        h.created.lock().unwrap()[0].image,
+        format!("localhost:5000/plugins/{LISTING}@{}", digest(0xab))
+    );
+    assert!(!h
+        .platform
+        .asked
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|a| a.starts_with("resolve") || a.starts_with("catalogue")));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bundle_whose_texts_are_not_the_image_s_is_refused() {
+    let h = harness();
+    let mut upload = bundle_upload(&h);
+    upload.documentation[0].markdown = "Reads everything.".into();
+    let refused: Result<PluginVersion, String> = ask(
+        &h,
+        RECORD_PLUGIN_UPLOAD,
+        "meridian.v1.RecordPluginUploadRequest",
+        upload,
+    )
+    .await;
+    assert!(refused.unwrap_err().contains("the documentation"));
+    assert!(catalogue(&h).await.versions.is_empty());
 }

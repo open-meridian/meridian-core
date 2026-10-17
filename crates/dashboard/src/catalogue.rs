@@ -228,6 +228,18 @@ fn step<'a>(method: &Method, rest: &'a str) -> Result<Step<'a>, StatusCode> {
     Err(StatusCode::METHOD_NOT_ALLOWED)
 }
 
+/// A path into plugins/{organisation}/{plugin} (W8.14): the repository and
+/// the rest after it, where the rest is no path of plugins/{organisation}
+/// itself and is one after the plugin's name.
+fn nested(method: &Method, organisation: &str, rest: &str) -> Option<(String, String)> {
+    if !matches!(step(method, rest), Err(StatusCode::NOT_FOUND)) {
+        return None;
+    }
+    let (plugin, after) = rest.split_once('/')?;
+    (is_name(plugin) && !matches!(step(method, after), Err(StatusCode::NOT_FOUND)))
+        .then(|| (format!("{organisation}/{plugin}"), after.to_string()))
+}
+
 /// The registry's Location, as the client must follow it: through here.
 fn rewritten(location: &str) -> String {
     let path = match location.find("/v2/") {
@@ -265,6 +277,12 @@ async fn pass_through(
     if !is_name(&name) {
         return refused(StatusCode::NOT_FOUND, "not a plugin's name");
     }
+    // A plugin bundle's repository is plugins/{organisation}/{plugin}
+    // (W8.14): the plugin's name is then the first part of the rest.
+    let (name, rest) = match nested(request.method(), &name, &rest) {
+        Some((repository, rest)) => (repository, rest),
+        None => (name, rest),
+    };
     match step(request.method(), &rest) {
         Err(status) => return refused(status, "not a step of pushing a plugin's image"),
         Ok(Step::Manifest(version)) => {
@@ -347,7 +365,11 @@ fn mounts_from_a_plugin(query: Option<&str>) -> bool {
             return true;
         };
         let from = from.replace("%2F", "/").replace("%2f", "/");
-        from.strip_prefix("plugins/").is_some_and(is_name)
+        from.strip_prefix("plugins/")
+            .is_some_and(|repository| match repository.split_once('/') {
+                Some((organisation, plugin)) => is_name(organisation) && is_name(plugin),
+                None => is_name(repository),
+            })
     })
 }
 
@@ -482,6 +504,42 @@ struct Upload {
     /// names; none from a CLI before v25.
     #[serde(default)]
     documentation: Vec<UploadedSection>,
+    /// A plugin bundle's (W8.14, contract v25): the listing,
+    /// `organisation/plugin`, whose image and referrers were pushed into
+    /// plugins/{organisation}/{plugin}; empty for a local upload.
+    #[serde(default)]
+    listing: String,
+    /// The registry it was listed in, `community` or `verified`.
+    #[serde(default)]
+    source_registry: String,
+    /// The bundle's dated SigningKeyStatus, as the platform signed it.
+    #[serde(default)]
+    key_status: Option<serde_json::Value>,
+    /// The listing statement, a DSSE envelope as JSON.
+    #[serde(default)]
+    listing_statement: String,
+}
+
+impl Upload {
+    /// Where the image was pushed: plugins/{listing} for a bundle,
+    /// plugins/{name} for a local upload; refused when a bundle's listing is
+    /// not `organisation/plugin` naming this plugin.
+    fn repository(&self) -> Result<&str, String> {
+        if self.listing.is_empty() {
+            return Ok(&self.name);
+        }
+        match self.listing.split_once('/') {
+            Some((organisation, plugin))
+                if is_name(organisation) && is_name(plugin) && plugin == self.name =>
+            {
+                Ok(&self.listing)
+            }
+            _ => Err(format!(
+                "`{}` is not organisation/plugin naming {}",
+                self.listing, self.name
+            )),
+        }
+    }
 }
 
 /// One section's text as the CLI read it from the built image.
@@ -526,16 +584,28 @@ async fn upload(
             ),
         );
     }
+    let repository = match upload.repository() {
+        Ok(repository) => repository.to_string(),
+        Err(why) => return refused(StatusCode::UNPROCESSABLE_ENTITY, why),
+    };
+    if !upload.listing.is_empty()
+        && (upload.source_registry.is_empty() || upload.key_status.is_none())
+    {
+        return refused(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a plugin bundle names its source registry and carries its key status",
+        );
+    }
     // The image first: a version recorded for an image nobody pushed would be
     // a launch waiting to fail.
-    match has_manifest(registry, &upload.name, &upload.image_digest).await {
+    match has_manifest(registry, &repository, &upload.image_digest).await {
         Ok(true) => {}
         Ok(false) => {
             return refused(
                 StatusCode::CONFLICT,
                 format!(
-                    "{} is not a manifest in plugins/{}; push the image first",
-                    upload.image_digest, upload.name
+                    "{} is not a manifest in plugins/{repository}; push the image first",
+                    upload.image_digest
                 ),
             )
         }
@@ -577,6 +647,13 @@ async fn upload(
         }),
         image_digest: upload.image_digest,
         documentation,
+        listing: upload.listing,
+        source_registry: upload.source_registry,
+        key_status: upload
+            .key_status
+            .map(|status| status.to_string())
+            .unwrap_or_default(),
+        listing_statement: upload.listing_statement,
     };
     let recorded: Result<PluginVersion, String> = ask(
         &app,

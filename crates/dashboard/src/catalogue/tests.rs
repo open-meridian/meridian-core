@@ -150,6 +150,19 @@ fn conductor(bus: &Bus) {
         if metadata.roles.iter().any(|r| r == "dashboard") {
             return Err("`dashboard` is one of the deployment's own components".into());
         }
+        // A plugin bundle (W8.14): its listing, source registry, key status
+        // and listing statement carried whole for the conductor to verify.
+        if !request.listing.is_empty() {
+            let status: serde_json::Value =
+                serde_json::from_str(&request.key_status).unwrap_or_default();
+            if request.listing != "open-meridian/snaptrade"
+                || request.source_registry != "community"
+                || status["issued_at_ns"] != 1_792_000_000_000_000_000i64
+                || request.listing_statement != "{\"payloadType\":\"x\"}"
+            {
+                return Err(format!("the bundle not carried whole: {request:?}"));
+            }
+        }
         // Contract v25: the SDK's declaration read whole, and the texts
         // carried beside it for the conductor to hold to its digests.
         if metadata.version == "0.5.0" {
@@ -711,5 +724,113 @@ fn a_blob_is_mounted_from_another_plugins_repository_alone() {
         "from=",
     ] {
         assert!(!mounts_from_a_plugin(Some(refused)), "{refused}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bundle_is_pushed_into_its_listing_s_repository_and_carried_whole() {
+    let h = harness().await;
+    // The image and its referrers, into plugins/{organisation}/{plugin}.
+    let base = "/terminal/registry/v2/plugins/open-meridian/snaptrade";
+    for (method, path, status) in [
+        ("HEAD", format!("{base}/blobs/{DIGEST}"), StatusCode::OK),
+        (
+            "POST",
+            format!("{base}/blobs/uploads/"),
+            StatusCode::ACCEPTED,
+        ),
+        (
+            "PATCH",
+            format!("{base}/blobs/uploads/u-1?_state=s"),
+            StatusCode::ACCEPTED,
+        ),
+        (
+            "PUT",
+            format!("{base}/manifests/1.4.0"),
+            StatusCode::CREATED,
+        ),
+        (
+            "PUT",
+            format!("{base}/manifests/sha256-{}", "3f".repeat(32)),
+            StatusCode::CREATED,
+        ),
+        (
+            "GET",
+            format!("{base}/manifests/1.4.0"),
+            StatusCode::METHOD_NOT_ALLOWED,
+        ),
+        (
+            "PUT",
+            format!("{base}/x/manifests/1.4.0"),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            "PUT",
+            format!("{base}/Snap_Trade/manifests/1"),
+            StatusCode::NOT_FOUND,
+        ),
+    ] {
+        assert_eq!(
+            send(&h, method, &path, Some(&h.ada), "").await.0,
+            status,
+            "{method} {path}"
+        );
+    }
+    {
+        let reached = h.reached.lock().unwrap();
+        assert_eq!(reached.len(), 5);
+        assert_eq!(
+            reached[0].1,
+            format!("/v2/plugins/open-meridian/snaptrade/blobs/{DIGEST}")
+        );
+        assert_eq!(
+            reached[3].1,
+            "/v2/plugins/open-meridian/snaptrade/manifests/1.4.0"
+        );
+    }
+    // The version recorded, its listing's repository checked for the image.
+    let mut bundle: serde_json::Value =
+        serde_json::from_str(&upload_body("1.4.0", DIGEST, &["custody"])).unwrap();
+    bundle["listing"] = serde_json::json!("open-meridian/snaptrade");
+    bundle["source_registry"] = serde_json::json!("community");
+    bundle["key_status"] = serde_json::json!({"issued_at_ns": 1_792_000_000_000_000_000i64,
+        "keys": [], "signature": "c2ln"});
+    bundle["listing_statement"] = serde_json::json!("{\"payloadType\":\"x\"}");
+    let (status, _, body) = send(
+        &h,
+        "POST",
+        "/terminal/plugins",
+        Some(&h.ada),
+        &bundle.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert!(h
+        .reached
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(method, path, _, _)| method == "HEAD"
+            && path == &format!("/v2/plugins/open-meridian/snaptrade/manifests/{DIGEST}")));
+    // A listing that is not organisation/plugin naming this plugin, or a
+    // bundle without its key status, is refused before the conductor hears.
+    for (field, value) in [
+        ("listing", serde_json::json!("open-meridian/kraken")),
+        ("listing", serde_json::json!("snaptrade")),
+        ("listing", serde_json::json!("Open_Meridian/snaptrade")),
+        ("key_status", serde_json::Value::Null),
+        ("source_registry", serde_json::json!("")),
+    ] {
+        let mut spoiled = bundle.clone();
+        spoiled[field] = value;
+        let (status, _, body) = send(
+            &h,
+            "POST",
+            "/terminal/plugins",
+            Some(&h.ada),
+            &spoiled.to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{field}: {body}");
     }
 }

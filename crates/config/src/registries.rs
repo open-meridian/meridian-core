@@ -383,53 +383,161 @@ impl Hold {
                 &repository,
             )
             .await?;
-        let attested = self.attestations(&envelopes, &chosen.image_digest, &listed)?;
         let key_status = self.key_status()?;
-        verify::signer_trusted(
+        self.verified(
+            Asked {
+                listing,
+                version,
+                registry: &chosen.registry,
+                digest: &chosen.image_digest,
+                catalogued: chosen.metadata.as_ref(),
+            },
+            &envelopes,
+            &listed,
             &key_status,
-            organisation_of(listing),
+        )
+        .map(|(version, documentation)| Fetched {
+            version,
+            statement: reply.listing_statement,
+            listed,
+            documentation,
+        })
+    }
+
+    /// A version carried in by a plugin bundle (W8.14; the spec's
+    /// requirement 45), its image and referrers already in the deployment's
+    /// own registry under plugins/{listing}: verified against the chart's
+    /// keys as at install -- the listing statement, the provenance and the
+    /// image's metadata among the referrers, the signer against the newer of
+    /// the bundle's key status and the one held -- and answered with the key
+    /// status's issue time. Nothing is recorded here; the bundle's key
+    /// status is kept as the newest held where it is newer, and only once
+    /// the bundle verified.
+    pub async fn carried(&self, bundle: &Bundle<'_>) -> Result<Fetched, String> {
+        if !matches!(bundle.registry, "community" | "verified") {
+            return Err(format!(
+                "the source registry: {:?} is neither community nor verified",
+                bundle.registry
+            ));
+        }
+        let document: Value = serde_json::from_str(bundle.key_status)
+            .map_err(|_| "the key status: the bundle's does not read".to_string())?;
+        verify::key_status_signed(&document, &self.keys)
+            .map_err(|why| format!("the key status: {why}"))?;
+        let carried = wire::key_status(&document);
+        let listed = verify::listing_statement(
+            bundle.listing_statement,
+            &self.keys,
+            bundle.listing,
+            bundle.version,
+            bundle.registry,
+            bundle.digest,
+        )?;
+        if !listed.floor.is_empty() {
+            meridian_sidecar::contract::admit(&listed.floor).map_err(|why| {
+                format!(
+                    "the floor: {} {} declares {why}",
+                    bundle.listing, bundle.version
+                )
+            })?;
+        }
+        let held = self.held()?;
+        let newest_held = held
+            .as_ref()
+            .filter(|held| !held.key_status.is_empty())
+            .and_then(|held| serde_json::from_str::<Value>(&held.key_status).ok())
+            .filter(|document| verify::key_status_signed(document, &self.keys).is_ok())
+            .map(|document| wire::key_status(&document))
+            .filter(|status| status.issued_at_ns > carried.issued_at_ns);
+        let checked = newest_held.unwrap_or_else(|| carried.clone());
+        let repository = format!("plugins/{}", bundle.listing);
+        let envelopes = self.upstream.referrers(&repository, bundle.digest).await?;
+        let (mut version, documentation) = self.verified(
+            Asked {
+                listing: bundle.listing,
+                version: bundle.version,
+                registry: bundle.registry,
+                digest: bundle.digest,
+                catalogued: None,
+            },
+            &envelopes,
+            &listed,
+            &checked,
+        )?;
+        version.key_status_issued_at_ns = checked.issued_at_ns;
+        let fetched = Fetched {
+            version,
+            statement: bundle.listing_statement.to_string(),
+            listed,
+            documentation,
+        };
+        if checked.issued_at_ns == carried.issued_at_ns {
+            let mut kept = held.unwrap_or_default();
+            kept.key_status = document.to_string();
+            self.store
+                .put_registry_catalogue(&kept)
+                .map_err(|failed| failed.to_string())?;
+        }
+        Ok(fetched)
+    }
+
+    /// What install and a bundle share once the listing statement verified
+    /// and the referrers are in hand (requirements 20, 22, 24, 25): the
+    /// provenance's signer, trusted at the build; the declaration the built
+    /// image carries; and the roles a launch may approve. Answers the version
+    /// to record and its documentation's texts, from the image's verified
+    /// metadata.
+    fn verified(
+        &self,
+        asked: Asked<'_>,
+        envelopes: &[String],
+        listed: &verify::Listed,
+        key_status: &SigningKeyStatus,
+    ) -> Result<(PluginVersion, Vec<DocumentationText>), String> {
+        let attested = self.attestations(envelopes, asked.digest, listed)?;
+        verify::signer_trusted(
+            key_status,
+            organisation_of(asked.listing),
             &listed.signer_key,
             attested.built_at_ns.unwrap_or(listed.listed_at_ns),
         )?;
         // The declaration recorded is the built image's (requirement 24).
-        let catalogued = chosen.metadata.clone().unwrap_or_default();
-        if catalogued.declaration != attested.metadata.declaration {
-            return Err(
-                "the declaration: the catalogue's is not the one the built image carries".into(),
-            );
+        if let Some(catalogued) = asked.catalogued {
+            if catalogued.declaration != attested.metadata.declaration {
+                return Err(
+                    "the declaration: the catalogue's is not the one the built image carries"
+                        .into(),
+                );
+            }
         }
         // What is approved is what is signed (requirement 25): a verified
         // version's roles are its review's; a community version's, its
         // declaration's.
-        let roles = if chosen.registry == "verified" {
+        let roles = if asked.registry == "verified" {
             listed.approved_roles.clone()
         } else {
             attested.metadata.roles.clone()
         };
-        if chosen.registry == "community" && listed.roles != roles {
+        if asked.registry == "community" && listed.roles != roles {
             return Err("the roles: the listing statement's are not the built image's".into());
         }
         let metadata = PluginMetadata {
-            name: listing.to_string(),
-            version: version.to_string(),
+            name: asked.listing.to_string(),
+            version: asked.version.to_string(),
             roles,
             interface: attested.metadata.interface,
             sdk_version: attested.metadata.sdk_version.clone(),
             declaration: attested.metadata.declaration.clone(),
         };
-        Ok(Fetched {
-            version: PluginVersion {
-                metadata: Some(metadata),
-                image_digest: chosen.image_digest.clone(),
-                source_registry: chosen.registry.clone(),
-                listing: listing.to_string(),
-                uploaded_at_ns: self.clock.now_ns(),
-                ..Default::default()
-            },
-            statement: reply.listing_statement,
-            listed,
-            documentation: attested.documentation,
-        })
+        let version = PluginVersion {
+            metadata: Some(metadata),
+            image_digest: asked.digest.to_string(),
+            source_registry: asked.registry.to_string(),
+            listing: asked.listing.to_string(),
+            uploaded_at_ns: self.clock.now_ns(),
+            ..Default::default()
+        };
+        Ok((version, attested.documentation))
     }
 
     /// The provenance and the image's metadata among `envelopes`, each
@@ -534,6 +642,31 @@ fn same_envelope(a: &str, b: &str) -> bool {
         (Ok(a), Ok(b)) => a == b,
         _ => false,
     }
+}
+
+/// What a verification is about.
+struct Asked<'a> {
+    listing: &'a str,
+    version: &'a str,
+    registry: &'a str,
+    digest: &'a str,
+    /// The catalogue's metadata for the version, where one is held: an
+    /// install's, never a bundle's.
+    catalogued: Option<&'a PluginMetadata>,
+}
+
+/// A plugin bundle as `meridian plugin upload --bundle` names it (W8.14):
+/// its image and referrers already pushed under plugins/{listing}.
+#[derive(Debug, Clone, Copy)]
+pub struct Bundle<'a> {
+    pub listing: &'a str,
+    pub version: &'a str,
+    /// `community` or `verified`.
+    pub registry: &'a str,
+    pub digest: &'a str,
+    /// The bundle's dated SigningKeyStatus, as the platform signed it.
+    pub key_status: &'a str,
+    pub listing_statement: &'a str,
 }
 
 struct Attested {

@@ -469,3 +469,177 @@ fn semver_orders_releases_above_their_pre_releases() {
     assert_eq!(semver_cmp("1.0", "1.0.0"), None);
     assert!(is_prerelease("2.0.0-beta") && !is_prerelease("2.0.0+meta"));
 }
+
+/// What `meridian plugin upload --bundle` names of the stand-in's 1.4.0:
+/// its key status and listing statement, as the download kept them.
+fn bundled(platform: &Platform) -> (String, String) {
+    (
+        platform.catalogue.lock().unwrap()["key_status"].to_string(),
+        platform.resolution.lock().unwrap()["listing_statement"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+    )
+}
+
+fn bundle<'a>(key_status: &'a str, statement: &'a str) -> Bundle<'a> {
+    Bundle {
+        listing: LISTING,
+        version: "1.4.0",
+        registry: "community",
+        digest: "",
+        key_status,
+        listing_statement: statement,
+    }
+}
+
+#[tokio::test]
+async fn a_bundle_is_verified_against_the_chart_s_keys_with_nothing_asked_of_the_platform() {
+    let platform = Platform::new();
+    let held = hold(&platform);
+    let (key_status, statement) = bundled(&platform);
+    let image = digest(0xab);
+    let carried = held
+        .carried(&Bundle {
+            digest: &image,
+            ..bundle(&key_status, &statement)
+        })
+        .await
+        .unwrap();
+    assert_eq!(carried.version.listing, LISTING);
+    assert_eq!(carried.version.source_registry, "community");
+    assert_eq!(
+        carried.version.key_status_issued_at_ns,
+        1_792_000_000_000_000_000
+    );
+    assert_eq!(carried.version.metadata.as_ref().unwrap().name, LISTING);
+    assert_eq!(
+        carried.version.metadata.as_ref().unwrap().roles,
+        ["custody"]
+    );
+    assert_eq!(carried.documentation[0].markdown, OVERVIEW);
+    assert_eq!(carried.statement, statement);
+    // The referrers are read from the deployment's own registry, and nothing
+    // from the platform, which an air-gapped deployment never reaches.
+    assert_eq!(
+        *platform.asked.lock().unwrap(),
+        [format!("referrers of plugins/{LISTING}")]
+    );
+    // The bundle's key status is the newest held, for the launch's check.
+    let kept = held.held().unwrap().unwrap();
+    assert_eq!(kept.pulled_at_ns, 0, "no catalogue was pulled");
+    assert!(kept.listings.is_empty());
+    assert_eq!(held.key_status().unwrap().keys[0].fingerprint, FINGERPRINT);
+}
+
+#[tokio::test]
+async fn a_bundle_that_does_not_verify_is_refused_naming_the_check_and_keeps_nothing() {
+    let platform = Platform::new();
+    let held = hold(&platform);
+    let (key_status, statement) = bundled(&platform);
+    let image = digest(0xab);
+    let at = |key_status, statement| Bundle {
+        digest: &image,
+        ..bundle(key_status, statement)
+    };
+    let forged = TestSigner::new()
+        .sign_document(json!({"issued_at_ns": 1, "keys": []}))
+        .to_string();
+    for (bundle, check) in [
+        (at(&forged, &statement), "the key status"),
+        (at("{not json", &statement), "the key status"),
+        (
+            Bundle {
+                version: "1.5.0",
+                ..at(&key_status, &statement)
+            },
+            "the listing statement",
+        ),
+        (
+            Bundle {
+                registry: "verified",
+                ..at(&key_status, &statement)
+            },
+            "the listing statement",
+        ),
+        (
+            Bundle {
+                registry: "local",
+                ..at(&key_status, &statement)
+            },
+            "the source registry",
+        ),
+        (
+            Bundle {
+                digest: &digest(0xcd),
+                ..at(&key_status, &statement)
+            },
+            "the listing statement",
+        ),
+    ] {
+        let refused = held.carried(&bundle).await.unwrap_err();
+        assert!(refused.contains(check), "{check}: {refused}");
+    }
+    // The provenance gone from the referrers pushed with it.
+    platform.referrers.lock().unwrap().remove(0);
+    let refused = held
+        .carried(&at(&key_status, &statement))
+        .await
+        .unwrap_err();
+    assert!(refused.contains("the provenance"), "{refused}");
+    assert!(held.held().unwrap().is_none(), "a refusal keeps nothing");
+}
+
+#[tokio::test]
+async fn a_bundle_s_signer_is_checked_against_the_newer_key_status_held() {
+    let platform = Platform::new();
+    let held = hold(&platform);
+    let (key_status, statement) = bundled(&platform);
+    let image = digest(0xab);
+    // A later key status, held from an earlier bundle or a pull, revokes the
+    // signer from before the build: the older bundle's status does not
+    // restore it.
+    let revoked = platform.signer.sign_document(json!({
+        "issued_at_ns": 1_792_100_000_000_000_000i64,
+        "keys": [{"key_id": "SGK-1", "organisation": "open-meridian", "name": "release",
+                  "public_key": "ssh-ed25519 AAAA", "fingerprint": FINGERPRINT,
+                  "registered_at_ns": 1, "registered_by_person_id": "",
+                  "revoked_at_ns": 2, "revoked_by_person_id": "", "revoke_reason": "lost",
+                  "not_trusted_after_ns": 2}],
+    }));
+    held.store()
+        .put_registry_catalogue(&HeldCatalogue {
+            key_status: revoked.to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+    let refused = held
+        .carried(&Bundle {
+            digest: &image,
+            ..bundle(&key_status, &statement)
+        })
+        .await
+        .unwrap_err();
+    assert!(refused.contains("revoked"), "{refused}");
+    // The newer status, carried in a later bundle, is the one kept and the
+    // one whose age the version shows.
+    let mut held_status: Value = serde_json::from_str(&key_status).unwrap();
+    held_status.as_object_mut().unwrap().remove("signature");
+    held_status["issued_at_ns"] = json!(1_792_150_000_000_000_000i64);
+    let newer = platform.signer.sign_document(held_status).to_string();
+    let carried = held
+        .carried(&Bundle {
+            digest: &image,
+            ..bundle(&newer, &statement)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        carried.version.key_status_issued_at_ns,
+        1_792_150_000_000_000_000
+    );
+    assert_eq!(
+        held.key_status().unwrap().issued_at_ns,
+        1_792_150_000_000_000_000
+    );
+}
