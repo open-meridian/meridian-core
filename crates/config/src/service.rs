@@ -76,7 +76,7 @@ use meridian_domain::v1::{
     SignInRecord, UserGroup, WithdrawPermissionReply, WithdrawPermissionRequest,
 };
 use meridian_domain::v1::{
-    ExternalAccountsEvent, ResolveInstrumentReply, ResolveInstrumentRequest,
+    ExternalAccountsEvent, PluginLaunchState, ResolveInstrumentReply, ResolveInstrumentRequest,
 };
 use meridian_pb::v1::{PluginAccessRequest, SettingColumnType, SettingDeclaration};
 use prost::Message;
@@ -383,11 +383,22 @@ fn launched_declaration(
     snapshot: &Snapshot,
     plugin_instance_id: &str,
 ) -> Option<meridian_pb::v1::PluginDeclaration> {
-    let launch = snapshot
-        .catalogue
-        .launches
-        .iter()
-        .find(|launch| launch.instance_id == plugin_instance_id)?;
+    // The instance's live launch, else its latest: the catalogue keeps every
+    // launch in history, oldest first, and an instance launched again from a
+    // newer version must be held to that version's declaration, never its
+    // first launch's (found on the dev deployment, 2026-10-17: every v25
+    // plugin refused for its 0.1.0's missing declaration).
+    let launches = || {
+        snapshot
+            .catalogue
+            .launches
+            .iter()
+            .filter(|launch| launch.instance_id == plugin_instance_id)
+    };
+    let launch = launches()
+        .rev()
+        .find(|launch| launch.state == PluginLaunchState::Launched as i32)
+        .or_else(|| launches().next_back())?;
     snapshot
         .catalogue
         .versions
