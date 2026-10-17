@@ -37,9 +37,40 @@ jobs:
       # which is the only check that the two implementations of that surface
       # agree. Both repositories are public, so this needs no credential and
       # nothing private is reachable from here.
+      #
+      # Which of the SDK's branches (the v25 build's O1, Q14): a pull
+      # request reads the SDK's branch of the same name where it has one --
+      # a contract change lands in both at once -- and main otherwise; a run
+      # by hand reads main. The run says which. The branch's name comes from
+      # the pull request, so it reaches the script only through the
+      # environment, and one holding anything but a branch name's characters
+      # reads main.
+      - name: Choose the SDK's branch
+        id: sdk
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          SDK: https://github.com/${{ github.repository_owner }}/meridian-python.git
+        run: |
+          ref=main
+          case "$HEAD_REF" in
+            "" | *[!A-Za-z0-9._/-]*) ;;
+            *)
+              if git ls-remote --exit-code --heads "$SDK" "refs/heads/$HEAD_REF" >/dev/null 2>&1; then
+                ref="$HEAD_REF"
+              fi
+              ;;
+          esac
+          if [ "$ref" = main ] && [ -n "$HEAD_REF" ]; then
+            echo "interop reads meridian-python@main: the SDK has no branch named after this pull request's"
+          else
+            echo "interop reads meridian-python@$ref"
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/meridian-python
+          ref: ${{ steps.sdk.outputs.ref }}
           path: workspace/meridian-python
 
       # Before anything builds an image: the runner's preinstalled toolsets
