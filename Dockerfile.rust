@@ -118,10 +118,25 @@ RUN --mount=type=cache,id=meridian-core-registry,target=/usr/local/cargo/registr
     --mount=type=cache,id=meridian-core-git,target=/usr/local/cargo/git \
     cargo deny --locked check advisories
 
+# The dashboard's unit-test binary alone, for the Settings pages below: the
+# compile's own invocation again over the same cache, so nothing compiles
+# again, and the one executable kept -- not compile's every test binary,
+# which the gate frees before e2e-settings-page runs (gate-drop-tests-image).
+FROM check AS settings-binary
+RUN --mount=type=cache,id=meridian-core-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=meridian-core-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=meridian-core-target,target=/w/target \
+    cargo test --workspace --locked --no-run --lib --test '*' \
+      --message-format=json-render-diagnostics >/tmp/compiled.json \
+ && exe=$(sed -n 's/.*"manifest_path":"[^"]*\/crates\/dashboard\/Cargo.toml".*"target":{"kind":\["lib"\].*"executable":"\([^"]*\)".*/\1/p' /tmp/compiled.json | head -1) \
+ && test -n "$exe" \
+ && cp "$exe" /settings-page \
+ && rm /tmp/compiled.json
+
 # A plugin's Settings pages served for a real browser (make e2e-settings-page):
-# the dashboard's unit-test binary from the compile above, whose ignored server
+# the dashboard's unit-test binary, whose ignored server
 # (crates/dashboard/src/admin/tests/served.rs) stands up its own world in-process,
 # on the runtime image so it serves the kit that image carries.
 FROM ${RUNTIME_IMAGE} AS settings-page
-COPY --from=compile /tests/meridian-dashboard/meridian_dashboard /usr/local/bin/settings-page
+COPY --from=settings-binary /settings-page /usr/local/bin/settings-page
 ENTRYPOINT ["settings-page", "--ignored", "--exact", "admin::tests::served::serve_a_plugins_settings_pages_for_a_browser", "--nocapture"]

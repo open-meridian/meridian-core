@@ -6,7 +6,7 @@ COMPOSE := docker compose
 DOCKER := DOCKER_BUILDKIT=1 docker
 
 .PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check licence-check-test gate-start \
-        stage-checks stage-runtime stage-compile stage-tests stage-sdk stage-dashboards stage-harness stage-first-run stage-image stage-lint \
+        gate-drop-tests-image stage-checks stage-runtime stage-compile stage-tests stage-sdk stage-dashboards stage-harness stage-first-run stage-image stage-lint \
         e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external e2e-cluster-backup \
         test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-service-account e2e-lake e2e-recorded e2e-orders e2e-one-id \
         build test test-store check-image-version chart-check check-crate-boundaries check-one-clock check-test-targets check-local-storage \
@@ -107,7 +107,7 @@ stage-runtime:    gate-begin-runtime check-nats-permissions check-codegen adviso
 	@$(GATE) end runtime
 stage-compile:    gate-begin-compile build test
 	@$(GATE) end compile
-stage-tests:      gate-begin-tests test-store test-broker test-directory e2e-settings-page
+stage-tests:      gate-begin-tests test-store test-broker test-directory gate-drop-tests-image e2e-settings-page
 	@$(GATE) end tests --drop compose:tests $(SETTINGS_PAGE_IMAGE) $(SETTINGS_BROWSER_IMAGE)
 stage-sdk:        gate-begin-sdk interop e2e-book
 	@$(GATE) end sdk
@@ -129,6 +129,16 @@ gate-start:
 
 gate-begin-%:
 	@$(GATE) begin $*
+
+# The tests stage's test binaries (compose's `tests`, 2.4 GB of debug test
+# binaries in a fresh run) freed once test-store, test-broker and
+# test-directory have run them, before e2e-settings-page builds the runtime
+# image's release build and pulls its browser: the stage then holds the
+# larger of its two halves, not their sum (v25's CI run held 15.5 GB of its
+# 15). e2e-settings-page takes the one binary it serves from
+# Dockerfile.rust's settings-binary, not from the whole set.
+gate-drop-tests-image:
+	@$(GATE) drop compose:tests
 
 ci-local-deep: ci-local
 

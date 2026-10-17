@@ -17,6 +17,7 @@ Docker's own filesystem, on a Docker Desktop VM and a CI runner alike.
     gate.py start --make-pid PID --floor-start GB --floor-stop GB
                   --budgets "stage=GB ..." --images "..."
     gate.py begin STAGE
+    gate.py drop IMAGE ...
     gate.py end STAGE [--drop IMAGE ...]
     gate.py finish
 
@@ -285,6 +286,23 @@ def free_stage(run: dict, drop: list[str]) -> None:
     docker("builder", "prune", "-f", "--filter", "type!=exec.cachemount")
 
 
+def drop(args: argparse.Namespace) -> int:
+    """Within a stage, what its earlier targets built and its later ones do not
+    need, freed before they run -- `end`'s --drop, staged -- so the stage holds
+    the larger of its parts at once, not their sum."""
+    if not started():
+        return 0
+    run = load()
+    before = free_kb()
+    record(before)
+    free_stage(run, args.images)
+    after = free_kb()
+    record(after)
+    print(f"-- gate: dropped {' '.join(args.images)} within the stage: {gb(before)} GB free, "
+          f"{gb(after)} GB once freed", flush=True)
+    return 0
+
+
 def end(args: argparse.Namespace) -> int:
     if not started():
         return 0
@@ -363,9 +381,12 @@ def main() -> int:
     e = sub.add_parser("end")
     e.add_argument("stage")
     e.add_argument("--drop", nargs="*", default=[])
+    d = sub.add_parser("drop")
+    d.add_argument("images", nargs="+")
     sub.add_parser("finish")
     args = parser.parse_args()
-    return {"start": start, "begin": begin, "end": end, "finish": finish}[args.command](args)
+    return {"start": start, "begin": begin, "drop": drop, "end": end,
+            "finish": finish}[args.command](args)
 
 
 if __name__ == "__main__":
