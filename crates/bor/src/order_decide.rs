@@ -2503,16 +2503,12 @@ pub(crate) fn reversal_lines(book: &Book, superseded: &str) -> Result<Vec<Moveme
     else {
         return Ok(Vec::new());
     };
-    let entry = &book.entries[at];
+    let body = book.body(entry_id)?;
     let lines: &[MovementLine] = match range {
-        Some((start, count)) => entry
-            .body
-            .lines
-            .get(start..start + count)
-            .unwrap_or_default(),
-        None => &entry.body.lines,
+        Some((start, count)) => body.lines.get(start..start + count).unwrap_or_default(),
+        None => &body.lines,
     };
-    Ok(lines
+    lines
         .iter()
         .map(|line| {
             let mut negated = line.clone();
@@ -2520,16 +2516,16 @@ pub(crate) fn reversal_lines(book: &Book, superseded: &str) -> Result<Vec<Moveme
             // A pending line a roll moved since is reversed where it is now
             // (W11.25; approved 2026-10-13).
             if line.bucket == SettlementBucket::Pending as i32 {
-                negated.value_date = rolled_to(book, at, line);
+                negated.value_date = rolled_to(book, at, line)?;
             }
             negated.quantity = line.quantity.as_ref().map(|quantity| {
                 Exact::from_wire(quantity)
                     .map(|value| value.negated().to_wire())
                     .unwrap_or(*quantity)
             });
-            negated
+            Ok(negated)
         })
-        .collect())
+        .collect()
 }
 
 /// Lines relieving a lot no longer open by as much -- a fill's lot booking
@@ -2607,17 +2603,19 @@ pub(crate) fn reroute_reliefs(book: &Book, lines: Vec<MovementLine>) -> Result<V
 /// held takes it on to the roll's new date (W11.25). A roll moves only what
 /// its instance's fills and rolls on the code left there, so a roll that
 /// moved the position from the line's date moved the line.
-pub(crate) fn rolled_to(book: &Book, at: usize, line: &MovementLine) -> String {
+pub(crate) fn rolled_to(book: &Book, at: usize, line: &MovementLine) -> Result<String> {
     let mut date = line.value_date.clone();
-    for later in book.entries.iter().skip(at + 1) {
-        for act in &later.body.acts {
+    // Only the later entries holding a roll are read (contract v26, W9.10).
+    let rolls = book.bodies_of(book.entries.iter().skip(at + 1).filter(|later| later.rolls))?;
+    for (_, later) in rolls {
+        for act in &later.acts {
             let Act::ValueDateRolled { roll, .. } = act else {
                 continue;
             };
             if roll.from_value_date != date || !roll.pair.contains(&line.instrument_id) {
                 continue;
             }
-            let moved = later.body.lines.iter().any(|moved| {
+            let moved = later.lines.iter().any(|moved| {
                 moved.bucket == SettlementBucket::Pending as i32
                     && moved.instrument_id == line.instrument_id
                     && moved.side == line.side
@@ -2629,7 +2627,7 @@ pub(crate) fn rolled_to(book: &Book, at: usize, line: &MovementLine) -> String {
             }
         }
     }
-    date
+    Ok(date)
 }
 
 fn date_field(field: &str, text: &str) -> Result<()> {
@@ -3258,16 +3256,18 @@ pub fn report_value_date_roll(
     // What this instance's fills and rolls on the code left pending on the
     // old date, by position, held to what each position has pending there.
     let mut owed: BTreeMap<Key, Exact> = BTreeMap::new();
-    for entry in &book.entries {
+    // Only the entries that did something on the order path are read
+    // (contract v26, W9.10): a fill's, an accept's or a roll's.
+    for (_, body) in book.bodies_of(book.entries.iter().filter(|entry| entry.acts))? {
         if !rolls_with(
             book,
-            &entry.body.acts,
+            &body.acts,
             &ctx.instance_id,
             &request.venue_account_code,
         ) {
             continue;
         }
-        for line in &entry.body.lines {
+        for line in &body.lines {
             if line.bucket != SettlementBucket::Pending as i32
                 || line.value_date != request.from_value_date
                 || !pair.contains(line.instrument_id.as_str())

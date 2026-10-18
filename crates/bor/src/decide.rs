@@ -1672,7 +1672,7 @@ fn adjustment_body(
 /// A reversal: the reversed entry's lines negated, at its effective date
 /// (W9.7); of an opening balance, only while no later entry moving the
 /// account's positions stands (W9.1, open point 5).
-fn reversal_body(book: &Book, entry_id: &str) -> Result<(Body, String)> {
+pub(crate) fn reversal_body(book: &Book, entry_id: &str) -> Result<(Body, String)> {
     let reversed = book.entry(entry_id).ok_or_else(|| {
         StoreError::Invalid(format!(
             "account {} holds no entry {entry_id}",
@@ -1684,7 +1684,7 @@ fn reversal_body(book: &Book, entry_id: &str) -> Result<(Body, String)> {
             "entry {entry_id} is reversed already"
         )));
     }
-    if !reversed.body.moves_positions() {
+    if !reversed.moves_positions {
         return Err(StoreError::Invalid(format!(
             "entry {entry_id} is a {}, which moves no position; a break's record is corrected \
              by its own act",
@@ -1693,7 +1693,7 @@ fn reversal_body(book: &Book, entry_id: &str) -> Result<(Body, String)> {
     }
     // A fill's or a charge's entry is the order path's: it is corrected by
     // a superseding execution, so positions and fills never disagree (W11).
-    if !reversed.body.acts.is_empty() {
+    if reversed.acts {
         return Err(StoreError::Invalid(format!(
             "entry {entry_id} is the order path's {}; it is corrected by a superseding \
              execution, never reversed",
@@ -1711,9 +1711,7 @@ fn reversal_body(book: &Book, entry_id: &str) -> Result<(Body, String)> {
             .position(|held| held.entry_id == entry_id)
             .expect("found above");
         let later = book.entries[index + 1..].iter().find(|held| {
-            held.body.moves_positions()
-                && held.reversed_by.is_none()
-                && held.body.reverses.is_empty()
+            held.moves_positions && held.reversed_by.is_none() && held.reverses.is_empty()
         });
         if let Some(later) = later {
             return Err(StoreError::refused(
@@ -1726,8 +1724,8 @@ fn reversal_body(book: &Book, entry_id: &str) -> Result<(Body, String)> {
             ));
         }
     }
-    let lines = reversed
-        .body
+    let body = book.body(entry_id)?;
+    let lines = body
         .lines
         .iter()
         .map(|line| {
@@ -1742,11 +1740,10 @@ fn reversal_body(book: &Book, entry_id: &str) -> Result<(Body, String)> {
         })
         .collect();
     let mut restored_unknown_costs = Vec::new();
-    let basis_adjustments = reversed
-        .body
+    let basis_adjustments = body
         .basis_adjustments
         .iter()
-        .zip(reversed.body.prior_holding_period_starts.iter())
+        .zip(body.prior_holding_period_starts.iter())
         .map(|(adjustment, prior)| BasisAdjustment {
             lot_id: adjustment.lot_id.clone(),
             cost: match &adjustment.cost {

@@ -86,6 +86,48 @@ pub enum StoreError {
     /// A refusal the book recorded (W11.8), as it is said on the bus.
     #[error("{0}")]
     Recorded(String),
+
+    /// A decision asked for entries' bodies the book does not hold
+    /// (contract v26, W9.10): the store loads them from the journal and
+    /// decides again ([`with_bodies`]). Never leaves the store.
+    #[error("the book holds no body for entries {0:?}")]
+    BodiesNeeded(Vec<String>),
+}
+
+/// How many times a decision may ask for bodies before it is a fault: each
+/// round loads every body the decision named at once.
+pub const BODY_ROUNDS: usize = 16;
+
+/// `decide` against `book`, loading from `load` each entry's body it asks
+/// for and deciding again (contract v26, W9.10; ruling 165): a decision is a
+/// pure function of the book, so deciding again with the bodies held is the
+/// decision a book holding every body makes.
+pub fn with_bodies<T>(
+    book: &mut Book,
+    mut load: impl FnMut(&str, &[String]) -> Result<Vec<(String, crate::journal::Body)>>,
+    mut decide: impl FnMut(&Book) -> Result<T>,
+) -> Result<T> {
+    for _ in 0..BODY_ROUNDS {
+        match decide(book) {
+            Err(StoreError::BodiesNeeded(entry_ids)) => {
+                let loaded = load(&book.account_id, &entry_ids)?;
+                if loaded.len() != entry_ids.len() {
+                    return Err(StoreError::Unavailable(format!(
+                        "account {}'s journal holds {} of the {} entries a decision named",
+                        book.account_id,
+                        loaded.len(),
+                        entry_ids.len()
+                    )));
+                }
+                book.hold_bodies(loaded);
+            }
+            other => return other,
+        }
+    }
+    Err(StoreError::Unavailable(format!(
+        "a decision on account {} asked for entries' bodies {BODY_ROUNDS} times",
+        book.account_id
+    )))
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -450,6 +492,22 @@ pub trait Store: Send + Sync {
     /// An account's journal, in order.
     fn journal(&self, account_id: &str) -> Result<Vec<Entry>>;
 
+    /// The bodies of the named entries of an account's journal (contract
+    /// v26, W9.10), each with its entry: what a decision asks for that the
+    /// book does not hold. An entry the journal does not have is left out.
+    fn bodies(
+        &self,
+        account_id: &str,
+        entry_ids: &[String],
+    ) -> Result<Vec<(String, crate::journal::Body)>> {
+        Ok(self
+            .journal(account_id)?
+            .into_iter()
+            .filter(|entry| entry_ids.contains(&entry.entry_id))
+            .map(|entry| (entry.entry_id, entry.body))
+            .collect())
+    }
+
     /// An account's book as its journal stands: from contract v25 (W9.10)
     /// from its latest snapshot and the journal's tail where the store keeps
     /// snapshots, else replayed whole.
@@ -459,7 +517,7 @@ pub trait Store: Send + Sync {
             .first()
             .map(|entry| entry.partition.clone())
             .unwrap_or_else(|| first_partition_of(account_id).to_string());
-        crate::book::Book::replay(account_id, &partition, &entries)
+        crate::book::Book::replay_lean(account_id, &partition, &entries)
     }
 
     /// The book's health per account (W9.10, contract v25; ruling 155): its

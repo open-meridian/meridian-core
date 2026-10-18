@@ -424,7 +424,7 @@ fn allocations_hold(
 // ── The lines a booking moves ──────────────────────────────────────────────
 
 /// The lots the booked executions opened, which booking closes first.
-fn fill_lots(book: &Book, execution_ids: &[String]) -> Vec<String> {
+fn fill_lots(book: &Book, execution_ids: &[String]) -> Result<Vec<String>> {
     let mut lots = Vec::new();
     for id in execution_ids {
         let Some(held) = book.ledger.executions.get(id) else {
@@ -434,16 +434,13 @@ fn fill_lots(book: &Book, execution_ids: &[String]) -> Vec<String> {
             Some((entry_id, start, count)) => (entry_id.clone(), Some((*start, *count))),
             None => (held.entry_id.clone(), None),
         };
-        let Some(entry) = book.entry(&entry_id) else {
+        if book.entry(&entry_id).is_none() {
             continue;
-        };
+        }
+        let body = book.body(&entry_id)?;
         let lines: &[MovementLine] = match range {
-            Some((start, count)) => entry
-                .body
-                .lines
-                .get(start..start + count)
-                .unwrap_or_default(),
-            None => &entry.body.lines,
+            Some((start, count)) => body.lines.get(start..start + count).unwrap_or_default(),
+            None => &body.lines,
         };
         for line in lines {
             if line.opens_lot.is_some()
@@ -453,7 +450,7 @@ fn fill_lots(book: &Book, execution_ids: &[String]) -> Vec<String> {
             }
         }
     }
-    lots
+    Ok(lots)
 }
 
 fn method_of(book: &Book) -> LotReliefMethod {
@@ -622,7 +619,7 @@ fn booking_lines(
 ) -> Result<Vec<MovementLine>> {
     let mut lines: Vec<MovementLine> = Vec::new();
     let mut seen: Vec<MovementLine> = earlier.to_vec();
-    let fills = fill_lots(book, execution_ids);
+    let fills = fill_lots(book, execution_ids)?;
     let method = method_of(book);
     let buy = buys(executed.side);
     let instrument = crate::order_decide::landing(book, &executed.instrument_id);
@@ -810,16 +807,15 @@ fn received_lines(
 /// An entry's lines between `start` and `start + count`, negated: what a
 /// cancel or a replace reverses, a lot it opened relieved to zero and one it
 /// relieved reopened by the same identifiers (W11.29).
-fn negated(book: &Book, entry_id: &str, start: usize, count: usize) -> Vec<MovementLine> {
+fn negated(book: &Book, entry_id: &str, start: usize, count: usize) -> Result<Vec<MovementLine>> {
     let Some(at) = book
         .entries
         .iter()
         .position(|held| held.entry_id == entry_id)
     else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    book.entries[at]
-        .body
+    book.body(entry_id)?
         .lines
         .get(start..start + count)
         .unwrap_or_default()
@@ -828,14 +824,14 @@ fn negated(book: &Book, entry_id: &str, start: usize, count: usize) -> Vec<Movem
             let mut out = line.clone();
             out.opens_lot = None;
             if line.bucket == SettlementBucket::Pending as i32 {
-                out.value_date = crate::order_decide::rolled_to(book, at, line);
+                out.value_date = crate::order_decide::rolled_to(book, at, line)?;
             }
             out.quantity = line.quantity.as_ref().map(|quantity| {
                 Exact::from_wire(quantity)
                     .map(|value| value.negated().to_wire())
                     .unwrap_or(*quantity)
             });
-            out
+            Ok(out)
         })
         .collect()
 }
@@ -1323,8 +1319,10 @@ pub fn correct_booking(
                 reason: request.reason.clone(),
             });
             let mut plan = Plan::new(CANCELLED, ctx.actor(), acts).reason(&request.reason);
-            plan.lines =
-                crate::order_decide::reroute_reliefs(book, negated(book, &entry_id, start, count))?;
+            plan.lines = crate::order_decide::reroute_reliefs(
+                book,
+                negated(book, &entry_id, start, count)?,
+            )?;
             finish(book, head, ctx, plan)
         }
         Ok(BookingCorrectionKind::Replace) => {
@@ -1360,8 +1358,10 @@ pub fn correct_booking(
                     ..allocation.clone()
                 })
                 .collect();
-            let reversed =
-                crate::order_decide::reroute_reliefs(book, negated(book, &entry_id, start, count))?;
+            let reversed = crate::order_decide::reroute_reliefs(
+                book,
+                negated(book, &entry_id, start, count)?,
+            )?;
             let lines = booking_lines(
                 book,
                 ctx,
@@ -1544,7 +1544,7 @@ pub fn withdraw_allocation(
         "allocation {allocation_id} of booking {booking_id} withdrawn by its correction"
     ));
     plan.lines =
-        crate::order_decide::reroute_reliefs(book, negated(book, &entry_id, start, count))?;
+        crate::order_decide::reroute_reliefs(book, negated(book, &entry_id, start, count)?)?;
     finish(book, head, ctx, plan).map(Some)
 }
 

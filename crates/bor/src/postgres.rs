@@ -239,9 +239,34 @@ fn book_from(
         None => {
             let entries = journal_of(client, account_id)?;
             let replayed = entries.len();
-            Ok((Book::replay(account_id, partition, &entries)?, replayed))
+            Ok((
+                Book::replay_lean(account_id, partition, &entries)?,
+                replayed,
+            ))
         }
     }
+}
+
+/// The bodies of the named entries of an account's journal (contract v26,
+/// W9.10), each with its entry: what a decision asked for that the book
+/// does not hold.
+fn bodies_of(
+    client: &mut impl GenericClient,
+    account_id: &str,
+    entry_ids: &[String],
+) -> Result<Vec<(String, Body)>> {
+    client
+        .query(
+            "SELECT entry_id, body FROM book_entry WHERE account_id = $1 AND entry_id = ANY($2)",
+            &[&account_id, &entry_ids],
+        )
+        .map_err(unavailable)?
+        .iter()
+        .map(|row| {
+            let body: Vec<u8> = row.get(1);
+            Ok((row.get(0), Body::from_bytes(&body)?))
+        })
+        .collect()
 }
 
 /// Keep a snapshot of an account's book as at its latest entry, and drop all
@@ -977,8 +1002,14 @@ impl Store for PostgresStore {
 
         // From its latest snapshot and the journal's tail (contract v25,
         // W9.10), never the whole journal once one is kept.
-        let (book, replayed) = book_from(&mut tx, account_id, &partition)?;
-        let decided = decide(&book, head.max(0) as u64)?;
+        let (mut book, replayed) = book_from(&mut tx, account_id, &partition)?;
+        // Each entry's body the decision asks for, read in this transaction
+        // (contract v26, W9.10), and the decision made again with it.
+        let decided = crate::store::with_bodies(
+            &mut book,
+            |account, ids| bodies_of(&mut tx, account, ids),
+            |book| decide(book, head.max(0) as u64),
+        )?;
         let entry = &decided.entry;
 
         tx.execute(
@@ -1036,6 +1067,10 @@ impl Store for PostgresStore {
 
     fn journal(&self, account_id: &str) -> Result<Vec<Entry>> {
         journal_of(&mut *self.conn()?, account_id)
+    }
+
+    fn bodies(&self, account_id: &str, entry_ids: &[String]) -> Result<Vec<(String, Body)>> {
+        bodies_of(&mut *self.conn()?, account_id, entry_ids)
     }
 
     fn book_health(
@@ -1417,7 +1452,7 @@ impl Store for PostgresStore {
         for (account, partition) in accounts {
             let entries = journal_of(&mut tx, &account)?;
             replayed += entries.len();
-            let book = Book::replay(&account, &partition, &entries)?;
+            let book = Book::replay_lean(&account, &partition, &entries)?;
             project(&mut tx, &account, &all_changes(&book)?)?;
             // Snapshots made again from the journal (contract v25, W9.10):
             // as at the latest entry, where the journal reaches the interval.

@@ -2056,7 +2056,9 @@ async fn different_identifiers_open_a_new_unrecognized_security_break() {
 /// journal's rows (each entry's body decoded, as the Postgres store reads
 /// them), a snapshot's size and the time to write and to read it back, and
 /// one entry of tail applied -- with the most memory each held above where
-/// it began.
+/// it began; and what the book itself holds once the journal's rows are let
+/// go, holding every entry's body as v25's did and holding none as v26's
+/// store does (W9.10, ruling 165).
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn replay_benchmark() {
@@ -2097,7 +2099,7 @@ async fn replay_benchmark() {
         idempotency_key: format!("figures:{n}"),
     };
     println!(
-        "entries | replay ms | replay peak MB | snapshot KB | encode ms | decode ms | decode peak MB | tail us/entry"
+        "entries | replay ms | replay peak MB | book MB with bodies | book MB without | snapshot KB | encode ms | decode ms | decode peak MB | tail us/entry"
     );
     for length in lengths {
         while made < length {
@@ -2134,10 +2136,24 @@ async fn replay_benchmark() {
                 ..entry.clone()
             })
             .collect();
-        let book = Book::replay(ACC, "P0", &entries).unwrap();
+        let book = Book::replay_lean(ACC, "P0", &entries).unwrap();
         let replay = started.elapsed();
         let replay_peak = Counting::peak() - base;
+        // What the book holds, every body in it (v25) and none (v26).
+        let mut held = book.clone();
+        let before_bodies = Counting::held();
+        held.hold_bodies(
+            entries
+                .iter()
+                .map(|entry| (entry.entry_id.clone(), entry.body.clone())),
+        );
+        let bodies_bytes = Counting::held().saturating_sub(before_bodies);
+        drop(held);
         drop(entries);
+        let lean_base = Counting::held();
+        let lean = book.clone();
+        let lean_bytes = Counting::held().saturating_sub(lean_base);
+        drop(lean);
         // A snapshot written, and read back.
         let started = Instant::now();
         let bytes = crate::snapshot::encode(&book);
@@ -2168,9 +2184,11 @@ async fn replay_benchmark() {
         resumed.apply(&tail, false).unwrap();
         let tail_us = started.elapsed().as_micros();
         println!(
-            "{length} | {:.1} | {:.1} | {} | {:.1} | {:.1} | {:.1} | {tail_us}",
+            "{length} | {:.1} | {:.1} | {:.2} | {:.2} | {} | {:.1} | {:.1} | {:.1} | {tail_us}",
             replay.as_secs_f64() * 1e3,
             replay_peak as f64 / 1e6,
+            (lean_bytes + bodies_bytes) as f64 / 1e6,
+            lean_bytes as f64 / 1e6,
             bytes.len() / 1024,
             encode.as_secs_f64() * 1e3,
             decode.as_secs_f64() * 1e3,

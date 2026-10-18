@@ -76,9 +76,16 @@ pub(crate) fn holds_across(before: &Book, entry: &Entry, after: &Book) {
 }
 
 /// For a whole journal: a snapshot at every entry, plus the rest, is the
-/// full replay.
+/// full replay; and that book, holding no body and loading each one a
+/// decision asks for from the journal (contract v26, W9.10), decides exactly
+/// as the full replay holding every body does.
 pub(crate) fn holds_at_every_split(account_id: &str, partition: &str, journal: &[Entry]) {
     let whole = Book::replay(account_id, partition, journal).unwrap();
+    assert_eq!(
+        whole.bodies.len(),
+        journal.len(),
+        "a replay holds every body"
+    );
     for at in 0..=journal.len() {
         let prefix = Book::replay(account_id, partition, &journal[..at]).unwrap();
         assert_eq!(
@@ -86,9 +93,85 @@ pub(crate) fn holds_at_every_split(account_id: &str, partition: &str, journal: &
             journal[..at].last().map(|e| e.first_sequence).unwrap_or(0)
         );
         let kept = decode(&encode(&prefix)).unwrap();
+        assert!(kept.bodies.is_empty(), "a snapshot holds no body");
         let resumed = resume(kept, &journal[at..]).unwrap();
         assert_eq!(resumed, whole, "split at {at} of {}", journal.len());
+        decides_lazily_as_the_whole(&whole, resumed, journal);
     }
+}
+
+/// A book holding no body answers, through [`crate::store::with_bodies`]
+/// over the journal, every body and every reversal exactly as `whole` does.
+fn decides_lazily_as_the_whole(whole: &Book, mut lazy: Book, journal: &[Entry]) {
+    let mut loads = 0;
+    let mut load = |_: &str, ids: &[String]| {
+        loads += 1;
+        Ok(journal
+            .iter()
+            .filter(|entry| ids.contains(&entry.entry_id))
+            .map(|entry| (entry.entry_id.clone(), entry.body.clone()))
+            .collect())
+    };
+    for entry in journal {
+        match lazy.body(&entry.entry_id) {
+            Ok(_) => {}
+            Err(StoreError::BodiesNeeded(named)) => assert_eq!(named, vec![entry.entry_id.clone()]),
+            Err(other) => panic!("{other}"),
+        }
+        let full = crate::decide::reversal_body(whole, &entry.entry_id).map_err(|e| e.to_string());
+        let loaded = crate::store::with_bodies(&mut lazy, &mut load, |book| {
+            crate::decide::reversal_body(book, &entry.entry_id)
+        })
+        .map_err(|e| e.to_string());
+        assert_eq!(loaded, full, "reversing {}", entry.entry_id);
+        let body = crate::store::with_bodies(&mut lazy, &mut load, |book| {
+            book.body(&entry.entry_id).cloned()
+        })
+        .unwrap();
+        assert_eq!(body, entry.body);
+    }
+    assert!(
+        journal.is_empty() || loads > 0,
+        "the lazy book loaded from the journal"
+    );
+}
+
+#[test]
+fn a_book_without_its_bodies_asks_for_them_and_a_bounded_number_of_rounds() {
+    let mut book = Book::new("ACC-1", "P0");
+    let asked = book.body("ENT-1").unwrap_err();
+    assert!(matches!(asked, StoreError::BodiesNeeded(ref ids) if ids == &["ENT-1".to_string()]));
+    // A journal that does not hold what was asked is a fault, never a loop.
+    let missing = crate::store::with_bodies(
+        &mut book,
+        |_, _| Ok(Vec::new()),
+        |book| book.body("ENT-1").map(|_| ()),
+    )
+    .unwrap_err();
+    assert!(
+        missing.to_string().contains("holds 0 of the 1"),
+        "{missing}"
+    );
+    let mut rounds = 0;
+    let looping = crate::store::with_bodies(
+        &mut book,
+        |_, ids| {
+            Ok(ids
+                .iter()
+                .map(|id| (id.clone(), Default::default()))
+                .collect())
+        },
+        |_| -> crate::store::Result<()> {
+            rounds += 1;
+            Err(StoreError::BodiesNeeded(vec![format!("ENT-{rounds}")]))
+        },
+    )
+    .unwrap_err();
+    assert_eq!(rounds, crate::store::BODY_ROUNDS);
+    assert!(
+        looping.to_string().contains("asked for entries' bodies"),
+        "{looping}"
+    );
 }
 
 #[test]
