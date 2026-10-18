@@ -50,9 +50,11 @@ area's, e2e/plugin-area/registry, which its make.py wrote and signed), it
 serves the registries' rows (W8.10, W5.19) from it: the catalogue, each
 version's resolution, and the plugin usage reports, heard; and, over TLS on
 port 8443 with the certificate in `HARNESS_REGISTRY_TLS`, the OCI registry
-the resolutions name, read-only, by digest, with the referrers API. A
-version it lists with an altered layer is served altered, as a tampered
-registry would.
+the resolutions name, read-only, by digest, with the referrers API and,
+from v26, the referrers tag schema, the API answering 404 for an image
+whose attestations are Sigstore bundles, as ghcr.io does. A version it
+lists with an altered layer is served altered, as a tampered registry
+would.
 
 From contract v26 (W1.30, W3.29; the v26 plan's item 7, rulings 199 and
 204) it mints binary event contracts by venue symbol: a matching request for
@@ -577,9 +579,18 @@ class Oci(http.server.BaseHTTPRequestHandler):
         index = registry_file("oci/index.json")
         _, _, rest = path.partition("/v2/")
         kind, digest = (rest.split("/")[-2:] + ["", ""])[:2] if "/" in rest else ("", "")
-        if kind == "referrers" and digest in index["referrers"]:
+        tag_schema_only = index.get("tag_schema_only", [])
+        if kind == "referrers" and digest in index["referrers"] and digest not in tag_schema_only:
             HEARD.append({"method": "GET", "path": path})
             return self.sent(200, json.dumps(index["referrers"][digest]).encode(),
+                             "application/vnd.oci.image.index.v1+json")
+        # The referrers tag schema (v26), `sha256-<hex>`: what a registry
+        # without the referrers API serves, as ghcr.io does, cosign keeping
+        # the index there; its API answers those images 404.
+        tagged = digest.replace("-", ":", 1) if digest.startswith("sha256-") else ""
+        if kind == "manifests" and tagged in index["referrers"]:
+            HEARD.append({"method": "GET", "path": path})
+            return self.sent(200, json.dumps(index["referrers"][tagged]).encode(),
                              "application/vnd.oci.image.index.v1+json")
         hex_ = digest.partition("sha256:")[2]
         held = os.path.join(REGISTRY, "oci", hex_)

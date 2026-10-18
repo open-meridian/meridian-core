@@ -21,6 +21,7 @@
 //! W4.1, contract v25).
 
 pub mod asset_class;
+pub mod attestation;
 pub mod date;
 pub mod declaration;
 pub mod exact;

@@ -1,0 +1,266 @@
+{
+ "about": "Captured 2026-10-17 from cosign v2.5.2 (cosign-darwin-arm64, sha256 51fdc6d8da8310d72df10065a52247b6bebfe990d4c946dd9f71e17588256011), signed with a throwaway key (cosign generate-key-pair; its public half is here, the private half was never kept). `cosign attest --yes --tlog-upload=false --new-bundle-format --key cosign.key --type <predicate type> --predicate <file> <image>@<digest>`, pushed to zot v2.1.5 (serves the referrers API) and distribution registry 2.8.3 (does not: cosign keeps the referrers tag schema, sha256-<hex>, as ghcr.io needs). `legacy_att` is the same provenance attested without --new-bundle-format: cosign's .att tag, whose layer is a bare DSSE envelope.",
+ "blobs": {
+  "sha256:5e7959f55764bf7536a86d8bdd776fa4bd62671e9e823f259c70570d44f47131": {
+   "dsseEnvelope": {
+    "payload": "eyJfdHlwZSI6Imh0dHBzOi8vaW4tdG90by5pby9TdGF0ZW1lbnQvdjAuMSIsInByZWRpY2F0ZVR5cGUiOiJodHRwczovL29wZW4tbWVyaWRpYW4uZGV2L2F0dGVzdGF0aW9uL3BsdWdpbi1tZXRhZGF0YS92MSIsInN1YmplY3QiOlt7Im5hbWUiOiJsb2NhbGhvc3Q6MTU4MDEvcGx1Z2lucy9leGFtcGxlLW9yZy9wcm9iZSIsImRpZ2VzdCI6eyJzaGEyNTYiOiIyODVkYjA3NjI2MWRhYWUxMWE2NjYxNGViMmU1ZjgwMmFkMjc4NTEyMThlOWZjYWI1MDgyOTUyMzYzMzQ0MTgwIn19XSwicHJlZGljYXRlIjp7ImRvY3VtZW50YXRpb24iOlt7ImRpZ2VzdCI6InNoYTI1Njp4IiwibmFtZSI6Im92ZXJ2aWV3Lm1kIiwidGV4dCI6IiMgUHJvYmUiLCJ0aXRsZSI6Ik92ZXJ2aWV3In1dLCJtZXRhZGF0YSI6eyJuYW1lIjoicHJvYmUiLCJyb2xlcyI6WyJkYXRhIl0sInZlcnNpb24iOiIwLjAuMSJ9LCJzY2hlbWFfdmVyc2lvbiI6InYyNSJ9fQ==",
+    "payloadType": "application/vnd.in-toto+json",
+    "signatures": [
+     {
+      "sig": "MEQCIH8O15395cR4AhttoEnCsSuncablPbioncHZ/EFm7RWyAiB3Eslg1+/MnmYHyLt+RPnAGKuODHTHjw6xQkymXAYoEw=="
+     }
+    ]
+   },
+   "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+   "verificationMaterial": {
+    "publicKey": {
+     "hint": "hhQD2T7uS/IGXP5j0SvBKu/8/q/Y+rxKe3mJ4AovjMo="
+    }
+   }
+  },
+  "sha256:854fe1241aeca3a096845f4eab334a3496b6c8c20450ff3c3457007c349132b1": {
+   "payload": "eyJfdHlwZSI6Imh0dHBzOi8vaW4tdG90by5pby9TdGF0ZW1lbnQvdjAuMSIsInByZWRpY2F0ZVR5cGUiOiJodHRwczovL3Nsc2EuZGV2L3Byb3ZlbmFuY2UvdjEiLCJzdWJqZWN0IjpbeyJuYW1lIjoibG9jYWxob3N0OjE1ODAxL3BsdWdpbnMvZXhhbXBsZS1vcmcvcHJvYmUiLCJkaWdlc3QiOnsic2hhMjU2IjoiMjg1ZGIwNzYyNjFkYWFlMTFhNjY2MTRlYjJlNWY4MDJhZDI3ODUxMjE4ZTlmY2FiNTA4Mjk1MjM2MzM0NDE4MCJ9fV0sInByZWRpY2F0ZSI6eyJidWlsZERlZmluaXRpb24iOnsiYnVpbGRUeXBlIjoiaHR0cHM6Ly9vcGVuLW1lcmlkaWFuLmRldi9wbHVnaW4tYnVpbGRlci92MSIsImV4dGVybmFsUGFyYW1ldGVycyI6eyJyZXBvc2l0b3J5IjoiZXhhbXBsZS1vcmcvcGx1Z2luLXByb2JlIiwidGFnIjoidjAuMC4xIn0sInJlc29sdmVkRGVwZW5kZW5jaWVzIjpbeyJkaWdlc3QiOnsiZ2l0Q29tbWl0IjoiMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2NyJ9LCJ1cmkiOiJnaXQraHR0cHM6Ly9naXRodWIuY29tL2V4YW1wbGUtb3JnL3BsdWdpbi1wcm9iZSJ9XX0sImJ1aWxkZXIiOiJvcGVuLW1lcmlkaWFuL3BsdWdpbi1idWlsZGVyIiwiY29tbWl0IjoiMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2NyIsInJlcG9zaXRvcnkiOiJleGFtcGxlLW9yZy9wbHVnaW4tcHJvYmUiLCJydW5EZXRhaWxzIjp7ImJ1aWxkZXIiOnsiaWQiOiJodHRwczovL2dpdGh1Yi5jb20vb3Blbi1tZXJpZGlhbi9wbHVnaW4tYnVpbGRlciJ9LCJtZXRhZGF0YSI6eyJpbnZvY2F0aW9uSWQiOiJodHRwczovL2dpdGh1Yi5jb20vb3Blbi1tZXJpZGlhbi9wbHVnaW4tYnVpbGRlci9hY3Rpb25zL3J1bnMvMSJ9fSwic2lnbmVyIjoiU0hBMjU2OnByb2JlcHJvYmVwcm9iZSIsInRhZyI6InYwLjAuMSJ9fQ==",
+   "payloadType": "application/vnd.in-toto+json",
+   "signatures": [
+    {
+     "keyid": "",
+     "sig": "MEYCIQCD6Z0JRwQNEUnz8kgHEQo82/ys4YNF3GJKOyi+og+jPQIhAIHUwiop+bcdYkiBafxyTt/hE1NddE1t2YZCAWi6vJrf"
+    }
+   ]
+  },
+  "sha256:a83e47cfc29457dbcad9b6cadd50b1d5fc22a3fb1d1a3f0878006e906638d1bb": {
+   "dsseEnvelope": {
+    "payload": "eyJfdHlwZSI6Imh0dHBzOi8vaW4tdG90by5pby9TdGF0ZW1lbnQvdjAuMSIsInByZWRpY2F0ZVR5cGUiOiJodHRwczovL3Nsc2EuZGV2L3Byb3ZlbmFuY2UvdjEiLCJzdWJqZWN0IjpbeyJuYW1lIjoibG9jYWxob3N0OjE1ODAwL3BsdWdpbnMvZXhhbXBsZS1vcmcvcHJvYmUiLCJkaWdlc3QiOnsic2hhMjU2IjoiMjg1ZGIwNzYyNjFkYWFlMTFhNjY2MTRlYjJlNWY4MDJhZDI3ODUxMjE4ZTlmY2FiNTA4Mjk1MjM2MzM0NDE4MCJ9fV0sInByZWRpY2F0ZSI6eyJidWlsZERlZmluaXRpb24iOnsiYnVpbGRUeXBlIjoiaHR0cHM6Ly9vcGVuLW1lcmlkaWFuLmRldi9wbHVnaW4tYnVpbGRlci92MSIsImV4dGVybmFsUGFyYW1ldGVycyI6eyJyZXBvc2l0b3J5IjoiZXhhbXBsZS1vcmcvcGx1Z2luLXByb2JlIiwidGFnIjoidjAuMC4xIn0sInJlc29sdmVkRGVwZW5kZW5jaWVzIjpbeyJkaWdlc3QiOnsiZ2l0Q29tbWl0IjoiMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2NyJ9LCJ1cmkiOiJnaXQraHR0cHM6Ly9naXRodWIuY29tL2V4YW1wbGUtb3JnL3BsdWdpbi1wcm9iZSJ9XX0sImJ1aWxkZXIiOiJvcGVuLW1lcmlkaWFuL3BsdWdpbi1idWlsZGVyIiwiY29tbWl0IjoiMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2NyIsInJlcG9zaXRvcnkiOiJleGFtcGxlLW9yZy9wbHVnaW4tcHJvYmUiLCJydW5EZXRhaWxzIjp7ImJ1aWxkZXIiOnsiaWQiOiJodHRwczovL2dpdGh1Yi5jb20vb3Blbi1tZXJpZGlhbi9wbHVnaW4tYnVpbGRlciJ9LCJtZXRhZGF0YSI6eyJpbnZvY2F0aW9uSWQiOiJodHRwczovL2dpdGh1Yi5jb20vb3Blbi1tZXJpZGlhbi9wbHVnaW4tYnVpbGRlci9hY3Rpb25zL3J1bnMvMSJ9fSwic2lnbmVyIjoiU0hBMjU2OnByb2JlcHJvYmVwcm9iZSIsInRhZyI6InYwLjAuMSJ9fQ==",
+    "payloadType": "application/vnd.in-toto+json",
+    "signatures": [
+     {
+      "sig": "MEUCIQCgQK4vjEpCT8DYLm+f8PrU+DrxJt0a1iQuaAYcGGwS+QIgZzk0lkkIbvJZrcoaQv+5R5I0zG0HasixpDpj4+DzsHg="
+     }
+    ]
+   },
+   "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+   "verificationMaterial": {
+    "publicKey": {
+     "hint": "hhQD2T7uS/IGXP5j0SvBKu/8/q/Y+rxKe3mJ4AovjMo="
+    }
+   }
+  },
+  "sha256:b3126d2de1a11f469fa22c3df5392efad8bd04ba4f3d97f38c4f87fb869d6868": {
+   "dsseEnvelope": {
+    "payload": "eyJfdHlwZSI6Imh0dHBzOi8vaW4tdG90by5pby9TdGF0ZW1lbnQvdjAuMSIsInByZWRpY2F0ZVR5cGUiOiJodHRwczovL29wZW4tbWVyaWRpYW4uZGV2L2F0dGVzdGF0aW9uL3BsdWdpbi1tZXRhZGF0YS92MSIsInN1YmplY3QiOlt7Im5hbWUiOiJsb2NhbGhvc3Q6MTU4MDAvcGx1Z2lucy9leGFtcGxlLW9yZy9wcm9iZSIsImRpZ2VzdCI6eyJzaGEyNTYiOiIyODVkYjA3NjI2MWRhYWUxMWE2NjYxNGViMmU1ZjgwMmFkMjc4NTEyMThlOWZjYWI1MDgyOTUyMzYzMzQ0MTgwIn19XSwicHJlZGljYXRlIjp7ImRvY3VtZW50YXRpb24iOlt7ImRpZ2VzdCI6InNoYTI1Njp4IiwibmFtZSI6Im92ZXJ2aWV3Lm1kIiwidGV4dCI6IiMgUHJvYmUiLCJ0aXRsZSI6Ik92ZXJ2aWV3In1dLCJtZXRhZGF0YSI6eyJuYW1lIjoicHJvYmUiLCJyb2xlcyI6WyJkYXRhIl0sInZlcnNpb24iOiIwLjAuMSJ9LCJzY2hlbWFfdmVyc2lvbiI6InYyNSJ9fQ==",
+    "payloadType": "application/vnd.in-toto+json",
+    "signatures": [
+     {
+      "sig": "MEUCIFg2FhM8Ur0hH/yAMr83r/xQotk1Llofkd9BVyEZyVLnAiEA3iqwDWq0HTHf7NkcRcleRNfWu047EB92IhYwZqeHOY8="
+     }
+    ]
+   },
+   "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+   "verificationMaterial": {
+    "publicKey": {
+     "hint": "hhQD2T7uS/IGXP5j0SvBKu/8/q/Y+rxKe3mJ4AovjMo="
+    }
+   }
+  },
+  "sha256:b514bcf2fefd0dca8b0297654390df17fbf2e8894320f251553e252757d6c358": {
+   "dsseEnvelope": {
+    "payload": "eyJfdHlwZSI6Imh0dHBzOi8vaW4tdG90by5pby9TdGF0ZW1lbnQvdjAuMSIsInByZWRpY2F0ZVR5cGUiOiJodHRwczovL3Nsc2EuZGV2L3Byb3ZlbmFuY2UvdjEiLCJzdWJqZWN0IjpbeyJuYW1lIjoibG9jYWxob3N0OjE1ODAxL3BsdWdpbnMvZXhhbXBsZS1vcmcvcHJvYmUiLCJkaWdlc3QiOnsic2hhMjU2IjoiMjg1ZGIwNzYyNjFkYWFlMTFhNjY2MTRlYjJlNWY4MDJhZDI3ODUxMjE4ZTlmY2FiNTA4Mjk1MjM2MzM0NDE4MCJ9fV0sInByZWRpY2F0ZSI6eyJidWlsZERlZmluaXRpb24iOnsiYnVpbGRUeXBlIjoiaHR0cHM6Ly9vcGVuLW1lcmlkaWFuLmRldi9wbHVnaW4tYnVpbGRlci92MSIsImV4dGVybmFsUGFyYW1ldGVycyI6eyJyZXBvc2l0b3J5IjoiZXhhbXBsZS1vcmcvcGx1Z2luLXByb2JlIiwidGFnIjoidjAuMC4xIn0sInJlc29sdmVkRGVwZW5kZW5jaWVzIjpbeyJkaWdlc3QiOnsiZ2l0Q29tbWl0IjoiMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2NyJ9LCJ1cmkiOiJnaXQraHR0cHM6Ly9naXRodWIuY29tL2V4YW1wbGUtb3JnL3BsdWdpbi1wcm9iZSJ9XX0sImJ1aWxkZXIiOiJvcGVuLW1lcmlkaWFuL3BsdWdpbi1idWlsZGVyIiwiY29tbWl0IjoiMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2NyIsInJlcG9zaXRvcnkiOiJleGFtcGxlLW9yZy9wbHVnaW4tcHJvYmUiLCJydW5EZXRhaWxzIjp7ImJ1aWxkZXIiOnsiaWQiOiJodHRwczovL2dpdGh1Yi5jb20vb3Blbi1tZXJpZGlhbi9wbHVnaW4tYnVpbGRlciJ9LCJtZXRhZGF0YSI6eyJpbnZvY2F0aW9uSWQiOiJodHRwczovL2dpdGh1Yi5jb20vb3Blbi1tZXJpZGlhbi9wbHVnaW4tYnVpbGRlci9hY3Rpb25zL3J1bnMvMSJ9fSwic2lnbmVyIjoiU0hBMjU2OnByb2JlcHJvYmVwcm9iZSIsInRhZyI6InYwLjAuMSJ9fQ==",
+    "payloadType": "application/vnd.in-toto+json",
+    "signatures": [
+     {
+      "sig": "MEQCIG/4ofaU+VdinSFkYXDQwypNCUtzdhqb42rnu8mct42RAiBxENdZnEdaXKw3IwmtxY0HybbfB9a1eGvZCzZyTL6+SQ=="
+     }
+    ]
+   },
+   "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+   "verificationMaterial": {
+    "publicKey": {
+     "hint": "hhQD2T7uS/IGXP5j0SvBKu/8/q/Y+rxKe3mJ4AovjMo="
+    }
+   }
+  }
+ },
+ "digest": "sha256:285db076261daae11a66614eb2e5f802ad27851218e9fcab5082952363344180",
+ "image": "localhost:15800/plugins/example-org/probe",
+ "legacy_att": {
+  "config": {
+   "digest": "sha256:246e8e6064c864e04ca2f2d85d80f9471eb8ad25b550c7fb9bdc54ae24a64a00",
+   "mediaType": "application/vnd.oci.image.config.v1+json",
+   "size": 233
+  },
+  "layers": [
+   {
+    "annotations": {
+     "dev.cosignproject.cosign/signature": "",
+     "predicateType": "https://slsa.dev/provenance/v1"
+    },
+    "digest": "sha256:854fe1241aeca3a096845f4eab334a3496b6c8c20450ff3c3457007c349132b1",
+    "mediaType": "application/vnd.dsse.envelope.v1+json",
+    "size": 1424
+   }
+  ],
+  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+  "schemaVersion": 2
+ },
+ "manifests": {
+  "sha256:177d26e77ae589a0e3b5a30996e7190c7cae45c58e2fff0af8dd1949d0de3dc3": {
+   "annotations": {
+    "dev.sigstore.bundle.content": "dsse-envelope",
+    "dev.sigstore.bundle.predicateType": "https://slsa.dev/provenance/v1",
+    "org.opencontainers.image.created": "2026-10-18T01:32:06Z"
+   },
+   "artifactType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+   "config": {
+    "artifactType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+    "digest": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    "mediaType": "application/vnd.oci.empty.v1+json",
+    "size": 2
+   },
+   "layers": [
+    {
+     "digest": "sha256:b514bcf2fefd0dca8b0297654390df17fbf2e8894320f251553e252757d6c358",
+     "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+     "size": 1587
+    }
+   ],
+   "mediaType": "application/vnd.oci.image.manifest.v1+json",
+   "schemaVersion": 2,
+   "subject": {
+    "digest": "sha256:285db076261daae11a66614eb2e5f802ad27851218e9fcab5082952363344180",
+    "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+    "size": 523
+   }
+  },
+  "sha256:192d9747261ea845176e0a271330491954a5b6c43b3a937655a39fa361ac7522": {
+   "annotations": {
+    "dev.sigstore.bundle.content": "dsse-envelope",
+    "dev.sigstore.bundle.predicateType": "https://open-meridian.dev/attestation/plugin-metadata/v1",
+    "org.opencontainers.image.created": "2026-10-18T01:32:07Z"
+   },
+   "artifactType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+   "config": {
+    "artifactType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+    "digest": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    "mediaType": "application/vnd.oci.empty.v1+json",
+    "size": 2
+   },
+   "layers": [
+    {
+     "digest": "sha256:5e7959f55764bf7536a86d8bdd776fa4bd62671e9e823f259c70570d44f47131",
+     "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+     "size": 983
+    }
+   ],
+   "mediaType": "application/vnd.oci.image.manifest.v1+json",
+   "schemaVersion": 2,
+   "subject": {
+    "digest": "sha256:285db076261daae11a66614eb2e5f802ad27851218e9fcab5082952363344180",
+    "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+    "size": 523
+   }
+  },
+  "sha256:963bc265fade07438cb2b2f059dca65ff0fe32b8c2e20016541cb839b430f1f7": {
+   "annotations": {
+    "dev.sigstore.bundle.content": "dsse-envelope",
+    "dev.sigstore.bundle.predicateType": "https://open-meridian.dev/attestation/plugin-metadata/v1",
+    "org.opencontainers.image.created": "2026-10-18T01:32:06Z"
+   },
+   "artifactType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+   "config": {
+    "artifactType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+    "digest": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    "mediaType": "application/vnd.oci.empty.v1+json",
+    "size": 2
+   },
+   "layers": [
+    {
+     "digest": "sha256:b3126d2de1a11f469fa22c3df5392efad8bd04ba4f3d97f38c4f87fb869d6868",
+     "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+     "size": 983
+    }
+   ],
+   "mediaType": "application/vnd.oci.image.manifest.v1+json",
+   "schemaVersion": 2,
+   "subject": {
+    "digest": "sha256:285db076261daae11a66614eb2e5f802ad27851218e9fcab5082952363344180",
+    "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+    "size": 523
+   }
+  },
+  "sha256:acf51cf55d993074ca7a5bd436356ea56c960a53d145fc1f8858fc3e8e8167b2": {
+   "annotations": {
+    "dev.sigstore.bundle.content": "dsse-envelope",
+    "dev.sigstore.bundle.predicateType": "https://slsa.dev/provenance/v1",
+    "org.opencontainers.image.created": "2026-10-18T01:32:06Z"
+   },
+   "artifactType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+   "config": {
+    "artifactType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+    "digest": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    "mediaType": "application/vnd.oci.empty.v1+json",
+    "size": 2
+   },
+   "layers": [
+    {
+     "digest": "sha256:a83e47cfc29457dbcad9b6cadd50b1d5fc22a3fb1d1a3f0878006e906638d1bb",
+     "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+     "size": 1587
+    }
+   ],
+   "mediaType": "application/vnd.oci.image.manifest.v1+json",
+   "schemaVersion": 2,
+   "subject": {
+    "digest": "sha256:285db076261daae11a66614eb2e5f802ad27851218e9fcab5082952363344180",
+    "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+    "size": 523
+   }
+  }
+ },
+ "public_key": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEgwcoaR2YmBV28NAldWRtJ5Tw/k0g\nL1wxfRRZOToYrl6iPWhE7Jg1C+PL37Fxf7IvQFHtGMWM0Vw+Ve2MiQw2OQ==\n-----END PUBLIC KEY-----\n",
+ "referrers_api": {
+  "manifests": [
+   {
+    "annotations": {
+     "dev.sigstore.bundle.content": "dsse-envelope",
+     "dev.sigstore.bundle.predicateType": "https://slsa.dev/provenance/v1",
+     "org.opencontainers.image.created": "2026-10-18T01:32:06Z"
+    },
+    "artifactType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+    "digest": "sha256:acf51cf55d993074ca7a5bd436356ea56c960a53d145fc1f8858fc3e8e8167b2",
+    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+    "size": 883
+   },
+   {
+    "annotations": {
+     "dev.sigstore.bundle.content": "dsse-envelope",
+     "dev.sigstore.bundle.predicateType": "https://open-meridian.dev/attestation/plugin-metadata/v1",
+     "org.opencontainers.image.created": "2026-10-18T01:32:06Z"
+    },
+    "artifactType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+    "digest": "sha256:963bc265fade07438cb2b2f059dca65ff0fe32b8c2e20016541cb839b430f1f7",
+    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+    "size": 908
+   }
+  ],
+  "mediaType": "application/vnd.oci.image.index.v1+json",
+  "schemaVersion": 2
+ },
+ "tag_schema": {
+  "manifests": [
+   {
+    "artifactType": "application/vnd.oci.empty.v1+json",
+    "digest": "sha256:177d26e77ae589a0e3b5a30996e7190c7cae45c58e2fff0af8dd1949d0de3dc3",
+    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+    "size": 883
+   },
+   {
+    "artifactType": "application/vnd.oci.empty.v1+json",
+    "digest": "sha256:192d9747261ea845176e0a271330491954a5b6c43b3a937655a39fa361ac7522",
+    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+    "size": 908
+   }
+  ],
+  "mediaType": "application/vnd.oci.image.index.v1+json",
+  "schemaVersion": 2
+ }
+}

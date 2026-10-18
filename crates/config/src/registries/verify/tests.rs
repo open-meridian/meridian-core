@@ -266,3 +266,54 @@ fn rfc3339_times_read_as_python_and_go_write_them() {
     );
     assert_eq!(rfc3339_ns("not a time"), None);
 }
+
+/// v26's core (found on the development deployment 2026-10-18): the
+/// builder attaches each attestation as a Sigstore bundle. Against real
+/// cosign 2.5.2 output, signed with the fixture's throwaway key: each
+/// bundle's envelope verifies against that key as the platform's, exactly
+/// as a bare envelope does -- the legacy `.att` layer too -- and against
+/// any other key nothing does, whatever the bundle's own verification
+/// material says.
+#[test]
+fn a_sigstore_bundles_envelope_verifies_against_the_platforms_keys_alone() {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../../domain/src/attestation/cosign-2.5.2.json"
+    ))
+    .unwrap();
+    let digest = fixture["digest"].as_str().unwrap();
+    let keys =
+        PlatformKeys::from_pems(&[fixture["public_key"].as_str().unwrap().to_string()]).unwrap();
+    let other = PlatformKeys::from_pems(&[TestSigner::new().pem()]).unwrap();
+    let blobs = &fixture["blobs"];
+    let mut stated = Vec::new();
+    let layers = fixture["manifests"]
+        .as_object()
+        .unwrap()
+        .values()
+        .flat_map(|manifest| manifest["layers"].as_array().unwrap().clone())
+        .chain(fixture["legacy_att"]["layers"].as_array().unwrap().clone());
+    for layer in layers {
+        let blob = &blobs[layer["digest"].as_str().unwrap()];
+        let envelope = meridian_domain::attestation::envelope_in(&layer, blob)
+            .unwrap()
+            .to_string();
+        let predicate = [PROVENANCE_PREDICATE, METADATA_PREDICATE]
+            .into_iter()
+            .find(|predicate| statement(&envelope, &keys, predicate, digest).is_ok())
+            .expect("each envelope verifies as one of the two");
+        stated.push(predicate);
+        assert_eq!(
+            statement(&envelope, &other, predicate, digest).unwrap_err(),
+            "no signature on it is the platform's"
+        );
+    }
+    assert_eq!(
+        stated
+            .iter()
+            .filter(|p| **p == PROVENANCE_PREDICATE)
+            .count(),
+        3,
+        "two bundles and the legacy .att"
+    );
+    assert_eq!(stated.len(), 5);
+}

@@ -345,7 +345,11 @@ impl Oci {
         }
     }
 
-    /// The DSSE envelopes among a referrer manifest's layers.
+    /// The DSSE envelopes among a referrer manifest's layers: a bare
+    /// envelope, or a Sigstore bundle's `dsseEnvelope` (v26's core, found on
+    /// the development deployment 2026-10-18: the builder attaches bundles).
+    /// Each is verified by the caller against the platform's keys; a
+    /// bundle's own verification material is never read.
     async fn envelopes_of(&self, from: &From<'_>, manifest: &serde_json::Value) -> Vec<String> {
         let mut found = Vec::new();
         for layer in manifest["layers"].as_array().into_iter().flatten() {
@@ -354,8 +358,9 @@ impl Oci {
             };
             if let Ok(bytes) = self.blob(from, digest).await {
                 if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                    if value.get("payloadType").is_some() {
-                        found.push(value.to_string());
+                    if let Some(envelope) = meridian_domain::attestation::envelope_in(layer, &value)
+                    {
+                        found.push(envelope.to_string());
                     }
                 }
             }
@@ -382,7 +387,10 @@ impl Oci {
         };
         let source = Source { host, name, token };
         self.copy_manifest(&source, repository, digest).await?;
-        // The referrers: the API, or the tag schema where there is none.
+        // The referrers: the API, or the tag schema where there is none --
+        // ghcr.io answers the API 404, and cosign keeps the index under the
+        // tag `sha256-<hex>` (OCI distribution 1.1's fallback). Either is
+        // read by digest below, and every envelope verified.
         let listed = match self
             .get(&source, &format!("referrers/{digest}"), INDEX)
             .await

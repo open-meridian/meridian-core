@@ -58,7 +58,10 @@ narrowed as the plan's tests ask, through `/mcp` alone:
    reads 1.4.0's sections, the troubleshooting's jailbreak withheld as
    prompt talk, and its Reference; the version's page draws it with the
    supervision notice; 1.5.0, installed, shows its changed overview while
-   1.4.0 keeps its own. The harness's instance was not launched from the
+   1.4.0 keeps its own. 1.4.0's attestations are bare DSSE envelopes the
+   referrers API lists; 1.5.0's are Sigstore bundles listed only under the
+   referrers tag schema, the API answering 404, as the platform's builder
+   attaches them on ghcr.io (v26's core). The harness's instance was not launched from the
    catalogue, so a custody admin's documentation read by instance says so.
 8. A launch of 1.4.0, verified again from the deployment's own registry,
    reaches the launcher the harness does not have; with its provenance
