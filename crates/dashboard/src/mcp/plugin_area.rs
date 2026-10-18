@@ -270,7 +270,7 @@ pub static SPECS: &[Spec] = &[
     spec(
         "read_registry_plugin",
         "Read a registry listing",
-        "one listing from the catalogue's copy, as its page shows it: its versions (pulled and withdrawn marked), each version's roles, floor against this deployment and build (repository, commit, tag, signer key), the vendor's attributes and support contact (stated by the vendor), and a version's declaration as its Reference, each version saying whether it was reviewed, with the platform Terms' address (terms_url). Its documentation's texts are read once it is installed (dashboard__read_plugin_documentation).",
+        "one listing from the catalogue's copy, as its page shows it: its versions (pulled and withdrawn marked), each version's roles, floor against this deployment and build (repository, commit, tag, signer key), the vendor's attributes and support contact (stated by the vendor), and a version's declaration as its Reference, each version saying whether it was reviewed, with the platform Terms' address (terms_url). Its documentation's texts as the catalogue carries them are drawn on its page's Documentation tab before it is installed, screened; once installed, dashboard__read_plugin_documentation reads them verified.",
         true,
         Gate::DeploymentAdmin,
         listing_schema,
@@ -753,6 +753,30 @@ fn listing_line_json(listing: &meridian_domain::v1::PluginListing) -> Value {
     })
 }
 
+/// A version's documentation sections as a tool answers them: each its
+/// vendor wrote as vendor_markdown, or withheld where the screen holds it
+/// as suspect.
+fn sections_json(texts: &[meridian_domain::v1::DocumentationText]) -> Vec<Value> {
+    crate::documentation::SECTIONS
+        .iter()
+        .filter_map(|(key, _)| texts.iter().find(|text| text.section == *key))
+        .map(|text| {
+            let screened = crate::documentation::screen(&text.markdown);
+            if screened.suspect() {
+                json!({
+                    "section": text.section,
+                    "withheld": format!(
+                        "withheld: {}; a person reads it on the Documentation tab",
+                        screened.why()
+                    ),
+                })
+            } else {
+                json!({"section": text.section, "vendor_markdown": text.markdown})
+            }
+        })
+        .collect()
+}
+
 fn listed_version_json(version: &meridian_domain::v1::ListedVersion) -> Value {
     let build = version.build.clone().unwrap_or_default();
     json!({
@@ -770,6 +794,8 @@ fn listed_version_json(version: &meridian_domain::v1::ListedVersion) -> Value {
         "pull": version.pull.as_ref().filter(|p| p.restored_at_ns == 0).map(pull_json),
         // Contract v26 (W8.10; ruling 274).
         "reviewed": version.reviewed,
+        // v25's follow-up: its sections as the catalogue carries them.
+        "documentation": sections_json(&version.documentation),
     })
 }
 
@@ -1341,24 +1367,7 @@ impl Context<'_> {
                     )
                 }
             };
-        let sections: Vec<Value> = crate::documentation::SECTIONS
-            .iter()
-            .filter_map(|(key, _)| reply.documentation.iter().find(|text| text.section == *key))
-            .map(|text| {
-                let screened = crate::documentation::screen(&text.markdown);
-                if screened.suspect() {
-                    json!({
-                        "section": text.section,
-                        "withheld": format!(
-                            "withheld: {}; a person reads it on the Documentation tab",
-                            screened.why()
-                        ),
-                    })
-                } else {
-                    json!({"section": text.section, "vendor_markdown": text.markdown})
-                }
-            })
-            .collect();
+        let sections = sections_json(&reply.documentation);
         let reference = reply.declaration.as_ref().map_or(Value::Null, |declared| {
             let mut said = crate::declaration::to_json(declared);
             others_json(&mut said);

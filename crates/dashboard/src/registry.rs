@@ -653,7 +653,12 @@ async fn listing_page(
     .collect();
     let body = match tab {
         "documentation" => match chosen {
-            Some(version) => listed_documentation(&name, version),
+            Some(version) => listed_documentation(
+                &name,
+                version,
+                asked.get("section").map(String::as_str),
+                asked.get("part").map(String::as_str),
+            ),
             None => "<p class=\"hint\">It lists no version.</p>".into(),
         },
         "versions" => versions_tab(&listing),
@@ -716,14 +721,21 @@ fn overview(listing: &PluginListing, chosen: Option<&ListedVersion>) -> String {
     )
 }
 
-/// A listed version's documentation before it is installed: the catalogue
-/// carries its declaration, drawn as the Documentation tab's Reference; its
-/// sections' texts arrive with the install, verified (W8.10).
-fn listed_documentation(name: &str, version: &ListedVersion) -> String {
+/// A listed version's documentation before it is installed (v25's
+/// follow-up): its sections' texts as the catalogue carries them
+/// (ListedVersion.documentation), screened as every vendor text is and
+/// verified against the declaration's digests when the version is
+/// installed; its Reference is its declaration.
+fn listed_documentation(
+    name: &str,
+    version: &ListedVersion,
+    section: Option<&str>,
+    part: Option<&str>,
+) -> String {
     let metadata = version.metadata.clone().unwrap_or_default();
     let reply = meridian_domain::v1::ReadPluginDocumentationReply {
         declaration: metadata.declaration.clone(),
-        documentation: Vec::new(),
+        documentation: version.documentation.clone(),
         uploaded_by: String::new(),
         uploaded_at_ns: version.listed_at_ns,
     };
@@ -734,29 +746,25 @@ fn listed_documentation(name: &str, version: &ListedVersion) -> String {
         version.version
     );
     let href = |section: &str, part: &str| crate::documentation::section_href(&base, section, part);
-    let sections = metadata
-        .declaration
-        .as_ref()
-        .map(|d| {
-            d.documentation
-                .iter()
-                .map(|s| s.name.clone())
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .unwrap_or_default();
+    let said = if version.documentation.is_empty() {
+        "Its sections arrive with the install, verified; its Reference is its declaration."
+    } else {
+        "As the catalogue carries it, before it is installed; verified against its declaration's digests when it is."
+    };
     format!(
-        "<p class=\"hint\">Its sections ({}) are read once it is installed, verified against the digests below; \
-         its Reference is its declaration.</p>{}",
-        if sections.is_empty() { "none".to_string() } else { escape(&sections) },
+        "<p class=\"hint\" data-listed-documentation>{said}</p>{}",
         crate::documentation::drawn(&crate::documentation::Page {
             name,
             version: &version.version,
             roles: &roles,
             reply: &reply,
             note: "",
-            section: Some(crate::documentation::REFERENCE),
-            part: None,
+            section: section.or(if version.documentation.is_empty() {
+                Some(crate::documentation::REFERENCE)
+            } else {
+                None
+            }),
+            part,
             href: &href,
         })
     )

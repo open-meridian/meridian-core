@@ -2863,6 +2863,11 @@ fn serving_registries(h: &Harness) -> Asked {
             signer_fingerprint: "SHA256:tagkey".into(),
             ..Default::default()
         }),
+        // v25's follow-up: its sections' texts in the catalogue's copy.
+        documentation: vec![meridian_domain::v1::DocumentationText {
+            section: "overview".into(),
+            markdown: format!("Reads the holdings of the brokerage accounts, version {v}.\n"),
+        }],
         ..Default::default()
     };
     keep(
@@ -3017,6 +3022,14 @@ async fn a_deployment_admin_browses_installs_and_keeps_from_the_plugins_page() {
         .to_str()
         .unwrap()
         .contains("script-src 'self' 'sha256-"));
+    // Its sections' texts as the catalogue carries them, before install.
+    assert!(
+        docs.body
+            .contains("Reads the holdings of the brokerage accounts")
+            && docs.body.contains("data-listed-documentation"),
+        "{}",
+        docs.body
+    );
     // The install sheet (ruling 274): the form at once, its one line
     // linking the Terms, with the usage setting and the floor.
     let sheet = get(
