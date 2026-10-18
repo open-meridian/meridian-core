@@ -779,6 +779,13 @@ message VenueCatalogue {
   // sends its venue when the `ems` accepts a venue-originated fill or
   // answers it DK. Unspecified, as a v22 catalogue is, reads as none.
   ExecutionAcknowledgement execution_acknowledgement = 6;
+  // Contract v26 (W11.20; G1 question 5, approved 2026-10-14): the
+  // environment the plugin's session actually reached, read from the
+  // vendor's host, in the role-common setting's values -- `live`,
+  // `sandbox` or `paper`; empty, as a v25 catalogue is, is no report. A
+  // connection is demo only while its setting and this both say `sandbox`
+  // or `paper`.
+  string environment = 7;
 }
 
 // The acknowledgement a venue takes of an execution it originated (W11.20;
@@ -947,4 +954,35 @@ message SentUsageReport {
   // Whether the platform received it.
   bool received = 2;
   IdentifierUsageReport report = 3;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W6.35 — the deployment's time zone, contract v26
+// ─────────────────────────────────────────────────────────────────────────────
+
+// The deployment admin sets the deployment's time zone (W6.35; the v26
+// plan's question 229): each change its own record.
+message SetDeploymentTimeZoneRequest {
+  // An IANA time-zone ID (RFC 6557's database): `America/New_York`.
+  string deployment_time_zone = 1;
+  string reason = 2;
+}
+
+// W6.35: the zone read, by the book for due_by (W11.34) and the dashboard.
+message ReadDeploymentTimeZoneRequest {}
+
+// The deployment's time zone in force, and beside it the deadline the book
+// sets a held booking's due_by from (W11.34; question 230).
+message DeploymentTimeZoneSetting {
+  // `America/New_York` by default.
+  string deployment_time_zone = 1;
+  // The last change; 0 and empty for the default never changed.
+  int64 changed_at_ns = 2;
+  string changed_by = 3;
+  // The earliest affirmation_deadline a launched operations instance
+  // declares (W8.1), minutes after midnight in the zone, 1 to 1440; 0 where
+  // none is launched or none declares one.
+  uint32 affirmation_deadline = 4;
+  // The instance declaring it; empty with 0.
+  string affirmation_deadline_instance_id = 5;
 }

@@ -6,8 +6,9 @@
 //! is a count or a word the platform may add to.
 
 use meridian_domain::v1::{
-    DownloadListedVersionReply, ListedVersion, PluginBuild, PluginListing, PluginMetadata,
-    PluginPull, PullCatalogueReply, PullReasonKind, SigningKeyRecord, SigningKeyStatus,
+    DocumentationText, DownloadListedVersionReply, ListedVersion, PluginBuild, PluginListing,
+    PluginMetadata, PluginPull, PluginPullStatus, PullCatalogueReply, PullReasonKind,
+    SigningKeyRecord, SigningKeyStatus,
 };
 use serde_json::Value;
 
@@ -89,8 +90,44 @@ fn build(value: &Value) -> PluginBuild {
         log_url: text(value, "log_url"),
         requested_at_ns: number(value, "requested_at_ns"),
         finished_at_ns: number(value, "finished_at_ns"),
+        // The platform's page for the build (contract v26, W8.8).
+        page_url: text(value, "page_url"),
         ..Default::default()
     }
+}
+
+/// The vendor's texts a listed version carries (contract v26, W8.10), each
+/// by its section; checked against the declaration's digests where they
+/// are drawn, never here.
+fn documentation(value: &Value) -> Vec<DocumentationText> {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|text_of| DocumentationText {
+            section: text(text_of, "section"),
+            markdown: text(text_of, "markdown"),
+        })
+        .filter(|text_of| !text_of.section.is_empty())
+        .collect()
+}
+
+/// Every pulled version in the catalogue as the platform signed it
+/// (contract v26, W8.14), or `None` where the answer carries none.
+pub fn pull_status(value: &Value) -> Option<PluginPullStatus> {
+    if !value.is_object() {
+        return None;
+    }
+    Some(PluginPullStatus {
+        issued_at_ns: number(value, "issued_at_ns"),
+        pulls: value["pulls"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(pull)
+            .collect(),
+        signature: text(value, "signature"),
+    })
 }
 
 /// A version's metadata, its declaration as the SDK prints it; one whose
@@ -135,6 +172,10 @@ pub fn listed_version(value: &Value, at: &str) -> Result<ListedVersion, String> 
         pull: pull(&value["pull"]),
         sequence: number(value, "sequence").max(0) as u64,
         listing_statement: text(value, "listing_statement"),
+        // Contract v26 (W8.10; ruling 274): reviewed for verified, and the
+        // vendor's texts for the Documentation tab before install.
+        reviewed: value["reviewed"].as_bool().unwrap_or(false),
+        documentation: documentation(&value["documentation"]),
     };
     if !matches!(version.registry.as_str(), "community" | "verified") {
         return Err(format!(
@@ -179,6 +220,10 @@ pub fn listing(value: &Value, at: &str) -> Result<PluginListing, String> {
         installs: number(value, "installs").max(0) as u64,
         instances: number(value, "instances").max(0) as u64,
         counts_shown: value["counts_shown"].as_bool().unwrap_or(false),
+        // Contract v26 (W8.10; ruling 274): agents' answers carry these in
+        // place of the notice.
+        reviewed: value["reviewed"].as_bool().unwrap_or(false),
+        terms_url: text(value, "terms_url"),
     })
 }
 
@@ -224,6 +269,9 @@ pub fn catalogue(value: &Value) -> Result<PullCatalogueReply, String> {
             .get("key_status")
             .filter(|status| status.is_object())
             .map(key_status),
+        // Contract v26 (W8.10; ruling 274): the Terms' address, which the
+        // install dialog's one line links.
+        terms_url: text(value, "terms_url"),
     })
 }
 
@@ -235,6 +283,8 @@ pub fn resolution(value: &Value) -> Result<DownloadListedVersionReply, String> {
         pull_token: text(value, "pull_token"),
         pull_token_expires_at_ns: number(value, "pull_token_expires_at_ns"),
         listing_statement: text(value, "listing_statement"),
+        // Contract v26 (W8.14; ruling 196): the catalogue's pulls, signed.
+        pull_status: pull_status(&value["pull_status"]),
     };
     if !is_digest(&reply.image_digest) {
         return Err("the resolution names no sha256 digest".into());

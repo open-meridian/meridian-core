@@ -241,6 +241,7 @@ pub(crate) fn stamp_of(claims: &CallerClaims, with_prepared: bool) -> Stamp {
         },
         // Decided per placement, where the command is sent (contract v22).
         connectivity_allowed: false,
+        connectivity_demo: false,
         account_scope: None,
     }
 }

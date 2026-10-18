@@ -518,6 +518,11 @@ struct Upload {
     /// The listing statement, a DSSE envelope as JSON.
     #[serde(default)]
     listing_statement: String,
+    /// The bundle's dated PluginPullStatus, as the platform signed it
+    /// (contract v26, W8.14; ruling 196); none from a CLI before v26 and for
+    /// a local upload.
+    #[serde(default)]
+    pull_status: Option<serde_json::Value>,
 }
 
 impl Upload {
@@ -654,6 +659,10 @@ async fn upload(
             .map(|status| status.to_string())
             .unwrap_or_default(),
         listing_statement: upload.listing_statement,
+        pull_status: upload
+            .pull_status
+            .map(|status| status.to_string())
+            .unwrap_or_default(),
     };
     let recorded: Result<PluginVersion, String> = ask(
         &app,

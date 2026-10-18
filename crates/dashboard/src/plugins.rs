@@ -1271,6 +1271,11 @@ pub(crate) struct Opening {
     /// In the claims as connectivity_instance_ids, which the ems's sidecar
     /// holds a placement to.
     pub connectivity_instance_ids: Vec<String>,
+    /// Those of them that are demo (contract v26, W11.8): the instance's
+    /// environment setting and its session's reported environment both
+    /// `sandbox` or `paper`. In the claims as demo_connectivity_instance_ids,
+    /// which the ems's sidecar stamps connectivity_demo from.
+    pub demo_connectivity_instance_ids: Vec<String>,
 }
 
 impl Opening {
@@ -1344,6 +1349,7 @@ impl Opening {
             owner_subject: String::new(),
             algorithm_id: String::new(),
             connectivity_instance_ids: self.connectivity_instance_ids,
+            demo_connectivity_instance_ids: self.demo_connectivity_instance_ids,
         }
     }
 }
@@ -1366,6 +1372,7 @@ pub(crate) fn opening(
             deployment_admin: access.deployment_admin,
             level,
             connectivity_instance_ids: Vec::new(),
+            demo_connectivity_instance_ids: Vec::new(),
         })
 }
 

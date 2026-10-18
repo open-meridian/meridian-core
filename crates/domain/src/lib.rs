@@ -30,6 +30,7 @@ pub mod money;
 pub mod protojson;
 pub mod semver;
 pub mod setting_table;
+pub mod template;
 pub mod text;
 pub mod zones;
 

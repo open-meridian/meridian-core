@@ -703,7 +703,12 @@ fn value(
         }
         "binary_event_contract" => {
             let terms = object_fields(held, &at, problems)?;
-            only(terms, &["payout", "closes_at_ns"], &at, problems);
+            only(
+                terms,
+                &["payout", "closes_at_ns", "floor", "cap", "bound_unit"],
+                &at,
+                problems,
+            );
             let payout_at = join(&at, "payout");
             let payout = match terms.get("payout") {
                 Some(said) => object_fields(said, &payout_at, problems)?,
@@ -735,6 +740,12 @@ fn value(
                     instrument_id: text(payout, "instrument_id", &payout_at, false, problems),
                 }),
                 closes_at_ns: integer(terms, "closes_at_ns", &at, false, problems),
+                // A range market's bounds (contract v26, W1.24), each a
+                // value as text and whether it is inclusive; either may be
+                // absent, for an open tail.
+                floor: bound_of(terms, "floor", &at, problems),
+                cap: bound_of(terms, "cap", &at, problems),
+                bound_unit: text(terms, "bound_unit", &at, false, problems),
             })
         }
         "currency" => match held.as_str() {
@@ -775,6 +786,39 @@ fn value(
         value: Some(inner),
         source,
     })
+}
+
+/// A range market's bound as a tool's input spells it (contract v26):
+/// `{"value": "70", "inclusive": true}`, or `None` where it is absent.
+fn bound_of(
+    terms: &Map<String, Value>,
+    name: &str,
+    path: &str,
+    problems: &mut Problems,
+) -> Option<meridian_domain::v1::EventContractBound> {
+    let at = join(path, name);
+    let said = terms.get(name).filter(|said| !said.is_null())?;
+    let bound = object_fields(said, &at, problems)?;
+    only(bound, &["value", "inclusive"], &at, problems);
+    let value_said = text(bound, "value", &at, true, problems);
+    let value = match value_said.parse::<meridian_domain::exact::Exact>() {
+        Ok(value) => Some(value.to_wire()),
+        Err(_) => {
+            if !value_said.is_empty() {
+                problems.add(&join(&at, "value"), "a decimal, as text");
+            }
+            None
+        }
+    };
+    let inclusive = match bound.get("inclusive") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(inclusive)) => *inclusive,
+        Some(_) => {
+            problems.add(&join(&at, "inclusive"), "true or false");
+            false
+        }
+    };
+    Some(meridian_domain::v1::EventContractBound { value, inclusive })
 }
 
 fn object_fields<'a>(

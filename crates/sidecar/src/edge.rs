@@ -533,6 +533,48 @@ fn is_past_window_setting(setting: &SettingDeclaration) -> bool {
     setting.r#type == SettingType::Choice as i32 && !setting.secret && offered == expected
 }
 
+/// Why the model tokens a heartbeat counts cannot stand, as the field's path
+/// and the words; or nothing (W4.5, contract v26, item 191): at most 64
+/// counts, each naming its endpoint, and one per endpoint, subject and
+/// client.
+pub fn model_tokens_refused(
+    tokens: &[meridian_pb::v1::ModelTokenCount],
+) -> Option<(String, String)> {
+    use meridian_pb::bounds::HEARTBEAT_REQUEST_MODEL_TOKENS_COUNT;
+    if !HEARTBEAT_REQUEST_MODEL_TOKENS_COUNT.admits(tokens.len()) {
+        return Some((
+            "model_tokens".into(),
+            format!(
+                "model_tokens names {} counts; at most {}",
+                tokens.len(),
+                HEARTBEAT_REQUEST_MODEL_TOKENS_COUNT.most
+            ),
+        ));
+    }
+    for (i, count) in tokens.iter().enumerate() {
+        if count.endpoint.trim().is_empty() {
+            return Some((
+                format!("model_tokens[{i}].endpoint"),
+                format!("model_tokens[{i}] names no endpoint; a count is of one model endpoint"),
+            ));
+        }
+        if tokens[..i].iter().any(|seen| {
+            seen.endpoint == count.endpoint
+                && seen.subject == count.subject
+                && seen.client_name == count.client_name
+        }) {
+            return Some((
+                format!("model_tokens[{i}]"),
+                format!(
+                    "model_tokens counts {} for the same subject and client twice; one count each",
+                    count.endpoint
+                ),
+            ));
+        }
+    }
+    None
+}
+
 /// Why what a heartbeat says each kind holds in storage cannot stand, as the
 /// field's path and the words; or nothing (W4.5, contract v16).
 pub fn stored_refused(

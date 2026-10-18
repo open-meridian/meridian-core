@@ -496,6 +496,7 @@ fn bundle_upload(h: &Harness) -> RecordPluginUploadRequest {
             .as_str()
             .unwrap()
             .into(),
+        pull_status: String::new(),
     }
 }
 

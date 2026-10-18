@@ -118,6 +118,24 @@ message BinaryEventContract {
 
   // When trading in it closes, as the venue states it; 0 when it states none.
   int64 closes_at_ns = 2;
+
+  // Contract v26 (W1.24; spec/the-contract-gaps-v26-and-v27-close, A4,
+  // approved 2026-10-14): a range market's bounds, fields of the binary
+  // event contract template's v26 version, never the group's. An open tail
+  // has one bound only; neither set where the contract is no range.
+  EventContractBound floor = 3;
+  EventContractBound cap = 4;
+  // The unit both bounds are in: an instrument's ID where the bound is a
+  // price, otherwise the venue's unit word (`degrees_f`, `index_points`,
+  // `percent`); empty where neither bound is set.
+  string bound_unit = 5;
+}
+
+// One bound of a range market (A4): Kalshi's `greater` and
+// `greater_or_equal` are inclusive false and true.
+message EventContractBound {
+  Decimal value = 1;
+  bool inclusive = 2;
 }
 
 // A money market fund's attributes, from SEC rule 2a-7 as amended in 2023
@@ -2169,14 +2187,45 @@ message SecurityTemplate {
   // True for the one template per asset class carrying identifiers, a
   // description and a currency; the platform mints no INS- record under it.
   bool base = 6;
-  // Its calculation package: the slot defined and empty until the template
-  // calculations (row 6i').
+  // The v24 slot for its calculation package, defined and kept empty: from
+  // contract v26 the package is calculation_package.
   string calculation = 7;
   // Each by its path, its type and whether it is required.
   repeated TemplateField fields = 8;
   // The identifier schemes it matches on, each by its scheme's spelling,
   // share_class_figi first.
   repeated string match_rule = 9;
+  // Contract v26 (W1.24; the intent's rulings 9 and 11; the v26 plan's
+  // question 225): its calculation package, declarative data; unset on a
+  // class's base template and on a version published before v26.
+  CalculationPackage calculation_package = 10;
+}
+
+// A template version's calculation package (W1.24): the pricing model it
+// binds, the market objects it reads, and test cases with exact answers,
+// which the analytics engine's built-in model and every implementation
+// routed for it must equal exactly. Data, never code.
+message CalculationPackage {
+  // `cash`, `quoted_price` or `binary_event` in v26, and the version.
+  string model_id = 1;
+  int32 model_version = 2;
+  // The kinds of its pricing inputs, as the lake names them: `close`,
+  // `nav`, `outcome`.
+  repeated string pricing_inputs = 3;
+  // Where its corporate-action factors come from, for returns (the first
+  // release's Q7); empty where none applies.
+  string corporate_action_factors = 4;
+  // Its version, which every valuation names.
+  string calculation_version = 5;
+  repeated CalculationTestCase test_cases = 6;
+}
+
+// One test case of a calculation package: inputs and the exact answer, each
+// as canonical JSON (RFC 8785).
+message CalculationTestCase {
+  string name = 1;
+  string inputs = 2;
+  string expected = 3;
 }
 
 // One field of a template (W3.24).
@@ -2294,4 +2343,137 @@ message ListIdentifierUsageReply {
   // resolving only through it, as the period ends, and the misses that
   // arrived with it as their only identifier within the period.
   repeated SchemeUsageCount scheme_counts = 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Event groups, contract v26
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// spec/the-contract-gaps-v26-and-v27-close, A1 to A9 (accepted 2026-10-14,
+// their names approved): a reference record grouping event contracts, kept
+// in the instrument master, minted on the platform beside the instruments it
+// groups (W1.30), reported by a venue's data plugin (W3.29), read and heard
+// by every role (W3.30). Each change of a flag or a member is a new dated
+// version; an ID is never reused (decisions/034).
+
+// A flag a venue may not state (A2): unknown is never false.
+enum EventGroupFlag {
+  // Read as not stated.
+  EVENT_GROUP_FLAG_UNSPECIFIED = 0;
+  EVENT_GROUP_FLAG_TRUE = 1;
+  EVENT_GROUP_FLAG_FALSE = 2;
+  EVENT_GROUP_FLAG_NOT_STATED = 3;
+}
+
+// An event's group of contracts, at a version.
+message EventGroup {
+  // `EVG-` and a ULID, the platform's; `LCL-` and a ULID for a deployment's
+  // own while it waits (A8's gap measure).
+  string event_group_id = 1;
+  // The venue that states it, the venue master's ID.
+  string venue_id = 2;
+  // The venue's reference for its event: Kalshi's event ticker,
+  // Polymarket's event slug.
+  string venue_event_ref = 3;
+  // The venue's words for it.
+  string title = 4;
+  repeated string member_instrument_ids = 5;
+  EventGroupFlag mutually_exclusive = 6;
+  EventGroupFlag exhaustive = 7;
+  // The venue's series, for a recurring event (A5); no series record in
+  // v26.
+  string series_id = 8;
+  // Monotonic from 1; a new version for each change of a flag or a member.
+  int64 version = 9;
+  // When this version became true, as the venue states it.
+  int64 valid_from_ns = 10;
+  // Stamped by the store.
+  int64 record_time_ns = 11;
+  // True for the deployment's own `LCL-` group, not yet matched or minted.
+  bool provisional = 12;
+  // Its place in the store's sequence of event groups, which a read after
+  // a sequence catches up by.
+  int64 sequence = 13;
+}
+
+// W3.29: a venue's data plugin reports the grouping its venue states.
+message ReportEventGroupRequest {
+  string venue_id = 1;
+  string venue_event_ref = 2;
+  string title = 3;
+  // Each resolved through W3.1 before it is sent.
+  repeated string member_instrument_ids = 4;
+  EventGroupFlag mutually_exclusive = 5;
+  EventGroupFlag exhaustive = 6;
+  string series_id = 7;
+  int64 valid_from_ns = 8;
+  RawRecordRef raw_record = 9;
+  // Stamped by the sidecar: the reporting instance.
+  string publisher_instance_id = 10;
+}
+
+message ReportEventGroupReply {
+  // The group as the store holds it, at its version.
+  EventGroup event_group = 1;
+  // The platform's staff have it to review; the deployment keeps its own
+  // `LCL-` group meanwhile.
+  bool pending_review = 2;
+}
+
+// W3.29: the instrument store asks the conductor, which alone dials the
+// platform.
+message AskPlatformForEventGroupRequest {
+  EscalateEventGroupRequest match_or_mint = 1;
+}
+
+message AskPlatformForEventGroupReply {
+  // False when the platform could not be reached; detail says why.
+  bool reachable = 1;
+  string detail = 2;
+  EscalateEventGroupReply answer = 3;
+}
+
+// W3.29, W1.30: the conductor's matching and minting request for a group,
+// members by their `INS-` IDs; it names no deployment and no `LCL-` ID.
+message EscalateEventGroupRequest {
+  string venue_id = 1;
+  string venue_event_ref = 2;
+  string title = 3;
+  repeated string member_instrument_ids = 4;
+  EventGroupFlag mutually_exclusive = 5;
+  EventGroupFlag exhaustive = 6;
+  string series_id = 7;
+  int64 valid_from_ns = 8;
+  // Only for retrying an answer that was lost.
+  string request_key = 9;
+}
+
+message EscalateEventGroupReply {
+  // The `EVG-` group matched or minted, at its version; unset while queued.
+  EventGroup event_group = 1;
+  // False when the master already held it.
+  bool minted = 2;
+  // In the staff's queue: a conflicting report, or one the venue's
+  // reference data does not confirm.
+  bool pending_review = 3;
+}
+
+// W3.30: the groups holding given instruments or given groups, as of a
+// time, or those changed after a sequence.
+message ListEventGroupsRequest {
+  repeated string instrument_ids = 1;
+  repeated string event_group_ids = 2;
+  // 0 for now.
+  int64 as_of_ns = 3;
+  // The last sequence the reader saw; 0 reads by the filters above.
+  int64 after_sequence = 4;
+  int32 page_size = 5;
+  string cursor = 6;
+}
+
+message ListEventGroupsReply {
+  repeated EventGroup event_groups = 1;
+  // The sequence read to.
+  int64 sequence = 2;
+  string next_cursor = 3;
 }

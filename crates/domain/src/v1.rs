@@ -50,6 +50,28 @@ pub struct BinaryEventContract {
     /// When trading in it closes, as the venue states it; 0 when it states none.
     #[prost(int64, tag = "2")]
     pub closes_at_ns: i64,
+    /// Contract v26 (W1.24; spec/the-contract-gaps-v26-and-v27-close, A4,
+    /// approved 2026-10-14): a range market's bounds, fields of the binary
+    /// event contract template's v26 version, never the group's. An open tail
+    /// has one bound only; neither set where the contract is no range.
+    #[prost(message, optional, tag = "3")]
+    pub floor: ::core::option::Option<EventContractBound>,
+    #[prost(message, optional, tag = "4")]
+    pub cap: ::core::option::Option<EventContractBound>,
+    /// The unit both bounds are in: an instrument's ID where the bound is a
+    /// price, otherwise the venue's unit word (`degrees_f`, `index_points`,
+    /// `percent`); empty where neither bound is set.
+    #[prost(string, tag = "5")]
+    pub bound_unit: ::prost::alloc::string::String,
+}
+/// One bound of a range market (A4): Kalshi's `greater` and
+/// `greater_or_equal` are inclusive false and true.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct EventContractBound {
+    #[prost(message, optional, tag = "1")]
+    pub value: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    #[prost(bool, tag = "2")]
+    pub inclusive: bool,
 }
 /// A money market fund's attributes, from SEC rule 2a-7 as amended in 2023
 /// (the product owner, 2026-10-02, the custody audit's Q4). Its observations
@@ -2229,8 +2251,8 @@ pub struct SecurityTemplate {
     /// description and a currency; the platform mints no INS- record under it.
     #[prost(bool, tag = "6")]
     pub base: bool,
-    /// Its calculation package: the slot defined and empty until the template
-    /// calculations (row 6i').
+    /// The v24 slot for its calculation package, defined and kept empty: from
+    /// contract v26 the package is calculation_package.
     #[prost(string, tag = "7")]
     pub calculation: ::prost::alloc::string::String,
     /// Each by its path, its type and whether it is required.
@@ -2240,6 +2262,47 @@ pub struct SecurityTemplate {
     /// share_class_figi first.
     #[prost(string, repeated, tag = "9")]
     pub match_rule: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Contract v26 (W1.24; the intent's rulings 9 and 11; the v26 plan's
+    /// question 225): its calculation package, declarative data; unset on a
+    /// class's base template and on a version published before v26.
+    #[prost(message, optional, tag = "10")]
+    pub calculation_package: ::core::option::Option<CalculationPackage>,
+}
+/// A template version's calculation package (W1.24): the pricing model it
+/// binds, the market objects it reads, and test cases with exact answers,
+/// which the analytics engine's built-in model and every implementation
+/// routed for it must equal exactly. Data, never code.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CalculationPackage {
+    /// `cash`, `quoted_price` or `binary_event` in v26, and the version.
+    #[prost(string, tag = "1")]
+    pub model_id: ::prost::alloc::string::String,
+    #[prost(int32, tag = "2")]
+    pub model_version: i32,
+    /// The kinds of its pricing inputs, as the lake names them: `close`,
+    /// `nav`, `outcome`.
+    #[prost(string, repeated, tag = "3")]
+    pub pricing_inputs: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Where its corporate-action factors come from, for returns (the first
+    /// release's Q7); empty where none applies.
+    #[prost(string, tag = "4")]
+    pub corporate_action_factors: ::prost::alloc::string::String,
+    /// Its version, which every valuation names.
+    #[prost(string, tag = "5")]
+    pub calculation_version: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "6")]
+    pub test_cases: ::prost::alloc::vec::Vec<CalculationTestCase>,
+}
+/// One test case of a calculation package: inputs and the exact answer, each
+/// as canonical JSON (RFC 8785).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CalculationTestCase {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub inputs: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub expected: ::prost::alloc::string::String,
 }
 /// One field of a template (W3.24).
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -2384,6 +2447,169 @@ pub struct ListIdentifierUsageReply {
     /// arrived with it as their only identifier within the period.
     #[prost(message, repeated, tag = "1")]
     pub scheme_counts: ::prost::alloc::vec::Vec<SchemeUsageCount>,
+}
+/// An event's group of contracts, at a version.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct EventGroup {
+    /// `EVG-` and a ULID, the platform's; `LCL-` and a ULID for a deployment's
+    /// own while it waits (A8's gap measure).
+    #[prost(string, tag = "1")]
+    pub event_group_id: ::prost::alloc::string::String,
+    /// The venue that states it, the venue master's ID.
+    #[prost(string, tag = "2")]
+    pub venue_id: ::prost::alloc::string::String,
+    /// The venue's reference for its event: Kalshi's event ticker,
+    /// Polymarket's event slug.
+    #[prost(string, tag = "3")]
+    pub venue_event_ref: ::prost::alloc::string::String,
+    /// The venue's words for it.
+    #[prost(string, tag = "4")]
+    pub title: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "5")]
+    pub member_instrument_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(enumeration = "EventGroupFlag", tag = "6")]
+    pub mutually_exclusive: i32,
+    #[prost(enumeration = "EventGroupFlag", tag = "7")]
+    pub exhaustive: i32,
+    /// The venue's series, for a recurring event (A5); no series record in
+    /// v26.
+    #[prost(string, tag = "8")]
+    pub series_id: ::prost::alloc::string::String,
+    /// Monotonic from 1; a new version for each change of a flag or a member.
+    #[prost(int64, tag = "9")]
+    pub version: i64,
+    /// When this version became true, as the venue states it.
+    #[prost(int64, tag = "10")]
+    pub valid_from_ns: i64,
+    /// Stamped by the store.
+    #[prost(int64, tag = "11")]
+    pub record_time_ns: i64,
+    /// True for the deployment's own `LCL-` group, not yet matched or minted.
+    #[prost(bool, tag = "12")]
+    pub provisional: bool,
+    /// Its place in the store's sequence of event groups, which a read after
+    /// a sequence catches up by.
+    #[prost(int64, tag = "13")]
+    pub sequence: i64,
+}
+/// W3.29: a venue's data plugin reports the grouping its venue states.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReportEventGroupRequest {
+    #[prost(string, tag = "1")]
+    pub venue_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub venue_event_ref: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub title: ::prost::alloc::string::String,
+    /// Each resolved through W3.1 before it is sent.
+    #[prost(string, repeated, tag = "4")]
+    pub member_instrument_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(enumeration = "EventGroupFlag", tag = "5")]
+    pub mutually_exclusive: i32,
+    #[prost(enumeration = "EventGroupFlag", tag = "6")]
+    pub exhaustive: i32,
+    #[prost(string, tag = "7")]
+    pub series_id: ::prost::alloc::string::String,
+    #[prost(int64, tag = "8")]
+    pub valid_from_ns: i64,
+    #[prost(message, optional, tag = "9")]
+    pub raw_record: ::core::option::Option<::meridian_pb::v1::RawRecordRef>,
+    /// Stamped by the sidecar: the reporting instance.
+    #[prost(string, tag = "10")]
+    pub publisher_instance_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReportEventGroupReply {
+    /// The group as the store holds it, at its version.
+    #[prost(message, optional, tag = "1")]
+    pub event_group: ::core::option::Option<EventGroup>,
+    /// The platform's staff have it to review; the deployment keeps its own
+    /// `LCL-` group meanwhile.
+    #[prost(bool, tag = "2")]
+    pub pending_review: bool,
+}
+/// W3.29: the instrument store asks the conductor, which alone dials the
+/// platform.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AskPlatformForEventGroupRequest {
+    #[prost(message, optional, tag = "1")]
+    pub match_or_mint: ::core::option::Option<EscalateEventGroupRequest>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AskPlatformForEventGroupReply {
+    /// False when the platform could not be reached; detail says why.
+    #[prost(bool, tag = "1")]
+    pub reachable: bool,
+    #[prost(string, tag = "2")]
+    pub detail: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub answer: ::core::option::Option<EscalateEventGroupReply>,
+}
+/// W3.29, W1.30: the conductor's matching and minting request for a group,
+/// members by their `INS-` IDs; it names no deployment and no `LCL-` ID.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct EscalateEventGroupRequest {
+    #[prost(string, tag = "1")]
+    pub venue_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub venue_event_ref: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub title: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "4")]
+    pub member_instrument_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(enumeration = "EventGroupFlag", tag = "5")]
+    pub mutually_exclusive: i32,
+    #[prost(enumeration = "EventGroupFlag", tag = "6")]
+    pub exhaustive: i32,
+    #[prost(string, tag = "7")]
+    pub series_id: ::prost::alloc::string::String,
+    #[prost(int64, tag = "8")]
+    pub valid_from_ns: i64,
+    /// Only for retrying an answer that was lost.
+    #[prost(string, tag = "9")]
+    pub request_key: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct EscalateEventGroupReply {
+    /// The `EVG-` group matched or minted, at its version; unset while queued.
+    #[prost(message, optional, tag = "1")]
+    pub event_group: ::core::option::Option<EventGroup>,
+    /// False when the master already held it.
+    #[prost(bool, tag = "2")]
+    pub minted: bool,
+    /// In the staff's queue: a conflicting report, or one the venue's
+    /// reference data does not confirm.
+    #[prost(bool, tag = "3")]
+    pub pending_review: bool,
+}
+/// W3.30: the groups holding given instruments or given groups, as of a
+/// time, or those changed after a sequence.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListEventGroupsRequest {
+    #[prost(string, repeated, tag = "1")]
+    pub instrument_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag = "2")]
+    pub event_group_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// 0 for now.
+    #[prost(int64, tag = "3")]
+    pub as_of_ns: i64,
+    /// The last sequence the reader saw; 0 reads by the filters above.
+    #[prost(int64, tag = "4")]
+    pub after_sequence: i64,
+    #[prost(int32, tag = "5")]
+    pub page_size: i32,
+    #[prost(string, tag = "6")]
+    pub cursor: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListEventGroupsReply {
+    #[prost(message, repeated, tag = "1")]
+    pub event_groups: ::prost::alloc::vec::Vec<EventGroup>,
+    /// The sequence read to.
+    #[prost(int64, tag = "2")]
+    pub sequence: i64,
+    #[prost(string, tag = "3")]
+    pub next_cursor: ::prost::alloc::string::String,
 }
 /// Lifecycle. The transition verbs are the commands; nothing sets this directly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
@@ -3282,6 +3508,40 @@ impl DateOutcome {
         }
     }
 }
+/// A flag a venue may not state (A2): unknown is never false.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum EventGroupFlag {
+    /// Read as not stated.
+    Unspecified = 0,
+    True = 1,
+    False = 2,
+    NotStated = 3,
+}
+impl EventGroupFlag {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "EVENT_GROUP_FLAG_UNSPECIFIED",
+            Self::True => "EVENT_GROUP_FLAG_TRUE",
+            Self::False => "EVENT_GROUP_FLAG_FALSE",
+            Self::NotStated => "EVENT_GROUP_FLAG_NOT_STATED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "EVENT_GROUP_FLAG_UNSPECIFIED" => Some(Self::Unspecified),
+            "EVENT_GROUP_FLAG_TRUE" => Some(Self::True),
+            "EVENT_GROUP_FLAG_FALSE" => Some(Self::False),
+            "EVENT_GROUP_FLAG_NOT_STATED" => Some(Self::NotStated),
+            _ => None,
+        }
+    }
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CreateOrganisationRequest {
     /// Display name. Not an identifier: two organisations may share one, and the
@@ -3328,9 +3588,11 @@ pub struct OrganisationRecord {
     /// The organisation part of its listings (contract v25, W5.29): a
     /// lower-case DNS label, at most 39 characters; editable until its first
     /// publish, then fixed. `open-meridian` is reserved for first-party
-    /// plugins. Empty until set.
+    /// plugins. Empty until set. Named `slug` until contract v26 (ruling 260),
+    /// the same field number, so a v25 reader decodes it unchanged; the
+    /// platform accepts the JSON name `slug` as an alias for one release.
     #[prost(string, tag = "11")]
-    pub slug: ::prost::alloc::string::String,
+    pub namespace: ::prost::alloc::string::String,
     /// Whether it may publish, and to which registries (W5.28), granted by
     /// staff, each grant its own record.
     #[prost(enumeration = "PublisherStatus", tag = "12")]
@@ -3367,39 +3629,43 @@ pub struct CheckOrganisationLeiRequest {
     #[prost(string, tag = "1")]
     pub organisation_id: ::prost::alloc::string::String,
 }
-/// Staff give the first party's slug, `open-meridian`, to the operating
-/// company's organisation (W5.28); no other organisation may take it.
+/// Staff give the first party's namespace, `open-meridian`, to the operating
+/// company's organisation (W5.28); no other organisation may take it. Named
+/// GiveFirstPartySlugRequest until contract v26 (ruling 260).
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct GiveFirstPartySlugRequest {
+pub struct GiveFirstPartyNamespaceRequest {
     #[prost(string, tag = "1")]
     pub organisation_id: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub note: ::prost::alloc::string::String,
 }
-/// Staff set a slug aside as confusable with an existing one (W5.28), so no
-/// organisation may take it.
+/// Staff set a namespace aside as confusable with an existing one (W5.28),
+/// so no organisation may take it; its record `namespace_set_aside`. Named
+/// SetAsideSlugRequest, its field `slug`, until contract v26 (ruling 260).
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct SetAsideSlugRequest {
+pub struct SetAsideNamespaceRequest {
     #[prost(string, tag = "1")]
-    pub slug: ::prost::alloc::string::String,
+    pub namespace: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub reason: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct SetAsideSlugReply {
+pub struct SetAsideNamespaceReply {
     #[prost(string, tag = "1")]
-    pub slug: ::prost::alloc::string::String,
+    pub namespace: ::prost::alloc::string::String,
     #[prost(int64, tag = "2")]
     pub set_aside_at_ns: i64,
 }
-/// An Owner or Admin gives the organisation's slug (W5.29), until its first
-/// publish.
+/// An Owner or Admin gives the organisation's namespace (W5.29), until its
+/// first publish; its record `namespace_set`. Named
+/// SetOrganisationSlugRequest, its field `slug`, until contract v26 (ruling
+/// 260).
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct SetOrganisationSlugRequest {
+pub struct SetOrganisationNamespaceRequest {
     #[prost(string, tag = "1")]
     pub organisation_id: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
-    pub slug: ::prost::alloc::string::String,
+    pub namespace: ::prost::alloc::string::String,
 }
 /// An Owner or Admin gives what verified needs (W5.29): the LEI, and the
 /// Account Holder, a person in the organisation. Naming another person
@@ -3940,6 +4206,11 @@ pub struct PluginReport {
     pub daily_operations: ::prost::alloc::vec::Vec<u64>,
     #[prost(uint64, repeated, tag = "22")]
     pub daily_requests: ::prost::alloc::vec::Vec<u64>,
+    /// Contract v26 (W4.5, W4.8; item 191): the model tokens the plugin's last
+    /// accepted heartbeat reported; shown on its Summary, never sent to the
+    /// platform.
+    #[prost(message, repeated, tag = "23")]
+    pub model_tokens: ::prost::alloc::vec::Vec<::meridian_pb::v1::ModelTokenCount>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct IssueClaimCodeRequest {
@@ -9033,6 +9304,27 @@ pub struct LocalRecordOrdersSetting {
     #[prost(int64, tag = "2")]
     pub open_order_count: i64,
 }
+/// W11.38 (contract v26): the deployment admin's guard on agents' orders,
+/// kept in the control partition, each change its own entry. Refused false
+/// in the version that brings it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SetAgentOrdersDemoOnlyRequest {
+    /// Shown "Agents may place orders on demo connections only"; true by
+    /// default.
+    #[prost(bool, tag = "1")]
+    pub agent_orders_demo_only: bool,
+    #[prost(string, tag = "2")]
+    pub reason: ::prost::alloc::string::String,
+}
+/// W11.39: the guard read.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ReadAgentOrdersDemoOnlyRequest {}
+/// The agents' guard in force (W11.38, W11.39).
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct AgentOrdersDemoOnlySetting {
+    #[prost(bool, tag = "1")]
+    pub agent_orders_demo_only: bool,
+}
 /// W9.10 (contract v25): the book's health per account, for a deployment
 /// admin -- the dashboard's tool and the CLI's `meridian status` -- whatever
 /// database the book runs on.
@@ -10774,6 +11066,9 @@ pub enum UnplacedReason {
     /// (W11.25, contract v23): kept in the account, so operations sees the
     /// venue's position and the book's differ.
     NothingPending = 4,
+    /// A give-up's answer naming an execution, or an allocation, the book does
+    /// not hold (W11.32, contract v26): kept whole in UnplacedFact.give_up.
+    UnknownExecution = 5,
 }
 impl UnplacedReason {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -10786,6 +11081,7 @@ impl UnplacedReason {
             Self::UnknownPlacement => "UNPLACED_REASON_UNKNOWN_PLACEMENT",
             Self::UnmappedVenueAccount => "UNPLACED_REASON_UNMAPPED_VENUE_ACCOUNT",
             Self::NothingPending => "UNPLACED_REASON_NOTHING_PENDING",
+            Self::UnknownExecution => "UNPLACED_REASON_UNKNOWN_EXECUTION",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -10795,6 +11091,7 @@ impl UnplacedReason {
             "UNPLACED_REASON_UNKNOWN_PLACEMENT" => Some(Self::UnknownPlacement),
             "UNPLACED_REASON_UNMAPPED_VENUE_ACCOUNT" => Some(Self::UnmappedVenueAccount),
             "UNPLACED_REASON_NOTHING_PENDING" => Some(Self::NothingPending),
+            "UNPLACED_REASON_UNKNOWN_EXECUTION" => Some(Self::UnknownExecution),
             _ => None,
         }
     }
@@ -11340,1447 +11637,6 @@ impl AlertKind {
             "ALERT_KIND_ERROR_ACCOUNT_BOOKING" => Some(Self::ErrorAccountBooking),
             "ALERT_KIND_BOOKING_HELD" => Some(Self::BookingHeld),
             "ALERT_KIND_COMPLIANCE" => Some(Self::Compliance),
-            _ => None,
-        }
-    }
-}
-/// Envelope wraps one payload.
-///
-/// The payload is opaque bytes rather than a oneof over every message type. A
-/// oneof would make the envelope a compile-time dependency of every message in
-/// the system, so adding any message would rebuild everything and the bus could
-/// not carry a payload it had not been compiled against.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct Envelope {
-    #[prost(message, optional, tag = "1")]
-    pub meta: ::core::option::Option<::meridian_pb::v1::MessageMeta>,
-    /// Fully-qualified name of the payload message, e.g. "meridian.v1.Position".
-    /// A subscriber checks this before decoding rather than guessing from topic.
-    #[prost(string, tag = "2")]
-    pub payload_type: ::prost::alloc::string::String,
-    /// The serialized payload.
-    #[prost(bytes = "vec", tag = "3")]
-    pub payload: ::prost::alloc::vec::Vec<u8>,
-}
-/// What a plugin says about itself, from `\[tool.meridian\]` in its
-/// pyproject.toml. Declarations for an administrator to approve, not grants.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct PluginMetadata {
-    /// Lowercase letters, digits and single hyphens, starting with a letter:
-    /// the name `meridian plugin new` gave it, and its repository in the
-    /// deployment's registry, plugins/<name>.
-    #[prost(string, tag = "1")]
-    pub name: ::prost::alloc::string::String,
-    /// As its pyproject.toml has it. An uploaded version is never replaced.
-    #[prost(string, tag = "2")]
-    pub version: ::prost::alloc::string::String,
-    /// A set, from matrix/roles.tsv, and never a component's name -- the
-    /// dashboard's among them (decisions/020). Empty is a plugin admitted with
-    /// no topics, as the reference plugin is.
-    #[prost(string, repeated, tag = "3")]
-    pub roles: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    /// Whether it serves a page through its sidecar (decisions/014).
-    #[prost(bool, tag = "5")]
-    pub interface: bool,
-    /// The open-meridian version its base image carries, so an administrator
-    /// can see which plugins stand on a base that needs a fix.
-    #[prost(string, tag = "6")]
-    pub sdk_version: ::prost::alloc::string::String,
-    /// What the version declares beside its roles (W8.1, contract v11): its
-    /// secret settings' names, what it does not carry, and the storage it asks
-    /// for. Read by the CLI from the built image, as the SDK builds it from the
-    /// plugin's code; shown in the catalogue and approved at launch. Unset for
-    /// a version built before v11. A declaration asking for storage on a
-    /// version holding no edge role is refused.
-    #[prost(message, optional, tag = "7")]
-    pub declaration: ::core::option::Option<::meridian_pb::v1::PluginDeclaration>,
-}
-/// The dashboard records a version once its image is in the registry.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct RecordPluginUploadRequest {
-    #[prost(message, optional, tag = "1")]
-    pub metadata: ::core::option::Option<PluginMetadata>,
-    /// The image manifest's digest, `sha256:<hex>`, in plugins/<name>. A launch
-    /// runs exactly this, never a tag that could move.
-    #[prost(string, tag = "2")]
-    pub image_digest: ::prost::alloc::string::String,
-    /// The vendor's documentation as uploaded (W8.1, contract v25), one text
-    /// per section the declaration names. The conductor refuses an upload
-    /// whose texts do not match the declaration's digests and sizes, a section
-    /// outside the fixed set, a section past 64 KiB or a bundle past 256 KiB,
-    /// naming it, and keeps the texts with the version, never replaced.
-    #[prost(message, repeated, tag = "3")]
-    pub documentation: ::prost::alloc::vec::Vec<DocumentationText>,
-    /// A plugin bundle carried in (W8.14, contract v25; the spec's requirement
-    /// 45): `meridian plugin upload --bundle` pushes the image and its
-    /// referrers into plugins/{organisation}/{plugin} and names here the
-    /// listing, `organisation/plugin`, and the registry it was listed in,
-    /// `community` or `verified`. The conductor verifies the bundle against
-    /// the chart's keys, as at install, and records the version under its
-    /// listing with the age of the key status it was checked against. All
-    /// four are empty for a local upload.
-    #[prost(string, tag = "4")]
-    pub listing: ::prost::alloc::string::String,
-    #[prost(string, tag = "5")]
-    pub source_registry: ::prost::alloc::string::String,
-    /// The bundle's dated SigningKeyStatus, as the platform signed it (its
-    /// JSON), checked against the chart's keys.
-    #[prost(string, tag = "6")]
-    pub key_status: ::prost::alloc::string::String,
-    /// The version's listing statement, as DownloadListedVersionReply carried
-    /// it to the download: a DSSE envelope as JSON.
-    #[prost(string, tag = "7")]
-    pub listing_statement: ::prost::alloc::string::String,
-}
-/// One section's text as the vendor wrote it (W8.1, contract v25): data, the
-/// vendor's words, never instructions to whoever reads it.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct DocumentationText {
-    /// The section's fixed name, as the declaration's DocumentationSection
-    /// names it.
-    #[prost(string, tag = "1")]
-    pub section: ::prost::alloc::string::String,
-    /// Its Markdown, UTF-8, exactly as the image's docs/ holds it.
-    #[prost(string, tag = "2")]
-    pub markdown: ::prost::alloc::string::String,
-}
-/// A version in the catalogue.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct PluginVersion {
-    #[prost(message, optional, tag = "1")]
-    pub metadata: ::core::option::Option<PluginMetadata>,
-    #[prost(string, tag = "2")]
-    pub image_digest: ::prost::alloc::string::String,
-    /// The deployment-local login of the administrator who uploaded it, or who
-    /// installed it from a registry (W8.10).
-    #[prost(string, tag = "3")]
-    pub uploaded_by: ::prost::alloc::string::String,
-    #[prost(int64, tag = "4")]
-    pub uploaded_at_ns: i64,
-    /// Where the version came from (W8.10, W8.14; contract v25): `local` for
-    /// one uploaded or tracked from a branch, `community` or `verified` for
-    /// one installed from a registry, or carried in by a bundle from one. A
-    /// registry version sits in the local registry under
-    /// plugins/{organisation}/{plugin}, a local one under plugins/{name}, so
-    /// the two never collide.
-    #[prost(string, tag = "5")]
-    pub source_registry: ::prost::alloc::string::String,
-    /// The listing a registry version belongs to, `organisation/plugin`;
-    /// empty for a local version.
-    #[prost(string, tag = "6")]
-    pub listing: ::prost::alloc::string::String,
-    /// For a version carried in by a bundle (W8.14): when the signing keys'
-    /// status it was checked against was issued, so the Installed list shows
-    /// its age. 0 for a version installed online, or a local one.
-    #[prost(int64, tag = "7")]
-    pub key_status_issued_at_ns: i64,
-    /// Retired from the catalogue (W8.15, contract v25): who retired it, when
-    /// and why. A retired version is no longer listed or launchable, its
-    /// image released from the local registry; its record is kept. Empty and
-    /// 0 while it is not retired.
-    #[prost(string, tag = "8")]
-    pub retired_by: ::prost::alloc::string::String,
-    #[prost(int64, tag = "9")]
-    pub retired_at_ns: i64,
-    #[prost(string, tag = "10")]
-    pub retired_note: ::prost::alloc::string::String,
-    /// An install's note (W8.10; decisions/031, decided 2026-10-17 under
-    /// agreement A): why a deployment admin installed it from a registry, kept
-    /// with the install's record beside uploaded_by and shown with it. Empty
-    /// for a local upload and a bundle's, which carry none.
-    #[prost(string, tag = "11")]
-    pub uploaded_note: ::prost::alloc::string::String,
-}
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
-pub struct PluginCatalogueRequest {}
-/// Every version uploaded and every launch, live or stopped.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct PluginCatalogue {
-    #[prost(message, repeated, tag = "1")]
-    pub versions: ::prost::alloc::vec::Vec<PluginVersion>,
-    #[prost(message, repeated, tag = "2")]
-    pub launches: ::prost::alloc::vec::Vec<PluginLaunch>,
-}
-/// A deployment admin launches a version. The roles are the ones they were
-/// shown and approved, and the launch is refused unless they are exactly the
-/// version's metadata: an approval of something other than what runs is no
-/// approval.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct LaunchPluginRequest {
-    #[prost(string, tag = "1")]
-    pub name: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub version: ::prost::alloc::string::String,
-    /// What it runs as, and what its sidecar's credential and grants are for.
-    /// Unique among the deployment's live plugins.
-    #[prost(string, tag = "3")]
-    pub instance_id: ::prost::alloc::string::String,
-    #[prost(string, repeated, tag = "4")]
-    pub approved_roles: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    /// In the live shape, on a development deployment alone: the plugin runs
-    /// the files sent to it since, and the launcher refuses this anywhere else
-    /// (W8.3, spec/live-plugin-development).
-    #[prost(bool, tag = "6")]
-    pub live: bool,
-    /// Why, kept with the launch's record (decisions/031; contract v17).
-    /// Through /mcp every launch carries one (W6.20).
-    #[prost(string, tag = "7")]
-    pub note: ::prost::alloc::string::String,
-}
-/// A launch, as the conductor records it.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct PluginLaunch {
-    #[prost(string, tag = "1")]
-    pub instance_id: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub name: ::prost::alloc::string::String,
-    #[prost(string, tag = "3")]
-    pub version: ::prost::alloc::string::String,
-    #[prost(string, tag = "4")]
-    pub image_digest: ::prost::alloc::string::String,
-    #[prost(string, repeated, tag = "5")]
-    pub roles: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, tag = "7")]
-    pub launched_by: ::prost::alloc::string::String,
-    #[prost(int64, tag = "8")]
-    pub launched_at_ns: i64,
-    #[prost(enumeration = "PluginLaunchState", tag = "9")]
-    pub state: i32,
-    #[prost(string, tag = "10")]
-    pub stopped_by: ::prost::alloc::string::String,
-    #[prost(int64, tag = "11")]
-    pub stopped_at_ns: i64,
-    #[prost(string, tag = "12")]
-    pub failure: ::prost::alloc::string::String,
-    /// Launched in the live shape (W8.3).
-    #[prost(bool, tag = "13")]
-    pub live: bool,
-    /// The delegation the person who launched it acted through and its
-    /// client's name, and the same for the stop, as the dashboard stamped them
-    /// (contract v17). A launch or stop before v17 was made through the
-    /// terminal on a delegation that was not recorded: these are empty, and
-    /// the store keeps a gap record saying so (decisions/031).
-    #[prost(string, tag = "14")]
-    pub acting_through_delegation: ::prost::alloc::string::String,
-    #[prost(string, tag = "15")]
-    pub client_name: ::prost::alloc::string::String,
-    #[prost(string, tag = "16")]
-    pub stopped_through_delegation: ::prost::alloc::string::String,
-    #[prost(string, tag = "17")]
-    pub stopped_client_name: ::prost::alloc::string::String,
-    /// Why it was launched, as kept with the launch (contract v17): required
-    /// through /mcp; empty where none was given, and on every launch before
-    /// v17.
-    #[prost(string, tag = "18")]
-    pub note: ::prost::alloc::string::String,
-    /// Why it was stopped, as kept with the stop (contract v17): required
-    /// through /mcp; empty while not stopped, where none was given, and on
-    /// every stop before v17.
-    #[prost(string, tag = "19")]
-    pub stopped_note: ::prost::alloc::string::String,
-    /// The prepared change it was made from, where a person made it from one
-    /// (W6.27, W4.9; contract v20): empty otherwise, and before v20.
-    #[prost(string, tag = "20")]
-    pub prepared_call_id: ::prost::alloc::string::String,
-    /// The same for the stop.
-    #[prost(string, tag = "21")]
-    pub stopped_prepared_call_id: ::prost::alloc::string::String,
-    /// A deployment admin's keeping of the instance after its version was
-    /// pulled (W8.12, contract v25): unset while its version is not pulled,
-    /// or the pull is not yet acknowledged. The Summary's and the Installed
-    /// list's warning stands until the instance is stopped or this is set.
-    #[prost(message, optional, tag = "22")]
-    pub pull_acknowledgement: ::core::option::Option<PullAcknowledgement>,
-}
-/// The conductor to the launcher: create this plugin, in the chart's plugin
-/// shape and no other.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct CreatePluginRequest {
-    #[prost(string, tag = "1")]
-    pub instance_id: ::prost::alloc::string::String,
-    /// Always the deployment's own registry, by digest:
-    /// `localhost:<port>/plugins/<name>@sha256:<hex>`.
-    #[prost(string, tag = "2")]
-    pub image: ::prost::alloc::string::String,
-    #[prost(string, repeated, tag = "3")]
-    pub roles: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(bool, tag = "5")]
-    pub interface: bool,
-    /// The chart's live shape rather than its plugin shape; refused by a
-    /// launcher on a deployment not installed for development.
-    #[prost(bool, tag = "6")]
-    pub live: bool,
-    /// The version's declaration, as approved at launch (W8.3, contract v11):
-    /// the launcher gives the instance storage of its own where it asks for
-    /// it. Unset for a version uploaded with none, which gets storage by
-    /// holding an edge role, as before v11.
-    #[prost(message, optional, tag = "7")]
-    pub declaration: ::core::option::Option<::meridian_pb::v1::PluginDeclaration>,
-    /// The archive a deployment admin allowed the instance (W8.3, W8.7,
-    /// contract v16): the launcher gives it beside its storage, mounted at
-    /// MERIDIAN_ARCHIVE_DIR or, in a cloud, a bucket named in
-    /// MERIDIAN_ARCHIVE_BUCKET with a credential scoped to it. Unset or not
-    /// allowed, none.
-    #[prost(message, optional, tag = "8")]
-    pub archive: ::core::option::Option<PluginArchive>,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct CreatePluginReply {
-    /// The workload the launcher made, which it alone may later remove.
-    #[prost(string, tag = "1")]
-    pub workload: ::prost::alloc::string::String,
-}
-/// A deployment admin allows an edge instance an archive, or changes its
-/// bound, from its Manage page; the conductor records it and restarts the
-/// instance through CreatePlugin carrying it.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct AllowArchiveRequest {
-    #[prost(string, tag = "1")]
-    pub instance_id: ::prost::alloc::string::String,
-    /// The most bytes it may hold; 0 for no bound.
-    #[prost(uint64, tag = "2")]
-    pub most_bytes: u64,
-    /// Why, kept with the change's record (decisions/031; contract v17).
-    /// Through /mcp every change carries one (W6.20).
-    #[prost(string, tag = "3")]
-    pub note: ::prost::alloc::string::String,
-}
-/// A deployment admin withdraws it: the instance is restarted without it,
-/// and what it holds is kept until an admin removes it.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct WithdrawArchiveRequest {
-    #[prost(string, tag = "1")]
-    pub instance_id: ::prost::alloc::string::String,
-    /// Why, kept with the change's record (decisions/031; contract v17).
-    /// Through /mcp every change carries one (W6.20).
-    #[prost(string, tag = "2")]
-    pub note: ::prost::alloc::string::String,
-}
-/// An instance's archive, as the conductor records it.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct PluginArchive {
-    #[prost(string, tag = "1")]
-    pub instance_id: ::prost::alloc::string::String,
-    /// Allowed now; false once withdrawn.
-    #[prost(bool, tag = "2")]
-    pub allowed: bool,
-    /// The most bytes it may hold; 0 for no bound.
-    #[prost(uint64, tag = "3")]
-    pub most_bytes: u64,
-    /// Who last allowed, changed or withdrew it, the deployment-local subject
-    /// the dashboard stamped, and when. Each is its own record (decisions/031).
-    #[prost(string, tag = "4")]
-    pub updated_by: ::prost::alloc::string::String,
-    #[prost(int64, tag = "5")]
-    pub updated_at_ns: i64,
-    /// The delegation the person acted through and its client's name, as the
-    /// dashboard stamped them (contract v17): empty for a change made in a
-    /// browser, and on every change before v17, each of which was.
-    #[prost(string, tag = "6")]
-    pub acting_through_delegation: ::prost::alloc::string::String,
-    #[prost(string, tag = "7")]
-    pub client_name: ::prost::alloc::string::String,
-    /// Why, as kept with its latest change (contract v17): required through
-    /// /mcp, optional at the page; empty where none was given, and on every
-    /// change before v17.
-    #[prost(string, tag = "8")]
-    pub note: ::prost::alloc::string::String,
-    /// The prepared change it was made from, where a person made it from one
-    /// (W6.27, W4.9; contract v20): empty otherwise, and before v20.
-    #[prost(string, tag = "9")]
-    pub prepared_call_id: ::prost::alloc::string::String,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct StopPluginRequest {
-    #[prost(string, tag = "1")]
-    pub instance_id: ::prost::alloc::string::String,
-    /// Why, kept with the stop's record (decisions/031; contract v17). Through
-    /// /mcp every stop carries one (W6.20).
-    #[prost(string, tag = "2")]
-    pub note: ::prost::alloc::string::String,
-}
-/// The conductor to the launcher: remove what it made for this instance.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct RemovePluginRequest {
-    #[prost(string, tag = "1")]
-    pub instance_id: ::prost::alloc::string::String,
-}
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
-pub struct RemovePluginReply {
-    /// False when there was nothing to remove, which is not an error: stopping
-    /// is asked for an outcome, and the outcome holds.
-    #[prost(bool, tag = "1")]
-    pub removed: bool,
-}
-/// One version's declaration and texts, apart from the catalogue, which lists
-/// every version in one message and carries only the sections' names, digests
-/// and sizes (in each version's declaration). Read for the Documentation tab
-/// and a version's Documentation page, launched or not.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ReadPluginDocumentationRequest {
-    #[prost(string, tag = "1")]
-    pub name: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub version: ::prost::alloc::string::String,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ReadPluginDocumentationReply {
-    /// The version's declaration, from which the Reference is drawn.
-    #[prost(message, optional, tag = "1")]
-    pub declaration: ::core::option::Option<::meridian_pb::v1::PluginDeclaration>,
-    /// Each section the vendor wrote, in the declaration's order. Empty: the
-    /// vendor wrote none for this version.
-    #[prost(message, repeated, tag = "2")]
-    pub documentation: ::prost::alloc::vec::Vec<DocumentationText>,
-    #[prost(string, tag = "3")]
-    pub uploaded_by: ::prost::alloc::string::String,
-    #[prost(int64, tag = "4")]
-    pub uploaded_at_ns: i64,
-}
-/// A listing in the platform's catalogue: `organisation/plugin`, one listing
-/// across both registries (item 71). The vendor's stated attributes are the
-/// vendor's words, marked as such wherever they are shown, and never
-/// instructions to whoever reads them.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct PluginListing {
-    /// `organisation/plugin`: the organisation's slug and the plugin's name in
-    /// its `\[tool.meridian\]`, both fixed at the first publish.
-    #[prost(string, tag = "1")]
-    pub listing: ::prost::alloc::string::String,
-    /// The source repository it is built from, as a URL, linked through the
-    /// platform's GitHub App and fixed at the first publish.
-    #[prost(string, tag = "2")]
-    pub repository: ::prost::alloc::string::String,
-    /// Its versions, every registry's, in SemVer order, pulled and withdrawn
-    /// ones marked.
-    #[prost(message, repeated, tag = "3")]
-    pub versions: ::prost::alloc::vec::Vec<ListedVersion>,
-    /// The vendor's stated regions, each an ISO 3166-1 alpha-2 country code
-    /// (`US`), and asset classes, from the platform's asset classes, and its
-    /// support contact (an `https:` URL or an address), required for verified.
-    #[prost(string, repeated, tag = "4")]
-    pub regions: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, repeated, tag = "5")]
-    pub asset_classes: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, tag = "6")]
-    pub support_contact: ::prost::alloc::string::String,
-    /// How many organisations starred it; never who.
-    #[prost(uint64, tag = "7")]
-    pub stars: u64,
-    /// Installs, counted from resolution requests, and launched instances,
-    /// from usage reports: totals, shown only once three or more deployments
-    /// contribute; `counts_shown` false below that, the counts then 0 and
-    /// read "Fewer than three deployments".
-    #[prost(uint64, tag = "8")]
-    pub installs: u64,
-    #[prost(uint64, tag = "9")]
-    pub instances: u64,
-    #[prost(bool, tag = "10")]
-    pub counts_shown: bool,
-}
-/// One version of a listing, in one registry.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ListedVersion {
-    #[prost(string, tag = "1")]
-    pub listing: ::prost::alloc::string::String,
-    /// SemVer 2.0, its release tag `v` and the version.
-    #[prost(string, tag = "2")]
-    pub version: ::prost::alloc::string::String,
-    /// `community` or `verified`.
-    #[prost(string, tag = "3")]
-    pub registry: ::prost::alloc::string::String,
-    /// What the builder built, by digest; the conductor installs this and
-    /// nothing else.
-    #[prost(string, tag = "4")]
-    pub image_digest: ::prost::alloc::string::String,
-    /// The built image's metadata: roles, interface, SDK and declaration, its
-    /// documentation named by digest.
-    #[prost(message, optional, tag = "5")]
-    pub metadata: ::core::option::Option<PluginMetadata>,
-    /// For verified, the roles the platform's review approved, from its
-    /// listing statement; a launch may approve no role beyond them. Empty for
-    /// community, whose roles are the declaration's, for the admin to approve.
-    #[prost(string, repeated, tag = "6")]
-    pub approved_roles: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    /// The version's floor: the contract version it declares, `v<N>`, which a
-    /// deployment's sidecar must serve.
-    #[prost(string, tag = "7")]
-    pub schema_version: ::prost::alloc::string::String,
-    /// How it was built.
-    #[prost(message, optional, tag = "8")]
-    pub build: ::core::option::Option<PluginBuild>,
-    #[prost(int64, tag = "9")]
-    pub listed_at_ns: i64,
-    /// Withdrawn by its vendor (W8.16): not offered for install or update,
-    /// still pullable by digest, with no warning to deployments running it.
-    #[prost(int64, tag = "10")]
-    pub withdrawn_at_ns: i64,
-    /// Its pull, unset while it is not pulled.
-    #[prost(message, optional, tag = "11")]
-    pub pull: ::core::option::Option<PluginPull>,
-    /// Its place in the catalogue's sequence, which a pull after a sequence
-    /// reads from.
-    #[prost(uint64, tag = "12")]
-    pub sequence: u64,
-    /// The platform's signed listing statement (requirement 21), the same
-    /// document the image carries as an OCI referrer: a DSSE envelope as JSON
-    /// -- payloadType `application/vnd.in-toto+json`, payload the base64 of
-    /// an in-toto statement whose subject is image_digest and whose predicate
-    /// type is `<https://open-meridian.dev/attestation/plugin-listing/v1`>
-    /// (the registry, the time, and for verified the review and its approved
-    /// roles), and its signatures -- which the conductor verifies at download
-    /// and again at launch against the platform's keys the chart carries.
-    /// Empty only before the version is listed.
-    #[prost(string, tag = "13")]
-    pub listing_statement: ::prost::alloc::string::String,
-}
-/// A build of a signed release tag by the platform's builder (W8.8; items 102,
-/// 103), followed by the CLI until the version is listed, queued for review
-/// or refused. A refused build carries no text of its own: why is the
-/// details of its findings at BUILD_FINDING_SEVERITY_BLOCKED. The repository
-/// and the builder are URLs.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct PluginBuild {
-    #[prost(string, tag = "1")]
-    pub build_id: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub listing: ::prost::alloc::string::String,
-    #[prost(string, tag = "3")]
-    pub version: ::prost::alloc::string::String,
-    /// `community` or `verified`, as the publish asked.
-    #[prost(string, tag = "4")]
-    pub registry: ::prost::alloc::string::String,
-    #[prost(enumeration = "PluginBuildState", tag = "5")]
-    pub state: i32,
-    /// What it was built from: the repository, the commit the tag pins, the
-    /// tag, and the fingerprint of the key that signed it.
-    #[prost(string, tag = "6")]
-    pub repository: ::prost::alloc::string::String,
-    #[prost(string, tag = "7")]
-    pub commit: ::prost::alloc::string::String,
-    #[prost(string, tag = "8")]
-    pub tag: ::prost::alloc::string::String,
-    #[prost(string, tag = "9")]
-    pub signer_fingerprint: ::prost::alloc::string::String,
-    /// The builder's identity, as its provenance names it.
-    #[prost(string, tag = "10")]
-    pub builder: ::prost::alloc::string::String,
-    /// The image's digest once built; empty before.
-    #[prost(string, tag = "11")]
-    pub image_digest: ::prost::alloc::string::String,
-    /// Each check's finding, in order: a refusal names the check that failed,
-    /// a warning is shown with the version.
-    #[prost(message, repeated, tag = "12")]
-    pub findings: ::prost::alloc::vec::Vec<BuildFinding>,
-    /// For community, the build's public log; empty for verified.
-    #[prost(string, tag = "13")]
-    pub log_url: ::prost::alloc::string::String,
-    #[prost(int64, tag = "14")]
-    pub requested_at_ns: i64,
-    #[prost(int64, tag = "15")]
-    pub finished_at_ns: i64,
-}
-/// One automatic check's finding on a build (requirement 14).
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct BuildFinding {
-    /// The check: the tag's signature, the repository and licence, the base
-    /// image, the dependency screen, a scan, the conformance suite, a cap, or
-    /// the declaration's and documentation's checks.
-    #[prost(string, tag = "1")]
-    pub check: ::prost::alloc::string::String,
-    #[prost(enumeration = "BuildFindingSeverity", tag = "2")]
-    pub severity: i32,
-    /// What it found, in words.
-    #[prost(string, tag = "3")]
-    pub detail: ::prost::alloc::string::String,
-}
-/// A person's review of a verified version (W8.9), its decision its own
-/// record (decisions/031).
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct PluginReview {
-    #[prost(string, tag = "1")]
-    pub review_id: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub listing: ::prost::alloc::string::String,
-    #[prost(string, tag = "3")]
-    pub version: ::prost::alloc::string::String,
-    /// Short when its roles and floor match the last approved version's,
-    /// full otherwise; never none.
-    #[prost(bool, tag = "4")]
-    pub full: bool,
-    #[prost(enumeration = "PluginReviewDecision", tag = "5")]
-    pub decision: i32,
-    /// The reviewer, a staff member holding REVIEW_PLUGINS, and when.
-    #[prost(string, tag = "6")]
-    pub reviewer_person_id: ::prost::alloc::string::String,
-    #[prost(int64, tag = "7")]
-    pub decided_at_ns: i64,
-    /// What an approval approves: the roles and the floor.
-    #[prost(string, repeated, tag = "8")]
-    pub approved_roles: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, tag = "9")]
-    pub schema_version: ::prost::alloc::string::String,
-    /// The reason sent to the vendor.
-    #[prost(string, tag = "10")]
-    pub reason: ::prost::alloc::string::String,
-}
-/// An organisation's tag-signing key (W5.30): its public half only.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct SigningKeyRecord {
-    #[prost(string, tag = "1")]
-    pub key_id: ::prost::alloc::string::String,
-    /// The organisation's slug.
-    #[prost(string, tag = "2")]
-    pub organisation: ::prost::alloc::string::String,
-    /// The organisation's name for the key.
-    #[prost(string, tag = "3")]
-    pub name: ::prost::alloc::string::String,
-    /// The SSH public key, as `ssh-ed25519 AAAA...`, and its SHA-256
-    /// fingerprint as git and GitHub show it.
-    #[prost(string, tag = "4")]
-    pub public_key: ::prost::alloc::string::String,
-    #[prost(string, tag = "5")]
-    pub fingerprint: ::prost::alloc::string::String,
-    #[prost(int64, tag = "6")]
-    pub registered_at_ns: i64,
-    #[prost(string, tag = "7")]
-    pub registered_by_person_id: ::prost::alloc::string::String,
-    /// A revocation: when, by whom, why, and the time after which nothing
-    /// built is trusted (item 74). 0 while it is active.
-    #[prost(int64, tag = "8")]
-    pub revoked_at_ns: i64,
-    #[prost(string, tag = "9")]
-    pub revoked_by_person_id: ::prost::alloc::string::String,
-    #[prost(string, tag = "10")]
-    pub revoke_reason: ::prost::alloc::string::String,
-    #[prost(int64, tag = "11")]
-    pub not_trusted_after_ns: i64,
-}
-/// Every organisation's tag-signing keys, active and revoked, as a document
-/// the platform signs (requirement 26): the conductor pulls it with the
-/// catalogue and checks a version's signer against the latest it holds, and
-/// a bundle carries a dated copy.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct SigningKeyStatus {
-    #[prost(int64, tag = "1")]
-    pub issued_at_ns: i64,
-    #[prost(message, repeated, tag = "2")]
-    pub keys: ::prost::alloc::vec::Vec<SigningKeyRecord>,
-    /// The platform's signature over the document, checked against the
-    /// platform's public keys each chart release carries: base64 of an ECDSA
-    /// P-256 signature over DSSE's pre-authentication encoding (PAE) of the
-    /// payload type `application/vnd.open-meridian.signing-key-status+json`
-    /// and the body, this record's canonical JSON without `signature` -- the
-    /// DSSE convention in-toto and Sigstore use.
-    #[prost(string, tag = "3")]
-    pub signature: ::prost::alloc::string::String,
-}
-/// A pull of a listing or a version from the catalogue (W8.12), staff's act,
-/// its own record. A pull stops new installs and updates and warns installed
-/// copies; it never removes one.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct PluginPull {
-    #[prost(string, tag = "1")]
-    pub listing: ::prost::alloc::string::String,
-    /// The one version pulled; never empty (W8.12).
-    #[prost(string, tag = "2")]
-    pub version: ::prost::alloc::string::String,
-    #[prost(enumeration = "PullReasonKind", tag = "3")]
-    pub kind: i32,
-    /// The reason, in words, as deployments and organisations are told it.
-    #[prost(string, tag = "4")]
-    pub reason: ::prost::alloc::string::String,
-    #[prost(int64, tag = "5")]
-    pub pulled_at_ns: i64,
-    /// For a copyright notice's pull, the notice (W8.13).
-    #[prost(string, tag = "6")]
-    pub notice_id: ::prost::alloc::string::String,
-    /// A restoration after a counter-notice (W8.13): when; 0 while it stands.
-    #[prost(int64, tag = "7")]
-    pub restored_at_ns: i64,
-}
-/// A copyright notice under 17 U.S.C. §512, recorded by staff against a
-/// listing's versions (W8.13), with its counter-notice and what became of it.
-/// The sender's contact details are kept for staff and the publishing
-/// organisation alone.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct CopyrightNotice {
-    #[prost(string, tag = "1")]
-    pub notice_id: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub listing: ::prost::alloc::string::String,
-    /// The versions, or digests, it names.
-    #[prost(string, repeated, tag = "3")]
-    pub versions: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, repeated, tag = "4")]
-    pub image_digests: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    /// The date received, ISO 8601.
-    #[prost(string, tag = "5")]
-    pub received_on: ::prost::alloc::string::String,
-    /// Each §512(c)(3) element present, by its paragraph, `i` to `vi`; a
-    /// notice missing one is incomplete and its sender told what is missing.
-    #[prost(string, repeated, tag = "6")]
-    pub elements_present: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(bool, tag = "7")]
-    pub complete: bool,
-    #[prost(string, tag = "8")]
-    pub sender_name: ::prost::alloc::string::String,
-    #[prost(string, tag = "9")]
-    pub sender_contact: ::prost::alloc::string::String,
-    #[prost(enumeration = "CopyrightNoticeState", tag = "10")]
-    pub state: i32,
-    /// The counter-notice: the date received and each §512(g)(3) element
-    /// present, by its paragraph, `A` to `D`.
-    #[prost(string, tag = "11")]
-    pub counter_received_on: ::prost::alloc::string::String,
-    #[prost(string, repeated, tag = "12")]
-    pub counter_elements_present: ::prost::alloc::vec::Vec<
-        ::prost::alloc::string::String,
-    >,
-    /// The restoration window, no sooner than 10 and no later than 14 business
-    /// days after the counter-notice, ISO 8601 dates.
-    #[prost(string, tag = "13")]
-    pub restore_from: ::prost::alloc::string::String,
-    #[prost(string, tag = "14")]
-    pub restore_until: ::prost::alloc::string::String,
-    /// A court action the sender filed, recorded by staff: the date, which
-    /// keeps the versions pulled.
-    #[prost(string, tag = "15")]
-    pub court_action_on: ::prost::alloc::string::String,
-}
-/// The plugin usage report (W5.19's carve-out; requirement 47): counts about
-/// each installed community or verified version, weekly. It names no person,
-/// account, instrument or local plugin.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct PluginUsageReport {
-    /// The week it covers, ISO 8601 dates, inclusive.
-    #[prost(string, tag = "1")]
-    pub period_start: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub period_end: ::prost::alloc::string::String,
-    #[prost(message, repeated, tag = "3")]
-    pub counts: ::prost::alloc::vec::Vec<PluginUsageCount>,
-}
-/// One installed registry version's counts over the week.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct PluginUsageCount {
-    #[prost(string, tag = "1")]
-    pub listing: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub version: ::prost::alloc::string::String,
-    #[prost(string, tag = "3")]
-    pub registry: ::prost::alloc::string::String,
-    /// Instances launched at the period's end.
-    #[prost(uint32, tag = "4")]
-    pub instances: u32,
-    /// People holding each level on any of its roles, at the period's end.
-    #[prost(uint32, tag = "5")]
-    pub people_read: u32,
-    #[prost(uint32, tag = "6")]
-    pub people_write: u32,
-    #[prost(uint32, tag = "7")]
-    pub people_admin: u32,
-    /// Seven daily counts, the period's first day first: operations its
-    /// sidecars carried, and page and tool requests.
-    #[prost(uint64, repeated, tag = "8")]
-    pub daily_operations: ::prost::alloc::vec::Vec<u64>,
-    #[prost(uint64, repeated, tag = "9")]
-    pub daily_requests: ::prost::alloc::vec::Vec<u64>,
-}
-/// The builder says it started: the build's public log, for community.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct RecordBuildStartedRequest {
-    #[prost(string, tag = "1")]
-    pub build_id: ::prost::alloc::string::String,
-    /// The nonce the platform gave the build when it was asked for; spent at
-    /// the results.
-    #[prost(string, tag = "2")]
-    pub intake_nonce: ::prost::alloc::string::String,
-    #[prost(string, tag = "3")]
-    pub log_url: ::prost::alloc::string::String,
-}
-/// The builder hands back what it built and what each check found -- one
-/// finding per check, the scan policy (plan Q4) applied in the builder -- and
-/// the platform checks them, then lists, queues for review or refuses. The
-/// provenance and the image's metadata are not in it: the platform reads
-/// them from the image's OCI 1.1 referrers, the builder's SLSA provenance
-/// and its plugin-metadata attestation
-/// (`<https://open-meridian.dev/attestation/plugin-metadata/v1`>).
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct RecordBuildResultsRequest {
-    #[prost(string, tag = "1")]
-    pub build_id: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub intake_nonce: ::prost::alloc::string::String,
-    #[prost(string, tag = "3")]
-    pub image_digest: ::prost::alloc::string::String,
-    #[prost(message, repeated, tag = "4")]
-    pub findings: ::prost::alloc::vec::Vec<BuildFinding>,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct PublishPluginVersionRequest {
-    /// The organisation's slug and the plugin's name.
-    #[prost(string, tag = "1")]
-    pub organisation: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub plugin: ::prost::alloc::string::String,
-    /// `community` or `verified`.
-    #[prost(string, tag = "3")]
-    pub registry: ::prost::alloc::string::String,
-    /// A repository linked through the platform's GitHub App, as its URL or
-    /// as owner/name; at a listing's first publish it becomes the listing's,
-    /// fixed, and is answered as a URL.
-    #[prost(string, tag = "4")]
-    pub repository: ::prost::alloc::string::String,
-    /// The release tag, `v` and the SemVer version, signed by a registered,
-    /// active key of the organisation.
-    #[prost(string, tag = "5")]
-    pub tag: ::prost::alloc::string::String,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ReadPluginBuildRequest {
-    #[prost(string, tag = "1")]
-    pub organisation: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub plugin: ::prost::alloc::string::String,
-    #[prost(string, tag = "3")]
-    pub build_id: ::prost::alloc::string::String,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct RegisterSigningKeyRequest {
-    #[prost(string, tag = "1")]
-    pub organisation: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub name: ::prost::alloc::string::String,
-    #[prost(string, tag = "3")]
-    pub public_key: ::prost::alloc::string::String,
-}
-/// The organisation's own keys, active and revoked (W5.30): its page and
-/// `meridian plugin key list`.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ListSigningKeysRequest {
-    #[prost(string, tag = "1")]
-    pub organisation: ::prost::alloc::string::String,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ListSigningKeysReply {
-    #[prost(message, repeated, tag = "1")]
-    pub keys: ::prost::alloc::vec::Vec<SigningKeyRecord>,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct RevokeSigningKeyRequest {
-    #[prost(string, tag = "1")]
-    pub organisation: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub key_id: ::prost::alloc::string::String,
-    /// Nothing built after it is trusted; at most now.
-    #[prost(int64, tag = "3")]
-    pub not_trusted_after_ns: i64,
-    #[prost(string, tag = "4")]
-    pub reason: ::prost::alloc::string::String,
-}
-/// The catalogue after a sequence: every listing changed since, with its
-/// versions, pulls and withdrawals, and the signing keys' status.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct PullCatalogueReply {
-    #[prost(message, repeated, tag = "1")]
-    pub listings: ::prost::alloc::vec::Vec<PluginListing>,
-    /// The latest sequence the answer holds, which the next pull reads after.
-    #[prost(uint64, tag = "2")]
-    pub sequence: u64,
-    #[prost(message, optional, tag = "3")]
-    pub key_status: ::core::option::Option<SigningKeyStatus>,
-}
-/// One resolution request per install or update (plan Q3), counted by the
-/// platform; also the CLI's bundle download (W8.14).
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct DownloadListedVersionRequest {
-    #[prost(string, tag = "1")]
-    pub listing: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub version: ::prost::alloc::string::String,
-    #[prost(string, tag = "3")]
-    pub registry: ::prost::alloc::string::String,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct DownloadListedVersionReply {
-    #[prost(string, tag = "1")]
-    pub image_digest: ::prost::alloc::string::String,
-    /// Where to pull it by digest: the repository in the platform's public
-    /// GitHub registry for community, in Artifact Registry for verified.
-    #[prost(string, tag = "2")]
-    pub pull_from: ::prost::alloc::string::String,
-    /// For verified, a short-lived pull token; empty for community, whose
-    /// bytes are pulled anonymously.
-    #[prost(string, tag = "3")]
-    pub pull_token: ::prost::alloc::string::String,
-    #[prost(int64, tag = "4")]
-    pub pull_token_expires_at_ns: i64,
-    /// The version's signed listing statement, as ListedVersion.listing_statement
-    /// carries it: a DSSE envelope as JSON. The conductor verifies it at
-    /// download and keeps it with the version for launch; the CLI's bundle
-    /// download verifies it and writes it into the bundle (W8.14), since a
-    /// verified version's statement is not a referrer the platform can push.
-    #[prost(string, tag = "5")]
-    pub listing_statement: ::prost::alloc::string::String,
-}
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
-pub struct ReportPluginUsageReply {
-    #[prost(int64, tag = "1")]
-    pub received_at_ns: i64,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ReviewPluginVersionRequest {
-    #[prost(string, tag = "1")]
-    pub review_id: ::prost::alloc::string::String,
-    #[prost(enumeration = "PluginReviewDecision", tag = "2")]
-    pub decision: i32,
-    /// On an approval, the roles approved, no wider than the declaration's.
-    #[prost(string, repeated, tag = "3")]
-    pub approved_roles: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, tag = "4")]
-    pub reason: ::prost::alloc::string::String,
-}
-/// A person holding REVIEW_PLUGINS accepts or rejects an agent's proposal --
-/// a review, a pull, a copyright pull or a restoration (W8.9, W8.12, W8.13).
-/// Accepting makes the act as that person, its own record.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct DecideRegistryProposalRequest {
-    #[prost(string, tag = "1")]
-    pub proposal_id: ::prost::alloc::string::String,
-    #[prost(bool, tag = "2")]
-    pub accept: bool,
-    #[prost(string, tag = "3")]
-    pub note: ::prost::alloc::string::String,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct DecideRegistryProposalReply {
-    #[prost(string, tag = "1")]
-    pub proposal_id: ::prost::alloc::string::String,
-    #[prost(bool, tag = "2")]
-    pub accepted: bool,
-    #[prost(int64, tag = "3")]
-    pub decided_at_ns: i64,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct PullListingRequest {
-    #[prost(string, tag = "1")]
-    pub listing: ::prost::alloc::string::String,
-    /// One version, required: pulling a whole listing, or the several versions
-    /// a copyright notice names, is one request per version, each its own
-    /// record (decisions/031; W8.12, W8.13).
-    #[prost(string, tag = "2")]
-    pub version: ::prost::alloc::string::String,
-    #[prost(enumeration = "PullReasonKind", tag = "3")]
-    pub kind: i32,
-    #[prost(string, tag = "4")]
-    pub reason: ::prost::alloc::string::String,
-    /// For a copyright notice's pull, the notice it acts on.
-    #[prost(string, tag = "5")]
-    pub notice_id: ::prost::alloc::string::String,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct StarPluginRequest {
-    #[prost(string, tag = "1")]
-    pub listing: ::prost::alloc::string::String,
-    /// True stars it, once per organisation; false takes the star back.
-    #[prost(bool, tag = "2")]
-    pub starred: bool,
-    /// The organisation starring, one the person is an Owner or Admin of with
-    /// an enrolled deployment: a person may belong to several, and a star is
-    /// one per organisation.
-    #[prost(string, tag = "3")]
-    pub organisation_id: ::prost::alloc::string::String,
-}
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
-pub struct StarPluginReply {
-    /// Whether this organisation's star stands, and the listing's count.
-    #[prost(bool, tag = "1")]
-    pub starred: bool,
-    #[prost(uint64, tag = "2")]
-    pub stars: u64,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct SetPluginAttributesRequest {
-    #[prost(string, tag = "1")]
-    pub organisation: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub plugin: ::prost::alloc::string::String,
-    #[prost(string, repeated, tag = "3")]
-    pub regions: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, repeated, tag = "4")]
-    pub asset_classes: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, tag = "5")]
-    pub support_contact: ::prost::alloc::string::String,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct WithdrawListedVersionRequest {
-    #[prost(string, tag = "1")]
-    pub organisation: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub plugin: ::prost::alloc::string::String,
-    #[prost(string, tag = "3")]
-    pub version: ::prost::alloc::string::String,
-    #[prost(string, tag = "4")]
-    pub reason: ::prost::alloc::string::String,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct SetMayPublishRequest {
-    #[prost(string, tag = "1")]
-    pub organisation: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub plugin: ::prost::alloc::string::String,
-    #[prost(string, tag = "3")]
-    pub person_id: ::prost::alloc::string::String,
-    /// True grants the permission, false withdraws it.
-    #[prost(bool, tag = "4")]
-    pub may_publish: bool,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct SetMayPublishReply {
-    /// Who holds it on the plugin now, beside the organisation's Owners and
-    /// Admins.
-    #[prost(string, repeated, tag = "1")]
-    pub person_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct RecordCopyrightNoticeRequest {
-    #[prost(string, tag = "1")]
-    pub listing: ::prost::alloc::string::String,
-    #[prost(string, repeated, tag = "2")]
-    pub versions: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, repeated, tag = "3")]
-    pub image_digests: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, tag = "4")]
-    pub received_on: ::prost::alloc::string::String,
-    #[prost(string, repeated, tag = "5")]
-    pub elements_present: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, tag = "6")]
-    pub sender_name: ::prost::alloc::string::String,
-    #[prost(string, tag = "7")]
-    pub sender_contact: ::prost::alloc::string::String,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct RecordCounterNoticeRequest {
-    #[prost(string, tag = "1")]
-    pub notice_id: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub received_on: ::prost::alloc::string::String,
-    #[prost(string, repeated, tag = "3")]
-    pub elements_present: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct RecordCourtActionRequest {
-    #[prost(string, tag = "1")]
-    pub notice_id: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub filed_on: ::prost::alloc::string::String,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct RestoreListedVersionRequest {
-    #[prost(string, tag = "1")]
-    pub notice_id: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub reason: ::prost::alloc::string::String,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct SetCopyrightAgentFiledRequest {
-    /// True turns the process on, which needs every detail below; false turns
-    /// it off.
-    #[prost(bool, tag = "1")]
-    pub filed: bool,
-    #[prost(string, tag = "2")]
-    pub agent_name: ::prost::alloc::string::String,
-    #[prost(string, tag = "3")]
-    pub agent_address: ::prost::alloc::string::String,
-    #[prost(string, tag = "4")]
-    pub registration_number: ::prost::alloc::string::String,
-    #[prost(string, tag = "5")]
-    pub registration_date: ::prost::alloc::string::String,
-    #[prost(string, tag = "6")]
-    pub reason: ::prost::alloc::string::String,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct SetCopyrightAgentFiledReply {
-    #[prost(bool, tag = "1")]
-    pub filed: bool,
-    #[prost(string, tag = "2")]
-    pub agent_name: ::prost::alloc::string::String,
-    #[prost(string, tag = "3")]
-    pub agent_address: ::prost::alloc::string::String,
-    #[prost(string, tag = "4")]
-    pub registration_number: ::prost::alloc::string::String,
-    #[prost(string, tag = "5")]
-    pub registration_date: ::prost::alloc::string::String,
-    #[prost(int64, tag = "6")]
-    pub changed_at_ns: i64,
-    #[prost(string, tag = "7")]
-    pub changed_by_person_id: ::prost::alloc::string::String,
-}
-/// Browse and a listing's page, read from the conductor's latest copy of the
-/// catalogue, so the platform is never reached in a page's request.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ListRegistryPluginsRequest {
-    /// Words matched against the listing's name and the vendor's text.
-    #[prost(string, tag = "1")]
-    pub search: ::prost::alloc::string::String,
-    /// `community` or `verified`; empty for both.
-    #[prost(string, tag = "2")]
-    pub registry: ::prost::alloc::string::String,
-    /// A role from matrix/roles.tsv; empty for any.
-    #[prost(string, tag = "3")]
-    pub role: ::prost::alloc::string::String,
-    /// One listing, `organisation/plugin`, for its page; empty for the list.
-    #[prost(string, tag = "4")]
-    pub listing: ::prost::alloc::string::String,
-    #[prost(int32, tag = "5")]
-    pub page_size: i32,
-    #[prost(string, tag = "6")]
-    pub cursor: ::prost::alloc::string::String,
-    /// Pull the catalogue first ("Pull now"), then answer.
-    #[prost(bool, tag = "7")]
-    pub pull_now: bool,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ListRegistryPluginsReply {
-    #[prost(message, repeated, tag = "1")]
-    pub listings: ::prost::alloc::vec::Vec<PluginListing>,
-    #[prost(string, tag = "2")]
-    pub next_cursor: ::prost::alloc::string::String,
-    /// When the conductor last pulled the catalogue.
-    #[prost(int64, tag = "3")]
-    pub catalogue_pulled_at_ns: i64,
-}
-/// A deployment admin installs a listed version: resolved, pulled by digest
-/// into the local registry with its referrers, verified, and recorded. Install
-/// launches nothing.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct InstallPluginRequest {
-    #[prost(string, tag = "1")]
-    pub listing: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub version: ::prost::alloc::string::String,
-    #[prost(string, tag = "3")]
-    pub registry: ::prost::alloc::string::String,
-    /// Why, kept with the install's record. Through /mcp every install
-    /// carries one.
-    #[prost(string, tag = "4")]
-    pub note: ::prost::alloc::string::String,
-}
-/// Moves an instance to a newer version from its source registry, or a local
-/// version's instance to a listed version of the same plugin (W8.11).
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct UpdatePluginRequest {
-    #[prost(string, tag = "1")]
-    pub instance_id: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub listing: ::prost::alloc::string::String,
-    #[prost(string, tag = "3")]
-    pub version: ::prost::alloc::string::String,
-    /// The roles as approved, exactly the version's (for verified, its
-    /// platform-approved roles); a widening waits for this approval.
-    #[prost(string, repeated, tag = "4")]
-    pub approved_roles: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, tag = "5")]
-    pub note: ::prost::alloc::string::String,
-}
-/// A deployment admin keeps an instance whose version was pulled (W8.12).
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct AcknowledgePullRequest {
-    #[prost(string, tag = "1")]
-    pub instance_id: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub note: ::prost::alloc::string::String,
-}
-/// Kept on the launch, its own record.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct PullAcknowledgement {
-    /// The pull it acknowledges.
-    #[prost(message, optional, tag = "1")]
-    pub pull: ::core::option::Option<PluginPull>,
-    #[prost(string, tag = "2")]
-    pub acknowledged_by: ::prost::alloc::string::String,
-    #[prost(int64, tag = "3")]
-    pub acknowledged_at_ns: i64,
-    #[prost(string, tag = "4")]
-    pub acting_through_delegation: ::prost::alloc::string::String,
-    #[prost(string, tag = "5")]
-    pub client_name: ::prost::alloc::string::String,
-    #[prost(string, tag = "6")]
-    pub note: ::prost::alloc::string::String,
-}
-/// A deployment admin retires an uploaded or installed version (W8.15): it
-/// leaves the catalogue and its image is released, unless an instance runs it
-/// or a record names it, which refuses it naming them.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct RetirePluginVersionRequest {
-    #[prost(string, tag = "1")]
-    pub name: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub version: ::prost::alloc::string::String,
-    #[prost(string, tag = "3")]
-    pub note: ::prost::alloc::string::String,
-}
-/// The plugin usage report's setting (W5.19): on by default.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct SetReportsPluginUsageRequest {
-    #[prost(bool, tag = "1")]
-    pub reports_plugin_usage: bool,
-    #[prost(string, tag = "2")]
-    pub reason: ::prost::alloc::string::String,
-}
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
-pub struct ReportsPluginUsageSetting {
-    #[prost(bool, tag = "1")]
-    pub reports_plugin_usage: bool,
-}
-/// The Registries tab: the reports sent, the setting in force and the
-/// catalogue's age.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ListPluginUsageReportsRequest {
-    #[prost(int32, tag = "1")]
-    pub page_size: i32,
-    #[prost(string, tag = "2")]
-    pub cursor: ::prost::alloc::string::String,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ListPluginUsageReportsReply {
-    #[prost(message, repeated, tag = "1")]
-    pub reports: ::prost::alloc::vec::Vec<SentPluginUsageReport>,
-    #[prost(string, tag = "2")]
-    pub next_cursor: ::prost::alloc::string::String,
-    #[prost(bool, tag = "3")]
-    pub reports_plugin_usage: bool,
-    #[prost(int64, tag = "4")]
-    pub catalogue_pulled_at_ns: i64,
-}
-/// A plugin usage report the conductor sent, kept on the deployment as its
-/// own record.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct SentPluginUsageReport {
-    #[prost(int64, tag = "1")]
-    pub sent_at_ns: i64,
-    /// Whether the platform received it.
-    #[prost(bool, tag = "2")]
-    pub received: bool,
-    #[prost(message, optional, tag = "3")]
-    pub report: ::core::option::Option<PluginUsageReport>,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
-#[repr(i32)]
-pub enum PluginLaunchState {
-    Unspecified = 0,
-    /// Recorded, and the launcher asked.
-    Launched = 1,
-    /// Stopped by an administrator; its instance may be launched again.
-    Stopped = 2,
-    /// The launcher refused or failed, with the reason in `failure`.
-    Failed = 3,
-}
-impl PluginLaunchState {
-    /// String value of the enum field names used in the ProtoBuf definition.
-    ///
-    /// The values are not transformed in any way and thus are considered stable
-    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
-    pub fn as_str_name(&self) -> &'static str {
-        match self {
-            Self::Unspecified => "PLUGIN_LAUNCH_STATE_UNSPECIFIED",
-            Self::Launched => "PLUGIN_LAUNCH_STATE_LAUNCHED",
-            Self::Stopped => "PLUGIN_LAUNCH_STATE_STOPPED",
-            Self::Failed => "PLUGIN_LAUNCH_STATE_FAILED",
-        }
-    }
-    /// Creates an enum from field names used in the ProtoBuf definition.
-    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
-        match value {
-            "PLUGIN_LAUNCH_STATE_UNSPECIFIED" => Some(Self::Unspecified),
-            "PLUGIN_LAUNCH_STATE_LAUNCHED" => Some(Self::Launched),
-            "PLUGIN_LAUNCH_STATE_STOPPED" => Some(Self::Stopped),
-            "PLUGIN_LAUNCH_STATE_FAILED" => Some(Self::Failed),
-            _ => None,
-        }
-    }
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
-#[repr(i32)]
-pub enum PluginBuildState {
-    Unspecified = 0,
-    /// Asked for, waiting for the builder.
-    Queued = 1,
-    /// Checked out, verified and building, or being checked.
-    Building = 2,
-    /// Every automatic check passed and, for community, listed.
-    Listed = 3,
-    /// Every automatic check passed; a verified version waiting for review.
-    InReview = 4,
-    /// A check failed, named in findings; nothing is listed.
-    Refused = 5,
-}
-impl PluginBuildState {
-    /// String value of the enum field names used in the ProtoBuf definition.
-    ///
-    /// The values are not transformed in any way and thus are considered stable
-    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
-    pub fn as_str_name(&self) -> &'static str {
-        match self {
-            Self::Unspecified => "PLUGIN_BUILD_STATE_UNSPECIFIED",
-            Self::Queued => "PLUGIN_BUILD_STATE_QUEUED",
-            Self::Building => "PLUGIN_BUILD_STATE_BUILDING",
-            Self::Listed => "PLUGIN_BUILD_STATE_LISTED",
-            Self::InReview => "PLUGIN_BUILD_STATE_IN_REVIEW",
-            Self::Refused => "PLUGIN_BUILD_STATE_REFUSED",
-        }
-    }
-    /// Creates an enum from field names used in the ProtoBuf definition.
-    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
-        match value {
-            "PLUGIN_BUILD_STATE_UNSPECIFIED" => Some(Self::Unspecified),
-            "PLUGIN_BUILD_STATE_QUEUED" => Some(Self::Queued),
-            "PLUGIN_BUILD_STATE_BUILDING" => Some(Self::Building),
-            "PLUGIN_BUILD_STATE_LISTED" => Some(Self::Listed),
-            "PLUGIN_BUILD_STATE_IN_REVIEW" => Some(Self::InReview),
-            "PLUGIN_BUILD_STATE_REFUSED" => Some(Self::Refused),
-            _ => None,
-        }
-    }
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
-#[repr(i32)]
-pub enum BuildFindingSeverity {
-    Unspecified = 0,
-    /// Passed.
-    Passed = 1,
-    /// Shown with the version; lists nothing less.
-    Warning = 2,
-    /// Refused: nothing is listed.
-    Blocked = 3,
-}
-impl BuildFindingSeverity {
-    /// String value of the enum field names used in the ProtoBuf definition.
-    ///
-    /// The values are not transformed in any way and thus are considered stable
-    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
-    pub fn as_str_name(&self) -> &'static str {
-        match self {
-            Self::Unspecified => "BUILD_FINDING_SEVERITY_UNSPECIFIED",
-            Self::Passed => "BUILD_FINDING_SEVERITY_PASSED",
-            Self::Warning => "BUILD_FINDING_SEVERITY_WARNING",
-            Self::Blocked => "BUILD_FINDING_SEVERITY_BLOCKED",
-        }
-    }
-    /// Creates an enum from field names used in the ProtoBuf definition.
-    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
-        match value {
-            "BUILD_FINDING_SEVERITY_UNSPECIFIED" => Some(Self::Unspecified),
-            "BUILD_FINDING_SEVERITY_PASSED" => Some(Self::Passed),
-            "BUILD_FINDING_SEVERITY_WARNING" => Some(Self::Warning),
-            "BUILD_FINDING_SEVERITY_BLOCKED" => Some(Self::Blocked),
-            _ => None,
-        }
-    }
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
-#[repr(i32)]
-pub enum PluginReviewDecision {
-    Unspecified = 0,
-    /// Waiting for a reviewer; an agent's proposal does not decide it.
-    Pending = 1,
-    Approved = 2,
-    /// Lists nothing; the vendor fixes it in a new version.
-    Refused = 3,
-}
-impl PluginReviewDecision {
-    /// String value of the enum field names used in the ProtoBuf definition.
-    ///
-    /// The values are not transformed in any way and thus are considered stable
-    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
-    pub fn as_str_name(&self) -> &'static str {
-        match self {
-            Self::Unspecified => "PLUGIN_REVIEW_DECISION_UNSPECIFIED",
-            Self::Pending => "PLUGIN_REVIEW_DECISION_PENDING",
-            Self::Approved => "PLUGIN_REVIEW_DECISION_APPROVED",
-            Self::Refused => "PLUGIN_REVIEW_DECISION_REFUSED",
-        }
-    }
-    /// Creates an enum from field names used in the ProtoBuf definition.
-    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
-        match value {
-            "PLUGIN_REVIEW_DECISION_UNSPECIFIED" => Some(Self::Unspecified),
-            "PLUGIN_REVIEW_DECISION_PENDING" => Some(Self::Pending),
-            "PLUGIN_REVIEW_DECISION_APPROVED" => Some(Self::Approved),
-            "PLUGIN_REVIEW_DECISION_REFUSED" => Some(Self::Refused),
-            _ => None,
-        }
-    }
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
-#[repr(i32)]
-pub enum PullReasonKind {
-    Unspecified = 0,
-    /// A breach of the Platform Terms.
-    TermsBreach = 1,
-    /// A copyright notice acted on (W8.13).
-    CopyrightNotice = 2,
-}
-impl PullReasonKind {
-    /// String value of the enum field names used in the ProtoBuf definition.
-    ///
-    /// The values are not transformed in any way and thus are considered stable
-    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
-    pub fn as_str_name(&self) -> &'static str {
-        match self {
-            Self::Unspecified => "PULL_REASON_KIND_UNSPECIFIED",
-            Self::TermsBreach => "PULL_REASON_KIND_TERMS_BREACH",
-            Self::CopyrightNotice => "PULL_REASON_KIND_COPYRIGHT_NOTICE",
-        }
-    }
-    /// Creates an enum from field names used in the ProtoBuf definition.
-    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
-        match value {
-            "PULL_REASON_KIND_UNSPECIFIED" => Some(Self::Unspecified),
-            "PULL_REASON_KIND_TERMS_BREACH" => Some(Self::TermsBreach),
-            "PULL_REASON_KIND_COPYRIGHT_NOTICE" => Some(Self::CopyrightNotice),
-            _ => None,
-        }
-    }
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
-#[repr(i32)]
-pub enum CopyrightNoticeState {
-    Unspecified = 0,
-    /// Missing a §512(c)(3) element.
-    Incomplete = 1,
-    Recorded = 2,
-    /// Its versions pulled.
-    ActedOn = 3,
-    /// A counter-notice recorded; the restoration window open.
-    Countered = 4,
-    Restored = 5,
-}
-impl CopyrightNoticeState {
-    /// String value of the enum field names used in the ProtoBuf definition.
-    ///
-    /// The values are not transformed in any way and thus are considered stable
-    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
-    pub fn as_str_name(&self) -> &'static str {
-        match self {
-            Self::Unspecified => "COPYRIGHT_NOTICE_STATE_UNSPECIFIED",
-            Self::Incomplete => "COPYRIGHT_NOTICE_STATE_INCOMPLETE",
-            Self::Recorded => "COPYRIGHT_NOTICE_STATE_RECORDED",
-            Self::ActedOn => "COPYRIGHT_NOTICE_STATE_ACTED_ON",
-            Self::Countered => "COPYRIGHT_NOTICE_STATE_COUNTERED",
-            Self::Restored => "COPYRIGHT_NOTICE_STATE_RESTORED",
-        }
-    }
-    /// Creates an enum from field names used in the ProtoBuf definition.
-    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
-        match value {
-            "COPYRIGHT_NOTICE_STATE_UNSPECIFIED" => Some(Self::Unspecified),
-            "COPYRIGHT_NOTICE_STATE_INCOMPLETE" => Some(Self::Incomplete),
-            "COPYRIGHT_NOTICE_STATE_RECORDED" => Some(Self::Recorded),
-            "COPYRIGHT_NOTICE_STATE_ACTED_ON" => Some(Self::ActedOn),
-            "COPYRIGHT_NOTICE_STATE_COUNTERED" => Some(Self::Countered),
-            "COPYRIGHT_NOTICE_STATE_RESTORED" => Some(Self::Restored),
             _ => None,
         }
     }
@@ -13583,6 +12439,69 @@ pub struct ListDatasetsReply {
     #[prost(message, repeated, tag = "3")]
     pub entitlements: ::prost::alloc::vec::Vec<DatasetEntitlement>,
 }
+/// One read-only query over one of the lake's kinds, within the asking
+/// instance's entitlements and its roles' kinds, capped in rows and columns.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct QueryLakeRequest {
+    /// `prices`, `bars`, `trades`, `quotes` or `outcomes`; a kind the asking
+    /// role does not read is refused naming it.
+    #[prost(string, tag = "1")]
+    pub kind: ::prost::alloc::string::String,
+    /// At most 500.
+    #[prost(message, repeated, tag = "2")]
+    pub subjects: ::prost::alloc::vec::Vec<SubjectRef>,
+    #[prost(message, optional, tag = "3")]
+    pub sources: ::core::option::Option<SourceChoice>,
+    /// A range of valid times, or of business dates (ISO 8601); none set reads
+    /// the latest.
+    #[prost(int64, tag = "4")]
+    pub valid_from_ns: i64,
+    #[prost(int64, tag = "5")]
+    pub valid_until_ns: i64,
+    #[prost(string, tag = "6")]
+    pub from_date: ::prost::alloc::string::String,
+    #[prost(string, tag = "7")]
+    pub to_date: ::prost::alloc::string::String,
+    /// The recorded-time cut-off; 0 for now.
+    #[prost(int64, tag = "8")]
+    pub as_of_ns: i64,
+    /// The fields wanted, by their dictionary entries
+    /// (`meridian.v1.Price.price`); none names every field the asker may read.
+    #[prost(string, repeated, tag = "9")]
+    pub fields: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// 1 to 10,000; 0 reads 1,000. Past it the reply is cut and says so.
+    #[prost(uint32, tag = "10")]
+    pub row_limit: u32,
+    /// The instance whose entitlements and roles bound the answer: a plugin's
+    /// own, stamped by its sidecar; the dashboard's tool, the instance the
+    /// person names and holds read on.
+    #[prost(string, tag = "11")]
+    pub instance_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct QueryLakeReply {
+    /// The rows of the kind asked, each with only the fields named; the other
+    /// lists empty.
+    #[prost(message, repeated, tag = "1")]
+    pub prices: ::prost::alloc::vec::Vec<Price>,
+    #[prost(message, repeated, tag = "2")]
+    pub bars: ::prost::alloc::vec::Vec<Bar>,
+    #[prost(message, repeated, tag = "3")]
+    pub trades: ::prost::alloc::vec::Vec<Trade>,
+    #[prost(message, repeated, tag = "4")]
+    pub quotes: ::prost::alloc::vec::Vec<Quote>,
+    #[prost(message, repeated, tag = "5")]
+    pub outcomes: ::prost::alloc::vec::Vec<Outcome>,
+    #[prost(message, repeated, tag = "6")]
+    pub unanswered: ::prost::alloc::vec::Vec<Unanswered>,
+    #[prost(message, repeated, tag = "7")]
+    pub datasets: ::prost::alloc::vec::Vec<DatasetRef>,
+    #[prost(message, optional, tag = "8")]
+    pub watermark: ::core::option::Option<Watermark>,
+    /// More rows matched than row_limit: the reply is cut at it, never paged.
+    #[prost(bool, tag = "9")]
+    pub truncated: bool,
+}
 /// Which of the source's clocks a timestamp is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -14022,6 +12941,2348 @@ impl UnansweredReason {
             "UNANSWERED_REASON_UNRESOLVED" => Some(Self::Unresolved),
             "UNANSWERED_REASON_BEYOND_HISTORY" => Some(Self::BeyondHistory),
             "UNANSWERED_REASON_NOT_KEPT" => Some(Self::NotKept),
+            _ => None,
+        }
+    }
+}
+/// A job (W12.1): what to compute, over what, against which inputs, named by
+/// reference. A read: it changes no record.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Job {
+    /// The accounts it is over, each in the client's read scope, which the
+    /// sidecar stamps on the request; one outside it is refused naming it.
+    #[prost(string, repeated, tag = "1")]
+    pub account_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Its inputs, by reference.
+    #[prost(message, optional, tag = "2")]
+    pub inputs: ::core::option::Option<InputRefs>,
+    /// The measures, each by definition and version.
+    #[prost(message, repeated, tag = "3")]
+    pub measures: ::prost::alloc::vec::Vec<MeasureRef>,
+    /// Trades added to one account's positions (W12.5); unset for none.
+    #[prost(message, optional, tag = "4")]
+    pub what_if: ::core::option::Option<WhatIf>,
+}
+/// A job's inputs, by reference (requirement 3): one watermark and one as-of
+/// for the whole job (requirements 7, 8).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct InputRefs {
+    /// The book's watermark; unset for now, which the component resolves to
+    /// the watermark it read and answers in the provenance.
+    #[prost(message, optional, tag = "1")]
+    pub book_at: ::core::option::Option<Watermark>,
+    /// The lake's recorded-time cut-off; 0 for now, resolved likewise.
+    #[prost(int64, tag = "2")]
+    pub lake_as_of_ns: i64,
+    /// The lake's source choice; none set is the deployment's default.
+    #[prost(message, optional, tag = "3")]
+    pub sources: ::core::option::Option<SourceChoice>,
+}
+/// A measure, by definition and version (requirement 14).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MeasureRef {
+    /// A definition the component serves: `market_value`, `exposure`,
+    /// `concentration`, `pnl`, `historical_var`, `expected_shortfall`,
+    /// `resolution_payoff`, `implied_distribution` in v26.
+    #[prost(string, tag = "1")]
+    pub definition: ::prost::alloc::string::String,
+    /// Its version, 1 or more.
+    #[prost(int32, tag = "2")]
+    pub version: i32,
+    /// What to break the figures down by, each a breakdown the definition
+    /// allows: `account`, `asset_class`, `currency`, `instrument`, `sleeve`,
+    /// `country`, or a scheme the deployment holds by its name.
+    #[prost(string, repeated, tag = "3")]
+    pub breakdowns: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// For an event measure, the event group it is over (W3.30).
+    #[prost(string, tag = "4")]
+    pub event_group_id: ::prost::alloc::string::String,
+}
+/// Trades added to one account's positions for a what-if (W12.5): never a
+/// book record unless proposed.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WhatIf {
+    #[prost(string, tag = "1")]
+    pub account_id: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "2")]
+    pub trades: ::prost::alloc::vec::Vec<WhatIfTrade>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WhatIfTrade {
+    #[prost(string, tag = "1")]
+    pub instrument_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "Side", tag = "2")]
+    pub side: i32,
+    #[prost(message, optional, tag = "3")]
+    pub quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// An assumed price; unset for the price at the job's as-of.
+    #[prost(message, optional, tag = "4")]
+    pub price: ::core::option::Option<Money>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RunJobRequest {
+    #[prost(message, optional, tag = "1")]
+    pub job: ::core::option::Option<Job>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RunJobReply {
+    /// True when the answer is here; false when the job finishes later
+    /// (W12.4), the component deciding by its size against the deadline (Q5).
+    #[prost(bool, tag = "1")]
+    pub answered_inline: bool,
+    /// `JOB-` and a ULID, never reused.
+    #[prost(string, tag = "2")]
+    pub job_id: ::prost::alloc::string::String,
+    /// Set when answered inline.
+    #[prost(message, optional, tag = "3")]
+    pub answer: ::core::option::Option<JobAnswer>,
+}
+/// A job's answer (W12.1, W12.4): figures, what was not evaluated and why,
+/// and what it was computed from. Not a record: recomputable from its
+/// provenance, cached by hash and losable (Q12).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct JobAnswer {
+    #[prost(string, tag = "1")]
+    pub job_id: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "2")]
+    pub figures: ::prost::alloc::vec::Vec<Figure>,
+    #[prost(message, repeated, tag = "3")]
+    pub not_evaluated: ::prost::alloc::vec::Vec<NotEvaluated>,
+    #[prost(message, optional, tag = "4")]
+    pub provenance: ::core::option::Option<AnswerProvenance>,
+}
+/// One figure (requirement 5; the first release's Q13 and Q14).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Figure {
+    /// The measure it answers.
+    #[prost(message, optional, tag = "1")]
+    pub measure: ::core::option::Option<MeasureRef>,
+    /// The account it is for; empty for a figure across the job's accounts.
+    #[prost(string, tag = "2")]
+    pub account_id: ::prost::alloc::string::String,
+    /// Its place in each breakdown the measure asked for.
+    #[prost(message, repeated, tag = "3")]
+    pub breakdown: ::prost::alloc::vec::Vec<BreakdownValue>,
+    /// Which scenario it is under: base, a what-if, a historical day, an
+    /// outcome.
+    #[prost(message, optional, tag = "4")]
+    pub scenario_key: ::core::option::Option<ScenarioKey>,
+    /// The value, for a figure that is one; unset for a weight.
+    #[prost(message, optional, tag = "5")]
+    pub value: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// A weight or a probability, as its two parts, so a bound is compared by
+    /// cross-multiplication, never a rounded division; unset for a value.
+    #[prost(message, optional, tag = "6")]
+    pub numerator: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    #[prost(message, optional, tag = "7")]
+    pub denominator: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// The cash instrument a value is in: the account's base currency or the
+    /// client's stated reporting currency; empty for a weight.
+    #[prost(string, tag = "8")]
+    pub currency_instrument_id: ::prost::alloc::string::String,
+    /// How it was computed: exact in v26, model from v28.
+    #[prost(enumeration = "ComputedAs", tag = "9")]
+    pub computed_as: i32,
+}
+/// A figure's place in one breakdown.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BreakdownValue {
+    /// The breakdown, as MeasureRef.breakdowns names it.
+    #[prost(string, tag = "1")]
+    pub breakdown: ::prost::alloc::string::String,
+    /// Its value: an asset class's name, an ISO 4217 code or a cash
+    /// instrument's ID, an instrument's ID, a sleeve, a country's ISO 3166-1
+    /// alpha-2 code, or a scheme's class.
+    #[prost(string, tag = "2")]
+    pub value: ::prost::alloc::string::String,
+}
+/// Which scenario a figure is under (the first release's Q13, approved
+/// 2026-10-14): one shape for what-ifs, VaR's days, resolution payoffs and,
+/// from v28, a grid point, which adds a kind and no field.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ScenarioKey {
+    #[prost(enumeration = "ScenarioKind", tag = "1")]
+    pub kind: i32,
+    /// For a historical day, the business date, ISO 8601.
+    #[prost(string, tag = "2")]
+    pub business_date: ::prost::alloc::string::String,
+    /// For an outcome, the member of the event group that resolves YES.
+    #[prost(string, tag = "3")]
+    pub outcome_instrument_id: ::prost::alloc::string::String,
+}
+/// A position or a figure not evaluated, and why (requirement 9): never
+/// zero.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct NotEvaluated {
+    #[prost(string, tag = "1")]
+    pub account_id: ::prost::alloc::string::String,
+    /// The instrument; empty where the whole measure is not evaluated.
+    #[prost(string, tag = "2")]
+    pub instrument_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub measure: ::core::option::Option<MeasureRef>,
+    #[prost(enumeration = "NotEvaluatedReason", tag = "4")]
+    pub reason: i32,
+    /// The dataset not entitled, the implementation unavailable, or the
+    /// scheme not held, where the reason names one.
+    #[prost(string, tag = "5")]
+    pub detail: ::prost::alloc::string::String,
+}
+/// What an answer was computed from (requirements 4 and 35; Q7). Named so it
+/// is not mistaken for meridian.v1.Provenance, a value's source.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AnswerProvenance {
+    /// The watermark and the as-of the job read at.
+    #[prost(message, optional, tag = "1")]
+    pub book_watermark: ::core::option::Option<Watermark>,
+    #[prost(int64, tag = "2")]
+    pub lake_as_of_ns: i64,
+    /// Each dataset read, as the lake's replies named them.
+    #[prost(string, repeated, tag = "3")]
+    pub datasets: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(message, repeated, tag = "4")]
+    pub instruments: ::prost::alloc::vec::Vec<InstrumentInput>,
+    #[prost(message, repeated, tag = "5")]
+    pub models: ::prost::alloc::vec::Vec<ModelRef>,
+    #[prost(message, repeated, tag = "6")]
+    pub measures: ::prost::alloc::vec::Vec<MeasureRef>,
+    /// Each event group read, at the version in force.
+    #[prost(message, repeated, tag = "7")]
+    pub event_groups: ::prost::alloc::vec::Vec<EventGroupInput>,
+    /// The routing table's version (W12.6).
+    #[prost(int64, tag = "8")]
+    pub routing_version: i64,
+    /// The component's version.
+    #[prost(string, tag = "9")]
+    pub engine_version: ::prost::alloc::string::String,
+    /// `sha256:` and the hex of SHA-256 over the RFC 8785 canonical JSON of
+    /// the inputs: two answers with the same hash are the same answer.
+    #[prost(string, tag = "10")]
+    pub answer_hash: ::prost::alloc::string::String,
+}
+/// One instrument a job read, by its record's and template's versions.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct InstrumentInput {
+    #[prost(string, tag = "1")]
+    pub instrument_id: ::prost::alloc::string::String,
+    #[prost(int64, tag = "2")]
+    pub record_version: i64,
+    #[prost(string, tag = "3")]
+    pub template_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub template_version: ::prost::alloc::string::String,
+    /// The template's calculation package's version (W1.24).
+    #[prost(string, tag = "5")]
+    pub calculation_version: ::prost::alloc::string::String,
+}
+/// One event group a job read, at its version.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct EventGroupInput {
+    #[prost(string, tag = "1")]
+    pub event_group_id: ::prost::alloc::string::String,
+    #[prost(int64, tag = "2")]
+    pub version: i64,
+}
+/// A pricing model and the implementation that answered for it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ModelRef {
+    /// `cash`, `quoted_price` or `binary_event` in v26.
+    #[prost(string, tag = "1")]
+    pub model_id: ::prost::alloc::string::String,
+    #[prost(int32, tag = "2")]
+    pub model_version: i32,
+    /// `built-in`, or a `pricing` plugin's instance ID.
+    #[prost(string, tag = "3")]
+    pub implementation: ::prost::alloc::string::String,
+    /// The component's version for the built-in one; the plugin's version
+    /// for a plugin's.
+    #[prost(string, tag = "4")]
+    pub implementation_version: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ListMeasureDefinitionsRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListMeasureDefinitionsReply {
+    #[prost(message, repeated, tag = "1")]
+    pub definitions: ::prost::alloc::vec::Vec<MeasureDefinition>,
+}
+/// A measure's versioned definition (requirements 14 to 17; Q15): shipped
+/// with the component, each fixing every parameter that changes its number.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MeasureDefinition {
+    #[prost(string, tag = "1")]
+    pub definition: ::prost::alloc::string::String,
+    #[prost(int32, tag = "2")]
+    pub version: i32,
+    /// Its parameters, fixed by the version: a VaR's confidence, horizon,
+    /// window, return type, missing-day treatment and quantile.
+    #[prost(message, repeated, tag = "3")]
+    pub parameters: ::prost::alloc::vec::Vec<MeasureParameter>,
+    /// The breakdowns it allows.
+    #[prost(string, repeated, tag = "4")]
+    pub breakdowns: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// The scale its values are rounded to, once, half to even; at most 18.
+    #[prost(int32, tag = "5")]
+    pub scale: i32,
+    /// The component's words for it.
+    #[prost(string, tag = "6")]
+    pub description: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MeasureParameter {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// As the definition writes it: `0.99`, `500`, `relative`.
+    #[prost(string, tag = "2")]
+    pub value: ::prost::alloc::string::String,
+}
+/// A batch the component hands the `pricing` instance a model id is routed
+/// to (W12.3), delivered to that instance alone and caught up by sequence.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PriceBatchRequest {
+    #[prost(string, tag = "1")]
+    pub batch_id: ::prost::alloc::string::String,
+    /// The routed instance, which alone hears it (matrix/directed.tsv).
+    #[prost(string, tag = "2")]
+    pub pricing_instance_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub model_id: ::prost::alloc::string::String,
+    #[prost(int32, tag = "4")]
+    pub model_version: i32,
+    #[prost(message, repeated, tag = "5")]
+    pub units: ::prost::alloc::vec::Vec<PricingUnit>,
+    /// When the component stops waiting for the answer.
+    #[prost(int64, tag = "6")]
+    pub deadline_ns: i64,
+    /// `sha256:` over the batch's inputs, naming it: a batch answered twice is
+    /// harmless.
+    #[prost(string, tag = "7")]
+    pub batch_hash: ::prost::alloc::string::String,
+    /// Its place in the instance's sequence, which ListPriceBatches reads
+    /// after.
+    #[prost(int64, tag = "8")]
+    pub sequence: i64,
+}
+/// One instrument to price under one scenario, with exactly the market
+/// objects its model declares (requirement 20).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PricingUnit {
+    #[prost(string, tag = "1")]
+    pub instrument_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub template_version: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub scenario_key: ::core::option::Option<ScenarioKey>,
+    #[prost(message, repeated, tag = "4")]
+    pub inputs: ::prost::alloc::vec::Vec<MarketObjectValue>,
+}
+/// A market object's value, by the lake's terms (Q6): observed, or a
+/// scenario's in its place.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MarketObjectValue {
+    /// The instrument it is about.
+    #[prost(string, tag = "1")]
+    pub subject_id: ::prost::alloc::string::String,
+    /// The lake's kind: `close`, `nav`, `mid`, `last`, or `outcome`.
+    #[prost(string, tag = "2")]
+    pub kind: ::prost::alloc::string::String,
+    /// A price, in the asset it is quoted in; for `outcome`, the settlement
+    /// value per contract.
+    #[prost(message, optional, tag = "3")]
+    pub value: ::core::option::Option<Money>,
+    /// The dataset it came from; empty for a scenario's value.
+    #[prost(string, tag = "4")]
+    pub dataset: ::prost::alloc::string::String,
+}
+/// A `pricing` plugin's answer to a batch (W12.3).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PriceBatchReply {
+    #[prost(string, tag = "1")]
+    pub batch_id: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "2")]
+    pub values: ::prost::alloc::vec::Vec<PricedUnit>,
+    /// Sensitivities its model declares: empty until v28 (the first
+    /// release, §3 rule 4), so a v26 plugin stays valid when they arrive.
+    #[prost(message, repeated, tag = "3")]
+    pub sensitivities: ::prost::alloc::vec::Vec<Sensitivity>,
+    /// Stamped by the sidecar: the answering instance.
+    #[prost(string, tag = "4")]
+    pub pricing_instance_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PricedUnit {
+    #[prost(string, tag = "1")]
+    pub instrument_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub scenario_key: ::core::option::Option<ScenarioKey>,
+    /// A value per unit, in the base currency the batch's inputs convert to.
+    #[prost(message, optional, tag = "3")]
+    pub value_per_unit: ::core::option::Option<Money>,
+}
+/// A sensitivity a model declares: carried empty in v26.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Sensitivity {
+    #[prost(string, tag = "1")]
+    pub instrument_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub scenario_key: ::core::option::Option<ScenarioKey>,
+    /// The sensitivity's name, as the model declares it.
+    #[prost(string, tag = "3")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "4")]
+    pub value: ::core::option::Option<::meridian_pb::v1::Decimal>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AnswerPriceBatchReply {
+    #[prost(string, tag = "1")]
+    pub batch_id: ::prost::alloc::string::String,
+}
+/// The batches waiting for the asking instance after a sequence (W12.3).
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ListPriceBatchesRequest {
+    #[prost(int64, tag = "1")]
+    pub after_sequence: i64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListPriceBatchesReply {
+    #[prost(message, repeated, tag = "1")]
+    pub batches: ::prost::alloc::vec::Vec<PriceBatchRequest>,
+    /// The sequence read to.
+    #[prost(int64, tag = "2")]
+    pub sequence: i64,
+}
+/// A job answered later has finished (W12.4), heard by the instance that ran
+/// it alone.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct JobFinishedEvent {
+    #[prost(string, tag = "1")]
+    pub job_id: ::prost::alloc::string::String,
+    /// The instance that ran it, which alone hears it (matrix/directed.tsv).
+    #[prost(string, tag = "2")]
+    pub client_instance_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub answer_hash: ::prost::alloc::string::String,
+    #[prost(int64, tag = "4")]
+    pub finished_at_ns: i64,
+    /// Its place in the instance's sequence, which ListFinishedJobs reads
+    /// after.
+    #[prost(int64, tag = "5")]
+    pub sequence: i64,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ListFinishedJobsRequest {
+    #[prost(int64, tag = "1")]
+    pub after_sequence: i64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListFinishedJobsReply {
+    #[prost(message, repeated, tag = "1")]
+    pub finished: ::prost::alloc::vec::Vec<JobFinishedEvent>,
+    #[prost(int64, tag = "2")]
+    pub sequence: i64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReadJobAnswerRequest {
+    #[prost(string, tag = "1")]
+    pub job_id: ::prost::alloc::string::String,
+}
+/// Which implementation answers a model id, deployment-wide (requirement
+/// 21), kept by the conductor; each change its own record.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ModelRouting {
+    #[prost(string, tag = "1")]
+    pub model_id: ::prost::alloc::string::String,
+    /// `built-in`, or a launched `pricing` instance declaring the model id.
+    #[prost(string, tag = "2")]
+    pub implementation: ::prost::alloc::string::String,
+    #[prost(int64, tag = "3")]
+    pub changed_at_ns: i64,
+    /// The person, as the record names them; empty for a model id never
+    /// routed, which reads `built-in`.
+    #[prost(string, tag = "4")]
+    pub changed_by: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub reason: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SetModelRoutingRequest {
+    #[prost(string, tag = "1")]
+    pub model_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub implementation: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub reason: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ListModelRoutingRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListModelRoutingReply {
+    #[prost(message, repeated, tag = "1")]
+    pub routes: ::prost::alloc::vec::Vec<ModelRouting>,
+    /// The table's version, which each answer's provenance names.
+    #[prost(int64, tag = "2")]
+    pub version: i64,
+}
+/// minimise ½ xᵀPx + qᵀx subject to Ax + s = b, s in K = K₁ × … × Kₘ, xᵢ
+/// integer for i in the integer set. Numbers only, no finance: the one
+/// message in the contract carrying floats, and never money (Q8).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StandardForm {
+    /// n, the number of variables.
+    #[prost(uint32, tag = "1")]
+    pub variables: u32,
+    /// P, upper-triangular, in compressed sparse columns; empty for a linear
+    /// problem.
+    #[prost(message, optional, tag = "2")]
+    pub p: ::core::option::Option<SparseMatrix>,
+    /// q, n values.
+    #[prost(double, repeated, tag = "3")]
+    pub q: ::prost::alloc::vec::Vec<f64>,
+    /// A, m × n, in compressed sparse columns.
+    #[prost(message, optional, tag = "4")]
+    pub a: ::core::option::Option<SparseMatrix>,
+    /// b, m values.
+    #[prost(double, repeated, tag = "5")]
+    pub b: ::prost::alloc::vec::Vec<f64>,
+    /// K's cones, in the order of A's rows.
+    #[prost(message, repeated, tag = "6")]
+    pub cones: ::prost::alloc::vec::Vec<Cone>,
+    /// The indices of the integer variables, from 0.
+    #[prost(uint32, repeated, tag = "7")]
+    pub integer_variables: ::prost::alloc::vec::Vec<u32>,
+}
+/// A sparse matrix in compressed sparse columns.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SparseMatrix {
+    #[prost(uint32, tag = "1")]
+    pub rows: u32,
+    #[prost(uint32, tag = "2")]
+    pub columns: u32,
+    /// columns + 1 offsets into row_indices and values.
+    #[prost(uint32, repeated, tag = "3")]
+    pub column_starts: ::prost::alloc::vec::Vec<u32>,
+    #[prost(uint32, repeated, tag = "4")]
+    pub row_indices: ::prost::alloc::vec::Vec<u32>,
+    #[prost(double, repeated, tag = "5")]
+    pub values: ::prost::alloc::vec::Vec<f64>,
+}
+/// One cone of K and its dimension.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct Cone {
+    #[prost(enumeration = "ConeKind", tag = "1")]
+    pub kind: i32,
+    #[prost(uint32, tag = "2")]
+    pub dimension: u32,
+}
+/// A solver's answer to a standard form, its certificate checked by a
+/// separate checker (requirement 36).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StandardFormAnswer {
+    #[prost(enumeration = "StandardFormStatus", tag = "1")]
+    pub status: i32,
+    /// The primal solution x, n values; the slack s, m values; the dual
+    /// solution y, m values.
+    #[prost(double, repeated, tag = "2")]
+    pub x: ::prost::alloc::vec::Vec<f64>,
+    #[prost(double, repeated, tag = "3")]
+    pub s: ::prost::alloc::vec::Vec<f64>,
+    #[prost(double, repeated, tag = "4")]
+    pub y: ::prost::alloc::vec::Vec<f64>,
+    /// The objective's value at x.
+    #[prost(double, tag = "5")]
+    pub objective: f64,
+    /// For an integer problem, the best bound found.
+    #[prost(double, tag = "6")]
+    pub best_bound: f64,
+}
+/// How a figure was computed (the first release's Q14, approved 2026-10-14
+/// as `exact` and `model`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ComputedAs {
+    /// Read as exact by a v26 reader; never sent by the component.
+    Unspecified = 0,
+    /// Exact decimal from quantities, quoted prices and FX.
+    Exact = 1,
+    /// A model's floating-point value, crossing at its definition's scale,
+    /// rounded half to even (Q8): from v28.
+    Model = 2,
+}
+impl ComputedAs {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "COMPUTED_AS_UNSPECIFIED",
+            Self::Exact => "COMPUTED_AS_EXACT",
+            Self::Model => "COMPUTED_AS_MODEL",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "COMPUTED_AS_UNSPECIFIED" => Some(Self::Unspecified),
+            "COMPUTED_AS_EXACT" => Some(Self::Exact),
+            "COMPUTED_AS_MODEL" => Some(Self::Model),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ScenarioKind {
+    /// Read as base.
+    Unspecified = 0,
+    /// The positions and market as they are.
+    Base = 1,
+    /// With the job's what-if trades added (W12.5).
+    WhatIf = 2,
+    /// One historical day's returns applied, for historical VaR and ES.
+    HistoricalDay = 3,
+    /// One member of an event group resolving YES (`resolution_payoff`).
+    Outcome = 4,
+    /// No named member resolving YES, for a group mutually exclusive and not
+    /// exhaustive (the options and event contracts spec's question 4).
+    NoneOfTheNamed = 5,
+}
+impl ScenarioKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "SCENARIO_KIND_UNSPECIFIED",
+            Self::Base => "SCENARIO_KIND_BASE",
+            Self::WhatIf => "SCENARIO_KIND_WHAT_IF",
+            Self::HistoricalDay => "SCENARIO_KIND_HISTORICAL_DAY",
+            Self::Outcome => "SCENARIO_KIND_OUTCOME",
+            Self::NoneOfTheNamed => "SCENARIO_KIND_NONE_OF_THE_NAMED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "SCENARIO_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "SCENARIO_KIND_BASE" => Some(Self::Base),
+            "SCENARIO_KIND_WHAT_IF" => Some(Self::WhatIf),
+            "SCENARIO_KIND_HISTORICAL_DAY" => Some(Self::HistoricalDay),
+            "SCENARIO_KIND_OUTCOME" => Some(Self::Outcome),
+            "SCENARIO_KIND_NONE_OF_THE_NAMED" => Some(Self::NoneOfTheNamed),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum NotEvaluatedReason {
+    Unspecified = 0,
+    /// No price of the kind the model declares at the as-of.
+    PriceMissing = 1,
+    /// A price older than the client's setting for its source allows.
+    PriceStale = 2,
+    /// A conversion leg to the base or reporting currency missing.
+    ConversionMissing = 3,
+    /// A dataset the client is not entitled to, named in detail (Q11).
+    NotEntitled = 4,
+    /// A local `LCL-` record: never priced.
+    LocalRecord = 5,
+    /// The routed implementation did not answer by the deadline, for a figure
+    /// a compliance rule reads (requirement 22).
+    ImplementationUnavailable = 6,
+    /// A breakdown whose scheme the deployment does not hold (requirement 17).
+    SchemeNotHeld = 7,
+    /// An implied distribution over a group not exhaustive in the version in
+    /// force (the first release's Q5): the raw prices and their sum still
+    /// answered.
+    GroupNotExhaustive = 8,
+    /// History too short or too sparse for the definition's window.
+    HistoryInsufficient = 9,
+}
+impl NotEvaluatedReason {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "NOT_EVALUATED_REASON_UNSPECIFIED",
+            Self::PriceMissing => "NOT_EVALUATED_REASON_PRICE_MISSING",
+            Self::PriceStale => "NOT_EVALUATED_REASON_PRICE_STALE",
+            Self::ConversionMissing => "NOT_EVALUATED_REASON_CONVERSION_MISSING",
+            Self::NotEntitled => "NOT_EVALUATED_REASON_NOT_ENTITLED",
+            Self::LocalRecord => "NOT_EVALUATED_REASON_LOCAL_RECORD",
+            Self::ImplementationUnavailable => {
+                "NOT_EVALUATED_REASON_IMPLEMENTATION_UNAVAILABLE"
+            }
+            Self::SchemeNotHeld => "NOT_EVALUATED_REASON_SCHEME_NOT_HELD",
+            Self::GroupNotExhaustive => "NOT_EVALUATED_REASON_GROUP_NOT_EXHAUSTIVE",
+            Self::HistoryInsufficient => "NOT_EVALUATED_REASON_HISTORY_INSUFFICIENT",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "NOT_EVALUATED_REASON_UNSPECIFIED" => Some(Self::Unspecified),
+            "NOT_EVALUATED_REASON_PRICE_MISSING" => Some(Self::PriceMissing),
+            "NOT_EVALUATED_REASON_PRICE_STALE" => Some(Self::PriceStale),
+            "NOT_EVALUATED_REASON_CONVERSION_MISSING" => Some(Self::ConversionMissing),
+            "NOT_EVALUATED_REASON_NOT_ENTITLED" => Some(Self::NotEntitled),
+            "NOT_EVALUATED_REASON_LOCAL_RECORD" => Some(Self::LocalRecord),
+            "NOT_EVALUATED_REASON_IMPLEMENTATION_UNAVAILABLE" => {
+                Some(Self::ImplementationUnavailable)
+            }
+            "NOT_EVALUATED_REASON_SCHEME_NOT_HELD" => Some(Self::SchemeNotHeld),
+            "NOT_EVALUATED_REASON_GROUP_NOT_EXHAUSTIVE" => Some(Self::GroupNotExhaustive),
+            "NOT_EVALUATED_REASON_HISTORY_INSUFFICIENT" => {
+                Some(Self::HistoryInsufficient)
+            }
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ConeKind {
+    Unspecified = 0,
+    /// s = 0: equalities.
+    Zero = 1,
+    /// s ≥ 0: inequalities.
+    Nonnegative = 2,
+    /// ‖s₂…ₖ‖ ≤ s₁.
+    SecondOrder = 3,
+}
+impl ConeKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "CONE_KIND_UNSPECIFIED",
+            Self::Zero => "CONE_KIND_ZERO",
+            Self::Nonnegative => "CONE_KIND_NONNEGATIVE",
+            Self::SecondOrder => "CONE_KIND_SECOND_ORDER",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "CONE_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "CONE_KIND_ZERO" => Some(Self::Zero),
+            "CONE_KIND_NONNEGATIVE" => Some(Self::Nonnegative),
+            "CONE_KIND_SECOND_ORDER" => Some(Self::SecondOrder),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum StandardFormStatus {
+    Unspecified = 0,
+    Solved = 1,
+    /// Infeasible, y the certificate.
+    Infeasible = 2,
+    /// Unbounded, x the certificate.
+    Unbounded = 3,
+    /// Stopped at an iteration or time limit, x the best found.
+    Stopped = 4,
+}
+impl StandardFormStatus {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "STANDARD_FORM_STATUS_UNSPECIFIED",
+            Self::Solved => "STANDARD_FORM_STATUS_SOLVED",
+            Self::Infeasible => "STANDARD_FORM_STATUS_INFEASIBLE",
+            Self::Unbounded => "STANDARD_FORM_STATUS_UNBOUNDED",
+            Self::Stopped => "STANDARD_FORM_STATUS_STOPPED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "STANDARD_FORM_STATUS_UNSPECIFIED" => Some(Self::Unspecified),
+            "STANDARD_FORM_STATUS_SOLVED" => Some(Self::Solved),
+            "STANDARD_FORM_STATUS_INFEASIBLE" => Some(Self::Infeasible),
+            "STANDARD_FORM_STATUS_UNBOUNDED" => Some(Self::Unbounded),
+            "STANDARD_FORM_STATUS_STOPPED" => Some(Self::Stopped),
+            _ => None,
+        }
+    }
+}
+/// Envelope wraps one payload.
+///
+/// The payload is opaque bytes rather than a oneof over every message type. A
+/// oneof would make the envelope a compile-time dependency of every message in
+/// the system, so adding any message would rebuild everything and the bus could
+/// not carry a payload it had not been compiled against.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Envelope {
+    #[prost(message, optional, tag = "1")]
+    pub meta: ::core::option::Option<::meridian_pb::v1::MessageMeta>,
+    /// Fully-qualified name of the payload message, e.g. "meridian.v1.Position".
+    /// A subscriber checks this before decoding rather than guessing from topic.
+    #[prost(string, tag = "2")]
+    pub payload_type: ::prost::alloc::string::String,
+    /// The serialized payload.
+    #[prost(bytes = "vec", tag = "3")]
+    pub payload: ::prost::alloc::vec::Vec<u8>,
+}
+/// What a plugin says about itself, from `\[tool.meridian\]` in its
+/// pyproject.toml. Declarations for an administrator to approve, not grants.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PluginMetadata {
+    /// Lowercase letters, digits and single hyphens, starting with a letter:
+    /// the name `meridian plugin new` gave it, and its repository in the
+    /// deployment's registry, plugins/<name>.
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// As its pyproject.toml has it. An uploaded version is never replaced.
+    #[prost(string, tag = "2")]
+    pub version: ::prost::alloc::string::String,
+    /// A set, from matrix/roles.tsv, and never a component's name -- the
+    /// dashboard's among them (decisions/020). Empty is a plugin admitted with
+    /// no topics, as the reference plugin is.
+    #[prost(string, repeated, tag = "3")]
+    pub roles: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Whether it serves a page through its sidecar (decisions/014).
+    #[prost(bool, tag = "5")]
+    pub interface: bool,
+    /// The open-meridian version its base image carries, so an administrator
+    /// can see which plugins stand on a base that needs a fix.
+    #[prost(string, tag = "6")]
+    pub sdk_version: ::prost::alloc::string::String,
+    /// What the version declares beside its roles (W8.1, contract v11): its
+    /// secret settings' names, what it does not carry, and the storage it asks
+    /// for. Read by the CLI from the built image, as the SDK builds it from the
+    /// plugin's code; shown in the catalogue and approved at launch. Unset for
+    /// a version built before v11. A declaration asking for storage on a
+    /// version holding no edge role is refused.
+    #[prost(message, optional, tag = "7")]
+    pub declaration: ::core::option::Option<::meridian_pb::v1::PluginDeclaration>,
+}
+/// The dashboard records a version once its image is in the registry.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RecordPluginUploadRequest {
+    #[prost(message, optional, tag = "1")]
+    pub metadata: ::core::option::Option<PluginMetadata>,
+    /// The image manifest's digest, `sha256:<hex>`, in plugins/<name>. A launch
+    /// runs exactly this, never a tag that could move.
+    #[prost(string, tag = "2")]
+    pub image_digest: ::prost::alloc::string::String,
+    /// The vendor's documentation as uploaded (W8.1, contract v25), one text
+    /// per section the declaration names. The conductor refuses an upload
+    /// whose texts do not match the declaration's digests and sizes, a section
+    /// outside the fixed set, a section past 64 KiB or a bundle past 256 KiB,
+    /// naming it, and keeps the texts with the version, never replaced.
+    #[prost(message, repeated, tag = "3")]
+    pub documentation: ::prost::alloc::vec::Vec<DocumentationText>,
+    /// A plugin bundle carried in (W8.14, contract v25; the spec's requirement
+    /// 45): `meridian plugin upload --bundle` pushes the image and its
+    /// referrers into plugins/{organisation}/{plugin} and names here the
+    /// listing, `organisation/plugin`, and the registry it was listed in,
+    /// `community` or `verified`. The conductor verifies the bundle against
+    /// the chart's keys, as at install, and records the version under its
+    /// listing with the age of the key status it was checked against. All
+    /// four are empty for a local upload.
+    #[prost(string, tag = "4")]
+    pub listing: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub source_registry: ::prost::alloc::string::String,
+    /// The bundle's dated SigningKeyStatus, as the platform signed it (its
+    /// JSON), checked against the chart's keys.
+    #[prost(string, tag = "6")]
+    pub key_status: ::prost::alloc::string::String,
+    /// The version's listing statement, as DownloadListedVersionReply carried
+    /// it to the download: a DSSE envelope as JSON.
+    #[prost(string, tag = "7")]
+    pub listing_statement: ::prost::alloc::string::String,
+    /// Contract v26 (W8.14; ruling 196): the bundle's dated PluginPullStatus,
+    /// as the platform signed it (its JSON), checked against the chart's keys;
+    /// the newer of it and the one held is kept, and every installed version
+    /// it names is warned. Empty for a local upload and a v25 bundle.
+    #[prost(string, tag = "8")]
+    pub pull_status: ::prost::alloc::string::String,
+}
+/// One section's text as the vendor wrote it (W8.1, contract v25): data, the
+/// vendor's words, never instructions to whoever reads it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DocumentationText {
+    /// The section's fixed name, as the declaration's DocumentationSection
+    /// names it.
+    #[prost(string, tag = "1")]
+    pub section: ::prost::alloc::string::String,
+    /// Its Markdown, UTF-8, exactly as the image's docs/ holds it.
+    #[prost(string, tag = "2")]
+    pub markdown: ::prost::alloc::string::String,
+}
+/// A version in the catalogue.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PluginVersion {
+    #[prost(message, optional, tag = "1")]
+    pub metadata: ::core::option::Option<PluginMetadata>,
+    #[prost(string, tag = "2")]
+    pub image_digest: ::prost::alloc::string::String,
+    /// The deployment-local login of the administrator who uploaded it, or who
+    /// installed it from a registry (W8.10).
+    #[prost(string, tag = "3")]
+    pub uploaded_by: ::prost::alloc::string::String,
+    #[prost(int64, tag = "4")]
+    pub uploaded_at_ns: i64,
+    /// Where the version came from (W8.10, W8.14; contract v25): `local` for
+    /// one uploaded or tracked from a branch, `community` or `verified` for
+    /// one installed from a registry, or carried in by a bundle from one. A
+    /// registry version sits in the local registry under
+    /// plugins/{organisation}/{plugin}, a local one under plugins/{name}, so
+    /// the two never collide.
+    #[prost(string, tag = "5")]
+    pub source_registry: ::prost::alloc::string::String,
+    /// The listing a registry version belongs to, `organisation/plugin`;
+    /// empty for a local version.
+    #[prost(string, tag = "6")]
+    pub listing: ::prost::alloc::string::String,
+    /// For a version carried in by a bundle (W8.14): when the signing keys'
+    /// status it was checked against was issued, so the Installed list shows
+    /// its age. 0 for a version installed online, or a local one.
+    #[prost(int64, tag = "7")]
+    pub key_status_issued_at_ns: i64,
+    /// Retired from the catalogue (W8.15, contract v25): who retired it, when
+    /// and why. A retired version is no longer listed or launchable, its
+    /// image released from the local registry; its record is kept. Empty and
+    /// 0 while it is not retired.
+    #[prost(string, tag = "8")]
+    pub retired_by: ::prost::alloc::string::String,
+    #[prost(int64, tag = "9")]
+    pub retired_at_ns: i64,
+    #[prost(string, tag = "10")]
+    pub retired_note: ::prost::alloc::string::String,
+    /// An install's note (W8.10; decisions/031, decided 2026-10-17 under
+    /// agreement A): why a deployment admin installed it from a registry, kept
+    /// with the install's record beside uploaded_by and shown with it. Empty
+    /// for a local upload and a bundle's, which carry none.
+    #[prost(string, tag = "11")]
+    pub uploaded_note: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct PluginCatalogueRequest {}
+/// Every version uploaded and every launch, live or stopped.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PluginCatalogue {
+    #[prost(message, repeated, tag = "1")]
+    pub versions: ::prost::alloc::vec::Vec<PluginVersion>,
+    #[prost(message, repeated, tag = "2")]
+    pub launches: ::prost::alloc::vec::Vec<PluginLaunch>,
+}
+/// A deployment admin launches a version. The roles are the ones they were
+/// shown and approved, and the launch is refused unless they are exactly the
+/// version's metadata: an approval of something other than what runs is no
+/// approval.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LaunchPluginRequest {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub version: ::prost::alloc::string::String,
+    /// What it runs as, and what its sidecar's credential and grants are for.
+    /// Unique among the deployment's live plugins.
+    #[prost(string, tag = "3")]
+    pub instance_id: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "4")]
+    pub approved_roles: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// In the live shape, on a development deployment alone: the plugin runs
+    /// the files sent to it since, and the launcher refuses this anywhere else
+    /// (W8.3, spec/live-plugin-development).
+    #[prost(bool, tag = "6")]
+    pub live: bool,
+    /// Why, kept with the launch's record (decisions/031; contract v17).
+    /// Through /mcp every launch carries one (W6.20).
+    #[prost(string, tag = "7")]
+    pub note: ::prost::alloc::string::String,
+}
+/// A launch, as the conductor records it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PluginLaunch {
+    #[prost(string, tag = "1")]
+    pub instance_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub version: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub image_digest: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "5")]
+    pub roles: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, tag = "7")]
+    pub launched_by: ::prost::alloc::string::String,
+    #[prost(int64, tag = "8")]
+    pub launched_at_ns: i64,
+    #[prost(enumeration = "PluginLaunchState", tag = "9")]
+    pub state: i32,
+    #[prost(string, tag = "10")]
+    pub stopped_by: ::prost::alloc::string::String,
+    #[prost(int64, tag = "11")]
+    pub stopped_at_ns: i64,
+    #[prost(string, tag = "12")]
+    pub failure: ::prost::alloc::string::String,
+    /// Launched in the live shape (W8.3).
+    #[prost(bool, tag = "13")]
+    pub live: bool,
+    /// The delegation the person who launched it acted through and its
+    /// client's name, and the same for the stop, as the dashboard stamped them
+    /// (contract v17). A launch or stop before v17 was made through the
+    /// terminal on a delegation that was not recorded: these are empty, and
+    /// the store keeps a gap record saying so (decisions/031).
+    #[prost(string, tag = "14")]
+    pub acting_through_delegation: ::prost::alloc::string::String,
+    #[prost(string, tag = "15")]
+    pub client_name: ::prost::alloc::string::String,
+    #[prost(string, tag = "16")]
+    pub stopped_through_delegation: ::prost::alloc::string::String,
+    #[prost(string, tag = "17")]
+    pub stopped_client_name: ::prost::alloc::string::String,
+    /// Why it was launched, as kept with the launch (contract v17): required
+    /// through /mcp; empty where none was given, and on every launch before
+    /// v17.
+    #[prost(string, tag = "18")]
+    pub note: ::prost::alloc::string::String,
+    /// Why it was stopped, as kept with the stop (contract v17): required
+    /// through /mcp; empty while not stopped, where none was given, and on
+    /// every stop before v17.
+    #[prost(string, tag = "19")]
+    pub stopped_note: ::prost::alloc::string::String,
+    /// The prepared change it was made from, where a person made it from one
+    /// (W6.27, W4.9; contract v20): empty otherwise, and before v20.
+    #[prost(string, tag = "20")]
+    pub prepared_call_id: ::prost::alloc::string::String,
+    /// The same for the stop.
+    #[prost(string, tag = "21")]
+    pub stopped_prepared_call_id: ::prost::alloc::string::String,
+    /// A deployment admin's keeping of the instance after its version was
+    /// pulled (W8.12, contract v25): unset while its version is not pulled,
+    /// or the pull is not yet acknowledged. The Summary's and the Installed
+    /// list's warning stands until the instance is stopped or this is set.
+    #[prost(message, optional, tag = "22")]
+    pub pull_acknowledgement: ::core::option::Option<PullAcknowledgement>,
+}
+/// The conductor to the launcher: create this plugin, in the chart's plugin
+/// shape and no other.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CreatePluginRequest {
+    #[prost(string, tag = "1")]
+    pub instance_id: ::prost::alloc::string::String,
+    /// Always the deployment's own registry, by digest:
+    /// `localhost:<port>/plugins/<name>@sha256:<hex>`.
+    #[prost(string, tag = "2")]
+    pub image: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "3")]
+    pub roles: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(bool, tag = "5")]
+    pub interface: bool,
+    /// The chart's live shape rather than its plugin shape; refused by a
+    /// launcher on a deployment not installed for development.
+    #[prost(bool, tag = "6")]
+    pub live: bool,
+    /// The version's declaration, as approved at launch (W8.3, contract v11):
+    /// the launcher gives the instance storage of its own where it asks for
+    /// it. Unset for a version uploaded with none, which gets storage by
+    /// holding an edge role, as before v11.
+    #[prost(message, optional, tag = "7")]
+    pub declaration: ::core::option::Option<::meridian_pb::v1::PluginDeclaration>,
+    /// The archive a deployment admin allowed the instance (W8.3, W8.7,
+    /// contract v16): the launcher gives it beside its storage, mounted at
+    /// MERIDIAN_ARCHIVE_DIR or, in a cloud, a bucket named in
+    /// MERIDIAN_ARCHIVE_BUCKET with a credential scoped to it. Unset or not
+    /// allowed, none.
+    #[prost(message, optional, tag = "8")]
+    pub archive: ::core::option::Option<PluginArchive>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CreatePluginReply {
+    /// The workload the launcher made, which it alone may later remove.
+    #[prost(string, tag = "1")]
+    pub workload: ::prost::alloc::string::String,
+}
+/// A deployment admin allows an edge instance an archive, or changes its
+/// bound, from its Manage page; the conductor records it and restarts the
+/// instance through CreatePlugin carrying it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AllowArchiveRequest {
+    #[prost(string, tag = "1")]
+    pub instance_id: ::prost::alloc::string::String,
+    /// The most bytes it may hold; 0 for no bound.
+    #[prost(uint64, tag = "2")]
+    pub most_bytes: u64,
+    /// Why, kept with the change's record (decisions/031; contract v17).
+    /// Through /mcp every change carries one (W6.20).
+    #[prost(string, tag = "3")]
+    pub note: ::prost::alloc::string::String,
+}
+/// A deployment admin withdraws it: the instance is restarted without it,
+/// and what it holds is kept until an admin removes it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WithdrawArchiveRequest {
+    #[prost(string, tag = "1")]
+    pub instance_id: ::prost::alloc::string::String,
+    /// Why, kept with the change's record (decisions/031; contract v17).
+    /// Through /mcp every change carries one (W6.20).
+    #[prost(string, tag = "2")]
+    pub note: ::prost::alloc::string::String,
+}
+/// An instance's archive, as the conductor records it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PluginArchive {
+    #[prost(string, tag = "1")]
+    pub instance_id: ::prost::alloc::string::String,
+    /// Allowed now; false once withdrawn.
+    #[prost(bool, tag = "2")]
+    pub allowed: bool,
+    /// The most bytes it may hold; 0 for no bound.
+    #[prost(uint64, tag = "3")]
+    pub most_bytes: u64,
+    /// Who last allowed, changed or withdrew it, the deployment-local subject
+    /// the dashboard stamped, and when. Each is its own record (decisions/031).
+    #[prost(string, tag = "4")]
+    pub updated_by: ::prost::alloc::string::String,
+    #[prost(int64, tag = "5")]
+    pub updated_at_ns: i64,
+    /// The delegation the person acted through and its client's name, as the
+    /// dashboard stamped them (contract v17): empty for a change made in a
+    /// browser, and on every change before v17, each of which was.
+    #[prost(string, tag = "6")]
+    pub acting_through_delegation: ::prost::alloc::string::String,
+    #[prost(string, tag = "7")]
+    pub client_name: ::prost::alloc::string::String,
+    /// Why, as kept with its latest change (contract v17): required through
+    /// /mcp, optional at the page; empty where none was given, and on every
+    /// change before v17.
+    #[prost(string, tag = "8")]
+    pub note: ::prost::alloc::string::String,
+    /// The prepared change it was made from, where a person made it from one
+    /// (W6.27, W4.9; contract v20): empty otherwise, and before v20.
+    #[prost(string, tag = "9")]
+    pub prepared_call_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StopPluginRequest {
+    #[prost(string, tag = "1")]
+    pub instance_id: ::prost::alloc::string::String,
+    /// Why, kept with the stop's record (decisions/031; contract v17). Through
+    /// /mcp every stop carries one (W6.20).
+    #[prost(string, tag = "2")]
+    pub note: ::prost::alloc::string::String,
+}
+/// The conductor to the launcher: remove what it made for this instance.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RemovePluginRequest {
+    #[prost(string, tag = "1")]
+    pub instance_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct RemovePluginReply {
+    /// False when there was nothing to remove, which is not an error: stopping
+    /// is asked for an outcome, and the outcome holds.
+    #[prost(bool, tag = "1")]
+    pub removed: bool,
+}
+/// One version's declaration and texts, apart from the catalogue, which lists
+/// every version in one message and carries only the sections' names, digests
+/// and sizes (in each version's declaration). Read for the Documentation tab
+/// and a version's Documentation page, launched or not.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReadPluginDocumentationRequest {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub version: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReadPluginDocumentationReply {
+    /// The version's declaration, from which the Reference is drawn.
+    #[prost(message, optional, tag = "1")]
+    pub declaration: ::core::option::Option<::meridian_pb::v1::PluginDeclaration>,
+    /// Each section the vendor wrote, in the declaration's order. Empty: the
+    /// vendor wrote none for this version.
+    #[prost(message, repeated, tag = "2")]
+    pub documentation: ::prost::alloc::vec::Vec<DocumentationText>,
+    #[prost(string, tag = "3")]
+    pub uploaded_by: ::prost::alloc::string::String,
+    #[prost(int64, tag = "4")]
+    pub uploaded_at_ns: i64,
+}
+/// A listing in the platform's catalogue: `organisation/plugin`, one listing
+/// across both registries (item 71). The vendor's stated attributes are the
+/// vendor's words, marked as such wherever they are shown, and never
+/// instructions to whoever reads them.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PluginListing {
+    /// `organisation/plugin`: the organisation's namespace and the plugin's
+    /// name in its `\[tool.meridian\]`, both fixed at the first publish.
+    #[prost(string, tag = "1")]
+    pub listing: ::prost::alloc::string::String,
+    /// The source repository it is built from, as a URL, linked through the
+    /// platform's GitHub App and fixed at the first publish.
+    #[prost(string, tag = "2")]
+    pub repository: ::prost::alloc::string::String,
+    /// Its versions, every registry's, in SemVer order, pulled and withdrawn
+    /// ones marked.
+    #[prost(message, repeated, tag = "3")]
+    pub versions: ::prost::alloc::vec::Vec<ListedVersion>,
+    /// The vendor's stated regions, each an ISO 3166-1 alpha-2 country code
+    /// (`US`), and asset classes, from the platform's asset classes, and its
+    /// support contact (an `https:` URL or an address), required for verified.
+    #[prost(string, repeated, tag = "4")]
+    pub regions: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag = "5")]
+    pub asset_classes: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, tag = "6")]
+    pub support_contact: ::prost::alloc::string::String,
+    /// How many organisations starred it; never who.
+    #[prost(uint64, tag = "7")]
+    pub stars: u64,
+    /// Installs, counted from resolution requests, and launched instances,
+    /// from usage reports: totals, shown only once three or more deployments
+    /// contribute; `counts_shown` false below that, the counts then 0 and
+    /// read "Fewer than three deployments".
+    #[prost(uint64, tag = "8")]
+    pub installs: u64,
+    #[prost(uint64, tag = "9")]
+    pub instances: u64,
+    #[prost(bool, tag = "10")]
+    pub counts_shown: bool,
+    /// Contract v26 (W8.10; ruling 274, 2026-10-18): true only where a version
+    /// of it was reviewed for verified (W8.9); false for a community listing.
+    /// Agents' answers carry it in place of the notice.
+    #[prost(bool, tag = "12")]
+    pub reviewed: bool,
+    /// The platform Terms' address, whose §9 "Plugins and registries" is the
+    /// registries' notice (ruling 278).
+    #[prost(string, tag = "13")]
+    pub terms_url: ::prost::alloc::string::String,
+}
+/// One version of a listing, in one registry.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListedVersion {
+    #[prost(string, tag = "1")]
+    pub listing: ::prost::alloc::string::String,
+    /// SemVer 2.0, its release tag `v` and the version.
+    #[prost(string, tag = "2")]
+    pub version: ::prost::alloc::string::String,
+    /// `community` or `verified`.
+    #[prost(string, tag = "3")]
+    pub registry: ::prost::alloc::string::String,
+    /// What the builder built, by digest; the conductor installs this and
+    /// nothing else.
+    #[prost(string, tag = "4")]
+    pub image_digest: ::prost::alloc::string::String,
+    /// The built image's metadata: roles, interface, SDK and declaration, its
+    /// documentation named by digest.
+    #[prost(message, optional, tag = "5")]
+    pub metadata: ::core::option::Option<PluginMetadata>,
+    /// For verified, the roles the platform's review approved, from its
+    /// listing statement; a launch may approve no role beyond them. Empty for
+    /// community, whose roles are the declaration's, for the admin to approve.
+    #[prost(string, repeated, tag = "6")]
+    pub approved_roles: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// The version's floor: the contract version it declares, `v<N>`, which a
+    /// deployment's sidecar must serve.
+    #[prost(string, tag = "7")]
+    pub schema_version: ::prost::alloc::string::String,
+    /// How it was built.
+    #[prost(message, optional, tag = "8")]
+    pub build: ::core::option::Option<PluginBuild>,
+    #[prost(int64, tag = "9")]
+    pub listed_at_ns: i64,
+    /// Withdrawn by its vendor (W8.16): not offered for install or update,
+    /// still pullable by digest, with no warning to deployments running it.
+    #[prost(int64, tag = "10")]
+    pub withdrawn_at_ns: i64,
+    /// Its pull, unset while it is not pulled.
+    #[prost(message, optional, tag = "11")]
+    pub pull: ::core::option::Option<PluginPull>,
+    /// Its place in the catalogue's sequence, which a pull after a sequence
+    /// reads from.
+    #[prost(uint64, tag = "12")]
+    pub sequence: u64,
+    /// The platform's signed listing statement (requirement 21), the same
+    /// document the image carries as an OCI referrer: a DSSE envelope as JSON
+    /// -- payloadType `application/vnd.in-toto+json`, payload the base64 of
+    /// an in-toto statement whose subject is image_digest and whose predicate
+    /// type is `<https://open-meridian.dev/attestation/plugin-listing/v1`>
+    /// (the registry, the time, and for verified the review and its approved
+    /// roles), and its signatures -- which the conductor verifies at download
+    /// and again at launch against the platform's keys the chart carries.
+    /// Empty only before the version is listed.
+    #[prost(string, tag = "13")]
+    pub listing_statement: ::prost::alloc::string::String,
+    /// Contract v26 (W8.10; ruling 274): true for a verified version a person
+    /// reviewed (W8.9); false for community.
+    #[prost(bool, tag = "14")]
+    pub reviewed: bool,
+    /// Contract v26 (W8.10; the v25 task's follow-ups): the vendor's texts,
+    /// one per section its declaration names by digest, so a listing's
+    /// Documentation tab before install draws them; checked against the
+    /// digests, never replaced.
+    #[prost(message, repeated, tag = "15")]
+    pub documentation: ::prost::alloc::vec::Vec<DocumentationText>,
+}
+/// A build of a signed release tag by the platform's builder (W8.8; items 102,
+/// 103), followed by the CLI until the version is listed, queued for review
+/// or refused. A refused build carries no text of its own: why is the
+/// details of its findings at BUILD_FINDING_SEVERITY_BLOCKED. The repository
+/// and the builder are URLs.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PluginBuild {
+    #[prost(string, tag = "1")]
+    pub build_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub listing: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub version: ::prost::alloc::string::String,
+    /// `community` or `verified`, as the publish asked.
+    #[prost(string, tag = "4")]
+    pub registry: ::prost::alloc::string::String,
+    #[prost(enumeration = "PluginBuildState", tag = "5")]
+    pub state: i32,
+    /// What it was built from: the repository, the commit the tag pins, the
+    /// tag, and the fingerprint of the key that signed it.
+    #[prost(string, tag = "6")]
+    pub repository: ::prost::alloc::string::String,
+    #[prost(string, tag = "7")]
+    pub commit: ::prost::alloc::string::String,
+    #[prost(string, tag = "8")]
+    pub tag: ::prost::alloc::string::String,
+    #[prost(string, tag = "9")]
+    pub signer_fingerprint: ::prost::alloc::string::String,
+    /// The builder's identity, as its provenance names it.
+    #[prost(string, tag = "10")]
+    pub builder: ::prost::alloc::string::String,
+    /// The image's digest once built; empty before.
+    #[prost(string, tag = "11")]
+    pub image_digest: ::prost::alloc::string::String,
+    /// Each check's finding, in order: a refusal names the check that failed,
+    /// a warning is shown with the version.
+    #[prost(message, repeated, tag = "12")]
+    pub findings: ::prost::alloc::vec::Vec<BuildFinding>,
+    /// For community, the build's public log; empty for verified.
+    #[prost(string, tag = "13")]
+    pub log_url: ::prost::alloc::string::String,
+    #[prost(int64, tag = "14")]
+    pub requested_at_ns: i64,
+    #[prost(int64, tag = "15")]
+    pub finished_at_ns: i64,
+    /// Contract v26 (W8.8; ruling 275): the platform's page for the build,
+    /// which `meridian plugin publish` prints; no client builds the address.
+    #[prost(string, tag = "16")]
+    pub page_url: ::prost::alloc::string::String,
+}
+/// One automatic check's finding on a build (requirement 14).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BuildFinding {
+    /// The check: the tag's signature, the repository and licence, the base
+    /// image, the dependency screen, a scan, the conformance suite, a cap, or
+    /// the declaration's and documentation's checks.
+    #[prost(string, tag = "1")]
+    pub check: ::prost::alloc::string::String,
+    #[prost(enumeration = "BuildFindingSeverity", tag = "2")]
+    pub severity: i32,
+    /// What it found, in words.
+    #[prost(string, tag = "3")]
+    pub detail: ::prost::alloc::string::String,
+}
+/// A person's review of a verified version (W8.9), its decision its own
+/// record (decisions/031).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PluginReview {
+    #[prost(string, tag = "1")]
+    pub review_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub listing: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub version: ::prost::alloc::string::String,
+    /// Short when its roles and floor match the last approved version's,
+    /// full otherwise; never none.
+    #[prost(bool, tag = "4")]
+    pub full: bool,
+    #[prost(enumeration = "PluginReviewDecision", tag = "5")]
+    pub decision: i32,
+    /// The reviewer, a staff member holding REVIEW_PLUGINS, and when.
+    #[prost(string, tag = "6")]
+    pub reviewer_person_id: ::prost::alloc::string::String,
+    #[prost(int64, tag = "7")]
+    pub decided_at_ns: i64,
+    /// What an approval approves: the roles and the floor.
+    #[prost(string, repeated, tag = "8")]
+    pub approved_roles: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, tag = "9")]
+    pub schema_version: ::prost::alloc::string::String,
+    /// The reason sent to the vendor.
+    #[prost(string, tag = "10")]
+    pub reason: ::prost::alloc::string::String,
+}
+/// An organisation's tag-signing key (W5.30): its public half only.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SigningKeyRecord {
+    #[prost(string, tag = "1")]
+    pub key_id: ::prost::alloc::string::String,
+    /// The organisation's namespace.
+    #[prost(string, tag = "2")]
+    pub organisation: ::prost::alloc::string::String,
+    /// The organisation's name for the key.
+    #[prost(string, tag = "3")]
+    pub name: ::prost::alloc::string::String,
+    /// The SSH public key, as `ssh-ed25519 AAAA...`, and its SHA-256
+    /// fingerprint as git and GitHub show it.
+    #[prost(string, tag = "4")]
+    pub public_key: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub fingerprint: ::prost::alloc::string::String,
+    #[prost(int64, tag = "6")]
+    pub registered_at_ns: i64,
+    #[prost(string, tag = "7")]
+    pub registered_by_person_id: ::prost::alloc::string::String,
+    /// A revocation: when, by whom, why, and the time after which nothing
+    /// built is trusted (item 74). 0 while it is active.
+    #[prost(int64, tag = "8")]
+    pub revoked_at_ns: i64,
+    #[prost(string, tag = "9")]
+    pub revoked_by_person_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "10")]
+    pub revoke_reason: ::prost::alloc::string::String,
+    #[prost(int64, tag = "11")]
+    pub not_trusted_after_ns: i64,
+}
+/// Every organisation's tag-signing keys, active and revoked, as a document
+/// the platform signs (requirement 26): the conductor pulls it with the
+/// catalogue and checks a version's signer against the latest it holds, and
+/// a bundle carries a dated copy.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SigningKeyStatus {
+    #[prost(int64, tag = "1")]
+    pub issued_at_ns: i64,
+    #[prost(message, repeated, tag = "2")]
+    pub keys: ::prost::alloc::vec::Vec<SigningKeyRecord>,
+    /// The platform's signature over the document, checked against the
+    /// platform's public keys each chart release carries: base64 of an ECDSA
+    /// P-256 signature over DSSE's pre-authentication encoding (PAE) of the
+    /// payload type `application/vnd.open-meridian.signing-key-status+json`
+    /// and the body, this record's canonical JSON without `signature` -- the
+    /// DSSE convention in-toto and Sigstore use.
+    #[prost(string, tag = "3")]
+    pub signature: ::prost::alloc::string::String,
+}
+/// A pull of a listing or a version from the catalogue (W8.12), staff's act,
+/// its own record. A pull stops new installs and updates and warns installed
+/// copies; it never removes one.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PluginPull {
+    #[prost(string, tag = "1")]
+    pub listing: ::prost::alloc::string::String,
+    /// The one version pulled; never empty (W8.12).
+    #[prost(string, tag = "2")]
+    pub version: ::prost::alloc::string::String,
+    #[prost(enumeration = "PullReasonKind", tag = "3")]
+    pub kind: i32,
+    /// The reason, in words, as deployments and organisations are told it.
+    #[prost(string, tag = "4")]
+    pub reason: ::prost::alloc::string::String,
+    #[prost(int64, tag = "5")]
+    pub pulled_at_ns: i64,
+    /// For a copyright notice's pull, the notice (W8.13).
+    #[prost(string, tag = "6")]
+    pub notice_id: ::prost::alloc::string::String,
+    /// A restoration after a counter-notice (W8.13): when; 0 while it stands.
+    #[prost(int64, tag = "7")]
+    pub restored_at_ns: i64,
+}
+/// A copyright notice under 17 U.S.C. §512, recorded by staff against a
+/// listing's versions (W8.13), with its counter-notice and what became of it.
+/// The sender's contact details are kept for staff and the publishing
+/// organisation alone.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CopyrightNotice {
+    #[prost(string, tag = "1")]
+    pub notice_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub listing: ::prost::alloc::string::String,
+    /// The versions, or digests, it names.
+    #[prost(string, repeated, tag = "3")]
+    pub versions: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag = "4")]
+    pub image_digests: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// The date received, ISO 8601.
+    #[prost(string, tag = "5")]
+    pub received_on: ::prost::alloc::string::String,
+    /// Each §512(c)(3) element present, by its paragraph, `i` to `vi`; a
+    /// notice missing one is incomplete and its sender told what is missing.
+    #[prost(string, repeated, tag = "6")]
+    pub elements_present: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(bool, tag = "7")]
+    pub complete: bool,
+    #[prost(string, tag = "8")]
+    pub sender_name: ::prost::alloc::string::String,
+    #[prost(string, tag = "9")]
+    pub sender_contact: ::prost::alloc::string::String,
+    #[prost(enumeration = "CopyrightNoticeState", tag = "10")]
+    pub state: i32,
+    /// The counter-notice: the date received and each §512(g)(3) element
+    /// present, by its paragraph, `A` to `D`.
+    #[prost(string, tag = "11")]
+    pub counter_received_on: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "12")]
+    pub counter_elements_present: ::prost::alloc::vec::Vec<
+        ::prost::alloc::string::String,
+    >,
+    /// The restoration window, no sooner than 10 and no later than 14 business
+    /// days after the counter-notice, ISO 8601 dates.
+    #[prost(string, tag = "13")]
+    pub restore_from: ::prost::alloc::string::String,
+    #[prost(string, tag = "14")]
+    pub restore_until: ::prost::alloc::string::String,
+    /// A court action the sender filed, recorded by staff: the date, which
+    /// keeps the versions pulled.
+    #[prost(string, tag = "15")]
+    pub court_action_on: ::prost::alloc::string::String,
+}
+/// The plugin usage report (W5.19's carve-out; requirement 47): counts about
+/// each installed community or verified version, weekly. It names no person,
+/// account, instrument or local plugin.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PluginUsageReport {
+    /// The week it covers, ISO 8601 dates, inclusive.
+    #[prost(string, tag = "1")]
+    pub period_start: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub period_end: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "3")]
+    pub counts: ::prost::alloc::vec::Vec<PluginUsageCount>,
+}
+/// One installed registry version's counts over the week.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PluginUsageCount {
+    #[prost(string, tag = "1")]
+    pub listing: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub version: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub registry: ::prost::alloc::string::String,
+    /// Instances launched at the period's end.
+    #[prost(uint32, tag = "4")]
+    pub instances: u32,
+    /// People holding each level on any of its roles, at the period's end.
+    #[prost(uint32, tag = "5")]
+    pub people_read: u32,
+    #[prost(uint32, tag = "6")]
+    pub people_write: u32,
+    #[prost(uint32, tag = "7")]
+    pub people_admin: u32,
+    /// Seven daily counts, the period's first day first: operations its
+    /// sidecars carried, and page and tool requests.
+    #[prost(uint64, repeated, tag = "8")]
+    pub daily_operations: ::prost::alloc::vec::Vec<u64>,
+    #[prost(uint64, repeated, tag = "9")]
+    pub daily_requests: ::prost::alloc::vec::Vec<u64>,
+}
+/// The builder says it started: the build's public log, for community.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RecordBuildStartedRequest {
+    #[prost(string, tag = "1")]
+    pub build_id: ::prost::alloc::string::String,
+    /// The nonce the platform gave the build when it was asked for; spent at
+    /// the results.
+    #[prost(string, tag = "2")]
+    pub intake_nonce: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub log_url: ::prost::alloc::string::String,
+}
+/// The builder hands back what it built and what each check found -- one
+/// finding per check, the scan policy (plan Q4) applied in the builder -- and
+/// the platform checks them, then lists, queues for review or refuses. The
+/// provenance and the image's metadata are not in it: the platform reads
+/// them from the image's OCI 1.1 referrers, the builder's SLSA provenance
+/// and its plugin-metadata attestation
+/// (`<https://open-meridian.dev/attestation/plugin-metadata/v1`>).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RecordBuildResultsRequest {
+    #[prost(string, tag = "1")]
+    pub build_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub intake_nonce: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub image_digest: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "4")]
+    pub findings: ::prost::alloc::vec::Vec<BuildFinding>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PublishPluginVersionRequest {
+    /// The organisation's namespace and the plugin's name.
+    #[prost(string, tag = "1")]
+    pub organisation: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub plugin: ::prost::alloc::string::String,
+    /// `community` or `verified`.
+    #[prost(string, tag = "3")]
+    pub registry: ::prost::alloc::string::String,
+    /// A repository linked through the platform's GitHub App, as its URL or
+    /// as owner/name; at a listing's first publish it becomes the listing's,
+    /// fixed, and is answered as a URL.
+    #[prost(string, tag = "4")]
+    pub repository: ::prost::alloc::string::String,
+    /// The release tag, `v` and the SemVer version, signed by a registered,
+    /// active key of the organisation.
+    #[prost(string, tag = "5")]
+    pub tag: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReadPluginBuildRequest {
+    #[prost(string, tag = "1")]
+    pub organisation: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub plugin: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub build_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RegisterSigningKeyRequest {
+    #[prost(string, tag = "1")]
+    pub organisation: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub public_key: ::prost::alloc::string::String,
+}
+/// The organisation's own keys, active and revoked (W5.30): its page and
+/// `meridian plugin key list`.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListSigningKeysRequest {
+    #[prost(string, tag = "1")]
+    pub organisation: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListSigningKeysReply {
+    #[prost(message, repeated, tag = "1")]
+    pub keys: ::prost::alloc::vec::Vec<SigningKeyRecord>,
+    /// Contract v26 (W5.30; ruling 262): the organisation's signing-key policy
+    /// in force.
+    #[prost(enumeration = "SigningKeyPolicy", tag = "2")]
+    pub policy: i32,
+}
+/// An Owner or Admin sets the organisation's signing-key policy (W5.30), a
+/// page act only. A tightening that would distrust registered keys is first
+/// answered with them listed and nothing changed; sent again with
+/// confirm_distrust, it sets each one's not_trusted_after to now, each its
+/// own record.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SetSigningKeyPolicyRequest {
+    #[prost(string, tag = "1")]
+    pub organisation: ::prost::alloc::string::String,
+    #[prost(enumeration = "SigningKeyPolicy", tag = "2")]
+    pub policy: i32,
+    #[prost(string, tag = "3")]
+    pub reason: ::prost::alloc::string::String,
+    #[prost(bool, tag = "4")]
+    pub confirm_distrust: bool,
+}
+/// The policy in force, each change its own record (decisions/031).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SigningKeyPolicyRecord {
+    #[prost(string, tag = "1")]
+    pub organisation: ::prost::alloc::string::String,
+    #[prost(enumeration = "SigningKeyPolicy", tag = "2")]
+    pub policy: i32,
+    #[prost(int64, tag = "3")]
+    pub changed_at_ns: i64,
+    #[prost(string, tag = "4")]
+    pub changed_by_person_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub reason: ::prost::alloc::string::String,
+    /// The keys a tightening distrusted, or would distrust where it was
+    /// answered as a warning (nothing changed then: changed_at_ns 0).
+    #[prost(string, repeated, tag = "6")]
+    pub distrusted_key_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RevokeSigningKeyRequest {
+    #[prost(string, tag = "1")]
+    pub organisation: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub key_id: ::prost::alloc::string::String,
+    /// Nothing built after it is trusted; at most now.
+    #[prost(int64, tag = "3")]
+    pub not_trusted_after_ns: i64,
+    #[prost(string, tag = "4")]
+    pub reason: ::prost::alloc::string::String,
+}
+/// The catalogue after a sequence: every listing changed since, with its
+/// versions, pulls and withdrawals, and the signing keys' status.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PullCatalogueReply {
+    #[prost(message, repeated, tag = "1")]
+    pub listings: ::prost::alloc::vec::Vec<PluginListing>,
+    /// The latest sequence the answer holds, which the next pull reads after.
+    #[prost(uint64, tag = "2")]
+    pub sequence: u64,
+    #[prost(message, optional, tag = "3")]
+    pub key_status: ::core::option::Option<SigningKeyStatus>,
+    /// Contract v26 (W8.10; ruling 274): the platform Terms' address, which
+    /// the install dialog's one line links.
+    #[prost(string, tag = "4")]
+    pub terms_url: ::prost::alloc::string::String,
+}
+/// One resolution request per install or update (plan Q3), counted by the
+/// platform; also the CLI's bundle download (W8.14).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DownloadListedVersionRequest {
+    #[prost(string, tag = "1")]
+    pub listing: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub version: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub registry: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DownloadListedVersionReply {
+    #[prost(string, tag = "1")]
+    pub image_digest: ::prost::alloc::string::String,
+    /// Where to pull it by digest: the repository in the platform's public
+    /// GitHub registry for community, in Artifact Registry for verified.
+    #[prost(string, tag = "2")]
+    pub pull_from: ::prost::alloc::string::String,
+    /// For verified, a short-lived pull token; empty for community, whose
+    /// bytes are pulled anonymously.
+    #[prost(string, tag = "3")]
+    pub pull_token: ::prost::alloc::string::String,
+    #[prost(int64, tag = "4")]
+    pub pull_token_expires_at_ns: i64,
+    /// The version's signed listing statement, as ListedVersion.listing_statement
+    /// carries it: a DSSE envelope as JSON. The conductor verifies it at
+    /// download and keeps it with the version for launch; the CLI's bundle
+    /// download verifies it and writes it into the bundle (W8.14), since a
+    /// verified version's statement is not a referrer the platform can push.
+    #[prost(string, tag = "5")]
+    pub listing_statement: ::prost::alloc::string::String,
+    /// Contract v26 (W8.14; ruling 196): every pulled version in the catalogue,
+    /// dated and signed, which the CLI writes into the bundle.
+    #[prost(message, optional, tag = "6")]
+    pub pull_status: ::core::option::Option<PluginPullStatus>,
+}
+/// Every pulled version in the catalogue, as a document the platform signs
+/// (W8.14, contract v26), so an air-gapped deployment is warned of a pull by
+/// a later bundle: as SigningKeyStatus is for keys.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PluginPullStatus {
+    #[prost(int64, tag = "1")]
+    pub issued_at_ns: i64,
+    /// Each pull standing or restored, by listing and version.
+    #[prost(message, repeated, tag = "2")]
+    pub pulls: ::prost::alloc::vec::Vec<PluginPull>,
+    /// The platform's signature: base64 of an ECDSA P-256 signature over
+    /// DSSE's pre-authentication encoding of the payload type
+    /// `application/vnd.open-meridian.plugin-pull-status+json` and the body,
+    /// this record's canonical JSON without `signature`.
+    #[prost(string, tag = "3")]
+    pub signature: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ReportPluginUsageReply {
+    #[prost(int64, tag = "1")]
+    pub received_at_ns: i64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReviewPluginVersionRequest {
+    #[prost(string, tag = "1")]
+    pub review_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "PluginReviewDecision", tag = "2")]
+    pub decision: i32,
+    /// On an approval, the roles approved, no wider than the declaration's.
+    #[prost(string, repeated, tag = "3")]
+    pub approved_roles: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, tag = "4")]
+    pub reason: ::prost::alloc::string::String,
+}
+/// A person holding REVIEW_PLUGINS accepts or rejects an agent's proposal --
+/// a review, a pull, a copyright pull or a restoration (W8.9, W8.12, W8.13).
+/// Accepting makes the act as that person, its own record.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DecideRegistryProposalRequest {
+    #[prost(string, tag = "1")]
+    pub proposal_id: ::prost::alloc::string::String,
+    #[prost(bool, tag = "2")]
+    pub accept: bool,
+    #[prost(string, tag = "3")]
+    pub note: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DecideRegistryProposalReply {
+    #[prost(string, tag = "1")]
+    pub proposal_id: ::prost::alloc::string::String,
+    #[prost(bool, tag = "2")]
+    pub accepted: bool,
+    #[prost(int64, tag = "3")]
+    pub decided_at_ns: i64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PullListingRequest {
+    #[prost(string, tag = "1")]
+    pub listing: ::prost::alloc::string::String,
+    /// One version, required: pulling a whole listing, or the several versions
+    /// a copyright notice names, is one request per version, each its own
+    /// record (decisions/031; W8.12, W8.13).
+    #[prost(string, tag = "2")]
+    pub version: ::prost::alloc::string::String,
+    #[prost(enumeration = "PullReasonKind", tag = "3")]
+    pub kind: i32,
+    #[prost(string, tag = "4")]
+    pub reason: ::prost::alloc::string::String,
+    /// For a copyright notice's pull, the notice it acts on.
+    #[prost(string, tag = "5")]
+    pub notice_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StarPluginRequest {
+    #[prost(string, tag = "1")]
+    pub listing: ::prost::alloc::string::String,
+    /// True stars it, once per organisation; false takes the star back.
+    #[prost(bool, tag = "2")]
+    pub starred: bool,
+    /// The organisation starring, one the person is an Owner or Admin of with
+    /// an enrolled deployment: a person may belong to several, and a star is
+    /// one per organisation.
+    #[prost(string, tag = "3")]
+    pub organisation_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct StarPluginReply {
+    /// Whether this organisation's star stands, and the listing's count.
+    #[prost(bool, tag = "1")]
+    pub starred: bool,
+    #[prost(uint64, tag = "2")]
+    pub stars: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SetPluginAttributesRequest {
+    #[prost(string, tag = "1")]
+    pub organisation: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub plugin: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "3")]
+    pub regions: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag = "4")]
+    pub asset_classes: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, tag = "5")]
+    pub support_contact: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WithdrawListedVersionRequest {
+    #[prost(string, tag = "1")]
+    pub organisation: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub plugin: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub version: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub reason: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SetMayPublishRequest {
+    #[prost(string, tag = "1")]
+    pub organisation: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub plugin: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub person_id: ::prost::alloc::string::String,
+    /// True grants the permission, false withdraws it.
+    #[prost(bool, tag = "4")]
+    pub may_publish: bool,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SetMayPublishReply {
+    /// Who holds it on the plugin now, beside the organisation's Owners and
+    /// Admins.
+    #[prost(string, repeated, tag = "1")]
+    pub person_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RecordCopyrightNoticeRequest {
+    #[prost(string, tag = "1")]
+    pub listing: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "2")]
+    pub versions: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag = "3")]
+    pub image_digests: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, tag = "4")]
+    pub received_on: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "5")]
+    pub elements_present: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, tag = "6")]
+    pub sender_name: ::prost::alloc::string::String,
+    #[prost(string, tag = "7")]
+    pub sender_contact: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RecordCounterNoticeRequest {
+    #[prost(string, tag = "1")]
+    pub notice_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub received_on: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "3")]
+    pub elements_present: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RecordCourtActionRequest {
+    #[prost(string, tag = "1")]
+    pub notice_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub filed_on: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RestoreListedVersionRequest {
+    #[prost(string, tag = "1")]
+    pub notice_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub reason: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SetCopyrightAgentFiledRequest {
+    /// True turns the process on, which needs every detail below; false turns
+    /// it off.
+    #[prost(bool, tag = "1")]
+    pub filed: bool,
+    #[prost(string, tag = "2")]
+    pub agent_name: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub agent_address: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub registration_number: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub registration_date: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub reason: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SetCopyrightAgentFiledReply {
+    #[prost(bool, tag = "1")]
+    pub filed: bool,
+    #[prost(string, tag = "2")]
+    pub agent_name: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub agent_address: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub registration_number: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub registration_date: ::prost::alloc::string::String,
+    #[prost(int64, tag = "6")]
+    pub changed_at_ns: i64,
+    #[prost(string, tag = "7")]
+    pub changed_by_person_id: ::prost::alloc::string::String,
+}
+/// Browse and a listing's page, read from the conductor's latest copy of the
+/// catalogue, so the platform is never reached in a page's request.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListRegistryPluginsRequest {
+    /// Words matched against the listing's name and the vendor's text.
+    #[prost(string, tag = "1")]
+    pub search: ::prost::alloc::string::String,
+    /// `community` or `verified`; empty for both.
+    #[prost(string, tag = "2")]
+    pub registry: ::prost::alloc::string::String,
+    /// A role from matrix/roles.tsv; empty for any.
+    #[prost(string, tag = "3")]
+    pub role: ::prost::alloc::string::String,
+    /// One listing, `organisation/plugin`, for its page; empty for the list.
+    #[prost(string, tag = "4")]
+    pub listing: ::prost::alloc::string::String,
+    #[prost(int32, tag = "5")]
+    pub page_size: i32,
+    #[prost(string, tag = "6")]
+    pub cursor: ::prost::alloc::string::String,
+    /// Pull the catalogue first ("Pull now"), then answer.
+    #[prost(bool, tag = "7")]
+    pub pull_now: bool,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListRegistryPluginsReply {
+    #[prost(message, repeated, tag = "1")]
+    pub listings: ::prost::alloc::vec::Vec<PluginListing>,
+    #[prost(string, tag = "2")]
+    pub next_cursor: ::prost::alloc::string::String,
+    /// When the conductor last pulled the catalogue.
+    #[prost(int64, tag = "3")]
+    pub catalogue_pulled_at_ns: i64,
+}
+/// A deployment admin installs a listed version: resolved, pulled by digest
+/// into the local registry with its referrers, verified, and recorded. Install
+/// launches nothing.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct InstallPluginRequest {
+    #[prost(string, tag = "1")]
+    pub listing: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub version: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub registry: ::prost::alloc::string::String,
+    /// Why, kept with the install's record. Through /mcp every install
+    /// carries one.
+    #[prost(string, tag = "4")]
+    pub note: ::prost::alloc::string::String,
+}
+/// Moves an instance to a newer version from its source registry, or a local
+/// version's instance to a listed version of the same plugin (W8.11).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UpdatePluginRequest {
+    #[prost(string, tag = "1")]
+    pub instance_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub listing: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub version: ::prost::alloc::string::String,
+    /// The roles as approved, exactly the version's (for verified, its
+    /// platform-approved roles); a widening waits for this approval.
+    #[prost(string, repeated, tag = "4")]
+    pub approved_roles: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, tag = "5")]
+    pub note: ::prost::alloc::string::String,
+}
+/// A deployment admin keeps an instance whose version was pulled (W8.12).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AcknowledgePullRequest {
+    #[prost(string, tag = "1")]
+    pub instance_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub note: ::prost::alloc::string::String,
+}
+/// Kept on the launch, its own record.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PullAcknowledgement {
+    /// The pull it acknowledges.
+    #[prost(message, optional, tag = "1")]
+    pub pull: ::core::option::Option<PluginPull>,
+    #[prost(string, tag = "2")]
+    pub acknowledged_by: ::prost::alloc::string::String,
+    #[prost(int64, tag = "3")]
+    pub acknowledged_at_ns: i64,
+    #[prost(string, tag = "4")]
+    pub acting_through_delegation: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub client_name: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub note: ::prost::alloc::string::String,
+}
+/// A deployment admin retires an uploaded or installed version (W8.15): it
+/// leaves the catalogue and its image is released, unless an instance runs it
+/// or a record names it, which refuses it naming them.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RetirePluginVersionRequest {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub version: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub note: ::prost::alloc::string::String,
+}
+/// The plugin usage report's setting (W5.19): on by default.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SetReportsPluginUsageRequest {
+    #[prost(bool, tag = "1")]
+    pub reports_plugin_usage: bool,
+    #[prost(string, tag = "2")]
+    pub reason: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ReportsPluginUsageSetting {
+    #[prost(bool, tag = "1")]
+    pub reports_plugin_usage: bool,
+}
+/// The Registries tab: the reports sent, the setting in force and the
+/// catalogue's age.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListPluginUsageReportsRequest {
+    #[prost(int32, tag = "1")]
+    pub page_size: i32,
+    #[prost(string, tag = "2")]
+    pub cursor: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListPluginUsageReportsReply {
+    #[prost(message, repeated, tag = "1")]
+    pub reports: ::prost::alloc::vec::Vec<SentPluginUsageReport>,
+    #[prost(string, tag = "2")]
+    pub next_cursor: ::prost::alloc::string::String,
+    #[prost(bool, tag = "3")]
+    pub reports_plugin_usage: bool,
+    #[prost(int64, tag = "4")]
+    pub catalogue_pulled_at_ns: i64,
+}
+/// A plugin usage report the conductor sent, kept on the deployment as its
+/// own record.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SentPluginUsageReport {
+    #[prost(int64, tag = "1")]
+    pub sent_at_ns: i64,
+    /// Whether the platform received it.
+    #[prost(bool, tag = "2")]
+    pub received: bool,
+    #[prost(message, optional, tag = "3")]
+    pub report: ::core::option::Option<PluginUsageReport>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum PluginLaunchState {
+    Unspecified = 0,
+    /// Recorded, and the launcher asked.
+    Launched = 1,
+    /// Stopped by an administrator; its instance may be launched again.
+    Stopped = 2,
+    /// The launcher refused or failed, with the reason in `failure`.
+    Failed = 3,
+}
+impl PluginLaunchState {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "PLUGIN_LAUNCH_STATE_UNSPECIFIED",
+            Self::Launched => "PLUGIN_LAUNCH_STATE_LAUNCHED",
+            Self::Stopped => "PLUGIN_LAUNCH_STATE_STOPPED",
+            Self::Failed => "PLUGIN_LAUNCH_STATE_FAILED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "PLUGIN_LAUNCH_STATE_UNSPECIFIED" => Some(Self::Unspecified),
+            "PLUGIN_LAUNCH_STATE_LAUNCHED" => Some(Self::Launched),
+            "PLUGIN_LAUNCH_STATE_STOPPED" => Some(Self::Stopped),
+            "PLUGIN_LAUNCH_STATE_FAILED" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum PluginBuildState {
+    Unspecified = 0,
+    /// Asked for, waiting for the builder.
+    Queued = 1,
+    /// Checked out, verified and building, or being checked.
+    Building = 2,
+    /// Every automatic check passed and, for community, listed.
+    Listed = 3,
+    /// Every automatic check passed; a verified version waiting for review.
+    InReview = 4,
+    /// A check failed, named in findings; nothing is listed.
+    Refused = 5,
+}
+impl PluginBuildState {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "PLUGIN_BUILD_STATE_UNSPECIFIED",
+            Self::Queued => "PLUGIN_BUILD_STATE_QUEUED",
+            Self::Building => "PLUGIN_BUILD_STATE_BUILDING",
+            Self::Listed => "PLUGIN_BUILD_STATE_LISTED",
+            Self::InReview => "PLUGIN_BUILD_STATE_IN_REVIEW",
+            Self::Refused => "PLUGIN_BUILD_STATE_REFUSED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "PLUGIN_BUILD_STATE_UNSPECIFIED" => Some(Self::Unspecified),
+            "PLUGIN_BUILD_STATE_QUEUED" => Some(Self::Queued),
+            "PLUGIN_BUILD_STATE_BUILDING" => Some(Self::Building),
+            "PLUGIN_BUILD_STATE_LISTED" => Some(Self::Listed),
+            "PLUGIN_BUILD_STATE_IN_REVIEW" => Some(Self::InReview),
+            "PLUGIN_BUILD_STATE_REFUSED" => Some(Self::Refused),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum BuildFindingSeverity {
+    Unspecified = 0,
+    /// Passed.
+    Passed = 1,
+    /// Shown with the version; lists nothing less.
+    Warning = 2,
+    /// Refused: nothing is listed.
+    Blocked = 3,
+}
+impl BuildFindingSeverity {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "BUILD_FINDING_SEVERITY_UNSPECIFIED",
+            Self::Passed => "BUILD_FINDING_SEVERITY_PASSED",
+            Self::Warning => "BUILD_FINDING_SEVERITY_WARNING",
+            Self::Blocked => "BUILD_FINDING_SEVERITY_BLOCKED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "BUILD_FINDING_SEVERITY_UNSPECIFIED" => Some(Self::Unspecified),
+            "BUILD_FINDING_SEVERITY_PASSED" => Some(Self::Passed),
+            "BUILD_FINDING_SEVERITY_WARNING" => Some(Self::Warning),
+            "BUILD_FINDING_SEVERITY_BLOCKED" => Some(Self::Blocked),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum PluginReviewDecision {
+    Unspecified = 0,
+    /// Waiting for a reviewer; an agent's proposal does not decide it.
+    Pending = 1,
+    Approved = 2,
+    /// Lists nothing; the vendor fixes it in a new version.
+    Refused = 3,
+}
+impl PluginReviewDecision {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "PLUGIN_REVIEW_DECISION_UNSPECIFIED",
+            Self::Pending => "PLUGIN_REVIEW_DECISION_PENDING",
+            Self::Approved => "PLUGIN_REVIEW_DECISION_APPROVED",
+            Self::Refused => "PLUGIN_REVIEW_DECISION_REFUSED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "PLUGIN_REVIEW_DECISION_UNSPECIFIED" => Some(Self::Unspecified),
+            "PLUGIN_REVIEW_DECISION_PENDING" => Some(Self::Pending),
+            "PLUGIN_REVIEW_DECISION_APPROVED" => Some(Self::Approved),
+            "PLUGIN_REVIEW_DECISION_REFUSED" => Some(Self::Refused),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum PullReasonKind {
+    Unspecified = 0,
+    /// A breach of the Platform Terms.
+    TermsBreach = 1,
+    /// A copyright notice acted on (W8.13).
+    CopyrightNotice = 2,
+}
+impl PullReasonKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "PULL_REASON_KIND_UNSPECIFIED",
+            Self::TermsBreach => "PULL_REASON_KIND_TERMS_BREACH",
+            Self::CopyrightNotice => "PULL_REASON_KIND_COPYRIGHT_NOTICE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "PULL_REASON_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "PULL_REASON_KIND_TERMS_BREACH" => Some(Self::TermsBreach),
+            "PULL_REASON_KIND_COPYRIGHT_NOTICE" => Some(Self::CopyrightNotice),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum CopyrightNoticeState {
+    Unspecified = 0,
+    /// Missing a §512(c)(3) element.
+    Incomplete = 1,
+    Recorded = 2,
+    /// Its versions pulled.
+    ActedOn = 3,
+    /// A counter-notice recorded; the restoration window open.
+    Countered = 4,
+    Restored = 5,
+}
+impl CopyrightNoticeState {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "COPYRIGHT_NOTICE_STATE_UNSPECIFIED",
+            Self::Incomplete => "COPYRIGHT_NOTICE_STATE_INCOMPLETE",
+            Self::Recorded => "COPYRIGHT_NOTICE_STATE_RECORDED",
+            Self::ActedOn => "COPYRIGHT_NOTICE_STATE_ACTED_ON",
+            Self::Countered => "COPYRIGHT_NOTICE_STATE_COUNTERED",
+            Self::Restored => "COPYRIGHT_NOTICE_STATE_RESTORED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "COPYRIGHT_NOTICE_STATE_UNSPECIFIED" => Some(Self::Unspecified),
+            "COPYRIGHT_NOTICE_STATE_INCOMPLETE" => Some(Self::Incomplete),
+            "COPYRIGHT_NOTICE_STATE_RECORDED" => Some(Self::Recorded),
+            "COPYRIGHT_NOTICE_STATE_ACTED_ON" => Some(Self::ActedOn),
+            "COPYRIGHT_NOTICE_STATE_COUNTERED" => Some(Self::Countered),
+            "COPYRIGHT_NOTICE_STATE_RESTORED" => Some(Self::Restored),
+            _ => None,
+        }
+    }
+}
+/// Which keys an organisation accepts (W5.30; ruling 262, 2026-10-18).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum SigningKeyPolicy {
+    /// Read as any key.
+    Unspecified = 0,
+    /// Any SSH key git signs with: the default.
+    Any = 1,
+    /// Hardware-backed keys only: `sk-ssh-ed25519@openssh.com`,
+    /// `sk-ecdsa-sha2-nistp256@openssh.com`.
+    HardwareOnly = 2,
+    /// Any key but a hardware-backed one.
+    DesktopOnly = 3,
+}
+impl SigningKeyPolicy {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "SIGNING_KEY_POLICY_UNSPECIFIED",
+            Self::Any => "SIGNING_KEY_POLICY_ANY",
+            Self::HardwareOnly => "SIGNING_KEY_POLICY_HARDWARE_ONLY",
+            Self::DesktopOnly => "SIGNING_KEY_POLICY_DESKTOP_ONLY",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "SIGNING_KEY_POLICY_UNSPECIFIED" => Some(Self::Unspecified),
+            "SIGNING_KEY_POLICY_ANY" => Some(Self::Any),
+            "SIGNING_KEY_POLICY_HARDWARE_ONLY" => Some(Self::HardwareOnly),
+            "SIGNING_KEY_POLICY_DESKTOP_ONLY" => Some(Self::DesktopOnly),
             _ => None,
         }
     }
@@ -14813,6 +16074,14 @@ pub struct VenueCatalogue {
     /// answers it DK. Unspecified, as a v22 catalogue is, reads as none.
     #[prost(enumeration = "ExecutionAcknowledgement", tag = "6")]
     pub execution_acknowledgement: i32,
+    /// Contract v26 (W11.20; G1 question 5, approved 2026-10-14): the
+    /// environment the plugin's session actually reached, read from the
+    /// vendor's host, in the role-common setting's values -- `live`,
+    /// `sandbox` or `paper`; empty, as a v25 catalogue is, is no report. A
+    /// connection is demo only while its setting and this both say `sandbox`
+    /// or `paper`.
+    #[prost(string, tag = "7")]
+    pub environment: ::prost::alloc::string::String,
 }
 /// An order type the venue offers, with the times in force it takes.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -14965,6 +16234,40 @@ pub struct SentUsageReport {
     pub received: bool,
     #[prost(message, optional, tag = "3")]
     pub report: ::core::option::Option<IdentifierUsageReport>,
+}
+/// The deployment admin sets the deployment's time zone (W6.35; the v26
+/// plan's question 229): each change its own record.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SetDeploymentTimeZoneRequest {
+    /// An IANA time-zone ID (RFC 6557's database): `America/New_York`.
+    #[prost(string, tag = "1")]
+    pub deployment_time_zone: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub reason: ::prost::alloc::string::String,
+}
+/// W6.35: the zone read, by the book for due_by (W11.34) and the dashboard.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ReadDeploymentTimeZoneRequest {}
+/// The deployment's time zone in force, and beside it the deadline the book
+/// sets a held booking's due_by from (W11.34; question 230).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DeploymentTimeZoneSetting {
+    /// `America/New_York` by default.
+    #[prost(string, tag = "1")]
+    pub deployment_time_zone: ::prost::alloc::string::String,
+    /// The last change; 0 and empty for the default never changed.
+    #[prost(int64, tag = "2")]
+    pub changed_at_ns: i64,
+    #[prost(string, tag = "3")]
+    pub changed_by: ::prost::alloc::string::String,
+    /// The earliest affirmation_deadline a launched operations instance
+    /// declares (W8.1), minutes after midnight in the zone, 1 to 1440; 0 where
+    /// none is launched or none declares one.
+    #[prost(uint32, tag = "4")]
+    pub affirmation_deadline: u32,
+    /// The instance declaring it; empty with 0.
+    #[prost(string, tag = "5")]
+    pub affirmation_deadline_instance_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -15446,6 +16749,10 @@ pub struct FirstRunConfiguration {
     /// refuses it rather than writing it.
     #[prost(message, optional, tag = "4")]
     pub administrator: ::core::option::Option<AdministratorAnswer>,
+    /// Contract v26 (W7.5, W6.35): the deployment's time zone, an IANA
+    /// time-zone ID; empty takes the default, `America/New_York`.
+    #[prost(string, tag = "5")]
+    pub deployment_time_zone: ::prost::alloc::string::String,
 }
 /// What the Job did, step by step. Applying the same configuration again
 /// completes a partial one.

@@ -234,6 +234,13 @@ impl Sidecar {
                 .as_ref()
                 .map(|r| r.stored.clone())
                 .unwrap_or_default(),
+            // The model tokens its last accepted heartbeat counted (W4.5,
+            // contract v26, item 191): counts, never a prompt or an answer,
+            // shown on its Summary and never sent to the platform.
+            model_tokens: registration
+                .as_ref()
+                .map(|r| r.model_tokens.clone())
+                .unwrap_or_default(),
             // The tools it declared and this sidecar admitted, and a sentence
             // for each refused (W4.1, W4.8, contract v12): the dashboard's
             // catalogue for /mcp, and the Summary's.

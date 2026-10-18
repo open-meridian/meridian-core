@@ -942,7 +942,13 @@ pub fn templates_from_json(value: &serde_json::Value) -> Result<Vec<SecurityTemp
         let instrument_type = meridian_domain::instrument_type::read(&kind).ok_or_else(|| {
             format!("{template_id} names type {kind:?}, which the schema does not define")
         })?;
+        // Its calculation package (contract v26, W1.24): data, refused with
+        // the version where it does not stand, never kept half.
+        let calculation_package =
+            meridian_domain::template::package_from_json(item.get("calculation_package"))
+                .map_err(|said| format!("{template_id} {said}"))?;
         out.push(SecurityTemplate {
+            calculation_package,
             template_version: text_of(item.get("template_version")),
             name: text_of(item.get("name")),
             asset_class: asset_class as i32,
@@ -1419,6 +1425,7 @@ fn into_record(record: WireRecord) -> Result<PbInstrument, PlatformError> {
             Some(meridian_domain::v1::BinaryEventContract {
                 payout,
                 closes_at_ns: contract.closes_at_ns,
+                ..Default::default()
             })
         }
     };

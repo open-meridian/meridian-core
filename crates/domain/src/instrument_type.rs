@@ -18,8 +18,8 @@
 
 use crate::exact::Exact;
 use crate::v1::{
-    AssetClass, BinaryEventContract, InstrumentType, LiquidityFeeRegime, Money, MoneyMarketFund,
-    MoneyMarketFundCategory, MoneyMarketFundInvestors, MoneyMarketFundNav,
+    AssetClass, BinaryEventContract, EventContractBound, InstrumentType, LiquidityFeeRegime, Money,
+    MoneyMarketFund, MoneyMarketFundCategory, MoneyMarketFundInvestors, MoneyMarketFundNav,
 };
 
 /// The asset class a type is under; `None` for no type.
@@ -189,7 +189,10 @@ pub fn fund_words(text: &str) -> String {
 /// A binary event contract's attributes as the store holds them: the
 /// payout's amount, its ISO 4217 code and its cash instrument (either may be
 /// empty, not both), and when trading closes in nanoseconds, separated by
-/// `|`.
+/// `|`. A range market's bounds (contract v26, W1.24) follow as three more
+/// fields -- the floor, the cap and their unit, a bound written as its value
+/// with `=` before it when inclusive, empty for an open tail -- and only when
+/// one is set, so a contract with none keeps v19's four.
 pub fn contract_to_text(contract: &BinaryEventContract) -> String {
     let payout = contract.payout.clone().unwrap_or_default();
     let amount = payout
@@ -198,20 +201,71 @@ pub fn contract_to_text(contract: &BinaryEventContract) -> String {
         .and_then(|d| Exact::from_wire(d).ok())
         .map(|e| e.to_string())
         .unwrap_or_default();
-    format!(
+    let mut text = format!(
         "{amount}|{}|{}|{}",
         payout.currency_code.trim(),
         payout.instrument_id.trim(),
         contract.closes_at_ns
-    )
+    );
+    if contract.floor.is_some() || contract.cap.is_some() {
+        text.push_str(&format!(
+            "|{}|{}|{}",
+            bound_to_text(contract.floor.as_ref()),
+            bound_to_text(contract.cap.as_ref()),
+            contract.bound_unit.trim()
+        ));
+    }
+    text
+}
+
+fn bound_to_text(bound: Option<&EventContractBound>) -> String {
+    let Some(bound) = bound else {
+        return String::new();
+    };
+    let value = bound
+        .value
+        .as_ref()
+        .and_then(|d| Exact::from_wire(d).ok())
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    if bound.inclusive {
+        format!("={value}")
+    } else {
+        value
+    }
+}
+
+fn bound_from_text(text: &str) -> Option<Option<EventContractBound>> {
+    if text.is_empty() {
+        return Some(None);
+    }
+    let (inclusive, value) = match text.strip_prefix('=') {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let value: Exact = value.parse().ok()?;
+    Some(Some(EventContractBound {
+        value: Some(value.to_wire()),
+        inclusive,
+    }))
 }
 
 /// The attributes `text` holds, or `None` for empty or text this did not
 /// write.
 pub fn contract_from_text(text: &str) -> Option<BinaryEventContract> {
     let parts: Vec<&str> = text.split('|').collect();
-    let [amount, code, instrument, closes] = parts.as_slice() else {
-        return None;
+    let (amount, code, instrument, closes, floor, cap, unit) = match parts.as_slice() {
+        [amount, code, instrument, closes] => (amount, code, instrument, closes, None, None, ""),
+        [amount, code, instrument, closes, floor, cap, unit] => (
+            amount,
+            code,
+            instrument,
+            closes,
+            bound_from_text(floor)?,
+            bound_from_text(cap)?,
+            *unit,
+        ),
+        _ => return None,
     };
     let amount: Exact = amount.parse().ok()?;
     Some(BinaryEventContract {
@@ -221,6 +275,9 @@ pub fn contract_from_text(text: &str) -> Option<BinaryEventContract> {
             instrument_id: instrument.to_string(),
         }),
         closes_at_ns: closes.parse().ok()?,
+        floor,
+        cap,
+        bound_unit: unit.to_string(),
     })
 }
 
@@ -259,6 +316,56 @@ pub fn contract_refused(contract: &BinaryEventContract) -> Vec<(&'static str, St
                 .to_string(),
         ));
     }
+    let mut bounds = Vec::new();
+    for (field, bound) in [
+        ("floor", contract.floor.as_ref()),
+        ("cap", contract.cap.as_ref()),
+    ] {
+        let Some(bound) = bound else { continue };
+        match bound.value.as_ref().map(Exact::from_wire) {
+            Some(Ok(value)) => bounds.push(value),
+            Some(Err(out)) => wrong.push((
+                if field == "floor" {
+                    "floor.value"
+                } else {
+                    "cap.value"
+                },
+                format!("the bound {out}"),
+            )),
+            None => wrong.push((
+                if field == "floor" {
+                    "floor.value"
+                } else {
+                    "cap.value"
+                },
+                "a range market's bound states its value".to_string(),
+            )),
+        }
+    }
+    if let [floor, cap] = bounds.as_slice() {
+        if floor > cap {
+            wrong.push((
+                "cap",
+                "a range market's cap is not below its floor".to_string(),
+            ));
+        }
+    }
+    let bounded = contract.floor.is_some() || contract.cap.is_some();
+    if bounded && contract.bound_unit.trim().is_empty() {
+        wrong.push((
+            "bound_unit",
+            "a range market's bounds name their unit".to_string(),
+        ));
+    }
+    if !bounded && !contract.bound_unit.trim().is_empty() {
+        wrong.push((
+            "bound_unit",
+            "a unit names the bounds' unit, and this contract has none".to_string(),
+        ));
+    }
+    if contract.bound_unit.contains('|') {
+        wrong.push(("bound_unit", "a unit is one word, without `|`".to_string()));
+    }
     wrong
 }
 
@@ -281,6 +388,51 @@ pub fn contract_words(text: &str) -> String {
         (code, instrument) => format!("{code} ({instrument})"),
     };
     let mut line = format!("pays {amount} {asset}");
+    let unit = contract.bound_unit.as_str();
+    let said = |bound: &EventContractBound| {
+        bound
+            .value
+            .as_ref()
+            .and_then(|d| Exact::from_wire(d).ok())
+            .map(|e| format!("{e} {unit}"))
+            .unwrap_or_default()
+    };
+    match (contract.floor.as_ref(), contract.cap.as_ref()) {
+        (Some(floor), Some(cap)) => line.push_str(&format!(
+            ", between {} ({}) and {} ({})",
+            said(floor),
+            if floor.inclusive {
+                "inclusive"
+            } else {
+                "exclusive"
+            },
+            said(cap),
+            if cap.inclusive {
+                "inclusive"
+            } else {
+                "exclusive"
+            }
+        )),
+        (Some(floor), None) => line.push_str(&format!(
+            ", {} {}",
+            if floor.inclusive {
+                "at or above"
+            } else {
+                "above"
+            },
+            said(floor)
+        )),
+        (None, Some(cap)) => line.push_str(&format!(
+            ", {} {}",
+            if cap.inclusive {
+                "at or below"
+            } else {
+                "below"
+            },
+            said(cap)
+        )),
+        (None, None) => {}
+    }
     if contract.closes_at_ns > 0 {
         line.push_str(&format!(", closes {}", utc_minute(contract.closes_at_ns)));
     }
@@ -323,6 +475,7 @@ mod tests {
                 instrument_id: String::new(),
             }),
             closes_at_ns: 1_793_664_000_000_000_000,
+            ..Default::default()
         };
         assert!(contract_refused(&contract).is_empty());
         let text = contract_to_text(&contract);
@@ -339,10 +492,67 @@ mod tests {
                 instrument_id: String::new(),
             }),
             closes_at_ns: 0,
+            ..Default::default()
         };
         let fields: Vec<&str> = contract_refused(&nothing).iter().map(|(f, _)| *f).collect();
         assert_eq!(fields, vec!["payout", "payout.amount"]);
         assert_eq!(contract_from_text(""), None);
+    }
+
+    #[test]
+    fn a_range_markets_bounds_round_trip_and_are_checked() {
+        let bound = |value: i128, inclusive: bool| EventContractBound {
+            value: Some(Exact::new(value, 0).unwrap().to_wire()),
+            inclusive,
+        };
+        let range = BinaryEventContract {
+            payout: Some(Money {
+                amount: Some(Exact::new(1, 0).unwrap().to_wire()),
+                currency_code: "USD".into(),
+                instrument_id: String::new(),
+            }),
+            closes_at_ns: 0,
+            floor: Some(bound(70, true)),
+            cap: Some(bound(74, false)),
+            bound_unit: "degrees_f".into(),
+        };
+        assert!(contract_refused(&range).is_empty());
+        let text = contract_to_text(&range);
+        assert_eq!(text, "1|USD||0|=70|74|degrees_f");
+        assert_eq!(contract_from_text(&text), Some(range.clone()));
+        assert_eq!(
+            contract_words(&text),
+            "pays 1 USD, between 70 degrees_f (inclusive) and 74 degrees_f (exclusive)"
+        );
+        let tail = BinaryEventContract {
+            cap: None,
+            ..range.clone()
+        };
+        let text = contract_to_text(&tail);
+        assert_eq!(text, "1|USD||0|=70||degrees_f");
+        assert_eq!(contract_from_text(&text), Some(tail.clone()));
+        assert_eq!(
+            contract_words(&text),
+            "pays 1 USD, at or above 70 degrees_f"
+        );
+        let upside_down = BinaryEventContract {
+            floor: Some(bound(80, false)),
+            ..range.clone()
+        };
+        let fields: Vec<&str> = contract_refused(&upside_down)
+            .iter()
+            .map(|(f, _)| *f)
+            .collect();
+        assert_eq!(fields, vec!["cap"]);
+        let unitless = BinaryEventContract {
+            bound_unit: String::new(),
+            ..range
+        };
+        let fields: Vec<&str> = contract_refused(&unitless)
+            .iter()
+            .map(|(f, _)| *f)
+            .collect();
+        assert_eq!(fields, vec!["bound_unit"]);
     }
 
     #[test]

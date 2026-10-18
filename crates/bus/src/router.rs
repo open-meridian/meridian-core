@@ -74,6 +74,14 @@ pub struct Stamp {
     /// everywhere else.
     pub connectivity_allowed: bool,
 
+    /// On a placement, and on an accept naming a new order (contract v26,
+    /// W11.8, W11.23): whether the connectivity plugin it names, or the
+    /// reported fills', is among the claims' demo_connectivity_instance_ids
+    /// -- its environment setting and its session's report both demo -- which
+    /// the book refuses an agent's act by while the deployment's
+    /// agent_orders_demo_only is on. False everywhere else.
+    pub connectivity_demo: bool,
+
     /// The accounts the plugin may read, stamped with the mark that they
     /// apply (W4.11): `Some`, an empty one included, is a plugin's read, which
     /// a store answers only within, and an empty one with nothing. `None` is
@@ -415,6 +423,9 @@ impl Bus {
             owner_subject: stamp.owner_subject.clone(),
             algorithm_id: stamp.algorithm_id.clone(),
             connectivity_allowed: stamp.connectivity_allowed,
+            connectivity_demo: stamp.connectivity_demo,
+            // The analytics component's own reads (W12.2), never a sidecar's.
+            on_behalf_of_instance_id: String::new(),
             // A read's scope is the sidecar's to stamp, for a plugin, marked
             // as applying; a core component reads as itself, unmarked.
             account_scope: stamp.account_scope.clone().unwrap_or_default(),

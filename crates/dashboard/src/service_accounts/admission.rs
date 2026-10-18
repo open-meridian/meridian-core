@@ -160,6 +160,7 @@ pub(crate) fn opening_on(
                 .map(|group| group.user_group_id.clone())
                 .collect(),
         ),
+        demo_connectivity_instance_ids: Vec::new(),
     })
 }
 

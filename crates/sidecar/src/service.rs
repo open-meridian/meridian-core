@@ -65,6 +65,11 @@ pub struct Registration {
     /// accepted heartbeat said (W4.5, contract v16), which its report
     /// carries; none after a heartbeat that was refused.
     pub stored: Vec<meridian_pb::v1::StoredSpan>,
+    /// The model tokens it used since it started, as its last accepted
+    /// heartbeat said (W4.5, contract v26, item 191): counts per endpoint,
+    /// subject and client, which its report carries to its Summary and
+    /// nowhere else; none after a heartbeat that was refused.
+    pub model_tokens: Vec<meridian_pb::v1::ModelTokenCount>,
 }
 
 /// An external account nobody has linked: rows refused for it, and when it
@@ -594,6 +599,7 @@ impl SidecarService for Sidecar {
             tools,
             tool_refusals,
             stored: Vec::new(),
+            model_tokens: Vec::new(),
         });
         self.changed.notify_one();
 
@@ -639,11 +645,16 @@ impl SidecarService for Sidecar {
             .or_else(|| {
                 crate::edge::stored_refused(&req.stored, registration.declaration.as_ref())
                     .map(|(path, words)| (words, vec![path]))
+            })
+            .or_else(|| {
+                crate::edge::model_tokens_refused(&req.model_tokens)
+                    .map(|(path, words)| (words, vec![path]))
             });
-        let (healthy, detail, figures, seen, stored) = match &refused {
+        let (healthy, detail, figures, seen, stored, tokens) = match &refused {
             Some((refusal, _)) => (
                 false,
                 format!("the plugin's heartbeat was refused: {refusal}"),
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
@@ -654,6 +665,7 @@ impl SidecarService for Sidecar {
                 req.figures,
                 req.not_carried_seen,
                 req.stored,
+                req.model_tokens,
             ),
             None => (
                 false,
@@ -661,6 +673,7 @@ impl SidecarService for Sidecar {
                 req.figures,
                 req.not_carried_seen,
                 req.stored,
+                req.model_tokens,
             ),
         };
 
@@ -670,13 +683,15 @@ impl SidecarService for Sidecar {
                 || state.health_detail != detail
                 || state.figures != figures
                 || state.not_carried_seen != seen
-                || state.stored != stored;
+                || state.stored != stored
+                || state.model_tokens != tokens;
             state.healthy = healthy;
             state.last_heartbeat_ns = self.clock.now_ns();
             state.health_detail = detail;
             state.figures = figures;
             state.not_carried_seen = seen;
             state.stored = stored;
+            state.model_tokens = tokens;
         }
         // What the report says moved, so it goes out now rather than at the
         // next interval; a heartbeat repeating the last says nothing new.
@@ -1345,7 +1360,7 @@ mod tests {
 
     #[tokio::test]
     async fn admission_is_refused_for_a_contract_outside_the_range() {
-        for declared in ["v1", "v26"] {
+        for declared in ["v1", "v27"] {
             let sc = sidecar();
             let mut req = register_req();
             req.schema_version = declared.into();
@@ -1354,7 +1369,7 @@ mod tests {
             assert!(!reply.admitted, "{declared} was admitted");
             // Both halves: what was declared, and what would be accepted.
             assert!(reply.refusal_reason.contains(declared));
-            assert!(reply.refusal_reason.contains("v2 through v25"));
+            assert!(reply.refusal_reason.contains("v2 through v26"));
             assert!(sc.registration().is_none());
         }
     }

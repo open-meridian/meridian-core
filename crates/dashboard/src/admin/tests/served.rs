@@ -2262,6 +2262,8 @@ fn registry_listings() -> Vec<meridian_domain::v1::PluginListing> {
             installs: stars * 3,
             instances: stars * 4,
             counts_shown: stars >= 3,
+            reviewed: false,
+            terms_url: "https://open-meridian.com/terms#plugins-and-registries".into(),
         }
     };
     let mut pulled = listed("open-meridian/fx", "1.4.0", "community", &["custody"]);

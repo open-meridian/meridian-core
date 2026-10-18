@@ -671,6 +671,15 @@ pub fn completion(filled: &Filled) -> Result<CompleteInstrumentsRequest, String>
                 instrument_id,
             }),
             closes_at_ns: utc_of_field(&filled.contract_closes)?,
+            // A range market's bounds are its template's fields, from the
+            // venue (contract v26, W1.24): the form keeps those held.
+            ..instrument_type::contract_from_text(&filled.contract_held)
+                .map(|held| meridian_domain::v1::BinaryEventContract {
+                    payout: None,
+                    closes_at_ns: 0,
+                    ..held
+                })
+                .unwrap_or_default()
         };
         if instrument_type::contract_to_text(&contract) != filled.contract_held {
             if filled.contract_source.trim().is_empty() {

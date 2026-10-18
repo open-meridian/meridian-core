@@ -1612,6 +1612,136 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.call_typed("platform.lake.query.list-datasets", "meridian.v1.ListDatasetsRequest", message, account, None).await
     }
 
+    /// W12.1: `platform.analytics.query.run-job` (preview).
+    async fn run_job(
+        &self,
+        request: Request<plugin::RunJobParams>,
+    ) -> Result<Response<plugin::RunJobResult>, Status> {
+        let message: domain::RunJobRequest = self.as_domain(request.into_inner())?;
+        if let Some(held0) = message.job.as_ref() {
+            if let Some(held1) = held0.what_if.as_ref() {
+                for (i2, held2) in held1.trades.iter().enumerate() {
+                    self.known(&format!("job.what_if.trades[{i2}].side"), held2.side, domain::Side::try_from(held2.side).is_ok())?;
+                    self.exact(&format!("job.what_if.trades[{i2}].quantity"), held2.quantity.as_ref())?;
+                    self.exact_money(&format!("job.what_if.trades[{i2}].price"), held2.price.as_ref())?;
+                }
+            }
+        }
+        let account = None;
+        self.call_typed("platform.analytics.query.run-job", "meridian.v1.RunJobRequest", message, account, None).await
+    }
+
+    /// W12.1: `platform.analytics.query.list-measure-definitions` (preview).
+    async fn list_measure_definitions(
+        &self,
+        request: Request<plugin::ListMeasureDefinitionsParams>,
+    ) -> Result<Response<plugin::ListMeasureDefinitionsResult>, Status> {
+        let message: domain::ListMeasureDefinitionsRequest = self.as_domain(request.into_inner())?;
+        let account = None;
+        self.call_typed("platform.analytics.query.list-measure-definitions", "meridian.v1.ListMeasureDefinitionsRequest", message, account, None).await
+    }
+
+    /// W12.3: `platform.analytics.query.list-price-batches` (preview).
+    async fn list_price_batches(
+        &self,
+        request: Request<plugin::ListPriceBatchesParams>,
+    ) -> Result<Response<plugin::ListPriceBatchesResult>, Status> {
+        let message: domain::ListPriceBatchesRequest = self.as_domain(request.into_inner())?;
+        let account = None;
+        self.call_typed("platform.analytics.query.list-price-batches", "meridian.v1.ListPriceBatchesRequest", message, account, None).await
+    }
+
+    /// W12.3: `platform.analytics.command.answer-price-batch` (preview).
+    async fn answer_price_batch(
+        &self,
+        request: Request<plugin::AnswerPriceBatchParams>,
+    ) -> Result<Response<plugin::AnswerPriceBatchResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let mut message: domain::PriceBatchReply = self.as_domain(params)?;
+        for (i0, held0) in message.values.iter().enumerate() {
+            if let Some(held1) = held0.scenario_key.as_ref() {
+                self.known(&format!("values[{i0}].scenario_key.kind"), held1.kind, domain::ScenarioKind::try_from(held1.kind).is_ok())?;
+            }
+            self.exact_money(&format!("values[{i0}].value_per_unit"), held0.value_per_unit.as_ref())?;
+        }
+        for (i0, held0) in message.sensitivities.iter().enumerate() {
+            if let Some(held1) = held0.scenario_key.as_ref() {
+                self.known(&format!("sensitivities[{i0}].scenario_key.kind"), held1.kind, domain::ScenarioKind::try_from(held1.kind).is_ok())?;
+            }
+            self.exact(&format!("sensitivities[{i0}].value"), held0.value.as_ref())?;
+        }
+        message.pricing_instance_id = self.instance_id().to_string();
+        let account = None;
+        self.command_typed("platform.analytics.command.answer-price-batch", "meridian.v1.PriceBatchReply", message, account, acting_for).await
+    }
+
+    /// W12.4: `platform.analytics.query.list-finished-jobs` (preview).
+    async fn list_finished_jobs(
+        &self,
+        request: Request<plugin::ListFinishedJobsParams>,
+    ) -> Result<Response<plugin::ListFinishedJobsResult>, Status> {
+        let message: domain::ListFinishedJobsRequest = self.as_domain(request.into_inner())?;
+        let account = None;
+        self.call_typed("platform.analytics.query.list-finished-jobs", "meridian.v1.ListFinishedJobsRequest", message, account, None).await
+    }
+
+    /// W12.4: `platform.analytics.query.read-job-answer` (preview).
+    async fn read_job_answer(
+        &self,
+        request: Request<plugin::ReadJobAnswerParams>,
+    ) -> Result<Response<plugin::ReadJobAnswerResult>, Status> {
+        let message: domain::ReadJobAnswerRequest = self.as_domain(request.into_inner())?;
+        let account = None;
+        self.call_typed("platform.analytics.query.read-job-answer", "meridian.v1.ReadJobAnswerRequest", message, account, None).await
+    }
+
+    /// W3.29: `platform.reference.command.report-event-group` (preview).
+    async fn report_event_group(
+        &self,
+        request: Request<plugin::ReportEventGroupParams>,
+    ) -> Result<Response<plugin::ReportEventGroupResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let mut message: domain::ReportEventGroupRequest = self.as_domain(params)?;
+        self.known("mutually_exclusive", message.mutually_exclusive, domain::EventGroupFlag::try_from(message.mutually_exclusive).is_ok())?;
+        self.known("exhaustive", message.exhaustive, domain::EventGroupFlag::try_from(message.exhaustive).is_ok())?;
+        message.publisher_instance_id = self.instance_id().to_string();
+        let account = None;
+        self.command_typed("platform.reference.command.report-event-group", "meridian.v1.ReportEventGroupRequest", message, account, acting_for).await
+    }
+
+    /// W3.30: `platform.reference.query.list-event-groups` (preview).
+    async fn list_event_groups(
+        &self,
+        request: Request<plugin::ListEventGroupsParams>,
+    ) -> Result<Response<plugin::ListEventGroupsResult>, Status> {
+        let message: domain::ListEventGroupsRequest = self.as_domain(request.into_inner())?;
+        let account = None;
+        self.call_typed("platform.reference.query.list-event-groups", "meridian.v1.ListEventGroupsRequest", message, account, None).await
+    }
+
+    /// W11.39: `platform.book.query.read-agent-orders-demo-only` (preview).
+    async fn read_agent_orders_demo_only(
+        &self,
+        request: Request<plugin::ReadAgentOrdersDemoOnlyParams>,
+    ) -> Result<Response<plugin::ReadAgentOrdersDemoOnlyResult>, Status> {
+        let message: domain::ReadAgentOrdersDemoOnlyRequest = self.as_domain(request.into_inner())?;
+        let account = None;
+        self.call_typed("platform.book.query.read-agent-orders-demo-only", "meridian.v1.ReadAgentOrdersDemoOnlyRequest", message, account, None).await
+    }
+
+    /// W10.10: `platform.lake.query.query-lake` (preview).
+    async fn query_lake(
+        &self,
+        request: Request<plugin::QueryLakeParams>,
+    ) -> Result<Response<plugin::QueryLakeResult>, Status> {
+        let mut message: domain::QueryLakeRequest = self.as_domain(request.into_inner())?;
+        message.instance_id = self.instance_id().to_string();
+        let account = None;
+        self.call_typed("platform.lake.query.query-lake", "meridian.v1.QueryLakeRequest", message, account, None).await
+    }
+
     type ReceiveStream = crate::receive::Deliveries;
 
     /// W4.3: every row this plugin's roles hear, within its read scope.
@@ -1809,6 +1939,27 @@ pub(crate) const DELIVERED: &[crate::receive::Row] = &[
         topic: "platform.book.event.alert-changed",
         payload_type: "meridian.v1.AlertChangedEvent",
         read: alert_changed,
+    },
+    crate::receive::Row {
+        name: "PriceBatch",
+        step: "W12.3",
+        topic: "platform.analytics.event.price-batch",
+        payload_type: "meridian.v1.PriceBatchRequest",
+        read: price_batch,
+    },
+    crate::receive::Row {
+        name: "JobFinished",
+        step: "W12.4",
+        topic: "platform.analytics.event.job-finished",
+        payload_type: "meridian.v1.JobFinishedEvent",
+        read: job_finished,
+    },
+    crate::receive::Row {
+        name: "EventGroupChanged",
+        step: "W3.30",
+        topic: "platform.reference.event.event-group-changed",
+        payload_type: "meridian.v1.EventGroup",
+        read: event_group_changed,
     },
 ];
 
@@ -2121,5 +2272,41 @@ fn alert_changed(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeEr
         journal: message.journal.clone(),
         cause: message.cause.clone(),
         item: plugin::delivery::Item::AlertChanged(message),
+    })
+}
+
+/// W12.3: a PriceBatchRequest, sequenced, unscoped.
+fn price_batch(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeError> {
+    let message = plugin::PriceBatchRequest::decode(payload)?;
+    Ok(crate::receive::Read {
+        account: None,
+        directed: vec![("pricing", message.pricing_instance_id.clone())],
+        journal: None,
+        cause: None,
+        item: plugin::delivery::Item::PriceBatch(message),
+    })
+}
+
+/// W12.4: a JobFinishedEvent, sequenced, unscoped.
+fn job_finished(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeError> {
+    let message = plugin::JobFinishedEvent::decode(payload)?;
+    Ok(crate::receive::Read {
+        account: None,
+        directed: vec![("reporting", message.client_instance_id.clone()), ("portfolio", message.client_instance_id.clone()), ("compliance", message.client_instance_id.clone()), ("signal", message.client_instance_id.clone())],
+        journal: None,
+        cause: None,
+        item: plugin::delivery::Item::JobFinished(message),
+    })
+}
+
+/// W3.30: a EventGroup, sequenced, unscoped.
+fn event_group_changed(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeError> {
+    let message = plugin::EventGroup::decode(payload)?;
+    Ok(crate::receive::Read {
+        account: None,
+        directed: Vec::new(),
+        journal: None,
+        cause: None,
+        item: plugin::delivery::Item::EventGroupChanged(message),
     })
 }
