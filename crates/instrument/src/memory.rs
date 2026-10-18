@@ -205,6 +205,36 @@ impl Store for MemoryStore {
         Ok(self.read()?.venues.values().cloned().collect())
     }
 
+    fn keep_event_group(
+        &self,
+        group: &meridian_domain::v1::EventGroup,
+        now_ns: i64,
+    ) -> Result<Option<meridian_domain::v1::EventGroup>> {
+        let mut held = self.write_lock()?;
+        if held.event_groups.iter().any(|kept| {
+            kept.event_group_id == group.event_group_id && kept.version == group.version
+        }) {
+            return Ok(None);
+        }
+        let sequence = held
+            .event_groups
+            .last()
+            .map(|kept| kept.sequence)
+            .unwrap_or(0)
+            + 1;
+        let kept = meridian_domain::v1::EventGroup {
+            record_time_ns: now_ns,
+            sequence,
+            ..group.clone()
+        };
+        held.event_groups.push(kept.clone());
+        Ok(Some(kept))
+    }
+
+    fn event_groups(&self) -> Result<Vec<meridian_domain::v1::EventGroup>> {
+        Ok(self.read()?.event_groups.clone())
+    }
+
     fn keep_calendar(
         &self,
         record: &meridian_domain::v1::CalendarRecord,

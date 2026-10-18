@@ -503,6 +503,18 @@ pub fn serve_all_within(
         });
     }
     serve_one_id(bus, store.clone(), clock.clone(), writing.clone());
+    // Event groups (contract v26, W3.29, W3.30): a report asks the platform
+    // through the conductor within the same bounded ask a resolve takes.
+    crate::event_groups::serve(
+        bus,
+        store.clone(),
+        clock.clone(),
+        writing.clone(),
+        Arc::new(crate::event_groups::BusAskGroup {
+            bus: Arc::clone(bus),
+            within: bound,
+        }),
+    );
     bus.serve(READ_INSTRUMENT_HISTORY, move |envelope| {
         let request: ReadInstrumentHistoryRequest =
             decode(&envelope, "meridian.v1.ReadInstrumentHistoryRequest")?;

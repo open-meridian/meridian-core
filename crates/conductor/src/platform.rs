@@ -443,6 +443,29 @@ impl Platform {
         ))
     }
 
+    /// W3.29, W1.30 (contract v26): a venue's grouping of event contracts,
+    /// its members by their `INS-` IDs, carried as it came; the platform's
+    /// answer whole -- its `EVG-` group at its version, or queued for its
+    /// staff. A platform without the route answers as unreachable.
+    pub async fn escalate_event_group(
+        &self,
+        request: &meridian_domain::v1::EscalateEventGroupRequest,
+        now_ns: i64,
+    ) -> Result<meridian_domain::v1::EscalateEventGroupReply, PlatformError> {
+        let body = serde_json::to_vec(&event_group_body(request))
+            .map_err(|failed| PlatformError::Malformed(failed.to_string()))?;
+        let response = self
+            .v24_call(
+                Method::Post,
+                "/api/v1/reference/escalate-event-group",
+                Some(body),
+                now_ns,
+            )
+            .await?;
+        let value: serde_json::Value = read_json(&response)?;
+        event_group_reply_from_json(&value).map_err(PlatformError::Malformed)
+    }
+
     /// A route contract v24 added (W3.4, W3.24, W3.25, W3.27, W3.28). A
     /// platform without it answers 404 -- or 405, 410 or 501 -- and is
     /// treated as unreachable, never as an answer (the build plan's step 4):
@@ -1079,6 +1102,97 @@ pub fn escalation_body(request: &EscalateInstrumentRequest) -> serde_json::Value
             }))
             .collect::<Vec<_>>(),
         "request_key": request.request_key,
+    })
+}
+
+/// W3.29's request as the platform's JSON spells it: the flags by their
+/// enum names, int64 as text.
+pub fn event_group_body(
+    request: &meridian_domain::v1::EscalateEventGroupRequest,
+) -> serde_json::Value {
+    // Unknown is never false (A2): unset travels as not stated.
+    let flag = |value: i32| {
+        use meridian_domain::v1::EventGroupFlag;
+        match EventGroupFlag::try_from(value) {
+            Ok(EventGroupFlag::True) => EventGroupFlag::True.as_str_name(),
+            Ok(EventGroupFlag::False) => EventGroupFlag::False.as_str_name(),
+            _ => EventGroupFlag::NotStated.as_str_name(),
+        }
+    };
+    serde_json::json!({
+        "venue_id": request.venue_id,
+        "venue_event_ref": request.venue_event_ref,
+        "title": request.title,
+        "member_instrument_ids": request.member_instrument_ids,
+        "mutually_exclusive": flag(request.mutually_exclusive),
+        "exhaustive": flag(request.exhaustive),
+        "series_id": request.series_id,
+        "valid_from_ns": request.valid_from_ns.to_string(),
+        "request_key": request.request_key,
+    })
+}
+
+/// The platform's answer to a group (W1.30): its `EVG-` group, read
+/// strictly where it names what is kept -- the ID, the venue, the members,
+/// the flags -- and refused where it does not.
+pub fn event_group_reply_from_json(
+    value: &serde_json::Value,
+) -> Result<meridian_domain::v1::EscalateEventGroupReply, String> {
+    use meridian_domain::v1::{EscalateEventGroupReply, EventGroup, EventGroupFlag};
+    let flag = |held: Option<&serde_json::Value>| -> Result<i32, String> {
+        match held {
+            None | Some(serde_json::Value::Null) => Ok(EventGroupFlag::NotStated as i32),
+            Some(serde_json::Value::String(name)) => EventGroupFlag::from_str_name(name)
+                .map(|flag| flag as i32)
+                .ok_or_else(|| format!("a flag {name:?} the schema does not define")),
+            Some(serde_json::Value::Number(n)) => n
+                .as_i64()
+                .and_then(|n| EventGroupFlag::try_from(n as i32).ok())
+                .map(|flag| flag as i32)
+                .ok_or_else(|| format!("a flag {n} the schema does not define")),
+            Some(other) => Err(format!("a flag {other} the schema does not define")),
+        }
+    };
+    let event_group = match value.get("event_group").filter(|held| held.is_object()) {
+        None => None,
+        Some(group) => {
+            let event_group_id = text_of(group.get("event_group_id"));
+            if !event_group_id.starts_with("EVG-") {
+                return Err(format!(
+                    "a group arrived as {event_group_id:?}, not the platform's"
+                ));
+            }
+            Some(EventGroup {
+                event_group_id,
+                venue_id: text_of(group.get("venue_id")),
+                venue_event_ref: text_of(group.get("venue_event_ref")),
+                title: text_of(group.get("title")),
+                member_instrument_ids: group
+                    .get("member_instrument_ids")
+                    .and_then(|members| members.as_array())
+                    .map(|members| members.iter().map(|m| text_of(Some(m))).collect())
+                    .unwrap_or_default(),
+                mutually_exclusive: flag(group.get("mutually_exclusive"))?,
+                exhaustive: flag(group.get("exhaustive"))?,
+                series_id: text_of(group.get("series_id")),
+                version: int_of(group.get("version")).max(1),
+                valid_from_ns: int_of(group.get("valid_from_ns")),
+                record_time_ns: 0,
+                provisional: false,
+                sequence: 0,
+            })
+        }
+    };
+    Ok(EscalateEventGroupReply {
+        event_group,
+        minted: value
+            .get("minted")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        pending_review: value
+            .get("pending_review")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
     })
 }
 
@@ -2374,6 +2488,64 @@ pub(crate) mod tests {
         assert!(!urls
             .iter()
             .any(|url| url.contains("cusip") || url.contains("symbol")));
+    }
+
+    #[tokio::test]
+    async fn a_group_is_asked_by_its_members_ins_ids_and_its_evg_answer_read() {
+        // Contract v26 (W3.29, W1.30).
+        use meridian_domain::v1::{EscalateEventGroupRequest, EventGroupFlag};
+        let answer = serde_json::json!({
+            "event_group": {
+                "event_group_id": "EVG-01JEVG00000000000000000001",
+                "venue_id": "VEN-K", "venue_event_ref": "KXFED-26NOV", "title": "Fed",
+                "member_instrument_ids": ["INS-A", "INS-B"],
+                "mutually_exclusive": "EVENT_GROUP_FLAG_TRUE",
+                "version": "2", "valid_from_ns": "5"
+            },
+            "minted": false, "pending_review": false
+        })
+        .to_string();
+        let transport = Fake::new(vec![Ok(reply(200, &answer))]);
+        let request = EscalateEventGroupRequest {
+            venue_id: "VEN-K".into(),
+            venue_event_ref: "KXFED-26NOV".into(),
+            member_instrument_ids: vec!["INS-A".into(), "INS-B".into()],
+            mutually_exclusive: EventGroupFlag::True as i32,
+            request_key: "k".into(),
+            ..Default::default()
+        };
+        let answered = platform(transport.clone())
+            .escalate_event_group(&request, NOW)
+            .await
+            .unwrap();
+        let group = answered.event_group.unwrap();
+        assert_eq!(group.version, 2);
+        assert_eq!(group.valid_from_ns, 5);
+        assert_eq!(
+            group.exhaustive,
+            EventGroupFlag::NotStated as i32,
+            "unknown is never false"
+        );
+        assert!(transport.urls()[0].ends_with("/api/v1/reference/escalate-event-group"));
+        let body: serde_json::Value = serde_json::from_str(&transport.bodies()[0]).unwrap();
+        assert_eq!(body["mutually_exclusive"], "EVENT_GROUP_FLAG_TRUE");
+        assert_eq!(body["exhaustive"], "EVENT_GROUP_FLAG_NOT_STATED");
+        assert_eq!(body["member_instrument_ids"][1], "INS-B");
+        // Under an ID that is not the platform's: refused; a platform before
+        // v26: unreachable.
+        let wrong = answer.replace("EVG-01JEVG", "LCL-01JEVG");
+        assert!(platform(Fake::new(vec![Ok(reply(200, &wrong))]))
+            .escalate_event_group(&request, NOW)
+            .await
+            .is_err());
+        let before = platform(Fake::new(vec![Ok(reply(404, "{}"))]))
+            .escalate_event_group(&request, NOW)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(before, PlatformError::Unreachable { .. }),
+            "{before}"
+        );
     }
 
     #[tokio::test]

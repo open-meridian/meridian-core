@@ -25,6 +25,7 @@
 
 pub mod calendars;
 pub mod complete;
+pub mod event_groups;
 pub mod ids;
 pub mod list;
 pub mod one_id;
