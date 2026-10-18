@@ -190,6 +190,23 @@ fn run() -> Result<(), String> {
             Ok(Err(why)) => tracing::warn!(why, "the escape hatch's default could not be recorded"),
             Err(failed) => tracing::warn!(%failed, "the escape hatch's backfill failed"),
         }
+        // Contract v26 (W11.38, decisions/031): the agents' guard recorded
+        // on at the upgrade, once.
+        let backfilling = bus.clone();
+        let held = Arc::clone(&store);
+        match tokio::task::spawn_blocking(move || {
+            meridian_bor::booking_service::backfill_agent_orders_demo_only(
+                &backfilling,
+                held.as_ref(),
+            )
+        })
+        .await
+        {
+            Ok(Ok(true)) => tracing::info!("agents may place orders on demo connections only"),
+            Ok(Ok(false)) => {}
+            Ok(Err(why)) => tracing::warn!(why, "the agents' guard could not be recorded"),
+            Err(failed) => tracing::warn!(%failed, "the agents' guard's backfill failed"),
+        }
         tokio::spawn(meridian_bor::booking_service::sweep_forever(
             bus.clone(),
             Arc::clone(&store),

@@ -151,6 +151,10 @@ pub enum Act {
     /// W11.8): the entry names the placing `ems`, the instance asked for, the
     /// actor and the reason, on the order.
     PlacementRefused { order_id: String },
+    /// An accept to a new order refused and recorded (contract v26, W11.23,
+    /// W11.38): an agent's, on a connection not stamped demo while the guard
+    /// is on; its executions stay unmatched.
+    AcceptRefused { execution_ids: Vec<String> },
     /// What the venue did with a placement (W11.10).
     PlacementReported {
         #[serde(with = "pb")]
@@ -316,6 +320,8 @@ pub enum Act {
     AlertCleared { alert_id: String },
     /// The escape hatch's setting (W11.36), in the control partition.
     LocalRecordOrdersSet { allows: bool },
+    /// The agents' guard (contract v26, W11.38), in the control partition.
+    AgentOrdersDemoOnlySet { on: bool },
 }
 
 /// An order as the book holds it: its terms, and what its journal says.
@@ -468,6 +474,9 @@ pub struct Ledger {
     /// The escape hatch's setting, where the control partition states it
     /// (W11.36): `None` before any entry has.
     pub local_record_orders: Option<bool>,
+    /// The agents' guard, where the control partition states it (contract
+    /// v26, W11.38): `None` before any entry has, which reads as on.
+    pub agent_orders_demo_only: Option<bool>,
 }
 
 /// The records an entry's acts change, each once, in the order they are
@@ -592,6 +601,11 @@ impl Ledger {
                 | Act::Condition { order_id, .. }
                 | Act::Overridden { order_id }
                 | Act::PlacementRefused { order_id } => push_once(&mut touched.orders, order_id),
+                Act::AcceptRefused { execution_ids } => {
+                    for id in execution_ids {
+                        push_once(&mut touched.executions, id);
+                    }
+                }
                 Act::Checked { order_id, check } => {
                     if check.placement_id.is_empty() {
                         push_once(&mut touched.orders, order_id);
@@ -712,6 +726,9 @@ impl Ledger {
                 // (W11.36).
                 Act::LocalRecordOrdersSet { .. } => {
                     push_once(&mut touched.settings, "local-record-orders")
+                }
+                Act::AgentOrdersDemoOnlySet { .. } => {
+                    push_once(&mut touched.settings, "agent-orders-demo-only")
                 }
             }
         }
@@ -873,7 +890,7 @@ impl Ledger {
                     },
                 );
             }
-            Act::PlacementRefused { .. } => {}
+            Act::PlacementRefused { .. } | Act::AcceptRefused { .. } => {}
             Act::PlacementReported { report } => self.reported(report),
             Act::Executed {
                 execution,
@@ -1180,6 +1197,9 @@ impl Ledger {
             }
             Act::LocalRecordOrdersSet { allows } => {
                 self.local_record_orders = Some(*allows);
+            }
+            Act::AgentOrdersDemoOnlySet { on } => {
+                self.agent_orders_demo_only = Some(*on);
             }
         }
     }

@@ -204,6 +204,8 @@ struct LedgerShape {
     sleeve_crosses: Vec<(String, String)>,
     alerts: Vec<(String, String)>,
     local_record_orders: Option<bool>,
+    #[serde(default)]
+    agent_orders_demo_only: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -402,6 +404,7 @@ fn ledger_shape(ledger: &Ledger) -> LedgerShape {
         sleeve_crosses,
         alerts,
         local_record_orders,
+        agent_orders_demo_only,
     } = ledger;
     LedgerShape {
         orders: orders
@@ -450,6 +453,7 @@ fn ledger_shape(ledger: &Ledger) -> LedgerShape {
         sleeve_crosses: map_pb(sleeve_crosses),
         alerts: map_pb(alerts),
         local_record_orders: *local_record_orders,
+        agent_orders_demo_only: *agent_orders_demo_only,
     }
 }
 
@@ -720,6 +724,7 @@ fn ledger_from(shape: LedgerShape) -> Result<Ledger> {
         sleeve_crosses: unmap_pb(&shape.sleeve_crosses)?,
         alerts: unmap_pb(&shape.alerts)?,
         local_record_orders: shape.local_record_orders,
+        agent_orders_demo_only: shape.agent_orders_demo_only,
     })
 }
 

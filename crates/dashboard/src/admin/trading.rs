@@ -40,6 +40,11 @@ pub const SET_LOCAL_RECORD_ORDERS: &str = "platform.book.command.set-local-recor
 pub const READ_LOCAL_RECORD_ORDERS: &str = "platform.book.query.read-local-record-orders";
 /// Where its form posts.
 pub const LOCAL_RECORDS_PATH: &str = "/admin/trading-instructions/local-records";
+/// W11.38, W11.39 (contract v26): the agents' guard, set and read.
+pub const SET_AGENT_ORDERS_DEMO_ONLY: &str = "platform.book.command.set-agent-orders-demo-only";
+pub const READ_AGENT_ORDERS_DEMO_ONLY: &str = "platform.book.query.read-agent-orders-demo-only";
+/// The guard's label (approved 2026-10-14).
+pub const AGENT_ORDERS_DEMO_ONLY_LABEL: &str = "Agents may place orders on demo connections only";
 
 const WAIT: Duration = Duration::from_secs(5);
 
@@ -346,6 +351,58 @@ pub async fn read_local_record_orders(
         .map_err(|failed| failed.to_string())?;
     meridian_domain::v1::LocalRecordOrdersSetting::decode(&bytes[..])
         .map_err(|failed| format!("the book's answer did not read: {failed}"))
+}
+
+/// The agents' guard in force (W11.39), read as the dashboard.
+pub async fn read_agent_orders_demo_only(
+    bus: &meridian_bus::Bus,
+) -> Result<meridian_domain::v1::AgentOrdersDemoOnlySetting, String> {
+    let (_, bytes) = bus
+        .call(
+            READ_AGENT_ORDERS_DEMO_ONLY,
+            "meridian.v1.ReadAgentOrdersDemoOnlyRequest",
+            meridian_domain::v1::ReadAgentOrdersDemoOnlyRequest {}.encode_to_vec(),
+            None,
+            Some(WAIT),
+        )
+        .await
+        .map_err(|failed| failed.to_string())?;
+    meridian_domain::v1::AgentOrdersDemoOnlySetting::decode(&bytes[..])
+        .map_err(|failed| format!("the book's answer did not read: {failed}"))
+}
+
+/// The guard as a tool answers it.
+pub fn agent_orders_demo_only_json(
+    setting: &meridian_domain::v1::AgentOrdersDemoOnlySetting,
+) -> serde_json::Value {
+    serde_json::json!({
+        "agent_orders_demo_only": setting.agent_orders_demo_only,
+        "label": AGENT_ORDERS_DEMO_ONLY_LABEL,
+        "can_be_turned_off": false,
+    })
+}
+
+/// The home page's line for the guard (W11.38): on, with no switch while
+/// it cannot be turned off; a page that could not read it says so.
+pub fn agent_orders_demo_only_line(
+    setting: Option<&meridian_domain::v1::AgentOrdersDemoOnlySetting>,
+) -> String {
+    match setting {
+        Some(setting) => format!(
+            "<p class=\"facts-line\" id=\"agent-orders-demo-only\" data-on=\"{on}\">\
+             {AGENT_ORDERS_DEMO_ONLY_LABEL}: <strong>{state}</strong>.</p>",
+            on = setting.agent_orders_demo_only,
+            state = if setting.agent_orders_demo_only {
+                "on"
+            } else {
+                "off"
+            },
+        ),
+        None => format!(
+            "<p class=\"facts-line\" id=\"agent-orders-demo-only\">{AGENT_ORDERS_DEMO_ONLY_LABEL}: \
+             the book did not answer.</p>"
+        ),
+    }
 }
 
 /// The setting as a tool answers it.

@@ -121,6 +121,15 @@ fn ended(state: OrderState) -> bool {
 
 /// A command other than a fact report needs a user: a person or a service
 /// account (W11's invariants; REFUSAL_REASON_ACTOR_REQUIRED).
+/// A sentence's first word capitalised.
+fn capitalised(words: &str) -> String {
+    let mut chars = words.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
 pub(crate) fn user_required(ctx: &Context, what: &str) -> Result<()> {
     if ctx.acting_for.is_empty() {
         return Err(StoreError::refused(
@@ -1664,6 +1673,37 @@ pub fn create_placement(
         let mut made = finish(book, head, ctx, plan)?;
         made.refusal =
             Some(StoreError::refused(RefusalReason::ConnectivityNotAllowed, words).on_the_bus());
+        return Ok(made);
+    }
+    // Refused and recorded (contract v26, W11.8, W11.38): an agent's
+    // placement on a connection the sidecar did not stamp demo while the
+    // deployment's guard is on.
+    if crate::booking::agent_live_refused(ctx) {
+        let connection = if request.connectivity_instance_id.is_empty() {
+            "no connectivity plugin".to_string()
+        } else {
+            request.connectivity_instance_id.clone()
+        };
+        let words = format!(
+            "Refused: {}. {connection} is live: a placement of order {order_id} by {ems} made \
+             through a delegation or by a service account is refused while the deployment's \
+             agent_orders_demo_only is on; a person may make it from the agent's prepared change",
+            capitalised(crate::booking::AGENT_LIVE_ORDER_WORDS)
+        );
+        let plan = Plan::new(
+            "placement-refused",
+            ctx.actor(),
+            vec![Act::PlacementRefused {
+                order_id: order_id.clone(),
+            }],
+        )
+        .reason(&format!(
+            "REFUSAL_REASON_AGENT_LIVE_ORDER: ems {ems}, connectivity {}",
+            request.connectivity_instance_id
+        ))
+        .key(&request.idempotency_key);
+        let mut made = finish(book, head, ctx, plan)?;
+        made.refusal = Some(StoreError::refused(RefusalReason::AgentLiveOrder, words).on_the_bus());
         return Ok(made);
     }
     if !claim_allows(order, ctx) {
@@ -4137,6 +4177,37 @@ pub fn accept_execution(
             order_id.clone()
         }
         Some(accept_execution_request::MatchedOrder::NewOrder(new_order)) => {
+            // Refused and recorded (contract v26, W11.23, W11.38): an agent's
+            // accept to a new order on a connection the sidecar did not stamp
+            // demo while the guard is on; the executions stay unmatched. An
+            // accept to an existing order is never refused by it.
+            if crate::booking::agent_live_refused(ctx) {
+                let words = format!(
+                    "Refused: {}. {} is live: an accept of fills to a new order made through a \
+                     delegation or by a service account is refused while the deployment's \
+                     agent_orders_demo_only is on; the executions stay unmatched",
+                    capitalised(crate::booking::AGENT_LIVE_ORDER_WORDS),
+                    first.sender
+                );
+                let plan = Plan::new(
+                    "accept-refused",
+                    ctx.actor(),
+                    vec![Act::AcceptRefused {
+                        execution_ids: named
+                            .iter()
+                            .map(|held| held.execution.execution_id.clone())
+                            .collect(),
+                    }],
+                )
+                .reason(&format!(
+                    "REFUSAL_REASON_AGENT_LIVE_ORDER: ems {}, connectivity {}",
+                    ctx.instance_id, first.sender
+                ));
+                let mut made = finish(book, head, ctx, plan)?;
+                made.refusal =
+                    Some(StoreError::refused(RefusalReason::AgentLiveOrder, words).on_the_bus());
+                return Ok(made);
+            }
             let order = Order {
                 order_id: ctx.mint(ids::ORDER),
                 account_id: book.account_id.clone(),

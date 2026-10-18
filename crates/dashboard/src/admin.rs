@@ -2776,7 +2776,8 @@ fn level_posted(
         )
     })?;
     let eyes = !field(fields, "second_pair_of_eyes").is_empty();
-    if let Some(why) = crate::prepared::levels::refused(level, eyes, line.preparable) {
+    if let Some(why) = crate::prepared::levels::refused_for(&line.act, level, eyes, line.preparable)
+    {
         return Err(why);
     }
     let note = field(fields, "note").to_string();

@@ -99,6 +99,12 @@ pub struct Context {
     /// Contract v24 (W11.36): the escape hatch's setting in force, read from
     /// the control partition; `None` reads as on, the default.
     pub local_record_orders: Option<bool>,
+    /// Contract v26 (W11.8, W11.23): the sidecar's verdict that the
+    /// connectivity plugin a placement or a new order's fills name is demo.
+    pub connectivity_demo: bool,
+    /// Contract v26 (W11.38): the agents' guard in force, read from the
+    /// control partition; `None` reads as on, the default.
+    pub agent_orders_demo_only: Option<bool>,
 }
 
 /// What an instrument's record says that the book requires (W9.1, contract
@@ -116,6 +122,16 @@ pub struct RecordSays {
 }
 
 impl Context {
+    /// Whether the act is an agent's (contract v26, W11.8; G1 question 3):
+    /// made through a delegation, or by a service account. A person's own
+    /// act at a page is not, nor one a person makes from an agent's
+    /// prepared change: its actor is the person, through no delegation.
+    pub(crate) fn agents(&self) -> bool {
+        !self.acting_for.is_empty()
+            && (!self.acting_through_delegation.is_empty()
+                || self.acting_for_kind == meridian_pb::v1::SubjectKind::ServiceAccount as i32)
+    }
+
     pub(crate) fn actor(&self) -> Actor {
         Actor {
             kind: Some(if self.acting_for.is_empty() {

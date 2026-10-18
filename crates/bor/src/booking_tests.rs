@@ -21,6 +21,7 @@ fn anywhere(subject: &'static str) -> As {
         person: Some(subject),
         scope: None,
         allowed: true,
+        ..Default::default()
     }
 }
 
@@ -174,6 +175,7 @@ async fn filled_in(
                 person: None,
                 scope: None,
                 allowed: false,
+                ..Default::default()
             },
         )
         .await
@@ -1101,6 +1103,7 @@ async fn an_open_orders_fill_after_its_record_resolved_lands_on_the_record_it_be
             person: None,
             scope: None,
             allowed: false,
+            ..Default::default()
         },
     )
     .await

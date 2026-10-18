@@ -58,7 +58,7 @@ const DAY_NS: i64 = 24 * 3_600 * 1_000_000_000;
 
 /// Core's acts that can be prepared (the plan's Q13; from contract v22 the
 /// order path's two, Q44), by their names on the surface.
-pub const CORE_PREPARABLE: [&str; 25] = [
+pub const CORE_PREPARABLE: [&str; 26] = [
     "dashboard__set_plugin_settings",
     "dashboard__allow_archive",
     "dashboard__withdraw_archive",
@@ -88,6 +88,8 @@ pub const CORE_PREPARABLE: [&str; 25] = [
     "dashboard__update_plugin",
     "dashboard__acknowledge_pull",
     "dashboard__set_reports_plugin_usage",
+    // Contract v26 (W11.38): preparable by an agent, made by a person.
+    "dashboard__set_agent_orders_demo_only",
 ];
 
 /// v20's own tools, never prepared and never levelled but for the three on

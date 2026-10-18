@@ -110,6 +110,7 @@ pub(crate) fn context_of(envelope: &Envelope, clock: &dyn Clock) -> Context {
             .account_scope_applies
             .then(|| meta.account_scope.iter().cloned().collect()),
         connectivity_allowed: meta.connectivity_allowed,
+        connectivity_demo: meta.connectivity_demo,
         message_id: meta.message_id,
         instance_id: meta.publisher_instance_id,
         acting_for: meta.acting_for_subject,
@@ -130,6 +131,7 @@ pub(crate) fn context_of(envelope: &Envelope, clock: &dyn Clock) -> Context {
         account_marks: Default::default(),
         members: Default::default(),
         local_record_orders: None,
+        agent_orders_demo_only: None,
     }
 }
 

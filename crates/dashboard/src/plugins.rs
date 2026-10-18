@@ -1290,6 +1290,9 @@ impl Opening {
     ) -> Self {
         self.connectivity_instance_ids =
             crate::admin::connectivity::routes(records, instance, subject, user_group_ids);
+        // Contract v26 (W11.8): those of them demo by their setting.
+        self.demo_connectivity_instance_ids =
+            crate::admin::connectivity::demo_routes(records, &self.connectivity_instance_ids);
         self
     }
 

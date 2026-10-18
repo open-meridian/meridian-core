@@ -630,6 +630,46 @@ pub fn routes(
         .collect()
 }
 
+/// The environments a connection is demo in (contract v26; W6.11's
+/// role-common setting; G1 question 5).
+pub const DEMO_ENVIRONMENTS: [&str; 2] = ["sandbox", "paper"];
+
+/// A connectivity instance's environment setting, core's record of what a
+/// person with admin on its role set (W6.11): empty where none is set.
+pub fn environment_set(records: &AccessRecords, instance: &str) -> String {
+    records
+        .plugin_settings
+        .iter()
+        .find(|held| held.plugin_instance_id == instance)
+        .and_then(|held| held.values.iter().find(|value| value.name == "environment"))
+        .map(|value| value.value.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Those of `routes` that are demo by their environment setting (contract
+/// v26, W11.8): what the claims carry as demo_connectivity_instance_ids.
+/// The session's key -- the venue catalogue's reported environment -- is
+/// held by the ems's sidecar as it stamps a placement, so a connection
+/// whose setting and session disagree, or whose session reports nothing,
+/// is live (failing closed).
+pub fn demo_routes(records: &AccessRecords, routes: &[String]) -> Vec<String> {
+    routes
+        .iter()
+        .filter(|instance| DEMO_ENVIRONMENTS.contains(&environment_set(records, instance).as_str()))
+        .cloned()
+        .collect()
+}
+
+/// A connection's badge (W11.8): Demo where its environment setting is
+/// sandbox or paper, Live otherwise.
+pub fn badge(records: &AccessRecords, instance: &str) -> &'static str {
+    if DEMO_ENVIRONMENTS.contains(&environment_set(records, instance).as_str()) {
+        "Demo"
+    } else {
+        "Live"
+    }
+}
+
 /// What `dashboard__read_plugin_access` answers of an instance's link and
 /// map (W11.21, W11.22): its link, for a connectivity plugin; its plugins
 /// and its map, for an `ems`; nothing for any other.

@@ -32,6 +32,7 @@ use meridian_domain::v1::{
     ListTradingInstructionsRequest, LocalRecordOrdersSetting, SetAccountAttributeRequest,
     SetLocalRecordOrdersRequest, TradingInstructionReply, TradingInstructionTarget,
 };
+use meridian_domain::v1::{AgentOrdersDemoOnlySetting, SetAgentOrdersDemoOnlyRequest};
 
 const WAIT: Duration = Duration::from_secs(5);
 const CHANGING: Duration = Duration::from_secs(20);
@@ -146,6 +147,31 @@ record. Answers the setting and the count of live orders on local records, namin
         Area::Trading,
         local_record_orders_schema,
     ),
+    // Contract v26 (W11.38, W11.39): the agents' guard, its read and its
+    // set, a deployment admin's; the set preparable by an agent and made by
+    // a person alone.
+    spec(
+        "read_agent_orders_demo_only",
+        "Read whether agents' orders are kept to demo connections",
+        "the deployment's guard on agents' orders, \"Agents may place orders on demo connections \
+only\": on by default and at the upgrade, and not turned off in this version. While on, a \
+placement, or an accept of fills to a new order, made through a delegation or by a service \
+account on a connection that is not demo is refused (REFUSAL_REASON_AGENT_LIVE_ORDER) and \
+recorded; a person's own act, and one a person makes from an agent's prepared change, are not.",
+        true,
+        Area::Trading,
+        nothing_schema,
+    ),
+    spec(
+        "set_agent_orders_demo_only",
+        "Keep agents' orders to demo connections",
+        "set the deployment's guard on agents' orders with a note saying why, each change its own \
+record (W11.38). Off is refused in this version. A person's act: an agent may prepare it and \
+never make it, whatever any level says.",
+        false,
+        Area::Trading,
+        agent_orders_demo_only_schema,
+    ),
 ];
 
 /// A spec's whole description, as the surface lists it.
@@ -192,6 +218,18 @@ fn local_record_orders_schema() -> Value {
             "note": note(),
         },
         "required": ["allows_local_record_orders", "note"],
+        "additionalProperties": false,
+    })
+}
+
+fn agent_orders_demo_only_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "agent_orders_demo_only": {"type": "boolean", "description": "true; false is refused in this version"},
+            "note": note(),
+        },
+        "required": ["agent_orders_demo_only", "note"],
         "additionalProperties": false,
     })
 }
@@ -256,6 +294,8 @@ pub async fn call(app: &App, caller: &Caller, spec: &Spec, arguments: Value) -> 
         "list_trading_instructions" => list_instructions(app, caller, &arguments).await,
         "set_trading_instruction" => set_instruction(app, caller, &arguments).await,
         "set_local_record_orders" => set_local_record_orders(app, caller, &arguments).await,
+        "read_agent_orders_demo_only" => read_agent_orders_demo_only(app, caller).await,
+        "set_agent_orders_demo_only" => set_agent_orders_demo_only(app, caller, &arguments).await,
         "close_account" => close_account(app, caller, &arguments).await,
         "read_book_health" => read_book_health(app, caller, &arguments).await,
         other => refused("not_listed", &format!("no tool {other}"), Vec::new()),
@@ -660,6 +700,87 @@ async fn set_local_record_orders(app: &App, caller: &Caller, arguments: &Value) 
     }
 }
 
+/// W11.39 (contract v26): the agents' guard read, a deployment admin's.
+async fn read_agent_orders_demo_only(app: &App, caller: &Caller) -> Value {
+    let (_, access) = match access_of(app, caller) {
+        Ok(held) => held,
+        Err(refusal) => return refusal,
+    };
+    if !access.deployment_admin {
+        return refused(
+            "not_permitted",
+            "the agents' guard is a deployment admin's to read",
+            Vec::new(),
+        );
+    }
+    match trading::read_agent_orders_demo_only(&app.bus).await {
+        Ok(setting) => {
+            json!({"outcome": "unchanged", "data": trading::agent_orders_demo_only_json(&setting)})
+        }
+        Err(failed) => refused("unavailable", &failed, Vec::new()),
+    }
+}
+
+/// W11.38 (contract v26): the agents' guard set, a deployment admin's own
+/// act; the book refuses it off, and refuses an agent's.
+async fn set_agent_orders_demo_only(app: &App, caller: &Caller, arguments: &Value) -> Value {
+    let mut problems = Problems::default();
+    let Some(top) = object(arguments, "", &mut problems) else {
+        return problems.refusal();
+    };
+    only(top, &["agent_orders_demo_only", "note"], "", &mut problems);
+    let on = match top.get("agent_orders_demo_only") {
+        Some(Value::Bool(on)) => *on,
+        None | Some(Value::Null) => {
+            problems.add("agent_orders_demo_only", "required");
+            true
+        }
+        Some(_) => {
+            problems.add("agent_orders_demo_only", "true or false");
+            true
+        }
+    };
+    if !on {
+        problems.add(
+            "agent_orders_demo_only",
+            "the guard cannot be turned off in this version",
+        );
+    }
+    let reason = text(top, "note", "", true, &mut problems);
+    if !problems.is_empty() {
+        return problems.refusal();
+    }
+    let (_, access) = match access_of(app, caller) {
+        Ok(held) => held,
+        Err(refusal) => return refusal,
+    };
+    if !access.deployment_admin {
+        return refused(
+            "not_permitted",
+            "the agents' guard is a deployment admin's",
+            Vec::new(),
+        );
+    }
+    let reply: Result<AgentOrdersDemoOnlySetting, _> = ask(
+        app,
+        caller,
+        trading::SET_AGENT_ORDERS_DEMO_ONLY,
+        "meridian.v1.SetAgentOrdersDemoOnlyRequest",
+        SetAgentOrdersDemoOnlyRequest {
+            agent_orders_demo_only: on,
+            reason,
+        },
+        CHANGING,
+    )
+    .await;
+    match reply {
+        Err(failed) => bus_refused(failed, ""),
+        Ok(reply) => {
+            json!({"outcome": "made", "data": trading::agent_orders_demo_only_json(&reply)})
+        }
+    }
+}
+
 /// W6.3 (contract v24): an account closed, a deployment admin's. No tool
 /// sets a grant (W6.30), so "Unlink all and close" is refused while one
 /// stands, naming it: a person withdraws it at the page.
@@ -758,6 +879,11 @@ pub const PARITY: &[(&str, &str)] = &[
     (
         "/admin/trading-instructions",
         "list_trading_instructions set_trading_instruction set_local_record_orders",
+    ),
+    // Contract v26 (W11.38, W11.39): the home page's line for the guard.
+    (
+        "/ agents' guard",
+        "read_agent_orders_demo_only set_agent_orders_demo_only",
     ),
 ];
 

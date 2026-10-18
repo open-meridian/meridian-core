@@ -31,8 +31,8 @@ use meridian_domain::v1::{
     BookingCorrectionKind, BookingState, CorrectBookingRequest, ErrorCause, Execution,
     GiveUpAnswer, GiveUpRecord, HandOffBookingRequest, HoldingSide, LotReliefMethod, LotSource,
     LotTerms, Money, MovementLine, OrderState, RaiseAlertRequest, RecordSleeveCrossRequest,
-    ReportGiveUpRequest, SetAllocationInstructionRequest, SetLocalRecordOrdersRequest,
-    SettlementBucket, Side, SleeveCross,
+    ReportGiveUpRequest, SetAgentOrdersDemoOnlyRequest, SetAllocationInstructionRequest,
+    SetLocalRecordOrdersRequest, SettlementBucket, Side, SleeveCross,
 };
 use meridian_pb::v1::RefusalReason;
 
@@ -1972,6 +1972,67 @@ pub fn set_local_record_orders(
     )
     .reason(&request.reason);
     made_without_records(book, head, ctx, plan)
+}
+
+// ── W11.38: the agents' guard ──────────────────────────────────────────────
+
+/// The words a refusal by the guard, and a check before sending, say
+/// (W11.8; the badge and the history's line, approved 2026-10-14).
+pub const AGENT_LIVE_ORDER_WORDS: &str = "agents may place orders on demo connections only";
+
+/// The agents' guard in force (contract v26, W11.38): on unless the control
+/// partition last said off, as it is by default and at the upgrade.
+pub fn agent_orders_demo_only(control: &Book) -> bool {
+    control.ledger.agent_orders_demo_only.unwrap_or(true)
+}
+
+/// W11.38: a deployment admin sets the guard, a person's own act with a
+/// reason; refused off in the version that brings it (G1 question 2), and
+/// never an agent's act, which may prepare the change and never make it.
+pub fn set_agent_orders_demo_only(
+    book: &Book,
+    head: u64,
+    ctx: &Context,
+    request: &SetAgentOrdersDemoOnlyRequest,
+) -> Result<Made> {
+    user_required(
+        ctx,
+        "setting whether agents' orders are kept to demo connections",
+    )?;
+    if ctx.agents() {
+        return Err(StoreError::Denied(
+            "the agents' guard is set by a person at the dashboard's home page; an agent may \
+             prepare the change and never make it"
+                .into(),
+        ));
+    }
+    if request.reason.trim().is_empty() {
+        return Err(StoreError::refused(
+            RefusalReason::ReasonRequired,
+            "the agents' guard is set with a reason",
+        ));
+    }
+    if !request.agent_orders_demo_only {
+        return Err(StoreError::Invalid(
+            "the agents' guard cannot be turned off in this version: agents may place orders \
+             on demo connections only (W11.38)"
+                .into(),
+        ));
+    }
+    let plan = Plan::new(
+        "agent-orders-demo-only-set",
+        ctx.actor(),
+        vec![Act::AgentOrdersDemoOnlySet { on: true }],
+    )
+    .reason(&request.reason);
+    made_without_records(book, head, ctx, plan)
+}
+
+/// Whether the guard refuses the act (contract v26, W11.8, W11.23): an
+/// agent's, on a connection the sidecar did not stamp demo, while the guard
+/// is on.
+pub fn agent_live_refused(ctx: &Context) -> bool {
+    ctx.agent_orders_demo_only.unwrap_or(true) && ctx.agents() && !ctx.connectivity_demo
 }
 
 /// An entry of the control partition changing no record row but the
