@@ -491,18 +491,18 @@ impl Platform {
         Ok(response)
     }
 
-    /// W3.24 (contract v24): the template catalogue, only versions after
-    /// `after_version` where one is held. Nothing of the deployment is sent.
+    /// W3.24 (contract v24): the template catalogue. `None` asks for the
+    /// whole of it, with no subject and no `after_version`; `Some` asks one
+    /// template's versions after the highest held, beside its subject by
+    /// the contract's name `template_id`, as W3.16's calendar pull is (ruled
+    /// 2026-10-14): a version belongs to its template, so an `after_version`
+    /// is never sent alone. Nothing of the deployment is sent.
     pub async fn pull_templates(
         &self,
-        after_version: i64,
+        after: Option<(&str, i64)>,
         now_ns: i64,
     ) -> Result<Vec<SecurityTemplate>, PlatformError> {
-        let path = if after_version > 0 {
-            format!("/api/v1/reference/templates?after_version={after_version}")
-        } else {
-            "/api/v1/reference/templates".to_string()
-        };
+        let path = templates_path(after);
         let response = self.v24_call(Method::Get, &path, None, now_ns).await?;
         let value = json_of(&response)?;
         templates_from_json(&value).map_err(PlatformError::Malformed)
@@ -912,6 +912,19 @@ fn registry_json(response: &Response) -> Result<serde_json::Value, String> {
         ));
     }
     value.ok_or_else(|| "the platform's answer is not JSON".to_string())
+}
+
+/// The catalogue's path: the whole of it, or one template's versions after
+/// the highest held, its subject named beside `after_version`.
+pub(crate) fn templates_path(after: Option<(&str, i64)>) -> String {
+    match after {
+        Some((template_id, after_version)) if !template_id.trim().is_empty() => format!(
+            "/api/v1/reference/templates?template_id={}&after_version={}",
+            encode(template_id.trim()),
+            after_version.max(0)
+        ),
+        _ => "/api/v1/reference/templates".to_string(),
+    }
 }
 
 fn json_of(response: &Response) -> Result<serde_json::Value, PlatformError> {

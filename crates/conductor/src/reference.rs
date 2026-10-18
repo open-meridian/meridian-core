@@ -3,8 +3,11 @@
 //!
 //! On start, daily, and -- the platform not reached -- every few minutes
 //! until it is, which is how a reconnect is noticed: the licence list, the
-//! template catalogue's versions after the highest seen, and the
-//! replacement feed after the last sequence read. Each is handed to the
+//! template catalogue, and the
+//! replacement feed after the last sequence read. The catalogue is asked
+//! whole (no subject, no `after_version`) to find templates not yet held,
+//! and each template held is asked for its versions after the highest seen
+//! by its `template_id` (W3.24, ruled 2026-10-14). Each is handed to the
 //! store on the bus as it came; the conductor writes into no other
 //! component's store (decisions/011). A platform without v24's routes is
 //! unreachable ([`crate::platform::Platform::pull_licence_list`] and the
@@ -16,12 +19,14 @@
 //! and no `open_meridian_local`. Until a list is read, the open schemes the
 //! contract names.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use meridian_bus::Bus;
 use meridian_domain::v1::{
-    Identifier as PbIdentifier, LicenceList, LicencePace, PullReplacementsReply, PullTemplatesReply,
+    Identifier as PbIdentifier, LicenceList, LicencePace, PullReplacementsReply,
+    PullTemplatesReply, SecurityTemplate,
 };
 use prost::Message;
 
@@ -95,9 +100,10 @@ pub struct ReferencePuller {
     platform: Arc<Platform>,
     clock: Arc<dyn meridian_clock::Clock>,
     licence: Licence,
-    /// The highest template version and feed sequence seen by this process:
-    /// the store keeps its own and passes over what it holds.
-    highest_template: Mutex<i64>,
+    /// The highest version of each template, by its ID, and the feed
+    /// sequence, seen by this process: the store keeps its own and passes
+    /// over what it holds.
+    highest_template: Mutex<BTreeMap<String, i64>>,
     feed_cursor: Mutex<i64>,
 }
 
@@ -113,7 +119,7 @@ impl ReferencePuller {
             platform,
             clock,
             licence,
-            highest_template: Mutex::new(0),
+            highest_template: Mutex::new(BTreeMap::new()),
             feed_cursor: Mutex::new(0),
         }
     }
@@ -132,16 +138,14 @@ impl ReferencePuller {
             list.encode_to_vec(),
         );
 
-        let after = self.highest_template.lock().map(|held| *held).unwrap_or(0);
-        let templates = self.platform.pull_templates(after, now).await?;
+        let templates = self.pull_templates(now).await?;
         if !templates.is_empty() {
-            let highest = templates
-                .iter()
-                .filter_map(|template| template.template_version.trim().parse::<i64>().ok())
-                .max()
-                .unwrap_or(0);
             if let Ok(mut held) = self.highest_template.lock() {
-                *held = (*held).max(highest);
+                for template in &templates {
+                    let version = version_of(template);
+                    let highest = held.entry(template.template_id.clone()).or_insert(0);
+                    *highest = (*highest).max(version);
+                }
             }
             self.publish(
                 TEMPLATES_PULLED,
@@ -177,6 +181,45 @@ impl ReferencePuller {
         Ok(())
     }
 
+    /// W3.24: each template held asked for its versions after the highest
+    /// seen, by its `template_id`; then the catalogue asked whole, for the
+    /// templates not held yet. An answer with nothing newer is no failure;
+    /// the platform away ends the round, to be tried again. A template the
+    /// platform refuses to answer for is said and passed over, the others
+    /// still asked.
+    async fn pull_templates(&self, now: i64) -> Result<Vec<SecurityTemplate>, PlatformError> {
+        let held: BTreeMap<String, i64> = self
+            .highest_template
+            .lock()
+            .map(|held| held.clone())
+            .unwrap_or_default();
+        let mut newer: Vec<SecurityTemplate> = Vec::new();
+        for (template_id, after) in &held {
+            match self
+                .platform
+                .pull_templates(Some((template_id, *after)), now)
+                .await
+            {
+                Ok(found) => newer.extend(
+                    found
+                        .into_iter()
+                        .filter(|t| t.template_id == *template_id && version_of(t) > *after),
+                ),
+                Err(failed) if failed.is_outage() => return Err(failed),
+                Err(failed) => {
+                    tracing::warn!(%failed, template_id, "a template's newer versions were not answered")
+                }
+            }
+        }
+        let whole = self.platform.pull_templates(None, now).await?;
+        newer.extend(
+            whole
+                .into_iter()
+                .filter(|t| !held.contains_key(&t.template_id)),
+        );
+        Ok(newer)
+    }
+
     fn publish(&self, topic: &str, kind: &str, payload: Vec<u8>) {
         if let Err(failed) = self.bus.publish(topic, kind, payload, None, None) {
             tracing::warn!(%failed, topic, "what the platform published could not be handed on; pulled again later");
@@ -194,7 +237,7 @@ impl ReferencePuller {
                 Ok(()) if rounds == 0 => {
                     rounds += 1;
                     if let Ok(mut held) = self.highest_template.lock() {
-                        *held = 0;
+                        held.clear();
                     }
                     if let Ok(mut held) = self.feed_cursor.lock() {
                         *held = 0;
@@ -210,6 +253,11 @@ impl ReferencePuller {
             tokio::time::sleep(wait).await;
         }
     }
+}
+
+/// A template's version as a number; 0 where it does not read.
+fn version_of(template: &SecurityTemplate) -> i64 {
+    template.template_version.trim().parse().unwrap_or(0)
 }
 
 /// The list a deployment sends by before any is read, for a page to show.
@@ -277,6 +325,125 @@ mod tests {
             &serde_json::json!({"templates": [{"template_id": "TPL-x", "asset_class": "bond"}]})
         )
         .is_err());
+    }
+
+    fn template(id: &str, version: &str) -> serde_json::Value {
+        serde_json::json!({"template_id": id, "template_version": version, "name": id,
+                           "asset_class": "equity", "base": false})
+    }
+
+    fn answer(
+        body: serde_json::Value,
+    ) -> Result<crate::platform::Response, crate::platform::TransportFailure> {
+        Ok(crate::platform::tests::reply(200, &body.to_string()))
+    }
+
+    /// The fixture's "a refresh after the highest version held" (W3.24,
+    /// ruled 2026-10-14): the first pull asks the whole catalogue; a refresh
+    /// asks each template held after its highest version by its
+    /// template_id, an answer with nothing newer no failure, and the whole
+    /// catalogue again only for templates not held. No after_version ever
+    /// travels without its subject.
+    #[tokio::test]
+    async fn a_refresh_asks_each_template_after_its_highest_and_never_a_bare_after_version() {
+        const NOW: i64 = 1_792_300_000_000_000_000;
+        let licence = serde_json::json!({"version": "3", "schemes": ["figi"],
+                                         "pace": {"batch_size": 100, "batches_per_minute": 6}});
+        let none = serde_json::json!({"entries": []});
+        let fake = crate::platform::tests::Fake::new(vec![
+            // The first round: the list, the whole catalogue, the feed.
+            answer(licence.clone()),
+            answer(
+                serde_json::json!({"templates": [template("TPL-equity", "1"), template("TPL-equity-base", "1")]}),
+            ),
+            answer(none.clone()),
+            // The refresh: the list, each template held, the whole, the feed.
+            answer(licence),
+            answer(serde_json::json!({"templates": [template("TPL-equity", "2")]})),
+            answer(serde_json::json!({"templates": []})),
+            answer(serde_json::json!({"templates": [
+                template("TPL-equity", "1"), template("TPL-equity", "2"),
+                template("TPL-equity-base", "1"), template("TPL-fund", "1")]})),
+            answer(none),
+        ]);
+        let clock = Arc::new(meridian_clock::ManualClock::at(NOW));
+        let bus = Arc::new(Bus::single(
+            "conductor-1",
+            Arc::new(meridian_bus::MemoryBackend::new()),
+            clock.clone(),
+        ));
+        let puller = ReferencePuller::new(
+            Arc::clone(&bus),
+            Arc::new(crate::platform::tests::platform(fake.clone())),
+            clock,
+            Licence::default(),
+        );
+        let mut pulled = bus.subscribe_every(TEMPLATES_PULLED);
+        let handed = |delivery: meridian_bus::Delivery| {
+            PullTemplatesReply::decode(&delivery.envelope.payload[..])
+                .unwrap()
+                .templates
+                .iter()
+                .map(|t| format!("{} {}", t.template_id, t.template_version))
+                .collect::<Vec<_>>()
+        };
+        puller.pull_once().await.unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(2), pulled.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(handed(first), vec!["TPL-equity 1", "TPL-equity-base 1"]);
+        puller.pull_once().await.unwrap();
+        let refreshed = tokio::time::timeout(Duration::from_secs(2), pulled.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(handed(refreshed), vec!["TPL-equity 2", "TPL-fund 1"]);
+        let urls = fake.urls();
+        let templates: Vec<&String> = urls
+            .iter()
+            .filter(|u| u.contains("/reference/templates"))
+            .collect();
+        assert!(
+            templates[0].ends_with("/api/v1/reference/templates"),
+            "{templates:?}"
+        );
+        assert!(
+            templates[1]
+                .ends_with("/api/v1/reference/templates?template_id=TPL-equity&after_version=1"),
+            "{templates:?}"
+        );
+        assert!(
+            templates[2].ends_with("?template_id=TPL-equity-base&after_version=1"),
+            "{templates:?}"
+        );
+        assert!(
+            templates[3].ends_with("/api/v1/reference/templates"),
+            "{templates:?}"
+        );
+        for url in &urls {
+            assert!(
+                !url.contains("after_version") || url.contains("template_id="),
+                "an after_version sent without its subject: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_catalogues_path_never_carries_a_bare_after_version() {
+        assert_eq!(
+            crate::platform::templates_path(None),
+            "/api/v1/reference/templates"
+        );
+        assert_eq!(
+            crate::platform::templates_path(Some(("", 4))),
+            "/api/v1/reference/templates",
+            "no subject, no after_version"
+        );
+        assert_eq!(
+            crate::platform::templates_path(Some(("TPL-a b", 4))),
+            "/api/v1/reference/templates?template_id=TPL-a%20b&after_version=4"
+        );
     }
 
     #[test]

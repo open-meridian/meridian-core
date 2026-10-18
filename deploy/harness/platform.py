@@ -645,9 +645,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not V24:
                 return self.answer(404, {"detail": "Not Found"})
             if url.path.endswith("/templates"):
+                # As the platform: after_version only beside a subject
+                # (template_id or asset_class; W3.24, ruled 2026-10-14).
+                template_id, asset_class = one("template_id"), one("asset_class")
+                if one("after_version") and not (template_id or asset_class):
+                    return self.answer(400, {"detail": "after_version needs a subject: "
+                                             "name template_id or asset_class"})
                 after = int(one("after_version") or 0)
-                return self.answer(200, {"templates": [t for t in TEMPLATES
-                                                       if int(t["template_version"]) > after]})
+                return self.answer(200, {"templates": [
+                    t for t in TEMPLATES
+                    if int(t["template_version"]) > after
+                    and (not template_id or t["template_id"] == template_id)
+                    and (not asset_class or t.get("asset_class") == asset_class)]})
             if url.path.endswith("/licence-list"):
                 return self.answer(200, {**LICENCE, "version": str(LICENCE["version"])})
             after = int(one("after_sequence") or 0)
