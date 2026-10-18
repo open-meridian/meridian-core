@@ -11,8 +11,11 @@
 //! plugin reads or hears changes, the journal stays the record (decisions/031),
 //! and a snapshot plus its tail is exactly what a full replay makes, which
 //! [`tests::a_snapshot_and_its_tail_are_the_full_replay`] and the store's
-//! property tests hold it to. A snapshot is derived: rebuilt from the journal
-//! whenever it is missing, unreadable or of another [`FORMAT`], never edited.
+//! property tests hold it to. A snapshot is derived, never the record: taken
+//! when a command's replay reaches the interval, and from v26 when a read
+//! replays past it and at the book's start for an account past it with none
+//! of this [`FORMAT`] (an upgraded or a quiet account's); one unreadable or of
+//! another format is passed over until then.
 //!
 //! Kept as JSON, every record the contract's own type in its protobuf
 //! encoding, as an entry is (crate::journal), so the book defines no second

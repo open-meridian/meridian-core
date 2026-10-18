@@ -111,6 +111,58 @@ impl PostgresStore {
         self.pool.get().map_err(unavailable)
     }
 
+    /// The start-up's snapshots (v26's core; W9.10's note "when a snapshot
+    /// is taken", decided 2026-10-18): every account -- `only` that one --
+    /// whose journal since its latest snapshot of this format reaches the
+    /// interval, an upgraded account's included, its book kept as at its
+    /// latest entry, each in its own transaction under its partition's lock.
+    /// Says how many were kept.
+    pub fn backfill_snapshots(&self, only: Option<&str>) -> Result<usize> {
+        let due: Vec<(String, String)> = self
+            .conn()?
+            .query(
+                "SELECT a.account_id, a.partition FROM book_account a
+                   LEFT JOIN LATERAL (
+                        SELECT s.last_sequence FROM book_snapshot s
+                          JOIN book_entry e
+                            ON e.entry_id = s.last_entry_id AND e.first_sequence = s.last_sequence
+                           AND e.account_id = s.account_id
+                         WHERE s.account_id = a.account_id AND s.format = $1
+                         ORDER BY s.last_sequence DESC LIMIT 1) s ON true
+                  WHERE ($3::text IS NULL OR a.account_id = $3)
+                    AND (SELECT count(*) FROM book_entry e
+                          WHERE e.account_id = a.account_id
+                            AND e.first_sequence > COALESCE(s.last_sequence, -1)) >= $2
+                  ORDER BY a.account_id COLLATE \"C\"",
+                &[
+                    &crate::snapshot::FORMAT,
+                    &(self.snapshot_interval as i64),
+                    &only,
+                ],
+            )
+            .map_err(unavailable)?
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        let mut kept = 0;
+        for (account, partition) in due {
+            let mut conn = self.conn()?;
+            let mut tx = conn.transaction().map_err(unavailable)?;
+            tx.execute(
+                "SELECT pg_advisory_xact_lock($1)",
+                &[&partition_lock(&partition)],
+            )
+            .map_err(unavailable)?;
+            let (book, replayed) = book_from(&mut tx, &account, &partition)?;
+            if replayed.entries as u64 >= self.snapshot_interval {
+                keep_snapshot(&mut tx, &book, replayed.last_committed_at_ns)?;
+                kept += 1;
+            }
+            tx.commit().map_err(unavailable)?;
+        }
+        Ok(kept)
+    }
+
     /// A read's transaction: every record and the heads as of one snapshot.
     fn reading<T>(&self, read: impl FnOnce(&mut Transaction<'_>) -> Result<T>) -> Result<T> {
         let mut conn = self.conn()?;
@@ -223,27 +275,65 @@ fn snapshot_of(
     Ok(None)
 }
 
+/// What a build of an account's book replayed: how many entries, and the
+/// deployment's time of the last, which a snapshot made of it is taken at.
+#[derive(Debug, Clone, Copy, Default)]
+struct Replayed {
+    entries: usize,
+    last_committed_at_ns: i64,
+}
+
+impl Replayed {
+    fn of(entries: &[Entry]) -> Replayed {
+        Replayed {
+            entries: entries.len(),
+            last_committed_at_ns: entries
+                .last()
+                .map(|entry| entry.cause.committed_at_ns)
+                .unwrap_or_default(),
+        }
+    }
+}
+
 /// An account's book now: its latest snapshot and the journal's tail, or the
-/// whole journal; and how many entries were replayed for it.
+/// whole journal; and what was replayed for it.
 fn book_from(
     client: &mut impl GenericClient,
     account_id: &str,
     partition: &str,
-) -> Result<(Book, usize)> {
+) -> Result<(Book, Replayed)> {
     match snapshot_of(client, account_id, None, None)? {
         Some(kept) => {
             let tail = journal_after(client, account_id, crate::snapshot::last_sequence(&kept))?;
-            let replayed = tail.len();
-            Ok((crate::snapshot::resume(kept, &tail)?, replayed))
+            Ok((crate::snapshot::resume(kept, &tail)?, Replayed::of(&tail)))
         }
         None => {
             let entries = journal_of(client, account_id)?;
-            let replayed = entries.len();
+            let replayed = Replayed::of(&entries);
             Ok((
                 Book::replay_lean(account_id, partition, &entries)?,
                 replayed,
             ))
         }
+    }
+}
+
+/// A read's snapshot (v26's core; W9.10's note "when a snapshot is taken",
+/// decided 2026-10-18): a book a read built by replaying past the interval
+/// is kept as at its latest entry, so a quiet account -- one no command
+/// writes to -- is not replayed whole on every read. A failure to keep it is
+/// logged and the read answered: a snapshot is derived, never the record.
+fn keep_read_snapshot(
+    client: &mut impl GenericClient,
+    book: &Book,
+    replayed: Replayed,
+    interval: u64,
+) {
+    if (replayed.entries as u64) < interval {
+        return;
+    }
+    if let Err(failed) = keep_snapshot(client, book, replayed.last_committed_at_ns) {
+        tracing::warn!(account = book.account_id, %failed, "a read's snapshot was not kept");
     }
 }
 
@@ -270,7 +360,10 @@ fn bodies_of(
 }
 
 /// Keep a snapshot of an account's book as at its latest entry, and drop all
-/// but the latest few (W9.10).
+/// but the latest few (W9.10). One already kept as at the same entry is made
+/// again: of an older format (an upgraded account's, contract v26) or
+/// unreadable, it would otherwise stand in the new one's place and be passed
+/// over on every read.
 fn keep_snapshot(client: &mut impl GenericClient, book: &Book, taken_at_ns: i64) -> Result<()> {
     let Some(last) = book.entries.last() else {
         return Ok(());
@@ -280,7 +373,11 @@ fn keep_snapshot(client: &mut impl GenericClient, book: &Book, taken_at_ns: i64)
             "INSERT INTO book_snapshot (account_id, last_sequence, last_entry_id, entries,
                                         latest_effective_date, format, taken_at_ns, snapshot)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-             ON CONFLICT (account_id, last_sequence) DO NOTHING",
+             ON CONFLICT (account_id, last_sequence) DO UPDATE
+                SET last_entry_id = EXCLUDED.last_entry_id, entries = EXCLUDED.entries,
+                    latest_effective_date = EXCLUDED.latest_effective_date,
+                    format = EXCLUDED.format, taken_at_ns = EXCLUDED.taken_at_ns,
+                    snapshot = EXCLUDED.snapshot",
             &[
                 &book.account_id,
                 &(last.first.sequence as i64),
@@ -1058,7 +1155,7 @@ impl Store for PostgresStore {
         )?;
         // A snapshot once the tail since the last one reaches the interval,
         // as at this entry, in the same transaction.
-        if replayed as u64 + 1 >= self.snapshot_interval {
+        if replayed.entries as u64 + 1 >= self.snapshot_interval {
             keep_snapshot(&mut tx, &decided.book, entry.cause.committed_at_ns)?;
         }
         tx.commit().map_err(unavailable)?;
@@ -1122,7 +1219,9 @@ impl Store for PostgresStore {
             .map_err(unavailable)?
             .map(|row| row.get(0))
             .unwrap_or_else(|| first_partition_of(account_id).to_string());
-        Ok(book_from(&mut *conn, account_id, &partition)?.0)
+        let (book, replayed) = book_from(&mut *conn, account_id, &partition)?;
+        keep_read_snapshot(&mut *conn, &book, replayed, self.snapshot_interval);
+        Ok(book)
     }
 
     fn book_as_of(&self, account_id: &str, at: &Mark, until: Option<&str>) -> Result<Book> {
@@ -1136,17 +1235,30 @@ impl Store for PostgresStore {
             .map(|row| row.get(0))
             .unwrap_or_else(|| FIRST_PARTITION.to_string());
         let at = at.get(&partition).copied().unwrap_or(0);
-        match snapshot_of(&mut *conn, account_id, Some(at), until)? {
+        let (book, entries) = match snapshot_of(&mut *conn, account_id, Some(at), until)? {
             Some(kept) => {
                 let after = crate::snapshot::last_sequence(&kept);
                 let tail = journal_after(&mut *conn, account_id, after)?;
-                kept.resume_as_of(&tail, Some(at), until)
+                (kept.resume_as_of(&tail, Some(at), until)?, tail)
             }
             None => {
                 let entries = journal_of(&mut *conn, account_id)?;
-                Book::as_of(account_id, &partition, &entries, Some(at), until)
+                let book = Book::as_of(account_id, &partition, &entries, Some(at), until)?;
+                (book, entries)
             }
+        };
+        // A read that reached the journal's end with no date is the book
+        // now, kept as a read's snapshot where it replayed past the interval
+        // (v26's core).
+        if until.is_none() && entries.last().is_none_or(|last| last.first_sequence <= at) {
+            keep_read_snapshot(
+                &mut *conn,
+                &book,
+                Replayed::of(&entries),
+                self.snapshot_interval,
+            );
         }
+        Ok(book)
     }
 
     fn accounts(&self) -> Result<Vec<String>> {

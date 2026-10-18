@@ -1,8 +1,13 @@
 -- An account's projection kept as at one entry (W9.10, contract v25): the
 -- book starts a command or a dated read from the latest snapshot at or
 -- before the entry it needs and replays the journal's tail. Core's own and no
--- record kind: derived from the journal, never edited, and rebuilt whenever
--- missing or of another format; `meridian-bor rebuild` makes them again.
+-- record kind: derived from the journal, never the record. Taken when a
+-- command's replay reaches the interval; from v26 also when a read replays
+-- past it, and at the book's start for every account past it with none of the
+-- current format (an upgraded account's). One of another format, or that does
+-- not read, is passed over -- the book replays from an older one, or the
+-- first entry -- until one is taken, which replaces it where both are as at
+-- the same entry. `meridian-bor rebuild` makes them again.
 --
 -- `last_sequence` and `last_entry_id` name the latest entry the snapshot
 -- holds (a snapshot whose entry the journal no longer has there is stale and

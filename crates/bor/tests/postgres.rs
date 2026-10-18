@@ -1151,3 +1151,106 @@ async fn a_snapshot_and_its_tail_answer_as_the_whole_journal_does() {
     let health = blocking(|| store.book_health(Some(&account), "", 10)).unwrap();
     assert_eq!(health[0].entries_since_snapshot, 0, "{health:?}");
 }
+
+/// v26's core (W9.10's note "when a snapshot is taken", decided 2026-10-18,
+/// found on the development deployment): an account no command writes to,
+/// or one whose snapshots are of an older format, is not replayed whole on
+/// every read. The start's backfill keeps a snapshot for one past the
+/// interval with none of this format, and a read replaying past it keeps
+/// one too, replacing an older format's as at the same entry.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_quiet_or_upgraded_account_is_snapshotted_at_start_and_by_a_read() {
+    let _alone = REBUILDS.lock().await;
+    let store = blocking(|| {
+        let store = PostgresStore::connect(&url(), 8)
+            .expect("could not reach the test database")
+            .with_snapshot_interval(3);
+        store.migrate(&meridian_clock::SystemClock).unwrap();
+        Arc::new(store)
+    });
+    let (bus, store) = wired_with(store);
+    let account = unique("ACC");
+    open(&bus, &account, "INS-AAPL").await;
+    for day in 9..=13 {
+        send(
+            &bus,
+            RECORD_BREAK,
+            &RecordBreakRequest {
+                account_id: account.clone(),
+                subject: Some(record_break_request::Subject::Position(PositionKey {
+                    instrument_id: "INS-AAPL".into(),
+                    side: HoldingSide::Long as i32,
+                })),
+                category: BreakCategory::TradeDateQuantity as i32,
+                differences: vec![BreakDifference {
+                    field: "trade_date_quantity".into(),
+                    book: None,
+                    street: None,
+                }],
+                business_date: format!("2026-09-{day:02}"),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    let client = || postgres::Client::connect(&url(), postgres::NoTls).unwrap();
+    let journal = blocking(|| store.journal(&account)).unwrap();
+    assert_eq!(journal.len(), 6);
+    let whole = meridian_bor::Book::replay(&account, &journal[0].partition, &journal).unwrap();
+    // As an upgraded account's: every snapshot of an older format.
+    let age = || {
+        blocking(|| {
+            client()
+                .execute(
+                    "UPDATE book_snapshot SET format = 1 WHERE account_id = $1",
+                    &[&account],
+                )
+                .unwrap()
+        })
+    };
+    let since =
+        || blocking(|| store.book_health(Some(&account), "", 1)).unwrap()[0].entries_since_snapshot;
+    let latest = || -> (i32, Vec<u8>) {
+        blocking(|| {
+            let row = client()
+                .query_one(
+                    "SELECT format, snapshot FROM book_snapshot WHERE account_id = $1
+                      ORDER BY last_sequence DESC LIMIT 1",
+                    &[&account],
+                )
+                .unwrap();
+            (row.get(0), row.get(1))
+        })
+    };
+    age();
+    assert_eq!(since(), 6, "none of this format");
+    // The start's backfill.
+    assert_eq!(
+        blocking(|| store.backfill_snapshots(Some(&account))).unwrap(),
+        1
+    );
+    assert_eq!(since(), 0);
+    let (format, bytes) = latest();
+    assert_eq!(format, meridian_bor::snapshot::FORMAT);
+    assert_eq!(meridian_bor::snapshot::decode(&bytes).unwrap(), whole);
+    // Nothing due again.
+    assert_eq!(
+        blocking(|| store.backfill_snapshots(Some(&account))).unwrap(),
+        0
+    );
+    // A read replaying past the interval keeps one, replacing the older
+    // format's kept as at the same entry.
+    age();
+    assert_eq!(since(), 6);
+    assert_eq!(blocking(|| store.book(&account)).unwrap(), whole);
+    assert_eq!(since(), 0);
+    assert_eq!(latest().0, meridian_bor::snapshot::FORMAT);
+    // And a read of the book now by a watermark, with no date, the same.
+    age();
+    let heads = blocking(|| store.heads()).unwrap();
+    let read = blocking(|| store.book_as_of(&account, &heads, None)).unwrap();
+    assert_eq!(read, whole);
+    assert_eq!(since(), 0);
+}

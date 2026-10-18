@@ -92,7 +92,7 @@ fn run() -> Result<(), String> {
     }
 
     let ready = Ready::from_env();
-    let store: Arc<dyn meridian_bor::Store> = Arc::new(wait_for_store(
+    let postgres: Arc<PostgresStore> = Arc::new(wait_for_store(
         "the book's database",
         &url,
         |url| {
@@ -107,6 +107,7 @@ fn run() -> Result<(), String> {
             })
         },
     )?);
+    let store: Arc<dyn meridian_bor::Store> = postgres.clone();
 
     let instance_id = var("MERIDIAN_INSTANCE_ID").unwrap_or_else(|| "bor-1".into());
 
@@ -114,6 +115,14 @@ fn run() -> Result<(), String> {
         let bus = bus_from_env(&instance_id).await?;
 
         meridian_bor::service::serve(bus.clone(), Arc::clone(&store), clock());
+        // The start's snapshots (v26; W9.10): every account whose journal
+        // since its latest snapshot of this format reaches the interval --
+        // a quiet one, or one upgraded from an older format -- kept now, off
+        // the runtime's threads, while the book serves.
+        tokio::task::spawn_blocking(move || match postgres.backfill_snapshots(None) {
+            Ok(kept) => tracing::info!(kept, "the book's snapshots are taken where due"),
+            Err(failed) => tracing::warn!(%failed, "the book's start-up snapshots stopped"),
+        });
         // Each currency's cash instrument (contract v18): the codes held
         // before resolved once and said to be filled in.
         // Read from the store, which blocks: off the runtime's own threads.
