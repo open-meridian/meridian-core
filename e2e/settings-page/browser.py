@@ -1058,8 +1058,8 @@ def the_documentation_pages(browser, prefix):
                           f"{name} at {size} is under the documentation's policy: {policy}")
                     check(page.locator("article.docs-vendor script, article.docs-vendor img").count() == 0,
                           f"{name} at {size} draws no script or image of the vendor's")
-                    check("Naming a plugin here is not an endorsement" in page.content(),
-                          f"{name} at {size} carries the supervision notice")
+                    check("not an endorsement" not in page.content(),
+                          f"{name} at {size} carries no notice (ruling 274)")
                 m = page.evaluate(MEASURE)
                 measured(page, f"{name} at {size}, {scheme}", f"v25-{prefix}-{name}-{size}-{scheme}.png")
                 check(m["tall"] <= 0, f"{name} at {size}, {scheme} fits one screen: {m['tall']}px taller")
@@ -1070,9 +1070,10 @@ def the_documentation_pages(browser, prefix):
 def the_registry_pages(browser, prefix):
     """Contract v25 (W8.10 to W8.12, W5.19): the Plugins page's Installed,
     Browse and Registries tabs, a listing's Overview, Documentation and
-    Versions, and the install, update and keep-or-stop sheets -- the install
-    and update sheets' notice their own first step (ruling 194) -- each on one
-    screen at the three sizes, in light and dark, with no sideways scroll."""
+    Versions, a plugin's Versions (ruling 305), and the install, update and
+    keep-or-stop sheets -- the install and update sheets the form at once,
+    with one line linking the Terms (ruling 274) -- each on one screen at the
+    three sizes, in light and dark, with no sideways scroll."""
     plugins = f"{BASE}/admin/plugins/versions?tab="
     listing = f"{BASE}/admin/plugins/registry/open-meridian/fx?tab="
     pages = [
@@ -1082,11 +1083,10 @@ def the_registry_pages(browser, prefix):
         ("listing-overview", listing + "overview", "open-meridian/fx"),
         ("listing-documentation", listing + "documentation", "open-meridian/fx"),
         ("listing-versions", listing + "versions", "1.5.0"),
-        # Ruling 194: the notice whole as each sheet's first step, then the form.
-        ("install-notice", f"{BASE}/admin/plugins/registry/open-meridian/fx/install?version=1.5.0", "Continue"),
-        ("install-sheet", f"{BASE}/admin/plugins/registry/open-meridian/fx/install?version=1.5.0&step=form", "1.5.0"),
-        ("update-notice", f"{BASE}/admin/plugins/registry/update?instance=fx-1&version=1.5.0", "Continue"),
-        ("update-sheet", f"{BASE}/admin/plugins/registry/update?instance=fx-1&version=1.5.0&step=form", "operations"),
+        ("plugin-versions", f"{BASE}/admin/plugins/versions/open-meridian%2Ffx", "Version"),
+        # Ruling 274: each sheet the form at once, its one line the Terms'.
+        ("install-sheet", f"{BASE}/admin/plugins/registry/open-meridian/fx/install?version=1.5.0", "1.5.0"),
+        ("update-sheet", f"{BASE}/admin/plugins/registry/update?instance=fx-1&version=1.5.0", "operations"),
         ("keep-or-stop-sheet", f"{BASE}/admin/plugins/registry/acknowledge?instance=fx-1", "fx-1"),
     ]
     for scheme in ("light", "dark"):
@@ -1100,19 +1100,26 @@ def the_registry_pages(browser, prefix):
                 settled(page)
                 text = page.evaluate("() => document.body.textContent")
                 check(says in text, f"{name} at {size}, {scheme} says {says!r}")
-                if name in ("installed", "browse", "listing-overview", "install-sheet"):
-                    check("Naming a plugin here is not an endorsement" in text,
-                          f"{name} at {size}, {scheme} carries the supervision notice")
-                if name.endswith("-notice"):
-                    whole = page.locator("section.notice-step section.notice.supervision")
-                    check(whole.count() == 1 and whole.is_visible()
-                          and "Whoever installs one carries its risk." in whole.inner_text(),
-                          f"{name} at {size}, {scheme} shows the notice whole, not folded")
-                    check(page.locator("form.sheet-act").count() == 0,
-                          f"{name} at {size}, {scheme} has no form before Continue")
+                check("not an endorsement" not in text and "nsupervised" not in text,
+                      f"{name} at {size}, {scheme} carries no notice (ruling 274)")
+                if name.endswith("-sheet") and name != "keep-or-stop-sheet":
+                    line = page.locator("[data-terms-line] a[href='https://open-meridian.com/terms#plugins-and-registries']")
+                    check(line.count() == 1 and line.is_visible(),
+                          f"{name} at {size}, {scheme} keeps the one line linking the Terms")
+                if name in ("installed", "browse"):
+                    check(page.locator("form.filter-bar input[type=search]").count() == 1,
+                          f"{name} at {size}, {scheme} has one search box")
+                    bar = page.evaluate("""() => { const f = document.querySelector('form.filter-bar');
+                        const tops = [...f.children].map(c => Math.round(c.getBoundingClientRect().top));
+                        return new Set(tops).size; }""")
+                    check(bar == 1 if width >= 640 else bar <= 3,
+                          f"{name} at {size}, {scheme} draws its filter bar on {bar} line(s)")
                 if name == "installed":
                     check(page.locator("[data-pulled]").count() == 1,
-                          f"at {size}, {scheme} the pulled version's instance is warned")
+                          f"at {size}, {scheme} the pulled version's plugin is warned")
+                if name == "plugin-versions":
+                    check(page.locator("[data-pulled]").count() >= 1,
+                          f"at {size}, {scheme} the pulled version is warned on its row")
                     check("keys as of 2026-10-14" in text,
                           f"at {size}, {scheme} a bundle's version shows its key status's age")
                 m = page.evaluate(MEASURE)

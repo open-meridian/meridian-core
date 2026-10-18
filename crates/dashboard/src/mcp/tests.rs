@@ -2846,10 +2846,7 @@ async fn a_reader_reads_the_documentation_marked_as_the_vendors_and_the_summary_
         .as_str()
         .unwrap()
         .starts_with("withheld"));
-    assert!(data["notice"]
-        .as_str()
-        .unwrap()
-        .contains("Local and community plugins are unsupervised."));
+    assert!(data.get("notice").is_none(), "{said}");
     assert_eq!(
         data["page"],
         format!("/plugins/{INSTANCE}?tab=documentation")
@@ -2969,16 +2966,15 @@ async fn the_registries_tools_read_for_a_deployment_admin_and_act_once_loosened(
     )
     .await;
     let data = &structured(&said)["data"];
-    assert!(data["notice"]
-        .as_str()
-        .unwrap()
-        .contains("Local and community plugins are unsupervised."));
-    assert_eq!(data["listings"][0]["listing"], "acme/ops", "{said}");
-    assert_eq!(data["listings"][0]["label"], "Community · Unsupervised");
+    assert!(data.get("notice").is_none(), "{said}");
     assert_eq!(
-        data["listings"][0]["installs"],
-        "Fewer than three deployments"
+        data["terms_url"],
+        "https://open-meridian.com/terms#plugins-and-registries"
     );
+    assert_eq!(data["listings"][0]["listing"], "acme/ops", "{said}");
+    assert_eq!(data["listings"][0]["label"], "Community");
+    assert_eq!(data["listings"][0]["reviewed"], false);
+    assert_eq!(data["listings"][0]["installs"], "<3");
     assert_eq!(data["listings"][0]["floor_served_here"], true);
     let (_, said, _) = rpc(
         &app,

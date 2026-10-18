@@ -7,11 +7,15 @@
 //! catalogue was last pulled with "Pull now", "Report plugin usage", and
 //! the reports sent -- and a listing's page (Overview, Documentation,
 //! Versions). Install, update and keep each open as a sheet of their own,
-//! the supervision notice first and the act at the foot.
+//! the act at the foot. From contract v26 (ruling 274) the registries are
+//! labelled Community, Verified and Local, and the install and update
+//! dialogs of a community or local version carry one line linking the
+//! Terms; no notice is drawn anywhere else. Installed is one row per plugin
+//! and each plugin has its Versions page (ruling 305, [`installed`]); every
+//! list orders versions by SemVer 2.0 precedence, newest first.
 //!
 //! Every page reads what the conductor keeps; the platform is never reached
-//! in a page's request but by "Pull now". Community is labelled
-//! "Unsupervised" wherever it appears.
+//! in a page's request but by "Pull now".
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -26,9 +30,9 @@ use meridian_bus::BusError;
 use meridian_domain::v1::{
     AcknowledgePullRequest, InstallPluginRequest, ListPluginUsageReportsReply,
     ListPluginUsageReportsRequest, ListRegistryPluginsReply, ListRegistryPluginsRequest,
-    ListedVersion, PluginCatalogue, PluginLaunch, PluginLaunchState, PluginListing, PluginPull,
-    PluginVersion, PullAcknowledgement, PullReasonKind, ReportsPluginUsageSetting,
-    SetReportsPluginUsageRequest, UpdatePluginRequest,
+    ListedVersion, PluginLaunch, PluginLaunchState, PluginListing, PluginPull, PluginVersion,
+    PullAcknowledgement, PullReasonKind, ReportsPluginUsageSetting, SetReportsPluginUsageRequest,
+    UpdatePluginRequest,
 };
 use prost::Message;
 
@@ -57,9 +61,30 @@ pub fn listing_path(listing: &str) -> String {
     format!("/admin/plugins/registry/{listing}")
 }
 
+pub mod installed;
+
 pub fn routes() -> Router<Arc<App>> {
     Router::new()
         .route("/admin/plugins/versions", get(plugins_page))
+        // Ruling 305: a plugin's Versions, and its acts.
+        .route("/admin/plugins/versions/launch", post(installed::launch))
+        .route("/admin/plugins/versions/retire", post(installed::retire))
+        .route(
+            "/admin/plugins/versions/retire-these",
+            post(installed::retire_these),
+        )
+        .route(
+            "/admin/plugins/versions/{name}",
+            get(installed::versions_page),
+        )
+        .route(
+            "/admin/plugins/versions/{name}/launch",
+            get(installed::launch_sheet),
+        )
+        .route(
+            "/admin/plugins/versions/{name}/retire-these",
+            get(installed::retire_these_sheet),
+        )
         .route(
             "/admin/plugins/registry/{organisation}/{plugin}",
             get(listing_page),
@@ -117,7 +142,7 @@ pub async fn listings(
     request: ListRegistryPluginsRequest,
 ) -> Result<ListRegistryPluginsReply, String> {
     let wait = if request.pull_now { PULLING } else { READING };
-    ask(
+    let mut reply: ListRegistryPluginsReply = ask(
         app,
         subject,
         REGISTRY_PLUGINS,
@@ -125,7 +150,14 @@ pub async fn listings(
         request,
         wait,
     )
-    .await
+    .await?;
+    // Each listing's versions newest first, by SemVer 2.0 precedence.
+    for listing in &mut reply.listings {
+        listing
+            .versions
+            .sort_by(|a, b| installed::newest_first(&a.version, &b.version));
+    }
+    Ok(reply)
 }
 
 /// The Registries tab's reports, setting and catalogue age.
@@ -150,13 +182,22 @@ pub async fn reports(
 
 // ── The words ───────────────────────────────────────────────────────────
 
-/// A source registry's label; community labelled "Unsupervised" wherever
-/// it appears (the spec's requirement 52).
+/// A source registry's label (ruling 274): Community, Verified or Local.
 pub fn registry_label(registry: &str) -> &'static str {
     match registry {
-        "community" => "Community · Unsupervised",
+        "community" => "Community",
         "verified" => "Verified",
         _ => "Local",
+    }
+}
+
+/// The Terms' line, on a community or a local version's install and update
+/// dialogs alone (ruling 274); none for a verified one.
+fn terms_line(registry: &str) -> String {
+    if registry == "verified" {
+        String::new()
+    } else {
+        crate::notice::line()
     }
 }
 
@@ -173,7 +214,7 @@ pub fn installs(listing: &PluginListing) -> String {
     if listing.counts_shown {
         listing.installs.to_string()
     } else {
-        "Fewer than three deployments".into()
+        "<3".into()
     }
 }
 
@@ -360,7 +401,7 @@ async fn plugins_page(
     let body = match tab {
         "browse" => browse(&app, &session, &asked).await,
         "registries" => registries_tab(&app, &session, &asked).await,
-        _ => installed(&app, &session).await,
+        _ => installed::installed(&app, &session, &asked).await,
     };
     let page = format!(
         "<section class=\"admin-section plugins-page\"><div class=\"section-head\"><div><h1>Plugins</h1></div></div>\
@@ -375,98 +416,6 @@ async fn plugins_page(
         &chrome(&session, "Plugins"),
     ))
     .into_response()
-}
-
-async fn installed(app: &App, session: &Session) -> String {
-    let catalogue: PluginCatalogue = match crate::catalogue::catalogue(app).await {
-        Ok(catalogue) => catalogue,
-        Err(failed) => return error_line(&format!("The catalogue could not be read: {failed}")),
-    };
-    let listings = listings(
-        app,
-        &session.subject,
-        ListRegistryPluginsRequest {
-            page_size: 200,
-            ..Default::default()
-        },
-    )
-    .await
-    .map(|reply| reply.listings)
-    .unwrap_or_default();
-    let rows: Vec<String> = catalogue
-        .versions
-        .iter()
-        .map(|v| {
-            let m = v.metadata.clone().unwrap_or_default();
-            let state = if v.retired_at_ns > 0 { "retired" } else { "listed" };
-            let sections = m.declaration.as_ref().map_or(0, |d| d.documentation.len());
-            // Each instance it runs, with its update and its pull warning.
-            let instances: String = catalogue
-                .launches
-                .iter()
-                .filter(|l| l.state == PluginLaunchState::Launched as i32 && l.name == m.name && l.version == m.version)
-                .map(|launch| {
-                    let mut said = vec![format!("<code>{}</code>", escape(&launch.instance_id))];
-                    if let Some(newer) = update_for(v, &launch.version, &listings) {
-                        let wants = roles_of(newer);
-                        let href = format!(
-                            "/admin/plugins/registry/update?instance={}&version={}",
-                            escape(&launch.instance_id),
-                            escape(&newer.version)
-                        );
-                        said.push(format!(
-                            "<a class=\"button\" href=\"{href}\">Update to {}</a>{}",
-                            escape(&newer.version),
-                            if widening(&launch.roles, &wants) {
-                                " <span class=\"badge warn\">Needs approval</span>"
-                            } else {
-                                ""
-                            }
-                        ));
-                    }
-                    if let Some(pull) = pull_warning(launch, v, &listings) {
-                        said.push(format!(
-                            "<span class=\"badge danger\" data-pulled>Pulled: {}</span> \
-                             <a class=\"button\" href=\"/admin/plugins/registry/acknowledge?instance={}\">Keep or stop</a>",
-                            pull_kind(&pull),
-                            escape(&launch.instance_id)
-                        ));
-                    }
-                    said.join(" ")
-                })
-                .collect::<Vec<_>>()
-                .join("; ");
-            let key_age = if v.key_status_issued_at_ns > 0 {
-                format!(
-                    " <span class=\"faint\">keys as of {}</span>",
-                    &crate::terminal::rfc3339(v.key_status_issued_at_ns)[..10]
-                )
-            } else {
-                String::new()
-            };
-            format!(
-                "<tr data-version=\"{name}@{version}\"><td><a href=\"{href}\">{name}</a></td>\
-                 <td>{version}</td><td>{registry}{key_age}</td><td class=\"wide\">{sections}</td>\
-                 <td>{instances}</td><td class=\"wide\">{state}</td></tr>",
-                href = escape(&crate::documentation::version_path(&m.name, &m.version)),
-                name = escape(&m.name),
-                version = escape(&m.version),
-                registry = registry_label(&v.source_registry),
-                instances = if instances.is_empty() { "<span class=\"faint\">none</span>".into() } else { instances },
-            )
-        })
-        .collect();
-    let table = if rows.is_empty() {
-        "<p class=\"hint\">No version is installed yet: `meridian plugin upload` adds a local one, Browse a listed one.</p>".to_string()
-    } else {
-        format!(
-            "<om-pager search=\"Search versions\"><table class=\"list one-line versions\"><thead><tr>\
-             <th>Plugin</th><th>Version</th><th>Source</th><th class=\"wide\">Sections</th><th>Instances</th>\
-             <th class=\"wide\">State</th></tr></thead><tbody>{}</tbody></table></om-pager>",
-            rows.concat()
-        )
-    };
-    format!("{}{table}", crate::notice::folded())
 }
 
 async fn browse(app: &App, session: &Session, asked: &HashMap<String, String>) -> String {
@@ -485,42 +434,26 @@ async fn browse(app: &App, session: &Session, asked: &HashMap<String, String>) -
     .await
     {
         Ok(reply) => reply,
-        Err(failed) => return format!("{}{}", crate::notice::folded(), error_line(&failed)),
+        Err(failed) => return error_line(&failed),
     };
-    let filter = format!(
-        "<form class=\"browse-filter\" method=\"get\" action=\"{PLUGINS_PATH}\"><input type=\"hidden\" name=\"tab\" value=\"browse\">\
-         <input type=\"search\" name=\"search\" value=\"{search}\" placeholder=\"Search listings\" aria-label=\"Search listings\">\
-         <select name=\"registry\" aria-label=\"Registry\"><option value=\"\">Any registry</option>\
-         <option value=\"community\"{c}>Community · Unsupervised</option><option value=\"verified\"{v}>Verified</option></select>\
-         <input type=\"text\" name=\"role\" value=\"{role}\" placeholder=\"Role\" aria-label=\"Role\">\
-         <button type=\"submit\">Find</button></form>",
-        search = escape(&field("search")),
-        role = escape(&field("role")),
-        c = if field("registry") == "community" { " selected" } else { "" },
-        v = if field("registry") == "verified" { " selected" } else { "" },
-    );
-    let rows: Vec<String> = reply
+    // The roles a listing may hold, for the Role select: every role the
+    // catalogue's listings name, and the one asked for.
+    let mut roles: Vec<String> = reply
         .listings
         .iter()
-        .map(|listing| {
-            let best = latest(listing);
-            let (floor_ok, floor) = best.map(floor_mark).unwrap_or((true, String::new()));
-            format!(
-                "<tr data-listing=\"{name}\"><td><a href=\"{href}\">{name}</a></td><td>{label}</td>\
-                 <td>{version}</td><td class=\"wide\">{roles}</td><td class=\"wide{floor_class}\">{floor}</td>\
-                 <td class=\"wide\">{stars}</td><td class=\"wide\">{installs}</td></tr>",
-                name = escape(&listing.listing),
-                href = escape(&listing_path(&listing.listing)),
-                label = best.map_or("", |v| registry_label(&v.registry)),
-                version = escape(best.map_or("", |v| v.version.as_str())),
-                roles = escape(&best.map(roles_of).unwrap_or_default().join(", ")),
-                floor_class = if floor_ok { "" } else { " refused" },
-                floor = escape(&floor),
-                stars = listing.stars,
-                installs = escape(&installs(listing)),
-            )
-        })
+        .flat_map(|listing| listing.versions.iter().flat_map(roles_of))
+        .chain(std::iter::once(field("role")).filter(|r| !r.is_empty()))
         .collect();
+    roles.sort();
+    roles.dedup();
+    let bar = installed::filter_bar(
+        "browse",
+        &field("search"),
+        &field("registry"),
+        &field("role"),
+        &roles,
+    );
+    let rows: Vec<String> = reply.listings.iter().map(browse_row).collect();
     let pulled = if reply.catalogue_pulled_at_ns > 0 {
         format!(
             "Catalogue pulled {}.",
@@ -533,14 +466,76 @@ async fn browse(app: &App, session: &Session, asked: &HashMap<String, String>) -
         format!("<p class=\"hint\">No listing matches. {pulled}</p>")
     } else {
         format!(
-            "<om-pager search=\"Filter these\"><table class=\"list one-line listings\"><thead><tr>\
-             <th>Listing</th><th>Registry</th><th>Latest</th><th class=\"wide\">Roles</th>\
-             <th class=\"wide\">Floor</th><th class=\"wide\">Stars</th><th class=\"wide\">Installs</th>\
+            "<om-pager><table class=\"list plugin-table listings\"><thead><tr>\
+             <th>Name</th><th class=\"wide\">Publisher</th><th class=\"mid\">Roles</th><th>Registry</th>\
+             <th>Version</th><th class=\"mid\">Installs</th><th class=\"wide\">Stars</th>\
              </tr></thead><tbody>{}</tbody></table></om-pager><p class=\"hint\">{pulled}</p>",
             rows.concat()
         )
     };
-    format!("{}{filter}{table}", crate::notice::folded())
+    format!("{bar}{table}")
+}
+
+/// A listing's display name (ruling 306): its latest version's interface
+/// title, falling back to the plugin's name.
+pub fn display_name(listing: &PluginListing) -> String {
+    latest(listing)
+        .and_then(|v| v.metadata.as_ref())
+        .and_then(|m| m.declaration.as_ref())
+        .and_then(|d| d.interface.as_ref())
+        .map(|i| i.title.trim().to_string())
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| {
+            listing
+                .listing
+                .split_once('/')
+                .map_or(listing.listing.clone(), |(_, plugin)| plugin.to_string())
+        })
+}
+
+/// A role list as a cell shows it (ruling 276): the first and "+N", the
+/// whole list its tooltip.
+fn roles_cell(roles: &[String]) -> String {
+    match roles {
+        [] => String::new(),
+        [only] => escape(only),
+        [first, rest @ ..] => format!(
+            "<span title=\"{all}\">{first} +{n}</span>",
+            all = escape(&roles.join(", ")),
+            first = escape(first),
+            n = rest.len()
+        ),
+    }
+}
+
+/// One listing on Browse (ruling 276): Name, Publisher, Roles, Registry,
+/// Version, Installs, Stars; the Name never truncated, the less important
+/// columns hidden at narrower widths.
+fn browse_row(listing: &PluginListing) -> String {
+    let best = latest(listing);
+    let (floor_ok, floor) = best.map(floor_mark).unwrap_or((true, String::new()));
+    format!(
+        "<tr data-listing=\"{id}\"><td class=\"keep\"><a href=\"{href}\" title=\"{id}\">{name}</a></td>\
+         <td class=\"wide\">{publisher}</td><td class=\"mid\">{roles}</td>\
+         <td><span class=\"pill\">{label}</span></td>\
+         <td{floor_class}{floor_title}>{version}</td><td class=\"mid\">{installs}</td>\
+         <td class=\"wide\">{stars}</td></tr>",
+        id = escape(&listing.listing),
+        href = escape(&listing_path(&listing.listing)),
+        name = escape(&display_name(listing)),
+        publisher = escape(if listing.publisher.is_empty() {
+            listing.listing.split('/').next().unwrap_or_default()
+        } else {
+            listing.publisher.as_str()
+        }),
+        roles = roles_cell(&best.map(roles_of).unwrap_or_default()),
+        label = best.map_or("", |v| registry_label(&v.registry)),
+        version = escape(best.map_or("", |v| v.version.as_str())),
+        floor_class = if floor_ok { "" } else { " class=\"refused\"" },
+        floor_title = if floor.is_empty() { String::new() } else { format!(" title=\"{}\"", escape(&floor)) },
+        stars = listing.stars,
+        installs = escape(&installs(listing)),
+    )
 }
 
 async fn registries_tab(app: &App, session: &Session, asked: &HashMap<String, String>) -> String {
@@ -706,11 +701,10 @@ fn overview(listing: &PluginListing, chosen: Option<&ListedVersion>) -> String {
         }
     );
     format!(
-        "<div class=\"listing-overview\">{notice}<dl class=\"facts\"><dt>Registry</dt><dd>{registry}</dd>\
+        "<div class=\"listing-overview\"><dl class=\"facts\"><dt>Registry</dt><dd>{registry}</dd>\
          <dt>Repository</dt><dd>{repository}</dd><dt>Build</dt><dd>{tag} at <code>{commit}</code>, signed by \
          <code>{signer}</code></dd><dt>Floor</dt><dd>{floor}</dd><dt>Stars</dt><dd>{stars}</dd>\
          <dt>Installs</dt><dd>{installs}</dd></dl>{vendor}</div>",
-        notice = crate::notice::full(),
         registry = chosen.map_or("", |v| registry_label(&v.registry)),
         repository = escape(&listing.repository),
         tag = escape(&build.tag),
@@ -770,10 +764,7 @@ fn listed_documentation(name: &str, version: &ListedVersion) -> String {
 
 fn versions_tab(listing: &PluginListing) -> String {
     let mut versions: Vec<&ListedVersion> = listing.versions.iter().collect();
-    versions.sort_by(|a, b| {
-        meridian_domain::semver::semver_cmp(&b.version, &a.version)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    versions.sort_by(|a, b| installed::newest_first(&a.version, &b.version));
     let rows: String = versions
         .iter()
         .map(|v| {
@@ -819,48 +810,16 @@ fn sheet(
     )
 }
 
-/// Ruling 194 (the PO, 2026-10-16): the install and update sheets show the
-/// notice in full, word for word, as their own first step, at every width,
-/// and the form only after Continue -- so whoever accepts the risk reads it
-/// whole.
-fn notice_step(title: &str, next: &str) -> String {
-    format!(
-        "<section class=\"sheet-dialog notice-step\" aria-labelledby=\"sheet-title\"><h1 id=\"sheet-title\">{title}</h1>\
-         {notice}<div class=\"sheet-foot\"><a class=\"button\" href=\"{PLUGINS_PATH}\">Cancel</a>\
-         <a class=\"button primary\" data-continue href=\"{next}\">Continue</a></div></section>",
-        title = escape(title),
-        notice = crate::notice::html(),
-        next = escape(next),
-    )
-}
-
-/// The form step's address: the sheet's own, its step the form's.
-fn form_step(path: &str, asked: &[(&str, &str)]) -> String {
-    let mut url = reqwest::Url::parse("http://dashboard.invalid/").expect("fixed");
-    url.set_path(path);
-    for (name, value) in asked {
-        url.query_pairs_mut().append_pair(name, value);
-    }
-    url.query_pairs_mut().append_pair("step", "form");
-    format!("{}?{}", url.path(), url.query().unwrap_or_default())
-}
-
-/// Whether the sheet asked for is its form, past the notice (ruling 194).
-fn at_form(asked: &HashMap<String, String>) -> bool {
-    asked.get("step").is_some_and(|step| step == "form")
-}
-
-/// The form step's mark that the notice was passed through (ruling 194),
-/// which the install and update acts require.
+/// The form's mark that its dialog was read (ruling 194, its Terms' line
+/// from ruling 274), which the install and update acts require.
 const NOTICE_READ: &str = "<input type=\"hidden\" name=\"notice\" value=\"read\">";
 
 fn notice_read(fields: &Fields) -> bool {
     field(fields, "notice") == "read"
 }
 
-/// What an install or update posted without passing through the notice.
-const NOTICE_FIRST: &str =
-    "the notice comes first: open the sheet again, read it, and Continue to the form";
+/// What an install or update posted from no dialog.
+const NOTICE_FIRST: &str = "open the install or update dialog again and send it from there";
 
 fn hidden(name: &str, value: &str) -> String {
     format!(
@@ -902,21 +861,6 @@ async fn install_sheet(
             .into_response();
     };
     let title = format!("Install {name} {}", version.version);
-    if !at_form(&asked) {
-        let next = form_step(
-            &format!("/admin/plugins/registry/{organisation}/{plugin}/install"),
-            &[
-                ("version", &version.version),
-                ("registry", &version.registry),
-            ],
-        );
-        return Html(crate::html::page_with(
-            "Install",
-            &notice_step(&title, &next),
-            &chrome(&session, "Install"),
-        ))
-        .into_response();
-    }
     let usage = reports(&app, &session.subject, "")
         .await
         .map(|r| r.reports_plugin_usage)
@@ -938,7 +882,7 @@ async fn install_sheet(
     );
     let mut page = sheet(
         &title,
-        &crate::notice::folded(),
+        &terms_line(&version.registry),
         &body,
         "/admin/plugins/registry/install",
         &format!(
@@ -1031,7 +975,7 @@ async fn install(
     if !notice_read(&fields) {
         return back(Err(NOTICE_FIRST.into()), "installed");
     }
-    let installed: Result<PluginVersion, String> = ask(
+    let done: Result<PluginVersion, String> = ask(
         &app,
         &session.subject,
         INSTALL_PLUGIN,
@@ -1046,7 +990,7 @@ async fn install(
     )
     .await;
     back(
-        installed.map(|v| {
+        done.map(|v| {
             let m = v.metadata.unwrap_or_default();
             format!(
                 "{} {} is installed, verified. Launch it to run it.",
@@ -1109,18 +1053,6 @@ async fn update_sheet(
     };
     let wants = roles_of(target);
     let title = format!("Update {instance} to {}", target.version);
-    if !at_form(&asked) {
-        let next = form_step(
-            "/admin/plugins/registry/update",
-            &[("instance", &instance), ("version", &target.version)],
-        );
-        return Html(crate::html::page_with(
-            "Update",
-            &notice_step(&title, &next),
-            &chrome(&session, "Update"),
-        ))
-        .into_response();
-    }
     let token = crate::admin::token_input(&session);
     let body = format!(
         "<dl class=\"facts\"><dt>Instance</dt><dd><code>{instance}</code></dd><dt>From</dt><dd>{from}</dd>\
@@ -1139,7 +1071,7 @@ async fn update_sheet(
     );
     let page = sheet(
         &title,
-        &crate::notice::folded(),
+        &terms_line(&target.registry),
         &body,
         "/admin/plugins/registry/update",
         &format!(
@@ -1230,7 +1162,7 @@ async fn acknowledge_sheet(
     );
     let page = sheet(
         &format!("Keep {instance}"),
-        &crate::notice::full(),
+        "",
         &body,
         "/admin/plugins/registry/acknowledge",
         &hidden("instance_id", &instance),

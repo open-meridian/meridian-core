@@ -141,14 +141,14 @@ fn a_widening_and_a_pull_warning_until_kept() {
 }
 
 #[test]
-fn counts_below_three_deployments_are_words_and_community_is_unsupervised() {
+fn counts_below_three_deployments_read_below_three_and_labels_are_the_registries() {
     let mut held = listing(vec![]);
     held.installs = 2;
-    assert_eq!(installs(&held), "Fewer than three deployments");
+    assert_eq!(installs(&held), "<3");
     held.counts_shown = true;
     held.installs = 4;
     assert_eq!(installs(&held), "4");
-    assert_eq!(registry_label("community"), "Community · Unsupervised");
+    assert_eq!(registry_label("community"), "Community");
     assert_eq!(registry_label("verified"), "Verified");
     assert_eq!(registry_label(""), "Local");
     assert!(floor_mark(&listed("1.0.0", "community", &[])).0);

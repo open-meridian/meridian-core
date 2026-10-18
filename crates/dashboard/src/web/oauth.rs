@@ -109,7 +109,7 @@ fn unavailable(unavailable: crate::terminal::Unavailable) -> Response {
     )
 }
 
-/// A refusal of a grant, naming why so an unsupervised client can report
+/// A refusal of a grant, naming why so a client with no person present can report
 /// what stopped it.
 fn refused_grant(refusal: Refusal) -> Response {
     json(

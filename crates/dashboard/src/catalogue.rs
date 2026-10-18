@@ -478,7 +478,23 @@ async fn catalogue_within(app: &App, within: Duration) -> Result<PluginCatalogue
         )
         .await
         .map_err(|failed| failed.to_string())?;
-    PluginCatalogue::decode(&bytes[..]).map_err(|failed| failed.to_string())
+    let mut held = PluginCatalogue::decode(&bytes[..]).map_err(|failed| failed.to_string())?;
+    sort_versions(&mut held);
+    Ok(held)
+}
+
+/// The catalogue's versions as every page, terminal and tool answer lists
+/// them (the product owner, 2026-10-18): by plugin name, then SemVer 2.0
+/// precedence newest first -- numeric segments as numbers, a pre-release
+/// below its release.
+pub fn sort_versions(held: &mut PluginCatalogue) {
+    let named = |v: &meridian_domain::v1::PluginVersion| v.metadata.clone().unwrap_or_default();
+    held.versions.sort_by(|a, b| {
+        let (a, b) = (named(a), named(b));
+        a.name
+            .cmp(&b.name)
+            .then_with(|| crate::registry::installed::newest_first(&a.version, &b.version))
+    });
 }
 
 #[derive(serde::Deserialize)]

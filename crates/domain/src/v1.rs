@@ -14164,6 +14164,11 @@ pub struct PluginListing {
     /// registries' notice (ruling 278).
     #[prost(string, tag = "13")]
     pub terms_url: ::prost::alloc::string::String,
+    /// Contract v26 (W8.10; ruling 306, 2026-10-18): the publishing
+    /// organisation's display name, filled in by the platform; Browse's
+    /// Publisher column reads it.
+    #[prost(string, tag = "14")]
+    pub publisher: ::prost::alloc::string::String,
 }
 /// One version of a listing, in one registry.
 #[derive(Clone, PartialEq, ::prost::Message)]

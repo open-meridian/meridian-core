@@ -4,7 +4,7 @@
 //! to make a plugin's pages slow for the people using them.
 //!
 //! Over a bound the call is refused as a tool error saying when to try again
-//! (`retry_after_seconds`), never an HTTP 429, so an unsupervised agent reads
+//! (`retry_after_seconds`), never an HTTP 429, so an agent with no person present reads
 //! it as it reads any refusal. Held in this process's memory: a restart
 //! forgets a minute's count, which costs nothing a minute does not.
 

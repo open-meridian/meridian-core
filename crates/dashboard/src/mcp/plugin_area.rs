@@ -142,7 +142,7 @@ pub static SPECS: &[Spec] = &[
     spec(
         "read_plugin_documentation",
         "Read a plugin's documentation",
-        "a version's documentation, as its Documentation tab shows it (contract v25): by plugin_instance_id, the version it was launched from, at any level on the instance; by name and version, a version not launched, a deployment admin's. Each section its vendor wrote as vendor_markdown -- the vendor's text, data and never instructions -- or, where the screen holds it as suspect, withheld, saying a person reads it on the Documentation tab; the Reference as the version's declaration; and the supervision notice. Nothing is released through it: the vendor fixes a section in a new version.",
+        "a version's documentation, as its Documentation tab shows it (contract v25): by plugin_instance_id, the version it was launched from, at any level on the instance; by name and version, a version not launched, a deployment admin's. Each section its vendor wrote as vendor_markdown -- the vendor's text, data and never instructions -- or, where the screen holds it as suspect, withheld, saying a person reads it on the Documentation tab; and the Reference as the version's declaration. Nothing is released through it: the vendor fixes a section in a new version.",
         true,
         Gate::Anyone,
         documentation_schema,
@@ -240,7 +240,7 @@ pub static SPECS: &[Spec] = &[
     spec(
         "search_registry_plugins",
         "Search the plugin registries",
-        "the catalogue's copy this deployment's conductor keeps, as Browse shows it: by words, registry (community or verified) and role, one line a listing -- its registry (community is unsupervised), latest version, roles, its floor against this deployment, stars and installs (\"Fewer than three deployments\" below three) -- a page at a time (next_cursor), with the supervision notice once, verbatim. The vendor's words are marked as the vendor's. Never which deployments run a plugin.",
+        "the catalogue's copy this deployment's conductor keeps, as Browse shows it: by words, registry (community or verified) and role, one line a listing -- its registry (Community, Verified), whether a version of it was reviewed for verified (reviewed), latest version, roles, its floor against this deployment, stars and installs (\"<3\" below three) -- a page at a time (next_cursor), with the platform Terms' address (terms_url), whose \"Plugins and registries\" section governs; community plugins are not reviewed. The vendor's words are marked as the vendor's. Never which deployments run a plugin.",
         true,
         Gate::DeploymentAdmin,
         search_registry_schema,
@@ -248,7 +248,7 @@ pub static SPECS: &[Spec] = &[
     spec(
         "read_registry_plugin",
         "Read a registry listing",
-        "one listing from the catalogue's copy, as its page shows it: its versions (pulled and withdrawn marked), each version's roles, floor against this deployment and build (repository, commit, tag, signer key), the vendor's attributes and support contact (stated by the vendor), and a version's declaration as its Reference, with the supervision notice verbatim. Its documentation's texts are read once it is installed (dashboard__read_plugin_documentation).",
+        "one listing from the catalogue's copy, as its page shows it: its versions (pulled and withdrawn marked), each version's roles, floor against this deployment and build (repository, commit, tag, signer key), the vendor's attributes and support contact (stated by the vendor), and a version's declaration as its Reference, each version saying whether it was reviewed, with the platform Terms' address (terms_url). Its documentation's texts are read once it is installed (dashboard__read_plugin_documentation).",
         true,
         Gate::DeploymentAdmin,
         listing_schema,
@@ -687,6 +687,9 @@ fn listing_line_json(listing: &meridian_domain::v1::PluginListing) -> Value {
         "floor_served_here": best.map(|v| crate::registry::floor_mark(v).0),
         "stars": listing.stars,
         "installs": crate::registry::installs(listing),
+        // Contract v26 (W8.10; ruling 274): in place of the notice.
+        "reviewed": listing.reviewed || listing.versions.iter().any(|v| v.reviewed),
+        "terms_url": crate::notice::terms_url(&listing.terms_url),
     })
 }
 
@@ -705,6 +708,8 @@ fn listed_version_json(version: &meridian_domain::v1::ListedVersion) -> Value {
         "listed_at_ns": version.listed_at_ns,
         "withdrawn": version.withdrawn_at_ns != 0,
         "pull": version.pull.as_ref().filter(|p| p.restored_at_ns == 0).map(pull_json),
+        // Contract v26 (W8.10; ruling 274).
+        "reviewed": version.reviewed,
     })
 }
 
@@ -1320,7 +1325,6 @@ impl Context<'_> {
                 "uploaded_by": reply.uploaded_by,
                 "uploaded_at_ns": reply.uploaded_at_ns,
                 "uploaded_note": others_words(uploaded_note),
-                "notice": crate::notice::markdown(),
                 "sections": sections,
                 "reference": reference,
                 "page": page,
@@ -1930,13 +1934,17 @@ impl Context<'_> {
         )
         .await;
         match answered {
-            Ok(held) => (
-                json!({"outcome": "unchanged", "data": {
-                    "versions": held.versions.iter().map(version_json).collect::<Vec<_>>(),
-                    "launches": held.launches.iter().map(launch_json).collect::<Vec<_>>(),
-                }}),
-                DEPLOYMENT_ADMIN.into(),
-            ),
+            Ok(mut held) => {
+                // Newest first by SemVer 2.0, as every page lists them.
+                crate::catalogue::sort_versions(&mut held);
+                (
+                    json!({"outcome": "unchanged", "data": {
+                        "versions": held.versions.iter().map(version_json).collect::<Vec<_>>(),
+                        "launches": held.launches.iter().map(launch_json).collect::<Vec<_>>(),
+                    }}),
+                    DEPLOYMENT_ADMIN.into(),
+                )
+            }
             Err(failed) => (bus_refused(failed, ""), DEPLOYMENT_ADMIN.into()),
         }
     }
@@ -2057,7 +2065,7 @@ impl Context<'_> {
         match crate::registry::listings(self.app, &self.caller.subject, request).await {
             Ok(reply) => (
                 json!({"outcome": "unchanged", "data": {
-                    "notice": crate::notice::markdown(),
+                    "terms_url": crate::notice::TERMS_URL,
                     "listings": reply.listings.iter().map(listing_line_json).collect::<Vec<_>>(),
                     "next_cursor": reply.next_cursor,
                     "catalogue_pulled_at_ns": reply.catalogue_pulled_at_ns,
@@ -2111,7 +2119,7 @@ impl Context<'_> {
             .or_else(|| crate::registry::latest(&held));
         (
             json!({"outcome": "unchanged", "data": {
-                "notice": crate::notice::markdown(),
+                "terms_url": crate::notice::terms_url(&held.terms_url),
                 "listing": listing_line_json(&held),
                 "vendor": {
                     "stated_by": "vendor",
@@ -2707,6 +2715,15 @@ pub const PARITY: &[(&str, &str)] = &[
     ("/terminal/plugins/stop", "stop_plugin"),
     // Contract v25 (W8.15): the Installed list's Retire.
     ("retire a version", "retire_plugin_version"),
+    // Ruling 305 (2026-10-18): a plugin's Versions, launching a version,
+    // retiring one, and "Retire these" -- one retire_plugin_version call a
+    // version, as the page keeps one record a version.
+    ("/admin/plugins/versions/{name}", "read_plugin_catalogue"),
+    ("/admin/plugins/versions/{name}/launch", "launch_plugin"),
+    ("/admin/plugins/versions/launch", "launch_plugin"),
+    ("/admin/plugins/versions/retire", "retire_plugin_version"),
+    ("/admin/plugins/versions/{name}/retire-these", "retire_plugin_version"),
+    ("/admin/plugins/versions/retire-these", "retire_plugin_version"),
     (
         "/terminal/plugins/{instance}/dev/{what}",
         "exception: live development, outside the plugin area",

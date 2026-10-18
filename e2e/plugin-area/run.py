@@ -47,8 +47,8 @@ narrowed as the plan's tests ask, through `/mcp` alone:
    and its OCI registry over TLS. The person pulls the catalogue on the
    Registries tab; the admin's agent lists both listings and reads the
    pulled version's reason by its kind, and is listed no install; each
-   install passes through the sheet's notice, its own step with Continue
-   (ruling 194), and one posted past it is refused; the person installs
+   install sheet is the form at once with its one line linking the Terms
+   (ruling 274), and one posted from no dialog is refused; the person installs
    1.4.0 by digest, verified, its note kept with it, and
    is refused a version whose layer the registry serves altered (the
    digest), the pulled version, and a version built after its signer's key
@@ -56,8 +56,8 @@ narrowed as the plan's tests ask, through `/mcp` alone:
    community registry by its digest, and the Installed list shows it.
 7. Its documentation, from the image's verified metadata: the admin's agent
    reads 1.4.0's sections, the troubleshooting's jailbreak withheld as
-   prompt talk, and its Reference; the version's page draws it with the
-   supervision notice; 1.5.0, installed, shows its changed overview while
+   prompt talk, and its Reference; the version's page draws it, no notice
+   beside it (ruling 274); 1.5.0, installed, shows its changed overview while
    1.4.0 keeps its own. 1.4.0's attestations are bare DSSE envelopes the
    referrers API lists; 1.5.0's are Sigstore bundles listed only under the
    referrers tag schema, the API answering 404, as the platform's builder
@@ -200,18 +200,16 @@ def version_read(person, client):
                 {"plugin_instance_id": INSTANCE}, "unchanged")["data"]["updated_at_ns"]
 
 
-def through_the_notice(listing_name, version):
-    """Ruling 194: the install sheet's first step is the notice, whole and
-    alone, with Continue; the form comes after it, and its act requires
-    having passed through (`notice=read`)."""
+def through_the_sheet(listing_name, version):
+    """Ruling 274: the install sheet is the form at once, with its one line
+    linking the Terms; its act requires having come from the dialog
+    (`notice=read`)."""
     sheet = f"/admin/plugins/registry/{listing_name}/install?version={version}&registry=community"
-    page = runner("core-page", sheet, "--expect", "Naming a plugin here is not an endorsement",
-                  "--expect", "data-continue")
-    found = re.search(r'data-continue href="([^"]+)"', page)
-    must(found and 'action="/admin/plugins/registry/install"' not in page,
-         f"the notice is its own step, with Continue and no form: {page[-600:]}")
-    runner("core-page", html.unescape(found.group(1)), "--expect", 'name="notice" value="read"',
-           "--expect", f"Install {listing_name} {version}")
+    page = runner("core-page", sheet, "--expect", "Community plugins aren't reviewed.",
+                  "--expect", 'name="notice" value="read"',
+                  "--expect", f"Install {listing_name} {version}")
+    must("not an endorsement" not in page and "nsupervised" not in page,
+         f"no notice on the sheet: {page[-600:]}")
 
 
 def setting(data, name):
@@ -434,17 +432,18 @@ def run():
     found = call(*as_admin, "dashboard__search_registry_plugins", {}, "unchanged")["data"]
     names = sorted(line["listing"] for line in found["listings"])
     must(names == [STAND_IN, "other-org/revoked"], f"step 6, Browse lists both listings: {names}")
-    must("not an endorsement" in found["notice"], f"step 6, the notice beside them: {found['notice'][:200]}")
+    must("notice" not in found and found.get("terms_url", "").endswith("#plugins-and-registries"),
+         f"step 6, the Terms' address beside them, no notice: {list(found)}")
     listing = call(*as_admin, "dashboard__read_registry_plugin", {"listing": STAND_IN},
                    "unchanged")["data"]
     pulled = [v for v in listing["versions"] if v["version"] == "1.3.0"]
     must(pulled and (pulled[0]["pull"] or {}).get("kind") == "PULL_REASON_KIND_TERMS_BREACH",
          f"step 6, the pulled version says why, by its kind: {pulled}")
-    through_the_notice(STAND_IN, "1.4.0")
+    through_the_sheet(STAND_IN, "1.4.0")
     skipped = runner("core-form", PLUGINS, INSTALL, f"listing={STAND_IN}", "version=1.4.0",
-                     "registry=community", "note=Past the notice.",
-                     "--expect-refused", "the notice comes first")
-    must("refused" in skipped, f"step 6, an install not passed through the notice is refused: {skipped}")
+                     "registry=community", "note=From no dialog.",
+                     "--expect-refused", "open the install or update dialog again")
+    must("refused" in skipped, f"step 6, an install posted from no dialog is refused: {skipped}")
     said = runner("core-form", PLUGINS, INSTALL, f"listing={STAND_IN}", "version=1.4.0",
                   "registry=community", "notice=read",
                   "note=The stand-in, from the community registry.")
@@ -452,7 +451,7 @@ def run():
     for listing_name, version, refusal in [(STAND_IN, "1.6.0", "the digest"),
                                            (STAND_IN, "1.3.0", "pulled"),
                                            ("other-org/revoked", "1.0.0", "revoked")]:
-        through_the_notice(listing_name, version)
+        through_the_sheet(listing_name, version)
         runner("core-form", PLUGINS, INSTALL, f"listing={listing_name}", f"version={version}",
                "registry=community", "notice=read", "note=Refused, it is to be.",
                "--expect-refused", refusal)
@@ -483,8 +482,8 @@ def run():
     must([s["name"] for s in (read.get("reference") or {}).get("settings", [])] == ["region"],
          f"step 7, the Reference from the declaration: {read.get('reference')}")
     runner("core-page", f"/admin/plugins/versions/{STAND_IN}/1.4.0/documentation",
-           "--expect", "Reads the holdings of the stand-in", "--expect", "not an endorsement")
-    through_the_notice(STAND_IN, "1.5.0")
+           "--expect", "Reads the holdings of the stand-in")
+    through_the_sheet(STAND_IN, "1.5.0")
     runner("core-form", PLUGINS, INSTALL, f"listing={STAND_IN}", "version=1.5.0",
            "registry=community", "notice=read", "note=The newer stand-in.")
     _, newer = documentation("1.5.0")

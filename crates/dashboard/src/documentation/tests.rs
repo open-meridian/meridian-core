@@ -88,13 +88,9 @@ fn the_sections_are_tabs_in_their_order_and_a_heading_is_an_entry() {
         html.contains("Investors.") && !html.contains("Reads accounts."),
         "{html}"
     );
-    // The notice, in full and by its title.
+    // Ruling 274: no notice beside the documentation.
     assert!(
-        html.contains("Local and community plugins are unsupervised."),
-        "{html}"
-    );
-    assert!(
-        html.contains("<details class=\"notice supervision\">"),
+        !html.contains("nsupervised") && !html.contains("not an endorsement"),
         "{html}"
     );
     assert!(html.contains("Written by its vendor"), "{html}");

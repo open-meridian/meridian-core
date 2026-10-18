@@ -436,6 +436,10 @@ message PluginListing {
   // The platform Terms' address, whose §9 "Plugins and registries" is the
   // registries' notice (ruling 278).
   string terms_url = 13;
+  // Contract v26 (W8.10; ruling 306, 2026-10-18): the publishing
+  // organisation's display name, filled in by the platform; Browse's
+  // Publisher column reads it.
+  string publisher = 14;
 }
 
 // One version of a listing, in one registry.

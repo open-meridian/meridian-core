@@ -18,9 +18,9 @@
 //! Reference) are tabs; within a section each level-one and level-two
 //! heading is an entry in a contents list beside it, one shown at a time; the
 //! Reference pages by part, each a kit table with its pager. Every tab and
-//! entry is a link, so none needs script. The supervision notice is drawn
-//! beside the vendor's text in full where the screen is wide, and by its
-//! title, opening in place, where it is not.
+//! entry is a link, so none needs script. From contract v26 (ruling 274) no
+//! notice is drawn beside the vendor's text: the Terms' line is the install
+//! and update dialogs' alone.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -337,15 +337,11 @@ pub fn drawn(page: &Page) -> String {
     };
     format!(
         "<div class=\"docs\" data-docs data-version=\"{version}\">\
-         <div class=\"docs-head\"><p class=\"docs-what\"><strong>{name}</strong> {version}{uploaded}{note}</p>{folded}</div>\
+         <div class=\"docs-head\"><p class=\"docs-what\"><strong>{name}</strong> {version}{uploaded}{note}</p></div>\
          {none}<nav class=\"tabs docs-sections\" aria-label=\"Its documentation\">{tabs}</nav>\
-         <div class=\"docs-body\">{contents}<div class=\"docs-text\">{body}</div>\
-         <aside class=\"docs-notice\" aria-label=\"{notice_title}\">{notice}</aside></div></div>",
+         <div class=\"docs-body\">{contents}<div class=\"docs-text\">{body}</div></div></div>",
         name = escape(page.name),
         version = escape(page.version),
-        folded = crate::notice::folded(),
-        notice = crate::notice::html(),
-        notice_title = escape(crate::notice::TITLE),
     )
 }
 

@@ -224,6 +224,8 @@ pub fn listing(value: &Value, at: &str) -> Result<PluginListing, String> {
         // place of the notice.
         reviewed: value["reviewed"].as_bool().unwrap_or(false),
         terms_url: text(value, "terms_url"),
+        // Contract v26 (ruling 306): the publishing organisation's name.
+        publisher: text(value, "publisher"),
     })
 }
 
