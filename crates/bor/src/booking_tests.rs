@@ -834,6 +834,11 @@ async fn a_give_up_naming_nothing_held_is_kept_unplaced_whole() {
     .unwrap();
     let kept = FactReply::decode(&reply[..]).unwrap().unplaced.unwrap();
     assert_eq!(kept.fact_kind, "give-up");
+    // Contract v26 (W11.32): named, where v25 left the reason unspecified.
+    assert_eq!(
+        kept.reason,
+        meridian_domain::v1::UnplacedReason::UnknownExecution as i32
+    );
     assert!(kept.account_id.is_empty(), "naming no account");
     assert_eq!(
         kept.fact,

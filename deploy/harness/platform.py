@@ -52,7 +52,22 @@ version's resolution, and the plugin usage reports, heard; and, over TLS on
 port 8443 with the certificate in `HARNESS_REGISTRY_TLS`, the OCI registry
 the resolutions name, read-only, by digest, with the referrers API. A
 version it lists with an altered layer is served altered, as a tampered
-registry would."""
+registry would.
+
+From contract v26 (W1.30, W3.29; the v26 plan's item 7, rulings 199 and
+204) it mints binary event contracts by venue symbol: a matching request for
+an event contract naming the venue's symbol as `ticker`, its `source` the
+venue's MIC (Kalshi's KLSH) or, for a venue with none, its `VEN-` ID
+(Polymarket's), is answered with a record minted for it, as the binary event
+contract template matches (W3.4), paying one unit of the currency the
+request offers. It holds the two prediction venues in its venue master, and
+answers POST /api/v1/reference/escalate-event-group (W1.30): a venue's
+grouping of contracts it minted, matched by the venue and its event's
+reference, minted `EVG-` on first asking and a new version where the flags
+or members changed; a member it does not hold queued for its staff. And the
+template catalogue carries v26's versions with their calculation packages
+(W1.24): cash, equity, and the binary event contract with its bounds.
+See V26 below."""
 import datetime
 import http.server
 import json
@@ -216,6 +231,24 @@ XNYS = venue("VEN-01JAE0000000000000000XNYS", "XNYS", "NEW YORK STOCK EXCHANGE, 
 XNAS = venue("VEN-01JAE0000000000000000XNAS", "XNAS", "NASDAQ - ALL MARKETS", "2005-06-27", "Q")
 VENUES = {"XNYS": XNYS, "XNAS": XNAS}
 
+# Contract v26: the two prediction venues, each as the venue master keeps
+# it -- Kalshi by its MIC, KLSH; Polymarket, which has none, by its own
+# symbol, the vendor's code its venue-codes list holds.
+KLSH = dict(venue("VEN-01JAE0000000000000000KLSH", "KLSH", "KALSHI EXCHANGE", "2021-07-01", "kalshi"),
+            kind="VENUE_KIND_EXCHANGE")
+KLSH["identifiers"][1]["source"] = "kalshi"
+POLYMARKET = {
+    "venue_id": "VEN-01JAE000000000000000POLYM", "name": "Polymarket", "country_code": "",
+    "kind": "VENUE_KIND_EXCHANGE",
+    "identifiers": [{"scheme": "symbol", "value": "polymarket", "source": "polymarket",
+                     "valid_from_ns": created("2020-06-01"), "valid_until_ns": 0}],
+    "operating_venue_id": "", "time_zone": "UTC", "version": 1,
+    "valid_from_ns": created("2020-06-01"), "record_time_ns": READ_AT,
+    "lifecycle_state": "INSTRUMENT_LIFECYCLE_STATE_ACTIVE",
+}
+VENUES["KLSH"] = KLSH
+EVENT_VENUES = {KLSH["venue_id"]: KLSH, POLYMARKET["venue_id"]: POLYMARKET}
+
 # A test equity, by its FIGI: Apple Inc., listed on Nasdaq (XNAS).
 EQUITIES = {
     "BBG000B9XRY4": {
@@ -312,6 +345,56 @@ TEMPLATES = [
      "fields": [{"path": "identifiers", "type": "identifier", "required": True}],
      "match_rule": ["iso4217"]},
 ]
+
+
+# Contract v26 (W1.24): each template's next version with its calculation
+# package, declarative data the analytics engine's built-in model and every
+# pricing plugin routed for it must equal exactly; and the binary event
+# contract's, whose fields add a range market's bounds (A4), none required.
+def packaged(template, version, package, extra_fields=()):
+    return {**template, "template_version": str(version),
+            "fields": template["fields"] + list(extra_fields), "calculation_package": package}
+
+
+EVENT_CONTRACT_V1 = {
+    "template_id": "TPL-binary-event-contract", "template_version": "1",
+    "name": "Binary event contract", "asset_class": "event_contract",
+    "instrument_type": "binary_event_contract", "base": False, "calculation": "",
+    "fields": [{"path": "identifiers", "type": "identifier", "required": True},
+               {"path": "description", "type": "text", "required": True},
+               {"path": "currency", "type": "text", "required": True},
+               {"path": "listing_venue_id", "type": "identifier", "required": True},
+               {"path": "instrument_type", "type": "enum", "required": True},
+               {"path": "binary_event_contract.payout", "type": "Money", "required": True},
+               {"path": "binary_event_contract.closes_at_ns", "type": "moment", "required": False}],
+    "match_rule": ["ticker"],
+}
+TEMPLATES += [
+    packaged(TEMPLATES[1], 2, {
+        "model_id": "cash", "model_version": 1, "pricing_inputs": ["close"],
+        "corporate_action_factors": "", "calculation_version": "1",
+        "test_cases": [{"name": "1,000 EUR at an EURUSD close of 1.0850, base USD",
+                        "inputs": json.dumps({"fx": "1.0850", "quantity": "1000"}, separators=(",", ":")),
+                        "expected": json.dumps({"market_value": "1085.00"}, separators=(",", ":"))}]}),
+    packaged(TEMPLATES[0], 2, {
+        "model_id": "quoted_price", "model_version": 1, "pricing_inputs": ["close"],
+        "corporate_action_factors": "the template's split and distribution factors, CRSP's A(t) = P(t)/C(t)",
+        "calculation_version": "1",
+        "test_cases": [{"name": "10 shares at a close of 227.50 USD, base USD",
+                        "inputs": json.dumps({"close": "227.50", "fx": "1", "quantity": "10"}, separators=(",", ":")),
+                        "expected": json.dumps({"market_value": "2275.00"}, separators=(",", ":"))}]}),
+    EVENT_CONTRACT_V1,
+    packaged(EVENT_CONTRACT_V1, 2, {
+        "model_id": "binary_event", "model_version": 1, "pricing_inputs": ["mid", "last", "outcome"],
+        "corporate_action_factors": "", "calculation_version": "1",
+        "test_cases": [{"name": "100 contracts paying 1 USD at a mid of 0.62",
+                        "inputs": json.dumps({"mid": "0.62", "payout": "1", "quantity": "100"}, separators=(",", ":")),
+                        "expected": json.dumps({"market_value": "62.00"}, separators=(",", ":"))}]},
+        [{"path": f"binary_event_contract.{part}", "type": kind, "required": False}
+         for part, kind in (("floor.value", "decimal"), ("floor.inclusive", "boolean"),
+                            ("cap.value", "decimal"), ("cap.inclusive", "boolean"),
+                            ("bound_unit", "text"))]),
+]
 # FIGIs the platform's source confirms and mints from, and those it cannot:
 # a near match, minted and flagged; anything else, its staff's queue.
 MINTS = {f for f in (os.environ.get("HARNESS_PLATFORM_MINTS") or "BBG00NEWMINT1,BBG00NEWMINT2").split(",") if f}
@@ -339,6 +422,92 @@ def minted_record(figi):
     return MINTED[figi]
 
 
+# ── Contract v26 (W1.30, W3.29): event contracts and their groups ───────────
+
+EVENT_CONTRACTS = {}
+EVENT_GROUPS = {}
+
+
+def event_venue(source):
+    """The venue a symbol sent as `ticker` names: by its MIC, or by its
+    `VEN-` ID where it has none (W3.4's spelling, ruled 2026-10-14)."""
+    if source in EVENT_VENUES:
+        return EVENT_VENUES[source]
+    return next((v for v in EVENT_VENUES.values()
+                 if any(i["scheme"] == "iso10383" and i["value"] == source for i in v["identifiers"])),
+                None)
+
+
+def event_contract(value, venue_record, asked):
+    """A binary event contract minted by its venue symbol, once: the
+    template's version 2, paying one unit of the currency offered."""
+    key = (value, venue_record["venue_id"])
+    if key not in EVENT_CONTRACTS:
+        offered = {f.get("path"): f.get("value", "") for f in asked.get("fields", [])}
+        currency = offered.get("currency") or "USD"
+        n = len(EVENT_CONTRACTS) + 1
+        mic = next((i["value"] for i in venue_record["identifiers"] if i["scheme"] == "iso10383"), "")
+        EVENT_CONTRACTS[key] = {
+            "instrument_id": f"INS-01JEVT{n:020d}",
+            "identifiers": [{"scheme": "ticker", "value": value, "source": mic or venue_record["venue_id"]}],
+            "asset_class": "ASSET_CLASS_EVENT_CONTRACT",
+            "instrument_type": "binary_event_contract",
+            "currency": currency,
+            "description": offered.get("description") or f"{venue_record['name']} event contract {value}",
+            "listing_venue_id": venue_record["venue_id"],
+            "binary_event_contract": {"payout": {"amount": "1", "currency_code": currency,
+                                                 "instrument_id": ""}, "closes_at_ns": 0},
+            "lifecycle_state": "INSTRUMENT_LIFECYCLE_STATE_ACTIVE",
+            "version": 1,
+            "template_id": "TPL-binary-event-contract",
+            "template_version": "2",
+        }
+    return EVENT_CONTRACTS[key]
+
+
+def held_instrument(instrument_id):
+    return (instrument_id in {r["instrument_id"] for r in EVENT_CONTRACTS.values()}
+            or instrument_id in {r["instrument_id"] for r in MINTED.values()}
+            or instrument_id in {r["instrument_id"] for r in EQUITIES.values()}
+            or instrument_id in {r["instrument_id"] for r in CRYPTO.values()})
+
+
+def event_group(asked):
+    """The platform's answer to a deployment's grouping (W1.30): matched by
+    the venue and its event's reference, minted on first asking, a new
+    version where the flags or members changed; a member it does not hold,
+    or an unknown venue, its staff's queue. A retry of a request key is
+    answered as first answered."""
+    key = asked.get("request_key", "")
+    if key and key in ANSWERS:
+        return ANSWERS[key]
+    members = sorted(asked.get("member_instrument_ids", []))
+    venue_id = asked.get("venue_id", "")
+    ref = asked.get("venue_event_ref", "")
+    if venue_id not in EVENT_VENUES or not ref or not members \
+            or not all(held_instrument(m) for m in members):
+        answer = {"minted": False, "pending_review": True}
+    else:
+        flags = {name: asked.get(name) or "EVENT_GROUP_FLAG_NOT_STATED"
+                 for name in ("mutually_exclusive", "exhaustive")}
+        held = EVENT_GROUPS.get((venue_id, ref))
+        minted = held is None
+        if held is None or held["member_instrument_ids"] != members \
+                or any(held[name] != flag for name, flag in flags.items()):
+            version = 1 if held is None else held["version"] + 1
+            group_id = held["event_group_id"] if held else f"EVG-01JEVG{len(EVENT_GROUPS) + 1:020d}"
+            held = {"event_group_id": group_id, "venue_id": venue_id, "venue_event_ref": ref,
+                    "title": asked.get("title", ""), "member_instrument_ids": members,
+                    **flags, "series_id": asked.get("series_id", ""), "version": version,
+                    "valid_from_ns": str(asked.get("valid_from_ns") or 0),
+                    "record_time_ns": str(time.time_ns()), "provisional": False}
+            EVENT_GROUPS[(venue_id, ref)] = held
+        answer = {"event_group": held, "minted": minted, "pending_review": False}
+    if key:
+        ANSWERS[key] = answer
+    return answer
+
+
 def match_or_mint(asked):
     """The platform's answer to a matching request (W3.4): a match, a mint
     from its own source, or its staff's queue; a retry of a request key
@@ -349,6 +518,13 @@ def match_or_mint(asked):
     answer = {"minted": False, "pending_review": True}
     for identifier in asked.get("identifiers", []):
         scheme, value = identifier.get("scheme", ""), identifier.get("value", "")
+        # Contract v26: a binary event contract by its venue's symbol.
+        venue_record = event_venue(identifier.get("source", "")) if scheme == "ticker" else None
+        if venue_record and asked.get("asset_class") == "event_contract" and value:
+            fresh = (value, venue_record["venue_id"]) not in EVENT_CONTRACTS
+            answer = {"minted": fresh, "instrument": event_contract(value, venue_record, asked),
+                      "venues": [venue_record]}
+            break
         if scheme in ("figi", "share_class_figi", "composite_figi") and value in EQUITIES:
             answer = {"minted": False, "instrument": EQUITIES[value], "venues": [XNAS]}
             break
@@ -445,6 +621,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         code = one("value").upper()
         if url.path == "/e2e/heard":
             return self.answer(200, {"heard": HEARD})
+        if url.path == "/e2e/event-groups":
+            # Contract v26: what it minted, for a run to read.
+            return self.answer(200, {"event_groups": list(EVENT_GROUPS.values()),
+                                     "event_contracts": list(EVENT_CONTRACTS.values())})
         if url.path == "/api/v1/registry/catalogue" and REGISTRY:
             HEARD.append({"method": "GET", "path": self.path})
             return self.answer(200, registry_file("catalogue.json"))
@@ -472,6 +652,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 and one("scheme") == "iso4217" and code in NAMES):
             time.sleep(SLOW.get(code, 0))
             body = json.dumps({"found": True, "instrument": record(code), "venues": []}).encode()
+            self.send_response(200)
+        elif (url.path == "/api/v1/reference/identifiers/resolve"
+                and one("scheme") == "symbol" and one("value") == "polymarket"
+                and one("source") in ("", "polymarket")):
+            # Contract v26: Polymarket, which has no MIC, by its own symbol.
+            body = json.dumps({"found": True, "venues": [POLYMARKET]}).encode()
+            self.send_response(200)
+        elif (url.path == "/api/v1/reference/identifiers/resolve"
+                and one("scheme") == "ticker" and event_venue(one("source"))
+                and (one("value"), event_venue(one("source"))["venue_id"]) in EVENT_CONTRACTS):
+            # Contract v26: an event contract minted already, by its symbol.
+            venue_record = event_venue(one("source"))
+            body = json.dumps({"found": True,
+                               "instrument": EVENT_CONTRACTS[(one("value"), venue_record["venue_id"])],
+                               "venues": [venue_record]}).encode()
             self.send_response(200)
         elif (url.path == "/api/v1/reference/identifiers/resolve"
                 and one("scheme") == "iso10383" and code in VENUES):
@@ -524,6 +719,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if url.path == "/e2e/replacements":
             REPLACEMENTS.extend(asked.get("entries", []))
             return self.answer(200, {"entries": REPLACEMENTS})
+        if url.path == "/api/v1/reference/escalate-event-group":
+            # Contract v26 (W1.30): a venue's grouping, matched or minted.
+            HEARD.append({"method": "POST", "path": url.path, "body": asked})
+            return self.answer(200, event_group(asked))
         if url.path in ("/api/v1/reference/escalate-instrument", "/api/v1/reference/usage-reports"):
             HEARD.append({"method": "POST", "path": url.path, "body": asked})
             if not V24:

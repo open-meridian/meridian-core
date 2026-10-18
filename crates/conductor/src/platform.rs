@@ -1175,6 +1175,24 @@ struct WireContract {
     payout: Option<WireMoney>,
     #[serde(default)]
     closes_at_ns: i64,
+    /// A range market's bounds and their unit (contract v26, W1.24): the
+    /// template's next version's fields; absent for a contract with none.
+    #[serde(default)]
+    floor: Option<WireBound>,
+    #[serde(default)]
+    cap: Option<WireBound>,
+    #[serde(default)]
+    bound_unit: String,
+}
+
+/// One bound of a range market as the platform's answer carries it: the
+/// value as text, so nothing passes through a float.
+#[derive(Debug, Deserialize)]
+struct WireBound {
+    #[serde(default)]
+    value: String,
+    #[serde(default)]
+    inclusive: bool,
 }
 
 /// A Money as the platform's answer carries it: the amount as text, so
@@ -1422,10 +1440,30 @@ fn into_record(record: WireRecord) -> Result<PbInstrument, PlatformError> {
                     instrument_id: money.instrument_id,
                 }),
             };
+            let bound = |held: Option<WireBound>, which: &str| {
+                held.map(|held| {
+                    held.value
+                        .trim()
+                        .parse::<meridian_domain::exact::Exact>()
+                        .map(|value| meridian_domain::v1::EventContractBound {
+                            value: Some(value.to_wire()),
+                            inclusive: held.inclusive,
+                        })
+                        .map_err(|_| {
+                            PlatformError::Malformed(format!(
+                                "{} arrived with a {which} of {:?}, which is no decimal",
+                                record.instrument_id, held.value
+                            ))
+                        })
+                })
+                .transpose()
+            };
             Some(meridian_domain::v1::BinaryEventContract {
                 payout,
                 closes_at_ns: contract.closes_at_ns,
-                ..Default::default()
+                floor: bound(contract.floor, "floor")?,
+                cap: bound(contract.cap, "cap")?,
+                bound_unit: contract.bound_unit,
             })
         }
     };
@@ -2008,6 +2046,49 @@ pub(crate) mod tests {
         assert!(transport.urls()[0].starts_with(&format!(
             "{ADDRESS}/api/v1/reference/instruments/INS-ONE?as_of_ns="
         )));
+    }
+
+    #[tokio::test]
+    async fn a_range_markets_bounds_arrive_with_its_record() {
+        // Contract v26 (W1.24, A4): the floor and cap, each with whether it
+        // is inclusive, and their unit; a bound that is no decimal refused.
+        let body = |floor: &str| {
+            serde_json::json!({
+                "found": true,
+                "instrument": {
+                    "instrument_id": "INS-KXHIGHNY",
+                    "identifiers": [{"scheme": "ticker", "value": "KXHIGHNY-26OCT18-B71.5",
+                                     "source": "KLSH"}],
+                    "asset_class": "ASSET_CLASS_EVENT_CONTRACT",
+                    "instrument_type": "binary_event_contract",
+                    "binary_event_contract": {
+                        "payout": {"amount": "1", "currency_code": "USD", "instrument_id": ""},
+                        "closes_at_ns": 0,
+                        "floor": {"value": floor, "inclusive": true},
+                        "cap": {"value": "72", "inclusive": false},
+                        "bound_unit": "degrees_f"
+                    },
+                    "lifecycle_state": "INSTRUMENT_LIFECYCLE_STATE_ACTIVE",
+                    "version": 1
+                }
+            })
+            .to_string()
+        };
+        let record = platform(Fake::new(vec![Ok(reply(200, &body("71")))]))
+            .pull_instrument("INS-KXHIGHNY", AS_OF, NOW)
+            .await
+            .unwrap()
+            .unwrap();
+        let contract = record.binary_event_contract.unwrap();
+        assert_eq!(
+            meridian_domain::instrument_type::contract_to_text(&contract),
+            "1|USD||0|=71|72|degrees_f"
+        );
+        let refused = platform(Fake::new(vec![Ok(reply(200, &body("seventy")))]))
+            .pull_instrument("INS-KXHIGHNY", AS_OF, NOW)
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("floor"), "{refused}");
     }
 
     #[tokio::test]

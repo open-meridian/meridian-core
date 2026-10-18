@@ -706,7 +706,8 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
             // A give-up naming no execution the book holds is kept as an
             // unplaced fact, the report whole in its own arm, naming no
             // account (contract v25, W11.32; decision 30), as an execution
-            // the book cannot place is (W11.13). Held to its shape first.
+            // the book cannot place is (W11.13), its reason from contract
+            // v26 UNPLACED_REASON_UNKNOWN_EXECUTION. Held to its shape first.
             if !request.execution_id.is_empty()
                 && store
                     .owner(Record::Execution, &request.execution_id)
@@ -720,7 +721,7 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
                     &envelope,
                     ctx,
                     meridian_domain::v1::unplaced_fact::Fact::GiveUp(request.clone()),
-                    meridian_domain::v1::UnplacedReason::Unspecified,
+                    meridian_domain::v1::UnplacedReason::UnknownExecution,
                     "",
                     request.raw_record.clone(),
                 );
