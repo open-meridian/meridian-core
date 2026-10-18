@@ -67,6 +67,8 @@ pub const RECORD_OUTCOMES: &str = "platform.lake.command.record-outcomes";
 pub const DECLINE_WANT: &str = "platform.lake.command.decline-want";
 pub const SET_SOURCE_PRIORITY: &str = "platform.lake.command.set-source-priority";
 pub const LIST_PRICES: &str = "platform.lake.query.list-prices";
+/// W10.10 (contract v26): one bounded, read-only query over a kind.
+pub const QUERY_LAKE: &str = "platform.lake.query.query-lake";
 pub const LIST_BARS: &str = "platform.lake.query.list-bars";
 pub const LIST_TRADES: &str = "platform.lake.query.list-trades";
 pub const LIST_QUOTES: &str = "platform.lake.query.list-quotes";
@@ -156,7 +158,7 @@ struct Wants {
 pub struct Lake {
     bus: Arc<Bus>,
     store: Arc<dyn Store>,
-    clock: Arc<dyn Clock>,
+    pub(crate) clock: Arc<dyn Clock>,
     config: RwLock<DataConfig>,
     wants: Mutex<Wants>,
     /// What a source declined, by dataset, subject and the date or range its
@@ -172,7 +174,7 @@ pub struct Lake {
     versions: Mutex<(BTreeMap<String, String>, i64)>,
 }
 
-fn reader_of(envelope: &Envelope) -> Reader {
+pub(crate) fn reader_of(envelope: &Envelope) -> Reader {
     match envelope.meta.as_ref() {
         Some(meta) if meta.account_scope_applies => {
             Reader::Plugin(meta.publisher_instance_id.clone())
@@ -1172,7 +1174,18 @@ impl Lake {
         request: ReadRequest,
         envelope: &Envelope,
     ) -> Result<ReadAnswer, String> {
-        let reader = reader_of(envelope);
+        self.read_as(reader_of(envelope), request, true)
+    }
+
+    /// A read as `reader`; `wants` says whether what it finds missing is
+    /// asked of the data plugins (a list read's; never QueryLake's, which
+    /// is read-only, W10.10).
+    pub(crate) fn read_as(
+        &self,
+        reader: Reader,
+        request: ReadRequest,
+        wants: bool,
+    ) -> Result<ReadAnswer, String> {
         if !bounds::LIST_PRICES_REQUEST_SUBJECTS_COUNT.admits(request.subjects.len()) {
             return Err(format!(
                 "subjects names {}; 1 to 500",
@@ -1349,7 +1362,7 @@ impl Lake {
                 now_ns: self.clock.now_ns(),
             },
         )?;
-        if offset == 0 {
+        if offset == 0 && wants {
             self.want(answered.asks.clone(), &reader);
         }
         // What a catch-up cannot answer, per partition it named (contract
@@ -1566,7 +1579,14 @@ impl Lake {
         request: ListOutcomesRequest,
         envelope: &Envelope,
     ) -> Result<ListOutcomesReply, String> {
-        let reader = reader_of(envelope);
+        self.list_outcomes_as(reader_of(envelope), request)
+    }
+
+    pub(crate) fn list_outcomes_as(
+        &self,
+        reader: Reader,
+        request: ListOutcomesRequest,
+    ) -> Result<ListOutcomesReply, String> {
         if !bounds::LIST_OUTCOMES_REQUEST_SUBJECTS_COUNT.admits(request.subjects.len()) {
             return Err(format!(
                 "subjects names {}; 1 to 500",
@@ -2276,6 +2296,15 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
                 watermark: Some(answer.watermark),
                 next_cursor: answer.next_cursor,
             })
+        },
+    );
+    serve_on(
+        &bus,
+        &lake,
+        QUERY_LAKE,
+        ("meridian.v1.QueryLakeRequest", "meridian.v1.QueryLakeReply"),
+        |lake, request: meridian_domain::v1::QueryLakeRequest, envelope| {
+            lake.query_lake(request, envelope)
         },
     );
     serve_on(

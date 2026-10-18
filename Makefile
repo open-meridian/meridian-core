@@ -201,6 +201,9 @@ DOMAIN_RS := crates/domain/src/v1.rs
 # boundaries/transitions.json (decisions/035): every language's copy is
 # generated, and this is core's.
 TRANSITIONS_RS := crates/bor/src/transitions.rs
+# The data dictionary core carries (contract v26): meridian-schema's
+# boundaries/fields.json, whole.
+FIELDS_JSON := crates/dashboard/src/mcp/fields.json
 SCRATCH   := .codegen-scratch
 # The meridian-schema revision the workspace links, whose protos a domain
 # proto may import (bus.proto takes MessageMeta from there).
@@ -213,8 +216,9 @@ codegen:
 	@rm -rf $(SCRATCH)
 	@$(DOCKER) build $(SCHEMA_PROTO) $(SCHEMA_BOUNDARIES) -f Dockerfile.codegen --target export \
 		--output type=local,dest=$(SCRATCH) .
-	@mv $(SCRATCH)/v1.rs $(DOMAIN_RS) && mv $(SCRATCH)/transitions.rs $(TRANSITIONS_RS) && rm -rf $(SCRATCH)
-	@echo "codegen: wrote $(DOMAIN_RS) and $(TRANSITIONS_RS)"
+	@mv $(SCRATCH)/v1.rs $(DOMAIN_RS) && mv $(SCRATCH)/transitions.rs $(TRANSITIONS_RS) \
+		&& mv $(SCRATCH)/fields.json $(FIELDS_JSON) && rm -rf $(SCRATCH)
+	@echo "codegen: wrote $(DOMAIN_RS), $(TRANSITIONS_RS) and $(FIELDS_JSON)"
 
 # Generate into a scratch directory and compare. A vendored file that does not
 # match a fresh generation is a stale checkout or a hand-edit, and both are the
@@ -225,7 +229,7 @@ check-codegen:
 	@$(DOCKER) build $(SCHEMA_PROTO) $(SCHEMA_BOUNDARIES) -f Dockerfile.codegen --target export \
 		--output type=local,dest=$(SCRATCH) . >/dev/null 2>&1 \
 		|| { echo "check-codegen: generation failed; run 'make codegen' to see why" >&2; exit 1; }
-	@for pair in "$(DOMAIN_RS) v1.rs" "$(TRANSITIONS_RS) transitions.rs"; do \
+	@for pair in "$(DOMAIN_RS) v1.rs" "$(TRANSITIONS_RS) transitions.rs" "$(FIELDS_JSON) fields.json"; do \
 		set -- $$pair; \
 		if ! diff -q $$1 $(SCRATCH)/$$2 >/dev/null 2>&1; then \
 			echo "check-codegen FAILED: $$1 is stale or hand-edited" >&2; \

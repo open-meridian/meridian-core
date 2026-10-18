@@ -1966,3 +1966,114 @@ async fn a_calendar_applied_re_checks_the_rows_it_changes_as_amendments_never_ve
     tokio::task::block_in_place(|| h.lake.recheck(&applied(2)));
     assert_eq!(h.store.closed_day_amendments().unwrap().len(), 2);
 }
+
+/// W10.10 (contract v26): QueryLake, as fixture lake/query-lake.yaml has
+/// it -- one kind over business dates, only the fields named, cut at its row
+/// limit and saying so; a dataset not entitled unanswered with its reason;
+/// its bounds refused naming the field; the dashboard's asked for a named
+/// instance, a plugin's for itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_query_reads_one_kind_within_bounds_and_says_where_it_was_cut() {
+    let h = harness();
+    record(
+        &h,
+        "coinbase-1",
+        vec![
+            close("coinbase-1", "d5", BTC, "2026-10-05", "1"),
+            close("coinbase-1", "d6", BTC, "2026-10-06", "2"),
+            close("coinbase-1", "d7", BTC, "2026-10-07", "3"),
+        ],
+        "",
+    )
+    .unwrap();
+    let asked = |instance: &str, plugin: bool, request: meridian_domain::v1::QueryLakeRequest| {
+        tokio::task::block_in_place(|| h.lake.query_lake(request, &envelope(instance, plugin, "")))
+    };
+    let request = meridian_domain::v1::QueryLakeRequest {
+        kind: "prices".into(),
+        subjects: vec![SubjectRef {
+            entity_id: BTC.into(),
+        }],
+        from_date: "2026-10-05".into(),
+        to_date: "2026-10-07".into(),
+        fields: vec![
+            "meridian.v1.Price.price".into(),
+            "meridian.v1.Price.kind".into(),
+        ],
+        row_limit: 2,
+        ..Default::default()
+    };
+    let cut = asked("reporting-1", true, request.clone()).unwrap();
+    assert_eq!(cut.prices.len(), 2);
+    assert!(cut.truncated, "more rows matched than the limit");
+    assert_eq!(amount(&cut.prices[0]), "1");
+    assert_eq!(cut.prices[0].basis, 0, "a field not named is left out");
+    assert!(cut.prices[0].meta.is_some(), "the row's meta always kept");
+    assert!(cut.datasets.iter().any(|d| d.dataset == "coinbase-1:daily"));
+    let whole = asked(
+        "reporting-1",
+        true,
+        meridian_domain::v1::QueryLakeRequest {
+            row_limit: 0,
+            ..request.clone()
+        },
+    )
+    .unwrap();
+    assert_eq!(whole.prices.len(), 3);
+    assert!(!whole.truncated);
+    // Not entitled: unanswered for the dataset, with its reason.
+    let stranger = asked("reporting-2", true, request.clone()).unwrap();
+    assert!(stranger.prices.is_empty());
+    assert!(stranger
+        .unanswered
+        .iter()
+        .any(|u| u.reason == UnansweredReason::NotEntitled as i32));
+    // Bounds, each refused naming its field.
+    let refused = |request: meridian_domain::v1::QueryLakeRequest| {
+        asked("reporting-1", true, request).unwrap_err()
+    };
+    assert!(refused(meridian_domain::v1::QueryLakeRequest {
+        subjects: vec![SubjectRef::default(); 501],
+        ..request.clone()
+    })
+    .contains("subjects"));
+    assert!(refused(meridian_domain::v1::QueryLakeRequest {
+        row_limit: 10_001,
+        ..request.clone()
+    })
+    .contains("row_limit"));
+    assert!(refused(meridian_domain::v1::QueryLakeRequest {
+        kind: "candles".into(),
+        ..request.clone()
+    })
+    .contains("kind"));
+    assert!(refused(meridian_domain::v1::QueryLakeRequest {
+        fields: vec!["meridian.v1.Trade.price".into()],
+        ..request.clone()
+    })
+    .contains("fields[0]"));
+    // The dashboard's tool names the instance; a plugin asks as itself.
+    assert!(asked("dashboard-1", false, request.clone())
+        .unwrap_err()
+        .contains("instance_id"));
+    let for_person = asked(
+        "dashboard-1",
+        false,
+        meridian_domain::v1::QueryLakeRequest {
+            instance_id: "reporting-1".into(),
+            ..request.clone()
+        },
+    )
+    .unwrap();
+    assert_eq!(for_person.prices.len(), 2);
+    assert!(asked(
+        "reporting-2",
+        true,
+        meridian_domain::v1::QueryLakeRequest {
+            instance_id: "reporting-1".into(),
+            ..request
+        },
+    )
+    .unwrap_err()
+    .contains("instance_id"));
+}

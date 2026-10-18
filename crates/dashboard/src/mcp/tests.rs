@@ -418,7 +418,10 @@ async fn the_list_is_what_the_person_holds_and_the_delegation_covers() {
             // Contract v25: the Documentation tab's tool, at any level.
             &[
                 "dashboard__list_plugins",
-                "dashboard__read_plugin_documentation"
+                "dashboard__read_plugin_documentation",
+                // Contract v26: the lake's bounded query and the dictionary.
+                "dashboard__query_lake",
+                "dashboard__read_dictionary_entry"
             ],
             PREPARED_TOOLS.as_slice(),
             &["dashboard__list_service_accounts"],
@@ -426,7 +429,7 @@ async fn the_list_is_what_the_person_holds_and_the_delegation_covers() {
         ]
         .concat()
     );
-    let listed = &said["result"]["tools"][TICKET_TOOLS.len() + PREPARED_TOOLS.len() + 4];
+    let listed = &said["result"]["tools"][TICKET_TOOLS.len() + PREPARED_TOOLS.len() + 6];
     assert_eq!(listed["annotations"]["readOnlyHint"], true);
     assert!(listed["description"]
         .as_str()
@@ -447,7 +450,10 @@ async fn the_list_is_what_the_person_holds_and_the_delegation_covers() {
             TICKET_TOOLS.as_slice(),
             &[
                 "dashboard__list_plugins",
-                "dashboard__read_plugin_documentation"
+                "dashboard__read_plugin_documentation",
+                // Contract v26: the lake's bounded query and the dictionary.
+                "dashboard__query_lake",
+                "dashboard__read_dictionary_entry"
             ],
             PREPARED_TOOLS.as_slice(),
             &["dashboard__list_service_accounts"],
@@ -497,7 +503,10 @@ async fn a_deployment_admins_delegation_lists_cores_tools_first_when_it_covers_t
             TICKET_TOOLS.as_slice(),
             &[
                 "dashboard__list_plugins",
-                "dashboard__read_plugin_documentation"
+                "dashboard__read_plugin_documentation",
+                // Contract v26: the lake's bounded query and the dictionary.
+                "dashboard__query_lake",
+                "dashboard__read_dictionary_entry"
             ],
             PREPARED_TOOLS.as_slice(),
             &["dashboard__list_service_accounts"]
@@ -3085,4 +3094,93 @@ async fn the_registries_tools_read_for_a_deployment_admin_and_act_once_loosened(
         .unwrap()
         .iter()
         .all(|(t, _, _)| t != crate::registry::UPDATE_PLUGIN));
+}
+
+/// Contract v26 (W10.10, W6.20): dashboard__query_lake asks the lake within
+/// an instance the person reads, for a kind its roles read, as that
+/// instance; dashboard__read_dictionary_entry answers an entry as the
+/// boundaries hold it.
+#[tokio::test]
+async fn a_lake_query_is_asked_as_the_instance_named_and_the_dictionary_answers_an_entry() {
+    let h = harness(false).await;
+    // ops-1 holds operations, which reads outcomes alone.
+    let mut held = records(false);
+    held.known_plugins = vec![meridian_domain::v1::KnownPluginRoles {
+        plugin_instance_id: INSTANCE.into(),
+        roles: vec!["operations".into()],
+    }];
+    held.access_groups[0].entries[0].role = "operations".into();
+    h.app.records.store(held, h.app.clock.now_ns());
+    let asked = Arc::new(Mutex::new(
+        Vec::<meridian_domain::v1::QueryLakeRequest>::new(),
+    ));
+    let heard = Arc::clone(&asked);
+    h.app
+        .bus
+        .serve("platform.lake.query.query-lake", move |envelope| {
+            heard.lock().unwrap().push(
+                meridian_domain::v1::QueryLakeRequest::decode(&envelope.payload[..]).unwrap(),
+            );
+            Ok((
+                "meridian.v1.QueryLakeReply".into(),
+                meridian_domain::v1::QueryLakeReply {
+                    truncated: true,
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            ))
+        });
+    let mut covers = covering(&["read"], false);
+    covers.plugins = [(
+        INSTANCE.to_string(),
+        "operations".to_string(),
+        "read".to_string(),
+    )]
+    .into_iter()
+    .collect();
+    let reading = token(&h.app, covers, Resource::Mcp).await;
+    let query = |kind: &str| {
+        call(
+            "dashboard__query_lake",
+            json!({"plugin_instance_id": INSTANCE, "kind": kind, "subjects": ["INS-A"], "row_limit": 2}),
+        )
+    };
+    let (_, said, _) = rpc(&h.app, Some(&reading), &[], query("trades")).await;
+    let refusal = structured(&said);
+    assert_eq!(refusal["outcome"], "refused", "{said}");
+    assert_eq!(refusal["fields"][0]["path"], "kind", "{said}");
+    assert!(
+        asked.lock().unwrap().is_empty(),
+        "nothing asked of the lake"
+    );
+    let (_, said, _) = rpc(&h.app, Some(&reading), &[], query("outcomes")).await;
+    assert_eq!(structured(&said)["data"]["truncated"], true, "{said}");
+    let sent = asked.lock().unwrap()[0].clone();
+    assert_eq!((sent.instance_id.as_str(), sent.row_limit), (INSTANCE, 2));
+    let (_, said, _) = rpc(
+        &h.app,
+        Some(&reading),
+        &[],
+        call(
+            "dashboard__query_lake",
+            json!({"plugin_instance_id": "other-1", "kind": "outcomes", "subjects": ["INS-A"]}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        structured(&said)["fields"][0]["path"],
+        "plugin_instance_id",
+        "{said}"
+    );
+    let (_, said, _) = rpc(
+        &h.app,
+        Some(&reading),
+        &[],
+        call(
+            "dashboard__read_dictionary_entry",
+            json!({"name": "meridian.v1.RunJobRequest.job"}),
+        ),
+    )
+    .await;
+    assert_eq!(structured(&said)["data"]["since"], "v26", "{said}");
 }

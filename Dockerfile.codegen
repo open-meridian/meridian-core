@@ -61,3 +61,6 @@ RUN mkdir -p /out \
 FROM scratch AS export
 COPY --from=rust-gen /out/v1.rs /v1.rs
 COPY --from=transitions /out/transitions.rs /transitions.rs
+# The data dictionary (contract v26, W6.20): the boundaries' fields.json at
+# the pinned revision, carried whole for dashboard__read_dictionary_entry.
+COPY --from=schema-boundaries fields.json /fields.json

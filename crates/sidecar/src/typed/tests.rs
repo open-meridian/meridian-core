@@ -47,9 +47,10 @@ fn contract() -> Contract {
          platform.config.query.accounts\tquery\tcustody\tconductor\n\
          platform.reference.query.resolve-identifier\tquery\tcustody\tinstrument\n\
          platform.street.query.list-custodial-positions\tquery\toperations\tstreet\n\
-         platform.street.query.list-statements\tquery\toperations\tstreet\n",
+         platform.street.query.list-statements\tquery\toperations\tstreet\n\
+         platform.lake.query.query-lake\tquery\toperations\tlake\n",
         "name\tkind\ncustody\trole\noperations\trole\nstreet\tcomponent\nsidecar\tcomponent\n\
-         conductor\tcomponent\ninstrument\tcomponent\n",
+         conductor\tcomponent\ninstrument\tcomponent\nlake\tcomponent\n",
     )
     .unwrap()
 }
@@ -2616,3 +2617,54 @@ async fn a_service_account_administers_nothing_whatever_it_holds() {
 
 /// Contract v22's admission (W4.9, W4.11, W11.20 to W11.22).
 mod order_path;
+
+/// W10.10 (contract v26): a QueryLake for a kind none of the plugin's roles
+/// reads is refused at the sidecar naming `kind` -- `operations` reads
+/// outcomes alone, `reporting` no trades or quotes -- and one it reads is
+/// asked of the lake as the plugin.
+#[tokio::test]
+async fn a_query_of_a_kind_the_roles_do_not_read_is_refused_naming_kind() {
+    let (sidecar, bus, _) = registered(&["operations"]).await;
+    let asked = Arc::new(Mutex::new(
+        Vec::<meridian_domain::v1::QueryLakeRequest>::new(),
+    ));
+    let heard = asked.clone();
+    bus.serve("platform.lake.query.query-lake", move |envelope| {
+        heard
+            .lock()
+            .unwrap()
+            .push(meridian_domain::v1::QueryLakeRequest::decode(&envelope.payload[..]).unwrap());
+        Ok((
+            "meridian.v1.QueryLakeReply".into(),
+            meridian_domain::v1::QueryLakeReply::default().encode_to_vec(),
+        ))
+    });
+    let query = |kind: &str| meridian_pb::plugin::v1::QueryLakeParams {
+        kind: kind.into(),
+        ..Default::default()
+    };
+    let refused = sidecar
+        .query_lake(Request::new(query("trades")))
+        .await
+        .expect_err("operations reads no trades");
+    assert_eq!(refused.code(), Code::PermissionDenied);
+    assert!(
+        refused.message().starts_with("kind:"),
+        "{}",
+        refused.message()
+    );
+    assert!(
+        asked.lock().unwrap().is_empty(),
+        "nothing asked of the lake"
+    );
+    sidecar
+        .query_lake(Request::new(query("outcomes")))
+        .await
+        .expect("operations reads outcomes");
+    let sent = asked.lock().unwrap()[0].clone();
+    assert_eq!(sent.kind, "outcomes");
+    assert_eq!(
+        sent.instance_id, "snaptrade-1",
+        "asked as the plugin itself"
+    );
+}

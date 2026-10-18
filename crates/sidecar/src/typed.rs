@@ -171,6 +171,9 @@ const VENUE_FACTS: [(&str, &str); 3] = [
 /// A placement (CreatePlacement, W11.8, contract v22), whose connectivity
 /// plugin the sidecar holds to the claims' connectivity_instance_ids.
 const CREATE_PLACEMENT: &str = "meridian.v1.CreatePlacementRequest";
+/// W10.10's request, whose kind the plugin's roles must read.
+const QUERY_LAKE: &str = "meridian.v1.QueryLakeRequest";
+
 /// An accept of fills (W11.23): to a new order, held to the agents' guard
 /// (contract v26).
 const ACCEPT_EXECUTION: &str = "meridian.v1.AcceptExecutionRequest";
@@ -474,6 +477,9 @@ impl Sidecar {
         self.daily.operation(self.clock.now_ns());
         let topic = self.own_topic(topic);
         self.granted(&topic)?;
+        if payload_type == QUERY_LAKE {
+            self.reads_the_kind(&message.encode_to_vec())?;
+        }
         let message = self.kept_at_the_edge(payload_type, message)?;
         self.dates_stand(payload_type, &message.encode_to_vec())?;
         let mut stamp = if AS_ITSELF.contains(&topic.as_str()) {
@@ -863,6 +869,28 @@ impl Sidecar {
 
     /// Which of this plugin's roles hold `topic` among their generated
     /// grants (decisions/033, point 3): what a person's act is admitted by.
+    /// W10.10 (contract v26): a QueryLake asks only a kind one of this
+    /// plugin's roles reads, as the reads' rows grant them -- `reporting`
+    /// reads no trades or quotes (the lake spec's Q6). Refused here, naming
+    /// `kind`; the lake checks the kind's spelling and the entitlements.
+    fn reads_the_kind(&self, payload: &[u8]) -> Result<(), Status> {
+        let asked = meridian_domain::v1::QueryLakeRequest::decode(payload).map_err(|failed| {
+            Status::invalid_argument(format!("an undecodable query: {failed}"))
+        })?;
+        let kind = asked.kind.trim();
+        if !meridian_domain::lake::QUERY_KINDS.contains(&kind)
+            || meridian_domain::lake::roles_read_kind(&self.identity.roles, kind)
+        {
+            return Ok(());
+        }
+        let refusal = format!(
+            "kind: no role this plugin holds ({}) reads {kind}",
+            self.identity.roles.join(", ")
+        );
+        self.note_refusal(&refusal);
+        Err(Status::permission_denied(refusal))
+    }
+
     fn roles_granting(&self, topic: &str) -> Vec<String> {
         self.contract.roles_granting(&self.identity.roles, topic)
     }
