@@ -75,6 +75,11 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/terminal/book-health", get(book_health))
         .route("/terminal/plugins/launch", post(launch))
         .route("/terminal/plugins/stop", post(stop))
+        // Contract v26 (the v26 plan's question 237): the registry's acts
+        // from `meridian plugin install|update|retire`.
+        .route("/terminal/plugins/install", post(install))
+        .route("/terminal/plugins/update", post(update))
+        .route("/terminal/plugins/retire", post(retire))
         .route(
             "/terminal/plugins/{instance}/dev/{what}",
             get(develop).put(develop),
@@ -756,12 +761,53 @@ async fn book_health(State(app): State<Arc<App>>, headers: HeaderMap) -> Respons
 }
 
 async fn list(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
-    if let Err(refusal) = admin(&app, &headers).await {
-        return *refusal;
-    }
+    let person: Result<Admin, ()> = match admin(&app, &headers).await {
+        Ok(admin) => Ok(admin),
+        Err(refusal) => return *refusal,
+    };
     let held = match catalogue(&app).await {
         Ok(held) => held,
         Err(failed) => return refused(StatusCode::BAD_GATEWAY, failed),
+    };
+    // Contract v26 (W8.2, W8.12): a registry version's source and its pull,
+    // and each launch running a pulled version whether it was kept.
+    let listings = match &person {
+        Ok(admin) => crate::registry::listings(
+            &app,
+            &admin.person.subject,
+            meridian_domain::v1::ListRegistryPluginsRequest {
+                page_size: 200,
+                ..Default::default()
+            },
+        )
+        .await
+        .map(|reply| reply.listings)
+        .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    let pull_of = |version: &PluginVersion| {
+        let m = version.metadata.clone().unwrap_or_default();
+        listings
+            .iter()
+            .find(|l| !version.listing.is_empty() && l.listing == version.listing)
+            .and_then(|l| {
+                l.versions
+                    .iter()
+                    .find(|v| v.version == m.version && v.registry == version.source_registry)
+            })
+            .and_then(|v| v.pull.clone())
+            .filter(|pull| pull.restored_at_ns == 0)
+    };
+    let pull_json = |pull: &meridian_domain::v1::PluginPull| {
+        serde_json::json!({
+            "kind": match meridian_domain::v1::PullReasonKind::try_from(pull.kind) {
+                Ok(meridian_domain::v1::PullReasonKind::CopyrightNotice) => "copyright_notice",
+                _ => "terms_breach",
+            },
+            "reason": pull.reason,
+            "pulled_at_ns": pull.pulled_at_ns.to_string(),
+            "warning": format!("pulled: {}", crate::registry::pull_kind(pull)),
+        })
     };
     let versions: Vec<serde_json::Value> = held
         .versions
@@ -773,6 +819,9 @@ async fn list(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
                 "interface": m.interface, "sdk_version": m.sdk_version,
                 "image_digest": version.image_digest,
                 "declaration": m.declaration.as_ref().map(crate::declaration::to_json),
+                "source_registry": version.source_registry,
+                "listing": version.listing,
+                "pull": pull_of(version).as_ref().map(pull_json),
             })
         })
         .collect();
@@ -780,10 +829,19 @@ async fn list(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
         .launches
         .iter()
         .map(|launch| {
+            let running = held.versions.iter().find(|v| {
+                v.metadata
+                    .as_ref()
+                    .is_some_and(|m| m.name == launch.name && m.version == launch.version)
+            });
+            let pulled = running.and_then(&pull_of);
             serde_json::json!({
                 "instance_id": launch.instance_id, "name": launch.name,
                 "version": launch.version, "state": state_name(launch.state),
                 "failure": launch.failure, "live": launch.live,
+                "pull_kept": pulled.as_ref().map(|_| {
+                    running.is_some_and(|v| crate::registry::pull_warning(launch, v, &listings).is_none())
+                }),
             })
         })
         .collect();
@@ -888,6 +946,252 @@ async fn stop(
         ),
         Err(reason) if reason.contains("is live") => refused(StatusCode::NOT_FOUND, reason),
         Err(reason) => refused(StatusCode::BAD_GATEWAY, reason),
+    }
+}
+
+/// A registry act's refusal as the terminal reads it: 403 for permission,
+/// 400 for an argument, each naming its fields; otherwise 409, the check or
+/// the floor that stopped it, nothing moved.
+fn registry_refused(reason: &str) -> Response {
+    match meridian_bus::read_refusal_status(reason) {
+        Some((status, fields, words)) => json(
+            match status {
+                meridian_bus::RefusalStatus::PermissionDenied => StatusCode::FORBIDDEN,
+                meridian_bus::RefusalStatus::InvalidArgument => StatusCode::BAD_REQUEST,
+            },
+            serde_json::json!({"error": words, "fields": fields}),
+        ),
+        None => {
+            let words = meridian_bus::read_refusal(reason).map_or(reason, |(_, words)| words);
+            refused(StatusCode::CONFLICT, words)
+        }
+    }
+}
+
+/// The words of a note a registry act requires, or the refusal naming it.
+fn noted(note: &str) -> Result<String, Box<Response>> {
+    let note = note.trim();
+    if note.is_empty() {
+        return Err(Box::new(json(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": "note: say why", "fields": ["note"]}),
+        )));
+    }
+    Ok(note.to_string())
+}
+
+#[derive(serde::Deserialize)]
+struct Install {
+    listing: String,
+    version: String,
+    #[serde(default)]
+    registry: String,
+    #[serde(default)]
+    note: String,
+}
+
+/// InstallPluginFromTerminal (contract v26, W8.10): JSON the dashboard
+/// turns into InstallPlugin for the deployment admin, under their
+/// delegation.
+async fn install(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let (person, asked): (Admin, Install) = match admin_asking(&app, &headers, &body).await {
+        Ok(asked) => asked,
+        Err(refusal) => return *refusal,
+    };
+    let note = match noted(&asked.note) {
+        Ok(note) => note,
+        Err(refusal) => return *refusal,
+    };
+    let installed: Result<PluginVersion, String> = ask(
+        &app,
+        &person,
+        crate::registry::INSTALL_PLUGIN,
+        "meridian.v1.InstallPluginRequest",
+        meridian_domain::v1::InstallPluginRequest {
+            listing: asked.listing,
+            version: asked.version,
+            registry: if asked.registry.is_empty() {
+                "community".into()
+            } else {
+                asked.registry
+            },
+            note,
+        },
+        Duration::from_secs(120),
+    )
+    .await;
+    match installed {
+        Ok(version) => {
+            let m = version.metadata.clone().unwrap_or_default();
+            json(
+                StatusCode::CREATED,
+                serde_json::json!({
+                    "name": m.name, "version": m.version,
+                    "listing": version.listing, "source_registry": version.source_registry,
+                }),
+            )
+        }
+        Err(reason) => registry_refused(&reason),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct Update {
+    instance_id: String,
+    /// Empty: the newest version the instance's source registry offers.
+    #[serde(default)]
+    version: String,
+    /// A local instance moved to a listing (W8.11).
+    #[serde(default)]
+    listing: String,
+    #[serde(default)]
+    approved_roles: Vec<String>,
+    #[serde(default)]
+    note: String,
+}
+
+/// UpdatePluginFromTerminal (contract v26, W8.11).
+async fn update(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let (person, asked): (Admin, Update) = match admin_asking(&app, &headers, &body).await {
+        Ok(asked) => asked,
+        Err(refusal) => return *refusal,
+    };
+    let note = match noted(&asked.note) {
+        Ok(note) => note,
+        Err(refusal) => return *refusal,
+    };
+    let mut version = asked.version.trim().to_string();
+    if version.is_empty() {
+        // The newest its source registry offers above what it runs.
+        let held = match catalogue(&app).await {
+            Ok(held) => held,
+            Err(failed) => return refused(StatusCode::BAD_GATEWAY, failed),
+        };
+        let Some(launch) = held
+            .launches
+            .iter()
+            .find(|l| l.instance_id == asked.instance_id)
+        else {
+            return refused(
+                StatusCode::NOT_FOUND,
+                format!("no instance {} in the catalogue", asked.instance_id),
+            );
+        };
+        let running = held.versions.iter().find(|v| {
+            v.metadata
+                .as_ref()
+                .is_some_and(|m| m.name == launch.name && m.version == launch.version)
+        });
+        let listings = crate::registry::listings(
+            &app,
+            &person.person.subject,
+            meridian_domain::v1::ListRegistryPluginsRequest {
+                page_size: 200,
+                ..Default::default()
+            },
+        )
+        .await
+        .map(|reply| reply.listings)
+        .unwrap_or_default();
+        match running.and_then(|v| crate::registry::update_for(v, &launch.version, &listings)) {
+            Some(newer) => version = newer.version.clone(),
+            None => {
+                return refused(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "{} runs the newest version its source registry offers",
+                        asked.instance_id
+                    ),
+                )
+            }
+        }
+    }
+    let moved: Result<PluginLaunch, String> = ask(
+        &app,
+        &person,
+        crate::registry::UPDATE_PLUGIN,
+        "meridian.v1.UpdatePluginRequest",
+        meridian_domain::v1::UpdatePluginRequest {
+            instance_id: asked.instance_id,
+            listing: asked.listing,
+            version,
+            approved_roles: asked.approved_roles,
+            note,
+        },
+        Duration::from_secs(120),
+    )
+    .await;
+    match moved {
+        Ok(launch) => json(
+            StatusCode::OK,
+            serde_json::json!({
+                "instance_id": launch.instance_id, "version": launch.version,
+                "state": state_name(launch.state),
+            }),
+        ),
+        Err(reason) => registry_refused(&reason),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct Retire {
+    name: String,
+    version: String,
+    #[serde(default)]
+    note: String,
+}
+
+/// RetirePluginVersionFromTerminal (contract v26, W8.15).
+async fn retire(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let (person, asked): (Admin, Retire) = match admin_asking(&app, &headers, &body).await {
+        Ok(asked) => asked,
+        Err(refusal) => return *refusal,
+    };
+    let note = match noted(&asked.note) {
+        Ok(note) => note,
+        Err(refusal) => return *refusal,
+    };
+    let retired: Result<PluginVersion, String> = ask(
+        &app,
+        &person,
+        RETIRE_PLUGIN_VERSION,
+        "meridian.v1.RetirePluginVersionRequest",
+        meridian_domain::v1::RetirePluginVersionRequest {
+            name: asked.name,
+            version: asked.version,
+            note,
+        },
+        Duration::from_secs(20),
+    )
+    .await;
+    match retired {
+        Ok(version) => {
+            let m = version.metadata.clone().unwrap_or_default();
+            json(
+                StatusCode::OK,
+                serde_json::json!({
+                    "name": m.name, "version": m.version,
+                    "retired_by": version.retired_by,
+                    "retired_at_ns": version.retired_at_ns.to_string(),
+                }),
+            )
+        }
+        Err(reason) if reason.contains("not in the catalogue") => {
+            refused(StatusCode::NOT_FOUND, reason)
+        }
+        Err(reason) => refused(StatusCode::CONFLICT, reason),
     }
 }
 

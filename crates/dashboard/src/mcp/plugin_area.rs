@@ -2976,6 +2976,11 @@ pub const PARITY: &[(&str, &str)] = &[
         "read_plugin_catalogue; exception: upload stays the CLI's (the plan's Q2)",
     ),
     ("/terminal/plugins/launch", "launch_plugin"),
+    // Contract v26 (the v26 plan's question 237): the registry's acts from
+    // the terminal.
+    ("/terminal/plugins/install", "install_plugin"),
+    ("/terminal/plugins/update", "update_plugin"),
+    ("/terminal/plugins/retire", "retire_plugin_version"),
     ("/admin/plugins/versions", "read_plugin_catalogue search_registry_plugins read_registries"),
     (
         "/admin/plugins/versions/{name}/{version}/documentation",

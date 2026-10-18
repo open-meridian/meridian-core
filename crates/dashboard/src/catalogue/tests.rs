@@ -126,6 +126,8 @@ fn conductor(bus: &Bus) {
                         ..Default::default()
                     }),
                     image_digest: DIGEST.into(),
+                    listing: "open-meridian/snaptrade".into(),
+                    source_registry: "community".into(),
                     ..Default::default()
                 }],
                 launches: vec![meridian_domain::v1::PluginLaunch {
@@ -205,6 +207,94 @@ fn conductor(bus: &Bus) {
             PluginLaunch {
                 instance_id: request.instance_id,
                 state: PluginLaunchState::Launched as i32,
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ))
+    });
+    // Contract v26 (W8.2, W8.12): the catalogue's copy, 0.1.0 pulled.
+    bus.serve(crate::registry::REGISTRY_PLUGINS, |_| {
+        Ok((
+            "meridian.v1.ListRegistryPluginsReply".into(),
+            meridian_domain::v1::ListRegistryPluginsReply {
+                listings: vec![meridian_domain::v1::PluginListing {
+                    listing: "open-meridian/snaptrade".into(),
+                    versions: vec![meridian_domain::v1::ListedVersion {
+                        listing: "open-meridian/snaptrade".into(),
+                        version: "0.1.0".into(),
+                        registry: "community".into(),
+                        pull: Some(meridian_domain::v1::PluginPull {
+                            kind: meridian_domain::v1::PullReasonKind::TermsBreach as i32,
+                            reason: "a breach".into(),
+                            pulled_at_ns: T0,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ))
+    });
+    // Contract v26: the registry's acts, as the terminal sends them.
+    bus.serve(crate::registry::INSTALL_PLUGIN, |envelope| {
+        stamped(&envelope)?;
+        let request =
+            meridian_domain::v1::InstallPluginRequest::decode(&envelope.payload[..]).unwrap();
+        if request.version == "9.9.9" {
+            return Err(
+                "open-meridian/snaptrade 9.9.9 needs contract v99; this deployment runs v26".into(),
+            );
+        }
+        Ok((
+            "meridian.v1.PluginVersion".into(),
+            PluginVersion {
+                metadata: Some(PluginMetadata {
+                    name: "snaptrade".into(),
+                    version: request.version,
+                    ..Default::default()
+                }),
+                listing: request.listing,
+                source_registry: request.registry,
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ))
+    });
+    bus.serve(crate::registry::UPDATE_PLUGIN, |envelope| {
+        stamped(&envelope)?;
+        let request =
+            meridian_domain::v1::UpdatePluginRequest::decode(&envelope.payload[..]).unwrap();
+        Ok((
+            "meridian.v1.PluginLaunch".into(),
+            PluginLaunch {
+                instance_id: request.instance_id,
+                version: request.version,
+                state: PluginLaunchState::Launched as i32,
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ))
+    });
+    bus.serve(crate::catalogue::RETIRE_PLUGIN_VERSION, |envelope| {
+        stamped(&envelope)?;
+        let request =
+            meridian_domain::v1::RetirePluginVersionRequest::decode(&envelope.payload[..]).unwrap();
+        if request.version == "0.1.0" {
+            return Err("snaptrade 0.1.0 is run by snaptrade-1; nothing retired".into());
+        }
+        Ok((
+            "meridian.v1.PluginVersion".into(),
+            PluginVersion {
+                metadata: Some(PluginMetadata {
+                    name: request.name,
+                    version: request.version,
+                    ..Default::default()
+                }),
+                retired_by: envelope.meta.unwrap_or_default().acting_for_subject,
+                retired_at_ns: T0,
                 ..Default::default()
             }
             .encode_to_vec(),
@@ -658,6 +748,18 @@ async fn the_catalogue_launching_and_stopping() {
     let listed: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(listed["versions"][0]["image_digest"], DIGEST);
     assert_eq!(listed["launches"][0]["state"], "launched");
+    // Contract v26: the version's source and its pull, and the instance
+    // running it not kept.
+    assert_eq!(listed["versions"][0]["source_registry"], "community");
+    assert_eq!(
+        listed["versions"][0]["pull"]["kind"], "terms_breach",
+        "{body}"
+    );
+    assert_eq!(
+        listed["versions"][0]["pull"]["warning"],
+        "pulled: a breach of the Platform Terms"
+    );
+    assert_eq!(listed["launches"][0]["pull_kept"], false);
 
     let launch = |roles: &[&str]| {
         serde_json::json!({"name": "snaptrade", "version": "0.1.0", "instance_id": "snaptrade-2",
@@ -704,6 +806,100 @@ async fn the_catalogue_launching_and_stopping() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Contract v26 (the v26 plan's question 237): `meridian plugin install`,
+/// `update` and `retire` send JSON the dashboard turns into the bus's
+/// commands for a deployment admin, each with a note, stamped with the
+/// delegation; a refusal says its status and its words.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_registry_version_is_installed_updated_and_retired_from_the_terminal() {
+    let h = harness().await;
+    for path in [
+        "/terminal/plugins/install",
+        "/terminal/plugins/update",
+        "/terminal/plugins/retire",
+    ] {
+        assert_eq!(
+            send(&h, "POST", path, Some(&h.bob), "{}").await.0,
+            StatusCode::FORBIDDEN,
+            "{path}"
+        );
+    }
+    let install = |version: &str, note: &str| {
+        serde_json::json!({"listing": "open-meridian/snaptrade", "version": version,
+                           "registry": "community", "note": note})
+        .to_string()
+    };
+    let (status, _, body) = send(
+        &h,
+        "POST",
+        "/terminal/plugins/install",
+        Some(&h.ada),
+        &install("0.18.0", "First-party custody plugin."),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let said: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        (said["version"].as_str(), said["source_registry"].as_str()),
+        (Some("0.18.0"), Some("community"))
+    );
+    let (status, _, body) = send(
+        &h,
+        "POST",
+        "/terminal/plugins/install",
+        Some(&h.ada),
+        &install("0.18.0", " "),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("\"fields\":[\"note\"]"), "{body}");
+    let (status, _, body) = send(
+        &h,
+        "POST",
+        "/terminal/plugins/install",
+        Some(&h.ada),
+        &install("9.9.9", "Newer."),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("needs contract v99"), "{body}");
+
+    let (status, _, body) = send(
+        &h,
+        "POST",
+        "/terminal/plugins/update",
+        Some(&h.ada),
+        r#"{"instance_id":"snaptrade-1","version":"0.18.1","approved_roles":["custody"],"note":"Fixes the pager."}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("\"version\":\"0.18.1\""), "{body}");
+
+    let (status, _, body) = send(
+        &h,
+        "POST",
+        "/terminal/plugins/retire",
+        Some(&h.ada),
+        r#"{"name":"snaptrade","version":"0.1.0","note":"Old."}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let (status, _, body) = send(
+        &h,
+        "POST",
+        "/terminal/plugins/retire",
+        Some(&h.ada),
+        r#"{"name":"snaptrade","version":"0.0.9","note":"Never launched."}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let said: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        !said["retired_by"].as_str().unwrap_or_default().is_empty(),
+        "{body}"
+    );
 }
 
 #[test]
