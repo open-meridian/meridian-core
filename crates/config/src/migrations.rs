@@ -147,6 +147,12 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0020_plugins_are_shared_and_documented.sql"),
         then: None,
     },
+    Migration {
+        version: 21,
+        name: "the_deployments_time_zone",
+        sql: include_str!("../migrations/0021_the_deployments_time_zone.sql"),
+        then: None,
+    },
 ];
 
 /// Migration 18 (contract v22; W11.21, decisions/031): each instance holding

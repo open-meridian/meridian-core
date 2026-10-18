@@ -3496,6 +3496,68 @@ async fn an_account_still_linked_granted_or_mapped_is_not_closed_and_each_is_nam
     assert_eq!(close().await.unwrap().state, AccountState::Closed as i32);
 }
 
+/// W6.35, W7.5 (contract v26): the deployment's time zone, America/New_York
+/// until set; a change names an IANA zone and says why, each its own record;
+/// the first run's zone recorded once where nothing set one before.
+#[tokio::test]
+async fn the_deployments_time_zone_is_new_york_until_set_each_change_its_own_record() {
+    let h = harness("dashboard-1");
+    let read = || {
+        ask::<_, meridian_domain::v1::DeploymentTimeZoneSetting>(
+            &h,
+            crate::service::READ_DEPLOYMENT_TIME_ZONE,
+            "meridian.v1.ReadDeploymentTimeZoneRequest",
+            meridian_domain::v1::ReadDeploymentTimeZoneRequest {},
+        )
+    };
+    let set = |zone: &str, reason: &str| {
+        ask::<_, meridian_domain::v1::DeploymentTimeZoneSetting>(
+            &h,
+            crate::service::SET_DEPLOYMENT_TIME_ZONE,
+            "meridian.v1.SetDeploymentTimeZoneRequest",
+            meridian_domain::v1::SetDeploymentTimeZoneRequest {
+                deployment_time_zone: zone.into(),
+                reason: reason.into(),
+            },
+        )
+    };
+    let default = read().await.unwrap();
+    assert_eq!(default.deployment_time_zone, "America/New_York");
+    assert_eq!(default.changed_at_ns, 0);
+    assert_eq!(
+        default.affirmation_deadline, 0,
+        "no operations instance launched"
+    );
+    let refused = set("Mars/Olympus_Mons", "moving").await.unwrap_err();
+    assert!(refused.contains("deployment_time_zone"), "{refused}");
+    let refused = set("Europe/London", " ").await.unwrap_err();
+    assert!(refused.contains("fields=reason"), "{refused}");
+    let changed = set("Europe/London", "the firm's office moved")
+        .await
+        .unwrap();
+    assert_eq!(changed.deployment_time_zone, "Europe/London");
+    assert!(changed.changed_at_ns > 0);
+    assert!(!changed.changed_by.is_empty());
+    assert_eq!(read().await.unwrap().deployment_time_zone, "Europe/London");
+    // The first run's zone is recorded only where nothing was set.
+    assert!(
+        !crate::service::record_first_run_time_zone(h.store.as_ref(), "Asia/Tokyo", 9).unwrap()
+    );
+    let fresh = crate::memory::MemoryStore::default();
+    assert!(crate::service::record_first_run_time_zone(&fresh, "Asia/Tokyo", 9).unwrap());
+    assert_eq!(
+        fresh.deployment_time_zone().unwrap().unwrap().changed_by,
+        "first-run"
+    );
+    assert!(crate::service::record_first_run_time_zone(&fresh, "Nowhere/Here", 10).is_ok());
+    assert!(crate::service::record_first_run_time_zone(
+        &crate::memory::MemoryStore::default(),
+        "Nowhere/Here",
+        10
+    )
+    .is_err());
+}
+
 /// W3.28 (contract v24): the usage report is on by default; turning it off
 /// says why and is its own record; the reports sent are listed.
 #[tokio::test]

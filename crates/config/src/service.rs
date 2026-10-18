@@ -97,6 +97,12 @@ pub const DEFINE_ACCOUNT: &str = "platform.config.command.define-account";
 pub const CLOSE_ACCOUNT: &str = "platform.config.command.close-account";
 /// W3.28 (contract v24): the usage statistics' setting, and the reports sent.
 pub const SET_REPORTS_USAGE: &str = "platform.config.command.set-reports-usage";
+/// W6.35 (contract v26): the deployment's time zone, set and read.
+pub const SET_DEPLOYMENT_TIME_ZONE: &str = "platform.config.command.set-deployment-time-zone";
+pub const READ_DEPLOYMENT_TIME_ZONE: &str = "platform.config.query.read-deployment-time-zone";
+/// The deployment's time zone with nothing set (the v26 plan's question
+/// 229: US first).
+pub const DEFAULT_TIME_ZONE: &str = "America/New_York";
 /// W3.28 (contract v25): the identifier schemes declared as licensed.
 pub const SET_LICENSED_SCHEMES: &str = "platform.config.command.set-licensed-schemes";
 
@@ -379,6 +385,85 @@ fn told(snapshot: &Snapshot, plugin_instance_id: &str) -> PluginConfiguration {
 /// contract v25), which its sidecar holds the plugin's registration to;
 /// none for an instance not launched from the catalogue, or a version
 /// uploaded with none.
+/// W6.35 (contract v26): the deployment's time zone in force, and beside
+/// it the earliest affirmation deadline a launched `operations` instance
+/// declares (W8.1, W11.34; the v26 plan's question 230), with the instance.
+pub fn time_zone_setting(
+    snapshot: &Snapshot,
+    held: Option<crate::store::TimeZoneChange>,
+) -> meridian_domain::v1::DeploymentTimeZoneSetting {
+    let held = held.unwrap_or_default();
+    let mut instances: Vec<&str> = snapshot
+        .catalogue
+        .launches
+        .iter()
+        .filter(|launch| launch.state == PluginLaunchState::Launched as i32)
+        .map(|launch| launch.instance_id.as_str())
+        .collect();
+    instances.sort_unstable();
+    instances.dedup();
+    let earliest = instances
+        .into_iter()
+        .filter(|instance| {
+            crate::connectivity::roles_of(snapshot, instance)
+                .iter()
+                .any(|role| role == "operations")
+        })
+        .filter_map(|instance| {
+            launched_declaration(snapshot, instance)
+                .map(|declaration| (declaration.affirmation_deadline, instance))
+        })
+        .filter(|(deadline, _)| (1..=1440).contains(deadline))
+        .min();
+    meridian_domain::v1::DeploymentTimeZoneSetting {
+        deployment_time_zone: if held.zone.is_empty() {
+            DEFAULT_TIME_ZONE.to_string()
+        } else {
+            held.zone
+        },
+        changed_at_ns: held.changed_at_ns,
+        changed_by: held.changed_by,
+        affirmation_deadline: earliest.map(|(deadline, _)| deadline).unwrap_or(0),
+        affirmation_deadline_instance_id: earliest
+            .map(|(_, instance)| instance.to_string())
+            .unwrap_or_default(),
+    }
+}
+
+/// W7.5 (contract v26): the zone the wizard was told, recorded once as the
+/// first change, by the deployment's first run, where nothing set one
+/// before. Says whether it recorded it.
+pub fn record_first_run_time_zone(
+    store: &dyn crate::store::Store,
+    zone: &str,
+    at_ns: i64,
+) -> Result<bool, String> {
+    let zone = zone.trim();
+    if zone.is_empty()
+        || store
+            .deployment_time_zone()
+            .map_err(|f| f.to_string())?
+            .is_some()
+    {
+        return Ok(false);
+    }
+    if !meridian_domain::zones::is_zone(zone) {
+        return Err(format!("{zone:?} is not an IANA time zone"));
+    }
+    store
+        .set_deployment_time_zone(
+            zone,
+            &Author {
+                by: "first-run".into(),
+                note: "set at the deployment's first run (W7.5)".into(),
+                ..Default::default()
+            },
+            at_ns,
+        )
+        .map_err(|f| f.to_string())?;
+    Ok(true)
+}
+
 fn launched_declaration(
     snapshot: &Snapshot,
     plugin_instance_id: &str,
@@ -1612,6 +1697,84 @@ pub fn serve_with(
                 reports_usage: cx.store.reports_usage().map_err(|f| f.to_string())?,
                 licensed_schemes: cx.store.licensed_schemes().map_err(|f| f.to_string())?,
             })
+        },
+    );
+
+    // W6.35 (contract v26): the deployment's time zone, a deployment admin's,
+    // each change its own record; and its read, by the book and the
+    // dashboard.
+    answer(
+        &context,
+        SET_DEPLOYMENT_TIME_ZONE,
+        (
+            "meridian.v1.SetDeploymentTimeZoneRequest",
+            "meridian.v1.DeploymentTimeZoneSetting",
+        ),
+        |cx, request: meridian_domain::v1::SetDeploymentTimeZoneRequest, envelope| {
+            let by = subject(envelope);
+            if by.is_empty() {
+                return Err(
+                    "the deployment's time zone is a deployment admin's, and this is sent for nobody"
+                        .into(),
+                );
+            }
+            let zone = request.deployment_time_zone.trim();
+            if !meridian_domain::zones::is_zone(zone) {
+                return Err(meridian_bus::refusal_with_status(
+                    meridian_bus::RefusalStatus::InvalidArgument,
+                    &["deployment_time_zone".to_string()],
+                    format!(
+                        "deployment_time_zone: {zone:?} is not an IANA time zone \
+                         (America/New_York, Europe/London, Asia/Tokyo)"
+                    ),
+                ));
+            }
+            if request.reason.trim().is_empty() {
+                return Err(meridian_bus::refusal_naming(
+                    meridian_pb::v1::RefusalReason::ReasonRequired as i32,
+                    &["reason".to_string()],
+                    "reason: a change to the deployment's time zone says why",
+                ));
+            }
+            if request.reason.chars().count() > 4_000 {
+                return Err("reason: at most 4,000 characters".into());
+            }
+            let held = cx.store.deployment_time_zone().map_err(|f| f.to_string())?;
+            let now = held
+                .as_ref()
+                .map(|held| held.zone.as_str())
+                .unwrap_or(DEFAULT_TIME_ZONE);
+            if now != zone || held.is_none() {
+                cx.store
+                    .set_deployment_time_zone(
+                        zone,
+                        &Author {
+                            note: request.reason.trim().to_string(),
+                            ..author(envelope)
+                        },
+                        cx.clock.now_ns(),
+                    )
+                    .map_err(|f| f.to_string())?;
+                tracing::info!(zone, by, "the deployment's time zone changed");
+            }
+            Ok(time_zone_setting(
+                &cx.snapshot()?,
+                cx.store.deployment_time_zone().map_err(|f| f.to_string())?,
+            ))
+        },
+    );
+    answer(
+        &context,
+        READ_DEPLOYMENT_TIME_ZONE,
+        (
+            "meridian.v1.ReadDeploymentTimeZoneRequest",
+            "meridian.v1.DeploymentTimeZoneSetting",
+        ),
+        |cx, _request: meridian_domain::v1::ReadDeploymentTimeZoneRequest, _| {
+            Ok(time_zone_setting(
+                &cx.snapshot()?,
+                cx.store.deployment_time_zone().map_err(|f| f.to_string())?,
+            ))
         },
     );
 

@@ -33,6 +33,7 @@ pub mod semver;
 pub mod setting_table;
 pub mod template;
 pub mod text;
+pub mod zone;
 pub mod zones;
 
 /// The roles at the edge, which alone may own storage for their raw external

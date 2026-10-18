@@ -126,6 +126,15 @@ pub struct Author {
     pub prepared_call_id: String,
 }
 
+/// The deployment's time zone as its latest change set it (contract v26,
+/// W6.35).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TimeZoneChange {
+    pub zone: String,
+    pub changed_at_ns: i64,
+    pub changed_by: String,
+}
+
 /// The longest a change's note may be, as a note on an instrument record.
 pub const MOST_NOTE: usize = 2_000;
 
@@ -1005,6 +1014,14 @@ pub trait Store: Send + Sync {
 
     /// The latest catalogue a plugin published for a code, if any.
     fn venue_catalogue(&self, instance_id: &str, code: &str) -> Result<Option<VenueCatalogue>>;
+
+    /// The deployment's time zone changed, its own record (contract v26,
+    /// W6.35, decisions/031): the zone, who, through what, when and why.
+    fn set_deployment_time_zone(&self, zone: &str, author: &Author, at_ns: i64) -> Result<()>;
+
+    /// The latest change to the deployment's time zone, if any: none is the
+    /// default, America/New_York.
+    fn deployment_time_zone(&self) -> Result<Option<TimeZoneChange>>;
 
     /// The usage statistics' setting changed, its own record (contract v24,
     /// W3.28, decisions/031): who, through what, when and why.

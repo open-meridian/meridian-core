@@ -34,6 +34,8 @@ pub struct MemoryStore {
     holds: Mutex<Vec<(Hold, String)>>,
     /// Contract v24 (W3.28): the usage setting's changes, and the reports.
     reports_usage: Mutex<Vec<(bool, Author, i64)>>,
+    /// Contract v26 (W6.35): the time zone's changes.
+    time_zones: Mutex<Vec<(String, Author, i64)>>,
     usage_reports: Mutex<Vec<meridian_domain::v1::SentUsageReport>>,
     archives: Mutex<Vec<(PluginArchive, String)>>,
     /// Each launch's and stop's note, in order (contract v17).
@@ -86,6 +88,7 @@ impl MemoryStore {
             access_changes: Mutex::new(Vec::new()),
             holds: Mutex::new(Vec::new()),
             reports_usage: Mutex::new(Vec::new()),
+            time_zones: Mutex::new(Vec::new()),
             usage_reports: Mutex::new(Vec::new()),
             registry: Mutex::new(None),
             statements: Mutex::new(Default::default()),
@@ -1121,6 +1124,28 @@ impl Store for MemoryStore {
                 held.connectivity_instance_id == instance_id && held.venue_account_code == code
             })
             .map(|(_, held)| held.clone()))
+    }
+
+    fn set_deployment_time_zone(&self, zone: &str, author: &Author, at_ns: i64) -> Result<()> {
+        self.time_zones.lock().expect("store lock poisoned").push((
+            zone.to_string(),
+            author.clone(),
+            at_ns,
+        ));
+        Ok(())
+    }
+
+    fn deployment_time_zone(&self) -> Result<Option<crate::store::TimeZoneChange>> {
+        Ok(self
+            .time_zones
+            .lock()
+            .expect("store lock poisoned")
+            .last()
+            .map(|(zone, author, at)| crate::store::TimeZoneChange {
+                zone: zone.clone(),
+                changed_at_ns: *at,
+                changed_by: author.by.clone(),
+            }))
     }
 
     fn set_reports_usage(&self, reports_usage: bool, author: &Author, at_ns: i64) -> Result<()> {

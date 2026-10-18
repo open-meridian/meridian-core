@@ -2121,6 +2121,43 @@ impl Store for PostgresStore {
             .transpose()
     }
 
+    fn set_deployment_time_zone(&self, zone: &str, author: &Author, at_ns: i64) -> Result<()> {
+        self.conn()?
+            .execute(
+                "INSERT INTO config_time_zone_change
+                        (deployment_time_zone, changed_by, through_delegation, client_name,
+                         prepared_call_id, changed_at_ns, note)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                &[
+                    &zone,
+                    &author.by,
+                    &author.delegation,
+                    &author.client,
+                    &author.prepared_call_id,
+                    &at_ns,
+                    &author.note,
+                ],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
+    fn deployment_time_zone(&self) -> Result<Option<crate::store::TimeZoneChange>> {
+        Ok(self
+            .conn()?
+            .query_opt(
+                "SELECT deployment_time_zone, changed_at_ns, changed_by FROM config_time_zone_change
+                  ORDER BY change_id DESC LIMIT 1",
+                &[],
+            )
+            .map_err(unavailable)?
+            .map(|row| crate::store::TimeZoneChange {
+                zone: row.get(0),
+                changed_at_ns: row.get(1),
+                changed_by: row.get(2),
+            }))
+    }
+
     fn set_reports_usage(&self, reports_usage: bool, author: &Author, at_ns: i64) -> Result<()> {
         self.conn()?
             .execute(
