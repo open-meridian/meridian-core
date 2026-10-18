@@ -6,17 +6,19 @@
 //! marked, and a person who may work the ticket and did not write the text
 //! releases it (W6.23).
 //!
-//! **The rules** are the platform's eleven, named as it names them --
-//! deliberately neutral, because the names are said back to agents --
-//! (meridian-platform `domain/text_rules.py`, held to the same red-team
-//! corpus, plans/tickets-inside-a-deployment Q6), with core's tool names in
-//! "tool name", and the ticket verbs (send, resolve, close, grant, delegate)
-//! said as an instruction. Each is matched case-blind on the text normalised
-//! as the platform normalises it -- NFKC, so full-width letters read as
-//! themselves, folded to lower case, its whitespace collapsed -- by plain
-//! phrase and word matchers: no regular-expression crate enters the kernel
-//! (Q7). A false positive costs a person one look; a miss still meets the
-//! primary defence, that no tool acts on a ticket.
+//! **The rules** are one canonical table (ruling 294; the v26 plan's
+//! question 239): meridian-design's evals/prompt-attacks/screen-rules.json,
+//! vendored beside this file by `make prompt-attacks` and read at build in
+//! place of hand-ported code, so the platform, the CLI and this deployment
+//! name and match the same rules -- deliberately neutral names, because they
+//! are said back to agents -- and replay the same red-team corpus. Each rule
+//! says the side it takes on each surface: a ticket's text held `suspect`, a
+//! vendor's text refused or withheld. Each is matched case-blind on the text
+//! normalised as the table says -- NFKC, so full-width letters read as
+//! themselves, folded to lower case, its whitespace collapsed -- by the
+//! table's plain phrase and word matchers: no regular-expression crate
+//! enters the kernel (Q7). A false positive costs a person one look; a miss
+//! still meets the primary defence, that no tool acts on a ticket.
 //!
 //! **Bounds and characters** refuse (requirement 59, [`meridian_domain::text`]);
 //! this module also normalises every text to NFC before it is bounded and
@@ -28,21 +30,15 @@ use unicode_normalization::UnicodeNormalization;
 /// What a tool answers in place of a text held as suspect.
 pub const WITHHELD: &str = "withheld until a person releases it on the ticket's page";
 
-/// The rules, in the order their names are answered.
-pub const RULES: [&str; 12] = [
-    "override",
-    "role marker",
-    "chat markup",
-    "instruction words",
-    "addressed to the reader",
-    "claims authority",
-    "tool name",
-    "answer-shaped",
-    "prompt talk",
-    "exfiltration",
-    "concealment",
-    "ticket verbs",
-];
+/// The rules a ticket's text and a note are held by (the table's `ticket`
+/// surface), in the order their names are answered.
+pub fn rules() -> Vec<&'static str> {
+    table()
+        .iter()
+        .filter(|rule| rule.ticket.is_some())
+        .map(|rule| rule.name)
+        .collect()
+}
 
 /// Core's own tools on the deployment's MCP surface, and the platform MCP's
 /// (its `TOOL_NAMES`), by name: either surface's tool named in a text reads
@@ -142,35 +138,9 @@ fn word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
-/// The contract's own terms ending in "instruction" or "instructions" (the
-/// dictionary's): the word in one of them is the contract's vocabulary, not
-/// an instruction to a reader, so "instruction words" does not match it
-/// there (agreement A, 2026-10-16). Exactly these, preceded by one space;
-/// every other "instruction" still matches. The platform's and the CLI's
-/// screens carry the same exemption.
-const CONTRACT_INSTRUCTION_TERMS: [&str; 5] = [
-    "allocation",
-    "trading",
-    "settlement",
-    "execution",
-    "handling",
-];
-
 impl Folded {
     fn len(&self) -> usize {
         self.chars.len()
-    }
-
-    /// Whether the word at `at` follows one of the contract's terms that
-    /// end in it ([`CONTRACT_INSTRUCTION_TERMS`]).
-    fn contract_term_before(&self, at: usize) -> bool {
-        if at == 0 || self.chars[at - 1] != ' ' {
-            return false;
-        }
-        CONTRACT_INSTRUCTION_TERMS.iter().any(|term| {
-            let n = term.chars().count();
-            at > n && self.at(at - 1 - n, term) && self.boundary_before(at - 1 - n)
-        })
     }
 
     /// Whether `needle` is at `at`.
@@ -305,439 +275,416 @@ impl Folded {
     }
 }
 
-/// The platform's claims rules for a vendor's text (meridian-platform
-/// `domain/registry_text.py`'s CLAIM_PATTERNS at fc9285f; the registries
-/// spec's requirement 28), named as it names them, so a plugin's
-/// documentation is screened alike at the catalogue and in the deployment
-/// (agreement A, 2026-10-16). Plain phrase matchers over the same folded
-/// text, as the rules above.
-pub const VENDOR_CLAIMS: [&str; 5] = [
-    "acts for the reader",
-    "claims endorsement",
-    "claims verification",
-    "poses as open meridian",
-    "claims regulatory readiness",
-];
+// ── The rules, from the one canonical table ──────────────────────────────
+//
+// meridian-design's evals/prompt-attacks/screen-rules.json (the v26 plan's
+// question 239, ruled 2026-10-17; ruling 294), vendored beside this file by
+// `make prompt-attacks` and read once: each rule's name as every surface
+// answers it, its matchers, and the side it takes on each surface. The
+// matchers are the table's kinds over the folded text, by plain phrase and
+// word matching -- no regular-expression crate enters the kernel (Q7); the
+// table's `regex` is the platform's reading of the same rule.
 
-/// The claims rules a vendor's text matches, in [`VENDOR_CLAIMS`]' order.
-pub fn vendor_claims(text: &str) -> Vec<&'static str> {
-    let f = folded(text);
-    if f.len() == 0 {
-        return Vec::new();
-    }
-    let joined = |firsts: &[&str], seconds: &[&str], between: &str| -> Vec<String> {
-        firsts
-            .iter()
-            .flat_map(|a| seconds.iter().map(move |b| format!("{a}{between}{b}")))
-            .collect()
-    };
-    let words = |phrases: &[String]| {
-        let phrases: Vec<&str> = phrases.iter().map(String::as_str).collect();
-        !f.any_word(&phrases).is_empty()
-    };
-    let mut found = Vec::new();
-    // Telling the reader to act at once, unasked.
-    let acts = f
-        .then_within(
-            &[
-                "install", "approve", "launch", "update", "enable", "grant", "star",
-            ],
-            &[
-                "automatically",
-                "immediately",
-                "without asking",
-                "without review",
-                "without approval",
-                "without confirmation",
-            ],
-            40,
-        )
-        .is_some()
-        || !f
-            .any_word(&[
-                "auto-approve",
-                "autoapprove",
-                "skip review",
-                "skip the review",
-                "skip approval",
-                "skip the approval",
-                "skip notice",
-                "skip the notice",
-            ])
-            .is_empty();
-    if acts {
-        found.push("acts for the reader");
-    }
-    let endorsed = f
-        .followed_by(
-            &[
-                "endorsed",
-                "recommended",
-                "certified",
-                "approved",
-                "vetted",
-                "audited",
-                "guaranteed",
-                "sponsored",
-            ],
-            &["by open meridian", "by the platform", "by meridian"],
-        )
-        .is_some()
-        || words(&joined(
-            &["official", "officially"],
-            &[
-                "open meridian plugin",
-                "open meridian partner",
-                "meridian plugin",
-                "meridian partner",
-            ],
-            " ",
-        ));
-    if endorsed {
-        found.push("claims endorsement");
-    }
-    let verified = words(&joined(
-        &["fully", "independently"],
-        &["verified", "audited", "reviewed"],
-        " ",
-    )) || words(&joined(
-        &["verified"],
-        &["safe", "secure", "compliant"],
-        " ",
-    )) || words(&[
-        "security-audited".to_string(),
-        "security audited".to_string(),
-    ]);
-    if verified {
-        found.push("claims verification");
-    }
-    let who = joined(
-        &[
-            "open meridian",
-            "meridian",
-            "the open meridian",
-            "the meridian",
-        ],
-        &["team", "staff", "platform", "support", "security"],
-        " ",
-    );
-    let poses = words(&joined(
-        &["this is", "message from", "on behalf of", "from"],
-        &who.iter().map(String::as_str).collect::<Vec<_>>(),
-        " ",
-    ));
-    if poses {
-        found.push("poses as open meridian");
-    }
-    let regulators = [
-        "sec", "finra", "mifid", "mifid ii", "17a-4", "sox", "soc2", "soc 2",
-    ];
-    let ready = ["compliant", "approved", "certified", "ready"];
-    let readiness = words(&joined(&regulators, &ready, "-"))
-        || words(&joined(&regulators, &ready, " "))
-        || words(&joined(&["regulator", "regulatory"], &["approved"], "-"))
-        || words(&joined(&["regulator", "regulatory"], &["approved"], " "));
-    if readiness {
-        found.push("claims regulatory readiness");
-    }
-    found
+const SCREEN_RULES: &str = include_str!("screen-rules.json");
+
+/// One matcher of a rule, as the table's `matcher_kinds` describes it.
+#[derive(Debug, Clone)]
+enum Matcher {
+    Words {
+        phrases: Vec<String>,
+        unless_after: Vec<String>,
+    },
+    Anywhere(Vec<String>),
+    Within {
+        first: Vec<String>,
+        then: Vec<String>,
+        gap: usize,
+    },
+    FollowedBy {
+        first: Vec<String>,
+        then: Vec<String>,
+    },
+    Marker(Vec<String>),
+    Tag(Vec<String>),
+    Opener(Vec<String>),
+    Closers,
+    LinkAfter {
+        first: Vec<String>,
+        gap: usize,
+    },
+    ToolShape,
+    SurfaceTools,
+    ClauseVerb {
+        verbs: Vec<String>,
+        leads: Vec<String>,
+        objects: Vec<String>,
+    },
+    Joined {
+        first: Vec<String>,
+        between: Vec<String>,
+        then: Vec<String>,
+    },
 }
 
-/// The rules a text matches, each once, in [`RULES`]' order, with where.
-pub fn matched(text: &str) -> Vec<Matched> {
-    let f = folded(text);
-    if f.len() == 0 {
-        return Vec::new();
-    }
-    let mut found: Vec<(&'static str, (usize, usize))> = Vec::new();
-    let mut add = |rule: &'static str, span: Option<(usize, usize)>| {
-        if let Some(span) = span {
-            found.push((rule, span));
-        }
-    };
+/// One rule of the table: its name, its matchers, and its side on the
+/// vendor-text surface (`refuse` or `withhold`) and the ticket surface
+/// (`suspect`); none where the surface does not take it.
+#[derive(Debug, Clone)]
+pub struct Rule {
+    pub name: &'static str,
+    matchers: Vec<Matcher>,
+    pub vendor_text: Option<&'static str>,
+    pub ticket: Option<&'static str>,
+}
 
-    add(
-        "override",
-        f.then_within(
-            &["ignore", "disregard", "forget", "override", "bypass"],
-            &[
-                "instruction",
-                "instructions",
-                "rule",
-                "rules",
-                "prompt",
-                "prompts",
-                "direction",
-                "directions",
-                "procedure",
-                "procedures",
-                "guideline",
-                "guidelines",
-            ],
-            40,
-        ),
-    );
-    add(
-        "role marker",
-        f.marker(&["system", "assistant", "developer", "user", "human"]),
-    );
-    add("chat markup", {
-        let mut spans: Vec<(usize, usize)> =
-            ["<|", "|>", "[inst]", "[/inst]", "<<sys>>", "<</sys>>", "</"]
+fn leaked(text: &str) -> &'static str {
+    Box::leak(text.to_string().into_boxed_str())
+}
+
+fn strings(value: &serde_json::Value) -> Vec<String> {
+    value
+        .as_array()
+        .map(|items| {
+            items
                 .iter()
-                .flat_map(|n| f.anywhere(n))
-                .collect();
-        // `< system >`, `</ user>` and their kind.
-        for (start, _) in f.anywhere("<") {
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The table read: every rule, in its order. A kind this code does not
+/// know fails the read, so a table ahead of it is caught by the tests, never
+/// skipped.
+fn read_table(text: &str) -> Result<Vec<Rule>, String> {
+    let whole: serde_json::Value =
+        serde_json::from_str(text).map_err(|failed| format!("the screen rules: {failed}"))?;
+    let named = |list: &str| strings(&whole[list]);
+    let mut rules = Vec::new();
+    for rule in whole["rules"]
+        .as_array()
+        .ok_or("the screen rules: no rules")?
+    {
+        let name = rule["name"].as_str().ok_or("a rule has no name")?;
+        let mut matchers = Vec::new();
+        for m in rule["matchers"].as_array().cloned().unwrap_or_default() {
+            let gap = m["gap"].as_u64().unwrap_or(0) as usize;
+            matchers.push(match m["kind"].as_str().unwrap_or_default() {
+                "words" => Matcher::Words {
+                    phrases: match m["list"].as_str() {
+                        Some(list) => named(list),
+                        None => strings(&m["phrases"]),
+                    },
+                    unless_after: m["unless_after"].as_str().map(named).unwrap_or_default(),
+                },
+                "anywhere" => Matcher::Anywhere(strings(&m["strings"])),
+                "within" => Matcher::Within {
+                    first: strings(&m["first"]),
+                    then: strings(&m["then"]),
+                    gap,
+                },
+                "followed_by" => Matcher::FollowedBy {
+                    first: strings(&m["first"]),
+                    then: strings(&m["then"]),
+                },
+                "marker" => Matcher::Marker(strings(&m["names"])),
+                "tag" => Matcher::Tag(strings(&m["names"])),
+                "opener" => Matcher::Opener(strings(&m["words"])),
+                "closers" => Matcher::Closers,
+                "link_after" => Matcher::LinkAfter {
+                    first: strings(&m["first"]),
+                    gap,
+                },
+                "tool_shape" => Matcher::ToolShape,
+                "surface_tools" => Matcher::SurfaceTools,
+                "clause_verb" => Matcher::ClauseVerb {
+                    verbs: strings(&m["verbs"]),
+                    leads: strings(&m["leads"]),
+                    objects: strings(&m["objects"]),
+                },
+                "joined" => Matcher::Joined {
+                    first: strings(&m["first"]),
+                    between: strings(&m["between"]),
+                    then: strings(&m["then"]),
+                },
+                other => return Err(format!("rule {name:?}: a matcher of kind {other:?}")),
+            });
+        }
+        rules.push(Rule {
+            name: leaked(name),
+            matchers,
+            vendor_text: rule["vendor_text"].as_str().map(leaked),
+            ticket: rule["ticket"].as_str().map(leaked),
+        });
+    }
+    Ok(rules)
+}
+
+/// The table, read once.
+pub fn table() -> &'static [Rule] {
+    static HELD: std::sync::OnceLock<Vec<Rule>> = std::sync::OnceLock::new();
+    HELD.get_or_init(|| read_table(SCREEN_RULES).expect("the vendored screen rules read"))
+}
+
+fn strs(items: &[String]) -> Vec<&str> {
+    items.iter().map(String::as_str).collect()
+}
+
+impl Folded {
+    /// Whether the word at `start` (of `phrase`) ends one of `terms`: the
+    /// contract's own "allocation instruction" is its vocabulary, not an
+    /// instruction to a reader (agreement A, 2026-10-16).
+    fn ends_a_term(&self, start: usize, phrase: &str, terms: &[String]) -> bool {
+        let n = phrase.chars().count();
+        terms.iter().any(|term| {
+            let t = term.chars().count();
+            term.ends_with(phrase)
+                && t > n
+                && start >= t - n
+                && self.at(start - (t - n), term)
+                && self.boundary_before(start - (t - n))
+        })
+    }
+
+    fn tag(&self, names: &[String]) -> Option<(usize, usize)> {
+        let skip = |i: &mut usize| {
+            if self.chars.get(*i) == Some(&' ') {
+                *i += 1;
+            }
+        };
+        self.anywhere("<").into_iter().find_map(|(start, _)| {
             let mut i = start + 1;
-            let skip = |i: &mut usize| {
-                if f.chars.get(*i) == Some(&' ') {
-                    *i += 1;
-                }
-            };
             skip(&mut i);
-            if f.chars.get(i) == Some(&'/') {
+            if self.chars.get(i) == Some(&'/') {
                 i += 1;
             }
             skip(&mut i);
-            for name in ["system", "assistant", "user", "instructions", "instruction"] {
-                if f.at(i, name) {
-                    let mut j = i + name.chars().count();
-                    skip(&mut j);
-                    if f.chars.get(j) == Some(&'>') {
-                        spans.push((start, j + 1));
-                        break;
-                    }
+            names.iter().find_map(|name| {
+                if !self.at(i, name) {
+                    return None;
                 }
+                let mut j = i + name.chars().count();
+                skip(&mut j);
+                (self.chars.get(j) == Some(&'>')).then_some((start, j + 1))
+            })
+        })
+    }
+
+    fn opener(&self, words: &[String]) -> Option<(usize, usize)> {
+        words.iter().find_map(|word| {
+            if !self.at(0, word) {
+                return None;
             }
-        }
-        spans.into_iter().min()
-    });
-    add("instruction words", {
-        f.any_word(&["instruction", "instructions", "from now on", "henceforth"])
+            let mut i = word.chars().count();
+            if self.chars.get(i) == Some(&' ') {
+                i += 1;
+            }
+            (self.chars.get(i) == Some(&':')).then_some((0, i + 1))
+        })
+    }
+
+    fn closers(&self) -> Option<(usize, usize)> {
+        self.anywhere("\"")
             .into_iter()
-            .filter(|(start, _)| !f.contract_term_before(*start))
-            .min()
-    });
-    add(
-        "addressed to the reader",
-        f.followed_by(
-            &["you"],
-            &[
-                "must",
-                "should",
-                "shall",
-                "need to",
-                "have to",
-                "are required to",
-                "are instructed to",
-                "will now",
-                "may now",
-            ],
-        )
-        .or_else(|| {
-            f.followed_by(
-                &[
-                    "curator",
-                    "curators",
-                    "agent",
-                    "agents",
-                    "assistant",
-                    "assistants",
-                    "model",
-                    "models",
-                    "llm",
-                    "llms",
-                ],
-                &["must", "should", "shall", "need to"],
-            )
-        }),
-    );
-    add(
-        "claims authority",
-        f.followed_by(
-            &[
-                "server",
-                "platform",
-                "open meridian",
-                "staff",
-                "administrator",
-                "admin",
-                "system",
-            ],
-            &[
-                "instruct",
-                "instructs",
-                "says",
-                "require",
-                "requires",
-                "direct",
-                "directs",
-                "order",
-                "orders",
-                "mandate",
-                "mandates",
-                "note",
-            ],
-        ),
-    );
-    add("tool name", {
-        let mut spans: Vec<(usize, usize)> = f.any_word(&TOOL_NAMES);
-        // A plugin's tool, `{instance}__{name}`, and core's, `dashboard__...`.
-        for (start, end) in f.anywhere("__") {
-            let mut s = start;
-            while s > 0 && (f.chars[s - 1].is_alphanumeric() || f.chars[s - 1] == '-') {
-                s -= 1;
-            }
-            let mut e = end;
-            while e < f.len() && word_char(f.chars[e]) {
-                e += 1;
-            }
-            if s < start && e > end && f.boundary_before(s) && f.boundary_after(e) {
-                spans.push((s, e));
-            }
-        }
-        spans.into_iter().min()
-    });
-    add("answer-shaped", {
-        let mut spans = Vec::new();
-        for opener in ["refused", "error", "outcome"] {
-            if f.at(0, opener) {
-                let mut i = opener.chars().count();
-                if f.chars.get(i) == Some(&' ') {
-                    i += 1;
-                }
-                if f.chars.get(i) == Some(&':') {
-                    spans.push((0, i + 1));
-                }
-            }
-        }
-        for (start, _) in f.anywhere("\"").into_iter().chain(f.anywhere("'")) {
-            let mut i = start + 1;
-            let mut closers = 0;
-            while closers < 2 {
-                if f.chars.get(i) == Some(&' ') {
-                    i += 1;
-                }
-                match f.chars.get(i) {
-                    Some('}' | ']') => {
-                        closers += 1;
+            .chain(self.anywhere("'"))
+            .filter_map(|(start, _)| {
+                let mut i = start + 1;
+                let mut closers = 0;
+                while closers < 2 {
+                    if self.chars.get(i) == Some(&' ') {
                         i += 1;
                     }
-                    _ => break,
+                    match self.chars.get(i) {
+                        Some('}' | ']') => {
+                            closers += 1;
+                            i += 1;
+                        }
+                        _ => break,
+                    }
                 }
-            }
-            if closers == 2 {
-                spans.push((start, i));
-            }
-        }
-        spans.extend(f.any_word(&["jsonrpc", "structuredcontent", "iserror", "tools/call"]));
-        spans.into_iter().min()
-    });
-    add("prompt talk", {
-        let mut spans: Vec<(usize, usize)> = ["system", "hidden", "original", "initial"]
-            .iter()
-            .filter_map(|w| f.followed_by(&[w], &["prompt"]))
-            .collect();
-        spans.extend(f.any_word(&[
-            "prompt injection",
-            "jailbreak",
-            "developer mode",
-            "pretend to be",
-            "pretend you",
-        ]));
-        spans.into_iter().min()
-    });
-    add("exfiltration", {
-        f.any_word(&[
-            "send",
-            "email",
-            "e-mail",
-            "post",
-            "upload",
-            "forward",
-            "exfiltrate",
-            "leak",
-        ])
-        .into_iter()
-        .filter_map(|(start, end)| {
-            let stop = (end + 61).min(f.len());
-            let link = (end..stop)
-                .find(|at| f.at(*at, "http://") || f.at(*at, "https://") || f.at(*at, "www."))
-                .map(|at| {
-                    let mut e = at;
-                    while e < f.len() && f.chars[e] != ' ' {
-                        e += 1;
-                    }
-                    e
-                });
-            link.or_else(|| f.email_after(end, 60)).map(|e| (start, e))
-        })
-        .min()
-    });
-    add("concealment", {
-        f.followed_by(
-            &["do not"],
-            &["tell", "report", "mention", "log", "reveal", "disclose"],
-        )
-        .into_iter()
-        .chain(f.any_word(&["keep this secret"]))
-        .min()
-    });
-    add("ticket verbs", ticket_verb(&f));
+                (closers == 2).then_some((start, i))
+            })
+            .min()
+    }
 
-    let original: Vec<char> = text.chars().collect();
-    let mut answered: Vec<Matched> = RULES
-        .iter()
-        .filter_map(|rule| {
-            found
-                .iter()
-                .find(|(name, _)| name == rule)
-                .map(|(_, (s, e))| {
-                    let start = f.from[*s];
-                    let end = f.from.get(e - 1).map_or(original.len(), |last| last + 1);
-                    Matched {
-                        rule,
-                        start,
-                        end: end.max(start + 1).min(original.len()),
-                    }
-                })
+    fn link_after(&self, first: &[&str], gap: usize) -> Option<(usize, usize)> {
+        self.any_word(first)
+            .into_iter()
+            .filter_map(|(start, end)| {
+                let stop = (end + gap + 1).min(self.len());
+                let link = (end..stop)
+                    .find(|at| {
+                        self.at(*at, "http://") || self.at(*at, "https://") || self.at(*at, "www.")
+                    })
+                    .map(|at| {
+                        let mut e = at;
+                        while e < self.len() && self.chars[e] != ' ' {
+                            e += 1;
+                        }
+                        e
+                    });
+                link.or_else(|| self.email_after(end, gap))
+                    .map(|e| (start, e))
+            })
+            .min()
+    }
+
+    fn tool_shape(&self) -> Option<(usize, usize)> {
+        self.anywhere("__")
+            .into_iter()
+            .filter_map(|(start, end)| {
+                let mut s = start;
+                while s > 0 && (self.chars[s - 1].is_alphanumeric() || self.chars[s - 1] == '-') {
+                    s -= 1;
+                }
+                let mut e = end;
+                while e < self.len() && word_char(self.chars[e]) {
+                    e += 1;
+                }
+                (s < start && e > end && self.boundary_before(s) && self.boundary_after(e))
+                    .then_some((s, e))
+            })
+            .min()
+    }
+
+    fn clause_verb(
+        &self,
+        verbs: &[&str],
+        leads: &[String],
+        objects: &[String],
+    ) -> Option<(usize, usize)> {
+        self.any_word(verbs).into_iter().find_map(|(start, end)| {
+            let mut i = start;
+            if i > 0 && self.chars[i - 1] == ' ' {
+                i -= 1;
+            }
+            let opens_clause = i == 0
+                || matches!(
+                    self.chars[i - 1],
+                    '.' | '!' | '?' | ';' | ':' | ',' | '-' | '(' | '['
+                )
+                || leads.iter().any(|lead| {
+                    let n = lead.chars().count();
+                    i >= n && self.at(i - n, lead) && self.boundary_before(i - n)
+                });
+            if !opens_clause || self.chars.get(end) != Some(&' ') {
+                return None;
+            }
+            objects.iter().find_map(|object| {
+                let n = object.chars().count();
+                (self.at(end + 1, object) && self.boundary_after(end + 1 + n))
+                    .then_some((start, end + 1 + n))
+            })
         })
-        .collect();
-    answered.dedup_by(|a, b| a.rule == b.rule);
-    answered
+    }
+
+    /// Where a matcher first matches, by its span; None where it does not.
+    fn matches(&self, matcher: &Matcher) -> Option<(usize, usize)> {
+        match matcher {
+            Matcher::Words {
+                phrases,
+                unless_after,
+            } => phrases
+                .iter()
+                .flat_map(|phrase| {
+                    self.words(phrase)
+                        .into_iter()
+                        .filter(|(start, _)| !self.ends_a_term(*start, phrase, unless_after))
+                })
+                .min(),
+            Matcher::Anywhere(strings) => strings.iter().flat_map(|n| self.anywhere(n)).min(),
+            Matcher::Within { first, then, gap } => {
+                self.then_within(&strs(first), &strs(then), *gap)
+            }
+            Matcher::FollowedBy { first, then } => first
+                .iter()
+                .filter_map(|word| self.followed_by(&[word.as_str()], &strs(then)))
+                .min(),
+            Matcher::Marker(names) => self.marker(&strs(names)),
+            Matcher::Tag(names) => self.tag(names),
+            Matcher::Opener(words) => self.opener(words),
+            Matcher::Closers => self.closers(),
+            Matcher::LinkAfter { first, gap } => self.link_after(&strs(first), *gap),
+            Matcher::ToolShape => self.tool_shape(),
+            Matcher::SurfaceTools => self.any_word(&TOOL_NAMES).into_iter().min(),
+            Matcher::ClauseVerb {
+                verbs,
+                leads,
+                objects,
+            } => self.clause_verb(&strs(verbs), leads, objects),
+            Matcher::Joined {
+                first,
+                between,
+                then,
+            } => first
+                .iter()
+                .flat_map(|a| {
+                    between
+                        .iter()
+                        .flat_map(move |sep| then.iter().map(move |b| format!("{a}{sep}{b}")))
+                })
+                .flat_map(|phrase| self.words(&phrase))
+                .min(),
+        }
+    }
 }
 
-/// One of the ticket verbs said as an instruction: at the start of the text
-/// or of a clause, or after "please", "then" or "and", and followed by what
-/// it acts on ("close it", "Resolve every ticket", "then send the logs").
-fn ticket_verb(f: &Folded) -> Option<(usize, usize)> {
-    const VERBS: [&str; 5] = ["send", "resolve", "close", "grant", "delegate"];
-    const OBJECTS: [&str; 12] = [
-        "it", "this", "that", "these", "those", "every", "all", "each", "the", "them", "any", "me",
-    ];
-    f.any_word(&VERBS).into_iter().find_map(|(start, end)| {
-        let mut i = start;
-        if i > 0 && f.chars[i - 1] == ' ' {
-            i -= 1;
-        }
-        let opens_clause = i == 0
-            || matches!(
-                f.chars[i - 1],
-                '.' | '!' | '?' | ';' | ':' | ',' | '-' | '(' | '['
-            )
-            || ["please", "then", "and", "now"].iter().any(|lead| {
-                let n = lead.chars().count();
-                i >= n && f.at(i - n, lead) && f.boundary_before(i - n)
-            });
-        if !opens_clause || f.chars.get(end) != Some(&' ') {
-            return None;
-        }
-        OBJECTS.iter().find_map(|object| {
-            let n = object.chars().count();
-            (f.at(end + 1, object) && f.boundary_after(end + 1 + n)).then_some((start, end + 1 + n))
+/// Each rule `surface` takes that `text` matches, in the table's order,
+/// with where it lies in the original text by character.
+fn matched_on(text: &str, takes: impl Fn(&Rule) -> bool) -> Vec<Matched> {
+    let f = folded(text);
+    if f.len() == 0 {
+        return Vec::new();
+    }
+    let original = text.chars().count();
+    table()
+        .iter()
+        .filter(|rule| takes(rule))
+        .filter_map(|rule| {
+            let (s, e) = rule.matchers.iter().filter_map(|m| f.matches(m)).min()?;
+            let start = f.from[s];
+            let end = f.from.get(e - 1).map_or(original, |last| last + 1);
+            Some(Matched {
+                rule: rule.name,
+                start,
+                end: end.max(start + 1).min(original),
+            })
         })
+        .collect()
+}
+
+/// The rules a ticket's text or a note matches (the table's `ticket`
+/// surface), each once, in the table's order, with where.
+pub fn matched(text: &str) -> Vec<Matched> {
+    matched_on(text, |rule| rule.ticket.is_some())
+}
+
+/// The rules a vendor's text matches (the table's `vendor_text` surface:
+/// a version's documentation and its declaration's vendor text, ruling
+/// 176), each with the side it takes -- `refuse` or `withhold`.
+pub fn vendor_text(text: &str) -> Vec<(&'static str, &'static str)> {
+    matched_on(text, |rule| rule.vendor_text.is_some())
+        .into_iter()
+        .filter_map(|m| {
+            table()
+                .iter()
+                .find(|rule| rule.name == m.rule)
+                .and_then(|rule| rule.vendor_text)
+                .map(|side| (m.rule, side))
+        })
+        .collect()
+}
+
+/// The vendor-text rules no ticket is held by -- the platform's claims
+/// rules and its registry tool names (registry_text.py's) -- a vendor's
+/// text matches, in the table's order.
+pub fn vendor_claims(text: &str) -> Vec<&'static str> {
+    matched_on(text, |rule| {
+        rule.vendor_text.is_some() && rule.ticket.is_none()
     })
+    .into_iter()
+    .map(|m| m.rule)
+    .collect()
 }
 
 /// The rules' names, as a ticket or a note keeps them.
@@ -820,6 +767,49 @@ mod tests {
 
     fn rules(text: &str) -> Vec<&'static str> {
         matched(text).into_iter().map(|m| m.rule).collect()
+    }
+
+    /// Ruling 294: the canonical table read whole -- every rule and every
+    /// matcher kind known -- and each surface's rules as it names them.
+    #[test]
+    fn the_canonical_table_is_read_whole_and_each_surface_takes_its_rules() {
+        let held = read_table(SCREEN_RULES).unwrap();
+        assert_eq!(held.len(), 18);
+        assert_eq!(
+            super::rules(),
+            vec![
+                "override",
+                "role marker",
+                "chat markup",
+                "instruction words",
+                "addressed to the reader",
+                "claims authority",
+                "tool name",
+                "answer-shaped",
+                "prompt talk",
+                "exfiltration",
+                "concealment",
+                "ticket verbs"
+            ]
+        );
+        let refusing: Vec<&str> = held
+            .iter()
+            .filter(|rule| rule.vendor_text == Some("refuse"))
+            .map(|rule| rule.name)
+            .collect();
+        assert!(
+            refusing.contains(&"claims regulatory readiness") && refusing.contains(&"override")
+        );
+        assert!(!refusing.contains(&"ticket verbs"));
+        assert!(
+            read_table(r#"{"rules": [{"name": "x", "matchers": [{"kind": "regex"}]}]}"#)
+                .unwrap_err()
+                .contains("regex")
+        );
+        assert_eq!(
+            vendor_text("Use search_plugins to find it."),
+            vec![("registry tool name", "withhold")]
+        );
     }
 
     #[test]

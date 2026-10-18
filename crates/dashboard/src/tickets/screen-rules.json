@@ -1,0 +1,699 @@
+{
+ "about": "The screen rules, one canonical table (the v26 plan's question 239, ruled 2026-10-17): each rule's name as every surface answers it, its matchers, the side it takes on each surface, and the corpus cases it pins. Vendored into meridian-platform, meridian-core and meridian-cli by each one's make prompt-attacks, and loaded at build or start-up instead of hand-ported code; check-vendored-corpus holds the copies equal, and the corpus replays in all three.",
+ "normalise": "NFKC, case-folded, every run of whitespace one space, leading and trailing whitespace dropped; a match is reported on the original text by character",
+ "matcher_kinds": {
+  "words": "any phrase of `phrases`, or of the named list `list`, standing as a whole word or phrase (\\b...\\b where its end is a word character); `unless_after` names a list of terms the matched word is exempt after, one space between",
+  "anywhere": "any string of `strings`, anywhere",
+  "within": "a word of `first`, then within `gap` characters a word of `then`",
+  "followed_by": "a word of `first`, one space, then a word or phrase of `then`",
+  "marker": "a word of `names`, an optional space, then a colon, not after a word character",
+  "tag": "`<`, an optional space, an optional `/`, an optional space, a name of `names`, an optional space, `>`",
+  "opener": "the text starting with a word of `words`, an optional space, then a colon",
+  "closers": "a quote (\" or '), then two closing brackets (} or ]), each after an optional space",
+  "link_after": "a word of `first`, then within `gap` characters http://, https://, www. or an e-mail address",
+  "tool_shape": "an `{instance}__{name}` tool: letters, digits and hyphens, `__`, then a word, standing whole",
+  "surface_tools": "a tool name the reading surface itself serves, by its own tool list (core's deployment tools, the platform's MCP tools): each surface's own, generated from its tool registry, never copied here",
+  "clause_verb": "a verb of `verbs` opening a clause -- at the start, after . ! ? ; : , - ( [ or after a word of `leads` -- then one space and a word of `objects`",
+  "joined": "a word of `first`, a separator of `between`, then a word of `then`, as one phrase"
+ },
+ "surfaces": {
+  "vendor_text": "a plugin's documentation and its declaration's vendor text, at the platform's build intake, the deployment's upload and meridian plugin check (ruling 176): refuse refuses the build or the upload naming the rule and fails plugin check; withhold keeps it, shown to people marked Screened and withheld from agents, and plugin check reports advice",
+  "ticket": "a ticket's title and seen text, and each note, in the deployment (W6.21 to W6.23): suspect files it held, its tools answering the matched rules and never the text until a person releases it",
+  "agent_write": "a description, note or source an agent writes through the platform's MCP (the curator's X8): hold keeps the write as a proposal for a person instead of making it"
+ },
+ "contract_terms": [
+  "allocation instruction",
+  "allocation instructions",
+  "trading instruction",
+  "trading instructions",
+  "settlement instruction",
+  "settlement instructions",
+  "execution instruction",
+  "execution instructions",
+  "handling instruction",
+  "handling instructions"
+ ],
+ "registry_tools": [
+  "search_plugins",
+  "get_plugin",
+  "search_plugin_documentation",
+  "read_listing_documentation",
+  "read_plugin_build",
+  "set_organisation_namespace",
+  "set_organisation_slug",
+  "check_publisher_lei",
+  "record_court_action",
+  "get_plugin_usage",
+  "list_repositories",
+  "get_verified_details",
+  "star_plugin",
+  "unstar_plugin",
+  "list_signing_keys",
+  "set_plugin_attributes",
+  "withdraw_version",
+  "list_plugin_reviews",
+  "get_plugin_review",
+  "propose_review",
+  "propose_pull",
+  "list_publishers",
+  "list_copyright_notices",
+  "get_copyright_notice",
+  "record_copyright_notice",
+  "record_counter_notice",
+  "propose_copyright_pull",
+  "propose_restore",
+  "get_copyright_agent",
+  "dashboard__search_registry_plugins",
+  "dashboard__read_registry_plugin",
+  "dashboard__install_plugin",
+  "dashboard__update_plugin",
+  "dashboard__acknowledge_pull",
+  "dashboard__read_registries",
+  "dashboard__set_reports_plugin_usage"
+ ],
+ "rules": [
+  {
+   "name": "override",
+   "regex": "\\b(?:ignore|disregard|forget|override|bypass)\\b.{0,40}?\\b(?:instructions?|rules?|prompts?|directions?|procedures?|guidelines?)\\b",
+   "matchers": [
+    {
+     "kind": "within",
+     "first": [
+      "ignore",
+      "disregard",
+      "forget",
+      "override",
+      "bypass"
+     ],
+     "then": [
+      "instruction",
+      "instructions",
+      "rule",
+      "rules",
+      "prompt",
+      "prompts",
+      "direction",
+      "directions",
+      "procedure",
+      "procedures",
+      "guideline",
+      "guidelines"
+     ],
+     "gap": 40
+    }
+   ],
+   "vendor_text": "refuse",
+   "ticket": "suspect",
+   "agent_write": "hold",
+   "cases": [
+    "RT1",
+    "RT9",
+    "RT19",
+    "RT44"
+   ]
+  },
+  {
+   "name": "role marker",
+   "regex": "(?:^|[^a-z0-9_])(?:system|assistant|developer|user|human)\\s*:",
+   "matchers": [
+    {
+     "kind": "marker",
+     "names": [
+      "system",
+      "assistant",
+      "developer",
+      "user",
+      "human"
+     ]
+    }
+   ],
+   "vendor_text": "withhold",
+   "ticket": "suspect",
+   "agent_write": "hold",
+   "cases": [
+    "RT2",
+    "RT6",
+    "RT10",
+    "RT24"
+   ]
+  },
+  {
+   "name": "chat markup",
+   "regex": "<\\||\\|>|\\[/?inst\\]|<</?sys>>|</|<\\s*/?\\s*(?:system|assistant|user|instructions?)\\s*>",
+   "matchers": [
+    {
+     "kind": "anywhere",
+     "strings": [
+      "<|",
+      "|>",
+      "[inst]",
+      "[/inst]",
+      "<<sys>>",
+      "<</sys>>",
+      "</"
+     ]
+    },
+    {
+     "kind": "tag",
+     "names": [
+      "system",
+      "assistant",
+      "user",
+      "instructions",
+      "instruction"
+     ]
+    }
+   ],
+   "vendor_text": "withhold",
+   "ticket": "suspect",
+   "agent_write": "hold",
+   "cases": [
+    "RT29",
+    "RT36"
+   ]
+  },
+  {
+   "name": "instruction words",
+   "regex": "\\binstructions?\\b|\\bfrom now on\\b|\\bhenceforth\\b",
+   "matchers": [
+    {
+     "kind": "words",
+     "phrases": [
+      "instruction",
+      "instructions",
+      "from now on",
+      "henceforth"
+     ],
+     "unless_after": "contract_terms"
+    }
+   ],
+   "vendor_text": "withhold",
+   "ticket": "suspect",
+   "agent_write": "hold",
+   "cases": [
+    "RT1",
+    "RT8",
+    "RT44",
+    "RT46"
+   ]
+  },
+  {
+   "name": "addressed to the reader",
+   "regex": "\\byou (?:must|should|shall|need to|have to|are (?:required|instructed) to|will now|may now)\\b|\\b(?:curators?|agents?|assistants?|models?|llms?) (?:must|should|shall|need to)\\b",
+   "matchers": [
+    {
+     "kind": "followed_by",
+     "first": [
+      "you"
+     ],
+     "then": [
+      "must",
+      "should",
+      "shall",
+      "need to",
+      "have to",
+      "are required to",
+      "are instructed to",
+      "will now",
+      "may now"
+     ]
+    },
+    {
+     "kind": "followed_by",
+     "first": [
+      "curator",
+      "curators",
+      "agent",
+      "agents",
+      "assistant",
+      "assistants",
+      "model",
+      "models",
+      "llm",
+      "llms"
+     ],
+     "then": [
+      "must",
+      "should",
+      "shall",
+      "need to"
+     ]
+    }
+   ],
+   "vendor_text": "withhold",
+   "ticket": "suspect",
+   "agent_write": "hold",
+   "cases": [
+    "RT7",
+    "RT20",
+    "RT25",
+    "RT38"
+   ]
+  },
+  {
+   "name": "claims authority",
+   "regex": "\\b(?:server|platform|open meridian|staff|administrator|admin|system) (?:instructs?|says|requires?|directs?|orders?|mandates?|note)\\b",
+   "matchers": [
+    {
+     "kind": "followed_by",
+     "first": [
+      "server",
+      "platform",
+      "open meridian",
+      "staff",
+      "administrator",
+      "admin",
+      "system"
+     ],
+     "then": [
+      "instruct",
+      "instructs",
+      "says",
+      "require",
+      "requires",
+      "direct",
+      "directs",
+      "order",
+      "orders",
+      "mandate",
+      "mandates",
+      "note"
+     ]
+    }
+   ],
+   "vendor_text": "refuse",
+   "ticket": "suspect",
+   "agent_write": "hold",
+   "cases": [
+    "RT2",
+    "RT7",
+    "RT21",
+    "RT22"
+   ]
+  },
+  {
+   "name": "tool name",
+   "regex": "\\b[a-z][a-z0-9-]*__[a-z][a-z0-9_]*\\b",
+   "matchers": [
+    {
+     "kind": "tool_shape"
+    },
+    {
+     "kind": "surface_tools"
+    }
+   ],
+   "vendor_text": "withhold",
+   "ticket": "suspect",
+   "agent_write": "hold",
+   "cases": [
+    "RT35",
+    "RT38"
+   ]
+  },
+  {
+   "name": "answer-shaped",
+   "regex": "^(?:refused|error|outcome)\\s*:|[\"']\\s*[}\\]]\\s*[}\\]]|\\b(?:jsonrpc|structuredcontent|iserror|tools/call)\\b",
+   "matchers": [
+    {
+     "kind": "opener",
+     "words": [
+      "refused",
+      "error",
+      "outcome"
+     ]
+    },
+    {
+     "kind": "closers"
+    },
+    {
+     "kind": "words",
+     "phrases": [
+      "jsonrpc",
+      "structuredcontent",
+      "iserror",
+      "tools/call"
+     ]
+    }
+   ],
+   "vendor_text": "withhold",
+   "ticket": "suspect",
+   "agent_write": "hold",
+   "cases": [
+    "RT6",
+    "RT17"
+   ]
+  },
+  {
+   "name": "prompt talk",
+   "regex": "\\b(?:system|hidden|original|initial) prompt\\b|\\bprompt injection\\b|\\bjailbreak\\b|\\bdeveloper mode\\b|\\bpretend (?:to be|you)\\b",
+   "matchers": [
+    {
+     "kind": "followed_by",
+     "first": [
+      "system",
+      "hidden",
+      "original",
+      "initial"
+     ],
+     "then": [
+      "prompt"
+     ]
+    },
+    {
+     "kind": "words",
+     "phrases": [
+      "prompt injection",
+      "jailbreak",
+      "developer mode",
+      "pretend to be",
+      "pretend you"
+     ]
+    }
+   ],
+   "vendor_text": "withhold",
+   "ticket": "suspect",
+   "agent_write": "hold",
+   "cases": []
+  },
+  {
+   "name": "exfiltration",
+   "regex": "\\b(?:send|email|e-mail|post|upload|forward|exfiltrate|leak)\\b.{0,60}?(?:https?://|www\\.|\\b[\\w.+-]+@[\\w-]+\\.[\\w.]{2,})",
+   "matchers": [
+    {
+     "kind": "link_after",
+     "first": [
+      "send",
+      "email",
+      "e-mail",
+      "post",
+      "upload",
+      "forward",
+      "exfiltrate",
+      "leak"
+     ],
+     "gap": 60
+    }
+   ],
+   "vendor_text": "refuse",
+   "ticket": "suspect",
+   "agent_write": "hold",
+   "cases": [
+    "RT10",
+    "RT13",
+    "RT23"
+   ]
+  },
+  {
+   "name": "concealment",
+   "regex": "\\bdo not (?:tell|report|mention|log|reveal|disclose)\\b|\\bkeep this secret\\b",
+   "matchers": [
+    {
+     "kind": "followed_by",
+     "first": [
+      "do not"
+     ],
+     "then": [
+      "tell",
+      "report",
+      "mention",
+      "log",
+      "reveal",
+      "disclose"
+     ]
+    },
+    {
+     "kind": "words",
+     "phrases": [
+      "keep this secret"
+     ]
+    }
+   ],
+   "vendor_text": "refuse",
+   "ticket": "suspect",
+   "agent_write": "hold",
+   "cases": []
+  },
+  {
+   "name": "ticket verbs",
+   "regex": null,
+   "matchers": [
+    {
+     "kind": "clause_verb",
+     "verbs": [
+      "send",
+      "resolve",
+      "close",
+      "grant",
+      "delegate"
+     ],
+     "leads": [
+      "please",
+      "then",
+      "and",
+      "now"
+     ],
+     "objects": [
+      "it",
+      "this",
+      "that",
+      "these",
+      "those",
+      "every",
+      "all",
+      "each",
+      "the",
+      "them",
+      "any",
+      "me"
+     ]
+    }
+   ],
+   "vendor_text": null,
+   "ticket": "suspect",
+   "agent_write": null,
+   "cases": [
+    "RT19"
+   ]
+  },
+  {
+   "name": "registry tool name",
+   "regex": "\\b(?:search_plugins|get_plugin|search_plugin_documentation|read_listing_documentation|read_plugin_build|set_organisation_namespace|set_organisation_slug|check_publisher_lei|record_court_action|get_plugin_usage|list_repositories|get_verified_details|star_plugin|unstar_plugin|list_signing_keys|set_plugin_attributes|withdraw_version|list_plugin_reviews|get_plugin_review|propose_review|propose_pull|list_publishers|list_copyright_notices|get_copyright_notice|record_copyright_notice|record_counter_notice|propose_copyright_pull|propose_restore|get_copyright_agent|dashboard__search_registry_plugins|dashboard__read_registry_plugin|dashboard__install_plugin|dashboard__update_plugin|dashboard__acknowledge_pull|dashboard__read_registries|dashboard__set_reports_plugin_usage)\\b",
+   "matchers": [
+    {
+     "kind": "words",
+     "list": "registry_tools"
+    }
+   ],
+   "vendor_text": "withhold",
+   "ticket": null,
+   "agent_write": null,
+   "cases": [
+    "RT38"
+   ]
+  },
+  {
+   "name": "acts for the reader",
+   "regex": "\\b(?:install|approve|launch|update|enable|grant|star)\\b.{0,40}?\\b(?:automatically|immediately|without (?:asking|review|approval|confirmation))\\b|\\b(?:auto-?approve|skip (?:the )?(?:review|approval|notice))\\b",
+   "matchers": [
+    {
+     "kind": "within",
+     "first": [
+      "install",
+      "approve",
+      "launch",
+      "update",
+      "enable",
+      "grant",
+      "star"
+     ],
+     "then": [
+      "automatically",
+      "immediately",
+      "without asking",
+      "without review",
+      "without approval",
+      "without confirmation"
+     ],
+     "gap": 40
+    },
+    {
+     "kind": "words",
+     "phrases": [
+      "auto-approve",
+      "autoapprove",
+      "skip review",
+      "skip the review",
+      "skip approval",
+      "skip the approval",
+      "skip notice",
+      "skip the notice"
+     ]
+    }
+   ],
+   "vendor_text": "refuse",
+   "ticket": null,
+   "agent_write": null,
+   "cases": [
+    "RT39"
+   ]
+  },
+  {
+   "name": "claims endorsement",
+   "regex": "\\b(?:endorsed|recommended|certified|approved|vetted|audited|guaranteed|sponsored) by (?:open meridian|the platform|meridian)\\b|\\bofficial(?:ly)? (?:open meridian|meridian) (?:plugin|partner)\\b",
+   "matchers": [
+    {
+     "kind": "followed_by",
+     "first": [
+      "endorsed",
+      "recommended",
+      "certified",
+      "approved",
+      "vetted",
+      "audited",
+      "guaranteed",
+      "sponsored"
+     ],
+     "then": [
+      "by open meridian",
+      "by the platform",
+      "by meridian"
+     ]
+    },
+    {
+     "kind": "words",
+     "phrases": [
+      "official open meridian plugin",
+      "official open meridian partner",
+      "official meridian plugin",
+      "official meridian partner",
+      "officially open meridian plugin",
+      "officially open meridian partner",
+      "officially meridian plugin",
+      "officially meridian partner"
+     ]
+    }
+   ],
+   "vendor_text": "refuse",
+   "ticket": null,
+   "agent_write": null,
+   "cases": [
+    "RT41"
+   ]
+  },
+  {
+   "name": "claims verification",
+   "regex": "\\b(?:fully|independently) (?:verified|audited|reviewed)\\b|\\bverified (?:safe|secure|compliant)\\b|\\bsecurity[- ]audited\\b",
+   "matchers": [
+    {
+     "kind": "words",
+     "phrases": [
+      "fully verified",
+      "fully audited",
+      "fully reviewed",
+      "independently verified",
+      "independently audited",
+      "independently reviewed",
+      "verified safe",
+      "verified secure",
+      "verified compliant",
+      "security-audited",
+      "security audited"
+     ]
+    }
+   ],
+   "vendor_text": "refuse",
+   "ticket": null,
+   "agent_write": null,
+   "cases": [
+    "RT42"
+   ]
+  },
+  {
+   "name": "poses as open meridian",
+   "regex": "\\b(?:this is|message from|on behalf of|from) (?:the )?(?:open meridian|meridian) (?:team|staff|platform|support|security)\\b",
+   "matchers": [
+    {
+     "kind": "followed_by",
+     "first": [
+      "this is",
+      "message from",
+      "on behalf of",
+      "from"
+     ],
+     "then": [
+      "open meridian team",
+      "open meridian staff",
+      "open meridian platform",
+      "open meridian support",
+      "open meridian security",
+      "meridian team",
+      "meridian staff",
+      "meridian platform",
+      "meridian support",
+      "meridian security",
+      "the open meridian team",
+      "the open meridian staff",
+      "the open meridian platform",
+      "the open meridian support",
+      "the open meridian security",
+      "the meridian team",
+      "the meridian staff",
+      "the meridian platform",
+      "the meridian support",
+      "the meridian security"
+     ]
+    }
+   ],
+   "vendor_text": "refuse",
+   "ticket": null,
+   "agent_write": null,
+   "cases": [
+    "RT40"
+   ]
+  },
+  {
+   "name": "claims regulatory readiness",
+   "regex": "\\b(?:sec|finra|mifid(?: ii)?|17a-4|sox|soc ?2)[- ](?:compliant|approved|certified|ready)\\b|\\bregulator(?:y)?[- ]approved\\b",
+   "matchers": [
+    {
+     "kind": "joined",
+     "first": [
+      "sec",
+      "finra",
+      "mifid",
+      "mifid ii",
+      "17a-4",
+      "sox",
+      "soc2",
+      "soc 2"
+     ],
+     "between": [
+      "-",
+      " "
+     ],
+     "then": [
+      "compliant",
+      "approved",
+      "certified",
+      "ready"
+     ]
+    },
+    {
+     "kind": "words",
+     "phrases": [
+      "regulator-approved",
+      "regulator approved",
+      "regulatory-approved",
+      "regulatory approved"
+     ]
+    }
+   ],
+   "vendor_text": "refuse",
+   "ticket": null,
+   "agent_write": null,
+   "cases": [
+    "RT43"
+   ]
+  }
+ ]
+}

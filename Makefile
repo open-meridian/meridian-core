@@ -2162,12 +2162,16 @@ interop: network
 # design's corpus changes, and commit the file it writes.
 DESIGN ?= ../meridian-design
 PROMPT_ATTACKS := deploy/prompt-attacks.json
+# The screen rules, one canonical table (ruling 294): read by the dashboard
+# at build in place of hand-ported rules.
+SCREEN_RULES := crates/dashboard/src/tickets/screen-rules.json
 
 prompt-attacks:
 	@test -d "$(DESIGN)/evals/prompt-attacks" \
 		|| { echo "no corpus at $(DESIGN)/evals/prompt-attacks; set DESIGN=<path to meridian-design>" >&2; exit 1; }
 	@$(PY) -c 'import json, pathlib, subprocess, sys; root = pathlib.Path(sys.argv[1]); corpus = json.loads((root / "corpus.json").read_text()); cases = sorted((json.loads(p.read_text()) for p in root.glob("RT*/case.json")), key=lambda c: int(c["id"][2:])); rev = subprocess.run(["git", "-C", str(root), "log", "-1", "--format=%h", "--", "."], capture_output=True, text=True).stdout.strip(); out = {"about": "Vendored from meridian-design evals/prompt-attacks at " + rev + " by make prompt-attacks; never edited here.", "channels": corpus["channels"], "outcomes": corpus["outcomes"], "refusals": corpus["refusals"], "cases": cases}; pathlib.Path(sys.argv[2]).write_text(json.dumps(out, indent=1, ensure_ascii=True) + "\n")' "$(DESIGN)/evals/prompt-attacks" "$(PROMPT_ATTACKS)"
-	@echo "prompt-attacks: wrote $(PROMPT_ATTACKS) from $(DESIGN)/evals/prompt-attacks"
+	@cp "$(DESIGN)/evals/prompt-attacks/screen-rules.json" $(SCREEN_RULES)
+	@echo "prompt-attacks: wrote $(PROMPT_ATTACKS) and $(SCREEN_RULES) from $(DESIGN)/evals/prompt-attacks"
 
 # The book of record (W9, contract v8), end to end through the Python SDK.
 #

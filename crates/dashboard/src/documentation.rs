@@ -170,30 +170,15 @@ impl Screen {
 }
 
 /// The rules whose match refuses a version's upload (ruling 176, the
-/// product owner, 2026-10-16, and its addendum under agreement A): false
-/// claims or hostile text in a vendor's documentation or declaration, as
-/// the platform's registry_text.py REFUSES lists them (4df7a9a). Every other
-/// match -- its WITHHOLDS, and core's own ticket verbs -- keeps the upload,
-/// the section shown to people marked "Screened" and withheld from agents.
-pub const REFUSING: [&str; 9] = [
-    "override",
-    "acts for the reader",
-    "claims endorsement",
-    "claims verification",
-    "claims regulatory readiness",
-    "poses as open meridian",
-    "exfiltration",
-    "concealment",
-    "claims authority",
-];
-
-/// The refusing rules a vendor's text matched, by name; none when it is
-/// kept.
+/// product owner, 2026-10-16, and its addendum under agreement A): those the
+/// canonical table's `vendor_text` surface marks `refuse` (ruling 294). Every
+/// other match -- `withhold` -- keeps the upload, the section shown to
+/// people marked "Screened" and withheld from agents.
 pub fn refused_by(text: &str) -> Vec<String> {
-    screen(text)
-        .rules
+    crate::tickets::quarantine::vendor_text(&crate::markdown::screened_text(text))
         .into_iter()
-        .filter(|rule| REFUSING.contains(&rule.as_str()))
+        .filter(|(_, side)| *side == "refuse")
+        .map(|(rule, _)| rule.to_string())
         .collect()
 }
 
@@ -251,15 +236,12 @@ fn walk(value: &serde_json::Value, path: &str, seen: &mut dyn FnMut(&str, &str))
 
 pub fn screen(markdown: &str) -> Screen {
     let read = crate::markdown::screened_text(markdown);
-    let matched = crate::tickets::quarantine::matched(&read);
-    // The platform's claims rules beside the deployment's own: a vendor's
+    // The canonical table's vendor-text rules (ruling 294): a vendor's
     // documentation is screened alike at the catalogue and here.
-    let mut rules = crate::tickets::quarantine::names(&matched);
-    rules.extend(
-        crate::tickets::quarantine::vendor_claims(&read)
-            .into_iter()
-            .map(String::from),
-    );
+    let rules = crate::tickets::quarantine::vendor_text(&read)
+        .into_iter()
+        .map(|(rule, _)| rule.to_string())
+        .collect();
     Screen {
         rules,
         hidden: crate::markdown::hidden(markdown),
