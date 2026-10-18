@@ -35,7 +35,7 @@ pub async fn read(bus: &meridian_bus::Bus) -> Result<DeploymentTimeZoneSetting, 
             "meridian.v1.ReadDeploymentTimeZoneRequest",
             ReadDeploymentTimeZoneRequest {}.encode_to_vec(),
             None,
-            Some(Duration::from_secs(5)),
+            Some(Duration::from_secs(3)),
         )
         .await
         .map_err(|failed| failed.to_string())?;

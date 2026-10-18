@@ -251,18 +251,6 @@ a.home-link:focus-visible{outline:none;box-shadow:0 0 0 3px var(--accent-wash)}a
 .section-head h2{margin:0 0 .15rem}.section-head .hint{margin:0}.section-head button{margin:0;flex-shrink:0}\
 .section-head>div{min-width:0;max-width:100%}.section-head .hint{white-space:normal;overflow-wrap:anywhere}\
 table.one-line .id{display:inline;margin-left:.4rem}table.one-line .flag{display:inline;padding:.1rem .45rem}\
-form.filter-bar{display:flex;flex-wrap:nowrap;gap:.5rem;align-items:center;margin:0 0 .6rem}\
-form.filter-bar .grow{flex:1 1 12rem;min-width:0;margin:0}form.filter-bar .filter-selects{display:flex;gap:.5rem;min-width:0}\
-form.filter-bar select,form.filter-bar button{margin:0}\
-@media (max-width:40rem){form.filter-bar{flex-wrap:wrap}form.filter-bar .grow{flex-basis:100%}\
-form.filter-bar .filter-selects{flex:1 1 0}form.filter-bar .filter-selects select{flex:1 1 0;min-width:0}}\
-table.plugin-table{width:100%;table-layout:auto}table.plugin-table th,table.plugin-table td{white-space:nowrap}\
-table.plugin-table td.keep,table.plugin-table td.keep a{overflow:visible;text-overflow:clip;max-width:none}\
-table.plugin-table td.actions{white-space:normal}table.plugin-table form.inline-act{display:inline-flex;gap:.3rem;margin:0}\
-table.plugin-table form.inline-act input{width:8rem;margin:0}\
-@media (max-width:60rem){table.plugin-table .wide{display:none}}\
-@media (max-width:40rem){table.plugin-table .mid{display:none}}\
-.terms-line{margin:.4rem 0 .8rem;color:var(--ink-soft);font-size:.9rem}\
 .scroll{overflow-x:auto}table.list td{vertical-align:middle}\
 @media (max-width:36rem){.section-head{flex-direction:column;align-items:stretch}td.actions{white-space:normal}}\
 table.list tbody tr:hover td{background:var(--line-soft)}\
@@ -488,6 +476,26 @@ form.consent section.summary .hint{display:none}}";
 
 /// A version's documentation (W6.9, contract v25; [`crate::documentation`]):
 /// drawn only on a page holding it, so no other page carries its weight.
+/// The Plugins pages' own (rulings 274, 276, 305): the filter bar, the
+/// plugin tables and their row menus, and the Terms line; drawn only on a
+/// page that has one.
+const PLUGIN_TABLE_STYLE: &str = "\
+form.filter-bar{display:flex;gap:.5rem;align-items:center;margin:0 0 .6rem}form.filter-bar>*{margin:0}\
+.filter-bar .grow{flex:1 1 12rem;min-width:0}.filter-selects{display:flex;gap:.5rem;min-width:0}.filter-selects select{margin:0;flex:none}\
+@media (max-width:40rem){form.filter-bar{flex-wrap:wrap}.filter-bar .grow{flex-basis:100%}.filter-selects{flex:1}\
+.filter-selects select{flex:1;min-width:0}}\
+.plugin-table{width:100%}.plugin-table th,.plugin-table td{white-space:nowrap}.plugin-table td.actions{white-space:normal}\
+.plugin-table .keep,.plugin-table .keep a{overflow:visible;text-overflow:clip;max-width:none}\
+.inline-act{display:inline-flex;gap:.3rem;margin:0}.inline-act input{width:8rem;margin:0}\
+@media (max-width:60rem){.plugin-table .wide{display:none}}@media (max-width:40rem){.plugin-table .mid{display:none}}\
+.terms-line{margin:.4rem 0 .8rem;color:var(--ink-soft);font-size:.9rem}\
+.row-acts{position:relative;display:inline-block}.row-acts>summary{padding:.25rem .6rem;border:1px solid var(--line-strong);\
+border-radius:var(--radius);cursor:pointer;font-size:.86rem;list-style:none}.row-acts>summary::after{content:\" \\25BE\"}\
+.row-acts .menu-pop{position:absolute;top:calc(100% + .25rem);right:0;display:flex;flex-direction:column;gap:.35rem;\
+padding:.5rem;z-index:20;background:var(--card);border:1px solid var(--line);border-radius:var(--radius)}\
+.row-acts .menu-pop>*{margin:0}\
+";
+
 const DOCS_STYLE: &str = "\
 .docs{display:flex;flex-direction:column;gap:.5rem;min-height:0}\
 .docs-head{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:.25rem 1rem}\
@@ -1256,13 +1264,21 @@ fn document(title: &str, body: &str, chrome: &Chrome, development: bool) -> Stri
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <meta name=\"color-scheme\" content=\"light dark\">\
-         <title>{} · Open Meridian</title>{icon}<script>{HEAD_SCRIPT}</script>{kit}<style>{STYLE}{docs}</style></head><body>\n\
+         <title>{} · Open Meridian</title>{icon}<script>{HEAD_SCRIPT}</script>{kit}<style>{STYLE}{docs}{plugin_tables}</style></head><body>\n\
          {}\n{banner}\n<main class=\"{main}\">\n{}\n</main>\n<script>{CHROME_SCRIPT}</script>{inbox}\n</body></html>\n",
         escape(title),
         header(chrome),
         body,
         icon = crate::brand::LINKS,
         docs = if body.contains("class=\"docs\"") { DOCS_STYLE } else { "" },
+        plugin_tables = if ["filter-bar", "plugin-table", "terms-line"]
+            .iter()
+            .any(|class| body.contains(class))
+        {
+            PLUGIN_TABLE_STYLE
+        } else {
+            ""
+        },
         inbox = if chrome.viewer.is_some() {
             format!("<script>{INBOX_SCRIPT}</script>")
         } else {

@@ -461,6 +461,7 @@ pub(crate) use books::{method_of as books_method_of, method_value as books_metho
 pub mod calendars;
 pub mod connectivity;
 pub mod data_sources;
+pub mod event_groups;
 pub mod holds;
 pub mod instruments;
 pub(crate) mod overview;
@@ -2428,7 +2429,50 @@ async fn instrument_page(
         Err(why) => return status_page(StatusCode::NOT_FOUND, "No such record", &why),
     };
     let done = field(&query, "done");
-    let mut body = instruments::record_page(&item, &versions, None, &token_input(&session));
+    // Contract v26 (W6.9, W3.30): the groups it is a member of, as they
+    // stood at the date asked, and their members' records for the bounds.
+    let as_of = field(&query, "as_of").to_string();
+    let groups = event_groups::list(
+        &app.bus,
+        &session.subject,
+        meridian_domain::v1::ListEventGroupsRequest {
+            instrument_ids: vec![instrument.clone()],
+            as_of_ns: event_groups::as_of_ns(&as_of),
+            page_size: 20,
+            ..Default::default()
+        },
+    )
+    .await
+    .map(|reply| reply.event_groups)
+    .unwrap_or_default();
+    let mut members = HashMap::new();
+    for member in groups
+        .iter()
+        .flat_map(|group| group.member_instrument_ids.iter())
+        .take(event_groups::MOST_MEMBERS)
+    {
+        if members.contains_key(member) {
+            continue;
+        }
+        if let Ok(listed) = instruments::list(&app.bus, member).await {
+            if let Some(record) = listed
+                .instruments
+                .into_iter()
+                .next()
+                .and_then(|i| i.instrument)
+            {
+                members.insert(member.clone(), record);
+            }
+        }
+    }
+    let groups_section = event_groups::section(&instrument, &groups, &members, &as_of);
+    let mut body = instruments::record_page(
+        &item,
+        &versions,
+        None,
+        &token_input(&session),
+        &groups_section,
+    );
     if !done.is_empty() {
         body = format!("<p class=\"passed\">{}</p>{body}", escape(done));
     }
@@ -2641,7 +2685,7 @@ async fn ask_the_platform(
     let (item, versions) = one_record(&app, &instrument)
         .await
         .unwrap_or((item, Vec::new()));
-    let body = instruments::record_page(&item, &versions, Some(&asked), &token_input(&session));
+    let body = instruments::record_page(&item, &versions, Some(&asked), &token_input(&session), "");
     Html(page_with(
         &instrument,
         &body,

@@ -1780,6 +1780,21 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
             .encode_to_vec(),
         ))
     });
+    // Contract v26 (W6.35): the deployment's time zone, set once, and the
+    // operations plugin's affirmation deadline, for the Time zone tab.
+    bus.serve(crate::admin::time_zone::READ_DEPLOYMENT_TIME_ZONE, |_| {
+        Ok((
+            "meridian.v1.DeploymentTimeZoneSetting".into(),
+            meridian_domain::v1::DeploymentTimeZoneSetting {
+                deployment_time_zone: "America/Chicago".into(),
+                changed_at_ns: 1_792_300_000_000_000_000,
+                changed_by: ADMIN.into(),
+                affirmation_deadline: 21 * 60,
+                affirmation_deadline_instance_id: "operations-1".into(),
+            }
+            .encode_to_vec(),
+        ))
+    });
     // Contract v25 (W8.10 to W8.12, W5.19): the catalogue's copy Browse and
     // a listing's page read, filtered as the conductor filters it, and the
     // usage reports sent.

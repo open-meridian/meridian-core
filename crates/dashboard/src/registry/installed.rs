@@ -544,18 +544,45 @@ fn version_row(
         .and_then(|listed| listed.pull.as_ref().filter(|p| p.restored_at_ns == 0))
         .map(|pull| {
             format!(
-                " <span class=\"badge danger\" data-pulled>Pulled: {}</span>",
-                super::pull_kind(pull)
+                " <span class=\"badge danger\" data-pulled title=\"Pulled: {k}\" aria-label=\"Pulled: {k}\">Pulled</span>",
+                k = super::pull_kind(pull)
             )
         })
         .unwrap_or_default();
+    // A version this deployment cannot run, said short beside it, its whole
+    // reason in its title and in the wider column.
+    let cannot = match runs {
+        Err(why) => format!(
+            " <span class=\"badge\" title=\"{w}\">{short}</span>",
+            w = escape(why),
+            short = escape(
+                why.split(';')
+                    .next()
+                    .unwrap_or("can't run")
+                    .replace("contract ", "")
+                    .trim()
+            ),
+        ),
+        Ok(()) => String::new(),
+    };
+    // One act inline; more in the row's menu, so the row stays one line.
+    let acts = match acts.len() {
+        0 => String::new(),
+        1 => acts.remove(0),
+        _ => format!(
+            "<details class=\"menu row-acts\"><summary aria-label=\"Act on {v}\">Act</summary>\
+             <div class=\"menu-pop\">{}</div></details>",
+            acts.join(""),
+            v = escape(&v),
+        ),
+    };
     format!(
-        "<tr data-version=\"{v}\"><td class=\"keep\"><a href=\"{doc}\">{v}</a>{w}{pulled}</td><td>{instances_said}</td>\
+        "<tr data-version=\"{v}\"><td class=\"keep\"><a href=\"{doc}\">{v}</a>{w}{pulled}{cannot}</td><td>{instances_said}</td>\
          <td class=\"mid\"><span class=\"pill\">{source}</span>{key_age}</td><td class=\"wide\">{runs_said}</td>\
          <td class=\"actions\">{acts}</td></tr>",
         v = escape(&v),
         doc = escape(&crate::documentation::version_path(name, &v)),
-        w = if widens { " <span class=\"badge warn\">Needs approval</span>" } else { "" },
+        w = if widens { " <span class=\"badge warn\" title=\"Needs approval: it asks a role more\">Needs approval</span>" } else { "" },
         source = registry_label(&version.source_registry),
         key_age = if version.key_status_issued_at_ns > 0 {
             format!(
@@ -565,7 +592,6 @@ fn version_row(
         } else {
             String::new()
         },
-        acts = acts.join(" "),
     )
 }
 

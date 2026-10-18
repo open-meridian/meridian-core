@@ -1036,7 +1036,7 @@ def the_documentation_pages(browser, prefix):
         ("docs-reference-settings", tab + "&section=reference&part=settings", "Consumer key"),
         ("docs-reference-tools", tab + "&section=reference&part=tools", "read_connection_0"),
         # The first rows: the kit's pager shows as many as fit.
-        ("versions", f"{BASE}/admin/plugins/versions", "0.0.0"),
+        ("versions", f"{BASE}/admin/plugins/versions", "0.13.0"),
         ("version-page", f"{BASE}/admin/plugins/versions/snaptrade/0.13.0/documentation"
                          "?section=troubleshooting", "A connection needs sign-in"),
     ]
@@ -1077,13 +1077,15 @@ def the_registry_pages(browser, prefix):
     plugins = f"{BASE}/admin/plugins/versions?tab="
     listing = f"{BASE}/admin/plugins/registry/open-meridian/fx?tab="
     pages = [
-        ("installed", plugins + "installed", "0.0.0"),
-        ("browse", plugins + "browse", "open-meridian/fx"),
+        ("installed", plugins + "installed", "0.13.0"),
+        ("browse", plugins + "browse", "Open Meridian"),
         ("registries", plugins + "registries", "Report plugin usage"),
         ("listing-overview", listing + "overview", "open-meridian/fx"),
         ("listing-documentation", listing + "documentation", "open-meridian/fx"),
         ("listing-versions", listing + "versions", "1.5.0"),
         ("plugin-versions", f"{BASE}/admin/plugins/versions/open-meridian%2Ffx", "Version"),
+        ("bundle-versions", f"{BASE}/admin/plugins/versions/acme%2Frates", "Version"),
+        ("semver-versions", f"{BASE}/admin/plugins/versions/snaptrade", "0.13.0"),
         # Ruling 274: each sheet the form at once, its one line the Terms'.
         ("install-sheet", f"{BASE}/admin/plugins/registry/open-meridian/fx/install?version=1.5.0", "1.5.0"),
         ("update-sheet", f"{BASE}/admin/plugins/registry/update?instance=fx-1&version=1.5.0", "operations"),
@@ -1110,8 +1112,11 @@ def the_registry_pages(browser, prefix):
                     check(page.locator("form.filter-bar input[type=search]").count() == 1,
                           f"{name} at {size}, {scheme} has one search box")
                     bar = page.evaluate("""() => { const f = document.querySelector('form.filter-bar');
-                        const tops = [...f.children].map(c => Math.round(c.getBoundingClientRect().top));
-                        return new Set(tops).size; }""")
+                        const tops = [...f.children].filter(c => c.type !== 'hidden')
+                          .map(c => c.getBoundingClientRect().top).sort((x, y) => x - y);
+                        let lines = 0, last = -1e9;
+                        for (const top of tops) { if (top - last > 8) { lines += 1; last = top; } }
+                        return lines; }""")
                     check(bar == 1 if width >= 640 else bar <= 3,
                           f"{name} at {size}, {scheme} draws its filter bar on {bar} line(s)")
                 if name == "installed":
@@ -1120,13 +1125,45 @@ def the_registry_pages(browser, prefix):
                 if name == "plugin-versions":
                     check(page.locator("[data-pulled]").count() >= 1,
                           f"at {size}, {scheme} the pulled version is warned on its row")
+                if name == "bundle-versions":
                     check("keys as of 2026-10-14" in text,
                           f"at {size}, {scheme} a bundle's version shows its key status's age")
+                if name == "semver-versions":
+                    order = page.evaluate("() => [...document.querySelectorAll('tr[data-version]')].map(r => r.dataset.version)")
+                    check(order[:5] == ["0.13.0", "0.12.0", "0.11.0", "0.10.0", "0.9.0"],
+                          f"at {size}, {scheme} versions are newest first by SemVer: {order[:6]}")
                 m = page.evaluate(MEASURE)
                 measured(page, f"{name} at {size}, {scheme}", f"v25-{prefix}-registry-{name}-{size}-{scheme}.png")
                 check(m["tall"] <= 0, f"{name} at {size}, {scheme} fits one screen: {m['tall']}px taller")
             check(not errors, f"the registry pages at {size}, {scheme} ran without an error: {errors}")
             ctx.close()
+
+
+def the_time_zone_tab(browser, prefix):
+    """Contract v26 (W6.35): the Settings' Time zone tab -- the zone in
+    force, who set it, the deadline a held booking is due by -- and its
+    Change dialog, each on one screen at the three sizes with no sideways
+    scroll."""
+    for size, width, height in V24_SIZES:
+        ctx = context(browser, width, height)
+        page = ctx.new_page()
+        errors = []
+        page.on("pageerror", lambda e: errors.append(str(e)))
+        page.goto(ADMIN_PAGE + "#time-zone")
+        settled(page)
+        said = page.inner_text("#time-zone")
+        check("America/Chicago" in said and "21:00" in said and "operations-1" in said,
+              f"at {size} the Time zone tab says the zone, the deadline and who declares it: {said[:200]!r}")
+        m = page.evaluate(MEASURE)
+        measured(page, f"time-zone at {size}", f"v26-{prefix}-time-zone-{size}.png")
+        check(m["tall"] <= 0, f"the Time zone tab at {size} fits one screen: {m['tall']}px taller")
+        page.click("#time-zone button[data-dialog-open=time-zone-change]")
+        page.wait_for_timeout(300)
+        boxed = inside_the_viewport(page)
+        check(not boxed, f"at {size} the time zone's dialog stays within the viewport{': ' + boxed if boxed else ''}")
+        page.screenshot(path=os.path.join(OUT, f"v26-{prefix}-time-zone-dialog-{size}.png"))
+        check(not errors, f"the Time zone tab at {size} ran without a script error: {errors}")
+        ctx.close()
 
 
 def the_v24_pages(browser, prefix):
@@ -1287,6 +1324,7 @@ with sync_playwright() as playwright:
     the_v25_pages(browser, prefix)
     the_documentation_pages(browser, prefix)
     the_registry_pages(browser, prefix)
+    the_time_zone_tab(browser, prefix)
     browser.close()
 
 if failures:
