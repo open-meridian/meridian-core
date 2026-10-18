@@ -398,8 +398,15 @@ registry:
 # an ECDSA P-256 public key as PEM. Empty, nothing is installed from a
 # registry: the Browse tab says the deployment reaches none. The release
 # fills them; an install changes them only to follow a published rotation.
+# v26: the platform's current key (SHA-256 of its PEM 69c1961a...), the
+# registry's signing key at open-meridian.com.
 registries:
-  platformKeys: []
+  platformKeys:
+    - |
+      -----BEGIN PUBLIC KEY-----
+      MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEYM0/p11OyeOPd/Wxgpt0yNiY74kY
+      CavdxXGp4OQ2EJvgQBJfLQm4DG2uWK3eIlP1NBy1ez3L7tuAnvT8TiIWeg==
+      -----END PUBLIC KEY-----
 
 # What launches the plugins a deployment admin uploads and approves (W8.3),
 # creating each a Deployment in the chart's plugin shape and nothing else

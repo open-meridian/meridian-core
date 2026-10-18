@@ -241,7 +241,7 @@ check-codegen:
 		fi; \
 	done
 	@rm -rf $(SCRATCH)
-	@echo "check-codegen OK: $(DOMAIN_RS) and $(TRANSITIONS_RS) match a fresh generation from the protos and the schema's transition table"
+	@echo "check-codegen OK: $(DOMAIN_RS), $(TRANSITIONS_RS) and $(FIELDS_JSON) match a fresh generation from the protos and the schema's boundaries"
 
 # A build whose result is a verdict, not an image: kept as build cache, which
 # the gate frees, rather than left behind as an untagged image holding its
@@ -2006,9 +2006,11 @@ chart-check:
 		|| { echo "chart-check FAILED: a platform key renders no ConfigMap entry" >&2; exit 1; }; \
 	[ "$$(echo "$$keyed" | grep -c 'name: MERIDIAN_PLATFORM_KEYS_DIR')" = 1 ] \
 		|| { echo "chart-check FAILED: the platform's keys reach other than the conductor alone" >&2; exit 1; }; \
-	! $(HELM) template check deploy/chart $$base 2>/dev/null | grep -q 'MERIDIAN_PLATFORM_KEYS_DIR\|platform-keys' \
-		|| { echo "chart-check FAILED: no platform key still renders the keys' volume or variable" >&2; exit 1; }
-	@echo "chart-check OK: the platform's keys on the conductor alone, as files, only where the chart carries some; four components, the dashboard and the three ways it signs people in, the key and the settings key on the conductor alone, both key paths, refusals, migrations, no pinned uid, a plugin held to its side of the pod, its front door open to the dashboard alone, an Ingress only when asked for and HTTPS alone unless plain HTTP is, development only when asked for, the live shape there alone, a backup only when sealed and placed, and nothing an upgrade leaves behind"
+	! $(HELM) template check deploy/chart $$base --set-json 'registries.platformKeys=[]' 2>/dev/null | grep -q 'MERIDIAN_PLATFORM_KEYS_DIR\|platform-keys' \
+		|| { echo "chart-check FAILED: no platform key still renders the keys' volume or variable" >&2; exit 1; }; \
+	$(HELM) template check deploy/chart $$base 2>/dev/null | grep -q 'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEYM0/p11OyeOPd/Wxgpt0yNiY74kY' \
+		|| { echo "chart-check FAILED: the chart's default does not carry the platform's key (v26)" >&2; exit 1; }
+	@echo "chart-check OK: the platform's keys on the conductor alone, as files, only where the chart carries some, its current key by default; four components, the dashboard and the three ways it signs people in, the key and the settings key on the conductor alone, both key paths, refusals, migrations, no pinned uid, a plugin held to its side of the pod, its front door open to the dashboard alone, an Ingress only when asked for and HTTPS alone unless plain HTTP is, development only when asked for, the live shape there alone, a backup only when sealed and placed, and nothing an upgrade leaves behind"
 
 lint:
 	@$(DOCKER) build -f Dockerfile.rust --target lint $(VERDICT) . >/dev/null 2>&1 \
