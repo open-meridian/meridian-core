@@ -213,6 +213,14 @@ fn run() -> Result<(), String> {
             meridian_bor::booking_service::SWEEP_EVERY,
         ));
 
+        // Contract v26 (W11.34): the affirmation deadline and the
+        // deployment's time zone, read from the conductor now and again, for
+        // a held booking's due_by.
+        tokio::spawn(meridian_bor::deadline::follow_forever(
+            bus.clone(),
+            meridian_bor::deadline::READ_EVERY,
+        ));
+
         // W5.20, said on the bus for the instrument store to carry outward.
         let reporting = bus.clone();
         let schema = meridian_bor::migrations::latest();

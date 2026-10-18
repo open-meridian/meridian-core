@@ -107,6 +107,14 @@ spec:
                   name: {{ .Values.firstRun.addressesSecretName }}
                   key: administrator-login
                   optional: true
+            # W7.5 (contract v26): the deployment's time zone the wizard
+            # was told, recorded once as the setting's first change.
+            - name: MERIDIAN_DEPLOYMENT_TIME_ZONE
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.firstRun.addressesSecretName }}
+                  key: deployment-time-zone
+                  optional: true
             {{- end }}
             - name: MERIDIAN_KEY_PATH
               value: {{ if include "meridian-runtime.generatedKey" . }}/var/lib/meridian/key.pem{{ else }}/etc/meridian/key.pem{{ end }}

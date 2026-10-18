@@ -49,6 +49,7 @@ pub mod booking;
 pub mod booking_service;
 pub mod cash;
 pub mod dates;
+pub mod deadline;
 pub mod decide;
 pub mod ids;
 pub mod journal;

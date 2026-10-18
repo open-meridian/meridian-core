@@ -158,6 +158,28 @@ impl Zone {
         }
     }
 
+    /// A zone of one POSIX TZ rule alone (`EST5EDT,M3.2.0,M11.1.0`), as a
+    /// file's footer gives it: what a test reads without the host's files.
+    pub fn of_rule(rule: &str) -> Result<Zone, String> {
+        Ok(Zone {
+            transitions: Vec::new(),
+            offsets: vec![0],
+            initial: 0,
+            rule: Some(Rule::parse(rule)?),
+        })
+    }
+
+    /// The instant, in nanoseconds since the epoch, a local wall-clock time
+    /// names: `seconds` past local midnight on `date` (W11.34's due_by). A
+    /// time a change skips reads at the offset before it; one a change
+    /// repeats, at the first.
+    pub fn instant_of(&self, date: Date, seconds: i64) -> i64 {
+        let local = date.days_since_epoch() * 86_400 + seconds;
+        let guess = local - i64::from(self.offset_at(local));
+        let utc = local - i64::from(self.offset_at(guess));
+        utc * 1_000_000_000
+    }
+
     /// The local date and the seconds past local midnight at an instant.
     pub fn local(&self, utc_ns: i64) -> Option<(Date, i64)> {
         let utc = utc_ns.div_euclid(1_000_000_000);
@@ -360,6 +382,27 @@ mod tests {
         // 2026-03-08 06:59:59 UTC is 01:59:59 EST; a second later, 03:00 EDT.
         assert_eq!(rule.offset_at(1_772_953_199), -5 * 3600);
         assert_eq!(rule.offset_at(1_772_953_200), -4 * 3600);
+    }
+
+    #[test]
+    fn a_local_time_names_its_instant_either_side_of_a_change() {
+        let new_york = Zone::of_rule("EST5EDT,M3.2.0,M11.1.0").unwrap();
+        let date = |text| Date::parse(text).unwrap();
+        // 17:00 on 2026-10-16, EDT: 21:00 UTC.
+        assert_eq!(
+            new_york.instant_of(date("2026-10-16"), 17 * 3600),
+            1_792_184_400 * 1_000_000_000
+        );
+        // 17:00 on 2026-12-15, EST: 22:00 UTC.
+        assert_eq!(
+            new_york.instant_of(date("2026-12-15"), 17 * 3600),
+            1_797_372_000 * 1_000_000_000
+        );
+        // Midnight's end (1440 minutes) is the next day's midnight.
+        assert_eq!(
+            new_york.instant_of(date("2026-10-16"), 86_400),
+            new_york.instant_of(date("2026-10-17"), 0)
+        );
     }
 
     #[test]

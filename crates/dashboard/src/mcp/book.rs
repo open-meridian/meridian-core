@@ -172,6 +172,29 @@ never make it, whatever any level says.",
         Area::Trading,
         agent_orders_demo_only_schema,
     ),
+    // Contract v26 (W6.35): the deployment's time zone, a deployment
+    // admin's; the set preparable, at may not for agents until loosened.
+    spec(
+        "read_deployment_time_zone",
+        "Read the deployment's time zone",
+        "the deployment's time zone, an IANA time-zone ID (America/New_York until set), its last \
+change and who made it, and the affirmation deadline the launched operations plugin declares, \
+minutes after local midnight, by which a held booking is due on its trade date in this zone \
+(0 where none declares one). It never moves a market's own cut, such as FX's 17:00 New York.",
+        true,
+        Area::Accounts,
+        nothing_schema,
+    ),
+    spec(
+        "set_deployment_time_zone",
+        "Set the deployment's time zone",
+        "set the deployment's time zone by its IANA time-zone ID, with a note saying why, each \
+change its own record (W6.35). An ID the time-zone database does not hold is refused naming \
+deployment_time_zone. Answers the setting as read_deployment_time_zone does.",
+        false,
+        Area::Accounts,
+        deployment_time_zone_schema,
+    ),
 ];
 
 /// A spec's whole description, as the surface lists it.
@@ -230,6 +253,18 @@ fn agent_orders_demo_only_schema() -> Value {
             "note": note(),
         },
         "required": ["agent_orders_demo_only", "note"],
+        "additionalProperties": false,
+    })
+}
+
+fn deployment_time_zone_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "deployment_time_zone": {"type": "string", "minLength": 1, "maxLength": 64, "description": "an IANA time-zone ID: America/New_York, Europe/London, Asia/Tokyo"},
+            "note": note(),
+        },
+        "required": ["deployment_time_zone", "note"],
         "additionalProperties": false,
     })
 }
@@ -296,6 +331,8 @@ pub async fn call(app: &App, caller: &Caller, spec: &Spec, arguments: Value) -> 
         "set_local_record_orders" => set_local_record_orders(app, caller, &arguments).await,
         "read_agent_orders_demo_only" => read_agent_orders_demo_only(app, caller).await,
         "set_agent_orders_demo_only" => set_agent_orders_demo_only(app, caller, &arguments).await,
+        "read_deployment_time_zone" => read_deployment_time_zone(app, caller).await,
+        "set_deployment_time_zone" => set_deployment_time_zone(app, caller, &arguments).await,
         "close_account" => close_account(app, caller, &arguments).await,
         "read_book_health" => read_book_health(app, caller, &arguments).await,
         other => refused("not_listed", &format!("no tool {other}"), Vec::new()),
@@ -781,6 +818,76 @@ async fn set_agent_orders_demo_only(app: &App, caller: &Caller, arguments: &Valu
     }
 }
 
+/// W6.35 (contract v26): the deployment's time zone read, a deployment
+/// admin's.
+async fn read_deployment_time_zone(app: &App, caller: &Caller) -> Value {
+    let (_, access) = match access_of(app, caller) {
+        Ok(held) => held,
+        Err(refusal) => return refusal,
+    };
+    if !access.deployment_admin {
+        return refused(
+            "not_permitted",
+            "the deployment's time zone is a deployment admin's to read",
+            Vec::new(),
+        );
+    }
+    match crate::admin::time_zone::read(&app.bus).await {
+        Ok(setting) => {
+            json!({"outcome": "unchanged", "data": crate::admin::time_zone::json(&setting)})
+        }
+        Err(failed) => refused("unavailable", &failed, Vec::new()),
+    }
+}
+
+/// W6.35 (contract v26): the deployment's time zone set, a deployment
+/// admin's; the conductor checks the ID and keeps the change.
+async fn set_deployment_time_zone(app: &App, caller: &Caller, arguments: &Value) -> Value {
+    let mut problems = Problems::default();
+    let Some(top) = object(arguments, "", &mut problems) else {
+        return problems.refusal();
+    };
+    only(top, &["deployment_time_zone", "note"], "", &mut problems);
+    let zone = text(top, "deployment_time_zone", "", true, &mut problems);
+    if !zone.is_empty() && !meridian_domain::zones::is_zone(zone.trim()) {
+        problems.add(
+            "deployment_time_zone",
+            "an IANA time-zone ID, such as America/New_York",
+        );
+    }
+    let reason = text(top, "note", "", true, &mut problems);
+    if !problems.is_empty() {
+        return problems.refusal();
+    }
+    let (_, access) = match access_of(app, caller) {
+        Ok(held) => held,
+        Err(refusal) => return refusal,
+    };
+    if !access.deployment_admin {
+        return refused(
+            "not_permitted",
+            "the deployment's time zone is a deployment admin's",
+            Vec::new(),
+        );
+    }
+    let reply: Result<meridian_domain::v1::DeploymentTimeZoneSetting, _> = ask(
+        app,
+        caller,
+        crate::admin::time_zone::SET_DEPLOYMENT_TIME_ZONE,
+        "meridian.v1.SetDeploymentTimeZoneRequest",
+        meridian_domain::v1::SetDeploymentTimeZoneRequest {
+            deployment_time_zone: zone.trim().to_string(),
+            reason,
+        },
+        CHANGING,
+    )
+    .await;
+    match reply {
+        Err(failed) => bus_refused(failed, "deployment_time_zone"),
+        Ok(reply) => json!({"outcome": "made", "data": crate::admin::time_zone::json(&reply)}),
+    }
+}
+
 /// W6.3 (contract v24): an account closed, a deployment admin's. No tool
 /// sets a grant (W6.30), so "Unlink all and close" is refused while one
 /// stands, naming it: a person withdraws it at the page.
@@ -880,6 +987,12 @@ pub const PARITY: &[(&str, &str)] = &[
         "/admin/trading-instructions",
         "list_trading_instructions set_trading_instruction set_local_record_orders",
     ),
+    // Contract v26 (W6.35): the Settings' Time zone tab and its form.
+    (
+        "tab time-zone",
+        "read_deployment_time_zone set_deployment_time_zone",
+    ),
+    ("/admin/time-zone", "set_deployment_time_zone"),
     // Contract v26 (W11.38, W11.39): the home page's line for the guard.
     (
         "/ agents' guard",

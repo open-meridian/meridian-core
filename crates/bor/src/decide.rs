@@ -105,6 +105,10 @@ pub struct Context {
     /// Contract v26 (W11.38): the agents' guard in force, read from the
     /// control partition; `None` reads as on, the default.
     pub agent_orders_demo_only: Option<bool>,
+    /// Contract v26 (W11.34; question 230): the affirmation deadline and the
+    /// deployment's time zone, as the book last read them; `None` where none
+    /// is declared, and a held booking's alert names no moment.
+    pub affirmation: Option<crate::deadline::Affirmation>,
 }
 
 /// What an instrument's record says that the book requires (W9.1, contract

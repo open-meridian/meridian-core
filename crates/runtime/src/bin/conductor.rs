@@ -598,6 +598,20 @@ fn install_named_administrator(store: &dyn meridian_config::Store) {
     let group = var("MERIDIAN_ADMINISTRATOR_DIRECTORY_GROUP").unwrap_or_default();
     let login = var("MERIDIAN_ADMINISTRATOR_LOGIN").unwrap_or_default();
 
+    // W7.5, W7.6 (contract v26): the zone the wizard was told, the
+    // setting's first record, naming the administrator; once, where nothing
+    // set one before.
+    if let Some(zone) = var("MERIDIAN_DEPLOYMENT_TIME_ZONE") {
+        let by = if login.is_empty() { &group } else { &login };
+        match meridian_config::service::record_first_run_time_zone(store, &zone, by, now_ns()) {
+            Ok(true) => tracing::info!(
+                zone,
+                "the deployment's time zone the wizard named is recorded"
+            ),
+            Ok(false) => {}
+            Err(failed) => tracing::warn!(%failed, "the wizard's time zone could not be recorded"),
+        }
+    }
     match meridian_config::install_named_administrator(store, &*clock(), &group, &login) {
         // Every start after the first, and every deployment whose
         // administrator arrived another way. The write refuses itself when one

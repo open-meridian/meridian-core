@@ -845,6 +845,17 @@ fn alert(
     reason: String,
     subject: AlertSubject,
 ) -> Act {
+    alert_due(ctx, account_id, kind, reason, subject, 0)
+}
+
+fn alert_due(
+    ctx: &Context,
+    account_id: &str,
+    kind: AlertKind,
+    reason: String,
+    subject: AlertSubject,
+    due_by: i64,
+) -> Act {
     Act::AlertRaised {
         alert: Alert {
             alert_id: ctx.mint(ALERT),
@@ -853,12 +864,10 @@ fn alert(
             state: AlertState::Raised as i32,
             reason,
             subject: Some(subject),
-            // From contract v25 the operations plugin's declaration carries
-            // its affirmation_deadline (W11.34), but no row brings a
-            // version's declaration to the book and the deployment names no
-            // time zone of its own, so a held booking's alert still names no
-            // moment it is due by: zero, as W11.34 reads it with none known.
-            due_by: 0,
+            // A held booking's: when the operations plugin's
+            // affirmation_deadline falls on its trade date, in the
+            // deployment's time zone (W11.34, contract v26); zero otherwise.
+            due_by,
             last_change: None,
         },
     }
@@ -897,7 +906,13 @@ fn error_alerts(ctx: &Context, book: &Book, booking: &Booking) -> Vec<Act> {
 }
 
 fn held_alert(ctx: &Context, book: &Book, booking: &Booking, reason: &str) -> Act {
-    alert(
+    // Its trade date, its first execution's as it stands (W11.34).
+    let due_by = ctx.affirmation.as_ref().map_or(0, |affirmation| {
+        executed(book, &booking.execution_ids)
+            .map(|executed| affirmation.due_by(&executed.trade_date))
+            .unwrap_or(0)
+    });
+    alert_due(
         ctx,
         &book.account_id,
         AlertKind::BookingHeld,
@@ -908,6 +923,7 @@ fn held_alert(ctx: &Context, book: &Book, booking: &Booking, reason: &str) -> Ac
             allocation_id: String::new(),
             position: None,
         },
+        due_by,
     )
 }
 

@@ -1323,6 +1323,17 @@ fn open_page(
          Give it a name: on one machine, <code>http://localhost</code> with the same \
          port.</p>"
             .to_string(),
+        // W7.5 (contract v26): the deployment's time zone, an IANA ID, New
+        // York unless chosen; changed later on the deployment's Settings.
+        choice(
+            "deployment_time_zone",
+            "Deployment time zone",
+            crate::admin::time_zone::DEFAULT,
+            &meridian_domain::zones::NAMES
+                .iter()
+                .map(|name| (*name, *name))
+                .collect::<Vec<_>>(),
+        ),
     ]
     .concat();
 

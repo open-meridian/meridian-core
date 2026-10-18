@@ -840,6 +840,15 @@ impl FirstRun {
             }
         }
 
+        // W7.5 (contract v26): the deployment's time zone, an IANA ID, for
+        // the conductor to record as the setting's first change, naming the
+        // administrator, when it starts (W7.6). Nothing where none was
+        // given or it is no zone: the deployment keeps New York.
+        let zone = configuration.deployment_time_zone.trim();
+        if meridian_domain::zones::is_zone(zone) {
+            values.insert("deployment-time-zone".to_string(), zone.as_bytes().to_vec());
+        }
+
         // The firm's issuer, where the chart reads the dashboard's from. Until
         // 2026-09-23 it was written only into the dashboard's OIDC Secret,
         // which the chart reads the client id out of and not the issuer, so a

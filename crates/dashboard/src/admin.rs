@@ -78,6 +78,7 @@ pub fn routes() -> Router<Arc<App>> {
             get(trading_page).post(set_trading_instruction),
         )
         .route(trading::LOCAL_RECORDS_PATH, post(set_local_record_orders))
+        .route("/admin/time-zone", post(set_deployment_time_zone))
         .route("/admin/data-sources", get(data_sources_page))
         .route("/admin/data-sources/licence", post(set_dataset_licence))
         .route(
@@ -463,6 +464,7 @@ pub mod data_sources;
 pub mod holds;
 pub mod instruments;
 pub(crate) mod overview;
+pub mod time_zone;
 pub(crate) use overview::listing;
 pub mod people;
 pub(crate) mod picker;
@@ -564,6 +566,11 @@ async fn admin_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Response
                 name: format!("{} (service account)", account.name),
             }),
     );
+    // Contract v26 (W6.35): the deployment's time zone, its tab.
+    let zone = time_zone::read(&app.bus).await;
+    if let Err(failed) = &zone {
+        tracing::warn!(%failed, "the deployment's time zone could not be read");
+    }
     let body = overview::render(
         &records,
         &delegating,
@@ -572,6 +579,7 @@ async fn admin_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Response
         &books,
         agents,
         service_accounts,
+        zone.as_ref().ok(),
         &token_input(&session),
         "",
     );
@@ -3204,6 +3212,61 @@ async fn set_local_record_orders(
 
 /// The escape hatch's act on the surface (W6.20, contract v24).
 const SET_LOCAL_RECORD_ORDERS_TOOL: &str = "dashboard__set_local_record_orders";
+
+/// W6.35 (contract v26): the deployment's time zone set, a deployment
+/// admin's, with a reason; or prepared for someone to make. The conductor
+/// checks the ID and keeps each change its own record.
+async fn set_deployment_time_zone(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Form(fields): Form<Fields>,
+) -> Response {
+    let back = "/admin#time-zone";
+    let (session, _) = match gate(&app, &headers, true) {
+        Ok(gated) => gated,
+        Err(response) => return *response,
+    };
+    if let Err(response) = form_token_matches(&session, &fields) {
+        return *response;
+    }
+    let zone = field(&fields, "deployment_time_zone").trim().to_string();
+    let note = field(&fields, "note").trim().to_string();
+    if note.is_empty() {
+        return not_done("say why the time zone changes", back);
+    }
+    let posted = prepare_or_gate(
+        &app,
+        &session,
+        &fields,
+        SET_DEPLOYMENT_TIME_ZONE_TOOL,
+        || Ok(serde_json::json!({"deployment_time_zone": zone, "note": note})),
+    )
+    .await;
+    if let Some(response) = posted_to(posted, back) {
+        return response;
+    }
+    let outcome = app
+        .bus
+        .call_for(
+            time_zone::SET_DEPLOYMENT_TIME_ZONE,
+            "meridian.v1.SetDeploymentTimeZoneRequest",
+            meridian_domain::v1::SetDeploymentTimeZoneRequest {
+                deployment_time_zone: zone.clone(),
+                reason: note.clone(),
+            }
+            .encode_to_vec(),
+            None,
+            Some(Duration::from_secs(10)),
+            &session.subject,
+        )
+        .await
+        .map(|_| ())
+        .map_err(said_of_refusal);
+    after_to(outcome, "/admin?done=Time+zone+set#time-zone", back)
+}
+
+/// The time zone's act on the surface (W6.35, contract v26).
+const SET_DEPLOYMENT_TIME_ZONE_TOOL: &str = "dashboard__set_deployment_time_zone";
 
 /// W3.28 (contract v24): "Report identifier usage", a deployment admin's,
 /// with a reason; or prepared for someone to make.

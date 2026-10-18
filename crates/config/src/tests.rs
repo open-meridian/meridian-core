@@ -3541,21 +3541,25 @@ async fn the_deployments_time_zone_is_new_york_until_set_each_change_its_own_rec
     assert_eq!(read().await.unwrap().deployment_time_zone, "Europe/London");
     // The first run's zone is recorded only where nothing was set.
     assert!(
-        !crate::service::record_first_run_time_zone(h.store.as_ref(), "Asia/Tokyo", 9).unwrap()
+        !crate::service::record_first_run_time_zone(h.store.as_ref(), "Asia/Tokyo", "", 9).unwrap()
     );
     let fresh = crate::memory::MemoryStore::default();
-    assert!(crate::service::record_first_run_time_zone(&fresh, "Asia/Tokyo", 9).unwrap());
+    assert!(
+        crate::service::record_first_run_time_zone(&fresh, "Asia/Tokyo", "local|ada", 9).unwrap()
+    );
     assert_eq!(
         fresh.deployment_time_zone().unwrap().unwrap().changed_by,
+        "local|ada",
+        "names the administrator the wizard was told"
+    );
+    assert!(crate::service::record_first_run_time_zone(&fresh, "Nowhere/Here", "", 10).is_ok());
+    let unnamed = crate::memory::MemoryStore::default();
+    assert!(crate::service::record_first_run_time_zone(&unnamed, "Nowhere/Here", "", 10).is_err());
+    assert!(crate::service::record_first_run_time_zone(&unnamed, "Asia/Tokyo", "", 11).unwrap());
+    assert_eq!(
+        unnamed.deployment_time_zone().unwrap().unwrap().changed_by,
         "first-run"
     );
-    assert!(crate::service::record_first_run_time_zone(&fresh, "Nowhere/Here", 10).is_ok());
-    assert!(crate::service::record_first_run_time_zone(
-        &crate::memory::MemoryStore::default(),
-        "Nowhere/Here",
-        10
-    )
-    .is_err());
 }
 
 /// W3.28 (contract v24): the usage report is on by default; turning it off

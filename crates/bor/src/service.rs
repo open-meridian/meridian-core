@@ -132,6 +132,7 @@ pub(crate) fn context_of(envelope: &Envelope, clock: &dyn Clock) -> Context {
         members: Default::default(),
         local_record_orders: None,
         agent_orders_demo_only: None,
+        affirmation: crate::deadline::current(),
     }
 }
 

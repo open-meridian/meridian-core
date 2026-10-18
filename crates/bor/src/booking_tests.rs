@@ -614,6 +614,19 @@ async fn a_bust_holds_a_booking_its_cancel_clears_the_alert_and_it_is_booked_aga
     )
     .await
     .unwrap();
+    // The operations plugin's affirmation deadline, 21:00 in the
+    // deployment's time zone (W11.34, contract v26), as the book read it.
+    crate::deadline::keep(
+        crate::deadline::of_setting(
+            &meridian_domain::v1::DeploymentTimeZoneSetting {
+                deployment_time_zone: "America/New_York".into(),
+                affirmation_deadline: 21 * 60,
+                ..Default::default()
+            },
+            |_| meridian_domain::zone::Zone::of_rule("EST5EDT,M3.2.0,M11.1.0"),
+        )
+        .unwrap(),
+    );
     // A bust of one of its executions (row b5): held, an alert raised.
     let held_order = order_now(&w, &order.order_id);
     let placement_id = held_order.placements[0].placement_id.clone();
@@ -641,6 +654,9 @@ async fn a_bust_holds_a_booking_its_cancel_clears_the_alert_and_it_is_booked_aga
     );
     let alerts = alerts_in(&w, ACC);
     assert_eq!(alerts[0].kind, AlertKind::BookingHeld as i32);
+    // Due by 21:00 EDT on its trade date, 2026-10-13: 01:00 UTC the next day.
+    assert_eq!(alerts[0].due_by, 1_791_939_600 * 1_000_000_000);
+    crate::deadline::keep(None);
 
     // Its hand-off's check fails: it stays held.
     let still = hand_off(&w, &booking.booking_id, false).await.unwrap();

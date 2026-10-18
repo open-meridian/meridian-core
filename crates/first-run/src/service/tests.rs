@@ -578,7 +578,7 @@ async fn the_first_administrators_account_is_written_where_the_dashboard_will_fi
     let (cluster, done) = watched();
     let run = first_run(Box::new(cluster), vec![]);
     let configuration = FirstRunConfiguration {
-        deployment_time_zone: String::new(),
+        deployment_time_zone: "Europe/London".into(),
         administrator: Some(AdministratorAnswer {
             named: Some(Named::LocalAccountLogin("ada".into())),
         }),
@@ -629,6 +629,9 @@ async fn the_first_administrators_account_is_written_where_the_dashboard_will_fi
     // And the switch, without which the dashboard read none of it: on a
     // cluster it came back up in first run, serving its wizard again.
     assert!(addresses.contains("local-accounts"), "{addresses}");
+    // W7.5 (contract v26): the zone, for the conductor to record naming
+    // the administrator.
+    assert!(addresses.contains("deployment-time-zone"), "{addresses}");
 }
 
 #[tokio::test]

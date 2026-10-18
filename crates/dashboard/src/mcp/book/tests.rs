@@ -31,7 +31,10 @@ fn routes(source: &str) -> Vec<String> {
 fn every_route_of_the_book_and_the_instructions_names_its_tool() {
     let mut checked = 0;
     for path in routes(include_str!("../../admin.rs")) {
-        if path != "/admin/accounts/book" && !path.starts_with("/admin/trading-instructions") {
+        if path != "/admin/accounts/book"
+            && path != "/admin/time-zone"
+            && !path.starts_with("/admin/trading-instructions")
+        {
             continue;
         }
         checked += 1;
@@ -41,7 +44,7 @@ fn every_route_of_the_book_and_the_instructions_names_its_tool() {
             .unwrap_or_else(|| panic!("{path} is routed and names no tool"));
         assert!(names_tools(by), "{path}: {by:?}");
     }
-    assert_eq!(checked, 2, "the routes were not found");
+    assert_eq!(checked, 3, "the routes were not found");
 }
 
 #[test]
@@ -81,8 +84,9 @@ fn the_four_tools_are_named_preparable_where_they_change_and_may_not_for_agents(
     // The four approved in v22, from contract v24 the escape hatch's setting
     // (W11.36, approved 2026-10-14) and closing an account (W6.3, approved
     // 2026-10-15), from contract v25 the book's health (ruling 155), and
-    // from contract v26 the agents' guard's read and set (W11.38, W11.39).
-    assert_eq!(SPECS.len(), 9, "the nine approved tools");
+    // from contract v26 the agents' guard's read and set (W11.38, W11.39)
+    // and the deployment's time zone's (W6.35).
+    assert_eq!(SPECS.len(), 11, "the eleven approved tools");
 }
 
 #[test]
@@ -140,7 +144,7 @@ fn a_change_takes_a_note_and_a_read_answers_unchanged() {
     }
     let source = include_str!("../book.rs");
     assert!(!source.contains("\"outcome\": \"read\""));
-    assert_eq!(source.matches("\"outcome\": \"unchanged\"").count(), 4);
+    assert_eq!(source.matches("\"outcome\": \"unchanged\"").count(), 5);
 }
 
 /// Contract v24 (W6.3, W6.30): "Unlink all and close" through the surface is

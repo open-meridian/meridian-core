@@ -431,11 +431,13 @@ pub fn time_zone_setting(
 }
 
 /// W7.5 (contract v26): the zone the wizard was told, recorded once as the
-/// first change, by the deployment's first run, where nothing set one
-/// before. Says whether it recorded it.
+/// first change, naming the administrator the wizard was told (`by`; the
+/// first run itself where none), where nothing set one before. Says
+/// whether it recorded it.
 pub fn record_first_run_time_zone(
     store: &dyn crate::store::Store,
     zone: &str,
+    by: &str,
     at_ns: i64,
 ) -> Result<bool, String> {
     let zone = zone.trim();
@@ -454,7 +456,13 @@ pub fn record_first_run_time_zone(
         .set_deployment_time_zone(
             zone,
             &Author {
-                by: "first-run".into(),
+                // The person the wizard was told administers the deployment
+                // (W7.5), else the first run itself.
+                by: if by.trim().is_empty() {
+                    "first-run".into()
+                } else {
+                    by.trim().to_string()
+                },
                 note: "set at the deployment's first run (W7.5)".into(),
                 ..Default::default()
             },
