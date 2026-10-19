@@ -50,8 +50,8 @@ RUN --mount=type=cache,id=meridian-core-registry,target=/usr/local/cargo/registr
 # Every test binary: each crate's unit tests and every integration test, in
 # one invocation with the whole workspace's features, as `test` always built
 # them. Kept, with a manifest saying whose each is, in /tests -- with the
-# workspace's binaries, linked back where a test that starts one finds it
-# (the runtime's waiting tests, by CARGO_BIN_EXE_<name>) -- the only part of the target
+# workspace's binaries a test starts, and only those, linked back where it
+# finds them (the runtime's waiting tests, by CARGO_BIN_EXE_<name>) -- the only part of the target
 # directory this image holds; tools/run-tests.sh runs them as `cargo test`
 # would. test-store, test-broker and test-directory run this image
 # beside their services (docker-compose.yaml's `tests`), where each used to

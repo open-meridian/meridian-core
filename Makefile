@@ -131,9 +131,9 @@ gate-start:
 gate-begin-%:
 	@$(GATE) begin $*
 
-# The tests stage's test binaries (compose's `tests`, 2.3 GB of debug test
+# The tests stage's test binaries (compose's `tests`, 1.6 GB of debug test
 # binaries in a fresh run, 2.5 before the runtime's integration tests were
-# one binary, ruling 354) freed once test-store, test-broker and
+# one binary and it kept only the programs a test starts, ruling 354) freed once test-store, test-broker and
 # test-directory have run them, before e2e-settings-page builds the runtime
 # image's release build and pulls its browser: the stage then holds the
 # larger of its two halves, not their sum (v25's CI run held 15.5 GB of its

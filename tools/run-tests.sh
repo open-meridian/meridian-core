@@ -11,9 +11,12 @@
 #
 #   run-tests.sh collect < cargo's JSON messages
 #       In the compile stage: copy each executable cargo reported -- the test
-#       binaries, and the workspace's own binaries, which a test may start by
+#       binaries, and those of the workspace's own binaries a test starts by
 #       the path cargo compiled into it (CARGO_BIN_EXE_<name>) -- to
 #       $MERIDIAN_TESTS_DIR/<package>/<target> and list it in manifest.tsv.
+#       A binary no test names is left out: the runtime's eleven, every one
+#       copied, were 1.1 GB of the image, and its tests start three (ruling
+#       354).
 #
 #   run-tests.sh link
 #       Once the target cache is no longer mounted: put each workspace binary
@@ -38,6 +41,14 @@ if [ "${1:-}" = collect ]; then
   sed -n 's/.*"manifest_path":"\([^"]*\)".*"target":{"kind":\["\([a-z-]*\)".*"name":"\([^"]*\)".*"executable":"\([^"]*\)".*/\1\t\2\t\3\t\4/p' \
     | while IFS=$'\t' read -r manifest kind name exe; do
         pkg=$(sed -n 's/^name *= *"\(.*\)"/\1/p' "$manifest" | head -1)
+        # Cargo gives a package's binaries' paths to that package's own
+        # integration tests and to nothing else, so a binary is kept when its
+        # package's sources name it, and one they do not is one no test here
+        # can start.
+        if [ "$kind" = bin ] \
+          && ! grep -rqF "CARGO_BIN_EXE_$name\"" "$(dirname "$manifest")"; then
+          continue
+        fi
         mkdir -p "$DIR/$pkg"
         cp "$exe" "$DIR/$pkg/$name"
         printf '%s\t%s\t%s\t%s\t%s\n' "$pkg" "$kind" "$name" "$(dirname "$manifest")" "$exe"
