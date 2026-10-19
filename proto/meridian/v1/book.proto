@@ -932,6 +932,12 @@ message AccountAttributes {
   // account, with no statement to reconcile against, flat once booked; a
   // balance left after booking holds the booking (W11.28).
   bool allocation_account = 8;
+  // Contract v26 (W9.13, W12.2; ruling 316, 2026-10-18): the platform's ID
+  // of the base currency's cash instrument, which the book resolves from
+  // base_currency_code when the base is set and keeps; empty while the
+  // instrument store has not resolved the code. What the analytics
+  // component values an account in.
+  string base_cash_instrument_id = 9;
 }
 
 message SetAccountAttributeRequest {

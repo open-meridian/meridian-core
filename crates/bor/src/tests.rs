@@ -1553,6 +1553,63 @@ async fn attributes_are_set_for_a_person_before_or_after_an_opening_balance() {
     assert_eq!(listed.attributes.len(), 1);
 }
 
+/// Contract v26 (W9.13; ruling 316): a base currency set names its cash
+/// instrument, the code resolved before the change is decided and kept on
+/// its record; the read answers it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_base_currency_set_names_its_cash_instrument() {
+    let (bus, _) = wired();
+    bus.serve(crate::cash::RESOLVE_IDENTIFIER, |envelope| {
+        let asked =
+            meridian_domain::v1::ResolveIdentifierRequest::decode(&envelope.payload[..]).unwrap();
+        let known = asked.identifiers[0].value == "CHF";
+        Ok((
+            "meridian.v1.ResolveIdentifierReply".into(),
+            meridian_domain::v1::ResolveIdentifierReply {
+                found: known,
+                instrument_id: if known {
+                    "INS-CASHCHF-V26".into()
+                } else {
+                    String::new()
+                },
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ))
+    });
+    let reply = send(
+        &bus,
+        SET_ACCOUNT_ATTRIBUTE,
+        "meridian.v1.SetAccountAttributeRequest",
+        &SetAccountAttributeRequest {
+            account_id: "ACC-3".into(),
+            attribute: Some(set_account_attribute_request::Attribute::BaseCurrencyCode(
+                "CHF".into(),
+            )),
+            reason: "the fund reports in it".into(),
+        },
+        Some("local|harness"),
+    )
+    .await
+    .unwrap();
+    let reply = AccountAttributeReply::decode(&reply[..]).unwrap();
+    // The process may already know CHF's instrument; either way the record
+    // names the one the book resolved.
+    let named = meridian_domain::money::known("CHF").expect("CHF resolved");
+    assert_eq!(reply.attributes.unwrap().base_cash_instrument_id, named);
+    let listed = read_as_a_plugin(
+        &bus,
+        LIST_ACCOUNT_ATTRIBUTES,
+        "meridian.v1.ListAccountAttributesRequest",
+        &ListAccountAttributesRequest::default(),
+        &["ACC-3"],
+    )
+    .await
+    .unwrap();
+    let listed = ListAccountAttributesReply::decode(&listed[..]).unwrap();
+    assert_eq!(listed.attributes[0].base_cash_instrument_id, named);
+}
+
 // ── W9.9 ────────────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]

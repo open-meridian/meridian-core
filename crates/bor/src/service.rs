@@ -622,6 +622,21 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
         bus.serve(SET_ACCOUNT_ATTRIBUTE, move |envelope| {
             let request: SetAccountAttributeRequest =
                 decode(&envelope, "meridian.v1.SetAccountAttributeRequest")?;
+            // A base currency's code resolved to its cash instrument before
+            // the change is decided, so the record names both (ruling 316).
+            if let Some(
+                meridian_domain::v1::set_account_attribute_request::Attribute::BaseCurrencyCode(
+                    code,
+                ),
+            ) = &request.attribute
+            {
+                crate::cash::ensure_blocking(
+                    &bus2,
+                    &store,
+                    std::slice::from_ref(code),
+                    clock.now_ns(),
+                );
+            }
             let ctx = context_of(&envelope, clock.as_ref());
             command(
                 &bus2,
@@ -778,7 +793,21 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
         Ok((
             "meridian.v1.ListAccountAttributesReply".to_string(),
             ListAccountAttributesReply {
-                attributes: page.records,
+                // An account whose base was set before contract v26, or
+                // before its code was resolved, answered with its cash
+                // instrument once the book holds the resolution (ruling 316).
+                attributes: page
+                    .records
+                    .into_iter()
+                    .map(|mut attributes| {
+                        if attributes.base_cash_instrument_id.is_empty() {
+                            attributes.base_cash_instrument_id =
+                                meridian_domain::money::known(&attributes.base_currency_code)
+                                    .unwrap_or_default();
+                        }
+                        attributes
+                    })
+                    .collect(),
                 next_cursor: page.next_cursor,
                 as_of: Some(watermark_of(&page.as_of)),
             }

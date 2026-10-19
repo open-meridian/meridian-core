@@ -1823,6 +1823,11 @@ pub fn set_attribute(
                     "base_currency_code is {code:?}; an ISO 4217 code is three capital letters"
                 )));
             }
+            // Its cash instrument, where the instrument store has resolved
+            // the code (contract v26, W9.13; ruling 316): kept on the record
+            // this change writes.
+            attributes.base_cash_instrument_id =
+                meridian_domain::money::known(&code).unwrap_or_default();
             attributes.base_currency_code = code;
         }
         Some(set_account_attribute_request::Attribute::LotReliefDefault(method)) => {

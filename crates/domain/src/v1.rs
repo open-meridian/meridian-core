@@ -7319,6 +7319,13 @@ pub struct AccountAttributes {
     /// balance left after booking holds the booking (W11.28).
     #[prost(bool, tag = "8")]
     pub allocation_account: bool,
+    /// Contract v26 (W9.13, W12.2; ruling 316, 2026-10-18): the platform's ID
+    /// of the base currency's cash instrument, which the book resolves from
+    /// base_currency_code when the base is set and keeps; empty while the
+    /// instrument store has not resolved the code. What the analytics
+    /// component values an account in.
+    #[prost(string, tag = "9")]
+    pub base_cash_instrument_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SetAccountAttributeRequest {
