@@ -195,6 +195,30 @@ deployment_time_zone. Answers the setting as read_deployment_time_zone does.",
         Area::Accounts,
         deployment_time_zone_schema,
     ),
+    // Contract v26 (W12.6): the analytics routing table, a deployment
+    // admin's; the set preparable, at may not for agents until loosened.
+    spec(
+        "list_model_routing",
+        "List the model routing",
+        "which implementation prices each of v26's model ids (cash, quoted_price, binary_event) \
+across the deployment -- built-in, or a launched pricing plugin's instance -- each with since \
+when, who routed it and why, and the table's version, which every analytics answer's provenance \
+names.",
+        true,
+        Area::Accounts,
+        nothing_schema,
+    ),
+    spec(
+        "set_model_routing",
+        "Route a model id",
+        "route a model id to built-in or to a launched pricing plugin's instance, with a note \
+saying why, each change its own record (W12.6). An instance that is not a pricing plugin the \
+deployment runs is refused naming implementation. A routed plugin that does not answer leaves \
+the figures through it not evaluated. Answers the table as list_model_routing does.",
+        false,
+        Area::Accounts,
+        model_routing_schema,
+    ),
 ];
 
 /// A spec's whole description, as the surface lists it.
@@ -269,6 +293,19 @@ fn deployment_time_zone_schema() -> Value {
     })
 }
 
+fn model_routing_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "model_id": {"type": "string", "enum": ["cash", "quoted_price", "binary_event"]},
+            "implementation": {"type": "string", "minLength": 1, "maxLength": 128, "description": "built-in, or a launched pricing plugin's instance ID"},
+            "note": note(),
+        },
+        "required": ["model_id", "implementation", "note"],
+        "additionalProperties": false,
+    })
+}
+
 fn instruction_schema() -> Value {
     json!({
         "type": "object",
@@ -333,6 +370,8 @@ pub async fn call(app: &App, caller: &Caller, spec: &Spec, arguments: Value) -> 
         "set_agent_orders_demo_only" => set_agent_orders_demo_only(app, caller, &arguments).await,
         "read_deployment_time_zone" => read_deployment_time_zone(app, caller).await,
         "set_deployment_time_zone" => set_deployment_time_zone(app, caller, &arguments).await,
+        "list_model_routing" => list_model_routing(app, caller).await,
+        "set_model_routing" => set_model_routing(app, caller, &arguments).await,
         "close_account" => close_account(app, caller, &arguments).await,
         "read_book_health" => read_book_health(app, caller, &arguments).await,
         other => refused("not_listed", &format!("no tool {other}"), Vec::new()),
@@ -888,6 +927,81 @@ async fn set_deployment_time_zone(app: &App, caller: &Caller, arguments: &Value)
     }
 }
 
+/// W12.6 (contract v26): the routing table read, a deployment admin's.
+async fn list_model_routing(app: &App, caller: &Caller) -> Value {
+    let (_, access) = match access_of(app, caller) {
+        Ok(held) => held,
+        Err(refusal) => return refusal,
+    };
+    if !access.deployment_admin {
+        return refused(
+            "not_permitted",
+            "the model routing is a deployment admin's to read",
+            Vec::new(),
+        );
+    }
+    match crate::admin::model_routing::read(&app.bus).await {
+        Ok(table) => {
+            json!({"outcome": "unchanged", "data": crate::admin::model_routing::json(&table)})
+        }
+        Err(failed) => refused("unavailable", &failed, Vec::new()),
+    }
+}
+
+/// W12.6 (contract v26): a model id routed, a deployment admin's; the
+/// conductor checks the implementation and keeps the change.
+async fn set_model_routing(app: &App, caller: &Caller, arguments: &Value) -> Value {
+    let mut problems = Problems::default();
+    let Some(top) = object(arguments, "", &mut problems) else {
+        return problems.refusal();
+    };
+    only(
+        top,
+        &["model_id", "implementation", "note"],
+        "",
+        &mut problems,
+    );
+    let model_id = text(top, "model_id", "", true, &mut problems);
+    if !model_id.is_empty()
+        && !["cash", "quoted_price", "binary_event"].contains(&model_id.as_str())
+    {
+        problems.add("model_id", "cash, quoted_price or binary_event");
+    }
+    let implementation = text(top, "implementation", "", true, &mut problems);
+    let reason = text(top, "note", "", true, &mut problems);
+    if !problems.is_empty() {
+        return problems.refusal();
+    }
+    let (_, access) = match access_of(app, caller) {
+        Ok(held) => held,
+        Err(refusal) => return refusal,
+    };
+    if !access.deployment_admin {
+        return refused(
+            "not_permitted",
+            "routing a model id is a deployment admin's",
+            Vec::new(),
+        );
+    }
+    let reply: Result<meridian_domain::v1::ListModelRoutingReply, _> = ask(
+        app,
+        caller,
+        crate::admin::model_routing::SET_MODEL_ROUTING,
+        "meridian.v1.SetModelRoutingRequest",
+        meridian_domain::v1::SetModelRoutingRequest {
+            model_id,
+            implementation: implementation.trim().to_string(),
+            reason,
+        },
+        CHANGING,
+    )
+    .await;
+    match reply {
+        Err(failed) => bus_refused(failed, "implementation"),
+        Ok(reply) => json!({"outcome": "made", "data": crate::admin::model_routing::json(&reply)}),
+    }
+}
+
 /// W6.3 (contract v24): an account closed, a deployment admin's. No tool
 /// sets a grant (W6.30), so "Unlink all and close" is refused while one
 /// stands, naming it: a person withdraws it at the page.
@@ -993,6 +1107,9 @@ pub const PARITY: &[(&str, &str)] = &[
         "read_deployment_time_zone set_deployment_time_zone",
     ),
     ("/admin/time-zone", "set_deployment_time_zone"),
+    // Contract v26 (W12.6): the Settings' Model routing tab and its form.
+    ("tab model-routing", "list_model_routing set_model_routing"),
+    ("/admin/model-routing", "set_model_routing"),
     // Contract v26 (W11.38, W11.39): the home page's line for the guard.
     (
         "/ agents' guard",

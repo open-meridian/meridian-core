@@ -41,6 +41,9 @@ needed?" So, in headless Chromium:
 - a secret's field (2026-10-10): who set it and when, or "Not set", in the
   field itself; no badge and no box; a Remove beside an optional secret
   alone, which asks first, declined sending nothing and confirmed removing it.
+- the Model routing tab (contract v26, W12.6): each model id on one line,
+  its implementation and since when, and its Change dialog, at 375, 582 and
+  1280 wide;
 - the Service accounts tab (contract v21): one line an account behind the
   kit's pager, its dialog within the viewport, one created from it prepare
   only by default; and the Access tab's Runs as, one line a role, nobody
@@ -1193,6 +1196,37 @@ def the_time_zone_tab(browser, prefix):
         ctx.close()
 
 
+def the_model_routing_tab(browser, prefix):
+    """Contract v26 (W12.6): the Settings' Model routing tab -- each model
+    id on one line, its implementation and since when, the measures the
+    analytics component serves -- and its Change dialog, each on one screen
+    at the three sizes with no sideways scroll."""
+    for size, width, height in V24_SIZES:
+        ctx = context(browser, width, height)
+        page = ctx.new_page()
+        errors = []
+        page.on("pageerror", lambda e: errors.append(str(e)))
+        page.goto(ADMIN_PAGE + "#model-routing")
+        settled(page)
+        models = page.eval_on_selector_all("#model-routing [data-model-id]", "ds => ds.map(d => d.dataset.modelId)")
+        check(models == ["cash", "quoted_price", "binary_event"],
+              f"at {size} the Model routing tab gives each model id a line: {models}")
+        said = page.inner_text("#model-routing")
+        check("sample-pricing-with-a-long-instance-name-1" in said and "never routed" in said
+              and "historical_var v1" in said,
+              f"at {size} it says each implementation, since when, and the measures served: {said[:240]!r}")
+        m = page.evaluate(MEASURE)
+        measured(page, f"model-routing at {size}", f"v26-{prefix}-model-routing-{size}.png")
+        check(m["tall"] <= 0, f"the Model routing tab at {size} fits one screen: {m['tall']}px taller")
+        page.click("#model-routing button[data-dialog-open=model-routing-change]")
+        page.wait_for_timeout(300)
+        boxed = inside_the_viewport(page)
+        check(not boxed, f"at {size} the routing's dialog stays within the viewport{': ' + boxed if boxed else ''}")
+        page.screenshot(path=os.path.join(OUT, f"v26-{prefix}-model-routing-dialog-{size}.png"))
+        check(not errors, f"the Model routing tab at {size} ran without a script error: {errors}")
+        ctx.close()
+
+
 def the_v24_pages(browser, prefix):
     """Contract v24: the Instruments page's provisional records and the
     usage report's setting; the home page's counts; the escape hatch's
@@ -1352,6 +1386,7 @@ with sync_playwright() as playwright:
     the_documentation_pages(browser, prefix)
     the_registry_pages(browser, prefix)
     the_time_zone_tab(browser, prefix)
+    the_model_routing_tab(browser, prefix)
     the_portal_overview(browser, prefix)
     browser.close()
 

@@ -1797,6 +1797,66 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
             .encode_to_vec(),
         ))
     });
+    // Contract v26 (W12.6): the routing table, one model id routed with a
+    // long reason, and the measures the analytics component serves.
+    bus.serve(crate::admin::model_routing::LIST_MODEL_ROUTING, |_| {
+        Ok((
+            "meridian.v1.ListModelRoutingReply".into(),
+            meridian_domain::v1::ListModelRoutingReply {
+                routes: vec![
+                    meridian_domain::v1::ModelRouting {
+                        model_id: "cash".into(),
+                        implementation: "built-in".into(),
+                        ..Default::default()
+                    },
+                    meridian_domain::v1::ModelRouting {
+                        model_id: "quoted_price".into(),
+                        implementation: "sample-pricing-with-a-long-instance-name-1".into(),
+                        changed_at_ns: 1_792_300_000_000_000_000,
+                        changed_by: ADMIN.into(),
+                        reason: "Prove the pricing seam against the built-in model, as the \
+                                 sample plugin answers it"
+                            .into(),
+                    },
+                    meridian_domain::v1::ModelRouting {
+                        model_id: "binary_event".into(),
+                        implementation: "built-in".into(),
+                        ..Default::default()
+                    },
+                ],
+                version: 2,
+            }
+            .encode_to_vec(),
+        ))
+    });
+    bus.serve(
+        crate::admin::model_routing::LIST_MEASURE_DEFINITIONS,
+        |_| {
+            Ok((
+                "meridian.v1.ListMeasureDefinitionsReply".into(),
+                meridian_domain::v1::ListMeasureDefinitionsReply {
+                    definitions: [
+                        "market_value",
+                        "exposure",
+                        "concentration",
+                        "pnl",
+                        "historical_var",
+                        "expected_shortfall",
+                        "resolution_payoff",
+                        "implied_distribution",
+                    ]
+                    .iter()
+                    .map(|d| meridian_domain::v1::MeasureDefinition {
+                        definition: d.to_string(),
+                        version: 1,
+                        ..Default::default()
+                    })
+                    .collect(),
+                }
+                .encode_to_vec(),
+            ))
+        },
+    );
     // Contract v25 (W8.10 to W8.12, W5.19): the catalogue's copy Browse and
     // a listing's page read, filtered as the conductor filters it, and the
     // usage reports sent.

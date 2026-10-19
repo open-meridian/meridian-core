@@ -29,7 +29,7 @@ use super::view::{self, Line};
 
 /// The sections, in the order an administrator reaches for them: who may do
 /// what first, then the parts it is made of.
-const TABS: [(&str, &str); 11] = [
+const TABS: [(&str, &str); 12] = [
     ("plugins", "Plugins"),
     ("permissions", "Permissions"),
     ("user-groups", "User groups"),
@@ -38,6 +38,7 @@ const TABS: [(&str, &str); 11] = [
     ("accounts", "Accounts"),
     ("holds", "Holds"),
     ("time-zone", "Time zone"),
+    ("model-routing", "Model routing"),
     ("agents", "Agents"),
     ("service-accounts", "Service accounts"),
     ("connected-clients", "Connected clients"),
@@ -202,6 +203,10 @@ pub fn render(
     agents: (String, String),
     service_accounts: (String, String),
     time_zone: Option<&meridian_domain::v1::DeploymentTimeZoneSetting>,
+    routing: (
+        Option<&meridian_domain::v1::ListModelRoutingReply>,
+        Option<&meridian_domain::v1::ListMeasureDefinitionsReply>,
+    ),
     token: &str,
     notice: &str,
 ) -> String {
@@ -1036,6 +1041,31 @@ pub fn render(
             super::time_zone::lines(time_zone, |subject| crate::tickets::display_name(
                 records, subject
             ))
+        ),
+    ));
+
+    // ── Model routing ───────────────────────────────────────────────────────
+    // W12.6 (contract v26): the analytics routing table, a deployment admin's.
+    let (table, served) = routing;
+    let route = dialog(
+        "model-routing-change",
+        "Route a model id",
+        "/admin/model-routing#model-routing",
+        token,
+        &super::model_routing::fields(table),
+        "Change",
+    );
+    sections.push(section(
+        "model-routing",
+        "Model routing",
+        "Which implementation prices each model id across the deployment: built-in, or a \
+         launched pricing plugin. Each change is kept with who made it and why.",
+        "<button type=\"button\" data-dialog-open=\"model-routing-change\">Change</button>",
+        format!(
+            "{}{route}",
+            super::model_routing::lines(table, served, |subject| {
+                crate::tickets::display_name(records, subject)
+            })
         ),
     ));
 
