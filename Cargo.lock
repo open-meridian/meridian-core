@@ -1959,6 +1959,8 @@ dependencies = [
  "bcrypt",
  "ed25519-dalek",
  "libc",
+ "meridian-analytics",
+ "meridian-analytics-engine",
  "meridian-bor",
  "meridian-bus",
  "meridian-clock",

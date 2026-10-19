@@ -380,14 +380,15 @@ e2e-cluster: network
 		|| { echo "e2e-cluster needs a cluster; point KUBECONFIG at one" >&2; exit 1; }
 	@test -f "$(PLATFORM)/docker-compose.yaml" \
 		|| { echo "no platform at $(PLATFORM); set PLATFORM=<path>" >&2; exit 1; }
-	@echo "e2e-cluster: building the image this cluster will run"
+	@echo "e2e-cluster: building the images this cluster will run"
 	@$(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
+	@$(DOCKER) build -q --target analytics -t $(ANALYTICS_IMAGE) . >/dev/null
 	@# And the browser the password branches are signed in with, in a pod.
 	@$(DOCKER) build -q -t $(E2E_BROWSER_IMAGE) -f e2e/cluster/browser.Dockerfile e2e/cluster >/dev/null
 	@# A cluster on the daemon that built the images sees them already; one
 	@# that is not (k3d, kind) is handed them, or its pods pull tags that exist
 	@# nowhere. Empty for Rancher Desktop and Docker Desktop.
-	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(RUNTIME_IMAGE) $(E2E_BROWSER_IMAGE) $(if $(filter cli,$(E2E_DRIVER)),$(E2E_CLI_IMAGE)) >/dev/null,:)
+	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(RUNTIME_IMAGE) $(ANALYTICS_IMAGE) $(E2E_BROWSER_IMAGE) $(if $(filter cli,$(E2E_DRIVER)),$(E2E_CLI_IMAGE)) >/dev/null,:)
 	# A pod calls the platform host.docker.internal, so the platform has to
 	# admit that name and expect it as the audience a deployment signs for.
 	# Django refuses an unlisted Host before any view runs, which is a 400 with
@@ -686,7 +687,8 @@ e2e-cluster-backup:
 	@$(DOCKER) build -q -t $(E2E_BACKUP_IMAGE) deploy/backup >/dev/null
 	@$(DOCKER) build -q -f "$(CLI)/Dockerfile.rust" --target e2e -t $(E2E_BACKUP_CLI_IMAGE) "$(CLI)" >/dev/null
 	@$(if $(E2E_BACKUP_RUNTIME),:,$(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null)
-	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(or $(E2E_BACKUP_RUNTIME),$(RUNTIME_IMAGE)) $(E2E_BACKUP_IMAGE) postgres:16-alpine >/dev/null,:)
+	@$(if $(E2E_BACKUP_RUNTIME),:,$(DOCKER) build -q --target analytics -t $(ANALYTICS_IMAGE) . >/dev/null)
+	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(or $(E2E_BACKUP_RUNTIME),$(RUNTIME_IMAGE)) $(if $(E2E_BACKUP_RUNTIME),,$(ANALYTICS_IMAGE)) $(E2E_BACKUP_IMAGE) postgres:16-alpine >/dev/null,:)
 	@kubectl delete namespace $(E2E_BACKUP_NAMESPACE) --ignore-not-found --wait >/dev/null 2>&1
 	@E2E_NAMESPACE=$(E2E_BACKUP_NAMESPACE) E2E_IMAGE=$(or $(E2E_BACKUP_RUNTIME),$(RUNTIME_IMAGE)) \
 	 E2E_BACKUP_IMAGE=$(E2E_BACKUP_IMAGE) E2E_CLI_IMAGE=$(E2E_BACKUP_CLI_IMAGE) E2E_WORKDIR="$(CURDIR)" \
@@ -717,6 +719,9 @@ PLUGIN_VALUES := --set 'sidecars[0].instanceId=check-1' --set 'sidecars[0].roles
 # configuration from the same code at start, so a file here and a chart there
 # cannot drift into two policies that must agree.
 RUNTIME_IMAGE = meridian-runtime:local
+# The analytics component's image, the same build's (Dockerfile's `analytics`
+# stage), named as the chart names it beside the runtime's (contract v26).
+ANALYTICS_IMAGE = $(subst meridian-runtime,meridian-analytics,$(RUNTIME_IMAGE))
 BROKER_CONFIG = $(DOCKER) run --rm -v "$(CURDIR)":/w -w /w $(RUNTIME_IMAGE) meridian-broker-config
 
 runtime-image:
@@ -1544,6 +1549,23 @@ chart-check:
 		|| { echo "chart-check FAILED: the bundled broker makes no credential for a sidecar's instance" >&2; exit 1; }; \
 	echo "$$rendered" | grep -q '"instance_id":"check-1","roles":\["custody","reporting"\]' \
 		|| { echo "chart-check FAILED: the bundled broker does not know a sidecar's instance and roles" >&2; exit 1; }
+	@# Contract v26 (W12): the analytics component, its coordinator and its
+	@# workers each a Deployment on its own image, the runtime's commit and
+	@# repository named meridian-analytics; its own credential on the broker
+	@# this chart brings; and the lake told its instance, whose reads for a
+	@# job are its client's.
+	@rendered="$$($(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check \
+		--set image.repository=example/meridian-runtime --set image.tag=t1 2>/dev/null)"; \
+	for part in coordinator worker; do \
+		echo "$$rendered" | grep -q "args: \[\"meridian-analytics\", \"$$part\"\]" \
+			|| { echo "chart-check FAILED: no analytics $$part Deployment" >&2; exit 1; }; \
+	done; \
+	[ "$$(echo "$$rendered" | grep -c 'image: "example/meridian-analytics:t1"')" = 2 ] \
+		|| { echo "chart-check FAILED: the analytics Deployments do not run the analytics image of the runtime's commit" >&2; exit 1; }; \
+	echo "$$rendered" | grep -q '^  analytics: ' \
+		|| { echo "chart-check FAILED: the bundled broker makes no credential for the analytics component" >&2; exit 1; }; \
+	echo "$$rendered" | grep -A1 'name: MERIDIAN_ANALYTICS_INSTANCE_ID' | grep -q 'value: check-meridian-runtime-analytics$$' \
+		|| { echo "chart-check FAILED: the lake is not told the analytics component's instance" >&2; exit 1; }
 	@# decisions/028. A configured plugin holding an edge role gets a claim of
 	@# its own, kept when the plugin is removed, mounted in its plugin's
 	@# container alone and named in MERIDIAN_STORAGE_DIR; one holding none gets

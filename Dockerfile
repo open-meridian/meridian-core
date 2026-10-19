@@ -52,6 +52,7 @@ RUN --mount=type=cache,id=meridian-core-registry,target=/usr/local/cargo/registr
        target/release/meridian-dashboard \
        target/release/meridian-first-run target/release/meridian-broker-config \
        target/release/meridian-launcher \
+       target/release/meridian-analytics \
        /usr/local/bin/
 # Asked of each binary rather than trusted to the compiler: the target
 # directory is a cache that outlives a build, and a binary it kept from the
@@ -82,6 +83,21 @@ COPY deploy/harness/compose.yaml deploy/harness/harness.py deploy/harness/street
      deploy/harness/moves.sql deploy/harness/lake.sql deploy/harness/platform.py \
      deploy/harness/README.md /harness/
 
+# The analytics component (contract v26, W12): its own image, one binary,
+# from the same build and commit as the runtime image. Its own so a chart's
+# worker pool scales and upgrades as a thing of its own and pulls nothing
+# else. It holds no database, no key and no kit: it reaches nothing but the
+# broker.
+FROM debian:bookworm-slim AS analytics
+LABEL org.opencontainers.image.source=https://github.com/open-meridian/meridian-core \
+      org.opencontainers.image.description="The analytics component: the coordinator and the worker pool"
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=build /usr/local/bin/meridian-analytics /usr/local/bin/meridian-analytics
+# A command is chosen -- coordinator or worker -- never inherited.
+ENTRYPOINT []
+
 FROM debian:bookworm-slim AS runtime
 # tzdata: the instrument store reads a spot-date rule's cut, 17:00
 # America/New_York for FX, in its zone from the tz database (contract v22,
@@ -110,6 +126,9 @@ COPY --from=build /usr/local/bin/meridian-dashboard /usr/local/bin/meridian-dash
 COPY --from=build /usr/local/bin/meridian-first-run /usr/local/bin/meridian-first-run
 COPY --from=build /usr/local/bin/meridian-broker-config /usr/local/bin/meridian-broker-config
 COPY --from=build /usr/local/bin/meridian-launcher /usr/local/bin/meridian-launcher
+# The analytics component too, for compose and the plugin harness, which run
+# every component from this image; a chart runs it from its own image above.
+COPY --from=build /usr/local/bin/meridian-analytics /usr/local/bin/meridian-analytics
 # One directory per version, where the dashboard looks (MERIDIAN_UI_DIR).
 COPY --from=ui /ui/dist/ /usr/share/meridian/ui/
 

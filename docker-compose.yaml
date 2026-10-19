@@ -45,6 +45,7 @@ services:
       # secret, one per identity, mounted into that container alone.
       MERIDIAN_NATS_RUNTIME: runtime-dev-only
       MERIDIAN_NATS_INSTRUMENT: instrument-dev-only
+      MERIDIAN_NATS_ANALYTICS: analytics-dev-only
       MERIDIAN_NATS_REFERENCE_1: reference-1-dev-only
       MERIDIAN_NATS_CUSTODY_TEST_1: custody-test-1-dev-only
       MERIDIAN_NATS_CUSTODY_TEST_2: custody-test-2-dev-only
@@ -126,6 +127,23 @@ services:
       MERIDIAN_LAKE_DATABASE_URL: ${MERIDIAN_LAKE_DATABASE_URL:-postgres://meridian:meridian@core-postgres:5432/meridian}
       MERIDIAN_BROKER_URL: nats://runtime:runtime-dev-only@nats:4222
       MERIDIAN_INSTANCE_ID: lake-1
+      RUST_LOG: ${RUST_LOG:-info}
+    networks: [meridian]
+
+  # The analytics component (contract v26, W12): coordinator and worker in one
+  # process, no store and no key; it reads for a job's client through the
+  # stores, the lake told its instance.
+  analytics:
+    build:
+      context: .
+      target: runtime
+    command: ["meridian-analytics"]
+    depends_on:
+      nats:
+        condition: service_started
+    environment:
+      MERIDIAN_BROKER_URL: nats://analytics:analytics-dev-only@nats:4222
+      MERIDIAN_INSTANCE_ID: analytics
       RUST_LOG: ${RUST_LOG:-info}
     networks: [meridian]
 

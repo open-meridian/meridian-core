@@ -83,6 +83,10 @@ fn run() -> Result<(), String> {
     )?);
 
     let instance_id = var("MERIDIAN_INSTANCE_ID").unwrap_or_else(|| "lake-1".into());
+    // The analytics component, whose reads for a job are its client's (W12.2).
+    if let Some(analytics) = var("MERIDIAN_ANALYTICS_INSTANCE_ID") {
+        meridian_lake::service::reads_for_analytics(&analytics);
+    }
 
     on_runtime(async {
         let bus = bus_from_env(&instance_id).await?;

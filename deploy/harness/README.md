@@ -38,7 +38,7 @@ same tag. The runtime image carries none of it.
 
 | File | What it is |
 |---|---|
-| `compose.yaml` | The deployment: `keys`, which draws the run's keys and passwords; Postgres; NATS configured for the plugins and their roles, and from contract v18 their datasets, written again on `entitle`; the stores migrated; street, the book (`bor`), the lake, instrument, conductor and a development dashboard; the `runner`; and `store` |
+| `compose.yaml` | The deployment: `keys`, which draws the run's keys and passwords; Postgres; NATS configured for the plugins and their roles, and from contract v18 their datasets, written again on `entitle`; the stores migrated; street, the book (`bor`), the lake, instrument, conductor, the analytics component (from contract v26) and a development dashboard; the `runner`; and `store` |
 | `harness.py` | The runner, standard library only: `ready`, `settings`, `hold`, `archive`, `summary`, `account`, `page`, `form`, `unlinked`, `grant`, `instruments`, `instrument`, `mcp`, `ticket`, `inbox`, `licence`, `entitle`, `priority`; and `compose`, which writes the plugins' half of the deployment |
 | `street.sql` | The street store as stable, sorted lines, which `store street` prints |
 | `book.sql` | The book of record as stable, sorted lines (contract v8), which `store book` prints |

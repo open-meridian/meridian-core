@@ -323,3 +323,31 @@ fn a_reader_is_granted_the_subjects_of_the_datasets_it_is_entitled_to_alone() {
         .publish
         .contains(&"platform.lake.*.event.prices-recorded".to_string()));
 }
+
+/// Contract v26 (W12; ruling 315): the analytics component holds its own
+/// credential -- its rows, and its own coordinator-to-worker topic, which
+/// no other credential carries.
+#[test]
+fn the_analytics_component_holds_its_own_credential_and_its_own_topic() {
+    let users = users(Contract::embedded(), &[]).expect("generates");
+    let analytics = user(&users, "analytics");
+    let unit = "platform.analytics.internal.compute-unit".to_string();
+    assert!(analytics.publish.contains(&unit) && analytics.subscribe.contains(&unit));
+    assert!(analytics
+        .subscribe
+        .contains(&"platform.analytics.query.run-job".to_string()));
+    assert!(analytics
+        .publish
+        .contains(&"platform.lake.query.list-prices".to_string()));
+    assert_eq!(
+        analytics.password,
+        Password::Env("MERIDIAN_NATS_ANALYTICS".into())
+    );
+    for other in users.iter().filter(|u| u.user != "analytics") {
+        assert!(
+            !other.publish.contains(&unit) && !other.subscribe.contains(&unit),
+            "{} carries the analytics component's own topic",
+            other.user
+        );
+    }
+}

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "A deployment's components: the street store, the book of record, the lake, the instrument store, the conductor and a plugin's sidecar"
+description = "A deployment's components: the street store, the book of record, the lake, the instrument store, the conductor, the analytics component and a plugin's sidecar"
 
 [lib]
 name = "meridian_runtime"
@@ -50,6 +50,11 @@ path = "src/bin/first_run.rs"
 name = "meridian-launcher"
 path = "src/bin/launcher.rs"
 
+# The analytics component (contract v26, W12): its own image's one binary.
+[[bin]]
+name = "meridian-analytics"
+path = "src/bin/analytics.rs"
+
 
 [dependencies]
 meridian-clock.workspace = true
@@ -62,6 +67,8 @@ meridian-conductor = { path = "../conductor" }
 meridian-config = { path = "../config" }
 meridian-dashboard = { path = "../dashboard" }
 meridian-first-run = { path = "../first-run" }
+meridian-analytics = { path = "../analytics" }
+meridian-analytics-engine = { path = "../analytics-engine" }
 axum.workspace = true
 meridian-sidecar = { path = "../sidecar" }
 meridian-pb.workspace = true

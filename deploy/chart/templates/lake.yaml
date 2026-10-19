@@ -60,6 +60,10 @@ spec:
           env:
             - name: MERIDIAN_INSTANCE_ID
               value: {{ include "meridian-runtime.fullname" . }}-lake
+            # The analytics component, whose reads for a job are its
+            # client's (contract v26, W12.2).
+            - name: MERIDIAN_ANALYTICS_INSTANCE_ID
+              value: {{ include "meridian-runtime.fullname" . }}-analytics
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
             - name: MERIDIAN_LAKE_DATABASE_URL

@@ -174,9 +174,25 @@ pub struct Lake {
     versions: Mutex<(BTreeMap<String, String>, i64)>,
 }
 
-/// The analytics component's instance, every copy of it (W12.2): the one
-/// publisher whose `on_behalf_of_instance_id` the lake reads.
+/// The analytics component's instance where nothing names another (W12.2).
 pub const ANALYTICS: &str = "analytics";
+
+static ANALYTICS_INSTANCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Name the analytics component's instance, every copy of it: the one
+/// publisher whose `on_behalf_of_instance_id` the lake reads. Set once, by
+/// the lake's process at start, from what the chart says; [`ANALYTICS`]
+/// otherwise.
+pub fn reads_for_analytics(instance: &str) {
+    let _ = ANALYTICS_INSTANCE.set(instance.to_string());
+}
+
+fn analytics_instance() -> &'static str {
+    ANALYTICS_INSTANCE
+        .get()
+        .map(String::as_str)
+        .unwrap_or(ANALYTICS)
+}
 
 pub(crate) fn reader_of(envelope: &Envelope) -> Reader {
     match envelope.meta.as_ref() {
@@ -184,7 +200,7 @@ pub(crate) fn reader_of(envelope: &Envelope) -> Reader {
         // entitlements and its role's kinds, never the component's own.
         Some(meta)
             if meta.account_scope_applies
-                && meta.publisher_instance_id == ANALYTICS
+                && meta.publisher_instance_id == analytics_instance()
                 && !meta.on_behalf_of_instance_id.is_empty() =>
         {
             Reader::Plugin(meta.on_behalf_of_instance_id.clone())

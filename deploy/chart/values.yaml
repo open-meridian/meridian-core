@@ -237,6 +237,44 @@ lake:
     existingSecret: ""
     key: ""
 
+# The analytics component (contract v26, W12): a coordinator and a pool of
+# workers, its own image from the same commit (tag empty means image.tag),
+# its own credential. Stateless, so either scales by its replica count; the
+# coordinator answers jobs, the workers compute their units. One of each by
+# default (the v26 plan's question 245), sized from v26's first benchmark
+# (crates/analytics-engine/BENCHMARK.md): a 500-position account's 500-day
+# VaR and ES is computed in well under its budget on one core, and a worker
+# holds its losable cache of parts, so its memory is the larger.
+analytics:
+  image:
+    # Empty is image.repository's, named meridian-analytics where it names
+    # meridian-runtime: ghcr.io/open-meridian/meridian-analytics beside the
+    # published runtime, meridian-analytics:local beside a local build.
+    repository: ""
+    tag: ""
+  coordinator:
+    replicaCount: 1
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        memory: 512Mi
+  worker:
+    replicaCount: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        memory: 1Gi
+  # How long a job may take and still be answered in the reply; past it the
+  # job finishes later and its client is told (the one-API spec's Q5).
+  inlineMs: 2000
+  # How long a routed pricing plugin has to answer a batch before the
+  # figures through it are not evaluated (W12.3, requirement 22).
+  priceDeadlineMs: 5000
+
 # Installed for development (spec/live-plugin-development, ruling 2): it may
 # run plugin code as it is being written, which nobody has reviewed, and every
 # dashboard page says so. Set at install -- `meridian up --development`, or a
@@ -334,6 +372,7 @@ broker:
   streetKey: street
   borKey: bor
   lakeKey: lake
+  analyticsKey: analytics
 
 # What first run writes, and what reads it. These are Secret names rather than
 # values: the wizard fills them in the cluster, and the chart names them so
