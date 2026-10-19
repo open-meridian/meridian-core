@@ -109,7 +109,7 @@ pub const DEFINITIONS: [Definition; 8] = [
         parameters: &[("unrealized", "market_value_less_open_lots_cost")],
         breakdowns: &BY,
         scale: 2,
-        description: "Each bucket's unrealized P&L: its market value less its open lots' cost",
+        description: "Unrealized P&L: each bucket's market value less its open lots' cost",
     },
     Definition {
         definition: "historical_var",

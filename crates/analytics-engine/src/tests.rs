@@ -62,7 +62,7 @@ fn allocations(f: impl FnOnce()) -> usize {
 // ── The SDK's pinned cases ──────────────────────────────────────────────────
 
 /// The cases, vendored from the SDK (reference_cases/SOURCE).
-const CASES: [(&str, &str); 7] = [
+const CASES: [(&str, &str); 8] = [
     (
         "valuation",
         include_str!("../reference_cases/valuation.json"),
@@ -88,6 +88,12 @@ const CASES: [(&str, &str); 7] = [
         include_str!("../reference_cases/historical-var-and-es.json"),
     ),
     ("what-if", include_str!("../reference_cases/what-if.json")),
+    // pnl version 2, realized beside unrealized: v27's, computed by the
+    // tests' own definition alone (ruling 320).
+    (
+        "pnl-v2-realized",
+        include_str!("../reference_cases/pnl-v2-realized.json"),
+    ),
 ];
 
 /// A case, held to its own canonical form as the SDK's `reference.load`
@@ -103,42 +109,19 @@ fn load(name: &str, raw: &str) -> Value {
     case
 }
 
-/// Whether a figure is pnl version 1's realized component, which the cases
-/// pinned before ruling 320 still carry: v1 is unrealized alone, realized
-/// is version 2's. Taken out of the comparison until the SDK's cases are
-/// regenerated (pnl v2 naming realized), and held exact through version 2
-/// by [`realized_is_version_twos_and_equals_the_reference`].
-fn realized_under_version_one(figure: &Value) -> bool {
-    figure["measure"]["definition"] == "pnl"
-        && figure["measure"]["version"] == 1
-        && figure["breakdown"].as_array().is_some_and(|b| {
-            b.iter()
-                .any(|v| v["breakdown"] == "component" && v["value"] == "realized")
-        })
-}
-
-/// The reference's answer as pnl version 1 answers it (ruling 320).
-fn as_version_one(answer: &Value) -> Value {
-    let mut out = answer.clone();
-    if let Some(Value::Array(figures)) = out.get_mut("figures") {
-        figures.retain(|f| !realized_under_version_one(f));
-    }
-    out
-}
-
 #[test]
 fn every_pinned_case_is_answered_as_the_reference_answers_it() {
     for (name, raw) in CASES {
         let case = load(name, raw);
         let answer = compute(&case["inputs"]).unwrap_or_else(|e| panic!("{name}: {e}"));
         let ours = canonical(&answer.to_json()).unwrap();
-        let theirs = canonical(&as_version_one(&case["answer"])).unwrap();
+        let theirs = canonical(&case["answer"]).unwrap();
         if ours != theirs {
             let ours: Value = serde_json::from_str(&ours).unwrap();
             for (part, mine) in ours.as_object().unwrap() {
                 assert_eq!(
                     serde_json::to_string_pretty(mine).unwrap(),
-                    serde_json::to_string_pretty(&as_version_one(&case["answer"])[part]).unwrap(),
+                    serde_json::to_string_pretty(&case["answer"][part]).unwrap(),
                     "{name}: the {part} differ from the reference's"
                 );
             }
@@ -153,52 +136,31 @@ fn every_pinned_case_is_answered_as_the_reference_answers_it() {
     }
 }
 
-/// pnl version 2, compiled for the tests alone: realized beside
-/// unrealized, every lot closed since the account opened, equal to the
-/// reference's figures (its answer's hash names its own inputs, which ask
-/// version 1, so the figures are compared alone).
+/// pnl version 2 is the tests' alone (ruling 320): its pinned case is
+/// answered exactly above, and no job reaches it -- the component serves
+/// version 1, lists version 1, and compiles no other.
 #[test]
-fn realized_is_version_twos_and_equals_the_reference() {
-    let mut checked = 0;
-    for (name, raw) in CASES {
-        let case = load(name, raw);
-        let expected: Vec<Value> = case["answer"]["figures"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|f| f["measure"]["definition"] == "pnl")
-            .cloned()
-            .collect();
-        if !expected.iter().any(realized_under_version_one) {
-            continue;
-        }
-        let mut inputs = case["inputs"].clone();
-        for measure in inputs["job"]["measures"].as_array_mut().unwrap() {
-            if measure["definition"] == "pnl" {
-                measure["version"] = Value::from(2);
-            }
-        }
-        let answer = compute(&inputs).unwrap();
-        let ours: Vec<Value> = answer.to_json()["figures"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|f| f["measure"]["definition"] == "pnl")
-            .map(|f| {
-                let mut f = f.clone();
-                f["measure"]["version"] = Value::from(1);
-                f
-            })
-            .collect();
-        assert_eq!(ours, expected, "{name}");
-        checked += 1;
-    }
-    assert!(checked > 0, "no pinned case asks realized");
-    // And no job reaches version 2: the component serves version 1 alone.
+fn realized_is_version_twos_and_no_job_reaches_it() {
+    assert!(CASES.iter().any(|(name, _)| *name == "pnl-v2-realized"));
     assert!(crate::definitions::definition("pnl", 2).is_none());
     assert!(!crate::definitions::wire()
         .iter()
         .any(|d| d.definition == "pnl" && d.version == 2));
+    let job = meridian_domain::v1::Job {
+        account_ids: vec!["ACC-1".into()],
+        inputs: None,
+        measures: vec![meridian_domain::v1::MeasureRef {
+            definition: "pnl".into(),
+            version: 2,
+            breakdowns: vec![],
+            event_group_id: String::new(),
+        }],
+        what_if: None,
+    };
+    assert_eq!(
+        crate::compile::compile(&job).unwrap_err().field,
+        "measures[0].version"
+    );
 }
 
 /// An executor that sends every part through its JSON, as the bus carries
@@ -407,7 +369,6 @@ fn generated_documents_are_answered_as_the_reference_answers_them() {
             (_, Err(e)) => panic!("{}: {e}", path.display()),
             (theirs, Ok(ours)) => {
                 let mine = ours.to_json();
-                let theirs = &as_version_one(theirs);
                 for part in ["figures", "not_evaluated", "provenance"] {
                     assert_eq!(
                         serde_json::to_string_pretty(&mine[part]).unwrap(),
