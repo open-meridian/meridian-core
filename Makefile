@@ -1056,7 +1056,8 @@ e2e-settings-page:
 # street` is the expected file exactly, nothing for the account left
 # unlinked; the dashboard counts that one not linked; a second plugin is
 # opened at write only once the admin is granted it; and `store book` prints
-# the book empty.
+# the book empty but for the upgrade's records, each once on its control
+# partition: v24's escape hatch and v26's agents' guard (decisions/031).
 HARNESS_IMAGE := meridian-harness:local
 HARNESS_FILES := README.md activity.sql book.sql compose.yaml harness.py lake.sql moves.sql platform.py street.sql tickets.sql
 HARNESS_SECRET := sk-test-harness-not-a-real-key
@@ -1171,7 +1172,10 @@ harness-check:
 	backfill='^entry|~control|local-record-orders-backfilled|[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}|instance bor-1$$'; \
 	[ "$$(grep -c "$$backfill" .harness/book || true)" = 1 ] \
 		|| fail "the book does not hold contract v24's escape-hatch record exactly once, on its control partition, written by bor (W11.36, decisions/031): $$(head -3 .harness/book)"; \
-	grep -v "$$backfill" .harness/book >.harness/book-written || true; \
+	guard='^entry|~control|agent-orders-demo-only-backfilled|[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}|instance bor-1$$'; \
+	[ "$$(grep -c "$$guard" .harness/book || true)" = 1 ] \
+		|| fail "the book does not hold contract v26's agents' guard record exactly once, on its control partition, written by bor (W11.38, decisions/031): $$(head -3 .harness/book)"; \
+	grep -v -e "$$backfill" -e "$$guard" .harness/book >.harness/book-written || true; \
 	[ ! -s .harness/book-written ] || fail "the book holds something nobody wrote: $$(head -3 .harness/book-written)"; \
 	$(HARNESS_STORE) ledger >/dev/null 2>&1 && fail "store printed a store it does not have"; \
 	$(HARNESS) exec -T -u 65532 custody python -c 'import os, pathlib; pathlib.Path(os.environ["MERIDIAN_STORAGE_DIR"], "kept").write_text("a raw record")' \
@@ -1188,7 +1192,7 @@ harness-check:
 	done; \
 	$(HARNESS) logs --no-color >>.e2e-harness.log 2>&1; \
 	$(HARNESS) --profile runner down -v --remove-orphans >>.e2e-harness.log 2>&1; \
-	echo "harness-check OK in $$(( $$(date +%s) - started ))s: the plugin harness is its own image, files only, and the runtime image carries none of it; no fixed password or hash is in its files; its compose writes five plugins, each beside its sidecar, one started again after failing first ($$restarts restart), one declaring v25 registering the declaration its sidecar holds it to and one differing refused naming the difference; its runner signs in with the password drawn for the run, sets a plugin's settings, defines an account and links it through the plugin's own form, taking what the page offered from the page; store street prints as expected, the dollar pulled from the master and the three other records it names listed as ones the book cannot use and one completed at the Instruments page, an MCP client connected on a delegation covering the deployment admin alone lists core's tools and no plugin's, is refused a completion without a note by path, completes a record through dashboard__complete_instruments whose history names the person and the client, and Connected clients lists its calls; nothing for the account left unlinked, which the dashboard counts ($$unlinked); a second plugin is opened at write once the admin is granted it, and store book prints the book empty; the custody plugin writes its storage as a user that is not root and finds it again in a new container, and the plugins holding no edge role have none"
+	echo "harness-check OK in $$(( $$(date +%s) - started ))s: the plugin harness is its own image, files only, and the runtime image carries none of it; no fixed password or hash is in its files; its compose writes five plugins, each beside its sidecar, one started again after failing first ($$restarts restart), one declaring v25 registering the declaration its sidecar holds it to and one differing refused naming the difference; its runner signs in with the password drawn for the run, sets a plugin's settings, defines an account and links it through the plugin's own form, taking what the page offered from the page; store street prints as expected, the dollar pulled from the master and the three other records it names listed as ones the book cannot use and one completed at the Instruments page, an MCP client connected on a delegation covering the deployment admin alone lists core's tools and no plugin's, is refused a completion without a note by path, completes a record through dashboard__complete_instruments whose history names the person and the client, and Connected clients lists its calls; nothing for the account left unlinked, which the dashboard counts ($$unlinked); a second plugin is opened at write once the admin is granted it, and store book prints the book empty but for the upgrade's two records, the escape hatch's and the agents' guard's; the custody plugin writes its storage as a user that is not root and finds it again in a new container, and the plugins holding no edge role have none"
 
 # Tickets inside a deployment (contract v13), end to end on the plugin
 # harness: core's stand-in as custody, operations and a plugin holding no
