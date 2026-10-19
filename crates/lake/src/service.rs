@@ -174,8 +174,23 @@ pub struct Lake {
     versions: Mutex<(BTreeMap<String, String>, i64)>,
 }
 
+/// The analytics component's instance, every copy of it (W12.2): the one
+/// publisher whose `on_behalf_of_instance_id` the lake reads.
+pub const ANALYTICS: &str = "analytics";
+
 pub(crate) fn reader_of(envelope: &Envelope) -> Reader {
     match envelope.meta.as_ref() {
+        // A job's read (contract v26, W12.2): within the client's
+        // entitlements and its role's kinds, never the component's own.
+        Some(meta)
+            if meta.account_scope_applies
+                && meta.publisher_instance_id == ANALYTICS
+                && !meta.on_behalf_of_instance_id.is_empty() =>
+        {
+            Reader::Plugin(meta.on_behalf_of_instance_id.clone())
+        }
+        // A sidecar never sets the field, and from anyone else it is
+        // ignored: the reader is the publisher.
         Some(meta) if meta.account_scope_applies => {
             Reader::Plugin(meta.publisher_instance_id.clone())
         }

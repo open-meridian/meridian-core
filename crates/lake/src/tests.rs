@@ -2077,3 +2077,33 @@ async fn a_query_reads_one_kind_within_bounds_and_says_where_it_was_cut() {
     .unwrap_err()
     .contains("instance_id"));
 }
+
+/// Contract v26 (W12.2): the analytics component reads for its client --
+/// the client's entitlements, never its own -- and the field is read from
+/// that component alone.
+#[test]
+fn a_jobs_read_is_the_clients_and_the_field_is_the_analytics_components_alone() {
+    let on_behalf = |publisher: &str, client: &str| Envelope {
+        meta: Some(MessageMeta {
+            publisher_instance_id: publisher.into(),
+            account_scope_applies: true,
+            on_behalf_of_instance_id: client.into(),
+            ..Default::default()
+        }),
+        payload_type: String::new(),
+        payload: Vec::new(),
+    };
+    assert_eq!(
+        crate::service::reader_of(&on_behalf(crate::service::ANALYTICS, "reporting-1")),
+        crate::config::Reader::Plugin("reporting-1".into())
+    );
+    // From a plugin's sidecar the field is ignored: the reader is itself.
+    assert_eq!(
+        crate::service::reader_of(&on_behalf("reporting-2", "reporting-1")),
+        crate::config::Reader::Plugin("reporting-2".into())
+    );
+    assert_eq!(
+        crate::service::reader_of(&on_behalf(crate::service::ANALYTICS, "")),
+        crate::config::Reader::Plugin(crate::service::ANALYTICS.into())
+    );
+}
