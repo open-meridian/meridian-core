@@ -6,7 +6,7 @@ COMPOSE := docker compose
 DOCKER := DOCKER_BUILDKIT=1 docker
 
 .PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check licence-check-test gate-start \
-        gate-drop-tests-image stage-checks stage-runtime stage-compile stage-tests stage-sdk stage-dashboards stage-harness stage-first-run stage-image stage-lint \
+        gate-mark-tests stage-checks stage-runtime stage-compile stage-tests stage-settings-page stage-sdk stage-dashboards stage-harness stage-first-run stage-image stage-lint \
         e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external e2e-cluster-backup \
         test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-service-account e2e-lake e2e-recorded e2e-orders e2e-one-id \
         build test test-store check-image-version chart-check check-crate-boundaries check-one-clock check-test-targets check-local-storage \
@@ -75,14 +75,23 @@ help:
 # and raising a budget, or recalibrating the CI row from a run, says why in
 # its commit.
 #
+# settings-page's two budgets are PROVISIONAL (ruling 354, 2026-10-19), set
+# before any run measured the stage on its own. Locally, 7 like the stages
+# around it: it held 3.6 to 3.8 GB above a warm start inside the tests
+# stage. On CI, 15, the largest budget already, so the most the gate may
+# hold does not grow: on v26's run it held about 10 GB carried from the
+# stages before it (the cargo caches, with test-broker's release build of
+# the runtime in them, and the service images) and added 3.5 GB, peaking at
+# 13.7. Replace both with a measured row and its headroom.
+#
 # The order is the targets' order before the stages, but e2e-settings-page,
 # which ran on its own between the plugin page and the harness, now runs
-# beside the other targets that use the compile's test binaries, so those are
-# freed once and not built twice.
+# straight after the targets that use the compile's test binaries, in a
+# stage of its own, once those are freed.
 GATE := $(PY) tools/gate.py
 #                    stage=GB: the most each stage may hold above where the gate started
-GATE_BUDGETS_LOCAL ?= checks=1 runtime=4 compile=9  tests=13 sdk=7  dashboards=7  harness=7  first-run=7  image=7  lint=7
-GATE_BUDGETS_CI    ?= checks=2 runtime=7 compile=12 tests=15 sdk=13 dashboards=13 harness=13 first-run=13 image=14 lint=13
+GATE_BUDGETS_LOCAL ?= checks=1 runtime=4 compile=9  tests=13 settings-page=7  sdk=7  dashboards=7  harness=7  first-run=7  image=7  lint=7
+GATE_BUDGETS_CI    ?= checks=2 runtime=7 compile=12 tests=15 settings-page=15 sdk=13 dashboards=13 harness=13 first-run=13 image=14 lint=13
 # The cargo caches kept between runs: a run starts them again once they are
 # this many days old, so what cargo built for a dependency nothing uses any
 # more does not stay on the disk for good.
@@ -97,7 +106,7 @@ GATE_DISK_START ?= 20
 GATE_DISK_STOP  ?= 16
 endif
 
-ci-local: gate-start stage-checks stage-runtime stage-compile stage-tests stage-sdk stage-dashboards stage-harness stage-first-run stage-image stage-lint
+ci-local: gate-start stage-checks stage-runtime stage-compile stage-tests stage-settings-page stage-sdk stage-dashboards stage-harness stage-first-run stage-image stage-lint
 	@$(GATE) finish
 	@echo
 	@echo "ci-local: GREEN"
@@ -108,8 +117,11 @@ stage-runtime:    gate-begin-runtime check-nats-permissions check-codegen adviso
 	@$(GATE) end runtime
 stage-compile:    gate-begin-compile build test
 	@$(GATE) end compile
-stage-tests:      gate-begin-tests test-store test-broker test-directory gate-drop-tests-image e2e-settings-page
-	@$(GATE) end tests --drop compose:tests $(SETTINGS_PAGE_IMAGE) $(SETTINGS_BROWSER_IMAGE)
+stage-tests:      gate-begin-tests gate-mark-tests test-store test-broker test-directory
+	@$(GATE) release tests
+	@$(GATE) end tests --drop compose:tests
+stage-settings-page: gate-begin-settings-page e2e-settings-page
+	@$(GATE) end settings-page --drop $(SETTINGS_PAGE_IMAGE) $(SETTINGS_BROWSER_IMAGE)
 stage-sdk:        gate-begin-sdk check-reference-cases interop e2e-book
 	@$(GATE) end sdk
 stage-dashboards: gate-begin-dashboards e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page
@@ -131,16 +143,19 @@ gate-start:
 gate-begin-%:
 	@$(GATE) begin $*
 
-# The tests stage's test binaries (compose's `tests`, 1.6 GB of debug test
-# binaries in a fresh run, 2.5 before the runtime's integration tests were
-# one binary and it kept only the programs a test starts, ruling 354) freed once test-store, test-broker and
-# test-directory have run them, before e2e-settings-page builds the runtime
-# image's release build and pulls its browser: the stage then holds the
-# larger of its two halves, not their sum (v25's CI run held 15.5 GB of its
-# 15). e2e-settings-page takes the one binary it serves from
-# Dockerfile.rust's settings-binary, not from the whole set.
-gate-drop-tests-image:
-	@$(GATE) drop compose:tests
+# The tests stage runs the test binaries (compose's `tests`, 1.6 GB of debug
+# test binaries in a fresh run, 2.5 before the runtime's integration tests
+# were one binary and it kept only the programs a test starts, ruling 354)
+# beside the services they need, and frees, as it ends, the binaries and the
+# Postgres, NATS and OpenLDAP containers it started, with their data; the
+# images stay, for the stages that start them again. e2e-settings-page,
+# which builds the settings page's server and pulls its browser, is a stage
+# of its own after it (ruling 354): on v26's CI run it was the tests stage's
+# peak, 13.7 GB of 15, after the binaries had been freed. It takes the one
+# binary it serves from Dockerfile.rust's settings-binary, compiled over the
+# cargo caches the gate keeps, not from the whole set.
+gate-mark-tests:
+	@$(GATE) mark tests postgres nats ldap ldap-tls
 
 ci-local-deep: ci-local
 
