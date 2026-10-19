@@ -131,8 +131,9 @@ gate-start:
 gate-begin-%:
 	@$(GATE) begin $*
 
-# The tests stage's test binaries (compose's `tests`, 2.4 GB of debug test
-# binaries in a fresh run) freed once test-store, test-broker and
+# The tests stage's test binaries (compose's `tests`, 2.3 GB of debug test
+# binaries in a fresh run, 2.5 before the runtime's integration tests were
+# one binary, ruling 354) freed once test-store, test-broker and
 # test-directory have run them, before e2e-settings-page builds the runtime
 # image's release build and pulls its browser: the stage then holds the
 # larger of its two halves, not their sum (v25's CI run held 15.5 GB of its
@@ -278,8 +279,15 @@ test-store: network
 		run-tests -p meridian-instrument --test postgres -p meridian-street --test postgres \
 			-p meridian-bor --test postgres -p meridian-lake --test postgres \
 			-p meridian-config --test postgres -p meridian-dashboard --test postgres \
-			-p meridian-runtime --test grants --test waiting \
 		>.test-store.log 2>&1 \
+		|| { echo "test-store FAILED. The last 40 lines, and the whole of it in .test-store.log:" >&2; \
+		     tail -40 .test-store.log >&2; exit 1; }
+	@# The runtime's two modules of its one integration-test binary that want
+	@# Postgres, on their own: a filter after -- applies to every binary a run
+	@# selects, and would select none of the postgres suites' tests above.
+	@$(COMPOSE) run --rm -T tests \
+		run-tests -p meridian-runtime --test it -- grants:: waiting:: \
+		>>.test-store.log 2>&1 \
 		|| { echo "test-store FAILED. The last 40 lines, and the whole of it in .test-store.log:" >&2; \
 		     tail -40 .test-store.log >&2; exit 1; }
 	@echo "test-store OK: the five stores and the dashboard's tables pass against Postgres, the migration grants the serving role what it made, and a component started before its database or its migration waits for it"
@@ -2324,16 +2332,16 @@ demo: network
 	@echo "     deployment $$(cat .demo/deployment-id)"
 	@echo "3/6  resolving, missing, pulling, applying"
 	@MERIDIAN_DEPLOYMENT_ID="$$(cat .demo/deployment-id)" \
-		$(COMPOSE) run --rm --build -T tests run-tests --test end_to_end
+		$(COMPOSE) run --rm --build -T tests run-tests -p meridian-runtime --test it -- end_to_end::
 	@echo "4/6  taking the platform away"
 	@docker compose --project-directory "$(PLATFORM)" -f "$(PLATFORM)/docker-compose.yaml" stop site >/dev/null 2>&1
 	@MERIDIAN_DEPLOYMENT_ID="$$(cat .demo/deployment-id)" \
-		$(COMPOSE) run --rm -T tests run-tests --test outage \
+		$(COMPOSE) run --rm -T tests run-tests -p meridian-runtime --test it -- outage:: \
 		|| { docker compose --project-directory "$(PLATFORM)" -f "$(PLATFORM)/docker-compose.yaml" start site >/dev/null 2>&1; exit 1; }
 	@echo "5/6  putting it back, and changing nothing else"
 	@docker compose --project-directory "$(PLATFORM)" -f "$(PLATFORM)/docker-compose.yaml" start site >/dev/null 2>&1
 	@MERIDIAN_DEPLOYMENT_ID="$$(cat .demo/deployment-id)" \
-		$(COMPOSE) run --rm -T tests run-tests --test end_to_end
+		$(COMPOSE) run --rm -T tests run-tests -p meridian-runtime --test it -- end_to_end::
 	@echo "6/6  done"
 
 # The network the platform and a deployment's runtime meet on.

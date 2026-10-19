@@ -51,7 +51,7 @@ RUN --mount=type=cache,id=meridian-core-registry,target=/usr/local/cargo/registr
 # one invocation with the whole workspace's features, as `test` always built
 # them. Kept, with a manifest saying whose each is, in /tests -- with the
 # workspace's binaries, linked back where a test that starts one finds it
-# (waiting.rs, by CARGO_BIN_EXE_<name>) -- the only part of the target
+# (the runtime's waiting tests, by CARGO_BIN_EXE_<name>) -- the only part of the target
 # directory this image holds; tools/run-tests.sh runs them as `cargo test`
 # would. test-store, test-broker and test-directory run this image
 # beside their services (docker-compose.yaml's `tests`), where each used to
@@ -81,7 +81,10 @@ RUN run-tests link
 # deliberately not offered for any of them, so a store or a platform client that
 # behaves differently in development cannot exist.
 FROM compile AS test
-RUN run-tests --workspace --lib --test wiring
+# The runtime's wiring module on its own run: a filter after -- applies to
+# every binary a run selects, the unit tests' too.
+RUN run-tests --workspace --lib \
+ && run-tests -p meridian-runtime --test it -- wiring::
 
 # Clippy is an analysis, not a build: it checks every target, tests included,
 # with nothing to copy from the compile above, and keeps what it checks in the
