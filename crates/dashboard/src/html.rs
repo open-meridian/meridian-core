@@ -483,7 +483,7 @@ form.consent section.summary .hint{display:none}}";
 /// page that has one.
 const PLUGIN_TABLE_STYLE: &str = "\
 form.filter-bar{display:flex;gap:.5rem;align-items:center;margin:0 0 .6rem}form.filter-bar>*{margin:0}\
-.filter-bar .grow{flex:1 1 12rem;min-width:0}.filter-selects{display:flex;gap:.5rem;min-width:0}.filter-selects select{margin:0;flex:none}\
+.filter-bar .grow{flex:1 1 12rem;min-width:0}.filter-selects{display:flex;gap:.5rem;min-width:0}.filter-selects select{margin:0;flex:none;width:auto}\
 @media (max-width:40rem){form.filter-bar{flex-wrap:wrap}.filter-bar .grow{flex-basis:100%}.filter-selects{flex:1}\
 .filter-selects select{flex:1;min-width:0}}\
 .plugin-table{width:100%}.plugin-table th,.plugin-table td{white-space:nowrap}.plugin-table td.actions{white-space:normal}\
