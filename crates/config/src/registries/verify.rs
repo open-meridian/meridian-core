@@ -31,6 +31,9 @@ pub const PROVENANCE_PREDICATE: &str = "https://slsa.dev/provenance/v1";
 pub const METADATA_PREDICATE: &str = "https://open-meridian.dev/attestation/plugin-metadata/v1";
 /// SigningKeyStatus's payload type (requirement 26).
 pub const KEY_STATUS_TYPE: &str = "application/vnd.open-meridian.signing-key-status+json";
+/// Contract v26 (W8.14; ruling 196): the payload type the platform signs
+/// every pulled version's record under.
+pub const PULL_STATUS_TYPE: &str = "application/vnd.open-meridian.plugin-pull-status+json";
 
 /// The DER prefix of a P-256 public key's SubjectPublicKeyInfo, before its
 /// uncompressed point: the algorithm `id-ecPublicKey` with the curve
@@ -242,6 +245,32 @@ pub fn listing_statement(
 
 /// SigningKeyStatus as the platform answers it, its signature checked
 /// against the canonical JSON of the record without it (requirement 26).
+/// Whether a PluginPullStatus is the platform's (W8.14, contract v26):
+/// signed as the key status is, under its own payload type.
+pub fn pull_status_signed(document: &Value, keys: &PlatformKeys) -> Result<(), String> {
+    if keys.is_empty() {
+        return Err(
+            "the chart carries no platform key, so the pull status cannot be checked".into(),
+        );
+    }
+    let Value::Object(fields) = document else {
+        return Err("the pull status is not a record".into());
+    };
+    let signature = fields
+        .get("signature")
+        .and_then(Value::as_str)
+        .and_then(b64)
+        .ok_or("the pull status carries no signature")?;
+    let mut unsigned = fields.clone();
+    unsigned.remove("signature");
+    let body = canonical_json(&Value::Object(unsigned));
+    if keys.signed(&pae(PULL_STATUS_TYPE, body.as_bytes()), &signature) {
+        Ok(())
+    } else {
+        Err("the pull status's signature is not the platform's".into())
+    }
+}
+
 pub fn key_status_signed(document: &Value, keys: &PlatformKeys) -> Result<(), String> {
     if keys.is_empty() {
         return Err(

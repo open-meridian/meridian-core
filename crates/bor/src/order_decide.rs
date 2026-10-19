@@ -121,6 +121,15 @@ fn ended(state: OrderState) -> bool {
 
 /// A command other than a fact report needs a user: a person or a service
 /// account (W11's invariants; REFUSAL_REASON_ACTOR_REQUIRED).
+/// A sentence's first word capitalised.
+fn capitalised(words: &str) -> String {
+    let mut chars = words.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
 pub(crate) fn user_required(ctx: &Context, what: &str) -> Result<()> {
     if ctx.acting_for.is_empty() {
         return Err(StoreError::refused(
@@ -1666,6 +1675,37 @@ pub fn create_placement(
             Some(StoreError::refused(RefusalReason::ConnectivityNotAllowed, words).on_the_bus());
         return Ok(made);
     }
+    // Refused and recorded (contract v26, W11.8, W11.38): an agent's
+    // placement on a connection the sidecar did not stamp demo while the
+    // deployment's guard is on.
+    if crate::booking::agent_live_refused(ctx) {
+        let connection = if request.connectivity_instance_id.is_empty() {
+            "no connectivity plugin".to_string()
+        } else {
+            request.connectivity_instance_id.clone()
+        };
+        let words = format!(
+            "Refused: {}. {connection} is live: a placement of order {order_id} by {ems} made \
+             through a delegation or by a service account is refused while the deployment's \
+             agent_orders_demo_only is on; a person may make it from the agent's prepared change",
+            capitalised(crate::booking::AGENT_LIVE_ORDER_WORDS)
+        );
+        let plan = Plan::new(
+            "placement-refused",
+            ctx.actor(),
+            vec![Act::PlacementRefused {
+                order_id: order_id.clone(),
+            }],
+        )
+        .reason(&format!(
+            "REFUSAL_REASON_AGENT_LIVE_ORDER: ems {ems}, connectivity {}",
+            request.connectivity_instance_id
+        ))
+        .key(&request.idempotency_key);
+        let mut made = finish(book, head, ctx, plan)?;
+        made.refusal = Some(StoreError::refused(RefusalReason::AgentLiveOrder, words).on_the_bus());
+        return Ok(made);
+    }
     if !claim_allows(order, ctx) {
         return Err(claim_refused(order));
     }
@@ -2503,16 +2543,12 @@ pub(crate) fn reversal_lines(book: &Book, superseded: &str) -> Result<Vec<Moveme
     else {
         return Ok(Vec::new());
     };
-    let entry = &book.entries[at];
+    let body = book.body(entry_id)?;
     let lines: &[MovementLine] = match range {
-        Some((start, count)) => entry
-            .body
-            .lines
-            .get(start..start + count)
-            .unwrap_or_default(),
-        None => &entry.body.lines,
+        Some((start, count)) => body.lines.get(start..start + count).unwrap_or_default(),
+        None => &body.lines,
     };
-    Ok(lines
+    lines
         .iter()
         .map(|line| {
             let mut negated = line.clone();
@@ -2520,16 +2556,16 @@ pub(crate) fn reversal_lines(book: &Book, superseded: &str) -> Result<Vec<Moveme
             // A pending line a roll moved since is reversed where it is now
             // (W11.25; approved 2026-10-13).
             if line.bucket == SettlementBucket::Pending as i32 {
-                negated.value_date = rolled_to(book, at, line);
+                negated.value_date = rolled_to(book, at, line)?;
             }
             negated.quantity = line.quantity.as_ref().map(|quantity| {
                 Exact::from_wire(quantity)
                     .map(|value| value.negated().to_wire())
                     .unwrap_or(*quantity)
             });
-            negated
+            Ok(negated)
         })
-        .collect())
+        .collect()
 }
 
 /// Lines relieving a lot no longer open by as much -- a fill's lot booking
@@ -2607,17 +2643,19 @@ pub(crate) fn reroute_reliefs(book: &Book, lines: Vec<MovementLine>) -> Result<V
 /// held takes it on to the roll's new date (W11.25). A roll moves only what
 /// its instance's fills and rolls on the code left there, so a roll that
 /// moved the position from the line's date moved the line.
-pub(crate) fn rolled_to(book: &Book, at: usize, line: &MovementLine) -> String {
+pub(crate) fn rolled_to(book: &Book, at: usize, line: &MovementLine) -> Result<String> {
     let mut date = line.value_date.clone();
-    for later in book.entries.iter().skip(at + 1) {
-        for act in &later.body.acts {
+    // Only the later entries holding a roll are read (contract v26, W9.10).
+    let rolls = book.bodies_of(book.entries.iter().skip(at + 1).filter(|later| later.rolls))?;
+    for (_, later) in rolls {
+        for act in &later.acts {
             let Act::ValueDateRolled { roll, .. } = act else {
                 continue;
             };
             if roll.from_value_date != date || !roll.pair.contains(&line.instrument_id) {
                 continue;
             }
-            let moved = later.body.lines.iter().any(|moved| {
+            let moved = later.lines.iter().any(|moved| {
                 moved.bucket == SettlementBucket::Pending as i32
                     && moved.instrument_id == line.instrument_id
                     && moved.side == line.side
@@ -2629,7 +2667,7 @@ pub(crate) fn rolled_to(book: &Book, at: usize, line: &MovementLine) -> String {
             }
         }
     }
-    date
+    Ok(date)
 }
 
 fn date_field(field: &str, text: &str) -> Result<()> {
@@ -3258,16 +3296,18 @@ pub fn report_value_date_roll(
     // What this instance's fills and rolls on the code left pending on the
     // old date, by position, held to what each position has pending there.
     let mut owed: BTreeMap<Key, Exact> = BTreeMap::new();
-    for entry in &book.entries {
+    // Only the entries that did something on the order path are read
+    // (contract v26, W9.10): a fill's, an accept's or a roll's.
+    for (_, body) in book.bodies_of(book.entries.iter().filter(|entry| entry.acts))? {
         if !rolls_with(
             book,
-            &entry.body.acts,
+            &body.acts,
             &ctx.instance_id,
             &request.venue_account_code,
         ) {
             continue;
         }
-        for line in &entry.body.lines {
+        for line in &body.lines {
             if line.bucket != SettlementBucket::Pending as i32
                 || line.value_date != request.from_value_date
                 || !pair.contains(line.instrument_id.as_str())
@@ -4137,6 +4177,37 @@ pub fn accept_execution(
             order_id.clone()
         }
         Some(accept_execution_request::MatchedOrder::NewOrder(new_order)) => {
+            // Refused and recorded (contract v26, W11.23, W11.38): an agent's
+            // accept to a new order on a connection the sidecar did not stamp
+            // demo while the guard is on; the executions stay unmatched. An
+            // accept to an existing order is never refused by it.
+            if crate::booking::agent_live_refused(ctx) {
+                let words = format!(
+                    "Refused: {}. {} is live: an accept of fills to a new order made through a \
+                     delegation or by a service account is refused while the deployment's \
+                     agent_orders_demo_only is on; the executions stay unmatched",
+                    capitalised(crate::booking::AGENT_LIVE_ORDER_WORDS),
+                    first.sender
+                );
+                let plan = Plan::new(
+                    "accept-refused",
+                    ctx.actor(),
+                    vec![Act::AcceptRefused {
+                        execution_ids: named
+                            .iter()
+                            .map(|held| held.execution.execution_id.clone())
+                            .collect(),
+                    }],
+                )
+                .reason(&format!(
+                    "REFUSAL_REASON_AGENT_LIVE_ORDER: ems {}, connectivity {}",
+                    ctx.instance_id, first.sender
+                ));
+                let mut made = finish(book, head, ctx, plan)?;
+                made.refusal =
+                    Some(StoreError::refused(RefusalReason::AgentLiveOrder, words).on_the_bus());
+                return Ok(made);
+            }
             let order = Order {
                 order_id: ctx.mint(ids::ORDER),
                 account_id: book.account_id.clone(),

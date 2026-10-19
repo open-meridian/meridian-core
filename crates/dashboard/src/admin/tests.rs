@@ -1157,7 +1157,7 @@ fn the_form_fits_one_screen_without_losing_what_it_says() {
     // marker are described by, and no other paragraph in the form.
     let client = setting(&form, "snaptrade_client_id");
     assert!(client.contains(
-        "<label class=\"setting-label\" for=\"setting-snaptrade_client_id\">Client ID</label>\
+        "<label class=\"setting-label\" for=\"setting-snaptrade_client_id\" title=\"Client ID\">Client ID</label>\
          <button type=\"button\" class=\"note-mark\" aria-label=\"About Client ID\" \
          aria-describedby=\"setting-snaptrade_client_id-about\"></button>"
     ));
@@ -3194,4 +3194,28 @@ fn an_optional_secret_is_removed_by_its_own_small_form_and_nothing_else_is_sent(
     assert_eq!(settings::request(&record, &submitted(main), false), None);
     // The script asks before a Remove posts.
     assert!(form.contains("indexOf(\"remove-\") === 0 && !window.confirm(asking)"));
+}
+
+/// Contract v26 (W4.5, W4.8): the Summary's model tokens, per endpoint,
+/// summed over the people and clients in its title; nothing where none.
+#[test]
+fn the_summary_says_the_model_tokens_a_plugin_reported_per_endpoint() {
+    let count =
+        |endpoint: &str, subject: &str, input: u64, output: u64| meridian_pb::v1::ModelTokenCount {
+            endpoint: endpoint.into(),
+            subject: subject.into(),
+            client_name: "Claude Code".into(),
+            input_tokens: input,
+            output_tokens: output,
+        };
+    let said = super::model_tokens_line(&[
+        count("local-llm", "local|ada", 1_200, 300),
+        count("local-llm", "local|bo", 800, 200),
+    ]);
+    assert!(said.contains("local-llm: 2,000 in, 500 out"), "{said}");
+    assert!(
+        said.contains("local|ada via Claude Code: 1,200 in, 300 out"),
+        "{said}"
+    );
+    assert_eq!(super::model_tokens_line(&[]), "");
 }

@@ -493,15 +493,21 @@ def main():
     print("F: wiped, as a reset of the cluster wipes it; the node's directory is left", flush=True)
     run("helm", "uninstall", RELEASE, "--namespace", NAMESPACE, "--wait")
     run("kubectl", "delete", "namespace", NAMESPACE, "--wait", "--timeout=300s")
-    held_pv = run("kubectl", "get", "pv", f"{NAMESPACE}-{FULL}-backup", check=False).returncode == 0
+    volume = f"{NAMESPACE}-{FULL}-backup"
+    held_pv = run("kubectl", "get", "pv", volume, check=False).returncode == 0
     if held_pv:
+        # From meridian 0.1.47 restore deletes a backup volume a deleted
+        # namespace left, within its own confirmation (the CLI's audit C4):
+        # the plan names it, and nothing changes until the plan is approved.
         left = cli(workdir, "restore", files[0], "--identity", "identity.txt",
-                   "-n", NAMESPACE, "--chart", "/chart", "--yes")
-        s.check(left.returncode == 1 and f"kubectl delete pv {NAMESPACE}-{FULL}-backup" in left.stderr,
-                "a backup volume the deleted namespace left is named before anything changes")
+                   "-n", NAMESPACE, "--chart", "/chart")
+        s.check(left.returncode == 1 and f"First it deletes the backup volume {volume}" in left.stderr
+                and "not approved, so nothing was changed" in left.stderr,
+                "a backup volume the deleted namespace left is named in the plan before anything changes")
         s.check(run("kubectl", "get", "namespace", NAMESPACE, check=False).returncode != 0,
                 "and nothing was made")
-    run("kubectl", "delete", "pv", f"{NAMESPACE}-{FULL}-backup", "--ignore-not-found", "--wait")
+        s.check(run("kubectl", "get", "pv", volume, check=False).returncode == 0,
+                "and the volume is kept until the plan is approved")
     s.check(run("kubectl", "get", "namespace", NAMESPACE, check=False).returncode != 0,
             "the namespace and everything in it are gone")
     s.check(node_backups() == on_node, "the backup is still in the node's directory")
@@ -519,6 +525,9 @@ def main():
     done = cli(workdir, "restore", files[0], "--identity", "identity.txt",
                "-n", NAMESPACE, "--chart", "/chart", "--timeout", "10m", "--yes")
     s.check(done.returncode == 0, f"meridian restore: exit {done.returncode}")
+    if held_pv:
+        s.check(f"Deleted the backup volume {volume}" in done.stdout + done.stderr,
+                "the volume the deleted namespace left is deleted first, as approved")
     s.check("every count as backed up" in done.stdout, "every table's row count as backed up")
     s.check("    config: " in done.stdout and "    book: " in done.stdout, "the counts by store")
     s.check(SECRET_VALUE not in done.stdout + done.stderr, "and it printed no secret")

@@ -45,7 +45,18 @@ const DATASET: &str = "{dataset}";
 /// owner 2026-10-11): it reads the launch records, the plugin catalogue, to
 /// know which roles a plugin was launched with, and that read is granted to
 /// it by its own column in the contract, not borrowed from the runtime's.
-const OWN_CREDENTIAL: [&str; 2] = ["first-run", "instrument"];
+///
+/// The analytics component holds one too (contract v26, W12): its rows are
+/// its own column, and its coordinator and workers share their own topic,
+/// below, which no other credential carries.
+const OWN_CREDENTIAL: [&str; 3] = ["first-run", "instrument", "analytics"];
+
+/// A component's own topics, which are not contract rows (topics.md,
+/// "Analytics": "component topics, not rows"): the analytics coordinator
+/// asking its worker pool for a unit (ruling 315, 2026-10-18), granted to
+/// that component's credential alone, publish and subscribe.
+const COMPONENT_TOPICS: [(&str, &str); 1] =
+    [("analytics", "platform.analytics.internal.compute-unit")];
 
 /// Why a component holds a credential of its own, as its user's note says.
 fn own_credential_note(component: &str) -> String {
@@ -261,6 +272,12 @@ pub fn users(contract: &Contract, instances: &[Instance]) -> Result<Vec<User>, S
         let (mut publish, mut subscribe) = component_subjects(contract, &[component]);
         if publish.is_empty() && subscribe.is_empty() {
             continue;
+        }
+        for (owner, topic) in COMPONENT_TOPICS {
+            if owner == component {
+                publish.push(topic.to_string());
+                subscribe.push(topic.to_string());
+            }
         }
         publish.push(INBOX.to_string());
         subscribe.push(INBOX.to_string());

@@ -188,7 +188,9 @@ fn declared() -> Vec<SettingDeclaration> {
         ),
         number(
             "activity_retention_days",
-            "Keep activity records for",
+            // A long label beside its "default" tag, both kept whole on a
+            // phone, the label giving way (the dev deployment, 2026-10-17).
+            "Keep each activity record SnapTrade reported for",
             "2555",
             "days",
             "How long the record of each activity SnapTrade reported is kept, from when it \
@@ -1780,6 +1782,81 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
             .encode_to_vec(),
         ))
     });
+    // Contract v26 (W6.35): the deployment's time zone, set once, and the
+    // operations plugin's affirmation deadline, for the Time zone tab.
+    bus.serve(crate::admin::time_zone::READ_DEPLOYMENT_TIME_ZONE, |_| {
+        Ok((
+            "meridian.v1.DeploymentTimeZoneSetting".into(),
+            meridian_domain::v1::DeploymentTimeZoneSetting {
+                deployment_time_zone: "America/Chicago".into(),
+                changed_at_ns: 1_792_300_000_000_000_000,
+                changed_by: ADMIN.into(),
+                affirmation_deadline: 21 * 60,
+                affirmation_deadline_instance_id: "operations-1".into(),
+            }
+            .encode_to_vec(),
+        ))
+    });
+    // Contract v26 (W12.6): the routing table, one model id routed with a
+    // long reason, and the measures the analytics component serves.
+    bus.serve(crate::admin::model_routing::LIST_MODEL_ROUTING, |_| {
+        Ok((
+            "meridian.v1.ListModelRoutingReply".into(),
+            meridian_domain::v1::ListModelRoutingReply {
+                routes: vec![
+                    meridian_domain::v1::ModelRouting {
+                        model_id: "cash".into(),
+                        implementation: "built-in".into(),
+                        ..Default::default()
+                    },
+                    meridian_domain::v1::ModelRouting {
+                        model_id: "quoted_price".into(),
+                        implementation: "sample-pricing-with-a-long-instance-name-1".into(),
+                        changed_at_ns: 1_792_300_000_000_000_000,
+                        changed_by: ADMIN.into(),
+                        reason: "Prove the pricing seam against the built-in model, as the \
+                                 sample plugin answers it"
+                            .into(),
+                    },
+                    meridian_domain::v1::ModelRouting {
+                        model_id: "binary_event".into(),
+                        implementation: "built-in".into(),
+                        ..Default::default()
+                    },
+                ],
+                version: 2,
+            }
+            .encode_to_vec(),
+        ))
+    });
+    bus.serve(
+        crate::admin::model_routing::LIST_MEASURE_DEFINITIONS,
+        |_| {
+            Ok((
+                "meridian.v1.ListMeasureDefinitionsReply".into(),
+                meridian_domain::v1::ListMeasureDefinitionsReply {
+                    definitions: [
+                        "market_value",
+                        "exposure",
+                        "concentration",
+                        "pnl",
+                        "historical_var",
+                        "expected_shortfall",
+                        "resolution_payoff",
+                        "implied_distribution",
+                    ]
+                    .iter()
+                    .map(|d| meridian_domain::v1::MeasureDefinition {
+                        definition: d.to_string(),
+                        version: 1,
+                        ..Default::default()
+                    })
+                    .collect(),
+                }
+                .encode_to_vec(),
+            ))
+        },
+    );
     // Contract v25 (W8.10 to W8.12, W5.19): the catalogue's copy Browse and
     // a listing's page read, filtered as the conductor filters it, and the
     // usage reports sent.
@@ -2262,6 +2339,9 @@ fn registry_listings() -> Vec<meridian_domain::v1::PluginListing> {
             installs: stars * 3,
             instances: stars * 4,
             counts_shown: stars >= 3,
+            reviewed: false,
+            terms_url: "https://open-meridian.com/terms#plugins-and-registries".into(),
+            publisher: "Open Meridian".into(),
         }
     };
     let mut pulled = listed("open-meridian/fx", "1.4.0", "community", &["custody"]);

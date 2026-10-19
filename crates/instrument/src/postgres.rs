@@ -48,12 +48,13 @@ const SCHEMA: &[&str] = &[
     include_str!("../migrations/0010_an_offer_keeps_its_provenance.sql"),
     include_str!("../migrations/0011_one_id.sql"),
     include_str!("../migrations/0012_a_listing_trades_in_its_currency.sql"),
+    include_str!("../migrations/0013_event_groups.sql"),
 ];
 
 /// A table the newest file makes. A database that has it has them all, so a
 /// start can check for this one and refuse a database an older release
 /// migrated, rather than failing later on the first record.
-const NEWEST_TABLE: &str = "instrument_state";
+const NEWEST_TABLE: &str = "instrument_event_group";
 
 /// And the column the newest file adds (0008, contract v20: the prepared
 /// change a version was made from), with its table, which a table check
@@ -1263,6 +1264,67 @@ impl Store for PostgresStore {
                         },
                     )?,
                     kept_at_ns: row.get(1),
+                })
+            })
+            .collect()
+    }
+
+    fn keep_event_group(
+        &self,
+        group: &meridian_domain::v1::EventGroup,
+        now_ns: i64,
+    ) -> Result<Option<meridian_domain::v1::EventGroup>> {
+        use prost::Message;
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        let sequence: Option<i64> = tx
+            .query_opt(
+                "INSERT INTO instrument_event_group
+                        (event_group_id, version, venue_id, venue_event_ref, record, kept_at_ns)
+                 VALUES ($1, $2, $3, $4, ''::bytea, $5)
+                 ON CONFLICT (event_group_id, version) DO NOTHING
+                 RETURNING sequence",
+                &[
+                    &group.event_group_id,
+                    &group.version,
+                    &group.venue_id,
+                    &group.venue_event_ref,
+                    &now_ns,
+                ],
+            )
+            .map_err(unavailable)?
+            .map(|row| row.get(0));
+        let Some(sequence) = sequence else {
+            return Ok(None);
+        };
+        let kept = meridian_domain::v1::EventGroup {
+            record_time_ns: now_ns,
+            sequence,
+            ..group.clone()
+        };
+        tx.execute(
+            "UPDATE instrument_event_group SET record = $3
+              WHERE event_group_id = $1 AND version = $2",
+            &[&kept.event_group_id, &kept.version, &kept.encode_to_vec()],
+        )
+        .map_err(unavailable)?;
+        tx.commit().map_err(unavailable)?;
+        Ok(Some(kept))
+    }
+
+    fn event_groups(&self) -> Result<Vec<meridian_domain::v1::EventGroup>> {
+        use prost::Message;
+        self.conn()?
+            .query(
+                "SELECT record FROM instrument_event_group ORDER BY sequence",
+                &[],
+            )
+            .map_err(unavailable)?
+            .into_iter()
+            .map(|row| {
+                let bytes: Vec<u8> = row.get(0);
+                meridian_domain::v1::EventGroup::decode(bytes.as_slice()).map_err(|failed| {
+                    StoreError::Unavailable(format!("an event group did not read: {failed}"))
                 })
             })
             .collect()

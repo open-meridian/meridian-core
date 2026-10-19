@@ -77,16 +77,26 @@ async fn plugin(instance: &str, roles: &[&str], map: Option<VenueAccountMap>) ->
     }
     let keeping = Arc::clone(&heard);
     bus.serve("platform.config.query.venue-catalogue", move |envelope| {
+        let asked = meridian_domain::v1::ReadVenueCatalogueRequest::decode(&envelope.payload[..])
+            .unwrap_or_default();
         keeping
             .lock()
             .unwrap()
             .push((envelope.meta.clone().unwrap_or_default(), envelope.payload));
+        // Contract v26: a session reporting a demo environment for the
+        // code DEMO, and none for any other.
+        let environment = if asked.venue_account_code == "DEMO" {
+            "sandbox"
+        } else {
+            ""
+        };
         Ok((
             "meridian.v1.ReadVenueCatalogueReply".into(),
             ReadVenueCatalogueReply {
                 catalogue: Some(VenueCatalogue {
                     connectivity_instance_id: "fix-1".into(),
                     venue_account_code: "ACCT-7".into(),
+                    environment: environment.into(),
                     ..Default::default()
                 }),
             }
@@ -632,6 +642,100 @@ async fn a_placement_says_whether_its_connectivity_plugin_is_one_the_caller_may_
         !allowed(&p),
         "the plugin as itself names nobody who may route"
     );
+}
+
+/// Contract v26 (W11.8, W11.23; G1 question 5): the stamp the book holds an
+/// agent's act to. A placement's connection is demo only where the claims
+/// name it demo (its setting) and its session reports a demo environment on
+/// the venue's catalogue; an accept to a new order only where every
+/// connection the caller may route through is demo; nothing else is stamped.
+#[tokio::test]
+async fn a_placement_is_stamped_demo_only_where_its_setting_and_its_session_both_say_so() {
+    use meridian_pb::plugin::v1::{AcceptExecutionParams, CreatePlacementParams};
+    let p = plugin("ems-1", &["ems"], None).await;
+    let keeping = Arc::clone(&p.heard);
+    p.bus
+        .serve("platform.book.command.accept-execution", move |envelope| {
+            keeping
+                .lock()
+                .unwrap()
+                .push((envelope.meta.clone().unwrap_or_default(), envelope.payload));
+            Ok(("meridian.v1.AcceptExecutionReply".into(), Vec::new()))
+        });
+    let with_demo = |routes: &[&str], demo: &[&str]| {
+        let assertion = routed(
+            &p.key,
+            "ems-1",
+            "ems",
+            AccessLevel::Write,
+            &["ACC-1"],
+            None,
+            "",
+            routes,
+        );
+        let mut claims = CallerClaims::decode(&assertion.claims[..]).unwrap();
+        claims.demo_connectivity_instance_ids = demo.iter().map(|d| d.to_string()).collect();
+        let claims = claims.encode_to_vec();
+        CallerAssertion {
+            signature: p.key.sign(&claims).to_bytes().to_vec(),
+            claims,
+            key_id: KEY_ID.into(),
+        }
+    };
+    let stamped = |p: &Plugin| {
+        p.heard
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|(meta, _)| meta.topic.starts_with("platform.book."))
+            .cloned()
+            .unwrap()
+            .0
+            .connectivity_demo
+    };
+    let place = |code: &str, acting_for: CallerAssertion| CreatePlacementParams {
+        order_id: "ORD-1".into(),
+        connectivity_instance_id: "fix-1".into(),
+        venue_account_code: code.into(),
+        quantity: one(),
+        acting_for: Some(acting_for),
+        ..Default::default()
+    };
+    for (code, demo, expected, why) in [
+        ("DEMO", vec!["fix-1"], true, "setting and session both demo"),
+        (
+            "LIVE-1",
+            vec!["fix-1"],
+            false,
+            "the session reports nothing",
+        ),
+        ("DEMO", vec![], false, "the setting is not demo"),
+    ] {
+        p.sidecar
+            .create_placement(Request::new(place(code, with_demo(&["fix-1"], &demo))))
+            .await
+            .unwrap();
+        assert_eq!(stamped(&p), expected, "{why}");
+    }
+    let accept = |acting_for: CallerAssertion| AcceptExecutionParams {
+        execution_ids: vec!["EXE-1".into()],
+        acting_for: Some(acting_for),
+        ..Default::default()
+    };
+    p.sidecar
+        .accept_execution(Request::new(accept(with_demo(&["fix-1"], &["fix-1"]))))
+        .await
+        .unwrap();
+    assert!(stamped(&p), "every route demo");
+    p.sidecar
+        .accept_execution(Request::new(accept(with_demo(
+            &["fix-1", "fix-2"],
+            &["fix-1"],
+        ))))
+        .await
+        .unwrap();
+    assert!(!stamped(&p), "one route live: failing closed");
 }
 
 // ── The order path's rules the sidecar holds (contract v22) ─────────────────

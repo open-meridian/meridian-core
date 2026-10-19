@@ -159,7 +159,7 @@ fn every_tool_parity_names_is_one_and_every_tool_is_named() {
     // v25's retirement of a version (W8.15), read of a version's
     // documentation (W6.20) and the registries' seven (W8.10 to W8.12,
     // W5.19).
-    assert_eq!(SPECS.len(), 23, "the twenty-three approved tools");
+    assert_eq!(SPECS.len(), 25, "the twenty-five approved tools");
 }
 
 /// Contract v25 (W6.20, W6.26, W8.15): retiring a version is a deployment

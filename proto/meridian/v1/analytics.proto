@@ -1,0 +1,535 @@
+// The analytics component: a job's question and its answer, the pricing
+// seam, the routing table and the solver's standard form.
+//
+// Derived from workflow W12 (an analytic answer names its inputs;
+// spec/the-analytics-engine-answers-behind-one-api, accepted 2026-10-12, Q1
+// to Q20 ruled, and spec/the-analytics-engines-first-release, accepted
+// 2026-10-14): contract v26, sdk-contract/the-analytics-component-contract.
+// Every message here traces to a matrix row; see matrix/matrix.tsv, but the
+// standard form's two, carved out until the optimiser's revision gives them
+// a row (matrix/proto-carve-outs.tsv).
+//
+// A job is a read: nothing here is a record. Every figure is exact decimal,
+// a Decimal or a Money (decisions/023), but the standard form's numbers,
+// which are the one place the contract carries floats and never money.
+
+syntax = "proto3";
+
+package meridian.v1;
+
+// The Decimal: plugin-facing, imported from there.
+import "meridian/v1/sidecar.proto";
+// Money.
+import "meridian/v1/amounts.proto";
+// A point in a store's record.
+import "meridian/v1/journal.proto";
+// The lake's source choice.
+import "meridian/v1/lake.proto";
+// An order's side.
+import "meridian/v1/book.proto";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W12.1 — a client runs a job
+// ─────────────────────────────────────────────────────────────────────────────
+
+// A job (W12.1): what to compute, over what, against which inputs, named by
+// reference. A read: it changes no record.
+message Job {
+  // The accounts it is over, each in the client's read scope, which the
+  // sidecar stamps on the request; one outside it is refused naming it.
+  repeated string account_ids = 1;
+  // Its inputs, by reference.
+  InputRefs inputs = 2;
+  // The measures, each by definition and version.
+  repeated MeasureRef measures = 3;
+  // Trades added to one account's positions (W12.5); unset for none.
+  WhatIf what_if = 4;
+}
+
+// A job's inputs, by reference (requirement 3): one watermark and one as-of
+// for the whole job (requirements 7, 8).
+message InputRefs {
+  // The book's watermark; unset for now, which the component resolves to
+  // the watermark it read and answers in the provenance.
+  Watermark book_at = 1;
+  // The lake's recorded-time cut-off; 0 for now, resolved likewise.
+  int64 lake_as_of_ns = 2;
+  // The lake's source choice; none set is the deployment's default.
+  SourceChoice sources = 3;
+}
+
+// A measure, by definition and version (requirement 14).
+message MeasureRef {
+  // A definition the component serves: `market_value`, `exposure`,
+  // `concentration`, `pnl`, `historical_var`, `expected_shortfall`,
+  // `resolution_payoff`, `implied_distribution` in v26.
+  string definition = 1;
+  // Its version, 1 or more.
+  int32 version = 2;
+  // What to break the figures down by, each a breakdown the definition
+  // allows: `account`, `asset_class`, `currency`, `instrument`, `sleeve`,
+  // `country`, or a scheme the deployment holds by its name.
+  repeated string breakdowns = 3;
+  // For an event measure, the event group it is over (W3.30).
+  string event_group_id = 4;
+}
+
+// Trades added to one account's positions for a what-if (W12.5): never a
+// book record unless proposed.
+message WhatIf {
+  string account_id = 1;
+  repeated WhatIfTrade trades = 2;
+}
+
+message WhatIfTrade {
+  string instrument_id = 1;
+  Side side = 2;
+  Decimal quantity = 3;
+  // An assumed price; unset for the price at the job's as-of.
+  optional Money price = 4;
+}
+
+message RunJobRequest {
+  Job job = 1;
+}
+
+message RunJobReply {
+  // True when the answer is here; false when the job finishes later
+  // (W12.4), the component deciding by its size against the deadline (Q5).
+  bool answered_inline = 1;
+  // `JOB-` and a ULID, never reused.
+  string job_id = 2;
+  // Set when answered inline.
+  JobAnswer answer = 3;
+}
+
+// A job's answer (W12.1, W12.4): figures, what was not evaluated and why,
+// and what it was computed from. Not a record: recomputable from its
+// provenance, cached by hash and losable (Q12).
+message JobAnswer {
+  string job_id = 1;
+  repeated Figure figures = 2;
+  repeated NotEvaluated not_evaluated = 3;
+  AnswerProvenance provenance = 4;
+}
+
+// One figure (requirement 5; the first release's Q13 and Q14).
+message Figure {
+  // The measure it answers.
+  MeasureRef measure = 1;
+  // The account it is for; empty for a figure across the job's accounts.
+  string account_id = 2;
+  // Its place in each breakdown the measure asked for.
+  repeated BreakdownValue breakdown = 3;
+  // Which scenario it is under: base, a what-if, a historical day, an
+  // outcome.
+  ScenarioKey scenario_key = 4;
+  // The value, for a figure that is one; unset for a weight.
+  optional Decimal value = 5;
+  // A weight or a probability, as its two parts, so a bound is compared by
+  // cross-multiplication, never a rounded division; unset for a value.
+  optional Decimal numerator = 6;
+  optional Decimal denominator = 7;
+  // The cash instrument a value is in: the account's base currency or the
+  // client's stated reporting currency; empty for a weight.
+  string currency_instrument_id = 8;
+  // How it was computed: exact in v26, model from v28.
+  ComputedAs computed_as = 9;
+}
+
+// How a figure was computed (the first release's Q14, approved 2026-10-14
+// as `exact` and `model`).
+enum ComputedAs {
+  // Read as exact by a v26 reader; never sent by the component.
+  COMPUTED_AS_UNSPECIFIED = 0;
+  // Exact decimal from quantities, quoted prices and FX.
+  COMPUTED_AS_EXACT = 1;
+  // A model's floating-point value, crossing at its definition's scale,
+  // rounded half to even (Q8): from v28.
+  COMPUTED_AS_MODEL = 2;
+}
+
+// A figure's place in one breakdown.
+message BreakdownValue {
+  // The breakdown, as MeasureRef.breakdowns names it.
+  string breakdown = 1;
+  // Its value: an asset class's name, an ISO 4217 code or a cash
+  // instrument's ID, an instrument's ID, a sleeve, a country's ISO 3166-1
+  // alpha-2 code, or a scheme's class.
+  string value = 2;
+}
+
+// Which scenario a figure is under (the first release's Q13, approved
+// 2026-10-14): one shape for what-ifs, VaR's days, resolution payoffs and,
+// from v28, a grid point, which adds a kind and no field.
+message ScenarioKey {
+  ScenarioKind kind = 1;
+  // For a historical day, the business date, ISO 8601.
+  string business_date = 2;
+  // For an outcome, the member of the event group that resolves YES.
+  string outcome_instrument_id = 3;
+}
+
+enum ScenarioKind {
+  // Read as base.
+  SCENARIO_KIND_UNSPECIFIED = 0;
+  // The positions and market as they are.
+  SCENARIO_KIND_BASE = 1;
+  // With the job's what-if trades added (W12.5).
+  SCENARIO_KIND_WHAT_IF = 2;
+  // One historical day's returns applied, for historical VaR and ES.
+  SCENARIO_KIND_HISTORICAL_DAY = 3;
+  // One member of an event group resolving YES (`resolution_payoff`).
+  SCENARIO_KIND_OUTCOME = 4;
+  // No named member resolving YES, for a group mutually exclusive and not
+  // exhaustive (the options and event contracts spec's question 4).
+  SCENARIO_KIND_NONE_OF_THE_NAMED = 5;
+}
+
+// A position or a figure not evaluated, and why (requirement 9): never
+// zero.
+message NotEvaluated {
+  string account_id = 1;
+  // The instrument; empty where the whole measure is not evaluated.
+  string instrument_id = 2;
+  MeasureRef measure = 3;
+  NotEvaluatedReason reason = 4;
+  // The dataset not entitled, the implementation unavailable, or the
+  // scheme not held, where the reason names one.
+  string detail = 5;
+}
+
+enum NotEvaluatedReason {
+  NOT_EVALUATED_REASON_UNSPECIFIED = 0;
+  // No price of the kind the model declares at the as-of.
+  NOT_EVALUATED_REASON_PRICE_MISSING = 1;
+  // A price older than the client's setting for its source allows.
+  NOT_EVALUATED_REASON_PRICE_STALE = 2;
+  // A conversion leg to the base or reporting currency missing.
+  NOT_EVALUATED_REASON_CONVERSION_MISSING = 3;
+  // A dataset the client is not entitled to, named in detail (Q11).
+  NOT_EVALUATED_REASON_NOT_ENTITLED = 4;
+  // A local `LCL-` record: never priced.
+  NOT_EVALUATED_REASON_LOCAL_RECORD = 5;
+  // The routed implementation did not answer by the deadline, for a figure
+  // a compliance rule reads (requirement 22).
+  NOT_EVALUATED_REASON_IMPLEMENTATION_UNAVAILABLE = 6;
+  // A breakdown whose scheme the deployment does not hold (requirement 17).
+  NOT_EVALUATED_REASON_SCHEME_NOT_HELD = 7;
+  // An implied distribution over a group not exhaustive in the version in
+  // force (the first release's Q5): the raw prices and their sum still
+  // answered.
+  NOT_EVALUATED_REASON_GROUP_NOT_EXHAUSTIVE = 8;
+  // History too short or too sparse for the definition's window.
+  NOT_EVALUATED_REASON_HISTORY_INSUFFICIENT = 9;
+}
+
+// What an answer was computed from (requirements 4 and 35; Q7). Named so it
+// is not mistaken for meridian.v1.Provenance, a value's source.
+message AnswerProvenance {
+  // The watermark and the as-of the job read at.
+  Watermark book_watermark = 1;
+  int64 lake_as_of_ns = 2;
+  // Each dataset read, as the lake's replies named them.
+  repeated string datasets = 3;
+  repeated InstrumentInput instruments = 4;
+  repeated ModelRef models = 5;
+  repeated MeasureRef measures = 6;
+  // Each event group read, at the version in force.
+  repeated EventGroupInput event_groups = 7;
+  // The routing table's version (W12.6).
+  int64 routing_version = 8;
+  // The component's version.
+  string engine_version = 9;
+  // `sha256:` and the hex of SHA-256 over the RFC 8785 canonical JSON of
+  // the inputs: two answers with the same hash are the same answer.
+  string answer_hash = 10;
+}
+
+// One instrument a job read, by its record's and template's versions.
+message InstrumentInput {
+  string instrument_id = 1;
+  int64 record_version = 2;
+  string template_id = 3;
+  string template_version = 4;
+  // The template's calculation package's version (W1.24).
+  string calculation_version = 5;
+}
+
+// One event group a job read, at its version.
+message EventGroupInput {
+  string event_group_id = 1;
+  int64 version = 2;
+}
+
+// A pricing model and the implementation that answered for it.
+message ModelRef {
+  // `cash`, `quoted_price` or `binary_event` in v26.
+  string model_id = 1;
+  int32 model_version = 2;
+  // `built-in`, or a `pricing` plugin's instance ID.
+  string implementation = 3;
+  // The component's version for the built-in one; the plugin's version
+  // for a plugin's.
+  string implementation_version = 4;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W12.1 — the measure definitions the component serves
+// ─────────────────────────────────────────────────────────────────────────────
+
+message ListMeasureDefinitionsRequest {}
+
+message ListMeasureDefinitionsReply {
+  repeated MeasureDefinition definitions = 1;
+}
+
+// A measure's versioned definition (requirements 14 to 17; Q15): shipped
+// with the component, each fixing every parameter that changes its number.
+message MeasureDefinition {
+  string definition = 1;
+  int32 version = 2;
+  // Its parameters, fixed by the version: a VaR's confidence, horizon,
+  // window, return type, missing-day treatment and quantile.
+  repeated MeasureParameter parameters = 3;
+  // The breakdowns it allows.
+  repeated string breakdowns = 4;
+  // The scale its values are rounded to, once, half to even; at most 18.
+  int32 scale = 5;
+  // The component's words for it.
+  string description = 6;
+}
+
+message MeasureParameter {
+  string name = 1;
+  // As the definition writes it: `0.99`, `500`, `relative`.
+  string value = 2;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W12.3 — the pricing seam
+// ─────────────────────────────────────────────────────────────────────────────
+
+// A batch the component hands the `pricing` instance a model id is routed
+// to (W12.3), delivered to that instance alone and caught up by sequence.
+message PriceBatchRequest {
+  string batch_id = 1;
+  // The routed instance, which alone hears it (matrix/directed.tsv).
+  string pricing_instance_id = 2;
+  string model_id = 3;
+  int32 model_version = 4;
+  repeated PricingUnit units = 5;
+  // When the component stops waiting for the answer.
+  int64 deadline_ns = 6;
+  // `sha256:` over the batch's inputs, naming it: a batch answered twice is
+  // harmless.
+  string batch_hash = 7;
+  // Its place in the instance's sequence, which ListPriceBatches reads
+  // after.
+  int64 sequence = 8;
+}
+
+// One instrument to price under one scenario, with exactly the market
+// objects its model declares (requirement 20).
+message PricingUnit {
+  string instrument_id = 1;
+  string template_version = 2;
+  ScenarioKey scenario_key = 3;
+  repeated MarketObjectValue inputs = 4;
+}
+
+// A market object's value, by the lake's terms (Q6): observed, or a
+// scenario's in its place.
+message MarketObjectValue {
+  // The instrument it is about.
+  string subject_id = 1;
+  // The lake's kind: `close`, `nav`, `mid`, `last`, or `outcome`.
+  string kind = 2;
+  // A price, in the asset it is quoted in; for `outcome`, the settlement
+  // value per contract.
+  Money value = 3;
+  // The dataset it came from; empty for a scenario's value.
+  string dataset = 4;
+}
+
+// A `pricing` plugin's answer to a batch (W12.3).
+message PriceBatchReply {
+  string batch_id = 1;
+  repeated PricedUnit values = 2;
+  // Sensitivities its model declares: empty until v28 (the first
+  // release, §3 rule 4), so a v26 plugin stays valid when they arrive.
+  repeated Sensitivity sensitivities = 3;
+  // Stamped by the sidecar: the answering instance.
+  string pricing_instance_id = 4;
+}
+
+message PricedUnit {
+  string instrument_id = 1;
+  ScenarioKey scenario_key = 2;
+  // A value per unit, in the base currency the batch's inputs convert to.
+  Money value_per_unit = 3;
+}
+
+// A sensitivity a model declares: carried empty in v26.
+message Sensitivity {
+  string instrument_id = 1;
+  ScenarioKey scenario_key = 2;
+  // The sensitivity's name, as the model declares it.
+  string name = 3;
+  Decimal value = 4;
+}
+
+message AnswerPriceBatchReply {
+  string batch_id = 1;
+}
+
+// The batches waiting for the asking instance after a sequence (W12.3).
+message ListPriceBatchesRequest {
+  int64 after_sequence = 1;
+}
+
+message ListPriceBatchesReply {
+  repeated PriceBatchRequest batches = 1;
+  // The sequence read to.
+  int64 sequence = 2;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W12.4 — a job finished later, and its answer
+// ─────────────────────────────────────────────────────────────────────────────
+
+// A job answered later has finished (W12.4), heard by the instance that ran
+// it alone.
+message JobFinishedEvent {
+  string job_id = 1;
+  // The instance that ran it, which alone hears it (matrix/directed.tsv).
+  string client_instance_id = 2;
+  string answer_hash = 3;
+  int64 finished_at_ns = 4;
+  // Its place in the instance's sequence, which ListFinishedJobs reads
+  // after.
+  int64 sequence = 5;
+}
+
+message ListFinishedJobsRequest {
+  int64 after_sequence = 1;
+}
+
+message ListFinishedJobsReply {
+  repeated JobFinishedEvent finished = 1;
+  int64 sequence = 2;
+}
+
+message ReadJobAnswerRequest {
+  string job_id = 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W12.6 — routing a model id
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Which implementation answers a model id, deployment-wide (requirement
+// 21), kept by the conductor; each change its own record.
+message ModelRouting {
+  string model_id = 1;
+  // `built-in`, or a launched `pricing` instance declaring the model id.
+  string implementation = 2;
+  int64 changed_at_ns = 3;
+  // The person, as the record names them; empty for a model id never
+  // routed, which reads `built-in`.
+  string changed_by = 4;
+  string reason = 5;
+}
+
+message SetModelRoutingRequest {
+  string model_id = 1;
+  string implementation = 2;
+  string reason = 3;
+}
+
+message ListModelRoutingRequest {}
+
+message ListModelRoutingReply {
+  repeated ModelRouting routes = 1;
+  // The table's version, which each answer's provenance names.
+  int64 version = 2;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The solver's standard form (requirement 29; Q17): fixed in v26 with no
+// solver and no row, carved out of the orphan check until the optimiser's
+// revision gives it one.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// minimise ½ xᵀPx + qᵀx subject to Ax + s = b, s in K = K₁ × … × Kₘ, xᵢ
+// integer for i in the integer set. Numbers only, no finance: the one
+// message in the contract carrying floats, and never money (Q8).
+message StandardForm {
+  // n, the number of variables.
+  uint32 variables = 1;
+  // P, upper-triangular, in compressed sparse columns; empty for a linear
+  // problem.
+  SparseMatrix p = 2;
+  // q, n values.
+  repeated double q = 3;
+  // A, m × n, in compressed sparse columns.
+  SparseMatrix a = 4;
+  // b, m values.
+  repeated double b = 5;
+  // K's cones, in the order of A's rows.
+  repeated Cone cones = 6;
+  // The indices of the integer variables, from 0.
+  repeated uint32 integer_variables = 7;
+}
+
+// A sparse matrix in compressed sparse columns.
+message SparseMatrix {
+  uint32 rows = 1;
+  uint32 columns = 2;
+  // columns + 1 offsets into row_indices and values.
+  repeated uint32 column_starts = 3;
+  repeated uint32 row_indices = 4;
+  repeated double values = 5;
+}
+
+// One cone of K and its dimension.
+message Cone {
+  ConeKind kind = 1;
+  uint32 dimension = 2;
+}
+
+enum ConeKind {
+  CONE_KIND_UNSPECIFIED = 0;
+  // s = 0: equalities.
+  CONE_KIND_ZERO = 1;
+  // s ≥ 0: inequalities.
+  CONE_KIND_NONNEGATIVE = 2;
+  // ‖s₂…ₖ‖ ≤ s₁.
+  CONE_KIND_SECOND_ORDER = 3;
+}
+
+// A solver's answer to a standard form, its certificate checked by a
+// separate checker (requirement 36).
+message StandardFormAnswer {
+  StandardFormStatus status = 1;
+  // The primal solution x, n values; the slack s, m values; the dual
+  // solution y, m values.
+  repeated double x = 2;
+  repeated double s = 3;
+  repeated double y = 4;
+  // The objective's value at x.
+  double objective = 5;
+  // For an integer problem, the best bound found.
+  double best_bound = 6;
+}
+
+enum StandardFormStatus {
+  STANDARD_FORM_STATUS_UNSPECIFIED = 0;
+  STANDARD_FORM_STATUS_SOLVED = 1;
+  // Infeasible, y the certificate.
+  STANDARD_FORM_STATUS_INFEASIBLE = 2;
+  // Unbounded, x the certificate.
+  STANDARD_FORM_STATUS_UNBOUNDED = 3;
+  // Stopped at an iteration or time limit, x the best found.
+  STANDARD_FORM_STATUS_STOPPED = 4;
+}

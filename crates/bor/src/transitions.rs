@@ -94,7 +94,7 @@ pub const TRANSITIONS: &[Transition] = &[
         cause: "a placement or a child order commits quantity",
         caused_by: &["ems"],
         to: &[To::State(OrderState::Working)],
-        refusal: &[RefusalReason::ConnectivityNotAllowed, RefusalReason::Claimed, RefusalReason::OrderState],
+        refusal: &[RefusalReason::ConnectivityNotAllowed, RefusalReason::Claimed, RefusalReason::OrderState, RefusalReason::AgentLiveOrder],
     },
     Transition {
         row: "7",
@@ -401,7 +401,7 @@ pub const EXECUTION_TRANSITIONS: &[Transition<ExecutionState>] = &[
         cause: "an accept to an existing order the accepting ems may place against, or to a new order made from the fills: the placement created at filled, the position moved as of the trade date; one naming an execution superseded by a bust or a correction is refused REFUSAL_REASON_EXECUTION_STATE; fills of more than one account, instrument, side, connectivity plugin or trade date REFUSAL_REASON_EXECUTIONS_DIFFER; an existing order claimed by another REFUSAL_REASON_CLAIMED",
         caused_by: &["ems"],
         to: &[To::State(ExecutionState::Matched)],
-        refusal: &[RefusalReason::ActorRequired, RefusalReason::OrderState, RefusalReason::Claimed, RefusalReason::QuantityExceedsOrder, RefusalReason::ExecutionState, RefusalReason::ExecutionsDiffer, RefusalReason::LocalRecordNotAllowed],
+        refusal: &[RefusalReason::ActorRequired, RefusalReason::OrderState, RefusalReason::Claimed, RefusalReason::QuantityExceedsOrder, RefusalReason::ExecutionState, RefusalReason::ExecutionsDiffer, RefusalReason::LocalRecordNotAllowed, RefusalReason::AgentLiveOrder],
     },
     Transition {
         row: "e4",

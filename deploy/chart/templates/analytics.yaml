@@ -1,0 +1,87 @@
+{{- include "meridian-runtime.require" . -}}
+{{/*
+  The analytics component (contract v26, W12): a coordinator that compiles
+  a job, resolves its inputs on the client's behalf and answers, and a pool
+  of workers taking units from the queue group they share. Its own image
+  (meridian-analytics), from the same commit as the runtime's, and its own
+  credential on the broker: its rows, and its own coordinator-to-worker
+  topic, which no other credential carries.
+
+  Stateless: no database, no key, no volume but readiness. A restart loses
+  the jobs in flight and the answers held, and a client runs its job again
+  (the one-API spec's Q12). Every copy, coordinator and worker, is one
+  instance on the bus, `<release>-analytics`: the queue group their topics
+  share, and the publisher the lake reads a job's client from.
+
+  Always rendered: the broker's generated configuration names the
+  component's credential whatever the values say, and a deployment's
+  templates bind to its models (the first release's §1).
+*/}}
+{{- $full := include "meridian-runtime.fullname" . }}
+{{- range $part := list "coordinator" "worker" }}
+{{- $values := index $.Values.analytics $part }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $full }}-analytics-{{ $part }}
+  labels:
+    meridian.dev/component: analytics-{{ $part }}
+    {{- include "meridian-runtime.labels" $ | nindent 4 }}
+spec:
+  replicas: {{ $values.replicaCount }}
+  revisionHistoryLimit: {{ $.Values.revisionHistoryLimit }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "meridian-runtime.name" $ }}
+      app.kubernetes.io/instance: {{ $.Release.Name }}
+      meridian.dev/component: analytics-{{ $part }}
+  template:
+    metadata:
+      labels:
+        {{- include "meridian-runtime.labels" $ | nindent 8 }}
+        meridian.dev/component: analytics-{{ $part }}
+      {{- with $.Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with $.Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: analytics-{{ $part }}
+          image: "{{ $.Values.analytics.image.repository | default (replace "meridian-runtime" "meridian-analytics" $.Values.image.repository) }}:{{ $.Values.analytics.image.tag | default $.Values.image.tag }}"
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          args: ["meridian-analytics", "{{ $part }}"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          env:
+            - name: MERIDIAN_INSTANCE_ID
+              value: {{ $full }}-analytics
+            - name: RUST_LOG
+              value: {{ $.Values.logLevel | quote }}
+            - name: MERIDIAN_BROKER_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "meridian-runtime.brokerSecret" $ }}
+                  key: {{ if $.Values.broker.existingSecret }}{{ $.Values.broker.analyticsKey }}{{ else }}analytics{{ end }}
+            {{- if eq $part "coordinator" }}
+            - name: MERIDIAN_ANALYTICS_INLINE_MS
+              value: {{ $.Values.analytics.inlineMs | quote }}
+            - name: MERIDIAN_ANALYTICS_PRICE_DEADLINE_MS
+              value: {{ $.Values.analytics.priceDeadlineMs | quote }}
+            {{- end }}
+            {{- include "meridian-runtime.readyEnv" $ | nindent 12 }}
+          {{- include "meridian-runtime.readyProbe" $ | nindent 10 }}
+          volumeMounts:
+            {{- include "meridian-runtime.readyMount" $ | nindent 12 }}
+          resources:
+            {{- toYaml $values.resources | nindent 12 }}
+      volumes:
+        {{- include "meridian-runtime.readyVolume" $ | nindent 8 }}
+{{- end }}

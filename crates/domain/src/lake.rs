@@ -848,3 +848,49 @@ mod closed_day_tests {
         assert!(closed_day(&missing, Date::parse("2026-10-18").unwrap()).is_none());
     }
 }
+
+/// W10.10 (contract v26): the kinds QueryLake answers, by the name its
+/// request spells.
+pub const QUERY_KINDS: [&str; 5] = ["prices", "bars", "trades", "quotes", "outcomes"];
+
+/// The lake kinds a role reads, as the reads' rows grant them (W10.10; the
+/// lake spec's Q6): prices, bars and outcomes for `reporting`, `portfolio`,
+/// `compliance` and `signal`; trades and quotes for `signal` and `ems`;
+/// trades for `data`; outcomes for `operations`. `reporting` reads no
+/// trades or quotes.
+pub fn kinds_read_by(role: &str) -> &'static [&'static str] {
+    match role {
+        "signal" => &["prices", "bars", "outcomes", "trades", "quotes"],
+        "reporting" | "portfolio" | "compliance" => &["prices", "bars", "outcomes"],
+        "ems" => &["trades", "quotes"],
+        "data" => &["trades"],
+        "operations" => &["outcomes"],
+        _ => &[],
+    }
+}
+
+/// Whether any of `roles` reads `kind` (W10.10).
+pub fn roles_read_kind(roles: &[String], kind: &str) -> bool {
+    roles.iter().any(|role| kinds_read_by(role).contains(&kind))
+}
+
+#[cfg(test)]
+mod query_kind_tests {
+    use super::*;
+
+    #[test]
+    fn reporting_reads_no_trades_or_quotes_and_signal_reads_every_kind() {
+        let reporting = vec!["reporting".to_string()];
+        assert!(roles_read_kind(&reporting, "prices"));
+        assert!(!roles_read_kind(&reporting, "trades"));
+        assert!(!roles_read_kind(&reporting, "quotes"));
+        for kind in QUERY_KINDS {
+            assert!(roles_read_kind(&["signal".to_string()], kind), "{kind}");
+        }
+        assert!(roles_read_kind(
+            &["custody".to_string(), "data".to_string()],
+            "trades"
+        ));
+        assert!(!roles_read_kind(&["custody".to_string()], "prices"));
+    }
+}

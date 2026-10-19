@@ -10,7 +10,7 @@ DOCKER := DOCKER_BUILDKIT=1 docker
         e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external e2e-cluster-backup \
         test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-service-account e2e-lake e2e-recorded e2e-orders e2e-one-id \
         build test test-store check-image-version chart-check check-crate-boundaries check-one-clock check-test-targets check-local-storage \
-        interop e2e-book prompt-attacks lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-first-run
+        interop e2e-book check-reference-cases reference-cases prompt-attacks lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-first-run
 
 help:
 	@echo "  make ci-local       run every gate (the pre-push gate, and what CI mirrors)"
@@ -36,6 +36,7 @@ help:
 	@echo "  make e2e-orders     the order path on the harness: proposed, released, placed, filled at a simulated venue, refused"
 	@echo "  make e2e-one-id     one ID on the harness: matched, minted or provisional, the licence list, the escape hatch, a resolution"
 	@echo "  make e2e-book       the book of record, written, read and heard through the SDK, then rebuilt"
+	@echo "  make check-reference-cases  the analytics engine's pinned cases are the SDK's, byte for byte"
 	@echo "  make up             bring up Postgres and the runtime"
 	@echo "  make down           take them down, keeping nothing"
 	@echo "  make demo           register this deployment and prove the round trip"
@@ -109,7 +110,7 @@ stage-compile:    gate-begin-compile build test
 	@$(GATE) end compile
 stage-tests:      gate-begin-tests test-store test-broker test-directory gate-drop-tests-image e2e-settings-page
 	@$(GATE) end tests --drop compose:tests $(SETTINGS_PAGE_IMAGE) $(SETTINGS_BROWSER_IMAGE)
-stage-sdk:        gate-begin-sdk interop e2e-book
+stage-sdk:        gate-begin-sdk check-reference-cases interop e2e-book
 	@$(GATE) end sdk
 stage-dashboards: gate-begin-dashboards e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page
 	@$(GATE) end dashboards
@@ -201,6 +202,9 @@ DOMAIN_RS := crates/domain/src/v1.rs
 # boundaries/transitions.json (decisions/035): every language's copy is
 # generated, and this is core's.
 TRANSITIONS_RS := crates/bor/src/transitions.rs
+# The data dictionary core carries (contract v26): meridian-schema's
+# boundaries/fields.json, whole.
+FIELDS_JSON := crates/dashboard/src/mcp/fields.json
 SCRATCH   := .codegen-scratch
 # The meridian-schema revision the workspace links, whose protos a domain
 # proto may import (bus.proto takes MessageMeta from there).
@@ -213,8 +217,9 @@ codegen:
 	@rm -rf $(SCRATCH)
 	@$(DOCKER) build $(SCHEMA_PROTO) $(SCHEMA_BOUNDARIES) -f Dockerfile.codegen --target export \
 		--output type=local,dest=$(SCRATCH) .
-	@mv $(SCRATCH)/v1.rs $(DOMAIN_RS) && mv $(SCRATCH)/transitions.rs $(TRANSITIONS_RS) && rm -rf $(SCRATCH)
-	@echo "codegen: wrote $(DOMAIN_RS) and $(TRANSITIONS_RS)"
+	@mv $(SCRATCH)/v1.rs $(DOMAIN_RS) && mv $(SCRATCH)/transitions.rs $(TRANSITIONS_RS) \
+		&& mv $(SCRATCH)/fields.json $(FIELDS_JSON) && rm -rf $(SCRATCH)
+	@echo "codegen: wrote $(DOMAIN_RS), $(TRANSITIONS_RS) and $(FIELDS_JSON)"
 
 # Generate into a scratch directory and compare. A vendored file that does not
 # match a fresh generation is a stale checkout or a hand-edit, and both are the
@@ -225,7 +230,7 @@ check-codegen:
 	@$(DOCKER) build $(SCHEMA_PROTO) $(SCHEMA_BOUNDARIES) -f Dockerfile.codegen --target export \
 		--output type=local,dest=$(SCRATCH) . >/dev/null 2>&1 \
 		|| { echo "check-codegen: generation failed; run 'make codegen' to see why" >&2; exit 1; }
-	@for pair in "$(DOMAIN_RS) v1.rs" "$(TRANSITIONS_RS) transitions.rs"; do \
+	@for pair in "$(DOMAIN_RS) v1.rs" "$(TRANSITIONS_RS) transitions.rs" "$(FIELDS_JSON) fields.json"; do \
 		set -- $$pair; \
 		if ! diff -q $$1 $(SCRATCH)/$$2 >/dev/null 2>&1; then \
 			echo "check-codegen FAILED: $$1 is stale or hand-edited" >&2; \
@@ -237,7 +242,7 @@ check-codegen:
 		fi; \
 	done
 	@rm -rf $(SCRATCH)
-	@echo "check-codegen OK: $(DOMAIN_RS) and $(TRANSITIONS_RS) match a fresh generation from the protos and the schema's transition table"
+	@echo "check-codegen OK: $(DOMAIN_RS), $(TRANSITIONS_RS) and $(FIELDS_JSON) match a fresh generation from the protos and the schema's boundaries"
 
 # A build whose result is a verdict, not an image: kept as build cache, which
 # the gate frees, rather than left behind as an untagged image holding its
@@ -375,14 +380,15 @@ e2e-cluster: network
 		|| { echo "e2e-cluster needs a cluster; point KUBECONFIG at one" >&2; exit 1; }
 	@test -f "$(PLATFORM)/docker-compose.yaml" \
 		|| { echo "no platform at $(PLATFORM); set PLATFORM=<path>" >&2; exit 1; }
-	@echo "e2e-cluster: building the image this cluster will run"
+	@echo "e2e-cluster: building the images this cluster will run"
 	@$(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
+	@$(DOCKER) build -q --target analytics -t $(ANALYTICS_IMAGE) . >/dev/null
 	@# And the browser the password branches are signed in with, in a pod.
 	@$(DOCKER) build -q -t $(E2E_BROWSER_IMAGE) -f e2e/cluster/browser.Dockerfile e2e/cluster >/dev/null
 	@# A cluster on the daemon that built the images sees them already; one
 	@# that is not (k3d, kind) is handed them, or its pods pull tags that exist
 	@# nowhere. Empty for Rancher Desktop and Docker Desktop.
-	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(RUNTIME_IMAGE) $(E2E_BROWSER_IMAGE) $(if $(filter cli,$(E2E_DRIVER)),$(E2E_CLI_IMAGE)) >/dev/null,:)
+	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(RUNTIME_IMAGE) $(ANALYTICS_IMAGE) $(E2E_BROWSER_IMAGE) $(if $(filter cli,$(E2E_DRIVER)),$(E2E_CLI_IMAGE)) >/dev/null,:)
 	# A pod calls the platform host.docker.internal, so the platform has to
 	# admit that name and expect it as the audience a deployment signs for.
 	# Django refuses an unlisted Host before any view runs, which is a 400 with
@@ -681,7 +687,8 @@ e2e-cluster-backup:
 	@$(DOCKER) build -q -t $(E2E_BACKUP_IMAGE) deploy/backup >/dev/null
 	@$(DOCKER) build -q -f "$(CLI)/Dockerfile.rust" --target e2e -t $(E2E_BACKUP_CLI_IMAGE) "$(CLI)" >/dev/null
 	@$(if $(E2E_BACKUP_RUNTIME),:,$(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null)
-	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(or $(E2E_BACKUP_RUNTIME),$(RUNTIME_IMAGE)) $(E2E_BACKUP_IMAGE) postgres:16-alpine >/dev/null,:)
+	@$(if $(E2E_BACKUP_RUNTIME),:,$(DOCKER) build -q --target analytics -t $(ANALYTICS_IMAGE) . >/dev/null)
+	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(or $(E2E_BACKUP_RUNTIME),$(RUNTIME_IMAGE)) $(if $(E2E_BACKUP_RUNTIME),,$(ANALYTICS_IMAGE)) $(E2E_BACKUP_IMAGE) postgres:16-alpine >/dev/null,:)
 	@kubectl delete namespace $(E2E_BACKUP_NAMESPACE) --ignore-not-found --wait >/dev/null 2>&1
 	@E2E_NAMESPACE=$(E2E_BACKUP_NAMESPACE) E2E_IMAGE=$(or $(E2E_BACKUP_RUNTIME),$(RUNTIME_IMAGE)) \
 	 E2E_BACKUP_IMAGE=$(E2E_BACKUP_IMAGE) E2E_CLI_IMAGE=$(E2E_BACKUP_CLI_IMAGE) E2E_WORKDIR="$(CURDIR)" \
@@ -712,6 +719,9 @@ PLUGIN_VALUES := --set 'sidecars[0].instanceId=check-1' --set 'sidecars[0].roles
 # configuration from the same code at start, so a file here and a chart there
 # cannot drift into two policies that must agree.
 RUNTIME_IMAGE = meridian-runtime:local
+# The analytics component's image, the same build's (Dockerfile's `analytics`
+# stage), named as the chart names it beside the runtime's (contract v26).
+ANALYTICS_IMAGE = $(subst meridian-runtime,meridian-analytics,$(RUNTIME_IMAGE))
 BROKER_CONFIG = $(DOCKER) run --rm -v "$(CURDIR)":/w -w /w $(RUNTIME_IMAGE) meridian-broker-config
 
 runtime-image:
@@ -1046,7 +1056,8 @@ e2e-settings-page:
 # street` is the expected file exactly, nothing for the account left
 # unlinked; the dashboard counts that one not linked; a second plugin is
 # opened at write only once the admin is granted it; and `store book` prints
-# the book empty.
+# the book empty but for the upgrade's records, each once on its control
+# partition: v24's escape hatch and v26's agents' guard (decisions/031).
 HARNESS_IMAGE := meridian-harness:local
 HARNESS_FILES := README.md activity.sql book.sql compose.yaml harness.py lake.sql moves.sql platform.py street.sql tickets.sql
 HARNESS_SECRET := sk-test-harness-not-a-real-key
@@ -1161,7 +1172,10 @@ harness-check:
 	backfill='^entry|~control|local-record-orders-backfilled|[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}|instance bor-1$$'; \
 	[ "$$(grep -c "$$backfill" .harness/book || true)" = 1 ] \
 		|| fail "the book does not hold contract v24's escape-hatch record exactly once, on its control partition, written by bor (W11.36, decisions/031): $$(head -3 .harness/book)"; \
-	grep -v "$$backfill" .harness/book >.harness/book-written || true; \
+	guard='^entry|~control|agent-orders-demo-only-backfilled|[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}|instance bor-1$$'; \
+	[ "$$(grep -c "$$guard" .harness/book || true)" = 1 ] \
+		|| fail "the book does not hold contract v26's agents' guard record exactly once, on its control partition, written by bor (W11.38, decisions/031): $$(head -3 .harness/book)"; \
+	grep -v -e "$$backfill" -e "$$guard" .harness/book >.harness/book-written || true; \
 	[ ! -s .harness/book-written ] || fail "the book holds something nobody wrote: $$(head -3 .harness/book-written)"; \
 	$(HARNESS_STORE) ledger >/dev/null 2>&1 && fail "store printed a store it does not have"; \
 	$(HARNESS) exec -T -u 65532 custody python -c 'import os, pathlib; pathlib.Path(os.environ["MERIDIAN_STORAGE_DIR"], "kept").write_text("a raw record")' \
@@ -1178,7 +1192,7 @@ harness-check:
 	done; \
 	$(HARNESS) logs --no-color >>.e2e-harness.log 2>&1; \
 	$(HARNESS) --profile runner down -v --remove-orphans >>.e2e-harness.log 2>&1; \
-	echo "harness-check OK in $$(( $$(date +%s) - started ))s: the plugin harness is its own image, files only, and the runtime image carries none of it; no fixed password or hash is in its files; its compose writes five plugins, each beside its sidecar, one started again after failing first ($$restarts restart), one declaring v25 registering the declaration its sidecar holds it to and one differing refused naming the difference; its runner signs in with the password drawn for the run, sets a plugin's settings, defines an account and links it through the plugin's own form, taking what the page offered from the page; store street prints as expected, the dollar pulled from the master and the three other records it names listed as ones the book cannot use and one completed at the Instruments page, an MCP client connected on a delegation covering the deployment admin alone lists core's tools and no plugin's, is refused a completion without a note by path, completes a record through dashboard__complete_instruments whose history names the person and the client, and Connected clients lists its calls; nothing for the account left unlinked, which the dashboard counts ($$unlinked); a second plugin is opened at write once the admin is granted it, and store book prints the book empty; the custody plugin writes its storage as a user that is not root and finds it again in a new container, and the plugins holding no edge role have none"
+	echo "harness-check OK in $$(( $$(date +%s) - started ))s: the plugin harness is its own image, files only, and the runtime image carries none of it; no fixed password or hash is in its files; its compose writes five plugins, each beside its sidecar, one started again after failing first ($$restarts restart), one declaring v25 registering the declaration its sidecar holds it to and one differing refused naming the difference; its runner signs in with the password drawn for the run, sets a plugin's settings, defines an account and links it through the plugin's own form, taking what the page offered from the page; store street prints as expected, the dollar pulled from the master and the three other records it names listed as ones the book cannot use and one completed at the Instruments page, an MCP client connected on a delegation covering the deployment admin alone lists core's tools and no plugin's, is refused a completion without a note by path, completes a record through dashboard__complete_instruments whose history names the person and the client, and Connected clients lists its calls; nothing for the account left unlinked, which the dashboard counts ($$unlinked); a second plugin is opened at write once the admin is granted it, and store book prints the book empty but for the upgrade's two records, the escape hatch's and the agents' guard's; the custody plugin writes its storage as a user that is not root and finds it again in a new container, and the plugins holding no edge role have none"
 
 # Tickets inside a deployment (contract v13), end to end on the plugin
 # harness: core's stand-in as custody, operations and a plugin holding no
@@ -1539,6 +1553,23 @@ chart-check:
 		|| { echo "chart-check FAILED: the bundled broker makes no credential for a sidecar's instance" >&2; exit 1; }; \
 	echo "$$rendered" | grep -q '"instance_id":"check-1","roles":\["custody","reporting"\]' \
 		|| { echo "chart-check FAILED: the bundled broker does not know a sidecar's instance and roles" >&2; exit 1; }
+	@# Contract v26 (W12): the analytics component, its coordinator and its
+	@# workers each a Deployment on its own image, the runtime's commit and
+	@# repository named meridian-analytics; its own credential on the broker
+	@# this chart brings; and the lake told its instance, whose reads for a
+	@# job are its client's.
+	@rendered="$$($(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check \
+		--set image.repository=example/meridian-runtime --set image.tag=t1 2>/dev/null)"; \
+	for part in coordinator worker; do \
+		echo "$$rendered" | grep -q "args: \[\"meridian-analytics\", \"$$part\"\]" \
+			|| { echo "chart-check FAILED: no analytics $$part Deployment" >&2; exit 1; }; \
+	done; \
+	[ "$$(echo "$$rendered" | grep -c 'image: "example/meridian-analytics:t1"')" = 2 ] \
+		|| { echo "chart-check FAILED: the analytics Deployments do not run the analytics image of the runtime's commit" >&2; exit 1; }; \
+	echo "$$rendered" | grep -q '^  analytics: ' \
+		|| { echo "chart-check FAILED: the bundled broker makes no credential for the analytics component" >&2; exit 1; }; \
+	echo "$$rendered" | grep -A1 'name: MERIDIAN_ANALYTICS_INSTANCE_ID' | grep -q 'value: check-meridian-runtime-analytics$$' \
+		|| { echo "chart-check FAILED: the lake is not told the analytics component's instance" >&2; exit 1; }
 	@# decisions/028. A configured plugin holding an edge role gets a claim of
 	@# its own, kept when the plugin is removed, mounted in its plugin's
 	@# container alone and named in MERIDIAN_STORAGE_DIR; one holding none gets
@@ -2002,9 +2033,11 @@ chart-check:
 		|| { echo "chart-check FAILED: a platform key renders no ConfigMap entry" >&2; exit 1; }; \
 	[ "$$(echo "$$keyed" | grep -c 'name: MERIDIAN_PLATFORM_KEYS_DIR')" = 1 ] \
 		|| { echo "chart-check FAILED: the platform's keys reach other than the conductor alone" >&2; exit 1; }; \
-	! $(HELM) template check deploy/chart $$base 2>/dev/null | grep -q 'MERIDIAN_PLATFORM_KEYS_DIR\|platform-keys' \
-		|| { echo "chart-check FAILED: no platform key still renders the keys' volume or variable" >&2; exit 1; }
-	@echo "chart-check OK: the platform's keys on the conductor alone, as files, only where the chart carries some; four components, the dashboard and the three ways it signs people in, the key and the settings key on the conductor alone, both key paths, refusals, migrations, no pinned uid, a plugin held to its side of the pod, its front door open to the dashboard alone, an Ingress only when asked for and HTTPS alone unless plain HTTP is, development only when asked for, the live shape there alone, a backup only when sealed and placed, and nothing an upgrade leaves behind"
+	! $(HELM) template check deploy/chart $$base --set-json 'registries.platformKeys=[]' 2>/dev/null | grep -q 'MERIDIAN_PLATFORM_KEYS_DIR\|platform-keys' \
+		|| { echo "chart-check FAILED: no platform key still renders the keys' volume or variable" >&2; exit 1; }; \
+	$(HELM) template check deploy/chart $$base 2>/dev/null | grep -q 'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEYM0/p11OyeOPd/Wxgpt0yNiY74kY' \
+		|| { echo "chart-check FAILED: the chart's default does not carry the platform's key (v26)" >&2; exit 1; }
+	@echo "chart-check OK: the platform's keys on the conductor alone, as files, only where the chart carries some, its current key by default; four components, the dashboard and the three ways it signs people in, the key and the settings key on the conductor alone, both key paths, refusals, migrations, no pinned uid, a plugin held to its side of the pod, its front door open to the dashboard alone, an Ingress only when asked for and HTTPS alone unless plain HTTP is, development only when asked for, the live shape there alone, a backup only when sealed and placed, and nothing an upgrade leaves behind"
 
 lint:
 	@$(DOCKER) build -f Dockerfile.rust --target lint $(VERDICT) . >/dev/null 2>&1 \
@@ -2147,6 +2180,34 @@ interop: network
 			|| { echo "interop FAILED: the street store did not keep what the SDK sent" >&2; exit 1; }
 	@echo "interop OK: the Python SDK and this runtime agree on the sidecar surface, and the street store keeps its numbers exactly"
 
+# The SDK's reference cases (spec/the-analytics-engine-answers-behind-one-api,
+# requirement 36): the analytics engine answers each exactly as the SDK's
+# reference computations do, figures and hash. Vendored, never edited: the
+# engine's tests read them at build (crates/analytics-engine/src/tests.rs),
+# and this check holds them to the SDK's own, byte for byte, file for file,
+# in the stage that has the SDK beside it. `make reference-cases` copies
+# them again after a deliberate change on the SDK's side.
+REFERENCE_CASES := crates/analytics-engine/reference_cases
+
+reference-cases:
+	@test -d "$(SDK)/tests/reference_cases" \
+		|| { echo "no reference cases at $(SDK)/tests/reference_cases; set SDK=<path to meridian-python>" >&2; exit 1; }
+	@rm -f $(REFERENCE_CASES)/*.json && cp "$(SDK)"/tests/reference_cases/*.json $(REFERENCE_CASES)/
+	@rev="$$(git -C "$(SDK)" log -1 --format=%h -- tests/reference_cases)"; \
+		echo "reference-cases: copied from $(SDK)/tests/reference_cases at $$rev; say so in $(REFERENCE_CASES)/SOURCE"
+
+check-reference-cases:
+	@test -d "$(SDK)/tests/reference_cases" \
+		|| { echo "no reference cases at $(SDK)/tests/reference_cases; set SDK=<path to meridian-python>" >&2; exit 1; }
+	@theirs="$$(cd "$(SDK)/tests/reference_cases" && ls *.json)"; ours="$$(cd $(REFERENCE_CASES) && ls *.json)"; \
+		[ "$$theirs" = "$$ours" ] \
+			|| { echo "check-reference-cases FAILED: the SDK holds [$$theirs] and core [$$ours]; run make reference-cases" >&2; exit 1; }; \
+		for f in $$theirs; do \
+			cmp -s "$(SDK)/tests/reference_cases/$$f" "$(REFERENCE_CASES)/$$f" \
+				|| { echo "check-reference-cases FAILED: $$f differs from the SDK's; run make reference-cases" >&2; exit 1; }; \
+		done
+	@echo "check-reference-cases OK: the engine's pinned cases are the SDK's, byte for byte"
+
 # The red-team corpus, vendored from meridian-design's evals/prompt-attacks/
 # (plans/tickets-inside-a-deployment, Q6, ruled 2026-10-03): one corpus for
 # the deployment and the platform, canonical in design, each case unchanged.
@@ -2156,12 +2217,16 @@ interop: network
 # design's corpus changes, and commit the file it writes.
 DESIGN ?= ../meridian-design
 PROMPT_ATTACKS := deploy/prompt-attacks.json
+# The screen rules, one canonical table (ruling 294): read by the dashboard
+# at build in place of hand-ported rules.
+SCREEN_RULES := crates/dashboard/src/tickets/screen-rules.json
 
 prompt-attacks:
 	@test -d "$(DESIGN)/evals/prompt-attacks" \
 		|| { echo "no corpus at $(DESIGN)/evals/prompt-attacks; set DESIGN=<path to meridian-design>" >&2; exit 1; }
 	@$(PY) -c 'import json, pathlib, subprocess, sys; root = pathlib.Path(sys.argv[1]); corpus = json.loads((root / "corpus.json").read_text()); cases = sorted((json.loads(p.read_text()) for p in root.glob("RT*/case.json")), key=lambda c: int(c["id"][2:])); rev = subprocess.run(["git", "-C", str(root), "log", "-1", "--format=%h", "--", "."], capture_output=True, text=True).stdout.strip(); out = {"about": "Vendored from meridian-design evals/prompt-attacks at " + rev + " by make prompt-attacks; never edited here.", "channels": corpus["channels"], "outcomes": corpus["outcomes"], "refusals": corpus["refusals"], "cases": cases}; pathlib.Path(sys.argv[2]).write_text(json.dumps(out, indent=1, ensure_ascii=True) + "\n")' "$(DESIGN)/evals/prompt-attacks" "$(PROMPT_ATTACKS)"
-	@echo "prompt-attacks: wrote $(PROMPT_ATTACKS) from $(DESIGN)/evals/prompt-attacks"
+	@cp "$(DESIGN)/evals/prompt-attacks/screen-rules.json" $(SCREEN_RULES)
+	@echo "prompt-attacks: wrote $(PROMPT_ATTACKS) and $(SCREEN_RULES) from $(DESIGN)/evals/prompt-attacks"
 
 # The book of record (W9, contract v8), end to end through the Python SDK.
 #

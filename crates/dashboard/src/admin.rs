@@ -78,6 +78,8 @@ pub fn routes() -> Router<Arc<App>> {
             get(trading_page).post(set_trading_instruction),
         )
         .route(trading::LOCAL_RECORDS_PATH, post(set_local_record_orders))
+        .route("/admin/time-zone", post(set_deployment_time_zone))
+        .route("/admin/model-routing", post(set_model_routing))
         .route("/admin/data-sources", get(data_sources_page))
         .route("/admin/data-sources/licence", post(set_dataset_licence))
         .route(
@@ -460,9 +462,12 @@ pub(crate) use books::{method_of as books_method_of, method_value as books_metho
 pub mod calendars;
 pub mod connectivity;
 pub mod data_sources;
+pub mod event_groups;
 pub mod holds;
 pub mod instruments;
+pub mod model_routing;
 pub(crate) mod overview;
+pub mod time_zone;
 pub(crate) use overview::listing;
 pub mod people;
 pub(crate) mod picker;
@@ -564,6 +569,18 @@ async fn admin_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Response
                 name: format!("{} (service account)", account.name),
             }),
     );
+    // Contract v26 (W6.35): the deployment's time zone, its tab.
+    let zone = time_zone::read(&app.bus).await;
+    if let Err(failed) = &zone {
+        tracing::warn!(%failed, "the deployment's time zone could not be read");
+    }
+    // Contract v26 (W12.6): the analytics routing table, its tab, with the
+    // measures the component serves beside it where it answers.
+    let routing = model_routing::read(&app.bus).await;
+    if let Err(failed) = &routing {
+        tracing::warn!(%failed, "the routing table could not be read");
+    }
+    let served = model_routing::definitions(&app.bus).await;
     let body = overview::render(
         &records,
         &delegating,
@@ -572,6 +589,8 @@ async fn admin_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Response
         &books,
         agents,
         service_accounts,
+        zone.as_ref().ok(),
+        (routing.as_ref().ok(), served.as_ref()),
         &token_input(&session),
         "",
     );
@@ -1361,6 +1380,49 @@ pub(crate) async fn setting_up_steps(
 /// them -- then the figures it reports, as tiles ([`crate::figures`]). The
 /// status is core's to say, so a plugin cannot misreport it, and the figures
 /// are only ever drawn as the plugin's, below it.
+/// The Summary's model-token line (contract v26): each endpoint's input and
+/// output tokens summed over the people and clients it worked for, those
+/// in its title; none where it reported none.
+pub(crate) fn model_tokens_line(counts: &[meridian_pb::v1::ModelTokenCount]) -> String {
+    if counts.is_empty() {
+        return String::new();
+    }
+    let mut by_endpoint: std::collections::BTreeMap<&str, (u64, u64, Vec<String>)> =
+        std::collections::BTreeMap::new();
+    for count in counts {
+        let held = by_endpoint.entry(count.endpoint.as_str()).or_default();
+        held.0 += count.input_tokens;
+        held.1 += count.output_tokens;
+        held.2.push(format!(
+            "{} via {}: {} in, {} out",
+            count.subject,
+            if count.client_name.is_empty() {
+                "no client"
+            } else {
+                &count.client_name
+            },
+            meridian_domain::thousands(count.input_tokens),
+            meridian_domain::thousands(count.output_tokens)
+        ));
+    }
+    let said: Vec<String> = by_endpoint
+        .iter()
+        .map(|(endpoint, (input, output, each))| {
+            format!(
+                "<span title=\"{}\">{}: {} in, {} out</span>",
+                escape(&each.join("; ")),
+                escape(endpoint),
+                meridian_domain::thousands(*input),
+                meridian_domain::thousands(*output)
+            )
+        })
+        .collect();
+    format!(
+        "<dt>Model tokens</dt><dd data-model-tokens>{}</dd>",
+        said.join(", ")
+    )
+}
+
 pub(crate) fn summary_tab(manage: &Manage) -> String {
     let state = crate::health::state(manage.report, manage.now);
     let (badge, why) = view::state_badge(&state, "status-note");
@@ -1427,6 +1489,15 @@ pub(crate) fn summary_tab(manage: &Manage) -> String {
         manage.report.map(|report| report.contract_version.as_str()),
         "not said",
     );
+    // The model tokens it reported using since it started (W4.5, W4.8,
+    // contract v26): per endpoint, in and out, each person and client in
+    // its title. Counts, never a prompt or an answer.
+    let tokens = model_tokens_line(
+        manage
+            .report
+            .map(|r| r.model_tokens.as_slice())
+            .unwrap_or_default(),
+    );
     let figures = crate::figures::section(manage.report, manage.now);
     // Its raw records, storage's and the archive's, and its moves (W6.9,
     // contract v16), for a plugin at the edge keeping them.
@@ -1450,7 +1521,7 @@ pub(crate) fn summary_tab(manage: &Manage) -> String {
     let status = format!(
         "<section class=\"panel padded\" id=\"status\"><div class=\"row\"><h2>Status</h2>{badge}</div>{why}\
          <dl class=\"facts\"><dt>Version</dt><dd data-version>{version}</dd>\
-         <dt>Contract</dt><dd data-contract>{contract}</dd>{stopped}{seen}</dl>{warnings}\
+         <dt>Contract</dt><dd data-contract>{contract}</dd>{stopped}{seen}{tokens}</dl>{warnings}\
          <p class=\"reserved\" data-reserved=\"lifecycle\">Restarting it, moving it to another version and \
          holding it at one will be here. They are not built yet.</p></section>{figures}"
     );
@@ -2420,7 +2491,50 @@ async fn instrument_page(
         Err(why) => return status_page(StatusCode::NOT_FOUND, "No such record", &why),
     };
     let done = field(&query, "done");
-    let mut body = instruments::record_page(&item, &versions, None, &token_input(&session));
+    // Contract v26 (W6.9, W3.30): the groups it is a member of, as they
+    // stood at the date asked, and their members' records for the bounds.
+    let as_of = field(&query, "as_of").to_string();
+    let groups = event_groups::list(
+        &app.bus,
+        &session.subject,
+        meridian_domain::v1::ListEventGroupsRequest {
+            instrument_ids: vec![instrument.clone()],
+            as_of_ns: event_groups::as_of_ns(&as_of),
+            page_size: 20,
+            ..Default::default()
+        },
+    )
+    .await
+    .map(|reply| reply.event_groups)
+    .unwrap_or_default();
+    let mut members = HashMap::new();
+    for member in groups
+        .iter()
+        .flat_map(|group| group.member_instrument_ids.iter())
+        .take(event_groups::MOST_MEMBERS)
+    {
+        if members.contains_key(member) {
+            continue;
+        }
+        if let Ok(listed) = instruments::list(&app.bus, member).await {
+            if let Some(record) = listed
+                .instruments
+                .into_iter()
+                .next()
+                .and_then(|i| i.instrument)
+            {
+                members.insert(member.clone(), record);
+            }
+        }
+    }
+    let groups_section = event_groups::section(&instrument, &groups, &members, &as_of);
+    let mut body = instruments::record_page(
+        &item,
+        &versions,
+        None,
+        &token_input(&session),
+        &groups_section,
+    );
     if !done.is_empty() {
         body = format!("<p class=\"passed\">{}</p>{body}", escape(done));
     }
@@ -2633,7 +2747,7 @@ async fn ask_the_platform(
     let (item, versions) = one_record(&app, &instrument)
         .await
         .unwrap_or((item, Vec::new()));
-    let body = instruments::record_page(&item, &versions, Some(&asked), &token_input(&session));
+    let body = instruments::record_page(&item, &versions, Some(&asked), &token_input(&session), "");
     Html(page_with(
         &instrument,
         &body,
@@ -2776,7 +2890,8 @@ fn level_posted(
         )
     })?;
     let eyes = !field(fields, "second_pair_of_eyes").is_empty();
-    if let Some(why) = crate::prepared::levels::refused(level, eyes, line.preparable) {
+    if let Some(why) = crate::prepared::levels::refused_for(&line.act, level, eyes, line.preparable)
+    {
         return Err(why);
     }
     let note = field(fields, "note").to_string();
@@ -3203,6 +3318,118 @@ async fn set_local_record_orders(
 
 /// The escape hatch's act on the surface (W6.20, contract v24).
 const SET_LOCAL_RECORD_ORDERS_TOOL: &str = "dashboard__set_local_record_orders";
+
+/// W6.35 (contract v26): the deployment's time zone set, a deployment
+/// admin's, with a reason; or prepared for someone to make. The conductor
+/// checks the ID and keeps each change its own record.
+async fn set_deployment_time_zone(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Form(fields): Form<Fields>,
+) -> Response {
+    let back = "/admin#time-zone";
+    let (session, _) = match gate(&app, &headers, true) {
+        Ok(gated) => gated,
+        Err(response) => return *response,
+    };
+    if let Err(response) = form_token_matches(&session, &fields) {
+        return *response;
+    }
+    let zone = field(&fields, "deployment_time_zone").trim().to_string();
+    let note = field(&fields, "note").trim().to_string();
+    if note.is_empty() {
+        return not_done("say why the time zone changes", back);
+    }
+    let posted = prepare_or_gate(
+        &app,
+        &session,
+        &fields,
+        SET_DEPLOYMENT_TIME_ZONE_TOOL,
+        || Ok(serde_json::json!({"deployment_time_zone": zone, "note": note})),
+    )
+    .await;
+    if let Some(response) = posted_to(posted, back) {
+        return response;
+    }
+    let outcome = app
+        .bus
+        .call_for(
+            time_zone::SET_DEPLOYMENT_TIME_ZONE,
+            "meridian.v1.SetDeploymentTimeZoneRequest",
+            meridian_domain::v1::SetDeploymentTimeZoneRequest {
+                deployment_time_zone: zone.clone(),
+                reason: note.clone(),
+            }
+            .encode_to_vec(),
+            None,
+            Some(Duration::from_secs(10)),
+            &session.subject,
+        )
+        .await
+        .map(|_| ())
+        .map_err(said_of_refusal);
+    after_to(outcome, "/admin?done=Time+zone+set#time-zone", back)
+}
+
+/// The time zone's act on the surface (W6.35, contract v26).
+const SET_DEPLOYMENT_TIME_ZONE_TOOL: &str = "dashboard__set_deployment_time_zone";
+
+/// W12.6 (contract v26): a model id routed, a deployment admin's, with a
+/// reason; or prepared for someone to make. The conductor checks the
+/// implementation and keeps each change its own record.
+async fn set_model_routing(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Form(fields): Form<Fields>,
+) -> Response {
+    let back = "/admin#model-routing";
+    let (session, _) = match gate(&app, &headers, true) {
+        Ok(gated) => gated,
+        Err(response) => return *response,
+    };
+    if let Err(response) = form_token_matches(&session, &fields) {
+        return *response;
+    }
+    let model_id = field(&fields, "model_id").trim().to_string();
+    let implementation = field(&fields, "implementation").trim().to_string();
+    let note = field(&fields, "note").trim().to_string();
+    if note.is_empty() {
+        return not_done("say why the model id is routed", back);
+    }
+    let posted = prepare_or_gate(&app, &session, &fields, SET_MODEL_ROUTING_TOOL, || {
+        Ok(serde_json::json!({
+            "model_id": model_id,
+            "implementation": implementation,
+            "note": note,
+        }))
+    })
+    .await;
+    if let Some(response) = posted_to(posted, back) {
+        return response;
+    }
+    let outcome = app
+        .bus
+        .call_for(
+            model_routing::SET_MODEL_ROUTING,
+            "meridian.v1.SetModelRoutingRequest",
+            meridian_domain::v1::SetModelRoutingRequest {
+                model_id: model_id.clone(),
+                implementation: implementation.clone(),
+                reason: note.clone(),
+            }
+            .encode_to_vec(),
+            None,
+            Some(Duration::from_secs(10)),
+            &session.subject,
+        )
+        .await
+        .map(|_| ())
+        .map_err(said_of_refusal);
+    after_to(outcome, "/admin?done=Model+routed#model-routing", back)
+}
+
+/// The routing's act on the surface (W12.6, contract v26).
+const SET_MODEL_ROUTING_TOOL: &str = "dashboard__set_model_routing";
 
 /// W3.28 (contract v24): "Report identifier usage", a deployment admin's,
 /// with a reason; or prepared for someone to make.

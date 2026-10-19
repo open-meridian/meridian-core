@@ -83,13 +83,28 @@ impl Store for MemoryStore {
             }
             return Ok(Acted::Duplicate(state.replies[entry_id].clone()));
         }
-        let book = state
+        let mut book = state
             .books
             .get(account_id)
             .cloned()
             .unwrap_or_else(|| Book::new(account_id, first_partition_of(account_id)));
         let head = state.heads.get(&book.partition).copied().unwrap_or(0);
-        let decided = decide(&book, head)?;
+        // The book holds no entry's body, as a store's never does (contract
+        // v26, W9.10): each one a decision asks for is read from the journal,
+        // so every test drives the bodies-on-demand path.
+        let journal = state.journals.get(account_id);
+        let decided = crate::store::with_bodies(
+            &mut book,
+            |_, ids| {
+                Ok(journal
+                    .into_iter()
+                    .flatten()
+                    .filter(|entry| ids.contains(&entry.entry_id))
+                    .map(|entry| (entry.entry_id.clone(), entry.body.clone()))
+                    .collect())
+            },
+            |book| decide(book, head),
+        )?;
         let entry = decided.entry.clone();
         // Every act any test makes holds the snapshot to the full replay
         // (contract v25, W9.10): the book before it, through a snapshot's
@@ -121,9 +136,9 @@ impl Store for MemoryStore {
             .entry(account_id.to_string())
             .or_default()
             .push(entry);
-        state
-            .books
-            .insert(account_id.to_string(), decided.book.clone());
+        let mut kept = decided.book.clone();
+        kept.release_bodies();
+        state.books.insert(account_id.to_string(), kept);
         Ok(Acted::Committed(Box::new(decided)))
     }
 

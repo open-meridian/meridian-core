@@ -140,6 +140,15 @@ pub(crate) fn opening_on(
         return None;
     }
     let accounts: Levels = held.accounts;
+    let routes = crate::admin::connectivity::routes(
+        records,
+        instance,
+        &account.service_account_id,
+        &meridian_access::user_groups_of(records, &account.service_account_id, &[])
+            .into_iter()
+            .map(|group| group.user_group_id.clone())
+            .collect(),
+    );
     Some(crate::plugins::Opening {
         access: accounts.clone(),
         roles: vec![RoleSession {
@@ -150,16 +159,10 @@ pub(crate) fn opening_on(
         deployment_admin: false,
         level: AccessLevel::Write,
         // The connectivity plugins it may route through (contract v22): by
-        // its SA- ID, and the user groups whose logins list it.
-        connectivity_instance_ids: crate::admin::connectivity::routes(
-            records,
-            instance,
-            &account.service_account_id,
-            &meridian_access::user_groups_of(records, &account.service_account_id, &[])
-                .into_iter()
-                .map(|group| group.user_group_id.clone())
-                .collect(),
-        ),
+        // its SA- ID, and the user groups whose logins list it; and those of
+        // them demo (contract v26, W11.8).
+        demo_connectivity_instance_ids: crate::admin::connectivity::demo_routes(records, &routes),
+        connectivity_instance_ids: routes,
     })
 }
 

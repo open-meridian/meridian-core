@@ -1802,6 +1802,7 @@ mod tests {
                 instrument_id: String::new(),
             }),
             closes_at_ns: 1_793_548_800_000_000_000,
+            ..Default::default()
         };
         let done = one(
             &store,

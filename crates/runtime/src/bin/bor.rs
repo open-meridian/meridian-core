@@ -92,7 +92,7 @@ fn run() -> Result<(), String> {
     }
 
     let ready = Ready::from_env();
-    let store: Arc<dyn meridian_bor::Store> = Arc::new(wait_for_store(
+    let postgres: Arc<PostgresStore> = Arc::new(wait_for_store(
         "the book's database",
         &url,
         |url| {
@@ -107,6 +107,7 @@ fn run() -> Result<(), String> {
             })
         },
     )?);
+    let store: Arc<dyn meridian_bor::Store> = postgres.clone();
 
     let instance_id = var("MERIDIAN_INSTANCE_ID").unwrap_or_else(|| "bor-1".into());
 
@@ -114,6 +115,14 @@ fn run() -> Result<(), String> {
         let bus = bus_from_env(&instance_id).await?;
 
         meridian_bor::service::serve(bus.clone(), Arc::clone(&store), clock());
+        // The start's snapshots (v26; W9.10): every account whose journal
+        // since its latest snapshot of this format reaches the interval --
+        // a quiet one, or one upgraded from an older format -- kept now, off
+        // the runtime's threads, while the book serves.
+        tokio::task::spawn_blocking(move || match postgres.backfill_snapshots(None) {
+            Ok(kept) => tracing::info!(kept, "the book's snapshots are taken where due"),
+            Err(failed) => tracing::warn!(%failed, "the book's start-up snapshots stopped"),
+        });
         // Each currency's cash instrument (contract v18): the codes held
         // before resolved once and said to be filled in.
         // Read from the store, which blocks: off the runtime's own threads.
@@ -181,10 +190,35 @@ fn run() -> Result<(), String> {
             Ok(Err(why)) => tracing::warn!(why, "the escape hatch's default could not be recorded"),
             Err(failed) => tracing::warn!(%failed, "the escape hatch's backfill failed"),
         }
+        // Contract v26 (W11.38, decisions/031): the agents' guard recorded
+        // on at the upgrade, once.
+        let backfilling = bus.clone();
+        let held = Arc::clone(&store);
+        match tokio::task::spawn_blocking(move || {
+            meridian_bor::booking_service::backfill_agent_orders_demo_only(
+                &backfilling,
+                held.as_ref(),
+            )
+        })
+        .await
+        {
+            Ok(Ok(true)) => tracing::info!("agents may place orders on demo connections only"),
+            Ok(Ok(false)) => {}
+            Ok(Err(why)) => tracing::warn!(why, "the agents' guard could not be recorded"),
+            Err(failed) => tracing::warn!(%failed, "the agents' guard's backfill failed"),
+        }
         tokio::spawn(meridian_bor::booking_service::sweep_forever(
             bus.clone(),
             Arc::clone(&store),
             meridian_bor::booking_service::SWEEP_EVERY,
+        ));
+
+        // Contract v26 (W11.34): the affirmation deadline and the
+        // deployment's time zone, read from the conductor now and again, for
+        // a held booking's due_by.
+        tokio::spawn(meridian_bor::deadline::follow_forever(
+            bus.clone(),
+            meridian_bor::deadline::READ_EVERY,
         ));
 
         // W5.20, said on the bus for the instrument store to carry outward.

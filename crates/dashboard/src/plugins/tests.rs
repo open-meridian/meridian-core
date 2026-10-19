@@ -2466,6 +2466,7 @@ fn where_no_frame_can_hold_a_session_the_page_opens_in_a_window_of_its_own() {
 fn the_assertion_names_the_delegation_a_person_came_through() {
     let opening = || Opening {
         connectivity_instance_ids: Default::default(),
+        demo_connectivity_instance_ids: Default::default(),
         access: meridian_access::Levels::default(),
         roles: vec![],
         deployment_admin: false,
@@ -2655,7 +2656,8 @@ async fn a_reader_reads_the_documentation_tab_and_a_stopped_instance_keeps_its_o
     );
     assert!(body.contains("[image not shown: pixel]") && !body.contains("evil.example"));
     assert!(body.contains("(docs.snaptrade.com)"), "{body}");
-    assert!(body.contains("Local and community plugins are unsupervised."));
+    // Ruling 274: no notice beside the documentation.
+    assert!(!body.contains("not an endorsement") && !body.contains("nsupervised"));
     let reference = get(
         &h.app,
         DASHBOARD,
@@ -2742,16 +2744,30 @@ async fn a_deployment_admin_reads_a_versions_documentation_before_launching_it()
     )
     .await;
     assert_eq!(listed.status, StatusCode::OK, "{}", listed.body);
+    // Ruling 305: one row a plugin, its name opening its Versions, where
+    // each version opens its documentation.
     assert!(
         listed.body.contains(
-            "<a href=\"/admin/plugins/versions/snaptrade/0.1.0/documentation\">snaptrade</a>"
+            "<a href=\"/admin/plugins/versions/snaptrade\" title=\"snaptrade\">snaptrade</a>"
         ),
         "{}",
         listed.body
     );
-    assert!(listed
-        .body
-        .contains("Naming a plugin here is not an endorsement"));
+    let versions = get(
+        &h.app,
+        DASHBOARD,
+        "/admin/plugins/versions/snaptrade",
+        &[dashboard_cookie(&h)],
+    )
+    .await;
+    assert!(
+        versions.body.contains(
+            "<a href=\"/admin/plugins/versions/snaptrade/0.1.0/documentation\">0.1.0</a>"
+        ),
+        "{}",
+        versions.body
+    );
+    assert!(!listed.body.contains("not an endorsement"));
     let page = get(
         &h.app,
         DASHBOARD,
@@ -2847,6 +2863,11 @@ fn serving_registries(h: &Harness) -> Asked {
             signer_fingerprint: "SHA256:tagkey".into(),
             ..Default::default()
         }),
+        // v25's follow-up: its sections' texts in the catalogue's copy.
+        documentation: vec![meridian_domain::v1::DocumentationText {
+            section: "overview".into(),
+            markdown: format!("Reads the holdings of the brokerage accounts, version {v}.\n"),
+        }],
         ..Default::default()
     };
     keep(
@@ -2944,13 +2965,25 @@ async fn a_deployment_admin_browses_installs_and_keeps_from_the_plugins_page() {
     // Installed: the source registry, the update offered and the pull.
     let installed = get(&h.app, DASHBOARD, "/admin/plugins/versions", &cookie).await;
     assert_eq!(installed.status, StatusCode::OK, "{}", installed.body);
-    for said in [
-        "Community · Unsupervised",
-        "Update to 1.5.0",
-        "Pulled: a breach of the Platform Terms",
-        "Naming a plugin here is not an endorsement",
-    ] {
+    for said in ["1.5.0", "Pulled"] {
         assert!(installed.body.contains(said), "{said}: {}", installed.body);
+    }
+    assert!(!installed.body.contains("not an endorsement"));
+    assert!(!installed.body.contains("nsupervised"));
+    // The plugin's Versions: the update offered, the source registry, the pull.
+    let versions = get(
+        &h.app,
+        DASHBOARD,
+        "/admin/plugins/versions/open-meridian%2Fsnaptrade",
+        &cookie,
+    )
+    .await;
+    for said in [
+        "<span class=\"pill\">Community</span>",
+        "Update snaptrade-1 to 1.5.0",
+        "Pulled: a breach of the Platform Terms",
+    ] {
+        assert!(versions.body.contains(said), "{said}: {}", versions.body);
     }
     // Browse: one line a listing, its counts as words below three.
     let browse = get(
@@ -2967,8 +3000,8 @@ async fn a_deployment_admin_browses_installs_and_keeps_from_the_plugins_page() {
         "{}",
         browse.body
     );
-    assert!(browse.body.contains("Fewer than three deployments"));
-    // The listing's page: the notice in full, the build, the vendor's words.
+    assert!(browse.body.contains("&lt;3"), "{}", browse.body);
+    // The listing's page: the build, the vendor's words; no notice.
     let page = get(
         &h.app,
         DASHBOARD,
@@ -2976,12 +3009,7 @@ async fn a_deployment_admin_browses_installs_and_keeps_from_the_plugins_page() {
         &cookie,
     )
     .await;
-    assert!(
-        page.body
-            .contains("Local and community plugins are unsupervised."),
-        "{}",
-        page.body
-    );
+    assert!(!page.body.contains("not an endorsement"), "{}", page.body);
     assert!(page.body.contains("SHA256:tagkey") && page.body.contains("Stated by its vendor"));
     let docs = get(
         &h.app,
@@ -2994,10 +3022,17 @@ async fn a_deployment_admin_browses_installs_and_keeps_from_the_plugins_page() {
         .to_str()
         .unwrap()
         .contains("script-src 'self' 'sha256-"));
-    // The install sheet: the notice first, in full and alone, as its own
-    // step with Continue (ruling 194); then the form, with the usage
-    // setting and the floor.
-    let notice = get(
+    // Its sections' texts as the catalogue carries them, before install.
+    assert!(
+        docs.body
+            .contains("Reads the holdings of the brokerage accounts")
+            && docs.body.contains("data-listed-documentation"),
+        "{}",
+        docs.body
+    );
+    // The install sheet (ruling 274): the form at once, its one line
+    // linking the Terms, with the usage setting and the floor.
+    let sheet = get(
         &h.app,
         DASHBOARD,
         "/admin/plugins/registry/open-meridian/snaptrade/install?version=1.5.0&registry=community",
@@ -3005,24 +3040,14 @@ async fn a_deployment_admin_browses_installs_and_keeps_from_the_plugins_page() {
     )
     .await;
     assert!(
-        notice.body.contains(&crate::notice::html())
-            && notice.body.contains("data-continue")
-            && !notice
+        sheet.body.contains(&crate::notice::line())
+            && sheet
                 .body
-                .contains("action=\"/admin/plugins/registry/install\""),
+                .contains("action=\"/admin/plugins/registry/install\"")
+            && !sheet.body.contains("data-continue"),
         "{}",
-        notice.body
+        sheet.body
     );
-    assert!(notice.body.contains(
-        "href=\"/admin/plugins/registry/open-meridian/snaptrade/install?version=1.5.0&amp;registry=community&amp;step=form\""
-    ));
-    let sheet = get(
-        &h.app,
-        DASHBOARD,
-        "/admin/plugins/registry/open-meridian/snaptrade/install?version=1.5.0&registry=community&step=form",
-        &cookie,
-    )
-    .await;
     assert!(
         sheet.body.contains("Install open-meridian/snaptrade 1.5.0"),
         "{}",
@@ -3033,13 +3058,13 @@ async fn a_deployment_admin_browses_installs_and_keeps_from_the_plugins_page() {
             && sheet.body.contains("<dt>Usage report</dt><dd>on")
     );
     let token = form_token(&sheet.body);
-    // Posted without passing through the notice: refused, nothing sent.
+    // Posted from no dialog: refused, nothing sent.
     let skipped = post_form_as(&h.app, "/admin/plugins/registry/install", &cookie,
         &format!("form_token={token}&listing=open-meridian%2Fsnaptrade&version=1.5.0&registry=community&note=Newer")).await;
     assert!(skipped.headers["location"]
         .to_str()
         .unwrap()
-        .contains("failed=the+notice+comes+first"));
+        .contains("failed=open+the+install+or+update+dialog+again"));
     assert!(asked
         .lock()
         .unwrap()

@@ -218,8 +218,10 @@ bor:
   mallocArenaMax: 2
   # How many entries an account's journal grows by between snapshots of its
   # book (contract v25, W9.10): a command or a dated read replays the journal
-  # from the latest snapshot, never from the account's first entry. The
-  # default is from core's replay benchmark; 10 to 100000.
+  # from the latest snapshot, never from the account's first entry. One is
+  # taken when a command or (from v26) a read replays this many, and at the
+  # book's start for every account past it with none current. The default is
+  # from core's replay benchmark; 10 to 100000.
   snapshotInterval: 1000
 
 # The lake (W10, contract v18). One replica: every batch takes its dataset's
@@ -234,6 +236,45 @@ lake:
   database:
     existingSecret: ""
     key: ""
+
+# The analytics component (contract v26, W12): a coordinator and a pool of
+# workers, its own image from the same commit, its own credential.
+# Stateless, so either scales by its replica count; the coordinator answers
+# jobs and computes a unit too large to send, the workers compute the rest.
+# One of each by default (the v26 plan's question 245), sized from v26's
+# first benchmark (crates/analytics-engine/BENCHMARK.md): a 500-position
+# account's 500-day VaR and ES reads, hashes and computes in about a quarter
+# of a second on one core, and its inputs (25 MB written out) are held
+# while it runs; a 1,000-account batch holds about ten times that.
+analytics:
+  image:
+    # Empty is image.repository's, named meridian-analytics where it names
+    # meridian-runtime: ghcr.io/open-meridian/meridian-analytics beside the
+    # published runtime, meridian-analytics:local beside a local build.
+    repository: ""
+    tag: ""
+  coordinator:
+    replicaCount: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        memory: 2Gi
+  worker:
+    replicaCount: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        memory: 2Gi
+  # How long a job may take and still be answered in the reply; past it the
+  # job finishes later and its client is told (the one-API spec's Q5).
+  inlineMs: 2000
+  # How long a routed pricing plugin has to answer a batch before the
+  # figures through it are not evaluated (W12.3, requirement 22).
+  priceDeadlineMs: 5000
 
 # Installed for development (spec/live-plugin-development, ruling 2): it may
 # run plugin code as it is being written, which nobody has reviewed, and every
@@ -332,6 +373,7 @@ broker:
   streetKey: street
   borKey: bor
   lakeKey: lake
+  analyticsKey: analytics
 
 # What first run writes, and what reads it. These are Secret names rather than
 # values: the wizard fills them in the cluster, and the chart names them so
@@ -396,8 +438,15 @@ registry:
 # an ECDSA P-256 public key as PEM. Empty, nothing is installed from a
 # registry: the Browse tab says the deployment reaches none. The release
 # fills them; an install changes them only to follow a published rotation.
+# v26: the platform's current key (SHA-256 of its PEM 69c1961a...), the
+# registry's signing key at open-meridian.com.
 registries:
-  platformKeys: []
+  platformKeys:
+    - |
+      -----BEGIN PUBLIC KEY-----
+      MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEYM0/p11OyeOPd/Wxgpt0yNiY74kY
+      CavdxXGp4OQ2EJvgQBJfLQm4DG2uWK3eIlP1NBy1ez3L7tuAnvT8TiIWeg==
+      -----END PUBLIC KEY-----
 
 # What launches the plugins a deployment admin uploads and approves (W8.3),
 # creating each a Deployment in the chart's plugin shape and nothing else

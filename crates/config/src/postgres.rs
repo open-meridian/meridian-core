@@ -2121,6 +2121,91 @@ impl Store for PostgresStore {
             .transpose()
     }
 
+    fn set_deployment_time_zone(&self, zone: &str, author: &Author, at_ns: i64) -> Result<()> {
+        self.conn()?
+            .execute(
+                "INSERT INTO config_time_zone_change
+                        (deployment_time_zone, changed_by, through_delegation, client_name,
+                         prepared_call_id, changed_at_ns, note)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                &[
+                    &zone,
+                    &author.by,
+                    &author.delegation,
+                    &author.client,
+                    &author.prepared_call_id,
+                    &at_ns,
+                    &author.note,
+                ],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
+    fn set_model_routing(
+        &self,
+        model_id: &str,
+        implementation: &str,
+        author: &Author,
+        at_ns: i64,
+    ) -> Result<()> {
+        self.conn()?
+            .execute(
+                "INSERT INTO config_model_routing_change
+                        (model_id, implementation, changed_by, through_delegation, client_name,
+                         prepared_call_id, changed_at_ns, note)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                &[
+                    &model_id,
+                    &implementation,
+                    &author.by,
+                    &author.delegation,
+                    &author.client,
+                    &author.prepared_call_id,
+                    &at_ns,
+                    &author.note,
+                ],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
+    fn model_routing_changes(&self) -> Result<Vec<crate::store::ModelRoutingChange>> {
+        Ok(self
+            .conn()?
+            .query(
+                "SELECT model_id, implementation, changed_at_ns, changed_by, note
+                   FROM config_model_routing_change ORDER BY change_id",
+                &[],
+            )
+            .map_err(unavailable)?
+            .into_iter()
+            .map(|row| crate::store::ModelRoutingChange {
+                model_id: row.get(0),
+                implementation: row.get(1),
+                changed_at_ns: row.get(2),
+                changed_by: row.get(3),
+                note: row.get(4),
+            })
+            .collect())
+    }
+
+    fn deployment_time_zone(&self) -> Result<Option<crate::store::TimeZoneChange>> {
+        Ok(self
+            .conn()?
+            .query_opt(
+                "SELECT deployment_time_zone, changed_at_ns, changed_by FROM config_time_zone_change
+                  ORDER BY change_id DESC LIMIT 1",
+                &[],
+            )
+            .map_err(unavailable)?
+            .map(|row| crate::store::TimeZoneChange {
+                zone: row.get(0),
+                changed_at_ns: row.get(1),
+                changed_by: row.get(2),
+            }))
+    }
+
     fn set_reports_usage(&self, reports_usage: bool, author: &Author, at_ns: i64) -> Result<()> {
         self.conn()?
             .execute(
@@ -2221,7 +2306,7 @@ impl Store for PostgresStore {
         let Some(row) = self
             .conn()?
             .query_opt(
-                "SELECT listings, sequence, key_status, pulled_at_ns
+                "SELECT listings, sequence, key_status, pulled_at_ns, pull_status
                    FROM config_registry_catalogue WHERE id = 1",
                 &[],
             )
@@ -2237,6 +2322,7 @@ impl Store for PostgresStore {
             sequence: u64::try_from(row.get::<_, i64>(1)).unwrap_or_default(),
             key_status: row.get(2),
             pulled_at_ns: row.get(3),
+            pull_status: row.get(4),
         }))
     }
 
@@ -2249,15 +2335,17 @@ impl Store for PostgresStore {
         .encode_to_vec();
         self.conn()?
             .execute(
-                "INSERT INTO config_registry_catalogue (id, listings, sequence, key_status, pulled_at_ns)
-                 VALUES (1, $1, $2, $3, $4)
+                "INSERT INTO config_registry_catalogue
+                        (id, listings, sequence, key_status, pulled_at_ns, pull_status)
+                 VALUES (1, $1, $2, $3, $4, $5)
                  ON CONFLICT (id) DO UPDATE SET listings = $1, sequence = $2, key_status = $3,
-                        pulled_at_ns = $4",
+                        pulled_at_ns = $4, pull_status = $5",
                 &[
                     &listings,
                     &i64::try_from(held.sequence).unwrap_or(i64::MAX),
                     &held.key_status,
                     &held.pulled_at_ns,
+                    &held.pull_status,
                 ],
             )
             .map_err(unavailable)?;

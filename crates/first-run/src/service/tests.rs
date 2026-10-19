@@ -289,6 +289,7 @@ async fn applying_writes_the_named_things_and_then_gives_up_the_rights() {
     let seen = cluster as Box<dyn Cluster>;
     let run = first_run(seen, vec![]);
     let configuration = FirstRunConfiguration {
+        deployment_time_zone: String::new(),
         administrator: Some(administrator("meridian-admins")),
         runtime_database: Some(database(&run)),
         login_backend: Some(LoginBackendAnswer {
@@ -337,6 +338,7 @@ async fn applying_writes_the_named_things_and_then_gives_up_the_rights() {
 async fn a_failed_step_keeps_the_rights_and_says_where_it_stopped() {
     let run = first_run(Box::new(Refusing("restart")), vec![]);
     let configuration = FirstRunConfiguration {
+        deployment_time_zone: String::new(),
         administrator: Some(administrator("meridian-admins")),
         runtime_database: Some(database(&run)),
         login_backend: Some(LoginBackendAnswer {
@@ -364,6 +366,7 @@ async fn a_failed_step_keeps_the_rights_and_says_where_it_stopped() {
 async fn the_firms_own_directory_leaves_the_bundle_at_zero() {
     let run = first_run(Box::new(Remembering::default()), vec![]);
     let configuration = FirstRunConfiguration {
+        deployment_time_zone: String::new(),
         administrator: Some(administrator("meridian-admins")),
         runtime_database: Some(database(&run)),
         login_backend: Some(LoginBackendAnswer {
@@ -456,6 +459,7 @@ async fn the_addresses_are_written_as_the_components_read_them() {
         provider_probe: Box::new(Providers::default()),
     };
     let configuration = FirstRunConfiguration {
+        deployment_time_zone: String::new(),
         administrator: Some(administrator("meridian-admins")),
         runtime_database: Some(database(&run)),
         login_backend: Some(LoginBackendAnswer {
@@ -504,6 +508,7 @@ async fn the_firms_own_issuer_reaches_the_secret_the_dashboard_reads() {
     let (cluster, done) = watched();
     let run = first_run(Box::new(cluster), vec![]);
     let configuration = FirstRunConfiguration {
+        deployment_time_zone: String::new(),
         administrator: Some(administrator("meridian-admins")),
         runtime_database: Some(database(&run)),
         login_backend: Some(firms_own_directory("")),
@@ -537,6 +542,7 @@ async fn the_groups_claim_is_written_only_when_the_wizard_was_told_one() {
         let (cluster, done) = watched();
         let run = first_run(Box::new(cluster), vec![]);
         let configuration = FirstRunConfiguration {
+            deployment_time_zone: String::new(),
             administrator: Some(administrator("meridian-admins")),
             runtime_database: Some(database(&run)),
             login_backend: Some(firms_own_directory(given)),
@@ -572,6 +578,7 @@ async fn the_first_administrators_account_is_written_where_the_dashboard_will_fi
     let (cluster, done) = watched();
     let run = first_run(Box::new(cluster), vec![]);
     let configuration = FirstRunConfiguration {
+        deployment_time_zone: "Europe/London".into(),
         administrator: Some(AdministratorAnswer {
             named: Some(Named::LocalAccountLogin("ada".into())),
         }),
@@ -622,6 +629,9 @@ async fn the_first_administrators_account_is_written_where_the_dashboard_will_fi
     // And the switch, without which the dashboard read none of it: on a
     // cluster it came back up in first run, serving its wizard again.
     assert!(addresses.contains("local-accounts"), "{addresses}");
+    // W7.5 (contract v26): the zone, for the conductor to record naming
+    // the administrator.
+    assert!(addresses.contains("deployment-time-zone"), "{addresses}");
 }
 
 #[tokio::test]
@@ -634,6 +644,7 @@ async fn the_firms_ldap_connection_reaches_the_dashboard_not_only_its_password()
     let (cluster, done) = watched();
     let run = first_run(Box::new(cluster), vec![]);
     let configuration = FirstRunConfiguration {
+        deployment_time_zone: String::new(),
         administrator: Some(administrator("meridian-admins")),
         runtime_database: Some(database(&run)),
         login_backend: Some(LoginBackendAnswer {
@@ -837,6 +848,7 @@ async fn a_local_account_with_no_password_is_refused_at_test_and_at_apply() {
     let (cluster, done) = watched();
     let run = first_run(Box::new(cluster), vec![]);
     let configuration = FirstRunConfiguration {
+        deployment_time_zone: String::new(),
         administrator: Some(AdministratorAnswer {
             named: Some(Named::LocalAccountLogin("ada".into())),
         }),
@@ -922,6 +934,7 @@ async fn trusted_audiences_reach_the_key_the_chart_reads_them_from() {
         oidc.trusted_audiences = vec!["project-8812".into(), " ".into()];
     }
     let configuration = FirstRunConfiguration {
+        deployment_time_zone: String::new(),
         administrator: Some(administrator("meridian-admins")),
         runtime_database: Some(database(&run)),
         login_backend: Some(backend),
@@ -952,6 +965,7 @@ async fn start_tls_reaches_the_dashboard_only_when_it_was_asked_for() {
             ldap.start_tls = asked;
         }
         let configuration = FirstRunConfiguration {
+            deployment_time_zone: String::new(),
             administrator: Some(administrator("meridian-admins")),
             runtime_database: Some(database(&run)),
             login_backend: Some(backend),

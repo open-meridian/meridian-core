@@ -41,6 +41,9 @@ needed?" So, in headless Chromium:
 - a secret's field (2026-10-10): who set it and when, or "Not set", in the
   field itself; no badge and no box; a Remove beside an optional secret
   alone, which asks first, declined sending nothing and confirmed removing it.
+- the Model routing tab (contract v26, W12.6): each model id on one line,
+  its implementation and since when, and its Change dialog, at 375, 582 and
+  1280 wide;
 - the Service accounts tab (contract v21): one line an account behind the
   kit's pager, its dialog within the viewport, one created from it prepare
   only by default; and the Access tab's Runs as, one line a role, nobody
@@ -119,6 +122,14 @@ def fits(browser, name, url, prefix):
             label = f"{name}{group or ''} at {size}"
             problems = page.evaluate(FIT)
             check(not problems, f"{label} fits one screen{': ' + '; '.join(problems) if problems else ''}")
+            # A field's tags stay whole beside a long label: the label gives
+            # way, ellipsised with its title, never a chip (v26).
+            clipped = page.evaluate("""() => [...document.querySelectorAll('.setting-head')]
+              .filter(h => h.offsetParent !== null)
+              .flatMap(h => [...h.querySelectorAll('.badge')].filter(b => b.offsetParent !== null)
+                .filter(b => b.getBoundingClientRect().right > h.getBoundingClientRect().right + 1)
+                .map(b => b.textContent))""")
+            check(not clipped, f"{label} keeps every field's tags whole: {clipped}")
             shot = f"{prefix}-{name}{('-' + group[1:]) if group else ''}-{size}.png"
             page.screenshot(path=os.path.join(OUT, shot))
         # A commercial key brings two more required fields into view.
@@ -1036,7 +1047,7 @@ def the_documentation_pages(browser, prefix):
         ("docs-reference-settings", tab + "&section=reference&part=settings", "Consumer key"),
         ("docs-reference-tools", tab + "&section=reference&part=tools", "read_connection_0"),
         # The first rows: the kit's pager shows as many as fit.
-        ("versions", f"{BASE}/admin/plugins/versions", "0.0.0"),
+        ("versions", f"{BASE}/admin/plugins/versions", "0.13.0"),
         ("version-page", f"{BASE}/admin/plugins/versions/snaptrade/0.13.0/documentation"
                          "?section=troubleshooting", "A connection needs sign-in"),
     ]
@@ -1058,8 +1069,8 @@ def the_documentation_pages(browser, prefix):
                           f"{name} at {size} is under the documentation's policy: {policy}")
                     check(page.locator("article.docs-vendor script, article.docs-vendor img").count() == 0,
                           f"{name} at {size} draws no script or image of the vendor's")
-                    check("Naming a plugin here is not an endorsement" in page.content(),
-                          f"{name} at {size} carries the supervision notice")
+                    check("not an endorsement" not in page.content(),
+                          f"{name} at {size} carries no notice (ruling 274)")
                 m = page.evaluate(MEASURE)
                 measured(page, f"{name} at {size}, {scheme}", f"v25-{prefix}-{name}-{size}-{scheme}.png")
                 check(m["tall"] <= 0, f"{name} at {size}, {scheme} fits one screen: {m['tall']}px taller")
@@ -1070,23 +1081,25 @@ def the_documentation_pages(browser, prefix):
 def the_registry_pages(browser, prefix):
     """Contract v25 (W8.10 to W8.12, W5.19): the Plugins page's Installed,
     Browse and Registries tabs, a listing's Overview, Documentation and
-    Versions, and the install, update and keep-or-stop sheets -- the install
-    and update sheets' notice their own first step (ruling 194) -- each on one
-    screen at the three sizes, in light and dark, with no sideways scroll."""
+    Versions, a plugin's Versions (ruling 305), and the install, update and
+    keep-or-stop sheets -- the install and update sheets the form at once,
+    with one line linking the Terms (ruling 274) -- each on one screen at the
+    three sizes, in light and dark, with no sideways scroll."""
     plugins = f"{BASE}/admin/plugins/versions?tab="
     listing = f"{BASE}/admin/plugins/registry/open-meridian/fx?tab="
     pages = [
-        ("installed", plugins + "installed", "0.0.0"),
-        ("browse", plugins + "browse", "open-meridian/fx"),
+        ("installed", plugins + "installed", "0.13.0"),
+        ("browse", plugins + "browse", "Open Meridian"),
         ("registries", plugins + "registries", "Report plugin usage"),
         ("listing-overview", listing + "overview", "open-meridian/fx"),
         ("listing-documentation", listing + "documentation", "open-meridian/fx"),
         ("listing-versions", listing + "versions", "1.5.0"),
-        # Ruling 194: the notice whole as each sheet's first step, then the form.
-        ("install-notice", f"{BASE}/admin/plugins/registry/open-meridian/fx/install?version=1.5.0", "Continue"),
-        ("install-sheet", f"{BASE}/admin/plugins/registry/open-meridian/fx/install?version=1.5.0&step=form", "1.5.0"),
-        ("update-notice", f"{BASE}/admin/plugins/registry/update?instance=fx-1&version=1.5.0", "Continue"),
-        ("update-sheet", f"{BASE}/admin/plugins/registry/update?instance=fx-1&version=1.5.0&step=form", "operations"),
+        ("plugin-versions", f"{BASE}/admin/plugins/versions/open-meridian%2Ffx", "Version"),
+        ("bundle-versions", f"{BASE}/admin/plugins/versions/acme%2Frates", "Version"),
+        ("semver-versions", f"{BASE}/admin/plugins/versions/snaptrade", "0.13.0"),
+        # Ruling 274: each sheet the form at once, its one line the Terms'.
+        ("install-sheet", f"{BASE}/admin/plugins/registry/open-meridian/fx/install?version=1.5.0", "1.5.0"),
+        ("update-sheet", f"{BASE}/admin/plugins/registry/update?instance=fx-1&version=1.5.0", "operations"),
         ("keep-or-stop-sheet", f"{BASE}/admin/plugins/registry/acknowledge?instance=fx-1", "fx-1"),
     ]
     for scheme in ("light", "dark"):
@@ -1100,26 +1113,118 @@ def the_registry_pages(browser, prefix):
                 settled(page)
                 text = page.evaluate("() => document.body.textContent")
                 check(says in text, f"{name} at {size}, {scheme} says {says!r}")
-                if name in ("installed", "browse", "listing-overview", "install-sheet"):
-                    check("Naming a plugin here is not an endorsement" in text,
-                          f"{name} at {size}, {scheme} carries the supervision notice")
-                if name.endswith("-notice"):
-                    whole = page.locator("section.notice-step section.notice.supervision")
-                    check(whole.count() == 1 and whole.is_visible()
-                          and "Whoever installs one carries its risk." in whole.inner_text(),
-                          f"{name} at {size}, {scheme} shows the notice whole, not folded")
-                    check(page.locator("form.sheet-act").count() == 0,
-                          f"{name} at {size}, {scheme} has no form before Continue")
+                check("not an endorsement" not in text and "nsupervised" not in text,
+                      f"{name} at {size}, {scheme} carries no notice (ruling 274)")
+                if name.endswith("-sheet") and name != "keep-or-stop-sheet":
+                    line = page.locator("[data-terms-line] a[href='https://open-meridian.com/terms#plugins-and-registries']")
+                    check(line.count() == 1 and line.is_visible(),
+                          f"{name} at {size}, {scheme} keeps the one line linking the Terms")
+                if name in ("installed", "browse"):
+                    check(page.locator("form.filter-bar input[type=search]").count() == 1,
+                          f"{name} at {size}, {scheme} has one search box")
+                    bar = page.evaluate("""() => { const f = document.querySelector('form.filter-bar');
+                        const tops = [...f.children].filter(c => c.type !== 'hidden')
+                          .map(c => c.getBoundingClientRect().top).sort((x, y) => x - y);
+                        let lines = 0, last = -1e9;
+                        for (const top of tops) { if (top - last > 8) { lines += 1; last = top; } }
+                        return lines; }""")
+                    check(bar == 1 if width >= 640 else bar <= 3,
+                          f"{name} at {size}, {scheme} draws its filter bar on {bar} line(s)")
                 if name == "installed":
                     check(page.locator("[data-pulled]").count() == 1,
-                          f"at {size}, {scheme} the pulled version's instance is warned")
+                          f"at {size}, {scheme} the pulled version's plugin is warned")
+                if name == "plugin-versions":
+                    check(page.locator("[data-pulled]").count() >= 1,
+                          f"at {size}, {scheme} the pulled version is warned on its row")
+                if name == "bundle-versions":
                     check("keys as of 2026-10-14" in text,
                           f"at {size}, {scheme} a bundle's version shows its key status's age")
+                if name == "semver-versions":
+                    order = page.evaluate("() => [...document.querySelectorAll('tr[data-version]')].map(r => r.dataset.version)")
+                    check(order[:5] == ["0.13.0", "0.12.0", "0.11.0", "0.10.0", "0.9.0"],
+                          f"at {size}, {scheme} versions are newest first by SemVer: {order[:6]}")
                 m = page.evaluate(MEASURE)
                 measured(page, f"{name} at {size}, {scheme}", f"v25-{prefix}-registry-{name}-{size}-{scheme}.png")
                 check(m["tall"] <= 0, f"{name} at {size}, {scheme} fits one screen: {m['tall']}px taller")
             check(not errors, f"the registry pages at {size}, {scheme} ran without an error: {errors}")
             ctx.close()
+
+
+def the_portal_overview(browser, prefix):
+    """v25's follow-up: a plugin's Overview in the admin portal -- its health,
+    what it needs, its records -- on one screen at the three sizes, with no
+    sideways scroll."""
+    for size, width, height in V24_SIZES:
+        ctx = context(browser, width, height)
+        page = ctx.new_page()
+        errors = []
+        page.on("pageerror", lambda e: errors.append(str(e)))
+        page.goto(PORTAL + "overview")
+        settled(page)
+        problems = measured(page, f"portal overview at {size}", f"v26-{prefix}-portal-overview-{size}.png")
+        m = page.evaluate(MEASURE)
+        check(m["tall"] <= 0 and not problems,
+              f"the portal's Overview at {size} fits one screen: {m['tall']}px taller; {problems}")
+        check(not errors, f"the portal's Overview at {size} ran without a script error: {errors}")
+        ctx.close()
+
+
+def the_time_zone_tab(browser, prefix):
+    """Contract v26 (W6.35): the Settings' Time zone tab -- the zone in
+    force, who set it, the deadline a held booking is due by -- and its
+    Change dialog, each on one screen at the three sizes with no sideways
+    scroll."""
+    for size, width, height in V24_SIZES:
+        ctx = context(browser, width, height)
+        page = ctx.new_page()
+        errors = []
+        page.on("pageerror", lambda e: errors.append(str(e)))
+        page.goto(ADMIN_PAGE + "#time-zone")
+        settled(page)
+        said = page.inner_text("#time-zone")
+        check("America/Chicago" in said and "21:00" in said and "operations-1" in said,
+              f"at {size} the Time zone tab says the zone, the deadline and who declares it: {said[:200]!r}")
+        m = page.evaluate(MEASURE)
+        measured(page, f"time-zone at {size}", f"v26-{prefix}-time-zone-{size}.png")
+        check(m["tall"] <= 0, f"the Time zone tab at {size} fits one screen: {m['tall']}px taller")
+        page.click("#time-zone button[data-dialog-open=time-zone-change]")
+        page.wait_for_timeout(300)
+        boxed = inside_the_viewport(page)
+        check(not boxed, f"at {size} the time zone's dialog stays within the viewport{': ' + boxed if boxed else ''}")
+        page.screenshot(path=os.path.join(OUT, f"v26-{prefix}-time-zone-dialog-{size}.png"))
+        check(not errors, f"the Time zone tab at {size} ran without a script error: {errors}")
+        ctx.close()
+
+
+def the_model_routing_tab(browser, prefix):
+    """Contract v26 (W12.6): the Settings' Model routing tab -- each model
+    id on one line, its implementation and since when, the measures the
+    analytics component serves -- and its Change dialog, each on one screen
+    at the three sizes with no sideways scroll."""
+    for size, width, height in V24_SIZES:
+        ctx = context(browser, width, height)
+        page = ctx.new_page()
+        errors = []
+        page.on("pageerror", lambda e: errors.append(str(e)))
+        page.goto(ADMIN_PAGE + "#model-routing")
+        settled(page)
+        models = page.eval_on_selector_all("#model-routing [data-model-id]", "ds => ds.map(d => d.dataset.modelId)")
+        check(models == ["cash", "quoted_price", "binary_event"],
+              f"at {size} the Model routing tab gives each model id a line: {models}")
+        said = page.inner_text("#model-routing")
+        check("sample-pricing-with-a-long-instance-name-1" in said and "never routed" in said
+              and "historical_var v1" in said,
+              f"at {size} it says each implementation, since when, and the measures served: {said[:240]!r}")
+        m = page.evaluate(MEASURE)
+        measured(page, f"model-routing at {size}", f"v26-{prefix}-model-routing-{size}.png")
+        check(m["tall"] <= 0, f"the Model routing tab at {size} fits one screen: {m['tall']}px taller")
+        page.click("#model-routing button[data-dialog-open=model-routing-change]")
+        page.wait_for_timeout(300)
+        boxed = inside_the_viewport(page)
+        check(not boxed, f"at {size} the routing's dialog stays within the viewport{': ' + boxed if boxed else ''}")
+        page.screenshot(path=os.path.join(OUT, f"v26-{prefix}-model-routing-dialog-{size}.png"))
+        check(not errors, f"the Model routing tab at {size} ran without a script error: {errors}")
+        ctx.close()
 
 
 def the_v24_pages(browser, prefix):
@@ -1280,6 +1385,9 @@ with sync_playwright() as playwright:
     the_v25_pages(browser, prefix)
     the_documentation_pages(browser, prefix)
     the_registry_pages(browser, prefix)
+    the_time_zone_tab(browser, prefix)
+    the_model_routing_tab(browser, prefix)
+    the_portal_overview(browser, prefix)
     browser.close()
 
 if failures:

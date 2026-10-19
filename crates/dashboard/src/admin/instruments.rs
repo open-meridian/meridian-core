@@ -671,6 +671,15 @@ pub fn completion(filled: &Filled) -> Result<CompleteInstrumentsRequest, String>
                 instrument_id,
             }),
             closes_at_ns: utc_of_field(&filled.contract_closes)?,
+            // A range market's bounds are its template's fields, from the
+            // venue (contract v26, W1.24): the form keeps those held.
+            ..instrument_type::contract_from_text(&filled.contract_held)
+                .map(|held| meridian_domain::v1::BinaryEventContract {
+                    payout: None,
+                    closes_at_ns: 0,
+                    ..held
+                })
+                .unwrap_or_default()
         };
         if instrument_type::contract_to_text(&contract) != filled.contract_held {
             if filled.contract_source.trim().is_empty() {
@@ -1643,6 +1652,7 @@ pub fn record_page(
     versions: &[InstrumentVersion],
     asked: Option<&Result<AskPlatformForInstrumentReply, String>>,
     token: &str,
+    event_groups: &str,
 ) -> String {
     let record = item.instrument.clone().unwrap_or_default();
     let id = escape(&record.instrument_id);
@@ -2097,19 +2107,25 @@ pub fn record_page(
          <button type=\"submit\">Ask the platform</button></form></div>{asked_html}\
          <nav class=\"tabs\"><a href=\"#says\" data-tab=\"says\">What it says</a>\
          <a href=\"#complete-it\" data-tab=\"complete-it\">Complete it</a>\
-         <a href=\"#history\" data-tab=\"history\">History</a></nav>\
+         <a href=\"#history\" data-tab=\"history\">History</a>{groups_tab}</nav>\
          <section class=\"admin-section\" id=\"says\"><div class=\"section-head\"><div><h2>What it says</h2></div></div>{values}</section>\
          <section class=\"admin-section\" id=\"complete-it\"><div class=\"section-head\"><div><h2>Complete it</h2>\
          <p class=\"hint\">Each value says where it came from. A value offered is filled in with its \
          source; change the value and say where the new one came from.</p></div></div>{form}</section>\
          <section class=\"admin-section\" id=\"history\"><div class=\"section-head\"><div><h2>History</h2></div></div>\
          <om-pager><table class=\"list one-line\"><thead><tr><th>Version</th><th>What</th><th>Changes</th><th class=\"wide\">Who</th>\
-         <th class=\"wide\">Note</th></tr></thead><tbody>{history}</tbody></table></om-pager></section></div>\
+         <th class=\"wide\">Note</th></tr></thead><tbody>{history}</tbody></table></om-pager></section>{event_groups}</div>\
          <script>{}{}{}{FORM_SCRIPT}</script>",
         super::overview::SCRIPT_START,
         super::overview::SCRIPT_END,
         super::data_sources::PAGER_SCRIPT,
         version = record.version,
+        // Contract v26 (W6.9, W3.30): a member of an event group's tab.
+        groups_tab = if event_groups.is_empty() {
+            ""
+        } else {
+            "<a href=\"#event-groups\" data-tab=\"event-groups\">Event groups</a>"
+        },
         book = if item.complete_for_book {
             "The book can use it."
         } else {
@@ -2324,7 +2340,7 @@ mod tests {
 
     #[test]
     fn a_funds_attributes_go_with_their_source_none_fee_included_and_round_trip() {
-        let page = record_page(&waiting(), &[], None, "");
+        let page = record_page(&waiting(), &[], None, "", "");
         assert!(page.contains("name=\"fund_source\""), "{page}");
         assert!(page.contains("name=\"fund_liquidity_fee\""), "{page}");
         assert!(page.contains(&format!(
@@ -2342,7 +2358,7 @@ mod tests {
                 liquidity_fee: LiquidityFeeRegime::None as i32,
             });
         }
-        let held_page = record_page(&holding, &[], None, "");
+        let held_page = record_page(&holding, &[], None, "", "");
         assert!(
             held_page.contains("government, retail, stable NAV, no liquidity fee"),
             "{held_page}"
@@ -2420,7 +2436,7 @@ mod tests {
 
     #[test]
     fn a_records_page_prefills_what_is_offered_with_its_source() {
-        let page = record_page(&waiting(), &[], None, "");
+        let page = record_page(&waiting(), &[], None, "", "");
         assert!(page.contains(&format!(
             "<option value=\"{}\" selected>Equity</option>",
             AssetClass::Equity as i32
@@ -2442,7 +2458,7 @@ mod tests {
 
     #[test]
     fn fields_gated_on_a_choice_are_read_only_with_it_and_a_contract_goes_with_its_terms() {
-        let page = record_page(&waiting(), &[], None, "");
+        let page = record_page(&waiting(), &[], None, "", "");
         assert!(
             page.contains("data-om-applies-when=\"instrument_type\""),
             "{page}"
@@ -2507,7 +2523,7 @@ mod tests {
             });
             record.identifiers[0].valid_from_ns = 5;
         }
-        let page = record_page(&item, &[], None, "");
+        let page = record_page(&item, &[], None, "", "");
         assert!(page.contains("Ended by the platform"), "{page}");
         assert!(page.contains("left 2026-11-01 00:00 UTC"), "{page}");
         let end = serde_json::json!({

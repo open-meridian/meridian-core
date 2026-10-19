@@ -154,6 +154,7 @@ impl Plugins {
             digest: &request.image_digest,
             key_status: &request.key_status,
             listing_statement: &request.listing_statement,
+            pull_status: &request.pull_status,
         }))?;
         let attested = fetched.version.metadata.clone().unwrap_or_default();
         if request

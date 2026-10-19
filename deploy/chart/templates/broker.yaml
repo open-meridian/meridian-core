@@ -30,7 +30,8 @@
   instrument store holds its own (contract v20): it reads the plugin
   catalogue by its own column in the contract, not the runtime's.
 */}}
-{{- $users := list "runtime" "instrument" }}
+{{- /* The analytics component holds its own too (contract v26, W12). */}}
+{{- $users := list "runtime" "instrument" "analytics" }}
 {{- if .Values.dashboard.enabled }}
 {{- $users = append $users (.Values.dashboard.brokerKey | default .Values.dashboard.instanceId) }}
 {{- $users = append $users .Values.firstRun.brokerKey }}

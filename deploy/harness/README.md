@@ -15,7 +15,12 @@ a slow or absent master mints nothing. From contract v22 it also holds seed
 settlement calendars and the US equities rule, the XNYS and XNAS venue
 records, and one test equity, Apple Inc., answered by its FIGI with XNAS as
 its listing venue, so a record asked of it (`instrument --ask-platform`) can be given a
-settlement date. Every other record is the deployment's
+settlement date. From contract v26 it mints binary event contracts by their
+venue's symbol -- sent as `ticker`, its source the venue's MIC (Kalshi's
+KLSH) or, for a venue with none, its `VEN-` ID (Polymarket's) -- holds those
+two venues, matches or mints their event groups (`EVG-`), and its template
+catalogue carries v26's versions with their calculation packages, so the
+prediction plugins' e2e runs here. Every other record is the deployment's
 own (contract v10), so every other row a plugin records names a record the
 deployment minted, completed by the
 runner as a deployment admin does at the dashboard's Instruments page; its dashboard runs with `MERIDIAN_DEVELOPMENT`,
@@ -33,7 +38,7 @@ same tag. The runtime image carries none of it.
 
 | File | What it is |
 |---|---|
-| `compose.yaml` | The deployment: `keys`, which draws the run's keys and passwords; Postgres; NATS configured for the plugins and their roles, and from contract v18 their datasets, written again on `entitle`; the stores migrated; street, the book (`bor`), the lake, instrument, conductor and a development dashboard; the `runner`; and `store` |
+| `compose.yaml` | The deployment: `keys`, which draws the run's keys and passwords; Postgres; NATS configured for the plugins and their roles, and from contract v18 their datasets, written again on `entitle`; the stores migrated; street, the book (`bor`), the lake, instrument, conductor, the analytics component (from contract v26) and a development dashboard; the `runner`; and `store` |
 | `harness.py` | The runner, standard library only: `ready`, `settings`, `hold`, `archive`, `summary`, `account`, `page`, `form`, `unlinked`, `grant`, `instruments`, `instrument`, `mcp`, `ticket`, `inbox`, `licence`, `entitle`, `priority`; and `compose`, which writes the plugins' half of the deployment |
 | `street.sql` | The street store as stable, sorted lines, which `store street` prints |
 | `book.sql` | The book of record as stable, sorted lines (contract v8), which `store book` prints |

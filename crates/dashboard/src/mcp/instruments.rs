@@ -67,6 +67,17 @@ pub static SPECS: &[Spec] = &[
         area: Area::Instruments,
         input_schema: history_schema,
     },
+    // Contract v26 (W6.9, W3.30): an event group's members, flags and
+    // bounds, as an instrument page's Event groups tab draws them.
+    Spec {
+        name: "list_event_groups",
+        title: "List event groups",
+        description: "the event groups a venue states its event contracts in (W3.30): for the instruments or the groups named, each group's ID (EVG- from the platform, LCL- the deployment's own while provisional), venue and venue reference, title, members by instrument ID, whether its members are mutually exclusive and exhaustive as stated (yes, no or not stated, never read as no), its version and when it took effect; as it stood at as_of_ns (0 now), or every version after after_sequence. Paged by cursor. A member's bounds are on its record (read_instrument).",
+        reads: true,
+        open_world: false,
+        area: Area::Instruments,
+        input_schema: event_groups_schema,
+    },
     Spec {
         name: "complete_instruments",
         title: "Complete instrument records",
@@ -247,6 +258,21 @@ fn list_schema() -> Value {
             "page_size": {"type": "integer", "minimum": 1, "maximum": 500},
             "include_complete": {"type": "boolean", "description": "complete records as well"},
             "provisional": {"type": "boolean", "description": "the provisional records alone, complete or not, each with why it is provisional (contract v24)"},
+        },
+        "additionalProperties": false,
+    })
+}
+
+fn event_groups_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "instrument_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 500},
+            "event_group_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 500},
+            "as_of_ns": {"type": "string", "description": "nanoseconds since the epoch, a decimal string; 0 or absent for now"},
+            "after_sequence": {"type": "integer", "minimum": 0},
+            "page_size": {"type": "integer", "minimum": 1, "maximum": 500},
+            "cursor": {"type": "string"},
         },
         "additionalProperties": false,
     })
@@ -703,7 +729,12 @@ fn value(
         }
         "binary_event_contract" => {
             let terms = object_fields(held, &at, problems)?;
-            only(terms, &["payout", "closes_at_ns"], &at, problems);
+            only(
+                terms,
+                &["payout", "closes_at_ns", "floor", "cap", "bound_unit"],
+                &at,
+                problems,
+            );
             let payout_at = join(&at, "payout");
             let payout = match terms.get("payout") {
                 Some(said) => object_fields(said, &payout_at, problems)?,
@@ -735,6 +766,12 @@ fn value(
                     instrument_id: text(payout, "instrument_id", &payout_at, false, problems),
                 }),
                 closes_at_ns: integer(terms, "closes_at_ns", &at, false, problems),
+                // A range market's bounds (contract v26, W1.24), each a
+                // value as text and whether it is inclusive; either may be
+                // absent, for an open tail.
+                floor: bound_of(terms, "floor", &at, problems),
+                cap: bound_of(terms, "cap", &at, problems),
+                bound_unit: text(terms, "bound_unit", &at, false, problems),
             })
         }
         "currency" => match held.as_str() {
@@ -775,6 +812,39 @@ fn value(
         value: Some(inner),
         source,
     })
+}
+
+/// A range market's bound as a tool's input spells it (contract v26):
+/// `{"value": "70", "inclusive": true}`, or `None` where it is absent.
+fn bound_of(
+    terms: &Map<String, Value>,
+    name: &str,
+    path: &str,
+    problems: &mut Problems,
+) -> Option<meridian_domain::v1::EventContractBound> {
+    let at = join(path, name);
+    let said = terms.get(name).filter(|said| !said.is_null())?;
+    let bound = object_fields(said, &at, problems)?;
+    only(bound, &["value", "inclusive"], &at, problems);
+    let value_said = text(bound, "value", &at, true, problems);
+    let value = match value_said.parse::<meridian_domain::exact::Exact>() {
+        Ok(value) => Some(value.to_wire()),
+        Err(_) => {
+            if !value_said.is_empty() {
+                problems.add(&join(&at, "value"), "a decimal, as text");
+            }
+            None
+        }
+    };
+    let inclusive = match bound.get("inclusive") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(inclusive)) => *inclusive,
+        Some(_) => {
+            problems.add(&join(&at, "inclusive"), "true or false");
+            false
+        }
+    };
+    Some(meridian_domain::v1::EventContractBound { value, inclusive })
 }
 
 fn object_fields<'a>(
@@ -1144,6 +1214,7 @@ pub async fn call(app: &App, caller: &Caller, spec: &Spec, arguments: Value) -> 
     match spec.name {
         "list_instruments_to_complete" => list(app, caller, &arguments).await,
         "read_instrument" => read(app, caller, &arguments).await,
+        "list_event_groups" => list_event_groups(app, caller, &arguments).await,
         "read_instrument_history" => history(app, caller, &arguments).await,
         "complete_instruments" => match completions(&arguments) {
             Ok(request) => complete(app, caller, request).await,
@@ -1315,6 +1386,79 @@ async fn read(app: &App, caller: &Caller, arguments: &Value) -> Value {
             vec![json!({"path": "instrument_id"})],
         ),
         Ok(Some(item)) => json!({"outcome": "unchanged", "data": to_complete_json(&item)}),
+    }
+}
+
+/// W3.30 (contract v26): ListEventGroups, as the instrument page's tab.
+async fn list_event_groups(app: &App, caller: &Caller, arguments: &Value) -> Value {
+    let mut problems = Problems::default();
+    let Some(top) = object(arguments, "", &mut problems) else {
+        return problems.refusal();
+    };
+    only(
+        top,
+        &[
+            "instrument_ids",
+            "event_group_ids",
+            "as_of_ns",
+            "after_sequence",
+            "page_size",
+            "cursor",
+        ],
+        "",
+        &mut problems,
+    );
+    let instrument_ids = ids(top, "instrument_ids", &mut problems);
+    let event_group_ids = ids(top, "event_group_ids", &mut problems);
+    let as_of_ns = stamp_ns(top, "as_of_ns", "", false, &mut problems);
+    let after_sequence = integer(top, "after_sequence", "", false, &mut problems);
+    if after_sequence < 0 {
+        problems.add("after_sequence", "from 0");
+    }
+    let page_size = integer(top, "page_size", "", false, &mut problems);
+    if !(0..=500).contains(&page_size) {
+        problems.add("page_size", "from 1 to 500");
+    }
+    let cursor = text(top, "cursor", "", false, &mut problems);
+    if !problems.is_empty() {
+        return problems.refusal();
+    }
+    let reply: Result<meridian_domain::v1::ListEventGroupsReply, _> = ask(
+        app,
+        caller,
+        crate::admin::event_groups::LIST_EVENT_GROUPS,
+        "meridian.v1.ListEventGroupsRequest",
+        meridian_domain::v1::ListEventGroupsRequest {
+            instrument_ids,
+            event_group_ids,
+            as_of_ns,
+            after_sequence,
+            page_size: page_size as i32,
+            cursor,
+        },
+        WAIT,
+    )
+    .await;
+    match reply {
+        Err(failed) => bus_refused(failed, ""),
+        Ok(reply) => json!({"outcome": "unchanged", "data": {
+            "event_groups": reply.event_groups.iter().map(|group| json!({
+                "event_group_id": group.event_group_id,
+                "venue_id": group.venue_id,
+                "venue_event_ref": group.venue_event_ref,
+                "title": super::others_words(&group.title),
+                "member_instrument_ids": group.member_instrument_ids,
+                "mutually_exclusive": crate::admin::event_groups::flag_words(group.mutually_exclusive),
+                "exhaustive": crate::admin::event_groups::flag_words(group.exhaustive),
+                "series_id": group.series_id,
+                "version": group.version,
+                "valid_from_ns": group.valid_from_ns.to_string(),
+                "provisional": group.provisional,
+                "sequence": group.sequence,
+            })).collect::<Vec<_>>(),
+            "sequence": reply.sequence,
+            "next_cursor": reply.next_cursor,
+        }}),
     }
 }
 

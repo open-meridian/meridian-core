@@ -39,6 +39,10 @@ concurrency:
 
 env:
   IMAGE: ghcr.io/open-meridian/meridian-runtime
+  # The analytics component's image (contract v26, W12): Dockerfile's
+  # `analytics` stage, from the same build, pushed and tagged beside the
+  # runtime's, so the chart names both by one commit.
+  ANALYTICS: ghcr.io/open-meridian/meridian-analytics
 
 jobs:
   build:
@@ -108,22 +112,42 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.platform }}
           cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
 
+      # The analytics image from the same build stage and cache, so no
+      # second compile: its own stage, one binary.
+      - id: analytics
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: analytics
+          platforms: ${{ matrix.platform }}
+          build-args: MERIDIAN_VERSION=${{ steps.version.outputs.runtime }}
+          outputs: type=image,name=${{ env.ANALYTICS }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.platform }}
+
       - name: Keep the digest
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
+          ANALYTICS_DIGEST: ${{ steps.analytics.outputs.digest }}
         run: |
-          mkdir -p /tmp/digests
+          mkdir -p /tmp/digests /tmp/analytics-digests
           # Through an environment variable: the prefix has to come off in the
           # shell, and shell expansion cannot happen inside a GitHub expression.
           # Nor can a GitHub expression appear in a comment, even an empty one:
           # they are evaluated anywhere in the file, and an empty one fails the
           # whole workflow to parse. That is how this comment broke it once.
           touch "/tmp/digests/${DIGEST#sha256:}"
+          touch "/tmp/analytics-digests/${ANALYTICS_DIGEST#sha256:}"
 
       - uses: actions/upload-artifact@v4
         with:
           name: digest-${{ strategy.job-index }}
           path: /tmp/digests/*
+          retention-days: 1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: analytics-digest-${{ strategy.job-index }}
+          path: /tmp/analytics-digests/*
           retention-days: 1
 
   publish:
@@ -154,6 +178,12 @@ jobs:
         with:
           path: /tmp/digests
           pattern: digest-*
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/analytics-digests
+          pattern: analytics-digest-*
           merge-multiple: true
 
       - uses: docker/setup-buildx-action@v3
@@ -191,6 +221,27 @@ jobs:
         run: |
           set -euo pipefail
           found=$(docker buildx imagetools inspect "$IMAGE:$TAG" --raw \
+            | jq -r '.manifests[]?.platform.architecture' \
+            | grep -v '^unknown$' | sort -u)
+          echo "architectures: $(echo $found | tr '\n' ' ')"
+          echo "$found" | grep -qx amd64
+          echo "$found" | grep -qx arm64
+
+      # The analytics image, combined and tagged the same way.
+      - name: Combine the analytics image
+        working-directory: /tmp/analytics-digests
+        run: |
+          docker buildx imagetools create \
+            -t "$ANALYTICS:${{ steps.tag.outputs.sha }}" \
+            -t "$ANALYTICS:latest" \
+            $(printf "$ANALYTICS@sha256:%s " *)
+
+      - name: Check both architectures of the analytics image are there
+        env:
+          TAG: ${{ steps.tag.outputs.sha }}
+        run: |
+          set -euo pipefail
+          found=$(docker buildx imagetools inspect "$ANALYTICS:$TAG" --raw \
             | jq -r '.manifests[]?.platform.architecture' \
             | grep -v '^unknown$' | sort -u)
           echo "architectures: $(echo $found | tr '\n' ' ')"
@@ -421,6 +472,8 @@ jobs:
           # match came early enough -- more often as the chart grew.
           rendered="$(helm template check deploy/chart --set deployment.id=publish-check)"
           grep -q "image: \"$IMAGE:$SHA\"" <<<"$rendered"
+          # And the analytics component's, published beside it above.
+          grep -q "image: \"$ANALYTICS:$SHA\"" <<<"$rendered"
 
       - name: Package and push
         env:

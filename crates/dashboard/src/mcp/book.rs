@@ -32,6 +32,7 @@ use meridian_domain::v1::{
     ListTradingInstructionsRequest, LocalRecordOrdersSetting, SetAccountAttributeRequest,
     SetLocalRecordOrdersRequest, TradingInstructionReply, TradingInstructionTarget,
 };
+use meridian_domain::v1::{AgentOrdersDemoOnlySetting, SetAgentOrdersDemoOnlyRequest};
 
 const WAIT: Duration = Duration::from_secs(5);
 const CHANGING: Duration = Duration::from_secs(20);
@@ -146,6 +147,78 @@ record. Answers the setting and the count of live orders on local records, namin
         Area::Trading,
         local_record_orders_schema,
     ),
+    // Contract v26 (W11.38, W11.39): the agents' guard, its read and its
+    // set, a deployment admin's; the set preparable by an agent and made by
+    // a person alone.
+    spec(
+        "read_agent_orders_demo_only",
+        "Read whether agents' orders are kept to demo connections",
+        "the deployment's guard on agents' orders, \"Agents may place orders on demo connections \
+only\": on by default and at the upgrade, and not turned off in this version. While on, a \
+placement, or an accept of fills to a new order, made through a delegation or by a service \
+account on a connection that is not demo is refused (REFUSAL_REASON_AGENT_LIVE_ORDER) and \
+recorded; a person's own act, and one a person makes from an agent's prepared change, are not.",
+        true,
+        Area::Trading,
+        nothing_schema,
+    ),
+    spec(
+        "set_agent_orders_demo_only",
+        "Keep agents' orders to demo connections",
+        "set the deployment's guard on agents' orders with a note saying why, each change its own \
+record (W11.38). Off is refused in this version. A person's act: an agent may prepare it and \
+never make it, whatever any level says.",
+        false,
+        Area::Trading,
+        agent_orders_demo_only_schema,
+    ),
+    // Contract v26 (W6.35): the deployment's time zone, a deployment
+    // admin's; the set preparable, at may not for agents until loosened.
+    spec(
+        "read_deployment_time_zone",
+        "Read the deployment's time zone",
+        "the deployment's time zone, an IANA time-zone ID (America/New_York until set), its last \
+change and who made it, and the affirmation deadline the launched operations plugin declares, \
+minutes after local midnight, by which a held booking is due on its trade date in this zone \
+(0 where none declares one). It never moves a market's own cut, such as FX's 17:00 New York.",
+        true,
+        Area::Accounts,
+        nothing_schema,
+    ),
+    spec(
+        "set_deployment_time_zone",
+        "Set the deployment's time zone",
+        "set the deployment's time zone by its IANA time-zone ID, with a note saying why, each \
+change its own record (W6.35). An ID the time-zone database does not hold is refused naming \
+deployment_time_zone. Answers the setting as read_deployment_time_zone does.",
+        false,
+        Area::Accounts,
+        deployment_time_zone_schema,
+    ),
+    // Contract v26 (W12.6): the analytics routing table, a deployment
+    // admin's; the set preparable, at may not for agents until loosened.
+    spec(
+        "list_model_routing",
+        "List the model routing",
+        "which implementation prices each of v26's model ids (cash, quoted_price, binary_event) \
+across the deployment -- built-in, or a launched pricing plugin's instance -- each with since \
+when, who routed it and why, and the table's version, which every analytics answer's provenance \
+names.",
+        true,
+        Area::Accounts,
+        nothing_schema,
+    ),
+    spec(
+        "set_model_routing",
+        "Route a model id",
+        "route a model id to built-in or to a launched pricing plugin's instance, with a note \
+saying why, each change its own record (W12.6). An instance that is not a pricing plugin the \
+deployment runs is refused naming implementation. A routed plugin that does not answer leaves \
+the figures through it not evaluated. Answers the table as list_model_routing does.",
+        false,
+        Area::Accounts,
+        model_routing_schema,
+    ),
 ];
 
 /// A spec's whole description, as the surface lists it.
@@ -192,6 +265,43 @@ fn local_record_orders_schema() -> Value {
             "note": note(),
         },
         "required": ["allows_local_record_orders", "note"],
+        "additionalProperties": false,
+    })
+}
+
+fn agent_orders_demo_only_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "agent_orders_demo_only": {"type": "boolean", "description": "true; false is refused in this version"},
+            "note": note(),
+        },
+        "required": ["agent_orders_demo_only", "note"],
+        "additionalProperties": false,
+    })
+}
+
+fn deployment_time_zone_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "deployment_time_zone": {"type": "string", "minLength": 1, "maxLength": 64, "description": "an IANA time-zone ID: America/New_York, Europe/London, Asia/Tokyo"},
+            "note": note(),
+        },
+        "required": ["deployment_time_zone", "note"],
+        "additionalProperties": false,
+    })
+}
+
+fn model_routing_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "model_id": {"type": "string", "enum": ["cash", "quoted_price", "binary_event"]},
+            "implementation": {"type": "string", "minLength": 1, "maxLength": 128, "description": "built-in, or a launched pricing plugin's instance ID"},
+            "note": note(),
+        },
+        "required": ["model_id", "implementation", "note"],
         "additionalProperties": false,
     })
 }
@@ -256,6 +366,12 @@ pub async fn call(app: &App, caller: &Caller, spec: &Spec, arguments: Value) -> 
         "list_trading_instructions" => list_instructions(app, caller, &arguments).await,
         "set_trading_instruction" => set_instruction(app, caller, &arguments).await,
         "set_local_record_orders" => set_local_record_orders(app, caller, &arguments).await,
+        "read_agent_orders_demo_only" => read_agent_orders_demo_only(app, caller).await,
+        "set_agent_orders_demo_only" => set_agent_orders_demo_only(app, caller, &arguments).await,
+        "read_deployment_time_zone" => read_deployment_time_zone(app, caller).await,
+        "set_deployment_time_zone" => set_deployment_time_zone(app, caller, &arguments).await,
+        "list_model_routing" => list_model_routing(app, caller).await,
+        "set_model_routing" => set_model_routing(app, caller, &arguments).await,
         "close_account" => close_account(app, caller, &arguments).await,
         "read_book_health" => read_book_health(app, caller, &arguments).await,
         other => refused("not_listed", &format!("no tool {other}"), Vec::new()),
@@ -660,6 +776,232 @@ async fn set_local_record_orders(app: &App, caller: &Caller, arguments: &Value) 
     }
 }
 
+/// W11.39 (contract v26): the agents' guard read, a deployment admin's.
+async fn read_agent_orders_demo_only(app: &App, caller: &Caller) -> Value {
+    let (_, access) = match access_of(app, caller) {
+        Ok(held) => held,
+        Err(refusal) => return refusal,
+    };
+    if !access.deployment_admin {
+        return refused(
+            "not_permitted",
+            "the agents' guard is a deployment admin's to read",
+            Vec::new(),
+        );
+    }
+    match trading::read_agent_orders_demo_only(&app.bus).await {
+        Ok(setting) => {
+            json!({"outcome": "unchanged", "data": trading::agent_orders_demo_only_json(&setting)})
+        }
+        Err(failed) => refused("unavailable", &failed, Vec::new()),
+    }
+}
+
+/// W11.38 (contract v26): the agents' guard set, a deployment admin's own
+/// act; the book refuses it off, and refuses an agent's.
+async fn set_agent_orders_demo_only(app: &App, caller: &Caller, arguments: &Value) -> Value {
+    let mut problems = Problems::default();
+    let Some(top) = object(arguments, "", &mut problems) else {
+        return problems.refusal();
+    };
+    only(top, &["agent_orders_demo_only", "note"], "", &mut problems);
+    let on = match top.get("agent_orders_demo_only") {
+        Some(Value::Bool(on)) => *on,
+        None | Some(Value::Null) => {
+            problems.add("agent_orders_demo_only", "required");
+            true
+        }
+        Some(_) => {
+            problems.add("agent_orders_demo_only", "true or false");
+            true
+        }
+    };
+    if !on {
+        problems.add(
+            "agent_orders_demo_only",
+            "the guard cannot be turned off in this version",
+        );
+    }
+    let reason = text(top, "note", "", true, &mut problems);
+    if !problems.is_empty() {
+        return problems.refusal();
+    }
+    let (_, access) = match access_of(app, caller) {
+        Ok(held) => held,
+        Err(refusal) => return refusal,
+    };
+    if !access.deployment_admin {
+        return refused(
+            "not_permitted",
+            "the agents' guard is a deployment admin's",
+            Vec::new(),
+        );
+    }
+    let reply: Result<AgentOrdersDemoOnlySetting, _> = ask(
+        app,
+        caller,
+        trading::SET_AGENT_ORDERS_DEMO_ONLY,
+        "meridian.v1.SetAgentOrdersDemoOnlyRequest",
+        SetAgentOrdersDemoOnlyRequest {
+            agent_orders_demo_only: on,
+            reason,
+        },
+        CHANGING,
+    )
+    .await;
+    match reply {
+        Err(failed) => bus_refused(failed, ""),
+        Ok(reply) => {
+            json!({"outcome": "made", "data": trading::agent_orders_demo_only_json(&reply)})
+        }
+    }
+}
+
+/// W6.35 (contract v26): the deployment's time zone read, a deployment
+/// admin's.
+async fn read_deployment_time_zone(app: &App, caller: &Caller) -> Value {
+    let (_, access) = match access_of(app, caller) {
+        Ok(held) => held,
+        Err(refusal) => return refusal,
+    };
+    if !access.deployment_admin {
+        return refused(
+            "not_permitted",
+            "the deployment's time zone is a deployment admin's to read",
+            Vec::new(),
+        );
+    }
+    match crate::admin::time_zone::read(&app.bus).await {
+        Ok(setting) => {
+            json!({"outcome": "unchanged", "data": crate::admin::time_zone::json(&setting)})
+        }
+        Err(failed) => refused("unavailable", &failed, Vec::new()),
+    }
+}
+
+/// W6.35 (contract v26): the deployment's time zone set, a deployment
+/// admin's; the conductor checks the ID and keeps the change.
+async fn set_deployment_time_zone(app: &App, caller: &Caller, arguments: &Value) -> Value {
+    let mut problems = Problems::default();
+    let Some(top) = object(arguments, "", &mut problems) else {
+        return problems.refusal();
+    };
+    only(top, &["deployment_time_zone", "note"], "", &mut problems);
+    let zone = text(top, "deployment_time_zone", "", true, &mut problems);
+    if !zone.is_empty() && !meridian_domain::zones::is_zone(zone.trim()) {
+        problems.add(
+            "deployment_time_zone",
+            "an IANA time-zone ID, such as America/New_York",
+        );
+    }
+    let reason = text(top, "note", "", true, &mut problems);
+    if !problems.is_empty() {
+        return problems.refusal();
+    }
+    let (_, access) = match access_of(app, caller) {
+        Ok(held) => held,
+        Err(refusal) => return refusal,
+    };
+    if !access.deployment_admin {
+        return refused(
+            "not_permitted",
+            "the deployment's time zone is a deployment admin's",
+            Vec::new(),
+        );
+    }
+    let reply: Result<meridian_domain::v1::DeploymentTimeZoneSetting, _> = ask(
+        app,
+        caller,
+        crate::admin::time_zone::SET_DEPLOYMENT_TIME_ZONE,
+        "meridian.v1.SetDeploymentTimeZoneRequest",
+        meridian_domain::v1::SetDeploymentTimeZoneRequest {
+            deployment_time_zone: zone.trim().to_string(),
+            reason,
+        },
+        CHANGING,
+    )
+    .await;
+    match reply {
+        Err(failed) => bus_refused(failed, "deployment_time_zone"),
+        Ok(reply) => json!({"outcome": "made", "data": crate::admin::time_zone::json(&reply)}),
+    }
+}
+
+/// W12.6 (contract v26): the routing table read, a deployment admin's.
+async fn list_model_routing(app: &App, caller: &Caller) -> Value {
+    let (_, access) = match access_of(app, caller) {
+        Ok(held) => held,
+        Err(refusal) => return refusal,
+    };
+    if !access.deployment_admin {
+        return refused(
+            "not_permitted",
+            "the model routing is a deployment admin's to read",
+            Vec::new(),
+        );
+    }
+    match crate::admin::model_routing::read(&app.bus).await {
+        Ok(table) => {
+            json!({"outcome": "unchanged", "data": crate::admin::model_routing::json(&table)})
+        }
+        Err(failed) => refused("unavailable", &failed, Vec::new()),
+    }
+}
+
+/// W12.6 (contract v26): a model id routed, a deployment admin's; the
+/// conductor checks the implementation and keeps the change.
+async fn set_model_routing(app: &App, caller: &Caller, arguments: &Value) -> Value {
+    let mut problems = Problems::default();
+    let Some(top) = object(arguments, "", &mut problems) else {
+        return problems.refusal();
+    };
+    only(
+        top,
+        &["model_id", "implementation", "note"],
+        "",
+        &mut problems,
+    );
+    let model_id = text(top, "model_id", "", true, &mut problems);
+    if !model_id.is_empty()
+        && !["cash", "quoted_price", "binary_event"].contains(&model_id.as_str())
+    {
+        problems.add("model_id", "cash, quoted_price or binary_event");
+    }
+    let implementation = text(top, "implementation", "", true, &mut problems);
+    let reason = text(top, "note", "", true, &mut problems);
+    if !problems.is_empty() {
+        return problems.refusal();
+    }
+    let (_, access) = match access_of(app, caller) {
+        Ok(held) => held,
+        Err(refusal) => return refusal,
+    };
+    if !access.deployment_admin {
+        return refused(
+            "not_permitted",
+            "routing a model id is a deployment admin's",
+            Vec::new(),
+        );
+    }
+    let reply: Result<meridian_domain::v1::ListModelRoutingReply, _> = ask(
+        app,
+        caller,
+        crate::admin::model_routing::SET_MODEL_ROUTING,
+        "meridian.v1.SetModelRoutingRequest",
+        meridian_domain::v1::SetModelRoutingRequest {
+            model_id,
+            implementation: implementation.trim().to_string(),
+            reason,
+        },
+        CHANGING,
+    )
+    .await;
+    match reply {
+        Err(failed) => bus_refused(failed, "implementation"),
+        Ok(reply) => json!({"outcome": "made", "data": crate::admin::model_routing::json(&reply)}),
+    }
+}
+
 /// W6.3 (contract v24): an account closed, a deployment admin's. No tool
 /// sets a grant (W6.30), so "Unlink all and close" is refused while one
 /// stands, naming it: a person withdraws it at the page.
@@ -758,6 +1100,20 @@ pub const PARITY: &[(&str, &str)] = &[
     (
         "/admin/trading-instructions",
         "list_trading_instructions set_trading_instruction set_local_record_orders",
+    ),
+    // Contract v26 (W6.35): the Settings' Time zone tab and its form.
+    (
+        "tab time-zone",
+        "read_deployment_time_zone set_deployment_time_zone",
+    ),
+    ("/admin/time-zone", "set_deployment_time_zone"),
+    // Contract v26 (W12.6): the Settings' Model routing tab and its form.
+    ("tab model-routing", "list_model_routing set_model_routing"),
+    ("/admin/model-routing", "set_model_routing"),
+    // Contract v26 (W11.38, W11.39): the home page's line for the guard.
+    (
+        "/ agents' guard",
+        "read_agent_orders_demo_only set_agent_orders_demo_only",
     ),
 ];
 

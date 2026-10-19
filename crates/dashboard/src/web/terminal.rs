@@ -141,7 +141,7 @@ fn unavailable(unavailable: Unavailable) -> Box<Response> {
 }
 
 /// 401, naming why, and a sentence for a delegation's refusals, which an
-/// unsupervised client reports as what stopped it. A terminal session's
+/// agent acting without a person present reports as what stopped it. A terminal session's
 /// keeps the answer the CLIs that hold one already read.
 fn invalid_token(
     app: &App,

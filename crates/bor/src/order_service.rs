@@ -717,7 +717,10 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
                 &meridian_domain::money::codes(&request),
                 clock.now_ns(),
             );
-            let ctx = context_of(&envelope, clock.as_ref());
+            let mut ctx = context_of(&envelope, clock.as_ref());
+            // Contract v26 (W11.8, W11.38): the agents' guard in force.
+            ctx.agent_orders_demo_only =
+                crate::booking_service::agent_orders_demo_only(store.as_ref());
             let account = owner_of(store.as_ref(), Record::Order, &request.order_id)
                 .map_err(|f| f.on_the_bus())?;
             act(
@@ -1165,6 +1168,9 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
                 ctx.records = found.records;
             }
             ctx.local_record_orders = crate::booking_service::local_record_orders(store.as_ref());
+            // Contract v26 (W11.23, W11.38): the agents' guard in force.
+            ctx.agent_orders_demo_only =
+                crate::booking_service::agent_orders_demo_only(store.as_ref());
             act(
                 &bus2,
                 store.as_ref(),

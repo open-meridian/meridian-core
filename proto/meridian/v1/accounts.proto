@@ -119,8 +119,10 @@ message OrganisationRecord {
   // The organisation part of its listings (contract v25, W5.29): a
   // lower-case DNS label, at most 39 characters; editable until its first
   // publish, then fixed. `open-meridian` is reserved for first-party
-  // plugins. Empty until set.
-  string slug = 11;
+  // plugins. Empty until set. Named `slug` until contract v26 (ruling 260),
+  // the same field number, so a v25 reader decodes it unchanged; the
+  // platform accepts the JSON name `slug` as an alias for one release.
+  string namespace = 11;
 
   // Whether it may publish, and to which registries (W5.28), granted by
   // staff, each grant its own record.
@@ -162,30 +164,34 @@ message CheckOrganisationLeiRequest {
   string organisation_id = 1;
 }
 
-// Staff give the first party's slug, `open-meridian`, to the operating
-// company's organisation (W5.28); no other organisation may take it.
-message GiveFirstPartySlugRequest {
+// Staff give the first party's namespace, `open-meridian`, to the operating
+// company's organisation (W5.28); no other organisation may take it. Named
+// GiveFirstPartySlugRequest until contract v26 (ruling 260).
+message GiveFirstPartyNamespaceRequest {
   string organisation_id = 1;
   string note = 2;
 }
 
-// Staff set a slug aside as confusable with an existing one (W5.28), so no
-// organisation may take it.
-message SetAsideSlugRequest {
-  string slug = 1;
+// Staff set a namespace aside as confusable with an existing one (W5.28),
+// so no organisation may take it; its record `namespace_set_aside`. Named
+// SetAsideSlugRequest, its field `slug`, until contract v26 (ruling 260).
+message SetAsideNamespaceRequest {
+  string namespace = 1;
   string reason = 2;
 }
 
-message SetAsideSlugReply {
-  string slug = 1;
+message SetAsideNamespaceReply {
+  string namespace = 1;
   int64 set_aside_at_ns = 2;
 }
 
-// An Owner or Admin gives the organisation's slug (W5.29), until its first
-// publish.
-message SetOrganisationSlugRequest {
+// An Owner or Admin gives the organisation's namespace (W5.29), until its
+// first publish; its record `namespace_set`. Named
+// SetOrganisationSlugRequest, its field `slug`, until contract v26 (ruling
+// 260).
+message SetOrganisationNamespaceRequest {
   string organisation_id = 1;
-  string slug = 2;
+  string namespace = 2;
 }
 
 // An Owner or Admin gives what verified needs (W5.29): the LEI, and the
@@ -780,6 +786,11 @@ message PluginReport {
   // per installed registry version; it carries no other figure on.
   repeated uint64 daily_operations = 21;
   repeated uint64 daily_requests = 22;
+
+  // Contract v26 (W4.5, W4.8; item 191): the model tokens the plugin's last
+  // accepted heartbeat reported; shown on its Summary, never sent to the
+  // platform.
+  repeated ModelTokenCount model_tokens = 23;
 
   // A single role, before a plugin could hold several.
   reserved 2;

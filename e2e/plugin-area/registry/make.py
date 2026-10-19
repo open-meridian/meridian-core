@@ -23,6 +23,14 @@ harness's conductor is given as the chart's platform key. What it writes:
 - `oci/`: every manifest and blob by its digest's hex, each image's
   referrers (the provenance and the image's metadata, DSSE envelopes) and
   `index.json`: each manifest's media type and each image's referrers.
+  From v26 (found on the development deployment 2026-10-18) 1.3.0 and
+  1.4.0 carry bare envelopes, listed by the referrers API, as cosign's
+  `.att` did; 1.5.0, 1.6.0 and other-org's 1.0.0 carry them as the
+  platform's builder now does, each in a Sigstore bundle (cosign 2.5's
+  `--new-bundle-format`: an empty config, one layer holding the bundle,
+  its verificationMaterial naming a key that is not the platform's, which
+  core must never read), listed only under the referrers tag schema
+  (`sha256-<hex>`), the referrers API answering 404, as ghcr.io does.
 - `cases.json`: what the run names -- each version's digest, and 1.4.0's
   provenance referrer, which the run removes from the deployment's own
   registry after install to show the launch's verification again refuse.
@@ -46,6 +54,7 @@ METADATA = "https://open-meridian.dev/attestation/plugin-metadata/v1"
 MANIFEST = "application/vnd.oci.image.manifest.v1+json"
 INDEX = "application/vnd.oci.image.index.v1+json"
 DSSE = "application/vnd.dsse.envelope.v1+json"
+BUNDLE = "application/vnd.dev.sigstore.bundle.v0.3+json"
 EMPTY = "application/vnd.oci.empty.v1+json"
 OM_KEY = "SHA256:e2e-open-meridian-release"
 OTHER_KEY = "SHA256:e2e-other-org-release"
@@ -86,6 +95,8 @@ def digest_of(data):
 BLOBS = {}
 MEDIA = {}
 REFERRERS = {}
+# Images whose referrers only the tag schema lists (v26): the API 404s.
+TAG_SCHEMA_ONLY = []
 
 
 def put(data, media=None):
@@ -122,8 +133,10 @@ def metadata(name, version):
                                   for section, text in texts(version)]}}
 
 
-def image(listing, version, signer, tampered=False):
-    """An image and its referrers, as the builder pushes them."""
+def image(listing, version, signer, tampered=False, bundled=False):
+    """An image and its referrers, as the builder pushes them: bare DSSE
+    envelopes, or (`bundled`) each in a Sigstore bundle listed under the
+    referrers tag schema alone."""
     layer = f"the stand-in, {listing} {version}\n".encode()
     config = canonical({"architecture": "amd64", "os": "linux",
                         "rootfs": {"type": "layers", "diff_ids": [digest_of(layer)]}}).encode()
@@ -142,23 +155,35 @@ def image(listing, version, signer, tampered=False):
         (METADATA, {"metadata": metadata(name, version), "schema_version": "v25",
                     "documentation": [{"name": s, "text": t} for s, t in texts(version)]}),
     ]:
-        held = canonical(statement(predicate_type, digest, predicate)).encode()
-        referrer = canonical({"schemaVersion": 2, "mediaType": MANIFEST, "artifactType": DSSE,
-                              "config": descriptor(b"{}", EMPTY),
-                              "layers": [descriptor(held, DSSE)],
-                              "subject": {"mediaType": MANIFEST, "digest": digest,
-                                          "size": len(manifest)}}).encode()
-        referrers.append({"mediaType": MANIFEST, "artifactType": DSSE,
+        signed_statement = statement(predicate_type, digest, predicate)
+        kind = BUNDLE if bundled else DSSE
+        if bundled:
+            held = canonical({"mediaType": BUNDLE, "dsseEnvelope": signed_statement,
+                              "verificationMaterial": {"publicKey": {"hint": "not-the-platforms"}}}).encode()
+        else:
+            held = canonical(signed_statement).encode()
+        body = {"schemaVersion": 2, "mediaType": MANIFEST, "artifactType": kind,
+                "config": descriptor(b"{}", EMPTY),
+                "layers": [descriptor(held, kind)],
+                "subject": {"mediaType": MANIFEST, "digest": digest, "size": len(manifest)}}
+        if bundled:
+            body["annotations"] = {"dev.sigstore.bundle.content": "dsse-envelope",
+                                   "dev.sigstore.bundle.predicateType": predicate_type}
+        referrer = canonical(body).encode()
+        referrers.append({"mediaType": MANIFEST,
+                          "artifactType": EMPTY if bundled else DSSE,
                           "digest": put(referrer, MANIFEST), "size": len(referrer),
                           "predicateType": predicate_type})
     REFERRERS[digest] = {"schemaVersion": 2, "mediaType": INDEX,
                          "manifests": [{k: v for k, v in r.items() if k != "predicateType"}
                                        for r in referrers]}
+    if bundled:
+        TAG_SCHEMA_ONLY.append(digest)
     return digest, referrers
 
 
-def listed(listing, version, signer, pull=None, tampered=False):
-    digest, referrers = image(listing, version, signer, tampered)
+def listed(listing, version, signer, pull=None, tampered=False, bundled=False):
+    digest, referrers = image(listing, version, signer, tampered, bundled)
     name = listing.split("/")[1]
     signed = canonical(statement(LISTING, digest, {
         "listing": listing, "version": version, "registry": "community",
@@ -190,14 +215,15 @@ def main():
               "pulled_at_ns": LISTED_AT_NS + 3600 * NS, "notice_id": "", "restored_at_ns": 0}
     for version, pull, tampered in [("1.3.0", pulled, False), ("1.4.0", None, False),
                                     ("1.5.0", None, False), ("1.6.0", None, True)]:
-        entry, resolution, referrers = listed("open-meridian/stand-in", version, OM_KEY, pull, tampered)
+        entry, resolution, referrers = listed("open-meridian/stand-in", version, OM_KEY, pull,
+                                              tampered, bundled=version in ("1.5.0", "1.6.0"))
         stand_in.append(entry)
         resolutions[f"open-meridian/stand-in@{version}"] = resolution
         cases[version] = entry["image_digest"]
         if version == "1.4.0":
             cases["provenance_1.4.0"] = next(r["digest"] for r in referrers
                                              if r["predicateType"] == PROVENANCE)
-    revoked, resolution, _ = listed("other-org/revoked", "1.0.0", OTHER_KEY)
+    revoked, resolution, _ = listed("other-org/revoked", "1.0.0", OTHER_KEY, bundled=True)
     resolutions["other-org/revoked@1.0.0"] = resolution
     cases["revoked"] = revoked["image_digest"]
     key = {"registered_by_person_id": "", "revoked_by_person_id": "", "revoke_reason": "",
@@ -221,7 +247,8 @@ def main():
             kept.write(data)
     for name, value in [("catalogue.json", catalogue), ("resolutions.json", resolutions),
                         ("cases.json", cases),
-                        ("oci/index.json", {"media": MEDIA, "referrers": REFERRERS})]:
+                        ("oci/index.json", {"media": MEDIA, "referrers": REFERRERS,
+                                            "tag_schema_only": TAG_SCHEMA_ONLY})]:
         with open(f"{OUT}/{name}", "w") as kept:
             json.dump(value, kept, indent=1, sort_keys=True)
             kept.write("\n")

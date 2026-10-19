@@ -932,6 +932,12 @@ message AccountAttributes {
   // account, with no statement to reconcile against, flat once booked; a
   // balance left after booking holds the booking (W11.28).
   bool allocation_account = 8;
+  // Contract v26 (W9.13, W12.2; ruling 316, 2026-10-18): the platform's ID
+  // of the base currency's cash instrument, which the book resolves from
+  // base_currency_code when the base is set and keeps; empty while the
+  // instrument store has not resolved the code. What the analytics
+  // component values an account in.
+  string base_cash_instrument_id = 9;
 }
 
 message SetAccountAttributeRequest {
@@ -1414,6 +1420,9 @@ enum UnplacedReason {
   // (W11.25, contract v23): kept in the account, so operations sees the
   // venue's position and the book's differ.
   UNPLACED_REASON_NOTHING_PENDING = 4;
+  // A give-up's answer naming an execution, or an allocation, the book does
+  // not hold (W11.32, contract v26): kept whole in UnplacedFact.give_up.
+  UNPLACED_REASON_UNKNOWN_EXECUTION = 5;
 }
 
 // The standard execution instructions (step 6's requirement 12; FIX's
@@ -2976,6 +2985,24 @@ message LocalRecordOrdersSetting {
   // Orders not ended whose instrument's record is provisional, as of the
   // answer, for the deployment: a count naming no account and no order.
   int64 open_order_count = 2;
+}
+
+// W11.38 (contract v26): the deployment admin's guard on agents' orders,
+// kept in the control partition, each change its own entry. Refused false
+// in the version that brings it.
+message SetAgentOrdersDemoOnlyRequest {
+  // Shown "Agents may place orders on demo connections only"; true by
+  // default.
+  bool agent_orders_demo_only = 1;
+  string reason = 2;
+}
+
+// W11.39: the guard read.
+message ReadAgentOrdersDemoOnlyRequest {}
+
+// The agents' guard in force (W11.38, W11.39).
+message AgentOrdersDemoOnlySetting {
+  bool agent_orders_demo_only = 1;
 }
 
 // W9.10 (contract v25): the book's health per account, for a deployment

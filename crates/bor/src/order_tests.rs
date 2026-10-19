@@ -139,6 +139,10 @@ struct As {
     person: Option<&'static str>,
     scope: Option<Vec<&'static str>>,
     allowed: bool,
+    /// The delegation the person acted through, an agent's (contract v26).
+    delegation: Option<&'static str>,
+    /// The sidecar's demo verdict on the connection (contract v26).
+    demo: bool,
 }
 
 fn person(subject: &'static str) -> As {
@@ -146,6 +150,7 @@ fn person(subject: &'static str) -> As {
         person: Some(subject),
         scope: Some(vec![ACC]),
         allowed: true,
+        ..Default::default()
     }
 }
 
@@ -154,6 +159,7 @@ fn venue() -> As {
         person: None,
         scope: Some(vec![ACC]),
         allowed: false,
+        ..Default::default()
     }
 }
 
@@ -171,6 +177,8 @@ async fn send_from<M: Message>(
             .as_ref()
             .map(|accounts| accounts.iter().map(|account| account.to_string()).collect()),
         connectivity_allowed: from.allowed,
+        acting_through_delegation: from.delegation.unwrap_or_default().to_string(),
+        connectivity_demo: from.demo,
         ..Default::default()
     };
     bus.call_stamped(
@@ -867,6 +875,7 @@ async fn a_command_naming_its_record_by_id_outside_the_write_scope_is_denied_cha
         person: Some(TRADER),
         scope: Some(vec![OTHER]),
         allowed: true,
+        ..Default::default()
     };
     let refused = order_command(
         &w,
@@ -1034,6 +1043,135 @@ async fn a_placement_at_a_connectivity_plugin_the_caller_may_not_route_through_i
     assert_eq!(heard.entry.unwrap().kind, "placement-refused");
     // Nothing was placed.
     assert_eq!(state(&order_now(&w, &order.order_id)), OrderState::Released);
+}
+
+/// Contract v26 (W11.8, W11.38; G1): an agent's placement -- through a
+/// delegation -- on a connection the sidecar did not stamp demo is refused
+/// and recorded while the guard is on, as it is by default; on a demo one it
+/// is placed; a person's own placement is never held to the guard.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_agents_placement_on_a_live_connection_is_refused_and_recorded_and_on_a_demo_one_placed()
+{
+    let w = wired();
+    let order = released(&w, "10").await;
+    let before = w.store.journal(ACC).unwrap().len();
+    let agent_live = As {
+        delegation: Some("DLG-agent-1"),
+        ..person(TRADER)
+    };
+    let refused = place(&w, &order.order_id, "4", &agent_live)
+        .await
+        .unwrap_err();
+    assert_eq!(code(&refused), Some(RefusalReason::AgentLiveOrder));
+    assert!(
+        refused.contains("Refused: Agents may place orders on demo connections only."),
+        "{refused}"
+    );
+    let journal = w.store.journal(ACC).unwrap();
+    assert_eq!(journal.len(), before + 1, "the refusal is recorded");
+    let entry = journal.last().unwrap();
+    assert_eq!(entry.meta.kind, "placement-refused");
+    assert!(entry
+        .meta
+        .reason
+        .contains("REFUSAL_REASON_AGENT_LIVE_ORDER"));
+    assert_eq!(state(&order_now(&w, &order.order_id)), OrderState::Released);
+    // On a demo connection the agent places.
+    let agent_demo = As {
+        demo: true,
+        ..agent_live.clone()
+    };
+    place(&w, &order.order_id, "4", &agent_demo).await.unwrap();
+    // A person's own placement on a live connection: never the guard's.
+    place(&w, &order.order_id, "6", &person(TRADER))
+        .await
+        .unwrap();
+}
+
+/// Contract v26 (W11.38, W11.39): the guard, on by default and recorded so
+/// at the upgrade, read without an account; set by a person with a reason,
+/// each change its own record; refused off, without a reason, and as an
+/// agent's act.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_agents_guard_is_on_recorded_at_the_upgrade_and_refused_off() {
+    use crate::booking_service::{
+        backfill_agent_orders_demo_only, READ_AGENT_ORDERS_DEMO_ONLY, SET_AGENT_ORDERS_DEMO_ONLY,
+    };
+    use crate::store::CONTROL_ACCOUNT;
+    let w = wired();
+    let read = || async {
+        AgentOrdersDemoOnlySetting::decode(
+            &send_from(
+                &w.bus,
+                READ_AGENT_ORDERS_DEMO_ONLY,
+                "meridian.v1.ReadAgentOrdersDemoOnlyRequest",
+                &ReadAgentOrdersDemoOnlyRequest {},
+                &As::default(),
+            )
+            .await
+            .unwrap()[..],
+        )
+        .unwrap()
+    };
+    assert!(read().await.agent_orders_demo_only, "on by default");
+    assert!(backfill_agent_orders_demo_only(&w.bus, w.store.as_ref()).unwrap());
+    assert!(
+        !backfill_agent_orders_demo_only(&w.bus, w.store.as_ref()).unwrap(),
+        "once"
+    );
+    let control = w.store.journal(CONTROL_ACCOUNT).unwrap();
+    assert_eq!(
+        control.last().unwrap().meta.kind,
+        "agent-orders-demo-only-backfilled"
+    );
+    let set = |on: bool, reason: &'static str, from: As| {
+        let bus = w.bus.clone();
+        async move {
+            send_from(
+                &bus,
+                SET_AGENT_ORDERS_DEMO_ONLY,
+                "meridian.v1.SetAgentOrdersDemoOnlyRequest",
+                &SetAgentOrdersDemoOnlyRequest {
+                    agent_orders_demo_only: on,
+                    reason: reason.into(),
+                },
+                &from,
+            )
+            .await
+        }
+    };
+    let admin = As {
+        person: Some(ADMIN),
+        ..Default::default()
+    };
+    let off = set(false, "try", admin.clone()).await.unwrap_err();
+    assert!(off.contains("cannot be turned off"), "{off}");
+    let unreasoned = set(true, " ", admin.clone()).await.unwrap_err();
+    assert_eq!(code(&unreasoned), Some(RefusalReason::ReasonRequired));
+    let by_agent = set(
+        true,
+        "an agent's",
+        As {
+            delegation: Some("DLG-agent-1"),
+            ..admin.clone()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        status_of(&by_agent).map(|(status, _)| status),
+        Some(meridian_bus::RefusalStatus::PermissionDenied)
+    );
+    let made = AgentOrdersDemoOnlySetting::decode(
+        &set(true, "confirmed at the review", admin).await.unwrap()[..],
+    )
+    .unwrap();
+    assert!(made.agent_orders_demo_only);
+    let control = w.store.journal(CONTROL_ACCOUNT).unwrap();
+    let entry = control.last().unwrap();
+    assert_eq!(entry.meta.kind, "agent-orders-demo-only-set");
+    assert_eq!(entry.meta.reason, "confirmed at the review");
+    assert!(read().await.agent_orders_demo_only);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2169,7 +2307,6 @@ async fn an_accept_to_a_new_order_makes_it_filled_with_the_ems_s_placement_as_of
         kept
     };
     let ids: Vec<&str> = prints.iter().map(|e| e.execution_id.as_str()).collect();
-    let before = w.store.heads().unwrap();
     // No user behind it: refused, nothing changed.
     let refused = accept(&w, &ids, to_new_order("core"), &venue())
         .await
@@ -2184,6 +2321,22 @@ async fn an_accept_to_a_new_order_makes_it_filled_with_the_ems_s_placement_as_of
             vec!["matched_order".to_string()]
         ))
     );
+    // Contract v26 (W11.23, W11.38): an agent's accept to a new order, on a
+    // connection not stamped demo, refused and recorded, the fills staying
+    // unmatched.
+    let agent = As {
+        delegation: Some("DLG-agent-1"),
+        ..person(TRADER)
+    };
+    let refused = accept(&w, &ids, to_new_order("core"), &agent)
+        .await
+        .unwrap_err();
+    assert_eq!(code(&refused), Some(RefusalReason::AgentLiveOrder));
+    assert_eq!(
+        w.store.journal(ACC).unwrap().last().unwrap().meta.kind,
+        "accept-refused"
+    );
+    let before = w.store.heads().unwrap();
     let done = accept(&w, &ids, to_new_order("core"), &person(TRADER))
         .await
         .unwrap();

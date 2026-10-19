@@ -28,6 +28,9 @@ use meridian_domain::v1::{
     RaiseAlertRequest, ReadLocalRecordOrdersRequest, RecordSleeveCrossRequest, ReportGiveUpRequest,
     SetAllocationInstructionRequest, SetLocalRecordOrdersRequest, SleeveCrossReply,
 };
+use meridian_domain::v1::{
+    AgentOrdersDemoOnlySetting, ReadAgentOrdersDemoOnlyRequest, SetAgentOrdersDemoOnlyRequest,
+};
 use meridian_pb::bounds;
 use prost::Message;
 
@@ -49,6 +52,9 @@ pub const RECORD_SLEEVE_CROSS: &str = "platform.book.command.record-sleeve-cross
 pub const RAISE_ALERT: &str = "platform.book.command.raise-alert";
 pub const ACKNOWLEDGE_ALERT: &str = "platform.book.command.acknowledge-alert";
 pub const SET_LOCAL_RECORD_ORDERS: &str = "platform.book.command.set-local-record-orders";
+/// W11.38 (contract v26): the agents' guard set, and read (W11.39).
+pub const SET_AGENT_ORDERS_DEMO_ONLY: &str = "platform.book.command.set-agent-orders-demo-only";
+pub const READ_AGENT_ORDERS_DEMO_ONLY: &str = "platform.book.query.read-agent-orders-demo-only";
 
 pub const BOOKING_UPDATED: &str = "platform.book.event.booking-updated";
 pub const ALERT_CHANGED: &str = "platform.book.event.alert-changed";
@@ -394,6 +400,65 @@ pub async fn sweep_forever(bus: Arc<Bus>, store: Arc<dyn Store>, every: Duration
     }
 }
 
+/// The agents' guard as the control partition states it (contract v26,
+/// W11.38): `None` before anything stated it, which reads as on.
+pub fn agent_orders_demo_only(store: &dyn Store) -> Option<bool> {
+    let book = store.book(CONTROL_ACCOUNT).ok()?;
+    book.ledger.agent_orders_demo_only
+}
+
+/// The upgrade's record of the agents' guard on (contract v26, W11.38,
+/// decisions/031): once, the book's own act, at the moment it ran. Says
+/// whether it recorded it.
+pub fn backfill_agent_orders_demo_only(bus: &Bus, store: &dyn Store) -> Result<bool, String> {
+    if agent_orders_demo_only(store).is_some() {
+        return Ok(false);
+    }
+    let now = bus.clock().now_ns();
+    let ctx = Context {
+        instance_id: bus.instance_id().to_string(),
+        event_time_ns: now,
+        received_at_ns: now,
+        committed_at_ns: now,
+        ..Default::default()
+    };
+    let key = "agent-orders-demo-only:default";
+    let acted = store.act(
+        CONTROL_ACCOUNT,
+        "",
+        key,
+        key.as_bytes(),
+        &mut |book, head| {
+            if book.ledger.agent_orders_demo_only.is_some() {
+                return Err(StoreError::Invalid(NOTHING_OWED.into()));
+            }
+            let draft = crate::decide::Draft {
+                entry_id: ctx.mint(crate::ids::ENTRY),
+                kind: "agent-orders-demo-only-backfilled",
+                effective_date: ctx.today(),
+                reason: "contract v26: agents may place orders on demo connections only, the \
+                         guard recorded on at the upgrade (W11.38, decisions/031)"
+                    .into(),
+                break_ids: Vec::new(),
+                idempotency_key: key.into(),
+                actor: ctx.actor(),
+                body: crate::journal::Body {
+                    acts: vec![crate::orders::Act::AgentOrdersDemoOnlySet { on: true }],
+                    ..Default::default()
+                },
+            };
+            let made = crate::decide::made(book, head, &ctx, draft)?;
+            Ok(crate::service::decided(made, Vec::new()))
+        },
+    );
+    match acted {
+        Ok(Acted::Committed(_)) => Ok(true),
+        Ok(Acted::Duplicate(_)) => Ok(false),
+        Err(StoreError::Invalid(said)) if said == NOTHING_OWED => Ok(false),
+        Err(failed) => Err(failed.to_string()),
+    }
+}
+
 /// The upgrade's record of the escape hatch on by default (W11.36,
 /// decisions/031): once, the book's own act, at the moment it ran. Says
 /// whether it recorded it.
@@ -706,7 +771,8 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
             // A give-up naming no execution the book holds is kept as an
             // unplaced fact, the report whole in its own arm, naming no
             // account (contract v25, W11.32; decision 30), as an execution
-            // the book cannot place is (W11.13). Held to its shape first.
+            // the book cannot place is (W11.13), its reason from contract
+            // v26 UNPLACED_REASON_UNKNOWN_EXECUTION. Held to its shape first.
             if !request.execution_id.is_empty()
                 && store
                     .owner(Record::Execution, &request.execution_id)
@@ -720,7 +786,7 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
                     &envelope,
                     ctx,
                     meridian_domain::v1::unplaced_fact::Fact::GiveUp(request.clone()),
-                    meridian_domain::v1::UnplacedReason::Unspecified,
+                    meridian_domain::v1::UnplacedReason::UnknownExecution,
                     "",
                     request.raw_record.clone(),
                 );
@@ -893,6 +959,47 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
                     local_record_orders_setting(&bus2, store.as_ref()).encode_to_vec(),
                 )
             })
+        });
+    }
+
+    {
+        let (bus2, store, clock) = (bus.clone(), store.clone(), clock.clone());
+        bus.serve(SET_AGENT_ORDERS_DEMO_ONLY, move |envelope| {
+            let request: SetAgentOrdersDemoOnlyRequest =
+                decode(&envelope, "meridian.v1.SetAgentOrdersDemoOnlyRequest")?;
+            let ctx = context_of(&envelope, clock.as_ref());
+            act(
+                &bus2,
+                store.as_ref(),
+                &envelope,
+                ctx,
+                CONTROL_ACCOUNT,
+                "",
+                "meridian.v1.AgentOrdersDemoOnlySetting",
+                &|book, head, ctx| {
+                    let made = booking::set_agent_orders_demo_only(book, head, ctx, &request)?;
+                    let reply = AgentOrdersDemoOnlySetting {
+                        agent_orders_demo_only: request.agent_orders_demo_only,
+                    }
+                    .encode_to_vec();
+                    Ok((made, reply))
+                },
+            )
+        });
+    }
+    {
+        let reading = store.clone();
+        bus.serve(READ_AGENT_ORDERS_DEMO_ONLY, move |envelope| {
+            let _: ReadAgentOrdersDemoOnlyRequest =
+                decode(&envelope, "meridian.v1.ReadAgentOrdersDemoOnlyRequest")?;
+            Ok((
+                "meridian.v1.AgentOrdersDemoOnlySetting".to_string(),
+                AgentOrdersDemoOnlySetting {
+                    agent_orders_demo_only: agent_orders_demo_only(reading.as_ref())
+                        .unwrap_or(true),
+                }
+                .encode_to_vec(),
+            ))
         });
     }
 

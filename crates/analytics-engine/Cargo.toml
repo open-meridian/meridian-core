@@ -1,0 +1,17 @@
+[package]
+name = "meridian-analytics-engine"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The analytics engine: v26's models and measures over a job's inputs, exact, with the answer's provenance and hash"
+
+[dependencies]
+# The job's messages as the wire carries them, compiled here.
+meridian-domain.workspace = true
+# RFC 8785's canonical JSON is written here; serde_json only reads and holds
+# the document.
+serde_json.workspace = true
+# The answer's hash (Q7).
+sha2.workspace = true
+hex.workspace = true

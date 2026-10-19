@@ -99,6 +99,16 @@ pub struct Context {
     /// Contract v24 (W11.36): the escape hatch's setting in force, read from
     /// the control partition; `None` reads as on, the default.
     pub local_record_orders: Option<bool>,
+    /// Contract v26 (W11.8, W11.23): the sidecar's verdict that the
+    /// connectivity plugin a placement or a new order's fills name is demo.
+    pub connectivity_demo: bool,
+    /// Contract v26 (W11.38): the agents' guard in force, read from the
+    /// control partition; `None` reads as on, the default.
+    pub agent_orders_demo_only: Option<bool>,
+    /// Contract v26 (W11.34; question 230): the affirmation deadline and the
+    /// deployment's time zone, as the book last read them; `None` where none
+    /// is declared, and a held booking's alert names no moment.
+    pub affirmation: Option<crate::deadline::Affirmation>,
 }
 
 /// What an instrument's record says that the book requires (W9.1, contract
@@ -116,6 +126,16 @@ pub struct RecordSays {
 }
 
 impl Context {
+    /// Whether the act is an agent's (contract v26, W11.8; G1 question 3):
+    /// made through a delegation, or by a service account. A person's own
+    /// act at a page is not, nor one a person makes from an agent's
+    /// prepared change: its actor is the person, through no delegation.
+    pub(crate) fn agents(&self) -> bool {
+        !self.acting_for.is_empty()
+            && (!self.acting_through_delegation.is_empty()
+                || self.acting_for_kind == meridian_pb::v1::SubjectKind::ServiceAccount as i32)
+    }
+
     pub(crate) fn actor(&self) -> Actor {
         Actor {
             kind: Some(if self.acting_for.is_empty() {
@@ -1672,7 +1692,7 @@ fn adjustment_body(
 /// A reversal: the reversed entry's lines negated, at its effective date
 /// (W9.7); of an opening balance, only while no later entry moving the
 /// account's positions stands (W9.1, open point 5).
-fn reversal_body(book: &Book, entry_id: &str) -> Result<(Body, String)> {
+pub(crate) fn reversal_body(book: &Book, entry_id: &str) -> Result<(Body, String)> {
     let reversed = book.entry(entry_id).ok_or_else(|| {
         StoreError::Invalid(format!(
             "account {} holds no entry {entry_id}",
@@ -1684,7 +1704,7 @@ fn reversal_body(book: &Book, entry_id: &str) -> Result<(Body, String)> {
             "entry {entry_id} is reversed already"
         )));
     }
-    if !reversed.body.moves_positions() {
+    if !reversed.moves_positions {
         return Err(StoreError::Invalid(format!(
             "entry {entry_id} is a {}, which moves no position; a break's record is corrected \
              by its own act",
@@ -1693,7 +1713,7 @@ fn reversal_body(book: &Book, entry_id: &str) -> Result<(Body, String)> {
     }
     // A fill's or a charge's entry is the order path's: it is corrected by
     // a superseding execution, so positions and fills never disagree (W11).
-    if !reversed.body.acts.is_empty() {
+    if reversed.acts {
         return Err(StoreError::Invalid(format!(
             "entry {entry_id} is the order path's {}; it is corrected by a superseding \
              execution, never reversed",
@@ -1711,9 +1731,7 @@ fn reversal_body(book: &Book, entry_id: &str) -> Result<(Body, String)> {
             .position(|held| held.entry_id == entry_id)
             .expect("found above");
         let later = book.entries[index + 1..].iter().find(|held| {
-            held.body.moves_positions()
-                && held.reversed_by.is_none()
-                && held.body.reverses.is_empty()
+            held.moves_positions && held.reversed_by.is_none() && held.reverses.is_empty()
         });
         if let Some(later) = later {
             return Err(StoreError::refused(
@@ -1726,8 +1744,8 @@ fn reversal_body(book: &Book, entry_id: &str) -> Result<(Body, String)> {
             ));
         }
     }
-    let lines = reversed
-        .body
+    let body = book.body(entry_id)?;
+    let lines = body
         .lines
         .iter()
         .map(|line| {
@@ -1742,11 +1760,10 @@ fn reversal_body(book: &Book, entry_id: &str) -> Result<(Body, String)> {
         })
         .collect();
     let mut restored_unknown_costs = Vec::new();
-    let basis_adjustments = reversed
-        .body
+    let basis_adjustments = body
         .basis_adjustments
         .iter()
-        .zip(reversed.body.prior_holding_period_starts.iter())
+        .zip(body.prior_holding_period_starts.iter())
         .map(|(adjustment, prior)| BasisAdjustment {
             lot_id: adjustment.lot_id.clone(),
             cost: match &adjustment.cost {
@@ -1806,6 +1823,11 @@ pub fn set_attribute(
                     "base_currency_code is {code:?}; an ISO 4217 code is three capital letters"
                 )));
             }
+            // Its cash instrument, where the instrument store has resolved
+            // the code (contract v26, W9.13; ruling 316): kept on the record
+            // this change writes.
+            attributes.base_cash_instrument_id =
+                meridian_domain::money::known(&code).unwrap_or_default();
             attributes.base_currency_code = code;
         }
         Some(set_account_attribute_request::Attribute::LotReliefDefault(method)) => {

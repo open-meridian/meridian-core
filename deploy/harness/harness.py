@@ -1078,7 +1078,7 @@ ROLE_NAME = re.compile(r"[a-z][a-z0-9-]*")
 # users that are not plugins. A sidecar is the service `sidecar-<instance>`.
 TAKEN = {"keys", "postgres", "broker-config", "nats", "migrate", "street", "bor",
          "lake", "instrument", "conductor", "dashboard", "runner", "store", "storage",
-         "runtime", "first-run", "dashboard-1"}
+         "runtime", "first-run", "dashboard-1", "analytics"}
 RUNTIME_IMAGE = "${MERIDIAN_RUNTIME_IMAGE:?set MERIDIAN_RUNTIME_IMAGE to the runtime image of the harness's commit}"
 # The roles whose plugins own storage for their raw external records
 # (decisions/028), as the chart's `meridian-runtime.edgeRoles` says them; a

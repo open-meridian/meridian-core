@@ -3496,6 +3496,72 @@ async fn an_account_still_linked_granted_or_mapped_is_not_closed_and_each_is_nam
     assert_eq!(close().await.unwrap().state, AccountState::Closed as i32);
 }
 
+/// W6.35, W7.5 (contract v26): the deployment's time zone, America/New_York
+/// until set; a change names an IANA zone and says why, each its own record;
+/// the first run's zone recorded once where nothing set one before.
+#[tokio::test]
+async fn the_deployments_time_zone_is_new_york_until_set_each_change_its_own_record() {
+    let h = harness("dashboard-1");
+    let read = || {
+        ask::<_, meridian_domain::v1::DeploymentTimeZoneSetting>(
+            &h,
+            crate::service::READ_DEPLOYMENT_TIME_ZONE,
+            "meridian.v1.ReadDeploymentTimeZoneRequest",
+            meridian_domain::v1::ReadDeploymentTimeZoneRequest {},
+        )
+    };
+    let set = |zone: &str, reason: &str| {
+        ask::<_, meridian_domain::v1::DeploymentTimeZoneSetting>(
+            &h,
+            crate::service::SET_DEPLOYMENT_TIME_ZONE,
+            "meridian.v1.SetDeploymentTimeZoneRequest",
+            meridian_domain::v1::SetDeploymentTimeZoneRequest {
+                deployment_time_zone: zone.into(),
+                reason: reason.into(),
+            },
+        )
+    };
+    let default = read().await.unwrap();
+    assert_eq!(default.deployment_time_zone, "America/New_York");
+    assert_eq!(default.changed_at_ns, 0);
+    assert_eq!(
+        default.affirmation_deadline, 0,
+        "no operations instance launched"
+    );
+    let refused = set("Mars/Olympus_Mons", "moving").await.unwrap_err();
+    assert!(refused.contains("deployment_time_zone"), "{refused}");
+    let refused = set("Europe/London", " ").await.unwrap_err();
+    assert!(refused.contains("fields=reason"), "{refused}");
+    let changed = set("Europe/London", "the firm's office moved")
+        .await
+        .unwrap();
+    assert_eq!(changed.deployment_time_zone, "Europe/London");
+    assert!(changed.changed_at_ns > 0);
+    assert!(!changed.changed_by.is_empty());
+    assert_eq!(read().await.unwrap().deployment_time_zone, "Europe/London");
+    // The first run's zone is recorded only where nothing was set.
+    assert!(
+        !crate::service::record_first_run_time_zone(h.store.as_ref(), "Asia/Tokyo", "", 9).unwrap()
+    );
+    let fresh = crate::memory::MemoryStore::default();
+    assert!(
+        crate::service::record_first_run_time_zone(&fresh, "Asia/Tokyo", "local|ada", 9).unwrap()
+    );
+    assert_eq!(
+        fresh.deployment_time_zone().unwrap().unwrap().changed_by,
+        "local|ada",
+        "names the administrator the wizard was told"
+    );
+    assert!(crate::service::record_first_run_time_zone(&fresh, "Nowhere/Here", "", 10).is_ok());
+    let unnamed = crate::memory::MemoryStore::default();
+    assert!(crate::service::record_first_run_time_zone(&unnamed, "Nowhere/Here", "", 10).is_err());
+    assert!(crate::service::record_first_run_time_zone(&unnamed, "Asia/Tokyo", "", 11).unwrap());
+    assert_eq!(
+        unnamed.deployment_time_zone().unwrap().unwrap().changed_by,
+        "first-run"
+    );
+}
+
 /// W3.28 (contract v24): the usage report is on by default; turning it off
 /// says why and is its own record; the reports sent are listed.
 #[tokio::test]
@@ -3854,4 +3920,86 @@ async fn a_relaunched_instance_is_held_to_its_running_version_s_uploaded_declara
         meridian_sidecar::held::difference(&registering(&wider), &uploaded)
             .is_some_and(|first| first.contains("venue")),
     );
+}
+
+/// W12.6 (contract v26; ruling 285): every model id built in until routed;
+/// a route names a pricing instance the deployment runs and says why, each
+/// change its own record, the table's version one more than its changes.
+#[tokio::test]
+async fn a_model_id_is_built_in_until_routed_to_a_running_pricing_instance() {
+    let h = harness("dashboard-1");
+    h.store
+        .record_plugin(&KnownPlugin {
+            plugin_instance_id: "sample-pricing-1".into(),
+            roles: vec!["pricing".into()],
+            last_reported_at_ns: 0,
+        })
+        .unwrap();
+    let read = || {
+        ask::<_, meridian_domain::v1::ListModelRoutingReply>(
+            &h,
+            crate::service::LIST_MODEL_ROUTING,
+            "meridian.v1.ListModelRoutingRequest",
+            meridian_domain::v1::ListModelRoutingRequest {},
+        )
+    };
+    let set = |model: &str, implementation: &str, reason: &str| {
+        ask::<_, meridian_domain::v1::ListModelRoutingReply>(
+            &h,
+            crate::service::SET_MODEL_ROUTING,
+            "meridian.v1.SetModelRoutingRequest",
+            meridian_domain::v1::SetModelRoutingRequest {
+                model_id: model.into(),
+                implementation: implementation.into(),
+                reason: reason.into(),
+            },
+        )
+    };
+    let table = read().await.unwrap();
+    assert_eq!(table.version, 1);
+    let named: Vec<(&str, &str)> = table
+        .routes
+        .iter()
+        .map(|r| (r.model_id.as_str(), r.implementation.as_str()))
+        .collect();
+    assert_eq!(
+        named,
+        vec![
+            ("cash", "built-in"),
+            ("quoted_price", "built-in"),
+            ("binary_event", "built-in")
+        ]
+    );
+    let refused = set("quoted_price", "oms-1", "prove the seam")
+        .await
+        .unwrap_err();
+    assert!(refused.contains("fields=implementation"), "{refused}");
+    let refused = set("quoted_price", "sample-pricing-1", " ")
+        .await
+        .unwrap_err();
+    assert!(refused.contains("fields=reason"), "{refused}");
+    let refused = set("black_scholes", "built-in", "later").await.unwrap_err();
+    assert!(refused.contains("fields=model_id"), "{refused}");
+    let routed = set("quoted_price", "sample-pricing-1", "Prove the pricing seam")
+        .await
+        .unwrap();
+    assert_eq!(routed.version, 2);
+    let quoted = &routed.routes[1];
+    assert_eq!(quoted.implementation, "sample-pricing-1");
+    assert_eq!(quoted.reason, "Prove the pricing seam");
+    assert!(!quoted.changed_by.is_empty() && quoted.changed_at_ns > 0);
+    // The same route again changes nothing; routed back is its own record.
+    assert_eq!(
+        set("quoted_price", "sample-pricing-1", "again")
+            .await
+            .unwrap()
+            .version,
+        2
+    );
+    let back = set("quoted_price", "built-in", "the plugin is retired")
+        .await
+        .unwrap();
+    assert_eq!(back.version, 3);
+    assert_eq!(back.routes[1].implementation, "built-in");
+    assert_eq!(h.store.model_routing_changes().unwrap().len(), 2);
 }

@@ -21,6 +21,7 @@
 //! W4.1, contract v25).
 
 pub mod asset_class;
+pub mod attestation;
 pub mod date;
 pub mod declaration;
 pub mod exact;
@@ -30,7 +31,9 @@ pub mod money;
 pub mod protojson;
 pub mod semver;
 pub mod setting_table;
+pub mod template;
 pub mod text;
+pub mod zone;
 pub mod zones;
 
 /// The roles at the edge, which alone may own storage for their raw external

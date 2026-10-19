@@ -412,6 +412,13 @@ async fn home(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
             provisional.as_ref(),
             app.clock.now_ns(),
         ));
+        // Contract v26 (W11.38): the agents' guard, on, with no switch.
+        let guard = crate::admin::trading::read_agent_orders_demo_only(&app.bus)
+            .await
+            .ok();
+        body.push_str(&crate::admin::trading::agent_orders_demo_only_line(
+            guard.as_ref(),
+        ));
         if let Ok(local) = crate::admin::trading::read_local_record_orders(&app.bus).await {
             let n = local.open_order_count;
             if n > 0 {
@@ -454,6 +461,17 @@ async fn home(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
             } else {
                 Vec::new()
             };
+            // Contract v26 (W11.8): a connection shown Demo or Live, by its
+            // environment setting.
+            let connection = access
+                .known_roles
+                .get(instance)
+                .is_some_and(|roles| roles.iter().any(|role| role == "connectivity"));
+            let badge = if connection {
+                Some(crate::admin::connectivity::badge(&app.bus, &records, instance).await)
+            } else {
+                None
+            };
             body.push_str(&plugin_card(
                 instance,
                 name_of(instance).as_deref(),
@@ -463,6 +481,7 @@ async fn home(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
                     .known_roles
                     .get(instance)
                     .is_some_and(|roles| roles.len() > 1),
+                badge,
             ));
         }
         body.push_str(
@@ -502,6 +521,7 @@ fn plugin_card(
     levels: &[meridian_access::AccessLevel],
     held: &meridian_access::PluginHeld,
     several: bool,
+    badge: Option<&str>,
 ) -> String {
     // The plugin's name where the catalogue launched it; one installed
     // otherwise is known by its instance alone.
@@ -520,9 +540,19 @@ fn plugin_card(
         .find(|c| c.is_alphanumeric())
         .map(String::from)
         .unwrap_or_default();
+    // Contract v26 (W11.8; ruling 310): Demo, Live, or Live (environment not
+    // confirmed), for a connectivity plugin.
+    let badge = match badge {
+        Some(said) => format!(
+            " <span class=\"badge {kind}\" data-environment=\"{said}\" title=\"{said}\">{said}</span>",
+            kind = if said == "Demo" { "good" } else { "warn" },
+            said = escape(said),
+        ),
+        None => String::new(),
+    };
     let text = format!(
         "<span class=\"plugin-icon\" aria-hidden=\"true\">{initial}</span>\
-         <span class=\"plugin-text\"><span class=\"plugin-name\">{title}</span>{sub}</span>",
+         <span class=\"plugin-text\"><span class=\"plugin-name\">{title}{badge}</span>{sub}</span>",
         initial = escape(&initial),
         title = escape(title),
     );

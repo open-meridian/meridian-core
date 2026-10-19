@@ -246,16 +246,80 @@ fn is_zero(value: &Option<meridian_pb::v1::Decimal>) -> bool {
         .unwrap_or(true)
 }
 
-/// An entry as the account's later acts need it: what a reversal negates,
-/// what entries a resolution names, and whether it has been reversed.
+/// An entry as the account's later acts need it: what entries a resolution
+/// names, whether it has been reversed, and what a scan over later entries
+/// asks of each. Its body -- what a reversal negates, a fill's lines -- is
+/// the journal's, loaded when a decision asks for it ([`Book::body`];
+/// contract v26, W9.10, ruling 165), so the book's memory stays flat as
+/// journals grow.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EntryIndex {
     pub entry_id: String,
     pub kind: String,
     pub effective_date: String,
     pub first: JournalRef,
-    pub body: Body,
     pub reversed_by: Option<String>,
+    /// Whether it moves a position (`Body::moves_positions`): what a
+    /// reversal of the opening balance is refused over while it stands.
+    pub moves_positions: bool,
+    /// The entry it reverses, empty for none.
+    pub reverses: String,
+    /// Whether it did anything on the order path: a value-date roll reads
+    /// only such entries' bodies.
+    pub acts: bool,
+    /// Whether one of its acts is a value-date roll (W11.25), which moves a
+    /// pending line an earlier entry left.
+    pub rolls: bool,
+}
+
+impl EntryIndex {
+    fn of(entry: &Entry, first: JournalRef) -> EntryIndex {
+        let body = &entry.body;
+        EntryIndex {
+            entry_id: entry.entry_id.clone(),
+            kind: entry.meta.kind.clone(),
+            effective_date: entry.meta.effective_date.clone(),
+            first,
+            reversed_by: None,
+            moves_positions: body.moves_positions(),
+            reverses: body.reverses.clone(),
+            acts: !body.acts.is_empty(),
+            rolls: body
+                .acts
+                .iter()
+                .any(|act| matches!(act, crate::orders::Act::ValueDateRolled { .. })),
+        }
+    }
+}
+
+/// The bodies of entries a decision has asked for, loaded from the journal
+/// (contract v26, W9.10): each entry's body is immutable and named by its
+/// entry, so however a book holds them -- every one after a replay in a
+/// test, only those asked for after a store's -- it is the same book, and
+/// two books compare equal whatever each holds.
+#[derive(Clone, Default)]
+pub struct Bodies(BTreeMap<String, std::sync::Arc<Body>>);
+
+impl PartialEq for Bodies {
+    fn eq(&self, _: &Bodies) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for Bodies {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} bodies held", self.0.len())
+    }
+}
+
+impl Bodies {
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 /// The records an entry changed, as they stand after it.
@@ -321,6 +385,9 @@ pub struct Book {
     /// (contract v22): false for an account the book held before, until the
     /// upgrade's backfill records it (decisions/031).
     pub waits_stated: bool,
+    /// The entries' bodies it holds (contract v26, W9.10): none in a
+    /// snapshot, and after a store's build only those a decision asked for.
+    pub bodies: Bodies,
 }
 
 /// How an agreement is keyed: the statement's external account and segment
@@ -351,12 +418,26 @@ impl Book {
             chains: [0; CHAINS],
             ledger: crate::orders::Ledger::default(),
             waits_stated: false,
+            bodies: Bodies::default(),
         }
     }
 
     /// An account replayed from its journal: strictly, so an entry that no
-    /// longer applies is a fault rather than a guess.
+    /// longer applies is a fault rather than a guess. It holds every entry's
+    /// body, the journal being in hand; a store's build holds none
+    /// ([`Book::replay_lean`]) and loads what a decision asks for.
     pub fn replay(account_id: &str, partition: &str, entries: &[Entry]) -> Result<Book> {
+        let mut book = Book::replay_lean(account_id, partition, entries)?;
+        book.hold_bodies(
+            entries
+                .iter()
+                .map(|entry| (entry.entry_id.clone(), entry.body.clone())),
+        );
+        Ok(book)
+    }
+
+    /// [`Book::replay`], holding no entry's body (contract v26, W9.10).
+    pub fn replay_lean(account_id: &str, partition: &str, entries: &[Entry]) -> Result<Book> {
         let mut book = Book::new(account_id, partition);
         for entry in entries {
             book.apply(entry, false)?;
@@ -410,6 +491,50 @@ impl Book {
 
     pub fn entry(&self, entry_id: &str) -> Option<&EntryIndex> {
         self.entries.iter().find(|held| held.entry_id == entry_id)
+    }
+
+    /// An entry's body, as the journal holds it (contract v26, W9.10): where
+    /// this book does not hold it, [`StoreError::BodiesNeeded`] naming it,
+    /// which the store answers by loading it and deciding again
+    /// ([`crate::store::with_bodies`]).
+    pub fn body(&self, entry_id: &str) -> Result<&Body> {
+        match self.bodies.0.get(entry_id) {
+            Some(body) => Ok(body),
+            None => Err(StoreError::BodiesNeeded(vec![entry_id.to_string()])),
+        }
+    }
+
+    /// The bodies of several entries, in their order; every one this book
+    /// does not hold named at once, so a scan loads them in one read.
+    pub fn bodies_of<'a>(
+        &self,
+        entries: impl IntoIterator<Item = &'a EntryIndex>,
+    ) -> Result<Vec<(&'a EntryIndex, &Body)>> {
+        let mut found = Vec::new();
+        let mut missing = Vec::new();
+        for entry in entries {
+            match self.bodies.0.get(&entry.entry_id) {
+                Some(body) => found.push((entry, body.as_ref())),
+                None => missing.push(entry.entry_id.clone()),
+            }
+        }
+        if !missing.is_empty() {
+            return Err(StoreError::BodiesNeeded(missing));
+        }
+        Ok(found)
+    }
+
+    /// Hold these bodies, loaded from the journal.
+    pub fn hold_bodies(&mut self, loaded: impl IntoIterator<Item = (String, Body)>) {
+        for (entry_id, body) in loaded {
+            self.bodies.0.insert(entry_id, std::sync::Arc::new(body));
+        }
+    }
+
+    /// Hold none: what a store's build leaves, the bodies a replay applied
+    /// let go, so a book holds only what a fold needs.
+    pub fn release_bodies(&mut self) {
+        self.bodies.0.clear();
     }
 
     /// The position holding a lot, by the lot's identifier.
@@ -780,14 +905,7 @@ impl Book {
                 reversed.reversed_by = Some(entry.entry_id.clone());
             }
         }
-        self.entries.push(EntryIndex {
-            entry_id: entry.entry_id.clone(),
-            kind: entry.meta.kind.clone(),
-            effective_date: entry.meta.effective_date.clone(),
-            first,
-            body: body.clone(),
-            reversed_by: None,
-        });
+        self.entries.push(EntryIndex::of(entry, first));
         Ok(changes)
     }
 

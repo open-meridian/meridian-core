@@ -31,8 +31,8 @@ use meridian_domain::v1::{
     BookingCorrectionKind, BookingState, CorrectBookingRequest, ErrorCause, Execution,
     GiveUpAnswer, GiveUpRecord, HandOffBookingRequest, HoldingSide, LotReliefMethod, LotSource,
     LotTerms, Money, MovementLine, OrderState, RaiseAlertRequest, RecordSleeveCrossRequest,
-    ReportGiveUpRequest, SetAllocationInstructionRequest, SetLocalRecordOrdersRequest,
-    SettlementBucket, Side, SleeveCross,
+    ReportGiveUpRequest, SetAgentOrdersDemoOnlyRequest, SetAllocationInstructionRequest,
+    SetLocalRecordOrdersRequest, SettlementBucket, Side, SleeveCross,
 };
 use meridian_pb::v1::RefusalReason;
 
@@ -424,7 +424,7 @@ fn allocations_hold(
 // ── The lines a booking moves ──────────────────────────────────────────────
 
 /// The lots the booked executions opened, which booking closes first.
-fn fill_lots(book: &Book, execution_ids: &[String]) -> Vec<String> {
+fn fill_lots(book: &Book, execution_ids: &[String]) -> Result<Vec<String>> {
     let mut lots = Vec::new();
     for id in execution_ids {
         let Some(held) = book.ledger.executions.get(id) else {
@@ -434,16 +434,13 @@ fn fill_lots(book: &Book, execution_ids: &[String]) -> Vec<String> {
             Some((entry_id, start, count)) => (entry_id.clone(), Some((*start, *count))),
             None => (held.entry_id.clone(), None),
         };
-        let Some(entry) = book.entry(&entry_id) else {
+        if book.entry(&entry_id).is_none() {
             continue;
-        };
+        }
+        let body = book.body(&entry_id)?;
         let lines: &[MovementLine] = match range {
-            Some((start, count)) => entry
-                .body
-                .lines
-                .get(start..start + count)
-                .unwrap_or_default(),
-            None => &entry.body.lines,
+            Some((start, count)) => body.lines.get(start..start + count).unwrap_or_default(),
+            None => &body.lines,
         };
         for line in lines {
             if line.opens_lot.is_some()
@@ -453,7 +450,7 @@ fn fill_lots(book: &Book, execution_ids: &[String]) -> Vec<String> {
             }
         }
     }
-    lots
+    Ok(lots)
 }
 
 fn method_of(book: &Book) -> LotReliefMethod {
@@ -622,7 +619,7 @@ fn booking_lines(
 ) -> Result<Vec<MovementLine>> {
     let mut lines: Vec<MovementLine> = Vec::new();
     let mut seen: Vec<MovementLine> = earlier.to_vec();
-    let fills = fill_lots(book, execution_ids);
+    let fills = fill_lots(book, execution_ids)?;
     let method = method_of(book);
     let buy = buys(executed.side);
     let instrument = crate::order_decide::landing(book, &executed.instrument_id);
@@ -810,16 +807,15 @@ fn received_lines(
 /// An entry's lines between `start` and `start + count`, negated: what a
 /// cancel or a replace reverses, a lot it opened relieved to zero and one it
 /// relieved reopened by the same identifiers (W11.29).
-fn negated(book: &Book, entry_id: &str, start: usize, count: usize) -> Vec<MovementLine> {
+fn negated(book: &Book, entry_id: &str, start: usize, count: usize) -> Result<Vec<MovementLine>> {
     let Some(at) = book
         .entries
         .iter()
         .position(|held| held.entry_id == entry_id)
     else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    book.entries[at]
-        .body
+    book.body(entry_id)?
         .lines
         .get(start..start + count)
         .unwrap_or_default()
@@ -828,14 +824,14 @@ fn negated(book: &Book, entry_id: &str, start: usize, count: usize) -> Vec<Movem
             let mut out = line.clone();
             out.opens_lot = None;
             if line.bucket == SettlementBucket::Pending as i32 {
-                out.value_date = crate::order_decide::rolled_to(book, at, line);
+                out.value_date = crate::order_decide::rolled_to(book, at, line)?;
             }
             out.quantity = line.quantity.as_ref().map(|quantity| {
                 Exact::from_wire(quantity)
                     .map(|value| value.negated().to_wire())
                     .unwrap_or(*quantity)
             });
-            out
+            Ok(out)
         })
         .collect()
 }
@@ -849,6 +845,17 @@ fn alert(
     reason: String,
     subject: AlertSubject,
 ) -> Act {
+    alert_due(ctx, account_id, kind, reason, subject, 0)
+}
+
+fn alert_due(
+    ctx: &Context,
+    account_id: &str,
+    kind: AlertKind,
+    reason: String,
+    subject: AlertSubject,
+    due_by: i64,
+) -> Act {
     Act::AlertRaised {
         alert: Alert {
             alert_id: ctx.mint(ALERT),
@@ -857,12 +864,10 @@ fn alert(
             state: AlertState::Raised as i32,
             reason,
             subject: Some(subject),
-            // From contract v25 the operations plugin's declaration carries
-            // its affirmation_deadline (W11.34), but no row brings a
-            // version's declaration to the book and the deployment names no
-            // time zone of its own, so a held booking's alert still names no
-            // moment it is due by: zero, as W11.34 reads it with none known.
-            due_by: 0,
+            // A held booking's: when the operations plugin's
+            // affirmation_deadline falls on its trade date, in the
+            // deployment's time zone (W11.34, contract v26); zero otherwise.
+            due_by,
             last_change: None,
         },
     }
@@ -901,7 +906,13 @@ fn error_alerts(ctx: &Context, book: &Book, booking: &Booking) -> Vec<Act> {
 }
 
 fn held_alert(ctx: &Context, book: &Book, booking: &Booking, reason: &str) -> Act {
-    alert(
+    // Its trade date, its first execution's as it stands (W11.34).
+    let due_by = ctx.affirmation.as_ref().map_or(0, |affirmation| {
+        executed(book, &booking.execution_ids)
+            .map(|executed| affirmation.due_by(&executed.trade_date))
+            .unwrap_or(0)
+    });
+    alert_due(
         ctx,
         &book.account_id,
         AlertKind::BookingHeld,
@@ -912,6 +923,7 @@ fn held_alert(ctx: &Context, book: &Book, booking: &Booking, reason: &str) -> Ac
             allocation_id: String::new(),
             position: None,
         },
+        due_by,
     )
 }
 
@@ -1323,8 +1335,10 @@ pub fn correct_booking(
                 reason: request.reason.clone(),
             });
             let mut plan = Plan::new(CANCELLED, ctx.actor(), acts).reason(&request.reason);
-            plan.lines =
-                crate::order_decide::reroute_reliefs(book, negated(book, &entry_id, start, count))?;
+            plan.lines = crate::order_decide::reroute_reliefs(
+                book,
+                negated(book, &entry_id, start, count)?,
+            )?;
             finish(book, head, ctx, plan)
         }
         Ok(BookingCorrectionKind::Replace) => {
@@ -1360,8 +1374,10 @@ pub fn correct_booking(
                     ..allocation.clone()
                 })
                 .collect();
-            let reversed =
-                crate::order_decide::reroute_reliefs(book, negated(book, &entry_id, start, count))?;
+            let reversed = crate::order_decide::reroute_reliefs(
+                book,
+                negated(book, &entry_id, start, count)?,
+            )?;
             let lines = booking_lines(
                 book,
                 ctx,
@@ -1544,7 +1560,7 @@ pub fn withdraw_allocation(
         "allocation {allocation_id} of booking {booking_id} withdrawn by its correction"
     ));
     plan.lines =
-        crate::order_decide::reroute_reliefs(book, negated(book, &entry_id, start, count))?;
+        crate::order_decide::reroute_reliefs(book, negated(book, &entry_id, start, count)?)?;
     finish(book, head, ctx, plan).map(Some)
 }
 
@@ -1972,6 +1988,67 @@ pub fn set_local_record_orders(
     )
     .reason(&request.reason);
     made_without_records(book, head, ctx, plan)
+}
+
+// ── W11.38: the agents' guard ──────────────────────────────────────────────
+
+/// The words a refusal by the guard, and a check before sending, say
+/// (W11.8; the badge and the history's line, approved 2026-10-14).
+pub const AGENT_LIVE_ORDER_WORDS: &str = "agents may place orders on demo connections only";
+
+/// The agents' guard in force (contract v26, W11.38): on unless the control
+/// partition last said off, as it is by default and at the upgrade.
+pub fn agent_orders_demo_only(control: &Book) -> bool {
+    control.ledger.agent_orders_demo_only.unwrap_or(true)
+}
+
+/// W11.38: a deployment admin sets the guard, a person's own act with a
+/// reason; refused off in the version that brings it (G1 question 2), and
+/// never an agent's act, which may prepare the change and never make it.
+pub fn set_agent_orders_demo_only(
+    book: &Book,
+    head: u64,
+    ctx: &Context,
+    request: &SetAgentOrdersDemoOnlyRequest,
+) -> Result<Made> {
+    user_required(
+        ctx,
+        "setting whether agents' orders are kept to demo connections",
+    )?;
+    if ctx.agents() {
+        return Err(StoreError::Denied(
+            "the agents' guard is set by a person at the dashboard's home page; an agent may \
+             prepare the change and never make it"
+                .into(),
+        ));
+    }
+    if request.reason.trim().is_empty() {
+        return Err(StoreError::refused(
+            RefusalReason::ReasonRequired,
+            "the agents' guard is set with a reason",
+        ));
+    }
+    if !request.agent_orders_demo_only {
+        return Err(StoreError::Invalid(
+            "the agents' guard cannot be turned off in this version: agents may place orders \
+             on demo connections only (W11.38)"
+                .into(),
+        ));
+    }
+    let plan = Plan::new(
+        "agent-orders-demo-only-set",
+        ctx.actor(),
+        vec![Act::AgentOrdersDemoOnlySet { on: true }],
+    )
+    .reason(&request.reason);
+    made_without_records(book, head, ctx, plan)
+}
+
+/// Whether the guard refuses the act (contract v26, W11.8, W11.23): an
+/// agent's, on a connection the sidecar did not stamp demo, while the guard
+/// is on.
+pub fn agent_live_refused(ctx: &Context) -> bool {
+    ctx.agent_orders_demo_only.unwrap_or(true) && ctx.agents() && !ctx.connectivity_demo
 }
 
 /// An entry of the control partition changing no record row but the

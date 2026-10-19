@@ -68,7 +68,7 @@ services:
         [ -s /keys/settings/key ] || openssl rand -out /keys/settings/key 32
         drawn() { printf 'h%s' "$$(openssl rand -hex 24)"; }
         [ -s /secrets/postgres ] || drawn > /secrets/postgres
-        for user in runtime instrument first-run dashboard-1 $${MERIDIAN_HARNESS_BROKER_USERS:?generate plugins.yaml with harness.py compose}; do
+        for user in runtime instrument analytics first-run dashboard-1 $${MERIDIAN_HARNESS_BROKER_USERS:?generate plugins.yaml with harness.py compose}; do
           [ -s "/secrets/nats/$$user" ] || drawn > "/secrets/nats/$$user"
         done
         b64() { xxd -r -p | base64 | tr -d '=\n'; }
@@ -240,6 +240,22 @@ services:
     depends_on: *serving
     environment:
       MERIDIAN_INSTANCE_ID: bor-1
+    volumes:
+      - secrets:/secrets:ro
+
+  # The analytics component (contract v26, W12): a job's figures, coordinator
+  # and worker in one process, reading for its client through the stores.
+  analytics:
+    <<: *runtime
+    command:
+      - |
+        set -e
+        broker=$$(cat /secrets/nats/analytics)
+        export MERIDIAN_BROKER_URL=nats://analytics:$$broker@nats:4222
+        exec meridian-analytics
+    depends_on: *serving
+    environment:
+      MERIDIAN_INSTANCE_ID: analytics
     volumes:
       - secrets:/secrets:ro
 

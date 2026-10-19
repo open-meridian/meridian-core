@@ -29,6 +29,11 @@ pub const ASK_PLATFORM_FOR_INSTRUMENT: &str =
 /// W3.3. What the platform answered, for the instrument store to keep.
 pub const INSTRUMENT_PULLED: &str = "platform.reference.event.instrument-pulled";
 
+/// W3.29 (contract v26): the instrument store asking about a venue's group
+/// of event contracts.
+pub const ASK_PLATFORM_FOR_EVENT_GROUP: &str =
+    "platform.reference.query.ask-platform-for-event-group";
+
 /// How long one ask may take before the person is told the platform did not
 /// answer. Within the dashboard's own wait for the reply (12 s), and longer
 /// than a resolve's bounded ask (8 s, the one-ID spec's requirement 15), so
@@ -83,6 +88,7 @@ impl Conductor {
     pub fn serve(self) {
         let this = Arc::new(self);
         let bus = Arc::clone(&this.bus);
+        let grouping = Arc::clone(&this);
         bus.serve(ASK_PLATFORM_FOR_INSTRUMENT, move |envelope| {
             if envelope.payload_type != "meridian.v1.AskPlatformForInstrumentRequest" {
                 return Err(format!(
@@ -101,6 +107,75 @@ impl Conductor {
                 reply.encode_to_vec(),
             ))
         });
+        let this = grouping;
+        bus.serve(ASK_PLATFORM_FOR_EVENT_GROUP, move |envelope| {
+            if envelope.payload_type != "meridian.v1.AskPlatformForEventGroupRequest" {
+                return Err(format!(
+                    "expected meridian.v1.AskPlatformForEventGroupRequest, got {}",
+                    envelope.payload_type
+                ));
+            }
+            let request =
+                meridian_domain::v1::AskPlatformForEventGroupRequest::decode(&envelope.payload[..])
+                    .map_err(|failed| format!("undecodable ask: {failed}"))?;
+            let asking = request.match_or_mint.unwrap_or_default();
+            // Members by the platform's own IDs alone: never a deployment's
+            // LCL- record (W3.29; decisions/037).
+            if let Some(i) = asking
+                .member_instrument_ids
+                .iter()
+                .position(|member| !member.starts_with("INS-"))
+            {
+                return Err(meridian_bus::refusal_naming(
+                    // REFUSAL_REASON_UNSPECIFIED: a malformed ask, no code.
+                    0,
+                    &[format!("match_or_mint.member_instrument_ids[{i}]")],
+                    "only the platform's INS- IDs travel; a group with a local member is the \
+                     deployment's own",
+                ));
+            }
+            let handle = tokio::runtime::Handle::try_current()
+                .map_err(|_| "the conductor has no runtime to ask on".to_string())?;
+            let reply = handle.block_on(this.event_group(&asking));
+            Ok((
+                "meridian.v1.AskPlatformForEventGroupReply".to_string(),
+                reply.encode_to_vec(),
+            ))
+        });
+    }
+
+    /// W3.29, W1.30 (contract v26): the platform asked to match or mint a
+    /// venue's group, bounded by [`ASKING`]; a platform without v26's route,
+    /// or not answering in time, is unreachable and the store keeps its own
+    /// group.
+    pub async fn event_group(
+        &self,
+        asking: &meridian_domain::v1::EscalateEventGroupRequest,
+    ) -> meridian_domain::v1::AskPlatformForEventGroupReply {
+        use meridian_domain::v1::AskPlatformForEventGroupReply;
+        let now_ns = self.clock.now_ns();
+        match tokio::time::timeout(ASKING, self.platform.escalate_event_group(asking, now_ns)).await
+        {
+            Err(_) => AskPlatformForEventGroupReply {
+                reachable: false,
+                detail: "the platform did not answer in time".into(),
+                answer: None,
+            },
+            Ok(Err(failed)) => AskPlatformForEventGroupReply {
+                reachable: false,
+                detail: failed.to_string(),
+                answer: None,
+            },
+            Ok(Ok(answer)) => AskPlatformForEventGroupReply {
+                reachable: true,
+                detail: if answer.pending_review {
+                    "queued for the platform's staff to review".into()
+                } else {
+                    String::new()
+                },
+                answer: Some(answer),
+            },
+        }
     }
 
     /// Ask, answer, and publish what came back.

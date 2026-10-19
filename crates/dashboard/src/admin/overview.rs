@@ -29,7 +29,7 @@ use super::view::{self, Line};
 
 /// The sections, in the order an administrator reaches for them: who may do
 /// what first, then the parts it is made of.
-const TABS: [(&str, &str); 10] = [
+const TABS: [(&str, &str); 12] = [
     ("plugins", "Plugins"),
     ("permissions", "Permissions"),
     ("user-groups", "User groups"),
@@ -37,6 +37,8 @@ const TABS: [(&str, &str); 10] = [
     ("access-groups", "Access groups"),
     ("accounts", "Accounts"),
     ("holds", "Holds"),
+    ("time-zone", "Time zone"),
+    ("model-routing", "Model routing"),
     ("agents", "Agents"),
     ("service-accounts", "Service accounts"),
     ("connected-clients", "Connected clients"),
@@ -200,6 +202,11 @@ pub fn render(
     books: &super::books::Books,
     agents: (String, String),
     service_accounts: (String, String),
+    time_zone: Option<&meridian_domain::v1::DeploymentTimeZoneSetting>,
+    routing: (
+        Option<&meridian_domain::v1::ListModelRoutingReply>,
+        Option<&meridian_domain::v1::ListMeasureDefinitionsReply>,
+    ),
     token: &str,
     notice: &str,
 ) -> String {
@@ -1011,6 +1018,55 @@ pub fn render(
          is deleted.",
         &add_button("hold", "a hold"),
         format!("{holds_body}{holds_dialog}"),
+    ));
+
+    // ── Time zone ───────────────────────────────────────────────────────────
+    // W6.35 (contract v26): the deployment's time zone, a deployment admin's.
+    let change = dialog(
+        "time-zone-change",
+        "Change the time zone",
+        "/admin/time-zone#time-zone",
+        token,
+        &super::time_zone::fields(time_zone),
+        "Change",
+    );
+    sections.push(section(
+        "time-zone",
+        "Time zone",
+        "The zone this deployment keeps its own times in: when a held booking is due, and the \
+         times shown here. Each change is kept with who made it and why.",
+        "<button type=\"button\" data-dialog-open=\"time-zone-change\">Change</button>",
+        format!(
+            "{}{change}",
+            super::time_zone::lines(time_zone, |subject| crate::tickets::display_name(
+                records, subject
+            ))
+        ),
+    ));
+
+    // ── Model routing ───────────────────────────────────────────────────────
+    // W12.6 (contract v26): the analytics routing table, a deployment admin's.
+    let (table, served) = routing;
+    let route = dialog(
+        "model-routing-change",
+        "Route a model id",
+        "/admin/model-routing#model-routing",
+        token,
+        &super::model_routing::fields(table),
+        "Change",
+    );
+    sections.push(section(
+        "model-routing",
+        "Model routing",
+        "Which implementation prices each model id across the deployment: built-in, or a \
+         launched pricing plugin. Each change is kept with who made it and why.",
+        "<button type=\"button\" data-dialog-open=\"model-routing-change\">Change</button>",
+        format!(
+            "{}{route}",
+            super::model_routing::lines(table, served, |subject| {
+                crate::tickets::display_name(records, subject)
+            })
+        ),
     ));
 
     // ── Agents ──────────────────────────────────────────────────────────────

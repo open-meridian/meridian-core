@@ -130,6 +130,11 @@ pub fn templates_from_json(
             calculation: text("calculation"),
             fields,
             match_rule,
+            // Its calculation package (contract v26, W1.24), refused whole
+            // where it does not stand: data the engine must equal exactly.
+            calculation_package: meridian_domain::template::package_from_json(
+                item.get("calculation_package"),
+            )?,
         });
     }
     Ok(out)

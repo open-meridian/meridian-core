@@ -313,6 +313,10 @@ message FirstRunConfiguration {
   // can administer, which is recoverable only with a claim code, so the Job
   // refuses it rather than writing it.
   AdministratorAnswer administrator = 4;
+
+  // Contract v26 (W7.5, W6.35): the deployment's time zone, an IANA
+  // time-zone ID; empty takes the default, `America/New_York`.
+  string deployment_time_zone = 5;
 }
 
 // What the Job did, step by step. Applying the same configuration again

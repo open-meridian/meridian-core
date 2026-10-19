@@ -11,12 +11,18 @@
 //! plugin reads or hears changes, the journal stays the record (decisions/031),
 //! and a snapshot plus its tail is exactly what a full replay makes, which
 //! [`tests::a_snapshot_and_its_tail_are_the_full_replay`] and the store's
-//! property tests hold it to. A snapshot is derived: rebuilt from the journal
-//! whenever it is missing, unreadable or of another [`FORMAT`], never edited.
+//! property tests hold it to. A snapshot is derived, never the record: taken
+//! when a command's replay reaches the interval, and from v26 when a read
+//! replays past it and at the book's start for an account past it with none
+//! of this [`FORMAT`] (an upgraded or a quiet account's); one unreadable or of
+//! another format is passed over until then.
 //!
 //! Kept as JSON, every record the contract's own type in its protobuf
 //! encoding, as an entry is (crate::journal), so the book defines no second
-//! shape for a record. Each of the book's own structures is written field by
+//! shape for a record. From format 2 (contract v26) it holds no entry's
+//! body: the book holds only what a fold needs and loads a body from the
+//! journal when a decision asks for it, so neither a snapshot nor the book's
+//! memory grows with what the entries carried. Each of the book's own structures is written field by
 //! field from an exhaustive destructuring, so a field added to one fails to
 //! compile here until the snapshot carries it.
 
@@ -30,7 +36,6 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 
 use crate::book::{Book, EntryIndex, LotState, PositionState};
-use crate::journal::Body;
 use crate::orders::{
     BookingHeld, ExecutionHeld, Ledger, LocateHeld, OrderHeld, PlacementHeld, ReceivedHeld,
 };
@@ -39,7 +44,9 @@ use crate::store::{Result, StoreError};
 /// The snapshot's shape and the projection it was made by. Raised whenever
 /// what a snapshot holds, or how the book folds an entry into it, changes:
 /// a snapshot of another format is stale, and rebuilt from the journal.
-pub const FORMAT: i32 = 1;
+/// Format 2 (contract v26, W9.10; ruling 165): an entry's index holds no
+/// body, which the book loads from the journal when a decision asks.
+pub const FORMAT: i32 = 2;
 
 /// The snapshot interval with nothing set: an account's projection kept
 /// every this many entries. From core's replay benchmark (item 122;
@@ -172,8 +179,11 @@ struct EntryShape {
     kind: String,
     effective_date: String,
     first: String,
-    body: String,
     reversed_by: Option<String>,
+    moves_positions: bool,
+    reverses: String,
+    acts: bool,
+    rolls: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -194,6 +204,8 @@ struct LedgerShape {
     sleeve_crosses: Vec<(String, String)>,
     alerts: Vec<(String, String)>,
     local_record_orders: Option<bool>,
+    #[serde(default)]
+    agent_orders_demo_only: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -278,6 +290,9 @@ pub fn encode(book: &Book) -> Vec<u8> {
         chains,
         ledger,
         waits_stated,
+        // The bodies a decision asked for: the journal's, never a
+        // snapshot's (format 2).
+        bodies: _,
     } = book;
     let shape = Shape {
         format: FORMAT,
@@ -352,16 +367,22 @@ fn entry_shape(entry: &EntryIndex) -> EntryShape {
         kind,
         effective_date,
         first,
-        body,
         reversed_by,
+        moves_positions,
+        reverses,
+        acts,
+        rolls,
     } = entry;
     EntryShape {
         entry_id: entry_id.clone(),
         kind: kind.clone(),
         effective_date: effective_date.clone(),
         first: pb(first),
-        body: STANDARD.encode(body.to_bytes()),
         reversed_by: reversed_by.clone(),
+        moves_positions: *moves_positions,
+        reverses: reverses.clone(),
+        acts: *acts,
+        rolls: *rolls,
     }
 }
 
@@ -383,6 +404,7 @@ fn ledger_shape(ledger: &Ledger) -> LedgerShape {
         sleeve_crosses,
         alerts,
         local_record_orders,
+        agent_orders_demo_only,
     } = ledger;
     LedgerShape {
         orders: orders
@@ -431,6 +453,7 @@ fn ledger_shape(ledger: &Ledger) -> LedgerShape {
         sleeve_crosses: map_pb(sleeve_crosses),
         alerts: map_pb(alerts),
         local_record_orders: *local_record_orders,
+        agent_orders_demo_only: *agent_orders_demo_only,
     }
 }
 
@@ -598,6 +621,7 @@ pub fn decode(bytes: &[u8]) -> Result<Book> {
         chains,
         ledger: ledger_from(shape.ledger)?,
         waits_stated: shape.waits_stated,
+        bodies: Default::default(),
     })
 }
 
@@ -637,16 +661,16 @@ fn position_from(shape: PositionShape) -> Result<PositionState> {
 }
 
 fn entry_from(shape: EntryShape) -> Result<EntryIndex> {
-    let body = STANDARD
-        .decode(&shape.body)
-        .map_err(|failed| StoreError::Invalid(format!("a snapshot's entry: {failed}")))?;
     Ok(EntryIndex {
         entry_id: shape.entry_id,
         kind: shape.kind,
         effective_date: shape.effective_date,
         first: un(&shape.first)?,
-        body: Body::from_bytes(&body)?,
         reversed_by: shape.reversed_by,
+        moves_positions: shape.moves_positions,
+        reverses: shape.reverses,
+        acts: shape.acts,
+        rolls: shape.rolls,
     })
 }
 
@@ -700,6 +724,7 @@ fn ledger_from(shape: LedgerShape) -> Result<Ledger> {
         sleeve_crosses: unmap_pb(&shape.sleeve_crosses)?,
         alerts: unmap_pb(&shape.alerts)?,
         local_record_orders: shape.local_record_orders,
+        agent_orders_demo_only: shape.agent_orders_demo_only,
     })
 }
 

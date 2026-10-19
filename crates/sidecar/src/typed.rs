@@ -171,6 +171,14 @@ const VENUE_FACTS: [(&str, &str); 3] = [
 /// A placement (CreatePlacement, W11.8, contract v22), whose connectivity
 /// plugin the sidecar holds to the claims' connectivity_instance_ids.
 const CREATE_PLACEMENT: &str = "meridian.v1.CreatePlacementRequest";
+/// W10.10's request, whose kind the plugin's roles must read.
+const QUERY_LAKE: &str = "meridian.v1.QueryLakeRequest";
+
+/// An accept of fills (W11.23): to a new order, held to the agents' guard
+/// (contract v26).
+const ACCEPT_EXECUTION: &str = "meridian.v1.AcceptExecutionRequest";
+/// The environments a connection is demo in (W11.8, W6.11; G1 question 5).
+const DEMO_ENVIRONMENTS: [&str; 2] = ["sandbox", "paper"];
 /// An order's change (W11.3, contract v22): a quantity change is never an
 /// `ems`'s.
 const REQUEST_ORDER_CHANGE: &str = "meridian.v1.RequestOrderChangeRequest";
@@ -241,7 +249,10 @@ pub(crate) fn stamp_of(claims: &CallerClaims, with_prepared: bool) -> Stamp {
         },
         // Decided per placement, where the command is sent (contract v22).
         connectivity_allowed: false,
+        connectivity_demo: false,
         account_scope: None,
+        // The analytics component's alone (W12.2); a sidecar never sets it.
+        on_behalf_of_instance_id: String::new(),
     }
 }
 
@@ -468,6 +479,9 @@ impl Sidecar {
         self.daily.operation(self.clock.now_ns());
         let topic = self.own_topic(topic);
         self.granted(&topic)?;
+        if payload_type == QUERY_LAKE {
+            self.reads_the_kind(&message.encode_to_vec())?;
+        }
         let message = self.kept_at_the_edge(payload_type, message)?;
         self.dates_stand(payload_type, &message.encode_to_vec())?;
         let mut stamp = if AS_ITSELF.contains(&topic.as_str()) {
@@ -674,9 +688,39 @@ impl Sidecar {
                 .unwrap_or_default();
             !named.is_empty() && claims.connectivity_instance_ids.contains(&named)
         });
+        // Contract v26 (W11.8, W11.23, W11.38): whether the connection is
+        // demo, which the book refuses an agent's live order by. A
+        // placement's connection is demo where the claims name it demo -- its
+        // environment setting, core's record, sandbox or paper -- and its
+        // session's reported environment on the venue's catalogue says so
+        // too, read here as an ems reads its catalogue; a mismatch, or no
+        // report, is live. An accept to a new order names no connection,
+        // so it is demo only where every connection the caller may route
+        // through from this ems is (failing closed).
+        let demo = match payload_type {
+            CREATE_PLACEMENT => {
+                let placement =
+                    domain::CreatePlacementRequest::decode(message.encode_to_vec().as_slice())
+                        .unwrap_or_default();
+                let named = placement.connectivity_instance_id;
+                !named.is_empty()
+                    && claims.demo_connectivity_instance_ids.contains(&named)
+                    && self
+                        .session_demo(&named, &placement.venue_account_code)
+                        .await
+            }
+            ACCEPT_EXECUTION => {
+                !claims.connectivity_instance_ids.is_empty()
+                    && claims
+                        .connectivity_instance_ids
+                        .iter()
+                        .all(|id| claims.demo_connectivity_instance_ids.contains(id))
+            }
+            _ => false,
+        };
         let unmapped = account.is_none();
         let reply: Response<R> = self
-            .ask_routed(&topic, payload_type, message, &claims, scope, routed)
+            .ask_routed_demo(&topic, payload_type, message, &claims, scope, routed, demo)
             .await?;
         self.count_unplaced(payload_type, unmapped, &reply.get_ref().encode_to_vec());
         Ok(reply)
@@ -738,6 +782,49 @@ impl Sidecar {
         scope: Option<Vec<String>>,
         routed: Option<bool>,
     ) -> Result<Response<R>, Status> {
+        self.ask_routed_demo(topic, payload_type, message, claims, scope, routed, false)
+            .await
+    }
+
+    /// Whether the venue's catalogue the connectivity plugin published for
+    /// `code` reports a demo environment (contract v26, W11.20): the
+    /// session's key of the agents' guard. Unreadable, or not reported, is
+    /// live.
+    async fn session_demo(&self, connectivity: &str, code: &str) -> bool {
+        let asked = self
+            .bus
+            .call(
+                AS_ITSELF[0],
+                "meridian.v1.ReadVenueCatalogueRequest",
+                domain::ReadVenueCatalogueRequest {
+                    connectivity_instance_id: connectivity.to_string(),
+                    venue_account_code: code.to_string(),
+                }
+                .encode_to_vec(),
+                None,
+                Some(std::time::Duration::from_secs(5)),
+            )
+            .await;
+        asked
+            .ok()
+            .and_then(|(_, bytes)| domain::ReadVenueCatalogueReply::decode(&bytes[..]).ok())
+            .and_then(|reply| reply.catalogue)
+            .is_some_and(|catalogue| DEMO_ENVIRONMENTS.contains(&catalogue.environment.as_str()))
+    }
+
+    /// [`Self::ask_routed`], with the connection's demo verdict (contract
+    /// v26).
+    #[allow(clippy::too_many_arguments)]
+    async fn ask_routed_demo<D: Message, R: Message + Default>(
+        &self,
+        topic: &str,
+        payload_type: &str,
+        message: D,
+        claims: &CallerClaims,
+        scope: Option<Vec<String>>,
+        routed: Option<bool>,
+        demo: bool,
+    ) -> Result<Response<R>, Status> {
         // The prepared change the person made this from (W4.9, contract
         // v20), as the dashboard's assertion named it; never alone. A service
         // account's kind and owner beside its subject (contract v21), and the
@@ -745,6 +832,7 @@ impl Sidecar {
         let mut stamp = stamp_of(claims, true);
         stamp.account_scope = scope;
         stamp.connectivity_allowed = routed.unwrap_or(false);
+        stamp.connectivity_demo = demo;
         let (_, payload) = self
             .bus
             .call_stamped(
@@ -783,6 +871,28 @@ impl Sidecar {
 
     /// Which of this plugin's roles hold `topic` among their generated
     /// grants (decisions/033, point 3): what a person's act is admitted by.
+    /// W10.10 (contract v26): a QueryLake asks only a kind one of this
+    /// plugin's roles reads, as the reads' rows grant them -- `reporting`
+    /// reads no trades or quotes (the lake spec's Q6). Refused here, naming
+    /// `kind`; the lake checks the kind's spelling and the entitlements.
+    fn reads_the_kind(&self, payload: &[u8]) -> Result<(), Status> {
+        let asked = meridian_domain::v1::QueryLakeRequest::decode(payload).map_err(|failed| {
+            Status::invalid_argument(format!("an undecodable query: {failed}"))
+        })?;
+        let kind = asked.kind.trim();
+        if !meridian_domain::lake::QUERY_KINDS.contains(&kind)
+            || meridian_domain::lake::roles_read_kind(&self.identity.roles, kind)
+        {
+            return Ok(());
+        }
+        let refusal = format!(
+            "kind: no role this plugin holds ({}) reads {kind}",
+            self.identity.roles.join(", ")
+        );
+        self.note_refusal(&refusal);
+        Err(Status::permission_denied(refusal))
+    }
+
     fn roles_granting(&self, topic: &str) -> Vec<String> {
         self.contract.roles_granting(&self.identity.roles, topic)
     }

@@ -1,0 +1,5 @@
+Vendored from open-meridian/meridian-python, tests/reference_cases, at 98726ab
+(the SDK's v26 branch: ruling 320, pnl v1 unrealized alone and realized as
+pnl v2), by `make reference-cases`; never edited here.
+`make check-reference-cases` holds them to the SDK's, byte for byte, and the
+engine's tests to the reference's figures and hashes (requirement 36).

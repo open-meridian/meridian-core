@@ -78,9 +78,6 @@ ol.notes,ol.notices{list-style:none;margin:0;padding:0}\
 ol.notes>li,ol.notices>li{padding:.7rem 0;border-top:1px solid var(--line-soft)}\
 ol.notes>li:first-child,ol.notices>li:first-child{border-top:0}\
 table.notices tr[data-unread] a{font-weight:650}\
-.notice-narrow{display:none}.notice-narrow>details.notice>summary{cursor:pointer;color:var(--ink-soft);font-size:.85rem}\
-@media (max-width:37.5rem){.notice-wide{display:none}.notice-narrow{display:block}}\
-@media (min-width:60.01rem){.listing-overview{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(0,1fr);column-gap:1.5rem;align-items:start}.listing-overview>.notice-wide{grid-row:1 / span 2}}\
 dl.ticket-facts{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:.3rem 1rem;margin:.8rem 0 0}\
 dl.ticket-facts dt{color:var(--ink-soft)}dl.ticket-facts dd{margin:0;overflow-wrap:anywhere}\
 ul.references{margin:0;padding-left:1.1rem}\
@@ -430,6 +427,8 @@ nav.setting-groups .badge{margin:0 0 0 .3rem;padding:.02rem .4rem;font-size:.7re
 form.settings .group-title{margin:.9rem 0 .4rem}form.settings.js .group-title{display:none}\
 form.settings.js .setting-group:not([id^=settings-developer]) .setting-head .need{display:none}\
 @media (max-width:40rem){form.settings .setting-head{flex-wrap:nowrap;overflow:hidden;white-space:nowrap}\
+form.settings .setting-head>*{flex:none}form.settings .setting-head .setting-label{flex:0 1 auto;min-width:0;\
+overflow:hidden;text-overflow:ellipsis}\
 form.settings .setting-head .id{display:none}\
 section.settings-page{padding:.85rem .9rem}form.settings .fields{gap:.5rem 1.25rem}}\
 .table-setting .about-line{margin:0 0 .5rem;font-size:.84rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}\
@@ -479,12 +478,32 @@ form.consent section.summary .hint{display:none}}";
 
 /// A version's documentation (W6.9, contract v25; [`crate::documentation`]):
 /// drawn only on a page holding it, so no other page carries its weight.
+/// The Plugins pages' own (rulings 274, 276, 305): the filter bar, the
+/// plugin tables and their row menus, and the Terms line; drawn only on a
+/// page that has one.
+const PLUGIN_TABLE_STYLE: &str = "\
+form.filter-bar{display:flex;gap:.5rem;align-items:center;margin:0 0 .6rem}form.filter-bar>*{margin:0}\
+.filter-bar .grow{flex:1 1 12rem;min-width:0}.filter-selects{display:flex;gap:.5rem;min-width:0}.filter-selects select{margin:0;flex:none;width:auto}\
+@media (max-width:40rem){form.filter-bar{flex-wrap:wrap}.filter-bar .grow{flex-basis:100%}.filter-selects{flex:1}\
+.filter-selects select{flex:1;min-width:0}}\
+.plugin-table{width:100%}.plugin-table th,.plugin-table td{white-space:nowrap}.plugin-table td.actions{white-space:normal}\
+.plugin-table .keep,.plugin-table .keep a{overflow:visible;text-overflow:clip;max-width:none}\
+.inline-act{display:inline-flex;gap:.3rem;margin:0}.inline-act input{width:8rem;margin:0}\
+@media (max-width:60rem){.plugin-table .wide{display:none}}@media (max-width:40rem){.plugin-table .mid{display:none}}\
+.terms-line{margin:.4rem 0 .8rem;color:var(--ink-soft);font-size:.9rem}\
+.row-acts{position:relative;display:inline-block}.row-acts>summary{padding:.25rem .6rem;border:1px solid var(--line-strong);\
+border-radius:var(--radius);cursor:pointer;font-size:.86rem;list-style:none}.row-acts>summary::after{content:\" \\25BE\"}\
+.row-acts .menu-pop{position:absolute;top:calc(100% + .25rem);right:0;display:flex;flex-direction:column;gap:.35rem;\
+padding:.5rem;z-index:20;background:var(--card);border:1px solid var(--line);border-radius:var(--radius)}\
+.row-acts .menu-pop>*{margin:0}\
+";
+
 const DOCS_STYLE: &str = "\
 .docs{display:flex;flex-direction:column;gap:.5rem;min-height:0}\
 .docs-head{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:.25rem 1rem}\
 .docs-what{margin:0;color:var(--ink-soft);font-size:.88rem;min-width:0;overflow-wrap:anywhere}\
 .docs nav.docs-sections{margin:0;flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none}\
-.docs-body{display:grid;grid-template-columns:11rem minmax(0,1fr) 15rem;gap:1rem;min-height:0;flex:1 1 0}\
+.docs-body{display:grid;grid-template-columns:11rem minmax(0,1fr);gap:1rem;min-height:0;flex:1 1 0}\
 .docs-contents ol{list-style:none;margin:0;padding:0}.docs-contents li a{display:block;padding:.25rem .5rem;\
 border-radius:var(--radius);color:var(--ink-soft);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}\
 .docs-contents li a.here{background:var(--accent-wash);color:var(--accent);font-weight:600}\
@@ -499,14 +518,10 @@ background:var(--card);border:1px solid var(--line);border-radius:var(--radius)}
 .docs-vendor th,.docs-vendor td{padding:.25rem .5rem;border-bottom:1px solid var(--line-soft);text-align:left}\
 .docs-vendor .doc-host{color:var(--ink-faint);font-size:.85em}.docs-vendor .doc-leaves{color:var(--ink-faint);margin-left:.1rem}\
 .docs-vendor .doc-image,.docs-vendor .doc-raw{color:var(--ink-faint)}.docs-vendor{overflow-wrap:anywhere}\
-.docs-notice{min-width:0;overflow:auto;font-size:.8rem;color:var(--ink-soft)}.docs-notice h3{font-size:.86rem;margin:0 0 .3rem}\
-.docs-notice p{margin:0 0 .4rem}.docs-head details.notice>summary{cursor:pointer;color:var(--ink-soft);font-size:.85rem}\
-.docs-head details.notice[open]{flex-basis:100%;font-size:.82rem}.docs-head details.notice h3{display:none}\
 .docs-reference .hint{margin:0 0 .4rem}\
 .docs-note{display:block;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink-soft);font-size:.85rem}\
-@media (min-width:60.01rem){.docs-head details.notice{display:none}}\
 @media (max-width:60rem){.docs-body{grid-template-columns:minmax(0,1fr);grid-template-rows:auto minmax(0,1fr)}\
-.docs-notice{display:none}.docs-contents-menu>summary{display:block;cursor:pointer;color:var(--ink-soft);font-size:.85rem}\
+.docs-contents-menu>summary{display:block;cursor:pointer;color:var(--ink-soft);font-size:.85rem}\
 .docs-contents-menu:not([open]) ol{display:none}.docs-contents ol{display:flex;flex-wrap:wrap;gap:.15rem}}\
 body:has(.docs){height:100vh;height:100dvh;min-height:0}\
 main:has(.docs){flex:1 1 0;min-height:0;display:flex;flex-direction:column;padding-bottom:var(--space-4)}\
@@ -1251,13 +1266,21 @@ fn document(title: &str, body: &str, chrome: &Chrome, development: bool) -> Stri
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <meta name=\"color-scheme\" content=\"light dark\">\
-         <title>{} · Open Meridian</title>{icon}<script>{HEAD_SCRIPT}</script>{kit}<style>{STYLE}{docs}</style></head><body>\n\
+         <title>{} · Open Meridian</title>{icon}<script>{HEAD_SCRIPT}</script>{kit}<style>{STYLE}{docs}{plugin_tables}</style></head><body>\n\
          {}\n{banner}\n<main class=\"{main}\">\n{}\n</main>\n<script>{CHROME_SCRIPT}</script>{inbox}\n</body></html>\n",
         escape(title),
         header(chrome),
         body,
         icon = crate::brand::LINKS,
         docs = if body.contains("class=\"docs\"") { DOCS_STYLE } else { "" },
+        plugin_tables = if ["filter-bar", "plugin-table", "terms-line"]
+            .iter()
+            .any(|class| body.contains(class))
+        {
+            PLUGIN_TABLE_STYLE
+        } else {
+            ""
+        },
         inbox = if chrome.viewer.is_some() {
             format!("<script>{INBOX_SCRIPT}</script>")
         } else {

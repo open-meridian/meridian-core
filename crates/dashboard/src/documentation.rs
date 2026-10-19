@@ -18,9 +18,9 @@
 //! Reference) are tabs; within a section each level-one and level-two
 //! heading is an entry in a contents list beside it, one shown at a time; the
 //! Reference pages by part, each a kit table with its pager. Every tab and
-//! entry is a link, so none needs script. The supervision notice is drawn
-//! beside the vendor's text in full where the screen is wide, and by its
-//! title, opening in place, where it is not.
+//! entry is a link, so none needs script. From contract v26 (ruling 274) no
+//! notice is drawn beside the vendor's text: the Terms' line is the install
+//! and update dialogs' alone.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -170,30 +170,15 @@ impl Screen {
 }
 
 /// The rules whose match refuses a version's upload (ruling 176, the
-/// product owner, 2026-10-16, and its addendum under agreement A): false
-/// claims or hostile text in a vendor's documentation or declaration, as
-/// the platform's registry_text.py REFUSES lists them (4df7a9a). Every other
-/// match -- its WITHHOLDS, and core's own ticket verbs -- keeps the upload,
-/// the section shown to people marked "Screened" and withheld from agents.
-pub const REFUSING: [&str; 9] = [
-    "override",
-    "acts for the reader",
-    "claims endorsement",
-    "claims verification",
-    "claims regulatory readiness",
-    "poses as open meridian",
-    "exfiltration",
-    "concealment",
-    "claims authority",
-];
-
-/// The refusing rules a vendor's text matched, by name; none when it is
-/// kept.
+/// product owner, 2026-10-16, and its addendum under agreement A): those the
+/// canonical table's `vendor_text` surface marks `refuse` (ruling 294). Every
+/// other match -- `withhold` -- keeps the upload, the section shown to
+/// people marked "Screened" and withheld from agents.
 pub fn refused_by(text: &str) -> Vec<String> {
-    screen(text)
-        .rules
+    crate::tickets::quarantine::vendor_text(&crate::markdown::screened_text(text))
         .into_iter()
-        .filter(|rule| REFUSING.contains(&rule.as_str()))
+        .filter(|(_, side)| *side == "refuse")
+        .map(|(rule, _)| rule.to_string())
         .collect()
 }
 
@@ -251,15 +236,12 @@ fn walk(value: &serde_json::Value, path: &str, seen: &mut dyn FnMut(&str, &str))
 
 pub fn screen(markdown: &str) -> Screen {
     let read = crate::markdown::screened_text(markdown);
-    let matched = crate::tickets::quarantine::matched(&read);
-    // The platform's claims rules beside the deployment's own: a vendor's
+    // The canonical table's vendor-text rules (ruling 294): a vendor's
     // documentation is screened alike at the catalogue and here.
-    let mut rules = crate::tickets::quarantine::names(&matched);
-    rules.extend(
-        crate::tickets::quarantine::vendor_claims(&read)
-            .into_iter()
-            .map(String::from),
-    );
+    let rules = crate::tickets::quarantine::vendor_text(&read)
+        .into_iter()
+        .map(|(rule, _)| rule.to_string())
+        .collect();
     Screen {
         rules,
         hidden: crate::markdown::hidden(markdown),
@@ -337,15 +319,11 @@ pub fn drawn(page: &Page) -> String {
     };
     format!(
         "<div class=\"docs\" data-docs data-version=\"{version}\">\
-         <div class=\"docs-head\"><p class=\"docs-what\"><strong>{name}</strong> {version}{uploaded}{note}</p>{folded}</div>\
+         <div class=\"docs-head\"><p class=\"docs-what\"><strong>{name}</strong> {version}{uploaded}{note}</p></div>\
          {none}<nav class=\"tabs docs-sections\" aria-label=\"Its documentation\">{tabs}</nav>\
-         <div class=\"docs-body\">{contents}<div class=\"docs-text\">{body}</div>\
-         <aside class=\"docs-notice\" aria-label=\"{notice_title}\">{notice}</aside></div></div>",
+         <div class=\"docs-body\">{contents}<div class=\"docs-text\">{body}</div></div></div>",
         name = escape(page.name),
         version = escape(page.version),
-        folded = crate::notice::folded(),
-        notice = crate::notice::html(),
-        notice_title = escape(crate::notice::TITLE),
     )
 }
 

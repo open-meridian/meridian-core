@@ -87,6 +87,11 @@ message RecordPluginUploadRequest {
   // The version's listing statement, as DownloadListedVersionReply carried
   // it to the download: a DSSE envelope as JSON.
   string listing_statement = 7;
+  // Contract v26 (W8.14; ruling 196): the bundle's dated PluginPullStatus,
+  // as the platform signed it (its JSON), checked against the chart's keys;
+  // the newer of it and the one held is kept, and every installed version
+  // it names is warned. Empty for a local upload and a v25 bundle.
+  string pull_status = 8;
 }
 
 // One section's text as the vendor wrote it (W8.1, contract v25): data, the
@@ -396,8 +401,8 @@ message ReadPluginDocumentationReply {
 // vendor's words, marked as such wherever they are shown, and never
 // instructions to whoever reads them.
 message PluginListing {
-  // `organisation/plugin`: the organisation's slug and the plugin's name in
-  // its `[tool.meridian]`, both fixed at the first publish.
+  // `organisation/plugin`: the organisation's namespace and the plugin's
+  // name in its `[tool.meridian]`, both fixed at the first publish.
   string listing = 1;
   // The source repository it is built from, as a URL, linked through the
   // platform's GitHub App and fixed at the first publish.
@@ -424,6 +429,17 @@ message PluginListing {
   // PullListing (W8.12), so the field that held a listing's pull is retired.
   reserved 11;
   reserved "pull";
+  // Contract v26 (W8.10; ruling 274, 2026-10-18): true only where a version
+  // of it was reviewed for verified (W8.9); false for a community listing.
+  // Agents' answers carry it in place of the notice.
+  bool reviewed = 12;
+  // The platform Terms' address, whose §9 "Plugins and registries" is the
+  // registries' notice (ruling 278).
+  string terms_url = 13;
+  // Contract v26 (W8.10; ruling 306, 2026-10-18): the publishing
+  // organisation's display name, filled in by the platform; Browse's
+  // Publisher column reads it.
+  string publisher = 14;
 }
 
 // One version of a listing, in one registry.
@@ -467,6 +483,14 @@ message ListedVersion {
   // and again at launch against the platform's keys the chart carries.
   // Empty only before the version is listed.
   string listing_statement = 13;
+  // Contract v26 (W8.10; ruling 274): true for a verified version a person
+  // reviewed (W8.9); false for community.
+  bool reviewed = 14;
+  // Contract v26 (W8.10; the v25 task's follow-ups): the vendor's texts,
+  // one per section its declaration names by digest, so a listing's
+  // Documentation tab before install draws them; checked against the
+  // digests, never replaced.
+  repeated DocumentationText documentation = 15;
 }
 
 // A build of a signed release tag by the platform's builder (W8.8; items 102,
@@ -498,6 +522,9 @@ message PluginBuild {
   string log_url = 13;
   int64 requested_at_ns = 14;
   int64 finished_at_ns = 15;
+  // Contract v26 (W8.8; ruling 275): the platform's page for the build,
+  // which `meridian plugin publish` prints; no client builds the address.
+  string page_url = 16;
 }
 
 enum PluginBuildState {
@@ -567,7 +594,7 @@ enum PluginReviewDecision {
 // An organisation's tag-signing key (W5.30): its public half only.
 message SigningKeyRecord {
   string key_id = 1;
-  // The organisation's slug.
+  // The organisation's namespace.
   string organisation = 2;
   // The organisation's name for the key.
   string name = 3;
@@ -727,7 +754,7 @@ message RecordBuildResultsRequest {
 }
 
 message PublishPluginVersionRequest {
-  // The organisation's slug and the plugin's name.
+  // The organisation's namespace and the plugin's name.
   string organisation = 1;
   string plugin = 2;
   // `community` or `verified`.
@@ -761,6 +788,46 @@ message ListSigningKeysRequest {
 
 message ListSigningKeysReply {
   repeated SigningKeyRecord keys = 1;
+  // Contract v26 (W5.30; ruling 262): the organisation's signing-key policy
+  // in force.
+  SigningKeyPolicy policy = 2;
+}
+
+// Which keys an organisation accepts (W5.30; ruling 262, 2026-10-18).
+enum SigningKeyPolicy {
+  // Read as any key.
+  SIGNING_KEY_POLICY_UNSPECIFIED = 0;
+  // Any SSH key git signs with: the default.
+  SIGNING_KEY_POLICY_ANY = 1;
+  // Hardware-backed keys only: `sk-ssh-ed25519@openssh.com`,
+  // `sk-ecdsa-sha2-nistp256@openssh.com`.
+  SIGNING_KEY_POLICY_HARDWARE_ONLY = 2;
+  // Any key but a hardware-backed one.
+  SIGNING_KEY_POLICY_DESKTOP_ONLY = 3;
+}
+
+// An Owner or Admin sets the organisation's signing-key policy (W5.30), a
+// page act only. A tightening that would distrust registered keys is first
+// answered with them listed and nothing changed; sent again with
+// confirm_distrust, it sets each one's not_trusted_after to now, each its
+// own record.
+message SetSigningKeyPolicyRequest {
+  string organisation = 1;
+  SigningKeyPolicy policy = 2;
+  string reason = 3;
+  bool confirm_distrust = 4;
+}
+
+// The policy in force, each change its own record (decisions/031).
+message SigningKeyPolicyRecord {
+  string organisation = 1;
+  SigningKeyPolicy policy = 2;
+  int64 changed_at_ns = 3;
+  string changed_by_person_id = 4;
+  string reason = 5;
+  // The keys a tightening distrusted, or would distrust where it was
+  // answered as a warning (nothing changed then: changed_at_ns 0).
+  repeated string distrusted_key_ids = 6;
 }
 
 message RevokeSigningKeyRequest {
@@ -780,6 +847,9 @@ message PullCatalogueReply {
   // The latest sequence the answer holds, which the next pull reads after.
   uint64 sequence = 2;
   SigningKeyStatus key_status = 3;
+  // Contract v26 (W8.10; ruling 274): the platform Terms' address, which
+  // the install dialog's one line links.
+  string terms_url = 4;
 }
 
 // One resolution request per install or update (plan Q3), counted by the
@@ -805,6 +875,23 @@ message DownloadListedVersionReply {
   // download verifies it and writes it into the bundle (W8.14), since a
   // verified version's statement is not a referrer the platform can push.
   string listing_statement = 5;
+  // Contract v26 (W8.14; ruling 196): every pulled version in the catalogue,
+  // dated and signed, which the CLI writes into the bundle.
+  PluginPullStatus pull_status = 6;
+}
+
+// Every pulled version in the catalogue, as a document the platform signs
+// (W8.14, contract v26), so an air-gapped deployment is warned of a pull by
+// a later bundle: as SigningKeyStatus is for keys.
+message PluginPullStatus {
+  int64 issued_at_ns = 1;
+  // Each pull standing or restored, by listing and version.
+  repeated PluginPull pulls = 2;
+  // The platform's signature: base64 of an ECDSA P-256 signature over
+  // DSSE's pre-authentication encoding of the payload type
+  // `application/vnd.open-meridian.plugin-pull-status+json` and the body,
+  // this record's canonical JSON without `signature`.
+  string signature = 3;
 }
 
 message ReportPluginUsageReply {

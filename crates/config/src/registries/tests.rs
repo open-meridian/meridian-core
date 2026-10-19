@@ -502,7 +502,94 @@ fn bundle<'a>(key_status: &'a str, statement: &'a str) -> Bundle<'a> {
         digest: "",
         key_status,
         listing_statement: statement,
+        pull_status: "",
     }
+}
+
+/// Contract v26 (ruling 196): a bundle's signed pull status is checked
+/// against the chart's keys, the newer kept, and the version it names warned
+/// in the catalogue's copy; one not the platform's is refused naming it, and
+/// an older one leaves the newer held.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bundle_s_pull_status_is_checked_kept_when_newer_and_warns_the_version_it_names() {
+    let platform = Platform::new();
+    let held = hold(&platform);
+    held.pull().await.unwrap();
+    let (key_status, statement) = bundled(&platform);
+    let image = digest(0xab);
+    let status = |issued: i64, restored: i64| {
+        platform
+            .signer
+            .sign_pull_status(json!({
+                "issued_at_ns": issued,
+                "pulls": [{"listing": LISTING, "version": "1.4.0", "kind": "PULL_REASON_KIND_TERMS_BREACH",
+                           "reason": "a breach", "pulled_at_ns": 10, "notice_id": "",
+                           "restored_at_ns": restored}],
+            }))
+            .to_string()
+    };
+    let forged = TestSigner::new()
+        .sign_pull_status(json!({"issued_at_ns": 5, "pulls": []}))
+        .to_string();
+    let refused = held
+        .carried(&Bundle {
+            digest: &image,
+            pull_status: &forged,
+            ..bundle(&key_status, &statement)
+        })
+        .await
+        .unwrap_err();
+    assert!(refused.starts_with("the pull status:"), "{refused}");
+    let newer = status(2_000, 0);
+    held.carried(&Bundle {
+        digest: &image,
+        pull_status: &newer,
+        ..bundle(&key_status, &statement)
+    })
+    .await
+    .unwrap();
+    let listed = held.list(&Default::default()).await.unwrap();
+    let pulled = listed.listings[0].versions[0].pull.clone().expect("warned");
+    assert_eq!(
+        (pulled.pulled_at_ns, pulled.reason.as_str()),
+        (10, "a breach")
+    );
+    // An older record leaves the newer held.
+    let older = status(1_000, 20);
+    held.carried(&Bundle {
+        digest: &image,
+        pull_status: &older,
+        ..bundle(&key_status, &statement)
+    })
+    .await
+    .unwrap();
+    let listed = held.list(&Default::default()).await.unwrap();
+    assert_eq!(
+        listed.listings[0].versions[0]
+            .pull
+            .as_ref()
+            .unwrap()
+            .restored_at_ns,
+        0
+    );
+    // A later restoration clears it.
+    let restored = status(3_000, 30);
+    held.carried(&Bundle {
+        digest: &image,
+        pull_status: &restored,
+        ..bundle(&key_status, &statement)
+    })
+    .await
+    .unwrap();
+    let listed = held.list(&Default::default()).await.unwrap();
+    assert_eq!(
+        listed.listings[0].versions[0]
+            .pull
+            .as_ref()
+            .unwrap()
+            .restored_at_ns,
+        30
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

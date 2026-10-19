@@ -96,7 +96,7 @@ impl Level {
 /// The order path's two core acts, at may not for agents until the
 /// deployment admin loosens them (contract v22; the order-path plan's
 /// refresh, Q44).
-pub const MAY_NOT_UNTIL_LOOSENED: [&str; 10] = [
+pub const MAY_NOT_UNTIL_LOOSENED: [&str; 12] = [
     "dashboard__set_account_attribute",
     "dashboard__set_trading_instruction",
     // Contract v24 (W11.36): as the trading instruction is.
@@ -111,6 +111,10 @@ pub const MAY_NOT_UNTIL_LOOSENED: [&str; 10] = [
     "dashboard__update_plugin",
     "dashboard__acknowledge_pull",
     "dashboard__set_reports_plugin_usage",
+    // Contract v26 (W6.35): the deployment's time zone.
+    "dashboard__set_deployment_time_zone",
+    // Contract v26 (W12.6): the analytics routing table.
+    "dashboard__set_model_routing",
 ];
 
 /// Core acts an agent may prepare but not make until the deployment admin
@@ -118,9 +122,17 @@ pub const MAY_NOT_UNTIL_LOOSENED: [&str; 10] = [
 /// which an agent prepares for the admin to make).
 pub const PREPARE_ONLY_UNTIL_LOOSENED: [&str; 1] = ["dashboard__apply_migration"];
 
+/// Core acts agents may never make, whatever any level says (contract v26,
+/// W11.38; G1 question 5): the agents' guard, which an agent may prepare
+/// and a person makes. No row loosens it, and a form refuses one that would.
+pub const MAY_NOT_ALWAYS: [&str; 1] = ["dashboard__set_agent_orders_demo_only"];
+
 /// The level an act stands at with no row of its own.
 pub fn default_for(act: &str) -> Level {
-    if ON_A_PREPARED_CHANGE.contains(&act) || MAY_NOT_UNTIL_LOOSENED.contains(&act) {
+    if ON_A_PREPARED_CHANGE.contains(&act)
+        || MAY_NOT_UNTIL_LOOSENED.contains(&act)
+        || MAY_NOT_ALWAYS.contains(&act)
+    {
         Level::MayNot
     } else if PREPARE_ONLY_UNTIL_LOOSENED.contains(&act) {
         Level::PrepareOnly
@@ -164,6 +176,9 @@ impl Levels {
 
     /// The act's own level, its admins' (or its default), and its gate.
     pub fn own(&self, act: &str) -> (Level, bool) {
+        if MAY_NOT_ALWAYS.contains(&act) {
+            return (Level::MayNot, false);
+        }
         match self.at(act, ACT) {
             Some(row) => (Level::from_code(row.level), row.second_pair_of_eyes),
             None => (default_for(act), false),
@@ -218,6 +233,10 @@ impl Levels {
                 level = Level::MayNot;
             }
         }
+        if MAY_NOT_ALWAYS.contains(&act) && level != Level::MayNot {
+            level = Level::MayNot;
+            from = "the act, which no level loosens".into();
+        }
         Applies {
             level,
             second_pair_of_eyes: eyes,
@@ -239,6 +258,19 @@ impl Levels {
 /// Why a level may not be set at a scope, or None: prepare only, or a gate,
 /// on an act that cannot be prepared; the gate on at the ceiling is never
 /// turned off below it (that one is kept and shown).
+/// Why a level may not be set on `act`: one loosening an act agents may
+/// never make (contract v26, W11.38); otherwise as [`refused`].
+pub fn refused_for(act: &str, level: Level, eyes: bool, preparable: bool) -> Option<String> {
+    if MAY_NOT_ALWAYS.contains(&act) && level != Level::MayNot {
+        return Some(
+            "level: agents may not make this act, and no level loosens that: an agent may \
+             prepare it, and a person makes it (W11.38)"
+                .into(),
+        );
+    }
+    refused(level, eyes, preparable)
+}
+
 pub fn refused(level: Level, eyes: bool, preparable: bool) -> Option<String> {
     if !preparable && level == Level::PrepareOnly {
         return Some(

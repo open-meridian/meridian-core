@@ -672,6 +672,9 @@ struct Answers {
     backend: LoginBackendAnswer,
     addresses: AddressesAnswer,
     administrator: AdministratorAnswer,
+    /// The deployment's time zone (contract v26, W7.5, W6.35), an IANA ID;
+    /// empty takes the default.
+    deployment_time_zone: String,
 }
 
 impl Answers {
@@ -696,6 +699,7 @@ impl Answers {
             login_backend: Some(self.backend.clone()),
             addresses: Some(self.addresses.clone()),
             administrator: Some(self.administrator.clone()),
+            deployment_time_zone: self.deployment_time_zone.clone(),
         }
     }
 }
@@ -823,6 +827,7 @@ async fn answers(app: &Arc<App>, fields: &Fields) -> Result<Answers, String> {
             dashboard_url: field("dashboard_url"),
         },
         administrator: administrator(fields),
+        deployment_time_zone: field("deployment_time_zone").trim().to_string(),
     })
 }
 
@@ -1318,6 +1323,17 @@ fn open_page(
          Give it a name: on one machine, <code>http://localhost</code> with the same \
          port.</p>"
             .to_string(),
+        // W7.5 (contract v26): the deployment's time zone, an IANA ID, New
+        // York unless chosen; changed later on the deployment's Settings.
+        choice(
+            "deployment_time_zone",
+            "Deployment time zone",
+            crate::admin::time_zone::DEFAULT,
+            &meridian_domain::zones::NAMES
+                .iter()
+                .map(|name| (*name, *name))
+                .collect::<Vec<_>>(),
+        ),
     ]
     .concat();
 

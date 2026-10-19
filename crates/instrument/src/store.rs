@@ -747,6 +747,19 @@ pub trait Store: Send + Sync {
     /// Every date rule version kept, with when it was kept, ordered by kind,
     /// subject and version.
     fn date_rule_versions(&self) -> Result<Vec<KeptDateRule>>;
+
+    /// Keep an event group's version (contract v26, W3.29), unless one with
+    /// its ID and version is held: the version kept, its record time now and
+    /// its place in the store's sequence of event groups stamped, or `None`
+    /// where it was held.
+    fn keep_event_group(
+        &self,
+        group: &meridian_domain::v1::EventGroup,
+        now_ns: i64,
+    ) -> Result<Option<meridian_domain::v1::EventGroup>>;
+
+    /// Every event group version kept, in sequence (W3.30).
+    fn event_groups(&self) -> Result<Vec<meridian_domain::v1::EventGroup>>;
 }
 
 /// A calendar version as the deployment keeps it (W3.17, contract v22): the
@@ -794,6 +807,9 @@ pub(crate) struct Held {
     /// kind and subject, and version.
     pub(crate) calendars: std::collections::BTreeMap<(String, i64), KeptCalendar>,
     pub(crate) date_rules: std::collections::BTreeMap<(i32, String, i64), KeptDateRule>,
+
+    /// Every event group version kept (contract v26), in sequence.
+    pub(crate) event_groups: Vec<meridian_domain::v1::EventGroup>,
 }
 
 impl Held {
