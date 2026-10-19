@@ -128,9 +128,41 @@ struct Record {
     payout: Option<(String, String, String)>,
 }
 
-/// The pricing input kinds a price may be read in, in the order a
-/// package's list is searched for its price.
+/// The pricing input kinds that are a price, as the lake names them.
 const PRICE_INPUTS: [&str; 5] = ["close", "nav", "last", "mid", "settlement"];
+
+/// The price kind an instrument is marked at: its package's first pricing
+/// input that is a price. A fund's package naming both `close` and `nav`
+/// (the first release's Q8: an ETF at the exchange's close, a mutual fund
+/// at its NAV) is read by the record: a fund listed on a venue is
+/// exchange-traded, at `close`; one listed nowhere, and a money-market
+/// fund, at `nav`. No price input named is `close`.
+pub fn price_kind_of(
+    model_id: &str,
+    pricing_inputs: &[String],
+    record: &v1::InstrumentRecord,
+) -> String {
+    if model_id == "cash" {
+        return String::new();
+    }
+    let names = |kind: &str| pricing_inputs.iter().any(|p| p == kind);
+    if names("close") && names("nav") {
+        let listed = !record.exchange_mic.is_empty() || !record.listing_venue_id.is_empty();
+        let money_market = record.money_market_fund.is_some()
+            || record.instrument_type == v1::InstrumentType::MoneyMarketFund as i32;
+        return if listed && !money_market {
+            "close"
+        } else {
+            "nav"
+        }
+        .to_string();
+    }
+    pricing_inputs
+        .iter()
+        .find(|p| PRICE_INPUTS.contains(&p.as_str()))
+        .cloned()
+        .unwrap_or_else(|| "close".to_string())
+}
 
 /// Resolve a compiled job on its client's behalf.
 pub fn resolve(
@@ -679,15 +711,7 @@ fn record(
             (model.to_string(), 1, kind, String::new())
         }
     };
-    let price_kind = if model_id == "cash" {
-        String::new()
-    } else {
-        PRICE_INPUTS
-            .iter()
-            .find(|k| pricing_inputs.iter().any(|p| p == *k))
-            .map(|k| k.to_string())
-            .unwrap_or_else(|| "close".to_string())
-    };
+    let price_kind = price_kind_of(&model_id, &pricing_inputs, &record);
     let payout = record
         .binary_event_contract
         .as_ref()

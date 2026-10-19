@@ -728,3 +728,40 @@ async fn a_routed_plugin_that_does_not_answer_leaves_its_figures_not_evaluated()
     // What the built-in models price still answers: cash and the event.
     assert_eq!(value(&answer, "market_value", &[]), "5042.00");
 }
+
+/// The price kind a record is marked at, from its package (the first
+/// release's Q8): the first price named; a fund's close where it is listed
+/// on a venue, its NAV where it is not or is a money-market fund.
+#[test]
+fn the_price_kind_is_the_packages_and_a_fund_reads_close_or_nav_by_its_listing() {
+    use crate::resolve::price_kind_of;
+    let inputs = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+    let plain = InstrumentRecord::default();
+    assert_eq!(price_kind_of("cash", &inputs(&["fx"]), &plain), "");
+    assert_eq!(
+        price_kind_of("quoted_price", &inputs(&["close", "fx"]), &plain),
+        "close"
+    );
+    assert_eq!(
+        price_kind_of("binary_event", &inputs(&["last", "mid", "outcome"]), &plain),
+        "last"
+    );
+    assert_eq!(
+        price_kind_of("binary_event", &inputs(&["mid", "last", "outcome"]), &plain),
+        "mid"
+    );
+    let fund = inputs(&["close", "nav"]);
+    let etf = InstrumentRecord {
+        exchange_mic: "ARCX".into(),
+        ..Default::default()
+    };
+    assert_eq!(price_kind_of("quoted_price", &fund, &etf), "close");
+    assert_eq!(price_kind_of("quoted_price", &fund, &plain), "nav");
+    let money_market = InstrumentRecord {
+        exchange_mic: "XNAS".into(),
+        instrument_type: InstrumentType::MoneyMarketFund as i32,
+        ..Default::default()
+    };
+    assert_eq!(price_kind_of("quoted_price", &fund, &money_market), "nav");
+    assert_eq!(price_kind_of("quoted_price", &inputs(&[]), &plain), "close");
+}
