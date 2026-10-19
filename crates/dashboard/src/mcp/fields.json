@@ -520,7 +520,7 @@
       "type": "text",
       "empty": "never empty",
       "intent": "names a measure's definition",
-      "meaning": "market_value, exposure, concentration, pnl, historical_var, expected_shortfall, resolution_payoff or implied_distribution in v26, as ListMeasureDefinitions answers",
+      "meaning": "market_value, exposure, concentration, pnl, historical_var, expected_shortfall, resolution_payoff or implied_distribution in v26, as ListMeasureDefinitions answers; pnl version 1 is Unrealized P&L alone, each bucket's market value less its open lots' cost under the breakdown component, and realized P&L beside it is pnl version 2, v27's (ruling 320)",
       "not_meaning": "a formula a client supplies",
       "filled": "as-reported",
       "filled_by": "plugin",
@@ -16327,6 +16327,19 @@
       "filled": "entered",
       "filled_by": "dashboard",
       "since": "v24",
+      "stability": "preview",
+      "store": "bor"
+    },
+    {
+      "name": "meridian.v1.AccountAttributes.base_cash_instrument_id",
+      "type": "identifier instrument",
+      "empty": "empty while no base currency is set, and while the instrument store has not resolved its code",
+      "intent": "names the cash instrument of the account's base currency (W9.13, W12.2; ruling 316)",
+      "meaning": "the platform's ID of the base currency's cash instrument, which the book resolves from base_currency_code when the base is set and keeps, each resolution its own record; an account whose base was set before v26 carries it once the book holds the resolution. What the analytics component values the account in",
+      "not_meaning": "an attribute a person or a plugin sets, or a conversion: the book converts nothing",
+      "filled": "decided",
+      "filled_by": "bor",
+      "since": "v26",
       "stability": "preview",
       "store": "bor"
     },

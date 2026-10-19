@@ -14,7 +14,7 @@ license = "AGPL-3.0-or-later"
 # reviewable change rather than something that drifts in on a rebuild -- a
 # schema change lands in every consumer as one arc or it is not landed.
 [workspace.dependencies]
-meridian-pb = { git = "https://github.com/open-meridian/meridian-schema.git", rev = "ab245c94455ba4b5ecc88ef108f03b3225daaf95" }
+meridian-pb = { git = "https://github.com/open-meridian/meridian-schema.git", rev = "309e093f3c875be57e1dfaab797a8fb85a1e996b" }
 # The domain messages, generated here from proto/ rather than taken from the
 # schema: they are the runtime's own traffic past the sidecar.
 meridian-domain = { path = "crates/domain" }
