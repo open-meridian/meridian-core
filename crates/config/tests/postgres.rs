@@ -2262,6 +2262,8 @@ fn the_registries_state_is_kept_whole() {
         sequence: 42,
         key_status: r#"{"issued_at_ns":1,"keys":[],"signature":"x"}"#.into(),
         pulled_at_ns: 7,
+        // Contract v26 (migration 0022): a bundle's pull status kept.
+        pull_status: r#"{"issued_at_ns":2,"pulls":[],"signature":"y"}"#.into(),
     };
     store.put_registry_catalogue(&held).unwrap();
     let mut later = held.clone();
