@@ -251,6 +251,8 @@ pub(crate) fn stamp_of(claims: &CallerClaims, with_prepared: bool) -> Stamp {
         connectivity_allowed: false,
         connectivity_demo: false,
         account_scope: None,
+        // The analytics component's alone (W12.2); a sidecar never sets it.
+        on_behalf_of_instance_id: String::new(),
     }
 }
 

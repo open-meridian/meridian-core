@@ -90,6 +90,13 @@ pub struct Stamp {
     /// write, narrowed to the person's write access where it acts for one
     /// (W4.9), which the store holding the record checks its account against.
     pub account_scope: Option<Vec<String>>,
+
+    /// The client instance the analytics component reads for (contract
+    /// v26, W12.2): set by that component alone, on its reads for a job,
+    /// beside the account scope the client's sidecar stamped on the job. A
+    /// store reads it only from the analytics component; empty everywhere
+    /// else.
+    pub on_behalf_of_instance_id: String,
 }
 
 /// The bus.
@@ -425,7 +432,7 @@ impl Bus {
             connectivity_allowed: stamp.connectivity_allowed,
             connectivity_demo: stamp.connectivity_demo,
             // The analytics component's own reads (W12.2), never a sidecar's.
-            on_behalf_of_instance_id: String::new(),
+            on_behalf_of_instance_id: stamp.on_behalf_of_instance_id.clone(),
             // A read's scope is the sidecar's to stamp, for a plugin, marked
             // as applying; a core component reads as itself, unmarked.
             account_scope: stamp.account_scope.clone().unwrap_or_default(),

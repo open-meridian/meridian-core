@@ -1,0 +1,20 @@
+[package]
+name = "meridian-analytics"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The analytics component: the coordinator and the worker pool, answering jobs on a client's behalf"
+
+[dependencies]
+meridian-analytics-engine = { path = "../analytics-engine" }
+meridian-bus = { path = "../bus" }
+meridian-clock.workspace = true
+meridian-domain.workspace = true
+meridian-pb.workspace = true
+prost.workspace = true
+serde_json.workspace = true
+rand.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+futures-util.workspace = true

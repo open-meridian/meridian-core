@@ -1718,6 +1718,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "meridian-analytics"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "meridian-analytics-engine",
+ "meridian-bus",
+ "meridian-clock",
+ "meridian-domain",
+ "meridian-pb",
+ "prost",
+ "rand 0.8.8",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "meridian-analytics-engine"
 version = "0.1.0"
 dependencies = [
