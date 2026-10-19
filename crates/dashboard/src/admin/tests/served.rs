@@ -186,6 +186,29 @@ fn declared() -> Vec<SettingDeclaration> {
             "How long SnapTrade's responses to each read are kept as received, for the Raw \
              responses tab. At least 1; older ones are removed.",
         ),
+        // A choice whose long label and "default Kept" tag must both stay
+        // whole on a phone (the dev deployment's data plugin, 2026-10-17).
+        SettingDeclaration {
+            default_value: "kept".into(),
+            choices: vec![
+                SettingChoice {
+                    value: "kept".into(),
+                    label: "Kept".into(),
+                    ..Default::default()
+                },
+                SettingChoice {
+                    value: "dropped".into(),
+                    label: "Dropped".into(),
+                    ..Default::default()
+                },
+            ],
+            ..setting(
+                "unmatched_rows",
+                SettingType::Choice,
+                "Rows naming an instrument this deployment does not hold",
+                "Whether a read's rows naming an instrument with no record are kept for later.",
+            )
+        },
         number(
             "activity_retention_days",
             "Keep activity records for",

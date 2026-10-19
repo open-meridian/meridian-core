@@ -427,6 +427,8 @@ nav.setting-groups .badge{margin:0 0 0 .3rem;padding:.02rem .4rem;font-size:.7re
 form.settings .group-title{margin:.9rem 0 .4rem}form.settings.js .group-title{display:none}\
 form.settings.js .setting-group:not([id^=settings-developer]) .setting-head .need{display:none}\
 @media (max-width:40rem){form.settings .setting-head{flex-wrap:nowrap;overflow:hidden;white-space:nowrap}\
+form.settings .setting-head>*{flex:none}form.settings .setting-head .setting-label{flex:0 1 auto;min-width:0;\
+overflow:hidden;text-overflow:ellipsis}\
 form.settings .setting-head .id{display:none}\
 section.settings-page{padding:.85rem .9rem}form.settings .fields{gap:.5rem 1.25rem}}\
 .table-setting .about-line{margin:0 0 .5rem;font-size:.84rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}\

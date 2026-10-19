@@ -119,6 +119,14 @@ def fits(browser, name, url, prefix):
             label = f"{name}{group or ''} at {size}"
             problems = page.evaluate(FIT)
             check(not problems, f"{label} fits one screen{': ' + '; '.join(problems) if problems else ''}")
+            # A field's tags stay whole beside a long label: the label gives
+            # way, ellipsised with its title, never a chip (v26).
+            clipped = page.evaluate("""() => [...document.querySelectorAll('.setting-head')]
+              .filter(h => h.offsetParent !== null)
+              .flatMap(h => [...h.querySelectorAll('.badge')].filter(b => b.offsetParent !== null)
+                .filter(b => b.getBoundingClientRect().right > h.getBoundingClientRect().right + 1)
+                .map(b => b.textContent))""")
+            check(not clipped, f"{label} keeps every field's tags whole: {clipped}")
             shot = f"{prefix}-{name}{('-' + group[1:]) if group else ''}-{size}.png"
             page.screenshot(path=os.path.join(OUT, shot))
         # A commercial key brings two more required fields into view.
@@ -1139,6 +1147,25 @@ def the_registry_pages(browser, prefix):
             ctx.close()
 
 
+def the_portal_overview(browser, prefix):
+    """v25's follow-up: a plugin's Overview in the admin portal -- its health,
+    what it needs, its records -- on one screen at the three sizes, with no
+    sideways scroll."""
+    for size, width, height in V24_SIZES:
+        ctx = context(browser, width, height)
+        page = ctx.new_page()
+        errors = []
+        page.on("pageerror", lambda e: errors.append(str(e)))
+        page.goto(PORTAL + "overview")
+        settled(page)
+        problems = measured(page, f"portal overview at {size}", f"v26-{prefix}-portal-overview-{size}.png")
+        m = page.evaluate(MEASURE)
+        check(m["tall"] <= 0 and not problems,
+              f"the portal's Overview at {size} fits one screen: {m['tall']}px taller; {problems}")
+        check(not errors, f"the portal's Overview at {size} ran without a script error: {errors}")
+        ctx.close()
+
+
 def the_time_zone_tab(browser, prefix):
     """Contract v26 (W6.35): the Settings' Time zone tab -- the zone in
     force, who set it, the deadline a held booking is due by -- and its
@@ -1325,6 +1352,7 @@ with sync_playwright() as playwright:
     the_documentation_pages(browser, prefix)
     the_registry_pages(browser, prefix)
     the_time_zone_tab(browser, prefix)
+    the_portal_overview(browser, prefix)
     browser.close()
 
 if failures:

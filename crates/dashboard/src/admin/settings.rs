@@ -374,11 +374,11 @@ fn heading(
     let called = escape(label(declaration));
     let name = if labels {
         format!(
-            "<label class=\"setting-label\" for=\"{}\">{called}</label>",
+            "<label class=\"setting-label\" for=\"{}\" title=\"{called}\">{called}</label>",
             control_id(declaration)
         )
     } else {
-        format!("<span class=\"setting-label\">{called}</span>")
+        format!("<span class=\"setting-label\" title=\"{called}\">{called}</span>")
     };
     let mark = if about.is_empty() {
         String::new()
