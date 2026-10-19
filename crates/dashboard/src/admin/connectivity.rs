@@ -24,6 +24,8 @@ use meridian_domain::v1::{
 };
 use meridian_pb::v1::{connectivity_user, ConnectivityLink, ConnectivityUser};
 
+use prost::Message;
+
 use crate::html::escape;
 use crate::web::App;
 
@@ -660,15 +662,91 @@ pub fn demo_routes(records: &AccessRecords, routes: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// A connection's badge (W11.8): Demo where its environment setting is
-/// sandbox or paper, Live otherwise.
-pub fn badge(records: &AccessRecords, instance: &str) -> &'static str {
-    if DEMO_ENVIRONMENTS.contains(&environment_set(records, instance).as_str()) {
+/// A connection set demo whose sessions have not all said so (ruling 310):
+/// the agents' guard treats it as live, and the badge says why.
+pub const LIVE_UNCONFIRMED: &str = "Live (environment not confirmed)";
+
+/// The badge from the setting and what each of its venue sessions reported
+/// (W11.8, W11.20; ruling 310): Demo only where the setting is sandbox or
+/// paper and every mapped venue account's catalogue reports sandbox or paper
+/// too -- the two keys the ems's sidecar stamps a placement by; a demo
+/// setting with no session mapped, or a session reporting otherwise or
+/// nothing, is Live (environment not confirmed); any other setting, Live.
+pub fn badge_of(set_demo: bool, reported: &[String]) -> &'static str {
+    if !set_demo {
+        return "Live";
+    }
+    if !reported.is_empty()
+        && reported
+            .iter()
+            .all(|environment| DEMO_ENVIRONMENTS.contains(&environment.as_str()))
+    {
         "Demo"
     } else {
-        "Live"
+        LIVE_UNCONFIRMED
     }
 }
+
+/// The venue account codes an ems mapped at this connectivity plugin
+/// (W11.22): its sessions.
+pub fn mapped_codes(records: &AccessRecords, instance: &str) -> Vec<String> {
+    let mut codes: Vec<String> = records
+        .venue_account_maps
+        .iter()
+        .flat_map(|map| map.mappings.iter())
+        .filter(|mapping| mapping.connectivity_instance_id == instance)
+        .map(|mapping| mapping.venue_account_code.clone())
+        .collect();
+    codes.sort();
+    codes.dedup();
+    codes
+}
+
+/// A connection's badge (W11.8; ruling 310), its sessions' environments
+/// read from the venue catalogues the conductor keeps
+/// (`platform.config.query.venue-catalogue`): what each reported, empty for
+/// one it has not published or that could not be read.
+pub async fn badge(
+    bus: &meridian_bus::Bus,
+    records: &AccessRecords,
+    instance: &str,
+) -> &'static str {
+    let set_demo = DEMO_ENVIRONMENTS.contains(&environment_set(records, instance).as_str());
+    if !set_demo {
+        return "Live";
+    }
+    let mut reported = Vec::new();
+    for code in mapped_codes(records, instance) {
+        let asked = bus
+            .call(
+                READ_VENUE_CATALOGUE,
+                "meridian.v1.ReadVenueCatalogueRequest",
+                meridian_domain::v1::ReadVenueCatalogueRequest {
+                    connectivity_instance_id: instance.to_string(),
+                    venue_account_code: code,
+                }
+                .encode_to_vec(),
+                None,
+                Some(std::time::Duration::from_secs(3)),
+            )
+            .await;
+        reported.push(
+            asked
+                .ok()
+                .and_then(|(_, bytes)| {
+                    meridian_domain::v1::ReadVenueCatalogueReply::decode(&bytes[..]).ok()
+                })
+                .and_then(|reply| reply.catalogue)
+                .map(|catalogue| catalogue.environment)
+                .unwrap_or_default(),
+        );
+    }
+    badge_of(set_demo, &reported)
+}
+
+/// The conductor's read of a venue's catalogue (W11.20), the dashboard's
+/// from ruling 310.
+pub const READ_VENUE_CATALOGUE: &str = "platform.config.query.venue-catalogue";
 
 /// What `dashboard__read_plugin_access` answers of an instance's link and
 /// map (W11.21, W11.22): its link, for a connectivity plugin; its plugins
@@ -960,5 +1038,87 @@ mod tests {
         // creates no placement (ruled 2026-10-13).
         assert!(routes(&records, "fix-1", "local|ada", &groups(&[])).is_empty());
         assert!(routes(&records, "fix-4", "local|ada", &groups(&[])).is_empty());
+    }
+
+    /// Ruling 310: Demo only where the setting and every mapped session say
+    /// so; a demo setting no session confirms is Live (environment not
+    /// confirmed); any other setting Live. Read from the conductor's venue
+    /// catalogues, as the ems's sidecar reads them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_connection_is_demo_only_where_its_sessions_confirm_it() {
+        assert_eq!(badge_of(false, &["sandbox".into()]), "Live");
+        assert_eq!(badge_of(true, &[]), LIVE_UNCONFIRMED);
+        assert_eq!(
+            badge_of(true, &["paper".into(), "".into()]),
+            LIVE_UNCONFIRMED
+        );
+        assert_eq!(badge_of(true, &["paper".into(), "sandbox".into()]), "Demo");
+        assert_eq!(badge_of(true, &["live".into()]), LIVE_UNCONFIRMED);
+
+        let bus = meridian_bus::Bus::single(
+            "dashboard-1",
+            std::sync::Arc::new(meridian_bus::MemoryBackend::new()),
+            std::sync::Arc::new(meridian_clock::ManualClock::at(1)),
+        );
+        bus.serve(READ_VENUE_CATALOGUE, |envelope| {
+            let asked =
+                meridian_domain::v1::ReadVenueCatalogueRequest::decode(&envelope.payload[..])
+                    .unwrap();
+            let environment = match asked.venue_account_code.as_str() {
+                "PRACTICE-1" => "sandbox",
+                "PRACTICE-2" => "paper",
+                _ => "",
+            };
+            Ok((
+                "meridian.v1.ReadVenueCatalogueReply".into(),
+                meridian_domain::v1::ReadVenueCatalogueReply {
+                    catalogue: (!environment.is_empty()).then(|| {
+                        meridian_domain::v1::VenueCatalogue {
+                            connectivity_instance_id: asked.connectivity_instance_id,
+                            venue_account_code: asked.venue_account_code,
+                            environment: environment.into(),
+                            ..Default::default()
+                        }
+                    }),
+                }
+                .encode_to_vec(),
+            ))
+        });
+        let with = |environment: &str, codes: &[&str]| AccessRecords {
+            plugin_settings: vec![meridian_domain::v1::PluginSettingsRecord {
+                plugin_instance_id: "fix-1".into(),
+                values: vec![meridian_domain::v1::PluginSettingValue {
+                    name: "environment".into(),
+                    value: environment.into(),
+                }],
+                ..Default::default()
+            }],
+            venue_account_maps: vec![VenueAccountMap {
+                ems_instance_id: "ems-1".into(),
+                mappings: codes
+                    .iter()
+                    .map(|code| VenueAccountMapping {
+                        connectivity_instance_id: "fix-1".into(),
+                        venue_account_code: code.to_string(),
+                        account_id: "ACC-1".into(),
+                    })
+                    .collect(),
+            }],
+            ..records()
+        };
+        let said = |records: AccessRecords| {
+            let bus = &bus;
+            async move { badge(bus, &records, "fix-1").await }
+        };
+        assert_eq!(
+            said(with("sandbox", &["PRACTICE-1", "PRACTICE-2"])).await,
+            "Demo"
+        );
+        assert_eq!(
+            said(with("sandbox", &["PRACTICE-1", "LIVE-9"])).await,
+            LIVE_UNCONFIRMED
+        );
+        assert_eq!(said(with("sandbox", &[])).await, LIVE_UNCONFIRMED);
+        assert_eq!(said(with("live", &["PRACTICE-1"])).await, "Live");
     }
 }

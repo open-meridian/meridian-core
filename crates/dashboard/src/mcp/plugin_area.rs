@@ -1223,7 +1223,26 @@ impl Context<'_> {
             return (problems.refusal(), level);
         }
         let reports: BTreeMap<String, PluginReport> = self.app.health.view();
-        let plugins: Vec<Value> = reached(Gate::Anyone, self.access, self.known)
+        let reached_now = reached(Gate::Anyone, self.access, self.known);
+        // Contract v26 (W11.8; ruling 310): a connectivity plugin's badge, as
+        // its card on the home page draws it.
+        let mut environments: BTreeMap<String, &'static str> = BTreeMap::new();
+        if let Ok(records) = self.app.records.current(self.app.clock.now_ns()) {
+            for instance in &reached_now {
+                let connection = self
+                    .access
+                    .known_roles
+                    .get(instance)
+                    .is_some_and(|roles| roles.iter().any(|role| role == "connectivity"));
+                if connection {
+                    environments.insert(
+                        instance.clone(),
+                        crate::admin::connectivity::badge(&self.app.bus, &records, instance).await,
+                    );
+                }
+            }
+        }
+        let plugins: Vec<Value> = reached_now
             .into_iter()
             .map(|instance| {
                 let held = self.access.plugin(&instance);
@@ -1251,7 +1270,7 @@ impl Context<'_> {
                     .map(|i| i.title.clone())
                     .unwrap_or_default();
                 let state = crate::health::state(report, self.app.clock.now_ns());
-                json!({
+                let mut said = json!({
                     "plugin_instance_id": instance,
                     "title": others_words(&title),
                     "roles": roles,
@@ -1260,7 +1279,11 @@ impl Context<'_> {
                     "healthy": report.is_some_and(|r| r.healthy),
                     "health_detail": if state.detail.is_empty() { state.word.to_string() } else { format!("{}: {}", state.word, others_words(&state.detail)) },
                     "reported_at_ns": report.map_or(0, |r| r.reported_at_ns),
-                })
+                });
+                if let Some(environment) = environments.get(&instance) {
+                    said["environment"] = json!(environment);
+                }
+                said
             })
             .collect();
         (

@@ -467,7 +467,11 @@ async fn home(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
                 .known_roles
                 .get(instance)
                 .is_some_and(|roles| roles.iter().any(|role| role == "connectivity"));
-            let badge = connection.then(|| crate::admin::connectivity::badge(&records, instance));
+            let badge = if connection {
+                Some(crate::admin::connectivity::badge(&app.bus, &records, instance).await)
+            } else {
+                None
+            };
             body.push_str(&plugin_card(
                 instance,
                 name_of(instance).as_deref(),
@@ -536,10 +540,11 @@ fn plugin_card(
         .find(|c| c.is_alphanumeric())
         .map(String::from)
         .unwrap_or_default();
-    // Contract v26 (W11.8): Demo or Live, for a connectivity plugin.
+    // Contract v26 (W11.8; ruling 310): Demo, Live, or Live (environment not
+    // confirmed), for a connectivity plugin.
     let badge = match badge {
         Some(said) => format!(
-            " <span class=\"badge {kind}\" data-environment=\"{said}\">{said}</span>",
+            " <span class=\"badge {kind}\" data-environment=\"{said}\" title=\"{said}\">{said}</span>",
             kind = if said == "Demo" { "good" } else { "warn" },
             said = escape(said),
         ),

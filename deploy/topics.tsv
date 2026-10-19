@@ -133,7 +133,7 @@ platform.config.query.plugin-documentation	query	dashboard	conductor
 platform.config.query.prepared-call	query	sidecar	dashboard
 platform.config.query.read-deployment-time-zone	query	bor,dashboard	conductor
 platform.config.query.registry-plugins	query	dashboard	conductor
-platform.config.query.venue-catalogue	query	ems,oms	conductor
+platform.config.query.venue-catalogue	query	ems,oms,dashboard	conductor
 platform.custody.*.event.external-accounts	event	custody	dashboard,conductor
 platform.custody.*.event.sync-status	event	custody	dashboard,street
 platform.deployment.command.create-plugin	command	conductor	launcher
