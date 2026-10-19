@@ -202,12 +202,20 @@ fn provenance(case: &Case, reads: &Reads, hash: &str) -> Value {
             }))
             .collect::<Vec<_>>(),
         "models": reads.models.iter()
-            .map(|(model, version)| json!({
-                "model_id": model,
-                "model_version": version,
-                "implementation": BUILT_IN,
-                "implementation_version": case.engine_version,
-            }))
+            .map(|(model, version)| match case.routed.get(model) {
+                Some(routed) => json!({
+                    "model_id": model,
+                    "model_version": version,
+                    "implementation": routed.implementation,
+                    "implementation_version": routed.implementation_version,
+                }),
+                None => json!({
+                    "model_id": model,
+                    "model_version": version,
+                    "implementation": BUILT_IN,
+                    "implementation_version": case.engine_version,
+                }),
+            })
             .collect::<Vec<_>>(),
         "measures": measures_asked,
         "event_groups": reads.groups.iter()

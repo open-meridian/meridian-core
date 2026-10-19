@@ -18,7 +18,10 @@
 
 use std::collections::BTreeSet;
 
-use crate::answer::{Reads, CONVERSION_MISSING, LOCAL_RECORD, PRICE_MISSING, PRICE_STALE};
+use crate::answer::{
+    Reads, CONVERSION_MISSING, IMPLEMENTATION_UNAVAILABLE, LOCAL_RECORD, NOT_ENTITLED,
+    PRICE_MISSING, PRICE_STALE,
+};
 use crate::case::{Case, CaseError, Price, Result};
 use crate::exact::Dec;
 
@@ -118,6 +121,48 @@ pub fn value(
     instrument_id: &str,
     base: &str,
 ) -> Result<std::result::Result<Valued, Why>> {
+    let valued = built_in(case, reads, instrument_id, base)?;
+    let Some(routed) = case
+        .instruments
+        .get(instrument_id)
+        .and_then(|record| case.routed.get(&record.model_id))
+    else {
+        return Ok(valued);
+    };
+    // Routed to a plugin (W12.3): its value per unit, the market objects
+    // its model declared kept for the historical scenarios; where it did
+    // not answer, not evaluated, naming it -- never the built-in model's in
+    // silence (requirement 22).
+    let unavailable = || {
+        Ok(Err((
+            IMPLEMENTATION_UNAVAILABLE,
+            routed.implementation.clone(),
+        )))
+    };
+    if !routed.answered {
+        return unavailable();
+    }
+    match (
+        valued,
+        case.priced
+            .get(&(instrument_id.to_string(), base.to_string())),
+    ) {
+        (Ok(valued), Some(per_unit)) => Ok(Ok(Valued {
+            per_unit: per_unit.clone(),
+            objects: valued.objects,
+        })),
+        (Err(why), _) => Ok(Err(why)),
+        (Ok(_), None) => unavailable(),
+    }
+}
+
+/// The built-in model's value per unit (requirement 19).
+fn built_in(
+    case: &Case,
+    reads: &mut Reads,
+    instrument_id: &str,
+    base: &str,
+) -> Result<std::result::Result<Valued, Why>> {
     if instrument_id.starts_with("LCL-") {
         return Ok(Err((LOCAL_RECORD, "local record: not priced".to_string())));
     }
@@ -161,6 +206,12 @@ pub fn value(
         }
     }
     let Some(price) = case.price(instrument_id, &record.price_kind) else {
+        if let Some(dataset) = case
+            .unentitled
+            .get(&(instrument_id.to_string(), record.price_kind.clone()))
+        {
+            return Ok(Err((NOT_ENTITLED, dataset.clone())));
+        }
         return Ok(Err((PRICE_MISSING, record.price_kind.clone())));
     };
     if case.stale(price) {

@@ -12,7 +12,8 @@
 /// `realized`.
 pub const COMPONENT: &str = "component";
 
-/// How realized P&L's period is labelled wherever it is shown (ruling 303).
+/// How realized P&L's period is labelled wherever it is shown (ruling
+/// 303): pnl version 2's, v27's (ruling 320).
 pub const REALIZED_SINCE: &str = "since the account opened";
 
 /// The implementation every model id has (requirement 19).
@@ -105,17 +106,10 @@ pub const DEFINITIONS: [Definition; 8] = [
     Definition {
         definition: "pnl",
         version: 1,
-        parameters: &[
-            ("unrealized", "market_value_less_open_lots_cost"),
-            (
-                "realized",
-                "closed_lots_proceeds_less_cost_since_the_account_opened",
-            ),
-        ],
+        parameters: &[("unrealized", "market_value_less_open_lots_cost")],
         breakdowns: &BY,
         scale: 2,
-        description: "Each bucket's unrealized P&L (open lots) and realized P&L since the account \
-                      opened (closed lots)",
+        description: "Each bucket's unrealized P&L: its market value less its open lots' cost",
     },
     Definition {
         definition: "historical_var",
@@ -156,11 +150,45 @@ pub const DEFINITIONS: [Definition; 8] = [
     },
 ];
 
+/// pnl version 2, realized beside unrealized: v27's, with the book
+/// recording a closed lot's proceeds (ruling 320). Compiled for the tests
+/// alone, so the SDK's realized cases stay exact, and served to no job:
+/// [`definition`] never finds it, and the compiler refuses its version.
+#[cfg(test)]
+pub const UNSERVED: [Definition; 1] = [Definition {
+    definition: "pnl",
+    version: 2,
+    parameters: &[
+        ("unrealized", "market_value_less_open_lots_cost"),
+        (
+            "realized",
+            "closed_lots_proceeds_less_cost_since_the_account_opened",
+        ),
+    ],
+    breakdowns: &BY,
+    scale: 2,
+    description: "Each bucket's unrealized P&L (open lots) and realized P&L since the account \
+                  opened (closed lots)",
+}];
+
 /// The definition by name and version, where the component serves it.
 pub fn definition(name: &str, version: i32) -> Option<&'static Definition> {
     DEFINITIONS
         .iter()
         .find(|d| d.definition == name && d.version == version)
+}
+
+/// The definition an inputs document names, as the engine computes it: a
+/// served one, and in the tests the unserved.
+pub fn computed(name: &str, version: i32) -> Option<&'static Definition> {
+    #[cfg(test)]
+    if let Some(unserved) = UNSERVED
+        .iter()
+        .find(|d| d.definition == name && d.version == version)
+    {
+        return Some(unserved);
+    }
+    definition(name, version)
 }
 
 /// The definitions as the wire carries them.

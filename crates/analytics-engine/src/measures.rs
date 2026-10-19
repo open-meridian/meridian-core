@@ -19,6 +19,9 @@ use crate::exact::Dec;
 use crate::historical;
 use crate::model::{self, conversion, product, Valued};
 
+/// Why a position whose lots carry no cost is not evaluated.
+pub const NO_COST: &str = "the book states no cost for its lots";
+
 /// A whole-number scale for a what-if trade's cost, as the reference rounds
 /// it.
 const COST_SCALE: u32 = 18;
@@ -51,7 +54,7 @@ pub struct Planned {
 pub fn lookup(key: &MeasureKey) -> Result<&'static Definition> {
     i32::try_from(key.version)
         .ok()
-        .and_then(|version| definitions::definition(&key.definition, version))
+        .and_then(|version| definitions::computed(&key.definition, version))
         .ok_or_else(|| {
             CaseError(format!(
                 "the component serves no definition {} v{}",
@@ -293,9 +296,13 @@ fn linear(
     part: &mut Part,
 ) -> Result<()> {
     let names = &key.breakdowns;
+    // pnl version 1 is unrealized alone; realized is version 2's, v27's
+    // (ruling 320).
+    let realized = definition.definition == "pnl" && definition.version >= 2;
     let components: &[&'static str] = match definition.definition {
         "exposure" => &["gross", "net"],
-        "pnl" => &["unrealized", "realized"],
+        "pnl" if realized => &["unrealized", "realized"],
+        "pnl" => &["unrealized"],
         _ => &[""],
     };
     let base = case.base(account)?.to_string();
@@ -341,18 +348,28 @@ fn linear(
                     add(&mut sums, group, "net", worth);
                 }
                 "pnl" => {
-                    let cost = position.cost.as_ref().ok_or_else(|| {
-                        CaseError(format!(
-                            "pnl asks {}'s lots' cost, and the inputs state none",
-                            position.instrument_id
-                        ))
-                    })?;
+                    // A lot the book holds no cost for (one a v8 book
+                    // opened) leaves its position's P&L not evaluated, never
+                    // a P&L over a cost of nothing. The reference refuses
+                    // such a document whole; a job answers the rest.
+                    let Some(cost) = position.cost.as_ref() else {
+                        if scenario == BASE {
+                            part.not_evaluated.push(unevaluated(
+                                account,
+                                &position.instrument_id,
+                                key,
+                                HISTORY_INSUFFICIENT,
+                                NO_COST.to_string(),
+                            ));
+                        }
+                        continue;
+                    };
                     add(&mut sums, group, "unrealized", worth.sub(cost));
                 }
                 _ => add(&mut sums, group, "", worth),
             }
         }
-        if definition.definition == "pnl" {
+        if realized {
             for lot in case.closed_lots.iter().filter(|l| l.account_id == account) {
                 let as_position = Position {
                     account_id: account.to_string(),
@@ -624,10 +641,12 @@ pub fn payoffs(
             }
         }
         if position.cost.is_none() {
-            return Err(CaseError(format!(
-                "{}'s payoff needs its lots' cost",
-                position.instrument_id
-            )));
+            failed.push((
+                position.instrument_id.clone(),
+                HISTORY_INSUFFICIENT,
+                NO_COST.to_string(),
+            ));
+            continue;
         }
         terms.push((position, payout.mul(&product(&legs))));
     }

@@ -103,19 +103,42 @@ fn load(name: &str, raw: &str) -> Value {
     case
 }
 
+/// Whether a figure is pnl version 1's realized component, which the cases
+/// pinned before ruling 320 still carry: v1 is unrealized alone, realized
+/// is version 2's. Taken out of the comparison until the SDK's cases are
+/// regenerated (pnl v2 naming realized), and held exact through version 2
+/// by [`realized_is_version_twos_and_equals_the_reference`].
+fn realized_under_version_one(figure: &Value) -> bool {
+    figure["measure"]["definition"] == "pnl"
+        && figure["measure"]["version"] == 1
+        && figure["breakdown"].as_array().is_some_and(|b| {
+            b.iter()
+                .any(|v| v["breakdown"] == "component" && v["value"] == "realized")
+        })
+}
+
+/// The reference's answer as pnl version 1 answers it (ruling 320).
+fn as_version_one(answer: &Value) -> Value {
+    let mut out = answer.clone();
+    if let Some(Value::Array(figures)) = out.get_mut("figures") {
+        figures.retain(|f| !realized_under_version_one(f));
+    }
+    out
+}
+
 #[test]
 fn every_pinned_case_is_answered_as_the_reference_answers_it() {
     for (name, raw) in CASES {
         let case = load(name, raw);
         let answer = compute(&case["inputs"]).unwrap_or_else(|e| panic!("{name}: {e}"));
         let ours = canonical(&answer.to_json()).unwrap();
-        let theirs = canonical(&case["answer"]).unwrap();
+        let theirs = canonical(&as_version_one(&case["answer"])).unwrap();
         if ours != theirs {
             let ours: Value = serde_json::from_str(&ours).unwrap();
             for (part, mine) in ours.as_object().unwrap() {
                 assert_eq!(
                     serde_json::to_string_pretty(mine).unwrap(),
-                    serde_json::to_string_pretty(&case["answer"][part]).unwrap(),
+                    serde_json::to_string_pretty(&as_version_one(&case["answer"])[part]).unwrap(),
                     "{name}: the {part} differ from the reference's"
                 );
             }
@@ -128,6 +151,54 @@ fn every_pinned_case_is_answered_as_the_reference_answers_it() {
             "{name}: the hash differs"
         );
     }
+}
+
+/// pnl version 2, compiled for the tests alone: realized beside
+/// unrealized, every lot closed since the account opened, equal to the
+/// reference's figures (its answer's hash names its own inputs, which ask
+/// version 1, so the figures are compared alone).
+#[test]
+fn realized_is_version_twos_and_equals_the_reference() {
+    let mut checked = 0;
+    for (name, raw) in CASES {
+        let case = load(name, raw);
+        let expected: Vec<Value> = case["answer"]["figures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["measure"]["definition"] == "pnl")
+            .cloned()
+            .collect();
+        if !expected.iter().any(realized_under_version_one) {
+            continue;
+        }
+        let mut inputs = case["inputs"].clone();
+        for measure in inputs["job"]["measures"].as_array_mut().unwrap() {
+            if measure["definition"] == "pnl" {
+                measure["version"] = Value::from(2);
+            }
+        }
+        let answer = compute(&inputs).unwrap();
+        let ours: Vec<Value> = answer.to_json()["figures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["measure"]["definition"] == "pnl")
+            .map(|f| {
+                let mut f = f.clone();
+                f["measure"]["version"] = Value::from(1);
+                f
+            })
+            .collect();
+        assert_eq!(ours, expected, "{name}");
+        checked += 1;
+    }
+    assert!(checked > 0, "no pinned case asks realized");
+    // And no job reaches version 2: the component serves version 1 alone.
+    assert!(crate::definitions::definition("pnl", 2).is_none());
+    assert!(!crate::definitions::wire()
+        .iter()
+        .any(|d| d.definition == "pnl" && d.version == 2));
 }
 
 /// An executor that sends every part through its JSON, as the bus carries
@@ -336,6 +407,7 @@ fn generated_documents_are_answered_as_the_reference_answers_them() {
             (_, Err(e)) => panic!("{}: {e}", path.display()),
             (theirs, Ok(ours)) => {
                 let mine = ours.to_json();
+                let theirs = &as_version_one(theirs);
                 for part in ["figures", "not_evaluated", "provenance"] {
                     assert_eq!(
                         serde_json::to_string_pretty(&mine[part]).unwrap(),
@@ -349,4 +421,90 @@ fn generated_documents_are_answered_as_the_reference_answers_them() {
         checked += 1;
     }
     assert!(checked > 0, "no documents in {dir}");
+}
+
+// ── What the component adds to a document beyond the reference's cases ─────
+
+fn unevaluated_reasons(answer: &crate::Answer) -> Vec<(String, String, &'static str, String)> {
+    answer
+        .not_evaluated
+        .iter()
+        .map(|u| {
+            (
+                u.measure.definition.clone(),
+                u.instrument_id.clone(),
+                u.reason,
+                u.detail.clone(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_routed_model_answers_by_its_plugin_and_never_silently_by_the_built_in_one() {
+    let case = load("valuation", CASES[0].1);
+    let aapl = "INS-01J8XQ4M7K0000000000AAPL";
+    let usd = "INS-01J8XQ4M7K00000000CASHUSD";
+    let mut inputs = case["inputs"].clone();
+    inputs["routed"] = serde_json::json!([{"model_id": "quoted_price",
+        "implementation": "sample-pricing-1", "implementation_version": "0.31.0", "answered": true}]);
+    inputs["priced"] = serde_json::json!([{"instrument_id": aapl,
+        "base_currency_instrument_id": usd, "value_per_unit": "227.50"}]);
+    let answer = compute(&inputs).unwrap();
+    let models = answer.provenance["models"].as_array().unwrap();
+    assert!(models.iter().any(|m| m["model_id"] == "quoted_price"
+        && m["implementation"] == "sample-pricing-1"
+        && m["implementation_version"] == "0.31.0"));
+    // The plugin answered AAPL in USD alone: every other quoted price is
+    // not evaluated, naming it.
+    let reasons = unevaluated_reasons(&answer);
+    assert!(reasons
+        .iter()
+        .any(|(_, i, r, d)| i == "INS-01J8XQ4M7K00000000000SPY"
+            && *r == crate::answer::IMPLEMENTATION_UNAVAILABLE
+            && d == "sample-pricing-1"));
+    // In ACC-1's USD it answered; in ACC-2's EUR it did not.
+    let unavailable_in = |account: &str| {
+        answer.not_evaluated.iter().any(|u| {
+            u.account_id == account
+                && u.instrument_id == aapl
+                && u.reason == crate::answer::IMPLEMENTATION_UNAVAILABLE
+        })
+    };
+    assert!(!unavailable_in("ACC-1"));
+    assert!(unavailable_in("ACC-2"));
+    // Not answered by the deadline: nothing through it is evaluated.
+    inputs["routed"][0]["answered"] = Value::Bool(false);
+    let unanswered = compute(&inputs).unwrap();
+    assert!(unevaluated_reasons(&unanswered)
+        .iter()
+        .any(|(_, i, r, _)| i == aapl && *r == crate::answer::IMPLEMENTATION_UNAVAILABLE));
+    assert_ne!(answer.answer_hash(), unanswered.answer_hash());
+}
+
+#[test]
+fn an_unentitled_price_is_not_evaluated_naming_the_dataset_and_pnl_is_unrealized_alone() {
+    let case = load("valuation", CASES[0].1);
+    let spy = "INS-01J8XQ4M7K00000000000SPY";
+    let mut inputs = case["inputs"].clone();
+    let market: Vec<Value> = inputs["market"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["subject_id"] != spy)
+        .cloned()
+        .collect();
+    inputs["market"] = Value::Array(market);
+    inputs["unentitled"] =
+        serde_json::json!([{"subject_id": spy, "kind": "close", "dataset": "alpaca-1:daily"}]);
+    let answer = compute(&inputs).unwrap();
+    let reasons = unevaluated_reasons(&answer);
+    assert!(reasons.iter().any(|(_, i, r, d)| i == spy
+        && *r == crate::answer::NOT_ENTITLED
+        && d == "alpaca-1:daily"));
+    // pnl version 1 is unrealized alone (ruling 320).
+    assert!(!answer.figures.iter().any(|f| f
+        .breakdown
+        .iter()
+        .any(|(b, v)| b == "component" && v == "realized")));
 }

@@ -211,6 +211,28 @@ pub struct Case {
     pub outcomes: BTreeMap<String, Outcome>,
     pub groups: BTreeMap<String, Group>,
     pub stale_after: BTreeMap<String, i64>,
+    /// Prices a dataset the client is not entitled to would have answered,
+    /// by subject and kind, naming the dataset (requirement 6; Q11):
+    /// `unentitled`, absent in the reference's cases.
+    pub unentitled: BTreeMap<(String, String), String>,
+    /// Model ids a deployment admin routed to a `pricing` plugin (W12.6),
+    /// each with its implementation, its version and whether it answered:
+    /// `routed`, absent where every model id is built in.
+    pub routed: BTreeMap<String, Routed>,
+    /// What a routed plugin answered, by instrument and the base it valued
+    /// it in: `priced`, absent where nothing is routed.
+    pub priced: BTreeMap<(String, String), Dec>,
+}
+
+/// A model id routed to a `pricing` plugin, for one job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Routed {
+    pub implementation: String,
+    pub implementation_version: String,
+    /// False where the plugin did not answer the job's batch by its
+    /// deadline: every figure through it is then not evaluated, never the
+    /// built-in model's in silence (requirement 22).
+    pub answered: bool,
 }
 
 impl Case {
@@ -402,6 +424,35 @@ impl Case {
                 })
                 .collect(),
             stale_after,
+            unentitled: items(inputs, "unentitled")
+                .iter()
+                .map(|u| ((text(u, "subject_id"), text(u, "kind")), text(u, "dataset")))
+                .collect(),
+            routed: items(inputs, "routed")
+                .iter()
+                .map(|r| {
+                    (
+                        text(r, "model_id"),
+                        Routed {
+                            implementation: text(r, "implementation"),
+                            implementation_version: text(r, "implementation_version"),
+                            answered: r.get("answered").and_then(Value::as_bool).unwrap_or(false),
+                        },
+                    )
+                })
+                .collect(),
+            priced: items(inputs, "priced")
+                .iter()
+                .map(|p| {
+                    Ok((
+                        (
+                            text(p, "instrument_id"),
+                            text(p, "base_currency_instrument_id"),
+                        ),
+                        decimal(p.get("value_per_unit"), "a priced unit's value")?,
+                    ))
+                })
+                .collect::<Result<_>>()?,
         })
     }
 
