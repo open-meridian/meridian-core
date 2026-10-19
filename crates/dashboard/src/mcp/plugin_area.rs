@@ -1486,6 +1486,21 @@ impl Context<'_> {
                 .map(|seen| json!({"scheme": others_words(&seen.scheme), "name": others_words(&seen.name), "count": seen.count}))
                 .collect::<Vec<_>>()
                 .into();
+            // Contract v26 (W4.5, W4.8): the model tokens it reported.
+            data["model_tokens"] = report_or
+                .model_tokens
+                .iter()
+                .map(|count| {
+                    json!({
+                        "endpoint": others_words(&count.endpoint),
+                        "subject": count.subject,
+                        "client_name": others_words(&count.client_name),
+                        "input_tokens": count.input_tokens,
+                        "output_tokens": count.output_tokens,
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into();
             data["tool_refusals"] = report_or
                 .tool_refusals
                 .iter()

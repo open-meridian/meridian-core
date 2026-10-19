@@ -1370,6 +1370,49 @@ pub(crate) async fn setting_up_steps(
 /// them -- then the figures it reports, as tiles ([`crate::figures`]). The
 /// status is core's to say, so a plugin cannot misreport it, and the figures
 /// are only ever drawn as the plugin's, below it.
+/// The Summary's model-token line (contract v26): each endpoint's input and
+/// output tokens summed over the people and clients it worked for, those
+/// in its title; none where it reported none.
+pub(crate) fn model_tokens_line(counts: &[meridian_pb::v1::ModelTokenCount]) -> String {
+    if counts.is_empty() {
+        return String::new();
+    }
+    let mut by_endpoint: std::collections::BTreeMap<&str, (u64, u64, Vec<String>)> =
+        std::collections::BTreeMap::new();
+    for count in counts {
+        let held = by_endpoint.entry(count.endpoint.as_str()).or_default();
+        held.0 += count.input_tokens;
+        held.1 += count.output_tokens;
+        held.2.push(format!(
+            "{} via {}: {} in, {} out",
+            count.subject,
+            if count.client_name.is_empty() {
+                "no client"
+            } else {
+                &count.client_name
+            },
+            meridian_domain::thousands(count.input_tokens),
+            meridian_domain::thousands(count.output_tokens)
+        ));
+    }
+    let said: Vec<String> = by_endpoint
+        .iter()
+        .map(|(endpoint, (input, output, each))| {
+            format!(
+                "<span title=\"{}\">{}: {} in, {} out</span>",
+                escape(&each.join("; ")),
+                escape(endpoint),
+                meridian_domain::thousands(*input),
+                meridian_domain::thousands(*output)
+            )
+        })
+        .collect();
+    format!(
+        "<dt>Model tokens</dt><dd data-model-tokens>{}</dd>",
+        said.join(", ")
+    )
+}
+
 pub(crate) fn summary_tab(manage: &Manage) -> String {
     let state = crate::health::state(manage.report, manage.now);
     let (badge, why) = view::state_badge(&state, "status-note");
@@ -1436,6 +1479,15 @@ pub(crate) fn summary_tab(manage: &Manage) -> String {
         manage.report.map(|report| report.contract_version.as_str()),
         "not said",
     );
+    // The model tokens it reported using since it started (W4.5, W4.8,
+    // contract v26): per endpoint, in and out, each person and client in
+    // its title. Counts, never a prompt or an answer.
+    let tokens = model_tokens_line(
+        manage
+            .report
+            .map(|r| r.model_tokens.as_slice())
+            .unwrap_or_default(),
+    );
     let figures = crate::figures::section(manage.report, manage.now);
     // Its raw records, storage's and the archive's, and its moves (W6.9,
     // contract v16), for a plugin at the edge keeping them.
@@ -1459,7 +1511,7 @@ pub(crate) fn summary_tab(manage: &Manage) -> String {
     let status = format!(
         "<section class=\"panel padded\" id=\"status\"><div class=\"row\"><h2>Status</h2>{badge}</div>{why}\
          <dl class=\"facts\"><dt>Version</dt><dd data-version>{version}</dd>\
-         <dt>Contract</dt><dd data-contract>{contract}</dd>{stopped}{seen}</dl>{warnings}\
+         <dt>Contract</dt><dd data-contract>{contract}</dd>{stopped}{seen}{tokens}</dl>{warnings}\
          <p class=\"reserved\" data-reserved=\"lifecycle\">Restarting it, moving it to another version and \
          holding it at one will be here. They are not built yet.</p></section>{figures}"
     );
