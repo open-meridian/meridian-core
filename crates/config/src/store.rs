@@ -1115,4 +1115,7 @@ pub struct HeldCatalogue {
     pub sequence: u64,
     pub key_status: String,
     pub pulled_at_ns: i64,
+    /// Contract v26 (W8.14; ruling 196): the newest PluginPullStatus a
+    /// bundle brought, its JSON as the platform signed it; empty for none.
+    pub pull_status: String,
 }

@@ -75,6 +75,14 @@ impl TestSigner {
         document["signature"] = Value::String(self.sign(&pae(KEY_STATUS_TYPE, body.as_bytes())));
         document
     }
+
+    /// A PluginPullStatus signed as the platform signs it (ruling 196).
+    pub(crate) fn sign_pull_status(&self, mut document: Value) -> Value {
+        let body = canonical_json(&document);
+        document["signature"] =
+            Value::String(self.sign(&pae(super::PULL_STATUS_TYPE, body.as_bytes())));
+        document
+    }
 }
 
 fn vector() -> Value {

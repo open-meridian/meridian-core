@@ -255,6 +255,7 @@ impl Hold {
             sequence: reply.sequence.max(held.sequence),
             key_status,
             pulled_at_ns: self.clock.now_ns(),
+            pull_status: held.pull_status,
         };
         self.keep(kept.clone()).await?;
         Ok(kept)
@@ -302,36 +303,36 @@ impl Hold {
             .split_whitespace()
             .map(str::to_lowercase)
             .collect();
-        let mut listings: Vec<PluginListing> = held
-            .listings
-            .into_iter()
-            .filter(|listing| request.listing.is_empty() || listing.listing == request.listing)
-            .filter(|listing| {
-                request.registry.is_empty()
-                    || listing
-                        .versions
-                        .iter()
-                        .any(|v| v.registry == request.registry)
-            })
-            .filter(|listing| {
-                request.role.is_empty()
-                    || listing.versions.iter().any(|v| {
-                        v.metadata
-                            .as_ref()
-                            .is_some_and(|m| m.roles.contains(&request.role))
-                    })
-            })
-            .filter(|listing| {
-                let haystack = format!(
-                    "{} {} {}",
-                    listing.listing,
-                    listing.regions.join(" "),
-                    listing.asset_classes.join(" ")
-                )
-                .to_lowercase();
-                words.iter().all(|word| haystack.contains(word))
-            })
-            .collect();
+        let mut listings: Vec<PluginListing> =
+            with_bundle_pulls(held.listings.clone(), &held, &self.keys)
+                .into_iter()
+                .filter(|listing| request.listing.is_empty() || listing.listing == request.listing)
+                .filter(|listing| {
+                    request.registry.is_empty()
+                        || listing
+                            .versions
+                            .iter()
+                            .any(|v| v.registry == request.registry)
+                })
+                .filter(|listing| {
+                    request.role.is_empty()
+                        || listing.versions.iter().any(|v| {
+                            v.metadata
+                                .as_ref()
+                                .is_some_and(|m| m.roles.contains(&request.role))
+                        })
+                })
+                .filter(|listing| {
+                    let haystack = format!(
+                        "{} {} {}",
+                        listing.listing,
+                        listing.regions.join(" "),
+                        listing.asset_classes.join(" ")
+                    )
+                    .to_lowercase();
+                    words.iter().all(|word| haystack.contains(word))
+                })
+                .collect();
         // Ranked by name match: a listing whose plugin part is a word first.
         listings.sort_by_key(|listing| {
             let plugin = listing.listing.split('/').nth(1).unwrap_or_default();
@@ -462,6 +463,20 @@ impl Hold {
         verify::key_status_signed(&document, &self.keys)
             .map_err(|why| format!("the key status: {why}"))?;
         let carried = wire::key_status(&document);
+        // Contract v26 (ruling 196): the bundle's pull status, checked
+        // against the chart's keys before anything is kept.
+        let pulls = if bundle.pull_status.trim().is_empty() {
+            None
+        } else {
+            let document: Value = serde_json::from_str(bundle.pull_status)
+                .map_err(|_| "the pull status: the bundle's does not read".to_string())?;
+            verify::pull_status_signed(&document, &self.keys)
+                .map_err(|why| format!("the pull status: {why}"))?;
+            let issued = wire::pull_status(&document)
+                .map(|status| status.issued_at_ns)
+                .unwrap_or_default();
+            Some((document, issued))
+        };
         let listed = verify::listing_statement(
             bundle.listing_statement,
             &self.keys,
@@ -508,9 +523,25 @@ impl Hold {
             listed,
             documentation,
         };
+        let mut kept = held.unwrap_or_default();
+        let mut changed = false;
         if checked.issued_at_ns == carried.issued_at_ns {
-            let mut kept = held.unwrap_or_default();
             kept.key_status = document.to_string();
+            changed = true;
+        }
+        // The newer pull status kept: the bundle's, where it was issued
+        // after the one held.
+        if let Some((document, issued)) = pulls {
+            let held_issued = serde_json::from_str::<Value>(&kept.pull_status)
+                .ok()
+                .and_then(|held| wire::pull_status(&held))
+                .map_or(i64::MIN, |status| status.issued_at_ns);
+            if issued > held_issued {
+                kept.pull_status = document.to_string();
+                changed = true;
+            }
+        }
+        if changed {
             self.keep(kept).await?;
         }
         Ok(fetched)
@@ -690,6 +721,43 @@ struct Asked<'a> {
     catalogued: Option<&'a PluginMetadata>,
 }
 
+/// The catalogue's copy with the pulls a bundle brought applied (W8.14;
+/// ruling 196): each pulled version the newest pull status names takes its
+/// pull, or its restoration, where it is newer than what the copy holds; a
+/// status whose signature no longer checks is passed over.
+pub fn with_bundle_pulls(
+    mut listings: Vec<PluginListing>,
+    held: &HeldCatalogue,
+    keys: &PlatformKeys,
+) -> Vec<PluginListing> {
+    let Some(status) = serde_json::from_str::<Value>(&held.pull_status)
+        .ok()
+        .filter(|document| verify::pull_status_signed(document, keys).is_ok())
+        .and_then(|document| wire::pull_status(&document))
+    else {
+        return listings;
+    };
+    for pull in status.pulls {
+        let Some(listing) = listings.iter_mut().find(|l| l.listing == pull.listing) else {
+            continue;
+        };
+        for version in listing
+            .versions
+            .iter_mut()
+            .filter(|v| v.version == pull.version)
+        {
+            let newer = version.pull.as_ref().is_none_or(|had| {
+                pull.pulled_at_ns.max(pull.restored_at_ns)
+                    > had.pulled_at_ns.max(had.restored_at_ns)
+            });
+            if newer {
+                version.pull = Some(pull.clone());
+            }
+        }
+    }
+    listings
+}
+
 /// A plugin bundle as `meridian plugin upload --bundle` names it (W8.14):
 /// its image and referrers already pushed under plugins/{listing}.
 #[derive(Debug, Clone, Copy)]
@@ -702,6 +770,9 @@ pub struct Bundle<'a> {
     /// The bundle's dated SigningKeyStatus, as the platform signed it.
     pub key_status: &'a str,
     pub listing_statement: &'a str,
+    /// Contract v26 (ruling 196): the bundle's dated PluginPullStatus, as
+    /// the platform signed it; empty for a v25 bundle.
+    pub pull_status: &'a str,
 }
 
 struct Attested {

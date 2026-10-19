@@ -2258,7 +2258,7 @@ impl Store for PostgresStore {
         let Some(row) = self
             .conn()?
             .query_opt(
-                "SELECT listings, sequence, key_status, pulled_at_ns
+                "SELECT listings, sequence, key_status, pulled_at_ns, pull_status
                    FROM config_registry_catalogue WHERE id = 1",
                 &[],
             )
@@ -2274,6 +2274,7 @@ impl Store for PostgresStore {
             sequence: u64::try_from(row.get::<_, i64>(1)).unwrap_or_default(),
             key_status: row.get(2),
             pulled_at_ns: row.get(3),
+            pull_status: row.get(4),
         }))
     }
 
@@ -2286,15 +2287,17 @@ impl Store for PostgresStore {
         .encode_to_vec();
         self.conn()?
             .execute(
-                "INSERT INTO config_registry_catalogue (id, listings, sequence, key_status, pulled_at_ns)
-                 VALUES (1, $1, $2, $3, $4)
+                "INSERT INTO config_registry_catalogue
+                        (id, listings, sequence, key_status, pulled_at_ns, pull_status)
+                 VALUES (1, $1, $2, $3, $4, $5)
                  ON CONFLICT (id) DO UPDATE SET listings = $1, sequence = $2, key_status = $3,
-                        pulled_at_ns = $4",
+                        pulled_at_ns = $4, pull_status = $5",
                 &[
                     &listings,
                     &i64::try_from(held.sequence).unwrap_or(i64::MAX),
                     &held.key_status,
                     &held.pulled_at_ns,
+                    &held.pull_status,
                 ],
             )
             .map_err(unavailable)?;
