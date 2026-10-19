@@ -10,7 +10,7 @@ DOCKER := DOCKER_BUILDKIT=1 docker
         e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external e2e-cluster-backup \
         test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-service-account e2e-lake e2e-recorded e2e-orders e2e-one-id \
         build test test-store check-image-version chart-check check-crate-boundaries check-one-clock check-test-targets check-local-storage \
-        interop e2e-book prompt-attacks lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-first-run
+        interop e2e-book check-reference-cases reference-cases prompt-attacks lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-first-run
 
 help:
 	@echo "  make ci-local       run every gate (the pre-push gate, and what CI mirrors)"
@@ -36,6 +36,7 @@ help:
 	@echo "  make e2e-orders     the order path on the harness: proposed, released, placed, filled at a simulated venue, refused"
 	@echo "  make e2e-one-id     one ID on the harness: matched, minted or provisional, the licence list, the escape hatch, a resolution"
 	@echo "  make e2e-book       the book of record, written, read and heard through the SDK, then rebuilt"
+	@echo "  make check-reference-cases  the analytics engine's pinned cases are the SDK's, byte for byte"
 	@echo "  make up             bring up Postgres and the runtime"
 	@echo "  make down           take them down, keeping nothing"
 	@echo "  make demo           register this deployment and prove the round trip"
@@ -109,7 +110,7 @@ stage-compile:    gate-begin-compile build test
 	@$(GATE) end compile
 stage-tests:      gate-begin-tests test-store test-broker test-directory gate-drop-tests-image e2e-settings-page
 	@$(GATE) end tests --drop compose:tests $(SETTINGS_PAGE_IMAGE) $(SETTINGS_BROWSER_IMAGE)
-stage-sdk:        gate-begin-sdk interop e2e-book
+stage-sdk:        gate-begin-sdk check-reference-cases interop e2e-book
 	@$(GATE) end sdk
 stage-dashboards: gate-begin-dashboards e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page
 	@$(GATE) end dashboards
@@ -2152,6 +2153,34 @@ interop: network
 		diff -u e2e/interop/positions.expected .interop.positions >&2 \
 			|| { echo "interop FAILED: the street store did not keep what the SDK sent" >&2; exit 1; }
 	@echo "interop OK: the Python SDK and this runtime agree on the sidecar surface, and the street store keeps its numbers exactly"
+
+# The SDK's reference cases (spec/the-analytics-engine-answers-behind-one-api,
+# requirement 36): the analytics engine answers each exactly as the SDK's
+# reference computations do, figures and hash. Vendored, never edited: the
+# engine's tests read them at build (crates/analytics-engine/src/tests.rs),
+# and this check holds them to the SDK's own, byte for byte, file for file,
+# in the stage that has the SDK beside it. `make reference-cases` copies
+# them again after a deliberate change on the SDK's side.
+REFERENCE_CASES := crates/analytics-engine/reference_cases
+
+reference-cases:
+	@test -d "$(SDK)/tests/reference_cases" \
+		|| { echo "no reference cases at $(SDK)/tests/reference_cases; set SDK=<path to meridian-python>" >&2; exit 1; }
+	@rm -f $(REFERENCE_CASES)/*.json && cp "$(SDK)"/tests/reference_cases/*.json $(REFERENCE_CASES)/
+	@rev="$$(git -C "$(SDK)" log -1 --format=%h -- tests/reference_cases)"; \
+		echo "reference-cases: copied from $(SDK)/tests/reference_cases at $$rev; say so in $(REFERENCE_CASES)/SOURCE"
+
+check-reference-cases:
+	@test -d "$(SDK)/tests/reference_cases" \
+		|| { echo "no reference cases at $(SDK)/tests/reference_cases; set SDK=<path to meridian-python>" >&2; exit 1; }
+	@theirs="$$(cd "$(SDK)/tests/reference_cases" && ls *.json)"; ours="$$(cd $(REFERENCE_CASES) && ls *.json)"; \
+		[ "$$theirs" = "$$ours" ] \
+			|| { echo "check-reference-cases FAILED: the SDK holds [$$theirs] and core [$$ours]; run make reference-cases" >&2; exit 1; }; \
+		for f in $$theirs; do \
+			cmp -s "$(SDK)/tests/reference_cases/$$f" "$(REFERENCE_CASES)/$$f" \
+				|| { echo "check-reference-cases FAILED: $$f differs from the SDK's; run make reference-cases" >&2; exit 1; }; \
+		done
+	@echo "check-reference-cases OK: the engine's pinned cases are the SDK's, byte for byte"
 
 # The red-team corpus, vendored from meridian-design's evals/prompt-attacks/
 # (plans/tickets-inside-a-deployment, Q6, ruled 2026-10-03): one corpus for

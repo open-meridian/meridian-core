@@ -1,0 +1,4 @@
+Vendored from open-meridian/meridian-python, tests/reference_cases, at c8c6d52
+(the SDK's v26 branch at 1449c09), by `make reference-cases`; never edited here.
+`make check-reference-cases` holds them to the SDK's, byte for byte, and the
+engine's tests to the reference's figures and hashes (requirement 36).
