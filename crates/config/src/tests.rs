@@ -3921,3 +3921,85 @@ async fn a_relaunched_instance_is_held_to_its_running_version_s_uploaded_declara
             .is_some_and(|first| first.contains("venue")),
     );
 }
+
+/// W12.6 (contract v26; ruling 285): every model id built in until routed;
+/// a route names a pricing instance the deployment runs and says why, each
+/// change its own record, the table's version one more than its changes.
+#[tokio::test]
+async fn a_model_id_is_built_in_until_routed_to_a_running_pricing_instance() {
+    let h = harness("dashboard-1");
+    h.store
+        .record_plugin(&KnownPlugin {
+            plugin_instance_id: "sample-pricing-1".into(),
+            roles: vec!["pricing".into()],
+            last_reported_at_ns: 0,
+        })
+        .unwrap();
+    let read = || {
+        ask::<_, meridian_domain::v1::ListModelRoutingReply>(
+            &h,
+            crate::service::LIST_MODEL_ROUTING,
+            "meridian.v1.ListModelRoutingRequest",
+            meridian_domain::v1::ListModelRoutingRequest {},
+        )
+    };
+    let set = |model: &str, implementation: &str, reason: &str| {
+        ask::<_, meridian_domain::v1::ListModelRoutingReply>(
+            &h,
+            crate::service::SET_MODEL_ROUTING,
+            "meridian.v1.SetModelRoutingRequest",
+            meridian_domain::v1::SetModelRoutingRequest {
+                model_id: model.into(),
+                implementation: implementation.into(),
+                reason: reason.into(),
+            },
+        )
+    };
+    let table = read().await.unwrap();
+    assert_eq!(table.version, 1);
+    let named: Vec<(&str, &str)> = table
+        .routes
+        .iter()
+        .map(|r| (r.model_id.as_str(), r.implementation.as_str()))
+        .collect();
+    assert_eq!(
+        named,
+        vec![
+            ("cash", "built-in"),
+            ("quoted_price", "built-in"),
+            ("binary_event", "built-in")
+        ]
+    );
+    let refused = set("quoted_price", "oms-1", "prove the seam")
+        .await
+        .unwrap_err();
+    assert!(refused.contains("fields=implementation"), "{refused}");
+    let refused = set("quoted_price", "sample-pricing-1", " ")
+        .await
+        .unwrap_err();
+    assert!(refused.contains("fields=reason"), "{refused}");
+    let refused = set("black_scholes", "built-in", "later").await.unwrap_err();
+    assert!(refused.contains("fields=model_id"), "{refused}");
+    let routed = set("quoted_price", "sample-pricing-1", "Prove the pricing seam")
+        .await
+        .unwrap();
+    assert_eq!(routed.version, 2);
+    let quoted = &routed.routes[1];
+    assert_eq!(quoted.implementation, "sample-pricing-1");
+    assert_eq!(quoted.reason, "Prove the pricing seam");
+    assert!(!quoted.changed_by.is_empty() && quoted.changed_at_ns > 0);
+    // The same route again changes nothing; routed back is its own record.
+    assert_eq!(
+        set("quoted_price", "sample-pricing-1", "again")
+            .await
+            .unwrap()
+            .version,
+        2
+    );
+    let back = set("quoted_price", "built-in", "the plugin is retired")
+        .await
+        .unwrap();
+    assert_eq!(back.version, 3);
+    assert_eq!(back.routes[1].implementation, "built-in");
+    assert_eq!(h.store.model_routing_changes().unwrap().len(), 2);
+}

@@ -539,6 +539,30 @@ fn the_licensed_schemes_are_the_latest_declaration_each_its_own_row() {
 }
 
 #[test]
+fn each_routing_change_is_its_own_row_read_back_in_order() {
+    // Contract v26 (W12.6, migration 0023).
+    let store = store("routing");
+    assert!(store.model_routing_changes().unwrap().is_empty());
+    let author = meridian_config::Author {
+        by: "local|ada".into(),
+        note: "prove the seam".into(),
+        ..Default::default()
+    };
+    store
+        .set_model_routing("quoted_price", "sample-pricing-1", &author, 1)
+        .unwrap();
+    store
+        .set_model_routing("quoted_price", "built-in", &author, 2)
+        .unwrap();
+    let changes = store.model_routing_changes().unwrap();
+    assert_eq!(changes.len(), 2);
+    assert_eq!(changes[0].implementation, "sample-pricing-1");
+    assert_eq!(changes[1].implementation, "built-in");
+    assert_eq!(changes[1].changed_by, "local|ada");
+    assert_eq!(changes[1].note, "prove the seam");
+}
+
+#[test]
 fn one_live_launch_per_instance_and_it_ends_once() {
     let store = store("launches");
     store

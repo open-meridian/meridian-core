@@ -135,6 +135,16 @@ pub struct TimeZoneChange {
     pub changed_by: String,
 }
 
+/// One change to the analytics routing table (contract v26, W12.6).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ModelRoutingChange {
+    pub model_id: String,
+    pub implementation: String,
+    pub changed_at_ns: i64,
+    pub changed_by: String,
+    pub note: String,
+}
+
 /// The longest a change's note may be, as a note on an instrument record.
 pub const MOST_NOTE: usize = 2_000;
 
@@ -1022,6 +1032,19 @@ pub trait Store: Send + Sync {
     /// The latest change to the deployment's time zone, if any: none is the
     /// default, America/New_York.
     fn deployment_time_zone(&self) -> Result<Option<TimeZoneChange>>;
+
+    /// A model id routed, its own record (contract v26, W12.6,
+    /// decisions/031): the implementation, who, through what, when and why.
+    fn set_model_routing(
+        &self,
+        model_id: &str,
+        implementation: &str,
+        author: &Author,
+        at_ns: i64,
+    ) -> Result<()>;
+
+    /// Every change to the routing table, oldest first.
+    fn model_routing_changes(&self) -> Result<Vec<ModelRoutingChange>>;
 
     /// The usage statistics' setting changed, its own record (contract v24,
     /// W3.28, decisions/031): who, through what, when and why.

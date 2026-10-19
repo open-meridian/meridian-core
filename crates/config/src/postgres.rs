@@ -2142,6 +2142,54 @@ impl Store for PostgresStore {
         Ok(())
     }
 
+    fn set_model_routing(
+        &self,
+        model_id: &str,
+        implementation: &str,
+        author: &Author,
+        at_ns: i64,
+    ) -> Result<()> {
+        self.conn()?
+            .execute(
+                "INSERT INTO config_model_routing_change
+                        (model_id, implementation, changed_by, through_delegation, client_name,
+                         prepared_call_id, changed_at_ns, note)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                &[
+                    &model_id,
+                    &implementation,
+                    &author.by,
+                    &author.delegation,
+                    &author.client,
+                    &author.prepared_call_id,
+                    &at_ns,
+                    &author.note,
+                ],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
+    fn model_routing_changes(&self) -> Result<Vec<crate::store::ModelRoutingChange>> {
+        Ok(self
+            .conn()?
+            .query(
+                "SELECT model_id, implementation, changed_at_ns, changed_by, note
+                   FROM config_model_routing_change ORDER BY change_id",
+                &[],
+            )
+            .map_err(unavailable)?
+            .into_iter()
+            .map(|row| crate::store::ModelRoutingChange {
+                model_id: row.get(0),
+                implementation: row.get(1),
+                changed_at_ns: row.get(2),
+                changed_by: row.get(3),
+                note: row.get(4),
+            })
+            .collect())
+    }
+
     fn deployment_time_zone(&self) -> Result<Option<crate::store::TimeZoneChange>> {
         Ok(self
             .conn()?

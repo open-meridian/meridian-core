@@ -36,6 +36,8 @@ pub struct MemoryStore {
     reports_usage: Mutex<Vec<(bool, Author, i64)>>,
     /// Contract v26 (W6.35): the time zone's changes.
     time_zones: Mutex<Vec<(String, Author, i64)>>,
+    /// Contract v26 (W12.6): the routing table's changes.
+    model_routing: Mutex<Vec<crate::store::ModelRoutingChange>>,
     usage_reports: Mutex<Vec<meridian_domain::v1::SentUsageReport>>,
     archives: Mutex<Vec<(PluginArchive, String)>>,
     /// Each launch's and stop's note, in order (contract v17).
@@ -89,6 +91,7 @@ impl MemoryStore {
             holds: Mutex::new(Vec::new()),
             reports_usage: Mutex::new(Vec::new()),
             time_zones: Mutex::new(Vec::new()),
+            model_routing: Mutex::new(Vec::new()),
             usage_reports: Mutex::new(Vec::new()),
             registry: Mutex::new(None),
             statements: Mutex::new(Default::default()),
@@ -1133,6 +1136,34 @@ impl Store for MemoryStore {
             at_ns,
         ));
         Ok(())
+    }
+
+    fn set_model_routing(
+        &self,
+        model_id: &str,
+        implementation: &str,
+        author: &Author,
+        at_ns: i64,
+    ) -> Result<()> {
+        self.model_routing
+            .lock()
+            .expect("store lock poisoned")
+            .push(crate::store::ModelRoutingChange {
+                model_id: model_id.to_string(),
+                implementation: implementation.to_string(),
+                changed_at_ns: at_ns,
+                changed_by: author.by.clone(),
+                note: author.note.clone(),
+            });
+        Ok(())
+    }
+
+    fn model_routing_changes(&self) -> Result<Vec<crate::store::ModelRoutingChange>> {
+        Ok(self
+            .model_routing
+            .lock()
+            .expect("store lock poisoned")
+            .clone())
     }
 
     fn deployment_time_zone(&self) -> Result<Option<crate::store::TimeZoneChange>> {

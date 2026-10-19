@@ -100,6 +100,13 @@ pub const SET_REPORTS_USAGE: &str = "platform.config.command.set-reports-usage";
 /// W6.35 (contract v26): the deployment's time zone, set and read.
 pub const SET_DEPLOYMENT_TIME_ZONE: &str = "platform.config.command.set-deployment-time-zone";
 pub const READ_DEPLOYMENT_TIME_ZONE: &str = "platform.config.query.read-deployment-time-zone";
+/// W12.6 (contract v26; ruling 285): the analytics routing table, held here.
+pub const SET_MODEL_ROUTING: &str = "platform.analytics.command.set-model-routing";
+pub const LIST_MODEL_ROUTING: &str = "platform.analytics.query.list-model-routing";
+/// v26's model ids, in the order the table lists them (the first release's
+/// §1), and the implementation every one has.
+pub const MODEL_IDS: [&str; 3] = ["cash", "quoted_price", "binary_event"];
+pub const BUILT_IN: &str = "built-in";
 /// The deployment's time zone with nothing set (the v26 plan's question
 /// 229: US first).
 pub const DEFAULT_TIME_ZONE: &str = "America/New_York";
@@ -428,6 +435,55 @@ pub fn time_zone_setting(
             .map(|(_, instance)| instance.to_string())
             .unwrap_or_default(),
     }
+}
+
+/// W12.6 (contract v26): the routing table in force, each model id at its
+/// latest change or `built-in`, and its version, one more than its changes.
+pub fn model_routing(
+    changes: &[crate::store::ModelRoutingChange],
+) -> meridian_domain::v1::ListModelRoutingReply {
+    meridian_domain::v1::ListModelRoutingReply {
+        routes: MODEL_IDS
+            .iter()
+            .map(
+                |model| match changes.iter().rev().find(|c| c.model_id == *model) {
+                    Some(change) => meridian_domain::v1::ModelRouting {
+                        model_id: change.model_id.clone(),
+                        implementation: change.implementation.clone(),
+                        changed_at_ns: change.changed_at_ns,
+                        changed_by: change.changed_by.clone(),
+                        reason: change.note.clone(),
+                    },
+                    None => meridian_domain::v1::ModelRouting {
+                        model_id: model.to_string(),
+                        implementation: BUILT_IN.to_string(),
+                        ..Default::default()
+                    },
+                },
+            )
+            .collect(),
+        version: changes.len() as i64 + 1,
+    }
+}
+
+/// Whether `instance` is a `pricing` instance the deployment runs: launched
+/// from the catalogue holding the role, or reporting it.
+fn runs_pricing(snapshot: &Snapshot, instance: &str) -> bool {
+    let holds = crate::connectivity::roles_of(snapshot, instance)
+        .iter()
+        .any(|role| role == "pricing");
+    let launched = snapshot
+        .catalogue
+        .launches
+        .iter()
+        .rev()
+        .find(|launch| launch.instance_id == instance)
+        .is_some_and(|launch| launch.state == PluginLaunchState::Launched as i32);
+    let reported = snapshot
+        .plugins
+        .iter()
+        .any(|plugin| plugin.plugin_instance_id == instance);
+    holds && (launched || reported)
 }
 
 /// W7.5 (contract v26): the zone the wizard was told, recorded once as the
@@ -1705,6 +1761,102 @@ pub fn serve_with(
                 reports_usage: cx.store.reports_usage().map_err(|f| f.to_string())?,
                 licensed_schemes: cx.store.licensed_schemes().map_err(|f| f.to_string())?,
             })
+        },
+    );
+
+    // W12.6 (contract v26; ruling 285): the analytics routing table, a
+    // deployment admin's, each change its own record; read by the dashboard
+    // and by the analytics component at every job.
+    answer(
+        &context,
+        SET_MODEL_ROUTING,
+        (
+            "meridian.v1.SetModelRoutingRequest",
+            "meridian.v1.ListModelRoutingReply",
+        ),
+        |cx, request: meridian_domain::v1::SetModelRoutingRequest, envelope| {
+            let by = subject(envelope);
+            if by.is_empty() {
+                return Err(meridian_bus::refusal_with_status(
+                    meridian_bus::RefusalStatus::PermissionDenied,
+                    &[],
+                    "routing a model id is a deployment admin's, and this is sent for nobody",
+                ));
+            }
+            let model = request.model_id.trim();
+            if !MODEL_IDS.contains(&model) {
+                return Err(meridian_bus::refusal_with_status(
+                    meridian_bus::RefusalStatus::InvalidArgument,
+                    &["model_id".to_string()],
+                    format!(
+                        "model_id: {model:?} is not a model id v26 serves ({})",
+                        MODEL_IDS.join(", ")
+                    ),
+                ));
+            }
+            if request.reason.trim().is_empty() {
+                return Err(meridian_bus::refusal_naming(
+                    meridian_pb::v1::RefusalReason::ReasonRequired as i32,
+                    &["reason".to_string()],
+                    "reason: a change to the routing table says why",
+                ));
+            }
+            if request.reason.chars().count() > 4_000 {
+                return Err("reason: at most 4,000 characters".into());
+            }
+            let implementation = request.implementation.trim();
+            if implementation != BUILT_IN && !runs_pricing(&cx.snapshot()?, implementation) {
+                return Err(format!(
+                    "failed_precondition: [fields=implementation] implementation: \
+                     {implementation:?} is not a pricing instance this deployment runs; \
+                     route to built-in or to a launched pricing instance"
+                ));
+            }
+            let changes = cx
+                .store
+                .model_routing_changes()
+                .map_err(|f| f.to_string())?;
+            let now = model_routing(&changes);
+            let held = now
+                .routes
+                .iter()
+                .find(|r| r.model_id == model)
+                .map(|r| r.implementation.clone())
+                .unwrap_or_default();
+            if held != implementation {
+                cx.store
+                    .set_model_routing(
+                        model,
+                        implementation,
+                        &Author {
+                            note: request.reason.trim().to_string(),
+                            ..author(envelope)
+                        },
+                        cx.clock.now_ns(),
+                    )
+                    .map_err(|f| f.to_string())?;
+                tracing::info!(model, implementation, by, "a model id was routed");
+            }
+            Ok(model_routing(
+                &cx.store
+                    .model_routing_changes()
+                    .map_err(|f| f.to_string())?,
+            ))
+        },
+    );
+    answer(
+        &context,
+        LIST_MODEL_ROUTING,
+        (
+            "meridian.v1.ListModelRoutingRequest",
+            "meridian.v1.ListModelRoutingReply",
+        ),
+        |cx, _request: meridian_domain::v1::ListModelRoutingRequest, _| {
+            Ok(model_routing(
+                &cx.store
+                    .model_routing_changes()
+                    .map_err(|f| f.to_string())?,
+            ))
         },
     );
 

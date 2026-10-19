@@ -159,6 +159,12 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0022_pulls_reach_a_bundle.sql"),
         then: None,
     },
+    Migration {
+        version: 23,
+        name: "model_routing",
+        sql: include_str!("../migrations/0023_model_routing.sql"),
+        then: None,
+    },
 ];
 
 /// Migration 18 (contract v22; W11.21, decisions/031): each instance holding
