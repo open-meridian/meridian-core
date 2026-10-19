@@ -238,13 +238,14 @@ lake:
     key: ""
 
 # The analytics component (contract v26, W12): a coordinator and a pool of
-# workers, its own image from the same commit (tag empty means image.tag),
-# its own credential. Stateless, so either scales by its replica count; the
-# coordinator answers jobs, the workers compute their units. One of each by
-# default (the v26 plan's question 245), sized from v26's first benchmark
-# (crates/analytics-engine/BENCHMARK.md): a 500-position account's 500-day
-# VaR and ES is computed in well under its budget on one core, and a worker
-# holds its losable cache of parts, so its memory is the larger.
+# workers, its own image from the same commit, its own credential.
+# Stateless, so either scales by its replica count; the coordinator answers
+# jobs and computes a unit too large to send, the workers compute the rest.
+# One of each by default (the v26 plan's question 245), sized from v26's
+# first benchmark (crates/analytics-engine/BENCHMARK.md): a 500-position
+# account's 500-day VaR and ES reads, hashes and computes in about a quarter
+# of a second on one core, and its inputs (25 MB written out) are held
+# while it runs; a 1,000-account batch holds about ten times that.
 analytics:
   image:
     # Empty is image.repository's, named meridian-analytics where it names
@@ -256,18 +257,18 @@ analytics:
     replicaCount: 1
     resources:
       requests:
-        cpu: 50m
-        memory: 64Mi
+        cpu: 100m
+        memory: 256Mi
       limits:
-        memory: 512Mi
+        memory: 2Gi
   worker:
     replicaCount: 1
     resources:
       requests:
         cpu: 100m
-        memory: 128Mi
+        memory: 256Mi
       limits:
-        memory: 1Gi
+        memory: 2Gi
   # How long a job may take and still be answered in the reply; past it the
   # job finishes later and its client is told (the one-API spec's Q5).
   inlineMs: 2000

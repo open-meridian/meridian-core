@@ -46,8 +46,9 @@ pub fn window(definition: &Definition) -> usize {
 fn series(case: &Case, subject: &str, dates: &[String]) -> Option<Vec<Dec>> {
     let mut out: Vec<Dec> = Vec::with_capacity(dates.len());
     let mut carried = 0;
+    let held = case.closes.get(subject);
     for day in dates {
-        match case.closes.get(&(subject.to_string(), day.clone())) {
+        match held.and_then(|closes| closes.get(day)) {
             Some(close) => {
                 carried = 0;
                 out.push(close.clone());
@@ -118,10 +119,12 @@ pub fn approximate(bucket: &Bucket, table: &[Series], days: usize, work: &mut Wo
         .max()
         .unwrap_or(0);
     let terms = bucket.holdings.len();
-    // Each term: the value now and each close read (relative error ε each),
-    // a ratio per series (ε) and a product per series (ε), a subtraction;
-    // then a sum over the terms. Twice that, for the bound's own rounding.
-    let relative = (4 * most + 6 + terms) as f64 * f64::EPSILON * 2.0;
+    // Each term: the value now and each close read (relative error 2ε each:
+    // the integer, then the scale), a ratio per series (ε) and a product
+    // per series (ε), a subtraction; then a sum over the terms. Four times
+    // that, for the bound's own rounding and to spare: a wider bound only
+    // computes more days exactly, never a different figure.
+    let relative = (5 * most + 8 + terms) as f64 * f64::EPSILON * 4.0;
     for day in 0..days {
         let mut sum = 0.0f64;
         let mut magnitude = 0.0f64;

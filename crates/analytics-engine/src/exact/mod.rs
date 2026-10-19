@@ -322,7 +322,11 @@ impl Dec {
     /// The nearest double: only to choose which historical days to compute
     /// exactly, never as a figure.
     pub fn to_f64(&self) -> f64 {
-        self.text().parse::<f64>().unwrap_or(f64::NAN)
+        match (&self.integer, self.scale) {
+            // The integer, then its scale: within two roundings of the value.
+            (Num::Small(value), scale) if scale <= 22 => *value as f64 / 10f64.powi(scale as i32),
+            _ => self.text().parse::<f64>().unwrap_or(f64::NAN),
+        }
     }
 
     pub fn to_ratio(&self) -> Ratio {

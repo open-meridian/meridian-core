@@ -206,8 +206,8 @@ pub struct Case {
     /// By subject and kind, in the document's order.
     pub market: BTreeMap<(String, String), Vec<Price>>,
     pub dates: Vec<String>,
-    /// By subject and business date; a later row for the same pair wins.
-    pub closes: BTreeMap<(String, String), Dec>,
+    /// By subject, then business date; a later row for the same pair wins.
+    pub closes: BTreeMap<String, BTreeMap<String, Dec>>,
     pub outcomes: BTreeMap<String, Outcome>,
     pub groups: BTreeMap<String, Group>,
     pub stale_after: BTreeMap<String, i64>,
@@ -278,11 +278,11 @@ impl Case {
                 .or_default()
                 .push(price);
         }
-        let history = inputs.get("history").cloned().unwrap_or(Value::Null);
-        let mut closes = BTreeMap::new();
-        for close in items(&history, "closes") {
-            closes.insert(
-                (text(close, "subject_id"), text(close, "business_date")),
+        let history = inputs.get("history").unwrap_or(&Value::Null);
+        let mut closes: BTreeMap<String, BTreeMap<String, Dec>> = BTreeMap::new();
+        for close in items(history, "closes") {
+            closes.entry(text(close, "subject_id")).or_default().insert(
+                text(close, "business_date"),
                 decimal(close.get("amount"), "a close's amount")?,
             );
         }
@@ -383,7 +383,7 @@ impl Case {
                 })
                 .collect::<Result<_>>()?,
             market,
-            dates: items(&history, "dates")
+            dates: items(history, "dates")
                 .iter()
                 .map(|d| d.as_str().unwrap_or_default().to_string())
                 .collect(),

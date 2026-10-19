@@ -38,6 +38,8 @@ pub mod model;
 pub mod pricing;
 
 #[cfg(test)]
+mod bench;
+#[cfg(test)]
 mod tests;
 
 pub use answer::Answer;

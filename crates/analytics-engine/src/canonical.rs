@@ -28,6 +28,12 @@ impl std::error::Error for NotCanonical {}
 
 fn write_string(text: &str, out: &mut String) {
     out.push('"');
+    // Nothing to escape, the common case: written whole.
+    if !text.bytes().any(|b| b < 0x20 || b == b'"' || b == b'\\') {
+        out.push_str(text);
+        out.push('"');
+        return;
+    }
     for character in text.chars() {
         match character {
             '"' => out.push_str("\\\""),
@@ -86,13 +92,16 @@ fn write(value: &Value, out: &mut String) -> Result<(), NotCanonical> {
         Value::Object(members) => {
             // RFC 8785 3.2.3: members sorted by their names' UTF-16 code
             // units, which a sort by code points would get wrong past U+FFFF.
-            let mut names: Vec<(&String, Vec<u16>)> = members
-                .keys()
-                .map(|name| (name, name.encode_utf16().collect()))
-                .collect();
-            names.sort_by(|a, b| a.1.cmp(&b.1));
+            // ASCII names sort the same by bytes, the common case, sorted
+            // without a copy.
+            let mut names: Vec<&String> = members.keys().collect();
+            if names.iter().all(|name| name.is_ascii()) {
+                names.sort_unstable();
+            } else {
+                names.sort_by(|a, b| a.encode_utf16().cmp(b.encode_utf16()));
+            }
             out.push('{');
-            for (i, (name, _)) in names.iter().enumerate() {
+            for (i, name) in names.iter().enumerate() {
                 if i > 0 {
                     out.push(',');
                 }
