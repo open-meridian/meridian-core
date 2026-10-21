@@ -951,7 +951,14 @@ pub fn read(
             weekends: record.weekends.clone(),
             coverage: record.coverage.clone(),
             sources: record.sources.clone(),
-            trading_sessions: record.trading_sessions.clone(),
+            // Contract v27 (W3.19): the sessions, and the early closes in
+            // the range read.
+            trading_sessions: record.trading_sessions.clone().map(|mut sessions| {
+                sessions.early_closes.retain(|day| {
+                    Date::parse(&day.date).is_ok_and(|date| date >= from && date <= to)
+                });
+                sessions
+            }),
         },
         None,
     ))

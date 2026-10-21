@@ -23,7 +23,7 @@ use meridian_domain::v1::{
     CalendarDayKind, CalendarKind, CalendarRecord, CalendarSource, CalendarWeekend,
     DateRuleVersion, DayCut, Identifier, InstrumentLifecycleState, MissingCalendarDetectedEvent,
     PullCalendarReply, SettlementDateRule, SettlementSystem, SpotCountingMode, SpotDateRule,
-    TenorDateRule, Weekday,
+    TenorDateRule, TradingSession, TradingSessionDay, TradingSessions, Weekday,
 };
 use prost::Message;
 use serde_json::Value;
@@ -338,6 +338,67 @@ fn sources(value: &Value) -> Result<Vec<CalendarSource>, String> {
         .collect()
 }
 
+fn weekdays(value: &Value) -> Result<Vec<i32>, String> {
+    list(value, "weekdays")
+        .iter()
+        .map(|day| match day {
+            Value::String(name) => Weekday::from_str_name(name)
+                .map(|day| day as i32)
+                .ok_or_else(|| format!("weekday {name:?} is not one")),
+            Value::Number(n) => Ok(n.as_i64().unwrap_or(0) as i32),
+            _ => Err("a weekday is not a name".to_string()),
+        })
+        .collect()
+}
+
+fn sessions(value: &Value) -> Result<Vec<TradingSession>, String> {
+    list(value, "sessions")
+        .iter()
+        .map(|session| {
+            let minute = |key: &str| -> Result<u32, String> {
+                let n = number(session, key)?;
+                u32::try_from(n)
+                    .ok()
+                    .filter(|n| *n <= 1440)
+                    .ok_or_else(|| format!("{key} {n} is not a minute of a day"))
+            };
+            Ok(TradingSession {
+                weekdays: weekdays(session)?,
+                start_minute: minute("start_minute")?,
+                end_minute: minute("end_minute")?,
+                extended: session
+                    .get("extended")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
+/// A trading-sessions calendar's sessions as the platform writes them
+/// (contract v27, W1.20; ruling 419): the zone, the sessions by weekday,
+/// start and end minutes after local midnight, extended or not, and the
+/// dated early closes; unset where the calendar carries none.
+fn trading_sessions(value: &Value) -> Result<Option<TradingSessions>, String> {
+    let Some(held) = value.get("trading_sessions").filter(|v| v.is_object()) else {
+        return Ok(None);
+    };
+    Ok(Some(TradingSessions {
+        time_zone: text(held, "time_zone"),
+        sessions: sessions(held)?,
+        early_closes: list(held, "early_closes")
+            .iter()
+            .map(|day| {
+                Ok(TradingSessionDay {
+                    date: text(day, "date"),
+                    sessions: sessions(day)?,
+                    source: text(day, "source"),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?,
+    }))
+}
+
 fn calendar(value: &Value) -> Result<CalendarRecord, String> {
     let calendar_id = text(value, "calendar_id");
     if !calendar_id.starts_with("CAL-") {
@@ -408,7 +469,7 @@ fn calendar(value: &Value) -> Result<CalendarRecord, String> {
         days,
         coverage,
         sources: sources(value)?,
-        trading_sessions: None,
+        trading_sessions: trading_sessions(value)?,
         version: number(value, "version")?,
         valid_time_ns: number(value, "valid_time_ns")?,
         record_time_ns: number(value, "record_time_ns")?,
@@ -561,6 +622,42 @@ mod tests {
             &json!({"calendars": [{"calendar_id": "CAL-1", "kind": "CALENDAR_KIND_MOON"}]})
         )
         .is_err());
+    }
+
+    #[test]
+    fn a_trading_sessions_calendar_reads_its_zone_sessions_and_early_closes() {
+        // Contract v27 (W1.20; ruling 419): FX's week, Sunday 17:00 to Friday
+        // 17:00 New York, and an early close; a minute past the day refused.
+        let fx = json!({
+            "calendar_id": "CAL-FX", "name": "FX", "kind": "CALENDAR_KIND_TRADING_SESSIONS",
+            "version": 1, "lifecycle_state": "INSTRUMENT_LIFECYCLE_STATE_ACTIVE",
+            "trading_sessions": {
+                "time_zone": "America/New_York",
+                "sessions": [
+                    {"weekdays": ["WEEKDAY_SUNDAY"], "start_minute": 1020, "end_minute": 1440},
+                    {"weekdays": ["WEEKDAY_MONDAY", "WEEKDAY_TUESDAY", "WEEKDAY_WEDNESDAY",
+                                  "WEEKDAY_THURSDAY"], "start_minute": 0, "end_minute": 1440},
+                    {"weekdays": ["WEEKDAY_FRIDAY"], "start_minute": 0, "end_minute": 1020}
+                ],
+                "early_closes": [{"date": "2026-12-24", "source": "SRC-1", "sessions": [
+                    {"weekdays": ["WEEKDAY_THURSDAY"], "start_minute": 0, "end_minute": 780}
+                ]}]
+            }
+        });
+        let read = calendar(&fx).unwrap();
+        let sessions = read.trading_sessions.unwrap();
+        assert_eq!(sessions.time_zone, "America/New_York");
+        assert_eq!(sessions.sessions.len(), 3);
+        assert_eq!(sessions.sessions[0].weekdays, vec![Weekday::Sunday as i32]);
+        assert_eq!(sessions.sessions[2].end_minute, 1020);
+        assert_eq!(sessions.early_closes[0].sessions[0].end_minute, 780);
+        let mut past = fx.clone();
+        past["trading_sessions"]["sessions"][0]["end_minute"] = json!(1441);
+        assert!(calendar(&past).unwrap_err().contains("end_minute"));
+        // Every other calendar carries none.
+        let plain = json!({"calendar_id": "CAL-X", "kind": "CALENDAR_KIND_TRADING",
+                           "lifecycle_state": "INSTRUMENT_LIFECYCLE_STATE_ACTIVE"});
+        assert!(calendar(&plain).unwrap().trading_sessions.is_none());
     }
 
     #[test]
