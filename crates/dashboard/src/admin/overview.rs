@@ -29,7 +29,7 @@ use super::view::{self, Line};
 
 /// The sections, in the order an administrator reaches for them: who may do
 /// what first, then the parts it is made of.
-const TABS: [(&str, &str); 12] = [
+const TABS: [(&str, &str); 13] = [
     ("plugins", "Plugins"),
     ("permissions", "Permissions"),
     ("user-groups", "User groups"),
@@ -38,6 +38,8 @@ const TABS: [(&str, &str); 12] = [
     ("accounts", "Accounts"),
     ("holds", "Holds"),
     ("time-zone", "Time zone"),
+    // Contract v27 (W6.36; ruling 483).
+    ("fx-pivots", "FX pivot currencies"),
     ("model-routing", "Model routing"),
     ("agents", "Agents"),
     ("service-accounts", "Service accounts"),
@@ -203,6 +205,10 @@ pub fn render(
     agents: (String, String),
     service_accounts: (String, String),
     time_zone: Option<&meridian_domain::v1::DeploymentTimeZoneSetting>,
+    fx_pivots: (
+        Option<&meridian_domain::v1::FxPivotCurrenciesSetting>,
+        &std::collections::BTreeMap<String, String>,
+    ),
     routing: (
         Option<&meridian_domain::v1::ListModelRoutingReply>,
         Option<&meridian_domain::v1::ListMeasureDefinitionsReply>,
@@ -1041,6 +1047,31 @@ pub fn render(
             super::time_zone::lines(time_zone, |subject| crate::tickets::display_name(
                 records, subject
             ))
+        ),
+    ));
+
+    // ── FX pivot currencies ─────────────────────────────────────────────────
+    // W6.36 (contract v27; rulings 462 and 483): a deployment admin's.
+    let (pivots, pivot_codes) = fx_pivots;
+    let order = dialog(
+        "fx-pivots-change",
+        "Change the FX pivot currencies",
+        "/admin/fx-pivot-currencies#fx-pivots",
+        token,
+        &super::fx_pivots::fields(pivots, pivot_codes),
+        "Change",
+    );
+    sections.push(section(
+        "fx-pivots",
+        "FX pivot currencies",
+        "The fiat currencies a valuation crosses through, in order, where the lake holds no \
+         rate between two currencies. Each change is kept with who made it and why.",
+        "<button type=\"button\" data-dialog-open=\"fx-pivots-change\">Change</button>",
+        format!(
+            "{}{order}",
+            super::fx_pivots::lines(pivots, pivot_codes, |subject| {
+                crate::tickets::display_name(records, subject)
+            })
         ),
     ));
 

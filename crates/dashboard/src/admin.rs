@@ -79,6 +79,7 @@ pub fn routes() -> Router<Arc<App>> {
         )
         .route(trading::LOCAL_RECORDS_PATH, post(set_local_record_orders))
         .route("/admin/time-zone", post(set_deployment_time_zone))
+        .route("/admin/fx-pivot-currencies", post(set_fx_pivot_currencies))
         .route("/admin/model-routing", post(set_model_routing))
         .route("/admin/data-sources", get(data_sources_page))
         .route("/admin/data-sources/licence", post(set_dataset_licence))
@@ -468,6 +469,7 @@ pub mod instruments;
 pub mod model_routing;
 pub(crate) mod overview;
 pub mod time_zone;
+pub mod fx_pivots;
 pub(crate) use overview::listing;
 pub mod people;
 pub(crate) mod picker;
@@ -574,6 +576,16 @@ async fn admin_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Response
     if let Err(failed) = &zone {
         tracing::warn!(%failed, "the deployment's time zone could not be read");
     }
+    // Contract v27 (W6.36): the FX pivot currencies, their tab, each named
+    // by its code.
+    let pivots = fx_pivots::read(&app.bus).await;
+    if let Err(failed) = &pivots {
+        tracing::warn!(%failed, "the FX pivot currencies could not be read");
+    }
+    let pivot_codes = match &pivots {
+        Ok(setting) => fx_pivots::codes(&app.bus, &setting.fx_pivot_currencies).await,
+        Err(_) => Default::default(),
+    };
     // Contract v26 (W12.6): the analytics routing table, its tab, with the
     // measures the component serves beside it where it answers.
     let routing = model_routing::read(&app.bus).await;
@@ -590,6 +602,7 @@ async fn admin_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Response
         agents,
         service_accounts,
         zone.as_ref().ok(),
+        (pivots.as_ref().ok(), &pivot_codes),
         (routing.as_ref().ok(), served.as_ref()),
         &token_input(&session),
         "",
@@ -3373,6 +3386,80 @@ async fn set_deployment_time_zone(
 
 /// The time zone's act on the surface (W6.35, contract v26).
 const SET_DEPLOYMENT_TIME_ZONE_TOOL: &str = "dashboard__set_deployment_time_zone";
+
+/// W6.36 (contract v27): the FX pivot currencies set, a deployment admin's,
+/// with a reason; or prepared for someone to make. Each code is sent as its
+/// fiat cash instrument; the conductor checks each and keeps each change
+/// its own record.
+async fn set_fx_pivot_currencies(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Form(fields): Form<Fields>,
+) -> Response {
+    let back = "/admin#fx-pivots";
+    let (session, _) = match gate(&app, &headers, true) {
+        Ok(gated) => gated,
+        Err(response) => return *response,
+    };
+    if let Err(response) = form_token_matches(&session, &fields) {
+        return *response;
+    }
+    let note = field(&fields, "note").trim().to_string();
+    if note.is_empty() {
+        return not_done("say why the FX pivot currencies change", back);
+    }
+    let codes: Vec<String> = (0..fx_pivots::MOST)
+        .map(|n| field(&fields, &format!("pivot_{n}")).trim().to_ascii_uppercase())
+        .filter(|code| !code.is_empty())
+        .collect();
+    if codes.is_empty() {
+        return not_done("name one fiat currency at least", back);
+    }
+    let mut pivots = Vec::with_capacity(codes.len());
+    for code in &codes {
+        match fx_pivots::instrument_of(&app.bus, code).await {
+            Some(id) => pivots.push(id),
+            None => {
+                return not_done(
+                    &format!("{code} names no fiat currency's cash instrument this deployment holds"),
+                    back,
+                )
+            }
+        }
+    }
+    let posted = prepare_or_gate(
+        &app,
+        &session,
+        &fields,
+        SET_FX_PIVOT_CURRENCIES_TOOL,
+        || Ok(serde_json::json!({"fx_pivot_currencies": pivots, "note": note})),
+    )
+    .await;
+    if let Some(response) = posted_to(posted, back) {
+        return response;
+    }
+    let outcome = app
+        .bus
+        .call_for(
+            fx_pivots::SET_FX_PIVOT_CURRENCIES,
+            "meridian.v1.SetFxPivotCurrenciesRequest",
+            meridian_domain::v1::SetFxPivotCurrenciesRequest {
+                fx_pivot_currencies: pivots.clone(),
+                reason: note.clone(),
+            }
+            .encode_to_vec(),
+            None,
+            Some(Duration::from_secs(10)),
+            &session.subject,
+        )
+        .await
+        .map(|_| ())
+        .map_err(said_of_refusal);
+    after_to(outcome, "/admin?done=FX+pivot+currencies+set#fx-pivots", back)
+}
+
+/// The FX pivot currencies' act on the surface (W6.36, contract v27).
+const SET_FX_PIVOT_CURRENCIES_TOOL: &str = "dashboard__set_fx_pivot_currencies";
 
 /// W12.6 (contract v26): a model id routed, a deployment admin's, with a
 /// reason; or prepared for someone to make. The conductor checks the

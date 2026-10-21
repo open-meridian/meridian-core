@@ -5,8 +5,9 @@
 
 use meridian_domain::exact::Exact;
 use meridian_domain::v1::{
-    Aggressor, Bar, Money, ObservationMeta, Outcome, OutcomeDetermination, OutcomeStage, Price,
-    PriceBasis, PriceKind, Quote, QuoteCharacteristic, Trade,
+    Aggressor, Bar, ExecutionCost, LiquidityIndicator, Money, ObservationMeta, Outcome,
+    OutcomeDetermination, OutcomeStage, Price, PriceBasis, PriceKind, Quote, QuoteCharacteristic,
+    Side, TcaBenchmark, TcaUnanswered, TimePrecision, Trade,
 };
 use serde_json::{json, Map, Value};
 
@@ -146,6 +147,15 @@ pub fn quote(q: &Quote) -> Value {
 pub fn outcome(o: &Outcome) -> Value {
     kept(vec![
         ("meta", meta(o.meta.as_ref())),
+        // Contract v27 (W10.4): the venue's challenge deadline, 0 unstated.
+        (
+            "challenge_ends_at_ns",
+            if o.challenge_ends_at_ns == 0 {
+                Value::Null
+            } else {
+                json!(o.challenge_ends_at_ns.to_string())
+            },
+        ),
         (
             "determination",
             named(o.determination, OutcomeDetermination::try_from, |e| {
@@ -165,5 +175,66 @@ pub fn outcome(o: &Outcome) -> Value {
                 json!(o.settled_at_ns.to_string())
             },
         ),
+    ])
+}
+
+/// An execution cost (contract v27, W10.11) as `dashboard__list_execution_costs`
+/// answers it.
+pub fn execution_cost(c: &ExecutionCost) -> Value {
+    let ns = |value: i64| {
+        if value == 0 {
+            Value::Null
+        } else {
+            json!(value.to_string())
+        }
+    };
+    kept(vec![
+        ("meta", meta(c.meta.as_ref())),
+        ("execution_id", json!(c.execution_id)),
+        ("order_id", json!(c.order_id)),
+        ("placement_id", json!(c.placement_id)),
+        ("account_id", json!(c.account_id)),
+        (
+            "benchmark",
+            named(c.benchmark, TcaBenchmark::try_from, |e| e.as_str_name()),
+        ),
+        ("benchmark_price", money(c.benchmark_price.as_ref())),
+        ("benchmark_at_ns", ns(c.benchmark_at_ns)),
+        ("benchmark_dataset", json!(c.benchmark_dataset)),
+        ("benchmark_row_key", json!(c.benchmark_row_key)),
+        ("fixing_id", json!(c.fixing_id)),
+        ("execution_price", money(c.execution_price.as_ref())),
+        ("side", named(c.side, Side::try_from, |e| e.as_str_name())),
+        ("notional", money(c.notional.as_ref())),
+        ("cost_bps", decimal(c.cost_bps.as_ref())),
+        ("fees_bps", decimal(c.fees_bps.as_ref())),
+        ("financing_bps", decimal(c.financing_bps.as_ref())),
+        (
+            "liquidity_indicator",
+            named(c.liquidity_indicator, LiquidityIndicator::try_from, |e| {
+                e.as_str_name()
+            }),
+        ),
+        ("venue_id", json!(c.venue_id)),
+        (
+            "unanswered",
+            named(c.unanswered, TcaUnanswered::try_from, |e| e.as_str_name()),
+        ),
+        ("staleness_bound_ns", ns(c.staleness_bound_ns)),
+        (
+            "time_precision",
+            named(c.time_precision, TimePrecision::try_from, |e| {
+                e.as_str_name()
+            }),
+        ),
+        (
+            "reject_count",
+            if c.reject_count == 0 {
+                Value::Null
+            } else {
+                json!(c.reject_count)
+            },
+        ),
+        ("time_to_fill_ns", ns(c.time_to_fill_ns)),
     ])
 }

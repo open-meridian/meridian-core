@@ -34,6 +34,7 @@ fn every_route_of_the_book_and_the_instructions_names_its_tool() {
         if path != "/admin/accounts/book"
             && path != "/admin/time-zone"
             && path != "/admin/model-routing"
+            && path != "/admin/fx-pivot-currencies"
             && !path.starts_with("/admin/trading-instructions")
         {
             continue;
@@ -45,7 +46,7 @@ fn every_route_of_the_book_and_the_instructions_names_its_tool() {
             .unwrap_or_else(|| panic!("{path} is routed and names no tool"));
         assert!(names_tools(by), "{path}: {by:?}");
     }
-    assert_eq!(checked, 4, "the routes were not found");
+    assert_eq!(checked, 5, "the routes were not found");
 }
 
 #[test]
@@ -61,7 +62,10 @@ fn the_four_tools_are_named_preparable_where_they_change_and_may_not_for_agents(
             "{} reaches nothing PARITY names",
             spec.name
         );
-        assert!(matches!(spec.area, Area::Accounts | Area::Trading));
+        assert!(matches!(
+            spec.area,
+            Area::Accounts | Area::Trading | Area::AccountReads
+        ));
         assert_eq!(
             spec.reads,
             spec.name.starts_with("list_") || spec.name.starts_with("read_"),
@@ -87,8 +91,9 @@ fn the_four_tools_are_named_preparable_where_they_change_and_may_not_for_agents(
     // 2026-10-15), from contract v25 the book's health (ruling 155), and
     // from contract v26 the agents' guard's read and set (W11.38, W11.39)
     // and the deployment's time zone's (W6.35), and the analytics routing
-    // table's (W12.6).
-    assert_eq!(SPECS.len(), 13, "the thirteen approved tools");
+    // table's (W12.6); from contract v27 an account's execution costs
+    // (W10.11) and the FX pivot currencies' read and set (W6.36).
+    assert_eq!(SPECS.len(), 16, "the sixteen approved tools");
 }
 
 #[test]
@@ -105,7 +110,7 @@ fn a_deployment_admin_reaches_all_four_and_a_plugins_admin_the_instructions_alon
         assert!(spec.area.open_to(&admin), "{}", spec.name);
         assert_eq!(
             spec.area.open_to(&plugin_admin),
-            spec.area == Area::Trading,
+            matches!(spec.area, Area::Trading | Area::AccountReads),
             "{}",
             spec.name
         );
@@ -124,10 +129,12 @@ fn a_change_takes_a_note_and_a_read_answers_unchanged() {
         assert!(!properties.contains_key("reason"), "{}", spec.name);
         if spec.reads {
             // A read takes no note; the book's health (contract v25) takes
-            // one account as a filter, nothing else.
+            // one account as a filter, nothing else; an account's execution
+            // costs (contract v27) its account and the lake read's filters.
             assert!(!properties.contains_key("note"), "{}", spec.name);
             assert!(
-                properties.keys().all(|key| key == "account_id"),
+                spec.name == "list_execution_costs"
+                    || properties.keys().all(|key| key == "account_id"),
                 "{}",
                 spec.name
             );
@@ -146,7 +153,7 @@ fn a_change_takes_a_note_and_a_read_answers_unchanged() {
     }
     let source = include_str!("../book.rs");
     assert!(!source.contains("\"outcome\": \"read\""));
-    assert_eq!(source.matches("\"outcome\": \"unchanged\"").count(), 6);
+    assert_eq!(source.matches("\"outcome\": \"unchanged\"").count(), 8);
 }
 
 /// Contract v24 (W6.3, W6.30): "Unlink all and close" through the surface is

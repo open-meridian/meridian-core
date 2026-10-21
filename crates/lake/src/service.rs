@@ -731,7 +731,15 @@ impl Lake {
                 ));
             }
             if meta.row_key.is_empty() {
-                meta.row_key = format!("{}:{}", cost.execution_id, benchmark.as_str_name());
+                // `EXE-…:arrival`, as fixtures/lake/list-execution-costs.yaml.
+                meta.row_key = format!(
+                    "{}:{}",
+                    cost.execution_id,
+                    benchmark
+                        .as_str_name()
+                        .trim_start_matches("TCA_BENCHMARK_")
+                        .to_ascii_lowercase()
+                );
             }
             let source = meta.source.get_or_insert_with(Default::default);
             source.dataset = lake::EXECUTION_COST_DATASET.to_string();

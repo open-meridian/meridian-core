@@ -209,7 +209,7 @@ fn boolean(top: &Map<String, Value>, name: &str, problems: &mut Problems) -> boo
     }
 }
 
-fn strings(
+pub(super) fn strings(
     top: &Map<String, Value>,
     name: &str,
     most: usize,
