@@ -57,3 +57,39 @@ message Money {
   // refused; neither set is refused.
   string instrument_id = 3;
 }
+
+// A value with its unit (contract v27, the lake's rates slice;
+// spec/the-lake-holds-researchs-kinds, shared addition 3 and Q8;
+// spec/a-public-rates-and-filings-data-plugin, §1 item 2): a Decimal that is
+// not money, in base units, with its unit from a closed list or, for a
+// physical unit, its UCUM code. A 3.87 per cent fixing is 3.87 percent, never
+// a Money.
+message UnitValue {
+  Decimal value = 1;
+  ValueUnit unit = 2;
+  // For VALUE_UNIT_INDEX, the index's base period as its publisher states
+  // it (`2015=100`); empty otherwise.
+  string index_base = 3;
+  // For VALUE_UNIT_UCUM, the physical unit's UCUM code (`Cel`, `[bbl_us]`);
+  // empty otherwise.
+  string ucum_code = 4;
+}
+
+// The closed list of units a UnitValue takes (contract v27).
+enum ValueUnit {
+  // Refused.
+  VALUE_UNIT_UNSPECIFIED = 0;
+  VALUE_UNIT_PERCENT = 1;
+  VALUE_UNIT_BASIS_POINTS = 2;
+  VALUE_UNIT_SHARES = 3;
+  VALUE_UNIT_CONTRACTS = 4;
+  // A face amount, in its currency's major unit.
+  VALUE_UNIT_PRINCIPAL = 5;
+  VALUE_UNIT_RATIO = 6;
+  VALUE_UNIT_COUNT = 7;
+  VALUE_UNIT_DAYS = 8;
+  // An index level, with its base period in index_base.
+  VALUE_UNIT_INDEX = 9;
+  // A physical unit, named by ucum_code.
+  VALUE_UNIT_UCUM = 10;
+}

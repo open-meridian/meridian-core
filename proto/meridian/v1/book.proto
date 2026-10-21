@@ -360,6 +360,26 @@ message Lot {
   repeated JournalRef adjusted_by = 7;
   // Its position's sleeve (contract v22); empty for the unsleeved part.
   string sleeve = 8;
+  // Contract v27 (W9.10; rulings 320 and 396): each relief of the lot, in
+  // order, with what the quantity relieved was sold for, so a reader
+  // computes realized P&L; the book stores nothing derived. Empty for a lot
+  // never relieved, and for a relief before v27 the upgrade could not
+  // backfill from its execution.
+  repeated LotRelief reliefs = 9;
+}
+
+// One relief of a lot (contract v27; W9.10).
+message LotRelief {
+  // The entry that relieved it, also listed in Lot.relieved_by.
+  JournalRef relieved_by = 1;
+  // The quantity relieved, positive.
+  Decimal quantity = 2;
+  // What that quantity was sold for, in the execution's asset, fees apart
+  // as the execution states them; unset for a relief with no execution
+  // behind it (a transfer out, a correction), never zero.
+  Money proceeds = 3;
+  // ISO 8601: the execution's trade date; empty with no execution.
+  string trade_date = 4;
 }
 
 // ── W9.1: the opening balance ──
@@ -1092,6 +1112,72 @@ enum PlacementCondition {
   PLACEMENT_CONDITION_SUSPENDED = 3;
   // Held at the venue until a stop or a condition triggers.
   PLACEMENT_CONDITION_AWAITING_TRIGGER = 4;
+  // Contract v27 (W11.8): sent while its reference price was past its
+  // ceiling, the `ems` admin having chosen to warn; its StaleReference on
+  // the condition. A record of the warning, never a refusal.
+  PLACEMENT_CONDITION_SENT_ON_STALE_REFERENCE = 5;
+}
+
+// Contract v27 (W11.8; spec/the-contract-gaps-v26-and-v27-close, B1 to B9):
+// how a placement is executed, set by the `ems` at its creation and never
+// changed, as FIX's HandlInst (21) is fixed for an order's life.
+// Unspecified is read as DMA: a placement from v22 to v26, never backfilled.
+enum PlacementType {
+  PLACEMENT_TYPE_UNSPECIFIED = 0;
+  // Direct market access: HandlInst 1 at the edge; carries no strategy.
+  PLACEMENT_TYPE_DMA = 1;
+  // A broker's algorithm: HandlInst 1 or 2 with its strategy, which it
+  // requires.
+  PLACEMENT_TYPE_ALGO = 2;
+  // Worked by a broker: HandlInst 3 with ExecInst Not held; carries no
+  // strategy.
+  PLACEMENT_TYPE_CARE = 3;
+  // A request for quote: a QuoteRequest, then the picked quote hit as
+  // OrdType D (Previously quoted) with its QuoteID; the only type an order
+  // of ORDER_TYPE_REQUEST_FOR_QUOTE takes.
+  PLACEMENT_TYPE_RFQ = 4;
+  // Agreed by phone or chat: names no connectivity instance, delivered to
+  // none, its fills the `ems`'s manual entries for a person.
+  PLACEMENT_TYPE_MANUAL = 5;
+}
+
+// Contract v27 (W11.40): what became of a dealer's quote on an RFQ placement.
+enum PlacementQuoteOutcome {
+  PLACEMENT_QUOTE_OUTCOME_UNSPECIFIED = 0;
+  // Received and standing.
+  PLACEMENT_QUOTE_OUTCOME_OPEN = 1;
+  // Picked by the `ems` (W11.41); the acceptance not yet confirmed.
+  PLACEMENT_QUOTE_OUTCOME_PICKED = 2;
+  // Accepted at the venue; its fill is reported as on any placement.
+  PLACEMENT_QUOTE_OUTCOME_ACCEPTED = 3;
+  // Past its valid-until time, or ended by the venue, unpicked or before
+  // the acceptance.
+  PLACEMENT_QUOTE_OUTCOME_EXPIRED = 4;
+  // Withdrawn by its dealer.
+  PLACEMENT_QUOTE_OUTCOME_WITHDRAWN = 5;
+  // Another quote was accepted.
+  PLACEMENT_QUOTE_OUTCOME_NOT_PICKED = 6;
+}
+
+// Contract v27 (W11.7; spec/sessions-and-data-report-their-latency-and-quality,
+// rulings 374 and 420): why an order is held, typed, beside the words.
+enum HoldCause {
+  // A hold with no typed cause, as every hold before v27.
+  HOLD_CAUSE_UNSPECIFIED = 0;
+  // The `ems`'s reference price was past its stale ceiling at its
+  // pre-trade check, its admin having chosen to refuse.
+  HOLD_CAUSE_REFERENCE_PRICE_STALE = 1;
+}
+
+// Contract v27 (W11.11; the gaps spec's D4): which convention set an
+// internal cross's rate on a net order. Core supports both; the plugin
+// chooses.
+enum CrossRateSource {
+  CROSS_RATE_SOURCE_UNSPECIFIED = 0;
+  // The net's street rate for every member: the platforms' allocate-back.
+  CROSS_RATE_SOURCE_NET_STREET_RATE = 1;
+  // The mid at the netting moment.
+  CROSS_RATE_SOURCE_MID_AT_NETTING = 2;
 }
 
 // ── The order's values (step 5's Q26; step 6) ──
@@ -1111,7 +1197,8 @@ enum OrderType {
   ORDER_TYPE_LIMIT = 2;
   ORDER_TYPE_STOP = 3;
   ORDER_TYPE_STOP_LIMIT = 4;
-  // An RFQ order: its quotes and outcomes are slice C's, on its placement.
+  // An RFQ order: from contract v27 its quotes and outcomes are on its RFQ
+  // placement (W11.40, W11.41), the buy side as initiator only.
   ORDER_TYPE_REQUEST_FOR_QUOTE = 5;
 }
 
@@ -1170,13 +1257,18 @@ enum TimePrecision {
   TIME_PRECISION_NANOSECOND = 4;
 }
 
-// The one named link in v22 (W11.1; step 5's link 1, Q6; the refresh's
-// Q41). Block, allocation, street order, two-way quote, alternatives and
-// basket join with their slices.
+// The named links (W11.1; step 5's link 1, Q6; the refresh's Q41): split
+// from v22, net from v27. Allocation, street order, two-way quote,
+// alternatives and basket join with their slices; a block names its members
+// on the block order (v24).
 enum OrderLinkKind {
   ORDER_LINK_KIND_UNSPECIFIED = 0;
   // A child order an `ems` (or the `oms`) worked out of its parent.
   ORDER_LINK_KIND_SPLIT = 1;
+  // Contract v27 (W11.1; the gaps spec's D2): a member of a net order, set
+  // by the book on each member when the `oms` proposes the net, naming it
+  // as the parent.
+  ORDER_LINK_KIND_NET = 2;
 }
 
 // Which quote a quote at time of receipt is (the refresh's Q35, as refined
@@ -1602,7 +1694,7 @@ message Order {
   // The orders a firm's order represents, recorded and not checked (Q37).
   repeated string represents_order_ids = 27;
 
-  // Slice C's, carried empty until it lands (the refresh's Q34): the axe an
+  // Slice C's sell side, carried empty, not v27's (the refresh's Q34): the axe an
   // order was made from in the lake, its source and counterparty.
   string axe_source = 28;
   string axe_counterparty_id = 29;
@@ -1641,6 +1733,16 @@ message Order {
   // Contract v24 (W11.33): each sleeve cross that filled the order; its
   // filled quantity counts each, and no execution is minted for one.
   repeated string sleeve_cross_ids = 46;
+
+  // Contract v27 (W11.1; the gaps spec's D2): on a net order, its members
+  // as proposed -- released FX orders of one pair and one value date, of
+  // both sides, each in no other live block or net. Empty on any other
+  // order.
+  repeated string net_member_order_ids = 47;
+
+  // Contract v27 (W11.1): the date an FX order settles on, as `portfolio`
+  // states it (FIX's SettlDate, 64), ISO 8601; empty is spot.
+  string value_date = 48;
 }
 
 // An order's status: its state, its conditions and its quantities, each
@@ -1666,6 +1768,24 @@ message StandingOrderCondition {
 
   // On does not tie out: why.
   TieOutReason tie_out_reason = 5;
+
+  // Contract v27 (W11.7): on held, its typed cause, and for a stale
+  // reference price the dataset, its age and the ceiling; unspecified and
+  // unset on any other condition, and on a hold with no typed cause.
+  HoldCause hold_cause = 6;
+  StaleReference stale_reference = 7;
+}
+
+// A reference price found past its ceiling at an `ems`'s pre-trade check
+// (contract v27; W11.7, W11.8).
+message StaleReference {
+  // The dataset the price came from, `instance:key`.
+  string dataset = 1;
+  // How old the price's confirmed time was at the check.
+  int64 age_ns = 2;
+  // The ceiling in force: the tighter of the dataset's and the `ems`
+  // admin's own.
+  int64 ceiling_ns = 3;
 }
 
 // The instance holding a claim, and the user it acts for.
@@ -1692,7 +1812,8 @@ message OrderQuantities {
   Decimal leaves = 7;
 }
 
-// The split link on a child order (W11.1; Q41).
+// The link on a child order (W11.1; Q41), or, from contract v27, on a
+// member of a net order, naming the net as its parent.
 message OrderLink {
   OrderLinkKind kind = 1;
   string parent_order_id = 2;
@@ -1866,7 +1987,7 @@ message Placement {
   TimePrecision routed_precision = 14;
   repeated string handling_instructions = 15;
 
-  // Slice C's, carried empty until it lands (the refresh's Q34): the RFQ a
+  // Slice C's sell side, carried empty, not v27's (the refresh's Q34): the RFQ a
   // placement answers, as FIX's QuoteID (tag 117), and the axe, as FIX's
   // IOIID (tag 23).
   string rfq_id = 16;
@@ -1895,6 +2016,48 @@ message Placement {
   // its outcome (W11.9; approved 2026-10-13), so its connectivity plugin
   // hears each on the placement. The order's stay on the order.
   repeated ChangeRequest change_requests = 26;
+
+  // Contract v27 (W11.8; the gaps spec's B1): how it is executed, set by
+  // the `ems` at its creation and never changed; unspecified is read as
+  // DMA.
+  PlacementType placement_type = 27;
+
+  // Contract v27 (W11.8; B5): a manual placement's trade details, its
+  // evidence and not street data -- the counterparty's contact as the
+  // person states it, and the time agreed with its precision. Empty on any
+  // other type.
+  string counterparty_contact = 28;
+  int64 agreed_at_ns = 29;
+  TimePrecision agreed_precision = 30;
+
+  // Contract v27 (W11.40, W11.41; slice C's buy side): the dealers' quotes
+  // received on an RFQ placement, each with its outcome, and the one the
+  // `ems` picked. Empty on any other type.
+  repeated PlacementQuote quotes = 31;
+  string picked_quote_id = 32;
+}
+
+// One dealer's quote received on the firm's RFQ placement (contract v27;
+// W11.40; requirement 50): a trade detail in the book, the buy side's
+// best-execution record, never copied into the lake.
+message PlacementQuote {
+  // `PQT-` and a ULID, minted by the book, never reused.
+  string quote_id = 1;
+  // The dealer, the venue master's `VEN-` ID.
+  string dealer_id = 2;
+  // The dealer's own QuoteID (FIX 117), as delivered: an external
+  // reference, never a key.
+  string dealer_quote_id = 3;
+  // The side the dealer quoted to the firm: its offer to a buyer, its bid
+  // to a seller.
+  Side side = 4;
+  Money price = 5;
+  Decimal quantity = 6;
+  int64 received_at_ns = 7;
+  // Its ValidUntilTime (FIX 62); 0 when unstated.
+  int64 valid_until_ns = 8;
+  PlacementQuoteOutcome outcome = 9;
+  RawRecordRef raw_record = 10;
 }
 
 // A placement's status, derived.
@@ -1911,6 +2074,9 @@ message StandingPlacementCondition {
   // On outcome unknown.
   UnknownReason unknown_reason = 4;
   AsReported status_as_reported = 5;
+  // Contract v27 (W11.8): on sent on a stale reference, what the `ems`'s
+  // check found.
+  StaleReference stale_reference = 6;
 }
 
 // An execution, never edited (W11.11): a bust or a correction is another,
@@ -2001,6 +2167,9 @@ message Execution {
   // Contract v24 (W11.32): each prime's answer to a give-up of the
   // execution, in the order recorded; a rejection moves no position.
   repeated GiveUpRecord give_up_answers = 41;
+  // Contract v27 (W11.11; the gaps spec's D4): on an internal cross of a
+  // net order, which convention set its rate; unspecified on any other.
+  CrossRateSource cross_rate_source = 42;
 }
 
 // An execution's finality: a level, and when it reached it.
@@ -2154,7 +2323,7 @@ message ProposeOrderRequest {
   // (38) and CashOrderQty (152) are alternatives (ruled 2026-10-12): an
   // order naming both, or neither, is refused INVALID_ARGUMENT naming
   // `quantity` and `cash_quantity`. 0, a pass, is refused naming `quantity`
-  // until slice C defines it.
+  // until slice C's sell side defines it, which is not v27's.
   optional Decimal quantity = 6;
   optional Money cash_quantity = 7;
   OrderType order_type = 8;
@@ -2198,6 +2367,15 @@ message ProposeOrderRequest {
   // (REFUSAL_REASON_ORDER_STATE). Released on creation, its quantity the
   // sum of its members' idle quantities.
   repeated string block_member_order_ids = 36;
+  // Contract v27 (W11.1; the gaps spec's D2): the `oms`'s net order, in the
+  // allocation account, naming members of both sides, each a released FX
+  // order of one pair and one value date in no other live block or net.
+  // Released on creation, its quantity signed buys minus sells, its side
+  // the larger's.
+  repeated string net_member_order_ids = 37;
+  // Contract v27 (W11.1): an FX order's value date, ISO 8601 (FIX's
+  // SettlDate, 64); empty is spot.
+  string value_date = 38;
 }
 
 // W11.2. A fact: never through the gate. By the `oms`, for a user, naming
@@ -2269,6 +2447,11 @@ message SetWorkingConditionRequest {
   bool set = 3;
   string reason = 4;
   string idempotency_key = 5;
+  // Contract v27 (W11.7): a hold's typed cause, and for a stale reference
+  // price what the check found; on any condition but held, refused
+  // INVALID_ARGUMENT naming `hold_cause`.
+  HoldCause hold_cause = 6;
+  StaleReference stale_reference = 7;
 }
 
 // W11.8. By the `ems` alone (ruled 2026-10-13).
@@ -2285,12 +2468,52 @@ message CreatePlacementRequest {
   string destination = 8;
   RouteType route_type = 9;
   repeated string handling_instructions = 10;
-  // Offered empty until slice C.
+  // Offered empty: slice C's sell side and axes are not v27's.
   string rfq_id = 11;
   string axe_id = 12;
   // Stamped by the sidecar: the sending instance.
   string ems_instance_id = 13;
   string idempotency_key = 14;
+  // Contract v27 (W11.8): its type; a manual placement names no
+  // connectivity instance and carries its trade details, any other type
+  // names one and carries none (INVALID_ARGUMENT naming the field).
+  PlacementType placement_type = 15;
+  string counterparty_contact = 16;
+  int64 agreed_at_ns = 17;
+  TimePrecision agreed_precision = 18;
+  // Contract v27 (W11.8): set where the `ems` places on a stale reference
+  // price, its admin having chosen to warn; the placement then holds
+  // PLACEMENT_CONDITION_SENT_ON_STALE_REFERENCE.
+  StaleReference stale_reference = 19;
+}
+
+// W11.40 (contract v27): a dealer's quote received on the firm's RFQ
+// placement, recorded by its connectivity plugin; or a later outcome of one
+// recorded, named by its quote ID. Answered with PlacementReply.
+message ReportPlacementQuoteRequest {
+  string placement_id = 1;
+  // Empty to record a new quote, which the book mints an ID for; a quote's
+  // ID to record its later outcome.
+  string quote_id = 2;
+  string dealer_id = 3;
+  string dealer_quote_id = 4;
+  Side side = 5;
+  optional Money price = 6;
+  optional Decimal quantity = 7;
+  int64 received_at_ns = 8;
+  int64 valid_until_ns = 9;
+  PlacementQuoteOutcome outcome = 10;
+  RawRecordRef raw_record = 11;
+  string idempotency_key = 12;
+}
+
+// W11.41 (contract v27): the `ems` picks one open quote on an RFQ placement
+// it made. Answered with PlacementReply.
+message PickPlacementQuoteRequest {
+  string placement_id = 1;
+  string quote_id = 2;
+  string reason = 3;
+  string idempotency_key = 4;
 }
 
 // W11.9. By the `ems` or the `oms`; by a connectivity plugin only to report
@@ -2376,6 +2599,11 @@ message ReportExecutionRequest {
   Side side = 33;
   string venue_order_id = 34;
   string venue_client_order_id = 35;
+
+  // Contract v27 (W11.11): on the `oms`'s internal cross of a net order,
+  // which convention set its rate; refused INVALID_ARGUMENT naming it where
+  // missing on such a cross, or set on any other execution.
+  CrossRateSource cross_rate_source = 36;
 }
 
 // W11.12.

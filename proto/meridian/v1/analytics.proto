@@ -44,6 +44,15 @@ message Job {
   repeated MeasureRef measures = 3;
   // Trades added to one account's positions (W12.5); unset for none.
   WhatIf what_if = 4;
+  // Contract v27 (W12.1; ruling 458): a business date, ISO 8601 in the
+  // deployment's time zone -- the book at that date's end, the lake at that
+  // date's closes; empty for now. Refused beside inputs.book_at or
+  // inputs.lake_as_of_ns, and for a date after today's.
+  string business_date = 5;
+  // Contract v27 (W12.1; ruling 459): the cash instrument the figures are
+  // converted to, by its `INS-` ID; empty answers each account in its base
+  // currency.
+  string reporting_currency = 6;
 }
 
 // A job's inputs, by reference (requirement 3): one watermark and one as-of
@@ -62,7 +71,8 @@ message InputRefs {
 message MeasureRef {
   // A definition the component serves: `market_value`, `exposure`,
   // `concentration`, `pnl`, `historical_var`, `expected_shortfall`,
-  // `resolution_payoff`, `implied_distribution` in v26.
+  // `resolution_payoff`, `implied_distribution` in v26; from v27 `pnl`
+  // version 2 (realized beside unrealized) and `execution_cost`.
   string definition = 1;
   // Its version, 1 or more.
   int32 version = 2;
@@ -135,6 +145,9 @@ message Figure {
   string currency_instrument_id = 8;
   // How it was computed: exact in v26, model from v28.
   ComputedAs computed_as = 9;
+  // Contract v27 (W12.2; ruling 374): its oldest input's source time; 0 for
+  // a figure that read no market data.
+  int64 oldest_input_source_ns = 10;
 }
 
 // How a figure was computed (the first release's Q14, approved 2026-10-14
@@ -197,6 +210,11 @@ message NotEvaluated {
   // The dataset not entitled, the implementation unavailable, or the
   // scheme not held, where the reason names one.
   string detail = 5;
+  // Contract v27 (W12.2; ruling 374): on a stale price, its age at the
+  // job's as-of and the ceiling in force, the tighter of the dataset's and
+  // the client's; 0 on any other reason.
+  int64 age_ns = 6;
+  int64 ceiling_ns = 7;
 }
 
 enum NotEvaluatedReason {
@@ -222,6 +240,9 @@ enum NotEvaluatedReason {
   NOT_EVALUATED_REASON_GROUP_NOT_EXHAUSTIVE = 8;
   // History too short or too sparse for the definition's window.
   NOT_EVALUATED_REASON_HISTORY_INSUFFICIENT = 9;
+  // Contract v27 (W12.2; ruling 325): a lot's cost the book does not
+  // record, which the measure needs.
+  NOT_EVALUATED_REASON_COST_MISSING = 10;
 }
 
 // What an answer was computed from (requirements 4 and 35; Q7). Named so it
@@ -244,6 +265,52 @@ message AnswerProvenance {
   // `sha256:` and the hex of SHA-256 over the RFC 8785 canonical JSON of
   // the inputs: two answers with the same hash are the same answer.
   string answer_hash = 10;
+  // Contract v27 (W12.7): the job's business date, where it had one.
+  string business_date = 11;
+  // Contract v27 (W12.7; ruling 460): each position's input price.
+  repeated InputPrice input_prices = 12;
+  // Contract v27 (W12.7; ruling 462): each conversion leg, direct or
+  // derived, with the pivot a cross went through.
+  repeated ConversionLeg conversion_legs = 13;
+}
+
+// One position's input price (contract v27; ruling 460).
+message InputPrice {
+  string instrument_id = 1;
+  Money price = 2;
+  // The lake row it came from: its dataset, row key and version.
+  string dataset = 3;
+  string row_key = 4;
+  uint64 version = 5;
+  // Its source time: the `event` time where present, else the earliest.
+  int64 source_ns = 6;
+}
+
+// One conversion leg (contract v27; ruling 462): from one cash instrument to
+// another, at a rate, direct from the lake or derived from it.
+message ConversionLeg {
+  string from_instrument_id = 1;
+  string to_instrument_id = 2;
+  // Units of `to` per unit of `from`; an inverted rate is 1 ÷ x rounded half
+  // to even to 18 places.
+  Decimal rate = 3;
+  ConversionDerivation derivation = 4;
+  // A cross's pivot, by its cash instrument's ID; empty otherwise.
+  string via_instrument_id = 5;
+  // The dataset the lake's rate came from.
+  string dataset = 6;
+}
+
+// How a conversion leg's rate was found (contract v27; ruling 462). Never
+// for a crypto or stablecoin leg, which converts by its own lake price.
+enum ConversionDerivation {
+  CONVERSION_DERIVATION_UNSPECIFIED = 0;
+  // The lake's rate in the leg's direction.
+  CONVERSION_DERIVATION_DIRECT = 1;
+  // The lake's rate the other way, inverted.
+  CONVERSION_DERIVATION_INVERTED = 2;
+  // Through a pivot, by the deployment's pivot order.
+  CONVERSION_DERIVATION_CROSSED = 3;
 }
 
 // One instrument a job read, by its record's and template's versions.
@@ -367,6 +434,9 @@ message PricedUnit {
   string instrument_id = 1;
   ScenarioKey scenario_key = 2;
   // A value per unit, in the base currency the batch's inputs convert to.
+  // From contract v27, under quoted_price, rounded half to even to 18
+  // decimal places, as the built-in implementation rounds it (rulings 453
+  // and 486).
   Money value_per_unit = 3;
 }
 
