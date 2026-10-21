@@ -410,7 +410,9 @@ e2e-cluster: network
 	@# A cluster on the daemon that built the images sees them already; one
 	@# that is not (k3d, kind) is handed them, or its pods pull tags that exist
 	@# nowhere. Empty for Rancher Desktop and Docker Desktop.
-	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(RUNTIME_IMAGE) $(ANALYTICS_IMAGE) $(E2E_BROWSER_IMAGE) $(if $(filter cli,$(E2E_DRIVER)),$(E2E_CLI_IMAGE)) >/dev/null,:)
+	@# Each image proved in the node, retried once, the run stopped with the
+	@# reason where one never arrives (e2e/cluster/image-load.sh).
+	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(RUNTIME_IMAGE) $(ANALYTICS_IMAGE) $(E2E_BROWSER_IMAGE) $(if $(filter cli,$(E2E_DRIVER)),$(E2E_CLI_IMAGE)),:)
 	# A pod calls the platform host.docker.internal, so the platform has to
 	# admit that name and expect it as the audience a deployment signs for.
 	# Django refuses an unlisted Host before any view runs, which is a 400 with
@@ -657,7 +659,7 @@ e2e-cluster-k3d:
 	&& ready "CoreDNS to come back from its restart" kubectl -n kube-system rollout status deploy/coredns --timeout=10s \
 	&& echo "e2e-cluster-k3d: the cluster is ready, $$(( $$(date +%s) - began ))s after it was made"
 	@KUBECONFIG=$(E2E_K3D_KUBECONFIG) $(MAKE) --no-print-directory $(E2E_CLUSTER_TARGET) \
-		E2E_IMAGE_LOAD="$(K3D) image import -c $(E2E_K3D_CLUSTER)"; \
+		E2E_IMAGE_LOAD="e2e/cluster/image-load.sh $(K3D) $(E2E_K3D_CLUSTER)"; \
 	  held=$$?; \
 	  if [ $$held -ne 0 ]; then \
 	    echo "e2e-cluster-k3d: what the cluster said, in .e2e-cluster.log" >&2; \
@@ -710,7 +712,7 @@ e2e-cluster-backup:
 	@$(DOCKER) build -q -f "$(CLI)/Dockerfile.rust" --target e2e -t $(E2E_BACKUP_CLI_IMAGE) "$(CLI)" >/dev/null
 	@$(if $(E2E_BACKUP_RUNTIME),:,$(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null)
 	@$(if $(E2E_BACKUP_RUNTIME),:,$(DOCKER) build -q --target analytics -t $(ANALYTICS_IMAGE) . >/dev/null)
-	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(or $(E2E_BACKUP_RUNTIME),$(RUNTIME_IMAGE)) $(if $(E2E_BACKUP_RUNTIME),,$(ANALYTICS_IMAGE)) $(E2E_BACKUP_IMAGE) postgres:16-alpine >/dev/null,:)
+	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(or $(E2E_BACKUP_RUNTIME),$(RUNTIME_IMAGE)) $(if $(E2E_BACKUP_RUNTIME),,$(ANALYTICS_IMAGE)) $(E2E_BACKUP_IMAGE) postgres:16-alpine,:)
 	@kubectl delete namespace $(E2E_BACKUP_NAMESPACE) --ignore-not-found --wait >/dev/null 2>&1
 	@E2E_NAMESPACE=$(E2E_BACKUP_NAMESPACE) E2E_IMAGE=$(or $(E2E_BACKUP_RUNTIME),$(RUNTIME_IMAGE)) \
 	 E2E_BACKUP_IMAGE=$(E2E_BACKUP_IMAGE) E2E_CLI_IMAGE=$(E2E_BACKUP_CLI_IMAGE) E2E_WORKDIR="$(CURDIR)" \
