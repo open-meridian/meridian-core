@@ -28,6 +28,11 @@ pub fn class_of(kind: InstrumentType) -> Option<AssetClass> {
         InstrumentType::Unspecified => None,
         InstrumentType::MoneyMarketFund => Some(AssetClass::Fund),
         InstrumentType::BinaryEventContract => Some(AssetClass::EventContract),
+        // Contract v27, the rates slice: what the lake observes and nobody
+        // holds.
+        InstrumentType::InterestRate | InstrumentType::RateCurve | InstrumentType::Index => {
+            Some(AssetClass::Referential)
+        }
     }
 }
 
@@ -58,6 +63,9 @@ pub fn words(kind: InstrumentType) -> &'static str {
         InstrumentType::Unspecified => "",
         InstrumentType::MoneyMarketFund => "money market fund",
         InstrumentType::BinaryEventContract => "binary event contract",
+        InstrumentType::InterestRate => "interest rate",
+        InstrumentType::RateCurve => "rate curve",
+        InstrumentType::Index => "index",
     }
 }
 

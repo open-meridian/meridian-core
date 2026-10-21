@@ -993,6 +993,7 @@ async fn install(
             version: field(&fields, "version").into(),
             registry: field(&fields, "registry").into(),
             note: field(&fields, "note").into(),
+            pack: String::new(),
         },
         INSTALLING,
     )

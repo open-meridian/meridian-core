@@ -951,6 +951,7 @@ pub fn read(
             weekends: record.weekends.clone(),
             coverage: record.coverage.clone(),
             sources: record.sources.clone(),
+            trading_sessions: record.trading_sessions.clone(),
         },
         None,
     ))

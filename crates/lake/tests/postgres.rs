@@ -305,6 +305,7 @@ fn outcome(dataset: &str, subject: &str, stage: i32, value: u64) -> Observation 
             code: "yes".into(),
             text: String::new(),
         }),
+        challenge_ends_at_ns: 0,
     })
 }
 

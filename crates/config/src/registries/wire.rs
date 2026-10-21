@@ -72,6 +72,8 @@ fn pull(value: &Value) -> Option<PluginPull> {
         pulled_at_ns: number(value, "pulled_at_ns"),
         notice_id: text(value, "notice_id"),
         restored_at_ns: number(value, "restored_at_ns"),
+        // Contract v27 (ruling 311).
+        by_bundle_issued_at_ns: number(value, "by_bundle_issued_at_ns"),
     })
 }
 
@@ -226,6 +228,10 @@ pub fn listing(value: &Value, at: &str) -> Result<PluginListing, String> {
         terms_url: text(value, "terms_url"),
         // Contract v26 (ruling 306): the publishing organisation's name.
         publisher: text(value, "publisher"),
+        // Contract v27 (ruling 330): validated by the platform.
+        support_url: text(value, "support_url"),
+        support_email: text(value, "support_email"),
+        prices: Vec::new(),
     })
 }
 
@@ -274,6 +280,7 @@ pub fn catalogue(value: &Value) -> Result<PullCatalogueReply, String> {
         // Contract v26 (W8.10; ruling 274): the Terms' address, which the
         // install dialog's one line links.
         terms_url: text(value, "terms_url"),
+        packs: Vec::new(),
     })
 }
 

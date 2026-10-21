@@ -2479,6 +2479,7 @@ impl Context<'_> {
             version: text(top, "version", "", true, &mut problems),
             registry: text(top, "registry", "", true, &mut problems),
             note: text(top, "note", "", true, &mut problems),
+            pack: String::new(),
         };
         if !problems.is_empty() {
             return (problems.refusal(), DEPLOYMENT_ADMIN.into());

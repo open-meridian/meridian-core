@@ -156,6 +156,7 @@ fn realized_is_version_twos_and_no_job_reaches_it() {
             event_group_id: String::new(),
         }],
         what_if: None,
+        ..Default::default()
     };
     assert_eq!(
         crate::compile::compile(&job).unwrap_err().field,

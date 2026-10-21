@@ -129,6 +129,7 @@ async fn install(h: &Harness, version: &str) -> Result<PluginVersion, String> {
             version: version.into(),
             registry: "community".into(),
             note: "SnapTrade for the brokerage accounts.".into(),
+            pack: String::new(),
         },
     )
     .await

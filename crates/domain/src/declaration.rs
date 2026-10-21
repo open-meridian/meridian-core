@@ -11,8 +11,9 @@
 //! (decisions/028). Never a value, an account or an identifier.
 
 use meridian_pb::v1::{
-    AlgorithmDeclaration, Catalogue, DatasetDeclaration, DatasetLicence, NotCarried,
-    NotCarriedReason, ObservationMode, PluginDeclaration, RawRecordKind, StorageDeclaration,
+    AlgorithmDeclaration, Catalogue, DatasetDeclaration, DatasetLicence, DerivedUse, NotCarried,
+    NotCarriedReason, ObservationMode, PluginDeclaration, PricingModelDeclaration, RawRecordKind,
+    StorageDeclaration,
 };
 
 /// The declaration as the CLI sends it, in JSON.
@@ -52,6 +53,17 @@ pub struct Declared {
     /// digest and its size (contract v25); the texts travel beside it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub documentation: Vec<DeclaredSection>,
+    /// A pricing plugin's model ids and versions (W12.3, contract v27,
+    /// ruling 324): absent from a version declaring none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pricing_models: Vec<DeclaredPricingModel>,
+}
+
+/// One pricing model as an upload's declaration names it (contract v27).
+#[derive(Debug, Default, Clone, serde::Deserialize, serde::Serialize)]
+pub struct DeclaredPricingModel {
+    pub model_id: String,
+    pub model_version: i32,
 }
 
 /// One section of the vendor's documentation as an upload's declaration
@@ -110,6 +122,9 @@ pub struct DeclaredDataset {
     /// v22): empty names none.
     #[serde(default)]
     pub calendar_id: String,
+    /// Its declared delay (W10.1, contract v27): 0 or absent for real time.
+    #[serde(default)]
+    pub declared_delay_ns: i64,
 }
 
 #[derive(Debug, Default, Clone, serde::Deserialize, serde::Serialize)]
@@ -120,6 +135,10 @@ pub struct DeclaredLicence {
     pub retention_days: u32,
     #[serde(default)]
     pub derived_use: bool,
+    /// The terms' derived-data answer (contract v27, ruling 479), by its
+    /// word (`internal_only`) or the enum's name; empty reads `derived_use`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub derived_use_terms: String,
     #[serde(default)]
     pub display: bool,
     #[serde(default)]
@@ -274,7 +293,37 @@ pub fn from_json(declared: &Declared) -> Result<PluginDeclaration, String> {
                 bytes: section.bytes,
             })
             .collect(),
+        pricing_models: declared
+            .pricing_models
+            .iter()
+            .map(|model| PricingModelDeclaration {
+                model_id: model.model_id.clone(),
+                model_version: model.model_version,
+            })
+            .collect(),
     })
+}
+
+/// A derived-data answer from its word (`not_restricted`) or the enum's
+/// name; empty is unspecified, anything else `None`.
+pub fn derived_use_of(text: &str) -> Option<DerivedUse> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Some(DerivedUse::Unspecified);
+    }
+    DerivedUse::from_str_name(text).or_else(|| {
+        DerivedUse::from_str_name(&format!("DERIVED_USE_{}", text.to_ascii_uppercase()))
+    })
+}
+
+/// A derived-data answer's word, as an upload carries it.
+pub fn derived_use_word(terms: i32) -> &'static str {
+    match DerivedUse::try_from(terms) {
+        Ok(DerivedUse::NotRestricted) => "not_restricted",
+        Ok(DerivedUse::InternalOnly) => "internal_only",
+        Ok(DerivedUse::RedistributionNeedsLicence) => "redistribution_needs_licence",
+        _ => "",
+    }
 }
 
 fn catalogue_from_json(catalogue: &DeclaredCatalogue) -> Result<Catalogue, String> {
@@ -290,6 +339,32 @@ fn catalogue_from_json(catalogue: &DeclaredCatalogue) -> Result<Catalogue, Strin
             })?;
             modes.push(mode as i32);
         }
+        let licence_default = match &dataset.licence_default {
+            None => None,
+            Some(l) => {
+                let terms = derived_use_of(&l.derived_use_terms).ok_or_else(|| {
+                    format!(
+                        "declaration.catalogue.datasets[{i}].licence_default.derived_use_terms \
+                         {:?} is none of not_restricted, internal_only and \
+                         redistribution_needs_licence",
+                        l.derived_use_terms
+                    )
+                })?;
+                #[allow(deprecated)]
+                let mut licence = DatasetLicence {
+                    kept: l.kept,
+                    retention_days: l.retention_days,
+                    derived_use: l.derived_use,
+                    derived_use_terms: terms as i32,
+                    display: l.display,
+                    default_fields: l.default_fields.clone(),
+                    personal_use: l.personal_use,
+                    ..Default::default()
+                };
+                crate::lake::derived_use_both(&mut licence);
+                Some(licence)
+            }
+        };
         datasets.push(DatasetDeclaration {
             key: dataset.key.clone(),
             vendor: dataset.vendor.clone(),
@@ -298,19 +373,12 @@ fn catalogue_from_json(catalogue: &DeclaredCatalogue) -> Result<Catalogue, Strin
             modes,
             cadence: dataset.cadence,
             history: dataset.history,
-            licence_default: dataset.licence_default.as_ref().map(|l| DatasetLicence {
-                kept: l.kept,
-                retention_days: l.retention_days,
-                derived_use: l.derived_use,
-                display: l.display,
-                default_fields: l.default_fields.clone(),
-                personal_use: l.personal_use,
-                ..Default::default()
-            }),
+            licence_default,
             day_time_zone: dataset.day_time_zone.clone(),
             day_end_minute: dataset.day_end_minute,
             venue_id: dataset.venue_id.clone(),
             calendar_id: dataset.calendar_id.clone(),
+            declared_delay_ns: dataset.declared_delay_ns,
         });
     }
     Ok(Catalogue { datasets })
@@ -329,7 +397,8 @@ pub fn dataset_json(dataset: &DatasetDeclaration) -> serde_json::Value {
         "licence_default": dataset.licence_default.as_ref().map(|l| serde_json::json!({
             "kept": l.kept,
             "retention_days": l.retention_days,
-            "derived_use": l.derived_use,
+            "derived_use": crate::lake::derived_use_bool(l),
+            "derived_use_terms": derived_use_word(crate::lake::derived_use_terms(l) as i32),
             "display": l.display,
             "default_fields": l.default_fields,
             "personal_use": l.personal_use,
@@ -338,6 +407,7 @@ pub fn dataset_json(dataset: &DatasetDeclaration) -> serde_json::Value {
         "day_end_minute": dataset.day_end_minute,
         "venue_id": dataset.venue_id,
         "calendar_id": dataset.calendar_id,
+        "declared_delay_ns": dataset.declared_delay_ns,
     })
 }
 
@@ -379,6 +449,11 @@ pub fn to_json(declaration: &PluginDeclaration) -> serde_json::Value {
             "name": section.name,
             "digest": section.digest,
             "bytes": section.bytes,
+        })).collect::<Vec<_>>(),
+        // Contract v27 (ruling 324): a pricing plugin's models.
+        "pricing_models": declaration.pricing_models.iter().map(|model| serde_json::json!({
+            "model_id": model.model_id,
+            "model_version": model.model_version,
         })).collect::<Vec<_>>(),
     })
 }

@@ -205,6 +205,7 @@ mod tests {
                 measure("implied_distribution", 1, "EVG-1"),
             ],
             what_if: None,
+            ..Default::default()
         };
         let compiled = compile(&job).unwrap();
         assert!(compiled.reads.closed_lots);

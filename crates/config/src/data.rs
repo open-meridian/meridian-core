@@ -92,11 +92,16 @@ pub fn datasets(snapshot: &Snapshot) -> Vec<DatasetRef> {
                 instance: instance.clone(),
                 vendor: declared.vendor.clone(),
                 aggregator: declared.aggregator.clone(),
+                declared_delay_ns: declared.declared_delay_ns,
                 declaration: Some(declared),
                 unconverted_count: 0,
                 miss_count: 0,
                 closed_day_count: 0,
                 outside_coverage_count: 0,
+                // Contract v27 (W10.9): the declared delay is the
+                // catalogue's; the stale ceiling and liveness the lake's.
+                stale_after_ns: 0,
+                liveness: Vec::new(),
             });
         }
     }
@@ -154,7 +159,7 @@ pub fn set_licence(
     if let Some(refused) = note_refused(&request.note) {
         return Err(refused);
     }
-    let licence = DatasetLicence {
+    let mut licence = DatasetLicence {
         dataset: request.dataset.clone(),
         updated_by: author.by.clone(),
         updated_at_ns: now_ns,
@@ -164,6 +169,9 @@ pub fn set_licence(
         prepared_call_id: author.prepared_call_id.clone(),
         ..terms
     };
+    // Ruling 479: what is kept carries both the terms' answer and the
+    // deprecated boolean, whichever the writer stated.
+    lake::derived_use_both(&mut licence);
     store
         .set_dataset_licence(&licence)
         .map_err(|failed| failed.to_string())?;

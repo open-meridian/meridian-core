@@ -3768,15 +3768,17 @@ async fn set_dataset_licence(
             "meridian.v1.SetDatasetLicenceRequest",
             meridian_domain::v1::SetDatasetLicenceRequest {
                 dataset: field(&fields, "dataset").to_string(),
-                licence: Some(meridian_pb::v1::DatasetLicence {
-                    kept,
-                    retention_days,
-                    derived_use: !field(&fields, "derived_use").is_empty(),
-                    display: !field(&fields, "display").is_empty(),
-                    default_fields: words(&fields, "default_fields"),
-                    personal_use: !field(&fields, "personal_use").is_empty(),
-                    ..Default::default()
-                }),
+                licence: Some(meridian_domain::lake::licence_with_derived_use(
+                    meridian_pb::v1::DatasetLicence {
+                        kept,
+                        retention_days,
+                        display: !field(&fields, "display").is_empty(),
+                        default_fields: words(&fields, "default_fields"),
+                        personal_use: !field(&fields, "personal_use").is_empty(),
+                        ..Default::default()
+                    },
+                    !field(&fields, "derived_use").is_empty(),
+                )),
                 // Optional at the page, as a hold's is; through /mcp
                 // every change carries one.
                 note: field(&fields, "note").to_string(),

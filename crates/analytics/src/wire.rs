@@ -9,9 +9,10 @@ use meridian_analytics_engine::case::MeasureKey;
 use meridian_analytics_engine::exact::Dec;
 use meridian_domain::exact::Exact;
 use meridian_domain::v1::{
-    AnswerProvenance, BreakdownValue, ComputedAs, EventGroupInput, Figure as WireFigure,
-    InstrumentInput, JobAnswer, MeasureRef, ModelRef, NotEvaluated, NotEvaluatedReason,
-    PartitionSequence, ScenarioKey, ScenarioKind, Watermark,
+    AnswerProvenance, BreakdownValue, ComputedAs, ConversionDerivation, ConversionLeg,
+    EventGroupInput, Figure as WireFigure, InputPrice, InstrumentInput, JobAnswer, MeasureRef,
+    ModelRef, NotEvaluated, NotEvaluatedReason, PartitionSequence, ScenarioKey, ScenarioKind,
+    Watermark,
 };
 use serde_json::Value;
 
@@ -59,6 +60,7 @@ fn figure(figure: &Figure) -> Result<WireFigure, String> {
         denominator: decimal(&figure.denominator)?,
         currency_instrument_id: figure.currency_instrument_id.clone(),
         computed_as: ComputedAs::Exact as i32,
+        oldest_input_source_ns: 0,
     })
 }
 
@@ -71,6 +73,8 @@ fn unevaluated(entry: &Unevaluated) -> NotEvaluated {
             .map(|r| r as i32)
             .unwrap_or(0),
         detail: entry.detail.clone(),
+        age_ns: 0,
+        ceiling_ns: 0,
     }
 }
 
@@ -142,7 +146,50 @@ pub fn provenance(json: &Value) -> AnswerProvenance {
         routing_version: integer(&json["routing_version"]),
         engine_version: text(&json["engine_version"]),
         answer_hash: text(&json["answer_hash"]),
+        // Contract v27 (W12.7; rulings 458, 460 and 462).
+        business_date: text(&json["business_date"]),
+        input_prices: list(&json["input_prices"])
+            .iter()
+            .map(|p| InputPrice {
+                instrument_id: text(&p["instrument_id"]),
+                price: money(&p["price"]),
+                dataset: text(&p["dataset"]),
+                row_key: text(&p["row_key"]),
+                version: integer(&p["version"]).max(0) as u64,
+                source_ns: integer(&p["source_ns"]),
+            })
+            .collect(),
+        conversion_legs: list(&json["conversion_legs"])
+            .iter()
+            .map(|leg| ConversionLeg {
+                from_instrument_id: text(&leg["from_instrument_id"]),
+                to_instrument_id: text(&leg["to_instrument_id"]),
+                rate: wire_decimal(&leg["rate"]),
+                derivation: ConversionDerivation::from_str_name(&text(&leg["derivation"]))
+                    .map(|d| d as i32)
+                    .unwrap_or(0),
+                via_instrument_id: text(&leg["via_instrument_id"]),
+                dataset: text(&leg["dataset"]),
+            })
+            .collect(),
     }
+}
+
+/// A decimal the provenance carries as text, on the wire; unset for none.
+fn wire_decimal(value: &Value) -> Option<meridian_pb::v1::Decimal> {
+    value
+        .as_str()
+        .and_then(|text| Exact::from_str(text).ok())
+        .map(Exact::to_wire)
+}
+
+/// A price the provenance carries as `{amount, instrument_id}`.
+fn money(value: &Value) -> Option<meridian_domain::v1::Money> {
+    value.is_object().then(|| meridian_domain::v1::Money {
+        amount: wire_decimal(&value["amount"]),
+        currency_code: String::new(),
+        instrument_id: text(&value["instrument_id"]),
+    })
 }
 
 /// The engine's answer as a `JobAnswer`.

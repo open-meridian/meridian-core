@@ -1235,6 +1235,7 @@ fn apply_lot(
                     relieved_by: Vec::new(),
                     adjusted_by: Vec::new(),
                     sleeve: line.sleeve.clone(),
+                    reliefs: Vec::new(),
                 },
                 opened_in: entry_sequence,
                 ordinal: position.opened_lots,

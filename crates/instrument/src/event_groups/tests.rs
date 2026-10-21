@@ -73,6 +73,7 @@ fn reported(members: &[&str], exhaustive: EventGroupFlag) -> ReportEventGroupReq
         valid_from_ns: NOW - 1,
         raw_record: None,
         publisher_instance_id: "data-kalshi-1".into(),
+        member_bounds: vec![],
     }
 }
 

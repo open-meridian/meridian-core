@@ -1519,6 +1519,7 @@ fn outcome(
             code: "yes".into(),
             text: String::new(),
         }),
+        challenge_ends_at_ns: 0,
     }
 }
 
@@ -1731,6 +1732,7 @@ fn calendar_held(h: &Harness) -> Arc<std::sync::atomic::AtomicI64> {
                 to_date: "2027-02-01".into(),
             }),
             sources: vec![],
+            trading_sessions: None,
         };
         Ok((
             "meridian.v1.ReadCalendarReply".into(),

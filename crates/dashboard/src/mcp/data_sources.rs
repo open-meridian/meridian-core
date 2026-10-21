@@ -246,7 +246,11 @@ fn licence_json(licence: &DatasetLicence, set: bool) -> Value {
         "set_by_the_deployment": set,
         "kept": licence.kept,
         "retention_days": licence.retention_days,
-        "derived_use": licence.derived_use,
+        "derived_use": meridian_domain::lake::derived_use_bool(licence),
+        // Contract v27 (ruling 479): the terms' answer beside the boolean.
+        "derived_use_terms": meridian_domain::declaration::derived_use_word(
+            meridian_domain::lake::derived_use_terms(licence) as i32,
+        ),
         "display": licence.display,
         "default_fields": licence.default_fields,
         "personal_use": licence.personal_use,
@@ -384,15 +388,17 @@ async fn set_licence(app: &App, caller: &Caller, arguments: &Value) -> Value {
     }
     let request = SetDatasetLicenceRequest {
         dataset: text(top, "dataset", "", true, &mut problems),
-        licence: Some(DatasetLicence {
-            kept: boolean(top, "kept", &mut problems),
-            retention_days: u32::try_from(retention).unwrap_or_default(),
-            derived_use: boolean(top, "derived_use", &mut problems),
-            display: boolean(top, "display", &mut problems),
-            default_fields: strings(top, "default_fields", MOST_FIELDS, &mut problems),
-            personal_use: boolean(top, "personal_use", &mut problems),
-            ..Default::default()
-        }),
+        licence: Some(meridian_domain::lake::licence_with_derived_use(
+            DatasetLicence {
+                kept: boolean(top, "kept", &mut problems),
+                retention_days: u32::try_from(retention).unwrap_or_default(),
+                display: boolean(top, "display", &mut problems),
+                default_fields: strings(top, "default_fields", MOST_FIELDS, &mut problems),
+                personal_use: boolean(top, "personal_use", &mut problems),
+                ..Default::default()
+            },
+            boolean(top, "derived_use", &mut problems),
+        )),
         // Through /mcp every change carries a note (W10.1).
         note: text(top, "note", "", true, &mut problems),
     };

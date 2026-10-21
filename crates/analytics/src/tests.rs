@@ -325,6 +325,8 @@ fn job(measures: &[(&str, &[&str], &str)]) -> RunJobRequest {
         job: Some(Job {
             account_ids: vec!["ACC-1".into()],
             inputs: None,
+            business_date: String::new(),
+            reporting_currency: String::new(),
             measures: measures
                 .iter()
                 .map(|(definition, breakdowns, group)| MeasureRef {

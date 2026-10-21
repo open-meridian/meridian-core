@@ -408,6 +408,7 @@ fn calendar(value: &Value) -> Result<CalendarRecord, String> {
         days,
         coverage,
         sources: sources(value)?,
+        trading_sessions: None,
         version: number(value, "version")?,
         valid_time_ns: number(value, "valid_time_ns")?,
         record_time_ns: number(value, "record_time_ns")?,

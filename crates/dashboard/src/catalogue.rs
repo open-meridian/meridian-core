@@ -1020,6 +1020,7 @@ async fn install(
                 asked.registry
             },
             note,
+            pack: String::new(),
         },
         Duration::from_secs(120),
     )

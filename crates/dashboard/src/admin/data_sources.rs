@@ -279,7 +279,7 @@ fn datasets_tab(rows: &[Row], records: &AccessRecords, token: &str) -> (String, 
                 },
                 "checked": {
                     "kept": if licence.kept { vec!["1"] } else { vec![] },
-                    "derived_use": if licence.derived_use { vec!["1"] } else { vec![] },
+                    "derived_use": if meridian_domain::lake::derived_use_bool(licence) { vec!["1"] } else { vec![] },
                     "display": if licence.display { vec!["1"] } else { vec![] },
                     "personal_use": if licence.personal_use { vec!["1"] } else { vec![] },
                 },

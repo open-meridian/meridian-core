@@ -16,7 +16,7 @@ use meridian_pb::bounds::{
     DATASET_DECLARATION_MODES_COUNT, DATASET_DECLARATION_VENDOR_LENGTH,
     DATASET_LICENCE_DEFAULT_FIELDS_COUNT, DATASET_LICENCE_RETENTION_DAYS_RANGE,
 };
-use meridian_pb::v1::{Catalogue, DatasetDeclaration, DatasetLicence, ObservationMode};
+use meridian_pb::v1::{Catalogue, DatasetDeclaration, DatasetLicence, DerivedUse, ObservationMode};
 
 /// A price of one kind for one subject.
 pub const PRICE: &str = "meridian.v1.Price";
@@ -379,13 +379,66 @@ pub fn effective_licence(
             dataset: dataset.to_string(),
             ..terms
         })
-        .unwrap_or(DatasetLicence {
-            dataset: dataset.to_string(),
-            kept: true,
-            derived_use: true,
-            display: true,
-            ..Default::default()
+        .unwrap_or_else(|| {
+            let mut licence = DatasetLicence {
+                dataset: dataset.to_string(),
+                kept: true,
+                display: true,
+                derived_use_terms: DerivedUse::NotRestricted as i32,
+                ..Default::default()
+            };
+            derived_use_both(&mut licence);
+            licence
         })
+}
+
+/// A licence's derived-data answer as read (contract v27, ruling 479): its
+/// `derived_use_terms`, or where that is unspecified the deprecated boolean,
+/// false as internal_only and true as not_restricted (ruling 180).
+#[allow(deprecated)]
+pub fn derived_use_terms(licence: &DatasetLicence) -> DerivedUse {
+    match DerivedUse::try_from(licence.derived_use_terms) {
+        Ok(DerivedUse::Unspecified) | Err(_) => {
+            if licence.derived_use {
+                DerivedUse::NotRestricted
+            } else {
+                DerivedUse::InternalOnly
+            }
+        }
+        Ok(terms) => terms,
+    }
+}
+
+/// The deprecated boolean as a v27 writer sets it beside the answer: false
+/// for internal_only, true for either other answer.
+pub fn derived_use_bool(licence: &DatasetLicence) -> bool {
+    derived_use_terms(licence) != DerivedUse::InternalOnly
+}
+
+/// A licence written from the dashboard's one box, "Derived data may be
+/// made", with both fields set (ruling 479): ticked is not_restricted,
+/// unticked internal_only.
+pub fn licence_with_derived_use(licence: DatasetLicence, derived: bool) -> DatasetLicence {
+    let mut licence = DatasetLicence {
+        derived_use_terms: if derived {
+            DerivedUse::NotRestricted
+        } else {
+            DerivedUse::InternalOnly
+        } as i32,
+        ..licence
+    };
+    derived_use_both(&mut licence);
+    licence
+}
+
+/// Sets both of a licence's derived-data fields from whichever it states
+/// (ruling 479: a v27 writer sets both): the answer where stated, else the
+/// boolean read as the answer.
+#[allow(deprecated)]
+pub fn derived_use_both(licence: &mut DatasetLicence) {
+    let terms = derived_use_terms(licence);
+    licence.derived_use_terms = terms as i32;
+    licence.derived_use = terms != DerivedUse::InternalOnly;
 }
 
 /// A dataset's ID in a deployment: its instance, a colon, and its key.
@@ -804,6 +857,7 @@ mod closed_day_tests {
                 to_date: "2027-02-01".into(),
             }),
             sources: vec![],
+            trading_sessions: None,
         }
     }
 

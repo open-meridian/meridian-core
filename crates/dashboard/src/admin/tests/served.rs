@@ -945,6 +945,7 @@ fn lake_listing() -> meridian_domain::v1::ListDatasetsReply {
                 // the browser sees both in the one cell.
                 closed_day_count: (n * 2 + k) as u64 * 11,
                 outside_coverage_count: if k == 1 { (n + 1) as u64 * 3 } else { 0 },
+                ..Default::default()
             });
             if n < 2 || (n == 2 && k == 0) {
                 for reader in ["sample-reporting-1", "board-1", "compliance-1"] {
@@ -971,7 +972,7 @@ fn lake_listing() -> meridian_domain::v1::ListDatasetsReply {
         dataset: "coinbase-1:daily".into(),
         kept: true,
         retention_days: 2555,
-        derived_use: true,
+        derived_use_terms: meridian_pb::v1::DerivedUse::NotRestricted as i32,
         display: true,
         updated_by: ADMIN.into(),
         updated_at_ns: 1_791_417_600_000_000_000,
@@ -1156,6 +1157,7 @@ fn calendar_year(
             address: "https://www.federalreserve.gov/aboutthefed/k8.htm".into(),
             read_at_ns: 1_760_140_800_000_000_000,
         }],
+        trading_sessions: None,
     }
 }
 
@@ -2342,6 +2344,7 @@ fn registry_listings() -> Vec<meridian_domain::v1::PluginListing> {
             reviewed: false,
             terms_url: "https://open-meridian.com/terms#plugins-and-registries".into(),
             publisher: "Open Meridian".into(),
+            ..Default::default()
         }
     };
     let mut pulled = listed("open-meridian/fx", "1.4.0", "community", &["custody"]);
