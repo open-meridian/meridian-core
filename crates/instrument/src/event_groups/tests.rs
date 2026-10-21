@@ -317,3 +317,62 @@ fn a_flag_unset_reads_as_not_stated_and_says_so() {
     assert_eq!(flag_words(0), "not stated");
     assert_eq!(flag_words(EventGroupFlag::True as i32), "yes");
 }
+
+/// Contract v27 (W3.29; ruling 464): a range member's floor, cap and unit as
+/// the venue states them are offered on its record, never in force; a
+/// bound naming no member of the report is refused naming it.
+#[test]
+fn a_members_bounds_are_offered_on_its_record_and_never_in_force() {
+    use meridian_domain::v1::{EventContractBound, EventGroupMemberBound};
+    let store = MemoryStore::new();
+    held(&store, "LCL-A");
+    held(&store, "LCL-B");
+    // LCL-A's attributes held: its payout and close, no bounds yet.
+    let mut a = store.by_id("LCL-A").unwrap().unwrap();
+    a.binary_event_contract = "1.00|USD||1793000000000000000".into();
+    let expected = a.version;
+    a.version += 1;
+    let entry = crate::one_id::version_of(&a, "amend", Vec::new(), "", NOW);
+    store.write(a, expected, entry).unwrap();
+    let platform = Platform::answering(vec![]);
+    let bound = |id: &str, floor: &str, cap: &str| EventGroupMemberBound {
+        instrument_id: id.into(),
+        floor: Some(EventContractBound {
+            value: Some(floor.parse::<meridian_domain::exact::Exact>().unwrap().to_wire()),
+            ..Default::default()
+        }),
+        cap: Some(EventContractBound {
+            value: Some(cap.parse::<meridian_domain::exact::Exact>().unwrap().to_wire()),
+            ..Default::default()
+        }),
+        bound_unit: "percent".into(),
+    };
+    let mut stray = reported(&["LCL-A", "LCL-B"], EventGroupFlag::True);
+    stray.member_bounds = vec![bound("LCL-C", "4.00", "4.25")];
+    let refused = report(&store, &platform, &stray, NOW).unwrap().unwrap_err();
+    assert_eq!(refused.fields, vec!["member_bounds[0].instrument_id".to_string()]);
+
+    let mut with = reported(&["LCL-A", "LCL-B"], EventGroupFlag::True);
+    with.member_bounds = vec![bound("LCL-A", "4.00", "4.25")];
+    report(&store, &platform, &with, NOW).unwrap().unwrap();
+    let record = store.by_id("LCL-A").unwrap().unwrap();
+    assert_eq!(
+        record.binary_event_contract, "1.00|USD||1793000000000000000",
+        "never in force"
+    );
+    let offered = record
+        .offers
+        .iter()
+        .find(|o| o.field == crate::store::Field::BinaryEventContract)
+        .expect("the bounds offered");
+    let contract = meridian_domain::instrument_type::contract_from_text(&offered.value).unwrap();
+    assert_eq!(contract.bound_unit, "percent");
+    assert!(contract.floor.is_some() && contract.cap.is_some());
+    assert_eq!(offered.instance_id, "data-kalshi-1");
+    assert!(store
+        .by_id("LCL-B")
+        .unwrap()
+        .unwrap()
+        .offers
+        .is_empty());
+}

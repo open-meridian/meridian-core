@@ -690,7 +690,7 @@ fn holders_elsewhere(store: &dyn Store, asked: &Asked, here: &str) -> Result<Vec
     Ok(others)
 }
 
-fn version_of(
+pub(crate) fn version_of(
     record: &Instrument,
     operation: &str,
     changes: Vec<crate::store::Change>,
