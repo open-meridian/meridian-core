@@ -1969,8 +1969,8 @@ pub fn create_placement(
         // Contract v27 (W11.8; ruling 420): sent on a stale reference, the
         // `ems` admin having chosen warn: a record of the warning, kept as
         // the placement's condition.
-        status: match &request.stale_reference {
-            Some(stale) => Some(meridian_domain::v1::PlacementStatus {
+        status: request.stale_reference.as_ref().map(|stale| {
+            meridian_domain::v1::PlacementStatus {
                 state: 0,
                 conditions: vec![meridian_domain::v1::StandingPlacementCondition {
                     condition: meridian_domain::v1::PlacementCondition::SentOnStaleReference as i32,
@@ -1983,9 +1983,8 @@ pub fn create_placement(
                     stale_reference: Some(stale.clone()),
                     ..Default::default()
                 }],
-            }),
-            None => None,
-        },
+            }
+        }),
         ..Default::default()
     };
     let plan = Plan::new(
