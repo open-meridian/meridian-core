@@ -1143,6 +1143,13 @@ def the_registry_pages(browser, prefix):
                 if name == "installed":
                     check(page.locator("[data-pulled]").count() == 1,
                           f"at {size}, {scheme} the pulled version's plugin is warned")
+                    # v27 stage E: each row says where its versions came from.
+                    sources = page.evaluate("() => [...document.querySelectorAll('table.installed tbody tr')]"
+                                            ".map(r => { const c = r.querySelector('td[data-source]');"
+                                            " return c && c.offsetParent !== null ? c.textContent.trim() : ''; })")
+                    words = {"Local", "Community", "Verified"}
+                    check(sources and all(s and set(s.split(", ")) <= words for s in sources),
+                          f"at {size}, {scheme} each Installed row shows its source: {sources}")
                 if name == "plugin-versions":
                     check(page.locator("[data-pulled]").count() >= 1,
                           f"at {size}, {scheme} the pulled version is warned on its row")

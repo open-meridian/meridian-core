@@ -156,3 +156,16 @@ fn counts_below_three_deployments_read_below_three_and_labels_are_the_registries
     beyond.schema_version = "v99".into();
     assert!(!floor_mark(&beyond).0);
 }
+
+#[test]
+fn a_plugins_row_says_where_its_versions_came_from() {
+    // v27 stage E: Verified, Community or Local, each once in that order,
+    // from the versions kept; every one retired, from those.
+    let verified = installed("1.0.0", "verified");
+    let local = installed("1.1.0", "local");
+    let mut community = installed("0.9.0", "community");
+    assert_eq!(installed::sources(&[&local, &verified]), "Verified, Local");
+    community.retired_at_ns = 5;
+    assert_eq!(installed::sources(&[&community, &local]), "Local");
+    assert_eq!(installed::sources(&[&community]), "Community");
+}
