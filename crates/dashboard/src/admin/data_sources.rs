@@ -543,7 +543,7 @@ fn priority_tab(
          <div class=\"dialog-body\"><input type=\"hidden\" name=\"against_updated_at_ns\" value=\"0\">\
          <label>Data type <select name=\"data_type\"><option value=\"{price}\">Price</option>\
          <option value=\"{bar}\">Bar</option><option value=\"{trade}\">Trade</option>\
-         <option value=\"{quote}\">Quote</option></select></label>\
+         <option value=\"{quote}\">Quote</option><option value=\"{rate}\">Rate</option></select></label>\
          <label data-om-applies-when=\"data_type\" data-om-one-of=\"{price}\">Kind, for prices \
          <select name=\"kind\" required><option value=\"close\">Close</option><option value=\"last\">Last</option>\
          <option value=\"nav\">NAV</option><option value=\"settlement\">Settlement</option></select></label>\
@@ -557,6 +557,7 @@ fn priority_tab(
         bar = lake::BAR,
         trade = lake::TRADE,
         quote = lake::QUOTE,
+        rate = lake::RATE,
     );
     (body, dialog)
 }

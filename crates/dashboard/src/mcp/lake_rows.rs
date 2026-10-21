@@ -5,9 +5,10 @@
 
 use meridian_domain::exact::Exact;
 use meridian_domain::v1::{
-    Aggressor, Bar, ExecutionCost, LiquidityIndicator, Money, ObservationMeta, Outcome,
-    OutcomeDetermination, OutcomeStage, Price, PriceBasis, PriceKind, Quote, QuoteCharacteristic,
-    Side, TcaBenchmark, TcaUnanswered, TimePrecision, Trade,
+    Aggressor, Bar, Compounding, DayCount, ExecutionCost, LiquidityIndicator, Money,
+    ObservationMeta, Outcome, OutcomeDetermination, OutcomeStage, Price, PriceBasis, PriceKind,
+    Quote, QuoteCharacteristic, Rate, RateKind, Side, TcaBenchmark, TcaUnanswered, TenorUnit,
+    TimePrecision, Trade, ValueUnit,
 };
 use serde_json::{json, Map, Value};
 
@@ -174,6 +175,77 @@ pub fn outcome(o: &Outcome) -> Value {
             } else {
                 json!(o.settled_at_ns.to_string())
             },
+        ),
+    ])
+}
+
+/// A rate (contract v27, the rates slice): its value with its unit, its
+/// convention and its tenor or maturity.
+pub fn rate(r: &Rate) -> Value {
+    let value = r.value.as_ref().map_or(Value::Null, |v| {
+        kept(vec![
+            ("value", decimal(v.value.as_ref())),
+            (
+                "unit",
+                named(v.unit, ValueUnit::try_from, |e| e.as_str_name()),
+            ),
+            ("index_base", json!(v.index_base)),
+            ("ucum_code", json!(v.ucum_code)),
+        ])
+    });
+    let convention = r.convention.as_ref().map_or(Value::Null, |c| {
+        kept(vec![
+            (
+                "day_count",
+                named(c.day_count, DayCount::try_from, |e| e.as_str_name()),
+            ),
+            (
+                "compounding",
+                named(c.compounding, Compounding::try_from, |e| e.as_str_name()),
+            ),
+            (
+                "periods_per_year",
+                if c.periods_per_year == 0 {
+                    Value::Null
+                } else {
+                    json!(c.periods_per_year)
+                },
+            ),
+        ])
+    });
+    let tenor = r.tenor.as_ref().map_or(Value::Null, |t| {
+        json!({
+            "count": t.count,
+            "unit": named(t.unit, TenorUnit::try_from, |e| e.as_str_name()),
+        })
+    });
+    kept(vec![
+        ("meta", meta(r.meta.as_ref())),
+        (
+            "kind",
+            named(r.kind, RateKind::try_from, |e| e.as_str_name()),
+        ),
+        ("value", value),
+        ("convention", convention),
+        ("tenor", tenor),
+        ("maturity_date", json!(r.maturity_date)),
+        ("preliminary", json!(r.preliminary)),
+        ("volume", money(r.volume.as_ref())),
+        (
+            "transaction_count",
+            r.transaction_count
+                .map_or(Value::Null, |n| json!(n.to_string())),
+        ),
+        (
+            "percentiles",
+            Value::Array(
+                r.percentiles
+                    .iter()
+                    .map(
+                        |p| json!({"percentile": p.percentile, "value": decimal(p.value.as_ref())}),
+                    )
+                    .collect(),
+            ),
         ),
     ])
 }
