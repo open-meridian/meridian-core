@@ -1213,8 +1213,13 @@ def the_fx_pivots_tab(browser, prefix):
             page.goto(ADMIN_PAGE + "#fx-pivots")
             settled(page)
             said = page.inner_text("#fx-pivots")
-            check("USD" in said and "set " in said,
-                  f"at {size} ({scheme}) the tab says the pivots by code and who set them: {said[:200]!r}")
+            if PASS == "fit":
+                # Never set (ruling 512): the readers' fallback, said.
+                check("USD, EUR (default)" in said and "never changed" in said,
+                      f"at {size} ({scheme}) the tab says the default never set: {said[:200]!r}")
+            else:
+                check("USD" in said and "set " in said,
+                      f"at {size} ({scheme}) the tab says the pivots by code and who set them: {said[:200]!r}")
             m = page.evaluate(MEASURE)
             measured(page, f"fx-pivots at {size} {scheme}", f"v27-{prefix}-fx-pivots-{size}-{scheme}.png")
             check(m["tall"] <= 0, f"the FX pivot currencies tab at {size} ({scheme}) fits one screen: {m['tall']}px taller")

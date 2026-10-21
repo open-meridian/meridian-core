@@ -128,10 +128,12 @@ pub fn lines(
         return "<p class=\"warn\">The FX pivot currencies could not be read just now.</p>"
             .to_string();
     };
+    // Never set (ruling 512): read as empty, the readers falling back to
+    // USD's and then EUR's, and said so.
     let (pivots, changed) = if setting.fx_pivot_currencies.is_empty() {
         (
-            ordered(&DEFAULT_CODES.map(String::from)),
-            "the default, never changed".to_string(),
+            format!("{} (default)", DEFAULT_CODES.join(", ")),
+            "never changed".to_string(),
         )
     } else {
         (
@@ -219,7 +221,11 @@ mod tests {
             &BTreeMap::new(),
             |s| s.to_string(),
         );
-        assert!(default.contains("USD, then EUR") && default.contains("never changed"));
+        assert!(
+            default.contains("<strong>USD, EUR (default)</strong>")
+                && default.contains("never changed"),
+            "{default}"
+        );
         assert!(lines(None, &codes, |s| s.to_string()).contains("could not be read"));
         let form = fields(Some(&held), &codes);
         assert!(form.contains("name=\"pivot_0\" value=\"EUR\""), "{form}");

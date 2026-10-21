@@ -1802,18 +1802,28 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
         ))
     });
     // Contract v27 (W6.36): the FX pivot currencies, the US dollar's record
-    // first, set by the admin, for the FX pivot currencies tab.
-    bus.serve(crate::admin::fx_pivots::READ_FX_PIVOT_CURRENCIES, |_| {
-        Ok((
-            "meridian.v1.FxPivotCurrenciesSetting".into(),
-            meridian_domain::v1::FxPivotCurrenciesSetting {
-                fx_pivot_currencies: vec![PLATFORM_USD.into()],
-                changed_at_ns: 1_792_300_000_000_000_000,
-                changed_by: ADMIN.into(),
-            }
-            .encode_to_vec(),
-        ))
-    });
+    // first, set by the admin, for the FX pivot currencies tab; never set in
+    // the development deployment's pass, which the tab says is the default
+    // (ruling 512).
+    let never_set = std::env::var("MERIDIAN_SETTINGS_DEVELOPMENT").is_ok_and(|v| v == "1");
+    bus.serve(
+        crate::admin::fx_pivots::READ_FX_PIVOT_CURRENCIES,
+        move |_| {
+            let setting = if never_set {
+                meridian_domain::v1::FxPivotCurrenciesSetting::default()
+            } else {
+                meridian_domain::v1::FxPivotCurrenciesSetting {
+                    fx_pivot_currencies: vec![PLATFORM_USD.into()],
+                    changed_at_ns: 1_792_300_000_000_000_000,
+                    changed_by: ADMIN.into(),
+                }
+            };
+            Ok((
+                "meridian.v1.FxPivotCurrenciesSetting".into(),
+                setting.encode_to_vec(),
+            ))
+        },
+    );
     // Contract v26 (W12.6): the routing table, one model id routed with a
     // long reason, and the measures the analytics component serves.
     bus.serve(crate::admin::model_routing::LIST_MODEL_ROUTING, |_| {
