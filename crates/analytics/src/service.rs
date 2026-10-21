@@ -263,7 +263,33 @@ impl Coordinator {
         }
         let answer = meridian_analytics_engine::compute_with(&inputs, self.executor.as_ref())
             .map_err(|failed| failed.0)?;
+        if answer.asks_execution_cost {
+            self.record_execution_costs(&wire::execution_costs(&answer, &resolved.executions));
+        }
         wire::job_answer(job_id, &answer)
+    }
+
+    /// Contract v27 (W10.11; ruling 481): the rows an `execution_cost` job
+    /// answered, recorded in the lake as the component itself, 500 a call;
+    /// the same inputs again a repeat, a different value the next version.
+    /// The answer stands whether or not the lake took them: a failure is
+    /// said, and the next job records them.
+    fn record_execution_costs(&self, costs: &[meridian_domain::v1::ExecutionCost]) {
+        for batch in costs.chunks(500) {
+            let request = meridian_domain::v1::RecordExecutionCostsRequest {
+                costs: batch.to_vec(),
+            };
+            let recorded = self.handle.block_on(self.bus.call(
+                topics::RECORD_EXECUTION_COSTS,
+                "meridian.v1.RecordExecutionCostsRequest",
+                request.encode_to_vec(),
+                None,
+                Some(self.config.read_timeout),
+            ));
+            if let Err(failed) = recorded {
+                tracing::warn!(%failed, rows = batch.len(), "execution costs were not recorded");
+            }
+        }
     }
 
     fn keep(&self, job_id: &str, client: &str, answer: Result<JobAnswer, String>) {

@@ -43,6 +43,10 @@ pub mod topics {
     pub const LIST_OUTCOMES: &str = "platform.lake.query.list-outcomes";
     /// Contract v27 (W6.36; ruling 483): the deployment's pivot order.
     pub const READ_FX_PIVOT_CURRENCIES: &str = "platform.config.query.read-fx-pivot-currencies";
+    /// Contract v27 (W11.17; ruling 510): an `execution_cost` job's orders,
+    /// their placements and executions, and an order's history.
+    pub const LIST_ORDERS: &str = "platform.book.query.list-orders";
+    pub const ORDER_HISTORY: &str = "platform.book.query.order-history";
     /// Contract v27 (W10.11): the execution costs a job records.
     pub const RECORD_EXECUTION_COSTS: &str = "platform.lake.command.record-execution-costs";
 

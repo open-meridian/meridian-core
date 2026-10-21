@@ -70,10 +70,10 @@ platform.book.query.list-alerts	query	compliance,reporting,oms,operations	bor
 platform.book.query.list-bookings	query	oms,operations,compliance,portfolio,reporting	bor
 platform.book.query.list-breaks	query	operations,oms,compliance,portfolio,reporting	bor
 platform.book.query.list-locates	query	compliance,oms,portfolio	bor
-platform.book.query.list-orders	query	oms,ems,compliance,portfolio,operations,reporting,connectivity	bor
+platform.book.query.list-orders	query	oms,ems,compliance,portfolio,operations,reporting,connectivity,analytics	bor
 platform.book.query.list-positions	query	portfolio,reporting,compliance,oms,operations,analytics	bor
 platform.book.query.list-trading-instructions	query	oms,ems,connectivity,portfolio,compliance,dashboard	bor
-platform.book.query.order-history	query	compliance,reporting,operations,oms	bor
+platform.book.query.order-history	query	compliance,reporting,operations,oms,analytics	bor
 platform.book.query.read-agent-orders-demo-only	query	oms,ems,portfolio,compliance,dashboard	bor
 platform.book.query.read-book-health	query	dashboard	bor
 platform.book.query.read-local-record-orders	query	oms,ems,portfolio,compliance,dashboard	bor

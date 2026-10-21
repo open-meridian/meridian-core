@@ -192,6 +192,72 @@ fn money(value: &Value) -> Option<meridian_domain::v1::Money> {
     })
 }
 
+/// The `ExecutionCost` rows an `execution_cost` job answered (contract v27,
+/// W10.11), as the lake records them: each under its execution's
+/// instrument and dated by its trade date, from `executions` (the
+/// resolve's, by execution ID); its row key the lake's (`EXE-…:arrival`).
+pub fn execution_costs(
+    answer: &Answer,
+    executions: &std::collections::BTreeMap<String, (String, String)>,
+) -> Vec<meridian_domain::v1::ExecutionCost> {
+    use meridian_domain::v1::{
+        ExecutionCost, LiquidityIndicator, ObservationMeta, Side, SubjectRef, TcaBenchmark,
+        TcaUnanswered, TimePrecision,
+    };
+    let integer = |value: &Value| -> i64 {
+        value
+            .as_i64()
+            .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+            .unwrap_or(0)
+    };
+    answer
+        .execution_costs
+        .iter()
+        .filter_map(|row| {
+            let execution_id = text(&row["execution_id"]);
+            let (instrument, trade_date) = executions.get(&execution_id)?;
+            Some(ExecutionCost {
+                meta: Some(ObservationMeta {
+                    subjects: vec![SubjectRef {
+                        entity_id: instrument.clone(),
+                    }],
+                    business_date: trade_date.clone(),
+                    ..Default::default()
+                }),
+                execution_id,
+                order_id: text(&row["order_id"]),
+                placement_id: text(&row["placement_id"]),
+                account_id: text(&row["account_id"]),
+                benchmark: TcaBenchmark::from_str_name(&text(&row["benchmark"]))
+                    .map_or(0, |b| b as i32),
+                benchmark_price: money(&row["benchmark_price"]),
+                benchmark_at_ns: integer(&row["benchmark_at_ns"]),
+                benchmark_dataset: text(&row["benchmark_dataset"]),
+                benchmark_row_key: text(&row["benchmark_row_key"]),
+                fixing_id: String::new(),
+                execution_price: money(&row["execution_price"]),
+                side: Side::from_str_name(&text(&row["side"])).map_or(0, |s| s as i32),
+                notional: money(&row["notional"]),
+                cost_bps: wire_decimal(&row["cost_bps"]),
+                fees_bps: wire_decimal(&row["fees_bps"]),
+                financing_bps: wire_decimal(&row["financing_bps"]),
+                liquidity_indicator: LiquidityIndicator::from_str_name(&text(
+                    &row["liquidity_indicator"],
+                ))
+                .map_or(0, |l| l as i32),
+                venue_id: text(&row["venue_id"]),
+                unanswered: TcaUnanswered::from_str_name(&text(&row["unanswered"]))
+                    .map_or(0, |u| u as i32),
+                staleness_bound_ns: integer(&row["staleness_bound_ns"]),
+                time_precision: TimePrecision::from_str_name(&text(&row["time_precision"]))
+                    .map_or(0, |t| t as i32),
+                reject_count: integer(&row["reject_count"]).max(0) as u32,
+                time_to_fill_ns: integer(&row["time_to_fill_ns"]),
+            })
+        })
+        .collect()
+}
+
 /// The engine's answer as a `JobAnswer`.
 pub fn job_answer(job_id: &str, answer: &Answer) -> Result<JobAnswer, String> {
     Ok(JobAnswer {

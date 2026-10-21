@@ -6,7 +6,9 @@
 //! `ListAccountAttributes` and `ListPositions` of the book,
 //! `ResolveInstrument`, `ReadTemplate` and `ListEventGroups` of the
 //! instrument store, `ListPrices` and `ListOutcomes` of the lake, and
-//! `ListModelRouting` of the conductor -- each carrying the client's
+//! `ListModelRouting` of the conductor; from contract v27 (ruling 510), for
+//! an `execution_cost` job, `ListOrders` and `ReadOrderHistory` of the book
+//! for the job's accounts -- each carrying the client's
 //! instance and the account scope its sidecar stamped on the job, so the
 //! book answers within that scope and the lake within that instance's
 //! entitlements and its role's kinds. One watermark and one as-of per job
@@ -25,8 +27,9 @@ use meridian_domain::exact::Exact;
 use meridian_domain::v1::{
     self as v1, EventGroupFlag, FxPivotCurrenciesSetting, Job, ListAccountAttributesReply,
     ListAccountAttributesRequest, ListEventGroupsReply, ListEventGroupsRequest,
-    ListModelRoutingReply, ListModelRoutingRequest, ListOutcomesReply, ListOutcomesRequest,
-    ListPositionsReply, ListPositionsRequest, ListPricesReply, ListPricesRequest, Money,
+    ListModelRoutingReply, ListModelRoutingRequest, ListOrdersReply, ListOrdersRequest,
+    ListOutcomesReply, ListOutcomesRequest, ListPositionsReply, ListPositionsRequest,
+    ListPricesReply, ListPricesRequest, Money, OrderHistoryReply, OrderHistoryRequest,
     OutcomeStage, PriceKind, ReadFxPivotCurrenciesRequest, ReadTemplateReply, ReadTemplateRequest,
     ResolveInstrumentReply, ResolveInstrumentRequest, SubjectRef, UnansweredReason,
 };
@@ -71,6 +74,10 @@ pub struct Resolved {
     pub inputs: Value,
     /// Model id to the `pricing` instance it is routed to, where any is.
     pub routes: BTreeMap<String, String>,
+    /// Contract v27 (W10.11): each execution an `execution_cost` job
+    /// measures, by its ID: its instrument and trade date, which its
+    /// `ExecutionCost` rows are recorded under.
+    pub executions: BTreeMap<String, (String, String)>,
 }
 
 /// A refusal of the job, as a bus error carries it.
@@ -308,10 +315,25 @@ pub fn resolve(
         }
     }
 
+    // Contract v27 (W10.11, W11.17; ruling 510): an `execution_cost` job's
+    // executions, read with their orders, placements and the orders'
+    // history for the job's accounts.
+    let measured = if compiled.reads.executions {
+        executions(asker, &compiled.reads.accounts, &business_date)?
+    } else {
+        Vec::new()
+    };
+
     // Each instrument's record and its template's package (W3.6, W3.24).
     let mut wanted: BTreeSet<String> = positions
         .iter()
         .map(|(_, p)| p.instrument_id.clone())
+        // An execution's instrument and the asset its price is in.
+        .chain(
+            measured
+                .iter()
+                .flat_map(|e| [e.instrument_id.clone(), e.price_instrument_id.clone()]),
+        )
         .chain(compiled.reads.what_if_instruments.iter().cloned())
         // Contract v27: the pivots' and the reporting currency's records,
         // which say whether each is fiat (ruling 462).
@@ -461,6 +483,29 @@ pub fn resolve(
         }
         wants = next;
         depth += 1;
+    }
+
+    // Contract v27 (C2, C4): the mid in force at each moment an execution is
+    // measured at, in the asset of its price; the engine takes the latest
+    // at or before the moment within the staleness bound.
+    let mut moments: BTreeMap<i64, BTreeSet<String>> = BTreeMap::new();
+    for execution in &measured {
+        for moment in execution.moments() {
+            moments
+                .entry(moment)
+                .or_default()
+                .insert(execution.instrument_id.clone());
+        }
+    }
+    for (moment, subjects) in moments {
+        let subjects: Vec<String> = subjects.into_iter().collect();
+        for chunk in subjects.chunks(SUBJECTS) {
+            for price in mids_at(asker, chunk, &sources, moment, as_of)? {
+                if let Some(row) = market_row(&price) {
+                    market.push(row);
+                }
+            }
+        }
     }
 
     // Each base currency's cash instrument's record, which a what-if's cash
@@ -677,6 +722,9 @@ pub fn resolve(
         "event_groups": event_groups,
         "stale_after_ns": {},
     });
+    if compiled.reads.executions {
+        document["executions"] = Value::Array(measured.iter().map(Measured::to_json).collect());
+    }
     if !unentitled.is_empty() {
         document["unentitled"] = Value::Array(
             unentitled
@@ -690,7 +738,341 @@ pub fn resolve(
     Ok(Resolved {
         inputs: document,
         routes,
+        executions: measured
+            .iter()
+            .map(|e| {
+                (
+                    e.execution_id.clone(),
+                    (e.instrument_id.clone(), e.trade_date.clone()),
+                )
+            })
+            .collect(),
     })
+}
+
+/// One execution an `execution_cost` job measures (contract v27, W10.11;
+/// C2, C7, C8), as the book answers it: the order's proposal (decision) and
+/// release to the desk (arrival) from its history, the placement's
+/// `routed_at_ns` (placement arrival) and the fill's trade time.
+#[derive(Debug, Clone, PartialEq)]
+struct Measured {
+    execution_id: String,
+    order_id: String,
+    placement_id: String,
+    account_id: String,
+    instrument_id: String,
+    side: String,
+    price: String,
+    price_instrument_id: String,
+    quantity: String,
+    trade_date: String,
+    decision_at_ns: i64,
+    arrival_at_ns: i64,
+    placement_arrival_at_ns: i64,
+    executed_at_ns: i64,
+    fees: Option<String>,
+    liquidity_indicator: String,
+    venue_id: String,
+    time_precision: String,
+    reject_count: i64,
+    time_to_fill_ns: i64,
+}
+
+impl Measured {
+    /// The moments it is measured at, each not 0.
+    fn moments(&self) -> Vec<i64> {
+        [
+            self.decision_at_ns,
+            self.arrival_at_ns,
+            self.placement_arrival_at_ns,
+            self.executed_at_ns,
+        ]
+        .into_iter()
+        .filter(|moment| *moment > 0)
+        .collect()
+    }
+
+    /// As the engine's inputs document holds it (the reference cases'
+    /// shape).
+    fn to_json(&self) -> Value {
+        json!({
+            "execution_id": self.execution_id,
+            "order_id": self.order_id,
+            "placement_id": self.placement_id,
+            "account_id": self.account_id,
+            "instrument_id": self.instrument_id,
+            "side": self.side,
+            "price": {"amount": self.price, "instrument_id": self.price_instrument_id},
+            "quantity": self.quantity,
+            "decision_at_ns": self.decision_at_ns.to_string(),
+            "arrival_at_ns": self.arrival_at_ns.to_string(),
+            "placement_arrival_at_ns": self.placement_arrival_at_ns.to_string(),
+            "executed_at_ns": self.executed_at_ns.to_string(),
+            "fees": self.fees.as_ref().map(|amount| json!({
+                "amount": amount, "instrument_id": self.price_instrument_id,
+            })),
+            "financing": Value::Null,
+            "liquidity_indicator": self.liquidity_indicator,
+            "venue_id": self.venue_id,
+            "time_precision": self.time_precision,
+            "reject_count": self.reject_count.to_string(),
+            "time_to_fill_ns": self.time_to_fill_ns.to_string(),
+        })
+    }
+}
+
+/// The name of an enum value, empty for unspecified.
+fn named(name: &str) -> String {
+    if name.ends_with("_UNSPECIFIED") {
+        String::new()
+    } else {
+        name.to_string()
+    }
+}
+
+/// Each account's executions an `execution_cost` job measures (contract
+/// v27, W10.11; ruling 510): every page of `ListOrders` for the account --
+/// its orders, their placements and executions -- and each measured order's
+/// history for its proposal and its release. A fill matched to an order is
+/// measured; one unmatched, answered don't know or superseded is not. With a
+/// business date, the executions traded on it alone.
+fn executions(
+    asker: &dyn Ask,
+    accounts: &[String],
+    business_date: &str,
+) -> Result<Vec<Measured>, Refused> {
+    let mut out = Vec::new();
+    for (i, account) in accounts.iter().enumerate() {
+        let mut orders: BTreeMap<String, v1::Order> = BTreeMap::new();
+        let mut placements: BTreeMap<String, v1::Placement> = BTreeMap::new();
+        let mut fills: BTreeMap<String, v1::Execution> = BTreeMap::new();
+        let mut cursor = String::new();
+        loop {
+            let reply: ListOrdersReply = ask(
+                asker,
+                topics::LIST_ORDERS,
+                "meridian.v1.ListOrdersRequest",
+                &ListOrdersRequest {
+                    account_id: account.clone(),
+                    page_size: BOOK_PAGE,
+                    cursor: cursor.clone(),
+                    ..Default::default()
+                },
+            )
+            .map_err(|failed| read_refused(&format!("account_ids[{i}]"), account, &failed))?;
+            for order in reply.orders {
+                for placement in &order.placements {
+                    placements.insert(placement.placement_id.clone(), placement.clone());
+                }
+                for fill in &order.executions {
+                    fills.insert(fill.execution_id.clone(), fill.clone());
+                }
+                orders.insert(order.order_id.clone(), order);
+            }
+            for placement in reply.placements {
+                placements.insert(placement.placement_id.clone(), placement);
+            }
+            for fill in reply.executions {
+                fills.insert(fill.execution_id.clone(), fill);
+            }
+            if reply.next_cursor.is_empty() {
+                break;
+            }
+            cursor = reply.next_cursor;
+        }
+        let superseded: BTreeSet<String> = fills
+            .values()
+            .filter(|f| !f.supersedes.is_empty())
+            .map(|f| f.supersedes.clone())
+            .collect();
+        let kept: Vec<&v1::Execution> = fills
+            .values()
+            .filter(|f| {
+                f.account_id == *account
+                    && !f.order_id.is_empty()
+                    && orders.contains_key(&f.order_id)
+                    && !superseded.contains(&f.execution_id)
+                    && matches!(
+                        v1::ExecutionState::try_from(f.state),
+                        Ok(v1::ExecutionState::Matched | v1::ExecutionState::Unspecified)
+                    )
+                    && (business_date.is_empty() || f.trade_date == business_date)
+            })
+            .collect();
+        // Each measured order's proposal and release, from its history.
+        let mut moments: BTreeMap<String, (i64, i64)> = BTreeMap::new();
+        for order_id in kept
+            .iter()
+            .map(|f| f.order_id.clone())
+            .collect::<BTreeSet<_>>()
+        {
+            let mut proposed = 0;
+            let mut released = 0;
+            let mut cursor = String::new();
+            loop {
+                let reply: OrderHistoryReply = ask(
+                    asker,
+                    topics::ORDER_HISTORY,
+                    "meridian.v1.OrderHistoryRequest",
+                    &OrderHistoryRequest {
+                        account_id: account.clone(),
+                        order_id: order_id.clone(),
+                        page_size: BOOK_PAGE,
+                        cursor: cursor.clone(),
+                    },
+                )
+                .map_err(|failed| read_refused(&format!("account_ids[{i}]"), account, &failed))?;
+                for entry in reply.entries {
+                    let at = if entry.event_time_ns > 0 {
+                        entry.event_time_ns
+                    } else {
+                        entry.received_at_ns
+                    };
+                    match entry.kind.as_str() {
+                        "order-proposed" if proposed == 0 => proposed = at,
+                        "order-released" if released == 0 => released = at,
+                        _ => {}
+                    }
+                }
+                if reply.next_cursor.is_empty() {
+                    break;
+                }
+                cursor = reply.next_cursor;
+            }
+            moments.insert(order_id, (proposed, released));
+        }
+        for fill in kept {
+            let Some(order) = orders.get(&fill.order_id) else {
+                continue;
+            };
+            let Some(price) = fill.price.as_ref() else {
+                continue;
+            };
+            let (Some(amount), Some(quantity)) = (
+                text_of(price.amount.as_ref()),
+                text_of(fill.quantity.as_ref()),
+            ) else {
+                continue;
+            };
+            let placement = placements.get(&fill.placement_id);
+            let (decision, arrival) = moments.get(&fill.order_id).copied().unwrap_or_default();
+            // A manual placement's agreed time, else its routing (C8).
+            let (placed_at, precision) = match placement {
+                Some(p) if p.agreed_at_ns > 0 => (p.agreed_at_ns, p.agreed_precision),
+                Some(p) => (p.routed_at_ns, p.routed_precision),
+                None => (0, 0),
+            };
+            // Fees in the asset of the price, summed (C3); none stated, none.
+            let mut fees: Option<Exact> = None;
+            for fee in &fill.fees {
+                if let Some(money) = fee.amount.as_ref() {
+                    let same = money.instrument_id == price.instrument_id
+                        || (!money.currency_code.is_empty()
+                            && money.currency_code == price.currency_code);
+                    if let (true, Some(value)) = (
+                        same,
+                        money.amount.as_ref().and_then(|d| Exact::from_wire(d).ok()),
+                    ) {
+                        fees = Some(match fees {
+                            None => value,
+                            Some(held) => held.checked_add(value).map_err(|_| {
+                                format!("{}'s fees are out of range", fill.execution_id)
+                            })?,
+                        });
+                    }
+                }
+            }
+            // The order's placements the venue rejected: last-look
+            // rejections, never a cost (C7).
+            let reject_count = order
+                .placements
+                .iter()
+                .filter(|p| p.rejection_reason == v1::RejectionReason::VenueRejected as i32)
+                .count() as i64;
+            out.push(Measured {
+                execution_id: fill.execution_id.clone(),
+                order_id: fill.order_id.clone(),
+                placement_id: fill.placement_id.clone(),
+                account_id: account.clone(),
+                instrument_id: fill.instrument_id.clone(),
+                side: named(
+                    v1::Side::try_from(fill.side)
+                        .unwrap_or(v1::Side::Unspecified)
+                        .as_str_name(),
+                ),
+                price: amount,
+                price_instrument_id: price.instrument_id.clone(),
+                quantity,
+                trade_date: fill.trade_date.clone(),
+                decision_at_ns: decision,
+                arrival_at_ns: arrival,
+                placement_arrival_at_ns: placed_at,
+                executed_at_ns: fill.trade_time_ns,
+                fees: fees.map(|f| f.to_string()),
+                liquidity_indicator: named(
+                    v1::LiquidityIndicator::try_from(fill.liquidity_indicator)
+                        .unwrap_or(v1::LiquidityIndicator::Unspecified)
+                        .as_str_name(),
+                ),
+                venue_id: fill.venue_id.clone(),
+                time_precision: named(
+                    v1::TimePrecision::try_from(precision)
+                        .unwrap_or(v1::TimePrecision::Unspecified)
+                        .as_str_name(),
+                ),
+                reject_count,
+                time_to_fill_ns: if placed_at > 0 && fill.trade_time_ns >= placed_at {
+                    fill.trade_time_ns - placed_at
+                } else {
+                    0
+                },
+            });
+        }
+    }
+    out.sort_by(|a, b| (&a.account_id, &a.execution_id).cmp(&(&b.account_id, &b.execution_id)));
+    Ok(out)
+}
+
+/// The mids of these subjects in force at a moment, as of the job's
+/// recorded-time cut (contract v27, C4), every page.
+fn mids_at(
+    asker: &dyn Ask,
+    subjects: &[String],
+    sources: &Option<v1::SourceChoice>,
+    moment: i64,
+    as_of: i64,
+) -> Result<Vec<v1::Price>, Refused> {
+    let mut out = Vec::new();
+    let mut cursor = String::new();
+    loop {
+        let reply: ListPricesReply = ask(
+            asker,
+            topics::LIST_PRICES,
+            "meridian.v1.ListPricesRequest",
+            &ListPricesRequest {
+                subjects: subjects
+                    .iter()
+                    .map(|s| SubjectRef {
+                        entity_id: s.clone(),
+                    })
+                    .collect(),
+                kinds: vec![PriceKind::Mid as i32],
+                sources: sources.clone(),
+                at_ns: moment,
+                as_of_ns: as_of,
+                page_size: PAGE,
+                cursor: cursor.clone(),
+                ..Default::default()
+            },
+        )
+        .map_err(|failed| format!("the lake's mids could not be read: {failed}"))?;
+        out.extend(reply.prices);
+        if reply.next_cursor.is_empty() {
+            break;
+        }
+        cursor = reply.next_cursor;
+    }
+    Ok(out)
 }
 
 /// Where a store's money says which cash instrument a currency's code
