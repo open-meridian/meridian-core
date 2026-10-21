@@ -24,12 +24,11 @@ use meridian_bus::{refusal_with_status, RefusalStatus};
 use meridian_domain::exact::Exact;
 use meridian_domain::v1::{
     self as v1, EventGroupFlag, FxPivotCurrenciesSetting, Job, ListAccountAttributesReply,
-    ListAccountAttributesRequest, ReadFxPivotCurrenciesRequest,
-    ListEventGroupsReply, ListEventGroupsRequest, ListModelRoutingReply, ListModelRoutingRequest,
-    ListOutcomesReply, ListOutcomesRequest, ListPositionsReply, ListPositionsRequest,
-    ListPricesReply, ListPricesRequest, Money, OutcomeStage, PriceKind, ReadTemplateReply,
-    ReadTemplateRequest, ResolveInstrumentReply, ResolveInstrumentRequest, SubjectRef,
-    UnansweredReason,
+    ListAccountAttributesRequest, ListEventGroupsReply, ListEventGroupsRequest,
+    ListModelRoutingReply, ListModelRoutingRequest, ListOutcomesReply, ListOutcomesRequest,
+    ListPositionsReply, ListPositionsRequest, ListPricesReply, ListPricesRequest, Money,
+    OutcomeStage, PriceKind, ReadFxPivotCurrenciesRequest, ReadTemplateReply, ReadTemplateRequest,
+    ResolveInstrumentReply, ResolveInstrumentRequest, SubjectRef, UnansweredReason,
 };
 use prost::Message;
 use serde_json::{json, Value};
@@ -1178,8 +1177,14 @@ fn closed_lots(
                     continue;
                 };
                 let (Some(quantity), Some(amount)) = (
-                    relief.quantity.as_ref().and_then(|d| Exact::from_wire(d).ok()),
-                    proceeds.amount.as_ref().and_then(|d| Exact::from_wire(d).ok()),
+                    relief
+                        .quantity
+                        .as_ref()
+                        .and_then(|d| Exact::from_wire(d).ok()),
+                    proceeds
+                        .amount
+                        .as_ref()
+                        .and_then(|d| Exact::from_wire(d).ok()),
                 ) else {
                     continue;
                 };

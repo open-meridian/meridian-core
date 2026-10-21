@@ -170,8 +170,8 @@ fn offer_bounds(
         return Ok(());
     };
     let offered = meridian_domain::v1::BinaryEventContract {
-        floor: bound.floor.clone(),
-        cap: bound.cap.clone(),
+        floor: bound.floor,
+        cap: bound.cap,
         bound_unit: bound.bound_unit.clone(),
         ..held.clone()
     };
@@ -281,7 +281,10 @@ pub fn report(
         else {
             return Ok(Err(refused(
                 format!("member_bounds[{i}].instrument_id"),
-                format!("{:?} is not one of the report's members", bound.instrument_id),
+                format!(
+                    "{:?} is not one of the report's members",
+                    bound.instrument_id
+                ),
             )));
         };
         bounds.push((members[at].clone(), bound.clone()));

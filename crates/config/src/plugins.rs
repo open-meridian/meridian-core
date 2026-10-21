@@ -417,7 +417,8 @@ fn declared(declaration: &PluginDeclaration, roles: &[String]) -> Result<(), Str
                     "declaration.pricing_models[{i}].model_id names no model id"
                 ));
             }
-            if !PRICING_MODEL_DECLARATION_MODEL_VERSION_RANGE.admits(i64::from(model.model_version)) {
+            if !PRICING_MODEL_DECLARATION_MODEL_VERSION_RANGE.admits(i64::from(model.model_version))
+            {
                 return Err(format!(
                     "declaration.pricing_models[{i}].model_version is {}; 1 or more",
                     model.model_version

@@ -125,7 +125,10 @@ fn harness_keyed(instance: &str, key: SettingsKey) -> Harness {
                 // A fiat currency's cash instrument (contract v27): one
                 // named INS-CASH and its ISO 4217 code; a token's, INS-CASH
                 // and a longer name, carries no code.
-                let code = asked.instrument_id.strip_prefix("INS-CASH").unwrap_or_default();
+                let code = asked
+                    .instrument_id
+                    .strip_prefix("INS-CASH")
+                    .unwrap_or_default();
                 meridian_domain::v1::InstrumentRecord {
                     instrument_id: resolved
                         .map(|n| format!("INS-{n}"))
@@ -3613,11 +3616,23 @@ async fn the_fx_pivot_currencies_are_fiat_ordered_by_a_deployment_admin_each_cha
     assert_eq!(default.changed_at_ns, 0);
     for (pivots, field) in [
         (vec![], "fields=fx_pivot_currencies"),
-        (vec!["INS-CASHUSD", "INS-CASHUSD"], "fields=fx_pivot_currencies[1]"),
-        (vec!["INS-CASHUSD", "INS-CASHUSDC"], "fields=fx_pivot_currencies[1]"),
+        (
+            vec!["INS-CASHUSD", "INS-CASHUSD"],
+            "fields=fx_pivot_currencies[1]",
+        ),
+        (
+            vec!["INS-CASHUSD", "INS-CASHUSDC"],
+            "fields=fx_pivot_currencies[1]",
+        ),
         (vec!["INS-AAPL"], "fields=fx_pivot_currencies[0]"),
         (
-            vec!["INS-CASHUSD", "INS-CASHEUR", "INS-CASHCHF", "INS-CASHGBP", "INS-CASHJPY"],
+            vec![
+                "INS-CASHUSD",
+                "INS-CASHEUR",
+                "INS-CASHCHF",
+                "INS-CASHGBP",
+                "INS-CASHJPY",
+            ],
             "fields=fx_pivot_currencies",
         ),
     ] {
@@ -3629,7 +3644,10 @@ async fn the_fx_pivot_currencies_are_fiat_ordered_by_a_deployment_admin_each_cha
     let changed = set(&["INS-CASHEUR", "INS-CASHUSD"], "the fund reports in euros")
         .await
         .unwrap();
-    assert_eq!(changed.fx_pivot_currencies, vec!["INS-CASHEUR", "INS-CASHUSD"]);
+    assert_eq!(
+        changed.fx_pivot_currencies,
+        vec!["INS-CASHEUR", "INS-CASHUSD"]
+    );
     assert!(changed.changed_at_ns > 0 && !changed.changed_by.is_empty());
     assert_eq!(
         read().await.unwrap().fx_pivot_currencies,

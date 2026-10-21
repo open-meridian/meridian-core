@@ -24,8 +24,8 @@ use meridian_domain::exact::Exact;
 use meridian_domain::v1::{
     AccountAttributes, AccountFigures, BookPosition, Break, Encumbrance, Execution, FreeBasis,
     HoldingSide, JournalRef, Locate, Lot, LotRelief, MarginAgreementRef, Money, MovementLine,
-    OpeningSource, Order,
-    PendingSettlement, PendingState, Placement, SettlementBucket, TradingInstruction, UnplacedFact,
+    OpeningSource, Order, PendingSettlement, PendingState, Placement, SettlementBucket,
+    TradingInstruction, UnplacedFact,
 };
 use meridian_pb::v1::RefusalReason;
 

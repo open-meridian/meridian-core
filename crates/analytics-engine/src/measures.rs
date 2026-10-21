@@ -19,7 +19,6 @@ use crate::exact::Dec;
 use crate::historical;
 use crate::model::{self, conversion, product, Valued};
 
-
 /// A whole-number scale for a what-if trade's cost, as the reference rounds
 /// it.
 const COST_SCALE: u32 = 18;
@@ -881,9 +880,7 @@ fn execution_cost(
             }
             let unanswered = if moment == 0 {
                 NOT_MEASURED
-            } else if quote
-                .is_none_or(|q| moment - q.valid_at_ns > bound || q.amount.is_zero())
-            {
+            } else if quote.is_none_or(|q| moment - q.valid_at_ns > bound || q.amount.is_zero()) {
                 NO_QUOTE
             } else {
                 ""

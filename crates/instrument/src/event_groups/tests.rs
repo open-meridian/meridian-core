@@ -338,11 +338,20 @@ fn a_members_bounds_are_offered_on_its_record_and_never_in_force() {
     let bound = |id: &str, floor: &str, cap: &str| EventGroupMemberBound {
         instrument_id: id.into(),
         floor: Some(EventContractBound {
-            value: Some(floor.parse::<meridian_domain::exact::Exact>().unwrap().to_wire()),
+            value: Some(
+                floor
+                    .parse::<meridian_domain::exact::Exact>()
+                    .unwrap()
+                    .to_wire(),
+            ),
             ..Default::default()
         }),
         cap: Some(EventContractBound {
-            value: Some(cap.parse::<meridian_domain::exact::Exact>().unwrap().to_wire()),
+            value: Some(
+                cap.parse::<meridian_domain::exact::Exact>()
+                    .unwrap()
+                    .to_wire(),
+            ),
             ..Default::default()
         }),
         bound_unit: "percent".into(),
@@ -350,7 +359,10 @@ fn a_members_bounds_are_offered_on_its_record_and_never_in_force() {
     let mut stray = reported(&["LCL-A", "LCL-B"], EventGroupFlag::True);
     stray.member_bounds = vec![bound("LCL-C", "4.00", "4.25")];
     let refused = report(&store, &platform, &stray, NOW).unwrap().unwrap_err();
-    assert_eq!(refused.fields, vec!["member_bounds[0].instrument_id".to_string()]);
+    assert_eq!(
+        refused.fields,
+        vec!["member_bounds[0].instrument_id".to_string()]
+    );
 
     let mut with = reported(&["LCL-A", "LCL-B"], EventGroupFlag::True);
     with.member_bounds = vec![bound("LCL-A", "4.00", "4.25")];
@@ -369,10 +381,5 @@ fn a_members_bounds_are_offered_on_its_record_and_never_in_force() {
     assert_eq!(contract.bound_unit, "percent");
     assert!(contract.floor.is_some() && contract.cap.is_some());
     assert_eq!(offered.instance_id, "data-kalshi-1");
-    assert!(store
-        .by_id("LCL-B")
-        .unwrap()
-        .unwrap()
-        .offers
-        .is_empty());
+    assert!(store.by_id("LCL-B").unwrap().unwrap().offers.is_empty());
 }

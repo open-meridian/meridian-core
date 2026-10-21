@@ -25,15 +25,16 @@ use meridian_domain::v1::{
     Check, CheckVerdict, Claimant, CreatePlacementRequest, DecideApprovalRequest, DkReason,
     DontKnowExecutionRequest, Execution, ExecutionKind, ExecutionState, HoldingSide, LocateUseKind,
     LotReliefMethod, LotSource, LotTerms, Money, MovementLine, Order, OrderChange, OrderChangeKind,
-    OrderCondition, OrderLinkKind, OrderOrigin, OrderState, OrderType, PersonRoles, Placement,
-    PickPlacementQuoteRequest, PlacementChange, PlacementChangeKind, PlacementEvent,
+    OrderCondition, OrderLinkKind, OrderOrigin, OrderState, OrderType, PersonRoles,
+    PickPlacementQuoteRequest, Placement, PlacementChange, PlacementChangeKind, PlacementEvent,
     PlacementQuote, PlacementQuoteOutcome, PlacementState, PlacementType, ProposeOrderRequest,
     RecordCheckRequest, RecordLocateRequest, RecordLocateUseRequest, RecordOrderRequest,
-    ReleaseOrderRequest, ReportChargeRequest, ReportExecutionRequest, ReportPlacementRequest,
-    ReportPlacementQuoteRequest, ReportValueDateRollRequest, RequestOrderChangeRequest, RequestPlacementChangeRequest,
-    SetTradingInstructionRequest, SetWorkingConditionRequest, SetterLevel, SettlementBucket, Side,
-    StandingOrderCondition, TieOutReason, TimeInForce, TradingInstruction,
-    TradingInstructionTarget, TradingInstructionValue, UnplacedFact, UnplacedReason, VenueActor,
+    ReleaseOrderRequest, ReportChargeRequest, ReportExecutionRequest, ReportPlacementQuoteRequest,
+    ReportPlacementRequest, ReportValueDateRollRequest, RequestOrderChangeRequest,
+    RequestPlacementChangeRequest, SetTradingInstructionRequest, SetWorkingConditionRequest,
+    SetterLevel, SettlementBucket, Side, StandingOrderCondition, TieOutReason, TimeInForce,
+    TradingInstruction, TradingInstructionTarget, TradingInstructionValue, UnplacedFact,
+    UnplacedReason, VenueActor,
 };
 use meridian_pb::v1::RefusalReason;
 
@@ -802,7 +803,12 @@ fn propose_block(
 /// creation as a block is. Only the net goes to market; the offset is
 /// crossed internally (W11.11). Each member is then linked to it by a child
 /// entry in its own account ([`link_net_member`]).
-fn propose_net(book: &Book, head: u64, ctx: &Context, request: &ProposeOrderRequest) -> Result<Made> {
+fn propose_net(
+    book: &Book,
+    head: u64,
+    ctx: &Context,
+    request: &ProposeOrderRequest,
+) -> Result<Made> {
     if request.cash_quantity.is_some() {
         return Err(malformed(
             &["cash_quantity"],
@@ -810,7 +816,10 @@ fn propose_net(book: &Book, head: u64, ctx: &Context, request: &ProposeOrderRequ
         ));
     }
     if request.link.is_some() {
-        return Err(malformed(&["link"], "a net names its members, and no parent"));
+        return Err(malformed(
+            &["link"],
+            "a net names its members, and no parent",
+        ));
     }
     let (quantity, side, instrument_id, quote_currency, value_key) =
         crate::booking::net_holds(ctx, &request.net_member_order_ids)?;
@@ -918,12 +927,9 @@ pub fn link_net_member(
     net_account_id: &str,
 ) -> Result<Option<Made>> {
     let member = held(book, member_order_id)?;
-    if member
-        .order
-        .link
-        .as_ref()
-        .is_some_and(|link| link.kind == OrderLinkKind::Net as i32 && link.parent_order_id == net_order_id)
-    {
+    if member.order.link.as_ref().is_some_and(|link| {
+        link.kind == OrderLinkKind::Net as i32 && link.parent_order_id == net_order_id
+    }) {
         return Ok(None);
     }
     let plan = Plan::new(
@@ -1944,7 +1950,10 @@ fn placement_type_holds(order: &OrderHeld, request: &CreatePlacementRequest) -> 
     }
     let manual = kind == PlacementType::Manual;
     let named = |field: &str, words: String| Err(malformed(&[field], words));
-    let words = kind.as_str_name().trim_start_matches("PLACEMENT_TYPE_").to_ascii_lowercase();
+    let words = kind
+        .as_str_name()
+        .trim_start_matches("PLACEMENT_TYPE_")
+        .to_ascii_lowercase();
     // An RFQ order takes only RFQ placements; an RFQ placement is allowed
     // on any order (B3).
     if order.order.order_type == OrderType::RequestForQuote as i32 && kind != PlacementType::Rfq {
@@ -1958,7 +1967,10 @@ fn placement_type_holds(order: &OrderHeld, request: &CreatePlacementRequest) -> 
             return named("strategy", "an algo placement names its strategy".into())
         }
         (PlacementType::Dma | PlacementType::Care | PlacementType::Manual, true) => {
-            return named("strategy", format!("a {words} placement carries no strategy"))
+            return named(
+                "strategy",
+                format!("a {words} placement carries no strategy"),
+            )
         }
         _ => {}
     }
@@ -1966,8 +1978,7 @@ fn placement_type_holds(order: &OrderHeld, request: &CreatePlacementRequest) -> 
         if !request.connectivity_instance_id.is_empty() {
             return named(
                 "connectivity_instance_id",
-                "a manual placement names no connectivity instance: it is delivered to none"
-                    .into(),
+                "a manual placement names no connectivity instance: it is delivered to none".into(),
             );
         }
         if !request.venue_account_code.is_empty() {
@@ -1990,7 +2001,10 @@ fn placement_type_holds(order: &OrderHeld, request: &CreatePlacementRequest) -> 
             );
         }
         let details = [
-            ("counterparty_contact", !request.counterparty_contact.is_empty()),
+            (
+                "counterparty_contact",
+                !request.counterparty_contact.is_empty(),
+            ),
             ("agreed_at_ns", request.agreed_at_ns != 0),
             ("agreed_precision", request.agreed_precision != 0),
         ];
@@ -2074,8 +2088,12 @@ pub fn report_placement_quote(
             request.placement_id, ctx.instance_id
         )));
     }
-    let outcome = PlacementQuoteOutcome::try_from(request.outcome)
-        .map_err(|_| malformed(&["outcome"], format!("{} is no quote outcome", request.outcome)))?;
+    let outcome = PlacementQuoteOutcome::try_from(request.outcome).map_err(|_| {
+        malformed(
+            &["outcome"],
+            format!("{} is no quote outcome", request.outcome),
+        )
+    })?;
     // A pick is the `ems`'s (W11.41), never the venue's report.
     if outcome == PlacementQuoteOutcome::Picked {
         return Err(malformed(
@@ -2140,10 +2158,9 @@ pub fn report_placement_quote(
                 ),
             ));
         };
-        let was = PlacementQuoteOutcome::try_from(held.outcome)
-            .unwrap_or(PlacementQuoteOutcome::Open);
-        if outcome == PlacementQuoteOutcome::Unspecified || quote_rank(outcome) <= quote_rank(was)
-        {
+        let was =
+            PlacementQuoteOutcome::try_from(held.outcome).unwrap_or(PlacementQuoteOutcome::Open);
+        if outcome == PlacementQuoteOutcome::Unspecified || quote_rank(outcome) <= quote_rank(was) {
             return Err(StoreError::refused(
                 RefusalReason::OrderState,
                 format!(
@@ -2156,7 +2173,10 @@ pub fn report_placement_quote(
         }
         PlacementQuote {
             outcome: outcome as i32,
-            raw_record: request.raw_record.clone().or_else(|| held.raw_record.clone()),
+            raw_record: request
+                .raw_record
+                .clone()
+                .or_else(|| held.raw_record.clone()),
             ..held.clone()
         }
     };
@@ -3329,7 +3349,11 @@ pub fn report_execution(
         sleeve: order.order.sleeve.clone(),
         // A net's internal cross is a buy for one member and a sale for
         // another: its side is its own (W11.11).
-        side: if cross { request.side } else { order.order.side },
+        side: if cross {
+            request.side
+        } else {
+            order.order.side
+        },
         cross_rate_source: request.cross_rate_source,
         ..execution_of(book, ctx, request, entered)
     };

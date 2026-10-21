@@ -464,12 +464,12 @@ pub mod calendars;
 pub mod connectivity;
 pub mod data_sources;
 pub mod event_groups;
+pub mod fx_pivots;
 pub mod holds;
 pub mod instruments;
 pub mod model_routing;
 pub(crate) mod overview;
 pub mod time_zone;
-pub mod fx_pivots;
 pub(crate) use overview::listing;
 pub mod people;
 pub(crate) mod picker;
@@ -3409,7 +3409,11 @@ async fn set_fx_pivot_currencies(
         return not_done("say why the FX pivot currencies change", back);
     }
     let codes: Vec<String> = (0..fx_pivots::MOST)
-        .map(|n| field(&fields, &format!("pivot_{n}")).trim().to_ascii_uppercase())
+        .map(|n| {
+            field(&fields, &format!("pivot_{n}"))
+                .trim()
+                .to_ascii_uppercase()
+        })
         .filter(|code| !code.is_empty())
         .collect();
     if codes.is_empty() {
@@ -3421,7 +3425,9 @@ async fn set_fx_pivot_currencies(
             Some(id) => pivots.push(id),
             None => {
                 return not_done(
-                    &format!("{code} names no fiat currency's cash instrument this deployment holds"),
+                    &format!(
+                        "{code} names no fiat currency's cash instrument this deployment holds"
+                    ),
                     back,
                 )
             }
@@ -3455,7 +3461,11 @@ async fn set_fx_pivot_currencies(
         .await
         .map(|_| ())
         .map_err(said_of_refusal);
-    after_to(outcome, "/admin?done=FX+pivot+currencies+set#fx-pivots", back)
+    after_to(
+        outcome,
+        "/admin?done=FX+pivot+currencies+set#fx-pivots",
+        back,
+    )
 }
 
 /// The FX pivot currencies' act on the surface (W6.36, contract v27).

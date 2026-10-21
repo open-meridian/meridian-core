@@ -36,19 +36,18 @@ use meridian_domain::money::{asset_of, Asset, CashInstruments, ISO4217};
 use meridian_domain::v1::PartitionSequence;
 use meridian_domain::v1::{
     BarsRecordedEvent, DatasetRef, DeclineWantReply, DeclineWantRequest, EntitlementsChangedEvent,
-    ExecutionCost, ListExecutionCostsReply, ListExecutionCostsRequest, RecordExecutionCostsRequest,
-    TcaBenchmark,
-    Identifier, InstrumentReplacedEvent, ListBarsReply, ListBarsRequest, ListDatasetsReply,
-    ListDatasetsRequest, ListOutcomesReply, ListOutcomesRequest, ListPricesReply,
-    ListPricesRequest, ListQuotesReply, ListQuotesRequest, ListSourcePrioritiesReply,
-    ListSourcePrioritiesRequest, ListTradesReply, ListTradesRequest,
-    MissingInstrumentDetectedEvent, MissingVenueDetectedEvent, ObservationsWantedEvent,
-    OutcomesRecordedEvent, PluginCatalogue, PluginCatalogueRequest, PluginLaunchState, PriceBasis,
-    PriceKind, PricesRecordedEvent, QuoteCharacteristic, QuotesRecordedEvent, RecordBarsRequest,
-    RecordObservationsReply, RecordOutcomesRequest, RecordPricesRequest, RecordQuotesRequest,
-    RecordTradesRequest, ResolveIdentifierReply, ResolveIdentifierRequest, ResolveInstrumentReply,
+    ExecutionCost, Identifier, InstrumentReplacedEvent, ListBarsReply, ListBarsRequest,
+    ListDatasetsReply, ListDatasetsRequest, ListExecutionCostsReply, ListExecutionCostsRequest,
+    ListOutcomesReply, ListOutcomesRequest, ListPricesReply, ListPricesRequest, ListQuotesReply,
+    ListQuotesRequest, ListSourcePrioritiesReply, ListSourcePrioritiesRequest, ListTradesReply,
+    ListTradesRequest, MissingInstrumentDetectedEvent, MissingVenueDetectedEvent,
+    ObservationsWantedEvent, OutcomesRecordedEvent, PluginCatalogue, PluginCatalogueRequest,
+    PluginLaunchState, PriceBasis, PriceKind, PricesRecordedEvent, QuoteCharacteristic,
+    QuotesRecordedEvent, RecordBarsRequest, RecordExecutionCostsRequest, RecordObservationsReply,
+    RecordOutcomesRequest, RecordPricesRequest, RecordQuotesRequest, RecordTradesRequest,
+    ResolveIdentifierReply, ResolveIdentifierRequest, ResolveInstrumentReply,
     ResolveInstrumentRequest, SetSourcePriorityRequest, SourceChoice, SourcePriority,
-    SourceTimeKind, SubjectRef, TradeCharacteristic, TradesRecordedEvent, Unanswered,
+    SourceTimeKind, SubjectRef, TcaBenchmark, TradeCharacteristic, TradesRecordedEvent, Unanswered,
     UnansweredReason, WantWithdrawnEvent, Watermark,
 };
 use meridian_pb::bounds;
@@ -707,17 +706,26 @@ impl Lake {
         if request.costs.is_empty() || request.costs.len() > 500 {
             return Err(invalid(
                 "costs",
-                format!("costs holds {} rows; a batch is 1 to 500", request.costs.len()),
+                format!(
+                    "costs holds {} rows; a batch is 1 to 500",
+                    request.costs.len()
+                ),
             ));
         }
         let mut rows = Vec::with_capacity(request.costs.len());
         for (n, mut cost) in request.costs.into_iter().enumerate() {
             let at = format!("costs[{n}]");
             if cost.execution_id.is_empty() {
-                return Err(invalid(&format!("{at}.execution_id"), "names its execution".into()));
+                return Err(invalid(
+                    &format!("{at}.execution_id"),
+                    "names its execution".into(),
+                ));
             }
             if cost.account_id.is_empty() {
-                return Err(invalid(&format!("{at}.account_id"), "names its account".into()));
+                return Err(invalid(
+                    &format!("{at}.account_id"),
+                    "names its account".into(),
+                ));
             }
             let benchmark = TcaBenchmark::try_from(cost.benchmark)
                 .ok()
@@ -764,7 +772,6 @@ impl Lake {
                 &heads,
                 &[lake::EXECUTION_COST_DATASET.to_string()].into(),
             )),
-            ..Default::default()
         })
     }
 
@@ -794,7 +801,10 @@ impl Lake {
                 return Err(meridian_bus::refusal_with_status(
                     meridian_bus::RefusalStatus::PermissionDenied,
                     &["account_id".to_string()],
-                    format!("account {} is outside this reader's scope", request.account_id),
+                    format!(
+                        "account {} is outside this reader's scope",
+                        request.account_id
+                    ),
                 ));
             }
         }
@@ -833,7 +843,8 @@ impl Lake {
             })
             .filter(|cost| cost.account_id == request.account_id)
             .filter(|cost| {
-                request.execution_ids.is_empty() || request.execution_ids.contains(&cost.execution_id)
+                request.execution_ids.is_empty()
+                    || request.execution_ids.contains(&cost.execution_id)
             })
             .filter(|cost| request.order_id.is_empty() || cost.order_id == request.order_id)
             .filter(|cost| {
@@ -843,7 +854,9 @@ impl Lake {
                         .as_ref()
                         .is_some_and(|meta| meta.business_date == request.trade_date)
             })
-            .filter(|cost| request.benchmarks.is_empty() || request.benchmarks.contains(&cost.benchmark))
+            .filter(|cost| {
+                request.benchmarks.is_empty() || request.benchmarks.contains(&cost.benchmark)
+            })
             .collect();
         costs.sort_by(|a, b| (&a.execution_id, a.benchmark).cmp(&(&b.execution_id, b.benchmark)));
         let next = skip + page;

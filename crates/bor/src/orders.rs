@@ -23,12 +23,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use meridian_domain::exact::Exact;
 use meridian_domain::v1::{
     Alert, AlertKind, AlertState, Allocation, Booking, BookingState, ChangeRequest,
-    ChangeRequestOutcome, Charge, Check, Execution, ExecutionKind, ExecutionState, FinalityLevel, GiveUpRecord,
-    JournalRef, Locate, LocateAnswer, LocateUse, LocateUseKind, Order, OrderCondition,
-    OrderLinkKind, OrderOrigin,
-    OrderQuantities, OrderState, OrderStatus, Placement, PlacementChangeKind, PlacementCondition,
-    PlacementEvent, PlacementQuote, PlacementQuoteOutcome, PlacementState, PlacementStatus,
-    ReportPlacementRequest,
+    ChangeRequestOutcome, Charge, Check, Execution, ExecutionKind, ExecutionState, FinalityLevel,
+    GiveUpRecord, JournalRef, Locate, LocateAnswer, LocateUse, LocateUseKind, Order,
+    OrderCondition, OrderLinkKind, OrderOrigin, OrderQuantities, OrderState, OrderStatus,
+    Placement, PlacementChangeKind, PlacementCondition, PlacementEvent, PlacementQuote,
+    PlacementQuoteOutcome, PlacementState, PlacementStatus, ReportPlacementRequest,
     ReportValueDateRollRequest, SleeveCross, StandingOrderCondition, StandingPlacementCondition,
     TieOutReason, TradingInstruction, UnplacedFact,
 };
@@ -659,7 +658,8 @@ impl Ledger {
                         push_once(&mut touched.orders, &held.placement.order_id);
                     }
                 }
-                Act::PlacementQuoted { placement_id, .. } | Act::QuotePicked { placement_id, .. } => {
+                Act::PlacementQuoted { placement_id, .. }
+                | Act::QuotePicked { placement_id, .. } => {
                     push_once(&mut touched.placements, placement_id);
                 }
                 Act::NetLinked { order_id, .. } => push_once(&mut touched.orders, order_id),

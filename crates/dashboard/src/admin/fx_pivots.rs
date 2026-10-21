@@ -86,7 +86,9 @@ pub async fn codes(bus: &meridian_bus::Bus, ids: &[String]) -> BTreeMap<String, 
 /// finds it: a cash record whose iso4217 identifier is the code.
 pub async fn instrument_of(bus: &meridian_bus::Bus, code: &str) -> Option<String> {
     let code = code.trim().to_ascii_uppercase();
-    let found = crate::admin::instruments::search(bus, &code, 50).await.ok()?;
+    let found = crate::admin::instruments::search(bus, &code, 50)
+        .await
+        .ok()?;
     found
         .instruments
         .iter()
@@ -158,7 +160,10 @@ pub fn lines(
 
 /// The dialog's fields: up to four ISO 4217 codes in order, the first
 /// required, and why.
-pub fn fields(setting: Option<&FxPivotCurrenciesSetting>, codes: &BTreeMap<String, String>) -> String {
+pub fn fields(
+    setting: Option<&FxPivotCurrenciesSetting>,
+    codes: &BTreeMap<String, String>,
+) -> String {
     let held: Vec<String> = match setting {
         Some(setting) if !setting.fx_pivot_currencies.is_empty() => setting
             .fx_pivot_currencies

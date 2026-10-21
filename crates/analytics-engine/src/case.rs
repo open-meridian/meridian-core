@@ -358,7 +358,11 @@ impl Case {
                 valid_at_ns,
                 row_key: text(row, "row_key"),
                 version: integer(row.get("version"), "version")?,
-                source_ns: if source_ns == 0 { valid_at_ns } else { source_ns },
+                source_ns: if source_ns == 0 {
+                    valid_at_ns
+                } else {
+                    source_ns
+                },
             };
             market
                 .entry((price.subject_id.clone(), price.kind.clone()))

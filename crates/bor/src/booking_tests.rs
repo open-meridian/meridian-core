@@ -1158,7 +1158,13 @@ async fn an_open_orders_fill_after_its_record_resolved_lands_on_the_record_it_be
 
 /// A released FX order of EUR against francs in `account`, for value on
 /// `value_date`: its ID.
-async fn fx_released(w: &Wired, account: &str, side: Side, quantity: &str, value_date: &str) -> String {
+async fn fx_released(
+    w: &Wired,
+    account: &str,
+    side: Side,
+    quantity: &str,
+    value_date: &str,
+) -> String {
     let request = ProposeOrderRequest {
         account_id: account.into(),
         instrument_id: EUR.into(),
@@ -1264,11 +1270,17 @@ async fn opposite_fx_orders_net_to_one_order_and_the_offset_is_crossed_internall
     let refused = propose(&w, &net_of(&[buyer.clone(), seller.clone(), later.clone()]))
         .await
         .unwrap_err();
-    assert_eq!(status_of(&refused).unwrap().1, vec!["net_member_order_ids[2]"]);
+    assert_eq!(
+        status_of(&refused).unwrap().1,
+        vec!["net_member_order_ids[2]"]
+    );
     let refused = propose(&w, &net_of(&[buyer.clone(), other_buyer.clone()]))
         .await
         .unwrap_err();
-    assert_eq!(status_of(&refused).unwrap().1, vec!["net_member_order_ids[1]"]);
+    assert_eq!(
+        status_of(&refused).unwrap().1,
+        vec!["net_member_order_ids[1]"]
+    );
     let both = ProposeOrderRequest {
         block_member_order_ids: vec![buyer.clone()],
         ..net_of(&[buyer.clone(), seller.clone()])
@@ -1308,13 +1320,17 @@ async fn opposite_fx_orders_net_to_one_order_and_the_offset_is_crossed_internall
     let mut no_source = fx_execution(&net.order_id, Side::Buy, "6000");
     no_source.cross_rate_source = 0;
     assert_eq!(
-        status_of(&entered(&w, &no_source).await.unwrap_err()).unwrap().1,
+        status_of(&entered(&w, &no_source).await.unwrap_err())
+            .unwrap()
+            .1,
         vec!["cross_rate_source"]
     );
     let mut not_a_net = fx_execution(&buyer, Side::Buy, "6000");
     not_a_net.account_id = FUND1.into();
     assert_eq!(
-        status_of(&entered(&w, &not_a_net).await.unwrap_err()).unwrap().1,
+        status_of(&entered(&w, &not_a_net).await.unwrap_err())
+            .unwrap()
+            .1,
         vec!["order_id"]
     );
     let cross_buy = entered(&w, &fx_execution(&net.order_id, Side::Buy, "6000"))
@@ -1323,10 +1339,16 @@ async fn opposite_fx_orders_net_to_one_order_and_the_offset_is_crossed_internall
     let cross_sell = entered(&w, &fx_execution(&net.order_id, Side::Sell, "6000"))
         .await
         .unwrap();
-    assert_eq!(cross_buy.cross_rate_source, CrossRateSource::NetStreetRate as i32);
+    assert_eq!(
+        cross_buy.cross_rate_source,
+        CrossRateSource::NetStreetRate as i32
+    );
     assert_eq!(cross_sell.side, Side::Sell as i32);
     // The crosses offset; they fill nothing of the net.
-    assert_eq!(read(&quantities(&order_now(&w, &net.order_id)).reported_filled), "0");
+    assert_eq!(
+        read(&quantities(&order_now(&w, &net.order_id)).reported_filled),
+        "0"
+    );
 
     // The net goes to market for 4000.
     let placement = place(&w, &net.order_id, "4000", &anywhere(TRADER))
@@ -1384,7 +1406,7 @@ async fn opposite_fx_orders_net_to_one_order_and_the_offset_is_crossed_internall
     book(
         &w,
         &net.order_id,
-        &[cross_sell.execution_id.clone()],
+        std::slice::from_ref(&cross_sell.execution_id),
         vec![at(FUND2, "6000", "5587.20")],
         true,
     )
@@ -1397,8 +1419,15 @@ async fn opposite_fx_orders_net_to_one_order_and_the_offset_is_crossed_internall
         .filter(|held| held.instrument_id == EUR)
         .map(|held| (held.side, read(&held.trade_date_quantity)))
         .collect();
-    assert_eq!(short, vec![(HoldingSide::Short as i32, "-6000".to_string())]);
+    assert_eq!(
+        short,
+        vec![(HoldingSide::Short as i32, "-6000".to_string())]
+    );
     for member in [&buyer, &seller] {
-        assert_eq!(state(&order_now(&w, member)), OrderState::Filled, "{member}");
+        assert_eq!(
+            state(&order_now(&w, member)),
+            OrderState::Filled,
+            "{member}"
+        );
     }
 }

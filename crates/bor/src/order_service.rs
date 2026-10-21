@@ -27,13 +27,12 @@ use meridian_domain::v1::{
     ListLocatesRequest, ListOrdersReply, ListOrdersRequest, ListTradingInstructionsReply,
     ListTradingInstructionsRequest, LocateReply, LocateUpdatedEvent, OrderHistoryReply,
     OrderHistoryRequest, OrderReply, OrderUpdatedEvent, PickPlacementQuoteRequest, PlacementReply,
-    PlacementUpdatedEvent, ReportPlacementQuoteRequest,
-    ProposeOrderRequest, RecordCheckRequest, RecordLocateRequest, RecordLocateUseRequest,
-    RecordOrderRequest, ReleaseOrderRequest, ReportChargeRequest, ReportExecutionRequest,
-    ReportPlacementRequest, ReportValueDateRollRequest, RequestOrderChangeRequest,
-    RequestPlacementChangeRequest, SetTradingInstructionRequest, SetWorkingConditionRequest,
-    TradingInstructionChangedEvent, TradingInstructionReply, UnplacedFactRecordedEvent,
-    UnplacedReason,
+    PlacementUpdatedEvent, ProposeOrderRequest, RecordCheckRequest, RecordLocateRequest,
+    RecordLocateUseRequest, RecordOrderRequest, ReleaseOrderRequest, ReportChargeRequest,
+    ReportExecutionRequest, ReportPlacementQuoteRequest, ReportPlacementRequest,
+    ReportValueDateRollRequest, RequestOrderChangeRequest, RequestPlacementChangeRequest,
+    SetTradingInstructionRequest, SetWorkingConditionRequest, TradingInstructionChangedEvent,
+    TradingInstructionReply, UnplacedFactRecordedEvent, UnplacedReason,
 };
 use meridian_pb::bounds;
 use prost::Message;

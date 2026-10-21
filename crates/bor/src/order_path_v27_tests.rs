@@ -17,7 +17,11 @@ fn placement(order_id: &str, kind: PlacementType) -> CreatePlacementRequest {
     }
 }
 
-async fn create(w: &Wired, request: &CreatePlacementRequest, from: &As) -> Result<Placement, String> {
+async fn create(
+    w: &Wired,
+    request: &CreatePlacementRequest,
+    from: &As,
+) -> Result<Placement, String> {
     send_from(
         &w.bus,
         CREATE_PLACEMENT,
@@ -26,12 +30,21 @@ async fn create(w: &Wired, request: &CreatePlacementRequest, from: &As) -> Resul
         from,
     )
     .await
-    .map(|reply| PlacementReply::decode(&reply[..]).unwrap().placement.unwrap())
+    .map(|reply| {
+        PlacementReply::decode(&reply[..])
+            .unwrap()
+            .placement
+            .unwrap()
+    })
 }
 
 fn fields(refused: &str) -> Vec<String> {
     let (status, fields) = status_of(refused).unwrap_or_else(|| panic!("{refused}"));
-    assert_eq!(status, meridian_bus::RefusalStatus::InvalidArgument, "{refused}");
+    assert_eq!(
+        status,
+        meridian_bus::RefusalStatus::InvalidArgument,
+        "{refused}"
+    );
     fields
 }
 
@@ -52,7 +65,10 @@ async fn a_placements_type_and_its_fields_agree_or_it_is_refused_naming_the_fiel
     let trader = person(TRADER);
 
     let algo = placement(id, PlacementType::Algo);
-    assert_eq!(fields(&create(&w, &algo, &trader).await.unwrap_err()), vec!["strategy"]);
+    assert_eq!(
+        fields(&create(&w, &algo, &trader).await.unwrap_err()),
+        vec!["strategy"]
+    );
     for kind in [PlacementType::Dma, PlacementType::Care] {
         let with_strategy = CreatePlacementRequest {
             strategy: strategy(),
@@ -137,7 +153,11 @@ async fn a_manual_placement_names_no_connection_and_keeps_its_trade_details() {
         ..by_phone.clone()
     };
     assert_eq!(
-        fields(&create(&w, &missing_counterparty, &no_route).await.unwrap_err()),
+        fields(
+            &create(&w, &missing_counterparty, &no_route)
+                .await
+                .unwrap_err()
+        ),
         vec!["destination"]
     );
     let placed = create(&w, &by_phone, &no_route).await.unwrap();
@@ -177,9 +197,13 @@ async fn an_rfq_order_takes_only_rfq_placements() {
     create(&w, &rfq, &person(TRADER)).await.unwrap();
     // On a limit order, an RFQ placement too.
     let limit = released(&w, "5").await;
-    create(&w, &placement(&limit.order_id, PlacementType::Rfq), &person(TRADER))
-        .await
-        .unwrap();
+    create(
+        &w,
+        &placement(&limit.order_id, PlacementType::Rfq),
+        &person(TRADER),
+    )
+    .await
+    .unwrap();
 }
 
 fn quote(placement_id: &str, dealer: &str, price: &str) -> ReportPlacementQuoteRequest {
@@ -201,7 +225,10 @@ fn quote(placement_id: &str, dealer: &str, price: &str) -> ReportPlacementQuoteR
     }
 }
 
-async fn report_quote(w: &Wired, request: &ReportPlacementQuoteRequest) -> Result<Placement, String> {
+async fn report_quote(
+    w: &Wired,
+    request: &ReportPlacementQuoteRequest,
+) -> Result<Placement, String> {
     send_from(
         &w.bus,
         REPORT_PLACEMENT_QUOTE,
@@ -210,10 +237,20 @@ async fn report_quote(w: &Wired, request: &ReportPlacementQuoteRequest) -> Resul
         &venue(),
     )
     .await
-    .map(|reply| PlacementReply::decode(&reply[..]).unwrap().placement.unwrap())
+    .map(|reply| {
+        PlacementReply::decode(&reply[..])
+            .unwrap()
+            .placement
+            .unwrap()
+    })
 }
 
-async fn pick(w: &Wired, placement_id: &str, quote_id: &str, from: &As) -> Result<Placement, String> {
+async fn pick(
+    w: &Wired,
+    placement_id: &str,
+    quote_id: &str,
+    from: &As,
+) -> Result<Placement, String> {
     send_from(
         &w.bus,
         PICK_PLACEMENT_QUOTE,
@@ -227,7 +264,12 @@ async fn pick(w: &Wired, placement_id: &str, quote_id: &str, from: &As) -> Resul
         from,
     )
     .await
-    .map(|reply| PlacementReply::decode(&reply[..]).unwrap().placement.unwrap())
+    .map(|reply| {
+        PlacementReply::decode(&reply[..])
+            .unwrap()
+            .placement
+            .unwrap()
+    })
 }
 
 fn outcome_of(placement: &Placement, quote_id: &str) -> PlacementQuoteOutcome {
@@ -283,7 +325,8 @@ async fn an_rfq_placements_quotes_are_recorded_and_one_is_picked_at_a_time() {
     assert_eq!(both.quotes.len(), 2);
     let b = both.quotes[1].quote_id.clone();
     assert_eq!(outcome_of(&both, &b), PlacementQuoteOutcome::Open);
-    let event = PlacementUpdatedEvent::decode(&next(&mut heard).await.envelope.payload[..]).unwrap();
+    let event =
+        PlacementUpdatedEvent::decode(&next(&mut heard).await.envelope.payload[..]).unwrap();
     assert_eq!(event.entry.unwrap().kind, "placement-quote-recorded");
 
     // The venue never reports a pick.
@@ -372,9 +415,13 @@ async fn an_rfq_placements_quotes_are_recorded_and_one_is_picked_at_a_time() {
 async fn a_pick_is_held_to_the_agents_guard_and_to_the_quotes_valid_until_time() {
     let w = wired();
     let order = released(&w, "4").await;
-    let rfq = create(&w, &placement(&order.order_id, PlacementType::Rfq), &person(TRADER))
-        .await
-        .unwrap();
+    let rfq = create(
+        &w,
+        &placement(&order.order_id, PlacementType::Rfq),
+        &person(TRADER),
+    )
+    .await
+    .unwrap();
     let short = ReportPlacementQuoteRequest {
         valid_until_ns: NOW - 1,
         ..quote(&rfq.placement_id, "VEN-A", "227.40")
@@ -404,7 +451,10 @@ async fn a_pick_is_held_to_the_agents_guard_and_to_the_quotes_valid_until_time()
     assert_eq!(code(&refused), Some(RefusalReason::AgentLiveOrder));
     let journal = w.store.journal(ACC).unwrap();
     assert_eq!(journal.len(), before + 1, "the refusal is recorded");
-    assert_eq!(journal.last().unwrap().meta.kind, "placement-quote-pick-refused");
+    assert_eq!(
+        journal.last().unwrap().meta.kind,
+        "placement-quote-pick-refused"
+    );
     let demo = As {
         demo: true,
         ..agent
@@ -471,8 +521,7 @@ async fn a_closed_lot_records_its_proceeds_on_each_relief() {
     assert_eq!(relief.relieved_by, lot.relieved_by.last().cloned());
     // A replay of the whole journal folds the same reliefs.
     let partition = lot.relieved_by.last().unwrap().partition.clone();
-    let replayed =
-        crate::Book::replay(ACC, &partition, &w.store.journal(ACC).unwrap()).unwrap();
+    let replayed = crate::Book::replay(ACC, &partition, &w.store.journal(ACC).unwrap()).unwrap();
     let again = replayed
         .positions
         .values()

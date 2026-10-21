@@ -448,7 +448,11 @@ pub fn compute(
                 account_id: account.to_string(),
                 breakdown: group.clone(),
                 scenario: Scenario::of(scenario),
-                value: Some(figure.mul(&rate.to_ratio()).round_half_even(definition.scale)),
+                value: Some(
+                    figure
+                        .mul(&rate.to_ratio())
+                        .round_half_even(definition.scale),
+                ),
                 numerator: None,
                 denominator: None,
                 currency_instrument_id: currency.clone(),

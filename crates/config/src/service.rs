@@ -2092,7 +2092,11 @@ pub fn serve_with(
                         cx.clock.now_ns(),
                     )
                     .map_err(|f| f.to_string())?;
-                tracing::info!(pivots = pivots.join(","), by, "the FX pivot currencies changed");
+                tracing::info!(
+                    pivots = pivots.join(","),
+                    by,
+                    "the FX pivot currencies changed"
+                );
             }
             Ok(fx_pivot_setting(
                 cx.store.fx_pivot_currencies().map_err(|f| f.to_string())?,

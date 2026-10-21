@@ -1050,7 +1050,11 @@ async fn list_execution_costs(app: &App, caller: &Caller, arguments: &Value) -> 
             _ => problems.add(&format!("benchmarks[{i}]"), "a TCA_BENCHMARK_ value"),
         }
     }
-    let page_size = top.get("page_size").and_then(Value::as_u64).unwrap_or(0).min(500) as u32;
+    let page_size = top
+        .get("page_size")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(500) as u32;
     let cursor = text(top, "cursor", "", false, &mut problems);
     if !problems.is_empty() {
         return problems.refusal();
@@ -1060,13 +1064,10 @@ async fn list_execution_costs(app: &App, caller: &Caller, arguments: &Value) -> 
         Err(refusal) => return refusal,
     };
     let reads = access.deployment_admin
-        || access
-            .plugins
-            .keys()
-            .any(|plugin| {
-                let held = access.held(plugin);
-                held.accounts.read.contains(&account_id) || held.accounts.write.contains(&account_id)
-            });
+        || access.plugins.keys().any(|plugin| {
+            let held = access.held(plugin);
+            held.accounts.read.contains(&account_id) || held.accounts.write.contains(&account_id)
+        });
     if !reads {
         return refused(
             "not_permitted",
@@ -1116,7 +1117,8 @@ async fn read_fx_pivot_currencies(app: &App, caller: &Caller) -> Value {
     }
     match crate::admin::fx_pivots::read(&app.bus).await {
         Ok(setting) => {
-            let codes = crate::admin::fx_pivots::codes(&app.bus, &setting.fx_pivot_currencies).await;
+            let codes =
+                crate::admin::fx_pivots::codes(&app.bus, &setting.fx_pivot_currencies).await;
             json!({"outcome": "unchanged", "data": crate::admin::fx_pivots::json(&setting, &codes)})
         }
         Err(failed) => refused("unavailable", &failed, Vec::new()),

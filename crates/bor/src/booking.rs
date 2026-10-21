@@ -102,7 +102,10 @@ pub fn joined_members(order: &meridian_domain::v1::Order) -> Vec<String> {
 /// currency's instrument and quote currency -- and one value date, in no
 /// other live block or net, and both sides named. Answers the net's signed
 /// quantity, buys less sells, and its side, the larger's.
-pub fn net_holds(ctx: &Context, members: &[String]) -> Result<(Exact, i32, String, String, String)> {
+pub fn net_holds(
+    ctx: &Context,
+    members: &[String],
+) -> Result<(Exact, i32, String, String, String)> {
     let mut seen = BTreeSet::new();
     let mut buys = Exact::ZERO;
     let mut sells = Exact::ZERO;
@@ -139,7 +142,9 @@ pub fn net_holds(ctx: &Context, members: &[String]) -> Result<(Exact, i32, Strin
         if view.quote_currency.is_empty() {
             return Err(malformed(
                 &[&field],
-                format!("order {member} names no quote currency: a net joins FX orders of one pair"),
+                format!(
+                    "order {member} names no quote currency: a net joins FX orders of one pair"
+                ),
             ));
         }
         match first {
@@ -150,7 +155,10 @@ pub fn net_holds(ctx: &Context, members: &[String]) -> Result<(Exact, i32, Strin
                 {
                     return Err(malformed(
                         &[&field],
-                        format!("order {member} is of another pair than order {}", first.order_id),
+                        format!(
+                            "order {member} is of another pair than order {}",
+                            first.order_id
+                        ),
                     ));
                 }
                 if view.value_key != first.value_key {
@@ -172,7 +180,10 @@ pub fn net_holds(ctx: &Context, members: &[String]) -> Result<(Exact, i32, Strin
         }
     }
     let Some(first) = first else {
-        return Err(malformed(&["net_member_order_ids"], "a net names its members"));
+        return Err(malformed(
+            &["net_member_order_ids"],
+            "a net names its members",
+        ));
     };
     let one_side = members.iter().all(|member| {
         ctx.members
@@ -187,9 +198,15 @@ pub fn net_holds(ctx: &Context, members: &[String]) -> Result<(Exact, i32, Strin
         ));
     }
     let (quantity, side) = if buys >= sells {
-        (numbers::add("net quantity", buys, sells.negated())?, Side::Buy as i32)
+        (
+            numbers::add("net quantity", buys, sells.negated())?,
+            Side::Buy as i32,
+        )
     } else {
-        (numbers::add("net quantity", sells, buys.negated())?, Side::Sell as i32)
+        (
+            numbers::add("net quantity", sells, buys.negated())?,
+            Side::Sell as i32,
+        )
     };
     Ok((
         quantity,

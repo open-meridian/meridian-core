@@ -21,8 +21,8 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 
 use crate::answer::{
-    Reads, CONVERSION_MISSING, CROSSED, DIRECT, IMPLEMENTATION_UNAVAILABLE, INVERTED,
-    LOCAL_RECORD, NOT_ENTITLED, PRICE_MISSING, PRICE_STALE,
+    Reads, CONVERSION_MISSING, CROSSED, DIRECT, IMPLEMENTATION_UNAVAILABLE, INVERTED, LOCAL_RECORD,
+    NOT_ENTITLED, PRICE_MISSING, PRICE_STALE,
 };
 use crate::case::{Case, CaseError, Price, Result};
 use crate::exact::big::Big;
@@ -153,23 +153,26 @@ fn direct(case: &Case, at: &str, to: &str) -> Option<Leg> {
 /// The lake's rate the other way (`to` priced in `at`), inverted (ruling
 /// 462).
 fn inverted(case: &Case, at: &str, to: &str) -> Option<Leg> {
-    CONVERSION_KINDS.iter().enumerate().find_map(|(rank, kind)| {
-        let price = case.price_in(to, kind, at)?;
-        if price.amount.is_zero() {
-            return None;
-        }
-        Some(Leg {
-            from_id: at.to_string(),
-            to_id: to.to_string(),
-            rate: inverse(&price.amount),
-            derivation: INVERTED,
-            via: String::new(),
-            dataset: price.dataset.clone(),
-            factors: vec![(price.clone(), -1)],
-            subs: Vec::new(),
-            kind_rank: rank,
+    CONVERSION_KINDS
+        .iter()
+        .enumerate()
+        .find_map(|(rank, kind)| {
+            let price = case.price_in(to, kind, at)?;
+            if price.amount.is_zero() {
+                return None;
+            }
+            Some(Leg {
+                from_id: at.to_string(),
+                to_id: to.to_string(),
+                rate: inverse(&price.amount),
+                derivation: INVERTED,
+                via: String::new(),
+                dataset: price.dataset.clone(),
+                factors: vec![(price.clone(), -1)],
+                subs: Vec::new(),
+                kind_rank: rank,
+            })
         })
-    })
 }
 
 /// A fiat leg with no direct rate in the lake's direction: inverted, else
@@ -183,7 +186,8 @@ fn derived(case: &Case, at: &str, to: &str) -> Option<Leg> {
     if let Some(leg) = inverted(case, at, to) {
         return Some(leg);
     }
-    let either = |from: &str, into: &str| direct(case, from, into).or_else(|| inverted(case, from, into));
+    let either =
+        |from: &str, into: &str| direct(case, from, into).or_else(|| inverted(case, from, into));
     for pivot in &case.pivots {
         if pivot == at || pivot == to || !case.fiat(pivot) {
             continue;
@@ -215,7 +219,9 @@ type Chain = (usize, Vec<u8>, Vec<usize>, Vec<String>, Vec<Leg>);
 fn keep(chains: &mut Vec<Chain>, legs: &[Leg]) {
     chains.push((
         counted(legs),
-        legs.iter().map(|leg| derivation_rank(leg.derivation)).collect(),
+        legs.iter()
+            .map(|leg| derivation_rank(leg.derivation))
+            .collect(),
         legs.iter().map(|leg| leg.kind_rank).collect(),
         legs.iter().map(|leg| leg.to_id.clone()).collect(),
         legs.to_vec(),

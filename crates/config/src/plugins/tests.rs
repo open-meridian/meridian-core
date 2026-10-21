@@ -940,22 +940,39 @@ async fn a_pricing_versions_models_are_pricings_each_named_once() {
     let refused = upload(&bus, with(&["pricing"], &[("quoted_price", 0)], "0.1.1"))
         .await
         .unwrap_err();
-    assert!(refused.contains("pricing_models[0].model_version"), "{refused}");
+    assert!(
+        refused.contains("pricing_models[0].model_version"),
+        "{refused}"
+    );
     let refused = upload(
         &bus,
-        with(&["pricing"], &[("quoted_price", 1), ("quoted_price", 1)], "0.1.2"),
+        with(
+            &["pricing"],
+            &[("quoted_price", 1), ("quoted_price", 1)],
+            "0.1.2",
+        ),
     )
     .await
     .unwrap_err();
     assert!(refused.contains("pricing_models[1]"), "{refused}");
     let recorded = upload(
         &bus,
-        with(&["pricing"], &[("quoted_price", 1), ("quoted_price", 2)], "0.1.3"),
+        with(
+            &["pricing"],
+            &[("quoted_price", 1), ("quoted_price", 2)],
+            "0.1.3",
+        ),
     )
     .await
     .unwrap();
     assert_eq!(
-        recorded.metadata.unwrap().declaration.unwrap().pricing_models.len(),
+        recorded
+            .metadata
+            .unwrap()
+            .declaration
+            .unwrap()
+            .pricing_models
+            .len(),
         2
     );
 }
