@@ -45,6 +45,15 @@ receive of TradesRecorded and QuotesRecorded) and serving:
   /quotes?subject=ID         ListQuotes, the latest in force;
   /quotes-wanted?subject=ID  ListQuotes of a subject nothing recorded.
 
+From contract v27 (the rates slice) it declares `rates` -- rates, pulled
+daily in New York -- and serves:
+
+  /rates     resolves SOFR and Treasury's par curve, referential records
+             the platform seeds (W1.1), through the SDK's rates helpers;
+             records SOFR's fixing and the curve's points for one date, a
+             tenor left unpublished making no row, then the fixing revised
+             with a later published time (W10.4).
+
 And from contract v20 (W10.6, W10.9, W3.1):
 
   /latest?subject=ID         ListTrades latest_recorded: its own last trade
@@ -64,7 +73,10 @@ STAND_IN_LAKE=reader serves:
   /datasets                                 the datasets it may read;
   /invalid-date?subject=ID                  a read naming 2026-02-30, sent past
                                             the SDK's own check, as the sidecar
-                                            answers it.
+                                            answers it;
+  /rates?subject=ID&date=D[&tenor=T][&published_as_of=N]
+                                            ListRates (contract v27): its rows and
+                                            what it left unanswered.
 
 The exchange file (STAND_IN_EXCHANGES, a directory holding exchange.json) is
 shaped on a vendor's responses with invented values: candles as
@@ -102,6 +114,7 @@ from meridian import (  # noqa: E402
 )
 from meridian.operations import as_decimal, as_money  # noqa: E402
 from meridian.plugin.v1 import operations_pb2 as ops  # noqa: E402
+from meridian.roles.data import rates as rate_helpers  # noqa: E402
 
 KIND = os.environ.get("STAND_IN_LAKE", "data")
 PORT = 8088
@@ -169,6 +182,16 @@ CATALOGUE = [
         day_end_minute=0,
         venue_id=VENUE,
     ), ["meridian.v1.Trade", "meridian.v1.Quote"]),
+    # Contract v27, the rates slice: a reference rate and a curve.
+    DatasetDeclaration(
+        key="rates",
+        vendor="Federal Reserve",
+        data_types=["meridian.v1.Rate"],
+        modes=["pull", "push"],
+        cadence=86_400,
+        licence_default=DatasetLicence(kept=True, derived_use=True, display=True),
+        day_time_zone="America/New_York",
+    ),
     DatasetDeclaration(
         key="fx",
         vendor="Federal Reserve",
@@ -407,6 +430,37 @@ class Dgm:
         log(late=said)
         return said
 
+    async def rates(self):
+        """Contract v27 (W10.4): SOFR's fixing and Treasury's par curve for
+        one date, through the SDK's rates helpers; then the fixing revised,
+        published later, as the next version of its row key."""
+        feed = rate_helpers.Feed(self.plugin, "lake", day_zone="America/New_York")
+        sofr = await feed.subject(("figi", "BBG00LAKSOFR"),
+                                  description="Secured Overnight Financing Rate",
+                                  instrument_type="interest_rate")
+        par = await feed.subject(("figi", "BBG00LAKUSTP"),
+                                 description="Daily Treasury par yield curve",
+                                 instrument_type="rate_curve")
+        if not sofr or not par:
+            raise RuntimeError(f"a referential record did not resolve: {sofr!r} {par!r}")
+        now = time.time_ns()
+        first, revised = now - 3600 * 10**9, now - 60 * 10**9
+        day = "2026-10-07"
+        fixing = lambda value, published: feed.rate(  # noqa: E731
+            sofr, "rates", "fixing", value, business_date=day, published_ns=published,
+            convention=rate_helpers.MONEY_MARKET, raw_key=f"sofr/{day}")
+        curve = feed.curve(par, "rates", "par_yield",
+                           {"3M": "4.05", "2Y": "3.60", "10Y": "4.12", "20Y": None},
+                           business_date=day, published_ns=first,
+                           convention=rate_helpers.BOND_EQUIVALENT, raw_key=f"par/{day}")
+        done = await self.plugin.record_rates(rates=[fixing("4.31", first)] + curve)
+        again = await self.plugin.record_rates(rates=[fixing("4.32", revised)])
+        said = {"sofr": sofr, "par": par, "recorded": done.recorded,
+                "restated": again.restated, "first_published": first,
+                "revised_published": revised}
+        log(rates=said)
+        return said
+
     async def resolve_as_of(self, query):
         one = lambda name: query.get(name, [""])[0]
         # A security with the name and currency the venue states (from
@@ -466,6 +520,8 @@ class Dgm:
             return await self.identity()
         if path == "/resolve-as-of":
             return await self.resolve_as_of(query)
+        if path == "/rates":
+            return await self.rates()
         if path == "/resolve":
             return await self.resolve()
         if path == "/record":
@@ -535,6 +591,26 @@ class Reader:
                            for u in answer.unanswered],
         }
 
+    async def rates(self, query):
+        """ListRates (contract v27, W10.6)."""
+        one = lambda name, default="": query.get(name, [default])[0]  # noqa: E731
+        answer = await self.plugin.list_rates(
+            subjects=[ops.SubjectRef(entity_id=s) for s in query.get("subject", [])],
+            business_date=one("date"),
+            tenors=[rate_helpers.tenor(t) for t in query.get("tenor", [])],
+            published_as_of_ns=int(one("published_as_of", "0")),
+        )
+        return {
+            "rates": [{"row_key": r.meta.row_key, "version": r.meta.version,
+                       "dataset": r.meta.source.dataset, "kind": ops.RateKind.Name(r.kind),
+                       "value": _amount(r.value.value),
+                       "tenor": rate_helpers.tenor_label(r.tenor) if r.HasField("tenor") else ""}
+                      for r in answer.rates],
+            "unanswered": [{"subject": u.subject.entity_id, "dataset": u.dataset,
+                            "reason": ops.UnansweredReason.Name(u.reason)}
+                           for u in answer.unanswered],
+        }
+
     async def invalid_date(self, query):
         params = ops.ListPricesParams(
             subjects=[ops.SubjectRef(entity_id=s) for s in query.get("subject", [])],
@@ -558,6 +634,8 @@ class Reader:
             return {"datasets": [d.dataset for d in listed.datasets]}
         if path == "/invalid-date":
             return await self.invalid_date(query)
+        if path == "/rates":
+            return await self.rates(query)
         return {"page": "the lake's reading stand-in"}
 
 

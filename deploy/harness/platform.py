@@ -287,6 +287,29 @@ CRYPTO = {
 }
 
 
+# Referential records the platform seeds (contract v27, the rates slice;
+# W1.1): a reference rate and a rate curve, by FIGI, what e2e-lake's rates
+# step records against. Never minted for a deployment's ask.
+REFERENTIAL = {
+    figi: {
+        "instrument_id": instrument_id,
+        "identifiers": [{"scheme": "figi", "value": figi, "source": ""}],
+        "asset_class": "ASSET_CLASS_REFERENTIAL",
+        "instrument_type": instrument_type,
+        "currency": "USD",
+        "description": description,
+        "lifecycle_state": "INSTRUMENT_LIFECYCLE_STATE_ACTIVE",
+        "version": 1,
+    }
+    for figi, instrument_id, instrument_type, description in (
+        ("BBG00LAKSOFR", f"INS-01JSOFR{'0' * 18}1", "interest_rate",
+         "Secured Overnight Financing Rate"),
+        ("BBG00LAKUSTP", f"INS-01JUSTP{'0' * 18}1", "rate_curve",
+         "Daily Treasury par yield curve"),
+    )
+}
+
+
 def calendars_for(one, many):
     """The seed answer to a pull by its one subject; versions after
     `after_version` only, on a refresh."""
@@ -471,7 +494,8 @@ def held_instrument(instrument_id):
     return (instrument_id in {r["instrument_id"] for r in EVENT_CONTRACTS.values()}
             or instrument_id in {r["instrument_id"] for r in MINTED.values()}
             or instrument_id in {r["instrument_id"] for r in EQUITIES.values()}
-            or instrument_id in {r["instrument_id"] for r in CRYPTO.values()})
+            or instrument_id in {r["instrument_id"] for r in CRYPTO.values()}
+            or instrument_id in {r["instrument_id"] for r in REFERENTIAL.values()})
 
 
 def event_group(asked):
@@ -532,6 +556,9 @@ def match_or_mint(asked):
             break
         if scheme == "caip19" and value in CRYPTO:
             answer = {"minted": False, "instrument": CRYPTO[value]}
+            break
+        if scheme == "figi" and value in REFERENTIAL:
+            answer = {"minted": False, "instrument": REFERENTIAL[value]}
             break
         if scheme == "iso4217" and value.upper() in NAMES:
             answer = {"minted": False, "instrument": record(value.upper())}

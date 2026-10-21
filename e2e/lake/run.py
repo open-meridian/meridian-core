@@ -56,6 +56,13 @@ harness's admin, Ben, who holds read on `book`.
    and `coin` records it against the want; the platform then confirms it
    and a person's ask resolves it to its INS- record, which `book` reads the
    LCL- row through (the replacement followed).
+14. Contract v27 (the rates slice; W10.4 to W10.6): `coin` resolves SOFR and
+   Treasury's par curve, referential records the platform seeds, and
+   records SOFR's fixing and the curve's points for a date, the 20-year
+   point unpublished, then the fixing revised; `book`, entitled to
+   `coin:rates`, reads the curve for the date (one row per tenor), the
+   20-year point as source silent, the fixing at version 2, and the
+   fixing as published before the revision at version 1.
 
 `make e2e-recorded` runs the same with STAND_IN_EXCHANGES naming RECORDED, a
 developer's recorded exchanges (plans/the-lake-prices-the-book, Q11).
@@ -506,6 +513,32 @@ def run():
     must(followed[0]["amount"] and followed[0]["version"] == 1,
          f"step 13, the LCL- row read through the INS- record: {followed}")
 
+    # 14. Contract v27, the rates slice: a fixing and a curve, revised, read
+    # point in time by published time.
+    runner("entitle", "--instance", "book", "coin:rates", "note=The book reads rates.")
+    rated = page("coin", "admin", "/rates")
+    must(rated["recorded"] == 4 and rated["restated"] == 1,
+         f"step 14, the fixing and three curve points recorded, the fixing revised: {rated}")
+    par, sofr = rated["par"], rated["sofr"]
+    must(par.startswith("INS-") and sofr.startswith("INS-"),
+         f"step 14, the platform's referential records: {rated}")
+    curve = until(60, lambda: (lambda said: said if len(said["rates"]) == 3 else None)(
+        page("book", "read", f"/rates?subject={par}&date={DAY_0}")),
+        "step 14, book did not read the curve's three points")
+    must(sorted(r["tenor"] for r in curve["rates"]) == ["10Y", "2Y", "3M"],
+         f"step 14, one row per tenor published: {curve}")
+    silent = page("book", "read", f"/rates?subject={par}&date={DAY_0}&tenor=20Y")
+    must(not silent["rates"] and any(u["reason"] == "UNANSWERED_REASON_SOURCE_SILENT"
+                                     for u in silent["unanswered"]),
+         f"step 14, a tenor not published is source silent, never zero: {silent}")
+    fixing = page("book", "read", f"/rates?subject={sofr}&date={DAY_0}")["rates"]
+    must(len(fixing) == 1 and fixing[0]["value"] == "4.32" and fixing[0]["version"] == 2,
+         f"step 14, the fixing at its revision: {fixing}")
+    published = page("book", "read", f"/rates?subject={sofr}&date={DAY_0}"
+                     f"&published_as_of={rated['first_published'] + 1}")["rates"]
+    must(len(published) == 1 and published[0]["value"] == "4.31" and published[0]["version"] == 1,
+         f"step 14, the fixing as published before the revision: {published}")
+
     # 11. The store.
     lines = compose("run", "--rm", "-T", "store", "lake").stdout.split("\n")
     log("store lake:\n" + "\n".join(lines))
@@ -524,6 +557,10 @@ def run():
     must(any(line.startswith("want|coin:ticks|withdrawn|") for line in lines),
          f"step 8, the standing want withdrawn: {lines}")
     must("priority|meridian.v1.Price|1|2" in lines, f"step 8, the priority's two changes: {lines}")
+    rate_rows = [line.split("|") for line in lines if line.startswith("row|coin:rates|rate|")]
+    fixing_versions = sorted(row[5] for row in rate_rows if row[6] == sofr)
+    must(len(rate_rows) == 5 and fixing_versions == ["1", "2"],
+         f"step 14, the curve's three points and the fixing's two versions kept: {rate_rows}")
     live_rows = [line.split("|") for line in lines if line.startswith("row|coin:live|")]
     live_sequences = sorted(int(row[3]) for row in live_rows)
     must(live_sequences == list(range(1, len(live_sequences) + 1)) and len(live_sequences) > 8,
@@ -547,7 +584,9 @@ def run():
           "a reader refused it, and its own datasets' licences; a currency the deployment did not "
           "hold pulled from the master and kept, found and not minted; a provisional record wanted "
           "of its data plugin, recorded against the want and read through the INS- record it "
-          "became; and `store lake` printing each version numbered with no "
+          "became; a fixing and a curve recorded against referential records, read "
+          "as a curve, a tenor not published as source silent, and the fixing as published "
+          "before its revision; and `store lake` printing each version numbered with no "
           "holes, the want and the priority's changes")
 
 
