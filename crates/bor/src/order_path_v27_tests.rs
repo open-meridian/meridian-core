@@ -412,3 +412,77 @@ async fn a_pick_is_held_to_the_agents_guard_and_to_the_quotes_valid_until_time()
     let picked = pick(&w, &rfq.placement_id, &fresh, &demo).await.unwrap();
     assert_eq!(picked.picked_quote_id, fresh);
 }
+
+/// W9.10 (rulings 320 and 396): a sale relieves the lot it closes, the
+/// relief recording what the quantity relieved was sold for and the trade
+/// date; the journal replays to the same reliefs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_closed_lot_records_its_proceeds_on_each_relief() {
+    let w = wired();
+    let bought = released(&w, "10").await;
+    let placement = place(&w, &bought.order_id, "10", &person(TRADER))
+        .await
+        .unwrap()
+        .placement
+        .unwrap();
+    execute(&w, &fill(&placement.placement_id, "10", "BUY:10"))
+        .await
+        .unwrap();
+
+    let sale = ProposeOrderRequest {
+        side: Side::Sell as i32,
+        ..buy("4")
+    };
+    let order = propose(&w, &sale).await.unwrap();
+    release(&w, &order.order_id).await.unwrap();
+    let placement = place(&w, &order.order_id, "4", &person(TRADER))
+        .await
+        .unwrap()
+        .placement
+        .unwrap();
+    let mut sold = fill(&placement.placement_id, "4", "SELL:4");
+    sold.price = usd("230.15");
+    sold.trade_date = "2026-10-14".into();
+    sold.computed_settlement_date = "2026-10-15".into();
+    execute(&w, &sold).await.unwrap();
+
+    let lots = |w: &Wired| {
+        w.store
+            .book(ACC)
+            .unwrap()
+            .positions
+            .values()
+            .find(|held| held.instrument_id == AAPL && held.side == HoldingSide::Long as i32)
+            .unwrap()
+            .lots
+            .values()
+            .map(|state| state.lot.clone())
+            .collect::<Vec<_>>()
+    };
+    let held = lots(&w);
+    assert_eq!(held.len(), 1);
+    let lot = &held[0];
+    assert_eq!(read(&lot.open_quantity), "6");
+    assert_eq!(lot.reliefs.len(), 1);
+    let relief = &lot.reliefs[0];
+    assert_eq!(read(&relief.quantity), "4");
+    assert_eq!(read(&relief.proceeds.as_ref().unwrap().amount), "920.60");
+    assert_eq!(relief.trade_date, "2026-10-14");
+    assert_eq!(relief.relieved_by, lot.relieved_by.last().cloned());
+    // A replay of the whole journal folds the same reliefs.
+    let partition = lot.relieved_by.last().unwrap().partition.clone();
+    let replayed =
+        crate::Book::replay(ACC, &partition, &w.store.journal(ACC).unwrap()).unwrap();
+    let again = replayed
+        .positions
+        .values()
+        .find(|held| held.instrument_id == AAPL && held.side == HoldingSide::Long as i32)
+        .unwrap()
+        .lots
+        .values()
+        .next()
+        .unwrap()
+        .lot
+        .clone();
+    assert_eq!(again.reliefs, lot.reliefs);
+}
