@@ -120,6 +120,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/sign-out", post(sign_out))
         .route("/mode", get(mode))
         .route("/.meridian/ui/{*file}", get(kit))
+        .route(crate::html::ACTS_PATH, get(acts))
         .route("/favicon.ico", get(icon))
         .route("/favicon.svg", get(icon))
         .route("/favicon-32.png", get(icon))
@@ -177,6 +178,22 @@ async fn framed_only_here(mut response: Response) -> Response {
 }
 
 /// The Open Meridian icon, on the dashboard's own host ([`crate::brand`]).
+/// The chrome's popovers and destructive-act dialogs (351's audit), one
+/// script every page names, the same for everyone.
+async fn acts() -> Response {
+    (
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/javascript; charset=utf-8",
+            ),
+            (axum::http::header::CACHE_CONTROL, "public, max-age=300"),
+        ],
+        crate::html::ACTS_SCRIPT,
+    )
+        .into_response()
+}
+
 async fn icon(request: axum::extract::Request) -> Response {
     crate::brand::serve(request.method(), request.uri().path())
 }

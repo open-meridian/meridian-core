@@ -527,11 +527,13 @@ fn version_row(
     }
     if instances.is_empty() {
         acts.push(format!(
-            "<form method=\"post\" action=\"{PLUGINS_PATH}/retire\" class=\"inline-act\">{token}\
-             {n}{ver}<input type=\"text\" name=\"note\" required maxlength=\"2000\" placeholder=\"Why\" aria-label=\"Why\">\
-             <button type=\"submit\">Retire</button></form>",
+            "<form method=\"post\" action=\"{PLUGINS_PATH}/retire\" class=\"inline-act\" \
+             data-confirm=\"Retire {said} {sv}? Nothing can launch it again until it is uploaded again.\">{token}\
+             {n}{ver}<button type=\"submit\">Retire</button></form>",
             n = hidden("name", name),
             ver = hidden("version", &v),
+            said = escape(name),
+            sv = escape(&v),
         ));
     }
     let wants = version

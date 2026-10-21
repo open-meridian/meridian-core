@@ -324,6 +324,9 @@ dialog::backdrop{background:var(--backdrop)}\
 .dialog-head{padding:1rem 1.25rem .25rem}.dialog-head h2{margin:0}.dialog-body{padding:.5rem 1.25rem}\
 .dialog-foot{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:.5rem;padding:.75rem 1.25rem;border-top:1px solid var(--line-soft)}\
 .dialog-foot button{margin:0}\
+.menu-pop>button.menu-close,header.bar .menu-pop>button.menu-close{display:block;width:auto;margin:0 0 .15rem auto;\
+padding:.05rem .45rem;border:0;background:none;font-size:1.15rem;line-height:1;color:var(--ink-faint)}\
+.menu-pop>button.menu-close:hover{color:var(--ink);background:var(--hover)}\
 fieldset.checks{border:1px solid var(--line);border-radius:var(--radius);padding:.5rem .75rem;margin:0 0 .9rem;\
 max-height:14rem;overflow:auto}fieldset.checks legend{font-size:.84rem;font-weight:550;padding:0 .25rem}\
 fieldset.checks label{margin:.25rem 0}\
@@ -1151,6 +1154,113 @@ pub enum Report<'a> {
     Omitted,
 }
 
+/// Popovers and destructive acts (351's audit), served apart at
+/// [`ACTS_PATH`] so every page carries one line of it, cached. A menu closes
+/// on its ×, on Escape (its summary taking the focus back) and on a press
+/// outside it, one open closing the others. A form or a button carrying
+/// `data-confirm` asks in a dialog -- what it does, a "Why" the act keeps as
+/// its `note`, the act's own button and a Cancel -- and nothing posts until
+/// the act is pressed there. Built from elements, never markup.
+pub const ACTS_SCRIPT: &str = r#"(function () {
+  function el(tag, attrs, text) {
+    var e = document.createElement(tag);
+    Object.keys(attrs || {}).forEach(function (k) { e.setAttribute(k, attrs[k]); });
+    if (text) e.textContent = text;
+    return e;
+  }
+  var menus = Array.prototype.slice.call(document.querySelectorAll("details.menu"));
+  function shut(menu, focus) {
+    if (!menu.open) return;
+    menu.open = false;
+    var summary = menu.querySelector("summary");
+    if (focus && summary) summary.focus();
+  }
+  menus.forEach(function (menu) {
+    var pop = menu.querySelector(".menu-pop");
+    if (pop && !pop.querySelector(".menu-close")) {
+      var close = el("button", { type: "button", "class": "menu-close", "aria-label": "Close" }, "×");
+      close.addEventListener("click", function () { shut(menu, true); });
+      pop.insertBefore(close, pop.firstChild);
+    }
+    menu.addEventListener("toggle", function () {
+      if (menu.open) menus.forEach(function (other) { if (other !== menu) shut(other, false); });
+    });
+  });
+  document.addEventListener("keydown", function (event) {
+    if (event.key === "Escape") menus.forEach(function (menu) { shut(menu, true); });
+  });
+  document.addEventListener("click", function (event) {
+    menus.forEach(function (menu) { if (!menu.contains(event.target)) shut(menu, false); });
+  });
+  var asking = null, dialog = null, title, said, why, act;
+  function confirmer() {
+    if (dialog) return dialog;
+    dialog = el("dialog", { id: "om-confirm", "aria-labelledby": "om-confirm-title" });
+    var form = el("form", { method: "dialog" });
+    var head = el("div", { "class": "dialog-head" });
+    title = el("h2", { id: "om-confirm-title" });
+    head.appendChild(title);
+    var body = el("div", { "class": "dialog-body" });
+    said = el("p", { "data-confirm-said": "" });
+    var label = el("label", {}, "Why");
+    why = el("textarea", { name: "why", rows: "2", maxlength: "2000", required: "" });
+    label.appendChild(why);
+    body.appendChild(said);
+    body.appendChild(label);
+    var foot = el("div", { "class": "dialog-foot" });
+    var cancel = el("button", { type: "button", "data-confirm-cancel": "" }, "Cancel");
+    act = el("button", { type: "submit", "class": "danger", "data-confirm-act": "" });
+    foot.appendChild(cancel);
+    foot.appendChild(act);
+    form.appendChild(head);
+    form.appendChild(body);
+    form.appendChild(foot);
+    dialog.appendChild(form);
+    document.body.appendChild(dialog);
+    cancel.addEventListener("click", function () { asking = null; dialog.close(); });
+    dialog.addEventListener("close", function () { asking = null; });
+    form.addEventListener("submit", function (event) {
+      event.preventDefault();
+      var given = why.value.trim();
+      if (!given || !asking) return;
+      var held = asking;
+      asking = null;
+      dialog.close();
+      var note = held.form.querySelector("[name=note]");
+      if (!note) {
+        note = el("input", { type: "hidden", name: "note" });
+        held.form.appendChild(note);
+      }
+      note.value = given;
+      held.form.setAttribute("data-confirmed", "");
+      if (held.submitter && held.form.requestSubmit) held.form.requestSubmit(held.submitter);
+      else held.form.submit();
+    });
+    return dialog;
+  }
+  document.addEventListener("submit", function (event) {
+    var form = event.target;
+    var submitter = event.submitter || null;
+    var asked = (submitter && submitter.getAttribute("data-confirm")) || form.getAttribute("data-confirm");
+    if (!asked) return;
+    if (form.hasAttribute("data-confirmed")) { form.removeAttribute("data-confirmed"); return; }
+    event.preventDefault();
+    confirmer();
+    asking = { form: form, submitter: submitter };
+    var named = (submitter && submitter.textContent.trim()) || "Confirm";
+    title.textContent = named;
+    act.textContent = named;
+    said.textContent = asked;
+    var existing = form.querySelector("[name=note]");
+    why.value = existing ? existing.value : "";
+    dialog.showModal();
+    why.focus();
+  }, true);
+})();"#;
+
+/// Where [`ACTS_SCRIPT`] is served.
+pub const ACTS_PATH: &str = "/acts.js";
+
 /// The Inbox's count in the header, read again every 30 seconds while the
 /// page is open (W6.24, requirement 36): a poll, never a stream.
 const INBOX_SCRIPT: &str = r#"(function () {
@@ -1267,7 +1377,7 @@ fn document(title: &str, body: &str, chrome: &Chrome, development: bool) -> Stri
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <meta name=\"color-scheme\" content=\"light dark\">\
          <title>{} · Open Meridian</title>{icon}<script>{HEAD_SCRIPT}</script>{kit}<style>{STYLE}{docs}{plugin_tables}</style></head><body>\n\
-         {}\n{banner}\n<main class=\"{main}\">\n{}\n</main>\n<script>{CHROME_SCRIPT}</script>{inbox}\n</body></html>\n",
+         {}\n{banner}\n<main class=\"{main}\">\n{}\n</main>\n<script>{CHROME_SCRIPT}</script><script src=\"{ACTS_PATH}\" defer></script>{inbox}\n</body></html>\n",
         escape(title),
         header(chrome),
         body,

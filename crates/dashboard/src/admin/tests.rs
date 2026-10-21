@@ -3192,8 +3192,8 @@ fn an_optional_secret_is_removed_by_its_own_small_form_and_nothing_else_is_sent(
     // The settings form posted as it stands, its secrets empty, sends nothing.
     let main = between(&form, "data-settings>", "</form>");
     assert_eq!(settings::request(&record, &submitted(main), false), None);
-    // The script asks before a Remove posts.
-    assert!(form.contains("indexOf(\"remove-\") === 0 && !window.confirm(asking)"));
+    // A Remove asks first, in the chrome's dialog (351's audit).
+    assert!(form.contains("data-confirm=\"Remove "), "{form}");
 }
 
 /// Contract v26 (W4.5, W4.8): the Summary's model tokens, per endpoint,

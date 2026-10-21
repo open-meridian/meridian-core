@@ -1430,12 +1430,7 @@ pub(super) const SCRIPT_END: &str = r##"
     if (closer) { closer.closest("dialog").close(); return; }
     if (event.target.tagName === "DIALOG") event.target.close();
   });
-  document.addEventListener("submit", function (event) {
-    var form = event.target;
-    if (form.hasAttribute("data-confirm") && !window.confirm(form.getAttribute("data-confirm"))) {
-      event.preventDefault();
-    }
-  });
+  // A form's data-confirm asks in the chrome's dialog (html.rs).
 })();"##;
 
 /// What still holds an account (approved 2026-10-14): a plugin's link of an
