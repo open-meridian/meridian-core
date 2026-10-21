@@ -308,6 +308,17 @@ pub trait Store: Send + Sync {
     fn closed_day_counts(&self) -> Result<BTreeMap<String, (u64, u64)>>;
 
     fn configuration(&self) -> Result<Option<EntitlementsChangedEvent>>;
+
+    /// Every row of one dataset and data type, each row key at its version
+    /// as of a recorded time (0 for now), whatever its subject: how the
+    /// account-scoped execution costs are read (contract v27, W10.11), their
+    /// subject the execution's instrument, which a reader does not name.
+    fn read_dataset(
+        &self,
+        dataset: &str,
+        data_type: DataType,
+        as_of_ns: i64,
+    ) -> Result<Vec<Observation>>;
 }
 
 /// Whether a query answers every version it finds, not each row key's

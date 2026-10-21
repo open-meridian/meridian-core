@@ -31,6 +31,15 @@ pub const QUOTE: &str = "meridian.v1.Quote";
 /// An event contract's outcome at one stage (contract v23, the lake's 1c).
 pub const OUTCOME: &str = "meridian.v1.Outcome";
 
+/// One execution's cost against one benchmark (contract v27, W10.11): the
+/// analytics component's row, in its own dataset, never a catalogue's.
+pub const EXECUTION_COST: &str = "meridian.v1.ExecutionCost";
+/// The dataset execution costs are recorded in (W10.11; ruling 481): the
+/// analytics component's, which no catalogue declares.
+pub const EXECUTION_COST_DATASET: &str = "analytics:execution_cost";
+/// The instance an execution cost's source names: the component.
+pub const ANALYTICS_INSTANCE: &str = "analytics";
+
 /// The lake's data types: the 1a's, the 1b's from contract v19, and the
 /// 1c's outcome from contract v23.
 pub const DATA_TYPES: [&str; 5] = [PRICE, BAR, TRADE, QUOTE, OUTCOME];

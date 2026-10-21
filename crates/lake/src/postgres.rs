@@ -720,6 +720,30 @@ impl Store for PostgresStore {
         Ok(first.zip(last))
     }
 
+    fn read_dataset(
+        &self,
+        dataset: &str,
+        data_type: crate::row::DataType,
+        as_of_ns: i64,
+    ) -> Result<Vec<Observation>> {
+        let cut_off = if as_of_ns == 0 { i64::MAX } else { as_of_ns };
+        let rows = self
+            .conn()?
+            .query(
+                "SELECT body FROM lake_row
+                  WHERE dataset = $1 AND data_type = $2 AND recorded_at_ns <= $3
+                  ORDER BY sequence",
+                &[&dataset, &data_type.code(), &cut_off],
+            )
+            .map_err(unavailable)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let body: Vec<u8> = row.get(0);
+            out.push(Observation::decode(data_type, &body).map_err(unreadable)?);
+        }
+        Ok(as_of(out, as_of_ns))
+    }
+
     fn dated_on(&self, dataset: &str, dates: &[String]) -> Result<Vec<Observation>> {
         let mut conn = self.conn()?;
         let mut tx = conn

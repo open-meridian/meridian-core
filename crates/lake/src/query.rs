@@ -103,6 +103,8 @@ fn keep_named(row: &mut Observation, named: &BTreeSet<String>) {
         Observation::Outcome(outcome) => {
             lake::strip_outcome(outcome, named);
         }
+        // Never a QueryLake kind: read by ListExecutionCosts alone.
+        Observation::ExecutionCost(_) => {}
     }
 }
 
@@ -414,6 +416,7 @@ impl Lake {
                 Observation::Trade(trade) => reply.trades.push(trade),
                 Observation::Quote(quote) => reply.quotes.push(quote),
                 Observation::Outcome(outcome) => reply.outcomes.push(outcome),
+                Observation::ExecutionCost(_) => {}
             }
         }
         Ok(reply)

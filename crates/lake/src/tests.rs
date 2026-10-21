@@ -2135,3 +2135,115 @@ fn a_jobs_read_is_the_clients_and_the_field_is_the_analytics_components_alone() 
         crate::config::Reader::Plugin(crate::service::ANALYTICS.into())
     );
 }
+
+/// Contract v27 (W10.11; ruling 481): execution costs are the analytics
+/// component's alone to record, keyed by execution and benchmark -- the same
+/// value a repeat, another the next version -- and read for one account,
+/// within the reader's scope, by execution, order, trade date or benchmark.
+#[tokio::test(flavor = "multi_thread")]
+async fn execution_costs_are_the_components_rows_read_within_the_readers_account_scope() {
+    use meridian_domain::v1::{
+        ExecutionCost, ListExecutionCostsRequest, RecordExecutionCostsRequest, TcaBenchmark,
+    };
+    let h = harness();
+    let cost = |execution: &str, account: &str, benchmark: TcaBenchmark, bps: &str| ExecutionCost {
+        meta: Some(ObservationMeta {
+            subjects: vec![SubjectRef {
+                entity_id: BTC.into(),
+            }],
+            business_date: "2026-10-07".into(),
+            valid_from_ns: NOW,
+            ..Default::default()
+        }),
+        execution_id: execution.into(),
+        order_id: format!("ORD-{execution}"),
+        account_id: account.into(),
+        benchmark: benchmark as i32,
+        benchmark_price: money("62000.00", "USD", ""),
+        execution_price: money("62010.00", "USD", ""),
+        notional: money("62010.00", "USD", ""),
+        cost_bps: decimal(bps),
+        ..Default::default()
+    };
+    let batch = RecordExecutionCostsRequest {
+        costs: vec![
+            cost("EXE-1", "ACC-1", TcaBenchmark::Arrival, "1.6129"),
+            cost("EXE-1", "ACC-1", TcaBenchmark::MidAtFill, "1.6129"),
+            cost("EXE-2", "ACC-2", TcaBenchmark::Arrival, "1.6129"),
+        ],
+    };
+    // Not the component: refused.
+    let refused = h
+        .lake
+        .record_execution_costs(batch.clone(), &envelope("reporting-1", true, ""))
+        .unwrap_err();
+    assert!(refused.contains("analytics component"), "{refused}");
+    let done = h
+        .lake
+        .record_execution_costs(batch.clone(), &envelope(service::ANALYTICS, false, ""))
+        .unwrap();
+    assert_eq!(done.recorded, 3);
+    let again = h
+        .lake
+        .record_execution_costs(batch, &envelope(service::ANALYTICS, false, ""))
+        .unwrap();
+    assert_eq!((again.recorded, again.unchanged), (0, 3), "a repeat");
+    let changed = cost("EXE-1", "ACC-1", TcaBenchmark::Arrival, "2.0000");
+    let restated = h
+        .lake
+        .record_execution_costs(
+            RecordExecutionCostsRequest {
+                costs: vec![changed],
+            },
+            &envelope(service::ANALYTICS, false, ""),
+        )
+        .unwrap();
+    assert_eq!(restated.restated, 1, "another value is the next version");
+
+    let mut scoped = envelope("reporting-1", true, "");
+    scoped.meta.as_mut().unwrap().account_scope = vec!["ACC-1".into()];
+    let read = h
+        .lake
+        .list_execution_costs(
+            ListExecutionCostsRequest {
+                account_id: "ACC-1".into(),
+                ..Default::default()
+            },
+            &scoped,
+        )
+        .unwrap();
+    assert_eq!(read.costs.len(), 2, "ACC-1's rows alone");
+    assert!(read.costs.iter().all(|c| c.account_id == "ACC-1"));
+    let arrival = read
+        .costs
+        .iter()
+        .find(|c| c.benchmark == TcaBenchmark::Arrival as i32)
+        .unwrap();
+    assert_eq!(arrival.meta.as_ref().unwrap().version, 2);
+    let one = h
+        .lake
+        .list_execution_costs(
+            ListExecutionCostsRequest {
+                account_id: "ACC-1".into(),
+                benchmarks: vec![TcaBenchmark::MidAtFill as i32],
+                trade_date: "2026-10-07".into(),
+                ..Default::default()
+            },
+            &scoped,
+        )
+        .unwrap();
+    assert_eq!(one.costs.len(), 1);
+    let outside = h
+        .lake
+        .list_execution_costs(
+            ListExecutionCostsRequest {
+                account_id: "ACC-2".into(),
+                ..Default::default()
+            },
+            &scoped,
+        )
+        .unwrap_err();
+    let (status, fields, _) = meridian_bus::read_refusal_status(&outside).unwrap();
+    assert_eq!(status, meridian_bus::RefusalStatus::PermissionDenied);
+    assert_eq!(fields, vec!["account_id".to_string()]);
+}

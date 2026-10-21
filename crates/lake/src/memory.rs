@@ -347,6 +347,22 @@ impl Store for MemoryStore {
         })
     }
 
+    fn read_dataset(
+        &self,
+        dataset: &str,
+        data_type: crate::row::DataType,
+        as_of_ns: i64,
+    ) -> Result<Vec<Observation>> {
+        let held = self.lock();
+        let rows = held
+            .rows
+            .iter()
+            .filter(|row| row.dataset() == dataset && row.data_type() == data_type)
+            .cloned()
+            .collect::<Vec<_>>();
+        Ok(as_of(rows, as_of_ns))
+    }
+
     fn dated_on(&self, dataset: &str, dates: &[String]) -> Result<Vec<Observation>> {
         let held = self.lock();
         let mut rows: Vec<Observation> = held

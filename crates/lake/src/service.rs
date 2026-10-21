@@ -36,6 +36,8 @@ use meridian_domain::money::{asset_of, Asset, CashInstruments, ISO4217};
 use meridian_domain::v1::PartitionSequence;
 use meridian_domain::v1::{
     BarsRecordedEvent, DatasetRef, DeclineWantReply, DeclineWantRequest, EntitlementsChangedEvent,
+    ExecutionCost, ListExecutionCostsReply, ListExecutionCostsRequest, RecordExecutionCostsRequest,
+    TcaBenchmark,
     Identifier, InstrumentReplacedEvent, ListBarsReply, ListBarsRequest, ListDatasetsReply,
     ListDatasetsRequest, ListOutcomesReply, ListOutcomesRequest, ListPricesReply,
     ListPricesRequest, ListQuotesReply, ListQuotesRequest, ListSourcePrioritiesReply,
@@ -74,6 +76,9 @@ pub const LIST_TRADES: &str = "platform.lake.query.list-trades";
 pub const LIST_QUOTES: &str = "platform.lake.query.list-quotes";
 pub const LIST_OUTCOMES: &str = "platform.lake.query.list-outcomes";
 pub const LIST_DATASETS: &str = "platform.lake.query.list-datasets";
+// Contract v27 (W10.11): execution costs, the analytics component's rows.
+pub const RECORD_EXECUTION_COSTS: &str = "platform.lake.command.record-execution-costs";
+pub const LIST_EXECUTION_COSTS: &str = "platform.lake.query.list-execution-costs";
 pub const LIST_SOURCE_PRIORITIES: &str = "platform.lake.query.list-source-priorities";
 pub const OBSERVATIONS_WANTED: &str = "platform.lake.event.observations-wanted";
 pub const WANT_WITHDRAWN: &str = "platform.lake.event.want-withdrawn";
@@ -97,6 +102,8 @@ pub fn recorded_topic(dataset: &str, data_type: DataType) -> String {
         DataType::Trade => format!("platform.lake.{dataset}.event.trades-recorded"),
         DataType::Quote => format!("platform.lake.{dataset}.event.quotes-recorded"),
         DataType::Outcome => format!("platform.lake.{dataset}.event.outcomes-recorded"),
+        // Never published: read within each reader's account scope (W10.11).
+        DataType::ExecutionCost => String::new(),
     }
 }
 
@@ -672,6 +679,179 @@ impl Lake {
         Ok(reply)
     }
 
+    /// W10.11 (contract v27; ruling 481): execution costs, the analytics
+    /// component's alone, recorded whole or refused naming the row and
+    /// field, in the dataset `analytics:execution_cost`, which no catalogue
+    /// declares. Each row is keyed by execution and benchmark: the same
+    /// value again a repeat, a different one the next version. Never
+    /// published: a reader reads them within its account scope.
+    pub(crate) fn record_execution_costs(
+        &self,
+        request: RecordExecutionCostsRequest,
+        envelope: &Envelope,
+    ) -> Result<RecordObservationsReply, String> {
+        let invalid = |field: &str, words: String| {
+            meridian_bus::refusal_with_status(
+                meridian_bus::RefusalStatus::InvalidArgument,
+                &[field.to_string()],
+                words,
+            )
+        };
+        if publisher(envelope) != analytics_instance() {
+            return Err(meridian_bus::refusal_with_status(
+                meridian_bus::RefusalStatus::PermissionDenied,
+                &[],
+                "execution costs are the analytics component's alone to record",
+            ));
+        }
+        if request.costs.is_empty() || request.costs.len() > 500 {
+            return Err(invalid(
+                "costs",
+                format!("costs holds {} rows; a batch is 1 to 500", request.costs.len()),
+            ));
+        }
+        let mut rows = Vec::with_capacity(request.costs.len());
+        for (n, mut cost) in request.costs.into_iter().enumerate() {
+            let at = format!("costs[{n}]");
+            if cost.execution_id.is_empty() {
+                return Err(invalid(&format!("{at}.execution_id"), "names its execution".into()));
+            }
+            if cost.account_id.is_empty() {
+                return Err(invalid(&format!("{at}.account_id"), "names its account".into()));
+            }
+            let benchmark = TcaBenchmark::try_from(cost.benchmark)
+                .ok()
+                .filter(|b| *b != TcaBenchmark::Unspecified)
+                .ok_or_else(|| invalid(&format!("{at}.benchmark"), "names its benchmark".into()))?;
+            let meta = cost.meta.get_or_insert_with(Default::default);
+            if meta.subjects.is_empty() {
+                return Err(invalid(
+                    &format!("{at}.meta.subjects"),
+                    "names the execution's instrument".into(),
+                ));
+            }
+            if meta.row_key.is_empty() {
+                meta.row_key = format!("{}:{}", cost.execution_id, benchmark.as_str_name());
+            }
+            let source = meta.source.get_or_insert_with(Default::default);
+            source.dataset = lake::EXECUTION_COST_DATASET.to_string();
+            source.instance = lake::ANALYTICS_INSTANCE.to_string();
+            meta.version = 0;
+            meta.sequence = 0;
+            meta.previous_sequence = 0;
+            meta.recorded_at_ns = 0;
+            meta.closed_day = None;
+            rows.push(Observation::ExecutionCost(cost));
+        }
+        let done = self
+            .store
+            .record(lake::EXECUTION_COST_DATASET, rows, self.clock.now_ns())
+            .map_err(|failed| failed.to_string())?;
+        let heads = self.store.heads().map_err(|failed| failed.to_string())?;
+        Ok(RecordObservationsReply {
+            recorded: done.recorded,
+            restated: done.restated,
+            unchanged: done.unchanged,
+            watermark: Some(watermark(
+                &heads,
+                &[lake::EXECUTION_COST_DATASET.to_string()].into(),
+            )),
+            ..Default::default()
+        })
+    }
+
+    /// W10.11 (contract v27; ruling 481): one account's execution costs, by
+    /// execution, by order or by trade date, as of a recorded time; the
+    /// lake's first account-scoped read. The sidecar checks the account
+    /// against the reader's read scope, and the lake again against the
+    /// scope the envelope carries: outside it, PERMISSION_DENIED naming
+    /// `account_id`.
+    pub(crate) fn list_execution_costs(
+        &self,
+        request: ListExecutionCostsRequest,
+        envelope: &Envelope,
+    ) -> Result<ListExecutionCostsReply, String> {
+        let invalid = |field: &str, words: &str| {
+            meridian_bus::refusal_with_status(
+                meridian_bus::RefusalStatus::InvalidArgument,
+                &[field.to_string()],
+                words,
+            )
+        };
+        if request.account_id.is_empty() {
+            return Err(invalid("account_id", "a read names one account"));
+        }
+        if let Some(meta) = envelope.meta.as_ref() {
+            if meta.account_scope_applies && !meta.account_scope.contains(&request.account_id) {
+                return Err(meridian_bus::refusal_with_status(
+                    meridian_bus::RefusalStatus::PermissionDenied,
+                    &["account_id".to_string()],
+                    format!("account {} is outside this reader's scope", request.account_id),
+                ));
+            }
+        }
+        if !bounds::LIST_EXECUTION_COSTS_REQUEST_EXECUTION_IDS_COUNT
+            .admits(request.execution_ids.len())
+        {
+            return Err(invalid("execution_ids", "at most 500 executions"));
+        }
+        if !request.trade_date.is_empty() && Date::parse(&request.trade_date).is_err() {
+            return Err(invalid("trade_date", "a date is YYYY-MM-DD"));
+        }
+        let page = match request.page_size {
+            0 => 100,
+            n => n.min(500),
+        } as usize;
+        let skip: usize = if request.cursor.is_empty() {
+            0
+        } else {
+            request
+                .cursor
+                .parse()
+                .map_err(|_| invalid("cursor", "not a cursor this lake wrote"))?
+        };
+        let mut costs: Vec<ExecutionCost> = self
+            .store
+            .read_dataset(
+                lake::EXECUTION_COST_DATASET,
+                DataType::ExecutionCost,
+                request.as_of_ns,
+            )
+            .map_err(|failed| failed.to_string())?
+            .into_iter()
+            .filter_map(|row| match row {
+                Observation::ExecutionCost(cost) => Some(cost),
+                _ => None,
+            })
+            .filter(|cost| cost.account_id == request.account_id)
+            .filter(|cost| {
+                request.execution_ids.is_empty() || request.execution_ids.contains(&cost.execution_id)
+            })
+            .filter(|cost| request.order_id.is_empty() || cost.order_id == request.order_id)
+            .filter(|cost| {
+                request.trade_date.is_empty()
+                    || cost
+                        .meta
+                        .as_ref()
+                        .is_some_and(|meta| meta.business_date == request.trade_date)
+            })
+            .filter(|cost| request.benchmarks.is_empty() || request.benchmarks.contains(&cost.benchmark))
+            .collect();
+        costs.sort_by(|a, b| (&a.execution_id, a.benchmark).cmp(&(&b.execution_id, b.benchmark)));
+        let next = skip + page;
+        let next_cursor = if next < costs.len() {
+            next.to_string()
+        } else {
+            String::new()
+        };
+        let mut reply = ListExecutionCostsReply {
+            costs: costs.into_iter().skip(skip).take(page).collect(),
+            next_cursor,
+        };
+        meridian_domain::money::fill_known(&mut reply);
+        Ok(reply)
+    }
+
     /// Contract v23 (W10.4; the lake plan's vL1c, items 8 to 11): each row
     /// with a business date -- a daily price or bar -- dated on a closed day
     /// of its dataset's calendar (DatasetDeclaration.calendar_id), or
@@ -837,6 +1017,8 @@ impl Lake {
 
     fn publish(&self, dataset: &str, row: &Observation) {
         let (payload_type, payload) = match row {
+            // Never published: read within each reader's scope (W10.11).
+            Observation::ExecutionCost(_) => return,
             Observation::Price(price) => (
                 "meridian.v1.PricesRecordedEvent",
                 PricesRecordedEvent {
@@ -1213,6 +1395,10 @@ impl Lake {
             },
             // Outcomes (contract v23) are read by ListOutcomes alone.
             DataType::Outcome => return Err("an outcome is read by ListOutcomes".into()),
+            // Execution costs (contract v27) by ListExecutionCosts alone.
+            DataType::ExecutionCost => {
+                return Err("an execution cost is read by ListExecutionCosts".into())
+            }
             // Quotes (contract v19): the latest in force at a time, or a
             // valid-time range; at most one.
             DataType::Quote => {
@@ -2180,6 +2366,30 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
                 "",
                 envelope,
             )
+        },
+    );
+    serve_on(
+        &bus,
+        &lake,
+        RECORD_EXECUTION_COSTS,
+        (
+            "meridian.v1.RecordExecutionCostsRequest",
+            "meridian.v1.RecordObservationsReply",
+        ),
+        |lake, request: RecordExecutionCostsRequest, envelope| {
+            lake.record_execution_costs(request, envelope)
+        },
+    );
+    serve_on(
+        &bus,
+        &lake,
+        LIST_EXECUTION_COSTS,
+        (
+            "meridian.v1.ListExecutionCostsRequest",
+            "meridian.v1.ListExecutionCostsReply",
+        ),
+        |lake, request: ListExecutionCostsRequest, envelope| {
+            lake.list_execution_costs(request, envelope)
         },
     );
     serve_on(
