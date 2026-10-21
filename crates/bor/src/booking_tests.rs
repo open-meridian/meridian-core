@@ -1153,3 +1153,252 @@ async fn an_open_orders_fill_after_its_record_resolved_lands_on_the_record_it_be
     let refused = propose(&w, &child).await.err().unwrap_or_default();
     assert!(!refused.contains("instrument"), "{refused}");
 }
+
+// ── Contract v27: FX netting (W11.1, W11.11; the gaps spec's D1 to D7) ────
+
+/// A released FX order of EUR against francs in `account`, for value on
+/// `value_date`: its ID.
+async fn fx_released(w: &Wired, account: &str, side: Side, quantity: &str, value_date: &str) -> String {
+    let request = ProposeOrderRequest {
+        account_id: account.into(),
+        instrument_id: EUR.into(),
+        side: side as i32,
+        quantity: d(quantity),
+        order_type: OrderType::Market as i32,
+        dealt_currency: EUR.into(),
+        quote_currency: CHF.into(),
+        time_in_force: TimeInForce::Day as i32,
+        value_date: value_date.into(),
+        ..Default::default()
+    };
+    let order = propose(w, &request).await.unwrap();
+    assert_eq!(order.value_date, value_date);
+    order_command(
+        w,
+        RELEASE_ORDER,
+        "meridian.v1.ReleaseOrderRequest",
+        &ReleaseOrderRequest {
+            order_id: order.order_id.clone(),
+            idempotency_key: String::new(),
+        },
+        &anywhere(TRADER),
+    )
+    .await
+    .unwrap();
+    order.order_id
+}
+
+fn net_of(members: &[String]) -> ProposeOrderRequest {
+    ProposeOrderRequest {
+        account_id: BLOCK.into(),
+        order_type: OrderType::Market as i32,
+        time_in_force: TimeInForce::Day as i32,
+        net_member_order_ids: members.to_vec(),
+        ..Default::default()
+    }
+}
+
+fn fx_execution(order_id: &str, side: Side, quantity: &str) -> ReportExecutionRequest {
+    ReportExecutionRequest {
+        account_id: BLOCK.into(),
+        order_id: order_id.into(),
+        kind: ExecutionKind::InternalCross as i32,
+        side: side as i32,
+        quantity: d(quantity),
+        price: chf("0.9312"),
+        trade_time_ns: NOW,
+        trade_date: "2026-10-13".into(),
+        settlement_date: "2026-10-15".into(),
+        cross_rate_source: CrossRateSource::NetStreetRate as i32,
+        ..Default::default()
+    }
+}
+
+async fn entered(w: &Wired, request: &ReportExecutionRequest) -> Result<Execution, String> {
+    send_from(
+        &w.bus,
+        REPORT_EXECUTION,
+        "meridian.v1.ReportExecutionRequest",
+        request,
+        &anywhere(TRADER),
+    )
+    .await
+    .map(|reply| FactReply::decode(&reply[..]).unwrap().execution.unwrap())
+}
+
+fn eur_in(w: &Wired, account: &str) -> String {
+    let mut total = Exact::ZERO;
+    for held in positions_of(w, account) {
+        if held.instrument_id != EUR {
+            continue;
+        }
+        let quantity: Exact = read(&held.trade_date_quantity).parse().unwrap();
+        total = crate::numbers::add("t", total, quantity).unwrap();
+    }
+    total.to_string()
+}
+
+/// D1 to D5: opposite FX orders on one pair and one value date net into
+/// one order in the allocation account, released on creation, its quantity
+/// buys less sells; each member linked to it; the offset crossed internally
+/// with its rate's source; the net's street fill and the crosses booked to
+/// the members, the allocation account netting to zero.
+#[tokio::test(flavor = "multi_thread")]
+async fn opposite_fx_orders_net_to_one_order_and_the_offset_is_crossed_internally() {
+    let w = wired();
+    for held in [FUND1, FUND2, BLOCK] {
+        account(&w, held).await;
+    }
+    attribute(
+        &w,
+        BLOCK,
+        set_account_attribute_request::Attribute::AllocationAccount(true),
+    )
+    .await;
+    let buyer = fx_released(&w, FUND1, Side::Buy, "10000", "2026-10-15").await;
+    let seller = fx_released(&w, FUND2, Side::Sell, "6000", "2026-10-15").await;
+    let later = fx_released(&w, FUND2, Side::Sell, "1000", "2026-10-16").await;
+    let other_buyer = fx_released(&w, FUND2, Side::Buy, "500", "2026-10-15").await;
+
+    // Another value date, one side alone, or a block and a net at once.
+    let refused = propose(&w, &net_of(&[buyer.clone(), seller.clone(), later.clone()]))
+        .await
+        .unwrap_err();
+    assert_eq!(status_of(&refused).unwrap().1, vec!["net_member_order_ids[2]"]);
+    let refused = propose(&w, &net_of(&[buyer.clone(), other_buyer.clone()]))
+        .await
+        .unwrap_err();
+    assert_eq!(status_of(&refused).unwrap().1, vec!["net_member_order_ids[1]"]);
+    let both = ProposeOrderRequest {
+        block_member_order_ids: vec![buyer.clone()],
+        ..net_of(&[buyer.clone(), seller.clone()])
+    };
+    assert_eq!(
+        status_of(&propose(&w, &both).await.unwrap_err()).unwrap().1,
+        vec!["block_member_order_ids", "net_member_order_ids"]
+    );
+
+    let net = propose(&w, &net_of(&[buyer.clone(), seller.clone()]))
+        .await
+        .unwrap();
+    assert_eq!(state(&net), OrderState::Released);
+    assert_eq!(read(&net.quantity), "4000");
+    assert_eq!(net.side, Side::Buy as i32);
+    assert_eq!(net.instrument_id, EUR);
+    assert_eq!(net.quote_currency, CHF);
+    assert_eq!(net.value_date, "2026-10-15");
+    // Each member linked to it, by a child entry in its own account.
+    for member in [&buyer, &seller] {
+        let link = order_now(&w, member).link.unwrap();
+        assert_eq!(link.kind, OrderLinkKind::Net as i32);
+        assert_eq!(link.parent_order_id, net.order_id);
+    }
+    assert_eq!(
+        w.store.journal(FUND1).unwrap().last().unwrap().meta.kind,
+        "net-member-linked"
+    );
+    // A member in a live net is refused another.
+    let again = propose(&w, &net_of(&[seller.clone(), other_buyer.clone()]))
+        .await
+        .unwrap_err();
+    assert_eq!(code(&again), Some(RefusalReason::OrderState), "{again}");
+
+    // The offset, crossed internally: refused with no source, on an order
+    // that is not a net, and a source on a street fill.
+    let mut no_source = fx_execution(&net.order_id, Side::Buy, "6000");
+    no_source.cross_rate_source = 0;
+    assert_eq!(
+        status_of(&entered(&w, &no_source).await.unwrap_err()).unwrap().1,
+        vec!["cross_rate_source"]
+    );
+    let mut not_a_net = fx_execution(&buyer, Side::Buy, "6000");
+    not_a_net.account_id = FUND1.into();
+    assert_eq!(
+        status_of(&entered(&w, &not_a_net).await.unwrap_err()).unwrap().1,
+        vec!["order_id"]
+    );
+    let cross_buy = entered(&w, &fx_execution(&net.order_id, Side::Buy, "6000"))
+        .await
+        .unwrap();
+    let cross_sell = entered(&w, &fx_execution(&net.order_id, Side::Sell, "6000"))
+        .await
+        .unwrap();
+    assert_eq!(cross_buy.cross_rate_source, CrossRateSource::NetStreetRate as i32);
+    assert_eq!(cross_sell.side, Side::Sell as i32);
+    // The crosses offset; they fill nothing of the net.
+    assert_eq!(read(&quantities(&order_now(&w, &net.order_id)).reported_filled), "0");
+
+    // The net goes to market for 4000.
+    let placement = place(&w, &net.order_id, "4000", &anywhere(TRADER))
+        .await
+        .unwrap()
+        .placement
+        .unwrap();
+    let mut street = fill(&placement.placement_id, "4000", "NET:1");
+    street.account_id = BLOCK.into();
+    street.price = chf("0.9312");
+    street.computed_settlement_date = "2026-10-15".into();
+    let mut sourced = street.clone();
+    sourced.cross_rate_source = CrossRateSource::MidAtNetting as i32;
+    let refused = send_from(
+        &w.bus,
+        REPORT_EXECUTION,
+        "meridian.v1.ReportExecutionRequest",
+        &sourced,
+        &As::default(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(status_of(&refused).unwrap().1, vec!["cross_rate_source"]);
+    let street = FactReply::decode(
+        &send_from(
+            &w.bus,
+            REPORT_EXECUTION,
+            "meridian.v1.ReportExecutionRequest",
+            &street,
+            &As::default(),
+        )
+        .await
+        .unwrap()[..],
+    )
+    .unwrap()
+    .execution
+    .unwrap();
+    assert_eq!(state(&order_now(&w, &net.order_id)), OrderState::Filled);
+
+    // Booked: the street fill and the buy cross to the buyer, the sell
+    // cross to the seller; the allocation account nets to zero.
+    let at = |account: &str, quantity: &str, gross: &str| Allocation {
+        average_price: chf("0.9312"),
+        ..allocation(account, quantity, gross)
+    };
+    book(
+        &w,
+        &net.order_id,
+        &[street.execution_id.clone(), cross_buy.execution_id.clone()],
+        vec![at(FUND1, "10000", "9312.00")],
+        true,
+    )
+    .await
+    .unwrap();
+    book(
+        &w,
+        &net.order_id,
+        &[cross_sell.execution_id.clone()],
+        vec![at(FUND2, "6000", "5587.20")],
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(eur_in(&w, BLOCK), "0");
+    assert_eq!(eur_in(&w, FUND1), "10000");
+    let short: Vec<(i32, String)> = positions_of(&w, FUND2)
+        .into_iter()
+        .filter(|held| held.instrument_id == EUR)
+        .map(|held| (held.side, read(&held.trade_date_quantity)))
+        .collect();
+    assert_eq!(short, vec![(HoldingSide::Short as i32, "-6000".to_string())]);
+    for member in [&buyer, &seller] {
+        assert_eq!(state(&order_now(&w, member)), OrderState::Filled, "{member}");
+    }
+}

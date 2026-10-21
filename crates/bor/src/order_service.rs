@@ -460,6 +460,13 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
                     &request.block_member_order_ids,
                 );
             }
+            // Contract v27 (W11.1): a net's members, read the same way.
+            if !request.net_member_order_ids.is_empty() {
+                ctx.members = crate::booking_service::member_views(
+                    store.as_ref(),
+                    &request.net_member_order_ids,
+                );
+            }
             if request.account_id.is_empty() {
                 return Err(StoreError::Malformed {
                     fields: vec!["account_id".into()],
@@ -486,7 +493,7 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
                     }
                 }
             }
-            act(
+            let answered = act(
                 &bus2,
                 store.as_ref(),
                 &envelope,
@@ -512,7 +519,23 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
                     Ok((made, reply))
                 },
                 None,
-            )
+            );
+            // Contract v27 (W11.1): each net member linked to the net by a
+            // child entry in its own account; the sweep makes any missed.
+            if let Ok((_, reply)) = &answered {
+                if !request.net_member_order_ids.is_empty() {
+                    if let Some(net) = OrderReply::decode(&reply[..]).ok().and_then(|r| r.order) {
+                        crate::booking_service::link_net_members(
+                            &bus2,
+                            store.as_ref(),
+                            &net.account_id,
+                            &net.order_id,
+                            &net.net_member_order_ids,
+                        );
+                    }
+                }
+            }
+            answered
         });
     }
     {

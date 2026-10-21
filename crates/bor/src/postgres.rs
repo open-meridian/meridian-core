@@ -900,7 +900,9 @@ fn project_orders(tx: &mut Transaction<'_>, account_id: &str, changes: &Changes)
         .map_err(unavailable)?;
     }
     for (record, _) in &changes.orders {
-        for member in &record.block_member_order_ids {
+        // A block's members, and from contract v27 a net's: in no other
+        // live block or net (W11.1).
+        for member in &crate::booking::joined_members(record) {
             tx.execute(
                 "INSERT INTO book_block_member (block_order_id, member_order_id, account_id)
                  VALUES ($1, $2, $3) ON CONFLICT (block_order_id, member_order_id) DO NOTHING",

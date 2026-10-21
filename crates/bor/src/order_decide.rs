@@ -500,6 +500,16 @@ pub fn propose_order(
     request: &ProposeOrderRequest,
 ) -> Result<Made> {
     user_required(ctx, "proposing an order")?;
+    date_field("value_date", &request.value_date)?;
+    if !request.net_member_order_ids.is_empty() {
+        if !request.block_member_order_ids.is_empty() {
+            return Err(malformed(
+                &["block_member_order_ids", "net_member_order_ids"],
+                "an order is a block or a net, never both",
+            ));
+        }
+        return propose_net(book, head, ctx, request);
+    }
     if !request.block_member_order_ids.is_empty() {
         return propose_block(book, head, ctx, request);
     }
@@ -615,6 +625,8 @@ pub fn propose_order(
         axe_source: request.axe_source.clone(),
         axe_counterparty_id: request.axe_counterparty_id.clone(),
         link: request.link.clone(),
+        // Contract v27 (W11.1; ruling 480): an FX order's value date.
+        value_date: request.value_date.clone(),
         ..Default::default()
     };
 
@@ -781,6 +793,152 @@ fn propose_block(
     )
     .key(&request.idempotency_key);
     finish(book, head, ctx, plan)
+}
+
+/// A net order (W11.1, contract v27; the gaps spec's D1 to D7): the
+/// `oms`'s, in the allocation account, naming released FX orders of one
+/// pair and one value date, of both sides, each in no other live block or
+/// net; its quantity buys less sells and its side the larger's; released on
+/// creation as a block is. Only the net goes to market; the offset is
+/// crossed internally (W11.11). Each member is then linked to it by a child
+/// entry in its own account ([`link_net_member`]).
+fn propose_net(book: &Book, head: u64, ctx: &Context, request: &ProposeOrderRequest) -> Result<Made> {
+    if request.cash_quantity.is_some() {
+        return Err(malformed(
+            &["cash_quantity"],
+            "a net's quantity is its members' buys less their sells",
+        ));
+    }
+    if request.link.is_some() {
+        return Err(malformed(&["link"], "a net names its members, and no parent"));
+    }
+    let (quantity, side, instrument_id, quote_currency, value_key) =
+        crate::booking::net_holds(ctx, &request.net_member_order_ids)?;
+    if !request.instrument_id.is_empty()
+        && !crate::became::same(&request.instrument_id, &instrument_id)
+    {
+        return Err(malformed(
+            &["instrument_id"],
+            format!("a net is of its members' pair, whose base is {instrument_id}"),
+        ));
+    }
+    if !request.quote_currency.is_empty() && request.quote_currency != quote_currency {
+        return Err(malformed(
+            &["quote_currency"],
+            format!("a net is of its members' pair, quoted in {quote_currency}"),
+        ));
+    }
+    if request.side != Side::Unspecified as i32 && request.side != side {
+        return Err(malformed(
+            &["side"],
+            "a net's side is the larger side's among its members",
+        ));
+    }
+    if let Some(stated) = decimal("quantity", request.quantity.as_ref())? {
+        if stated != quantity {
+            return Err(malformed(
+                &["quantity"],
+                format!(
+                    "a net's quantity is its members' buys less their sells, {quantity}, and \
+                     this states {stated}"
+                ),
+            ));
+        }
+    }
+    if quantity.is_zero() {
+        return Err(malformed(
+            &["net_member_order_ids"],
+            "the members offset exactly: nothing goes to market, and the offset is crossed \
+             between them",
+        ));
+    }
+    ctx.references_answered()?;
+    crate::booking::local_record_allowed(ctx, &instrument_id, "the net")?;
+    let value_date = if value_key.starts_with("spot@") {
+        String::new()
+    } else {
+        value_key
+    };
+    if !request.value_date.is_empty() && request.value_date != value_date {
+        return Err(malformed(
+            &["value_date"],
+            "a net settles on its members' value date",
+        ));
+    }
+    let order = Order {
+        order_id: ctx.mint(ids::ORDER),
+        account_id: book.account_id.clone(),
+        instrument_id,
+        sleeve: request.sleeve.clone(),
+        side,
+        quantity: numbers::wire(quantity),
+        order_type: request.order_type,
+        limit_price: request.limit_price.clone(),
+        stop_price: request.stop_price.clone(),
+        quote_currency,
+        time_in_force: request.time_in_force,
+        expire_date: request.expire_date.clone(),
+        expire_time_ns: request.expire_time_ns,
+        execution_instructions: request.execution_instructions.clone(),
+        lot_relief_method: request.lot_relief_method,
+        capacity: request.capacity,
+        direction: request.direction,
+        handling_instructions: request.handling_instructions.clone(),
+        person_roles: Some(PersonRoles {
+            entered_by: Some(ctx.actor()),
+            executed_by: None,
+            decided_by: request.decided_by.clone(),
+        }),
+        net_member_order_ids: request.net_member_order_ids.clone(),
+        value_date,
+        ..Default::default()
+    };
+    let plan = Plan::new(
+        "order-proposed",
+        ctx.actor(),
+        vec![Act::Opened {
+            order,
+            released: true,
+        }],
+    )
+    .key(&request.idempotency_key);
+    finish(book, head, ctx, plan)
+}
+
+/// The child entry linking a net's member to the net (W11.1, contract v27):
+/// the book's act in the member's own account, its link
+/// `ORDER_LINK_KIND_NET` naming the net as its parent. `None` where it is
+/// linked already.
+pub fn link_net_member(
+    book: &Book,
+    head: u64,
+    ctx: &Context,
+    member_order_id: &str,
+    net_order_id: &str,
+    net_account_id: &str,
+) -> Result<Option<Made>> {
+    let member = held(book, member_order_id)?;
+    if member
+        .order
+        .link
+        .as_ref()
+        .is_some_and(|link| link.kind == OrderLinkKind::Net as i32 && link.parent_order_id == net_order_id)
+    {
+        return Ok(None);
+    }
+    let plan = Plan::new(
+        "net-member-linked",
+        ctx.actor(),
+        vec![Act::NetLinked {
+            order_id: member_order_id.to_string(),
+            net_order_id: net_order_id.to_string(),
+            net_account_id: net_account_id.to_string(),
+        }],
+    )
+    .reason(&format!(
+        "a member of net order {net_order_id} in account {net_account_id}"
+    ));
+    finish(book, head, ctx, plan).map(Some)
 }
 
 /// An FX order's quote currency (W11.1, contract v23; approved 2026-10-13):
@@ -3162,13 +3320,17 @@ pub fn report_execution(
         ));
     };
     let order = held(book, &order_id)?;
+    let cross = cross_holds(order, request, kind, bust)?;
     let sender = ctx.instance_id.clone();
     let mut execution = Execution {
         order_id: order_id.clone(),
         placement_id: placement_id.clone(),
         instrument_id: order.order.instrument_id.clone(),
         sleeve: order.order.sleeve.clone(),
-        side: order.order.side,
+        // A net's internal cross is a buy for one member and a sale for
+        // another: its side is its own (W11.11).
+        side: if cross { request.side } else { order.order.side },
+        cross_rate_source: request.cross_rate_source,
         ..execution_of(book, ctx, request, entered)
     };
     // A repeat of a fact already applied, by the venue's identifiers, is
@@ -3252,6 +3414,62 @@ pub fn report_execution(
         from,
     );
     Ok(made)
+}
+
+/// A net's internal cross (W11.11, contract v27; the gaps spec's D3 and
+/// D4): on a net order, the `oms`'s entry for a person, on no placement,
+/// with its side and the convention that set its rate. `cross_rate_source`
+/// on any other execution, or a cross on an order that is not a net, is
+/// refused INVALID_ARGUMENT naming the field. Whether it is one.
+fn cross_holds(
+    order: &OrderHeld,
+    request: &ReportExecutionRequest,
+    kind: ExecutionKind,
+    bust: bool,
+) -> Result<bool> {
+    let source = meridian_domain::v1::CrossRateSource::try_from(request.cross_rate_source)
+        .unwrap_or(meridian_domain::v1::CrossRateSource::Unspecified);
+    if kind != ExecutionKind::InternalCross {
+        if source != meridian_domain::v1::CrossRateSource::Unspecified {
+            return Err(malformed(
+                &["cross_rate_source"],
+                "a cross rate's source is stated on a net's internal cross alone",
+            ));
+        }
+        return Ok(false);
+    }
+    if bust {
+        return Ok(true);
+    }
+    if order.order.net_member_order_ids.is_empty() {
+        return Err(malformed(
+            &["order_id"],
+            format!(
+                "order {} is not a net: an internal cross offsets a net's members",
+                order.order.order_id
+            ),
+        ));
+    }
+    if source == meridian_domain::v1::CrossRateSource::Unspecified {
+        return Err(malformed(
+            &["cross_rate_source"],
+            "a net's internal cross says which convention set its rate: the net's street rate \
+             or the mid at netting",
+        ));
+    }
+    if !request.placement_id.is_empty() {
+        return Err(malformed(
+            &["placement_id"],
+            "an internal cross goes to no venue, on no placement",
+        ));
+    }
+    if !matches!(Side::try_from(request.side), Ok(Side::Buy | Side::Sell)) {
+        return Err(malformed(
+            &["side"],
+            "an internal cross states its side, a buy for one member and a sale for another",
+        ));
+    }
+    Ok(true)
 }
 
 /// An execution as the request reports it, minted, on no order or placement

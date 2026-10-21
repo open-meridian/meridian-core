@@ -23,8 +23,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use meridian_domain::exact::Exact;
 use meridian_domain::v1::{
     Alert, AlertKind, AlertState, Allocation, Booking, BookingState, ChangeRequest,
-    ChangeRequestOutcome, Charge, Check, Execution, ExecutionState, FinalityLevel, GiveUpRecord,
-    JournalRef, Locate, LocateAnswer, LocateUse, LocateUseKind, Order, OrderCondition, OrderOrigin,
+    ChangeRequestOutcome, Charge, Check, Execution, ExecutionKind, ExecutionState, FinalityLevel, GiveUpRecord,
+    JournalRef, Locate, LocateAnswer, LocateUse, LocateUseKind, Order, OrderCondition,
+    OrderLinkKind, OrderOrigin,
     OrderQuantities, OrderState, OrderStatus, Placement, PlacementChangeKind, PlacementCondition,
     PlacementEvent, PlacementQuote, PlacementQuoteOutcome, PlacementState, PlacementStatus,
     ReportPlacementRequest,
@@ -160,6 +161,14 @@ pub enum Act {
     QuotePicked {
         placement_id: String,
         quote_id: String,
+    },
+    /// Contract v27 (W11.1): a child entry in a net member's own account,
+    /// the book's act: the member linked to the net order, in the
+    /// allocation account, as its parent.
+    NetLinked {
+        order_id: String,
+        net_order_id: String,
+        net_account_id: String,
     },
     /// A placement refused and recorded (REFUSAL_REASON_CONNECTIVITY_NOT_ALLOWED,
     /// W11.8): the entry names the placing `ems`, the instance asked for, the
@@ -653,6 +662,7 @@ impl Ledger {
                 Act::PlacementQuoted { placement_id, .. } | Act::QuotePicked { placement_id, .. } => {
                     push_once(&mut touched.placements, placement_id);
                 }
+                Act::NetLinked { order_id, .. } => push_once(&mut touched.orders, order_id),
                 Act::Accepted {
                     execution_ids,
                     order_id,
@@ -753,10 +763,13 @@ impl Ledger {
         let mut index = 0;
         while index < touched.orders.len() {
             let order_id = touched.orders[index].clone();
+            // A net member's link names the net in the allocation account
+            // (contract v27), never a parent here.
             let parent = self
                 .orders
                 .get(&order_id)
                 .and_then(|held| held.order.link.as_ref())
+                .filter(|link| link.kind != OrderLinkKind::Net as i32)
                 .map(|link| link.parent_order_id.clone())
                 .or_else(|| opened_parents.get(&order_id).cloned());
             if let Some(parent) = parent {
@@ -925,6 +938,18 @@ impl Ledger {
                     {
                         held.placement.picked_quote_id.clear();
                     }
+                }
+            }
+            Act::NetLinked {
+                order_id,
+                net_order_id,
+                ..
+            } => {
+                if let Some(held) = self.orders.get_mut(order_id) {
+                    held.order.link = Some(meridian_domain::v1::OrderLink {
+                        kind: OrderLinkKind::Net as i32,
+                        parent_order_id: net_order_id.clone(),
+                    });
                 }
             }
             Act::QuotePicked {
@@ -1499,6 +1524,11 @@ impl Ledger {
                 continue;
             };
             if execution.superseded_by.is_some() {
+                continue;
+            }
+            // Contract v27 (W11.11): a net's internal crosses offset its
+            // members against each other; only its street fills fill it.
+            if execution.execution.kind == ExecutionKind::InternalCross as i32 {
                 continue;
             }
             let amount = self.counted(Some(held), &execution.execution)?;

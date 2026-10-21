@@ -511,9 +511,7 @@ impl Store for MemoryStore {
         let mut out = Vec::new();
         for (key, book) in &state.books {
             for (id, held) in &book.ledger.orders {
-                if held
-                    .order
-                    .block_member_order_ids
+                if crate::booking::joined_members(&held.order)
                     .iter()
                     .any(|member| member == member_order_id)
                     && book.ledger.order_live(id)?
