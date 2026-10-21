@@ -53,6 +53,14 @@ no brokerage, no paper account, no trading API of any kind is reached.
    overfill's excess booked to the error account with its cause; and
    operations' correction by replace after the hand-off, each fund holding
    the corrected allocation.
+12. Execution costs (contract v27; W10.11, W11.17, ruling 510): the orders'
+   account given its base currency, the portfolio plugin runs an
+   execution_cost job on it; the analytics component reads the account's
+   orders, placements, executions and the orders' history, and records an
+   ExecutionCost row per execution per benchmark, keyed `EXE-...:arrival`:
+   step 4's two fills measured at the order's proposal, its release, the
+   placement's routing and the fill, each NO_QUOTE where the harness lake
+   holds no mid; the same job again records nothing new.
 
 Run from the repository's root by the Makefile, which builds the images and
 copies the harness out first; standard library only.
@@ -445,6 +453,28 @@ def run():
          f"step 11, operations reads the booking: {listed}")
     del before_over
 
+    # 12. Execution costs from the order path (contract v27, ruling 510).
+    runner("core-form", "/admin", "/admin/accounts/book", f"account_id={account}",
+           "base_currency_code=USD", "lot_relief_default=0", "waits_for_compliance=no-wait",
+           "note=The fund reports in dollars.")
+    tca = page("pm", "write", f"/tca?account={account}")
+    first_fills = [r for r in tca["rows"] if r["order_id"] == order1]
+    benchmarks = sorted({r["benchmark"] for r in first_fills})
+    must(len(first_fills) == 8 and benchmarks == [
+        "TCA_BENCHMARK_ARRIVAL", "TCA_BENCHMARK_DECISION", "TCA_BENCHMARK_MID_AT_FILL",
+        "TCA_BENCHMARK_PLACEMENT_ARRIVAL"],
+         f"step 12, step 4's two fills, each against four benchmarks: {tca}")
+    must(all(r["row_key"] == f"{r['execution_id']}:" + r["benchmark"][len("TCA_BENCHMARK_"):].lower()
+             for r in first_fills),
+         f"step 12, each row keyed by its execution and benchmark: {first_fills}")
+    must(all(r["benchmark_at_ns"] > 0 and r["unanswered"] == "TCA_UNANSWERED_NO_QUOTE"
+             for r in first_fills),
+         f"step 12, each moment from the order path, no mid in the harness lake: {first_fills}")
+    again = page("pm", "write", f"/tca?account={account}")
+    must(sorted((r["row_key"], r["version"]) for r in again["rows"])
+         == sorted((r["row_key"], r["version"]) for r in tca["rows"]),
+         f"step 12, the same job again records nothing new: {again}")
+
     # 10. The book printed, and rebuilt from its journal line for line.
     before = store_book()
     for wanted in ("order|Orders fund|", "placement|Orders fund|", "execution|Orders fund|",
@@ -474,7 +504,9 @@ def run():
           "EUR/USD's spot date Tuesday 13 October, by the platform's IDs, the deployment's own; "
           "a block across two funds booked and handed off, each member filled by its allocation; "
           "an overfill's excess booked to the error account; a correction by replace after the "
-          "hand-off; and meridian-bor rebuild reproducing the book "
+          "hand-off; execution costs recorded by the analytics component from the order "
+          "path's orders, placements, executions and history, once; and meridian-bor rebuild "
+          "reproducing the book "
           "line for line")
 
 

@@ -353,7 +353,32 @@ class Pm(Plugin):
             return order_json(done.order)
         if path == "/orders":
             return await self.orders(query)
+        if path == "/tca":
+            return await self.tca(query)
         return {"page": "the portfolio stand-in"}
+
+    async def tca(self, query):
+        """Contract v27 (W10.11, W12.1; ruling 510): an execution_cost job on
+        an account, which the analytics component answers from the book's
+        orders, placements, executions and the orders' history and records
+        in the lake; then the account's rows, as ListExecutionCosts reads
+        them."""
+        account = one(query, "account")
+        ran = await self.call("RunJob", ops.RunJobParams(job=ops.Job(
+            account_ids=[account],
+            measures=[ops.MeasureRef(definition="execution_cost", version=1)])))
+        listed = await self.call("ListExecutionCosts", ops.ListExecutionCostsParams(
+            account_id=account, page_size=500))
+        return {
+            "answered_inline": ran.answered_inline,
+            "rows": [{"row_key": c.meta.row_key, "execution_id": c.execution_id,
+                      "order_id": c.order_id, "placement_id": c.placement_id,
+                      "benchmark": ops.TcaBenchmark.Name(c.benchmark),
+                      "benchmark_at_ns": c.benchmark_at_ns,
+                      "unanswered": ops.TcaUnanswered.Name(c.unanswered),
+                      "version": c.meta.version}
+                     for c in listed.costs],
+        }
 
 
 # ── oms and ems ─────────────────────────────────────────────────────────────
