@@ -245,6 +245,8 @@ fn read(
                 page_size: 0,
                 cursor: String::new(),
                 after: None,
+                tenors: Vec::new(),
+                published_as_of_ns: 0,
             },
             &envelope(reader, reader != "dashboard-1", ""),
         )
@@ -448,6 +450,8 @@ async fn a_reader_not_entitled_is_refused_per_dataset_and_a_field_it_may_not_rea
                 page_size: 0,
                 cursor: String::new(),
                 after: None,
+                tenors: Vec::new(),
+                published_as_of_ns: 0,
             },
             &envelope("reporting-1", true, ""),
         )
@@ -971,6 +975,8 @@ async fn a_read_with_an_invalid_date_or_two_times_is_refused_and_misses_are_coun
         page_size: 0,
         cursor: String::new(),
         after: None,
+        tenors: Vec::new(),
+        published_as_of_ns: 0,
     };
     let invalid = tokio::task::block_in_place(|| {
         h.lake
@@ -1129,6 +1135,8 @@ fn live_read(
                 page_size: 0,
                 cursor: String::new(),
                 after,
+                tenors: Vec::new(),
+                published_as_of_ns: 0,
             },
             &envelope("signal-1", true, ""),
         )
@@ -1671,6 +1679,8 @@ async fn an_outcome_is_restated_per_stage_every_version_heard_and_read_as_of_or_
             page_size: 0,
             cursor: String::new(),
             after: None,
+            tenors: Vec::new(),
+            published_as_of_ns: 0,
         },
         &envelope("reporting-1", true, "")
     ))
@@ -1794,6 +1804,7 @@ fn kept_rows(h: &Harness, as_of_ns: i64) -> Vec<Observation> {
                 until_ns: 0,
             },
             as_of_ns,
+            published_as_of_ns: 0,
         })
         .unwrap()
 }
@@ -1907,6 +1918,7 @@ async fn a_daily_value_on_a_closed_day_is_recorded_flagged_and_counted() {
                 until_ns: 0,
             },
             as_of_ns: 0,
+            published_as_of_ns: 0,
         })
         .unwrap();
     assert!(kraken[0].meta().closed_day.is_none());

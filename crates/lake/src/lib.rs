@@ -42,6 +42,8 @@ pub mod store;
 mod memory;
 
 #[cfg(test)]
+mod rates_tests;
+#[cfg(test)]
 mod tests;
 
 pub use memory::MemoryStore;

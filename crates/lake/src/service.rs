@@ -35,6 +35,10 @@ use meridian_domain::lake;
 use meridian_domain::money::{asset_of, Asset, CashInstruments, ISO4217};
 use meridian_domain::v1::PartitionSequence;
 use meridian_domain::v1::{
+    AssetClass, Compounding, InstrumentType, ListRatesReply, ListRatesRequest, RateKind,
+    RecordRatesRequest, TenorUnit, ValueUnit,
+};
+use meridian_domain::v1::{
     BarsRecordedEvent, DatasetRef, DeclineWantReply, DeclineWantRequest, EntitlementsChangedEvent,
     ExecutionCost, Identifier, InstrumentReplacedEvent, ListBarsReply, ListBarsRequest,
     ListDatasetsReply, ListDatasetsRequest, ListExecutionCostsReply, ListExecutionCostsRequest,
@@ -43,9 +47,9 @@ use meridian_domain::v1::{
     ListTradesRequest, MissingInstrumentDetectedEvent, MissingVenueDetectedEvent,
     ObservationsWantedEvent, OutcomesRecordedEvent, PluginCatalogue, PluginCatalogueRequest,
     PluginLaunchState, PriceBasis, PriceKind, PricesRecordedEvent, QuoteCharacteristic,
-    QuotesRecordedEvent, RecordBarsRequest, RecordExecutionCostsRequest, RecordObservationsReply,
-    RecordOutcomesRequest, RecordPricesRequest, RecordQuotesRequest, RecordTradesRequest,
-    ResolveIdentifierReply, ResolveIdentifierRequest, ResolveInstrumentReply,
+    QuotesRecordedEvent, RatesRecordedEvent, RecordBarsRequest, RecordExecutionCostsRequest,
+    RecordObservationsReply, RecordOutcomesRequest, RecordPricesRequest, RecordQuotesRequest,
+    RecordTradesRequest, ResolveIdentifierReply, ResolveIdentifierRequest, ResolveInstrumentReply,
     ResolveInstrumentRequest, SetSourcePriorityRequest, SourceChoice, SourcePriority,
     SourceTimeKind, SubjectRef, TcaBenchmark, TradeCharacteristic, TradesRecordedEvent, Unanswered,
     UnansweredReason, WantWithdrawnEvent, Watermark,
@@ -65,6 +69,9 @@ pub const RECORD_BARS: &str = "platform.lake.command.record-bars";
 pub const RECORD_TRADES: &str = "platform.lake.command.record-trades";
 pub const RECORD_QUOTES: &str = "platform.lake.command.record-quotes";
 pub const RECORD_OUTCOMES: &str = "platform.lake.command.record-outcomes";
+/// Contract v27, the rates slice (W10.4, W10.6).
+pub const RECORD_RATES: &str = "platform.lake.command.record-rates";
+pub const LIST_RATES: &str = "platform.lake.query.list-rates";
 pub const DECLINE_WANT: &str = "platform.lake.command.decline-want";
 pub const SET_SOURCE_PRIORITY: &str = "platform.lake.command.set-source-priority";
 pub const LIST_PRICES: &str = "platform.lake.query.list-prices";
@@ -101,6 +108,7 @@ pub fn recorded_topic(dataset: &str, data_type: DataType) -> String {
         DataType::Trade => format!("platform.lake.{dataset}.event.trades-recorded"),
         DataType::Quote => format!("platform.lake.{dataset}.event.quotes-recorded"),
         DataType::Outcome => format!("platform.lake.{dataset}.event.outcomes-recorded"),
+        DataType::Rate => format!("platform.lake.{dataset}.event.rates-recorded"),
         // Never published: read within each reader's account scope (W10.11).
         DataType::ExecutionCost => String::new(),
     }
@@ -172,7 +180,9 @@ pub struct Lake {
     declined: Mutex<read::Declined>,
     /// Trades recorded since the band last read them.
     trades_recorded: std::sync::atomic::AtomicU64,
-    held: Mutex<BTreeSet<String>>,
+    /// Each record the instrument store said it holds, with its asset class
+    /// and type: a rate's subject is a referential record (contract v27).
+    held: Mutex<BTreeMap<String, (i32, i32)>>,
     cash: Mutex<CashInstruments>,
     versions: Mutex<(BTreeMap<String, String>, i64)>,
 }
@@ -266,7 +276,7 @@ impl Lake {
             wants: Mutex::new(Wants::default()),
             declined: Mutex::new(BTreeMap::new()),
             trades_recorded: std::sync::atomic::AtomicU64::new(0),
-            held: Mutex::new(BTreeSet::new()),
+            held: Mutex::new(BTreeMap::new()),
             cash: Mutex::new(CashInstruments::default()),
             versions: Mutex::new((BTreeMap::new(), 0)),
         })
@@ -296,8 +306,14 @@ impl Lake {
     /// Whether the instrument store holds a record by this ID (W3.6),
     /// remembered once it does.
     fn subject_held(&self, entity: &str) -> Result<bool, String> {
-        if self.held.lock().expect("held poisoned").contains(entity) {
-            return Ok(true);
+        Ok(self.subject_record(entity)?.is_some())
+    }
+
+    /// The asset class and type of the record the instrument store holds
+    /// by this ID, remembered once it does; `None` where it holds none.
+    fn subject_record(&self, entity: &str) -> Result<Option<(i32, i32)>, String> {
+        if let Some(held) = self.held.lock().expect("held poisoned").get(entity) {
+            return Ok(Some(*held));
         }
         let reply: ResolveInstrumentReply = self
             .ask(
@@ -309,14 +325,15 @@ impl Lake {
                 },
             )
             .map_err(|failed| format!("the instrument store did not say whether it holds {entity}, and nothing was recorded: {failed}"))?;
-        let held = reply.found && reply.instrument.is_some();
-        if held {
-            self.held
-                .lock()
-                .expect("held poisoned")
-                .insert(entity.to_string());
-        }
-        Ok(held)
+        let Some(record) = reply.instrument.filter(|_| reply.found) else {
+            return Ok(None);
+        };
+        let said = (record.asset_class, record.instrument_type);
+        self.held
+            .lock()
+            .expect("held poisoned")
+            .insert(entity.to_string(), said);
+        Ok(Some(said))
     }
 
     /// The cash instrument a currency's ISO 4217 code names (W3.1, W10.5),
@@ -451,11 +468,33 @@ impl Lake {
                         "{at}.meta.subjects[{j}].entity_id is 1 to 64 characters"
                     ));
                 }
-                if !self.subject_held(&subject.entity_id)? {
+                let Some((class, kind)) = self.subject_record(&subject.entity_id)? else {
                     return Err(format!(
                         "{at}.meta.subjects[{j}].entity_id {:?} is no record the deployment holds",
                         subject.entity_id
                     ));
+                };
+                // A rate's subject is a referential record (contract v27,
+                // W1.1, W10.4): an interest rate, a rate curve or an index.
+                if data_type == DataType::Rate {
+                    if class != AssetClass::Referential as i32 {
+                        return Err(format!(
+                            "{at}.meta.subjects[{j}].entity_id {:?} is no referential record; a \
+                             rate's subject is an interest rate, a rate curve or an index",
+                            subject.entity_id
+                        ));
+                    }
+                    if kind == InstrumentType::RateCurve as i32 {
+                        if let Observation::Rate(rate) = &row {
+                            if rate.tenor.is_none() && rate.maturity_date.is_empty() {
+                                return Err(format!(
+                                    "{at}.tenor: a point of the rate curve {:?} names its \
+                                     tenor or its maturity_date",
+                                    subject.entity_id
+                                ));
+                            }
+                        }
+                    }
                 }
             }
             meridian_domain::date::optional(
@@ -559,6 +598,7 @@ impl Lake {
                 Observation::Trade(trade) => trade_refused(&at, trade)?,
                 Observation::Quote(quote) => quote_refused(&at, quote)?,
                 Observation::Outcome(outcome) => outcome_refused(&at, outcome)?,
+                Observation::Rate(rate) => rate_refused(&at, rate)?,
                 _ => {}
             }
             if let Observation::Bar(bar) = &row {
@@ -602,6 +642,7 @@ impl Lake {
             "trades" => bounds::RECORD_TRADES_REQUEST_TRADES_COUNT,
             "quotes" => bounds::RECORD_QUOTES_REQUEST_QUOTES_COUNT,
             "outcomes" => bounds::RECORD_OUTCOMES_REQUEST_OUTCOMES_COUNT,
+            "rates" => bounds::RECORD_RATES_REQUEST_RATES_COUNT,
             _ => bounds::RECORD_BARS_REQUEST_BARS_COUNT,
         };
         if !bound.admits(rows.len()) {
@@ -1077,6 +1118,15 @@ impl Lake {
                 }
                 .encode_to_vec(),
             ),
+            // Conflated by the receive per subject, dataset, kind, tenor,
+            // maturity and convention (contract v27, W10.5).
+            Observation::Rate(rate) => (
+                "meridian.v1.RatesRecordedEvent",
+                RatesRecordedEvent {
+                    rate: Some(rate.clone()),
+                }
+                .encode_to_vec(),
+            ),
         };
         let topic = recorded_topic(dataset, row.data_type());
         if let Err(failed) = self.bus.publish(&topic, payload_type, payload, None, None) {
@@ -1437,7 +1487,8 @@ impl Lake {
                     }
                 }
             }
-            DataType::Price | DataType::Bar => {
+            // A rate is read as a price is (contract v27, W10.6).
+            DataType::Price | DataType::Bar | DataType::Rate => {
                 let given = [
                     request.at_ns != 0,
                     !request.business_date.is_empty(),
@@ -1542,6 +1593,8 @@ impl Lake {
             sources,
             when,
             as_of_ns: as_of,
+            tenors: request.tenors,
+            published_as_of_ns: request.published_as_of_ns,
         };
         let answered = read::answer(
             self.store.as_ref(),
@@ -1643,6 +1696,66 @@ impl Lake {
     /// recorded of each subject asked, per dataset and venue, with the watermark it was read at, so the
     /// plugin backfills a restart's gap from the venue's history. Its own
     /// rows alone, by no entitlement; refused from any other reader.
+    /// W10.6, contract v27 (the rates slice): rates for 1 to 500 subjects,
+    /// as prices are read, narrowed by kind and tenor; as of a recorded
+    /// time, and optionally as the source had published them by a time.
+    pub(crate) fn list_rates(
+        &self,
+        request: ListRatesRequest,
+        envelope: &Envelope,
+    ) -> Result<ListRatesReply, String> {
+        if request.published_as_of_ns < 0 {
+            return Err("published_as_of_ns is a time, or 0 to read by recorded time".into());
+        }
+        if !bounds::LIST_RATES_REQUEST_SUBJECTS_COUNT.admits(request.subjects.len()) {
+            return Err(format!(
+                "subjects names {}; 1 to 500",
+                request.subjects.len()
+            ));
+        }
+        for (i, tenor) in request.tenors.iter().enumerate() {
+            if TenorUnit::try_from(tenor.unit).unwrap_or(TenorUnit::Unspecified)
+                == TenorUnit::Unspecified
+            {
+                return Err(format!("tenors[{i}].unit is unspecified"));
+            }
+        }
+        let answer = self.read(
+            ReadRequest {
+                data_type: DataType::Rate,
+                subjects: request.subjects,
+                kinds: request.kinds,
+                interval_ns: 0,
+                sources: request.sources,
+                at_ns: request.at_ns,
+                business_date: request.business_date,
+                valid_from_ns: request.valid_from_ns,
+                valid_until_ns: request.valid_until_ns,
+                as_of_ns: request.as_of_ns,
+                page_size: request.page_size,
+                cursor: request.cursor,
+                after: None,
+                tenors: request.tenors,
+                published_as_of_ns: request.published_as_of_ns,
+            },
+            envelope,
+        )?;
+        Ok(ListRatesReply {
+            rates: answer
+                .rows
+                .into_iter()
+                .filter_map(|r| match r {
+                    Observation::Rate(rate) => Some(rate),
+                    _ => None,
+                })
+                .collect(),
+            unanswered: answer.unanswered,
+            datasets: answer.datasets,
+            watermark: Some(answer.watermark),
+            next_cursor: answer.next_cursor,
+        })
+    }
+
     pub(crate) fn latest_recorded(
         &self,
         request: &ListTradesRequest,
@@ -1715,6 +1828,7 @@ impl Lake {
                                 until_ns: i64::MAX,
                             },
                             as_of_ns: now,
+                            published_as_of_ns: 0,
                         })
                         .map_err(|failed| failed.to_string())?;
                     let mut found = false;
@@ -1833,6 +1947,8 @@ impl Lake {
             },
             when,
             as_of_ns: as_of,
+            tenors: Vec::new(),
+            published_as_of_ns: 0,
         };
         let answered = read::answer(
             self.store.as_ref(),
@@ -1937,7 +2053,11 @@ impl Lake {
             DataType::Price if kind == PriceKind::Unspecified => {
                 return Err("kind: a price's priority names its kind".into())
             }
-            DataType::Bar | DataType::Trade | DataType::Quote | DataType::Outcome
+            DataType::Bar
+            | DataType::Trade
+            | DataType::Quote
+            | DataType::Outcome
+            | DataType::Rate
                 if kind != PriceKind::Unspecified =>
             {
                 return Err(format!(
@@ -2150,6 +2270,65 @@ fn trade_refused(at: &str, trade: &meridian_domain::v1::Trade) -> Result<(), Str
 /// four. Its two sides in one asset is checked beside its amounts.
 /// An outcome held to W10.4 (contract v23): its determination and stage
 /// said, its settlement value set and never negative, its venue's word kept.
+/// A rate held to W10.4 (contract v27, the rates slice): its kind, its value
+/// with its unit and its convention's compounding stated; a compounded rate
+/// names its periods a year; a tenor names its unit and a count; a maturity
+/// is a date; a percentile is 1 to 99. Whether a curve point names its tenor
+/// or maturity is checked against its subject's type.
+fn rate_refused(at: &str, rate: &meridian_domain::v1::Rate) -> Result<(), String> {
+    if RateKind::try_from(rate.kind).unwrap_or(RateKind::Unspecified) == RateKind::Unspecified {
+        return Err(format!("{at}.kind is unspecified"));
+    }
+    let Some(value) = rate.value.as_ref() else {
+        return Err(format!("{at}.value is required: the rate with its unit"));
+    };
+    let Some(number) = value.value.as_ref() else {
+        return Err(format!("{at}.value.value is required"));
+    };
+    meridian_domain::exact::Exact::from_wire(number)
+        .map_err(|out| format!("{at}.value.value {out}"))?;
+    let unit = ValueUnit::try_from(value.unit).unwrap_or(ValueUnit::Unspecified);
+    if unit == ValueUnit::Unspecified {
+        return Err(format!("{at}.value.unit is unspecified"));
+    }
+    if unit == ValueUnit::Ucum && value.ucum_code.trim().is_empty() {
+        return Err(format!("{at}.value.ucum_code names the physical unit"));
+    }
+    let Some(convention) = rate.convention.as_ref() else {
+        return Err(format!("{at}.convention is required: how the rate accrues"));
+    };
+    let compounding =
+        Compounding::try_from(convention.compounding).unwrap_or(Compounding::Unspecified);
+    if compounding == Compounding::Unspecified {
+        return Err(format!("{at}.convention.compounding is unspecified"));
+    }
+    if compounding == Compounding::Compounded && convention.periods_per_year == 0 {
+        return Err(format!(
+            "{at}.convention.periods_per_year: a compounded rate names its periods a year"
+        ));
+    }
+    if let Some(tenor) = rate.tenor.as_ref() {
+        if TenorUnit::try_from(tenor.unit).unwrap_or(TenorUnit::Unspecified)
+            == TenorUnit::Unspecified
+        {
+            return Err(format!("{at}.tenor.unit is unspecified"));
+        }
+        if tenor.count < 1 {
+            return Err(format!("{at}.tenor.count is at least 1"));
+        }
+    }
+    meridian_domain::date::optional(&format!("{at}.maturity_date"), &rate.maturity_date)?;
+    for (i, percentile) in rate.percentiles.iter().enumerate() {
+        if !(1..=99).contains(&percentile.percentile) {
+            return Err(format!("{at}.percentiles[{i}].percentile is 1 to 99"));
+        }
+        if percentile.value.is_none() {
+            return Err(format!("{at}.percentiles[{i}].value is required"));
+        }
+    }
+    Ok(())
+}
+
 fn outcome_refused(at: &str, outcome: &meridian_domain::v1::Outcome) -> Result<(), String> {
     use meridian_domain::v1::{OutcomeDetermination, OutcomeStage};
     if OutcomeDetermination::try_from(outcome.determination)
@@ -2238,6 +2417,10 @@ pub struct ReadRequest {
     /// A trades read's catch-up (contract v19): the watermark the reader
     /// last saw.
     pub after: Option<Watermark>,
+    /// A rates read's tenors (contract v27); empty for every tenor.
+    pub tenors: Vec<meridian_domain::v1::Tenor>,
+    /// A rates read's published-time cut-off (contract v27); 0 for none.
+    pub published_as_of_ns: i64,
 }
 
 #[derive(Debug)]
@@ -2389,6 +2572,33 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
             )
         },
     );
+    // Contract v27, the rates slice (W10.4).
+    serve_on(
+        &bus,
+        &lake,
+        RECORD_RATES,
+        (
+            "meridian.v1.RecordRatesRequest",
+            "meridian.v1.RecordObservationsReply",
+        ),
+        |lake, request: RecordRatesRequest, envelope| {
+            lake.record(
+                "rates",
+                request.rates.into_iter().map(Observation::Rate).collect(),
+                &request.want_id,
+                envelope,
+            )
+        },
+    );
+    // Contract v27, the rates slice (W10.6): read as prices are, narrowed
+    // by kind and tenor, and optionally as the source had published them.
+    serve_on(
+        &bus,
+        &lake,
+        LIST_RATES,
+        ("meridian.v1.ListRatesRequest", "meridian.v1.ListRatesReply"),
+        |lake, request: ListRatesRequest, envelope| lake.list_rates(request, envelope),
+    );
     serve_on(
         &bus,
         &lake,
@@ -2452,6 +2662,8 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
                     page_size: request.page_size,
                     cursor: request.cursor,
                     after: request.after_watermark,
+                    tenors: Vec::new(),
+                    published_as_of_ns: 0,
                 },
                 envelope,
             )?;
@@ -2495,6 +2707,8 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
                     page_size: request.page_size,
                     cursor: request.cursor,
                     after: None,
+                    tenors: Vec::new(),
+                    published_as_of_ns: 0,
                 },
                 envelope,
             )?;
@@ -2547,6 +2761,8 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
                     page_size: request.page_size,
                     cursor: request.cursor,
                     after: None,
+                    tenors: Vec::new(),
+                    published_as_of_ns: 0,
                 },
                 envelope,
             )?;
@@ -2587,6 +2803,8 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
                     page_size: request.page_size,
                     cursor: request.cursor,
                     after: None,
+                    tenors: Vec::new(),
+                    published_as_of_ns: 0,
                 },
                 envelope,
             )?;
@@ -2718,10 +2936,9 @@ impl Lake {
             }
             "meridian.v1.InstrumentReplacedEvent" => {
                 if let Ok(event) = InstrumentReplacedEvent::decode(&envelope.payload[..]) {
-                    let stays = event
-                        .instrument
-                        .map(|i| i.instrument_id)
-                        .unwrap_or_default();
+                    let record = event.instrument.unwrap_or_default();
+                    let said = (record.asset_class, record.instrument_type);
+                    let stays = record.instrument_id;
                     if !event.replaced_instrument_id.is_empty() && !stays.is_empty() {
                         if let Err(failed) =
                             self.store
@@ -2729,7 +2946,7 @@ impl Lake {
                         {
                             tracing::warn!(%failed, "a replacement was not kept");
                         }
-                        self.held.lock().expect("held poisoned").insert(stays);
+                        self.held.lock().expect("held poisoned").insert(stays, said);
                     }
                 }
             }

@@ -67,6 +67,13 @@ pub(crate) fn number(
                 done.unchanged += 1;
                 continue;
             }
+            // A rate's confirmation (contract v27, W10.4): only its raw
+            // reference changed. Recorded, as the next version keeping the
+            // reference, and counted unchanged, never a restatement.
+            Some(held) if held.confirms(&row) => {
+                done.unchanged += 1;
+                held.meta().version + 1
+            }
             Some(held) => {
                 done.restated += 1;
                 held.meta().version + 1

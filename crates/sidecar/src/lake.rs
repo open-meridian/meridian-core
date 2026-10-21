@@ -29,9 +29,9 @@ use std::sync::{Arc, RwLock};
 use meridian_bus::Bus;
 use meridian_domain::v1::{
     BarsRecordedEvent, EntitlementsChangedEvent, ListBarsRequest, ListPricesRequest,
-    ObservationMeta, ObservationsWantedEvent, OutcomesRecordedEvent, PricesRecordedEvent,
-    QuotesRecordedEvent, RecordBarsRequest, RecordPricesRequest, TradesRecordedEvent,
-    WantWithdrawnEvent,
+    ListRatesRequest, ObservationMeta, ObservationsWantedEvent, OutcomesRecordedEvent,
+    PricesRecordedEvent, QuotesRecordedEvent, RatesRecordedEvent, RecordBarsRequest,
+    RecordPricesRequest, RecordRatesRequest, TradesRecordedEvent, WantWithdrawnEvent,
 };
 use prost::Message;
 use tokio::sync::watch;
@@ -126,8 +126,9 @@ pub(crate) struct Said {
     /// The latest value first under load, per this key (decisions/024):
     /// a price per subject, dataset, kind, venue and asset; a bar per
     /// subject, dataset, venue and interval start; a quote per subject,
-    /// dataset, venue and asset (contract v19); a want per want. None for a
-    /// trade, which is never conflated.
+    /// dataset, venue and asset (contract v19); a rate per subject, dataset,
+    /// kind, tenor, maturity and convention (contract v27); a want per want.
+    /// None for a trade, which is never conflated.
     pub key: Option<String>,
     pub is_want: bool,
 }
@@ -210,6 +211,22 @@ pub(crate) fn said(payload_type: &str, payload: &[u8]) -> Option<Said> {
                 is_want: false,
             })
         }
+        // Contract v27, the rates slice (W10.5).
+        "meridian.v1.RatesRecordedEvent" => {
+            let rate = RatesRecordedEvent::decode(payload).ok()?.rate?;
+            let (dataset, subjects, _) = meta_said(rate.meta.as_ref());
+            Some(Said {
+                key: Some(format!(
+                    "rate|{}|{dataset}|{}|{}",
+                    subjects.first().cloned().unwrap_or_default(),
+                    rate.kind,
+                    meridian_domain::lake::rate_point(&rate)
+                )),
+                dataset,
+                subjects,
+                is_want: false,
+            })
+        }
         "meridian.v1.ObservationsWantedEvent" => {
             let want = ObservationsWantedEvent::decode(payload).ok()?;
             Some(Said {
@@ -284,6 +301,15 @@ pub(crate) fn stripped(payload_type: &str, payload: &[u8], allowed: &BTreeSet<St
             }
             Err(_) => payload.to_vec(),
         },
+        "meridian.v1.RatesRecordedEvent" => match RatesRecordedEvent::decode(payload) {
+            Ok(mut event) => {
+                if let Some(rate) = event.rate.as_mut() {
+                    meridian_domain::lake::strip_rate(rate, allowed);
+                }
+                event.encode_to_vec()
+            }
+            Err(_) => payload.to_vec(),
+        },
         _ => payload.to_vec(),
     }
 }
@@ -321,6 +347,23 @@ pub(crate) fn dates_refused(payload_type: &str, payload: &[u8]) -> Option<String
         }
         "meridian.v1.ListBarsRequest" => {
             let request = ListBarsRequest::decode(payload).ok()?;
+            check("business_date".into(), &request.business_date)
+        }
+        // Contract v27, the rates slice.
+        "meridian.v1.RecordRatesRequest" => {
+            let request = RecordRatesRequest::decode(payload).ok()?;
+            request.rates.iter().enumerate().find_map(|(i, rate)| {
+                let date = rate
+                    .meta
+                    .as_ref()
+                    .map(|m| m.business_date.as_str())
+                    .unwrap_or("");
+                check(format!("rates[{i}].meta.business_date"), date)
+                    .or_else(|| check(format!("rates[{i}].maturity_date"), &rate.maturity_date))
+            })
+        }
+        "meridian.v1.ListRatesRequest" => {
+            let request = ListRatesRequest::decode(payload).ok()?;
             check("business_date".into(), &request.business_date)
         }
         _ => None,
@@ -407,6 +450,50 @@ mod tests {
             ..Default::default()
         };
         assert!(dates_refused("meridian.v1.ListPricesRequest", &read.encode_to_vec()).is_none());
+    }
+
+    #[test]
+    fn a_rate_is_conflated_per_kind_tenor_maturity_and_convention() {
+        // Contract v27 (W10.5): a bill's discount and coupon-equivalent rates
+        // for one tenor never collapse, nor two tenors of one curve; the same
+        // point again does.
+        use meridian_domain::v1::{Rate, RateConvention, Tenor};
+        let rate = |kind: i32, months: i32, compounding: i32| RatesRecordedEvent {
+            rate: Some(Rate {
+                meta: Some(ObservationMeta {
+                    subjects: vec![SubjectRef {
+                        entity_id: "INS-BILLS".into(),
+                    }],
+                    source: Some(Source {
+                        dataset: "us-treasury-1:ust_bills".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                kind,
+                tenor: Some(Tenor {
+                    count: months,
+                    unit: 3,
+                }),
+                convention: Some(RateConvention {
+                    day_count: 1,
+                    compounding,
+                    periods_per_year: 0,
+                }),
+                ..Default::default()
+            }),
+        };
+        let key = |event: RatesRecordedEvent| {
+            let said = said("meridian.v1.RatesRecordedEvent", &event.encode_to_vec()).unwrap();
+            assert_eq!(said.dataset, "us-treasury-1:ust_bills");
+            assert_eq!(said.subjects, vec!["INS-BILLS"]);
+            said.key.unwrap()
+        };
+        let discount = key(rate(6, 3, 4));
+        assert_ne!(discount, key(rate(7, 3, 2)), "two conventions, one tenor");
+        assert_ne!(discount, key(rate(6, 6, 4)), "two tenors");
+        assert_eq!(discount, key(rate(6, 3, 4)), "the same point");
+        assert!(discount.starts_with("rate|INS-BILLS|us-treasury-1:ust_bills|6|"));
     }
 
     #[test]

@@ -390,7 +390,11 @@ impl Store for PostgresStore {
         }
         let amendments = amendments_of(&mut tx, &query.datasets)?;
         tx.commit().map_err(unavailable)?;
-        let mut out = as_of(out, query.as_of_ns);
+        let mut out = if crate::store::every_version(query) {
+            crate::store::recorded_by(out, query.as_of_ns)
+        } else {
+            as_of(out, query.as_of_ns)
+        };
         as_flagged(&mut out, &amendments, query.as_of_ns);
         Ok(out)
     }
