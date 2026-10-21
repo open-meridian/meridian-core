@@ -276,6 +276,14 @@ the same image with the list on stdin:
       compliance, at the Accounts tab's book part, as a deployment admin
       sets it.
 
+  model-routing MODEL_ID IMPLEMENTATION note=TEXT [--expect-refused TEXT]
+      From contract v26 (W12.6): routes a model id to a `pricing` plugin's
+      instance, or back to `built-in`, at the Settings' Model routing tab, as
+      a deployment admin does, so a run can stop the plugin and read its
+      figures not evaluated. An agent's own call to
+      dashboard__set_model_routing is at "may not" by default; `agents
+      dashboard__set_model_routing --level may_make` loosens it first.
+
 Every command acts as the harness's admin, or, given --as NAME, as one of
 the people `keys` drew a password for (MERIDIAN_HARNESS_PEOPLE, `name=Display
 Name` comma separated), whose account the `people` service made: a run that
@@ -2396,6 +2404,23 @@ def attribute(args):
     print(f"attribute: {said or rest[0] + ' waits ' + given['waits']}")
 
 
+def model_routing(args):
+    """`model-routing MODEL_ID IMPLEMENTATION note=TEXT`: the Settings' Model
+    routing tab (W12.6), as a deployment admin routes a model id."""
+    refusal = option(args, "--expect-refused", None)
+    given = dict(pairs(args))
+    rest = [a for a in args if "=" not in a]
+    if len(rest) != 2:
+        raise Failed("model-routing takes a model id and an implementation")
+    person = signed_in()
+    page = person.get("/admin")
+    done = person.post("/admin/model-routing", {
+        "form_token": form_token(page), "model_id": rest[0], "implementation": rest[1],
+        "note": given.get("note", "")})
+    said = refused_or_done(done, refusal, "the routing")
+    print(f"model-routing: {said or rest[0] + ' routed to ' + rest[1]}")
+
+
 def core_form(args):
     """`core-form PAGE POST FIELD=VALUE... [--expect-refused TEXT]`: one of
     core's own forms, as the deployment admin signed in: PAGE read for its
@@ -2425,7 +2450,8 @@ COMMANDS = {"ready": ready, "settings": settings, "hold": hold, "archive": archi
             "prepared-form": prepared_form, "prepare-settings": prepare_settings,
             "agents": agents, "linkable": linkable, "core-page": core_page,
             "service-account": service_account, "connectivity": connectivity,
-            "instruction": instruction, "attribute": attribute, "core-form": core_form}
+            "instruction": instruction, "attribute": attribute, "core-form": core_form,
+            "model-routing": model_routing}
 
 
 def main(argv):

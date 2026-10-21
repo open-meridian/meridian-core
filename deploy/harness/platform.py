@@ -249,7 +249,13 @@ POLYMARKET = {
     "lifecycle_state": "INSTRUMENT_LIFECYCLE_STATE_ACTIVE",
 }
 VENUES["KLSH"] = KLSH
-EVENT_VENUES = {KLSH["venue_id"]: KLSH, POLYMARKET["venue_id"]: POLYMARKET}
+# v27 stage E: Polymarket US, by its MIC, QCEX, as the venue master holds it.
+QCEX = dict(venue("VEN-01JAE0000000000000000QCEX", "QCEX", "POLYMARKET US", "2025-07-01",
+                  "polymarket-us"), kind="VENUE_KIND_EXCHANGE")
+QCEX["identifiers"][1]["source"] = "polymarket-us"
+VENUES["QCEX"] = QCEX
+EVENT_VENUES = {KLSH["venue_id"]: KLSH, POLYMARKET["venue_id"]: POLYMARKET,
+                QCEX["venue_id"]: QCEX}
 
 # A test equity, by its FIGI: Apple Inc., listed on Nasdaq (XNAS).
 EQUITIES = {
@@ -271,6 +277,7 @@ EQUITIES = {
 # provisional local one, which is not priced (W10.6).
 BTC_CAIP19 = "bip122:000000000019d6689c085ae165831e93/slip44:0"
 USDC_CAIP19 = "eip155:1/erc20:0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+POLYGON_USDC_CAIP19 = "eip155:137/erc20:0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
 CRYPTO = {
     caip19: {
         "instrument_id": instrument_id,
@@ -283,7 +290,20 @@ CRYPTO = {
     for caip19, instrument_id, description in (
         (BTC_CAIP19, f"INS-01JBTC{'0' * 19}1", "Bitcoin"),
         (USDC_CAIP19, f"INS-01JUSDC{'0' * 18}1", "USD Coin"),
+        # v27 stage E: the token Polymarket pays out in, USDC on Polygon.
+        (POLYGON_USDC_CAIP19, f"INS-01JUSDCP{'0' * 17}1", "USD Coin (Polygon)"),
     )
+}
+
+# What each event venue's contracts pay out when the source offers no
+# currency (v27 stage E): the venue's own payout instrument -- Polymarket's
+# 1 USDC on its token -- never USD by default; Kalshi and Polymarket US pay
+# dollars.
+VENUE_PAYOUTS = {
+    POLYMARKET["venue_id"]: {"amount": "1", "currency_code": "",
+                             "instrument_id": CRYPTO[POLYGON_USDC_CAIP19]["instrument_id"]},
+    KLSH["venue_id"]: {"amount": "1", "currency_code": "USD", "instrument_id": ""},
+    QCEX["venue_id"]: {"amount": "1", "currency_code": "USD", "instrument_id": ""},
 }
 
 
@@ -469,6 +489,12 @@ def event_contract(value, venue_record, asked):
     key = (value, venue_record["venue_id"])
     if key not in EVENT_CONTRACTS:
         offered = {f.get("path"): f.get("value", "") for f in asked.get("fields", [])}
+        # A currency the source offers is paid in; else the venue's own
+        # payout instrument (v27 stage E).
+        payout = ({"amount": "1", "currency_code": offered["currency"], "instrument_id": ""}
+                  if offered.get("currency") else
+                  VENUE_PAYOUTS.get(venue_record["venue_id"],
+                                    {"amount": "1", "currency_code": "USD", "instrument_id": ""}))
         currency = offered.get("currency") or "USD"
         n = len(EVENT_CONTRACTS) + 1
         mic = next((i["value"] for i in venue_record["identifiers"] if i["scheme"] == "iso10383"), "")
@@ -480,8 +506,7 @@ def event_contract(value, venue_record, asked):
             "currency": currency,
             "description": offered.get("description") or f"{venue_record['name']} event contract {value}",
             "listing_venue_id": venue_record["venue_id"],
-            "binary_event_contract": {"payout": {"amount": "1", "currency_code": currency,
-                                                 "instrument_id": ""}, "closes_at_ns": 0},
+            "binary_event_contract": {"payout": payout, "closes_at_ns": 0},
             "lifecycle_state": "INSTRUMENT_LIFECYCLE_STATE_ACTIVE",
             "version": 1,
             "template_id": "TPL-binary-event-contract",

@@ -453,6 +453,13 @@ def run():
          f"step 11, operations reads the booking: {listed}")
     del before_over
 
+    # The harness routes a model id as a deployment admin does (v27 stage E):
+    # the venue's plugin prices nothing, so routing to it is refused; back to
+    # the built-in model is taken.
+    runner("model-routing", "quoted_price", "venue", "note=Not a pricing plugin.",
+           "--expect-refused", "pricing")
+    runner("model-routing", "quoted_price", "built-in", "note=The built-in model prices it.")
+
     # 12. Execution costs from the order path (contract v27, ruling 510).
     runner("core-form", "/admin", "/admin/accounts/book", f"account_id={account}",
            "base_currency_code=USD", "lot_relief_default=0", "waits_for_compliance=no-wait",
