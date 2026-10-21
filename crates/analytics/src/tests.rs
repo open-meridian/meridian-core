@@ -499,7 +499,8 @@ async fn an_account_outside_the_scope_and_a_definition_not_served_are_refused_na
     )
     .await
     .unwrap();
-    assert_eq!(definitions.definitions.len(), 8);
+    // v26's eight, and from contract v27 execution_cost v1 and pnl v2.
+    assert_eq!(definitions.definitions.len(), 10);
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -41,6 +41,10 @@ pub mod topics {
     pub const LIST_EVENT_GROUPS: &str = "platform.reference.query.list-event-groups";
     pub const LIST_PRICES: &str = "platform.lake.query.list-prices";
     pub const LIST_OUTCOMES: &str = "platform.lake.query.list-outcomes";
+    /// Contract v27 (W6.36; ruling 483): the deployment's pivot order.
+    pub const READ_FX_PIVOT_CURRENCIES: &str = "platform.config.query.read-fx-pivot-currencies";
+    /// Contract v27 (W10.11): the execution costs a job records.
+    pub const RECORD_EXECUTION_COSTS: &str = "platform.lake.command.record-execution-costs";
 
     /// The component's own topic, coordinator to worker: a unit, asked of
     /// the worker pool's queue group and answered by one worker. A

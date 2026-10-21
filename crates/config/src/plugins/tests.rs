@@ -912,6 +912,54 @@ async fn an_affirmation_deadline_is_operations_and_a_time_of_day() {
     upload(&bus, with(&["custody"], 0, "0.1.3")).await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pricing_versions_models_are_pricings_each_named_once() {
+    // Contract v27 (W12.3; ruling 324): refused on a version not holding
+    // pricing; each model id and version once, each version 1 or more.
+    let (bus, _) = harness();
+    let with = |roles: &[&str], models: &[(&str, i32)], version: &str| {
+        let mut upload = snaptrade(version);
+        let metadata = upload.metadata.as_mut().unwrap();
+        metadata.roles = roles.iter().map(|r| r.to_string()).collect();
+        metadata.declaration = Some(meridian_pb::v1::PluginDeclaration {
+            pricing_models: models
+                .iter()
+                .map(|(id, v)| meridian_pb::v1::PricingModelDeclaration {
+                    model_id: id.to_string(),
+                    model_version: *v,
+                })
+                .collect(),
+            ..Default::default()
+        });
+        upload
+    };
+    let refused = upload(&bus, with(&["custody"], &[("quoted_price", 1)], "0.1.0"))
+        .await
+        .unwrap_err();
+    assert!(refused.contains("not holding pricing"), "{refused}");
+    let refused = upload(&bus, with(&["pricing"], &[("quoted_price", 0)], "0.1.1"))
+        .await
+        .unwrap_err();
+    assert!(refused.contains("pricing_models[0].model_version"), "{refused}");
+    let refused = upload(
+        &bus,
+        with(&["pricing"], &[("quoted_price", 1), ("quoted_price", 1)], "0.1.2"),
+    )
+    .await
+    .unwrap_err();
+    assert!(refused.contains("pricing_models[1]"), "{refused}");
+    let recorded = upload(
+        &bus,
+        with(&["pricing"], &[("quoted_price", 1), ("quoted_price", 2)], "0.1.3"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        recorded.metadata.unwrap().declaration.unwrap().pricing_models.len(),
+        2
+    );
+}
+
 /// A version naming its documentation, with the texts the CLI read.
 fn documented(version: &str, texts: &[(&str, &str)]) -> RecordPluginUploadRequest {
     use sha2::Digest;

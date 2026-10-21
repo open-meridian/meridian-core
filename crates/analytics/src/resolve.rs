@@ -23,7 +23,8 @@ use meridian_analytics_engine::compile::Compiled;
 use meridian_bus::{refusal_with_status, RefusalStatus};
 use meridian_domain::exact::Exact;
 use meridian_domain::v1::{
-    self as v1, EventGroupFlag, Job, ListAccountAttributesReply, ListAccountAttributesRequest,
+    self as v1, EventGroupFlag, FxPivotCurrenciesSetting, Job, ListAccountAttributesReply,
+    ListAccountAttributesRequest, ReadFxPivotCurrenciesRequest,
     ListEventGroupsReply, ListEventGroupsRequest, ListModelRoutingReply, ListModelRoutingRequest,
     ListOutcomesReply, ListOutcomesRequest, ListPositionsReply, ListPositionsRequest,
     ListPricesReply, ListPricesRequest, Money, OutcomeStage, PriceKind, ReadTemplateReply,
@@ -124,6 +125,10 @@ struct Record {
     model_version: i64,
     asset_class: String,
     currency_code: String,
+    /// Contract v27 (ruling 462): a fiat cash instrument's ISO 4217 code,
+    /// from its `iso4217` identifier; empty for a token and every other
+    /// instrument.
+    iso_code: String,
     price_kind: String,
     payout: Option<(String, String, String)>,
 }
@@ -179,6 +184,30 @@ pub fn resolve(
         now_ns
     };
     let sources = inputs.sources.clone();
+    // Contract v27 (W12.1; ruling 458): a business date -- the book at its
+    // end, the lake at its closes -- never one after today's.
+    let business_date = job.business_date.clone();
+    if !business_date.is_empty() {
+        let today = meridian_domain::date::Date::of_utc_instant(now_ns).to_string();
+        if business_date > today {
+            return Err(refusal_with_status(
+                RefusalStatus::InvalidArgument,
+                &["business_date".to_string()],
+                format!("business_date: {business_date} is after today's, {today}"),
+            ));
+        }
+    }
+
+    // Contract v27 (W6.36; ruling 483): the deployment's pivot order, by
+    // cash instrument; never set, USD's and then EUR's, as this job's stores
+    // name them (below).
+    let pivots: FxPivotCurrenciesSetting = ask(
+        asker,
+        topics::READ_FX_PIVOT_CURRENCIES,
+        "meridian.v1.ReadFxPivotCurrenciesRequest",
+        &ReadFxPivotCurrenciesRequest {},
+    )
+    .unwrap_or_default();
 
     // The routing table in force (W12.6), named by its version.
     let routing: ListModelRoutingReply = ask(
@@ -246,6 +275,7 @@ pub fn resolve(
                 &ListPositionsRequest {
                     account_id: account.clone(),
                     at: inputs.book_at.clone(),
+                    business_date: business_date.clone(),
                     page_size: BOOK_PAGE,
                     cursor: cursor.clone(),
                     ..Default::default()
@@ -284,6 +314,10 @@ pub fn resolve(
         .iter()
         .map(|(_, p)| p.instrument_id.clone())
         .chain(compiled.reads.what_if_instruments.iter().cloned())
+        // Contract v27: the pivots' and the reporting currency's records,
+        // which say whether each is fiat (ruling 462).
+        .chain(pivots.fx_pivot_currencies.iter().cloned())
+        .chain(Some(job.reporting_currency.clone()).filter(|r| !r.is_empty()))
         .collect();
     let mut groups: BTreeMap<String, v1::EventGroup> = BTreeMap::new();
     let named_groups: Vec<String> = compiled.reads.event_groups.iter().cloned().collect();
@@ -366,10 +400,21 @@ pub fn resolve(
             }
         }
     }
+    // Contract v27 (ruling 462): the bases', the pivots' and the reporting
+    // currency's own prices too, so a fiat leg with no rate in the lake's
+    // direction is inverted or crossed from the rate the other way.
+    let mut fiat_ends: BTreeSet<String> = pivots.fx_pivot_currencies.iter().cloned().collect();
+    if !job.reporting_currency.is_empty() {
+        fiat_ends.insert(job.reporting_currency.clone());
+    }
     for (_, code) in &base_codes {
         if let Some(id) = codes.get(code) {
-            wants.entry(id.clone()).or_default();
+            fiat_ends.insert(id.clone());
         }
+    }
+    for id in &fiat_ends {
+        let kinds = wants.entry(id.clone()).or_default();
+        kinds.extend(LEG_KINDS.iter().map(|k| *k as i32));
     }
     let mut depth = 0;
     while !wants.is_empty() && depth <= MOST_LEGS {
@@ -386,7 +431,15 @@ pub fn resolve(
         }
         for (kinds, subjects) in by_kinds {
             for chunk in subjects.chunks(SUBJECTS) {
-                let rows = prices(asker, chunk, &kinds, &sources, as_of, &mut unentitled)?;
+                let rows = prices(
+                    asker,
+                    chunk,
+                    &kinds,
+                    &sources,
+                    as_of,
+                    &business_date,
+                    &mut unentitled,
+                )?;
                 for price in rows {
                     let Some(row) = market_row(&price) else {
                         continue;
@@ -564,9 +617,21 @@ pub fn resolve(
                 "price_kind": r.price_kind,
                 "payout": r.payout.as_ref().map(|(amount, currency, _)| json!({"amount": amount, "instrument_id": currency})),
                 "country": "",
+                // Contract v27 (ruling 462): fiat alone is inverted or crossed.
+                "currency_code": r.iso_code,
             })
         })
         .collect();
+    // The pivots in force: the setting's, or never set, USD's cash
+    // instrument and then EUR's, as this job's stores named them (W6.36).
+    let pivot_ids: Vec<String> = if pivots.fx_pivot_currencies.is_empty() {
+        ["USD", "EUR"]
+            .iter()
+            .filter_map(|code| codes.get(*code).cloned())
+            .collect()
+    } else {
+        pivots.fx_pivot_currencies.clone()
+    };
     market.sort_by_key(|row| {
         (
             row["subject_id"].as_str().unwrap_or_default().to_string(),
@@ -590,6 +655,7 @@ pub fn resolve(
         })
         .collect();
     let mut document = json!({
+        "fx_pivot_currencies": pivot_ids,
         "engine_version": engine_version,
         "job": job_json(job, compiled),
         "book_watermark": watermark_json(&watermark),
@@ -597,9 +663,14 @@ pub fn resolve(
         "routing_version": routing.version.to_string(),
         "accounts": accounts,
         "positions": position_rows,
-        // pnl version 1 is unrealized alone (ruling 320); the book records
-        // no closed lot's proceeds until v27, so nothing reads closed lots.
-        "closed_lots": [],
+        // Contract v27 (rulings 320 and 396): each closed lot's relief with
+        // its proceeds, for pnl version 2's realized; none where no measure
+        // asks.
+        "closed_lots": if compiled.definitions.iter().any(|d| d.definition == "pnl" && d.version >= 2) {
+            closed_lots(&positions, &codes, &base_codes)
+        } else {
+            Vec::new()
+        },
         "instruments": instruments,
         "market": market,
         "history": {"dates": dates, "closes": closes},
@@ -712,6 +783,16 @@ fn record(
         }
     };
     let price_kind = price_kind_of(&model_id, &pricing_inputs, &record);
+    let iso_code = if asset_class == "cash" {
+        record
+            .identifiers
+            .iter()
+            .find(|i| i.scheme == "iso4217")
+            .map(|i| i.value.clone())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     let payout = record
         .binary_event_contract
         .as_ref()
@@ -729,6 +810,7 @@ fn record(
         model_version,
         asset_class,
         currency_code: record.currency,
+        iso_code,
         price_kind,
         payout,
     }))
@@ -768,12 +850,14 @@ fn event_groups(
 
 /// Prices of these subjects and kinds at the as-of, every page; what a
 /// dataset would have answered and the client is not entitled to, noted.
+#[allow(clippy::too_many_arguments)]
 fn prices(
     asker: &dyn Ask,
     subjects: &[String],
     kinds: &[i32],
     sources: &Option<v1::SourceChoice>,
     as_of: i64,
+    business_date: &str,
     unentitled: &mut BTreeMap<(String, String), String>,
 ) -> Result<Vec<v1::Price>, Refused> {
     let mut out = Vec::new();
@@ -792,7 +876,10 @@ fn prices(
                     .collect(),
                 kinds: kinds.to_vec(),
                 sources: sources.clone(),
-                at_ns: as_of,
+                // A business date's closes (ruling 458), else the latest in
+                // force at the as-of.
+                at_ns: if business_date.is_empty() { as_of } else { 0 },
+                business_date: business_date.to_string(),
                 as_of_ns: as_of,
                 page_size: PAGE,
                 cursor: cursor.clone(),
@@ -825,6 +912,15 @@ fn market_row(price: &v1::Price) -> Option<Value> {
     let subject = meta.subjects.first()?.entity_id.clone();
     let money = price.price.as_ref()?;
     let amount = text_of(money.amount.as_ref())?;
+    // Contract v27 (ruling 460): its source time, the event time where the
+    // source states one, else the earliest it states, else its valid time.
+    let event = meta
+        .source_times
+        .iter()
+        .find(|t| t.kind == v1::SourceTimeKind::Event as i32)
+        .map(|t| t.at_ns);
+    let earliest = meta.source_times.iter().map(|t| t.at_ns).min();
+    let source_ns = event.or(earliest).unwrap_or(meta.valid_from_ns);
     Some(json!({
         "subject_id": subject,
         "kind": kind_name(price.kind),
@@ -832,6 +928,9 @@ fn market_row(price: &v1::Price) -> Option<Value> {
         "instrument_id": money.instrument_id,
         "dataset": meta.source.as_ref().map(|s| s.dataset.clone()).unwrap_or_default(),
         "valid_at_ns": meta.valid_from_ns.to_string(),
+        "row_key": meta.row_key,
+        "version": meta.version.to_string(),
+        "source_ns": source_ns.to_string(),
     }))
 }
 
@@ -1024,9 +1123,105 @@ fn job_json(job: &Job, compiled: &Compiled) -> Value {
             })).collect::<Vec<_>>(),
         })
     });
-    json!({
+    let mut out = json!({
         "account_ids": job.account_ids,
         "measures": compiled.measures.iter().map(|m| m.to_json()).collect::<Vec<_>>(),
         "what_if": what_if,
-    })
+    });
+    // Contract v27 (rulings 458 and 459), written where the job names them.
+    if !job.business_date.is_empty() {
+        out["business_date"] = json!(job.business_date);
+    }
+    if !job.reporting_currency.is_empty() {
+        out["reporting_currency"] = json!(job.reporting_currency);
+    }
+    out
+}
+
+/// Each relief of a lot the book closed, as pnl version 2 reads it (W9.10,
+/// contract v27; rulings 320 and 396): the quantity relieved, what it was
+/// sold for and its cost -- the lot's cost in the base for that share of it
+/// -- each in the account's base; a relief with no proceeds is no sale and
+/// is left out; a lot with no cost in the base answers none, which the
+/// engine answers COST_MISSING (ruling 325).
+fn closed_lots(
+    positions: &[(String, v1::BookPosition)],
+    codes: &BTreeMap<String, String>,
+    base_codes: &[(String, String)],
+) -> Vec<Value> {
+    let mut out = Vec::new();
+    for (account, position) in positions {
+        let base_code = base_codes
+            .iter()
+            .find(|(a, _)| a == account)
+            .map(|(_, c)| c.clone())
+            .unwrap_or_default();
+        let base = codes.get(&base_code).cloned().unwrap_or_default();
+        let in_base = |money: &Money| {
+            money.instrument_id == base
+                || (money.instrument_id.is_empty() && money.currency_code == base_code)
+        };
+        for lot in &position.lots {
+            let original = lot
+                .original_quantity
+                .as_ref()
+                .and_then(|d| Exact::from_wire(d).ok());
+            let cost = lot
+                .terms
+                .as_ref()
+                .and_then(|t| t.cost.as_ref())
+                .filter(|c| in_base(c))
+                .and_then(|c| c.amount.as_ref())
+                .and_then(|d| Exact::from_wire(d).ok());
+            for relief in &lot.reliefs {
+                let Some(proceeds) = relief.proceeds.as_ref().filter(|p| in_base(p)) else {
+                    continue;
+                };
+                let (Some(quantity), Some(amount)) = (
+                    relief.quantity.as_ref().and_then(|d| Exact::from_wire(d).ok()),
+                    proceeds.amount.as_ref().and_then(|d| Exact::from_wire(d).ok()),
+                ) else {
+                    continue;
+                };
+                // The lot's cost for the quantity relieved, exact where it
+                // divides, else rounded at 18 places.
+                let share = match (cost, original) {
+                    (Some(cost), Some(original)) if !original.is_zero() => {
+                        cost_share(cost, quantity, original)
+                    }
+                    _ => None,
+                };
+                out.push(json!({
+                    "account_id": account,
+                    "instrument_id": position.instrument_id,
+                    "quantity": quantity.to_string(),
+                    "proceeds": amount.to_string(),
+                    "cost": share.map(|c| c.to_string()).unwrap_or_default(),
+                    "sleeve": lot.sleeve,
+                }));
+            }
+        }
+    }
+    out.sort_by(|a, b| {
+        (a["account_id"].as_str(), a["instrument_id"].as_str())
+            .cmp(&(b["account_id"].as_str(), b["instrument_id"].as_str()))
+    });
+    out
+}
+
+/// cost × quantity ÷ original, as text the engine reads exactly: by the
+/// engine's own exact arithmetic, rounded half to even to 18 places.
+fn cost_share(cost: Exact, quantity: Exact, original: Exact) -> Option<String> {
+    use meridian_analytics_engine::exact::Dec;
+    let read = |e: Exact| Dec::parse(&e.to_string()).ok();
+    let (cost, quantity, original) = (read(cost)?, read(quantity)?, read(original)?);
+    if original.is_zero() {
+        return None;
+    }
+    let share = cost
+        .mul(&quantity)
+        .to_ratio()
+        .div(&original.to_ratio())
+        .round_half_even(18);
+    Some(share.text())
 }

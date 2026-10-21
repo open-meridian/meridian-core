@@ -358,6 +358,8 @@ impl Observation {
                     && same_money(&a.settlement_value, &b.settlement_value)
                     && a.settled_at_ns == b.settled_at_ns
                     && a.determination_as_reported == b.determination_as_reported
+                    // Contract v27 (W10.4): the venue's challenge deadline.
+                    && a.challenge_ends_at_ns == b.challenge_ends_at_ns
             }
             (Observation::ExecutionCost(a), Observation::ExecutionCost(b)) => {
                 same_money(&a.benchmark_price, &b.benchmark_price)
