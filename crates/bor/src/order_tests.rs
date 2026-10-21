@@ -3288,3 +3288,134 @@ mod booking;
 
 #[path = "order_path_v27_tests.rs"]
 mod order_path_v27;
+
+// ── Contract v27 (W11.7, W11.8; rulings 374 and 420): checks at use ────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_reference_holds_the_order_typed_or_rides_its_placement() {
+    let w = wired();
+    let order = released(&w, "10").await;
+    let stale = StaleReference {
+        dataset: "oanda-1:pricing".into(),
+        age_ns: 7_200_000_000,
+        ceiling_ns: 5_000_000_000,
+    };
+    let hold = |condition: OrderCondition, cause: HoldCause, stale: Option<StaleReference>| {
+        SetWorkingConditionRequest {
+            order_id: order.order_id.clone(),
+            condition: condition as i32,
+            set: true,
+            reason: "the reference price is stale".into(),
+            hold_cause: cause as i32,
+            stale_reference: stale,
+            ..Default::default()
+        }
+    };
+    let send = |request: SetWorkingConditionRequest| {
+        let w = &w;
+        async move {
+            order_command(
+                w,
+                SET_WORKING_CONDITION,
+                "meridian.v1.SetWorkingConditionRequest",
+                &request,
+                &person(TRADER),
+            )
+            .await
+        }
+    };
+    // A cause on any condition but held, or with no stale reference, is
+    // refused naming the field; a stale reference with no cause too.
+    let refused = send(hold(
+        OrderCondition::Claimed,
+        HoldCause::ReferencePriceStale,
+        Some(stale.clone()),
+    ))
+    .await
+    .unwrap_err();
+    assert_eq!(
+        status_of(&refused).unwrap().1,
+        vec!["hold_cause".to_string()]
+    );
+    let refused = send(hold(
+        OrderCondition::Held,
+        HoldCause::ReferencePriceStale,
+        None,
+    ))
+    .await
+    .unwrap_err();
+    assert_eq!(
+        status_of(&refused).unwrap().1,
+        vec!["stale_reference".to_string()]
+    );
+    let refused = send(hold(
+        OrderCondition::Held,
+        HoldCause::Unspecified,
+        Some(stale.clone()),
+    ))
+    .await
+    .unwrap_err();
+    assert_eq!(
+        status_of(&refused).unwrap().1,
+        vec!["stale_reference".to_string()]
+    );
+    // Held with its typed cause, read typed.
+    let held = send(hold(
+        OrderCondition::Held,
+        HoldCause::ReferencePriceStale,
+        Some(stale.clone()),
+    ))
+    .await
+    .unwrap()
+    .order
+    .unwrap();
+    let condition = held
+        .status
+        .unwrap()
+        .conditions
+        .into_iter()
+        .find(|c| c.condition == OrderCondition::Held as i32)
+        .unwrap();
+    assert_eq!(condition.hold_cause, HoldCause::ReferencePriceStale as i32);
+    assert_eq!(condition.stale_reference.unwrap(), stale);
+    // Released from the hold, a warned placement carries the warning.
+    send(SetWorkingConditionRequest {
+        set: false,
+        ..hold(OrderCondition::Held, HoldCause::Unspecified, None)
+    })
+    .await
+    .unwrap();
+    let placed = send_from(
+        &w.bus,
+        CREATE_PLACEMENT,
+        "meridian.v1.CreatePlacementRequest",
+        &CreatePlacementRequest {
+            order_id: order.order_id.clone(),
+            connectivity_instance_id: ME.into(),
+            venue_account_code: "SNAP-ACCT-9F2".into(),
+            quantity: d("10"),
+            limit_price: usd("227.50"),
+            stale_reference: Some(stale.clone()),
+            ..Default::default()
+        },
+        &person(TRADER),
+    )
+    .await
+    .map(|reply| PlacementReply::decode(&reply[..]).unwrap())
+    .unwrap()
+    .placement
+    .unwrap();
+    let warned = placed
+        .status
+        .unwrap()
+        .conditions
+        .into_iter()
+        .find(|c| c.condition == PlacementCondition::SentOnStaleReference as i32)
+        .expect("the warning kept on the placement");
+    assert_eq!(warned.stale_reference.unwrap(), stale);
+    assert!(
+        warned.reason.contains("2.2 s past its ceiling"),
+        "{}",
+        warned.reason
+    );
+}

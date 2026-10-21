@@ -1771,6 +1771,42 @@ pub fn set_working_condition(
         return Err(claim_refused(order));
     }
     let mut held_condition = standing(ctx, kind, request.reason.clone());
+    // Contract v27 (W11.7; rulings 374 and 420): a hold's typed cause, the
+    // `ems`'s stale reference price with its dataset, age and ceiling; on a
+    // held condition set and no other.
+    let cause = meridian_domain::v1::HoldCause::try_from(request.hold_cause)
+        .map_err(|_| malformed(&["hold_cause"], "names no hold cause"))?;
+    if cause != meridian_domain::v1::HoldCause::Unspecified {
+        if kind != OrderCondition::Held || !request.set {
+            return Err(malformed(
+                &["hold_cause"],
+                "a hold's cause is set on a held condition being set, and no other",
+            ));
+        }
+        let Some(stale) = request
+            .stale_reference
+            .as_ref()
+            .filter(|s| !s.dataset.is_empty())
+        else {
+            return Err(malformed(
+                &["stale_reference"],
+                "a hold on a stale reference price names its dataset, age and ceiling",
+            ));
+        };
+        if stale.age_ns < 0 || stale.ceiling_ns < 0 {
+            return Err(malformed(
+                &["stale_reference"],
+                "a stale reference's age and ceiling are never negative",
+            ));
+        }
+        held_condition.hold_cause = request.hold_cause;
+        held_condition.stale_reference = Some(stale.clone());
+    } else if request.stale_reference.is_some() {
+        return Err(malformed(
+            &["stale_reference"],
+            "a stale reference rides a hold whose cause is the stale reference price",
+        ));
+    }
     if kind == OrderCondition::Claimed {
         held_condition.claimant = Some(Claimant {
             instance_id: ctx.instance_id.clone(),
@@ -1891,6 +1927,15 @@ pub fn create_placement(
             ))
         }
     }
+    if let Some(stale) = &request.stale_reference {
+        if stale.dataset.is_empty() || stale.age_ns < 0 || stale.ceiling_ns < 0 {
+            return Err(malformed(
+                &["stale_reference"],
+                "a placement sent on a stale reference names its dataset, and its age and \
+                 ceiling, never negative",
+            ));
+        }
+    }
     let placement = Placement {
         placement_id: ctx.mint(ids::PLACEMENT),
         order_id: order_id.clone(),
@@ -1921,6 +1966,26 @@ pub fn create_placement(
         counterparty_contact: request.counterparty_contact.clone(),
         agreed_at_ns: request.agreed_at_ns,
         agreed_precision: request.agreed_precision,
+        // Contract v27 (W11.8; ruling 420): sent on a stale reference, the
+        // `ems` admin having chosen warn: a record of the warning, kept as
+        // the placement's condition.
+        status: match &request.stale_reference {
+            Some(stale) => Some(meridian_domain::v1::PlacementStatus {
+                state: 0,
+                conditions: vec![meridian_domain::v1::StandingPlacementCondition {
+                    condition: meridian_domain::v1::PlacementCondition::SentOnStaleReference as i32,
+                    reason: format!(
+                        "sent on {}'s reference price, {} past its ceiling",
+                        stale.dataset,
+                        words_ns(stale.age_ns.saturating_sub(stale.ceiling_ns))
+                    ),
+                    actor: Some(ctx.actor()),
+                    stale_reference: Some(stale.clone()),
+                    ..Default::default()
+                }],
+            }),
+            None => None,
+        },
         ..Default::default()
     };
     let plan = Plan::new(
@@ -1933,6 +1998,12 @@ pub fn create_placement(
     check_reached(book, &made, &order_id, "6", Some(state))
         .or_else(|_| check_reached(book, &made, &order_id, "8", Some(state)))?;
     Ok(made)
+}
+
+/// A span in words a person reads: `3.2 s`.
+fn words_ns(ns: i64) -> String {
+    let ms = ns.max(0) / 1_000_000;
+    format!("{}.{} s", ms / 1000, (ms % 1000) / 100)
 }
 
 /// A placement's type against its fields (contract v27, W11.8; the gaps

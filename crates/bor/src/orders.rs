@@ -911,11 +911,25 @@ impl Ledger {
                         order.placements.push(id.clone());
                     }
                 }
+                // Contract v27 (W11.8): a warning it was opened with, sent
+                // on a stale reference, kept as its condition; its status
+                // is otherwise derived.
+                let mut opened = placement.clone();
+                let conditions = opened
+                    .status
+                    .take()
+                    .map(|status| status.conditions)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|c| c.condition == PlacementCondition::SentOnStaleReference as i32)
+                    .map(|c| (c.condition, c))
+                    .collect();
                 self.placements.insert(
                     id,
                     PlacementHeld {
-                        placement: placement.clone(),
+                        placement: opened,
                         state: PlacementState::Queued,
+                        conditions,
                         ..Default::default()
                     },
                 );
