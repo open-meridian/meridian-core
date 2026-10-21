@@ -125,5 +125,15 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 
+# Line tables alone for debug builds and tests, so a stack trace stays
+# readable at about half the artifacts' size: what Dockerfile.rust's builds
+# already set by environment, here for every build of the workspace, a
+# developer's own cargo included (ruling 354).
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
+
 [profile.release]
 debug = false

@@ -18,6 +18,8 @@ Docker's own filesystem, on a Docker Desktop VM and a CI runner alike.
                   --budgets "stage=GB ..." --images "..."
     gate.py begin STAGE
     gate.py drop IMAGE ...
+    gate.py mark STAGE SERVICE ...
+    gate.py release STAGE
     gate.py end STAGE [--drop IMAGE ...]
     gate.py finish
 
@@ -29,6 +31,13 @@ an image the gate did not make. The cargo caches outlive a run, so a change
 recompiles only what it touched; `start` empties them once they are older than
 GATE_CACHE_DAYS, since cargo keeps what it built for every dependency version
 it has ever seen.
+
+What `release` frees: the containers of the compose services `mark` named
+that the stage's targets created -- those there at `release` and not at
+`mark` -- with their anonymous volumes (a database's data, a directory's).
+Never a container that was there before the stage, so a developer's own
+stack keeps running; never a named volume; and never the services' images,
+which later stages start again.
 """
 
 from __future__ import annotations
@@ -183,7 +192,7 @@ def start(args: argparse.Namespace) -> int:
         except (ProcessLookupError, ValueError):
             pass
     docker("rm", "-f", PROBE)
-    for f in ("samples", "stages", "current", "breach", "finished", "daemon.pid"):
+    for f in ("samples", "stages", "current", "breach", "finished", "daemon.pid", "marked.json"):
         (STATE / f).unlink(missing_ok=True)
     STATE.mkdir(exist_ok=True)
 
@@ -303,6 +312,51 @@ def drop(args: argparse.Namespace) -> int:
     return 0
 
 
+def service_containers(services: list[str]) -> set[str]:
+    """The containers of these services in this repository's compose project,
+    running or not, by ID."""
+    done = subprocess.run(["docker", "compose", "--profile", "*", "ps", "-aq", *services],
+                          cwd=ROOT, capture_output=True, text=True)
+    return set(done.stdout.split()) if done.returncode == 0 else set()
+
+
+def mark(args: argparse.Namespace) -> int:
+    """The services whose containers the stage's targets will create, with the
+    containers they have already, so `release` frees only the stage's own."""
+    if not started():
+        return 0
+    path = STATE / "marked.json"
+    marked = json.loads(path.read_text()) if path.exists() else {}
+    marked[args.stage] = {"services": args.services,
+                          "before": sorted(service_containers(args.services))}
+    path.write_text(json.dumps(marked))
+    return 0
+
+
+def release(args: argparse.Namespace) -> int:
+    """The containers the stage's targets created for the services `mark`
+    named, and their anonymous volumes, removed before the next stage."""
+    if not started():
+        return 0
+    path = STATE / "marked.json"
+    marked = json.loads(path.read_text()) if path.exists() else {}
+    if args.stage not in marked:
+        sys.exit(f"gate: releasing {args.stage}, which marked no services")
+    entry = marked.pop(args.stage)
+    path.write_text(json.dumps(marked))
+    before = free_kb()
+    record(before)
+    created = sorted(service_containers(entry["services"]) - set(entry["before"]))
+    for container in created:
+        docker("rm", "-f", "-v", container)
+    after = free_kb()
+    record(after)
+    print(f"-- gate: released {len(created)} container(s) of {' '.join(entry['services'])} "
+          f"the stage made, with their volumes: {gb(before)} GB free, {gb(after)} GB once freed",
+          flush=True)
+    return 0
+
+
 def end(args: argparse.Namespace) -> int:
     if not started():
         return 0
@@ -356,7 +410,7 @@ def finish(_: argparse.Namespace) -> int:
     print("\ngate: per-stage peak, GB above the start "
           f"({gb(run['start_free_kb'])} GB free then):")
     for stage, peak, budget, lowest, after, secs, verdict in rows:
-        print(f"  {stage:<12} peak {peak:>5} of {budget:>4}  lowest free {lowest:>5}  "
+        print(f"  {stage:<14} peak {peak:>5} of {budget:>4}  lowest free {lowest:>5}  "
               f"freed to {after:>5}  {int(secs) // 60:>3}m{int(secs) % 60:02d}s  {verdict}")
     worst = max(rows, key=lambda r: float(r[1]))
     print(f"gate: the most it held at once was {worst[1]} GB, in {worst[0]}")
@@ -383,10 +437,15 @@ def main() -> int:
     e.add_argument("--drop", nargs="*", default=[])
     d = sub.add_parser("drop")
     d.add_argument("images", nargs="+")
+    m = sub.add_parser("mark")
+    m.add_argument("stage")
+    m.add_argument("services", nargs="+")
+    r = sub.add_parser("release")
+    r.add_argument("stage")
     sub.add_parser("finish")
     args = parser.parse_args()
-    return {"start": start, "begin": begin, "drop": drop, "end": end,
-            "finish": finish}[args.command](args)
+    return {"start": start, "begin": begin, "drop": drop, "mark": mark, "release": release,
+            "end": end, "finish": finish}[args.command](args)
 
 
 if __name__ == "__main__":
