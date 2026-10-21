@@ -26,7 +26,8 @@ use meridian_domain::v1::{
     DontKnowExecutionRequest, ExecutionRecordedEvent, FactReply, ListLocatesReply,
     ListLocatesRequest, ListOrdersReply, ListOrdersRequest, ListTradingInstructionsReply,
     ListTradingInstructionsRequest, LocateReply, LocateUpdatedEvent, OrderHistoryReply,
-    OrderHistoryRequest, OrderReply, OrderUpdatedEvent, PlacementReply, PlacementUpdatedEvent,
+    OrderHistoryRequest, OrderReply, OrderUpdatedEvent, PickPlacementQuoteRequest, PlacementReply,
+    PlacementUpdatedEvent, ReportPlacementQuoteRequest,
     ProposeOrderRequest, RecordCheckRequest, RecordLocateRequest, RecordLocateUseRequest,
     RecordOrderRequest, ReleaseOrderRequest, ReportChargeRequest, ReportExecutionRequest,
     ReportPlacementRequest, ReportValueDateRollRequest, RequestOrderChangeRequest,
@@ -64,6 +65,9 @@ pub const RECORD_LOCATE_USE: &str = "platform.book.command.record-locate-use";
 pub const ACCEPT_EXECUTION: &str = "platform.book.command.accept-execution";
 pub const DONT_KNOW_EXECUTION: &str = "platform.book.command.dont-know-execution";
 pub const REPORT_VALUE_DATE_ROLL: &str = "platform.book.command.report-value-date-roll";
+// Contract v27 (W11.40, W11.41): an RFQ placement's quotes and the pick.
+pub const REPORT_PLACEMENT_QUOTE: &str = "platform.book.command.report-placement-quote";
+pub const PICK_PLACEMENT_QUOTE: &str = "platform.book.command.pick-placement-quote";
 
 pub const ORDER_UPDATED: &str = "platform.book.event.order-updated";
 pub const PLACEMENT_UPDATED: &str = "platform.book.event.placement-updated";
@@ -979,6 +983,67 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
                 &|book, head, ctx| {
                     let made = orders::report_value_date_roll(book, head, ctx, &request)?;
                     let reply = fact_reply(&made);
+                    Ok((made, reply))
+                },
+                None,
+            )
+        });
+    }
+    {
+        // W11.40 (contract v27): a dealer's quote on the firm's RFQ
+        // placement, from the connectivity plugin the placement names.
+        let (bus2, store, clock) = (bus.clone(), store.clone(), clock.clone());
+        bus.serve(REPORT_PLACEMENT_QUOTE, move |envelope| {
+            let request: ReportPlacementQuoteRequest =
+                decode(&envelope, "meridian.v1.ReportPlacementQuoteRequest")?;
+            crate::cash::ensure_blocking(
+                &bus2,
+                &store,
+                &meridian_domain::money::codes(&request),
+                clock.now_ns(),
+            );
+            let ctx = context_of(&envelope, clock.as_ref());
+            let account = owner_of(store.as_ref(), Record::Placement, &request.placement_id)
+                .map_err(|f| f.on_the_bus())?;
+            act(
+                &bus2,
+                store.as_ref(),
+                &envelope,
+                ctx,
+                &account,
+                &request.idempotency_key,
+                "meridian.v1.PlacementReply",
+                &|book, head, ctx| {
+                    let made = orders::report_placement_quote(book, head, ctx, &request)?;
+                    let reply = placement_reply(&made, &request.placement_id, "");
+                    Ok((made, reply))
+                },
+                None,
+            )
+        });
+    }
+    {
+        // W11.41 (contract v27): the ems's pick of an open quote.
+        let (bus2, store, clock) = (bus.clone(), store.clone(), clock.clone());
+        bus.serve(PICK_PLACEMENT_QUOTE, move |envelope| {
+            let request: PickPlacementQuoteRequest =
+                decode(&envelope, "meridian.v1.PickPlacementQuoteRequest")?;
+            let mut ctx = context_of(&envelope, clock.as_ref());
+            ctx.agent_orders_demo_only =
+                crate::booking_service::agent_orders_demo_only(store.as_ref());
+            let account = owner_of(store.as_ref(), Record::Placement, &request.placement_id)
+                .map_err(|f| f.on_the_bus())?;
+            act(
+                &bus2,
+                store.as_ref(),
+                &envelope,
+                ctx,
+                &account,
+                &request.idempotency_key,
+                "meridian.v1.PlacementReply",
+                &|book, head, ctx| {
+                    let made = orders::pick_placement_quote(book, head, ctx, &request)?;
+                    let reply = placement_reply(&made, &request.placement_id, "");
                     Ok((made, reply))
                 },
                 None,

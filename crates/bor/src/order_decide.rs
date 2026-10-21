@@ -26,10 +26,11 @@ use meridian_domain::v1::{
     DontKnowExecutionRequest, Execution, ExecutionKind, ExecutionState, HoldingSide, LocateUseKind,
     LotReliefMethod, LotSource, LotTerms, Money, MovementLine, Order, OrderChange, OrderChangeKind,
     OrderCondition, OrderLinkKind, OrderOrigin, OrderState, OrderType, PersonRoles, Placement,
-    PlacementChange, PlacementChangeKind, PlacementEvent, PlacementState, ProposeOrderRequest,
+    PickPlacementQuoteRequest, PlacementChange, PlacementChangeKind, PlacementEvent,
+    PlacementQuote, PlacementQuoteOutcome, PlacementState, PlacementType, ProposeOrderRequest,
     RecordCheckRequest, RecordLocateRequest, RecordLocateUseRequest, RecordOrderRequest,
     ReleaseOrderRequest, ReportChargeRequest, ReportExecutionRequest, ReportPlacementRequest,
-    ReportValueDateRollRequest, RequestOrderChangeRequest, RequestPlacementChangeRequest,
+    ReportPlacementQuoteRequest, ReportValueDateRollRequest, RequestOrderChangeRequest, RequestPlacementChangeRequest,
     SetTradingInstructionRequest, SetWorkingConditionRequest, SetterLevel, SettlementBucket, Side,
     StandingOrderCondition, TieOutReason, TimeInForce, TradingInstruction,
     TradingInstructionTarget, TradingInstructionValue, UnplacedFact, UnplacedReason, VenueActor,
@@ -1639,6 +1640,7 @@ pub fn create_placement(
     let order = held(book, &request.order_id)?;
     in_scope(ctx, &order.order.account_id)?;
     user_required(ctx, "creating a placement")?;
+    let manual = placement_type_holds(order, request)?;
     let order_id = request.order_id.clone();
     let ems = if request.ems_instance_id.is_empty() {
         ctx.instance_id.clone()
@@ -1647,8 +1649,9 @@ pub fn create_placement(
     };
     // Refused and recorded (W11.8, the refresh's Q30): a connectivity
     // plugin not linked to the placing `ems`, or not made available to the
-    // user the command acts for, by the sidecar's verdict.
-    if !ctx.connectivity_allowed {
+    // user the command acts for, by the sidecar's verdict. A manual
+    // placement names none, so it routes through none (contract v27, B5).
+    if !manual && !ctx.connectivity_allowed {
         let words = format!(
             "a placement of order {order_id} by {ems} at {} is refused: that connectivity \
              plugin is not one {ems} is linked to and the user may route through",
@@ -1746,6 +1749,12 @@ pub fn create_placement(
             executed_by: Some(ctx.actor()),
             ..Default::default()
         }),
+        // Contract v27 (W11.8): its type, set once; a manual placement's
+        // trade details, its evidence.
+        placement_type: request.placement_type,
+        counterparty_contact: request.counterparty_contact.clone(),
+        agreed_at_ns: request.agreed_at_ns,
+        agreed_precision: request.agreed_precision,
         ..Default::default()
     };
     let plan = Plan::new(
@@ -1758,6 +1767,370 @@ pub fn create_placement(
     check_reached(book, &made, &order_id, "6", Some(state))
         .or_else(|_| check_reached(book, &made, &order_id, "8", Some(state)))?;
     Ok(made)
+}
+
+/// A placement's type against its fields (contract v27, W11.8; the gaps
+/// spec's B3 and B5), refused INVALID_ARGUMENT naming the field. Whether it
+/// is manual: a manual placement names no connectivity instance. An
+/// unspecified type is read as DMA and checked as before v27: a plugin
+/// built before v27 states none.
+fn placement_type_holds(order: &OrderHeld, request: &CreatePlacementRequest) -> Result<bool> {
+    let kind = PlacementType::try_from(request.placement_type).map_err(|_| {
+        malformed(
+            &["placement_type"],
+            format!("{} is no placement type", request.placement_type),
+        )
+    })?;
+    if kind == PlacementType::Unspecified {
+        return Ok(false);
+    }
+    let manual = kind == PlacementType::Manual;
+    let named = |field: &str, words: String| Err(malformed(&[field], words));
+    let words = kind.as_str_name().trim_start_matches("PLACEMENT_TYPE_").to_ascii_lowercase();
+    // An RFQ order takes only RFQ placements; an RFQ placement is allowed
+    // on any order (B3).
+    if order.order.order_type == OrderType::RequestForQuote as i32 && kind != PlacementType::Rfq {
+        return named(
+            "placement_type",
+            format!("an order of type request for quote takes only RFQ placements, not {words}"),
+        );
+    }
+    match (kind, request.strategy.is_some()) {
+        (PlacementType::Algo, false) => {
+            return named("strategy", "an algo placement names its strategy".into())
+        }
+        (PlacementType::Dma | PlacementType::Care | PlacementType::Manual, true) => {
+            return named("strategy", format!("a {words} placement carries no strategy"))
+        }
+        _ => {}
+    }
+    if manual {
+        if !request.connectivity_instance_id.is_empty() {
+            return named(
+                "connectivity_instance_id",
+                "a manual placement names no connectivity instance: it is delivered to none"
+                    .into(),
+            );
+        }
+        if !request.venue_account_code.is_empty() {
+            return named(
+                "venue_account_code",
+                "a manual placement names no venue account code".into(),
+            );
+        }
+        if request.destination.is_empty() {
+            return named(
+                "destination",
+                "a manual placement names its counterparty as a VEN- destination".into(),
+            );
+        }
+    } else {
+        if request.connectivity_instance_id.is_empty() {
+            return named(
+                "connectivity_instance_id",
+                format!("a {words} placement names the connectivity instance it reaches"),
+            );
+        }
+        let details = [
+            ("counterparty_contact", !request.counterparty_contact.is_empty()),
+            ("agreed_at_ns", request.agreed_at_ns != 0),
+            ("agreed_precision", request.agreed_precision != 0),
+        ];
+        if let Some((field, _)) = details.iter().find(|(_, set)| *set) {
+            return named(
+                field,
+                format!("a {words} placement carries no manual trade details"),
+            );
+        }
+    }
+    Ok(manual)
+}
+
+// ── W11.40, W11.41: an RFQ placement's quotes (contract v27) ─────────────────
+
+/// How far a quote's outcome has gone: open, then picked, then an end.
+/// An outcome is recorded only forward (W11.40).
+fn quote_rank(outcome: PlacementQuoteOutcome) -> u8 {
+    match outcome {
+        PlacementQuoteOutcome::Unspecified | PlacementQuoteOutcome::Open => 0,
+        PlacementQuoteOutcome::Picked => 1,
+        PlacementQuoteOutcome::Accepted
+        | PlacementQuoteOutcome::Expired
+        | PlacementQuoteOutcome::Withdrawn
+        | PlacementQuoteOutcome::NotPicked => 2,
+    }
+}
+
+fn quote_words(outcome: PlacementQuoteOutcome) -> String {
+    outcome
+        .as_str_name()
+        .trim_start_matches("PLACEMENT_QUOTE_OUTCOME_")
+        .to_ascii_lowercase()
+        .replace('_', " ")
+}
+
+/// W11.40: a dealer's quote received on the firm's RFQ placement, recorded
+/// by the connectivity plugin the placement names; or a later outcome of
+/// one recorded, by its quote ID. A trade detail in the book, journalled in
+/// the order's partition: never refused for risk, never copied to the lake.
+pub fn report_placement_quote(
+    book: &Book,
+    head: u64,
+    ctx: &Context,
+    request: &ReportPlacementQuoteRequest,
+) -> Result<Made> {
+    let placed = book
+        .ledger
+        .placements
+        .get(&request.placement_id)
+        .ok_or_else(|| {
+            StoreError::Invalid(format!(
+                "account {} holds no placement {}",
+                book.account_id, request.placement_id
+            ))
+        })?;
+    let state = state_of(book, &placed.placement.order_id)?;
+    if placed.placement.placement_type != PlacementType::Rfq as i32 {
+        return Err(state_refused(
+            row("8"),
+            state,
+            &format!(
+                "a quote on placement {}, which is not an RFQ placement,",
+                request.placement_id
+            ),
+        ));
+    }
+    if placed.placement.connectivity_instance_id != ctx.instance_id {
+        return Err(state_refused(
+            row("8"),
+            state,
+            &format!(
+                "a quote on placement {}, which names {}, not {},",
+                request.placement_id, placed.placement.connectivity_instance_id, ctx.instance_id
+            ),
+        ));
+    }
+    if !fact_in_scope(ctx, &placed.placement.account_id) {
+        return Err(StoreError::Denied(format!(
+            "placement {}'s account is outside {}'s scope",
+            request.placement_id, ctx.instance_id
+        )));
+    }
+    let outcome = PlacementQuoteOutcome::try_from(request.outcome)
+        .map_err(|_| malformed(&["outcome"], format!("{} is no quote outcome", request.outcome)))?;
+    // A pick is the `ems`'s (W11.41), never the venue's report.
+    if outcome == PlacementQuoteOutcome::Picked {
+        return Err(malformed(
+            &["outcome"],
+            "a quote is picked by the ems that made the placement, never reported picked",
+        ));
+    }
+    let quote = if request.quote_id.is_empty() {
+        let mut missing: Vec<&str> = Vec::new();
+        if request.dealer_id.is_empty() {
+            missing.push("dealer_id");
+        }
+        if request.side == Side::Unspecified as i32 {
+            missing.push("side");
+        }
+        if amount_of(request.price.as_ref()).is_none() {
+            missing.push("price");
+        }
+        if !missing.is_empty() {
+            return Err(malformed(
+                &missing,
+                "a quote names its dealer, its side and its price",
+            ));
+        }
+        if let Some(quantity) = decimal("quantity", request.quantity.as_ref())? {
+            if quantity.is_zero() || quantity.is_negative() {
+                return Err(malformed(&["quantity"], "a quote's quantity is positive"));
+            }
+        }
+        PlacementQuote {
+            quote_id: ctx.mint(ids::PLACEMENT_QUOTE),
+            dealer_id: request.dealer_id.clone(),
+            dealer_quote_id: request.dealer_quote_id.clone(),
+            side: request.side,
+            price: request.price.clone(),
+            quantity: request.quantity,
+            received_at_ns: if request.received_at_ns == 0 {
+                ctx.received_at_ns
+            } else {
+                request.received_at_ns
+            },
+            valid_until_ns: request.valid_until_ns,
+            outcome: if outcome == PlacementQuoteOutcome::Unspecified {
+                PlacementQuoteOutcome::Open as i32
+            } else {
+                outcome as i32
+            },
+            raw_record: request.raw_record.clone(),
+        }
+    } else {
+        let Some(held) = placed
+            .placement
+            .quotes
+            .iter()
+            .find(|quote| quote.quote_id == request.quote_id)
+        else {
+            return Err(malformed(
+                &["quote_id"],
+                format!(
+                    "placement {} holds no quote {}",
+                    request.placement_id, request.quote_id
+                ),
+            ));
+        };
+        let was = PlacementQuoteOutcome::try_from(held.outcome)
+            .unwrap_or(PlacementQuoteOutcome::Open);
+        if outcome == PlacementQuoteOutcome::Unspecified || quote_rank(outcome) <= quote_rank(was)
+        {
+            return Err(StoreError::refused(
+                RefusalReason::OrderState,
+                format!(
+                    "quote {} is {}; its outcome moves only forward, never to {}",
+                    request.quote_id,
+                    quote_words(was),
+                    quote_words(outcome)
+                ),
+            ));
+        }
+        PlacementQuote {
+            outcome: outcome as i32,
+            raw_record: request.raw_record.clone().or_else(|| held.raw_record.clone()),
+            ..held.clone()
+        }
+    };
+    let plan = Plan::new(
+        "placement-quote-recorded",
+        venue_actor(ctx),
+        vec![Act::PlacementQuoted {
+            placement_id: request.placement_id.clone(),
+            quote,
+        }],
+    )
+    .key(&request.idempotency_key);
+    finish(book, head, ctx, plan)
+}
+
+/// W11.41: the `ems` that made an RFQ placement picks one of its open
+/// quotes, the best or not, for a person or as its service account; the
+/// placement, carrying the pick, is delivered to its connectivity plugin,
+/// which sends the acceptance.
+pub fn pick_placement_quote(
+    book: &Book,
+    head: u64,
+    ctx: &Context,
+    request: &PickPlacementQuoteRequest,
+) -> Result<Made> {
+    let placed = book
+        .ledger
+        .placements
+        .get(&request.placement_id)
+        .ok_or_else(|| {
+            StoreError::Invalid(format!(
+                "account {} holds no placement {}",
+                book.account_id, request.placement_id
+            ))
+        })?;
+    let order = held(book, &placed.placement.order_id)?;
+    in_scope(ctx, &order.order.account_id)?;
+    if placed.placement.ems_instance_id != ctx.instance_id {
+        return Err(StoreError::Denied(format!(
+            "placement {} was made by {}, not {}: only the ems that made a placement picks its \
+             quote",
+            request.placement_id, placed.placement.ems_instance_id, ctx.instance_id
+        )));
+    }
+    user_required(ctx, "picking a quote")?;
+    let order_id = order.order.order_id.clone();
+    // The agents' guard applies as to a placement (W11.8, W11.38).
+    if crate::booking::agent_live_refused(ctx) {
+        let words = format!(
+            "Refused: {}. {} is live: a pick of a quote on placement {} made through a \
+             delegation or by a service account is refused while the deployment's \
+             agent_orders_demo_only is on; a person may make it from the agent's prepared change",
+            capitalised(crate::booking::AGENT_LIVE_ORDER_WORDS),
+            placed.placement.connectivity_instance_id,
+            request.placement_id
+        );
+        let plan = Plan::new(
+            "placement-quote-pick-refused",
+            ctx.actor(),
+            vec![Act::PlacementRefused {
+                order_id: order_id.clone(),
+            }],
+        )
+        .reason(&format!(
+            "REFUSAL_REASON_AGENT_LIVE_ORDER: ems {}, connectivity {}, quote {}",
+            ctx.instance_id, placed.placement.connectivity_instance_id, request.quote_id
+        ))
+        .key(&request.idempotency_key);
+        let mut made = finish(book, head, ctx, plan)?;
+        made.refusal = Some(StoreError::refused(RefusalReason::AgentLiveOrder, words).on_the_bus());
+        return Ok(made);
+    }
+    if !claim_allows(order, ctx) {
+        return Err(claim_refused(order));
+    }
+    let refused = |words: String| Err(StoreError::refused(RefusalReason::OrderState, words));
+    if !book.ledger.placement_live(&request.placement_id)? {
+        return refused(format!(
+            "placement {} has ended: no quote on it is picked",
+            request.placement_id
+        ));
+    }
+    let Some(quote) = placed
+        .placement
+        .quotes
+        .iter()
+        .find(|quote| quote.quote_id == request.quote_id)
+    else {
+        return Err(malformed(
+            &["quote_id"],
+            format!(
+                "placement {} holds no quote {}",
+                request.placement_id, request.quote_id
+            ),
+        ));
+    };
+    if let Some(standing) = placed.placement.quotes.iter().find(|held| {
+        held.quote_id == placed.placement.picked_quote_id
+            && held.outcome == PlacementQuoteOutcome::Picked as i32
+    }) {
+        return refused(format!(
+            "quote {} on placement {} is picked already; a second pick waits until it is \
+             accepted, expires or is withdrawn",
+            standing.quote_id, request.placement_id
+        ));
+    }
+    let outcome =
+        PlacementQuoteOutcome::try_from(quote.outcome).unwrap_or(PlacementQuoteOutcome::Open);
+    if quote_rank(outcome) != 0 {
+        return refused(format!(
+            "quote {} is {}, not open",
+            quote.quote_id,
+            quote_words(outcome)
+        ));
+    }
+    if quote.valid_until_ns != 0 && ctx.received_at_ns > quote.valid_until_ns {
+        return refused(format!(
+            "quote {} stood until {}, and is past its valid-until time",
+            quote.quote_id, quote.valid_until_ns
+        ));
+    }
+    let plan = Plan::new(
+        "placement-quote-picked",
+        ctx.actor(),
+        vec![Act::QuotePicked {
+            placement_id: request.placement_id.clone(),
+            quote_id: request.quote_id.clone(),
+        }],
+    )
+    .reason(&request.reason)
+    .key(&request.idempotency_key);
+    finish(book, head, ctx, plan)
 }
 
 // ── W11.9: ask for a change to a placement ──────────────────────────────────

@@ -26,7 +26,8 @@ use meridian_domain::v1::{
     ChangeRequestOutcome, Charge, Check, Execution, ExecutionState, FinalityLevel, GiveUpRecord,
     JournalRef, Locate, LocateAnswer, LocateUse, LocateUseKind, Order, OrderCondition, OrderOrigin,
     OrderQuantities, OrderState, OrderStatus, Placement, PlacementChangeKind, PlacementCondition,
-    PlacementEvent, PlacementState, PlacementStatus, ReportPlacementRequest,
+    PlacementEvent, PlacementQuote, PlacementQuoteOutcome, PlacementState, PlacementStatus,
+    ReportPlacementRequest,
     ReportValueDateRollRequest, SleeveCross, StandingOrderCondition, StandingPlacementCondition,
     TieOutReason, TradingInstruction, UnplacedFact,
 };
@@ -146,6 +147,19 @@ pub enum Act {
     PlacementOpened {
         #[serde(with = "pb")]
         placement: Placement,
+    },
+    /// Contract v27 (W11.40): a dealer's quote on an RFQ placement,
+    /// recorded or moved to a later outcome: the quote whole as it now
+    /// stands. A picked quote moved on clears the pick.
+    PlacementQuoted {
+        placement_id: String,
+        #[serde(with = "pb")]
+        quote: PlacementQuote,
+    },
+    /// Contract v27 (W11.41): the `ems`'s pick of an open quote.
+    QuotePicked {
+        placement_id: String,
+        quote_id: String,
     },
     /// A placement refused and recorded (REFUSAL_REASON_CONNECTIVITY_NOT_ALLOWED,
     /// W11.8): the entry names the placing `ems`, the instance asked for, the
@@ -636,6 +650,9 @@ impl Ledger {
                         push_once(&mut touched.orders, &held.placement.order_id);
                     }
                 }
+                Act::PlacementQuoted { placement_id, .. } | Act::QuotePicked { placement_id, .. } => {
+                    push_once(&mut touched.placements, placement_id);
+                }
                 Act::Accepted {
                     execution_ids,
                     order_id,
@@ -889,6 +906,42 @@ impl Ledger {
                         ..Default::default()
                     },
                 );
+            }
+            Act::PlacementQuoted {
+                placement_id,
+                quote,
+            } => {
+                if let Some(held) = self.placements.get_mut(placement_id) {
+                    let quotes = &mut held.placement.quotes;
+                    match quotes.iter_mut().find(|q| q.quote_id == quote.quote_id) {
+                        Some(kept) => *kept = quote.clone(),
+                        None => quotes.push(quote.clone()),
+                    }
+                    if held.placement.picked_quote_id == quote.quote_id
+                        && matches!(
+                            PlacementQuoteOutcome::try_from(quote.outcome),
+                            Ok(PlacementQuoteOutcome::Expired | PlacementQuoteOutcome::Withdrawn)
+                        )
+                    {
+                        held.placement.picked_quote_id.clear();
+                    }
+                }
+            }
+            Act::QuotePicked {
+                placement_id,
+                quote_id,
+            } => {
+                if let Some(held) = self.placements.get_mut(placement_id) {
+                    if let Some(quote) = held
+                        .placement
+                        .quotes
+                        .iter_mut()
+                        .find(|q| &q.quote_id == quote_id)
+                    {
+                        quote.outcome = PlacementQuoteOutcome::Picked as i32;
+                    }
+                    held.placement.picked_quote_id = quote_id.clone();
+                }
             }
             Act::PlacementRefused { .. } | Act::AcceptRefused { .. } => {}
             Act::PlacementReported { report } => self.reported(report),

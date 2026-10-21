@@ -45,6 +45,8 @@ pub const CHARGE: &str = "CHG";
 pub const UNPLACED: &str = "UNP";
 pub const LOCATE: &str = "LOC";
 pub const CHANGE_REQUEST: &str = "CRQ";
+// Contract v27 (W11.40): a dealer's quote on an RFQ placement.
+pub const PLACEMENT_QUOTE: &str = "PQT";
 
 #[cfg(test)]
 mod tests {

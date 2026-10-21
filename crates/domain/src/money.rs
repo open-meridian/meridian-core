@@ -214,7 +214,9 @@ macro_rules! monies {
 
 monies! {
     LotTerms { unit_cost, cost }
-    Lot { terms }
+    Lot { terms, reliefs }
+    // Contract v27 (W9.10): a relief's proceeds.
+    LotRelief { proceeds }
     BookPosition { lots }
     OpeningLot { terms }
     OpeningPosition { lots }
@@ -262,7 +264,10 @@ monies! {
     Charge { fee }
     OrderChange { limit_price }
     PlacementChange { limit_price }
-    Placement { limit_price, strategy }
+    Placement { limit_price, strategy, quotes }
+    // Contract v27 (W11.40): a dealer's quote on an RFQ placement.
+    PlacementQuote { price }
+    ReportPlacementQuoteRequest { price }
     Execution { price, fees }
     Order { cash_quantity, limit_price, stop_price, quote_at_receipt, change_requests, placements,
         executions, charges }
@@ -299,6 +304,10 @@ monies! {
     SleeveCrossReply { sleeve_cross }
     BookingUpdatedEvent { booking }
     ListBookingsReply { bookings }
+    // Execution costs (contract v27, W10.11).
+    ExecutionCost { benchmark_price, execution_price, notional }
+    RecordExecutionCostsRequest { costs }
+    ListExecutionCostsReply { costs }
 }
 
 impl Monies for crate::v1::ChangeRequest {

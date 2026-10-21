@@ -3269,3 +3269,8 @@ async fn an_fx_orders_amended_limit_stays_in_its_quote_currency() {
 
 #[path = "booking_tests.rs"]
 mod booking;
+
+// ── Contract v27: the placement type, an RFQ's quotes and FX netting ───────
+
+#[path = "order_path_v27_tests.rs"]
+mod order_path_v27;

@@ -122,7 +122,7 @@ const MAP_VENUE_ACCOUNT: &str = "platform.config.command.map-venue-account";
 /// to the person's write access where it acts for one, which the book checks
 /// the record's account against. The generated operations hand these no
 /// account; a test holds this list to them.
-pub(crate) const BY_ID_ALONE: [&str; 20] = [
+pub(crate) const BY_ID_ALONE: [&str; 22] = [
     "meridian.v1.RequestOrderChangeRequest",
     "meridian.v1.RecordCheckRequest",
     "meridian.v1.DecideApprovalRequest",
@@ -148,6 +148,10 @@ pub(crate) const BY_ID_ALONE: [&str; 20] = [
     "meridian.v1.ReportGiveUpRequest",
     "meridian.v1.RecordSleeveCrossRequest",
     "meridian.v1.AcknowledgeAlertRequest",
+    // Contract v27 (W11.40, W11.41): an RFQ placement's quote and its pick,
+    // named by the placement.
+    "meridian.v1.ReportPlacementQuoteRequest",
+    "meridian.v1.PickPlacementQuoteRequest",
 ];
 
 /// The venue facts stamped from the venue account map (matrix/stamped.tsv's
@@ -177,6 +181,9 @@ const QUERY_LAKE: &str = "meridian.v1.QueryLakeRequest";
 /// An accept of fills (W11.23): to a new order, held to the agents' guard
 /// (contract v26).
 const ACCEPT_EXECUTION: &str = "meridian.v1.AcceptExecutionRequest";
+/// A pick of a quote on an RFQ placement (W11.41, contract v27), held to the
+/// agents' guard as a placement is.
+const PICK_PLACEMENT_QUOTE: &str = "meridian.v1.PickPlacementQuoteRequest";
 /// The environments a connection is demo in (W11.8, W6.11; G1 question 5).
 const DEMO_ENVIRONMENTS: [&str; 2] = ["sandbox", "paper"];
 /// An order's change (W11.3, contract v22): a quantity change is never an
@@ -709,7 +716,10 @@ impl Sidecar {
                         .session_demo(&named, &placement.venue_account_code)
                         .await
             }
-            ACCEPT_EXECUTION => {
+            // A pick names its placement, not its connection: demo only where
+            // every connection the caller may route through from this ems is
+            // (failing closed, as an accept to a new order does).
+            ACCEPT_EXECUTION | PICK_PLACEMENT_QUOTE => {
                 !claims.connectivity_instance_ids.is_empty()
                     && claims
                         .connectivity_instance_ids
