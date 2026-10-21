@@ -18,53 +18,234 @@
 
 use std::collections::BTreeSet;
 
+use serde_json::{json, Value};
+
 use crate::answer::{
-    Reads, CONVERSION_MISSING, IMPLEMENTATION_UNAVAILABLE, LOCAL_RECORD, NOT_ENTITLED,
-    PRICE_MISSING, PRICE_STALE,
+    Reads, CONVERSION_MISSING, CROSSED, DIRECT, IMPLEMENTATION_UNAVAILABLE, INVERTED,
+    LOCAL_RECORD, NOT_ENTITLED, PRICE_MISSING, PRICE_STALE,
 };
 use crate::case::{Case, CaseError, Price, Result};
-use crate::exact::Dec;
+use crate::exact::big::Big;
+use crate::exact::{Dec, Ratio};
 
 /// Conversion legs' kinds, in the order a leg is taken.
 pub const CONVERSION_KINDS: [&str; 3] = ["close", "mid", "last"];
-/// The longest conversion chain.
+/// The longest conversion chain, a cross counting as its two sub-legs.
 pub const MOST_LEGS: usize = 3;
+/// The places an inverted or crossed rate, and a quoted price's value per
+/// unit, are rounded to, half to even (rulings 453, 462 and 486).
+pub const RATE_SCALE: u32 = 18;
 
-/// A position's value per unit in its base, and the market objects it read
-/// (its price, then its conversion legs), which a historical scenario moves.
+/// One conversion leg (contract v27, ruling 462): from one cash instrument
+/// to another at a rate -- the lake's own, its inverse rounded half to even
+/// to 18 places, or a cross through a pivot, its two sub-legs' rates
+/// multiplied and rounded so -- with the lake's prices it moves with, each
+/// with its exponent (1, or -1 inverted).
+#[derive(Debug, Clone)]
+pub struct Leg {
+    pub from_id: String,
+    pub to_id: String,
+    pub rate: Dec,
+    pub derivation: &'static str,
+    pub via: String,
+    pub dataset: String,
+    pub factors: Vec<(Price, i32)>,
+    pub subs: Vec<Leg>,
+    pub kind_rank: usize,
+}
+
+impl Leg {
+    fn direct(price: &Price, rank: usize) -> Leg {
+        Leg {
+            from_id: price.subject_id.clone(),
+            to_id: price.instrument_id.clone(),
+            rate: price.amount.clone(),
+            derivation: DIRECT,
+            via: String::new(),
+            dataset: price.dataset.clone(),
+            factors: vec![(price.clone(), 1)],
+            subs: Vec::new(),
+            kind_rank: rank,
+        }
+    }
+
+    /// As the provenance names it (W12.7).
+    pub fn to_json(&self) -> Value {
+        json!({
+            "from_instrument_id": self.from_id,
+            "to_instrument_id": self.to_id,
+            "rate": self.rate.text(),
+            "derivation": self.derivation,
+            "via_instrument_id": self.via,
+            "dataset": self.dataset,
+        })
+    }
+}
+
+/// A derivation's place in a tie (direct, then inverted, then crossed).
+pub fn derivation_rank(derivation: &str) -> u8 {
+    match derivation {
+        DIRECT => 0,
+        INVERTED => 1,
+        _ => 2,
+    }
+}
+
+/// A position's value per unit in its base, the market objects it read
+/// with how each moves it (its exponent), its own price where its model
+/// read one, and its conversion legs.
 #[derive(Debug, Clone)]
 pub struct Valued {
     pub per_unit: Dec,
-    pub objects: Vec<Price>,
+    pub factors: Vec<(Price, i32)>,
+    pub own: Option<Price>,
+    pub legs: Vec<Leg>,
+}
+
+fn valued(per_unit: Dec, legs: Vec<Leg>, own: Option<Price>) -> Valued {
+    let mut factors: Vec<(Price, i32)> = Vec::new();
+    if let Some(own) = &own {
+        factors.push((own.clone(), 1));
+    }
+    for leg in &legs {
+        factors.extend(leg.factors.iter().cloned());
+    }
+    Valued {
+        per_unit,
+        factors,
+        own,
+        legs,
+    }
 }
 
 /// Why a value per unit could not be given: the reason and its detail.
 pub type Why = (&'static str, String);
 
-/// The product of the legs' amounts.
-pub fn product(legs: &[Price]) -> Dec {
+/// The product of the legs' rates.
+pub fn product(legs: &[Leg]) -> Dec {
     let mut out = Dec::from_int(1);
     for leg in legs {
-        out = out.mul(&leg.amount);
+        out = out.mul(&leg.rate);
     }
     out
 }
 
-/// The legs from `held` to `base`, or why there are none.
-pub fn conversion(case: &Case, held: &str, base: &str) -> std::result::Result<Vec<Price>, Why> {
+/// A chain's length against [`MOST_LEGS`]: a cross counts as its two.
+fn counted(legs: &[Leg]) -> usize {
+    legs.iter()
+        .map(|leg| if leg.derivation == CROSSED { 2 } else { 1 })
+        .sum()
+}
+
+/// 1 / x, rounded half to even to 18 places.
+fn inverse(x: &Dec) -> Dec {
+    Ratio::new(Big::pow10(x.scale()), x.integer().to_big()).round_half_even(RATE_SCALE)
+}
+
+/// The lake's own rate from `at` to `to`, by kind in order.
+fn direct(case: &Case, at: &str, to: &str) -> Option<Leg> {
+    CONVERSION_KINDS
+        .iter()
+        .enumerate()
+        .find_map(|(rank, kind)| case.price_in(at, kind, to).map(|p| Leg::direct(p, rank)))
+}
+
+/// The lake's rate the other way (`to` priced in `at`), inverted (ruling
+/// 462).
+fn inverted(case: &Case, at: &str, to: &str) -> Option<Leg> {
+    CONVERSION_KINDS.iter().enumerate().find_map(|(rank, kind)| {
+        let price = case.price_in(to, kind, at)?;
+        if price.amount.is_zero() {
+            return None;
+        }
+        Some(Leg {
+            from_id: at.to_string(),
+            to_id: to.to_string(),
+            rate: inverse(&price.amount),
+            derivation: INVERTED,
+            via: String::new(),
+            dataset: price.dataset.clone(),
+            factors: vec![(price.clone(), -1)],
+            subs: Vec::new(),
+            kind_rank: rank,
+        })
+    })
+}
+
+/// A fiat leg with no direct rate in the lake's direction: inverted, else
+/// crossed through the first pivot both sub-legs reach, each direct or
+/// inverted, its rate their product rounded half to even to 18 places
+/// (rulings 462 and 483). None for a token's leg.
+fn derived(case: &Case, at: &str, to: &str) -> Option<Leg> {
+    if !(case.fiat(at) && case.fiat(to)) {
+        return None;
+    }
+    if let Some(leg) = inverted(case, at, to) {
+        return Some(leg);
+    }
+    let either = |from: &str, into: &str| direct(case, from, into).or_else(|| inverted(case, from, into));
+    for pivot in &case.pivots {
+        if pivot == at || pivot == to || !case.fiat(pivot) {
+            continue;
+        }
+        let (Some(first), Some(second)) = (either(at, pivot), either(pivot, to)) else {
+            continue;
+        };
+        let rate = first.rate.mul(&second.rate).round_half_even(RATE_SCALE);
+        let mut factors = first.factors.clone();
+        factors.extend(second.factors.iter().cloned());
+        let kind_rank = first.kind_rank.max(second.kind_rank);
+        return Some(Leg {
+            from_id: at.to_string(),
+            to_id: to.to_string(),
+            rate,
+            derivation: CROSSED,
+            via: pivot.clone(),
+            dataset: String::new(),
+            factors,
+            subs: vec![first, second],
+            kind_rank,
+        });
+    }
+    None
+}
+
+type Chain = (usize, Vec<u8>, Vec<usize>, Vec<String>, Vec<Leg>);
+
+fn keep(chains: &mut Vec<Chain>, legs: &[Leg]) {
+    chains.push((
+        counted(legs),
+        legs.iter().map(|leg| derivation_rank(leg.derivation)).collect(),
+        legs.iter().map(|leg| leg.kind_rank).collect(),
+        legs.iter().map(|leg| leg.to_id.clone()).collect(),
+        legs.to_vec(),
+    ));
+}
+
+/// The legs from `held` to `base`, or why there are none: the shortest
+/// chain of the lake's own rates, at most [`MOST_LEGS`] (a cross counting as
+/// its two sub-legs), its last leg from a fiat currency to a fiat base
+/// inverted or crossed where the lake has no direct rate (contract v27,
+/// ruling 462); a token's leg only ever the lake's own. Ties go by each
+/// leg's derivation, then the lowest kinds, then the instrument IDs' order.
+/// A stale price under any leg is `PRICE_STALE`.
+pub fn conversion(case: &Case, held: &str, base: &str) -> std::result::Result<Vec<Leg>, Why> {
     if held == base {
         return Ok(Vec::new());
     }
-    let mut chains: Vec<(Vec<usize>, Vec<String>, Vec<Price>)> = Vec::new();
+    let mut chains: Vec<Chain> = Vec::new();
     let mut seen = BTreeSet::from([held.to_string()]);
     let mut legs = Vec::new();
     walk(case, held, base, &mut legs, &mut seen, &mut chains);
     if chains.is_empty() {
         return Err((CONVERSION_MISSING, String::new()));
     }
-    chains.sort_by(|a, b| (a.2.len(), &a.0, &a.1).cmp(&(b.2.len(), &b.0, &b.1)));
-    let (_, _, legs) = chains.swap_remove(0);
-    if legs.iter().any(|leg| case.stale(leg)) {
+    chains.sort_by(|a, b| (a.0, &a.1, &a.2, &a.3).cmp(&(b.0, &b.1, &b.2, &b.3)));
+    let (_, _, _, _, legs) = chains.swap_remove(0);
+    if legs
+        .iter()
+        .any(|leg| leg.factors.iter().any(|(price, _)| case.stale(price)))
+    {
         return Err((PRICE_STALE, String::new()));
     }
     Ok(legs)
@@ -74,40 +255,38 @@ fn walk(
     case: &Case,
     at: &str,
     base: &str,
-    legs: &mut Vec<Price>,
+    legs: &mut Vec<Leg>,
     seen: &mut BTreeSet<String>,
-    chains: &mut Vec<(Vec<usize>, Vec<String>, Vec<Price>)>,
+    chains: &mut Vec<Chain>,
 ) {
     if at == base {
-        let ranks = legs
-            .iter()
-            .map(|leg| {
-                CONVERSION_KINDS
-                    .iter()
-                    .position(|k| *k == leg.kind)
-                    .unwrap_or(9)
-            })
-            .collect();
-        let ids = legs.iter().map(|leg| leg.instrument_id.clone()).collect();
-        chains.push((ranks, ids, legs.clone()));
+        keep(chains, legs);
         return;
     }
     if legs.len() == MOST_LEGS {
         return;
     }
-    for kind in CONVERSION_KINDS {
-        let Some(leg) = case.price(at, kind) else {
-            continue;
-        };
-        if seen.contains(&leg.instrument_id) {
-            continue;
+    if direct(case, at, base).is_none() {
+        if let Some(leg) = derived(case, at, base) {
+            legs.push(leg);
+            if counted(legs) <= MOST_LEGS {
+                keep(chains, legs);
+            }
+            legs.pop();
         }
-        let next = leg.instrument_id.clone();
-        seen.insert(next.clone());
-        legs.push(leg.clone());
-        walk(case, &next, base, legs, seen, chains);
-        legs.pop();
-        seen.remove(&next);
+    }
+    for (rank, kind) in CONVERSION_KINDS.iter().enumerate() {
+        for price in case.quoted_in(at, kind) {
+            if seen.contains(&price.instrument_id) {
+                continue;
+            }
+            let next = price.instrument_id.clone();
+            seen.insert(next.clone());
+            legs.push(Leg::direct(price, rank));
+            walk(case, &next, base, legs, seen, chains);
+            legs.pop();
+            seen.remove(&next);
+        }
     }
 }
 
@@ -149,7 +328,7 @@ pub fn value(
     ) {
         (Ok(valued), Some(per_unit)) => Ok(Ok(Valued {
             per_unit: per_unit.clone(),
-            objects: valued.objects,
+            ..valued
         })),
         (Err(why), _) => Ok(Err(why)),
         (Ok(_), None) => unavailable(),
@@ -177,10 +356,8 @@ fn built_in(
         .insert((record.model_id.clone(), record.model_version));
     match record.model_id.as_str() {
         "cash" => {
-            return Ok(conversion(case, instrument_id, base).map(|legs| Valued {
-                per_unit: product(&legs),
-                objects: legs,
-            }));
+            return Ok(conversion(case, instrument_id, base)
+                .map(|legs| valued(product(&legs), legs, None)));
         }
         "binary_event" => {
             if let Some(outcome) = case.outcomes.get(instrument_id).filter(|o| o.final_) {
@@ -192,9 +369,8 @@ fn built_in(
                         "{instrument_id} is a binary event contract with no payout"
                     ))
                 })?;
-                return Ok(conversion(case, currency, base).map(|legs| Valued {
-                    per_unit: outcome.settlement_value.mul(&product(&legs)),
-                    objects: legs,
+                return Ok(conversion(case, currency, base).map(|legs| {
+                    valued(outcome.settlement_value.mul(&product(&legs)), legs, None)
                 }));
             }
         }
@@ -218,20 +394,62 @@ fn built_in(
         return Ok(Err((PRICE_STALE, price.dataset.clone())));
     }
     Ok(conversion(case, &price.instrument_id, base).map(|legs| {
-        let per_unit = price.amount.mul(&product(&legs));
-        let mut objects = Vec::with_capacity(legs.len() + 1);
-        objects.push(price.clone());
-        objects.extend(legs);
-        Valued { per_unit, objects }
+        // Contract v27 (rulings 453 and 486): a quoted price's value per
+        // unit rounded half to even to 18 places; its market value that
+        // times the quantity, exact.
+        let per_unit = price
+            .amount
+            .mul(&product(&legs))
+            .round_half_even(RATE_SCALE);
+        valued(per_unit, legs, Some(price.clone()))
     }))
 }
 
-/// The datasets a used value read.
+/// What a used value read, for the provenance: its datasets, its own price
+/// (ruling 460) and its conversion legs (ruling 462).
 pub fn read(reads: &mut Reads, valued: &Valued) {
-    for object in &valued.objects {
-        if !object.dataset.is_empty() {
-            reads.datasets.insert(object.dataset.clone());
+    for (price, _) in &valued.factors {
+        if !price.dataset.is_empty() {
+            reads.datasets.insert(price.dataset.clone());
         }
+    }
+    if let Some(own) = &valued.own {
+        reads
+            .input_prices
+            .entry(own.subject_id.clone())
+            .or_insert_with(|| {
+                json!({
+                    "instrument_id": own.subject_id,
+                    "price": {"amount": own.amount.text(), "instrument_id": own.instrument_id},
+                    "dataset": own.dataset,
+                    "row_key": own.row_key,
+                    "version": own.version.to_string(),
+                    "source_ns": own.source_ns.to_string(),
+                })
+            });
+    }
+    read_legs(reads, &valued.legs);
+}
+
+/// Conversion legs read, each named once in the provenance, a cross with
+/// its two sub-legs.
+pub fn read_legs(reads: &mut Reads, legs: &[Leg]) {
+    for leg in legs {
+        for (price, _) in &leg.factors {
+            if !price.dataset.is_empty() {
+                reads.datasets.insert(price.dataset.clone());
+            }
+        }
+        reads
+            .legs
+            .entry((
+                leg.from_id.clone(),
+                leg.to_id.clone(),
+                derivation_rank(leg.derivation),
+                leg.via.clone(),
+            ))
+            .or_insert_with(|| leg.to_json());
+        read_legs(reads, &leg.subs);
     }
 }
 
@@ -277,6 +495,11 @@ pub fn value_per_unit(
                 && !visited.contains(subject)
         });
         let Some((subject, _, amount, currency)) = leg else {
+            // Contract v27 (rulings 453 and 486): a quoted price's rounded
+            // half to even to 18 places where it runs past them.
+            if model_id == "quoted_price" && value.scale() > RATE_SCALE {
+                value = value.round_half_even(RATE_SCALE);
+            }
             return Ok((value, held));
         };
         visited.insert(subject.clone());

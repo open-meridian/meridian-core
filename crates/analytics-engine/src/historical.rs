@@ -80,7 +80,9 @@ pub struct Series {
 pub struct Holding {
     pub now: Dec,
     pub now_f: f64,
-    pub series: Vec<usize>,
+    /// Each series it moves with, and its exponent: 1, or -1 for an
+    /// inverted conversion leg, which moves inversely (contract v27).
+    pub series: Vec<(usize, i32)>,
 }
 
 /// A bucket's holdings over a shared table of series: what one figure is
@@ -130,8 +132,12 @@ pub fn approximate(bucket: &Bucket, table: &[Series], days: usize, work: &mut Wo
         let mut magnitude = 0.0f64;
         for holding in &bucket.holdings {
             let mut moved = holding.now_f;
-            for &s in &holding.series {
-                moved *= table[s].ratios[day];
+            for &(s, exponent) in &holding.series {
+                if exponent < 0 {
+                    moved /= table[s].ratios[day];
+                } else {
+                    moved *= table[s].ratios[day];
+                }
             }
             sum += moved - holding.now_f;
             magnitude += moved.abs() + holding.now_f.abs();
@@ -151,10 +157,14 @@ pub fn exact_day(bucket: &Bucket, table: &[Series], day: usize) -> Ratio {
     for holding in &bucket.holdings {
         let now = holding.now.to_ratio();
         let mut moved = now.clone();
-        for &s in &holding.series {
+        for &(s, exponent) in &holding.series {
             let after = table[s].closes[day + 1].to_ratio();
             let before = table[s].closes[day].to_ratio();
-            moved = moved.mul(&after).div(&before);
+            moved = if exponent < 0 {
+                moved.mul(&before).div(&after)
+            } else {
+                moved.mul(&after).div(&before)
+            };
         }
         total = total.add(&moved.sub(&now));
     }
@@ -345,14 +355,16 @@ pub fn gather(
                 continue;
             }
         };
-        let mut moves = Vec::with_capacity(valued.objects.len());
+        let mut moves = Vec::with_capacity(valued.factors.len());
         let mut short = false;
-        for object in &valued.objects {
+        for (object, exponent) in &valued.factors {
             let index = by_subject
                 .entry(object.subject_id.clone())
                 .or_insert_with(|| {
                     let closes = series(case, &object.subject_id, dates)?;
-                    if closes[..closes.len() - 1].iter().any(Dec::is_zero) {
+                    // Every close, the last too: an inverted leg divides by
+                    // it (contract v27).
+                    if closes.iter().any(Dec::is_zero) {
                         return None;
                     }
                     let floats: Vec<f64> = closes.iter().map(Dec::to_f64).collect();
@@ -361,7 +373,7 @@ pub fn gather(
                     Some(table.len() - 1)
                 });
             match index {
-                Some(index) => moves.push(*index),
+                Some(index) => moves.push((*index, *exponent)),
                 None => {
                     short = true;
                     break;
@@ -410,6 +422,9 @@ pub fn compute(
     let window = window(definition);
     let k = order_statistic(window, definition)?;
     let base = case.base(account)?.to_string();
+    let Some((rate, currency)) = crate::measures::reporting(case, key, account, part)? else {
+        return Ok(());
+    };
     for scenario in scenarios(case, account) {
         let Gathered {
             table,
@@ -433,10 +448,10 @@ pub fn compute(
                 account_id: account.to_string(),
                 breakdown: group.clone(),
                 scenario: Scenario::of(scenario),
-                value: Some(figure.round_half_even(definition.scale)),
+                value: Some(figure.mul(&rate.to_ratio()).round_half_even(definition.scale)),
                 numerator: None,
                 denominator: None,
-                currency_instrument_id: base.clone(),
+                currency_instrument_id: currency.clone(),
             });
         }
         let worst = worst_resolution(case, &held, &base, &mut part.reads)?;
@@ -453,10 +468,10 @@ pub fn compute(
                 account_id: account.to_string(),
                 breakdown: Vec::new(),
                 scenario: Scenario::of(OUTCOME),
-                value: Some(worst.negated().round_half_even(definition.scale)),
+                value: Some(worst.negated().mul(&rate).round_half_even(definition.scale)),
                 numerator: None,
                 denominator: None,
-                currency_instrument_id: base.clone(),
+                currency_instrument_id: currency.clone(),
             });
         }
     }

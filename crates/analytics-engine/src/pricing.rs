@@ -73,6 +73,9 @@ pub fn unit_inputs(case: &Case, instrument_id: &str, base: &str) -> Option<Vec<P
                 instrument_id: currency.clone(),
                 dataset: outcome.dataset.clone(),
                 valid_at_ns: 0,
+                row_key: String::new(),
+                version: 0,
+                source_ns: 0,
             });
             currency.clone()
         }
@@ -82,6 +85,24 @@ pub fn unit_inputs(case: &Case, instrument_id: &str, base: &str) -> Option<Vec<P
             price.instrument_id.clone()
         }
     };
-    out.extend(model::conversion(case, &held, base).ok()?);
+    // Each conversion leg as one market object: the lake's own rate, or
+    // from contract v27 a derived one (inverted or crossed), the currency
+    // in hand's price in the next at the leg's rate.
+    out.extend(model::conversion(case, &held, base).ok()?.into_iter().map(|leg| {
+        match (leg.derivation, leg.factors.first()) {
+            (crate::answer::DIRECT, Some((price, _))) => price.clone(),
+            _ => Price {
+                subject_id: leg.from_id,
+                kind: "derived".to_string(),
+                amount: leg.rate,
+                instrument_id: leg.to_id,
+                dataset: leg.dataset,
+                valid_at_ns: 0,
+                row_key: String::new(),
+                version: 0,
+                source_ns: 0,
+            },
+        }
+    }));
     Some(out)
 }

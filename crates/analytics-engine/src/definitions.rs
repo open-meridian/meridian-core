@@ -71,8 +71,10 @@ const HISTORICAL: &[(&str, &str)] = &[
     ("event_contracts", "excluded_with_resolution_worst_case"),
 ];
 
-/// Every definition the component serves, in the order it lists them.
-pub const DEFINITIONS: [Definition; 8] = [
+/// Every definition the component serves, in the order it lists them:
+/// v26's at version 1, and from contract v27 `execution_cost` version 1 and
+/// `pnl` version 2.
+pub const DEFINITIONS: [Definition; 10] = [
     Definition {
         definition: "market_value",
         version: 1,
@@ -148,28 +150,43 @@ pub const DEFINITIONS: [Definition; 8] = [
         description: "Each outcome's price over the sum of the group's prices, as a numerator \
                       and a denominator",
     },
+    // Contract v27 (W12.1; the gaps spec's C1 to C10): each execution's cost
+    // against each benchmark, recorded as the lake's ExecutionCost rows.
+    Definition {
+        definition: "execution_cost",
+        version: 1,
+        parameters: &[
+            (
+                "benchmarks",
+                "decision_arrival_placement_arrival_mid_at_fill",
+            ),
+            ("sign", "side_adjusted_positive_cost"),
+            ("units", "bps"),
+            ("staleness_bound_ns", "5000000000"),
+        ],
+        breakdowns: &["account"],
+        scale: 4,
+        description: "Each execution's cost against each benchmark in bps, side-adjusted, \
+                      positive a cost; each account's notional-weighted mean per benchmark",
+    },
+    // Contract v27 (rulings 320 and 396): realized P&L beside unrealized,
+    // served now the book records each closed lot's proceeds (Lot.reliefs).
+    Definition {
+        definition: "pnl",
+        version: 2,
+        parameters: &[
+            ("unrealized", "market_value_less_open_lots_cost"),
+            (
+                "realized",
+                "closed_lots_proceeds_less_cost_since_the_account_opened",
+            ),
+        ],
+        breakdowns: &BY,
+        scale: 2,
+        description: "Each bucket's unrealized P&L (open lots) and realized P&L since the \
+                      account opened (closed lots)",
+    },
 ];
-
-/// pnl version 2, realized beside unrealized: v27's, with the book
-/// recording a closed lot's proceeds (ruling 320). Compiled for the tests
-/// alone, so the SDK's realized cases stay exact, and served to no job:
-/// [`definition`] never finds it, and the compiler refuses its version.
-#[cfg(test)]
-pub const UNSERVED: [Definition; 1] = [Definition {
-    definition: "pnl",
-    version: 2,
-    parameters: &[
-        ("unrealized", "market_value_less_open_lots_cost"),
-        (
-            "realized",
-            "closed_lots_proceeds_less_cost_since_the_account_opened",
-        ),
-    ],
-    breakdowns: &BY,
-    scale: 2,
-    description: "Each bucket's unrealized P&L (open lots) and realized P&L since the account \
-                  opened (closed lots)",
-}];
 
 /// The definition by name and version, where the component serves it.
 pub fn definition(name: &str, version: i32) -> Option<&'static Definition> {
@@ -178,16 +195,8 @@ pub fn definition(name: &str, version: i32) -> Option<&'static Definition> {
         .find(|d| d.definition == name && d.version == version)
 }
 
-/// The definition an inputs document names, as the engine computes it: a
-/// served one, and in the tests the unserved.
+/// The definition an inputs document names, as the engine computes it.
 pub fn computed(name: &str, version: i32) -> Option<&'static Definition> {
-    #[cfg(test)]
-    if let Some(unserved) = UNSERVED
-        .iter()
-        .find(|d| d.definition == name && d.version == version)
-    {
-        return Some(unserved);
-    }
     definition(name, version)
 }
 
