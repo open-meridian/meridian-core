@@ -572,6 +572,7 @@ pub fn propose_order(
         }
     }
     ctx.references_answered()?;
+    ctx.not_referential("", &request.instrument_id)?;
     let missing = ctx.instrument_missing("", &request.instrument_id);
     if !missing.is_empty() {
         return Err(StoreError::incomplete(
@@ -1046,6 +1047,7 @@ pub fn record_order(
         }
     }
     ctx.references_answered()?;
+    ctx.not_referential("", &request.instrument_id)?;
     let missing = ctx.instrument_missing("", &request.instrument_id);
     if !missing.is_empty() {
         return Err(StoreError::incomplete(

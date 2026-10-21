@@ -69,10 +69,15 @@ pub fn words(kind: InstrumentType) -> &'static str {
     }
 }
 
-/// Every type the list holds, in its order: what a form offers.
-pub const TYPES: [InstrumentType; 2] = [
+/// Every type the list holds, in its order: what a refusal lists. From
+/// contract v27 the referential types too (W1.1), which the platform seeds
+/// and no deployment's form offers.
+pub const TYPES: [InstrumentType; 5] = [
     InstrumentType::MoneyMarketFund,
     InstrumentType::BinaryEventContract,
+    InstrumentType::InterestRate,
+    InstrumentType::RateCurve,
+    InstrumentType::Index,
 ];
 
 /// A type by its name without the prefix, in lower case

@@ -115,7 +115,9 @@ pub struct Context {
 /// v10): an asset class and a currency in force, and whether its class is
 /// cash; from contract v24 the currency's code, which with the account's base
 /// currency decides whether lots apply (W9.1, option (c)), and whether the
-/// record is provisional, a local record (W3.7, W11's escape hatch).
+/// record is provisional, a local record (W3.7, W11's escape hatch); from
+/// contract v27 whether its class is referential, a record the lake observes
+/// and nobody holds (W9.10).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RecordSays {
     pub asset_class: bool,
@@ -123,6 +125,7 @@ pub struct RecordSays {
     pub cash: bool,
     pub code: String,
     pub provisional: bool,
+    pub referential: bool,
 }
 
 impl Context {
@@ -179,6 +182,34 @@ impl Context {
             ));
         }
         Ok(())
+    }
+
+    /// Contract v27 (W9.10, W11.1; the rates slice): an `INS-` record of the
+    /// asset class `referential` -- an interest rate, a rate curve, an index
+    /// -- names what the lake observes and is never held. An entry moving a
+    /// position in one, or an order naming one, is refused INVALID_ARGUMENT
+    /// naming its `instrument_id`, under `field`.
+    pub(crate) fn not_referential(&self, field: &str, instrument: &str) -> Result<()> {
+        if !self
+            .records
+            .get(instrument)
+            .is_some_and(|says| says.referential)
+        {
+            return Ok(());
+        }
+        let path = if field.is_empty() {
+            "instrument_id".to_string()
+        } else {
+            format!("{field}.instrument_id")
+        };
+        Err(StoreError::Malformed {
+            words: format!(
+                "{path} names {instrument}, a referential record (an interest rate, a rate \
+                 curve or an index): what the lake observes is never held, so no position \
+                 or order names it"
+            ),
+            fields: vec![path],
+        })
     }
 
     /// Each instrument field the book requires that `instrument`'s record
@@ -432,6 +463,9 @@ pub fn opening_balance(
         _ => {}
     }
     ctx.references_answered()?;
+    for (index, position) in request.positions.iter().enumerate() {
+        ctx.not_referential(&format!("positions[{index}]"), &position.instrument_id)?;
+    }
     let missing = opening_missing(book, ctx, request);
     if !missing.is_empty() {
         return Err(StoreError::incomplete("the opening balance", missing));
@@ -1561,6 +1595,9 @@ fn adjustment_body(
         ));
     }
     ctx.references_answered()?;
+    for (index, line) in adjustment.lines.iter().enumerate() {
+        ctx.not_referential(&format!("adjustment.lines[{index}]"), &line.instrument_id)?;
+    }
     let mut missing: Vec<String> = Vec::new();
     for (index, line) in adjustment.lines.iter().enumerate() {
         let field = format!("adjustment.lines[{index}]");

@@ -25,6 +25,8 @@ const ACC: &str = "ACC-1";
 const OTHER: &str = "ACC-2";
 const AAPL: &str = "INS-01J8XQ4M7K0000000000AAPL";
 const NOCCY: &str = "INS-01J8XQ4M7K00000000NOCCY";
+/// A referential record (contract v27): SOFR, which the lake observes.
+const SOFR: &str = "INS-01J8XQ4M7K000000000SOFR";
 /// The order tests' cash, in a currency no other test of this process
 /// resolves: the code's instrument is learned process-wide (contract v18).
 const CHF: &str = "INS-01J8XQ4M7K00000000CASHCHF";
@@ -68,6 +70,7 @@ fn wired() -> Wired {
         let instrument = match asked.instrument_id.as_str() {
             AAPL => Some(record(AssetClass::Equity, "CHF")),
             NOCCY => Some(record(AssetClass::Equity, "")),
+            SOFR => Some(record(AssetClass::Referential, "USD")),
             CHF => Some(record(AssetClass::Cash, "CHF")),
             EUR => Some(record(AssetClass::Cash, "EUR")),
             LOCAL | RESOLVING => Some(InstrumentRecord {
@@ -502,6 +505,17 @@ async fn a_proposal_is_proposed_entered_by_its_user_and_names_what_its_instrumen
     assert_eq!(
         meridian_bus::refusal_fields(&refused),
         vec!["instrument.currency"]
+    );
+
+    // A referential record is never held (contract v27, W9.10, W11.1):
+    // INVALID_ARGUMENT naming instrument_id, though the record is complete.
+    let mut observed = buy("10");
+    observed.instrument_id = SOFR.into();
+    let refused = propose(&w, &observed).await.unwrap_err();
+    assert_eq!(code(&refused), None);
+    assert_eq!(
+        status_of(&refused).unwrap().1,
+        vec!["instrument_id".to_string()]
     );
 
     let nobody = send_from(
