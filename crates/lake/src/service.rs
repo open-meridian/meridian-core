@@ -167,9 +167,6 @@ pub struct Lake {
     /// Trades recorded since the band last read them.
     trades_recorded: std::sync::atomic::AtomicU64,
     held: Mutex<BTreeSet<String>>,
-    /// Subjects the instrument store answered provisional, and when
-    /// (contract v24, W10.6): a local line is never wanted.
-    local: Mutex<std::collections::BTreeMap<String, i64>>,
     cash: Mutex<CashInstruments>,
     versions: Mutex<(BTreeMap<String, String>, i64)>,
 }
@@ -264,7 +261,6 @@ impl Lake {
             declined: Mutex::new(BTreeMap::new()),
             trades_recorded: std::sync::atomic::AtomicU64::new(0),
             held: Mutex::new(BTreeSet::new()),
-            local: Mutex::new(std::collections::BTreeMap::new()),
             cash: Mutex::new(CashInstruments::default()),
             versions: Mutex::new((BTreeMap::new(), 0)),
         })
@@ -928,56 +924,14 @@ impl Lake {
         }
     }
 
-    /// Whether a subject is a provisional record's (contract v24, W10.6,
-    /// W10.7): a local line, never priced, so never wanted. Asked of the
-    /// instrument store, a provisional answer remembered five minutes -- its
-    /// resolution moves it to the `INS-` record, which is wanted. Not known
-    /// is not provisional: the want goes as before.
-    fn subject_local(&self, entity: &str, now: i64) -> bool {
-        const LOCAL_FOR_NS: i64 = 300 * 1_000_000_000;
-        // Only a deployment's own `LCL-` record is ever provisional (W3.7).
-        if !entity.starts_with("LCL-") {
-            return false;
-        }
-        if let Some(at) = self.local.lock().expect("local poisoned").get(entity) {
-            if now - at < LOCAL_FOR_NS {
-                return true;
-            }
-        }
-        let reply: Result<ResolveInstrumentReply, String> = self.ask(
-            RESOLVE_INSTRUMENT,
-            "meridian.v1.ResolveInstrumentRequest",
-            ResolveInstrumentRequest {
-                instrument_id: entity.to_string(),
-                as_of_ns: now,
-            },
-        );
-        let local = reply
-            .ok()
-            .and_then(|reply| reply.instrument)
-            .is_some_and(|record| record.provisional && record.instrument_id == entity);
-        let mut held = self.local.lock().expect("local poisoned");
-        if local {
-            held.insert(entity.to_string(), now);
-        } else {
-            held.remove(entity);
-        }
-        local
-    }
-
     /// Ask the instances serving what a read could not answer, coalescing
-    /// identical asks and asking again only after a minute. A local line's
-    /// subject is never wanted (contract v24, W10.7).
+    /// identical asks and asking again only after a minute. From contract
+    /// v27 a provisional (`LCL-`) subject is wanted as any other (ruling 484,
+    /// W10.6, W10.7): the data plugin answers it by the identifiers the
+    /// record carries, or declines it; only valuing a local line is
+    /// refused, by the analytics component.
     fn want(&self, asks: Vec<read::Ask>, reader: &Reader) {
         let now = self.clock.now_ns();
-        let asks: Vec<read::Ask> = asks
-            .into_iter()
-            .filter_map(|mut ask| {
-                ask.subjects
-                    .retain(|subject| !self.subject_local(subject, now));
-                (!ask.subjects.is_empty()).then_some(ask)
-            })
-            .collect();
         let config = self.config();
         let by = match reader {
             Reader::Plugin(instance) => instance.clone(),

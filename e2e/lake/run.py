@@ -50,6 +50,12 @@ harness's admin, Ben, who holds read on `book`.
    licences; a currency the deployment does not hold pulled from the
    harness's master, never minted; a master slower than a resolve waits, or
    stopped, mints nothing, and a later resolve finds the pulled record.
+13. Contract v27 (ruling 484; W10.6, W10.7): a provisional LCL- record, which
+   the platform cannot yet confirm, read by `book` on a day nothing
+   recorded is wanted of `coin` -- the want sent, never ASKED_SOURCE alone --
+   and `coin` records it against the want; the platform then confirms it
+   and a person's ask resolves it to its INS- record, which `book` reads the
+   LCL- row through (the replacement followed).
 
 `make e2e-recorded` runs the same with STAND_IN_EXCHANGES naming RECORDED, a
 developer's recorded exchanges (plans/the-lake-prices-the-book, Q11).
@@ -59,6 +65,7 @@ copies the harness out first; standard library only.
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -77,6 +84,9 @@ FIVE = ["dashboard__list_datasets", "dashboard__set_dataset_licence",
         "dashboard__set_dataset_entitlement", "dashboard__list_source_priorities",
         "dashboard__set_source_priority"]
 DAY_1, DAY_2, DAY_0 = "2026-10-08", "2026-10-09", "2026-10-07"
+# Contract v27 (ruling 484): a FIGI the platform stand-in's source cannot
+# confirm until told to (deploy/harness/platform.py, /e2e/confirm).
+PENDING = "BBG00LAKEPEND1"
 
 
 class Failed(Exception):
@@ -139,6 +149,22 @@ def call(tool, arguments, outcome):
     must(answer.get("outcome") == outcome,
          f"{tool} answered {answer.get('outcome')}, not {outcome}: {done.stdout[-700:]}")
     return answer
+
+
+def platform(path, body=None):
+    """The platform stand-in, from inside its own container."""
+    script = ("import json,sys,urllib.request;"
+              f"r=urllib.request.Request('http://127.0.0.1:8000{path}',"
+              + ("data=sys.stdin.read().encode(),method='POST',headers={'Content-Type':'application/json'})"
+                 if body is not None else "method='GET')")
+              + ";print(urllib.request.urlopen(r).read().decode())")
+    done = subprocess.run(COMPOSE + ["exec", "-T", "platform", "python", "-c", script], env=ENV,
+                          input=json.dumps(body) if body is not None else None,
+                          capture_output=True, text=True, timeout=60)
+    log(f"$ platform {path}\n{done.stdout}{done.stderr}")
+    if done.returncode != 0:
+        raise Failed(f"the platform stand-in {path}: {done.stderr[-400:]}")
+    return json.loads(done.stdout)
 
 
 def datasets_listed():
@@ -450,6 +476,36 @@ def run():
     must(krona.get("found") and not krona.get("minted"),
          f"step 12, the master back, the krona pulled, not minted: {krona}")
 
+    # 13. Contract v27 (ruling 484): a provisional subject is wanted of its
+    # data plugin, answered by the identifiers its record carries, and
+    # followed to the INS- record it becomes.
+    local = page("coin", "admin", f"/resolve-as-of?scheme=figi&value={PENDING}")
+    local_id = local["instrument_id"]
+    must(local_id.startswith("LCL-"), f"step 13, a record the platform cannot confirm is local: {local}")
+    asked = page("book", "read", f"/prices?subject={local_id}&date={DAY_0}&kind=close&dataset=coin:daily")
+    must(not asked["prices"] and any(u["reason"] == "UNANSWERED_REASON_ASKED_SOURCE"
+                                     for u in asked["unanswered"]),
+         f"step 13, a provisional subject not recorded is asked of its source: {asked}")
+    until(60, lambda: [w for w in page("coin", "admin", "/wants")["wants"]
+                       if local_id in w["subjects"] and w["business_date"] == DAY_0],
+          "step 13, coin heard no want naming the provisional subject")
+    until(60, lambda: page("book", "read",
+                           f"/prices?subject={local_id}&date={DAY_0}&kind=close&dataset=coin:daily")["prices"],
+          "step 13, coin did not record the provisional subject's day against the want")
+    platform("/e2e/confirm", {"figis": [PENDING]})
+    runner("instrument", local_id, "--ask-platform")
+    resolved = until(90, lambda: (lambda said: said if "open_meridian_local" in said else None)(
+        runner("core-page", f"/admin/instruments/{local_id}")),
+        "step 13, the provisional record did not resolve")
+    became = re.search(r"INS-01JMINT\d{19}", resolved)
+    must(became, "step 13, the record it became is the platform's INS- record")
+    followed = until(60, lambda: page("book", "read",
+                                      f"/prices?subject={became.group(0)}&date={DAY_0}&kind=close"
+                                      "&dataset=coin:daily")["prices"],
+                     "step 13, the INS- record did not read the row recorded under the LCL- ID")
+    must(followed[0]["amount"] and followed[0]["version"] == 1,
+         f"step 13, the LCL- row read through the INS- record: {followed}")
+
     # 11. The store.
     lines = compose("run", "--rm", "-T", "store", "lake").stdout.split("\n")
     log("store lake:\n" + "\n".join(lines))
@@ -489,7 +545,9 @@ def run():
           "record for its own dates; a restarted data plugin streaming again on its standing want, "
           "delivered again by the lake, reading its own last trade per venue for the backfill, "
           "a reader refused it, and its own datasets' licences; a currency the deployment did not "
-          "hold pulled from the master and kept, found and not minted; and `store lake` printing each version numbered with no "
+          "hold pulled from the master and kept, found and not minted; a provisional record wanted "
+          "of its data plugin, recorded against the want and read through the INS- record it "
+          "became; and `store lake` printing each version numbered with no "
           "holes, the want and the priority's changes")
 
 

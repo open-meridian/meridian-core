@@ -223,9 +223,11 @@ class Dgm:
         return dict(self.ids)
 
     def meta(self, row_key, subject, dataset, seconds, venue=""):
+        # A subject by its name here, or (contract v27) by the ID a want named.
+        entity = self.ids.get(subject, subject)
         return ObservationMeta(
             row_key=row_key,
-            subjects=[ops.SubjectRef(entity_id=self.ids[subject])],
+            subjects=[ops.SubjectRef(entity_id=entity)],
             source=ops.Source(dataset=self.dataset(dataset), venue_id=venue),
             valid_from_ns=seconds * 10**9,
             valid_until_ns=seconds * 10**9 + DAY_NS,
@@ -234,10 +236,11 @@ class Dgm:
             raw=self.plugin.raw_record(f"candles/{row_key}"),
         )
 
-    def close(self, candle):
+    def close(self, candle, subject="btc"):
         seconds, _low, _high, _open, close, _volume = candle
+        key = "BTC-USD" if subject == "btc" else subject
         return Price(
-            meta=self.meta(f"BTC-USD:1d:{seconds}", "btc", "daily", seconds, VENUE),
+            meta=self.meta(f"{key}:1d:{seconds}", subject, "daily", seconds, VENUE),
             kind="close",
             price=Money(Decimal(close), "USD"),
             basis="per_unit",
@@ -330,10 +333,16 @@ class Dgm:
             return
         await self.resolve()
         wanted = date.fromisoformat(want.business_date)
+        # Each subject the want names: BTC by its own name, and from contract
+        # v27 a provisional (LCL-) record by the ID the want names, as a data
+        # plugin answers by the identifiers the record carries (ruling 484).
+        btc = self.ids["btc"]
+        subjects = ["btc" if s.entity_id == btc else s.entity_id for s in want.subjects]
         for candle in exchange()["candles"]["BTC-USD"]:
             if day_of(candle[0]) == wanted:
-                done = await self.plugin.record_prices(prices=[self.close(candle)],
-                                                       want_id=want.want_id)
+                done = await self.plugin.record_prices(
+                    prices=[self.close(candle, subject) for subject in subjects],
+                    want_id=want.want_id)
                 log(answered={"want_id": want.want_id, "recorded": done.recorded})
                 return
 

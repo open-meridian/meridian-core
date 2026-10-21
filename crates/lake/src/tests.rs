@@ -581,13 +581,16 @@ async fn a_read_not_answered_is_wanted_once_for_two_readers_answered_and_a_decli
 /// A provisional record (contract v24).
 const LOCAL: &str = "LCL-01J8LOCAL0000000000000000";
 
-/// Contract v24 (W10.6, W10.7): a local line is never priced, so its
-/// subject is never wanted; another subject in the same read still is.
+/// Contract v27 (ruling 484; W10.6, W10.7): a read naming a provisional
+/// (`LCL-`) subject the lake does not keep is wanted of its data plugin, as
+/// any other subject is -- never answered ASKED_SOURCE without the want
+/// sent -- and the rows recorded against it are followed to the `INS-`
+/// record it becomes.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_local_lines_subject_is_never_wanted() {
+async fn a_provisional_subject_is_wanted_and_followed_to_the_record_it_becomes() {
     let h = harness();
     let mut wanted = h.bus.subscribe_every(service::OBSERVATIONS_WANTED);
-    read(
+    let answer = read(
         &h,
         "reporting-1",
         &[LOCAL],
@@ -595,24 +598,47 @@ async fn a_local_lines_subject_is_never_wanted() {
         SourceChoice::default(),
         0,
     );
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(150), wanted.recv())
-            .await
-            .is_err(),
-        "nothing wanted for a provisional record"
-    );
-    read(
+    assert!(answer
+        .unanswered
+        .iter()
+        .any(|u| u.reason == UnansweredReason::AskedSource as i32));
+    let want = ObservationsWantedEvent::decode(&wanted.recv().await.unwrap().envelope.payload[..])
+        .unwrap();
+    let subjects: Vec<&str> = want.subjects.iter().map(|s| s.entity_id.as_str()).collect();
+    assert_eq!(subjects, vec![LOCAL]);
+    // The data plugin answers it by the record's identifiers, then the
+    // record is resolved to the platform's: the row is followed.
+    record(
+        &h,
+        "coinbase-1",
+        vec![close("coinbase-1", "k", LOCAL, "2026-10-07", "3")],
+        &want.want_id,
+    )
+    .unwrap();
+    h.lake.hear(Envelope {
+        meta: None,
+        payload_type: "meridian.v1.InstrumentReplacedEvent".into(),
+        payload: InstrumentReplacedEvent {
+            replaced_instrument_id: LOCAL.into(),
+            instrument: Some(InstrumentRecord {
+                instrument_id: AAPL.into(),
+                ..Default::default()
+            }),
+            replaced_at_ns: NOW,
+            ..Default::default()
+        }
+        .encode_to_vec(),
+    });
+    let followed = read(
         &h,
         "reporting-1",
-        &[LOCAL, BTC],
+        &[AAPL],
         "2026-10-07",
         SourceChoice::default(),
         0,
     );
-    let want = ObservationsWantedEvent::decode(&wanted.recv().await.unwrap().envelope.payload[..])
-        .unwrap();
-    let subjects: Vec<&str> = want.subjects.iter().map(|s| s.entity_id.as_str()).collect();
-    assert_eq!(subjects, vec![BTC]);
+    assert_eq!(followed.rows.len(), 1);
+    assert_eq!(followed.rows[0].subject(), LOCAL, "the row as recorded");
 }
 
 #[tokio::test(flavor = "multi_thread")]
