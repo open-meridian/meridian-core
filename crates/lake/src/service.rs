@@ -71,6 +71,8 @@ pub const RECORD_QUOTES: &str = "platform.lake.command.record-quotes";
 pub const RECORD_OUTCOMES: &str = "platform.lake.command.record-outcomes";
 /// Contract v27, the rates slice (W10.4, W10.6).
 pub const RECORD_RATES: &str = "platform.lake.command.record-rates";
+/// Contract v27 (W10.4, W10.5; ruling 418): a dataset's liveness.
+pub const RECORD_LIVENESS: &str = "platform.lake.command.record-liveness";
 pub const LIST_RATES: &str = "platform.lake.query.list-rates";
 pub const DECLINE_WANT: &str = "platform.lake.command.decline-want";
 pub const SET_SOURCE_PRIORITY: &str = "platform.lake.command.set-source-priority";
@@ -185,6 +187,10 @@ pub struct Lake {
     held: Mutex<BTreeMap<String, (i32, i32)>>,
     cash: Mutex<CashInstruments>,
     versions: Mutex<(BTreeMap<String, String>, i64)>,
+    /// Contract v27 (W10.4; ruling 418): the latest liveness per dataset
+    /// and venue. Not a row, never kept as one: measurement a data plugin
+    /// sends again within seconds, so a restart loses nothing it needs.
+    liveness: Mutex<BTreeMap<(String, String), meridian_domain::v1::DatasetLiveness>>,
 }
 
 /// The analytics component's instance where nothing names another (W12.2).
@@ -279,6 +285,7 @@ impl Lake {
             held: Mutex::new(BTreeMap::new()),
             cash: Mutex::new(CashInstruments::default()),
             versions: Mutex::new((BTreeMap::new(), 0)),
+            liveness: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -2007,6 +2014,16 @@ impl Lake {
                 // those outside the calendar's coverage, counted apart.
                 closed_day_count: flagged.get(dataset).map_or(0, |c| c.0),
                 outside_coverage_count: flagged.get(dataset).map_or(0, |c| c.1),
+                // Contract v27 (W10.9; ruling 418): the latest liveness the
+                // lake keeps, one per venue.
+                liveness: self
+                    .liveness
+                    .lock()
+                    .expect("liveness poisoned")
+                    .range((dataset.clone(), String::new())..)
+                    .take_while(|((held, _), _)| held == dataset)
+                    .map(|(_, alive)| alive.clone())
+                    .collect(),
                 ..held.clone()
             });
             match &reader {
@@ -2028,6 +2045,87 @@ impl Lake {
             .cloned()
             .collect();
         Ok(reply)
+    }
+
+    /// W10.4, contract v27 (ruling 418): a data plugin's datasets' liveness,
+    /// 1 to 500 items, each a dataset its catalogue declares, the venue where
+    /// it has one, and `alive_at_ns`, the source's last heartbeat or poll;
+    /// recorded whole or refused naming the item and field. The latest per
+    /// dataset and venue is kept, an earlier one heard late changing
+    /// nothing, and published on the dataset's subject (W10.5), conflated per
+    /// dataset and venue; it is answered in the datasets' listing (W10.9).
+    pub(crate) fn record_liveness(
+        &self,
+        request: meridian_domain::v1::RecordLivenessRequest,
+        envelope: &Envelope,
+    ) -> Result<meridian_domain::v1::RecordLivenessReply, String> {
+        let instance = publisher(envelope);
+        let bound = bounds::RECORD_LIVENESS_REQUEST_LIVENESS_COUNT;
+        if !bound.admits(request.liveness.len()) {
+            return Err(format!(
+                "liveness holds {} items; a batch is {} to {}",
+                request.liveness.len(),
+                bound.least,
+                bound.most
+            ));
+        }
+        let config = self.config();
+        let mut checked = Vec::with_capacity(request.liveness.len());
+        for (i, mut alive) in request.liveness.into_iter().enumerate() {
+            let at = format!("liveness[{i}]");
+            if !config.declared_by(&alive.dataset, &instance) {
+                return Err(format!(
+                    "{at}.dataset {:?} is no dataset this instance's catalogue declares",
+                    alive.dataset
+                ));
+            }
+            if !alive.venue_id.is_empty() && !alive.venue_id.starts_with("VEN-") {
+                return Err(format!(
+                    "{at}.venue_id {:?} is not a venue master ID",
+                    alive.venue_id
+                ));
+            }
+            if alive.alive_at_ns <= 0 {
+                return Err(format!(
+                    "{at}.alive_at_ns is the source's last heartbeat or poll, a time"
+                ));
+            }
+            // Whose it is, the lake's word, never the plugin's.
+            alive.instance = instance.clone();
+            checked.push(alive);
+        }
+        let mut kept = 0;
+        for alive in checked {
+            let key = (alive.dataset.clone(), alive.venue_id.clone());
+            let newer = {
+                let mut held = self.liveness.lock().expect("liveness poisoned");
+                let newer = held
+                    .get(&key)
+                    .is_none_or(|before| before.alive_at_ns < alive.alive_at_ns);
+                if newer {
+                    held.insert(key, alive.clone());
+                }
+                newer
+            };
+            if !newer {
+                continue;
+            }
+            kept += 1;
+            let topic = format!("platform.lake.{}.event.liveness-recorded", alive.dataset);
+            let event = meridian_domain::v1::LivenessRecordedEvent {
+                liveness: Some(alive),
+            };
+            if let Err(failed) = self.bus.publish(
+                &topic,
+                "meridian.v1.LivenessRecordedEvent",
+                event.encode_to_vec(),
+                None,
+                None,
+            ) {
+                tracing::warn!(topic, %failed, "a dataset's liveness was kept and not published");
+            }
+        }
+        Ok(meridian_domain::v1::RecordLivenessReply { kept })
     }
 
     pub(crate) fn set_priority(
@@ -2588,6 +2686,19 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
                 &request.want_id,
                 envelope,
             )
+        },
+    );
+    // Contract v27 (W10.4; ruling 418): a dataset's liveness.
+    serve_on(
+        &bus,
+        &lake,
+        RECORD_LIVENESS,
+        (
+            "meridian.v1.RecordLivenessRequest",
+            "meridian.v1.RecordLivenessReply",
+        ),
+        |lake, request: meridian_domain::v1::RecordLivenessRequest, envelope| {
+            lake.record_liveness(request, envelope)
         },
     );
     // Contract v27, the rates slice (W10.6): read as prices are, narrowed

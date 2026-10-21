@@ -222,3 +222,30 @@ fn an_entitlement_names_a_running_instance_and_entries_of_the_datasets_types() {
     let (_, changes) = store.dataset_changes("coinbase-1:daily").unwrap();
     assert_eq!(changes.len(), 2, "each change its own record");
 }
+
+#[test]
+fn a_datasets_stale_ceiling_is_its_data_plugin_admins_dataset_thresholds() {
+    // Contract v27 (W10.9; ruling 417): `stale_after` in whole seconds, by
+    // the dataset's key; a row that does not read passed over.
+    let store = store();
+    let mut snapshot = store.snapshot().unwrap();
+    snapshot.settings.push(crate::store::StoredSetting {
+        plugin_instance_id: "coinbase-1".into(),
+        name: DATASET_THRESHOLDS.into(),
+        held: crate::store::Held::Plain(
+            r#"[{"dataset":"daily","asset_class":"crypto","stale_after":"10"},
+                {"dataset":"ticks","stale_after":"soon"}]"#
+                .into(),
+        ),
+        set_by: "local|ada".into(),
+        set_at_ns: NOW,
+    });
+    let launched = datasets(&snapshot);
+    assert_eq!(launched[0].stale_after_ns, 10_000_000_000);
+    assert_eq!(
+        stale_after(&snapshot, "coinbase-1").len(),
+        1,
+        "the row that does not read is passed over"
+    );
+    assert!(stale_after(&snapshot, "kraken-1").is_empty());
+}

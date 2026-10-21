@@ -664,6 +664,13 @@ pub fn catalogue_refused(catalogue: &Catalogue, roles: &[String]) -> Option<Stri
                 DATA_TYPES.join(", ")
             ));
         }
+        // Contract v27 (W10.1; ruling 369): a delayed dataset's declared
+        // delay, 0 for real time, never negative.
+        if dataset.declared_delay_ns < 0 {
+            return Some(format!(
+                "{at}.declared_delay_ns is the delay the dataset is served at, 0 or more"
+            ));
+        }
         if !DATASET_DECLARATION_MODES_COUNT.admits(dataset.modes.len()) {
             return Some(format!("{at}.modes names {}; 1 to 3", dataset.modes.len()));
         }

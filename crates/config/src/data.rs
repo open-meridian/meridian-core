@@ -82,11 +82,48 @@ pub fn catalogues(snapshot: &Snapshot) -> BTreeMap<String, Catalogue> {
     running
 }
 
+/// The data plugin admin's stale ceilings (contract v27, W10.9; rulings 368
+/// and 417): the table setting `dataset_thresholds`, read by its fixed name,
+/// each row's `dataset` the dataset's key in the instance's catalogue and its
+/// `stale_after` whole seconds; by key, in nanoseconds. A row that does not
+/// read is passed over, never guessed at.
+pub const DATASET_THRESHOLDS: &str = "dataset_thresholds";
+
+pub fn stale_after(snapshot: &Snapshot, instance: &str) -> BTreeMap<String, i64> {
+    let mut out = BTreeMap::new();
+    let Some(held) = snapshot
+        .settings
+        .iter()
+        .find(|s| s.plugin_instance_id == instance && s.name == DATASET_THRESHOLDS)
+    else {
+        return out;
+    };
+    let crate::store::Held::Plain(value) = &held.held else {
+        return out;
+    };
+    for row in meridian_domain::setting_table::parse(value).unwrap_or_default() {
+        let key = row.cells.get("dataset").map(|k| k.trim().to_string());
+        let seconds = row
+            .cells
+            .get("stale_after")
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .filter(|s| *s > 0);
+        if let (Some(key), Some(seconds)) = (key, seconds) {
+            if let Some(ns) = seconds.checked_mul(1_000_000_000) {
+                out.insert(key, ns);
+            }
+        }
+    }
+    out
+}
+
 /// Every launched dataset, by its ID, with its catalogue entry.
 pub fn datasets(snapshot: &Snapshot) -> Vec<DatasetRef> {
     let mut out = Vec::new();
     for (instance, catalogue) in catalogues(snapshot) {
+        let ceilings = stale_after(snapshot, &instance);
         for declared in catalogue.datasets {
+            let stale_after_ns = ceilings.get(&declared.key).copied().unwrap_or(0);
             out.push(DatasetRef {
                 dataset: lake::dataset_id(&instance, &declared.key),
                 instance: instance.clone(),
@@ -99,8 +136,9 @@ pub fn datasets(snapshot: &Snapshot) -> Vec<DatasetRef> {
                 closed_day_count: 0,
                 outside_coverage_count: 0,
                 // Contract v27 (W10.9): the declared delay is the
-                // catalogue's; the stale ceiling and liveness the lake's.
-                stale_after_ns: 0,
+                // catalogue's, the stale ceiling the data plugin admin's
+                // `dataset_thresholds`; liveness the lake's.
+                stale_after_ns,
                 liveness: Vec::new(),
             });
         }

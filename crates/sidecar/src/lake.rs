@@ -29,9 +29,10 @@ use std::sync::{Arc, RwLock};
 use meridian_bus::Bus;
 use meridian_domain::v1::{
     BarsRecordedEvent, EntitlementsChangedEvent, ListBarsRequest, ListPricesRequest,
-    ListRatesRequest, ObservationMeta, ObservationsWantedEvent, OutcomesRecordedEvent,
-    PricesRecordedEvent, QuotesRecordedEvent, RatesRecordedEvent, RecordBarsRequest,
-    RecordPricesRequest, RecordRatesRequest, TradesRecordedEvent, WantWithdrawnEvent,
+    ListRatesRequest, LivenessRecordedEvent, ObservationMeta, ObservationsWantedEvent,
+    OutcomesRecordedEvent, PricesRecordedEvent, QuotesRecordedEvent, RatesRecordedEvent,
+    RecordBarsRequest, RecordPricesRequest, RecordRatesRequest, TradesRecordedEvent,
+    WantWithdrawnEvent,
 };
 use prost::Message;
 use tokio::sync::watch;
@@ -224,6 +225,18 @@ pub(crate) fn said(payload_type: &str, payload: &[u8]) -> Option<Said> {
                 )),
                 dataset,
                 subjects,
+                is_want: false,
+            })
+        }
+        // Contract v27 (W10.5; ruling 418): a dataset's liveness, about no
+        // subject, heard by every reader of the dataset, conflated per
+        // dataset and venue.
+        "meridian.v1.LivenessRecordedEvent" => {
+            let alive = LivenessRecordedEvent::decode(payload).ok()?.liveness?;
+            Some(Said {
+                key: Some(format!("liveness|{}|{}", alive.dataset, alive.venue_id)),
+                dataset: alive.dataset,
+                subjects: Vec::new(),
                 is_want: false,
             })
         }

@@ -508,7 +508,10 @@ async fn deliver(
             let Some(fields) = lake.entitled.fields(&said.dataset) else {
                 return;
             };
-            if !said.subjects.iter().any(|s| lake.subjects.contains(s)) {
+            // A dataset's liveness names no subject (contract v27): every
+            // reader of the dataset hears it.
+            if !said.subjects.is_empty() && !said.subjects.iter().any(|s| lake.subjects.contains(s))
+            {
                 return;
             }
             envelope.payload =

@@ -2259,3 +2259,65 @@ async fn execution_costs_are_the_components_rows_read_within_the_readers_account
     assert_eq!(status, meridian_bus::RefusalStatus::PermissionDenied);
     assert_eq!(fields, vec!["account_id".to_string()]);
 }
+
+/// Contract v27 (W10.4, W10.5, W10.9; ruling 418): a dataset's liveness,
+/// kept latest per dataset and venue, published on the dataset's subject,
+/// answered in the listing; another instance's dataset refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_datasets_liveness_is_kept_published_and_listed() {
+    use meridian_domain::v1::{DatasetLiveness, LivenessRecordedEvent, RecordLivenessRequest};
+    let h = harness();
+    let mut heard = h
+        .bus
+        .subscribe_every("platform.lake.coinbase-1:daily.event.liveness-recorded");
+    let alive = |dataset: &str, at: i64| DatasetLiveness {
+        dataset: dataset.into(),
+        venue_id: "VEN-01JA0000000000000CBEXC".into(),
+        alive_at_ns: at,
+        instance: "someone-else".into(),
+    };
+    let record = |items: Vec<DatasetLiveness>| {
+        tokio::task::block_in_place(|| {
+            h.lake.record_liveness(
+                RecordLivenessRequest { liveness: items },
+                &envelope("coinbase-1", true, ""),
+            )
+        })
+    };
+    let kept = record(vec![alive("coinbase-1:daily", NOW - 5)]).unwrap();
+    assert_eq!(kept.kept, 1);
+    let event = LivenessRecordedEvent::decode(&heard.recv().await.unwrap().envelope.payload[..])
+        .unwrap()
+        .liveness
+        .unwrap();
+    assert_eq!(event.alive_at_ns, NOW - 5);
+    assert_eq!(event.instance, "coinbase-1", "whose it is, the lake's word");
+    // An earlier one heard late changes nothing.
+    assert_eq!(
+        record(vec![alive("coinbase-1:daily", NOW - 9)])
+            .unwrap()
+            .kept,
+        0
+    );
+    // Another instance's dataset, and no time, are refused naming the item.
+    let refused = record(vec![alive("kraken-1:daily", NOW)]).unwrap_err();
+    assert!(refused.starts_with("liveness[0].dataset"), "{refused}");
+    let refused = record(vec![alive("coinbase-1:daily", 0)]).unwrap_err();
+    assert!(refused.starts_with("liveness[0].alive_at_ns"), "{refused}");
+    let listed =
+        tokio::task::block_in_place(|| h.lake.list_datasets(&envelope("dashboard-1", false, "")))
+            .unwrap();
+    let daily = listed
+        .datasets
+        .iter()
+        .find(|d| d.dataset == "coinbase-1:daily")
+        .unwrap();
+    assert_eq!(daily.liveness.len(), 1);
+    assert_eq!(daily.liveness[0].alive_at_ns, NOW - 5);
+    let kraken = listed
+        .datasets
+        .iter()
+        .find(|d| d.dataset == "kraken-1:daily")
+        .unwrap();
+    assert!(kraken.liveness.is_empty());
+}
