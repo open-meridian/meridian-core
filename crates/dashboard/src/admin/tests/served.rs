@@ -1399,7 +1399,9 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
                 .collect();
             // The US dollar's record, kept under the platform's `INS-` ID
             // (contract v24, requirement 19), found by it.
-            if !search.is_empty() && PLATFORM_USD.to_lowercase().contains(&search) {
+            if (!search.is_empty() && PLATFORM_USD.to_lowercase().contains(&search))
+                || asked.instrument_id == PLATFORM_USD
+            {
                 instruments.push(InstrumentToComplete {
                     instrument: Some(InstrumentRecord {
                         instrument_id: PLATFORM_USD.into(),
@@ -1795,6 +1797,19 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
                 changed_by: ADMIN.into(),
                 affirmation_deadline: 21 * 60,
                 affirmation_deadline_instance_id: "operations-1".into(),
+            }
+            .encode_to_vec(),
+        ))
+    });
+    // Contract v27 (W6.36): the FX pivot currencies, the US dollar's record
+    // first, set by the admin, for the FX pivot currencies tab.
+    bus.serve(crate::admin::fx_pivots::READ_FX_PIVOT_CURRENCIES, |_| {
+        Ok((
+            "meridian.v1.FxPivotCurrenciesSetting".into(),
+            meridian_domain::v1::FxPivotCurrenciesSetting {
+                fx_pivot_currencies: vec![PLATFORM_USD.into()],
+                changed_at_ns: 1_792_300_000_000_000_000,
+                changed_by: ADMIN.into(),
             }
             .encode_to_vec(),
         ))

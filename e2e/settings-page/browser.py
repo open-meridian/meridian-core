@@ -44,6 +44,9 @@ needed?" So, in headless Chromium:
 - the Model routing tab (contract v26, W12.6): each model id on one line,
   its implementation and since when, and its Change dialog, at 375, 582 and
   1280 wide;
+- the FX pivot currencies tab (contract v27, W6.36): the pivots in order by
+  their codes, and its Change dialog of four codes, at 375, 582 and 1280 wide
+  in light and dark;
 - the Service accounts tab (contract v21): one line an account behind the
   kit's pager, its dialog within the viewport, one created from it prepare
   only by default; and the Access tab's Runs as, one line a role, nobody
@@ -1196,6 +1199,36 @@ def the_time_zone_tab(browser, prefix):
         ctx.close()
 
 
+def the_fx_pivots_tab(browser, prefix):
+    """Contract v27 (W6.36; ruling 483): the Settings' FX pivot currencies
+    tab -- the pivots in order by their codes, the last change and who made
+    it -- and its Change dialog of four codes and a reason, each on one
+    screen at the three sizes, in light and dark, with no sideways scroll."""
+    for scheme in ("light", "dark"):
+        for size, width, height in V24_SIZES:
+            ctx = context(browser, width, height, scheme=scheme)
+            page = ctx.new_page()
+            errors = []
+            page.on("pageerror", lambda e: errors.append(str(e)))
+            page.goto(ADMIN_PAGE + "#fx-pivots")
+            settled(page)
+            said = page.inner_text("#fx-pivots")
+            check("USD" in said and "set " in said,
+                  f"at {size} ({scheme}) the tab says the pivots by code and who set them: {said[:200]!r}")
+            m = page.evaluate(MEASURE)
+            measured(page, f"fx-pivots at {size} {scheme}", f"v27-{prefix}-fx-pivots-{size}-{scheme}.png")
+            check(m["tall"] <= 0, f"the FX pivot currencies tab at {size} ({scheme}) fits one screen: {m['tall']}px taller")
+            page.click("#fx-pivots button[data-dialog-open=fx-pivots-change]")
+            page.wait_for_timeout(300)
+            boxed = inside_the_viewport(page)
+            check(not boxed, f"at {size} ({scheme}) the pivots' dialog stays within the viewport{': ' + boxed if boxed else ''}")
+            inside = page.evaluate(INSIDE)
+            check(not inside, f"at {size} ({scheme}) nothing in the pivots' dialog reaches past it: {inside}")
+            page.screenshot(path=os.path.join(OUT, f"v27-{prefix}-fx-pivots-dialog-{size}-{scheme}.png"))
+            check(not errors, f"the FX pivot currencies tab at {size} ({scheme}) ran without a script error: {errors}")
+            ctx.close()
+
+
 def the_model_routing_tab(browser, prefix):
     """Contract v26 (W12.6): the Settings' Model routing tab -- each model
     id on one line, its implementation and since when, the measures the
@@ -1386,6 +1419,7 @@ with sync_playwright() as playwright:
     the_documentation_pages(browser, prefix)
     the_registry_pages(browser, prefix)
     the_time_zone_tab(browser, prefix)
+    the_fx_pivots_tab(browser, prefix)
     the_model_routing_tab(browser, prefix)
     the_portal_overview(browser, prefix)
     browser.close()
