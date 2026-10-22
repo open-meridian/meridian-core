@@ -34,6 +34,85 @@ pub struct Money {
     #[prost(string, tag = "3")]
     pub instrument_id: ::prost::alloc::string::String,
 }
+/// A value with its unit (contract v27, the lake's rates slice;
+/// spec/the-lake-holds-researchs-kinds, shared addition 3 and Q8;
+/// spec/a-public-rates-and-filings-data-plugin, §1 item 2): a Decimal that is
+/// not money, in base units, with its unit from a closed list or, for a
+/// physical unit, its UCUM code. A 3.87 per cent fixing is 3.87 percent, never
+/// a Money.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UnitValue {
+    #[prost(message, optional, tag = "1")]
+    pub value: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    #[prost(enumeration = "ValueUnit", tag = "2")]
+    pub unit: i32,
+    /// For VALUE_UNIT_INDEX, the index's base period as its publisher states
+    /// it (`2015=100`); empty otherwise.
+    #[prost(string, tag = "3")]
+    pub index_base: ::prost::alloc::string::String,
+    /// For VALUE_UNIT_UCUM, the physical unit's UCUM code (`Cel`, `\[bbl_us\]`);
+    /// empty otherwise.
+    #[prost(string, tag = "4")]
+    pub ucum_code: ::prost::alloc::string::String,
+}
+/// The closed list of units a UnitValue takes (contract v27).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ValueUnit {
+    /// Refused.
+    Unspecified = 0,
+    Percent = 1,
+    BasisPoints = 2,
+    Shares = 3,
+    Contracts = 4,
+    /// A face amount, in its currency's major unit.
+    Principal = 5,
+    Ratio = 6,
+    Count = 7,
+    Days = 8,
+    /// An index level, with its base period in index_base.
+    Index = 9,
+    /// A physical unit, named by ucum_code.
+    Ucum = 10,
+}
+impl ValueUnit {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "VALUE_UNIT_UNSPECIFIED",
+            Self::Percent => "VALUE_UNIT_PERCENT",
+            Self::BasisPoints => "VALUE_UNIT_BASIS_POINTS",
+            Self::Shares => "VALUE_UNIT_SHARES",
+            Self::Contracts => "VALUE_UNIT_CONTRACTS",
+            Self::Principal => "VALUE_UNIT_PRINCIPAL",
+            Self::Ratio => "VALUE_UNIT_RATIO",
+            Self::Count => "VALUE_UNIT_COUNT",
+            Self::Days => "VALUE_UNIT_DAYS",
+            Self::Index => "VALUE_UNIT_INDEX",
+            Self::Ucum => "VALUE_UNIT_UCUM",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "VALUE_UNIT_UNSPECIFIED" => Some(Self::Unspecified),
+            "VALUE_UNIT_PERCENT" => Some(Self::Percent),
+            "VALUE_UNIT_BASIS_POINTS" => Some(Self::BasisPoints),
+            "VALUE_UNIT_SHARES" => Some(Self::Shares),
+            "VALUE_UNIT_CONTRACTS" => Some(Self::Contracts),
+            "VALUE_UNIT_PRINCIPAL" => Some(Self::Principal),
+            "VALUE_UNIT_RATIO" => Some(Self::Ratio),
+            "VALUE_UNIT_COUNT" => Some(Self::Count),
+            "VALUE_UNIT_DAYS" => Some(Self::Days),
+            "VALUE_UNIT_INDEX" => Some(Self::Index),
+            "VALUE_UNIT_UCUM" => Some(Self::Ucum),
+            _ => None,
+        }
+    }
+}
 /// A binary event contract's attributes (contract v19; plans/the-lake-prices-
 /// the-book, Q38): what it pays and when trading in it closes. Which outcome
 /// it pays on stays in its description, the venue's words, until the outcome
@@ -1539,6 +1618,48 @@ pub struct AskPlatformForInstrumentReply {
     #[prost(message, optional, tag = "5")]
     pub match_or_mint_answer: ::core::option::Option<EscalateInstrumentReply>,
 }
+/// A venue's trading sessions (contract v27; W1.20, W3.19; ruling 419): the
+/// minimal kind staleness needs, sessions a day in local time.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TradingSessions {
+    /// IANA.
+    #[prost(string, tag = "1")]
+    pub time_zone: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "2")]
+    pub sessions: ::prost::alloc::vec::Vec<TradingSession>,
+    /// Each day whose sessions differ: an early close, a late open, a day
+    /// closed; an early close announced later is a new version.
+    #[prost(message, repeated, tag = "3")]
+    pub early_closes: ::prost::alloc::vec::Vec<TradingSessionDay>,
+}
+/// One session, on the weekdays it runs.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TradingSession {
+    #[prost(enumeration = "Weekday", repeated, tag = "1")]
+    pub weekdays: ::prost::alloc::vec::Vec<i32>,
+    /// Minutes after local midnight: the start, and the end, exclusive, at most
+    /// 1440.
+    #[prost(uint32, tag = "2")]
+    pub start_minute: u32,
+    #[prost(uint32, tag = "3")]
+    pub end_minute: u32,
+    /// An extended session: pre-market or after-hours.
+    #[prost(bool, tag = "4")]
+    pub extended: bool,
+}
+/// One dated day's sessions, in place of the weekday's.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TradingSessionDay {
+    /// ISO 8601, a plain date.
+    #[prost(string, tag = "1")]
+    pub date: ::prost::alloc::string::String,
+    /// None for a day closed.
+    #[prost(message, repeated, tag = "2")]
+    pub sessions: ::prost::alloc::vec::Vec<TradingSession>,
+    /// A source_id among the version's sources.
+    #[prost(string, tag = "3")]
+    pub source: ::prost::alloc::string::String,
+}
 /// A calendar's weekend, dated, so a change of weekend takes effect on its
 /// day.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1649,6 +1770,10 @@ pub struct CalendarRecord {
     /// Active, or decommissioned: the master's lifecycle, as a venue's.
     #[prost(enumeration = "InstrumentLifecycleState", tag = "16")]
     pub lifecycle_state: i32,
+    /// Contract v27: a trading-sessions calendar's sessions; unset on every
+    /// other kind.
+    #[prost(message, optional, tag = "17")]
+    pub trading_sessions: ::core::option::Option<TradingSessions>,
 }
 /// W1.20. Answered by the calendar's record at version 1.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1679,6 +1804,10 @@ pub struct DefineCalendarRequest {
     /// Required from an agent, whose draft a person on the staff approves.
     #[prost(string, tag = "12")]
     pub note: ::prost::alloc::string::String,
+    /// Contract v27: for CALENDAR_KIND_TRADING_SESSIONS, its sessions, required
+    /// there and refused on any other kind.
+    #[prost(message, optional, tag = "13")]
+    pub trading_sessions: ::core::option::Option<TradingSessions>,
 }
 /// W1.21. The next version, whole, or a decommission; refused against a
 /// version that is not the latest.
@@ -1713,6 +1842,9 @@ pub struct AmendCalendarRequest {
     /// Decommissioned as of valid_time_ns; unspecified leaves it as it was.
     #[prost(enumeration = "InstrumentLifecycleState", tag = "14")]
     pub lifecycle_state: i32,
+    /// Contract v27: a trading-sessions calendar's sessions, whole.
+    #[prost(message, optional, tag = "15")]
+    pub trading_sessions: ::core::option::Option<TradingSessions>,
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct Tenor {
@@ -1993,6 +2125,10 @@ pub struct ReadCalendarReply {
     pub coverage: ::core::option::Option<CalendarCoverage>,
     #[prost(message, repeated, tag = "7")]
     pub sources: ::prost::alloc::vec::Vec<CalendarSource>,
+    /// Contract v27 (W3.19): a trading-sessions calendar's sessions, with the
+    /// early closes falling in the range; unset on every other kind.
+    #[prost(message, optional, tag = "8")]
+    pub trading_sessions: ::core::option::Option<TradingSessions>,
 }
 /// W3.20: an instrument's settlement date by its market's rule.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -2517,6 +2653,25 @@ pub struct ReportEventGroupRequest {
     /// Stamped by the sidecar: the reporting instance.
     #[prost(string, tag = "10")]
     pub publisher_instance_id: ::prost::alloc::string::String,
+    /// Contract v27 (W3.29; ruling 464): each range member's floor, cap and
+    /// unit as the venue states them, taken as values offered for the
+    /// member's record; a person's value wins.
+    #[prost(message, repeated, tag = "11")]
+    pub member_bounds: ::prost::alloc::vec::Vec<EventGroupMemberBound>,
+}
+/// One range member's bounds as its venue states them (contract v27; ruling
+/// 464): the binary event contract template's floor, cap and bound_unit.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct EventGroupMemberBound {
+    /// One of the report's members.
+    #[prost(string, tag = "1")]
+    pub instrument_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub floor: ::core::option::Option<EventContractBound>,
+    #[prost(message, optional, tag = "3")]
+    pub cap: ::core::option::Option<EventContractBound>,
+    #[prost(string, tag = "4")]
+    pub bound_unit: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ReportEventGroupReply {
@@ -2680,6 +2835,11 @@ pub enum AssetClass {
     EventContract = 6,
     /// A holding of a currency's cash instrument (spec/the-account-side-fits-every-venue).
     Cash = 7,
+    /// Contract v27 (W1.1; spec/a-public-rates-and-filings-data-plugin, Q3):
+    /// what the lake observes and nobody holds -- an interest rate, a rate
+    /// curve, an index -- following ISO 10962's category T. Never held: W9
+    /// refuses a position in one.
+    Referential = 8,
 }
 impl AssetClass {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -2696,6 +2856,7 @@ impl AssetClass {
             Self::CryptoAsset => "ASSET_CLASS_CRYPTO_ASSET",
             Self::EventContract => "ASSET_CLASS_EVENT_CONTRACT",
             Self::Cash => "ASSET_CLASS_CASH",
+            Self::Referential => "ASSET_CLASS_REFERENTIAL",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -2709,6 +2870,7 @@ impl AssetClass {
             "ASSET_CLASS_CRYPTO_ASSET" => Some(Self::CryptoAsset),
             "ASSET_CLASS_EVENT_CONTRACT" => Some(Self::EventContract),
             "ASSET_CLASS_CASH" => Some(Self::Cash),
+            "ASSET_CLASS_REFERENTIAL" => Some(Self::Referential),
             _ => None,
         }
     }
@@ -2733,6 +2895,15 @@ pub enum InstrumentType {
     /// BinaryEventContract. A venue's YES and NO tokens are two instruments,
     /// each one.
     BinaryEventContract = 2,
+    /// Under referential (contract v27; the rates slice): a reference rate --
+    /// SOFR, EFFR, €STR, an average, a bound of the FOMC range.
+    InterestRate = 3,
+    /// Under referential (contract v27): a rate curve, one record whose points
+    /// are the lake's rows by tenor -- Treasury's par curves, the Board's zero
+    /// curve.
+    RateCurve = 4,
+    /// Under referential (contract v27): an index -- the SOFR Index.
+    Index = 5,
 }
 impl InstrumentType {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -2744,6 +2915,9 @@ impl InstrumentType {
             Self::Unspecified => "INSTRUMENT_TYPE_UNSPECIFIED",
             Self::MoneyMarketFund => "INSTRUMENT_TYPE_MONEY_MARKET_FUND",
             Self::BinaryEventContract => "INSTRUMENT_TYPE_BINARY_EVENT_CONTRACT",
+            Self::InterestRate => "INSTRUMENT_TYPE_INTEREST_RATE",
+            Self::RateCurve => "INSTRUMENT_TYPE_RATE_CURVE",
+            Self::Index => "INSTRUMENT_TYPE_INDEX",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -2752,6 +2926,9 @@ impl InstrumentType {
             "INSTRUMENT_TYPE_UNSPECIFIED" => Some(Self::Unspecified),
             "INSTRUMENT_TYPE_MONEY_MARKET_FUND" => Some(Self::MoneyMarketFund),
             "INSTRUMENT_TYPE_BINARY_EVENT_CONTRACT" => Some(Self::BinaryEventContract),
+            "INSTRUMENT_TYPE_INTEREST_RATE" => Some(Self::InterestRate),
+            "INSTRUMENT_TYPE_RATE_CURVE" => Some(Self::RateCurve),
+            "INSTRUMENT_TYPE_INDEX" => Some(Self::Index),
             _ => None,
         }
     }
@@ -3253,6 +3430,9 @@ pub enum CalendarKind {
     /// A securities settlement system's days; its subject the system by name
     /// and country.
     SecuritiesSettlement = 3,
+    /// Contract v27 (W1.20; ruling 419): a venue's trading sessions, in its
+    /// trading_sessions; its subject the venues that follow it.
+    TradingSessions = 4,
 }
 impl CalendarKind {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -3265,6 +3445,7 @@ impl CalendarKind {
             Self::Currency => "CALENDAR_KIND_CURRENCY",
             Self::Trading => "CALENDAR_KIND_TRADING",
             Self::SecuritiesSettlement => "CALENDAR_KIND_SECURITIES_SETTLEMENT",
+            Self::TradingSessions => "CALENDAR_KIND_TRADING_SESSIONS",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -3274,6 +3455,7 @@ impl CalendarKind {
             "CALENDAR_KIND_CURRENCY" => Some(Self::Currency),
             "CALENDAR_KIND_TRADING" => Some(Self::Trading),
             "CALENDAR_KIND_SECURITIES_SETTLEMENT" => Some(Self::SecuritiesSettlement),
+            "CALENDAR_KIND_TRADING_SESSIONS" => Some(Self::TradingSessions),
             _ => None,
         }
     }
@@ -6603,6 +6785,31 @@ pub struct Lot {
     /// Its position's sleeve (contract v22); empty for the unsleeved part.
     #[prost(string, tag = "8")]
     pub sleeve: ::prost::alloc::string::String,
+    /// Contract v27 (W9.10; rulings 320 and 396): each relief of the lot, in
+    /// order, with what the quantity relieved was sold for, so a reader
+    /// computes realized P&L; the book stores nothing derived. Empty for a lot
+    /// never relieved, and for a relief before v27 the upgrade could not
+    /// backfill from its execution.
+    #[prost(message, repeated, tag = "9")]
+    pub reliefs: ::prost::alloc::vec::Vec<LotRelief>,
+}
+/// One relief of a lot (contract v27; W9.10).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LotRelief {
+    /// The entry that relieved it, also listed in Lot.relieved_by.
+    #[prost(message, optional, tag = "1")]
+    pub relieved_by: ::core::option::Option<JournalRef>,
+    /// The quantity relieved, positive.
+    #[prost(message, optional, tag = "2")]
+    pub quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// What that quantity was sold for, in the execution's asset, fees apart
+    /// as the execution states them; unset for a relief with no execution
+    /// behind it (a transfer out, a correction), never zero.
+    #[prost(message, optional, tag = "3")]
+    pub proceeds: ::core::option::Option<Money>,
+    /// ISO 8601: the execution's trade date; empty with no execution.
+    #[prost(string, tag = "4")]
+    pub trade_date: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct OpeningSource {
@@ -7495,7 +7702,7 @@ pub struct Order {
     /// The orders a firm's order represents, recorded and not checked (Q37).
     #[prost(string, repeated, tag = "27")]
     pub represents_order_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    /// Slice C's, carried empty until it lands (the refresh's Q34): the axe an
+    /// Slice C's sell side, carried empty, not v27's (the refresh's Q34): the axe an
     /// order was made from in the lake, its source and counterparty.
     #[prost(string, tag = "28")]
     pub axe_source: ::prost::alloc::string::String,
@@ -7539,6 +7746,16 @@ pub struct Order {
     /// filled quantity counts each, and no execution is minted for one.
     #[prost(string, repeated, tag = "46")]
     pub sleeve_cross_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Contract v27 (W11.1; the gaps spec's D2): on a net order, its members
+    /// as proposed -- released FX orders of one pair and one value date, of
+    /// both sides, each in no other live block or net. Empty on any other
+    /// order.
+    #[prost(string, repeated, tag = "47")]
+    pub net_member_order_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Contract v27 (W11.1): the date an FX order settles on, as `portfolio`
+    /// states it (FIX's SettlDate, 64), ISO 8601; empty is spot.
+    #[prost(string, tag = "48")]
+    pub value_date: ::prost::alloc::string::String,
 }
 /// An order's status: its state, its conditions and its quantities, each
 /// derived.
@@ -7568,6 +7785,28 @@ pub struct StandingOrderCondition {
     /// On does not tie out: why.
     #[prost(enumeration = "TieOutReason", tag = "5")]
     pub tie_out_reason: i32,
+    /// Contract v27 (W11.7): on held, its typed cause, and for a stale
+    /// reference price the dataset, its age and the ceiling; unspecified and
+    /// unset on any other condition, and on a hold with no typed cause.
+    #[prost(enumeration = "HoldCause", tag = "6")]
+    pub hold_cause: i32,
+    #[prost(message, optional, tag = "7")]
+    pub stale_reference: ::core::option::Option<StaleReference>,
+}
+/// A reference price found past its ceiling at an `ems`'s pre-trade check
+/// (contract v27; W11.7, W11.8).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StaleReference {
+    /// The dataset the price came from, `instance:key`.
+    #[prost(string, tag = "1")]
+    pub dataset: ::prost::alloc::string::String,
+    /// How old the price's confirmed time was at the check.
+    #[prost(int64, tag = "2")]
+    pub age_ns: i64,
+    /// The ceiling in force: the tighter of the dataset's and the `ems`
+    /// admin's own.
+    #[prost(int64, tag = "3")]
+    pub ceiling_ns: i64,
 }
 /// The instance holding a claim, and the user it acts for.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -7609,7 +7848,8 @@ pub struct OrderQuantities {
     #[prost(message, optional, tag = "7")]
     pub leaves: ::core::option::Option<::meridian_pb::v1::Decimal>,
 }
-/// The split link on a child order (W11.1; Q41).
+/// The link on a child order (W11.1; Q41), or, from contract v27, on a
+/// member of a net order, naming the net as its parent.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct OrderLink {
     #[prost(enumeration = "OrderLinkKind", tag = "1")]
@@ -7855,7 +8095,7 @@ pub struct Placement {
     pub routed_precision: i32,
     #[prost(string, repeated, tag = "15")]
     pub handling_instructions: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    /// Slice C's, carried empty until it lands (the refresh's Q34): the RFQ a
+    /// Slice C's sell side, carried empty, not v27's (the refresh's Q34): the RFQ a
     /// placement answers, as FIX's QuoteID (tag 117), and the axe, as FIX's
     /// IOIID (tag 23).
     #[prost(string, tag = "16")]
@@ -7889,6 +8129,61 @@ pub struct Placement {
     /// hears each on the placement. The order's stay on the order.
     #[prost(message, repeated, tag = "26")]
     pub change_requests: ::prost::alloc::vec::Vec<ChangeRequest>,
+    /// Contract v27 (W11.8; the gaps spec's B1): how it is executed, set by
+    /// the `ems` at its creation and never changed; unspecified is read as
+    /// DMA.
+    #[prost(enumeration = "PlacementType", tag = "27")]
+    pub placement_type: i32,
+    /// Contract v27 (W11.8; B5): a manual placement's trade details, its
+    /// evidence and not street data -- the counterparty's contact as the
+    /// person states it, and the time agreed with its precision. Empty on any
+    /// other type.
+    #[prost(string, tag = "28")]
+    pub counterparty_contact: ::prost::alloc::string::String,
+    #[prost(int64, tag = "29")]
+    pub agreed_at_ns: i64,
+    #[prost(enumeration = "TimePrecision", tag = "30")]
+    pub agreed_precision: i32,
+    /// Contract v27 (W11.40, W11.41; slice C's buy side): the dealers' quotes
+    /// received on an RFQ placement, each with its outcome, and the one the
+    /// `ems` picked. Empty on any other type.
+    #[prost(message, repeated, tag = "31")]
+    pub quotes: ::prost::alloc::vec::Vec<PlacementQuote>,
+    #[prost(string, tag = "32")]
+    pub picked_quote_id: ::prost::alloc::string::String,
+}
+/// One dealer's quote received on the firm's RFQ placement (contract v27;
+/// W11.40; requirement 50): a trade detail in the book, the buy side's
+/// best-execution record, never copied into the lake.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PlacementQuote {
+    /// `PQT-` and a ULID, minted by the book, never reused.
+    #[prost(string, tag = "1")]
+    pub quote_id: ::prost::alloc::string::String,
+    /// The dealer, the venue master's `VEN-` ID.
+    #[prost(string, tag = "2")]
+    pub dealer_id: ::prost::alloc::string::String,
+    /// The dealer's own QuoteID (FIX 117), as delivered: an external
+    /// reference, never a key.
+    #[prost(string, tag = "3")]
+    pub dealer_quote_id: ::prost::alloc::string::String,
+    /// The side the dealer quoted to the firm: its offer to a buyer, its bid
+    /// to a seller.
+    #[prost(enumeration = "Side", tag = "4")]
+    pub side: i32,
+    #[prost(message, optional, tag = "5")]
+    pub price: ::core::option::Option<Money>,
+    #[prost(message, optional, tag = "6")]
+    pub quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    #[prost(int64, tag = "7")]
+    pub received_at_ns: i64,
+    /// Its ValidUntilTime (FIX 62); 0 when unstated.
+    #[prost(int64, tag = "8")]
+    pub valid_until_ns: i64,
+    #[prost(enumeration = "PlacementQuoteOutcome", tag = "9")]
+    pub outcome: i32,
+    #[prost(message, optional, tag = "10")]
+    pub raw_record: ::core::option::Option<::meridian_pb::v1::RawRecordRef>,
 }
 /// A placement's status, derived.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -7912,6 +8207,10 @@ pub struct StandingPlacementCondition {
     pub unknown_reason: i32,
     #[prost(message, optional, tag = "5")]
     pub status_as_reported: ::core::option::Option<::meridian_pb::v1::AsReported>,
+    /// Contract v27 (W11.8): on sent on a stale reference, what the `ems`'s
+    /// check found.
+    #[prost(message, optional, tag = "6")]
+    pub stale_reference: ::core::option::Option<StaleReference>,
 }
 /// An execution, never edited (W11.11): a bust or a correction is another,
 /// superseding it.
@@ -8027,6 +8326,10 @@ pub struct Execution {
     /// execution, in the order recorded; a rejection moves no position.
     #[prost(message, repeated, tag = "41")]
     pub give_up_answers: ::prost::alloc::vec::Vec<GiveUpRecord>,
+    /// Contract v27 (W11.11; the gaps spec's D4): on an internal cross of a
+    /// net order, which convention set its rate; unspecified on any other.
+    #[prost(enumeration = "CrossRateSource", tag = "42")]
+    pub cross_rate_source: i32,
 }
 /// An execution's finality: a level, and when it reached it.
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
@@ -8243,7 +8546,7 @@ pub struct ProposeOrderRequest {
     /// (38) and CashOrderQty (152) are alternatives (ruled 2026-10-12): an
     /// order naming both, or neither, is refused INVALID_ARGUMENT naming
     /// `quantity` and `cash_quantity`. 0, a pass, is refused naming `quantity`
-    /// until slice C defines it.
+    /// until slice C's sell side defines it, which is not v27's.
     #[prost(message, optional, tag = "6")]
     pub quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
     #[prost(message, optional, tag = "7")]
@@ -8318,6 +8621,17 @@ pub struct ProposeOrderRequest {
     /// sum of its members' idle quantities.
     #[prost(string, repeated, tag = "36")]
     pub block_member_order_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Contract v27 (W11.1; the gaps spec's D2): the `oms`'s net order, in the
+    /// allocation account, naming members of both sides, each a released FX
+    /// order of one pair and one value date in no other live block or net.
+    /// Released on creation, its quantity signed buys minus sells, its side
+    /// the larger's.
+    #[prost(string, repeated, tag = "37")]
+    pub net_member_order_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Contract v27 (W11.1): an FX order's value date, ISO 8601 (FIX's
+    /// SettlDate, 64); empty is spot.
+    #[prost(string, tag = "38")]
+    pub value_date: ::prost::alloc::string::String,
 }
 /// W11.2. A fact: never through the gate. By the `oms`, for a user, naming
 /// the account: a telephoned or outside order. A connectivity plugin records
@@ -8416,6 +8730,13 @@ pub struct SetWorkingConditionRequest {
     pub reason: ::prost::alloc::string::String,
     #[prost(string, tag = "5")]
     pub idempotency_key: ::prost::alloc::string::String,
+    /// Contract v27 (W11.7): a hold's typed cause, and for a stale reference
+    /// price what the check found; on any condition but held, refused
+    /// INVALID_ARGUMENT naming `hold_cause`.
+    #[prost(enumeration = "HoldCause", tag = "6")]
+    pub hold_cause: i32,
+    #[prost(message, optional, tag = "7")]
+    pub stale_reference: ::core::option::Option<StaleReference>,
 }
 /// W11.8. By the `ems` alone (ruled 2026-10-13).
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -8442,7 +8763,7 @@ pub struct CreatePlacementRequest {
     pub route_type: i32,
     #[prost(string, repeated, tag = "10")]
     pub handling_instructions: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    /// Offered empty until slice C.
+    /// Offered empty: slice C's sell side and axes are not v27's.
     #[prost(string, tag = "11")]
     pub rfq_id: ::prost::alloc::string::String,
     #[prost(string, tag = "12")]
@@ -8451,6 +8772,67 @@ pub struct CreatePlacementRequest {
     #[prost(string, tag = "13")]
     pub ems_instance_id: ::prost::alloc::string::String,
     #[prost(string, tag = "14")]
+    pub idempotency_key: ::prost::alloc::string::String,
+    /// Contract v27 (W11.8): its type; a manual placement names no
+    /// connectivity instance and carries its trade details, any other type
+    /// names one and carries none (INVALID_ARGUMENT naming the field).
+    #[prost(enumeration = "PlacementType", tag = "15")]
+    pub placement_type: i32,
+    #[prost(string, tag = "16")]
+    pub counterparty_contact: ::prost::alloc::string::String,
+    #[prost(int64, tag = "17")]
+    pub agreed_at_ns: i64,
+    #[prost(enumeration = "TimePrecision", tag = "18")]
+    pub agreed_precision: i32,
+    /// Contract v27 (W11.8): set where the `ems` places on a stale reference
+    /// price, its admin having chosen to warn; the placement then holds
+    /// PLACEMENT_CONDITION_SENT_ON_STALE_REFERENCE.
+    #[prost(message, optional, tag = "19")]
+    pub stale_reference: ::core::option::Option<StaleReference>,
+}
+/// W11.40 (contract v27): a dealer's quote received on the firm's RFQ
+/// placement, recorded by its connectivity plugin; or a later outcome of one
+/// recorded, named by its quote ID. Answered with PlacementReply.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReportPlacementQuoteRequest {
+    #[prost(string, tag = "1")]
+    pub placement_id: ::prost::alloc::string::String,
+    /// Empty to record a new quote, which the book mints an ID for; a quote's
+    /// ID to record its later outcome.
+    #[prost(string, tag = "2")]
+    pub quote_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub dealer_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub dealer_quote_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "Side", tag = "5")]
+    pub side: i32,
+    #[prost(message, optional, tag = "6")]
+    pub price: ::core::option::Option<Money>,
+    #[prost(message, optional, tag = "7")]
+    pub quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    #[prost(int64, tag = "8")]
+    pub received_at_ns: i64,
+    #[prost(int64, tag = "9")]
+    pub valid_until_ns: i64,
+    #[prost(enumeration = "PlacementQuoteOutcome", tag = "10")]
+    pub outcome: i32,
+    #[prost(message, optional, tag = "11")]
+    pub raw_record: ::core::option::Option<::meridian_pb::v1::RawRecordRef>,
+    #[prost(string, tag = "12")]
+    pub idempotency_key: ::prost::alloc::string::String,
+}
+/// W11.41 (contract v27): the `ems` picks one open quote on an RFQ placement
+/// it made. Answered with PlacementReply.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PickPlacementQuoteRequest {
+    #[prost(string, tag = "1")]
+    pub placement_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub quote_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub reason: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
     pub idempotency_key: ::prost::alloc::string::String,
 }
 /// W11.9. By the `ems` or the `oms`; by a connectivity plugin only to report
@@ -8585,6 +8967,11 @@ pub struct ReportExecutionRequest {
     pub venue_order_id: ::prost::alloc::string::String,
     #[prost(string, tag = "35")]
     pub venue_client_order_id: ::prost::alloc::string::String,
+    /// Contract v27 (W11.11): on the `oms`'s internal cross of a net order,
+    /// which convention set its rate; refused INVALID_ARGUMENT naming it where
+    /// missing on such a cross, or set on any other execution.
+    #[prost(enumeration = "CrossRateSource", tag = "36")]
+    pub cross_rate_source: i32,
 }
 /// W11.12.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -10043,6 +10430,10 @@ pub enum PlacementCondition {
     Suspended = 3,
     /// Held at the venue until a stop or a condition triggers.
     AwaitingTrigger = 4,
+    /// Contract v27 (W11.8): sent while its reference price was past its
+    /// ceiling, the `ems` admin having chosen to warn; its StaleReference on
+    /// the condition. A record of the warning, never a refusal.
+    SentOnStaleReference = 5,
 }
 impl PlacementCondition {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -10056,6 +10447,7 @@ impl PlacementCondition {
             Self::OutcomeUnknown => "PLACEMENT_CONDITION_OUTCOME_UNKNOWN",
             Self::Suspended => "PLACEMENT_CONDITION_SUSPENDED",
             Self::AwaitingTrigger => "PLACEMENT_CONDITION_AWAITING_TRIGGER",
+            Self::SentOnStaleReference => "PLACEMENT_CONDITION_SENT_ON_STALE_REFERENCE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -10066,6 +10458,175 @@ impl PlacementCondition {
             "PLACEMENT_CONDITION_OUTCOME_UNKNOWN" => Some(Self::OutcomeUnknown),
             "PLACEMENT_CONDITION_SUSPENDED" => Some(Self::Suspended),
             "PLACEMENT_CONDITION_AWAITING_TRIGGER" => Some(Self::AwaitingTrigger),
+            "PLACEMENT_CONDITION_SENT_ON_STALE_REFERENCE" => {
+                Some(Self::SentOnStaleReference)
+            }
+            _ => None,
+        }
+    }
+}
+/// Contract v27 (W11.8; spec/the-contract-gaps-v26-and-v27-close, B1 to B9):
+/// how a placement is executed, set by the `ems` at its creation and never
+/// changed, as FIX's HandlInst (21) is fixed for an order's life.
+/// Unspecified is read as DMA: a placement from v22 to v26, never backfilled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum PlacementType {
+    Unspecified = 0,
+    /// Direct market access: HandlInst 1 at the edge; carries no strategy.
+    Dma = 1,
+    /// A broker's algorithm: HandlInst 1 or 2 with its strategy, which it
+    /// requires.
+    Algo = 2,
+    /// Worked by a broker: HandlInst 3 with ExecInst Not held; carries no
+    /// strategy.
+    Care = 3,
+    /// A request for quote: a QuoteRequest, then the picked quote hit as
+    /// OrdType D (Previously quoted) with its QuoteID; the only type an order
+    /// of ORDER_TYPE_REQUEST_FOR_QUOTE takes.
+    Rfq = 4,
+    /// Agreed by phone or chat: names no connectivity instance, delivered to
+    /// none, its fills the `ems`'s manual entries for a person.
+    Manual = 5,
+}
+impl PlacementType {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "PLACEMENT_TYPE_UNSPECIFIED",
+            Self::Dma => "PLACEMENT_TYPE_DMA",
+            Self::Algo => "PLACEMENT_TYPE_ALGO",
+            Self::Care => "PLACEMENT_TYPE_CARE",
+            Self::Rfq => "PLACEMENT_TYPE_RFQ",
+            Self::Manual => "PLACEMENT_TYPE_MANUAL",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "PLACEMENT_TYPE_UNSPECIFIED" => Some(Self::Unspecified),
+            "PLACEMENT_TYPE_DMA" => Some(Self::Dma),
+            "PLACEMENT_TYPE_ALGO" => Some(Self::Algo),
+            "PLACEMENT_TYPE_CARE" => Some(Self::Care),
+            "PLACEMENT_TYPE_RFQ" => Some(Self::Rfq),
+            "PLACEMENT_TYPE_MANUAL" => Some(Self::Manual),
+            _ => None,
+        }
+    }
+}
+/// Contract v27 (W11.40): what became of a dealer's quote on an RFQ placement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum PlacementQuoteOutcome {
+    Unspecified = 0,
+    /// Received and standing.
+    Open = 1,
+    /// Picked by the `ems` (W11.41); the acceptance not yet confirmed.
+    Picked = 2,
+    /// Accepted at the venue; its fill is reported as on any placement.
+    Accepted = 3,
+    /// Past its valid-until time, or ended by the venue, unpicked or before
+    /// the acceptance.
+    Expired = 4,
+    /// Withdrawn by its dealer.
+    Withdrawn = 5,
+    /// Another quote was accepted.
+    NotPicked = 6,
+}
+impl PlacementQuoteOutcome {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "PLACEMENT_QUOTE_OUTCOME_UNSPECIFIED",
+            Self::Open => "PLACEMENT_QUOTE_OUTCOME_OPEN",
+            Self::Picked => "PLACEMENT_QUOTE_OUTCOME_PICKED",
+            Self::Accepted => "PLACEMENT_QUOTE_OUTCOME_ACCEPTED",
+            Self::Expired => "PLACEMENT_QUOTE_OUTCOME_EXPIRED",
+            Self::Withdrawn => "PLACEMENT_QUOTE_OUTCOME_WITHDRAWN",
+            Self::NotPicked => "PLACEMENT_QUOTE_OUTCOME_NOT_PICKED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "PLACEMENT_QUOTE_OUTCOME_UNSPECIFIED" => Some(Self::Unspecified),
+            "PLACEMENT_QUOTE_OUTCOME_OPEN" => Some(Self::Open),
+            "PLACEMENT_QUOTE_OUTCOME_PICKED" => Some(Self::Picked),
+            "PLACEMENT_QUOTE_OUTCOME_ACCEPTED" => Some(Self::Accepted),
+            "PLACEMENT_QUOTE_OUTCOME_EXPIRED" => Some(Self::Expired),
+            "PLACEMENT_QUOTE_OUTCOME_WITHDRAWN" => Some(Self::Withdrawn),
+            "PLACEMENT_QUOTE_OUTCOME_NOT_PICKED" => Some(Self::NotPicked),
+            _ => None,
+        }
+    }
+}
+/// Contract v27 (W11.7; spec/sessions-and-data-report-their-latency-and-quality,
+/// rulings 374 and 420): why an order is held, typed, beside the words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum HoldCause {
+    /// A hold with no typed cause, as every hold before v27.
+    Unspecified = 0,
+    /// The `ems`'s reference price was past its stale ceiling at its
+    /// pre-trade check, its admin having chosen to refuse.
+    ReferencePriceStale = 1,
+}
+impl HoldCause {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "HOLD_CAUSE_UNSPECIFIED",
+            Self::ReferencePriceStale => "HOLD_CAUSE_REFERENCE_PRICE_STALE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "HOLD_CAUSE_UNSPECIFIED" => Some(Self::Unspecified),
+            "HOLD_CAUSE_REFERENCE_PRICE_STALE" => Some(Self::ReferencePriceStale),
+            _ => None,
+        }
+    }
+}
+/// Contract v27 (W11.11; the gaps spec's D4): which convention set an
+/// internal cross's rate on a net order. Core supports both; the plugin
+/// chooses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum CrossRateSource {
+    Unspecified = 0,
+    /// The net's street rate for every member: the platforms' allocate-back.
+    NetStreetRate = 1,
+    /// The mid at the netting moment.
+    MidAtNetting = 2,
+}
+impl CrossRateSource {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "CROSS_RATE_SOURCE_UNSPECIFIED",
+            Self::NetStreetRate => "CROSS_RATE_SOURCE_NET_STREET_RATE",
+            Self::MidAtNetting => "CROSS_RATE_SOURCE_MID_AT_NETTING",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "CROSS_RATE_SOURCE_UNSPECIFIED" => Some(Self::Unspecified),
+            "CROSS_RATE_SOURCE_NET_STREET_RATE" => Some(Self::NetStreetRate),
+            "CROSS_RATE_SOURCE_MID_AT_NETTING" => Some(Self::MidAtNetting),
             _ => None,
         }
     }
@@ -10114,7 +10675,8 @@ pub enum OrderType {
     Limit = 2,
     Stop = 3,
     StopLimit = 4,
-    /// An RFQ order: its quotes and outcomes are slice C's, on its placement.
+    /// An RFQ order: from contract v27 its quotes and outcomes are on its RFQ
+    /// placement (W11.40, W11.41), the buy side as initiator only.
     RequestForQuote = 5,
 }
 impl OrderType {
@@ -10329,15 +10891,20 @@ impl TimePrecision {
         }
     }
 }
-/// The one named link in v22 (W11.1; step 5's link 1, Q6; the refresh's
-/// Q41). Block, allocation, street order, two-way quote, alternatives and
-/// basket join with their slices.
+/// The named links (W11.1; step 5's link 1, Q6; the refresh's Q41): split
+/// from v22, net from v27. Allocation, street order, two-way quote,
+/// alternatives and basket join with their slices; a block names its members
+/// on the block order (v24).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum OrderLinkKind {
     Unspecified = 0,
     /// A child order an `ems` (or the `oms`) worked out of its parent.
     Split = 1,
+    /// Contract v27 (W11.1; the gaps spec's D2): a member of a net order, set
+    /// by the book on each member when the `oms` proposes the net, naming it
+    /// as the parent.
+    Net = 2,
 }
 impl OrderLinkKind {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -10348,6 +10915,7 @@ impl OrderLinkKind {
         match self {
             Self::Unspecified => "ORDER_LINK_KIND_UNSPECIFIED",
             Self::Split => "ORDER_LINK_KIND_SPLIT",
+            Self::Net => "ORDER_LINK_KIND_NET",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -10355,6 +10923,7 @@ impl OrderLinkKind {
         match value {
             "ORDER_LINK_KIND_UNSPECIFIED" => Some(Self::Unspecified),
             "ORDER_LINK_KIND_SPLIT" => Some(Self::Split),
+            "ORDER_LINK_KIND_NET" => Some(Self::Net),
             _ => None,
         }
     }
@@ -11787,6 +12356,18 @@ pub struct DatasetRef {
     pub closed_day_count: u64,
     #[prost(uint64, tag = "9")]
     pub outside_coverage_count: u64,
+    /// Contract v27 (W10.9; rulings 369 and 417): the dataset's declared
+    /// delay, from its catalogue, 0 for real time; and its stale ceiling, the
+    /// data plugin admin's `stale_after` for it, 0 when none is set. Set in a
+    /// listing and in every read's answer.
+    #[prost(int64, tag = "10")]
+    pub declared_delay_ns: i64,
+    #[prost(int64, tag = "11")]
+    pub stale_after_ns: i64,
+    /// Contract v27 (W10.9; ruling 418): in a listing, the latest liveness the
+    /// lake keeps for the dataset, one per venue; empty in a read's answer.
+    #[prost(message, repeated, tag = "12")]
+    pub liveness: ::prost::alloc::vec::Vec<DatasetLiveness>,
 }
 /// A price of one kind for one subject. An FX rate is the price of one
 /// currency's cash instrument in another (spec/the-lake, Q3); the lake never
@@ -11935,6 +12516,286 @@ pub struct Outcome {
     /// The venue's own word for the determination, as reported.
     #[prost(message, optional, tag = "6")]
     pub determination_as_reported: ::core::option::Option<::meridian_pb::v1::AsReported>,
+    /// Contract v27 (W10.4; the options and event contracts spec's G1): when a
+    /// proposed outcome's challenge window ends, as the venue reports it; 0
+    /// when not stated. Never derived by core.
+    #[prost(int64, tag = "7")]
+    pub challenge_ends_at_ns: i64,
+}
+/// A rate (W10.4): a fixing, an average, an index level or a curve point, for
+/// one subject -- a referential `INS-` record -- as one source stated it. A
+/// curve is one record; its points are rows, each with its tenor. Conflated
+/// per subject, dataset, kind, tenor, maturity and convention.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Rate {
+    #[prost(message, optional, tag = "1")]
+    pub meta: ::core::option::Option<ObservationMeta>,
+    #[prost(enumeration = "RateKind", tag = "2")]
+    pub kind: i32,
+    /// The value with its unit: a percent, basis points or an index level.
+    #[prost(message, optional, tag = "3")]
+    pub value: ::core::option::Option<UnitValue>,
+    #[prost(message, optional, tag = "4")]
+    pub convention: ::core::option::Option<RateConvention>,
+    /// A curve point's tenor, a count and a unit (`3M`, `10Y`, `ON`), or its
+    /// exact maturity, ISO 8601; neither on a rate that is no curve point.
+    #[prost(message, optional, tag = "5")]
+    pub tenor: ::core::option::Option<Tenor>,
+    #[prost(string, tag = "6")]
+    pub maturity_date: ::prost::alloc::string::String,
+    /// True while the source marks it preliminary; its final value is the next
+    /// version of the row key.
+    #[prost(bool, tag = "7")]
+    pub preliminary: bool,
+    /// Optional, as the source states them: the volume transacted, how many
+    /// transactions, and the distribution's percentiles (SOFR's 1st, 25th,
+    /// 75th and 99th). Not stated is unset, never zero.
+    #[prost(message, optional, tag = "8")]
+    pub volume: ::core::option::Option<Money>,
+    #[prost(uint64, optional, tag = "9")]
+    pub transaction_count: ::core::option::Option<u64>,
+    #[prost(message, repeated, tag = "10")]
+    pub percentiles: ::prost::alloc::vec::Vec<RatePercentile>,
+}
+/// How a rate accrues (FDP item 1).
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct RateConvention {
+    #[prost(enumeration = "DayCount", tag = "1")]
+    pub day_count: i32,
+    #[prost(enumeration = "Compounding", tag = "2")]
+    pub compounding: i32,
+    /// For COMPOUNDING_COMPOUNDED, the periods a year (2 for a semi-annual
+    /// bond-equivalent yield); 0 otherwise.
+    #[prost(uint32, tag = "3")]
+    pub periods_per_year: u32,
+}
+/// One percentile of a rate's distribution, as the source states it.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct RatePercentile {
+    /// 1 to 99.
+    #[prost(uint32, tag = "1")]
+    pub percentile: u32,
+    #[prost(message, optional, tag = "2")]
+    pub value: ::core::option::Option<::meridian_pb::v1::Decimal>,
+}
+/// A batch of rates, recorded whole or refused naming the item and field:
+/// 1 to 500.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RecordRatesRequest {
+    #[prost(message, repeated, tag = "1")]
+    pub rates: ::prost::alloc::vec::Vec<Rate>,
+    /// The want these answer (W10.7), as delivered; empty for rows recorded
+    /// unasked.
+    #[prost(string, tag = "2")]
+    pub want_id: ::prost::alloc::string::String,
+}
+/// A rate the lake recorded, on its dataset's subject (W10.5): conflated.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RatesRecordedEvent {
+    #[prost(message, optional, tag = "1")]
+    pub rate: ::core::option::Option<Rate>,
+}
+/// Rates for subjects (W10.6), at one of: the latest in force at a valid
+/// time; a business date; or a valid-time range. As of a recorded time, and
+/// optionally as the source had published them by a time.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListRatesRequest {
+    /// 1 to 500.
+    #[prost(message, repeated, tag = "1")]
+    pub subjects: ::prost::alloc::vec::Vec<SubjectRef>,
+    /// Which kinds; empty for every kind.
+    #[prost(enumeration = "RateKind", repeated, tag = "2")]
+    pub kinds: ::prost::alloc::vec::Vec<i32>,
+    /// Which tenors; empty for every tenor.
+    #[prost(message, repeated, tag = "3")]
+    pub tenors: ::prost::alloc::vec::Vec<Tenor>,
+    #[prost(message, optional, tag = "4")]
+    pub sources: ::core::option::Option<SourceChoice>,
+    #[prost(int64, tag = "5")]
+    pub at_ns: i64,
+    #[prost(string, tag = "6")]
+    pub business_date: ::prost::alloc::string::String,
+    #[prost(int64, tag = "7")]
+    pub valid_from_ns: i64,
+    #[prost(int64, tag = "8")]
+    pub valid_until_ns: i64,
+    /// The recorded-time cut-off, 0 for now: what the lake knew then.
+    #[prost(int64, tag = "9")]
+    pub as_of_ns: i64,
+    /// Shared additions 1 and 2: what the source had published by this time,
+    /// the version in force by published time among the rows recorded by
+    /// as_of_ns; 0 reads by recorded time alone, the default and the audit
+    /// answer.
+    #[prost(int64, tag = "10")]
+    pub published_as_of_ns: i64,
+    /// At most 500 rows, 100 when 0.
+    #[prost(uint32, tag = "11")]
+    pub page_size: u32,
+    #[prost(string, tag = "12")]
+    pub cursor: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListRatesReply {
+    #[prost(message, repeated, tag = "1")]
+    pub rates: ::prost::alloc::vec::Vec<Rate>,
+    #[prost(message, repeated, tag = "2")]
+    pub unanswered: ::prost::alloc::vec::Vec<Unanswered>,
+    #[prost(message, repeated, tag = "3")]
+    pub datasets: ::prost::alloc::vec::Vec<DatasetRef>,
+    #[prost(message, optional, tag = "4")]
+    pub watermark: ::core::option::Option<Watermark>,
+    #[prost(string, tag = "5")]
+    pub next_cursor: ::prost::alloc::string::String,
+}
+/// A dataset's latest sign of life: its source's heartbeat or poll, which
+/// confirms the values in force. Not a row, and never kept as one.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DatasetLiveness {
+    /// A dataset the recording instance declares, `instance:key`.
+    #[prost(string, tag = "1")]
+    pub dataset: ::prost::alloc::string::String,
+    /// The venue it is for, the venue master's ID; empty for the dataset's
+    /// consolidated view.
+    #[prost(string, tag = "2")]
+    pub venue_id: ::prost::alloc::string::String,
+    /// The source's last heartbeat or poll, on the one clock.
+    #[prost(int64, tag = "3")]
+    pub alive_at_ns: i64,
+    /// The recording instance, stamped by its sidecar.
+    #[prost(string, tag = "4")]
+    pub instance: ::prost::alloc::string::String,
+}
+/// 1 to 500 liveness items.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RecordLivenessRequest {
+    #[prost(message, repeated, tag = "1")]
+    pub liveness: ::prost::alloc::vec::Vec<DatasetLiveness>,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct RecordLivenessReply {
+    /// The items kept, each the latest for its dataset and venue.
+    #[prost(uint32, tag = "1")]
+    pub kept: u32,
+}
+/// A dataset's liveness, on its subject: conflated per dataset and venue.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LivenessRecordedEvent {
+    #[prost(message, optional, tag = "1")]
+    pub liveness: ::core::option::Option<DatasetLiveness>,
+}
+/// One execution's cost against one benchmark, written by the analytics
+/// component (W12.1's `execution_cost`), keyed by execution and benchmark. The
+/// lake's first rows naming an account: read within the reader's scope.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ExecutionCost {
+    /// The envelope: its subject the execution's instrument; its source the
+    /// analytics component and the dataset `analytics:execution_cost`.
+    #[prost(message, optional, tag = "1")]
+    pub meta: ::core::option::Option<ObservationMeta>,
+    #[prost(string, tag = "2")]
+    pub execution_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub order_id: ::prost::alloc::string::String,
+    /// Empty for a fill on no placement accepted to a new order, and for an
+    /// internal cross.
+    #[prost(string, tag = "4")]
+    pub placement_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub account_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "TcaBenchmark", tag = "6")]
+    pub benchmark: i32,
+    /// The benchmark's price and the moment it was taken at; unset and 0 when
+    /// unanswered.
+    #[prost(message, optional, tag = "7")]
+    pub benchmark_price: ::core::option::Option<Money>,
+    #[prost(int64, tag = "8")]
+    pub benchmark_at_ns: i64,
+    /// The quote the benchmark came from: its dataset and row key, never mixed
+    /// silently.
+    #[prost(string, tag = "9")]
+    pub benchmark_dataset: ::prost::alloc::string::String,
+    #[prost(string, tag = "10")]
+    pub benchmark_row_key: ::prost::alloc::string::String,
+    /// For TCA_BENCHMARK_FIX, the fixing's `INS-` record; empty otherwise.
+    #[prost(string, tag = "11")]
+    pub fixing_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "12")]
+    pub execution_price: ::core::option::Option<Money>,
+    #[prost(enumeration = "Side", tag = "13")]
+    pub side: i32,
+    /// The execution's notional, in its asset.
+    #[prost(message, optional, tag = "14")]
+    pub notional: ::core::option::Option<Money>,
+    /// Side-adjusted, positive a cost: s × (price − benchmark) ÷ benchmark ×
+    /// 10⁴; unset when unanswered.
+    #[prost(message, optional, tag = "15")]
+    pub cost_bps: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// Fees and financing, apart, in bps of notional; unset where none.
+    #[prost(message, optional, tag = "16")]
+    pub fees_bps: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    #[prost(message, optional, tag = "17")]
+    pub financing_bps: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// As the connectivity plugin reported them.
+    #[prost(enumeration = "LiquidityIndicator", tag = "18")]
+    pub liquidity_indicator: i32,
+    #[prost(string, tag = "19")]
+    pub venue_id: ::prost::alloc::string::String,
+    /// Why it was not measured, beside no price and no cost; unspecified when
+    /// measured.
+    #[prost(enumeration = "TcaUnanswered", tag = "20")]
+    pub unanswered: i32,
+    /// The quote's staleness bound in force: 5 seconds by default, the tighter
+    /// of it and the dataset's stale ceiling.
+    #[prost(int64, tag = "21")]
+    pub staleness_bound_ns: i64,
+    /// The execution's time precision as stated: a manual fill's.
+    #[prost(enumeration = "TimePrecision", tag = "22")]
+    pub time_precision: i32,
+    /// The placement's last-look rejections, and its time to fill; never a
+    /// cost in bps.
+    #[prost(uint32, tag = "23")]
+    pub reject_count: u32,
+    #[prost(int64, tag = "24")]
+    pub time_to_fill_ns: i64,
+}
+/// 1 to 500 execution costs, the analytics component's alone.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RecordExecutionCostsRequest {
+    #[prost(message, repeated, tag = "1")]
+    pub costs: ::prost::alloc::vec::Vec<ExecutionCost>,
+}
+/// One account's execution costs (W10.11): by execution, by order or by trade
+/// date, as of a recorded time.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListExecutionCostsRequest {
+    /// The account, within the reader's read scope.
+    #[prost(string, tag = "1")]
+    pub account_id: ::prost::alloc::string::String,
+    /// At most 500; empty for every execution the other filters name.
+    #[prost(string, repeated, tag = "2")]
+    pub execution_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, tag = "3")]
+    pub order_id: ::prost::alloc::string::String,
+    /// ISO 8601: the executions traded on that date.
+    #[prost(string, tag = "4")]
+    pub trade_date: ::prost::alloc::string::String,
+    /// Empty for every benchmark.
+    #[prost(enumeration = "TcaBenchmark", repeated, tag = "5")]
+    pub benchmarks: ::prost::alloc::vec::Vec<i32>,
+    #[prost(int64, tag = "6")]
+    pub as_of_ns: i64,
+    /// At most 500 rows, 100 when 0.
+    #[prost(uint32, tag = "7")]
+    pub page_size: u32,
+    #[prost(string, tag = "8")]
+    pub cursor: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListExecutionCostsReply {
+    #[prost(message, repeated, tag = "1")]
+    pub costs: ::prost::alloc::vec::Vec<ExecutionCost>,
+    #[prost(string, tag = "2")]
+    pub next_cursor: ::prost::alloc::string::String,
 }
 /// A batch of prices, recorded whole or refused naming the item and field:
 /// 1 to 500.
@@ -12450,8 +13311,8 @@ pub struct ListDatasetsReply {
 /// instance's entitlements and its roles' kinds, capped in rows and columns.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct QueryLakeRequest {
-    /// `prices`, `bars`, `trades`, `quotes` or `outcomes`; a kind the asking
-    /// role does not read is refused naming it.
+    /// `prices`, `bars`, `trades`, `quotes` or `outcomes`, and from contract
+    /// v27 `rates`; a kind the asking role does not read is refused naming it.
     #[prost(string, tag = "1")]
     pub kind: ::prost::alloc::string::String,
     /// At most 500.
@@ -12508,6 +13369,9 @@ pub struct QueryLakeReply {
     /// More rows matched than row_limit: the reply is cut at it, never paged.
     #[prost(bool, tag = "9")]
     pub truncated: bool,
+    /// Contract v27 (W10.10): rates, for a query of the kind `rates`.
+    #[prost(message, repeated, tag = "10")]
+    pub rates: ::prost::alloc::vec::Vec<Rate>,
 }
 /// Which of the source's clocks a timestamp is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
@@ -12823,6 +13687,214 @@ impl QuoteCharacteristic {
         }
     }
 }
+/// What a rate is (FDP item 1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum RateKind {
+    /// Refused.
+    Unspecified = 0,
+    /// A reference rate's daily fixing: SOFR, EFFR, €STR.
+    Fixing = 1,
+    /// A compounded or simple average over a period: the SOFR averages.
+    Average = 2,
+    /// An index's level: the SOFR Index.
+    IndexLevel = 3,
+    /// A par yield curve's point.
+    ParYield = 4,
+    /// A zero-coupon yield curve's point.
+    Zero = 5,
+    /// A bill's bank-discount rate.
+    Discount = 6,
+    /// A bill's coupon-equivalent (bond-equivalent) yield.
+    CouponEquivalent = 7,
+}
+impl RateKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "RATE_KIND_UNSPECIFIED",
+            Self::Fixing => "RATE_KIND_FIXING",
+            Self::Average => "RATE_KIND_AVERAGE",
+            Self::IndexLevel => "RATE_KIND_INDEX_LEVEL",
+            Self::ParYield => "RATE_KIND_PAR_YIELD",
+            Self::Zero => "RATE_KIND_ZERO",
+            Self::Discount => "RATE_KIND_DISCOUNT",
+            Self::CouponEquivalent => "RATE_KIND_COUPON_EQUIVALENT",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "RATE_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "RATE_KIND_FIXING" => Some(Self::Fixing),
+            "RATE_KIND_AVERAGE" => Some(Self::Average),
+            "RATE_KIND_INDEX_LEVEL" => Some(Self::IndexLevel),
+            "RATE_KIND_PAR_YIELD" => Some(Self::ParYield),
+            "RATE_KIND_ZERO" => Some(Self::Zero),
+            "RATE_KIND_DISCOUNT" => Some(Self::Discount),
+            "RATE_KIND_COUPON_EQUIVALENT" => Some(Self::CouponEquivalent),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum DayCount {
+    /// Not stated by the source.
+    Unspecified = 0,
+    Act360 = 1,
+    Act365Fixed = 2,
+    ActAct = 3,
+    Thirty360 = 4,
+    Bus252 = 5,
+}
+impl DayCount {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "DAY_COUNT_UNSPECIFIED",
+            Self::Act360 => "DAY_COUNT_ACT_360",
+            Self::Act365Fixed => "DAY_COUNT_ACT_365_FIXED",
+            Self::ActAct => "DAY_COUNT_ACT_ACT",
+            Self::Thirty360 => "DAY_COUNT_THIRTY_360",
+            Self::Bus252 => "DAY_COUNT_BUS_252",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "DAY_COUNT_UNSPECIFIED" => Some(Self::Unspecified),
+            "DAY_COUNT_ACT_360" => Some(Self::Act360),
+            "DAY_COUNT_ACT_365_FIXED" => Some(Self::Act365Fixed),
+            "DAY_COUNT_ACT_ACT" => Some(Self::ActAct),
+            "DAY_COUNT_THIRTY_360" => Some(Self::Thirty360),
+            "DAY_COUNT_BUS_252" => Some(Self::Bus252),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum Compounding {
+    /// Refused.
+    Unspecified = 0,
+    Simple = 1,
+    Compounded = 2,
+    Continuous = 3,
+    Discount = 4,
+}
+impl Compounding {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "COMPOUNDING_UNSPECIFIED",
+            Self::Simple => "COMPOUNDING_SIMPLE",
+            Self::Compounded => "COMPOUNDING_COMPOUNDED",
+            Self::Continuous => "COMPOUNDING_CONTINUOUS",
+            Self::Discount => "COMPOUNDING_DISCOUNT",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "COMPOUNDING_UNSPECIFIED" => Some(Self::Unspecified),
+            "COMPOUNDING_SIMPLE" => Some(Self::Simple),
+            "COMPOUNDING_COMPOUNDED" => Some(Self::Compounded),
+            "COMPOUNDING_CONTINUOUS" => Some(Self::Continuous),
+            "COMPOUNDING_DISCOUNT" => Some(Self::Discount),
+            _ => None,
+        }
+    }
+}
+/// The standard benchmarks (C2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum TcaBenchmark {
+    Unspecified = 0,
+    /// The mid at the order's proposal.
+    Decision = 1,
+    /// The mid at the order's release to the desk.
+    Arrival = 2,
+    /// The mid at the placement's routed_at_ns: the broker's arrival.
+    PlacementArrival = 3,
+    MidAtFill = 4,
+    /// Needs trades: never measured for FX spot from one venue.
+    IntervalVwap = 5,
+    /// A named fixing, licensed by the deployment.
+    Fix = 6,
+}
+impl TcaBenchmark {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "TCA_BENCHMARK_UNSPECIFIED",
+            Self::Decision => "TCA_BENCHMARK_DECISION",
+            Self::Arrival => "TCA_BENCHMARK_ARRIVAL",
+            Self::PlacementArrival => "TCA_BENCHMARK_PLACEMENT_ARRIVAL",
+            Self::MidAtFill => "TCA_BENCHMARK_MID_AT_FILL",
+            Self::IntervalVwap => "TCA_BENCHMARK_INTERVAL_VWAP",
+            Self::Fix => "TCA_BENCHMARK_FIX",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "TCA_BENCHMARK_UNSPECIFIED" => Some(Self::Unspecified),
+            "TCA_BENCHMARK_DECISION" => Some(Self::Decision),
+            "TCA_BENCHMARK_ARRIVAL" => Some(Self::Arrival),
+            "TCA_BENCHMARK_PLACEMENT_ARRIVAL" => Some(Self::PlacementArrival),
+            "TCA_BENCHMARK_MID_AT_FILL" => Some(Self::MidAtFill),
+            "TCA_BENCHMARK_INTERVAL_VWAP" => Some(Self::IntervalVwap),
+            "TCA_BENCHMARK_FIX" => Some(Self::Fix),
+            _ => None,
+        }
+    }
+}
+/// Why a benchmark was not measured (C4, C8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum TcaUnanswered {
+    Unspecified = 0,
+    /// No quote in force within the staleness bound: never an imputed value.
+    NoQuote = 1,
+    /// The benchmark has no moment for this execution: a venue-originated fill
+    /// accepted to a new order has no decision or arrival time.
+    NotMeasured = 2,
+}
+impl TcaUnanswered {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "TCA_UNANSWERED_UNSPECIFIED",
+            Self::NoQuote => "TCA_UNANSWERED_NO_QUOTE",
+            Self::NotMeasured => "TCA_UNANSWERED_NOT_MEASURED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "TCA_UNANSWERED_UNSPECIFIED" => Some(Self::Unspecified),
+            "TCA_UNANSWERED_NO_QUOTE" => Some(Self::NoQuote),
+            "TCA_UNANSWERED_NOT_MEASURED" => Some(Self::NotMeasured),
+            _ => None,
+        }
+    }
+}
 /// What an event contract's instrument pays (the lake plan's "vL1c", item 1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -12969,6 +14041,17 @@ pub struct Job {
     /// Trades added to one account's positions (W12.5); unset for none.
     #[prost(message, optional, tag = "4")]
     pub what_if: ::core::option::Option<WhatIf>,
+    /// Contract v27 (W12.1; ruling 458): a business date, ISO 8601 in the
+    /// deployment's time zone -- the book at that date's end, the lake at that
+    /// date's closes; empty for now. Refused beside inputs.book_at or
+    /// inputs.lake_as_of_ns, and for a date after today's.
+    #[prost(string, tag = "5")]
+    pub business_date: ::prost::alloc::string::String,
+    /// Contract v27 (W12.1; ruling 459): the cash instrument the figures are
+    /// converted to, by its `INS-` ID; empty answers each account in its base
+    /// currency.
+    #[prost(string, tag = "6")]
+    pub reporting_currency: ::prost::alloc::string::String,
 }
 /// A job's inputs, by reference (requirement 3): one watermark and one as-of
 /// for the whole job (requirements 7, 8).
@@ -12990,7 +14073,8 @@ pub struct InputRefs {
 pub struct MeasureRef {
     /// A definition the component serves: `market_value`, `exposure`,
     /// `concentration`, `pnl`, `historical_var`, `expected_shortfall`,
-    /// `resolution_payoff`, `implied_distribution` in v26.
+    /// `resolution_payoff`, `implied_distribution` in v26; from v27 `pnl`
+    /// version 2 (realized beside unrealized) and `execution_cost`.
     #[prost(string, tag = "1")]
     pub definition: ::prost::alloc::string::String,
     /// Its version, 1 or more.
@@ -13090,6 +14174,10 @@ pub struct Figure {
     /// How it was computed: exact in v26, model from v28.
     #[prost(enumeration = "ComputedAs", tag = "9")]
     pub computed_as: i32,
+    /// Contract v27 (W12.2; ruling 374): its oldest input's source time; 0 for
+    /// a figure that read no market data.
+    #[prost(int64, tag = "10")]
+    pub oldest_input_source_ns: i64,
 }
 /// A figure's place in one breakdown.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -13134,6 +14222,13 @@ pub struct NotEvaluated {
     /// scheme not held, where the reason names one.
     #[prost(string, tag = "5")]
     pub detail: ::prost::alloc::string::String,
+    /// Contract v27 (W12.2; ruling 374): on a stale price, its age at the
+    /// job's as-of and the ceiling in force, the tighter of the dataset's and
+    /// the client's; 0 on any other reason.
+    #[prost(int64, tag = "6")]
+    pub age_ns: i64,
+    #[prost(int64, tag = "7")]
+    pub ceiling_ns: i64,
 }
 /// What an answer was computed from (requirements 4 and 35; Q7). Named so it
 /// is not mistaken for meridian.v1.Provenance, a value's source.
@@ -13166,6 +14261,55 @@ pub struct AnswerProvenance {
     /// the inputs: two answers with the same hash are the same answer.
     #[prost(string, tag = "10")]
     pub answer_hash: ::prost::alloc::string::String,
+    /// Contract v27 (W12.7): the job's business date, where it had one.
+    #[prost(string, tag = "11")]
+    pub business_date: ::prost::alloc::string::String,
+    /// Contract v27 (W12.7; ruling 460): each position's input price.
+    #[prost(message, repeated, tag = "12")]
+    pub input_prices: ::prost::alloc::vec::Vec<InputPrice>,
+    /// Contract v27 (W12.7; ruling 462): each conversion leg, direct or
+    /// derived, with the pivot a cross went through.
+    #[prost(message, repeated, tag = "13")]
+    pub conversion_legs: ::prost::alloc::vec::Vec<ConversionLeg>,
+}
+/// One position's input price (contract v27; ruling 460).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct InputPrice {
+    #[prost(string, tag = "1")]
+    pub instrument_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub price: ::core::option::Option<Money>,
+    /// The lake row it came from: its dataset, row key and version.
+    #[prost(string, tag = "3")]
+    pub dataset: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub row_key: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "5")]
+    pub version: u64,
+    /// Its source time: the `event` time where present, else the earliest.
+    #[prost(int64, tag = "6")]
+    pub source_ns: i64,
+}
+/// One conversion leg (contract v27; ruling 462): from one cash instrument to
+/// another, at a rate, direct from the lake or derived from it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ConversionLeg {
+    #[prost(string, tag = "1")]
+    pub from_instrument_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub to_instrument_id: ::prost::alloc::string::String,
+    /// Units of `to` per unit of `from`; an inverted rate is 1 ÷ x rounded half
+    /// to even to 18 places.
+    #[prost(message, optional, tag = "3")]
+    pub rate: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    #[prost(enumeration = "ConversionDerivation", tag = "4")]
+    pub derivation: i32,
+    /// A cross's pivot, by its cash instrument's ID; empty otherwise.
+    #[prost(string, tag = "5")]
+    pub via_instrument_id: ::prost::alloc::string::String,
+    /// The dataset the lake's rate came from.
+    #[prost(string, tag = "6")]
+    pub dataset: ::prost::alloc::string::String,
 }
 /// One instrument a job read, by its record's and template's versions.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -13323,6 +14467,9 @@ pub struct PricedUnit {
     #[prost(message, optional, tag = "2")]
     pub scenario_key: ::core::option::Option<ScenarioKey>,
     /// A value per unit, in the base currency the batch's inputs convert to.
+    /// From contract v27, under quoted_price, rounded half to even to 18
+    /// decimal places, as the built-in implementation rounds it (rulings 453
+    /// and 486).
     #[prost(message, optional, tag = "3")]
     pub value_per_unit: ::core::option::Option<Money>,
 }
@@ -13607,6 +14754,9 @@ pub enum NotEvaluatedReason {
     GroupNotExhaustive = 8,
     /// History too short or too sparse for the definition's window.
     HistoryInsufficient = 9,
+    /// Contract v27 (W12.2; ruling 325): a lot's cost the book does not
+    /// record, which the measure needs.
+    CostMissing = 10,
 }
 impl NotEvaluatedReason {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -13627,6 +14777,7 @@ impl NotEvaluatedReason {
             Self::SchemeNotHeld => "NOT_EVALUATED_REASON_SCHEME_NOT_HELD",
             Self::GroupNotExhaustive => "NOT_EVALUATED_REASON_GROUP_NOT_EXHAUSTIVE",
             Self::HistoryInsufficient => "NOT_EVALUATED_REASON_HISTORY_INSUFFICIENT",
+            Self::CostMissing => "NOT_EVALUATED_REASON_COST_MISSING",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -13646,6 +14797,44 @@ impl NotEvaluatedReason {
             "NOT_EVALUATED_REASON_HISTORY_INSUFFICIENT" => {
                 Some(Self::HistoryInsufficient)
             }
+            "NOT_EVALUATED_REASON_COST_MISSING" => Some(Self::CostMissing),
+            _ => None,
+        }
+    }
+}
+/// How a conversion leg's rate was found (contract v27; ruling 462). Never
+/// for a crypto or stablecoin leg, which converts by its own lake price.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ConversionDerivation {
+    Unspecified = 0,
+    /// The lake's rate in the leg's direction.
+    Direct = 1,
+    /// The lake's rate the other way, inverted.
+    Inverted = 2,
+    /// Through a pivot, by the deployment's pivot order.
+    Crossed = 3,
+}
+impl ConversionDerivation {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "CONVERSION_DERIVATION_UNSPECIFIED",
+            Self::Direct => "CONVERSION_DERIVATION_DIRECT",
+            Self::Inverted => "CONVERSION_DERIVATION_INVERTED",
+            Self::Crossed => "CONVERSION_DERIVATION_CROSSED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "CONVERSION_DERIVATION_UNSPECIFIED" => Some(Self::Unspecified),
+            "CONVERSION_DERIVATION_DIRECT" => Some(Self::Direct),
+            "CONVERSION_DERIVATION_INVERTED" => Some(Self::Inverted),
+            "CONVERSION_DERIVATION_CROSSED" => Some(Self::Crossed),
             _ => None,
         }
     }
@@ -14176,6 +15365,19 @@ pub struct PluginListing {
     /// Publisher column reads it.
     #[prost(string, tag = "14")]
     pub publisher: ::prost::alloc::string::String,
+    /// Contract v27 (W8.16; ruling 330, 2026-10-19): the support contact as two
+    /// fields, each validated as its kind, at least one required for
+    /// verified; support_contact is read as the one or the other during the
+    /// move, then retired.
+    #[prost(string, tag = "15")]
+    pub support_url: ::prost::alloc::string::String,
+    #[prost(string, tag = "16")]
+    pub support_email: ::prost::alloc::string::String,
+    /// Contract v27 (W8.20; spec/every-data-source-is-licensed-on-the-same-terms,
+    /// §3): the approved prices, one per dataset and meter (and per category
+    /// or professional status where its terms split them); never a proposal.
+    #[prost(message, repeated, tag = "17")]
+    pub prices: ::prost::alloc::vec::Vec<ListingPrice>,
 }
 /// One version of a listing, in one registry.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -14292,6 +15494,11 @@ pub struct PluginBuild {
     /// which `meridian plugin publish` prints; no client builds the address.
     #[prost(string, tag = "16")]
     pub page_url: ::prost::alloc::string::String,
+    /// Contract v27 (W8.8; ruling 353): the display name the publish request
+    /// declared, shown on the publisher's row while it builds; empty from a CLI
+    /// before 0.1.50.
+    #[prost(string, tag = "17")]
+    pub declared_title: ::prost::alloc::string::String,
 }
 /// One automatic check's finding on a build (requirement 14).
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -14411,6 +15618,11 @@ pub struct PluginPull {
     /// A restoration after a counter-notice (W8.13): when; 0 while it stands.
     #[prost(int64, tag = "7")]
     pub restored_at_ns: i64,
+    /// Contract v27 (W8.14; ruling 311): in a deployment's copy, the issue time
+    /// of the bundle's PluginPullStatus it came by; 0 for a pull learned at a
+    /// catalogue pull.
+    #[prost(int64, tag = "8")]
+    pub by_bundle_issued_at_ns: i64,
 }
 /// A copyright notice under 17 U.S.C. §512, recorded by staff against a
 /// listing's versions (W8.13), with its counter-notice and what became of it.
@@ -14549,6 +15761,11 @@ pub struct PublishPluginVersionRequest {
     /// active key of the organisation.
     #[prost(string, tag = "5")]
     pub tag: ::prost::alloc::string::String,
+    /// Contract v27 (W8.8; ruling 353): the plugin's display name as the CLI
+    /// read it from the declaration, optional; the builder refuses the build
+    /// where the built image's declaration names another.
+    #[prost(string, tag = "6")]
+    pub declared_title: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ReadPluginBuildRequest {
@@ -14645,6 +15862,11 @@ pub struct PullCatalogueReply {
     /// the install dialog's one line links.
     #[prost(string, tag = "4")]
     pub terms_url: ::prost::alloc::string::String,
+    /// Contract v27 (W8.10; spec/starter-packs, requirement 14): every pack
+    /// whose catalogue record falls after the sequence asked, whole, at its
+    /// latest published revision; a v26 conductor ignores it.
+    #[prost(message, repeated, tag = "5")]
+    pub packs: ::prost::alloc::vec::Vec<PluginPack>,
 }
 /// One resolution request per install or update (plan Q3), counted by the
 /// platform; also the CLI's bundle download (W8.14).
@@ -14786,8 +16008,16 @@ pub struct SetPluginAttributesRequest {
     pub regions: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(string, repeated, tag = "4")]
     pub asset_classes: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Read during the move as support_url or support_email by its form;
+    /// refused beside either.
     #[prost(string, tag = "5")]
     pub support_contact: ::prost::alloc::string::String,
+    /// Contract v27 (W8.16; ruling 330): an `https:` URL, and an address, each
+    /// refused INVALID_ARGUMENT naming it where it is not of its kind.
+    #[prost(string, tag = "6")]
+    pub support_url: ::prost::alloc::string::String,
+    #[prost(string, tag = "7")]
+    pub support_email: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct WithdrawListedVersionRequest {
@@ -14942,6 +16172,10 @@ pub struct InstallPluginRequest {
     /// carries one.
     #[prost(string, tag = "4")]
     pub note: ::prost::alloc::string::String,
+    /// Contract v27 (W8.10, W8.18; spec/starter-packs, requirement 18): the pack
+    /// whose install made it, `organisation/pack`; empty for one listing's.
+    #[prost(string, tag = "5")]
+    pub pack: ::prost::alloc::string::String,
 }
 /// Moves an instance to a newer version from its source registry, or a local
 /// version's instance to a listed version of the same plugin (W8.11).
@@ -15041,6 +16275,418 @@ pub struct SentPluginUsageReport {
     pub received: bool,
     #[prost(message, optional, tag = "3")]
     pub report: ::core::option::Option<PluginUsageReport>,
+}
+/// A starter pack in the platform's catalogue: a curated list of listings for
+/// one kind of trading, never a merged plugin (336).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PluginPack {
+    /// `organisation/pack`: the curator's namespace and the pack's DNS label,
+    /// fixed at its first publish.
+    #[prost(string, tag = "1")]
+    pub pack: ::prost::alloc::string::String,
+    /// The curating organisation's display name.
+    #[prost(string, tag = "2")]
+    pub curator: ::prost::alloc::string::String,
+    /// Its latest published revision, immutable.
+    #[prost(message, optional, tag = "3")]
+    pub revision: ::core::option::Option<PackRevision>,
+    /// When its curator withdrew it; 0 while it stands.
+    #[prost(int64, tag = "4")]
+    pub withdrawn_at_ns: i64,
+    /// Its place in the catalogue's sequence.
+    #[prost(uint64, tag = "5")]
+    pub sequence: u64,
+}
+/// A published revision of a pack, never changed afterwards (requirement 4).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PackRevision {
+    /// From 1.
+    #[prost(uint64, tag = "1")]
+    pub revision: u64,
+    #[prost(string, tag = "2")]
+    pub title: ::prost::alloc::string::String,
+    /// At most 280 characters.
+    #[prost(string, tag = "3")]
+    pub description: ::prost::alloc::string::String,
+    /// From the platform's closed list of asset classes.
+    #[prost(string, repeated, tag = "4")]
+    pub asset_classes: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// In the curator's order.
+    #[prost(message, repeated, tag = "5")]
+    pub members: ::prost::alloc::vec::Vec<PackMember>,
+    /// The reviewer's note.
+    #[prost(string, tag = "6")]
+    pub note: ::prost::alloc::string::String,
+    #[prost(int64, tag = "7")]
+    pub published_at_ns: i64,
+}
+/// One member of a pack (requirement 3).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PackMember {
+    /// `organisation/plugin`.
+    #[prost(string, tag = "1")]
+    pub listing: ::prost::alloc::string::String,
+    /// `community` or `verified`, never local.
+    #[prost(string, tag = "2")]
+    pub registry: ::prost::alloc::string::String,
+    #[prost(enumeration = "PackSelection", tag = "3")]
+    pub selection: i32,
+    /// Its group label on the install sheet: "Data", "Brokers".
+    #[prost(string, tag = "4")]
+    pub group: ::prost::alloc::string::String,
+    /// A listed version of the listing: the floor it tracks its latest above.
+    #[prost(string, tag = "5")]
+    pub minimum_version: ::prost::alloc::string::String,
+}
+/// W8.17: staff publish a pack's next revision after its review.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PublishPluginPackRequest {
+    #[prost(string, tag = "1")]
+    pub organisation: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub pack: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub title: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub description: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "5")]
+    pub asset_classes: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(message, repeated, tag = "6")]
+    pub members: ::prost::alloc::vec::Vec<PackMember>,
+    #[prost(string, tag = "7")]
+    pub note: ::prost::alloc::string::String,
+}
+/// W8.17: staff withdraw a pack, or restore one withdrawn.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WithdrawPluginPackRequest {
+    #[prost(string, tag = "1")]
+    pub organisation: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub pack: ::prost::alloc::string::String,
+    /// True restores a withdrawn pack.
+    #[prost(bool, tag = "3")]
+    pub restore: bool,
+    #[prost(string, tag = "4")]
+    pub note: ::prost::alloc::string::String,
+}
+/// W8.18: Browse's pack view, read from the conductor's copy of the catalogue.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListRegistryPacksRequest {
+    /// Words matched against the pack's title and description.
+    #[prost(string, tag = "1")]
+    pub search: ::prost::alloc::string::String,
+    /// One pack, `organisation/pack`; empty for the list.
+    #[prost(string, tag = "2")]
+    pub pack: ::prost::alloc::string::String,
+    #[prost(int32, tag = "3")]
+    pub page_size: i32,
+    #[prost(string, tag = "4")]
+    pub cursor: ::prost::alloc::string::String,
+    /// Pull the catalogue first, then answer.
+    #[prost(bool, tag = "5")]
+    pub pull_now: bool,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListRegistryPacksReply {
+    #[prost(message, repeated, tag = "1")]
+    pub packs: ::prost::alloc::vec::Vec<PluginPack>,
+    #[prost(string, tag = "2")]
+    pub next_cursor: ::prost::alloc::string::String,
+    #[prost(int64, tag = "3")]
+    pub catalogue_pulled_at_ns: i64,
+}
+/// W8.18: install a pack, the ticked members one by one as a job.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct InstallPackRequest {
+    #[prost(string, tag = "1")]
+    pub pack: ::prost::alloc::string::String,
+    /// The revision the sheet showed; another is refused FAILED_PRECONDITION
+    /// naming it.
+    #[prost(uint64, tag = "2")]
+    pub revision: u64,
+    /// The members ticked, by listing; a name not a member is refused
+    /// INVALID_ARGUMENT naming it before anything moves.
+    #[prost(string, repeated, tag = "3")]
+    pub members: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, tag = "4")]
+    pub note: ::prost::alloc::string::String,
+}
+/// The pack job, and each member's outcome so far.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PackInstall {
+    #[prost(string, tag = "1")]
+    pub pack: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub revision: u64,
+    #[prost(message, repeated, tag = "3")]
+    pub members: ::prost::alloc::vec::Vec<PackMemberStatus>,
+}
+/// W8.19: a pack's page.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReadPackRequest {
+    #[prost(string, tag = "1")]
+    pub pack: ::prost::alloc::string::String,
+}
+/// An installed pack's status: the setup checklist (339).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PackStatus {
+    #[prost(string, tag = "1")]
+    pub pack: ::prost::alloc::string::String,
+    /// The revision installed, and the catalogue's latest.
+    #[prost(uint64, tag = "2")]
+    pub installed_revision: u64,
+    #[prost(uint64, tag = "3")]
+    pub latest_revision: u64,
+    /// Withdrawn by its curator.
+    #[prost(bool, tag = "4")]
+    pub withdrawn: bool,
+    #[prost(message, repeated, tag = "5")]
+    pub members: ::prost::alloc::vec::Vec<PackMemberStatus>,
+}
+/// One member's state in this deployment.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PackMemberStatus {
+    #[prost(string, tag = "1")]
+    pub listing: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub group: ::prost::alloc::string::String,
+    /// Installed here, and the latest offered at or above the minimum; empty
+    /// when none.
+    #[prost(string, tag = "3")]
+    pub installed_version: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub latest_version: ::prost::alloc::string::String,
+    #[prost(enumeration = "PackMemberState", tag = "5")]
+    pub state: i32,
+    /// Why, for failed, unavailable or not permitted, in words.
+    #[prost(string, tag = "6")]
+    pub reason: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "7")]
+    pub instance_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// The instance's "Setting up" next step, in its words.
+    #[prost(string, tag = "8")]
+    pub setup: ::prost::alloc::string::String,
+    /// The revision that added it, where after the installed one; the
+    /// revision that removed it, where it is no longer in the pack.
+    #[prost(uint64, tag = "9")]
+    pub added_by_revision: u64,
+    #[prost(uint64, tag = "10")]
+    pub removed_by_revision: u64,
+}
+/// W8.19: update every launched member to its own latest.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UpdatePackRequest {
+    #[prost(string, tag = "1")]
+    pub pack: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub note: ::prost::alloc::string::String,
+}
+/// W8.19: remove the deployment's pack record; no member is touched.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RemovePackRequest {
+    #[prost(string, tag = "1")]
+    pub pack: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub note: ::prost::alloc::string::String,
+}
+/// One price on a listing: one dataset's meter, and its category or
+/// professional status where the dataset's terms split by one.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListingPrice {
+    /// The catalogue key of the dataset it prices.
+    #[prost(string, tag = "1")]
+    pub dataset: ::prost::alloc::string::String,
+    #[prost(enumeration = "::meridian_pb::v1::LicenceMeter", tag = "2")]
+    pub meter: i32,
+    /// For non-display split by category; unspecified otherwise.
+    #[prost(enumeration = "::meridian_pb::v1::NonDisplayCategory", tag = "3")]
+    pub category: i32,
+    /// For display split by professional status; unspecified otherwise.
+    #[prost(enumeration = "ProfessionalStatus", tag = "4")]
+    pub professional: i32,
+    #[prost(message, optional, tag = "5")]
+    pub amount: ::core::option::Option<Money>,
+    #[prost(enumeration = "PricePeriod", tag = "6")]
+    pub period: i32,
+    #[prost(message, repeated, tag = "7")]
+    pub tiers: ::prost::alloc::vec::Vec<PriceTier>,
+    #[prost(enumeration = "TierMode", tag = "8")]
+    pub tier_mode: i32,
+    /// Per person or per deployment, by the meter; unset for none.
+    #[prost(message, optional, tag = "9")]
+    pub cap: ::core::option::Option<Money>,
+    /// ISO 8601: when an approved price takes effect.
+    #[prost(string, tag = "10")]
+    pub effective_from: ::prost::alloc::string::String,
+    /// The notice the vendor gives of a change, in days.
+    #[prost(uint32, tag = "11")]
+    pub notice_days: u32,
+}
+/// One tier: from and to count the meter's units, inclusive; to 0 is open.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PriceTier {
+    #[prost(uint32, tag = "1")]
+    pub from: u32,
+    #[prost(uint32, tag = "2")]
+    pub to: u32,
+    #[prost(message, optional, tag = "3")]
+    pub amount: ::core::option::Option<Money>,
+}
+/// W8.20: a vendor's proposed prices, staff's to approve or reject.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListingPriceProposal {
+    #[prost(string, tag = "1")]
+    pub proposal_id: ::prost::alloc::string::String,
+    /// `organisation/plugin`.
+    #[prost(string, tag = "2")]
+    pub listing: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "3")]
+    pub prices: ::prost::alloc::vec::Vec<ListingPrice>,
+    #[prost(enumeration = "ListingPriceProposalState", tag = "4")]
+    pub state: i32,
+    #[prost(string, tag = "5")]
+    pub note: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub proposed_by: ::prost::alloc::string::String,
+    #[prost(int64, tag = "7")]
+    pub proposed_at_ns: i64,
+    #[prost(string, tag = "8")]
+    pub decided_by: ::prost::alloc::string::String,
+    #[prost(int64, tag = "9")]
+    pub decided_at_ns: i64,
+    #[prost(string, tag = "10")]
+    pub decision_note: ::prost::alloc::string::String,
+}
+/// W8.20: an Owner or Admin proposes the listing's prices, whole.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ProposeListingPricesRequest {
+    #[prost(string, tag = "1")]
+    pub organisation: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub plugin: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "3")]
+    pub prices: ::prost::alloc::vec::Vec<ListingPrice>,
+    #[prost(string, tag = "4")]
+    pub note: ::prost::alloc::string::String,
+}
+/// W8.20: staff approve or reject a proposal, with a note.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReviewListingPricesRequest {
+    #[prost(string, tag = "1")]
+    pub proposal_id: ::prost::alloc::string::String,
+    #[prost(bool, tag = "2")]
+    pub approve: bool,
+    #[prost(string, tag = "3")]
+    pub note: ::prost::alloc::string::String,
+}
+/// 1 to 500 snapshots, every 10 seconds, to core's monitor.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReportLatencyRequest {
+    #[prost(message, repeated, tag = "1")]
+    pub snapshots: ::prost::alloc::vec::Vec<LatencySnapshot>,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ReportLatencyReply {
+    #[prost(uint32, tag = "1")]
+    pub accepted: u32,
+}
+/// One histogram snapshot over an interval: a session's metric, or a dataset's
+/// age at a hop.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LatencySnapshot {
+    #[prost(int64, tag = "1")]
+    pub interval_start_ns: i64,
+    #[prost(int64, tag = "2")]
+    pub interval_ns: i64,
+    /// The session, by the plugin's own name for it; empty for a dataset's.
+    #[prost(string, tag = "3")]
+    pub session: ::prost::alloc::string::String,
+    /// The dataset, `instance:key`, and the hop; empty and unspecified for a
+    /// session's.
+    #[prost(string, tag = "4")]
+    pub dataset: ::prost::alloc::string::String,
+    #[prost(enumeration = "AgeHop", tag = "5")]
+    pub hop: i32,
+    #[prost(enumeration = "LatencyMetric", tag = "6")]
+    pub metric: i32,
+    #[prost(message, optional, tag = "7")]
+    pub histogram: ::core::option::Option<LatencyHistogram>,
+    #[prost(message, optional, tag = "8")]
+    pub counters: ::core::option::Option<LatencyCounters>,
+    /// The source's clock minus ours, corrected by half the round trip.
+    #[prost(int64, tag = "9")]
+    pub clock_skew_ns: i64,
+    /// The session's last message or heartbeat.
+    #[prost(int64, tag = "10")]
+    pub alive_at_ns: i64,
+    /// The absolute ceilings in force, as the plugin's settings hold them.
+    #[prost(message, optional, tag = "11")]
+    pub ceilings: ::core::option::Option<LatencyCeilings>,
+    /// The reporting instance, stamped by its sidecar.
+    #[prost(string, tag = "12")]
+    pub instance_id: ::prost::alloc::string::String,
+}
+/// A sparse log-linear histogram, HdrHistogram's layout (ruling 416).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LatencyHistogram {
+    #[prost(int64, tag = "1")]
+    pub lowest_ns: i64,
+    /// 2 in v27.
+    #[prost(uint32, tag = "2")]
+    pub significant_digits: u32,
+    #[prost(message, repeated, tag = "3")]
+    pub buckets: ::prost::alloc::vec::Vec<LatencyBucket>,
+    #[prost(int64, tag = "4")]
+    pub min_ns: i64,
+    #[prost(int64, tag = "5")]
+    pub max_ns: i64,
+    /// Values recorded in the interval.
+    #[prost(uint64, tag = "6")]
+    pub total: u64,
+}
+/// One bucket with a count; empty buckets are not sent.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct LatencyBucket {
+    #[prost(uint32, tag = "1")]
+    pub bucket: u32,
+    #[prost(uint64, tag = "2")]
+    pub count: u64,
+}
+/// A session's congestion in the interval.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct LatencyCounters {
+    #[prost(uint64, tag = "1")]
+    pub gaps: u64,
+    #[prost(uint64, tag = "2")]
+    pub resends: u64,
+    #[prost(uint64, tag = "3")]
+    pub reconnects: u64,
+    #[prost(uint64, tag = "4")]
+    pub rate_limited: u64,
+    /// Messages queued to send, at their peak.
+    #[prost(uint64, tag = "5")]
+    pub backlog_peak: u64,
+}
+/// The plugin admin's session_ceilings for the connection, in force; 0 is no
+/// ceiling.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct LatencyCeilings {
+    #[prost(int64, tag = "1")]
+    pub rtt_p99_ns: i64,
+    #[prost(int64, tag = "2")]
+    pub order_ack_p99_ns: i64,
+    #[prost(int64, tag = "3")]
+    pub fill_delay_p99_ns: i64,
+    #[prost(int64, tag = "4")]
+    pub feed_delay_p99_ns: i64,
+    #[prost(int64, tag = "5")]
+    pub clock_skew_max_ns: i64,
+    #[prost(uint32, tag = "6")]
+    pub gaps_per_hour: u32,
+    #[prost(uint32, tag = "7")]
+    pub reconnects_per_hour: u32,
+    #[prost(uint32, tag = "8")]
+    pub backlog_max: u32,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -15295,6 +16941,298 @@ impl SigningKeyPolicy {
             "SIGNING_KEY_POLICY_ANY" => Some(Self::Any),
             "SIGNING_KEY_POLICY_HARDWARE_ONLY" => Some(Self::HardwareOnly),
             "SIGNING_KEY_POLICY_DESKTOP_ONLY" => Some(Self::DesktopOnly),
+            _ => None,
+        }
+    }
+}
+/// How a member is offered on the install sheet (requirement 3; Debian's
+/// Depends, Recommends and Suggests).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum PackSelection {
+    Unspecified = 0,
+    /// Ticked and fixed.
+    Required = 1,
+    /// Ticked; the deployment admin may untick it.
+    Preselected = 2,
+    /// Unticked; the deployment admin may tick it.
+    Choose = 3,
+}
+impl PackSelection {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "PACK_SELECTION_UNSPECIFIED",
+            Self::Required => "PACK_SELECTION_REQUIRED",
+            Self::Preselected => "PACK_SELECTION_PRESELECTED",
+            Self::Choose => "PACK_SELECTION_CHOOSE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "PACK_SELECTION_UNSPECIFIED" => Some(Self::Unspecified),
+            "PACK_SELECTION_REQUIRED" => Some(Self::Required),
+            "PACK_SELECTION_PRESELECTED" => Some(Self::Preselected),
+            "PACK_SELECTION_CHOOSE" => Some(Self::Choose),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum PackMemberState {
+    Unspecified = 0,
+    NotInstalled = 1,
+    Installing = 2,
+    Failed = 3,
+    Installed = 4,
+    Launched = 5,
+    /// No offered version at or above its minimum.
+    Unavailable = 6,
+    /// Its floor not met, or a registry this deployment does not take.
+    NotPermitted = 7,
+}
+impl PackMemberState {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "PACK_MEMBER_STATE_UNSPECIFIED",
+            Self::NotInstalled => "PACK_MEMBER_STATE_NOT_INSTALLED",
+            Self::Installing => "PACK_MEMBER_STATE_INSTALLING",
+            Self::Failed => "PACK_MEMBER_STATE_FAILED",
+            Self::Installed => "PACK_MEMBER_STATE_INSTALLED",
+            Self::Launched => "PACK_MEMBER_STATE_LAUNCHED",
+            Self::Unavailable => "PACK_MEMBER_STATE_UNAVAILABLE",
+            Self::NotPermitted => "PACK_MEMBER_STATE_NOT_PERMITTED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "PACK_MEMBER_STATE_UNSPECIFIED" => Some(Self::Unspecified),
+            "PACK_MEMBER_STATE_NOT_INSTALLED" => Some(Self::NotInstalled),
+            "PACK_MEMBER_STATE_INSTALLING" => Some(Self::Installing),
+            "PACK_MEMBER_STATE_FAILED" => Some(Self::Failed),
+            "PACK_MEMBER_STATE_INSTALLED" => Some(Self::Installed),
+            "PACK_MEMBER_STATE_LAUNCHED" => Some(Self::Launched),
+            "PACK_MEMBER_STATE_UNAVAILABLE" => Some(Self::Unavailable),
+            "PACK_MEMBER_STATE_NOT_PERMITTED" => Some(Self::NotPermitted),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum PricePeriod {
+    Unspecified = 0,
+    Month = 1,
+    Year = 2,
+}
+impl PricePeriod {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "PRICE_PERIOD_UNSPECIFIED",
+            Self::Month => "PRICE_PERIOD_MONTH",
+            Self::Year => "PRICE_PERIOD_YEAR",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "PRICE_PERIOD_UNSPECIFIED" => Some(Self::Unspecified),
+            "PRICE_PERIOD_MONTH" => Some(Self::Month),
+            "PRICE_PERIOD_YEAR" => Some(Self::Year),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum TierMode {
+    Unspecified = 0,
+    /// Each tier prices its own slice.
+    Bracket = 1,
+    /// The tier reached prices everything.
+    Whole = 2,
+}
+impl TierMode {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "TIER_MODE_UNSPECIFIED",
+            Self::Bracket => "TIER_MODE_BRACKET",
+            Self::Whole => "TIER_MODE_WHOLE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "TIER_MODE_UNSPECIFIED" => Some(Self::Unspecified),
+            "TIER_MODE_BRACKET" => Some(Self::Bracket),
+            "TIER_MODE_WHOLE" => Some(Self::Whole),
+            _ => None,
+        }
+    }
+}
+/// A display price's professional status, where the terms split by it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ProfessionalStatus {
+    Unspecified = 0,
+    Professional = 1,
+    NonProfessional = 2,
+}
+impl ProfessionalStatus {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "PROFESSIONAL_STATUS_UNSPECIFIED",
+            Self::Professional => "PROFESSIONAL_STATUS_PROFESSIONAL",
+            Self::NonProfessional => "PROFESSIONAL_STATUS_NON_PROFESSIONAL",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "PROFESSIONAL_STATUS_UNSPECIFIED" => Some(Self::Unspecified),
+            "PROFESSIONAL_STATUS_PROFESSIONAL" => Some(Self::Professional),
+            "PROFESSIONAL_STATUS_NON_PROFESSIONAL" => Some(Self::NonProfessional),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ListingPriceProposalState {
+    Unspecified = 0,
+    Proposed = 1,
+    Approved = 2,
+    Rejected = 3,
+}
+impl ListingPriceProposalState {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "LISTING_PRICE_PROPOSAL_STATE_UNSPECIFIED",
+            Self::Proposed => "LISTING_PRICE_PROPOSAL_STATE_PROPOSED",
+            Self::Approved => "LISTING_PRICE_PROPOSAL_STATE_APPROVED",
+            Self::Rejected => "LISTING_PRICE_PROPOSAL_STATE_REJECTED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "LISTING_PRICE_PROPOSAL_STATE_UNSPECIFIED" => Some(Self::Unspecified),
+            "LISTING_PRICE_PROPOSAL_STATE_PROPOSED" => Some(Self::Proposed),
+            "LISTING_PRICE_PROPOSAL_STATE_APPROVED" => Some(Self::Approved),
+            "LISTING_PRICE_PROPOSAL_STATE_REJECTED" => Some(Self::Rejected),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum LatencyMetric {
+    Unspecified = 0,
+    /// Round trip: FIX TestRequest to its Heartbeat, a WebSocket ping to its
+    /// pong, a REST call's duration.
+    Rtt = 1,
+    /// Connectivity: placement sent to the venue's acknowledgement.
+    OrderAck = 2,
+    /// Connectivity: the venue's transaction time to the fill received.
+    FillDelay = 3,
+    /// A dataset's age at a hop.
+    Age = 4,
+}
+impl LatencyMetric {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "LATENCY_METRIC_UNSPECIFIED",
+            Self::Rtt => "LATENCY_METRIC_RTT",
+            Self::OrderAck => "LATENCY_METRIC_ORDER_ACK",
+            Self::FillDelay => "LATENCY_METRIC_FILL_DELAY",
+            Self::Age => "LATENCY_METRIC_AGE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "LATENCY_METRIC_UNSPECIFIED" => Some(Self::Unspecified),
+            "LATENCY_METRIC_RTT" => Some(Self::Rtt),
+            "LATENCY_METRIC_ORDER_ACK" => Some(Self::OrderAck),
+            "LATENCY_METRIC_FILL_DELAY" => Some(Self::FillDelay),
+            "LATENCY_METRIC_AGE" => Some(Self::Age),
+            _ => None,
+        }
+    }
+}
+/// Where a dataset's age is measured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum AgeHop {
+    Unspecified = 0,
+    /// The data plugin, on parsing the vendor's message: the feed delay.
+    Edge = 1,
+    Sidecar = 2,
+    Lake = 3,
+    Bus = 4,
+    Analytics = 5,
+    /// The `ems`, at its pre-trade check.
+    EmsCheck = 6,
+    Page = 7,
+}
+impl AgeHop {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "AGE_HOP_UNSPECIFIED",
+            Self::Edge => "AGE_HOP_EDGE",
+            Self::Sidecar => "AGE_HOP_SIDECAR",
+            Self::Lake => "AGE_HOP_LAKE",
+            Self::Bus => "AGE_HOP_BUS",
+            Self::Analytics => "AGE_HOP_ANALYTICS",
+            Self::EmsCheck => "AGE_HOP_EMS_CHECK",
+            Self::Page => "AGE_HOP_PAGE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "AGE_HOP_UNSPECIFIED" => Some(Self::Unspecified),
+            "AGE_HOP_EDGE" => Some(Self::Edge),
+            "AGE_HOP_SIDECAR" => Some(Self::Sidecar),
+            "AGE_HOP_LAKE" => Some(Self::Lake),
+            "AGE_HOP_BUS" => Some(Self::Bus),
+            "AGE_HOP_ANALYTICS" => Some(Self::Analytics),
+            "AGE_HOP_EMS_CHECK" => Some(Self::EmsCheck),
+            "AGE_HOP_PAGE" => Some(Self::Page),
             _ => None,
         }
     }
@@ -16094,6 +18032,12 @@ pub struct VenueCatalogue {
     /// or `paper`.
     #[prost(string, tag = "7")]
     pub environment: ::prost::alloc::string::String,
+    /// Contract v27 (W11.20; the gaps spec's B4): the placement types the
+    /// venue takes beside its order types; one not listed is rejected
+    /// unsupported by the connectivity plugin. Empty, as a v26 catalogue is,
+    /// reads as DMA alone.
+    #[prost(enumeration = "PlacementType", repeated, tag = "8")]
+    pub placement_types: ::prost::alloc::vec::Vec<i32>,
 }
 /// An order type the venue offers, with the times in force it takes.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -16280,6 +18224,35 @@ pub struct DeploymentTimeZoneSetting {
     /// The instance declaring it; empty with 0.
     #[prost(string, tag = "5")]
     pub affirmation_deadline_instance_id: ::prost::alloc::string::String,
+}
+/// The deployment admin sets the order of the pivots the analytics component
+/// crosses a fiat cash leg through when the lake holds no direct rate in
+/// either direction (W6.36, W12.2; rulings 462 and 483): each change its own
+/// record.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SetFxPivotCurrenciesRequest {
+    /// Fiat cash instruments by their `INS-` IDs, tried in order: one to four,
+    /// none repeated, never a crypto or stablecoin instrument.
+    #[prost(string, repeated, tag = "1")]
+    pub fx_pivot_currencies: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, tag = "2")]
+    pub reason: ::prost::alloc::string::String,
+}
+/// W6.36: the pivots read, by the analytics component as it converts a job's
+/// legs (W12.2) and by the dashboard.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ReadFxPivotCurrenciesRequest {}
+/// The deployment's FX pivot currencies in force.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FxPivotCurrenciesSetting {
+    /// USD's cash instrument, then EUR's, by default.
+    #[prost(string, repeated, tag = "1")]
+    pub fx_pivot_currencies: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// The last change; 0 and empty for the default never changed.
+    #[prost(int64, tag = "2")]
+    pub changed_at_ns: i64,
+    #[prost(string, tag = "3")]
+    pub changed_by: ::prost::alloc::string::String,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]

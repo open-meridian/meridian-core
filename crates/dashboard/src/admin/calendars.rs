@@ -588,6 +588,7 @@ mod tests {
                 name: "Federal Reserve holidays".into(),
                 ..Default::default()
             }],
+            trading_sessions: None,
         });
         let none = BTreeMap::new();
         let page = tab(

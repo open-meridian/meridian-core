@@ -102,7 +102,11 @@ header.bar .bar-link{padding:.35rem .5rem}}\
 main.sheet{width:calc(100% - 2rem);max-width:44rem;margin:2.5rem auto 4rem;padding:1.9rem 2.1rem;background:var(--card);\
 border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow)}\
 @media (max-width:44rem){main.sheet{width:100%;margin:0;border:0;border-radius:0;padding:1.25rem 1rem}}\
-main.page{width:100%}\
+main.page{width:100%}main.shell{width:100%;padding:0}\
+@media (max-width:47.99rem){main.shell .om-shell>.om-shell-main{padding:.35rem var(--space-4) 0}\
+.om-shell-main nav.tabs{margin:.3rem 0 .5rem;padding-bottom:.4rem}\
+.om-shell-main .plugin-area nav.tabs,.om-shell-main .plugin-view nav.tabs{margin-bottom:.6rem}\
+om-sidebar>.om-sidebar-bar{padding-block:0}om-sidebar button.om-sidebar-open{min-height:2.5rem}}\
 main.frame{flex:1 1 auto;display:flex;min-height:0}\
 main.frame iframe{flex:1 1 auto;width:100%;border:0;background:var(--page)}\
 main.sheet h1{margin:0 0 .35rem}h2{margin:0 0 .75rem}h3{font-size:.95rem;margin:1.25rem 0 .25rem;font-weight:600}\
@@ -324,6 +328,9 @@ dialog::backdrop{background:var(--backdrop)}\
 .dialog-head{padding:1rem 1.25rem .25rem}.dialog-head h2{margin:0}.dialog-body{padding:.5rem 1.25rem}\
 .dialog-foot{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:.5rem;padding:.75rem 1.25rem;border-top:1px solid var(--line-soft)}\
 .dialog-foot button{margin:0}\
+.menu-pop>button.menu-close,header.bar .menu-pop>button.menu-close{display:block;width:auto;margin:0 0 .15rem auto;\
+padding:.05rem .45rem;border:0;background:none;font-size:1.15rem;line-height:1;color:var(--ink-faint)}\
+.menu-pop>button.menu-close:hover{color:var(--ink);background:var(--hover)}\
 fieldset.checks{border:1px solid var(--line);border-radius:var(--radius);padding:.5rem .75rem;margin:0 0 .9rem;\
 max-height:14rem;overflow:auto}fieldset.checks legend{font-size:.84rem;font-weight:550;padding:0 .25rem}\
 fieldset.checks label{margin:.25rem 0}\
@@ -1137,6 +1144,10 @@ pub struct Chrome<'a> {
     pub in_admin: bool,
     /// What "Report a problem" in the header says the person was on.
     pub report: Report<'a>,
+    /// The settings' sidebar beside the page (rulings 447 to 451): `None`
+    /// for none; `Some("")` with the current item worked out from the
+    /// address; `Some(id)` naming it (a plugin's Manage page, `plugins`).
+    pub sidebar: Option<&'a str>,
 }
 
 /// Where "Report a problem" in the header fills in what a ticket concerns
@@ -1150,6 +1161,133 @@ pub enum Report<'a> {
     Concerning(&'a str),
     Omitted,
 }
+
+/// Popovers and destructive acts (351's audit), served apart at
+/// [`ACTS_PATH`] so every page carries one line of it, cached. A menu closes
+/// on its ×, on Escape (its summary taking the focus back) and on a press
+/// outside it, one open closing the others. A form or a button carrying
+/// `data-confirm` asks in a dialog -- what it does, a "Why" the act keeps as
+/// its `note`, the act's own button and a Cancel -- and nothing posts until
+/// the act is pressed there. Built from elements, never markup.
+pub const ACTS_SCRIPT: &str = r#"(function () {
+  function el(tag, attrs, text) {
+    var e = document.createElement(tag);
+    Object.keys(attrs || {}).forEach(function (k) { e.setAttribute(k, attrs[k]); });
+    if (text) e.textContent = text;
+    return e;
+  }
+  var menus = Array.prototype.slice.call(document.querySelectorAll("details.menu"));
+  function shut(menu, focus) {
+    if (!menu.open) return;
+    menu.open = false;
+    var summary = menu.querySelector("summary");
+    if (focus && summary) summary.focus();
+  }
+  menus.forEach(function (menu) {
+    var pop = menu.querySelector(".menu-pop");
+    if (pop && !pop.querySelector(".menu-close")) {
+      var close = el("button", { type: "button", "class": "menu-close", "aria-label": "Close" }, "×");
+      close.addEventListener("click", function () { shut(menu, true); });
+      pop.insertBefore(close, pop.firstChild);
+    }
+    menu.addEventListener("toggle", function () {
+      if (menu.open) menus.forEach(function (other) { if (other !== menu) shut(other, false); });
+    });
+  });
+  document.addEventListener("keydown", function (event) {
+    if (event.key === "Escape") menus.forEach(function (menu) { shut(menu, true); });
+  });
+  document.addEventListener("click", function (event) {
+    menus.forEach(function (menu) { if (!menu.contains(event.target)) shut(menu, false); });
+  });
+  // The settings' sidebar (kit 0.13.0) sits under what is above the page --
+  // the header, and the development banner where one is drawn -- so it is
+  // as tall as the screen leaves; and the pagers measure again once it is
+  // drawn, so their pages fit beside or under it.
+  var shell = document.querySelector(".om-shell");
+  function under() {
+    if (!shell) return;
+    var top = shell.getBoundingClientRect().top + window.scrollY;
+    if (top > 0) shell.style.setProperty("--om-sidebar-top", Math.round(top) + "px");
+  }
+  if (shell) {
+    under();
+    window.addEventListener("resize", under);
+    if (window.customElements) {
+      customElements.whenDefined("om-sidebar").then(function () {
+        under();
+        window.setTimeout(function () { window.dispatchEvent(new Event("resize")); }, 0);
+      });
+    }
+  }
+  var asking = null, dialog = null, title, said, why, act;
+  function confirmer() {
+    if (dialog) return dialog;
+    dialog = el("dialog", { id: "om-confirm", "aria-labelledby": "om-confirm-title" });
+    var form = el("form", { method: "dialog" });
+    var head = el("div", { "class": "dialog-head" });
+    title = el("h2", { id: "om-confirm-title" });
+    head.appendChild(title);
+    var body = el("div", { "class": "dialog-body" });
+    said = el("p", { "data-confirm-said": "" });
+    var label = el("label", {}, "Why");
+    why = el("textarea", { name: "why", rows: "2", maxlength: "2000", required: "" });
+    label.appendChild(why);
+    body.appendChild(said);
+    body.appendChild(label);
+    var foot = el("div", { "class": "dialog-foot" });
+    var cancel = el("button", { type: "button", "data-confirm-cancel": "" }, "Cancel");
+    act = el("button", { type: "submit", "class": "danger", "data-confirm-act": "" });
+    foot.appendChild(cancel);
+    foot.appendChild(act);
+    form.appendChild(head);
+    form.appendChild(body);
+    form.appendChild(foot);
+    dialog.appendChild(form);
+    document.body.appendChild(dialog);
+    cancel.addEventListener("click", function () { asking = null; dialog.close(); });
+    dialog.addEventListener("close", function () { asking = null; });
+    form.addEventListener("submit", function (event) {
+      event.preventDefault();
+      var given = why.value.trim();
+      if (!given || !asking) return;
+      var held = asking;
+      asking = null;
+      dialog.close();
+      var note = held.form.querySelector("[name=note]");
+      if (!note) {
+        note = el("input", { type: "hidden", name: "note" });
+        held.form.appendChild(note);
+      }
+      note.value = given;
+      held.form.setAttribute("data-confirmed", "");
+      if (held.submitter && held.form.requestSubmit) held.form.requestSubmit(held.submitter);
+      else held.form.submit();
+    });
+    return dialog;
+  }
+  document.addEventListener("submit", function (event) {
+    var form = event.target;
+    var submitter = event.submitter || null;
+    var asked = (submitter && submitter.getAttribute("data-confirm")) || form.getAttribute("data-confirm");
+    if (!asked) return;
+    if (form.hasAttribute("data-confirmed")) { form.removeAttribute("data-confirmed"); return; }
+    event.preventDefault();
+    confirmer();
+    asking = { form: form, submitter: submitter };
+    var named = (submitter && submitter.textContent.trim()) || "Confirm";
+    title.textContent = named;
+    act.textContent = named;
+    said.textContent = asked;
+    var existing = form.querySelector("[name=note]");
+    why.value = existing ? existing.value : "";
+    dialog.showModal();
+    why.focus();
+  }, true);
+})();"#;
+
+/// Where [`ACTS_SCRIPT`] is served.
+pub const ACTS_PATH: &str = "/acts.js";
 
 /// The Inbox's count in the header, read again every 30 seconds while the
 /// page is open (W6.24, requirement 36): a poll, never a stream.
@@ -1254,10 +1392,214 @@ fn report_link(part: &str) -> String {
     )
 }
 
+/// The settings' sections, as rulings 447 and 448 group and name them: a
+/// group's label, then each item's id, words, address, icon and the other
+/// addresses that are it too. Every address stays what it was (449). FX
+/// pivot currencies (483) sits under Deployment beside the time zone.
+/// One item: its id, words, address, icon and its other addresses.
+type SidebarItem = (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static [&'static str],
+);
+
+const SIDEBAR: [(&str, &[SidebarItem]); 5] = [
+    (
+        "Plugins",
+        &[
+            ("plugins", "Plugins", "/admin#plugins", "grid", &[]),
+            (
+                "versions",
+                "Versions \u{b7} Browse \u{b7} Registries",
+                "/admin/plugins/versions?tab=installed",
+                "package",
+                &[
+                    "/admin/plugins/versions?tab=browse",
+                    "/admin/plugins/versions?tab=registries",
+                ],
+            ),
+            (
+                "model-routing",
+                "Model routing",
+                "/admin#model-routing",
+                "route",
+                &[],
+            ),
+        ],
+    ),
+    (
+        "People and access",
+        &[
+            (
+                "permissions",
+                "Permissions",
+                "/admin#permissions",
+                "shield",
+                &[],
+            ),
+            (
+                "user-groups",
+                "User groups",
+                "/admin#user-groups",
+                "users",
+                &[],
+            ),
+            (
+                "access-groups",
+                "Access groups",
+                "/admin#access-groups",
+                "key",
+                &[],
+            ),
+            (
+                "service-accounts",
+                "Service accounts",
+                "/admin#service-accounts",
+                "server",
+                &[],
+            ),
+            ("agents", "Agents", "/admin#agents", "bot", &[]),
+            (
+                "connected-clients",
+                "Connected clients",
+                "/admin#connected-clients",
+                "link",
+                &[],
+            ),
+        ],
+    ),
+    (
+        "Accounts",
+        &[
+            ("accounts", "Accounts", "/admin#accounts", "wallet", &[]),
+            (
+                "account-groups",
+                "Account groups",
+                "/admin#account-groups",
+                "layers",
+                &[],
+            ),
+            ("holds", "Holds", "/admin#holds", "lock", &[]),
+            (
+                "trading-instructions",
+                "Trading instructions",
+                "/admin/trading-instructions",
+                "list",
+                &[],
+            ),
+        ],
+    ),
+    (
+        "Data",
+        &[
+            (
+                "data-sources",
+                "Data sources",
+                "/admin/data-sources",
+                "database",
+                &[],
+            ),
+            (
+                "instruments",
+                "Instruments",
+                "/admin/instruments",
+                "chart",
+                &[],
+            ),
+        ],
+    ),
+    (
+        "Deployment",
+        &[
+            ("time-zone", "Time zone", "/admin#time-zone", "clock", &[]),
+            (
+                "fx-pivots",
+                "FX pivot currencies",
+                "/admin#fx-pivots",
+                "",
+                &[],
+            ),
+        ],
+    ),
+];
+
+/// The header bar's height, which the sticky sidebar sits under.
+const HEADER_HEIGHT: &str = "56px";
+
+/// The sidebar and the page beside it (kit 0.13.0's `om-sidebar`): its
+/// groups as data, and the same links as a plain list for a browser
+/// without the kit.
+pub fn shell(current: &str, body: &str) -> String {
+    let groups: Vec<serde_json::Value> = SIDEBAR
+        .iter()
+        .map(|(label, items)| {
+            serde_json::json!({
+                "label": label,
+                "items": items.iter().map(|(id, words, href, icon, also)| {
+                    let mut item = serde_json::json!({"id": id, "label": words, "href": href});
+                    if !icon.is_empty() {
+                        item["icon"] = serde_json::json!(icon);
+                    }
+                    if !also.is_empty() {
+                        item["also"] = serde_json::json!(also);
+                    }
+                    item
+                }).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    // Never "</" inside the script: the data is JSON, its slashes escaped.
+    let data = serde_json::json!({ "groups": groups })
+        .to_string()
+        .replace("</", "<\\/");
+    let links: String = SIDEBAR
+        .iter()
+        .map(|(label, items)| {
+            format!(
+                "<li>{}<ul>{}</ul></li>",
+                escape(label),
+                items
+                    .iter()
+                    .map(|(_, words, href, _, _)| format!(
+                        "<li><a href=\"{}\">{}</a></li>",
+                        escape(href),
+                        escape(words)
+                    ))
+                    .collect::<String>()
+            )
+        })
+        .collect();
+    let current = if current.is_empty() {
+        String::new()
+    } else {
+        format!(" current=\"{}\"", escape(current))
+    };
+    format!(
+        "<div class=\"om-shell\" style=\"--om-sidebar-top:{HEADER_HEIGHT}\">\
+         <om-sidebar label=\"Settings\" remember=\"admin\"{current}>\
+         <script type=\"application/json\">{data}</script>\
+         <nav aria-label=\"Settings\"><ul>{links}</ul></nav></om-sidebar>\
+         <div class=\"om-shell-main\">{body}</div></div>"
+    )
+}
+
 fn document(title: &str, body: &str, chrome: &Chrome, development: bool) -> String {
     let banner = if development { DEVELOPMENT_BANNER } else { "" };
+    // The settings' sidebar beside the page where the chrome asks for it.
+    let shelled;
+    let body = match chrome.sidebar {
+        Some(current) => {
+            shelled = shell(current, body);
+            shelled.as_str()
+        }
+        None => body,
+    };
     let kit = kit_links(body);
-    let main = if chrome.main.is_empty() {
+    let main = if chrome.sidebar.is_some() {
+        "shell"
+    } else if chrome.main.is_empty() {
         "sheet"
     } else {
         chrome.main
@@ -1267,7 +1609,7 @@ fn document(title: &str, body: &str, chrome: &Chrome, development: bool) -> Stri
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <meta name=\"color-scheme\" content=\"light dark\">\
          <title>{} · Open Meridian</title>{icon}<script>{HEAD_SCRIPT}</script>{kit}<style>{STYLE}{docs}{plugin_tables}</style></head><body>\n\
-         {}\n{banner}\n<main class=\"{main}\">\n{}\n</main>\n<script>{CHROME_SCRIPT}</script>{inbox}\n</body></html>\n",
+         {}\n{banner}\n<main class=\"{main}\">\n{}\n</main>\n<script>{CHROME_SCRIPT}</script><script src=\"{ACTS_PATH}\" defer></script>{inbox}\n</body></html>\n",
         escape(title),
         header(chrome),
         body,

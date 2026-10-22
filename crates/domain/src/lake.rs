@@ -16,7 +16,7 @@ use meridian_pb::bounds::{
     DATASET_DECLARATION_MODES_COUNT, DATASET_DECLARATION_VENDOR_LENGTH,
     DATASET_LICENCE_DEFAULT_FIELDS_COUNT, DATASET_LICENCE_RETENTION_DAYS_RANGE,
 };
-use meridian_pb::v1::{Catalogue, DatasetDeclaration, DatasetLicence, ObservationMode};
+use meridian_pb::v1::{Catalogue, DatasetDeclaration, DatasetLicence, DerivedUse, ObservationMode};
 
 /// A price of one kind for one subject.
 pub const PRICE: &str = "meridian.v1.Price";
@@ -31,13 +31,28 @@ pub const QUOTE: &str = "meridian.v1.Quote";
 /// An event contract's outcome at one stage (contract v23, the lake's 1c).
 pub const OUTCOME: &str = "meridian.v1.Outcome";
 
-/// The lake's data types: the 1a's, the 1b's from contract v19, and the
-/// 1c's outcome from contract v23.
-pub const DATA_TYPES: [&str; 5] = [PRICE, BAR, TRADE, QUOTE, OUTCOME];
+/// A fixing, an average, an index level or a curve point for one referential
+/// record (contract v27, the rates slice; W10.4).
+pub const RATE: &str = "meridian.v1.Rate";
+
+/// One execution's cost against one benchmark (contract v27, W10.11): the
+/// analytics component's row, in its own dataset, never a catalogue's.
+pub const EXECUTION_COST: &str = "meridian.v1.ExecutionCost";
+/// The dataset execution costs are recorded in (W10.11; ruling 481): the
+/// analytics component's, which no catalogue declares.
+pub const EXECUTION_COST_DATASET: &str = "analytics:execution_cost";
+/// The instance an execution cost's source names: the component.
+pub const ANALYTICS_INSTANCE: &str = "analytics";
+
+/// The lake's data types: the 1a's, the 1b's from contract v19, the 1c's
+/// outcome from contract v23, and the rates slice's rate from contract v27.
+pub const DATA_TYPES: [&str; 6] = [PRICE, BAR, TRADE, QUOTE, OUTCOME, RATE];
 
 /// The data types a default read takes a priority among (W10.3): an outcome
-/// is read from every dataset that holds it, with no default (contract v23).
-pub const PRIORITISED: [&str; 4] = [PRICE, BAR, TRADE, QUOTE];
+/// is read from every dataset that holds it, with no default (contract v23);
+/// a rate is read as prices are, under the source priority (contract v27,
+/// W10.6: FRED's 10-year point and Treasury's sit under one priority).
+pub const PRIORITISED: [&str; 5] = [PRICE, BAR, TRADE, QUOTE, RATE];
 
 const PRICE_FIELDS: [&str; 4] = [
     "meridian.v1.Price.meta",
@@ -83,6 +98,19 @@ const OUTCOME_FIELDS: [&str; 6] = [
     "meridian.v1.Outcome.determination_as_reported",
 ];
 
+const RATE_FIELDS: [&str; 10] = [
+    "meridian.v1.Rate.meta",
+    "meridian.v1.Rate.kind",
+    "meridian.v1.Rate.value",
+    "meridian.v1.Rate.convention",
+    "meridian.v1.Rate.tenor",
+    "meridian.v1.Rate.maturity_date",
+    "meridian.v1.Rate.preliminary",
+    "meridian.v1.Rate.volume",
+    "meridian.v1.Rate.transaction_count",
+    "meridian.v1.Rate.percentiles",
+];
+
 /// The dictionary entries of a data type's fields; none for one the lake
 /// does not have.
 pub fn fields_of(data_type: &str) -> &'static [&'static str] {
@@ -92,6 +120,7 @@ pub fn fields_of(data_type: &str) -> &'static [&'static str] {
         TRADE => &TRADE_FIELDS,
         QUOTE => &QUOTE_FIELDS,
         OUTCOME => &OUTCOME_FIELDS,
+        RATE => &RATE_FIELDS,
         _ => &[],
     }
 }
@@ -258,6 +287,52 @@ pub fn strip_quote(
     removed
 }
 
+/// [`strip_price`], for a rate (contract v27, the rates slice).
+pub fn strip_rate(
+    rate: &mut crate::v1::Rate,
+    allowed: &std::collections::BTreeSet<String>,
+) -> Vec<&'static str> {
+    let mut removed = Vec::new();
+    if allowed.is_empty() {
+        return removed;
+    }
+    let mut gone = |entry: &'static str| {
+        let gone = !allowed.contains(entry);
+        if gone {
+            removed.push(entry);
+        }
+        gone
+    };
+    if gone(RATE_FIELDS[1]) {
+        rate.kind = 0;
+    }
+    if gone(RATE_FIELDS[2]) {
+        rate.value = None;
+    }
+    if gone(RATE_FIELDS[3]) {
+        rate.convention = None;
+    }
+    if gone(RATE_FIELDS[4]) {
+        rate.tenor = None;
+    }
+    if gone(RATE_FIELDS[5]) {
+        rate.maturity_date.clear();
+    }
+    if gone(RATE_FIELDS[6]) {
+        rate.preliminary = false;
+    }
+    if gone(RATE_FIELDS[7]) {
+        rate.volume = None;
+    }
+    if gone(RATE_FIELDS[8]) {
+        rate.transaction_count = None;
+    }
+    if gone(RATE_FIELDS[9]) {
+        rate.percentiles.clear();
+    }
+    removed
+}
+
 /// [`strip_price`], for an outcome (contract v23).
 pub fn strip_outcome(
     outcome: &mut crate::v1::Outcome,
@@ -306,6 +381,26 @@ pub fn asset_key(money: Option<&crate::v1::Money>) -> String {
             }
         })
         .unwrap_or_default()
+}
+
+/// A rate's point and convention (contract v27, the rates slice): its tenor
+/// (count and unit) or exact maturity, and its convention (day count,
+/// compounding, periods a year), as one key. Beside the subject, dataset and
+/// kind it is what a rate's deliveries are conflated per (W10.5) and its
+/// latest chosen per (W10.6): two conventions for one tenor, a bill's
+/// discount and coupon-equivalent rates, are two keys.
+pub fn rate_point(rate: &crate::v1::Rate) -> String {
+    let tenor = rate
+        .tenor
+        .as_ref()
+        .map(|t| format!("{}:{}", t.count, t.unit))
+        .unwrap_or_default();
+    let convention = rate
+        .convention
+        .as_ref()
+        .map(|c| format!("{}:{}:{}", c.day_count, c.compounding, c.periods_per_year))
+        .unwrap_or_default();
+    format!("{tenor}|{}|{convention}", rate.maturity_date)
 }
 
 /// A quote's asset: its bid's, or its ask's where the bid side is empty.
@@ -379,13 +474,66 @@ pub fn effective_licence(
             dataset: dataset.to_string(),
             ..terms
         })
-        .unwrap_or(DatasetLicence {
-            dataset: dataset.to_string(),
-            kept: true,
-            derived_use: true,
-            display: true,
-            ..Default::default()
+        .unwrap_or_else(|| {
+            let mut licence = DatasetLicence {
+                dataset: dataset.to_string(),
+                kept: true,
+                display: true,
+                derived_use_terms: DerivedUse::NotRestricted as i32,
+                ..Default::default()
+            };
+            derived_use_both(&mut licence);
+            licence
         })
+}
+
+/// A licence's derived-data answer as read (contract v27, ruling 479): its
+/// `derived_use_terms`, or where that is unspecified the deprecated boolean,
+/// false as internal_only and true as not_restricted (ruling 180).
+#[allow(deprecated)]
+pub fn derived_use_terms(licence: &DatasetLicence) -> DerivedUse {
+    match DerivedUse::try_from(licence.derived_use_terms) {
+        Ok(DerivedUse::Unspecified) | Err(_) => {
+            if licence.derived_use {
+                DerivedUse::NotRestricted
+            } else {
+                DerivedUse::InternalOnly
+            }
+        }
+        Ok(terms) => terms,
+    }
+}
+
+/// The deprecated boolean as a v27 writer sets it beside the answer: false
+/// for internal_only, true for either other answer.
+pub fn derived_use_bool(licence: &DatasetLicence) -> bool {
+    derived_use_terms(licence) != DerivedUse::InternalOnly
+}
+
+/// A licence written from the dashboard's one box, "Derived data may be
+/// made", with both fields set (ruling 479): ticked is not_restricted,
+/// unticked internal_only.
+pub fn licence_with_derived_use(licence: DatasetLicence, derived: bool) -> DatasetLicence {
+    let mut licence = DatasetLicence {
+        derived_use_terms: if derived {
+            DerivedUse::NotRestricted
+        } else {
+            DerivedUse::InternalOnly
+        } as i32,
+        ..licence
+    };
+    derived_use_both(&mut licence);
+    licence
+}
+
+/// Sets both of a licence's derived-data fields from whichever it states
+/// (ruling 479: a v27 writer sets both): the answer where stated, else the
+/// boolean read as the answer.
+#[allow(deprecated)]
+pub fn derived_use_both(licence: &mut DatasetLicence) {
+    let terms = derived_use_terms(licence);
+    licence.derived_use_terms = terms as i32;
+    licence.derived_use = terms != DerivedUse::InternalOnly;
 }
 
 /// A dataset's ID in a deployment: its instance, a colon, and its key.
@@ -514,6 +662,13 @@ pub fn catalogue_refused(catalogue: &Catalogue, roles: &[String]) -> Option<Stri
             return Some(format!(
                 "{at}.data_types names no data type the lake has ({})",
                 DATA_TYPES.join(", ")
+            ));
+        }
+        // Contract v27 (W10.1; ruling 369): a delayed dataset's declared
+        // delay, 0 for real time, never negative.
+        if dataset.declared_delay_ns < 0 {
+            return Some(format!(
+                "{at}.declared_delay_ns is the delay the dataset is served at, 0 or more"
             ));
         }
         if !DATASET_DECLARATION_MODES_COUNT.admits(dataset.modes.len()) {
@@ -804,6 +959,7 @@ mod closed_day_tests {
                 to_date: "2027-02-01".into(),
             }),
             sources: vec![],
+            trading_sessions: None,
         }
     }
 
@@ -851,17 +1007,17 @@ mod closed_day_tests {
 
 /// W10.10 (contract v26): the kinds QueryLake answers, by the name its
 /// request spells.
-pub const QUERY_KINDS: [&str; 5] = ["prices", "bars", "trades", "quotes", "outcomes"];
+pub const QUERY_KINDS: [&str; 6] = ["prices", "bars", "trades", "quotes", "outcomes", "rates"];
 
 /// The lake kinds a role reads, as the reads' rows grant them (W10.10; the
 /// lake spec's Q6): prices, bars and outcomes for `reporting`, `portfolio`,
-/// `compliance` and `signal`; trades and quotes for `signal` and `ems`;
-/// trades for `data`; outcomes for `operations`. `reporting` reads no
-/// trades or quotes.
+/// `compliance` and `signal`, and from contract v27 rates, prices' readers
+/// (W10.6); trades and quotes for `signal` and `ems`; trades for `data`;
+/// outcomes for `operations`. `reporting` reads no trades or quotes.
 pub fn kinds_read_by(role: &str) -> &'static [&'static str] {
     match role {
-        "signal" => &["prices", "bars", "outcomes", "trades", "quotes"],
-        "reporting" | "portfolio" | "compliance" => &["prices", "bars", "outcomes"],
+        "signal" => &["prices", "bars", "outcomes", "rates", "trades", "quotes"],
+        "reporting" | "portfolio" | "compliance" => &["prices", "bars", "outcomes", "rates"],
         "ems" => &["trades", "quotes"],
         "data" => &["trades"],
         "operations" => &["outcomes"],
@@ -887,6 +1043,12 @@ mod query_kind_tests {
         for kind in QUERY_KINDS {
             assert!(roles_read_kind(&["signal".to_string()], kind), "{kind}");
         }
+        // Contract v27: prices' readers read rates; ems and data do not.
+        for role in ["reporting", "portfolio", "compliance", "signal"] {
+            assert!(roles_read_kind(&[role.to_string()], "rates"), "{role}");
+        }
+        assert!(!roles_read_kind(&["ems".to_string()], "rates"));
+        assert!(!roles_read_kind(&["data".to_string()], "rates"));
         assert!(roles_read_kind(
             &["custody".to_string(), "data".to_string()],
             "trades"

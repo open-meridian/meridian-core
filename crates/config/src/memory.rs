@@ -36,6 +36,7 @@ pub struct MemoryStore {
     reports_usage: Mutex<Vec<(bool, Author, i64)>>,
     /// Contract v26 (W6.35): the time zone's changes.
     time_zones: Mutex<Vec<(String, Author, i64)>>,
+    fx_pivots: Mutex<Vec<(Vec<String>, Author, i64)>>,
     /// Contract v26 (W12.6): the routing table's changes.
     model_routing: Mutex<Vec<crate::store::ModelRoutingChange>>,
     usage_reports: Mutex<Vec<meridian_domain::v1::SentUsageReport>>,
@@ -91,6 +92,7 @@ impl MemoryStore {
             holds: Mutex::new(Vec::new()),
             reports_usage: Mutex::new(Vec::new()),
             time_zones: Mutex::new(Vec::new()),
+            fx_pivots: Mutex::new(Vec::new()),
             model_routing: Mutex::new(Vec::new()),
             usage_reports: Mutex::new(Vec::new()),
             registry: Mutex::new(None),
@@ -1174,6 +1176,33 @@ impl Store for MemoryStore {
             .last()
             .map(|(zone, author, at)| crate::store::TimeZoneChange {
                 zone: zone.clone(),
+                changed_at_ns: *at,
+                changed_by: author.by.clone(),
+            }))
+    }
+
+    fn set_fx_pivot_currencies(
+        &self,
+        pivots: &[String],
+        author: &Author,
+        at_ns: i64,
+    ) -> Result<()> {
+        self.fx_pivots.lock().expect("store lock poisoned").push((
+            pivots.to_vec(),
+            author.clone(),
+            at_ns,
+        ));
+        Ok(())
+    }
+
+    fn fx_pivot_currencies(&self) -> Result<Option<crate::store::FxPivotChange>> {
+        Ok(self
+            .fx_pivots
+            .lock()
+            .expect("store lock poisoned")
+            .last()
+            .map(|(pivots, author, at)| crate::store::FxPivotChange {
+                fx_pivot_currencies: pivots.clone(),
                 changed_at_ns: *at,
                 changed_by: author.by.clone(),
             }))

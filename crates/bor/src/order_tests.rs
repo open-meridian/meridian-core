@@ -25,6 +25,8 @@ const ACC: &str = "ACC-1";
 const OTHER: &str = "ACC-2";
 const AAPL: &str = "INS-01J8XQ4M7K0000000000AAPL";
 const NOCCY: &str = "INS-01J8XQ4M7K00000000NOCCY";
+/// A referential record (contract v27): SOFR, which the lake observes.
+const SOFR: &str = "INS-01J8XQ4M7K000000000SOFR";
 /// The order tests' cash, in a currency no other test of this process
 /// resolves: the code's instrument is learned process-wide (contract v18).
 const CHF: &str = "INS-01J8XQ4M7K00000000CASHCHF";
@@ -68,6 +70,7 @@ fn wired() -> Wired {
         let instrument = match asked.instrument_id.as_str() {
             AAPL => Some(record(AssetClass::Equity, "CHF")),
             NOCCY => Some(record(AssetClass::Equity, "")),
+            SOFR => Some(record(AssetClass::Referential, "USD")),
             CHF => Some(record(AssetClass::Cash, "CHF")),
             EUR => Some(record(AssetClass::Cash, "EUR")),
             LOCAL | RESOLVING => Some(InstrumentRecord {
@@ -502,6 +505,17 @@ async fn a_proposal_is_proposed_entered_by_its_user_and_names_what_its_instrumen
     assert_eq!(
         meridian_bus::refusal_fields(&refused),
         vec!["instrument.currency"]
+    );
+
+    // A referential record is never held (contract v27, W9.10, W11.1):
+    // INVALID_ARGUMENT naming instrument_id, though the record is complete.
+    let mut observed = buy("10");
+    observed.instrument_id = SOFR.into();
+    let refused = propose(&w, &observed).await.unwrap_err();
+    assert_eq!(code(&refused), None);
+    assert_eq!(
+        status_of(&refused).unwrap().1,
+        vec!["instrument_id".to_string()]
     );
 
     let nobody = send_from(
@@ -3269,3 +3283,139 @@ async fn an_fx_orders_amended_limit_stays_in_its_quote_currency() {
 
 #[path = "booking_tests.rs"]
 mod booking;
+
+// ── Contract v27: the placement type, an RFQ's quotes and FX netting ───────
+
+#[path = "order_path_v27_tests.rs"]
+mod order_path_v27;
+
+// ── Contract v27 (W11.7, W11.8; rulings 374 and 420): checks at use ────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_reference_holds_the_order_typed_or_rides_its_placement() {
+    let w = wired();
+    let order = released(&w, "10").await;
+    let stale = StaleReference {
+        dataset: "oanda-1:pricing".into(),
+        age_ns: 7_200_000_000,
+        ceiling_ns: 5_000_000_000,
+    };
+    let hold = |condition: OrderCondition, cause: HoldCause, stale: Option<StaleReference>| {
+        SetWorkingConditionRequest {
+            order_id: order.order_id.clone(),
+            condition: condition as i32,
+            set: true,
+            reason: "the reference price is stale".into(),
+            hold_cause: cause as i32,
+            stale_reference: stale,
+            ..Default::default()
+        }
+    };
+    let send = |request: SetWorkingConditionRequest| {
+        let w = &w;
+        async move {
+            order_command(
+                w,
+                SET_WORKING_CONDITION,
+                "meridian.v1.SetWorkingConditionRequest",
+                &request,
+                &person(TRADER),
+            )
+            .await
+        }
+    };
+    // A cause on any condition but held, or with no stale reference, is
+    // refused naming the field; a stale reference with no cause too.
+    let refused = send(hold(
+        OrderCondition::Claimed,
+        HoldCause::ReferencePriceStale,
+        Some(stale.clone()),
+    ))
+    .await
+    .unwrap_err();
+    assert_eq!(
+        status_of(&refused).unwrap().1,
+        vec!["hold_cause".to_string()]
+    );
+    let refused = send(hold(
+        OrderCondition::Held,
+        HoldCause::ReferencePriceStale,
+        None,
+    ))
+    .await
+    .unwrap_err();
+    assert_eq!(
+        status_of(&refused).unwrap().1,
+        vec!["stale_reference".to_string()]
+    );
+    let refused = send(hold(
+        OrderCondition::Held,
+        HoldCause::Unspecified,
+        Some(stale.clone()),
+    ))
+    .await
+    .unwrap_err();
+    assert_eq!(
+        status_of(&refused).unwrap().1,
+        vec!["stale_reference".to_string()]
+    );
+    // Held with its typed cause, read typed.
+    let held = send(hold(
+        OrderCondition::Held,
+        HoldCause::ReferencePriceStale,
+        Some(stale.clone()),
+    ))
+    .await
+    .unwrap()
+    .order
+    .unwrap();
+    let condition = held
+        .status
+        .unwrap()
+        .conditions
+        .into_iter()
+        .find(|c| c.condition == OrderCondition::Held as i32)
+        .unwrap();
+    assert_eq!(condition.hold_cause, HoldCause::ReferencePriceStale as i32);
+    assert_eq!(condition.stale_reference.unwrap(), stale);
+    // Released from the hold, a warned placement carries the warning.
+    send(SetWorkingConditionRequest {
+        set: false,
+        ..hold(OrderCondition::Held, HoldCause::Unspecified, None)
+    })
+    .await
+    .unwrap();
+    let placed = send_from(
+        &w.bus,
+        CREATE_PLACEMENT,
+        "meridian.v1.CreatePlacementRequest",
+        &CreatePlacementRequest {
+            order_id: order.order_id.clone(),
+            connectivity_instance_id: ME.into(),
+            venue_account_code: "SNAP-ACCT-9F2".into(),
+            quantity: d("10"),
+            limit_price: usd("227.50"),
+            stale_reference: Some(stale.clone()),
+            ..Default::default()
+        },
+        &person(TRADER),
+    )
+    .await
+    .map(|reply| PlacementReply::decode(&reply[..]).unwrap())
+    .unwrap()
+    .placement
+    .unwrap();
+    let warned = placed
+        .status
+        .unwrap()
+        .conditions
+        .into_iter()
+        .find(|c| c.condition == PlacementCondition::SentOnStaleReference as i32)
+        .expect("the warning kept on the placement");
+    assert_eq!(warned.stale_reference.unwrap(), stale);
+    assert!(
+        warned.reason.contains("2.2 s past its ceiling"),
+        "{}",
+        warned.reason
+    );
+}

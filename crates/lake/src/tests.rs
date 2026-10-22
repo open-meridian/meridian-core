@@ -245,6 +245,8 @@ fn read(
                 page_size: 0,
                 cursor: String::new(),
                 after: None,
+                tenors: Vec::new(),
+                published_as_of_ns: 0,
             },
             &envelope(reader, reader != "dashboard-1", ""),
         )
@@ -448,6 +450,8 @@ async fn a_reader_not_entitled_is_refused_per_dataset_and_a_field_it_may_not_rea
                 page_size: 0,
                 cursor: String::new(),
                 after: None,
+                tenors: Vec::new(),
+                published_as_of_ns: 0,
             },
             &envelope("reporting-1", true, ""),
         )
@@ -581,13 +585,16 @@ async fn a_read_not_answered_is_wanted_once_for_two_readers_answered_and_a_decli
 /// A provisional record (contract v24).
 const LOCAL: &str = "LCL-01J8LOCAL0000000000000000";
 
-/// Contract v24 (W10.6, W10.7): a local line is never priced, so its
-/// subject is never wanted; another subject in the same read still is.
+/// Contract v27 (ruling 484; W10.6, W10.7): a read naming a provisional
+/// (`LCL-`) subject the lake does not keep is wanted of its data plugin, as
+/// any other subject is -- never answered ASKED_SOURCE without the want
+/// sent -- and the rows recorded against it are followed to the `INS-`
+/// record it becomes.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_local_lines_subject_is_never_wanted() {
+async fn a_provisional_subject_is_wanted_and_followed_to_the_record_it_becomes() {
     let h = harness();
     let mut wanted = h.bus.subscribe_every(service::OBSERVATIONS_WANTED);
-    read(
+    let answer = read(
         &h,
         "reporting-1",
         &[LOCAL],
@@ -595,24 +602,47 @@ async fn a_local_lines_subject_is_never_wanted() {
         SourceChoice::default(),
         0,
     );
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(150), wanted.recv())
-            .await
-            .is_err(),
-        "nothing wanted for a provisional record"
-    );
-    read(
+    assert!(answer
+        .unanswered
+        .iter()
+        .any(|u| u.reason == UnansweredReason::AskedSource as i32));
+    let want = ObservationsWantedEvent::decode(&wanted.recv().await.unwrap().envelope.payload[..])
+        .unwrap();
+    let subjects: Vec<&str> = want.subjects.iter().map(|s| s.entity_id.as_str()).collect();
+    assert_eq!(subjects, vec![LOCAL]);
+    // The data plugin answers it by the record's identifiers, then the
+    // record is resolved to the platform's: the row is followed.
+    record(
+        &h,
+        "coinbase-1",
+        vec![close("coinbase-1", "k", LOCAL, "2026-10-07", "3")],
+        &want.want_id,
+    )
+    .unwrap();
+    h.lake.hear(Envelope {
+        meta: None,
+        payload_type: "meridian.v1.InstrumentReplacedEvent".into(),
+        payload: InstrumentReplacedEvent {
+            replaced_instrument_id: LOCAL.into(),
+            instrument: Some(InstrumentRecord {
+                instrument_id: AAPL.into(),
+                ..Default::default()
+            }),
+            replaced_at_ns: NOW,
+            ..Default::default()
+        }
+        .encode_to_vec(),
+    });
+    let followed = read(
         &h,
         "reporting-1",
-        &[LOCAL, BTC],
+        &[AAPL],
         "2026-10-07",
         SourceChoice::default(),
         0,
     );
-    let want = ObservationsWantedEvent::decode(&wanted.recv().await.unwrap().envelope.payload[..])
-        .unwrap();
-    let subjects: Vec<&str> = want.subjects.iter().map(|s| s.entity_id.as_str()).collect();
-    assert_eq!(subjects, vec![BTC]);
+    assert_eq!(followed.rows.len(), 1);
+    assert_eq!(followed.rows[0].subject(), LOCAL, "the row as recorded");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -945,6 +975,8 @@ async fn a_read_with_an_invalid_date_or_two_times_is_refused_and_misses_are_coun
         page_size: 0,
         cursor: String::new(),
         after: None,
+        tenors: Vec::new(),
+        published_as_of_ns: 0,
     };
     let invalid = tokio::task::block_in_place(|| {
         h.lake
@@ -1103,6 +1135,8 @@ fn live_read(
                 page_size: 0,
                 cursor: String::new(),
                 after,
+                tenors: Vec::new(),
+                published_as_of_ns: 0,
             },
             &envelope("signal-1", true, ""),
         )
@@ -1519,6 +1553,7 @@ fn outcome(
             code: "yes".into(),
             text: String::new(),
         }),
+        challenge_ends_at_ns: 0,
     }
 }
 
@@ -1644,6 +1679,8 @@ async fn an_outcome_is_restated_per_stage_every_version_heard_and_read_as_of_or_
             page_size: 0,
             cursor: String::new(),
             after: None,
+            tenors: Vec::new(),
+            published_as_of_ns: 0,
         },
         &envelope("reporting-1", true, "")
     ))
@@ -1731,6 +1768,7 @@ fn calendar_held(h: &Harness) -> Arc<std::sync::atomic::AtomicI64> {
                 to_date: "2027-02-01".into(),
             }),
             sources: vec![],
+            trading_sessions: None,
         };
         Ok((
             "meridian.v1.ReadCalendarReply".into(),
@@ -1766,6 +1804,7 @@ fn kept_rows(h: &Harness, as_of_ns: i64) -> Vec<Observation> {
                 until_ns: 0,
             },
             as_of_ns,
+            published_as_of_ns: 0,
         })
         .unwrap()
 }
@@ -1879,6 +1918,7 @@ async fn a_daily_value_on_a_closed_day_is_recorded_flagged_and_counted() {
                 until_ns: 0,
             },
             as_of_ns: 0,
+            published_as_of_ns: 0,
         })
         .unwrap();
     assert!(kraken[0].meta().closed_day.is_none());
@@ -2106,4 +2146,178 @@ fn a_jobs_read_is_the_clients_and_the_field_is_the_analytics_components_alone() 
         crate::service::reader_of(&on_behalf(crate::service::ANALYTICS, "")),
         crate::config::Reader::Plugin(crate::service::ANALYTICS.into())
     );
+}
+
+/// Contract v27 (W10.11; ruling 481): execution costs are the analytics
+/// component's alone to record, keyed by execution and benchmark -- the same
+/// value a repeat, another the next version -- and read for one account,
+/// within the reader's scope, by execution, order, trade date or benchmark.
+#[tokio::test(flavor = "multi_thread")]
+async fn execution_costs_are_the_components_rows_read_within_the_readers_account_scope() {
+    use meridian_domain::v1::{
+        ExecutionCost, ListExecutionCostsRequest, RecordExecutionCostsRequest, TcaBenchmark,
+    };
+    let h = harness();
+    let cost = |execution: &str, account: &str, benchmark: TcaBenchmark, bps: &str| ExecutionCost {
+        meta: Some(ObservationMeta {
+            subjects: vec![SubjectRef {
+                entity_id: BTC.into(),
+            }],
+            business_date: "2026-10-07".into(),
+            valid_from_ns: NOW,
+            ..Default::default()
+        }),
+        execution_id: execution.into(),
+        order_id: format!("ORD-{execution}"),
+        account_id: account.into(),
+        benchmark: benchmark as i32,
+        benchmark_price: money("62000.00", "USD", ""),
+        execution_price: money("62010.00", "USD", ""),
+        notional: money("62010.00", "USD", ""),
+        cost_bps: decimal(bps),
+        ..Default::default()
+    };
+    let batch = RecordExecutionCostsRequest {
+        costs: vec![
+            cost("EXE-1", "ACC-1", TcaBenchmark::Arrival, "1.6129"),
+            cost("EXE-1", "ACC-1", TcaBenchmark::MidAtFill, "1.6129"),
+            cost("EXE-2", "ACC-2", TcaBenchmark::Arrival, "1.6129"),
+        ],
+    };
+    // Not the component: refused.
+    let refused = h
+        .lake
+        .record_execution_costs(batch.clone(), &envelope("reporting-1", true, ""))
+        .unwrap_err();
+    assert!(refused.contains("analytics component"), "{refused}");
+    let done = h
+        .lake
+        .record_execution_costs(batch.clone(), &envelope(service::ANALYTICS, false, ""))
+        .unwrap();
+    assert_eq!(done.recorded, 3);
+    let again = h
+        .lake
+        .record_execution_costs(batch, &envelope(service::ANALYTICS, false, ""))
+        .unwrap();
+    assert_eq!((again.recorded, again.unchanged), (0, 3), "a repeat");
+    let changed = cost("EXE-1", "ACC-1", TcaBenchmark::Arrival, "2.0000");
+    let restated = h
+        .lake
+        .record_execution_costs(
+            RecordExecutionCostsRequest {
+                costs: vec![changed],
+            },
+            &envelope(service::ANALYTICS, false, ""),
+        )
+        .unwrap();
+    assert_eq!(restated.restated, 1, "another value is the next version");
+
+    let mut scoped = envelope("reporting-1", true, "");
+    scoped.meta.as_mut().unwrap().account_scope = vec!["ACC-1".into()];
+    let read = h
+        .lake
+        .list_execution_costs(
+            ListExecutionCostsRequest {
+                account_id: "ACC-1".into(),
+                ..Default::default()
+            },
+            &scoped,
+        )
+        .unwrap();
+    assert_eq!(read.costs.len(), 2, "ACC-1's rows alone");
+    assert!(read.costs.iter().all(|c| c.account_id == "ACC-1"));
+    let arrival = read
+        .costs
+        .iter()
+        .find(|c| c.benchmark == TcaBenchmark::Arrival as i32)
+        .unwrap();
+    assert_eq!(arrival.meta.as_ref().unwrap().version, 2);
+    let one = h
+        .lake
+        .list_execution_costs(
+            ListExecutionCostsRequest {
+                account_id: "ACC-1".into(),
+                benchmarks: vec![TcaBenchmark::MidAtFill as i32],
+                trade_date: "2026-10-07".into(),
+                ..Default::default()
+            },
+            &scoped,
+        )
+        .unwrap();
+    assert_eq!(one.costs.len(), 1);
+    let outside = h
+        .lake
+        .list_execution_costs(
+            ListExecutionCostsRequest {
+                account_id: "ACC-2".into(),
+                ..Default::default()
+            },
+            &scoped,
+        )
+        .unwrap_err();
+    let (status, fields, _) = meridian_bus::read_refusal_status(&outside).unwrap();
+    assert_eq!(status, meridian_bus::RefusalStatus::PermissionDenied);
+    assert_eq!(fields, vec!["account_id".to_string()]);
+}
+
+/// Contract v27 (W10.4, W10.5, W10.9; ruling 418): a dataset's liveness,
+/// kept latest per dataset and venue, published on the dataset's subject,
+/// answered in the listing; another instance's dataset refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_datasets_liveness_is_kept_published_and_listed() {
+    use meridian_domain::v1::{DatasetLiveness, LivenessRecordedEvent, RecordLivenessRequest};
+    let h = harness();
+    let mut heard = h
+        .bus
+        .subscribe_every("platform.lake.coinbase-1:daily.event.liveness-recorded");
+    let alive = |dataset: &str, at: i64| DatasetLiveness {
+        dataset: dataset.into(),
+        venue_id: "VEN-01JA0000000000000CBEXC".into(),
+        alive_at_ns: at,
+        instance: "someone-else".into(),
+    };
+    let record = |items: Vec<DatasetLiveness>| {
+        tokio::task::block_in_place(|| {
+            h.lake.record_liveness(
+                RecordLivenessRequest { liveness: items },
+                &envelope("coinbase-1", true, ""),
+            )
+        })
+    };
+    let kept = record(vec![alive("coinbase-1:daily", NOW - 5)]).unwrap();
+    assert_eq!(kept.kept, 1);
+    let event = LivenessRecordedEvent::decode(&heard.recv().await.unwrap().envelope.payload[..])
+        .unwrap()
+        .liveness
+        .unwrap();
+    assert_eq!(event.alive_at_ns, NOW - 5);
+    assert_eq!(event.instance, "coinbase-1", "whose it is, the lake's word");
+    // An earlier one heard late changes nothing.
+    assert_eq!(
+        record(vec![alive("coinbase-1:daily", NOW - 9)])
+            .unwrap()
+            .kept,
+        0
+    );
+    // Another instance's dataset, and no time, are refused naming the item.
+    let refused = record(vec![alive("kraken-1:daily", NOW)]).unwrap_err();
+    assert!(refused.starts_with("liveness[0].dataset"), "{refused}");
+    let refused = record(vec![alive("coinbase-1:daily", 0)]).unwrap_err();
+    assert!(refused.starts_with("liveness[0].alive_at_ns"), "{refused}");
+    let listed =
+        tokio::task::block_in_place(|| h.lake.list_datasets(&envelope("dashboard-1", false, "")))
+            .unwrap();
+    let daily = listed
+        .datasets
+        .iter()
+        .find(|d| d.dataset == "coinbase-1:daily")
+        .unwrap();
+    assert_eq!(daily.liveness.len(), 1);
+    assert_eq!(daily.liveness[0].alive_at_ns, NOW - 5);
+    let kraken = listed
+        .datasets
+        .iter()
+        .find(|d| d.dataset == "kraken-1:daily")
+        .unwrap();
+    assert!(kraken.liveness.is_empty());
 }

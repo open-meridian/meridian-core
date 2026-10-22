@@ -1468,11 +1468,16 @@ async fn each_section_adds_with_a_short_button_and_its_dialog_says_what_is_made(
         );
         assert!(!part.contains(&format!(">{title}</button>")), "{section}");
     }
-    // The tabs still say which groups.
-    let tabs = between(&body, "<nav class=\"tabs\">", "</nav>");
+    // The settings' sidebar says which groups (rulings 447 and 448), its
+    // plain links there for a browser without the kit.
+    let sidebar = between(&body, "<nav aria-label=\"Settings\">", "</nav>");
     for tab in ["User groups", "Account groups", "Access groups"] {
-        assert!(tabs.contains(&format!(">{tab}</a>")), "{tab}");
+        assert!(sidebar.contains(&format!(">{tab}</a>")), "{tab}");
     }
+    assert!(
+        body.contains("<om-sidebar label=\"Settings\" remember=\"admin\">"),
+        "{body}"
+    );
 }
 
 type Asked = Arc<Mutex<Vec<(SetPluginSettingsRequest, String)>>>;
@@ -3192,8 +3197,8 @@ fn an_optional_secret_is_removed_by_its_own_small_form_and_nothing_else_is_sent(
     // The settings form posted as it stands, its secrets empty, sends nothing.
     let main = between(&form, "data-settings>", "</form>");
     assert_eq!(settings::request(&record, &submitted(main), false), None);
-    // The script asks before a Remove posts.
-    assert!(form.contains("indexOf(\"remove-\") === 0 && !window.confirm(asking)"));
+    // A Remove asks first, in the chrome's dialog (351's audit).
+    assert!(form.contains("data-confirm=\"Remove "), "{form}");
 }
 
 /// Contract v26 (W4.5, W4.8): the Summary's model tokens, per endpoint,

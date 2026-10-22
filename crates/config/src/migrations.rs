@@ -165,6 +165,12 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0023_model_routing.sql"),
         then: None,
     },
+    Migration {
+        version: 24,
+        name: "fx_pivot_currencies",
+        sql: include_str!("../migrations/0024_fx_pivot_currencies.sql"),
+        then: None,
+    },
 ];
 
 /// Migration 18 (contract v22; W11.21, decisions/031): each instance holding

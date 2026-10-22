@@ -23,8 +23,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use meridian_domain::exact::Exact;
 use meridian_domain::v1::{
     AccountAttributes, AccountFigures, BookPosition, Break, Encumbrance, Execution, FreeBasis,
-    HoldingSide, JournalRef, Locate, Lot, MarginAgreementRef, MovementLine, OpeningSource, Order,
-    PendingSettlement, PendingState, Placement, SettlementBucket, TradingInstruction, UnplacedFact,
+    HoldingSide, JournalRef, Locate, Lot, LotRelief, MarginAgreementRef, Money, MovementLine,
+    OpeningSource, Order, PendingSettlement, PendingState, Placement, SettlementBucket,
+    TradingInstruction, UnplacedFact,
 };
 use meridian_pb::v1::RefusalReason;
 
@@ -699,9 +700,17 @@ impl Book {
             .iter()
             .map(|line| (line.instrument_id.clone(), line.side, line.sleeve.clone()))
             .collect();
+        // Contract v27 (W9.10; rulings 320 and 396): what the entry sold
+        // each instrument at -- its execution's price, or a booking's
+        // average price -- so each relief records its proceeds.
+        let sales = sales_of(body, &entry.meta.effective_date, &self.account_id);
         for line in &body.lines {
             let key = (line.instrument_id.clone(), line.side, line.sleeve.clone());
             let reference = refs[&key].clone();
+            let sale = sales
+                .iter()
+                .find(|(instrument, _, _)| crate::became::same(instrument, &line.instrument_id))
+                .map(|(_, price, date)| (price, date.as_str()));
             let quantity = numbers::required(
                 &format!("the line on {}'s quantity", line.instrument_id),
                 line.quantity.as_ref(),
@@ -723,6 +732,7 @@ impl Book {
                 &reference,
                 entry.first_sequence,
                 lenient,
+                sale,
             )?;
         }
 
@@ -1192,8 +1202,66 @@ pub fn side_named(side: i32) -> &'static str {
     }
 }
 
+/// What an entry sold each instrument at (W9.10, contract v27): a fill's
+/// price and trade date, an allocation received at its average price on the
+/// entry's date, or a booking's own allocation. None for an entry with no
+/// execution behind it -- a transfer, a correction -- whose reliefs carry no
+/// proceeds.
+fn sales_of(body: &Body, effective_date: &str, account_id: &str) -> Vec<(String, Money, String)> {
+    use crate::orders::Act;
+    let mut out = Vec::new();
+    for act in &body.acts {
+        match act {
+            Act::Executed { execution, .. } => {
+                let fills = execution
+                    .quantity
+                    .as_ref()
+                    .and_then(|q| Exact::from_wire(q).ok())
+                    .is_some_and(|q| !q.is_zero());
+                if let (true, Some(price)) = (fills, execution.price.as_ref()) {
+                    out.push((
+                        execution.instrument_id.clone(),
+                        price.clone(),
+                        execution.trade_date.clone(),
+                    ));
+                }
+            }
+            Act::AllocationReceived { allocation, .. } => {
+                if let Some(price) = allocation.average_price.as_ref() {
+                    out.push((String::new(), price.clone(), effective_date.to_string()));
+                }
+            }
+            Act::BookingOpened { booking, .. } => {
+                for allocation in &booking.allocations {
+                    if allocation.account_id == account_id {
+                        if let Some(price) = allocation.average_price.as_ref() {
+                            out.push((String::new(), price.clone(), effective_date.to_string()));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // An allocation names no instrument: it is the entry's one traded.
+    let traded = body
+        .lines
+        .iter()
+        .find(|line| line.opens_lot.is_some() || !line.lot_id.is_empty())
+        .map(|line| line.instrument_id.clone())
+        .unwrap_or_default();
+    for sale in &mut out {
+        if sale.0.is_empty() {
+            sale.0 = traded.clone();
+        }
+    }
+    out
+}
+
 /// A line's lot: opened, carried in from another position, added to within
-/// the entry that opened it, or relieved.
+/// the entry that opened it, or relieved; a relief recorded with what the
+/// quantity relieved was sold for, where the entry sold it (contract v27).
+#[allow(clippy::too_many_arguments)]
 fn apply_lot(
     position: &mut PositionState,
     line: &MovementLine,
@@ -1202,6 +1270,7 @@ fn apply_lot(
     reference: &JournalRef,
     entry_sequence: u64,
     lenient: bool,
+    sale: Option<(&Money, &str)>,
 ) -> Result<()> {
     if let Some(terms) = &line.opens_lot {
         if line.lot_id.is_empty() {
@@ -1235,6 +1304,7 @@ fn apply_lot(
                     relieved_by: Vec::new(),
                     adjusted_by: Vec::new(),
                     sleeve: line.sleeve.clone(),
+                    reliefs: Vec::new(),
                 },
                 opened_in: entry_sequence,
                 ordinal: position.opened_lots,
@@ -1279,9 +1349,60 @@ fn apply_lot(
         )?;
         state.lot.original_quantity =
             numbers::wire(numbers::add("lots.original_quantity", original, quantity)?);
-    } else if magnitude_below(after, open) && state.lot.relieved_by.last() != Some(reference) {
-        state.lot.relieved_by.push(reference.clone());
+    } else if magnitude_below(after, open) {
+        if state.lot.relieved_by.last() != Some(reference) {
+            state.lot.relieved_by.push(reference.clone());
+        }
+        let relieved = numbers::add("relief", open, after.negated())?;
+        let relieved = if relieved.is_negative() {
+            relieved.negated()
+        } else {
+            relieved
+        };
+        record_relief(&mut state.lot, reference, relieved, sale)?;
     }
+    Ok(())
+}
+
+/// One relief of a lot (W9.10, contract v27): the entry, the quantity, and
+/// its proceeds where the entry sold it; two lines of one entry relieving
+/// the same lot are one relief.
+fn record_relief(
+    lot: &mut Lot,
+    reference: &JournalRef,
+    relieved: Exact,
+    sale: Option<(&Money, &str)>,
+) -> Result<()> {
+    let proceeds = |quantity: Exact| -> Result<Option<Money>> {
+        let Some((price, _)) = sale else {
+            return Ok(None);
+        };
+        let Some(unit) = price.amount.as_ref().and_then(|a| Exact::from_wire(a).ok()) else {
+            return Ok(None);
+        };
+        let amount = crate::orders::multiply("a relief's proceeds", quantity, unit)?;
+        Ok(Some(Money {
+            amount: numbers::wire(amount),
+            ..price.clone()
+        }))
+    };
+    if let Some(last) = lot
+        .reliefs
+        .last_mut()
+        .filter(|last| last.relieved_by.as_ref() == Some(reference))
+    {
+        let before = numbers::required("relief.quantity", last.quantity.as_ref())?;
+        let total = numbers::add("relief.quantity", before, relieved)?;
+        last.quantity = numbers::wire(total);
+        last.proceeds = proceeds(total)?;
+        return Ok(());
+    }
+    lot.reliefs.push(LotRelief {
+        relieved_by: Some(reference.clone()),
+        quantity: numbers::wire(relieved),
+        proceeds: proceeds(relieved)?,
+        trade_date: sale.map(|(_, date)| date.to_string()).unwrap_or_default(),
+    });
     Ok(())
 }
 

@@ -100,6 +100,11 @@ pub const SET_REPORTS_USAGE: &str = "platform.config.command.set-reports-usage";
 /// W6.35 (contract v26): the deployment's time zone, set and read.
 pub const SET_DEPLOYMENT_TIME_ZONE: &str = "platform.config.command.set-deployment-time-zone";
 pub const READ_DEPLOYMENT_TIME_ZONE: &str = "platform.config.query.read-deployment-time-zone";
+// Contract v27 (W6.36; ruling 483): the deployment's FX pivot currencies.
+pub const SET_FX_PIVOT_CURRENCIES: &str = "platform.config.command.set-fx-pivot-currencies";
+pub const READ_FX_PIVOT_CURRENCIES: &str = "platform.config.query.read-fx-pivot-currencies";
+/// The most pivots a deployment orders (W6.36).
+pub const MOST_PIVOTS: usize = 4;
 /// W12.6 (contract v26; ruling 285): the analytics routing table, held here.
 pub const SET_MODEL_ROUTING: &str = "platform.analytics.command.set-model-routing";
 pub const LIST_MODEL_ROUTING: &str = "platform.analytics.query.list-model-routing";
@@ -486,6 +491,21 @@ fn runs_pricing(snapshot: &Snapshot, instance: &str) -> bool {
     holds && (launched || reported)
 }
 
+/// The pivots in force, as the read answers them (W6.36): the latest
+/// change's, or never set, none, with no change -- read as USD's cash
+/// instrument and then EUR's, which each reader names by the codes its own
+/// stores answer (the conductor resolves no code).
+pub fn fx_pivot_setting(
+    held: Option<crate::store::FxPivotChange>,
+) -> meridian_domain::v1::FxPivotCurrenciesSetting {
+    let held = held.unwrap_or_default();
+    meridian_domain::v1::FxPivotCurrenciesSetting {
+        fx_pivot_currencies: held.fx_pivot_currencies,
+        changed_at_ns: held.changed_at_ns,
+        changed_by: held.changed_by,
+    }
+}
+
 /// W7.5 (contract v26): the zone the wizard was told, recorded once as the
 /// first change, naming the administrator the wizard was told (`by`; the
 /// first run itself where none), where nothing set one before. Says
@@ -832,6 +852,36 @@ impl Context {
             self.announce(&before)?;
         }
         Ok(changed_tables)
+    }
+
+    /// A record by its ID, as the instrument store answers it from a
+    /// handler's blocking thread; `None` where it holds none.
+    fn instrument_record(
+        &self,
+        instrument_id: &str,
+    ) -> Result<Option<meridian_domain::v1::InstrumentRecord>, String> {
+        let handle = tokio::runtime::Handle::try_current().map_err(|failed| failed.to_string())?;
+        let (payload_type, payload) = handle
+            .block_on(
+                self.bus.call(
+                    RESOLVE_INSTRUMENT,
+                    "meridian.v1.ResolveInstrumentRequest",
+                    ResolveInstrumentRequest {
+                        instrument_id: instrument_id.to_string(),
+                        as_of_ns: self.clock.now_ns(),
+                    }
+                    .encode_to_vec(),
+                    None,
+                    Some(INSTRUMENT_WAIT),
+                ),
+            )
+            .map_err(|failed| failed.to_string())?;
+        if payload_type != "meridian.v1.ResolveInstrumentReply" {
+            return Err(format!("the instrument store answered {payload_type}"));
+        }
+        let reply =
+            ResolveInstrumentReply::decode(&payload[..]).map_err(|failed| failed.to_string())?;
+        Ok(reply.instrument.filter(|_| reply.found))
     }
 
     /// Whether the instrument store holds a record by this ID, asked from a
@@ -1812,6 +1862,27 @@ pub fn serve_with(
                      route to built-in or to a launched pricing instance"
                 ));
             }
+            // Contract v27 (W12.3, W12.6; ruling 324): a pricing instance
+            // whose launched version declares its models must list this
+            // one; a version built before v27 declares none and is read as
+            // before.
+            if implementation != BUILT_IN {
+                let declared = launched_declaration(&cx.snapshot()?, implementation)
+                    .map(|declaration| declaration.pricing_models.clone())
+                    .unwrap_or_default();
+                if !declared.is_empty() && !declared.iter().any(|m| m.model_id == model) {
+                    let listed: Vec<String> = declared
+                        .iter()
+                        .map(|m| format!("{} v{}", m.model_id, m.model_version))
+                        .collect();
+                    return Err(format!(
+                        "failed_precondition: [fields=implementation] implementation: \
+                         {implementation}'s launched version declares the models {}, not \
+                         {model}; route {model} to built-in or to an instance declaring it",
+                        listed.join(", ")
+                    ));
+                }
+            }
             let changes = cx
                 .store
                 .model_routing_changes()
@@ -1934,6 +2005,114 @@ pub fn serve_with(
             Ok(time_zone_setting(
                 &cx.snapshot()?,
                 cx.store.deployment_time_zone().map_err(|f| f.to_string())?,
+            ))
+        },
+    );
+
+    // W6.36 (contract v27; rulings 462 and 483): the deployment's FX pivot
+    // currencies, a deployment admin's, each change its own record; read by
+    // the analytics component as it converts a job's legs, and by the
+    // dashboard.
+    answer(
+        &context,
+        SET_FX_PIVOT_CURRENCIES,
+        (
+            "meridian.v1.SetFxPivotCurrenciesRequest",
+            "meridian.v1.FxPivotCurrenciesSetting",
+        ),
+        |cx, request: meridian_domain::v1::SetFxPivotCurrenciesRequest, envelope| {
+            let by = subject(envelope);
+            if by.is_empty() {
+                return Err(
+                    "the deployment's FX pivot currencies are a deployment admin's, and this is \
+                     sent for nobody"
+                        .into(),
+                );
+            }
+            let invalid = |field: String, words: String| {
+                meridian_bus::refusal_with_status(
+                    meridian_bus::RefusalStatus::InvalidArgument,
+                    &[field],
+                    words,
+                )
+            };
+            let pivots: Vec<String> = request
+                .fx_pivot_currencies
+                .iter()
+                .map(|p| p.trim().to_string())
+                .collect();
+            if pivots.is_empty() || pivots.len() > MOST_PIVOTS {
+                return Err(invalid(
+                    "fx_pivot_currencies".into(),
+                    format!(
+                        "fx_pivot_currencies names {}; one to {MOST_PIVOTS} fiat cash instruments",
+                        pivots.len()
+                    ),
+                ));
+            }
+            for (n, pivot) in pivots.iter().enumerate() {
+                let field = format!("fx_pivot_currencies[{n}]");
+                if pivots[..n].contains(pivot) {
+                    return Err(invalid(field, format!("{pivot} is named twice")));
+                }
+                let record = cx.instrument_record(pivot)?;
+                let fiat = record.as_ref().is_some_and(|r| {
+                    r.asset_class == meridian_domain::v1::AssetClass::Cash as i32
+                        && r.identifiers.iter().any(|i| i.scheme == "iso4217")
+                });
+                if !fiat {
+                    return Err(invalid(
+                        field,
+                        format!(
+                            "{pivot} is no fiat currency's cash instrument: a pivot is never a \
+                             crypto asset or a stablecoin (ruling 462)"
+                        ),
+                    ));
+                }
+            }
+            if request.reason.trim().is_empty() {
+                return Err(meridian_bus::refusal_naming(
+                    meridian_pb::v1::RefusalReason::ReasonRequired as i32,
+                    &["reason".to_string()],
+                    "reason: a change to the FX pivot currencies says why",
+                ));
+            }
+            if request.reason.chars().count() > 4_000 {
+                return Err("reason: at most 4,000 characters".into());
+            }
+            let held = cx.store.fx_pivot_currencies().map_err(|f| f.to_string())?;
+            if held.as_ref().map(|h| &h.fx_pivot_currencies) != Some(&pivots) {
+                cx.store
+                    .set_fx_pivot_currencies(
+                        &pivots,
+                        &Author {
+                            note: request.reason.trim().to_string(),
+                            ..author(envelope)
+                        },
+                        cx.clock.now_ns(),
+                    )
+                    .map_err(|f| f.to_string())?;
+                tracing::info!(
+                    pivots = pivots.join(","),
+                    by,
+                    "the FX pivot currencies changed"
+                );
+            }
+            Ok(fx_pivot_setting(
+                cx.store.fx_pivot_currencies().map_err(|f| f.to_string())?,
+            ))
+        },
+    );
+    answer(
+        &context,
+        READ_FX_PIVOT_CURRENCIES,
+        (
+            "meridian.v1.ReadFxPivotCurrenciesRequest",
+            "meridian.v1.FxPivotCurrenciesSetting",
+        ),
+        |cx, _request: meridian_domain::v1::ReadFxPivotCurrenciesRequest, _| {
+            Ok(fx_pivot_setting(
+                cx.store.fx_pivot_currencies().map_err(|f| f.to_string())?,
             ))
         },
     );

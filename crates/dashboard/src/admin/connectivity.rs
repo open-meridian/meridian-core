@@ -671,10 +671,20 @@ pub const LIVE_UNCONFIRMED: &str = "Live (environment not confirmed)";
 /// paper and every mapped venue account's catalogue reports sandbox or paper
 /// too -- the two keys the ems's sidecar stamps a placement by; a demo
 /// setting with no session mapped, or a session reporting otherwise or
-/// nothing, is Live (environment not confirmed); any other setting, Live.
+/// nothing, is Live (environment not confirmed). From v27 (ruling 505, one
+/// "Live" badge, the SDK's): a live setting a session contradicts --
+/// reporting sandbox or paper -- is Live (environment not confirmed) too;
+/// otherwise Live.
 pub fn badge_of(set_demo: bool, reported: &[String]) -> &'static str {
     if !set_demo {
-        return "Live";
+        return if reported
+            .iter()
+            .any(|environment| DEMO_ENVIRONMENTS.contains(&environment.as_str()))
+        {
+            LIVE_UNCONFIRMED
+        } else {
+            "Live"
+        };
     }
     if !reported.is_empty()
         && reported
@@ -712,9 +722,6 @@ pub async fn badge(
     instance: &str,
 ) -> &'static str {
     let set_demo = DEMO_ENVIRONMENTS.contains(&environment_set(records, instance).as_str());
-    if !set_demo {
-        return "Live";
-    }
     let mut reported = Vec::new();
     for code in mapped_codes(records, instance) {
         let asked = bus
@@ -1046,7 +1053,11 @@ mod tests {
     /// catalogues, as the ems's sidecar reads them.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_connection_is_demo_only_where_its_sessions_confirm_it() {
-        assert_eq!(badge_of(false, &["sandbox".into()]), "Live");
+        // Ruling 505: a live setting a session contradicts is not
+        // confirmed either; one a session agrees with, or none reports, Live.
+        assert_eq!(badge_of(false, &["sandbox".into()]), LIVE_UNCONFIRMED);
+        assert_eq!(badge_of(false, &["live".into()]), "Live");
+        assert_eq!(badge_of(false, &[]), "Live");
         assert_eq!(badge_of(true, &[]), LIVE_UNCONFIRMED);
         assert_eq!(
             badge_of(true, &["paper".into(), "".into()]),
@@ -1119,6 +1130,8 @@ mod tests {
             LIVE_UNCONFIRMED
         );
         assert_eq!(said(with("sandbox", &[])).await, LIVE_UNCONFIRMED);
-        assert_eq!(said(with("live", &["PRACTICE-1"])).await, "Live");
+        // Ruling 505: set live, a practice session contradicting it.
+        assert_eq!(said(with("live", &["PRACTICE-1"])).await, LIVE_UNCONFIRMED);
+        assert_eq!(said(with("live", &["LIVE-9"])).await, "Live");
     }
 }

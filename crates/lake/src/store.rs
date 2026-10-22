@@ -55,13 +55,18 @@ pub struct Query {
     pub when: When,
     /// The recorded-time cut-off.
     pub as_of_ns: i64,
+    /// A rate's published-time cut-off (contract v27, W10.6); 0 for none.
+    /// Given, the store answers every version recorded by `as_of_ns`, and
+    /// the read chooses the version in force by published time.
+    pub published_as_of_ns: i64,
 }
 
 /// What a batch did.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Recorded {
     /// The rows it recorded, new and restated, as recorded: their envelopes
-    /// filled. An unchanged row is not among them.
+    /// filled. An unchanged row is not among them; a rate's confirmation,
+    /// counted unchanged, is (contract v27).
     pub rows: Vec<Observation>,
     pub recorded: u32,
     pub restated: u32,
@@ -308,14 +313,29 @@ pub trait Store: Send + Sync {
     fn closed_day_counts(&self) -> Result<BTreeMap<String, (u64, u64)>>;
 
     fn configuration(&self) -> Result<Option<EntitlementsChangedEvent>>;
+
+    /// Every row of one dataset and data type, each row key at its version
+    /// as of a recorded time (0 for now), whatever its subject: how the
+    /// account-scoped execution costs are read (contract v27, W10.11), their
+    /// subject the execution's instrument, which a reader does not name.
+    fn read_dataset(
+        &self,
+        dataset: &str,
+        data_type: DataType,
+        as_of_ns: i64,
+    ) -> Result<Vec<Observation>>;
 }
 
 /// Whether a query answers every version it finds, not each row key's
 /// latest: an outcome's catch-up after a watermark, since every version is
 /// delivered and none conflated (contract v23, the lake plan's vL1c, item
 /// 4), so a reader that lost some reads each stage it lost.
+///
+/// A published-time read of rates (contract v27, W10.6) takes every version
+/// too: which is in force by published time is the read's to choose.
 pub fn every_version(query: &Query) -> bool {
-    query.data_type == DataType::Outcome && matches!(query.when, When::After(_))
+    (query.data_type == DataType::Outcome && matches!(query.when, When::After(_)))
+        || query.published_as_of_ns != 0
 }
 
 /// Each row recorded at or before a cut-off (0 for none), every version.

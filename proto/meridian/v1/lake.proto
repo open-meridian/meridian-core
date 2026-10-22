@@ -32,6 +32,8 @@ import "meridian/v1/journal.proto";
 // The date read's check of a date (DateCheck), reused for the closed-day
 // flag (contract v23).
 import "meridian/v1/book.proto";
+// A curve point's tenor (contract v27, the rates slice).
+import "meridian/v1/reference.proto";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // The envelope
@@ -183,6 +185,17 @@ message DatasetRef {
   // entitlements change.
   uint64 closed_day_count = 8;
   uint64 outside_coverage_count = 9;
+
+  // Contract v27 (W10.9; rulings 369 and 417): the dataset's declared
+  // delay, from its catalogue, 0 for real time; and its stale ceiling, the
+  // data plugin admin's `stale_after` for it, 0 when none is set. Set in a
+  // listing and in every read's answer.
+  int64 declared_delay_ns = 10;
+  int64 stale_after_ns = 11;
+
+  // Contract v27 (W10.9; ruling 418): in a listing, the latest liveness the
+  // lake keeps for the dataset, one per venue; empty in a read's answer.
+  repeated DatasetLiveness liveness = 12;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -423,6 +436,288 @@ message Outcome {
 
   // The venue's own word for the determination, as reported.
   AsReported determination_as_reported = 6;
+
+  // Contract v27 (W10.4; the options and event contracts spec's G1): when a
+  // proposed outcome's challenge window ends, as the venue reports it; 0
+  // when not stated. Never derived by core.
+  int64 challenge_ends_at_ns = 7;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Contract v27: the rates slice (spec/a-public-rates-and-filings-data-plugin,
+// §1 items 1 to 3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// A rate (W10.4): a fixing, an average, an index level or a curve point, for
+// one subject -- a referential `INS-` record -- as one source stated it. A
+// curve is one record; its points are rows, each with its tenor. Conflated
+// per subject, dataset, kind, tenor, maturity and convention.
+message Rate {
+  ObservationMeta meta = 1;
+  RateKind kind = 2;
+  // The value with its unit: a percent, basis points or an index level.
+  UnitValue value = 3;
+  RateConvention convention = 4;
+  // A curve point's tenor, a count and a unit (`3M`, `10Y`, `ON`), or its
+  // exact maturity, ISO 8601; neither on a rate that is no curve point.
+  Tenor tenor = 5;
+  string maturity_date = 6;
+  // True while the source marks it preliminary; its final value is the next
+  // version of the row key.
+  bool preliminary = 7;
+  // Optional, as the source states them: the volume transacted, how many
+  // transactions, and the distribution's percentiles (SOFR's 1st, 25th,
+  // 75th and 99th). Not stated is unset, never zero.
+  optional Money volume = 8;
+  optional uint64 transaction_count = 9;
+  repeated RatePercentile percentiles = 10;
+}
+
+// What a rate is (FDP item 1).
+enum RateKind {
+  // Refused.
+  RATE_KIND_UNSPECIFIED = 0;
+  // A reference rate's daily fixing: SOFR, EFFR, €STR.
+  RATE_KIND_FIXING = 1;
+  // A compounded or simple average over a period: the SOFR averages.
+  RATE_KIND_AVERAGE = 2;
+  // An index's level: the SOFR Index.
+  RATE_KIND_INDEX_LEVEL = 3;
+  // A par yield curve's point.
+  RATE_KIND_PAR_YIELD = 4;
+  // A zero-coupon yield curve's point.
+  RATE_KIND_ZERO = 5;
+  // A bill's bank-discount rate.
+  RATE_KIND_DISCOUNT = 6;
+  // A bill's coupon-equivalent (bond-equivalent) yield.
+  RATE_KIND_COUPON_EQUIVALENT = 7;
+}
+
+// How a rate accrues (FDP item 1).
+message RateConvention {
+  DayCount day_count = 1;
+  Compounding compounding = 2;
+  // For COMPOUNDING_COMPOUNDED, the periods a year (2 for a semi-annual
+  // bond-equivalent yield); 0 otherwise.
+  uint32 periods_per_year = 3;
+}
+
+enum DayCount {
+  // Not stated by the source.
+  DAY_COUNT_UNSPECIFIED = 0;
+  DAY_COUNT_ACT_360 = 1;
+  DAY_COUNT_ACT_365_FIXED = 2;
+  DAY_COUNT_ACT_ACT = 3;
+  DAY_COUNT_THIRTY_360 = 4;
+  DAY_COUNT_BUS_252 = 5;
+}
+
+enum Compounding {
+  // Refused.
+  COMPOUNDING_UNSPECIFIED = 0;
+  COMPOUNDING_SIMPLE = 1;
+  COMPOUNDING_COMPOUNDED = 2;
+  COMPOUNDING_CONTINUOUS = 3;
+  COMPOUNDING_DISCOUNT = 4;
+}
+
+// One percentile of a rate's distribution, as the source states it.
+message RatePercentile {
+  // 1 to 99.
+  uint32 percentile = 1;
+  Decimal value = 2;
+}
+
+// A batch of rates, recorded whole or refused naming the item and field:
+// 1 to 500.
+message RecordRatesRequest {
+  repeated Rate rates = 1;
+  // The want these answer (W10.7), as delivered; empty for rows recorded
+  // unasked.
+  string want_id = 2;
+}
+
+// A rate the lake recorded, on its dataset's subject (W10.5): conflated.
+message RatesRecordedEvent {
+  Rate rate = 1;
+}
+
+// Rates for subjects (W10.6), at one of: the latest in force at a valid
+// time; a business date; or a valid-time range. As of a recorded time, and
+// optionally as the source had published them by a time.
+message ListRatesRequest {
+  // 1 to 500.
+  repeated SubjectRef subjects = 1;
+  // Which kinds; empty for every kind.
+  repeated RateKind kinds = 2;
+  // Which tenors; empty for every tenor.
+  repeated Tenor tenors = 3;
+  SourceChoice sources = 4;
+  int64 at_ns = 5;
+  string business_date = 6;
+  int64 valid_from_ns = 7;
+  int64 valid_until_ns = 8;
+  // The recorded-time cut-off, 0 for now: what the lake knew then.
+  int64 as_of_ns = 9;
+  // Shared additions 1 and 2: what the source had published by this time,
+  // the version in force by published time among the rows recorded by
+  // as_of_ns; 0 reads by recorded time alone, the default and the audit
+  // answer.
+  int64 published_as_of_ns = 10;
+  // At most 500 rows, 100 when 0.
+  uint32 page_size = 11;
+  string cursor = 12;
+}
+
+message ListRatesReply {
+  repeated Rate rates = 1;
+  repeated Unanswered unanswered = 2;
+  repeated DatasetRef datasets = 3;
+  Watermark watermark = 4;
+  string next_cursor = 5;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Contract v27: a dataset's liveness (W10.4, W10.5; ruling 418)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// A dataset's latest sign of life: its source's heartbeat or poll, which
+// confirms the values in force. Not a row, and never kept as one.
+message DatasetLiveness {
+  // A dataset the recording instance declares, `instance:key`.
+  string dataset = 1;
+  // The venue it is for, the venue master's ID; empty for the dataset's
+  // consolidated view.
+  string venue_id = 2;
+  // The source's last heartbeat or poll, on the one clock.
+  int64 alive_at_ns = 3;
+  // The recording instance, stamped by its sidecar.
+  string instance = 4;
+}
+
+// 1 to 500 liveness items.
+message RecordLivenessRequest {
+  repeated DatasetLiveness liveness = 1;
+}
+
+message RecordLivenessReply {
+  // The items kept, each the latest for its dataset and venue.
+  uint32 kept = 1;
+}
+
+// A dataset's liveness, on its subject: conflated per dataset and venue.
+message LivenessRecordedEvent {
+  DatasetLiveness liveness = 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Contract v27: execution costs (W10.11; spec/the-contract-gaps-v26-and-v27-close,
+// C1 to C10)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// One execution's cost against one benchmark, written by the analytics
+// component (W12.1's `execution_cost`), keyed by execution and benchmark. The
+// lake's first rows naming an account: read within the reader's scope.
+message ExecutionCost {
+  // The envelope: its subject the execution's instrument; its source the
+  // analytics component and the dataset `analytics:execution_cost`.
+  ObservationMeta meta = 1;
+  string execution_id = 2;
+  string order_id = 3;
+  // Empty for a fill on no placement accepted to a new order, and for an
+  // internal cross.
+  string placement_id = 4;
+  string account_id = 5;
+  TcaBenchmark benchmark = 6;
+  // The benchmark's price and the moment it was taken at; unset and 0 when
+  // unanswered.
+  Money benchmark_price = 7;
+  int64 benchmark_at_ns = 8;
+  // The quote the benchmark came from: its dataset and row key, never mixed
+  // silently.
+  string benchmark_dataset = 9;
+  string benchmark_row_key = 10;
+  // For TCA_BENCHMARK_FIX, the fixing's `INS-` record; empty otherwise.
+  string fixing_id = 11;
+  Money execution_price = 12;
+  Side side = 13;
+  // The execution's notional, in its asset.
+  Money notional = 14;
+  // Side-adjusted, positive a cost: s × (price − benchmark) ÷ benchmark ×
+  // 10⁴; unset when unanswered.
+  optional Decimal cost_bps = 15;
+  // Fees and financing, apart, in bps of notional; unset where none.
+  optional Decimal fees_bps = 16;
+  optional Decimal financing_bps = 17;
+  // As the connectivity plugin reported them.
+  LiquidityIndicator liquidity_indicator = 18;
+  string venue_id = 19;
+  // Why it was not measured, beside no price and no cost; unspecified when
+  // measured.
+  TcaUnanswered unanswered = 20;
+  // The quote's staleness bound in force: 5 seconds by default, the tighter
+  // of it and the dataset's stale ceiling.
+  int64 staleness_bound_ns = 21;
+  // The execution's time precision as stated: a manual fill's.
+  TimePrecision time_precision = 22;
+  // The placement's last-look rejections, and its time to fill; never a
+  // cost in bps.
+  uint32 reject_count = 23;
+  int64 time_to_fill_ns = 24;
+}
+
+// The standard benchmarks (C2).
+enum TcaBenchmark {
+  TCA_BENCHMARK_UNSPECIFIED = 0;
+  // The mid at the order's proposal.
+  TCA_BENCHMARK_DECISION = 1;
+  // The mid at the order's release to the desk.
+  TCA_BENCHMARK_ARRIVAL = 2;
+  // The mid at the placement's routed_at_ns: the broker's arrival.
+  TCA_BENCHMARK_PLACEMENT_ARRIVAL = 3;
+  TCA_BENCHMARK_MID_AT_FILL = 4;
+  // Needs trades: never measured for FX spot from one venue.
+  TCA_BENCHMARK_INTERVAL_VWAP = 5;
+  // A named fixing, licensed by the deployment.
+  TCA_BENCHMARK_FIX = 6;
+}
+
+// Why a benchmark was not measured (C4, C8).
+enum TcaUnanswered {
+  TCA_UNANSWERED_UNSPECIFIED = 0;
+  // No quote in force within the staleness bound: never an imputed value.
+  TCA_UNANSWERED_NO_QUOTE = 1;
+  // The benchmark has no moment for this execution: a venue-originated fill
+  // accepted to a new order has no decision or arrival time.
+  TCA_UNANSWERED_NOT_MEASURED = 2;
+}
+
+// 1 to 500 execution costs, the analytics component's alone.
+message RecordExecutionCostsRequest {
+  repeated ExecutionCost costs = 1;
+}
+
+// One account's execution costs (W10.11): by execution, by order or by trade
+// date, as of a recorded time.
+message ListExecutionCostsRequest {
+  // The account, within the reader's read scope.
+  string account_id = 1;
+  // At most 500; empty for every execution the other filters name.
+  repeated string execution_ids = 2;
+  string order_id = 3;
+  // ISO 8601: the executions traded on that date.
+  string trade_date = 4;
+  // Empty for every benchmark.
+  repeated TcaBenchmark benchmarks = 5;
+  int64 as_of_ns = 6;
+  // At most 500 rows, 100 when 0.
+  uint32 page_size = 7;
+  string cursor = 8;
+}
+
+message ListExecutionCostsReply {
+  repeated ExecutionCost costs = 1;
+  string next_cursor = 2;
 }
 
 // What an event contract's instrument pays (the lake plan's "vL1c", item 1).
@@ -931,8 +1226,8 @@ message ListDatasetsReply {
 // One read-only query over one of the lake's kinds, within the asking
 // instance's entitlements and its roles' kinds, capped in rows and columns.
 message QueryLakeRequest {
-  // `prices`, `bars`, `trades`, `quotes` or `outcomes`; a kind the asking
-  // role does not read is refused naming it.
+  // `prices`, `bars`, `trades`, `quotes` or `outcomes`, and from contract
+  // v27 `rates`; a kind the asking role does not read is refused naming it.
   string kind = 1;
   // At most 500.
   repeated SubjectRef subjects = 2;
@@ -969,4 +1264,6 @@ message QueryLakeReply {
   Watermark watermark = 8;
   // More rows matched than row_limit: the reply is cut at it, never paged.
   bool truncated = 9;
+  // Contract v27 (W10.10): rates, for a query of the kind `rates`.
+  repeated Rate rates = 10;
 }

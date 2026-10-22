@@ -156,12 +156,14 @@ pub fn answer(case: &Case, inputs: &Value, hash: &str, executor: &dyn Executor) 
     let mut parts = executor.run(&job, &units).into_iter();
     let mut figures = Vec::new();
     let mut not_evaluated = Vec::new();
+    let mut execution_costs = Vec::new();
     let mut reads = Reads::default();
     for plan in planned {
         let (figures_before, unevaluated_before) = (figures.len(), not_evaluated.len());
         let mut take = |part: Part| {
             figures.extend(part.figures);
             not_evaluated.extend(part.not_evaluated);
+            execution_costs.extend(part.execution_costs);
             reads.absorb(part.reads);
         };
         take(plan.preamble);
@@ -172,10 +174,22 @@ pub fn answer(case: &Case, inputs: &Value, hash: &str, executor: &dyn Executor) 
         figures[figures_before..].sort_by(|a, b| a.order_key().cmp(&b.order_key()));
     }
     let provenance = provenance(case, &reads, hash);
+    // Contract v27 (W10.11): the rows by execution, then benchmark.
+    execution_costs.sort_by_key(|row| {
+        (
+            row["execution_id"].as_str().unwrap_or_default().to_string(),
+            measures::benchmark_order(row["benchmark"].as_str().unwrap_or_default()),
+        )
+    });
     Ok(Answer {
         figures,
         not_evaluated,
         provenance,
+        execution_costs,
+        asks_execution_cost: case
+            .measures
+            .iter()
+            .any(|key| key.definition == "execution_cost"),
     })
 }
 
@@ -189,6 +203,10 @@ fn provenance(case: &Case, reads: &Reads, hash: &str) -> Value {
     }
     json!({
         "book_watermark": case.book_watermark,
+        // Contract v27 (W12.7; rulings 458, 460 and 462).
+        "business_date": case.business_date,
+        "input_prices": reads.input_prices.values().collect::<Vec<_>>(),
+        "conversion_legs": reads.legs.values().collect::<Vec<_>>(),
         "lake_as_of_ns": case.lake_as_of_ns.to_string(),
         "datasets": reads.datasets.iter().collect::<Vec<_>>(),
         "instruments": reads.instruments.iter()
@@ -230,7 +248,7 @@ fn provenance(case: &Case, reads: &Reads, hash: &str) -> Value {
 // ── A part over the wire, between the coordinator and a worker ──────────────
 
 /// The enum names a part may carry, as `&'static str`.
-const NAMES: [&str; 15] = [
+const NAMES: [&str; 16] = [
     BASE,
     WHAT_IF,
     HISTORICAL_DAY,
@@ -246,6 +264,7 @@ const NAMES: [&str; 15] = [
     GROUP_NOT_EXHAUSTIVE,
     HISTORY_INSUFFICIENT,
     EXACT,
+    COST_MISSING,
 ];
 
 fn name(value: &Value) -> Result<&'static str> {
@@ -289,7 +308,10 @@ impl Part {
                 "instruments": self.reads.instruments,
                 "models": self.reads.models.iter().map(|(m, v)| json!([m, v])).collect::<Vec<_>>(),
                 "groups": self.reads.groups,
+                "input_prices": self.reads.input_prices.values().collect::<Vec<_>>(),
+                "legs": self.reads.legs.values().collect::<Vec<_>>(),
             },
+            "execution_costs": self.execution_costs,
         })
     }
 
@@ -375,7 +397,41 @@ impl Part {
                     })
                     .collect(),
                 groups: strings(&read["groups"]).into_iter().collect(),
+                input_prices: read["input_prices"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|p| {
+                        (
+                            p["instrument_id"].as_str().unwrap_or_default().to_string(),
+                            p.clone(),
+                        )
+                    })
+                    .collect(),
+                legs: read["legs"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|leg| {
+                        let text = |name: &str| leg[name].as_str().unwrap_or_default().to_string();
+                        (
+                            (
+                                text("from_instrument_id"),
+                                text("to_instrument_id"),
+                                crate::model::derivation_rank(&text("derivation")),
+                                text("via_instrument_id"),
+                            ),
+                            leg.clone(),
+                        )
+                    })
+                    .collect(),
             },
+            execution_costs: value["execution_costs"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default(),
         })
     }
 }

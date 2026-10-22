@@ -82,21 +82,64 @@ pub fn catalogues(snapshot: &Snapshot) -> BTreeMap<String, Catalogue> {
     running
 }
 
+/// The data plugin admin's stale ceilings (contract v27, W10.9; rulings 368
+/// and 417): the table setting `dataset_thresholds`, read by its fixed name,
+/// each row's `dataset` the dataset's key in the instance's catalogue and its
+/// `stale_after` whole seconds; by key, in nanoseconds. A row that does not
+/// read is passed over, never guessed at.
+pub const DATASET_THRESHOLDS: &str = "dataset_thresholds";
+
+pub fn stale_after(snapshot: &Snapshot, instance: &str) -> BTreeMap<String, i64> {
+    let mut out = BTreeMap::new();
+    let Some(held) = snapshot
+        .settings
+        .iter()
+        .find(|s| s.plugin_instance_id == instance && s.name == DATASET_THRESHOLDS)
+    else {
+        return out;
+    };
+    let crate::store::Held::Plain(value) = &held.held else {
+        return out;
+    };
+    for row in meridian_domain::setting_table::parse(value).unwrap_or_default() {
+        let key = row.cells.get("dataset").map(|k| k.trim().to_string());
+        let seconds = row
+            .cells
+            .get("stale_after")
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .filter(|s| *s > 0);
+        if let (Some(key), Some(seconds)) = (key, seconds) {
+            if let Some(ns) = seconds.checked_mul(1_000_000_000) {
+                out.insert(key, ns);
+            }
+        }
+    }
+    out
+}
+
 /// Every launched dataset, by its ID, with its catalogue entry.
 pub fn datasets(snapshot: &Snapshot) -> Vec<DatasetRef> {
     let mut out = Vec::new();
     for (instance, catalogue) in catalogues(snapshot) {
+        let ceilings = stale_after(snapshot, &instance);
         for declared in catalogue.datasets {
+            let stale_after_ns = ceilings.get(&declared.key).copied().unwrap_or(0);
             out.push(DatasetRef {
                 dataset: lake::dataset_id(&instance, &declared.key),
                 instance: instance.clone(),
                 vendor: declared.vendor.clone(),
                 aggregator: declared.aggregator.clone(),
+                declared_delay_ns: declared.declared_delay_ns,
                 declaration: Some(declared),
                 unconverted_count: 0,
                 miss_count: 0,
                 closed_day_count: 0,
                 outside_coverage_count: 0,
+                // Contract v27 (W10.9): the declared delay is the
+                // catalogue's, the stale ceiling the data plugin admin's
+                // `dataset_thresholds`; liveness the lake's.
+                stale_after_ns,
+                liveness: Vec::new(),
             });
         }
     }
@@ -154,7 +197,7 @@ pub fn set_licence(
     if let Some(refused) = note_refused(&request.note) {
         return Err(refused);
     }
-    let licence = DatasetLicence {
+    let mut licence = DatasetLicence {
         dataset: request.dataset.clone(),
         updated_by: author.by.clone(),
         updated_at_ns: now_ns,
@@ -164,6 +207,9 @@ pub fn set_licence(
         prepared_call_id: author.prepared_call_id.clone(),
         ..terms
     };
+    // Ruling 479: what is kept carries both the terms' answer and the
+    // deprecated boolean, whichever the writer stated.
+    lake::derived_use_both(&mut licence);
     store
         .set_dataset_licence(&licence)
         .map_err(|failed| failed.to_string())?;

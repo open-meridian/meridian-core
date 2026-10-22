@@ -148,6 +148,60 @@ pub fn in_force(versions: &[EventGroup], as_of_ns: i64) -> Vec<EventGroup> {
     out
 }
 
+/// A member's bounds as its venue states them, offered on its record as its
+/// binary event contract's attributes with the floor, cap and unit the venue
+/// states (contract v27, ruling 464): never in force until a person accepts
+/// it; a record whose attributes already say the same is left alone.
+fn offer_bounds(
+    store: &dyn Store,
+    member: &str,
+    bound: &meridian_domain::v1::EventGroupMemberBound,
+    instance_id: &str,
+    now_ns: i64,
+) -> Result<()> {
+    use meridian_domain::instrument_type::{contract_from_text, contract_to_text};
+    let Some(mut record) = store.by_id(member)? else {
+        return Ok(());
+    };
+    // The bounds complete attributes the record holds -- its payout and
+    // close -- and are offered with them; a record holding none has nothing
+    // they could complete.
+    let Some(held) = contract_from_text(&record.binary_event_contract) else {
+        return Ok(());
+    };
+    let offered = meridian_domain::v1::BinaryEventContract {
+        floor: bound.floor,
+        cap: bound.cap,
+        bound_unit: bound.bound_unit.clone(),
+        ..held.clone()
+    };
+    if offered == held {
+        return Ok(());
+    }
+    let offer = crate::store::Offer {
+        field: crate::store::Field::BinaryEventContract,
+        value: contract_to_text(&offered),
+        identifier: None,
+        source: format!("offered by {instance_id} from its venue's event group report"),
+        instance_id: instance_id.to_string(),
+        offered_at_ns: now_ns,
+        valid_until_ns: 0,
+        provenance: Vec::new(),
+    };
+    let expected = record.version;
+    if !crate::resolve::keep_offers(&mut record, vec![offer]) {
+        return Ok(());
+    }
+    record.version = expected + 1;
+    record.record_time_ns = now_ns;
+    let mut entry = crate::one_id::version_of(&record, "offer", Vec::new(), "", now_ns);
+    entry.instance_id = instance_id.to_string();
+    // A record changed meanwhile keeps its own: the venue states the bounds
+    // again on its next report.
+    let _ = store.write(record, expected, entry)?;
+    Ok(())
+}
+
 /// W3.29: keep what a venue's data plugin reports, asking the platform to
 /// match or mint it where every member is the platform's.
 pub fn report(
@@ -214,6 +268,29 @@ pub fn report(
             )));
         }
         members.push(id);
+    }
+    // Contract v27 (W3.29; ruling 464): each range member's floor, cap and
+    // unit as the venue states them, offered on the member's record -- a
+    // person's value wins, and nothing is in force until accepted.
+    let mut bounds = Vec::new();
+    for (i, bound) in request.member_bounds.iter().enumerate() {
+        let Some(at) = request
+            .member_instrument_ids
+            .iter()
+            .position(|member| member.trim() == bound.instrument_id.trim())
+        else {
+            return Ok(Err(refused(
+                format!("member_bounds[{i}].instrument_id"),
+                format!(
+                    "{:?} is not one of the report's members",
+                    bound.instrument_id
+                ),
+            )));
+        };
+        bounds.push((members[at].clone(), bound.clone()));
+    }
+    for (member, bound) in &bounds {
+        offer_bounds(store, member, bound, &request.publisher_instance_id, now_ns)?;
     }
     members.sort();
     let exclusive = stated(request.mutually_exclusive);

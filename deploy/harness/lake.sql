@@ -17,7 +17,8 @@
 SELECT line FROM (
     SELECT 'row|' || dataset || '|' || CASE data_type WHEN 1 THEN 'price' WHEN 2 THEN 'bar'
                                                          WHEN 3 THEN 'trade' WHEN 4 THEN 'quote'
-                                                         WHEN 5 THEN 'outcome' ELSE '?' END
+                                                         WHEN 5 THEN 'outcome' WHEN 6 THEN 'rate'
+                                                         WHEN 7 THEN 'execution_cost' ELSE '?' END
         || '|' || sequence || '|' || row_key || '|' || version || '|' || subject || '|'
         || CASE data_type WHEN 2 THEN interval_ns::text ELSE kind::text END || '|' || venue_id || '|'
         || COALESCE(business_date::text, '') || '|' || previous_sequence || '|' || unconverted AS line

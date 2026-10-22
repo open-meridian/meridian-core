@@ -693,6 +693,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         let acting_for = params.acting_for.take();
         let message: domain::SetWorkingConditionRequest = self.as_domain(params)?;
         self.known("condition", message.condition, domain::OrderCondition::try_from(message.condition).is_ok())?;
+        self.known("hold_cause", message.hold_cause, domain::HoldCause::try_from(message.hold_cause).is_ok())?;
         let account = None;
         self.command_typed("platform.book.command.set-working-condition", "meridian.v1.SetWorkingConditionRequest", message, account, acting_for).await
     }
@@ -716,6 +717,8 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         }
         self.known("time_in_force", message.time_in_force, domain::TimeInForce::try_from(message.time_in_force).is_ok())?;
         self.known("route_type", message.route_type, domain::RouteType::try_from(message.route_type).is_ok())?;
+        self.known("placement_type", message.placement_type, domain::PlacementType::try_from(message.placement_type).is_ok())?;
+        self.known("agreed_precision", message.agreed_precision, domain::TimePrecision::try_from(message.agreed_precision).is_ok())?;
         message.ems_instance_id = self.instance_id().to_string();
         let account = None;
         self.command_typed("platform.book.command.create-placement", "meridian.v1.CreatePlacementRequest", message, account, acting_for).await
@@ -787,6 +790,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.known("source", message.source, domain::ExecutionSource::try_from(message.source).is_ok())?;
         self.known("liquidity_indicator", message.liquidity_indicator, domain::LiquidityIndicator::try_from(message.liquidity_indicator).is_ok())?;
         self.known("side", message.side, domain::Side::try_from(message.side).is_ok())?;
+        self.known("cross_rate_source", message.cross_rate_source, domain::CrossRateSource::try_from(message.cross_rate_source).is_ok())?;
         message.account_id = self.venue_mapped_account("meridian.v1.ReportExecutionRequest", &message.venue_account_code, &message.account_id).await?;
         let stamped0 = message.counterparty.get_or_insert_with(Default::default);
         for stamped1 in stamped0.identifiers.iter_mut() {
@@ -924,6 +928,9 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
                 self.known(&format!("catalogue.eligibility[{i1}].borrow_status"), held1.borrow_status, domain::BorrowStatus::try_from(held1.borrow_status).is_ok())?;
             }
             self.known("catalogue.execution_acknowledgement", held0.execution_acknowledgement, domain::ExecutionAcknowledgement::try_from(held0.execution_acknowledgement).is_ok())?;
+            for (i1, &value) in held0.placement_types.iter().enumerate() {
+                self.known(&format!("catalogue.placement_types[{i1}]"), value, domain::PlacementType::try_from(value).is_ok())?;
+            }
         }
         message.publisher_instance_id = self.instance_id().to_string();
         self.publish_typed("platform.config.event.venue-catalogue", "meridian.v1.VenueCatalogueEvent", message).await
@@ -1704,6 +1711,14 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         let mut params = request.into_inner();
         let acting_for = params.acting_for.take();
         let mut message: domain::ReportEventGroupRequest = self.as_domain(params)?;
+        for (i0, held0) in message.member_bounds.iter().enumerate() {
+            if let Some(held1) = held0.floor.as_ref() {
+                self.exact(&format!("member_bounds[{i0}].floor.value"), held1.value.as_ref())?;
+            }
+            if let Some(held1) = held0.cap.as_ref() {
+                self.exact(&format!("member_bounds[{i0}].cap.value"), held1.value.as_ref())?;
+            }
+        }
         self.known("mutually_exclusive", message.mutually_exclusive, domain::EventGroupFlag::try_from(message.mutually_exclusive).is_ok())?;
         self.known("exhaustive", message.exhaustive, domain::EventGroupFlag::try_from(message.exhaustive).is_ok())?;
         message.publisher_instance_id = self.instance_id().to_string();
@@ -1740,6 +1755,178 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         message.instance_id = self.instance_id().to_string();
         let account = None;
         self.call_typed("platform.lake.query.query-lake", "meridian.v1.QueryLakeRequest", message, account, None).await
+    }
+
+    /// W4.16: `platform.deployment.command.report-latency` (preview).
+    async fn report_latency(
+        &self,
+        request: Request<plugin::ReportLatencyParams>,
+    ) -> Result<Response<plugin::ReportLatencyResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let mut message: domain::ReportLatencyRequest = self.as_domain(params)?;
+        let bound = meridian_pb::bounds::REPORT_LATENCY_REQUEST_SNAPSHOTS_COUNT;
+        if !bound.admits(message.snapshots.len()) {
+            let refusal = format!(
+                "snapshots holds {} rows; a batch is {} to {}",
+                message.snapshots.len(),
+                bound.least,
+                bound.most
+            );
+            self.note_refusal(&refusal);
+            return Err(Status::invalid_argument(refusal));
+        }
+        for (i0, held0) in message.snapshots.iter().enumerate() {
+            self.known(&format!("snapshots[{i0}].hop"), held0.hop, domain::AgeHop::try_from(held0.hop).is_ok())?;
+            self.known(&format!("snapshots[{i0}].metric"), held0.metric, domain::LatencyMetric::try_from(held0.metric).is_ok())?;
+        }
+        for stamped0 in message.snapshots.iter_mut() {
+            stamped0.instance_id = self.instance_id().to_string();
+        }
+        let account = None;
+        self.command_typed("platform.deployment.command.report-latency", "meridian.v1.ReportLatencyRequest", message, account, acting_for).await
+    }
+
+    /// W10.4: `platform.lake.command.record-rates` (preview).
+    async fn record_rates(
+        &self,
+        request: Request<plugin::RecordRatesParams>,
+    ) -> Result<Response<plugin::RecordRatesResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let mut message: domain::RecordRatesRequest = self.as_domain(params)?;
+        let bound = meridian_pb::bounds::RECORD_RATES_REQUEST_RATES_COUNT;
+        if !bound.admits(message.rates.len()) {
+            let refusal = format!(
+                "rates holds {} rows; a batch is {} to {}",
+                message.rates.len(),
+                bound.least,
+                bound.most
+            );
+            self.note_refusal(&refusal);
+            return Err(Status::invalid_argument(refusal));
+        }
+        for (i0, held0) in message.rates.iter().enumerate() {
+            if let Some(held1) = held0.meta.as_ref() {
+                for (i2, held2) in held1.source_times.iter().enumerate() {
+                    self.known(&format!("rates[{i0}].meta.source_times[{i2}].kind"), held2.kind, domain::SourceTimeKind::try_from(held2.kind).is_ok())?;
+                }
+                if let Some(held2) = held1.closed_day.as_ref() {
+                    self.known(&format!("rates[{i0}].meta.closed_day.reason"), held2.reason, domain::DateCheckReason::try_from(held2.reason).is_ok())?;
+                }
+            }
+            self.known(&format!("rates[{i0}].kind"), held0.kind, domain::RateKind::try_from(held0.kind).is_ok())?;
+            if let Some(held1) = held0.value.as_ref() {
+                self.exact(&format!("rates[{i0}].value.value"), held1.value.as_ref())?;
+                self.known(&format!("rates[{i0}].value.unit"), held1.unit, domain::ValueUnit::try_from(held1.unit).is_ok())?;
+            }
+            if let Some(held1) = held0.convention.as_ref() {
+                self.known(&format!("rates[{i0}].convention.day_count"), held1.day_count, domain::DayCount::try_from(held1.day_count).is_ok())?;
+                self.known(&format!("rates[{i0}].convention.compounding"), held1.compounding, domain::Compounding::try_from(held1.compounding).is_ok())?;
+            }
+            if let Some(held1) = held0.tenor.as_ref() {
+                self.known(&format!("rates[{i0}].tenor.unit"), held1.unit, domain::TenorUnit::try_from(held1.unit).is_ok())?;
+            }
+            self.exact_money(&format!("rates[{i0}].volume"), held0.volume.as_ref())?;
+            for (i1, held1) in held0.percentiles.iter().enumerate() {
+                self.exact(&format!("rates[{i0}].percentiles[{i1}].value"), held1.value.as_ref())?;
+            }
+        }
+        for stamped0 in message.rates.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            let stamped2 = stamped1.source.get_or_insert_with(Default::default);
+            stamped2.instance = self.instance_id().to_string();
+            stamped2.plugin_version = Default::default();
+        }
+        for stamped0 in message.rates.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            stamped1.sent_at_ns = Default::default();
+        }
+        let account = None;
+        self.command_typed("platform.lake.command.record-rates", "meridian.v1.RecordRatesRequest", message, account, acting_for).await
+    }
+
+    /// W10.6: `platform.lake.query.list-rates` (preview).
+    async fn list_rates(
+        &self,
+        request: Request<plugin::ListRatesParams>,
+    ) -> Result<Response<plugin::ListRatesResult>, Status> {
+        let message: domain::ListRatesRequest = self.as_domain(request.into_inner())?;
+        for (i0, held0) in message.tenors.iter().enumerate() {
+            self.known(&format!("tenors[{i0}].unit"), held0.unit, domain::TenorUnit::try_from(held0.unit).is_ok())?;
+        }
+        for &value in &message.kinds {
+            self.known("kinds", value, domain::RateKind::try_from(value).is_ok())?;
+        }
+        let account = None;
+        self.call_typed("platform.lake.query.list-rates", "meridian.v1.ListRatesRequest", message, account, None).await
+    }
+
+    /// W10.4: `platform.lake.command.record-liveness` (preview).
+    async fn record_liveness(
+        &self,
+        request: Request<plugin::RecordLivenessParams>,
+    ) -> Result<Response<plugin::RecordLivenessResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let mut message: domain::RecordLivenessRequest = self.as_domain(params)?;
+        let bound = meridian_pb::bounds::RECORD_LIVENESS_REQUEST_LIVENESS_COUNT;
+        if !bound.admits(message.liveness.len()) {
+            let refusal = format!(
+                "liveness holds {} rows; a batch is {} to {}",
+                message.liveness.len(),
+                bound.least,
+                bound.most
+            );
+            self.note_refusal(&refusal);
+            return Err(Status::invalid_argument(refusal));
+        }
+        for stamped0 in message.liveness.iter_mut() {
+            stamped0.instance = self.instance_id().to_string();
+        }
+        let account = None;
+        self.command_typed("platform.lake.command.record-liveness", "meridian.v1.RecordLivenessRequest", message, account, acting_for).await
+    }
+
+    /// W10.11: `platform.lake.query.list-execution-costs` (preview).
+    async fn list_execution_costs(
+        &self,
+        request: Request<plugin::ListExecutionCostsParams>,
+    ) -> Result<Response<plugin::ListExecutionCostsResult>, Status> {
+        let message: domain::ListExecutionCostsRequest = self.as_domain(request.into_inner())?;
+        for &value in &message.benchmarks {
+            self.known("benchmarks", value, domain::TcaBenchmark::try_from(value).is_ok())?;
+        }
+        let account = Some(message.account_id.clone());
+        self.call_typed("platform.lake.query.list-execution-costs", "meridian.v1.ListExecutionCostsRequest", message, account, None).await
+    }
+
+    /// W11.40: `platform.book.command.report-placement-quote` (preview).
+    async fn report_placement_quote(
+        &self,
+        request: Request<plugin::ReportPlacementQuoteParams>,
+    ) -> Result<Response<plugin::ReportPlacementQuoteResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let message: domain::ReportPlacementQuoteRequest = self.as_domain(params)?;
+        self.exact_money("price", message.price.as_ref())?;
+        self.exact("quantity", message.quantity.as_ref())?;
+        self.known("side", message.side, domain::Side::try_from(message.side).is_ok())?;
+        self.known("outcome", message.outcome, domain::PlacementQuoteOutcome::try_from(message.outcome).is_ok())?;
+        let account = None;
+        self.command_typed("platform.book.command.report-placement-quote", "meridian.v1.ReportPlacementQuoteRequest", message, account, acting_for).await
+    }
+
+    /// W11.41: `platform.book.command.pick-placement-quote` (preview).
+    async fn pick_placement_quote(
+        &self,
+        request: Request<plugin::PickPlacementQuoteParams>,
+    ) -> Result<Response<plugin::PickPlacementQuoteResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let message: domain::PickPlacementQuoteRequest = self.as_domain(params)?;
+        let account = None;
+        self.command_typed("platform.book.command.pick-placement-quote", "meridian.v1.PickPlacementQuoteRequest", message, account, acting_for).await
     }
 
     type ReceiveStream = crate::receive::Deliveries;
@@ -1960,6 +2147,20 @@ pub(crate) const DELIVERED: &[crate::receive::Row] = &[
         topic: "platform.reference.event.event-group-changed",
         payload_type: "meridian.v1.EventGroup",
         read: event_group_changed,
+    },
+    crate::receive::Row {
+        name: "RatesRecorded",
+        step: "W10.5",
+        topic: "platform.lake.{dataset}.event.rates-recorded",
+        payload_type: "meridian.v1.RatesRecordedEvent",
+        read: rates_recorded,
+    },
+    crate::receive::Row {
+        name: "LivenessRecorded",
+        step: "W10.5",
+        topic: "platform.lake.{dataset}.event.liveness-recorded",
+        payload_type: "meridian.v1.LivenessRecordedEvent",
+        read: liveness_recorded,
     },
 ];
 
@@ -2308,5 +2509,29 @@ fn event_group_changed(payload: &[u8]) -> Result<crate::receive::Read, prost::De
         journal: None,
         cause: None,
         item: plugin::delivery::Item::EventGroupChanged(message),
+    })
+}
+
+/// W10.5: a RatesRecordedEvent, conflated, unscoped.
+fn rates_recorded(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeError> {
+    let message = plugin::RatesRecordedEvent::decode(payload)?;
+    Ok(crate::receive::Read {
+        account: None,
+        directed: Vec::new(),
+        journal: None,
+        cause: None,
+        item: plugin::delivery::Item::RatesRecorded(message),
+    })
+}
+
+/// W10.5: a LivenessRecordedEvent, conflated, unscoped.
+fn liveness_recorded(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeError> {
+    let message = plugin::LivenessRecordedEvent::decode(payload)?;
+    Ok(crate::receive::Read {
+        account: None,
+        directed: Vec::new(),
+        journal: None,
+        cause: None,
+        item: plugin::delivery::Item::LivenessRecorded(message),
     })
 }

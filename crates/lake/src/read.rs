@@ -18,14 +18,18 @@
 //!
 //! The latest is chosen per subject, dataset, kind, venue and the row's
 //! asset (contract v19, approved 2026-10-10): BTC priced in USD and in USDC
-//! on one venue answers both, as a quote's latest per its asset. A catch-up
+//! on one venue answers both, as a quote's latest per its asset; a rate's
+//! per its tenor, maturity and convention besides (contract v27, W10.6).
+//! A rate read as published by a time (contract v27, shared additions 1 and
+//! 2) answers each row key at the version in force by published time among
+//! those recorded by the recorded-time cut. A catch-up
 //! after a watermark (trades, the plan's Q33) asks no source: what was not
 //! recorded since is nothing new.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use meridian_domain::date::Date;
-use meridian_domain::v1::{SourceChoice, SourcePriority, UnansweredReason};
+use meridian_domain::v1::{SourceChoice, SourcePriority, SourceTimeKind, Tenor, UnansweredReason};
 use meridian_pb::v1::ObservationMode;
 
 use crate::config::{DataConfig, Reader};
@@ -77,6 +81,10 @@ pub struct Read {
     pub sources: SourceChoice,
     pub when: When,
     pub as_of_ns: i64,
+    /// A rate read's tenors (contract v27); empty for every tenor.
+    pub tenors: Vec<Tenor>,
+    /// A rate read's published-time cut-off (contract v27); 0 for none.
+    pub published_as_of_ns: i64,
 }
 
 /// What a source declined, by dataset, subject and the date or range its
@@ -119,6 +127,12 @@ fn order_for(read: &Read, against: &Against<'_>, kind: i32, readable: &[String])
             .cloned()
             .collect();
     }
+    // Only a price's priority names a kind (a rate's names none, W10.3).
+    let kind = if read.data_type == DataType::Price {
+        kind
+    } else {
+        0
+    };
     let set = against
         .priorities
         .iter()
@@ -241,10 +255,11 @@ fn why_not(
     (UnansweredReason::NotCovered, false)
 }
 
-/// The latest in force per subject, dataset, kind, venue, length and asset:
-/// what a read of the latest at a valid time answers.
+/// The latest in force per subject, dataset, kind, venue, length and asset,
+/// and a rate's point and convention: what a read of the latest at a valid
+/// time answers.
 fn latest_in_force(rows: Vec<Observation>) -> Vec<Observation> {
-    type Key = (String, String, i32, String, i64, String);
+    type Key = (String, String, i32, String, i64, String, String);
     let mut chosen: BTreeMap<Key, Observation> = BTreeMap::new();
     for row in rows {
         let key = (
@@ -254,6 +269,7 @@ fn latest_in_force(rows: Vec<Observation>) -> Vec<Observation> {
             row.venue().to_string(),
             row.interval_ns(),
             row.asset(),
+            row.point(),
         );
         let later = |held: &Observation| {
             (row.meta().valid_from_ns, row.meta().sequence)
@@ -267,6 +283,49 @@ fn latest_in_force(rows: Vec<Observation>) -> Vec<Observation> {
         }
     }
     chosen.into_values().collect()
+}
+
+/// When a source published a row: its published source time, or where the
+/// source states none, when the lake recorded it (contract v27, W10.4).
+pub fn published_at(row: &Observation) -> i64 {
+    row.meta()
+        .source_times
+        .iter()
+        .find(|time| time.kind == SourceTimeKind::Published as i32)
+        .map_or(row.meta().recorded_at_ns, |time| time.at_ns)
+}
+
+/// Each row key at the version in force by published time (contract v27,
+/// W10.6; shared additions 1 and 2): of the versions given -- every one
+/// recorded by the recorded-time cut -- the latest published by
+/// `published_as_of_ns`, versions ordered by published time, then by
+/// version. A row key nothing of which was published by then answers
+/// nothing.
+pub fn as_published(rows: Vec<Observation>, published_as_of_ns: i64) -> Vec<Observation> {
+    let mut chosen: BTreeMap<(String, i16, String), Observation> = BTreeMap::new();
+    for row in rows {
+        let published = published_at(&row);
+        if published > published_as_of_ns {
+            continue;
+        }
+        let key = (
+            row.dataset().to_string(),
+            row.data_type().code(),
+            row.meta().row_key.clone(),
+        );
+        let later = |held: &Observation| {
+            (published, row.meta().version) > (published_at(held), held.meta().version)
+        };
+        match chosen.get(&key) {
+            Some(held) if !later(held) => {}
+            _ => {
+                chosen.insert(key, row);
+            }
+        }
+    }
+    let mut out: Vec<Observation> = chosen.into_values().collect();
+    out.sort_by_key(|row| (row.dataset().to_string(), row.meta().sequence));
+    out
 }
 
 /// Answer a read from the store, as the reader may read it.
@@ -351,8 +410,40 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
             interval_ns: read.interval_ns,
             when: read.when.clone(),
             as_of_ns: read.as_of_ns,
+            published_as_of_ns: read.published_as_of_ns,
         })
         .map_err(|failed| failed.to_string())?;
+    if read.published_as_of_ns != 0 {
+        rows = as_published(rows, read.published_as_of_ns);
+    }
+    // A rate read narrowed by tenor: a row with no tenor (a fixing, a point
+    // named by maturity) is no tenor asked. A dataset that holds the subject
+    // for the time asked and none of the tenors asked did not publish them:
+    // source silent, never asked again (W10.4, a-tenor-not-published).
+    let mut tenor_silent: BTreeSet<(String, String)> = BTreeSet::new();
+    if !read.tenors.is_empty() {
+        let asked_tenor = |row: &Observation| match row {
+            Observation::Rate(rate) => rate
+                .tenor
+                .as_ref()
+                .is_some_and(|tenor| read.tenors.contains(tenor)),
+            _ => true,
+        };
+        for row in &rows {
+            tenor_silent.insert((alias_of(row.subject()), row.dataset().to_string()));
+        }
+        rows.retain(asked_tenor);
+        for row in &rows {
+            tenor_silent.remove(&(alias_of(row.subject()), row.dataset().to_string()));
+        }
+    }
+    let why_not = |dataset: &str, subject: &str| {
+        if tenor_silent.contains(&(subject.to_string(), dataset.to_string())) {
+            (UnansweredReason::SourceSilent, false)
+        } else {
+            why_not(read, against, dataset, subject)
+        }
+    };
     if matches!(read.when, When::Latest { .. }) {
         rows = latest_in_force(rows);
     }
@@ -410,7 +501,7 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
                     let of: Vec<&Observation> =
                         held.iter().filter(|r| r.dataset() == dataset).collect();
                     if of.is_empty() {
-                        let (reason, ask) = why_not(read, against, dataset, subject);
+                        let (reason, ask) = why_not(dataset, subject);
                         if ask {
                             asks.entry(dataset.clone())
                                 .or_default()
@@ -441,7 +532,7 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
                     .cloned()
                     .collect();
                 if of.is_empty() {
-                    let (reason, ask) = why_not(read, against, dataset, subject);
+                    let (reason, ask) = why_not(dataset, subject);
                     let reason = if ask && asked_one {
                         // One instance is asked at a time: the first that can be.
                         UnansweredReason::NotCovered
@@ -532,7 +623,13 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
             dataset,
             data_type: read.data_type,
             subjects: subjects.into_iter().collect(),
-            kinds: read.kinds.clone(),
+            // A want names prices' kinds alone (W10.7): a rate's want asks
+            // for the subject, every kind and tenor the source publishes.
+            kinds: if read.data_type == DataType::Price {
+                read.kinds.clone()
+            } else {
+                Vec::new()
+            },
             interval_ns: read.interval_ns,
             when: read.when.clone(),
             standing: standing && current,

@@ -107,6 +107,7 @@ fn a_batch_is_numbered_restated_read_as_of_and_retention_recorded() {
         interval_ns: 0,
         when: When::BusinessDate(Date::parse("2026-10-07").unwrap()),
         as_of_ns,
+        published_as_of_ns: 0,
     };
     let now = store.read(&query(0)).unwrap();
     assert_eq!(now.len(), 1);
@@ -264,6 +265,7 @@ fn trades_recorded_after_a_watermark_are_read_whatever_their_valid_time() {
             interval_ns: 0,
             when: When::After([(dataset.clone(), 2)].into()),
             as_of_ns: 0,
+            published_as_of_ns: 0,
         })
         .unwrap();
     assert_eq!(after.len(), 1);
@@ -305,6 +307,7 @@ fn outcome(dataset: &str, subject: &str, stage: i32, value: u64) -> Observation 
             code: "yes".into(),
             text: String::new(),
         }),
+        challenge_ends_at_ns: 0,
     })
 }
 
@@ -333,6 +336,7 @@ fn an_outcomes_every_version_is_read_after_a_watermark() {
         interval_ns: 0,
         when,
         as_of_ns,
+        published_as_of_ns: 0,
     };
     let versions = |rows: Vec<Observation>| -> Vec<u64> {
         rows.iter().map(|row| row.meta().version).collect()
@@ -420,6 +424,7 @@ fn a_closed_day_flag_is_counted_and_amended_beside_its_row() {
         interval_ns: 0,
         when: When::BusinessDate(Date::parse("2026-10-13").unwrap()),
         as_of_ns,
+        published_as_of_ns: 0,
     };
     assert!(store.read(&query(1_500)).unwrap()[0]
         .meta()

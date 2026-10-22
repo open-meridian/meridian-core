@@ -28,6 +28,11 @@ pub fn class_of(kind: InstrumentType) -> Option<AssetClass> {
         InstrumentType::Unspecified => None,
         InstrumentType::MoneyMarketFund => Some(AssetClass::Fund),
         InstrumentType::BinaryEventContract => Some(AssetClass::EventContract),
+        // Contract v27, the rates slice: what the lake observes and nobody
+        // holds.
+        InstrumentType::InterestRate | InstrumentType::RateCurve | InstrumentType::Index => {
+            Some(AssetClass::Referential)
+        }
     }
 }
 
@@ -58,13 +63,21 @@ pub fn words(kind: InstrumentType) -> &'static str {
         InstrumentType::Unspecified => "",
         InstrumentType::MoneyMarketFund => "money market fund",
         InstrumentType::BinaryEventContract => "binary event contract",
+        InstrumentType::InterestRate => "interest rate",
+        InstrumentType::RateCurve => "rate curve",
+        InstrumentType::Index => "index",
     }
 }
 
-/// Every type the list holds, in its order: what a form offers.
-pub const TYPES: [InstrumentType; 2] = [
+/// Every type the list holds, in its order: what a refusal lists. From
+/// contract v27 the referential types too (W1.1), which the platform seeds
+/// and no deployment's form offers.
+pub const TYPES: [InstrumentType; 5] = [
     InstrumentType::MoneyMarketFund,
     InstrumentType::BinaryEventContract,
+    InstrumentType::InterestRate,
+    InstrumentType::RateCurve,
+    InstrumentType::Index,
 ];
 
 /// A type by its name without the prefix, in lower case

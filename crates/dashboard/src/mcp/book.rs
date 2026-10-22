@@ -195,6 +195,46 @@ deployment_time_zone. Answers the setting as read_deployment_time_zone does.",
         Area::Accounts,
         deployment_time_zone_schema,
     ),
+    // Contract v27 (W6.36; rulings 462 and 483): the FX pivot currencies, a
+    // deployment admin's; the set preparable, at may not for agents until
+    // loosened, as the time zone is.
+    spec(
+        "read_fx_pivot_currencies",
+        "Read the FX pivot currencies",
+        "the fiat cash instruments, in order, an analytics valuation crosses a fiat leg through \
+where the lake holds no rate between the two currencies in either direction: each by its INS- \
+ID and ISO 4217 code, USD's and then EUR's where never set (default true), with the last change \
+and who made it. A crypto asset or a stablecoin is never crossed.",
+        true,
+        Area::Accounts,
+        nothing_schema,
+    ),
+    spec(
+        "set_fx_pivot_currencies",
+        "Set the FX pivot currencies",
+        "order the FX pivot currencies: one to four fiat currencies' cash instruments by their \
+INS- IDs, none twice, never a token, with a note saying why, each change its own record \
+(W6.36). An ID that is no fiat cash instrument is refused naming it. Answers the setting as \
+read_fx_pivot_currencies does.",
+        false,
+        Area::Accounts,
+        fx_pivot_currencies_schema,
+    ),
+    // Contract v27 (W10.11; W6.20): one account's execution costs, the
+    // lake's rows, a person's at the read level on that account.
+    spec(
+        "list_execution_costs",
+        "List an account's execution costs",
+        "one account's execution costs, the analytics component's rows in the lake: each \
+execution's cost against each standard benchmark (decision, arrival, placement arrival, mid at \
+fill) in bps, side-adjusted and positive a cost, fees and financing apart, the benchmark's \
+price, moment, dataset and row, the liquidity indicator, venue, last-look rejects and time to \
+fill, or why a benchmark was not measured; by execution, order, trade date or benchmark, paged. \
+Read on the account is needed.",
+        true,
+        Area::AccountReads,
+        execution_costs_schema,
+    ),
     // Contract v26 (W12.6): the analytics routing table, a deployment
     // admin's; the set preparable, at may not for agents until loosened.
     spec(
@@ -293,6 +333,45 @@ fn deployment_time_zone_schema() -> Value {
     })
 }
 
+fn execution_costs_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "account_id": {"type": "string", "minLength": 1},
+            "execution_ids": {"type": "array", "maxItems": 500, "items": {"type": "string"}},
+            "order_id": {"type": "string"},
+            "trade_date": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
+            "benchmarks": {"type": "array", "items": {"type": "string", "enum": [
+                "TCA_BENCHMARK_DECISION", "TCA_BENCHMARK_ARRIVAL",
+                "TCA_BENCHMARK_PLACEMENT_ARRIVAL", "TCA_BENCHMARK_MID_AT_FILL",
+                "TCA_BENCHMARK_INTERVAL_VWAP", "TCA_BENCHMARK_FIX"]}},
+            "page_size": {"type": "integer", "minimum": 0, "maximum": 500},
+            "cursor": {"type": "string"},
+        },
+        "required": ["account_id"],
+        "additionalProperties": false,
+    })
+}
+
+fn fx_pivot_currencies_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "fx_pivot_currencies": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 4,
+                "uniqueItems": true,
+                "items": {"type": "string", "pattern": "^INS-", "description": "a fiat currency's cash instrument"},
+                "description": "tried in order",
+            },
+            "note": note(),
+        },
+        "required": ["fx_pivot_currencies", "note"],
+        "additionalProperties": false,
+    })
+}
+
 fn model_routing_schema() -> Value {
     json!({
         "type": "object",
@@ -370,6 +449,9 @@ pub async fn call(app: &App, caller: &Caller, spec: &Spec, arguments: Value) -> 
         "set_agent_orders_demo_only" => set_agent_orders_demo_only(app, caller, &arguments).await,
         "read_deployment_time_zone" => read_deployment_time_zone(app, caller).await,
         "set_deployment_time_zone" => set_deployment_time_zone(app, caller, &arguments).await,
+        "list_execution_costs" => list_execution_costs(app, caller, &arguments).await,
+        "read_fx_pivot_currencies" => read_fx_pivot_currencies(app, caller).await,
+        "set_fx_pivot_currencies" => set_fx_pivot_currencies(app, caller, &arguments).await,
         "list_model_routing" => list_model_routing(app, caller).await,
         "set_model_routing" => set_model_routing(app, caller, &arguments).await,
         "close_account" => close_account(app, caller, &arguments).await,
@@ -927,6 +1009,175 @@ async fn set_deployment_time_zone(app: &App, caller: &Caller, arguments: &Value)
     }
 }
 
+/// W10.11 (contract v27): one account's execution costs, read only where the
+/// person holds read on that account through some plugin, or administers
+/// the deployment.
+async fn list_execution_costs(app: &App, caller: &Caller, arguments: &Value) -> Value {
+    let mut problems = Problems::default();
+    let Some(top) = object(arguments, "", &mut problems) else {
+        return problems.refusal();
+    };
+    only(
+        top,
+        &[
+            "account_id",
+            "execution_ids",
+            "order_id",
+            "trade_date",
+            "benchmarks",
+            "page_size",
+            "cursor",
+        ],
+        "",
+        &mut problems,
+    );
+    let account_id = text(top, "account_id", "", true, &mut problems);
+    let execution_ids = super::data_sources::strings(top, "execution_ids", 500, &mut problems);
+    let order_id = text(top, "order_id", "", false, &mut problems);
+    let trade_date = text(top, "trade_date", "", false, &mut problems);
+    if !trade_date.is_empty() && !meridian_domain::date::is_date(&trade_date) {
+        problems.add("trade_date", "a date, YYYY-MM-DD");
+    }
+    let mut benchmarks = Vec::new();
+    for (i, name) in super::data_sources::strings(top, "benchmarks", 6, &mut problems)
+        .iter()
+        .enumerate()
+    {
+        match meridian_domain::v1::TcaBenchmark::from_str_name(name) {
+            Some(b) if b != meridian_domain::v1::TcaBenchmark::Unspecified => {
+                benchmarks.push(b as i32)
+            }
+            _ => problems.add(&format!("benchmarks[{i}]"), "a TCA_BENCHMARK_ value"),
+        }
+    }
+    let page_size = top
+        .get("page_size")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(500) as u32;
+    let cursor = text(top, "cursor", "", false, &mut problems);
+    if !problems.is_empty() {
+        return problems.refusal();
+    }
+    let (_, access) = match access_of(app, caller) {
+        Ok(held) => held,
+        Err(refusal) => return refusal,
+    };
+    let reads = access.deployment_admin
+        || access.plugins.keys().any(|plugin| {
+            let held = access.held(plugin);
+            held.accounts.read.contains(&account_id) || held.accounts.write.contains(&account_id)
+        });
+    if !reads {
+        return refused(
+            "not_permitted",
+            &format!("{account_id} is not an account you may read"),
+            vec![json!({"path": "account_id"})],
+        );
+    }
+    let reply: Result<meridian_domain::v1::ListExecutionCostsReply, _> = ask(
+        app,
+        caller,
+        "platform.lake.query.list-execution-costs",
+        "meridian.v1.ListExecutionCostsRequest",
+        meridian_domain::v1::ListExecutionCostsRequest {
+            account_id,
+            execution_ids,
+            order_id,
+            trade_date,
+            benchmarks,
+            as_of_ns: 0,
+            page_size,
+            cursor,
+        },
+        WAIT,
+    )
+    .await;
+    match reply {
+        Err(failed) => bus_refused(failed, "account_id"),
+        Ok(reply) => json!({"outcome": "unchanged", "data": {
+            "costs": reply.costs.iter().map(super::lake_rows::execution_cost).collect::<Vec<_>>(),
+            "next_cursor": reply.next_cursor,
+        }}),
+    }
+}
+
+/// W6.36 (contract v27): the FX pivot currencies read, a deployment admin's.
+async fn read_fx_pivot_currencies(app: &App, caller: &Caller) -> Value {
+    let (_, access) = match access_of(app, caller) {
+        Ok(held) => held,
+        Err(refusal) => return refusal,
+    };
+    if !access.deployment_admin {
+        return refused(
+            "not_permitted",
+            "the FX pivot currencies are a deployment admin's to read",
+            Vec::new(),
+        );
+    }
+    match crate::admin::fx_pivots::read(&app.bus).await {
+        Ok(setting) => {
+            let codes =
+                crate::admin::fx_pivots::codes(&app.bus, &setting.fx_pivot_currencies).await;
+            json!({"outcome": "unchanged", "data": crate::admin::fx_pivots::json(&setting, &codes)})
+        }
+        Err(failed) => refused("unavailable", &failed, Vec::new()),
+    }
+}
+
+/// W6.36 (contract v27): the FX pivot currencies set, a deployment admin's;
+/// the conductor checks each is fiat and keeps the change.
+async fn set_fx_pivot_currencies(app: &App, caller: &Caller, arguments: &Value) -> Value {
+    let mut problems = Problems::default();
+    let Some(top) = object(arguments, "", &mut problems) else {
+        return problems.refusal();
+    };
+    only(top, &["fx_pivot_currencies", "note"], "", &mut problems);
+    let pivots = super::data_sources::strings(
+        top,
+        "fx_pivot_currencies",
+        crate::admin::fx_pivots::MOST,
+        &mut problems,
+    );
+    if pivots.is_empty() && problems.is_empty() {
+        problems.add("fx_pivot_currencies", "one to four fiat cash instruments");
+    }
+    let reason = text(top, "note", "", true, &mut problems);
+    if !problems.is_empty() {
+        return problems.refusal();
+    }
+    let (_, access) = match access_of(app, caller) {
+        Ok(held) => held,
+        Err(refusal) => return refusal,
+    };
+    if !access.deployment_admin {
+        return refused(
+            "not_permitted",
+            "the FX pivot currencies are a deployment admin's",
+            Vec::new(),
+        );
+    }
+    let reply: Result<meridian_domain::v1::FxPivotCurrenciesSetting, _> = ask(
+        app,
+        caller,
+        crate::admin::fx_pivots::SET_FX_PIVOT_CURRENCIES,
+        "meridian.v1.SetFxPivotCurrenciesRequest",
+        meridian_domain::v1::SetFxPivotCurrenciesRequest {
+            fx_pivot_currencies: pivots,
+            reason,
+        },
+        CHANGING,
+    )
+    .await;
+    match reply {
+        Err(failed) => bus_refused(failed, "fx_pivot_currencies"),
+        Ok(reply) => {
+            let codes = crate::admin::fx_pivots::codes(&app.bus, &reply.fx_pivot_currencies).await;
+            json!({"outcome": "made", "data": crate::admin::fx_pivots::json(&reply, &codes)})
+        }
+    }
+}
+
 /// W12.6 (contract v26): the routing table read, a deployment admin's.
 async fn list_model_routing(app: &App, caller: &Caller) -> Value {
     let (_, access) = match access_of(app, caller) {
@@ -1115,6 +1366,16 @@ pub const PARITY: &[(&str, &str)] = &[
         "/ agents' guard",
         "read_agent_orders_demo_only set_agent_orders_demo_only",
     ),
+    // Contract v27 (W6.36): the Settings' FX pivot currencies tab and its
+    // form.
+    (
+        "tab fx-pivots",
+        "read_fx_pivot_currencies set_fx_pivot_currencies",
+    ),
+    ("/admin/fx-pivot-currencies", "set_fx_pivot_currencies"),
+    // Contract v27 (W10.11): the lake's execution-cost rows, which a
+    // plugin's TCA page draws; core draws no page of its own for them.
+    ("lake ExecutionCost rows", "list_execution_costs"),
 ];
 
 #[cfg(test)]

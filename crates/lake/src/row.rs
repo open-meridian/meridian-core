@@ -1,12 +1,14 @@
 //! One row of the lake under its envelope: a price or a bar (the 1a), a trade
 //! or a quote (the 1b, contract v19), an event contract's outcome (the 1c,
-//! contract v23).
+//! contract v23), a rate (contract v27, the rates slice).
 
 use std::collections::BTreeSet;
 
 use meridian_domain::exact::Exact;
 use meridian_domain::lake;
-use meridian_domain::v1::{Bar, Money, ObservationMeta, Outcome, Price, Quote, Trade};
+use meridian_domain::v1::{
+    Bar, ExecutionCost, Money, ObservationMeta, Outcome, Price, Quote, Rate, Trade,
+};
 use meridian_pb::v1::Decimal;
 use prost::Message;
 
@@ -20,6 +22,10 @@ pub enum DataType {
     Quote,
     /// Contract v23.
     Outcome,
+    /// Contract v27 (W10.11): the analytics component's, account-scoped.
+    ExecutionCost,
+    /// Contract v27, the rates slice (W10.4).
+    Rate,
 }
 
 impl DataType {
@@ -32,6 +38,8 @@ impl DataType {
             lake::TRADE => Some(DataType::Trade),
             lake::QUOTE => Some(DataType::Quote),
             lake::OUTCOME => Some(DataType::Outcome),
+            lake::EXECUTION_COST => Some(DataType::ExecutionCost),
+            lake::RATE => Some(DataType::Rate),
             _ => None,
         }
     }
@@ -43,6 +51,8 @@ impl DataType {
             DataType::Trade => lake::TRADE,
             DataType::Quote => lake::QUOTE,
             DataType::Outcome => lake::OUTCOME,
+            DataType::ExecutionCost => lake::EXECUTION_COST,
+            DataType::Rate => lake::RATE,
         }
     }
 
@@ -53,6 +63,8 @@ impl DataType {
             DataType::Trade => 3,
             DataType::Quote => 4,
             DataType::Outcome => 5,
+            DataType::Rate => 6,
+            DataType::ExecutionCost => 7,
         }
     }
 
@@ -63,6 +75,8 @@ impl DataType {
             3 => Some(DataType::Trade),
             4 => Some(DataType::Quote),
             5 => Some(DataType::Outcome),
+            6 => Some(DataType::Rate),
+            7 => Some(DataType::ExecutionCost),
             _ => None,
         }
     }
@@ -77,7 +91,12 @@ impl DataType {
     /// trade's, a quote's or an outcome's (contract v23, the lake plan's
     /// vL1c, items 3 and 11).
     pub fn dated(self) -> bool {
-        matches!(self, DataType::Price | DataType::Bar)
+        // An execution cost is dated by its execution's trade date; a rate
+        // by the business day it is for, in its dataset's zone.
+        matches!(
+            self,
+            DataType::Price | DataType::Bar | DataType::ExecutionCost | DataType::Rate
+        )
     }
 }
 
@@ -92,6 +111,8 @@ pub enum Observation {
     Trade(Trade),
     Quote(Quote),
     Outcome(Outcome),
+    ExecutionCost(ExecutionCost),
+    Rate(Rate),
 }
 
 impl Observation {
@@ -102,6 +123,8 @@ impl Observation {
             Observation::Trade(_) => DataType::Trade,
             Observation::Quote(_) => DataType::Quote,
             Observation::Outcome(_) => DataType::Outcome,
+            Observation::ExecutionCost(_) => DataType::ExecutionCost,
+            Observation::Rate(_) => DataType::Rate,
         }
     }
 
@@ -113,6 +136,8 @@ impl Observation {
             Observation::Trade(trade) => trade.meta.as_ref(),
             Observation::Quote(quote) => quote.meta.as_ref(),
             Observation::Outcome(outcome) => outcome.meta.as_ref(),
+            Observation::ExecutionCost(cost) => cost.meta.as_ref(),
+            Observation::Rate(rate) => rate.meta.as_ref(),
         };
         meta.unwrap_or_else(|| NONE.get_or_init(ObservationMeta::default))
     }
@@ -124,14 +149,29 @@ impl Observation {
             Observation::Trade(trade) => trade.meta.get_or_insert_with(Default::default),
             Observation::Quote(quote) => quote.meta.get_or_insert_with(Default::default),
             Observation::Outcome(outcome) => outcome.meta.get_or_insert_with(Default::default),
+            Observation::ExecutionCost(cost) => cost.meta.get_or_insert_with(Default::default),
+            Observation::Rate(rate) => rate.meta.get_or_insert_with(Default::default),
         }
     }
 
-    /// A price's kind; 0 for the other data types.
+    /// A price's kind, or from contract v27 a rate's; 0 for the other data
+    /// types.
     pub fn kind(&self) -> i32 {
         match self {
             Observation::Price(price) => price.kind,
+            Observation::Rate(rate) => rate.kind,
             _ => 0,
+        }
+    }
+
+    /// A rate's point and convention (contract v27, W10.5, W10.6): its
+    /// tenor or maturity and its convention, what its latest is chosen and
+    /// its deliveries conflated per beside the kind; empty for the other
+    /// data types.
+    pub fn point(&self) -> String {
+        match self {
+            Observation::Rate(rate) => lake::rate_point(rate),
+            _ => String::new(),
         }
     }
 
@@ -163,6 +203,9 @@ impl Observation {
             Observation::Trade(trade) => lake::asset_key(trade.price.as_ref()),
             Observation::Quote(quote) => lake::quote_asset(quote),
             Observation::Outcome(outcome) => lake::asset_key(outcome.settlement_value.as_ref()),
+            Observation::ExecutionCost(cost) => lake::asset_key(cost.execution_price.as_ref()),
+            // A rate is no amount: its unit is in its point's key.
+            Observation::Rate(_) => String::new(),
         }
     }
 
@@ -206,6 +249,8 @@ impl Observation {
             Observation::Trade(trade) => trade.encode_to_vec(),
             Observation::Quote(quote) => quote.encode_to_vec(),
             Observation::Outcome(outcome) => outcome.encode_to_vec(),
+            Observation::ExecutionCost(cost) => cost.encode_to_vec(),
+            Observation::Rate(rate) => rate.encode_to_vec(),
         }
     }
 
@@ -216,6 +261,8 @@ impl Observation {
             DataType::Trade => Observation::Trade(Trade::decode(bytes)?),
             DataType::Quote => Observation::Quote(Quote::decode(bytes)?),
             DataType::Outcome => Observation::Outcome(Outcome::decode(bytes)?),
+            DataType::ExecutionCost => Observation::ExecutionCost(ExecutionCost::decode(bytes)?),
+            DataType::Rate => Observation::Rate(Rate::decode(bytes)?),
         })
     }
 
@@ -266,6 +313,24 @@ impl Observation {
                 .as_mut()
                 .map(|m| vec![("settlement_value", m)])
                 .unwrap_or_default(),
+            Observation::ExecutionCost(cost) => {
+                let mut out = Vec::new();
+                if let Some(m) = cost.benchmark_price.as_mut() {
+                    out.push(("benchmark_price", m));
+                }
+                if let Some(m) = cost.execution_price.as_mut() {
+                    out.push(("execution_price", m));
+                }
+                if let Some(m) = cost.notional.as_mut() {
+                    out.push(("notional", m));
+                }
+                out
+            }
+            Observation::Rate(rate) => rate
+                .volume
+                .as_mut()
+                .map(|m| vec![("volume", m)])
+                .unwrap_or_default(),
         }
     }
 
@@ -273,6 +338,19 @@ impl Observation {
     /// gave, decimals compared by value so 764.2 is 764.20, and none of what
     /// the lake decides or the sidecar stamps.
     pub fn same_value(&self, other: &Observation) -> bool {
+        self.same_but_raw(other) && self.meta().raw == other.meta().raw
+    }
+
+    /// Whether two rows say the same thing but for their raw reference: a
+    /// rate's confirmation (contract v27, W10.4; research-kinds' shared
+    /// addition 2), recorded and not counted as a restatement.
+    pub fn confirms(&self, other: &Observation) -> bool {
+        self.data_type() == DataType::Rate
+            && self.meta().raw != other.meta().raw
+            && self.same_but_raw(other)
+    }
+
+    fn same_but_raw(&self, other: &Observation) -> bool {
         let said = |meta: &ObservationMeta| {
             let source = meta.source.clone().unwrap_or_default();
             (
@@ -284,7 +362,6 @@ impl Observation {
                 meta.valid_until_ns,
                 meta.business_date.clone(),
                 meta.source_times.clone(),
-                meta.raw.clone(),
                 meta.unconverted.clone(),
             )
         };
@@ -325,6 +402,54 @@ impl Observation {
                     && same_money(&a.settlement_value, &b.settlement_value)
                     && a.settled_at_ns == b.settled_at_ns
                     && a.determination_as_reported == b.determination_as_reported
+                    // Contract v27 (W10.4): the venue's challenge deadline.
+                    && a.challenge_ends_at_ns == b.challenge_ends_at_ns
+            }
+            (Observation::ExecutionCost(a), Observation::ExecutionCost(b)) => {
+                same_money(&a.benchmark_price, &b.benchmark_price)
+                    && same_money(&a.execution_price, &b.execution_price)
+                    && same_money(&a.notional, &b.notional)
+                    && same_decimal(&a.cost_bps, &b.cost_bps)
+                    && same_decimal(&a.fees_bps, &b.fees_bps)
+                    && same_decimal(&a.financing_bps, &b.financing_bps)
+                    && ExecutionCost {
+                        meta: None,
+                        benchmark_price: None,
+                        execution_price: None,
+                        notional: None,
+                        cost_bps: None,
+                        fees_bps: None,
+                        financing_bps: None,
+                        ..a.clone()
+                    } == ExecutionCost {
+                        meta: None,
+                        benchmark_price: None,
+                        execution_price: None,
+                        notional: None,
+                        cost_bps: None,
+                        fees_bps: None,
+                        financing_bps: None,
+                        ..b.clone()
+                    }
+            }
+            (Observation::Rate(a), Observation::Rate(b)) => {
+                let value = |rate: &Rate| rate.value.clone().unwrap_or_default();
+                let (va, vb) = (value(a), value(b));
+                a.kind == b.kind
+                    && same_decimal(&va.value, &vb.value)
+                    && (va.unit, &va.index_base, &va.ucum_code)
+                        == (vb.unit, &vb.index_base, &vb.ucum_code)
+                    && a.value.is_some() == b.value.is_some()
+                    && a.convention == b.convention
+                    && a.tenor == b.tenor
+                    && a.maturity_date == b.maturity_date
+                    && a.preliminary == b.preliminary
+                    && same_money(&a.volume, &b.volume)
+                    && a.transaction_count == b.transaction_count
+                    && a.percentiles.len() == b.percentiles.len()
+                    && a.percentiles.iter().zip(&b.percentiles).all(|(x, y)| {
+                        x.percentile == y.percentile && same_decimal(&x.value, &y.value)
+                    })
             }
             _ => false,
         }
@@ -341,6 +466,9 @@ impl Observation {
             Observation::Trade(trade) => lake::strip_trade(trade, allowed),
             Observation::Quote(quote) => lake::strip_quote(quote, allowed),
             Observation::Outcome(outcome) => lake::strip_outcome(outcome, allowed),
+            // Read within the reader's account scope, never by entitlement.
+            Observation::ExecutionCost(_) => Vec::new(),
+            Observation::Rate(rate) => lake::strip_rate(rate, allowed),
         }
     }
 }

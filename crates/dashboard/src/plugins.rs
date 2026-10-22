@@ -1039,6 +1039,9 @@ pub(crate) async fn frame(
             in_admin: false,
             // The area's head carries it, with the plugin filled in.
             report: crate::html::Report::Omitted,
+            // Manage, for a deployment admin: inside the settings' shell,
+            // Plugins current, its own tabs kept and no second sidebar (450).
+            sidebar: (level == AccessLevel::Admin && access.deployment_admin).then_some("plugins"),
         },
     );
     // The vendor's text is drawn under the documentation's policy: no script

@@ -2206,6 +2206,48 @@ impl Store for PostgresStore {
             }))
     }
 
+    fn set_fx_pivot_currencies(
+        &self,
+        pivots: &[String],
+        author: &Author,
+        at_ns: i64,
+    ) -> Result<()> {
+        self.conn()?
+            .execute(
+                "INSERT INTO config_fx_pivot_change
+                        (fx_pivot_currencies, changed_by, through_delegation, client_name,
+                         prepared_call_id, changed_at_ns, note)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                &[
+                    &pivots,
+                    &author.by,
+                    &author.delegation,
+                    &author.client,
+                    &author.prepared_call_id,
+                    &at_ns,
+                    &author.note,
+                ],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
+    fn fx_pivot_currencies(&self) -> Result<Option<crate::store::FxPivotChange>> {
+        Ok(self
+            .conn()?
+            .query_opt(
+                "SELECT fx_pivot_currencies, changed_at_ns, changed_by FROM config_fx_pivot_change
+                  ORDER BY change_id DESC LIMIT 1",
+                &[],
+            )
+            .map_err(unavailable)?
+            .map(|row| crate::store::FxPivotChange {
+                fx_pivot_currencies: row.get(0),
+                changed_at_ns: row.get(1),
+                changed_by: row.get(2),
+            }))
+    }
+
     fn set_reports_usage(&self, reports_usage: bool, author: &Author, at_ns: i64) -> Result<()> {
         self.conn()?
             .execute(

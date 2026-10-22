@@ -389,6 +389,49 @@ fn declared(declaration: &PluginDeclaration, roles: &[String]) -> Result<(), Str
             );
         }
     }
+    // A pricing plugin's models (W12.3, contract v27; ruling 324): refused on
+    // a version not holding pricing; at most 32, each model id and version
+    // once, each version 1 or more.
+    if !declaration.pricing_models.is_empty() {
+        use meridian_pb::bounds::{
+            PLUGIN_DECLARATION_PRICING_MODELS_COUNT, PRICING_MODEL_DECLARATION_MODEL_VERSION_RANGE,
+        };
+        if !roles.iter().any(|role| role == "pricing") {
+            return Err(
+                "declaration.pricing_models is declared by a version not holding pricing; only \
+                 pricing declares the models it answers"
+                    .into(),
+            );
+        }
+        if !PLUGIN_DECLARATION_PRICING_MODELS_COUNT.admits(declaration.pricing_models.len()) {
+            return Err(format!(
+                "declaration.pricing_models names {}; at most {}",
+                declaration.pricing_models.len(),
+                PLUGIN_DECLARATION_PRICING_MODELS_COUNT.most
+            ));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for (i, model) in declaration.pricing_models.iter().enumerate() {
+            if model.model_id.trim().is_empty() {
+                return Err(format!(
+                    "declaration.pricing_models[{i}].model_id names no model id"
+                ));
+            }
+            if !PRICING_MODEL_DECLARATION_MODEL_VERSION_RANGE.admits(i64::from(model.model_version))
+            {
+                return Err(format!(
+                    "declaration.pricing_models[{i}].model_version is {}; 1 or more",
+                    model.model_version
+                ));
+            }
+            if !seen.insert((model.model_id.clone(), model.model_version)) {
+                return Err(format!(
+                    "declaration.pricing_models[{i}] names {} v{} twice",
+                    model.model_id, model.model_version
+                ));
+            }
+        }
+    }
     // A data plugin's catalogue (W8.1, contract v18), as `meridian plugin check`
     // says first and the sidecar again at registration.
     if let Some(catalogue) = &declaration.catalogue {

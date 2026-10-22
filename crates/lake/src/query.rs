@@ -56,6 +56,8 @@ pub fn kind_of(kind: &str) -> Option<DataType> {
         "trades" => Some(DataType::Trade),
         "quotes" => Some(DataType::Quote),
         "outcomes" => Some(DataType::Outcome),
+        // Contract v27, the rates slice: read as prices are.
+        "rates" => Some(DataType::Rate),
         _ => None,
     }
 }
@@ -103,6 +105,11 @@ fn keep_named(row: &mut Observation, named: &BTreeSet<String>) {
         Observation::Outcome(outcome) => {
             lake::strip_outcome(outcome, named);
         }
+        Observation::Rate(rate) => {
+            lake::strip_rate(rate, named);
+        }
+        // Never a QueryLake kind: read by ListExecutionCosts alone.
+        Observation::ExecutionCost(_) => {}
     }
 }
 
@@ -327,6 +334,8 @@ impl Lake {
                         page_size: PAGE,
                         cursor,
                         after: None,
+                        tenors: Vec::new(),
+                        published_as_of_ns: 0,
                     }
                 };
             // Every page of one read, until the limit is passed.
@@ -414,6 +423,8 @@ impl Lake {
                 Observation::Trade(trade) => reply.trades.push(trade),
                 Observation::Quote(quote) => reply.quotes.push(quote),
                 Observation::Outcome(outcome) => reply.outcomes.push(outcome),
+                Observation::Rate(rate) => reply.rates.push(rate),
+                Observation::ExecutionCost(_) => {}
             }
         }
         Ok(reply)

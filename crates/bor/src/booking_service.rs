@@ -202,6 +202,11 @@ pub fn member_views(store: &dyn Store, members: &[String]) -> BTreeMap<String, M
             .and_then(|blocks| blocks.into_iter().next())
             .map(|(_, block)| block)
             .unwrap_or_default();
+        let value_key = if held.order.value_date.is_empty() {
+            format!("spot@{}", crate::dates::date_of(held.opened_at_ns))
+        } else {
+            held.order.value_date.clone()
+        };
         views.insert(
             member.clone(),
             MemberView {
@@ -213,6 +218,8 @@ pub fn member_views(store: &dyn Store, members: &[String]) -> BTreeMap<String, M
                 idle,
                 instructed,
                 in_block,
+                quote_currency: held.order.quote_currency.clone(),
+                value_key,
             },
         );
     }
@@ -316,6 +323,48 @@ fn said(
     }
 }
 
+/// The child entries linking each of a net's members to it (W11.1, contract
+/// v27), each in the member's own account, idempotent by its key. Says how
+/// many it made.
+pub fn link_net_members(
+    bus: &Bus,
+    store: &dyn Store,
+    net_account_id: &str,
+    net_order_id: &str,
+    members: &[String],
+) -> usize {
+    let now = bus.clock().now_ns();
+    let ctx = Context {
+        instance_id: bus.instance_id().to_string(),
+        event_time_ns: now,
+        received_at_ns: now,
+        committed_at_ns: now,
+        ..Default::default()
+    };
+    let mut made = 0;
+    for member in members {
+        let Ok(Some(account)) = store.owner(Record::Order, member) else {
+            continue;
+        };
+        let key = format!("net-link:{net_order_id}:{member}");
+        let acted = store.act(&account, "", &key, key.as_bytes(), &mut |book, head| {
+            match crate::order_decide::link_net_member(
+                book,
+                head,
+                &ctx,
+                member,
+                net_order_id,
+                net_account_id,
+            )? {
+                Some(made) => Ok(crate::service::decided(made, Vec::new())),
+                None => Err(StoreError::Invalid(NOTHING_OWED.into())),
+            }
+        });
+        made += said(bus, acted, None, None);
+    }
+    made
+}
+
 /// Every child entry owed, across the deployment (W11.30): each allocation of
 /// a live booking received by its account, and each received allocation its
 /// booking no longer carries withdrawn. Says how many it made.
@@ -329,6 +378,7 @@ pub fn sweep_children(bus: &Bus, store: &dyn Store) -> Result<usize, String> {
     let mut received_by: BTreeSet<(String, String, String)> = BTreeSet::new();
     let mut carried_by: BTreeSet<(String, String, String)> = BTreeSet::new();
     let mut receiving: Vec<(String, String, String, String)> = Vec::new();
+    let mut nets: Vec<(String, String, Vec<String>)> = Vec::new();
     for account in &accounts {
         let book = store.book(account).map_err(|failed| failed.to_string())?;
         for (id, held) in &book.ledger.bookings {
@@ -346,13 +396,25 @@ pub fn sweep_children(bus: &Bus, store: &dyn Store) -> Result<usize, String> {
                 .ledger
                 .orders
                 .get(&held.booking.order_id)
-                .map(|order| order.order.block_member_order_ids.clone())
+                .map(|order| booking::joined_members(&order.order))
                 .unwrap_or_default();
             let ctx = Context {
                 members: member_views(store, &members),
                 ..Default::default()
             };
             moves.extend(booking::child_moves(&book, id, &ctx).map_err(|f| f.to_string())?);
+        }
+        // Contract v27 (W11.1): each live net's members linked to it.
+        for (id, held) in &book.ledger.orders {
+            if !held.order.net_member_order_ids.is_empty()
+                && book.ledger.order_live(id).unwrap_or(false)
+            {
+                nets.push((
+                    account.clone(),
+                    id.clone(),
+                    held.order.net_member_order_ids.clone(),
+                ));
+            }
         }
         for ((booking_id, allocation_id), received) in &book.ledger.received {
             received_by.insert((account.clone(), booking_id.clone(), allocation_id.clone()));
@@ -380,7 +442,11 @@ pub fn sweep_children(bus: &Bus, store: &dyn Store) -> Result<usize, String> {
         })
         .map(|(account, booking_id, allocation_id, _)| (account, booking_id, allocation_id))
         .collect();
-    Ok(make_children(bus, store, &moves, &withdrawals, None, None))
+    let mut made = make_children(bus, store, &moves, &withdrawals, None, None);
+    for (account, net, members) in &nets {
+        made += link_net_members(bus, store, account, net, members);
+    }
+    Ok(made)
 }
 
 /// Sweep now, and then every `every`, for as long as the process runs.
@@ -1123,6 +1189,6 @@ fn block_members(store: &dyn Store, account: &str, order_id: &str) -> Vec<String
     book.ledger
         .orders
         .get(order_id)
-        .map(|held| held.order.block_member_order_ids.clone())
+        .map(|held| booking::joined_members(&held.order))
         .unwrap_or_default()
 }

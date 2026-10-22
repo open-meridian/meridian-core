@@ -44,6 +44,9 @@ needed?" So, in headless Chromium:
 - the Model routing tab (contract v26, W12.6): each model id on one line,
   its implementation and since when, and its Change dialog, at 375, 582 and
   1280 wide;
+- the FX pivot currencies tab (contract v27, W6.36): the pivots in order by
+  their codes, and its Change dialog of four codes, at 375, 582 and 1280 wide
+  in light and dark;
 - the Service accounts tab (contract v21): one line an account behind the
   kit's pager, its dialog within the viewport, one created from it prepare
   only by default; and the Access tab's Runs as, one line a role, nobody
@@ -479,7 +482,11 @@ def the_raw_records_and_the_holds(browser, prefix):
                 check(not problems, f"the Summary with its archive allowed fits one screen"
                       f"{': ' + '; '.join(problems) if problems else ''}")
                 page.screenshot(path=os.path.join(OUT, f"{prefix}-summary-archive-allowed-{size}.png"))
+                # A destructive act asks in a dialog (351's audit): why, then
+                # the act's own button.
                 page.click("#records [data-withdraw-archive]")
+                page.fill("dialog#om-confirm textarea[name=why]", "No longer needed.")
+                page.click("dialog#om-confirm [data-confirm-act]")
                 settled(page)
                 said = page.inner_text("#records .archive-state")
                 check("Archive withdrawn" in said, f"withdrawn, it says so again: {said}")
@@ -843,15 +850,18 @@ def a_secret_says_where_it_stands(browser, prefix):
               f"{': ' + '; '.join(problems) if problems else ''}")
         page.screenshot(path=os.path.join(OUT, f"{prefix}-secret-optional-{size}.png"))
         if size == "desktop" and PASS != "fit":
-            asked = []
-            page.once("dialog", lambda d: (asked.append(d.message), d.dismiss()))
+            # Asked in the chrome's dialog (351's audit), declined by Cancel.
             page.click("[data-setting=webhook_token] [data-remove]")
-            page.wait_for_timeout(400)
-            check(asked and asked[0].startswith("Remove Webhook token?")
+            page.wait_for_timeout(300)
+            asked = page.inner_text("dialog#om-confirm[open] [data-confirm-said]")
+            page.click("dialog#om-confirm [data-confirm-cancel]")
+            page.wait_for_timeout(300)
+            check(asked.startswith("Remove Webhook token?")
                   and page.locator("[data-setting=webhook_token] [data-remove]").count() == 1,
-                  f"Remove asks first, and declined, nothing is sent: {asked}")
-            page.once("dialog", lambda d: d.accept())
+                  f"Remove asks first, and declined, nothing is sent: {asked!r}")
             page.click("[data-setting=webhook_token] [data-remove]")
+            page.fill("dialog#om-confirm textarea[name=why]", "Rotated at the vendor.")
+            page.click("dialog#om-confirm [data-confirm-act]")
             settled(page)
             after = page.get_attribute("[data-setting=webhook_token] input[type=password]", "placeholder")
             check(after == "Not set" and not page.locator("[data-setting=webhook_token] [data-remove]").count(),
@@ -1133,6 +1143,13 @@ def the_registry_pages(browser, prefix):
                 if name == "installed":
                     check(page.locator("[data-pulled]").count() == 1,
                           f"at {size}, {scheme} the pulled version's plugin is warned")
+                    # v27 stage E: each row says where its versions came from.
+                    sources = page.evaluate("() => [...document.querySelectorAll('table.installed tbody tr')]"
+                                            ".map(r => { const c = r.querySelector('td[data-source]');"
+                                            " return c && c.offsetParent !== null ? c.textContent.trim() : ''; })")
+                    words = {"Local", "Community", "Verified"}
+                    check(sources and all(s and set(s.split(", ")) <= words for s in sources),
+                          f"at {size}, {scheme} each Installed row shows its source: {sources}")
                 if name == "plugin-versions":
                     check(page.locator("[data-pulled]").count() >= 1,
                           f"at {size}, {scheme} the pulled version is warned on its row")
@@ -1194,6 +1211,168 @@ def the_time_zone_tab(browser, prefix):
         page.screenshot(path=os.path.join(OUT, f"v26-{prefix}-time-zone-dialog-{size}.png"))
         check(not errors, f"the Time zone tab at {size} ran without a script error: {errors}")
         ctx.close()
+
+
+def the_fx_pivots_tab(browser, prefix):
+    """Contract v27 (W6.36; ruling 483): the Settings' FX pivot currencies
+    tab -- the pivots in order by their codes, the last change and who made
+    it -- and its Change dialog of four codes and a reason, each on one
+    screen at the three sizes, in light and dark, with no sideways scroll."""
+    for scheme in ("light", "dark"):
+        for size, width, height in V24_SIZES:
+            ctx = context(browser, width, height, scheme=scheme)
+            page = ctx.new_page()
+            errors = []
+            page.on("pageerror", lambda e: errors.append(str(e)))
+            page.goto(ADMIN_PAGE + "#fx-pivots")
+            settled(page)
+            said = page.inner_text("#fx-pivots")
+            if PASS == "fit":
+                # Never set (ruling 512): the readers' fallback, said.
+                check("USD, EUR (default)" in said and "never changed" in said,
+                      f"at {size} ({scheme}) the tab says the default never set: {said[:200]!r}")
+            else:
+                check("USD" in said and "set " in said,
+                      f"at {size} ({scheme}) the tab says the pivots by code and who set them: {said[:200]!r}")
+            m = page.evaluate(MEASURE)
+            measured(page, f"fx-pivots at {size} {scheme}", f"v27-{prefix}-fx-pivots-{size}-{scheme}.png")
+            check(m["tall"] <= 0, f"the FX pivot currencies tab at {size} ({scheme}) fits one screen: {m['tall']}px taller")
+            page.click("#fx-pivots button[data-dialog-open=fx-pivots-change]")
+            page.wait_for_timeout(300)
+            boxed = inside_the_viewport(page)
+            check(not boxed, f"at {size} ({scheme}) the pivots' dialog stays within the viewport{': ' + boxed if boxed else ''}")
+            inside = page.evaluate(INSIDE)
+            check(not inside, f"at {size} ({scheme}) nothing in the pivots' dialog reaches past it: {inside}")
+            page.screenshot(path=os.path.join(OUT, f"v27-{prefix}-fx-pivots-dialog-{size}-{scheme}.png"))
+            check(not errors, f"the FX pivot currencies tab at {size} ({scheme}) ran without a script error: {errors}")
+            ctx.close()
+
+
+def the_settings_sidebar(browser, prefix):
+    """Rulings 447 to 451 (v27 stage E, kit 0.13.0's om-sidebar): the
+    settings' grouped sidebar beside /admin and its separate pages -- exactly
+    one current item, following the hash and the address; collapsed by
+    keyboard on a desktop and remembered across a reload; a drawer below
+    768 px opened from Menu by keyboard, focus on the current item, closed
+    by Escape with focus back on Menu -- at 375, 582 and 1280 px, light and
+    dark, with no sideways scroll."""
+    current = "() => [...document.querySelectorAll('om-sidebar a[aria-current=page]')].map(a => a.textContent.trim())"
+    for scheme in ("light", "dark"):
+        for size, width, height in V24_SIZES:
+            ctx = context(browser, width, height, scheme=scheme)
+            page = ctx.new_page()
+            errors = []
+            page.on("pageerror", lambda e: errors.append(str(e)))
+            page.goto(ADMIN_PAGE + "#holds")
+            settled(page)
+            said = page.evaluate(current)
+            check(said == ["Holds"], f"at {size} ({scheme}) one item is current, Holds: {said}")
+            page.evaluate("h => { location.hash = h; }", "#accounts")
+            page.wait_for_timeout(200)
+            said = page.evaluate(current)
+            check(said == ["Accounts"], f"at {size} ({scheme}) the current item follows the hash: {said}")
+            measured(page, f"settings sidebar at {size} {scheme}", f"v27-{prefix}-sidebar-{size}-{scheme}.png")
+            if width < 768:
+                page.focus("om-sidebar .om-sidebar-open")
+                page.keyboard.press("Enter")
+                page.wait_for_timeout(300)
+                drawer = page.locator("dialog.om-sidebar-drawer[open]")
+                check(drawer.count() == 1, f"at {size} ({scheme}) Menu opens the drawer by keyboard")
+                focused = page.evaluate("() => document.activeElement && document.activeElement.getAttribute('aria-current')")
+                check(focused == "page", f"at {size} ({scheme}) the focus is on the current item: {focused}")
+                page.screenshot(path=os.path.join(OUT, f"v27-{prefix}-sidebar-drawer-{size}-{scheme}.png"))
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(300)
+                back = page.evaluate("() => document.activeElement && document.activeElement.classList.contains('om-sidebar-open')")
+                check(page.locator("dialog.om-sidebar-drawer[open]").count() == 0 and back,
+                      f"at {size} ({scheme}) Escape closes the drawer, the focus back on Menu")
+            else:
+                collapsed = "() => document.querySelector('om-sidebar').collapsed"
+                page.focus("om-sidebar .om-sidebar-collapse")
+                page.keyboard.press("Enter")
+                page.wait_for_timeout(200)
+                check(page.evaluate(collapsed), f"at {size} ({scheme}) the sidebar collapses by keyboard")
+                page.reload()
+                settled(page)
+                check(page.evaluate(collapsed), f"at {size} ({scheme}) collapsed is remembered across a reload")
+                page.screenshot(path=os.path.join(OUT, f"v27-{prefix}-sidebar-collapsed-{size}-{scheme}.png"))
+                page.focus("om-sidebar .om-sidebar-collapse")
+                page.keyboard.press("Enter")
+                page.wait_for_timeout(200)
+                check(not page.evaluate(collapsed), f"at {size} ({scheme}) and expands again")
+            for path, item in (("/admin/data-sources", "Data sources"), ("/admin/instruments", "Instruments")):
+                page.goto(f"{BASE}{path}")
+                settled(page)
+                said = page.evaluate(current)
+                check(said == [item], f"at {size} ({scheme}) {path} is {item} in the sidebar: {said}")
+                m = page.evaluate(MEASURE)
+                check(m["wide"] <= 0, f"at {size} ({scheme}) {path} scrolls no wider than the screen: {m['wide']}px")
+            check(not errors, f"the sidebar at {size} ({scheme}) ran without a script error: {errors}")
+            ctx.close()
+
+
+def popovers_close_and_destructive_acts_ask(browser, prefix):
+    """351's audit (v27, stage E): the header's menu closes on its ×, on
+    Escape and on a press outside it; a destructive act -- clearing a hold --
+    asks in a dialog with a Why, its own button and a Cancel, which closes
+    it with nothing posted; at the three sizes, light and dark, by keyboard."""
+    menu = "header.bar details.menu.person"
+    is_open = f"() => document.querySelector('{menu}').open"
+    for scheme in ("light", "dark"):
+        for size, width, height in V24_SIZES:
+            ctx = context(browser, width, height, scheme=scheme)
+            page = ctx.new_page()
+            errors = []
+            page.on("pageerror", lambda e: errors.append(str(e)))
+            page.goto(ADMIN_PAGE + "#holds")
+            settled(page)
+            page.click(f"{menu} > summary")
+            check(page.evaluate(is_open), f"at {size} ({scheme}) the header's menu opens")
+            page.keyboard.press("Escape")
+            check(not page.evaluate(is_open), f"at {size} ({scheme}) Escape closes it")
+            focused = page.evaluate("() => document.activeElement && document.activeElement.tagName")
+            check(focused == "SUMMARY", f"at {size} ({scheme}) the focus goes back to its summary: {focused}")
+            page.click(f"{menu} > summary")
+            page.click(f"{menu} .menu-close")
+            check(not page.evaluate(is_open), f"at {size} ({scheme}) its × closes it")
+            page.click(f"{menu} > summary")
+            page.mouse.click(4, height - 4)
+            check(not page.evaluate(is_open), f"at {size} ({scheme}) a press outside closes it")
+            # The first destructive act the screen shows: a hold's Clear where
+            # it is drawn, else a permission's Withdraw or an account's Close.
+            act = None
+            for tab in ("#holds", "#permissions", "#accounts"):
+                page.evaluate("h => { location.hash = h; }", tab)
+                page.wait_for_timeout(200)
+                shown = page.locator(f"{tab} form[data-confirm] button[type=submit]:visible")
+                if shown.count():
+                    act = shown.first
+                    break
+            check(act is not None, f"at {size} ({scheme}) a destructive act is on the screen")
+            if act is None:
+                ctx.close()
+                continue
+            named = act.inner_text().strip()
+            before = page.url
+            act.click()
+            page.wait_for_timeout(300)
+            dialog = page.locator("dialog#om-confirm[open]")
+            check(dialog.count() == 1, f"at {size} ({scheme}) {named} asks in a dialog")
+            said = dialog.inner_text() if dialog.count() else ""
+            check("Why" in said and "Cancel" in said and named in said,
+                  f"at {size} ({scheme}) the dialog says the act, asks why, offers Cancel: {said[:160]!r}")
+            active = page.evaluate("() => document.activeElement && document.activeElement.name")
+            check(active == "why", f"at {size} ({scheme}) the focus is on Why: {active}")
+            boxed = inside_the_viewport(page)
+            check(not boxed, f"at {size} ({scheme}) the dialog stays within the viewport{': ' + boxed if boxed else ''}")
+            page.screenshot(path=os.path.join(OUT, f"v27-{prefix}-confirm-{size}-{scheme}.png"))
+            page.keyboard.press("Tab")
+            page.keyboard.press("Enter")
+            page.wait_for_timeout(200)
+            check(page.locator("dialog#om-confirm[open]").count() == 0 and page.url == before,
+                  f"at {size} ({scheme}) Cancel, by keyboard, closes it and posts nothing")
+            check(not errors, f"the menu and the dialog at {size} ({scheme}) ran without a script error: {errors}")
+            ctx.close()
 
 
 def the_model_routing_tab(browser, prefix):
@@ -1386,6 +1565,9 @@ with sync_playwright() as playwright:
     the_documentation_pages(browser, prefix)
     the_registry_pages(browser, prefix)
     the_time_zone_tab(browser, prefix)
+    the_fx_pivots_tab(browser, prefix)
+    popovers_close_and_destructive_acts_ask(browser, prefix)
+    the_settings_sidebar(browser, prefix)
     the_model_routing_tab(browser, prefix)
     the_portal_overview(browser, prefix)
     browser.close()

@@ -80,6 +80,12 @@ enum AssetClass {
 
   // A holding of a currency's cash instrument (spec/the-account-side-fits-every-venue).
   ASSET_CLASS_CASH = 7;
+
+  // Contract v27 (W1.1; spec/a-public-rates-and-filings-data-plugin, Q3):
+  // what the lake observes and nobody holds -- an interest rate, a rate
+  // curve, an index -- following ISO 10962's category T. Never held: W9
+  // refuses a position in one.
+  ASSET_CLASS_REFERENTIAL = 8;
 }
 
 // What kind of instrument within its asset class (contract v11; the product
@@ -102,6 +108,16 @@ enum InstrumentType {
   // BinaryEventContract. A venue's YES and NO tokens are two instruments,
   // each one.
   INSTRUMENT_TYPE_BINARY_EVENT_CONTRACT = 2;
+
+  // Under referential (contract v27; the rates slice): a reference rate --
+  // SOFR, EFFR, €STR, an average, a bound of the FOMC range.
+  INSTRUMENT_TYPE_INTEREST_RATE = 3;
+  // Under referential (contract v27): a rate curve, one record whose points
+  // are the lake's rows by tenor -- Treasury's par curves, the Board's zero
+  // curve.
+  INSTRUMENT_TYPE_RATE_CURVE = 4;
+  // Under referential (contract v27): an index -- the SOFR Index.
+  INSTRUMENT_TYPE_INDEX = 5;
 }
 
 // A binary event contract's attributes (contract v19; plans/the-lake-prices-
@@ -1615,6 +1631,41 @@ enum CalendarKind {
   // A securities settlement system's days; its subject the system by name
   // and country.
   CALENDAR_KIND_SECURITIES_SETTLEMENT = 3;
+  // Contract v27 (W1.20; ruling 419): a venue's trading sessions, in its
+  // trading_sessions; its subject the venues that follow it.
+  CALENDAR_KIND_TRADING_SESSIONS = 4;
+}
+
+// A venue's trading sessions (contract v27; W1.20, W3.19; ruling 419): the
+// minimal kind staleness needs, sessions a day in local time.
+message TradingSessions {
+  // IANA.
+  string time_zone = 1;
+  repeated TradingSession sessions = 2;
+  // Each day whose sessions differ: an early close, a late open, a day
+  // closed; an early close announced later is a new version.
+  repeated TradingSessionDay early_closes = 3;
+}
+
+// One session, on the weekdays it runs.
+message TradingSession {
+  repeated Weekday weekdays = 1;
+  // Minutes after local midnight: the start, and the end, exclusive, at most
+  // 1440.
+  uint32 start_minute = 2;
+  uint32 end_minute = 3;
+  // An extended session: pre-market or after-hours.
+  bool extended = 4;
+}
+
+// One dated day's sessions, in place of the weekday's.
+message TradingSessionDay {
+  // ISO 8601, a plain date.
+  string date = 1;
+  // None for a day closed.
+  repeated TradingSession sessions = 2;
+  // A source_id among the version's sources.
+  string source = 3;
 }
 
 // What a listed day is.
@@ -1720,6 +1771,9 @@ message CalendarRecord {
   string note = 15;
   // Active, or decommissioned: the master's lifecycle, as a venue's.
   InstrumentLifecycleState lifecycle_state = 16;
+  // Contract v27: a trading-sessions calendar's sessions; unset on every
+  // other kind.
+  TradingSessions trading_sessions = 17;
 }
 
 // W1.20. Answered by the calendar's record at version 1.
@@ -1738,6 +1792,9 @@ message DefineCalendarRequest {
   int64 valid_time_ns = 11;
   // Required from an agent, whose draft a person on the staff approves.
   string note = 12;
+  // Contract v27: for CALENDAR_KIND_TRADING_SESSIONS, its sessions, required
+  // there and refused on any other kind.
+  TradingSessions trading_sessions = 13;
 }
 
 // W1.21. The next version, whole, or a decommission; refused against a
@@ -1758,6 +1815,8 @@ message AmendCalendarRequest {
   string note = 13;
   // Decommissioned as of valid_time_ns; unspecified leaves it as it was.
   InstrumentLifecycleState lifecycle_state = 14;
+  // Contract v27: a trading-sessions calendar's sessions, whole.
+  TradingSessions trading_sessions = 15;
 }
 
 // How a date rolls on its calendars.
@@ -1979,6 +2038,9 @@ message ReadCalendarReply {
   repeated CalendarWeekend weekends = 5;
   CalendarCoverage coverage = 6;
   repeated CalendarSource sources = 7;
+  // Contract v27 (W3.19): a trading-sessions calendar's sessions, with the
+  // early closes falling in the range; unset on every other kind.
+  TradingSessions trading_sessions = 8;
 }
 
 // Why a date was or was not computed (requirement 9).
@@ -2410,6 +2472,20 @@ message ReportEventGroupRequest {
   RawRecordRef raw_record = 9;
   // Stamped by the sidecar: the reporting instance.
   string publisher_instance_id = 10;
+  // Contract v27 (W3.29; ruling 464): each range member's floor, cap and
+  // unit as the venue states them, taken as values offered for the
+  // member's record; a person's value wins.
+  repeated EventGroupMemberBound member_bounds = 11;
+}
+
+// One range member's bounds as its venue states them (contract v27; ruling
+// 464): the binary event contract template's floor, cap and bound_unit.
+message EventGroupMemberBound {
+  // One of the report's members.
+  string instrument_id = 1;
+  EventContractBound floor = 2;
+  EventContractBound cap = 3;
+  string bound_unit = 4;
 }
 
 message ReportEventGroupReply {

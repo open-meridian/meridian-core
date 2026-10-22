@@ -46,7 +46,10 @@ use crate::store::{Result, StoreError};
 /// a snapshot of another format is stale, and rebuilt from the journal.
 /// Format 2 (contract v26, W9.10; ruling 165): an entry's index holds no
 /// body, which the book loads from the journal when a decision asks.
-pub const FORMAT: i32 = 2;
+/// Format 3 (contract v27, W9.10; rulings 320 and 396): each lot's reliefs
+/// carry their proceeds, folded from the entry's execution, so a snapshot
+/// of format 2 is rebuilt from the journal and every relief backfilled.
+pub const FORMAT: i32 = 3;
 
 /// The snapshot interval with nothing set: an account's projection kept
 /// every this many entries. From core's replay benchmark (item 122;

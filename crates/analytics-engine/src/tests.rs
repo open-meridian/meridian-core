@@ -62,7 +62,7 @@ fn allocations(f: impl FnOnce()) -> usize {
 // ── The SDK's pinned cases ──────────────────────────────────────────────────
 
 /// The cases, vendored from the SDK (reference_cases/SOURCE).
-const CASES: [(&str, &str); 8] = [
+const CASES: [(&str, &str); 12] = [
     (
         "valuation",
         include_str!("../reference_cases/valuation.json"),
@@ -88,11 +88,28 @@ const CASES: [(&str, &str); 8] = [
         include_str!("../reference_cases/historical-var-and-es.json"),
     ),
     ("what-if", include_str!("../reference_cases/what-if.json")),
-    // pnl version 2, realized beside unrealized: v27's, computed by the
-    // tests' own definition alone (ruling 320).
+    // pnl version 2, realized beside unrealized: v27's (rulings 320, 396).
     (
         "pnl-v2-realized",
         include_str!("../reference_cases/pnl-v2-realized.json"),
+    ),
+    // Contract v27: rulings 453 and 486, 462 and 483, 459, and W12.1's
+    // execution_cost.
+    (
+        "quoted-price-past-18-places",
+        include_str!("../reference_cases/quoted-price-past-18-places.json"),
+    ),
+    (
+        "inverted-and-crossed",
+        include_str!("../reference_cases/inverted-and-crossed.json"),
+    ),
+    (
+        "reporting-currency",
+        include_str!("../reference_cases/reporting-currency.json"),
+    ),
+    (
+        "execution-cost",
+        include_str!("../reference_cases/execution-cost.json"),
     ),
 ];
 
@@ -136,29 +153,31 @@ fn every_pinned_case_is_answered_as_the_reference_answers_it() {
     }
 }
 
-/// pnl version 2 is the tests' alone (ruling 320): its pinned case is
-/// answered exactly above, and no job reaches it -- the component serves
-/// version 1, lists version 1, and compiles no other.
+/// pnl version 2 is served from contract v27 (rulings 320 and 396): listed,
+/// compiled, and its pinned case answered exactly above; version 3 is
+/// refused naming the version.
 #[test]
-fn realized_is_version_twos_and_no_job_reaches_it() {
+fn realized_is_version_two_and_served() {
     assert!(CASES.iter().any(|(name, _)| *name == "pnl-v2-realized"));
-    assert!(crate::definitions::definition("pnl", 2).is_none());
-    assert!(!crate::definitions::wire()
+    assert!(crate::definitions::definition("pnl", 2).is_some());
+    assert!(crate::definitions::wire()
         .iter()
         .any(|d| d.definition == "pnl" && d.version == 2));
-    let job = meridian_domain::v1::Job {
+    let job = |version: i32| meridian_domain::v1::Job {
         account_ids: vec!["ACC-1".into()],
         inputs: None,
         measures: vec![meridian_domain::v1::MeasureRef {
             definition: "pnl".into(),
-            version: 2,
+            version,
             breakdowns: vec![],
             event_group_id: String::new(),
         }],
         what_if: None,
+        ..Default::default()
     };
+    assert!(crate::compile::compile(&job(2)).unwrap().reads.closed_lots);
     assert_eq!(
-        crate::compile::compile(&job).unwrap_err().field,
+        crate::compile::compile(&job(3)).unwrap_err().field,
         "measures[0].version"
     );
 }

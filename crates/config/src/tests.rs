@@ -121,11 +121,34 @@ fn harness_keyed(instance: &str, key: SettingsKey) -> Harness {
         let found = asked.instrument_id.starts_with("INS-") || resolved.is_some();
         let reply = meridian_domain::v1::ResolveInstrumentReply {
             found,
-            instrument: found.then(|| meridian_domain::v1::InstrumentRecord {
-                instrument_id: resolved
-                    .map(|n| format!("INS-{n}"))
-                    .unwrap_or_else(|| asked.instrument_id.clone()),
-                ..Default::default()
+            instrument: found.then(|| {
+                // A fiat currency's cash instrument (contract v27): one
+                // named INS-CASH and its ISO 4217 code; a token's, INS-CASH
+                // and a longer name, carries no code.
+                let code = asked
+                    .instrument_id
+                    .strip_prefix("INS-CASH")
+                    .unwrap_or_default();
+                meridian_domain::v1::InstrumentRecord {
+                    instrument_id: resolved
+                        .map(|n| format!("INS-{n}"))
+                        .unwrap_or_else(|| asked.instrument_id.clone()),
+                    asset_class: if code.is_empty() {
+                        0
+                    } else {
+                        meridian_domain::v1::AssetClass::Cash as i32
+                    },
+                    identifiers: if code.len() == 3 {
+                        vec![meridian_domain::v1::Identifier {
+                            scheme: "iso4217".into(),
+                            value: code.into(),
+                            ..Default::default()
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                    ..Default::default()
+                }
             }),
         };
         Ok((
@@ -3559,6 +3582,76 @@ async fn the_deployments_time_zone_is_new_york_until_set_each_change_its_own_rec
     assert_eq!(
         unnamed.deployment_time_zone().unwrap().unwrap().changed_by,
         "first-run"
+    );
+}
+
+/// W6.36 (contract v27; rulings 462 and 483): the FX pivot currencies, none
+/// set until a deployment admin orders them -- read as USD's and then EUR's
+/// -- one to four fiat cash instruments, none twice, never a token, each change
+/// saying why and its own record.
+#[tokio::test]
+async fn the_fx_pivot_currencies_are_fiat_ordered_by_a_deployment_admin_each_change_recorded() {
+    let h = harness("dashboard-1");
+    let read = || {
+        ask::<_, meridian_domain::v1::FxPivotCurrenciesSetting>(
+            &h,
+            crate::service::READ_FX_PIVOT_CURRENCIES,
+            "meridian.v1.ReadFxPivotCurrenciesRequest",
+            meridian_domain::v1::ReadFxPivotCurrenciesRequest {},
+        )
+    };
+    let set = |pivots: &[&str], reason: &str| {
+        ask::<_, meridian_domain::v1::FxPivotCurrenciesSetting>(
+            &h,
+            crate::service::SET_FX_PIVOT_CURRENCIES,
+            "meridian.v1.SetFxPivotCurrenciesRequest",
+            meridian_domain::v1::SetFxPivotCurrenciesRequest {
+                fx_pivot_currencies: pivots.iter().map(|p| p.to_string()).collect(),
+                reason: reason.into(),
+            },
+        )
+    };
+    let default = read().await.unwrap();
+    assert!(default.fx_pivot_currencies.is_empty());
+    assert_eq!(default.changed_at_ns, 0);
+    for (pivots, field) in [
+        (vec![], "fields=fx_pivot_currencies"),
+        (
+            vec!["INS-CASHUSD", "INS-CASHUSD"],
+            "fields=fx_pivot_currencies[1]",
+        ),
+        (
+            vec!["INS-CASHUSD", "INS-CASHUSDC"],
+            "fields=fx_pivot_currencies[1]",
+        ),
+        (vec!["INS-AAPL"], "fields=fx_pivot_currencies[0]"),
+        (
+            vec![
+                "INS-CASHUSD",
+                "INS-CASHEUR",
+                "INS-CASHCHF",
+                "INS-CASHGBP",
+                "INS-CASHJPY",
+            ],
+            "fields=fx_pivot_currencies",
+        ),
+    ] {
+        let refused = set(&pivots, "ordered").await.unwrap_err();
+        assert!(refused.contains(field), "{pivots:?}: {refused}");
+    }
+    let refused = set(&["INS-CASHEUR"], " ").await.unwrap_err();
+    assert!(refused.contains("fields=reason"), "{refused}");
+    let changed = set(&["INS-CASHEUR", "INS-CASHUSD"], "the fund reports in euros")
+        .await
+        .unwrap();
+    assert_eq!(
+        changed.fx_pivot_currencies,
+        vec!["INS-CASHEUR", "INS-CASHUSD"]
+    );
+    assert!(changed.changed_at_ns > 0 && !changed.changed_by.is_empty());
+    assert_eq!(
+        read().await.unwrap().fx_pivot_currencies,
+        vec!["INS-CASHEUR", "INS-CASHUSD"]
     );
 }
 

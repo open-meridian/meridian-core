@@ -135,6 +135,15 @@ pub struct TimeZoneChange {
     pub changed_by: String,
 }
 
+/// The deployment's FX pivot currencies as their latest change set them
+/// (contract v27, W6.36).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FxPivotChange {
+    pub fx_pivot_currencies: Vec<String>,
+    pub changed_at_ns: i64,
+    pub changed_by: String,
+}
+
 /// One change to the analytics routing table (contract v26, W12.6).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ModelRoutingChange {
@@ -1032,6 +1041,15 @@ pub trait Store: Send + Sync {
     /// The latest change to the deployment's time zone, if any: none is the
     /// default, America/New_York.
     fn deployment_time_zone(&self) -> Result<Option<TimeZoneChange>>;
+
+    /// The deployment's FX pivot currencies changed, its own record
+    /// (contract v27, W6.36, decisions/031).
+    fn set_fx_pivot_currencies(&self, pivots: &[String], author: &Author, at_ns: i64)
+        -> Result<()>;
+
+    /// The latest change to the pivots, if any: none is the default, USD's
+    /// cash instrument and then EUR's.
+    fn fx_pivot_currencies(&self) -> Result<Option<FxPivotChange>>;
 
     /// A model id routed, its own record (contract v26, W12.6,
     /// decisions/031): the implementation, who, through what, when and why.

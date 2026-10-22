@@ -85,6 +85,11 @@ pub struct Price {
     pub instrument_id: String,
     pub dataset: String,
     pub valid_at_ns: i64,
+    /// Contract v27 (ruling 460): the lake row it came from -- its key and
+    /// version -- and its source time, the valid time where none is stated.
+    pub row_key: String,
+    pub version: i64,
+    pub source_ns: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +106,10 @@ pub struct Instrument {
     pub price_kind: String,
     pub payout: Option<(Dec, String)>,
     pub country: String,
+    /// Contract v27 (ruling 462): its ISO 4217 code, a fiat currency's cash
+    /// instrument, whose legs alone are inverted or crossed; empty for a
+    /// token.
+    pub currency_code: String,
 }
 
 #[derive(Debug, Clone)]
@@ -118,8 +127,35 @@ pub struct ClosedLot {
     pub instrument_id: String,
     pub quantity: Dec,
     pub proceeds: Dec,
-    pub cost: Dec,
+    /// None where the book records no cost (contract v27, ruling 325).
+    pub cost: Option<Dec>,
     pub sleeve: String,
+}
+
+/// An execution `execution_cost` measures (contract v27, W12.1, W10.11).
+#[derive(Debug, Clone)]
+pub struct Execution {
+    pub execution_id: String,
+    pub order_id: String,
+    pub placement_id: String,
+    pub account_id: String,
+    pub instrument_id: String,
+    pub side: String,
+    pub price: Dec,
+    pub price_instrument_id: String,
+    pub quantity: Dec,
+    /// Each benchmark's moment, 0 where it has none.
+    pub decision_at_ns: i64,
+    pub arrival_at_ns: i64,
+    pub placement_arrival_at_ns: i64,
+    pub executed_at_ns: i64,
+    pub fees: Option<Dec>,
+    pub financing: Option<Dec>,
+    pub liquidity_indicator: String,
+    pub venue_id: String,
+    pub time_precision: String,
+    pub reject_count: i64,
+    pub time_to_fill_ns: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -189,6 +225,43 @@ pub struct WhatIf {
     pub trades: Vec<WhatIfTrade>,
 }
 
+/// An amount `{amount, instrument_id}`, or None for null or absent.
+fn optional_amount(value: Option<&Value>, what: &str) -> Result<Option<Dec>> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(held) => Ok(Some(decimal(held.get("amount"), what)?)),
+    }
+}
+
+fn execution(e: &Value) -> Result<Execution> {
+    let price = e.get("price").unwrap_or(&Value::Null);
+    Ok(Execution {
+        execution_id: text(e, "execution_id"),
+        order_id: text(e, "order_id"),
+        placement_id: text(e, "placement_id"),
+        account_id: text(e, "account_id"),
+        instrument_id: text(e, "instrument_id"),
+        side: text(e, "side"),
+        price: decimal(price.get("amount"), "an execution's price")?,
+        price_instrument_id: text(price, "instrument_id"),
+        quantity: decimal(e.get("quantity"), "an execution's quantity")?,
+        decision_at_ns: integer(e.get("decision_at_ns"), "decision_at_ns")?,
+        arrival_at_ns: integer(e.get("arrival_at_ns"), "arrival_at_ns")?,
+        placement_arrival_at_ns: integer(
+            e.get("placement_arrival_at_ns"),
+            "placement_arrival_at_ns",
+        )?,
+        executed_at_ns: integer(e.get("executed_at_ns"), "executed_at_ns")?,
+        fees: optional_amount(e.get("fees"), "an execution's fees")?,
+        financing: optional_amount(e.get("financing"), "an execution's financing")?,
+        liquidity_indicator: text(e, "liquidity_indicator"),
+        venue_id: text(e, "venue_id"),
+        time_precision: text(e, "time_precision"),
+        reject_count: integer(e.get("reject_count"), "reject_count")?,
+        time_to_fill_ns: integer(e.get("time_to_fill_ns"), "time_to_fill_ns")?,
+    })
+}
+
 /// An inputs document, read once.
 #[derive(Debug, Clone)]
 pub struct Case {
@@ -222,6 +295,15 @@ pub struct Case {
     /// What a routed plugin answered, by instrument and the base it valued
     /// it in: `priced`, absent where nothing is routed.
     pub priced: BTreeMap<(String, String), Dec>,
+    /// Contract v27 (rulings 458, 459, 462 and 483): the job's business
+    /// date and reporting currency, and the deployment's pivot order.
+    pub business_date: String,
+    pub reporting_currency: String,
+    pub pivots: Vec<String>,
+    /// Contract v27 (W12.1): the executions `execution_cost` measures, and
+    /// its quotes' staleness bound by default.
+    pub executions: Vec<Execution>,
+    pub tca_staleness_bound_ns: i64,
 }
 
 /// A model id routed to a `pricing` plugin, for one job.
@@ -265,13 +347,22 @@ impl Case {
         };
         let mut market: BTreeMap<(String, String), Vec<Price>> = BTreeMap::new();
         for row in items(inputs, "market") {
+            let valid_at_ns = integer(row.get("valid_at_ns"), "valid_at_ns")?;
+            let source_ns = integer(row.get("source_ns"), "source_ns")?;
             let price = Price {
                 subject_id: text(row, "subject_id"),
                 kind: text(row, "kind"),
                 amount: decimal(row.get("amount"), "a market row's amount")?,
                 instrument_id: text(row, "instrument_id"),
                 dataset: text(row, "dataset"),
-                valid_at_ns: integer(row.get("valid_at_ns"), "valid_at_ns")?,
+                valid_at_ns,
+                row_key: text(row, "row_key"),
+                version: integer(row.get("version"), "version")?,
+                source_ns: if source_ns == 0 {
+                    valid_at_ns
+                } else {
+                    source_ns
+                },
             };
             market
                 .entry((price.subject_id.clone(), price.kind.clone()))
@@ -348,6 +439,7 @@ impl Case {
                         price_kind: text(i, "price_kind"),
                         payout,
                         country: text(i, "country"),
+                        currency_code: text(i, "currency_code"),
                     };
                     Ok((record.instrument_id.clone(), record))
                 })
@@ -377,7 +469,12 @@ impl Case {
                         instrument_id: text(c, "instrument_id"),
                         quantity: decimal(c.get("quantity"), "a closed lot's quantity")?,
                         proceeds: decimal(c.get("proceeds"), "a closed lot's proceeds")?,
-                        cost: decimal(c.get("cost"), "a closed lot's cost")?,
+                        cost: match c.get("cost") {
+                            Some(Value::String(cost)) if !cost.is_empty() => {
+                                Some(decimal(c.get("cost"), "a closed lot's cost")?)
+                            }
+                            _ => None,
+                        },
                         sleeve: text(c, "sleeve"),
                     })
                 })
@@ -453,7 +550,59 @@ impl Case {
                     ))
                 })
                 .collect::<Result<_>>()?,
+            business_date: text(job, "business_date"),
+            reporting_currency: text(job, "reporting_currency"),
+            pivots: items(inputs, "fx_pivot_currencies")
+                .iter()
+                .map(|p| p.as_str().unwrap_or_default().to_string())
+                .collect(),
+            executions: items(inputs, "executions")
+                .iter()
+                .map(execution)
+                .collect::<Result<_>>()?,
+            tca_staleness_bound_ns: integer(
+                inputs.get("tca_staleness_bound_ns"),
+                "tca_staleness_bound_ns",
+            )?,
         })
+    }
+
+    /// The price of `subject` in one instrument (contract v27): an FX rate
+    /// is the price of one cash instrument in another, and a currency may be
+    /// priced in several, each its own row. The latest valid, as
+    /// [`Case::price`] chooses.
+    pub fn price_in(&self, subject: &str, kind: &str, instrument_id: &str) -> Option<&Price> {
+        let held = self.market.get(&(subject.to_string(), kind.to_string()))?;
+        let mut best: Option<&Price> = None;
+        for price in held.iter().filter(|p| p.instrument_id == instrument_id) {
+            match best {
+                Some(b) if (price.valid_at_ns, &price.dataset) <= (b.valid_at_ns, &b.dataset) => {}
+                _ => best = Some(price),
+            }
+        }
+        best
+    }
+
+    /// The latest price of `subject` of `kind` in each instrument it is
+    /// priced in, by the instruments' IDs.
+    pub fn quoted_in(&self, subject: &str, kind: &str) -> Vec<&Price> {
+        let Some(held) = self.market.get(&(subject.to_string(), kind.to_string())) else {
+            return Vec::new();
+        };
+        let instruments: std::collections::BTreeSet<&str> =
+            held.iter().map(|p| p.instrument_id.as_str()).collect();
+        instruments
+            .into_iter()
+            .filter_map(|instrument| self.price_in(subject, kind, instrument))
+            .collect()
+    }
+
+    /// Whether a cash instrument is a fiat currency's, with an ISO 4217
+    /// code: only a fiat leg is inverted or crossed (ruling 462).
+    pub fn fiat(&self, instrument_id: &str) -> bool {
+        self.instruments
+            .get(instrument_id)
+            .is_some_and(|record| !record.currency_code.is_empty())
     }
 
     /// The account's base currency's cash instrument.

@@ -459,6 +459,7 @@ fn wired() -> (Arc<Bus>, Arc<MemoryStore>) {
             AAPL | ZZTP_LOCAL | ZZTP_KEPT => Some(record(AssetClass::Equity, "USD")),
             USD => Some(record(AssetClass::Cash, "USD")),
             SNAP => Some(record(AssetClass::Unspecified, "")),
+            SOFR => Some(record(AssetClass::Referential, "USD")),
             _ => None,
         };
         Ok((
@@ -619,6 +620,31 @@ async fn an_instrument_whose_record_lacks_its_class_or_currency_is_refused_namin
             "positions[3].instrument.asset_class",
             "positions[3].instrument.currency",
         ]
+    );
+    assert!(store.journal(ACC).unwrap().is_empty(), "nothing applied");
+}
+
+/// A referential record (contract v27, the rates slice): SOFR.
+const SOFR: &str = "INS-01J8XQ4M7K000000000SOFR";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_position_in_a_referential_record_is_refused_naming_its_instrument() {
+    // Contract v27 (W9.10): an interest rate, a rate curve or an index names
+    // what the lake observes and is never held, its record complete or not.
+    let (bus, store) = wired();
+    let mut request = opening();
+    request.positions.push(OpeningPosition {
+        instrument_id: SOFR.into(),
+        side: HoldingSide::Long as i32,
+        trade_date_quantity: d("1"),
+        settled_quantity: d("1"),
+        ..Default::default()
+    });
+    let refused = opening_refused(&bus, &request).await;
+    assert_eq!(code(&refused), None, "{refused}");
+    assert_eq!(
+        meridian_bus::read_refusal_status(&refused).map(|(_, fields, _)| fields),
+        Some(vec!["positions[2].instrument_id".to_string()])
     );
     assert!(store.journal(ACC).unwrap().is_empty(), "nothing applied");
 }

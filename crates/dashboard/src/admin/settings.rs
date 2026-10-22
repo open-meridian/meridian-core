@@ -944,10 +944,7 @@ const SCRIPT: &str = r#"(function () {
   var form = document.querySelector("form[data-settings]");
   if (!form) return;
   form.classList.add("js");
-  document.addEventListener("submit", function (event) {
-    var asking = event.target.getAttribute && event.target.getAttribute("data-confirm");
-    if (asking && event.target.id.indexOf("remove-") === 0 && !window.confirm(asking)) event.preventDefault();
-  });
+  // A removal's data-confirm asks in the chrome's dialog (html.rs).
   var bubble = document.getElementById("settings-hint-bubble");
   var shown = null;
   var nav = form.querySelector("nav[data-sections]");

@@ -443,6 +443,10 @@ pub enum Area {
     /// The trading instructions (contract v22, W11.15): the deployment
     /// admin's capabilities, or admin of a plugin, within it.
     Trading,
+    /// An account's rows read at the read level on it (contract v27,
+    /// W10.11): any level on any plugin, or the deployment admin's
+    /// capabilities, each call held to the account named.
+    AccountReads,
 }
 
 impl Area {
@@ -456,6 +460,7 @@ impl Area {
             Area::ServiceAccounts => "Service accounts",
             Area::Accounts => "Accounts",
             Area::Trading => "Trading instructions",
+            Area::AccountReads => "Accounts",
         }
     }
 
@@ -477,6 +482,11 @@ impl Area {
             }
             Area::Accounts => access.deployment_admin,
             Area::Trading => access.deployment_admin || access.administers_any(),
+            Area::AccountReads => {
+                access.deployment_admin
+                    || access.all_plugins_admin
+                    || access.plugins.values().any(|held| held.holds_any())
+            }
         }
     }
 }
@@ -568,7 +578,7 @@ impl Tool {
                             Area::Plugins(_) => plugin_area::described(spec),
                             Area::DataSources => data_sources::described(spec),
                             Area::Prepared | Area::ServiceAccounts => spec.description.to_string(),
-                            Area::Accounts | Area::Trading => book::described(spec),
+                            Area::Accounts | Area::Trading | Area::AccountReads => book::described(spec),
                         }
                     ),
                     "inputSchema": (spec.input_schema)(),
@@ -890,7 +900,9 @@ pub async fn run_core(app: &App, caller: &Caller, spec: &'static Spec, arguments
                 .0
         }
         Area::ServiceAccounts => service_accounts::call(app, caller, spec, arguments).await.0,
-        Area::Accounts | Area::Trading => book::call(app, caller, spec, arguments).await,
+        Area::Accounts | Area::Trading | Area::AccountReads => {
+            book::call(app, caller, spec, arguments).await
+        }
     }
 }
 
@@ -1041,6 +1053,11 @@ async fn call(app: &Arc<App>, caller: &Caller, name: &str, arguments: Value) -> 
             Area::Trading => (
                 book::call(app, caller, spec, arguments).await,
                 String::new(),
+            ),
+            // At the read level on the account named (contract v27).
+            Area::AccountReads => (
+                book::call(app, caller, spec, arguments).await,
+                "read".to_string(),
             ),
         },
         Owner::Plugin {

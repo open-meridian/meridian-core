@@ -9,9 +9,10 @@ use meridian_analytics_engine::case::MeasureKey;
 use meridian_analytics_engine::exact::Dec;
 use meridian_domain::exact::Exact;
 use meridian_domain::v1::{
-    AnswerProvenance, BreakdownValue, ComputedAs, EventGroupInput, Figure as WireFigure,
-    InstrumentInput, JobAnswer, MeasureRef, ModelRef, NotEvaluated, NotEvaluatedReason,
-    PartitionSequence, ScenarioKey, ScenarioKind, Watermark,
+    AnswerProvenance, BreakdownValue, ComputedAs, ConversionDerivation, ConversionLeg,
+    EventGroupInput, Figure as WireFigure, InputPrice, InstrumentInput, JobAnswer, MeasureRef,
+    ModelRef, NotEvaluated, NotEvaluatedReason, PartitionSequence, ScenarioKey, ScenarioKind,
+    Watermark,
 };
 use serde_json::Value;
 
@@ -59,6 +60,7 @@ fn figure(figure: &Figure) -> Result<WireFigure, String> {
         denominator: decimal(&figure.denominator)?,
         currency_instrument_id: figure.currency_instrument_id.clone(),
         computed_as: ComputedAs::Exact as i32,
+        oldest_input_source_ns: 0,
     })
 }
 
@@ -71,6 +73,8 @@ fn unevaluated(entry: &Unevaluated) -> NotEvaluated {
             .map(|r| r as i32)
             .unwrap_or(0),
         detail: entry.detail.clone(),
+        age_ns: 0,
+        ceiling_ns: 0,
     }
 }
 
@@ -142,7 +146,116 @@ pub fn provenance(json: &Value) -> AnswerProvenance {
         routing_version: integer(&json["routing_version"]),
         engine_version: text(&json["engine_version"]),
         answer_hash: text(&json["answer_hash"]),
+        // Contract v27 (W12.7; rulings 458, 460 and 462).
+        business_date: text(&json["business_date"]),
+        input_prices: list(&json["input_prices"])
+            .iter()
+            .map(|p| InputPrice {
+                instrument_id: text(&p["instrument_id"]),
+                price: money(&p["price"]),
+                dataset: text(&p["dataset"]),
+                row_key: text(&p["row_key"]),
+                version: integer(&p["version"]).max(0) as u64,
+                source_ns: integer(&p["source_ns"]),
+            })
+            .collect(),
+        conversion_legs: list(&json["conversion_legs"])
+            .iter()
+            .map(|leg| ConversionLeg {
+                from_instrument_id: text(&leg["from_instrument_id"]),
+                to_instrument_id: text(&leg["to_instrument_id"]),
+                rate: wire_decimal(&leg["rate"]),
+                derivation: ConversionDerivation::from_str_name(&text(&leg["derivation"]))
+                    .map(|d| d as i32)
+                    .unwrap_or(0),
+                via_instrument_id: text(&leg["via_instrument_id"]),
+                dataset: text(&leg["dataset"]),
+            })
+            .collect(),
     }
+}
+
+/// A decimal the provenance carries as text, on the wire; unset for none.
+fn wire_decimal(value: &Value) -> Option<meridian_pb::v1::Decimal> {
+    value
+        .as_str()
+        .and_then(|text| Exact::from_str(text).ok())
+        .map(Exact::to_wire)
+}
+
+/// A price the provenance carries as `{amount, instrument_id}`.
+fn money(value: &Value) -> Option<meridian_domain::v1::Money> {
+    value.is_object().then(|| meridian_domain::v1::Money {
+        amount: wire_decimal(&value["amount"]),
+        currency_code: String::new(),
+        instrument_id: text(&value["instrument_id"]),
+    })
+}
+
+/// The `ExecutionCost` rows an `execution_cost` job answered (contract v27,
+/// W10.11), as the lake records them: each under its execution's
+/// instrument and dated by its trade date, from `executions` (the
+/// resolve's, by execution ID); its row key the lake's (`EXE-…:arrival`).
+pub fn execution_costs(
+    answer: &Answer,
+    executions: &std::collections::BTreeMap<String, (String, String)>,
+) -> Vec<meridian_domain::v1::ExecutionCost> {
+    use meridian_domain::v1::{
+        ExecutionCost, LiquidityIndicator, ObservationMeta, Side, SubjectRef, TcaBenchmark,
+        TcaUnanswered, TimePrecision,
+    };
+    let integer = |value: &Value| -> i64 {
+        value
+            .as_i64()
+            .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+            .unwrap_or(0)
+    };
+    answer
+        .execution_costs
+        .iter()
+        .filter_map(|row| {
+            let execution_id = text(&row["execution_id"]);
+            let (instrument, trade_date) = executions.get(&execution_id)?;
+            Some(ExecutionCost {
+                meta: Some(ObservationMeta {
+                    subjects: vec![SubjectRef {
+                        entity_id: instrument.clone(),
+                    }],
+                    business_date: trade_date.clone(),
+                    ..Default::default()
+                }),
+                execution_id,
+                order_id: text(&row["order_id"]),
+                placement_id: text(&row["placement_id"]),
+                account_id: text(&row["account_id"]),
+                benchmark: TcaBenchmark::from_str_name(&text(&row["benchmark"]))
+                    .map_or(0, |b| b as i32),
+                benchmark_price: money(&row["benchmark_price"]),
+                benchmark_at_ns: integer(&row["benchmark_at_ns"]),
+                benchmark_dataset: text(&row["benchmark_dataset"]),
+                benchmark_row_key: text(&row["benchmark_row_key"]),
+                fixing_id: String::new(),
+                execution_price: money(&row["execution_price"]),
+                side: Side::from_str_name(&text(&row["side"])).map_or(0, |s| s as i32),
+                notional: money(&row["notional"]),
+                cost_bps: wire_decimal(&row["cost_bps"]),
+                fees_bps: wire_decimal(&row["fees_bps"]),
+                financing_bps: wire_decimal(&row["financing_bps"]),
+                liquidity_indicator: LiquidityIndicator::from_str_name(&text(
+                    &row["liquidity_indicator"],
+                ))
+                .map_or(0, |l| l as i32),
+                venue_id: text(&row["venue_id"]),
+                unanswered: TcaUnanswered::from_str_name(&text(&row["unanswered"]))
+                    .map_or(0, |u| u as i32),
+                staleness_bound_ns: integer(&row["staleness_bound_ns"]),
+                time_precision: TimePrecision::from_str_name(&text(&row["time_precision"]))
+                    .map_or(0, |t| t as i32),
+                reject_count: integer(&row["reject_count"]).max(0) as u32,
+                time_to_fill_ns: integer(&row["time_to_fill_ns"]),
+            })
+        })
+        .collect()
 }
 
 /// The engine's answer as a `JobAnswer`.

@@ -500,7 +500,8 @@ fn allow_controls(instance: &str, allowed: Option<&PluginArchive>, token: &str) 
     };
     let withdraw = if allowed.is_some() {
         format!(
-            "<form method=\"post\" action=\"/plugins/{instance}/archive/withdraw\" class=\"inline\">{token}\
+            "<form method=\"post\" action=\"/plugins/{instance}/archive/withdraw\" class=\"inline\" \
+             data-confirm=\"Withdraw {instance}'s archive? It restarts without it; what it holds is kept.\">{token}\
              <button type=\"submit\" data-withdraw-archive>Withdraw</button></form>"
         )
     } else {

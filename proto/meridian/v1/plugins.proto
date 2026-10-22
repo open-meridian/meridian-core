@@ -19,6 +19,8 @@ package meridian.v1;
 // PluginDeclaration, which a plugin's SDK builds and its registration carries
 // too, declared in meridian-schema's sidecar.proto (contract v11).
 import "meridian/v1/sidecar.proto";
+// A listing's prices (contract v27).
+import "meridian/v1/amounts.proto";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // W8.1 — an uploaded version
@@ -440,6 +442,16 @@ message PluginListing {
   // organisation's display name, filled in by the platform; Browse's
   // Publisher column reads it.
   string publisher = 14;
+  // Contract v27 (W8.16; ruling 330, 2026-10-19): the support contact as two
+  // fields, each validated as its kind, at least one required for
+  // verified; support_contact is read as the one or the other during the
+  // move, then retired.
+  string support_url = 15;
+  string support_email = 16;
+  // Contract v27 (W8.20; spec/every-data-source-is-licensed-on-the-same-terms,
+  // §3): the approved prices, one per dataset and meter (and per category
+  // or professional status where its terms split them); never a proposal.
+  repeated ListingPrice prices = 17;
 }
 
 // One version of a listing, in one registry.
@@ -525,6 +537,10 @@ message PluginBuild {
   // Contract v26 (W8.8; ruling 275): the platform's page for the build,
   // which `meridian plugin publish` prints; no client builds the address.
   string page_url = 16;
+  // Contract v27 (W8.8; ruling 353): the display name the publish request
+  // declared, shown on the publisher's row while it builds; empty from a CLI
+  // before 0.1.50.
+  string declared_title = 17;
 }
 
 enum PluginBuildState {
@@ -643,6 +659,10 @@ message PluginPull {
   string notice_id = 6;
   // A restoration after a counter-notice (W8.13): when; 0 while it stands.
   int64 restored_at_ns = 7;
+  // Contract v27 (W8.14; ruling 311): in a deployment's copy, the issue time
+  // of the bundle's PluginPullStatus it came by; 0 for a pull learned at a
+  // catalogue pull.
+  int64 by_bundle_issued_at_ns = 8;
 }
 
 enum PullReasonKind {
@@ -766,6 +786,10 @@ message PublishPluginVersionRequest {
   // The release tag, `v` and the SemVer version, signed by a registered,
   // active key of the organisation.
   string tag = 5;
+  // Contract v27 (W8.8; ruling 353): the plugin's display name as the CLI
+  // read it from the declaration, optional; the builder refuses the build
+  // where the built image's declaration names another.
+  string declared_title = 6;
 }
 
 message ReadPluginBuildRequest {
@@ -850,6 +874,10 @@ message PullCatalogueReply {
   // Contract v26 (W8.10; ruling 274): the platform Terms' address, which
   // the install dialog's one line links.
   string terms_url = 4;
+  // Contract v27 (W8.10; spec/starter-packs, requirement 14): every pack
+  // whose catalogue record falls after the sequence asked, whole, at its
+  // latest published revision; a v26 conductor ignores it.
+  repeated PluginPack packs = 5;
 }
 
 // One resolution request per install or update (plan Q3), counted by the
@@ -957,7 +985,13 @@ message SetPluginAttributesRequest {
   string plugin = 2;
   repeated string regions = 3;
   repeated string asset_classes = 4;
+  // Read during the move as support_url or support_email by its form;
+  // refused beside either.
   string support_contact = 5;
+  // Contract v27 (W8.16; ruling 330): an `https:` URL, and an address, each
+  // refused INVALID_ARGUMENT naming it where it is not of its kind.
+  string support_url = 6;
+  string support_email = 7;
 }
 
 message WithdrawListedVersionRequest {
@@ -1065,6 +1099,9 @@ message InstallPluginRequest {
   // Why, kept with the install's record. Through /mcp every install
   // carries one.
   string note = 4;
+  // Contract v27 (W8.10, W8.18; spec/starter-packs, requirement 18): the pack
+  // whose install made it, `organisation/pack`; empty for one listing's.
+  string pack = 5;
 }
 
 // Moves an instance to a newer version from its source registry, or a local
@@ -1136,4 +1173,382 @@ message SentPluginUsageReport {
   // Whether the platform received it.
   bool received = 2;
   PluginUsageReport report = 3;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Contract v27: starter packs (W8.17 to W8.19; spec/starter-packs, its names
+// approved 2026-10-19 with rulings 400 to 414)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// A starter pack in the platform's catalogue: a curated list of listings for
+// one kind of trading, never a merged plugin (336).
+message PluginPack {
+  // `organisation/pack`: the curator's namespace and the pack's DNS label,
+  // fixed at its first publish.
+  string pack = 1;
+  // The curating organisation's display name.
+  string curator = 2;
+  // Its latest published revision, immutable.
+  PackRevision revision = 3;
+  // When its curator withdrew it; 0 while it stands.
+  int64 withdrawn_at_ns = 4;
+  // Its place in the catalogue's sequence.
+  uint64 sequence = 5;
+}
+
+// A published revision of a pack, never changed afterwards (requirement 4).
+message PackRevision {
+  // From 1.
+  uint64 revision = 1;
+  string title = 2;
+  // At most 280 characters.
+  string description = 3;
+  // From the platform's closed list of asset classes.
+  repeated string asset_classes = 4;
+  // In the curator's order.
+  repeated PackMember members = 5;
+  // The reviewer's note.
+  string note = 6;
+  int64 published_at_ns = 7;
+}
+
+// One member of a pack (requirement 3).
+message PackMember {
+  // `organisation/plugin`.
+  string listing = 1;
+  // `community` or `verified`, never local.
+  string registry = 2;
+  PackSelection selection = 3;
+  // Its group label on the install sheet: "Data", "Brokers".
+  string group = 4;
+  // A listed version of the listing: the floor it tracks its latest above.
+  string minimum_version = 5;
+}
+
+// How a member is offered on the install sheet (requirement 3; Debian's
+// Depends, Recommends and Suggests).
+enum PackSelection {
+  PACK_SELECTION_UNSPECIFIED = 0;
+  // Ticked and fixed.
+  PACK_SELECTION_REQUIRED = 1;
+  // Ticked; the deployment admin may untick it.
+  PACK_SELECTION_PRESELECTED = 2;
+  // Unticked; the deployment admin may tick it.
+  PACK_SELECTION_CHOOSE = 3;
+}
+
+// W8.17: staff publish a pack's next revision after its review.
+message PublishPluginPackRequest {
+  string organisation = 1;
+  string pack = 2;
+  string title = 3;
+  string description = 4;
+  repeated string asset_classes = 5;
+  repeated PackMember members = 6;
+  string note = 7;
+}
+
+// W8.17: staff withdraw a pack, or restore one withdrawn.
+message WithdrawPluginPackRequest {
+  string organisation = 1;
+  string pack = 2;
+  // True restores a withdrawn pack.
+  bool restore = 3;
+  string note = 4;
+}
+
+// W8.18: Browse's pack view, read from the conductor's copy of the catalogue.
+message ListRegistryPacksRequest {
+  // Words matched against the pack's title and description.
+  string search = 1;
+  // One pack, `organisation/pack`; empty for the list.
+  string pack = 2;
+  int32 page_size = 3;
+  string cursor = 4;
+  // Pull the catalogue first, then answer.
+  bool pull_now = 5;
+}
+
+message ListRegistryPacksReply {
+  repeated PluginPack packs = 1;
+  string next_cursor = 2;
+  int64 catalogue_pulled_at_ns = 3;
+}
+
+// W8.18: install a pack, the ticked members one by one as a job.
+message InstallPackRequest {
+  string pack = 1;
+  // The revision the sheet showed; another is refused FAILED_PRECONDITION
+  // naming it.
+  uint64 revision = 2;
+  // The members ticked, by listing; a name not a member is refused
+  // INVALID_ARGUMENT naming it before anything moves.
+  repeated string members = 3;
+  string note = 4;
+}
+
+// The pack job, and each member's outcome so far.
+message PackInstall {
+  string pack = 1;
+  uint64 revision = 2;
+  repeated PackMemberStatus members = 3;
+}
+
+// W8.19: a pack's page.
+message ReadPackRequest {
+  string pack = 1;
+}
+
+// An installed pack's status: the setup checklist (339).
+message PackStatus {
+  string pack = 1;
+  // The revision installed, and the catalogue's latest.
+  uint64 installed_revision = 2;
+  uint64 latest_revision = 3;
+  // Withdrawn by its curator.
+  bool withdrawn = 4;
+  repeated PackMemberStatus members = 5;
+}
+
+// One member's state in this deployment.
+message PackMemberStatus {
+  string listing = 1;
+  string group = 2;
+  // Installed here, and the latest offered at or above the minimum; empty
+  // when none.
+  string installed_version = 3;
+  string latest_version = 4;
+  PackMemberState state = 5;
+  // Why, for failed, unavailable or not permitted, in words.
+  string reason = 6;
+  repeated string instance_ids = 7;
+  // The instance's "Setting up" next step, in its words.
+  string setup = 8;
+  // The revision that added it, where after the installed one; the
+  // revision that removed it, where it is no longer in the pack.
+  uint64 added_by_revision = 9;
+  uint64 removed_by_revision = 10;
+}
+
+enum PackMemberState {
+  PACK_MEMBER_STATE_UNSPECIFIED = 0;
+  PACK_MEMBER_STATE_NOT_INSTALLED = 1;
+  PACK_MEMBER_STATE_INSTALLING = 2;
+  PACK_MEMBER_STATE_FAILED = 3;
+  PACK_MEMBER_STATE_INSTALLED = 4;
+  PACK_MEMBER_STATE_LAUNCHED = 5;
+  // No offered version at or above its minimum.
+  PACK_MEMBER_STATE_UNAVAILABLE = 6;
+  // Its floor not met, or a registry this deployment does not take.
+  PACK_MEMBER_STATE_NOT_PERMITTED = 7;
+}
+
+// W8.19: update every launched member to its own latest.
+message UpdatePackRequest {
+  string pack = 1;
+  string note = 2;
+}
+
+// W8.19: remove the deployment's pack record; no member is touched.
+message RemovePackRequest {
+  string pack = 1;
+  string note = 2;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Contract v27: a listing's prices (W8.20;
+// spec/every-data-source-is-licensed-on-the-same-terms, §3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// One price on a listing: one dataset's meter, and its category or
+// professional status where the dataset's terms split by one.
+message ListingPrice {
+  // The catalogue key of the dataset it prices.
+  string dataset = 1;
+  LicenceMeter meter = 2;
+  // For non-display split by category; unspecified otherwise.
+  NonDisplayCategory category = 3;
+  // For display split by professional status; unspecified otherwise.
+  ProfessionalStatus professional = 4;
+  Money amount = 5;
+  PricePeriod period = 6;
+  repeated PriceTier tiers = 7;
+  TierMode tier_mode = 8;
+  // Per person or per deployment, by the meter; unset for none.
+  Money cap = 9;
+  // ISO 8601: when an approved price takes effect.
+  string effective_from = 10;
+  // The notice the vendor gives of a change, in days.
+  uint32 notice_days = 11;
+}
+
+// One tier: from and to count the meter's units, inclusive; to 0 is open.
+message PriceTier {
+  uint32 from = 1;
+  uint32 to = 2;
+  Money amount = 3;
+}
+
+enum PricePeriod {
+  PRICE_PERIOD_UNSPECIFIED = 0;
+  PRICE_PERIOD_MONTH = 1;
+  PRICE_PERIOD_YEAR = 2;
+}
+
+enum TierMode {
+  TIER_MODE_UNSPECIFIED = 0;
+  // Each tier prices its own slice.
+  TIER_MODE_BRACKET = 1;
+  // The tier reached prices everything.
+  TIER_MODE_WHOLE = 2;
+}
+
+// A display price's professional status, where the terms split by it.
+enum ProfessionalStatus {
+  PROFESSIONAL_STATUS_UNSPECIFIED = 0;
+  PROFESSIONAL_STATUS_PROFESSIONAL = 1;
+  PROFESSIONAL_STATUS_NON_PROFESSIONAL = 2;
+}
+
+// W8.20: a vendor's proposed prices, staff's to approve or reject.
+message ListingPriceProposal {
+  string proposal_id = 1;
+  // `organisation/plugin`.
+  string listing = 2;
+  repeated ListingPrice prices = 3;
+  ListingPriceProposalState state = 4;
+  string note = 5;
+  string proposed_by = 6;
+  int64 proposed_at_ns = 7;
+  string decided_by = 8;
+  int64 decided_at_ns = 9;
+  string decision_note = 10;
+}
+
+enum ListingPriceProposalState {
+  LISTING_PRICE_PROPOSAL_STATE_UNSPECIFIED = 0;
+  LISTING_PRICE_PROPOSAL_STATE_PROPOSED = 1;
+  LISTING_PRICE_PROPOSAL_STATE_APPROVED = 2;
+  LISTING_PRICE_PROPOSAL_STATE_REJECTED = 3;
+}
+
+// W8.20: an Owner or Admin proposes the listing's prices, whole.
+message ProposeListingPricesRequest {
+  string organisation = 1;
+  string plugin = 2;
+  repeated ListingPrice prices = 3;
+  string note = 4;
+}
+
+// W8.20: staff approve or reject a proposal, with a note.
+message ReviewListingPricesRequest {
+  string proposal_id = 1;
+  bool approve = 2;
+  string note = 3;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Contract v27: a session's latency and a hop's data age (W4.16;
+// spec/sessions-and-data-report-their-latency-and-quality, rulings 415 to 427)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// 1 to 500 snapshots, every 10 seconds, to core's monitor.
+message ReportLatencyRequest {
+  repeated LatencySnapshot snapshots = 1;
+}
+
+message ReportLatencyReply {
+  uint32 accepted = 1;
+}
+
+// One histogram snapshot over an interval: a session's metric, or a dataset's
+// age at a hop.
+message LatencySnapshot {
+  int64 interval_start_ns = 1;
+  int64 interval_ns = 2;
+  // The session, by the plugin's own name for it; empty for a dataset's.
+  string session = 3;
+  // The dataset, `instance:key`, and the hop; empty and unspecified for a
+  // session's.
+  string dataset = 4;
+  AgeHop hop = 5;
+  LatencyMetric metric = 6;
+  LatencyHistogram histogram = 7;
+  LatencyCounters counters = 8;
+  // The source's clock minus ours, corrected by half the round trip.
+  int64 clock_skew_ns = 9;
+  // The session's last message or heartbeat.
+  int64 alive_at_ns = 10;
+  // The absolute ceilings in force, as the plugin's settings hold them.
+  LatencyCeilings ceilings = 11;
+  // The reporting instance, stamped by its sidecar.
+  string instance_id = 12;
+}
+
+enum LatencyMetric {
+  LATENCY_METRIC_UNSPECIFIED = 0;
+  // Round trip: FIX TestRequest to its Heartbeat, a WebSocket ping to its
+  // pong, a REST call's duration.
+  LATENCY_METRIC_RTT = 1;
+  // Connectivity: placement sent to the venue's acknowledgement.
+  LATENCY_METRIC_ORDER_ACK = 2;
+  // Connectivity: the venue's transaction time to the fill received.
+  LATENCY_METRIC_FILL_DELAY = 3;
+  // A dataset's age at a hop.
+  LATENCY_METRIC_AGE = 4;
+}
+
+// Where a dataset's age is measured.
+enum AgeHop {
+  AGE_HOP_UNSPECIFIED = 0;
+  // The data plugin, on parsing the vendor's message: the feed delay.
+  AGE_HOP_EDGE = 1;
+  AGE_HOP_SIDECAR = 2;
+  AGE_HOP_LAKE = 3;
+  AGE_HOP_BUS = 4;
+  AGE_HOP_ANALYTICS = 5;
+  // The `ems`, at its pre-trade check.
+  AGE_HOP_EMS_CHECK = 6;
+  AGE_HOP_PAGE = 7;
+}
+
+// A sparse log-linear histogram, HdrHistogram's layout (ruling 416).
+message LatencyHistogram {
+  int64 lowest_ns = 1;
+  // 2 in v27.
+  uint32 significant_digits = 2;
+  repeated LatencyBucket buckets = 3;
+  int64 min_ns = 4;
+  int64 max_ns = 5;
+  // Values recorded in the interval.
+  uint64 total = 6;
+}
+
+// One bucket with a count; empty buckets are not sent.
+message LatencyBucket {
+  uint32 bucket = 1;
+  uint64 count = 2;
+}
+
+// A session's congestion in the interval.
+message LatencyCounters {
+  uint64 gaps = 1;
+  uint64 resends = 2;
+  uint64 reconnects = 3;
+  uint64 rate_limited = 4;
+  // Messages queued to send, at their peak.
+  uint64 backlog_peak = 5;
+}
+
+// The plugin admin's session_ceilings for the connection, in force; 0 is no
+// ceiling.
+message LatencyCeilings {
+  int64 rtt_p99_ns = 1;
+  int64 order_ack_p99_ns = 2;
+  int64 fill_delay_p99_ns = 3;
+  int64 feed_delay_p99_ns = 4;
+  int64 clock_skew_max_ns = 5;
+  uint32 gaps_per_hour = 6;
+  uint32 reconnects_per_hour = 7;
+  uint32 backlog_max = 8;
 }

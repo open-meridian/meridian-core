@@ -58,7 +58,7 @@ const DAY_NS: i64 = 24 * 3_600 * 1_000_000_000;
 
 /// Core's acts that can be prepared (the plan's Q13; from contract v22 the
 /// order path's two, Q44), by their names on the surface.
-pub const CORE_PREPARABLE: [&str; 28] = [
+pub const CORE_PREPARABLE: [&str; 29] = [
     "dashboard__set_plugin_settings",
     "dashboard__allow_archive",
     "dashboard__withdraw_archive",
@@ -94,6 +94,8 @@ pub const CORE_PREPARABLE: [&str; 28] = [
     "dashboard__set_deployment_time_zone",
     // Contract v26 (W12.6).
     "dashboard__set_model_routing",
+    // Contract v27 (W6.36).
+    "dashboard__set_fx_pivot_currencies",
 ];
 
 /// v20's own tools, never prepared and never levelled but for the three on

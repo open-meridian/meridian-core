@@ -392,9 +392,11 @@ with sync_playwright() as playwright:
     theirs = [who for who, count in now.items() if count > earlier.get(who, 0)]
     check(len(theirs) == 1, f"one person's row holds it: {theirs}")
     if theirs:
-        # The page asks before it revokes them.
-        page.once("dialog", lambda asked: asked.accept())
+        # The page asks before it revokes them, in its dialog, with why
+        # (351's audit, v27 stage E).
         page.locator(f"#connected-clients tr[data-id='{theirs[0]}'] button:has-text('Revoke them all')").click()
+        page.fill("dialog#om-confirm textarea[name=why]", "The stand-in's clients are done.")
+        page.click("dialog#om-confirm [data-confirm-act]")
         page.wait_for_load_state()
         check("revoked=" in page.url, f"the administrator revokes that person's delegations: {page.url}")
         check(theirs[0] not in held_by(page), "and none of theirs is listed")

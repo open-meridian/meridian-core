@@ -44,6 +44,9 @@ pub struct Reads {
     pub history_dates: usize,
     /// Instruments a what-if adds, beyond the positions held.
     pub what_if_instruments: BTreeSet<String>,
+    /// Contract v27 (W12.1): whether a measure reads the accounts'
+    /// executions and their quotes (`execution_cost`).
+    pub executions: bool,
 }
 
 /// A job, compiled: its measures as the answer names them back, and its
@@ -84,6 +87,20 @@ pub fn compile(job: &Job) -> Result<Compiled, Refused> {
     if job.measures.is_empty() {
         return Err(refused("measures", "a job asks one measure or more"));
     }
+    // Contract v27 (W12.1; ruling 458): a business date, never beside a
+    // watermark or an as-of; the component refuses one after today's.
+    if !job.business_date.is_empty() {
+        if meridian_domain::date::Date::parse(&job.business_date).is_err() {
+            return Err(refused("business_date", "a date is YYYY-MM-DD"));
+        }
+        let inputs = job.inputs.clone().unwrap_or_default();
+        if inputs.book_at.is_some() || inputs.lake_as_of_ns != 0 {
+            return Err(refused(
+                "business_date",
+                "a job reads at a business date or at a watermark and an as-of, never both",
+            ));
+        }
+    }
     let mut reads = Reads {
         accounts: job.account_ids.clone(),
         ..Reads::default()
@@ -96,11 +113,18 @@ pub fn compile(job: &Job) -> Result<Compiled, Refused> {
                 .iter()
                 .any(|d| d.definition == measure.definition);
             return Err(if named {
+                let versions: Vec<String> = definitions::DEFINITIONS
+                    .iter()
+                    .filter(|d| d.definition == measure.definition)
+                    .map(|d| d.version.to_string())
+                    .collect();
                 refused(
                     format!("measures[{i}].version"),
                     format!(
-                        "the component serves {} at version 1, not {}",
-                        measure.definition, measure.version
+                        "the component serves {} at version {}, not {}",
+                        measure.definition,
+                        versions.join(" or "),
+                        measure.version
                     ),
                 )
             } else {
@@ -132,6 +156,9 @@ pub fn compile(job: &Job) -> Result<Compiled, Refused> {
         }
         if definition.definition == "pnl" {
             reads.closed_lots = true;
+        }
+        if definition.definition == "execution_cost" {
+            reads.executions = true;
         }
         if matches!(
             definition.definition,
@@ -205,6 +232,7 @@ mod tests {
                 measure("implied_distribution", 1, "EVG-1"),
             ],
             what_if: None,
+            ..Default::default()
         };
         let compiled = compile(&job).unwrap();
         assert!(compiled.reads.closed_lots);

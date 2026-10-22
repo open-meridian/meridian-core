@@ -76,8 +76,145 @@ pub struct MemberView {
     pub idle: Exact,
     /// The accounts its allocation instruction names; its own where none.
     pub instructed: Vec<String>,
-    /// A live block naming it already, where one does (question 27).
+    /// A live block naming it already, where one does (question 27); from
+    /// contract v27, or a live net.
     pub in_block: String,
+    /// Contract v27 (W11.1): an FX order's quote currency, and its value
+    /// date as a net compares it: the date stated, or for spot, `spot@` and
+    /// the trade date it was opened on.
+    pub quote_currency: String,
+    pub value_key: String,
+}
+
+/// The block's or the net's members an order names (W11.1): a block's from
+/// contract v24, a net's from v27.
+pub fn joined_members(order: &meridian_domain::v1::Order) -> Vec<String> {
+    order
+        .block_member_order_ids
+        .iter()
+        .chain(order.net_member_order_ids.iter())
+        .cloned()
+        .collect()
+}
+
+/// A net's members (W11.1, contract v27; the gaps spec's D2), each held to
+/// the rule: released or working, an FX order of the net's pair -- its base
+/// currency's instrument and quote currency -- and one value date, in no
+/// other live block or net, and both sides named. Answers the net's signed
+/// quantity, buys less sells, and its side, the larger's.
+pub fn net_holds(
+    ctx: &Context,
+    members: &[String],
+) -> Result<(Exact, i32, String, String, String)> {
+    let mut seen = BTreeSet::new();
+    let mut buys = Exact::ZERO;
+    let mut sells = Exact::ZERO;
+    let mut first: Option<&MemberView> = None;
+    for (index, member) in members.iter().enumerate() {
+        let field = format!("net_member_order_ids[{index}]");
+        if !seen.insert(member.as_str()) {
+            return Err(malformed(&[&field], format!("names order {member} twice")));
+        }
+        let Some(view) = ctx.members.get(member) else {
+            return Err(malformed(
+                &[&field],
+                format!("the book holds no order {member}"),
+            ));
+        };
+        let state = OrderState::try_from(view.state).unwrap_or(OrderState::Unspecified);
+        if !matches!(state, OrderState::Released | OrderState::Working) {
+            return Err(state_refused(
+                crate::order_decide::row("i2"),
+                state,
+                &format!("naming order {member}, which is not released, in a net"),
+            ));
+        }
+        if !view.in_block.is_empty() {
+            return Err(StoreError::refused(
+                RefusalReason::OrderState,
+                format!(
+                    "order {member} is in live block or net {} already: a member's filled \
+                     quantity is its allocation's, and two would count it twice",
+                    view.in_block
+                ),
+            ));
+        }
+        if view.quote_currency.is_empty() {
+            return Err(malformed(
+                &[&field],
+                format!(
+                    "order {member} names no quote currency: a net joins FX orders of one pair"
+                ),
+            ));
+        }
+        match first {
+            None => first = Some(view),
+            Some(first) => {
+                if !crate::became::same(&view.instrument_id, &first.instrument_id)
+                    || view.quote_currency != first.quote_currency
+                {
+                    return Err(malformed(
+                        &[&field],
+                        format!(
+                            "order {member} is of another pair than order {}",
+                            first.order_id
+                        ),
+                    ));
+                }
+                if view.value_key != first.value_key {
+                    return Err(malformed(
+                        &[&field],
+                        format!(
+                            "order {member} settles on another value date than order {}",
+                            first.order_id
+                        ),
+                    ));
+                }
+            }
+        }
+        let side = Side::try_from(view.side).unwrap_or(Side::Unspecified);
+        if matches!(side, Side::Buy) {
+            buys = numbers::add("net quantity", buys, view.idle)?;
+        } else {
+            sells = numbers::add("net quantity", sells, view.idle)?;
+        }
+    }
+    let Some(first) = first else {
+        return Err(malformed(
+            &["net_member_order_ids"],
+            "a net names its members",
+        ));
+    };
+    let one_side = members.iter().all(|member| {
+        ctx.members
+            .get(member)
+            .is_some_and(|view| (view.side == Side::Buy as i32) == (first.side == Side::Buy as i32))
+    });
+    if one_side {
+        let last = format!("net_member_order_ids[{}]", members.len() - 1);
+        return Err(malformed(
+            &[&last],
+            "a net names members of both sides; one side alone is a block",
+        ));
+    }
+    let (quantity, side) = if buys >= sells {
+        (
+            numbers::add("net quantity", buys, sells.negated())?,
+            Side::Buy as i32,
+        )
+    } else {
+        (
+            numbers::add("net quantity", sells, buys.negated())?,
+            Side::Sell as i32,
+        )
+    };
+    Ok((
+        quantity,
+        side,
+        first.instrument_id.clone(),
+        first.quote_currency.clone(),
+        first.value_key.clone(),
+    ))
 }
 
 // ── The table (decisions/035 as amended at v24) ────────────────────────────
@@ -300,8 +437,9 @@ fn instructed_accounts(book: &Book, ctx: &Context, order_id: &str) -> BTreeSet<S
     let Some(held) = book.ledger.orders.get(order_id) else {
         return accounts;
     };
-    if !held.order.block_member_order_ids.is_empty() {
-        for member in &held.order.block_member_order_ids {
+    let members = joined_members(&held.order);
+    if !members.is_empty() {
+        for member in &members {
             if let Some(view) = ctx.members.get(member) {
                 accounts.extend(view.instructed.iter().cloned());
             }
@@ -1453,20 +1591,22 @@ pub fn child_moves(book: &Book, booking_id: &str, ctx: &Context) -> Result<Vec<C
         return Ok(Vec::new());
     };
     let executed = executed(book, &held.booking.execution_ids)?;
-    let members: Vec<&String> = book
+    let members: Vec<String> = book
         .ledger
         .orders
         .get(&held.booking.order_id)
-        .map(|order| order.order.block_member_order_ids.iter().collect())
+        .map(|order| joined_members(&order.order))
         .unwrap_or_default();
     let mut out = Vec::new();
     for allocation in allocations_elsewhere(&held.booking) {
+        // A net's members are of both sides: the member filled is the one
+        // in the allocation's account on the booking's side.
         let member_order_id = members
             .iter()
             .find(|member| {
-                ctx.members
-                    .get(member.as_str())
-                    .is_some_and(|view| view.account_id == allocation.account_id)
+                ctx.members.get(member.as_str()).is_some_and(|view| {
+                    view.account_id == allocation.account_id && view.side == executed.side
+                })
             })
             .map(|member| member.to_string())
             .unwrap_or_default();

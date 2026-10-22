@@ -243,7 +243,7 @@ pub(super) async fn installed(
     }
     format!(
         "{bar}<om-pager><table class=\"list plugin-table installed\"><thead><tr>\
-         <th>Name</th><th>Running</th><th class=\"mid\">Newest</th><th class=\"wide\">Other versions</th>\
+         <th>Name</th><th>Source</th><th>Running</th><th class=\"mid\">Newest</th><th class=\"wide\">Other versions</th>\
          <th>State</th></tr></thead><tbody>{}</tbody></table></om-pager>",
         rows.concat()
     )
@@ -326,14 +326,38 @@ fn plugin_row(
                 .map_or(name, |(_, plugin)| plugin)
                 .to_string()
         });
+    let source = sources(versions);
     format!(
-        "<tr data-plugin=\"{n}\"><td class=\"keep\"><a href=\"{href}\" title=\"{n}\">{shown}</a></td><td>{running_said}</td>\
+        "<tr data-plugin=\"{n}\"><td class=\"keep\"><a href=\"{href}\" title=\"{n}\">{shown}</a></td>\
+         <td data-source title=\"{source}\">{source}</td><td>{running_said}</td>\
          <td class=\"mid\">{newest}</td><td class=\"wide\">{others}</td><td>{state}</td></tr>",
         n = escape(name),
         shown = escape(&title),
         href = escape(&versions_path(name)),
         newest = escape(&newest),
     )
+}
+
+/// Where a plugin's kept versions came from (v27, stage E): Verified,
+/// Community or Local, each once in that order; a plugin every version of
+/// which is retired says where those came from.
+pub fn sources(versions: &[&PluginVersion]) -> String {
+    let kept: Vec<&&PluginVersion> = versions.iter().filter(|v| v.retired_at_ns == 0).collect();
+    let from: Vec<&str> = if kept.is_empty() {
+        versions
+            .iter()
+            .map(|v| registry_label(&v.source_registry))
+            .collect()
+    } else {
+        kept.iter()
+            .map(|v| registry_label(&v.source_registry))
+            .collect()
+    };
+    ["Verified", "Community", "Local"]
+        .into_iter()
+        .filter(|label| from.contains(label))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// `GET /admin/plugins/versions/{name}?show=all`: a plugin's Versions.
@@ -527,11 +551,13 @@ fn version_row(
     }
     if instances.is_empty() {
         acts.push(format!(
-            "<form method=\"post\" action=\"{PLUGINS_PATH}/retire\" class=\"inline-act\">{token}\
-             {n}{ver}<input type=\"text\" name=\"note\" required maxlength=\"2000\" placeholder=\"Why\" aria-label=\"Why\">\
-             <button type=\"submit\">Retire</button></form>",
+            "<form method=\"post\" action=\"{PLUGINS_PATH}/retire\" class=\"inline-act\" \
+             data-confirm=\"Retire {said} {sv}? Nothing can launch it again until it is uploaded again.\">{token}\
+             {n}{ver}<button type=\"submit\">Retire</button></form>",
             n = hidden("name", name),
             ver = hidden("version", &v),
+            said = escape(name),
+            sv = escape(&v),
         ));
     }
     let wants = version

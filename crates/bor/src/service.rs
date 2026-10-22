@@ -169,6 +169,7 @@ fn record_says(record: &meridian_domain::v1::InstrumentRecord) -> RecordSays {
         cash: class == meridian_domain::v1::AssetClass::Cash,
         code: record.currency.trim().to_string(),
         provisional: record.provisional,
+        referential: class == meridian_domain::v1::AssetClass::Referential,
     }
 }
 

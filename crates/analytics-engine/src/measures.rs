@@ -19,9 +19,6 @@ use crate::exact::Dec;
 use crate::historical;
 use crate::model::{self, conversion, product, Valued};
 
-/// Why a position whose lots carry no cost is not evaluated.
-pub const NO_COST: &str = "the book states no cost for its lots";
-
 /// A whole-number scale for a what-if trade's cost, as the reference rounds
 /// it.
 const COST_SCALE: u32 = 18;
@@ -32,6 +29,9 @@ pub struct Part {
     pub figures: Vec<Figure>,
     pub not_evaluated: Vec<Unevaluated>,
     pub reads: Reads,
+    /// Contract v27 (W10.11): the `ExecutionCost` rows an `execution_cost`
+    /// unit answers, as the answer's JSON holds them.
+    pub execution_costs: Vec<serde_json::Value>,
 }
 
 /// A unit of work: one measure of the job, over one account or (for the
@@ -115,7 +115,7 @@ pub fn plan(case: &Case, index: usize) -> Result<Planned> {
                 Vec::new()
             }
         }
-        "concentration" => per_account(),
+        "concentration" | "execution_cost" => per_account(),
         "historical_var" | "expected_shortfall" => {
             preamble.not_evaluated = unknown(definition.breakdowns);
             let window = historical::window(definition);
@@ -161,9 +161,38 @@ pub fn compute(case: &Case, unit: &Unit) -> Result<Part> {
         }
         "resolution_payoff" => resolution_payoff(case, key, definition, account, &mut part)?,
         "implied_distribution" => implied_distribution(case, key, definition, &mut part)?,
+        "execution_cost" => execution_cost(case, key, definition, account, &mut part)?,
         other => return Err(CaseError(format!("no computation for {other}"))),
     }
     Ok(part)
+}
+
+/// The rate from an account's base to the job's reporting currency
+/// (contract v27, ruling 459), its legs read, and the currency its money
+/// figures are in: 1 and the base where the job names none, or its base.
+/// None, the account not evaluated with why, where no chain reaches it.
+pub fn reporting(
+    case: &Case,
+    key: &MeasureKey,
+    account: &str,
+    part: &mut Part,
+) -> Result<Option<(Dec, String)>> {
+    let base = case.base(account)?.to_string();
+    let reporting = &case.reporting_currency;
+    if reporting.is_empty() || *reporting == base {
+        return Ok(Some((Dec::from_int(1), base)));
+    }
+    match conversion(case, &base, reporting) {
+        Ok(legs) => {
+            model::read_legs(&mut part.reads, &legs);
+            Ok(Some((product(&legs), reporting.clone())))
+        }
+        Err((why, _)) => {
+            part.not_evaluated
+                .push(unevaluated(account, "", key, why, reporting.clone()));
+            Ok(None)
+        }
+    }
 }
 
 /// The scenarios an account is answered under: the base, and the what-if
@@ -306,6 +335,9 @@ fn linear(
         _ => &[""],
     };
     let base = case.base(account)?.to_string();
+    let Some((rate, currency)) = reporting(case, key, account, part)? else {
+        return Ok(());
+    };
     for scenario in scenarios(case, account) {
         let mut sums = Sums::new();
         for position in positions(case, &mut part.reads, account, scenario)? {
@@ -352,14 +384,15 @@ fn linear(
                     // opened) leaves its position's P&L not evaluated, never
                     // a P&L over a cost of nothing. The reference refuses
                     // such a document whole; a job answers the rest.
+                    // Contract v27 (ruling 325): NOT_EVALUATED_REASON_COST_MISSING.
                     let Some(cost) = position.cost.as_ref() else {
                         if scenario == BASE {
                             part.not_evaluated.push(unevaluated(
                                 account,
                                 &position.instrument_id,
                                 key,
-                                HISTORY_INSUFFICIENT,
-                                NO_COST.to_string(),
+                                COST_MISSING,
+                                String::new(),
                             ));
                         }
                         continue;
@@ -379,7 +412,21 @@ fn linear(
                     sleeve: lot.sleeve.clone(),
                 };
                 match breakdown_of(case, &as_position, names) {
-                    Ok(group) => add(&mut sums, group, "realized", lot.proceeds.sub(&lot.cost)),
+                    Ok(group) => {
+                        let Some(cost) = lot.cost.as_ref() else {
+                            if scenario == BASE {
+                                part.not_evaluated.push(unevaluated(
+                                    account,
+                                    &lot.instrument_id,
+                                    key,
+                                    COST_MISSING,
+                                    String::new(),
+                                ));
+                            }
+                            continue;
+                        };
+                        add(&mut sums, group, "realized", lot.proceeds.sub(cost))
+                    }
                     Err(missing) => {
                         if scenario == BASE {
                             part.not_evaluated.push(unevaluated(
@@ -409,10 +456,10 @@ fn linear(
                     account_id: account.to_string(),
                     breakdown,
                     scenario: Scenario::of(scenario),
-                    value: Some(value.round_half_even(definition.scale)),
+                    value: Some(value.mul(&rate).round_half_even(definition.scale)),
                     numerator: None,
                     denominator: None,
-                    currency_instrument_id: base.clone(),
+                    currency_instrument_id: currency.clone(),
                 });
             }
         }
@@ -635,19 +682,11 @@ pub fn payoffs(
                 continue;
             }
         };
-        for leg in &legs {
-            if !leg.dataset.is_empty() {
-                reads.datasets.insert(leg.dataset.clone());
-            }
-        }
         if position.cost.is_none() {
-            failed.push((
-                position.instrument_id.clone(),
-                HISTORY_INSUFFICIENT,
-                NO_COST.to_string(),
-            ));
+            failed.push((position.instrument_id.clone(), COST_MISSING, String::new()));
             continue;
         }
+        model::read_legs(reads, &legs);
         terms.push((position, payout.mul(&product(&legs))));
     }
     if !failed.is_empty() {
@@ -701,6 +740,9 @@ fn resolution_payoff(
     {
         return Ok(());
     }
+    let Some((rate, currency)) = reporting(case, key, account, part)? else {
+        return Ok(());
+    };
     match payoffs(case, group, &held, &base, &mut part.reads)? {
         Err(failed) => {
             for (instrument, why, detail) in failed {
@@ -715,13 +757,204 @@ fn resolution_payoff(
                     account_id: account.to_string(),
                     breakdown: Vec::new(),
                     scenario,
-                    value: Some(total.round_half_even(definition.scale)),
+                    value: Some(total.mul(&rate).round_half_even(definition.scale)),
                     numerator: None,
                     denominator: None,
-                    currency_instrument_id: base.clone(),
+                    currency_instrument_id: currency.clone(),
                 });
             }
         }
+    }
+    Ok(())
+}
+
+// ── execution_cost, version 1 (contract v27; the gaps spec's C1 to C10) ─────
+
+/// The benchmarks version 1 measures, in order, with the execution's moment
+/// each is taken at; a fixing and interval VWAP need inputs a v1 job does
+/// not read.
+pub const TCA_BENCHMARKS: [&str; 4] = [
+    "TCA_BENCHMARK_DECISION",
+    "TCA_BENCHMARK_ARRIVAL",
+    "TCA_BENCHMARK_PLACEMENT_ARRIVAL",
+    "TCA_BENCHMARK_MID_AT_FILL",
+];
+/// The quote's staleness bound by default (C4): 5 seconds.
+pub const TCA_STALENESS_BOUND_NS: i64 = 5_000_000_000;
+pub const NO_QUOTE: &str = "TCA_UNANSWERED_NO_QUOTE";
+pub const NOT_MEASURED: &str = "TCA_UNANSWERED_NOT_MEASURED";
+/// The places a cost in bps is rounded to, half to even.
+const BPS_SCALE: u32 = 4;
+
+/// A benchmark's place among [`TCA_BENCHMARKS`], the rows' order.
+pub fn benchmark_order(benchmark: &str) -> usize {
+    TCA_BENCHMARKS
+        .iter()
+        .position(|b| *b == benchmark)
+        .unwrap_or(TCA_BENCHMARKS.len())
+}
+
+fn ten_thousand() -> crate::exact::Ratio {
+    Dec::from_int(10_000).to_ratio()
+}
+
+fn bps(value: &crate::exact::Ratio) -> Dec {
+    value.mul(&ten_thousand()).round_half_even(BPS_SCALE)
+}
+
+fn money_json(amount: &Dec, instrument_id: &str) -> serde_json::Value {
+    serde_json::json!({"amount": amount.text(), "instrument_id": instrument_id})
+}
+
+/// execution_cost v1: each execution of the account against each benchmark
+/// it is measured by, in bps, side-adjusted, positive a cost -- s × (price −
+/// benchmark) ÷ benchmark × 10⁴ (C3) -- against the mid in force at the
+/// benchmark's moment within the staleness bound, never an imputed value
+/// (C4); fees and financing apart in bps of notional. Each row is the
+/// lake's `ExecutionCost`; the figures are the account's notional-weighted
+/// mean per benchmark, its notional in its base (or the job's reporting
+/// currency).
+fn execution_cost(
+    case: &Case,
+    key: &MeasureKey,
+    definition: &Definition,
+    account: &str,
+    part: &mut Part,
+) -> Result<()> {
+    use crate::exact::Ratio;
+    let base = case.base(account)?.to_string();
+    let Some((rate, _currency)) = reporting(case, key, account, part)? else {
+        return Ok(());
+    };
+    let bound_default = if case.tca_staleness_bound_ns == 0 {
+        TCA_STALENESS_BOUND_NS
+    } else {
+        case.tca_staleness_bound_ns
+    };
+    let mut weighted: BTreeMap<&'static str, (Ratio, Ratio)> = BTreeMap::new();
+    for execution in case.executions.iter().filter(|e| e.account_id == account) {
+        let price = &execution.price;
+        let held = &execution.price_instrument_id;
+        let notional = price.mul(&execution.quantity);
+        let sign: i128 = if execution.side == "SIDE_BUY" { 1 } else { -1 };
+        let in_base = match conversion(case, held, &base) {
+            Ok(legs) => {
+                model::read_legs(&mut part.reads, &legs);
+                Some(notional.mul(&product(&legs)).mul(&rate).to_ratio())
+            }
+            Err(_) => None,
+        };
+        let charge = |amount: &Option<Dec>| -> Option<Dec> {
+            match amount {
+                Some(amount) if !notional.is_zero() => {
+                    Some(bps(&amount.to_ratio().div(&notional.to_ratio())))
+                }
+                _ => None,
+            }
+        };
+        let fees = charge(&execution.fees);
+        let financing = charge(&execution.financing);
+        let moments = [
+            execution.decision_at_ns,
+            execution.arrival_at_ns,
+            execution.placement_arrival_at_ns,
+            execution.executed_at_ns,
+        ];
+        for (benchmark, moment) in TCA_BENCHMARKS.iter().zip(moments) {
+            // The mid in force at the moment, in the execution's asset.
+            let quote = case
+                .market
+                .get(&(execution.instrument_id.clone(), "mid".to_string()))
+                .into_iter()
+                .flatten()
+                .filter(|q| q.instrument_id == *held && q.valid_at_ns <= moment)
+                .fold(None::<&crate::case::Price>, |best, q| match best {
+                    Some(b) if (q.valid_at_ns, &q.dataset) <= (b.valid_at_ns, &b.dataset) => {
+                        Some(b)
+                    }
+                    _ => Some(q),
+                });
+            let mut bound = bound_default;
+            if let Some(limit) = quote.and_then(|q| case.stale_after.get(&q.dataset)) {
+                bound = bound.min(*limit);
+            }
+            let unanswered = if moment == 0 {
+                NOT_MEASURED
+            } else if quote.is_none_or(|q| moment - q.valid_at_ns > bound || q.amount.is_zero()) {
+                NO_QUOTE
+            } else {
+                ""
+            };
+            let mut cost = None;
+            if unanswered.is_empty() {
+                if let Some(quote) = quote {
+                    part.reads.datasets.insert(quote.dataset.clone());
+                    let exact = price
+                        .sub(&quote.amount)
+                        .to_ratio()
+                        .div(&quote.amount.to_ratio())
+                        .mul(&Dec::from_int(sign).to_ratio());
+                    cost = Some(bps(&exact));
+                    if let Some(in_base) = &in_base {
+                        let held = weighted
+                            .entry(benchmark)
+                            .or_insert_with(|| (Ratio::zero(), Ratio::zero()));
+                        held.0 = held.0.add(&exact.mul(&ten_thousand()).mul(in_base));
+                        held.1 = held.1.add(in_base);
+                    }
+                }
+            }
+            let answered = unanswered.is_empty() && quote.is_some();
+            let text = |held: &Option<Dec>| match held {
+                Some(value) => serde_json::Value::String(value.text()),
+                None => serde_json::Value::Null,
+            };
+            part.execution_costs.push(serde_json::json!({
+                "execution_id": execution.execution_id,
+                "order_id": execution.order_id,
+                "placement_id": execution.placement_id,
+                "account_id": account,
+                "benchmark": benchmark,
+                "benchmark_price": match quote.filter(|_| answered) {
+                    Some(q) => money_json(&q.amount, &q.instrument_id),
+                    None => serde_json::Value::Null,
+                },
+                "benchmark_at_ns": (if unanswered == NOT_MEASURED { 0 } else { moment }).to_string(),
+                "benchmark_dataset": quote.filter(|_| answered).map(|q| q.dataset.clone()).unwrap_or_default(),
+                "benchmark_row_key": quote.filter(|_| answered).map(|q| q.row_key.clone()).unwrap_or_default(),
+                "execution_price": money_json(price, held),
+                "side": execution.side,
+                "notional": money_json(&notional, held),
+                "cost_bps": text(&cost),
+                "fees_bps": text(&fees),
+                "financing_bps": text(&financing),
+                "liquidity_indicator": execution.liquidity_indicator,
+                "venue_id": execution.venue_id,
+                "unanswered": unanswered,
+                "staleness_bound_ns": bound.to_string(),
+                "time_precision": execution.time_precision,
+                "reject_count": execution.reject_count,
+                "time_to_fill_ns": execution.time_to_fill_ns.to_string(),
+            }));
+        }
+    }
+    for benchmark in TCA_BENCHMARKS {
+        let Some((total, weight)) = weighted.get(benchmark) else {
+            continue;
+        };
+        if weight.signum() == 0 {
+            continue;
+        }
+        part.figures.push(Figure {
+            measure: key.clone(),
+            account_id: account.to_string(),
+            breakdown: vec![("benchmark".to_string(), benchmark.to_string())],
+            scenario: Scenario::of(BASE),
+            value: Some(total.div(weight).round_half_even(definition.scale)),
+            numerator: None,
+            denominator: None,
+            currency_instrument_id: String::new(),
+        });
     }
     Ok(())
 }

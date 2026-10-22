@@ -1599,9 +1599,16 @@ async fn each_button_shows_the_pages_at_its_level_and_no_way_to_the_portal_even_
     );
     assert!(!manage.contains("<iframe"), "{manage}");
     assert!(!manage.contains("Statements"), "{manage}");
-    // Its admin, a deployment admin too, is shown no way from here to its
-    // tabs in the admin portal (the product owner, 2026-09-30).
-    assert!(!manage.contains("/admin/plugins/"), "{manage}");
+    // Its admin, a deployment admin too, is shown no way from the page to
+    // its tabs in the admin portal (the product owner, 2026-09-30): from
+    // v27 the page sits inside the settings' shell, Plugins current, and
+    // keeps its own tabs (ruling 450); the page itself names no portal tab.
+    assert!(manage.contains("current=\"plugins\""), "{manage}");
+    let page_alone = manage
+        .split("class=\"om-shell-main\">")
+        .nth(1)
+        .unwrap_or(&manage);
+    assert!(!page_alone.contains("/admin/plugins/"), "{page_alone}");
     let connections = area("admin&tab=connections").await;
     assert!(
         connections.contains(
@@ -1795,6 +1802,11 @@ async fn under_manage_the_dashboard_draws_summary_then_settings_opens_on_summary
     .await;
     assert_eq!(manage.status, StatusCode::OK, "{}", manage.body);
     let body = manage.body.split("</header>").nth(1).unwrap();
+    // The page alone, inside the settings' shell (ruling 450).
+    let body = body
+        .split("class=\"om-shell-main\">")
+        .nth(1)
+        .unwrap_or(body);
     assert_eq!(
         tab_row(body),
         (
@@ -1879,6 +1891,12 @@ async fn under_manage_the_dashboard_draws_summary_then_settings_opens_on_summary
     .await;
     assert_eq!(settings.status, StatusCode::OK, "{}", settings.body);
     let settings = settings.body.split("</header>").nth(1).unwrap();
+    // The page alone, inside the settings' shell a deployment admin sees
+    // (ruling 450).
+    let settings = settings
+        .split("class=\"om-shell-main\">")
+        .nth(1)
+        .unwrap_or(settings);
     assert_eq!(tab_row(settings).1, "settings");
     for summary in [
         "id=\"status\"",

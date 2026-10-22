@@ -45,6 +45,7 @@ fn chrome<'a>(session: &'a Session, admin: bool, crumbs: String) -> Chrome<'a> {
         main: "page",
         in_admin: false,
         report: Report::Dashboard,
+        sidebar: None,
     }
 }
 
@@ -370,8 +371,7 @@ async fn prepared_page(
          <p class=\"hint\">The check: {checked}</p></section>\
          <section class=\"panel padded\"><h2>Its history</h2><table class=\"list one-line\"><thead><tr>\
          <th>Step</th><th>By</th><th>When</th><th>Note</th></tr></thead><tbody>{history}</tbody></table></section></div>\
-         </div>\
-         <script>document.addEventListener(\"submit\",function(e){{var b=e.submitter;if(b&&b.hasAttribute(\"data-confirm\")&&!window.confirm(b.getAttribute(\"data-confirm\")))e.preventDefault();}});</script>",
+         </div>",
         tool = escape(&kept.tool_name),
         title = escape(act.as_ref().map_or(kept.tool_name.as_str(), |act| act.title())),
         id = escape(&id),

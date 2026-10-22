@@ -5,7 +5,7 @@
 //! it (`meridian.analytics.answer_json`), which the identity test compares
 //! byte for byte; and the wire's `JobAnswer`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
 
@@ -28,6 +28,13 @@ pub const IMPLEMENTATION_UNAVAILABLE: &str = "NOT_EVALUATED_REASON_IMPLEMENTATIO
 pub const SCHEME_NOT_HELD: &str = "NOT_EVALUATED_REASON_SCHEME_NOT_HELD";
 pub const GROUP_NOT_EXHAUSTIVE: &str = "NOT_EVALUATED_REASON_GROUP_NOT_EXHAUSTIVE";
 pub const HISTORY_INSUFFICIENT: &str = "NOT_EVALUATED_REASON_HISTORY_INSUFFICIENT";
+/// Contract v27 (ruling 325): a lot's cost the book does not record.
+pub const COST_MISSING: &str = "NOT_EVALUATED_REASON_COST_MISSING";
+
+/// How a conversion leg's rate was found (contract v27, ruling 462).
+pub const DIRECT: &str = "CONVERSION_DERIVATION_DIRECT";
+pub const INVERTED: &str = "CONVERSION_DERIVATION_INVERTED";
+pub const CROSSED: &str = "CONVERSION_DERIVATION_CROSSED";
 
 /// The order scenarios are answered in within one breakdown.
 pub fn scenario_order(kind: &str) -> u8 {
@@ -155,6 +162,12 @@ pub struct Reads {
     pub instruments: BTreeSet<String>,
     pub models: BTreeSet<(String, i64)>,
     pub groups: BTreeSet<String>,
+    /// Contract v27 (ruling 460): each position's own price, by its
+    /// instrument, as the provenance names it.
+    pub input_prices: BTreeMap<String, Value>,
+    /// Contract v27 (ruling 462): each conversion leg, by (from, to,
+    /// derivation's rank, via), as the provenance names it.
+    pub legs: BTreeMap<(String, String, u8, String), Value>,
 }
 
 impl Reads {
@@ -163,6 +176,12 @@ impl Reads {
         self.instruments.extend(other.instruments);
         self.models.extend(other.models);
         self.groups.extend(other.groups);
+        for (key, price) in other.input_prices {
+            self.input_prices.entry(key).or_insert(price);
+        }
+        for (key, leg) in other.legs {
+            self.legs.entry(key).or_insert(leg);
+        }
     }
 }
 
@@ -172,6 +191,10 @@ pub struct Answer {
     pub figures: Vec<Figure>,
     pub not_evaluated: Vec<Unevaluated>,
     pub provenance: Value,
+    /// Contract v27 (W10.11): the `ExecutionCost` rows an `execution_cost`
+    /// job records, in the answer's JSON only where the job asks for it.
+    pub execution_costs: Vec<Value>,
+    pub asks_execution_cost: bool,
 }
 
 impl Answer {
@@ -184,10 +207,14 @@ impl Answer {
 
     /// The answer as a reference case's `answer` holds it.
     pub fn to_json(&self) -> Value {
-        json!({
+        let mut out = json!({
             "figures": self.figures.iter().map(Figure::to_json).collect::<Vec<_>>(),
             "not_evaluated": self.not_evaluated.iter().map(Unevaluated::to_json).collect::<Vec<_>>(),
             "provenance": self.provenance,
-        })
+        });
+        if self.asks_execution_cost {
+            out["execution_costs"] = Value::Array(self.execution_costs.clone());
+        }
+        out
     }
 }

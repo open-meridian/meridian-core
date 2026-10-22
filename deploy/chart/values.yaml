@@ -68,6 +68,16 @@ database:
     size: 20Gi
     # The cluster's default provisioner, whatever it is.
     storageClassName: ""
+    # The bundled Postgres's own requests and limits (v27 stage E): every
+    # store's tables and the lake's rows in one server want more than the
+    # shared `resources` a component gets, and the dev deployment's database
+    # sat near that limit. Empty takes the shared `resources`.
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        memory: 1Gi
 
 key:
   # Let the instrument store make its own key, inside the cluster, in a volume only it

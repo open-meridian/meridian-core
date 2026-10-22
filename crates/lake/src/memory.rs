@@ -67,6 +67,13 @@ pub(crate) fn number(
                 done.unchanged += 1;
                 continue;
             }
+            // A rate's confirmation (contract v27, W10.4): only its raw
+            // reference changed. Recorded, as the next version keeping the
+            // reference, and counted unchanged, never a restatement.
+            Some(held) if held.confirms(&row) => {
+                done.unchanged += 1;
+                held.meta().version + 1
+            }
             Some(held) => {
                 done.restated += 1;
                 held.meta().version + 1
@@ -345,6 +352,22 @@ impl Store for MemoryStore {
             (Some(first), Some(last)) => Some((first.to_string(), last.to_string())),
             _ => None,
         })
+    }
+
+    fn read_dataset(
+        &self,
+        dataset: &str,
+        data_type: crate::row::DataType,
+        as_of_ns: i64,
+    ) -> Result<Vec<Observation>> {
+        let held = self.lock();
+        let rows = held
+            .rows
+            .iter()
+            .filter(|row| row.dataset() == dataset && row.data_type() == data_type)
+            .cloned()
+            .collect::<Vec<_>>();
+        Ok(as_of(rows, as_of_ns))
     }
 
     fn dated_on(&self, dataset: &str, dates: &[String]) -> Result<Vec<Observation>> {

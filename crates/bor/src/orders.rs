@@ -23,10 +23,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use meridian_domain::exact::Exact;
 use meridian_domain::v1::{
     Alert, AlertKind, AlertState, Allocation, Booking, BookingState, ChangeRequest,
-    ChangeRequestOutcome, Charge, Check, Execution, ExecutionState, FinalityLevel, GiveUpRecord,
-    JournalRef, Locate, LocateAnswer, LocateUse, LocateUseKind, Order, OrderCondition, OrderOrigin,
-    OrderQuantities, OrderState, OrderStatus, Placement, PlacementChangeKind, PlacementCondition,
-    PlacementEvent, PlacementState, PlacementStatus, ReportPlacementRequest,
+    ChangeRequestOutcome, Charge, Check, Execution, ExecutionKind, ExecutionState, FinalityLevel,
+    GiveUpRecord, JournalRef, Locate, LocateAnswer, LocateUse, LocateUseKind, Order,
+    OrderCondition, OrderLinkKind, OrderOrigin, OrderQuantities, OrderState, OrderStatus,
+    Placement, PlacementChangeKind, PlacementCondition, PlacementEvent, PlacementQuote,
+    PlacementQuoteOutcome, PlacementState, PlacementStatus, ReportPlacementRequest,
     ReportValueDateRollRequest, SleeveCross, StandingOrderCondition, StandingPlacementCondition,
     TieOutReason, TradingInstruction, UnplacedFact,
 };
@@ -146,6 +147,27 @@ pub enum Act {
     PlacementOpened {
         #[serde(with = "pb")]
         placement: Placement,
+    },
+    /// Contract v27 (W11.40): a dealer's quote on an RFQ placement,
+    /// recorded or moved to a later outcome: the quote whole as it now
+    /// stands. A picked quote moved on clears the pick.
+    PlacementQuoted {
+        placement_id: String,
+        #[serde(with = "pb")]
+        quote: PlacementQuote,
+    },
+    /// Contract v27 (W11.41): the `ems`'s pick of an open quote.
+    QuotePicked {
+        placement_id: String,
+        quote_id: String,
+    },
+    /// Contract v27 (W11.1): a child entry in a net member's own account,
+    /// the book's act: the member linked to the net order, in the
+    /// allocation account, as its parent.
+    NetLinked {
+        order_id: String,
+        net_order_id: String,
+        net_account_id: String,
     },
     /// A placement refused and recorded (REFUSAL_REASON_CONNECTIVITY_NOT_ALLOWED,
     /// W11.8): the entry names the placing `ems`, the instance asked for, the
@@ -636,6 +658,11 @@ impl Ledger {
                         push_once(&mut touched.orders, &held.placement.order_id);
                     }
                 }
+                Act::PlacementQuoted { placement_id, .. }
+                | Act::QuotePicked { placement_id, .. } => {
+                    push_once(&mut touched.placements, placement_id);
+                }
+                Act::NetLinked { order_id, .. } => push_once(&mut touched.orders, order_id),
                 Act::Accepted {
                     execution_ids,
                     order_id,
@@ -736,10 +763,13 @@ impl Ledger {
         let mut index = 0;
         while index < touched.orders.len() {
             let order_id = touched.orders[index].clone();
+            // A net member's link names the net in the allocation account
+            // (contract v27), never a parent here.
             let parent = self
                 .orders
                 .get(&order_id)
                 .and_then(|held| held.order.link.as_ref())
+                .filter(|link| link.kind != OrderLinkKind::Net as i32)
                 .map(|link| link.parent_order_id.clone())
                 .or_else(|| opened_parents.get(&order_id).cloned());
             if let Some(parent) = parent {
@@ -881,14 +911,76 @@ impl Ledger {
                         order.placements.push(id.clone());
                     }
                 }
+                // Contract v27 (W11.8): a warning it was opened with, sent
+                // on a stale reference, kept as its condition; its status
+                // is otherwise derived.
+                let mut opened = placement.clone();
+                let conditions = opened
+                    .status
+                    .take()
+                    .map(|status| status.conditions)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|c| c.condition == PlacementCondition::SentOnStaleReference as i32)
+                    .map(|c| (c.condition, c))
+                    .collect();
                 self.placements.insert(
                     id,
                     PlacementHeld {
-                        placement: placement.clone(),
+                        placement: opened,
                         state: PlacementState::Queued,
+                        conditions,
                         ..Default::default()
                     },
                 );
+            }
+            Act::PlacementQuoted {
+                placement_id,
+                quote,
+            } => {
+                if let Some(held) = self.placements.get_mut(placement_id) {
+                    let quotes = &mut held.placement.quotes;
+                    match quotes.iter_mut().find(|q| q.quote_id == quote.quote_id) {
+                        Some(kept) => *kept = quote.clone(),
+                        None => quotes.push(quote.clone()),
+                    }
+                    if held.placement.picked_quote_id == quote.quote_id
+                        && matches!(
+                            PlacementQuoteOutcome::try_from(quote.outcome),
+                            Ok(PlacementQuoteOutcome::Expired | PlacementQuoteOutcome::Withdrawn)
+                        )
+                    {
+                        held.placement.picked_quote_id.clear();
+                    }
+                }
+            }
+            Act::NetLinked {
+                order_id,
+                net_order_id,
+                ..
+            } => {
+                if let Some(held) = self.orders.get_mut(order_id) {
+                    held.order.link = Some(meridian_domain::v1::OrderLink {
+                        kind: OrderLinkKind::Net as i32,
+                        parent_order_id: net_order_id.clone(),
+                    });
+                }
+            }
+            Act::QuotePicked {
+                placement_id,
+                quote_id,
+            } => {
+                if let Some(held) = self.placements.get_mut(placement_id) {
+                    if let Some(quote) = held
+                        .placement
+                        .quotes
+                        .iter_mut()
+                        .find(|q| &q.quote_id == quote_id)
+                    {
+                        quote.outcome = PlacementQuoteOutcome::Picked as i32;
+                    }
+                    held.placement.picked_quote_id = quote_id.clone();
+                }
             }
             Act::PlacementRefused { .. } | Act::AcceptRefused { .. } => {}
             Act::PlacementReported { report } => self.reported(report),
@@ -1446,6 +1538,11 @@ impl Ledger {
                 continue;
             };
             if execution.superseded_by.is_some() {
+                continue;
+            }
+            // Contract v27 (W11.11): a net's internal crosses offset its
+            // members against each other; only its street fills fill it.
+            if execution.execution.kind == ExecutionKind::InternalCross as i32 {
                 continue;
             }
             let amount = self.counted(Some(held), &execution.execution)?;

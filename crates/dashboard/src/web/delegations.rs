@@ -399,7 +399,12 @@ async fn revoke_own(
     }
     match app
         .delegations
-        .revoke(&id, &session.subject, "revoked by the person", now)
+        .revoke(
+            &id,
+            &session.subject,
+            why(&fields, "revoked by the person"),
+            now,
+        )
         .await
     {
         Ok(_) => {
@@ -478,6 +483,7 @@ async fn persons(
         ),
     );
     let mut chrome = admin_chrome(&session);
+    chrome.sidebar = Some("connected-clients");
     chrome.crumbs = format!(
         "{}{}",
         crumb_link("/admin#connected-clients", "Connected clients"),
@@ -500,6 +506,16 @@ pub(crate) fn path_segment(subject: &str) -> String {
         .collect()
 }
 
+/// Why a revocation was made: the note its dialog took (351's audit), or the
+/// words it has always said where none was given.
+fn why<'a>(fields: &'a Fields, otherwise: &'a str) -> &'a str {
+    fields
+        .get("note")
+        .map(|note| note.trim())
+        .filter(|note| !note.is_empty())
+        .unwrap_or(otherwise)
+}
+
 /// POST /admin/people/{subject}/delegations/revoke: RevokePersonsDelegations.
 /// One delegation, by `delegation_id`, or every one the person holds, by
 /// `all`.
@@ -517,7 +533,7 @@ async fn revoke_persons(
         return *response;
     }
     let now = app.clock.now_ns();
-    let why = "revoked by a deployment admin";
+    let why = why(&fields, "revoked by a deployment admin");
     let revoked = if fields.get("all").map(String::as_str) == Some("1") {
         app.delegations
             .revoke_person(&subject, &session.subject, why, now)
