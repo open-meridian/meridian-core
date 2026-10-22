@@ -35,6 +35,16 @@ present() {
 }
 
 for image in "$@"; do
+	# An image this host never built or pulled (postgres:16-alpine) is not
+	# there for k3d to hand over: pulled first, said so.
+	if ! docker image inspect "$image" >/dev/null 2>&1; then
+		echo "image-load: $image is not on this host; pulling it"
+		docker pull -q "$image" >"$log" 2>&1 || {
+			echo "image-load: $image could not be pulled:" >&2
+			tail -20 "$log" >&2
+			exit 1
+		}
+	fi
 	loaded=
 	for attempt in 1 2; do
 		"$k3d" image import -c "$cluster" "$image" >"$log" 2>&1
