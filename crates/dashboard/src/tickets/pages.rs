@@ -267,6 +267,7 @@ fn chrome<'a>(session: &'a Session, access: &Access, crumbs: String) -> Chrome<'
         main: "page",
         in_admin: false,
         report: Report::Dashboard,
+        sidebar: None,
     }
 }
 

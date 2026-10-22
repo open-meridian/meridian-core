@@ -27,25 +27,6 @@ use super::people::Person;
 use super::picker::{self, Choice};
 use super::view::{self, Line};
 
-/// The sections, in the order an administrator reaches for them: who may do
-/// what first, then the parts it is made of.
-const TABS: [(&str, &str); 13] = [
-    ("plugins", "Plugins"),
-    ("permissions", "Permissions"),
-    ("user-groups", "User groups"),
-    ("account-groups", "Account groups"),
-    ("access-groups", "Access groups"),
-    ("accounts", "Accounts"),
-    ("holds", "Holds"),
-    ("time-zone", "Time zone"),
-    // Contract v27 (W6.36; ruling 483).
-    ("fx-pivots", "FX pivot currencies"),
-    ("model-routing", "Model routing"),
-    ("agents", "Agents"),
-    ("service-accounts", "Service accounts"),
-    ("connected-clients", "Connected clients"),
-];
-
 fn level_name(level: i32) -> &'static str {
     match AccessLevel::try_from(level) {
         Ok(AccessLevel::Write) => "write",
@@ -1200,10 +1181,6 @@ pub fn render(
         body,
     ));
 
-    let tabs: String = TABS
-        .iter()
-        .map(|(id, title)| format!("<a href=\"#{id}\" data-tab=\"{id}\">{title}</a>"))
-        .collect();
     let notice = if notice.is_empty() {
         String::new()
     } else {
@@ -1211,10 +1188,7 @@ pub fn render(
     };
     format!(
         "<div class=\"admin\"><div class=\"page-head\"><h1>Settings</h1>\
-         <a class=\"button\" href=\"/admin/instruments\">Instruments</a>\
-         <a class=\"button\" href=\"/admin/data-sources\">Data sources</a>\
-         <a class=\"button\" href=\"/admin/trading-instructions\">Trading instructions</a></div>\
-         {notice}<nav class=\"tabs\">{tabs}</nav>{}</div>\
+         </div>{notice}{}</div>\
          <script>{SCRIPT_START}{}{NOTE_SCRIPT}{SCRIPT_END}{}</script>",
         sections.concat(),
         picker::SCRIPT,

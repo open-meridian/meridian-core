@@ -505,6 +505,7 @@ fn person_chrome<'a>(session: &'a Session, admin: bool, crumbs: String) -> Chrom
         main: "page",
         in_admin: false,
         report: Report::Dashboard,
+        sidebar: None,
     }
 }
 

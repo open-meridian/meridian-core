@@ -1248,6 +1248,69 @@ def the_fx_pivots_tab(browser, prefix):
             ctx.close()
 
 
+def the_settings_sidebar(browser, prefix):
+    """Rulings 447 to 451 (v27 stage E, kit 0.13.0's om-sidebar): the
+    settings' grouped sidebar beside /admin and its separate pages -- exactly
+    one current item, following the hash and the address; collapsed by
+    keyboard on a desktop and remembered across a reload; a drawer below
+    768 px opened from Menu by keyboard, focus on the current item, closed
+    by Escape with focus back on Menu -- at 375, 582 and 1280 px, light and
+    dark, with no sideways scroll."""
+    current = "() => [...document.querySelectorAll('om-sidebar a[aria-current=page]')].map(a => a.textContent.trim())"
+    for scheme in ("light", "dark"):
+        for size, width, height in V24_SIZES:
+            ctx = context(browser, width, height, scheme=scheme)
+            page = ctx.new_page()
+            errors = []
+            page.on("pageerror", lambda e: errors.append(str(e)))
+            page.goto(ADMIN_PAGE + "#holds")
+            settled(page)
+            said = page.evaluate(current)
+            check(said == ["Holds"], f"at {size} ({scheme}) one item is current, Holds: {said}")
+            page.evaluate("h => { location.hash = h; }", "#accounts")
+            page.wait_for_timeout(200)
+            said = page.evaluate(current)
+            check(said == ["Accounts"], f"at {size} ({scheme}) the current item follows the hash: {said}")
+            measured(page, f"settings sidebar at {size} {scheme}", f"v27-{prefix}-sidebar-{size}-{scheme}.png")
+            if width < 768:
+                page.focus("om-sidebar .om-sidebar-open")
+                page.keyboard.press("Enter")
+                page.wait_for_timeout(300)
+                drawer = page.locator("dialog.om-sidebar-drawer[open]")
+                check(drawer.count() == 1, f"at {size} ({scheme}) Menu opens the drawer by keyboard")
+                focused = page.evaluate("() => document.activeElement && document.activeElement.getAttribute('aria-current')")
+                check(focused == "page", f"at {size} ({scheme}) the focus is on the current item: {focused}")
+                page.screenshot(path=os.path.join(OUT, f"v27-{prefix}-sidebar-drawer-{size}-{scheme}.png"))
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(300)
+                back = page.evaluate("() => document.activeElement && document.activeElement.classList.contains('om-sidebar-open')")
+                check(page.locator("dialog.om-sidebar-drawer[open]").count() == 0 and back,
+                      f"at {size} ({scheme}) Escape closes the drawer, the focus back on Menu")
+            else:
+                collapsed = "() => document.querySelector('om-sidebar').collapsed"
+                page.focus("om-sidebar .om-sidebar-collapse")
+                page.keyboard.press("Enter")
+                page.wait_for_timeout(200)
+                check(page.evaluate(collapsed), f"at {size} ({scheme}) the sidebar collapses by keyboard")
+                page.reload()
+                settled(page)
+                check(page.evaluate(collapsed), f"at {size} ({scheme}) collapsed is remembered across a reload")
+                page.screenshot(path=os.path.join(OUT, f"v27-{prefix}-sidebar-collapsed-{size}-{scheme}.png"))
+                page.focus("om-sidebar .om-sidebar-collapse")
+                page.keyboard.press("Enter")
+                page.wait_for_timeout(200)
+                check(not page.evaluate(collapsed), f"at {size} ({scheme}) and expands again")
+            for path, item in (("/admin/data-sources", "Data sources"), ("/admin/instruments", "Instruments")):
+                page.goto(f"{BASE}{path}")
+                settled(page)
+                said = page.evaluate(current)
+                check(said == [item], f"at {size} ({scheme}) {path} is {item} in the sidebar: {said}")
+                m = page.evaluate(MEASURE)
+                check(m["wide"] <= 0, f"at {size} ({scheme}) {path} scrolls no wider than the screen: {m['wide']}px")
+            check(not errors, f"the sidebar at {size} ({scheme}) ran without a script error: {errors}")
+            ctx.close()
+
+
 def popovers_close_and_destructive_acts_ask(browser, prefix):
     """351's audit (v27, stage E): the header's menu closes on its ×, on
     Escape and on a press outside it; a destructive act -- clearing a hold --
@@ -1504,6 +1567,7 @@ with sync_playwright() as playwright:
     the_time_zone_tab(browser, prefix)
     the_fx_pivots_tab(browser, prefix)
     popovers_close_and_destructive_acts_ask(browser, prefix)
+    the_settings_sidebar(browser, prefix)
     the_model_routing_tab(browser, prefix)
     the_portal_overview(browser, prefix)
     browser.close()

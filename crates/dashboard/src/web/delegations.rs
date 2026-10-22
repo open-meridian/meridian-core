@@ -483,6 +483,7 @@ async fn persons(
         ),
     );
     let mut chrome = admin_chrome(&session);
+    chrome.sidebar = Some("connected-clients");
     chrome.crumbs = format!(
         "{}{}",
         crumb_link("/admin#connected-clients", "Connected clients"),

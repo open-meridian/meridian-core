@@ -102,7 +102,11 @@ header.bar .bar-link{padding:.35rem .5rem}}\
 main.sheet{width:calc(100% - 2rem);max-width:44rem;margin:2.5rem auto 4rem;padding:1.9rem 2.1rem;background:var(--card);\
 border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow)}\
 @media (max-width:44rem){main.sheet{width:100%;margin:0;border:0;border-radius:0;padding:1.25rem 1rem}}\
-main.page{width:100%}\
+main.page{width:100%}main.shell{width:100%;padding:0}\
+@media (max-width:47.99rem){main.shell .om-shell>.om-shell-main{padding:.35rem var(--space-4) 0}\
+.om-shell-main nav.tabs{margin:.3rem 0 .5rem;padding-bottom:.4rem}\
+.om-shell-main .plugin-area nav.tabs,.om-shell-main .plugin-view nav.tabs{margin-bottom:.6rem}\
+om-sidebar>.om-sidebar-bar{padding-block:0}om-sidebar button.om-sidebar-open{min-height:2.5rem}}\
 main.frame{flex:1 1 auto;display:flex;min-height:0}\
 main.frame iframe{flex:1 1 auto;width:100%;border:0;background:var(--page)}\
 main.sheet h1{margin:0 0 .35rem}h2{margin:0 0 .75rem}h3{font-size:.95rem;margin:1.25rem 0 .25rem;font-weight:600}\
@@ -1140,6 +1144,10 @@ pub struct Chrome<'a> {
     pub in_admin: bool,
     /// What "Report a problem" in the header says the person was on.
     pub report: Report<'a>,
+    /// The settings' sidebar beside the page (rulings 447 to 451): `None`
+    /// for none; `Some("")` with the current item worked out from the
+    /// address; `Some(id)` naming it (a plugin's Manage page, `plugins`).
+    pub sidebar: Option<&'a str>,
 }
 
 /// Where "Report a problem" in the header fills in what a ticket concerns
@@ -1192,6 +1200,26 @@ pub const ACTS_SCRIPT: &str = r#"(function () {
   document.addEventListener("click", function (event) {
     menus.forEach(function (menu) { if (!menu.contains(event.target)) shut(menu, false); });
   });
+  // The settings' sidebar (kit 0.13.0) sits under what is above the page --
+  // the header, and the development banner where one is drawn -- so it is
+  // as tall as the screen leaves; and the pagers measure again once it is
+  // drawn, so their pages fit beside or under it.
+  var shell = document.querySelector(".om-shell");
+  function under() {
+    if (!shell) return;
+    var top = shell.getBoundingClientRect().top + window.scrollY;
+    if (top > 0) shell.style.setProperty("--om-sidebar-top", Math.round(top) + "px");
+  }
+  if (shell) {
+    under();
+    window.addEventListener("resize", under);
+    if (window.customElements) {
+      customElements.whenDefined("om-sidebar").then(function () {
+        under();
+        window.setTimeout(function () { window.dispatchEvent(new Event("resize")); }, 0);
+      });
+    }
+  }
   var asking = null, dialog = null, title, said, why, act;
   function confirmer() {
     if (dialog) return dialog;
@@ -1364,10 +1392,214 @@ fn report_link(part: &str) -> String {
     )
 }
 
+/// The settings' sections, as rulings 447 and 448 group and name them: a
+/// group's label, then each item's id, words, address, icon and the other
+/// addresses that are it too. Every address stays what it was (449). FX
+/// pivot currencies (483) sits under Deployment beside the time zone.
+/// One item: its id, words, address, icon and its other addresses.
+type SidebarItem = (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static [&'static str],
+);
+
+const SIDEBAR: [(&str, &[SidebarItem]); 5] = [
+    (
+        "Plugins",
+        &[
+            ("plugins", "Plugins", "/admin#plugins", "grid", &[]),
+            (
+                "versions",
+                "Versions \u{b7} Browse \u{b7} Registries",
+                "/admin/plugins/versions?tab=installed",
+                "package",
+                &[
+                    "/admin/plugins/versions?tab=browse",
+                    "/admin/plugins/versions?tab=registries",
+                ],
+            ),
+            (
+                "model-routing",
+                "Model routing",
+                "/admin#model-routing",
+                "route",
+                &[],
+            ),
+        ],
+    ),
+    (
+        "People and access",
+        &[
+            (
+                "permissions",
+                "Permissions",
+                "/admin#permissions",
+                "shield",
+                &[],
+            ),
+            (
+                "user-groups",
+                "User groups",
+                "/admin#user-groups",
+                "users",
+                &[],
+            ),
+            (
+                "access-groups",
+                "Access groups",
+                "/admin#access-groups",
+                "key",
+                &[],
+            ),
+            (
+                "service-accounts",
+                "Service accounts",
+                "/admin#service-accounts",
+                "server",
+                &[],
+            ),
+            ("agents", "Agents", "/admin#agents", "bot", &[]),
+            (
+                "connected-clients",
+                "Connected clients",
+                "/admin#connected-clients",
+                "link",
+                &[],
+            ),
+        ],
+    ),
+    (
+        "Accounts",
+        &[
+            ("accounts", "Accounts", "/admin#accounts", "wallet", &[]),
+            (
+                "account-groups",
+                "Account groups",
+                "/admin#account-groups",
+                "layers",
+                &[],
+            ),
+            ("holds", "Holds", "/admin#holds", "lock", &[]),
+            (
+                "trading-instructions",
+                "Trading instructions",
+                "/admin/trading-instructions",
+                "list",
+                &[],
+            ),
+        ],
+    ),
+    (
+        "Data",
+        &[
+            (
+                "data-sources",
+                "Data sources",
+                "/admin/data-sources",
+                "database",
+                &[],
+            ),
+            (
+                "instruments",
+                "Instruments",
+                "/admin/instruments",
+                "chart",
+                &[],
+            ),
+        ],
+    ),
+    (
+        "Deployment",
+        &[
+            ("time-zone", "Time zone", "/admin#time-zone", "clock", &[]),
+            (
+                "fx-pivots",
+                "FX pivot currencies",
+                "/admin#fx-pivots",
+                "",
+                &[],
+            ),
+        ],
+    ),
+];
+
+/// The header bar's height, which the sticky sidebar sits under.
+const HEADER_HEIGHT: &str = "56px";
+
+/// The sidebar and the page beside it (kit 0.13.0's `om-sidebar`): its
+/// groups as data, and the same links as a plain list for a browser
+/// without the kit.
+pub fn shell(current: &str, body: &str) -> String {
+    let groups: Vec<serde_json::Value> = SIDEBAR
+        .iter()
+        .map(|(label, items)| {
+            serde_json::json!({
+                "label": label,
+                "items": items.iter().map(|(id, words, href, icon, also)| {
+                    let mut item = serde_json::json!({"id": id, "label": words, "href": href});
+                    if !icon.is_empty() {
+                        item["icon"] = serde_json::json!(icon);
+                    }
+                    if !also.is_empty() {
+                        item["also"] = serde_json::json!(also);
+                    }
+                    item
+                }).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    // Never "</" inside the script: the data is JSON, its slashes escaped.
+    let data = serde_json::json!({ "groups": groups })
+        .to_string()
+        .replace("</", "<\\/");
+    let links: String = SIDEBAR
+        .iter()
+        .map(|(label, items)| {
+            format!(
+                "<li>{}<ul>{}</ul></li>",
+                escape(label),
+                items
+                    .iter()
+                    .map(|(_, words, href, _, _)| format!(
+                        "<li><a href=\"{}\">{}</a></li>",
+                        escape(href),
+                        escape(words)
+                    ))
+                    .collect::<String>()
+            )
+        })
+        .collect();
+    let current = if current.is_empty() {
+        String::new()
+    } else {
+        format!(" current=\"{}\"", escape(current))
+    };
+    format!(
+        "<div class=\"om-shell\" style=\"--om-sidebar-top:{HEADER_HEIGHT}\">\
+         <om-sidebar label=\"Settings\" remember=\"admin\"{current}>\
+         <script type=\"application/json\">{data}</script>\
+         <nav aria-label=\"Settings\"><ul>{links}</ul></nav></om-sidebar>\
+         <div class=\"om-shell-main\">{body}</div></div>"
+    )
+}
+
 fn document(title: &str, body: &str, chrome: &Chrome, development: bool) -> String {
     let banner = if development { DEVELOPMENT_BANNER } else { "" };
+    // The settings' sidebar beside the page where the chrome asks for it.
+    let shelled;
+    let body = match chrome.sidebar {
+        Some(current) => {
+            shelled = shell(current, body);
+            shelled.as_str()
+        }
+        None => body,
+    };
     let kit = kit_links(body);
-    let main = if chrome.main.is_empty() {
+    let main = if chrome.sidebar.is_some() {
+        "shell"
+    } else if chrome.main.is_empty() {
         "sheet"
     } else {
         chrome.main

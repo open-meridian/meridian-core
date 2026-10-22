@@ -45,6 +45,7 @@ fn chrome<'a>(session: &'a Session, admin: bool, crumbs: String) -> Chrome<'a> {
         main: "page",
         in_admin: false,
         report: Report::Dashboard,
+        sidebar: None,
     }
 }
 

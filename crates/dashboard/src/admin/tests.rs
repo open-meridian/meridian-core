@@ -1468,11 +1468,16 @@ async fn each_section_adds_with_a_short_button_and_its_dialog_says_what_is_made(
         );
         assert!(!part.contains(&format!(">{title}</button>")), "{section}");
     }
-    // The tabs still say which groups.
-    let tabs = between(&body, "<nav class=\"tabs\">", "</nav>");
+    // The settings' sidebar says which groups (rulings 447 and 448), its
+    // plain links there for a browser without the kit.
+    let sidebar = between(&body, "<nav aria-label=\"Settings\">", "</nav>");
     for tab in ["User groups", "Account groups", "Access groups"] {
-        assert!(tabs.contains(&format!(">{tab}</a>")), "{tab}");
+        assert!(sidebar.contains(&format!(">{tab}</a>")), "{tab}");
     }
+    assert!(
+        body.contains("<om-sidebar label=\"Settings\" remember=\"admin\">"),
+        "{body}"
+    );
 }
 
 type Asked = Arc<Mutex<Vec<(SetPluginSettingsRequest, String)>>>;

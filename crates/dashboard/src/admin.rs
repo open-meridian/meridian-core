@@ -446,6 +446,9 @@ pub(crate) fn admin_chrome(session: &Session) -> Chrome<'_> {
         main: "page",
         in_admin: true,
         report: crate::html::Report::Dashboard,
+        // The settings' sidebar (rulings 447 to 451), its current item
+        // worked out from the address.
+        sidebar: Some(""),
     }
 }
 
@@ -817,6 +820,8 @@ async fn plugin_view(
             crate::html::crumb_link("/admin#plugins", "Plugins"),
             crate::html::crumb_here(name, Some(&instance)),
         );
+        // A plugin's settings, inside the settings' shell, Plugins current.
+        chrome.sidebar = Some("plugins");
     } else {
         chrome.crumbs = format!(
             "{}{}",
@@ -826,6 +831,8 @@ async fn plugin_view(
         if let Some(viewer) = chrome.viewer.as_mut() {
             viewer.admin = false;
         }
+        // A plugin's admin who is no deployment admin has no settings.
+        chrome.sidebar = None;
     }
     Html(page_with(&format!("{name} admin"), &body, &chrome)).into_response()
 }
