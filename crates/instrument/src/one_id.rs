@@ -1392,7 +1392,8 @@ mod tests {
                 "{id}"
             );
         }
-        assert_eq!(shipped.iter().filter(|t| t.base).count(), 7);
+        // From contract v27, the referential class's base too.
+        assert_eq!(shipped.iter().filter(|t| t.base).count(), 8);
         let equity = shipped
             .iter()
             .find(|t| t.template_id == "TPL-equity")
@@ -1417,6 +1418,19 @@ mod tests {
         .unwrap();
         assert!(base && proposed.template_id == "TPL-equity-base");
         assert!(pick(&all, AssetClass::Unspecified, InstrumentType::Unspecified).is_none());
+        // Contract v27: each referential type its own template, matched by
+        // FIGI, ISIN or the administrator's source-scoped symbol.
+        for (kind, id) in [
+            (InstrumentType::InterestRate, "TPL-interest-rate"),
+            (InstrumentType::RateCurve, "TPL-rate-curve"),
+            (InstrumentType::Index, "TPL-index"),
+        ] {
+            let (template, base) = pick(&all, AssetClass::Referential, kind).unwrap();
+            assert!(!base && template.template_id == id, "{id}");
+            assert_eq!(template.match_rule, ["figi", "isin", "symbol"]);
+        }
+        let (base, _) = pick(&all, AssetClass::Referential, InstrumentType::Unspecified).unwrap();
+        assert_eq!(base.template_id, "TPL-referential-base");
     }
 
     #[test]

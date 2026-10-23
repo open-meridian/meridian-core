@@ -1,5 +1,5 @@
 {
- "about": "The platform's first templates and each asset class's base template, at their published version 1, shipped with each core release so a deployment names a record's template and its missing fields before its first pull and while the platform cannot be reached (W3.24; ruled 2026-10-14). Mirrors meridian-platform platform_site/domain/templates.py (FIRST and BASES) as published at platform c343559. A pull adds the versions after.",
+ "about": "The platform's first templates and each asset class's base template, at their published version 1, shipped with each core release so a deployment names a record's template and its missing fields before its first pull and while the platform cannot be reached (W3.24; ruled 2026-10-14). Mirrors meridian-platform platform_site/domain/templates.py (FIRST and BASES) as published at platform c343559, and from contract v27 the referential templates (TPL-interest-rate, TPL-rate-curve, TPL-index, TPL-referential-base) as published at platform a9d5e01. A pull adds the versions after.",
  "templates": [
   {
    "template_id": "TPL-cash",
@@ -224,6 +224,114 @@
    "calculation": ""
   },
   {
+   "template_id": "TPL-interest-rate",
+   "asset_class": "referential",
+   "instrument_type": "interest_rate",
+   "name": "Interest rate",
+   "fields": [
+    {
+     "path": "identifiers",
+     "type": "identifier",
+     "required": true
+    },
+    {
+     "path": "description",
+     "type": "text",
+     "required": true
+    },
+    {
+     "path": "currency",
+     "type": "text",
+     "required": true
+    },
+    {
+     "path": "instrument_type",
+     "type": "enum",
+     "required": true
+    }
+   ],
+   "match_rule": [
+    "figi",
+    "isin",
+    "symbol"
+   ],
+   "base": false,
+   "template_version": "1",
+   "calculation": ""
+  },
+  {
+   "template_id": "TPL-rate-curve",
+   "asset_class": "referential",
+   "instrument_type": "rate_curve",
+   "name": "Rate curve",
+   "fields": [
+    {
+     "path": "identifiers",
+     "type": "identifier",
+     "required": true
+    },
+    {
+     "path": "description",
+     "type": "text",
+     "required": true
+    },
+    {
+     "path": "currency",
+     "type": "text",
+     "required": true
+    },
+    {
+     "path": "instrument_type",
+     "type": "enum",
+     "required": true
+    }
+   ],
+   "match_rule": [
+    "figi",
+    "isin",
+    "symbol"
+   ],
+   "base": false,
+   "template_version": "1",
+   "calculation": ""
+  },
+  {
+   "template_id": "TPL-index",
+   "asset_class": "referential",
+   "instrument_type": "index",
+   "name": "Index",
+   "fields": [
+    {
+     "path": "identifiers",
+     "type": "identifier",
+     "required": true
+    },
+    {
+     "path": "description",
+     "type": "text",
+     "required": true
+    },
+    {
+     "path": "currency",
+     "type": "text",
+     "required": true
+    },
+    {
+     "path": "instrument_type",
+     "type": "enum",
+     "required": true
+    }
+   ],
+   "match_rule": [
+    "figi",
+    "isin",
+    "symbol"
+   ],
+   "base": false,
+   "template_version": "1",
+   "calculation": ""
+  },
+  {
    "template_id": "TPL-equity-base",
    "asset_class": "equity",
    "instrument_type": "",
@@ -385,6 +493,33 @@
    "asset_class": "cash",
    "instrument_type": "",
    "name": "Cash, base",
+   "fields": [
+    {
+     "path": "identifiers",
+     "type": "identifier",
+     "required": true
+    },
+    {
+     "path": "description",
+     "type": "text",
+     "required": true
+    },
+    {
+     "path": "currency",
+     "type": "text",
+     "required": true
+    }
+   ],
+   "match_rule": [],
+   "base": true,
+   "template_version": "1",
+   "calculation": ""
+  },
+  {
+   "template_id": "TPL-referential-base",
+   "asset_class": "referential",
+   "instrument_type": "",
+   "name": "Referential, base",
    "fields": [
     {
      "path": "identifiers",
