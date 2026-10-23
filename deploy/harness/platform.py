@@ -632,8 +632,9 @@ def match_or_mint(asked):
             break
         # The seeded referential records, as the platform matches them: by
         # the administrator's code and its source, or by ISIN.
-        held = (REFERENTIAL_BY_SYMBOL.get((value, identifier.get("source", "")))
-                if scheme == "symbol" else
+        source = identifier.get("source", "")
+        held = (REFERENTIAL_BY_SYMBOL.get((value, source))
+                if scheme == "symbol" and source in LICENCE["administrators"] else
                 REFERENTIAL_BY_ISIN.get(value) if scheme == "isin" else None)
         if held:
             answer = {"minted": False, "instrument": held}
@@ -792,6 +793,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = json.dumps({"found": True,
                                "instrument": EVENT_CONTRACTS[(one("value"), venue_record["venue_id"])],
                                "venues": [venue_record]}).encode()
+            self.send_response(200)
+        elif (url.path == "/api/v1/reference/identifiers/resolve"
+                and one("scheme") == "symbol" and one("source") in LICENCE["administrators"]
+                and (one("value"), one("source")) in REFERENTIAL_BY_SYMBOL):
+            # Contract v27 (ruling 545): a seeded referential record by its
+            # administrator's code, found only with that administrator named.
+            body = json.dumps({"found": True,
+                               "instrument": REFERENTIAL_BY_SYMBOL[(one("value"), one("source"))],
+                               "venues": []}).encode()
             self.send_response(200)
         elif (url.path == "/api/v1/reference/identifiers/resolve"
                 and one("scheme") == "iso10383" and code in VENUES):

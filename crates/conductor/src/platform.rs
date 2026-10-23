@@ -54,6 +54,35 @@ use serde::Deserialize;
 use crate::assertions::{DeploymentKey, SigningError, MAX_LIFETIME_SECONDS};
 use meridian_symbology::{open_identifiers_strongest_first, GLOBAL_ID};
 
+/// What a pull asks the platform by, in order (W3.3): the open identifiers,
+/// strongest first, then an administrator's own code -- a `symbol` with the
+/// administrator as its source (ruling 545). A symbol reaches here only
+/// where the licence list admitted it (`reference::sendable_on`), and is
+/// asked with its source, without which the platform finds nothing.
+pub fn pulled_by(identifiers: &[PbIdentifier]) -> Vec<&PbIdentifier> {
+    let mut asked = open_identifiers_strongest_first(identifiers);
+    asked.extend(identifiers.iter().filter(|identifier| {
+        identifier.scheme == "symbol"
+            && !identifier.source.is_empty()
+            && !identifier.value.trim().is_empty()
+    }));
+    asked
+}
+
+/// The resolve path for an identifier, its source named where it has one.
+fn resolve_path(identifier: &PbIdentifier, as_of_ns: i64) -> String {
+    let mut path = format!(
+        "/api/v1/reference/identifiers/resolve?scheme={}&value={}&as_of_ns={}",
+        encode(&identifier.scheme),
+        encode(&identifier.value),
+        as_of_ns
+    );
+    if !identifier.source.is_empty() {
+        path.push_str(&format!("&source={}", encode(&identifier.source)));
+    }
+    path
+}
+
 /// How a request is made. Two verbs is all the contract uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
@@ -249,13 +278,12 @@ impl Platform {
         as_of_ns: i64,
         now_ns: i64,
     ) -> Result<Option<PbInstrument>, PlatformError> {
-        for identifier in open_identifiers_strongest_first(identifiers) {
+        for identifier in pulled_by(identifiers) {
             let found = if identifier.scheme == GLOBAL_ID {
                 self.pull_instrument(&identifier.value, as_of_ns, now_ns)
                     .await?
             } else {
-                self.pull_identifier(&identifier.scheme, &identifier.value, as_of_ns, now_ns)
-                    .await?
+                self.pull_identifier(identifier, as_of_ns, now_ns).await?
             };
             if found.is_some() {
                 return Ok(found);
@@ -274,7 +302,7 @@ impl Platform {
         as_of_ns: i64,
         now_ns: i64,
     ) -> Result<Option<(PbInstrument, Vec<VenueRecord>)>, PlatformError> {
-        for identifier in open_identifiers_strongest_first(identifiers) {
+        for identifier in pulled_by(identifiers) {
             let path = if identifier.scheme == GLOBAL_ID {
                 format!(
                     "/api/v1/reference/instruments/{}?as_of_ns={}",
@@ -282,12 +310,7 @@ impl Platform {
                     as_of_ns
                 )
             } else {
-                format!(
-                    "/api/v1/reference/identifiers/resolve?scheme={}&value={}&as_of_ns={}",
-                    encode(&identifier.scheme),
-                    encode(&identifier.value),
-                    as_of_ns
-                )
+                resolve_path(identifier, as_of_ns)
             };
             let response = self.call(Method::Get, &path, None, now_ns).await?;
             if let Some(found) = found_with_venues(response)? {
@@ -307,15 +330,7 @@ impl Platform {
         as_of_ns: i64,
         now_ns: i64,
     ) -> Result<Vec<VenueRecord>, PlatformError> {
-        let mut path = format!(
-            "/api/v1/reference/identifiers/resolve?scheme={}&value={}&as_of_ns={}",
-            encode(&identifier.scheme),
-            encode(&identifier.value),
-            as_of_ns
-        );
-        if !identifier.source.is_empty() {
-            path.push_str(&format!("&source={}", encode(&identifier.source)));
-        }
+        let path = resolve_path(identifier, as_of_ns);
         let response = self.call(Method::Get, &path, None, now_ns).await?;
         if response.status == 404 {
             return Ok(Vec::new());
@@ -368,20 +383,16 @@ impl Platform {
         found_or_nothing(response)
     }
 
-    /// W3.3, by an identifier the master might know it under.
+    /// W3.3, by an identifier the master might know it under, with its
+    /// source where it has one: an administrator's symbol is found only by
+    /// its administrator (ruling 545).
     pub async fn pull_identifier(
         &self,
-        scheme: &str,
-        value: &str,
+        identifier: &PbIdentifier,
         as_of_ns: i64,
         now_ns: i64,
     ) -> Result<Option<PbInstrument>, PlatformError> {
-        let path = format!(
-            "/api/v1/reference/identifiers/resolve?scheme={}&value={}&as_of_ns={}",
-            encode(scheme),
-            encode(value),
-            as_of_ns
-        );
+        let path = resolve_path(identifier, as_of_ns);
         let response = self.call(Method::Get, &path, None, now_ns).await?;
         found_or_nothing(response)
     }
@@ -2297,6 +2308,29 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn an_administrators_symbol_is_pulled_with_its_source() {
+        let transport = Fake::new(vec![
+            Ok(reply(404, "{\"found\": false}")),
+            Ok(reply(200, &record_json("INS-SOFR"))),
+        ]);
+        let platform = platform(transport.clone());
+        // Ruling 545: after the open identifiers, the administrator's code,
+        // asked with the administrator named.
+        let asked = [
+            identifier("symbol", "SOFR", "nyfed"),
+            identifier("figi", "BBG000ZZTOP1", ""),
+        ];
+        let found = platform.ask(&asked, AS_OF, NOW).await.unwrap();
+        assert_eq!(found.unwrap().instrument_id, "INS-SOFR");
+        let urls = transport.urls();
+        assert!(urls[0].contains("scheme=figi"), "{urls:?}");
+        assert!(
+            urls[1].contains("scheme=symbol&value=SOFR") && urls[1].ends_with("&source=nyfed"),
+            "{urls:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_master_that_does_not_hold_it_is_nothing_rather_than_an_error() {
         let transport = Fake::new(vec![Ok(reply(
             404,
@@ -2304,7 +2338,7 @@ pub(crate) mod tests {
         ))]);
 
         let found = platform(transport)
-            .pull_identifier("figi", "BBG000ZZTOP1", AS_OF, NOW)
+            .pull_identifier(&identifier("figi", "BBG000ZZTOP1", ""), AS_OF, NOW)
             .await
             .unwrap();
 

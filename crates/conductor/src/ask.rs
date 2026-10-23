@@ -17,7 +17,6 @@ use meridian_bus::Bus;
 use meridian_domain::v1::{
     AskPlatformForInstrumentReply, AskPlatformForInstrumentRequest, PullInstrumentReply,
 };
-use meridian_symbology::open_identifiers_strongest_first;
 use prost::Message;
 
 use crate::platform::Platform;
@@ -196,7 +195,7 @@ impl Conductor {
             identifiers: sendable,
             ..request.clone()
         };
-        if open_identifiers_strongest_first(&request.identifiers).is_empty() {
+        if crate::platform::pulled_by(&request.identifiers).is_empty() {
             return AskPlatformForInstrumentReply {
                 reachable: true,
                 found: false,
