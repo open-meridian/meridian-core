@@ -759,6 +759,7 @@ mod tests {
             version: 4,
             schemes: vec!["figi".into(), "cusip".into()],
             pace: None,
+            administrators: Vec::new(),
         });
         let after = conductor.ask(&matching(vec![cusip()]), "", "").await;
         assert!(after.match_or_mint_answer.unwrap().pending_review);

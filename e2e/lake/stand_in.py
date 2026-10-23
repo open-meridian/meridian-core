@@ -435,10 +435,12 @@ class Dgm:
         one date, through the SDK's rates helpers; then the fixing revised,
         published later, as the next version of its row key."""
         feed = rate_helpers.Feed(self.plugin, "lake", day_zone="America/New_York")
-        sofr = await feed.subject(("figi", "BBG00LAKSOFR"),
+        # By the administrator's own code, the administrator its source
+        # (ruling 545).
+        sofr = await feed.subject(("symbol", "SOFR", "nyfed"),
                                   description="Secured Overnight Financing Rate",
                                   instrument_type="interest_rate")
-        par = await feed.subject(("figi", "BBG00LAKUSTP"),
+        par = await feed.subject(("symbol", "Daily Treasury Par Yield Curve Rates", "ustreasury"),
                                  description="Daily Treasury par yield curve",
                                  instrument_type="rate_curve")
         if not sofr or not par:

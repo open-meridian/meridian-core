@@ -1039,6 +1039,19 @@ pub fn licence_from_json(value: &serde_json::Value) -> Result<LicenceList, Strin
         );
     }
     let pace = value.get("pace");
+    // The administrators the administrator_symbol family admits (ruling
+    // 545); absent from a list before it, so none.
+    let administrators = value
+        .get("administrators")
+        .and_then(|administrators| administrators.as_array())
+        .map(|administrators| {
+            administrators
+                .iter()
+                .map(|administrator| text_of(Some(administrator)))
+                .filter(|administrator| !administrator.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
     Ok(LicenceList {
         version: int_of(value.get("version")),
         schemes,
@@ -1046,6 +1059,7 @@ pub fn licence_from_json(value: &serde_json::Value) -> Result<LicenceList, Strin
             batch_size: (int_of(pace.and_then(|pace| pace.get("batch_size"))) as i32).clamp(0, 100),
             batches_per_minute: int_of(pace.and_then(|pace| pace.get("batches_per_minute"))) as i32,
         }),
+        administrators,
     })
 }
 

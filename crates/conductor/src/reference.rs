@@ -272,6 +272,7 @@ pub fn default_licence() -> LicenceList {
             batch_size: 100,
             batches_per_minute: 6,
         }),
+        administrators: Vec::new(),
     }
 }
 
@@ -290,6 +291,18 @@ mod tests {
         .unwrap();
         assert_eq!(list.version, 3);
         assert_eq!(list.pace.unwrap().batch_size, 100);
+        assert!(list.administrators.is_empty());
+        // Ruling 545: the administrators the administrator_symbol family admits.
+        let admitting = licence_from_json(&serde_json::json!({
+            "version": "5",
+            "schemes": ["figi", "administrator_symbol"],
+            "administrators": ["nyfed", "frb", "ecb", "ustreasury"]
+        }))
+        .unwrap();
+        assert_eq!(
+            admitting.administrators,
+            ["nyfed", "frb", "ecb", "ustreasury"]
+        );
         assert!(licence_from_json(
             &serde_json::json!({"version": "4", "schemes": ["open_meridian_local"]})
         )

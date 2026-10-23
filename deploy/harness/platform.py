@@ -374,29 +374,6 @@ REFERENTIAL_BY_SYMBOL = {(i["value"], i["source"]): r for r in REFERENTIAL_RECOR
 REFERENTIAL_BY_ISIN = {i["value"]: r for r in REFERENTIAL_RECORDS
                        for i in r["identifiers"] if i["scheme"] == "isin"}
 
-# Two by FIGI alone, which e2e-lake's rates step resolves (contract v27): a
-# deployment sends the platform no source-scoped symbol (W3.25), and the
-# seeded records carry no FIGI yet, so the run names these.
-REFERENTIAL = {
-    figi: {
-        "instrument_id": instrument_id,
-        "identifiers": [{"scheme": "figi", "value": figi, "source": ""}],
-        "asset_class": "ASSET_CLASS_REFERENTIAL",
-        "instrument_type": instrument_type,
-        "currency": "USD",
-        "description": description,
-        "lifecycle_state": "INSTRUMENT_LIFECYCLE_STATE_ACTIVE",
-        "version": 1,
-    }
-    for figi, instrument_id, instrument_type, description in (
-        ("BBG00LAKSOFR", f"INS-01JSOFR{'0' * 18}1", "interest_rate",
-         "Secured Overnight Financing Rate"),
-        ("BBG00LAKUSTP", f"INS-01JUSTP{'0' * 18}1", "rate_curve",
-         "Daily Treasury par yield curve"),
-    )
-}
-
-
 def calendars_for(one, many):
     """The seed answer to a pull by its one subject; versions after
     `after_version` only, on a refresh."""
@@ -438,11 +415,15 @@ def calendars_for(one, many):
 # POST /e2e/licence and POST /e2e/replacements, as the platform's staff would.
 
 V24 = os.environ.get("HARNESS_PLATFORM_V24", "1") != "0"
+# The administrator_symbol family and the administrators it admits, as the
+# platform lists them (ruling 545): a symbol whose source is one of these.
 LICENCE = {
     "version": 1,
     "schemes": [s for s in (os.environ.get("HARNESS_LICENCE")
-                            or "figi,lei,ticker_and_venue,caip19,iso4217,sec_series,sec_class").split(",") if s],
+                            or "figi,lei,ticker_and_venue,caip19,iso4217,sec_series,sec_class,"
+                               "administrator_symbol").split(",") if s],
     "pace": {"batch_size": 100, "batches_per_minute": 6},
+    "administrators": ["nyfed", "frb", "ecb", "ustreasury"],
 }
 TEMPLATES = [
     {"template_id": "TPL-equity", "template_version": "1", "name": "Equity", "asset_class": "equity",
@@ -587,7 +568,6 @@ def held_instrument(instrument_id):
             or instrument_id in {r["instrument_id"] for r in MINTED.values()}
             or instrument_id in {r["instrument_id"] for r in EQUITIES.values()}
             or instrument_id in {r["instrument_id"] for r in CRYPTO.values()}
-            or instrument_id in {r["instrument_id"] for r in REFERENTIAL.values()}
             or instrument_id in {r["instrument_id"] for r in REFERENTIAL_RECORDS})
 
 
@@ -649,9 +629,6 @@ def match_or_mint(asked):
             break
         if scheme == "caip19" and value in CRYPTO:
             answer = {"minted": False, "instrument": CRYPTO[value]}
-            break
-        if scheme == "figi" and value in REFERENTIAL:
-            answer = {"minted": False, "instrument": REFERENTIAL[value]}
             break
         # The seeded referential records, as the platform matches them: by
         # the administrator's code and its source, or by ISIN.
@@ -858,6 +835,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.answer(200, answer) if answer else self.answer(404, {"detail": "Not Found"})
         if url.path == "/e2e/licence":
             LICENCE["schemes"] = asked.get("schemes", LICENCE["schemes"])
+            LICENCE["administrators"] = asked.get("administrators", LICENCE["administrators"])
             LICENCE["version"] += 1
             return self.answer(200, LICENCE)
         if url.path == "/e2e/confirm":

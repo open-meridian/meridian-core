@@ -2475,6 +2475,14 @@ pub struct LicenceList {
     /// The pace a migration's or a backfill's batches are sent at.
     #[prost(message, optional, tag = "3")]
     pub pace: ::core::option::Option<LicencePace>,
+    /// The administrators whose codes the administrator_symbol family admits
+    /// (W3.25; ruling 545): a wire `symbol` is sent only when its `source`
+    /// names one of these and `schemes` names the family. Each is a source as
+    /// the platform's referential records spell it (nyfed, frb, ecb,
+    /// ustreasury); one is added by a list update, with no release. A
+    /// vendor's symbol is never sent.
+    #[prost(string, repeated, tag = "4")]
+    pub administrators: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// A pace, as OpenFIGI states its own limits (W3.25).
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
