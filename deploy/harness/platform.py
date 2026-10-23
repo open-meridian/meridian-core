@@ -307,9 +307,76 @@ VENUE_PAYOUTS = {
 }
 
 
-# Referential records the platform seeds (contract v27, the rates slice;
-# W1.1): a reference rate and a rate curve, by FIGI, what e2e-lake's rates
-# step records against. Never minted for a deployment's ask.
+# The platform's referential records (contract v27, W1.1): the 22 its
+# `seed_referential` seeds (meridian-platform a9d5e01,
+# platform_site/domain/referential_records.py, SEEDS), each named by its
+# administrator's code as a `symbol` scoped to its source, and by an ISIN
+# where one exists (€STR's), each under its type's template. Matched by
+# symbol and source, or by ISIN; never minted for a deployment's ask.
+REFERENTIAL_SEEDS = (
+    ("nyfed", "SOFR", "interest_rate", "USD", "Secured Overnight Financing Rate (SOFR)", ""),
+    ("nyfed", "EFFR", "interest_rate", "USD", "Effective Federal Funds Rate (EFFR)", ""),
+    ("nyfed", "OBFR", "interest_rate", "USD", "Overnight Bank Funding Rate (OBFR)", ""),
+    ("nyfed", "TGCR", "interest_rate", "USD", "Tri-Party General Collateral Rate (TGCR)", ""),
+    ("nyfed", "BGCR", "interest_rate", "USD", "Broad General Collateral Rate (BGCR)", ""),
+    ("nyfed", "SOFR 30-day average", "interest_rate", "USD", "30-day Average SOFR", ""),
+    ("nyfed", "SOFR 90-day average", "interest_rate", "USD", "90-day Average SOFR", ""),
+    ("nyfed", "SOFR 180-day average", "interest_rate", "USD", "180-day Average SOFR", ""),
+    ("nyfed", "SOFR Index", "index", "USD", "SOFR Index", ""),
+    ("frb", "FOMC target range lower bound", "interest_rate", "USD",
+     "Federal funds target range, lower bound (FOMC)", ""),
+    ("frb", "FOMC target range upper bound", "interest_rate", "USD",
+     "Federal funds target range, upper bound (FOMC)", ""),
+    ("ecb", "ESTR", "interest_rate", "EUR", "Euro short-term rate (€STR)", "EU000A2X2A25"),
+    ("ecb", "ESTR 1-week compounded average", "interest_rate", "EUR",
+     "€STR compounded average rate, 1 week", ""),
+    ("ecb", "ESTR 1-month compounded average", "interest_rate", "EUR",
+     "€STR compounded average rate, 1 month", ""),
+    ("ecb", "ESTR 3-month compounded average", "interest_rate", "EUR",
+     "€STR compounded average rate, 3 months", ""),
+    ("ecb", "ESTR 6-month compounded average", "interest_rate", "EUR",
+     "€STR compounded average rate, 6 months", ""),
+    ("ecb", "ESTR 12-month compounded average", "interest_rate", "EUR",
+     "€STR compounded average rate, 12 months", ""),
+    ("ecb", "ESTR compounded index", "index", "EUR", "€STR compounded index", ""),
+    ("ustreasury", "Daily Treasury Par Yield Curve Rates", "rate_curve", "USD",
+     "Daily Treasury par yield curve", ""),
+    ("ustreasury", "Daily Treasury Par Real Yield Curve Rates", "rate_curve", "USD",
+     "Daily Treasury par real yield curve", ""),
+    ("ustreasury", "Daily Treasury Bill Rates", "rate_curve", "USD", "Daily Treasury bill rates", ""),
+    ("frb", "feds200628", "rate_curve", "USD",
+     "Treasury zero-coupon yield curve (Federal Reserve Board)", ""),
+)
+
+
+def referential_record(n, source, code, kind, currency, description, isin):
+    identifiers = [{"scheme": "symbol", "value": code, "source": source}]
+    if isin:
+        identifiers.append({"scheme": "isin", "value": isin, "source": ""})
+    return {
+        "instrument_id": f"INS-01JREF{n:020d}",
+        "identifiers": identifiers,
+        "asset_class": "ASSET_CLASS_REFERENTIAL",
+        "instrument_type": kind,
+        "currency": currency,
+        "description": description,
+        "lifecycle_state": "INSTRUMENT_LIFECYCLE_STATE_ACTIVE",
+        "version": 1,
+        "template_id": f"TPL-{kind.replace('_', '-')}",
+        "template_version": "1",
+    }
+
+
+REFERENTIAL_RECORDS = [referential_record(n, *seed) for n, seed in enumerate(REFERENTIAL_SEEDS, 1)]
+# By symbol and its source, and by ISIN.
+REFERENTIAL_BY_SYMBOL = {(i["value"], i["source"]): r for r in REFERENTIAL_RECORDS
+                         for i in r["identifiers"] if i["scheme"] == "symbol"}
+REFERENTIAL_BY_ISIN = {i["value"]: r for r in REFERENTIAL_RECORDS
+                       for i in r["identifiers"] if i["scheme"] == "isin"}
+
+# Two by FIGI alone, which e2e-lake's rates step resolves (contract v27): a
+# deployment sends the platform no source-scoped symbol (W3.25), and the
+# seeded records carry no FIGI yet, so the run names these.
 REFERENTIAL = {
     figi: {
         "instrument_id": instrument_id,
@@ -520,7 +587,8 @@ def held_instrument(instrument_id):
             or instrument_id in {r["instrument_id"] for r in MINTED.values()}
             or instrument_id in {r["instrument_id"] for r in EQUITIES.values()}
             or instrument_id in {r["instrument_id"] for r in CRYPTO.values()}
-            or instrument_id in {r["instrument_id"] for r in REFERENTIAL.values()})
+            or instrument_id in {r["instrument_id"] for r in REFERENTIAL.values()}
+            or instrument_id in {r["instrument_id"] for r in REFERENTIAL_RECORDS})
 
 
 def event_group(asked):
@@ -584,6 +652,14 @@ def match_or_mint(asked):
             break
         if scheme == "figi" and value in REFERENTIAL:
             answer = {"minted": False, "instrument": REFERENTIAL[value]}
+            break
+        # The seeded referential records, as the platform matches them: by
+        # the administrator's code and its source, or by ISIN.
+        held = (REFERENTIAL_BY_SYMBOL.get((value, identifier.get("source", "")))
+                if scheme == "symbol" else
+                REFERENTIAL_BY_ISIN.get(value) if scheme == "isin" else None)
+        if held:
+            answer = {"minted": False, "instrument": held}
             break
         if scheme == "iso4217" and value.upper() in NAMES:
             answer = {"minted": False, "instrument": record(value.upper())}
