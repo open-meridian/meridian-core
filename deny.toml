@@ -24,4 +24,14 @@ ignore = [
     # is not reachable. No fixed release exists. Revisit if the dashboard ever
     # signs or decrypts with RSA, or when a fixed `rsa` ships.
     { id = "RUSTSEC-2023-0071", reason = "rsa is used by openidconnect only to verify signatures with public keys; no private-key operation is reachable" },
+    # Timing variability in crypto-bigint's constant-time operations, which
+    # matters only on secret integers. crypto-bigint 0.5 arrives through
+    # elliptic-curve 0.13 (p256, p384, ecdsa), which openidconnect uses only
+    # to verify ES256/ES384 ID-token signatures with the directory's public
+    # keys: every value is public, and core signs nothing with an EC key (its
+    # caller assertions are ed25519, dalek). The fix is crypto-bigint 0.7.6,
+    # which the elliptic-curve 0.13 line cannot take. Revisit when
+    # openidconnect moves to elliptic-curve 0.14, or if core ever signs with
+    # an EC key.
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 is reached only through openidconnect's ECDSA signature verification with public keys; no secret integer is reachable" },
 ]
