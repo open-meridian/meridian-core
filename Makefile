@@ -279,11 +279,20 @@ build:
 		     echo "  DOCKER_BUILDKIT=1 docker build -f Dockerfile.rust --target check ." >&2; exit 1; }
 	@echo "build OK: workspace compiles"
 
+# The run's own output is kept, and on a failure the failing tests' is
+# printed from it: a run on CI is not repeatable at will, and a test that
+# fails once must be named by the run it failed in, not by a second one.
 test:
-	@$(DOCKER) build -f Dockerfile.rust --target test $(VERDICT) . >/dev/null 2>&1 \
-		|| { echo "test FAILED; see the output with:" >&2; \
-		     echo "  DOCKER_BUILDKIT=1 docker build -f Dockerfile.rust --target test --progress=plain ." >&2; exit 1; }
-	@echo "test OK: workspace tests pass"
+	@log=$$(mktemp); \
+	if $(DOCKER) build -f Dockerfile.rust --target test $(VERDICT) --progress=plain . >$$log 2>&1; then \
+		rm -f $$log; echo "test OK: workspace tests pass"; \
+	else \
+		echo "test FAILED; the failing tests and their output:" >&2; \
+		grep -E -e '---- .* stdout ----' -e 'panicked at' -e '^#[0-9]+ [0-9.]+ test .* FAILED$$' \
+			-e 'test result: FAILED' -e 'run-tests:' -e 'error:' $$log | cut -c1-400 >&2; \
+		echo "-- the last 120 lines:" >&2; tail -n 120 $$log | cut -c1-400 >&2; \
+		rm -f $$log; exit 1; \
+	fi
 
 # The store's tests need a database. A build stage has none, and a lightweight
 # in-process substitute is exactly what must not exist: a store that behaves

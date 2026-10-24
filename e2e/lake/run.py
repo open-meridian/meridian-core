@@ -57,7 +57,8 @@ harness's admin, Ben, who holds read on `book`.
    and a person's ask resolves it to its INS- record, which `book` reads the
    LCL- row through (the replacement followed).
 14. Contract v27 (the rates slice; W10.4 to W10.6): `coin` resolves SOFR and
-   Treasury's par curve, referential records the platform seeds, and
+   Treasury's par curve, referential records the platform seeds, by each
+   administrator's own code (`symbol` at nyfed and ustreasury; ruling 545), and
    records SOFR's fixing and the curve's points for a date, the 20-year
    point unpublished, then the fixing revised; `book`, entitled to
    `coin:rates`, reads the curve for the date (one row per tenor), the

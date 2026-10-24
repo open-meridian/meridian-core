@@ -856,10 +856,16 @@ fn the_one_id_state_is_kept_whole_and_each_replacement_numbered() {
             batch_size: 100,
             batches_per_minute: 6,
         }),
+        administrators: vec!["nyfed".into()],
     };
     assert!(store.keep_licence_list(&list, 7).unwrap());
     assert!(!store.keep_licence_list(&list, 8).unwrap());
-    assert!(store.licence_list().unwrap().unwrap().version >= list.version);
+    let kept = store.licence_list().unwrap().unwrap();
+    assert!(kept.version >= list.version);
+    if kept.version == list.version {
+        // The administrators kept with the list (ruling 545).
+        assert_eq!(kept.administrators, ["nyfed"]);
+    }
 
     let key = unique("state");
     assert_eq!(store.state(&key).unwrap(), None);

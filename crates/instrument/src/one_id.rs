@@ -47,6 +47,12 @@ pub const OPEN_FAMILIES: [&str; 7] = [
     "sec_class",
 ];
 
+/// The family an administrator's own code is licensed by (ruling 545): wire
+/// `symbol` with the administrator in its `source`, sent only for an
+/// administrator the list names. Not among the open schemes, so a list
+/// must be read before one is sent.
+pub const ADMINISTRATOR_SYMBOL: &str = "administrator_symbol";
+
 /// The catalogue's first versions, shipped with each release (W3.24; ruled
 /// 2026-10-14).
 const SHIPPED: &str = include_str!("../templates/first.json");
@@ -289,6 +295,7 @@ pub fn default_licence() -> LicenceList {
             batch_size: 100,
             batches_per_minute: 6,
         }),
+        administrators: Vec::new(),
     }
 }
 
@@ -311,10 +318,29 @@ pub fn family(scheme: &str) -> &str {
     }
 }
 
+/// The family an identifier held is licensed by under a list: a `symbol`
+/// whose source is an administrator the list names is
+/// `administrator_symbol` (ruling 545); any other, its scheme's family.
+pub fn family_held<'a>(scheme: &'a str, source: &str, list: &LicenceList) -> &'a str {
+    if scheme == "symbol"
+        && !source.is_empty()
+        && list
+            .administrators
+            .iter()
+            .any(|administrator| administrator == source)
+    {
+        ADMINISTRATOR_SYMBOL
+    } else {
+        family(scheme)
+    }
+}
+
 /// The identifiers a request to the platform may carry (W3's invariant;
 /// W3.25): each in a scheme whose family the list names; never the `LCL-`
 /// ID, never `open_meridian_local`, never the platform's own ID scheme, and
-/// never a source-scoped symbol but a ticker carrying its venue.
+/// never a source-scoped code but a ticker carrying its venue and, where
+/// the list names the `administrator_symbol` family, a symbol whose source
+/// is an administrator it admits (ruling 545). A vendor's symbol never is.
 pub fn sendable(identifiers: &[Asked], list: &LicenceList) -> Vec<PbIdentifier> {
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
@@ -326,14 +352,12 @@ pub fn sendable(identifiers: &[Asked], list: &LicenceList) -> Vec<PbIdentifier> 
         {
             continue;
         }
-        if !asked.source.is_empty() && asked.scheme != "ticker" {
+        let licensed = family_held(&asked.scheme, &asked.source, list);
+        if !asked.source.is_empty() && asked.scheme != "ticker" && licensed != ADMINISTRATOR_SYMBOL
+        {
             continue;
         }
-        if !list
-            .schemes
-            .iter()
-            .any(|scheme| scheme == family(&asked.scheme))
-        {
+        if !list.schemes.iter().any(|scheme| scheme == licensed) {
             continue;
         }
         if seen.insert((
@@ -1392,7 +1416,8 @@ mod tests {
                 "{id}"
             );
         }
-        assert_eq!(shipped.iter().filter(|t| t.base).count(), 7);
+        // From contract v27, the referential class's base too.
+        assert_eq!(shipped.iter().filter(|t| t.base).count(), 8);
         let equity = shipped
             .iter()
             .find(|t| t.template_id == "TPL-equity")
@@ -1417,6 +1442,19 @@ mod tests {
         .unwrap();
         assert!(base && proposed.template_id == "TPL-equity-base");
         assert!(pick(&all, AssetClass::Unspecified, InstrumentType::Unspecified).is_none());
+        // Contract v27: each referential type its own template, matched by
+        // FIGI, ISIN or the administrator's source-scoped symbol.
+        for (kind, id) in [
+            (InstrumentType::InterestRate, "TPL-interest-rate"),
+            (InstrumentType::RateCurve, "TPL-rate-curve"),
+            (InstrumentType::Index, "TPL-index"),
+        ] {
+            let (template, base) = pick(&all, AssetClass::Referential, kind).unwrap();
+            assert!(!base && template.template_id == id, "{id}");
+            assert_eq!(template.match_rule, ["figi", "isin", "symbol"]);
+        }
+        let (base, _) = pick(&all, AssetClass::Referential, InstrumentType::Unspecified).unwrap();
+        assert_eq!(base.template_id, "TPL-referential-base");
     }
 
     #[test]
@@ -1450,6 +1488,49 @@ mod tests {
         assert!(!sendable(&held, &narrow)
             .iter()
             .any(|identifier| identifier.scheme.contains("figi")));
+    }
+
+    #[test]
+    fn an_administrators_symbol_is_sendable_only_where_the_list_admits_it() {
+        let held = vec![
+            asked("symbol", "SOFR", "nyfed"),
+            asked("symbol", "ESTR", "ecb"),
+            asked("symbol", "AAPL", "snaptrade"),
+        ];
+        let symbols = |list: &LicenceList| -> Vec<(String, String)> {
+            sendable(&held, list)
+                .into_iter()
+                .filter(|identifier| identifier.scheme == "symbol")
+                .map(|identifier| (identifier.value, identifier.source))
+                .collect()
+        };
+        // Ruling 545: the family listed and the source admitted.
+        let mut admitting = default_licence();
+        admitting.schemes.push(ADMINISTRATOR_SYMBOL.into());
+        admitting.administrators = vec!["nyfed".into(), "frb".into()];
+        assert_eq!(symbols(&admitting), vec![("SOFR".into(), "nyfed".into())]);
+        // A source the list does not admit, an administrator or a vendor,
+        // is not sent.
+        assert!(!symbols(&admitting)
+            .iter()
+            .any(|(_, source)| source == "ecb"));
+        assert!(!symbols(&admitting)
+            .iter()
+            .any(|(_, source)| source == "snaptrade"));
+        // The administrators named without the family: none is sent.
+        let mut unlisted = admitting.clone();
+        unlisted
+            .schemes
+            .retain(|scheme| scheme != ADMINISTRATOR_SYMBOL);
+        assert!(symbols(&unlisted).is_empty());
+        // The list held before any pull admits none (W3.25's open schemes).
+        assert!(symbols(&default_licence()).is_empty());
+        assert!(!OPEN_FAMILIES.contains(&ADMINISTRATOR_SYMBOL));
+        // A symbol is still never sent under a list naming a bare `symbol`
+        // family, whatever its source.
+        let mut bare = default_licence();
+        bare.schemes.push("symbol".into());
+        assert!(symbols(&bare).is_empty());
     }
 
     #[test]

@@ -72,13 +72,35 @@ pub fn family(scheme: &str) -> &str {
     }
 }
 
+/// The family an administrator's own code is licensed by (ruling 545): wire
+/// `symbol` with the administrator in its `source`, for an administrator
+/// the list names.
+pub const ADMINISTRATOR_SYMBOL: &str = "administrator_symbol";
+
+/// The family an identifier is licensed by under a list: a `symbol` whose
+/// source is an administrator the list names is `administrator_symbol`
+/// (ruling 545); any other, its scheme's family.
+pub fn family_on<'a>(identifier: &'a PbIdentifier, list: &LicenceList) -> &'a str {
+    if identifier.scheme == "symbol"
+        && !identifier.source.is_empty()
+        && list.administrators.contains(&identifier.source)
+    {
+        ADMINISTRATOR_SYMBOL
+    } else {
+        family(&identifier.scheme)
+    }
+}
+
 /// The identifiers a request may carry (W3.25; W3's invariant): each in a
 /// scheme whose family the list names, or the platform's own ID; never the
 /// deployment's.
 pub fn sendable_on(identifiers: &[PbIdentifier], list: Option<&LicenceList>) -> Vec<PbIdentifier> {
-    let named = |scheme: &str| match list {
-        Some(list) => list.schemes.iter().any(|held| held == family(scheme)),
-        None => OPEN_FAMILIES.contains(&family(scheme)),
+    let named = |identifier: &PbIdentifier| match list {
+        Some(list) => list
+            .schemes
+            .iter()
+            .any(|held| held == family_on(identifier, list)),
+        None => OPEN_FAMILIES.contains(&family(&identifier.scheme)),
     };
     identifiers
         .iter()
@@ -88,7 +110,7 @@ pub fn sendable_on(identifiers: &[PbIdentifier], list: Option<&LicenceList>) -> 
                 && !identifier.value.trim().is_empty()
                 && ((identifier.scheme == meridian_symbology::GLOBAL_ID
                     && identifier.value.starts_with("INS-"))
-                    || named(&identifier.scheme))
+                    || named(identifier))
         })
         .cloned()
         .collect()
@@ -272,6 +294,7 @@ pub fn default_licence() -> LicenceList {
             batch_size: 100,
             batches_per_minute: 6,
         }),
+        administrators: Vec::new(),
     }
 }
 
@@ -290,6 +313,18 @@ mod tests {
         .unwrap();
         assert_eq!(list.version, 3);
         assert_eq!(list.pace.unwrap().batch_size, 100);
+        assert!(list.administrators.is_empty());
+        // Ruling 545: the administrators the administrator_symbol family admits.
+        let admitting = licence_from_json(&serde_json::json!({
+            "version": "5",
+            "schemes": ["figi", "administrator_symbol"],
+            "administrators": ["nyfed", "frb", "ecb", "ustreasury"]
+        }))
+        .unwrap();
+        assert_eq!(
+            admitting.administrators,
+            ["nyfed", "frb", "ecb", "ustreasury"]
+        );
         assert!(licence_from_json(
             &serde_json::json!({"version": "4", "schemes": ["open_meridian_local"]})
         )
@@ -470,5 +505,39 @@ mod tests {
         assert!(sendable_on(&asked, Some(&list))
             .iter()
             .all(|i| !i.scheme.contains("figi")));
+    }
+
+    #[test]
+    fn an_administrators_symbol_travels_only_where_the_list_admits_it() {
+        let symbol = |value: &str, source: &str| PbIdentifier {
+            scheme: "symbol".into(),
+            value: value.into(),
+            source: source.into(),
+            ..Default::default()
+        };
+        let asked = vec![
+            symbol("SOFR", "nyfed"),
+            symbol("ESTR", "ecb"),
+            symbol("AAPL", "snaptrade"),
+        ];
+        let sources = |list: Option<&LicenceList>| -> Vec<String> {
+            sendable_on(&asked, list)
+                .into_iter()
+                .map(|i| i.source)
+                .collect()
+        };
+        // Ruling 545: the family listed and the source admitted.
+        let mut admitting = default_licence();
+        admitting.schemes.push(ADMINISTRATOR_SYMBOL.into());
+        admitting.administrators = vec!["nyfed".into()];
+        assert_eq!(sources(Some(&admitting)), vec!["nyfed"]);
+        // Without the family, or with no list read, none travels.
+        let mut unlisted = admitting.clone();
+        unlisted
+            .schemes
+            .retain(|scheme| scheme != ADMINISTRATOR_SYMBOL);
+        assert!(sources(Some(&unlisted)).is_empty());
+        assert!(sources(None).is_empty());
+        assert!(sources(Some(&default_licence())).is_empty());
     }
 }

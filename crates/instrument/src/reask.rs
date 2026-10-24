@@ -373,9 +373,10 @@ pub fn backfill_counts(store: &dyn Store, live: &[Instrument]) -> Vec<BackfillCo
         .filter(|scheme| !one_id::OPEN_FAMILIES.contains(&scheme.as_str()))
         .map(|scheme| {
             let carrying = |record: &&Instrument| {
-                record
-                    .held_now()
-                    .any(|identifier| one_id::family(&identifier.scheme) == scheme.as_str())
+                record.held_now().any(|identifier| {
+                    one_id::family_held(&identifier.scheme, &identifier.source, &list)
+                        == scheme.as_str()
+                })
             };
             BackfillCount {
                 scheme: scheme.clone(),
