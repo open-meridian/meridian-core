@@ -2,9 +2,14 @@
 # runs the same target locally, so a red run here means the hook was bypassed or
 # the runner differs from a developer's machine -- both worth knowing.
 #
-# The single job is named for the make target it runs. ci-mirror-check enforces
-# that correspondence from inside ci-local, so a job added here without a target
+# Each job is named for the make target it runs. ci-mirror-check enforces that
+# correspondence from inside ci-local, so a job added here without a target
 # fails the build rather than quietly escaping local reproduction.
+#
+# Ruling 556 (the product owner, 2026-10-24): the plugin harness's suites,
+# the gate's longest stage, run as the e2e-harness jobs beside ci-local rather
+# than inside it, and the release build's cargo caches are kept between runs.
+# Locally `make ci-local` is still the whole gate, harness suites included.
 name: ci
 
 # On the pull request and by hand, and not again on main. A change lands
@@ -80,6 +85,33 @@ jobs:
         working-directory: workspace/meridian-core
         run: tools/free-runner-disk.sh
 
+      # Ruling 556: the release build's cargo caches from an earlier run, put
+      # in place before the gate starts (tools/ci-cargo-cache.sh). Keyed on the
+      # toolchain and Cargo.lock; another lock's caches under the same
+      # toolchain are still most of the compile. A run of a pull request reads
+      # what an earlier run of it, or one on main, kept. Never decides a run.
+      - name: The cargo caches' key
+        id: cargo
+        working-directory: workspace/meridian-core
+        run: |
+          rust="$(sed -n 's/^ARG RUST_VERSION=//p' Dockerfile | head -1)"
+          echo "prefix=cargo-release-${RUNNER_OS}-rust${rust}-" >> "$GITHUB_OUTPUT"
+          echo "key=cargo-release-${RUNNER_OS}-rust${rust}-${{ hashFiles('workspace/meridian-core/Cargo.lock') }}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the cargo caches
+        id: cargo-cache
+        uses: actions/cache/restore@v4
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/cargo
+          key: ${{ steps.cargo.outputs.key }}
+          restore-keys: ${{ steps.cargo.outputs.prefix }}
+
+      - name: Put the cargo caches in place
+        working-directory: workspace/meridian-core
+        continue-on-error: true
+        run: tools/ci-cargo-cache.sh put "$RUNNER_TEMP/cargo"
+
       # The gate needs a range to police. A default checkout is shallow and
       # detached, with no upstream and no origin/main, and the tool now fails
       # rather than passing on that. See the review finding on meridian-core#5,
@@ -98,14 +130,31 @@ jobs:
           fi
           echo "CONTRACT_DIFF_BASE=$base" >> "$GITHUB_ENV"
 
+      # The harness's suites are the e2e-harness jobs below (ruling 556).
       - name: make ci-local
         working-directory: workspace/meridian-core
-        run: make ci-local
+        run: make ci-local E2E_HARNESS_TARGET=
         # build, test and lint each run in Dockerfile.rust at the pinned toolchain.
         # No Rust is installed on the runner, deliberately: the container is the
         # only place a version is chosen.
         env:
           DOCKER_BUILDKIT: "1"
+
+      # Kept only from a green run, and only where this key was not restored
+      # whole: a key is written once.
+      - name: Take the cargo caches
+        if: success() && steps.cargo-cache.outputs.cache-hit != 'true'
+        working-directory: workspace/meridian-core
+        continue-on-error: true
+        run: tools/ci-cargo-cache.sh take "$RUNNER_TEMP/cargo"
+
+      - name: Keep the cargo caches
+        if: success() && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/cargo
+          key: ${{ steps.cargo.outputs.key }}
 
       # What the services said, kept only when something failed. The e2e
       # targets write these beside the checkout and the runner names them on
@@ -121,6 +170,103 @@ jobs:
           # The logs are dotfiles, which v4 leaves out unless told; with
           # `ignore` as well, every failure uploaded nothing and said nothing
           # until 2026-09-25.
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 14
+
+  # The plugin harness's suites (ruling 556): `make e2e-harness`, a few suites
+  # per job, beside ci-local rather than after it, so the longest stage of the
+  # gate is off the run's critical path. Each suite builds its images and runs
+  # in its own compose project, needing no other's state (the Makefile's
+  # HARNESS_SUITES); the groups are balanced on v27's timings (e2e-lake alone
+  # is six minutes). A suite added to HARNESS_SUITES is added to a group here,
+  # or no job runs it.
+  e2e-harness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: lake
+            suites: e2e-lake e2e-prepared e2e-activity
+          - group: orders
+            suites: e2e-orders e2e-access-per-role e2e-plugin-area harness-check
+          - group: tickets
+            suites: e2e-tickets e2e-one-id e2e-service-account e2e-archive
+    name: e2e-harness (${{ matrix.group }})
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: workspace/meridian-core
+
+      # The SDK, chosen as ci-local chooses it.
+      - name: Choose the SDK's branch
+        id: sdk
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          SDK: https://github.com/${{ github.repository_owner }}/meridian-python.git
+        run: |
+          ref=main
+          case "$HEAD_REF" in
+            "" | *[!A-Za-z0-9._/-]*) ;;
+            *)
+              if git ls-remote --exit-code --heads "$SDK" "refs/heads/$HEAD_REF" >/dev/null 2>&1; then
+                ref="$HEAD_REF"
+              fi
+              ;;
+          esac
+          echo "the harness reads meridian-python@$ref"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/meridian-python
+          ref: ${{ steps.sdk.outputs.ref }}
+          path: workspace/meridian-python
+
+      - name: Free the runner's disk
+        working-directory: workspace/meridian-core
+        run: tools/free-runner-disk.sh
+
+      # The runtime image each suite builds compiles from ci-local's kept
+      # cargo caches; read here, never written.
+      - name: The cargo caches' key
+        id: cargo
+        working-directory: workspace/meridian-core
+        run: |
+          rust="$(sed -n 's/^ARG RUST_VERSION=//p' Dockerfile | head -1)"
+          echo "prefix=cargo-release-${RUNNER_OS}-rust${rust}-" >> "$GITHUB_OUTPUT"
+          echo "key=cargo-release-${RUNNER_OS}-rust${rust}-${{ hashFiles('workspace/meridian-core/Cargo.lock') }}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the cargo caches
+        uses: actions/cache/restore@v4
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/cargo
+          key: ${{ steps.cargo.outputs.key }}
+          restore-keys: ${{ steps.cargo.outputs.prefix }}
+
+      - name: Put the cargo caches in place
+        working-directory: workspace/meridian-core
+        continue-on-error: true
+        run: tools/ci-cargo-cache.sh put "$RUNNER_TEMP/cargo"
+
+      - name: make e2e-harness
+        working-directory: workspace/meridian-core
+        env:
+          DOCKER_BUILDKIT: "1"
+          SUITES: ${{ matrix.suites }}
+        run: make e2e-harness E2E_HARNESS_TARGET="$SUITES"
+
+      - name: Keep what the e2e services said
+        if: failure()
+        timeout-minutes: 5
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-harness-${{ matrix.group }}-logs
+          path: workspace/meridian-core/.e2e-*.log
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 14
