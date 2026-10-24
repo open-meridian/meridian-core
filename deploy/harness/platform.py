@@ -277,7 +277,6 @@ EQUITIES = {
 # provisional local one, which is not priced (W10.6).
 BTC_CAIP19 = "bip122:000000000019d6689c085ae165831e93/slip44:0"
 USDC_CAIP19 = "eip155:1/erc20:0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
-POLYGON_USDC_CAIP19 = "eip155:137/erc20:0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
 CRYPTO = {
     caip19: {
         "instrument_id": instrument_id,
@@ -290,18 +289,31 @@ CRYPTO = {
     for caip19, instrument_id, description in (
         (BTC_CAIP19, f"INS-01JBTC{'0' * 19}1", "Bitcoin"),
         (USDC_CAIP19, f"INS-01JUSDC{'0' * 18}1", "USD Coin"),
-        # v27 stage E: the token Polymarket pays out in, USDC on Polygon.
-        (POLYGON_USDC_CAIP19, f"INS-01JUSDCP{'0' * 17}1", "USD Coin (Polygon)"),
     )
+}
+
+# Polymarket's collateral, which its contracts pay out in (ruling 550): pUSD,
+# a cash record of the platform's, by its token on Polygon and by
+# Polymarket's own symbol for it, as the platform's record carries them.
+PUSD_CAIP19 = "eip155:137/erc20:0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb"
+PUSD = {
+    "instrument_id": f"INS-01JPUSD{'0' * 18}1",
+    "identifiers": [{"scheme": "caip19", "value": PUSD_CAIP19, "source": ""},
+                    {"scheme": "symbol", "value": "PUSD", "source": "polymarket"}],
+    "asset_class": "ASSET_CLASS_CASH",
+    "currency": "PUSD",
+    "description": "pUSD, Polymarket's collateral",
+    "lifecycle_state": "INSTRUMENT_LIFECYCLE_STATE_ACTIVE",
+    "version": 1,
 }
 
 # What each event venue's contracts pay out when the source offers no
 # currency (v27 stage E): the venue's own payout instrument -- Polymarket's
-# 1 USDC on its token -- never USD by default; Kalshi and Polymarket US pay
+# 1 pUSD (ruling 550) -- never USD by default; Kalshi and Polymarket US pay
 # dollars.
 VENUE_PAYOUTS = {
     POLYMARKET["venue_id"]: {"amount": "1", "currency_code": "",
-                             "instrument_id": CRYPTO[POLYGON_USDC_CAIP19]["instrument_id"]},
+                             "instrument_id": PUSD["instrument_id"]},
     KLSH["venue_id"]: {"amount": "1", "currency_code": "USD", "instrument_id": ""},
     QCEX["venue_id"]: {"amount": "1", "currency_code": "USD", "instrument_id": ""},
 }
@@ -580,6 +592,7 @@ def held_instrument(instrument_id):
             or instrument_id in {r["instrument_id"] for r in MINTED.values()}
             or instrument_id in {r["instrument_id"] for r in EQUITIES.values()}
             or instrument_id in {r["instrument_id"] for r in CRYPTO.values()}
+            or instrument_id == PUSD["instrument_id"]
             or instrument_id in {r["instrument_id"] for r in REFERENTIAL_RECORDS})
 
 
@@ -641,6 +654,10 @@ def match_or_mint(asked):
             break
         if scheme == "caip19" and value in CRYPTO:
             answer = {"minted": False, "instrument": CRYPTO[value]}
+            break
+        if (scheme, value, identifier.get("source", "")) in {
+                (i["scheme"], i["value"], i["source"]) for i in PUSD["identifiers"]}:
+            answer = {"minted": False, "instrument": PUSD}
             break
         # The seeded referential records, as the platform matches them: by
         # the administrator's code and its source, or by ISIN.
