@@ -286,6 +286,89 @@ mod tests {
         );
     }
 
+    /// A data plugin's catalogue as the SDK uploads it (JSON, read by core)
+    /// and as it registers it (the wire), with or without the licence's
+    /// attribution terms (contract v27; SDK 0.32.2): the two agree.
+    #[test]
+    fn a_catalogue_registers_with_or_without_its_licences_attribution_terms() {
+        use meridian_pb::v1::{
+            Catalogue, CopyrightClass, DatasetDeclaration, DatasetLicence, DerivedUse,
+            ObservationMode, Redistribution,
+        };
+        let terms = serde_json::json!({
+            "redistribution": "allowed_with_attribution",
+            "attribution_required": true,
+            "attribution_text": "Source: central bank statistics",
+            "copyright_class": "public_domain",
+            "no_more_restrictive_terms": true
+        });
+        for with_terms in [true, false] {
+            let mut licence = serde_json::json!({
+                "kept": true, "retention_days": 0, "derived_use": true,
+                "derived_use_terms": "not_restricted", "display": true,
+                "default_fields": [], "personal_use": false
+            });
+            if with_terms {
+                for (name, value) in terms.as_object().unwrap() {
+                    licence[name] = value.clone();
+                }
+            }
+            let declared: meridian_domain::declaration::Declared =
+                serde_json::from_value(serde_json::json!({
+                    "catalogue": {"datasets": [{
+                        "key": "rates", "vendor": "Central bank", "modes": ["pull"],
+                        "licence_default": licence
+                    }]}
+                }))
+                .unwrap();
+            let uploaded = meridian_domain::declaration::from_json(&declared).unwrap();
+            // What DatasetLicence._wire() sends.
+            #[allow(deprecated)]
+            let wire = DatasetLicence {
+                kept: true,
+                derived_use: true,
+                derived_use_terms: DerivedUse::NotRestricted as i32,
+                display: true,
+                redistribution: if with_terms {
+                    Redistribution::AllowedWithAttribution as i32
+                } else {
+                    Redistribution::Unspecified as i32
+                },
+                attribution_required: with_terms,
+                attribution_text: if with_terms {
+                    "Source: central bank statistics".into()
+                } else {
+                    String::new()
+                },
+                copyright_class: if with_terms {
+                    CopyrightClass::PublicDomain as i32
+                } else {
+                    CopyrightClass::Unspecified as i32
+                },
+                no_more_restrictive_terms: with_terms,
+                ..Default::default()
+            };
+            let registered = PluginDeclaration {
+                catalogue: Some(Catalogue {
+                    datasets: vec![DatasetDeclaration {
+                        key: "rates".into(),
+                        vendor: "Central bank".into(),
+                        modes: vec![ObservationMode::Pull as i32],
+                        licence_default: Some(wire),
+                        ..Default::default()
+                    }],
+                }),
+                ..Default::default()
+            };
+            let request = RegisterRequest {
+                schema_version: "v27".into(),
+                declaration: Some(registered),
+                ..Default::default()
+            };
+            assert_eq!(difference(&request, &uploaded), None, "terms: {with_terms}");
+        }
+    }
+
     /// A setting named like a window setting for a kind the version does
     /// not store is compared like any other.
     #[test]

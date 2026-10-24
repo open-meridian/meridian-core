@@ -11,9 +11,9 @@
 //! (decisions/028). Never a value, an account or an identifier.
 
 use meridian_pb::v1::{
-    AlgorithmDeclaration, Catalogue, DatasetDeclaration, DatasetLicence, DerivedUse, NotCarried,
-    NotCarriedReason, ObservationMode, PluginDeclaration, PricingModelDeclaration, RawRecordKind,
-    StorageDeclaration,
+    AlgorithmDeclaration, Catalogue, CopyrightClass, DatasetDeclaration, DatasetLicence,
+    DerivedUse, NotCarried, NotCarriedReason, ObservationMode, PluginDeclaration,
+    PricingModelDeclaration, RawRecordKind, Redistribution, StorageDeclaration,
 };
 
 /// The declaration as the CLI sends it, in JSON.
@@ -145,6 +145,21 @@ pub struct DeclaredLicence {
     pub default_fields: Vec<String>,
     #[serde(default)]
     pub personal_use: bool,
+    /// The attribution and redistribution terms (contract v27, §1c and §1d
+    /// of spec/every-data-source-is-licensed-on-the-same-terms), as the SDK
+    /// uploads them from 0.32.2: the two answers by their words
+    /// (`allowed_with_attribution`, `public_domain`) or the enums' names,
+    /// empty for not stated.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub redistribution: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub attribution_required: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub attribution_text: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub copyright_class: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_more_restrictive_terms: bool,
 }
 
 /// A mode as the wire numbers it, from its word or the enum's name.
@@ -316,6 +331,50 @@ pub fn derived_use_of(text: &str) -> Option<DerivedUse> {
     })
 }
 
+/// A redistribution answer from its word (`not_allowed`) or the enum's name;
+/// empty is not stated, anything else `None`.
+pub fn redistribution_of(text: &str) -> Option<Redistribution> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Some(Redistribution::Unspecified);
+    }
+    Redistribution::from_str_name(text).or_else(|| {
+        Redistribution::from_str_name(&format!("REDISTRIBUTION_{}", text.to_ascii_uppercase()))
+    })
+}
+
+/// A redistribution answer's word, as an upload carries it; empty for none.
+pub fn redistribution_word(answer: i32) -> &'static str {
+    match Redistribution::try_from(answer) {
+        Ok(Redistribution::NotAllowed) => "not_allowed",
+        Ok(Redistribution::LicenceRequired) => "licence_required",
+        Ok(Redistribution::AllowedWithAttribution) => "allowed_with_attribution",
+        _ => "",
+    }
+}
+
+/// A copyright class from its word (`public_domain`) or the enum's name;
+/// empty is not stated, anything else `None`.
+pub fn copyright_class_of(text: &str) -> Option<CopyrightClass> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Some(CopyrightClass::Unspecified);
+    }
+    CopyrightClass::from_str_name(text).or_else(|| {
+        CopyrightClass::from_str_name(&format!("COPYRIGHT_CLASS_{}", text.to_ascii_uppercase()))
+    })
+}
+
+/// A copyright class's word, as an upload carries it; empty for none.
+pub fn copyright_class_word(class: i32) -> &'static str {
+    match CopyrightClass::try_from(class) {
+        Ok(CopyrightClass::PublicDomain) => "public_domain",
+        Ok(CopyrightClass::CopyrightCitationRequired) => "copyright_citation_required",
+        Ok(CopyrightClass::CopyrightPreapprovalRequired) => "copyright_preapproval_required",
+        _ => "",
+    }
+}
+
 /// A derived-data answer's word, as an upload carries it.
 pub fn derived_use_word(terms: i32) -> &'static str {
     match DerivedUse::try_from(terms) {
@@ -350,6 +409,21 @@ fn catalogue_from_json(catalogue: &DeclaredCatalogue) -> Result<Catalogue, Strin
                         l.derived_use_terms
                     )
                 })?;
+                let redistribution = redistribution_of(&l.redistribution).ok_or_else(|| {
+                    format!(
+                        "declaration.catalogue.datasets[{i}].licence_default.redistribution {:?} \
+                         is none of not_allowed, licence_required and allowed_with_attribution",
+                        l.redistribution
+                    )
+                })?;
+                let copyright_class = copyright_class_of(&l.copyright_class).ok_or_else(|| {
+                    format!(
+                        "declaration.catalogue.datasets[{i}].licence_default.copyright_class \
+                         {:?} is none of public_domain, copyright_citation_required and \
+                         copyright_preapproval_required",
+                        l.copyright_class
+                    )
+                })?;
                 #[allow(deprecated)]
                 let mut licence = DatasetLicence {
                     kept: l.kept,
@@ -359,6 +433,11 @@ fn catalogue_from_json(catalogue: &DeclaredCatalogue) -> Result<Catalogue, Strin
                     display: l.display,
                     default_fields: l.default_fields.clone(),
                     personal_use: l.personal_use,
+                    redistribution: redistribution as i32,
+                    attribution_required: l.attribution_required,
+                    attribution_text: l.attribution_text.clone(),
+                    copyright_class: copyright_class as i32,
+                    no_more_restrictive_terms: l.no_more_restrictive_terms,
                     ..Default::default()
                 };
                 crate::lake::derived_use_both(&mut licence);
@@ -402,6 +481,11 @@ pub fn dataset_json(dataset: &DatasetDeclaration) -> serde_json::Value {
             "display": l.display,
             "default_fields": l.default_fields,
             "personal_use": l.personal_use,
+            "redistribution": redistribution_word(l.redistribution),
+            "attribution_required": l.attribution_required,
+            "attribution_text": l.attribution_text,
+            "copyright_class": copyright_class_word(l.copyright_class),
+            "no_more_restrictive_terms": l.no_more_restrictive_terms,
         })),
         "day_time_zone": dataset.day_time_zone,
         "day_end_minute": dataset.day_end_minute,
@@ -526,5 +610,72 @@ mod tests {
         assert!(from_json(&bad)
             .unwrap_err()
             .contains("catalogue.datasets[0].modes[0]"));
+    }
+
+    #[test]
+    fn a_licences_attribution_terms_travel_as_the_sdk_uploads_them() {
+        // SDK 0.32.2's DatasetLicence._to_json (contract v27, §1c and §1d).
+        let declared: Declared = serde_json::from_value(serde_json::json!({
+            "catalogue": {"datasets": [{
+                "key": "rates", "vendor": "ECB", "modes": ["pull"],
+                "licence_default": {
+                    "kept": true, "retention_days": 0, "derived_use": true,
+                    "derived_use_terms": "not_restricted", "display": true,
+                    "default_fields": [], "personal_use": false,
+                    "redistribution": "allowed_with_attribution",
+                    "attribution_required": true,
+                    "attribution_text": "Source: ECB statistics",
+                    "copyright_class": "copyright_citation_required",
+                    "no_more_restrictive_terms": true
+                }
+            }]}
+        }))
+        .unwrap();
+        let declaration = from_json(&declared).unwrap();
+        let licence = declaration.catalogue.as_ref().unwrap().datasets[0]
+            .licence_default
+            .clone()
+            .unwrap();
+        assert_eq!(
+            licence.redistribution,
+            Redistribution::AllowedWithAttribution as i32
+        );
+        assert!(licence.attribution_required && licence.no_more_restrictive_terms);
+        assert_eq!(licence.attribution_text, "Source: ECB statistics");
+        assert_eq!(
+            licence.copyright_class,
+            CopyrightClass::CopyrightCitationRequired as i32
+        );
+        // Printed back by the same words, so a second read is the same.
+        let back = to_json(&declaration);
+        let printed = &back["catalogue"]["datasets"][0]["licence_default"];
+        assert_eq!(printed["redistribution"], "allowed_with_attribution");
+        assert_eq!(printed["copyright_class"], "copyright_citation_required");
+        let again: Declared = serde_json::from_value(back).unwrap();
+        assert_eq!(from_json(&again).unwrap(), declaration);
+        // The enums' names read as their words; anything else is refused.
+        let mut named = declared.clone();
+        named.catalogue.as_mut().unwrap().datasets[0]
+            .licence_default
+            .as_mut()
+            .unwrap()
+            .copyright_class = "COPYRIGHT_CLASS_PUBLIC_DOMAIN".into();
+        assert_eq!(
+            from_json(&named).unwrap().catalogue.unwrap().datasets[0]
+                .licence_default
+                .as_ref()
+                .unwrap()
+                .copyright_class,
+            CopyrightClass::PublicDomain as i32
+        );
+        let mut bad = declared.clone();
+        bad.catalogue.as_mut().unwrap().datasets[0]
+            .licence_default
+            .as_mut()
+            .unwrap()
+            .redistribution = "sometimes".into();
+        assert!(from_json(&bad)
+            .unwrap_err()
+            .contains("licence_default.redistribution"));
     }
 }
