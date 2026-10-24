@@ -307,8 +307,8 @@ VENUE_PAYOUTS = {
 }
 
 
-# The platform's referential records (contract v27, W1.1): the 22 its
-# `seed_referential` seeds (meridian-platform a9d5e01,
+# The platform's referential records (contract v27, W1.1): the 28 its
+# `seed_referential` seeds (meridian-platform 932da80,
 # platform_site/domain/referential_records.py, SEEDS), each named by its
 # administrator's code as a `symbol` scoped to its source, and by an ISIN
 # where one exists (€STR's), each under its type's template. Matched by
@@ -346,6 +346,18 @@ REFERENTIAL_SEEDS = (
     ("ustreasury", "Daily Treasury Bill Rates", "rate_curve", "USD", "Daily Treasury bill rates", ""),
     ("frb", "feds200628", "rate_curve", "USD",
      "Treasury zero-coupon yield curve (Federal Reserve Board)", ""),
+    # H.15's other series (ruling 541; meridian-platform 932da80).
+    ("frb", "Treasury bills secondary market", "rate_curve", "USD",
+     "Treasury bill secondary market rates, 4-week to 1-year (H.15)", ""),
+    ("frb", "AA nonfinancial commercial paper", "rate_curve", "USD",
+     "AA nonfinancial commercial paper rates, 30- to 90-day (H.15)", ""),
+    ("frb", "AA financial commercial paper", "rate_curve", "USD",
+     "AA financial commercial paper rates, 30- to 90-day (H.15)", ""),
+    ("frb", "Bank prime loan rate", "interest_rate", "USD", "Bank prime loan rate (H.15)", ""),
+    ("frb", "Discount window primary credit rate", "interest_rate", "USD",
+     "Discount window primary credit rate (H.15)", ""),
+    ("frb", "Treasury inflation-indexed long-term average", "interest_rate", "USD",
+     "Treasury inflation-indexed long-term average yield, over 10 years (H.15)", ""),
 )
 
 
