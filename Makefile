@@ -8,7 +8,7 @@ DOCKER := DOCKER_BUILDKIT=1 docker
 .PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check licence-check-test gate-start \
         gate-mark-tests stage-checks stage-runtime stage-compile stage-tests stage-settings-page stage-sdk stage-dashboards stage-harness stage-first-run stage-image stage-lint \
         e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external e2e-cluster-backup \
-        test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-service-account e2e-lake e2e-recorded e2e-orders e2e-one-id \
+        test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-service-account e2e-lake e2e-recorded e2e-orders e2e-one-id e2e-harness \
         build test test-store check-image-version chart-check check-crate-boundaries check-one-clock check-test-targets check-local-storage \
         interop e2e-book check-reference-cases reference-cases prompt-attacks lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-first-run
 
@@ -125,8 +125,22 @@ stage-sdk:        gate-begin-sdk check-reference-cases interop e2e-book
 	@$(GATE) end sdk
 stage-dashboards: gate-begin-dashboards e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page
 	@$(GATE) end dashboards
-stage-harness:    gate-begin-harness harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-service-account e2e-lake e2e-orders e2e-one-id
+stage-harness:    gate-begin-harness e2e-harness
 	@$(GATE) end harness --drop meridian-python-interop $(HARNESS_IMAGE)
+
+# The plugin harness's suites (ruling 556). Each builds the images it needs
+# and runs in its own compose project, writing .harness afresh, so none needs
+# another's state and any can run alone or on another machine. ci-local runs
+# them all, one after another; CI runs them as the e2e-harness jobs, a few
+# suites each, beside ci-local (which it runs with E2E_HARNESS_TARGET empty),
+# as e2e-cluster-k3d runs one target per job. `make e2e-harness
+# E2E_HARNESS_TARGET="<suites>"` runs any of them.
+HARNESS_SUITES := harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive \
+	e2e-plugin-area e2e-prepared e2e-service-account e2e-lake e2e-orders e2e-one-id
+E2E_HARNESS_TARGET ?= $(HARNESS_SUITES)
+e2e-harness: $(E2E_HARNESS_TARGET)
+	@not="$(filter-out $(HARNESS_SUITES),$(E2E_HARNESS_TARGET))"; [ -z "$$not" ] \
+		|| { echo "e2e-harness FAILED: $$not is no harness suite; they are $(HARNESS_SUITES)" >&2; exit 1; }
 stage-first-run:  gate-begin-first-run e2e-first-run e2e-first-run-brought e2e-first-run-oidc
 	@$(GATE) end first-run
 stage-image:      gate-begin-image check-image-version chart-check
@@ -160,6 +174,13 @@ ci-local-deep: ci-local
 
 ci-mirror-check:
 	@$(PY) tools/ci_mirror_check.py --repo-root .
+	@# Ruling 556: every harness suite in exactly one of CI's e2e-harness
+	@# groups, so a suite added here is never one no job runs.
+	@grouped="$$(sed -n 's/^ *suites: //p' .github/workflows/ci.yaml | tr ' ' '\n' | grep . | LC_ALL=C sort)"; \
+	suites="$$(printf '%s\n' $(HARNESS_SUITES) | LC_ALL=C sort)"; \
+	[ "$$grouped" = "$$suites" ] \
+		|| { echo "ci-mirror-check FAILED: CI's e2e-harness groups run $$(echo $$grouped), and HARNESS_SUITES is $$(echo $$suites); each suite in exactly one group" >&2; exit 1; }
+	@echo "ci-mirror-check OK: the $(words $(HARNESS_SUITES)) harness suites each in one of CI's e2e-harness groups"
 
 # GitHub enforces an issue form's required box only in the browser, so the
 # suggestion licence is asked for by an action (.github/actions/licence-check)
