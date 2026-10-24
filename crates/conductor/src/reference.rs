@@ -18,6 +18,14 @@
 //! venue `ticker_and_venue` -- and never the deployment's own: no `LCL-` ID
 //! and no `open_meridian_local`. Until a list is read, the open schemes the
 //! contract names.
+//!
+//! **A store that starts after a hand-off** (found by plugin-fred's e2e,
+//! 2026-10-24): the bus delivers at most once, so a store not yet listening
+//! when the round is handed on misses it, and until the next daily round
+//! would send by the open schemes alone. The store says it started, as every
+//! component does (W5.20, `platform.deployment.event.component-report`,
+//! after it has subscribed); the puller hears it and, for a store started
+//! after its last hand-off, hands the round on again at once.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -56,6 +64,16 @@ pub const OPEN_FAMILIES: [&str; 7] = [
 pub const EVERY: Duration = Duration::from_secs(86_400);
 pub const AGAIN_AFTER: Duration = Duration::from_secs(300);
 pub const FIRST_AGAIN_AFTER: Duration = Duration::from_secs(60);
+
+/// Where each component says what it runs and when it started (W5.20).
+pub const COMPONENT_REPORT: &str = "platform.deployment.event.component-report";
+
+/// The component the round is handed to.
+pub const STORE_COMPONENT: &str = "instrument";
+
+/// A start this close before the last hand-off is still taken as after it:
+/// the store's clock and this one are two machines' (skew, never a gap).
+pub const START_SKEW_NS: i64 = 10_000_000_000;
 
 /// The feed's page, as the platform serves it.
 const FEED_PAGE: usize = 1000;
@@ -127,6 +145,11 @@ pub struct ReferencePuller {
     /// over what it holds.
     highest_template: Mutex<BTreeMap<String, i64>>,
     feed_cursor: Mutex<i64>,
+    /// When the licence list was last handed on, and the store's start last
+    /// heard: a store started after the hand-off is handed the round again.
+    handed_at_ns: Mutex<i64>,
+    store_started_ns: Mutex<i64>,
+    store_started: tokio::sync::Notify,
 }
 
 impl ReferencePuller {
@@ -143,6 +166,44 @@ impl ReferencePuller {
             licence,
             highest_template: Mutex::new(BTreeMap::new()),
             feed_cursor: Mutex::new(0),
+            handed_at_ns: Mutex::new(0),
+            store_started_ns: Mutex::new(0),
+            store_started: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Whether a store's report says it started after the last hand-off,
+    /// and so missed it: a start not heard before, at or after the
+    /// hand-off less the skew allowed. Nothing handed on yet needs no
+    /// repeat; the round under way reaches it.
+    pub fn store_missed_it(&self, started_at_ns: i64) -> bool {
+        let Ok(mut heard) = self.store_started_ns.lock() else {
+            return false;
+        };
+        if *heard == started_at_ns {
+            return false;
+        }
+        *heard = started_at_ns;
+        let handed = self.handed_at_ns.lock().map(|held| *held).unwrap_or(0);
+        handed > 0 && started_at_ns >= handed - START_SKEW_NS
+    }
+
+    /// The store's reports, heard for as long as this runs: one that
+    /// started after the last hand-off wakes the round.
+    async fn hear_store_starts(self: Arc<Self>, mut reports: meridian_bus::Subscription) {
+        while let Some(delivery) = reports.recv().await {
+            let Ok(report) =
+                meridian_domain::v1::ComponentReport::decode(&delivery.envelope.payload[..])
+            else {
+                continue;
+            };
+            if report.component == STORE_COMPONENT && self.store_missed_it(report.started_at_ns) {
+                tracing::info!(
+                    started_at_ns = report.started_at_ns,
+                    "the instrument store started after the reference data was handed on; handing it on again"
+                );
+                self.store_started.notify_one();
+            }
         }
     }
 
@@ -159,6 +220,9 @@ impl ReferencePuller {
             "meridian.v1.LicenceList",
             list.encode_to_vec(),
         );
+        if let Ok(mut held) = self.handed_at_ns.lock() {
+            *held = self.clock.now_ns();
+        }
 
         let templates = self.pull_templates(now).await?;
         if !templates.is_empty() {
@@ -251,8 +315,12 @@ impl ReferencePuller {
     /// Pull now, then daily; the platform not reached, every few minutes
     /// until it is. The first round is handed on twice, a minute apart and
     /// whole: a store starting after this one missed the first (at-most-once
-    /// delivery), and keeps each thing once.
+    /// delivery), and keeps each thing once. A store heard starting after a
+    /// hand-off is handed a whole round at once, whenever it starts.
     pub async fn start(self: Arc<Self>) {
+        // Subscribed before the first hand-off, so no start goes unheard.
+        let reports = self.bus.subscribe_every(COMPONENT_REPORT);
+        tokio::spawn(Arc::clone(&self).hear_store_starts(reports));
         let mut rounds = 0;
         loop {
             let wait = match self.pull_once().await {
@@ -272,7 +340,18 @@ impl ReferencePuller {
                     AGAIN_AFTER
                 }
             };
-            tokio::time::sleep(wait).await;
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                _ = self.store_started.notified() => {
+                    // Whole, as the first round's repeat is.
+                    if let Ok(mut held) = self.highest_template.lock() {
+                        held.clear();
+                    }
+                    if let Ok(mut held) = self.feed_cursor.lock() {
+                        *held = 0;
+                    }
+                }
+            }
         }
     }
 }
@@ -462,6 +541,89 @@ mod tests {
                 "an after_version sent without its subject: {url}"
             );
         }
+    }
+
+    /// A store that starts after the first hand-off (plugin-fred's e2e,
+    /// 2026-10-24): its start, heard on the component reports, has the round
+    /// handed on again at once -- not a minute or a day later -- and a start
+    /// from before the hand-off, which heard it, does not.
+    #[tokio::test]
+    async fn a_store_starting_after_the_hand_off_is_handed_the_list_again() {
+        const NOW: i64 = 1_792_300_000_000_000_000;
+        let licence = serde_json::json!({"version": "7",
+                                         "schemes": ["figi", "administrator_symbol"],
+                                         "administrators": ["nyfed"],
+                                         "pace": {"batch_size": 100, "batches_per_minute": 6}});
+        let round = |licence: &serde_json::Value| {
+            vec![
+                answer(licence.clone()),
+                answer(serde_json::json!({"templates": []})),
+                answer(serde_json::json!({"entries": []})),
+            ]
+        };
+        let fake = crate::platform::tests::Fake::new([round(&licence), round(&licence)].concat());
+        let clock = Arc::new(meridian_clock::ManualClock::at(NOW));
+        let bus = Arc::new(Bus::single(
+            "conductor-1",
+            Arc::new(meridian_bus::MemoryBackend::new()),
+            clock.clone(),
+        ));
+        let puller = Arc::new(ReferencePuller::new(
+            Arc::clone(&bus),
+            Arc::new(crate::platform::tests::platform(fake.clone())),
+            clock,
+            Licence::default(),
+        ));
+        // Something on the bus before the store is, to see the first hand-off.
+        let mut early = bus.subscribe_every(LICENCE_LIST_PULLED);
+        tokio::spawn(Arc::clone(&puller).start());
+        tokio::time::timeout(Duration::from_secs(2), early.recv())
+            .await
+            .expect("the first hand-off")
+            .unwrap();
+
+        // The store starts now: subscribed, then its first report.
+        let mut store = bus.subscribe_every(LICENCE_LIST_PULLED);
+        let report = |started_at_ns: i64| {
+            meridian_domain::v1::ComponentReport {
+                component: STORE_COMPONENT.into(),
+                started_at_ns,
+                ..Default::default()
+            }
+            .encode_to_vec()
+        };
+        // A start a minute before the hand-off heard it: nothing again.
+        bus.publish(
+            COMPONENT_REPORT,
+            "meridian.v1.ComponentReport",
+            report(NOW - 60_000_000_000),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), store.recv())
+                .await
+                .is_err(),
+            "a store up before the hand-off is not handed it again"
+        );
+        bus.publish(
+            COMPONENT_REPORT,
+            "meridian.v1.ComponentReport",
+            report(NOW + 130_000_000),
+            None,
+            None,
+        )
+        .unwrap();
+        let again = tokio::time::timeout(Duration::from_secs(2), store.recv())
+            .await
+            .expect("the list handed on again, well inside FIRST_AGAIN_AFTER")
+            .unwrap();
+        let list = LicenceList::decode(&again.envelope.payload[..]).unwrap();
+        assert_eq!(list.version, 7);
+        assert_eq!(list.administrators, ["nyfed"]);
+        // Heard again at its next report, the same start is not a new one.
+        assert!(!puller.store_missed_it(NOW + 130_000_000));
     }
 
     #[test]
