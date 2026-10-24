@@ -147,9 +147,9 @@ pub struct DeclaredLicence {
     pub personal_use: bool,
     /// The attribution and redistribution terms (contract v27, §1c and §1d
     /// of spec/every-data-source-is-licensed-on-the-same-terms), as the SDK
-    /// uploads them from 0.32.2: the two answers by their words
-    /// (`allowed_with_attribution`, `public_domain`) or the enums' names,
-    /// empty for not stated.
+    /// uploads them from 0.32.2 (`not_affiliated_notice` from 0.32.3): the
+    /// two answers by their words (`allowed_with_attribution`,
+    /// `public_domain`) or the enums' names, empty for not stated.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub redistribution: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -160,6 +160,8 @@ pub struct DeclaredLicence {
     pub copyright_class: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub no_more_restrictive_terms: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub not_affiliated_notice: String,
 }
 
 /// A mode as the wire numbers it, from its word or the enum's name.
@@ -438,6 +440,7 @@ fn catalogue_from_json(catalogue: &DeclaredCatalogue) -> Result<Catalogue, Strin
                     attribution_text: l.attribution_text.clone(),
                     copyright_class: copyright_class as i32,
                     no_more_restrictive_terms: l.no_more_restrictive_terms,
+                    not_affiliated_notice: l.not_affiliated_notice.clone(),
                     ..Default::default()
                 };
                 crate::lake::derived_use_both(&mut licence);
@@ -486,6 +489,7 @@ pub fn dataset_json(dataset: &DatasetDeclaration) -> serde_json::Value {
             "attribution_text": l.attribution_text,
             "copyright_class": copyright_class_word(l.copyright_class),
             "no_more_restrictive_terms": l.no_more_restrictive_terms,
+            "not_affiliated_notice": l.not_affiliated_notice,
         })),
         "day_time_zone": dataset.day_time_zone,
         "day_end_minute": dataset.day_end_minute,
@@ -626,7 +630,8 @@ mod tests {
                     "attribution_required": true,
                     "attribution_text": "Source: ECB statistics",
                     "copyright_class": "copyright_citation_required",
-                    "no_more_restrictive_terms": true
+                    "no_more_restrictive_terms": true,
+                    "not_affiliated_notice": "Not affiliated with or endorsed by the ECB."
                 }
             }]}
         }))
@@ -642,6 +647,10 @@ mod tests {
         );
         assert!(licence.attribution_required && licence.no_more_restrictive_terms);
         assert_eq!(licence.attribution_text, "Source: ECB statistics");
+        assert_eq!(
+            licence.not_affiliated_notice,
+            "Not affiliated with or endorsed by the ECB."
+        );
         assert_eq!(
             licence.copyright_class,
             CopyrightClass::CopyrightCitationRequired as i32

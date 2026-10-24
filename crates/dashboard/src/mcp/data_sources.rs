@@ -256,7 +256,7 @@ fn licence_json(licence: &DatasetLicence, set: bool) -> Value {
         "personal_use": licence.personal_use,
         // Contract v27 (§1c, §1d): the attribution and redistribution terms
         // the vendor's plugin declared, by their words; the attribution's
-        // text is the plugin's words.
+        // text and the not-affiliated notice are the plugin's words.
         "redistribution": meridian_domain::declaration::redistribution_word(
             licence.redistribution,
         ),
@@ -266,6 +266,7 @@ fn licence_json(licence: &DatasetLicence, set: bool) -> Value {
             licence.copyright_class,
         ),
         "no_more_restrictive_terms": licence.no_more_restrictive_terms,
+        "not_affiliated_notice": others_words(&licence.not_affiliated_notice),
         "updated_by": licence.updated_by,
         "updated_at_ns": stamp_said(licence.updated_at_ns),
         "acting_through_delegation": licence.acting_through_delegation,

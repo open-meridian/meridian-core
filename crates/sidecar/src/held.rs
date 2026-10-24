@@ -300,7 +300,8 @@ mod tests {
             "attribution_required": true,
             "attribution_text": "Source: central bank statistics",
             "copyright_class": "public_domain",
-            "no_more_restrictive_terms": true
+            "no_more_restrictive_terms": true,
+            "not_affiliated_notice": "Not affiliated with the central bank."
         });
         for with_terms in [true, false] {
             let mut licence = serde_json::json!({
@@ -346,6 +347,11 @@ mod tests {
                     CopyrightClass::Unspecified as i32
                 },
                 no_more_restrictive_terms: with_terms,
+                not_affiliated_notice: if with_terms {
+                    "Not affiliated with the central bank.".into()
+                } else {
+                    String::new()
+                },
                 ..Default::default()
             };
             let registered = PluginDeclaration {
