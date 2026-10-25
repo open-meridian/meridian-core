@@ -1052,3 +1052,30 @@ message SeriesRequestRule {
   int64 changed_at_ns = 4;
   string changed_by = 5;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Contract v28, track D: the latency remainder
+// (sdk-contract/sessions-and-data-report-their-latency-contract)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// W6.38 (rulings 515 and 517): whether an ems plugin's admin may choose
+// to warn, beside refuse, when an order is placed on a reference price past
+// its ceiling. Refuse only by default. Each change its own record.
+message SetStaleReferenceActionsPermittedRequest {
+  bool warn_permitted = 1;
+  string reason = 2;
+}
+
+// W6.38: the setting read, by an ems plugin before it places on a stale
+// reference, and by the dashboard.
+message ReadStaleReferenceActionsPermittedRequest {}
+
+// The stale-reference actions permitted in force (W6.38).
+message StaleReferenceActionsPermittedSetting {
+  // True: an ems plugin admin may choose warn; false: refuse only, and a
+  // plugin's warn is read as refuse.
+  bool warn_permitted = 1;
+  // The last change; 0 and empty for the default never changed.
+  int64 changed_at_ns = 2;
+  string changed_by = 3;
+}
