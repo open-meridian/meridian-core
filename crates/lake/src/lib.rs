@@ -44,6 +44,8 @@ mod memory;
 #[cfg(test)]
 mod chain_tests;
 #[cfg(test)]
+mod corporate_action_tests;
+#[cfg(test)]
 mod rates_tests;
 #[cfg(test)]
 mod tests;

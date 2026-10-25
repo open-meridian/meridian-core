@@ -57,6 +57,10 @@ pub const DERIVED_SERIES: &str = "meridian.v1.DerivedSeries";
 /// A scenario or a scenario set a signal plugin saved (contract v28, W12.8).
 pub const SAVED_SCENARIO: &str = "meridian.v1.SavedScenario";
 
+/// A declared corporate action, a cash dividend in v28, as its rule found
+/// it in the source (contract v28, the filings slice; W10.4).
+pub const CORPORATE_ACTION: &str = "meridian.v1.CorporateActionAnnounced";
+
 /// The scheme a futures series key names its venue in, beside the
 /// exchange's symbol (contract v28, W1.26): the ISO 10383 MIC.
 pub const MIC_SCHEME: &str = "mic";
@@ -65,8 +69,9 @@ pub const OCC_OSI_SCHEME: &str = "occ_osi";
 
 /// The lake's data types: the 1a's, the 1b's from contract v19, the 1c's
 /// outcome from contract v23, the rates slice's rate from contract v27, and
-/// from contract v28 statistics and listed series.
-pub const DATA_TYPES: [&str; 10] = [
+/// from contract v28 statistics, listed series, derived series, saved
+/// scenarios and declared corporate actions.
+pub const DATA_TYPES: [&str; 11] = [
     PRICE,
     BAR,
     TRADE,
@@ -77,6 +82,7 @@ pub const DATA_TYPES: [&str; 10] = [
     LISTED_SERIES,
     DERIVED_SERIES,
     SAVED_SCENARIO,
+    CORPORATE_ACTION,
 ];
 
 /// The data types a default read takes a priority among (W10.3): an outcome
@@ -174,6 +180,18 @@ const SAVED_SCENARIO_FIELDS: [&str; 4] = [
     "meridian.v1.SavedScenario.description",
 ];
 
+const CORPORATE_ACTION_FIELDS: [&str; 9] = [
+    "meridian.v1.CorporateActionAnnounced.meta",
+    "meridian.v1.CorporateActionAnnounced.kind",
+    "meridian.v1.CorporateActionAnnounced.amount_per_share",
+    "meridian.v1.CorporateActionAnnounced.declared_date",
+    "meridian.v1.CorporateActionAnnounced.ex_date",
+    "meridian.v1.CorporateActionAnnounced.record_date",
+    "meridian.v1.CorporateActionAnnounced.payment_date",
+    "meridian.v1.CorporateActionAnnounced.rule",
+    "meridian.v1.CorporateActionAnnounced.filing",
+];
+
 /// The dictionary entries of a data type's fields; none for one the lake
 /// does not have.
 pub fn fields_of(data_type: &str) -> &'static [&'static str] {
@@ -188,6 +206,7 @@ pub fn fields_of(data_type: &str) -> &'static [&'static str] {
         LISTED_SERIES => &LISTED_SERIES_FIELDS,
         DERIVED_SERIES => &DERIVED_SERIES_FIELDS,
         SAVED_SCENARIO => &SAVED_SCENARIO_FIELDS,
+        CORPORATE_ACTION => &CORPORATE_ACTION_FIELDS,
         _ => &[],
     }
 }
@@ -532,6 +551,47 @@ pub fn strip_outcome(
     }
     if gone(OUTCOME_FIELDS[5]) {
         outcome.determination_as_reported = None;
+    }
+    removed
+}
+
+/// [`strip_outcome`], for a declared corporate action (contract v28, the
+/// filings slice): its kind is what the row is, never stripped.
+pub fn strip_corporate_action(
+    action: &mut crate::v1::CorporateActionAnnounced,
+    allowed: &std::collections::BTreeSet<String>,
+) -> Vec<&'static str> {
+    let mut removed = Vec::new();
+    if allowed.is_empty() {
+        return removed;
+    }
+    let mut gone = |entry: &'static str| {
+        let gone = !allowed.contains(entry);
+        if gone {
+            removed.push(entry);
+        }
+        gone
+    };
+    if gone(CORPORATE_ACTION_FIELDS[2]) {
+        action.amount_per_share = None;
+    }
+    if gone(CORPORATE_ACTION_FIELDS[3]) {
+        action.declared_date.clear();
+    }
+    if gone(CORPORATE_ACTION_FIELDS[4]) {
+        action.ex_date.clear();
+    }
+    if gone(CORPORATE_ACTION_FIELDS[5]) {
+        action.record_date.clear();
+    }
+    if gone(CORPORATE_ACTION_FIELDS[6]) {
+        action.payment_date.clear();
+    }
+    if gone(CORPORATE_ACTION_FIELDS[7]) {
+        action.rule = None;
+    }
+    if gone(CORPORATE_ACTION_FIELDS[8]) {
+        action.filing = None;
     }
     removed
 }

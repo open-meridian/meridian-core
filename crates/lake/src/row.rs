@@ -1,15 +1,16 @@
 //! One row of the lake under its envelope: a price or a bar (the 1a), a trade
 //! or a quote (the 1b, contract v19), an event contract's outcome (the 1c,
 //! contract v23), a rate (contract v27, the rates slice), a statistic and a
-//! listed series (contract v28).
+//! listed series, a derived series, a saved scenario and a declared corporate
+//! action (contract v28).
 
 use std::collections::BTreeSet;
 
 use meridian_domain::exact::Exact;
 use meridian_domain::lake;
 use meridian_domain::v1::{
-    Bar, DerivedSeries, ExecutionCost, ListedSeries, Money, ObservationMeta, Outcome, Price, Quote,
-    Rate, SavedScenario, Statistic, Trade,
+    Bar, CorporateActionAnnounced, DerivedSeries, ExecutionCost, ListedSeries, Money,
+    ObservationMeta, Outcome, Price, Quote, Rate, SavedScenario, Statistic, Trade,
 };
 use meridian_pb::v1::Decimal;
 use prost::Message;
@@ -36,6 +37,8 @@ pub enum DataType {
     Derived,
     /// Contract v28 (W12.8): a saved scenario or scenario set.
     Scenario,
+    /// Contract v28, the filings slice (W10.4): a declared cash dividend.
+    CorporateAction,
 }
 
 impl DataType {
@@ -54,6 +57,7 @@ impl DataType {
             lake::LISTED_SERIES => Some(DataType::Series),
             lake::DERIVED_SERIES => Some(DataType::Derived),
             lake::SAVED_SCENARIO => Some(DataType::Scenario),
+            lake::CORPORATE_ACTION => Some(DataType::CorporateAction),
             _ => None,
         }
     }
@@ -71,6 +75,7 @@ impl DataType {
             DataType::Series => lake::LISTED_SERIES,
             DataType::Derived => lake::DERIVED_SERIES,
             DataType::Scenario => lake::SAVED_SCENARIO,
+            DataType::CorporateAction => lake::CORPORATE_ACTION,
         }
     }
 
@@ -87,6 +92,7 @@ impl DataType {
             DataType::Series => 9,
             DataType::Derived => 10,
             DataType::Scenario => 11,
+            DataType::CorporateAction => 12,
         }
     }
 
@@ -103,6 +109,7 @@ impl DataType {
             9 => Some(DataType::Series),
             10 => Some(DataType::Derived),
             11 => Some(DataType::Scenario),
+            12 => Some(DataType::CorporateAction),
             _ => None,
         }
     }
@@ -149,6 +156,7 @@ pub enum Observation {
     Series(ListedSeries),
     Derived(DerivedSeries),
     Scenario(SavedScenario),
+    CorporateAction(CorporateActionAnnounced),
 }
 
 impl Observation {
@@ -165,6 +173,7 @@ impl Observation {
             Observation::Series(_) => DataType::Series,
             Observation::Derived(_) => DataType::Derived,
             Observation::Scenario(_) => DataType::Scenario,
+            Observation::CorporateAction(_) => DataType::CorporateAction,
         }
     }
 
@@ -182,6 +191,7 @@ impl Observation {
             Observation::Series(series) => series.meta.as_ref(),
             Observation::Derived(value) => value.meta.as_ref(),
             Observation::Scenario(saved) => saved.meta.as_ref(),
+            Observation::CorporateAction(action) => action.meta.as_ref(),
         };
         meta.unwrap_or_else(|| NONE.get_or_init(ObservationMeta::default))
     }
@@ -201,17 +211,31 @@ impl Observation {
             Observation::Series(series) => series.meta.get_or_insert_with(Default::default),
             Observation::Derived(value) => value.meta.get_or_insert_with(Default::default),
             Observation::Scenario(saved) => saved.meta.get_or_insert_with(Default::default),
+            Observation::CorporateAction(action) => {
+                action.meta.get_or_insert_with(Default::default)
+            }
         }
     }
 
     /// A price's kind, or from contract v27 a rate's, from contract v28 a
-    /// statistic's; 0 for the other data types.
+    /// statistic's and a corporate action's; 0 for the other data types.
     pub fn kind(&self) -> i32 {
         match self {
             Observation::Price(price) => price.kind,
             Observation::Rate(rate) => rate.kind,
             Observation::Statistic(statistic) => statistic.kind,
+            Observation::CorporateAction(action) => action.kind,
             _ => 0,
+        }
+    }
+
+    /// The date a read by dates is on (contract v28, W10.6): its business
+    /// date, or for a corporate action its kind's date -- a cash dividend's
+    /// ex-date, the date a holder's entitlement turns on.
+    pub fn date(&self) -> &str {
+        match self {
+            Observation::CorporateAction(action) => &action.ex_date,
+            _ => &self.meta().business_date,
         }
     }
 
@@ -279,7 +303,9 @@ impl Observation {
             | Observation::Statistic(_)
             | Observation::Series(_)
             | Observation::Derived(_)
-            | Observation::Scenario(_) => String::new(),
+            | Observation::Scenario(_)
+            // Never conflated nor chosen per asset (contract v28, W10.5).
+            | Observation::CorporateAction(_) => String::new(),
         }
     }
 
@@ -329,6 +355,7 @@ impl Observation {
             Observation::Series(series) => series.encode_to_vec(),
             Observation::Derived(value) => value.encode_to_vec(),
             Observation::Scenario(saved) => saved.encode_to_vec(),
+            Observation::CorporateAction(action) => action.encode_to_vec(),
         }
     }
 
@@ -345,6 +372,9 @@ impl Observation {
             DataType::Series => Observation::Series(ListedSeries::decode(bytes)?),
             DataType::Derived => Observation::Derived(DerivedSeries::decode(bytes)?),
             DataType::Scenario => Observation::Scenario(SavedScenario::decode(bytes)?),
+            DataType::CorporateAction => {
+                Observation::CorporateAction(CorporateActionAnnounced::decode(bytes)?)
+            }
         })
     }
 
@@ -423,6 +453,11 @@ impl Observation {
                 .volume
                 .as_mut()
                 .map(|m| vec![("volume", m)])
+                .unwrap_or_default(),
+            Observation::CorporateAction(action) => action
+                .amount_per_share
+                .as_mut()
+                .map(|m| vec![("amount_per_share", m)])
                 .unwrap_or_default(),
             Observation::Statistic(_)
             | Observation::Series(_)
@@ -581,6 +616,23 @@ impl Observation {
                     && a.scenario_set == b.scenario_set
                     && a.description == b.description
             }
+            (Observation::CorporateAction(a), Observation::CorporateAction(b)) => {
+                a.kind == b.kind
+                    && same_money(&a.amount_per_share, &b.amount_per_share)
+                    && (
+                        &a.declared_date,
+                        &a.ex_date,
+                        &a.record_date,
+                        &a.payment_date,
+                    ) == (
+                        &b.declared_date,
+                        &b.ex_date,
+                        &b.record_date,
+                        &b.payment_date,
+                    )
+                    && a.rule == b.rule
+                    && a.filing == b.filing
+            }
             _ => false,
         }
     }
@@ -603,6 +655,7 @@ impl Observation {
             Observation::Series(series) => lake::strip_series(series, allowed),
             // A signal plugin's own rows, read whole by whoever reads them.
             Observation::Derived(_) | Observation::Scenario(_) => Vec::new(),
+            Observation::CorporateAction(action) => lake::strip_corporate_action(action, allowed),
         }
     }
 }

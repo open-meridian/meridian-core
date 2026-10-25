@@ -114,7 +114,8 @@ fn keep_named(row: &mut Observation, named: &BTreeSet<String>) {
         | Observation::Statistic(_)
         | Observation::Series(_)
         | Observation::Derived(_)
-        | Observation::Scenario(_) => {}
+        | Observation::Scenario(_)
+        | Observation::CorporateAction(_) => {}
     }
 }
 
@@ -436,7 +437,8 @@ impl Lake {
                 | Observation::Statistic(_)
                 | Observation::Series(_)
                 | Observation::Derived(_)
-                | Observation::Scenario(_) => {}
+                | Observation::Scenario(_)
+                | Observation::CorporateAction(_) => {}
             }
         }
         Ok(reply)

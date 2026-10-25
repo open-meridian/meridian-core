@@ -28,11 +28,12 @@ use std::sync::{Arc, RwLock};
 
 use meridian_bus::Bus;
 use meridian_domain::v1::{
-    AgeHop, BarsRecordedEvent, EntitlementsChangedEvent, ListBarsRequest, ListPricesRequest,
-    ListRatesRequest, LivenessRecordedEvent, ObservationMeta, ObservationsWantedEvent,
-    OutcomesRecordedEvent, PricesRecordedEvent, QuotesRecordedEvent, RatesRecordedEvent,
-    RecordBarsRequest, RecordPricesRequest, RecordQuotesRequest, RecordRatesRequest,
-    RecordTradesRequest, StatisticsRecordedEvent, TradesRecordedEvent, WantWithdrawnEvent,
+    AgeHop, BarsRecordedEvent, CorporateActionsRecordedEvent, EntitlementsChangedEvent,
+    ListBarsRequest, ListPricesRequest, ListRatesRequest, LivenessRecordedEvent, ObservationMeta,
+    ObservationsWantedEvent, OutcomesRecordedEvent, PricesRecordedEvent, QuotesRecordedEvent,
+    RatesRecordedEvent, RecordBarsRequest, RecordPricesRequest, RecordQuotesRequest,
+    RecordRatesRequest, RecordTradesRequest, StatisticsRecordedEvent, TradesRecordedEvent,
+    WantWithdrawnEvent,
 };
 use prost::Message;
 use tokio::sync::watch;
@@ -245,6 +246,21 @@ pub(crate) fn said(payload_type: &str, payload: &[u8]) -> Option<Said> {
                 is_want: false,
             })
         }
+        // Every declared corporate action, never conflated (contract v28,
+        // W10.5): narrowed to the subjects a receive names, the security's
+        // or its issuer's.
+        "meridian.v1.CorporateActionsRecordedEvent" => {
+            let action = CorporateActionsRecordedEvent::decode(payload)
+                .ok()?
+                .action?;
+            let (dataset, subjects, _) = meta_said(action.meta.as_ref());
+            Some(Said {
+                key: None,
+                dataset,
+                subjects,
+                is_want: false,
+            })
+        }
         // Every version of an outcome, never conflated (contract v23).
         "meridian.v1.OutcomesRecordedEvent" => {
             let outcome = OutcomesRecordedEvent::decode(payload).ok()?.outcome?;
@@ -404,6 +420,17 @@ pub(crate) fn stripped(payload_type: &str, payload: &[u8], allowed: &BTreeSet<St
             }
             Err(_) => payload.to_vec(),
         },
+        "meridian.v1.CorporateActionsRecordedEvent" => {
+            match CorporateActionsRecordedEvent::decode(payload) {
+                Ok(mut event) => {
+                    if let Some(action) = event.action.as_mut() {
+                        meridian_domain::lake::strip_corporate_action(action, allowed);
+                    }
+                    event.encode_to_vec()
+                }
+                Err(_) => payload.to_vec(),
+            }
+        }
         "meridian.v1.StatisticsRecordedEvent" => match StatisticsRecordedEvent::decode(payload) {
             Ok(mut event) => {
                 if let Some(statistic) = event.statistic.as_mut() {
@@ -554,6 +581,63 @@ mod tests {
             ..Default::default()
         };
         assert!(dates_refused("meridian.v1.ListPricesRequest", &read.encode_to_vec()).is_none());
+    }
+
+    #[test]
+    fn a_corporate_action_is_never_conflated_heard_by_either_subject_and_stripped() {
+        // Contract v28, the filings slice (W10.5).
+        use meridian_domain::v1::{CorporateActionAnnounced, Money, ObservationMeta};
+        let event = CorporateActionsRecordedEvent {
+            action: Some(CorporateActionAnnounced {
+                meta: Some(ObservationMeta {
+                    subjects: vec![
+                        SubjectRef {
+                            entity_id: "INS-AAPL".into(),
+                            ..Default::default()
+                        },
+                        SubjectRef {
+                            entity_id: "ENT-APPLE".into(),
+                            role: meridian_domain::v1::SubjectRole::Issuer as i32,
+                        },
+                    ],
+                    source: Some(Source {
+                        dataset: "sec-edgar-1:dividends".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                kind: 1,
+                amount_per_share: Some(Money::default()),
+                ex_date: "2026-11-10".into(),
+                ..Default::default()
+            }),
+        }
+        .encode_to_vec();
+        let heard = said("meridian.v1.CorporateActionsRecordedEvent", &event).unwrap();
+        assert_eq!(heard.key, None, "every version delivered");
+        assert_eq!(heard.dataset, "sec-edgar-1:dividends");
+        assert_eq!(heard.subjects, vec!["INS-AAPL", "ENT-APPLE"]);
+        let allowed: BTreeSet<String> = [
+            "meridian.v1.CorporateActionAnnounced.meta",
+            "meridian.v1.CorporateActionAnnounced.kind",
+            "meridian.v1.CorporateActionAnnounced.ex_date",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let kept = CorporateActionsRecordedEvent::decode(
+            &stripped(
+                "meridian.v1.CorporateActionsRecordedEvent",
+                &event,
+                &allowed,
+            )[..],
+        )
+        .unwrap()
+        .action
+        .unwrap();
+        assert!(kept.amount_per_share.is_none());
+        assert_eq!(kept.ex_date, "2026-11-10");
+        assert_eq!(kept.kind, 1);
     }
 
     #[test]

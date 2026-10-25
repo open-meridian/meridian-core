@@ -55,8 +55,13 @@ use meridian_domain::v1::{
     UnansweredReason, WantWithdrawnEvent, Watermark,
 };
 use meridian_domain::v1::{
+    CorporateActionKind, CorporateActionsRecordedEvent, ListCorporateActionsReply,
+    ListCorporateActionsRequest, RecordCorporateActionsRequest, ResolveCompanyRequest,
+};
+use meridian_domain::v1::{
     ListSeriesReply, ListSeriesRequest, ListStatisticsReply, ListStatisticsRequest,
     RecordSeriesRequest, RecordStatisticsRequest, StatisticKind, StatisticsRecordedEvent,
+    SubjectRole,
 };
 use meridian_pb::bounds;
 use prost::Message;
@@ -89,6 +94,12 @@ pub const RECORD_DERIVED_SERIES: &str = "platform.lake.command.record-derived-se
 pub const LIST_DERIVED_SERIES: &str = "platform.lake.query.list-derived-series";
 pub const RECORD_SCENARIOS: &str = "platform.lake.command.record-scenarios";
 pub const LIST_SCENARIOS: &str = "platform.lake.query.list-scenarios";
+/// Contract v28, the filings slice (W10.4, W10.6): declared corporate
+/// actions, a cash dividend in v28.
+pub const RECORD_CORPORATE_ACTIONS: &str = "platform.lake.command.record-corporate-actions";
+pub const LIST_CORPORATE_ACTIONS: &str = "platform.lake.query.list-corporate-actions";
+/// A company subject's record (contract v28, W3.32): asked by its `ENT-` ID.
+pub const RESOLVE_COMPANY: &str = "platform.reference.query.resolve-company";
 pub const DECLINE_WANT: &str = "platform.lake.command.decline-want";
 pub const SET_SOURCE_PRIORITY: &str = "platform.lake.command.set-source-priority";
 pub const LIST_PRICES: &str = "platform.lake.query.list-prices";
@@ -117,6 +128,9 @@ pub const READ_CALENDAR: &str = "platform.reference.query.read-calendar";
 /// A calendar's new version, heard to re-check the flag (W3.17, W10.4).
 pub const CALENDAR_APPLIED: &str = "platform.reference.event.calendar-applied";
 
+/// A company's platform ID begins with this (contract v28, ruling 594).
+const COMPANY_PREFIX: &str = "ENT-";
+
 /// A dataset's subject for a data type's recorded rows.
 pub fn recorded_topic(dataset: &str, data_type: DataType) -> String {
     match data_type {
@@ -129,6 +143,10 @@ pub fn recorded_topic(dataset: &str, data_type: DataType) -> String {
         // Contract v28 (W10.5): conflated per subject, series key, kind and
         // business date.
         DataType::Statistic => format!("platform.lake.{dataset}.event.statistics-recorded"),
+        // Contract v28, the filings slice (W10.5): never conflated.
+        DataType::CorporateAction => {
+            format!("platform.lake.{dataset}.event.corporate-actions-recorded")
+        }
         // Never published: read within each reader's account scope (W10.11);
         // a listed series is read when a chain is built (contract v28, W10.5).
         // A signal plugin's derived values and saved scenarios are read,
@@ -338,6 +356,49 @@ impl Lake {
     /// remembered once it does.
     fn subject_held(&self, entity: &str) -> Result<bool, String> {
         Ok(self.subject_record(entity)?.is_some())
+    }
+
+    /// Whether the instrument store holds a company by its `ENT-` ID
+    /// (contract v28, W3.32), remembered once it does: its refusal is a
+    /// company it does not hold; no answer in time records nothing.
+    fn company_held(&self, entity: &str) -> Result<bool, String> {
+        if self
+            .held
+            .lock()
+            .expect("held poisoned")
+            .contains_key(entity)
+        {
+            return Ok(true);
+        }
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| "the lake has no runtime to ask on".to_string())?;
+        let asked = handle.block_on(
+            self.bus.call(
+                RESOLVE_COMPANY,
+                "meridian.v1.ResolveCompanyRequest",
+                ResolveCompanyRequest {
+                    company_id: entity.to_string(),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+                None,
+                Some(ASKING),
+            ),
+        );
+        match asked {
+            Ok(_) => {
+                self.held
+                    .lock()
+                    .expect("held poisoned")
+                    .insert(entity.to_string(), (0, 0));
+                Ok(true)
+            }
+            Err(meridian_bus::BusError::HandlerFailed { .. }) => Ok(false),
+            Err(failed) => Err(format!(
+                "the instrument store did not say whether it holds {entity}, and nothing was \
+                 recorded: {failed}"
+            )),
+        }
     }
 
     /// The asset class and type of the record the instrument store holds
@@ -821,11 +882,49 @@ impl Lake {
                     meta.subjects.len()
                 ));
             }
+            // A declared corporate action's subject is the security, the
+            // company its issuer where stated (contract v28, W10.4): a
+            // company by its platform record, in that role alone.
+            if data_type == DataType::CorporateAction
+                && !meta
+                    .subjects
+                    .iter()
+                    .any(|subject| !subject.entity_id.starts_with(COMPANY_PREFIX))
+            {
+                return Err(format!(
+                    "{at}.meta.subjects names no security: a corporate action's subject is the \
+                     security, its issuer beside it where stated"
+                ));
+            }
             for (j, subject) in meta.subjects.iter().enumerate() {
                 if !(1..=64).contains(&subject.entity_id.chars().count()) {
                     return Err(format!(
                         "{at}.meta.subjects[{j}].entity_id is 1 to 64 characters"
                     ));
+                }
+                if subject.entity_id.starts_with(COMPANY_PREFIX) {
+                    if data_type != DataType::CorporateAction {
+                        return Err(format!(
+                            "{at}.meta.subjects[{j}].entity_id {:?}: a company is no subject of \
+                             {}",
+                            subject.entity_id,
+                            data_type.name()
+                        ));
+                    }
+                    if subject.role != SubjectRole::Issuer as i32 {
+                        return Err(format!(
+                            "{at}.meta.subjects[{j}].role: a company names a corporate action's \
+                             issuer, SUBJECT_ROLE_ISSUER"
+                        ));
+                    }
+                    if !self.company_held(&subject.entity_id)? {
+                        return Err(format!(
+                            "{at}.meta.subjects[{j}].entity_id {:?} is no company the deployment \
+                             holds; resolve it (W3.32) first",
+                            subject.entity_id
+                        ));
+                    }
+                    continue;
                 }
                 let Some((class, kind)) = self.subject_record(&subject.entity_id)? else {
                     return Err(format!(
@@ -884,6 +983,7 @@ impl Lake {
                     match data_type {
                         DataType::Trade => "a trade",
                         DataType::Quote => "a quote",
+                        DataType::CorporateAction => "a corporate action, dated by its own fields,",
                         _ => "an outcome",
                     }
                 ));
@@ -976,6 +1076,7 @@ impl Lake {
                 Observation::Series(series) => series_refused(&at, series)?,
                 Observation::Derived(value) => derived_refused(&at, value)?,
                 Observation::Scenario(saved) => self.scenario_refused(&at, saved)?,
+                Observation::CorporateAction(action) => corporate_action_refused(&at, action)?,
                 _ => {}
             }
             if let Observation::Bar(bar) = &row {
@@ -1024,6 +1125,7 @@ impl Lake {
             "series" => bounds::RECORD_SERIES_REQUEST_SERIES_COUNT,
             "values" => bounds::RECORD_DERIVED_SERIES_REQUEST_VALUES_COUNT,
             "scenarios" => bounds::RECORD_SCENARIOS_REQUEST_SCENARIOS_COUNT,
+            "actions" => bounds::RECORD_CORPORATE_ACTIONS_REQUEST_ACTIONS_COUNT,
             _ => bounds::RECORD_BARS_REQUEST_BARS_COUNT,
         };
         if !bound.admits(rows.len()) {
@@ -1477,6 +1579,15 @@ impl Lake {
             | Observation::Series(_)
             | Observation::Derived(_)
             | Observation::Scenario(_) => return,
+            // Every version, never conflated (contract v28, W10.5): an
+            // announcement is an event, not a value in force.
+            Observation::CorporateAction(action) => (
+                "meridian.v1.CorporateActionsRecordedEvent",
+                CorporateActionsRecordedEvent {
+                    action: Some(action.clone()),
+                }
+                .encode_to_vec(),
+            ),
             Observation::Statistic(statistic) => (
                 "meridian.v1.StatisticsRecordedEvent",
                 StatisticsRecordedEvent {
@@ -1896,6 +2007,30 @@ impl Lake {
             DataType::Series => When::Latest { at_ns: 0 },
             // A saved scenario (contract v28) is read by ListScenarios.
             DataType::Scenario => return Err("a saved scenario is read by ListScenarios".into()),
+            // A declared corporate action (contract v28, W10.6): every row
+            // key's version in force, narrowed by its kind's date; or the
+            // versions recorded after a watermark, whatever their dates.
+            DataType::CorporateAction => match after {
+                Some(watermark) => {
+                    let mut at: BTreeMap<String, u64> = BTreeMap::new();
+                    for (i, partition) in watermark.partitions.iter().enumerate() {
+                        if at
+                            .insert(partition.partition.clone(), partition.sequence)
+                            .is_some()
+                        {
+                            return Err(format!(
+                                "after_watermark.partitions[{i}] {:?} is named twice",
+                                partition.partition
+                            ));
+                        }
+                    }
+                    When::After(at)
+                }
+                None => When::Range {
+                    from_ns: 1,
+                    until_ns: 0,
+                },
+            },
             // A rate is read as a price is (contract v27, W10.6); and a
             // statistic (contract v28).
             DataType::Price
@@ -2012,6 +2147,13 @@ impl Lake {
             series_keys: request.series_keys,
             all_series: request.all_series,
             dates: request.dates,
+            // A subject asked in a role (contract v28, W10.6).
+            roles: request
+                .subjects
+                .iter()
+                .filter(|s| s.role != SubjectRole::Unspecified as i32)
+                .map(|s| (s.entity_id.clone(), s.role))
+                .collect(),
         };
         let answered = read::answer(
             self.store.as_ref(),
@@ -2451,6 +2593,98 @@ impl Lake {
         })
     }
 
+    /// W10.6, contract v28 (the filings slice): the declared corporate
+    /// actions of 1 to 64 subjects -- a security, or its issuer as a company
+    /// in the role asked -- by kind and a range of the kind's date (a cash
+    /// dividend's ex-date), point in time by recorded time or by what the
+    /// source had published; or the versions recorded after a watermark,
+    /// whatever their dates, which is how a reader that lost some catches up
+    /// (ruling 598).
+    pub(crate) fn list_corporate_actions(
+        &self,
+        request: ListCorporateActionsRequest,
+        envelope: &Envelope,
+    ) -> Result<ListCorporateActionsReply, String> {
+        if !bounds::LIST_CORPORATE_ACTIONS_REQUEST_SUBJECTS_COUNT.admits(request.subjects.len()) {
+            return Err(format!(
+                "subjects names {}; 1 to 64",
+                request.subjects.len()
+            ));
+        }
+        for (i, kind) in request.kinds.iter().enumerate() {
+            if CorporateActionKind::try_from(*kind).unwrap_or(CorporateActionKind::Unspecified)
+                == CorporateActionKind::Unspecified
+            {
+                return Err(format!("kinds[{i}] is unspecified"));
+            }
+        }
+        let caught_up = request
+            .after_watermark
+            .as_ref()
+            .is_some_and(|watermark| !watermark.partitions.is_empty());
+        let ranged = !request.from_date.is_empty() || !request.to_date.is_empty();
+        if caught_up && ranged {
+            return Err(
+                "after_watermark and from_date or to_date: a catch-up reads whatever the dates"
+                    .into(),
+            );
+        }
+        let dates = if ranged {
+            let from = meridian_domain::date::optional("from_date", &request.from_date)?
+                .unwrap_or(Date::of_utc_instant(0));
+            let to = match meridian_domain::date::optional("to_date", &request.to_date)? {
+                Some(to) => to,
+                None => Date::from_ymd(9999, 12, 31).expect("the last day"),
+            };
+            if to < from {
+                return Err("to_date is on or after from_date".into());
+            }
+            Some((from, to))
+        } else {
+            None
+        };
+        if request.published_as_of_ns < 0 {
+            return Err("published_as_of_ns is never negative".into());
+        }
+        let answer = self.read(
+            ReadRequest {
+                data_type: DataType::CorporateAction,
+                subjects: request.subjects,
+                kinds: request.kinds,
+                interval_ns: 0,
+                sources: request.sources,
+                at_ns: 0,
+                business_date: String::new(),
+                valid_from_ns: 0,
+                valid_until_ns: 0,
+                as_of_ns: request.as_of_ns,
+                page_size: request.page_size,
+                cursor: request.cursor,
+                after: request.after_watermark,
+                tenors: Vec::new(),
+                published_as_of_ns: request.published_as_of_ns,
+                series_keys: Vec::new(),
+                all_series: false,
+                dates,
+            },
+            envelope,
+        )?;
+        Ok(ListCorporateActionsReply {
+            actions: answer
+                .rows
+                .into_iter()
+                .filter_map(|r| match r {
+                    Observation::CorporateAction(action) => Some(action),
+                    _ => None,
+                })
+                .collect(),
+            unanswered: answer.unanswered,
+            datasets: answer.datasets,
+            watermark: Some(answer.watermark),
+            next_cursor: answer.next_cursor,
+        })
+    }
+
     pub(crate) fn latest_recorded(
         &self,
         request: &ListTradesRequest,
@@ -2647,6 +2881,7 @@ impl Lake {
             series_keys: Vec::new(),
             all_series: false,
             dates: None,
+            roles: Vec::new(),
         };
         let answered = read::answer(
             self.store.as_ref(),
@@ -3087,6 +3322,69 @@ fn statistic_refused(at: &str, statistic: &meridian_domain::v1::Statistic) -> Re
 /// A derived value held to W10.4 (contract v28, track B): its series named,
 /// its value stated, its rule a definition and version, and the datasets it
 /// was derived from.
+/// A declared corporate action held to W10.4 (contract v28, the filings
+/// slice): its kind stated; a cash dividend's amount per share and each of
+/// its four dates, a plain date, as the rule found them -- the plugin never
+/// infers one (FDP Q12); the rule named; the filing's accession and form
+/// where it names one.
+fn corporate_action_refused(
+    at: &str,
+    action: &meridian_domain::v1::CorporateActionAnnounced,
+) -> Result<(), String> {
+    let kind =
+        CorporateActionKind::try_from(action.kind).unwrap_or(CorporateActionKind::Unspecified);
+    if kind == CorporateActionKind::Unspecified {
+        return Err(format!("{at}.kind is unspecified"));
+    }
+    if kind == CorporateActionKind::CashDividend {
+        if action
+            .amount_per_share
+            .as_ref()
+            .and_then(|m| m.amount.as_ref())
+            .is_none()
+        {
+            return Err(format!(
+                "{at}.amount_per_share is required on a cash dividend, as declared"
+            ));
+        }
+        for (name, date) in [
+            ("declared_date", &action.declared_date),
+            ("ex_date", &action.ex_date),
+            ("record_date", &action.record_date),
+            ("payment_date", &action.payment_date),
+        ] {
+            if date.is_empty() {
+                return Err(format!(
+                    "{at}.{name} is required: a row is recorded only where the rule finds it"
+                ));
+            }
+            meridian_domain::date::optional(&format!("{at}.{name}"), date)?;
+        }
+    }
+    let rule = action.rule.clone().unwrap_or_default();
+    if rule.definition.trim().is_empty() || rule.version < 1 {
+        return Err(format!(
+            "{at}.rule is required: the definition that found it and its version, from 1"
+        ));
+    }
+    if let Some(filing) = &action.filing {
+        if !bounds::FILING_REF_ACCESSION_NUMBER_LENGTH
+            .admits(filing.accession_number.chars().count())
+            || filing.accession_number.trim().is_empty()
+        {
+            return Err(format!(
+                "{at}.filing.accession_number is 1 to 32 characters"
+            ));
+        }
+        if !bounds::FILING_REF_FORM_LENGTH.admits(filing.form.chars().count())
+            || filing.form.trim().is_empty()
+        {
+            return Err(format!("{at}.filing.form is 1 to 32 characters"));
+        }
+    }
+    Ok(())
+}
+
 fn derived_refused(at: &str, value: &meridian_domain::v1::DerivedSeries) -> Result<(), String> {
     if !bounds::DERIVED_SERIES_SERIES_LENGTH.admits(value.series.chars().count()) {
         return Err(format!("{at}.series is 1 to 64 characters"));
@@ -3550,6 +3848,41 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
             "meridian.v1.ListStatisticsReply",
         ),
         |lake, request: ListStatisticsRequest, envelope| lake.list_statistics(request, envelope),
+    );
+    // Contract v28, the filings slice (W10.4 to W10.6): declared corporate
+    // actions, published unconflated and read by subject, kind and date.
+    serve_on(
+        &bus,
+        &lake,
+        RECORD_CORPORATE_ACTIONS,
+        (
+            "meridian.v1.RecordCorporateActionsRequest",
+            "meridian.v1.RecordObservationsReply",
+        ),
+        |lake, request: RecordCorporateActionsRequest, envelope| {
+            lake.record(
+                "actions",
+                request
+                    .actions
+                    .into_iter()
+                    .map(Observation::CorporateAction)
+                    .collect(),
+                &request.want_id,
+                envelope,
+            )
+        },
+    );
+    serve_on(
+        &bus,
+        &lake,
+        LIST_CORPORATE_ACTIONS,
+        (
+            "meridian.v1.ListCorporateActionsRequest",
+            "meridian.v1.ListCorporateActionsReply",
+        ),
+        |lake, request: ListCorporateActionsRequest, envelope| {
+            lake.list_corporate_actions(request, envelope)
+        },
     );
     // Contract v28, track B (W10.4, W10.6, W12.8): a signal plugin's
     // derived series and saved scenarios.

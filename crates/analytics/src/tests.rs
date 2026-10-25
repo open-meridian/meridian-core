@@ -1064,6 +1064,15 @@ fn par(count: i32, unit: TenorUnit, percent: &str) -> Rate {
 }
 
 fn chain_stores_with(curve_held: bool) -> Stores {
+    chain_stores_paying(curve_held, Vec::new())
+}
+
+/// The chain's stores, the lake holding these declared dividends of the
+/// underlying (contract v28, the filings slice; W10.6).
+fn chain_stores_paying(
+    curve_held: bool,
+    dividends: Vec<meridian_domain::v1::CorporateActionAnnounced>,
+) -> Stores {
     let stores = stores();
     serve_store(
         &stores,
@@ -1155,7 +1164,13 @@ fn chain_stores_with(curve_held: bool) -> Stores {
         &stores,
         topics::LIST_CORPORATE_ACTIONS,
         "meridian.v1.ListCorporateActionsReply",
-        |_request: ListCorporateActionsRequest| ListCorporateActionsReply::default(),
+        move |request: ListCorporateActionsRequest| {
+            assert_eq!(request.subjects[0].entity_id, AAPL);
+            ListCorporateActionsReply {
+                actions: dividends.clone(),
+                ..Default::default()
+            }
+        },
     );
     serve_store(
         &stores,
@@ -1390,4 +1405,87 @@ async fn a_chain_reads_treasurys_curve_by_its_symbol_and_none_held_is_not_evalua
             }));
         }
     }
+}
+
+/// A declared cash dividend of the underlying, as the lake answers it.
+fn declared(ex_date: &str, amount: &str) -> meridian_domain::v1::CorporateActionAnnounced {
+    meridian_domain::v1::CorporateActionAnnounced {
+        meta: Some(ObservationMeta {
+            row_key: format!("dividend:{ex_date}"),
+            subjects: vec![SubjectRef {
+                entity_id: AAPL.into(),
+                ..Default::default()
+            }],
+            source: Some(Source {
+                dataset: "sec-edgar-1:dividends".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        kind: meridian_domain::v1::CorporateActionKind::CashDividend as i32,
+        amount_per_share: money(amount, USD, "USD"),
+        declared_date: "2026-10-01".into(),
+        ex_date: ex_date.into(),
+        record_date: ex_date.into(),
+        payment_date: "2026-11-27".into(),
+        ..Default::default()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dividend_going_ex_the_day_before_expiry_moves_an_american_calls_price() {
+    // Contract v28 (W12.2; the filings slice's rows, read tolerantly since
+    // pass 2): the tree takes the lake's declared dividends, escrowed, and
+    // an American call worth exercising before the ex-date is priced so.
+    // The same quotes then solve to another implied volatility: the
+    // model's price at any one volatility moved. Which way is the chain's
+    // to say, since the forward and borrow come from put-call parity with
+    // the dividends' present value taken out (ruling 608).
+    let iv_of = |dividends: Vec<meridian_domain::v1::CorporateActionAnnounced>| async move {
+        let stores = chain_stores_paying(true, dividends);
+        coordinator(&stores, Config::default(), false);
+        let mut request = job(&[("implied_volatility", &["series", "quote_side"], "")]);
+        let asked = request.job.as_mut().unwrap();
+        asked.account_ids.clear();
+        asked.chains = vec![ChainRef {
+            underlying_instrument_id: AAPL.into(),
+            expiration_from: "2026-11-20".into(),
+            expiration_to: "2026-11-20".into(),
+            series_keys: Vec::new(),
+        }];
+        let reply: RunJobReply = ask_as(
+            &stores.bus,
+            topics::RUN_JOB,
+            "meridian.v1.RunJobRequest",
+            request,
+            &[],
+        )
+        .await
+        .unwrap();
+        let answer = reply.answer.unwrap();
+        let mid = answer
+            .figures
+            .iter()
+            .find(|f| {
+                f.series_key.first().is_some_and(|k| k.value == OSI_CALL)
+                    && f.breakdown.iter().any(|b| b.value == "mid")
+            })
+            .unwrap_or_else(|| panic!("{:?}", answer.not_evaluated));
+        let iv: f64 = Exact::from_wire(mid.value.as_ref().unwrap())
+            .unwrap()
+            .to_string()
+            .parse()
+            .unwrap();
+        (iv, answer.provenance.unwrap().datasets)
+    };
+    let (none, _) = iv_of(Vec::new()).await;
+    let (paying, datasets) = iv_of(vec![declared("2026-11-19", "3.00")]).await;
+    assert!(
+        (paying - none).abs() > 1e-4,
+        "the dividend moved nothing: {none} and {paying}"
+    );
+    assert!(datasets.contains(&"sec-edgar-1:dividends".to_string()));
+    // Going ex after expiry, it is no dividend of this option's.
+    let (after, _) = iv_of(vec![declared("2026-11-23", "3.00")]).await;
+    assert!((after - none).abs() < 1e-9, "{none} and {after}");
 }
