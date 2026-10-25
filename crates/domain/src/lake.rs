@@ -51,6 +51,12 @@ pub const STATISTIC: &str = "meridian.v1.Statistic";
 /// (contract v28, ruling 561; W10.4).
 pub const LISTED_SERIES: &str = "meridian.v1.ListedSeries";
 
+/// One value of a signal plugin's own series, naming its rule and inputs
+/// (contract v28, track B; W10.4).
+pub const DERIVED_SERIES: &str = "meridian.v1.DerivedSeries";
+/// A scenario or a scenario set a signal plugin saved (contract v28, W12.8).
+pub const SAVED_SCENARIO: &str = "meridian.v1.SavedScenario";
+
 /// The scheme a futures series key names its venue in, beside the
 /// exchange's symbol (contract v28, W1.26): the ISO 10383 MIC.
 pub const MIC_SCHEME: &str = "mic";
@@ -60,7 +66,7 @@ pub const OCC_OSI_SCHEME: &str = "occ_osi";
 /// The lake's data types: the 1a's, the 1b's from contract v19, the 1c's
 /// outcome from contract v23, the rates slice's rate from contract v27, and
 /// from contract v28 statistics and listed series.
-pub const DATA_TYPES: [&str; 8] = [
+pub const DATA_TYPES: [&str; 10] = [
     PRICE,
     BAR,
     TRADE,
@@ -69,6 +75,8 @@ pub const DATA_TYPES: [&str; 8] = [
     RATE,
     STATISTIC,
     LISTED_SERIES,
+    DERIVED_SERIES,
+    SAVED_SCENARIO,
 ];
 
 /// The data types a default read takes a priority among (W10.3): an outcome
@@ -151,6 +159,21 @@ const LISTED_SERIES_FIELDS: [&str; 5] = [
     "meridian.v1.ListedSeries.instrument_id",
 ];
 
+const DERIVED_SERIES_FIELDS: [&str; 5] = [
+    "meridian.v1.DerivedSeries.meta",
+    "meridian.v1.DerivedSeries.series",
+    "meridian.v1.DerivedSeries.value",
+    "meridian.v1.DerivedSeries.rule",
+    "meridian.v1.DerivedSeries.inputs",
+];
+
+const SAVED_SCENARIO_FIELDS: [&str; 4] = [
+    "meridian.v1.SavedScenario.meta",
+    "meridian.v1.SavedScenario.scenario",
+    "meridian.v1.SavedScenario.scenario_set",
+    "meridian.v1.SavedScenario.description",
+];
+
 /// The dictionary entries of a data type's fields; none for one the lake
 /// does not have.
 pub fn fields_of(data_type: &str) -> &'static [&'static str] {
@@ -163,6 +186,8 @@ pub fn fields_of(data_type: &str) -> &'static [&'static str] {
         RATE => &RATE_FIELDS,
         STATISTIC => &STATISTIC_FIELDS,
         LISTED_SERIES => &LISTED_SERIES_FIELDS,
+        DERIVED_SERIES => &DERIVED_SERIES_FIELDS,
+        SAVED_SCENARIO => &SAVED_SCENARIO_FIELDS,
         _ => &[],
     }
 }
@@ -739,7 +764,29 @@ pub fn catalogue_refused(catalogue: &Catalogue, roles: &[String]) -> Option<Stri
     if catalogue.datasets.is_empty() {
         return None;
     }
-    if !roles.iter().any(|role| role == "data") {
+    // Contract v28 (W10.4; sdk-contract/signal-derives-data-from-sources):
+    // a signal plugin declares its own derived datasets, serving derived
+    // series and saved scenarios and nothing else.
+    let data = roles.iter().any(|role| role == "data");
+    let signal = roles.iter().any(|role| role == "signal");
+    if !data && signal {
+        for (i, dataset) in catalogue.datasets.iter().enumerate() {
+            for (j, named) in dataset.data_types.iter().enumerate() {
+                let derived = [DERIVED_SERIES, SAVED_SCENARIO].contains(&named.as_str())
+                    || type_of_entry(named).is_some_and(|data_type| {
+                        [DERIVED_SERIES, SAVED_SCENARIO].contains(&data_type)
+                    });
+                if !derived {
+                    return Some(format!(
+                        "declaration.catalogue.datasets[{i}].data_types[{j}] {named:?}: a signal \
+                         plugin's own datasets serve derived series and saved scenarios, never a \
+                         source's data"
+                    ));
+                }
+            }
+        }
+    }
+    if !data && !signal {
         return Some(format!(
             "declaration.catalogue declares datasets on a version holding {}, not data: the \
              catalogue is a data plugin's",

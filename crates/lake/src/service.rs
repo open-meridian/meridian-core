@@ -83,6 +83,12 @@ pub const RECORD_SERIES: &str = "platform.lake.command.record-series";
 pub const LIST_SERIES: &str = "platform.lake.query.list-series";
 pub const RECORD_STATISTICS: &str = "platform.lake.command.record-statistics";
 pub const LIST_STATISTICS: &str = "platform.lake.query.list-statistics";
+/// Contract v28, track B (W10.4, W10.6, W12.8): a signal plugin's derived
+/// series and saved scenarios.
+pub const RECORD_DERIVED_SERIES: &str = "platform.lake.command.record-derived-series";
+pub const LIST_DERIVED_SERIES: &str = "platform.lake.query.list-derived-series";
+pub const RECORD_SCENARIOS: &str = "platform.lake.command.record-scenarios";
+pub const LIST_SCENARIOS: &str = "platform.lake.query.list-scenarios";
 pub const DECLINE_WANT: &str = "platform.lake.command.decline-want";
 pub const SET_SOURCE_PRIORITY: &str = "platform.lake.command.set-source-priority";
 pub const LIST_PRICES: &str = "platform.lake.query.list-prices";
@@ -125,7 +131,11 @@ pub fn recorded_topic(dataset: &str, data_type: DataType) -> String {
         DataType::Statistic => format!("platform.lake.{dataset}.event.statistics-recorded"),
         // Never published: read within each reader's account scope (W10.11);
         // a listed series is read when a chain is built (contract v28, W10.5).
-        DataType::ExecutionCost | DataType::Series => String::new(),
+        // A signal plugin's derived values and saved scenarios are read,
+        // never published (contract v28, W10.5).
+        DataType::ExecutionCost | DataType::Series | DataType::Derived | DataType::Scenario => {
+            String::new()
+        }
     }
 }
 
@@ -511,6 +521,241 @@ impl Lake {
         Ok(())
     }
 
+    /// A saved scenario held to W12.8 (contract v28; rulings 566, 581 to
+    /// 584): one scenario or one scenario set, named; each shock its object,
+    /// a target held or every object of its kind, and a form and unit its
+    /// object takes; a set's axes and their steps within bounds.
+    fn scenario_refused(
+        &self,
+        at: &str,
+        saved: &meridian_domain::v1::SavedScenario,
+    ) -> Result<(), String> {
+        if saved.description.chars().count() > 2_000 {
+            return Err(format!("{at}.description is at most 2,000 characters"));
+        }
+        match (&saved.scenario, &saved.scenario_set) {
+            (Some(scenario), None) => self.one_scenario(&format!("{at}.scenario"), scenario),
+            (None, Some(set)) => {
+                let path = format!("{at}.scenario_set");
+                if !bounds::SCENARIO_SET_NAME_LENGTH.admits(set.name.chars().count()) {
+                    return Err(format!("{path}.name is 1 to 200 characters"));
+                }
+                if !bounds::SCENARIO_SET_AXES_COUNT.admits(set.axes.len()) {
+                    return Err(format!("{path}.axes names {}; 1 to 4", set.axes.len()));
+                }
+                for (a, axis) in set.axes.iter().enumerate() {
+                    let path = format!("{path}.axes[{a}]");
+                    if !bounds::SCENARIO_AXIS_NAME_LENGTH.admits(axis.name.chars().count()) {
+                        return Err(format!("{path}.name is 1 to 64 characters"));
+                    }
+                    if !bounds::SCENARIO_AXIS_STEPS_COUNT.admits(axis.steps.len()) {
+                        return Err(format!("{path}.steps names {}; 1 to 32", axis.steps.len()));
+                    }
+                    for (s, step) in axis.steps.iter().enumerate() {
+                        self.one_scenario(&format!("{path}.steps[{s}]"), step)?;
+                    }
+                }
+                Ok(())
+            }
+            _ => Err(format!(
+                "{at}: a saved scenario is one scenario or one scenario set, exactly one"
+            )),
+        }
+    }
+
+    fn one_scenario(
+        &self,
+        at: &str,
+        scenario: &meridian_domain::v1::Scenario,
+    ) -> Result<(), String> {
+        use meridian_domain::v1::{ShockForm, ShockObject, ShockUnit};
+        if !bounds::SCENARIO_NAME_LENGTH.admits(scenario.name.chars().count()) {
+            return Err(format!("{at}.name is 1 to 200 characters"));
+        }
+        if !bounds::SCENARIO_SHOCKS_COUNT.admits(scenario.shocks.len()) {
+            return Err(format!(
+                "{at}.shocks names {}; at most 64",
+                scenario.shocks.len()
+            ));
+        }
+        for (i, shock) in scenario.shocks.iter().enumerate() {
+            let path = format!("{at}.shocks[{i}]");
+            let object = ShockObject::try_from(shock.object).unwrap_or(ShockObject::Unspecified);
+            let form = ShockForm::try_from(shock.form).unwrap_or(ShockForm::Unspecified);
+            let unit = ShockUnit::try_from(shock.unit).unwrap_or(ShockUnit::Unspecified);
+            if object == ShockObject::Unspecified {
+                return Err(format!("{path}.object is unspecified"));
+            }
+            // Each object's forms and units (581, 584).
+            let fits = match object {
+                ShockObject::Spot => matches!(
+                    (form, unit),
+                    (ShockForm::Relative, ShockUnit::Percent)
+                        | (ShockForm::Absolute, ShockUnit::Price)
+                ),
+                ShockObject::VolSurface => matches!(
+                    (form, unit),
+                    (
+                        ShockForm::Parallel | ShockForm::Bucketed,
+                        ShockUnit::VolPoints
+                    )
+                ),
+                ShockObject::Rate => matches!(
+                    (form, unit),
+                    (
+                        ShockForm::Parallel | ShockForm::Bucketed,
+                        ShockUnit::BasisPoints
+                    )
+                ),
+                ShockObject::Time => matches!(
+                    (form, unit),
+                    (ShockForm::Absolute, ShockUnit::Days | ShockUnit::Minutes)
+                        | (ShockForm::ToSettlement, _)
+                ),
+                ShockObject::Unspecified => false,
+            };
+            if !fits {
+                return Err(format!(
+                    "{path}.form and unit: a {} shock takes {}",
+                    object
+                        .as_str_name()
+                        .trim_start_matches("SHOCK_OBJECT_")
+                        .to_lowercase(),
+                    match object {
+                        ShockObject::Spot => "relative in percent, or absolute in price",
+                        ShockObject::VolSurface => "vol points, parallel or per expiry bucket",
+                        ShockObject::Rate => "basis points, parallel or per tenor",
+                        _ => "days or minutes, or to settlement",
+                    }
+                ));
+            }
+            if form == ShockForm::Bucketed {
+                if shock.buckets.is_empty() {
+                    return Err(format!(
+                        "{path}.buckets: a bucketed shock names its buckets"
+                    ));
+                }
+            } else if form != ShockForm::ToSettlement && shock.value.is_none() {
+                return Err(format!("{path}.value is required"));
+            }
+            let target = shock.target.clone().unwrap_or_default();
+            match (target.every, target.subject_id.is_empty()) {
+                (true, true) => {}
+                (false, false) => {
+                    if !self.subject_held(&target.subject_id)? {
+                        return Err(format!(
+                            "{path}.target.subject_id {:?} is no record the deployment holds",
+                            target.subject_id
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(format!(
+                        "{path}.target: an object by its subject ID, or every object of its kind, \
+                         exactly one"
+                    ))
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// W10.6, contract v28 (track B): a signal plugin's derived values for
+    /// 1 to 64 subjects, by series and a range of business dates, every
+    /// readable derived dataset side by side, each value's latest version.
+    pub(crate) fn list_derived_series(
+        &self,
+        request: meridian_domain::v1::ListDerivedSeriesRequest,
+        envelope: &Envelope,
+    ) -> Result<meridian_domain::v1::ListDerivedSeriesReply, String> {
+        if !bounds::LIST_DERIVED_SERIES_REQUEST_SUBJECTS_COUNT.admits(request.subjects.len()) {
+            return Err(format!(
+                "subjects names {}; 1 to 64",
+                request.subjects.len()
+            ));
+        }
+        let from = meridian_domain::date::optional("from_date", &request.from_date)?
+            .unwrap_or(Date::of_utc_instant(0));
+        let to = meridian_domain::date::optional("to_date", &request.to_date)?
+            .unwrap_or(Date::of_utc_instant(self.clock.now_ns()));
+        let answer = self.read(
+            ReadRequest {
+                data_type: DataType::Derived,
+                subjects: request.subjects,
+                kinds: Vec::new(),
+                interval_ns: 0,
+                sources: Some(SourceChoice {
+                    side_by_side: true,
+                    ..Default::default()
+                }),
+                at_ns: 0,
+                business_date: String::new(),
+                valid_from_ns: 1,
+                valid_until_ns: 0,
+                as_of_ns: 0,
+                page_size: 500,
+                cursor: String::new(),
+                after: None,
+                tenors: Vec::new(),
+                published_as_of_ns: 0,
+                series_keys: Vec::new(),
+                all_series: false,
+                dates: Some((from, to)),
+            },
+            envelope,
+        )?;
+        Ok(meridian_domain::v1::ListDerivedSeriesReply {
+            values: answer
+                .rows
+                .into_iter()
+                .filter_map(|row| match row {
+                    Observation::Derived(value)
+                        if request.series.is_empty() || request.series.contains(&value.series) =>
+                    {
+                        Some(value)
+                    }
+                    _ => None,
+                })
+                .collect(),
+        })
+    }
+
+    /// W12.8, contract v28: the saved scenarios of every dataset the reader
+    /// may read, by row key, each at its latest version, or at the version
+    /// asked of one row key where that is its latest.
+    pub(crate) fn list_scenarios(
+        &self,
+        request: meridian_domain::v1::ListScenariosRequest,
+        envelope: &Envelope,
+    ) -> Result<meridian_domain::v1::ListScenariosReply, String> {
+        if request.version != 0 && request.row_keys.len() != 1 {
+            return Err("version: with one row key".into());
+        }
+        let reader = reader_of(envelope);
+        let config = self.config();
+        let mut scenarios = Vec::new();
+        for dataset in config.readable(&reader, DataType::Scenario) {
+            let rows = self
+                .store
+                .read_dataset(&dataset, DataType::Scenario, 0)
+                .map_err(|failed| failed.to_string())?;
+            for row in rows {
+                let Observation::Scenario(saved) = row else {
+                    continue;
+                };
+                let meta = saved.meta.clone().unwrap_or_default();
+                if !request.row_keys.is_empty() && !request.row_keys.contains(&meta.row_key) {
+                    continue;
+                }
+                if request.version != 0 && meta.version != request.version {
+                    continue;
+                }
+                scenarios.push(saved);
+            }
+        }
+        Ok(meridian_domain::v1::ListScenariosReply { scenarios })
+    }
+
     /// A batch checked as W10.4 says, each Money's instrument resolved, its
     /// envelope's stamps decided: the rows to record by dataset, or the
     /// refusal naming the item and field.
@@ -557,7 +802,16 @@ impl Lake {
                     source.venue_id
                 ));
             }
-            if !(1..=8).contains(&meta.subjects.len()) {
+            // A saved scenario names its objects in its shocks, and no
+            // subject (contract v28, W12.8).
+            if data_type == DataType::Scenario {
+                if !meta.subjects.is_empty() {
+                    return Err(format!(
+                        "{at}.meta.subjects: a saved scenario names no subject; its shocks name \
+                         their objects"
+                    ));
+                }
+            } else if !(1..=8).contains(&meta.subjects.len()) {
                 return Err(format!(
                     "{at}.meta.subjects names {}; 1 to 8",
                     meta.subjects.len()
@@ -606,6 +860,11 @@ impl Lake {
                 &meta.business_date,
             )?;
             // A statistic is a value per trading date (contract v28, W10.4).
+            if data_type == DataType::Derived && meta.business_date.is_empty() {
+                return Err(format!(
+                    "{at}.meta.business_date is required: a derived value's business date"
+                ));
+            }
             if data_type == DataType::Statistic && meta.business_date.is_empty() {
                 return Err(format!(
                     "{at}.meta.business_date is required: a statistic's trading date"
@@ -711,6 +970,8 @@ impl Lake {
                 Observation::Rate(rate) => rate_refused(&at, rate)?,
                 Observation::Statistic(statistic) => statistic_refused(&at, statistic)?,
                 Observation::Series(series) => series_refused(&at, series)?,
+                Observation::Derived(value) => derived_refused(&at, value)?,
+                Observation::Scenario(saved) => self.scenario_refused(&at, saved)?,
                 _ => {}
             }
             if let Observation::Bar(bar) = &row {
@@ -757,6 +1018,8 @@ impl Lake {
             "rates" => bounds::RECORD_RATES_REQUEST_RATES_COUNT,
             "statistics" => bounds::RECORD_STATISTICS_REQUEST_STATISTICS_COUNT,
             "series" => bounds::RECORD_SERIES_REQUEST_SERIES_COUNT,
+            "values" => bounds::RECORD_DERIVED_SERIES_REQUEST_VALUES_COUNT,
+            "scenarios" => bounds::RECORD_SCENARIOS_REQUEST_SCENARIOS_COUNT,
             _ => bounds::RECORD_BARS_REQUEST_BARS_COUNT,
         };
         if !bound.admits(rows.len()) {
@@ -1195,7 +1458,10 @@ impl Lake {
         let (payload_type, payload) = match row {
             // Never published: read within each reader's scope (W10.11); a
             // series' terms change rarely and are read (contract v28, W10.5).
-            Observation::ExecutionCost(_) | Observation::Series(_) => return,
+            Observation::ExecutionCost(_)
+            | Observation::Series(_)
+            | Observation::Derived(_)
+            | Observation::Scenario(_) => return,
             Observation::Statistic(statistic) => (
                 "meridian.v1.StatisticsRecordedEvent",
                 StatisticsRecordedEvent {
@@ -1613,9 +1879,15 @@ impl Lake {
             // A listed series (contract v28): its terms in force at the as-of,
             // never a date or a range.
             DataType::Series => When::Latest { at_ns: 0 },
+            // A saved scenario (contract v28) is read by ListScenarios.
+            DataType::Scenario => return Err("a saved scenario is read by ListScenarios".into()),
             // A rate is read as a price is (contract v27, W10.6); and a
             // statistic (contract v28).
-            DataType::Price | DataType::Bar | DataType::Rate | DataType::Statistic => {
+            DataType::Price
+            | DataType::Bar
+            | DataType::Rate
+            | DataType::Statistic
+            | DataType::Derived => {
                 let given = [
                     request.at_ns != 0,
                     !request.business_date.is_empty(),
@@ -2769,6 +3041,41 @@ fn statistic_refused(at: &str, statistic: &meridian_domain::v1::Statistic) -> Re
     Ok(())
 }
 
+/// A derived value held to W10.4 (contract v28, track B): its series named,
+/// its value stated, its rule a definition and version, and the datasets it
+/// was derived from.
+fn derived_refused(at: &str, value: &meridian_domain::v1::DerivedSeries) -> Result<(), String> {
+    if !bounds::DERIVED_SERIES_SERIES_LENGTH.admits(value.series.chars().count()) {
+        return Err(format!("{at}.series is 1 to 64 characters"));
+    }
+    if value
+        .value
+        .as_ref()
+        .and_then(|v| v.value.as_ref())
+        .is_none()
+    {
+        return Err(format!("{at}.value is required, with its unit"));
+    }
+    let rule = value.rule.clone().unwrap_or_default();
+    if rule.definition.trim().is_empty() || rule.version < 1 {
+        return Err(format!(
+            "{at}.rule is required: the definition it was derived by and its version, from 1"
+        ));
+    }
+    if !bounds::DERIVED_SERIES_INPUTS_COUNT.admits(value.inputs.len()) {
+        return Err(format!(
+            "{at}.inputs names {}; 1 to 32, each dataset read",
+            value.inputs.len()
+        ));
+    }
+    for (i, input) in value.inputs.iter().enumerate() {
+        if input.dataset.trim().is_empty() {
+            return Err(format!("{at}.inputs[{i}].dataset is required"));
+        }
+    }
+    Ok(())
+}
+
 /// A listed series held to W10.4 (contract v28, ruling 561): its template
 /// and version named, each field by its path, and no instrument ID, which
 /// is the lake's answer on a read.
@@ -3200,6 +3507,74 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
             "meridian.v1.ListStatisticsReply",
         ),
         |lake, request: ListStatisticsRequest, envelope| lake.list_statistics(request, envelope),
+    );
+    // Contract v28, track B (W10.4, W10.6, W12.8): a signal plugin's
+    // derived series and saved scenarios.
+    serve_on(
+        &bus,
+        &lake,
+        RECORD_DERIVED_SERIES,
+        (
+            "meridian.v1.RecordDerivedSeriesRequest",
+            "meridian.v1.RecordObservationsReply",
+        ),
+        |lake, request: meridian_domain::v1::RecordDerivedSeriesRequest, envelope| {
+            lake.record(
+                "values",
+                request
+                    .values
+                    .into_iter()
+                    .map(Observation::Derived)
+                    .collect(),
+                "",
+                envelope,
+            )
+        },
+    );
+    serve_on(
+        &bus,
+        &lake,
+        LIST_DERIVED_SERIES,
+        (
+            "meridian.v1.ListDerivedSeriesRequest",
+            "meridian.v1.ListDerivedSeriesReply",
+        ),
+        |lake, request: meridian_domain::v1::ListDerivedSeriesRequest, envelope| {
+            lake.list_derived_series(request, envelope)
+        },
+    );
+    serve_on(
+        &bus,
+        &lake,
+        RECORD_SCENARIOS,
+        (
+            "meridian.v1.RecordScenariosRequest",
+            "meridian.v1.RecordObservationsReply",
+        ),
+        |lake, request: meridian_domain::v1::RecordScenariosRequest, envelope| {
+            lake.record(
+                "scenarios",
+                request
+                    .scenarios
+                    .into_iter()
+                    .map(Observation::Scenario)
+                    .collect(),
+                "",
+                envelope,
+            )
+        },
+    );
+    serve_on(
+        &bus,
+        &lake,
+        LIST_SCENARIOS,
+        (
+            "meridian.v1.ListScenariosRequest",
+            "meridian.v1.ListScenariosReply",
+        ),
+        |lake, request: meridian_domain::v1::ListScenariosRequest, envelope| {
+            lake.list_scenarios(request, envelope)
+        },
     );
     // Contract v27 (W10.4; ruling 418): a dataset's liveness.
     serve_on(

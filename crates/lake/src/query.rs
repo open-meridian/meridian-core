@@ -110,7 +110,11 @@ fn keep_named(row: &mut Observation, named: &BTreeSet<String>) {
         }
         // Never a QueryLake kind: read by ListExecutionCosts alone; nor,
         // in contract v28, statistics or series (ListStatistics, ListSeries).
-        Observation::ExecutionCost(_) | Observation::Statistic(_) | Observation::Series(_) => {}
+        Observation::ExecutionCost(_)
+        | Observation::Statistic(_)
+        | Observation::Series(_)
+        | Observation::Derived(_)
+        | Observation::Scenario(_) => {}
     }
 }
 
@@ -430,7 +434,9 @@ impl Lake {
                 Observation::Rate(rate) => reply.rates.push(rate),
                 Observation::ExecutionCost(_)
                 | Observation::Statistic(_)
-                | Observation::Series(_) => {}
+                | Observation::Series(_)
+                | Observation::Derived(_)
+                | Observation::Scenario(_) => {}
             }
         }
         Ok(reply)

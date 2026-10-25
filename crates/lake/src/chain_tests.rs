@@ -32,6 +32,7 @@ const HELD_CALL: &str = "INS-01JC28AAPLC230000000000001";
 const CHAIN: &str = "tradier-1:options";
 const OSI_CALL: &str = "AAPL  261120C00230000";
 const OSI_PUT: &str = "AAPL  261218P00200000";
+const DERIVED: &str = "signal-1:derived";
 
 struct Harness {
     bus: Arc<Bus>,
@@ -106,36 +107,67 @@ fn harness() -> Harness {
 /// statistics; signal-1 entitled to every field.
 fn configuration() -> EntitlementsChangedEvent {
     let (instance, key) = CHAIN.split_once(':').unwrap();
-    EntitlementsChangedEvent {
-        datasets: vec![DatasetRef {
-            dataset: CHAIN.into(),
-            instance: instance.into(),
-            vendor: "Tradier".into(),
-            declaration: Some(DatasetDeclaration {
-                key: key.into(),
-                vendor: "Tradier".into(),
-                data_types: vec![
-                    "meridian.v1.ListedSeries".into(),
-                    "meridian.v1.Quote".into(),
-                    "meridian.v1.Trade".into(),
-                    "meridian.v1.Statistic".into(),
-                ],
-                modes: vec![ObservationMode::Stream as i32],
-                licence_default: Some(DatasetLicence {
-                    kept: true,
-                    ..Default::default()
-                }),
+    let derived = DatasetRef {
+        dataset: DERIVED.into(),
+        instance: "signal-1".into(),
+        vendor: "Derived".into(),
+        declaration: Some(DatasetDeclaration {
+            key: "derived".into(),
+            vendor: "Derived".into(),
+            data_types: vec![
+                "meridian.v1.DerivedSeries".into(),
+                "meridian.v1.SavedScenario".into(),
+            ],
+            modes: vec![ObservationMode::Push as i32],
+            licence_default: Some(DatasetLicence {
+                kept: true,
                 ..Default::default()
             }),
             ..Default::default()
-        }],
+        }),
+        ..Default::default()
+    };
+    EntitlementsChangedEvent {
+        datasets: vec![
+            derived,
+            DatasetRef {
+                dataset: CHAIN.into(),
+                instance: instance.into(),
+                vendor: "Tradier".into(),
+                declaration: Some(DatasetDeclaration {
+                    key: key.into(),
+                    vendor: "Tradier".into(),
+                    data_types: vec![
+                        "meridian.v1.ListedSeries".into(),
+                        "meridian.v1.Quote".into(),
+                        "meridian.v1.Trade".into(),
+                        "meridian.v1.Statistic".into(),
+                    ],
+                    modes: vec![ObservationMode::Stream as i32],
+                    licence_default: Some(DatasetLicence {
+                        kept: true,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ],
         licences: vec![],
-        entitlements: vec![DatasetEntitlement {
-            dataset: CHAIN.into(),
-            instance: "signal-1".into(),
-            allowed: true,
-            ..Default::default()
-        }],
+        entitlements: vec![
+            DatasetEntitlement {
+                dataset: CHAIN.into(),
+                instance: "signal-1".into(),
+                allowed: true,
+                ..Default::default()
+            },
+            DatasetEntitlement {
+                dataset: DERIVED.into(),
+                instance: "signal-1".into(),
+                allowed: true,
+                ..Default::default()
+            },
+        ],
         changed_at_ns: NOW,
     }
 }
@@ -523,5 +555,201 @@ async fn what_w10_4_refuses_of_a_chain_is_refused_naming_the_field() {
     assert_eq!(
         record(&h, "quotes", vec![Observation::Quote(future_chain)]).unwrap(),
         (1, 0, 0)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_signal_plugins_derived_series_and_saved_scenarios_are_kept_and_read() {
+    // Contract v28, track B (W10.4, W10.6, W12.8; rulings 566, 581 to 584).
+    use meridian_domain::v1::{
+        DerivedInput, DerivedSeries, ListDerivedSeriesRequest, ListScenariosRequest, MeasureRef,
+        SavedScenario, Scenario, ScenarioAxis, ScenarioSet, Shock, ShockForm, ShockObject,
+        ShockTarget, ShockUnit,
+    };
+    let h = harness();
+    let own = |row_key: &str, date: &str, subjects: &[&str]| {
+        Some(ObservationMeta {
+            row_key: row_key.into(),
+            subjects: subjects
+                .iter()
+                .map(|s| SubjectRef {
+                    entity_id: s.to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+            source: Some(Source {
+                instance: "signal-1".into(),
+                dataset: DERIVED.into(),
+                ..Default::default()
+            }),
+            valid_from_ns: NOW - HOUR,
+            business_date: date.into(),
+            ..Default::default()
+        })
+    };
+    let iv30 = |date: &str, value: &str| DerivedSeries {
+        meta: own(&format!("iv30:{date}"), date, &[AAPL]),
+        series: "iv30".into(),
+        value: Some(UnitValue {
+            value: decimal(value),
+            unit: ValueUnit::Percent as i32,
+            ..Default::default()
+        }),
+        rule: Some(MeasureRef {
+            definition: "implied_vol_30d".into(),
+            version: 1,
+            ..Default::default()
+        }),
+        inputs: vec![DerivedInput {
+            dataset: CHAIN.into(),
+            as_of_ns: NOW - HOUR,
+        }],
+    };
+    let record_as = |field: &str, rows: Vec<Observation>| {
+        tokio::task::block_in_place(|| h.lake.record(field, rows, "", &envelope("signal-1")))
+            .map(|reply| (reply.recorded, reply.restated, reply.unchanged))
+    };
+    assert_eq!(
+        record_as(
+            "values",
+            vec![
+                Observation::Derived(iv30("2026-10-06", "27.4")),
+                Observation::Derived(iv30("2026-10-07", "28.1")),
+            ]
+        )
+        .unwrap(),
+        (2, 0, 0)
+    );
+    let mut ruleless = iv30("2026-10-07", "28.1");
+    ruleless.rule = None;
+    assert!(record_as("values", vec![Observation::Derived(ruleless)])
+        .unwrap_err()
+        .contains("values[0].rule"));
+    let listed = tokio::task::block_in_place(|| {
+        h.lake.list_derived_series(
+            ListDerivedSeriesRequest {
+                subjects: subjects(AAPL),
+                series: vec!["iv30".into()],
+                from_date: "2026-10-07".into(),
+                to_date: String::new(),
+            },
+            &envelope("signal-1"),
+        )
+    })
+    .unwrap();
+    assert_eq!(listed.values.len(), 1);
+    assert_eq!(
+        listed.values[0].meta.as_ref().unwrap().business_date,
+        "2026-10-07"
+    );
+    // A scenario set: spot by +-10% against vol by +-5 points.
+    let shock = |object: ShockObject, form: ShockForm, unit: ShockUnit, value: &str| Shock {
+        object: object as i32,
+        target: Some(ShockTarget {
+            subject_id: AAPL.into(),
+            every: false,
+        }),
+        form: form as i32,
+        unit: unit as i32,
+        value: decimal(value),
+        buckets: vec![],
+    };
+    let step = |name: &str, shocks: Vec<Shock>| Scenario {
+        name: name.into(),
+        shocks,
+    };
+    let grid = SavedScenario {
+        meta: own("grid-1", "", &[]),
+        scenario: None,
+        scenario_set: Some(ScenarioSet {
+            name: "Spot by vol".into(),
+            axes: vec![
+                ScenarioAxis {
+                    name: "spot".into(),
+                    steps: ["-10", "0", "10"]
+                        .iter()
+                        .map(|v| {
+                            step(
+                                v,
+                                vec![shock(
+                                    ShockObject::Spot,
+                                    ShockForm::Relative,
+                                    ShockUnit::Percent,
+                                    v,
+                                )],
+                            )
+                        })
+                        .collect(),
+                },
+                ScenarioAxis {
+                    name: "vol".into(),
+                    steps: ["-5", "5"]
+                        .iter()
+                        .map(|v| {
+                            step(
+                                v,
+                                vec![shock(
+                                    ShockObject::VolSurface,
+                                    ShockForm::Parallel,
+                                    ShockUnit::VolPoints,
+                                    v,
+                                )],
+                            )
+                        })
+                        .collect(),
+                },
+            ],
+        }),
+        description: "The scenario grid's default".into(),
+    };
+    assert_eq!(
+        record_as("scenarios", vec![Observation::Scenario(grid.clone())]).unwrap(),
+        (1, 0, 0)
+    );
+    // A spot shock in basis points, and an object not held, are refused.
+    let mut wrong = grid.clone();
+    wrong.scenario_set = None;
+    wrong.scenario = Some(step(
+        "bad",
+        vec![shock(
+            ShockObject::Spot,
+            ShockForm::Relative,
+            ShockUnit::BasisPoints,
+            "1",
+        )],
+    ));
+    assert!(
+        record_as("scenarios", vec![Observation::Scenario(wrong.clone())])
+            .unwrap_err()
+            .contains("scenarios[0].scenario.shocks[0].form and unit")
+    );
+    let mut unheld = shock(
+        ShockObject::Spot,
+        ShockForm::Relative,
+        ShockUnit::Percent,
+        "1",
+    );
+    unheld.target = Some(ShockTarget {
+        subject_id: "INS-NOT-HELD".into(),
+        every: false,
+    });
+    wrong.scenario = Some(step("unheld", vec![unheld]));
+    assert!(record_as("scenarios", vec![Observation::Scenario(wrong)])
+        .unwrap_err()
+        .contains("target.subject_id"));
+    let saved = tokio::task::block_in_place(|| {
+        h.lake.list_scenarios(
+            ListScenariosRequest {
+                row_keys: vec!["grid-1".into()],
+                version: 0,
+            },
+            &envelope("signal-1"),
+        )
+    })
+    .unwrap();
+    assert_eq!(saved.scenarios.len(), 1);
+    assert_eq!(
+        saved.scenarios[0].scenario_set.as_ref().unwrap().axes.len(),
+        2
     );
 }

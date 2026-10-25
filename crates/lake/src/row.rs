@@ -8,8 +8,8 @@ use std::collections::BTreeSet;
 use meridian_domain::exact::Exact;
 use meridian_domain::lake;
 use meridian_domain::v1::{
-    Bar, ExecutionCost, ListedSeries, Money, ObservationMeta, Outcome, Price, Quote, Rate,
-    Statistic, Trade,
+    Bar, DerivedSeries, ExecutionCost, ListedSeries, Money, ObservationMeta, Outcome, Price, Quote,
+    Rate, SavedScenario, Statistic, Trade,
 };
 use meridian_pb::v1::Decimal;
 use prost::Message;
@@ -32,6 +32,10 @@ pub enum DataType {
     Statistic,
     /// Contract v28 (ruling 561, W10.4): a series' terms, never minted.
     Series,
+    /// Contract v28, track B (W10.4): a signal plugin's derived value.
+    Derived,
+    /// Contract v28 (W12.8): a saved scenario or scenario set.
+    Scenario,
 }
 
 impl DataType {
@@ -48,6 +52,8 @@ impl DataType {
             lake::RATE => Some(DataType::Rate),
             lake::STATISTIC => Some(DataType::Statistic),
             lake::LISTED_SERIES => Some(DataType::Series),
+            lake::DERIVED_SERIES => Some(DataType::Derived),
+            lake::SAVED_SCENARIO => Some(DataType::Scenario),
             _ => None,
         }
     }
@@ -63,6 +69,8 @@ impl DataType {
             DataType::Rate => lake::RATE,
             DataType::Statistic => lake::STATISTIC,
             DataType::Series => lake::LISTED_SERIES,
+            DataType::Derived => lake::DERIVED_SERIES,
+            DataType::Scenario => lake::SAVED_SCENARIO,
         }
     }
 
@@ -77,6 +85,8 @@ impl DataType {
             DataType::ExecutionCost => 7,
             DataType::Statistic => 8,
             DataType::Series => 9,
+            DataType::Derived => 10,
+            DataType::Scenario => 11,
         }
     }
 
@@ -91,6 +101,8 @@ impl DataType {
             7 => Some(DataType::ExecutionCost),
             8 => Some(DataType::Statistic),
             9 => Some(DataType::Series),
+            10 => Some(DataType::Derived),
+            11 => Some(DataType::Scenario),
             _ => None,
         }
     }
@@ -115,6 +127,7 @@ impl DataType {
                 | DataType::ExecutionCost
                 | DataType::Rate
                 | DataType::Statistic
+                | DataType::Derived
         )
     }
 }
@@ -134,6 +147,8 @@ pub enum Observation {
     Rate(Rate),
     Statistic(Statistic),
     Series(ListedSeries),
+    Derived(DerivedSeries),
+    Scenario(SavedScenario),
 }
 
 impl Observation {
@@ -148,6 +163,8 @@ impl Observation {
             Observation::Rate(_) => DataType::Rate,
             Observation::Statistic(_) => DataType::Statistic,
             Observation::Series(_) => DataType::Series,
+            Observation::Derived(_) => DataType::Derived,
+            Observation::Scenario(_) => DataType::Scenario,
         }
     }
 
@@ -163,6 +180,8 @@ impl Observation {
             Observation::Rate(rate) => rate.meta.as_ref(),
             Observation::Statistic(statistic) => statistic.meta.as_ref(),
             Observation::Series(series) => series.meta.as_ref(),
+            Observation::Derived(value) => value.meta.as_ref(),
+            Observation::Scenario(saved) => saved.meta.as_ref(),
         };
         meta.unwrap_or_else(|| NONE.get_or_init(ObservationMeta::default))
     }
@@ -180,6 +199,8 @@ impl Observation {
                 statistic.meta.get_or_insert_with(Default::default)
             }
             Observation::Series(series) => series.meta.get_or_insert_with(Default::default),
+            Observation::Derived(value) => value.meta.get_or_insert_with(Default::default),
+            Observation::Scenario(saved) => saved.meta.get_or_insert_with(Default::default),
         }
     }
 
@@ -211,6 +232,8 @@ impl Observation {
     pub fn point(&self) -> String {
         let point = match self {
             Observation::Rate(rate) => lake::rate_point(rate),
+            // A derived value's latest is per its series (contract v28).
+            Observation::Derived(value) => value.series.clone(),
             _ => String::new(),
         };
         let series = self.series();
@@ -252,9 +275,11 @@ impl Observation {
             Observation::ExecutionCost(cost) => lake::asset_key(cost.execution_price.as_ref()),
             // A rate is no amount: its unit is in its point's key; nor is a
             // statistic or a series' terms (contract v28).
-            Observation::Rate(_) | Observation::Statistic(_) | Observation::Series(_) => {
-                String::new()
-            }
+            Observation::Rate(_)
+            | Observation::Statistic(_)
+            | Observation::Series(_)
+            | Observation::Derived(_)
+            | Observation::Scenario(_) => String::new(),
         }
     }
 
@@ -302,6 +327,8 @@ impl Observation {
             Observation::Rate(rate) => rate.encode_to_vec(),
             Observation::Statistic(statistic) => statistic.encode_to_vec(),
             Observation::Series(series) => series.encode_to_vec(),
+            Observation::Derived(value) => value.encode_to_vec(),
+            Observation::Scenario(saved) => saved.encode_to_vec(),
         }
     }
 
@@ -316,6 +343,8 @@ impl Observation {
             DataType::Rate => Observation::Rate(Rate::decode(bytes)?),
             DataType::Statistic => Observation::Statistic(Statistic::decode(bytes)?),
             DataType::Series => Observation::Series(ListedSeries::decode(bytes)?),
+            DataType::Derived => Observation::Derived(DerivedSeries::decode(bytes)?),
+            DataType::Scenario => Observation::Scenario(SavedScenario::decode(bytes)?),
         })
     }
 
@@ -395,7 +424,10 @@ impl Observation {
                 .as_mut()
                 .map(|m| vec![("volume", m)])
                 .unwrap_or_default(),
-            Observation::Statistic(_) | Observation::Series(_) => Vec::new(),
+            Observation::Statistic(_)
+            | Observation::Series(_)
+            | Observation::Derived(_)
+            | Observation::Scenario(_) => Vec::new(),
         }
     }
 
@@ -533,6 +565,22 @@ impl Observation {
                     && a.template_version == b.template_version
                     && a.fields == b.fields
             }
+            (Observation::Derived(a), Observation::Derived(b)) => {
+                let value = |row: &DerivedSeries| row.value.clone().unwrap_or_default();
+                let (va, vb) = (value(a), value(b));
+                a.series == b.series
+                    && a.value.is_some() == b.value.is_some()
+                    && same_decimal(&va.value, &vb.value)
+                    && (va.unit, &va.index_base, &va.ucum_code)
+                        == (vb.unit, &vb.index_base, &vb.ucum_code)
+                    && a.rule == b.rule
+                    && a.inputs == b.inputs
+            }
+            (Observation::Scenario(a), Observation::Scenario(b)) => {
+                a.scenario == b.scenario
+                    && a.scenario_set == b.scenario_set
+                    && a.description == b.description
+            }
             _ => false,
         }
     }
@@ -553,6 +601,8 @@ impl Observation {
             Observation::Rate(rate) => lake::strip_rate(rate, allowed),
             Observation::Statistic(statistic) => lake::strip_statistic(statistic, allowed),
             Observation::Series(series) => lake::strip_series(series, allowed),
+            // A signal plugin's own rows, read whole by whoever reads them.
+            Observation::Derived(_) | Observation::Scenario(_) => Vec::new(),
         }
     }
 }
