@@ -151,11 +151,7 @@ fn side_closed(book: &Book, event: &LifecycleEvent) -> HoldingSide {
         LifecycleEventKind::Expiry => {
             let instrument = landing(book, &event.instrument_id);
             let long: Key = (instrument, HoldingSide::Long as i32, String::new());
-            if book
-                .positions
-                .get(&long)
-                .is_some_and(|held| !held.lots.is_empty())
-            {
+            if open_lots(book, &long, &[]).is_ok_and(|lots| !lots.is_empty()) {
                 HoldingSide::Long
             } else {
                 HoldingSide::Short
