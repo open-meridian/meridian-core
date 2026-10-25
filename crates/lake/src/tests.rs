@@ -21,6 +21,8 @@ use crate::service::{self, Lake, ReadRequest};
 use crate::store::Store;
 use crate::MemoryStore;
 
+mod quality;
+
 const NOW: i64 = 1_791_417_600_000_000_000; // 2026-10-08T00:00Z
 const DAY: i64 = 86_400 * 1_000_000_000;
 const BTC: &str = "LCL-BTC";

@@ -8,8 +8,8 @@ use meridian_domain::v1::{EntitlementsChangedEvent, SourcePriority};
 
 use crate::row::Observation;
 use crate::store::{
-    as_flagged, closed_reason, counted, matches, ClosedDayAmendment, Query, Recorded, Removal,
-    Result, Served, Stale, Store, WantChange,
+    as_assessed, as_flagged, closed_reason, counted, matches, Assessment, ClosedDayAmendment,
+    Query, Recorded, Removal, Result, Served, Stale, Store, WantChange,
 };
 
 #[derive(Default)]
@@ -24,6 +24,7 @@ struct Held {
     aliases: BTreeMap<String, String>,
     configuration: Option<EntitlementsChangedEvent>,
     amendments: Vec<ClosedDayAmendment>,
+    assessments: Vec<Assessment>,
 }
 
 #[derive(Default)]
@@ -205,6 +206,7 @@ impl Store for MemoryStore {
             as_of(rows, query.as_of_ns)
         };
         as_flagged(&mut out, &held.amendments, query.as_of_ns);
+        as_assessed(&mut out, &held.assessments, query.as_of_ns);
         Ok(out)
     }
 
@@ -367,7 +369,9 @@ impl Store for MemoryStore {
             .filter(|row| row.dataset() == dataset && row.data_type() == data_type)
             .cloned()
             .collect::<Vec<_>>();
-        Ok(as_of(rows, as_of_ns))
+        let mut out = as_of(rows, as_of_ns);
+        as_assessed(&mut out, &held.assessments, as_of_ns);
+        Ok(out)
     }
 
     fn read_dataset_versions(
@@ -383,6 +387,7 @@ impl Store for MemoryStore {
             .cloned()
             .collect();
         rows.sort_by_key(|row| row.meta().sequence);
+        as_assessed(&mut rows, &held.assessments, 0);
         Ok(rows)
     }
 
@@ -419,6 +424,31 @@ impl Store for MemoryStore {
             count.1 += outside;
         }
         Ok(counts)
+    }
+
+    fn row_version(&self, dataset: &str, row_key: &str, version: u64) -> Result<Vec<Observation>> {
+        let held = self.lock();
+        let mut rows: Vec<Observation> = held
+            .rows
+            .iter()
+            .filter(|row| {
+                row.dataset() == dataset
+                    && row.meta().row_key == row_key
+                    && row.meta().version == version
+            })
+            .cloned()
+            .collect();
+        as_assessed(&mut rows, &held.assessments, 0);
+        Ok(rows)
+    }
+
+    fn assess(&self, assessments: &[Assessment]) -> Result<()> {
+        self.lock().assessments.extend(assessments.iter().cloned());
+        Ok(())
+    }
+
+    fn assessments(&self) -> Result<Vec<Assessment>> {
+        Ok(self.lock().assessments.clone())
     }
 }
 

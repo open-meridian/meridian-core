@@ -34,7 +34,8 @@ use meridian_pb::v1::ObservationMode;
 
 use crate::config::{DataConfig, Reader};
 use crate::row::{DataType, Observation};
-use crate::store::{Query, Store, When};
+use crate::store::{invalid, Query, Store, When};
+use meridian_bus::{refusal_with_status, RefusalStatus};
 
 const NS_PER_DAY: i64 = 86_400 * 1_000_000_000;
 
@@ -342,8 +343,24 @@ pub fn as_published(rows: Vec<Observation>, published_as_of_ns: i64) -> Vec<Obse
     out
 }
 
+/// Contract v28 (W10.6; rulings 421 and 619): `include_quarantined` on a
+/// read that names no dataset -- a default or a side-by-side read -- is
+/// refused naming it.
+pub fn quarantine_refused(sources: &SourceChoice) -> Result<(), String> {
+    if sources.include_quarantined && sources.named.is_empty() {
+        return Err(refusal_with_status(
+            RefusalStatus::InvalidArgument,
+            &["sources.include_quarantined".to_string()],
+            "sources.include_quarantined is set only on a read naming its datasets; a default or \
+             side-by-side read leaves invalid rows out",
+        ));
+    }
+    Ok(())
+}
+
 /// Answer a read from the store, as the reader may read it.
 pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<Answered, String> {
+    quarantine_refused(&read.sources)?;
     let config = against.config;
     let mut out = Answered::default();
     let readable = config.readable(&read.reader, read.data_type);
@@ -477,8 +494,34 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
             tenor_silent.remove(&(alias_of(row.subject()), row.dataset().to_string()));
         }
     }
-    let why_not = |dataset: &str, subject: &str| {
-        if tenor_silent.contains(&(subject.to_string(), dataset.to_string())) {
+    // Quarantine (contract v28, W10.6; rulings 421, 422 and 619): a row
+    // whose effective state is invalid is left out before the one in force
+    // is chosen, so a subject's last valid row stands, unless the read
+    // names its datasets with `include_quarantined`. A dataset left with
+    // nothing for a subject and kind is source silent: asked nothing, and
+    // never fallen back to.
+    let mut left_out: BTreeSet<(String, String, i32)> = BTreeSet::new();
+    if !read.sources.include_quarantined {
+        for row in rows.iter().filter(|row| invalid(row)) {
+            left_out.insert((
+                alias_of(row.subject()),
+                row.dataset().to_string(),
+                row.kind(),
+            ));
+        }
+        rows.retain(|row| !invalid(row));
+        for row in &rows {
+            left_out.remove(&(
+                alias_of(row.subject()),
+                row.dataset().to_string(),
+                row.kind(),
+            ));
+        }
+    }
+    let why_not = |dataset: &str, subject: &str, kind: i32| {
+        if tenor_silent.contains(&(subject.to_string(), dataset.to_string()))
+            || left_out.contains(&(subject.to_string(), dataset.to_string(), kind))
+        {
             (UnansweredReason::SourceSilent, false)
         } else {
             why_not(read, against, dataset, subject)
@@ -521,11 +564,20 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
         // bar's is 0.
         let mut kinds: Vec<i32> = kinds_asked.clone();
         if kinds.is_empty() {
-            kinds = by_subject
+            let mut found: BTreeSet<i32> = by_subject
                 .keys()
                 .filter(|(s, _)| s == subject)
                 .map(|(_, k)| *k)
                 .collect();
+            // A kind whose every row was left out is answered too: source
+            // silent where it was held.
+            found.extend(
+                left_out
+                    .iter()
+                    .filter(|(s, _, _)| s == subject)
+                    .map(|(_, _, k)| *k),
+            );
+            kinds = found.into_iter().collect();
         }
         let nothing_held = kinds.is_empty();
         if nothing_held {
@@ -552,7 +604,7 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
                     let of: Vec<&Observation> =
                         held.iter().filter(|r| r.dataset() == dataset).collect();
                     if of.is_empty() {
-                        let (reason, ask) = why_not(dataset, subject);
+                        let (reason, ask) = why_not(dataset, subject, kind);
                         if ask {
                             asks.entry(dataset.clone())
                                 .or_default()
@@ -583,7 +635,7 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
                     .cloned()
                     .collect();
                 if of.is_empty() {
-                    let (reason, ask) = why_not(dataset, subject);
+                    let (reason, ask) = why_not(dataset, subject, kind);
                     let reason = if ask && asked_one {
                         // One instance is asked at a time: the first that can be.
                         UnansweredReason::NotCovered
