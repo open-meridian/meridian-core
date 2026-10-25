@@ -44,15 +44,39 @@ pub const EXECUTION_COST_DATASET: &str = "analytics:execution_cost";
 /// The instance an execution cost's source names: the component.
 pub const ANALYTICS_INSTANCE: &str = "analytics";
 
+/// Open interest or a volume per contract per trading date (contract v28,
+/// G11; W10.4).
+pub const STATISTIC: &str = "meridian.v1.Statistic";
+/// A listed option or future series as its source lists it, never minted
+/// (contract v28, ruling 561; W10.4).
+pub const LISTED_SERIES: &str = "meridian.v1.ListedSeries";
+
+/// The scheme a futures series key names its venue in, beside the
+/// exchange's symbol (contract v28, W1.26): the ISO 10383 MIC.
+pub const MIC_SCHEME: &str = "mic";
+/// The scheme an option series is keyed by (contract v28, W1.26; 560).
+pub const OCC_OSI_SCHEME: &str = "occ_osi";
+
 /// The lake's data types: the 1a's, the 1b's from contract v19, the 1c's
-/// outcome from contract v23, and the rates slice's rate from contract v27.
-pub const DATA_TYPES: [&str; 6] = [PRICE, BAR, TRADE, QUOTE, OUTCOME, RATE];
+/// outcome from contract v23, the rates slice's rate from contract v27, and
+/// from contract v28 statistics and listed series.
+pub const DATA_TYPES: [&str; 8] = [
+    PRICE,
+    BAR,
+    TRADE,
+    QUOTE,
+    OUTCOME,
+    RATE,
+    STATISTIC,
+    LISTED_SERIES,
+];
 
 /// The data types a default read takes a priority among (W10.3): an outcome
 /// is read from every dataset that holds it, with no default (contract v23);
 /// a rate is read as prices are, under the source priority (contract v27,
 /// W10.6: FRED's 10-year point and Treasury's sit under one priority).
-pub const PRIORITISED: [&str; 5] = [PRICE, BAR, TRADE, QUOTE, RATE];
+/// From contract v28 statistics and listed series too, as any dataset's rows.
+pub const PRIORITISED: [&str; 7] = [PRICE, BAR, TRADE, QUOTE, RATE, STATISTIC, LISTED_SERIES];
 
 const PRICE_FIELDS: [&str; 4] = [
     "meridian.v1.Price.meta",
@@ -71,7 +95,7 @@ const BAR_FIELDS: [&str; 8] = [
     "meridian.v1.Bar.trade_count",
 ];
 
-const TRADE_FIELDS: [&str; 7] = [
+const TRADE_FIELDS: [&str; 8] = [
     "meridian.v1.Trade.meta",
     "meridian.v1.Trade.price",
     "meridian.v1.Trade.quantity",
@@ -79,6 +103,8 @@ const TRADE_FIELDS: [&str; 7] = [
     "meridian.v1.Trade.aggressor",
     "meridian.v1.Trade.source_sequence",
     "meridian.v1.Trade.cancelled",
+    // Contract v28 (G9).
+    "meridian.v1.Trade.quote_at_trade",
 ];
 const QUOTE_FIELDS: [&str; 6] = [
     "meridian.v1.Quote.meta",
@@ -111,6 +137,20 @@ const RATE_FIELDS: [&str; 10] = [
     "meridian.v1.Rate.percentiles",
 ];
 
+const STATISTIC_FIELDS: [&str; 3] = [
+    "meridian.v1.Statistic.meta",
+    "meridian.v1.Statistic.kind",
+    "meridian.v1.Statistic.value",
+];
+
+const LISTED_SERIES_FIELDS: [&str; 5] = [
+    "meridian.v1.ListedSeries.meta",
+    "meridian.v1.ListedSeries.template_id",
+    "meridian.v1.ListedSeries.template_version",
+    "meridian.v1.ListedSeries.fields",
+    "meridian.v1.ListedSeries.instrument_id",
+];
+
 /// The dictionary entries of a data type's fields; none for one the lake
 /// does not have.
 pub fn fields_of(data_type: &str) -> &'static [&'static str] {
@@ -121,6 +161,8 @@ pub fn fields_of(data_type: &str) -> &'static [&'static str] {
         QUOTE => &QUOTE_FIELDS,
         OUTCOME => &OUTCOME_FIELDS,
         RATE => &RATE_FIELDS,
+        STATISTIC => &STATISTIC_FIELDS,
+        LISTED_SERIES => &LISTED_SERIES_FIELDS,
         _ => &[],
     }
 }
@@ -250,7 +292,109 @@ pub fn strip_trade(
     if gone(TRADE_FIELDS[6]) {
         trade.cancelled = false;
     }
+    if gone(TRADE_FIELDS[7]) {
+        trade.quote_at_trade = None;
+    }
     removed
+}
+
+/// [`strip_price`], for a statistic (contract v28).
+pub fn strip_statistic(
+    statistic: &mut crate::v1::Statistic,
+    allowed: &std::collections::BTreeSet<String>,
+) -> Vec<&'static str> {
+    let mut removed = Vec::new();
+    if allowed.is_empty() {
+        return removed;
+    }
+    let mut gone = |entry: &'static str| {
+        let gone = !allowed.contains(entry);
+        if gone {
+            removed.push(entry);
+        }
+        gone
+    };
+    if gone(STATISTIC_FIELDS[1]) {
+        statistic.kind = 0;
+    }
+    if gone(STATISTIC_FIELDS[2]) {
+        statistic.value = None;
+    }
+    removed
+}
+
+/// [`strip_price`], for a listed series (contract v28). Its instrument ID is
+/// the lake's own answer, never stripped.
+pub fn strip_series(
+    series: &mut crate::v1::ListedSeries,
+    allowed: &std::collections::BTreeSet<String>,
+) -> Vec<&'static str> {
+    let mut removed = Vec::new();
+    if allowed.is_empty() {
+        return removed;
+    }
+    let mut gone = |entry: &'static str| {
+        let gone = !allowed.contains(entry);
+        if gone {
+            removed.push(entry);
+        }
+        gone
+    };
+    if gone(LISTED_SERIES_FIELDS[1]) {
+        series.template_id.clear();
+    }
+    if gone(LISTED_SERIES_FIELDS[2]) {
+        series.template_version.clear();
+    }
+    if gone(LISTED_SERIES_FIELDS[3]) {
+        series.fields.clear();
+    }
+    removed
+}
+
+/// A series key as one text (contract v28, ruling 561): each identifier as
+/// scheme and value, in order of scheme, so a key reads the same however its
+/// writer ordered it. Empty for a row keyed by no series. Beside a row's
+/// subject it is what its latest is chosen per and its deliveries conflated
+/// per.
+pub fn series_key_text(key: &[crate::v1::Identifier]) -> String {
+    let mut parts: Vec<String> = key
+        .iter()
+        .map(|identifier| format!("{}={}", identifier.scheme, identifier.value))
+        .collect();
+    parts.sort();
+    parts.join("|")
+}
+
+/// Whether a row keyed by `key` is one a read asked for (contract v28,
+/// W10.6): a row keyed by no series always, being the subject's own; a
+/// series' row where the read asks for every series, or names its key -- one
+/// of its identifiers other than the MIC asked, and its MIC, where it has one
+/// and the read names any, among those asked.
+pub fn series_asked(
+    key: &[crate::v1::Identifier],
+    asked: &[crate::v1::Identifier],
+    all: bool,
+) -> bool {
+    if key.is_empty() || all {
+        return true;
+    }
+    let named = |identifier: &crate::v1::Identifier| {
+        asked
+            .iter()
+            .any(|a| a.scheme == identifier.scheme && a.value == identifier.value)
+    };
+    let symbol = key
+        .iter()
+        .filter(|identifier| identifier.scheme != MIC_SCHEME)
+        .any(named);
+    let mics_asked = asked.iter().any(|a| a.scheme == MIC_SCHEME);
+    let venue = !mics_asked
+        || key
+            .iter()
+            .filter(|identifier| identifier.scheme == MIC_SCHEME)
+            .all(named);
+    symbol && venue
 }
 
 /// [`strip_price`], for a quote (contract v19).

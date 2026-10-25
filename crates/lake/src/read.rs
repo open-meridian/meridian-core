@@ -85,6 +85,15 @@ pub struct Read {
     pub tenors: Vec<Tenor>,
     /// A rate read's published-time cut-off (contract v27); 0 for none.
     pub published_as_of_ns: i64,
+    /// Contract v28 (ruling 561): the series asked for by key, and whether
+    /// every series of the subjects is; neither, and a row keyed by a series
+    /// is left out, so a v27 reader of an underlying never receives its
+    /// chain.
+    pub series_keys: Vec<meridian_domain::v1::Identifier>,
+    pub all_series: bool,
+    /// Contract v28 (ListStatistics): business dates from and to,
+    /// inclusive; `None` for no range.
+    pub dates: Option<(Date, Date)>,
 }
 
 /// What a source declined, by dataset, subject and the date or range its
@@ -415,6 +424,20 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
         .map_err(|failed| failed.to_string())?;
     if read.published_as_of_ns != 0 {
         rows = as_published(rows, read.published_as_of_ns);
+    }
+    // A chain's rows only to a read that asks for series (contract v28,
+    // W10.6): a listed series is always keyed by one, and read by ListSeries.
+    rows.retain(|row| {
+        meridian_domain::lake::series_asked(
+            &row.meta().series_key,
+            &read.series_keys,
+            read.all_series,
+        )
+    });
+    if let Some((from, to)) = &read.dates {
+        rows.retain(|row| {
+            Date::parse(&row.meta().business_date).is_ok_and(|date| &date >= from && &date <= to)
+        });
     }
     // A rate read narrowed by tenor: a row with no tenor (a fixing, a point
     // named by maturity) is no tenor asked. A dataset that holds the subject

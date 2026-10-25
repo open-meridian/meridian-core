@@ -249,6 +249,9 @@ fn read(
                 after: None,
                 tenors: Vec::new(),
                 published_as_of_ns: 0,
+                series_keys: Vec::new(),
+                all_series: false,
+                dates: None,
             },
             &envelope(reader, reader != "dashboard-1", ""),
         )
@@ -455,6 +458,9 @@ async fn a_reader_not_entitled_is_refused_per_dataset_and_a_field_it_may_not_rea
                 after: None,
                 tenors: Vec::new(),
                 published_as_of_ns: 0,
+                series_keys: Vec::new(),
+                all_series: false,
+                dates: None,
             },
             &envelope("reporting-1", true, ""),
         )
@@ -984,6 +990,9 @@ async fn a_read_with_an_invalid_date_or_two_times_is_refused_and_misses_are_coun
         after: None,
         tenors: Vec::new(),
         published_as_of_ns: 0,
+        series_keys: Vec::new(),
+        all_series: false,
+        dates: None,
     };
     let invalid = tokio::task::block_in_place(|| {
         h.lake
@@ -1147,6 +1156,9 @@ fn live_read(
                 after,
                 tenors: Vec::new(),
                 published_as_of_ns: 0,
+                series_keys: Vec::new(),
+                all_series: false,
+                dates: None,
             },
             &envelope("signal-1", true, ""),
         )
@@ -1697,6 +1709,9 @@ async fn an_outcome_is_restated_per_stage_every_version_heard_and_read_as_of_or_
             after: None,
             tenors: Vec::new(),
             published_as_of_ns: 0,
+            series_keys: Vec::new(),
+            all_series: false,
+            dates: None,
         },
         &envelope("reporting-1", true, "")
     ))

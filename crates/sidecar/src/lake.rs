@@ -31,8 +31,8 @@ use meridian_domain::v1::{
     BarsRecordedEvent, EntitlementsChangedEvent, ListBarsRequest, ListPricesRequest,
     ListRatesRequest, LivenessRecordedEvent, ObservationMeta, ObservationsWantedEvent,
     OutcomesRecordedEvent, PricesRecordedEvent, QuotesRecordedEvent, RatesRecordedEvent,
-    RecordBarsRequest, RecordPricesRequest, RecordRatesRequest, TradesRecordedEvent,
-    WantWithdrawnEvent,
+    RecordBarsRequest, RecordPricesRequest, RecordRatesRequest, StatisticsRecordedEvent,
+    TradesRecordedEvent, WantWithdrawnEvent,
 };
 use prost::Message;
 use tokio::sync::watch;
@@ -134,6 +134,20 @@ pub(crate) struct Said {
     pub is_want: bool,
 }
 
+/// A row's series key as a key's last part (contract v28, ruling 561): a
+/// chain's rows under one underlying are conflated per series; a row keyed
+/// by none keeps the key it had.
+fn series_said(meta: Option<&ObservationMeta>) -> String {
+    let series = meta
+        .map(|meta| meridian_domain::lake::series_key_text(&meta.series_key))
+        .unwrap_or_default();
+    if series.is_empty() {
+        series
+    } else {
+        format!("|#{series}")
+    }
+}
+
 fn meta_said(meta: Option<&ObservationMeta>) -> (String, Vec<String>, String) {
     let meta = meta.cloned().unwrap_or_default();
     let source = meta.source.unwrap_or_default();
@@ -152,9 +166,10 @@ pub(crate) fn said(payload_type: &str, payload: &[u8]) -> Option<Said> {
             let price = PricesRecordedEvent::decode(payload).ok()?.price?;
             let (dataset, subjects, venue) = meta_said(price.meta.as_ref());
             let asset = meridian_domain::lake::asset_key(price.price.as_ref());
+            let series = series_said(price.meta.as_ref());
             Some(Said {
                 key: Some(format!(
-                    "price|{}|{dataset}|{}|{venue}|{asset}",
+                    "price|{}|{dataset}|{}|{venue}|{asset}{series}",
                     subjects.first().cloned().unwrap_or_default(),
                     price.kind
                 )),
@@ -167,9 +182,10 @@ pub(crate) fn said(payload_type: &str, payload: &[u8]) -> Option<Said> {
             let bar = BarsRecordedEvent::decode(payload).ok()?.bar?;
             let from = bar.meta.as_ref().map_or(0, |m| m.valid_from_ns);
             let (dataset, subjects, venue) = meta_said(bar.meta.as_ref());
+            let series = series_said(bar.meta.as_ref());
             Some(Said {
                 key: Some(format!(
-                    "bar|{}|{dataset}|{venue}|{from}",
+                    "bar|{}|{dataset}|{venue}|{from}{series}",
                     subjects.first().cloned().unwrap_or_default()
                 )),
                 dataset,
@@ -202,9 +218,10 @@ pub(crate) fn said(payload_type: &str, payload: &[u8]) -> Option<Said> {
             let quote = QuotesRecordedEvent::decode(payload).ok()?.quote?;
             let (dataset, subjects, venue) = meta_said(quote.meta.as_ref());
             let asset = meridian_domain::lake::quote_asset(&quote);
+            let series = series_said(quote.meta.as_ref());
             Some(Said {
                 key: Some(format!(
-                    "quote|{}|{dataset}|{venue}|{asset}",
+                    "quote|{}|{dataset}|{venue}|{asset}{series}",
                     subjects.first().cloned().unwrap_or_default()
                 )),
                 dataset,
@@ -222,6 +239,28 @@ pub(crate) fn said(payload_type: &str, payload: &[u8]) -> Option<Said> {
                     subjects.first().cloned().unwrap_or_default(),
                     rate.kind,
                     meridian_domain::lake::rate_point(&rate)
+                )),
+                dataset,
+                subjects,
+                is_want: false,
+            })
+        }
+        // Contract v28 (W10.5): per subject, series key, kind and business
+        // date.
+        "meridian.v1.StatisticsRecordedEvent" => {
+            let statistic = StatisticsRecordedEvent::decode(payload).ok()?.statistic?;
+            let (dataset, subjects, _) = meta_said(statistic.meta.as_ref());
+            let date = statistic
+                .meta
+                .as_ref()
+                .map(|meta| meta.business_date.clone())
+                .unwrap_or_default();
+            Some(Said {
+                key: Some(format!(
+                    "statistic|{}|{dataset}|{}|{date}{}",
+                    subjects.first().cloned().unwrap_or_default(),
+                    statistic.kind,
+                    series_said(statistic.meta.as_ref())
                 )),
                 dataset,
                 subjects,
@@ -318,6 +357,15 @@ pub(crate) fn stripped(payload_type: &str, payload: &[u8], allowed: &BTreeSet<St
             Ok(mut event) => {
                 if let Some(rate) = event.rate.as_mut() {
                     meridian_domain::lake::strip_rate(rate, allowed);
+                }
+                event.encode_to_vec()
+            }
+            Err(_) => payload.to_vec(),
+        },
+        "meridian.v1.StatisticsRecordedEvent" => match StatisticsRecordedEvent::decode(payload) {
+            Ok(mut event) => {
+                if let Some(statistic) = event.statistic.as_mut() {
+                    meridian_domain::lake::strip_statistic(statistic, allowed);
                 }
                 event.encode_to_vec()
             }
@@ -509,6 +557,73 @@ mod tests {
         assert_ne!(discount, key(rate(6, 6, 4)), "two tenors");
         assert_eq!(discount, key(rate(6, 3, 4)), "the same point");
         assert!(discount.starts_with("rate|INS-BILLS|us-treasury-1:ust_bills|6|"));
+    }
+
+    #[test]
+    fn a_chains_quotes_and_statistics_are_conflated_per_series() {
+        // Contract v28 (W10.5; ruling 561): two series under one underlying
+        // never collapse; a statistic per series, kind and trading date.
+        use meridian_domain::v1::{Identifier, Quote, Statistic};
+        let meta = |osi: &str, date: &str| {
+            Some(ObservationMeta {
+                subjects: vec![SubjectRef {
+                    entity_id: "INS-AAPL".into(),
+                    ..Default::default()
+                }],
+                source: Some(Source {
+                    dataset: "tradier-1:options".into(),
+                    ..Default::default()
+                }),
+                business_date: date.into(),
+                series_key: vec![Identifier {
+                    scheme: "occ_osi".into(),
+                    value: osi.into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+        };
+        let quote = |osi: &str| {
+            said(
+                "meridian.v1.QuotesRecordedEvent",
+                &QuotesRecordedEvent {
+                    quote: Some(Quote {
+                        meta: meta(osi, ""),
+                        ..Default::default()
+                    }),
+                }
+                .encode_to_vec(),
+            )
+            .unwrap()
+            .key
+            .unwrap()
+        };
+        assert_ne!(
+            quote("AAPL  261120C00230000"),
+            quote("AAPL  261120P00230000")
+        );
+        assert!(quote("AAPL  261120C00230000").ends_with("|#occ_osi=AAPL  261120C00230000"));
+        let statistic = |osi: &str, date: &str, kind: i32| {
+            said(
+                "meridian.v1.StatisticsRecordedEvent",
+                &StatisticsRecordedEvent {
+                    statistic: Some(Statistic {
+                        meta: meta(osi, date),
+                        kind,
+                        value: None,
+                    }),
+                }
+                .encode_to_vec(),
+            )
+            .unwrap()
+            .key
+            .unwrap()
+        };
+        let oi = statistic("AAPL  261120C00230000", "2026-10-07", 1);
+        assert_eq!(oi, statistic("AAPL  261120C00230000", "2026-10-07", 1));
+        assert_ne!(oi, statistic("AAPL  261120C00230000", "2026-10-08", 1));
+        assert_ne!(oi, statistic("AAPL  261120C00230000", "2026-10-07", 2));
+        assert_ne!(oi, statistic("AAPL  261120P00230000", "2026-10-07", 1));
     }
 
     #[test]
