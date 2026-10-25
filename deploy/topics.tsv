@@ -156,7 +156,7 @@ platform.custody.*.event.external-accounts	event	custody	dashboard,conductor
 platform.custody.*.event.sync-status	event	custody	dashboard,street
 platform.deployment.command.create-plugin	command	conductor	launcher
 platform.deployment.command.remove-plugin	command	conductor	launcher
-platform.deployment.command.report-latency	command	data,connectivity,ems	dashboard
+platform.deployment.command.report-latency	command	data,connectivity,ems,sidecar,lake,analytics	dashboard
 platform.deployment.event.component-report	event	street,bor,instrument	conductor
 platform.deployment.event.plugin-report	event	sidecar	dashboard,conductor
 platform.lake.command.decline-want	command	data	lake
@@ -191,7 +191,7 @@ platform.lake.query.list-filings	query	signal,portfolio,reporting,dashboard,anal
 platform.lake.query.list-holdings	query	signal,portfolio,reporting,dashboard	lake
 platform.lake.query.list-outcomes	query	reporting,portfolio,compliance,signal,operations,analytics	lake
 platform.lake.query.list-prices	query	reporting,portfolio,compliance,signal,operations,analytics	lake
-platform.lake.query.list-quotes	query	signal,ems	lake
+platform.lake.query.list-quotes	query	signal,ems,analytics	lake
 platform.lake.query.list-rates	query	reporting,portfolio,compliance,signal,analytics	lake
 platform.lake.query.list-rating-actions	query	signal,portfolio,reporting,dashboard	lake
 platform.lake.query.list-reported-facts	query	signal,portfolio,reporting,dashboard	lake

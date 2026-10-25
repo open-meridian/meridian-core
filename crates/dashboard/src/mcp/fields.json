@@ -2667,7 +2667,7 @@
       },
       "empty": "none: every series in the window",
       "intent": "names series of the chain",
-      "meaning": "their occ_osi symbols, or symbol and MIC pairs",
+      "meaning": "their occ_osi symbols, or symbol and MIC pairs, the MIC under iso10383",
       "not_meaning": "INS- IDs",
       "filled": "as-reported",
       "filled_by": "plugin",
@@ -2720,7 +2720,7 @@
       "type": "repeated message Identifier",
       "empty": "none: the figure names an INS- record or none",
       "intent": "names a series not held a figure is for (contract v28)",
-      "meaning": "its occ_osi symbol, or symbol and MIC",
+      "meaning": "its occ_osi symbol, or symbol and MIC, the MIC under iso10383",
       "not_meaning": "an instrument ID",
       "filled": "decided",
       "filled_by": "analytics",
@@ -26903,11 +26903,19 @@
       "type": "text",
       "empty": "never empty",
       "intent": "names the calendar read (W3.19)",
-      "meaning": "its `CAL-` ID, the platform's, never reused",
+      "meaning": "its `CAL-` ID, the platform's, never reused; from v28 a venue's `VEN-` ID, read as the trading-sessions calendar naming that venue (W3.19, W12.2)",
       "not_meaning": "a currency code or an FpML business centre",
       "filled": "as-reported",
       "filled_by": "plugin",
       "since": "v22",
+      "changes": [
+        {
+          "version": "v28",
+          "kind": "widened",
+          "what": "a venue's VEN- ID reads the trading-sessions calendar that names the venue, how a row's sessions are found through its venue (ruling 570 (i); the read decided under the working agreement, 2026-10-25)",
+          "was": {}
+        }
+      ],
       "stability": "preview",
       "store": "instrument"
     },
@@ -30196,7 +30204,7 @@
       },
       "empty": "never empty",
       "intent": "names the series by its key",
-      "meaning": "the occ_osi symbol, or a future's or future option's exchange symbol and its MIC as two identifiers",
+      "meaning": "the occ_osi symbol, or a future's or future option's exchange symbol and its MIC as two identifiers, the MIC under iso10383",
       "not_meaning": "an LCL- or INS- ID",
       "filled": "as-reported",
       "filled_by": "portfolio",
@@ -35807,7 +35815,7 @@
       },
       "empty": "none: the row is about its subjects alone",
       "intent": "keys a chain row by its series without minting it (ruling 561)",
-      "meaning": "the series' identifier -- the occ_osi symbol, or a future's or future option's exchange symbol and its MIC -- on a row whose subject is the underlying; in the row's conflation key",
+      "meaning": "the series' identifier -- the occ_osi symbol, or a future's or future option's exchange symbol and its MIC under iso10383 -- on a row whose subject is the underlying; in the row's conflation key",
       "not_meaning": "an identifier resolved to a record: a chain row is never resolved (W3.1); a row about a series the deployment holds names its INS- record as subject and no key",
       "filled": "as-reported",
       "filled_by": "data",
@@ -36049,7 +36057,7 @@
       },
       "empty": "none: every series of the subjects asked",
       "intent": "asks for chain rows by series (contract v28)",
-      "meaning": "the series' keys (occ_osi, or a symbol and its MIC), each answered if listed under the subjects asked",
+      "meaning": "the series' keys (occ_osi, or a symbol and its MIC under iso10383), each answered if listed under the subjects asked",
       "not_meaning": "INS- IDs, which subjects name",
       "filled": "as-reported",
       "filled_by": "signal",
@@ -36419,7 +36427,7 @@
       },
       "empty": "none: rows keyed by a series are not answered unless all_series is true",
       "intent": "asks for chain rows by series (contract v28)",
-      "meaning": "the series' keys (occ_osi, or a symbol and its MIC), each row keyed by one answered with the subjects asked",
+      "meaning": "the series' keys (occ_osi, or a symbol and its MIC under iso10383), each row keyed by one answered with the subjects asked",
       "not_meaning": "INS- IDs, which subjects name",
       "filled": "as-reported",
       "filled_by": "signal",
@@ -36577,7 +36585,7 @@
       },
       "empty": "none: rows keyed by a series are not answered unless all_series is true",
       "intent": "asks for chain rows by series (contract v28)",
-      "meaning": "the series' keys (occ_osi, or a symbol and its MIC), each row keyed by one answered with the subjects asked",
+      "meaning": "the series' keys (occ_osi, or a symbol and its MIC under iso10383), each row keyed by one answered with the subjects asked",
       "not_meaning": "INS- IDs, which subjects name",
       "filled": "as-reported",
       "filled_by": "signal",
@@ -36609,7 +36617,7 @@
       },
       "empty": "none: rows keyed by a series are not answered unless all_series is true",
       "intent": "asks for chain rows by series (contract v28)",
-      "meaning": "the series' keys (occ_osi, or a symbol and its MIC), each row keyed by one answered with the subjects asked",
+      "meaning": "the series' keys (occ_osi, or a symbol and its MIC under iso10383), each row keyed by one answered with the subjects asked",
       "not_meaning": "INS- IDs, which subjects name",
       "filled": "as-reported",
       "filled_by": "signal",
@@ -47987,6 +47995,13 @@
       "filled": "as-reported",
       "filled_by": "plugin",
       "since": "v27",
+      "changes": [
+        {
+          "version": "v28",
+          "kind": "clarified",
+          "what": "core's components send their own hops' snapshots on the same row as plugins do, and the monitor merges them with the plugins' (ruling 606, reversing 570 (ii)'s direct write; W4.16)"
+        }
+      ],
       "stability": "preview",
       "store": "sidecar"
     },
@@ -48109,11 +48124,18 @@
       ],
       "empty": "unspecified for a session's snapshot",
       "intent": "says where a dataset's age is measured",
-      "meaning": "the hop whose reading of the one clock, minus the row's source time, is the age; a plugin reports edge and ems_check, and core records its own hops into the same store directly",
+      "meaning": "the hop whose reading of the one clock, minus the row's source time, is the age; a plugin reports edge and ems_check, and from v28 core's components report their own hops on the same row: the sidecar sidecar, bus and page, the lake lake, the analytics component analytics (ruling 606)",
       "not_meaning": "a session's metric",
       "filled": "as-reported",
       "filled_by": "plugin",
       "since": "v27",
+      "changes": [
+        {
+          "version": "v28",
+          "kind": "clarified",
+          "what": "core's own hops are reported on ReportLatency by the component that records them, no longer written into the monitor's store directly (ruling 606)"
+        }
+      ],
       "stability": "preview",
       "store": "sidecar"
     },
@@ -48234,13 +48256,20 @@
     {
       "name": "meridian.v1.LatencySnapshot.instance_id",
       "type": "identifier instance",
-      "empty": "never empty: the sidecar stamps it",
+      "empty": "never empty on a plugin's or a sidecar's snapshot: the sidecar stamps it; from v28 empty on the lake's and the analytics component's own, which are no plugin's, their hop naming them",
       "intent": "names the reporting instance",
       "meaning": "stamped by its sidecar",
       "not_meaning": "anything the plugin supplies",
       "filled": "stamped",
       "filled_by": "sidecar",
       "since": "v27",
+      "changes": [
+        {
+          "version": "v28",
+          "kind": "clarified",
+          "what": "a core component's own snapshot carries no instance (ruling 606); a sidecar's own hops carry its plugin's instance, stamped as on a plugin's"
+        }
+      ],
       "stability": "preview",
       "store": "sidecar"
     },
