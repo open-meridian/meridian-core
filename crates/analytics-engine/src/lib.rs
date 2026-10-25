@@ -35,6 +35,7 @@ pub mod graph;
 pub mod historical;
 pub mod measures;
 pub mod model;
+pub mod options;
 pub mod pricing;
 
 #[cfg(test)]

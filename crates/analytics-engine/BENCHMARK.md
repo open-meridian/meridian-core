@@ -72,3 +72,32 @@ values (a few hundred MB), and a batch-sized job about ten times the
 document. A deployment running batch-sized jobs raises the limit, or
 `analytics.worker.replicaCount`, and the batch above shows what four
 workers buy.
+
+## v28: the tree on a T1 chain refresh
+
+The plan's Track B asks the binomial tree's cost over a T1 chain refresh,
+about 20 underlyings a minute (3 s each), with Andersen-Lake's fixed-point
+method only if the tree is too slow (ruling 565).
+
+    cargo test -p meridian-analytics-engine --release options::tests::bench -- --ignored --nocapture
+
+`src/options.rs` writes a large single-name chain: 12 monthly expiries by
+80 strikes, calls and puts (1,920 options), one discrete dividend, each
+quote inverted at bid, mid and ask (Brent, 0.01% to 500%) on an American
+CRR tree with the escrowed dividend, and the mid's greeks (delta, gamma and
+theta from the tree's nodes; vega, rho, vanna and charm by bump and reprice,
+seven trees each). One thread, in the gate's Linux container on the same
+machine as above, Rust 1.90, release profile, 2026-10-24.
+
+| Workload | Measured |
+|---|---|
+| 5,517 inversions and 1,920 greek sets, 200 steps | 1.79 s |
+| 1,752 mid inversions alone, 200 steps | 0.55 s |
+| 1,769 mid inversions alone, 500 steps | 3.68 s |
+
+At 200 steps a large chain refreshes inside its 3 s on one worker, so the
+tree stands and Andersen-Lake is not built. Steps are the definition's
+parameter: at 500 steps the inversions alone take 3.7 s for this chain,
+which the component's workers share. The inversions the chain does not
+answer (about one in ten) are deep options quoted at their intrinsic value,
+where no volatility is identified.
