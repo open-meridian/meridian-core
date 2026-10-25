@@ -288,6 +288,10 @@ pub struct Case {
     /// by subject and kind, naming the dataset (requirement 6; Q11):
     /// `unentitled`, absent in the reference's cases.
     pub unentitled: BTreeMap<(String, String), String>,
+    /// Contract v28 (W12.2; rulings 421 and 619): inputs whose only row in
+    /// force is invalid, by subject and kind, naming the dataset:
+    /// `quarantined`, absent where none is.
+    pub quarantined: BTreeMap<(String, String), String>,
     /// Model ids a deployment admin routed to a `pricing` plugin (W12.6),
     /// each with its implementation, its version and whether it answered:
     /// `routed`, absent where every model id is built in.
@@ -526,6 +530,10 @@ impl Case {
                 .collect(),
             stale_after,
             unentitled: items(inputs, "unentitled")
+                .iter()
+                .map(|u| ((text(u, "subject_id"), text(u, "kind")), text(u, "dataset")))
+                .collect(),
+            quarantined: items(inputs, "quarantined")
                 .iter()
                 .map(|u| ((text(u, "subject_id"), text(u, "kind")), text(u, "dataset")))
                 .collect(),

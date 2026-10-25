@@ -393,6 +393,9 @@ pub fn resolve(
     // conversion leg, leg by leg, at most three deep (Q10).
     let mut market: Vec<Value> = Vec::new();
     let mut unentitled: BTreeMap<(String, String), String> = BTreeMap::new();
+    // Contract v28 (W12.2; ruling 619): inputs whose row in force is
+    // invalid, by subject and kind, naming the dataset.
+    let mut quarantined: BTreeMap<(String, String), String> = BTreeMap::new();
     let mut asked: BTreeSet<(String, i32)> = BTreeSet::new();
     let members: BTreeSet<String> = groups
         .values()
@@ -463,6 +466,7 @@ pub fn resolve(
                     as_of,
                     &business_date,
                     &mut unentitled,
+                    &mut quarantined,
                 )?;
                 for price in rows {
                     let Some(row) = market_row(&price) else {
@@ -759,6 +763,16 @@ pub fn resolve(
     }
     if let Some(set) = crate::chains::scenario(asker, job)? {
         document["scenario"] = set;
+    }
+    if !quarantined.is_empty() {
+        document["quarantined"] = Value::Array(
+            quarantined
+                .iter()
+                .map(|((subject, kind), dataset)| {
+                    json!({"subject_id": subject, "kind": kind, "dataset": dataset})
+                })
+                .collect(),
+        );
     }
     if !unentitled.is_empty() {
         document["unentitled"] = Value::Array(
@@ -1267,6 +1281,14 @@ fn event_groups(
 
 /// Prices of these subjects and kinds at the as-of, every page; what a
 /// dataset would have answered and the client is not entitled to, noted.
+///
+/// Contract v28 (W12.2; rulings 421 and 619): a job's read leaves invalid
+/// rows out as every default read does. Where a subject and kind found no
+/// row and a dataset was source silent for the subject, that dataset is read
+/// again by name with `include_quarantined`: where the row in force there
+/// is invalid, the input is quarantined, noted naming the dataset. A row
+/// answered invalid -- to a job naming its datasets with
+/// `include_quarantined` -- is never used, and is noted the same way.
 #[allow(clippy::too_many_arguments)]
 fn prices(
     asker: &dyn Ask,
@@ -1276,53 +1298,157 @@ fn prices(
     as_of: i64,
     business_date: &str,
     unentitled: &mut BTreeMap<(String, String), String>,
+    quarantined: &mut BTreeMap<(String, String), String>,
 ) -> Result<Vec<v1::Price>, Refused> {
+    let read = |subjects: &[String],
+                sources: &Option<v1::SourceChoice>|
+     -> Result<Vec<ListPricesReply>, Refused> {
+        let mut replies = Vec::new();
+        let mut cursor = String::new();
+        loop {
+            let reply: ListPricesReply = ask(
+                asker,
+                topics::LIST_PRICES,
+                "meridian.v1.ListPricesRequest",
+                &ListPricesRequest {
+                    subjects: subjects
+                        .iter()
+                        .map(|s| SubjectRef {
+                            entity_id: s.clone(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    kinds: kinds.to_vec(),
+                    sources: sources.clone(),
+                    // A business date's closes (ruling 458), else the latest in
+                    // force at the as-of.
+                    at_ns: if business_date.is_empty() { as_of } else { 0 },
+                    business_date: business_date.to_string(),
+                    as_of_ns: as_of,
+                    page_size: PAGE,
+                    cursor: cursor.clone(),
+                    ..Default::default()
+                },
+            )
+            .map_err(|failed| format!("the lake's prices could not be read: {failed}"))?;
+            let next = reply.next_cursor.clone();
+            replies.push(reply);
+            if next.is_empty() {
+                break;
+            }
+            cursor = next;
+        }
+        Ok(replies)
+    };
     let mut out = Vec::new();
-    let mut cursor = String::new();
-    loop {
-        let reply: ListPricesReply = ask(
-            asker,
-            topics::LIST_PRICES,
-            "meridian.v1.ListPricesRequest",
-            &ListPricesRequest {
-                subjects: subjects
-                    .iter()
-                    .map(|s| SubjectRef {
-                        entity_id: s.clone(),
-                        ..Default::default()
-                    })
-                    .collect(),
-                kinds: kinds.to_vec(),
-                sources: sources.clone(),
-                // A business date's closes (ruling 458), else the latest in
-                // force at the as-of.
-                at_ns: if business_date.is_empty() { as_of } else { 0 },
-                business_date: business_date.to_string(),
-                as_of_ns: as_of,
-                page_size: PAGE,
-                cursor: cursor.clone(),
-                ..Default::default()
-            },
-        )
-        .map_err(|failed| format!("the lake's prices could not be read: {failed}"))?;
+    let mut silent: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for reply in read(subjects, sources)? {
         for missing in &reply.unanswered {
+            let Some(subject) = &missing.subject else {
+                continue;
+            };
             if missing.reason == UnansweredReason::NotEntitled as i32 {
-                if let Some(subject) = &missing.subject {
-                    for kind in kinds {
-                        unentitled
-                            .entry((subject.entity_id.clone(), kind_name(*kind)))
-                            .or_insert(missing.dataset.clone());
-                    }
+                for kind in kinds {
+                    unentitled
+                        .entry((subject.entity_id.clone(), kind_name(*kind)))
+                        .or_insert(missing.dataset.clone());
                 }
+            }
+            if missing.reason == UnansweredReason::SourceSilent as i32
+                && !missing.dataset.is_empty()
+            {
+                silent
+                    .entry(missing.dataset.clone())
+                    .or_default()
+                    .insert(subject.entity_id.clone());
             }
         }
         out.extend(reply.prices);
-        if reply.next_cursor.is_empty() {
-            break;
+    }
+    let (out, mut answered) = usable(out, quarantined);
+    for (dataset, held) in silent {
+        let wanted: Vec<String> = held
+            .into_iter()
+            .filter(|s| kinds.iter().any(|k| !answered.contains(&(s.clone(), *k))))
+            .collect();
+        if wanted.is_empty() {
+            continue;
         }
-        cursor = reply.next_cursor;
+        let named = Some(v1::SourceChoice {
+            named: vec![dataset.clone()],
+            include_quarantined: true,
+            ..Default::default()
+        });
+        for reply in read(&wanted, &named)? {
+            for price in reply.prices {
+                let Some(subject) = price
+                    .meta
+                    .as_ref()
+                    .and_then(|m| m.subjects.first())
+                    .map(|s| s.entity_id.clone())
+                else {
+                    continue;
+                };
+                if answered.contains(&(subject.clone(), price.kind)) || !quarantine(&price) {
+                    continue;
+                }
+                quarantined
+                    .entry((subject.clone(), kind_name(price.kind)))
+                    .or_insert(dataset.clone());
+                answered.insert((subject, price.kind));
+            }
+        }
     }
     Ok(out)
+}
+
+/// Whether a row's effective state is invalid (contract v28, W10.4).
+fn quarantine(price: &v1::Price) -> bool {
+    price
+        .meta
+        .as_ref()
+        .is_some_and(|m| m.quality == v1::QualityState::Invalid as i32)
+}
+
+/// The rows a job may use -- every one not invalid -- and the subjects and
+/// kinds they answer; an invalid one noted quarantined, naming its dataset.
+fn usable(
+    rows: Vec<v1::Price>,
+    quarantined: &mut BTreeMap<(String, String), String>,
+) -> (Vec<v1::Price>, BTreeSet<(String, i32)>) {
+    let mut kept = Vec::new();
+    let mut invalid = Vec::new();
+    for price in rows {
+        if quarantine(&price) {
+            invalid.push(price);
+        } else {
+            kept.push(price);
+        }
+    }
+    let answered: BTreeSet<(String, i32)> = kept
+        .iter()
+        .filter_map(|p| Some((p.meta.as_ref()?.subjects.first()?.entity_id.clone(), p.kind)))
+        .collect();
+    for price in invalid {
+        let Some(meta) = price.meta.as_ref() else {
+            continue;
+        };
+        let Some(subject) = meta.subjects.first() else {
+            continue;
+        };
+        if answered.contains(&(subject.entity_id.clone(), price.kind)) {
+            continue;
+        }
+        quarantined
+            .entry((subject.entity_id.clone(), kind_name(price.kind)))
+            .or_insert(
+                meta.source
+                    .as_ref()
+                    .map(|s| s.dataset.clone())
+                    .unwrap_or_default(),
+            );
+    }
+    (kept, answered)
 }
 
 /// An input row's age at the `analytics` hop (W4.16; the latency spec's

@@ -21,8 +21,8 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 
 use crate::answer::{
-    Reads, CONVERSION_MISSING, CROSSED, DIRECT, IMPLEMENTATION_UNAVAILABLE, INVERTED, LOCAL_RECORD,
-    NOT_ENTITLED, PRICE_MISSING, PRICE_STALE,
+    Reads, CONVERSION_MISSING, CROSSED, DIRECT, IMPLEMENTATION_UNAVAILABLE, INPUT_QUARANTINED,
+    INVERTED, LOCAL_RECORD, NOT_ENTITLED, PRICE_MISSING, PRICE_STALE,
 };
 use crate::case::{Case, CaseError, Price, Result};
 use crate::exact::big::Big;
@@ -393,6 +393,13 @@ fn built_in(
             .get(&(instrument_id.to_string(), record.price_kind.clone()))
         {
             return Ok(Err((NOT_ENTITLED, dataset.clone())));
+        }
+        // Contract v28 (W12.2; ruling 619): its only row in force invalid.
+        if let Some(dataset) = case
+            .quarantined
+            .get(&(instrument_id.to_string(), record.price_kind.clone()))
+        {
+            return Ok(Err((INPUT_QUARANTINED, dataset.clone())));
         }
         return Ok(Err((PRICE_MISSING, record.price_kind.clone())));
     };
