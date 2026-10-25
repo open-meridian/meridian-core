@@ -2180,7 +2180,8 @@ fn request_series_records(
                     meridian_bus::RefusalStatus::InvalidArgument,
                     &[format!("series[{i}].series_key")],
                     format!(
-                        "series[{i}].series_key: no listed-series row under {} holds it, and the                          platform needs the series' terms",
+                        "series[{i}].series_key: no listed-series row under {} holds it, and the \
+                         platform needs the series' terms",
                         want.underlying_instrument_id
                     ),
                 )
