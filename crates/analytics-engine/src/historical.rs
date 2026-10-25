@@ -335,6 +335,7 @@ pub fn gather(
                         measure: key.clone(),
                         reason: why,
                         detail,
+                        series_key: Vec::new(),
                     });
                 }
                 continue;
@@ -350,6 +351,7 @@ pub fn gather(
                         measure: key.clone(),
                         reason: SCHEME_NOT_HELD,
                         detail: missing,
+                        series_key: Vec::new(),
                     });
                 }
                 continue;
@@ -388,6 +390,7 @@ pub fn gather(
                     measure: key.clone(),
                     reason: HISTORY_INSUFFICIENT,
                     detail: String::new(),
+                    series_key: Vec::new(),
                 });
             }
             continue;
@@ -456,6 +459,7 @@ pub fn compute(
                 numerator: None,
                 denominator: None,
                 currency_instrument_id: currency.clone(),
+                ..Default::default()
             });
         }
         let worst = worst_resolution(case, &held, &base, &mut part.reads)?;
@@ -476,6 +480,7 @@ pub fn compute(
                 numerator: None,
                 denominator: None,
                 currency_instrument_id: currency.clone(),
+                ..Default::default()
             });
         }
     }

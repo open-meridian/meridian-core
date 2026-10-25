@@ -54,15 +54,19 @@ fn figure(figure: &Figure) -> Result<WireFigure, String> {
                 .unwrap_or(0),
             business_date: figure.scenario.business_date.clone(),
             outcome_instrument_id: figure.scenario.outcome_instrument_id.clone(),
-            ..Default::default()
+            // Contract v28 (W12.8): a scenario point's key.
+            scenario_row_key: figure.scenario.scenario_row_key.clone(),
+            scenario_version: figure.scenario.scenario_version,
+            axis_positions: figure.scenario.axis_positions.clone(),
         }),
         value: decimal(&figure.value)?,
         numerator: decimal(&figure.numerator)?,
         denominator: decimal(&figure.denominator)?,
         currency_instrument_id: figure.currency_instrument_id.clone(),
-        computed_as: ComputedAs::Exact as i32,
-        oldest_input_source_ns: 0,
-        series_key: Vec::new(),
+        computed_as: ComputedAs::from_str_name(figure.computed_as).unwrap_or(ComputedAs::Exact)
+            as i32,
+        oldest_input_source_ns: figure.oldest_input_source_ns,
+        series_key: series_key(&figure.series_key),
     })
 }
 
@@ -77,8 +81,19 @@ fn unevaluated(entry: &Unevaluated) -> NotEvaluated {
         detail: entry.detail.clone(),
         age_ns: 0,
         ceiling_ns: 0,
-        series_key: Vec::new(),
+        series_key: series_key(&entry.series_key),
     }
+}
+
+/// Contract v28: a series' key as the wire's identifiers.
+fn series_key(key: &[(String, String)]) -> Vec<meridian_domain::v1::Identifier> {
+    key.iter()
+        .map(|(scheme, value)| meridian_domain::v1::Identifier {
+            scheme: scheme.clone(),
+            value: value.clone(),
+            ..Default::default()
+        })
+        .collect()
 }
 
 fn integer(value: &Value) -> i64 {

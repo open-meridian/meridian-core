@@ -919,7 +919,19 @@ pub fn read(
             request.to_date, request.from_date
         ));
     }
-    let Some(record) = held.calendars.get(&request.calendar_id) else {
+    // Contract v28 (W12.2; ruling 570 (i)): a venue's ID reads the
+    // trading-sessions calendar naming that venue, as closed-day calendars
+    // name the venues that follow them -- how a row's sessions are found
+    // through its venue.
+    let by_venue = || {
+        request.calendar_id.starts_with("VEN-").then(|| {
+            held.calendars.values().find(|c| {
+                c.kind == meridian_domain::v1::CalendarKind::TradingSessions as i32
+                    && c.venue_ids.contains(&request.calendar_id)
+            })
+        })?
+    };
+    let Some(record) = held.calendars.get(&request.calendar_id).or_else(by_venue) else {
         return Ok((
             ReadCalendarReply {
                 found: false,

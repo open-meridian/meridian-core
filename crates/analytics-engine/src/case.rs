@@ -304,6 +304,10 @@ pub struct Case {
     /// its quotes' staleness bound by default.
     pub executions: Vec<Execution>,
     pub tca_staleness_bound_ns: i64,
+    /// Contract v28 (W12.1): the chains the job names, resolved, and the
+    /// scenario set its points are generated from (W12.8).
+    pub chains: Vec<crate::chains::Chain>,
+    pub scenario: Option<crate::scenario::Set>,
 }
 
 /// A model id routed to a `pricing` plugin, for one job.
@@ -564,6 +568,8 @@ impl Case {
                 inputs.get("tca_staleness_bound_ns"),
                 "tca_staleness_bound_ns",
             )?,
+            chains: crate::chains::read(inputs)?,
+            scenario: crate::scenario::Set::read(inputs)?,
         })
     }
 

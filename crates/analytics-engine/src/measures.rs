@@ -103,6 +103,7 @@ pub fn plan(case: &Case, index: usize) -> Result<Planned> {
                 measure: key.clone(),
                 reason: SCHEME_NOT_HELD,
                 detail: name.clone(),
+                series_key: Vec::new(),
             })
             .collect()
     };
@@ -128,6 +129,7 @@ pub fn plan(case: &Case, index: usize) -> Result<Planned> {
                     measure: key.clone(),
                     reason: HISTORY_INSUFFICIENT,
                     detail: format!("{} business dates", case.dates.len()),
+                    series_key: Vec::new(),
                 });
                 Vec::new()
             } else {
@@ -142,6 +144,20 @@ pub fn plan(case: &Case, index: usize) -> Result<Planned> {
             measure: index,
             account: None,
         }],
+        // Contract v28 (W12.1): a chain measure is one unit over the job's
+        // chains; the grid one per account, over its positions.
+        name if crate::chains::is_chain_measure(name) => vec![Unit {
+            measure: index,
+            account: None,
+        }],
+        "scenario_grid" => {
+            preamble.not_evaluated = unknown(definition.breakdowns);
+            if preamble.not_evaluated.is_empty() {
+                per_account()
+            } else {
+                Vec::new()
+            }
+        }
         other => return Err(CaseError(format!("no computation for {other}"))),
     };
     Ok(Planned { preamble, units })
@@ -162,6 +178,10 @@ pub fn compute(case: &Case, unit: &Unit) -> Result<Part> {
         "resolution_payoff" => resolution_payoff(case, key, definition, account, &mut part)?,
         "implied_distribution" => implied_distribution(case, key, definition, &mut part)?,
         "execution_cost" => execution_cost(case, key, definition, account, &mut part)?,
+        name if crate::chains::is_chain_measure(name) => {
+            part = crate::chains::compute(case, key, definition)?
+        }
+        "scenario_grid" => part = crate::chains::scenario_grid(case, key, definition, account)?,
         other => return Err(CaseError(format!("no computation for {other}"))),
     }
     Ok(part)
@@ -300,6 +320,7 @@ fn unevaluated(
         measure: key.clone(),
         reason,
         detail,
+        series_key: Vec::new(),
     }
 }
 
@@ -460,6 +481,7 @@ fn linear(
                     numerator: None,
                     denominator: None,
                     currency_instrument_id: currency.clone(),
+                    ..Default::default()
                 });
             }
         }
@@ -519,6 +541,7 @@ fn concentration(
                 numerator: Some(worth.round_half_even(definition.scale)),
                 denominator: Some(total.clone()),
                 currency_instrument_id: String::new(),
+                ..Default::default()
             });
         }
     }
@@ -602,6 +625,7 @@ fn implied_distribution(
         numerator: None,
         denominator: None,
         currency_instrument_id: currency.clone(),
+        ..Default::default()
     });
     let exhaustive = group.exhaustive == "EVENT_GROUP_FLAG_TRUE";
     if !exhaustive {
@@ -624,6 +648,7 @@ fn implied_distribution(
                 numerator: Some(price.round_half_even(scale)),
                 denominator: Some(total.round_half_even(scale)),
                 currency_instrument_id: String::new(),
+                ..Default::default()
             }
         } else {
             Figure {
@@ -635,6 +660,7 @@ fn implied_distribution(
                 numerator: None,
                 denominator: None,
                 currency_instrument_id: currency.clone(),
+                ..Default::default()
             }
         });
     }
@@ -761,6 +787,7 @@ fn resolution_payoff(
                     numerator: None,
                     denominator: None,
                     currency_instrument_id: currency.clone(),
+                    ..Default::default()
                 });
             }
         }
@@ -954,6 +981,7 @@ fn execution_cost(
             numerator: None,
             denominator: None,
             currency_instrument_id: String::new(),
+            ..Default::default()
         });
     }
     Ok(())

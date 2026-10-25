@@ -28,6 +28,7 @@
 pub mod answer;
 pub mod canonical;
 pub mod case;
+pub mod chains;
 pub mod compile;
 pub mod definitions;
 pub mod exact;
@@ -37,9 +38,12 @@ pub mod measures;
 pub mod model;
 pub mod options;
 pub mod pricing;
+pub mod scenario;
 
 #[cfg(test)]
 mod bench;
+#[cfg(test)]
+mod chains_tests;
 #[cfg(test)]
 mod tests;
 

@@ -19,8 +19,18 @@ pub const REALIZED_SINCE: &str = "since the account opened";
 /// The implementation every model id has (requirement 19).
 pub const BUILT_IN: &str = "built-in";
 
-/// v26's model ids, each at version 1 (the first release's §1).
-pub const MODELS: [&str; 3] = ["cash", "quoted_price", "binary_event"];
+/// v26's model ids, each at version 1 (the first release's §1); from
+/// contract v28 (ruling 565) the option models and the calibrations.
+pub const MODELS: [&str; 8] = [
+    "cash",
+    "quoted_price",
+    "binary_event",
+    "american_binomial",
+    "black_scholes",
+    "black_76",
+    "svi",
+    "ssvi",
+];
 
 /// The breakdowns the linear measures allow (requirement 17).
 pub const BY: [&str; 6] = [
@@ -71,10 +81,52 @@ const HISTORICAL: &[(&str, &str)] = &[
     ("event_contracts", "excluded_with_resolution_worst_case"),
 ];
 
+/// The option models' parameters (contract v28; W12.1, W12.3; ruling 565).
+const OPTION_MODEL: &[(&str, &str)] = &[
+    (
+        "models",
+        "american_binomial_black_scholes_black_76_by_the_package_binding",
+    ),
+    ("steps", "200"),
+    ("time", "calendar_minutes_to_settlement_over_525600"),
+    (
+        "settlement_time",
+        "am_at_the_session_open_pm_at_1600_in_the_venue_zone",
+    ),
+    ("forward", "put_call_parity_at_the_least_abs_call_less_put"),
+];
+
+/// The surface's parameters (contract v28; W12.1).
+const SURFACE: &[(&str, &str)] = &[
+    ("slice", "raw_svi_out_of_the_money_mids"),
+    ("across", "ssvi_power_law"),
+    ("weights", "inverse_iv_bid_ask_width"),
+    ("checks", "gatheral_jacquier_butterfly_and_calendar"),
+    ("steps", "200"),
+];
+
+/// A positioning basis's parameters (ruling 591: one version per basis).
+const POSITIONING_LONG_CALLS_SHORT_PUTS: &[(&str, &str)] = &[
+    ("positioning_basis", "convention_long_calls_short_puts"),
+    ("greeks", "gex_dex_vex_chex"),
+    ("gex", "gamma_times_spot_squared_over_100_per_1pct_move"),
+    ("expiry_window", "the_job_chains"),
+    ("open_interest_date", "the_latest_on_or_before_the_as_of"),
+    ("steps", "200"),
+];
+const POSITIONING_SHORT_ALL: &[(&str, &str)] = &[
+    ("positioning_basis", "convention_short_all"),
+    ("greeks", "gex_dex_vex_chex"),
+    ("gex", "gamma_times_spot_squared_over_100_per_1pct_move"),
+    ("expiry_window", "the_job_chains"),
+    ("open_interest_date", "the_latest_on_or_before_the_as_of"),
+    ("steps", "200"),
+];
+
 /// Every definition the component serves, in the order it lists them:
-/// v26's at version 1, and from contract v27 `execution_cost` version 1 and
-/// `pnl` version 2.
-pub const DEFINITIONS: [Definition; 10] = [
+/// v26's at version 1, from contract v27 `execution_cost` version 1 and
+/// `pnl` version 2, and from contract v28 the options measures (W12.1).
+pub const DEFINITIONS: [Definition; 23] = [
     Definition {
         definition: "market_value",
         version: 1,
@@ -185,6 +237,139 @@ pub const DEFINITIONS: [Definition; 10] = [
         scale: 2,
         description: "Each bucket's unrealized P&L (open lots) and realized P&L since the \
                       account opened (closed lots)",
+    },
+    // Contract v28 (W12.1; ruling 565; OPT 2.2 and G14).
+    Definition {
+        definition: "implied_volatility",
+        version: 1,
+        parameters: OPTION_MODEL,
+        breakdowns: &["series", "quote_side"],
+        scale: 6,
+        description: "Each series' implied volatility at bid, mid and ask; none below intrinsic",
+    },
+    Definition {
+        definition: "implied_forward",
+        version: 1,
+        parameters: OPTION_MODEL,
+        breakdowns: &["expiry"],
+        scale: 6,
+        description: "Each expiration's forward from put-call parity, and the borrow it implies",
+    },
+    Definition {
+        definition: "greeks",
+        version: 1,
+        parameters: &[
+            ("models", "american_binomial_black_scholes_black_76_by_the_package_binding"),
+            ("steps", "200"),
+            ("node", "the_implied_volatility_at_mid"),
+            (
+                "units",
+                "delta_gamma_per_1_vega_vanna_per_vol_point_theta_charm_per_calendar_day_rho_per_1pct",
+            ),
+        ],
+        breakdowns: &["series", "greek"],
+        scale: 6,
+        description: "Each series' delta, gamma, theta, vega, rho, vanna and charm, from the node \
+                      its implied volatility came from",
+    },
+    Definition {
+        definition: "surface_fit",
+        version: 1,
+        parameters: SURFACE,
+        breakdowns: &["expiry", "parameter"],
+        scale: 6,
+        description: "Raw SVI per expiration and SSVI across them, no-arbitrage checked: the \
+                      parameters, RMSE in vol points and the share inside the bid-ask",
+    },
+    Definition {
+        definition: "surface_residual",
+        version: 1,
+        parameters: SURFACE,
+        breakdowns: &["series"],
+        scale: 4,
+        description: "Each series' residual to the fitted surface in vol points; rich or cheap \
+                      only outside the IV bid-ask",
+    },
+    Definition {
+        definition: "term_and_skew",
+        version: 1,
+        parameters: SURFACE,
+        breakdowns: &["expiry"],
+        scale: 6,
+        description: "ATM IV, constant-maturity 30, 60 and 90 days, the 25-delta risk reversal \
+                      and butterfly, and both expected moves",
+    },
+    Definition {
+        definition: "volatility_index",
+        version: 1,
+        parameters: &[
+            ("method", "cboe_published_method"),
+            ("target_days", "30"),
+            ("time", "calendar_minutes_to_settlement_over_525600"),
+        ],
+        breakdowns: &[],
+        scale: 4,
+        description: "Cboe's published volatility index method on the listed strip; no option \
+                      model",
+    },
+    Definition {
+        definition: "scenario_grid",
+        version: 1,
+        parameters: &[
+            ("surface_dynamics", "sticky_strike"),
+            ("expiration", "intrinsic"),
+            ("models", "american_binomial_black_scholes_black_76_by_the_package_binding"),
+            ("steps", "200"),
+        ],
+        breakdowns: &["instrument", "account"],
+        scale: 2,
+        description: "Each position's value at each point of a scenario set, on the fitted \
+                      surface",
+    },
+    Definition {
+        definition: "positioning_exposure",
+        version: 1,
+        parameters: POSITIONING_LONG_CALLS_SHORT_PUTS,
+        breakdowns: &["expiry", "greek", "series"],
+        scale: 2,
+        description: "GEX, DEX, VEX and CHEX by series and expiry; long calls and short puts",
+    },
+    Definition {
+        definition: "positioning_exposure",
+        version: 2,
+        parameters: POSITIONING_SHORT_ALL,
+        breakdowns: &["expiry", "greek", "series"],
+        scale: 2,
+        description: "GEX, DEX, VEX and CHEX by series and expiry; every series short",
+    },
+    Definition {
+        definition: "positioning_levels",
+        version: 1,
+        parameters: &[
+            ("positioning_basis", "convention_long_calls_short_puts"),
+            ("spot_grid", "plus_or_minus_15pct_in_0.5pct_steps"),
+            ("liquidity", "the_underlying_volume_times_spot"),
+        ],
+        breakdowns: &[],
+        scale: 4,
+        description: "The zero-gamma crossings, the gamma concentration strikes, gamma to \
+                      liquidity and the 0DTE share",
+    },
+    Definition {
+        definition: "max_pain",
+        version: 1,
+        parameters: &[("open_interest", "the_latest_statistic_on_or_before_the_as_of")],
+        breakdowns: &["expiry"],
+        scale: 4,
+        description: "Each expiration's strike at which the holders' payout is least, exact",
+    },
+    Definition {
+        definition: "open_interest_change",
+        version: 1,
+        parameters: &[("dates", "the_latest_trading_date_less_the_one_before")],
+        breakdowns: &["series"],
+        scale: 0,
+        description: "Each series' open interest less the trading date's before, exact",
     },
 ];
 

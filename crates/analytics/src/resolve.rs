@@ -726,6 +726,31 @@ pub fn resolve(
     if compiled.reads.executions {
         document["executions"] = Value::Array(measured.iter().map(Measured::to_json).collect());
     }
+    // Contract v28 (W12.1, W12.2, W12.8): the chains, resolved, and the
+    // scenario set; written only where the job reads them.
+    if compiled.reads.chains {
+        let held: BTreeSet<String> = positions
+            .iter()
+            .map(|(_, p)| p.instrument_id.clone())
+            .collect();
+        let rate = crate::chains::rate(asker, job, as_of, &sources);
+        let mut calendars = BTreeMap::new();
+        let mut chains = Vec::new();
+        for chain in crate::chains::refs(asker, job, compiled, &held, as_of) {
+            chains.push(crate::chains::chain(
+                asker,
+                &chain,
+                &sources,
+                as_of,
+                rate.as_ref(),
+                &mut calendars,
+            )?);
+        }
+        document["chains"] = Value::Array(chains);
+    }
+    if let Some(set) = crate::chains::scenario(asker, job)? {
+        document["scenario"] = set;
+    }
     if !unentitled.is_empty() {
         document["unentitled"] = Value::Array(
             unentitled

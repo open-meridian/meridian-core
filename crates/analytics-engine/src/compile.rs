@@ -47,6 +47,10 @@ pub struct Reads {
     /// Contract v27 (W12.1): whether a measure reads the accounts'
     /// executions and their quotes (`execution_cost`).
     pub executions: bool,
+    /// Contract v28 (W12.1): whether a measure reads a chain, and whether
+    /// the scenario grid reads the accounts' options' chains.
+    pub chains: bool,
+    pub held_chains: bool,
 }
 
 /// A job, compiled: its measures as the answer names them back, and its
@@ -76,7 +80,14 @@ fn key(measure: &MeasureRef) -> MeasureKey {
 
 /// Compile a job, or refuse it naming the input.
 pub fn compile(job: &Job) -> Result<Compiled, Refused> {
-    if job.account_ids.is_empty() {
+    // Contract v28 (W12.1): a job asking only chain measures may name no
+    // account; any other measure is over one account or more.
+    let chains_only = !job.measures.is_empty()
+        && job
+            .measures
+            .iter()
+            .all(|m| crate::chains::is_chain_measure(&m.definition));
+    if job.account_ids.is_empty() && !chains_only {
         return Err(refused("account_ids", "a job is over one account or more"));
     }
     for (i, account) in job.account_ids.iter().enumerate() {
@@ -160,6 +171,29 @@ pub fn compile(job: &Job) -> Result<Compiled, Refused> {
         if definition.definition == "execution_cost" {
             reads.executions = true;
         }
+        // Contract v28 (W12.1, W12.8).
+        if crate::chains::is_chain_measure(definition.definition) {
+            if job.chains.is_empty() {
+                return Err(refused(
+                    "chains",
+                    format!(
+                        "{} is over a chain, and the job names none",
+                        measure.definition
+                    ),
+                ));
+            }
+            reads.chains = true;
+        }
+        if definition.definition == "scenario_grid" {
+            if job.scenario_set.is_none() && job.scenario_ref.is_none() {
+                return Err(refused(
+                    "scenario_set",
+                    "scenario_grid is over a scenario set: inline, or saved by scenario_ref",
+                ));
+            }
+            reads.chains = true;
+            reads.held_chains = true;
+        }
         if matches!(
             definition.definition,
             "historical_var" | "expected_shortfall"
@@ -168,6 +202,68 @@ pub fn compile(job: &Job) -> Result<Compiled, Refused> {
         }
         measures.push(key(measure));
         served.push(definition);
+    }
+    // Contract v28 (W12.1): each chain names its underlying, and its window
+    // is two plain dates in order.
+    for (i, chain) in job.chains.iter().enumerate() {
+        if chain.underlying_instrument_id.trim().is_empty() {
+            return Err(refused(
+                format!("chains[{i}].underlying_instrument_id"),
+                "a chain names its underlying",
+            ));
+        }
+        for (name, date) in [
+            ("expiration_from", &chain.expiration_from),
+            ("expiration_to", &chain.expiration_to),
+        ] {
+            if !date.is_empty() && meridian_domain::date::Date::parse(date).is_err() {
+                return Err(refused(
+                    format!("chains[{i}].{name}"),
+                    "a date is YYYY-MM-DD",
+                ));
+            }
+        }
+        if !chain.expiration_from.is_empty()
+            && !chain.expiration_to.is_empty()
+            && chain.expiration_to < chain.expiration_from
+        {
+            return Err(refused(
+                format!("chains[{i}].expiration_to"),
+                "a window ends on or after it starts",
+            ));
+        }
+        for (k, key) in chain.series_keys.iter().enumerate() {
+            if key.scheme.is_empty() || key.value.is_empty() {
+                return Err(refused(
+                    format!("chains[{i}].series_keys[{k}]"),
+                    "a series key states its scheme and value",
+                ));
+            }
+        }
+    }
+    // Contract v28 (W12.8; rulings 581 to 583): an inline set, or a saved
+    // one by its key, never both.
+    if let Some(set) = &job.scenario_set {
+        if job.scenario_ref.is_some() {
+            return Err(refused("scenario_ref", "refused beside scenario_set"));
+        }
+        if let Some((field, words)) = crate::scenario::wire_refused("scenario_set", set) {
+            return Err(refused(field, words));
+        }
+    }
+    if let Some(saved) = &job.scenario_ref {
+        if saved.row_key.trim().is_empty() {
+            return Err(refused(
+                "scenario_ref.row_key",
+                "a saved scenario is named by its row key",
+            ));
+        }
+        if saved.dataset.trim().is_empty() {
+            return Err(refused(
+                "scenario_ref.dataset",
+                "a saved scenario names its dataset",
+            ));
+        }
     }
     if let Some(what_if) = &job.what_if {
         if !job.account_ids.contains(&what_if.account_id) {
@@ -262,5 +358,64 @@ mod tests {
         let mut bad = job.clone();
         bad.account_ids.clear();
         assert_eq!(compile(&bad).unwrap_err().field, "account_ids");
+    }
+
+    #[test]
+    fn a_chain_job_names_its_chains_and_a_grid_its_scenario_set() {
+        use meridian_domain::v1::{ChainRef, Scenario, ScenarioAxis, ScenarioRef, ScenarioSet};
+        let chain = ChainRef {
+            underlying_instrument_id: "INS-AAPL".into(),
+            expiration_from: "2026-11-20".into(),
+            expiration_to: "2026-11-20".into(),
+            series_keys: Vec::new(),
+        };
+        let job = Job {
+            chains: vec![chain.clone()],
+            measures: vec![
+                measure("implied_volatility", 1, ""),
+                measure("greeks", 1, ""),
+            ],
+            ..Default::default()
+        };
+        let compiled = compile(&job).unwrap();
+        assert!(compiled.reads.chains && compiled.reads.accounts.is_empty());
+        let mut bad = job.clone();
+        bad.chains.clear();
+        assert_eq!(compile(&bad).unwrap_err().field, "chains");
+        let mut bad = job.clone();
+        bad.chains[0].expiration_to = "2026-11-19".into();
+        assert_eq!(compile(&bad).unwrap_err().field, "chains[0].expiration_to");
+
+        let mut grid = Job {
+            account_ids: vec!["ACC-1".into()],
+            measures: vec![measure("scenario_grid", 1, "")],
+            ..Default::default()
+        };
+        assert_eq!(compile(&grid).unwrap_err().field, "scenario_set");
+        grid.scenario_set = Some(ScenarioSet {
+            name: "grid".into(),
+            axes: vec![ScenarioAxis {
+                name: "spot".into(),
+                steps: vec![Scenario {
+                    name: "base".into(),
+                    shocks: Vec::new(),
+                }],
+            }],
+        });
+        assert!(compile(&grid).unwrap().reads.held_chains);
+        grid.scenario_ref = Some(ScenarioRef {
+            row_key: "grid:1".into(),
+            dataset: "sample-options-1:scenarios".into(),
+            version: 1,
+        });
+        assert_eq!(compile(&grid).unwrap_err().field, "scenario_ref");
+        grid.scenario_ref = None;
+        grid.scenario_set.as_mut().unwrap().axes[0].steps[0]
+            .name
+            .clear();
+        assert_eq!(
+            compile(&grid).unwrap_err().field,
+            "scenario_set.axes[0].steps[0].name"
+        );
     }
 }
