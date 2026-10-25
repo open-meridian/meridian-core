@@ -873,3 +873,51 @@ fn the_one_id_state_is_kept_whole_and_each_replacement_numbered() {
     store.set_state(&key, "1044").unwrap();
     assert_eq!(store.state(&key).unwrap().as_deref(), Some("1044"));
 }
+
+#[test]
+fn every_company_version_is_kept_once_and_an_identifier_it_carried_finds_it() {
+    // Contract v28 (W3.32; ruling 612): the platform's ENT- record, each
+    // version its own row; an identifier a former version carried still
+    // finds the company, its window saying whether it holds it.
+    use meridian_domain::v1::{CompanyRecord, Identifier as PbIdentifier};
+    let store = store();
+    let company_id = format!("ENT-{}", unique("company"));
+    let cik = unique("cik");
+    let former = unique("cik");
+    let pb = |value: &str, until: i64| PbIdentifier {
+        scheme: "cik".into(),
+        value: value.into(),
+        valid_until_ns: until,
+        ..Default::default()
+    };
+    let first = CompanyRecord {
+        company_id: company_id.clone(),
+        name: "First Name".into(),
+        identifiers: vec![pb(&former, 0)],
+        former_names: Vec::new(),
+        version: 1,
+    };
+    let second = CompanyRecord {
+        name: "Second Name".into(),
+        identifiers: vec![pb(&former, 5), pb(&cik, 0)],
+        version: 2,
+        ..first.clone()
+    };
+    assert!(store.keep_company(&first, 1).unwrap());
+    assert!(!store.keep_company(&first, 2).unwrap());
+    assert!(store.keep_company(&second, 3).unwrap());
+    assert_eq!(store.company(&company_id).unwrap(), Some(second.clone()));
+    assert_eq!(
+        store.companies_with("cik", &cik).unwrap(),
+        vec![second.clone()]
+    );
+    assert_eq!(store.companies_with("cik", &former).unwrap(), vec![second]);
+    assert!(store
+        .companies_with("cik", &unique("cik"))
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store.company(&format!("ENT-{}", unique("none"))).unwrap(),
+        None
+    );
+}

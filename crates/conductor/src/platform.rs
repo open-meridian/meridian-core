@@ -477,6 +477,31 @@ impl Platform {
         event_group_reply_from_json(&value).map_err(PlatformError::Malformed)
     }
 
+    /// W1.32, W3.32 (contract v28; ruling 612): a company the instrument
+    /// store does not hold, asked by its open identifiers alone -- a CIK, an
+    /// LEI, each in a scheme on the licence list -- with no name the store
+    /// lacks and a request key; the platform's answer whole: its `ENT-`
+    /// record matched or minted, or the request queued for its staff. A
+    /// platform without the route answers as unreachable.
+    pub async fn match_or_mint_company(
+        &self,
+        request: &meridian_domain::v1::MatchOrMintCompanyRequest,
+        now_ns: i64,
+    ) -> Result<meridian_domain::v1::MatchOrMintCompanyReply, PlatformError> {
+        let body = serde_json::to_vec(&company_body(request))
+            .map_err(|failed| PlatformError::Malformed(failed.to_string()))?;
+        let response = self
+            .v24_call(
+                Method::Post,
+                "/api/v1/reference/match-company",
+                Some(body),
+                now_ns,
+            )
+            .await?;
+        let value: serde_json::Value = read_json(&response)?;
+        company_reply_from_json(&value).map_err(PlatformError::Malformed)
+    }
+
     /// A route contract v24 added (W3.4, W3.24, W3.25, W3.27, W3.28). A
     /// platform without it answers 404 -- or 405, 410 or 501 -- and is
     /// treated as unreachable, never as an answer (the build plan's step 4):
@@ -1250,6 +1275,107 @@ pub fn event_group_reply_from_json(
     };
     Ok(EscalateEventGroupReply {
         event_group,
+        minted: value
+            .get("minted")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        pending_review: value
+            .get("pending_review")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    })
+}
+
+/// W1.32's request as the platform's JSON spells it (contract v28): the
+/// identifiers, the name where one is known, and the request key; nothing
+/// of the deployment.
+pub fn company_body(request: &meridian_domain::v1::MatchOrMintCompanyRequest) -> serde_json::Value {
+    serde_json::json!({
+        "identifiers": request
+            .identifiers
+            .iter()
+            .map(|identifier| serde_json::json!({
+                "scheme": identifier.scheme,
+                "value": identifier.value,
+                "source": identifier.source,
+            }))
+            .collect::<Vec<_>>(),
+        "name": request.name,
+        "request_key": request.request_key,
+    })
+}
+
+/// The platform's answer to a company (W1.32): its `ENT-` record, read
+/// strictly where it names what is kept -- the ID, the name, the identifiers
+/// with their windows -- and refused where it does not.
+pub fn company_reply_from_json(
+    value: &serde_json::Value,
+) -> Result<meridian_domain::v1::MatchOrMintCompanyReply, String> {
+    use meridian_domain::v1::{CompanyRecord, FormerName, MatchOrMintCompanyReply};
+    let company = match value.get("company").filter(|held| held.is_object()) {
+        None => None,
+        Some(company) => {
+            let company_id = text_of(company.get("company_id"));
+            if !company_id.starts_with("ENT-") {
+                return Err(format!(
+                    "a company arrived as {company_id:?}, not the platform's"
+                ));
+            }
+            let name = text_of(company.get("name"));
+            if name.trim().is_empty() {
+                return Err(format!("the company {company_id} arrived with no name"));
+            }
+            let mut identifiers = Vec::new();
+            for held in company
+                .get("identifiers")
+                .and_then(|held| held.as_array())
+                .into_iter()
+                .flatten()
+            {
+                let scheme = text_of(held.get("scheme"));
+                let value = text_of(held.get("value"));
+                if scheme.is_empty() || value.is_empty() {
+                    return Err(format!(
+                        "the company {company_id} arrived with an identifier missing its scheme \
+                         or value"
+                    ));
+                }
+                identifiers.push(PbIdentifier {
+                    scheme,
+                    value,
+                    source: text_of(held.get("source")),
+                    valid_from_ns: int_of(held.get("valid_from_ns")),
+                    valid_until_ns: int_of(held.get("valid_until_ns")),
+                    trading_currency: String::new(),
+                });
+            }
+            if identifiers.is_empty() {
+                return Err(format!(
+                    "the company {company_id} arrived with no identifier"
+                ));
+            }
+            Some(CompanyRecord {
+                company_id,
+                name,
+                identifiers,
+                former_names: company
+                    .get("former_names")
+                    .and_then(|names| names.as_array())
+                    .into_iter()
+                    .flatten()
+                    .map(|former| FormerName {
+                        name: text_of(former.get("name")),
+                        valid_from: text_of(former.get("valid_from")),
+                        valid_until: text_of(former.get("valid_until")),
+                    })
+                    .filter(|former| !former.name.trim().is_empty())
+                    .collect(),
+                version: int_of(company.get("version")).max(1),
+            })
+        }
+    };
+    Ok(MatchOrMintCompanyReply {
+        company,
         minted: value
             .get("minted")
             .and_then(|v| v.as_bool())
@@ -2628,6 +2754,71 @@ pub(crate) mod tests {
             .is_err());
         let before = platform(Fake::new(vec![Ok(reply(404, "{}"))]))
             .escalate_event_group(&request, NOW)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(before, PlatformError::Unreachable { .. }),
+            "{before}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_company_is_asked_by_its_identifiers_and_its_ent_answer_read() {
+        // Contract v28 (W1.32, W3.32; ruling 612).
+        use meridian_domain::v1::MatchOrMintCompanyRequest;
+        let answer = serde_json::json!({
+            "company": {
+                "company_id": "ENT-01JC28APPLEINC000000000001",
+                "name": "Apple Inc.",
+                "identifiers": [{"scheme": "cik", "value": "0000320193", "valid_from_ns": "7"}],
+                "former_names": [{"name": "APPLE COMPUTER INC", "valid_until": "2007-01-04"}],
+                "version": "3"
+            },
+            "minted": true, "pending_review": false
+        })
+        .to_string();
+        let transport = Fake::new(vec![Ok(reply(200, &answer))]);
+        let request = MatchOrMintCompanyRequest {
+            identifiers: vec![identifier("cik", "0000320193", "")],
+            name: String::new(),
+            request_key: "k".into(),
+        };
+        let answered = platform(transport.clone())
+            .match_or_mint_company(&request, NOW)
+            .await
+            .unwrap();
+        assert!(answered.minted && !answered.pending_review);
+        let company = answered.company.unwrap();
+        assert_eq!(company.version, 3);
+        assert_eq!(company.identifiers[0].valid_from_ns, 7);
+        assert_eq!(company.former_names[0].valid_until, "2007-01-04");
+        assert!(transport.urls()[0].ends_with("/api/v1/reference/match-company"));
+        let body: serde_json::Value = serde_json::from_str(&transport.bodies()[0]).unwrap();
+        assert_eq!(body["identifiers"][0]["scheme"], "cik");
+        assert_eq!(body["request_key"], "k");
+        assert_eq!(
+            body.as_object().unwrap().len(),
+            3,
+            "identifiers, name and request key, nothing else: {body}"
+        );
+        // Queued: no company, pending review.
+        let queued = platform(Fake::new(vec![Ok(reply(
+            200,
+            r#"{"minted": false, "pending_review": true}"#,
+        ))]))
+        .match_or_mint_company(&request, NOW)
+        .await
+        .unwrap();
+        assert!(queued.company.is_none() && queued.pending_review);
+        // Under an ID that is not the platform's: refused; a platform before
+        // v28: unreachable.
+        let wrong = answer.replace("ENT-01JC28", "LCL-01JC28");
+        assert!(platform(Fake::new(vec![Ok(reply(200, &wrong))]))
+            .match_or_mint_company(&request, NOW)
+            .await
+            .is_err());
+        let before = platform(Fake::new(vec![Ok(reply(404, "{}"))]))
+            .match_or_mint_company(&request, NOW)
             .await
             .unwrap_err();
         assert!(

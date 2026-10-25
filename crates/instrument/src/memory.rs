@@ -235,6 +235,59 @@ impl Store for MemoryStore {
         Ok(self.read()?.event_groups.clone())
     }
 
+    fn keep_company(
+        &self,
+        company: &meridian_domain::v1::CompanyRecord,
+        _now_ns: i64,
+    ) -> Result<bool> {
+        let mut held = self.write_lock()?;
+        let key = (company.company_id.clone(), company.version);
+        if held.companies.contains_key(&key) {
+            return Ok(false);
+        }
+        held.companies.insert(key, company.clone());
+        Ok(true)
+    }
+
+    fn company(&self, company_id: &str) -> Result<Option<meridian_domain::v1::CompanyRecord>> {
+        Ok(self
+            .read()?
+            .companies
+            .range((company_id.to_string(), i64::MIN)..=(company_id.to_string(), i64::MAX))
+            .next_back()
+            .map(|(_, record)| record.clone()))
+    }
+
+    fn companies_with(
+        &self,
+        scheme: &str,
+        value: &str,
+    ) -> Result<Vec<meridian_domain::v1::CompanyRecord>> {
+        let held = self.read()?;
+        let ids: std::collections::BTreeSet<&String> = held
+            .companies
+            .iter()
+            .filter(|(_, record)| {
+                record
+                    .identifiers
+                    .iter()
+                    .any(|identifier| identifier.scheme == scheme && identifier.value == value)
+            })
+            .map(|((id, _), _)| id)
+            .collect();
+        let mut out = Vec::new();
+        for id in ids {
+            if let Some((_, record)) = held
+                .companies
+                .range((id.clone(), i64::MIN)..=(id.clone(), i64::MAX))
+                .next_back()
+            {
+                out.push(record.clone());
+            }
+        }
+        Ok(out)
+    }
+
     fn keep_calendar(
         &self,
         record: &meridian_domain::v1::CalendarRecord,

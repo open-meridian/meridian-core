@@ -50,15 +50,17 @@ const SCHEMA: &[&str] = &[
     include_str!("../migrations/0012_a_listing_trades_in_its_currency.sql"),
     include_str!("../migrations/0013_event_groups.sql"),
     include_str!("../migrations/0014_listed_terms.sql"),
+    include_str!("../migrations/0015_companies.sql"),
 ];
 
 /// A table the newest file makes. A database that has it has them all, so a
 /// start can check for this one and refuse a database an older release
 /// migrated, rather than failing later on the first record.
-const NEWEST_TABLE: &str = "instrument_event_group";
+const NEWEST_TABLE: &str = "instrument_company_identifier";
 
-/// And the column the newest file adds (0014, contract v28: a listed
-/// series' terms), with its table, which a table check cannot see.
+/// And the column the newest file adding one adds (0014, contract v28: a
+/// listed series' terms), with its table, which a table check cannot see;
+/// 0015 (contract v28: the company kind) adds tables only.
 const NEWEST_COLUMN: (&str, &str) = ("instrument", "listed_terms");
 
 /// Names the schema lock. An arbitrary constant, and it only has to be the same
@@ -1330,6 +1332,85 @@ impl Store for PostgresStore {
                 let bytes: Vec<u8> = row.get(0);
                 meridian_domain::v1::EventGroup::decode(bytes.as_slice()).map_err(|failed| {
                     StoreError::Unavailable(format!("an event group did not read: {failed}"))
+                })
+            })
+            .collect()
+    }
+
+    fn keep_company(
+        &self,
+        company: &meridian_domain::v1::CompanyRecord,
+        now_ns: i64,
+    ) -> Result<bool> {
+        use prost::Message;
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        let kept = tx
+            .execute(
+                "INSERT INTO instrument_company (company_id, version, record, kept_at_ns)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (company_id, version) DO NOTHING",
+                &[
+                    &company.company_id,
+                    &company.version,
+                    &company.encode_to_vec(),
+                    &now_ns,
+                ],
+            )
+            .map_err(unavailable)?
+            == 1;
+        for identifier in &company.identifiers {
+            tx.execute(
+                "INSERT INTO instrument_company_identifier (scheme, value, company_id)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT DO NOTHING",
+                &[&identifier.scheme, &identifier.value, &company.company_id],
+            )
+            .map_err(unavailable)?;
+        }
+        tx.commit().map_err(unavailable)?;
+        Ok(kept)
+    }
+
+    fn company(&self, company_id: &str) -> Result<Option<meridian_domain::v1::CompanyRecord>> {
+        use prost::Message;
+        self.conn()?
+            .query_opt(
+                "SELECT record FROM instrument_company
+                  WHERE company_id = $1 ORDER BY version DESC LIMIT 1",
+                &[&company_id],
+            )
+            .map_err(unavailable)?
+            .map(|row| {
+                let bytes: Vec<u8> = row.get(0);
+                meridian_domain::v1::CompanyRecord::decode(bytes.as_slice()).map_err(|failed| {
+                    StoreError::Unavailable(format!("a company record did not read: {failed}"))
+                })
+            })
+            .transpose()
+    }
+
+    fn companies_with(
+        &self,
+        scheme: &str,
+        value: &str,
+    ) -> Result<Vec<meridian_domain::v1::CompanyRecord>> {
+        use prost::Message;
+        self.conn()?
+            .query(
+                "SELECT DISTINCT ON (c.company_id) c.record
+                   FROM instrument_company c
+                   JOIN instrument_company_identifier i ON i.company_id = c.company_id
+                  WHERE i.scheme = $1 AND i.value = $2
+                  ORDER BY c.company_id, c.version DESC",
+                &[&scheme, &value],
+            )
+            .map_err(unavailable)?
+            .into_iter()
+            .map(|row| {
+                let bytes: Vec<u8> = row.get(0);
+                meridian_domain::v1::CompanyRecord::decode(bytes.as_slice()).map_err(|failed| {
+                    StoreError::Unavailable(format!("a company record did not read: {failed}"))
                 })
             })
             .collect()

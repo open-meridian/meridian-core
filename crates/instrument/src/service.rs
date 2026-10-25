@@ -582,6 +582,17 @@ pub fn serve_all_within(
             within: bound,
         }),
     );
+    // Companies (contract v28, W3.32; ruling 612): a miss by identifiers asks
+    // the platform through the conductor within the same bounded ask.
+    crate::companies::serve(
+        bus,
+        store.clone(),
+        clock.clone(),
+        Arc::new(crate::companies::BusAskCompany {
+            bus: Arc::clone(bus),
+            within: bound,
+        }),
+    );
     bus.serve(READ_INSTRUMENT_HISTORY, move |envelope| {
         let request: ReadInstrumentHistoryRequest =
             decode(&envelope, "meridian.v1.ReadInstrumentHistoryRequest")?;
