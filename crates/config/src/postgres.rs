@@ -2403,6 +2403,8 @@ impl Store for PostgresStore {
             key_status: row.get(2),
             pulled_at_ns: row.get(3),
             pull_status: row.get(4),
+            // The packs kept in the same message (contract v27, field 5).
+            packs: held.packs,
         }))
     }
 
@@ -2410,6 +2412,7 @@ impl Store for PostgresStore {
         use prost::Message;
         let listings = meridian_domain::v1::PullCatalogueReply {
             listings: held.listings.clone(),
+            packs: held.packs.clone(),
             ..Default::default()
         }
         .encode_to_vec();
@@ -2438,6 +2441,7 @@ impl Store for PostgresStore {
         documentation: &[meridian_domain::v1::DocumentationText],
         listing_statement: &str,
         by: &Author,
+        pack: &str,
     ) -> Result<bool> {
         if !self.record_plugin_version_documented(version, documentation)? {
             return Ok(false);
@@ -2448,7 +2452,7 @@ impl Store for PostgresStore {
                 "UPDATE config_plugin_version
                     SET listing_statement = $3, uploaded_through_delegation = $4,
                         uploaded_client_name = $5, uploaded_prepared_call_id = $6,
-                        uploaded_note = $7
+                        uploaded_note = $7, installed_by_pack = $8
                   WHERE name = $1 AND version = $2",
                 &[
                     &metadata.name,
@@ -2458,10 +2462,96 @@ impl Store for PostgresStore {
                     &by.client,
                     &by.prepared_call_id,
                     &by.note,
+                    &pack,
                 ],
             )
             .map_err(unavailable)?;
         Ok(true)
+    }
+
+    fn install_pack(&self, name: &str, version: &str) -> Result<String> {
+        Ok(self
+            .conn()?
+            .query_opt(
+                "SELECT installed_by_pack FROM config_plugin_version
+                  WHERE name = $1 AND version = $2",
+                &[&name, &version],
+            )
+            .map_err(unavailable)?
+            .map(|row| row.get(0))
+            .unwrap_or_default())
+    }
+
+    fn record_pack_change(&self, change: &crate::store::PackChange) -> Result<()> {
+        use prost::Message;
+        let members = meridian_domain::v1::PackStatus {
+            members: change.members.clone(),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        self.conn()?
+            .execute(
+                "INSERT INTO config_pack_change
+                        (pack, kind, revision, held, members, changed_by, through_delegation,
+                         client_name, prepared_call_id, changed_at_ns, note)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                &[
+                    &change.pack,
+                    &change.kind.name(),
+                    &i64::try_from(change.revision).unwrap_or(i64::MAX),
+                    &change.held.encode_to_vec(),
+                    &members,
+                    &change.by.by,
+                    &change.by.delegation,
+                    &change.by.client,
+                    &change.by.prepared_call_id,
+                    &change.at_ns,
+                    &change.by.note,
+                ],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
+    fn pack_changes(&self, pack: &str) -> Result<Vec<crate::store::PackChange>> {
+        use prost::Message;
+        self.conn()?
+            .query(
+                "SELECT pack, kind, revision, held, members, changed_by, through_delegation,
+                        client_name, prepared_call_id, changed_at_ns, note
+                   FROM config_pack_change
+                  WHERE $1 = '' OR pack = $1
+                  ORDER BY change_id",
+                &[&pack],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| {
+                let kind: String = row.get(1);
+                let held: Vec<u8> = row.get(3);
+                let members: Vec<u8> = row.get(4);
+                Ok(crate::store::PackChange {
+                    pack: row.get(0),
+                    kind: crate::store::PackChangeKind::from_name(&kind).ok_or_else(|| {
+                        StoreError::Unavailable(format!("a pack change of kind {kind}"))
+                    })?,
+                    revision: u64::try_from(row.get::<_, i64>(2)).unwrap_or_default(),
+                    held: meridian_domain::v1::PluginPack::decode(&held[..])
+                        .map_err(unavailable)?,
+                    members: meridian_domain::v1::PackStatus::decode(&members[..])
+                        .map_err(unavailable)?
+                        .members,
+                    by: Author {
+                        by: row.get(5),
+                        delegation: row.get(6),
+                        client: row.get(7),
+                        prepared_call_id: row.get(8),
+                        note: row.get(10),
+                    },
+                    at_ns: row.get(9),
+                })
+            })
+            .collect()
     }
 
     fn installation(&self, name: &str, version: &str) -> Result<Option<Author>> {

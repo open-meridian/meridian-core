@@ -315,6 +315,58 @@ pub static SPECS: &[Spec] = &[
         Gate::DeploymentAdmin,
         set_usage_schema,
     ),
+    // Contract v27's wire, built in v28 (W8.18, W8.19; spec/starter-packs,
+    // requirement 32): Browse's pack view and the install sheet's reads,
+    // install and retry, the pack page and its checklist, Update all and
+    // Remove pack, each a deployment admin's.
+    spec(
+        "list_registry_packs",
+        "List the starter packs",
+        "the starter packs in the catalogue's copy this deployment's conductor keeps, as Browse's \"Starter packs\" view shows them (pulled first with pull_now): one line a pack -- its name (organisation/pack), title, curator, revision, asset classes, members, and this deployment's state (\"Not installed\", or \"Installed: 7 of 9 members\") -- by words (search), a page at a time (next_cursor). A withdrawn pack is not listed. A pack's title and description are its curator's words. A pack is a list of listings, never a merged plugin; naming a plugin in one is not an endorsement.",
+        true,
+        Gate::DeploymentAdmin,
+        list_packs_schema,
+    ),
+    spec(
+        "read_registry_pack",
+        "Read a starter pack",
+        "one starter pack as its install sheet shows it: each member in the curator's order with its group, its selection (required, preselected or choose; brokers and venues to choose, none preselected), its version as resolved (its latest offered release at or above its minimum), its roles, its floor against this deployment, its registry, its terms' access basis (Licensed, Open) and its terms section's address, and its state here (installed already at a version, unavailable, or not permitted here with the reason, neither of which can be ticked); with the revision to install, the Terms' address where a member is community, and that each data source's terms are accepted on Data sources, never by a pack.",
+        true,
+        Gate::DeploymentAdmin,
+        pack_schema,
+    ),
+    spec(
+        "install_pack",
+        "Install a starter pack",
+        "install a starter pack, as the install sheet's Install does, with a note: members whole as ticked, or else the required and preselected members with `with` ticked and `without` left out (each a listing, or its plugin part); a name that is not a member is refused by its path before anything moves, and a revision other than the catalogue's latest refused naming revision. Each member is installed by dashboard__install_plugin's steps, one by one as a job that goes on past a failure and rolls nothing back, each its own install record naming the pack, and the pack one record of the members ticked and each one's outcome; a member installed already at any version is left alone. Answered at once with each member's state, those to install \"installing\"; dashboard__read_pack follows the job. Retry installs the failed members again. Install launches nothing: each member launches from the pack page, its roles approved on its own.",
+        false,
+        Gate::DeploymentAdmin,
+        install_pack_schema,
+    ),
+    spec(
+        "read_pack",
+        "Read a starter pack's page",
+        "a starter pack's page, the setup checklist: the revision installed and the catalogue's latest, whether its curator withdrew it, and each member -- its group, its version installed and the latest offered, its state (not_installed, installing, failed, installed, launched, unavailable, not_permitted) and the reason, its instances, its connection from that instance's \"Setting up\" (\"Set up\", the next step's words, \"Not answering\", or \"Launch to connect\"), the revision that added it since the install or that dropped it (\"No longer in this pack\", still installed).",
+        true,
+        Gate::DeploymentAdmin,
+        pack_schema,
+    ),
+    spec(
+        "update_pack",
+        "Update every member of a starter pack",
+        "\"Update all\", with a note: each launched member with a newer offered version in its source registry moved by its own update, each its own record; a member whose new version asks for more roles skipped as \"Needs approval\", which a person approves on its own Update sheet; an installed member not launched given the newer version; a member added since never installed. One record of each member's outcome. Nothing launches that was not launched.",
+        false,
+        Gate::DeploymentAdmin,
+        pack_note_schema,
+    ),
+    spec(
+        "remove_pack",
+        "Remove a starter pack's record",
+        "\"Remove pack\", with a note: only this deployment's record of the pack is removed, its own record; every member stays installed, and running where it runs, answered as each stays. Nothing is stopped or uninstalled.",
+        false,
+        Gate::DeploymentAdmin,
+        pack_note_schema,
+    ),
     spec(
         "read_plugin_access",
         "Read who holds access to a plugin",
@@ -442,6 +494,56 @@ fn install_schema() -> Value {
             "note": note_schema(),
         },
         "required": ["listing", "version", "registry", "note"],
+        "additionalProperties": false,
+    })
+}
+
+fn list_packs_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "search": {"type": "string"},
+            "cursor": {"type": "string", "description": "next_cursor from the page before"},
+            "pull_now": {"type": "boolean", "description": "pull the catalogue first"},
+        },
+        "additionalProperties": false,
+    })
+}
+
+fn pack_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {"pack": {"type": "string", "description": "organisation/pack"}},
+        "required": ["pack"],
+        "additionalProperties": false,
+    })
+}
+
+fn install_pack_schema() -> Value {
+    let names = json!({"type": "array", "items": {"type": "string"}, "maxItems": 64});
+    json!({
+        "type": "object",
+        "properties": {
+            "pack": {"type": "string", "description": "organisation/pack"},
+            "revision": {"type": "integer", "minimum": 1, "description": "the revision read; the catalogue's latest when absent"},
+            "members": {"type": "array", "items": {"type": "string"}, "maxItems": 64, "description": "the members ticked, whole; or leave it out for the pack's defaults with `with` and `without`"},
+            "with": names,
+            "without": names,
+            "note": note_schema(),
+        },
+        "required": ["pack", "note"],
+        "additionalProperties": false,
+    })
+}
+
+fn pack_note_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "pack": {"type": "string", "description": "organisation/pack"},
+            "note": note_schema(),
+        },
+        "required": ["pack", "note"],
         "additionalProperties": false,
     })
 }
@@ -1124,6 +1226,12 @@ pub async fn call(app: &App, caller: &Caller, spec: &Spec, arguments: Value) -> 
         "acknowledge_pull" => at.acknowledge_pull(&arguments).await,
         "read_registries" => at.read_registries(&arguments).await,
         "set_reports_plugin_usage" => at.set_reports_plugin_usage(&arguments).await,
+        "list_registry_packs" => at.list_registry_packs(&arguments).await,
+        "read_registry_pack" => at.read_registry_pack(&arguments).await,
+        "install_pack" => at.install_pack(&arguments).await,
+        "read_pack" => at.read_pack(&arguments).await,
+        "update_pack" => at.update_pack(&arguments).await,
+        "remove_pack" => at.remove_pack(&arguments).await,
         "read_plugin_access" => at.read_plugin_access(&arguments).await,
         "read_linkable_accounts" => at.read_linkable_accounts(&arguments),
         other => (
@@ -1164,6 +1272,24 @@ fn boolean(top: &Map<String, Value>, name: &str, problems: &mut Problems) -> boo
         Some(_) => {
             problems.add(name, "true or false");
             false
+        }
+    }
+}
+
+/// A list of names, refused by its path where it is anything else; None
+/// where it is absent.
+fn strings(top: &Map<String, Value>, name: &str, problems: &mut Problems) -> Option<Vec<String>> {
+    match top.get(name) {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(items)) if items.iter().all(Value::is_string) => Some(
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(|s| s.trim().to_string()))
+                .collect(),
+        ),
+        Some(_) => {
+            problems.add(name, "a list of listings, organisation/plugin");
+            None
         }
     }
 }
@@ -2510,6 +2636,278 @@ impl Context<'_> {
         }
     }
 
+    /// W8.18 (contract v27's wire, built in v28): Browse's pack view.
+    async fn list_registry_packs(&self, arguments: &Value) -> (Value, String) {
+        use crate::registry::packs;
+        let mut problems = Problems::default();
+        let Some(top) = top(arguments, &["search", "cursor", "pull_now"], &mut problems) else {
+            return (problems.refusal(), DEPLOYMENT_ADMIN.into());
+        };
+        let request = meridian_domain::v1::ListRegistryPacksRequest {
+            search: text(top, "search", "", false, &mut problems),
+            cursor: text(top, "cursor", "", false, &mut problems),
+            pull_now: boolean(top, "pull_now", &mut problems),
+            page_size: 50,
+            ..Default::default()
+        };
+        if !problems.is_empty() {
+            return (problems.refusal(), DEPLOYMENT_ADMIN.into());
+        }
+        let reply = match packs::registry_packs(self.app, &self.caller.subject, request).await {
+            Ok(reply) => reply,
+            Err(failed) => {
+                return (
+                    refused("unavailable", &failed, Vec::new()),
+                    DEPLOYMENT_ADMIN.into(),
+                )
+            }
+        };
+        let mut lines = Vec::new();
+        for pack in &reply.packs {
+            let mut line = packs::pack_json(pack);
+            if let Ok(status) = packs::pack_status(self.app, &self.caller.subject, &pack.pack).await
+            {
+                line["state"] = json!(packs::deployment_state(&status));
+                line["installed_revision"] = json!(status.installed_revision);
+            }
+            lines.push(line);
+        }
+        (
+            json!({"outcome": "unchanged", "data": {
+                "packs": lines,
+                "next_cursor": reply.next_cursor,
+                "catalogue_pulled_at_ns": reply.catalogue_pulled_at_ns,
+            }}),
+            DEPLOYMENT_ADMIN.into(),
+        )
+    }
+
+    /// The pack named, from the catalogue's copy, or the refusal naming it.
+    async fn registry_pack(
+        &self,
+        top: &Map<String, Value>,
+        problems: &mut Problems,
+    ) -> Result<meridian_domain::v1::PluginPack, Value> {
+        let name = text(top, "pack", "", true, problems);
+        if !problems.is_empty() {
+            return Err(std::mem::take(problems).refusal());
+        }
+        match crate::registry::packs::registry_pack(self.app, &self.caller.subject, &name).await {
+            Ok(Some(pack)) => Ok(pack),
+            Ok(None) => Err(refused(
+                "not_listed",
+                &format!(
+                    "No starter pack {name} is offered in the catalogue this deployment holds."
+                ),
+                vec![json!({"path": "pack"})],
+            )),
+            Err(failed) => Err(refused("unavailable", &failed, Vec::new())),
+        }
+    }
+
+    async fn read_registry_pack(&self, arguments: &Value) -> (Value, String) {
+        use crate::registry::packs;
+        let mut problems = Problems::default();
+        let Some(top) = top(arguments, &["pack"], &mut problems) else {
+            return (problems.refusal(), DEPLOYMENT_ADMIN.into());
+        };
+        let pack = match self.registry_pack(top, &mut problems).await {
+            Ok(pack) => pack,
+            Err(refusal) => return (refusal, DEPLOYMENT_ADMIN.into()),
+        };
+        let status = packs::pack_status(self.app, &self.caller.subject, &pack.pack)
+            .await
+            .unwrap_or_default();
+        let mut data = packs::pack_json(&pack);
+        let members = pack.revision.clone().unwrap_or_default().members;
+        let mut lines = Vec::new();
+        for member in &members {
+            let held = status.members.iter().find(|m| m.listing == member.listing);
+            let resolved = held.map(|m| m.latest_version.clone()).unwrap_or_default();
+            let listing = crate::registry::listings(
+                self.app,
+                &self.caller.subject,
+                meridian_domain::v1::ListRegistryPluginsRequest {
+                    listing: member.listing.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .ok()
+            .and_then(|reply| reply.listings.into_iter().next());
+            let version = listing.as_ref().and_then(|l| {
+                l.versions
+                    .iter()
+                    .find(|v| v.version == resolved && v.registry == member.registry)
+            });
+            lines.push(json!({
+                "listing": member.listing,
+                "group": others_words(&member.group),
+                "registry": member.registry,
+                "label": crate::registry::registry_label(&member.registry),
+                "minimum_version": member.minimum_version,
+                "version": resolved,
+                "roles": version.and_then(|v| v.metadata.as_ref()).map(|m| m.roles.clone()).unwrap_or_default(),
+                "floor": version.map(|v| v.schema_version.clone()),
+                "floor_served_here": version.map(|v| crate::registry::floor_mark(v).0),
+                "terms": version.map(packs::access_basis).unwrap_or_default(),
+                "terms_section": format!("{}?tab=documentation&section=terms", crate::registry::listing_path(&member.listing)),
+                "state": held.map(|m| packs::state_key(m.state)).unwrap_or("not_installed"),
+                "reason": held.map(|m| m.reason.clone()).unwrap_or_default(),
+                "installed_version": held.map(|m| m.installed_version.clone()).unwrap_or_default(),
+            }));
+        }
+        data["members"] = json!(lines);
+        data["state"] = json!(packs::deployment_state(&status));
+        data["installed_revision"] = json!(status.installed_revision);
+        if members.iter().any(|m| m.registry == "community") {
+            data["terms_url"] = json!(crate::notice::TERMS_URL);
+        }
+        data["data_sources"] = json!(packs::DATA_SOURCES_LINE);
+        (
+            json!({"outcome": "unchanged", "data": data}),
+            DEPLOYMENT_ADMIN.into(),
+        )
+    }
+
+    async fn install_pack(&self, arguments: &Value) -> (Value, String) {
+        use crate::registry::packs;
+        let mut problems = Problems::default();
+        let Some(top) = top(
+            arguments,
+            &["pack", "revision", "members", "with", "without", "note"],
+            &mut problems,
+        ) else {
+            return (problems.refusal(), DEPLOYMENT_ADMIN.into());
+        };
+        let note = text(top, "note", "", true, &mut problems);
+        let revision = integer(top, "revision", "", false, &mut problems);
+        let members = strings(top, "members", &mut problems);
+        let with = strings(top, "with", &mut problems).unwrap_or_default();
+        let without = strings(top, "without", &mut problems).unwrap_or_default();
+        let pack = match self.registry_pack(top, &mut problems).await {
+            Ok(pack) => pack,
+            Err(refusal) => return (refusal, DEPLOYMENT_ADMIN.into()),
+        };
+        if !problems.is_empty() {
+            return (problems.refusal(), DEPLOYMENT_ADMIN.into());
+        }
+        let ticked = match packs::ticked(&pack, members.as_deref(), &with, &without) {
+            Ok(ticked) => ticked,
+            Err((path, words)) => {
+                return (
+                    refused("invalid", &words, vec![json!({"path": path})]),
+                    DEPLOYMENT_ADMIN.into(),
+                )
+            }
+        };
+        let request = meridian_domain::v1::InstallPackRequest {
+            pack: pack.pack.clone(),
+            revision: if revision > 0 {
+                revision as u64
+            } else {
+                pack.revision.as_ref().map_or(0, |r| r.revision)
+            },
+            members: ticked,
+            note,
+        };
+        match self
+            .deployment_act::<meridian_domain::v1::PackInstall>(
+                packs::INSTALL_PACK,
+                "meridian.v1.InstallPackRequest",
+                request,
+                crate::registry::INSTALLING,
+            )
+            .await
+        {
+            Ok(answer) => (
+                json!({"outcome": "made", "data": packs::install_json(&answer)}),
+                DEPLOYMENT_ADMIN.into(),
+            ),
+            Err(refusal) => (refusal, DEPLOYMENT_ADMIN.into()),
+        }
+    }
+
+    async fn read_pack(&self, arguments: &Value) -> (Value, String) {
+        use crate::registry::packs;
+        let mut problems = Problems::default();
+        let Some(top) = top(arguments, &["pack"], &mut problems) else {
+            return (problems.refusal(), DEPLOYMENT_ADMIN.into());
+        };
+        let name = text(top, "pack", "", true, &mut problems);
+        if !problems.is_empty() {
+            return (problems.refusal(), DEPLOYMENT_ADMIN.into());
+        }
+        match packs::checklist(self.app, &self.caller.subject, &name, self.records).await {
+            Ok(checklist) => {
+                let mut data = packs::status_json(&checklist.status);
+                if let Some(members) = data["members"].as_array_mut() {
+                    for member in members {
+                        let listing = member["listing"].as_str().unwrap_or_default().to_string();
+                        if let Some(href) = checklist.links.get(&listing) {
+                            member["setup_href"] = json!(href);
+                        }
+                    }
+                }
+                (
+                    json!({"outcome": "unchanged", "data": data}),
+                    DEPLOYMENT_ADMIN.into(),
+                )
+            }
+            Err(failed) => (
+                refused("not_listed", &failed, vec![json!({"path": "pack"})]),
+                DEPLOYMENT_ADMIN.into(),
+            ),
+        }
+    }
+
+    async fn update_pack(&self, arguments: &Value) -> (Value, String) {
+        self.pack_act(arguments, crate::registry::packs::UPDATE_PACK, true)
+            .await
+    }
+
+    async fn remove_pack(&self, arguments: &Value) -> (Value, String) {
+        self.pack_act(arguments, crate::registry::packs::REMOVE_PACK, false)
+            .await
+    }
+
+    /// Update all, or Remove pack: the pack and a note.
+    async fn pack_act(&self, arguments: &Value, topic: &str, update: bool) -> (Value, String) {
+        let mut problems = Problems::default();
+        let Some(top) = top(arguments, &["pack", "note"], &mut problems) else {
+            return (problems.refusal(), DEPLOYMENT_ADMIN.into());
+        };
+        let pack = text(top, "pack", "", true, &mut problems);
+        let note = text(top, "note", "", true, &mut problems);
+        if !problems.is_empty() {
+            return (problems.refusal(), DEPLOYMENT_ADMIN.into());
+        }
+        let answered = if update {
+            self.deployment_act::<meridian_domain::v1::PackStatus>(
+                topic,
+                "meridian.v1.UpdatePackRequest",
+                meridian_domain::v1::UpdatePackRequest { pack, note },
+                crate::registry::INSTALLING,
+            )
+            .await
+        } else {
+            self.deployment_act::<meridian_domain::v1::PackStatus>(
+                topic,
+                "meridian.v1.RemovePackRequest",
+                meridian_domain::v1::RemovePackRequest { pack, note },
+                Duration::from_secs(10),
+            )
+            .await
+        };
+        match answered {
+            Ok(status) => (
+                json!({"outcome": "made", "data": crate::registry::packs::status_json(&status)}),
+                DEPLOYMENT_ADMIN.into(),
+            ),
+            Err(refusal) => (refusal, DEPLOYMENT_ADMIN.into()),
+        }
+    }
+
     async fn update_plugin(&self, arguments: &Value) -> (Value, String) {
         let mut problems = Problems::default();
         let Some(top) = top(
@@ -3061,6 +3459,23 @@ pub const PARITY: &[(&str, &str)] = &[
     ("/admin/plugins/registry/update", "update_plugin"),
     ("/admin/plugins/registry/acknowledge", "acknowledge_pull"),
     ("/admin/plugins/registry/pull", "read_registries"),
+    // Contract v27's wire, built in v28 (W8.18, W8.19): starter packs.
+    ("/admin/plugins/versions?tab=browse&view=packs", "list_registry_packs"),
+    (
+        "/admin/plugins/packs/{organisation}/{pack}/install",
+        "read_registry_pack install_pack",
+    ),
+    ("/admin/plugins/packs/install", "install_pack"),
+    ("/admin/plugins/packs/{organisation}/{pack}", "read_pack"),
+    ("/admin/plugins/packs/{organisation}/{pack}/update", "read_pack update_pack"),
+    ("/admin/plugins/packs/update", "update_pack"),
+    ("/admin/plugins/packs/{organisation}/{pack}/remove", "read_pack remove_pack"),
+    ("/admin/plugins/packs/remove", "remove_pack"),
+    ("/terminal/packs", "list_registry_packs"),
+    ("/terminal/packs/{organisation}/{pack}", "read_pack"),
+    ("/terminal/packs/install", "install_pack"),
+    ("/terminal/packs/update", "update_pack"),
+    ("/terminal/packs/remove", "remove_pack"),
     ("/admin/plugins/registry/usage", "set_reports_plugin_usage"),
     ("/terminal/plugins/stop", "stop_plugin"),
     // Contract v25 (W8.15): the Installed list's Retire.

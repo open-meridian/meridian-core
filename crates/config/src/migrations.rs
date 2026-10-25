@@ -177,6 +177,12 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0025_deployment_settings.sql"),
         then: None,
     },
+    Migration {
+        version: 26,
+        name: "starter_packs",
+        sql: include_str!("../migrations/0026_starter_packs.sql"),
+        then: None,
+    },
 ];
 
 /// Migration 18 (contract v22; W11.21, decisions/031): each instance holding

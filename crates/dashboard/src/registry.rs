@@ -62,9 +62,12 @@ pub fn listing_path(listing: &str) -> String {
 }
 
 pub mod installed;
+pub mod packs;
 
 pub fn routes() -> Router<Arc<App>> {
     Router::new()
+        // Contract v27's wire, built in v28 (W8.18, W8.19): starter packs.
+        .merge(packs::routes())
         .route("/admin/plugins/versions", get(plugins_page))
         // Ruling 305: a plugin's Versions, and its acts.
         .route("/admin/plugins/versions/launch", post(installed::launch))
@@ -419,6 +422,22 @@ async fn plugins_page(
 }
 
 async fn browse(app: &App, session: &Session, asked: &HashMap<String, String>) -> String {
+    // Browse's two-way switch (W8.18; spec/starter-packs, requirement 16).
+    if asked.get("view").map(String::as_str) == Some("packs") {
+        return format!(
+            "{}{}",
+            packs::switch("packs"),
+            packs::view(app, session, asked).await
+        );
+    }
+    format!(
+        "{}{}",
+        packs::switch("plugins"),
+        browse_plugins(app, session, asked).await
+    )
+}
+
+async fn browse_plugins(app: &App, session: &Session, asked: &HashMap<String, String>) -> String {
     let field = |name: &str| asked.get(name).cloned().unwrap_or_default();
     let reply = match listings(
         app,

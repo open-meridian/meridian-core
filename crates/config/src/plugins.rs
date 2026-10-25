@@ -101,8 +101,11 @@ struct Plugins {
     /// The community and verified registries, where the deployment reaches
     /// them (contract v25, W8.10 to W8.12).
     registries: Option<Arc<crate::registries::Hold>>,
+    /// The starter packs whose install is under way (W8.18, v28).
+    packs: packs::Jobs,
 }
 
+pub mod packs;
 mod registry;
 pub use registry::{
     ACKNOWLEDGE_PULL, INSTALL_PLUGIN, LIST_PLUGIN_USAGE_REPORTS, REGISTRY_PLUGINS,
@@ -1243,6 +1246,7 @@ pub fn serve_plugins_and_registries(
         archive,
         local,
         registries,
+        packs: packs::Jobs::default(),
     });
     answer_on(
         &bus,
@@ -1273,6 +1277,46 @@ pub fn serve_plugins_and_registries(
             "meridian.v1.PluginLaunch",
         ),
         |plugins, request, envelope| plugins.update(request, envelope),
+    );
+    // Starter packs (contract v27's wire, built in v28; W8.18, W8.19).
+    answer_on(
+        &bus,
+        &plugins,
+        packs::REGISTRY_PACKS,
+        (
+            "meridian.v1.ListRegistryPacksRequest",
+            "meridian.v1.ListRegistryPacksReply",
+        ),
+        |plugins, request, _| plugins.list_registry_packs(request),
+    );
+    let installing = Arc::clone(&plugins);
+    answer_on(
+        &bus,
+        &plugins,
+        packs::INSTALL_PACK,
+        ("meridian.v1.InstallPackRequest", "meridian.v1.PackInstall"),
+        move |_, request, envelope| installing.install_pack(request, envelope),
+    );
+    answer_on(
+        &bus,
+        &plugins,
+        packs::READ_PACK,
+        ("meridian.v1.ReadPackRequest", "meridian.v1.PackStatus"),
+        |plugins, request, _| plugins.read_pack(request),
+    );
+    answer_on(
+        &bus,
+        &plugins,
+        packs::UPDATE_PACK,
+        ("meridian.v1.UpdatePackRequest", "meridian.v1.PackStatus"),
+        |plugins, request, envelope| plugins.update_pack(request, envelope),
+    );
+    answer_on(
+        &bus,
+        &plugins,
+        packs::REMOVE_PACK,
+        ("meridian.v1.RemovePackRequest", "meridian.v1.PackStatus"),
+        |plugins, request, envelope| plugins.remove_pack(request, envelope),
     );
     answer_on(
         &bus,

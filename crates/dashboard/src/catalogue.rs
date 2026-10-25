@@ -80,6 +80,14 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/terminal/plugins/install", post(install))
         .route("/terminal/plugins/update", post(update))
         .route("/terminal/plugins/retire", post(retire))
+        // Contract v27's wire, built in v28 (W8.18, W8.19): `meridian
+        // plugin install --pack` and `meridian plugin pack
+        // list|show|update|remove`.
+        .route("/terminal/packs", get(list_packs))
+        .route("/terminal/packs/{organisation}/{pack}", get(read_pack))
+        .route("/terminal/packs/install", post(install_pack))
+        .route("/terminal/packs/update", post(update_pack))
+        .route("/terminal/packs/remove", post(remove_pack))
         .route(
             "/terminal/plugins/{instance}/dev/{what}",
             get(develop).put(develop),
@@ -988,6 +996,10 @@ struct Install {
     registry: String,
     #[serde(default)]
     note: String,
+    /// A pack's member installed on its own (W8.10; contract v27): the
+    /// pack, `organisation/pack`, its install record names.
+    #[serde(default)]
+    pack: String,
 }
 
 /// InstallPluginFromTerminal (contract v26, W8.10): JSON the dashboard
@@ -1020,7 +1032,7 @@ async fn install(
                 asked.registry
             },
             note,
-            pack: String::new(),
+            pack: asked.pack.trim().to_string(),
         },
         Duration::from_secs(120),
     )
@@ -1036,6 +1048,252 @@ async fn install(
                 }),
             )
         }
+        Err(reason) => registry_refused(&reason),
+    }
+}
+
+// ── Starter packs from the terminal (W8.18, W8.19) ─────────────────────
+
+/// A pack as the terminal names it (ruling 401): a bare name is
+/// `open-meridian/<name>`.
+fn pack_named(name: &str) -> String {
+    let name = name.trim();
+    if name.contains('/') {
+        name.to_string()
+    } else {
+        format!("open-meridian/{name}")
+    }
+}
+
+/// ListPacksFromTerminal: `meridian plugin pack list`, Browse's view with
+/// each pack's state here.
+async fn list_packs(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    use crate::registry::packs;
+    let person = match admin(&app, &headers).await {
+        Ok(person) => person,
+        Err(refusal) => return *refusal,
+    };
+    let reply: Result<meridian_domain::v1::ListRegistryPacksReply, String> = ask(
+        &app,
+        &person,
+        packs::REGISTRY_PACKS,
+        "meridian.v1.ListRegistryPacksRequest",
+        meridian_domain::v1::ListRegistryPacksRequest {
+            page_size: 200,
+            ..Default::default()
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+    let reply = match reply {
+        Ok(reply) => reply,
+        Err(reason) => return registry_refused(&reason),
+    };
+    let mut lines = Vec::new();
+    for pack in &reply.packs {
+        let mut line = packs::pack_json(pack);
+        let status: Result<meridian_domain::v1::PackStatus, String> = ask(
+            &app,
+            &person,
+            packs::READ_PACK,
+            "meridian.v1.ReadPackRequest",
+            meridian_domain::v1::ReadPackRequest {
+                pack: pack.pack.clone(),
+            },
+            Duration::from_secs(10),
+        )
+        .await;
+        if let Ok(status) = status {
+            line["state"] = serde_json::json!(if status.installed_revision > 0 {
+                "installed"
+            } else {
+                "not_installed"
+            });
+            line["said"] = serde_json::json!(packs::deployment_state(&status));
+            line["installed_revision"] = serde_json::json!(status.installed_revision);
+        }
+        lines.push(line);
+    }
+    json(
+        StatusCode::OK,
+        serde_json::json!({"packs": lines, "catalogue_pulled_at_ns": reply.catalogue_pulled_at_ns}),
+    )
+}
+
+/// ReadPackFromTerminal: `meridian plugin pack show`, the checklist.
+async fn read_pack(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Path((organisation, pack)): Path<(String, String)>,
+) -> Response {
+    let person = match admin(&app, &headers).await {
+        Ok(person) => person,
+        Err(refusal) => return *refusal,
+    };
+    let records = match app.records.current(app.clock.now_ns()) {
+        Ok(records) => records,
+        Err(stale) => return refused(StatusCode::SERVICE_UNAVAILABLE, stale.to_string()),
+    };
+    let name = format!("{organisation}/{pack}");
+    match crate::registry::packs::checklist(&app, &person.person.subject, &name, &records).await {
+        Ok(checklist) => json(
+            StatusCode::OK,
+            crate::registry::packs::status_json(&checklist.status),
+        ),
+        Err(reason) => refused(StatusCode::NOT_FOUND, reason),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct InstallPack {
+    pack: String,
+    /// The members whole, where given; else the pack's defaults with these.
+    #[serde(default)]
+    members: Option<Vec<String>>,
+    #[serde(default)]
+    with: Vec<String>,
+    #[serde(default)]
+    without: Vec<String>,
+    /// The revision read; the catalogue's latest where absent.
+    #[serde(default)]
+    revision: u64,
+    #[serde(default)]
+    note: String,
+}
+
+/// InstallPackFromTerminal: `meridian plugin install --pack`, JSON the
+/// dashboard turns into InstallPack; a name that is not a member refused
+/// before anything moves.
+async fn install_pack(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    use crate::registry::packs;
+    let (person, asked): (Admin, InstallPack) = match admin_asking(&app, &headers, &body).await {
+        Ok(asked) => asked,
+        Err(refusal) => return *refusal,
+    };
+    let note = match noted(&asked.note) {
+        Ok(note) => note,
+        Err(refusal) => return *refusal,
+    };
+    let name = pack_named(&asked.pack);
+    let held: Result<meridian_domain::v1::ListRegistryPacksReply, String> = ask(
+        &app,
+        &person,
+        packs::REGISTRY_PACKS,
+        "meridian.v1.ListRegistryPacksRequest",
+        meridian_domain::v1::ListRegistryPacksRequest {
+            pack: name.clone(),
+            page_size: 1,
+            ..Default::default()
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+    let Some(pack) = held.ok().and_then(|reply| reply.packs.into_iter().next()) else {
+        return json(
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"error": format!("no starter pack {name} is offered in the catalogue"),
+                               "fields": ["pack"]}),
+        );
+    };
+    let members = match packs::ticked(&pack, asked.members.as_deref(), &asked.with, &asked.without)
+    {
+        Ok(members) => members,
+        Err((path, words)) => {
+            return json(
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"error": words, "fields": [path]}),
+            )
+        }
+    };
+    let revision = if asked.revision > 0 {
+        asked.revision
+    } else {
+        pack.revision.as_ref().map_or(0, |r| r.revision)
+    };
+    let installed: Result<meridian_domain::v1::PackInstall, String> = ask(
+        &app,
+        &person,
+        packs::INSTALL_PACK,
+        "meridian.v1.InstallPackRequest",
+        meridian_domain::v1::InstallPackRequest {
+            pack: name,
+            revision,
+            members,
+            note,
+        },
+        Duration::from_secs(30),
+    )
+    .await;
+    match installed {
+        Ok(answer) => json(StatusCode::CREATED, packs::install_json(&answer)),
+        Err(reason) => registry_refused(&reason),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct PackNote {
+    pack: String,
+    #[serde(default)]
+    note: String,
+}
+
+/// UpdatePackFromTerminal: `meridian plugin pack update`.
+async fn update_pack(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    pack_act(&app, &headers, &body, true).await
+}
+
+/// RemovePackFromTerminal: `meridian plugin pack remove`; every member
+/// stays installed and running.
+async fn remove_pack(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    pack_act(&app, &headers, &body, false).await
+}
+
+async fn pack_act(app: &App, headers: &HeaderMap, body: &[u8], update: bool) -> Response {
+    use crate::registry::packs;
+    let (person, asked): (Admin, PackNote) = match admin_asking(app, headers, body).await {
+        Ok(asked) => asked,
+        Err(refusal) => return *refusal,
+    };
+    let note = match noted(&asked.note) {
+        Ok(note) => note,
+        Err(refusal) => return *refusal,
+    };
+    let pack = pack_named(&asked.pack);
+    let done: Result<meridian_domain::v1::PackStatus, String> = if update {
+        ask(
+            app,
+            &person,
+            packs::UPDATE_PACK,
+            "meridian.v1.UpdatePackRequest",
+            meridian_domain::v1::UpdatePackRequest { pack, note },
+            crate::registry::INSTALLING,
+        )
+        .await
+    } else {
+        ask(
+            app,
+            &person,
+            packs::REMOVE_PACK,
+            "meridian.v1.RemovePackRequest",
+            meridian_domain::v1::RemovePackRequest { pack, note },
+            Duration::from_secs(10),
+        )
+        .await
+    };
+    match done {
+        Ok(status) => json(StatusCode::OK, packs::status_json(&status)),
         Err(reason) => registry_refused(&reason),
     }
 }

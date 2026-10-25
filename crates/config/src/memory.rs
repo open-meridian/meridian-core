@@ -69,6 +69,10 @@ pub struct MemoryStore {
     /// Who retired each version, through what (W8.15, contract v25).
     retirements: Mutex<std::collections::BTreeMap<(String, String), Author>>,
     installations: Mutex<std::collections::BTreeMap<(String, String), Author>>,
+    /// The pack each install record names (W8.18, v28).
+    install_packs: Mutex<std::collections::BTreeMap<(String, String), String>>,
+    /// Each change to a starter pack's record, in order (W8.18, W8.19).
+    pack_changes: Mutex<Vec<crate::store::PackChange>>,
     /// The registries (contract v25): the catalogue's copy, each listed
     /// version's statement, the usage setting's changes and the reports.
     registry: Mutex<Option<crate::store::HeldCatalogue>>,
@@ -102,6 +106,8 @@ impl MemoryStore {
             model_routing: Mutex::new(Vec::new()),
             usage_reports: Mutex::new(Vec::new()),
             registry: Mutex::new(None),
+            install_packs: Mutex::new(Default::default()),
+            pack_changes: Mutex::new(Vec::new()),
             statements: Mutex::new(Default::default()),
             reports_plugin_usage: Mutex::new(Vec::new()),
             plugin_usage_reports: Mutex::new(Vec::new()),
@@ -1315,11 +1321,16 @@ impl Store for MemoryStore {
         documentation: &[meridian_domain::v1::DocumentationText],
         listing_statement: &str,
         by: &Author,
+        pack: &str,
     ) -> Result<bool> {
         let recorded = self.record_plugin_version_documented(version, documentation)?;
         if recorded {
             let metadata = version.metadata.clone().unwrap_or_default();
             let key = (metadata.name, metadata.version);
+            self.install_packs
+                .lock()
+                .expect("store lock poisoned")
+                .insert(key.clone(), pack.to_string());
             self.statements
                 .lock()
                 .expect("store lock poisoned")
@@ -1330,6 +1341,39 @@ impl Store for MemoryStore {
                 .insert(key, by.clone());
         }
         Ok(recorded)
+    }
+
+    fn install_pack(&self, name: &str, version: &str) -> Result<String> {
+        Ok(self
+            .install_packs
+            .lock()
+            .expect("store lock poisoned")
+            .get(&(name.to_string(), version.to_string()))
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn record_pack_change(&self, change: &crate::store::PackChange) -> Result<()> {
+        #[cfg(test)]
+        blocks_like_postgres();
+        self.pack_changes
+            .lock()
+            .expect("store lock poisoned")
+            .push(change.clone());
+        Ok(())
+    }
+
+    fn pack_changes(&self, pack: &str) -> Result<Vec<crate::store::PackChange>> {
+        #[cfg(test)]
+        blocks_like_postgres();
+        Ok(self
+            .pack_changes
+            .lock()
+            .expect("store lock poisoned")
+            .iter()
+            .filter(|change| pack.is_empty() || change.pack == pack)
+            .cloned()
+            .collect())
     }
 
     fn installation(&self, name: &str, version: &str) -> Result<Option<Author>> {

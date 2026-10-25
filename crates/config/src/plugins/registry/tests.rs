@@ -24,7 +24,7 @@ use crate::registries::{Hold, Registries};
 use crate::service::Clock;
 use crate::{ArchiveGrant, MemoryStore};
 
-const ADA: &str = "local|ada";
+pub(crate) const ADA: &str = "local|ada";
 
 struct At(i64);
 impl Clock for At {
@@ -33,14 +33,14 @@ impl Clock for At {
     }
 }
 
-struct Harness {
-    bus: Arc<Bus>,
-    platform: Arc<Platform>,
-    store: Arc<dyn crate::Store>,
-    created: Arc<Mutex<Vec<CreatePluginRequest>>>,
+pub(crate) struct Harness {
+    pub(crate) bus: Arc<Bus>,
+    pub(crate) platform: Arc<Platform>,
+    pub(crate) store: Arc<dyn crate::Store>,
+    pub(crate) created: Arc<Mutex<Vec<CreatePluginRequest>>>,
 }
 
-fn harness() -> Harness {
+pub(crate) fn harness() -> Harness {
     let bus = Arc::new(Bus::single(
         "conductor-1",
         Arc::new(MemoryBackend::new()),
@@ -91,7 +91,7 @@ fn harness() -> Harness {
     }
 }
 
-async fn ask<Q: Message, A: Message + Default>(
+pub(crate) async fn ask<Q: Message, A: Message + Default>(
     h: &Harness,
     topic: &str,
     kind: &str,
@@ -105,7 +105,7 @@ async fn ask<Q: Message, A: Message + Default>(
     Ok(A::decode(&bytes[..]).unwrap())
 }
 
-async fn pull(h: &Harness) -> ListRegistryPluginsReply {
+pub(crate) async fn pull(h: &Harness) -> ListRegistryPluginsReply {
     ask(
         h,
         REGISTRY_PLUGINS,
@@ -135,7 +135,7 @@ async fn install(h: &Harness, version: &str) -> Result<PluginVersion, String> {
     .await
 }
 
-async fn launch(
+pub(crate) async fn launch(
     h: &Harness,
     name: &str,
     version: &str,
@@ -157,7 +157,7 @@ async fn launch(
     .await
 }
 
-async fn catalogue(h: &Harness) -> PluginCatalogue {
+pub(crate) async fn catalogue(h: &Harness) -> PluginCatalogue {
     ask(
         h,
         PLUGIN_CATALOGUE,
@@ -169,7 +169,7 @@ async fn catalogue(h: &Harness) -> PluginCatalogue {
 }
 
 /// A second listed version, 1.5.0, signed as the platform signs 1.4.0.
-fn list_version_1_5(h: &Harness, roles: &[&str]) {
+pub(crate) fn list_version_1_5(h: &Harness, roles: &[&str]) {
     let image = digest(0xcd);
     let signer = &h.platform.signer;
     let statement = signer.statement(LISTING_PREDICATE, &image, json!({

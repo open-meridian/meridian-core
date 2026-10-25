@@ -37,7 +37,7 @@ pub const LIST_PLUGIN_USAGE_REPORTS: &str = "platform.config.query.list-plugin-u
 const MOST_REPORTS: usize = 200;
 
 impl Plugins {
-    fn registries(&self) -> Result<&std::sync::Arc<Hold>, String> {
+    pub(super) fn registries(&self) -> Result<&std::sync::Arc<Hold>, String> {
         self.registries.as_ref().ok_or_else(|| {
             "this deployment reaches no registry: it is not enrolled with the platform, or its \
              chart carries no platform key"
@@ -45,12 +45,16 @@ impl Plugins {
         })
     }
 
-    fn block_on<T>(&self, work: impl std::future::Future<Output = T>) -> T {
+    pub(super) fn block_on<T>(&self, work: impl std::future::Future<Output = T>) -> T {
         tokio::runtime::Handle::current().block_on(work)
     }
 
     /// The version recorded under a name and a version.
-    fn recorded(&self, name: &str, version: &str) -> Result<Option<PluginVersion>, String> {
+    pub(super) fn recorded(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<Option<PluginVersion>, String> {
         Ok(self
             .snapshot()?
             .catalogue
@@ -74,13 +78,16 @@ impl Plugins {
     /// Resolve, pull, verify and record a listed version (W8.10): its
     /// documentation, from the image's verified metadata, held to its
     /// declaration's digests, and its listing statement kept for launch.
-    fn install_version(
+    /// From v28 (W8.18) the install record names the pack whose install
+    /// made it, or none.
+    pub(super) fn install_version(
         &self,
         listing: &str,
         version: &str,
         registry: &str,
         note: &str,
         envelope: &Envelope,
+        pack: &str,
     ) -> Result<PluginVersion, String> {
         let hold = self.registries()?;
         let fetched = self.block_on(hold.fetch(listing, version, registry))?;
@@ -105,7 +112,13 @@ impl Plugins {
         recorded.uploaded_note = by.note.clone();
         if !self
             .store
-            .record_listed_version(&recorded, &fetched.documentation, &fetched.statement, &by)
+            .record_listed_version(
+                &recorded,
+                &fetched.documentation,
+                &fetched.statement,
+                &by,
+                pack,
+            )
             .map_err(|failed| failed.to_string())?
         {
             return Err(format!("{listing} {version} is installed already"));
@@ -115,6 +128,7 @@ impl Plugins {
             version,
             registry = recorded.source_registry,
             by = recorded.uploaded_by,
+            pack,
             "a version installed from a registry"
         );
         Ok(recorded)
@@ -189,6 +203,7 @@ impl Plugins {
                 &fetched.documentation,
                 &fetched.statement,
                 &author(envelope),
+                "",
             )
             .map_err(|failed| failed.to_string())?
         {
@@ -229,6 +244,7 @@ impl Plugins {
             &request.registry,
             &request.note,
             envelope,
+            &request.pack,
         )?;
         Ok(installed)
     }
@@ -339,6 +355,7 @@ impl Plugins {
                 "",
                 &request.note,
                 envelope,
+                "",
             )?,
         };
         let metadata = version.metadata.clone().unwrap_or_default();
@@ -570,4 +587,4 @@ impl Plugins {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

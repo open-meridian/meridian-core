@@ -2288,6 +2288,13 @@ fn the_registries_state_is_kept_whole() {
         pulled_at_ns: 7,
         // Contract v26 (migration 0022): a bundle's pull status kept.
         pull_status: r#"{"issued_at_ns":2,"pulls":[],"signature":"y"}"#.into(),
+        // Contract v27 (W8.17; built v28): the packs kept beside them.
+        packs: vec![meridian_domain::v1::PluginPack {
+            pack: "open-meridian/fx".into(),
+            curator: "Open Meridian".into(),
+            sequence: 41,
+            ..Default::default()
+        }],
     };
     store.put_registry_catalogue(&held).unwrap();
     let mut later = held.clone();
@@ -2307,11 +2314,17 @@ fn the_registries_state_is_kept_whole() {
         prepared_call_id: "PC-7".into(),
     };
     assert!(store
-        .record_listed_version(&listed, &[], "{\"payloadType\":\"x\"}", &by)
+        .record_listed_version(
+            &listed,
+            &[],
+            "{\"payloadType\":\"x\"}",
+            &by,
+            "open-meridian/fx"
+        )
         .unwrap());
     assert!(
         !store
-            .record_listed_version(&listed, &[], "{}", &meridian_config::Author::default())
+            .record_listed_version(&listed, &[], "{}", &meridian_config::Author::default(), "")
             .unwrap(),
         "never replaced"
     );
@@ -2327,6 +2340,46 @@ fn the_registries_state_is_kept_whole() {
     assert_eq!(installed.note, "FX rates for the treasury desk.");
     assert_eq!(installed.prepared_call_id, "PC-7");
     assert!(store.installation("snaptrade", "9").unwrap().is_none());
+    // From v28 (W8.18): the install record names the pack that made it.
+    assert_eq!(
+        store
+            .install_pack("open-meridian/snaptrade", "1.4.0")
+            .unwrap(),
+        "open-meridian/fx"
+    );
+    assert_eq!(store.install_pack("snaptrade", "9").unwrap(), "");
+    // Each change to a pack's record its own record (decisions/031).
+    let change = |kind, note: &str| meridian_config::PackChange {
+        kind,
+        pack: "open-meridian/fx".into(),
+        revision: 2,
+        held: meridian_domain::v1::PluginPack {
+            pack: "open-meridian/fx".into(),
+            ..Default::default()
+        },
+        members: vec![meridian_domain::v1::PackMemberStatus {
+            listing: "open-meridian/snaptrade".into(),
+            state: meridian_domain::v1::PackMemberState::Installed as i32,
+            ..Default::default()
+        }],
+        by: meridian_config::Author {
+            note: note.into(),
+            ..by.clone()
+        },
+        at_ns: 9,
+    };
+    let installed_pack = change(meridian_config::PackChangeKind::Installed, "FX desk.");
+    let removed_pack = change(meridian_config::PackChangeKind::Removed, "A custom set.");
+    store.record_pack_change(&installed_pack).unwrap();
+    store.record_pack_change(&removed_pack).unwrap();
+    assert_eq!(
+        store.pack_changes("open-meridian/fx").unwrap(),
+        vec![installed_pack, removed_pack]
+    );
+    assert!(store
+        .pack_changes("open-meridian/crypto")
+        .unwrap()
+        .is_empty());
     let held = store.snapshot().unwrap();
     let noted = held
         .catalogue
