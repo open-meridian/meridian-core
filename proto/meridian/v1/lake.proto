@@ -107,6 +107,12 @@ message ObservationMeta {
   // is the underlying; in the row's conflation key. None: the row is about its
   // subjects alone.
   repeated Identifier series_key = 16;
+  // Contract v28: set at the edge; on a read, the row's effective state, the
+  // highest of its own and every assessment of it. Unspecified: valid.
+  QualityState quality = 17;
+  // Contract v28: each check it failed, with the assessments' reasons on a
+  // read. None on a valid row.
+  repeated QualityReason quality_reasons = 18;
 }
 
 // One entity a row is about.
@@ -879,6 +885,10 @@ message SourceChoice {
 
   // Every dataset the reader is entitled to, each row naming its own.
   bool side_by_side = 3;
+  // Contract v28: true, on a read naming its datasets: invalid rows are
+  // answered, each with its state and reasons; refused on a default or
+  // side-by-side read. False: invalid rows are left out.
+  bool include_quarantined = 4;
 }
 
 // A subject, dataset or field a read could not serve, and why; the rest still
@@ -2108,4 +2118,78 @@ enum RatingActionKind {
   RATING_ACTION_KIND_AFFIRMED = 4;
   // Withdrawn.
   RATING_ACTION_KIND_WITHDRAWN = 5;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Contract v28, track C (2 of 2): quality states
+// (sdk-contract/lake-observations-carry-quality-states-contract)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Contract v28: a signal plugin's escalation of one row version's quality, its
+// own record, never a rewrite (contract v28, W10.12).
+message QualityAssessment {
+  // As the lake names it. Never empty.
+  string dataset = 1;
+  // Its row key as recorded. Never empty.
+  string row_key = 2;
+  // The row key's version; a later version is assessed afresh. Never 0.
+  uint64 version = 3;
+  // Suspicious or invalid; refused when lower than the row's effective state,
+  // since states only escalate. Unspecified is refused.
+  QualityState state = 4;
+  // Price_outlier, cross_source_disagreement, or an edge reason re-judged.
+  // Never empty.
+  repeated QualityReason reasons = 5;
+  // Stamped by the sidecar. Never empty on a record; a plugin leaves it empty.
+  string assessed_by_instance = 6;
+}
+
+// Contract v28 (W10.12): RecordQualityAssessments's request.
+message RecordQualityAssessmentsRequest {
+  // 1 to 500, recorded whole or refused naming the item and field. Never
+  // empty.
+  repeated QualityAssessment assessments = 1;
+}
+
+// Contract v28 (W10.12): RecordQualityAssessments's answer.
+message RecordQualityAssessmentsReply {
+  // Each its own record. 0: none recorded.
+  uint32 recorded = 1;
+}
+
+enum QualityState {
+  // Read as valid: every row before v28.
+  QUALITY_STATE_UNSPECIFIED = 0;
+  // No check failed.
+  QUALITY_STATE_VALID = 1;
+  // Served, flagged.
+  QUALITY_STATE_SUSPICIOUS = 2;
+  // Left out of default and side-by-side reads; served only to a read naming
+  // its dataset with include_quarantined.
+  QUALITY_STATE_INVALID = 3;
+}
+
+enum QualityReason {
+  // Refused on a row whose state is not valid.
+  QUALITY_REASON_UNSPECIFIED = 0;
+  // A field failing its dictionary bound, the raw record kept at the edge.
+  QUALITY_REASON_SCHEMA = 1;
+  // The same source sequence or content under a new row key.
+  QUALITY_REASON_DUPLICATE = 2;
+  // Bid above ask beyond the dataset's tolerance.
+  QUALITY_REASON_CROSSED_QUOTE = 3;
+  // After a gap in the source's sequence, until resynced.
+  QUALITY_REASON_SEQUENCE_GAP = 4;
+  // A source time earlier than the subject's last beyond tolerance.
+  QUALITY_REASON_OUT_OF_ORDER = 5;
+  // Arrived past the stale ceiling.
+  QUALITY_REASON_STALE = 6;
+  // A source time ahead of the clock beyond the skew allowance, or before the
+  // session's start.
+  QUALITY_REASON_IMPLAUSIBLE_TIMESTAMP = 7;
+  // Outside a robust rolling baseline, a signal plugin's judgment.
+  QUALITY_REASON_PRICE_OUTLIER = 8;
+  // Apart from another dataset for the same subject beyond tolerance, a signal
+  // plugin's judgment.
+  QUALITY_REASON_CROSS_SOURCE_DISAGREEMENT = 9;
 }
