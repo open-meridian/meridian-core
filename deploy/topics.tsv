@@ -229,6 +229,7 @@ platform.reference.event.licence-list-pulled	event	conductor	instrument
 platform.reference.event.replacements-pulled	event	conductor	instrument
 platform.reference.event.templates-pulled	event	conductor	instrument
 platform.reference.event.venue-missing	event	data,connectivity	instrument,conductor,lake
+platform.reference.query.ask-platform-for-company	query	instrument	conductor
 platform.reference.query.ask-platform-for-event-group	query	instrument	conductor
 platform.reference.query.ask-platform-for-instrument	query	dashboard,instrument	conductor
 platform.reference.query.compute-date	query	compliance,confirmation,connectivity,custody,data,ems,oms,operations,portfolio,reference,reporting,servicing,settlement,signal	instrument
