@@ -238,7 +238,10 @@ pub fn summary_line(instance: &str, now_ns: i64) -> String {
     } else {
         return String::new();
     };
-    format!("<dt>Latency</dt><dd class=\"one-line\" data-latency>{said}</dd>")
+    // One line, cut with an ellipsis on a phone; the whole of it in the
+    // title (W4.16; every page fits one screen).
+    let whole = said.replace("<span class=\"badge warn\">Breached</span>", "Breached:");
+    format!("<dt>Latency</dt><dd data-latency title=\"{whole}\">{said}</dd>")
 }
 
 /// The Summary's latency part as `dashboard__read_plugin_summary` answers

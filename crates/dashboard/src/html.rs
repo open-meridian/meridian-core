@@ -389,6 +389,7 @@ ul.plugins.tiles .plugin-card{padding:.85rem}}\
 .panel>h2,.panel .panel-title{margin:0 0 .25rem}\
 .facts{display:grid;grid-template-columns:auto minmax(0,1fr);gap:.35rem 1rem;margin:.75rem 0 0;font-size:.9rem}\
 .facts dt{color:var(--ink-faint)}.facts dd{margin:0;overflow-wrap:anywhere}\
+.facts dd[data-latency]{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}\
 .flag{display:block;padding:.55rem .8rem;border-radius:var(--radius);\
 background:var(--warn-wash);color:var(--warn-ink);font-size:.9rem;margin:.75rem 0 0}\
 .flag a{color:inherit;text-decoration:underline}\
