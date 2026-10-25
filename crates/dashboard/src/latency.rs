@@ -217,31 +217,34 @@ pub fn summary_line(instance: &str, now_ns: i64) -> String {
         .iter()
         .filter(|r| r.latency_since_ns != 0 || r.backlog_since_ns != 0)
         .collect();
-    let said = if let Some(first) = open.first() {
-        let since = first.latency_since_ns.max(first.backlog_since_ns);
-        format!(
-            "<span class=\"badge warn\">Breached</span> {} since {}{}",
-            escape(&series_words(first)),
-            escape(&crate::custody::utc(since)),
-            if open.len() > 1 {
-                format!(", and {} more", open.len() - 1)
-            } else {
-                String::new()
-            }
+    // Short enough for one line on a phone; the series named in the title
+    // (W4.16; every page fits one screen).
+    let (said, whole) = if let Some(first) = open.first() {
+        let since = crate::custody::utc(first.latency_since_ns.max(first.backlog_since_ns));
+        let named: Vec<String> = open.iter().map(|r| series_words(r)).collect();
+        (
+            format!(
+                "<span class=\"badge warn\">Breached</span> since {}",
+                escape(&since[11..])
+            ),
+            format!("Breached since {since}: {}", named.join(", ")),
         )
     } else if let Some(worst) = reads.iter().max_by_key(|r| r.p99_ns) {
-        format!(
-            "Within its ceilings; highest p99 {} ms, {}",
-            ms(worst.p99_ns),
-            escape(&series_words(worst))
+        (
+            format!("Within ceilings, p99 {} ms", ms(worst.p99_ns)),
+            format!(
+                "Highest p99 {} ms: {}",
+                ms(worst.p99_ns),
+                series_words(worst)
+            ),
         )
     } else {
         return String::new();
     };
-    // One line, cut with an ellipsis on a phone; the whole of it in the
-    // title (W4.16; every page fits one screen).
-    let whole = said.replace("<span class=\"badge warn\">Breached</span>", "Breached:");
-    format!("<dt>Latency</dt><dd data-latency title=\"{whole}\">{said}</dd>")
+    format!(
+        "<dt>Latency</dt><dd data-latency title=\"{}\">{said}</dd>",
+        escape(&whole)
+    )
 }
 
 /// The Summary's latency part as `dashboard__read_plugin_summary` answers
@@ -422,8 +425,11 @@ mod tests {
         )
         .unwrap();
         let line = summary_line(instance, start + 20_000_000_000);
-        assert!(line.contains("Within its ceilings"), "{line}");
-        assert!(line.contains("pricing-stream round trip"), "{line}");
+        assert!(line.contains("Within ceilings"), "{line}");
+        assert!(
+            line.contains("pricing-stream round trip"),
+            "named in its title: {line}"
+        );
         for minute in 1..=3 {
             let at = start + minute * 60_000_000_000;
             receive(
