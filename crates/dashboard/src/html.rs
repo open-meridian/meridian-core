@@ -217,7 +217,10 @@ form.prepared-act input[name=note]{flex:1 1 12rem;min-width:0}form.prepared-act 
 @media (max-width:640px){table.delegations :is(th,td):is(:nth-child(3),:nth-child(5),:nth-child(6)),table.calls :is(th,td):is(:nth-child(1),:nth-child(4),:nth-child(6)),table.prepared-by-clients :is(th,td):is(:nth-child(1),:nth-child(2),:nth-child(6)){display:none}table.calls code{overflow-wrap:anywhere}}\
 table.linkable th.actions{width:7rem}table.linkable td.actions{text-align:right}\
 @media (max-width:640px){table.agents .wide,table.linkable .wide{display:none}}\
-@media (max-width:640px){table.datasets .wide,table.entitlements .wide,table.priorities .wide,table.entitlements .dates,\
+.eligibility{border:0;padding:0;margin:0;min-width:0;display:grid;grid-template-columns:1fr 1fr;gap:0 .75rem}\
+.eligibility legend,.eligibility .threshold{grid-column:1/-1;padding:0}.eligibility legend{font-weight:600}\
+.eligibility .threshold{display:grid;grid-template-columns:2fr 2fr 1fr;gap:.5rem}.eligibility input{min-width:0}\
+@media (max-width:640px){table.ages .wide,table.datasets .wide,table.entitlements .wide,table.priorities .wide,table.entitlements .dates,\
 table.priorities .dates,table.priorities .actions{display:none}table.datasets th:first-child{width:42%}\
 table.datasets th.actions{width:5.5rem}table.entitlements th.actions{width:6.5rem}table.priorities th:first-child{width:36%}}\
 .figure{min-width:0;padding:.85rem 1rem;background:var(--card);border:1px solid var(--line);border-radius:var(--radius-lg);\

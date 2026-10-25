@@ -193,8 +193,8 @@ pub fn tab(reads: &[Read]) -> String {
             };
             format!(
                 "<tr data-id=\"{instance} {name} {what}\"><td title=\"{name}\">{name}</td>\
-                 <td title=\"{instance}\">{instance}</td><td>{what}</td>\
-                 <td class=\"number\">{p50}</td><td class=\"number wide\">{p95}</td>\
+                 <td class=\"wide\" title=\"{instance}\">{instance}</td><td>{what}</td>\
+                 <td class=\"number wide\">{p50}</td><td class=\"number wide\">{p95}</td>\
                  <td class=\"number\">{p99}</td><td class=\"number wide\">{count}</td></tr>",
                 instance = escape(&read.key.instance),
                 name = escape(name),
@@ -208,7 +208,7 @@ pub fn tab(reads: &[Read]) -> String {
         .collect();
     format!(
         "<om-pager search=\"Search data age\"><table class=\"list one-line ages\" data-ages=\"{n}\">\
-         <thead><tr><th>Dataset or session</th><th>Plugin</th><th>Hop</th><th>p50 ms</th>\
+         <thead><tr><th>Dataset or session</th><th class=\"wide\">Plugin</th><th>Hop</th><th class=\"wide\">p50 ms</th>\
          <th class=\"wide\">p95 ms</th><th>p99 ms</th><th class=\"wide\">Count</th></tr></thead>\
          <tbody>{lines}</tbody></table></om-pager>",
         n = reads.len()

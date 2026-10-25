@@ -406,12 +406,12 @@ fn datasets_tab(rows: &[Row], records: &AccessRecords, token: &str) -> (String, 
          <fieldset class=\"eligibility\"><legend>Who may take it, as its terms state</legend>\
          <label class=\"check\"><input type=\"checkbox\" name=\"eligibility_uses\" value=\"personal\"> Personal use</label>\
          <label class=\"check\"><input type=\"checkbox\" name=\"eligibility_uses\" value=\"commercial\"> Commercial use</label>\
-         <label>Buyer revenue below <input name=\"buyer_revenue_below\" inputmode=\"decimal\" \
-         pattern=\"[0-9]+(\\.[0-9]+)?\" placeholder=\"No threshold\"></label>\
-         <label>Buyer revenue at least <input name=\"buyer_revenue_at_least\" inputmode=\"decimal\" \
-         pattern=\"[0-9]+(\\.[0-9]+)?\" placeholder=\"No threshold\"></label>\
-         <label>In <input name=\"buyer_revenue_currency_code\" maxlength=\"3\" pattern=\"[A-Za-z]{{3}}\" \
-         placeholder=\"USD\"></label></fieldset>\
+         <div class=\"threshold\"><label>Revenue below <input name=\"buyer_revenue_below\" inputmode=\"decimal\" \
+         pattern=\"[0-9]+(\\.[0-9]+)?\" placeholder=\"None\"></label>\
+         <label>or at least <input name=\"buyer_revenue_at_least\" inputmode=\"decimal\" \
+         pattern=\"[0-9]+(\\.[0-9]+)?\" placeholder=\"None\"></label>\
+         <label>Currency <input name=\"buyer_revenue_currency_code\" maxlength=\"3\" pattern=\"[A-Za-z]{{3}}\" \
+         placeholder=\"USD\"></label></div></fieldset>\
          <label>Fields readable by default <input name=\"default_fields\" \
          placeholder=\"Every field; or meridian.v1.Bar.vwap, ...\"></label>\
          <label>Note <input name=\"note\" maxlength=\"2000\" placeholder=\"Why\"></label>\

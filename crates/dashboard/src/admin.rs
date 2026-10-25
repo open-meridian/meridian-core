@@ -3659,17 +3659,19 @@ async fn request_series_records(
                 .map_err(|failed| failed.to_string())
         });
     match outcome {
-        Ok(reply) => {
-            let said = format!("{}: {}", symbol.trim(), series_rule::answered(&reply));
-            after_to(
-                Ok(()),
-                &format!(
-                    "/admin?done={}#series-rule",
-                    series_rule::form_encoded(&said)
-                ),
-                back,
-            )
-        }
+        // The answer is the point of the act: said on a page of its own,
+        // with the way back to the tab.
+        Ok(reply) => Html(page(
+            "Series requested",
+            &format!(
+                "<h1>Series requested</h1><p class=\"passed\" data-series-answer>{}: {}</p>\
+                 <p><a href=\"{}\">Back to the series request rule</a></p>",
+                escape(symbol.trim()),
+                escape(&series_rule::answered(&reply)),
+                escape(back)
+            ),
+        ))
+        .into_response(),
         Err(failed) => after_to(Err(failed), back, back),
     }
 }

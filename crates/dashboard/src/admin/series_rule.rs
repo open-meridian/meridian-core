@@ -132,22 +132,6 @@ pub fn request_fields() -> String {
         .to_string()
 }
 
-/// Text as a query's value: letters, digits and `-_.~` kept, a space `+`,
-/// every other byte `%XX`.
-pub fn form_encoded(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for byte in text.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char)
-            }
-            b' ' => out.push('+'),
-            other => out.push_str(&format!("%{other:02X}")),
-        }
-    }
-    out
-}
-
 /// What a request's answer says, one phrase per series.
 pub fn answered(reply: &meridian_domain::v1::RequestSeriesRecordsReply) -> String {
     reply
@@ -202,7 +186,6 @@ mod tests {
         assert!(form.contains("value=\"100\""), "{form}");
         assert_eq!(json(&changed)["daily_limit"], 100);
         assert_eq!(json(&default)["default"], true);
-        assert_eq!(form_encoded("AAPL  2611: held"), "AAPL++2611%3A+held");
         let said = answered(&meridian_domain::v1::RequestSeriesRecordsReply {
             answers: vec![meridian_domain::v1::SeriesAnswer {
                 refused_by_rule: true,

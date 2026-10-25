@@ -1905,6 +1905,66 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
             .encode_to_vec(),
         ))
     });
+    // Contract v28 (W6.37, W3.31): the series request rule, at its default,
+    // and a request for series the rule refuses.
+    bus.serve(crate::admin::series_rule::READ_SERIES_REQUEST_RULE, |_| {
+        Ok((
+            "meridian.v1.SeriesRequestRule".into(),
+            meridian_domain::v1::SeriesRequestRule {
+                orders: true,
+                standing_wants: false,
+                daily_limit: 500,
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ))
+    });
+    bus.serve(
+        crate::admin::series_rule::REQUEST_SERIES_RECORDS,
+        |envelope| {
+            let asked =
+                meridian_domain::v1::RequestSeriesRecordsRequest::decode(&envelope.payload[..])
+                    .map_err(|e| e.to_string())?;
+            Ok((
+                "meridian.v1.RequestSeriesRecordsReply".into(),
+                meridian_domain::v1::RequestSeriesRecordsReply {
+                    answers: asked
+                        .series
+                        .iter()
+                        .map(|want| meridian_domain::v1::SeriesAnswer {
+                            series_key: want.series_key.clone(),
+                            refused_by_rule: want.cause
+                                == meridian_domain::v1::SeriesRequestCause::Standing as i32,
+                            pending_review: want.cause
+                                != meridian_domain::v1::SeriesRequestCause::Standing as i32,
+                            ..Default::default()
+                        })
+                        .collect(),
+                }
+                .encode_to_vec(),
+            ))
+        },
+    );
+    // Contract v28 (W10.9): the Age tab's rows, as reports and core's hops
+    // would leave them in the monitor.
+    {
+        let now = meridian_clock::SystemClock.now_ns();
+        for (n, dataset) in ["alpaca-1:quotes", "tradier-1:options", "coinbase-1:trades"]
+            .iter()
+            .enumerate()
+        {
+            for hop in ["AGE_HOP_EDGE", "AGE_HOP_LAKE"] {
+                for k in 1..=40_i64 {
+                    meridian_domain::latency::monitor().record_age(
+                        dataset,
+                        hop,
+                        (n as i64 + 1) * k * 250_000,
+                        now,
+                    );
+                }
+            }
+        }
+    }
     bus.serve(crate::registry::LIST_PLUGIN_USAGE_REPORTS, |_| {
         let count =
             |listing: &str, version: &str, registry: &str| meridian_domain::v1::PluginUsageCount {
