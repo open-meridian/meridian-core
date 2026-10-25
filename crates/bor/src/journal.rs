@@ -88,6 +88,9 @@ pub struct Body {
     /// It states whether releases wait for compliance (contract v22): a new
     /// account's first entry, the attribute set, or the upgrade's backfill.
     pub states_waits: bool,
+    /// Contract v28 (W9.16 to W9.18): each lifecycle event as it stands
+    /// after the entry, whole.
+    pub lifecycle_events: Vec<meridian_domain::v1::LifecycleEvent>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -128,6 +131,8 @@ struct Kept {
     trade: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     states_waits: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    lifecycle_events: Vec<String>,
 }
 
 fn encoded<M: Message>(message: &M) -> String {
@@ -177,6 +182,7 @@ impl Body {
             acts: self.acts.clone(),
             trade: self.trade,
             states_waits: self.states_waits,
+            lifecycle_events: self.lifecycle_events.iter().map(encoded).collect(),
         };
         serde_json::to_vec(&kept).expect("an entry's body is plain data")
     }
@@ -208,6 +214,7 @@ impl Body {
             acts: kept.acts,
             trade: kept.trade,
             states_waits: kept.states_waits,
+            lifecycle_events: all(&kept.lifecycle_events)?,
         })
     }
 

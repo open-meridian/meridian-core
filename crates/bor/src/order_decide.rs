@@ -176,6 +176,137 @@ pub(crate) fn fact_in_scope(ctx: &Context, account_id: &str) -> bool {
         .is_none_or(|scope| scope.contains(account_id))
 }
 
+/// Whether an instrument's record is a listed option's, a future option's or
+/// a future's (contract v28): what takes a position effect and a lifecycle.
+pub(crate) fn listed_derivative(ctx: &Context, instrument: &str) -> bool {
+    ctx.records.get(instrument).is_some_and(|says| {
+        matches!(
+            meridian_domain::v1::InstrumentType::try_from(says.instrument_type),
+            Ok(meridian_domain::v1::InstrumentType::ListedOption
+                | meridian_domain::v1::InstrumentType::FutureOption
+                | meridian_domain::v1::InstrumentType::Future)
+        )
+    })
+}
+
+/// Contract v28 (W11.1; FIX 77 and 564): open or close on an order or a leg
+/// in an option or a future, as option brokers require it; unset on any
+/// other instrument.
+fn position_effect_refused(ctx: &Context, at: &str, instrument: &str, effect: i32) -> Result<()> {
+    let path = format!("{at}position_effect");
+    let stated = effect != meridian_domain::v1::PositionEffect::Unspecified as i32;
+    if meridian_domain::v1::PositionEffect::try_from(effect).is_err() {
+        return Err(malformed(&[&path], "open or close"));
+    }
+    match (listed_derivative(ctx, instrument), stated) {
+        (true, false) => Err(malformed(
+            &[&path],
+            "an order in an option or a future says whether it opens or closes, as option \
+             brokers require",
+        )),
+        (false, true) => Err(malformed(
+            &[&path],
+            "only an order in an option or a future opens or closes; this instrument is neither",
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Contract v28 (W11.1; rulings 564, 592): a package, FIX's 35=AB -- no
+/// top-level instrument, two to 16 legs, each its instrument, side, ratio
+/// and position effect, the ratios whole and in lowest terms, at most one
+/// leg in no option or future, and no leg in an expired series or in a
+/// series with no `INS-` record.
+fn package_refused(ctx: &Context, request: &ProposeOrderRequest) -> Result<()> {
+    if !request.instrument_id.is_empty() {
+        return Err(malformed(
+            &["instrument_id"],
+            "a package names no top-level instrument: its legs name theirs",
+        ));
+    }
+    if !(2..=16).contains(&request.legs.len()) {
+        return Err(malformed(
+            &["legs"],
+            format!(
+                "a package has 2 to 16 legs; this has {}",
+                request.legs.len()
+            ),
+        ));
+    }
+    ctx.references_answered()?;
+    let mut ratios = Vec::new();
+    let mut plain = 0;
+    for (n, leg) in request.legs.iter().enumerate() {
+        let at = format!("legs[{n}].");
+        if !leg.instrument_id.starts_with("INS-") {
+            return Err(malformed(
+                &[&format!("{at}instrument_id")],
+                "each leg names a series' INS- record; a series with none is asked for first \
+                 (W3.31)",
+            ));
+        }
+        if ctx
+            .records
+            .get(&leg.instrument_id)
+            .is_some_and(|says| says.expired)
+        {
+            return Err(malformed(
+                &[&format!("{at}instrument_id")],
+                format!("{} is an expired series", leg.instrument_id),
+            ));
+        }
+        ctx.not_referential(&format!("legs[{n}]"), &leg.instrument_id)?;
+        if leg.side == Side::Unspecified as i32 || Side::try_from(leg.side).is_err() {
+            return Err(malformed(
+                &[&format!("{at}side")],
+                "each leg names its side",
+            ));
+        }
+        let ratio = decimal(&format!("{at}ratio"), leg.ratio.as_ref())?
+            .ok_or_else(|| malformed(&[&format!("{at}ratio")], "each leg states its ratio"))?;
+        if ratio.scale() > 0 && !ratio.integer().rem_euclid(10i128.pow(ratio.scale())).eq(&0) {
+            return Err(malformed(
+                &[&format!("{at}ratio")],
+                "a leg's ratio is a whole number of units",
+            ));
+        }
+        let whole = ratio.integer() / 10i128.pow(ratio.scale());
+        if whole <= 0 {
+            return Err(malformed(
+                &[&format!("{at}ratio")],
+                "a leg's ratio is positive",
+            ));
+        }
+        ratios.push(whole);
+        if !listed_derivative(ctx, &leg.instrument_id) {
+            plain += 1;
+        }
+        position_effect_refused(ctx, &at, &leg.instrument_id, leg.position_effect)?;
+    }
+    if plain > 1 {
+        return Err(malformed(
+            &["legs"],
+            "a package holds at most one leg that is no option or future",
+        ));
+    }
+    fn gcd(a: i128, b: i128) -> i128 {
+        if b == 0 {
+            a
+        } else {
+            gcd(b, a % b)
+        }
+    }
+    let common = ratios.iter().copied().fold(0, gcd);
+    if common > 1 {
+        let at = ratios.iter().position(|ratio| *ratio > 1).unwrap_or(0);
+        return Err(malformed(
+            &[&format!("legs[{at}].ratio")],
+            format!("the legs' ratios are in lowest terms; divide each by {common}"),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn malformed(fields: &[&str], words: impl Into<String>) -> StoreError {
     StoreError::Malformed {
         fields: fields.iter().map(|field| field.to_string()).collect(),
@@ -549,7 +680,11 @@ pub fn propose_order(
             }
         }
     }
-    if request.instrument_id.is_empty() {
+    // Contract v28 (W11.1; ruling 564): an order with legs is one package.
+    let package = !request.legs.is_empty();
+    if package {
+        package_refused(ctx, request)?;
+    } else if request.instrument_id.is_empty() {
         return Err(malformed(
             &["instrument_id"],
             "an order names its instrument",
@@ -557,6 +692,9 @@ pub fn propose_order(
     }
     if request.side == Side::Unspecified as i32 || Side::try_from(request.side).is_err() {
         return Err(malformed(&["side"], "an order names its side"));
+    }
+    if !package {
+        position_effect_refused(ctx, "", &request.instrument_id, request.position_effect)?;
     }
     quote_currency_holds(request)?;
     let child = request
@@ -573,7 +711,11 @@ pub fn propose_order(
     }
     ctx.references_answered()?;
     ctx.not_referential("", &request.instrument_id)?;
-    let missing = ctx.instrument_missing("", &request.instrument_id);
+    let missing = if package {
+        Vec::new()
+    } else {
+        ctx.instrument_missing("", &request.instrument_id)
+    };
     if !missing.is_empty() {
         return Err(StoreError::incomplete(
             "the order's instrument",
@@ -585,7 +727,9 @@ pub fn propose_order(
     }
     // The escape hatch (contract v24, W11's invariant, row 23b): an order on
     // a local record, refused while the deployment's setting is off.
-    crate::booking::local_record_allowed(ctx, &request.instrument_id, "the proposal")?;
+    if !package {
+        crate::booking::local_record_allowed(ctx, &request.instrument_id, "the proposal")?;
+    }
 
     let mut order = Order {
         order_id: ctx.mint(ids::ORDER),
@@ -629,6 +773,8 @@ pub fn propose_order(
         link: request.link.clone(),
         // Contract v27 (W11.1; ruling 480): an FX order's value date.
         value_date: request.value_date.clone(),
+        // Contract v28 (W11.1): open or close, as option brokers require.
+        position_effect: request.position_effect,
         ..Default::default()
     };
 
@@ -2945,6 +3091,14 @@ fn trade_lines(
     execution: &Execution,
     earlier: &[MovementLine],
 ) -> Result<Vec<MovementLine>> {
+    // Contract v28 (W11.24; ruling 564): a package's own execution books
+    // nothing -- each leg's books to its own lots -- and is kept as the
+    // record of the net price.
+    if execution.multi_leg_reporting_type
+        == meridian_domain::v1::MultiLegReportingType::Package as i32
+    {
+        return Ok(Vec::new());
+    }
     let quantity = numbers::required("quantity", execution.quantity.as_ref())?;
     let price = execution
         .price

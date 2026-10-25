@@ -53,10 +53,12 @@ pub enum Chain {
     Alert = 11,
     /// The control partition's settings (W11.36).
     Setting = 12,
+    /// Contract v28 (W9.16 to W9.19): lifecycle events.
+    Lifecycle = 13,
 }
 
 /// How many rows an account's changes are chained per.
-pub(crate) const CHAINS: usize = 13;
+pub(crate) const CHAINS: usize = 14;
 
 /// A position's key within its account: instrument, side and, from contract
 /// v22, sleeve (W9's invariants; empty for the account's unsleeved part).
@@ -331,6 +333,8 @@ pub struct Changes {
     pub breaks: Vec<Break>,
     pub figures: Vec<AccountFigures>,
     pub attributes: Option<AccountAttributes>,
+    /// Contract v28: the lifecycle events the entry changed, whole.
+    pub lifecycle_events: Vec<meridian_domain::v1::LifecycleEvent>,
     /// The order path's records the entry changed, whole, with what changed
     /// on an order or a placement (W11.13).
     pub orders: Vec<(Order, Vec<String>)>,
@@ -374,6 +378,8 @@ pub struct Book {
     pub breaks: BTreeMap<String, Break>,
     pub figures: BTreeMap<(String, String), AccountFigures>,
     pub attributes: Option<AccountAttributes>,
+    /// Contract v28 (W9.16 to W9.19): each lifecycle event by its `LCE-` ID.
+    pub lifecycle_events: BTreeMap<String, meridian_domain::v1::LifecycleEvent>,
     /// The standing opening balance: its entry and D0.
     pub opening: Option<(String, String)>,
     /// Opening balances reversed, in order.
@@ -413,6 +419,7 @@ impl Book {
             breaks: BTreeMap::new(),
             figures: BTreeMap::new(),
             attributes: None,
+            lifecycle_events: BTreeMap::new(),
             opening: None,
             reversed_openings: Vec::new(),
             entries: Vec::new(),
@@ -630,6 +637,11 @@ impl Book {
             .attributes
             .as_ref()
             .map(|_| take(self, Chain::Attributes));
+        let lifecycle_refs: Vec<JournalRef> = body
+            .lifecycle_events
+            .iter()
+            .map(|_| take(self, Chain::Lifecycle))
+            .collect();
         // The order path's records (W11.13), each row chained of its own, in
         // the order their acts name them.
         let touched = self.ledger.touched(&body.acts);
@@ -853,6 +865,14 @@ impl Book {
             record.last_change = Some(reference);
             self.breaks.insert(record.break_id.clone(), record.clone());
             changes.breaks.push(record);
+        }
+
+        for (held, reference) in body.lifecycle_events.iter().zip(lifecycle_refs) {
+            let mut record = held.clone();
+            record.last_change = Some(reference);
+            self.lifecycle_events
+                .insert(record.event_id.clone(), record.clone());
+            changes.lifecycle_events.push(record);
         }
 
         for (held, reference) in body.figures.iter().zip(figure_refs) {

@@ -442,11 +442,13 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
                 clock.now_ns(),
             );
             let mut ctx = context_of(&envelope, clock.as_ref());
-            let found = references(
-                &bus2,
-                std::slice::from_ref(&request.instrument_id),
-                ctx.received_at_ns,
-            );
+            // Contract v28 (W11.1): a package's legs' records beside it.
+            let mut named: Vec<String> = Vec::new();
+            if !request.instrument_id.is_empty() {
+                named.push(request.instrument_id.clone());
+            }
+            named.extend(request.legs.iter().map(|leg| leg.instrument_id.clone()));
+            let found = references(&bus2, &named, ctx.received_at_ns);
             ctx.reference_versions = found.versions;
             ctx.records = found.records;
             ctx.reference_unavailable = found.unavailable;

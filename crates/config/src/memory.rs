@@ -22,6 +22,10 @@ use crate::store::{
 };
 use crate::DEPLOYMENT_ADMIN;
 
+/// A deployment setting's change as kept: its name, value, author and time
+/// (contract v28).
+type SettingKept = (String, Vec<u8>, Author, i64);
+
 pub struct MemoryStore {
     state: Mutex<Snapshot>,
     /// Each settings change's own record (W6.11), as the Postgres store keeps
@@ -34,7 +38,7 @@ pub struct MemoryStore {
     holds: Mutex<Vec<(Hold, String)>>,
     /// Contract v24 (W3.28): the usage setting's changes, and the reports.
     reports_usage: Mutex<Vec<(bool, Author, i64)>>,
-    settings: Mutex<Vec<(String, Vec<u8>, Author, i64)>>,
+    settings: Mutex<Vec<SettingKept>>,
     /// Contract v26 (W6.35): the time zone's changes.
     time_zones: Mutex<Vec<(String, Author, i64)>>,
     fx_pivots: Mutex<Vec<(Vec<String>, Author, i64)>>,

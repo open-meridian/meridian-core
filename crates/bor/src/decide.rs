@@ -126,6 +126,11 @@ pub struct RecordSays {
     pub code: String,
     pub provisional: bool,
     pub referential: bool,
+    /// Contract v28: its type within its class, a listed option's or a
+    /// future's what a lifecycle event names (W9.16).
+    pub instrument_type: i32,
+    /// Contract v28 (579): a listed series past its last lifecycle date.
+    pub expired: bool,
 }
 
 impl Context {
@@ -382,6 +387,11 @@ fn admits(side: HoldingSide, quantity: Exact) -> bool {
         HoldingSide::Short => !quantity.negated().is_negative(),
         _ => !quantity.is_negative(),
     }
+}
+
+/// [`opening_required`], for the lifecycle events (contract v28).
+pub(crate) fn opening_required_for(book: &Book) -> Result<(String, String)> {
+    opening_required(book)
 }
 
 fn opening_required(book: &Book) -> Result<(String, String)> {
