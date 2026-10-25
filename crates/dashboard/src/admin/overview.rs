@@ -325,9 +325,9 @@ pub fn render(
         rows.push_str(&format!(
             "<tr data-id=\"{id}\" data-user-group=\"{ug}\" data-account-group=\"{ag}\" data-access-group=\"{acg}\">\
              <td>{user}</td><td>{accounts}</td><td>{access}</td><td class=\"actions\">\
-             <button type=\"button\" data-dialog-open=\"permission-withdraw\" \
-             data-title=\"Withdraw this permission\" data-fill=\"{fill}\">Withdraw</button></td></tr>",
-            fill = escape(&serde_json::json!({"permission_id": p.permission_id}).to_string()),
+             <form method=\"post\" action=\"/admin/permissions/withdraw#permissions\" \
+             data-confirm=\"Withdraw this permission? The people in the user group lose what it gave them.\">{token}\
+             <input type=\"hidden\" name=\"permission_id\" value=\"{id}\"><button type=\"submit\">Withdraw</button></form></td></tr>",
             id = escape(&p.permission_id),
             ug = escape(&p.user_group_id),
             ag = escape(&p.account_group_id),
@@ -389,25 +389,13 @@ pub fn render(
         ),
         "Grant",
     );
-    // Contract v28 (W6.7, ruling 549): a withdrawal says why, kept on its
-    // record.
-    let withdraw = dialog(
-        "permission-withdraw",
-        "Withdraw this permission",
-        "/admin/permissions/withdraw#permissions",
-        token,
-        "<input type=\"hidden\" name=\"permission_id\" value=\"\">\
-         <p class=\"warn\">The people in the user group lose what it gave them.</p>\
-         <label>Why<textarea name=\"note\" required maxlength=\"2000\" rows=\"2\"></textarea></label>",
-        "Withdraw",
-    );
     sections.push(section(
         "permissions",
         "Permissions",
         "Who may do what: the people in a user group, using an access group's plugins, \
          on an account group's accounts.",
         &add_button("new-permission", "a permission"),
-        format!("{table}{grant}{withdraw}"),
+        format!("{table}{grant}"),
     ));
 
     // ── User groups ─────────────────────────────────────────────────────────
