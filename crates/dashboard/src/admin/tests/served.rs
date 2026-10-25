@@ -1890,10 +1890,16 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
     bus.serve(crate::registry::REGISTRY_PLUGINS, |envelope| {
         let asked =
             meridian_domain::v1::ListRegistryPluginsRequest::decode(&envelope.payload[..]).unwrap();
+        // The starter packs' members (v28), answered when one is named, so
+        // Browse's own list stays as it was.
+        let members = pack_listings()
+            .into_iter()
+            .filter(|l| !asked.listing.is_empty() && l.listing == asked.listing);
         let listings = registry_listings()
             .into_iter()
             .filter(|l| asked.listing.is_empty() || l.listing == asked.listing)
             .filter(|l| asked.search.is_empty() || l.listing.contains(&asked.search))
+            .chain(members)
             .collect();
         Ok((
             "meridian.v1.ListRegistryPluginsReply".into(),
@@ -1905,6 +1911,79 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
             .encode_to_vec(),
         ))
     });
+    // Contract v27's wire, built in v28 (W8.18, W8.19): two starter packs --
+    // Crypto installed at revision 1 of 2, a member added since, one
+    // launched, one failed; Multi-asset's sixteen not installed, one
+    // unavailable and one not permitted here -- and their acts answered as
+    // the conductor answers them.
+    bus.serve(crate::registry::packs::REGISTRY_PACKS, |envelope| {
+        let asked =
+            meridian_domain::v1::ListRegistryPacksRequest::decode(&envelope.payload[..]).unwrap();
+        let packs = served_packs()
+            .into_iter()
+            .filter(|p| asked.pack.is_empty() || p.pack == asked.pack)
+            .filter(|p| {
+                asked.search.is_empty()
+                    || p.revision.as_ref().is_some_and(|r| {
+                        r.title
+                            .to_lowercase()
+                            .contains(&asked.search.to_lowercase())
+                    })
+            })
+            .collect();
+        Ok((
+            "meridian.v1.ListRegistryPacksReply".into(),
+            meridian_domain::v1::ListRegistryPacksReply {
+                packs,
+                next_cursor: String::new(),
+                catalogue_pulled_at_ns: 1_792_200_000_000_000_000,
+            }
+            .encode_to_vec(),
+        ))
+    });
+    bus.serve(crate::registry::packs::READ_PACK, |envelope| {
+        let asked = meridian_domain::v1::ReadPackRequest::decode(&envelope.payload[..]).unwrap();
+        match served_pack_status(&asked.pack) {
+            Some(status) => Ok(("meridian.v1.PackStatus".into(), status.encode_to_vec())),
+            None => Err(format!(
+                "no starter pack {} is in the catalogue this deployment holds",
+                asked.pack
+            )),
+        }
+    });
+    bus.serve(crate::registry::packs::INSTALL_PACK, |envelope| {
+        let asked = meridian_domain::v1::InstallPackRequest::decode(&envelope.payload[..]).unwrap();
+        Ok((
+            "meridian.v1.PackInstall".into(),
+            meridian_domain::v1::PackInstall {
+                pack: asked.pack,
+                revision: asked.revision,
+                members: asked
+                    .members
+                    .iter()
+                    .map(|listing| meridian_domain::v1::PackMemberStatus {
+                        listing: listing.clone(),
+                        state: meridian_domain::v1::PackMemberState::Installing as i32,
+                        ..Default::default()
+                    })
+                    .collect(),
+            }
+            .encode_to_vec(),
+        ))
+    });
+    for topic in [
+        crate::registry::packs::UPDATE_PACK,
+        crate::registry::packs::REMOVE_PACK,
+    ] {
+        bus.serve(topic, |_| {
+            Ok((
+                "meridian.v1.PackStatus".into(),
+                served_pack_status("open-meridian/crypto")
+                    .unwrap_or_default()
+                    .encode_to_vec(),
+            ))
+        });
+    }
     // Contract v28 (W6.37, W3.31): the series request rule, at its default,
     // and a request for series the rule refuses.
     bus.serve(crate::admin::series_rule::READ_SERIES_REQUEST_RULE, |_| {
@@ -2446,6 +2525,345 @@ fn registry_versions() -> Vec<meridian_domain::v1::PluginVersion> {
         version("open-meridian/fx", "1.4.0", "community", 0),
         version("acme/rates", "2.0.0", "verified", 1_792_000_000_000_000_000),
     ]
+}
+
+/// The starter packs' members as the catalogue's copy holds them (v28):
+/// each a listing of one version, its roles and its datasets' terms.
+fn pack_listings() -> Vec<meridian_domain::v1::PluginListing> {
+    use meridian_pb::v1::{AccessBasis, Catalogue, DatasetDeclaration, DatasetLicence};
+    let member = |listing: &str, title: &str, version: &str, roles: &[&str], basis: AccessBasis| {
+        let mut declaration = documented_declaration();
+        declaration.interface = Some(meridian_pb::v1::InterfaceDeclaration {
+            title: title.into(),
+            ..Default::default()
+        });
+        if basis != AccessBasis::Unspecified {
+            declaration.catalogue = Some(Catalogue {
+                datasets: vec![DatasetDeclaration {
+                    key: "daily".into(),
+                    licence_default: Some(DatasetLicence {
+                        access_basis: basis as i32,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+            });
+        }
+        meridian_domain::v1::PluginListing {
+            listing: listing.into(),
+            versions: vec![meridian_domain::v1::ListedVersion {
+                listing: listing.into(),
+                version: version.into(),
+                registry: "community".into(),
+                metadata: Some(meridian_domain::v1::PluginMetadata {
+                    name: listing.into(),
+                    version: version.into(),
+                    roles: roles.iter().map(|r| r.to_string()).collect(),
+                    declaration: Some(declaration),
+                    ..Default::default()
+                }),
+                schema_version: "v27".into(),
+                ..Default::default()
+            }],
+            publisher: "Open Meridian".into(),
+            ..Default::default()
+        }
+    };
+    PACK_MEMBERS
+        .iter()
+        .map(|(listing, title, version, roles, _, _)| {
+            let basis = if roles.contains(&"data") {
+                if listing.ends_with("tiingo") || listing.ends_with("truefx") {
+                    AccessBasis::Licensed
+                } else {
+                    AccessBasis::PublicDomain
+                }
+            } else {
+                AccessBasis::Unspecified
+            };
+            member(listing, title, version, roles, basis)
+        })
+        .collect()
+}
+
+/// Each member: listing, title, version, roles, group, selection.
+#[allow(clippy::type_complexity)]
+const PACK_MEMBERS: [(&str, &str, &str, &[&str], &str, i32); 16] = [
+    (
+        "open-meridian/tiingo",
+        "Tiingo",
+        "0.6.2",
+        &["data"],
+        "Data",
+        2,
+    ),
+    (
+        "open-meridian/us-treasury",
+        "US Treasury",
+        "0.2.0",
+        &["data"],
+        "Data",
+        2,
+    ),
+    (
+        "open-meridian/ny-fed",
+        "New York Fed",
+        "0.1.0",
+        &["data"],
+        "Data",
+        2,
+    ),
+    (
+        "open-meridian/plugin-ecb",
+        "European Central Bank",
+        "0.3.1",
+        &["data"],
+        "Data",
+        2,
+    ),
+    ("open-meridian/fred", "FRED", "0.1.0", &["data"], "Data", 2),
+    (
+        "open-meridian/fed-board",
+        "Federal Reserve Board",
+        "0.2.0",
+        &["data"],
+        "Data",
+        2,
+    ),
+    (
+        "open-meridian/truefx",
+        "TrueFX",
+        "0.4.0",
+        &["data"],
+        "Data",
+        2,
+    ),
+    (
+        "open-meridian/sec-edgar",
+        "SEC EDGAR",
+        "0.1.0",
+        &["data"],
+        "Data",
+        2,
+    ),
+    (
+        "open-meridian/alpaca",
+        "Alpaca",
+        "0.9.0",
+        &["custody", "connectivity"],
+        "Brokers",
+        3,
+    ),
+    (
+        "open-meridian/oanda",
+        "OANDA",
+        "0.8.1",
+        &["custody", "connectivity"],
+        "Brokers",
+        3,
+    ),
+    (
+        "open-meridian/snaptrade",
+        "SnapTrade",
+        "0.11.1",
+        &["custody"],
+        "Brokers",
+        3,
+    ),
+    (
+        "open-meridian/tradier",
+        "Tradier",
+        "0.5.0",
+        &["custody", "connectivity"],
+        "Brokers",
+        3,
+    ),
+    (
+        "open-meridian/coinbase",
+        "Coinbase",
+        "0.7.1",
+        &["custody", "connectivity"],
+        "Venues",
+        3,
+    ),
+    (
+        "open-meridian/kalshi",
+        "Kalshi",
+        "0.4.0",
+        &["custody", "connectivity"],
+        "Venues",
+        3,
+    ),
+    (
+        "open-meridian/kraken",
+        "Kraken",
+        "0.6.0",
+        &["custody", "connectivity"],
+        "Venues",
+        3,
+    ),
+    (
+        "open-meridian/polymarket-us",
+        "Polymarket US",
+        "0.2.0",
+        &["custody", "connectivity"],
+        "Venues",
+        3,
+    ),
+];
+
+/// The two packs the stand-in's catalogue carries.
+fn served_packs() -> Vec<meridian_domain::v1::PluginPack> {
+    let member = |listing: &str| {
+        let (_, _, _, _, group, selection) = PACK_MEMBERS
+            .iter()
+            .find(|m| m.0 == listing)
+            .copied()
+            .expect("a member");
+        meridian_domain::v1::PackMember {
+            listing: listing.into(),
+            registry: "community".into(),
+            selection,
+            group: group.into(),
+            minimum_version: "0.1.0".into(),
+        }
+    };
+    let pack = |name: &str,
+                revision: u64,
+                title: &str,
+                about: &str,
+                classes: &[&str],
+                members: Vec<meridian_domain::v1::PackMember>| {
+        meridian_domain::v1::PluginPack {
+            pack: name.into(),
+            curator: "Open Meridian".into(),
+            revision: Some(meridian_domain::v1::PackRevision {
+                revision,
+                title: title.into(),
+                description: about.into(),
+                asset_classes: classes.iter().map(|c| c.to_string()).collect(),
+                members,
+                note: "Reviewed.".into(),
+                published_at_ns: 1_792_100_000_000_000_000,
+            }),
+            withdrawn_at_ns: 0,
+            sequence: 212,
+        }
+    };
+    vec![
+        pack(
+            "open-meridian/crypto",
+            2,
+            "Crypto",
+            "Rates for discounting, and the venues where you hold crypto accounts.",
+            &["crypto_asset", "cash"],
+            [
+                "open-meridian/us-treasury",
+                "open-meridian/ny-fed",
+                "open-meridian/fred",
+                "open-meridian/coinbase",
+                "open-meridian/kraken",
+            ]
+            .iter()
+            .map(|m| member(m))
+            .collect(),
+        ),
+        pack(
+            "open-meridian/multi-asset",
+            1,
+            "Multi-asset",
+            "Every launch pack's members: market data, rates, filings, brokers and venues.",
+            &["equity", "cash", "crypto_asset", "event_contract"],
+            PACK_MEMBERS.iter().map(|m| member(m.0)).collect(),
+        ),
+    ]
+}
+
+/// What the stand-in conductor answers for a pack's page.
+fn served_pack_status(pack: &str) -> Option<meridian_domain::v1::PackStatus> {
+    use meridian_domain::v1::{PackMemberState as S, PackMemberStatus};
+    let held = served_packs().into_iter().find(|p| p.pack == pack)?;
+    let version = |listing: &str| {
+        PACK_MEMBERS
+            .iter()
+            .find(|m| m.0 == listing)
+            .map(|m| m.2.to_string())
+            .unwrap_or_default()
+    };
+    let status = |listing: &str, state: S| PackMemberStatus {
+        listing: listing.into(),
+        group: PACK_MEMBERS
+            .iter()
+            .find(|m| m.0 == listing)
+            .map(|m| m.4.to_string())
+            .unwrap_or_default(),
+        latest_version: version(listing),
+        state: state as i32,
+        ..Default::default()
+    };
+    if pack == "open-meridian/crypto" {
+        return Some(meridian_domain::v1::PackStatus {
+            pack: pack.into(),
+            installed_revision: 1,
+            latest_revision: 2,
+            withdrawn: false,
+            members: vec![
+                PackMemberStatus {
+                    installed_version: "0.2.0".into(),
+                    setup: "Launch to connect".into(),
+                    ..status("open-meridian/us-treasury", S::Installed)
+                },
+                PackMemberStatus {
+                    installed_version: "0.1.0".into(),
+                    instance_ids: vec!["ny-fed-1".into()],
+                    ..status("open-meridian/ny-fed", S::Launched)
+                },
+                PackMemberStatus {
+                    added_by_revision: 2,
+                    ..status("open-meridian/fred", S::NotInstalled)
+                },
+                PackMemberStatus {
+                    installed_version: "0.7.0".into(),
+                    instance_ids: vec![INSTANCE.into()],
+                    reason: "Installed 0.7.0; 0.7.1 offered".into(),
+                    ..status("open-meridian/coinbase", S::Launched)
+                },
+                PackMemberStatus {
+                    reason: "verification failed: the provenance: none of the image's referrers is its provenance".into(),
+                    ..status("open-meridian/kraken", S::Failed)
+                },
+            ],
+        });
+    }
+    Some(meridian_domain::v1::PackStatus {
+        pack: pack.into(),
+        installed_revision: 0,
+        latest_revision: held.revision.as_ref().map_or(0, |r| r.revision),
+        withdrawn: false,
+        members: held
+            .revision
+            .unwrap_or_default()
+            .members
+            .iter()
+            .map(|m| match m.listing.as_str() {
+                "open-meridian/sec-edgar" => PackMemberStatus {
+                    latest_version: String::new(),
+                    reason: "none listed at or above 0.1.0".into(),
+                    ..status(&m.listing, S::Unavailable)
+                },
+                "open-meridian/polymarket-us" => PackMemberStatus {
+                    reason: "the floor: open-meridian/polymarket-us 0.2.0 declares v99, which this deployment's sidecar does not serve".into(),
+                    ..status(&m.listing, S::NotPermitted)
+                },
+                "open-meridian/snaptrade" => PackMemberStatus {
+                    installed_version: "0.11.1".into(),
+                    setup: "Launch to connect".into(),
+                    ..status(&m.listing, S::Installed)
+                },
+                _ => status(&m.listing, S::NotInstalled),
+            })
+            .collect(),
+    })
 }
 
 /// Contract v25: the catalogue's copy -- open-meridian/fx with its pulled

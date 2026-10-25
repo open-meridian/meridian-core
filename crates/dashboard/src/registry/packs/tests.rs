@@ -197,3 +197,28 @@ fn browse_switches_between_plugins_and_starter_packs() {
     assert_eq!(group_key("Brokers & venues"), "brokers---venues");
     assert_eq!(groups(members_of(&crypto())), vec!["Data", "Venues"]);
 }
+
+#[test]
+fn a_members_next_act_is_its_setup_step_its_update_or_retry() {
+    let mut member = status("open-meridian/coinbase", PackMemberState::Launched);
+    member.instance_ids = vec!["coinbase-1".into()];
+    member.installed_version = "0.7.0".into();
+    member.latest_version = "0.7.1".into();
+    member.setup = "Enter the credentials".into();
+    let link = "/plugins/coinbase-1?level=admin&tab=settings".to_string();
+    let setup = next_act("open-meridian/crypto", &member, Some(&link));
+    assert!(
+        setup.contains("data-setup-link") && setup.contains("Enter the credentials"),
+        "{setup}"
+    );
+    // Set up: a newer version offered links its own Update sheet.
+    let update = next_act("open-meridian/crypto", &member, None);
+    assert!(
+        update.contains("Update to 0.7.1") && update.contains("instance=coinbase-1"),
+        "{update}"
+    );
+    member.state = PackMemberState::Failed as i32;
+    assert!(next_act("open-meridian/crypto", &member, None).contains(">Retry</a>"));
+    member.state = PackMemberState::Installed as i32;
+    assert!(next_act("open-meridian/crypto", &member, None).contains(">Launch</a>"));
+}

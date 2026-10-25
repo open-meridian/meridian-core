@@ -1167,6 +1167,78 @@ def the_registry_pages(browser, prefix):
             ctx.close()
 
 
+def the_pack_pages(browser, prefix):
+    """Contract v27's wire, built in v28 (W8.18, W8.19; spec/starter-packs,
+    requirements 16 to 27 and 31): Browse's "Starter packs" view, the
+    sixteen-member pack's install sheet -- a step per group, eight rows a
+    page, the review with the Terms' one line and the data sources' line --
+    the pack page's group tabs and About as the setup checklist, a revision's
+    added member, a failed member, and the Update all and Remove pack sheets,
+    each on one screen at the three sizes, in light and dark, with no
+    sideways scroll; and the install sheet's Next reached by keyboard."""
+    crypto = f"{BASE}/admin/plugins/packs/open-meridian/crypto"
+    multi = f"{BASE}/admin/plugins/packs/open-meridian/multi-asset/install"
+    pages = [
+        ("browse-packs", f"{BASE}/admin/plugins/versions?tab=browse&view=packs",
+         "Installed: 3 of 5 members"),
+        ("install-data", multi, "Tiingo"),
+        ("install-brokers", multi + "?step=1", "Alpaca"),
+        ("install-venues", multi + "?step=2", "Not permitted here"),
+        ("install-review", multi + "?step=3", "Each data source's terms are accepted on Data sources"),
+        ("install-added", crypto + "/install?ticked=1&step=99&member=open-meridian%2Ffred", "FRED"),
+        ("page-data", crypto + "?tab=data", "Added to this pack: FRED"),
+        ("page-venues", crypto + "?tab=venues", "Failed: verification failed"),
+        ("page-about", crypto + "?tab=about", "1 installed · 2 in the catalogue"),
+        ("update-sheet", crypto + "/update", "Installed 0.7.0; 0.7.1 offered"),
+        ("remove-sheet", crypto + "/remove", "Every member stays installed"),
+    ]
+    for scheme in ("light", "dark"):
+        for size, width, height in V24_SIZES:
+            ctx = context(browser, width, height, scheme=scheme)
+            page = ctx.new_page()
+            errors = []
+            page.on("pageerror", lambda e: errors.append(str(e)))
+            for name, url, says in pages:
+                page.goto(url)
+                settled(page)
+                text = page.evaluate("() => document.body.textContent")
+                check(says in text, f"pack {name} at {size}, {scheme} says {says!r}")
+                if name == "install-data":
+                    ticked = page.eval_on_selector_all(
+                        "input[type=checkbox][name=member]:checked", "bs => bs.map(b => b.value)")
+                    check("open-meridian/tiingo" in ticked,
+                          f"at {size}, {scheme} the data members are ticked: {ticked}")
+                if name == "install-brokers":
+                    ticked = page.eval_on_selector_all(
+                        "input[type=checkbox][name=member]:checked", "bs => bs.map(b => b.value)")
+                    check(not ticked, f"at {size}, {scheme} no broker is preselected: {ticked}")
+                if name == "install-venues":
+                    refused = page.locator("tr[data-member='open-meridian/polymarket-us'] input[type=checkbox]")
+                    check(refused.count() == 1 and refused.is_disabled(),
+                          f"at {size}, {scheme} a member not permitted here cannot be ticked")
+                if name == "install-review":
+                    line = page.locator("[data-terms-line] a[href='https://open-meridian.com/terms#plugins-and-registries']")
+                    check(line.count() == 1, f"at {size}, {scheme} the review carries the Terms' one line once")
+                if name == "remove-sheet":
+                    check(page.locator("form[data-confirm] button.danger").count() == 1,
+                          f"at {size}, {scheme} Remove pack asks in the confirm dialog")
+                m = page.evaluate(MEASURE)
+                measured(page, f"pack {name} at {size}, {scheme}", f"packs-{name}-{size}-{scheme}.png")
+                check(m["tall"] <= 0, f"pack {name} at {size}, {scheme} fits one screen: {m['tall']}px taller")
+            # The install sheet by keyboard: Tab reaches Next.
+            page.goto(multi)
+            settled(page)
+            reached = False
+            for _ in range(60):
+                page.keyboard.press("Tab")
+                if page.evaluate("() => (document.activeElement.textContent || '').trim() === 'Next'"):
+                    reached = True
+                    break
+            check(reached, f"at {size}, {scheme} the install sheet's Next is reached by keyboard")
+            check(not errors, f"the pack pages at {size}, {scheme} ran without an error: {errors}")
+            ctx.close()
+
+
 def the_portal_overview(browser, prefix):
     """v25's follow-up: a plugin's Overview in the admin portal -- its health,
     what it needs, its records -- on one screen at the three sizes, with no
@@ -1564,6 +1636,7 @@ with sync_playwright() as playwright:
     the_v25_pages(browser, prefix)
     the_documentation_pages(browser, prefix)
     the_registry_pages(browser, prefix)
+    the_pack_pages(browser, prefix)
     the_time_zone_tab(browser, prefix)
     the_fx_pivots_tab(browser, prefix)
     popovers_close_and_destructive_acts_ask(browser, prefix)

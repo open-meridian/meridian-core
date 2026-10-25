@@ -2744,6 +2744,7 @@ impl Context<'_> {
                 "listing": member.listing,
                 "group": others_words(&member.group),
                 "registry": member.registry,
+                "selection": packs::selection_key(member.selection),
                 "label": crate::registry::registry_label(&member.registry),
                 "minimum_version": member.minimum_version,
                 "version": resolved,

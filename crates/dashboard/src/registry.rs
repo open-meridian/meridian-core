@@ -131,8 +131,15 @@ async fn ask<R: Message + Default>(
         )
         .await
         .map_err(|failed| match failed {
+            // A refusal's words, its code or its status (a starter pack's
+            // refusal names its field, v28) left out of what a page says.
             BusError::HandlerFailed { detail, .. } => meridian_bus::read_refusal(&detail)
-                .map_or(detail.clone(), |(_, words)| words.to_string()),
+                .map(|(_, words)| words.to_string())
+                .or_else(|| {
+                    meridian_bus::read_refusal_status(&detail)
+                        .map(|(_, _, words)| words.to_string())
+                })
+                .unwrap_or(detail),
             other => other.to_string(),
         })?;
     R::decode(&bytes[..]).map_err(|failed| format!("an undecodable reply: {failed}"))

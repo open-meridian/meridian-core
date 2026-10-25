@@ -227,7 +227,8 @@ pub fn state_key(state: i32) -> &'static str {
     }
 }
 
-fn selection_key(selection: i32) -> &'static str {
+/// A member's selection as the tools answer it.
+pub fn selection_key(selection: i32) -> &'static str {
     match PackSelection::try_from(selection) {
         Ok(PackSelection::Required) => "required",
         Ok(PackSelection::Preselected) => "preselected",
@@ -585,7 +586,7 @@ pub async fn view(app: &App, session: &Session, asked: &HashMap<String, String>)
     let bar = format!(
         "<form method=\"get\" action=\"{PLUGINS_PATH}\" class=\"filter-bar\" role=\"search\">\
          <input type=\"hidden\" name=\"tab\" value=\"browse\"><input type=\"hidden\" name=\"view\" value=\"packs\">\
-         <input type=\"search\" name=\"search\" value=\"{s}\" placeholder=\"Search starter packs\" aria-label=\"Search starter packs\">\
+         <input type=\"search\" class=\"grow\" name=\"search\" value=\"{s}\" placeholder=\"Search starter packs\" aria-label=\"Search starter packs\">\
          <button type=\"submit\">Search</button></form>",
         s = escape(&search)
     );
@@ -727,24 +728,26 @@ async fn install_sheet(
     let title = format!("Install {}", title_of(&held));
     let base = format!("{}/install", pack_path(&name));
     let revision = held.revision.as_ref().map_or(0, |r| r.revision);
-    let steps_nav: String = groups
+    // The steps, one line: the groups in the curator's order, then Review.
+    let steps_said: Vec<String> = groups
         .iter()
         .map(String::as_str)
         .chain(std::iter::once("Review"))
         .enumerate()
         .map(|(n, said)| {
-            format!(
-                "<li{on}>{said}</li>",
-                on = if n == step {
-                    " aria-current=\"step\" class=\"here\""
-                } else {
-                    ""
-                },
-                said = escape(said)
-            )
+            if n == step {
+                format!("<strong aria-current=\"step\">{}</strong>", escape(said))
+            } else {
+                escape(said)
+            }
         })
         .collect();
-    let steps_nav = format!("<ol class=\"steps pack-steps\" aria-label=\"Steps\">{steps_nav}</ol>");
+    let steps_nav = format!(
+        "<p class=\"hint pack-steps\" aria-label=\"Steps\">Step {} of {}: {}</p>",
+        step + 1,
+        groups.len() + 1,
+        steps_said.join(" · ")
+    );
     let body = if step < groups.len() {
         let group = &groups[step];
         let rows: String = members
@@ -753,42 +756,44 @@ async fn install_sheet(
             .map(|m| {
                 let listing = listings.get(&m.listing);
                 let held_status = statuses.get(m.listing.as_str()).copied();
-                let resolved = held_status.map(|s| s.latest_version.as_str()).unwrap_or_default();
+                let resolved = held_status
+                    .map(|s| s.latest_version.as_str())
+                    .unwrap_or_default();
                 let version = version_in(listing, resolved, &m.registry);
                 let can = tickable(held_status);
                 let required = m.selection == PackSelection::Required as i32;
                 let checked = ticked.contains(&m.listing) && can;
                 let roles = version.map(super::roles_of).unwrap_or_default();
                 let floor = version.map(|v| floor_mark(v).1).unwrap_or_default();
+                // The version as resolved, or what keeps the member from
+                // being installed, its reason beneath the table.
                 let state = held_status
                     .filter(|s| s.state != PackMemberState::NotInstalled as i32)
-                    .map(|s| {
-                        let said = state_said(s.state);
-                        if s.reason.is_empty() {
-                            said.to_string()
-                        } else {
-                            format!("{said}: {}", s.reason)
-                        }
-                    })
+                    .map(|s| state_said(s.state).to_string())
                     .unwrap_or_default();
+                let why = held_status.map(|s| s.reason.as_str()).unwrap_or_default();
                 let basis = version.map(access_basis).unwrap_or_default();
                 format!(
                     "<tr data-member=\"{id}\"><td class=\"tick\"><input type=\"checkbox\" name=\"member\" value=\"{id}\" \
                      aria-label=\"Install {name}\"{checked}{disabled}>{fixed}</td>\
-                     <td class=\"keep\" title=\"{id}\">{name}{state}</td><td>{version_said}</td>\
+                     <td title=\"{id}\">{name}</td><td class=\"version\" title=\"{why}\">{said}</td>\
                      <td class=\"mid\">{roles}</td><td class=\"wide\">{floor}</td><td class=\"mid\">{registry}</td>\
                      <td class=\"wide\"><a href=\"{terms}\">{basis}</a></td></tr>",
                     id = escape(&m.listing),
                     name = escape(&member_name(listing, &m.listing)),
                     checked = if checked { " checked" } else { "" },
                     disabled = if !can || required { " disabled" } else { "" },
-                    fixed = if required && can { hidden("member", &m.listing) } else { String::new() },
-                    state = if state.is_empty() {
-                        String::new()
+                    fixed = if required && can {
+                        hidden("member", &m.listing)
                     } else {
-                        format!(" <span class=\"pill\" data-member-state>{}</span>", escape(&state))
+                        String::new()
                     },
-                    version_said = escape(resolved),
+                    said = if state.is_empty() {
+                        escape(resolved)
+                    } else {
+                        format!("<span data-member-state>{}</span>", escape(&state))
+                    },
+                    why = escape(why),
                     roles = escape(&roles.join(", ")),
                     floor = escape(&floor),
                     registry = registry_label(&m.registry),
@@ -798,6 +803,24 @@ async fn install_sheet(
                     )),
                     basis = if basis.is_empty() { "Terms" } else { basis },
                 )
+            })
+            .collect();
+        // Why a member is installed already, unavailable or not permitted
+        // here, beneath the table (requirements 25 and 26).
+        let reasons: String = members
+            .iter()
+            .filter(|m| &m.group == group)
+            .filter_map(|m| {
+                let held = statuses.get(m.listing.as_str())?;
+                (!held.reason.is_empty()).then(|| {
+                    format!(
+                        "<p class=\"hint\" data-reason=\"{id}\">{name}: {state}, {why}.</p>",
+                        id = escape(&m.listing),
+                        name = escape(&member_name(listings.get(&m.listing), &m.listing)),
+                        state = state_said(held.state).to_lowercase(),
+                        why = escape(&held.reason),
+                    )
+                })
             })
             .collect();
         // The other groups' ticks ride along.
@@ -814,9 +837,10 @@ async fn install_sheet(
             "<form method=\"get\" action=\"{base}\" class=\"sheet-act pack-step\">\
              <input type=\"hidden\" name=\"ticked\" value=\"1\">{carried}\
              <h2>{group}</h2><om-pager rows=\"{STEP_ROWS}\"><table class=\"list one-line plugin-table pack-members\">\
-             <thead><tr><th class=\"tick\"><span class=\"visually-hidden\">Install</span></th><th>Name</th><th>Version</th>\
-             <th class=\"mid\">Roles</th><th class=\"wide\">Floor</th><th class=\"mid\">Registry</th>\
-             <th class=\"wide\">Terms</th></tr></thead><tbody>{rows}</tbody></table></om-pager>\
+             <thead><tr><th class=\"tick\"><span class=\"visually-hidden\">Install</span></th><th>Name</th>\
+             <th class=\"version\">Version</th><th class=\"mid\">Roles</th><th class=\"wide\">Floor</th>\
+             <th class=\"mid\">Registry</th><th class=\"wide\">Terms</th></tr></thead><tbody>{rows}</tbody></table>\
+             </om-pager>{reasons}\
              <div class=\"sheet-foot\"><a class=\"button\" href=\"{PACKS_VIEW}\">Cancel</a>{back}\
              <button type=\"submit\" name=\"step\" value=\"{next}\" class=\"primary\">Next</button></div></form>",
             base = escape(&base),
@@ -1013,13 +1037,32 @@ fn next_act(name: &str, member: &PackMemberStatus, link: Option<&String>) -> Str
                 member.installed_version
             )),
         ),
-        Ok(PackMemberState::Launched) => match link {
-            Some(href) => format!(
-                "<a class=\"button\" href=\"{}\">{}</a>",
+        // The setup step's own words, a link, cut on a phone with its
+        // whole text on hover.
+        Ok(PackMemberState::Launched) => match (link, member.instance_ids.first()) {
+            (Some(href), _) => format!(
+                "<a href=\"{}\" title=\"{said}\" data-setup-link>{said}</a>",
                 escape(href),
-                escape(&member.setup)
+                said = escape(&member.setup)
             ),
-            None => String::new(),
+            // Requirement 20: a newer version offered, on its own Update
+            // sheet, where a widening is approved on its own.
+            (None, Some(instance))
+                if meridian_domain::semver::semver_cmp(
+                    &member.latest_version,
+                    &member.installed_version,
+                ) == Some(std::cmp::Ordering::Greater) =>
+            {
+                format!(
+                    "<a href=\"{href}\" data-update-link>Update to {v}</a>",
+                    href = escape(&format!(
+                        "/admin/plugins/registry/update?instance={instance}&version={}",
+                        member.latest_version
+                    )),
+                    v = escape(&member.latest_version),
+                )
+            }
+            _ => String::new(),
         },
         _ => String::new(),
     }
@@ -1054,8 +1097,9 @@ fn member_row(
         String::new()
     };
     format!(
-        "<tr data-member=\"{id}\" data-state=\"{key}\"><td class=\"keep\" title=\"{id}\">{label}</td>\
-         <td>{versions}</td><td title=\"{state_title}\">{state}</td><td class=\"mid\" data-setup>{setup}</td>\
+        "<tr data-member=\"{id}\" data-state=\"{key}\"><td title=\"{id}\">{label}</td>\
+         <td class=\"version\" title=\"{versions}\">{versions}</td><td title=\"{state_title}\">{state}</td>\
+         <td class=\"mid\" data-setup title=\"{setup}\">{setup}</td>\
          <td class=\"actions\">{act}</td></tr>",
         id = escape(&member.listing),
         key = state_key(member.state),
@@ -1221,11 +1265,25 @@ async fn pack_page(
                 )
             })
             .collect();
+        // A failed member's why, beneath the table, whole (requirement 24).
+        let reasons: String = status
+            .members
+            .iter()
+            .filter(|m| group_key(&m.group) == tab && m.state == PackMemberState::Failed as i32)
+            .map(|m| {
+                format!(
+                    "<p class=\"hint\" data-reason=\"{id}\">{name}: failed, {why}.</p>",
+                    id = escape(&m.listing),
+                    name = escape(&member_name(listings.get(&m.listing), &m.listing)),
+                    why = escape(&m.reason),
+                )
+            })
+            .collect();
         format!(
             "<om-pager rows=\"{STEP_ROWS}\"><table class=\"list one-line plugin-table checklist\"><thead><tr>\
-             <th>Name</th><th>Version</th><th>State</th><th class=\"mid\">Connection</th>\
+             <th>Name</th><th class=\"version\">Version</th><th>State</th><th class=\"mid\">Connection</th>\
              <th class=\"actions\"><span class=\"visually-hidden\">Next</span></th></tr></thead>\
-             <tbody>{rows}</tbody></table></om-pager>"
+             <tbody>{rows}</tbody></table></om-pager>{reasons}"
         )
     };
     let acts = if status.installed_revision == 0 {
@@ -1348,10 +1406,19 @@ async fn update(
                 .iter()
                 .filter(|m| m.reason == "Needs approval")
                 .count();
-            if held == 0 {
-                "Updated: each member is at its latest.".to_string()
-            } else {
-                format!("Updated; {held} members need approval on their own Update sheet.")
+            let failed = status
+                .members
+                .iter()
+                .filter(|m| m.state == PackMemberState::Failed as i32)
+                .count();
+            match (held, failed) {
+                (0, 0) => "Updated: each member is at its latest.".to_string(),
+                (held, 0) => {
+                    format!("Updated; {held} members need approval on their own Update sheet.")
+                }
+                (held, failed) => format!(
+                    "Updated; {failed} members failed and {held} need approval: each says why below."
+                ),
             }
         }),
     )

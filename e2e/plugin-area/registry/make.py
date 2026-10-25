@@ -10,13 +10,17 @@ pre-authentication encoding of canonical JSON), with a key made here and
 thrown away; only its public half is kept, as `platform-key.pem`, which the
 harness's conductor is given as the chart's platform key. What it writes:
 
-- `catalogue.json`: PullCatalogueReply as the platform answers it -- two
+- `catalogue.json`: PullCatalogueReply as the platform answers it -- three
   listings and the signing keys' status. `open-meridian/stand-in` lists
   1.3.0, pulled for a terms breach; 1.4.0 and 1.5.0, whose overview
   differs and whose troubleshooting mentions a jailbreak (the screen's
   "prompt talk", withheld where an agent reads it); and 1.6.0, whose layer
   the stand-in serves altered. `other-org/revoked` lists 1.0.0, built after
-  its organisation's key was revoked.
+  its organisation's key was revoked. From v28 (W8.18, W8.19)
+  `open-meridian/stand-in-rates` lists 0.1.0, which installs cleanly, and
+  the catalogue carries one starter pack, `open-meridian/stand-in-desk`:
+  stand-in-rates and revoked preselected under "Data", the stand-in to
+  choose under "Brokers".
 - `resolutions.json`: each version's DownloadListedVersionReply, its
   listing statement among it, to be pulled from the stand-in's own OCI
   registry (`platform:8443`, over TLS).
@@ -226,6 +230,10 @@ def main():
     revoked, resolution, _ = listed("other-org/revoked", "1.0.0", OTHER_KEY, bundled=True)
     resolutions["other-org/revoked@1.0.0"] = resolution
     cases["revoked"] = revoked["image_digest"]
+    # v28: a listing a starter pack installs cleanly.
+    rates, resolution, _ = listed("open-meridian/stand-in-rates", "0.1.0", OM_KEY)
+    resolutions["open-meridian/stand-in-rates@0.1.0"] = resolution
+    cases["stand-in-rates"] = rates["image_digest"]
     key = {"registered_by_person_id": "", "revoked_by_person_id": "", "revoke_reason": "",
            "revoked_at_ns": 0, "not_trusted_after_ns": 0, "public_key": "ssh-ed25519 AAAAe2e"}
     status = {"issued_at_ns": LISTED_AT_NS + 7200 * NS, "keys": [
@@ -237,9 +245,22 @@ def main():
              revoke_reason="The laptop holding it was lost.",
              not_trusted_after_ns=LISTED_AT_NS - 3600 * NS)]}
     status["signature"] = sign(pae(KEY_STATUS, canonical(status).encode()))
+    member = lambda listing, selection, group, floor: {
+        "listing": listing, "registry": "community", "selection": f"PACK_SELECTION_{selection}",
+        "group": group, "minimum_version": floor}
+    desk = {"pack": "open-meridian/stand-in-desk", "curator": "Open Meridian", "sequence": 4,
+            "withdrawn_at_ns": 0,
+            "revision": {"revision": 1, "title": "Stand-in desk",
+                         "description": "The stand-in's rates and accounts, for the harness.",
+                         "asset_classes": ["equity"], "note": "Reviewed.",
+                         "published_at_ns": LISTED_AT_NS,
+                         "members": [member("open-meridian/stand-in-rates", "PRESELECTED", "Data", "0.1.0"),
+                                     member("other-org/revoked", "PRESELECTED", "Data", "1.0.0"),
+                                     member("open-meridian/stand-in", "CHOOSE", "Brokers", "1.4.0")]}}
     catalogue = {"listings": [listing_of("open-meridian/stand-in", stand_in),
+                              listing_of("open-meridian/stand-in-rates", [rates]),
                               listing_of("other-org/revoked", [revoked])],
-                 "sequence": 4, "key_status": status}
+                 "packs": [desk], "sequence": 4, "key_status": status}
 
     os.makedirs(f"{OUT}/oci", exist_ok=True)
     for digest, data in BLOBS.items():

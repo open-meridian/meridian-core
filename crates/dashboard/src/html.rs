@@ -497,6 +497,10 @@ form.filter-bar{display:flex;gap:.5rem;align-items:center;margin:0 0 .6rem}form.
 @media (max-width:40rem){form.filter-bar{flex-wrap:wrap}.filter-bar .grow{flex-basis:100%}.filter-selects{flex:1}\
 .filter-selects select{flex:1;min-width:0}}\
 .plugin-table{width:100%}.plugin-table th,.plugin-table td{white-space:nowrap}.plugin-table td.actions{white-space:normal}\
+.plugin-table :is(th,td).tick{width:2.75rem;padding-inline:.5rem}.plugin-table :is(th,td).version{width:6.5rem}\
+.plugin-table.checklist :is(th,td).actions{width:9.5rem;text-align:right}\
+.plugin-table.checklist td.actions{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}\
+@media (max-width:40rem){.plugin-table.checklist :is(th,td).actions{width:6rem}.plugin-table :is(th,td).version{width:4.5rem}}\
 .plugin-table .keep,.plugin-table .keep a{overflow:visible;text-overflow:clip;max-width:none}\
 .inline-act{display:inline-flex;gap:.3rem;margin:0}.inline-act input{width:8rem;margin:0}\
 @media (max-width:60rem){.plugin-table .wide{display:none}}@media (max-width:40rem){.plugin-table .mid{display:none}}\
