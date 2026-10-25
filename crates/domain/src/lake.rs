@@ -1247,3 +1247,63 @@ mod query_kind_tests {
         assert!(!roles_read_kind(&["custody".to_string()], "prices"));
     }
 }
+
+/// A licence's eligibility (contract v28, ruling 491; 597): who may take the
+/// dataset -- personal or commercial use -- and a buyer-revenue threshold
+/// either way, a decimal in the currency its code names. The words a page
+/// and a tool state it in; `None` where nothing is stated, and why not where
+/// a part does not read.
+pub fn eligibility_of(
+    uses: &[&str],
+    below: &str,
+    at_least: &str,
+    currency: &str,
+) -> Result<Option<meridian_pb::v1::DataEligibility>, String> {
+    use meridian_pb::v1::{DataEligibility, DataUse};
+    let mut out = DataEligibility::default();
+    for (i, used) in uses.iter().enumerate() {
+        let read = match used.trim() {
+            "personal" => DataUse::Personal,
+            "commercial" => DataUse::Commercial,
+            "" => continue,
+            other => {
+                return Err(format!(
+                    "eligibility.uses[{i}] {other:?} is personal or commercial"
+                ))
+            }
+        };
+        if !out.uses.contains(&(read as i32)) {
+            out.uses.push(read as i32);
+        }
+    }
+    let decimal = |field: &str, text: &str| -> Result<Option<meridian_pb::v1::Decimal>, String> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Ok(None);
+        }
+        let read: crate::exact::Exact = text
+            .parse()
+            .map_err(|_| format!("eligibility.{field} {text:?} is not a number"))?;
+        if read.is_negative() {
+            return Err(format!("eligibility.{field} is never below zero"));
+        }
+        Ok(Some(read.to_wire()))
+    };
+    out.buyer_revenue_below = decimal("buyer_revenue_below", below)?;
+    out.buyer_revenue_at_least = decimal("buyer_revenue_at_least", at_least)?;
+    let currency = currency.trim().to_ascii_uppercase();
+    let threshold = out.buyer_revenue_below.is_some() || out.buyer_revenue_at_least.is_some();
+    if threshold && !(currency.len() == 3 && currency.chars().all(|c| c.is_ascii_uppercase())) {
+        return Err(
+            "eligibility.buyer_revenue_currency_code: a threshold names its ISO 4217 currency"
+                .into(),
+        );
+    }
+    if threshold {
+        out.buyer_revenue_currency_code = currency;
+    }
+    if out.uses.is_empty() && !threshold {
+        return Ok(None);
+    }
+    Ok(Some(out))
+}

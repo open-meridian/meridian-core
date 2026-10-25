@@ -4106,6 +4106,12 @@ async fn set_dataset_licence(
                 "display": !field(&fields, "display").is_empty(),
                 "default_fields": words(&fields, "default_fields"),
                 "personal_use": !field(&fields, "personal_use").is_empty(),
+                "eligibility": {
+                    "uses": list(&fields, "eligibility_uses"),
+                    "buyer_revenue_below": field(&fields, "buyer_revenue_below"),
+                    "buyer_revenue_at_least": field(&fields, "buyer_revenue_at_least"),
+                    "buyer_revenue_currency_code": field(&fields, "buyer_revenue_currency_code").to_ascii_uppercase(),
+                },
                 "note": field(&fields, "note"),
             }))
         },
@@ -4118,6 +4124,18 @@ async fn set_dataset_licence(
         field(&fields, "retention_days")
     } else {
         "0"
+    };
+    // Contract v28 (491, 597): the eligibility the terms state, where given.
+    let uses_said = list(&fields, "eligibility_uses");
+    let uses: Vec<&str> = uses_said.iter().map(String::as_str).collect();
+    let eligibility = match meridian_domain::lake::eligibility_of(
+        &uses,
+        field(&fields, "buyer_revenue_below"),
+        field(&fields, "buyer_revenue_at_least"),
+        field(&fields, "buyer_revenue_currency_code"),
+    ) {
+        Ok(read) => read,
+        Err(why) => return not_done(&why, DATA_SOURCES),
     };
     let outcome = match retention.parse::<u32>() {
         Err(_) => Err(format!(
@@ -4138,6 +4156,7 @@ async fn set_dataset_licence(
                         display: !field(&fields, "display").is_empty(),
                         default_fields: words(&fields, "default_fields"),
                         personal_use: !field(&fields, "personal_use").is_empty(),
+                        eligibility,
                         ..Default::default()
                     },
                     !field(&fields, "derived_use").is_empty(),

@@ -197,6 +197,11 @@ pub fn set_licence(
     if let Some(refused) = note_refused(&request.note) {
         return Err(refused);
     }
+    // Contract v28 (W10.1; sdk-contract/a-deployment-counts-its-licensed-
+    // data-use-contract): a person's licence keeps the declared terms -- a
+    // part the request leaves unstated is the catalogue's declared value,
+    // never cleared by an edit of another part.
+    let terms = kept_declared(terms, declaration.licence_default.as_ref());
     let mut licence = DatasetLicence {
         dataset: request.dataset.clone(),
         updated_by: author.by.clone(),
@@ -221,6 +226,77 @@ pub fn set_licence(
         "a dataset licensed"
     );
     Ok(licence)
+}
+
+/// A licence as a person states it, its unstated parts the declared terms'
+/// (contract v28, W10.1): the terms version, access basis, timeliness and
+/// delay, the underlying source, the meters and the display, non-display
+/// and enterprise terms, the derived-use, redistribution and outside
+/// computation answers, the prohibited uses, the six attribution terms,
+/// the report's cadence and day, and the eligibility (491, 597).
+pub fn kept_declared(
+    mut terms: DatasetLicence,
+    declared: Option<&DatasetLicence>,
+) -> DatasetLicence {
+    let Some(declared) = declared else {
+        return terms;
+    };
+    let text = |held: &mut String, from: &String| {
+        if held.is_empty() {
+            *held = from.clone();
+        }
+    };
+    let number = |held: &mut i32, from: i32| {
+        if *held == 0 {
+            *held = from;
+        }
+    };
+    text(&mut terms.terms_version, &declared.terms_version);
+    number(&mut terms.access_basis, declared.access_basis);
+    number(&mut terms.timeliness, declared.timeliness);
+    if terms.delay_minutes == 0 {
+        terms.delay_minutes = declared.delay_minutes;
+    }
+    text(&mut terms.delay_label, &declared.delay_label);
+    text(&mut terms.underlying_source, &declared.underlying_source);
+    if terms.meters.is_empty() {
+        terms.meters = declared.meters.clone();
+    }
+    if terms.display_terms.is_none() {
+        terms.display_terms = declared.display_terms;
+    }
+    if terms.non_display.is_none() {
+        terms.non_display = declared.non_display.clone();
+    }
+    if terms.enterprise.is_none() {
+        terms.enterprise = declared.enterprise.clone();
+    }
+    number(&mut terms.derived_use_terms, declared.derived_use_terms);
+    if terms.derived_multi_instrument_free.is_none() {
+        terms.derived_multi_instrument_free = declared.derived_multi_instrument_free;
+    }
+    terms.derived_creation_is_non_display |= declared.derived_creation_is_non_display;
+    number(&mut terms.redistribution, declared.redistribution);
+    number(&mut terms.outside_computation, declared.outside_computation);
+    if terms.prohibited_uses.is_empty() {
+        terms.prohibited_uses = declared.prohibited_uses.clone();
+    }
+    terms.attribution_required |= declared.attribution_required;
+    text(&mut terms.attribution_text, &declared.attribution_text);
+    number(&mut terms.copyright_class, declared.copyright_class);
+    terms.no_more_restrictive_terms |= declared.no_more_restrictive_terms;
+    text(
+        &mut terms.not_affiliated_notice,
+        &declared.not_affiliated_notice,
+    );
+    number(&mut terms.report_cadence, declared.report_cadence);
+    if terms.report_due_day == 0 {
+        terms.report_due_day = declared.report_due_day;
+    }
+    if terms.eligibility.is_none() {
+        terms.eligibility = declared.eligibility.clone();
+    }
+    terms
 }
 
 /// An instance entitled to a dataset, or its entitlement withdrawn (W10.1).

@@ -284,6 +284,11 @@ fn datasets_tab(rows: &[Row], records: &AccessRecords, token: &str) -> (String, 
                     "derived_use": if meridian_domain::lake::derived_use_bool(licence) { vec!["1"] } else { vec![] },
                     "display": if licence.display { vec!["1"] } else { vec![] },
                     "personal_use": if licence.personal_use { vec!["1"] } else { vec![] },
+                    // Contract v28 (491, 597): the eligibility in force.
+                    "eligibility_uses": licence.eligibility.as_ref().map(|e| e.uses.iter().map(|u| match meridian_pb::v1::DataUse::try_from(*u) {
+                        Ok(meridian_pb::v1::DataUse::Personal) => "personal",
+                        _ => "commercial",
+                    }).collect::<Vec<_>>()).unwrap_or_default(),
                 },
             });
             let entitle = serde_json::json!({"fields": {"dataset": d.dataset, "instance": "", "fields": "", "note": ""},
@@ -398,6 +403,15 @@ fn datasets_tab(rows: &[Row], records: &AccessRecords, token: &str) -> (String, 
          <label class=\"check\"><input type=\"checkbox\" name=\"derived_use\" value=\"1\"> Derived data may be made</label>\
          <label class=\"check\"><input type=\"checkbox\" name=\"display\" value=\"1\"> It may be shown</label>\
          <label class=\"check\"><input type=\"checkbox\" name=\"personal_use\" value=\"1\"> Its terms are one person's</label>\
+         <fieldset class=\"eligibility\"><legend>Who may take it, as its terms state</legend>\
+         <label class=\"check\"><input type=\"checkbox\" name=\"eligibility_uses\" value=\"personal\"> Personal use</label>\
+         <label class=\"check\"><input type=\"checkbox\" name=\"eligibility_uses\" value=\"commercial\"> Commercial use</label>\
+         <label>Buyer revenue below <input name=\"buyer_revenue_below\" inputmode=\"decimal\" \
+         pattern=\"[0-9]+(\\.[0-9]+)?\" placeholder=\"No threshold\"></label>\
+         <label>Buyer revenue at least <input name=\"buyer_revenue_at_least\" inputmode=\"decimal\" \
+         pattern=\"[0-9]+(\\.[0-9]+)?\" placeholder=\"No threshold\"></label>\
+         <label>In <input name=\"buyer_revenue_currency_code\" maxlength=\"3\" pattern=\"[A-Za-z]{{3}}\" \
+         placeholder=\"USD\"></label></fieldset>\
          <label>Fields readable by default <input name=\"default_fields\" \
          placeholder=\"Every field; or meridian.v1.Bar.vwap, ...\"></label>\
          <label>Note <input name=\"note\" maxlength=\"2000\" placeholder=\"Why\"></label>\
