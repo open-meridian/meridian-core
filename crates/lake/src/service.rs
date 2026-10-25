@@ -1060,9 +1060,20 @@ impl Lake {
             reply.recorded += done.recorded;
             reply.restated += done.restated;
             reply.unchanged += done.unchanged;
+            // Each real-time row's age at the `lake` hop, on commit (W4.16;
+            // the latency spec's "The hops"; ruling 606): sent to the
+            // monitor with the component's next report.
+            let committed = self.clock.now_ns();
             for row in &done.rows {
                 subjects.extend(row.subjects());
                 self.publish(&dataset, row);
+                if row.data_type().real_time() {
+                    meridian_domain::latency::recorder().record(
+                        &dataset,
+                        meridian_domain::v1::AgeHop::Lake,
+                        committed - meridian_domain::latency::source_ns(row.meta()),
+                    );
+                }
             }
             let trades = done
                 .rows

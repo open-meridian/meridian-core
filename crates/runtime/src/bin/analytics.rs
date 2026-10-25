@@ -70,6 +70,8 @@ fn run() -> Result<(), String> {
 
     on_runtime(async move {
         let bus = bus_from_env(&instance_id).await?;
+        // Its own hop's ages, to the monitor (W4.16; ruling 606).
+        tokio::spawn(meridian_runtime::report_latency_forever(Arc::clone(&bus)));
         if works {
             worker::serve(&bus, Arc::new(Cache::new(UNITS_KEPT)));
         }

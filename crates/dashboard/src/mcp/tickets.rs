@@ -357,11 +357,15 @@ async fn answer(
                 .notices(&caller.subject)
                 .await
                 .unwrap_or_default();
+            // A latency or backlog episode of a plugin the person
+            // administers, opened or closed (contract v28; W4.16; 427).
+            let latency = crate::latency::notices::of(&caller.subject).await;
             Ok(json!({
                 "outcome": "unchanged",
                 "data": {
                     "notices": notices.iter().map(|(n, t)| tickets::notice_json(n, Some(t), true)).collect::<Vec<_>>(),
                     "service_account_notices": owned.iter().map(crate::service_accounts::notice_json).collect::<Vec<_>>(),
+                    "latency_notices": latency.iter().map(crate::latency::notices::json).collect::<Vec<_>>(),
                 },
             }))
         }

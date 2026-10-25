@@ -1492,6 +1492,10 @@ impl Context<'_> {
                 json!({"instance_id": launch.instance_id, "name": launch.name, "version": launch.version})
             }),
             "sync": sync,
+            // Its sessions' latency and its datasets' ages over the last
+            // minute, each with its ceiling and open episodes (contract v28;
+            // W4.16, the Summary's latency part).
+            "latency": crate::latency::summary_json(&instance, self.app.clock.now_ns()),
         });
         // The Summary's own parts, for an admin of any of its roles; a
         // deployment admin who is none reads the Overview's.

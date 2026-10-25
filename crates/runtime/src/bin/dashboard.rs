@@ -343,6 +343,13 @@ fn run() -> Result<(), String> {
         };
     // Service accounts and each role's "runs as" beside them (contract
     // v21); in memory without one.
+    // A latency or backlog episode's notices beside them (contract v28;
+    // W4.16, ruling 427); in memory without one.
+    if let Some(database) = &database {
+        meridian_dashboard::latency::notices::keep_in(Arc::new(
+            meridian_dashboard::latency::notices::InPostgres::on(database.clone()),
+        ));
+    }
     let service_account_store: Arc<
         dyn meridian_dashboard::service_accounts::store::ServiceAccountStore,
     > = match &database {
@@ -538,6 +545,9 @@ fn run() -> Result<(), String> {
         // Core's latency monitor (contract v28; W4.16): every plugin's
         // ReportLatency, merged for the Age tab and dashboard__read_data_age.
         meridian_dashboard::latency::serve(Arc::clone(&app));
+        // Its judge: each whole minute, each episode opened or closed a
+        // notice to the people it concerns (W4.16; ruling 427).
+        meridian_dashboard::latency::notices::judge_forever(Arc::clone(&app));
         // The prepared change a page was opened from, and a person's own
         // settings (W4.14, W6.31, contract v20).
         meridian_dashboard::prepared::serve(Arc::clone(&app));

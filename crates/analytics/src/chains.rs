@@ -281,6 +281,7 @@ pub fn chain(
     as_of: i64,
     rate: Option<&Value>,
     calendars: &mut BTreeMap<String, Option<v1::TradingSessions>>,
+    live: bool,
 ) -> Result<Value, Refused> {
     let underlying = chain.underlying_instrument_id.as_str();
     let record = resolve_instrument(asker, underlying, as_of);
@@ -362,6 +363,10 @@ pub fn chain(
         learn(&reply.datasets, &mut declarations);
         for quote in reply.quotes {
             let Some(meta) = &quote.meta else { continue };
+            if live {
+                // Read at now (as_of is now): its age at this hop (606).
+                crate::resolve::age_at_analytics(meta, as_of);
+            }
             let key = key_of(&meta.series_key);
             let newer = quotes
                 .get(&key)

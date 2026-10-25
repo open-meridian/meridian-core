@@ -1953,15 +1953,31 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
             .iter()
             .enumerate()
         {
-            for hop in ["AGE_HOP_EDGE", "AGE_HOP_LAKE"] {
+            // A plugin's edge, under its instance; the lake's own hop, under
+            // the lake (ruling 606).
+            for (instance, hop) in [
+                (
+                    dataset.split(':').next().unwrap_or_default(),
+                    "AGE_HOP_EDGE",
+                ),
+                ("lake-1", "AGE_HOP_LAKE"),
+            ] {
+                let mut ages = meridian_domain::latency::Histogram::default();
                 for k in 1..=40_i64 {
-                    meridian_domain::latency::monitor().record_age(
-                        dataset,
-                        hop,
-                        (n as i64 + 1) * k * 250_000,
-                        now,
-                    );
+                    ages.record((n as i64 + 1) * k * 250_000);
                 }
+                meridian_domain::latency::monitor().merge(
+                    meridian_domain::latency::Key {
+                        instance: instance.to_string(),
+                        scope: meridian_domain::latency::Scope::Dataset {
+                            dataset: dataset.to_string(),
+                            hop: hop.to_string(),
+                        },
+                    },
+                    now,
+                    &ages,
+                    meridian_domain::latency::Said::default(),
+                );
             }
         }
     }

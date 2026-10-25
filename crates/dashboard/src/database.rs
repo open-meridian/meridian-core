@@ -103,6 +103,12 @@ const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0009_a_service_account.sql"),
         then: None,
     },
+    Migration {
+        version: 10,
+        name: "a_latency_episode",
+        sql: include_str!("../migrations/0010_a_latency_episode.sql"),
+        then: None,
+    },
 ];
 
 /// Migration 8's record (W6.29, decisions/031): every act at may make and

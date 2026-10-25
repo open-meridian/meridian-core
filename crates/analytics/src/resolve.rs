@@ -190,6 +190,9 @@ pub fn resolve(
         now_ns
     };
     let sources = inputs.sources.clone();
+    // A job read at now, whose inputs' ages at this hop are measured
+    // (W4.16; ruling 606): never one read as of a past time or a date.
+    let live = inputs.lake_as_of_ns == 0 && job.business_date.is_empty();
     // Contract v27 (W12.1; ruling 458): a business date -- the book at its
     // end, the lake at its closes -- never one after today's.
     let business_date = job.business_date.clone();
@@ -465,6 +468,11 @@ pub fn resolve(
                     let Some(row) = market_row(&price) else {
                         continue;
                     };
+                    if live {
+                        if let Some(meta) = price.meta.as_ref() {
+                            age_at_analytics(meta, now_ns);
+                        }
+                    }
                     if let Some(money) = price.price.as_ref() {
                         learn(&mut codes, money);
                     }
@@ -744,6 +752,7 @@ pub fn resolve(
                 as_of,
                 rate.as_ref(),
                 &mut calendars,
+                live,
             )?);
         }
         document["chains"] = Value::Array(chains);
@@ -1314,6 +1323,22 @@ fn prices(
         cursor = reply.next_cursor;
     }
     Ok(out)
+}
+
+/// An input row's age at the `analytics` hop (W4.16; the latency spec's
+/// "The hops"; ruling 606): now less its source time, recorded for the
+/// component's next report to the monitor.
+pub(crate) fn age_at_analytics(meta: &v1::ObservationMeta, now_ns: i64) {
+    let dataset = meta
+        .source
+        .as_ref()
+        .map(|s| s.dataset.as_str())
+        .unwrap_or_default();
+    meridian_domain::latency::recorder().record(
+        dataset,
+        v1::AgeHop::Analytics,
+        now_ns - meridian_domain::latency::source_ns(meta),
+    );
 }
 
 fn market_row(price: &v1::Price) -> Option<Value> {

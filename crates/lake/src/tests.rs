@@ -2354,3 +2354,36 @@ async fn a_datasets_liveness_is_kept_published_and_listed() {
         .unwrap();
     assert!(kraken.liveness.is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rows_age_at_the_lake_hop_is_recorded_on_commit_for_the_monitor() {
+    // Contract v28 (W4.16; the latency spec's "The hops"; ruling 606): the
+    // lake measures its own hop and sends it on report-latency, never into
+    // the monitor's store directly.
+    let h = harness();
+    h.lake.configured(&live_configuration());
+    let now = h.lake.clock.now_ns();
+    record_rows(
+        &h,
+        "quotes",
+        vec![Observation::Quote(quote(
+            "q-age-1",
+            now - 3_000_000,
+            money("100", "USD", ""),
+            money("101", "USD", ""),
+        ))],
+    )
+    .unwrap();
+    let taken = meridian_domain::latency::recorder().take(now + 1);
+    let lake = taken
+        .iter()
+        .find(|s| {
+            s.dataset == "coinbase-1:live" && s.hop == meridian_domain::v1::AgeHop::Lake as i32
+        })
+        .expect("the lake hop's snapshot");
+    assert!(lake.histogram.as_ref().unwrap().total >= 1);
+    assert!(
+        lake.instance_id.is_empty(),
+        "no instance: the lake is no plugin's"
+    );
+}

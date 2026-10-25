@@ -28,11 +28,11 @@ use std::sync::{Arc, RwLock};
 
 use meridian_bus::Bus;
 use meridian_domain::v1::{
-    BarsRecordedEvent, EntitlementsChangedEvent, ListBarsRequest, ListPricesRequest,
+    AgeHop, BarsRecordedEvent, EntitlementsChangedEvent, ListBarsRequest, ListPricesRequest,
     ListRatesRequest, LivenessRecordedEvent, ObservationMeta, ObservationsWantedEvent,
     OutcomesRecordedEvent, PricesRecordedEvent, QuotesRecordedEvent, RatesRecordedEvent,
-    RecordBarsRequest, RecordPricesRequest, RecordRatesRequest, StatisticsRecordedEvent,
-    TradesRecordedEvent, WantWithdrawnEvent,
+    RecordBarsRequest, RecordPricesRequest, RecordQuotesRequest, RecordRatesRequest,
+    RecordTradesRequest, StatisticsRecordedEvent, TradesRecordedEvent, WantWithdrawnEvent,
 };
 use prost::Message;
 use tokio::sync::watch;
@@ -156,6 +156,48 @@ fn meta_said(meta: Option<&ObservationMeta>) -> (String, Vec<String>, String) {
         meta.subjects.into_iter().map(|s| s.entity_id).collect(),
         source.venue_id,
     )
+}
+
+/// Each real-time row's age at `hop` now -- the batch a data plugin sent,
+/// accepted (`sidecar`), or a row delivered to a reader (`bus`) -- recorded
+/// for this sidecar's next report to the monitor (W4.16; the latency spec's
+/// "The hops"; ruling 606). Trades and quotes alone: a daily value's age is
+/// its date's, not a hop's.
+pub(crate) fn record_ages(payload_type: &str, payload: &[u8], hop: AgeHop, now_ns: i64) {
+    let metas: Vec<ObservationMeta> = match payload_type {
+        "meridian.v1.TradesRecordedEvent" => TradesRecordedEvent::decode(payload)
+            .ok()
+            .and_then(|e| e.trade)
+            .and_then(|t| t.meta)
+            .into_iter()
+            .collect(),
+        "meridian.v1.QuotesRecordedEvent" => QuotesRecordedEvent::decode(payload)
+            .ok()
+            .and_then(|e| e.quote)
+            .and_then(|q| q.meta)
+            .into_iter()
+            .collect(),
+        "meridian.v1.RecordTradesRequest" => RecordTradesRequest::decode(payload)
+            .map(|r| r.trades.into_iter().filter_map(|t| t.meta).collect())
+            .unwrap_or_default(),
+        "meridian.v1.RecordQuotesRequest" => RecordQuotesRequest::decode(payload)
+            .map(|r| r.quotes.into_iter().filter_map(|q| q.meta).collect())
+            .unwrap_or_default(),
+        _ => return,
+    };
+    let recorder = meridian_domain::latency::recorder();
+    for meta in &metas {
+        let dataset = meta
+            .source
+            .as_ref()
+            .map(|s| s.dataset.as_str())
+            .unwrap_or_default();
+        recorder.record(
+            dataset,
+            hop,
+            now_ns - meridian_domain::latency::source_ns(meta),
+        );
+    }
 }
 
 /// A lake row's payload read for what the receive decides by; None for a
@@ -704,5 +746,57 @@ mod tests {
             .unwrap()
             .key
         );
+    }
+
+    #[test]
+    fn a_batch_accepted_and_a_row_delivered_record_their_ages_at_their_hops() {
+        // Contract v28 (W4.16; ruling 606): the sidecar's own hops, sent on
+        // report-latency under its plugin's instance.
+        let now = 1_792_600_000_000_000_000;
+        let quote = |dataset: &str| meridian_domain::v1::Quote {
+            meta: Some(ObservationMeta {
+                row_key: "q-1".into(),
+                source: Some(Source {
+                    dataset: dataset.into(),
+                    ..Default::default()
+                }),
+                valid_from_ns: now - 4_000_000,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let batch = RecordQuotesRequest {
+            quotes: vec![quote("v28-age-sidecar:quotes")],
+            ..Default::default()
+        };
+        record_ages(
+            "meridian.v1.RecordQuotesRequest",
+            &batch.encode_to_vec(),
+            AgeHop::Sidecar,
+            now,
+        );
+        let heard = QuotesRecordedEvent {
+            quote: Some(quote("v28-age-bus:quotes")),
+        };
+        record_ages(
+            "meridian.v1.QuotesRecordedEvent",
+            &heard.encode_to_vec(),
+            AgeHop::Bus,
+            now,
+        );
+        // A daily value is no hop's.
+        record_ages("meridian.v1.PricesRecordedEvent", &[], AgeHop::Bus, now);
+        let taken = meridian_domain::latency::recorder().take(now);
+        let at = |dataset: &str, hop: AgeHop| {
+            taken
+                .iter()
+                .find(|s| s.dataset == dataset && s.hop == hop as i32)
+                .map(|s| s.histogram.as_ref().unwrap().min_ns)
+        };
+        assert_eq!(
+            at("v28-age-sidecar:quotes", AgeHop::Sidecar),
+            Some(4_000_000)
+        );
+        assert_eq!(at("v28-age-bus:quotes", AgeHop::Bus), Some(4_000_000));
     }
 }

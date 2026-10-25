@@ -585,6 +585,14 @@ impl Sidecar {
         let message = self.kept_at_the_edge(payload_type, message)?;
         self.statement_stands(payload_type, &message.encode_to_vec())?;
         self.dates_stand(payload_type, &message.encode_to_vec())?;
+        // A record batch's rows' age at the `sidecar` hop, on accepting it
+        // (W4.16; ruling 606).
+        crate::lake::record_ages(
+            payload_type,
+            &message.encode_to_vec(),
+            meridian_domain::v1::AgeHop::Sidecar,
+            self.clock.now_ns(),
+        );
         // A command naming no account names none: a statement from a plugin
         // built before v7 is admitted with no account (crate::older).
         let account = account.filter(|account| !account.is_empty());

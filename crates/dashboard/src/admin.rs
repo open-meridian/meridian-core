@@ -1538,6 +1538,9 @@ pub(crate) fn summary_tab(manage: &Manage) -> String {
             .unwrap_or_default(),
     );
     let figures = crate::figures::section(manage.report, manage.now);
+    // Its sessions' latency and its datasets' ages, and an episode open
+    // (contract v28; W4.16; ruling 427).
+    let latency = crate::latency::summary_line(manage.instance, manage.now);
     // Its raw records, storage's and the archive's, and its moves (W6.9,
     // contract v16), for a plugin at the edge keeping them.
     let (records, moves) = match manage.moves {
@@ -1560,7 +1563,7 @@ pub(crate) fn summary_tab(manage: &Manage) -> String {
     let status = format!(
         "<section class=\"panel padded\" id=\"status\"><div class=\"row\"><h2>Status</h2>{badge}</div>{why}\
          <dl class=\"facts\"><dt>Version</dt><dd data-version>{version}</dd>\
-         <dt>Contract</dt><dd data-contract>{contract}</dd>{stopped}{seen}{tokens}</dl>{warnings}\
+         <dt>Contract</dt><dd data-contract>{contract}</dd>{stopped}{seen}{tokens}{latency}</dl>{warnings}\
          <p class=\"reserved\" data-reserved=\"lifecycle\">Restarting it, moving it to another version and \
          holding it at one will be here. They are not built yet.</p></section>{figures}"
     );
