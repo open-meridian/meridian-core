@@ -81,6 +81,10 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/admin/time-zone", post(set_deployment_time_zone))
         .route("/admin/fx-pivot-currencies", post(set_fx_pivot_currencies))
         .route("/admin/series-request-rule", post(set_series_request_rule))
+        .route(
+            "/admin/stale-reference-actions",
+            post(set_stale_reference_actions_permitted),
+        )
         .route("/admin/model-routing", post(set_model_routing))
         .route("/admin/data-sources", get(data_sources_page))
         .route("/admin/data-sources/licence", post(set_dataset_licence))
@@ -474,6 +478,7 @@ pub mod instruments;
 pub mod model_routing;
 pub(crate) mod overview;
 pub mod series_rule;
+pub mod stale_reference;
 pub mod time_zone;
 pub(crate) use overview::listing;
 pub mod people;
@@ -596,6 +601,11 @@ async fn admin_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Response
     if let Err(failed) = &series {
         tracing::warn!(%failed, "the series request rule could not be read");
     }
+    // Contract v28 (W6.38): the stale reference actions permitted, its tab.
+    let stale = stale_reference::read(&app.bus).await;
+    if let Err(failed) = &stale {
+        tracing::warn!(%failed, "the stale reference actions permitted could not be read");
+    }
     // Contract v26 (W12.6): the analytics routing table, its tab, with the
     // measures the component serves beside it where it answers.
     let routing = model_routing::read(&app.bus).await;
@@ -613,7 +623,7 @@ async fn admin_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Response
         service_accounts,
         zone.as_ref().ok(),
         (pivots.as_ref().ok(), &pivot_codes),
-        series.as_ref().ok(),
+        (series.as_ref().ok(), stale.as_ref().ok()),
         (routing.as_ref().ok(), served.as_ref()),
         &token_input(&session),
         "",
@@ -3565,6 +3575,65 @@ async fn set_series_request_rule(
 
 /// The series request rule's act on the surface (W6.37, contract v28).
 const SET_SERIES_REQUEST_RULE_TOOL: &str = "dashboard__set_series_request_rule";
+
+/// W6.38 (contract v28): the stale reference actions permitted set, a
+/// deployment admin's, with a reason; or prepared for someone to make.
+async fn set_stale_reference_actions_permitted(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Form(fields): Form<Fields>,
+) -> Response {
+    let back = "/admin#stale-reference";
+    let (session, _) = match gate(&app, &headers, true) {
+        Ok(gated) => gated,
+        Err(response) => return *response,
+    };
+    if let Err(response) = form_token_matches(&session, &fields) {
+        return *response;
+    }
+    let note = field(&fields, "note").trim().to_string();
+    if note.is_empty() {
+        return not_done("say why the stale reference actions change", back);
+    }
+    let warn_permitted = field(&fields, "warn_permitted") == "on";
+    let posted = prepare_or_gate(
+        &app,
+        &session,
+        &fields,
+        SET_STALE_REFERENCE_ACTIONS_PERMITTED_TOOL,
+        || Ok(serde_json::json!({"warn_permitted": warn_permitted, "note": note})),
+    )
+    .await;
+    if let Some(response) = posted_to(posted, back) {
+        return response;
+    }
+    let outcome = app
+        .bus
+        .call_for(
+            stale_reference::SET_STALE_REFERENCE_ACTIONS_PERMITTED,
+            "meridian.v1.SetStaleReferenceActionsPermittedRequest",
+            meridian_domain::v1::SetStaleReferenceActionsPermittedRequest {
+                warn_permitted,
+                reason: note.clone(),
+            }
+            .encode_to_vec(),
+            None,
+            Some(Duration::from_secs(10)),
+            &session.subject,
+        )
+        .await
+        .map(|_| ())
+        .map_err(said_of_refusal);
+    after_to(
+        outcome,
+        "/admin?done=Stale+reference+actions+set#stale-reference",
+        back,
+    )
+}
+
+/// The stale reference actions' act on the surface (W6.38, contract v28).
+const SET_STALE_REFERENCE_ACTIONS_PERMITTED_TOOL: &str =
+    "dashboard__set_stale_reference_actions_permitted";
 
 /// W12.6 (contract v26): a model id routed, a deployment admin's, with a
 /// reason; or prepared for someone to make. The conductor checks the

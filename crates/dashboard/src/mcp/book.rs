@@ -238,6 +238,28 @@ read_fx_pivot_currencies does.",
         Area::Accounts,
         series_request_rule_schema,
     ),
+    // Contract v28 (W6.38; rulings 517, 600): the stale reference actions
+    // permitted, a deployment admin's; the set preparable.
+    spec(
+        "read_stale_reference_actions_permitted",
+        "Read the stale reference actions permitted",
+        "whether an execution plugin's admin may choose warn, beside refuse, when a placement's \
+reference price is past its ceiling (warn_permitted; refuse only by default), with the last \
+change and who made it.",
+        true,
+        Area::Accounts,
+        nothing_schema,
+    ),
+    spec(
+        "set_stale_reference_actions_permitted",
+        "Set the stale reference actions permitted",
+        "permit warn beside refuse, or refuse only (warn_permitted true or false), with a note \
+saying why, each change its own record (W6.38). Answers the setting as \
+read_stale_reference_actions_permitted does.",
+        false,
+        Area::Accounts,
+        stale_reference_schema,
+    ),
     // Contract v27 (W10.11; W6.20): one account's execution costs, the
     // lake's rows, a person's at the read level on that account.
     spec(
@@ -371,6 +393,18 @@ fn execution_costs_schema() -> Value {
     })
 }
 
+fn stale_reference_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "warn_permitted": {"type": "boolean", "description": "an execution plugin's admin may choose warn beside refuse"},
+            "note": note(),
+        },
+        "required": ["warn_permitted", "note"],
+        "additionalProperties": false,
+    })
+}
+
 fn series_request_rule_schema() -> Value {
     json!({
         "type": "object",
@@ -485,6 +519,10 @@ pub async fn call(app: &App, caller: &Caller, spec: &Spec, arguments: Value) -> 
         "read_fx_pivot_currencies" => read_fx_pivot_currencies(app, caller).await,
         "set_fx_pivot_currencies" => set_fx_pivot_currencies(app, caller, &arguments).await,
         "read_series_request_rule" => read_series_request_rule(app, caller).await,
+        "read_stale_reference_actions_permitted" => read_stale_reference(app, caller).await,
+        "set_stale_reference_actions_permitted" => {
+            set_stale_reference(app, caller, &arguments).await
+        }
         "set_series_request_rule" => set_series_request_rule(app, caller, &arguments).await,
         "list_model_routing" => list_model_routing(app, caller).await,
         "set_model_routing" => set_model_routing(app, caller, &arguments).await,
@@ -1212,6 +1250,82 @@ async fn set_fx_pivot_currencies(app: &App, caller: &Caller, arguments: &Value) 
     }
 }
 
+/// W6.38 (contract v28): the stale reference actions read, a deployment
+/// admin's.
+async fn read_stale_reference(app: &App, caller: &Caller) -> Value {
+    let (_, access) = match access_of(app, caller) {
+        Ok(held) => held,
+        Err(refusal) => return refusal,
+    };
+    if !access.deployment_admin {
+        return refused(
+            "not_permitted",
+            "the stale reference actions permitted are a deployment admin's to read",
+            Vec::new(),
+        );
+    }
+    match crate::admin::stale_reference::read(&app.bus).await {
+        Ok(setting) => {
+            json!({"outcome": "unchanged", "data": crate::admin::stale_reference::json(&setting)})
+        }
+        Err(failed) => refused("unavailable", &failed, Vec::new()),
+    }
+}
+
+/// W6.38 (contract v28): the stale reference actions set, a deployment
+/// admin's; the conductor keeps the change.
+async fn set_stale_reference(app: &App, caller: &Caller, arguments: &Value) -> Value {
+    let mut problems = Problems::default();
+    let Some(top) = object(arguments, "", &mut problems) else {
+        return problems.refusal();
+    };
+    only(top, &["warn_permitted", "note"], "", &mut problems);
+    let warn_permitted = match top.get("warn_permitted") {
+        Some(Value::Bool(said)) => *said,
+        None | Some(Value::Null) => {
+            problems.add("warn_permitted", "required");
+            false
+        }
+        Some(_) => {
+            problems.add("warn_permitted", "true or false");
+            false
+        }
+    };
+    let reason = text(top, "note", "", true, &mut problems);
+    if !problems.is_empty() {
+        return problems.refusal();
+    }
+    let (_, access) = match access_of(app, caller) {
+        Ok(held) => held,
+        Err(refusal) => return refusal,
+    };
+    if !access.deployment_admin {
+        return refused(
+            "not_permitted",
+            "the stale reference actions permitted are a deployment admin's",
+            Vec::new(),
+        );
+    }
+    let reply: Result<meridian_domain::v1::StaleReferenceActionsPermittedSetting, _> = ask(
+        app,
+        caller,
+        crate::admin::stale_reference::SET_STALE_REFERENCE_ACTIONS_PERMITTED,
+        "meridian.v1.SetStaleReferenceActionsPermittedRequest",
+        meridian_domain::v1::SetStaleReferenceActionsPermittedRequest {
+            warn_permitted,
+            reason,
+        },
+        CHANGING,
+    )
+    .await;
+    match reply {
+        Err(failed) => bus_refused(failed, "warn_permitted"),
+        Ok(setting) => {
+            json!({"outcome": "made", "data": crate::admin::stale_reference::json(&setting)})
+        }
+    }
+}
+
 /// W6.37 (contract v28): the series request rule read, a deployment admin's.
 async fn read_series_request_rule(app: &App, caller: &Caller) -> Value {
     let (_, access) = match access_of(app, caller) {
@@ -1500,6 +1614,15 @@ pub const PARITY: &[(&str, &str)] = &[
         "read_series_request_rule set_series_request_rule",
     ),
     ("/admin/series-request-rule", "set_series_request_rule"),
+    // Contract v28 (W6.38): the stale reference actions' tab and its form.
+    (
+        "tab stale-reference",
+        "read_stale_reference_actions_permitted set_stale_reference_actions_permitted",
+    ),
+    (
+        "/admin/stale-reference-actions",
+        "set_stale_reference_actions_permitted",
+    ),
     // Contract v27 (W10.11): the lake's execution-cost rows, which a
     // plugin's TCA page draws; core draws no page of its own for them.
     ("lake ExecutionCost rows", "list_execution_costs"),

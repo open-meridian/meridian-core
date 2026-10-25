@@ -96,7 +96,7 @@ impl Level {
 /// The order path's two core acts, at may not for agents until the
 /// deployment admin loosens them (contract v22; the order-path plan's
 /// refresh, Q44).
-pub const MAY_NOT_UNTIL_LOOSENED: [&str; 14] = [
+pub const MAY_NOT_UNTIL_LOOSENED: [&str; 15] = [
     "dashboard__set_account_attribute",
     "dashboard__set_trading_instruction",
     // Contract v24 (W11.36): as the trading instruction is.
@@ -119,6 +119,8 @@ pub const MAY_NOT_UNTIL_LOOSENED: [&str; 14] = [
     "dashboard__set_fx_pivot_currencies",
     // Contract v28 (W6.37): the series request rule, as the pivots are.
     "dashboard__set_series_request_rule",
+    // Contract v28 (W6.38).
+    "dashboard__set_stale_reference_actions_permitted",
 ];
 
 /// Core acts an agent may prepare but not make until the deployment admin

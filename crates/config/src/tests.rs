@@ -3595,6 +3595,40 @@ async fn the_deployments_time_zone_is_new_york_until_set_each_change_its_own_rec
 /// -- one to four fiat cash instruments, none twice, never a token, each change
 /// saying why and its own record.
 #[tokio::test]
+async fn the_stale_reference_actions_permitted_are_refuse_only_until_a_deployment_admin_permits_warn(
+) {
+    // Contract v28 (W6.38; rulings 517, 600).
+    let h = harness("dashboard-1");
+    let read = || {
+        ask::<_, meridian_domain::v1::StaleReferenceActionsPermittedSetting>(
+            &h,
+            crate::service::READ_STALE_REFERENCE_ACTIONS_PERMITTED,
+            "meridian.v1.ReadStaleReferenceActionsPermittedRequest",
+            meridian_domain::v1::ReadStaleReferenceActionsPermittedRequest {},
+        )
+    };
+    let set = |warn: bool, reason: &str| {
+        ask::<_, meridian_domain::v1::StaleReferenceActionsPermittedSetting>(
+            &h,
+            crate::service::SET_STALE_REFERENCE_ACTIONS_PERMITTED,
+            "meridian.v1.SetStaleReferenceActionsPermittedRequest",
+            meridian_domain::v1::SetStaleReferenceActionsPermittedRequest {
+                warn_permitted: warn,
+                reason: reason.into(),
+            },
+        )
+    };
+    let default = read().await.unwrap();
+    assert!(!default.warn_permitted && default.changed_at_ns == 0);
+    assert!(set(true, " ").await.unwrap_err().contains("fields=reason"));
+    let changed = set(true, "the desk works delayed reference prices")
+        .await
+        .unwrap();
+    assert!(changed.warn_permitted && changed.changed_at_ns > 0);
+    assert!(read().await.unwrap().warn_permitted);
+}
+
+#[tokio::test]
 async fn the_series_request_rule_is_a_deployment_admins_each_change_recorded() {
     // Contract v28 (W6.37; rulings 561, 589): orders on, standing wants off
     // and 500 a day by default; a limit of 0 or past 5,000 refused naming

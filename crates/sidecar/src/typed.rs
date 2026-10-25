@@ -112,7 +112,12 @@ pub(crate) const FOR_A_PERSON_AT_ANY_LEVEL: [&str; 2] = [FILE_TICKET, FILED_TICK
 /// and nothing of the deployment's configuration a person administers (the
 /// main session's settlement, 2026-10-12). Sent for nobody, whatever
 /// assertion the call carries.
-pub(crate) const AS_ITSELF: [&str; 1] = ["platform.config.query.venue-catalogue"];
+pub(crate) const AS_ITSELF: [&str; 2] = [
+    "platform.config.query.venue-catalogue",
+    // Contract v28 (W6.38; ruling 600): an ems reads what the deployment
+    // permits at its own role, as it reads its own settings.
+    "platform.config.query.read-stale-reference-actions-permitted",
+];
 /// An `ems`'s venue account mapping (MapVenueAccount, W11.22, contract v22).
 const MAP_VENUE_ACCOUNT: &str = "platform.config.command.map-venue-account";
 /// The commands that name a record by its ID alone -- an order, a placement,
