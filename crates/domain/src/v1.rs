@@ -2951,8 +2951,8 @@ pub struct RequestSeriesRecordsRequest {
 /// (W3.31).
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SeriesWant {
-    /// The occ_osi symbol, or a future's or future option's exchange symbol and
-    /// its MIC as two identifiers. Never empty.
+    /// The occ_osi symbol, or a future's or future option's exchange ticker
+    /// carrying its venue's ISO 10383 MIC in source. Never empty.
     #[prost(message, repeated, tag = "1")]
     pub series_key: ::prost::alloc::vec::Vec<Identifier>,
     /// The INS- record the chain rows name as their subject. Never empty.
@@ -13414,9 +13414,9 @@ pub struct ObservationMeta {
     #[prost(message, optional, tag = "15")]
     pub closed_day: ::core::option::Option<DateCheck>,
     /// Contract v28: the series' identifier -- the occ_osi symbol, or a future's
-    /// or future option's exchange symbol and its MIC -- on a row whose subject
-    /// is the underlying; in the row's conflation key. None: the row is about its
-    /// subjects alone.
+    /// or future option's exchange ticker carrying its venue's MIC in source --
+    /// on a row whose subject is the underlying; in the row's conflation key.
+    /// None: the row is about its subjects alone.
     #[prost(message, repeated, tag = "16")]
     pub series_key: ::prost::alloc::vec::Vec<Identifier>,
     /// Contract v28: set at the edge; on a read, the row's effective state, the
@@ -14221,8 +14221,8 @@ pub struct ListTradesRequest {
     /// from any other reader, naming it.
     #[prost(bool, tag = "9")]
     pub latest_recorded: bool,
-    /// Contract v28: the series' keys (occ_osi, or a symbol and its MIC), each
-    /// row keyed by one answered with the subjects asked. None: rows keyed by a
+    /// Contract v28: the series' keys (occ_osi, or a ticker carrying its venue's
+    /// MIC in source), each row keyed by one answered with the subjects asked. None: rows keyed by a
     /// series are not answered unless all_series is true.
     #[prost(message, repeated, tag = "10")]
     pub series_keys: ::prost::alloc::vec::Vec<Identifier>,
@@ -14270,8 +14270,8 @@ pub struct ListQuotesRequest {
     pub page_size: u32,
     #[prost(string, tag = "8")]
     pub cursor: ::prost::alloc::string::String,
-    /// Contract v28: the series' keys (occ_osi, or a symbol and its MIC), each
-    /// row keyed by one answered with the subjects asked. None: rows keyed by a
+    /// Contract v28: the series' keys (occ_osi, or a ticker carrying its venue's
+    /// MIC in source), each row keyed by one answered with the subjects asked. None: rows keyed by a
     /// series are not answered unless all_series is true.
     #[prost(message, repeated, tag = "9")]
     pub series_keys: ::prost::alloc::vec::Vec<Identifier>,
@@ -14607,8 +14607,8 @@ pub struct ListSeriesRequest {
     /// A plain date. Empty: to the latest.
     #[prost(string, tag = "4")]
     pub expiration_to: ::prost::alloc::string::String,
-    /// The series' keys (occ_osi, or a symbol and its MIC), each answered if
-    /// listed under the subjects asked. None: every series of the subjects asked.
+    /// The series' keys (occ_osi, or a ticker carrying its venue's MIC in
+    /// source), each answered if listed under the subjects asked. None: every series of the subjects asked.
     #[prost(message, repeated, tag = "5")]
     pub series_keys: ::prost::alloc::vec::Vec<Identifier>,
     /// The default, named datasets, or every entitled dataset side by side.
@@ -14703,8 +14703,8 @@ pub struct ListStatisticsRequest {
     /// A plain date. Empty: no range.
     #[prost(string, tag = "5")]
     pub to_date: ::prost::alloc::string::String,
-    /// The series' keys (occ_osi, or a symbol and its MIC), each row keyed by one
-    /// answered with the subjects asked. None: rows keyed by a series are not
+    /// The series' keys (occ_osi, or a ticker carrying its venue's MIC in
+    /// source), each row keyed by one answered with the subjects asked. None: rows keyed by a series are not
     /// answered unless all_series is true.
     #[prost(message, repeated, tag = "6")]
     pub series_keys: ::prost::alloc::vec::Vec<Identifier>,
@@ -16668,8 +16668,8 @@ pub struct Figure {
     /// a figure that read no market data.
     #[prost(int64, tag = "10")]
     pub oldest_input_source_ns: i64,
-    /// Contract v28: its occ_osi symbol, or symbol and MIC. None: the figure
-    /// names an INS- record or none.
+    /// Contract v28: its occ_osi symbol, or a ticker carrying its venue's MIC in
+    /// source. None: the figure names an INS- record or none.
     #[prost(message, repeated, tag = "11")]
     pub series_key: ::prost::alloc::vec::Vec<Identifier>,
 }
@@ -17170,8 +17170,8 @@ pub struct ChainRef {
     /// A plain date. Empty: to the latest.
     #[prost(string, tag = "3")]
     pub expiration_to: ::prost::alloc::string::String,
-    /// Their occ_osi symbols, or symbol and MIC pairs. None: every series in the
-    /// window.
+    /// Their occ_osi symbols, or tickers each carrying its venue's MIC in source.
+    /// None: every series in the window.
     #[prost(message, repeated, tag = "4")]
     pub series_keys: ::prost::alloc::vec::Vec<Identifier>,
 }

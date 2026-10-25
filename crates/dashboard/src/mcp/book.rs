@@ -435,12 +435,13 @@ fn request_series_records_schema() -> Value {
                         "series_key": {
                             "type": "array",
                             "minItems": 1,
-                            "maxItems": 2,
+                            "maxItems": 1,
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "scheme": {"type": "string", "description": "occ_osi, or symbol and mic"},
+                                    "scheme": {"type": "string", "enum": ["occ_osi", "ticker"], "description": "occ_osi for a listed option; ticker for a future or a future option"},
                                     "value": {"type": "string"},
+                                    "source": {"type": "string", "description": "a ticker's venue, its ISO 10383 MIC (XCME); empty for occ_osi"},
                                 },
                                 "required": ["scheme", "value"],
                                 "additionalProperties": false,
@@ -1497,21 +1498,29 @@ async fn request_series_records(app: &App, caller: &Caller, arguments: &Value) -
                 );
                 let mut key = Vec::new();
                 match want.get("series_key") {
-                    Some(Value::Array(ids)) if (1..=2).contains(&ids.len()) => {
-                        for (k, id) in ids.iter().enumerate() {
-                            let here = format!("{at}.series_key[{k}]");
-                            let Some(id) = object(id, &here, &mut problems) else {
-                                continue;
-                            };
-                            only(id, &["scheme", "value"], &here, &mut problems);
+                    Some(Value::Array(ids)) if ids.len() == 1 => {
+                        let here = format!("{at}.series_key[0]");
+                        if let Some(id) = object(&ids[0], &here, &mut problems) {
+                            only(id, &["scheme", "value", "source"], &here, &mut problems);
                             key.push(meridian_domain::v1::Identifier {
                                 scheme: text(id, "scheme", &here, true, &mut problems),
                                 value: text(id, "value", &here, true, &mut problems),
+                                source: text(id, "source", &here, false, &mut problems),
                                 ..Default::default()
                             });
+                            if let Some((path, why)) =
+                                meridian_domain::lake::series_key_problem(&key)
+                            {
+                                if path.starts_with("[0].") {
+                                    problems.add(&format!("{at}.series_key{path}"), &why);
+                                }
+                            }
                         }
                     }
-                    _ => problems.add(&format!("{at}.series_key"), "one or two identifiers"),
+                    _ => problems.add(
+                        &format!("{at}.series_key"),
+                        "one identifier: occ_osi, or a ticker with its venue's MIC in source",
+                    ),
                 }
                 let underlying = text(want, "underlying_instrument_id", &at, true, &mut problems);
                 if !underlying.is_empty() && !underlying.starts_with("INS-") {

@@ -550,15 +550,32 @@ async fn what_w10_4_refuses_of_a_chain_is_refused_naming_the_field() {
     let said = record(&h, "quotes", vec![Observation::Quote(on_held)]).unwrap_err();
     assert!(said.contains("meta.series_key"), "{said}");
     assert!(said.contains("own record"), "{said}");
-    // A MIC alone.
-    let mut mic = quote(OSI_CALL, "4.10", "4.20", NOW - HOUR);
-    mic.meta.as_mut().unwrap().series_key = vec![Identifier {
-        scheme: "mic".into(),
-        value: "XCME".into(),
+    // A futures key in the third amendment's spelling, a symbol beside a
+    // MIC as two identifiers; a MIC alone; a ticker with no MIC in source
+    // (DESIGN28's sixth amendment: one ticker carrying its venue).
+    let keyed = |key: Vec<Identifier>| {
+        let mut row = quote(OSI_CALL, "4.10", "4.20", NOW - HOUR);
+        row.meta.as_mut().unwrap().series_key = key;
+        record(&h, "quotes", vec![Observation::Quote(row)]).unwrap_err()
+    };
+    let identifier = |scheme: &str, value: &str, source: &str| Identifier {
+        scheme: scheme.into(),
+        value: value.into(),
+        source: source.into(),
         ..Default::default()
-    }];
-    let said = record(&h, "quotes", vec![Observation::Quote(mic)]).unwrap_err();
-    assert!(said.contains("a MIC alone"), "{said}");
+    };
+    let said = keyed(vec![
+        identifier("symbol", "ESZ6", ""),
+        identifier("iso10383", "XCME", ""),
+    ]);
+    assert!(
+        said.contains("meta.series_key: names 2; one identifier"),
+        "{said}"
+    );
+    let said = keyed(vec![identifier("mic", "XCME", "")]);
+    assert!(said.contains("meta.series_key[0].scheme"), "{said}");
+    let said = keyed(vec![identifier("ticker", "ESZ6", "")]);
+    assert!(said.contains("meta.series_key[0].source"), "{said}");
     // A series with no key; one naming its record.
     let mut keyless = series(OSI_CALL, "call", "230", "2026-11-20");
     keyless.meta.as_mut().unwrap().series_key.clear();
@@ -579,22 +596,17 @@ async fn what_w10_4_refuses_of_a_chain_is_refused_naming_the_field() {
     let negative = open_interest(OSI_CALL, "2026-10-07", "-1");
     let said = record(&h, "statistics", vec![Observation::Statistic(negative)]).unwrap_err();
     assert!(said.contains("never negative"), "{said}");
-    // A futures option's chain keyed under its future, by symbol and MIC.
+    // A futures option's chain keyed under its future, by its ticker
+    // carrying the venue's MIC.
     let mut future_chain = quote(OSI_CALL, "12.5", "12.75", NOW - HOUR);
     let m = future_chain.meta.as_mut().unwrap();
     m.subjects = subjects(ES);
-    m.series_key = vec![
-        Identifier {
-            scheme: "symbol".into(),
-            value: "ESZ6 C5800".into(),
-            ..Default::default()
-        },
-        Identifier {
-            scheme: "mic".into(),
-            value: "XCME".into(),
-            ..Default::default()
-        },
-    ];
+    m.series_key = vec![Identifier {
+        scheme: "ticker".into(),
+        value: "ESZ6 C5800".into(),
+        source: "XCME".into(),
+        ..Default::default()
+    }];
     assert_eq!(
         record(&h, "quotes", vec![Observation::Quote(future_chain)]).unwrap(),
         (1, 0, 0)

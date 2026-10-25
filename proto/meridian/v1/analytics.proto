@@ -145,8 +145,8 @@ message Figure {
   // Contract v27 (W12.2; ruling 374): its oldest input's source time; 0 for
   // a figure that read no market data.
   int64 oldest_input_source_ns = 10;
-  // Contract v28: its occ_osi symbol, or symbol and MIC. None: the figure
-  // names an INS- record or none.
+  // Contract v28: its occ_osi symbol, or a ticker carrying its venue's MIC in
+  // source. None: the figure names an INS- record or none.
   repeated Identifier series_key = 11;
 }
 
@@ -640,8 +640,8 @@ message ChainRef {
   string expiration_from = 2;
   // A plain date. Empty: to the latest.
   string expiration_to = 3;
-  // Their occ_osi symbols, or symbol and MIC pairs. None: every series in the
-  // window.
+  // Their occ_osi symbols, or tickers each carrying its venue's MIC in source.
+  // None: every series in the window.
   repeated Identifier series_keys = 4;
 }
 

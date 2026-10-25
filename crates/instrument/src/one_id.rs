@@ -618,10 +618,6 @@ fn master_identifiers(master: &InstrumentRecord) -> Vec<Asked> {
         .collect()
 }
 
-/// Each listing identifier's trading currency, as the platform's master holds
-/// it per listing (contract v25, W3.1), set on the record's open identifier
-/// it names; an identifier the master gives none keeps none. True when one
-/// changed.
 /// A listed series' terms as the platform's record states them (contract
 /// v28; rulings 559, 575): taken whole where they differ, an adjustment being
 /// the record's next version with its ID kept. True when they changed.
@@ -634,6 +630,10 @@ pub fn take_listed_terms(record: &mut Instrument, master: &InstrumentRecord) -> 
     true
 }
 
+/// Each listing identifier's trading currency, as the platform's master holds
+/// it per listing (contract v25, W3.1), set on the record's open identifier
+/// it names; an identifier the master gives none keeps none. True when one
+/// changed.
 pub fn take_trading_currencies(record: &mut Instrument, master: &InstrumentRecord) -> bool {
     let mut changed = false;
     for held in record.identifiers.iter_mut().filter(|held| held.open()) {
@@ -1593,6 +1593,18 @@ mod tests {
         assert!(sendable(&held, &later)
             .iter()
             .any(|identifier| identifier.scheme == "cusip"));
+        // A futures series key, one ticker carrying its venue's MIC (W1.26;
+        // DESIGN28's sixth amendment), is sent; a MIC on its own is not.
+        let future = vec![
+            asked("ticker", "ESZ6", "XCME"),
+            asked("iso10383", "XCME", ""),
+            asked("mic", "XCME", ""),
+        ];
+        let sent: Vec<(String, String)> = sendable(&future, &list)
+            .into_iter()
+            .map(|identifier| (identifier.scheme, identifier.source))
+            .collect();
+        assert_eq!(sent, vec![("ticker".to_string(), "XCME".to_string())]);
         // A list without FIGI sends none of its three levels.
         let mut narrow = list;
         narrow.schemes.retain(|scheme| scheme != "figi");

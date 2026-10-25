@@ -61,9 +61,11 @@ pub const SAVED_SCENARIO: &str = "meridian.v1.SavedScenario";
 /// it in the source (contract v28, the filings slice; W10.4).
 pub const CORPORATE_ACTION: &str = "meridian.v1.CorporateActionAnnounced";
 
-/// The scheme a futures series key names its venue in, beside the
-/// exchange's symbol (contract v28, W1.26): the ISO 10383 MIC.
-pub const MIC_SCHEME: &str = "mic";
+/// The scheme a future's or a future option's series is keyed by: the
+/// exchange's ticker, one identifier carrying its venue's ISO 10383 MIC in
+/// `source` (contract v28, W1.26 and W10.4; DESIGN28's sixth amendment,
+/// as `Identifier.scheme` has had it since v24).
+pub const TICKER_SCHEME: &str = "ticker";
 /// The scheme an option series is keyed by (contract v28, W1.26; 560).
 pub const OCC_OSI_SCHEME: &str = "occ_osi";
 
@@ -397,24 +399,69 @@ pub fn strip_series(
 }
 
 /// A series key as one text (contract v28, ruling 561): each identifier as
-/// scheme and value, in order of scheme, so a key reads the same however its
-/// writer ordered it. Empty for a row keyed by no series. Beside a row's
-/// subject it is what its latest is chosen per and its deliveries conflated
-/// per.
+/// scheme and value, a ticker's venue after it (`ticker=ESZ6@XCME`), in order
+/// of scheme, so a key reads the same however its writer ordered it. Empty
+/// for a row keyed by no series. Beside a row's subject it is what its
+/// latest is chosen per and its deliveries conflated per.
 pub fn series_key_text(key: &[crate::v1::Identifier]) -> String {
     let mut parts: Vec<String> = key
         .iter()
-        .map(|identifier| format!("{}={}", identifier.scheme, identifier.value))
+        .map(|identifier| {
+            if identifier.source.is_empty() {
+                format!("{}={}", identifier.scheme, identifier.value)
+            } else {
+                format!(
+                    "{}={}@{}",
+                    identifier.scheme, identifier.value, identifier.source
+                )
+            }
+        })
         .collect();
     parts.sort();
     parts.join("|")
 }
 
+/// What a series key lacks, if anything (contract v28, W10.4 and W3.31;
+/// DESIGN28's sixth amendment): the path under the key that is wrong --
+/// empty for the key itself, `[0].scheme`, `[0].source` -- and why. A key is
+/// one identifier: an option's `occ_osi` symbol, or a future's or a future
+/// option's exchange ticker carrying its venue's ISO 10383 MIC in `source`.
+pub fn series_key_problem(key: &[crate::v1::Identifier]) -> Option<(&'static str, String)> {
+    let [identifier] = key else {
+        return Some((
+            "",
+            format!(
+                "names {}; one identifier, an occ_osi symbol or a ticker carrying its venue's \
+                 MIC in source",
+                key.len()
+            ),
+        ));
+    };
+    if identifier.scheme.trim().is_empty() || identifier.value.trim().is_empty() {
+        return Some(("[0]", "names a scheme and a value".into()));
+    }
+    match identifier.scheme.as_str() {
+        OCC_OSI_SCHEME => None,
+        TICKER_SCHEME => {
+            let mic = identifier.source.trim();
+            (mic.len() != 4 || !mic.chars().all(|c| c.is_ascii_alphanumeric())).then(|| {
+                (
+                    "[0].source",
+                    "a ticker carries its venue's ISO 10383 MIC, four letters or digits".into(),
+                )
+            })
+        }
+        other => Some((
+            "[0].scheme",
+            format!("{other:?} keys no series; occ_osi, or ticker with its venue's MIC in source"),
+        )),
+    }
+}
+
 /// Whether a row keyed by `key` is one a read asked for (contract v28,
 /// W10.6): a row keyed by no series always, being the subject's own; a
-/// series' row where the read asks for every series, or names its key -- one
-/// of its identifiers other than the MIC asked, and its MIC, where it has one
-/// and the read names any, among those asked.
+/// series' row where the read asks for every series, or names its key -- the
+/// same scheme and value, and for a ticker the same venue in `source`.
 pub fn series_asked(
     key: &[crate::v1::Identifier],
     asked: &[crate::v1::Identifier],
@@ -423,22 +470,14 @@ pub fn series_asked(
     if key.is_empty() || all {
         return true;
     }
-    let named = |identifier: &crate::v1::Identifier| {
-        asked
-            .iter()
-            .any(|a| a.scheme == identifier.scheme && a.value == identifier.value)
-    };
-    let symbol = key
-        .iter()
-        .filter(|identifier| identifier.scheme != MIC_SCHEME)
-        .any(named);
-    let mics_asked = asked.iter().any(|a| a.scheme == MIC_SCHEME);
-    let venue = !mics_asked
-        || key
-            .iter()
-            .filter(|identifier| identifier.scheme == MIC_SCHEME)
-            .all(named);
-    symbol && venue
+    key.iter().any(|identifier| {
+        asked.iter().any(|a| {
+            a.scheme == identifier.scheme
+                && a.value == identifier.value
+                && (identifier.scheme != TICKER_SCHEME
+                    || a.source.eq_ignore_ascii_case(&identifier.source))
+        })
+    })
 }
 
 /// [`strip_price`], for a quote (contract v19).
@@ -979,6 +1018,39 @@ pub fn catalogue_refused(catalogue: &Catalogue, roles: &[String]) -> Option<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_futures_series_is_keyed_by_one_ticker_carrying_its_venue() {
+        // DESIGN28's sixth amendment (W1.26, W10.4): one `ticker`, the
+        // venue's MIC in `source`; the same ticker on another venue is
+        // another series.
+        let ticker = |value: &str, mic: &str| crate::v1::Identifier {
+            scheme: TICKER_SCHEME.into(),
+            value: value.into(),
+            source: mic.into(),
+            ..Default::default()
+        };
+        let osi = crate::v1::Identifier {
+            scheme: OCC_OSI_SCHEME.into(),
+            value: "AAPL  261120C00230000".into(),
+            ..Default::default()
+        };
+        let es = [ticker("ESZ6", "XCME")];
+        assert_eq!(series_key_text(&es), "ticker=ESZ6@XCME");
+        assert_eq!(
+            series_key_text(std::slice::from_ref(&osi)),
+            "occ_osi=AAPL  261120C00230000"
+        );
+        assert!(series_asked(&es, &[ticker("ESZ6", "xcme")], false));
+        assert!(!series_asked(&es, &[ticker("ESZ6", "XEUR")], false));
+        assert!(!series_asked(&es, std::slice::from_ref(&osi), false));
+        assert!(series_asked(
+            std::slice::from_ref(&osi),
+            std::slice::from_ref(&osi),
+            false
+        ));
+        assert!(series_asked(&es, &[], true));
+    }
 
     fn daily() -> DatasetDeclaration {
         DatasetDeclaration {

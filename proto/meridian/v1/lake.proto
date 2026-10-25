@@ -103,9 +103,9 @@ message ObservationMeta {
   // name. Recorded as reported, never refused. Decided by the lake.
   DateCheck closed_day = 15;
   // Contract v28: the series' identifier -- the occ_osi symbol, or a future's
-  // or future option's exchange symbol and its MIC -- on a row whose subject
-  // is the underlying; in the row's conflation key. None: the row is about its
-  // subjects alone.
+  // or future option's exchange ticker carrying its venue's MIC in source --
+  // on a row whose subject is the underlying; in the row's conflation key.
+  // None: the row is about its subjects alone.
   repeated Identifier series_key = 16;
   // Contract v28: set at the edge; on a read, the row's effective state, the
   // highest of its own and every assessment of it. Unspecified: valid.
@@ -1031,8 +1031,8 @@ message ListTradesRequest {
   // data plugin reads only its own instance's rows, by no entitlement; refused
   // from any other reader, naming it.
   bool latest_recorded = 9;
-  // Contract v28: the series' keys (occ_osi, or a symbol and its MIC), each
-  // row keyed by one answered with the subjects asked. None: rows keyed by a
+  // Contract v28: the series' keys (occ_osi, or a ticker carrying its venue's
+  // MIC in source), each row keyed by one answered with the subjects asked. None: rows keyed by a
   // series are not answered unless all_series is true.
   repeated Identifier series_keys = 10;
   // Contract v28: true: rows keyed by any series of the underlying are
@@ -1069,8 +1069,8 @@ message ListQuotesRequest {
   // At most 500 rows, 100 when 0.
   uint32 page_size = 7;
   string cursor = 8;
-  // Contract v28: the series' keys (occ_osi, or a symbol and its MIC), each
-  // row keyed by one answered with the subjects asked. None: rows keyed by a
+  // Contract v28: the series' keys (occ_osi, or a ticker carrying its venue's
+  // MIC in source), each row keyed by one answered with the subjects asked. None: rows keyed by a
   // series are not answered unless all_series is true.
   repeated Identifier series_keys = 9;
   // Contract v28: true: rows keyed by any series of the underlying are
@@ -1361,8 +1361,8 @@ message ListSeriesRequest {
   string expiration_from = 3;
   // A plain date. Empty: to the latest.
   string expiration_to = 4;
-  // The series' keys (occ_osi, or a symbol and its MIC), each answered if
-  // listed under the subjects asked. None: every series of the subjects asked.
+  // The series' keys (occ_osi, or a ticker carrying its venue's MIC in
+  // source), each answered if listed under the subjects asked. None: every series of the subjects asked.
   repeated Identifier series_keys = 5;
   // The default, named datasets, or every entitled dataset side by side.
   // Unset: the deployment's default.
@@ -1436,8 +1436,8 @@ message ListStatisticsRequest {
   string from_date = 4;
   // A plain date. Empty: no range.
   string to_date = 5;
-  // The series' keys (occ_osi, or a symbol and its MIC), each row keyed by one
-  // answered with the subjects asked. None: rows keyed by a series are not
+  // The series' keys (occ_osi, or a ticker carrying its venue's MIC in
+  // source), each row keyed by one answered with the subjects asked. None: rows keyed by a series are not
   // answered unless all_series is true.
   repeated Identifier series_keys = 6;
   // True: rows keyed by any series of the underlying are answered beside its

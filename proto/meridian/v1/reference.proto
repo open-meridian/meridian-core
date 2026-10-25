@@ -2722,8 +2722,8 @@ message RequestSeriesRecordsRequest {
 // Contract v28 (RequestSeriesRecordsRequest.series): names the series wanted
 // (W3.31).
 message SeriesWant {
-  // The occ_osi symbol, or a future's or future option's exchange symbol and
-  // its MIC as two identifiers. Never empty.
+  // The occ_osi symbol, or a future's or future option's exchange ticker
+  // carrying its venue's ISO 10383 MIC in source. Never empty.
   repeated Identifier series_key = 1;
   // The INS- record the chain rows name as their subject. Never empty.
   string underlying_instrument_id = 2;

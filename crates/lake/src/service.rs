@@ -502,9 +502,9 @@ impl Lake {
         held.0.get(instance).cloned().unwrap_or_default()
     }
 
-    /// A row's series key held to W10.4 (contract v28, ruling 561): at most
-    /// two identifiers, each a scheme and a value, an option's `occ_osi`
-    /// alone or an exchange's symbol with its MIC; on a quote, a trade, a
+    /// A row's series key held to W10.4 (contract v28, ruling 561): one
+    /// identifier, an option's `occ_osi` symbol or a future's or future
+    /// option's `ticker` carrying its venue's MIC in `source`; on a quote, a trade, a
     /// price, a bar or a statistic whose subject is the underlying, never on
     /// an option's own record, which is the series; required on a listed
     /// series.
@@ -529,40 +529,8 @@ impl Lake {
                 data_type.name()
             ));
         }
-        if !bounds::OBSERVATION_META_SERIES_KEY_COUNT.admits(key.len()) {
-            return Err(format!(
-                "{at}.meta.series_key names {}; an occ_osi symbol, or a symbol and its MIC",
-                key.len()
-            ));
-        }
-        for (k, identifier) in key.iter().enumerate() {
-            if identifier.scheme.trim().is_empty() || identifier.value.trim().is_empty() {
-                return Err(format!(
-                    "{at}.meta.series_key[{k}] names a scheme and a value"
-                ));
-            }
-        }
-        let mics = key
-            .iter()
-            .filter(|identifier| identifier.scheme == lake::MIC_SCHEME)
-            .count();
-        let osi = key
-            .iter()
-            .any(|identifier| identifier.scheme == lake::OCC_OSI_SCHEME);
-        if mics == key.len() {
-            return Err(format!(
-                "{at}.meta.series_key names a MIC alone; a symbol beside it keys the series"
-            ));
-        }
-        if osi && key.len() > 1 {
-            return Err(format!(
-                "{at}.meta.series_key: an occ_osi symbol keys an option series alone"
-            ));
-        }
-        if key.len() == 2 && mics != 1 {
-            return Err(format!(
-                "{at}.meta.series_key: two identifiers are an exchange's symbol and its MIC"
-            ));
+        if let Some((path, why)) = lake::series_key_problem(key) {
+            return Err(format!("{at}.meta.series_key{path}: {why}"));
         }
         // A key names a series under its subject: a row about a held
         // option is keyed by its record and names no key.

@@ -2078,15 +2078,10 @@ pub fn keep_pulled(
 }
 
 /// Whether a resolve names a listed series' key alone (contract v28,
-/// W1.26): an `occ_osi` symbol, or an exchange's symbol with its MIC.
+/// W1.26, W10.4): an `occ_osi` symbol, or a future's or a future option's
+/// ticker carrying its venue's MIC in `source` (DESIGN28's sixth amendment).
 fn series_key_only(request: &ResolveIdentifierRequest) -> bool {
-    let schemes: Vec<&str> = request
-        .identifiers
-        .iter()
-        .map(|identifier| identifier.scheme.as_str())
-        .collect();
-    matches!(schemes.as_slice(), ["occ_osi"])
-        || (schemes.len() == 2 && schemes.contains(&"mic") && schemes.contains(&"symbol"))
+    meridian_domain::lake::series_key_problem(&request.identifiers).is_none()
 }
 
 /// The store's key for the day's count of series asked of the platform
@@ -2138,16 +2133,18 @@ fn request_series_records(
         return Err("note: at most 2,000 characters".into());
     }
     for (i, want) in request.series.iter().enumerate() {
-        if !meridian_pb::bounds::SERIES_WANT_SERIES_KEY_COUNT.admits(want.series_key.len())
-            || want
-                .series_key
-                .iter()
-                .any(|key| key.scheme.trim().is_empty() || key.value.trim().is_empty())
-        {
+        let problem =
+            if meridian_pb::bounds::SERIES_WANT_SERIES_KEY_COUNT.admits(want.series_key.len()) {
+                meridian_domain::lake::series_key_problem(&want.series_key)
+            } else {
+                Some(("", format!("names {}", want.series_key.len())))
+            };
+        if let Some((path, why)) = problem {
+            let field = format!("series[{i}].series_key{path}");
             return Err(meridian_bus::refusal_with_status(
                 meridian_bus::RefusalStatus::InvalidArgument,
-                &[format!("series[{i}].series_key")],
-                format!("series[{i}].series_key is an occ_osi symbol, or a symbol and its MIC"),
+                std::slice::from_ref(&field),
+                format!("{field}: {why}"),
             ));
         }
         if want.underlying_instrument_id.trim().is_empty() {
@@ -2678,6 +2675,151 @@ mod tests {
         .await
         .unwrap_err();
         assert!(said.contains("series[0].series_key"), "{said}");
+        assert_eq!(asked.lock().unwrap().len(), 1, "nothing more sent");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_futures_series_is_asked_for_as_one_ticker_carrying_its_venue() {
+        // DESIGN28's sixth amendment (W1.26, W3.31): a future's key is one
+        // `ticker` with its venue's MIC in `source`, which the licence
+        // filter sends as the platform's TPL-future matches it; a symbol
+        // beside a MIC, the third amendment's spelling, is refused naming
+        // the key, nothing sent.
+        use meridian_domain::v1::{
+            ListSeriesReply, ListSeriesRequest, ListedSeries, ObservationMeta,
+            RequestSeriesRecordsReply, RequestSeriesRecordsRequest, SeriesRequestCause, SeriesWant,
+            Source,
+        };
+        let (store_bus, plugin_bus) = two("portfolio-1");
+        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        launched(&store_bus, &[("portfolio-1", &["portfolio"])]);
+        let es = vec![PbIdentifier {
+            scheme: "ticker".into(),
+            value: "ESZ6".into(),
+            source: "XCME".into(),
+            ..Default::default()
+        }];
+        store_bus.serve(LIST_SERIES, move |envelope| {
+            let asked = ListSeriesRequest::decode(&envelope.payload[..]).unwrap();
+            Ok((
+                "meridian.v1.ListSeriesReply".to_string(),
+                ListSeriesReply {
+                    series: vec![ListedSeries {
+                        meta: Some(ObservationMeta {
+                            series_key: asked.series_keys.clone(),
+                            source: Some(Source {
+                                dataset: "broker-1:futures".into(),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }),
+                        template_id: "TPL-future".into(),
+                        template_version: "1".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            ))
+        });
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        store_bus.serve(ASK_PLATFORM_FOR_INSTRUMENT, move |envelope| {
+            let request =
+                meridian_domain::v1::AskPlatformForInstrumentRequest::decode(&envelope.payload[..])
+                    .unwrap();
+            seen.lock().unwrap().push(request.clone());
+            Ok((
+                "meridian.v1.AskPlatformForInstrumentReply".to_string(),
+                meridian_domain::v1::AskPlatformForInstrumentReply {
+                    reachable: true,
+                    found: true,
+                    instrument: Some(PbInstrument {
+                        instrument_id: "INS-ESZ6".into(),
+                        asset_class: AssetClass::Derivative as i32,
+                        instrument_type: meridian_domain::v1::InstrumentType::Future as i32,
+                        currency: "USD".into(),
+                        description: "ES 202612 future".into(),
+                        identifiers: request.identifiers.clone(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            ))
+        });
+        serve_queries(
+            &store_bus,
+            store.clone(),
+            Arc::new(meridian_clock::ManualClock::at(NOW)),
+        );
+        let request = |key: Vec<PbIdentifier>| RequestSeriesRecordsRequest {
+            series: vec![SeriesWant {
+                series_key: key,
+                underlying_instrument_id: "INS-SPX".into(),
+                cause: SeriesRequestCause::Order as i32,
+            }],
+            note: String::new(),
+        };
+        let reply: RequestSeriesRecordsReply = ask(
+            &plugin_bus,
+            REQUEST_SERIES_RECORDS,
+            "meridian.v1.RequestSeriesRecordsRequest",
+            request(es.clone()),
+            "",
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply.answers[0].instrument_id, "INS-ESZ6");
+        let sent = asked.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "asked once");
+        let carried: Vec<(&str, &str, &str)> = sent[0]
+            .identifiers
+            .iter()
+            .map(|i| (i.scheme.as_str(), i.value.as_str(), i.source.as_str()))
+            .collect();
+        assert_eq!(
+            carried,
+            vec![("ticker", "ESZ6", "XCME")],
+            "past the licence filter"
+        );
+        // The third amendment's spelling, refused before anything is read
+        // or sent.
+        let said = ask::<RequestSeriesRecordsReply>(
+            &plugin_bus,
+            REQUEST_SERIES_RECORDS,
+            "meridian.v1.RequestSeriesRecordsRequest",
+            request(vec![
+                PbIdentifier {
+                    scheme: "symbol".into(),
+                    value: "ESZ6".into(),
+                    ..Default::default()
+                },
+                PbIdentifier {
+                    scheme: "iso10383".into(),
+                    value: "XCME".into(),
+                    ..Default::default()
+                },
+            ]),
+            "",
+        )
+        .await
+        .unwrap_err();
+        assert!(said.contains("series[0].series_key"), "{said}");
+        let said = ask::<RequestSeriesRecordsReply>(
+            &plugin_bus,
+            REQUEST_SERIES_RECORDS,
+            "meridian.v1.RequestSeriesRecordsRequest",
+            request(vec![PbIdentifier {
+                scheme: "ticker".into(),
+                value: "ESZ6".into(),
+                ..Default::default()
+            }]),
+            "",
+        )
+        .await
+        .unwrap_err();
+        assert!(said.contains("series[0].series_key[0].source"), "{said}");
         assert_eq!(asked.lock().unwrap().len(), 1, "nothing more sent");
     }
 
