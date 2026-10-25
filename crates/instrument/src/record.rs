@@ -58,6 +58,9 @@ pub fn to_wire(instrument: &Instrument) -> PbInstrument {
         template_id: instrument.local.template_id.clone(),
         template_version: instrument.local.template_version.clone(),
         missing_fields: instrument.local.missing_fields.clone(),
+        // Contract v28: a listed series' terms (Stage A fills them).
+        listed_option: None,
+        future: None,
     }
 }
 

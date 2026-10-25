@@ -228,7 +228,14 @@ pub const CONTRACT_FLOOR: u32 = 2;
 /// placement's type and an RFQ's quotes, a net order, rates, a dataset's
 /// liveness, execution costs, a session's latency and a pricing plugin's
 /// declared models. A plugin built before sends none of them.
-pub const CONTRACT_CURRENT: u32 = 27;
+/// v28 is listed options and futures, the engine's chains and the common
+/// scenario format, the filings slice, quality states and the latency
+/// remainder (sdk-contract/listed-options-and-futures-contract,
+/// sdk-contract/the-common-scenario-format-contract and the tasks filed with
+/// them): series and their statistics, a lifecycle event, a package's
+/// legs, derived series and saved scenarios, filings, quality assessments
+/// and the stale-reference setting. A plugin built before sends none of them.
+pub const CONTRACT_CURRENT: u32 = 28;
 
 /// The contract version a plugin registered with, as a number: what the
 /// rules for a plugin built before an addition read. Zero for one that does
@@ -476,7 +483,7 @@ mod tests {
             admit("v1"),
             Err(
                 "the plugin was built against contract v1, older than this sidecar accepts \
-                 (v2 through v27); rebuild it against v2 or later"
+                 (v2 through v28); rebuild it against v2 or later"
                     .into()
             )
         );
@@ -485,11 +492,11 @@ mod tests {
     #[test]
     fn a_contract_newer_than_this_sidecar_is_refused_naming_both_halves() {
         assert_eq!(
-            admit("v28"),
+            admit("v29"),
             Err(
-                "the plugin was built against contract v28, newer than this sidecar \
-                 (v2 through v27); upgrade the runtime, or rebuild the plugin against \
-                 v27 or earlier"
+                "the plugin was built against contract v29, newer than this sidecar \
+                 (v2 through v28); upgrade the runtime, or rebuild the plugin against \
+                 v28 or earlier"
                     .into()
             )
         );
@@ -500,7 +507,7 @@ mod tests {
         assert_eq!(
             admit(""),
             Err(
-                "the plugin declared no contract version; this sidecar accepts v2 through v27"
+                "the plugin declared no contract version; this sidecar accepts v2 through v28"
                     .into()
             )
         );

@@ -429,6 +429,7 @@ mod tests {
                 meta: Some(ObservationMeta {
                     subjects: vec![SubjectRef {
                         entity_id: "LCL-BTC".into(),
+                        ..Default::default()
                     }],
                     source: Some(Source {
                         dataset: "coinbase-1:daily".into(),
@@ -476,6 +477,7 @@ mod tests {
                 meta: Some(ObservationMeta {
                     subjects: vec![SubjectRef {
                         entity_id: "INS-BILLS".into(),
+                        ..Default::default()
                     }],
                     source: Some(Source {
                         dataset: "us-treasury-1:ust_bills".into(),
@@ -516,6 +518,7 @@ mod tests {
             Some(ObservationMeta {
                 subjects: vec![SubjectRef {
                     entity_id: "LCL-BTC".into(),
+                    ..Default::default()
                 }],
                 source: Some(Source {
                     dataset: "coinbase-1:live".into(),

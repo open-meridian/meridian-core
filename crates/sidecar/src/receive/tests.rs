@@ -393,6 +393,7 @@ async fn a_reader_hears_its_entitled_datasets_rows_about_its_subjects_stripped()
             meta: Some(ObservationMeta {
                 subjects: vec![SubjectRef {
                     entity_id: subject.into(),
+                    ..Default::default()
                 }],
                 source: Some(Source {
                     dataset: dataset.into(),

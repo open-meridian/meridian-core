@@ -1360,7 +1360,7 @@ mod tests {
 
     #[tokio::test]
     async fn admission_is_refused_for_a_contract_outside_the_range() {
-        for declared in ["v1", "v28"] {
+        for declared in ["v1", "v29"] {
             let sc = sidecar();
             let mut req = register_req();
             req.schema_version = declared.into();
@@ -1369,7 +1369,7 @@ mod tests {
             assert!(!reply.admitted, "{declared} was admitted");
             // Both halves: what was declared, and what would be accepted.
             assert!(reply.refusal_reason.contains(declared));
-            assert!(reply.refusal_reason.contains("v2 through v27"));
+            assert!(reply.refusal_reason.contains("v2 through v28"));
             assert!(sc.registration().is_none());
         }
     }

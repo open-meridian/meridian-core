@@ -1672,6 +1672,7 @@ impl Context<'_> {
                     .get("side_by_side")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+                ..Default::default()
             }),
             Some(_) => {
                 problems.add("sources", "an object: default, named or side_by_side");
@@ -1729,7 +1730,10 @@ impl Context<'_> {
                 kind,
                 subjects: subjects
                     .into_iter()
-                    .map(|entity_id| meridian_domain::v1::SubjectRef { entity_id })
+                    .map(|entity_id| meridian_domain::v1::SubjectRef {
+                        entity_id,
+                        ..Default::default()
+                    })
                     .collect(),
                 sources,
                 valid_from_ns,

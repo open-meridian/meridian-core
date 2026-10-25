@@ -560,6 +560,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         for (i0, held0) in message.legs.iter().enumerate() {
             self.known(&format!("legs[{i0}].side"), held0.side, domain::Side::try_from(held0.side).is_ok())?;
             self.exact(&format!("legs[{i0}].ratio"), held0.ratio.as_ref())?;
+            self.known(&format!("legs[{i0}].position_effect"), held0.position_effect, domain::PositionEffect::try_from(held0.position_effect).is_ok())?;
         }
         if let Some(held0) = message.allocation_instruction.as_ref() {
             for (i1, held1) in held0.lines.iter().enumerate() {
@@ -591,6 +592,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         for &value in &message.execution_instructions {
             self.known("execution_instructions", value, domain::ExecutionInstruction::try_from(value).is_ok())?;
         }
+        self.known("position_effect", message.position_effect, domain::PositionEffect::try_from(message.position_effect).is_ok())?;
         for stamped0 in message.parties.iter_mut() {
             for stamped1 in stamped0.identifiers.iter_mut() {
                 stamped1.valid_from_ns = Default::default();
@@ -791,6 +793,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.known("liquidity_indicator", message.liquidity_indicator, domain::LiquidityIndicator::try_from(message.liquidity_indicator).is_ok())?;
         self.known("side", message.side, domain::Side::try_from(message.side).is_ok())?;
         self.known("cross_rate_source", message.cross_rate_source, domain::CrossRateSource::try_from(message.cross_rate_source).is_ok())?;
+        self.known("multi_leg_reporting_type", message.multi_leg_reporting_type, domain::MultiLegReportingType::try_from(message.multi_leg_reporting_type).is_ok())?;
         message.account_id = self.venue_mapped_account("meridian.v1.ReportExecutionRequest", &message.venue_account_code, &message.account_id).await?;
         let stamped0 = message.counterparty.get_or_insert_with(Default::default);
         for stamped1 in stamped0.identifiers.iter_mut() {
@@ -1310,11 +1313,18 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         }
         for (i0, held0) in message.prices.iter().enumerate() {
             if let Some(held1) = held0.meta.as_ref() {
+                for (i2, held2) in held1.subjects.iter().enumerate() {
+                    self.known(&format!("prices[{i0}].meta.subjects[{i2}].role"), held2.role, domain::SubjectRole::try_from(held2.role).is_ok())?;
+                }
                 for (i2, held2) in held1.source_times.iter().enumerate() {
                     self.known(&format!("prices[{i0}].meta.source_times[{i2}].kind"), held2.kind, domain::SourceTimeKind::try_from(held2.kind).is_ok())?;
                 }
                 if let Some(held2) = held1.closed_day.as_ref() {
                     self.known(&format!("prices[{i0}].meta.closed_day.reason"), held2.reason, domain::DateCheckReason::try_from(held2.reason).is_ok())?;
+                }
+                self.known(&format!("prices[{i0}].meta.quality"), held1.quality, domain::QualityState::try_from(held1.quality).is_ok())?;
+                for (i2, &value) in held1.quality_reasons.iter().enumerate() {
+                    self.known(&format!("prices[{i0}].meta.quality_reasons[{i2}]"), value, domain::QualityReason::try_from(value).is_ok())?;
                 }
             }
             self.known(&format!("prices[{i0}].kind"), held0.kind, domain::PriceKind::try_from(held0.kind).is_ok())?;
@@ -1330,6 +1340,13 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         for stamped0 in message.prices.iter_mut() {
             let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
             stamped1.sent_at_ns = Default::default();
+        }
+        for stamped0 in message.prices.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            for stamped2 in stamped1.series_key.iter_mut() {
+                stamped2.valid_from_ns = Default::default();
+                stamped2.valid_until_ns = Default::default();
+            }
         }
         let account = None;
         self.command_typed("platform.lake.command.record-prices", "meridian.v1.RecordPricesRequest", message, account, acting_for).await
@@ -1356,11 +1373,18 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         }
         for (i0, held0) in message.bars.iter().enumerate() {
             if let Some(held1) = held0.meta.as_ref() {
+                for (i2, held2) in held1.subjects.iter().enumerate() {
+                    self.known(&format!("bars[{i0}].meta.subjects[{i2}].role"), held2.role, domain::SubjectRole::try_from(held2.role).is_ok())?;
+                }
                 for (i2, held2) in held1.source_times.iter().enumerate() {
                     self.known(&format!("bars[{i0}].meta.source_times[{i2}].kind"), held2.kind, domain::SourceTimeKind::try_from(held2.kind).is_ok())?;
                 }
                 if let Some(held2) = held1.closed_day.as_ref() {
                     self.known(&format!("bars[{i0}].meta.closed_day.reason"), held2.reason, domain::DateCheckReason::try_from(held2.reason).is_ok())?;
+                }
+                self.known(&format!("bars[{i0}].meta.quality"), held1.quality, domain::QualityState::try_from(held1.quality).is_ok())?;
+                for (i2, &value) in held1.quality_reasons.iter().enumerate() {
+                    self.known(&format!("bars[{i0}].meta.quality_reasons[{i2}]"), value, domain::QualityReason::try_from(value).is_ok())?;
                 }
             }
             self.exact_money(&format!("bars[{i0}].open"), held0.open.as_ref())?;
@@ -1379,6 +1403,13 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         for stamped0 in message.bars.iter_mut() {
             let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
             stamped1.sent_at_ns = Default::default();
+        }
+        for stamped0 in message.bars.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            for stamped2 in stamped1.series_key.iter_mut() {
+                stamped2.valid_from_ns = Default::default();
+                stamped2.valid_until_ns = Default::default();
+            }
         }
         let account = None;
         self.command_typed("platform.lake.command.record-bars", "meridian.v1.RecordBarsRequest", message, account, acting_for).await
@@ -1405,11 +1436,18 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         }
         for (i0, held0) in message.trades.iter().enumerate() {
             if let Some(held1) = held0.meta.as_ref() {
+                for (i2, held2) in held1.subjects.iter().enumerate() {
+                    self.known(&format!("trades[{i0}].meta.subjects[{i2}].role"), held2.role, domain::SubjectRole::try_from(held2.role).is_ok())?;
+                }
                 for (i2, held2) in held1.source_times.iter().enumerate() {
                     self.known(&format!("trades[{i0}].meta.source_times[{i2}].kind"), held2.kind, domain::SourceTimeKind::try_from(held2.kind).is_ok())?;
                 }
                 if let Some(held2) = held1.closed_day.as_ref() {
                     self.known(&format!("trades[{i0}].meta.closed_day.reason"), held2.reason, domain::DateCheckReason::try_from(held2.reason).is_ok())?;
+                }
+                self.known(&format!("trades[{i0}].meta.quality"), held1.quality, domain::QualityState::try_from(held1.quality).is_ok())?;
+                for (i2, &value) in held1.quality_reasons.iter().enumerate() {
+                    self.known(&format!("trades[{i0}].meta.quality_reasons[{i2}]"), value, domain::QualityReason::try_from(value).is_ok())?;
                 }
             }
             self.exact_money(&format!("trades[{i0}].price"), held0.price.as_ref())?;
@@ -1432,6 +1470,12 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
                 }
             }
             self.known(&format!("trades[{i0}].aggressor"), held0.aggressor, domain::Aggressor::try_from(held0.aggressor).is_ok())?;
+            if let Some(held1) = held0.quote_at_trade.as_ref() {
+                self.exact_money(&format!("trades[{i0}].quote_at_trade.bid"), held1.bid.as_ref())?;
+                self.exact_money(&format!("trades[{i0}].quote_at_trade.ask"), held1.ask.as_ref())?;
+                self.exact(&format!("trades[{i0}].quote_at_trade.bid_quantity"), held1.bid_quantity.as_ref())?;
+                self.exact(&format!("trades[{i0}].quote_at_trade.ask_quantity"), held1.ask_quantity.as_ref())?;
+            }
         }
         for stamped0 in message.trades.iter_mut() {
             let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
@@ -1442,6 +1486,13 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         for stamped0 in message.trades.iter_mut() {
             let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
             stamped1.sent_at_ns = Default::default();
+        }
+        for stamped0 in message.trades.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            for stamped2 in stamped1.series_key.iter_mut() {
+                stamped2.valid_from_ns = Default::default();
+                stamped2.valid_until_ns = Default::default();
+            }
         }
         let account = None;
         self.command_typed("platform.lake.command.record-trades", "meridian.v1.RecordTradesRequest", message, account, acting_for).await
@@ -1468,11 +1519,18 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         }
         for (i0, held0) in message.quotes.iter().enumerate() {
             if let Some(held1) = held0.meta.as_ref() {
+                for (i2, held2) in held1.subjects.iter().enumerate() {
+                    self.known(&format!("quotes[{i0}].meta.subjects[{i2}].role"), held2.role, domain::SubjectRole::try_from(held2.role).is_ok())?;
+                }
                 for (i2, held2) in held1.source_times.iter().enumerate() {
                     self.known(&format!("quotes[{i0}].meta.source_times[{i2}].kind"), held2.kind, domain::SourceTimeKind::try_from(held2.kind).is_ok())?;
                 }
                 if let Some(held2) = held1.closed_day.as_ref() {
                     self.known(&format!("quotes[{i0}].meta.closed_day.reason"), held2.reason, domain::DateCheckReason::try_from(held2.reason).is_ok())?;
+                }
+                self.known(&format!("quotes[{i0}].meta.quality"), held1.quality, domain::QualityState::try_from(held1.quality).is_ok())?;
+                for (i2, &value) in held1.quality_reasons.iter().enumerate() {
+                    self.known(&format!("quotes[{i0}].meta.quality_reasons[{i2}]"), value, domain::QualityReason::try_from(value).is_ok())?;
                 }
             }
             self.exact_money(&format!("quotes[{i0}].bid"), held0.bid.as_ref())?;
@@ -1492,6 +1550,13 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         for stamped0 in message.quotes.iter_mut() {
             let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
             stamped1.sent_at_ns = Default::default();
+        }
+        for stamped0 in message.quotes.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            for stamped2 in stamped1.series_key.iter_mut() {
+                stamped2.valid_from_ns = Default::default();
+                stamped2.valid_until_ns = Default::default();
+            }
         }
         let account = None;
         self.command_typed("platform.lake.command.record-quotes", "meridian.v1.RecordQuotesRequest", message, account, acting_for).await
@@ -1518,11 +1583,18 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         }
         for (i0, held0) in message.outcomes.iter().enumerate() {
             if let Some(held1) = held0.meta.as_ref() {
+                for (i2, held2) in held1.subjects.iter().enumerate() {
+                    self.known(&format!("outcomes[{i0}].meta.subjects[{i2}].role"), held2.role, domain::SubjectRole::try_from(held2.role).is_ok())?;
+                }
                 for (i2, held2) in held1.source_times.iter().enumerate() {
                     self.known(&format!("outcomes[{i0}].meta.source_times[{i2}].kind"), held2.kind, domain::SourceTimeKind::try_from(held2.kind).is_ok())?;
                 }
                 if let Some(held2) = held1.closed_day.as_ref() {
                     self.known(&format!("outcomes[{i0}].meta.closed_day.reason"), held2.reason, domain::DateCheckReason::try_from(held2.reason).is_ok())?;
+                }
+                self.known(&format!("outcomes[{i0}].meta.quality"), held1.quality, domain::QualityState::try_from(held1.quality).is_ok())?;
+                for (i2, &value) in held1.quality_reasons.iter().enumerate() {
+                    self.known(&format!("outcomes[{i0}].meta.quality_reasons[{i2}]"), value, domain::QualityReason::try_from(value).is_ok())?;
                 }
             }
             self.known(&format!("outcomes[{i0}].determination"), held0.determination, domain::OutcomeDetermination::try_from(held0.determination).is_ok())?;
@@ -1539,6 +1611,13 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
             let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
             stamped1.sent_at_ns = Default::default();
         }
+        for stamped0 in message.outcomes.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            for stamped2 in stamped1.series_key.iter_mut() {
+                stamped2.valid_from_ns = Default::default();
+                stamped2.valid_until_ns = Default::default();
+            }
+        }
         let account = None;
         self.command_typed("platform.lake.command.record-outcomes", "meridian.v1.RecordOutcomesRequest", message, account, acting_for).await
     }
@@ -1549,6 +1628,9 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         request: Request<plugin::ListPricesParams>,
     ) -> Result<Response<plugin::ListPricesResult>, Status> {
         let message: domain::ListPricesRequest = self.as_domain(request.into_inner())?;
+        for (i0, held0) in message.subjects.iter().enumerate() {
+            self.known(&format!("subjects[{i0}].role"), held0.role, domain::SubjectRole::try_from(held0.role).is_ok())?;
+        }
         for &value in &message.kinds {
             self.known("kinds", value, domain::PriceKind::try_from(value).is_ok())?;
         }
@@ -1562,6 +1644,9 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         request: Request<plugin::ListBarsParams>,
     ) -> Result<Response<plugin::ListBarsResult>, Status> {
         let message: domain::ListBarsRequest = self.as_domain(request.into_inner())?;
+        for (i0, held0) in message.subjects.iter().enumerate() {
+            self.known(&format!("subjects[{i0}].role"), held0.role, domain::SubjectRole::try_from(held0.role).is_ok())?;
+        }
         let account = None;
         self.call_typed("platform.lake.query.list-bars", "meridian.v1.ListBarsRequest", message, account, None).await
     }
@@ -1571,7 +1656,14 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         &self,
         request: Request<plugin::ListTradesParams>,
     ) -> Result<Response<plugin::ListTradesResult>, Status> {
-        let message: domain::ListTradesRequest = self.as_domain(request.into_inner())?;
+        let mut message: domain::ListTradesRequest = self.as_domain(request.into_inner())?;
+        for (i0, held0) in message.subjects.iter().enumerate() {
+            self.known(&format!("subjects[{i0}].role"), held0.role, domain::SubjectRole::try_from(held0.role).is_ok())?;
+        }
+        for stamped0 in message.series_keys.iter_mut() {
+            stamped0.valid_from_ns = Default::default();
+            stamped0.valid_until_ns = Default::default();
+        }
         let account = None;
         self.call_typed("platform.lake.query.list-trades", "meridian.v1.ListTradesRequest", message, account, None).await
     }
@@ -1581,7 +1673,14 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         &self,
         request: Request<plugin::ListQuotesParams>,
     ) -> Result<Response<plugin::ListQuotesResult>, Status> {
-        let message: domain::ListQuotesRequest = self.as_domain(request.into_inner())?;
+        let mut message: domain::ListQuotesRequest = self.as_domain(request.into_inner())?;
+        for (i0, held0) in message.subjects.iter().enumerate() {
+            self.known(&format!("subjects[{i0}].role"), held0.role, domain::SubjectRole::try_from(held0.role).is_ok())?;
+        }
+        for stamped0 in message.series_keys.iter_mut() {
+            stamped0.valid_from_ns = Default::default();
+            stamped0.valid_until_ns = Default::default();
+        }
         let account = None;
         self.call_typed("platform.lake.query.list-quotes", "meridian.v1.ListQuotesRequest", message, account, None).await
     }
@@ -1592,6 +1691,9 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         request: Request<plugin::ListOutcomesParams>,
     ) -> Result<Response<plugin::ListOutcomesResult>, Status> {
         let message: domain::ListOutcomesRequest = self.as_domain(request.into_inner())?;
+        for (i0, held0) in message.subjects.iter().enumerate() {
+            self.known(&format!("subjects[{i0}].role"), held0.role, domain::SubjectRole::try_from(held0.role).is_ok())?;
+        }
         let account = None;
         self.call_typed("platform.lake.query.list-outcomes", "meridian.v1.ListOutcomesRequest", message, account, None).await
     }
@@ -1604,6 +1706,9 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         let mut params = request.into_inner();
         let acting_for = params.acting_for.take();
         let message: domain::DeclineWantRequest = self.as_domain(params)?;
+        for (i0, held0) in message.subjects.iter().enumerate() {
+            self.known(&format!("subjects[{i0}].role"), held0.role, domain::SubjectRole::try_from(held0.role).is_ok())?;
+        }
         self.known("reason", message.reason, domain::UnansweredReason::try_from(message.reason).is_ok())?;
         let account = None;
         self.command_typed("platform.lake.command.decline-want", "meridian.v1.DeclineWantRequest", message, account, acting_for).await
@@ -1624,7 +1729,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         &self,
         request: Request<plugin::RunJobParams>,
     ) -> Result<Response<plugin::RunJobResult>, Status> {
-        let message: domain::RunJobRequest = self.as_domain(request.into_inner())?;
+        let mut message: domain::RunJobRequest = self.as_domain(request.into_inner())?;
         if let Some(held0) = message.job.as_ref() {
             if let Some(held1) = held0.what_if.as_ref() {
                 for (i2, held2) in held1.trades.iter().enumerate() {
@@ -1632,6 +1737,31 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
                     self.exact(&format!("job.what_if.trades[{i2}].quantity"), held2.quantity.as_ref())?;
                     self.exact_money(&format!("job.what_if.trades[{i2}].price"), held2.price.as_ref())?;
                 }
+            }
+            if let Some(held1) = held0.scenario_set.as_ref() {
+                for (i2, held2) in held1.axes.iter().enumerate() {
+                    for (i3, held3) in held2.steps.iter().enumerate() {
+                        for (i4, held4) in held3.shocks.iter().enumerate() {
+                            self.known(&format!("job.scenario_set.axes[{i2}].steps[{i3}].shocks[{i4}].object"), held4.object, domain::ShockObject::try_from(held4.object).is_ok())?;
+                            self.known(&format!("job.scenario_set.axes[{i2}].steps[{i3}].shocks[{i4}].form"), held4.form, domain::ShockForm::try_from(held4.form).is_ok())?;
+                            self.known(&format!("job.scenario_set.axes[{i2}].steps[{i3}].shocks[{i4}].unit"), held4.unit, domain::ShockUnit::try_from(held4.unit).is_ok())?;
+                            self.exact(&format!("job.scenario_set.axes[{i2}].steps[{i3}].shocks[{i4}].value"), held4.value.as_ref())?;
+                            for (i5, held5) in held4.buckets.iter().enumerate() {
+                                if let Some(held6) = held5.tenor.as_ref() {
+                                    self.known(&format!("job.scenario_set.axes[{i2}].steps[{i3}].shocks[{i4}].buckets[{i5}].tenor.unit"), held6.unit, domain::TenorUnit::try_from(held6.unit).is_ok())?;
+                                }
+                                self.exact(&format!("job.scenario_set.axes[{i2}].steps[{i3}].shocks[{i4}].buckets[{i5}].value"), held5.value.as_ref())?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let stamped0 = message.job.get_or_insert_with(Default::default);
+        for stamped1 in stamped0.chains.iter_mut() {
+            for stamped2 in stamped1.series_keys.iter_mut() {
+                stamped2.valid_from_ns = Default::default();
+                stamped2.valid_until_ns = Default::default();
             }
         }
         let account = None;
@@ -1752,6 +1882,9 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         request: Request<plugin::QueryLakeParams>,
     ) -> Result<Response<plugin::QueryLakeResult>, Status> {
         let mut message: domain::QueryLakeRequest = self.as_domain(request.into_inner())?;
+        for (i0, held0) in message.subjects.iter().enumerate() {
+            self.known(&format!("subjects[{i0}].role"), held0.role, domain::SubjectRole::try_from(held0.role).is_ok())?;
+        }
         message.instance_id = self.instance_id().to_string();
         let account = None;
         self.call_typed("platform.lake.query.query-lake", "meridian.v1.QueryLakeRequest", message, account, None).await
@@ -1808,11 +1941,18 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         }
         for (i0, held0) in message.rates.iter().enumerate() {
             if let Some(held1) = held0.meta.as_ref() {
+                for (i2, held2) in held1.subjects.iter().enumerate() {
+                    self.known(&format!("rates[{i0}].meta.subjects[{i2}].role"), held2.role, domain::SubjectRole::try_from(held2.role).is_ok())?;
+                }
                 for (i2, held2) in held1.source_times.iter().enumerate() {
                     self.known(&format!("rates[{i0}].meta.source_times[{i2}].kind"), held2.kind, domain::SourceTimeKind::try_from(held2.kind).is_ok())?;
                 }
                 if let Some(held2) = held1.closed_day.as_ref() {
                     self.known(&format!("rates[{i0}].meta.closed_day.reason"), held2.reason, domain::DateCheckReason::try_from(held2.reason).is_ok())?;
+                }
+                self.known(&format!("rates[{i0}].meta.quality"), held1.quality, domain::QualityState::try_from(held1.quality).is_ok())?;
+                for (i2, &value) in held1.quality_reasons.iter().enumerate() {
+                    self.known(&format!("rates[{i0}].meta.quality_reasons[{i2}]"), value, domain::QualityReason::try_from(value).is_ok())?;
                 }
             }
             self.known(&format!("rates[{i0}].kind"), held0.kind, domain::RateKind::try_from(held0.kind).is_ok())?;
@@ -1842,6 +1982,13 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
             let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
             stamped1.sent_at_ns = Default::default();
         }
+        for stamped0 in message.rates.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            for stamped2 in stamped1.series_key.iter_mut() {
+                stamped2.valid_from_ns = Default::default();
+                stamped2.valid_until_ns = Default::default();
+            }
+        }
         let account = None;
         self.command_typed("platform.lake.command.record-rates", "meridian.v1.RecordRatesRequest", message, account, acting_for).await
     }
@@ -1852,6 +1999,9 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         request: Request<plugin::ListRatesParams>,
     ) -> Result<Response<plugin::ListRatesResult>, Status> {
         let message: domain::ListRatesRequest = self.as_domain(request.into_inner())?;
+        for (i0, held0) in message.subjects.iter().enumerate() {
+            self.known(&format!("subjects[{i0}].role"), held0.role, domain::SubjectRole::try_from(held0.role).is_ok())?;
+        }
         for (i0, held0) in message.tenors.iter().enumerate() {
             self.known(&format!("tenors[{i0}].unit"), held0.unit, domain::TenorUnit::try_from(held0.unit).is_ok())?;
         }
@@ -1927,6 +2077,923 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         let message: domain::PickPlacementQuoteRequest = self.as_domain(params)?;
         let account = None;
         self.command_typed("platform.book.command.pick-placement-quote", "meridian.v1.PickPlacementQuoteRequest", message, account, acting_for).await
+    }
+
+    /// W3.31: `platform.reference.command.request-series-records` (preview).
+    async fn request_series_records(
+        &self,
+        request: Request<plugin::RequestSeriesRecordsParams>,
+    ) -> Result<Response<plugin::RequestSeriesRecordsResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let mut message: domain::RequestSeriesRecordsRequest = self.as_domain(params)?;
+        for (i0, held0) in message.series.iter().enumerate() {
+            self.known(&format!("series[{i0}].cause"), held0.cause, domain::SeriesRequestCause::try_from(held0.cause).is_ok())?;
+        }
+        for stamped0 in message.series.iter_mut() {
+            for stamped1 in stamped0.series_key.iter_mut() {
+                stamped1.valid_from_ns = Default::default();
+                stamped1.valid_until_ns = Default::default();
+            }
+        }
+        let account = None;
+        self.command_typed("platform.reference.command.request-series-records", "meridian.v1.RequestSeriesRecordsRequest", message, account, acting_for).await
+    }
+
+    /// W10.4: `platform.lake.command.record-series` (preview).
+    async fn record_series(
+        &self,
+        request: Request<plugin::RecordSeriesParams>,
+    ) -> Result<Response<plugin::RecordSeriesResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let mut message: domain::RecordSeriesRequest = self.as_domain(params)?;
+        let bound = meridian_pb::bounds::RECORD_SERIES_REQUEST_SERIES_COUNT;
+        if !bound.admits(message.series.len()) {
+            let refusal = format!(
+                "series holds {} rows; a batch is {} to {}",
+                message.series.len(),
+                bound.least,
+                bound.most
+            );
+            self.note_refusal(&refusal);
+            return Err(Status::invalid_argument(refusal));
+        }
+        for (i0, held0) in message.series.iter().enumerate() {
+            if let Some(held1) = held0.meta.as_ref() {
+                for (i2, held2) in held1.subjects.iter().enumerate() {
+                    self.known(&format!("series[{i0}].meta.subjects[{i2}].role"), held2.role, domain::SubjectRole::try_from(held2.role).is_ok())?;
+                }
+                for (i2, held2) in held1.source_times.iter().enumerate() {
+                    self.known(&format!("series[{i0}].meta.source_times[{i2}].kind"), held2.kind, domain::SourceTimeKind::try_from(held2.kind).is_ok())?;
+                }
+                if let Some(held2) = held1.closed_day.as_ref() {
+                    self.known(&format!("series[{i0}].meta.closed_day.reason"), held2.reason, domain::DateCheckReason::try_from(held2.reason).is_ok())?;
+                }
+                self.known(&format!("series[{i0}].meta.quality"), held1.quality, domain::QualityState::try_from(held1.quality).is_ok())?;
+                for (i2, &value) in held1.quality_reasons.iter().enumerate() {
+                    self.known(&format!("series[{i0}].meta.quality_reasons[{i2}]"), value, domain::QualityReason::try_from(value).is_ok())?;
+                }
+            }
+            for (i1, held1) in held0.fields.iter().enumerate() {
+                if let Some(held2) = held1.provenance.as_ref() {
+                    self.known(&format!("series[{i0}].fields[{i1}].provenance.kind"), held2.kind, meridian_pb::v1::ProvenanceKind::try_from(held2.kind).is_ok())?;
+                    if let Some(held3) = held2.date_basis.as_ref() {
+                        if let Some(held4) = held3.rule.as_ref() {
+                            self.known(&format!("series[{i0}].fields[{i1}].provenance.date_basis.rule.kind"), held4.kind, meridian_pb::v1::DateRuleKind::try_from(held4.kind).is_ok())?;
+                        }
+                    }
+                }
+            }
+        }
+        for stamped0 in message.series.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            let stamped2 = stamped1.source.get_or_insert_with(Default::default);
+            stamped2.instance = self.instance_id().to_string();
+            stamped2.plugin_version = Default::default();
+        }
+        for stamped0 in message.series.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            stamped1.sent_at_ns = Default::default();
+        }
+        for stamped0 in message.series.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            for stamped2 in stamped1.series_key.iter_mut() {
+                stamped2.valid_from_ns = Default::default();
+                stamped2.valid_until_ns = Default::default();
+            }
+        }
+        let account = None;
+        self.command_typed("platform.lake.command.record-series", "meridian.v1.RecordSeriesRequest", message, account, acting_for).await
+    }
+
+    /// W10.6: `platform.lake.query.list-series` (preview).
+    async fn list_series(
+        &self,
+        request: Request<plugin::ListSeriesParams>,
+    ) -> Result<Response<plugin::ListSeriesResult>, Status> {
+        let mut message: domain::ListSeriesRequest = self.as_domain(request.into_inner())?;
+        for (i0, held0) in message.subjects.iter().enumerate() {
+            self.known(&format!("subjects[{i0}].role"), held0.role, domain::SubjectRole::try_from(held0.role).is_ok())?;
+        }
+        self.known("instrument_type", message.instrument_type, domain::InstrumentType::try_from(message.instrument_type).is_ok())?;
+        for stamped0 in message.series_keys.iter_mut() {
+            stamped0.valid_from_ns = Default::default();
+            stamped0.valid_until_ns = Default::default();
+        }
+        let account = None;
+        self.call_typed("platform.lake.query.list-series", "meridian.v1.ListSeriesRequest", message, account, None).await
+    }
+
+    /// W10.4: `platform.lake.command.record-statistics` (preview).
+    async fn record_statistics(
+        &self,
+        request: Request<plugin::RecordStatisticsParams>,
+    ) -> Result<Response<plugin::RecordStatisticsResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let mut message: domain::RecordStatisticsRequest = self.as_domain(params)?;
+        let bound = meridian_pb::bounds::RECORD_STATISTICS_REQUEST_STATISTICS_COUNT;
+        if !bound.admits(message.statistics.len()) {
+            let refusal = format!(
+                "statistics holds {} rows; a batch is {} to {}",
+                message.statistics.len(),
+                bound.least,
+                bound.most
+            );
+            self.note_refusal(&refusal);
+            return Err(Status::invalid_argument(refusal));
+        }
+        for (i0, held0) in message.statistics.iter().enumerate() {
+            if let Some(held1) = held0.meta.as_ref() {
+                for (i2, held2) in held1.subjects.iter().enumerate() {
+                    self.known(&format!("statistics[{i0}].meta.subjects[{i2}].role"), held2.role, domain::SubjectRole::try_from(held2.role).is_ok())?;
+                }
+                for (i2, held2) in held1.source_times.iter().enumerate() {
+                    self.known(&format!("statistics[{i0}].meta.source_times[{i2}].kind"), held2.kind, domain::SourceTimeKind::try_from(held2.kind).is_ok())?;
+                }
+                if let Some(held2) = held1.closed_day.as_ref() {
+                    self.known(&format!("statistics[{i0}].meta.closed_day.reason"), held2.reason, domain::DateCheckReason::try_from(held2.reason).is_ok())?;
+                }
+                self.known(&format!("statistics[{i0}].meta.quality"), held1.quality, domain::QualityState::try_from(held1.quality).is_ok())?;
+                for (i2, &value) in held1.quality_reasons.iter().enumerate() {
+                    self.known(&format!("statistics[{i0}].meta.quality_reasons[{i2}]"), value, domain::QualityReason::try_from(value).is_ok())?;
+                }
+            }
+            self.known(&format!("statistics[{i0}].kind"), held0.kind, domain::StatisticKind::try_from(held0.kind).is_ok())?;
+            if let Some(held1) = held0.value.as_ref() {
+                self.exact(&format!("statistics[{i0}].value.value"), held1.value.as_ref())?;
+                self.known(&format!("statistics[{i0}].value.unit"), held1.unit, domain::ValueUnit::try_from(held1.unit).is_ok())?;
+            }
+        }
+        for stamped0 in message.statistics.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            let stamped2 = stamped1.source.get_or_insert_with(Default::default);
+            stamped2.instance = self.instance_id().to_string();
+            stamped2.plugin_version = Default::default();
+        }
+        for stamped0 in message.statistics.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            stamped1.sent_at_ns = Default::default();
+        }
+        for stamped0 in message.statistics.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            for stamped2 in stamped1.series_key.iter_mut() {
+                stamped2.valid_from_ns = Default::default();
+                stamped2.valid_until_ns = Default::default();
+            }
+        }
+        let account = None;
+        self.command_typed("platform.lake.command.record-statistics", "meridian.v1.RecordStatisticsRequest", message, account, acting_for).await
+    }
+
+    /// W10.6: `platform.lake.query.list-statistics` (preview).
+    async fn list_statistics(
+        &self,
+        request: Request<plugin::ListStatisticsParams>,
+    ) -> Result<Response<plugin::ListStatisticsResult>, Status> {
+        let mut message: domain::ListStatisticsRequest = self.as_domain(request.into_inner())?;
+        for (i0, held0) in message.subjects.iter().enumerate() {
+            self.known(&format!("subjects[{i0}].role"), held0.role, domain::SubjectRole::try_from(held0.role).is_ok())?;
+        }
+        for &value in &message.kinds {
+            self.known("kinds", value, domain::StatisticKind::try_from(value).is_ok())?;
+        }
+        for stamped0 in message.series_keys.iter_mut() {
+            stamped0.valid_from_ns = Default::default();
+            stamped0.valid_until_ns = Default::default();
+        }
+        let account = None;
+        self.call_typed("platform.lake.query.list-statistics", "meridian.v1.ListStatisticsRequest", message, account, None).await
+    }
+
+    /// W9.16: `platform.book.command.record-lifecycle-event` (preview).
+    async fn record_lifecycle_event(
+        &self,
+        request: Request<plugin::RecordLifecycleEventParams>,
+    ) -> Result<Response<plugin::RecordLifecycleEventResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let message: domain::RecordLifecycleEventRequest = self.as_domain(params)?;
+        if let Some(held0) = message.event.as_ref() {
+            self.known("event.kind", held0.kind, domain::LifecycleEventKind::try_from(held0.kind).is_ok())?;
+            self.known("event.state", held0.state, domain::LifecycleEventState::try_from(held0.state).is_ok())?;
+            self.exact("event.quantity", held0.quantity.as_ref())?;
+            for (i1, held1) in held0.deliveries.iter().enumerate() {
+                self.exact(&format!("event.deliveries[{i1}].quantity"), held1.quantity.as_ref())?;
+                self.exact_money(&format!("event.deliveries[{i1}].price"), held1.price.as_ref())?;
+            }
+            self.exact_money("event.cash", held0.cash.as_ref())?;
+            self.exact_money("event.settlement_price", held0.settlement_price.as_ref())?;
+            self.exact_money("event.proposal_basis", held0.proposal_basis.as_ref())?;
+        }
+        let account = None;
+        self.command_typed("platform.book.command.record-lifecycle-event", "meridian.v1.RecordLifecycleEventRequest", message, account, acting_for).await
+    }
+
+    /// W9.17: `platform.book.command.propose-lifecycle-events` (preview).
+    async fn propose_lifecycle_events(
+        &self,
+        request: Request<plugin::ProposeLifecycleEventsParams>,
+    ) -> Result<Response<plugin::ProposeLifecycleEventsResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let message: domain::ProposeLifecycleEventsRequest = self.as_domain(params)?;
+        for (i0, held0) in message.events.iter().enumerate() {
+            self.known(&format!("events[{i0}].kind"), held0.kind, domain::LifecycleEventKind::try_from(held0.kind).is_ok())?;
+            self.known(&format!("events[{i0}].state"), held0.state, domain::LifecycleEventState::try_from(held0.state).is_ok())?;
+            self.exact(&format!("events[{i0}].quantity"), held0.quantity.as_ref())?;
+            for (i1, held1) in held0.deliveries.iter().enumerate() {
+                self.exact(&format!("events[{i0}].deliveries[{i1}].quantity"), held1.quantity.as_ref())?;
+                self.exact_money(&format!("events[{i0}].deliveries[{i1}].price"), held1.price.as_ref())?;
+            }
+            self.exact_money(&format!("events[{i0}].cash"), held0.cash.as_ref())?;
+            self.exact_money(&format!("events[{i0}].settlement_price"), held0.settlement_price.as_ref())?;
+            self.exact_money(&format!("events[{i0}].proposal_basis"), held0.proposal_basis.as_ref())?;
+        }
+        let account = None;
+        self.command_typed("platform.book.command.propose-lifecycle-events", "meridian.v1.ProposeLifecycleEventsRequest", message, account, acting_for).await
+    }
+
+    /// W9.18: `platform.book.command.release-lifecycle-event` (preview).
+    async fn release_lifecycle_event(
+        &self,
+        request: Request<plugin::ReleaseLifecycleEventParams>,
+    ) -> Result<Response<plugin::ReleaseLifecycleEventResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let message: domain::ReleaseLifecycleEventRequest = self.as_domain(params)?;
+        let account = None;
+        self.command_typed("platform.book.command.release-lifecycle-event", "meridian.v1.ReleaseLifecycleEventRequest", message, account, acting_for).await
+    }
+
+    /// W9.19: `platform.book.query.list-lifecycle-events` (preview).
+    async fn list_lifecycle_events(
+        &self,
+        request: Request<plugin::ListLifecycleEventsParams>,
+    ) -> Result<Response<plugin::ListLifecycleEventsResult>, Status> {
+        let message: domain::ListLifecycleEventsRequest = self.as_domain(request.into_inner())?;
+        for &value in &message.kinds {
+            self.known("kinds", value, domain::LifecycleEventKind::try_from(value).is_ok())?;
+        }
+        let account = Some(message.account_id.clone());
+        self.call_typed("platform.book.query.list-lifecycle-events", "meridian.v1.ListLifecycleEventsRequest", message, account, None).await
+    }
+
+    /// W10.4: `platform.lake.command.record-derived-series` (preview).
+    async fn record_derived_series(
+        &self,
+        request: Request<plugin::RecordDerivedSeriesParams>,
+    ) -> Result<Response<plugin::RecordDerivedSeriesResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let mut message: domain::RecordDerivedSeriesRequest = self.as_domain(params)?;
+        let bound = meridian_pb::bounds::RECORD_DERIVED_SERIES_REQUEST_VALUES_COUNT;
+        if !bound.admits(message.values.len()) {
+            let refusal = format!(
+                "values holds {} rows; a batch is {} to {}",
+                message.values.len(),
+                bound.least,
+                bound.most
+            );
+            self.note_refusal(&refusal);
+            return Err(Status::invalid_argument(refusal));
+        }
+        for (i0, held0) in message.values.iter().enumerate() {
+            if let Some(held1) = held0.meta.as_ref() {
+                for (i2, held2) in held1.subjects.iter().enumerate() {
+                    self.known(&format!("values[{i0}].meta.subjects[{i2}].role"), held2.role, domain::SubjectRole::try_from(held2.role).is_ok())?;
+                }
+                for (i2, held2) in held1.source_times.iter().enumerate() {
+                    self.known(&format!("values[{i0}].meta.source_times[{i2}].kind"), held2.kind, domain::SourceTimeKind::try_from(held2.kind).is_ok())?;
+                }
+                if let Some(held2) = held1.closed_day.as_ref() {
+                    self.known(&format!("values[{i0}].meta.closed_day.reason"), held2.reason, domain::DateCheckReason::try_from(held2.reason).is_ok())?;
+                }
+                self.known(&format!("values[{i0}].meta.quality"), held1.quality, domain::QualityState::try_from(held1.quality).is_ok())?;
+                for (i2, &value) in held1.quality_reasons.iter().enumerate() {
+                    self.known(&format!("values[{i0}].meta.quality_reasons[{i2}]"), value, domain::QualityReason::try_from(value).is_ok())?;
+                }
+            }
+            if let Some(held1) = held0.value.as_ref() {
+                self.exact(&format!("values[{i0}].value.value"), held1.value.as_ref())?;
+                self.known(&format!("values[{i0}].value.unit"), held1.unit, domain::ValueUnit::try_from(held1.unit).is_ok())?;
+            }
+        }
+        for stamped0 in message.values.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            let stamped2 = stamped1.source.get_or_insert_with(Default::default);
+            stamped2.instance = self.instance_id().to_string();
+            stamped2.plugin_version = Default::default();
+        }
+        for stamped0 in message.values.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            stamped1.sent_at_ns = Default::default();
+        }
+        for stamped0 in message.values.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            for stamped2 in stamped1.series_key.iter_mut() {
+                stamped2.valid_from_ns = Default::default();
+                stamped2.valid_until_ns = Default::default();
+            }
+        }
+        let account = None;
+        self.command_typed("platform.lake.command.record-derived-series", "meridian.v1.RecordDerivedSeriesRequest", message, account, acting_for).await
+    }
+
+    /// W10.6: `platform.lake.query.list-derived-series` (preview).
+    async fn list_derived_series(
+        &self,
+        request: Request<plugin::ListDerivedSeriesParams>,
+    ) -> Result<Response<plugin::ListDerivedSeriesResult>, Status> {
+        let message: domain::ListDerivedSeriesRequest = self.as_domain(request.into_inner())?;
+        for (i0, held0) in message.subjects.iter().enumerate() {
+            self.known(&format!("subjects[{i0}].role"), held0.role, domain::SubjectRole::try_from(held0.role).is_ok())?;
+        }
+        let account = None;
+        self.call_typed("platform.lake.query.list-derived-series", "meridian.v1.ListDerivedSeriesRequest", message, account, None).await
+    }
+
+    /// W12.8: `platform.lake.command.record-scenarios` (preview).
+    async fn record_scenarios(
+        &self,
+        request: Request<plugin::RecordScenariosParams>,
+    ) -> Result<Response<plugin::RecordScenariosResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let mut message: domain::RecordScenariosRequest = self.as_domain(params)?;
+        for (i0, held0) in message.scenarios.iter().enumerate() {
+            if let Some(held1) = held0.meta.as_ref() {
+                for (i2, held2) in held1.subjects.iter().enumerate() {
+                    self.known(&format!("scenarios[{i0}].meta.subjects[{i2}].role"), held2.role, domain::SubjectRole::try_from(held2.role).is_ok())?;
+                }
+                for (i2, held2) in held1.source_times.iter().enumerate() {
+                    self.known(&format!("scenarios[{i0}].meta.source_times[{i2}].kind"), held2.kind, domain::SourceTimeKind::try_from(held2.kind).is_ok())?;
+                }
+                if let Some(held2) = held1.closed_day.as_ref() {
+                    self.known(&format!("scenarios[{i0}].meta.closed_day.reason"), held2.reason, domain::DateCheckReason::try_from(held2.reason).is_ok())?;
+                }
+                self.known(&format!("scenarios[{i0}].meta.quality"), held1.quality, domain::QualityState::try_from(held1.quality).is_ok())?;
+                for (i2, &value) in held1.quality_reasons.iter().enumerate() {
+                    self.known(&format!("scenarios[{i0}].meta.quality_reasons[{i2}]"), value, domain::QualityReason::try_from(value).is_ok())?;
+                }
+            }
+            if let Some(held1) = held0.scenario.as_ref() {
+                for (i2, held2) in held1.shocks.iter().enumerate() {
+                    self.known(&format!("scenarios[{i0}].scenario.shocks[{i2}].object"), held2.object, domain::ShockObject::try_from(held2.object).is_ok())?;
+                    self.known(&format!("scenarios[{i0}].scenario.shocks[{i2}].form"), held2.form, domain::ShockForm::try_from(held2.form).is_ok())?;
+                    self.known(&format!("scenarios[{i0}].scenario.shocks[{i2}].unit"), held2.unit, domain::ShockUnit::try_from(held2.unit).is_ok())?;
+                    self.exact(&format!("scenarios[{i0}].scenario.shocks[{i2}].value"), held2.value.as_ref())?;
+                    for (i3, held3) in held2.buckets.iter().enumerate() {
+                        if let Some(held4) = held3.tenor.as_ref() {
+                            self.known(&format!("scenarios[{i0}].scenario.shocks[{i2}].buckets[{i3}].tenor.unit"), held4.unit, domain::TenorUnit::try_from(held4.unit).is_ok())?;
+                        }
+                        self.exact(&format!("scenarios[{i0}].scenario.shocks[{i2}].buckets[{i3}].value"), held3.value.as_ref())?;
+                    }
+                }
+            }
+            if let Some(held1) = held0.scenario_set.as_ref() {
+                for (i2, held2) in held1.axes.iter().enumerate() {
+                    for (i3, held3) in held2.steps.iter().enumerate() {
+                        for (i4, held4) in held3.shocks.iter().enumerate() {
+                            self.known(&format!("scenarios[{i0}].scenario_set.axes[{i2}].steps[{i3}].shocks[{i4}].object"), held4.object, domain::ShockObject::try_from(held4.object).is_ok())?;
+                            self.known(&format!("scenarios[{i0}].scenario_set.axes[{i2}].steps[{i3}].shocks[{i4}].form"), held4.form, domain::ShockForm::try_from(held4.form).is_ok())?;
+                            self.known(&format!("scenarios[{i0}].scenario_set.axes[{i2}].steps[{i3}].shocks[{i4}].unit"), held4.unit, domain::ShockUnit::try_from(held4.unit).is_ok())?;
+                            self.exact(&format!("scenarios[{i0}].scenario_set.axes[{i2}].steps[{i3}].shocks[{i4}].value"), held4.value.as_ref())?;
+                            for (i5, held5) in held4.buckets.iter().enumerate() {
+                                if let Some(held6) = held5.tenor.as_ref() {
+                                    self.known(&format!("scenarios[{i0}].scenario_set.axes[{i2}].steps[{i3}].shocks[{i4}].buckets[{i5}].tenor.unit"), held6.unit, domain::TenorUnit::try_from(held6.unit).is_ok())?;
+                                }
+                                self.exact(&format!("scenarios[{i0}].scenario_set.axes[{i2}].steps[{i3}].shocks[{i4}].buckets[{i5}].value"), held5.value.as_ref())?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for stamped0 in message.scenarios.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            let stamped2 = stamped1.source.get_or_insert_with(Default::default);
+            stamped2.instance = self.instance_id().to_string();
+            stamped2.plugin_version = Default::default();
+        }
+        for stamped0 in message.scenarios.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            stamped1.sent_at_ns = Default::default();
+        }
+        for stamped0 in message.scenarios.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            for stamped2 in stamped1.series_key.iter_mut() {
+                stamped2.valid_from_ns = Default::default();
+                stamped2.valid_until_ns = Default::default();
+            }
+        }
+        let account = None;
+        self.command_typed("platform.lake.command.record-scenarios", "meridian.v1.RecordScenariosRequest", message, account, acting_for).await
+    }
+
+    /// W12.8: `platform.lake.query.list-scenarios` (preview).
+    async fn list_scenarios(
+        &self,
+        request: Request<plugin::ListScenariosParams>,
+    ) -> Result<Response<plugin::ListScenariosResult>, Status> {
+        let message: domain::ListScenariosRequest = self.as_domain(request.into_inner())?;
+        let account = None;
+        self.call_typed("platform.lake.query.list-scenarios", "meridian.v1.ListScenariosRequest", message, account, None).await
+    }
+
+    /// W3.32: `platform.reference.query.resolve-company` (preview).
+    async fn resolve_company(
+        &self,
+        request: Request<plugin::ResolveCompanyParams>,
+    ) -> Result<Response<plugin::ResolveCompanyResult>, Status> {
+        let mut message: domain::ResolveCompanyRequest = self.as_domain(request.into_inner())?;
+        for stamped0 in message.identifiers.iter_mut() {
+            stamped0.valid_from_ns = Default::default();
+            stamped0.valid_until_ns = Default::default();
+        }
+        let account = None;
+        self.call_typed("platform.reference.query.resolve-company", "meridian.v1.ResolveCompanyRequest", message, account, None).await
+    }
+
+    /// W10.4: `platform.lake.command.record-filings` (preview).
+    async fn record_filings(
+        &self,
+        request: Request<plugin::RecordFilingsParams>,
+    ) -> Result<Response<plugin::RecordFilingsResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let mut message: domain::RecordFilingsRequest = self.as_domain(params)?;
+        let bound = meridian_pb::bounds::RECORD_FILINGS_REQUEST_FILINGS_COUNT;
+        if !bound.admits(message.filings.len()) {
+            let refusal = format!(
+                "filings holds {} rows; a batch is {} to {}",
+                message.filings.len(),
+                bound.least,
+                bound.most
+            );
+            self.note_refusal(&refusal);
+            return Err(Status::invalid_argument(refusal));
+        }
+        for (i0, held0) in message.filings.iter().enumerate() {
+            if let Some(held1) = held0.meta.as_ref() {
+                for (i2, held2) in held1.subjects.iter().enumerate() {
+                    self.known(&format!("filings[{i0}].meta.subjects[{i2}].role"), held2.role, domain::SubjectRole::try_from(held2.role).is_ok())?;
+                }
+                for (i2, held2) in held1.source_times.iter().enumerate() {
+                    self.known(&format!("filings[{i0}].meta.source_times[{i2}].kind"), held2.kind, domain::SourceTimeKind::try_from(held2.kind).is_ok())?;
+                }
+                if let Some(held2) = held1.closed_day.as_ref() {
+                    self.known(&format!("filings[{i0}].meta.closed_day.reason"), held2.reason, domain::DateCheckReason::try_from(held2.reason).is_ok())?;
+                }
+                self.known(&format!("filings[{i0}].meta.quality"), held1.quality, domain::QualityState::try_from(held1.quality).is_ok())?;
+                for (i2, &value) in held1.quality_reasons.iter().enumerate() {
+                    self.known(&format!("filings[{i0}].meta.quality_reasons[{i2}]"), value, domain::QualityReason::try_from(value).is_ok())?;
+                }
+            }
+            self.known(&format!("filings[{i0}].kind"), held0.kind, domain::FilingKind::try_from(held0.kind).is_ok())?;
+        }
+        for stamped0 in message.filings.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            let stamped2 = stamped1.source.get_or_insert_with(Default::default);
+            stamped2.instance = self.instance_id().to_string();
+            stamped2.plugin_version = Default::default();
+        }
+        for stamped0 in message.filings.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            stamped1.sent_at_ns = Default::default();
+        }
+        for stamped0 in message.filings.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            for stamped2 in stamped1.series_key.iter_mut() {
+                stamped2.valid_from_ns = Default::default();
+                stamped2.valid_until_ns = Default::default();
+            }
+        }
+        let account = None;
+        self.command_typed("platform.lake.command.record-filings", "meridian.v1.RecordFilingsRequest", message, account, acting_for).await
+    }
+
+    /// W10.6: `platform.lake.query.list-filings` (preview).
+    async fn list_filings(
+        &self,
+        request: Request<plugin::ListFilingsParams>,
+    ) -> Result<Response<plugin::ListFilingsResult>, Status> {
+        let message: domain::ListFilingsRequest = self.as_domain(request.into_inner())?;
+        for (i0, held0) in message.subjects.iter().enumerate() {
+            self.known(&format!("subjects[{i0}].role"), held0.role, domain::SubjectRole::try_from(held0.role).is_ok())?;
+        }
+        for &value in &message.kinds {
+            self.known("kinds", value, domain::FilingKind::try_from(value).is_ok())?;
+        }
+        let account = None;
+        self.call_typed("platform.lake.query.list-filings", "meridian.v1.ListFilingsRequest", message, account, None).await
+    }
+
+    /// W10.4: `platform.lake.command.record-reported-facts` (preview).
+    async fn record_reported_facts(
+        &self,
+        request: Request<plugin::RecordReportedFactsParams>,
+    ) -> Result<Response<plugin::RecordReportedFactsResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let mut message: domain::RecordReportedFactsRequest = self.as_domain(params)?;
+        let bound = meridian_pb::bounds::RECORD_REPORTED_FACTS_REQUEST_FACTS_COUNT;
+        if !bound.admits(message.facts.len()) {
+            let refusal = format!(
+                "facts holds {} rows; a batch is {} to {}",
+                message.facts.len(),
+                bound.least,
+                bound.most
+            );
+            self.note_refusal(&refusal);
+            return Err(Status::invalid_argument(refusal));
+        }
+        for (i0, held0) in message.facts.iter().enumerate() {
+            if let Some(held1) = held0.meta.as_ref() {
+                for (i2, held2) in held1.subjects.iter().enumerate() {
+                    self.known(&format!("facts[{i0}].meta.subjects[{i2}].role"), held2.role, domain::SubjectRole::try_from(held2.role).is_ok())?;
+                }
+                for (i2, held2) in held1.source_times.iter().enumerate() {
+                    self.known(&format!("facts[{i0}].meta.source_times[{i2}].kind"), held2.kind, domain::SourceTimeKind::try_from(held2.kind).is_ok())?;
+                }
+                if let Some(held2) = held1.closed_day.as_ref() {
+                    self.known(&format!("facts[{i0}].meta.closed_day.reason"), held2.reason, domain::DateCheckReason::try_from(held2.reason).is_ok())?;
+                }
+                self.known(&format!("facts[{i0}].meta.quality"), held1.quality, domain::QualityState::try_from(held1.quality).is_ok())?;
+                for (i2, &value) in held1.quality_reasons.iter().enumerate() {
+                    self.known(&format!("facts[{i0}].meta.quality_reasons[{i2}]"), value, domain::QualityReason::try_from(value).is_ok())?;
+                }
+            }
+            self.exact_money(&format!("facts[{i0}].amount"), held0.amount.as_ref())?;
+            if let Some(held1) = held0.value.as_ref() {
+                self.exact(&format!("facts[{i0}].value.value"), held1.value.as_ref())?;
+                self.known(&format!("facts[{i0}].value.unit"), held1.unit, domain::ValueUnit::try_from(held1.unit).is_ok())?;
+            }
+        }
+        for stamped0 in message.facts.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            let stamped2 = stamped1.source.get_or_insert_with(Default::default);
+            stamped2.instance = self.instance_id().to_string();
+            stamped2.plugin_version = Default::default();
+        }
+        for stamped0 in message.facts.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            stamped1.sent_at_ns = Default::default();
+        }
+        for stamped0 in message.facts.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            for stamped2 in stamped1.series_key.iter_mut() {
+                stamped2.valid_from_ns = Default::default();
+                stamped2.valid_until_ns = Default::default();
+            }
+        }
+        let account = None;
+        self.command_typed("platform.lake.command.record-reported-facts", "meridian.v1.RecordReportedFactsRequest", message, account, acting_for).await
+    }
+
+    /// W10.6: `platform.lake.query.list-reported-facts` (preview).
+    async fn list_reported_facts(
+        &self,
+        request: Request<plugin::ListReportedFactsParams>,
+    ) -> Result<Response<plugin::ListReportedFactsResult>, Status> {
+        let message: domain::ListReportedFactsRequest = self.as_domain(request.into_inner())?;
+        for (i0, held0) in message.subjects.iter().enumerate() {
+            self.known(&format!("subjects[{i0}].role"), held0.role, domain::SubjectRole::try_from(held0.role).is_ok())?;
+        }
+        let account = None;
+        self.call_typed("platform.lake.query.list-reported-facts", "meridian.v1.ListReportedFactsRequest", message, account, None).await
+    }
+
+    /// W10.4: `platform.lake.command.record-holdings-reports` (preview).
+    async fn record_holdings_reports(
+        &self,
+        request: Request<plugin::RecordHoldingsReportsParams>,
+    ) -> Result<Response<plugin::RecordHoldingsReportsResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let mut message: domain::RecordHoldingsReportsRequest = self.as_domain(params)?;
+        let bound = meridian_pb::bounds::RECORD_HOLDINGS_REPORTS_REQUEST_REPORTS_COUNT;
+        if !bound.admits(message.reports.len()) {
+            let refusal = format!(
+                "reports holds {} rows; a batch is {} to {}",
+                message.reports.len(),
+                bound.least,
+                bound.most
+            );
+            self.note_refusal(&refusal);
+            return Err(Status::invalid_argument(refusal));
+        }
+        for (i0, held0) in message.reports.iter().enumerate() {
+            if let Some(held1) = held0.meta.as_ref() {
+                for (i2, held2) in held1.subjects.iter().enumerate() {
+                    self.known(&format!("reports[{i0}].meta.subjects[{i2}].role"), held2.role, domain::SubjectRole::try_from(held2.role).is_ok())?;
+                }
+                for (i2, held2) in held1.source_times.iter().enumerate() {
+                    self.known(&format!("reports[{i0}].meta.source_times[{i2}].kind"), held2.kind, domain::SourceTimeKind::try_from(held2.kind).is_ok())?;
+                }
+                if let Some(held2) = held1.closed_day.as_ref() {
+                    self.known(&format!("reports[{i0}].meta.closed_day.reason"), held2.reason, domain::DateCheckReason::try_from(held2.reason).is_ok())?;
+                }
+                self.known(&format!("reports[{i0}].meta.quality"), held1.quality, domain::QualityState::try_from(held1.quality).is_ok())?;
+                for (i2, &value) in held1.quality_reasons.iter().enumerate() {
+                    self.known(&format!("reports[{i0}].meta.quality_reasons[{i2}]"), value, domain::QualityReason::try_from(value).is_ok())?;
+                }
+            }
+            self.known(&format!("reports[{i0}].kind"), held0.kind, domain::HoldingsReportKind::try_from(held0.kind).is_ok())?;
+        }
+        for stamped0 in message.reports.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            let stamped2 = stamped1.source.get_or_insert_with(Default::default);
+            stamped2.instance = self.instance_id().to_string();
+            stamped2.plugin_version = Default::default();
+        }
+        for stamped0 in message.reports.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            stamped1.sent_at_ns = Default::default();
+        }
+        for stamped0 in message.reports.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            for stamped2 in stamped1.series_key.iter_mut() {
+                stamped2.valid_from_ns = Default::default();
+                stamped2.valid_until_ns = Default::default();
+            }
+        }
+        let account = None;
+        self.command_typed("platform.lake.command.record-holdings-reports", "meridian.v1.RecordHoldingsReportsRequest", message, account, acting_for).await
+    }
+
+    /// W10.4: `platform.lake.command.record-holdings` (preview).
+    async fn record_holdings(
+        &self,
+        request: Request<plugin::RecordHoldingsParams>,
+    ) -> Result<Response<plugin::RecordHoldingsResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let mut message: domain::RecordHoldingsRequest = self.as_domain(params)?;
+        let bound = meridian_pb::bounds::RECORD_HOLDINGS_REQUEST_HOLDINGS_COUNT;
+        if !bound.admits(message.holdings.len()) {
+            let refusal = format!(
+                "holdings holds {} rows; a batch is {} to {}",
+                message.holdings.len(),
+                bound.least,
+                bound.most
+            );
+            self.note_refusal(&refusal);
+            return Err(Status::invalid_argument(refusal));
+        }
+        for (i0, held0) in message.holdings.iter().enumerate() {
+            if let Some(held1) = held0.meta.as_ref() {
+                for (i2, held2) in held1.subjects.iter().enumerate() {
+                    self.known(&format!("holdings[{i0}].meta.subjects[{i2}].role"), held2.role, domain::SubjectRole::try_from(held2.role).is_ok())?;
+                }
+                for (i2, held2) in held1.source_times.iter().enumerate() {
+                    self.known(&format!("holdings[{i0}].meta.source_times[{i2}].kind"), held2.kind, domain::SourceTimeKind::try_from(held2.kind).is_ok())?;
+                }
+                if let Some(held2) = held1.closed_day.as_ref() {
+                    self.known(&format!("holdings[{i0}].meta.closed_day.reason"), held2.reason, domain::DateCheckReason::try_from(held2.reason).is_ok())?;
+                }
+                self.known(&format!("holdings[{i0}].meta.quality"), held1.quality, domain::QualityState::try_from(held1.quality).is_ok())?;
+                for (i2, &value) in held1.quality_reasons.iter().enumerate() {
+                    self.known(&format!("holdings[{i0}].meta.quality_reasons[{i2}]"), value, domain::QualityReason::try_from(value).is_ok())?;
+                }
+            }
+            if let Some(held1) = held0.quantity.as_ref() {
+                self.exact(&format!("holdings[{i0}].quantity.value"), held1.value.as_ref())?;
+                self.known(&format!("holdings[{i0}].quantity.unit"), held1.unit, domain::ValueUnit::try_from(held1.unit).is_ok())?;
+            }
+            self.exact_money(&format!("holdings[{i0}].market_value"), held0.market_value.as_ref())?;
+            if let Some(held1) = held0.percent_of_class.as_ref() {
+                self.exact(&format!("holdings[{i0}].percent_of_class.value"), held1.value.as_ref())?;
+                self.known(&format!("holdings[{i0}].percent_of_class.unit"), held1.unit, domain::ValueUnit::try_from(held1.unit).is_ok())?;
+            }
+        }
+        for stamped0 in message.holdings.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            let stamped2 = stamped1.source.get_or_insert_with(Default::default);
+            stamped2.instance = self.instance_id().to_string();
+            stamped2.plugin_version = Default::default();
+        }
+        for stamped0 in message.holdings.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            stamped1.sent_at_ns = Default::default();
+        }
+        for stamped0 in message.holdings.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            for stamped2 in stamped1.series_key.iter_mut() {
+                stamped2.valid_from_ns = Default::default();
+                stamped2.valid_until_ns = Default::default();
+            }
+        }
+        let account = None;
+        self.command_typed("platform.lake.command.record-holdings", "meridian.v1.RecordHoldingsRequest", message, account, acting_for).await
+    }
+
+    /// W10.6: `platform.lake.query.list-holdings` (preview).
+    async fn list_holdings(
+        &self,
+        request: Request<plugin::ListHoldingsParams>,
+    ) -> Result<Response<plugin::ListHoldingsResult>, Status> {
+        let message: domain::ListHoldingsRequest = self.as_domain(request.into_inner())?;
+        for (i0, held0) in message.subjects.iter().enumerate() {
+            self.known(&format!("subjects[{i0}].role"), held0.role, domain::SubjectRole::try_from(held0.role).is_ok())?;
+        }
+        for &value in &message.kinds {
+            self.known("kinds", value, domain::HoldingsReportKind::try_from(value).is_ok())?;
+        }
+        let account = None;
+        self.call_typed("platform.lake.query.list-holdings", "meridian.v1.ListHoldingsRequest", message, account, None).await
+    }
+
+    /// W10.4: `platform.lake.command.record-corporate-actions` (preview).
+    async fn record_corporate_actions(
+        &self,
+        request: Request<plugin::RecordCorporateActionsParams>,
+    ) -> Result<Response<plugin::RecordCorporateActionsResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let mut message: domain::RecordCorporateActionsRequest = self.as_domain(params)?;
+        let bound = meridian_pb::bounds::RECORD_CORPORATE_ACTIONS_REQUEST_ACTIONS_COUNT;
+        if !bound.admits(message.actions.len()) {
+            let refusal = format!(
+                "actions holds {} rows; a batch is {} to {}",
+                message.actions.len(),
+                bound.least,
+                bound.most
+            );
+            self.note_refusal(&refusal);
+            return Err(Status::invalid_argument(refusal));
+        }
+        for (i0, held0) in message.actions.iter().enumerate() {
+            if let Some(held1) = held0.meta.as_ref() {
+                for (i2, held2) in held1.subjects.iter().enumerate() {
+                    self.known(&format!("actions[{i0}].meta.subjects[{i2}].role"), held2.role, domain::SubjectRole::try_from(held2.role).is_ok())?;
+                }
+                for (i2, held2) in held1.source_times.iter().enumerate() {
+                    self.known(&format!("actions[{i0}].meta.source_times[{i2}].kind"), held2.kind, domain::SourceTimeKind::try_from(held2.kind).is_ok())?;
+                }
+                if let Some(held2) = held1.closed_day.as_ref() {
+                    self.known(&format!("actions[{i0}].meta.closed_day.reason"), held2.reason, domain::DateCheckReason::try_from(held2.reason).is_ok())?;
+                }
+                self.known(&format!("actions[{i0}].meta.quality"), held1.quality, domain::QualityState::try_from(held1.quality).is_ok())?;
+                for (i2, &value) in held1.quality_reasons.iter().enumerate() {
+                    self.known(&format!("actions[{i0}].meta.quality_reasons[{i2}]"), value, domain::QualityReason::try_from(value).is_ok())?;
+                }
+            }
+            self.known(&format!("actions[{i0}].kind"), held0.kind, domain::CorporateActionKind::try_from(held0.kind).is_ok())?;
+            self.exact_money(&format!("actions[{i0}].amount_per_share"), held0.amount_per_share.as_ref())?;
+        }
+        for stamped0 in message.actions.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            let stamped2 = stamped1.source.get_or_insert_with(Default::default);
+            stamped2.instance = self.instance_id().to_string();
+            stamped2.plugin_version = Default::default();
+        }
+        for stamped0 in message.actions.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            stamped1.sent_at_ns = Default::default();
+        }
+        for stamped0 in message.actions.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            for stamped2 in stamped1.series_key.iter_mut() {
+                stamped2.valid_from_ns = Default::default();
+                stamped2.valid_until_ns = Default::default();
+            }
+        }
+        let account = None;
+        self.command_typed("platform.lake.command.record-corporate-actions", "meridian.v1.RecordCorporateActionsRequest", message, account, acting_for).await
+    }
+
+    /// W10.6: `platform.lake.query.list-corporate-actions` (preview).
+    async fn list_corporate_actions(
+        &self,
+        request: Request<plugin::ListCorporateActionsParams>,
+    ) -> Result<Response<plugin::ListCorporateActionsResult>, Status> {
+        let message: domain::ListCorporateActionsRequest = self.as_domain(request.into_inner())?;
+        for (i0, held0) in message.subjects.iter().enumerate() {
+            self.known(&format!("subjects[{i0}].role"), held0.role, domain::SubjectRole::try_from(held0.role).is_ok())?;
+        }
+        for &value in &message.kinds {
+            self.known("kinds", value, domain::CorporateActionKind::try_from(value).is_ok())?;
+        }
+        let account = None;
+        self.call_typed("platform.lake.query.list-corporate-actions", "meridian.v1.ListCorporateActionsRequest", message, account, None).await
+    }
+
+    /// W10.4: `platform.lake.command.record-rating-actions` (preview).
+    async fn record_rating_actions(
+        &self,
+        request: Request<plugin::RecordRatingActionsParams>,
+    ) -> Result<Response<plugin::RecordRatingActionsResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let mut message: domain::RecordRatingActionsRequest = self.as_domain(params)?;
+        let bound = meridian_pb::bounds::RECORD_RATING_ACTIONS_REQUEST_ACTIONS_COUNT;
+        if !bound.admits(message.actions.len()) {
+            let refusal = format!(
+                "actions holds {} rows; a batch is {} to {}",
+                message.actions.len(),
+                bound.least,
+                bound.most
+            );
+            self.note_refusal(&refusal);
+            return Err(Status::invalid_argument(refusal));
+        }
+        for (i0, held0) in message.actions.iter().enumerate() {
+            if let Some(held1) = held0.meta.as_ref() {
+                for (i2, held2) in held1.subjects.iter().enumerate() {
+                    self.known(&format!("actions[{i0}].meta.subjects[{i2}].role"), held2.role, domain::SubjectRole::try_from(held2.role).is_ok())?;
+                }
+                for (i2, held2) in held1.source_times.iter().enumerate() {
+                    self.known(&format!("actions[{i0}].meta.source_times[{i2}].kind"), held2.kind, domain::SourceTimeKind::try_from(held2.kind).is_ok())?;
+                }
+                if let Some(held2) = held1.closed_day.as_ref() {
+                    self.known(&format!("actions[{i0}].meta.closed_day.reason"), held2.reason, domain::DateCheckReason::try_from(held2.reason).is_ok())?;
+                }
+                self.known(&format!("actions[{i0}].meta.quality"), held1.quality, domain::QualityState::try_from(held1.quality).is_ok())?;
+                for (i2, &value) in held1.quality_reasons.iter().enumerate() {
+                    self.known(&format!("actions[{i0}].meta.quality_reasons[{i2}]"), value, domain::QualityReason::try_from(value).is_ok())?;
+                }
+            }
+            self.known(&format!("actions[{i0}].action"), held0.action, domain::RatingActionKind::try_from(held0.action).is_ok())?;
+        }
+        for stamped0 in message.actions.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            let stamped2 = stamped1.source.get_or_insert_with(Default::default);
+            stamped2.instance = self.instance_id().to_string();
+            stamped2.plugin_version = Default::default();
+        }
+        for stamped0 in message.actions.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            stamped1.sent_at_ns = Default::default();
+        }
+        for stamped0 in message.actions.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            for stamped2 in stamped1.series_key.iter_mut() {
+                stamped2.valid_from_ns = Default::default();
+                stamped2.valid_until_ns = Default::default();
+            }
+        }
+        let account = None;
+        self.command_typed("platform.lake.command.record-rating-actions", "meridian.v1.RecordRatingActionsRequest", message, account, acting_for).await
+    }
+
+    /// W10.6: `platform.lake.query.list-rating-actions` (preview).
+    async fn list_rating_actions(
+        &self,
+        request: Request<plugin::ListRatingActionsParams>,
+    ) -> Result<Response<plugin::ListRatingActionsResult>, Status> {
+        let message: domain::ListRatingActionsRequest = self.as_domain(request.into_inner())?;
+        for (i0, held0) in message.subjects.iter().enumerate() {
+            self.known(&format!("subjects[{i0}].role"), held0.role, domain::SubjectRole::try_from(held0.role).is_ok())?;
+        }
+        for &value in &message.kinds {
+            self.known("kinds", value, domain::RatingActionKind::try_from(value).is_ok())?;
+        }
+        let account = None;
+        self.call_typed("platform.lake.query.list-rating-actions", "meridian.v1.ListRatingActionsRequest", message, account, None).await
+    }
+
+    /// W10.12: `platform.lake.command.record-quality-assessments` (preview).
+    async fn record_quality_assessments(
+        &self,
+        request: Request<plugin::RecordQualityAssessmentsParams>,
+    ) -> Result<Response<plugin::RecordQualityAssessmentsResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let mut message: domain::RecordQualityAssessmentsRequest = self.as_domain(params)?;
+        let bound = meridian_pb::bounds::RECORD_QUALITY_ASSESSMENTS_REQUEST_ASSESSMENTS_COUNT;
+        if !bound.admits(message.assessments.len()) {
+            let refusal = format!(
+                "assessments holds {} rows; a batch is {} to {}",
+                message.assessments.len(),
+                bound.least,
+                bound.most
+            );
+            self.note_refusal(&refusal);
+            return Err(Status::invalid_argument(refusal));
+        }
+        for (i0, held0) in message.assessments.iter().enumerate() {
+            self.known(&format!("assessments[{i0}].state"), held0.state, domain::QualityState::try_from(held0.state).is_ok())?;
+            for (i1, &value) in held0.reasons.iter().enumerate() {
+                self.known(&format!("assessments[{i0}].reasons[{i1}]"), value, domain::QualityReason::try_from(value).is_ok())?;
+            }
+        }
+        for stamped0 in message.assessments.iter_mut() {
+            stamped0.assessed_by_instance = self.instance_id().to_string();
+        }
+        let account = None;
+        self.command_typed("platform.lake.command.record-quality-assessments", "meridian.v1.RecordQualityAssessmentsRequest", message, account, acting_for).await
+    }
+
+    /// W6.38: `platform.config.query.read-stale-reference-actions-permitted` (preview).
+    async fn read_stale_reference_actions_permitted(
+        &self,
+        request: Request<plugin::ReadStaleReferenceActionsPermittedParams>,
+    ) -> Result<Response<plugin::ReadStaleReferenceActionsPermittedResult>, Status> {
+        let message: domain::ReadStaleReferenceActionsPermittedRequest = self.as_domain(request.into_inner())?;
+        let account = None;
+        self.call_typed("platform.config.query.read-stale-reference-actions-permitted", "meridian.v1.ReadStaleReferenceActionsPermittedRequest", message, account, None).await
     }
 
     type ReceiveStream = crate::receive::Deliveries;
@@ -2161,6 +3228,34 @@ pub(crate) const DELIVERED: &[crate::receive::Row] = &[
         topic: "platform.lake.{dataset}.event.liveness-recorded",
         payload_type: "meridian.v1.LivenessRecordedEvent",
         read: liveness_recorded,
+    },
+    crate::receive::Row {
+        name: "StatisticsRecorded",
+        step: "W10.5",
+        topic: "platform.lake.{dataset}.event.statistics-recorded",
+        payload_type: "meridian.v1.StatisticsRecordedEvent",
+        read: statistics_recorded,
+    },
+    crate::receive::Row {
+        name: "LifecycleEventRecorded",
+        step: "W9.19",
+        topic: "platform.book.event.lifecycle-event-recorded",
+        payload_type: "meridian.v1.LifecycleEventRecordedEvent",
+        read: lifecycle_event_recorded,
+    },
+    crate::receive::Row {
+        name: "FilingsRecorded",
+        step: "W10.5",
+        topic: "platform.lake.{dataset}.event.filings-recorded",
+        payload_type: "meridian.v1.FilingsRecordedEvent",
+        read: filings_recorded,
+    },
+    crate::receive::Row {
+        name: "CorporateActionsRecorded",
+        step: "W10.5",
+        topic: "platform.lake.{dataset}.event.corporate-actions-recorded",
+        payload_type: "meridian.v1.CorporateActionsRecordedEvent",
+        read: corporate_actions_recorded,
     },
 ];
 
@@ -2533,5 +3628,53 @@ fn liveness_recorded(payload: &[u8]) -> Result<crate::receive::Read, prost::Deco
         journal: None,
         cause: None,
         item: plugin::delivery::Item::LivenessRecorded(message),
+    })
+}
+
+/// W10.5: a StatisticsRecordedEvent, conflated, unscoped.
+fn statistics_recorded(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeError> {
+    let message = plugin::StatisticsRecordedEvent::decode(payload)?;
+    Ok(crate::receive::Read {
+        account: None,
+        directed: Vec::new(),
+        journal: None,
+        cause: None,
+        item: plugin::delivery::Item::StatisticsRecorded(message),
+    })
+}
+
+/// W9.19: a LifecycleEventRecordedEvent, its account at `event.account_id`.
+fn lifecycle_event_recorded(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeError> {
+    let message = plugin::LifecycleEventRecordedEvent::decode(payload)?;
+    Ok(crate::receive::Read {
+        account: Some(message.event.as_ref().map(|held| held.account_id.clone()).unwrap_or_default()),
+        directed: Vec::new(),
+        journal: message.journal.clone(),
+        cause: message.cause.clone(),
+        item: plugin::delivery::Item::LifecycleEventRecorded(message),
+    })
+}
+
+/// W10.5: a FilingsRecordedEvent, unconflated, unscoped.
+fn filings_recorded(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeError> {
+    let message = plugin::FilingsRecordedEvent::decode(payload)?;
+    Ok(crate::receive::Read {
+        account: None,
+        directed: Vec::new(),
+        journal: None,
+        cause: None,
+        item: plugin::delivery::Item::FilingsRecorded(message),
+    })
+}
+
+/// W10.5: a CorporateActionsRecordedEvent, unconflated, unscoped.
+fn corporate_actions_recorded(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeError> {
+    let message = plugin::CorporateActionsRecordedEvent::decode(payload)?;
+    Ok(crate::receive::Read {
+        account: None,
+        directed: Vec::new(),
+        journal: None,
+        cause: None,
+        item: plugin::delivery::Item::CorporateActionsRecorded(message),
     })
 }

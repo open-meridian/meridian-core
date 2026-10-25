@@ -263,6 +263,7 @@ fn watermark(heads: &BTreeMap<String, u64>, datasets: &BTreeSet<String>) -> Wate
 fn subject_ref(subject: &str) -> Option<SubjectRef> {
     (!subject.is_empty()).then(|| SubjectRef {
         entity_id: subject.to_string(),
+        ..Default::default()
     })
 }
 
@@ -1244,6 +1245,7 @@ impl Lake {
                             .iter()
                             .map(|s| SubjectRef {
                                 entity_id: s.clone(),
+                                ..Default::default()
                             })
                             .collect(),
                         kinds: kinds.clone(),

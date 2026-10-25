@@ -33,6 +33,13 @@ pub fn class_of(kind: InstrumentType) -> Option<AssetClass> {
         InstrumentType::InterestRate | InstrumentType::RateCurve | InstrumentType::Index => {
             Some(AssetClass::Referential)
         }
+        // Contract v28, listed options and futures: one series or contract
+        // month a record under derivative; the commodity a future is written
+        // on, referential and never held (ruling 577).
+        InstrumentType::ListedOption | InstrumentType::Future | InstrumentType::FutureOption => {
+            Some(AssetClass::Derivative)
+        }
+        InstrumentType::Commodity => Some(AssetClass::Referential),
     }
 }
 
@@ -66,18 +73,26 @@ pub fn words(kind: InstrumentType) -> &'static str {
         InstrumentType::InterestRate => "interest rate",
         InstrumentType::RateCurve => "rate curve",
         InstrumentType::Index => "index",
+        InstrumentType::ListedOption => "listed option",
+        InstrumentType::Future => "future",
+        InstrumentType::FutureOption => "future option",
+        InstrumentType::Commodity => "commodity",
     }
 }
 
 /// Every type the list holds, in its order: what a refusal lists. From
 /// contract v27 the referential types too (W1.1), which the platform seeds
 /// and no deployment's form offers.
-pub const TYPES: [InstrumentType; 5] = [
+pub const TYPES: [InstrumentType; 9] = [
     InstrumentType::MoneyMarketFund,
     InstrumentType::BinaryEventContract,
     InstrumentType::InterestRate,
     InstrumentType::RateCurve,
     InstrumentType::Index,
+    InstrumentType::ListedOption,
+    InstrumentType::Future,
+    InstrumentType::FutureOption,
+    InstrumentType::Commodity,
 ];
 
 /// A type by its name without the prefix, in lower case

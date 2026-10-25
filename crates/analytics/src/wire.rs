@@ -54,6 +54,7 @@ fn figure(figure: &Figure) -> Result<WireFigure, String> {
                 .unwrap_or(0),
             business_date: figure.scenario.business_date.clone(),
             outcome_instrument_id: figure.scenario.outcome_instrument_id.clone(),
+            ..Default::default()
         }),
         value: decimal(&figure.value)?,
         numerator: decimal(&figure.numerator)?,
@@ -61,6 +62,7 @@ fn figure(figure: &Figure) -> Result<WireFigure, String> {
         currency_instrument_id: figure.currency_instrument_id.clone(),
         computed_as: ComputedAs::Exact as i32,
         oldest_input_source_ns: 0,
+        series_key: Vec::new(),
     })
 }
 
@@ -75,6 +77,7 @@ fn unevaluated(entry: &Unevaluated) -> NotEvaluated {
         detail: entry.detail.clone(),
         age_ns: 0,
         ceiling_ns: 0,
+        series_key: Vec::new(),
     }
 }
 
@@ -220,6 +223,7 @@ pub fn execution_costs(
                 meta: Some(ObservationMeta {
                     subjects: vec![SubjectRef {
                         entity_id: instrument.clone(),
+                        ..Default::default()
                     }],
                     business_date: trade_date.clone(),
                     ..Default::default()

@@ -539,6 +539,7 @@ pub fn resolve(
                     .iter()
                     .map(|id| SubjectRef {
                         entity_id: id.clone(),
+                        ..Default::default()
                     })
                     .collect(),
                 after_watermark: None,
@@ -1054,6 +1055,7 @@ fn mids_at(
                     .iter()
                     .map(|s| SubjectRef {
                         entity_id: s.clone(),
+                        ..Default::default()
                     })
                     .collect(),
                 kinds: vec![PriceKind::Mid as i32],
@@ -1253,6 +1255,7 @@ fn prices(
                     .iter()
                     .map(|s| SubjectRef {
                         entity_id: s.clone(),
+                        ..Default::default()
                     })
                     .collect(),
                 kinds: kinds.to_vec(),
@@ -1342,6 +1345,7 @@ fn history(
                             .iter()
                             .map(|s| SubjectRef {
                                 entity_id: s.clone(),
+                                ..Default::default()
                             })
                             .collect(),
                         kinds: vec![kind],

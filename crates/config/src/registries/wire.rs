@@ -232,6 +232,10 @@ pub fn listing(value: &Value, at: &str) -> Result<PluginListing, String> {
         support_url: text(value, "support_url"),
         support_email: text(value, "support_email"),
         prices: Vec::new(),
+        // Contract v28 (W8.16): the listing that replaces it, or empty.
+        replaced_by: Some(text(value, "replaced_by"))
+            .filter(|successor| is_listing(successor))
+            .unwrap_or_default(),
     })
 }
 

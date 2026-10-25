@@ -43,6 +43,7 @@ fn price(subject: &str, kind: PriceKind, amount: &str, instrument: &str, dataset
         meta: Some(ObservationMeta {
             subjects: vec![SubjectRef {
                 entity_id: subject.into(),
+                ..Default::default()
             }],
             source: Some(Source {
                 dataset: dataset.into(),
@@ -329,6 +330,9 @@ fn job(measures: &[(&str, &[&str], &str)]) -> RunJobRequest {
             inputs: None,
             business_date: String::new(),
             reporting_currency: String::new(),
+            chains: Vec::new(),
+            scenario_set: None,
+            scenario_ref: None,
             measures: measures
                 .iter()
                 .map(|(definition, breakdowns, group)| MeasureRef {

@@ -122,7 +122,7 @@ const MAP_VENUE_ACCOUNT: &str = "platform.config.command.map-venue-account";
 /// to the person's write access where it acts for one, which the book checks
 /// the record's account against. The generated operations hand these no
 /// account; a test holds this list to them.
-pub(crate) const BY_ID_ALONE: [&str; 22] = [
+pub(crate) const BY_ID_ALONE: [&str; 25] = [
     "meridian.v1.RequestOrderChangeRequest",
     "meridian.v1.RecordCheckRequest",
     "meridian.v1.DecideApprovalRequest",
@@ -152,6 +152,12 @@ pub(crate) const BY_ID_ALONE: [&str; 22] = [
     // named by the placement.
     "meridian.v1.ReportPlacementQuoteRequest",
     "meridian.v1.PickPlacementQuoteRequest",
+    // Contract v28 (W9.16 to W9.18): a lifecycle event names its account
+    // inside the event, each event's held to the scope; a release names
+    // the proposed event by its ID.
+    "meridian.v1.RecordLifecycleEventRequest",
+    "meridian.v1.ProposeLifecycleEventsRequest",
+    "meridian.v1.ReleaseLifecycleEventRequest",
 ];
 
 /// The venue facts stamped from the venue account map (matrix/stamped.tsv's

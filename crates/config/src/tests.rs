@@ -788,7 +788,10 @@ async fn the_last_permission_to_deployment_admin_cannot_be_withdrawn() {
                 h,
                 WITHDRAW_PERMISSION,
                 "meridian.v1.WithdrawPermissionRequest",
-                WithdrawPermissionRequest { permission_id: id },
+                WithdrawPermissionRequest {
+                    permission_id: id,
+                    note: "no longer needed".into(),
+                },
             )
             .await
             .unwrap()
@@ -2830,6 +2833,7 @@ async fn all_plugins_admin_and_all_accounts_are_built_in() {
         "meridian.v1.WithdrawPermissionRequest",
         WithdrawPermissionRequest {
             permission_id: linked.permission_id,
+            note: "no longer needed".into(),
         },
     )
     .await
@@ -3152,6 +3156,7 @@ async fn every_grant_change_is_its_own_record_naming_who_and_when() {
         "meridian.v1.WithdrawPermissionRequest",
         WithdrawPermissionRequest {
             permission_id: permission.permission_id.clone(),
+            note: "no longer needed".into(),
         },
     )
     .await

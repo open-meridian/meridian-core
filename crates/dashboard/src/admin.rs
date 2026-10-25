@@ -2330,6 +2330,8 @@ async fn withdraw(
     admin_form!(app, headers, fields, session, {
         let request = WithdrawPermissionRequest {
             permission_id: field(&fields, "permission_id").into(),
+            // Contract v28 (W6.7): why, on the withdrawal's own record.
+            note: field(&fields, "note").trim().into(),
         };
         let reply: Result<WithdrawPermissionReply, String> = command(
             &app,

@@ -110,6 +110,22 @@ pub fn templates_from_json(
                             .get("required")
                             .and_then(|required| required.as_bool())
                             .unwrap_or(false),
+                        // Contract v28 (574): the level, read from required
+                        // on a version before it.
+                        requirement: meridian_domain::template::requirement_of(
+                            field
+                                .get("requirement")
+                                .and_then(|level| level.as_str())
+                                .unwrap_or_default(),
+                            field
+                                .get("required")
+                                .and_then(|required| required.as_bool())
+                                .unwrap_or(false),
+                        ) as i32,
+                        repeated: field
+                            .get("repeated")
+                            .and_then(|repeated| repeated.as_bool())
+                            .unwrap_or(false),
                     })
                     .collect()
             })
@@ -141,6 +157,12 @@ pub fn templates_from_json(
             calculation_package: meridian_domain::template::package_from_json(
                 item.get("calculation_package"),
             )?,
+            // Contract v28 (579): withdrawn, and the version new mints use.
+            withdrawn: item
+                .get("withdrawn")
+                .and_then(|withdrawn| withdrawn.as_bool())
+                .unwrap_or(false),
+            successor_version: text("successor_version"),
         });
     }
     Ok(out)
@@ -1887,18 +1909,21 @@ mod tests {
                 instrument_id: "INS-A".into(),
                 replaced_by: "INS-B".into(),
                 decommissioned: false,
+                expired: false,
             },
             meridian_domain::v1::ReplacementFeedEntry {
                 sequence: 1044,
                 instrument_id: "INS-NOT-HELD".into(),
                 replaced_by: "INS-D".into(),
                 decommissioned: false,
+                expired: false,
             },
             meridian_domain::v1::ReplacementFeedEntry {
                 sequence: 1045,
                 instrument_id: "INS-C".into(),
                 replaced_by: String::new(),
                 decommissioned: true,
+                expired: false,
             },
         ];
         let applied = apply_feed(&store, &entries, NOW + 5).unwrap();

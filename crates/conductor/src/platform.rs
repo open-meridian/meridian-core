@@ -45,9 +45,9 @@ use std::time::Duration;
 use meridian_domain::asset_class;
 use meridian_domain::v1::{
     AssetClass, ClaimCodePurpose, DiagnosticBundle, DiagnosticBundleReceipt,
-    EscalateInstrumentReply, EscalateInstrumentRequest, Identifier as PbIdentifier,
-    InstrumentRecord as PbInstrument, LicenceList, LicencePace, RedeemClaimCodeReply,
-    ReplacementFeedEntry, SecurityTemplate, VenueRecord,
+    EscalateInstrumentReply, EscalateInstrumentRequest, FieldRequirement,
+    Identifier as PbIdentifier, InstrumentRecord as PbInstrument, LicenceList, LicencePace,
+    RedeemClaimCodeReply, ReplacementFeedEntry, SecurityTemplate, VenueRecord,
 };
 use serde::Deserialize;
 
@@ -1011,13 +1011,28 @@ pub fn templates_from_json(value: &serde_json::Value) -> Result<Vec<SecurityTemp
                 .map(|fields| {
                     fields
                         .iter()
-                        .map(|field| meridian_domain::v1::TemplateField {
-                            path: text_of(field.get("path")),
-                            r#type: text_of(field.get("type")),
-                            required: field
+                        .map(|field| {
+                            let required = field
                                 .get("required")
                                 .and_then(|r| r.as_bool())
-                                .unwrap_or(false),
+                                .unwrap_or(false);
+                            // Contract v28 (574): the requirement level by its
+                            // word or enum name; a version before it reads
+                            // required as mint and its absence as optional.
+                            let requirement = meridian_domain::template::requirement_of(
+                                &text_of(field.get("requirement")),
+                                required,
+                            );
+                            meridian_domain::v1::TemplateField {
+                                path: text_of(field.get("path")),
+                                r#type: text_of(field.get("type")),
+                                required: required || requirement == FieldRequirement::Mint,
+                                requirement: requirement as i32,
+                                repeated: field
+                                    .get("repeated")
+                                    .and_then(|r| r.as_bool())
+                                    .unwrap_or(false),
+                            }
                         })
                         .collect()
                 })
@@ -1027,6 +1042,13 @@ pub fn templates_from_json(value: &serde_json::Value) -> Result<Vec<SecurityTemp
                 .and_then(|rule| rule.as_array())
                 .map(|rule| rule.iter().map(|scheme| text_of(Some(scheme))).collect())
                 .unwrap_or_default(),
+            // Contract v28 (579): a withdrawn version, readable and
+            // runnable, names the version new mints use.
+            withdrawn: item
+                .get("withdrawn")
+                .and_then(|w| w.as_bool())
+                .unwrap_or(false),
+            successor_version: text_of(item.get("successor_version")),
             template_id,
         });
     }
@@ -1096,6 +1118,11 @@ pub fn replacements_from_json(
                 replaced_by: text_of(entry.get("replaced_by")),
                 decommissioned: entry
                     .get("decommissioned")
+                    .and_then(|d| d.as_bool())
+                    .unwrap_or(false),
+                // Contract v28 (579): a series past its last lifecycle date.
+                expired: entry
+                    .get("expired")
                     .and_then(|d| d.as_bool())
                     .unwrap_or(false),
             })
