@@ -306,15 +306,16 @@ pub fn rows(notices: &[Notice]) -> String {
     let lines: String = notices
         .iter()
         .map(|notice| {
-            let (badge, tone) = match notice.kind.as_str() {
-                "latency_breached" => ("Latency breached", "warn"),
-                "backlog_breached" => ("Backlog breached", "warn"),
-                "latency_recovered" => ("Latency recovered", "ok"),
-                _ => ("Backlog recovered", "ok"),
+            // One word a badge, so it fits a phone; the series, and backlog
+            // or p99, in the line beside it.
+            let (badge, tone) = if notice.kind.ends_with("breached") {
+                ("Breached", " warn")
+            } else {
+                ("Recovered", "")
             };
             format!(
-                "<tr data-kind=\"{kind}\" data-plugin=\"{instance}\"><td><span class=\"badge {tone}\">{badge}</span></td>\
-                 <td title=\"{about}\"><a href=\"/admin/plugins/{instance}\">{instance}</a> {about}</td>\
+                "<tr data-kind=\"{kind}\" data-plugin=\"{instance}\"><td><span class=\"badge{tone}\" title=\"{kind}\">{badge}</span></td>\
+                 <td title=\"{instance}: {about}\"><strong>{instance}</strong> {about}</td>\
                  <td>{when}</td></tr>",
                 kind = escape(&notice.kind),
                 instance = escape(&notice.plugin_instance_id),
@@ -510,8 +511,8 @@ mod tests {
         assert_eq!(ola.len(), 2);
         assert_eq!(ola[0].notice_id, "N03", "newest first");
         let drawn = rows(&ola);
-        assert!(drawn.contains("Latency breached"), "{drawn}");
-        assert!(drawn.contains("href=\"/admin/plugins/fix-1\""));
+        assert!(drawn.contains(">Breached<"), "{drawn}");
+        assert!(drawn.contains("<strong>fix-1</strong>"), "{drawn}");
         assert_eq!(json(&ola[0])["kind"], "latency_breached");
     }
 }

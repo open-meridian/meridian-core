@@ -1980,6 +1980,58 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
                 );
             }
         }
+        // Contract v28 (W4.16; rulings 427 and 606): the instance's session
+        // over its ceiling for three minutes, an episode open on its
+        // Summary, and its notices, opened and an earlier one closed, in the
+        // Inbox.
+        let minute = 60_000_000_000_i64;
+        let start = (now / minute - 4) * minute;
+        for (i, ms) in [40_i64, 2_300, 2_400, 2_350].iter().enumerate() {
+            let mut rtt = meridian_domain::latency::Histogram::default();
+            for _ in 0..12 {
+                rtt.record(ms * 1_000_000);
+            }
+            meridian_domain::latency::monitor().merge(
+                meridian_domain::latency::Key {
+                    instance: INSTANCE.into(),
+                    scope: meridian_domain::latency::Scope::Session {
+                        session: "snaptrade-api".into(),
+                        metric: "LATENCY_METRIC_RTT".into(),
+                    },
+                },
+                start + i as i64 * minute + 1,
+                &rtt,
+                meridian_domain::latency::Said {
+                    ceiling_ns: 250_000_000,
+                    alive_at_ns: now,
+                    ..Default::default()
+                },
+            );
+        }
+        let judged = meridian_domain::latency::monitor().judge(now);
+        let store = Arc::new(crate::latency::notices::InMemory::default());
+        let mut notices: Vec<crate::latency::notices::Notice> = judged
+            .iter()
+            .enumerate()
+            .map(|(n, t)| crate::latency::notices::Notice {
+                notice_id: format!("01JLAT{n:020}"),
+                subject: ADMIN.into(),
+                plugin_instance_id: t.key.instance.clone(),
+                kind: t.kind.into(),
+                about: crate::latency::notices::about(t),
+                changed_ns: now,
+            })
+            .collect();
+        notices.push(crate::latency::notices::Notice {
+            notice_id: "01JLAT0000000000000000000".into(),
+            subject: ADMIN.into(),
+            plugin_instance_id: "lake-1".into(),
+            kind: "latency_recovered".into(),
+            about: "alpaca-1:quotes at lake: p99 3.2 ms".into(),
+            changed_ns: now - 3_600_000_000_000,
+        });
+        crate::latency::notices::NoticeStore::notify(store.as_ref(), &notices).unwrap();
+        crate::latency::notices::keep_in(store);
     }
     bus.serve(crate::registry::LIST_PLUGIN_USAGE_REPORTS, |_| {
         let count =

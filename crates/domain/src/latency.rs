@@ -308,7 +308,10 @@ impl Monitor {
                 {
                     merged.add(histogram);
                 }
-                if merged.total == 0 && series.last_at_ns < from {
+                // Quiet in the window and no episode open: nothing to say.
+                // An open episode stays read until it closes.
+                let open = series.latency_since != 0 || series.backlog_since != 0;
+                if merged.total == 0 && series.last_at_ns < from && !open {
                     return None;
                 }
                 Some(Read {
