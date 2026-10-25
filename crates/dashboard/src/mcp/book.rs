@@ -220,6 +220,24 @@ read_fx_pivot_currencies does.",
         Area::Accounts,
         fx_pivot_currencies_schema,
     ),
+    // Contract v28 (W6.37; rulings 561, 589): the series request rule, a
+    // deployment admin's; the set preparable, as the FX pivots are.
+    spec(
+        "read_series_request_rule",
+        "Read the series request rule",
+        "which wants for a listed option or future series the deployment does not hold the instrument store asks the platform for with no person: an order's or a proposal's (orders, on by default), a standing want's (standing_wants, off by default), and the most series a day (daily_limit, 500 by default), with the last change and who made it.",
+        true,
+        Area::Accounts,
+        nothing_schema,
+    ),
+    spec(
+        "set_series_request_rule",
+        "Set the series request rule",
+        "set the series request rule: orders and standing_wants true or false, daily_limit 1 to 5,000, with a note saying why, each change its own record (W6.37). Answers the rule as read_series_request_rule does.",
+        false,
+        Area::Accounts,
+        series_request_rule_schema,
+    ),
     // Contract v27 (W10.11; W6.20): one account's execution costs, the
     // lake's rows, a person's at the read level on that account.
     spec(
@@ -353,6 +371,20 @@ fn execution_costs_schema() -> Value {
     })
 }
 
+fn series_request_rule_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "orders": {"type": "boolean", "description": "a series an order or a proposal names is asked for"},
+            "standing_wants": {"type": "boolean", "description": "a standing want's series are asked for"},
+            "daily_limit": {"type": "integer", "minimum": 1, "maximum": 5000, "description": "the most series asked for in a day"},
+            "note": note(),
+        },
+        "required": ["orders", "standing_wants", "daily_limit", "note"],
+        "additionalProperties": false,
+    })
+}
+
 fn fx_pivot_currencies_schema() -> Value {
     json!({
         "type": "object",
@@ -452,6 +484,8 @@ pub async fn call(app: &App, caller: &Caller, spec: &Spec, arguments: Value) -> 
         "list_execution_costs" => list_execution_costs(app, caller, &arguments).await,
         "read_fx_pivot_currencies" => read_fx_pivot_currencies(app, caller).await,
         "set_fx_pivot_currencies" => set_fx_pivot_currencies(app, caller, &arguments).await,
+        "read_series_request_rule" => read_series_request_rule(app, caller).await,
+        "set_series_request_rule" => set_series_request_rule(app, caller, &arguments).await,
         "list_model_routing" => list_model_routing(app, caller).await,
         "set_model_routing" => set_model_routing(app, caller, &arguments).await,
         "close_account" => close_account(app, caller, &arguments).await,
@@ -1178,6 +1212,93 @@ async fn set_fx_pivot_currencies(app: &App, caller: &Caller, arguments: &Value) 
     }
 }
 
+/// W6.37 (contract v28): the series request rule read, a deployment admin's.
+async fn read_series_request_rule(app: &App, caller: &Caller) -> Value {
+    let (_, access) = match access_of(app, caller) {
+        Ok(held) => held,
+        Err(refusal) => return refusal,
+    };
+    if !access.deployment_admin {
+        return refused(
+            "not_permitted",
+            "the series request rule is a deployment admin's to read",
+            Vec::new(),
+        );
+    }
+    match crate::admin::series_rule::read(&app.bus).await {
+        Ok(rule) => json!({"outcome": "unchanged", "data": crate::admin::series_rule::json(&rule)}),
+        Err(failed) => refused("unavailable", &failed, Vec::new()),
+    }
+}
+
+/// W6.37 (contract v28): the series request rule set, a deployment admin's;
+/// the conductor checks the day's limit and keeps the change.
+async fn set_series_request_rule(app: &App, caller: &Caller, arguments: &Value) -> Value {
+    let mut problems = Problems::default();
+    let Some(top) = object(arguments, "", &mut problems) else {
+        return problems.refusal();
+    };
+    only(
+        top,
+        &["orders", "standing_wants", "daily_limit", "note"],
+        "",
+        &mut problems,
+    );
+    let flag = |name: &str, problems: &mut Problems| match top.get(name) {
+        Some(Value::Bool(said)) => *said,
+        None | Some(Value::Null) => {
+            problems.add(name, "required");
+            false
+        }
+        Some(_) => {
+            problems.add(name, "true or false");
+            false
+        }
+    };
+    let orders = flag("orders", &mut problems);
+    let standing_wants = flag("standing_wants", &mut problems);
+    let daily_limit = super::instruments::integer(top, "daily_limit", "", true, &mut problems);
+    if !(1..=i64::from(crate::admin::series_rule::MOST_A_DAY)).contains(&daily_limit) {
+        problems.add("daily_limit", "1 to 5,000 series a day");
+    }
+    let reason = text(top, "note", "", true, &mut problems);
+    if !problems.is_empty() {
+        return problems.refusal();
+    }
+    let (_, access) = match access_of(app, caller) {
+        Ok(held) => held,
+        Err(refusal) => return refusal,
+    };
+    if !access.deployment_admin {
+        return refused(
+            "not_permitted",
+            "the series request rule is a deployment admin's",
+            Vec::new(),
+        );
+    }
+    let reply: Result<meridian_domain::v1::SeriesRequestRule, _> = ask(
+        app,
+        caller,
+        crate::admin::series_rule::SET_SERIES_REQUEST_RULE,
+        "meridian.v1.SetSeriesRequestRuleRequest",
+        meridian_domain::v1::SetSeriesRequestRuleRequest {
+            rule: Some(meridian_domain::v1::SeriesRequestRule {
+                orders,
+                standing_wants,
+                daily_limit: daily_limit as u32,
+                ..Default::default()
+            }),
+            reason,
+        },
+        CHANGING,
+    )
+    .await;
+    match reply {
+        Err(failed) => bus_refused(failed, "rule.daily_limit"),
+        Ok(rule) => json!({"outcome": "made", "data": crate::admin::series_rule::json(&rule)}),
+    }
+}
+
 /// W12.6 (contract v26): the routing table read, a deployment admin's.
 async fn list_model_routing(app: &App, caller: &Caller) -> Value {
     let (_, access) = match access_of(app, caller) {
@@ -1373,6 +1494,12 @@ pub const PARITY: &[(&str, &str)] = &[
         "read_fx_pivot_currencies set_fx_pivot_currencies",
     ),
     ("/admin/fx-pivot-currencies", "set_fx_pivot_currencies"),
+    // Contract v28 (W6.37): the series request rule's tab and its form.
+    (
+        "tab series-rule",
+        "read_series_request_rule set_series_request_rule",
+    ),
+    ("/admin/series-request-rule", "set_series_request_rule"),
     // Contract v27 (W10.11): the lake's execution-cost rows, which a
     // plugin's TCA page draws; core draws no page of its own for them.
     ("lake ExecutionCost rows", "list_execution_costs"),

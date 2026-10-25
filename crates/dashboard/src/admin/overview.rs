@@ -190,6 +190,7 @@ pub fn render(
         Option<&meridian_domain::v1::FxPivotCurrenciesSetting>,
         &std::collections::BTreeMap<String, String>,
     ),
+    series_rule: Option<&meridian_domain::v1::SeriesRequestRule>,
     routing: (
         Option<&meridian_domain::v1::ListModelRoutingReply>,
         Option<&meridian_domain::v1::ListMeasureDefinitionsReply>,
@@ -1051,6 +1052,31 @@ pub fn render(
         format!(
             "{}{order}",
             super::fx_pivots::lines(pivots, pivot_codes, |subject| {
+                crate::tickets::display_name(records, subject)
+            })
+        ),
+    ));
+
+    // ── Series request rule ─────────────────────────────────────────────────
+    // W6.37 (contract v28; rulings 561 and 589): a deployment admin's.
+    let rule_change = dialog(
+        "series-rule-change",
+        "Change the series request rule",
+        "/admin/series-request-rule#series-rule",
+        token,
+        &super::series_rule::fields(series_rule),
+        "Change",
+    );
+    sections.push(section(
+        "series-rule",
+        super::series_rule::LABEL,
+        "Which wants for a listed option or future this deployment does not hold are asked of \
+         the platform with no person, and how many a day. Each change is kept with who made it \
+         and why.",
+        "<button type=\"button\" data-dialog-open=\"series-rule-change\">Change</button>",
+        format!(
+            "{}{rule_change}",
+            super::series_rule::lines(series_rule, |subject| {
                 crate::tickets::display_name(records, subject)
             })
         ),

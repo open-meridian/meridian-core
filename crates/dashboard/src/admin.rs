@@ -80,6 +80,7 @@ pub fn routes() -> Router<Arc<App>> {
         .route(trading::LOCAL_RECORDS_PATH, post(set_local_record_orders))
         .route("/admin/time-zone", post(set_deployment_time_zone))
         .route("/admin/fx-pivot-currencies", post(set_fx_pivot_currencies))
+        .route("/admin/series-request-rule", post(set_series_request_rule))
         .route("/admin/model-routing", post(set_model_routing))
         .route("/admin/data-sources", get(data_sources_page))
         .route("/admin/data-sources/licence", post(set_dataset_licence))
@@ -472,6 +473,7 @@ pub mod holds;
 pub mod instruments;
 pub mod model_routing;
 pub(crate) mod overview;
+pub mod series_rule;
 pub mod time_zone;
 pub(crate) use overview::listing;
 pub mod people;
@@ -589,6 +591,11 @@ async fn admin_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Response
         Ok(setting) => fx_pivots::codes(&app.bus, &setting.fx_pivot_currencies).await,
         Err(_) => Default::default(),
     };
+    // Contract v28 (W6.37): the series request rule, its tab.
+    let series = series_rule::read(&app.bus).await;
+    if let Err(failed) = &series {
+        tracing::warn!(%failed, "the series request rule could not be read");
+    }
     // Contract v26 (W12.6): the analytics routing table, its tab, with the
     // measures the component serves beside it where it answers.
     let routing = model_routing::read(&app.bus).await;
@@ -606,6 +613,7 @@ async fn admin_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Response
         service_accounts,
         zone.as_ref().ok(),
         (pivots.as_ref().ok(), &pivot_codes),
+        series.as_ref().ok(),
         (routing.as_ref().ok(), served.as_ref()),
         &token_input(&session),
         "",
@@ -3479,6 +3487,84 @@ async fn set_fx_pivot_currencies(
 
 /// The FX pivot currencies' act on the surface (W6.36, contract v27).
 const SET_FX_PIVOT_CURRENCIES_TOOL: &str = "dashboard__set_fx_pivot_currencies";
+
+/// W6.37 (contract v28): the series request rule set, a deployment admin's,
+/// with a reason; or prepared for someone to make. The conductor checks the
+/// day's limit and keeps each change its own record.
+async fn set_series_request_rule(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Form(fields): Form<Fields>,
+) -> Response {
+    let back = "/admin#series-rule";
+    let (session, _) = match gate(&app, &headers, true) {
+        Ok(gated) => gated,
+        Err(response) => return *response,
+    };
+    if let Err(response) = form_token_matches(&session, &fields) {
+        return *response;
+    }
+    let note = field(&fields, "note").trim().to_string();
+    if note.is_empty() {
+        return not_done("say why the series request rule changes", back);
+    }
+    let orders = field(&fields, "orders") == "on";
+    let standing_wants = field(&fields, "standing_wants") == "on";
+    let Ok(daily_limit) = field(&fields, "daily_limit").trim().parse::<u32>() else {
+        return not_done("the day's limit is a whole number of series", back);
+    };
+    if !(1..=series_rule::MOST_A_DAY).contains(&daily_limit) {
+        return not_done("the day's limit is 1 to 5,000 series", back);
+    }
+    let posted = prepare_or_gate(
+        &app,
+        &session,
+        &fields,
+        SET_SERIES_REQUEST_RULE_TOOL,
+        || {
+            Ok(serde_json::json!({
+                "orders": orders,
+                "standing_wants": standing_wants,
+                "daily_limit": daily_limit,
+                "note": note,
+            }))
+        },
+    )
+    .await;
+    if let Some(response) = posted_to(posted, back) {
+        return response;
+    }
+    let outcome = app
+        .bus
+        .call_for(
+            series_rule::SET_SERIES_REQUEST_RULE,
+            "meridian.v1.SetSeriesRequestRuleRequest",
+            meridian_domain::v1::SetSeriesRequestRuleRequest {
+                rule: Some(meridian_domain::v1::SeriesRequestRule {
+                    orders,
+                    standing_wants,
+                    daily_limit,
+                    ..Default::default()
+                }),
+                reason: note.clone(),
+            }
+            .encode_to_vec(),
+            None,
+            Some(Duration::from_secs(10)),
+            &session.subject,
+        )
+        .await
+        .map(|_| ())
+        .map_err(said_of_refusal);
+    after_to(
+        outcome,
+        "/admin?done=Series+request+rule+set#series-rule",
+        back,
+    )
+}
+
+/// The series request rule's act on the surface (W6.37, contract v28).
+const SET_SERIES_REQUEST_RULE_TOOL: &str = "dashboard__set_series_request_rule";
 
 /// W12.6 (contract v26): a model id routed, a deployment admin's, with a
 /// reason; or prepared for someone to make. The conductor checks the
