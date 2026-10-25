@@ -387,6 +387,9 @@ message GrantPermissionRequest {
 // who configure no plugin (W6.7).
 message WithdrawPermissionRequest {
   string permission_id = 1;
+  // Contract v28 (W6.7; sdk-contract/withdrawing-a-permission-request-carries-a-note):
+  // why, required, on the withdrawal's own record (decisions/031).
+  string note = 2;
 }
 
 message WithdrawPermissionReply {
