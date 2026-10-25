@@ -135,6 +135,20 @@ pub struct TimeZoneChange {
     pub changed_by: String,
 }
 
+/// A deployment setting as its latest change set it (contract v28): its
+/// value, the message's bytes, and who changed it when.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DeploymentSettingChange {
+    pub value: Vec<u8>,
+    pub changed_at_ns: i64,
+    pub changed_by: String,
+}
+
+/// The series request rule's name among the settings (W6.37).
+pub const SERIES_REQUEST_RULE: &str = "series_request_rule";
+/// The stale-reference actions permitted, by name (W6.38).
+pub const STALE_REFERENCE_ACTIONS_PERMITTED: &str = "stale_reference_actions_permitted";
+
 /// The deployment's FX pivot currencies as their latest change set them
 /// (contract v27, W6.36).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1063,6 +1077,14 @@ pub trait Store: Send + Sync {
 
     /// Every change to the routing table, oldest first.
     fn model_routing_changes(&self) -> Result<Vec<ModelRoutingChange>>;
+
+    /// A deployment setting changed, its own record (contract v28; W6.37,
+    /// W6.38, decisions/031): its name, its value, who, through what, when
+    /// and why.
+    fn set_setting(&self, setting: &str, value: &[u8], author: &Author, at_ns: i64) -> Result<()>;
+
+    /// A setting's latest change, if any: none is its default.
+    fn setting(&self, setting: &str) -> Result<Option<DeploymentSettingChange>>;
 
     /// The usage statistics' setting changed, its own record (contract v24,
     /// W3.28, decisions/031): who, through what, when and why.

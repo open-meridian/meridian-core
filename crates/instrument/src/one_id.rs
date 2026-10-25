@@ -282,11 +282,44 @@ pub fn missing_fields(record: &Instrument, template: &SecurityTemplate) -> Vec<S
         !record.value(field).trim().is_empty()
             || record.offers.iter().any(|offer| offer.field == field)
     };
+    let kind = meridian_domain::instrument_type::read(&record.instrument_type)
+        .unwrap_or(InstrumentType::Unspecified);
+    let listed = matches!(
+        kind,
+        InstrumentType::ListedOption | InstrumentType::Future | InstrumentType::FutureOption
+    );
     template
         .fields
         .iter()
-        .filter(|field| field.required)
+        // Contract v28 (574): a mint or complete field can be missing, an
+        // optional one never; before v28, required.
+        .filter(|field| {
+            match meridian_domain::v1::FieldRequirement::try_from(field.requirement)
+                .unwrap_or(meridian_domain::v1::FieldRequirement::Unspecified)
+            {
+                meridian_domain::v1::FieldRequirement::Mint
+                | meridian_domain::v1::FieldRequirement::Complete => true,
+                meridian_domain::v1::FieldRequirement::Optional => false,
+                meridian_domain::v1::FieldRequirement::Unspecified => field.required,
+            }
+        })
         .filter(|field| match field.path.as_str() {
+            path if listed
+                && ![
+                    "identifiers",
+                    "description",
+                    "currency",
+                    "instrument_type",
+                    "listing_venue_id",
+                ]
+                .contains(&path) =>
+            {
+                meridian_domain::instrument_type::listed_path_missing(
+                    kind,
+                    &record.listed_terms,
+                    path,
+                )
+            }
             "identifiers" => record.held_now().next().is_none(),
             "description" => !held(Field::Description),
             "currency" => !held(Field::Currency),
@@ -589,6 +622,18 @@ fn master_identifiers(master: &InstrumentRecord) -> Vec<Asked> {
 /// it per listing (contract v25, W3.1), set on the record's open identifier
 /// it names; an identifier the master gives none keeps none. True when one
 /// changed.
+/// A listed series' terms as the platform's record states them (contract
+/// v28; rulings 559, 575): taken whole where they differ, an adjustment being
+/// the record's next version with its ID kept. True when they changed.
+pub fn take_listed_terms(record: &mut Instrument, master: &InstrumentRecord) -> bool {
+    let terms = meridian_domain::instrument_type::listed_terms_to_text(master);
+    if terms.is_empty() || terms == record.listed_terms {
+        return false;
+    }
+    record.listed_terms = terms;
+    true
+}
+
 pub fn take_trading_currencies(record: &mut Instrument, master: &InstrumentRecord) -> bool {
     let mut changed = false;
     for held in record.identifiers.iter_mut().filter(|held| held.open()) {
@@ -646,7 +691,8 @@ pub fn keep_platform_record(
         }
         let offered = crate::resolve::keep_offers(&mut held, offers);
         let listed = take_trading_currencies(&mut held, master);
-        if changes.is_empty() && !offered && !listed {
+        let terms = take_listed_terms(&mut held, master);
+        if changes.is_empty() && !offered && !listed && !terms {
             return Ok((held, false));
         }
         held.version = expected + 1;
@@ -701,6 +747,7 @@ pub fn keep_platform_record(
         }
     }
     take_trading_currencies(&mut candidate, master);
+    take_listed_terms(&mut candidate, master);
     if let Some(contract) = &master.binary_event_contract {
         candidate.binary_event_contract =
             meridian_domain::instrument_type::contract_to_text(contract);
@@ -921,6 +968,7 @@ pub fn resolve_to_as(
             // Only what is on the record now travels; windows kept.
             stays.identifiers.retain(|identifier| identifier.open());
             take_trading_currencies(&mut stays, master);
+            take_listed_terms(&mut stays, master);
             // The open_meridian identifier stops being written (requirement 2).
             for identifier in stays.identifiers.iter_mut() {
                 if identifier.scheme == meridian_symbology::GLOBAL_ID {
@@ -1248,7 +1296,16 @@ pub fn apply_feed(
     let mut read_to = cursor;
     for entry in entries {
         if store.by_id(&entry.instrument_id)?.is_some() {
-            if entry.decommissioned {
+            // Contract v28 (579): a series past its last lifecycle date,
+            // marked expired, its ID kept and never reused; nothing moves.
+            if entry.expired {
+                if let Some(shown) = expire(store, &entry.instrument_id, now_ns)? {
+                    applied.push(Applied {
+                        replaced: None,
+                        changed: vec![shown],
+                    });
+                }
+            } else if entry.decommissioned {
                 if let Some(shown) = decommission(store, &entry.instrument_id, now_ns)? {
                     applied.push(Applied {
                         replaced: None,
@@ -1283,6 +1340,38 @@ pub fn apply_feed(
     }
     let _ = read_to;
     Ok(applied)
+}
+
+/// The record's lifecycle state for an expired series (contract v28).
+pub const EXPIRED: &str = "INSTRUMENT_LIFECYCLE_STATE_EXPIRED";
+
+/// An expiry the platform's feed said (contract v28, ruling 579): the held
+/// series marked expired as its next version, its ID kept, never merged nor
+/// decommissioned and moving no position; a position still held after it
+/// is a break the book shows. `None` where it was shown already.
+pub fn expire(store: &dyn Store, instrument_id: &str, now_ns: i64) -> Result<Option<Instrument>> {
+    let Some(mut record) = store.by_id(instrument_id)? else {
+        return Ok(None);
+    };
+    if record.lifecycle_state == EXPIRED {
+        return Ok(None);
+    }
+    let expected = record.version;
+    record.lifecycle_state = EXPIRED.to_string();
+    record.version = expected + 1;
+    record.record_time_ns = now_ns;
+    let entry = version_of(
+        &record,
+        "expired",
+        Vec::new(),
+        "the platform marked the series expired past its last lifecycle date (its replacement \
+         feed, W3.27; ruling 579); its ID is kept and no position moves",
+        now_ns,
+    );
+    match store.write(record.clone(), expected, entry)? {
+        Written::Stored => Ok(Some(record)),
+        _ => Ok(None),
+    }
 }
 
 /// A decommission the platform's feed said, shown on the held record and
@@ -1946,6 +2035,128 @@ mod tests {
         assert!(
             apply_feed(&store, &entries, NOW + 6).unwrap().is_empty(),
             "read once"
+        );
+    }
+
+    #[test]
+    fn a_listed_series_keeps_its_terms_lists_what_it_lacks_and_expires_by_the_feed() {
+        // Contract v28 (rulings 559, 574, 575, 579): the platform's option
+        // record with its terms; its last trade date and deliverable not yet
+        // stated (complete), its settlement time optional on a physically
+        // settled option; an adjustment the next version; expired by the
+        // feed, its ID kept.
+        use meridian_domain::v1::{
+            ExerciseStyle, FieldRequirement, ListedOption, PutOrCall, SettlementMethod,
+            TemplateField,
+        };
+        let store = MemoryStore::new();
+        let osi = ResolveIdentifierRequest {
+            identifiers: vec![PbIdentifier {
+                scheme: "occ_osi".into(),
+                value: "AAPL  261120C00230000".into(),
+                ..Default::default()
+            }],
+            as_of_ns: NOW,
+            stated_asset_class: AssetClass::Derivative as i32,
+            ..Default::default()
+        };
+        let terms = ListedOption {
+            underlying_instrument_id: "INS-AAPL".into(),
+            put_or_call: PutOrCall::Call as i32,
+            strike_price: Some(meridian_domain::v1::Money {
+                amount: Some(
+                    "230"
+                        .parse::<meridian_domain::exact::Exact>()
+                        .unwrap()
+                        .to_wire(),
+                ),
+                currency_code: "USD".into(),
+                instrument_id: String::new(),
+            }),
+            expiration_date: "2026-11-20".into(),
+            exercise_style: ExerciseStyle::American as i32,
+            settlement_method: SettlementMethod::Physical as i32,
+            contract_multiplier: Some(
+                "100"
+                    .parse::<meridian_domain::exact::Exact>()
+                    .unwrap()
+                    .to_wire(),
+            ),
+            option_root: "AAPL".into(),
+            ..Default::default()
+        };
+        let option = InstrumentRecord {
+            instrument_id: "INS-AAPLC230".into(),
+            identifiers: osi.identifiers.clone(),
+            asset_class: AssetClass::Derivative as i32,
+            instrument_type: InstrumentType::ListedOption as i32,
+            currency: "USD".into(),
+            description: "AAPL Nov 20 2026 230 call".into(),
+            version: 1,
+            template_id: "TPL-listed-option".into(),
+            template_version: "1".into(),
+            listed_option: Some(terms.clone()),
+            ..Default::default()
+        };
+        unmatched(&store, &osi, PlatformSaid::Record(Box::new(option.clone())));
+        let held = store.by_id("INS-AAPLC230").unwrap().unwrap();
+        let wire = crate::record::to_wire(&held);
+        assert_eq!(wire.listed_option.as_ref(), Some(&terms));
+        assert!(wire.future.is_none());
+        let field = |path: &str, requirement: FieldRequirement| TemplateField {
+            path: path.into(),
+            r#type: "text".into(),
+            required: requirement == FieldRequirement::Mint,
+            requirement: requirement as i32,
+            repeated: path == "deliverable",
+        };
+        let template = SecurityTemplate {
+            fields: vec![
+                field("underlying_instrument_id", FieldRequirement::Mint),
+                field("strike_price", FieldRequirement::Mint),
+                field("option_root", FieldRequirement::Mint),
+                field("deliverable", FieldRequirement::Complete),
+                field("last_trade_date", FieldRequirement::Complete),
+                field("settlement_time", FieldRequirement::Complete),
+                field("contract_month", FieldRequirement::Optional),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            missing_fields(&held, &template),
+            vec!["deliverable".to_string(), "last_trade_date".to_string()]
+        );
+        // An adjustment: the platform's next version, the deliverable 150.
+        let mut adjusted = option.clone();
+        let mut new_terms = terms.clone();
+        new_terms.contract_multiplier = Some(
+            "150"
+                .parse::<meridian_domain::exact::Exact>()
+                .unwrap()
+                .to_wire(),
+        );
+        adjusted.listed_option = Some(new_terms.clone());
+        adjusted.version = 2;
+        let (kept, minted) =
+            keep_platform_record(&store, &[], &adjusted, None, Vec::new(), NOW + 1).unwrap();
+        assert!(!minted);
+        assert_eq!(kept.version, held.version + 1);
+        assert_eq!(crate::record::to_wire(&kept).listed_option, Some(new_terms));
+        // Expired by the feed: kept, never merged or decommissioned.
+        let entries = vec![meridian_domain::v1::ReplacementFeedEntry {
+            sequence: 7,
+            instrument_id: "INS-AAPLC230".into(),
+            replaced_by: String::new(),
+            decommissioned: false,
+            expired: true,
+        }];
+        assert_eq!(apply_feed(&store, &entries, NOW + 2).unwrap().len(), 1);
+        let expired = store.by_id("INS-AAPLC230").unwrap().unwrap();
+        assert_eq!(expired.lifecycle_state, EXPIRED);
+        assert!(!expired.local.decommissioned);
+        assert_eq!(
+            crate::replace::current(&store, "INS-AAPLC230").unwrap(),
+            "INS-AAPLC230"
         );
     }
 

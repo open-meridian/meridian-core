@@ -3595,6 +3595,53 @@ async fn the_deployments_time_zone_is_new_york_until_set_each_change_its_own_rec
 /// -- one to four fiat cash instruments, none twice, never a token, each change
 /// saying why and its own record.
 #[tokio::test]
+async fn the_series_request_rule_is_a_deployment_admins_each_change_recorded() {
+    // Contract v28 (W6.37; rulings 561, 589): orders on, standing wants off
+    // and 500 a day by default; a limit of 0 or past 5,000 refused naming
+    // it; no reason refused; each change its own record.
+    let h = harness("dashboard-1");
+    let read = || {
+        ask::<_, meridian_domain::v1::SeriesRequestRule>(
+            &h,
+            crate::service::READ_SERIES_REQUEST_RULE,
+            "meridian.v1.ReadSeriesRequestRuleRequest",
+            meridian_domain::v1::ReadSeriesRequestRuleRequest {},
+        )
+    };
+    let set = |orders: bool, standing: bool, limit: u32, reason: &str| {
+        ask::<_, meridian_domain::v1::SeriesRequestRule>(
+            &h,
+            crate::service::SET_SERIES_REQUEST_RULE,
+            "meridian.v1.SetSeriesRequestRuleRequest",
+            meridian_domain::v1::SetSeriesRequestRuleRequest {
+                rule: Some(meridian_domain::v1::SeriesRequestRule {
+                    orders,
+                    standing_wants: standing,
+                    daily_limit: limit,
+                    ..Default::default()
+                }),
+                reason: reason.into(),
+            },
+        )
+    };
+    let default = read().await.unwrap();
+    assert!(default.orders && !default.standing_wants);
+    assert_eq!((default.daily_limit, default.changed_at_ns), (500, 0));
+    for limit in [0, 5_001] {
+        let refused = set(true, true, limit, "chains").await.unwrap_err();
+        assert!(refused.contains("fields=rule.daily_limit"), "{refused}");
+    }
+    let refused = set(true, true, 100, " ").await.unwrap_err();
+    assert!(refused.contains("fields=reason"), "{refused}");
+    let changed = set(true, true, 100, "the options views watch SPX's chain")
+        .await
+        .unwrap();
+    assert!(changed.standing_wants && changed.daily_limit == 100);
+    assert!(changed.changed_at_ns > 0 && !changed.changed_by.is_empty());
+    assert_eq!(read().await.unwrap().daily_limit, 100);
+}
+
+#[tokio::test]
 async fn the_fx_pivot_currencies_are_fiat_ordered_by_a_deployment_admin_each_change_recorded() {
     let h = harness("dashboard-1");
     let read = || {

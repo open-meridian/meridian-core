@@ -34,6 +34,7 @@ pub struct MemoryStore {
     holds: Mutex<Vec<(Hold, String)>>,
     /// Contract v24 (W3.28): the usage setting's changes, and the reports.
     reports_usage: Mutex<Vec<(bool, Author, i64)>>,
+    settings: Mutex<Vec<(String, Vec<u8>, Author, i64)>>,
     /// Contract v26 (W6.35): the time zone's changes.
     time_zones: Mutex<Vec<(String, Author, i64)>>,
     fx_pivots: Mutex<Vec<(Vec<String>, Author, i64)>>,
@@ -91,6 +92,7 @@ impl MemoryStore {
             access_changes: Mutex::new(Vec::new()),
             holds: Mutex::new(Vec::new()),
             reports_usage: Mutex::new(Vec::new()),
+            settings: Mutex::new(Vec::new()),
             time_zones: Mutex::new(Vec::new()),
             fx_pivots: Mutex::new(Vec::new()),
             model_routing: Mutex::new(Vec::new()),
@@ -1206,6 +1208,33 @@ impl Store for MemoryStore {
                 changed_at_ns: *at,
                 changed_by: author.by.clone(),
             }))
+    }
+
+    fn set_setting(&self, setting: &str, value: &[u8], author: &Author, at_ns: i64) -> Result<()> {
+        self.settings.lock().expect("store lock poisoned").push((
+            setting.to_string(),
+            value.to_vec(),
+            author.clone(),
+            at_ns,
+        ));
+        Ok(())
+    }
+
+    fn setting(&self, setting: &str) -> Result<Option<crate::store::DeploymentSettingChange>> {
+        Ok(self
+            .settings
+            .lock()
+            .expect("store lock poisoned")
+            .iter()
+            .rev()
+            .find(|(name, ..)| name == setting)
+            .map(
+                |(_, value, author, at)| crate::store::DeploymentSettingChange {
+                    value: value.clone(),
+                    changed_at_ns: *at,
+                    changed_by: author.by.clone(),
+                },
+            ))
     }
 
     fn set_reports_usage(&self, reports_usage: bool, author: &Author, at_ns: i64) -> Result<()> {

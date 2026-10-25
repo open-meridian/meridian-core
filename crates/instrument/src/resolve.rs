@@ -569,6 +569,7 @@ fn mint(
         instrument_type: String::new(),
         money_market_fund: String::new(),
         binary_event_contract: String::new(),
+        listed_terms: String::new(),
         listing_venue_id: String::new(),
         sources: asked
             .iter()
@@ -1045,6 +1046,7 @@ mod tests {
             instrument_type: String::new(),
             money_market_fund: String::new(),
             binary_event_contract: String::new(),
+            listed_terms: String::new(),
             listing_venue_id: String::new(),
             sources: Vec::new(),
             offers: Vec::new(),

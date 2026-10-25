@@ -319,6 +319,12 @@ pub struct Instrument {
     /// the platform's answer to a person's ask; empty where none is known.
     pub listing_venue_id: String,
 
+    /// A listed series' full terms, as the platform's record states them
+    /// (contract v28; rulings 559 and 575): the listed option's or the
+    /// future's message, its bytes in hex
+    /// (`instrument_type::listed_terms_to_text`); empty for any other record.
+    pub listed_terms: String,
+
     /// Where each value in force came from.
     pub sources: Vec<Source>,
 

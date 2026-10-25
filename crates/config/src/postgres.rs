@@ -2248,6 +2248,44 @@ impl Store for PostgresStore {
             }))
     }
 
+    fn set_setting(&self, setting: &str, value: &[u8], author: &Author, at_ns: i64) -> Result<()> {
+        self.conn()?
+            .execute(
+                "INSERT INTO config_setting_change
+                        (setting, value, changed_by, through_delegation, client_name,
+                         prepared_call_id, changed_at_ns, note)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                &[
+                    &setting,
+                    &value,
+                    &author.by,
+                    &author.delegation,
+                    &author.client,
+                    &author.prepared_call_id,
+                    &at_ns,
+                    &author.note,
+                ],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
+    fn setting(&self, setting: &str) -> Result<Option<crate::store::DeploymentSettingChange>> {
+        Ok(self
+            .conn()?
+            .query_opt(
+                "SELECT value, changed_at_ns, changed_by FROM config_setting_change
+                  WHERE setting = $1 ORDER BY change_id DESC LIMIT 1",
+                &[&setting],
+            )
+            .map_err(unavailable)?
+            .map(|row| crate::store::DeploymentSettingChange {
+                value: row.get(0),
+                changed_at_ns: row.get(1),
+                changed_by: row.get(2),
+            }))
+    }
+
     fn set_reports_usage(&self, reports_usage: bool, author: &Author, at_ns: i64) -> Result<()> {
         self.conn()?
             .execute(

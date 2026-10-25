@@ -125,6 +125,14 @@ pub const TEMPLATES_PULLED: &str = "platform.reference.event.templates-pulled";
 pub const LICENCE_LIST_PULLED: &str = "platform.reference.event.licence-list-pulled";
 pub const REPLACEMENTS_PULLED: &str = "platform.reference.event.replacements-pulled";
 
+/// W3.31 (contract v28; ruling 561). A listed series asked for when it is
+/// wanted, under the deployment's series request rule.
+pub const REQUEST_SERIES_RECORDS: &str = "platform.reference.command.request-series-records";
+/// W6.37: the rule, read before asking.
+pub const READ_SERIES_REQUEST_RULE: &str = "platform.config.query.read-series-request-rule";
+/// W10.6: a series' terms, read from the lake's listing.
+pub const LIST_SERIES: &str = "platform.lake.query.list-series";
+
 /// Where the time comes from: the deployment's one clock (decisions/024),
 /// given by whoever wires this up.
 pub use meridian_clock::Clock;
@@ -184,7 +192,14 @@ pub fn serve_all_within(
             // Read-only for an instance none of whose launched roles may mint
             // (contract v20, W3.1): `reporting`, by the launch records, never
             // by anything the plugin sends.
-            if asking.reads_only(&instance, now_ns) {
+            // A series key alone, asked by the deployment's own components
+            // (the lake filling ListSeries' records, W10.6): matched, never
+            // minted (contract v28, ruling 561); a series is asked for by
+            // RequestSeriesRecords (W3.31) or resolved by a plugin that
+            // holds it.
+            if asking.reads_only(&instance, now_ns)
+                || (series_key_only(&request) && asking.launched_roles(&instance, now_ns).is_none())
+            {
                 let resolution =
                     crate::resolve::resolve_identifier_read_only(store.as_ref(), &request, now_ns)
                         .map_err(|failed| failed.to_string())?;
@@ -341,6 +356,36 @@ pub fn serve_all_within(
             Ok((
                 "meridian.v1.ResolveIdentifierReply".to_string(),
                 resolution.reply.encode_to_vec(),
+            ))
+        });
+    }
+    // W3.31 (contract v28; ruling 561): a listed series asked for when it
+    // is wanted.
+    {
+        let (store, clock, writing, announcing) = (
+            store.clone(),
+            clock.clone(),
+            writing.clone(),
+            Arc::clone(bus),
+        );
+        let asking = Arc::new(Asking::waiting(Arc::clone(bus), bound));
+        let asked_today = Arc::new(Mutex::new((0i64, 0u32)));
+        bus.serve(REQUEST_SERIES_RECORDS, move |envelope| {
+            let request: meridian_domain::v1::RequestSeriesRecordsRequest =
+                decode(&envelope, "meridian.v1.RequestSeriesRecordsRequest")?;
+            let reply = request_series_records(
+                request,
+                &envelope,
+                &store,
+                &clock,
+                &writing,
+                &asking,
+                &announcing,
+                &asked_today,
+            )?;
+            Ok((
+                "meridian.v1.RequestSeriesRecordsReply".to_string(),
+                reply.encode_to_vec(),
             ))
         });
     }
@@ -958,6 +1003,12 @@ impl Asking {
     /// Whether `instance` resolves read-only: launched with roles, none of
     /// them minting. An instance the launch records do not name -- one run
     /// outside the catalogue, or a catalogue not read -- resolves as before.
+    /// The roles an instance was launched with, `None` for an instance the
+    /// launch records do not name -- the deployment's own components.
+    pub fn launched_roles(&self, instance: &str, now_ns: i64) -> Option<Vec<String>> {
+        self.roles_of(instance, now_ns)
+    }
+
     pub fn reads_only(&self, instance: &str, now_ns: i64) -> bool {
         match self.roles_of(instance, now_ns) {
             Some(roles) => {
@@ -1993,6 +2044,299 @@ pub fn keep_pulled(
     Ok(applied)
 }
 
+/// Whether a resolve names a listed series' key alone (contract v28,
+/// W1.26): an `occ_osi` symbol, or an exchange's symbol with its MIC.
+fn series_key_only(request: &ResolveIdentifierRequest) -> bool {
+    let schemes: Vec<&str> = request
+        .identifiers
+        .iter()
+        .map(|identifier| identifier.scheme.as_str())
+        .collect();
+    matches!(schemes.as_slice(), ["occ_osi"])
+        || (schemes.len() == 2 && schemes.contains(&"mic") && schemes.contains(&"symbol"))
+}
+
+/// W3.31 (contract v28; ruling 561): each series wanted, where the rule
+/// allows its cause and the day's limit is not reached, matched or minted by
+/// the platform from the lake's listing of its terms, as a miss is asked
+/// (W3.4); one the store holds answered as held; one the rule does not allow
+/// refused by it, nothing sent. A key no listing holds refuses the request,
+/// naming it: the platform needs a template-complete request.
+#[allow(clippy::too_many_arguments)]
+fn request_series_records(
+    request: meridian_domain::v1::RequestSeriesRecordsRequest,
+    envelope: &Envelope,
+    store: &Arc<dyn Store>,
+    clock: &Arc<dyn Clock>,
+    writing: &Writing,
+    asking: &Asking,
+    bus: &Arc<Bus>,
+    asked_today: &Mutex<(i64, u32)>,
+) -> Result<meridian_domain::v1::RequestSeriesRecordsReply, String> {
+    use meridian_domain::v1::{
+        ListSeriesReply, ListSeriesRequest, SeriesAnswer, SeriesRequestCause, SeriesRequestRule,
+        SubjectRef,
+    };
+    let started = std::time::Instant::now();
+    if !meridian_pb::bounds::REQUEST_SERIES_RECORDS_REQUEST_SERIES_COUNT
+        .admits(request.series.len())
+    {
+        return Err(meridian_bus::refusal_with_status(
+            meridian_bus::RefusalStatus::InvalidArgument,
+            &["series".to_string()],
+            format!("series names {}; 1 to 500", request.series.len()),
+        ));
+    }
+    let actor = actor_of(envelope);
+    if !actor.delegation.is_empty() && request.note.trim().is_empty() {
+        return Err(meridian_bus::refusal_naming(
+            meridian_pb::v1::RefusalReason::ReasonRequired as i32,
+            &["note".to_string()],
+            "note: through a delegation a request for series says why",
+        ));
+    }
+    if request.note.chars().count() > 2_000 {
+        return Err("note: at most 2,000 characters".into());
+    }
+    for (i, want) in request.series.iter().enumerate() {
+        if !meridian_pb::bounds::SERIES_WANT_SERIES_KEY_COUNT.admits(want.series_key.len())
+            || want
+                .series_key
+                .iter()
+                .any(|key| key.scheme.trim().is_empty() || key.value.trim().is_empty())
+        {
+            return Err(meridian_bus::refusal_with_status(
+                meridian_bus::RefusalStatus::InvalidArgument,
+                &[format!("series[{i}].series_key")],
+                format!("series[{i}].series_key is an occ_osi symbol, or a symbol and its MIC"),
+            ));
+        }
+        if want.underlying_instrument_id.trim().is_empty() {
+            return Err(meridian_bus::refusal_with_status(
+                meridian_bus::RefusalStatus::InvalidArgument,
+                &[format!("series[{i}].underlying_instrument_id")],
+                format!("series[{i}].underlying_instrument_id is required"),
+            ));
+        }
+        if SeriesRequestCause::try_from(want.cause).unwrap_or(SeriesRequestCause::Unspecified)
+            == SeriesRequestCause::Unspecified
+        {
+            return Err(meridian_bus::refusal_with_status(
+                meridian_bus::RefusalStatus::InvalidArgument,
+                &[format!("series[{i}].cause")],
+                format!("series[{i}].cause is unspecified: an order's, or a standing want's"),
+            ));
+        }
+    }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return Err("the instrument store has no runtime to ask on".into());
+    };
+    let call = |topic: &str, kind: &str, payload: Vec<u8>| {
+        handle.block_on(bus.call(topic, kind, payload, None, Some(BOUNDED_ASK)))
+    };
+    // The rule in force, its default where the conductor does not answer.
+    let rule = call(
+        READ_SERIES_REQUEST_RULE,
+        "meridian.v1.ReadSeriesRequestRuleRequest",
+        meridian_domain::v1::ReadSeriesRequestRuleRequest {}.encode_to_vec(),
+    )
+    .ok()
+    .and_then(|(_, bytes)| SeriesRequestRule::decode(&bytes[..]).ok())
+    .unwrap_or(SeriesRequestRule {
+        orders: true,
+        standing_wants: false,
+        daily_limit: 500,
+        ..Default::default()
+    });
+    // Each series' listing, read first, so a key no listing holds refuses
+    // the whole request before anything is sent.
+    let mut listings = Vec::new();
+    for (i, want) in request.series.iter().enumerate() {
+        let reply = call(
+            LIST_SERIES,
+            "meridian.v1.ListSeriesRequest",
+            ListSeriesRequest {
+                subjects: vec![SubjectRef {
+                    entity_id: want.underlying_instrument_id.clone(),
+                    ..Default::default()
+                }],
+                series_keys: want.series_key.clone(),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        )
+        .map_err(|failed| {
+            format!(
+                "the lake did not answer for the series' terms, and nothing was asked: {failed}"
+            )
+        })?;
+        let listed = ListSeriesReply::decode(&reply.1[..])
+            .map_err(|failed| failed.to_string())?
+            .series
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                meridian_bus::refusal_with_status(
+                    meridian_bus::RefusalStatus::InvalidArgument,
+                    &[format!("series[{i}].series_key")],
+                    format!(
+                        "series[{i}].series_key: no listed-series row under {} holds it, and the                          platform needs the series' terms",
+                        want.underlying_instrument_id
+                    ),
+                )
+            })?;
+        listings.push(listed);
+    }
+    let instance = envelope
+        .meta
+        .as_ref()
+        .map(|meta| meta.publisher_instance_id.clone())
+        .unwrap_or_default();
+    let mut answers = Vec::new();
+    for (want, listed) in request.series.iter().zip(listings) {
+        let now_ns = clock.now_ns();
+        let mut answer = SeriesAnswer {
+            series_key: want.series_key.clone(),
+            ..Default::default()
+        };
+        let resolve = ResolveIdentifierRequest {
+            identifiers: want.series_key.clone(),
+            as_of_ns: now_ns,
+            stated_asset_class: meridian_domain::v1::AssetClass::Derivative as i32,
+            ..Default::default()
+        };
+        // Held already: answered, needing no rule.
+        let held = crate::resolve::resolve_identifier_read_only(store.as_ref(), &resolve, now_ns)
+            .map_err(|failed| failed.to_string())?;
+        if held.reply.found && !held.reply.provisional {
+            answer.instrument_id = held.reply.instrument_id;
+            answers.push(answer);
+            continue;
+        }
+        let allowed = match SeriesRequestCause::try_from(want.cause) {
+            Ok(SeriesRequestCause::Order) => rule.orders,
+            Ok(SeriesRequestCause::Standing) => rule.standing_wants,
+            _ => false,
+        };
+        let within_limit = {
+            let mut today = asked_today
+                .lock()
+                .map_err(|_| "the day's count is poisoned")?;
+            let day = now_ns.div_euclid(86_400 * 1_000_000_000);
+            if today.0 != day {
+                *today = (day, 0);
+            }
+            if today.1 < rule.daily_limit.max(1) {
+                today.1 += 1;
+                true
+            } else {
+                false
+            }
+        };
+        if !allowed || !within_limit {
+            tracing::info!(
+                series = ?want.series_key,
+                cause = want.cause,
+                within_limit,
+                "a series was refused by the deployment's series request rule; nothing was sent"
+            );
+            answer.refused_by_rule = true;
+            answers.push(answer);
+            continue;
+        }
+        let asked =
+            match crate::resolve::resolve_matched(store.as_ref(), &resolve, &instance, now_ns)
+                .map_err(|failed| failed.to_string())?
+            {
+                crate::resolve::Matched::Unmatched(asked) => asked,
+                crate::resolve::Matched::Answered(answered) => {
+                    answer.instrument_id = answered.reply.instrument_id.clone();
+                    answer.pending_review = answered.reply.provisional;
+                    if answer.pending_review {
+                        answer.instrument_id.clear();
+                    }
+                    answers.push(answer);
+                    continue;
+                }
+            };
+        let catalogue = crate::one_id::catalogue(store.as_ref());
+        let template = catalogue
+            .iter()
+            .find(|t| {
+                t.template_id == listed.template_id && t.template_version == listed.template_version
+            })
+            .cloned();
+        let dataset = listed
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.source.as_ref())
+            .map(|source| source.dataset.clone())
+            .unwrap_or_default();
+        let asking_for = crate::one_id::escalation(
+            &asked,
+            &resolve,
+            template.as_ref(),
+            &crate::one_id::licence(store.as_ref()),
+            &instance,
+            now_ns,
+        )
+        .map(|mut asking_for| {
+            // The template the listing names, its terms by their paths,
+            // each with its dataset as provenance (W3.31).
+            asking_for.template_id = listed.template_id.clone();
+            asking_for.template_version = listed.template_version.clone();
+            asking_for.fields.extend(listed.fields.iter().map(|field| {
+                meridian_domain::v1::TemplateFieldValue {
+                    path: field.path.clone(),
+                    value: field.value.clone(),
+                    provenance: Some(meridian_pb::v1::Provenance {
+                        kind: meridian_pb::v1::ProvenanceKind::Reported as i32,
+                        source: dataset.clone(),
+                        ..Default::default()
+                    }),
+                }
+            }));
+            asking_for
+        });
+        let said = match asking_for {
+            None => crate::resolve::PlatformSaid::NotAsked,
+            Some(asking_for) => {
+                let late = late_answer(
+                    Arc::clone(bus),
+                    store.clone(),
+                    clock.clone(),
+                    writing.clone(),
+                    resolve.clone(),
+                    asked.clone(),
+                    instance.clone(),
+                );
+                asking.match_or_mint(asking_for, late, started)
+            }
+        };
+        let resolution = {
+            let _held = writing.lock().map_err(|_| "the write lock is poisoned")?;
+            crate::resolve::resolve_unmatched(
+                store.as_ref(),
+                &resolve,
+                asked,
+                &instance,
+                clock.now_ns(),
+                said,
+            )
+            .map_err(|failed| failed.to_string())?
+        };
+        if let Some(changed) = &resolution.changed {
+            announce(bus, changed, envelope, clock.now_ns());
+        }
+        answer.pending_review = resolution.reply.provisional;
+        if !answer.pending_review {
+            answer.instrument_id = resolution.reply.instrument_id;
+        }
+        answers.push(answer);
+    }
+    Ok(meridian_domain::v1::RequestSeriesRecordsReply { answers })
+}
+
 fn decode<M: Message + Default>(envelope: &Envelope, wanted: &str) -> Result<M, String> {
     if envelope.payload_type != wanted {
         return Err(format!("expected {wanted}, got {}", envelope.payload_type));
@@ -2089,6 +2433,225 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_wanted_series_is_asked_for_under_the_rule_from_the_lakes_listing() {
+        // Contract v28 (W3.31; rulings 561, 589): an order's want asked for
+        // with the listing's terms and minted by the platform; a standing
+        // want refused by the default rule, nothing sent; a key no listing
+        // holds refuses the request, naming it; the lake's own lookup of a
+        // series not held mints nothing.
+        use meridian_domain::v1::{
+            ListSeriesReply, ListSeriesRequest, ListedSeries, ObservationMeta,
+            RequestSeriesRecordsReply, RequestSeriesRecordsRequest, SeriesRequestCause, SeriesWant,
+            Source, TemplateFieldValue,
+        };
+        const OSI: &str = "AAPL  261120C00230000";
+        let (store_bus, plugin_bus) = two("portfolio-1");
+        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        store
+            .keep_licence_list(
+                &meridian_domain::v1::LicenceList {
+                    version: 3,
+                    schemes: vec!["figi".into(), "iso4217".into(), "occ_osi".into()],
+                    ..Default::default()
+                },
+                NOW,
+            )
+            .unwrap();
+        launched(&store_bus, &[("portfolio-1", &["portfolio"])]);
+        let osi = |value: &str| {
+            vec![PbIdentifier {
+                scheme: "occ_osi".into(),
+                value: value.into(),
+                ..Default::default()
+            }]
+        };
+        store_bus.serve(LIST_SERIES, move |envelope| {
+            let asked = ListSeriesRequest::decode(&envelope.payload[..]).unwrap();
+            let listed = asked.series_keys.first().is_some_and(|k| k.value == OSI);
+            Ok((
+                "meridian.v1.ListSeriesReply".to_string(),
+                ListSeriesReply {
+                    series: listed
+                        .then(|| ListedSeries {
+                            meta: Some(ObservationMeta {
+                                series_key: asked.series_keys.clone(),
+                                source: Some(Source {
+                                    dataset: "tradier-1:options".into(),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            }),
+                            template_id: "TPL-listed-option".into(),
+                            template_version: "1".into(),
+                            fields: vec![TemplateFieldValue {
+                                path: "strike_price".into(),
+                                value: "230 USD".into(),
+                                ..Default::default()
+                            }],
+                            instrument_id: String::new(),
+                        })
+                        .into_iter()
+                        .collect(),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            ))
+        });
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        store_bus.serve(ASK_PLATFORM_FOR_INSTRUMENT, move |envelope| {
+            let request =
+                meridian_domain::v1::AskPlatformForInstrumentRequest::decode(&envelope.payload[..])
+                    .unwrap();
+            seen.lock().unwrap().push(request.clone());
+            Ok((
+                "meridian.v1.AskPlatformForInstrumentReply".to_string(),
+                meridian_domain::v1::AskPlatformForInstrumentReply {
+                    reachable: true,
+                    found: true,
+                    instrument: Some(PbInstrument {
+                        instrument_id: "INS-AAPLC230".into(),
+                        asset_class: AssetClass::Derivative as i32,
+                        instrument_type: meridian_domain::v1::InstrumentType::ListedOption as i32,
+                        currency: "USD".into(),
+                        description: "AAPL Nov 20 2026 230 call".into(),
+                        identifiers: request.identifiers.clone(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            ))
+        });
+        serve_queries(
+            &store_bus,
+            store.clone(),
+            Arc::new(meridian_clock::ManualClock::at(NOW)),
+        );
+        let want = |key: &str, cause: SeriesRequestCause| SeriesWant {
+            series_key: osi(key),
+            underlying_instrument_id: "INS-AAPL".into(),
+            cause: cause as i32,
+        };
+        let reply: RequestSeriesRecordsReply = ask(
+            &plugin_bus,
+            REQUEST_SERIES_RECORDS,
+            "meridian.v1.RequestSeriesRecordsRequest",
+            RequestSeriesRecordsRequest {
+                series: vec![
+                    want(OSI, SeriesRequestCause::Order),
+                    want(OSI, SeriesRequestCause::Standing),
+                ],
+                note: String::new(),
+            },
+            "",
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply.answers[0].instrument_id, "INS-AAPLC230");
+        assert!(!reply.answers[0].pending_review && !reply.answers[0].refused_by_rule);
+        // Held now: answered as held, needing no rule.
+        assert_eq!(reply.answers[1].instrument_id, "INS-AAPLC230");
+        let sent = asked.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "asked once");
+        let match_or_mint = sent[0].match_or_mint.as_ref().unwrap();
+        assert_eq!(match_or_mint.template_id, "TPL-listed-option");
+        assert!(match_or_mint
+            .fields
+            .iter()
+            .any(|f| f.path == "strike_price" && f.value == "230 USD"));
+        // A standing want for a series not held: refused by the default rule.
+        let refused: RequestSeriesRecordsReply = ask(
+            &plugin_bus,
+            REQUEST_SERIES_RECORDS,
+            "meridian.v1.RequestSeriesRecordsRequest",
+            RequestSeriesRecordsRequest {
+                series: vec![SeriesWant {
+                    series_key: osi(OSI),
+                    ..want(OSI, SeriesRequestCause::Standing)
+                }],
+                note: String::new(),
+            },
+            "",
+        )
+        .await
+        .unwrap();
+        assert_eq!(refused.answers[0].instrument_id, "INS-AAPLC230", "held");
+        // A key no listing holds.
+        let said = ask::<RequestSeriesRecordsReply>(
+            &plugin_bus,
+            REQUEST_SERIES_RECORDS,
+            "meridian.v1.RequestSeriesRecordsRequest",
+            RequestSeriesRecordsRequest {
+                series: vec![want("AAPL  261218P00200000", SeriesRequestCause::Order)],
+                note: String::new(),
+            },
+            "",
+        )
+        .await
+        .unwrap_err();
+        assert!(said.contains("series[0].series_key"), "{said}");
+        assert_eq!(asked.lock().unwrap().len(), 1, "nothing more sent");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_standing_want_is_refused_by_the_default_rule_and_nothing_is_sent() {
+        use meridian_domain::v1::{
+            ListSeriesReply, ListedSeries, ObservationMeta, RequestSeriesRecordsReply,
+            RequestSeriesRecordsRequest, SeriesRequestCause, SeriesWant,
+        };
+        let (store_bus, plugin_bus) = two("signal-1");
+        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        launched(&store_bus, &[("signal-1", &["signal"])]);
+        store_bus.serve(LIST_SERIES, |_| {
+            Ok((
+                "meridian.v1.ListSeriesReply".to_string(),
+                ListSeriesReply {
+                    series: vec![ListedSeries {
+                        meta: Some(ObservationMeta::default()),
+                        template_id: "TPL-listed-option".into(),
+                        template_version: "1".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            ))
+        });
+        store_bus.serve(ASK_PLATFORM_FOR_INSTRUMENT, |_| {
+            panic!("a series the rule refuses is never sent")
+        });
+        serve_queries(
+            &store_bus,
+            store.clone(),
+            Arc::new(meridian_clock::ManualClock::at(NOW)),
+        );
+        let reply: RequestSeriesRecordsReply = ask(
+            &plugin_bus,
+            REQUEST_SERIES_RECORDS,
+            "meridian.v1.RequestSeriesRecordsRequest",
+            RequestSeriesRecordsRequest {
+                series: vec![SeriesWant {
+                    series_key: vec![PbIdentifier {
+                        scheme: "occ_osi".into(),
+                        value: "SPXW  261120C05800000".into(),
+                        ..Default::default()
+                    }],
+                    underlying_instrument_id: "INS-SPX".into(),
+                    cause: SeriesRequestCause::Standing as i32,
+                }],
+                note: String::new(),
+            },
+            "",
+        )
+        .await
+        .unwrap();
+        assert!(reply.answers[0].refused_by_rule);
+        assert!(reply.answers[0].instrument_id.is_empty());
+        assert_eq!(store.count().unwrap(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -58,9 +58,20 @@ pub fn to_wire(instrument: &Instrument) -> PbInstrument {
         template_id: instrument.local.template_id.clone(),
         template_version: instrument.local.template_version.clone(),
         missing_fields: instrument.local.missing_fields.clone(),
-        // Contract v28: a listed series' terms (Stage A fills them).
-        listed_option: None,
-        future: None,
+        // Contract v28 (rulings 559, 575): a listed series' full terms, by
+        // its type.
+        listed_option: match instrument_type::read(&instrument.instrument_type) {
+            Some(InstrumentType::ListedOption | InstrumentType::FutureOption) => {
+                instrument_type::listed_option_from_text(&instrument.listed_terms)
+            }
+            _ => None,
+        },
+        future: match instrument_type::read(&instrument.instrument_type) {
+            Some(InstrumentType::Future) => {
+                instrument_type::future_from_text(&instrument.listed_terms)
+            }
+            _ => None,
+        },
     }
 }
 
