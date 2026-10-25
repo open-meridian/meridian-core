@@ -324,6 +324,12 @@ pub trait Store: Send + Sync {
         data_type: DataType,
         as_of_ns: i64,
     ) -> Result<Vec<Observation>>;
+
+    /// Every version of every row of one dataset and data type, in sequence
+    /// order: how a saved scenario is read at a version not its latest
+    /// (contract v28, W10.6, W12.8).
+    fn read_dataset_versions(&self, dataset: &str, data_type: DataType)
+        -> Result<Vec<Observation>>;
 }
 
 /// Whether a query answers every version it finds, not each row key's

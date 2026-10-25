@@ -81,6 +81,7 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/admin/time-zone", post(set_deployment_time_zone))
         .route("/admin/fx-pivot-currencies", post(set_fx_pivot_currencies))
         .route("/admin/series-request-rule", post(set_series_request_rule))
+        .route("/admin/series-records", post(request_series_records))
         .route(
             "/admin/stale-reference-actions",
             post(set_stale_reference_actions_permitted),
@@ -3575,6 +3576,106 @@ async fn set_series_request_rule(
 
 /// The series request rule's act on the surface (W6.37, contract v28).
 const SET_SERIES_REQUEST_RULE_TOOL: &str = "dashboard__set_series_request_rule";
+
+/// W3.31 (contract v28): one series asked of the platform by a deployment
+/// admin, under the rule, with a reason; or prepared for someone to make.
+async fn request_series_records(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Form(fields): Form<Fields>,
+) -> Response {
+    let back = "/admin#series-rule";
+    let (session, _) = match gate(&app, &headers, true) {
+        Ok(gated) => gated,
+        Err(response) => return *response,
+    };
+    if let Err(response) = form_token_matches(&session, &fields) {
+        return *response;
+    }
+    let note = field(&fields, "note").trim().to_string();
+    if note.is_empty() {
+        return not_done("say why the series are asked for", back);
+    }
+    let underlying = field(&fields, "underlying_instrument_id")
+        .trim()
+        .to_string();
+    if !underlying.starts_with("INS-") {
+        return not_done("the underlying is an INS- record", back);
+    }
+    let symbol = field(&fields, "occ_osi").to_string();
+    if symbol.trim().is_empty() || symbol.chars().count() > 21 {
+        return not_done("an OCC symbol is 21 characters at most", back);
+    }
+    let cause = match field(&fields, "cause") {
+        "standing" => meridian_domain::v1::SeriesRequestCause::Standing,
+        _ => meridian_domain::v1::SeriesRequestCause::Order,
+    };
+    let posted = prepare_or_gate(
+        &app,
+        &session,
+        &fields,
+        REQUEST_SERIES_RECORDS_TOOL,
+        || {
+            Ok(serde_json::json!({
+                "series": [{
+                    "series_key": [{"scheme": "occ_osi", "value": symbol}],
+                    "underlying_instrument_id": underlying,
+                    "cause": if cause == meridian_domain::v1::SeriesRequestCause::Standing { "standing" } else { "order" },
+                }],
+                "note": note,
+            }))
+        },
+    )
+    .await;
+    if let Some(response) = posted_to(posted, back) {
+        return response;
+    }
+    let outcome = app
+        .bus
+        .call_for(
+            series_rule::REQUEST_SERIES_RECORDS,
+            "meridian.v1.RequestSeriesRecordsRequest",
+            meridian_domain::v1::RequestSeriesRecordsRequest {
+                series: vec![meridian_domain::v1::SeriesWant {
+                    series_key: vec![meridian_domain::v1::Identifier {
+                        scheme: "occ_osi".into(),
+                        value: symbol.clone(),
+                        ..Default::default()
+                    }],
+                    underlying_instrument_id: underlying.clone(),
+                    cause: cause as i32,
+                }],
+                note: note.clone(),
+            }
+            .encode_to_vec(),
+            None,
+            Some(Duration::from_secs(30)),
+            &session.subject,
+        )
+        .await
+        .map_err(said_of_refusal)
+        .and_then(|(_, bytes)| {
+            meridian_domain::v1::RequestSeriesRecordsReply::decode(&bytes[..])
+                .map_err(|failed| failed.to_string())
+        });
+    match outcome {
+        Ok(reply) => {
+            let said = format!("{}: {}", symbol.trim(), series_rule::answered(&reply));
+            after_to(
+                Ok(()),
+                &format!(
+                    "/admin?done={}#series-rule",
+                    series_rule::form_encoded(&said)
+                ),
+                back,
+            )
+        }
+        Err(failed) => after_to(Err(failed), back, back),
+    }
+}
+
+/// The request for series records' act on the surface (W3.31, contract v28).
+const REQUEST_SERIES_RECORDS_TOOL: &str = "dashboard__request_series_records";
 
 /// W6.38 (contract v28): the stale reference actions permitted set, a
 /// deployment admin's, with a reason; or prepared for someone to make.

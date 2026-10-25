@@ -1384,6 +1384,44 @@ fn apply_lot(
     Ok(())
 }
 
+/// The multiplier a lot was costed by (contract v28, 559): its cost over its
+/// original quantity times its unit cost, where that is exactly a number the
+/// two multiply back to -- a listed option's 100 -- and one otherwise. Read
+/// from the lot itself, so a replay needs no instrument store.
+fn lot_multiplier(lot: &Lot) -> Exact {
+    let read = |d: Option<&meridian_pb::v1::Decimal>| d.and_then(|d| Exact::from_wire(d).ok());
+    let Some(terms) = lot.terms.as_ref() else {
+        return Exact::ONE;
+    };
+    let (Some(unit), Some(cost), Some(quantity)) = (
+        read(terms.unit_cost.as_ref().and_then(|m| m.amount.as_ref())),
+        read(terms.cost.as_ref().and_then(|m| m.amount.as_ref())),
+        read(lot.original_quantity.as_ref()),
+    ) else {
+        return Exact::ONE;
+    };
+    let Ok(per) = crate::orders::multiply("a lot's cost", unit, quantity) else {
+        return Exact::ONE;
+    };
+    let as_f64 = |e: Exact| e.to_string().parse::<f64>().unwrap_or(0.0);
+    let (per_f, cost_f) = (as_f64(per), as_f64(cost));
+    if per_f == 0.0 || cost_f == 0.0 {
+        return Exact::ONE;
+    }
+    let guess = format!("{:.6}", (cost_f / per_f).abs());
+    let guess = guess.trim_end_matches('0').trim_end_matches('.');
+    match guess.parse::<Exact>() {
+        Ok(m)
+            if !m.is_zero()
+                && crate::orders::multiply("a lot's cost", per, m)
+                    .is_ok_and(|back| back == cost || back == cost.negated()) =>
+        {
+            m
+        }
+        _ => Exact::ONE,
+    }
+}
+
 /// One relief of a lot (W9.10, contract v27): the entry, the quantity, and
 /// its proceeds where the entry sold it; two lines of one entry relieving
 /// the same lot are one relief.
@@ -1393,6 +1431,7 @@ fn record_relief(
     relieved: Exact,
     sale: Option<(&Money, &str)>,
 ) -> Result<()> {
+    let multiplier = lot_multiplier(lot);
     let proceeds = |quantity: Exact| -> Result<Option<Money>> {
         let Some((price, _)) = sale else {
             return Ok(None);
@@ -1400,7 +1439,11 @@ fn record_relief(
         let Some(unit) = price.amount.as_ref().and_then(|a| Exact::from_wire(a).ok()) else {
             return Ok(None);
         };
-        let amount = crate::orders::multiply("a relief's proceeds", quantity, unit)?;
+        let amount = crate::orders::multiply(
+            "a relief's proceeds",
+            crate::orders::multiply("a relief's proceeds", quantity, unit)?,
+            multiplier,
+        )?;
         Ok(Some(Money {
             amount: numbers::wire(amount),
             ..price.clone()

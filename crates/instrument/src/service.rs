@@ -2056,6 +2056,12 @@ fn series_key_only(request: &ResolveIdentifierRequest) -> bool {
         || (schemes.len() == 2 && schemes.contains(&"mic") && schemes.contains(&"symbol"))
 }
 
+/// The store's key for the day's count of series asked of the platform
+/// (W3.31): `day count`, kept across restarts.
+pub const SERIES_REQUESTS_TODAY: &str = "series-requests-today";
+/// The prefix of each refused series request's own record (W3.31).
+pub const SERIES_REQUEST_REFUSED: &str = "series-request-refused/";
+
 /// W3.31 (contract v28; ruling 561): each series wanted, where the rule
 /// allows its cause and the day's limit is not reached, matched or minted by
 /// the platform from the lake's listing of its terms, as a miss is asked
@@ -2219,26 +2225,70 @@ fn request_series_records(
             Ok(SeriesRequestCause::Standing) => rule.standing_wants,
             _ => false,
         };
+        // The day's count, kept in the store so a restart neither forgets
+        // nor resets it (W3.31): `day count`, the day in UTC days.
         let within_limit = {
-            let mut today = asked_today
+            let _counting = asked_today
                 .lock()
                 .map_err(|_| "the day's count is poisoned")?;
             let day = now_ns.div_euclid(86_400 * 1_000_000_000);
-            if today.0 != day {
-                *today = (day, 0);
-            }
-            if today.1 < rule.daily_limit.max(1) {
-                today.1 += 1;
+            let kept = store
+                .state(SERIES_REQUESTS_TODAY)
+                .map_err(|failed| failed.to_string())?
+                .and_then(|held| {
+                    let (d, n) = held.split_once(' ')?;
+                    Some((d.parse::<i64>().ok()?, n.parse::<u32>().ok()?))
+                })
+                .filter(|(d, _)| *d == day)
+                .map_or(0, |(_, n)| n);
+            if kept < rule.daily_limit.max(1) {
+                store
+                    .set_state(SERIES_REQUESTS_TODAY, &format!("{day} {}", kept + 1))
+                    .map_err(|failed| failed.to_string())?;
                 true
             } else {
                 false
             }
         };
         if !allowed || !within_limit {
+            // A refused request is its own record (W3.31; decisions/031):
+            // kept in the store under its own key, never overwritten.
+            let why = if allowed {
+                format!("the day's limit of {} is reached", rule.daily_limit.max(1))
+            } else {
+                "the rule does not allow its cause".to_string()
+            };
+            let kept = serde_json::json!({
+                "series_key": want.series_key.iter()
+                    .map(|k| serde_json::json!({"scheme": k.scheme, "value": k.value}))
+                    .collect::<Vec<_>>(),
+                "underlying_instrument_id": want.underlying_instrument_id,
+                "cause": SeriesRequestCause::try_from(want.cause)
+                    .map(|c| c.as_str_name())
+                    .unwrap_or_default(),
+                "refused_because": why,
+                "person": actor.person,
+                "delegation": actor.delegation,
+                "instance": instance,
+                "note": request.note,
+                "at_ns": now_ns.to_string(),
+            });
+            let mut n = 0u32;
+            let key = loop {
+                let key = format!("{SERIES_REQUEST_REFUSED}{now_ns:020}-{n:04}");
+                if store.state(&key).map_err(|f| f.to_string())?.is_none() {
+                    break key;
+                }
+                n += 1;
+            };
+            store
+                .set_state(&key, &kept.to_string())
+                .map_err(|failed| failed.to_string())?;
             tracing::info!(
                 series = ?want.series_key,
                 cause = want.cause,
                 within_limit,
+                record = %key,
                 "a series was refused by the deployment's series request rule; nothing was sent"
             );
             answer.refused_by_rule = true;
@@ -2653,6 +2703,45 @@ mod tests {
         assert!(reply.answers[0].refused_by_rule);
         assert!(reply.answers[0].instrument_id.is_empty());
         assert_eq!(store.count().unwrap(), 0);
+        // The refusal is its own record (W3.31; decisions/031).
+        let kept = store
+            .state(&format!("{SERIES_REQUEST_REFUSED}{NOW:020}-0000"))
+            .unwrap()
+            .expect("the refusal is kept");
+        assert!(kept.contains("SERIES_REQUEST_CAUSE_STANDING"), "{kept}");
+        assert!(kept.contains("does not allow its cause"), "{kept}");
+        // The day's count is kept in the store: at the limit, an order's
+        // series is refused too, and its refusal is a second record.
+        let day = NOW.div_euclid(86_400 * 1_000_000_000);
+        store
+            .set_state(SERIES_REQUESTS_TODAY, &format!("{day} 500"))
+            .unwrap();
+        let reply: RequestSeriesRecordsReply = ask(
+            &plugin_bus,
+            REQUEST_SERIES_RECORDS,
+            "meridian.v1.RequestSeriesRecordsRequest",
+            RequestSeriesRecordsRequest {
+                series: vec![SeriesWant {
+                    series_key: vec![PbIdentifier {
+                        scheme: "occ_osi".into(),
+                        value: "SPXW  261120C05900000".into(),
+                        ..Default::default()
+                    }],
+                    underlying_instrument_id: "INS-SPX".into(),
+                    cause: SeriesRequestCause::Order as i32,
+                }],
+                note: String::new(),
+            },
+            "",
+        )
+        .await
+        .unwrap();
+        assert!(reply.answers[0].refused_by_rule);
+        let second = store
+            .state(&format!("{SERIES_REQUEST_REFUSED}{NOW:020}-0001"))
+            .unwrap()
+            .expect("the second refusal is its own record");
+        assert!(second.contains("limit of 500"), "{second}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

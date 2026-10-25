@@ -131,6 +131,21 @@ pub struct RecordSays {
     pub instrument_type: i32,
     /// Contract v28 (579): a listed series past its last lifecycle date.
     pub expired: bool,
+    /// Contract v28 (559; FIX 231): a listed option's or a future's
+    /// `ContractMultiplier`, the premium multiplier its fills' cash and cost
+    /// are priced by; None for every other record, read as one.
+    pub multiplier: Option<Exact>,
+}
+
+impl Context {
+    /// The multiplier an instrument's fill is priced by (559): its series'
+    /// `ContractMultiplier` where its record carries one, else one.
+    pub fn multiplier(&self, instrument: &str) -> Exact {
+        self.records
+            .get(instrument)
+            .and_then(|r| r.multiplier)
+            .unwrap_or(Exact::ONE)
+    }
 }
 
 impl Context {

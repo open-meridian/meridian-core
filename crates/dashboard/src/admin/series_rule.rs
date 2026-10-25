@@ -21,6 +21,12 @@ pub const READ_SERIES_REQUEST_RULE: &str = "platform.config.query.read-series-re
 /// Where the tab's form posts.
 pub const PATH: &str = "/admin/series-request-rule";
 
+/// Where the tab's request for series posts (W3.31).
+pub const REQUEST_PATH: &str = "/admin/series-records#series-rule";
+
+/// The instrument store's command for series records (W3.31).
+pub const REQUEST_SERIES_RECORDS: &str = "platform.reference.command.request-series-records";
+
 /// The setting's label (W6.37).
 pub const LABEL: &str = "Series request rule";
 
@@ -113,6 +119,53 @@ pub fn fields(rule: Option<&SeriesRequestRule>) -> String {
     )
 }
 
+/// The request dialog's fields (W3.31): one series by its OCC symbol, its
+/// underlying, its cause, and why.
+pub fn request_fields() -> String {
+    "<label>Underlying<input name=\"underlying_instrument_id\" required pattern=\"INS-.+\" \
+     placeholder=\"INS-\" autocomplete=\"off\"></label>\
+     <label>OCC symbol<input name=\"occ_osi\" required maxlength=\"21\" \
+     placeholder=\"AAPL  261120C00230000\" autocomplete=\"off\"></label>\
+     <label>For<select name=\"cause\"><option value=\"order\">An order or a proposal</option>\
+     <option value=\"standing\">A standing want</option></select></label>\
+     <label>Why<textarea name=\"note\" required maxlength=\"2000\" rows=\"2\"></textarea></label>"
+        .to_string()
+}
+
+/// Text as a query's value: letters, digits and `-_.~` kept, a space `+`,
+/// every other byte `%XX`.
+pub fn form_encoded(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            b' ' => out.push('+'),
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+/// What a request's answer says, one phrase per series.
+pub fn answered(reply: &meridian_domain::v1::RequestSeriesRecordsReply) -> String {
+    reply
+        .answers
+        .iter()
+        .map(|a| {
+            if a.refused_by_rule {
+                "refused by the rule, nothing sent".to_string()
+            } else if a.pending_review {
+                "with the platform's staff for review".to_string()
+            } else {
+                format!("held as {}", a.instrument_id)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,5 +202,14 @@ mod tests {
         assert!(form.contains("value=\"100\""), "{form}");
         assert_eq!(json(&changed)["daily_limit"], 100);
         assert_eq!(json(&default)["default"], true);
+        assert_eq!(form_encoded("AAPL  2611: held"), "AAPL++2611%3A+held");
+        let said = answered(&meridian_domain::v1::RequestSeriesRecordsReply {
+            answers: vec![meridian_domain::v1::SeriesAnswer {
+                refused_by_rule: true,
+                ..Default::default()
+            }],
+        });
+        assert_eq!(said, "refused by the rule, nothing sent");
+        assert!(request_fields().contains("name=\"occ_osi\""));
     }
 }

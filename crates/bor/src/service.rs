@@ -179,6 +179,19 @@ fn record_says(record: &meridian_domain::v1::InstrumentRecord) -> RecordSays {
         instrument_type: record.instrument_type,
         expired: record.lifecycle_state
             == meridian_domain::v1::InstrumentLifecycleState::Expired as i32,
+        // Contract v28 (559): the series' premium multiplier.
+        multiplier: record
+            .listed_option
+            .as_ref()
+            .and_then(|o| o.contract_multiplier.as_ref())
+            .or_else(|| {
+                record
+                    .future
+                    .as_ref()
+                    .and_then(|f| f.contract_multiplier.as_ref())
+            })
+            .and_then(|m| meridian_domain::exact::Exact::from_wire(m).ok())
+            .filter(|m| !m.is_zero() && !m.is_negative()),
     }
 }
 

@@ -3105,6 +3105,10 @@ fn trade_lines(
         .clone()
         .ok_or_else(|| malformed(&["price"], "a fill states its price"))?;
     let unit = numbers::amount("price", &price)?;
+    // Contract v28 (559; FIX 231): a listed option's or a future's fill is
+    // priced per unit of its underlying, its cash and cost by its series'
+    // multiplier -- one SPY option at 2.50 is 250.00.
+    let multiplier = ctx.multiplier(&execution.instrument_id);
     let value_date = if execution.settlement_date.is_empty() {
         execution.computed_settlement_date.clone()
     } else {
@@ -3142,7 +3146,11 @@ fn trade_lines(
             (
                 Some(price.clone()),
                 Some(Money {
-                    amount: numbers::wire(orders::multiply("cost", magnitude, unit)?),
+                    amount: numbers::wire(orders::multiply(
+                        "cost",
+                        orders::multiply("cost", magnitude, unit)?,
+                        multiplier,
+                    )?),
                     ..price.clone()
                 }),
             )
@@ -3213,7 +3221,11 @@ fn trade_lines(
     // -- the account's base currency a balance, any other opening or
     // relieving lots (contract v24, option (c)), a receipt's lot costed in
     // the base where the fill's other leg is the base currency itself.
-    let notional = orders::multiply("cash", quantity, unit)?;
+    let notional = orders::multiply(
+        "cash",
+        orders::multiply("cash", quantity, unit)?,
+        multiplier,
+    )?;
     let cash = cash_instrument(&price)?;
     let signed = if side == Side::Buy {
         notional.negated()
@@ -3504,6 +3516,22 @@ pub fn report_execution(
     }
     if !bust && request.price.is_none() {
         return Err(malformed(&["price"], "a fill states its price"));
+    }
+    // Contract v28 (W11.24; rulings 442, 527, 564): a leg's fill names the
+    // package fill it is part of, so the two are linked; nothing else does.
+    let leg =
+        request.multi_leg_reporting_type == meridian_domain::v1::MultiLegReportingType::Leg as i32;
+    if leg && request.package_execution_id.trim().is_empty() {
+        return Err(malformed(
+            &["package_execution_id"],
+            "a leg's fill names its package execution",
+        ));
+    }
+    if !leg && !request.package_execution_id.is_empty() {
+        return Err(malformed(
+            &["package_execution_id"],
+            "only a leg's fill names a package execution",
+        ));
     }
 
     // Placed on its placement or, done away, its order, in this account.

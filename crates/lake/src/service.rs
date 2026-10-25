@@ -722,7 +722,8 @@ impl Lake {
 
     /// W12.8, contract v28: the saved scenarios of every dataset the reader
     /// may read, by row key, each at its latest version, or at the version
-    /// asked of one row key where that is its latest.
+    /// asked of one row key, whichever version that is (each edit is the
+    /// next version of its key, and a job names any).
     pub(crate) fn list_scenarios(
         &self,
         request: meridian_domain::v1::ListScenariosRequest,
@@ -735,10 +736,13 @@ impl Lake {
         let config = self.config();
         let mut scenarios = Vec::new();
         for dataset in config.readable(&reader, DataType::Scenario) {
-            let rows = self
-                .store
-                .read_dataset(&dataset, DataType::Scenario, 0)
-                .map_err(|failed| failed.to_string())?;
+            let rows = if request.version == 0 {
+                self.store.read_dataset(&dataset, DataType::Scenario, 0)
+            } else {
+                self.store
+                    .read_dataset_versions(&dataset, DataType::Scenario)
+            }
+            .map_err(|failed| failed.to_string())?;
             for row in rows {
                 let Observation::Scenario(saved) = row else {
                     continue;
@@ -2214,89 +2218,117 @@ impl Lake {
             })
             .collect();
         let all_series = request.series_keys.is_empty();
-        let answer = self.read(
-            ReadRequest {
-                data_type: DataType::Series,
-                subjects: request.subjects,
-                kinds: Vec::new(),
-                interval_ns: 0,
-                sources: request.sources,
-                at_ns: 0,
-                business_date: String::new(),
-                valid_from_ns: 0,
-                valid_until_ns: 0,
-                as_of_ns: request.as_of_ns,
-                page_size: request.page_size,
-                cursor: request.cursor,
-                after: None,
-                tenors: Vec::new(),
-                published_as_of_ns: 0,
-                series_keys: request.series_keys,
-                all_series,
-                dates: None,
-            },
-            envelope,
-        )?;
+        // The page asked, filled after the type and the window are applied
+        // (a filtered page is never short while rows remain): each read asks
+        // only for what the page still lacks, so the cursor it answers is the
+        // page's, never past a row left out.
+        let want = match request.page_size {
+            0 => 100,
+            n => n.min(500),
+        };
+        let mut cursor = request.cursor.clone();
         let mut series = Vec::new();
-        for row in answer.rows {
-            let Observation::Series(mut listed) = row else {
-                continue;
-            };
-            let meta = listed.meta.clone().unwrap_or_default();
-            let field = |path: &str| {
-                listed
-                    .fields
-                    .iter()
-                    .find(|field| field.path == path)
-                    .map(|field| field.value.clone())
-                    .unwrap_or_default()
-            };
-            // Its type: a future names its product code; an option on a
-            // future record is a future option (W1.24).
-            let underlying = meta
-                .subjects
-                .first()
-                .and_then(|subject| underlyings.get(&subject.entity_id))
-                .copied()
-                .unwrap_or(0);
-            let its_kind = if !field("product_code").is_empty() {
-                InstrumentType::Future
-            } else if underlying == InstrumentType::Future as i32 {
-                InstrumentType::FutureOption
-            } else {
-                InstrumentType::ListedOption
-            };
-            if kind != InstrumentType::Unspecified && kind != its_kind {
-                continue;
+        let mut unanswered = Vec::new();
+        let mut datasets: Vec<meridian_domain::v1::DatasetRef> = Vec::new();
+        let mut watermark = None;
+        let next_cursor = loop {
+            let lacking = want - series.len() as u32;
+            let answer = self.read(
+                ReadRequest {
+                    data_type: DataType::Series,
+                    subjects: request.subjects.clone(),
+                    kinds: Vec::new(),
+                    interval_ns: 0,
+                    sources: request.sources.clone(),
+                    at_ns: 0,
+                    business_date: String::new(),
+                    valid_from_ns: 0,
+                    valid_until_ns: 0,
+                    as_of_ns: request.as_of_ns,
+                    page_size: lacking,
+                    cursor: cursor.clone(),
+                    after: None,
+                    tenors: Vec::new(),
+                    published_as_of_ns: 0,
+                    series_keys: request.series_keys.clone(),
+                    all_series,
+                    dates: None,
+                },
+                envelope,
+            )?;
+            if watermark.is_none() {
+                watermark = Some(answer.watermark.clone());
+                unanswered = answer.unanswered.clone();
             }
-            if from.is_some() || to.is_some() {
-                let expires = [
-                    "expiration_date",
-                    "last_trade_date",
-                    "final_settlement_date",
-                ]
-                .iter()
-                .map(|path| field(path))
-                .find(|date| !date.is_empty())
-                .and_then(|date| Date::parse(&date).ok());
-                let Some(expires) = expires else {
-                    continue;
-                };
-                if from.as_ref().is_some_and(|from| &expires < from)
-                    || to.as_ref().is_some_and(|to| &expires > to)
-                {
-                    continue;
+            for dataset in answer.datasets {
+                if !datasets.iter().any(|d| d.dataset == dataset.dataset) {
+                    datasets.push(dataset);
                 }
             }
-            listed.instrument_id = self.series_record(&meta.series_key);
-            series.push(listed);
-        }
+            for row in answer.rows {
+                let Observation::Series(mut listed) = row else {
+                    continue;
+                };
+                let meta = listed.meta.clone().unwrap_or_default();
+                let field = |path: &str| {
+                    listed
+                        .fields
+                        .iter()
+                        .find(|field| field.path == path)
+                        .map(|field| field.value.clone())
+                        .unwrap_or_default()
+                };
+                // Its type: a future names its product code; an option on a
+                // future record is a future option (W1.24).
+                let underlying = meta
+                    .subjects
+                    .first()
+                    .and_then(|subject| underlyings.get(&subject.entity_id))
+                    .copied()
+                    .unwrap_or(0);
+                let its_kind = if !field("product_code").is_empty() {
+                    InstrumentType::Future
+                } else if underlying == InstrumentType::Future as i32 {
+                    InstrumentType::FutureOption
+                } else {
+                    InstrumentType::ListedOption
+                };
+                if kind != InstrumentType::Unspecified && kind != its_kind {
+                    continue;
+                }
+                if from.is_some() || to.is_some() {
+                    let expires = [
+                        "expiration_date",
+                        "last_trade_date",
+                        "final_settlement_date",
+                    ]
+                    .iter()
+                    .map(|path| field(path))
+                    .find(|date| !date.is_empty())
+                    .and_then(|date| Date::parse(&date).ok());
+                    let Some(expires) = expires else {
+                        continue;
+                    };
+                    if from.as_ref().is_some_and(|from| &expires < from)
+                        || to.as_ref().is_some_and(|to| &expires > to)
+                    {
+                        continue;
+                    }
+                }
+                listed.instrument_id = self.series_record(&meta.series_key);
+                series.push(listed);
+            }
+            if answer.next_cursor.is_empty() || series.len() as u32 >= want {
+                break answer.next_cursor;
+            }
+            cursor = answer.next_cursor;
+        };
         Ok(ListSeriesReply {
             series,
-            unanswered: answer.unanswered,
-            datasets: answer.datasets,
-            watermark: Some(answer.watermark),
-            next_cursor: answer.next_cursor,
+            unanswered,
+            datasets,
+            watermark,
+            next_cursor,
         })
     }
 

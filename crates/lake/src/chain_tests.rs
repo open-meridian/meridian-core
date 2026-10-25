@@ -381,6 +381,49 @@ async fn a_chain_is_recorded_and_read_by_its_underlying_never_minted() {
     });
     assert_eq!(put.len(), 1);
     assert_eq!(put[0].meta.as_ref().unwrap().series_key, osi(OSI_PUT));
+    // A window's page is filled after the window is applied: a page of one
+    // in November holds the November call, never an empty page with a
+    // cursor, though the December put was recorded between them.
+    let mut more = Vec::new();
+    for strike in ["240", "250", "260"] {
+        more.push(Observation::Series(series(
+            &format!("AAPL  261218P00{strike}000"),
+            "put",
+            strike,
+            "2026-12-18",
+        )));
+    }
+    more.push(Observation::Series(series(
+        "AAPL  261120C00240000",
+        "call",
+        "240",
+        "2026-11-20",
+    )));
+    assert_eq!(record(&h, "series", more).unwrap(), (4, 0, 0));
+    let page = |cursor: &str| {
+        tokio::task::block_in_place(|| {
+            h.lake.list_series(
+                ListSeriesRequest {
+                    subjects: subjects(AAPL),
+                    expiration_from: "2026-11-01".into(),
+                    expiration_to: "2026-11-30".into(),
+                    page_size: 1,
+                    cursor: cursor.into(),
+                    ..Default::default()
+                },
+                &envelope("signal-1"),
+            )
+        })
+        .unwrap()
+    };
+    let first = page("");
+    assert_eq!(first.series.len(), 1);
+    let second = page(&first.next_cursor);
+    assert_eq!(second.series.len(), 1, "no short page while rows remain");
+    assert_ne!(
+        first.series[0].meta.as_ref().unwrap().series_key,
+        second.series[0].meta.as_ref().unwrap().series_key
+    );
     // An adjustment is the next version of the row key.
     let mut adjusted = series(OSI_CALL, "call", "230", "2026-11-20");
     adjusted.fields[6] = field("contract_multiplier", "150");
@@ -752,4 +795,29 @@ async fn a_signal_plugins_derived_series_and_saved_scenarios_are_kept_and_read()
         saved.scenarios[0].scenario_set.as_ref().unwrap().axes.len(),
         2
     );
+    // An edit is the next version of its key; a job may name either.
+    let mut edited = grid.clone();
+    edited.scenario_set.as_mut().unwrap().axes.pop();
+    assert_eq!(
+        record_as("scenarios", vec![Observation::Scenario(edited)]).unwrap(),
+        (0, 1, 0)
+    );
+    let at = |version: u64| {
+        tokio::task::block_in_place(|| {
+            h.lake.list_scenarios(
+                ListScenariosRequest {
+                    row_keys: vec!["grid-1".into()],
+                    version,
+                },
+                &envelope("signal-1"),
+            )
+        })
+        .unwrap()
+        .scenarios
+    };
+    let axes = |rows: &[SavedScenario]| rows[0].scenario_set.as_ref().unwrap().axes.len();
+    assert_eq!(axes(&at(0)), 1, "the latest");
+    assert_eq!(axes(&at(1)), 2, "the version asked, though not the latest");
+    assert_eq!(axes(&at(2)), 1);
+    assert!(at(3).is_empty());
 }

@@ -213,8 +213,14 @@ fn lines(book: &Book, ctx: &Context, event: &LifecycleEvent) -> Result<Vec<Movem
                 ..Default::default()
             });
             if let Some(Some(unit)) = costs.iter().find(|(id, _)| id == &lot_id).map(|(_, c)| *c) {
-                // Paid for a long, received for a short.
-                let part = crate::orders::multiply("premium", take, unit)?;
+                // Paid for a long, received for a short; the lot's unit cost
+                // is per unit of the underlying, a contract its multiplier
+                // of them (559).
+                let part = crate::orders::multiply(
+                    "premium",
+                    crate::orders::multiply("premium", take, unit)?,
+                    ctx.multiplier(&event.instrument_id),
+                )?;
                 let signed = if side == HoldingSide::Long {
                     part
                 } else {

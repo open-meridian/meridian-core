@@ -84,6 +84,11 @@ fn wired() -> Wired {
             RESOLVED => Some(record(AssetClass::Equity, "CHF")),
             CALL_230 | CALL_240 => Some(InstrumentRecord {
                 instrument_type: InstrumentType::ListedOption as i32,
+                // Contract v28 (559): its premium multiplier.
+                listed_option: Some(ListedOption {
+                    contract_multiplier: d("100"),
+                    ..Default::default()
+                }),
                 ..record(AssetClass::Derivative, "USD")
             }),
             EXPIRED_CALL => Some(InstrumentRecord {
@@ -3537,4 +3542,63 @@ async fn a_package_is_two_to_sixteen_legs_in_lowest_terms_each_opening_or_closin
         .await,
         vec!["position_effect"]
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_option_fill_is_priced_by_its_multiplier_and_a_leg_names_its_package() {
+    // Contract v28 (559; FIX 231): one option bought at 2.50 is 250.00 of
+    // cost and cash; a leg's fill names its package execution.
+    let w = wired();
+    let order = propose(
+        &w,
+        &ProposeOrderRequest {
+            instrument_id: CALL_230.into(),
+            position_effect: PositionEffect::Open as i32,
+            limit_price: usd("2.50"),
+            ..buy("1")
+        },
+    )
+    .await
+    .unwrap();
+    waits(&w, ACC, false).await;
+    release(&w, &order.order_id).await.unwrap();
+    let placement = place(&w, &order.order_id, "1", &person(TRADER))
+        .await
+        .unwrap()
+        .placement
+        .unwrap();
+    let mut filled = fill(&placement.placement_id, "1", "VENUE-1");
+    filled.price = usd("2.50");
+    let mut leg = filled.clone();
+    leg.multi_leg_reporting_type = MultiLegReportingType::Leg as i32;
+    let refused = execute(&w, &leg).await.unwrap_err();
+    assert_eq!(
+        status_of(&refused).map(|(_, f)| f).unwrap_or_default(),
+        vec!["package_execution_id"]
+    );
+    execute(&w, &filled).await.unwrap();
+    let positions = w
+        .store
+        .positions(&crate::store::PositionsRead {
+            scope: Scope::Everything,
+            account_id: ACC.into(),
+            since: None,
+            business_date: String::new(),
+            at: None,
+            limit: 100,
+            cursor: String::new(),
+        })
+        .unwrap();
+    let held = |instrument: &str| {
+        positions
+            .records
+            .iter()
+            .find(|p| p.instrument_id == instrument)
+            .cloned()
+            .unwrap_or_else(|| panic!("{instrument} is held"))
+    };
+    let option = held(CALL_230);
+    let terms = option.lots[0].terms.clone().unwrap();
+    assert_eq!(read(&terms.cost.unwrap().amount), "250.00");
+    assert_eq!(read(&terms.unit_cost.unwrap().amount), "2.50");
 }

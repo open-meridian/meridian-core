@@ -96,8 +96,9 @@ fn the_four_tools_are_named_preparable_where_they_change_and_may_not_for_agents(
     // table's (W12.6); from contract v27 an account's execution costs
     // (W10.11) and the FX pivot currencies' read and set (W6.36); from
     // contract v28 the series request rule's read and set (W6.37) and the
-    // stale reference actions permitted's (W6.38).
-    assert_eq!(SPECS.len(), 20, "the twenty approved tools");
+    // stale reference actions permitted's (W6.38), and series asked of the
+    // platform (W3.31).
+    assert_eq!(SPECS.len(), 21, "the twenty-one approved tools");
 }
 
 #[test]

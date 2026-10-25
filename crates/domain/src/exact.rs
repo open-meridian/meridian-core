@@ -80,6 +80,12 @@ impl Exact {
         scale: 0,
     };
 
+    /// One, the multiplier of everything but a listed series (contract v28).
+    pub const ONE: Self = Self {
+        integer: 1,
+        scale: 0,
+    };
+
     /// Refused outside the range rather than clamped or rounded.
     pub fn new(integer: i128, scale: u32) -> Result<Self, OutOfRange> {
         if scale > PLACES {
