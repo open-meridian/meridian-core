@@ -2809,3 +2809,68 @@ enum SeriesRequestCause {
   // A standing want for an underlying's series.
   SERIES_REQUEST_CAUSE_STANDING = 2;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Contract v28, track C (1 of 2): the filings slice
+// (sdk-contract/the-lake-holds-researchs-kinds)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Contract v28 (W3.32): ResolveCompany's request.
+message ResolveCompanyRequest {
+  // Its ENT- ID. Empty where identifiers name it.
+  string company_id = 1;
+  // A cik or an lei. None where company_id names it.
+  repeated Identifier identifiers = 2;
+  // Nanoseconds since the epoch, against the identifiers' validity windows. 0:
+  // now.
+  int64 as_of_ns = 3;
+}
+
+// Contract v28: the platform's minimal company record: its ENT- ID, name, CIK
+// and LEI as dated identifiers and former names (contract v28, FDP Q6).
+message CompanyRecord {
+  // ENT- and a ULID, the platform's, never reused. Never empty.
+  string company_id = 1;
+  // The current name. Never empty.
+  string name = 2;
+  // Cik and lei, each with its validity window. Never empty.
+  repeated Identifier identifiers = 3;
+  // Each a name and the dates it was used, as EDGAR states them. None.
+  repeated FormerName former_names = 4;
+  // Assigned by the master. Never 0.
+  int64 version = 5;
+}
+
+// Contract v28 (CompanyRecord.former_names): carries its former names, dated.
+message FormerName {
+  // As the source states it. Never empty.
+  string name = 1;
+  // A plain date. Empty where the source states none.
+  string valid_from = 2;
+  // A plain date. Never empty.
+  string valid_until = 3;
+}
+
+// W1.32 (FDP Q6): the conductor's request that the platform match or mint
+// a company, by its open identifiers only; it names no deployment and the
+// platform keeps no asker.
+message MatchOrMintCompanyRequest {
+  // A `cik`, an `lei`, each a scheme on the licence list.
+  repeated Identifier identifiers = 1;
+  // The company's name as the source states it, to verify against; empty
+  // where none is known.
+  string name = 2;
+  // Only for retrying an answer that was lost.
+  string request_key = 3;
+}
+
+message MatchOrMintCompanyReply {
+  // The `ENT-` company matched or minted, at its version; unset while
+  // queued.
+  CompanyRecord company = 1;
+  // False when the master already held it.
+  bool minted = 2;
+  // In the staff's queue: a source that does not confirm it, or a natural
+  // person's CIK, which is never minted.
+  bool pending_review = 3;
+}

@@ -114,6 +114,9 @@ message SubjectRef {
   // The deployment's own ID for the entity: an instrument's in the lake's
   // 1a and 1b. 1 to 64 characters.
   string entity_id = 1;
+  // Contract v28: one of a small closed list; a row names up to 64 subjects.
+  // Unspecified: subject.
+  SubjectRole role = 2;
 }
 
 // Where a row came from.
@@ -1591,4 +1594,518 @@ message ListScenariosRequest {
 message ListScenariosReply {
   // Each at the version asked. None saved.
   repeated SavedScenario scenarios = 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Contract v28, track C (1 of 2): the filings slice
+// (sdk-contract/the-lake-holds-researchs-kinds)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Contract v28 (Filing.filing): names the filing.
+message FilingRef {
+  // EDGAR's accession number, 0000320193-26-000105. Never empty.
+  string accession_number = 1;
+  // 10-K, 8-K, 13F-HR, SC 13D/A. Never empty.
+  string form = 2;
+}
+
+// Contract v28: a filing as its publisher accepted it, keyed by accession, its
+// documents kept at the edge (contract v28).
+message Filing {
+  // Its row key, its subjects with their roles, its source, valid time and
+  // business date where it has one, its published time, version and sequence.
+  // Never unset.
+  ObservationMeta meta = 1;
+  // Its accession and form. Never unset.
+  FilingRef filing = 2;
+  // A short platform list over the forms as reported. Unspecified is refused.
+  FilingKind kind = 3;
+  // 2.02 for results of operations, which dates an earnings report. None: the
+  // form has no items, or none stated.
+  repeated string items = 4;
+  // A plain date. Empty where the form states none.
+  string period_of_report = 5;
+  // A plain date; the acceptance time is the envelope's published source time.
+  // Never empty.
+  string filed_date = 6;
+}
+
+// Contract v28 (W10.4): RecordFilings's request.
+message RecordFilingsRequest {
+  // 1 to 500 rows, recorded whole or refused naming the item and field. Never
+  // empty.
+  repeated Filing filings = 1;
+  // The want's identifier as it was delivered. Empty: recorded unasked.
+  string want_id = 2;
+}
+
+// Contract v28 (W10.5): FilingsRecorded's event.
+message FilingsRecordedEvent {
+  // The row as recorded. Never unset.
+  Filing filing = 1;
+}
+
+// Contract v28 (W10.6): ListFilings's request.
+message ListFilingsRequest {
+  // Each a company or an instrument, with the role it must hold on the row
+  // where given. Never empty.
+  repeated SubjectRef subjects = 1;
+  // A plain date on the kind's date. Empty: no lower bound.
+  string from_date = 2;
+  // A plain date on the kind's date. Empty: to the latest.
+  string to_date = 3;
+  // The kinds answered. None: every kind.
+  repeated FilingKind kinds = 4;
+  // The version in force by published time, among rows recorded by as_of_ns.
+  // 0: no published-time cut.
+  int64 published_as_of_ns = 5;
+  // The default, named datasets, or every entitled dataset side by side.
+  // Unset: the deployment's default.
+  SourceChoice sources = 6;
+  // The recorded-time cut-off: nothing recorded after it answers. 0: what the
+  // lake knows now.
+  int64 as_of_ns = 7;
+  // How many rows a page holds at most. 0 is 100; past 500, answered at 500.
+  uint32 page_size = 8;
+  // The previous reply's next_cursor, as given. Empty for the first page.
+  string cursor = 9;
+  // The watermark the reader last saw: answered the rows each dataset
+  // partition it names recorded after its sequence there, for the subjects
+  // asked, whatever their dates (amendment to DESIGN28, 2026-10-24: an
+  // unconflated row is caught up after a watermark, as trades and outcomes
+  // are). Unset: a read by dates, or as of as_of_ns.
+  Watermark after_watermark = 10;
+}
+
+// Contract v28 (W10.6): ListFilings's answer.
+message ListFilingsReply {
+  // The rows, each naming its dataset. None answered.
+  repeated Filing filings = 1;
+  // Each subject, dataset and field not answered, with its reason. None: every
+  // part answered.
+  repeated Unanswered unanswered = 2;
+  // Each dataset answered, with its vendor, declaration and liveness. None
+  // answered.
+  repeated DatasetRef datasets = 3;
+  // The sequence per partition the answer holds, from which a reader hears
+  // what follows. Never unset on an answer.
+  Watermark watermark = 4;
+  // Opaque, passed back as cursor. Empty on the last page.
+  string next_cursor = 5;
+}
+
+// Contract v28: a value a filer reported for a concept and period, each later
+// filing's different value the next version (contract v28).
+message ReportedFact {
+  // Its row key, its subjects with their roles, its source, valid time and
+  // business date where it has one, its published time, version and sequence.
+  // Never unset.
+  ObservationMeta meta = 1;
+  // Its taxonomy prefix and name, us-gaap:EarningsPerShareBasic. Never empty.
+  string concept = 2;
+  // In the currency the filer reported. Unset where value is set.
+  optional Money amount = 3;
+  // Shares, a ratio, a per-share figure as reported. Unset where amount is
+  // set; a fact with neither is refused.
+  UnitValue value = 4;
+  // A plain date. Empty on an instant.
+  string period_start = 5;
+  // A plain date. Never empty.
+  string period_end = 6;
+  // Each an axis and a member, as reported. None: the fact is for the filer as
+  // a whole.
+  repeated FactDimension dimensions = 7;
+  // Its accession and form. Never unset.
+  FilingRef filing = 8;
+}
+
+// Contract v28 (ReportedFact.dimensions): qualifies the fact by its
+// dimensions.
+message FactDimension {
+  // As reported, us-gaap:StatementBusinessSegmentsAxis. Never empty.
+  string axis = 1;
+  // As reported. Never empty.
+  string member = 2;
+}
+
+// Contract v28 (W10.4): RecordReportedFacts's request.
+message RecordReportedFactsRequest {
+  // 1 to 500 rows, recorded whole or refused naming the item and field. Never
+  // empty.
+  repeated ReportedFact facts = 1;
+  // The want's identifier as it was delivered. Empty: recorded unasked.
+  string want_id = 2;
+}
+
+// Contract v28 (W10.6): ListReportedFacts's request.
+message ListReportedFactsRequest {
+  // Each a company or an instrument, with the role it must hold on the row
+  // where given. Never empty.
+  repeated SubjectRef subjects = 1;
+  // A plain date on the kind's date. Empty: no lower bound.
+  string from_date = 2;
+  // A plain date on the kind's date. Empty: to the latest.
+  string to_date = 3;
+  // The version in force by published time, among rows recorded by as_of_ns.
+  // 0: no published-time cut.
+  int64 published_as_of_ns = 4;
+  // The default, named datasets, or every entitled dataset side by side.
+  // Unset: the deployment's default.
+  SourceChoice sources = 5;
+  // The recorded-time cut-off: nothing recorded after it answers. 0: what the
+  // lake knows now.
+  int64 as_of_ns = 6;
+  // How many rows a page holds at most. 0 is 100; past 500, answered at 500.
+  uint32 page_size = 7;
+  // The previous reply's next_cursor, as given. Empty for the first page.
+  string cursor = 8;
+  // Taxonomy and name. None: every concept.
+  repeated string concepts = 9;
+}
+
+// Contract v28 (W10.6): ListReportedFacts's answer.
+message ListReportedFactsReply {
+  // The rows, each naming its dataset. None answered.
+  repeated ReportedFact facts = 1;
+  // Each subject, dataset and field not answered, with its reason. None: every
+  // part answered.
+  repeated Unanswered unanswered = 2;
+  // Each dataset answered, with its vendor, declaration and liveness. None
+  // answered.
+  repeated DatasetRef datasets = 3;
+  // The sequence per partition the answer holds, from which a reader hears
+  // what follows. Never unset on an answer.
+  Watermark watermark = 4;
+  // Opaque, passed back as cursor. Empty on the last page.
+  string next_cursor = 5;
+}
+
+// Contract v28: a holder's report of its holdings as of a date, complete or
+// not (contract v28).
+message HoldingsReport {
+  // Its row key, its subjects with their roles, its source, valid time and
+  // business date where it has one, its published time, version and sequence.
+  // Never unset.
+  ObservationMeta meta = 1;
+  // The form family. Unspecified is refused.
+  HoldingsReportKind kind = 2;
+  // A plain date: a 13F's quarter end, a 13D's event date. Never empty.
+  string report_date = 3;
+  // True: a security missing from it reads as sold (a 13F). False: a security
+  // missing from it says nothing.
+  bool complete = 4;
+  // Its accession and form. Never unset.
+  FilingRef filing = 5;
+}
+
+// Contract v28: one holding of a holdings report (contract v28).
+message Holding {
+  // Its row key, its subjects with their roles, its source, valid time and
+  // business date where it has one, its published time, version and sequence.
+  // Never unset.
+  ObservationMeta meta = 1;
+  // The HoldingsReport's row key. Never empty.
+  string report_row_key = 2;
+  // Shares or principal, as reported. Unset where the report states none.
+  UnitValue quantity = 3;
+  // As reported. Unset where the report states none.
+  optional Money market_value = 4;
+  // A percent, as reported. Unset where the report states none (a 13F).
+  UnitValue percent_of_class = 5;
+}
+
+// Contract v28 (W10.4): RecordHoldingsReports's request.
+message RecordHoldingsReportsRequest {
+  // 1 to 500 rows, recorded whole or refused naming the item and field. Never
+  // empty.
+  repeated HoldingsReport reports = 1;
+  // The want's identifier as it was delivered. Empty: recorded unasked.
+  string want_id = 2;
+}
+
+// Contract v28 (W10.4): RecordHoldings's request.
+message RecordHoldingsRequest {
+  // 1 to 500 rows, recorded whole or refused naming the item and field. Never
+  // empty.
+  repeated Holding holdings = 1;
+  // The want's identifier as it was delivered. Empty: recorded unasked.
+  string want_id = 2;
+}
+
+// Contract v28 (W10.6): ListHoldings's request.
+message ListHoldingsRequest {
+  // Each a company or an instrument, with the role it must hold on the row
+  // where given. Never empty.
+  repeated SubjectRef subjects = 1;
+  // A plain date on the kind's date. Empty: no lower bound.
+  string from_date = 2;
+  // A plain date on the kind's date. Empty: to the latest.
+  string to_date = 3;
+  // The kinds answered. None: every kind.
+  repeated HoldingsReportKind kinds = 4;
+  // The version in force by published time, among rows recorded by as_of_ns.
+  // 0: no published-time cut.
+  int64 published_as_of_ns = 5;
+  // The default, named datasets, or every entitled dataset side by side.
+  // Unset: the deployment's default.
+  SourceChoice sources = 6;
+  // The recorded-time cut-off: nothing recorded after it answers. 0: what the
+  // lake knows now.
+  int64 as_of_ns = 7;
+  // How many rows a page holds at most. 0 is 100; past 500, answered at 500.
+  uint32 page_size = 8;
+  // The previous reply's next_cursor, as given. Empty for the first page.
+  string cursor = 9;
+}
+
+// Contract v28 (W10.6): ListHoldings's answer.
+message ListHoldingsReply {
+  // The rows, each naming its dataset. None answered.
+  repeated Holding holdings = 1;
+  // Each subject, dataset and field not answered, with its reason. None: every
+  // part answered.
+  repeated Unanswered unanswered = 2;
+  // Each dataset answered, with its vendor, declaration and liveness. None
+  // answered.
+  repeated DatasetRef datasets = 3;
+  // The sequence per partition the answer holds, from which a reader hears
+  // what follows. Never unset on an answer.
+  Watermark watermark = 4;
+  // Opaque, passed back as cursor. Empty on the last page.
+  string next_cursor = 5;
+  // Each once. None answered.
+  repeated HoldingsReport reports = 6;
+}
+
+// Contract v28: a corporate action as announced, a declared dividend in v28:
+// market data, never a servicing event (contract v28).
+message CorporateActionAnnounced {
+  // Its row key, its subjects with their roles, its source, valid time and
+  // business date where it has one, its published time, version and sequence.
+  // Never unset.
+  ObservationMeta meta = 1;
+  // The action's kind, growing by revision. Unspecified is refused.
+  CorporateActionKind kind = 2;
+  // As declared. Never unset on a cash dividend.
+  Money amount_per_share = 3;
+  // A plain date. Never empty: a row is recorded only where the rule finds it.
+  string declared_date = 4;
+  // A plain date. Never empty: a row is recorded only where the rule finds it.
+  string ex_date = 5;
+  // A plain date. Never empty: a row is recorded only where the rule finds it.
+  string record_date = 6;
+  // A plain date. Never empty: a row is recorded only where the rule finds it.
+  string payment_date = 7;
+  // A definition and its version. Never unset.
+  MeasureRef rule = 8;
+  // An 8-K's accession. Unset where the source is no filing.
+  FilingRef filing = 9;
+}
+
+// Contract v28 (W10.4): RecordCorporateActions's request.
+message RecordCorporateActionsRequest {
+  // 1 to 500 rows, recorded whole or refused naming the item and field. Never
+  // empty.
+  repeated CorporateActionAnnounced actions = 1;
+  // The want's identifier as it was delivered. Empty: recorded unasked.
+  string want_id = 2;
+}
+
+// Contract v28 (W10.5): CorporateActionsRecorded's event.
+message CorporateActionsRecordedEvent {
+  // The row as recorded. Never unset.
+  CorporateActionAnnounced action = 1;
+}
+
+// Contract v28 (W10.6): ListCorporateActions's request.
+message ListCorporateActionsRequest {
+  // Each a company or an instrument, with the role it must hold on the row
+  // where given. Never empty.
+  repeated SubjectRef subjects = 1;
+  // A plain date on the kind's date. Empty: no lower bound.
+  string from_date = 2;
+  // A plain date on the kind's date. Empty: to the latest.
+  string to_date = 3;
+  // The kinds answered. None: every kind.
+  repeated CorporateActionKind kinds = 4;
+  // The version in force by published time, among rows recorded by as_of_ns.
+  // 0: no published-time cut.
+  int64 published_as_of_ns = 5;
+  // The default, named datasets, or every entitled dataset side by side.
+  // Unset: the deployment's default.
+  SourceChoice sources = 6;
+  // The recorded-time cut-off: nothing recorded after it answers. 0: what the
+  // lake knows now.
+  int64 as_of_ns = 7;
+  // How many rows a page holds at most. 0 is 100; past 500, answered at 500.
+  uint32 page_size = 8;
+  // The previous reply's next_cursor, as given. Empty for the first page.
+  string cursor = 9;
+  // The watermark the reader last saw: answered the rows each dataset
+  // partition it names recorded after its sequence there, for the subjects
+  // asked, whatever their dates (amendment to DESIGN28, 2026-10-24: an
+  // unconflated row is caught up after a watermark, as trades and outcomes
+  // are). Unset: a read by dates, or as of as_of_ns.
+  Watermark after_watermark = 10;
+}
+
+// Contract v28 (W10.6): ListCorporateActions's answer.
+message ListCorporateActionsReply {
+  // The rows, each naming its dataset. None answered.
+  repeated CorporateActionAnnounced actions = 1;
+  // Each subject, dataset and field not answered, with its reason. None: every
+  // part answered.
+  repeated Unanswered unanswered = 2;
+  // Each dataset answered, with its vendor, declaration and liveness. None
+  // answered.
+  repeated DatasetRef datasets = 3;
+  // The sequence per partition the answer holds, from which a reader hears
+  // what follows. Never unset on an answer.
+  Watermark watermark = 4;
+  // Opaque, passed back as cursor. Empty on the last page.
+  string next_cursor = 5;
+}
+
+// Contract v28: a rating agency's action on a rating, from its published
+// history (contract v28).
+message RatingAction {
+  // Its row key, its subjects with their roles, its source, valid time and
+  // business date where it has one, its published time, version and sequence.
+  // Never unset.
+  ObservationMeta meta = 1;
+  // The agency's symbol, AA+, Baa2. Empty on a withdrawal.
+  string rating = 2;
+  // The 17g-7 rating type: issuer, issue, long or short term. Never empty.
+  string rating_class = 3;
+  // The action, from the history's action type. Unspecified is refused.
+  RatingActionKind action = 4;
+}
+
+// Contract v28 (W10.4): RecordRatingActions's request.
+message RecordRatingActionsRequest {
+  // 1 to 500 rows, recorded whole or refused naming the item and field. Never
+  // empty.
+  repeated RatingAction actions = 1;
+  // The want's identifier as it was delivered. Empty: recorded unasked.
+  string want_id = 2;
+}
+
+// Contract v28 (W10.6): ListRatingActions's request.
+message ListRatingActionsRequest {
+  // Each a company or an instrument, with the role it must hold on the row
+  // where given. Never empty.
+  repeated SubjectRef subjects = 1;
+  // A plain date on the kind's date. Empty: no lower bound.
+  string from_date = 2;
+  // A plain date on the kind's date. Empty: to the latest.
+  string to_date = 3;
+  // The kinds answered. None: every kind.
+  repeated RatingActionKind kinds = 4;
+  // The version in force by published time, among rows recorded by as_of_ns.
+  // 0: no published-time cut.
+  int64 published_as_of_ns = 5;
+  // The default, named datasets, or every entitled dataset side by side.
+  // Unset: the deployment's default.
+  SourceChoice sources = 6;
+  // The recorded-time cut-off: nothing recorded after it answers. 0: what the
+  // lake knows now.
+  int64 as_of_ns = 7;
+  // How many rows a page holds at most. 0 is 100; past 500, answered at 500.
+  uint32 page_size = 8;
+  // The previous reply's next_cursor, as given. Empty for the first page.
+  string cursor = 9;
+}
+
+// Contract v28 (W10.6): ListRatingActions's answer.
+message ListRatingActionsReply {
+  // The rows, each naming its dataset. None answered.
+  repeated RatingAction actions = 1;
+  // Each subject, dataset and field not answered, with its reason. None: every
+  // part answered.
+  repeated Unanswered unanswered = 2;
+  // Each dataset answered, with its vendor, declaration and liveness. None
+  // answered.
+  repeated DatasetRef datasets = 3;
+  // The sequence per partition the answer holds, from which a reader hears
+  // what follows. Never unset on an answer.
+  Watermark watermark = 4;
+  // Opaque, passed back as cursor. Empty on the last page.
+  string next_cursor = 5;
+}
+
+enum SubjectRole {
+  // Read as subject: every row before v28.
+  SUBJECT_ROLE_UNSPECIFIED = 0;
+  // What the row is about.
+  SUBJECT_ROLE_SUBJECT = 1;
+  // Who holds: a 13F manager, a 13D or 13G filer.
+  SUBJECT_ROLE_HOLDER = 2;
+  // What is held, or an issue rated.
+  SUBJECT_ROLE_HELD = 3;
+  // Who issued it.
+  SUBJECT_ROLE_ISSUER = 4;
+  // An insider reporting ownership.
+  SUBJECT_ROLE_REPORTING_OWNER = 5;
+  // Who filed.
+  SUBJECT_ROLE_FILER = 6;
+  // What a derivative is on.
+  SUBJECT_ROLE_UNDERLYING = 7;
+  // The rating agency (FDP Q7).
+  SUBJECT_ROLE_RATER = 8;
+}
+
+enum FilingKind {
+  // Refused.
+  FILING_KIND_UNSPECIFIED = 0;
+  // 10-K, 20-F, 40-F.
+  FILING_KIND_ANNUAL_REPORT = 1;
+  // 10-Q.
+  FILING_KIND_QUARTERLY_REPORT = 2;
+  // 8-K, 6-K.
+  FILING_KIND_CURRENT_REPORT = 3;
+  // DEF 14A and its kin.
+  FILING_KIND_PROXY = 4;
+  // S-1, F-1 and their amendments.
+  FILING_KIND_REGISTRATION = 5;
+  // Forms 3, 4 and 5.
+  FILING_KIND_OWNERSHIP = 6;
+  // 13F-HR.
+  FILING_KIND_HOLDINGS_REPORT = 7;
+  // Schedules 13D and 13G.
+  FILING_KIND_BENEFICIAL_OWNERSHIP = 8;
+  // Any other form, its form as reported.
+  FILING_KIND_OTHER = 9;
+}
+
+enum HoldingsReportKind {
+  // Refused.
+  HOLDINGS_REPORT_KIND_UNSPECIFIED = 0;
+  // A 13F-HR.
+  HOLDINGS_REPORT_KIND_FORM_13F = 1;
+  // A Schedule 13D or its amendment.
+  HOLDINGS_REPORT_KIND_SCHEDULE_13D = 2;
+  // A Schedule 13G or its amendment.
+  HOLDINGS_REPORT_KIND_SCHEDULE_13G = 3;
+}
+
+enum CorporateActionKind {
+  // Refused.
+  CORPORATE_ACTION_KIND_UNSPECIFIED = 0;
+  // A declared cash dividend.
+  CORPORATE_ACTION_KIND_CASH_DIVIDEND = 1;
+}
+
+enum RatingActionKind {
+  // Refused.
+  RATING_ACTION_KIND_UNSPECIFIED = 0;
+  // A new rating.
+  RATING_ACTION_KIND_NEW = 1;
+  // Raised.
+  RATING_ACTION_KIND_UPGRADE = 2;
+  // Lowered.
+  RATING_ACTION_KIND_DOWNGRADE = 3;
+  // Affirmed.
+  RATING_ACTION_KIND_AFFIRMED = 4;
+  // Withdrawn.
+  RATING_ACTION_KIND_WITHDRAWN = 5;
 }
