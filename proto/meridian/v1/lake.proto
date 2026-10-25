@@ -34,6 +34,8 @@ import "meridian/v1/journal.proto";
 import "meridian/v1/book.proto";
 // A curve point's tenor (contract v27, the rates slice).
 import "meridian/v1/reference.proto";
+// A derived value's rule and a saved scenario (contract v28).
+import "meridian/v1/scenarios.proto";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // The envelope
@@ -1496,4 +1498,97 @@ enum StatisticKind {
   // All shares reported to that facility on the date, the same file's total
   // (ruling 593).
   STATISTIC_KIND_TOTAL_VOLUME = 5;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Contract v28, track B: the engine's chains and the common scenario format
+// (sdk-contract/the-common-scenario-format-contract;
+// sdk-contract/signal-derives-data-from-sources)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Contract v28: one value of a signal plugin's own series, naming its rule and
+// inputs, never presented as a publisher's figure (contract v28).
+message DerivedSeries {
+  // Its key, subject, the signal plugin's own derived dataset, its business
+  // date and version. Never unset.
+  ObservationMeta meta = 1;
+  // Its own name for it: iv30, the index's level, a positioning summary's
+  // part. Never empty.
+  string series = 2;
+  // As derived. Never unset.
+  UnitValue value = 3;
+  // A definition and its version, an analytics measure's where one was used.
+  // Never unset.
+  MeasureRef rule = 4;
+  // Each dataset read and the as-of it was read at, so licences and counts can
+  // follow it. Never empty.
+  repeated DerivedInput inputs = 5;
+}
+
+// Contract v28 (DerivedSeries.inputs): names what the value was derived from.
+message DerivedInput {
+  // As the lake named it. Never empty.
+  string dataset = 1;
+  // Nanoseconds since the epoch. 0: not pinned.
+  int64 as_of_ns = 2;
+}
+
+// Contract v28 (W10.4): RecordDerivedSeries's request.
+message RecordDerivedSeriesRequest {
+  // 1 to 500 rows, recorded whole or refused naming the item and field. Never
+  // empty.
+  repeated DerivedSeries values = 1;
+}
+
+// Contract v28 (W10.6): ListDerivedSeries's request.
+message ListDerivedSeriesRequest {
+  // Each an INS- record. Never empty.
+  repeated SubjectRef subjects = 1;
+  // The plugin's own names. None: every series.
+  repeated string series = 2;
+  // A plain date. Empty: no lower bound.
+  string from_date = 3;
+  // A plain date. Empty: to the latest.
+  string to_date = 4;
+}
+
+// Contract v28 (W10.6): ListDerivedSeries's answer.
+message ListDerivedSeriesReply {
+  // Each naming its rule and inputs. None answered.
+  repeated DerivedSeries values = 1;
+}
+
+// Contract v28: a scenario or scenario set a signal plugin saved, each change
+// the next version of its key (contract v28, W12.8).
+message SavedScenario {
+  // Its row key (the plugin's), its dataset and version; an edit is the next
+  // version. Never unset.
+  ObservationMeta meta = 1;
+  // One point. Unset where scenario_set is set.
+  Scenario scenario = 2;
+  // Its axes, never its points. Unset where scenario is set.
+  ScenarioSet scenario_set = 3;
+  // A person's words. Empty: no description.
+  string description = 4;
+}
+
+// Contract v28 (W12.8): RecordScenarios's request.
+message RecordScenariosRequest {
+  // 1 to 50, each recorded whole or refused naming the item and field. Never
+  // empty.
+  repeated SavedScenario scenarios = 1;
+}
+
+// Contract v28 (W12.8): ListScenarios's request.
+message ListScenariosRequest {
+  // Their row keys. None: every saved scenario.
+  repeated string row_keys = 1;
+  // The row key's version, with one row key. 0: the latest.
+  uint64 version = 2;
+}
+
+// Contract v28 (W12.8): ListScenarios's answer.
+message ListScenariosReply {
+  // Each at the version asked. None saved.
+  repeated SavedScenario scenarios = 1;
 }

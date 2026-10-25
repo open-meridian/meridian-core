@@ -29,6 +29,8 @@ import "meridian/v1/lake.proto";
 import "meridian/v1/book.proto";
 // A series' identifiers (contract v28).
 import "meridian/v1/reference.proto";
+// A measure's reference and the scenario format (contract v28).
+import "meridian/v1/scenarios.proto";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // W12.1 — a client runs a job
@@ -59,6 +61,12 @@ message Job {
   // series not held are priced from their chain rows, never minted (ruling
   // 561). None: the job is over its accounts alone.
   repeated ChainRef chains = 7;
+  // Contract v28: the axes the engine generates the points from; the answer's
+  // hash covers it. Unset: no inline scenario.
+  ScenarioSet scenario_set = 8;
+  // Contract v28: its row key and version in the lake (W12.8); refused beside
+  // scenario_set. Unset: no saved scenario.
+  ScenarioRef scenario_ref = 9;
 }
 
 // A job's inputs, by reference (requirement 3): one watermark and one as-of
@@ -71,23 +79,6 @@ message InputRefs {
   int64 lake_as_of_ns = 2;
   // The lake's source choice; none set is the deployment's default.
   SourceChoice sources = 3;
-}
-
-// A measure, by definition and version (requirement 14).
-message MeasureRef {
-  // A definition the component serves: `market_value`, `exposure`,
-  // `concentration`, `pnl`, `historical_var`, `expected_shortfall`,
-  // `resolution_payoff`, `implied_distribution` in v26; from v27 `pnl`
-  // version 2 (realized beside unrealized) and `execution_cost`.
-  string definition = 1;
-  // Its version, 1 or more.
-  int32 version = 2;
-  // What to break the figures down by, each a breakdown the definition
-  // allows: `account`, `asset_class`, `currency`, `instrument`, `sleeve`,
-  // `country`, or a scheme the deployment holds by its name.
-  repeated string breakdowns = 3;
-  // For an event measure, the event group it is over (W3.30).
-  string event_group_id = 4;
 }
 
 // Trades added to one account's positions for a what-if (W12.5): never a
@@ -190,6 +181,15 @@ message ScenarioKey {
   string business_date = 2;
   // For an outcome, the member of the event group that resolves YES.
   string outcome_instrument_id = 3;
+  // Contract v28: the saved row key, or `inline` for a job's own set. Empty
+  // except on a scenario point.
+  string scenario_row_key = 4;
+  // Contract v28: the row key's version. 0 except on a saved scenario's point.
+  uint64 scenario_version = 5;
+  // Contract v28: one position per axis, from 0, in the set's axis order: the
+  // point is the product of those steps. None except on a scenario set's
+  // point.
+  repeated uint32 axis_positions = 6;
 }
 
 enum ScenarioKind {
@@ -206,6 +206,9 @@ enum ScenarioKind {
   // No named member resolving YES, for a group mutually exclusive and not
   // exhaustive (the options and event contracts spec's question 4).
   SCENARIO_KIND_NONE_OF_THE_NAMED = 5;
+  // Contract v28: One point of a scenario or a scenario set, keyed by its set
+  // and axis positions.
+  SCENARIO_KIND_SCENARIO_POINT = 6;
 }
 
 // A position or a figure not evaluated, and why (requirement 9): never
@@ -637,4 +640,21 @@ message ChainRef {
   // Their occ_osi symbols, or symbol and MIC pairs. None: every series in the
   // window.
   repeated Identifier series_keys = 4;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Contract v28, track B: the engine's chains and the common scenario format
+// (sdk-contract/the-common-scenario-format-contract;
+// sdk-contract/signal-derives-data-from-sources)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Contract v28 (Job.scenario_ref): names a saved scenario or set.
+message ScenarioRef {
+  // Its row key in the signal plugin's scenarios dataset. Never empty.
+  string row_key = 1;
+  // The signal plugin's scenarios dataset. Never empty.
+  string dataset = 2;
+  // The row key's version; an edited scenario is a new version. 0: the latest
+  // version.
+  uint64 version = 3;
 }
