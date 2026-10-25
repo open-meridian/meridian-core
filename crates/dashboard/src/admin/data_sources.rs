@@ -52,10 +52,12 @@ pub const SET_DATASET_ENTITLEMENT: &str = "platform.config.command.set-dataset-e
 const WAIT: Duration = Duration::from_secs(5);
 
 /// The page's tabs, in the order an admin reaches for them.
-pub const TABS: [(&str, &str); 3] = [
+pub const TABS: [(&str, &str); 4] = [
     ("datasets", "Datasets"),
     ("entitlements", "Entitlements"),
     ("priority", "Priority"),
+    // Contract v28 (W10.9): the monitor's data age and session latency.
+    ("age", "Age"),
 ];
 
 async fn read<R: Message + Default>(
@@ -591,6 +593,7 @@ pub fn page(
     records: &AccessRecords,
     token: &str,
     notice: &str,
+    ages: &[meridian_domain::latency::Read],
 ) -> String {
     let unread = |why: &str| {
         format!(
@@ -626,7 +629,7 @@ pub fn page(
                aria-label=\"Add a priority\">+ Add</button>";
     format!(
         "<div class=\"admin\"><div class=\"page-head\"><h1>Data sources</h1></div>{notice}\
-         <nav class=\"tabs\">{tabs}</nav>{}{}{}{datasets_dialogs}{priority_dialog}</div>\
+         <nav class=\"tabs\">{tabs}</nav>{}{}{}{}{datasets_dialogs}{priority_dialog}</div>\
          <script>{}{}{PAGER_SCRIPT}</script>",
         section(
             "datasets",
@@ -651,6 +654,15 @@ pub fn page(
              over when one is silent.",
             add,
             &priority_body
+        ),
+        section(
+            "age",
+            "Age",
+            "Over the last minute, how old each dataset's rows are at each hop, from the source's \
+             time, and each plugin's sessions' round trip, order acknowledgement and fill delay, \
+             as the plugins measure them.",
+            "",
+            &crate::latency::tab(ages)
         ),
         super::overview::SCRIPT_START,
         super::overview::SCRIPT_END,
@@ -724,6 +736,7 @@ mod tests {
             &records,
             "<t>",
             "",
+            &[],
         );
         assert!(body.contains("data-datasets=\"1\""), "{body}");
         assert!(body.contains("<td class=\"wide num\" data-unconverted>2</td>"));
@@ -764,6 +777,7 @@ mod tests {
             &records,
             "<t>",
             "",
+            &[],
         );
         assert!(body.contains("data-one-person"), "{body}");
         // Not one person's terms: no warning however many read.
@@ -789,6 +803,7 @@ mod tests {
             &AccessRecords::default(),
             "<t>",
             "",
+            &[],
         );
         assert!(body.contains("Price, close"));
         assert!(body.contains("a-1:daily then b-1:daily"));
@@ -807,6 +822,7 @@ mod tests {
             &AccessRecords::default(),
             "<t>",
             "",
+            &[],
         );
         assert!(body.contains("The lake did not answer: timed out"));
     }

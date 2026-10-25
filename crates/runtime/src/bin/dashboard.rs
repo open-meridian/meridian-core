@@ -535,6 +535,9 @@ fn run() -> Result<(), String> {
         // instance its sidecar names (W4.12): the first topics the
         // dashboard answers.
         meridian_dashboard::tickets::plugin::serve(Arc::clone(&app));
+        // Core's latency monitor (contract v28; W4.16): every plugin's
+        // ReportLatency, merged for the Age tab and dashboard__read_data_age.
+        meridian_dashboard::latency::serve(Arc::clone(&app));
         // The prepared change a page was opened from, and a person's own
         // settings (W4.14, W6.31, contract v20).
         meridian_dashboard::prepared::serve(Arc::clone(&app));

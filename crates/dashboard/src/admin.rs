@@ -4044,6 +4044,7 @@ async fn data_sources_page(
         &records,
         &token_input(&session),
         field(&query, "done"),
+        &crate::latency::reads(app.clock.now_ns()),
     );
     Html(page_with(
         "Data sources",

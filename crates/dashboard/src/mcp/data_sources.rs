@@ -67,6 +67,18 @@ const fn spec(
 }
 
 pub static SPECS: &[Spec] = &[
+    // Contract v28's latency remainder (W10.9, W4.16; rulings 515, 517):
+    // the monitor's read, the deployment admin's.
+    spec(
+        "read_data_age",
+        "Read the data age",
+        "the data age per dataset and hop, and each data, connectivity or execution plugin's \
+sessions' round trip, order acknowledgement and fill delay, over the last minute: p50, p95 and \
+p99 in nanoseconds, how many were measured, the plugin that measured them, the session's last \
+sign of life and its backlog's peak. Measured by the plugins and core, never a price; no row.",
+        true,
+        nothing_schema,
+    ),
     spec(
         "list_datasets",
         "List datasets",
@@ -308,6 +320,7 @@ fn priority_json(p: &SourcePriority) -> Value {
 pub async fn call(app: &App, caller: &Caller, spec: &Spec, arguments: Value) -> Value {
     match spec.name {
         "list_datasets" => list_datasets(app, caller, &arguments).await,
+        "read_data_age" => read_data_age(app, caller, &arguments),
         "set_dataset_licence" => set_licence(app, caller, &arguments).await,
         "set_dataset_entitlement" => set_entitlement(app, caller, &arguments).await,
         "list_source_priorities" => list_priorities(app, caller, &arguments).await,
@@ -474,6 +487,29 @@ async fn set_entitlement(app: &App, caller: &Caller, arguments: &Value) -> Value
     }
 }
 
+/// W10.9 (contract v28): the monitor's read, the deployment admin's.
+fn read_data_age(app: &App, caller: &Caller, arguments: &Value) -> Value {
+    if let Some(refusal) = nothing(arguments) {
+        return refusal;
+    }
+    let records = match app.records.current(app.clock.now_ns()) {
+        Ok(records) => records,
+        Err(stale) => return refused("unavailable", &stale.to_string(), Vec::new()),
+    };
+    if !caller.access(&records).deployment_admin {
+        return refused(
+            "not_permitted",
+            "the data age is a deployment admin's to read",
+            Vec::new(),
+        );
+    }
+    let reads = crate::latency::reads(app.clock.now_ns());
+    json!({"outcome": "unchanged", "data": {
+        "window_ns": crate::latency::WINDOW_NS.to_string(),
+        "ages": reads.iter().map(crate::latency::json).collect::<Vec<_>>(),
+    }})
+}
+
 async fn list_priorities(app: &App, caller: &Caller, arguments: &Value) -> Value {
     if let Some(refusal) = nothing(arguments) {
         return refusal;
@@ -579,6 +615,8 @@ pub const PARITY: &[(&str, &str)] = &[
     ("tab datasets", "list_datasets"),
     ("tab entitlements", "list_datasets set_dataset_entitlement"),
     ("tab priority", "list_source_priorities set_source_priority"),
+    // Contract v28 (W10.9): the Age tab.
+    ("tab age", "read_data_age"),
     (
         "/admin/data-sources",
         "list_datasets list_source_priorities",
