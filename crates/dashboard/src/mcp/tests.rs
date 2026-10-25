@@ -3144,10 +3144,22 @@ async fn a_lake_query_is_asked_as_the_instance_named_and_the_dictionary_answers_
             heard.lock().unwrap().push(
                 meridian_domain::v1::QueryLakeRequest::decode(&envelope.payload[..]).unwrap(),
             );
+            // Contract v28 (ruling 619): an invalid row, answered to a query
+            // naming its dataset with include_quarantined.
+            let outcome = meridian_domain::v1::Outcome {
+                meta: Some(meridian_domain::v1::ObservationMeta {
+                    row_key: "k".into(),
+                    quality: meridian_domain::v1::QualityState::Invalid as i32,
+                    quality_reasons: vec![meridian_domain::v1::QualityReason::PriceOutlier as i32],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
             Ok((
                 "meridian.v1.QueryLakeReply".into(),
                 meridian_domain::v1::QueryLakeReply {
                     truncated: true,
+                    outcomes: vec![outcome],
                     ..Default::default()
                 }
                 .encode_to_vec(),
@@ -3180,6 +3192,29 @@ async fn a_lake_query_is_asked_as_the_instance_named_and_the_dictionary_answers_
     assert_eq!(structured(&said)["data"]["truncated"], true, "{said}");
     let sent = asked.lock().unwrap()[0].clone();
     assert_eq!((sent.instance_id.as_str(), sent.row_limit), (INSTANCE, 2));
+    // Contract v28 (W10.6; ruling 619): include_quarantined passed to the
+    // lake, and each row's quality and reasons answered on its meta.
+    let (_, said, _) = rpc(
+        &h.app,
+        Some(&reading),
+        &[],
+        call(
+            "dashboard__query_lake",
+            json!({"plugin_instance_id": INSTANCE, "kind": "outcomes", "subjects": ["INS-A"],
+                   "sources": {"named": ["kalshi-1:outcomes"], "include_quarantined": true}}),
+        ),
+    )
+    .await;
+    let meta = &structured(&said)["data"]["outcomes"][0]["meta"];
+    assert_eq!(meta["quality"], "QUALITY_STATE_INVALID", "{said}");
+    assert_eq!(
+        meta["quality_reasons"][0], "QUALITY_REASON_PRICE_OUTLIER",
+        "{said}"
+    );
+    let sent = asked.lock().unwrap()[1].clone();
+    let sources = sent.sources.unwrap();
+    assert!(sources.include_quarantined);
+    assert_eq!(sources.named, vec!["kalshi-1:outcomes".to_string()]);
     let (_, said, _) = rpc(
         &h.app,
         Some(&reading),

@@ -409,6 +409,9 @@ fn query_lake_schema() -> Value {
                     "default": {"type": "boolean"},
                     "named": {"type": "array", "items": {"type": "string"}, "maxItems": 16},
                     "side_by_side": {"type": "boolean"},
+                    // Contract v28 (W10.6; rulings 421 and 619): invalid
+                    // rows too, on a query naming its datasets.
+                    "include_quarantined": {"type": "boolean", "description": "with named: invalid rows too, each with its quality and reasons"},
                 },
                 "additionalProperties": false,
             },
@@ -1802,7 +1805,10 @@ impl Context<'_> {
                     .get("side_by_side")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
-                ..Default::default()
+                include_quarantined: choice
+                    .get("include_quarantined")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
             }),
             Some(_) => {
                 problems.add("sources", "an object: default, named or side_by_side");
