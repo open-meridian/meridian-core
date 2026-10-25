@@ -25,6 +25,13 @@
 //! those recorded by the recorded-time cut. A catch-up
 //! after a watermark (trades, the plan's Q33) asks no source: what was not
 //! recorded since is nothing new.
+//!
+//! From contract v28 (W10.6; rulings 421, 422 and 619) every row answers its
+//! effective quality, and a read that does not name its datasets with
+//! `include_quarantined` leaves a row whose state is invalid out before the
+//! latest is chosen, so the last row not invalid stands; a dataset left with
+//! nothing for a subject is source silent, asked nothing and never fallen
+//! back to. A suspicious row is served, flagged.
 
 use std::collections::{BTreeMap, BTreeSet};
 

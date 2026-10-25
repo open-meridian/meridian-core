@@ -29,6 +29,13 @@ services:
       - ${MERIDIAN_HARNESS_STAND_IN}:/stand-in:ro
     environment:
       STAND_IN_LAKE: desk
+  # Contract v28: a signal plugin escalating a close's quality (W10.12).
+  lens:
+    entrypoint: ["python", "-u", "/stand-in/stand_in.py"]
+    volumes:
+      - ${MERIDIAN_HARNESS_STAND_IN}:/stand-in:ro
+    environment:
+      STAND_IN_LAKE: signal
   # The harness's master answers JPY nine seconds late, past the resolve's eight-second bounded ask and within the
   # conductor's ten-second request (contract v24;
   # v20's five-second sidecar call before it; the 2026-10-11 ruling): a slow master mints nothing, and a later

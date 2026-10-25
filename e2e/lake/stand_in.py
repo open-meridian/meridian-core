@@ -42,7 +42,10 @@ receive of TradesRecorded and QuotesRecorded) and serving:
   /follow?subject=ID...      hears trades and quotes about them;
   /heard                     each trade and quote heard, with its sequence;
   /catch-up?after=N          ListTrades after the watermark live:N;
-  /quotes?subject=ID         ListQuotes, the latest in force;
+  /quotes?subject=ID[&dataset=D][&quarantined=1]
+                             ListQuotes, the latest in force, each with its
+                             quality; with quarantined, include_quarantined
+                             (contract v28), its refusal said;
   /quotes-wanted?subject=ID  ListQuotes of a subject nothing recorded.
 
 From contract v27 (the rates slice) it declares `rates` -- rates, pulled
@@ -62,14 +65,34 @@ And from contract v20 (W10.6, W10.9, W3.1):
 
 The wire is the SDK's own (SDK 0.24.0 carries v20's typed operations).
 
+From contract v28 (quality states; W10.4, W10.6, W10.12; ruling 619):
+
+  /quality   records four BTC quotes on `live` through the SDK's edge
+             checks (meridian.roles.data.quality.EdgeChecks): one valid,
+             the same again under a new key (a duplicate, suspicious), one
+             after a sequence gap (suspicious) and, resynced, a crossed one
+             (invalid), each recorded with its state.
+
+STAND_IN_LAKE=signal is a `signal` plugin serving:
+
+  /assess?subject=ID&date=D&state=S[&version=N]
+             reads the subject's close for the date from coin:daily and
+             records its assessment (RecordQualityAssessments), its version
+             the row's unless given; answering what was recorded or the
+             refusal.
+
 STAND_IN_LAKE=reader serves:
 
   /follow?subject=ID...                     hears what is recorded for them;
   /heard                                    what it heard, each row's dataset,
                                             row key and version;
   /prices?subject=ID&date=D[&kind=K][&dataset=D][&as_of=N][&latest=1]
-                                            one read, its rows and what it left
-                                            unanswered;
+         [&quarantined=1]
+                                            one read, its rows (each with its
+                                            quality) and what it left
+                                            unanswered; with quarantined, the
+                                            datasets named include_quarantined
+                                            (contract v28), its refusal said;
   /datasets                                 the datasets it may read;
   /invalid-date?subject=ID                  a read naming 2026-02-30, sent past
                                             the SDK's own check, as the sidecar
@@ -86,6 +109,7 @@ beside this file; `make e2e-recorded` the directory RECORDED names, a
 developer's recorded exchanges, never committed.
 """
 import asyncio
+import dataclasses
 import http.server
 import json
 import os
@@ -109,12 +133,14 @@ from meridian import (  # noqa: E402
     ObservationMeta,
     Page,
     Price,
+    Quote,
     SourceChoice,
     SourceTime,
 )
 from meridian.operations import as_decimal, as_money  # noqa: E402
 from meridian.plugin.v1 import operations_pb2 as ops  # noqa: E402
 from meridian.roles.data import rates as rate_helpers  # noqa: E402
+from meridian.roles.data.quality import EdgeChecks, assessment  # noqa: E402
 
 KIND = os.environ.get("STAND_IN_LAKE", "data")
 PORT = 8088
@@ -432,6 +458,40 @@ class Dgm:
         log(late=said)
         return said
 
+    async def quality(self):
+        """Contract v28 (W10.4; ruling 424): BTC's quotes on `live` judged by
+        the SDK's edge checks, as a data plugin's `Wants.record` judges them:
+        valid; the same again under a new key, a duplicate; after a gap in
+        the stream's sequence; and, resynced, crossed."""
+        await self.resolve()
+        edge = EdgeChecks()
+        now = time.time_ns()
+
+        def quote(key, at, bid, ask):
+            return Quote(
+                meta=ObservationMeta(
+                    row_key=key,
+                    subjects=[meridian.SubjectRef(entity_id=self.ids["btc"])],
+                    source=ops.Source(dataset=self.dataset("live"), venue_id=VENUE),
+                    valid_from_ns=at),
+                bid=Money(Decimal(bid), "USD"), ask=Money(Decimal(ask), "USD"))
+
+        live = "live"
+        edge.sequenced(live, 1)
+        rows = edge.judged(live, [quote("BTC-USD-Q-21", now + 1000, "62010", "62012")])
+        rows += edge.judged(live, [quote("BTC-USD-Q-22", now + 2000, "62010", "62012")])
+        edge.sequenced(live, 2)
+        edge.sequenced(live, 5)
+        rows += edge.judged(live, [quote("BTC-USD-Q-23", now + 3000, "62011", "62013")])
+        edge.resynced(live)
+        rows += edge.judged(live, [quote("BTC-USD-Q-24", now + 4000, "62020", "62015")])
+        done = await self.plugin.record_quotes(quotes=rows)
+        said = {"recorded": done.recorded,
+                "states": {r.meta.row_key: [str(r.meta.quality or "valid"),
+                                            list(r.meta.quality_reasons)] for r in rows}}
+        log(quality=said)
+        return said
+
     async def rates(self):
         """Contract v27 (W10.4): SOFR's fixing and Treasury's par curve for
         one date, through the SDK's rates helpers; then the fixing revised,
@@ -526,6 +586,8 @@ class Dgm:
             return await self.resolve_as_of(query)
         if path == "/rates":
             return await self.rates()
+        if path == "/quality":
+            return await self.quality()
         if path == "/resolve":
             return await self.resolve()
         if path == "/record":
@@ -556,7 +618,16 @@ def price_json(price):
         "amount": str(money.amount),
         "instrument_id": money.instrument_id,
         "currency_code": money.currency_code,
+        # Contract v28: the row's effective state and its reasons.
+        "quality": ops.QualityState.Name(meta.quality),
+        "quality_reasons": [ops.QualityReason.Name(r) for r in meta.quality_reasons],
     }
+
+
+def refusal_of(failed):
+    """A refusal as gRPC carries it, in words."""
+    details = getattr(failed, "details", None)
+    return details() if callable(details) else str(failed)
 
 
 class Reader:
@@ -579,7 +650,9 @@ class Reader:
         one = lambda name, default="": query.get(name, [default])[0]
         subjects = [meridian.SubjectRef(entity_id=s) for s in query.get("subject", [])]
         named = query.get("dataset", [])
-        sources = SourceChoice(named=named) if named else None
+        quarantined = one("quarantined") == "1"
+        sources = (ops.SourceChoice(named=named, include_quarantined=quarantined)
+                   if named or quarantined else None)
         asked = {"subjects": subjects, "sources": sources}
         if one("kind"):
             asked["kinds"] = [one("kind")]
@@ -587,7 +660,10 @@ class Reader:
             asked["business_date"] = one("date")
         if one("as_of"):
             asked["as_of_ns"] = int(one("as_of"))
-        answer = await self.plugin.list_prices(**asked)
+        try:
+            answer = await self.plugin.list_prices(**asked)
+        except Exception as failed:  # the lake's refusal, said back
+            return {"refused": refusal_of(failed), "prices": [], "unanswered": []}
         return {
             "prices": [price_json(price) for price in answer.prices],
             "unanswered": [{"subject": u.subject.entity_id, "dataset": u.dataset,
@@ -672,7 +748,10 @@ def quote_json(quote):
     side = quote.bid if quote.HasField("bid") else quote.ask
     return {"row_key": meta.row_key, "version": meta.version, "sequence": meta.sequence,
             "bid": _amount(quote.bid.amount) if quote.HasField("bid") else "",
-            "instrument_id": side.instrument_id}
+            "instrument_id": side.instrument_id,
+            # Contract v28: the row's state and its reasons.
+            "quality": ops.QualityState.Name(meta.quality),
+            "quality_reasons": [ops.QualityReason.Name(r) for r in meta.quality_reasons]}
 
 
 class Desk:
@@ -723,10 +802,53 @@ class Desk:
             except Exception as refused:  # the sidecar's answer, said back
                 return {"refused": str(refused)[:300]}
         if path in ("/quotes", "/quotes-wanted"):
-            answer = await self.plugin._operations().ListQuotes(ops.ListQuotesParams(subjects=refs))
+            named = query.get("dataset", [])
+            quarantined = query.get("quarantined", [""])[0] == "1"
+            params = ops.ListQuotesParams(subjects=refs)
+            if named or quarantined:
+                params.sources.CopyFrom(ops.SourceChoice(named=named,
+                                                         include_quarantined=quarantined))
+            try:
+                answer = await self.plugin._operations().ListQuotes(params)
+            except Exception as failed:  # the lake's refusal, said back
+                return {"refused": refusal_of(failed), "quotes": [], "unanswered": []}
             return {"quotes": [quote_json(q) for q in answer.quotes],
                     "unanswered": [ops.UnansweredReason.Name(u.reason) for u in answer.unanswered]}
         return {"page": "the lake's desk stand-in"}
+
+
+# ── The lens: a signal plugin escalating a close's quality (contract v28) ──
+
+
+class Lens:
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    async def assess(self, query):
+        """W10.12: read the close, then record its assessment, as a signal
+        plugin does once its baseline finds it an outlier."""
+        one = lambda name, default="": query.get(name, [default])[0]  # noqa: E731
+        read = await self.plugin.list_prices(
+            subjects=[meridian.SubjectRef(entity_id=one("subject"))], kinds=["close"],
+            business_date=one("date"),
+            sources=ops.SourceChoice(named=["coin:daily"], include_quarantined=True))
+        if not read.prices:
+            return {"refused": f"no close read: {read.unanswered}"}
+        found = assessment(read.prices[0], one("state"), ("price_outlier",))
+        if one("version"):
+            found = dataclasses.replace(found, version=int(one("version")))
+        try:
+            done = await self.plugin.record_quality_assessments(assessments=[found])
+        except Exception as failed:  # the lake's refusal, said back
+            return {"refused": refusal_of(failed)}
+        said = {"recorded": done.recorded, "row_key": found.row_key, "version": found.version}
+        log(assessed=said)
+        return said
+
+    async def answer(self, path, query):
+        if path == "/assess":
+            return await self.assess(query)
+        return {"page": "the lake's signal stand-in"}
 
 
 # ── Serving the page ────────────────────────────────────────────────────
@@ -764,6 +886,11 @@ async def main():
         served = Dgm(plugin)
         asyncio.ensure_future(plugin.receive(observations_wanted=served.on_want,
                                              want_withdrawn=served.on_withdrawn))
+    elif KIND == "signal":
+        plugin = await meridian.connect(
+            interface=Interface(PORT, "Signal stand-in", pages=[Page("/", "Quality", levels=["read"])]),
+        )
+        served = Lens(plugin)
     elif KIND == "desk":
         plugin = await meridian.connect(
             interface=Interface(PORT, "Desk stand-in", pages=[Page("/", "Trades", levels=["read"])]),
