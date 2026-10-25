@@ -73,6 +73,11 @@ fn run() -> Result<(), String> {
     )?);
 
     let instance_id = var("MERIDIAN_INSTANCE_ID").unwrap_or_else(|| "instrument-1".into());
+    // The analytics component, whose resolves are read-only (contract v28's
+    // fourth amendment, W3.1).
+    if let Some(analytics) = var("MERIDIAN_ANALYTICS_INSTANCE_ID") {
+        meridian_instrument::service::reads_for_analytics(&analytics);
+    }
 
     // The store is borrowed, never moved in, so it outlives the runtime
     // (meridian_runtime::on_runtime).

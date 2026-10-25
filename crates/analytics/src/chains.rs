@@ -527,6 +527,7 @@ pub fn chain(
     let mut datasets: BTreeSet<String> = declarations.keys().cloned().collect();
     datasets.extend(stats_datasets);
     let mut today_local: Option<String> = None;
+    let mut packages: BTreeMap<(String, String), Option<v1::CalculationPackage>> = BTreeMap::new();
     let mut rows = Vec::new();
     for listed in &series {
         let Some(meta) = &listed.meta else { continue };
@@ -575,10 +576,18 @@ pub fn chain(
             Err(why) => (0, why),
         };
         let european = field(listed, "exercise_style").ends_with("EUROPEAN");
-        let model = match (kind, european) {
-            ("future", _) => "black_76",
-            (_, true) => "black_scholes",
-            _ => "american_binomial",
+        // The model its template version's package binds for its terms
+        // (ruling 576; W12.2): never a table of the engine's own.
+        let (model, unbound) = match bound_model(
+            asker,
+            &listed.template_id,
+            &listed.template_version,
+            field(listed, "exercise_style"),
+            record.as_ref().map_or(0, |r| r.asset_class),
+            &mut packages,
+        ) {
+            Ok(model) => (model, String::new()),
+            Err(why) => (String::new(), why),
         };
         let Some(strike) = amount(field(listed, "strike_price")) else {
             continue;
@@ -615,6 +624,7 @@ pub fn chain(
             "unsessioned": if quotes_refused.is_empty() || quote.is_some() { unsessioned } else { quotes_refused.clone() },
             "exercise_style": if european { "european" } else { "american" },
             "model_id": model,
+            "unbound": unbound,
             "multiplier": amount(field(listed, "contract_multiplier")).unwrap_or_else(|| "100".into()),
             "bid": bid,
             "ask": ask_price,
@@ -716,58 +726,187 @@ pub fn scenario(asker: &dyn Ask, job: &Job) -> Result<Option<Value>, Refused> {
     Ok(Some(scenario::set_json(&saved.row_key, version, &set)))
 }
 
-/// The rate curve a scenario's rate shock names, read at the as-of: its
-/// shortest tenor's value, continuous, a year. None where no shock names
-/// one (DESIGN28 leaves how a job's curve is found unstated; the carry is
-/// then implied from parity whole).
+/// The model a series' template version's calculation package binds for
+/// its exercise style and its underlying's asset class (ruling 576; W1.24,
+/// W12.2): the most specific binding that matches -- a style and a class
+/// named over either left unspecified -- or, for a package with no
+/// bindings, the package's own model. Why not, where none binds.
+fn bound_model(
+    asker: &dyn Ask,
+    template_id: &str,
+    template_version: &str,
+    exercise_style: &str,
+    underlying_asset_class: i32,
+    packages: &mut BTreeMap<(String, String), Option<v1::CalculationPackage>>,
+) -> Result<String, String> {
+    let package = packages
+        .entry((template_id.to_string(), template_version.to_string()))
+        .or_insert_with(|| {
+            let reply: Result<v1::ReadTemplateReply, String> = ask(
+                asker,
+                topics::READ_TEMPLATE,
+                "meridian.v1.ReadTemplateRequest",
+                &v1::ReadTemplateRequest {
+                    template_id: template_id.to_string(),
+                    template_version: template_version.to_string(),
+                },
+            );
+            reply
+                .ok()
+                .and_then(|r| r.template)
+                .and_then(|t| t.calculation_package)
+        })
+        .as_ref()
+        .ok_or_else(|| {
+            format!("template {template_id} version {template_version}: no calculation package")
+        })?;
+    if package.model_bindings.is_empty() {
+        return Ok(package.model_id.clone());
+    }
+    let style = v1::ExerciseStyle::from_str_name(exercise_style).map_or(0, |s| s as i32);
+    package
+        .model_bindings
+        .iter()
+        .filter(|b| b.exercise_style == 0 || b.exercise_style == style)
+        .filter(|b| b.underlying_asset_class == 0 || b.underlying_asset_class == underlying_asset_class)
+        .max_by_key(|b| {
+            u8::from(b.exercise_style != 0) + u8::from(b.underlying_asset_class != 0)
+        })
+        .map(|b| b.model_id.clone())
+        .ok_or_else(|| {
+            format!(
+                "template {template_id} version {template_version} binds no model for {exercise_style}"
+            )
+        })
+}
+
+/// The curves a `risk_free_rate` value names (ruling 608; 611's names):
+/// `ust_cmt`, Treasury's par yield curve -- its constant-maturity rates --
+/// found by its administrator's symbol as the platform seeds the record
+/// (W12.2, W3.1; the fourth amendment).
+const CURVES: &[(&str, &str, &str)] = &[(
+    "ust_cmt",
+    "Daily Treasury Par Yield Curve Rates",
+    "ustreasury",
+)];
+
+/// The job's risk-free curve at the as-of (W12.2; rulings 608 and 611): the
+/// one its definitions' `risk_free_rate` names, resolved read-only by its
+/// symbol and read through the deployment's source priority for rates, its
+/// par yields -- bond-equivalent, compounded twice a year -- as continuous
+/// rates by time in years, for the engine to read at each expiry by its
+/// `rate_interpolation`. Where it cannot be read, why, and every option of
+/// the job is not evaluated naming it.
 pub fn rate(
     asker: &dyn Ask,
-    job: &Job,
+    compiled: &Compiled,
     as_of: i64,
     sources: &Option<v1::SourceChoice>,
-) -> Option<Value> {
-    let set = job.scenario_set.as_ref()?;
-    let curve = set
-        .axes
+) -> Value {
+    let named = compiled
+        .definitions
         .iter()
-        .flat_map(|a| a.steps.iter())
-        .flat_map(|s| s.shocks.iter())
-        .filter(|s| s.object == v1::ShockObject::Rate as i32)
-        .filter_map(|s| s.target.as_ref())
-        .find(|t| !t.every && !t.subject_id.is_empty())?
-        .subject_id
-        .clone();
-    let reply: v1::ListRatesReply = ask(
+        .find_map(|d| d.parameter("risk_free_rate"))
+        .unwrap_or("ust_cmt");
+    let missing = |why: &str| json!({"missing": format!("the risk-free curve {named}: {why}")});
+    let Some(&(_, symbol, source)) = CURVES.iter().find(|(name, _, _)| *name == named) else {
+        return missing("no curve of that name");
+    };
+    let resolved: Result<v1::ResolveIdentifierReply, String> = ask(
         asker,
-        topics::LIST_RATES,
-        "meridian.v1.ListRatesRequest",
-        &v1::ListRatesRequest {
-            subjects: subject(&curve),
-            sources: sources.clone(),
-            at_ns: as_of,
+        topics::RESOLVE_IDENTIFIER,
+        "meridian.v1.ResolveIdentifierRequest",
+        &v1::ResolveIdentifierRequest {
+            identifiers: vec![Identifier {
+                scheme: "symbol".into(),
+                value: symbol.into(),
+                source: source.into(),
+                ..Default::default()
+            }],
             as_of_ns: as_of,
-            page_size: PAGE,
             ..Default::default()
         },
-    )
-    .ok()?;
-    let shortest = reply
-        .rates
+    );
+    let curve = match resolved {
+        Ok(reply) if reply.found && !reply.instrument_id.is_empty() => reply.instrument_id,
+        Ok(_) => return missing("the deployment holds no record of it"),
+        Err(failed) => return missing(&format!("not resolved: {failed}")),
+    };
+    let mut points: Vec<Value> = Vec::new();
+    let mut dataset = String::new();
+    let mut unanswered = String::new();
+    let mut cursor = String::new();
+    loop {
+        let reply: v1::ListRatesReply = match ask(
+            asker,
+            topics::LIST_RATES,
+            "meridian.v1.ListRatesRequest",
+            &v1::ListRatesRequest {
+                subjects: subject(&curve),
+                kinds: vec![v1::RateKind::ParYield as i32],
+                sources: sources.clone(),
+                at_ns: as_of,
+                as_of_ns: as_of,
+                page_size: PAGE,
+                cursor: cursor.clone(),
+                ..Default::default()
+            },
+        ) {
+            Ok(reply) => reply,
+            Err(failed) => return missing(&format!("its rates could not be read: {failed}")),
+        };
+        if let Some(first) = reply.unanswered.first() {
+            unanswered = first.dataset.clone();
+        }
+        for r in &reply.rates {
+            let Some(percent) = r
+                .value
+                .as_ref()
+                .and_then(|v| text_of(v.value.as_ref()))
+                .and_then(|v| v.parse::<f64>().ok())
+            else {
+                continue;
+            };
+            let days = scenario::tenor_days(&r.tenor.unwrap_or_default());
+            if days <= 0.0 {
+                continue;
+            }
+            if dataset.is_empty() {
+                dataset = r
+                    .meta
+                    .as_ref()
+                    .and_then(|m| m.source.as_ref())
+                    .map(|s| s.dataset.clone())
+                    .unwrap_or_default();
+            }
+            points.push(json!({
+                "years": format!("{:.9}", days / 365.0),
+                "rate": format!("{:.12}", 2.0 * (1.0 + percent / 200.0).ln()),
+                "tenor_days": format!("{days}"),
+                "par_yield": format!("{percent}"),
+            }));
+        }
+        if reply.next_cursor.is_empty() {
+            break;
+        }
+        cursor = reply.next_cursor;
+    }
+    if points.is_empty() {
+        return missing(&if unanswered.is_empty() {
+            "no par yields at the as-of".to_string()
+        } else {
+            format!("no par yields at the as-of in {unanswered}")
+        });
+    }
+    let interpolation = compiled
+        .definitions
         .iter()
-        .filter_map(|r| {
-            let tenor = r.tenor.unwrap_or_default();
-            let value = text_of(r.value.as_ref()?.value.as_ref())?;
-            Some((
-                scenario::tenor_days(&tenor),
-                value,
-                r.meta.clone().unwrap_or_default(),
-            ))
-        })
-        .min_by(|a, b| a.0.total_cmp(&b.0))?;
-    let percent: f64 = shortest.1.parse().ok()?;
-    Some(json!({
-        "value": ((1.0 + percent / 100.0).ln()).to_string(),
-        "dataset": shortest.2.source.map(|s| s.dataset).unwrap_or_default(),
+        .find_map(|d| d.parameter("rate_interpolation"))
+        .unwrap_or("cubic_spline");
+    json!({
         "subject_id": curve,
-    }))
+        "dataset": dataset,
+        "interpolation": interpolation,
+        "points": points,
+    })
 }

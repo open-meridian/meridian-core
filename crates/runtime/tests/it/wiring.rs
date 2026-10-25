@@ -568,6 +568,27 @@ fn the_contract_admits_each_role_to_exactly_its_own_work() {
     assert!(ems.may_publish(meridian_lake::service::LIST_DATASETS));
     assert!(ems.may_subscribe("platform.lake.{dataset}.event.trades-recorded"));
     assert!(!ems.may_publish(meridian_lake::service::LIST_PRICES));
+    // Contract v28's third amendment: the analytics component reads a
+    // chain's quotes on a job's behalf (ruling 607), and core's components
+    // send their own hops' ages to the monitor as plugins do (ruling 606).
+    assert!(contract
+        .component("analytics")
+        .may_publish(meridian_lake::service::LIST_QUOTES));
+    // Its default risk-free curve, by its symbol (the fourth amendment).
+    assert!(contract
+        .component("analytics")
+        .may_publish("platform.reference.query.resolve-identifier"));
+    for component in ["analytics", "lake", "sidecar"] {
+        assert!(
+            contract
+                .component(component)
+                .may_publish(meridian_runtime::REPORT_LATENCY_TOPIC),
+            "{component}"
+        );
+    }
+    assert!(!contract
+        .component("bor")
+        .may_publish(meridian_runtime::REPORT_LATENCY_TOPIC));
     // portfolio and oms hear neither (ruled 2026-10-10: portfolio shapes
     // orders and oms aggregates them; signal and ems take high-resolution
     // data).

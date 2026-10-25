@@ -214,6 +214,30 @@ fn stores() -> Stores {
                 "TPL-event" => ("binary_event", &["last", "settlement_value"]),
                 _ => ("quoted_price", &["close", "fx"]),
             };
+            // listed_option v1 binds its model by term (ruling 576; W1.24):
+            // American on an equity the tree, European Black-Scholes.
+            let bind = |style: ExerciseStyle, class: AssetClass, model: &str| ModelBinding {
+                exercise_style: style as i32,
+                underlying_asset_class: class as i32,
+                model_id: model.into(),
+                model_version: 1,
+            };
+            let model_bindings = if request.template_id == "TPL-listed-option" {
+                vec![
+                    bind(
+                        ExerciseStyle::American,
+                        AssetClass::Equity,
+                        "american_binomial",
+                    ),
+                    bind(
+                        ExerciseStyle::European,
+                        AssetClass::Unspecified,
+                        "black_scholes",
+                    ),
+                ]
+            } else {
+                Vec::new()
+            };
             ReadTemplateReply {
                 template: Some(SecurityTemplate {
                     template_id: request.template_id,
@@ -223,6 +247,7 @@ fn stores() -> Stores {
                         model_version: 1,
                         pricing_inputs: inputs.iter().map(|i| i.to_string()).collect(),
                         calculation_version: "1".into(),
+                        model_bindings,
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -1008,7 +1033,85 @@ fn quote_row(osi: &str, bid: &str, ask: &str) -> Quote {
 }
 
 fn chain_stores() -> Stores {
+    chain_stores_with(true)
+}
+
+/// Treasury's par curve, as the platform seeds it and the rates slice
+/// records it (rulings 608 and 611): held, or not.
+const UST: &str = "INS-UST-PAR";
+
+fn par(count: i32, unit: TenorUnit, percent: &str) -> Rate {
+    Rate {
+        meta: Some(ObservationMeta {
+            source: Some(Source {
+                dataset: "us-treasury-1:ust_par".into(),
+                ..Default::default()
+            }),
+            valid_from_ns: NOW - 86_400_000_000_000,
+            ..Default::default()
+        }),
+        kind: RateKind::ParYield as i32,
+        value: Some(UnitValue {
+            value: d(percent),
+            ..Default::default()
+        }),
+        tenor: Some(Tenor {
+            count,
+            unit: unit as i32,
+        }),
+        ..Default::default()
+    }
+}
+
+fn chain_stores_with(curve_held: bool) -> Stores {
     let stores = stores();
+    serve_store(
+        &stores,
+        topics::RESOLVE_IDENTIFIER,
+        "meridian.v1.ResolveIdentifierReply",
+        move |request: ResolveIdentifierRequest| {
+            let named = &request.identifiers[0];
+            assert_eq!(
+                (
+                    named.scheme.as_str(),
+                    named.value.as_str(),
+                    named.source.as_str()
+                ),
+                (
+                    "symbol",
+                    "Daily Treasury Par Yield Curve Rates",
+                    "ustreasury"
+                ),
+                "the default curve, by its administrator's symbol"
+            );
+            ResolveIdentifierReply {
+                found: curve_held,
+                instrument_id: if curve_held {
+                    UST.into()
+                } else {
+                    String::new()
+                },
+                ..Default::default()
+            }
+        },
+    );
+    serve_store(
+        &stores,
+        topics::LIST_RATES,
+        "meridian.v1.ListRatesReply",
+        |request: ListRatesRequest| {
+            assert_eq!(request.subjects[0].entity_id, UST);
+            assert_eq!(request.kinds, vec![RateKind::ParYield as i32]);
+            ListRatesReply {
+                rates: vec![
+                    par(1, TenorUnit::Month, "4.20"),
+                    par(3, TenorUnit::Month, "4.25"),
+                    par(1, TenorUnit::Year, "4.10"),
+                ],
+                ..Default::default()
+            }
+        },
+    );
     serve_store(
         &stores,
         topics::LIST_SERIES,
@@ -1244,4 +1347,47 @@ async fn a_grid_on_a_saved_set_answers_each_point_and_an_inline_set_beside_it_is
     request.job.as_mut().unwrap().scenario_set = Some(set);
     let refused = run(request).await.unwrap_err();
     assert!(refused.contains("scenario_ref"), "{refused}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chain_reads_treasurys_curve_by_its_symbol_and_none_held_is_not_evaluated() {
+    // Rulings 608 and 611 and the fourth amendment: the default curve,
+    // ust_cmt, resolved read-only by its administrator's symbol, its par
+    // yields read at the as-of and named in the provenance.
+    for held in [true, false] {
+        let stores = chain_stores_with(held);
+        coordinator(&stores, Config::default(), false);
+        let mut request = job(&[("implied_volatility", &["series", "quote_side"], "")]);
+        let asked = request.job.as_mut().unwrap();
+        asked.account_ids.clear();
+        asked.chains = vec![ChainRef {
+            underlying_instrument_id: AAPL.into(),
+            expiration_from: "2026-11-20".into(),
+            expiration_to: "2026-11-20".into(),
+            series_keys: Vec::new(),
+        }];
+        let reply: RunJobReply = ask_as(
+            &stores.bus,
+            topics::RUN_JOB,
+            "meridian.v1.RunJobRequest",
+            request,
+            &[],
+        )
+        .await
+        .unwrap();
+        let answer = reply.answer.unwrap();
+        if held {
+            assert!(!answer.figures.is_empty(), "{:?}", answer.not_evaluated);
+            assert!(answer
+                .provenance
+                .unwrap()
+                .datasets
+                .contains(&"us-treasury-1:ust_par".to_string()));
+        } else {
+            assert!(answer.figures.is_empty());
+            assert!(answer.not_evaluated.iter().all(|u| {
+                u.reason == NotEvaluatedReason::PriceMissing as i32 && u.detail.contains("ust_cmt")
+            }));
+        }
+    }
 }

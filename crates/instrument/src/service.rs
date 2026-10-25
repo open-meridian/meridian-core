@@ -39,6 +39,24 @@ use crate::replace::replaced;
 use crate::resolve::{conflict_reported, resolve_instrument};
 use crate::store::{Instrument, Store};
 
+/// The analytics component's own name on the bus, as the lake knows it
+/// (contract v28's fourth amendment, W3.1): whose resolves are read-only.
+pub const ANALYTICS: &str = "analytics";
+static ANALYTICS_INSTANCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Name the analytics component's instance, as the chart tells the store.
+/// Set once, at start; [`ANALYTICS`] otherwise.
+pub fn reads_for_analytics(instance: &str) {
+    let _ = ANALYTICS_INSTANCE.set(instance.to_string());
+}
+
+fn analytics_instance() -> &'static str {
+    ANALYTICS_INSTANCE
+        .get()
+        .map(String::as_str)
+        .unwrap_or(ANALYTICS)
+}
+
 /// W3.1. A connector asking what a set of identifiers meant.
 pub const RESOLVE_IDENTIFIER: &str = "platform.reference.query.resolve-identifier";
 
@@ -197,7 +215,11 @@ pub fn serve_all_within(
             // minted (contract v28, ruling 561); a series is asked for by
             // RequestSeriesRecords (W3.31) or resolved by a plugin that
             // holds it.
+            // The analytics component, for a job's default risk-free curve
+            // (contract v28's fourth amendment, W3.1; rulings 608 and 611):
+            // read-only, a job being a read that changes no record.
             if asking.reads_only(&instance, now_ns)
+                || instance == analytics_instance()
                 || (series_key_only(&request) && asking.launched_roles(&instance, now_ns).is_none())
             {
                 let resolution =
@@ -2753,6 +2775,10 @@ mod tests {
             ("both-1", &["reporting", "custody"][..], true),
             ("data-1", &["dgm"][..], true),
             ("unlaunched-1", &[][..], true),
+            // Contract v28's fourth amendment (W3.1; rulings 608 and 611):
+            // the analytics component, a component the launch records never
+            // name, resolves read-only by its name alone.
+            (ANALYTICS, &[][..], false),
         ] {
             let (store_bus, plugin_bus) = two(instance);
             let store: Arc<dyn Store> = Arc::new(MemoryStore::new());

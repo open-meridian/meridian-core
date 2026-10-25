@@ -56,7 +56,11 @@ fn index_chain(vol: f64, spread: f64, days: &[i64]) -> Value {
         "underlying_instrument_id": "INS-SPX",
         "currency_instrument_id": "INS-USD",
         "spot": {"amount": format!("{spot}"), "dataset": "tradier-1:options", "source_ns": AS_OF.to_string()},
-        "rate": {"value": format!("{rate}"), "dataset": "us-treasury-1:par", "subject_id": "INS-UST"},
+        // A flat curve at `rate` (ruling 608): two points, one level.
+        "rate": {
+            "dataset": "us-treasury-1:par", "subject_id": "INS-UST",
+            "points": [{"years": "0.083333", "rate": format!("{rate}")}, {"years": "30", "rate": format!("{rate}")}],
+        },
         "dividends": [],
         "underlying_kind": "index",
         "today": "2026-10-24",
@@ -407,4 +411,73 @@ fn the_inverse_normal_inverts_the_normal() {
         assert!((crate::options::cdf(inverse_cdf(p)) - p).abs() < 1e-12);
     }
     assert!(chains::is_chain_measure("greeks") && !chains::is_chain_measure("scenario_grid"));
+}
+
+#[test]
+fn the_curve_is_a_natural_cubic_spline_through_its_points_flat_beyond_them() {
+    // Ruling 608, 611's `cubic_spline`: through every point, flat outside,
+    // and a straight line stays straight.
+    let points = [(0.25, 0.040), (1.0, 0.042), (2.0, 0.039), (5.0, 0.037)];
+    for (t, r) in points {
+        assert!((chains::spline_at(&points, t).unwrap() - r).abs() < 1e-12);
+    }
+    assert_eq!(chains::spline_at(&points, 0.01), Some(0.040));
+    assert_eq!(chains::spline_at(&points, 30.0), Some(0.037));
+    let line = [(0.0, 0.01), (1.0, 0.02), (3.0, 0.04)];
+    assert!((chains::spline_at(&line, 2.0).unwrap() - 0.03).abs() < 1e-12);
+    // Between points it bends, never jumps: close to its neighbours.
+    let mid = chains::spline_at(&points, 1.5).unwrap();
+    assert!((0.038..0.043).contains(&mid), "{mid}");
+    assert_eq!(chains::spline_at(&[], 1.0), None);
+}
+
+#[test]
+fn an_expirys_rate_is_read_off_the_curve_at_its_own_time() {
+    // Two expiries on a steep curve: each prices at its own point, so the
+    // implied volatility the flat 4% priced is recovered only where the
+    // curve says 4%.
+    let mut chain = index_chain(0.22, 0.0, &[30, 365]);
+    chain["rate"]["points"] = json!([
+        {"years": "0.0821917", "rate": "0.04"},
+        {"years": "1", "rate": "0.06"},
+    ]);
+    let doc = inputs(vec![chain], vec![("implied_forward", 1, vec!["expiry"])]);
+    let answer = crate::compute(&doc).unwrap();
+    let borrow = |expiry_days: i64| {
+        let expiry =
+            meridian_domain::date::Date::of_utc_instant(AS_OF + expiry_days * DAY).to_string();
+        figures(&answer, "implied_forward")
+            .into_iter()
+            .find(|f| {
+                f.breakdown.contains(&("expiry".into(), expiry.clone()))
+                    && f.breakdown.contains(&("component".into(), "borrow".into()))
+            })
+            .map(value)
+            .unwrap()
+    };
+    // Parity at the curve's rate gives back the yield the chain was priced
+    // with only where the curve's rate is the pricing one.
+    assert!((borrow(30) - 0.015).abs() < 1e-3, "{}", borrow(30));
+    assert!((borrow(365) - 0.035).abs() < 2e-3, "{}", borrow(365));
+}
+
+#[test]
+fn no_curve_leaves_every_option_not_evaluated_naming_the_curve() {
+    let mut chain = index_chain(0.22, 0.0, &[30]);
+    chain["rate"] = json!({"missing": "the risk-free curve ust_cmt: not held by the deployment"});
+    let doc = inputs(
+        vec![chain],
+        vec![
+            ("implied_volatility", 1, vec![]),
+            ("volatility_index", 1, vec![]),
+        ],
+    );
+    let answer = crate::compute(&doc).unwrap();
+    assert!(figures(&answer, "implied_volatility").is_empty());
+    assert!(figures(&answer, "volatility_index").is_empty());
+    assert!(!answer.not_evaluated.is_empty());
+    for u in &answer.not_evaluated {
+        assert_eq!(u.reason, PRICE_MISSING);
+        assert!(u.detail.contains("ust_cmt"), "{}", u.detail);
+    }
 }

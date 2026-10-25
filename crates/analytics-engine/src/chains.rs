@@ -60,7 +60,10 @@ pub struct Series {
     pub settles_at_ns: i64,
     pub unsessioned: String,
     pub american: bool,
+    /// The model its template's package binds (ruling 576); empty where
+    /// none binds, `unbound` saying why.
     pub model: String,
+    pub unbound: String,
     pub multiplier: f64,
     pub multiplier_exact: Dec,
     pub bid: Option<f64>,
@@ -81,8 +84,11 @@ pub struct Chain {
     pub spot: Option<f64>,
     pub spot_source_ns: i64,
     pub spot_dataset: String,
-    /// Continuous, a year; 0 where no curve is read.
-    pub rate: f64,
+    /// The risk-free curve (ruling 608; 611's `risk_free_rate`): each point
+    /// its time in years and its rate, continuous; empty where none was
+    /// read, `rate_missing` saying why, and every option not evaluated.
+    pub curve: Vec<(f64, f64)>,
+    pub rate_missing: String,
     pub rate_dataset: String,
     pub rate_subject: String,
     /// Each declared cash dividend: its ex instant and amount.
@@ -162,6 +168,7 @@ pub fn read(inputs: &Value) -> Result<Vec<Chain>> {
                 unsessioned: text(s, "unsessioned"),
                 american: text(s, "exercise_style") != "european",
                 model: text(s, "model_id"),
+                unbound: text(s, "unbound"),
                 multiplier: multiplier_exact.to_f64(),
                 multiplier_exact,
                 bid: optional(s, "bid", "a series' bid")?.map(|d| d.to_f64()),
@@ -175,6 +182,17 @@ pub fn read(inputs: &Value) -> Result<Vec<Chain>> {
         }
         let spot = c.get("spot").filter(|v| !v.is_null());
         let rate = c.get("rate").filter(|v| !v.is_null());
+        let mut curve: Vec<(f64, f64)> = Vec::new();
+        if let Some(r) = rate {
+            for point in items(r, "points") {
+                curve.push((
+                    decimal(point.get("years"), "a curve point's time")?.to_f64(),
+                    decimal(point.get("rate"), "a curve point's rate")?.to_f64(),
+                ));
+            }
+        }
+        curve.sort_by(|a, b| a.0.total_cmp(&b.0));
+        curve.dedup_by(|a, b| a.0 == b.0);
         out.push(Chain {
             underlying: text(c, "underlying_instrument_id"),
             currency_instrument_id: text(c, "currency_instrument_id"),
@@ -184,10 +202,15 @@ pub fn read(inputs: &Value) -> Result<Vec<Chain>> {
             },
             spot_source_ns: spot.map(|s| int(s, "source_ns")).unwrap_or(0),
             spot_dataset: spot.map(|s| text(s, "dataset")).unwrap_or_default(),
-            rate: match rate {
-                Some(r) => decimal(r.get("value"), "the rate")?.to_f64(),
-                None => 0.0,
+            rate_missing: if curve.is_empty() {
+                match rate.map(|r| text(r, "missing")).filter(|m| !m.is_empty()) {
+                    Some(said) => said,
+                    None => "the risk-free curve: none read at the as-of".to_string(),
+                }
+            } else {
+                String::new()
             },
+            curve,
             rate_dataset: rate.map(|r| text(r, "dataset")).unwrap_or_default(),
             rate_subject: rate.map(|r| text(r, "subject_id")).unwrap_or_default(),
             dividends: items(c, "dividends")
@@ -388,6 +411,52 @@ fn intrinsic(s: &Series, spot: f64, forward: f64, rate: f64, t: f64) -> f64 {
     }
 }
 
+/// A natural cubic spline through the curve's points, read at `t` years
+/// (ruling 608; 611's `rate_interpolation` `cubic_spline`, as Cboe's VIX
+/// method derives a yield at each expiration from Treasury's curve); flat
+/// before the first point and after the last. None for no curve.
+pub fn spline_at(points: &[(f64, f64)], t: f64) -> Option<f64> {
+    let n = points.len();
+    let (first, last) = (points.first()?, points.last()?);
+    if n == 1 || t <= first.0 {
+        return Some(first.1);
+    }
+    if t >= last.0 {
+        return Some(last.1);
+    }
+    // The second derivatives, natural at both ends (a tridiagonal solve).
+    let h: Vec<f64> = (0..n - 1).map(|i| points[i + 1].0 - points[i].0).collect();
+    let mut m = vec![0.0; n];
+    let mut c = vec![0.0; n];
+    let mut d = vec![0.0; n];
+    for i in 1..n - 1 {
+        let slope = |j: usize| (points[j + 1].1 - points[j].1) / h[j];
+        let a = h[i - 1];
+        let b = 2.0 * (h[i - 1] + h[i]);
+        let rhs = 6.0 * (slope(i) - slope(i - 1));
+        let denominator = b - a * c[i - 1];
+        c[i] = h[i] / denominator;
+        d[i] = (rhs - a * d[i - 1]) / denominator;
+    }
+    for i in (1..n - 1).rev() {
+        m[i] = d[i] - c[i] * m[i + 1];
+    }
+    let i = (0..n - 1).find(|&i| t <= points[i + 1].0)?;
+    let (x0, y0, x1, y1) = (points[i].0, points[i].1, points[i + 1].0, points[i + 1].1);
+    let (a, b) = ((x1 - t) / h[i], (t - x0) / h[i]);
+    Some(
+        a * y0 + b * y1 + ((a.powi(3) - a) * m[i] + (b.powi(3) - b) * m[i + 1]) * h[i] * h[i] / 6.0,
+    )
+}
+
+impl Chain {
+    /// The risk-free rate to `t` years, continuous: the curve's spline
+    /// there, or why there is none.
+    pub fn rate_at(&self, t: f64) -> std::result::Result<f64, (&'static str, String)> {
+        spline_at(&self.curve, t).ok_or((PRICE_MISSING, self.rate_missing.clone()))
+    }
+}
+
 /// Solve a chain at the job's as-of: each expiry's forward from put-call
 /// parity at the strike with the smallest |C - P| (W12.1), and each
 /// series' implied volatility at bid, mid and ask.
@@ -411,8 +480,9 @@ pub fn solve(chain: &Chain, as_of_ns: i64, steps: usize) -> ChainSolution {
             if t <= 0.0 {
                 return Err((PRICE_MISSING, format!("{expiry} has settled")));
             }
+            let rate = chain.rate_at(t)?;
             if chain.underlying_kind == "future" {
-                return Ok((spot, chain.rate));
+                return Ok((spot, rate));
             }
             let mut best: Option<(f64, f64, f64)> = None;
             for &i in members {
@@ -434,14 +504,16 @@ pub fn solve(chain: &Chain, as_of_ns: i64, steps: usize) -> ChainSolution {
                     }
                 }
             }
+            // Parity at the curve's rate: the forward and the borrow it
+            // implies, never the rate itself (ruling 608's cross-check).
             let forward = match best {
-                Some((k, c, p)) => k + (c - p) * (chain.rate * t).exp(),
-                None => spot * (chain.rate * t).exp(),
+                Some((k, c, p)) => k + (c - p) * (rate * t).exp(),
+                None => spot * (rate * t).exp(),
             };
             if forward <= 0.0 {
                 return Err((PRICE_MISSING, format!("{expiry}: no forward")));
             }
-            Ok((forward, chain.rate - (forward / spot).ln() / t))
+            Ok((forward, rate - (forward / spot).ln() / t))
         })();
         forwards.insert(expiry.to_string(), found);
     }
@@ -452,6 +524,9 @@ pub fn solve(chain: &Chain, as_of_ns: i64, steps: usize) -> ChainSolution {
             let spot = spot.ok_or((PRICE_MISSING, "the underlying's price".to_string()))?;
             if !s.quarantined.is_empty() {
                 return Err((INPUT_QUARANTINED, s.quarantined.clone()));
+            }
+            if s.model.is_empty() {
+                return Err((IMPLEMENTATION_UNAVAILABLE, s.unbound.clone()));
             }
             if s.settles_at_ns == 0 {
                 return Err((PRICE_MISSING, s.unsessioned.clone()));
@@ -464,6 +539,7 @@ pub fn solve(chain: &Chain, as_of_ns: i64, steps: usize) -> ChainSolution {
                 .get(&s.expiry)
                 .cloned()
                 .unwrap_or(Err((PRICE_MISSING, "no forward".into())))?;
+            let rate = chain.rate_at(t)?;
             let dividends: Vec<Dividend> = chain
                 .dividends
                 .iter()
@@ -477,21 +553,21 @@ pub fn solve(chain: &Chain, as_of_ns: i64, steps: usize) -> ChainSolution {
             // dividends' present value grown at r - b, the parity forward.
             let carry = match s.model.as_str() {
                 BLACK_SCHOLES => implied,
-                BLACK_76 => chain.rate,
+                BLACK_76 => rate,
                 _ => {
                     let pv: f64 = dividends
                         .iter()
-                        .map(|d| d.amount * (-chain.rate * d.t).exp())
+                        .map(|d| d.amount * (-rate * d.t).exp())
                         .sum();
                     let net = spot - pv;
                     if net > 0.0 {
-                        chain.rate - (forward / net).ln() / t
+                        rate - (forward / net).ln() / t
                     } else {
                         0.0
                     }
                 }
             };
-            let floor = intrinsic(s, spot, forward, chain.rate, t);
+            let floor = intrinsic(s, spot, forward, rate, t);
             let quotes = [s.bid, mid(s), s.ask];
             let iv = std::array::from_fn(|side| {
                 let Some(quote) = quotes[side] else {
@@ -502,8 +578,8 @@ pub fn solve(chain: &Chain, as_of_ns: i64, steps: usize) -> ChainSolution {
                 }
                 implied_vol(quote, |vol| {
                     price(
-                        &s.model, s.right, spot, s.strike, t, chain.rate, carry, vol, &dividends,
-                        steps, s.american,
+                        &s.model, s.right, spot, s.strike, t, rate, carry, vol, &dividends, steps,
+                        s.american,
                     )
                 })
                 .ok_or((
@@ -517,7 +593,7 @@ pub fn solve(chain: &Chain, as_of_ns: i64, steps: usize) -> ChainSolution {
             Ok(Solved {
                 t,
                 spot,
-                rate: chain.rate,
+                rate,
                 carry,
                 forward,
                 dividends,
@@ -1198,6 +1274,10 @@ fn term_and_skew(
 
 /// Cboe's published method on a listed strip (W12.1): no option model.
 fn volatility_index(chain: &Chain, as_of: i64, out: &mut Out<'_>) {
+    if chain.curve.is_empty() {
+        out.not(&Vec::new(), "", PRICE_MISSING, chain.rate_missing.clone());
+        return;
+    }
     let mut terms: Vec<(f64, f64)> = Vec::new();
     let mut by_expiry: BTreeMap<&str, Vec<&Series>> = BTreeMap::new();
     for s in &chain.series {
@@ -1233,7 +1313,7 @@ fn volatility_index(chain: &Chain, as_of: i64, out: &mut Out<'_>) {
             })
             .min_by(|a, b| (a.1 - a.2).abs().total_cmp(&(b.1 - b.2).abs()));
         let Some((k, c, p)) = pair else { continue };
-        let r = chain.rate;
+        let Ok(r) = chain.rate_at(t) else { continue };
         let forward = k + (r * t).exp() * (c - p);
         let Some(&k0) = strikes.iter().rev().find(|&&s| s <= forward) else {
             continue;

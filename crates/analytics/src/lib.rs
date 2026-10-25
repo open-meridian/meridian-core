@@ -58,6 +58,9 @@ pub mod topics {
     pub const LIST_CORPORATE_ACTIONS: &str = "platform.lake.query.list-corporate-actions";
     pub const LIST_SCENARIOS: &str = "platform.lake.query.list-scenarios";
     pub const LIST_RATES: &str = "platform.lake.query.list-rates";
+    /// Contract v28's fourth amendment (W3.1, W12.2; rulings 608 and 611):
+    /// the default risk-free curve's record, by its symbol, read-only.
+    pub const RESOLVE_IDENTIFIER: &str = "platform.reference.query.resolve-identifier";
     pub const READ_CALENDAR: &str = "platform.reference.query.read-calendar";
 
     /// The component's own topic, coordinator to worker: a unit, asked of

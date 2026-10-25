@@ -94,6 +94,10 @@ const OPTION_MODEL: &[(&str, &str)] = &[
         "am_at_the_session_open_pm_at_1600_in_the_venue_zone",
     ),
     ("forward", "put_call_parity_at_the_least_abs_call_less_put"),
+    // Ruling 608 as 611 named it: the curve, and how it is read at each
+    // expiry; a later version overrides either (requirement 14).
+    ("risk_free_rate", "ust_cmt"),
+    ("rate_interpolation", "cubic_spline"),
 ];
 
 /// The surface's parameters (contract v28; W12.1).
@@ -103,6 +107,8 @@ const SURFACE: &[(&str, &str)] = &[
     ("weights", "inverse_iv_bid_ask_width"),
     ("checks", "gatheral_jacquier_butterfly_and_calendar"),
     ("steps", "200"),
+    ("risk_free_rate", "ust_cmt"),
+    ("rate_interpolation", "cubic_spline"),
 ];
 
 /// A positioning basis's parameters (ruling 591: one version per basis).
@@ -113,6 +119,8 @@ const POSITIONING_LONG_CALLS_SHORT_PUTS: &[(&str, &str)] = &[
     ("expiry_window", "the_job_chains"),
     ("open_interest_date", "the_latest_on_or_before_the_as_of"),
     ("steps", "200"),
+    ("risk_free_rate", "ust_cmt"),
+    ("rate_interpolation", "cubic_spline"),
 ];
 const POSITIONING_SHORT_ALL: &[(&str, &str)] = &[
     ("positioning_basis", "convention_short_all"),
@@ -121,6 +129,8 @@ const POSITIONING_SHORT_ALL: &[(&str, &str)] = &[
     ("expiry_window", "the_job_chains"),
     ("open_interest_date", "the_latest_on_or_before_the_as_of"),
     ("steps", "200"),
+    ("risk_free_rate", "ust_cmt"),
+    ("rate_interpolation", "cubic_spline"),
 ];
 
 /// Every definition the component serves, in the order it lists them:
@@ -262,6 +272,8 @@ pub const DEFINITIONS: [Definition; 23] = [
             ("models", "american_binomial_black_scholes_black_76_by_the_package_binding"),
             ("steps", "200"),
             ("node", "the_implied_volatility_at_mid"),
+            ("risk_free_rate", "ust_cmt"),
+            ("rate_interpolation", "cubic_spline"),
             (
                 "units",
                 "delta_gamma_per_1_vega_vanna_per_vol_point_theta_charm_per_calendar_day_rho_per_1pct",
@@ -306,6 +318,8 @@ pub const DEFINITIONS: [Definition; 23] = [
             ("method", "cboe_published_method"),
             ("target_days", "30"),
             ("time", "calendar_minutes_to_settlement_over_525600"),
+            ("risk_free_rate", "ust_cmt"),
+            ("rate_interpolation", "cubic_spline"),
         ],
         breakdowns: &[],
         scale: 4,
@@ -320,6 +334,8 @@ pub const DEFINITIONS: [Definition; 23] = [
             ("expiration", "intrinsic"),
             ("models", "american_binomial_black_scholes_black_76_by_the_package_binding"),
             ("steps", "200"),
+            ("risk_free_rate", "ust_cmt"),
+            ("rate_interpolation", "cubic_spline"),
         ],
         breakdowns: &["instrument", "account"],
         scale: 2,
@@ -349,6 +365,8 @@ pub const DEFINITIONS: [Definition; 23] = [
             ("positioning_basis", "convention_long_calls_short_puts"),
             ("spot_grid", "plus_or_minus_15pct_in_0.5pct_steps"),
             ("liquidity", "the_underlying_volume_times_spot"),
+            ("risk_free_rate", "ust_cmt"),
+            ("rate_interpolation", "cubic_spline"),
         ],
         breakdowns: &[],
         scale: 4,
