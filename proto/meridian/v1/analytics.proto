@@ -27,6 +27,8 @@ import "meridian/v1/journal.proto";
 import "meridian/v1/lake.proto";
 // An order's side.
 import "meridian/v1/book.proto";
+// A series' identifiers (contract v28).
+import "meridian/v1/reference.proto";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // W12.1 — a client runs a job
@@ -53,6 +55,10 @@ message Job {
   // converted to, by its `INS-` ID; empty answers each account in its base
   // currency.
   string reporting_currency = 6;
+  // Contract v28: each an underlying, an expiration window or series keys;
+  // series not held are priced from their chain rows, never minted (ruling
+  // 561). None: the job is over its accounts alone.
+  repeated ChainRef chains = 7;
 }
 
 // A job's inputs, by reference (requirement 3): one watermark and one as-of
@@ -148,6 +154,9 @@ message Figure {
   // Contract v27 (W12.2; ruling 374): its oldest input's source time; 0 for
   // a figure that read no market data.
   int64 oldest_input_source_ns = 10;
+  // Contract v28: its occ_osi symbol, or symbol and MIC. None: the figure
+  // names an INS- record or none.
+  repeated Identifier series_key = 11;
 }
 
 // How a figure was computed (the first release's Q14, approved 2026-10-14
@@ -215,6 +224,8 @@ message NotEvaluated {
   // the client's; 0 on any other reason.
   int64 age_ns = 6;
   int64 ceiling_ns = 7;
+  // Contract v28: its key, as Figure.series_key. None.
+  repeated Identifier series_key = 8;
 }
 
 enum NotEvaluatedReason {
@@ -243,6 +254,12 @@ enum NotEvaluatedReason {
   // Contract v27 (W12.2; ruling 325): a lot's cost the book does not
   // record, which the measure needs.
   NOT_EVALUATED_REASON_COST_MISSING = 10;
+  // Contract v28: An option quote below its intrinsic value: no implied
+  // volatility exists for it.
+  NOT_EVALUATED_REASON_BELOW_INTRINSIC = 11;
+  // Contract v28: A surface fit that failed a no-arbitrage check or did not
+  // converge.
+  NOT_EVALUATED_REASON_FIT_FAILED = 12;
 }
 
 // What an answer was computed from (requirements 4 and 35; Q7). Named so it
@@ -602,4 +619,22 @@ enum StandardFormStatus {
   STANDARD_FORM_STATUS_UNBOUNDED = 3;
   // Stopped at an iteration or time limit, x the best found.
   STANDARD_FORM_STATUS_STOPPED = 4;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Contract v28, track A: listed options and futures
+// (sdk-contract/listed-options-and-futures-contract)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Contract v28 (Job.chains): names chains a job prices (contract v28).
+message ChainRef {
+  // Its INS- record, the subject of its chain rows. Never empty.
+  string underlying_instrument_id = 1;
+  // A plain date. Empty: from the earliest.
+  string expiration_from = 2;
+  // A plain date. Empty: to the latest.
+  string expiration_to = 3;
+  // Their occ_osi symbols, or symbol and MIC pairs. None: every series in the
+  // window.
+  repeated Identifier series_keys = 4;
 }

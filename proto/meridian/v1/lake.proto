@@ -100,6 +100,11 @@ message ObservationMeta {
   // date, each calendar with its version, the reason and the holiday's
   // name. Recorded as reported, never refused. Decided by the lake.
   DateCheck closed_day = 15;
+  // Contract v28: the series' identifier -- the occ_osi symbol, or a future's
+  // or future option's exchange symbol and its MIC -- on a row whose subject
+  // is the underlying; in the row's conflation key. None: the row is about its
+  // subjects alone.
+  repeated Identifier series_key = 16;
 }
 
 // One entity a row is about.
@@ -302,6 +307,10 @@ message Trade {
 
   // True in a version saying the source withdrew the trade.
   bool cancelled = 7;
+  // Contract v28: the bid and ask, their sizes and the quote's own source
+  // time. Unset: the source states none and the plugin kept none; never joined
+  // from kept quotes.
+  QuoteAtTrade quote_at_trade = 8;
 }
 
 // What a trade may count for (spec/the-lake, "Trade attributes"): written on
@@ -379,6 +388,13 @@ enum TradeCharacteristic {
   TRADE_CHARACTERISTIC_CONTINGENT = 13;
   // A cross of two orders by one participant.
   TRADE_CHARACTERISTIC_CROSS = 14;
+  // Contract v28: A leg of a complex order's execution: its price is the
+  // package's, so a side inferred from it is not applicable.
+  TRADE_CHARACTERISTIC_MULTI_LEG = 15;
+  // Contract v28: An option print tied to a stock trade, or the reverse.
+  TRADE_CHARACTERISTIC_STOCK_OPTION_TIED = 16;
+  // Contract v28: A trade made on an exchange's floor.
+  TRADE_CHARACTERISTIC_FLOOR = 17;
 }
 
 // The best bid and offer, on a venue or consolidated: in force from its valid
@@ -1000,6 +1016,14 @@ message ListTradesRequest {
   // data plugin reads only its own instance's rows, by no entitlement; refused
   // from any other reader, naming it.
   bool latest_recorded = 9;
+  // Contract v28: the series' keys (occ_osi, or a symbol and its MIC), each
+  // row keyed by one answered with the subjects asked. None: rows keyed by a
+  // series are not answered unless all_series is true.
+  repeated Identifier series_keys = 10;
+  // Contract v28: true: rows keyed by any series of the underlying are
+  // answered beside its own. False: rows keyed by a series are left out, so a
+  // v27 reader of an underlying never receives its chain.
+  bool all_series = 11;
 }
 
 message ListTradesReply {
@@ -1030,6 +1054,14 @@ message ListQuotesRequest {
   // At most 500 rows, 100 when 0.
   uint32 page_size = 7;
   string cursor = 8;
+  // Contract v28: the series' keys (occ_osi, or a symbol and its MIC), each
+  // row keyed by one answered with the subjects asked. None: rows keyed by a
+  // series are not answered unless all_series is true.
+  repeated Identifier series_keys = 9;
+  // Contract v28: true: rows keyed by any series of the underlying are
+  // answered beside its own. False: rows keyed by a series are left out, so a
+  // v27 reader of an underlying never receives its chain.
+  bool all_series = 10;
 }
 
 message ListQuotesReply {
@@ -1266,4 +1298,202 @@ message QueryLakeReply {
   bool truncated = 9;
   // Contract v27 (W10.10): rates, for a query of the kind `rates`.
   repeated Rate rates = 10;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Contract v28, track A: listed options and futures
+// (sdk-contract/listed-options-and-futures-contract)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Contract v28: a listed option or future series as its source lists it: its
+// key, its underlying and its terms as the template's fields, never minting it
+// (contract v28).
+message ListedSeries {
+  // Its row key, the underlying as its subject, the series_key, its source,
+  // valid time and version; an adjustment is the next version of its key.
+  // Never unset.
+  ObservationMeta meta = 1;
+  // The listed_option, future or future_option template's TPL- ID. Never
+  // empty.
+  string template_id = 2;
+  // A published version the catalogue holds. Never empty.
+  string template_version = 3;
+  // Each by its template path, the values the platform needs for a
+  // template-complete request (W3.31). Never empty.
+  repeated TemplateFieldValue fields = 4;
+  // Filled by the lake on a read, from the instrument store, never minted.
+  // Empty: the deployment holds no record with the series' key; never set by a
+  // writer.
+  string instrument_id = 5;
+}
+
+// Contract v28 (W10.4): RecordSeries's request.
+message RecordSeriesRequest {
+  // 1 to 500 rows, recorded whole or refused naming the item and field. Never
+  // empty.
+  repeated ListedSeries series = 1;
+  // The want's identifier as it was delivered. Empty: recorded unasked.
+  string want_id = 2;
+}
+
+// Contract v28 (W10.6): ListSeries's request.
+message ListSeriesRequest {
+  // Each underlying's INS- record. Never empty.
+  repeated SubjectRef subjects = 1;
+  // Listed_option, future or future_option. Unspecified: every listed type.
+  InstrumentType instrument_type = 2;
+  // A plain date. Empty: from the earliest.
+  string expiration_from = 3;
+  // A plain date. Empty: to the latest.
+  string expiration_to = 4;
+  // The series' keys (occ_osi, or a symbol and its MIC), each answered if
+  // listed under the subjects asked. None: every series of the subjects asked.
+  repeated Identifier series_keys = 5;
+  // The default, named datasets, or every entitled dataset side by side.
+  // Unset: the deployment's default.
+  SourceChoice sources = 6;
+  // The recorded-time cut-off: nothing recorded after it answers. 0: what the
+  // lake knows now.
+  int64 as_of_ns = 7;
+  // How many rows a page holds at most. 0 is 100; past 500, answered at 500.
+  uint32 page_size = 8;
+  // The previous reply's next_cursor, as given. Empty for the first page.
+  string cursor = 9;
+}
+
+// Contract v28 (W10.6): ListSeries's answer.
+message ListSeriesReply {
+  // Each series at the as-of, with its terms and, where held, its INS- record.
+  // None answered.
+  repeated ListedSeries series = 1;
+  // Each subject, dataset and field not answered, with its reason. None: every
+  // part answered.
+  repeated Unanswered unanswered = 2;
+  // Each dataset answered, with its vendor, declaration and liveness. None
+  // answered.
+  repeated DatasetRef datasets = 3;
+  // The sequence per partition the answer holds, from which a reader hears
+  // what follows. Never unset on an answer.
+  Watermark watermark = 4;
+  // Opaque, passed back as cursor. Empty on the last page.
+  string next_cursor = 5;
+}
+
+// Contract v28: a value per contract per trading date as its source publishes
+// it: open interest, volume, block volume (contract v28).
+message Statistic {
+  // Its key, its subject (the contract's INS- record, or the underlying with
+  // the series_key), its source and its business_date, the trading date it is
+  // for. Never unset.
+  ObservationMeta meta = 1;
+  // The kind, a closed list growing by revision. Unspecified is refused.
+  StatisticKind kind = 2;
+  // Contracts for an option or a future, shares for an equity. Never unset; a
+  // source that does not state one records no row, never a zero.
+  UnitValue value = 3;
+}
+
+// Contract v28 (W10.4): RecordStatistics's request.
+message RecordStatisticsRequest {
+  // 1 to 500 rows, recorded whole or refused naming the item and field. Never
+  // empty.
+  repeated Statistic statistics = 1;
+  // The want's identifier as it was delivered. Empty: recorded unasked.
+  string want_id = 2;
+}
+
+// Contract v28 (W10.5): StatisticsRecorded's event.
+message StatisticsRecordedEvent {
+  // The row as recorded, with its version and sequence. Never unset.
+  Statistic statistic = 1;
+}
+
+// Contract v28 (W10.6): ListStatistics's request.
+message ListStatisticsRequest {
+  // Each INS- record; with series_keys or all_series, an underlying's chain.
+  // Never empty.
+  repeated SubjectRef subjects = 1;
+  // The kinds answered. None: every kind.
+  repeated StatisticKind kinds = 2;
+  // A plain date. Empty: the latest date each subject has.
+  string business_date = 3;
+  // A plain date; refused beside business_date. Empty: no range.
+  string from_date = 4;
+  // A plain date. Empty: no range.
+  string to_date = 5;
+  // The series' keys (occ_osi, or a symbol and its MIC), each row keyed by one
+  // answered with the subjects asked. None: rows keyed by a series are not
+  // answered unless all_series is true.
+  repeated Identifier series_keys = 6;
+  // True: rows keyed by any series of the underlying are answered beside its
+  // own. False: rows keyed by a series are left out, so a v27 reader of an
+  // underlying never receives its chain.
+  bool all_series = 7;
+  // The default, named datasets, or every entitled dataset side by side.
+  // Unset: the deployment's default.
+  SourceChoice sources = 8;
+  // The recorded-time cut-off: nothing recorded after it answers. 0: what the
+  // lake knows now.
+  int64 as_of_ns = 9;
+  // How many rows a page holds at most. 0 is 100; past 500, answered at 500.
+  uint32 page_size = 10;
+  // The previous reply's next_cursor, as given. Empty for the first page.
+  string cursor = 11;
+}
+
+// Contract v28 (W10.6): ListStatistics's answer.
+message ListStatisticsReply {
+  // The rows, each naming its dataset. None answered.
+  repeated Statistic statistics = 1;
+  // Each subject, dataset and field not answered, with its reason. None: every
+  // part answered.
+  repeated Unanswered unanswered = 2;
+  // Each dataset answered, with its vendor, declaration and liveness. None
+  // answered.
+  repeated DatasetRef datasets = 3;
+  // The sequence per partition the answer holds, from which a reader hears
+  // what follows. Never unset on an answer.
+  Watermark watermark = 4;
+  // Opaque, passed back as cursor. Empty on the last page.
+  string next_cursor = 5;
+}
+
+// Contract v28 (Trade.quote_at_trade): carries the quote in force when the
+// print happened (G9; approved 573).
+message QuoteAtTrade {
+  // As the source states it, or as the plugin last received it on the same
+  // feed. Unset: no bid in force.
+  optional Money bid = 1;
+  // As the source states it, or as the plugin last received it on the same
+  // feed. Unset: no ask in force.
+  optional Money ask = 2;
+  // As stated. Unset: not stated.
+  optional Decimal bid_quantity = 3;
+  // As stated. Unset: not stated.
+  optional Decimal ask_quantity = 4;
+  // The quote's own source time, so a reader can refuse a stale one. 0: the
+  // source states no quote time.
+  int64 source_time_ns = 5;
+  // True: the best bid and offer the plugin last received on the same feed
+  // before the print. False: the source stated the quote with the print.
+  bool as_last_received = 6;
+}
+
+enum StatisticKind {
+  // Refused.
+  STATISTIC_KIND_UNSPECIFIED = 0;
+  // Contracts open at the trading date's end, as the clearing house or the
+  // chain states it.
+  STATISTIC_KIND_OPEN_INTEREST = 1;
+  // Contracts traded on the date; cleared volume where the source is the
+  // clearing house.
+  STATISTIC_KIND_VOLUME = 2;
+  // Contracts traded in blocks on the date, as the source states it.
+  STATISTIC_KIND_BLOCK_VOLUME = 3;
+  // Shares sold short on the date as reported to a FINRA facility, FINRA's
+  // daily short-sale volume file (ruling 593).
+  STATISTIC_KIND_SHORT_VOLUME = 4;
+  // All shares reported to that facility on the date, the same file's total
+  // (ruling 593).
+  STATISTIC_KIND_TOTAL_VOLUME = 5;
 }

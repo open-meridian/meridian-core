@@ -1019,3 +1019,36 @@ message FxPivotCurrenciesSetting {
   int64 changed_at_ns = 2;
   string changed_by = 3;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Contract v28, track A: listed options and futures
+// (sdk-contract/listed-options-and-futures-contract)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// W6.37 (ruling 561; its shape ruled 2026-10-24, 589): the deployment
+// admin's standing acceptance rule for asking the platform to mint listed
+// series: an order's want, a standing want, and a daily limit. Each change
+// its own record.
+message SetSeriesRequestRuleRequest {
+  SeriesRequestRule rule = 1;
+  string reason = 2;
+}
+
+// W6.37: the rule read, by the instrument store before it asks
+// (RequestSeriesRecords, W3.31) and by the dashboard.
+message ReadSeriesRequestRuleRequest {}
+
+// The series request rule in force (W6.37; 589).
+message SeriesRequestRule {
+  // True: a series an order or a proposal names is asked for. On by
+  // default.
+  bool orders = 1;
+  // True: a standing want's series (a signal plugin's watched chains) are
+  // asked for. Off by default, refused by rule.
+  bool standing_wants = 2;
+  // The most series asked for in a day, 1 or more; 500 by default.
+  uint32 daily_limit = 3;
+  // The last change; 0 and empty for the default never changed.
+  int64 changed_at_ns = 4;
+  string changed_by = 5;
+}
