@@ -515,7 +515,7 @@ fn browse_row(listing: &PluginListing) -> String {
     let best = latest(listing);
     let (floor_ok, floor) = best.map(floor_mark).unwrap_or((true, String::new()));
     format!(
-        "<tr data-listing=\"{id}\"><td class=\"keep\"><a href=\"{href}\" title=\"{id}\">{name}</a></td>\
+        "<tr data-listing=\"{id}\"><td class=\"keep\"><a href=\"{href}\" title=\"{id}\">{name}</a>{successor}</td>\
          <td class=\"wide\">{publisher}</td><td class=\"mid\">{roles}</td>\
          <td><span class=\"pill\">{label}</span></td>\
          <td{floor_class}{floor_title}>{version}</td><td class=\"mid\">{installs}</td>\
@@ -523,6 +523,17 @@ fn browse_row(listing: &PluginListing) -> String {
         id = escape(&listing.listing),
         href = escape(&listing_path(&listing.listing)),
         name = escape(&display_name(listing)),
+        // Contract v28 (W8.16): a withdrawn listing names its successor.
+        successor = if listing.replaced_by.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " <a class=\"pill\" data-replaced-by=\"{to}\" href=\"{href}\" title=\"Replaced by {to}\">\
+                 Replaced by {to}</a>",
+                to = escape(&listing.replaced_by),
+                href = escape(&listing_path(&listing.replaced_by)),
+            )
+        },
         publisher = escape(if listing.publisher.is_empty() {
             listing.listing.split('/').next().unwrap_or_default()
         } else {

@@ -2701,10 +2701,34 @@ pub fn serve_with(
             "meridian.v1.WithdrawPermissionReply",
         ),
         |cx, request: WithdrawPermissionRequest, envelope| {
+            // Contract v28 (W6.7, ruling 549): why, required, on the
+            // withdrawal's own record (decisions/031).
+            let note = request.note.trim();
+            if note.is_empty() {
+                return Err(meridian_bus::refusal_naming(
+                    meridian_pb::v1::RefusalReason::ReasonRequired as i32,
+                    &["note".to_string()],
+                    "note: a withdrawal of a permission says why",
+                ));
+            }
+            if note.chars().count() > 2_000 {
+                return Err(meridian_bus::refusal_with_status(
+                    meridian_bus::RefusalStatus::InvalidArgument,
+                    &["note".to_string()],
+                    "note: at most 2,000 characters".to_string(),
+                ));
+            }
             let before = cx.snapshot()?;
             let outcome = cx
                 .store
-                .withdraw_permission(&request.permission_id, &author(envelope), cx.clock.now_ns())
+                .withdraw_permission(
+                    &request.permission_id,
+                    &Author {
+                        note: note.to_string(),
+                        ..author(envelope)
+                    },
+                    cx.clock.now_ns(),
+                )
                 .map_err(|f| f.to_string())?;
             let reply = match outcome {
                 Withdrawal::Withdrawn => {

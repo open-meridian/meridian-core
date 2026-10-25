@@ -690,7 +690,7 @@ with sync_playwright() as playwright:
     )
     check(bool(hers), f"her permission to deployment admin is listed: {hers and hers.group(1)}")
     if hers:
-        administer(context, "/admin/permissions/withdraw", {"permission_id": hers.group(1)})
+        administer(context, "/admin/permissions/withdraw", {"permission_id": hers.group(1), "note": "her access is no longer needed"})
     open(f"{SHARED}/list-again", "w").close()
     again = said_by("list-again.out", 120)
     check(

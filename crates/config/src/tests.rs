@@ -3629,6 +3629,24 @@ async fn the_stale_reference_actions_permitted_are_refuse_only_until_a_deploymen
 }
 
 #[tokio::test]
+async fn a_permission_withdrawn_says_why_or_is_refused() {
+    // Contract v28 (W6.7, ruling 549): the note is required.
+    let h = harness("dashboard-1");
+    let refused = ask::<_, WithdrawPermissionReply>(
+        &h,
+        WITHDRAW_PERMISSION,
+        "meridian.v1.WithdrawPermissionRequest",
+        WithdrawPermissionRequest {
+            permission_id: "PRM-1".into(),
+            note: "  ".into(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(refused.contains("fields=note"), "{refused}");
+}
+
+#[tokio::test]
 async fn the_series_request_rule_is_a_deployment_admins_each_change_recorded() {
     // Contract v28 (W6.37; rulings 561, 589): orders on, standing wants off
     // and 500 a day by default; a limit of 0 or past 5,000 refused naming
