@@ -865,3 +865,139 @@ async fn a_request_is_answered_once_by_one_copy_of_the_component() {
         "each request handled once"
     );
 }
+
+// ── An answer past the broker's limit ───────────────────────────────────────
+
+/// A catalogue past the broker's 1 MiB: many versions, each with a large
+/// declaration -- tools with long descriptions and schemas, as a plugin's
+/// documentation makes them.
+fn a_catalogue_past_a_mebibyte() -> meridian_domain::v1::PluginCatalogue {
+    use meridian_domain::v1::{PluginCatalogue, PluginMetadata, PluginVersion};
+    use meridian_pb::v1::{PluginDeclaration, ToolDeclaration};
+    let words = "what this tool reads and why, in the vendor's words. ".repeat(40);
+    let versions = (0..240)
+        .map(|n| PluginVersion {
+            metadata: Some(PluginMetadata {
+                name: format!("plugin-{}", n % 22),
+                version: format!("0.{}.0", n / 22),
+                declaration: Some(PluginDeclaration {
+                    tools: (0..2)
+                        .map(|t| ToolDeclaration {
+                            name: format!("read_{t}"),
+                            description: words.clone(),
+                            input_schema: format!("{{\"description\": \"{words}\"}}"),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            image_digest: format!("sha256:{n:064x}"),
+            ..Default::default()
+        })
+        .collect();
+    PluginCatalogue {
+        versions,
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn an_answer_past_the_brokers_limit_is_refused_naming_its_topic_and_size() {
+    // Found on dev, 2026-10-26: the plugin catalogue grew to 1,050,251
+    // bytes, the broker would not carry it, and every caller waited out ten
+    // seconds for an answer that was never sent. Now the caller is told at
+    // once, and why.
+    use prost::Message as _;
+    let asking = bus("asking-for-too-much").await;
+    let answering = bus("answering-too-much").await;
+    let topic = topic("query.plugin-catalogue");
+    let catalogue = a_catalogue_past_a_mebibyte().encode_to_vec();
+    let size = catalogue.len();
+    assert!(size > 1_048_576, "the catalogue is {size} bytes");
+
+    answering.serve(&topic, move |_| {
+        Ok(("meridian.v1.PluginCatalogue".to_string(), catalogue.clone()))
+    });
+    settle().await;
+
+    let started = std::time::Instant::now();
+    let refused = asking
+        .call(
+            &topic,
+            "meridian.v1.PluginCatalogueRequest",
+            vec![],
+            None,
+            Some(Duration::from_secs(10)),
+        )
+        .await
+        .expect_err("the answer is past the broker's limit");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "refused at once, not timed out: {:?}",
+        started.elapsed()
+    );
+    match refused {
+        BusError::HandlerFailed {
+            topic: named,
+            detail,
+        } => {
+            assert_eq!(named, topic);
+            assert!(detail.contains(&format!("`{topic}`")), "{detail}");
+            assert!(
+                detail.contains("bytes, past the broker's limit of"),
+                "{detail}"
+            );
+            assert!(detail.contains("1048576 bytes"), "{detail}");
+        }
+        other => panic!("expected the refusal, got {other:?}"),
+    }
+
+    // The answering side still answers what fits.
+    let small = topic.clone() + "-small";
+    answering.serve(&small, |_| {
+        Ok(("meridian.v1.PluginCatalogue".to_string(), vec![]))
+    });
+    settle().await;
+    asking
+        .call(
+            &small,
+            "meridian.v1.PluginCatalogueRequest",
+            vec![],
+            None,
+            None,
+        )
+        .await
+        .expect("an answer that fits is answered");
+}
+
+#[tokio::test]
+async fn a_question_past_the_brokers_limit_is_refused_before_it_is_sent() {
+    let asking = bus("asking-too-much").await;
+    let topic = topic("query.too-large-to-ask");
+    let refused = asking
+        .call(
+            &topic,
+            "meridian.test.Question",
+            vec![0u8; 2 * 1_048_576],
+            None,
+            Some(Duration::from_secs(10)),
+        )
+        .await
+        .expect_err("the question is past the broker's limit");
+    assert!(
+        matches!(
+            refused,
+            BusError::TooLarge {
+                most: 1_048_576,
+                ..
+            }
+        ),
+        "expected TooLarge, got {refused:?}"
+    );
+    assert!(
+        refused.to_string().contains(&format!("`{topic}`")),
+        "{refused}"
+    );
+}

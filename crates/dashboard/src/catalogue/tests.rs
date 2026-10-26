@@ -118,6 +118,7 @@ fn conductor(bus: &Bus) {
         Ok((
             "meridian.v1.PluginCatalogue".into(),
             PluginCatalogue {
+                next_cursor: String::new(),
                 versions: vec![PluginVersion {
                     metadata: Some(PluginMetadata {
                         name: "snaptrade".into(),

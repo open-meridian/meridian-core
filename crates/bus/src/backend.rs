@@ -23,6 +23,15 @@ pub enum BusError {
 
     #[error("the bus is shutting down")]
     ShuttingDown,
+
+    /// A question past what the broker carries, refused before it was sent
+    /// rather than lost on the way.
+    #[error("a question to `{topic}` is {size} bytes, past the broker's limit of {most} bytes, and was not sent")]
+    TooLarge {
+        topic: String,
+        size: usize,
+        most: usize,
+    },
 }
 
 /// How a component's refusal carries its reason code across the bus.

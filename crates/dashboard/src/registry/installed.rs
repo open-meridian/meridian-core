@@ -956,6 +956,7 @@ mod tests {
                 version("alpaca", "0.11.0-rc.2"),
             ],
             launches: Vec::new(),
+            next_cursor: String::new(),
         };
         crate::catalogue::sort_versions(&mut held);
         let said: Vec<String> = held

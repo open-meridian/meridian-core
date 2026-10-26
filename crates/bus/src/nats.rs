@@ -228,6 +228,18 @@ impl Backend for NatsBackend {
                 return Err(BusError::NotPublishable(subject));
             }
 
+            // A question past what the broker carries is refused here,
+            // naming its size, rather than by the client's own words.
+            let question = envelope.encode_to_vec();
+            let most = client.server_info().max_payload;
+            if most > 0 && question.len() > most {
+                return Err(BusError::TooLarge {
+                    topic: subject,
+                    size: question.len(),
+                    most,
+                });
+            }
+
             // The caller's timeout, on the request itself. The client has one
             // of its own, ten seconds unless told otherwise, and it fired
             // first and was reported as this one: every call on this bus was
@@ -238,7 +250,7 @@ impl Backend for NatsBackend {
                 client.send_request(
                     subject.clone(),
                     async_nats::Request::new()
-                        .payload(envelope.encode_to_vec().into())
+                        .payload(question.into())
                         .timeout(Some(timeout)),
                 ),
             )
@@ -434,18 +446,40 @@ impl NatsBackend {
                         payload_type,
                         payload,
                     };
+                    let encoded = reply.encode_to_vec();
+
+                    // An answer past what the broker carries is refused here,
+                    // naming the topic and the size: sent, the broker drops
+                    // it and the caller waits out its whole timeout for an
+                    // answer that never comes (found on dev, 2026-10-26, the
+                    // plugin catalogue at 1,050,251 bytes).
+                    let (encoded, refusal) = match refusal {
+                        None => match past_the_broker(
+                            &topic,
+                            encoded.len(),
+                            client.server_info().max_payload,
+                        ) {
+                            Some(detail) => {
+                                tracing::error!(topic, "{detail}");
+                                let empty = Envelope {
+                                    meta: None,
+                                    payload_type: String::new(),
+                                    payload: Vec::new(),
+                                };
+                                (empty.encode_to_vec(), Some(detail))
+                            }
+                            None => (encoded, None),
+                        },
+                        refused => (encoded, refused),
+                    };
 
                     let sent = match refusal {
-                        None => client.publish(reply_to, reply.encode_to_vec().into()).await,
+                        None => client.publish(reply_to, encoded.into()).await,
                         Some(detail) => {
                             let mut headers = async_nats::HeaderMap::new();
                             headers.insert(REFUSAL_HEADER, detail.as_str());
                             client
-                                .publish_with_headers(
-                                    reply_to,
-                                    headers,
-                                    reply.encode_to_vec().into(),
-                                )
+                                .publish_with_headers(reply_to, headers, encoded.into())
                                 .await
                         }
                     };
@@ -480,6 +514,23 @@ impl NatsBackend {
     }
 }
 
+/// Why an answer of `size` bytes is not sent, where the broker carries at
+/// most `most` (its `max_payload`, 1 MiB unless its configuration says
+/// otherwise): the topic, the size and the limit, for the caller and the
+/// log. None where it fits, and where the broker states no limit.
+///
+/// NATS keeps messages small by design, and the limit is not raised to make
+/// an answer fit: an answer that grows with a deployment's data pages, or
+/// answers only what its caller needs.
+pub(crate) fn past_the_broker(topic: &str, size: usize, most: usize) -> Option<String> {
+    (most > 0 && size > most).then(|| {
+        format!(
+            "the answer to `{topic}` is {size} bytes, past the broker's limit of {most} bytes, \
+             and was not sent"
+        )
+    })
+}
+
 /// `work` on the blocking pool once a permit is free, the permit held until
 /// it is done: no more than the semaphore's permits answer at once.
 async fn answer_bounded<T: Send + 'static>(
@@ -488,6 +539,27 @@ async fn answer_bounded<T: Send + 'static>(
 ) -> Result<T, tokio::task::JoinError> {
     let _permit = answering.acquire().await;
     tokio::task::spawn_blocking(work).await
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::*;
+
+    #[test]
+    fn an_answer_past_the_limit_is_named_by_topic_and_size() {
+        let most = 1_048_576;
+        assert_eq!(past_the_broker("platform.x.query.y", most, most), None);
+        let said = past_the_broker("platform.config.query.plugin-catalogue", 1_050_251, most)
+            .expect("past the limit");
+        assert!(
+            said.contains("`platform.config.query.plugin-catalogue`"),
+            "{said}"
+        );
+        assert!(said.contains("1050251 bytes"), "{said}");
+        assert!(said.contains("limit of 1048576 bytes"), "{said}");
+        // A broker that states no limit is not second-guessed.
+        assert_eq!(past_the_broker("platform.x.query.y", 5, 0), None);
+    }
 }
 
 #[cfg(test)]

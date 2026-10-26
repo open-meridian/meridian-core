@@ -142,6 +142,29 @@ pub const VENUE_MISSING: &str = "platform.reference.event.venue-missing";
 pub const RESOLVE_INSTRUMENT: &str = "platform.reference.query.resolve-instrument";
 pub const RESOLVE_IDENTIFIER: &str = "platform.reference.query.resolve-identifier";
 pub const PLUGIN_CATALOGUE: &str = "platform.config.query.plugin-catalogue";
+
+/// Every launch in the catalogue, read a page at a time with
+/// `launches_only` (contract v28's amendment, ruling 696), `ask` putting
+/// each request to the conductor.
+pub(crate) fn launches_in_pages(
+    ask: impl Fn(PluginCatalogueRequest) -> Result<PluginCatalogue, String>,
+) -> Result<PluginCatalogue, String> {
+    let mut asked = PluginCatalogueRequest {
+        launches_only: true,
+        ..Default::default()
+    };
+    let mut held = PluginCatalogue::default();
+    // More pages than any catalogue's launches fill.
+    for _ in 0..1000 {
+        let page = ask(asked.clone())?;
+        held.launches.extend(page.launches);
+        if page.next_cursor.is_empty() || page.next_cursor == asked.cursor {
+            return Ok(held);
+        }
+        asked.cursor = page.next_cursor;
+    }
+    Err("the catalogue's launches ran past 1000 pages".to_string())
+}
 /// A dataset's calendar, read for the closed-day flag (W3.19, W10.4).
 pub const READ_CALENDAR: &str = "platform.reference.query.read-calendar";
 /// A calendar's new version, heard to re-check the flag (W3.17, W10.4).
@@ -504,11 +527,15 @@ impl Lake {
                 return held.0.get(instance).cloned().unwrap_or_default();
             }
         }
-        let read: Result<PluginCatalogue, String> = self.ask(
-            PLUGIN_CATALOGUE,
-            "meridian.v1.PluginCatalogueRequest",
-            PluginCatalogueRequest {},
-        );
+        // The launches alone, page by page (contract v28's amendment,
+        // ruling 696): no version's declaration is needed here.
+        let read = launches_in_pages(|asked| {
+            self.ask(
+                PLUGIN_CATALOGUE,
+                "meridian.v1.PluginCatalogueRequest",
+                asked,
+            )
+        });
         let mut held = self.versions.lock().expect("versions poisoned");
         match read {
             Ok(catalogue) => {
