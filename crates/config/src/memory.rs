@@ -6,9 +6,9 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use meridian_domain::v1::{
-    AccessGroup, AccessRecords, AccountGroup, AccountRecord, ExternalAccountLink, Hold, LinkableAccounts,
-    MoveRecord, Permission, PluginArchive, PluginLaunch, PluginLaunchState, PluginVersion,
-    SettingLastChange, SignInRecord, UserGroup,
+    AccessGroup, AccessRecords, AccountGroup, AccountRecord, ExternalAccountLink, Hold,
+    LinkableAccounts, MoveRecord, Permission, PluginArchive, PluginLaunch, PluginLaunchState,
+    PluginVersion, SettingLastChange, SignInRecord, UserGroup,
 };
 
 use meridian_domain::v1::VenueCatalogue;

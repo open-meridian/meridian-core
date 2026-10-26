@@ -244,10 +244,19 @@ mod tests {
         assert!(form.contains("<option value=\"occ_osi\">"), "{form}");
         assert!(form.contains("<option value=\"ticker\">"), "{form}");
         assert!(form.contains("name=\"source\""), "{form}");
-        assert_eq!(series_key("occ_osi", "AAPL  261120C00230000", "XCME").unwrap()[0].source, "");
+        assert_eq!(
+            series_key("occ_osi", "AAPL  261120C00230000", "XCME").unwrap()[0].source,
+            ""
+        );
         let future = series_key("ticker", " ESZ6 ", "xcme").unwrap();
-        assert_eq!((future[0].value.as_str(), future[0].source.as_str()), ("ESZ6", "XCME"));
-        assert!(series_key("ticker", "ESZ6", "").is_err(), "a ticker needs its venue");
+        assert_eq!(
+            (future[0].value.as_str(), future[0].source.as_str()),
+            ("ESZ6", "XCME")
+        );
+        assert!(
+            series_key("ticker", "ESZ6", "").is_err(),
+            "a ticker needs its venue"
+        );
         assert!(series_key("isin", "US0378331005", "").is_err());
     }
 }

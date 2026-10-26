@@ -3,6 +3,7 @@ use std::sync::Mutex;
 use axum::body::{to_bytes, Body};
 use axum::http::header::COOKIE;
 use axum::http::Request;
+use meridian_access::DEPLOYMENT_ADMIN;
 use meridian_bus::{Bus, MemoryBackend};
 use meridian_domain::v1::{
     AccountRecord, AccountState, DefineAccountRequest, ExternalAccount, ExternalAccountLink,
@@ -10,7 +11,6 @@ use meridian_domain::v1::{
     SetPluginSettingsRequest, SyncState, SyncStatusEvent, UnlinkedExternalAccount,
     UnlinkedExternalAccountsEvent,
 };
-use meridian_access::DEPLOYMENT_ADMIN;
 use meridian_pb::v1::{SettingChoice, SettingCondition, SettingDeclaration, SettingType};
 use tower::ServiceExt;
 

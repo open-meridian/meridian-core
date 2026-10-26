@@ -599,8 +599,7 @@ impl Plugins {
         let plugins = Arc::clone(self);
         let envelope = envelope.clone();
         let note = request.note.clone();
-        let job =
-            move || plugins.run_pack_install(&pack, &queued, &note, &envelope, began_at_ns);
+        let job = move || plugins.run_pack_install(&pack, &queued, &note, &envelope, began_at_ns);
         match tokio::runtime::Handle::try_current() {
             // A job of its own (407): the answer does not wait for it.
             Ok(runtime) => {
@@ -718,8 +717,7 @@ impl Plugins {
                 .iter()
                 .filter(|member| {
                     job.members.iter().any(|m| {
-                        m.listing == member.listing
-                            && m.state == PackMemberState::Installing as i32
+                        m.listing == member.listing && m.state == PackMemberState::Installing as i32
                     })
                 })
                 .cloned()
@@ -732,7 +730,13 @@ impl Plugins {
                 members = queued.len(),
                 "a starter pack's install carried on after a restart"
             );
-            self.run_pack_install(&job.held, &queued, &job.note, &job.envelope, job.began_at_ns);
+            self.run_pack_install(
+                &job.held,
+                &queued,
+                &job.note,
+                &job.envelope,
+                job.began_at_ns,
+            );
         }
     }
 

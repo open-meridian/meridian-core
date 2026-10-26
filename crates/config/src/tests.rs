@@ -868,10 +868,7 @@ async fn a_claim_is_honoured_while_only_a_misspelt_group_holds_deployment_admin(
     assert!(redeemed.redeemed, "{}", redeemed.refusal_reason);
     let after = records(&h).await;
     assert_eq!(after.user_groups.len(), 2, "the misspelt group stays");
-    assert!(after
-        .user_groups
-        .iter()
-        .any(|group| group.logins == [ADA]));
+    assert!(after.user_groups.iter().any(|group| group.logins == [ADA]));
 
     let again = redeem(&h, "someone-else").await;
     assert!(!again.redeemed);

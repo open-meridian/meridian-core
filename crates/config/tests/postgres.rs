@@ -303,24 +303,44 @@ fn a_claim_installs_an_admin_while_only_a_misspelt_group_holds_it() {
     wizard.directory_groups = vec!["meridain-admins".into()];
     let author = meridian_config::Author::default();
     assert!(store
-        .install_first_admin(&wizard, &[admin_permission("PRM-wizard", "UG-wizard")], &author, 0)
+        .install_first_admin(
+            &wizard,
+            &[admin_permission("PRM-wizard", "UG-wizard")],
+            &author,
+            0
+        )
         .unwrap());
 
     let claimed = user_group("UG-claimed", "ada");
     assert!(store
-        .install_claimed_admin(&claimed, &[admin_permission("PRM-claimed", "UG-claimed")], &author, 1)
+        .install_claimed_admin(
+            &claimed,
+            &[admin_permission("PRM-claimed", "UG-claimed")],
+            &author,
+            1
+        )
         .unwrap());
     let again = user_group("UG-again", "ben");
     assert!(
         !store
-            .install_claimed_admin(&again, &[admin_permission("PRM-again", "UG-again")], &author, 2)
+            .install_claimed_admin(
+                &again,
+                &[admin_permission("PRM-again", "UG-again")],
+                &author,
+                2
+            )
             .unwrap(),
         "a named login holds it now"
     );
 
     let fresh = store_at("presented").0;
     assert!(fresh
-        .install_first_admin(&wizard, &[admin_permission("PRM-wizard", "UG-wizard")], &author, 0)
+        .install_first_admin(
+            &wizard,
+            &[admin_permission("PRM-wizard", "UG-wizard")],
+            &author,
+            0
+        )
         .unwrap());
     fresh
         .record_sign_in(&SignInRecord {
@@ -332,7 +352,12 @@ fn a_claim_installs_an_admin_while_only_a_misspelt_group_holds_it() {
         .unwrap();
     assert!(
         !fresh
-            .install_claimed_admin(&claimed, &[admin_permission("PRM-claimed", "UG-claimed")], &author, 2)
+            .install_claimed_admin(
+                &claimed,
+                &[admin_permission("PRM-claimed", "UG-claimed")],
+                &author,
+                2
+            )
             .unwrap(),
         "a person presented the group"
     );

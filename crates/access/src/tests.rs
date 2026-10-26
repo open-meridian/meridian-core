@@ -747,15 +747,26 @@ fn deployment_admin_held_by_a_misspelt_group_nobody_signed_in_with_holds_for_nob
         directory_groups: vec!["meridian-admins".into()],
         signed_in_at_ns: 1,
     }];
-    assert!(!deployment_admin_held(&records), "nobody presented the misspelt name");
+    assert!(
+        !deployment_admin_held(&records),
+        "nobody presented the misspelt name"
+    );
 
-    records.people[0].directory_groups.push("meridain-admins".into());
-    assert!(deployment_admin_held(&records), "a person who presented it holds it");
+    records.people[0]
+        .directory_groups
+        .push("meridain-admins".into());
+    assert!(
+        deployment_admin_held(&records),
+        "a person who presented it holds it"
+    );
 
     records.people.clear();
     records.user_groups[0].logins = vec![ADA.into()];
     assert!(deployment_admin_held(&records), "a named login holds it");
 
     records.permissions.clear();
-    assert!(!deployment_admin_held(&records), "no permission, nobody holds it");
+    assert!(
+        !deployment_admin_held(&records),
+        "no permission, nobody holds it"
+    );
 }

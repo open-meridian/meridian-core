@@ -2306,9 +2306,18 @@ mod tests {
         };
         use_kit("kit/".into());
         let names = [
-            "Summary", "Contracts", "Exclusive groups", "Event groups", "Scores",
-            "Positions", "Ticket", "Chains", "Volatility surface", "Scenario grid",
-            "Order flow", "Settings",
+            "Summary",
+            "Contracts",
+            "Exclusive groups",
+            "Event groups",
+            "Scores",
+            "Positions",
+            "Ticket",
+            "Chains",
+            "Volatility surface",
+            "Scenario grid",
+            "Order flow",
+            "Settings",
         ];
         let links: String = names
             .iter()
@@ -2316,7 +2325,11 @@ mod tests {
             .map(|(i, name)| {
                 format!(
                     "<a href=\"#t{i}\" data-tab=\"t{i}\"{}>{name}</a>",
-                    if i == 9 { " class=\"here\" aria-current=\"page\"" } else { "" }
+                    if i == 9 {
+                        " class=\"here\" aria-current=\"page\""
+                    } else {
+                        ""
+                    }
                 )
             })
             .collect();
