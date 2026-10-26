@@ -95,6 +95,9 @@ pub struct Hold {
     clock: Arc<dyn Clock>,
     /// One pull at a time: a second waits and reads what the first kept.
     pulling: tokio::sync::Mutex<()>,
+    /// The registries this deployment takes (`registries.taken`, ruling
+    /// 616); empty, every one.
+    taken: Vec<String>,
 }
 
 pub use meridian_domain::semver::{is_prerelease, semver_cmp};
@@ -173,7 +176,32 @@ impl Hold {
             store,
             clock,
             pulling: tokio::sync::Mutex::new(()),
+            taken: Vec::new(),
         }
+    }
+
+    /// Taking only these registries (`registries.taken`; spec/starter-
+    /// packs, requirement 26; ruling 616): a version from any other is
+    /// refused at install, and a pack's member from one reads "Not
+    /// permitted here". Empty takes every registry, as before.
+    pub fn taking(mut self, registries: Vec<String>) -> Hold {
+        self.taken = registries
+            .into_iter()
+            .map(|r| r.trim().to_lowercase())
+            .filter(|r| !r.is_empty())
+            .collect();
+        self
+    }
+
+    /// Why a version from `registry` is not taken here, or none.
+    pub fn taken_refused(&self, registry: &str) -> Option<String> {
+        if self.taken.is_empty() || self.taken.iter().any(|r| r == registry) {
+            return None;
+        }
+        Some(format!(
+            "this deployment does not take the {registry} registry (registries.taken: {})",
+            self.taken.join(", ")
+        ))
     }
 
     pub fn store(&self) -> &Arc<dyn Store> {
@@ -398,6 +426,9 @@ impl Hold {
             ));
         }
         if let Some(refusal) = floor_refused(&chosen) {
+            return Err(refusal);
+        }
+        if let Some(refusal) = self.taken_refused(&chosen.registry) {
             return Err(refusal);
         }
         let reply = wire::resolution(

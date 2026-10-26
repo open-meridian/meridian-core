@@ -1249,6 +1249,8 @@ pub fn serve_plugins_and_registries(
         registries,
         packs: packs::Jobs::default(),
     });
+    // A pack install a restart interrupted, carried on (616).
+    plugins.resume_pack_jobs();
     answer_on(
         &bus,
         &plugins,

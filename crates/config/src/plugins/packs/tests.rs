@@ -15,7 +15,7 @@ use serde_json::json;
 
 use super::*;
 use crate::plugins::registry::tests::{
-    ask, catalogue, harness, launch, list_version_1_5, pull, Harness, ADA,
+    ask, catalogue, harness, harness_with, launch, list_version_1_5, pull, Harness, ADA,
 };
 use crate::registries::tests::LISTING;
 
@@ -198,6 +198,73 @@ async fn a_pack_installs_member_by_member_past_a_failure_each_install_naming_it(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_pack_job_a_restart_interrupted_is_carried_on_and_recorded_once() {
+    // 616: the job is kept in the store at its start and after each
+    // member; a conductor starting over that store carries it on.
+    let before = harness();
+    publish(&before, 1, members_v1());
+    pull(&before).await;
+    let listed: ListRegistryPacksReply = ask(
+        &before,
+        REGISTRY_PACKS,
+        "meridian.v1.ListRegistryPacksRequest",
+        ListRegistryPacksRequest::default(),
+    )
+    .await
+    .unwrap();
+    let job = PackJob {
+        pack: PACK.into(),
+        held: listed.packs[0].clone(),
+        members: vec![meridian_domain::v1::PackMemberStatus {
+            listing: LISTING.into(),
+            state: PackMemberState::Installing as i32,
+            ..Default::default()
+        }],
+        envelope: Envelope {
+            meta: Some(meridian_pb::v1::MessageMeta {
+                acting_for_subject: ADA.into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        note: NOTE.into(),
+        began_at_ns: 1,
+    };
+    before.store.put_pack_job(&job).unwrap();
+
+    let after = harness_with(Arc::clone(&before.platform), Arc::clone(&before.store));
+    let status = settled(&after).await;
+    assert_eq!(status.installed_revision, 1);
+    assert_eq!(member(&status, LISTING).state, PackMemberState::Installed as i32);
+    let held = changes(&after).await;
+    assert_eq!(held.len(), 1, "one pack_installed");
+    assert_eq!(held[0].kind, PackChangeKind::Installed);
+    assert_eq!((held[0].by.by.as_str(), held[0].by.note.as_str()), (ADA, NOTE));
+    for _ in 0..100 {
+        if after.store.pack_jobs().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(after.store.pack_jobs().unwrap().is_empty(), "the job is cleared");
+    assert_eq!(catalogue(&after).await.versions.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pack_job_is_kept_while_it_runs_and_cleared_once_recorded() {
+    let h = harness();
+    installed(&h).await;
+    for _ in 0..100 {
+        if h.store.pack_jobs().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(h.store.pack_jobs().unwrap().is_empty());
+    assert_eq!(changes(&h).await.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_member_installed_already_is_left_alone_and_shown_below_the_version_offered() {
     let h = harness();
     let status = installed(&h).await;
@@ -253,6 +320,12 @@ async fn update_all_holds_a_widening_member_for_its_own_approval() {
         .any(|l| l.version == "1.4.0" && l.state == PluginLaunchState::Launched as i32));
     let recorded = changes(&h).await;
     assert_eq!(recorded.last().unwrap().kind, PackChangeKind::Updated);
+    // Remembered (616): read again, from the pack_updated record, it still
+    // needs approval while it runs below the version offered.
+    let again = read(&h).await;
+    let again = member(&again, LISTING);
+    assert_eq!(again.reason, NEEDS_APPROVAL);
+    assert_eq!(again.state, PackMemberState::Launched as i32);
 }
 
 #[tokio::test(flavor = "multi_thread")]

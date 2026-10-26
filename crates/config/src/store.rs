@@ -1164,6 +1164,16 @@ pub trait Store: Send + Sync {
     /// `pack` is empty.
     fn pack_changes(&self, pack: &str) -> Result<Vec<PackChange>>;
 
+    /// A pack's install under way, written at its start and after each
+    /// member, so a restart carries it on (616); one per pack, replaced.
+    fn put_pack_job(&self, job: &PackJob) -> Result<()>;
+
+    /// Every pack install under way, as last written.
+    fn pack_jobs(&self) -> Result<Vec<PackJob>>;
+
+    /// A pack's install finished: its `pack_installed` record is written.
+    fn end_pack_job(&self, pack: &str) -> Result<()>;
+
     /// Who installed a registry version, through what, and why; none for a
     /// local version or one not recorded.
     fn installation(&self, name: &str, version: &str) -> Result<Option<Author>>;
@@ -1249,6 +1259,21 @@ pub struct PackChange {
     pub members: Vec<meridian_domain::v1::PackMemberStatus>,
     pub by: Author,
     pub at_ns: i64,
+}
+
+/// A starter pack's install under way (616): the pack as ticked from, each
+/// ticked member's state so far, and who asked through what, so a conductor
+/// that restarts mid-job carries it on and still writes the one
+/// `pack_installed` record.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PackJob {
+    pub pack: String,
+    pub held: meridian_domain::v1::PluginPack,
+    pub members: Vec<meridian_domain::v1::PackMemberStatus>,
+    /// The asking envelope, for the records each member's install leaves.
+    pub envelope: meridian_domain::v1::Envelope,
+    pub note: String,
+    pub began_at_ns: i64,
 }
 
 /// The conductor's latest copy of the platform's catalogue (W8.10): every

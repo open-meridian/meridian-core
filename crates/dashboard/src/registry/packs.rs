@@ -258,6 +258,17 @@ pub fn deployment_state(status: &PackStatus) -> String {
     format!("Installed: {installed} of {} members", current.len())
 }
 
+/// This deployment's state of a pack as a key, as the terminal and the tools
+/// answer it beside its words in `said` (the CLI's queue, 2026-10-26):
+/// `installed` or `not_installed`.
+pub fn pack_state_key(status: &PackStatus) -> &'static str {
+    if status.installed_revision > 0 {
+        "installed"
+    } else {
+        "not_installed"
+    }
+}
+
 /// A member's terms access basis (requirement 17, ruling 356): "Licensed"
 /// where any dataset it declares is licensed, "Open" where every one is open
 /// or public domain, nothing where it declares none.
@@ -447,9 +458,26 @@ pub fn status_json(status: &PackStatus) -> Value {
         "installed_revision": status.installed_revision,
         "latest_revision": status.latest_revision,
         "withdrawn": status.withdrawn,
-        "state": deployment_state(status),
+        "state": pack_state_key(status),
+        "said": deployment_state(status),
         "members": status.members.iter().map(member_json).collect::<Vec<_>>(),
     })
+}
+
+/// The checklist, as `dashboard__read_pack` and the terminal's
+/// `GET /terminal/packs/{org}/{pack}` both answer it: the status, with each
+/// launched member's `setup_href` where its next step is done.
+pub fn checklist_json(checklist: &Checklist) -> Value {
+    let mut data = status_json(&checklist.status);
+    if let Some(members) = data["members"].as_array_mut() {
+        for member in members {
+            let listing = member["listing"].as_str().unwrap_or_default().to_string();
+            if let Some(href) = checklist.links.get(&listing) {
+                member["setup_href"] = json!(href);
+            }
+        }
+    }
+    data
 }
 
 /// A pack install's answer, as the tools and `--json` answer it.

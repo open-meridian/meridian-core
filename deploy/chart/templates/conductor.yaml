@@ -133,6 +133,13 @@ spec:
             - name: MERIDIAN_PLATFORM_KEYS_DIR
               value: /etc/meridian/platform-keys
             {{- end }}
+            {{- with .Values.registries.taken }}
+            # The registries this deployment takes (ruling 616): a version
+            # from another is refused, a pack's member from one "Not
+            # permitted here".
+            - name: MERIDIAN_REGISTRIES_TAKEN
+              value: {{ join "," . | quote }}
+            {{- end }}
             {{- end }}
             - name: MERIDIAN_INSTANCE_ID
               value: {{ include "meridian-runtime.fullname" . }}-conductor

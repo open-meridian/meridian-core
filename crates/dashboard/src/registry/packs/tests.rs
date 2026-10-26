@@ -143,6 +143,40 @@ fn a_members_state_is_said_and_keyed() {
     });
     assert_eq!(json["members"][0]["state"], "launched");
     assert_eq!(json["installed_revision"], 1);
+    // A pack's state is a key, as a member's is; its words are in `said`.
+    assert_eq!(json["state"], "installed");
+    assert_eq!(json["said"], "Installed: 1 of 1 members");
+}
+
+#[test]
+fn the_checklist_answers_each_launched_members_setup_href() {
+    // The terminal's GET /terminal/packs/{org}/{pack} answers as
+    // dashboard__read_pack does: one function draws both.
+    let checklist = Checklist {
+        status: PackStatus {
+            pack: "open-meridian/crypto".into(),
+            installed_revision: 0,
+            members: vec![
+                status("open-meridian/coinbase", PackMemberState::Launched),
+                status("open-meridian/kraken", PackMemberState::NotInstalled),
+            ],
+            ..Default::default()
+        },
+        links: [(
+            "open-meridian/coinbase".to_string(),
+            "/admin/plugins/coinbase-1?tab=settings".to_string(),
+        )]
+        .into_iter()
+        .collect(),
+    };
+    let json = checklist_json(&checklist);
+    assert_eq!(json["state"], "not_installed");
+    assert_eq!(json["said"], "Not installed");
+    assert_eq!(
+        json["members"][0]["setup_href"],
+        "/admin/plugins/coinbase-1?tab=settings"
+    );
+    assert!(json["members"][1].get("setup_href").is_none());
 }
 
 #[test]

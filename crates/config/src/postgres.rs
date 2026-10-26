@@ -2597,6 +2597,71 @@ impl Store for PostgresStore {
             .collect()
     }
 
+    fn put_pack_job(&self, job: &crate::store::PackJob) -> Result<()> {
+        use prost::Message;
+        let members = meridian_domain::v1::PackStatus {
+            members: job.members.clone(),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        self.conn()?
+            .execute(
+                "INSERT INTO config_pack_job (pack, held, members, envelope, note, began_at_ns)
+                 VALUES ($1, $2, $3, $4, $5, $6)
+                 ON CONFLICT (pack) DO UPDATE
+                    SET held = excluded.held, members = excluded.members,
+                        envelope = excluded.envelope, note = excluded.note,
+                        began_at_ns = excluded.began_at_ns",
+                &[
+                    &job.pack,
+                    &job.held.encode_to_vec(),
+                    &members,
+                    &job.envelope.encode_to_vec(),
+                    &job.note,
+                    &job.began_at_ns,
+                ],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
+    fn pack_jobs(&self) -> Result<Vec<crate::store::PackJob>> {
+        use prost::Message;
+        self.conn()?
+            .query(
+                "SELECT pack, held, members, envelope, note, began_at_ns
+                   FROM config_pack_job ORDER BY began_at_ns, pack",
+                &[],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|row| {
+                let held: Vec<u8> = row.get(1);
+                let members: Vec<u8> = row.get(2);
+                let envelope: Vec<u8> = row.get(3);
+                Ok(crate::store::PackJob {
+                    pack: row.get(0),
+                    held: meridian_domain::v1::PluginPack::decode(&held[..])
+                        .map_err(unavailable)?,
+                    members: meridian_domain::v1::PackStatus::decode(&members[..])
+                        .map_err(unavailable)?
+                        .members,
+                    envelope: meridian_domain::v1::Envelope::decode(&envelope[..])
+                        .map_err(unavailable)?,
+                    note: row.get(4),
+                    began_at_ns: row.get(5),
+                })
+            })
+            .collect()
+    }
+
+    fn end_pack_job(&self, pack: &str) -> Result<()> {
+        self.conn()?
+            .execute("DELETE FROM config_pack_job WHERE pack = $1", &[&pack])
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
     fn installation(&self, name: &str, version: &str) -> Result<Option<Author>> {
         Ok(self
             .conn()?

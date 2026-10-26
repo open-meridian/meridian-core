@@ -538,7 +538,8 @@ def run():
     runner("core-page", f"{PLUGINS}?tab=browse&view=packs", "--expect", "Stand-in desk",
            "--expect", "Not installed")
     packs = call(*as_admin, "dashboard__list_registry_packs", {}, "unchanged")["data"]["packs"]
-    must([p["pack"] for p in packs] == [PACK] and packs[0]["state"] == "Not installed",
+    must([p["pack"] for p in packs] == [PACK] and packs[0]["state"] == "not_installed"
+         and packs[0]["said"] == "Not installed",
          f"step 8b, the agent lists the one pack, not installed: {packs}")
     sheet = call(*as_admin, "dashboard__read_registry_pack", {"pack": PACK}, "unchanged")["data"]
     by_member = {m["listing"]: m for m in sheet["members"]}
@@ -564,7 +565,8 @@ def run():
             break
         time.sleep(1)
     members = {m["listing"]: m for m in status["members"]}
-    must(status["installed_revision"] == 1 and members[RATES]["state"] == "installed"
+    must(status["installed_revision"] == 1 and status["state"] == "installed"
+         and status["said"].startswith("Installed: ") and members[RATES]["state"] == "installed"
          and members[RATES]["installed_version"] == "0.1.0"
          and members[RATES]["setup"] == "Launch to connect",
          f"step 8b, stand-in-rates installed, to launch from the checklist: {status}")

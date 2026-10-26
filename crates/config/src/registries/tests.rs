@@ -749,3 +749,23 @@ async fn a_bundle_s_signer_is_checked_against_the_newer_key_status_held() {
         1_792_150_000_000_000_000
     );
 }
+
+#[tokio::test]
+async fn a_registry_this_deployment_does_not_take_is_refused_at_install() {
+    // `registries.taken` (ruling 616; spec/starter-packs, requirement 26).
+    let platform = Platform::new();
+    let held = hold(&platform).taking(vec!["Verified ".into()]);
+    held.pull().await.unwrap();
+    let refused = held
+        .fetch(LISTING, "1.4.0", "community")
+        .await
+        .err()
+        .expect("refused");
+    assert!(
+        refused.contains("does not take the community registry"),
+        "{refused}"
+    );
+    assert_eq!(held.taken_refused("verified"), None);
+    // Empty takes every registry, as before.
+    assert_eq!(hold(&platform).taken_refused("community"), None);
+}

@@ -2,6 +2,7 @@
 //! database configured. Its atomic operations hold one lock across the check
 //! and the write, which is what makes them atomic.
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use meridian_domain::v1::{
@@ -73,6 +74,7 @@ pub struct MemoryStore {
     install_packs: Mutex<std::collections::BTreeMap<(String, String), String>>,
     /// Each change to a starter pack's record, in order (W8.18, W8.19).
     pack_changes: Mutex<Vec<crate::store::PackChange>>,
+    pack_jobs: Mutex<BTreeMap<String, crate::store::PackJob>>,
     /// The registries (contract v25): the catalogue's copy, each listed
     /// version's statement, the usage setting's changes and the reports.
     registry: Mutex<Option<crate::store::HeldCatalogue>>,
@@ -139,6 +141,7 @@ impl MemoryStore {
             registry: Mutex::new(None),
             install_packs: Mutex::new(Default::default()),
             pack_changes: Mutex::new(Vec::new()),
+            pack_jobs: Mutex::new(BTreeMap::new()),
             statements: Mutex::new(Default::default()),
             reports_plugin_usage: Mutex::new(Vec::new()),
             plugin_usage_reports: Mutex::new(Vec::new()),
@@ -1405,6 +1408,32 @@ impl Store for MemoryStore {
             .filter(|change| pack.is_empty() || change.pack == pack)
             .cloned()
             .collect())
+    }
+
+    fn put_pack_job(&self, job: &crate::store::PackJob) -> Result<()> {
+        self.pack_jobs
+            .lock()
+            .expect("store lock poisoned")
+            .insert(job.pack.clone(), job.clone());
+        Ok(())
+    }
+
+    fn pack_jobs(&self) -> Result<Vec<crate::store::PackJob>> {
+        Ok(self
+            .pack_jobs
+            .lock()
+            .expect("store lock poisoned")
+            .values()
+            .cloned()
+            .collect())
+    }
+
+    fn end_pack_job(&self, pack: &str) -> Result<()> {
+        self.pack_jobs
+            .lock()
+            .expect("store lock poisoned")
+            .remove(pack);
+        Ok(())
     }
 
     fn installation(&self, name: &str, version: &str) -> Result<Option<Author>> {
