@@ -61,6 +61,21 @@ pub const SAVED_SCENARIO: &str = "meridian.v1.SavedScenario";
 /// it in the source (contract v28, the filings slice; W10.4).
 pub const CORPORATE_ACTION: &str = "meridian.v1.CorporateActionAnnounced";
 
+/// A filing as its publisher accepted it, keyed by accession (contract v28,
+/// the filings slice; W10.4).
+pub const FILING: &str = "meridian.v1.Filing";
+/// A value a filer reported for a concept and period, a later filing's
+/// different value its next version (contract v28, the filings slice).
+pub const REPORTED_FACT: &str = "meridian.v1.ReportedFact";
+/// A rating agency's action on a rating, from its Rule 17g-7(b) history
+/// (contract v28, the filings slice; FDP Q7).
+pub const RATING_ACTION: &str = "meridian.v1.RatingAction";
+/// A holder's report of its holdings as of a date: a 13F, a 13D or a 13G
+/// (contract v28, the filings slice; the guardrail's second move-out).
+pub const HOLDINGS_REPORT: &str = "meridian.v1.HoldingsReport";
+/// One holding of a holdings report (contract v28, the filings slice).
+pub const HOLDING: &str = "meridian.v1.Holding";
+
 /// The scheme a future's or a future option's series is keyed by: the
 /// exchange's ticker, one identifier carrying its venue's ISO 10383 MIC in
 /// `source` (contract v28, W1.26 and W10.4; DESIGN28's sixth amendment,
@@ -72,8 +87,9 @@ pub const OCC_OSI_SCHEME: &str = "occ_osi";
 /// The lake's data types: the 1a's, the 1b's from contract v19, the 1c's
 /// outcome from contract v23, the rates slice's rate from contract v27, and
 /// from contract v28 statistics, listed series, derived series, saved
-/// scenarios and declared corporate actions.
-pub const DATA_TYPES: [&str; 11] = [
+/// scenarios, declared corporate actions, and the filings slice's filings,
+/// reported facts, rating actions, holdings reports and holdings.
+pub const DATA_TYPES: [&str; 16] = [
     PRICE,
     BAR,
     TRADE,
@@ -85,6 +101,11 @@ pub const DATA_TYPES: [&str; 11] = [
     DERIVED_SERIES,
     SAVED_SCENARIO,
     CORPORATE_ACTION,
+    FILING,
+    REPORTED_FACT,
+    RATING_ACTION,
+    HOLDINGS_REPORT,
+    HOLDING,
 ];
 
 /// The data types a default read takes a priority among (W10.3): an outcome
@@ -194,6 +215,49 @@ const CORPORATE_ACTION_FIELDS: [&str; 9] = [
     "meridian.v1.CorporateActionAnnounced.filing",
 ];
 
+const FILING_FIELDS: [&str; 6] = [
+    "meridian.v1.Filing.meta",
+    "meridian.v1.Filing.filing",
+    "meridian.v1.Filing.kind",
+    "meridian.v1.Filing.items",
+    "meridian.v1.Filing.period_of_report",
+    "meridian.v1.Filing.filed_date",
+];
+
+const REPORTED_FACT_FIELDS: [&str; 8] = [
+    "meridian.v1.ReportedFact.meta",
+    "meridian.v1.ReportedFact.concept",
+    "meridian.v1.ReportedFact.amount",
+    "meridian.v1.ReportedFact.value",
+    "meridian.v1.ReportedFact.period_start",
+    "meridian.v1.ReportedFact.period_end",
+    "meridian.v1.ReportedFact.dimensions",
+    "meridian.v1.ReportedFact.filing",
+];
+
+const RATING_ACTION_FIELDS: [&str; 4] = [
+    "meridian.v1.RatingAction.meta",
+    "meridian.v1.RatingAction.rating",
+    "meridian.v1.RatingAction.rating_class",
+    "meridian.v1.RatingAction.action",
+];
+
+const HOLDINGS_REPORT_FIELDS: [&str; 5] = [
+    "meridian.v1.HoldingsReport.meta",
+    "meridian.v1.HoldingsReport.kind",
+    "meridian.v1.HoldingsReport.report_date",
+    "meridian.v1.HoldingsReport.complete",
+    "meridian.v1.HoldingsReport.filing",
+];
+
+const HOLDING_FIELDS: [&str; 5] = [
+    "meridian.v1.Holding.meta",
+    "meridian.v1.Holding.report_row_key",
+    "meridian.v1.Holding.quantity",
+    "meridian.v1.Holding.market_value",
+    "meridian.v1.Holding.percent_of_class",
+];
+
 /// The dictionary entries of a data type's fields; none for one the lake
 /// does not have.
 pub fn fields_of(data_type: &str) -> &'static [&'static str] {
@@ -209,6 +273,11 @@ pub fn fields_of(data_type: &str) -> &'static [&'static str] {
         DERIVED_SERIES => &DERIVED_SERIES_FIELDS,
         SAVED_SCENARIO => &SAVED_SCENARIO_FIELDS,
         CORPORATE_ACTION => &CORPORATE_ACTION_FIELDS,
+        FILING => &FILING_FIELDS,
+        REPORTED_FACT => &REPORTED_FACT_FIELDS,
+        RATING_ACTION => &RATING_ACTION_FIELDS,
+        HOLDINGS_REPORT => &HOLDINGS_REPORT_FIELDS,
+        HOLDING => &HOLDING_FIELDS,
         _ => &[],
     }
 }
@@ -633,6 +702,93 @@ pub fn strip_corporate_action(
         action.filing = None;
     }
     removed
+}
+
+/// The fields a reader may not read removed, and named: each entry not in
+/// `allowed`, an empty set allowing every field. What a row is -- its
+/// envelope, and its kind, concept, action or report -- is never removed.
+fn strip_by(
+    fields: &'static [&'static str],
+    keep: &[usize],
+    allowed: &std::collections::BTreeSet<String>,
+    mut clear: impl FnMut(usize),
+) -> Vec<&'static str> {
+    let mut removed = Vec::new();
+    if allowed.is_empty() {
+        return removed;
+    }
+    for (i, entry) in fields.iter().enumerate() {
+        if i == 0 || keep.contains(&i) || allowed.contains(*entry) {
+            continue;
+        }
+        clear(i);
+        removed.push(*entry);
+    }
+    removed
+}
+
+/// [`strip_outcome`], for a filing (contract v28, the filings slice): its
+/// kind is what the row is, never stripped.
+pub fn strip_filing(
+    filing: &mut crate::v1::Filing,
+    allowed: &std::collections::BTreeSet<String>,
+) -> Vec<&'static str> {
+    strip_by(&FILING_FIELDS, &[2], allowed, |i| match i {
+        1 => filing.filing = None,
+        3 => filing.items.clear(),
+        4 => filing.period_of_report.clear(),
+        _ => filing.filed_date.clear(),
+    })
+}
+
+/// [`strip_outcome`], for a reported fact: its concept is what it is.
+pub fn strip_reported_fact(
+    fact: &mut crate::v1::ReportedFact,
+    allowed: &std::collections::BTreeSet<String>,
+) -> Vec<&'static str> {
+    strip_by(&REPORTED_FACT_FIELDS, &[1], allowed, |i| match i {
+        2 => fact.amount = None,
+        3 => fact.value = None,
+        4 => fact.period_start.clear(),
+        5 => fact.period_end.clear(),
+        6 => fact.dimensions.clear(),
+        _ => fact.filing = None,
+    })
+}
+
+/// [`strip_outcome`], for a rating action: its action is what it is.
+pub fn strip_rating_action(
+    action: &mut crate::v1::RatingAction,
+    allowed: &std::collections::BTreeSet<String>,
+) -> Vec<&'static str> {
+    strip_by(&RATING_ACTION_FIELDS, &[3], allowed, |i| match i {
+        1 => action.rating.clear(),
+        _ => action.rating_class.clear(),
+    })
+}
+
+/// [`strip_outcome`], for a holdings report: its kind is what it is.
+pub fn strip_holdings_report(
+    report: &mut crate::v1::HoldingsReport,
+    allowed: &std::collections::BTreeSet<String>,
+) -> Vec<&'static str> {
+    strip_by(&HOLDINGS_REPORT_FIELDS, &[1], allowed, |i| match i {
+        2 => report.report_date.clear(),
+        3 => report.complete = false,
+        _ => report.filing = None,
+    })
+}
+
+/// [`strip_outcome`], for a holding: the report it belongs to is what it is.
+pub fn strip_holding(
+    holding: &mut crate::v1::Holding,
+    allowed: &std::collections::BTreeSet<String>,
+) -> Vec<&'static str> {
+    strip_by(&HOLDING_FIELDS, &[1], allowed, |i| match i {
+        2 => holding.quantity = None,
+        3 => holding.market_value = None,
+        _ => holding.percent_of_class = None,
+    })
 }
 
 /// The asset a row is priced in, by its Money's cash instrument (or its

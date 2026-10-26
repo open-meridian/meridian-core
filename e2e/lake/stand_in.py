@@ -73,13 +73,25 @@ From contract v28 (quality states; W10.4, W10.6, W10.12; ruling 619):
              after a sequence gap (suspicious) and, resynced, a crossed one
              (invalid), each recorded with its state.
 
+From contract v28's filings slice (W10.4 to W10.6; core release C2) it
+declares `filings` -- filings, reported facts, rating actions, holdings
+reports and holdings, pushed -- and serves:
+
+  /filings   resolves Apple, Berkshire Hathaway and Moody's by CIK
+             (ResolveCompany, W3.32) and Apple's share by its FIGI, and
+             records an 8-K with Item 2.02, a quarter's basic EPS and then
+             a later filing restating it, a 13F report and its Apple
+             holding, and Moody's affirmation of Apple's rating.
+
 STAND_IN_LAKE=signal is a `signal` plugin serving:
 
   /assess?subject=ID&date=D&state=S[&version=N]
              reads the subject's close for the date from coin:daily and
              records its assessment (RecordQualityAssessments), its version
              the row's unless given; answering what was recorded or the
-             refusal.
+             refusal;
+  /follow-filings?subject=ID  hears the filings recorded about it (W10.5);
+  /filings-heard             each filing heard, its row key and items.
 
 STAND_IN_LAKE=reader serves:
 
@@ -99,7 +111,12 @@ STAND_IN_LAKE=reader serves:
                                             answers it;
   /rates?subject=ID&date=D[&tenor=T][&published_as_of=N]
                                             ListRates (contract v27): its rows and
-                                            what it left unanswered.
+                                            what it left unanswered;
+  /filed?subject=ID&role=R[&published_as_of=N]
+                                            contract v28: ListFilings,
+                                            ListReportedFacts, ListRatingActions
+                                            and ListHoldings of the subject in
+                                            its role, each row in brief.
 
 The exchange file (STAND_IN_EXCHANGES, a directory holding exchange.json) is
 shaped on a vendor's responses with invented values: candles as
@@ -215,6 +232,17 @@ CATALOGUE = [
         data_types=["meridian.v1.Rate"],
         modes=["pull", "push"],
         cadence=86_400,
+        licence_default=DatasetLicence(kept=True, derived_use=True, display=True),
+        day_time_zone="America/New_York",
+    ),
+    # Contract v28, the filings slice: EDGAR-like rows, pushed.
+    DatasetDeclaration(
+        key="filings",
+        vendor="SEC EDGAR",
+        data_types=["meridian.v1.Filing", "meridian.v1.ReportedFact",
+                    "meridian.v1.RatingAction", "meridian.v1.HoldingsReport",
+                    "meridian.v1.Holding"],
+        modes=["push"],
         licence_default=DatasetLicence(kept=True, derived_use=True, display=True),
         day_time_zone="America/New_York",
     ),
@@ -525,6 +553,79 @@ class Dgm:
         log(rates=said)
         return said
 
+    async def filings(self):
+        """Contract v28, the filings slice (W10.4): each company by its CIK,
+        Apple's share by its FIGI; an 8-K dating an earnings report, a fact
+        and its restatement by a later filing published after it, a 13F and
+        its holding, and a rating action."""
+        companies = {}
+        for name, cik in (("apple", "0000320193"), ("berkshire", "0001067983"),
+                          ("moodys", "0001059556")):
+            found = await self.plugin.resolve_company(
+                identifiers=[ops.Identifier(scheme="cik", value=cik)])
+            companies[name] = found.company_id
+        share = await self.plugin.resolve_identifier(
+            identifiers=[ops.Identifier(scheme="figi", value="BBG000B9XRY4")],
+            stated_asset_class="equity", stated_description="Apple Inc.", stated_currency="USD")
+        if not share.instrument_id:
+            raise RuntimeError(f"Apple's share did not resolve: {share}")
+        apple, berkshire, moodys = companies["apple"], companies["berkshire"], companies["moodys"]
+        now = time.time_ns()
+        first, restated = now - 3600 * 10**9, now - 60 * 10**9
+
+        def meta(row_key, subjects, valid, published):
+            return ObservationMeta(
+                row_key=row_key,
+                subjects=[meridian.SubjectRef(entity_id=e, role=r) for e, r in subjects],
+                source=ops.Source(dataset=self.dataset("filings")),
+                valid_from_ns=valid,
+                source_times=[SourceTime(kind="published", at_ns=published)],
+                raw=self.plugin.raw_record(f"edgar/{row_key}"))
+
+        eight_k = "0000320193-26-000105"
+        filed = await self.plugin.record_filings(filings=[meridian.Filing(
+            meta=meta(eight_k, [(apple, "filer")], first, first),
+            filing=ops.FilingRef(accession_number=eight_k, form="8-K"),
+            kind="current_report", items=["2.02", "9.01"], filed_date="2026-10-30")])
+        eps_key = "320193:us-gaap:EarningsPerShareBasic:USD/shares:2026-06-28:2026-09-27"
+
+        def eps(amount, accession, published):
+            return meridian.ReportedFact(
+                meta=meta(eps_key, [(apple, "filer")], published, published),
+                concept="us-gaap:EarningsPerShareBasic", amount=Money(Decimal(amount), "USD"),
+                period_start="2026-06-28", period_end="2026-09-27",
+                filing=ops.FilingRef(accession_number=accession, form="10-K"))
+
+        fact = await self.plugin.record_reported_facts(
+            facts=[eps("1.85", "0000320193-26-000107", first)])
+        fact_again = await self.plugin.record_reported_facts(
+            facts=[eps("1.86", "0000320193-26-000121", restated)])
+        q3 = "0001067983-26-000045"
+        quarter_end = int(datetime(2026, 9, 30, tzinfo=timezone.utc).timestamp()) * 10**9
+        reported = await self.plugin.record_holdings_reports(reports=[meridian.HoldingsReport(
+            meta=meta(q3, [(berkshire, "holder")], quarter_end, first),
+            kind="form_13f", report_date="2026-09-30", complete=True,
+            filing=ops.FilingRef(accession_number=q3, form="13F-HR"))])
+        held = await self.plugin.record_holdings(holdings=[meridian.Holding(
+            meta=meta(f"{q3}:037833100", [(berkshire, "holder"), (share.instrument_id, "held")],
+                      quarter_end, first),
+            report_row_key=q3,
+            quantity=meridian.UnitValue(value=Decimal("300000000"), unit="shares"),
+            market_value=Money(Decimal("69000000000"), "USD"))])
+        affirmed = int(datetime(2026, 5, 2, tzinfo=timezone.utc).timestamp()) * 10**9
+        rated = await self.plugin.record_rating_actions(actions=[meridian.RatingAction(
+            meta=meta(f"moodys:issuer:{apple}:2026-05-02", [(apple, "subject"), (moodys, "rater")],
+                      affirmed, first),
+            rating="Aaa", rating_class="long-term issuer", action="affirmed")])
+        said = {"apple": apple, "berkshire": berkshire, "moodys": moodys,
+                "share": share.instrument_id, "first_published": first,
+                "restated_published": restated,
+                "recorded": [filed.recorded, fact.recorded, reported.recorded, held.recorded,
+                             rated.recorded],
+                "restated": fact_again.restated}
+        log(filings=said)
+        return said
+
     async def resolve_as_of(self, query):
         one = lambda name: query.get(name, [""])[0]
         # A security with the name and currency the venue states (from
@@ -588,6 +689,8 @@ class Dgm:
             return await self.rates()
         if path == "/quality":
             return await self.quality()
+        if path == "/filings":
+            return await self.filings()
         if path == "/resolve":
             return await self.resolve()
         if path == "/record":
@@ -691,6 +794,34 @@ class Reader:
                            for u in answer.unanswered],
         }
 
+    async def filed(self, query):
+        """Contract v28 (W10.6): the filings slice's four reads of one
+        subject in its role, each row in brief."""
+        one = lambda name, default="": query.get(name, [default])[0]  # noqa: E731
+        subjects = [meridian.SubjectRef(entity_id=one("subject"), role=one("role") or None)]
+        published = int(one("published_as_of", "0"))
+        brief = lambda meta: {"row_key": meta.row_key, "version": meta.version,  # noqa: E731
+                              "dataset": meta.source.dataset}
+        filings = await self.plugin.list_filings(subjects=subjects, published_as_of_ns=published)
+        facts = await self.plugin.list_reported_facts(subjects=subjects,
+                                                      published_as_of_ns=published)
+        ratings = await self.plugin.list_rating_actions(subjects=subjects,
+                                                        published_as_of_ns=published)
+        holdings = await self.plugin.list_holdings(subjects=subjects, published_as_of_ns=published,
+                                                   kinds=["form_13f"], from_date="2026-09-30")
+        return {
+            "filings": [dict(brief(f.meta), items=list(f.items), filed_date=f.filed_date,
+                             kind=ops.FilingKind.Name(f.kind)) for f in filings.filings],
+            "facts": [dict(brief(f.meta), amount=_amount(f.amount.amount),
+                           filing=f.filing.accession_number) for f in facts.facts],
+            "ratings": [dict(brief(r.meta), rating=r.rating,
+                             action=ops.RatingActionKind.Name(r.action)) for r in ratings.actions],
+            "holdings": [dict(brief(h.meta), report=h.report_row_key,
+                              quantity=_amount(h.quantity.value)) for h in holdings.holdings],
+            "reports": [dict(brief(r.meta), report_date=r.report_date, complete=r.complete)
+                        for r in holdings.reports],
+        }
+
     async def invalid_date(self, query):
         params = ops.ListPricesParams(
             subjects=[ops.SubjectRef(entity_id=s) for s in query.get("subject", [])],
@@ -716,6 +847,8 @@ class Reader:
             return await self.invalid_date(query)
         if path == "/rates":
             return await self.rates(query)
+        if path == "/filed":
+            return await self.filed(query)
         return {"page": "the lake's reading stand-in"}
 
 
@@ -823,6 +956,14 @@ class Desk:
 class Lens:
     def __init__(self, plugin):
         self.plugin = plugin
+        self.filings = []
+        self.hearing = None
+
+    async def on_filing(self, heard):
+        filing = heard.message.filing
+        self.filings.append({"row_key": filing.meta.row_key, "version": filing.meta.version,
+                             "items": list(filing.items)})
+        log(heard_filing=self.filings[-1])
 
     async def assess(self, query):
         """W10.12: read the close, then record its assessment, as a signal
@@ -848,6 +989,14 @@ class Lens:
     async def answer(self, path, query):
         if path == "/assess":
             return await self.assess(query)
+        if path == "/follow-filings":
+            # Contract v28 (W10.5): every filing, never conflated.
+            if self.hearing is None:
+                self.hearing = asyncio.ensure_future(self.plugin.receive(
+                    filings_recorded=self.on_filing, subjects=query.get("subject", [])))
+            return {"following": query.get("subject", [])}
+        if path == "/filings-heard":
+            return {"filings": self.filings}
         return {"page": "the lake's signal stand-in"}
 
 

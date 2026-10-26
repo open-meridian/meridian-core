@@ -71,6 +71,8 @@ use prost::Message;
 
 pub use meridian_clock::Clock;
 
+mod filings;
+
 use crate::config::{DataConfig, Reader};
 use crate::read::{self, Against, Read};
 use crate::row::{DataType, Observation};
@@ -103,6 +105,18 @@ pub const LIST_SCENARIOS: &str = "platform.lake.query.list-scenarios";
 /// actions, a cash dividend in v28.
 pub const RECORD_CORPORATE_ACTIONS: &str = "platform.lake.command.record-corporate-actions";
 pub const LIST_CORPORATE_ACTIONS: &str = "platform.lake.query.list-corporate-actions";
+/// Contract v28, the filings slice (W10.4 to W10.6): filings, reported
+/// facts and rating actions; and, the guardrail's second move-out, holdings
+/// reports and their holdings ([`filings`]).
+pub const RECORD_FILINGS: &str = "platform.lake.command.record-filings";
+pub const LIST_FILINGS: &str = "platform.lake.query.list-filings";
+pub const RECORD_REPORTED_FACTS: &str = "platform.lake.command.record-reported-facts";
+pub const LIST_REPORTED_FACTS: &str = "platform.lake.query.list-reported-facts";
+pub const RECORD_RATING_ACTIONS: &str = "platform.lake.command.record-rating-actions";
+pub const LIST_RATING_ACTIONS: &str = "platform.lake.query.list-rating-actions";
+pub const RECORD_HOLDINGS_REPORTS: &str = "platform.lake.command.record-holdings-reports";
+pub const RECORD_HOLDINGS: &str = "platform.lake.command.record-holdings";
+pub const LIST_HOLDINGS: &str = "platform.lake.query.list-holdings";
 /// A company subject's record (contract v28, W3.32): asked by its `ENT-` ID.
 pub const RESOLVE_COMPANY: &str = "platform.reference.query.resolve-company";
 pub const DECLINE_WANT: &str = "platform.lake.command.decline-want";
@@ -152,6 +166,13 @@ pub fn recorded_topic(dataset: &str, data_type: DataType) -> String {
         DataType::CorporateAction => {
             format!("platform.lake.{dataset}.event.corporate-actions-recorded")
         }
+        DataType::Filing => format!("platform.lake.{dataset}.event.filings-recorded"),
+        // Read, not heard (contract v28, W10.5): facts, holdings and rating
+        // actions arrive in bulk and lag their periods by weeks.
+        DataType::ReportedFact
+        | DataType::RatingAction
+        | DataType::HoldingsReport
+        | DataType::Holding => String::new(),
         // Never published: read within each reader's account scope (W10.11);
         // a listed series is read when a chain is built (contract v28, W10.5).
         // A signal plugin's derived values and saved scenarios are read,
@@ -528,7 +549,8 @@ impl Lake {
         if matches!(
             data_type,
             DataType::Outcome | DataType::Rate | DataType::ExecutionCost
-        ) {
+        ) || data_type.filings()
+        {
             return Err(format!(
                 "{at}.meta.series_key: {} is keyed by no series",
                 data_type.name()
@@ -857,19 +879,16 @@ impl Lake {
                     meta.subjects.len()
                 ));
             }
-            // A declared corporate action's subject is the security, the
-            // company its issuer where stated (contract v28, W10.4): a
-            // company by its platform record, in that role alone.
-            if data_type == DataType::CorporateAction
-                && !meta
-                    .subjects
-                    .iter()
-                    .any(|subject| !subject.entity_id.starts_with(COMPANY_PREFIX))
-            {
-                return Err(format!(
-                    "{at}.meta.subjects names no security: a corporate action's subject is the \
-                     security, its issuer beside it where stated"
-                ));
+            // The filings slice's subjects in their roles (contract v28,
+            // W10.4): a company by its platform record, in a role its kind
+            // gives a company; and what each kind must name.
+            if data_type.filings() {
+                self.filings_subjects_refused(&at, data_type, &meta.subjects)?;
+                if meta.valid_from_ns <= 0 {
+                    return Err(format!(
+                        "{at}.meta.valid_from_ns is required: when it became true, never 0"
+                    ));
+                }
             }
             for (j, subject) in meta.subjects.iter().enumerate() {
                 if !(1..=64).contains(&subject.entity_id.chars().count()) {
@@ -877,29 +896,15 @@ impl Lake {
                         "{at}.meta.subjects[{j}].entity_id is 1 to 64 characters"
                     ));
                 }
-                if subject.entity_id.starts_with(COMPANY_PREFIX) {
-                    if data_type != DataType::CorporateAction {
-                        return Err(format!(
-                            "{at}.meta.subjects[{j}].entity_id {:?}: a company is no subject of \
-                             {}",
-                            subject.entity_id,
-                            data_type.name()
-                        ));
-                    }
-                    if subject.role != SubjectRole::Issuer as i32 {
-                        return Err(format!(
-                            "{at}.meta.subjects[{j}].role: a company names a corporate action's \
-                             issuer, SUBJECT_ROLE_ISSUER"
-                        ));
-                    }
-                    if !self.company_held(&subject.entity_id)? {
-                        return Err(format!(
-                            "{at}.meta.subjects[{j}].entity_id {:?} is no company the deployment \
-                             holds; resolve it (W3.32) first",
-                            subject.entity_id
-                        ));
-                    }
+                if data_type.filings() {
                     continue;
+                }
+                if subject.entity_id.starts_with(COMPANY_PREFIX) {
+                    return Err(format!(
+                        "{at}.meta.subjects[{j}].entity_id {:?}: a company is no subject of {}",
+                        subject.entity_id,
+                        data_type.name()
+                    ));
                 }
                 let Some((class, kind)) = self.subject_record(&subject.entity_id)? else {
                     return Err(format!(
@@ -959,6 +964,8 @@ impl Lake {
                         DataType::Trade => "a trade",
                         DataType::Quote => "a quote",
                         DataType::CorporateAction => "a corporate action, dated by its own fields,",
+                        kind if kind.filings() =>
+                            "a row of the filings slice, dated by its own fields,",
                         _ => "an outcome",
                     }
                 ));
@@ -1070,6 +1077,13 @@ impl Lake {
                 Observation::Derived(value) => derived_refused(&at, value)?,
                 Observation::Scenario(saved) => self.scenario_refused(&at, saved)?,
                 Observation::CorporateAction(action) => corporate_action_refused(&at, action)?,
+                Observation::Filing(filing) => filings::filing_refused(&at, filing)?,
+                Observation::ReportedFact(fact) => filings::reported_fact_refused(&at, fact)?,
+                Observation::RatingAction(action) => filings::rating_action_refused(&at, action)?,
+                Observation::HoldingsReport(report) => {
+                    filings::holdings_report_refused(&at, report)?
+                }
+                Observation::Holding(holding) => filings::holding_refused(&at, holding)?,
                 _ => {}
             }
             if let Observation::Bar(bar) = &row {
@@ -1118,7 +1132,19 @@ impl Lake {
             "series" => bounds::RECORD_SERIES_REQUEST_SERIES_COUNT,
             "values" => bounds::RECORD_DERIVED_SERIES_REQUEST_VALUES_COUNT,
             "scenarios" => bounds::RECORD_SCENARIOS_REQUEST_SCENARIOS_COUNT,
+            // Two requests name their rows `actions` (contract v28).
+            "actions"
+                if rows
+                    .first()
+                    .is_some_and(|row| row.data_type() == DataType::RatingAction) =>
+            {
+                bounds::RECORD_RATING_ACTIONS_REQUEST_ACTIONS_COUNT
+            }
             "actions" => bounds::RECORD_CORPORATE_ACTIONS_REQUEST_ACTIONS_COUNT,
+            "filings" => bounds::RECORD_FILINGS_REQUEST_FILINGS_COUNT,
+            "facts" => bounds::RECORD_REPORTED_FACTS_REQUEST_FACTS_COUNT,
+            "reports" => bounds::RECORD_HOLDINGS_REPORTS_REQUEST_REPORTS_COUNT,
+            "holdings" => bounds::RECORD_HOLDINGS_REQUEST_HOLDINGS_COUNT,
             _ => bounds::RECORD_BARS_REQUEST_BARS_COUNT,
         };
         if !bound.admits(rows.len()) {
@@ -1574,6 +1600,20 @@ impl Lake {
             | Observation::Series(_)
             | Observation::Derived(_)
             | Observation::Scenario(_) => return,
+            // Read, not heard (contract v28, W10.5).
+            Observation::ReportedFact(_)
+            | Observation::RatingAction(_)
+            | Observation::HoldingsReport(_)
+            | Observation::Holding(_) => return,
+            // Every version, never conflated (contract v28, W10.5): a filing
+            // is an event, not a value in force.
+            Observation::Filing(filing) => (
+                "meridian.v1.FilingsRecordedEvent",
+                meridian_domain::v1::FilingsRecordedEvent {
+                    filing: Some(filing.clone()),
+                }
+                .encode_to_vec(),
+            ),
             // Every version, never conflated (contract v28, W10.5): an
             // announcement is an event, not a value in force.
             Observation::CorporateAction(action) => (
@@ -1934,6 +1974,19 @@ impl Lake {
         request: ReadRequest,
         wants: bool,
     ) -> Result<ReadAnswer, String> {
+        self.read_within(reader, request, wants, read::Narrowed::default())
+    }
+
+    /// [`Lake::read_as`], keeping only the rows `narrowed` keeps besides
+    /// (contract v28, the filings slice: a fact's concepts, a holding's
+    /// reports), before the page is cut.
+    pub(crate) fn read_within(
+        &self,
+        reader: Reader,
+        request: ReadRequest,
+        wants: bool,
+        narrowed: read::Narrowed,
+    ) -> Result<ReadAnswer, String> {
         if !bounds::LIST_PRICES_REQUEST_SUBJECTS_COUNT.admits(request.subjects.len()) {
             return Err(format!(
                 "subjects names {}; 1 to 500",
@@ -2005,7 +2058,7 @@ impl Lake {
             // A declared corporate action (contract v28, W10.6): every row
             // key's version in force, narrowed by its kind's date; or the
             // versions recorded after a watermark, whatever their dates.
-            DataType::CorporateAction => match after {
+            DataType::CorporateAction | DataType::Filing => match after {
                 Some(watermark) => {
                     let mut at: BTreeMap<String, u64> = BTreeMap::new();
                     for (i, partition) in watermark.partitions.iter().enumerate() {
@@ -2026,6 +2079,15 @@ impl Lake {
                     until_ns: 0,
                 },
             },
+            // The filings slice's other kinds (contract v28, W10.6): every row
+            // key's version in force, narrowed by its kind's date.
+            DataType::ReportedFact | DataType::RatingAction | DataType::Holding => When::Range {
+                from_ns: 1,
+                until_ns: 0,
+            },
+            DataType::HoldingsReport => {
+                return Err("a holdings report is read by ListHoldings, beside its holdings".into())
+            }
             // A rate is read as a price is (contract v27, W10.6); and a
             // statistic (contract v28).
             DataType::Price
@@ -2149,6 +2211,7 @@ impl Lake {
                 .filter(|s| s.role != SubjectRole::Unspecified as i32)
                 .map(|s| (s.entity_id.clone(), s.role))
                 .collect(),
+            narrowed,
         };
         let answered = read::answer(
             self.store.as_ref(),
@@ -2600,12 +2663,6 @@ impl Lake {
         request: ListCorporateActionsRequest,
         envelope: &Envelope,
     ) -> Result<ListCorporateActionsReply, String> {
-        if !bounds::LIST_CORPORATE_ACTIONS_REQUEST_SUBJECTS_COUNT.admits(request.subjects.len()) {
-            return Err(format!(
-                "subjects names {}; 1 to 64",
-                request.subjects.len()
-            ));
-        }
         for (i, kind) in request.kinds.iter().enumerate() {
             if CorporateActionKind::try_from(*kind).unwrap_or(CorporateActionKind::Unspecified)
                 == CorporateActionKind::Unspecified
@@ -2613,57 +2670,21 @@ impl Lake {
                 return Err(format!("kinds[{i}] is unspecified"));
             }
         }
-        let caught_up = request
-            .after_watermark
-            .as_ref()
-            .is_some_and(|watermark| !watermark.partitions.is_empty());
-        let ranged = !request.from_date.is_empty() || !request.to_date.is_empty();
-        if caught_up && ranged {
-            return Err(
-                "after_watermark and from_date or to_date: a catch-up reads whatever the dates"
-                    .into(),
-            );
-        }
-        let dates = if ranged {
-            let from = meridian_domain::date::optional("from_date", &request.from_date)?
-                .unwrap_or(Date::of_utc_instant(0));
-            let to = match meridian_domain::date::optional("to_date", &request.to_date)? {
-                Some(to) => to,
-                None => Date::from_ymd(9999, 12, 31).expect("the last day"),
-            };
-            if to < from {
-                return Err("to_date is on or after from_date".into());
-            }
-            Some((from, to))
-        } else {
-            None
+        let asked = filings::Asked {
+            data_type: DataType::CorporateAction,
+            subjects: request.subjects,
+            subjects_bound: bounds::LIST_CORPORATE_ACTIONS_REQUEST_SUBJECTS_COUNT,
+            kinds: request.kinds,
+            from_date: request.from_date,
+            to_date: request.to_date,
+            published_as_of_ns: request.published_as_of_ns,
+            sources: request.sources,
+            as_of_ns: request.as_of_ns,
+            page_size: request.page_size,
+            cursor: request.cursor,
+            after: request.after_watermark,
         };
-        if request.published_as_of_ns < 0 {
-            return Err("published_as_of_ns is never negative".into());
-        }
-        let answer = self.read(
-            ReadRequest {
-                data_type: DataType::CorporateAction,
-                subjects: request.subjects,
-                kinds: request.kinds,
-                interval_ns: 0,
-                sources: request.sources,
-                at_ns: 0,
-                business_date: String::new(),
-                valid_from_ns: 0,
-                valid_until_ns: 0,
-                as_of_ns: request.as_of_ns,
-                page_size: request.page_size,
-                cursor: request.cursor,
-                after: request.after_watermark,
-                tenors: Vec::new(),
-                published_as_of_ns: request.published_as_of_ns,
-                series_keys: Vec::new(),
-                all_series: false,
-                dates,
-            },
-            envelope,
-        )?;
+        let answer = self.read(asked.request()?, envelope)?;
         Ok(ListCorporateActionsReply {
             actions: answer
                 .rows
@@ -2877,6 +2898,7 @@ impl Lake {
             all_series: false,
             dates: None,
             roles: Vec::new(),
+            narrowed: read::Narrowed::default(),
         };
         let answered = read::answer(
             self.store.as_ref(),
@@ -4019,6 +4041,7 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
             lake.list_corporate_actions(request, envelope)
         },
     );
+    filings::serve(&bus, &lake);
     // Contract v28, track B (W10.4, W10.6, W12.8): a signal plugin's
     // derived series and saved scenarios.
     serve_on(

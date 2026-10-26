@@ -48,8 +48,10 @@ pub const REPLACEMENTS_PULLED: &str = "platform.reference.event.replacements-pul
 /// The deployment-only scheme a resolved `LCL-` ID is kept under; never sent.
 pub const LOCAL_SCHEME: &str = "open_meridian_local";
 
-/// The open schemes sendable before any list is read.
-pub const OPEN_FAMILIES: [&str; 7] = [
+/// The open schemes sendable before any list is read (W3.25): from contract
+/// 28's core release C2 the SEC's `cik` too, a company's public identifier
+/// (W1.32).
+pub const OPEN_FAMILIES: [&str; 8] = [
     "figi",
     "lei",
     "ticker_and_venue",
@@ -57,6 +59,7 @@ pub const OPEN_FAMILIES: [&str; 7] = [
     "iso4217",
     "sec_series",
     "sec_class",
+    "cik",
 ];
 
 /// How often the pulls run once the platform answers, and how soon they are
@@ -656,12 +659,17 @@ mod tests {
             held(LOCAL_SCHEME, "LCL-01J8"),
             held("figi", "LCL-SNEAKY"),
             held(meridian_symbology::GLOBAL_ID, "INS-01J8"),
+            held("cik", "0000320193"),
         ];
         let sent: Vec<String> = sendable_on(&asked, None)
             .into_iter()
             .map(|i| i.scheme)
             .collect();
-        assert_eq!(sent, vec!["composite_figi", meridian_symbology::GLOBAL_ID]);
+        // With no list read, the open schemes: the CIK among them (W3.25).
+        assert_eq!(
+            sent,
+            vec!["composite_figi", meridian_symbology::GLOBAL_ID, "cik"]
+        );
         let mut list = default_licence();
         list.schemes.retain(|scheme| scheme != "figi");
         assert!(sendable_on(&asked, Some(&list))

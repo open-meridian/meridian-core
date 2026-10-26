@@ -29,11 +29,11 @@ use std::sync::{Arc, RwLock};
 use meridian_bus::Bus;
 use meridian_domain::v1::{
     AgeHop, BarsRecordedEvent, CorporateActionsRecordedEvent, EntitlementsChangedEvent,
-    ListBarsRequest, ListPricesRequest, ListRatesRequest, LivenessRecordedEvent, ObservationMeta,
-    ObservationsWantedEvent, OutcomesRecordedEvent, PricesRecordedEvent, QuotesRecordedEvent,
-    RatesRecordedEvent, RecordBarsRequest, RecordPricesRequest, RecordQuotesRequest,
-    RecordRatesRequest, RecordTradesRequest, StatisticsRecordedEvent, TradesRecordedEvent,
-    WantWithdrawnEvent,
+    FilingsRecordedEvent, ListBarsRequest, ListPricesRequest, ListRatesRequest,
+    LivenessRecordedEvent, ObservationMeta, ObservationsWantedEvent, OutcomesRecordedEvent,
+    PricesRecordedEvent, QuotesRecordedEvent, RatesRecordedEvent, RecordBarsRequest,
+    RecordPricesRequest, RecordQuotesRequest, RecordRatesRequest, RecordTradesRequest,
+    StatisticsRecordedEvent, TradesRecordedEvent, WantWithdrawnEvent,
 };
 use prost::Message;
 use tokio::sync::watch;
@@ -261,6 +261,18 @@ pub(crate) fn said(payload_type: &str, payload: &[u8]) -> Option<Said> {
                 is_want: false,
             })
         }
+        // Every filing, never conflated (contract v28, W10.5): narrowed to
+        // the subjects a receive names, its filer's or another's.
+        "meridian.v1.FilingsRecordedEvent" => {
+            let filing = FilingsRecordedEvent::decode(payload).ok()?.filing?;
+            let (dataset, subjects, _) = meta_said(filing.meta.as_ref());
+            Some(Said {
+                key: None,
+                dataset,
+                subjects,
+                is_want: false,
+            })
+        }
         // Every version of an outcome, never conflated (contract v23).
         "meridian.v1.OutcomesRecordedEvent" => {
             let outcome = OutcomesRecordedEvent::decode(payload).ok()?.outcome?;
@@ -431,6 +443,15 @@ pub(crate) fn stripped(payload_type: &str, payload: &[u8], allowed: &BTreeSet<St
                 Err(_) => payload.to_vec(),
             }
         }
+        "meridian.v1.FilingsRecordedEvent" => match FilingsRecordedEvent::decode(payload) {
+            Ok(mut event) => {
+                if let Some(filing) = event.filing.as_mut() {
+                    meridian_domain::lake::strip_filing(filing, allowed);
+                }
+                event.encode_to_vec()
+            }
+            Err(_) => payload.to_vec(),
+        },
         "meridian.v1.StatisticsRecordedEvent" => match StatisticsRecordedEvent::decode(payload) {
             Ok(mut event) => {
                 if let Some(statistic) = event.statistic.as_mut() {
@@ -581,6 +602,55 @@ mod tests {
             ..Default::default()
         };
         assert!(dates_refused("meridian.v1.ListPricesRequest", &read.encode_to_vec()).is_none());
+    }
+
+    #[test]
+    fn a_filing_is_never_conflated_heard_by_its_filer_and_stripped() {
+        // Contract v28, the filings slice (W10.5).
+        use meridian_domain::v1::{Filing, FilingRef, ObservationMeta};
+        let event = FilingsRecordedEvent {
+            filing: Some(Filing {
+                meta: Some(ObservationMeta {
+                    row_key: "0000320193-26-000105".into(),
+                    subjects: vec![SubjectRef {
+                        entity_id: "ENT-APPLE".into(),
+                        role: meridian_domain::v1::SubjectRole::Filer as i32,
+                    }],
+                    source: Some(Source {
+                        dataset: "sec-edgar-1:filings".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                filing: Some(FilingRef {
+                    accession_number: "0000320193-26-000105".into(),
+                    form: "8-K".into(),
+                }),
+                kind: 3,
+                items: vec!["2.02".into(), "9.01".into()],
+                filed_date: "2026-10-30".into(),
+                ..Default::default()
+            }),
+        }
+        .encode_to_vec();
+        let heard = said("meridian.v1.FilingsRecordedEvent", &event).unwrap();
+        assert_eq!(heard.key, None, "every version delivered");
+        assert_eq!(heard.dataset, "sec-edgar-1:filings");
+        assert_eq!(heard.subjects, vec!["ENT-APPLE"]);
+        let allowed: BTreeSet<String> =
+            ["meridian.v1.Filing.meta", "meridian.v1.Filing.filed_date"]
+                .into_iter()
+                .map(String::from)
+                .collect();
+        let kept = FilingsRecordedEvent::decode(
+            &stripped("meridian.v1.FilingsRecordedEvent", &event, &allowed)[..],
+        )
+        .unwrap()
+        .filing
+        .unwrap();
+        assert!(kept.items.is_empty() && kept.filing.is_none());
+        assert_eq!(kept.filed_date, "2026-10-30");
+        assert_eq!(kept.kind, 3, "what the row is is never stripped");
     }
 
     #[test]

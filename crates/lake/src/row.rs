@@ -2,15 +2,17 @@
 //! or a quote (the 1b, contract v19), an event contract's outcome (the 1c,
 //! contract v23), a rate (contract v27, the rates slice), a statistic and a
 //! listed series, a derived series, a saved scenario and a declared corporate
-//! action (contract v28).
+//! action, and the filings slice's filings, reported facts, rating actions,
+//! holdings reports and holdings (contract v28).
 
 use std::collections::BTreeSet;
 
 use meridian_domain::exact::Exact;
 use meridian_domain::lake;
 use meridian_domain::v1::{
-    Bar, CorporateActionAnnounced, DerivedSeries, ExecutionCost, ListedSeries, Money,
-    ObservationMeta, Outcome, Price, Quote, Rate, SavedScenario, Statistic, Trade,
+    Bar, CorporateActionAnnounced, DerivedSeries, ExecutionCost, Filing, Holding, HoldingsReport,
+    ListedSeries, Money, ObservationMeta, Outcome, Price, Quote, Rate, RatingAction, ReportedFact,
+    SavedScenario, Statistic, Trade,
 };
 use meridian_pb::v1::Decimal;
 use prost::Message;
@@ -39,6 +41,17 @@ pub enum DataType {
     Scenario,
     /// Contract v28, the filings slice (W10.4): a declared cash dividend.
     CorporateAction,
+    /// Contract v28, the filings slice (W10.4): a filing, keyed by accession.
+    Filing,
+    /// Contract v28, the filings slice (W10.4): a value a filer reported.
+    ReportedFact,
+    /// Contract v28, the filings slice (W10.4): a rating agency's action.
+    RatingAction,
+    /// Contract v28, the filings slice (W10.4; the guardrail's second
+    /// move-out): a 13F, 13D or 13G report.
+    HoldingsReport,
+    /// Contract v28, the filings slice: one holding of a holdings report.
+    Holding,
 }
 
 impl DataType {
@@ -58,6 +71,11 @@ impl DataType {
             lake::DERIVED_SERIES => Some(DataType::Derived),
             lake::SAVED_SCENARIO => Some(DataType::Scenario),
             lake::CORPORATE_ACTION => Some(DataType::CorporateAction),
+            lake::FILING => Some(DataType::Filing),
+            lake::REPORTED_FACT => Some(DataType::ReportedFact),
+            lake::RATING_ACTION => Some(DataType::RatingAction),
+            lake::HOLDINGS_REPORT => Some(DataType::HoldingsReport),
+            lake::HOLDING => Some(DataType::Holding),
             _ => None,
         }
     }
@@ -76,6 +94,11 @@ impl DataType {
             DataType::Derived => lake::DERIVED_SERIES,
             DataType::Scenario => lake::SAVED_SCENARIO,
             DataType::CorporateAction => lake::CORPORATE_ACTION,
+            DataType::Filing => lake::FILING,
+            DataType::ReportedFact => lake::REPORTED_FACT,
+            DataType::RatingAction => lake::RATING_ACTION,
+            DataType::HoldingsReport => lake::HOLDINGS_REPORT,
+            DataType::Holding => lake::HOLDING,
         }
     }
 
@@ -93,6 +116,11 @@ impl DataType {
             DataType::Derived => 10,
             DataType::Scenario => 11,
             DataType::CorporateAction => 12,
+            DataType::Filing => 13,
+            DataType::ReportedFact => 14,
+            DataType::RatingAction => 15,
+            DataType::HoldingsReport => 16,
+            DataType::Holding => 17,
         }
     }
 
@@ -110,6 +138,11 @@ impl DataType {
             10 => Some(DataType::Derived),
             11 => Some(DataType::Scenario),
             12 => Some(DataType::CorporateAction),
+            13 => Some(DataType::Filing),
+            14 => Some(DataType::ReportedFact),
+            15 => Some(DataType::RatingAction),
+            16 => Some(DataType::HoldingsReport),
+            17 => Some(DataType::Holding),
             _ => None,
         }
     }
@@ -118,6 +151,22 @@ impl DataType {
     /// date: real-time data (contract v19; ruling 3 of 2026-10-09).
     pub fn real_time(self) -> bool {
         matches!(self, DataType::Trade | DataType::Quote)
+    }
+
+    /// Whether it is one of the filings slice's kinds (contract v28, W10.4):
+    /// its rows name their subjects in roles, a company among them by its
+    /// `ENT-` record, are dated by their own fields, never a business date,
+    /// and are never conflated.
+    pub fn filings(self) -> bool {
+        matches!(
+            self,
+            DataType::CorporateAction
+                | DataType::Filing
+                | DataType::ReportedFact
+                | DataType::RatingAction
+                | DataType::HoldingsReport
+                | DataType::Holding
+        )
     }
 
     /// Whether its rows may name a business date: a daily value's, never a
@@ -157,6 +206,11 @@ pub enum Observation {
     Derived(DerivedSeries),
     Scenario(SavedScenario),
     CorporateAction(CorporateActionAnnounced),
+    Filing(Filing),
+    ReportedFact(ReportedFact),
+    RatingAction(RatingAction),
+    HoldingsReport(HoldingsReport),
+    Holding(Holding),
 }
 
 impl Observation {
@@ -174,6 +228,11 @@ impl Observation {
             Observation::Derived(_) => DataType::Derived,
             Observation::Scenario(_) => DataType::Scenario,
             Observation::CorporateAction(_) => DataType::CorporateAction,
+            Observation::Filing(_) => DataType::Filing,
+            Observation::ReportedFact(_) => DataType::ReportedFact,
+            Observation::RatingAction(_) => DataType::RatingAction,
+            Observation::HoldingsReport(_) => DataType::HoldingsReport,
+            Observation::Holding(_) => DataType::Holding,
         }
     }
 
@@ -192,6 +251,11 @@ impl Observation {
             Observation::Derived(value) => value.meta.as_ref(),
             Observation::Scenario(saved) => saved.meta.as_ref(),
             Observation::CorporateAction(action) => action.meta.as_ref(),
+            Observation::Filing(filing) => filing.meta.as_ref(),
+            Observation::ReportedFact(fact) => fact.meta.as_ref(),
+            Observation::RatingAction(action) => action.meta.as_ref(),
+            Observation::HoldingsReport(report) => report.meta.as_ref(),
+            Observation::Holding(holding) => holding.meta.as_ref(),
         };
         meta.unwrap_or_else(|| NONE.get_or_init(ObservationMeta::default))
     }
@@ -214,28 +278,46 @@ impl Observation {
             Observation::CorporateAction(action) => {
                 action.meta.get_or_insert_with(Default::default)
             }
+            Observation::Filing(filing) => filing.meta.get_or_insert_with(Default::default),
+            Observation::ReportedFact(fact) => fact.meta.get_or_insert_with(Default::default),
+            Observation::RatingAction(action) => action.meta.get_or_insert_with(Default::default),
+            Observation::HoldingsReport(report) => report.meta.get_or_insert_with(Default::default),
+            Observation::Holding(holding) => holding.meta.get_or_insert_with(Default::default),
         }
     }
 
     /// A price's kind, or from contract v27 a rate's, from contract v28 a
-    /// statistic's and a corporate action's; 0 for the other data types.
+    /// statistic's, a corporate action's, a filing's, a rating action's
+    /// action and a holdings report's; 0 for the other data types.
     pub fn kind(&self) -> i32 {
         match self {
             Observation::Price(price) => price.kind,
             Observation::Rate(rate) => rate.kind,
             Observation::Statistic(statistic) => statistic.kind,
             Observation::CorporateAction(action) => action.kind,
+            Observation::Filing(filing) => filing.kind,
+            Observation::RatingAction(action) => action.action,
+            Observation::HoldingsReport(report) => report.kind,
             _ => 0,
         }
     }
 
     /// The date a read by dates is on (contract v28, W10.6): its business
-    /// date, or for a corporate action its kind's date -- a cash dividend's
-    /// ex-date, the date a holder's entitlement turns on.
-    pub fn date(&self) -> &str {
+    /// date, or for the filings slice's kinds the kind's date -- a cash
+    /// dividend's ex-date, the date a holder's entitlement turns on; a
+    /// filing's filed date; a fact's period end; a rating action's date,
+    /// its valid time's UTC day; a holdings report's report date. A
+    /// holding's is its report's, read by ListHoldings beside it.
+    pub fn date(&self) -> String {
         match self {
-            Observation::CorporateAction(action) => &action.ex_date,
-            _ => &self.meta().business_date,
+            Observation::CorporateAction(action) => action.ex_date.clone(),
+            Observation::Filing(filing) => filing.filed_date.clone(),
+            Observation::ReportedFact(fact) => fact.period_end.clone(),
+            Observation::RatingAction(_) => {
+                meridian_domain::date::Date::of_utc_instant(self.meta().valid_from_ns).to_string()
+            }
+            Observation::HoldingsReport(report) => report.report_date.clone(),
+            _ => self.meta().business_date.clone(),
         }
     }
 
@@ -305,7 +387,12 @@ impl Observation {
             | Observation::Derived(_)
             | Observation::Scenario(_)
             // Never conflated nor chosen per asset (contract v28, W10.5).
-            | Observation::CorporateAction(_) => String::new(),
+            | Observation::CorporateAction(_)
+            | Observation::Filing(_)
+            | Observation::ReportedFact(_)
+            | Observation::RatingAction(_)
+            | Observation::HoldingsReport(_)
+            | Observation::Holding(_) => String::new(),
         }
     }
 
@@ -356,6 +443,11 @@ impl Observation {
             Observation::Derived(value) => value.encode_to_vec(),
             Observation::Scenario(saved) => saved.encode_to_vec(),
             Observation::CorporateAction(action) => action.encode_to_vec(),
+            Observation::Filing(filing) => filing.encode_to_vec(),
+            Observation::ReportedFact(fact) => fact.encode_to_vec(),
+            Observation::RatingAction(action) => action.encode_to_vec(),
+            Observation::HoldingsReport(report) => report.encode_to_vec(),
+            Observation::Holding(holding) => holding.encode_to_vec(),
         }
     }
 
@@ -375,6 +467,11 @@ impl Observation {
             DataType::CorporateAction => {
                 Observation::CorporateAction(CorporateActionAnnounced::decode(bytes)?)
             }
+            DataType::Filing => Observation::Filing(Filing::decode(bytes)?),
+            DataType::ReportedFact => Observation::ReportedFact(ReportedFact::decode(bytes)?),
+            DataType::RatingAction => Observation::RatingAction(RatingAction::decode(bytes)?),
+            DataType::HoldingsReport => Observation::HoldingsReport(HoldingsReport::decode(bytes)?),
+            DataType::Holding => Observation::Holding(Holding::decode(bytes)?),
         })
     }
 
@@ -459,10 +556,24 @@ impl Observation {
                 .as_mut()
                 .map(|m| vec![("amount_per_share", m)])
                 .unwrap_or_default(),
+            // In the currency the filer reported (contract v28, W10.4).
+            Observation::ReportedFact(fact) => fact
+                .amount
+                .as_mut()
+                .map(|m| vec![("amount", m)])
+                .unwrap_or_default(),
+            Observation::Holding(holding) => holding
+                .market_value
+                .as_mut()
+                .map(|m| vec![("market_value", m)])
+                .unwrap_or_default(),
             Observation::Statistic(_)
             | Observation::Series(_)
             | Observation::Derived(_)
-            | Observation::Scenario(_) => Vec::new(),
+            | Observation::Scenario(_)
+            | Observation::Filing(_)
+            | Observation::RatingAction(_)
+            | Observation::HoldingsReport(_) => Vec::new(),
         }
     }
 
@@ -476,10 +587,35 @@ impl Observation {
     /// Whether two rows say the same thing but for their raw reference: a
     /// rate's confirmation (contract v27, W10.4; research-kinds' shared
     /// addition 2), recorded and not counted as a restatement.
+    ///
+    /// From contract v28 a reported fact a later filing repeats is a
+    /// confirmation too (W10.4, a-fact-confirmed): the same value for the
+    /// same concept, unit, dimensions and period, from another filing --
+    /// its accession, its published time, its valid time and its raw
+    /// reference its own -- recorded as the next version naming that filing,
+    /// so first published and latest are two reads of one history.
     pub fn confirms(&self, other: &Observation) -> bool {
-        self.data_type() == DataType::Rate
-            && self.meta().raw != other.meta().raw
-            && self.same_but_raw(other)
+        match (self, other) {
+            (Observation::ReportedFact(a), Observation::ReportedFact(b)) => {
+                let restated = |fact: &ReportedFact| {
+                    let mut fact = fact.clone();
+                    fact.filing = None;
+                    let meta = fact.meta.get_or_insert_with(Default::default);
+                    meta.raw = None;
+                    meta.source_times.clear();
+                    meta.valid_from_ns = 0;
+                    meta.valid_until_ns = 0;
+                    Observation::ReportedFact(fact)
+                };
+                (a.filing != b.filing || self.meta().raw != other.meta().raw)
+                    && restated(a).same_but_raw(&restated(b))
+            }
+            _ => {
+                self.data_type() == DataType::Rate
+                    && self.meta().raw != other.meta().raw
+                    && self.same_but_raw(other)
+            }
+        }
     }
 
     fn same_but_raw(&self, other: &Observation) -> bool {
@@ -633,6 +769,34 @@ impl Observation {
                     && a.rule == b.rule
                     && a.filing == b.filing
             }
+            (Observation::Filing(a), Observation::Filing(b)) => {
+                a.filing == b.filing
+                    && a.kind == b.kind
+                    && a.items == b.items
+                    && a.period_of_report == b.period_of_report
+                    && a.filed_date == b.filed_date
+            }
+            (Observation::ReportedFact(a), Observation::ReportedFact(b)) => {
+                a.concept == b.concept
+                    && same_money(&a.amount, &b.amount)
+                    && same_unit_value(&a.value, &b.value)
+                    && (&a.period_start, &a.period_end) == (&b.period_start, &b.period_end)
+                    && a.dimensions == b.dimensions
+                    && a.filing == b.filing
+            }
+            (Observation::RatingAction(a), Observation::RatingAction(b)) => {
+                (&a.rating, &a.rating_class, a.action) == (&b.rating, &b.rating_class, b.action)
+            }
+            (Observation::HoldingsReport(a), Observation::HoldingsReport(b)) => {
+                (a.kind, &a.report_date, a.complete, &a.filing)
+                    == (b.kind, &b.report_date, b.complete, &b.filing)
+            }
+            (Observation::Holding(a), Observation::Holding(b)) => {
+                a.report_row_key == b.report_row_key
+                    && same_unit_value(&a.quantity, &b.quantity)
+                    && same_money(&a.market_value, &b.market_value)
+                    && same_unit_value(&a.percent_of_class, &b.percent_of_class)
+            }
             _ => false,
         }
     }
@@ -656,7 +820,27 @@ impl Observation {
             // A signal plugin's own rows, read whole by whoever reads them.
             Observation::Derived(_) | Observation::Scenario(_) => Vec::new(),
             Observation::CorporateAction(action) => lake::strip_corporate_action(action, allowed),
+            Observation::Filing(filing) => lake::strip_filing(filing, allowed),
+            Observation::ReportedFact(fact) => lake::strip_reported_fact(fact, allowed),
+            Observation::RatingAction(action) => lake::strip_rating_action(action, allowed),
+            Observation::HoldingsReport(report) => lake::strip_holdings_report(report, allowed),
+            Observation::Holding(holding) => lake::strip_holding(holding, allowed),
         }
+    }
+}
+
+/// Two values with their units the same, decimals compared by value.
+fn same_unit_value(
+    a: &Option<meridian_domain::v1::UnitValue>,
+    b: &Option<meridian_domain::v1::UnitValue>,
+) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            same_decimal(&a.value, &b.value)
+                && (a.unit, &a.index_base, &a.ucum_code) == (b.unit, &b.index_base, &b.ucum_code)
+        }
+        _ => false,
     }
 }
 
