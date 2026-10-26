@@ -260,48 +260,142 @@ fn insert(tx: &mut Transaction<'_>, dataset: &str, row: &Observation) -> Result<
 /// state or an assessment by the cut-off (ruling 619) -- so the read's own
 /// choice, made again over these, is the one it makes over every row. A
 /// row without a `latest_key` is a key of its own.
-const LATEST: &str = "
-WITH candidates AS MATERIALIZED (
-    SELECT dataset, sequence, row_key, version, subject, kind, venue_id, interval_ns,
-           COALESCE(latest_key, 'row ' || sequence::text) AS latest_key,
-           valid_from_ns, COALESCE(quality, 0) AS quality
-      FROM lake_row
-     WHERE dataset = ANY($1) AND subjects && $2 AND data_type = $3
-       AND (cardinality($4::smallint[]) = 0 OR kind = ANY($4))
-       AND ($5::bigint = 0 OR interval_ns = $5)
-       AND recorded_at_ns <= $6
-       AND ($7::text IS NULL OR business_date = $7::text::date)
-       AND valid_from_ns >= $8 AND valid_from_ns < $9 AND valid_from_ns <= $10
+///
+/// Served by an index, never a scan of a busy subject's history (ruling
+/// 770; C3 part 2's bench: 5.1 s at 400,000 rows of one underlying). The
+/// keys a subject holds are found by skipping through `lake_row_latest`,
+/// one probe a key, and each key's latest -- and latest not invalid -- is
+/// the first row in force down its own entries. A row naming an asked
+/// subject after its first is found by `lake_row_by_later_subjects` and
+/// chosen as before; a row not yet given its key (`lake_row_unkeyed`) is
+/// one of its own. "In force" is the same test the whole read applies: the
+/// latest version of its row key among the rows the read would load. Each
+/// part is written so a table without statistics yet (a fresh deployment,
+/// the gate's) is read by the same indexes.
+static LATEST: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    // The read's own conditions on a row, as the whole read applies them.
+    let window = |a: &str| {
+        format!(
+            "{a}.recorded_at_ns <= $6
+             AND ($7::text IS NULL OR {a}.business_date = $7::text::date)
+             AND {a}.valid_from_ns >= $8 AND {a}.valid_from_ns < $9 AND {a}.valid_from_ns <= $10"
+        )
+    };
+    let narrowed = |a: &str| {
+        format!(
+            "{a}.data_type = $3
+             AND (cardinality($4::smallint[]) = 0 OR {a}.kind = ANY($4))
+             AND ($5::bigint = 0 OR {a}.interval_ns = $5)
+             AND {}",
+            window(a)
+        )
+    };
+    // A scalar subquery, never a join: each row's own key bound, so the
+    // planner reads its row key's versions by `lake_row_version` whatever
+    // the statistics say (a fresh table's had it scan the dataset a row).
+    let in_force = format!(
+        "r.version = (SELECT max(v.version) FROM lake_row v
+                       WHERE v.dataset = r.dataset AND v.data_type = r.data_type
+                         AND v.row_key = r.row_key
+                         AND v.subjects && $2::text[] AND {})",
+        narrowed("v")
+    );
+    let invalid = "(COALESCE(r.quality, 0) = 3
+          OR EXISTS (SELECT 1 FROM lake_quality_assessment a
+                      WHERE a.dataset = r.dataset AND a.sequence = r.sequence
+                        AND a.state = 3 AND a.at_ns <= $6))";
+    let down_the_key = |also: &str| {
+        format!(
+            "(SELECT r.dataset, r.sequence FROM lake_row r
+               WHERE r.dataset = k.dataset AND r.data_type = $3 AND r.subject = k.subject
+                 AND r.kind = k.kind AND r.venue_id = k.venue_id
+                 AND r.interval_ns = k.interval_ns AND r.latest_key = k.latest_key
+                 AND {} AND {in_force} {also}
+               ORDER BY r.valid_from_ns DESC, r.sequence DESC
+               LIMIT 1)",
+            window("r")
+        )
+    };
+    // The next key of a dataset's subject past `after`, by the index's order.
+    let next_key = |dataset: &str, subject: &str, after: &str| {
+        format!(
+            "SELECT r.dataset, r.subject, r.kind, r.venue_id, r.interval_ns, r.latest_key
+               FROM lake_row r
+              WHERE r.dataset = {dataset} AND r.data_type = $3 AND r.subject = {subject}
+                AND {after}
+              ORDER BY r.kind, r.venue_id, r.interval_ns, r.latest_key
+              LIMIT 1"
+        )
+    };
+    format!(
+        "
+WITH RECURSIVE keys (dataset, subject, kind, venue_id, interval_ns, latest_key) AS (
+    SELECT first.*
+      FROM (SELECT DISTINCT unnest($1::text[])) AS d (dataset)
+     CROSS JOIN (SELECT DISTINCT unnest($2::text[])) AS s (subject)
+     CROSS JOIN LATERAL ({first}) AS first
+  UNION ALL
+    SELECT next.*
+      FROM keys k
+     CROSS JOIN LATERAL ({next}) AS next
 ),
-in_force AS (
-    SELECT DISTINCT ON (dataset, row_key) *
-      FROM candidates
-     ORDER BY dataset, row_key, version DESC
+-- Found by the later subjects' index alone: the datasets and the data type
+-- asked are kept apart, so no index they lead is scanned beside it.
+named_later AS MATERIALIZED (
+    SELECT r.dataset, r.data_type, r.sequence, r.subject, r.kind, r.venue_id,
+           r.interval_ns, r.latest_key, r.valid_from_ns, {invalid} AS invalid
+      FROM lake_row r
+     WHERE (r.subjects[2:]) && $2::text[]
+       AND NOT (r.subject = ANY($2)) AND r.latest_key IS NOT NULL
+       AND (cardinality($4::smallint[]) = 0 OR r.kind = ANY($4))
+       AND ($5::bigint = 0 OR r.interval_ns = $5)
+       AND {window_r} AND {in_force}
 ),
-judged AS (
-    SELECT f.*, (f.quality = 3 OR bad.sequence IS NOT NULL) AS invalid
-      FROM in_force f
-      LEFT JOIN (SELECT DISTINCT dataset, sequence FROM lake_quality_assessment
-                  WHERE dataset = ANY($1) AND state = 3 AND at_ns <= $6) AS bad
-        ON bad.dataset = f.dataset AND bad.sequence = f.sequence
+later AS (
+    SELECT * FROM named_later WHERE dataset = ANY($1) AND data_type = $3
 ),
 chosen AS (
+    SELECT c.dataset, c.sequence
+      FROM keys k
+     CROSS JOIN LATERAL ({latest} UNION ALL {latest_valid}) AS c
+     WHERE (cardinality($4::smallint[]) = 0 OR k.kind = ANY($4))
+       AND ($5::bigint = 0 OR k.interval_ns = $5)
+  UNION ALL
+    SELECT r.dataset, r.sequence
+      FROM lake_row r
+     WHERE r.dataset = ANY($1) AND r.latest_key IS NULL AND r.subjects && $2::text[]
+       AND {narrowed_r} AND {in_force}
+  UNION ALL
     (SELECT DISTINCT ON (dataset, subject, kind, venue_id, interval_ns, latest_key)
             dataset, sequence
-       FROM judged
+       FROM later
       ORDER BY dataset, subject, kind, venue_id, interval_ns, latest_key,
                valid_from_ns DESC, sequence DESC)
-    UNION
+  UNION ALL
     (SELECT DISTINCT ON (dataset, subject, kind, venue_id, interval_ns, latest_key)
             dataset, sequence
-       FROM judged
+       FROM later
       WHERE NOT invalid
       ORDER BY dataset, subject, kind, venue_id, interval_ns, latest_key,
                valid_from_ns DESC, sequence DESC)
 )
 SELECT r.body FROM lake_row r
-  JOIN chosen c ON r.dataset = c.dataset AND r.sequence = c.sequence
- ORDER BY r.dataset, r.sequence";
+  JOIN (SELECT DISTINCT dataset, sequence FROM chosen) c
+    ON r.dataset = c.dataset AND r.sequence = c.sequence
+ ORDER BY r.dataset, r.sequence",
+        first = next_key("d.dataset", "s.subject", "r.latest_key IS NOT NULL"),
+        next = next_key(
+            "k.dataset",
+            "k.subject",
+            "(r.kind, r.venue_id, r.interval_ns, r.latest_key)
+                 > (k.kind, k.venue_id, k.interval_ns, k.latest_key)"
+        ),
+        latest = down_the_key(""),
+        latest_valid = down_the_key(&format!("AND NOT {invalid}")),
+        narrowed_r = narrowed("r"),
+        window_r = window("r"),
+    )
+});
 
 /// How many rows a backfill of `latest_key` and `quality` reads at a time.
 const BACKFILL_BATCH: i64 = 2000;
@@ -521,10 +615,17 @@ impl Store for PostgresStore {
         let latest = query.latest_only
             && matches!(query.when, When::Latest { .. })
             && !crate::store::every_version(query);
+        if latest {
+            // Its plan is a few hundred index probes, estimated as if each
+            // ran a key's whole history: compiled, it took a second more
+            // than it ran (ruling 770's bench), so never compiled.
+            tx.batch_execute("SET LOCAL jit = off")
+                .map_err(unavailable)?;
+        }
         let rows = tx
             .query(
                 if latest {
-                    LATEST
+                    LATEST.as_str()
                 } else {
                     "SELECT body FROM lake_row
                   WHERE dataset = ANY($1) AND subjects && $2 AND data_type = $3

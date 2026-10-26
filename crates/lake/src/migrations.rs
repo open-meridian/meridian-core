@@ -39,6 +39,12 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "latest",
         sql: include_str!("../migrations/0004_latest.sql"),
     },
+    // The latest read served by an index (ruling 770).
+    Migration {
+        version: 5,
+        name: "latest_index",
+        sql: include_str!("../migrations/0005_latest_index.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\
