@@ -13,6 +13,7 @@
 pub mod broker;
 pub mod launched;
 pub mod launcher;
+pub mod preflight;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, OnceLock};

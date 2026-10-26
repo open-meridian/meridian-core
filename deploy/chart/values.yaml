@@ -128,6 +128,18 @@ key:
 #     fsGroup: 10001
 podSecurityContext: {}
 
+# The upgrade preflight (H1): before an upgrade changes anything, the release
+# being installed checks the deployment -- the database's disk, memory and
+# connections against their limits, the largest bus answer against the
+# broker's 1 MiB payload limit, each store's schema and the stored templates
+# against this release, each pending migration additive or named, the
+# launched plugins, the newest backup -- and stops the upgrade on a blocked
+# check, nothing changed. A pre-upgrade hook, read-only, holding no RBAC
+# (templates/preflight-job.yaml). Off only for tooling that cannot wait on
+# a hook; `meridian-conductor preflight` runs the same checks by hand.
+preflight:
+  enabled: true
+
 # Applying the schema, once per release, before the new version serves.
 #
 # The runtime verifies rather than applies on start, so this is not optional:

@@ -48,8 +48,8 @@ pub use plugins::{serve_plugins_and_registries, serve_plugins_reaching, LocalReg
 pub use postgres::PostgresStore;
 pub use sealing::SettingsKey;
 pub use service::{
-    all_accounts, all_plugins_admin, configuration, deployment_admin, install_named_administrator,
-    serve, serve_with, Clock, Upstream,
+    access_records_of, all_accounts, all_plugins_admin, configuration, deployment_admin,
+    install_named_administrator, serve, serve_with, Clock, Upstream,
 };
 pub use store::{
     AccessChangeKind, AccessChangeRecord, Author, ChangeKind, Ending, Held, KnownPlugin,

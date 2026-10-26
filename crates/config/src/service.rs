@@ -1287,6 +1287,39 @@ pub fn serve(
 
 /// One sweep of settings cells naming a replaced record (requirement 10),
 /// for a test to drive without waiting for the hourly one.
+/// The dashboard's AccessRecords as the store answers them from `snapshot`
+/// (decisions/015): what the conductor serves on the bus, and what the
+/// upgrade preflight measures against the broker's payload limit.
+pub fn access_records_of(snapshot: Snapshot, now_ns: i64) -> meridian_domain::v1::AccessRecords {
+    // Each connectivity plugin's link and each ems's map (W11.21,
+    // W11.22, contract v22), for the dashboard's pages and its read
+    // tool.
+    let connectivity_links = snapshot.connectivity.values().cloned().collect();
+    let venue_account_maps = crate::connectivity::maps(&snapshot);
+    // Each known plugin's settings form (W6.11): what it declared,
+    // and which secrets are set, never what they are.
+    let plugin_settings = snapshot
+        .plugins
+        .iter()
+        .map(|plugin| settings_record(&snapshot, &plugin.plugin_instance_id))
+        .collect();
+    let mut records = snapshot.records;
+    records.read_at_ns = now_ns;
+    records.plugin_settings = plugin_settings;
+    // With the links, so the dashboard can tell which of the accounts
+    // a connector reports have none (W2.8, W6.4). Only the dashboard
+    // asks this, and it may already see every account.
+    records.links = snapshot.links;
+    // The holds standing, for the deployment's Settings and each
+    // edge plugin's Summary (W6.25, contract v16).
+    records.holds = snapshot.holds;
+    // Each instance's linkable accounts (W6.30, contract v20).
+    records.linkable_accounts = snapshot.linkable.into_values().collect();
+    records.connectivity_links = connectivity_links;
+    records.venue_account_maps = venue_account_maps;
+    records
+}
+
 #[cfg(test)]
 pub(crate) fn repoint_now(
     bus: Arc<Bus>,
@@ -1376,33 +1409,7 @@ pub fn serve_with(
         ),
         |cx, _: AccessRecordsRequest, _| {
             let snapshot = cx.snapshot()?;
-            // Each connectivity plugin's link and each ems's map (W11.21,
-            // W11.22, contract v22), for the dashboard's pages and its read
-            // tool.
-            let connectivity_links = snapshot.connectivity.values().cloned().collect();
-            let venue_account_maps = crate::connectivity::maps(&snapshot);
-            // Each known plugin's settings form (W6.11): what it declared,
-            // and which secrets are set, never what they are.
-            let plugin_settings = snapshot
-                .plugins
-                .iter()
-                .map(|plugin| settings_record(&snapshot, &plugin.plugin_instance_id))
-                .collect();
-            let mut records = snapshot.records;
-            records.read_at_ns = cx.clock.now_ns();
-            records.plugin_settings = plugin_settings;
-            // With the links, so the dashboard can tell which of the accounts
-            // a connector reports have none (W2.8, W6.4). Only the dashboard
-            // asks this, and it may already see every account.
-            records.links = snapshot.links;
-            // The holds standing, for the deployment's Settings and each
-            // edge plugin's Summary (W6.25, contract v16).
-            records.holds = snapshot.holds;
-            // Each instance's linkable accounts (W6.30, contract v20).
-            records.linkable_accounts = snapshot.linkable.into_values().collect();
-            records.connectivity_links = connectivity_links;
-            records.venue_account_maps = venue_account_maps;
-            Ok(records)
+            Ok(access_records_of(snapshot, cx.clock.now_ns()))
         },
     );
 

@@ -1,0 +1,151 @@
+{{- include "meridian-runtime.require" . -}}
+{{- if .Values.preflight.enabled }}
+{{/*
+  The upgrade preflight (H1, ruling 586; kernel/an-upgrade-is-checked-before-
+  it-is-applied): the release being installed checks the deployment it is
+  about to change, and changes nothing.
+
+  A pre-upgrade hook, so it runs from the new image after Helm renders the
+  release and before any resource changes, and a blocked check -- a schema
+  newer than this release, a database or a bus answer past its limit, a
+  database that does not answer -- fails the hook, which stops the upgrade
+  with nothing changed: `helm upgrade`, `meridian upgrade-deployment` and a
+  GitOps tool honouring hooks alike. A warning passes and is said. Its report
+  is one JSON object, the last line of its log, kept until the next upgrade
+  (before-hook-creation) so it can be read afterwards.
+
+  Never on install: a fresh install has nothing to check, and its database is
+  not configured until the wizard writes it.
+
+  It holds no RBAC and reaches no API: its database sessions are read-only
+  (`default_transaction_read_only`), on the serving credential, never the
+  migrating one; what it reads of backups is a directory listing of the
+  chart's own backup volume, mounted read-only, where the chart brings that
+  volume. Its report names stores, sizes and counts, never an account or a
+  person.
+*/}}
+{{- $b := .Values.backup | default dict }}
+{{- $backups := and $b.recipient (or $b.path $b.existingClaim) }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "meridian-runtime.fullname" . }}-preflight
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-upgrade
+    "helm.sh/hook-weight": "10"
+    # Kept until the next upgrade's hook replaces it, so its report can be
+    # read; removed a day after it finishes either way, as every Job here.
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: 0
+  # A check that cannot finish in five minutes is not a check: the upgrade
+  # stops rather than waits.
+  activeDeadlineSeconds: 300
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        meridian.dev/component: preflight
+        {{- include "meridian-runtime.labels" . | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: preflight
+          image: "{{ .Values.image.repository }}:{{ .Values.conductor.image.tag | default .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["meridian-conductor", "preflight"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          env:
+            {{/* The serving credentials, each optional: a deployment whose
+                 wizard has not configured its database has none, and is said
+                 to have nothing to check. */}}
+            - name: MERIDIAN_CONFIG_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.conductor.database.existingSecret | default (include "meridian-runtime.databaseSecret" $) }}
+                  key: {{ .Values.conductor.database.key | default .Values.database.key }}
+                  optional: true
+            - name: MERIDIAN_STREET_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.street.database.existingSecret | default (include "meridian-runtime.databaseSecret" $) }}
+                  key: {{ .Values.street.database.key | default .Values.database.key }}
+                  optional: true
+            - name: MERIDIAN_BOR_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.bor.database.existingSecret | default (include "meridian-runtime.databaseSecret" $) }}
+                  key: {{ .Values.bor.database.key | default .Values.database.key }}
+                  optional: true
+            - name: MERIDIAN_LAKE_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.lake.database.existingSecret | default (include "meridian-runtime.databaseSecret" $) }}
+                  key: {{ .Values.lake.database.key | default .Values.database.key }}
+                  optional: true
+            - name: MERIDIAN_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.existingSecret | default (include "meridian-runtime.databaseSecret" $) }}
+                  key: {{ .Values.database.key }}
+                  optional: true
+            {{- if .Values.dashboard.enabled }}
+            - name: MERIDIAN_DASHBOARD_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "meridian-runtime.databaseSecret" $ }}
+                  key: {{ .Values.database.key }}
+                  optional: true
+            {{- end }}
+            {{- if .Values.database.brought.enabled }}
+            # The database this chart brings: its volume and its memory
+            # limit, which the check measures it against.
+            - name: MERIDIAN_PREFLIGHT_DATABASE_VOLUME
+              value: {{ .Values.database.brought.size | quote }}
+            {{- with .Values.database.brought.resources.limits }}
+            {{- with .memory }}
+            - name: MERIDIAN_PREFLIGHT_DATABASE_MEMORY
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- if $backups }}
+            - name: MERIDIAN_PREFLIGHT_BACKUP_CONFIGURED
+              value: "true"
+            {{- if $b.path }}
+            - name: MERIDIAN_PREFLIGHT_BACKUPS
+              value: /backups
+            {{- end }}
+            {{- end }}
+            - name: RUST_LOG
+              value: {{ .Values.logLevel | quote }}
+          {{- if and $backups $b.path }}
+          volumeMounts:
+            - name: backups
+              mountPath: /backups
+              readOnly: true
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- if and $backups $b.path }}
+      {{/* Only the chart's own backup volume, a node directory every pod
+           may share; a claim of the administrator's own may be one that
+           only one pod at a time can hold, which a hook must never wait on. */}}
+      volumes:
+        - name: backups
+          persistentVolumeClaim:
+            claimName: {{ printf "%s-backup" (include "meridian-runtime.fullname" .) }}
+            readOnly: true
+      {{- end }}
+{{- end }}
