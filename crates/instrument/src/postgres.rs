@@ -1062,11 +1062,20 @@ impl Store for PostgresStore {
         now_ns: i64,
     ) -> Result<bool> {
         use prost::Message;
-        Ok(self
+        // A published version never changes, so a held copy whose bytes
+        // differ was decoded by an older build that dropped fields it did
+        // not know (found on dev 2026-10-26: a v27 pod kept v28's templates
+        // without their model bindings during a rolling upgrade). This
+        // build's whole copy replaces it; an equal one changes nothing.
+        let kept = self
             .conn()?
-            .execute(
+            .query(
                 "INSERT INTO instrument_template (template_id, template_version, record, kept_at_ns)
-                 VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (template_id, template_version) DO UPDATE
+                    SET record = EXCLUDED.record, kept_at_ns = EXCLUDED.kept_at_ns
+                  WHERE instrument_template.record IS DISTINCT FROM EXCLUDED.record
+                 RETURNING (xmax = 0) AS inserted",
                 &[
                     &template.template_id,
                     &template.template_version,
@@ -1074,8 +1083,15 @@ impl Store for PostgresStore {
                     &now_ns,
                 ],
             )
-            .map_err(unavailable)?
-            == 1)
+            .map_err(unavailable)?;
+        if kept.first().is_some_and(|row| !row.get::<_, bool>(0)) {
+            tracing::warn!(
+                template_id = %template.template_id,
+                template_version = %template.template_version,
+                "a template version held from an older decode was replaced by the whole copy"
+            );
+        }
+        Ok(!kept.is_empty())
     }
 
     fn templates(&self) -> Result<Vec<meridian_domain::v1::SecurityTemplate>> {

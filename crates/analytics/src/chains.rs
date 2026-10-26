@@ -828,6 +828,11 @@ fn bound_model(
             format!("template {template_id} version {template_version}: no calculation package")
         })?;
     if package.model_bindings.is_empty() {
+        if package.model_id.trim().is_empty() {
+            return Err(format!(
+                "template {template_id} version {template_version}: its package binds no model"
+            ));
+        }
         return Ok(package.model_id.clone());
     }
     let style = v1::ExerciseStyle::from_str_name(exercise_style).map_or(0, |s| s as i32);
@@ -976,4 +981,67 @@ pub fn rate(
         "interpolation": interpolation,
         "points": points,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The instrument store, answering every template read with `package`.
+    struct Templates(Option<v1::CalculationPackage>);
+
+    impl Ask for Templates {
+        fn ask(&self, _: &str, _: &str, _: Vec<u8>) -> Result<(String, Vec<u8>), String> {
+            Ok((
+                "meridian.v1.ReadTemplateReply".into(),
+                v1::ReadTemplateReply {
+                    template: Some(v1::SecurityTemplate {
+                        calculation_package: self.0.clone(),
+                        ..Default::default()
+                    }),
+                }
+                .encode_to_vec(),
+            ))
+        }
+    }
+
+    fn bound(package: Option<v1::CalculationPackage>) -> Result<String, String> {
+        bound_model(
+            &Templates(package),
+            "TPL-LISTED-OPTION",
+            "1",
+            "EXERCISE_STYLE_AMERICAN",
+            v1::AssetClass::Equity as i32,
+            &mut BTreeMap::new(),
+        )
+    }
+
+    /// Found on dev 2026-10-26: a package held without its bindings named
+    /// an empty model, which the engine answered as an implementation it
+    /// does not have. Its own words now say why.
+    #[test]
+    fn a_package_with_neither_bindings_nor_a_model_binds_no_model() {
+        let said = bound(Some(v1::CalculationPackage::default())).unwrap_err();
+        assert_eq!(
+            said,
+            "template TPL-LISTED-OPTION version 1: its package binds no model"
+        );
+        let own = v1::CalculationPackage {
+            model_id: "quoted_price".into(),
+            model_version: 1,
+            ..Default::default()
+        };
+        assert_eq!(bound(Some(own)).unwrap(), "quoted_price");
+        let bindings = v1::CalculationPackage {
+            model_bindings: vec![v1::ModelBinding {
+                exercise_style: v1::ExerciseStyle::American as i32,
+                model_id: "american_binomial".into(),
+                model_version: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(bound(Some(bindings)).unwrap(), "american_binomial");
+        assert!(bound(None).unwrap_err().ends_with("no calculation package"));
+    }
 }

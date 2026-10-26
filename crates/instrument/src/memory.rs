@@ -141,7 +141,9 @@ impl Store for MemoryStore {
             template.template_version.clone(),
         );
         let mut held = self.write_lock()?;
-        if held.templates.contains_key(&key) {
+        // A held copy that differs was decoded by an older build: replaced,
+        // as the Postgres store does.
+        if held.templates.get(&key) == Some(template) {
             return Ok(false);
         }
         held.templates.insert(key, template.clone());

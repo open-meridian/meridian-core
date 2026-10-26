@@ -694,8 +694,10 @@ pub trait Store: Send + Sync {
     /// `limit` (W3.22).
     fn replacements_after(&self, sequence: i64, limit: usize) -> Result<Vec<ReplacementKept>>;
 
-    /// Keep a template version the platform published (W3.24), unless held:
-    /// true when it was not.
+    /// Keep a template version the platform published (W3.24), unless held
+    /// as it is: true when it was not. A published version never changes,
+    /// so a held copy that differs -- decoded by an older build, which drops
+    /// the fields it does not know -- is replaced by this one.
     fn keep_template(
         &self,
         template: &meridian_domain::v1::SecurityTemplate,
