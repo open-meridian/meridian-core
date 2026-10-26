@@ -1268,6 +1268,29 @@ fn chain_stores_paying(
             }
         },
     );
+    // The lake's listing (ruling 767): the options dataset's declaration,
+    // which a read's answer leaves unset.
+    serve_store(
+        &stores,
+        topics::LIST_DATASETS,
+        "meridian.v1.ListDatasetsReply",
+        |_request: meridian_domain::v1::ListDatasetsRequest| {
+            meridian_domain::v1::ListDatasetsReply {
+                datasets: vec![meridian_domain::v1::DatasetRef {
+                    dataset: "tradier-1:options".into(),
+                    instance: "tradier-1".into(),
+                    declaration: Some(meridian_pb::v1::DatasetDeclaration {
+                        key: "options".into(),
+                        day_time_zone: "America/New_York".into(),
+                        day_end_minute: 960,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+        },
+    );
     serve_store(
         &stores,
         topics::READ_CALENDAR,
@@ -1357,6 +1380,18 @@ async fn a_chain_job_answers_iv_and_greeks_naming_each_series_by_its_key() {
     assert!(provenance
         .datasets
         .contains(&"tradier-1:options".to_string()));
+    // The lake's listing read once for the job, on the client's behalf
+    // (ruling 767), so within its entitlements.
+    let heard = stores.heard.lock().unwrap();
+    let listed: Vec<&MessageMeta> = heard
+        .stamps
+        .iter()
+        .filter(|(t, _)| t == topics::LIST_DATASETS)
+        .map(|(_, meta)| meta)
+        .collect();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].on_behalf_of_instance_id, crate::INSTANCE);
+    assert!(listed[0].account_scope_applies);
 }
 
 /// Contract v28 (W12.2; rulings 421 and 619): a series whose only quote in

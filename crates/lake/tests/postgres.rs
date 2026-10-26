@@ -556,6 +556,66 @@ fn keys_of(rows: &[Observation]) -> Vec<String> {
     keys
 }
 
+/// Ruling 770: the latest read served by an index, and its choice the same
+/// for a row naming the asked subject after its first (found by the later
+/// subjects' index, a key of that first subject), and for a row key whose
+/// later version moved it to another first subject (its earlier version no
+/// longer in force under either).
+#[test]
+fn a_latest_read_by_the_index_keeps_a_later_subjects_rows_and_a_moved_row_key() {
+    let store = store();
+    let dataset = unique("tradier-1:options");
+    let subject = unique("INS-UNDERLYING");
+    let other = unique("INS-OTHER");
+    let naming_other_first = |mut row: Observation| {
+        row.meta_mut().subjects.insert(
+            0,
+            meridian_domain::v1::SubjectRef {
+                entity_id: other.clone(),
+                ..Default::default()
+            },
+        );
+        row
+    };
+    let rows = vec![
+        naming_other_first(chain_trade(&dataset, "x1", &subject, "A", 10)),
+        naming_other_first(chain_trade(&dataset, "x2", &subject, "A", 20)),
+        chain_trade(&dataset, "y1", &subject, "A", 15),
+        chain_trade(&dataset, "m", &subject, "B", 30),
+        chain_trade(&dataset, "n", &subject, "B", 25),
+    ];
+    assert_eq!(store.record(&dataset, rows, 1_000).unwrap().recorded, 5);
+    let moved = store
+        .record(
+            &dataset,
+            vec![naming_other_first(chain_trade(
+                &dataset, "m", &subject, "B", 30,
+            ))],
+            1_100,
+        )
+        .unwrap();
+    assert_eq!(moved.restated, 1);
+    let every = store
+        .read(&latest_query(&dataset, &subject, false))
+        .unwrap();
+    assert_eq!(keys_of(&every), vec!["m", "n", "x1", "x2", "y1"]);
+    let chosen = store.read(&latest_query(&dataset, &subject, true)).unwrap();
+    assert_eq!(
+        keys_of(&chosen),
+        vec!["m", "n", "x2", "y1"],
+        "per first subject and series the latest, m at its version in force"
+    );
+    let m = chosen.iter().find(|r| r.meta().row_key == "m").unwrap();
+    assert_eq!(m.meta().version, 2);
+    // As of before the move, m was the asked subject's own series B latest.
+    let mut before = latest_query(&dataset, &subject, true);
+    before.as_of_ns = 1_050;
+    assert_eq!(
+        keys_of(&store.read(&before).unwrap()),
+        vec!["m", "x2", "y1"]
+    );
+}
+
 /// Found on dev 2026-10-26: a read of the latest loaded every row its
 /// datasets kept for the subject -- a chain's quotes, 81,720 rows in two
 /// hours -- and chose the latest in memory. Chosen in SQL: each row key at
