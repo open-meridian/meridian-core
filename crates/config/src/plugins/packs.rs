@@ -30,7 +30,7 @@ use meridian_domain::v1::{
 use super::Plugins;
 use crate::registries::{floor_refused, offered};
 use crate::service::author;
-use crate::store::{note_refused, HeldCatalogue, PackChange, PackChangeKind, Snapshot};
+use crate::store::{note_refused, HeldCatalogue, PackChange, PackChangeKind, PackJob, Snapshot};
 
 /// W8.18: Browse's pack view.
 pub const REGISTRY_PACKS: &str = "platform.config.query.registry-packs";
@@ -52,7 +52,9 @@ pub const NEEDS_APPROVAL: &str = "Needs approval";
 
 /// The packs whose install is under way, each member's state so far: a job
 /// runs member by member (407), and the pack's page reads it until its
-/// `pack_installed` record is written.
+/// `pack_installed` record is written. Each is also kept in the store
+/// ([`PackJob`]) at its start and after each member, so a conductor that
+/// restarts mid-job carries it on (616).
 #[derive(Default)]
 pub(super) struct Jobs(Mutex<BTreeMap<String, Vec<PackMemberStatus>>>);
 
@@ -270,6 +272,7 @@ fn member_status(
     snapshot: &Snapshot,
     outcome: Option<&PackMemberStatus>,
     job: Option<&PackMemberStatus>,
+    taken: &dyn Fn(&str) -> Option<String>,
 ) -> PackMemberStatus {
     let resolved = resolve(listings, member, &member.registry);
     let latest = resolved
@@ -314,6 +317,13 @@ fn member_status(
         // Requirement 25: below the version resolved, left for "Update all".
         if !latest.is_empty() && newer(&latest, at) {
             status.reason = format!("Installed {at}; {latest} offered");
+            // Requirement 20, remembered (616): "Update all" held it back
+            // as widening, and it still runs below the version offered, so
+            // it reads "Needs approval" until its own approval moves it --
+            // after the pack's page is read again, or core restarts.
+            if !launches.is_empty() && outcome.is_some_and(|o| o.reason == NEEDS_APPROVAL) {
+                status.reason = NEEDS_APPROVAL.into();
+            }
         }
         return status;
     }
@@ -327,7 +337,8 @@ fn member_status(
             status.state = PackMemberState::Unavailable as i32;
             status.reason = why;
         }
-        Ok(version) => match floor_refused(&version) {
+        // Requirement 26: its floor not met, or a registry not taken here.
+        Ok(version) => match floor_refused(&version).or_else(|| taken(&version.registry)) {
             Some(why) => {
                 status.state = PackMemberState::NotPermitted as i32;
                 status.reason = why;
@@ -373,6 +384,8 @@ impl Plugins {
             ));
         };
         let snapshot = self.snapshot()?;
+        let hold = self.registries()?;
+        let taken = |registry: &str| hold.taken_refused(registry);
         let job = self.packs.get(pack).unwrap_or_default();
         let latest_revision = revision_of(&latest);
         let installed_members: &[PackMember] = kept.as_ref().map_or(&[], |k| members_of(&k.held));
@@ -383,6 +396,7 @@ impl Plugins {
                 &snapshot,
                 kept.as_ref().and_then(|k| k.outcomes.get(&member.listing)),
                 job.iter().find(|j| j.listing == member.listing),
+                &taken,
             );
             if kept.is_some()
                 && !installed_members
@@ -531,7 +545,9 @@ impl Plugins {
                 ),
             ));
         }
-        let listings = self.registries()?.listings_of(&held);
+        let hold = self.registries()?;
+        let listings = hold.listings_of(&held);
+        let taken = |registry: &str| hold.taken_refused(registry);
         let snapshot = self.snapshot()?;
         let kept = self.kept_pack(&request.pack)?;
         let ticked: Vec<PackMember> = members
@@ -549,6 +565,7 @@ impl Plugins {
                     &snapshot,
                     kept.as_ref().and_then(|k| k.outcomes.get(&member.listing)),
                     None,
+                    &taken,
                 );
                 // Requirement 25: a member installed at any version is left
                 // alone; the rest are installed by the job.
@@ -577,10 +594,12 @@ impl Plugins {
                 request.pack
             ));
         }
+        let began_at_ns = self.clock.now_ns();
+        self.keep_job(&pack, &request.note, envelope, began_at_ns);
         let plugins = Arc::clone(self);
         let envelope = envelope.clone();
         let note = request.note.clone();
-        let job = move || plugins.run_pack_install(&pack, &queued, &note, &envelope);
+        let job = move || plugins.run_pack_install(&pack, &queued, &note, &envelope, began_at_ns);
         match tokio::runtime::Handle::try_current() {
             // A job of its own (407): the answer does not wait for it.
             Ok(runtime) => {
@@ -599,10 +618,12 @@ impl Plugins {
         queued: &[PackMember],
         note: &str,
         envelope: &Envelope,
+        began_at_ns: i64,
     ) {
         for member in queued {
             let outcome = self.install_member(pack, member, note, envelope);
             self.packs.set(&pack.pack, &outcome);
+            self.keep_job(pack, note, envelope, began_at_ns);
         }
         let members = self.packs.get(&pack.pack).unwrap_or_default();
         let change = PackChange {
@@ -618,17 +639,24 @@ impl Plugins {
             at_ns: self.clock.now_ns(),
         };
         match self.store.record_pack_change(&change) {
-            Ok(()) => tracing::info!(
-                pack = change.pack,
-                revision = change.revision,
-                by = change.by.by,
-                failed = change
-                    .members
-                    .iter()
-                    .filter(|m| m.state == PackMemberState::Failed as i32)
-                    .count(),
-                "a starter pack installed"
-            ),
+            Ok(()) => {
+                tracing::info!(
+                    pack = change.pack,
+                    revision = change.revision,
+                    by = change.by.by,
+                    failed = change
+                        .members
+                        .iter()
+                        .filter(|m| m.state == PackMemberState::Failed as i32)
+                        .count(),
+                    "a starter pack installed"
+                );
+                // Only once the record is written: a job whose record was
+                // not is carried on, and recorded, at the next start.
+                if let Err(failed) = self.store.end_pack_job(&change.pack) {
+                    tracing::warn!(pack = change.pack, %failed, "a finished pack job was not cleared");
+                }
+            }
             Err(failed) => tracing::error!(
                 pack = change.pack,
                 %failed,
@@ -636,6 +664,80 @@ impl Plugins {
             ),
         }
         self.packs.end(&pack.pack);
+    }
+
+    /// The job as it stands, kept in the store (616); a failure to keep it
+    /// is logged and the job goes on, as it would have before.
+    fn keep_job(&self, pack: &PluginPack, note: &str, envelope: &Envelope, began_at_ns: i64) {
+        let Some(members) = self.packs.get(&pack.pack) else {
+            return;
+        };
+        let job = PackJob {
+            pack: pack.pack.clone(),
+            held: pack.clone(),
+            members,
+            envelope: envelope.clone(),
+            note: note.to_string(),
+            began_at_ns,
+        };
+        if let Err(failed) = self.store.put_pack_job(&job) {
+            tracing::warn!(pack = job.pack, %failed, "a pack job's progress was not kept");
+        }
+    }
+
+    /// At start (616): each pack install a restart interrupted, carried on
+    /// from the members still installing, in the curator's order, by the
+    /// person and delegation that asked, then recorded once as
+    /// `pack_installed`. A member whose install completed before the
+    /// restart reads as installed, never installed twice.
+    pub(super) fn resume_pack_jobs(self: &Arc<Self>) {
+        // The store blocks, as Postgres's client does: read and run off the
+        // runtime, as every other store call here is.
+        let plugins = Arc::clone(self);
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn_blocking(move || plugins.resume_now());
+            }
+            Err(_) => plugins.resume_now(),
+        }
+    }
+
+    /// [`Plugins::resume_pack_jobs`], on a thread that may block: each job
+    /// carried on in turn.
+    fn resume_now(&self) {
+        let jobs = match self.store.pack_jobs() {
+            Ok(jobs) => jobs,
+            Err(failed) => {
+                tracing::error!(%failed, "the pack jobs under way could not be read");
+                return;
+            }
+        };
+        for job in jobs {
+            let queued: Vec<PackMember> = members_of(&job.held)
+                .iter()
+                .filter(|member| {
+                    job.members.iter().any(|m| {
+                        m.listing == member.listing && m.state == PackMemberState::Installing as i32
+                    })
+                })
+                .cloned()
+                .collect();
+            if !self.packs.begin(&job.pack, job.members.clone()) {
+                continue;
+            }
+            tracing::info!(
+                pack = job.pack,
+                members = queued.len(),
+                "a starter pack's install carried on after a restart"
+            );
+            self.run_pack_install(
+                &job.held,
+                &queued,
+                &job.note,
+                &job.envelope,
+                job.began_at_ns,
+            );
+        }
     }
 
     /// One member's install within a pack's job: resolved again, its floor
@@ -661,6 +763,29 @@ impl Plugins {
         if let Some(why) = floor_refused(&version) {
             return failed(member, &version.version, failure(&why));
         }
+        let installed = PackMemberStatus {
+            listing: member.listing.clone(),
+            group: member.group.clone(),
+            installed_version: version.version.clone(),
+            latest_version: version.version.clone(),
+            state: PackMemberState::Installed as i32,
+            setup: LAUNCH_TO_CONNECT.into(),
+            ..Default::default()
+        };
+        // A job carried on after a restart (616): the member's install may
+        // have completed before it, and is not done twice.
+        let held_already = self.snapshot().is_ok_and(|snapshot| {
+            snapshot.catalogue.versions.iter().any(|v| {
+                v.listing == member.listing
+                    && v.retired_at_ns == 0
+                    && v.metadata
+                        .as_ref()
+                        .is_some_and(|m| m.version == version.version)
+            })
+        });
+        if held_already {
+            return installed;
+        }
         match self.install_version(
             &member.listing,
             &version.version,
@@ -669,15 +794,7 @@ impl Plugins {
             envelope,
             &pack.pack,
         ) {
-            Ok(_) => PackMemberStatus {
-                listing: member.listing.clone(),
-                group: member.group.clone(),
-                installed_version: version.version.clone(),
-                latest_version: version.version.clone(),
-                state: PackMemberState::Installed as i32,
-                setup: LAUNCH_TO_CONNECT.into(),
-                ..Default::default()
-            },
+            Ok(_) => installed,
             Err(why) => {
                 tracing::warn!(
                     pack = pack.pack,

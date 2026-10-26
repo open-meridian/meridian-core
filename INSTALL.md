@@ -303,11 +303,12 @@ empty.
 
 **Spell the group exactly.** It is not checked and cannot be: a directory
 states a person's groups when they sign in, and it is not asked to list them.
-A group that does not exist is a deployment nobody can administer. A
-first-admin code does not help then, since the misspelt group is still an
-administrator's permission and `/claim` answers **Already claimed**: getting
-back in means making a group in your directory with exactly the name you typed,
-signing in as a member of it, and correcting the group in Settings.
+A group that does not exist is a deployment nobody can administer, until
+a first-admin code is redeemed: `/claim` takes one while no person has signed
+in as a member of the administrators' group (and the group names no login).
+Ask for a first-admin code on open-meridian.com, sign in, redeem it at
+`/claim`, and correct the group in Settings. Once somebody has signed in as a
+member, the group holds and `/claim` answers **Already claimed**.
 
 **Address.** Where a browser reaches this deployment: the Ingress's name,
 which the wizard offers when there is one. This is the address your staff will

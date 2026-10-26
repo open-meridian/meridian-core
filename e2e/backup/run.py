@@ -462,13 +462,22 @@ def main():
     s.check(bool(key_before), "the conductor holds the deployment's key")
 
     print("E: backed up on the schedule, then by `meridian backup --to`", flush=True)
-    def scheduled():
+    def completed():
+        """The scheduled runs that finished, by name, oldest first."""
         jobs = json.loads(out("get", "jobs", "-l", "meridian.dev/component=backup", "-o", "json"))["items"]
-        return any(j["status"].get("succeeded") for j in jobs
-                   if not j["metadata"].get("annotations", {}).get("cronjob.kubernetes.io/instantiate"))
-    wait_for("a scheduled backup", scheduled, seconds=200)
+        done = [j for j in jobs if j["status"].get("succeeded")
+                and not j["metadata"].get("annotations", {}).get("cronjob.kubernetes.io/instantiate")]
+        done.sort(key=lambda j: j["status"].get("completionTime", ""))
+        return [j["metadata"]["name"] for j in done]
+    wait_for("a scheduled backup", lambda: bool(completed()), seconds=200)
     s.check(True, "the CronJob wrote a backup on its schedule")
-    log = out("logs", "-l", "meridian.dev/component=backup", "--tail=-1")
+    # The completed run's own log: a later scheduled run may be mid-flight,
+    # and the CronJob's label reaches its pod too, which has not yet said
+    # what it wrote (flaked 2026-10-25, run 40235294905).
+    finished = completed()[0]
+    pods = out("get", "pods", "-l", f"job-name={finished}",
+               "--field-selector=status.phase=Succeeded", "-o", "name").split()
+    log = out("logs", pods[0], "--tail=-1") if pods else ""
     s.check("backup: wrote " in log and "tables" in log, "and said what it wrote, names and counts only")
     s.check(SECRET_VALUE not in log and recipient not in log, "and printed no secret")
     kubectl("patch", "cronjob", f"{FULL}-backup", "--type=merge", "-p", '{"spec":{"suspend":true}}')

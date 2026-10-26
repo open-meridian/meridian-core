@@ -1139,11 +1139,7 @@ async fn list_packs(State(app): State<Arc<App>>, headers: HeaderMap) -> Response
         )
         .await;
         if let Ok(status) = status {
-            line["state"] = serde_json::json!(if status.installed_revision > 0 {
-                "installed"
-            } else {
-                "not_installed"
-            });
+            line["state"] = serde_json::json!(packs::pack_state_key(&status));
             line["said"] = serde_json::json!(packs::deployment_state(&status));
             line["installed_revision"] = serde_json::json!(status.installed_revision);
         }
@@ -1171,9 +1167,10 @@ async fn read_pack(
     };
     let name = format!("{organisation}/{pack}");
     match crate::registry::packs::checklist(&app, &person.person.subject, &name, &records).await {
+        // As `dashboard__read_pack` answers it, `setup_href` and all.
         Ok(checklist) => json(
             StatusCode::OK,
-            crate::registry::packs::status_json(&checklist.status),
+            crate::registry::packs::checklist_json(&checklist),
         ),
         Err(reason) => refused(StatusCode::NOT_FOUND, reason),
     }

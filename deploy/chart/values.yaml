@@ -451,6 +451,12 @@ registry:
 # v26: the platform's current key (SHA-256 of its PEM 69c1961a...), the
 # registry's signing key at open-meridian.com.
 registries:
+  # The registries this deployment takes, any of `community` and `verified`
+  # (spec/starter-packs, requirement 26; ruling 616). Empty takes both. A
+  # version from a registry not taken is refused at install, and a starter
+  # pack's member from one reads "Not permitted here" and cannot be ticked.
+  # Changed, like every value, with `meridian upgrade-deployment -f`.
+  taken: []
   platformKeys:
     - |
       -----BEGIN PUBLIC KEY-----

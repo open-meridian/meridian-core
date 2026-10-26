@@ -3,6 +3,7 @@ use std::sync::Mutex;
 use axum::body::{to_bytes, Body};
 use axum::http::header::COOKIE;
 use axum::http::Request;
+use meridian_access::DEPLOYMENT_ADMIN;
 use meridian_bus::{Bus, MemoryBackend};
 use meridian_domain::v1::{
     AccountRecord, AccountState, DefineAccountRequest, ExternalAccount, ExternalAccountLink,
@@ -730,6 +731,18 @@ async fn the_claim_page_is_open_only_while_nobody_administers() {
     assert_eq!(
         send(&claimed, get(&claimed, "/claim", true)).await.0,
         StatusCode::CONFLICT
+    );
+
+    // The wizard's directory group misspelt: the permission is there, but
+    // nobody signed in with that group, so nobody holds it and the claim
+    // stays open (design/a-misspelt-administrators-group, ruled 2026-10-10).
+    let mut misspelt = admin_records();
+    misspelt.user_groups[0].logins.clear();
+    misspelt.user_groups[0].directory_groups = vec!["meridain-admins".into()];
+    let misspelt = harness(misspelt, None);
+    assert_eq!(
+        send(&misspelt, get(&misspelt, "/claim", true)).await.0,
+        StatusCode::OK
     );
 }
 

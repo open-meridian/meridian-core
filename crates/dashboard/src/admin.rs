@@ -28,7 +28,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
-use meridian_access::{person_access, Access, AccessLevel, DEPLOYMENT_ADMIN};
+use meridian_access::{person_access, Access, AccessLevel};
 use meridian_bus::BusError;
 use meridian_domain::v1::{
     AccessEntry, AccessGroup, AccessRecords, AccountGroup, ClaimCodePurpose, CloseAccountRequest,
@@ -145,11 +145,12 @@ fn list(fields: &Fields, name: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether a person holds deployment admin: a permission held only by a
+/// directory group nobody signed in with (the wizard's, misspelt) leaves the
+/// claim page open (design/a-misspelt-administrators-group, ruled
+/// 2026-10-10).
 fn has_admin(records: &AccessRecords) -> bool {
-    records
-        .permissions
-        .iter()
-        .any(|p| p.access_group_id == DEPLOYMENT_ADMIN)
+    meridian_access::deployment_admin_held(records)
 }
 
 pub(crate) fn status_page(status: StatusCode, title: &str, sentence: &str) -> Response {
@@ -3605,10 +3606,17 @@ async fn request_series_records(
     if !underlying.starts_with("INS-") {
         return not_done("the underlying is an INS- record", back);
     }
-    let symbol = field(&fields, "occ_osi").to_string();
-    if symbol.trim().is_empty() || symbol.chars().count() > 21 {
-        return not_done("an OCC symbol is 21 characters at most", back);
-    }
+    // A listed option by its OCC symbol, or a future or future option by
+    // its ticker with its venue's MIC, as the tool takes it (W3.31).
+    let series_key = match series_rule::series_key(
+        field(&fields, "scheme"),
+        field(&fields, "symbol"),
+        field(&fields, "source"),
+    ) {
+        Ok(key) => key,
+        Err(why) => return not_done(&why, back),
+    };
+    let symbol = series_key[0].value.clone();
     let cause = match field(&fields, "cause") {
         "standing" => meridian_domain::v1::SeriesRequestCause::Standing,
         _ => meridian_domain::v1::SeriesRequestCause::Order,
@@ -3621,7 +3629,9 @@ async fn request_series_records(
         || {
             Ok(serde_json::json!({
                 "series": [{
-                    "series_key": [{"scheme": "occ_osi", "value": symbol}],
+                    "series_key": series_key.iter().map(|id| serde_json::json!({
+                        "scheme": id.scheme, "value": id.value, "source": id.source,
+                    })).collect::<Vec<_>>(),
                     "underlying_instrument_id": underlying,
                     "cause": if cause == meridian_domain::v1::SeriesRequestCause::Standing { "standing" } else { "order" },
                 }],
@@ -3640,11 +3650,7 @@ async fn request_series_records(
             "meridian.v1.RequestSeriesRecordsRequest",
             meridian_domain::v1::RequestSeriesRecordsRequest {
                 series: vec![meridian_domain::v1::SeriesWant {
-                    series_key: vec![meridian_domain::v1::Identifier {
-                        scheme: "occ_osi".into(),
-                        value: symbol.clone(),
-                        ..Default::default()
-                    }],
+                    series_key: series_key.clone(),
                     underlying_instrument_id: underlying.clone(),
                     cause: cause as i32,
                 }],

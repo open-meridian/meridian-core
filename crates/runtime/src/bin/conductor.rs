@@ -366,12 +366,21 @@ fn registries_from_env(
         }
     };
     match PlatformRegistries::new(Arc::clone(platform), &upstream) {
-        Ok(registries) => Some(Arc::new(meridian_config::registries::Hold::new(
-            Arc::new(registries),
-            keys,
-            Arc::clone(store),
-            clock(),
-        ))),
+        Ok(registries) => Some(Arc::new(
+            meridian_config::registries::Hold::new(
+                Arc::new(registries),
+                keys,
+                Arc::clone(store),
+                clock(),
+            )
+            // The chart's `registries.taken` (ruling 616): the registries
+            // this deployment takes, comma separated; unset, every one.
+            .taking(
+                var("MERIDIAN_REGISTRIES_TAKEN")
+                    .map(|taken| taken.split(',').map(str::to_string).collect())
+                    .unwrap_or_default(),
+            ),
+        )),
         Err(failed) => {
             tracing::warn!(%failed, "the registries are not reached");
             None

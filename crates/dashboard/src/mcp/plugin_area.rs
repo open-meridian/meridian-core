@@ -2715,7 +2715,8 @@ impl Context<'_> {
             let mut line = packs::pack_json(pack);
             if let Ok(status) = packs::pack_status(self.app, &self.caller.subject, &pack.pack).await
             {
-                line["state"] = json!(packs::deployment_state(&status));
+                line["state"] = json!(packs::pack_state_key(&status));
+                line["said"] = json!(packs::deployment_state(&status));
                 line["installed_revision"] = json!(status.installed_revision);
             }
             lines.push(line);
@@ -2807,7 +2808,8 @@ impl Context<'_> {
             }));
         }
         data["members"] = json!(lines);
-        data["state"] = json!(packs::deployment_state(&status));
+        data["state"] = json!(packs::pack_state_key(&status));
+        data["said"] = json!(packs::deployment_state(&status));
         data["installed_revision"] = json!(status.installed_revision);
         if members.iter().any(|m| m.registry == "community") {
             data["terms_url"] = json!(crate::notice::TERMS_URL);
@@ -2888,21 +2890,10 @@ impl Context<'_> {
             return (problems.refusal(), DEPLOYMENT_ADMIN.into());
         }
         match packs::checklist(self.app, &self.caller.subject, &name, self.records).await {
-            Ok(checklist) => {
-                let mut data = packs::status_json(&checklist.status);
-                if let Some(members) = data["members"].as_array_mut() {
-                    for member in members {
-                        let listing = member["listing"].as_str().unwrap_or_default().to_string();
-                        if let Some(href) = checklist.links.get(&listing) {
-                            member["setup_href"] = json!(href);
-                        }
-                    }
-                }
-                (
-                    json!({"outcome": "unchanged", "data": data}),
-                    DEPLOYMENT_ADMIN.into(),
-                )
-            }
+            Ok(checklist) => (
+                json!({"outcome": "unchanged", "data": packs::checklist_json(&checklist)}),
+                DEPLOYMENT_ADMIN.into(),
+            ),
             Err(failed) => (
                 refused("not_listed", &failed, vec![json!({"path": "pack"})]),
                 DEPLOYMENT_ADMIN.into(),

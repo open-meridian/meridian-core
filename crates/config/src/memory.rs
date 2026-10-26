@@ -2,12 +2,13 @@
 //! database configured. Its atomic operations hold one lock across the check
 //! and the write, which is what makes them atomic.
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use meridian_domain::v1::{
-    AccessGroup, AccountGroup, AccountRecord, ExternalAccountLink, Hold, LinkableAccounts,
-    MoveRecord, Permission, PluginArchive, PluginLaunch, PluginLaunchState, PluginVersion,
-    SettingLastChange, SignInRecord, UserGroup,
+    AccessGroup, AccessRecords, AccountGroup, AccountRecord, ExternalAccountLink, Hold,
+    LinkableAccounts, MoveRecord, Permission, PluginArchive, PluginLaunch, PluginLaunchState,
+    PluginVersion, SettingLastChange, SignInRecord, UserGroup,
 };
 
 use meridian_domain::v1::VenueCatalogue;
@@ -73,6 +74,7 @@ pub struct MemoryStore {
     install_packs: Mutex<std::collections::BTreeMap<(String, String), String>>,
     /// Each change to a starter pack's record, in order (W8.18, W8.19).
     pack_changes: Mutex<Vec<crate::store::PackChange>>,
+    pack_jobs: Mutex<BTreeMap<String, crate::store::PackJob>>,
     /// The registries (contract v25): the catalogue's copy, each listed
     /// version's statement, the usage setting's changes and the reports.
     registry: Mutex<Option<crate::store::HeldCatalogue>>,
@@ -82,6 +84,37 @@ pub struct MemoryStore {
 }
 
 impl MemoryStore {
+    /// Writes the group and its permissions, each recorded as granted by
+    /// `author`, unless `held` says the records already have an admin; one
+    /// lock, so two at once cannot both write.
+    fn install_admin_unless(
+        &self,
+        group: &UserGroup,
+        permissions: &[Permission],
+        author: &Author,
+        at_ns: i64,
+        held: impl Fn(&AccessRecords) -> bool,
+    ) -> Result<bool> {
+        let mut state = self.state.lock().expect("store lock poisoned");
+        if held(&state.records) {
+            return Ok(false);
+        }
+        state.records.user_groups.push(group.clone());
+        state
+            .records
+            .permissions
+            .extend(permissions.iter().cloned());
+        self.access_changes
+            .lock()
+            .expect("store lock poisoned")
+            .extend(
+                permissions
+                    .iter()
+                    .map(|permission| permission_change(permission, true, author, at_ns)),
+            );
+        Ok(true)
+    }
+
     /// Starts as a fresh deployment does: deployment admin, All plugins
     /// (admin) and All accounts exist, and nobody holds any of them.
     pub fn new() -> Self {
@@ -108,6 +141,7 @@ impl MemoryStore {
             registry: Mutex::new(None),
             install_packs: Mutex::new(Default::default()),
             pack_changes: Mutex::new(Vec::new()),
+            pack_jobs: Mutex::new(BTreeMap::new()),
             statements: Mutex::new(Default::default()),
             reports_plugin_usage: Mutex::new(Vec::new()),
             plugin_usage_reports: Mutex::new(Vec::new()),
@@ -427,29 +461,29 @@ impl Store for MemoryStore {
         author: &Author,
         at_ns: i64,
     ) -> Result<bool> {
-        let mut state = self.state.lock().expect("store lock poisoned");
-        if state
-            .records
-            .permissions
-            .iter()
-            .any(|p| p.access_group_id == DEPLOYMENT_ADMIN)
-        {
-            return Ok(false);
-        }
-        state.records.user_groups.push(group.clone());
-        state
-            .records
-            .permissions
-            .extend(permissions.iter().cloned());
-        self.access_changes
-            .lock()
-            .expect("store lock poisoned")
-            .extend(
-                permissions
-                    .iter()
-                    .map(|permission| permission_change(permission, true, author, at_ns)),
-            );
-        Ok(true)
+        let held = |records: &AccessRecords| {
+            records
+                .permissions
+                .iter()
+                .any(|p| p.access_group_id == DEPLOYMENT_ADMIN)
+        };
+        self.install_admin_unless(group, permissions, author, at_ns, held)
+    }
+
+    fn install_claimed_admin(
+        &self,
+        group: &UserGroup,
+        permissions: &[Permission],
+        author: &Author,
+        at_ns: i64,
+    ) -> Result<bool> {
+        self.install_admin_unless(
+            group,
+            permissions,
+            author,
+            at_ns,
+            meridian_access::deployment_admin_held,
+        )
     }
 
     fn access_changes(&self, access_group_id: &str) -> Result<Vec<AccessChangeRecord>> {
@@ -1374,6 +1408,38 @@ impl Store for MemoryStore {
             .filter(|change| pack.is_empty() || change.pack == pack)
             .cloned()
             .collect())
+    }
+
+    fn put_pack_job(&self, job: &crate::store::PackJob) -> Result<()> {
+        #[cfg(test)]
+        blocks_like_postgres();
+        self.pack_jobs
+            .lock()
+            .expect("store lock poisoned")
+            .insert(job.pack.clone(), job.clone());
+        Ok(())
+    }
+
+    fn pack_jobs(&self) -> Result<Vec<crate::store::PackJob>> {
+        #[cfg(test)]
+        blocks_like_postgres();
+        Ok(self
+            .pack_jobs
+            .lock()
+            .expect("store lock poisoned")
+            .values()
+            .cloned()
+            .collect())
+    }
+
+    fn end_pack_job(&self, pack: &str) -> Result<()> {
+        #[cfg(test)]
+        blocks_like_postgres();
+        self.pack_jobs
+            .lock()
+            .expect("store lock poisoned")
+            .remove(pack);
+        Ok(())
     }
 
     fn installation(&self, name: &str, version: &str) -> Result<Option<Author>> {

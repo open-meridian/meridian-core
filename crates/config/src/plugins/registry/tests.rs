@@ -41,13 +41,17 @@ pub(crate) struct Harness {
 }
 
 pub(crate) fn harness() -> Harness {
+    harness_with(Platform::new(), Arc::new(MemoryStore::new()))
+}
+
+/// A conductor serving on a bus of its own, over a store and a stand-in
+/// platform another may have used: what a restart starts from.
+pub(crate) fn harness_with(platform: Arc<Platform>, store: Arc<dyn crate::Store>) -> Harness {
     let bus = Arc::new(Bus::single(
         "conductor-1",
         Arc::new(MemoryBackend::new()),
         Arc::new(meridian_clock::SystemClock),
     ));
-    let platform = Platform::new();
-    let store: Arc<dyn crate::Store> = Arc::new(MemoryStore::new());
     let clock = Arc::new(At(1_792_200_000_000_000_000));
     let hold = Arc::new(Hold::new(
         Arc::clone(&platform) as Arc<dyn Registries>,

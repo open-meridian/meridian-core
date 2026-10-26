@@ -29,6 +29,12 @@ const HEADER: &str = "\
 # The contract is the policy; this is the broker saying the same thing in its
 # own language. Run `make nats-permissions` after the contract moves.
 
+# The largest message the broker carries, stated rather than left to the
+# broker's default. The bus reads it from the broker and refuses a question
+# or an answer past it, and a paged answer is budgeted under it (the plugin
+# catalogue's page ends at 512 KiB). Never raised to fit an answer: page it.
+max_payload: 1MB
+
 ";
 
 fn main() {
@@ -416,4 +422,14 @@ fn run() -> Result<(), String> {
             .map_err(|failed| format!("{path} could not be written: {failed}"))?,
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_configuration_states_the_brokers_max_payload() {
+        // H1 (ruling 586): stated, never the broker's default, so the 512 KiB
+        // page budget is set against a limit the chart says.
+        assert!(super::HEADER.contains("\nmax_payload: 1MB\n"));
+    }
 }

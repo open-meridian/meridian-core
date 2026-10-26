@@ -840,6 +840,75 @@ async fn a_claim_code_makes_the_redeemer_the_first_deployment_admin_once() {
 }
 
 #[tokio::test]
+async fn a_claim_is_honoured_while_only_a_misspelt_group_holds_deployment_admin() {
+    // design/a-misspelt-administrators-group (ruled 2026-10-10; H1, 586):
+    // the wizard's directory group misspelt still writes the permission;
+    // while no person signed in with it, a first-admin claim is honoured,
+    // and the misspelt group is left for the new admin to correct.
+    let h = harness("dashboard-1");
+    let misspelt = UserGroup {
+        user_group_id: "ug-wizard".into(),
+        name: "Deployment admins".into(),
+        directory_groups: vec!["meridain-admins".into()],
+        logins: Vec::new(),
+    };
+    let permission = Permission {
+        permission_id: "perm-wizard".into(),
+        user_group_id: misspelt.user_group_id.clone(),
+        account_group_id: String::new(),
+        access_group_id: DEPLOYMENT_ADMIN.into(),
+    };
+    assert!(h
+        .store
+        .install_first_admin(&misspelt, &[permission], &crate::Author::default(), 0)
+        .unwrap());
+    *h.platform.redeem.lock().unwrap() = true;
+
+    let redeemed = redeem(&h, ADA).await;
+    assert!(redeemed.redeemed, "{}", redeemed.refusal_reason);
+    let after = records(&h).await;
+    assert_eq!(after.user_groups.len(), 2, "the misspelt group stays");
+    assert!(after.user_groups.iter().any(|group| group.logins == [ADA]));
+
+    let again = redeem(&h, "someone-else").await;
+    assert!(!again.redeemed);
+    assert_eq!(
+        again.refusal_reason,
+        "this deployment already has a deployment admin"
+    );
+}
+
+#[test]
+fn a_claim_is_refused_once_a_person_signed_in_with_the_admins_group() {
+    let store = MemoryStore::new();
+    assert!(install_named_administrator(&store, &FixedClock, "meridian-admins", "").unwrap());
+    store
+        .record_sign_in(&SignInRecord {
+            subject: ADA.into(),
+            display_name: "Ada".into(),
+            directory_groups: vec!["meridian-admins".into()],
+            signed_in_at_ns: 1,
+        })
+        .unwrap();
+    let group = UserGroup {
+        user_group_id: "ug-claimed".into(),
+        name: "Deployment admins".into(),
+        directory_groups: Vec::new(),
+        logins: vec!["someone-else".into()],
+    };
+    let permission = Permission {
+        permission_id: "perm-claimed".into(),
+        user_group_id: group.user_group_id.clone(),
+        account_group_id: String::new(),
+        access_group_id: DEPLOYMENT_ADMIN.into(),
+    };
+    assert!(!store
+        .install_claimed_admin(&group, &[permission], &crate::Author::default(), 2)
+        .unwrap());
+    assert_eq!(store.snapshot().unwrap().records.user_groups.len(), 1);
+}
+
+#[tokio::test]
 async fn a_refused_or_anonymous_claim_installs_nobody() {
     let h = harness("dashboard-1");
     let refused = redeem(&h, ADA).await;

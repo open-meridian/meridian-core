@@ -252,7 +252,10 @@ spec:
         # a restart (spec/the-local-plugin-registry, decision 3). The
         # configuration lives and dies with the pod, and holds no password:
         # the chart's instances' are read from the environment, a launched
-        # plugin's is checked against a hash.
+        # plugin's is checked against a hash. It states the broker's
+        # `max_payload: 1MB` explicitly, the limit the bus reads and every
+        # paged answer is budgeted under (the plugin catalogue's 512 KiB
+        # page), never left to the broker's default.
         - name: broker
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}

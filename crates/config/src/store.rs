@@ -811,6 +811,21 @@ pub trait Store: Send + Sync {
         at_ns: i64,
     ) -> Result<bool>;
 
+    /// Atomic, as [`Store::install_first_admin`], for a first-admin claim
+    /// code: writes the group and its permissions only while no person holds
+    /// deployment admin ([`meridian_access::deployment_admin_held`]), so a
+    /// permission held only by a directory group nobody signed in with -- a
+    /// misspelt one -- does not stop the claim (design/a-misspelt-
+    /// administrators-group, ruled 2026-10-10). That group is left as it
+    /// is, for the new admin to correct.
+    fn install_claimed_admin(
+        &self,
+        group: &UserGroup,
+        permissions: &[Permission],
+        author: &Author,
+        at_ns: i64,
+    ) -> Result<bool>;
+
     /// Every change recorded for one access group and the permissions to it,
     /// gap and rewrite records included, in the order recorded.
     fn access_changes(&self, access_group_id: &str) -> Result<Vec<AccessChangeRecord>>;
@@ -1149,6 +1164,16 @@ pub trait Store: Send + Sync {
     /// `pack` is empty.
     fn pack_changes(&self, pack: &str) -> Result<Vec<PackChange>>;
 
+    /// A pack's install under way, written at its start and after each
+    /// member, so a restart carries it on (616); one per pack, replaced.
+    fn put_pack_job(&self, job: &PackJob) -> Result<()>;
+
+    /// Every pack install under way, as last written.
+    fn pack_jobs(&self) -> Result<Vec<PackJob>>;
+
+    /// A pack's install finished: its `pack_installed` record is written.
+    fn end_pack_job(&self, pack: &str) -> Result<()>;
+
     /// Who installed a registry version, through what, and why; none for a
     /// local version or one not recorded.
     fn installation(&self, name: &str, version: &str) -> Result<Option<Author>>;
@@ -1234,6 +1259,21 @@ pub struct PackChange {
     pub members: Vec<meridian_domain::v1::PackMemberStatus>,
     pub by: Author,
     pub at_ns: i64,
+}
+
+/// A starter pack's install under way (616): the pack as ticked from, each
+/// ticked member's state so far, and who asked through what, so a conductor
+/// that restarts mid-job carries it on and still writes the one
+/// `pack_installed` record.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PackJob {
+    pub pack: String,
+    pub held: meridian_domain::v1::PluginPack,
+    pub members: Vec<meridian_domain::v1::PackMemberStatus>,
+    /// The asking envelope, for the records each member's install leaves.
+    pub envelope: meridian_domain::v1::Envelope,
+    pub note: String,
+    pub began_at_ns: i64,
 }
 
 /// The conductor's latest copy of the platform's catalogue (W8.10): every
