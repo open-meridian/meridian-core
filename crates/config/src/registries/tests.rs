@@ -756,11 +756,9 @@ async fn a_registry_this_deployment_does_not_take_is_refused_at_install() {
     let platform = Platform::new();
     let held = hold(&platform).taking(vec!["Verified ".into()]);
     held.pull().await.unwrap();
-    let refused = held
-        .fetch(LISTING, "1.4.0", "community")
-        .await
-        .err()
-        .expect("refused");
+    let Err(refused) = held.fetch(LISTING, "1.4.0", "community").await else {
+        panic!("a registry not taken was fetched");
+    };
     assert!(
         refused.contains("does not take the community registry"),
         "{refused}"
