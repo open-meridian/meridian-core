@@ -362,7 +362,7 @@ E2E_BACKEND_SAID = $(if $(filter oidc,$(E2E_BACKEND)), signing people in through
 
 e2e-first-run: network
 	@rm -f .e2e-first-run.log
-	@$(E2E_FIRST_RUN) down -v --remove-orphans >>.e2e-first-run.log 2>&1 || true
+	@$(E2E_FIRST_RUN) --profile e2e down -v --remove-orphans >>.e2e-first-run.log 2>&1 || true
 	@set -e; \
 	$(E2E_FIRST_RUN) build dashboard-first-run conductor-first-run first-run >>.e2e-first-run.log 2>&1; \
 	$(E2E_FIRST_RUN) up -d postgres nats fr-pki fr-kube fr-platform fake-idp >>.e2e-first-run.log 2>&1; \
@@ -373,7 +373,7 @@ e2e-first-run: network
 		     $(E2E_FIRST_RUN) logs --no-color first-run dashboard-first-run conductor-first-run \
 		       > .e2e-first-run.services.log 2>&1; \
 		     echo "  services in .e2e-first-run.services.log" >&2; \
-		     $(E2E_FIRST_RUN) down -v --remove-orphans >>.e2e-first-run.log 2>&1; exit 1; }
+		     $(E2E_FIRST_RUN) --profile e2e down -v --remove-orphans >>.e2e-first-run.log 2>&1; exit 1; }
 	@cat .e2e-first-run.run.log
 	@if [ "$(E2E_DB_ROUTE)" = "brought" ]; then \
 		$(E2E_FIRST_RUN) exec -T postgres psql -U meridian -d brought -Atc \
@@ -388,7 +388,7 @@ e2e-first-run: network
 		  || { echo "e2e-first-run FAILED: the migrating role may not create tables" >&2; exit 1; }; \
 		echo "  the roles are real: brought_app may not create tables and brought_migrate may"; \
 	fi
-	@$(E2E_FIRST_RUN) down -v --remove-orphans >>.e2e-first-run.log 2>&1
+	@$(E2E_FIRST_RUN) --profile e2e down -v --remove-orphans >>.e2e-first-run.log 2>&1
 	@echo "e2e-first-run OK: an install given nothing, made to serve$(E2E_ROUTE_SAID)$(E2E_BACKEND_SAID)"
 
 # The same run, taking the other route. Its own target rather than a loop, so
