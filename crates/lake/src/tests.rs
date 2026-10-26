@@ -685,6 +685,67 @@ async fn a_standing_want_no_reader_asks_within_its_cadence_is_withdrawn() {
     assert_eq!(gone.want_id, want.want_id);
 }
 
+/// Found on dev 2026-10-26: a latest read finding only rows older than a
+/// pull dataset's cadence answered source silent and asked nothing, and the
+/// lake's wants live in memory, so after a restart a chain froze. The source
+/// is asked again as when nothing is held, keeping the want current; the
+/// last row is still served, and the next dataset is still asked.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_latest_read_finding_only_rows_older_than_the_cadence_asks_the_source_again() {
+    let h = harness();
+    let mut c = configuration(true, &[]);
+    c.datasets[0].declaration.as_mut().unwrap().cadence = 60;
+    h.lake.configured(&c);
+    record(
+        &h,
+        "coinbase-1",
+        vec![close(
+            "coinbase-1",
+            "BTC-USD:2026-10-07",
+            BTC,
+            "2026-10-07",
+            "62000.5",
+        )],
+        "",
+    )
+    .unwrap();
+    let mut wanted = h.bus.subscribe_every(service::OBSERVATIONS_WANTED);
+    let fresh = read(&h, "reporting-1", &[BTC], "", SourceChoice::default(), 0);
+    assert_eq!(fresh.rows.len(), 1);
+    assert!(fresh.unanswered.is_empty());
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), wanted.recv())
+            .await
+            .is_err(),
+        "a row within the cadence asks nothing"
+    );
+
+    h.clock.advance(61 * 1_000_000_000);
+    let stale = read(&h, "reporting-1", &[BTC], "", SourceChoice::default(), 0);
+    assert_eq!(stale.rows.len(), 1, "the last row, served as it is");
+    assert!(stale.unanswered.iter().any(
+        |u| u.dataset == "coinbase-1:daily" && u.reason == UnansweredReason::AskedSource as i32
+    ));
+    let mut asked = Vec::new();
+    while let Ok(Some(delivery)) =
+        tokio::time::timeout(std::time::Duration::from_millis(200), wanted.recv()).await
+    {
+        let want = ObservationsWantedEvent::decode(&delivery.envelope.payload[..]).unwrap();
+        let subjects: Vec<&str> = want.subjects.iter().map(|s| s.entity_id.as_str()).collect();
+        assert_eq!(subjects, vec![BTC]);
+        asked.push((want.dataset.clone(), want.standing));
+    }
+    asked.sort();
+    assert_eq!(
+        asked,
+        vec![
+            ("coinbase-1:daily".to_string(), true),
+            ("kraken-1:daily".to_string(), false),
+        ],
+        "the silent source asked again, standing; the next one asked too"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dataset_not_kept_is_served_and_only_that_it_was_served_is_kept() {
     let h = harness();
@@ -1838,6 +1899,7 @@ fn kept_rows(h: &Harness, as_of_ns: i64) -> Vec<Observation> {
             },
             as_of_ns,
             published_as_of_ns: 0,
+            latest_only: false,
         })
         .unwrap()
 }
@@ -1952,6 +2014,7 @@ async fn a_daily_value_on_a_closed_day_is_recorded_flagged_and_counted() {
             },
             as_of_ns: 0,
             published_as_of_ns: 0,
+            latest_only: false,
         })
         .unwrap();
     assert!(kraken[0].meta().closed_day.is_none());

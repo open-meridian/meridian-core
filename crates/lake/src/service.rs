@@ -2801,6 +2801,7 @@ impl Lake {
                             },
                             as_of_ns: now,
                             published_as_of_ns: 0,
+                            latest_only: false,
                         })
                         .map_err(|failed| failed.to_string())?;
                     let mut found = false;

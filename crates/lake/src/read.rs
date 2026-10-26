@@ -462,6 +462,15 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
             when: read.when.clone(),
             as_of_ns: read.as_of_ns,
             published_as_of_ns: read.published_as_of_ns,
+            // Only where nothing narrows the rows before the latest is
+            // chosen but what commutes with it -- a series and a tenor are
+            // in the point, an invalid row's successor is answered beside
+            // it -- may the store choose it.
+            latest_only: matches!(read.when, When::Latest { .. })
+                && read.published_as_of_ns == 0
+                && read.dates.is_none()
+                && read.roles.is_empty()
+                && read.narrowed == Narrowed::default(),
         })
         .map_err(|failed| failed.to_string())?;
     if read.published_as_of_ns != 0 {
@@ -596,6 +605,7 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
     let mut asks: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut chosen: Vec<Observation> = Vec::new();
     let catching_up = matches!(read.when, When::After(_));
+    let series_asked = read.all_series || !read.series_keys.is_empty();
     for subject in &read.subjects {
         // The kinds to answer: those asked, or those any dataset holds; a
         // bar's is 0.
@@ -660,57 +670,98 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
                 continue;
             }
             // Default or named: the first dataset in order with a row that is
-            // not silent; each above it said, with why.
+            // not silent; each above it said, with why. A read that asks for
+            // series chooses per series (contract v28, W10.6): an
+            // underlying's own quote in one dataset and its chain's in
+            // another each answer, one source per series, never mixed
+            // within one. A dataset holding the subject's other series is
+            // not named for this one; it answered what it holds.
+            let holding: BTreeSet<String> = held.iter().map(|r| r.dataset().to_string()).collect();
+            let groups: Vec<Vec<Observation>> = if series_asked && !held.is_empty() {
+                let mut by_series: BTreeMap<String, Vec<Observation>> = BTreeMap::new();
+                for row in held {
+                    by_series.entry(row.series()).or_default().push(row);
+                }
+                by_series.into_values().collect()
+            } else {
+                vec![held]
+            };
+            // One instance is asked at a time per subject and kind: the
+            // first that can be.
+            let mut asked_of: Option<String> = None;
             let mut fallen: Vec<NotServed> = Vec::new();
-            let mut answered = false;
-            let mut first_silent: Option<Vec<Observation>> = None;
-            let mut asked_one = false;
-            for dataset in &order {
-                let of: Vec<Observation> = held
-                    .iter()
-                    .filter(|r| r.dataset() == dataset)
-                    .cloned()
-                    .collect();
-                if of.is_empty() {
-                    let (reason, ask) = why_not(dataset, subject, kind);
-                    let reason = if ask && asked_one {
-                        // One instance is asked at a time: the first that can be.
-                        UnansweredReason::NotCovered
-                    } else {
-                        reason
-                    };
-                    if ask && !asked_one {
-                        asks.entry(dataset.clone())
-                            .or_default()
-                            .insert(subject.clone());
-                        asked_one = true;
+            for group in groups {
+                let mut answered = false;
+                let mut first_silent: Option<Vec<Observation>> = None;
+                for dataset in &order {
+                    let of: Vec<Observation> = group
+                        .iter()
+                        .filter(|r| r.dataset() == dataset)
+                        .cloned()
+                        .collect();
+                    let latest_silent = !of.is_empty()
+                        && matches!(read.when, When::Latest { .. })
+                        && of.iter().all(|r| silent(r, against));
+                    if of.is_empty() && holding.contains(dataset) {
+                        continue;
                     }
-                    fallen.push(NotServed {
-                        subject: subject.clone(),
-                        dataset: dataset.clone(),
-                        field: String::new(),
-                        reason,
-                    });
-                    continue;
-                }
-                if matches!(read.when, When::Latest { .. }) && of.iter().all(|r| silent(r, against))
-                {
-                    fallen.push(NotServed {
-                        subject: subject.clone(),
-                        dataset: dataset.clone(),
-                        field: String::new(),
-                        reason: UnansweredReason::SourceSilent,
-                    });
-                    first_silent.get_or_insert(of);
-                    continue;
-                }
-                chosen.extend(of);
-                answered = true;
-                break;
-            }
-            if !answered {
-                if let Some(of) = first_silent {
+                    if of.is_empty() || latest_silent {
+                        let (reason, ask) = why_not(dataset, subject, kind);
+                        let reason = if latest_silent {
+                            // Only rows older than the dataset's cadence:
+                            // its source is asked again as when nothing is
+                            // held, which keeps the want current -- the
+                            // lake's wants live in memory, and a chain read
+                            // after a restart froze. A re-ask, not the one
+                            // instance a read falls through to: the next
+                            // dataset is still asked where it holds nothing.
+                            if ask {
+                                asks.entry(dataset.clone())
+                                    .or_default()
+                                    .insert(subject.clone());
+                                UnansweredReason::AskedSource
+                            } else {
+                                UnansweredReason::SourceSilent
+                            }
+                        } else if ask {
+                            // One instance is asked at a time: the first
+                            // that can be.
+                            match &asked_of {
+                                None => {
+                                    asks.entry(dataset.clone())
+                                        .or_default()
+                                        .insert(subject.clone());
+                                    asked_of = Some(dataset.clone());
+                                    reason
+                                }
+                                Some(asked) if asked == dataset => reason,
+                                Some(_) => UnansweredReason::NotCovered,
+                            }
+                        } else {
+                            reason
+                        };
+                        let said = NotServed {
+                            subject: subject.clone(),
+                            dataset: dataset.clone(),
+                            field: String::new(),
+                            reason,
+                        };
+                        if !fallen.contains(&said) {
+                            fallen.push(said);
+                        }
+                        if latest_silent {
+                            first_silent.get_or_insert(of);
+                        }
+                        continue;
+                    }
                     chosen.extend(of);
+                    answered = true;
+                    break;
+                }
+                if !answered {
+                    if let Some(of) = first_silent {
+                        chosen.extend(of);
+                    }
                 }
             }
             out.not_served.extend(fallen);
