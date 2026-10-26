@@ -37,6 +37,11 @@ pub const ASK_PLATFORM_FOR_EVENT_GROUP: &str =
 /// company it does not hold, by its open identifiers alone.
 pub const ASK_PLATFORM_FOR_COMPANY: &str = "platform.reference.query.ask-platform-for-company";
 
+/// W3.33 (contract v28; rulings 757, 763, 765): the instrument picker's
+/// search, the dashboard's ask.
+pub const ASK_PLATFORM_FOR_INSTRUMENT_CANDIDATES: &str =
+    "platform.reference.query.ask-platform-for-instrument-candidates";
+
 /// How long one ask may take before the person is told the platform did not
 /// answer. Within the dashboard's own wait for the reply (12 s), and longer
 /// than a resolve's bounded ask (8 s, the one-ID spec's requirement 15), so
@@ -131,6 +136,25 @@ impl Conductor {
                 reply.encode_to_vec(),
             ))
         });
+        let searching = Arc::clone(&grouping);
+        bus.serve(ASK_PLATFORM_FOR_INSTRUMENT_CANDIDATES, move |envelope| {
+            if envelope.payload_type != "meridian.v1.InstrumentCandidatesRequest" {
+                return Err(format!(
+                    "expected meridian.v1.InstrumentCandidatesRequest, got {}",
+                    envelope.payload_type
+                ));
+            }
+            let request =
+                meridian_domain::v1::InstrumentCandidatesRequest::decode(&envelope.payload[..])
+                    .map_err(|failed| format!("undecodable ask: {failed}"))?;
+            let handle = tokio::runtime::Handle::try_current()
+                .map_err(|_| "the conductor has no runtime to ask on".to_string())?;
+            let reply = handle.block_on(searching.candidates(&request));
+            Ok((
+                "meridian.v1.AskPlatformForInstrumentCandidatesReply".to_string(),
+                reply.encode_to_vec(),
+            ))
+        });
         let this = grouping;
         bus.serve(ASK_PLATFORM_FOR_EVENT_GROUP, move |envelope| {
             if envelope.payload_type != "meridian.v1.AskPlatformForEventGroupRequest" {
@@ -205,6 +229,55 @@ impl Conductor {
             Err(_) => Err("the platform did not answer in time".into()),
             Ok(Err(failed)) => Err(format!("the platform could not be reached: {failed}")),
             Ok(Ok(answer)) => Ok(answer),
+        }
+    }
+
+    /// W3.33 (contract v28; ruling 757): the platform's candidates for what
+    /// a person typed into the picker, sent as typed and nothing else -- an
+    /// ISIN or a CUSIP among it, the licensed-scheme rule's one exception
+    /// (ruling 761) -- bounded by [`ASKING`]. Not reached, said so, and the
+    /// picker answers from the deployment's own records.
+    pub async fn candidates(
+        &self,
+        asking: &meridian_domain::v1::InstrumentCandidatesRequest,
+    ) -> meridian_domain::v1::AskPlatformForInstrumentCandidatesReply {
+        use meridian_domain::v1::AskPlatformForInstrumentCandidatesReply;
+        let query = asking
+            .query
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if query.is_empty() || query.chars().count() > 64 {
+            return AskPlatformForInstrumentCandidatesReply {
+                reachable: false,
+                detail: "the search is one line of 1 to 64 characters".into(),
+                answer: None,
+            };
+        }
+        let asking = meridian_domain::v1::InstrumentCandidatesRequest {
+            query,
+            limit: asking.limit.clamp(0, 25),
+            ..asking.clone()
+        };
+        let now_ns = self.clock.now_ns();
+        match tokio::time::timeout(ASKING, self.platform.instrument_candidates(&asking, now_ns))
+            .await
+        {
+            Err(_) => AskPlatformForInstrumentCandidatesReply {
+                reachable: false,
+                detail: "the platform did not answer in time".into(),
+                answer: None,
+            },
+            Ok(Err(failed)) => AskPlatformForInstrumentCandidatesReply {
+                reachable: false,
+                detail: failed.to_string(),
+                answer: None,
+            },
+            Ok(Ok(answer)) => AskPlatformForInstrumentCandidatesReply {
+                reachable: true,
+                detail: String::new(),
+                answer: Some(answer),
+            },
         }
     }
 
@@ -770,6 +843,88 @@ mod tests {
 
     fn reply_404() -> crate::platform::Response {
         reply(404, "{}")
+    }
+
+    // ── Contract v28 (W3.33; rulings 757, 761) ────────────────────────────
+
+    #[tokio::test]
+    async fn the_pickers_search_is_sent_as_typed_and_answered_whole() {
+        let bus = bus();
+        let answered = serde_json::json!({
+            "candidates": [
+                {"instrument_id": "INS-01JSPY", "ticker": "SPY", "mic": "ARCX", "country": "US",
+                 "name": "SPDR S&P 500 ETF Trust", "asset_class": "ASSET_CLASS_FUND",
+                 "currency": "USD", "composite_figi": "BBG000BDTBL9",
+                 "share_class_figi": "BBG001S72SM3", "identifiers": []},
+                {"instrument_id": "", "ticker": "QQQ", "mic": "", "country": "US",
+                 "name": "Invesco QQQ Trust", "asset_class": "ASSET_CLASS_UNSPECIFIED",
+                 "currency": "", "composite_figi": "BBG000BSWKH7", "share_class_figi": "",
+                 "identifiers": [{"scheme": "composite_figi", "value": "BBG000BSWKH7", "source": ""}]}
+            ],
+            "sources": [{"source": "https://api.openfigi.com", "outcome": "found",
+                         "read_at": "2026-10-26T20:00:00Z"}]
+        });
+        let transport = Fake::new(vec![Ok(reply(200, &answered.to_string()))]);
+        let conductor = Conductor::new(
+            bus.clone(),
+            Arc::new(platform_with(transport.clone())),
+            bus.clock(),
+        );
+        // An ISIN a person typed passes as typed (ruling 761), and nothing
+        // else of the deployment's goes with it.
+        let reply = conductor
+            .candidates(&meridian_domain::v1::InstrumentCandidatesRequest {
+                query: "  US78462F1030 ".into(),
+                limit: 99,
+                ..Default::default()
+            })
+            .await;
+        assert!(reply.reachable, "{reply:?}");
+        let answer = reply.answer.unwrap();
+        assert_eq!(answer.candidates.len(), 2);
+        assert_eq!(answer.candidates[0].instrument_id, "INS-01JSPY");
+        assert_eq!(
+            answer.candidates[0].asset_class,
+            meridian_domain::v1::AssetClass::Fund as i32
+        );
+        assert_eq!(answer.candidates[1].identifiers[0].scheme, "composite_figi");
+        assert_eq!(answer.sources[0].outcome, "found");
+        assert!(transport.urls()[0].ends_with("/api/v1/reference/instrument-candidates"));
+        let sent: serde_json::Value = serde_json::from_str(&transport.bodies()[0]).unwrap();
+        assert_eq!(
+            sent,
+            serde_json::json!({"query": "US78462F1030", "limit": 25})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_platform_without_the_search_is_unreachable_and_said_so() {
+        let bus = bus();
+        let conductor = Conductor::new(
+            bus.clone(),
+            Arc::new(platform_with(Fake::new(vec![Ok(reply_404())]))),
+            bus.clock(),
+        );
+        let reply = conductor
+            .candidates(&meridian_domain::v1::InstrumentCandidatesRequest {
+                query: "SPY".into(),
+                ..Default::default()
+            })
+            .await;
+        assert!(!reply.reachable && reply.answer.is_none());
+        assert!(reply.detail.contains("404"), "{}", reply.detail);
+        // A blank search is not sent at all.
+        let transport = Fake::new(vec![]);
+        let conductor = Conductor::new(
+            bus.clone(),
+            Arc::new(platform_with(transport.clone())),
+            bus.clock(),
+        );
+        let reply = conductor
+            .candidates(&meridian_domain::v1::InstrumentCandidatesRequest::default())
+            .await;
+        assert!(!reply.reachable);
+        assert_eq!(transport.calls(), 0);
     }
 
     #[tokio::test(start_paused = true)]
