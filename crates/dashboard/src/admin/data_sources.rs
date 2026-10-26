@@ -685,10 +685,8 @@ pub fn page(
         section(
             "use",
             "Use",
-            "Who could use each dataset in the month, against its meters, from the records and \
-             the entitlements: the persons able to read it, the plugins entitled to it by \
-             category, and the service accounts. Kept with their dates; you file them with the \
-             vendor, and they are never sent anywhere.",
+            "Who could use each dataset in the month, from the records and entitlements: \
+             persons, plugins by category, service accounts. Yours to file; never sent.",
             "<button type=\"button\" data-dialog-open=\"professional-status\">Change a status</button>",
             &used.0
         ),

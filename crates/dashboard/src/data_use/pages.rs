@@ -157,8 +157,8 @@ async fn test_page(
         forms
     };
     let lead = if owed {
-        "The data a plugin you are opening reads is priced differently for professionals and \
-         non-professionals. Answer once, for yourself; an agent acting for you counts as you."
+        "Data you are about to see is priced apart for professionals. Answer once; an agent \
+         acting for you counts as you."
     } else {
         "How you answered for the data you can read."
     };
@@ -408,10 +408,11 @@ pub fn tab(
         })
         .collect();
     let choose = format!(
-        "<form method=\"get\" action=\"/admin/data-sources#use\" class=\"use-choose\">\
-         <label>Month <select name=\"month\" onchange=\"this.form.submit()\">{months}</select></label>\
-         <label>Count by <select name=\"by\" onchange=\"this.form.submit()\">\
-         <option value=\"dataset\"{d}>Dataset</option><option value=\"source\"{s}>Source</option></select></label>\
+        "<form method=\"get\" action=\"/admin/data-sources#use\" class=\"filter-bar use-choose\">\
+         <div class=\"filter-selects\"><select name=\"month\" aria-label=\"Month\" title=\"Month\" \
+         onchange=\"this.form.submit()\">{months}</select>\
+         <select name=\"by\" aria-label=\"Count by\" title=\"Count by\" onchange=\"this.form.submit()\">\
+         <option value=\"dataset\"{d}>By dataset</option><option value=\"source\"{s}>By source</option></select></div>\
          <noscript><button type=\"submit\">Show</button></noscript>\
          <a class=\"button\" href=\"/admin/data-sources/use.csv?month={month}\" download>Export CSV</a></form>",
         d = if by_source { "" } else { " selected" },
@@ -435,11 +436,11 @@ pub fn tab(
                 "<tr data-id=\"{key}\"><td title=\"{key}\">{key}</td>\
                  <td class=\"wide\" title=\"{meters}\">{meters}</td>\
                  <td class=\"num\" data-persons>{persons}</td>\
-                 <td class=\"muted\" data-served title=\"Persons served and devices are counted from \
-                 what the sidecars serve, which a later release counts\">not counted yet</td>\
-                 <td class=\"wide\" data-status title=\"Professional / non-professional; unanswered \
-                 counts as professional\">{status}</td>\
-                 <td class=\"num\" data-plugins title=\"{plugins_said}\">{plugins}</td>\
+                 <td class=\"muted\" data-served title=\"not counted yet: persons served and devices are \
+                 counted from what the sidecars serve, which a later release counts\">not counted yet</td>\
+                 <td class=\"wide\" data-status title=\"{status}: professional / non-professional; \
+                 unanswered counts as professional\">{status}</td>\
+                 <td class=\"wide num\" data-plugins title=\"{plugins_said}\">{plugins}</td>\
                  <td class=\"wide num\" data-service-accounts>{sa}</td>\
                  <td class=\"wide\" title=\"{beside}\">{beside}</td></tr>",
                 key = escape(&c.key),
@@ -458,10 +459,10 @@ pub fn tab(
             "<om-pager search=\"Search counts\"><table class=\"list one-line use\" data-use=\"{n}\"><thead><tr>\
              <th>{first}</th><th class=\"wide\">Meters</th>\
              <th class=\"num\" title=\"Display persons able to read it\">Persons</th>\
-             <th title=\"Display persons served\">Served</th>\
+             <th class=\"served\" title=\"Display persons served\">Served</th>\
              <th class=\"wide\" title=\"Professional / non-professional\">Pro / non-pro</th>\
-             <th class=\"num\" title=\"Non-display plugins entitled, by category\">Plugins</th>\
-             <th class=\"wide num\" title=\"Service accounts able to read it, on the non-display meter\">Service accts</th>\
+             <th class=\"wide num\" title=\"Non-display plugins entitled, by category\">Plugins</th>\
+             <th class=\"wide num svc\" title=\"Service accounts able to read it, on the non-display meter\">Service accts</th>\
              <th class=\"wide\">{beside}</th></tr></thead><tbody>{lines}</tbody></table></om-pager>",
             n = counts.len(),
             first = if by_source { "Source" } else { "Dataset" },

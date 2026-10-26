@@ -54,6 +54,9 @@ use crate::web::{router, App};
 
 const INSTANCE: &str = "snaptrade-1";
 const ADMIN: &str = "https://directory.example.org|admin";
+/// Contract v28 (W10.1): a person reading prices through plugin-03, whom
+/// the professional test asks.
+const READER: &str = "https://directory.example.org|ines";
 
 fn setting(name: &str, kind: SettingType, label: &str, description: &str) -> SettingDeclaration {
     SettingDeclaration {
@@ -444,6 +447,39 @@ fn accounts() -> Vec<meridian_domain::v1::AccountRecord> {
 fn records() -> AccessRecords {
     let mut records = settings_records();
     per_role(&mut records);
+    // Contract v28 (W10.1, W10.13): Ines reads plugin-03's reporting role,
+    // which kraken-1:daily, split professional and non-professional, is
+    // entitled to.
+    records.user_groups.push(UserGroup {
+        user_group_id: "UG-PRICES".into(),
+        name: "Prices".into(),
+        directory_groups: vec![],
+        logins: vec![READER.into()],
+    });
+    records
+        .access_groups
+        .push(meridian_domain::v1::AccessGroup {
+            access_group_id: "AX-PRICES".into(),
+            name: "Prices".into(),
+            entries: vec![meridian_domain::v1::AccessEntry {
+                plugin_instance_id: "plugin-03".into(),
+                level: AccessLevel::Read as i32,
+                role: "reporting".into(),
+            }],
+            built_in: false,
+        });
+    records.permissions.push(Permission {
+        permission_id: "P-PRICES".into(),
+        user_group_id: "UG-PRICES".into(),
+        account_group_id: "AG-DESK".into(),
+        access_group_id: "AX-PRICES".into(),
+    });
+    records.people.push(SignInRecord {
+        subject: READER.into(),
+        display_name: "Ines Reader".into(),
+        directory_groups: vec![],
+        signed_in_at_ns: 1_791_417_600_000_000_000,
+    });
     records.accounts = accounts();
     // Contract v22 (W11.21, W11.22): fix-1 available and linked to ems-1,
     // which mapped every account on it.
@@ -968,6 +1004,38 @@ fn lake_listing() -> meridian_domain::v1::ListDatasetsReply {
             }
         }
     }
+    // Contract v28 (W10.1, W10.13): one dataset licensed on meters, its
+    // display terms split professional and non-professional on the
+    // standard test, plugin-03 entitled to it.
+    reply.licences.push(DatasetLicence {
+        dataset: "kraken-1:daily".into(),
+        kept: true,
+        display: true,
+        meters: vec![
+            meridian_pb::v1::LicenceMeter::Display as i32,
+            meridian_pb::v1::LicenceMeter::NonDisplay as i32,
+        ],
+        display_terms: Some(meridian_pb::v1::DisplayTerms {
+            professional_split: true,
+            professional_definition: meridian_pb::v1::ProfessionalDefinition::Standard as i32,
+            ..Default::default()
+        }),
+        underlying_source: "Kraken".into(),
+        delay_label: "Real time".into(),
+        updated_by: ADMIN.into(),
+        updated_at_ns: 1_791_417_600_000_000_000,
+        note: "Licensed per person and per plugin.".into(),
+        ..Default::default()
+    });
+    reply.entitlements.push(DatasetEntitlement {
+        dataset: "kraken-1:daily".into(),
+        instance: "plugin-03".into(),
+        allowed: true,
+        updated_by: ADMIN.into(),
+        updated_at_ns: 1_791_417_600_000_000_000,
+        note: "The desk's prices.".into(),
+        ..Default::default()
+    });
     reply.licences.push(DatasetLicence {
         dataset: "coinbase-1:daily".into(),
         kept: true,
@@ -2239,6 +2307,16 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
         .await
         .expect("the port");
     println!("SESSION={session}");
+    // Contract v28 (W10.1): Ines's own, whom the professional test asks.
+    println!(
+        "READER_SESSION={}",
+        app.sessions.start(
+            READER,
+            "Ines Reader",
+            vec![],
+            meridian_clock::SystemClock.now_ns()
+        )
+    );
     println!("serving the settings pages on port {port}");
     axum::serve(listener, router(app)).await.unwrap();
 }

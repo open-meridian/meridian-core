@@ -25,6 +25,10 @@ needed?" So, in headless Chromium:
   allowing with a bound and withdrawing, each back on the Summary saying so;
   and the deployment's Holds tab and its dialog, a hold set from it held --
   each page and open dialog fitting one screen at both sizes;
+- the Data sources page's Use tab and the professional test (contract v28,
+  W10.1, W10.13): a line a dataset or source, persons served "not counted
+  yet", its status dialog, and the test answered once -- at 375, 582 and 1280
+  wide, light and dark;
 - the Data sources page (contract v18): its Datasets, Entitlements and
   Priority tabs, one line a row on the kit's pager, which upgrades, with no
   cell cut off; its licence, entitlement and priority dialogs within the
@@ -67,6 +71,9 @@ from playwright.sync_api import sync_playwright
 
 BASE = os.environ.get("E2E_DASHBOARD", "http://settings-page:8080").rstrip("/")
 SESSION = os.environ["E2E_SESSION"]
+# Contract v28 (W10.1): Ines, who reads prices the professional test asks
+# her about.
+READER_SESSION = os.environ.get("E2E_READER_SESSION", "")
 PASS = os.environ.get("PASS", "all")
 OUT = os.environ.get("OUT", "/out")
 INSTANCE = "snaptrade-1"
@@ -85,12 +92,12 @@ def check(held, said):
         failures.append(said)
 
 
-def context(browser, width=1440, height=900, script=True, scheme="light"):
+def context(browser, width=1440, height=900, script=True, scheme="light", session=None):
     ctx = browser.new_context(
         viewport={"width": width, "height": height}, java_script_enabled=script,
         color_scheme=scheme,
     )
-    ctx.add_cookies([{"name": "meridian_session", "value": SESSION, "url": BASE}])
+    ctx.add_cookies([{"name": "meridian_session", "value": session or SESSION, "url": BASE}])
     return ctx
 
 
@@ -961,6 +968,94 @@ def the_data_sources_page(browser, prefix):
         ctx.close()
 
 
+def the_data_use_and_the_professional_test(browser, prefix):
+    """Contract v28 (W10.1, W10.13; ruling 754): the Data sources page's Use
+    tab -- a line a dataset, or a source, against its meters, the persons
+    served "not counted yet" -- and its status dialog; and the professional
+    test's form as the person it asks sees it, answered once. Each at 375,
+    582 and 1280 wide, light and dark, no sideways scroll, one screen."""
+    for scheme in ("light", "dark"):
+        for size, width, height in V24_SIZES:
+            ctx = context(browser, width, height, scheme=scheme)
+            page = ctx.new_page()
+            errors = []
+            page.on("pageerror", lambda e: errors.append(str(e)))
+            for by in ("dataset", "source"):
+                page.goto(f"{DATA_SOURCES}?by={by}#use")
+                settled(page)
+                rows = page.eval_on_selector_all("#use table.use tbody tr", "rows => rows.length")
+                check(rows > 0, f"at {size} ({scheme}) the Use tab by {by} lists its rows: {rows}")
+                said = page.inner_text("#use")
+                check("not counted yet" in said,
+                      f"at {size} ({scheme}) the Use tab says persons served are not counted yet")
+                cut = page.evaluate(CUT_UNTITLED, "#use table.use")
+                check(not cut, f"at {size} ({scheme}) no cell of the Use tab is cut off but one whose title holds it: {cut}")
+                labelled = page.evaluate("""() => [...document.querySelectorAll('#use select, #use input, #use button, #use a.button')]
+                  .filter((c) => c.offsetParent !== null)
+                  .filter((c) => !(c.closest('label') || c.getAttribute('aria-label') || c.textContent.trim()))
+                  .map((c) => c.outerHTML.slice(0, 80))""")
+                check(not labelled, f"at {size} ({scheme}) every control on the Use tab is labelled: {labelled}")
+                problems = measured(page, f"use-{by} at {size} {scheme}",
+                                    f"v28-{prefix}-data-use-{by}-{size}-{scheme}.png")
+                check(not problems, f"the Use tab by {by} at {size} ({scheme}) fits one screen"
+                      f"{': ' + '; '.join(problems) if problems else ''}")
+            page.goto(f"{DATA_SOURCES}#use")
+            settled(page)
+            row = page.locator("#use tr[data-id='kraken-1:daily']")
+            check(row.count() == 1 and row.locator("[data-persons]").inner_text().strip() == "1",
+                  f"at {size} ({scheme}) kraken-1:daily counts Ines, the one person reading it")
+            page.click("#use button[data-dialog-open=professional-status]")
+            page.wait_for_timeout(300)
+            boxed = inside_the_viewport(page)
+            check(not boxed, f"at {size} ({scheme}) the status dialog stays within the viewport{': ' + boxed if boxed else ''}")
+            inside = page.evaluate(INSIDE)
+            check(not inside, f"at {size} ({scheme}) nothing in the status dialog reaches past it: {inside}")
+            page.screenshot(path=os.path.join(OUT, f"v28-{prefix}-data-use-status-dialog-{size}-{scheme}.png"))
+            check(not errors, f"the Use tab at {size} ({scheme}) ran without a script error: {errors}")
+            ctx.close()
+            if not READER_SESSION:
+                continue
+            # The test as Ines sees it, unanswered: its text and two answers.
+            ctx = context(browser, width, height, scheme=scheme, session=READER_SESSION)
+            page = ctx.new_page()
+            page.goto(f"{BASE}/professional-test?then=%2F")
+            settled(page)
+            form = page.locator("form.professional-test[data-test=standard]")
+            answered = form.locator("[data-answered]").count() > 0
+            if not answered:
+                check(form.locator("button[name=answer]").count() == 2,
+                      f"at {size} ({scheme}) the standard test offers its two answers")
+            problems = measured(page, f"professional-test at {size} {scheme}",
+                                f"v28-{prefix}-professional-test-{size}-{scheme}.png")
+            m = page.evaluate(MEASURE)
+            check(m["tall"] <= 0, f"the professional test at {size} ({scheme}) fits one screen: {m['tall']}px taller")
+            check(not problems, f"the professional test at {size} ({scheme}) fits by the kit's check"
+                  f"{': ' + '; '.join(problems) if problems else ''}")
+            ctx.close()
+    if READER_SESSION:
+        # Answered once: the record stands, and the count splits.
+        ctx = context(browser, session=READER_SESSION)
+        page = ctx.new_page()
+        page.goto(f"{BASE}/professional-test?then=%2F")
+        settled(page)
+        if page.locator("form.professional-test button[value=non_professional]").count():
+            page.click("form.professional-test button[value=non_professional]")
+            settled(page)
+        said = page.get_attribute("form.professional-test[data-test=standard] [data-answered]", "data-answered")
+        check(said == "non_professional", f"Ines's answer is held: {said!r}")
+        ctx.close()
+        ctx = context(browser)
+        page = ctx.new_page()
+        page.goto(f"{DATA_SOURCES}#use")
+        settled(page)
+        status = page.inner_text("#use tr[data-id='kraken-1:daily'] [data-status]")
+        check(status.strip() == "0 / 1", f"kraken-1:daily's professional / non-professional count: {status!r}")
+        csv = page.request.get(f"{DATA_SOURCES}/use.csv")
+        check(csv.status == 200 and "kraken-1:daily,Kraken,display,person,https://directory.example.org|ines,Ines Reader,non_professional"
+              in csv.text(), f"the export carries Ines's line: {csv.status} {csv.text()[:400]!r}")
+        ctx.close()
+
+
 def the_icon_is_linked_and_served(browser):
     """The product owner, 2026-10-06: the Open Meridian icon on the
     deployment too."""
@@ -1619,6 +1714,7 @@ with sync_playwright() as playwright:
     the_access_editor_has_a_row_per_role(browser, prefix)
     the_raw_records_and_the_holds(browser, prefix)
     the_data_sources_page(browser, prefix)
+    the_data_use_and_the_professional_test(browser, prefix)
     the_accounts_tab_holds_the_book(browser, prefix)
     the_service_accounts_tab_and_runs_as(browser, prefix)
     the_connectivity_part_and_the_calendars_tab(browser, prefix)
