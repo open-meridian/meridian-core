@@ -230,7 +230,7 @@ async fn a_pack_job_a_restart_interrupted_is_carried_on_and_recorded_once() {
         note: NOTE.into(),
         began_at_ns: 1,
     };
-    before.store.put_pack_job(&job).unwrap();
+    tokio::task::block_in_place(|| before.store.put_pack_job(&job)).unwrap();
 
     let after = harness_with(Arc::clone(&before.platform), Arc::clone(&before.store));
     let status = settled(&after).await;
@@ -241,12 +241,12 @@ async fn a_pack_job_a_restart_interrupted_is_carried_on_and_recorded_once() {
     assert_eq!(held[0].kind, PackChangeKind::Installed);
     assert_eq!((held[0].by.by.as_str(), held[0].by.note.as_str()), (ADA, NOTE));
     for _ in 0..100 {
-        if after.store.pack_jobs().unwrap().is_empty() {
+        if tokio::task::block_in_place(|| after.store.pack_jobs()).unwrap().is_empty() {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    assert!(after.store.pack_jobs().unwrap().is_empty(), "the job is cleared");
+    assert!(tokio::task::block_in_place(|| after.store.pack_jobs()).unwrap().is_empty(), "the job is cleared");
     assert_eq!(catalogue(&after).await.versions.len(), 1);
 }
 
@@ -255,12 +255,12 @@ async fn a_pack_job_is_kept_while_it_runs_and_cleared_once_recorded() {
     let h = harness();
     installed(&h).await;
     for _ in 0..100 {
-        if h.store.pack_jobs().unwrap().is_empty() {
+        if tokio::task::block_in_place(|| h.store.pack_jobs()).unwrap().is_empty() {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    assert!(h.store.pack_jobs().unwrap().is_empty());
+    assert!(tokio::task::block_in_place(|| h.store.pack_jobs()).unwrap().is_empty());
     assert_eq!(changes(&h).await.len(), 1);
 }
 

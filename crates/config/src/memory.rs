@@ -1411,6 +1411,8 @@ impl Store for MemoryStore {
     }
 
     fn put_pack_job(&self, job: &crate::store::PackJob) -> Result<()> {
+        #[cfg(test)]
+        blocks_like_postgres();
         self.pack_jobs
             .lock()
             .expect("store lock poisoned")
@@ -1419,6 +1421,8 @@ impl Store for MemoryStore {
     }
 
     fn pack_jobs(&self) -> Result<Vec<crate::store::PackJob>> {
+        #[cfg(test)]
+        blocks_like_postgres();
         Ok(self
             .pack_jobs
             .lock()
@@ -1429,6 +1433,8 @@ impl Store for MemoryStore {
     }
 
     fn end_pack_job(&self, pack: &str) -> Result<()> {
+        #[cfg(test)]
+        blocks_like_postgres();
         self.pack_jobs
             .lock()
             .expect("store lock poisoned")

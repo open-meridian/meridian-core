@@ -692,6 +692,20 @@ impl Plugins {
     /// `pack_installed`. A member whose install completed before the
     /// restart reads as installed, never installed twice.
     pub(super) fn resume_pack_jobs(self: &Arc<Self>) {
+        // The store blocks, as Postgres's client does: read and run off the
+        // runtime, as every other store call here is.
+        let plugins = Arc::clone(self);
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn_blocking(move || plugins.resume_now());
+            }
+            Err(_) => plugins.resume_now(),
+        }
+    }
+
+    /// [`Plugins::resume_pack_jobs`], on a thread that may block: each job
+    /// carried on in turn.
+    fn resume_now(&self) {
         let jobs = match self.store.pack_jobs() {
             Ok(jobs) => jobs,
             Err(failed) => {
@@ -718,22 +732,7 @@ impl Plugins {
                 members = queued.len(),
                 "a starter pack's install carried on after a restart"
             );
-            let plugins = Arc::clone(self);
-            let run = move || {
-                plugins.run_pack_install(
-                    &job.held,
-                    &queued,
-                    &job.note,
-                    &job.envelope,
-                    job.began_at_ns,
-                )
-            };
-            match tokio::runtime::Handle::try_current() {
-                Ok(runtime) => {
-                    runtime.spawn_blocking(run);
-                }
-                Err(_) => run(),
-            }
+            self.run_pack_install(&job.held, &queued, &job.note, &job.envelope, job.began_at_ns);
         }
     }
 
