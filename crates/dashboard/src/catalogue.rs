@@ -815,17 +815,9 @@ async fn list(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
     // Contract v26 (W8.2, W8.12): a registry version's source and its pull,
     // and each launch running a pulled version whether it was kept.
     let listings = match &person {
-        Ok(admin) => crate::registry::listings(
-            &app,
-            &admin.person.subject,
-            meridian_domain::v1::ListRegistryPluginsRequest {
-                page_size: 200,
-                ..Default::default()
-            },
-        )
-        .await
-        .map(|reply| reply.listings)
-        .unwrap_or_default(),
+        Ok(admin) => crate::registry::every_listing(&app, &admin.person.subject)
+            .await
+            .unwrap_or_default(),
         Err(_) => Vec::new(),
     };
     let pull_of = |version: &PluginVersion| {
@@ -1381,17 +1373,9 @@ async fn update(
                 .as_ref()
                 .is_some_and(|m| m.name == launch.name && m.version == launch.version)
         });
-        let listings = crate::registry::listings(
-            &app,
-            &person.person.subject,
-            meridian_domain::v1::ListRegistryPluginsRequest {
-                page_size: 200,
-                ..Default::default()
-            },
-        )
-        .await
-        .map(|reply| reply.listings)
-        .unwrap_or_default();
+        let listings = crate::registry::every_listing(&app, &person.person.subject)
+            .await
+            .unwrap_or_default();
         match running.and_then(|v| crate::registry::update_for(v, &launch.version, &listings)) {
             Some(newer) => version = newer.version.clone(),
             None => {

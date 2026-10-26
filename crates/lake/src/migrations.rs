@@ -33,6 +33,12 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "quality",
         sql: include_str!("../migrations/0003_quality.sql"),
     },
+    // The latest in force chosen in SQL (found on dev 2026-10-26).
+    Migration {
+        version: 4,
+        name: "latest",
+        sql: include_str!("../migrations/0004_latest.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

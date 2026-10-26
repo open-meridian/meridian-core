@@ -523,6 +523,20 @@ pub fn chain(
             ..Default::default()
         },
     );
+    // A dataset served, not kept, that served nothing within the read is
+    // named with its licence where no price was read (ruling 734).
+    let not_kept: BTreeSet<String> = price_reply
+        .as_ref()
+        .map(|reply| {
+            reply
+                .unanswered
+                .iter()
+                .filter(|u| u.reason == v1::UnansweredReason::NotKept as i32)
+                .filter(|u| !u.dataset.is_empty())
+                .map(|u| u.dataset.clone())
+                .collect()
+        })
+        .unwrap_or_default();
     let spot = price_reply.ok().and_then(|reply| {
         reply
             .prices
@@ -718,10 +732,16 @@ pub fn chain(
         .as_ref()
         .map(|(_, money, _)| money.instrument_id.clone())
         .unwrap_or_default();
+    let spot_missing = if spot.is_none() && !not_kept.is_empty() {
+        spot_not_kept(&not_kept)
+    } else {
+        String::new()
+    };
     Ok(json!({
         "underlying_instrument_id": underlying,
         "currency_instrument_id": currency,
         "spot": spot_json,
+        "spot_missing": spot_missing,
         "rate": rate.cloned(),
         "dividends": dividends,
         "dividends_dataset": dividends_dataset,
@@ -793,6 +813,18 @@ pub fn scenario(asker: &dyn Ask, job: &Job) -> Result<Option<Value>, Refused> {
     Ok(Some(scenario::set_json(&saved.row_key, version, &set)))
 }
 
+/// Why the underlying's price is missing where its datasets are served,
+/// not kept (ruling 734): each named, with its licence.
+fn spot_not_kept(datasets: &BTreeSet<String>) -> String {
+    let named: Vec<&str> = datasets.iter().map(String::as_str).collect();
+    format!(
+        "the underlying's price: {} {} served, not kept, by its licence, and served nothing \
+         within the read",
+        named.join(", "),
+        if named.len() == 1 { "is" } else { "are" }
+    )
+}
+
 /// The model a series' template version's calculation package binds for
 /// its exercise style and its underlying's asset class (ruling 576; W1.24,
 /// W12.2): the most specific binding that matches -- a style and a class
@@ -828,6 +860,11 @@ fn bound_model(
             format!("template {template_id} version {template_version}: no calculation package")
         })?;
     if package.model_bindings.is_empty() {
+        if package.model_id.trim().is_empty() {
+            return Err(format!(
+                "template {template_id} version {template_version}: its package binds no model"
+            ));
+        }
         return Ok(package.model_id.clone());
     }
     let style = v1::ExerciseStyle::from_str_name(exercise_style).map_or(0, |s| s as i32);
@@ -976,4 +1013,79 @@ pub fn rate(
         "interpolation": interpolation,
         "points": points,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The instrument store, answering every template read with `package`.
+    struct Templates(Option<v1::CalculationPackage>);
+
+    impl Ask for Templates {
+        fn ask(&self, _: &str, _: &str, _: Vec<u8>) -> Result<(String, Vec<u8>), String> {
+            Ok((
+                "meridian.v1.ReadTemplateReply".into(),
+                v1::ReadTemplateReply {
+                    template: Some(v1::SecurityTemplate {
+                        calculation_package: self.0.clone(),
+                        ..Default::default()
+                    }),
+                }
+                .encode_to_vec(),
+            ))
+        }
+    }
+
+    fn bound(package: Option<v1::CalculationPackage>) -> Result<String, String> {
+        bound_model(
+            &Templates(package),
+            "TPL-LISTED-OPTION",
+            "1",
+            "EXERCISE_STYLE_AMERICAN",
+            v1::AssetClass::Equity as i32,
+            &mut BTreeMap::new(),
+        )
+    }
+
+    #[test]
+    fn a_price_served_not_kept_is_named_with_its_licence() {
+        let one: BTreeSet<String> = ["tradier-1:live_delayed".to_string()].into();
+        assert_eq!(
+            spot_not_kept(&one),
+            "the underlying's price: tradier-1:live_delayed is served, not kept, by its \
+             licence, and served nothing within the read"
+        );
+        let two: BTreeSet<String> = ["a:x".to_string(), "b:y".to_string()].into();
+        assert!(spot_not_kept(&two).starts_with("the underlying's price: a:x, b:y are served"));
+    }
+
+    /// Found on dev 2026-10-26: a package held without its bindings named
+    /// an empty model, which the engine answered as an implementation it
+    /// does not have. Its own words now say why.
+    #[test]
+    fn a_package_with_neither_bindings_nor_a_model_binds_no_model() {
+        let said = bound(Some(v1::CalculationPackage::default())).unwrap_err();
+        assert_eq!(
+            said,
+            "template TPL-LISTED-OPTION version 1: its package binds no model"
+        );
+        let own = v1::CalculationPackage {
+            model_id: "quoted_price".into(),
+            model_version: 1,
+            ..Default::default()
+        };
+        assert_eq!(bound(Some(own)).unwrap(), "quoted_price");
+        let bindings = v1::CalculationPackage {
+            model_bindings: vec![v1::ModelBinding {
+                exercise_style: v1::ExerciseStyle::American as i32,
+                model_id: "american_binomial".into(),
+                model_version: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(bound(Some(bindings)).unwrap(), "american_binomial");
+        assert!(bound(None).unwrap_err().ends_with("no calculation package"));
+    }
 }

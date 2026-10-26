@@ -60,6 +60,12 @@ pub struct Query {
     /// Given, the store answers every version recorded by `as_of_ns`, and
     /// the read chooses the version in force by published time.
     pub published_as_of_ns: i64,
+    /// A read of the latest that narrows its rows no further before the
+    /// latest is chosen: the store may answer, of the rows it would, only
+    /// each one's latest per subject, dataset, kind, venue, length, asset
+    /// and point, and the latest of those not invalid, as the read chooses
+    /// them ([`crate::read`]). A store may answer every row still.
+    pub latest_only: bool,
 }
 
 /// What a batch did.

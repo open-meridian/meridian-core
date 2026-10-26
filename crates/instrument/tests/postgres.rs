@@ -841,6 +841,28 @@ fn the_one_id_state_is_kept_whole_and_each_replacement_numbered() {
         "a version is kept once"
     );
     assert!(store.templates().unwrap().contains(&template));
+    // A held copy that differs was decoded by an older build (found on dev
+    // 2026-10-26: a pod of the release before dropped a package's model
+    // bindings); the whole copy replaces it, and is then kept once.
+    let whole = meridian_domain::v1::SecurityTemplate {
+        calculation_package: Some(meridian_domain::v1::CalculationPackage {
+            model_bindings: vec![meridian_domain::v1::ModelBinding {
+                model_id: "black_scholes".into(),
+                model_version: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+        ..template.clone()
+    };
+    assert!(
+        store.keep_template(&whole, 7).unwrap(),
+        "a differing copy replaces the held one"
+    );
+    assert!(!store.keep_template(&whole, 8).unwrap());
+    let held = store.templates().unwrap();
+    assert!(held.contains(&whole));
+    assert!(!held.contains(&template));
 
     // A version no earlier run kept: the database outlives a run (test-store
     // runs again against the same one), and a counter alone starts again at

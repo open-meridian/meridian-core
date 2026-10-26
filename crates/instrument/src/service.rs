@@ -856,6 +856,25 @@ pub fn keep_reference(
             };
             let mut kept = false;
             for template in &reply.templates {
+                // A package that does not stand is never kept: one with
+                // neither bindings nor a model was decoded by a build that
+                // dropped its bindings, and would answer no model at all.
+                if let Some((field, words)) =
+                    template.calculation_package.as_ref().and_then(|package| {
+                        meridian_domain::template::refused(package)
+                            .into_iter()
+                            .next()
+                    })
+                {
+                    tracing::warn!(
+                        template_id = %template.template_id,
+                        template_version = %template.template_version,
+                        field,
+                        words,
+                        "a template version whose package does not stand was not kept"
+                    );
+                    continue;
+                }
                 match store.keep_template(template, now_ns) {
                     Ok(new) => kept |= new,
                     Err(failed) => return Handled::Ignored(failed.to_string()),
@@ -3642,5 +3661,98 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(held.instrument.unwrap().listing_venue_id, "VEN-XNYS");
+    }
+
+    /// A listed option's template version as the platform publishes it
+    /// (contract v28, ruling 576): its package binds its models, its own
+    /// model left empty.
+    fn listed_option_template() -> meridian_domain::v1::SecurityTemplate {
+        use meridian_domain::v1::{
+            CalculationPackage, CalculationTestCase, ExerciseStyle, ModelBinding, SecurityTemplate,
+        };
+        SecurityTemplate {
+            template_id: "TPL-LISTED-OPTION".into(),
+            template_version: "1".into(),
+            name: "listed option".into(),
+            asset_class: AssetClass::Equity as i32,
+            calculation_package: Some(CalculationPackage {
+                model_bindings: vec![ModelBinding {
+                    exercise_style: ExerciseStyle::American as i32,
+                    underlying_asset_class: AssetClass::Equity as i32,
+                    model_id: "american_binomial".into(),
+                    model_version: 1,
+                }],
+                model_id: String::new(),
+                model_version: 0,
+                pricing_inputs: vec!["quote".into()],
+                corporate_action_factors: String::new(),
+                calculation_version: "1".into(),
+                test_cases: vec![CalculationTestCase {
+                    name: "at the money".into(),
+                    inputs: "{}".into(),
+                    expected: "{}".into(),
+                }],
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn templates_pulled(templates: Vec<meridian_domain::v1::SecurityTemplate>) -> Envelope {
+        Envelope {
+            meta: None,
+            payload_type: "meridian.v1.PullTemplatesReply".into(),
+            payload: meridian_domain::v1::PullTemplatesReply { templates }.encode_to_vec(),
+        }
+    }
+
+    /// Found on dev 2026-10-26: during a rolling upgrade a pod of the
+    /// release before decoded v28's templates without their model bindings
+    /// (tag 7) and kept them, and a version held was never kept again, so
+    /// every series answered no implementation. The next hand-off replaces
+    /// the held copy with the whole one; a copy whose package does not
+    /// stand -- neither bindings nor a model -- is never kept.
+    #[test]
+    fn a_held_copy_without_bindings_is_replaced_by_the_whole_one_on_the_next_hand_off() {
+        let bus = bus();
+        let store = MemoryStore::new();
+        let writing: Writing = Arc::new(Mutex::new(()));
+        let whole = listed_option_template();
+        let mut stripped = whole.clone();
+        if let Some(package) = stripped.calculation_package.as_mut() {
+            package.model_bindings.clear();
+        }
+
+        // This build never keeps the stripped copy itself.
+        let handled = keep_reference(
+            &bus,
+            &store,
+            &writing,
+            &templates_pulled(vec![stripped.clone()]),
+            NOW,
+        );
+        assert_eq!(handled, Handled::Kept(false));
+        assert!(store.templates().unwrap().is_empty());
+
+        // The older build's copy, held; the next hand-off replaces it.
+        assert!(store.keep_template(&stripped, NOW).unwrap());
+        let handled = keep_reference(
+            &bus,
+            &store,
+            &writing,
+            &templates_pulled(vec![whole.clone()]),
+            NOW + 1,
+        );
+        assert_eq!(handled, Handled::Kept(true));
+        assert_eq!(store.templates().unwrap(), vec![whole.clone()]);
+
+        // The same copy again changes nothing.
+        let handled = keep_reference(
+            &bus,
+            &store,
+            &writing,
+            &templates_pulled(vec![whole]),
+            NOW + 2,
+        );
+        assert_eq!(handled, Handled::Kept(false));
     }
 }

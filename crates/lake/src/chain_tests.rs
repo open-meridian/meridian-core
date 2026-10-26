@@ -461,6 +461,81 @@ async fn chain_quotes_are_answered_only_to_a_read_asking_for_series() {
         .any(|q| q.meta.as_ref().unwrap().series_key == osi(OSI_CALL)));
 }
 
+/// The underlying's own quotes in a dataset of their own, before the
+/// chain's in the default order (alphabetical, no priority set).
+const LIVE: &str = "tradier-1:live";
+
+/// Found on dev 2026-10-26: the underlying's own quote in
+/// tradier:live_delayed hid every series quote in tradier:options_delayed,
+/// the default read taking the first dataset with any row for the subject.
+/// A read that asks for series chooses its source per series: one source
+/// per series, never mixed within one (the intent's Q4).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_default_read_of_a_chain_chooses_its_source_per_series() {
+    let h = harness();
+    let mut c = configuration();
+    let mut live = c.datasets[1].clone();
+    live.dataset = LIVE.into();
+    if let Some(declaration) = live.declaration.as_mut() {
+        declaration.key = "live".into();
+    }
+    c.datasets.push(live);
+    c.entitlements.push(DatasetEntitlement {
+        dataset: LIVE.into(),
+        instance: "signal-1".into(),
+        allowed: true,
+        ..Default::default()
+    });
+    h.lake.configured(&c);
+    let mut own_meta = meta("quote:AAPL", AAPL, vec![], "");
+    if let Some(source) = own_meta.as_mut().and_then(|m| m.source.as_mut()) {
+        source.dataset = LIVE.into();
+    }
+    let own = Quote {
+        meta: own_meta,
+        bid: usd("227.50"),
+        ask: usd("227.52"),
+        ..Default::default()
+    };
+    assert_eq!(
+        record(&h, "quotes", vec![Observation::Quote(own)]).unwrap(),
+        (1, 0, 0)
+    );
+    let chain = vec![
+        Observation::Quote(quote(OSI_CALL, "4.10", "4.20", NOW - HOUR)),
+        Observation::Quote(quote(OSI_PUT, "1.05", "1.10", NOW - HOUR)),
+    ];
+    assert_eq!(record(&h, "quotes", chain).unwrap(), (2, 0, 0));
+
+    let every = read_quotes(&h, vec![], true);
+    assert_eq!(every.len(), 3, "the underlying's quote and each series'");
+    let from = |quote: &Quote| {
+        quote
+            .meta
+            .as_ref()
+            .unwrap()
+            .source
+            .as_ref()
+            .unwrap()
+            .dataset
+            .clone()
+    };
+    for quote in &every {
+        let keyed = !quote.meta.as_ref().unwrap().series_key.is_empty();
+        assert_eq!(from(quote), if keyed { CHAIN } else { LIVE });
+    }
+    // A v27 reader of the underlying still hears its own quote alone.
+    let plain = read_quotes(&h, vec![], false);
+    assert_eq!(plain.len(), 1);
+    assert_eq!(from(&plain[0]), LIVE);
+    // One series by its key, beside the underlying's own.
+    let call = read_quotes(&h, osi(OSI_CALL), false);
+    assert_eq!(call.len(), 2);
+    assert!(call
+        .iter()
+        .any(|q| q.meta.as_ref().unwrap().series_key == osi(OSI_CALL) && from(q) == CHAIN));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_statistic_is_recorded_per_series_and_date_heard_and_read() {
     let h = harness();

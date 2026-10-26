@@ -352,23 +352,10 @@ async fn listings_of(
     subject: &str,
     members: &[PackMember],
 ) -> BTreeMap<String, PluginListing> {
-    let mut found: BTreeMap<String, PluginListing> = super::listings(
-        app,
-        subject,
-        ListRegistryPluginsRequest {
-            page_size: 200,
-            ..Default::default()
-        },
-    )
-    .await
-    .map(|reply| {
-        reply
-            .listings
-            .into_iter()
-            .map(|l| (l.listing.clone(), l))
-            .collect()
-    })
-    .unwrap_or_default();
+    let mut found: BTreeMap<String, PluginListing> = super::every_listing(app, subject)
+        .await
+        .map(|every| every.into_iter().map(|l| (l.listing.clone(), l)).collect())
+        .unwrap_or_default();
     for member in members {
         if found.contains_key(&member.listing) {
             continue;

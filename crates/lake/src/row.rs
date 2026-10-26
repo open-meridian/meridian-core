@@ -350,6 +350,14 @@ impl Observation {
         }
     }
 
+    /// What a read of the latest chooses per besides its subject,
+    /// dataset, kind, venue and length -- the row's asset and point -- as
+    /// one text, which the Postgres store keeps beside the row to choose
+    /// the latest in SQL.
+    pub fn latest_key(&self) -> String {
+        format!("{}\u{1f}{}", self.asset(), self.point())
+    }
+
     /// A bar's length; 0 for the other data types.
     pub fn interval_ns(&self) -> i64 {
         match self {

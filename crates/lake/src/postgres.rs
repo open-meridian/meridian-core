@@ -222,9 +222,10 @@ fn insert(tx: &mut Transaction<'_>, dataset: &str, row: &Observation) -> Result<
         "INSERT INTO lake_row
                 (dataset, sequence, data_type, row_key, version, subject, subjects, kind,
                  interval_ns, venue_id, valid_from_ns, valid_until_ns, business_date,
-                 recorded_at_ns, previous_sequence, unconverted, body, closed_reason)
+                 recorded_at_ns, previous_sequence, unconverted, body, closed_reason,
+                 latest_key, quality)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::text::date, $14, $15,
-                 $16, $17, $18)",
+                 $16, $17, $18, $19, $20)",
         &[
             &dataset,
             &(meta.sequence as i64),
@@ -244,10 +245,119 @@ fn insert(tx: &mut Transaction<'_>, dataset: &str, row: &Observation) -> Result<
             &!meta.unconverted.is_empty(),
             &row.encode(),
             &closed_reason(meta.closed_day.as_ref()),
+            &row.latest_key(),
+            &(meta.quality as i16),
         ],
     )
     .map_err(unavailable)?;
     Ok(())
+}
+
+/// A read of the latest, chosen in SQL (found on dev 2026-10-26): of the
+/// rows the read would load, each row key at its version in force, then per
+/// subject, dataset, kind, venue, length and `latest_key` the latest by
+/// valid time and sequence, and the latest of those not invalid -- its own
+/// state or an assessment by the cut-off (ruling 619) -- so the read's own
+/// choice, made again over these, is the one it makes over every row. A
+/// row without a `latest_key` is a key of its own.
+const LATEST: &str = "
+WITH candidates AS MATERIALIZED (
+    SELECT dataset, sequence, row_key, version, subject, kind, venue_id, interval_ns,
+           COALESCE(latest_key, 'row ' || sequence::text) AS latest_key,
+           valid_from_ns, COALESCE(quality, 0) AS quality
+      FROM lake_row
+     WHERE dataset = ANY($1) AND subjects && $2 AND data_type = $3
+       AND (cardinality($4::smallint[]) = 0 OR kind = ANY($4))
+       AND ($5::bigint = 0 OR interval_ns = $5)
+       AND recorded_at_ns <= $6
+       AND ($7::text IS NULL OR business_date = $7::text::date)
+       AND valid_from_ns >= $8 AND valid_from_ns < $9 AND valid_from_ns <= $10
+),
+in_force AS (
+    SELECT DISTINCT ON (dataset, row_key) *
+      FROM candidates
+     ORDER BY dataset, row_key, version DESC
+),
+judged AS (
+    SELECT f.*, (f.quality = 3 OR bad.sequence IS NOT NULL) AS invalid
+      FROM in_force f
+      LEFT JOIN (SELECT DISTINCT dataset, sequence FROM lake_quality_assessment
+                  WHERE dataset = ANY($1) AND state = 3 AND at_ns <= $6) AS bad
+        ON bad.dataset = f.dataset AND bad.sequence = f.sequence
+),
+chosen AS (
+    (SELECT DISTINCT ON (dataset, subject, kind, venue_id, interval_ns, latest_key)
+            dataset, sequence
+       FROM judged
+      ORDER BY dataset, subject, kind, venue_id, interval_ns, latest_key,
+               valid_from_ns DESC, sequence DESC)
+    UNION
+    (SELECT DISTINCT ON (dataset, subject, kind, venue_id, interval_ns, latest_key)
+            dataset, sequence
+       FROM judged
+      WHERE NOT invalid
+      ORDER BY dataset, subject, kind, venue_id, interval_ns, latest_key,
+               valid_from_ns DESC, sequence DESC)
+)
+SELECT r.body FROM lake_row r
+  JOIN chosen c ON r.dataset = c.dataset AND r.sequence = c.sequence
+ ORDER BY r.dataset, r.sequence";
+
+/// How many rows a backfill of `latest_key` and `quality` reads at a time.
+const BACKFILL_BATCH: i64 = 2000;
+
+/// Fill in `latest_key` and `quality` where a row has none (migration 4):
+/// read from its own body, batch by batch, each its own transaction, so a
+/// large lake is never locked whole. A row whose body does not read is
+/// passed over, a key of its own as before. Run by `migrate`, every time,
+/// so a row a release before this recorded during a rolling upgrade is
+/// filled in by the next.
+fn backfill_latest_keys(conn: &mut Connection) -> Result<u64> {
+    let mut after: (String, i64) = (String::new(), 0);
+    let mut filled = 0u64;
+    loop {
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        let rows = tx
+            .query(
+                "SELECT dataset, sequence, data_type, body FROM lake_row
+                  WHERE (dataset, sequence) > ($1, $2) AND latest_key IS NULL
+                  ORDER BY dataset, sequence
+                  LIMIT $3",
+                &[&after.0, &after.1, &BACKFILL_BATCH],
+            )
+            .map_err(unavailable)?;
+        let Some(last) = rows.last() else {
+            tx.commit().map_err(unavailable)?;
+            break;
+        };
+        after = (last.get(0), last.get(1));
+        let (mut datasets, mut sequences, mut keys, mut states) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for row in &rows {
+            let code: i16 = row.get(2);
+            let body: Vec<u8> = row.get(3);
+            let Some(observation) = crate::row::DataType::from_code(code)
+                .and_then(|data_type| Observation::decode(data_type, &body).ok())
+            else {
+                continue;
+            };
+            datasets.push(row.get::<_, String>(0));
+            sequences.push(row.get::<_, i64>(1));
+            keys.push(observation.latest_key());
+            states.push(observation.meta().quality as i16);
+        }
+        filled += tx
+            .execute(
+                "UPDATE lake_row r SET latest_key = f.latest_key, quality = f.quality
+                   FROM unnest($1::text[], $2::bigint[], $3::text[], $4::smallint[])
+                        AS f(dataset, sequence, latest_key, quality)
+                  WHERE r.dataset = f.dataset AND r.sequence = f.sequence",
+                &[&datasets, &sequences, &keys, &states],
+            )
+            .map_err(unavailable)?;
+        tx.commit().map_err(unavailable)?;
+    }
+    Ok(filled)
 }
 
 impl Store for PostgresStore {
@@ -405,16 +515,26 @@ impl Store for PostgresStore {
             ),
             When::After(_) => unreachable!("answered above"),
         };
+        // The latest chosen in SQL where the read lets it (found on dev
+        // 2026-10-26: every row a chain's dataset kept was loaded to choose
+        // a few hundred); never where every version is answered.
+        let latest = query.latest_only
+            && matches!(query.when, When::Latest { .. })
+            && !crate::store::every_version(query);
         let rows = tx
             .query(
-                "SELECT body FROM lake_row
+                if latest {
+                    LATEST
+                } else {
+                    "SELECT body FROM lake_row
                   WHERE dataset = ANY($1) AND subjects && $2 AND data_type = $3
                     AND (cardinality($4::smallint[]) = 0 OR kind = ANY($4))
                     AND ($5::bigint = 0 OR interval_ns = $5)
                     AND recorded_at_ns <= $6
                     AND ($7::text IS NULL OR business_date = $7::text::date)
                     AND valid_from_ns >= $8 AND valid_from_ns < $9 AND valid_from_ns <= $10
-                  ORDER BY dataset, sequence",
+                  ORDER BY dataset, sequence"
+                },
                 &[
                     &query.datasets,
                     &query.subjects,
@@ -998,6 +1118,10 @@ fn apply_migrations(conn: &mut Connection, clock: &dyn meridian_clock::Clock) ->
         tx.batch_execute(migration.sql).map_err(unavailable)?;
         migrations::record(&mut tx, migration, clock.now_ns())?;
         tx.commit().map_err(unavailable)?;
+    }
+    let filled = backfill_latest_keys(conn)?;
+    if filled > 0 {
+        tracing::info!(filled, "rows given the key their latest is chosen by");
     }
     Ok(())
 }

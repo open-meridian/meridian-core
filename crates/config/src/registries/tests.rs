@@ -767,3 +767,56 @@ async fn a_registry_this_deployment_does_not_take_is_refused_at_install() {
     // Empty takes every registry, as before.
     assert_eq!(hold(&platform).taken_refused("community"), None);
 }
+
+/// Found on dev 2026-10-26: a page of Browse's copy reached 1,445,337
+/// bytes, past the broker's 1 MiB, and was never sent. A page ends within
+/// its budget whatever its size asks; every listing is read once and in
+/// order by following the cursor; a listing past the budget is a page of
+/// its own.
+#[test]
+fn a_page_of_listings_ends_within_its_budget_and_the_cursor_reads_on() {
+    use prost::Message;
+    let listing = |n: usize, bytes: usize| PluginListing {
+        listing: format!("open-meridian/plugin-{n:02}"),
+        regions: vec!["x".repeat(bytes)],
+        ..Default::default()
+    };
+    let mut listings: Vec<PluginListing> = (0..10).map(|n| listing(n, 200 * 1024)).collect();
+    listings.insert(4, listing(99, 700 * 1024));
+    let total = listings.len();
+    let budget = LIST_PAGE_BUDGET;
+    let mut read = Vec::new();
+    let mut cursor = String::new();
+    let mut pages = 0;
+    loop {
+        let start: usize = cursor.parse().unwrap_or(0);
+        let (page, next) = page_of(listings.clone(), start, 200, budget);
+        assert!(!page.is_empty());
+        let reply = ListRegistryPluginsReply {
+            listings: page.clone(),
+            next_cursor: next.clone(),
+            catalogue_pulled_at_ns: 1,
+        };
+        assert!(
+            page.len() == 1 || reply.encoded_len() <= 512 * 1024,
+            "a page of {} is {} bytes",
+            page.len(),
+            reply.encoded_len()
+        );
+        read.extend(page.into_iter().map(|l| l.listing));
+        pages += 1;
+        if next.is_empty() {
+            break;
+        }
+        cursor = next;
+    }
+    let every: Vec<String> = listings.iter().map(|l| l.listing.clone()).collect();
+    assert_eq!(read, every, "each listing once, in order");
+    assert!(pages >= 6, "{pages} pages for {total} listings");
+    // A page size still caps a page, and small listings fill it.
+    let small: Vec<PluginListing> = (0..10).map(|n| listing(n, 10)).collect();
+    let (page, next) = page_of(small.clone(), 0, 4, budget);
+    assert_eq!((page.len(), next.as_str()), (4, "4"));
+    let (page, next) = page_of(small, 8, 4, budget);
+    assert_eq!((page.len(), next.as_str()), (2, ""));
+}

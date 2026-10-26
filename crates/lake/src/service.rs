@@ -231,6 +231,27 @@ pub const TRADES_LOGGED_EVERY: Duration = Duration::from_secs(60);
 /// How long the catalogue's launched versions are read again after.
 const VERSIONS_FOR_NS: i64 = 300 * 1_000_000_000;
 
+/// How long a read that asked a source for a dataset served, not kept,
+/// waits for the served answer (W10.7, "the lake answers the waiting
+/// reader"; ruling 734): within every reader's own read timeout.
+pub const SERVED_WAIT: Duration = Duration::from_secs(3);
+
+/// What a read waiting on a want of a dataset served, not kept, hears
+/// (ruling 734): the rows served for it, or the subjects declined.
+#[derive(Debug, Clone)]
+enum Heard {
+    Served(Vec<Observation>),
+    Declined(Vec<String>),
+}
+
+/// A read waiting on a want of a dataset served, not kept: its dataset,
+/// the subjects it asked, and what it hears.
+struct Waiting {
+    dataset: String,
+    subjects: BTreeSet<String>,
+    heard: std::sync::mpsc::Receiver<Heard>,
+}
+
 /// A want open, coalescing readers' identical asks.
 #[derive(Debug, Clone)]
 struct OpenWant {
@@ -267,6 +288,10 @@ pub struct Lake {
     pub(crate) clock: Arc<dyn Clock>,
     config: RwLock<DataConfig>,
     wants: Mutex<Wants>,
+    /// The reads waiting on each want of a dataset served, not kept (W10.7;
+    /// ruling 734), by want ID: what is served for the want is handed to
+    /// them, since the lake keeps none of it to read again.
+    waiting: Mutex<BTreeMap<String, Vec<std::sync::mpsc::Sender<Heard>>>>,
     /// What a source declined, by dataset, subject and the date or range its
     /// want asked (contract v19): its reason and when.
     declined: Mutex<read::Declined>,
@@ -371,6 +396,7 @@ impl Lake {
             clock,
             config: RwLock::new(config),
             wants: Mutex::new(Wants::default()),
+            waiting: Mutex::new(BTreeMap::new()),
             declined: Mutex::new(BTreeMap::new()),
             trades_recorded: std::sync::atomic::AtomicU64::new(0),
             held: Mutex::new(BTreeMap::new()),
@@ -1202,7 +1228,13 @@ impl Lake {
                     .get(want_id)
                     .map(|w| w.asked_by.iter().cloned().collect())
                     .unwrap_or_else(|| config.entitled(&dataset));
-                self.store.serve_unkept(&dataset, rows, &readers, now)
+                let served = self.store.serve_unkept(&dataset, rows, &readers, now);
+                // The reads waiting on the want hear what was served
+                // (W10.7; ruling 734): the lake keeps none of it.
+                if let Ok(done) = &served {
+                    self.hand_to_waiting(want_id, Heard::Served(done.rows.clone()));
+                }
+                served
             }
             .map_err(|failed| failed.to_string())?;
             reply.recorded += done.recorded;
@@ -1759,7 +1791,12 @@ impl Lake {
     /// W10.6, W10.7): the data plugin answers it by the identifiers the
     /// record carries, or declines it; only valuing a local line is
     /// refused, by the analytics component.
-    fn want(&self, asks: Vec<read::Ask>, reader: &Reader) {
+    ///
+    /// An ask of a dataset served, not kept, answers a [`Waiting`] where the
+    /// read may still hear its want served: the want published by this
+    /// read, or by another within [`SERVED_WAIT`] (ruling 734).
+    fn want(&self, asks: Vec<read::Ask>, reader: &Reader) -> Vec<Waiting> {
+        let mut waitings = Vec::new();
         let now = self.clock.now_ns();
         let config = self.config();
         let by = match reader {
@@ -1787,6 +1824,7 @@ impl Lake {
             );
             let mut wants = self.wants.lock().expect("wants poisoned");
             let existing = wants.by_key.get(&key).cloned();
+            let mut recent = false;
             let (want_id, publish) = match existing
                 .and_then(|id| wants.open.get_mut(&id).map(|w| (id, w)))
             {
@@ -1797,6 +1835,7 @@ impl Lake {
                     if again {
                         open.published_at_ns = now;
                     }
+                    recent = now - open.published_at_ns < SERVED_WAIT.as_nanos() as i64;
                     (id, again)
                 }
                 None => {
@@ -1841,6 +1880,22 @@ impl Lake {
             let event = wants.open.get(&want_id).map(|w| w.event.clone());
             drop(wants);
             let Some(event) = event else { continue };
+            // Served, not kept: the read waits on the want, listening before
+            // it is published, so what is served is never missed.
+            if !config.licence(&ask.dataset).kept && (publish || recent) {
+                let (tell, heard) = std::sync::mpsc::channel();
+                self.waiting
+                    .lock()
+                    .expect("waiting poisoned")
+                    .entry(want_id.clone())
+                    .or_default()
+                    .push(tell);
+                waitings.push(Waiting {
+                    dataset: ask.dataset.clone(),
+                    subjects: ask.subjects.iter().cloned().collect(),
+                    heard,
+                });
+            }
             if publish {
                 if let Err(failed) = self.bus.publish(
                     OBSERVATIONS_WANTED,
@@ -1866,6 +1921,55 @@ impl Lake {
                 }
             }
         }
+        waitings
+    }
+
+    /// What was served for a want, or declined of it, handed to the reads
+    /// waiting on it; a read that stopped waiting is let go.
+    fn hand_to_waiting(&self, want_id: &str, heard: Heard) {
+        if want_id.is_empty() {
+            return;
+        }
+        let mut waiting = self.waiting.lock().expect("waiting poisoned");
+        if let Some(reads) = waiting.get_mut(want_id) {
+            reads.retain(|read| read.send(heard.clone()).is_ok());
+            if reads.is_empty() {
+                waiting.remove(want_id);
+            }
+        }
+    }
+
+    /// Wait, at most [`SERVED_WAIT`], for what each want of a dataset
+    /// served, not kept, is served, by dataset: until every subject asked is
+    /// served or declined.
+    fn wait_for_served(&self, waitings: Vec<Waiting>) -> BTreeMap<String, Vec<Observation>> {
+        let until = std::time::Instant::now() + SERVED_WAIT;
+        let mut served: BTreeMap<String, Vec<Observation>> = BTreeMap::new();
+        for mut waiting in waitings {
+            while !waiting.subjects.is_empty() {
+                let left = until.saturating_duration_since(std::time::Instant::now());
+                match waiting.heard.recv_timeout(left) {
+                    Ok(Heard::Served(rows)) => {
+                        for row in &rows {
+                            for subject in row.subjects() {
+                                waiting.subjects.remove(&subject);
+                            }
+                        }
+                        served
+                            .entry(waiting.dataset.clone())
+                            .or_default()
+                            .extend(rows);
+                    }
+                    Ok(Heard::Declined(subjects)) => {
+                        for subject in subjects {
+                            waiting.subjects.remove(&subject);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        served
     }
 
     /// The standing wants no reader asked within their dataset's cadence
@@ -2240,24 +2344,40 @@ impl Lake {
                 .collect(),
             narrowed,
         };
-        let answered = read::answer(
-            self.store.as_ref(),
-            &read,
-            &Against {
-                config: &config,
-                priorities: &priorities,
-                declined: &declined,
-                aliases: &aliases,
-                now_ns: self.clock.now_ns(),
-            },
-        )?;
-        if offset == 0 && wants {
-            self.want(answered.asks.clone(), &reader);
-        }
+        let against = Against {
+            config: &config,
+            priorities: &priorities,
+            declined: &declined,
+            aliases: &aliases,
+            now_ns: self.clock.now_ns(),
+        };
+        let mut answered = read::answer(self.store.as_ref(), &read, &against)?;
+        // A dataset served, not kept (W10.7; ruling 734): the read that
+        // asked hears what is served within its wait; any other is told it
+        // is not kept, never asked forever.
+        let served = if offset == 0 && wants {
+            // A subject another dataset answered is not waited for.
+            let answering: BTreeSet<String> = answered
+                .rows
+                .iter()
+                .flat_map(|row| row.subjects())
+                .collect();
+            let waitings = self
+                .want(answered.asks.clone(), &reader)
+                .into_iter()
+                .filter_map(|mut waiting| {
+                    waiting.subjects.retain(|s| !answering.contains(s));
+                    (!waiting.subjects.is_empty()).then_some(waiting)
+                })
+                .collect();
+            self.wait_for_served(waitings)
+        } else {
+            BTreeMap::new()
+        };
+        read::with_served(&read, &against, &mut answered, served);
         // What a catch-up cannot answer, per partition it named (contract
         // v19): a dataset not read, one not kept, or rows since the
         // watermark that retention removed.
-        let mut answered = answered;
         if let When::After(watermark) = &read.when {
             let readable = config.readable(&reader, read.data_type);
             let heads = self.store.heads().map_err(|failed| failed.to_string())?;
@@ -2801,6 +2921,7 @@ impl Lake {
                             },
                             as_of_ns: now,
                             published_as_of_ns: 0,
+                            latest_only: false,
                         })
                         .map_err(|failed| failed.to_string())?;
                     let mut found = false;
@@ -3398,6 +3519,7 @@ impl Lake {
             &instance,
             now,
         );
+        self.hand_to_waiting(&request.want_id, Heard::Declined(subjects));
         Ok(DeclineWantReply {})
     }
 

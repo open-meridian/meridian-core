@@ -39,6 +39,45 @@ use serde_json::Value;
 use crate::store::{HeldCatalogue, Store};
 use verify::PlatformKeys;
 
+/// About 512 KiB, as the plugin catalogue's page (ruling 696): a page of
+/// Browse's copy ends there whatever `page_size` says, less room for the
+/// cursor and the envelope. Each listing carries every version with its
+/// declaration, and on dev, 2026-10-26, a page of them reached 1,445,337
+/// bytes, past the broker's 1 MiB, so the answer was never sent.
+const LIST_PAGE_BUDGET: usize = 512 * 1024 - 4 * 1024;
+
+/// The listings from `start`, at most `size` and within `budget` bytes
+/// encoded -- a listing larger than that a page of its own -- and where the
+/// next page starts, empty after the last.
+fn page_of(
+    listings: Vec<PluginListing>,
+    start: usize,
+    size: usize,
+    budget: usize,
+) -> (Vec<PluginListing>, String) {
+    use prost::Message;
+    let total = listings.len();
+    let mut page = Vec::new();
+    let mut used = 0;
+    for listing in listings.into_iter().skip(start).take(size) {
+        // Each as a repeated field's entry: its tag and length besides.
+        let len = listing.encoded_len();
+        let bytes = len + prost::length_delimiter_len(len) + 1;
+        if !page.is_empty() && used + bytes > budget {
+            break;
+        }
+        used += bytes;
+        page.push(listing);
+    }
+    let next = start + page.len();
+    let next_cursor = if next < total {
+        next.to_string()
+    } else {
+        String::new()
+    };
+    (page, next_cursor)
+}
+
 /// A future the conductor's binary answers.
 pub type Fut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -392,14 +431,9 @@ impl Hold {
             .unwrap_or(50)
             .min(200);
         let start: usize = request.cursor.parse().unwrap_or(0);
-        let next = start + size;
-        let next_cursor = if next < listings.len() {
-            next.to_string()
-        } else {
-            String::new()
-        };
+        let (listings, next_cursor) = page_of(listings, start, size, LIST_PAGE_BUDGET);
         Ok(ListRegistryPluginsReply {
-            listings: listings.into_iter().skip(start).take(size).collect(),
+            listings,
             next_cursor,
             catalogue_pulled_at_ns: held.pulled_at_ns,
         })

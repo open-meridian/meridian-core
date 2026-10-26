@@ -109,6 +109,7 @@ fn a_batch_is_numbered_restated_read_as_of_and_retention_recorded() {
         when: When::BusinessDate(Date::parse("2026-10-07").unwrap()),
         as_of_ns,
         published_as_of_ns: 0,
+        latest_only: false,
     };
     let now = store.read(&query(0)).unwrap();
     assert_eq!(now.len(), 1);
@@ -268,6 +269,7 @@ fn trades_recorded_after_a_watermark_are_read_whatever_their_valid_time() {
             when: When::After([(dataset.clone(), 2)].into()),
             as_of_ns: 0,
             published_as_of_ns: 0,
+            latest_only: false,
         })
         .unwrap();
     assert_eq!(after.len(), 1);
@@ -340,6 +342,7 @@ fn an_outcomes_every_version_is_read_after_a_watermark() {
         when,
         as_of_ns,
         published_as_of_ns: 0,
+        latest_only: false,
     };
     let versions = |rows: Vec<Observation>| -> Vec<u64> {
         rows.iter().map(|row| row.meta().version).collect()
@@ -428,6 +431,7 @@ fn a_closed_day_flag_is_counted_and_amended_beside_its_row() {
         when: When::BusinessDate(Date::parse("2026-10-13").unwrap()),
         as_of_ns,
         published_as_of_ns: 0,
+        latest_only: false,
     };
     assert!(store.read(&query(1_500)).unwrap()[0]
         .meta()
@@ -482,6 +486,7 @@ fn an_assessment_is_kept_beside_its_row_and_raises_its_effective_state() {
         when: When::BusinessDate(Date::parse("2026-10-13").unwrap()),
         as_of_ns,
         published_as_of_ns: 0,
+        latest_only: false,
     };
     let then = store.read(&query(1_500)).unwrap();
     assert_eq!(then[0].meta().quality, QualityState::Suspicious as i32);
@@ -509,4 +514,208 @@ fn an_assessment_is_kept_beside_its_row_and_raises_its_effective_state() {
             .quality,
         QualityState::Invalid as i32
     );
+}
+
+/// A chain row: a trade of the underlying keyed by `series` (none for the
+/// underlying's own), at `valid_from_ns`.
+fn chain_trade(
+    dataset: &str,
+    row_key: &str,
+    subject: &str,
+    series: &str,
+    valid_from_ns: i64,
+) -> Observation {
+    let mut row = trade(dataset, row_key, subject, valid_from_ns);
+    if !series.is_empty() {
+        row.meta_mut().series_key = vec![meridian_domain::v1::Identifier {
+            scheme: "occ_osi".into(),
+            value: series.into(),
+            ..Default::default()
+        }];
+    }
+    row
+}
+
+fn latest_query(dataset: &str, subject: &str, latest_only: bool) -> Query {
+    Query {
+        datasets: vec![dataset.to_string()],
+        subjects: vec![subject.to_string()],
+        data_type: DataType::Trade,
+        kinds: vec![],
+        interval_ns: 0,
+        when: When::Latest { at_ns: 0 },
+        as_of_ns: 0,
+        published_as_of_ns: 0,
+        latest_only,
+    }
+}
+
+fn keys_of(rows: &[Observation]) -> Vec<String> {
+    let mut keys: Vec<String> = rows.iter().map(|r| r.meta().row_key.clone()).collect();
+    keys.sort();
+    keys
+}
+
+/// Found on dev 2026-10-26: a read of the latest loaded every row its
+/// datasets kept for the subject -- a chain's quotes, 81,720 rows in two
+/// hours -- and chose the latest in memory. Chosen in SQL: each row key at
+/// its version in force, then per series (and asset, venue, kind) the latest
+/// and the latest not invalid, by its own state or an assessment, so the
+/// read's choice over these is its choice over every row. A row without the
+/// key it is chosen by is a key of its own, and `migrate` fills it in.
+#[test]
+fn a_read_of_the_latest_is_chosen_in_sql_per_series_keeping_the_last_valid_row() {
+    use meridian_domain::v1::QualityState;
+    use meridian_lake::store::Assessment;
+    let store = store();
+    let dataset = unique("tradier-1:options");
+    let subject = unique("INS-UNDERLYING");
+    let mut invalid = chain_trade(&dataset, "a3", &subject, "A", 30);
+    invalid.meta_mut().quality = QualityState::Invalid as i32;
+    let rows = vec![
+        chain_trade(&dataset, "t1", &subject, "", 10),
+        chain_trade(&dataset, "t2", &subject, "", 20),
+        chain_trade(&dataset, "a1", &subject, "A", 10),
+        chain_trade(&dataset, "a2", &subject, "A", 20),
+        invalid,
+        chain_trade(&dataset, "r", &subject, "A", 40),
+        chain_trade(&dataset, "b1", &subject, "B", 10),
+        chain_trade(&dataset, "b2", &subject, "B", 20),
+    ];
+    let done = store.record(&dataset, rows, 1_000).unwrap();
+    assert_eq!(done.recorded, 8);
+    // `r` restated to an earlier time: its version in force is no latest.
+    let restated = store
+        .record(
+            &dataset,
+            vec![chain_trade(&dataset, "r", &subject, "A", 5)],
+            1_100,
+        )
+        .unwrap();
+    assert_eq!(restated.restated, 1);
+    let b2 = done
+        .rows
+        .iter()
+        .find(|r| r.meta().row_key == "b2")
+        .unwrap()
+        .meta()
+        .sequence;
+    store
+        .assess(&[Assessment {
+            dataset: dataset.clone(),
+            sequence: b2,
+            row_key: "b2".into(),
+            version: 1,
+            state: QualityState::Invalid as i32,
+            reasons: vec![],
+            by_instance: "signal-1".into(),
+            at_ns: 1_200,
+        }])
+        .unwrap();
+
+    let every = store
+        .read(&latest_query(&dataset, &subject, false))
+        .unwrap();
+    assert_eq!(
+        keys_of(&every),
+        vec!["a1", "a2", "a3", "b1", "b2", "r", "t1", "t2"],
+        "every row key at its version in force"
+    );
+    let chosen = store.read(&latest_query(&dataset, &subject, true)).unwrap();
+    assert_eq!(
+        keys_of(&chosen),
+        vec!["a2", "a3", "b1", "b2", "t2"],
+        "per series the latest, and the latest not invalid"
+    );
+    let state = |key: &str| {
+        chosen
+            .iter()
+            .find(|r| r.meta().row_key == key)
+            .unwrap()
+            .meta()
+            .quality
+    };
+    assert_eq!(state("b2"), QualityState::Invalid as i32, "as assessed");
+    assert_eq!(state("a3"), QualityState::Invalid as i32, "as recorded");
+    // As of before the restatement and the assessment: r at its first
+    // version is series A's latest and valid, and b2 stood.
+    let mut before = latest_query(&dataset, &subject, true);
+    before.as_of_ns = 1_050;
+    assert_eq!(
+        keys_of(&store.read(&before).unwrap()),
+        vec!["b2", "r", "t2"],
+        "r as recorded first, b2 not yet assessed"
+    );
+
+    // Rows recorded without the key (before migration 4, or by the release
+    // before during a rolling upgrade): each a key of its own, then filled
+    // in by the next migrate.
+    let url = std::env::var("MERIDIAN_TEST_DATABASE_URL").unwrap();
+    let mut raw = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    raw.execute(
+        "UPDATE lake_row SET latest_key = NULL, quality = NULL WHERE dataset = $1",
+        &[&dataset],
+    )
+    .unwrap();
+    let unkeyed = store.read(&latest_query(&dataset, &subject, true)).unwrap();
+    assert_eq!(keys_of(&unkeyed), keys_of(&every), "every row, as before");
+    store.migrate(&SystemClock).unwrap();
+    let missing: i64 = raw
+        .query_one(
+            "SELECT count(*) FROM lake_row WHERE dataset = $1 AND latest_key IS NULL",
+            &[&dataset],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(missing, 0, "filled in by migrate");
+    let filled = store.read(&latest_query(&dataset, &subject, true)).unwrap();
+    assert_eq!(keys_of(&filled), keys_of(&chosen));
+}
+
+/// The bench behind the fix: a chain of 200 series quoted 100 times each,
+/// read for the latest both ways. Prints what each loaded and how long it
+/// took; asserts the SQL choice loads one row per series.
+#[test]
+fn a_chains_latest_loads_one_row_per_series() {
+    let store = store();
+    let dataset = unique("tradier-1:options");
+    let subject = unique("INS-UNDERLYING");
+    let (series, times) = (200, 100);
+    for time in 0..times {
+        let batch: Vec<Observation> = (0..series)
+            .map(|s| {
+                chain_trade(
+                    &dataset,
+                    &format!("S{s:03}:q:{time}"),
+                    &subject,
+                    &format!("S{s:03}"),
+                    1 + time as i64,
+                )
+            })
+            .collect();
+        store.record(&dataset, batch, 1_000 + time as i64).unwrap();
+    }
+    let size = |rows: &[Observation]| rows.iter().map(|r| r.encode().len()).sum::<usize>();
+    let started = std::time::Instant::now();
+    let every = store
+        .read(&latest_query(&dataset, &subject, false))
+        .unwrap();
+    let every_took = started.elapsed();
+    let started = std::time::Instant::now();
+    let chosen = store.read(&latest_query(&dataset, &subject, true)).unwrap();
+    let chosen_took = started.elapsed();
+    eprintln!(
+        "bench: every row {} rows, {} bytes, {:?}; chosen in SQL {} rows, {} bytes, {:?}",
+        every.len(),
+        size(&every),
+        every_took,
+        chosen.len(),
+        size(&chosen),
+        chosen_took
+    );
+    assert_eq!(every.len(), series * times);
+    assert_eq!(chosen.len(), series);
+    assert!(chosen
+        .iter()
+        .all(|row| row.meta().valid_from_ns == times as i64));
 }
