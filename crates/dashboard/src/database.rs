@@ -145,7 +145,7 @@ CREATE TABLE IF NOT EXISTS dashboard_schema_migration (
 )";
 
 /// Each migration this release carries, as the upgrade preflight reads
-/// them: its version, name and SQL.
+/// them (H1): its version, name and SQL.
 pub fn migrations() -> Vec<(i64, &'static str, &'static str)> {
     MIGRATIONS
         .iter()

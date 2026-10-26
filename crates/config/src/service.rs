@@ -1289,7 +1289,7 @@ pub fn serve(
 /// for a test to drive without waiting for the hourly one.
 /// The dashboard's AccessRecords as the store answers them from `snapshot`
 /// (decisions/015): what the conductor serves on the bus, and what the
-/// upgrade preflight measures against the broker's payload limit.
+/// upgrade preflight measures against the broker's 1 MiB payload limit.
 pub fn access_records_of(snapshot: Snapshot, now_ns: i64) -> meridian_domain::v1::AccessRecords {
     // Each connectivity plugin's link and each ems's map (W11.21,
     // W11.22, contract v22), for the dashboard's pages and its read
