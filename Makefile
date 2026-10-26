@@ -1955,9 +1955,16 @@ chart-check:
 		|| { echo "chart-check FAILED: a sidecar pod is not named under the plugins' one Service, so the dashboard cannot reach it" >&2; exit 1; }; \
 	[ "$$(echo "$$rendered" | grep -c '^kind: NetworkPolicy$$')" = "$$($(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check 2>/dev/null | grep -c '^kind: NetworkPolicy$$')" ] \
 		|| { echo "chart-check FAILED: a plugin brought its own NetworkPolicy; every plugin shares one, so the launcher never makes one" >&2; exit 1; }
+	@# The one exception is the upgrade preflight (H1, ruling 586), whose
+	@# purpose is to stop an upgrade: before an upgrade only, never on an
+	@# install, and finishing at once where no database is configured yet.
 	@$(HELM) template check deploy/chart $(CHART_VALUES) 2>/dev/null \
-		| awk '/^kind: Job$$/{j=1} j&&/helm.sh\/hook/{print} /^---/{j=0}' | grep -q 'pre-install\|pre-upgrade\|post-install' \
+		| awk '/^kind: Job$$/{j=1} j&&/^  name: .*-preflight$$/{j=0} j&&/helm.sh\/hook/{print} /^---/{j=0}' | grep -q 'pre-install\|pre-upgrade\|post-install' \
 		&& { echo "chart-check FAILED: a Job runs as a Helm hook. A hook must finish before the dashboard exists, and on a fresh install the wizard is what configures the database it would wait for" >&2; exit 1; }; \
+	$(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check 2>/dev/null \
+		| awk '/^---/{p=0} /^  name: check-meridian-runtime-preflight$$/{p=1} p&&/"helm.sh\/hook":/{print}' \
+		| grep -qx '    "helm.sh/hook": pre-upgrade' \
+		|| { echo "chart-check FAILED: the upgrade preflight is not a pre-upgrade hook alone: it must run before every upgrade and never on an install" >&2; exit 1; }; \
 	true
 	@# Upgrades leave nothing behind to pile up (task kernel/upgrading-a-
 	@# deployment-in-place): four upgrades of one deployment left 26 old

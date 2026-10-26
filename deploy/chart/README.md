@@ -187,5 +187,7 @@ and a blocked check stops `helm upgrade` -- and `meridian upgrade-deployment`
 
 It changes nothing: its database sessions are read-only, it holds no RBAC and
 calls nothing on the bus, and its report names stores, sizes and counts, never
-an account or a person. The last line of its log is the report as JSON, kept
-until the next upgrade: `kubectl logs job/<release>-meridian-runtime-preflight`.
+an account or a person. The last line of its log is the report as JSON; a
+blocked run's Job is kept until the next upgrade, so why it stopped can be
+read: `kubectl logs job/<release>-meridian-runtime-preflight`. Run the same
+checks by hand from the release's image with `meridian-conductor preflight`.

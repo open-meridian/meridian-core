@@ -11,8 +11,9 @@
   database that does not answer -- fails the hook, which stops the upgrade
   with nothing changed: `helm upgrade`, `meridian upgrade-deployment` and a
   GitOps tool honouring hooks alike. A warning passes and is said. Its report
-  is one JSON object, the last line of its log, kept until the next upgrade
-  (before-hook-creation) so it can be read afterwards.
+  is one JSON object, the last line of its log: a blocked run's Job stays
+  until the next upgrade's hook replaces it, so why it stopped can be read;
+  one that passed goes when it succeeds, as every hook here does.
 
   Never on install: a fresh install has nothing to check, and its database is
   not configured until the wizard writes it.
@@ -35,9 +36,9 @@ metadata:
   annotations:
     "helm.sh/hook": pre-upgrade
     "helm.sh/hook-weight": "10"
-    # Kept until the next upgrade's hook replaces it, so its report can be
-    # read; removed a day after it finishes either way, as every Job here.
-    "helm.sh/hook-delete-policy": before-hook-creation
+    # Gone once it passes; a blocked one kept until the next upgrade's hook
+    # replaces it, or a day after it finished, so its report can be read.
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
 spec:
   backoffLimit: 0
   # A check that cannot finish in five minutes is not a check: the upgrade
