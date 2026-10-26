@@ -901,7 +901,7 @@ def main():
     page = ada.get(dash("/admin"))
     linked_to_all = permission_of(page, "all-plugins-admin")
     check(linked_to_all is not None, "the claim linked her group to All plugins (admin)")
-    administer(ada, "/admin/permissions/withdraw", {"permission_id": linked_to_all or ""})
+    administer(ada, "/admin/permissions/withdraw", {"permission_id": linked_to_all or "", "note": "the plugin no longer reaches every account"})
     offered = buttons(ada)
     check(offered == ["Open", "View"], f"her home offers Open and View, and no Manage: {offered}")
     check(session_at(ada, "admin")[0] is None, "a Manage session is refused")

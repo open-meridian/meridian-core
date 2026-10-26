@@ -67,6 +67,15 @@ narrowed as the plan's tests ask, through `/mcp` alone:
    reaches the launcher the harness does not have; with its provenance
    taken out of that registry (registry/tamper.py) the next is refused by
    the verification at launch, naming the provenance.
+8b. A starter pack (W8.18, W8.19; v28): Browse's "Starter packs" view
+   and the agent's reads list it, its install a person's while agents are
+   at may not; the deployment admin installs it through its sheet's review
+   with every member ticked -- a name not a member refused first -- and the
+   job installs stand-in-rates, its install record naming the pack, fails
+   the revoked signer's member past it, and leaves the stand-in installed
+   already alone; the pack page is the checklist, with Retry for the failed;
+   Update all tries the stand-in's newest, its tampered layer failing on the
+   record; Remove pack removes the record and nothing else.
 9. No tool list read in the run holds an access change, and no answer
    carries the secret's value; `store moves` prints each change its own
    record, naming the person, the delegation, the client and the note.
@@ -106,6 +115,12 @@ STAND_IN = "open-meridian/stand-in"
 # core-form would read as a field.
 PLUGINS = "/admin/plugins/versions"
 INSTALL = "/admin/plugins/registry/install"
+# v28 (W8.18, W8.19): the stand-in's starter pack and its clean member.
+PACK = "open-meridian/stand-in-desk"
+RATES = "open-meridian/stand-in-rates"
+PACK_PAGE = f"/admin/plugins/packs/{PACK}"
+PACK_READS = ["dashboard__list_registry_packs", "dashboard__read_registry_pack",
+              "dashboard__read_pack"]
 REGISTRY_READS = ["dashboard__search_registry_plugins", "dashboard__read_registry_plugin",
                   "dashboard__read_registries"]
 INSTANCE = "area"
@@ -431,7 +446,8 @@ def run():
     must("pulled" in said, f"step 6, the catalogue pulled on the Registries tab: {said}")
     found = call(*as_admin, "dashboard__search_registry_plugins", {}, "unchanged")["data"]
     names = sorted(line["listing"] for line in found["listings"])
-    must(names == [STAND_IN, "other-org/revoked"], f"step 6, Browse lists both listings: {names}")
+    must(names == sorted([STAND_IN, RATES, "other-org/revoked"]),
+         f"step 6, Browse lists the three listings: {names}")
     must("notice" not in found and found.get("terms_url", "").endswith("#plugins-and-registries"),
          f"step 6, the Terms' address beside them, no notice: {list(found)}")
     listing = call(*as_admin, "dashboard__read_registry_plugin", {"listing": STAND_IN},
@@ -513,6 +529,66 @@ def run():
          and "provenance" in refused.get("detail", ""),
          f"step 8, the launch refused by its verification again, naming the provenance: {refused}")
 
+    # 8b. A starter pack, installed member by member as a job (v28).
+    listed = tools(*as_admin)
+    for name in PACK_READS:
+        must(name in listed, f"step 8b, {name} is listed to a deployment admin: {listed}")
+    for name in ["dashboard__install_pack", "dashboard__update_pack", "dashboard__remove_pack"]:
+        must(name not in listed, f"step 8b, {name} is a person's until the levels loosen it: {listed}")
+    runner("core-page", f"{PLUGINS}?tab=browse&view=packs", "--expect", "Stand-in desk",
+           "--expect", "Not installed")
+    packs = call(*as_admin, "dashboard__list_registry_packs", {}, "unchanged")["data"]["packs"]
+    must([p["pack"] for p in packs] == [PACK] and packs[0]["state"] == "Not installed",
+         f"step 8b, the agent lists the one pack, not installed: {packs}")
+    sheet = call(*as_admin, "dashboard__read_registry_pack", {"pack": PACK}, "unchanged")["data"]
+    by_member = {m["listing"]: m for m in sheet["members"]}
+    must(by_member[RATES]["selection"] == "preselected" and by_member[RATES]["version"] == "0.1.0"
+         and by_member[STAND_IN]["selection"] == "choose"
+         and by_member[STAND_IN]["state"] == "installed",
+         f"step 8b, the sheet's members: rates preselected at 0.1.0, the stand-in to choose and "
+         f"installed already: {sheet}")
+    review = f"{PACK_PAGE}/install?step=2"
+    runner("core-page", review, "--expect", "accepted on Data sources",
+           "--expect", 'name="notice" value="read"')
+    runner("core-form", PACK_PAGE + "/install", "/admin/plugins/packs/install", f"pack={PACK}", "revision=1",
+           f"member={RATES}", "member=open-meridian/elsewhere", "notice=read",
+           "note=Not a member.", "--expect-refused", "not a member")
+    said = runner("core-form", PACK_PAGE + "/install", "/admin/plugins/packs/install", f"pack={PACK}", "revision=1",
+                  f"member={RATES}", "member=other-org/revoked", f"member={STAND_IN}",
+                  "notice=read", "note=The stand-in desk.")
+    must("Installing 2 members" in said, f"step 8b, the job installs the two not installed: {said}")
+    status = {}
+    for _ in range(60):
+        status = call(*as_admin, "dashboard__read_pack", {"pack": PACK}, "unchanged")["data"]
+        if not any(m["state"] == "installing" for m in status["members"]):
+            break
+        time.sleep(1)
+    members = {m["listing"]: m for m in status["members"]}
+    must(status["installed_revision"] == 1 and members[RATES]["state"] == "installed"
+         and members[RATES]["installed_version"] == "0.1.0"
+         and members[RATES]["setup"] == "Launch to connect",
+         f"step 8b, stand-in-rates installed, to launch from the checklist: {status}")
+    must(members["other-org/revoked"]["state"] == "failed"
+         and members["other-org/revoked"]["reason"].startswith("verification failed: the signing key"),
+         f"step 8b, the revoked signer's member failed, the job going on past it: {status}")
+    must(members[STAND_IN]["state"] == "installed" and members[STAND_IN]["installed_version"] == "1.5.0"
+         and members[STAND_IN]["reason"] == "Installed 1.5.0; 1.6.0 offered",
+         f"step 8b, the stand-in installed already left alone: {status}")
+    runner("core-page", f"{PACK_PAGE}?tab=data", "--expect", "Retry", "--expect", "Launch")
+    catalogue = call(*as_admin, "dashboard__read_plugin_catalogue", {}, "unchanged")["data"]
+    must(not [launch for launch in catalogue["launches"] if launch.get("name") == RATES],
+         f"step 8b, install launched nothing: {catalogue['launches']}")
+    said = runner("core-form", PACK_PAGE + "/update", "/admin/plugins/packs/update", f"pack={PACK}",
+                  "note=Every member to its own latest.")
+    must("Updated" in said, f"step 8b, Update all: {said}")
+    said = runner("core-form", PACK_PAGE + "/remove", "/admin/plugins/packs/remove", f"pack={PACK}",
+                  "note=The desk moves to a custom set.")
+    must("every member stays installed" in said, f"step 8b, Remove pack: {said}")
+    after = call(*as_admin, "dashboard__read_pack", {"pack": PACK}, "unchanged")["data"]
+    must(after["installed_revision"] == 0
+         and {m["listing"]: m["state"] for m in after["members"]}[RATES] == "installed",
+         f"step 8b, the record removed, every member left installed: {after}")
+
     # 9. No access change listed, no secret answered, each change its record.
     for names in LISTS:
         for name in names:
@@ -545,6 +621,18 @@ def run():
         "Not until the bucket is in place."]),
          f"step 9, each archive change its own record: {archives}")
     must(ben, "Ben's delegation")
+    # v28 (W8.18, W8.19): the member's install names its pack; the pack's
+    # three records, each naming the person and why.
+    must(f"install|{RATES}|0.1.0|{PACK}|local|harness|||The stand-in desk." in store,
+         f"step 9, the member's install record names the pack: {store}")
+    must(f"install|{STAND_IN}|1.4.0||local|harness|||The stand-in, from the community registry."
+         in store, f"step 9, an install of one listing names no pack: {store}")
+    packs_kept = [line for line in store if line.startswith(f"pack|{PACK}|")]
+    must(packs_kept == sorted([
+        f"pack|{PACK}|pack_installed|1|local|harness|||The stand-in desk.",
+        f"pack|{PACK}|pack_updated|1|local|harness|||Every member to its own latest.",
+        f"pack|{PACK}|pack_removed|1|local|harness|||The desk moves to a custom set."]),
+         f"step 9, each change to the pack's record its own record: {packs_kept}")
 
     took = int(time.time() - started)
     print(f"e2e-plugin-area OK in {took}s: on the plugin harness, an edge plugin holding custody "
@@ -563,7 +651,10 @@ def run():
           "platform, the catalogue pulled, a version installed by digest and verified, a tampered "
           "layer, a pulled version and a revoked signer refused, the documentation read from the "
           "verified image with a shape withheld and each version keeping its own, and a launch "
-          "verified again and refused once its provenance left the deployment's registry")
+          "verified again and refused once its provenance left the deployment's registry; and a "
+          "starter pack read by Browse and the agent, installed through its sheet member by member "
+          "as a job past a failed member, the one installed already left alone, its checklist, "
+          "Update all and Remove pack, each its own record, the member's install naming the pack")
 
 
 def main():

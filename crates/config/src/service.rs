@@ -103,6 +103,15 @@ pub const READ_DEPLOYMENT_TIME_ZONE: &str = "platform.config.query.read-deployme
 // Contract v27 (W6.36; ruling 483): the deployment's FX pivot currencies.
 pub const SET_FX_PIVOT_CURRENCIES: &str = "platform.config.command.set-fx-pivot-currencies";
 pub const READ_FX_PIVOT_CURRENCIES: &str = "platform.config.query.read-fx-pivot-currencies";
+/// Contract v28 (W6.37; rulings 561 and 589): the series request rule.
+pub const SET_SERIES_REQUEST_RULE: &str = "platform.config.command.set-series-request-rule";
+pub const READ_SERIES_REQUEST_RULE: &str = "platform.config.query.read-series-request-rule";
+/// Contract v28 (W6.38; rulings 515, 517, 600): the stale-reference actions
+/// the deployment permits.
+pub const SET_STALE_REFERENCE_ACTIONS_PERMITTED: &str =
+    "platform.config.command.set-stale-reference-actions-permitted";
+pub const READ_STALE_REFERENCE_ACTIONS_PERMITTED: &str =
+    "platform.config.query.read-stale-reference-actions-permitted";
 /// The most pivots a deployment orders (W6.36).
 pub const MOST_PIVOTS: usize = 4;
 /// W12.6 (contract v26; ruling 285): the analytics routing table, held here.
@@ -503,6 +512,55 @@ pub fn fx_pivot_setting(
         fx_pivot_currencies: held.fx_pivot_currencies,
         changed_at_ns: held.changed_at_ns,
         changed_by: held.changed_by,
+    }
+}
+
+/// The series request rule in force (W6.37; 589): the latest change's, or
+/// never set, the default -- orders on, standing wants off, 500 a day --
+/// with no change.
+pub fn series_request_rule(
+    held: Option<crate::store::DeploymentSettingChange>,
+) -> meridian_domain::v1::SeriesRequestRule {
+    match held {
+        Some(change) => {
+            let rule = meridian_domain::v1::SeriesRequestRule::decode(&change.value[..])
+                .unwrap_or_else(|_| default_series_request_rule());
+            meridian_domain::v1::SeriesRequestRule {
+                changed_at_ns: change.changed_at_ns,
+                changed_by: change.changed_by,
+                ..rule
+            }
+        }
+        None => default_series_request_rule(),
+    }
+}
+
+/// The stale-reference actions permitted in force (W6.38): the latest
+/// change's, or never set, refuse only, with no change.
+pub fn stale_reference_actions_permitted(
+    held: Option<crate::store::DeploymentSettingChange>,
+) -> meridian_domain::v1::StaleReferenceActionsPermittedSetting {
+    match held {
+        Some(change) => meridian_domain::v1::StaleReferenceActionsPermittedSetting {
+            warn_permitted: meridian_domain::v1::StaleReferenceActionsPermittedSetting::decode(
+                &change.value[..],
+            )
+            .map(|setting| setting.warn_permitted)
+            .unwrap_or(false),
+            changed_at_ns: change.changed_at_ns,
+            changed_by: change.changed_by,
+        },
+        None => Default::default(),
+    }
+}
+
+fn default_series_request_rule() -> meridian_domain::v1::SeriesRequestRule {
+    meridian_domain::v1::SeriesRequestRule {
+        orders: true,
+        standing_wants: false,
+        daily_limit: 500,
+        changed_at_ns: 0,
+        changed_by: String::new(),
     }
 }
 
@@ -2117,6 +2175,184 @@ pub fn serve_with(
         },
     );
 
+    // W6.37 (contract v28; rulings 561 and 589): the series request rule, a
+    // deployment admin's, each change its own record; read by the
+    // instrument store before it asks the platform for a series, and by the
+    // dashboard.
+    answer(
+        &context,
+        SET_SERIES_REQUEST_RULE,
+        (
+            "meridian.v1.SetSeriesRequestRuleRequest",
+            "meridian.v1.SeriesRequestRule",
+        ),
+        |cx, request: meridian_domain::v1::SetSeriesRequestRuleRequest, envelope| {
+            let by = subject(envelope);
+            if by.is_empty() {
+                return Err(
+                    "the series request rule is a deployment admin's, and this is sent for nobody"
+                        .into(),
+                );
+            }
+            let rule = request.rule.unwrap_or_default();
+            if !(1..=5_000).contains(&rule.daily_limit) {
+                return Err(meridian_bus::refusal_with_status(
+                    meridian_bus::RefusalStatus::InvalidArgument,
+                    &["rule.daily_limit".to_string()],
+                    format!(
+                        "rule.daily_limit is {}; 1 to 5,000 series a day",
+                        rule.daily_limit
+                    ),
+                ));
+            }
+            if request.reason.trim().is_empty() {
+                return Err(meridian_bus::refusal_naming(
+                    meridian_pb::v1::RefusalReason::ReasonRequired as i32,
+                    &["reason".to_string()],
+                    "reason: a change to the series request rule says why",
+                ));
+            }
+            if request.reason.chars().count() > 4_000 {
+                return Err("reason: at most 4,000 characters".into());
+            }
+            let value = meridian_domain::v1::SeriesRequestRule {
+                orders: rule.orders,
+                standing_wants: rule.standing_wants,
+                daily_limit: rule.daily_limit,
+                changed_at_ns: 0,
+                changed_by: String::new(),
+            };
+            let held = series_request_rule(
+                cx.store
+                    .setting(crate::store::SERIES_REQUEST_RULE)
+                    .map_err(|f| f.to_string())?,
+            );
+            let unchanged = (held.orders, held.standing_wants, held.daily_limit)
+                == (value.orders, value.standing_wants, value.daily_limit)
+                && held.changed_at_ns != 0;
+            if !unchanged {
+                cx.store
+                    .set_setting(
+                        crate::store::SERIES_REQUEST_RULE,
+                        &value.encode_to_vec(),
+                        &Author {
+                            note: request.reason.trim().to_string(),
+                            ..author(envelope)
+                        },
+                        cx.clock.now_ns(),
+                    )
+                    .map_err(|f| f.to_string())?;
+                tracing::info!(
+                    orders = value.orders,
+                    standing_wants = value.standing_wants,
+                    daily_limit = value.daily_limit,
+                    by,
+                    "the series request rule changed"
+                );
+            }
+            Ok(series_request_rule(
+                cx.store
+                    .setting(crate::store::SERIES_REQUEST_RULE)
+                    .map_err(|f| f.to_string())?,
+            ))
+        },
+    );
+    answer(
+        &context,
+        READ_SERIES_REQUEST_RULE,
+        (
+            "meridian.v1.ReadSeriesRequestRuleRequest",
+            "meridian.v1.SeriesRequestRule",
+        ),
+        |cx, _request: meridian_domain::v1::ReadSeriesRequestRuleRequest, _| {
+            Ok(series_request_rule(
+                cx.store
+                    .setting(crate::store::SERIES_REQUEST_RULE)
+                    .map_err(|f| f.to_string())?,
+            ))
+        },
+    );
+
+    // W6.38 (contract v28; rulings 515, 517, 600): whether an ems plugin's
+    // admin may choose warn beside refuse on a stale reference price, a
+    // deployment admin's, each change its own record; read by an ems at its
+    // own role and by the dashboard.
+    answer(
+        &context,
+        SET_STALE_REFERENCE_ACTIONS_PERMITTED,
+        (
+            "meridian.v1.SetStaleReferenceActionsPermittedRequest",
+            "meridian.v1.StaleReferenceActionsPermittedSetting",
+        ),
+        |cx, request: meridian_domain::v1::SetStaleReferenceActionsPermittedRequest, envelope| {
+            let by = subject(envelope);
+            if by.is_empty() {
+                return Err(
+                    "the stale-reference actions permitted are a deployment admin's, and this is \
+                     sent for nobody"
+                        .into(),
+                );
+            }
+            if request.reason.trim().is_empty() {
+                return Err(meridian_bus::refusal_naming(
+                    meridian_pb::v1::RefusalReason::ReasonRequired as i32,
+                    &["reason".to_string()],
+                    "reason: a change to the stale-reference actions permitted says why",
+                ));
+            }
+            if request.reason.chars().count() > 4_000 {
+                return Err("reason: at most 4,000 characters".into());
+            }
+            let held = stale_reference_actions_permitted(
+                cx.store
+                    .setting(crate::store::STALE_REFERENCE_ACTIONS_PERMITTED)
+                    .map_err(|f| f.to_string())?,
+            );
+            if held.changed_at_ns == 0 || held.warn_permitted != request.warn_permitted {
+                cx.store
+                    .set_setting(
+                        crate::store::STALE_REFERENCE_ACTIONS_PERMITTED,
+                        &meridian_domain::v1::StaleReferenceActionsPermittedSetting {
+                            warn_permitted: request.warn_permitted,
+                            ..Default::default()
+                        }
+                        .encode_to_vec(),
+                        &Author {
+                            note: request.reason.trim().to_string(),
+                            ..author(envelope)
+                        },
+                        cx.clock.now_ns(),
+                    )
+                    .map_err(|f| f.to_string())?;
+                tracing::info!(
+                    warn_permitted = request.warn_permitted,
+                    by,
+                    "the stale-reference actions permitted changed"
+                );
+            }
+            Ok(stale_reference_actions_permitted(
+                cx.store
+                    .setting(crate::store::STALE_REFERENCE_ACTIONS_PERMITTED)
+                    .map_err(|f| f.to_string())?,
+            ))
+        },
+    );
+    answer(
+        &context,
+        READ_STALE_REFERENCE_ACTIONS_PERMITTED,
+        (
+            "meridian.v1.ReadStaleReferenceActionsPermittedRequest",
+            "meridian.v1.StaleReferenceActionsPermittedSetting",
+        ),
+        |cx, _request: meridian_domain::v1::ReadStaleReferenceActionsPermittedRequest, _| {
+            Ok(stale_reference_actions_permitted(
+                cx.store
+                    .setting(crate::store::STALE_REFERENCE_ACTIONS_PERMITTED)
+                    .map_err(|f| f.to_string())?,
+            ))
+        },
+    );
+
     // W3.28 (contract v25): the identifier schemes the deployment declares
     // it is licensed for, the deployment admin's, the whole list each time,
     // each a scheme the licence list names, each change its own record.
@@ -2465,10 +2701,34 @@ pub fn serve_with(
             "meridian.v1.WithdrawPermissionReply",
         ),
         |cx, request: WithdrawPermissionRequest, envelope| {
+            // Contract v28 (W6.7, ruling 549): why, required, on the
+            // withdrawal's own record (decisions/031).
+            let note = request.note.trim();
+            if note.is_empty() {
+                return Err(meridian_bus::refusal_naming(
+                    meridian_pb::v1::RefusalReason::ReasonRequired as i32,
+                    &["note".to_string()],
+                    "note: a withdrawal of a permission says why",
+                ));
+            }
+            if note.chars().count() > 2_000 {
+                return Err(meridian_bus::refusal_with_status(
+                    meridian_bus::RefusalStatus::InvalidArgument,
+                    &["note".to_string()],
+                    "note: at most 2,000 characters".to_string(),
+                ));
+            }
             let before = cx.snapshot()?;
             let outcome = cx
                 .store
-                .withdraw_permission(&request.permission_id, &author(envelope), cx.clock.now_ns())
+                .withdraw_permission(
+                    &request.permission_id,
+                    &Author {
+                        note: note.to_string(),
+                        ..author(envelope)
+                    },
+                    cx.clock.now_ns(),
+                )
                 .map_err(|f| f.to_string())?;
             let reply = match outcome {
                 Withdrawal::Withdrawn => {

@@ -461,6 +461,42 @@ pub async fn report_inward_forever(bus: Arc<Bus>, component: &'static str, schem
     }
 }
 
+/// The monitor's topic, which a component's own hops are sent on (W4.16).
+pub const REPORT_LATENCY_TOPIC: &str = "platform.deployment.command.report-latency";
+
+/// A core component's own hops, sent to the monitor every 10 seconds as a
+/// plugin sends its own (contract v28; W4.16; ruling 606, reversing 570
+/// (ii)'s direct write): what this process's
+/// [`meridian_domain::latency::recorder`] holds, in batches of at most 500.
+/// Nothing is sent while nothing was recorded. A monitor that does not
+/// answer loses that interval's measurements, never the component's work:
+/// they are measurements, not records.
+pub async fn report_latency_forever(bus: Arc<Bus>) {
+    use prost::Message as _;
+    let every = Duration::from_nanos(meridian_domain::latency::REPORT_EVERY_NS as u64);
+    loop {
+        tokio::time::sleep(every).await;
+        let snapshots = meridian_domain::latency::recorder().take(bus.clock().now_ns());
+        for batch in snapshots.chunks(500) {
+            let request = meridian_domain::v1::ReportLatencyRequest {
+                snapshots: batch.to_vec(),
+            };
+            if let Err(failed) = bus
+                .call(
+                    REPORT_LATENCY_TOPIC,
+                    "meridian.v1.ReportLatencyRequest",
+                    request.encode_to_vec(),
+                    None,
+                    None,
+                )
+                .await
+            {
+                tracing::debug!(%failed, "this component's hops were not reported");
+            }
+        }
+    }
+}
+
 /// What every other component has said about itself, newest per component.
 ///
 /// A current picture rather than a history, for the reason the platform keeps

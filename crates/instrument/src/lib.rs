@@ -24,6 +24,7 @@
 //! global ID added as an identifier, never adopted as the key.
 
 pub mod calendars;
+pub mod companies;
 pub mod complete;
 pub mod event_groups;
 pub mod ids;

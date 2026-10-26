@@ -236,8 +236,20 @@ monies! {
     UnresolvedHolding { market_value }
     Price { price }
     Bar { open, high, low, close, vwap }
-    Trade { price }
+    Trade { price, quote_at_trade }
     Quote { bid, ask }
+    // Contract v28 (G9): the quote in force at a print.
+    QuoteAtTrade { bid, ask }
+    // Contract v28 (W9.16 to W9.19): a lifecycle event's amounts.
+    LifecycleDelivery { price }
+    LifecycleEvent { deliveries, cash, settlement_price, proposal_basis }
+    LifecycleEventRecordedEvent { event }
+    RecordLifecycleEventRequest { event }
+    ProposeLifecycleEventsRequest { events }
+    RecordLifecycleEventReply { event }
+    ProposeLifecycleEventsReply { events }
+    ReleaseLifecycleEventReply { event }
+    ListLifecycleEventsReply { events }
     BookEntryReply { positions, breaks, figures }
     ListPositionsReply { positions }
     ListBreaksReply { breaks }

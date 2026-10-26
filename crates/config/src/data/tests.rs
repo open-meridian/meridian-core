@@ -249,3 +249,50 @@ fn a_datasets_stale_ceiling_is_its_data_plugin_admins_dataset_thresholds() {
     );
     assert!(stale_after(&snapshot, "kraken-1").is_empty());
 }
+
+#[test]
+fn a_persons_licence_keeps_the_declared_terms_it_does_not_state() {
+    // Contract v28 (W10.1; 491, 597).
+    let declared = DatasetLicence {
+        attribution_required: true,
+        attribution_text: "Data from a vendor".into(),
+        copyright_class: 2,
+        redistribution: 1,
+        no_more_restrictive_terms: true,
+        not_affiliated_notice: "Not affiliated".into(),
+        terms_version: "2026-10".into(),
+        eligibility: meridian_domain::lake::eligibility_of(&["personal"], "", "", "").unwrap(),
+        ..Default::default()
+    };
+    let stated = DatasetLicence {
+        kept: true,
+        retention_days: 30,
+        ..Default::default()
+    };
+    let kept = super::kept_declared(stated, Some(&declared));
+    assert!(kept.kept && kept.retention_days == 30);
+    assert!(kept.attribution_required && kept.no_more_restrictive_terms);
+    assert_eq!(kept.attribution_text, "Data from a vendor");
+    assert_eq!((kept.copyright_class, kept.redistribution), (2, 1));
+    assert_eq!(kept.not_affiliated_notice, "Not affiliated");
+    assert_eq!(kept.terms_version, "2026-10");
+    assert_eq!(kept.eligibility, declared.eligibility);
+    // A stated eligibility stands over the declared one.
+    let commercial =
+        meridian_domain::lake::eligibility_of(&["commercial"], "", "1000000", "usd").unwrap();
+    let stated = DatasetLicence {
+        eligibility: commercial.clone(),
+        ..Default::default()
+    };
+    assert_eq!(
+        super::kept_declared(stated, Some(&declared)).eligibility,
+        commercial
+    );
+    assert_eq!(commercial.unwrap().buyer_revenue_currency_code, "USD");
+    assert!(meridian_domain::lake::eligibility_of(&[], "5", "", "").is_err());
+    assert!(meridian_domain::lake::eligibility_of(&["corporate"], "", "", "").is_err());
+    assert_eq!(
+        meridian_domain::lake::eligibility_of(&[], "", "", "").unwrap(),
+        None
+    );
+}

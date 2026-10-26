@@ -43,6 +43,7 @@ fn price(subject: &str, kind: PriceKind, amount: &str, instrument: &str, dataset
         meta: Some(ObservationMeta {
             subjects: vec![SubjectRef {
                 entity_id: subject.into(),
+                ..Default::default()
             }],
             source: Some(Source {
                 dataset: dataset.into(),
@@ -213,6 +214,30 @@ fn stores() -> Stores {
                 "TPL-event" => ("binary_event", &["last", "settlement_value"]),
                 _ => ("quoted_price", &["close", "fx"]),
             };
+            // listed_option v1 binds its model by term (ruling 576; W1.24):
+            // American on an equity the tree, European Black-Scholes.
+            let bind = |style: ExerciseStyle, class: AssetClass, model: &str| ModelBinding {
+                exercise_style: style as i32,
+                underlying_asset_class: class as i32,
+                model_id: model.into(),
+                model_version: 1,
+            };
+            let model_bindings = if request.template_id == "TPL-listed-option" {
+                vec![
+                    bind(
+                        ExerciseStyle::American,
+                        AssetClass::Equity,
+                        "american_binomial",
+                    ),
+                    bind(
+                        ExerciseStyle::European,
+                        AssetClass::Unspecified,
+                        "black_scholes",
+                    ),
+                ]
+            } else {
+                Vec::new()
+            };
             ReadTemplateReply {
                 template: Some(SecurityTemplate {
                     template_id: request.template_id,
@@ -222,6 +247,7 @@ fn stores() -> Stores {
                         model_version: 1,
                         pricing_inputs: inputs.iter().map(|i| i.to_string()).collect(),
                         calculation_version: "1".into(),
+                        model_bindings,
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -329,6 +355,9 @@ fn job(measures: &[(&str, &[&str], &str)]) -> RunJobRequest {
             inputs: None,
             business_date: String::new(),
             reporting_currency: String::new(),
+            chains: Vec::new(),
+            scenario_set: None,
+            scenario_ref: None,
             measures: measures
                 .iter()
                 .map(|(definition, breakdowns, group)| MeasureRef {
@@ -501,8 +530,10 @@ async fn an_account_outside_the_scope_and_a_definition_not_served_are_refused_na
     )
     .await
     .unwrap();
-    // v26's eight, and from contract v27 execution_cost v1 and pnl v2.
-    assert_eq!(definitions.definitions.len(), 10);
+    // v26's eight, from contract v27 execution_cost v1 and pnl v2, and from
+    // contract v28 the twelve options measures, positioning_exposure at a
+    // version per basis (ruling 591).
+    assert_eq!(definitions.definitions.len(), 23);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -930,4 +961,531 @@ async fn an_execution_cost_job_reads_the_order_path_and_records_its_rows() {
         assert!(meta.account_scope_applies, "{topic}");
         assert_eq!(meta.account_scope, vec!["ACC-1".to_string()], "{topic}");
     }
+}
+
+// ── Contract v28: a job over a chain, and a grid on a saved scenario set ────
+
+const OSI_CALL: &str = "AAPL  261120C00230000";
+const OSI_PUT: &str = "AAPL  261120P00230000";
+const OSI_DEEP: &str = "AAPL  261120C00150000";
+const VENUE: &str = "VEN-XCBO";
+
+fn series_row(osi: &str, right: &str, strike: &str) -> ListedSeries {
+    ListedSeries {
+        meta: Some(ObservationMeta {
+            row_key: osi.into(),
+            subjects: vec![SubjectRef {
+                entity_id: AAPL.into(),
+                ..Default::default()
+            }],
+            series_key: vec![Identifier {
+                scheme: "occ_osi".into(),
+                value: osi.into(),
+                ..Default::default()
+            }],
+            source: Some(Source {
+                dataset: "tradier-1:options".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        template_id: "TPL-listed-option".into(),
+        template_version: "1".into(),
+        fields: [
+            ("underlying_instrument_id", AAPL.to_string()),
+            ("put_or_call", format!("PUT_OR_CALL_{right}")),
+            ("strike_price", format!("{strike} USD")),
+            ("expiration_date", "2026-11-20".into()),
+            ("exercise_style", "EXERCISE_STYLE_AMERICAN".into()),
+            ("contract_multiplier", "100".into()),
+        ]
+        .into_iter()
+        .map(|(path, value)| TemplateFieldValue {
+            path: path.into(),
+            value,
+            ..Default::default()
+        })
+        .collect(),
+        instrument_id: String::new(),
+    }
+}
+
+fn quote_row(osi: &str, bid: &str, ask: &str) -> Quote {
+    Quote {
+        meta: Some(ObservationMeta {
+            series_key: vec![Identifier {
+                scheme: "occ_osi".into(),
+                value: osi.into(),
+                ..Default::default()
+            }],
+            source: Some(Source {
+                dataset: "tradier-1:options".into(),
+                venue_id: VENUE.into(),
+                ..Default::default()
+            }),
+            valid_from_ns: NOW - 1_000,
+            ..Default::default()
+        }),
+        bid: money(bid, USD, "USD"),
+        ask: money(ask, USD, "USD"),
+        ..Default::default()
+    }
+}
+
+fn chain_stores() -> Stores {
+    chain_stores_with(true)
+}
+
+/// Treasury's par curve, as the platform seeds it and the rates slice
+/// records it (rulings 608 and 611): held, or not.
+const UST: &str = "INS-UST-PAR";
+
+fn par(count: i32, unit: TenorUnit, percent: &str) -> Rate {
+    Rate {
+        meta: Some(ObservationMeta {
+            source: Some(Source {
+                dataset: "us-treasury-1:ust_par".into(),
+                ..Default::default()
+            }),
+            valid_from_ns: NOW - 86_400_000_000_000,
+            ..Default::default()
+        }),
+        kind: RateKind::ParYield as i32,
+        value: Some(UnitValue {
+            value: d(percent),
+            ..Default::default()
+        }),
+        tenor: Some(Tenor {
+            count,
+            unit: unit as i32,
+        }),
+        ..Default::default()
+    }
+}
+
+fn chain_stores_with(curve_held: bool) -> Stores {
+    chain_stores_paying(curve_held, Vec::new())
+}
+
+/// The chain's stores, the lake holding these declared dividends of the
+/// underlying (contract v28, the filings slice; W10.6).
+fn chain_stores_paying(
+    curve_held: bool,
+    dividends: Vec<meridian_domain::v1::CorporateActionAnnounced>,
+) -> Stores {
+    let stores = stores();
+    serve_store(
+        &stores,
+        topics::RESOLVE_IDENTIFIER,
+        "meridian.v1.ResolveIdentifierReply",
+        move |request: ResolveIdentifierRequest| {
+            let named = &request.identifiers[0];
+            assert_eq!(
+                (
+                    named.scheme.as_str(),
+                    named.value.as_str(),
+                    named.source.as_str()
+                ),
+                (
+                    "symbol",
+                    "Daily Treasury Par Yield Curve Rates",
+                    "ustreasury"
+                ),
+                "the default curve, by its administrator's symbol"
+            );
+            ResolveIdentifierReply {
+                found: curve_held,
+                instrument_id: if curve_held {
+                    UST.into()
+                } else {
+                    String::new()
+                },
+                ..Default::default()
+            }
+        },
+    );
+    serve_store(
+        &stores,
+        topics::LIST_RATES,
+        "meridian.v1.ListRatesReply",
+        |request: ListRatesRequest| {
+            assert_eq!(request.subjects[0].entity_id, UST);
+            assert_eq!(request.kinds, vec![RateKind::ParYield as i32]);
+            ListRatesReply {
+                rates: vec![
+                    par(1, TenorUnit::Month, "4.20"),
+                    par(3, TenorUnit::Month, "4.25"),
+                    par(1, TenorUnit::Year, "4.10"),
+                ],
+                ..Default::default()
+            }
+        },
+    );
+    serve_store(
+        &stores,
+        topics::LIST_SERIES,
+        "meridian.v1.ListSeriesReply",
+        |_request: ListSeriesRequest| ListSeriesReply {
+            series: vec![
+                series_row(OSI_CALL, "CALL", "230.00"),
+                series_row(OSI_PUT, "PUT", "230.00"),
+                series_row(OSI_DEEP, "CALL", "150.00"),
+            ],
+            ..Default::default()
+        },
+    );
+    serve_store(
+        &stores,
+        topics::LIST_QUOTES,
+        "meridian.v1.ListQuotesReply",
+        |request: ListQuotesRequest| {
+            assert!(
+                request.all_series,
+                "a chain with no keys reads every series"
+            );
+            ListQuotesReply {
+                quotes: vec![
+                    quote_row(OSI_CALL, "8.10", "8.30"),
+                    quote_row(OSI_PUT, "9.40", "9.60"),
+                    // Under its intrinsic of 77.50 on every side.
+                    quote_row(OSI_DEEP, "70.00", "71.00"),
+                ],
+                ..Default::default()
+            }
+        },
+    );
+    serve_store(
+        &stores,
+        topics::LIST_STATISTICS,
+        "meridian.v1.ListStatisticsReply",
+        |_request: ListStatisticsRequest| ListStatisticsReply::default(),
+    );
+    serve_store(
+        &stores,
+        topics::LIST_CORPORATE_ACTIONS,
+        "meridian.v1.ListCorporateActionsReply",
+        move |request: ListCorporateActionsRequest| {
+            assert_eq!(request.subjects[0].entity_id, AAPL);
+            ListCorporateActionsReply {
+                actions: dividends.clone(),
+                ..Default::default()
+            }
+        },
+    );
+    serve_store(
+        &stores,
+        topics::READ_CALENDAR,
+        "meridian.v1.ReadCalendarReply",
+        |request: ReadCalendarRequest| ReadCalendarReply {
+            // The venue's trading sessions, found through the quote's venue
+            // (ruling 570 (i)).
+            found: request.calendar_id == VENUE,
+            calendar_id: request.calendar_id,
+            trading_sessions: Some(TradingSessions {
+                time_zone: "America/New_York".into(),
+                sessions: vec![TradingSession {
+                    weekdays: (1..=5).collect(),
+                    start_minute: 570,
+                    end_minute: 960,
+                    extended: false,
+                }],
+                early_closes: Vec::new(),
+            }),
+            ..Default::default()
+        },
+    );
+    stores
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chain_job_answers_iv_and_greeks_naming_each_series_by_its_key() {
+    let stores = chain_stores();
+    coordinator(&stores, Config::default(), false);
+    let mut request = job(&[
+        ("implied_volatility", &["series", "quote_side"], ""),
+        ("greeks", &["series", "greek"], ""),
+    ]);
+    let asked = request.job.as_mut().unwrap();
+    asked.account_ids.clear();
+    asked.chains = vec![ChainRef {
+        underlying_instrument_id: AAPL.into(),
+        expiration_from: "2026-11-20".into(),
+        expiration_to: "2026-11-20".into(),
+        series_keys: Vec::new(),
+    }];
+    let reply: RunJobReply = ask_as(
+        &stores.bus,
+        topics::RUN_JOB,
+        "meridian.v1.RunJobRequest",
+        request,
+        &[],
+    )
+    .await
+    .unwrap();
+    let answer = reply.answer.unwrap();
+    let ivs: Vec<&Figure> = answer
+        .figures
+        .iter()
+        .filter(|f| f.measure.as_ref().unwrap().definition == "implied_volatility")
+        .collect();
+    assert_eq!(ivs.len(), 6, "{:?}", answer.not_evaluated);
+    for f in &ivs {
+        assert_eq!(f.computed_as, ComputedAs::Model as i32);
+        assert_eq!(f.series_key[0].scheme, "occ_osi");
+        let iv: f64 = Exact::from_wire(f.value.as_ref().unwrap())
+            .unwrap()
+            .to_string()
+            .parse()
+            .unwrap();
+        assert!(iv > 0.05 && iv < 1.5, "{iv}");
+    }
+    let below: Vec<&NotEvaluated> = answer
+        .not_evaluated
+        .iter()
+        .filter(|u| u.reason == NotEvaluatedReason::BelowIntrinsic as i32)
+        .collect();
+    // The deep call's three sides for IV, and its greeks, which need a mid.
+    assert_eq!(below.len(), 4);
+    assert!(below.iter().all(|u| u.series_key[0].value == OSI_DEEP));
+    let greeks = answer
+        .figures
+        .iter()
+        .filter(|f| f.measure.as_ref().unwrap().definition == "greeks")
+        .count();
+    assert_eq!(greeks, 14, "two series' seven greeks");
+    let provenance = answer.provenance.unwrap();
+    assert!(provenance
+        .models
+        .iter()
+        .any(|m| m.model_id == "american_binomial"));
+    assert!(provenance
+        .datasets
+        .contains(&"tradier-1:options".to_string()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_grid_on_a_saved_set_answers_each_point_and_an_inline_set_beside_it_is_refused() {
+    let stores = chain_stores();
+    let spot = |value: &str| Shock {
+        object: ShockObject::Spot as i32,
+        target: Some(ShockTarget {
+            subject_id: String::new(),
+            every: true,
+        }),
+        form: ShockForm::Relative as i32,
+        unit: ShockUnit::Percent as i32,
+        value: d(value),
+        buckets: Vec::new(),
+    };
+    let set = ScenarioSet {
+        name: "price by date".into(),
+        axes: vec![ScenarioAxis {
+            name: "spot".into(),
+            steps: vec![
+                Scenario {
+                    name: "-10%".into(),
+                    shocks: vec![spot("-10")],
+                },
+                Scenario {
+                    name: "+10%".into(),
+                    shocks: vec![spot("10")],
+                },
+            ],
+        }],
+    };
+    let saved = set.clone();
+    serve_store(
+        &stores,
+        topics::LIST_SCENARIOS,
+        "meridian.v1.ListScenariosReply",
+        move |request: ListScenariosRequest| ListScenariosReply {
+            scenarios: vec![SavedScenario {
+                meta: Some(ObservationMeta {
+                    row_key: request.row_keys[0].clone(),
+                    version: 1,
+                    source: Some(Source {
+                        dataset: "sample-options-1:scenarios".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                scenario_set: Some(saved.clone()),
+                ..Default::default()
+            }],
+        },
+    );
+    coordinator(&stores, Config::default(), false);
+    let mut request = job(&[("scenario_grid", &["instrument"], "")]);
+    request.job.as_mut().unwrap().chains = vec![ChainRef {
+        underlying_instrument_id: AAPL.into(),
+        ..Default::default()
+    }];
+    request.job.as_mut().unwrap().scenario_ref = Some(ScenarioRef {
+        row_key: "grid:price-by-date".into(),
+        dataset: "sample-options-1:scenarios".into(),
+        version: 1,
+    });
+    let run = |request: RunJobRequest| async {
+        ask_as::<RunJobReply>(
+            &stores.bus,
+            topics::RUN_JOB,
+            "meridian.v1.RunJobRequest",
+            request,
+            &["ACC-1"],
+        )
+        .await
+    };
+    let first = run(request.clone()).await.unwrap().answer.unwrap();
+    let grid: Vec<&Figure> = first
+        .figures
+        .iter()
+        .filter(|f| f.measure.as_ref().unwrap().definition == "scenario_grid")
+        .collect();
+    // AAPL's positions held, each at the two points; the rest are in no
+    // chain the job reads, each not evaluated saying so.
+    assert_eq!(grid.len() % 2, 0, "{:?}", first.not_evaluated);
+    assert!(!grid.is_empty() && grid.iter().all(|f| f.breakdown[0].value == AAPL));
+    assert!(first
+        .not_evaluated
+        .iter()
+        .any(|u| u.instrument_id == BTC && u.reason == NotEvaluatedReason::PriceMissing as i32));
+    let key = grid[0].scenario_key.as_ref().unwrap();
+    assert_eq!(key.kind, ScenarioKind::ScenarioPoint as i32);
+    assert_eq!(key.scenario_row_key, "grid:price-by-date");
+    assert_eq!(key.scenario_version, 1);
+    // The same saved version run twice answers the same hash.
+    let second = run(request.clone()).await.unwrap().answer.unwrap();
+    assert_eq!(
+        first.provenance.unwrap().answer_hash,
+        second.provenance.unwrap().answer_hash
+    );
+    request.job.as_mut().unwrap().scenario_set = Some(set);
+    let refused = run(request).await.unwrap_err();
+    assert!(refused.contains("scenario_ref"), "{refused}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chain_reads_treasurys_curve_by_its_symbol_and_none_held_is_not_evaluated() {
+    // Rulings 608 and 611 and the fourth amendment: the default curve,
+    // ust_cmt, resolved read-only by its administrator's symbol, its par
+    // yields read at the as-of and named in the provenance.
+    for held in [true, false] {
+        let stores = chain_stores_with(held);
+        coordinator(&stores, Config::default(), false);
+        let mut request = job(&[("implied_volatility", &["series", "quote_side"], "")]);
+        let asked = request.job.as_mut().unwrap();
+        asked.account_ids.clear();
+        asked.chains = vec![ChainRef {
+            underlying_instrument_id: AAPL.into(),
+            expiration_from: "2026-11-20".into(),
+            expiration_to: "2026-11-20".into(),
+            series_keys: Vec::new(),
+        }];
+        let reply: RunJobReply = ask_as(
+            &stores.bus,
+            topics::RUN_JOB,
+            "meridian.v1.RunJobRequest",
+            request,
+            &[],
+        )
+        .await
+        .unwrap();
+        let answer = reply.answer.unwrap();
+        if held {
+            assert!(!answer.figures.is_empty(), "{:?}", answer.not_evaluated);
+            assert!(answer
+                .provenance
+                .unwrap()
+                .datasets
+                .contains(&"us-treasury-1:ust_par".to_string()));
+        } else {
+            assert!(answer.figures.is_empty());
+            assert!(answer.not_evaluated.iter().all(|u| {
+                u.reason == NotEvaluatedReason::PriceMissing as i32 && u.detail.contains("ust_cmt")
+            }));
+        }
+    }
+}
+
+/// A declared cash dividend of the underlying, as the lake answers it.
+fn declared(ex_date: &str, amount: &str) -> meridian_domain::v1::CorporateActionAnnounced {
+    meridian_domain::v1::CorporateActionAnnounced {
+        meta: Some(ObservationMeta {
+            row_key: format!("dividend:{ex_date}"),
+            subjects: vec![SubjectRef {
+                entity_id: AAPL.into(),
+                ..Default::default()
+            }],
+            source: Some(Source {
+                dataset: "sec-edgar-1:dividends".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        kind: meridian_domain::v1::CorporateActionKind::CashDividend as i32,
+        amount_per_share: money(amount, USD, "USD"),
+        declared_date: "2026-10-01".into(),
+        ex_date: ex_date.into(),
+        record_date: ex_date.into(),
+        payment_date: "2026-11-27".into(),
+        ..Default::default()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dividend_going_ex_the_day_before_expiry_moves_an_american_calls_price() {
+    // Contract v28 (W12.2; the filings slice's rows, read tolerantly since
+    // pass 2): the tree takes the lake's declared dividends, escrowed, and
+    // an American call worth exercising before the ex-date is priced so.
+    // The same quotes then solve to another implied volatility: the
+    // model's price at any one volatility moved. Which way is the chain's
+    // to say, since the forward and borrow come from put-call parity with
+    // the dividends' present value taken out (ruling 608).
+    let iv_of = |dividends: Vec<meridian_domain::v1::CorporateActionAnnounced>| async move {
+        let stores = chain_stores_paying(true, dividends);
+        coordinator(&stores, Config::default(), false);
+        let mut request = job(&[("implied_volatility", &["series", "quote_side"], "")]);
+        let asked = request.job.as_mut().unwrap();
+        asked.account_ids.clear();
+        asked.chains = vec![ChainRef {
+            underlying_instrument_id: AAPL.into(),
+            expiration_from: "2026-11-20".into(),
+            expiration_to: "2026-11-20".into(),
+            series_keys: Vec::new(),
+        }];
+        let reply: RunJobReply = ask_as(
+            &stores.bus,
+            topics::RUN_JOB,
+            "meridian.v1.RunJobRequest",
+            request,
+            &[],
+        )
+        .await
+        .unwrap();
+        let answer = reply.answer.unwrap();
+        let mid = answer
+            .figures
+            .iter()
+            .find(|f| {
+                f.series_key.first().is_some_and(|k| k.value == OSI_CALL)
+                    && f.breakdown.iter().any(|b| b.value == "mid")
+            })
+            .unwrap_or_else(|| panic!("{:?}", answer.not_evaluated));
+        let iv: f64 = Exact::from_wire(mid.value.as_ref().unwrap())
+            .unwrap()
+            .to_string()
+            .parse()
+            .unwrap();
+        (iv, answer.provenance.unwrap().datasets)
+    };
+    let (none, _) = iv_of(Vec::new()).await;
+    let (paying, datasets) = iv_of(vec![declared("2026-11-19", "3.00")]).await;
+    assert!(
+        (paying - none).abs() > 1e-4,
+        "the dividend moved nothing: {none} and {paying}"
+    );
+    assert!(datasets.contains(&"sec-edgar-1:dividends".to_string()));
+    // Going ex after expiry, it is no dividend of this option's.
+    let (after, _) = iv_of(vec![declared("2026-11-23", "3.00")]).await;
+    assert!((after - none).abs() < 1e-9, "{none} and {after}");
 }

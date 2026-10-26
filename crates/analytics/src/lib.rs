@@ -14,6 +14,7 @@
 //! (`meridian-analytics-engine`) is our own Rust and nothing else computes a
 //! figure (ruled 2026-10-12).
 
+pub mod chains;
 pub mod resolve;
 pub mod service;
 pub mod wire;
@@ -49,6 +50,18 @@ pub mod topics {
     pub const ORDER_HISTORY: &str = "platform.book.query.order-history";
     /// Contract v27 (W10.11): the execution costs a job records.
     pub const RECORD_EXECUTION_COSTS: &str = "platform.lake.command.record-execution-costs";
+    /// Contract v28 (W12.1, W12.2, W12.8): a job's chains, their series,
+    /// quotes, statistics, dividends and sessions, and its saved scenario.
+    pub const LIST_SERIES: &str = "platform.lake.query.list-series";
+    pub const LIST_QUOTES: &str = "platform.lake.query.list-quotes";
+    pub const LIST_STATISTICS: &str = "platform.lake.query.list-statistics";
+    pub const LIST_CORPORATE_ACTIONS: &str = "platform.lake.query.list-corporate-actions";
+    pub const LIST_SCENARIOS: &str = "platform.lake.query.list-scenarios";
+    pub const LIST_RATES: &str = "platform.lake.query.list-rates";
+    /// Contract v28's fourth amendment (W3.1, W12.2; rulings 608 and 611):
+    /// the default risk-free curve's record, by its symbol, read-only.
+    pub const RESOLVE_IDENTIFIER: &str = "platform.reference.query.resolve-identifier";
+    pub const READ_CALENDAR: &str = "platform.reference.query.read-calendar";
 
     /// The component's own topic, coordinator to worker: a unit, asked of
     /// the worker pool's queue group and answered by one worker. A

@@ -98,6 +98,8 @@ fn run() -> Result<(), String> {
         let reporting = bus.clone();
         let schema = meridian_lake::migrations::latest();
         tokio::spawn(async move { report_inward_forever(reporting, "lake", schema).await });
+        // Its own hop's ages, to the monitor (W4.16; ruling 606).
+        tokio::spawn(meridian_runtime::report_latency_forever(bus.clone()));
 
         tracing::info!(instance_id, started_at_ns = now_ns(), "the lake is serving");
         ready.serving();

@@ -108,8 +108,14 @@ fn keep_named(row: &mut Observation, named: &BTreeSet<String>) {
         Observation::Rate(rate) => {
             lake::strip_rate(rate, named);
         }
-        // Never a QueryLake kind: read by ListExecutionCosts alone.
-        Observation::ExecutionCost(_) => {}
+        // Never a QueryLake kind: read by ListExecutionCosts alone; nor,
+        // in contract v28, statistics or series (ListStatistics, ListSeries).
+        Observation::ExecutionCost(_)
+        | Observation::Statistic(_)
+        | Observation::Series(_)
+        | Observation::Derived(_)
+        | Observation::Scenario(_)
+        | Observation::CorporateAction(_) => {}
     }
 }
 
@@ -336,6 +342,9 @@ impl Lake {
                         after: None,
                         tenors: Vec::new(),
                         published_as_of_ns: 0,
+                        series_keys: Vec::new(),
+                        all_series: false,
+                        dates: None,
                     }
                 };
             // Every page of one read, until the limit is passed.
@@ -424,7 +433,12 @@ impl Lake {
                 Observation::Quote(quote) => reply.quotes.push(quote),
                 Observation::Outcome(outcome) => reply.outcomes.push(outcome),
                 Observation::Rate(rate) => reply.rates.push(rate),
-                Observation::ExecutionCost(_) => {}
+                Observation::ExecutionCost(_)
+                | Observation::Statistic(_)
+                | Observation::Series(_)
+                | Observation::Derived(_)
+                | Observation::Scenario(_)
+                | Observation::CorporateAction(_) => {}
             }
         }
         Ok(reply)

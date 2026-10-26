@@ -72,12 +72,14 @@ fn every_tool_parity_names_is_one_and_every_tool_is_named() {
         );
         assert_eq!(spec.area, Area::DataSources, "{}", spec.name);
         assert!(
-            spec.reads == spec.name.starts_with("list_"),
-            "{} reads only when it lists",
+            spec.reads == (spec.name.starts_with("list_") || spec.name.starts_with("read_")),
+            "{} reads only when it lists or reads",
             spec.name
         );
     }
-    assert_eq!(SPECS.len(), 5, "the five approved tools");
+    // The five of contract v23, and from contract v28 the data age's read
+    // (W10.9; 517).
+    assert_eq!(SPECS.len(), 6, "the six approved tools");
 }
 
 #[test]

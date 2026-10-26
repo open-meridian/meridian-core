@@ -190,6 +190,9 @@ pub fn resolve(
         now_ns
     };
     let sources = inputs.sources.clone();
+    // A job read at now, whose inputs' ages at this hop are measured
+    // (W4.16; ruling 606): never one read as of a past time or a date.
+    let live = inputs.lake_as_of_ns == 0 && job.business_date.is_empty();
     // Contract v27 (W12.1; ruling 458): a business date -- the book at its
     // end, the lake at its closes -- never one after today's.
     let business_date = job.business_date.clone();
@@ -465,6 +468,11 @@ pub fn resolve(
                     let Some(row) = market_row(&price) else {
                         continue;
                     };
+                    if live {
+                        if let Some(meta) = price.meta.as_ref() {
+                            age_at_analytics(meta, now_ns);
+                        }
+                    }
                     if let Some(money) = price.price.as_ref() {
                         learn(&mut codes, money);
                     }
@@ -539,6 +547,7 @@ pub fn resolve(
                     .iter()
                     .map(|id| SubjectRef {
                         entity_id: id.clone(),
+                        ..Default::default()
                     })
                     .collect(),
                 after_watermark: None,
@@ -724,6 +733,32 @@ pub fn resolve(
     });
     if compiled.reads.executions {
         document["executions"] = Value::Array(measured.iter().map(Measured::to_json).collect());
+    }
+    // Contract v28 (W12.1, W12.2, W12.8): the chains, resolved, and the
+    // scenario set; written only where the job reads them.
+    if compiled.reads.chains {
+        let held: BTreeSet<String> = positions
+            .iter()
+            .map(|(_, p)| p.instrument_id.clone())
+            .collect();
+        let rate = crate::chains::rate(asker, compiled, as_of, &sources);
+        let mut calendars = BTreeMap::new();
+        let mut chains = Vec::new();
+        for chain in crate::chains::refs(asker, job, compiled, &held, as_of) {
+            chains.push(crate::chains::chain(
+                asker,
+                &chain,
+                &sources,
+                as_of,
+                Some(&rate),
+                &mut calendars,
+                live,
+            )?);
+        }
+        document["chains"] = Value::Array(chains);
+    }
+    if let Some(set) = crate::chains::scenario(asker, job)? {
+        document["scenario"] = set;
     }
     if !unentitled.is_empty() {
         document["unentitled"] = Value::Array(
@@ -1054,6 +1089,7 @@ fn mids_at(
                     .iter()
                     .map(|s| SubjectRef {
                         entity_id: s.clone(),
+                        ..Default::default()
                     })
                     .collect(),
                 kinds: vec![PriceKind::Mid as i32],
@@ -1253,6 +1289,7 @@ fn prices(
                     .iter()
                     .map(|s| SubjectRef {
                         entity_id: s.clone(),
+                        ..Default::default()
                     })
                     .collect(),
                 kinds: kinds.to_vec(),
@@ -1286,6 +1323,22 @@ fn prices(
         cursor = reply.next_cursor;
     }
     Ok(out)
+}
+
+/// An input row's age at the `analytics` hop (W4.16; the latency spec's
+/// "The hops"; ruling 606): now less its source time, recorded for the
+/// component's next report to the monitor.
+pub(crate) fn age_at_analytics(meta: &v1::ObservationMeta, now_ns: i64) {
+    let dataset = meta
+        .source
+        .as_ref()
+        .map(|s| s.dataset.as_str())
+        .unwrap_or_default();
+    meridian_domain::latency::recorder().record(
+        dataset,
+        v1::AgeHop::Analytics,
+        now_ns - meridian_domain::latency::source_ns(meta),
+    );
 }
 
 fn market_row(price: &v1::Price) -> Option<Value> {
@@ -1342,6 +1395,7 @@ fn history(
                             .iter()
                             .map(|s| SubjectRef {
                                 entity_id: s.clone(),
+                                ..Default::default()
                             })
                             .collect(),
                         kinds: vec![kind],

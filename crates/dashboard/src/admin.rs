@@ -80,6 +80,12 @@ pub fn routes() -> Router<Arc<App>> {
         .route(trading::LOCAL_RECORDS_PATH, post(set_local_record_orders))
         .route("/admin/time-zone", post(set_deployment_time_zone))
         .route("/admin/fx-pivot-currencies", post(set_fx_pivot_currencies))
+        .route("/admin/series-request-rule", post(set_series_request_rule))
+        .route("/admin/series-records", post(request_series_records))
+        .route(
+            "/admin/stale-reference-actions",
+            post(set_stale_reference_actions_permitted),
+        )
         .route("/admin/model-routing", post(set_model_routing))
         .route("/admin/data-sources", get(data_sources_page))
         .route("/admin/data-sources/licence", post(set_dataset_licence))
@@ -472,6 +478,8 @@ pub mod holds;
 pub mod instruments;
 pub mod model_routing;
 pub(crate) mod overview;
+pub mod series_rule;
+pub mod stale_reference;
 pub mod time_zone;
 pub(crate) use overview::listing;
 pub mod people;
@@ -589,6 +597,16 @@ async fn admin_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Response
         Ok(setting) => fx_pivots::codes(&app.bus, &setting.fx_pivot_currencies).await,
         Err(_) => Default::default(),
     };
+    // Contract v28 (W6.37): the series request rule, its tab.
+    let series = series_rule::read(&app.bus).await;
+    if let Err(failed) = &series {
+        tracing::warn!(%failed, "the series request rule could not be read");
+    }
+    // Contract v28 (W6.38): the stale reference actions permitted, its tab.
+    let stale = stale_reference::read(&app.bus).await;
+    if let Err(failed) = &stale {
+        tracing::warn!(%failed, "the stale reference actions permitted could not be read");
+    }
     // Contract v26 (W12.6): the analytics routing table, its tab, with the
     // measures the component serves beside it where it answers.
     let routing = model_routing::read(&app.bus).await;
@@ -606,6 +624,7 @@ async fn admin_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Response
         service_accounts,
         zone.as_ref().ok(),
         (pivots.as_ref().ok(), &pivot_codes),
+        (series.as_ref().ok(), stale.as_ref().ok()),
         (routing.as_ref().ok(), served.as_ref()),
         &token_input(&session),
         "",
@@ -1519,6 +1538,9 @@ pub(crate) fn summary_tab(manage: &Manage) -> String {
             .unwrap_or_default(),
     );
     let figures = crate::figures::section(manage.report, manage.now);
+    // Its sessions' latency and its datasets' ages, and an episode open
+    // (contract v28; W4.16; ruling 427).
+    let latency = crate::latency::summary_line(manage.instance, manage.now);
     // Its raw records, storage's and the archive's, and its moves (W6.9,
     // contract v16), for a plugin at the edge keeping them.
     let (records, moves) = match manage.moves {
@@ -1541,7 +1563,7 @@ pub(crate) fn summary_tab(manage: &Manage) -> String {
     let status = format!(
         "<section class=\"panel padded\" id=\"status\"><div class=\"row\"><h2>Status</h2>{badge}</div>{why}\
          <dl class=\"facts\"><dt>Version</dt><dd data-version>{version}</dd>\
-         <dt>Contract</dt><dd data-contract>{contract}</dd>{stopped}{seen}{tokens}</dl>{warnings}\
+         <dt>Contract</dt><dd data-contract>{contract}</dd>{stopped}{seen}{tokens}{latency}</dl>{warnings}\
          <p class=\"reserved\" data-reserved=\"lifecycle\">Restarting it, moving it to another version and \
          holding it at one will be here. They are not built yet.</p></section>{figures}"
     );
@@ -2330,6 +2352,8 @@ async fn withdraw(
     admin_form!(app, headers, fields, session, {
         let request = WithdrawPermissionRequest {
             permission_id: field(&fields, "permission_id").into(),
+            // Contract v28 (W6.7): why, on the withdrawal's own record.
+            note: field(&fields, "note").trim().into(),
         };
         let reply: Result<WithdrawPermissionReply, String> = command(
             &app,
@@ -3478,6 +3502,245 @@ async fn set_fx_pivot_currencies(
 /// The FX pivot currencies' act on the surface (W6.36, contract v27).
 const SET_FX_PIVOT_CURRENCIES_TOOL: &str = "dashboard__set_fx_pivot_currencies";
 
+/// W6.37 (contract v28): the series request rule set, a deployment admin's,
+/// with a reason; or prepared for someone to make. The conductor checks the
+/// day's limit and keeps each change its own record.
+async fn set_series_request_rule(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Form(fields): Form<Fields>,
+) -> Response {
+    let back = "/admin#series-rule";
+    let (session, _) = match gate(&app, &headers, true) {
+        Ok(gated) => gated,
+        Err(response) => return *response,
+    };
+    if let Err(response) = form_token_matches(&session, &fields) {
+        return *response;
+    }
+    let note = field(&fields, "note").trim().to_string();
+    if note.is_empty() {
+        return not_done("say why the series request rule changes", back);
+    }
+    let orders = field(&fields, "orders") == "on";
+    let standing_wants = field(&fields, "standing_wants") == "on";
+    let Ok(daily_limit) = field(&fields, "daily_limit").trim().parse::<u32>() else {
+        return not_done("the day's limit is a whole number of series", back);
+    };
+    if !(1..=series_rule::MOST_A_DAY).contains(&daily_limit) {
+        return not_done("the day's limit is 1 to 5,000 series", back);
+    }
+    let posted = prepare_or_gate(
+        &app,
+        &session,
+        &fields,
+        SET_SERIES_REQUEST_RULE_TOOL,
+        || {
+            Ok(serde_json::json!({
+                "orders": orders,
+                "standing_wants": standing_wants,
+                "daily_limit": daily_limit,
+                "note": note,
+            }))
+        },
+    )
+    .await;
+    if let Some(response) = posted_to(posted, back) {
+        return response;
+    }
+    let outcome = app
+        .bus
+        .call_for(
+            series_rule::SET_SERIES_REQUEST_RULE,
+            "meridian.v1.SetSeriesRequestRuleRequest",
+            meridian_domain::v1::SetSeriesRequestRuleRequest {
+                rule: Some(meridian_domain::v1::SeriesRequestRule {
+                    orders,
+                    standing_wants,
+                    daily_limit,
+                    ..Default::default()
+                }),
+                reason: note.clone(),
+            }
+            .encode_to_vec(),
+            None,
+            Some(Duration::from_secs(10)),
+            &session.subject,
+        )
+        .await
+        .map(|_| ())
+        .map_err(said_of_refusal);
+    after_to(
+        outcome,
+        "/admin?done=Series+request+rule+set#series-rule",
+        back,
+    )
+}
+
+/// The series request rule's act on the surface (W6.37, contract v28).
+const SET_SERIES_REQUEST_RULE_TOOL: &str = "dashboard__set_series_request_rule";
+
+/// W3.31 (contract v28): one series asked of the platform by a deployment
+/// admin, under the rule, with a reason; or prepared for someone to make.
+async fn request_series_records(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Form(fields): Form<Fields>,
+) -> Response {
+    let back = "/admin#series-rule";
+    let (session, _) = match gate(&app, &headers, true) {
+        Ok(gated) => gated,
+        Err(response) => return *response,
+    };
+    if let Err(response) = form_token_matches(&session, &fields) {
+        return *response;
+    }
+    let note = field(&fields, "note").trim().to_string();
+    if note.is_empty() {
+        return not_done("say why the series are asked for", back);
+    }
+    let underlying = field(&fields, "underlying_instrument_id")
+        .trim()
+        .to_string();
+    if !underlying.starts_with("INS-") {
+        return not_done("the underlying is an INS- record", back);
+    }
+    let symbol = field(&fields, "occ_osi").to_string();
+    if symbol.trim().is_empty() || symbol.chars().count() > 21 {
+        return not_done("an OCC symbol is 21 characters at most", back);
+    }
+    let cause = match field(&fields, "cause") {
+        "standing" => meridian_domain::v1::SeriesRequestCause::Standing,
+        _ => meridian_domain::v1::SeriesRequestCause::Order,
+    };
+    let posted = prepare_or_gate(
+        &app,
+        &session,
+        &fields,
+        REQUEST_SERIES_RECORDS_TOOL,
+        || {
+            Ok(serde_json::json!({
+                "series": [{
+                    "series_key": [{"scheme": "occ_osi", "value": symbol}],
+                    "underlying_instrument_id": underlying,
+                    "cause": if cause == meridian_domain::v1::SeriesRequestCause::Standing { "standing" } else { "order" },
+                }],
+                "note": note,
+            }))
+        },
+    )
+    .await;
+    if let Some(response) = posted_to(posted, back) {
+        return response;
+    }
+    let outcome = app
+        .bus
+        .call_for(
+            series_rule::REQUEST_SERIES_RECORDS,
+            "meridian.v1.RequestSeriesRecordsRequest",
+            meridian_domain::v1::RequestSeriesRecordsRequest {
+                series: vec![meridian_domain::v1::SeriesWant {
+                    series_key: vec![meridian_domain::v1::Identifier {
+                        scheme: "occ_osi".into(),
+                        value: symbol.clone(),
+                        ..Default::default()
+                    }],
+                    underlying_instrument_id: underlying.clone(),
+                    cause: cause as i32,
+                }],
+                note: note.clone(),
+            }
+            .encode_to_vec(),
+            None,
+            Some(Duration::from_secs(30)),
+            &session.subject,
+        )
+        .await
+        .map_err(said_of_refusal)
+        .and_then(|(_, bytes)| {
+            meridian_domain::v1::RequestSeriesRecordsReply::decode(&bytes[..])
+                .map_err(|failed| failed.to_string())
+        });
+    match outcome {
+        // The answer is the point of the act: said on a page of its own,
+        // with the way back to the tab.
+        Ok(reply) => Html(page(
+            "Series requested",
+            &format!(
+                "<h1>Series requested</h1><p class=\"passed\" data-series-answer>{}: {}</p>\
+                 <p><a href=\"{}\">Back to the series request rule</a></p>",
+                escape(symbol.trim()),
+                escape(&series_rule::answered(&reply)),
+                escape(back)
+            ),
+        ))
+        .into_response(),
+        Err(failed) => after_to(Err(failed), back, back),
+    }
+}
+
+/// The request for series records' act on the surface (W3.31, contract v28).
+const REQUEST_SERIES_RECORDS_TOOL: &str = "dashboard__request_series_records";
+
+/// W6.38 (contract v28): the stale reference actions permitted set, a
+/// deployment admin's, with a reason; or prepared for someone to make.
+async fn set_stale_reference_actions_permitted(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Form(fields): Form<Fields>,
+) -> Response {
+    let back = "/admin#stale-reference";
+    let (session, _) = match gate(&app, &headers, true) {
+        Ok(gated) => gated,
+        Err(response) => return *response,
+    };
+    if let Err(response) = form_token_matches(&session, &fields) {
+        return *response;
+    }
+    let note = field(&fields, "note").trim().to_string();
+    if note.is_empty() {
+        return not_done("say why the stale reference actions change", back);
+    }
+    let warn_permitted = field(&fields, "warn_permitted") == "on";
+    let posted = prepare_or_gate(
+        &app,
+        &session,
+        &fields,
+        SET_STALE_REFERENCE_ACTIONS_PERMITTED_TOOL,
+        || Ok(serde_json::json!({"warn_permitted": warn_permitted, "note": note})),
+    )
+    .await;
+    if let Some(response) = posted_to(posted, back) {
+        return response;
+    }
+    let outcome = app
+        .bus
+        .call_for(
+            stale_reference::SET_STALE_REFERENCE_ACTIONS_PERMITTED,
+            "meridian.v1.SetStaleReferenceActionsPermittedRequest",
+            meridian_domain::v1::SetStaleReferenceActionsPermittedRequest {
+                warn_permitted,
+                reason: note.clone(),
+            }
+            .encode_to_vec(),
+            None,
+            Some(Duration::from_secs(10)),
+            &session.subject,
+        )
+        .await
+        .map(|_| ())
+        .map_err(said_of_refusal);
+    after_to(
+        outcome,
+        "/admin?done=Stale+reference+actions+set#stale-reference",
+        back,
+    )
+}
+
+/// The stale reference actions' act on the surface (W6.38, contract v28).
+const SET_STALE_REFERENCE_ACTIONS_PERMITTED_TOOL: &str =
+    "dashboard__set_stale_reference_actions_permitted";
+
 /// W12.6 (contract v26): a model id routed, a deployment admin's, with a
 /// reason; or prepared for someone to make. The conductor checks the
 /// implementation and keeps each change its own record.
@@ -3786,6 +4049,7 @@ async fn data_sources_page(
         &records,
         &token_input(&session),
         field(&query, "done"),
+        &crate::latency::reads(app.clock.now_ns()),
     );
     Html(page_with(
         "Data sources",
@@ -3847,6 +4111,12 @@ async fn set_dataset_licence(
                 "display": !field(&fields, "display").is_empty(),
                 "default_fields": words(&fields, "default_fields"),
                 "personal_use": !field(&fields, "personal_use").is_empty(),
+                "eligibility": {
+                    "uses": list(&fields, "eligibility_uses"),
+                    "buyer_revenue_below": field(&fields, "buyer_revenue_below"),
+                    "buyer_revenue_at_least": field(&fields, "buyer_revenue_at_least"),
+                    "buyer_revenue_currency_code": field(&fields, "buyer_revenue_currency_code").to_ascii_uppercase(),
+                },
                 "note": field(&fields, "note"),
             }))
         },
@@ -3859,6 +4129,18 @@ async fn set_dataset_licence(
         field(&fields, "retention_days")
     } else {
         "0"
+    };
+    // Contract v28 (491, 597): the eligibility the terms state, where given.
+    let uses_said = list(&fields, "eligibility_uses");
+    let uses: Vec<&str> = uses_said.iter().map(String::as_str).collect();
+    let eligibility = match meridian_domain::lake::eligibility_of(
+        &uses,
+        field(&fields, "buyer_revenue_below"),
+        field(&fields, "buyer_revenue_at_least"),
+        field(&fields, "buyer_revenue_currency_code"),
+    ) {
+        Ok(read) => read,
+        Err(why) => return not_done(&why, DATA_SOURCES),
     };
     let outcome = match retention.parse::<u32>() {
         Err(_) => Err(format!(
@@ -3879,6 +4161,7 @@ async fn set_dataset_licence(
                         display: !field(&fields, "display").is_empty(),
                         default_fields: words(&fields, "default_fields"),
                         personal_use: !field(&fields, "personal_use").is_empty(),
+                        eligibility,
                         ..Default::default()
                     },
                     !field(&fields, "derived_use").is_empty(),

@@ -169,3 +169,27 @@ fn a_plugins_row_says_where_its_versions_came_from() {
     assert_eq!(installed::sources(&[&community, &local]), "Local");
     assert_eq!(installed::sources(&[&community]), "Community");
 }
+
+#[test]
+fn a_listing_replaced_names_its_successor_in_browse() {
+    // Contract v28 (W8.16): PullCatalogue's replaced_by, shown on the row.
+    let listing = meridian_domain::v1::PluginListing {
+        listing: "open-meridian/public-data".into(),
+        replaced_by: "open-meridian/plugin-ecb".into(),
+        ..Default::default()
+    };
+    let row = super::browse_row(&listing);
+    assert!(
+        row.contains("data-replaced-by=\"open-meridian/plugin-ecb\""),
+        "{row}"
+    );
+    assert!(
+        row.contains("Replaced by open-meridian/plugin-ecb"),
+        "{row}"
+    );
+    let plain = super::browse_row(&meridian_domain::v1::PluginListing {
+        listing: "open-meridian/plugin-ecb".into(),
+        ..Default::default()
+    });
+    assert!(!plain.contains("Replaced by"), "{plain}");
+}

@@ -33,6 +33,10 @@ pub const INSTRUMENT_PULLED: &str = "platform.reference.event.instrument-pulled"
 pub const ASK_PLATFORM_FOR_EVENT_GROUP: &str =
     "platform.reference.query.ask-platform-for-event-group";
 
+/// W3.32 (contract v28; ruling 612): the instrument store asking about a
+/// company it does not hold, by its open identifiers alone.
+pub const ASK_PLATFORM_FOR_COMPANY: &str = "platform.reference.query.ask-platform-for-company";
+
 /// How long one ask may take before the person is told the platform did not
 /// answer. Within the dashboard's own wait for the reply (12 s), and longer
 /// than a resolve's bounded ask (8 s, the one-ID spec's requirement 15), so
@@ -106,6 +110,27 @@ impl Conductor {
                 reply.encode_to_vec(),
             ))
         });
+        let naming = Arc::clone(&grouping);
+        bus.serve(ASK_PLATFORM_FOR_COMPANY, move |envelope| {
+            if envelope.payload_type != "meridian.v1.MatchOrMintCompanyRequest" {
+                return Err(format!(
+                    "expected meridian.v1.MatchOrMintCompanyRequest, got {}",
+                    envelope.payload_type
+                ));
+            }
+            let request =
+                meridian_domain::v1::MatchOrMintCompanyRequest::decode(&envelope.payload[..])
+                    .map_err(|failed| format!("undecodable ask: {failed}"))?;
+            let handle = tokio::runtime::Handle::try_current()
+                .map_err(|_| "the conductor has no runtime to ask on".to_string())?;
+            // The platform not reached is a refusal saying so, never a reply
+            // (W3.32): the reply carries the platform's answer alone.
+            let reply = handle.block_on(naming.company(&request))?;
+            Ok((
+                "meridian.v1.MatchOrMintCompanyReply".to_string(),
+                reply.encode_to_vec(),
+            ))
+        });
         let this = grouping;
         bus.serve(ASK_PLATFORM_FOR_EVENT_GROUP, move |envelope| {
             if envelope.payload_type != "meridian.v1.AskPlatformForEventGroupRequest" {
@@ -141,6 +166,46 @@ impl Conductor {
                 reply.encode_to_vec(),
             ))
         });
+    }
+
+    /// W3.32, W1.32 (contract v28; ruling 612): the platform asked to match
+    /// or mint a company, bounded by [`ASKING`], only identifiers in a scheme
+    /// on the licence list sent. Its answer whole; a platform without the
+    /// route, or not answering in time, is the refusal's words, and the
+    /// store's resolve a miss.
+    pub async fn company(
+        &self,
+        asking: &meridian_domain::v1::MatchOrMintCompanyRequest,
+    ) -> Result<meridian_domain::v1::MatchOrMintCompanyReply, String> {
+        let licence = self.licence.read().map(|held| held.clone()).ok().flatten();
+        let asking = meridian_domain::v1::MatchOrMintCompanyRequest {
+            // A company is named by a CIK or an LEI (W1.32), never a
+            // source's own code nor the deployment's.
+            identifiers: crate::reference::sendable_on(&asking.identifiers, licence.as_ref())
+                .into_iter()
+                .filter(|identifier| {
+                    identifier.source.is_empty()
+                        && matches!(identifier.scheme.as_str(), "cik" | "lei")
+                })
+                .collect(),
+            ..asking.clone()
+        };
+        if asking.identifiers.is_empty() {
+            return Err(meridian_bus::refusal_naming(
+                // REFUSAL_REASON_UNSPECIFIED: nothing it may send, no code.
+                0,
+                &["identifiers".to_string()],
+                "no identifier in a scheme on the licence list to ask the platform by",
+            ));
+        }
+        let now_ns = self.clock.now_ns();
+        match tokio::time::timeout(ASKING, self.platform.match_or_mint_company(&asking, now_ns))
+            .await
+        {
+            Err(_) => Err("the platform did not answer in time".into()),
+            Ok(Err(failed)) => Err(format!("the platform could not be reached: {failed}")),
+            Ok(Ok(answer)) => Ok(answer),
+        }
     }
 
     /// W3.29, W1.30 (contract v26): the platform asked to match or mint a
@@ -763,5 +828,65 @@ mod tests {
         let after = conductor.ask(&matching(vec![cusip()]), "", "").await;
         assert!(after.match_or_mint_answer.unwrap().pending_review);
         assert!(transport.bodies()[0].contains("037833100"));
+    }
+
+    #[tokio::test]
+    async fn a_company_is_asked_by_a_cik_or_an_lei_on_the_list_alone() {
+        // Contract v28 (W3.32; ruling 612).
+        use meridian_domain::v1::{LicenceList, MatchOrMintCompanyRequest};
+        let bus = bus();
+        let answer = r#"{"company": {"company_id": "ENT-01JC28APPLEINC000000000001",
+            "name": "Apple Inc.", "identifiers": [{"scheme": "cik", "value": "0000320193"}],
+            "version": 1}, "minted": false}"#;
+        let transport = Fake::new(vec![Ok(reply(200, answer))]);
+        let licence: crate::reference::Licence = Arc::default();
+        let conductor = Conductor::new(
+            bus.clone(),
+            Arc::new(platform_with(transport.clone())),
+            bus.clock(),
+        )
+        .with_licence(licence.clone());
+        let id = |scheme: &str, value: &str, source: &str| PbIdentifier {
+            scheme: scheme.into(),
+            value: value.into(),
+            source: source.into(),
+            ..Default::default()
+        };
+        let asking = MatchOrMintCompanyRequest {
+            identifiers: vec![
+                id("cik", "0000320193", ""),
+                id("symbol", "AAPL", "snaptrade"),
+            ],
+            name: String::new(),
+            request_key: "k".into(),
+        };
+        // No list read: a CIK is not among the open schemes (W3.25), so
+        // there is nothing to ask by.
+        assert!(conductor.company(&asking).await.is_err());
+        assert_eq!(transport.calls(), 0);
+        *licence.write().unwrap() = Some(LicenceList {
+            version: 2,
+            schemes: vec!["cik".into(), "lei".into()],
+            ..Default::default()
+        });
+        let answered = conductor.company(&asking).await.unwrap();
+        assert_eq!(
+            answered.company.unwrap().company_id,
+            "ENT-01JC28APPLEINC000000000001"
+        );
+        let body = &transport.bodies()[0];
+        assert!(
+            body.contains("0000320193") && !body.contains("AAPL"),
+            "{body}"
+        );
+        // The platform not reached: the words, never a reply.
+        let away = Conductor::new(
+            bus.clone(),
+            Arc::new(platform_with(Fake::new(vec![Ok(reply(404, "{}"))]))),
+            bus.clock(),
+        )
+        .with_licence(licence);
+        let refused = away.company(&asking).await.unwrap_err();
+        assert!(refused.contains("could not be reached"), "{refused}");
     }
 }

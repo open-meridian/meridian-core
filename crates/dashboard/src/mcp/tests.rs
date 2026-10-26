@@ -838,12 +838,30 @@ async fn a_delegation_past_its_burst_is_told_when_to_try_again_as_a_tool_error()
         let (_, said, _) = rpc(&h.app, Some(&token), &[], call("nowhere__x", json!({}))).await;
         assert_eq!(said["result"]["structuredContent"]["reason"], "not_listed");
     }
-    let (status, said, _) = rpc(&h.app, Some(&token), &[], call("ops-1__confirm", json!({}))).await;
+    // The bucket earns a token a second, so a slow runner may have earned
+    // some back during the burst: spend what was earned, then the next
+    // call is refused. A confirm a refill lets through reaches the plugin
+    // and is counted, never asserted away.
+    let mut let_through = 0;
+    let (status, said) = loop {
+        loop {
+            let (_, said, _) = rpc(&h.app, Some(&token), &[], call("nowhere__x", json!({}))).await;
+            if said["result"]["structuredContent"]["reason"] == "rate_limited" {
+                break;
+            }
+        }
+        let (status, said, _) =
+            rpc(&h.app, Some(&token), &[], call("ops-1__confirm", json!({}))).await;
+        if said["result"]["structuredContent"]["reason"] == "rate_limited" || let_through == 3 {
+            break (status, said);
+        }
+        let_through += 1;
+    };
     assert_eq!(status, 200, "a bound is a tool error, never an HTTP 429");
     let refused = &said["result"]["structuredContent"];
     assert_eq!(refused["reason"], "rate_limited");
     assert!(refused["retry_after_seconds"].as_u64().unwrap() >= 1);
-    assert!(h.reached.lock().unwrap().is_empty());
+    assert_eq!(h.reached.lock().unwrap().len(), let_through);
     let calls = h
         .app
         .delegations

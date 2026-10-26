@@ -49,7 +49,10 @@ use crate::store::{Result, StoreError};
 /// Format 3 (contract v27, W9.10; rulings 320 and 396): each lot's reliefs
 /// carry their proceeds, folded from the entry's execution, so a snapshot
 /// of format 2 is rebuilt from the journal and every relief backfilled.
-pub const FORMAT: i32 = 3;
+///
+/// Format 4 (contract v28, W9.16 to W9.19): the account's lifecycle events,
+/// and their chain, so a snapshot of format 3 is rebuilt from the journal.
+pub const FORMAT: i32 = 4;
 
 /// The snapshot interval with nothing set: an account's projection kept
 /// every this many entries. From core's replay benchmark (item 122;
@@ -157,6 +160,8 @@ struct Shape {
     chains: Vec<u64>,
     ledger: LedgerShape,
     waits_stated: bool,
+    #[serde(default)]
+    lifecycle_events: Vec<(String, String)>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -287,6 +292,7 @@ pub fn encode(book: &Book) -> Vec<u8> {
         breaks,
         figures,
         attributes,
+        lifecycle_events,
         opening,
         reversed_openings,
         entries,
@@ -307,6 +313,7 @@ pub fn encode(book: &Book) -> Vec<u8> {
             .collect(),
         breaks: map_pb(breaks),
         figures: map_pb(figures),
+        lifecycle_events: map_pb(lifecycle_events),
         attributes: opt(attributes),
         opening: opening.clone(),
         reversed_openings: reversed_openings.clone(),
@@ -613,6 +620,7 @@ pub fn decode(bytes: &[u8]) -> Result<Book> {
             .collect::<Result<_>>()?,
         breaks: unmap_pb(&shape.breaks)?,
         figures: unmap_pb(&shape.figures)?,
+        lifecycle_events: unmap_pb(&shape.lifecycle_events)?,
         attributes: unopt(&shape.attributes)?,
         opening: shape.opening,
         reversed_openings: shape.reversed_openings,

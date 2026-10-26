@@ -69,7 +69,12 @@ reference, minted `EVG-` on first asking and a new version where the flags
 or members changed; a member it does not hold queued for its staff. And the
 template catalogue carries v26's versions with their calculation packages
 (W1.24): cash, equity, and the binary event contract with its bounds.
-See V26 below."""
+See V26 below.
+
+From contract v28 (W1.32; ruling 612) it answers POST
+/api/v1/reference/match-company: a company its source confirms by CIK (or
+the LEI it holds for one), minted `ENT-` on first asking and matched after,
+any other queued for its staff; its licence list carries `cik`."""
 import datetime
 import http.server
 import json
@@ -445,7 +450,7 @@ LICENCE = {
     "version": 1,
     "schemes": [s for s in (os.environ.get("HARNESS_LICENCE")
                             or "figi,lei,ticker_and_venue,caip19,iso4217,sec_series,sec_class,"
-                               "administrator_symbol").split(",") if s],
+                               "administrator_symbol,cik").split(",") if s],
     "pace": {"batch_size": 100, "batches_per_minute": 6},
     "administrators": ["nyfed", "frb", "ecb", "ustreasury"],
 }
@@ -679,6 +684,47 @@ def match_or_mint(asked):
     return answer
 
 
+# Contract v28 (W1.32; ruling 612): the companies its source -- EDGAR's
+# company list -- confirms, by CIK, each minted `ENT-` on first asking and
+# matched after; any other CIK or LEI its staff's queue. The CIK is on the
+# licence list among the SEC's identifiers (W1.32, W3.25).
+COMPANY_SOURCE = {
+    "0000320193": ("ENT-01JC28APPLEINC000000000001", "Apple Inc.", "HWUPKR0MPOU8FGXBT394",
+                   [{"name": "APPLE COMPUTER INC", "valid_until": "2007-01-04"}]),
+    "0001067983": ("ENT-01JC28BERKSHIRE00000000001", "Berkshire Hathaway Inc", "", []),
+}
+COMPANIES = {}
+
+
+def company(asked):
+    """The platform's answer to a company (W1.32): matched, minted from its
+    source, or its staff's queue; a retry of a request key answered as first
+    answered."""
+    key = asked.get("request_key", "")
+    if key and key in ANSWERS:
+        return ANSWERS[key]
+    answer = {"minted": False, "pending_review": True}
+    for identifier in asked.get("identifiers", []):
+        scheme, value = identifier.get("scheme", ""), identifier.get("value", "")
+        cik = value if scheme == "cik" else next(
+            (c for c, (_, _, lei, _) in COMPANY_SOURCE.items() if scheme == "lei" and lei == value),
+            None)
+        if cik in COMPANY_SOURCE:
+            company_id, name, lei, former = COMPANY_SOURCE[cik]
+            fresh = cik not in COMPANIES
+            COMPANIES.setdefault(cik, {
+                "company_id": company_id, "name": name, "version": 1,
+                "identifiers": [{"scheme": "cik", "value": cik}]
+                + ([{"scheme": "lei", "value": lei}] if lei else []),
+                "former_names": former,
+            })
+            answer = {"company": COMPANIES[cik], "minted": fresh, "pending_review": False}
+            break
+    if key:
+        ANSWERS[key] = answer
+    return answer
+
+
 REGISTRY = os.environ.get("HARNESS_REGISTRY", "")
 
 
@@ -888,6 +934,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Contract v26 (W1.30): a venue's grouping, matched or minted.
             HEARD.append({"method": "POST", "path": url.path, "body": asked})
             return self.answer(200, event_group(asked))
+        if url.path == "/api/v1/reference/match-company":
+            # Contract v28 (W1.32; ruling 612): a company, matched or minted.
+            HEARD.append({"method": "POST", "path": url.path, "body": asked})
+            return self.answer(200, company(asked))
         if url.path in ("/api/v1/reference/escalate-instrument", "/api/v1/reference/usage-reports"):
             HEARD.append({"method": "POST", "path": url.path, "body": asked})
             if not V24:

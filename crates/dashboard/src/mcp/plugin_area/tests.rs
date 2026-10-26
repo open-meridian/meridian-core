@@ -122,13 +122,16 @@ fn every_route_of_a_plugins_area_its_holds_and_its_lifecycle_names_its_tool_or_i
         include_str!("../../plugins.rs"),
         include_str!("../../documentation.rs"),
         include_str!("../../registry.rs"),
+        // Contract v27's wire, built in v28 (W8.18, W8.19).
+        include_str!("../../registry/packs.rs"),
     ];
     let mut checked = 0;
     for path in sources.iter().flat_map(|source| routes(source)) {
         let ours = path.starts_with("/plugins/{instance}")
             || path.starts_with("/admin/plugins/")
             || path == "/admin/holds"
-            || path.starts_with("/terminal/plugins");
+            || path.starts_with("/terminal/plugins")
+            || path.starts_with("/terminal/packs");
         if !ours {
             continue;
         }
@@ -158,8 +161,53 @@ fn every_tool_parity_names_is_one_and_every_tool_is_named() {
     // v17's thirteen, v20's read of the accounts an instance may link, and
     // v25's retirement of a version (W8.15), read of a version's
     // documentation (W6.20) and the registries' seven (W8.10 to W8.12,
-    // W5.19).
-    assert_eq!(SPECS.len(), 25, "the twenty-five approved tools");
+    // W5.19); v26's two; and v27's six for starter packs, built in v28
+    // (W8.18, W8.19; spec/starter-packs, requirement 32).
+    assert_eq!(SPECS.len(), 31, "the thirty-one approved tools");
+}
+
+/// Starter packs (W8.18, W8.19; spec/starter-packs, requirement 32): the
+/// reads at the deployment admin's level, each act with a note,
+/// preparable, at may not until loosened, as installing a plugin is.
+#[test]
+fn the_pack_tools_read_and_act_at_the_deployment_admins_level() {
+    for (name, reads) in [
+        ("list_registry_packs", true),
+        ("read_registry_pack", true),
+        ("read_pack", true),
+        ("install_pack", false),
+        ("update_pack", false),
+        ("remove_pack", false),
+    ] {
+        let spec = SPECS.iter().find(|spec| spec.name == name).expect(name);
+        assert_eq!(spec.reads, reads, "{name}");
+        assert_eq!(
+            spec.area,
+            super::Area::Plugins(Gate::DeploymentAdmin),
+            "{name}"
+        );
+        if !reads {
+            let schema = (spec.input_schema)();
+            assert!(
+                schema["required"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|f| f == "note"),
+                "{name}"
+            );
+            let full = format!("dashboard__{name}");
+            assert!(
+                crate::prepared::CORE_PREPARABLE.contains(&full.as_str()),
+                "{name}"
+            );
+            assert_eq!(
+                crate::prepared::levels::default_for(&full),
+                crate::prepared::levels::Level::MayNot,
+                "{name}"
+            );
+        }
+    }
 }
 
 /// Contract v25 (W6.20, W6.26, W8.15): retiring a version is a deployment

@@ -220,6 +220,62 @@ read_fx_pivot_currencies does.",
         Area::Accounts,
         fx_pivot_currencies_schema,
     ),
+    // Contract v28 (W6.37; rulings 561, 589): the series request rule, a
+    // deployment admin's; the set preparable, as the FX pivots are.
+    spec(
+        "read_series_request_rule",
+        "Read the series request rule",
+        "which wants for a listed option or future series the deployment does not hold the instrument store asks the platform for with no person: an order's or a proposal's (orders, on by default), a standing want's (standing_wants, off by default), and the most series a day (daily_limit, 500 by default), with the last change and who made it.",
+        true,
+        Area::Accounts,
+        nothing_schema,
+    ),
+    spec(
+        "set_series_request_rule",
+        "Set the series request rule",
+        "set the series request rule: orders and standing_wants true or false, daily_limit 1 to 5,000, with a note saying why, each change its own record (W6.37). Answers the rule as read_series_request_rule does.",
+        false,
+        Area::Accounts,
+        series_request_rule_schema,
+    ),
+    // Contract v28 (W3.31, W6.37; ruling 561): series asked of the platform
+    // by a deployment admin, under the rule, with a note.
+    spec(
+        "request_series_records",
+        "Request series records",
+        "ask the platform for the INS- records of listed option or future series the \
+deployment does not hold, under the series request rule: each series by its key (an occ_osi \
+symbol, or a symbol and its MIC) and its underlying's INS- ID, its cause order or standing, \
+1 to 500, with a note saying why. Each series is answered with its record where held or \
+minted, pending_review where the platform's staff review it, or refused_by_rule where the \
+rule does not allow its cause or the day's limit is reached, nothing sent; a key no listed \
+series row holds is refused naming it. Each request its own record.",
+        false,
+        Area::Accounts,
+        request_series_records_schema,
+    ),
+    // Contract v28 (W6.38; rulings 517, 600): the stale reference actions
+    // permitted, a deployment admin's; the set preparable.
+    spec(
+        "read_stale_reference_actions_permitted",
+        "Read the stale reference actions permitted",
+        "whether an execution plugin's admin may choose warn, beside refuse, when a placement's \
+reference price is past its ceiling (warn_permitted; refuse only by default), with the last \
+change and who made it.",
+        true,
+        Area::Accounts,
+        nothing_schema,
+    ),
+    spec(
+        "set_stale_reference_actions_permitted",
+        "Set the stale reference actions permitted",
+        "permit warn beside refuse, or refuse only (warn_permitted true or false), with a note \
+saying why, each change its own record (W6.38). Answers the setting as \
+read_stale_reference_actions_permitted does.",
+        false,
+        Area::Accounts,
+        stale_reference_schema,
+    ),
     // Contract v27 (W10.11; W6.20): one account's execution costs, the
     // lake's rows, a person's at the read level on that account.
     spec(
@@ -353,6 +409,72 @@ fn execution_costs_schema() -> Value {
     })
 }
 
+fn stale_reference_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "warn_permitted": {"type": "boolean", "description": "an execution plugin's admin may choose warn beside refuse"},
+            "note": note(),
+        },
+        "required": ["warn_permitted", "note"],
+        "additionalProperties": false,
+    })
+}
+
+fn request_series_records_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "series": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 500,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "series_key": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 1,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "scheme": {"type": "string", "enum": ["occ_osi", "ticker"], "description": "occ_osi for a listed option; ticker for a future or a future option"},
+                                    "value": {"type": "string"},
+                                    "source": {"type": "string", "description": "a ticker's venue, its ISO 10383 MIC (XCME); empty for occ_osi"},
+                                },
+                                "required": ["scheme", "value"],
+                                "additionalProperties": false,
+                            },
+                        },
+                        "underlying_instrument_id": {"type": "string", "pattern": "^INS-"},
+                        "cause": {"type": "string", "enum": ["order", "standing"]},
+                    },
+                    "required": ["series_key", "underlying_instrument_id", "cause"],
+                    "additionalProperties": false,
+                },
+            },
+            "note": note(),
+        },
+        "required": ["series", "note"],
+        "additionalProperties": false,
+    })
+}
+
+fn series_request_rule_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "orders": {"type": "boolean", "description": "a series an order or a proposal names is asked for"},
+            "standing_wants": {"type": "boolean", "description": "a standing want's series are asked for"},
+            "daily_limit": {"type": "integer", "minimum": 1, "maximum": 5000, "description": "the most series asked for in a day"},
+            "note": note(),
+        },
+        "required": ["orders", "standing_wants", "daily_limit", "note"],
+        "additionalProperties": false,
+    })
+}
+
 fn fx_pivot_currencies_schema() -> Value {
     json!({
         "type": "object",
@@ -452,6 +574,13 @@ pub async fn call(app: &App, caller: &Caller, spec: &Spec, arguments: Value) -> 
         "list_execution_costs" => list_execution_costs(app, caller, &arguments).await,
         "read_fx_pivot_currencies" => read_fx_pivot_currencies(app, caller).await,
         "set_fx_pivot_currencies" => set_fx_pivot_currencies(app, caller, &arguments).await,
+        "read_series_request_rule" => read_series_request_rule(app, caller).await,
+        "read_stale_reference_actions_permitted" => read_stale_reference(app, caller).await,
+        "set_stale_reference_actions_permitted" => {
+            set_stale_reference(app, caller, &arguments).await
+        }
+        "set_series_request_rule" => set_series_request_rule(app, caller, &arguments).await,
+        "request_series_records" => request_series_records(app, caller, &arguments).await,
         "list_model_routing" => list_model_routing(app, caller).await,
         "set_model_routing" => set_model_routing(app, caller, &arguments).await,
         "close_account" => close_account(app, caller, &arguments).await,
@@ -1178,6 +1307,290 @@ async fn set_fx_pivot_currencies(app: &App, caller: &Caller, arguments: &Value) 
     }
 }
 
+/// W6.38 (contract v28): the stale reference actions read, a deployment
+/// admin's.
+async fn read_stale_reference(app: &App, caller: &Caller) -> Value {
+    let (_, access) = match access_of(app, caller) {
+        Ok(held) => held,
+        Err(refusal) => return refusal,
+    };
+    if !access.deployment_admin {
+        return refused(
+            "not_permitted",
+            "the stale reference actions permitted are a deployment admin's to read",
+            Vec::new(),
+        );
+    }
+    match crate::admin::stale_reference::read(&app.bus).await {
+        Ok(setting) => {
+            json!({"outcome": "unchanged", "data": crate::admin::stale_reference::json(&setting)})
+        }
+        Err(failed) => refused("unavailable", &failed, Vec::new()),
+    }
+}
+
+/// W6.38 (contract v28): the stale reference actions set, a deployment
+/// admin's; the conductor keeps the change.
+async fn set_stale_reference(app: &App, caller: &Caller, arguments: &Value) -> Value {
+    let mut problems = Problems::default();
+    let Some(top) = object(arguments, "", &mut problems) else {
+        return problems.refusal();
+    };
+    only(top, &["warn_permitted", "note"], "", &mut problems);
+    let warn_permitted = match top.get("warn_permitted") {
+        Some(Value::Bool(said)) => *said,
+        None | Some(Value::Null) => {
+            problems.add("warn_permitted", "required");
+            false
+        }
+        Some(_) => {
+            problems.add("warn_permitted", "true or false");
+            false
+        }
+    };
+    let reason = text(top, "note", "", true, &mut problems);
+    if !problems.is_empty() {
+        return problems.refusal();
+    }
+    let (_, access) = match access_of(app, caller) {
+        Ok(held) => held,
+        Err(refusal) => return refusal,
+    };
+    if !access.deployment_admin {
+        return refused(
+            "not_permitted",
+            "the stale reference actions permitted are a deployment admin's",
+            Vec::new(),
+        );
+    }
+    let reply: Result<meridian_domain::v1::StaleReferenceActionsPermittedSetting, _> = ask(
+        app,
+        caller,
+        crate::admin::stale_reference::SET_STALE_REFERENCE_ACTIONS_PERMITTED,
+        "meridian.v1.SetStaleReferenceActionsPermittedRequest",
+        meridian_domain::v1::SetStaleReferenceActionsPermittedRequest {
+            warn_permitted,
+            reason,
+        },
+        CHANGING,
+    )
+    .await;
+    match reply {
+        Err(failed) => bus_refused(failed, "warn_permitted"),
+        Ok(setting) => {
+            json!({"outcome": "made", "data": crate::admin::stale_reference::json(&setting)})
+        }
+    }
+}
+
+/// W6.37 (contract v28): the series request rule read, a deployment admin's.
+async fn read_series_request_rule(app: &App, caller: &Caller) -> Value {
+    let (_, access) = match access_of(app, caller) {
+        Ok(held) => held,
+        Err(refusal) => return refusal,
+    };
+    if !access.deployment_admin {
+        return refused(
+            "not_permitted",
+            "the series request rule is a deployment admin's to read",
+            Vec::new(),
+        );
+    }
+    match crate::admin::series_rule::read(&app.bus).await {
+        Ok(rule) => json!({"outcome": "unchanged", "data": crate::admin::series_rule::json(&rule)}),
+        Err(failed) => refused("unavailable", &failed, Vec::new()),
+    }
+}
+
+/// W6.37 (contract v28): the series request rule set, a deployment admin's;
+/// the conductor checks the day's limit and keeps the change.
+async fn set_series_request_rule(app: &App, caller: &Caller, arguments: &Value) -> Value {
+    let mut problems = Problems::default();
+    let Some(top) = object(arguments, "", &mut problems) else {
+        return problems.refusal();
+    };
+    only(
+        top,
+        &["orders", "standing_wants", "daily_limit", "note"],
+        "",
+        &mut problems,
+    );
+    let flag = |name: &str, problems: &mut Problems| match top.get(name) {
+        Some(Value::Bool(said)) => *said,
+        None | Some(Value::Null) => {
+            problems.add(name, "required");
+            false
+        }
+        Some(_) => {
+            problems.add(name, "true or false");
+            false
+        }
+    };
+    let orders = flag("orders", &mut problems);
+    let standing_wants = flag("standing_wants", &mut problems);
+    let daily_limit = super::instruments::integer(top, "daily_limit", "", true, &mut problems);
+    if !(1..=i64::from(crate::admin::series_rule::MOST_A_DAY)).contains(&daily_limit) {
+        problems.add("daily_limit", "1 to 5,000 series a day");
+    }
+    let reason = text(top, "note", "", true, &mut problems);
+    if !problems.is_empty() {
+        return problems.refusal();
+    }
+    let (_, access) = match access_of(app, caller) {
+        Ok(held) => held,
+        Err(refusal) => return refusal,
+    };
+    if !access.deployment_admin {
+        return refused(
+            "not_permitted",
+            "the series request rule is a deployment admin's",
+            Vec::new(),
+        );
+    }
+    let reply: Result<meridian_domain::v1::SeriesRequestRule, _> = ask(
+        app,
+        caller,
+        crate::admin::series_rule::SET_SERIES_REQUEST_RULE,
+        "meridian.v1.SetSeriesRequestRuleRequest",
+        meridian_domain::v1::SetSeriesRequestRuleRequest {
+            rule: Some(meridian_domain::v1::SeriesRequestRule {
+                orders,
+                standing_wants,
+                daily_limit: daily_limit as u32,
+                ..Default::default()
+            }),
+            reason,
+        },
+        CHANGING,
+    )
+    .await;
+    match reply {
+        Err(failed) => bus_refused(failed, "rule.daily_limit"),
+        Ok(rule) => json!({"outcome": "made", "data": crate::admin::series_rule::json(&rule)}),
+    }
+}
+
+/// W3.31 (contract v28): series asked of the platform by a deployment admin,
+/// under the rule, with a note; each answered as the instrument store
+/// answers it.
+async fn request_series_records(app: &App, caller: &Caller, arguments: &Value) -> Value {
+    use meridian_domain::v1::{
+        RequestSeriesRecordsReply, RequestSeriesRecordsRequest, SeriesRequestCause, SeriesWant,
+    };
+    let mut problems = Problems::default();
+    let Some(top) = object(arguments, "", &mut problems) else {
+        return problems.refusal();
+    };
+    only(top, &["series", "note"], "", &mut problems);
+    let mut wants = Vec::new();
+    match top.get("series") {
+        Some(Value::Array(items)) if (1..=500).contains(&items.len()) => {
+            for (i, item) in items.iter().enumerate() {
+                let at = format!("series[{i}]");
+                let Some(want) = object(item, &at, &mut problems) else {
+                    continue;
+                };
+                only(
+                    want,
+                    &["series_key", "underlying_instrument_id", "cause"],
+                    &at,
+                    &mut problems,
+                );
+                let mut key = Vec::new();
+                match want.get("series_key") {
+                    Some(Value::Array(ids)) if ids.len() == 1 => {
+                        let here = format!("{at}.series_key[0]");
+                        if let Some(id) = object(&ids[0], &here, &mut problems) {
+                            only(id, &["scheme", "value", "source"], &here, &mut problems);
+                            key.push(meridian_domain::v1::Identifier {
+                                scheme: text(id, "scheme", &here, true, &mut problems),
+                                value: text(id, "value", &here, true, &mut problems),
+                                source: text(id, "source", &here, false, &mut problems),
+                                ..Default::default()
+                            });
+                            if let Some((path, why)) =
+                                meridian_domain::lake::series_key_problem(&key)
+                            {
+                                if path.starts_with("[0].") {
+                                    problems.add(&format!("{at}.series_key{path}"), &why);
+                                }
+                            }
+                        }
+                    }
+                    _ => problems.add(
+                        &format!("{at}.series_key"),
+                        "one identifier: occ_osi, or a ticker with its venue's MIC in source",
+                    ),
+                }
+                let underlying = text(want, "underlying_instrument_id", &at, true, &mut problems);
+                if !underlying.is_empty() && !underlying.starts_with("INS-") {
+                    problems.add(&format!("{at}.underlying_instrument_id"), "an INS- record");
+                }
+                let cause = match want.get("cause").and_then(Value::as_str) {
+                    Some("order") => SeriesRequestCause::Order,
+                    Some("standing") => SeriesRequestCause::Standing,
+                    _ => {
+                        problems.add(&format!("{at}.cause"), "order or standing");
+                        SeriesRequestCause::Unspecified
+                    }
+                };
+                wants.push(SeriesWant {
+                    series_key: key,
+                    underlying_instrument_id: underlying,
+                    cause: cause as i32,
+                });
+            }
+        }
+        _ => problems.add("series", "1 to 500 series"),
+    }
+    let note = text(top, "note", "", true, &mut problems);
+    if !problems.is_empty() {
+        return problems.refusal();
+    }
+    let (_, access) = match access_of(app, caller) {
+        Ok(held) => held,
+        Err(refusal) => return refusal,
+    };
+    if !access.deployment_admin {
+        return refused(
+            "not_permitted",
+            "asking the platform for series records is a deployment admin's",
+            Vec::new(),
+        );
+    }
+    let reply: Result<RequestSeriesRecordsReply, _> = ask(
+        app,
+        caller,
+        REQUEST_SERIES_RECORDS,
+        "meridian.v1.RequestSeriesRecordsRequest",
+        RequestSeriesRecordsRequest {
+            series: wants,
+            note,
+        },
+        CHANGING,
+    )
+    .await;
+    match reply {
+        Err(failed) => bus_refused(failed, "series"),
+        Ok(reply) => json!({
+            "outcome": "made",
+            "data": {
+                "answers": reply.answers.iter().map(|a| json!({
+                    "series_key": a.series_key.iter()
+                        .map(|k| json!({"scheme": k.scheme, "value": k.value}))
+                        .collect::<Vec<_>>(),
+                    "instrument_id": a.instrument_id,
+                    "pending_review": a.pending_review,
+                    "refused_by_rule": a.refused_by_rule,
+                })).collect::<Vec<_>>(),
+            },
+        }),
+    }
+}
+
+/// The instrument store's command for series records (W3.31).
+const REQUEST_SERIES_RECORDS: &str = "platform.reference.command.request-series-records";
+
 /// W12.6 (contract v26): the routing table read, a deployment admin's.
 async fn list_model_routing(app: &App, caller: &Caller) -> Value {
     let (_, access) = match access_of(app, caller) {
@@ -1373,6 +1786,23 @@ pub const PARITY: &[(&str, &str)] = &[
         "read_fx_pivot_currencies set_fx_pivot_currencies",
     ),
     ("/admin/fx-pivot-currencies", "set_fx_pivot_currencies"),
+    // Contract v28 (W6.37): the series request rule's tab and its form.
+    (
+        "tab series-rule",
+        "read_series_request_rule set_series_request_rule",
+    ),
+    ("/admin/series-request-rule", "set_series_request_rule"),
+    // Contract v28 (W3.31): the tab's Request series dialog.
+    ("/admin/series-records", "request_series_records"),
+    // Contract v28 (W6.38): the stale reference actions' tab and its form.
+    (
+        "tab stale-reference",
+        "read_stale_reference_actions_permitted set_stale_reference_actions_permitted",
+    ),
+    (
+        "/admin/stale-reference-actions",
+        "set_stale_reference_actions_permitted",
+    ),
     // Contract v27 (W10.11): the lake's execution-cost rows, which a
     // plugin's TCA page draws; core draws no page of its own for them.
     ("lake ExecutionCost rows", "list_execution_costs"),

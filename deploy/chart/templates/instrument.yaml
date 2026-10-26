@@ -41,6 +41,10 @@ spec:
           env:
             - name: MERIDIAN_INSTANCE_ID
               value: {{ include "meridian-runtime.fullname" . }}-instrument
+            # The analytics component, whose resolves are read-only
+            # (contract v28's fourth amendment, W3.1).
+            - name: MERIDIAN_ANALYTICS_INSTANCE_ID
+              value: {{ include "meridian-runtime.fullname" . }}-analytics
             - name: MERIDIAN_BROKER_URL
               valueFrom:
                 secretKeyRef:

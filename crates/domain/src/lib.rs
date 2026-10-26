@@ -27,6 +27,7 @@ pub mod declaration;
 pub mod exact;
 pub mod instrument_type;
 pub mod lake;
+pub mod latency;
 pub mod money;
 pub mod protojson;
 pub mod semver;

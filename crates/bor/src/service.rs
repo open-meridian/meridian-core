@@ -66,6 +66,12 @@ pub const POSITION_CHANGED: &str = "platform.book.event.position-changed";
 pub const BREAK_CHANGED: &str = "platform.book.event.break-changed";
 pub const ACCOUNT_FIGURES_RECORDED: &str = "platform.book.event.account-figures-recorded";
 pub const ACCOUNT_ATTRIBUTE_CHANGED: &str = "platform.book.event.account-attribute-changed";
+/// Contract v28 (W9.16 to W9.19): a listed option's or a future's lifecycle.
+pub const RECORD_LIFECYCLE_EVENT: &str = "platform.book.command.record-lifecycle-event";
+pub const PROPOSE_LIFECYCLE_EVENTS: &str = "platform.book.command.propose-lifecycle-events";
+pub const RELEASE_LIFECYCLE_EVENT: &str = "platform.book.command.release-lifecycle-event";
+pub const LIST_LIFECYCLE_EVENTS: &str = "platform.book.query.list-lifecycle-events";
+pub const LIFECYCLE_EVENT_RECORDED: &str = "platform.book.event.lifecycle-event-recorded";
 
 pub const LIST_POSITIONS: &str = "platform.book.query.list-positions";
 pub const LIST_BREAKS: &str = "platform.book.query.list-breaks";
@@ -170,6 +176,22 @@ fn record_says(record: &meridian_domain::v1::InstrumentRecord) -> RecordSays {
         code: record.currency.trim().to_string(),
         provisional: record.provisional,
         referential: class == meridian_domain::v1::AssetClass::Referential,
+        instrument_type: record.instrument_type,
+        expired: record.lifecycle_state
+            == meridian_domain::v1::InstrumentLifecycleState::Expired as i32,
+        // Contract v28 (559): the series' premium multiplier.
+        multiplier: record
+            .listed_option
+            .as_ref()
+            .and_then(|o| o.contract_multiplier.as_ref())
+            .or_else(|| {
+                record
+                    .future
+                    .as_ref()
+                    .and_then(|f| f.contract_multiplier.as_ref())
+            })
+            .and_then(|m| meridian_domain::exact::Exact::from_wire(m).ok())
+            .filter(|m| !m.is_zero() && !m.is_negative()),
     }
 }
 
@@ -322,6 +344,23 @@ pub fn announce(bus: &Bus, decided: &Decided, correlation: Option<&str>, causati
             },
         );
     }
+    // Contract v28 (W9.19): each lifecycle event the entry changed, after
+    // it commits, with its journal and cause.
+    for record in &decided.changes.lifecycle_events {
+        say(
+            LIFECYCLE_EVENT_RECORDED,
+            "meridian.v1.LifecycleEventRecordedEvent",
+            {
+                let mut event = meridian_domain::v1::LifecycleEventRecordedEvent {
+                    event: Some(record.clone()),
+                    journal: record.last_change.clone(),
+                    cause: Some(entry.cause.clone()),
+                };
+                meridian_domain::money::fill_known(&mut event);
+                event.encode_to_vec()
+            },
+        );
+    }
     if let Some(record) = &decided.changes.attributes {
         say(
             ACCOUNT_ATTRIBUTE_CHANGED,
@@ -423,6 +462,254 @@ pub(crate) fn command_store(
         ));
     }
     Ok((reply_type.to_string(), reply))
+}
+
+/// W9.16 to W9.19 (contract v28): a lifecycle event reported, proposed,
+/// released and read.
+fn serve_lifecycle(bus: &Arc<Bus>, store: &Arc<dyn Store>, clock: &Arc<dyn Clock>) {
+    use meridian_domain::v1::{
+        LifecycleEvent, ListLifecycleEventsReply, ListLifecycleEventsRequest,
+        ProposeLifecycleEventsReply, ProposeLifecycleEventsRequest, RecordLifecycleEventReply,
+        RecordLifecycleEventRequest, ReleaseLifecycleEventReply, ReleaseLifecycleEventRequest,
+    };
+    fn event_of(made: &Made, booked: bool) -> LifecycleEvent {
+        made.changes
+            .lifecycle_events
+            .iter()
+            .find(|event| {
+                !booked || event.state == meridian_domain::v1::LifecycleEventState::Booked as i32
+            })
+            .cloned()
+            .unwrap_or_default()
+    }
+    {
+        let (bus2, store, clock) = (bus.clone(), store.clone(), clock.clone());
+        bus.serve(RECORD_LIFECYCLE_EVENT, move |envelope| {
+            let request: RecordLifecycleEventRequest =
+                decode(&envelope, "meridian.v1.RecordLifecycleEventRequest")?;
+            let event = request.event.clone().unwrap_or_default();
+            crate::cash::ensure_blocking(
+                &bus2,
+                &store,
+                &meridian_domain::money::codes(&request),
+                clock.now_ns(),
+            );
+            let mut ctx = context_of(&envelope, clock.as_ref());
+            let mut named = vec![event.instrument_id.clone()];
+            named.extend(event.deliveries.iter().map(|d| d.instrument_id.clone()));
+            let found = references(&bus2, &named, ctx.received_at_ns);
+            ctx.reference_versions = found.versions;
+            ctx.records = found.records;
+            ctx.reference_unavailable = found.unavailable;
+            command(
+                &bus2,
+                store.as_ref(),
+                &envelope,
+                ctx,
+                &event.account_id,
+                &request.idempotency_key,
+                "meridian.v1.RecordLifecycleEventReply",
+                &|book, head, ctx| {
+                    let made = crate::lifecycle::record(book, head, ctx, &request)?;
+                    let reply = RecordLifecycleEventReply {
+                        event: Some(event_of(&made, true)),
+                    }
+                    .encode_to_vec();
+                    Ok((made, reply))
+                },
+            )
+        });
+    }
+    {
+        let (bus2, store, clock) = (bus.clone(), store.clone(), clock.clone());
+        bus.serve(PROPOSE_LIFECYCLE_EVENTS, move |envelope| {
+            let request: ProposeLifecycleEventsRequest =
+                decode(&envelope, "meridian.v1.ProposeLifecycleEventsRequest")?;
+            if !bounds::PROPOSE_LIFECYCLE_EVENTS_REQUEST_EVENTS_COUNT.admits(request.events.len()) {
+                return Err(format!("events names {}; 1 to 500", request.events.len()));
+            }
+            crate::cash::ensure_blocking(
+                &bus2,
+                &store,
+                &meridian_domain::money::codes(&request),
+                clock.now_ns(),
+            );
+            let mut ctx = context_of(&envelope, clock.as_ref());
+            let named: Vec<String> = request
+                .events
+                .iter()
+                .map(|event| event.instrument_id.clone())
+                .collect();
+            let found = references(&bus2, &named, ctx.received_at_ns);
+            ctx.reference_versions = found.versions;
+            ctx.records = found.records;
+            ctx.reference_unavailable = found.unavailable;
+            // Each account's proposals one entry, in the order first named.
+            let mut accounts: Vec<String> = Vec::new();
+            for event in &request.events {
+                if event.account_id.is_empty() {
+                    return Err("events[].account_id: each proposal names its account".into());
+                }
+                if !accounts.contains(&event.account_id) {
+                    accounts.push(event.account_id.clone());
+                }
+            }
+            let mut proposed: Vec<(usize, LifecycleEvent)> = Vec::new();
+            for account in &accounts {
+                let mine: Vec<(usize, LifecycleEvent)> = request
+                    .events
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, event)| &event.account_id == account)
+                    .map(|(i, event)| (i, event.clone()))
+                    .collect();
+                let positions: Vec<usize> = mine.iter().map(|(i, _)| *i).collect();
+                let (_, bytes) = command(
+                    &bus2,
+                    store.as_ref(),
+                    &envelope,
+                    ctx.clone(),
+                    account,
+                    "",
+                    "meridian.v1.ProposeLifecycleEventsReply",
+                    &|book, head, ctx| {
+                        let made = crate::lifecycle::propose(book, head, ctx, &mine)?;
+                        let reply = ProposeLifecycleEventsReply {
+                            events: made.changes.lifecycle_events.clone(),
+                        }
+                        .encode_to_vec();
+                        Ok((made, reply))
+                    },
+                )?;
+                let answered = ProposeLifecycleEventsReply::decode(&bytes[..])
+                    .map_err(|failed| failed.to_string())?;
+                proposed.extend(positions.into_iter().zip(answered.events));
+            }
+            proposed.sort_by_key(|(i, _)| *i);
+            Ok((
+                "meridian.v1.ProposeLifecycleEventsReply".to_string(),
+                ProposeLifecycleEventsReply {
+                    events: proposed.into_iter().map(|(_, event)| event).collect(),
+                }
+                .encode_to_vec(),
+            ))
+        });
+    }
+    {
+        let (bus2, store, clock) = (bus.clone(), store.clone(), clock.clone());
+        bus.serve(RELEASE_LIFECYCLE_EVENT, move |envelope| {
+            let request: ReleaseLifecycleEventRequest =
+                decode(&envelope, "meridian.v1.ReleaseLifecycleEventRequest")?;
+            let mut ctx = context_of(&envelope, clock.as_ref());
+            // The account holding the proposal: among the sender's scope, or
+            // every account for a core component.
+            let accounts: Vec<String> = match &ctx.account_scope {
+                Some(scope) => scope.iter().cloned().collect(),
+                None => store.accounts().map_err(|failed| failed.on_the_bus())?,
+            };
+            let mut holder = None;
+            for account in accounts {
+                let book = store.book(&account).map_err(|failed| failed.on_the_bus())?;
+                if let Some(event) = book.lifecycle_events.get(&request.event_id) {
+                    holder = Some((account, event.clone()));
+                    break;
+                }
+            }
+            let Some((account, proposal)) = holder else {
+                return Err(meridian_bus::refusal_with_status(
+                    meridian_bus::RefusalStatus::InvalidArgument,
+                    &["event_id".to_string()],
+                    format!(
+                        "{:?} names no proposal in the accounts in the sender's scope",
+                        request.event_id
+                    ),
+                ));
+            };
+            let mut named = vec![proposal.instrument_id.clone()];
+            named.extend(proposal.deliveries.iter().map(|d| d.instrument_id.clone()));
+            let found = references(&bus2, &named, ctx.received_at_ns);
+            ctx.reference_versions = found.versions;
+            ctx.records = found.records;
+            ctx.reference_unavailable = found.unavailable;
+            command(
+                &bus2,
+                store.as_ref(),
+                &envelope,
+                ctx,
+                &account,
+                "",
+                "meridian.v1.ReleaseLifecycleEventReply",
+                &|book, head, ctx| {
+                    let made = crate::lifecycle::release(book, head, ctx, &request)?;
+                    let reply = ReleaseLifecycleEventReply {
+                        event: Some(event_of(&made, true)),
+                    }
+                    .encode_to_vec();
+                    Ok((made, reply))
+                },
+            )
+        });
+    }
+    {
+        let reading = store.clone();
+        bus.serve(LIST_LIFECYCLE_EVENTS, move |envelope| {
+            let request: ListLifecycleEventsRequest =
+                decode(&envelope, "meridian.v1.ListLifecycleEventsRequest")?;
+            if request.account_id.is_empty() {
+                return Err(meridian_bus::refusal_with_status(
+                    meridian_bus::RefusalStatus::InvalidArgument,
+                    &["account_id".to_string()],
+                    "account_id: an account in the reader's scope".to_string(),
+                ));
+            }
+            if !scope_of(&envelope).holds(&request.account_id) {
+                return Err(format!(
+                    "{} is outside the reader's scope",
+                    request.account_id
+                ));
+            }
+            let book = reading
+                .book(&request.account_id)
+                .map_err(|failed| failed.on_the_bus())?;
+            let since = crate::store::mark_of(request.since.as_ref())
+                .and_then(|mark| mark.get(&book.partition).copied())
+                .unwrap_or(0);
+            let all = crate::lifecycle::listed(
+                &book,
+                &request.instrument_id,
+                &request.kinds,
+                &request.from_date,
+                &request.to_date,
+                since,
+            );
+            let limit = crate::store::page_limit(
+                request.page_size as i32,
+                bounds::LIST_LIFECYCLE_EVENTS_REQUEST_PAGE_SIZE_RANGE,
+            );
+            let offset: usize = request.cursor.parse().unwrap_or(0);
+            let page: Vec<LifecycleEvent> = all.iter().skip(offset).take(limit).cloned().collect();
+            let next = offset + page.len();
+            let heads = reading.heads().map_err(|failed| failed.on_the_bus())?;
+            let mut as_of = crate::store::Mark::new();
+            if let Some(head) = heads.get(&book.partition) {
+                as_of.insert(book.partition.clone(), *head);
+            }
+            let mut reply = ListLifecycleEventsReply {
+                events: page,
+                as_of: Some(crate::store::watermark_of(&as_of)),
+                next_cursor: if next < all.len() {
+                    next.to_string()
+                } else {
+                    String::new()
+                },
+            };
+            meridian_domain::money::fill_known(&mut reply);
+            Ok((
+                "meridian.v1.ListLifecycleEventsReply".to_string(),
+                reply.encode_to_vec(),
+            ))
+        });
+    }
 }
 
 /// Register every handler the book serves.
@@ -537,6 +824,7 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
             )
         });
     }
+    serve_lifecycle(&bus, &store, &clock);
     {
         let (bus2, store, clock) = (bus.clone(), store.clone(), clock.clone());
         bus.serve(HANDLE_BREAK, move |envelope| {

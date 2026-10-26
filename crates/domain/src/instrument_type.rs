@@ -22,6 +22,97 @@ use crate::v1::{
     MoneyMarketFund, MoneyMarketFundCategory, MoneyMarketFundInvestors, MoneyMarketFundNav,
 };
 
+/// A listed series' terms as the store holds them (contract v28; rulings
+/// 559 and 575): the platform record's listed option or future, the
+/// message's bytes in hex; empty for a record with neither.
+pub fn listed_terms_to_text(record: &crate::v1::InstrumentRecord) -> String {
+    use prost::Message;
+    let bytes = match (&record.listed_option, &record.future) {
+        (Some(option), _) => option.encode_to_vec(),
+        (None, Some(future)) => future.encode_to_vec(),
+        (None, None) => return String::new(),
+    };
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn unhex(text: &str) -> Option<Vec<u8>> {
+    let text = text.trim();
+    if text.is_empty() || !text.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(text.get(i..i + 2)?, 16).ok())
+        .collect()
+}
+
+/// A listed option's or a future option's terms from the store's text, or
+/// `None` where the record holds none.
+pub fn listed_option_from_text(text: &str) -> Option<crate::v1::ListedOption> {
+    use prost::Message;
+    crate::v1::ListedOption::decode(&unhex(text)?[..]).ok()
+}
+
+/// A future's terms from the store's text, or `None` where it holds none.
+pub fn future_from_text(text: &str) -> Option<crate::v1::FutureContract> {
+    use prost::Message;
+    crate::v1::FutureContract::decode(&unhex(text)?[..]).ok()
+}
+
+/// Whether a listed series' terms leave a template path unfilled (contract
+/// v28, W1.24): an underlying, a right, a strike, a date, a style, a method,
+/// a multiplier, a root, a deliverable or a month not stated; a settlement
+/// time missing only on a cash-settled option, a first notice date only on a
+/// physically delivered future. False for a path the terms do not carry.
+pub fn listed_path_missing(kind: InstrumentType, text: &str, path: &str) -> bool {
+    use crate::v1::{SettlementMethod, SettlementTime};
+    match kind {
+        InstrumentType::ListedOption | InstrumentType::FutureOption => {
+            let Some(terms) = listed_option_from_text(text) else {
+                return true;
+            };
+            match path {
+                "underlying_instrument_id" => terms.underlying_instrument_id.is_empty(),
+                "put_or_call" => terms.put_or_call == 0,
+                "strike_price" => terms.strike_price.is_none(),
+                "expiration_date" => terms.expiration_date.is_empty(),
+                "last_trade_date" => terms.last_trade_date.is_empty(),
+                "exercise_style" => terms.exercise_style == 0,
+                "settlement_method" => terms.settlement_method == 0,
+                "settlement_time" => {
+                    terms.settlement_method == SettlementMethod::Cash as i32
+                        && terms.settlement_time == SettlementTime::Unspecified as i32
+                }
+                "contract_multiplier" => terms.contract_multiplier.is_none(),
+                "option_root" => terms.option_root.is_empty(),
+                "contract_month" => false,
+                path if path.starts_with("deliverable") => terms.deliverable.is_empty(),
+                _ => false,
+            }
+        }
+        InstrumentType::Future => {
+            let Some(terms) = future_from_text(text) else {
+                return true;
+            };
+            match path {
+                "underlying_instrument_id" => terms.underlying_instrument_id.is_empty(),
+                "product_code" => terms.product_code.is_empty(),
+                "contract_month" => terms.contract_month.is_empty(),
+                "last_trade_date" => terms.last_trade_date.is_empty(),
+                "final_settlement_date" => terms.final_settlement_date.is_empty(),
+                "settlement_method" => terms.settlement_method == 0,
+                "contract_multiplier" => terms.contract_multiplier.is_none(),
+                "first_notice_date" => {
+                    terms.settlement_method == SettlementMethod::Physical as i32
+                        && terms.first_notice_date.is_empty()
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
 /// The asset class a type is under; `None` for no type.
 pub fn class_of(kind: InstrumentType) -> Option<AssetClass> {
     match kind {
@@ -33,6 +124,13 @@ pub fn class_of(kind: InstrumentType) -> Option<AssetClass> {
         InstrumentType::InterestRate | InstrumentType::RateCurve | InstrumentType::Index => {
             Some(AssetClass::Referential)
         }
+        // Contract v28, listed options and futures: one series or contract
+        // month a record under derivative; the commodity a future is written
+        // on, referential and never held (ruling 577).
+        InstrumentType::ListedOption | InstrumentType::Future | InstrumentType::FutureOption => {
+            Some(AssetClass::Derivative)
+        }
+        InstrumentType::Commodity => Some(AssetClass::Referential),
     }
 }
 
@@ -66,18 +164,26 @@ pub fn words(kind: InstrumentType) -> &'static str {
         InstrumentType::InterestRate => "interest rate",
         InstrumentType::RateCurve => "rate curve",
         InstrumentType::Index => "index",
+        InstrumentType::ListedOption => "listed option",
+        InstrumentType::Future => "future",
+        InstrumentType::FutureOption => "future option",
+        InstrumentType::Commodity => "commodity",
     }
 }
 
 /// Every type the list holds, in its order: what a refusal lists. From
 /// contract v27 the referential types too (W1.1), which the platform seeds
 /// and no deployment's form offers.
-pub const TYPES: [InstrumentType; 5] = [
+pub const TYPES: [InstrumentType; 9] = [
     InstrumentType::MoneyMarketFund,
     InstrumentType::BinaryEventContract,
     InstrumentType::InterestRate,
     InstrumentType::RateCurve,
     InstrumentType::Index,
+    InstrumentType::ListedOption,
+    InstrumentType::Future,
+    InstrumentType::FutureOption,
+    InstrumentType::Commodity,
 ];
 
 /// A type by its name without the prefix, in lower case

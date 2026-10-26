@@ -217,7 +217,10 @@ form.prepared-act input[name=note]{flex:1 1 12rem;min-width:0}form.prepared-act 
 @media (max-width:640px){table.delegations :is(th,td):is(:nth-child(3),:nth-child(5),:nth-child(6)),table.calls :is(th,td):is(:nth-child(1),:nth-child(4),:nth-child(6)),table.prepared-by-clients :is(th,td):is(:nth-child(1),:nth-child(2),:nth-child(6)){display:none}table.calls code{overflow-wrap:anywhere}}\
 table.linkable th.actions{width:7rem}table.linkable td.actions{text-align:right}\
 @media (max-width:640px){table.agents .wide,table.linkable .wide{display:none}}\
-@media (max-width:640px){table.datasets .wide,table.entitlements .wide,table.priorities .wide,table.entitlements .dates,\
+.eligibility{border:0;padding:0;margin:0;min-width:0;display:grid;grid-template-columns:1fr 1fr;gap:0 .75rem}\
+.eligibility legend,.eligibility .threshold{grid-column:1/-1;padding:0}.eligibility legend{font-weight:600}\
+.eligibility .threshold{display:grid;grid-template-columns:2fr 2fr 1fr;gap:.5rem}.eligibility input{min-width:0}\
+@media (max-width:640px){table.ages .wide,table.datasets .wide,table.entitlements .wide,table.priorities .wide,table.entitlements .dates,\
 table.priorities .dates,table.priorities .actions{display:none}table.datasets th:first-child{width:42%}\
 table.datasets th.actions{width:5.5rem}table.entitlements th.actions{width:6.5rem}table.priorities th:first-child{width:36%}}\
 .figure{min-width:0;padding:.85rem 1rem;background:var(--card);border:1px solid var(--line);border-radius:var(--radius-lg);\
@@ -494,6 +497,10 @@ form.filter-bar{display:flex;gap:.5rem;align-items:center;margin:0 0 .6rem}form.
 @media (max-width:40rem){form.filter-bar{flex-wrap:wrap}.filter-bar .grow{flex-basis:100%}.filter-selects{flex:1}\
 .filter-selects select{flex:1;min-width:0}}\
 .plugin-table{width:100%}.plugin-table th,.plugin-table td{white-space:nowrap}.plugin-table td.actions{white-space:normal}\
+.plugin-table :is(th,td).tick{width:2.75rem;padding-inline:.5rem}.plugin-table :is(th,td).version{width:6.5rem}\
+.plugin-table.checklist :is(th,td).actions{width:9.5rem;text-align:right}\
+.plugin-table.checklist td.actions{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}\
+@media (max-width:40rem){.plugin-table.checklist :is(th,td).actions{width:6rem}.plugin-table :is(th,td).version{width:4.5rem}}\
 .plugin-table .keep,.plugin-table .keep a{overflow:visible;text-overflow:clip;max-width:none}\
 .inline-act{display:inline-flex;gap:.3rem;margin:0}.inline-act input{width:8rem;margin:0}\
 @media (max-width:60rem){.plugin-table .wide{display:none}}@media (max-width:40rem){.plugin-table .mid{display:none}}\

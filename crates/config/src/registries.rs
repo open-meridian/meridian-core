@@ -250,12 +250,23 @@ impl Hold {
             }
         }
         listings.sort_by(|a, b| a.listing.cmp(&b.listing));
+        // The packs (contract v27, requirement 14): each touched since the
+        // sequence arrives whole and replaces what was held of it.
+        let mut packs = held.packs;
+        for pack in reply.packs {
+            match packs.iter_mut().find(|held| held.pack == pack.pack) {
+                Some(slot) => *slot = pack,
+                None => packs.push(pack),
+            }
+        }
+        packs.sort_by(|a, b| a.pack.cmp(&b.pack));
         let kept = HeldCatalogue {
             listings,
             sequence: reply.sequence.max(held.sequence),
             key_status,
             pulled_at_ns: self.clock.now_ns(),
             pull_status: held.pull_status,
+            packs,
         };
         self.keep(kept.clone()).await?;
         Ok(kept)
@@ -275,6 +286,12 @@ impl Hold {
         verify::key_status_signed(&document, &self.keys)
             .map_err(|why| format!("the signing key: {why}"))?;
         Ok(wire::key_status(&document))
+    }
+
+    /// The listings a copy holds, with the pulls a bundle brought applied
+    /// (ruling 196): what a starter pack's members resolve against (W8.18).
+    pub fn listings_of(&self, held: &HeldCatalogue) -> Vec<PluginListing> {
+        with_bundle_pulls(held.listings.clone(), held, &self.keys)
     }
 
     /// One listed version from the copy held.

@@ -53,6 +53,7 @@ pub mod deadline;
 pub mod decide;
 pub mod ids;
 pub mod journal;
+pub mod lifecycle;
 pub mod migrations;
 pub mod numbers;
 pub mod order_decide;
@@ -69,6 +70,8 @@ pub mod transitions;
 
 mod memory;
 
+#[cfg(test)]
+mod lifecycle_tests;
 #[cfg(test)]
 mod order_tests;
 #[cfg(test)]

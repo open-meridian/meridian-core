@@ -452,6 +452,10 @@ message PluginListing {
   // §3): the approved prices, one per dataset and meter (and per category
   // or professional status where its terms split them); never a proposal.
   repeated ListingPrice prices = 17;
+  // Contract v28 (W8.16; sdk-contract/a-withdrawn-listing-names-its-successor-in-every-deployment):
+  // the listing that replaces it, `<organisation>/<plugin>`; empty for none.
+  // Additive: an older core ignores it.
+  string replaced_by = 18;
 }
 
 // One version of a listing, in one registry.

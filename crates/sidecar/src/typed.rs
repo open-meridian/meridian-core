@@ -112,7 +112,12 @@ pub(crate) const FOR_A_PERSON_AT_ANY_LEVEL: [&str; 2] = [FILE_TICKET, FILED_TICK
 /// and nothing of the deployment's configuration a person administers (the
 /// main session's settlement, 2026-10-12). Sent for nobody, whatever
 /// assertion the call carries.
-pub(crate) const AS_ITSELF: [&str; 1] = ["platform.config.query.venue-catalogue"];
+pub(crate) const AS_ITSELF: [&str; 2] = [
+    "platform.config.query.venue-catalogue",
+    // Contract v28 (W6.38; ruling 600): an ems reads what the deployment
+    // permits at its own role, as it reads its own settings.
+    "platform.config.query.read-stale-reference-actions-permitted",
+];
 /// An `ems`'s venue account mapping (MapVenueAccount, W11.22, contract v22).
 const MAP_VENUE_ACCOUNT: &str = "platform.config.command.map-venue-account";
 /// The commands that name a record by its ID alone -- an order, a placement,
@@ -122,7 +127,7 @@ const MAP_VENUE_ACCOUNT: &str = "platform.config.command.map-venue-account";
 /// to the person's write access where it acts for one, which the book checks
 /// the record's account against. The generated operations hand these no
 /// account; a test holds this list to them.
-pub(crate) const BY_ID_ALONE: [&str; 22] = [
+pub(crate) const BY_ID_ALONE: [&str; 25] = [
     "meridian.v1.RequestOrderChangeRequest",
     "meridian.v1.RecordCheckRequest",
     "meridian.v1.DecideApprovalRequest",
@@ -152,6 +157,12 @@ pub(crate) const BY_ID_ALONE: [&str; 22] = [
     // named by the placement.
     "meridian.v1.ReportPlacementQuoteRequest",
     "meridian.v1.PickPlacementQuoteRequest",
+    // Contract v28 (W9.16 to W9.18): a lifecycle event names its account
+    // inside the event, each event's held to the scope; a release names
+    // the proposed event by its ID.
+    "meridian.v1.RecordLifecycleEventRequest",
+    "meridian.v1.ProposeLifecycleEventsRequest",
+    "meridian.v1.ReleaseLifecycleEventRequest",
 ];
 
 /// The venue facts stamped from the venue account map (matrix/stamped.tsv's
@@ -574,6 +585,14 @@ impl Sidecar {
         let message = self.kept_at_the_edge(payload_type, message)?;
         self.statement_stands(payload_type, &message.encode_to_vec())?;
         self.dates_stand(payload_type, &message.encode_to_vec())?;
+        // A record batch's rows' age at the `sidecar` hop, on accepting it
+        // (W4.16; ruling 606).
+        crate::lake::record_ages(
+            payload_type,
+            &message.encode_to_vec(),
+            meridian_domain::v1::AgeHop::Sidecar,
+            self.clock.now_ns(),
+        );
         // A command naming no account names none: a statement from a plugin
         // built before v7 is admitted with no account (crate::older).
         let account = account.filter(|account| !account.is_empty());

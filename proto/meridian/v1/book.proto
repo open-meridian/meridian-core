@@ -1743,6 +1743,9 @@ message Order {
   // Contract v27 (W11.1): the date an FX order settles on, as `portfolio`
   // states it (FIX's SettlDate, 64), ISO 8601; empty is spot.
   string value_date = 48;
+  // Contract v28: as option brokers require it: buy to open, sell to close.
+  // Unspecified on an instrument that is no option or future.
+  PositionEffect position_effect = 49;
 }
 
 // An order's status: its state, its conditions and its quantities, each
@@ -1825,6 +1828,10 @@ message Leg {
   Side side = 2;
   // FIX's LegRatioQty (623).
   Decimal ratio = 3;
+  // Contract v28: as option brokers require it: buy to open, sell to close; on
+  // a package, per leg. Unspecified on an instrument that is no option or
+  // future.
+  PositionEffect position_effect = 4;
 }
 
 // `portfolio`'s allocation instruction (principle 1; FIX's
@@ -2170,6 +2177,13 @@ message Execution {
   // Contract v27 (W11.11; the gaps spec's D4): on an internal cross of a
   // net order, which convention set its rate; unspecified on any other.
   CrossRateSource cross_rate_source = 42;
+  // Contract v28: a package is reported once for the package and once per leg,
+  // linked. Unspecified: single.
+  MultiLegReportingType multi_leg_reporting_type = 43;
+  // Contract v28: on a leg reported, the package fill's venue_execution_id as
+  // reported; on a leg recorded, the package's execution_id. Empty except on a
+  // leg's fill.
+  string package_execution_id = 44;
 }
 
 // An execution's finality: a level, and when it reached it.
@@ -2376,6 +2390,9 @@ message ProposeOrderRequest {
   // Contract v27 (W11.1): an FX order's value date, ISO 8601 (FIX's
   // SettlDate, 64); empty is spot.
   string value_date = 38;
+  // Contract v28: as option brokers require it: buy to open, sell to close.
+  // Unspecified on an instrument that is no option or future.
+  PositionEffect position_effect = 39;
 }
 
 // W11.2. A fact: never through the gate. By the `oms`, for a user, naming
@@ -2604,6 +2621,13 @@ message ReportExecutionRequest {
   // which convention set its rate; refused INVALID_ARGUMENT naming it where
   // missing on such a cross, or set on any other execution.
   CrossRateSource cross_rate_source = 36;
+  // Contract v28: a package is reported once for the package and once per leg,
+  // linked. Unspecified: single.
+  MultiLegReportingType multi_leg_reporting_type = 37;
+  // Contract v28: on a leg reported, the package fill's venue_execution_id as
+  // reported; on a leg recorded, the package's execution_id. Empty except on a
+  // leg's fill.
+  string package_execution_id = 38;
 }
 
 // W11.12.
@@ -3331,4 +3355,207 @@ message ListAlertsReply {
   repeated Alert alerts = 1;
   Watermark as_of = 2;
   string next_cursor = 3;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Contract v28, track A: listed options and futures
+// (sdk-contract/listed-options-and-futures-contract)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Contract v28: a listed option's exercise, assignment or expiry, or a
+// future's day of settlement variation, reported, proposed or released, each
+// its own record (contract v28, W9.16 to W9.19).
+message LifecycleEvent {
+  // LCE- and a ULID, minted by the book, never reused. Empty on a request;
+  // never empty on a record.
+  string event_id = 1;
+  // An account in the sender's scope. Never empty.
+  string account_id = 2;
+  // A listed_option, future_option or future INS- record. Never empty.
+  string instrument_id = 3;
+  // The event's kind, a closed list. Unspecified is refused.
+  LifecycleEventKind kind = 4;
+  // Decided by the book. Unset on a request.
+  LifecycleEventState state = 5;
+  // Contracts exercised, assigned or expired; on a variation, the contracts
+  // held at the settlement. Never unset.
+  Decimal quantity = 6;
+  // A plain date: the exercise, assignment or expiry date, or the settlement's
+  // trading date. Never empty.
+  string event_date = 7;
+  // Each instrument and its signed quantity, as the broker states it, the
+  // deliverable's components among them. None: an expiry, a cash settlement or
+  // a variation; refused on a physical exercise or assignment.
+  repeated LifecycleDelivery deliveries = 8;
+  // Signed, positive received: a cash settlement's amount, a deliverable's
+  // cash component, or a day's variation. Unset where no cash moves.
+  optional Money cash = 9;
+  // The exchange's settlement price for a variation; the settlement value for
+  // a cash-settled option. Unset on an exercise or assignment with physical
+  // delivery and on an expiry; refused unset on a variation.
+  optional Money settlement_price = 10;
+  // As the plugin read it; with the account, the book's key for a report sent
+  // twice. Empty on a proposal, and where the broker states none.
+  string external_event_id = 11;
+  // The proposal's event_id. Empty except on a report that answered a
+  // proposal, and on a release.
+  string answers_event_id = 12;
+  // The underlying's close against the strike for an exercise by exception, or
+  // the settlement price. Unset except on a proposal.
+  optional Money proposal_basis = 13;
+  // The plugin's raw record, kept at the edge. Unset on a proposal.
+  RawRecordRef raw_record = 14;
+  // Its journal entry. Unset on a request.
+  JournalRef last_change = 15;
+}
+
+// Contract v28 (LifecycleEvent.deliveries): states what changed hands on
+// physical delivery.
+message LifecycleDelivery {
+  // The underlying, a deliverable component, or a currency's cash instrument.
+  // Never empty.
+  string instrument_id = 1;
+  // Signed: positive received into the account, negative delivered out. Never
+  // unset; never zero.
+  Decimal quantity = 2;
+  // The strike, or an adjusted deliverable's stated price. Unset: the strike,
+  // by the option's terms.
+  optional Money price = 3;
+}
+
+// Contract v28 (W9.16): RecordLifecycleEvent's request.
+message RecordLifecycleEventRequest {
+  // The event as the broker states it, or as proposed. Never unset.
+  LifecycleEvent event = 1;
+  // The plugin's key for the report. Empty: the envelope's message identifier
+  // stands for it.
+  string idempotency_key = 2;
+}
+
+// Contract v28 (W9.16): RecordLifecycleEvent's answer.
+message RecordLifecycleEventReply {
+  // Its event_id, state and the proposal it answered. Never unset.
+  LifecycleEvent event = 1;
+}
+
+// Contract v28 (W9.17): ProposeLifecycleEvents's request.
+message ProposeLifecycleEventsRequest {
+  // Each in its account, recorded as proposed. Never empty.
+  repeated LifecycleEvent events = 1;
+}
+
+// Contract v28 (W9.17): ProposeLifecycleEvents's answer.
+message ProposeLifecycleEventsReply {
+  // Its event_id and state. One per event proposed, in order.
+  repeated LifecycleEvent events = 1;
+}
+
+// Contract v28 (W9.18): ReleaseLifecycleEvent's request.
+message ReleaseLifecycleEventRequest {
+  // A proposal no report answered. Never empty.
+  string event_id = 1;
+  // Kept on the release's entry (decisions/031). Never empty: refused
+  // REFUSAL_REASON_REASON_REQUIRED.
+  string note = 2;
+}
+
+// Contract v28 (W9.18): ReleaseLifecycleEvent's answer.
+message ReleaseLifecycleEventReply {
+  // The proposal, booked. Never unset.
+  LifecycleEvent event = 1;
+}
+
+// Contract v28 (W9.19): LifecycleEventRecorded's event.
+message LifecycleEventRecordedEvent {
+  // The event as committed. Never unset.
+  LifecycleEvent event = 1;
+  // The partition and sequence the entry committed at; the event is sent only
+  // after it commits (W9's invariants; amendment to DESIGN28, 2026-10-24).
+  // Never unset.
+  JournalRef journal = 2;
+  // The message that caused it, its instance and its identifiers, as every
+  // delivery's cause (W9.8). Never unset.
+  ChangeCause cause = 3;
+}
+
+// Contract v28 (W9.19): ListLifecycleEvents's request.
+message ListLifecycleEventsRequest {
+  // An account in the reader's scope. Never empty.
+  string account_id = 1;
+  // Its INS- record. Empty: every instrument.
+  string instrument_id = 2;
+  // The kinds answered. None: every kind.
+  repeated LifecycleEventKind kinds = 3;
+  // A plain date, on event_date. Empty: from the account's opening balance.
+  string from_date = 4;
+  // A plain date, on event_date. Empty: to today.
+  string to_date = 5;
+  // A sequence per partition; events whose last change is above it (amendment
+  // to DESIGN28, 2026-10-24: a record row is caught up by watermark, as the
+  // book's other records are). Unset is everything.
+  Watermark since = 6;
+  // How many events a page holds at most. 0 is 100; past 500, answered at 500.
+  uint32 page_size = 7;
+  // The next_cursor a page answered, as written. Empty is the first page.
+  string cursor = 8;
+}
+
+// Contract v28 (W9.19): ListLifecycleEvents's answer.
+message ListLifecycleEventsReply {
+  // Each with its state, in the account's sequence. None in the window.
+  repeated LifecycleEvent events = 1;
+  // The head of each partition the read saw, at one snapshot. Never empty.
+  Watermark as_of = 2;
+  // Opaque. Empty when nothing follows.
+  string next_cursor = 3;
+}
+
+enum PositionEffect {
+  // Not stated: an instrument that is no option or future; refused on an
+  // option or a future.
+  POSITION_EFFECT_UNSPECIFIED = 0;
+  // Opens or adds to a position.
+  POSITION_EFFECT_OPEN = 1;
+  // Closes or reduces a position.
+  POSITION_EFFECT_CLOSE = 2;
+}
+
+enum MultiLegReportingType {
+  // Read as single.
+  MULTI_LEG_REPORTING_TYPE_UNSPECIFIED = 0;
+  // A fill of a single-instrument order (FIX 442 = 1).
+  MULTI_LEG_REPORTING_TYPE_SINGLE = 1;
+  // One leg's fill of a package (442 = 2): the leg's instrument, side,
+  // quantity and price.
+  MULTI_LEG_REPORTING_TYPE_LEG = 2;
+  // The package's fill (442 = 3): no instrument, quantity in package units,
+  // the net price.
+  MULTI_LEG_REPORTING_TYPE_PACKAGE = 3;
+}
+
+enum LifecycleEventKind {
+  // Refused.
+  LIFECYCLE_EVENT_KIND_UNSPECIFIED = 0;
+  // A long option exercised: by the holder, or by exception at expiry.
+  LIFECYCLE_EVENT_KIND_EXERCISE = 1;
+  // A short option assigned, as the broker allocated it.
+  LIFECYCLE_EVENT_KIND_ASSIGNMENT = 2;
+  // An option expired with nothing delivered or paid.
+  LIFECYCLE_EVENT_KIND_EXPIRY = 3;
+  // A future's day of variation against the settlement price, a cash line only
+  // (ruling 562).
+  LIFECYCLE_EVENT_KIND_SETTLEMENT_VARIATION = 4;
+}
+
+enum LifecycleEventState {
+  // Never on a record; a sender leaves it unset.
+  LIFECYCLE_EVENT_STATE_UNSPECIFIED = 0;
+  // Proposed by servicing, moving nothing.
+  LIFECYCLE_EVENT_STATE_PROPOSED = 1;
+  // A proposal a report answered.
+  LIFECYCLE_EVENT_STATE_ANSWERED = 2;
+  // A report, or a released proposal, its movement lines journaled.
+  LIFECYCLE_EVENT_STATE_BOOKED = 3;
+  // A booked event a later correction names.
+  LIFECYCLE_EVENT_STATE_SUPERSEDED = 4;
 }

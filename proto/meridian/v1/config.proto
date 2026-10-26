@@ -387,6 +387,9 @@ message GrantPermissionRequest {
 // who configure no plugin (W6.7).
 message WithdrawPermissionRequest {
   string permission_id = 1;
+  // Contract v28 (W6.7; sdk-contract/withdrawing-a-permission-request-carries-a-note):
+  // why, required, on the withdrawal's own record (decisions/031).
+  string note = 2;
 }
 
 message WithdrawPermissionReply {
@@ -1015,6 +1018,66 @@ message ReadFxPivotCurrenciesRequest {}
 message FxPivotCurrenciesSetting {
   // USD's cash instrument, then EUR's, by default.
   repeated string fx_pivot_currencies = 1;
+  // The last change; 0 and empty for the default never changed.
+  int64 changed_at_ns = 2;
+  string changed_by = 3;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Contract v28, track A: listed options and futures
+// (sdk-contract/listed-options-and-futures-contract)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// W6.37 (ruling 561; its shape ruled 2026-10-24, 589): the deployment
+// admin's standing acceptance rule for asking the platform to mint listed
+// series: an order's want, a standing want, and a daily limit. Each change
+// its own record.
+message SetSeriesRequestRuleRequest {
+  SeriesRequestRule rule = 1;
+  string reason = 2;
+}
+
+// W6.37: the rule read, by the instrument store before it asks
+// (RequestSeriesRecords, W3.31) and by the dashboard.
+message ReadSeriesRequestRuleRequest {}
+
+// The series request rule in force (W6.37; 589).
+message SeriesRequestRule {
+  // True: a series an order or a proposal names is asked for. On by
+  // default.
+  bool orders = 1;
+  // True: a standing want's series (a signal plugin's watched chains) are
+  // asked for. Off by default, refused by rule.
+  bool standing_wants = 2;
+  // The most series asked for in a day, 1 or more; 500 by default.
+  uint32 daily_limit = 3;
+  // The last change; 0 and empty for the default never changed.
+  int64 changed_at_ns = 4;
+  string changed_by = 5;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Contract v28, track D: the latency remainder
+// (sdk-contract/sessions-and-data-report-their-latency-contract)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// W6.38 (rulings 515 and 517): whether an ems plugin's admin may choose
+// to warn, beside refuse, when an order is placed on a reference price past
+// its ceiling. Refuse only by default. Each change its own record.
+message SetStaleReferenceActionsPermittedRequest {
+  bool warn_permitted = 1;
+  string reason = 2;
+}
+
+// W6.38: the setting read, by an ems plugin before it places on a stale
+// reference, and by the dashboard.
+message ReadStaleReferenceActionsPermittedRequest {}
+
+// The stale-reference actions permitted in force (W6.38).
+message StaleReferenceActionsPermittedSetting {
+  // True: an ems plugin admin may choose warn; false: refuse only, and a
+  // plugin's warn is read as refuse.
+  bool warn_permitted = 1;
   // The last change; 0 and empty for the default never changed.
   int64 changed_at_ns = 2;
   string changed_by = 3;

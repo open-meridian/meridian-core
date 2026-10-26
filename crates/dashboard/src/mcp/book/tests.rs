@@ -35,6 +35,8 @@ fn every_route_of_the_book_and_the_instructions_names_its_tool() {
             && path != "/admin/time-zone"
             && path != "/admin/model-routing"
             && path != "/admin/fx-pivot-currencies"
+            && path != "/admin/series-request-rule"
+            && path != "/admin/stale-reference-actions"
             && !path.starts_with("/admin/trading-instructions")
         {
             continue;
@@ -46,7 +48,7 @@ fn every_route_of_the_book_and_the_instructions_names_its_tool() {
             .unwrap_or_else(|| panic!("{path} is routed and names no tool"));
         assert!(names_tools(by), "{path}: {by:?}");
     }
-    assert_eq!(checked, 5, "the routes were not found");
+    assert_eq!(checked, 7, "the routes were not found");
 }
 
 #[test]
@@ -92,8 +94,11 @@ fn the_four_tools_are_named_preparable_where_they_change_and_may_not_for_agents(
     // from contract v26 the agents' guard's read and set (W11.38, W11.39)
     // and the deployment's time zone's (W6.35), and the analytics routing
     // table's (W12.6); from contract v27 an account's execution costs
-    // (W10.11) and the FX pivot currencies' read and set (W6.36).
-    assert_eq!(SPECS.len(), 16, "the sixteen approved tools");
+    // (W10.11) and the FX pivot currencies' read and set (W6.36); from
+    // contract v28 the series request rule's read and set (W6.37) and the
+    // stale reference actions permitted's (W6.38), and series asked of the
+    // platform (W3.31).
+    assert_eq!(SPECS.len(), 21, "the twenty-one approved tools");
 }
 
 #[test]
@@ -153,7 +158,7 @@ fn a_change_takes_a_note_and_a_read_answers_unchanged() {
     }
     let source = include_str!("../book.rs");
     assert!(!source.contains("\"outcome\": \"read\""));
-    assert_eq!(source.matches("\"outcome\": \"unchanged\"").count(), 8);
+    assert_eq!(source.matches("\"outcome\": \"unchanged\"").count(), 10);
 }
 
 /// Contract v24 (W6.3, W6.30): "Unlink all and close" through the surface is

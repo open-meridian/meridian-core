@@ -6,9 +6,9 @@
 //! is a count or a word the platform may add to.
 
 use meridian_domain::v1::{
-    DocumentationText, DownloadListedVersionReply, ListedVersion, PluginBuild, PluginListing,
-    PluginMetadata, PluginPull, PluginPullStatus, PullCatalogueReply, PullReasonKind,
-    SigningKeyRecord, SigningKeyStatus,
+    DocumentationText, DownloadListedVersionReply, ListedVersion, PackMember, PackRevision,
+    PackSelection, PluginBuild, PluginListing, PluginMetadata, PluginPack, PluginPull,
+    PluginPullStatus, PullCatalogueReply, PullReasonKind, SigningKeyRecord, SigningKeyStatus,
 };
 use serde_json::Value;
 
@@ -232,6 +232,10 @@ pub fn listing(value: &Value, at: &str) -> Result<PluginListing, String> {
         support_url: text(value, "support_url"),
         support_email: text(value, "support_email"),
         prices: Vec::new(),
+        // Contract v28 (W8.16): the listing that replaces it, or empty.
+        replaced_by: Some(text(value, "replaced_by"))
+            .filter(|successor| is_listing(successor))
+            .unwrap_or_default(),
     })
 }
 
@@ -261,6 +265,74 @@ pub fn key_status(value: &Value) -> SigningKeyStatus {
     }
 }
 
+/// One member of a pack (contract v27, W8.17): its listing an
+/// `organisation/plugin`, its registry community or verified, never local,
+/// and its selection by name; one that does not read is refused, naming it.
+fn pack_member(value: &Value, at: &str) -> Result<PackMember, String> {
+    let listing = text(value, "listing");
+    if !is_listing(&listing) {
+        return Err(format!(
+            "{at}.listing {listing:?} is not organisation/plugin"
+        ));
+    }
+    let registry = text(value, "registry");
+    if !matches!(registry.as_str(), "community" | "verified") {
+        return Err(format!(
+            "{at}.registry is {registry:?}, not community or verified"
+        ));
+    }
+    let selection = value["selection"]
+        .as_str()
+        .and_then(PackSelection::from_str_name)
+        .filter(|selection| *selection != PackSelection::Unspecified)
+        .ok_or_else(|| format!("{at}.selection is not required, preselected or choose"))?;
+    Ok(PackMember {
+        listing,
+        registry,
+        selection: selection as i32,
+        group: text(value, "group"),
+        minimum_version: text(value, "minimum_version"),
+    })
+}
+
+/// A starter pack, read from the catalogue (contract v27, W8.17;
+/// spec/starter-packs, requirement 14): at its latest published revision,
+/// whole; one that does not read is refused, naming it.
+pub fn pack(value: &Value, at: &str) -> Result<PluginPack, String> {
+    let name = text(value, "pack");
+    if !is_listing(&name) {
+        return Err(format!("{at}.pack {name:?} is not organisation/pack"));
+    }
+    let revision = &value["revision"];
+    if !revision.is_object() {
+        return Err(format!(
+            "{at}.revision: a pack in the catalogue is published"
+        ));
+    }
+    let members = revision["members"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .map(|(n, member)| pack_member(member, &format!("{at}.revision.members[{n}]")))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(PluginPack {
+        pack: name,
+        curator: text(value, "curator"),
+        revision: Some(PackRevision {
+            revision: number(revision, "revision").max(0) as u64,
+            title: text(revision, "title"),
+            description: text(revision, "description"),
+            asset_classes: words(revision, "asset_classes"),
+            members,
+            note: text(revision, "note"),
+            published_at_ns: number(revision, "published_at_ns"),
+        }),
+        withdrawn_at_ns: number(value, "withdrawn_at_ns"),
+        sequence: number(value, "sequence").max(0) as u64,
+    })
+}
+
 /// PullCatalogueReply, as the platform answers it.
 pub fn catalogue(value: &Value) -> Result<PullCatalogueReply, String> {
     let listings = value["listings"]
@@ -280,7 +352,15 @@ pub fn catalogue(value: &Value) -> Result<PullCatalogueReply, String> {
         // Contract v26 (W8.10; ruling 274): the Terms' address, which the
         // install dialog's one line links.
         terms_url: text(value, "terms_url"),
-        packs: Vec::new(),
+        // Contract v27 (W8.17; built in v28): the packs touched after the
+        // sequence asked; none from a platform before v27.
+        packs: value["packs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .map(|(n, item)| pack(item, &format!("packs[{n}]")))
+            .collect::<Result<Vec<_>, _>>()?,
     })
 }
 

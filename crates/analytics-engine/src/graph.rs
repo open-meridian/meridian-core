@@ -248,7 +248,7 @@ fn provenance(case: &Case, reads: &Reads, hash: &str) -> Value {
 // ── A part over the wire, between the coordinator and a worker ──────────────
 
 /// The enum names a part may carry, as `&'static str`.
-const NAMES: [&str; 16] = [
+const NAMES: [&str; 21] = [
     BASE,
     WHAT_IF,
     HISTORICAL_DAY,
@@ -265,7 +265,30 @@ const NAMES: [&str; 16] = [
     HISTORY_INSUFFICIENT,
     EXACT,
     COST_MISSING,
+    // Contract v28.
+    MODEL,
+    SCENARIO_POINT,
+    BELOW_INTRINSIC,
+    FIT_FAILED,
+    INPUT_QUARANTINED,
 ];
+
+fn series_key(value: &Value) -> Vec<(String, String)> {
+    value
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(|i| {
+                    (
+                        i["scheme"].as_str().unwrap_or_default().to_string(),
+                        i["value"].as_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 fn name(value: &Value) -> Result<&'static str> {
     let text = value.as_str().unwrap_or_default();
@@ -350,7 +373,30 @@ impl Part {
                             .as_str()
                             .unwrap_or_default()
                             .to_string(),
+                        scenario_row_key: scenario["scenario_row_key"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                        scenario_version: scenario["scenario_version"]
+                            .as_str()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(0),
+                        axis_positions: scenario["axis_positions"]
+                            .as_array()
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|p| p.as_u64())
+                                    .map(|p| p as u32)
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
                     },
+                    computed_as: name(&f["computed_as"]).unwrap_or(EXACT),
+                    series_key: series_key(&f["series_key"]),
+                    oldest_input_source_ns: f["oldest_input_source_ns"]
+                        .as_str()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0),
                     value: decimal(&f["value"])?,
                     numerator: decimal(&f["numerator"])?,
                     denominator: decimal(&f["denominator"])?,
@@ -374,6 +420,7 @@ impl Part {
                     measure: measure(u)?,
                     reason: name(&u["reason"])?,
                     detail: u["detail"].as_str().unwrap_or_default().to_string(),
+                    series_key: series_key(&u["series_key"]),
                 })
             })
             .collect::<Result<_>>()?;

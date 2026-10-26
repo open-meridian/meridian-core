@@ -190,6 +190,10 @@ pub fn render(
         Option<&meridian_domain::v1::FxPivotCurrenciesSetting>,
         &std::collections::BTreeMap<String, String>,
     ),
+    (series_rule, stale_reference): (
+        Option<&meridian_domain::v1::SeriesRequestRule>,
+        Option<&meridian_domain::v1::StaleReferenceActionsPermittedSetting>,
+    ),
     routing: (
         Option<&meridian_domain::v1::ListModelRoutingReply>,
         Option<&meridian_domain::v1::ListMeasureDefinitionsReply>,
@@ -1051,6 +1055,66 @@ pub fn render(
         format!(
             "{}{order}",
             super::fx_pivots::lines(pivots, pivot_codes, |subject| {
+                crate::tickets::display_name(records, subject)
+            })
+        ),
+    ));
+
+    // ── Series request rule ─────────────────────────────────────────────────
+    // W6.37 (contract v28; rulings 561 and 589): a deployment admin's.
+    let rule_change = dialog(
+        "series-rule-change",
+        "Change the series request rule",
+        "/admin/series-request-rule#series-rule",
+        token,
+        &super::series_rule::fields(series_rule),
+        "Change",
+    );
+    // W3.31 (contract v28): series asked of the platform by a person, under
+    // the rule.
+    let series_request = dialog(
+        "series-request",
+        "Request series records",
+        super::series_rule::REQUEST_PATH,
+        token,
+        &super::series_rule::request_fields(),
+        "Request",
+    );
+    sections.push(section(
+        "series-rule",
+        super::series_rule::LABEL,
+        "Which wants for a listed option or future this deployment does not hold are asked of \
+         the platform with no person, and how many a day. Each change is kept with who made it \
+         and why.",
+        "<button type=\"button\" data-dialog-open=\"series-request\">Request series</button> \
+         <button type=\"button\" data-dialog-open=\"series-rule-change\">Change</button>",
+        format!(
+            "{}{rule_change}{series_request}",
+            super::series_rule::lines(series_rule, |subject| {
+                crate::tickets::display_name(records, subject)
+            })
+        ),
+    ));
+
+    // ── Stale reference actions permitted ───────────────────────────────────
+    // W6.38 (contract v28; rulings 517, 600): a deployment admin's.
+    let stale_change = dialog(
+        "stale-reference-change",
+        "Change the stale reference actions permitted",
+        "/admin/stale-reference-actions#stale-reference",
+        token,
+        &super::stale_reference::fields(stale_reference),
+        "Change",
+    );
+    sections.push(section(
+        "stale-reference",
+        super::stale_reference::LABEL,
+        "What an execution plugin's admin may choose when a placement's reference price is past \
+         its ceiling. Each change is kept with who made it and why.",
+        "<button type=\"button\" data-dialog-open=\"stale-reference-change\">Change</button>",
+        format!(
+            "{}{stale_change}",
+            super::stale_reference::lines(stale_reference, |subject| {
                 crate::tickets::display_name(records, subject)
             })
         ),

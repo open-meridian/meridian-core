@@ -122,6 +122,9 @@ fn run() -> Result<(), String> {
         .map_err(|failed| failed.to_string())?
         .block_on(async {
             let bus = bus_from_env(&instance_id).await?;
+            // Its own hops' ages -- a record batch accepted, a row delivered
+            // -- to the monitor, under its plugin's instance (W4.16; 606).
+            tokio::spawn(meridian_runtime::report_latency_forever(bus.clone()));
             let mut sidecar = Sidecar::new(bus, &deployment_id, identity);
             if let Some(verifier) = verifier {
                 sidecar = sidecar.with_verifier(verifier);

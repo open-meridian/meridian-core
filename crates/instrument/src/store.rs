@@ -319,6 +319,12 @@ pub struct Instrument {
     /// the platform's answer to a person's ask; empty where none is known.
     pub listing_venue_id: String,
 
+    /// A listed series' full terms, as the platform's record states them
+    /// (contract v28; rulings 559 and 575): the listed option's or the
+    /// future's message, its bytes in hex
+    /// (`instrument_type::listed_terms_to_text`); empty for any other record.
+    pub listed_terms: String,
+
     /// Where each value in force came from.
     pub sources: Vec<Source>,
 
@@ -760,6 +766,28 @@ pub trait Store: Send + Sync {
 
     /// Every event group version kept, in sequence (W3.30).
     fn event_groups(&self) -> Result<Vec<meridian_domain::v1::EventGroup>>;
+
+    /// Keep a company record's version as the platform answered it
+    /// (contract v28, W3.32): true where kept, false where that version was
+    /// held. Every version stays, each its own record, and each identifier it
+    /// carries finds it.
+    fn keep_company(
+        &self,
+        company: &meridian_domain::v1::CompanyRecord,
+        now_ns: i64,
+    ) -> Result<bool>;
+
+    /// A company record by its `ENT-` ID, at the latest version held.
+    fn company(&self, company_id: &str) -> Result<Option<meridian_domain::v1::CompanyRecord>>;
+
+    /// Every company any version of which carried this identifier, each at
+    /// its latest version, ordered by ID; whether it holds it at a date is
+    /// the record's window to say (W3.32).
+    fn companies_with(
+        &self,
+        scheme: &str,
+        value: &str,
+    ) -> Result<Vec<meridian_domain::v1::CompanyRecord>>;
 }
 
 /// A calendar version as the deployment keeps it (W3.17, contract v22): the
@@ -810,6 +838,10 @@ pub(crate) struct Held {
 
     /// Every event group version kept (contract v26), in sequence.
     pub(crate) event_groups: Vec<meridian_domain::v1::EventGroup>,
+
+    /// Every company record version kept (contract v28), by ID and version.
+    pub(crate) companies:
+        std::collections::BTreeMap<(String, i64), meridian_domain::v1::CompanyRecord>,
 }
 
 impl Held {

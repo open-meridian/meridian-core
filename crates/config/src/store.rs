@@ -135,6 +135,20 @@ pub struct TimeZoneChange {
     pub changed_by: String,
 }
 
+/// A deployment setting as its latest change set it (contract v28): its
+/// value, the message's bytes, and who changed it when.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DeploymentSettingChange {
+    pub value: Vec<u8>,
+    pub changed_at_ns: i64,
+    pub changed_by: String,
+}
+
+/// The series request rule's name among the settings (W6.37).
+pub const SERIES_REQUEST_RULE: &str = "series_request_rule";
+/// The stale-reference actions permitted, by name (W6.38).
+pub const STALE_REFERENCE_ACTIONS_PERMITTED: &str = "stale_reference_actions_permitted";
+
 /// The deployment's FX pivot currencies as their latest change set them
 /// (contract v27, W6.36).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1064,6 +1078,14 @@ pub trait Store: Send + Sync {
     /// Every change to the routing table, oldest first.
     fn model_routing_changes(&self) -> Result<Vec<ModelRoutingChange>>;
 
+    /// A deployment setting changed, its own record (contract v28; W6.37,
+    /// W6.38, decisions/031): its name, its value, who, through what, when
+    /// and why.
+    fn set_setting(&self, setting: &str, value: &[u8], author: &Author, at_ns: i64) -> Result<()>;
+
+    /// A setting's latest change, if any: none is its default.
+    fn setting(&self, setting: &str) -> Result<Option<DeploymentSettingChange>>;
+
     /// The usage statistics' setting changed, its own record (contract v24,
     /// W3.28, decisions/031): who, through what, when and why.
     fn set_reports_usage(&self, reports_usage: bool, author: &Author, at_ns: i64) -> Result<()>;
@@ -1101,13 +1123,31 @@ pub trait Store: Send + Sync {
     /// The install is its own record (decisions/031): who, through which
     /// delegation and client, from which prepared change, and its note
     /// (`version.uploaded_note`, the same as `by.note`).
+    ///
+    /// From v28 (spec/starter-packs, requirement 18) the install record
+    /// carries the pack whose install made it, `organisation/pack`, or
+    /// empty for one listing's.
     fn record_listed_version(
         &self,
         version: &PluginVersion,
         documentation: &[meridian_domain::v1::DocumentationText],
         listing_statement: &str,
         by: &Author,
+        pack: &str,
     ) -> Result<bool>;
+
+    /// The pack a registry version's install record names (W8.18); empty
+    /// for one listing's install, a local version, or one not recorded.
+    fn install_pack(&self, name: &str, version: &str) -> Result<String>;
+
+    /// A change to the deployment's record of a starter pack, its own
+    /// record (W8.18, W8.19; decisions/031): `pack_installed`,
+    /// `pack_updated` or `pack_removed`, never updated, never deleted.
+    fn record_pack_change(&self, change: &PackChange) -> Result<()>;
+
+    /// The changes to a pack's record, oldest first; every pack's where
+    /// `pack` is empty.
+    fn pack_changes(&self, pack: &str) -> Result<Vec<PackChange>>;
 
     /// Who installed a registry version, through what, and why; none for a
     /// local version or one not recorded.
@@ -1146,6 +1186,56 @@ pub trait Store: Send + Sync {
     ) -> Result<Vec<meridian_domain::v1::SentPluginUsageReport>>;
 }
 
+/// What a change to a starter pack's record in this deployment was (W8.18,
+/// W8.19; spec/starter-packs, requirements 18, 20 and 22).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackChangeKind {
+    /// The pack's ticked members installed, each with its outcome.
+    Installed,
+    /// "Update all": each member's outcome.
+    Updated,
+    /// The deployment's pack record removed; no member touched.
+    Removed,
+}
+
+impl PackChangeKind {
+    /// As the record names it.
+    pub fn name(self) -> &'static str {
+        match self {
+            PackChangeKind::Installed => "pack_installed",
+            PackChangeKind::Updated => "pack_updated",
+            PackChangeKind::Removed => "pack_removed",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<PackChangeKind> {
+        match name {
+            "pack_installed" => Some(PackChangeKind::Installed),
+            "pack_updated" => Some(PackChangeKind::Updated),
+            "pack_removed" => Some(PackChangeKind::Removed),
+            _ => None,
+        }
+    }
+}
+
+/// One change to a starter pack's record (decisions/031): the pack as the
+/// catalogue held it then, at the revision installed; each member's
+/// outcome; who, through what, when and why.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PackChange {
+    pub kind: PackChangeKind,
+    pub pack: String,
+    /// The revision installed (for an install, the one ticked from).
+    pub revision: u64,
+    /// The pack as the catalogue held it at the change.
+    pub held: meridian_domain::v1::PluginPack,
+    /// Each member's outcome: for an install, the members ticked; for an
+    /// update, every member; for a removal, every member as it stayed.
+    pub members: Vec<meridian_domain::v1::PackMemberStatus>,
+    pub by: Author,
+    pub at_ns: i64,
+}
+
 /// The conductor's latest copy of the platform's catalogue (W8.10): every
 /// listing as last pulled, the sequence the next pull reads after, the
 /// signing keys' status as the platform signed it (its JSON, so its
@@ -1159,4 +1249,8 @@ pub struct HeldCatalogue {
     /// Contract v26 (W8.14; ruling 196): the newest PluginPullStatus a
     /// bundle brought, its JSON as the platform signed it; empty for none.
     pub pull_status: String,
+    /// Contract v27 (W8.17, W8.18; spec/starter-packs, requirement 14):
+    /// every starter pack as last pulled, at its latest published
+    /// revision, a withdrawn one kept with its withdrawal.
+    pub packs: Vec<meridian_domain::v1::PluginPack>,
 }

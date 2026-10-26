@@ -208,6 +208,7 @@ fn rate(
             row_key: key.into(),
             subjects: vec![SubjectRef {
                 entity_id: subject.into(),
+                ..Default::default()
             }],
             source: Some(Source {
                 instance: instance.into(),
@@ -305,6 +306,7 @@ fn subjects(ids: &[&str]) -> Vec<SubjectRef> {
     ids.iter()
         .map(|id| SubjectRef {
             entity_id: id.to_string(),
+            ..Default::default()
         })
         .collect()
 }

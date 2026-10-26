@@ -52,10 +52,12 @@ pub const SET_DATASET_ENTITLEMENT: &str = "platform.config.command.set-dataset-e
 const WAIT: Duration = Duration::from_secs(5);
 
 /// The page's tabs, in the order an admin reaches for them.
-pub const TABS: [(&str, &str); 3] = [
+pub const TABS: [(&str, &str); 4] = [
     ("datasets", "Datasets"),
     ("entitlements", "Entitlements"),
     ("priority", "Priority"),
+    // Contract v28 (W10.9): the monitor's data age and session latency.
+    ("age", "Age"),
 ];
 
 async fn read<R: Message + Default>(
@@ -282,6 +284,11 @@ fn datasets_tab(rows: &[Row], records: &AccessRecords, token: &str) -> (String, 
                     "derived_use": if meridian_domain::lake::derived_use_bool(licence) { vec!["1"] } else { vec![] },
                     "display": if licence.display { vec!["1"] } else { vec![] },
                     "personal_use": if licence.personal_use { vec!["1"] } else { vec![] },
+                    // Contract v28 (491, 597): the eligibility in force.
+                    "eligibility_uses": licence.eligibility.as_ref().map(|e| e.uses.iter().map(|u| match meridian_pb::v1::DataUse::try_from(*u) {
+                        Ok(meridian_pb::v1::DataUse::Personal) => "personal",
+                        _ => "commercial",
+                    }).collect::<Vec<_>>()).unwrap_or_default(),
                 },
             });
             let entitle = serde_json::json!({"fields": {"dataset": d.dataset, "instance": "", "fields": "", "note": ""},
@@ -396,6 +403,15 @@ fn datasets_tab(rows: &[Row], records: &AccessRecords, token: &str) -> (String, 
          <label class=\"check\"><input type=\"checkbox\" name=\"derived_use\" value=\"1\"> Derived data may be made</label>\
          <label class=\"check\"><input type=\"checkbox\" name=\"display\" value=\"1\"> It may be shown</label>\
          <label class=\"check\"><input type=\"checkbox\" name=\"personal_use\" value=\"1\"> Its terms are one person's</label>\
+         <fieldset class=\"eligibility\"><legend>Who may take it, as its terms state</legend>\
+         <label class=\"check\"><input type=\"checkbox\" name=\"eligibility_uses\" value=\"personal\"> Personal use</label>\
+         <label class=\"check\"><input type=\"checkbox\" name=\"eligibility_uses\" value=\"commercial\"> Commercial use</label>\
+         <div class=\"threshold\"><label>Revenue below <input name=\"buyer_revenue_below\" inputmode=\"decimal\" \
+         pattern=\"[0-9]+(\\.[0-9]+)?\" placeholder=\"None\"></label>\
+         <label>or at least <input name=\"buyer_revenue_at_least\" inputmode=\"decimal\" \
+         pattern=\"[0-9]+(\\.[0-9]+)?\" placeholder=\"None\"></label>\
+         <label>Currency <input name=\"buyer_revenue_currency_code\" maxlength=\"3\" pattern=\"[A-Za-z]{{3}}\" \
+         placeholder=\"USD\"></label></div></fieldset>\
          <label>Fields readable by default <input name=\"default_fields\" \
          placeholder=\"Every field; or meridian.v1.Bar.vwap, ...\"></label>\
          <label>Note <input name=\"note\" maxlength=\"2000\" placeholder=\"Why\"></label>\
@@ -591,6 +607,7 @@ pub fn page(
     records: &AccessRecords,
     token: &str,
     notice: &str,
+    ages: &[meridian_domain::latency::Read],
 ) -> String {
     let unread = |why: &str| {
         format!(
@@ -626,7 +643,7 @@ pub fn page(
                aria-label=\"Add a priority\">+ Add</button>";
     format!(
         "<div class=\"admin\"><div class=\"page-head\"><h1>Data sources</h1></div>{notice}\
-         <nav class=\"tabs\">{tabs}</nav>{}{}{}{datasets_dialogs}{priority_dialog}</div>\
+         <nav class=\"tabs\">{tabs}</nav>{}{}{}{}{datasets_dialogs}{priority_dialog}</div>\
          <script>{}{}{PAGER_SCRIPT}</script>",
         section(
             "datasets",
@@ -651,6 +668,15 @@ pub fn page(
              over when one is silent.",
             add,
             &priority_body
+        ),
+        section(
+            "age",
+            "Age",
+            "Over the last minute, how old each dataset's rows are at each hop, from the source's \
+             time, and each plugin's sessions' round trip, order acknowledgement and fill delay, \
+             as the plugins measure them.",
+            "",
+            &crate::latency::tab(ages)
         ),
         super::overview::SCRIPT_START,
         super::overview::SCRIPT_END,
@@ -724,6 +750,7 @@ mod tests {
             &records,
             "<t>",
             "",
+            &[],
         );
         assert!(body.contains("data-datasets=\"1\""), "{body}");
         assert!(body.contains("<td class=\"wide num\" data-unconverted>2</td>"));
@@ -764,6 +791,7 @@ mod tests {
             &records,
             "<t>",
             "",
+            &[],
         );
         assert!(body.contains("data-one-person"), "{body}");
         // Not one person's terms: no warning however many read.
@@ -789,6 +817,7 @@ mod tests {
             &AccessRecords::default(),
             "<t>",
             "",
+            &[],
         );
         assert!(body.contains("Price, close"));
         assert!(body.contains("a-1:daily then b-1:daily"));
@@ -807,6 +836,7 @@ mod tests {
             &AccessRecords::default(),
             "<t>",
             "",
+            &[],
         );
         assert!(body.contains("The lake did not answer: timed out"));
     }

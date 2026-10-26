@@ -67,6 +67,18 @@ const fn spec(
 }
 
 pub static SPECS: &[Spec] = &[
+    // Contract v28's latency remainder (W10.9, W4.16; rulings 515, 517):
+    // the monitor's read, the deployment admin's.
+    spec(
+        "read_data_age",
+        "Read the data age",
+        "the data age per dataset and hop, and each data, connectivity or execution plugin's \
+sessions' round trip, order acknowledgement and fill delay, over the last minute: p50, p95 and \
+p99 in nanoseconds, how many were measured, the plugin that measured them, the session's last \
+sign of life and its backlog's peak. Measured by the plugins and core, never a price; no row.",
+        true,
+        nothing_schema,
+    ),
     spec(
         "list_datasets",
         "List datasets",
@@ -156,6 +168,17 @@ fn licence_schema() -> Value {
             "display": {"type": "boolean"},
             "default_fields": fields_list("the fields readable by default, by their dictionary entries; none for every field"),
             "personal_use": {"type": "boolean", "description": "whether its terms are one person's"},
+            "eligibility": {
+                "type": "object",
+                "description": "contract v28 (491): who may take it, as the terms state; unset keeps the declared eligibility. Shown, never enforced",
+                "properties": {
+                    "uses": {"type": "array", "items": {"type": "string", "enum": ["personal", "commercial"]}},
+                    "buyer_revenue_below": {"type": "string", "pattern": "^[0-9]+(\\.[0-9]+)?$"},
+                    "buyer_revenue_at_least": {"type": "string", "pattern": "^[0-9]+(\\.[0-9]+)?$"},
+                    "buyer_revenue_currency_code": {"type": "string", "pattern": "^[A-Z]{3}$"},
+                },
+                "additionalProperties": false,
+            },
             "note": note(),
         },
         "required": ["dataset", "kept", "retention_days", "derived_use", "display", "personal_use", "note"],
@@ -267,6 +290,19 @@ fn licence_json(licence: &DatasetLicence, set: bool) -> Value {
         ),
         "no_more_restrictive_terms": licence.no_more_restrictive_terms,
         "not_affiliated_notice": others_words(&licence.not_affiliated_notice),
+        // Contract v28 (491, 597): who may take it, as the terms state.
+        "eligibility": licence.eligibility.as_ref().map(|e| json!({
+            "uses": e.uses.iter().map(|u| match meridian_pb::v1::DataUse::try_from(*u) {
+                Ok(meridian_pb::v1::DataUse::Personal) => "personal",
+                Ok(meridian_pb::v1::DataUse::Commercial) => "commercial",
+                _ => "unspecified",
+            }).collect::<Vec<_>>(),
+            "buyer_revenue_below": e.buyer_revenue_below.as_ref()
+                .and_then(|d| meridian_domain::exact::Exact::from_wire(d).ok()).map(|x| x.to_string()),
+            "buyer_revenue_at_least": e.buyer_revenue_at_least.as_ref()
+                .and_then(|d| meridian_domain::exact::Exact::from_wire(d).ok()).map(|x| x.to_string()),
+            "buyer_revenue_currency_code": e.buyer_revenue_currency_code,
+        })),
         "updated_by": licence.updated_by,
         "updated_at_ns": stamp_said(licence.updated_at_ns),
         "acting_through_delegation": licence.acting_through_delegation,
@@ -308,6 +344,7 @@ fn priority_json(p: &SourcePriority) -> Value {
 pub async fn call(app: &App, caller: &Caller, spec: &Spec, arguments: Value) -> Value {
     match spec.name {
         "list_datasets" => list_datasets(app, caller, &arguments).await,
+        "read_data_age" => read_data_age(app, caller, &arguments),
         "set_dataset_licence" => set_licence(app, caller, &arguments).await,
         "set_dataset_entitlement" => set_entitlement(app, caller, &arguments).await,
         "list_source_priorities" => list_priorities(app, caller, &arguments).await,
@@ -390,11 +427,41 @@ async fn set_licence(app: &App, caller: &Caller, arguments: &Value) -> Value {
             "display",
             "default_fields",
             "personal_use",
+            "eligibility",
             "note",
         ],
         "",
         &mut problems,
     );
+    // Contract v28 (491, 597): the eligibility, where stated.
+    let eligibility = match top.get("eligibility") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(held)) => {
+            let uses: Vec<&str> = held
+                .get("uses")
+                .and_then(Value::as_array)
+                .map(|u| u.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            let said = |name: &str| held.get(name).and_then(Value::as_str).unwrap_or_default();
+            match meridian_domain::lake::eligibility_of(
+                &uses,
+                said("buyer_revenue_below"),
+                said("buyer_revenue_at_least"),
+                said("buyer_revenue_currency_code"),
+            ) {
+                Ok(read) => read,
+                Err(why) => {
+                    let field = why.split(' ').next().unwrap_or("eligibility").to_string();
+                    problems.add(&field, &why);
+                    None
+                }
+            }
+        }
+        Some(_) => {
+            problems.add("eligibility", "an object");
+            None
+        }
+    };
     let retention = integer(top, "retention_days", "", true, &mut problems);
     if !(0..=36_500).contains(&retention) {
         problems.add("retention_days", "0 to 36,500 days");
@@ -408,6 +475,7 @@ async fn set_licence(app: &App, caller: &Caller, arguments: &Value) -> Value {
                 display: boolean(top, "display", &mut problems),
                 default_fields: strings(top, "default_fields", MOST_FIELDS, &mut problems),
                 personal_use: boolean(top, "personal_use", &mut problems),
+                eligibility,
                 ..Default::default()
             },
             boolean(top, "derived_use", &mut problems),
@@ -472,6 +540,29 @@ async fn set_entitlement(app: &App, caller: &Caller, arguments: &Value) -> Value
             json!({"outcome": "made", "data": {"entitlement": entitlement_json(&entitlement)}})
         }
     }
+}
+
+/// W10.9 (contract v28): the monitor's read, the deployment admin's.
+fn read_data_age(app: &App, caller: &Caller, arguments: &Value) -> Value {
+    if let Some(refusal) = nothing(arguments) {
+        return refusal;
+    }
+    let records = match app.records.current(app.clock.now_ns()) {
+        Ok(records) => records,
+        Err(stale) => return refused("unavailable", &stale.to_string(), Vec::new()),
+    };
+    if !caller.access(&records).deployment_admin {
+        return refused(
+            "not_permitted",
+            "the data age is a deployment admin's to read",
+            Vec::new(),
+        );
+    }
+    let reads = crate::latency::reads(app.clock.now_ns());
+    json!({"outcome": "unchanged", "data": {
+        "window_ns": crate::latency::WINDOW_NS.to_string(),
+        "ages": reads.iter().map(crate::latency::json).collect::<Vec<_>>(),
+    }})
 }
 
 async fn list_priorities(app: &App, caller: &Caller, arguments: &Value) -> Value {
@@ -579,6 +670,8 @@ pub const PARITY: &[(&str, &str)] = &[
     ("tab datasets", "list_datasets"),
     ("tab entitlements", "list_datasets set_dataset_entitlement"),
     ("tab priority", "list_source_priorities set_source_priority"),
+    // Contract v28 (W10.9): the Age tab.
+    ("tab age", "read_data_age"),
     (
         "/admin/data-sources",
         "list_datasets list_source_priorities",

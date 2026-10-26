@@ -324,6 +324,12 @@ pub trait Store: Send + Sync {
         data_type: DataType,
         as_of_ns: i64,
     ) -> Result<Vec<Observation>>;
+
+    /// Every version of every row of one dataset and data type, in sequence
+    /// order: how a saved scenario is read at a version not its latest
+    /// (contract v28, W10.6, W12.8).
+    fn read_dataset_versions(&self, dataset: &str, data_type: DataType)
+        -> Result<Vec<Observation>>;
 }
 
 /// Whether a query answers every version it finds, not each row key's
@@ -333,8 +339,15 @@ pub trait Store: Send + Sync {
 ///
 /// A published-time read of rates (contract v27, W10.6) takes every version
 /// too: which is in force by published time is the read's to choose.
+///
+/// From contract v28 a declared corporate action is caught up the same way
+/// (the amendment of 2026-10-24: an unconflated row is caught up after a
+/// watermark, as trades and outcomes are).
 pub fn every_version(query: &Query) -> bool {
-    (query.data_type == DataType::Outcome && matches!(query.when, When::After(_)))
+    (matches!(
+        query.data_type,
+        DataType::Outcome | DataType::CorporateAction
+    ) && matches!(query.when, When::After(_)))
         || query.published_as_of_ns != 0
 }
 

@@ -43,11 +43,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use meridian_domain::asset_class;
+use meridian_domain::exact::Exact;
 use meridian_domain::v1::{
     AssetClass, ClaimCodePurpose, DiagnosticBundle, DiagnosticBundleReceipt,
-    EscalateInstrumentReply, EscalateInstrumentRequest, Identifier as PbIdentifier,
-    InstrumentRecord as PbInstrument, LicenceList, LicencePace, RedeemClaimCodeReply,
-    ReplacementFeedEntry, SecurityTemplate, VenueRecord,
+    EscalateInstrumentReply, EscalateInstrumentRequest, FieldRequirement,
+    Identifier as PbIdentifier, InstrumentRecord as PbInstrument, LicenceList, LicencePace,
+    RedeemClaimCodeReply, ReplacementFeedEntry, SecurityTemplate, VenueRecord,
 };
 use serde::Deserialize;
 
@@ -475,6 +476,31 @@ impl Platform {
             .await?;
         let value: serde_json::Value = read_json(&response)?;
         event_group_reply_from_json(&value).map_err(PlatformError::Malformed)
+    }
+
+    /// W1.32, W3.32 (contract v28; ruling 612): a company the instrument
+    /// store does not hold, asked by its open identifiers alone -- a CIK, an
+    /// LEI, each in a scheme on the licence list -- with no name the store
+    /// lacks and a request key; the platform's answer whole: its `ENT-`
+    /// record matched or minted, or the request queued for its staff. A
+    /// platform without the route answers as unreachable.
+    pub async fn match_or_mint_company(
+        &self,
+        request: &meridian_domain::v1::MatchOrMintCompanyRequest,
+        now_ns: i64,
+    ) -> Result<meridian_domain::v1::MatchOrMintCompanyReply, PlatformError> {
+        let body = serde_json::to_vec(&company_body(request))
+            .map_err(|failed| PlatformError::Malformed(failed.to_string()))?;
+        let response = self
+            .v24_call(
+                Method::Post,
+                "/api/v1/reference/match-company",
+                Some(body),
+                now_ns,
+            )
+            .await?;
+        let value: serde_json::Value = read_json(&response)?;
+        company_reply_from_json(&value).map_err(PlatformError::Malformed)
     }
 
     /// A route contract v24 added (W3.4, W3.24, W3.25, W3.27, W3.28). A
@@ -1011,13 +1037,28 @@ pub fn templates_from_json(value: &serde_json::Value) -> Result<Vec<SecurityTemp
                 .map(|fields| {
                     fields
                         .iter()
-                        .map(|field| meridian_domain::v1::TemplateField {
-                            path: text_of(field.get("path")),
-                            r#type: text_of(field.get("type")),
-                            required: field
+                        .map(|field| {
+                            let required = field
                                 .get("required")
                                 .and_then(|r| r.as_bool())
-                                .unwrap_or(false),
+                                .unwrap_or(false);
+                            // Contract v28 (574): the requirement level by its
+                            // word or enum name; a version before it reads
+                            // required as mint and its absence as optional.
+                            let requirement = meridian_domain::template::requirement_of(
+                                &text_of(field.get("requirement")),
+                                required,
+                            );
+                            meridian_domain::v1::TemplateField {
+                                path: text_of(field.get("path")),
+                                r#type: text_of(field.get("type")),
+                                required: required || requirement == FieldRequirement::Mint,
+                                requirement: requirement as i32,
+                                repeated: field
+                                    .get("repeated")
+                                    .and_then(|r| r.as_bool())
+                                    .unwrap_or(false),
+                            }
                         })
                         .collect()
                 })
@@ -1027,6 +1068,13 @@ pub fn templates_from_json(value: &serde_json::Value) -> Result<Vec<SecurityTemp
                 .and_then(|rule| rule.as_array())
                 .map(|rule| rule.iter().map(|scheme| text_of(Some(scheme))).collect())
                 .unwrap_or_default(),
+            // Contract v28 (579): a withdrawn version, readable and
+            // runnable, names the version new mints use.
+            withdrawn: item
+                .get("withdrawn")
+                .and_then(|w| w.as_bool())
+                .unwrap_or(false),
+            successor_version: text_of(item.get("successor_version")),
             template_id,
         });
     }
@@ -1096,6 +1144,11 @@ pub fn replacements_from_json(
                 replaced_by: text_of(entry.get("replaced_by")),
                 decommissioned: entry
                     .get("decommissioned")
+                    .and_then(|d| d.as_bool())
+                    .unwrap_or(false),
+                // Contract v28 (579): a series past its last lifecycle date.
+                expired: entry
+                    .get("expired")
                     .and_then(|d| d.as_bool())
                     .unwrap_or(false),
             })
@@ -1234,6 +1287,107 @@ pub fn event_group_reply_from_json(
     })
 }
 
+/// W1.32's request as the platform's JSON spells it (contract v28): the
+/// identifiers, the name where one is known, and the request key; nothing
+/// of the deployment.
+pub fn company_body(request: &meridian_domain::v1::MatchOrMintCompanyRequest) -> serde_json::Value {
+    serde_json::json!({
+        "identifiers": request
+            .identifiers
+            .iter()
+            .map(|identifier| serde_json::json!({
+                "scheme": identifier.scheme,
+                "value": identifier.value,
+                "source": identifier.source,
+            }))
+            .collect::<Vec<_>>(),
+        "name": request.name,
+        "request_key": request.request_key,
+    })
+}
+
+/// The platform's answer to a company (W1.32): its `ENT-` record, read
+/// strictly where it names what is kept -- the ID, the name, the identifiers
+/// with their windows -- and refused where it does not.
+pub fn company_reply_from_json(
+    value: &serde_json::Value,
+) -> Result<meridian_domain::v1::MatchOrMintCompanyReply, String> {
+    use meridian_domain::v1::{CompanyRecord, FormerName, MatchOrMintCompanyReply};
+    let company = match value.get("company").filter(|held| held.is_object()) {
+        None => None,
+        Some(company) => {
+            let company_id = text_of(company.get("company_id"));
+            if !company_id.starts_with("ENT-") {
+                return Err(format!(
+                    "a company arrived as {company_id:?}, not the platform's"
+                ));
+            }
+            let name = text_of(company.get("name"));
+            if name.trim().is_empty() {
+                return Err(format!("the company {company_id} arrived with no name"));
+            }
+            let mut identifiers = Vec::new();
+            for held in company
+                .get("identifiers")
+                .and_then(|held| held.as_array())
+                .into_iter()
+                .flatten()
+            {
+                let scheme = text_of(held.get("scheme"));
+                let value = text_of(held.get("value"));
+                if scheme.is_empty() || value.is_empty() {
+                    return Err(format!(
+                        "the company {company_id} arrived with an identifier missing its scheme \
+                         or value"
+                    ));
+                }
+                identifiers.push(PbIdentifier {
+                    scheme,
+                    value,
+                    source: text_of(held.get("source")),
+                    valid_from_ns: int_of(held.get("valid_from_ns")),
+                    valid_until_ns: int_of(held.get("valid_until_ns")),
+                    trading_currency: String::new(),
+                });
+            }
+            if identifiers.is_empty() {
+                return Err(format!(
+                    "the company {company_id} arrived with no identifier"
+                ));
+            }
+            Some(CompanyRecord {
+                company_id,
+                name,
+                identifiers,
+                former_names: company
+                    .get("former_names")
+                    .and_then(|names| names.as_array())
+                    .into_iter()
+                    .flatten()
+                    .map(|former| FormerName {
+                        name: text_of(former.get("name")),
+                        valid_from: text_of(former.get("valid_from")),
+                        valid_until: text_of(former.get("valid_until")),
+                    })
+                    .filter(|former| !former.name.trim().is_empty())
+                    .collect(),
+                version: int_of(company.get("version")).max(1),
+            })
+        }
+    };
+    Ok(MatchOrMintCompanyReply {
+        company,
+        minted: value
+            .get("minted")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        pending_review: value
+            .get("pending_review")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    })
+}
+
 /// A reply from the platform, in the shape of the contract's messages.
 ///
 /// Unknown fields are ignored, matching protobuf. What is not ignored is a
@@ -1305,6 +1459,12 @@ struct WireRecord {
     /// a record that is not one.
     #[serde(default)]
     binary_event_contract: Option<WireContract>,
+    /// A listed series' terms (contract v28, W1.1): a listed option's or a
+    /// future option's, and a future's; null on every other record.
+    #[serde(default)]
+    listed_option: Option<WireListedOption>,
+    #[serde(default)]
+    future: Option<WireFuture>,
     #[serde(default)]
     lifecycle_state: String,
     #[serde(default)]
@@ -1345,6 +1505,67 @@ struct WireBound {
     value: String,
     #[serde(default)]
     inclusive: bool,
+}
+
+/// meridian.v1.ListedOption as the platform's answer carries it: enums by
+/// their names, the strike a Money and the multiplier and each quantity as
+/// text, so nothing passes through a float.
+#[derive(Debug, Deserialize)]
+struct WireListedOption {
+    #[serde(default)]
+    underlying_instrument_id: String,
+    #[serde(default)]
+    put_or_call: String,
+    #[serde(default)]
+    strike_price: Option<WireMoney>,
+    #[serde(default)]
+    expiration_date: String,
+    #[serde(default)]
+    last_trade_date: String,
+    #[serde(default)]
+    exercise_style: String,
+    #[serde(default)]
+    settlement_method: String,
+    #[serde(default)]
+    settlement_time: String,
+    #[serde(default)]
+    contract_multiplier: String,
+    #[serde(default)]
+    deliverable: Vec<WireComponent>,
+    #[serde(default)]
+    option_root: String,
+    #[serde(default)]
+    contract_month: String,
+}
+
+/// meridian.v1.DeliverableComponent as the platform's answer carries it.
+#[derive(Debug, Deserialize)]
+struct WireComponent {
+    #[serde(default)]
+    instrument_id: String,
+    #[serde(default)]
+    quantity: String,
+}
+
+/// meridian.v1.FutureContract as the platform's answer carries it.
+#[derive(Debug, Deserialize)]
+struct WireFuture {
+    #[serde(default)]
+    underlying_instrument_id: String,
+    #[serde(default)]
+    product_code: String,
+    #[serde(default)]
+    contract_month: String,
+    #[serde(default)]
+    last_trade_date: String,
+    #[serde(default)]
+    final_settlement_date: String,
+    #[serde(default)]
+    settlement_method: String,
+    #[serde(default)]
+    contract_multiplier: String,
+    #[serde(default)]
+    first_notice_date: String,
 }
 
 /// A Money as the platform's answer carries it: the amount as text, so
@@ -1565,33 +1786,14 @@ fn into_record(record: WireRecord) -> Result<PbInstrument, PlatformError> {
                 record.instrument_id, record.instrument_type
             ))
         })? as i32;
+    let id = record.instrument_id.as_str();
     let binary_event_contract = match record.binary_event_contract {
         None => None,
         Some(contract) => {
-            let payout = match contract.payout {
-                None => None,
-                Some(money) => Some(meridian_domain::v1::Money {
-                    amount: if money.amount.trim().is_empty() {
-                        None
-                    } else {
-                        Some(
-                            money
-                                .amount
-                                .trim()
-                                .parse::<meridian_domain::exact::Exact>()
-                                .map_err(|_| {
-                                    PlatformError::Malformed(format!(
-                                        "{} arrived with a payout of {:?}, which is no decimal",
-                                        record.instrument_id, money.amount
-                                    ))
-                                })?
-                                .to_wire(),
-                        )
-                    },
-                    currency_code: money.currency_code,
-                    instrument_id: money.instrument_id,
-                }),
-            };
+            let payout = contract
+                .payout
+                .map(|money| wire_money(id, "payout", money))
+                .transpose()?;
             let bound = |held: Option<WireBound>, which: &str| {
                 held.map(|held| {
                     held.value
@@ -1619,6 +1821,14 @@ fn into_record(record: WireRecord) -> Result<PbInstrument, PlatformError> {
             })
         }
     };
+    let listed_option = record
+        .listed_option
+        .map(|terms| listed_option(id, terms))
+        .transpose()?;
+    let future = record
+        .future
+        .map(|terms| future_contract(id, terms))
+        .transpose()?;
 
     Ok(PbInstrument {
         instrument_id: record.instrument_id,
@@ -1640,7 +1850,133 @@ fn into_record(record: WireRecord) -> Result<PbInstrument, PlatformError> {
         record_time_ns: record.record_time_ns,
         template_id: record.template_id,
         template_version: record.template_version,
+        listed_option,
+        future,
         ..Default::default()
+    })
+}
+
+/// A decimal the answer carries as text, `None` where it is empty; one that
+/// is no decimal is refused naming its field.
+fn wire_decimal(
+    id: &str,
+    what: &str,
+    text: &str,
+) -> Result<Option<meridian_domain::exact::Exact>, PlatformError> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    text.parse::<meridian_domain::exact::Exact>()
+        .map(Some)
+        .map_err(|_| {
+            PlatformError::Malformed(format!(
+                "{id} arrived with a {what} of {text:?}, which is no decimal"
+            ))
+        })
+}
+
+fn wire_money(
+    id: &str,
+    what: &str,
+    money: WireMoney,
+) -> Result<meridian_domain::v1::Money, PlatformError> {
+    Ok(meridian_domain::v1::Money {
+        amount: wire_decimal(id, what, &money.amount)?.map(Exact::to_wire),
+        currency_code: money.currency_code,
+        instrument_id: money.instrument_id,
+    })
+}
+
+/// An enum the answer carries by its name, unspecified where it is empty; a
+/// name the schema does not define is refused, never read as unspecified.
+fn wire_enum(
+    id: &str,
+    what: &str,
+    name: &str,
+    by_name: impl Fn(&str) -> Option<i32>,
+) -> Result<i32, PlatformError> {
+    if name.trim().is_empty() {
+        return Ok(0);
+    }
+    by_name(name.trim()).ok_or_else(|| {
+        PlatformError::Malformed(format!(
+            "{id} arrived with {what} {name:?}, which the schema does not define"
+        ))
+    })
+}
+
+/// A listed option's or a future option's terms (contract v28, W1.1), as
+/// the instrument store keeps them with the record.
+fn listed_option(
+    id: &str,
+    terms: WireListedOption,
+) -> Result<meridian_domain::v1::ListedOption, PlatformError> {
+    use meridian_domain::v1::{
+        DeliverableComponent, ExerciseStyle, PutOrCall, SettlementMethod, SettlementTime,
+    };
+    Ok(meridian_domain::v1::ListedOption {
+        underlying_instrument_id: terms.underlying_instrument_id,
+        put_or_call: wire_enum(id, "put_or_call", &terms.put_or_call, |n| {
+            PutOrCall::from_str_name(n).map(|v| v as i32)
+        })?,
+        strike_price: terms
+            .strike_price
+            .map(|money| wire_money(id, "strike_price", money))
+            .transpose()?,
+        expiration_date: terms.expiration_date,
+        last_trade_date: terms.last_trade_date,
+        exercise_style: wire_enum(id, "exercise_style", &terms.exercise_style, |n| {
+            ExerciseStyle::from_str_name(n).map(|v| v as i32)
+        })?,
+        settlement_method: wire_enum(id, "settlement_method", &terms.settlement_method, |n| {
+            SettlementMethod::from_str_name(n).map(|v| v as i32)
+        })?,
+        settlement_time: wire_enum(id, "settlement_time", &terms.settlement_time, |n| {
+            SettlementTime::from_str_name(n).map(|v| v as i32)
+        })?,
+        contract_multiplier: wire_decimal(id, "contract_multiplier", &terms.contract_multiplier)?
+            .map(Exact::to_wire),
+        deliverable: terms
+            .deliverable
+            .into_iter()
+            .enumerate()
+            .map(|(n, component)| {
+                Ok(DeliverableComponent {
+                    quantity: wire_decimal(
+                        id,
+                        &format!("deliverable[{n}].quantity"),
+                        &component.quantity,
+                    )?
+                    .map(Exact::to_wire),
+                    instrument_id: component.instrument_id,
+                })
+            })
+            .collect::<Result<_, PlatformError>>()?,
+        option_root: terms.option_root,
+        contract_month: terms.contract_month,
+    })
+}
+
+/// A future's terms (contract v28, W1.1), as the instrument store keeps
+/// them with the record.
+fn future_contract(
+    id: &str,
+    terms: WireFuture,
+) -> Result<meridian_domain::v1::FutureContract, PlatformError> {
+    use meridian_domain::v1::SettlementMethod;
+    Ok(meridian_domain::v1::FutureContract {
+        underlying_instrument_id: terms.underlying_instrument_id,
+        product_code: terms.product_code,
+        contract_month: terms.contract_month,
+        last_trade_date: terms.last_trade_date,
+        final_settlement_date: terms.final_settlement_date,
+        settlement_method: wire_enum(id, "settlement_method", &terms.settlement_method, |n| {
+            SettlementMethod::from_str_name(n).map(|v| v as i32)
+        })?,
+        contract_multiplier: wire_decimal(id, "contract_multiplier", &terms.contract_multiplier)?
+            .map(Exact::to_wire),
+        first_notice_date: terms.first_notice_date,
     })
 }
 
@@ -2243,6 +2579,192 @@ pub(crate) mod tests {
         assert!(refused.to_string().contains("floor"), "{refused}");
     }
 
+    /// A listed option the platform minted, as its escalation answers it
+    /// (meridian-platform's v28 step: `instruments._as_record`, the terms as
+    /// `listed_terms` writes them -- enums by name, decimals as text).
+    fn minted_option(multiplier: &str, put_or_call: &str) -> String {
+        serde_json::json!({
+            "found": true,
+            "minted": true,
+            "near_match": false,
+            "pending_review": false,
+            "instrument": {
+                "instrument_id": "INS-AAPL261120C230",
+                "identifiers": [
+                    {"scheme": "occ_osi", "value": "AAPL  261120C00230000", "source": "",
+                     "valid_from_ns": AS_OF, "valid_until_ns": 0},
+                    {"scheme": "figi", "value": "BBG01OPTION1", "source": "",
+                     "valid_from_ns": AS_OF, "valid_until_ns": 0}
+                ],
+                "asset_class": "derivative",
+                "currency": "USD",
+                "exchange_mic": "",
+                "listing_venue_id": "",
+                "description": "AAPL 2026-11-20 230 Call",
+                "instrument_type": "listed_option",
+                "binary_event_contract": null,
+                "listed_option": {
+                    "underlying_instrument_id": "INS-AAPL",
+                    "put_or_call": put_or_call,
+                    "strike_price": {"amount": "230", "currency_code": "USD", "instrument_id": ""},
+                    "expiration_date": "2026-11-20",
+                    "last_trade_date": "2026-11-20",
+                    "exercise_style": "EXERCISE_STYLE_AMERICAN",
+                    "settlement_method": "SETTLEMENT_METHOD_PHYSICAL",
+                    "settlement_time": "",
+                    "contract_multiplier": multiplier,
+                    "deliverable": [{"instrument_id": "INS-AAPL", "quantity": "100"}],
+                    "option_root": "AAPL",
+                    "contract_month": ""
+                },
+                "future": null,
+                "lifecycle_state": "INSTRUMENT_LIFECYCLE_STATE_ACTIVE",
+                "template_id": "TPL-listed-option",
+                "template_version": "1",
+                "version": 1,
+                "valid_from_ns": AS_OF,
+                "record_time_ns": AS_OF
+            }
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn a_minted_series_arrives_with_its_terms() {
+        // Contract v28 (W1.1, W3.31): the series' full terms reach the
+        // deployment with its record, so the store keeps them (575).
+        use meridian_domain::exact::Exact;
+        use meridian_domain::v1::{ExerciseStyle, PutOrCall, SettlementMethod, SettlementTime};
+        let answer = platform(Fake::new(vec![Ok(reply(
+            201,
+            &minted_option("100", "PUT_OR_CALL_CALL"),
+        ))]))
+        .escalate(&escalation(), NOW)
+        .await
+        .unwrap();
+        assert!(answer.minted);
+        let record = answer.instrument.unwrap();
+        assert_eq!(
+            record.instrument_type,
+            meridian_domain::v1::InstrumentType::ListedOption as i32
+        );
+        assert!(record.future.is_none());
+        let terms = record.listed_option.clone().unwrap();
+        assert_eq!(terms.underlying_instrument_id, "INS-AAPL");
+        assert_eq!(terms.put_or_call, PutOrCall::Call as i32);
+        assert_eq!(terms.exercise_style, ExerciseStyle::American as i32);
+        assert_eq!(terms.settlement_method, SettlementMethod::Physical as i32);
+        assert_eq!(terms.settlement_time, SettlementTime::Unspecified as i32);
+        let strike = terms.strike_price.unwrap();
+        assert_eq!(strike.currency_code, "USD");
+        assert_eq!(
+            Exact::from_wire(&strike.amount.unwrap())
+                .unwrap()
+                .to_string(),
+            "230"
+        );
+        assert_eq!(
+            Exact::from_wire(&terms.contract_multiplier.unwrap())
+                .unwrap()
+                .to_string(),
+            "100"
+        );
+        assert_eq!(terms.deliverable.len(), 1);
+        assert_eq!(terms.deliverable[0].instrument_id, "INS-AAPL");
+        assert_eq!(
+            Exact::from_wire(terms.deliverable[0].quantity.as_ref().unwrap())
+                .unwrap()
+                .to_string(),
+            "100"
+        );
+        assert_eq!(
+            (terms.option_root.as_str(), terms.expiration_date.as_str()),
+            ("AAPL", "2026-11-20")
+        );
+        // What the store keeps reads back as the same terms.
+        let kept = meridian_domain::instrument_type::listed_terms_to_text(&record);
+        assert_eq!(
+            meridian_domain::instrument_type::listed_option_from_text(&kept),
+            record.listed_option
+        );
+
+        // A multiplier that is no decimal, and a right the schema does not
+        // define, are refused naming the field, never kept as unset.
+        for (multiplier, right, field) in [
+            ("a hundred", "PUT_OR_CALL_CALL", "contract_multiplier"),
+            ("100", "PUT_OR_CALL_STRADDLE", "put_or_call"),
+        ] {
+            let refused = platform(Fake::new(vec![Ok(reply(
+                201,
+                &minted_option(multiplier, right),
+            ))]))
+            .escalate(&escalation(), NOW)
+            .await
+            .unwrap_err();
+            assert!(refused.to_string().contains(field), "{refused}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pulled_future_arrives_with_its_terms() {
+        // Contract v28 (W1.1): a future's terms, as the platform answers
+        // them (its v28 step's test: ESZ6 on XCME, cash-settled, x50).
+        use meridian_domain::v1::SettlementMethod;
+        let body = serde_json::json!({
+            "found": true,
+            "instrument": {
+                "instrument_id": "INS-ESZ6",
+                "identifiers": [{"scheme": "ticker", "value": "ESZ6", "source": "XCME",
+                                 "valid_from_ns": AS_OF, "valid_until_ns": 0}],
+                "asset_class": "derivative",
+                "currency": "USD",
+                "description": "ES 202612 future",
+                "instrument_type": "future",
+                "binary_event_contract": null,
+                "listed_option": null,
+                "future": {
+                    "underlying_instrument_id": "INS-SPX",
+                    "product_code": "ES",
+                    "contract_month": "202612",
+                    "last_trade_date": "2026-12-18",
+                    "final_settlement_date": "2026-12-18",
+                    "settlement_method": "SETTLEMENT_METHOD_CASH",
+                    "contract_multiplier": "50",
+                    "first_notice_date": ""
+                },
+                "lifecycle_state": "INSTRUMENT_LIFECYCLE_STATE_ACTIVE",
+                "template_id": "TPL-future",
+                "template_version": "1",
+                "version": 1
+            }
+        })
+        .to_string();
+        let record = platform(Fake::new(vec![Ok(reply(200, &body))]))
+            .pull_instrument("INS-ESZ6", AS_OF, NOW)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(record.listed_option.is_none());
+        let terms = record.future.clone().unwrap();
+        assert_eq!(
+            (terms.product_code.as_str(), terms.contract_month.as_str()),
+            ("ES", "202612")
+        );
+        assert_eq!(terms.settlement_method, SettlementMethod::Cash as i32);
+        assert_eq!(terms.final_settlement_date, "2026-12-18");
+        assert_eq!(
+            meridian_domain::exact::Exact::from_wire(&terms.contract_multiplier.unwrap())
+                .unwrap()
+                .to_string(),
+            "50"
+        );
+        let kept = meridian_domain::instrument_type::listed_terms_to_text(&record);
+        assert_eq!(
+            meridian_domain::instrument_type::future_from_text(&kept),
+            record.future
+        );
+    }
+
     #[tokio::test]
     async fn a_pull_carries_the_event_contract_and_each_identifiers_window() {
         // Contract v19: the type and its payout and close, and the
@@ -2601,6 +3123,71 @@ pub(crate) mod tests {
             .is_err());
         let before = platform(Fake::new(vec![Ok(reply(404, "{}"))]))
             .escalate_event_group(&request, NOW)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(before, PlatformError::Unreachable { .. }),
+            "{before}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_company_is_asked_by_its_identifiers_and_its_ent_answer_read() {
+        // Contract v28 (W1.32, W3.32; ruling 612).
+        use meridian_domain::v1::MatchOrMintCompanyRequest;
+        let answer = serde_json::json!({
+            "company": {
+                "company_id": "ENT-01JC28APPLEINC000000000001",
+                "name": "Apple Inc.",
+                "identifiers": [{"scheme": "cik", "value": "0000320193", "valid_from_ns": "7"}],
+                "former_names": [{"name": "APPLE COMPUTER INC", "valid_until": "2007-01-04"}],
+                "version": "3"
+            },
+            "minted": true, "pending_review": false
+        })
+        .to_string();
+        let transport = Fake::new(vec![Ok(reply(200, &answer))]);
+        let request = MatchOrMintCompanyRequest {
+            identifiers: vec![identifier("cik", "0000320193", "")],
+            name: String::new(),
+            request_key: "k".into(),
+        };
+        let answered = platform(transport.clone())
+            .match_or_mint_company(&request, NOW)
+            .await
+            .unwrap();
+        assert!(answered.minted && !answered.pending_review);
+        let company = answered.company.unwrap();
+        assert_eq!(company.version, 3);
+        assert_eq!(company.identifiers[0].valid_from_ns, 7);
+        assert_eq!(company.former_names[0].valid_until, "2007-01-04");
+        assert!(transport.urls()[0].ends_with("/api/v1/reference/match-company"));
+        let body: serde_json::Value = serde_json::from_str(&transport.bodies()[0]).unwrap();
+        assert_eq!(body["identifiers"][0]["scheme"], "cik");
+        assert_eq!(body["request_key"], "k");
+        assert_eq!(
+            body.as_object().unwrap().len(),
+            3,
+            "identifiers, name and request key, nothing else: {body}"
+        );
+        // Queued: no company, pending review.
+        let queued = platform(Fake::new(vec![Ok(reply(
+            200,
+            r#"{"minted": false, "pending_review": true}"#,
+        ))]))
+        .match_or_mint_company(&request, NOW)
+        .await
+        .unwrap();
+        assert!(queued.company.is_none() && queued.pending_review);
+        // Under an ID that is not the platform's: refused; a platform before
+        // v28: unreachable.
+        let wrong = answer.replace("ENT-01JC28", "LCL-01JC28");
+        assert!(platform(Fake::new(vec![Ok(reply(200, &wrong))]))
+            .match_or_mint_company(&request, NOW)
+            .await
+            .is_err());
+        let before = platform(Fake::new(vec![Ok(reply(404, "{}"))]))
+            .match_or_mint_company(&request, NOW)
             .await
             .unwrap_err();
         assert!(

@@ -62,9 +62,12 @@ pub fn listing_path(listing: &str) -> String {
 }
 
 pub mod installed;
+pub mod packs;
 
 pub fn routes() -> Router<Arc<App>> {
     Router::new()
+        // Contract v27's wire, built in v28 (W8.18, W8.19): starter packs.
+        .merge(packs::routes())
         .route("/admin/plugins/versions", get(plugins_page))
         // Ruling 305: a plugin's Versions, and its acts.
         .route("/admin/plugins/versions/launch", post(installed::launch))
@@ -128,8 +131,15 @@ async fn ask<R: Message + Default>(
         )
         .await
         .map_err(|failed| match failed {
+            // A refusal's words, its code or its status (a starter pack's
+            // refusal names its field, v28) left out of what a page says.
             BusError::HandlerFailed { detail, .. } => meridian_bus::read_refusal(&detail)
-                .map_or(detail.clone(), |(_, words)| words.to_string()),
+                .map(|(_, words)| words.to_string())
+                .or_else(|| {
+                    meridian_bus::read_refusal_status(&detail)
+                        .map(|(_, _, words)| words.to_string())
+                })
+                .unwrap_or(detail),
             other => other.to_string(),
         })?;
     R::decode(&bytes[..]).map_err(|failed| format!("an undecodable reply: {failed}"))
@@ -419,6 +429,22 @@ async fn plugins_page(
 }
 
 async fn browse(app: &App, session: &Session, asked: &HashMap<String, String>) -> String {
+    // Browse's two-way switch (W8.18; spec/starter-packs, requirement 16).
+    if asked.get("view").map(String::as_str) == Some("packs") {
+        return format!(
+            "{}{}",
+            packs::switch("packs"),
+            packs::view(app, session, asked).await
+        );
+    }
+    format!(
+        "{}{}",
+        packs::switch("plugins"),
+        browse_plugins(app, session, asked).await
+    )
+}
+
+async fn browse_plugins(app: &App, session: &Session, asked: &HashMap<String, String>) -> String {
     let field = |name: &str| asked.get(name).cloned().unwrap_or_default();
     let reply = match listings(
         app,
@@ -515,7 +541,7 @@ fn browse_row(listing: &PluginListing) -> String {
     let best = latest(listing);
     let (floor_ok, floor) = best.map(floor_mark).unwrap_or((true, String::new()));
     format!(
-        "<tr data-listing=\"{id}\"><td class=\"keep\"><a href=\"{href}\" title=\"{id}\">{name}</a></td>\
+        "<tr data-listing=\"{id}\"><td class=\"keep\"><a href=\"{href}\" title=\"{id}\">{name}</a>{successor}</td>\
          <td class=\"wide\">{publisher}</td><td class=\"mid\">{roles}</td>\
          <td><span class=\"pill\">{label}</span></td>\
          <td{floor_class}{floor_title}>{version}</td><td class=\"mid\">{installs}</td>\
@@ -523,6 +549,17 @@ fn browse_row(listing: &PluginListing) -> String {
         id = escape(&listing.listing),
         href = escape(&listing_path(&listing.listing)),
         name = escape(&display_name(listing)),
+        // Contract v28 (W8.16): a withdrawn listing names its successor.
+        successor = if listing.replaced_by.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " <a class=\"pill\" data-replaced-by=\"{to}\" href=\"{href}\" title=\"Replaced by {to}\">\
+                 Replaced by {to}</a>",
+                to = escape(&listing.replaced_by),
+                href = escape(&listing_path(&listing.replaced_by)),
+            )
+        },
         publisher = escape(if listing.publisher.is_empty() {
             listing.listing.split('/').next().unwrap_or_default()
         } else {

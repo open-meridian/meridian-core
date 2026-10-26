@@ -43,6 +43,10 @@ const RESOLVED: &str = "INS-01J8XQ4M7K0000000000RSLV";
 /// The bus's own instance: in these tests the `ems`, the `oms` and the
 /// connectivity plugin at once.
 const ME: &str = "oems-1";
+/// Contract v28: two listed calls of one root, and an expired one.
+const CALL_230: &str = "INS-01J8XQ4M7K000000AAPLC230";
+const CALL_240: &str = "INS-01J8XQ4M7K000000AAPLC240";
+const EXPIRED_CALL: &str = "INS-01J8XQ4M7K000000AAPLC100";
 /// 2026-10-13T13:30:00Z.
 const NOW: i64 = 1_760_362_200_000_000_000;
 
@@ -78,6 +82,20 @@ fn wired() -> Wired {
                 ..record(AssetClass::Equity, "CHF")
             }),
             RESOLVED => Some(record(AssetClass::Equity, "CHF")),
+            CALL_230 | CALL_240 => Some(InstrumentRecord {
+                instrument_type: InstrumentType::ListedOption as i32,
+                // Contract v28 (559): its premium multiplier.
+                listed_option: Some(ListedOption {
+                    contract_multiplier: d("100"),
+                    ..Default::default()
+                }),
+                ..record(AssetClass::Derivative, "USD")
+            }),
+            EXPIRED_CALL => Some(InstrumentRecord {
+                instrument_type: InstrumentType::ListedOption as i32,
+                lifecycle_state: InstrumentLifecycleState::Expired as i32,
+                ..record(AssetClass::Derivative, "USD")
+            }),
             _ => None,
         };
         Ok((
@@ -3418,4 +3436,169 @@ async fn a_stale_reference_holds_the_order_typed_or_rides_its_placement() {
         "{}",
         warned.reason
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_package_is_two_to_sixteen_legs_in_lowest_terms_each_opening_or_closing() {
+    // Contract v28 (W11.1; rulings 564, 592): a vertical spread, bought as
+    // one package at a net debit; and what W11.1 refuses, naming the field.
+    let w = wired();
+    let leg = |instrument: &str, side: Side, ratio: &str| Leg {
+        instrument_id: instrument.into(),
+        side: side as i32,
+        ratio: d(ratio),
+        position_effect: PositionEffect::Open as i32,
+    };
+    let vertical = ProposeOrderRequest {
+        instrument_id: String::new(),
+        legs: vec![
+            leg(CALL_230, Side::Buy, "1"),
+            leg(CALL_240, Side::Sell, "1"),
+        ],
+        limit_price: usd("3.10"),
+        quantity: d("5"),
+        ..buy("5")
+    };
+    let order = propose(&w, &vertical).await.unwrap();
+    assert_eq!(order.legs.len(), 2);
+    assert!(order.instrument_id.is_empty());
+    let refused = |request: ProposeOrderRequest| {
+        let w = &w;
+        async move {
+            let said = propose(w, &request).await.unwrap_err();
+            status_of(&said)
+                .map(|(_, fields)| fields)
+                .unwrap_or_default()
+        }
+    };
+    assert_eq!(
+        refused(ProposeOrderRequest {
+            instrument_id: AAPL.into(),
+            ..vertical.clone()
+        })
+        .await,
+        vec!["instrument_id"]
+    );
+    assert_eq!(
+        refused(ProposeOrderRequest {
+            legs: vec![leg(CALL_230, Side::Buy, "1")],
+            ..vertical.clone()
+        })
+        .await,
+        vec!["legs"]
+    );
+    assert_eq!(
+        refused(ProposeOrderRequest {
+            legs: vec![
+                leg(CALL_230, Side::Buy, "2"),
+                leg(CALL_240, Side::Sell, "2")
+            ],
+            ..vertical.clone()
+        })
+        .await,
+        vec!["legs[0].ratio"]
+    );
+    assert_eq!(
+        refused(ProposeOrderRequest {
+            legs: vec![
+                Leg {
+                    position_effect: PositionEffect::Unspecified as i32,
+                    ..leg(CALL_230, Side::Buy, "1")
+                },
+                leg(CALL_240, Side::Sell, "1"),
+            ],
+            ..vertical.clone()
+        })
+        .await,
+        vec!["legs[0].position_effect"]
+    );
+    assert_eq!(
+        refused(ProposeOrderRequest {
+            legs: vec![
+                leg(EXPIRED_CALL, Side::Buy, "1"),
+                leg(CALL_240, Side::Sell, "1")
+            ],
+            ..vertical.clone()
+        })
+        .await,
+        vec!["legs[0].instrument_id"]
+    );
+    // A single-leg order in an option says open or close; one in a share
+    // says neither.
+    assert_eq!(
+        refused(ProposeOrderRequest {
+            instrument_id: CALL_230.into(),
+            legs: vec![],
+            ..vertical.clone()
+        })
+        .await,
+        vec!["position_effect"]
+    );
+    assert_eq!(
+        refused(ProposeOrderRequest {
+            position_effect: PositionEffect::Close as i32,
+            ..buy("5")
+        })
+        .await,
+        vec!["position_effect"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_option_fill_is_priced_by_its_multiplier_and_a_leg_names_its_package() {
+    // Contract v28 (559; FIX 231): one option bought at 2.50 is 250.00 of
+    // cost and cash; a leg's fill names its package execution.
+    let w = wired();
+    let order = propose(
+        &w,
+        &ProposeOrderRequest {
+            instrument_id: CALL_230.into(),
+            position_effect: PositionEffect::Open as i32,
+            limit_price: usd("2.50"),
+            ..buy("1")
+        },
+    )
+    .await
+    .unwrap();
+    waits(&w, ACC, false).await;
+    release(&w, &order.order_id).await.unwrap();
+    let placement = place(&w, &order.order_id, "1", &person(TRADER))
+        .await
+        .unwrap()
+        .placement
+        .unwrap();
+    let mut filled = fill(&placement.placement_id, "1", "VENUE-1");
+    filled.price = usd("2.50");
+    let mut leg = filled.clone();
+    leg.multi_leg_reporting_type = MultiLegReportingType::Leg as i32;
+    let refused = execute(&w, &leg).await.unwrap_err();
+    assert_eq!(
+        status_of(&refused).map(|(_, f)| f).unwrap_or_default(),
+        vec!["package_execution_id"]
+    );
+    execute(&w, &filled).await.unwrap();
+    let positions = w
+        .store
+        .positions(&crate::store::PositionsRead {
+            scope: Scope::Everything,
+            account_id: ACC.into(),
+            since: None,
+            business_date: String::new(),
+            at: None,
+            limit: 100,
+            cursor: String::new(),
+        })
+        .unwrap();
+    let held = |instrument: &str| {
+        positions
+            .records
+            .iter()
+            .find(|p| p.instrument_id == instrument)
+            .cloned()
+            .unwrap_or_else(|| panic!("{instrument} is held"))
+    };
+    let option = held(CALL_230);
+    let terms = option.lots[0].terms.clone().unwrap();
+    assert_eq!(read(&terms.cost.unwrap().amount), "250.00");
+    assert_eq!(read(&terms.unit_cost.unwrap().amount), "2.50");
 }

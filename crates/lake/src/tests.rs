@@ -183,6 +183,7 @@ fn close(instance: &str, row_key: &str, subject: &str, date: &str, amount: &str)
             row_key: row_key.into(),
             subjects: vec![SubjectRef {
                 entity_id: subject.into(),
+                ..Default::default()
             }],
             source: Some(Source {
                 instance: instance.into(),
@@ -232,6 +233,7 @@ fn read(
                     .iter()
                     .map(|s| SubjectRef {
                         entity_id: s.to_string(),
+                        ..Default::default()
                     })
                     .collect(),
                 kinds: vec![],
@@ -247,6 +249,9 @@ fn read(
                 after: None,
                 tenors: Vec::new(),
                 published_as_of_ns: 0,
+                series_keys: Vec::new(),
+                all_series: false,
+                dates: None,
             },
             &envelope(reader, reader != "dashboard-1", ""),
         )
@@ -438,6 +443,7 @@ async fn a_reader_not_entitled_is_refused_per_dataset_and_a_field_it_may_not_rea
                 data_type: DataType::Bar,
                 subjects: vec![SubjectRef {
                     entity_id: BTC.into(),
+                    ..Default::default()
                 }],
                 kinds: vec![],
                 interval_ns: 0,
@@ -452,6 +458,9 @@ async fn a_reader_not_entitled_is_refused_per_dataset_and_a_field_it_may_not_rea
                 after: None,
                 tenors: Vec::new(),
                 published_as_of_ns: 0,
+                series_keys: Vec::new(),
+                all_series: false,
+                dates: None,
             },
             &envelope("reporting-1", true, ""),
         )
@@ -546,6 +555,7 @@ async fn a_read_not_answered_is_wanted_once_for_two_readers_answered_and_a_decli
                 want_id: aapl.want_id.clone(),
                 subjects: vec![SubjectRef {
                     entity_id: AAPL.into(),
+                    ..Default::default()
                 }],
                 reason: UnansweredReason::NotCovered as i32,
             },
@@ -559,6 +569,7 @@ async fn a_read_not_answered_is_wanted_once_for_two_readers_answered_and_a_decli
                 want_id: aapl.want_id,
                 subjects: vec![SubjectRef {
                     entity_id: AAPL.into(),
+                    ..Default::default()
                 }],
                 reason: UnansweredReason::NotCovered as i32,
             },
@@ -754,6 +765,7 @@ async fn a_batch_is_refused_whole_naming_the_item_and_field() {
     eight.meta.as_mut().unwrap().subjects = (0..9)
         .map(|_| SubjectRef {
             entity_id: BTC.into(),
+            ..Default::default()
         })
         .collect();
     assert!(record(&h, "coinbase-1", vec![eight], "")
@@ -963,6 +975,7 @@ async fn a_read_with_an_invalid_date_or_two_times_is_refused_and_misses_are_coun
         data_type: DataType::Price,
         subjects: vec![SubjectRef {
             entity_id: BTC.into(),
+            ..Default::default()
         }],
         kinds: vec![],
         interval_ns: 0,
@@ -977,6 +990,9 @@ async fn a_read_with_an_invalid_date_or_two_times_is_refused_and_misses_are_coun
         after: None,
         tenors: Vec::new(),
         published_as_of_ns: 0,
+        series_keys: Vec::new(),
+        all_series: false,
+        dates: None,
     };
     let invalid = tokio::task::block_in_place(|| {
         h.lake
@@ -1059,6 +1075,7 @@ fn live_meta(row_key: &str, valid_from_ns: i64) -> Option<ObservationMeta> {
         row_key: row_key.into(),
         subjects: vec![SubjectRef {
             entity_id: BTC.into(),
+            ..Default::default()
         }],
         source: Some(Source {
             instance: "coinbase-1".into(),
@@ -1080,6 +1097,7 @@ fn trade(row_key: &str, valid_from_ns: i64, price: &str) -> meridian_domain::v1:
         aggressor: meridian_domain::v1::Aggressor::Buy as i32,
         source_sequence: 7,
         cancelled: false,
+        quote_at_trade: None,
     }
 }
 
@@ -1123,6 +1141,7 @@ fn live_read(
                 data_type,
                 subjects: vec![SubjectRef {
                     entity_id: BTC.into(),
+                    ..Default::default()
                 }],
                 kinds: vec![],
                 interval_ns: 0,
@@ -1137,6 +1156,9 @@ fn live_read(
                 after,
                 tenors: Vec::new(),
                 published_as_of_ns: 0,
+                series_keys: Vec::new(),
+                all_series: false,
+                dates: None,
             },
             &envelope("signal-1", true, ""),
         )
@@ -1244,6 +1266,7 @@ async fn a_restarted_data_plugin_reads_its_own_last_trade_and_its_datasets_licen
     let asked = meridian_domain::v1::ListTradesRequest {
         subjects: vec![SubjectRef {
             entity_id: BTC.into(),
+            ..Default::default()
         }],
         latest_recorded: true,
         ..Default::default()
@@ -1331,6 +1354,7 @@ async fn the_latest_is_chosen_per_asset_for_prices_and_quotes() {
             row_key: key.into(),
             subjects: vec![SubjectRef {
                 entity_id: BTC.into(),
+                ..Default::default()
             }],
             source: Some(Source {
                 instance: "coinbase-1".into(),
@@ -1416,6 +1440,7 @@ async fn a_decline_stands_for_the_date_asked_only_and_a_streamed_latest_is_stand
                 want_id: want.want_id,
                 subjects: vec![SubjectRef {
                     entity_id: AAPL.into(),
+                    ..Default::default()
                 }],
                 reason: UnansweredReason::NotCovered as i32,
             },
@@ -1535,6 +1560,7 @@ fn outcome(
             row_key: "KXFED-26OCT-T4.25".into(),
             subjects: vec![SubjectRef {
                 entity_id: AAPL.into(),
+                ..Default::default()
             }],
             source: Some(Source {
                 instance: "kalshi-1".into(),
@@ -1582,6 +1608,7 @@ fn read_outcomes(
             meridian_domain::v1::ListOutcomesRequest {
                 subjects: vec![SubjectRef {
                     entity_id: AAPL.into(),
+                    ..Default::default()
                 }],
                 after_watermark: after,
                 as_of_ns,
@@ -1666,7 +1693,8 @@ async fn an_outcome_is_restated_per_stage_every_version_heard_and_read_as_of_or_
         ReadRequest {
             data_type: DataType::Outcome,
             subjects: vec![SubjectRef {
-                entity_id: AAPL.into()
+                entity_id: AAPL.into(),
+                ..Default::default()
             }],
             kinds: vec![],
             interval_ns: 0,
@@ -1681,6 +1709,9 @@ async fn an_outcome_is_restated_per_stage_every_version_heard_and_read_as_of_or_
             after: None,
             tenors: Vec::new(),
             published_as_of_ns: 0,
+            series_keys: Vec::new(),
+            all_series: false,
+            dates: None,
         },
         &envelope("reporting-1", true, "")
     ))
@@ -2033,6 +2064,7 @@ async fn a_query_reads_one_kind_within_bounds_and_says_where_it_was_cut() {
         kind: "prices".into(),
         subjects: vec![SubjectRef {
             entity_id: BTC.into(),
+            ..Default::default()
         }],
         from_date: "2026-10-05".into(),
         to_date: "2026-10-07".into(),
@@ -2162,6 +2194,7 @@ async fn execution_costs_are_the_components_rows_read_within_the_readers_account
         meta: Some(ObservationMeta {
             subjects: vec![SubjectRef {
                 entity_id: BTC.into(),
+                ..Default::default()
             }],
             business_date: "2026-10-07".into(),
             valid_from_ns: NOW,
@@ -2320,4 +2353,37 @@ async fn a_datasets_liveness_is_kept_published_and_listed() {
         .find(|d| d.dataset == "kraken-1:daily")
         .unwrap();
     assert!(kraken.liveness.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rows_age_at_the_lake_hop_is_recorded_on_commit_for_the_monitor() {
+    // Contract v28 (W4.16; the latency spec's "The hops"; ruling 606): the
+    // lake measures its own hop and sends it on report-latency, never into
+    // the monitor's store directly.
+    let h = harness();
+    h.lake.configured(&live_configuration());
+    let now = h.lake.clock.now_ns();
+    record_rows(
+        &h,
+        "quotes",
+        vec![Observation::Quote(quote(
+            "q-age-1",
+            now - 3_000_000,
+            money("100", "USD", ""),
+            money("101", "USD", ""),
+        ))],
+    )
+    .unwrap();
+    let taken = meridian_domain::latency::recorder().take(now + 1);
+    let lake = taken
+        .iter()
+        .find(|s| {
+            s.dataset == "coinbase-1:live" && s.hop == meridian_domain::v1::AgeHop::Lake as i32
+        })
+        .expect("the lake hop's snapshot");
+    assert!(lake.histogram.as_ref().unwrap().total >= 1);
+    assert!(
+        lake.instance_id.is_empty(),
+        "no instance: the lake is no plugin's"
+    );
 }

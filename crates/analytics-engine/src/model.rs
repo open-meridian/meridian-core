@@ -470,7 +470,7 @@ pub fn value_per_unit(
     instrument_id: &str,
     inputs: &[(String, String, Dec, String)],
 ) -> std::result::Result<(Dec, String), String> {
-    if !crate::definitions::MODELS.contains(&model_id) {
+    if !crate::definitions::MODELS[..3].contains(&model_id) {
         return Err(format!("{model_id:?} is not one of v26's models"));
     }
     let (mut value, mut held) = if model_id == "cash" {

@@ -85,6 +85,20 @@ pub struct Read {
     pub tenors: Vec<Tenor>,
     /// A rate read's published-time cut-off (contract v27); 0 for none.
     pub published_as_of_ns: i64,
+    /// Contract v28 (ruling 561): the series asked for by key, and whether
+    /// every series of the subjects is; neither, and a row keyed by a series
+    /// is left out, so a v27 reader of an underlying never receives its
+    /// chain.
+    pub series_keys: Vec<meridian_domain::v1::Identifier>,
+    pub all_series: bool,
+    /// Contract v28 (ListStatistics): business dates from and to,
+    /// inclusive; `None` for no range. A corporate action's are its kind's
+    /// date ([`Observation::date`]).
+    pub dates: Option<(Date, Date)>,
+    /// Contract v28 (the filings slice, W10.6): each subject asked with the
+    /// role it must hold on a row, where the read gives one; none for a
+    /// subject in any role.
+    pub roles: Vec<(String, i32)>,
 }
 
 /// What a source declined, by dataset, subject and the date or range its
@@ -416,6 +430,32 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
     if read.published_as_of_ns != 0 {
         rows = as_published(rows, read.published_as_of_ns);
     }
+    // A chain's rows only to a read that asks for series (contract v28,
+    // W10.6): a listed series is always keyed by one, and read by ListSeries.
+    rows.retain(|row| {
+        meridian_domain::lake::series_asked(
+            &row.meta().series_key,
+            &read.series_keys,
+            read.all_series,
+        )
+    });
+    if let Some((from, to)) = &read.dates {
+        rows.retain(|row| Date::parse(row.date()).is_ok_and(|date| &date >= from && &date <= to));
+    }
+    // A subject asked in a role (contract v28, W10.6): a row naming it in
+    // another is not its; an unspecified role on a row reads as `subject`.
+    if !read.roles.is_empty() {
+        rows.retain(|row| {
+            row.meta().subjects.iter().any(|named| {
+                let subject = alias_of(&named.entity_id);
+                read.subjects.contains(&subject)
+                    && read
+                        .roles
+                        .iter()
+                        .all(|(entity, role)| entity != &subject || named.role.max(1) == *role)
+            })
+        });
+    }
     // A rate read narrowed by tenor: a row with no tenor (a fixing, a point
     // named by maturity) is no tenor asked. A dataset that holds the subject
     // for the time asked and none of the tenors asked did not publish them:
@@ -448,11 +488,22 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
         rows = latest_in_force(rows);
     }
 
-    // By the subject asked about, then kind.
+    // By the subject asked about, then kind. A corporate action names its
+    // security and its issuer (contract v28, W10.4), and is the answer to
+    // whichever of them was asked, once.
     let mut by_subject: BTreeMap<(String, i32), Vec<Observation>> = BTreeMap::new();
     for row in rows {
+        let subject = if read.data_type == DataType::CorporateAction {
+            row.subjects()
+                .iter()
+                .map(|s| alias_of(s))
+                .find(|s| read.subjects.contains(s))
+                .unwrap_or_else(|| alias_of(row.subject()))
+        } else {
+            alias_of(row.subject())
+        };
         by_subject
-            .entry((alias_of(row.subject()), row.kind()))
+            .entry((subject, row.kind()))
             .or_default()
             .push(row);
     }

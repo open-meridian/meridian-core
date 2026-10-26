@@ -44,15 +44,55 @@ pub const EXECUTION_COST_DATASET: &str = "analytics:execution_cost";
 /// The instance an execution cost's source names: the component.
 pub const ANALYTICS_INSTANCE: &str = "analytics";
 
+/// Open interest or a volume per contract per trading date (contract v28,
+/// G11; W10.4).
+pub const STATISTIC: &str = "meridian.v1.Statistic";
+/// A listed option or future series as its source lists it, never minted
+/// (contract v28, ruling 561; W10.4).
+pub const LISTED_SERIES: &str = "meridian.v1.ListedSeries";
+
+/// One value of a signal plugin's own series, naming its rule and inputs
+/// (contract v28, track B; W10.4).
+pub const DERIVED_SERIES: &str = "meridian.v1.DerivedSeries";
+/// A scenario or a scenario set a signal plugin saved (contract v28, W12.8).
+pub const SAVED_SCENARIO: &str = "meridian.v1.SavedScenario";
+
+/// A declared corporate action, a cash dividend in v28, as its rule found
+/// it in the source (contract v28, the filings slice; W10.4).
+pub const CORPORATE_ACTION: &str = "meridian.v1.CorporateActionAnnounced";
+
+/// The scheme a future's or a future option's series is keyed by: the
+/// exchange's ticker, one identifier carrying its venue's ISO 10383 MIC in
+/// `source` (contract v28, W1.26 and W10.4; DESIGN28's sixth amendment,
+/// as `Identifier.scheme` has had it since v24).
+pub const TICKER_SCHEME: &str = "ticker";
+/// The scheme an option series is keyed by (contract v28, W1.26; 560).
+pub const OCC_OSI_SCHEME: &str = "occ_osi";
+
 /// The lake's data types: the 1a's, the 1b's from contract v19, the 1c's
-/// outcome from contract v23, and the rates slice's rate from contract v27.
-pub const DATA_TYPES: [&str; 6] = [PRICE, BAR, TRADE, QUOTE, OUTCOME, RATE];
+/// outcome from contract v23, the rates slice's rate from contract v27, and
+/// from contract v28 statistics, listed series, derived series, saved
+/// scenarios and declared corporate actions.
+pub const DATA_TYPES: [&str; 11] = [
+    PRICE,
+    BAR,
+    TRADE,
+    QUOTE,
+    OUTCOME,
+    RATE,
+    STATISTIC,
+    LISTED_SERIES,
+    DERIVED_SERIES,
+    SAVED_SCENARIO,
+    CORPORATE_ACTION,
+];
 
 /// The data types a default read takes a priority among (W10.3): an outcome
 /// is read from every dataset that holds it, with no default (contract v23);
 /// a rate is read as prices are, under the source priority (contract v27,
 /// W10.6: FRED's 10-year point and Treasury's sit under one priority).
-pub const PRIORITISED: [&str; 5] = [PRICE, BAR, TRADE, QUOTE, RATE];
+/// From contract v28 statistics and listed series too, as any dataset's rows.
+pub const PRIORITISED: [&str; 7] = [PRICE, BAR, TRADE, QUOTE, RATE, STATISTIC, LISTED_SERIES];
 
 const PRICE_FIELDS: [&str; 4] = [
     "meridian.v1.Price.meta",
@@ -71,7 +111,7 @@ const BAR_FIELDS: [&str; 8] = [
     "meridian.v1.Bar.trade_count",
 ];
 
-const TRADE_FIELDS: [&str; 7] = [
+const TRADE_FIELDS: [&str; 8] = [
     "meridian.v1.Trade.meta",
     "meridian.v1.Trade.price",
     "meridian.v1.Trade.quantity",
@@ -79,6 +119,8 @@ const TRADE_FIELDS: [&str; 7] = [
     "meridian.v1.Trade.aggressor",
     "meridian.v1.Trade.source_sequence",
     "meridian.v1.Trade.cancelled",
+    // Contract v28 (G9).
+    "meridian.v1.Trade.quote_at_trade",
 ];
 const QUOTE_FIELDS: [&str; 6] = [
     "meridian.v1.Quote.meta",
@@ -111,6 +153,47 @@ const RATE_FIELDS: [&str; 10] = [
     "meridian.v1.Rate.percentiles",
 ];
 
+const STATISTIC_FIELDS: [&str; 3] = [
+    "meridian.v1.Statistic.meta",
+    "meridian.v1.Statistic.kind",
+    "meridian.v1.Statistic.value",
+];
+
+const LISTED_SERIES_FIELDS: [&str; 5] = [
+    "meridian.v1.ListedSeries.meta",
+    "meridian.v1.ListedSeries.template_id",
+    "meridian.v1.ListedSeries.template_version",
+    "meridian.v1.ListedSeries.fields",
+    "meridian.v1.ListedSeries.instrument_id",
+];
+
+const DERIVED_SERIES_FIELDS: [&str; 5] = [
+    "meridian.v1.DerivedSeries.meta",
+    "meridian.v1.DerivedSeries.series",
+    "meridian.v1.DerivedSeries.value",
+    "meridian.v1.DerivedSeries.rule",
+    "meridian.v1.DerivedSeries.inputs",
+];
+
+const SAVED_SCENARIO_FIELDS: [&str; 4] = [
+    "meridian.v1.SavedScenario.meta",
+    "meridian.v1.SavedScenario.scenario",
+    "meridian.v1.SavedScenario.scenario_set",
+    "meridian.v1.SavedScenario.description",
+];
+
+const CORPORATE_ACTION_FIELDS: [&str; 9] = [
+    "meridian.v1.CorporateActionAnnounced.meta",
+    "meridian.v1.CorporateActionAnnounced.kind",
+    "meridian.v1.CorporateActionAnnounced.amount_per_share",
+    "meridian.v1.CorporateActionAnnounced.declared_date",
+    "meridian.v1.CorporateActionAnnounced.ex_date",
+    "meridian.v1.CorporateActionAnnounced.record_date",
+    "meridian.v1.CorporateActionAnnounced.payment_date",
+    "meridian.v1.CorporateActionAnnounced.rule",
+    "meridian.v1.CorporateActionAnnounced.filing",
+];
+
 /// The dictionary entries of a data type's fields; none for one the lake
 /// does not have.
 pub fn fields_of(data_type: &str) -> &'static [&'static str] {
@@ -121,6 +204,11 @@ pub fn fields_of(data_type: &str) -> &'static [&'static str] {
         QUOTE => &QUOTE_FIELDS,
         OUTCOME => &OUTCOME_FIELDS,
         RATE => &RATE_FIELDS,
+        STATISTIC => &STATISTIC_FIELDS,
+        LISTED_SERIES => &LISTED_SERIES_FIELDS,
+        DERIVED_SERIES => &DERIVED_SERIES_FIELDS,
+        SAVED_SCENARIO => &SAVED_SCENARIO_FIELDS,
+        CORPORATE_ACTION => &CORPORATE_ACTION_FIELDS,
         _ => &[],
     }
 }
@@ -250,7 +338,146 @@ pub fn strip_trade(
     if gone(TRADE_FIELDS[6]) {
         trade.cancelled = false;
     }
+    if gone(TRADE_FIELDS[7]) {
+        trade.quote_at_trade = None;
+    }
     removed
+}
+
+/// [`strip_price`], for a statistic (contract v28).
+pub fn strip_statistic(
+    statistic: &mut crate::v1::Statistic,
+    allowed: &std::collections::BTreeSet<String>,
+) -> Vec<&'static str> {
+    let mut removed = Vec::new();
+    if allowed.is_empty() {
+        return removed;
+    }
+    let mut gone = |entry: &'static str| {
+        let gone = !allowed.contains(entry);
+        if gone {
+            removed.push(entry);
+        }
+        gone
+    };
+    if gone(STATISTIC_FIELDS[1]) {
+        statistic.kind = 0;
+    }
+    if gone(STATISTIC_FIELDS[2]) {
+        statistic.value = None;
+    }
+    removed
+}
+
+/// [`strip_price`], for a listed series (contract v28). Its instrument ID is
+/// the lake's own answer, never stripped.
+pub fn strip_series(
+    series: &mut crate::v1::ListedSeries,
+    allowed: &std::collections::BTreeSet<String>,
+) -> Vec<&'static str> {
+    let mut removed = Vec::new();
+    if allowed.is_empty() {
+        return removed;
+    }
+    let mut gone = |entry: &'static str| {
+        let gone = !allowed.contains(entry);
+        if gone {
+            removed.push(entry);
+        }
+        gone
+    };
+    if gone(LISTED_SERIES_FIELDS[1]) {
+        series.template_id.clear();
+    }
+    if gone(LISTED_SERIES_FIELDS[2]) {
+        series.template_version.clear();
+    }
+    if gone(LISTED_SERIES_FIELDS[3]) {
+        series.fields.clear();
+    }
+    removed
+}
+
+/// A series key as one text (contract v28, ruling 561): each identifier as
+/// scheme and value, a ticker's venue after it (`ticker=ESZ6@XCME`), in order
+/// of scheme, so a key reads the same however its writer ordered it. Empty
+/// for a row keyed by no series. Beside a row's subject it is what its
+/// latest is chosen per and its deliveries conflated per.
+pub fn series_key_text(key: &[crate::v1::Identifier]) -> String {
+    let mut parts: Vec<String> = key
+        .iter()
+        .map(|identifier| {
+            if identifier.source.is_empty() {
+                format!("{}={}", identifier.scheme, identifier.value)
+            } else {
+                format!(
+                    "{}={}@{}",
+                    identifier.scheme, identifier.value, identifier.source
+                )
+            }
+        })
+        .collect();
+    parts.sort();
+    parts.join("|")
+}
+
+/// What a series key lacks, if anything (contract v28, W10.4 and W3.31;
+/// DESIGN28's sixth amendment): the path under the key that is wrong --
+/// empty for the key itself, `[0].scheme`, `[0].source` -- and why. A key is
+/// one identifier: an option's `occ_osi` symbol, or a future's or a future
+/// option's exchange ticker carrying its venue's ISO 10383 MIC in `source`.
+pub fn series_key_problem(key: &[crate::v1::Identifier]) -> Option<(&'static str, String)> {
+    let [identifier] = key else {
+        return Some((
+            "",
+            format!(
+                "names {}; one identifier, an occ_osi symbol or a ticker carrying its venue's \
+                 MIC in source",
+                key.len()
+            ),
+        ));
+    };
+    if identifier.scheme.trim().is_empty() || identifier.value.trim().is_empty() {
+        return Some(("[0]", "names a scheme and a value".into()));
+    }
+    match identifier.scheme.as_str() {
+        OCC_OSI_SCHEME => None,
+        TICKER_SCHEME => {
+            let mic = identifier.source.trim();
+            (mic.len() != 4 || !mic.chars().all(|c| c.is_ascii_alphanumeric())).then(|| {
+                (
+                    "[0].source",
+                    "a ticker carries its venue's ISO 10383 MIC, four letters or digits".into(),
+                )
+            })
+        }
+        other => Some((
+            "[0].scheme",
+            format!("{other:?} keys no series; occ_osi, or ticker with its venue's MIC in source"),
+        )),
+    }
+}
+
+/// Whether a row keyed by `key` is one a read asked for (contract v28,
+/// W10.6): a row keyed by no series always, being the subject's own; a
+/// series' row where the read asks for every series, or names its key -- the
+/// same scheme and value, and for a ticker the same venue in `source`.
+pub fn series_asked(
+    key: &[crate::v1::Identifier],
+    asked: &[crate::v1::Identifier],
+    all: bool,
+) -> bool {
+    if key.is_empty() || all {
+        return true;
+    }
+    key.iter().any(|identifier| {
+        asked.iter().any(|a| {
+            a.scheme == identifier.scheme
+                && a.value == identifier.value
+                && (identifier.scheme != TICKER_SCHEME
+                    || a.source.eq_ignore_ascii_case(&identifier.source))
+        })
+    })
 }
 
 /// [`strip_price`], for a quote (contract v19).
@@ -363,6 +590,47 @@ pub fn strip_outcome(
     }
     if gone(OUTCOME_FIELDS[5]) {
         outcome.determination_as_reported = None;
+    }
+    removed
+}
+
+/// [`strip_outcome`], for a declared corporate action (contract v28, the
+/// filings slice): its kind is what the row is, never stripped.
+pub fn strip_corporate_action(
+    action: &mut crate::v1::CorporateActionAnnounced,
+    allowed: &std::collections::BTreeSet<String>,
+) -> Vec<&'static str> {
+    let mut removed = Vec::new();
+    if allowed.is_empty() {
+        return removed;
+    }
+    let mut gone = |entry: &'static str| {
+        let gone = !allowed.contains(entry);
+        if gone {
+            removed.push(entry);
+        }
+        gone
+    };
+    if gone(CORPORATE_ACTION_FIELDS[2]) {
+        action.amount_per_share = None;
+    }
+    if gone(CORPORATE_ACTION_FIELDS[3]) {
+        action.declared_date.clear();
+    }
+    if gone(CORPORATE_ACTION_FIELDS[4]) {
+        action.ex_date.clear();
+    }
+    if gone(CORPORATE_ACTION_FIELDS[5]) {
+        action.record_date.clear();
+    }
+    if gone(CORPORATE_ACTION_FIELDS[6]) {
+        action.payment_date.clear();
+    }
+    if gone(CORPORATE_ACTION_FIELDS[7]) {
+        action.rule = None;
+    }
+    if gone(CORPORATE_ACTION_FIELDS[8]) {
+        action.filing = None;
     }
     removed
 }
@@ -595,7 +863,29 @@ pub fn catalogue_refused(catalogue: &Catalogue, roles: &[String]) -> Option<Stri
     if catalogue.datasets.is_empty() {
         return None;
     }
-    if !roles.iter().any(|role| role == "data") {
+    // Contract v28 (W10.4; sdk-contract/signal-derives-data-from-sources):
+    // a signal plugin declares its own derived datasets, serving derived
+    // series and saved scenarios and nothing else.
+    let data = roles.iter().any(|role| role == "data");
+    let signal = roles.iter().any(|role| role == "signal");
+    if !data && signal {
+        for (i, dataset) in catalogue.datasets.iter().enumerate() {
+            for (j, named) in dataset.data_types.iter().enumerate() {
+                let derived = [DERIVED_SERIES, SAVED_SCENARIO].contains(&named.as_str())
+                    || type_of_entry(named).is_some_and(|data_type| {
+                        [DERIVED_SERIES, SAVED_SCENARIO].contains(&data_type)
+                    });
+                if !derived {
+                    return Some(format!(
+                        "declaration.catalogue.datasets[{i}].data_types[{j}] {named:?}: a signal \
+                         plugin's own datasets serve derived series and saved scenarios, never a \
+                         source's data"
+                    ));
+                }
+            }
+        }
+    }
+    if !data && !signal {
         return Some(format!(
             "declaration.catalogue declares datasets on a version holding {}, not data: the \
              catalogue is a data plugin's",
@@ -728,6 +1018,39 @@ pub fn catalogue_refused(catalogue: &Catalogue, roles: &[String]) -> Option<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_futures_series_is_keyed_by_one_ticker_carrying_its_venue() {
+        // DESIGN28's sixth amendment (W1.26, W10.4): one `ticker`, the
+        // venue's MIC in `source`; the same ticker on another venue is
+        // another series.
+        let ticker = |value: &str, mic: &str| crate::v1::Identifier {
+            scheme: TICKER_SCHEME.into(),
+            value: value.into(),
+            source: mic.into(),
+            ..Default::default()
+        };
+        let osi = crate::v1::Identifier {
+            scheme: OCC_OSI_SCHEME.into(),
+            value: "AAPL  261120C00230000".into(),
+            ..Default::default()
+        };
+        let es = [ticker("ESZ6", "XCME")];
+        assert_eq!(series_key_text(&es), "ticker=ESZ6@XCME");
+        assert_eq!(
+            series_key_text(std::slice::from_ref(&osi)),
+            "occ_osi=AAPL  261120C00230000"
+        );
+        assert!(series_asked(&es, &[ticker("ESZ6", "xcme")], false));
+        assert!(!series_asked(&es, &[ticker("ESZ6", "XEUR")], false));
+        assert!(!series_asked(&es, std::slice::from_ref(&osi), false));
+        assert!(series_asked(
+            std::slice::from_ref(&osi),
+            std::slice::from_ref(&osi),
+            false
+        ));
+        assert!(series_asked(&es, &[], true));
+    }
 
     fn daily() -> DatasetDeclaration {
         DatasetDeclaration {
@@ -1055,4 +1378,64 @@ mod query_kind_tests {
         ));
         assert!(!roles_read_kind(&["custody".to_string()], "prices"));
     }
+}
+
+/// A licence's eligibility (contract v28, ruling 491; 597): who may take the
+/// dataset -- personal or commercial use -- and a buyer-revenue threshold
+/// either way, a decimal in the currency its code names. The words a page
+/// and a tool state it in; `None` where nothing is stated, and why not where
+/// a part does not read.
+pub fn eligibility_of(
+    uses: &[&str],
+    below: &str,
+    at_least: &str,
+    currency: &str,
+) -> Result<Option<meridian_pb::v1::DataEligibility>, String> {
+    use meridian_pb::v1::{DataEligibility, DataUse};
+    let mut out = DataEligibility::default();
+    for (i, used) in uses.iter().enumerate() {
+        let read = match used.trim() {
+            "personal" => DataUse::Personal,
+            "commercial" => DataUse::Commercial,
+            "" => continue,
+            other => {
+                return Err(format!(
+                    "eligibility.uses[{i}] {other:?} is personal or commercial"
+                ))
+            }
+        };
+        if !out.uses.contains(&(read as i32)) {
+            out.uses.push(read as i32);
+        }
+    }
+    let decimal = |field: &str, text: &str| -> Result<Option<meridian_pb::v1::Decimal>, String> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Ok(None);
+        }
+        let read: crate::exact::Exact = text
+            .parse()
+            .map_err(|_| format!("eligibility.{field} {text:?} is not a number"))?;
+        if read.is_negative() {
+            return Err(format!("eligibility.{field} is never below zero"));
+        }
+        Ok(Some(read.to_wire()))
+    };
+    out.buyer_revenue_below = decimal("buyer_revenue_below", below)?;
+    out.buyer_revenue_at_least = decimal("buyer_revenue_at_least", at_least)?;
+    let currency = currency.trim().to_ascii_uppercase();
+    let threshold = out.buyer_revenue_below.is_some() || out.buyer_revenue_at_least.is_some();
+    if threshold && !(currency.len() == 3 && currency.chars().all(|c| c.is_ascii_uppercase())) {
+        return Err(
+            "eligibility.buyer_revenue_currency_code: a threshold names its ISO 4217 currency"
+                .into(),
+        );
+    }
+    if threshold {
+        out.buyer_revenue_currency_code = currency;
+    }
+    if out.uses.is_empty() && !threshold {
+        return Ok(None);
+    }
+    Ok(Some(out))
 }

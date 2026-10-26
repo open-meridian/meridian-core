@@ -897,3 +897,39 @@ fn a_spot_read_by_resolved_local_currency_ids_reads_the_platforms_rule() {
     };
     assert_eq!(pair_followed(&business, platform), business);
 }
+
+#[test]
+fn a_venues_id_reads_the_trading_sessions_calendar_naming_it() {
+    let mut sessions = calendar("CAL-XCBO-SESSIONS", 1, &[]);
+    sessions.kind = CalendarKind::TradingSessions as i32;
+    sessions.venue_ids = vec!["VEN-XCBO".into()];
+    sessions.trading_sessions = Some(meridian_domain::v1::TradingSessions {
+        time_zone: "America/Chicago".into(),
+        ..Default::default()
+    });
+    let (mut calendars, rules) = seed();
+    calendars.push(kept(sessions, 1));
+    let held = Held::as_of(&calendars, &rules, 0);
+    let asked = |id: &str| {
+        read(
+            &held,
+            &ReadCalendarRequest {
+                calendar_id: id.into(),
+                from_date: "2026-11-02".into(),
+                to_date: "2026-11-06".into(),
+                ..Default::default()
+            },
+            1,
+        )
+        .unwrap()
+        .0
+    };
+    let found = asked("VEN-XCBO");
+    assert!(found.found);
+    assert_eq!(found.calendar_id, "CAL-XCBO-SESSIONS");
+    assert_eq!(found.trading_sessions.unwrap().time_zone, "America/Chicago");
+    assert!(
+        !asked("VEN-XNYS").found,
+        "a venue no sessions calendar names"
+    );
+}

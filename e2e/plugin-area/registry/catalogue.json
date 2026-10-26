@@ -29,7 +29,7 @@
     "revoked_by_person_id": "PER-oo"
    }
   ],
-  "signature": "MEQCIHm4mr6AWFdfqghGOopLBfVzUbi/iXCzrPYhYAwbg/tXAiBmjMN2Y1fjyYA95/k+Ja8y1OBkWiJczlpWNOtROJSNLg=="
+  "signature": "MEQCIBn76s5N90LR64Hrixe/uF0H4RcaNmfHm+t6cWWjnxhCAiArba7RkZB+xuTXwS+bfd3qlE84nMiMtlFb4GIwBTkEtg=="
  },
  "listings": [
   {
@@ -55,7 +55,7 @@
      "image_digest": "sha256:f0fea24b22a52baff40b9aa31e0d9ee5ad809f0bc2ea38e179a172775b2a73d5",
      "listed_at_ns": 1792152000000000000,
      "listing": "open-meridian/stand-in",
-     "listing_statement": "{\"payload\":\"eyJfdHlwZSI6Imh0dHBzOi8vaW4tdG90by5pby9TdGF0ZW1lbnQvdjEiLCJwcmVkaWNhdGUiOnsiYXBwcm92ZWRfcm9sZXMiOltdLCJmbG9vciI6InYyNSIsImxpc3RlZF9hdCI6IjIwMjYtMTAtMTZUMTI6MDA6MDBaIiwibGlzdGluZyI6Im9wZW4tbWVyaWRpYW4vc3RhbmQtaW4iLCJyZWdpc3RyeSI6ImNvbW11bml0eSIsInJldmlld19pZCI6IiIsInJvbGVzIjpbImN1c3RvZHkiXSwic2lnbmVyX2tleSI6IlNIQTI1NjplMmUtb3Blbi1tZXJpZGlhbi1yZWxlYXNlIiwidmVyc2lvbiI6IjEuMy4wIn0sInByZWRpY2F0ZVR5cGUiOiJodHRwczovL29wZW4tbWVyaWRpYW4uZGV2L2F0dGVzdGF0aW9uL3BsdWdpbi1saXN0aW5nL3YxIiwic3ViamVjdCI6W3siZGlnZXN0Ijp7InNoYTI1NiI6ImYwZmVhMjRiMjJhNTJiYWZmNDBiOWFhMzFlMGQ5ZWU1YWQ4MDlmMGJjMmVhMzhlMTc5YTE3Mjc3NWIyYTczZDUifSwibmFtZSI6InBsYXRmb3JtOjg0NDMvcGx1Z2lucy94In1dfQ==\",\"payloadType\":\"application/vnd.in-toto+json\",\"signatures\":[{\"keyid\":\"e2e-platform\",\"sig\":\"MEQCIC9ocnwmaGl15Ou7w0tCTqIQQoRp8mroyuFOlsA1SfYTAiBH0TSwbMyUlYNCeBMC/Jsbk0QqzlEApJ0Pi4cTPqDXPg==\"}]}",
+     "listing_statement": "{\"payload\":\"eyJfdHlwZSI6Imh0dHBzOi8vaW4tdG90by5pby9TdGF0ZW1lbnQvdjEiLCJwcmVkaWNhdGUiOnsiYXBwcm92ZWRfcm9sZXMiOltdLCJmbG9vciI6InYyNSIsImxpc3RlZF9hdCI6IjIwMjYtMTAtMTZUMTI6MDA6MDBaIiwibGlzdGluZyI6Im9wZW4tbWVyaWRpYW4vc3RhbmQtaW4iLCJyZWdpc3RyeSI6ImNvbW11bml0eSIsInJldmlld19pZCI6IiIsInJvbGVzIjpbImN1c3RvZHkiXSwic2lnbmVyX2tleSI6IlNIQTI1NjplMmUtb3Blbi1tZXJpZGlhbi1yZWxlYXNlIiwidmVyc2lvbiI6IjEuMy4wIn0sInByZWRpY2F0ZVR5cGUiOiJodHRwczovL29wZW4tbWVyaWRpYW4uZGV2L2F0dGVzdGF0aW9uL3BsdWdpbi1saXN0aW5nL3YxIiwic3ViamVjdCI6W3siZGlnZXN0Ijp7InNoYTI1NiI6ImYwZmVhMjRiMjJhNTJiYWZmNDBiOWFhMzFlMGQ5ZWU1YWQ4MDlmMGJjMmVhMzhlMTc5YTE3Mjc3NWIyYTczZDUifSwibmFtZSI6InBsYXRmb3JtOjg0NDMvcGx1Z2lucy94In1dfQ==\",\"payloadType\":\"application/vnd.in-toto+json\",\"signatures\":[{\"keyid\":\"e2e-platform\",\"sig\":\"MEQCIDWYdcxoJp7gEw7qBe5dDwDhXmDY6ql29f+ZwiOYgJQGAiA5W7HiBucgJjIT2VmYhLodB9ZySBZAVBFes1eSEwBvCw==\"}]}",
      "metadata": {
       "declaration": {
        "documentation": [
@@ -120,7 +120,7 @@
      "image_digest": "sha256:353b48b2db40be02c4531d176bca350d0545dc5a843fdbfbb7073136930039ab",
      "listed_at_ns": 1792152000000000000,
      "listing": "open-meridian/stand-in",
-     "listing_statement": "{\"payload\":\"eyJfdHlwZSI6Imh0dHBzOi8vaW4tdG90by5pby9TdGF0ZW1lbnQvdjEiLCJwcmVkaWNhdGUiOnsiYXBwcm92ZWRfcm9sZXMiOltdLCJmbG9vciI6InYyNSIsImxpc3RlZF9hdCI6IjIwMjYtMTAtMTZUMTI6MDA6MDBaIiwibGlzdGluZyI6Im9wZW4tbWVyaWRpYW4vc3RhbmQtaW4iLCJyZWdpc3RyeSI6ImNvbW11bml0eSIsInJldmlld19pZCI6IiIsInJvbGVzIjpbImN1c3RvZHkiXSwic2lnbmVyX2tleSI6IlNIQTI1NjplMmUtb3Blbi1tZXJpZGlhbi1yZWxlYXNlIiwidmVyc2lvbiI6IjEuNC4wIn0sInByZWRpY2F0ZVR5cGUiOiJodHRwczovL29wZW4tbWVyaWRpYW4uZGV2L2F0dGVzdGF0aW9uL3BsdWdpbi1saXN0aW5nL3YxIiwic3ViamVjdCI6W3siZGlnZXN0Ijp7InNoYTI1NiI6IjM1M2I0OGIyZGI0MGJlMDJjNDUzMWQxNzZiY2EzNTBkMDU0NWRjNWE4NDNmZGJmYmI3MDczMTM2OTMwMDM5YWIifSwibmFtZSI6InBsYXRmb3JtOjg0NDMvcGx1Z2lucy94In1dfQ==\",\"payloadType\":\"application/vnd.in-toto+json\",\"signatures\":[{\"keyid\":\"e2e-platform\",\"sig\":\"MEYCIQDT0xw3Xe57M6+EjpRavdAWPZrQpydbOhd33hsYHlwUFwIhAKVVDDCDPXDfxCEhDEd/vJkbNn3pNVHLoWnGqaAUOXX0\"}]}",
+     "listing_statement": "{\"payload\":\"eyJfdHlwZSI6Imh0dHBzOi8vaW4tdG90by5pby9TdGF0ZW1lbnQvdjEiLCJwcmVkaWNhdGUiOnsiYXBwcm92ZWRfcm9sZXMiOltdLCJmbG9vciI6InYyNSIsImxpc3RlZF9hdCI6IjIwMjYtMTAtMTZUMTI6MDA6MDBaIiwibGlzdGluZyI6Im9wZW4tbWVyaWRpYW4vc3RhbmQtaW4iLCJyZWdpc3RyeSI6ImNvbW11bml0eSIsInJldmlld19pZCI6IiIsInJvbGVzIjpbImN1c3RvZHkiXSwic2lnbmVyX2tleSI6IlNIQTI1NjplMmUtb3Blbi1tZXJpZGlhbi1yZWxlYXNlIiwidmVyc2lvbiI6IjEuNC4wIn0sInByZWRpY2F0ZVR5cGUiOiJodHRwczovL29wZW4tbWVyaWRpYW4uZGV2L2F0dGVzdGF0aW9uL3BsdWdpbi1saXN0aW5nL3YxIiwic3ViamVjdCI6W3siZGlnZXN0Ijp7InNoYTI1NiI6IjM1M2I0OGIyZGI0MGJlMDJjNDUzMWQxNzZiY2EzNTBkMDU0NWRjNWE4NDNmZGJmYmI3MDczMTM2OTMwMDM5YWIifSwibmFtZSI6InBsYXRmb3JtOjg0NDMvcGx1Z2lucy94In1dfQ==\",\"payloadType\":\"application/vnd.in-toto+json\",\"signatures\":[{\"keyid\":\"e2e-platform\",\"sig\":\"MEUCIQDe4zEJSk/rJpLpds33iOXR01/DkRZDUiUM/WYLT/2ttgIgfm8H9rvF0/Z0QeAebUixiXGVFqmAVHKAIHKze+t9AxU=\"}]}",
      "metadata": {
       "declaration": {
        "documentation": [
@@ -176,7 +176,7 @@
      "image_digest": "sha256:b347c9b9c14029c6232afdae56e76bad2d7102ed7502cbb7b141d068cf8f87e1",
      "listed_at_ns": 1792152000000000000,
      "listing": "open-meridian/stand-in",
-     "listing_statement": "{\"payload\":\"eyJfdHlwZSI6Imh0dHBzOi8vaW4tdG90by5pby9TdGF0ZW1lbnQvdjEiLCJwcmVkaWNhdGUiOnsiYXBwcm92ZWRfcm9sZXMiOltdLCJmbG9vciI6InYyNSIsImxpc3RlZF9hdCI6IjIwMjYtMTAtMTZUMTI6MDA6MDBaIiwibGlzdGluZyI6Im9wZW4tbWVyaWRpYW4vc3RhbmQtaW4iLCJyZWdpc3RyeSI6ImNvbW11bml0eSIsInJldmlld19pZCI6IiIsInJvbGVzIjpbImN1c3RvZHkiXSwic2lnbmVyX2tleSI6IlNIQTI1NjplMmUtb3Blbi1tZXJpZGlhbi1yZWxlYXNlIiwidmVyc2lvbiI6IjEuNS4wIn0sInByZWRpY2F0ZVR5cGUiOiJodHRwczovL29wZW4tbWVyaWRpYW4uZGV2L2F0dGVzdGF0aW9uL3BsdWdpbi1saXN0aW5nL3YxIiwic3ViamVjdCI6W3siZGlnZXN0Ijp7InNoYTI1NiI6ImIzNDdjOWI5YzE0MDI5YzYyMzJhZmRhZTU2ZTc2YmFkMmQ3MTAyZWQ3NTAyY2JiN2IxNDFkMDY4Y2Y4Zjg3ZTEifSwibmFtZSI6InBsYXRmb3JtOjg0NDMvcGx1Z2lucy94In1dfQ==\",\"payloadType\":\"application/vnd.in-toto+json\",\"signatures\":[{\"keyid\":\"e2e-platform\",\"sig\":\"MEYCIQCEgEVLa5VBenAy45rMRdkW6viF4K1AKrUCWEjMCpEBAAIhAJrIl9be3RKonmZSqmsEqWkLAu6cwaY4Qq8VmA97/GbZ\"}]}",
+     "listing_statement": "{\"payload\":\"eyJfdHlwZSI6Imh0dHBzOi8vaW4tdG90by5pby9TdGF0ZW1lbnQvdjEiLCJwcmVkaWNhdGUiOnsiYXBwcm92ZWRfcm9sZXMiOltdLCJmbG9vciI6InYyNSIsImxpc3RlZF9hdCI6IjIwMjYtMTAtMTZUMTI6MDA6MDBaIiwibGlzdGluZyI6Im9wZW4tbWVyaWRpYW4vc3RhbmQtaW4iLCJyZWdpc3RyeSI6ImNvbW11bml0eSIsInJldmlld19pZCI6IiIsInJvbGVzIjpbImN1c3RvZHkiXSwic2lnbmVyX2tleSI6IlNIQTI1NjplMmUtb3Blbi1tZXJpZGlhbi1yZWxlYXNlIiwidmVyc2lvbiI6IjEuNS4wIn0sInByZWRpY2F0ZVR5cGUiOiJodHRwczovL29wZW4tbWVyaWRpYW4uZGV2L2F0dGVzdGF0aW9uL3BsdWdpbi1saXN0aW5nL3YxIiwic3ViamVjdCI6W3siZGlnZXN0Ijp7InNoYTI1NiI6ImIzNDdjOWI5YzE0MDI5YzYyMzJhZmRhZTU2ZTc2YmFkMmQ3MTAyZWQ3NTAyY2JiN2IxNDFkMDY4Y2Y4Zjg3ZTEifSwibmFtZSI6InBsYXRmb3JtOjg0NDMvcGx1Z2lucy94In1dfQ==\",\"payloadType\":\"application/vnd.in-toto+json\",\"signatures\":[{\"keyid\":\"e2e-platform\",\"sig\":\"MEQCIF80jVxxceL4g3edkPOMh71N6g6ZZqFp9d0M7y2G59XxAiBmwaNKbbe9Twg7b45O41ZhC0NasfwbP7Wp5l2wzWP3Jw==\"}]}",
      "metadata": {
       "declaration": {
        "documentation": [
@@ -232,7 +232,7 @@
      "image_digest": "sha256:e14e09f4384d18af7c86bd9bbf9e658d208ac7481fa3e140cc4cebd877f6e793",
      "listed_at_ns": 1792152000000000000,
      "listing": "open-meridian/stand-in",
-     "listing_statement": "{\"payload\":\"eyJfdHlwZSI6Imh0dHBzOi8vaW4tdG90by5pby9TdGF0ZW1lbnQvdjEiLCJwcmVkaWNhdGUiOnsiYXBwcm92ZWRfcm9sZXMiOltdLCJmbG9vciI6InYyNSIsImxpc3RlZF9hdCI6IjIwMjYtMTAtMTZUMTI6MDA6MDBaIiwibGlzdGluZyI6Im9wZW4tbWVyaWRpYW4vc3RhbmQtaW4iLCJyZWdpc3RyeSI6ImNvbW11bml0eSIsInJldmlld19pZCI6IiIsInJvbGVzIjpbImN1c3RvZHkiXSwic2lnbmVyX2tleSI6IlNIQTI1NjplMmUtb3Blbi1tZXJpZGlhbi1yZWxlYXNlIiwidmVyc2lvbiI6IjEuNi4wIn0sInByZWRpY2F0ZVR5cGUiOiJodHRwczovL29wZW4tbWVyaWRpYW4uZGV2L2F0dGVzdGF0aW9uL3BsdWdpbi1saXN0aW5nL3YxIiwic3ViamVjdCI6W3siZGlnZXN0Ijp7InNoYTI1NiI6ImUxNGUwOWY0Mzg0ZDE4YWY3Yzg2YmQ5YmJmOWU2NThkMjA4YWM3NDgxZmEzZTE0MGNjNGNlYmQ4NzdmNmU3OTMifSwibmFtZSI6InBsYXRmb3JtOjg0NDMvcGx1Z2lucy94In1dfQ==\",\"payloadType\":\"application/vnd.in-toto+json\",\"signatures\":[{\"keyid\":\"e2e-platform\",\"sig\":\"MEUCIQDaV98OkH9+NpROHFm+waaO3QVMoFrxJx6uivEAY6pWgQIgH0lEkWP9EqqbpJHMXEM9rqb20P98iq1/bhOunRGv2P0=\"}]}",
+     "listing_statement": "{\"payload\":\"eyJfdHlwZSI6Imh0dHBzOi8vaW4tdG90by5pby9TdGF0ZW1lbnQvdjEiLCJwcmVkaWNhdGUiOnsiYXBwcm92ZWRfcm9sZXMiOltdLCJmbG9vciI6InYyNSIsImxpc3RlZF9hdCI6IjIwMjYtMTAtMTZUMTI6MDA6MDBaIiwibGlzdGluZyI6Im9wZW4tbWVyaWRpYW4vc3RhbmQtaW4iLCJyZWdpc3RyeSI6ImNvbW11bml0eSIsInJldmlld19pZCI6IiIsInJvbGVzIjpbImN1c3RvZHkiXSwic2lnbmVyX2tleSI6IlNIQTI1NjplMmUtb3Blbi1tZXJpZGlhbi1yZWxlYXNlIiwidmVyc2lvbiI6IjEuNi4wIn0sInByZWRpY2F0ZVR5cGUiOiJodHRwczovL29wZW4tbWVyaWRpYW4uZGV2L2F0dGVzdGF0aW9uL3BsdWdpbi1saXN0aW5nL3YxIiwic3ViamVjdCI6W3siZGlnZXN0Ijp7InNoYTI1NiI6ImUxNGUwOWY0Mzg0ZDE4YWY3Yzg2YmQ5YmJmOWU2NThkMjA4YWM3NDgxZmEzZTE0MGNjNGNlYmQ4NzdmNmU3OTMifSwibmFtZSI6InBsYXRmb3JtOjg0NDMvcGx1Z2lucy94In1dfQ==\",\"payloadType\":\"application/vnd.in-toto+json\",\"signatures\":[{\"keyid\":\"e2e-platform\",\"sig\":\"MEUCIQDTrbaG/G9ZLKQ079c6f9P0FvW0A9EcNIJr4KnWWu/h2wIgVaaxyLPsPzmJ6xhEXeWohX40ghI0ctAgKBQxyJ/KGXI=\"}]}",
      "metadata": {
       "declaration": {
        "documentation": [
@@ -289,6 +289,79 @@
    "counts_shown": false,
    "installs": 0,
    "instances": 0,
+   "listing": "open-meridian/stand-in-rates",
+   "regions": [
+    "US"
+   ],
+   "repository": "https://github.com/open-meridian/plugin-stand-in-rates",
+   "stars": 3,
+   "support_contact": "",
+   "versions": [
+    {
+     "approved_roles": [],
+     "build": {
+      "signer_fingerprint": "SHA256:e2e-open-meridian-release"
+     },
+     "image_digest": "sha256:50f9e0e65e3decb03e1537955a3b7243d8daec3411abad046094e189420ecc6f",
+     "listed_at_ns": 1792152000000000000,
+     "listing": "open-meridian/stand-in-rates",
+     "listing_statement": "{\"payload\":\"eyJfdHlwZSI6Imh0dHBzOi8vaW4tdG90by5pby9TdGF0ZW1lbnQvdjEiLCJwcmVkaWNhdGUiOnsiYXBwcm92ZWRfcm9sZXMiOltdLCJmbG9vciI6InYyNSIsImxpc3RlZF9hdCI6IjIwMjYtMTAtMTZUMTI6MDA6MDBaIiwibGlzdGluZyI6Im9wZW4tbWVyaWRpYW4vc3RhbmQtaW4tcmF0ZXMiLCJyZWdpc3RyeSI6ImNvbW11bml0eSIsInJldmlld19pZCI6IiIsInJvbGVzIjpbImN1c3RvZHkiXSwic2lnbmVyX2tleSI6IlNIQTI1NjplMmUtb3Blbi1tZXJpZGlhbi1yZWxlYXNlIiwidmVyc2lvbiI6IjAuMS4wIn0sInByZWRpY2F0ZVR5cGUiOiJodHRwczovL29wZW4tbWVyaWRpYW4uZGV2L2F0dGVzdGF0aW9uL3BsdWdpbi1saXN0aW5nL3YxIiwic3ViamVjdCI6W3siZGlnZXN0Ijp7InNoYTI1NiI6IjUwZjllMGU2NWUzZGVjYjAzZTE1Mzc5NTVhM2I3MjQzZDhkYWVjMzQxMWFiYWQwNDYwOTRlMTg5NDIwZWNjNmYifSwibmFtZSI6InBsYXRmb3JtOjg0NDMvcGx1Z2lucy94In1dfQ==\",\"payloadType\":\"application/vnd.in-toto+json\",\"signatures\":[{\"keyid\":\"e2e-platform\",\"sig\":\"MEQCIGUcykLuz4NUv6s+sznSq2jf4jgy00iBVA2Kkb2Gkz4qAiB1KcvWhlfnUEPcTPEDAGeaplectRWLNdV5vNTkCA0jyg==\"}]}",
+     "metadata": {
+      "declaration": {
+       "documentation": [
+        {
+         "bytes": 59,
+         "digest": "sha256:707e14aa4aa7bcc8c44da09ee270ce1c0e47350db93e3697ef2f9f7a2cf51531",
+         "name": "overview"
+        },
+        {
+         "bytes": 74,
+         "digest": "sha256:6507d2c3cff774bafa67a42fefb602a3df529beb3a0349b50148e7a58fd7b64c",
+         "name": "setup"
+        },
+        {
+         "bytes": 113,
+         "digest": "sha256:10e87cd889b9558936a4aae0fc5e34191444b0b38e0484968a04ac08152c131e",
+         "name": "troubleshooting"
+        }
+       ],
+       "not_carried": [],
+       "secret_settings": [
+        "api_key"
+       ],
+       "settings": [
+        {
+         "description": "Where the stand-in's accounts are held.",
+         "label": "Region",
+         "name": "region",
+         "type": "SETTING_TYPE_STRING"
+        }
+       ],
+       "storage": null
+      },
+      "interface": false,
+      "name": "stand-in-rates",
+      "roles": [
+       "custody"
+      ],
+      "sdk_version": "0.29.0",
+      "version": "0.1.0"
+     },
+     "registry": "community",
+     "schema_version": "v25",
+     "sequence": 4,
+     "version": "0.1.0",
+     "withdrawn_at_ns": 0
+    }
+   ]
+  },
+  {
+   "asset_classes": [
+    "equity"
+   ],
+   "counts_shown": false,
+   "installs": 0,
+   "instances": 0,
    "listing": "other-org/revoked",
    "regions": [
     "US"
@@ -305,7 +378,7 @@
      "image_digest": "sha256:fee244acb9a548b637cf9868802b71fd7a02f53c2fbb4d2ff528f2c4d28a7043",
      "listed_at_ns": 1792152000000000000,
      "listing": "other-org/revoked",
-     "listing_statement": "{\"payload\":\"eyJfdHlwZSI6Imh0dHBzOi8vaW4tdG90by5pby9TdGF0ZW1lbnQvdjEiLCJwcmVkaWNhdGUiOnsiYXBwcm92ZWRfcm9sZXMiOltdLCJmbG9vciI6InYyNSIsImxpc3RlZF9hdCI6IjIwMjYtMTAtMTZUMTI6MDA6MDBaIiwibGlzdGluZyI6Im90aGVyLW9yZy9yZXZva2VkIiwicmVnaXN0cnkiOiJjb21tdW5pdHkiLCJyZXZpZXdfaWQiOiIiLCJyb2xlcyI6WyJjdXN0b2R5Il0sInNpZ25lcl9rZXkiOiJTSEEyNTY6ZTJlLW90aGVyLW9yZy1yZWxlYXNlIiwidmVyc2lvbiI6IjEuMC4wIn0sInByZWRpY2F0ZVR5cGUiOiJodHRwczovL29wZW4tbWVyaWRpYW4uZGV2L2F0dGVzdGF0aW9uL3BsdWdpbi1saXN0aW5nL3YxIiwic3ViamVjdCI6W3siZGlnZXN0Ijp7InNoYTI1NiI6ImZlZTI0NGFjYjlhNTQ4YjYzN2NmOTg2ODgwMmI3MWZkN2EwMmY1M2MyZmJiNGQyZmY1MjhmMmM0ZDI4YTcwNDMifSwibmFtZSI6InBsYXRmb3JtOjg0NDMvcGx1Z2lucy94In1dfQ==\",\"payloadType\":\"application/vnd.in-toto+json\",\"signatures\":[{\"keyid\":\"e2e-platform\",\"sig\":\"MEUCIFDQJFJ1ZNmJ6Mhd1sWZm5ci4OwEO7ZOE8WvVl04wO6DAiEAvV1J6cmO6hu8LvZ98oo7/KVlhE6uLvX2B/IZM9xAD/U=\"}]}",
+     "listing_statement": "{\"payload\":\"eyJfdHlwZSI6Imh0dHBzOi8vaW4tdG90by5pby9TdGF0ZW1lbnQvdjEiLCJwcmVkaWNhdGUiOnsiYXBwcm92ZWRfcm9sZXMiOltdLCJmbG9vciI6InYyNSIsImxpc3RlZF9hdCI6IjIwMjYtMTAtMTZUMTI6MDA6MDBaIiwibGlzdGluZyI6Im90aGVyLW9yZy9yZXZva2VkIiwicmVnaXN0cnkiOiJjb21tdW5pdHkiLCJyZXZpZXdfaWQiOiIiLCJyb2xlcyI6WyJjdXN0b2R5Il0sInNpZ25lcl9rZXkiOiJTSEEyNTY6ZTJlLW90aGVyLW9yZy1yZWxlYXNlIiwidmVyc2lvbiI6IjEuMC4wIn0sInByZWRpY2F0ZVR5cGUiOiJodHRwczovL29wZW4tbWVyaWRpYW4uZGV2L2F0dGVzdGF0aW9uL3BsdWdpbi1saXN0aW5nL3YxIiwic3ViamVjdCI6W3siZGlnZXN0Ijp7InNoYTI1NiI6ImZlZTI0NGFjYjlhNTQ4YjYzN2NmOTg2ODgwMmI3MWZkN2EwMmY1M2MyZmJiNGQyZmY1MjhmMmM0ZDI4YTcwNDMifSwibmFtZSI6InBsYXRmb3JtOjg0NDMvcGx1Z2lucy94In1dfQ==\",\"payloadType\":\"application/vnd.in-toto+json\",\"signatures\":[{\"keyid\":\"e2e-platform\",\"sig\":\"MEUCIEZ9dME9BQhyCgoQNCGiguJuZsHEDbZuOVECJXU9O70NAiEAr6qp93sy0NmMdiKzlwdDddUt1ifFuGs9Obbq9sXN7mI=\"}]}",
      "metadata": {
       "declaration": {
        "documentation": [
@@ -354,6 +427,47 @@
      "withdrawn_at_ns": 0
     }
    ]
+  }
+ ],
+ "packs": [
+  {
+   "curator": "Open Meridian",
+   "pack": "open-meridian/stand-in-desk",
+   "revision": {
+    "asset_classes": [
+     "equity"
+    ],
+    "description": "The stand-in's rates and accounts, for the harness.",
+    "members": [
+     {
+      "group": "Data",
+      "listing": "open-meridian/stand-in-rates",
+      "minimum_version": "0.1.0",
+      "registry": "community",
+      "selection": "PACK_SELECTION_PRESELECTED"
+     },
+     {
+      "group": "Data",
+      "listing": "other-org/revoked",
+      "minimum_version": "1.0.0",
+      "registry": "community",
+      "selection": "PACK_SELECTION_PRESELECTED"
+     },
+     {
+      "group": "Brokers",
+      "listing": "open-meridian/stand-in",
+      "minimum_version": "1.4.0",
+      "registry": "community",
+      "selection": "PACK_SELECTION_CHOOSE"
+     }
+    ],
+    "note": "Reviewed.",
+    "published_at_ns": 1792152000000000000,
+    "revision": 1,
+    "title": "Stand-in desk"
+   },
+   "sequence": 4,
+   "withdrawn_at_ns": 0
   }
  ],
  "sequence": 4

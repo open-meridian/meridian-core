@@ -45,7 +45,7 @@ same tag. The runtime image carries none of it.
 | `tickets.sql` | The dashboard's tickets, the records they name and their notes, as stable, sorted lines (contract v13), which `store tickets` prints; never a text |
 | `activity.sql` | The custodian's activity and each connection's latest sync status, as the street keeps them, as stable, sorted lines (contract v14), which `store activity` prints |
 | `lake.sql` | The lake's rows, priorities, wants, servings of a dataset not kept, removals, misses and aliases, as stable, sorted lines (contract v18), which `store lake` prints; never a value |
-| `moves.sql` | An edge plugin's moves of its raw records, and the holds and archives a deployment admin set, each its own record, as stable, sorted lines (contract v16), and from contract v17 each setting change and the delegation, client and note of each change, which `store moves` prints; never a record's content, nor a setting's value |
+| `moves.sql` | An edge plugin's moves of its raw records, and the holds and archives a deployment admin set, each its own record, as stable, sorted lines (contract v16), and from contract v17 each setting change and the delegation, client and note of each change, and from v28 each registry install with the starter pack that made it and each change to a pack's record, which `store moves` prints; never a record's content, nor a setting's value |
 
 ## Taking it out of the image
 

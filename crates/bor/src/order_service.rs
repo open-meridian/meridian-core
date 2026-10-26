@@ -442,11 +442,13 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
                 clock.now_ns(),
             );
             let mut ctx = context_of(&envelope, clock.as_ref());
-            let found = references(
-                &bus2,
-                std::slice::from_ref(&request.instrument_id),
-                ctx.received_at_ns,
-            );
+            // Contract v28 (W11.1): a package's legs' records beside it.
+            let mut named: Vec<String> = Vec::new();
+            if !request.instrument_id.is_empty() {
+                named.push(request.instrument_id.clone());
+            }
+            named.extend(request.legs.iter().map(|leg| leg.instrument_id.clone()));
+            let found = references(&bus2, &named, ctx.received_at_ns);
             ctx.reference_versions = found.versions;
             ctx.records = found.records;
             ctx.reference_unavailable = found.unavailable;
@@ -862,7 +864,38 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
                 &meridian_domain::money::codes(&request),
                 clock.now_ns(),
             );
-            let ctx = context_of(&envelope, clock.as_ref());
+            let mut ctx = context_of(&envelope, clock.as_ref());
+            // Contract v28 (559): the filled instrument's record, for its
+            // series' multiplier -- named, or its placement's order's.
+            let filled = if !request.instrument_id.is_empty() {
+                request.instrument_id.clone()
+            } else if request.account_id.is_empty() {
+                String::new()
+            } else {
+                store
+                    .book(&request.account_id)
+                    .ok()
+                    .and_then(|book| {
+                        let placed = book.ledger.placements.get(&request.placement_id)?;
+                        let order = book.ledger.orders.get(&placed.placement.order_id)?;
+                        Some(order.order.instrument_id.clone())
+                    })
+                    .or_else(|| {
+                        let book = store.book(&request.account_id).ok()?;
+                        Some(
+                            book.ledger
+                                .orders
+                                .get(&request.order_id)?
+                                .order
+                                .instrument_id
+                                .clone(),
+                        )
+                    })
+                    .unwrap_or_default()
+            };
+            if !filled.is_empty() {
+                ctx.records = references(&bus2, &[filled], ctx.received_at_ns).records;
+            }
             let fact = unplaced_fact::Fact::Execution(request.clone());
             if request.account_id.is_empty() {
                 if !ctx.acting_for.is_empty() {

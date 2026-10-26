@@ -126,6 +126,26 @@ pub struct RecordSays {
     pub code: String,
     pub provisional: bool,
     pub referential: bool,
+    /// Contract v28: its type within its class, a listed option's or a
+    /// future's what a lifecycle event names (W9.16).
+    pub instrument_type: i32,
+    /// Contract v28 (579): a listed series past its last lifecycle date.
+    pub expired: bool,
+    /// Contract v28 (559; FIX 231): a listed option's or a future's
+    /// `ContractMultiplier`, the premium multiplier its fills' cash and cost
+    /// are priced by; None for every other record, read as one.
+    pub multiplier: Option<Exact>,
+}
+
+impl Context {
+    /// The multiplier an instrument's fill is priced by (559): its series'
+    /// `ContractMultiplier` where its record carries one, else one.
+    pub fn multiplier(&self, instrument: &str) -> Exact {
+        self.records
+            .get(instrument)
+            .and_then(|r| r.multiplier)
+            .unwrap_or(Exact::ONE)
+    }
 }
 
 impl Context {
@@ -382,6 +402,11 @@ fn admits(side: HoldingSide, quantity: Exact) -> bool {
         HoldingSide::Short => !quantity.negated().is_negative(),
         _ => !quantity.is_negative(),
     }
+}
+
+/// [`opening_required`], for the lifecycle events (contract v28).
+pub(crate) fn opening_required_for(book: &Book) -> Result<(String, String)> {
+    opening_required(book)
 }
 
 fn opening_required(book: &Book) -> Result<(String, String)> {

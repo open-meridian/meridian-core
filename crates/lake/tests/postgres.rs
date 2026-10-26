@@ -38,6 +38,7 @@ fn close(dataset: &str, row_key: &str, subject: &str, date: &str, amount: i64) -
             row_key: row_key.into(),
             subjects: vec![SubjectRef {
                 entity_id: subject.into(),
+                ..Default::default()
             }],
             source: Some(Source {
                 instance: "coinbase-1".into(),
@@ -206,6 +207,7 @@ fn trade(dataset: &str, row_key: &str, subject: &str, valid_from_ns: i64) -> Obs
             row_key: row_key.into(),
             subjects: vec![SubjectRef {
                 entity_id: subject.into(),
+                ..Default::default()
             }],
             source: Some(Source {
                 instance: "coinbase-1".into(),
@@ -281,6 +283,7 @@ fn outcome(dataset: &str, subject: &str, stage: i32, value: u64) -> Observation 
             row_key: "KXFED-26OCT".into(),
             subjects: vec![SubjectRef {
                 entity_id: subject.into(),
+                ..Default::default()
             }],
             source: Some(Source {
                 instance: "kalshi-1".into(),

@@ -11,6 +11,12 @@
 --   archive|instance|allowed|most bytes|set by|delegation|client|note
 --   setting|instance|name|set, cleared, gap or redacted|secret|set by|delegation|client|note
 --
+-- and from v28 (W8.18, W8.19) each registry install, with the starter pack
+-- whose install made it, and each change to a starter pack's record:
+--
+--   install|listing|version|pack|installed by|delegation|client|note
+--   pack|pack|pack_installed, pack_updated or pack_removed|revision|by|delegation|client|note
+--
 -- Never a record's content, nor a setting's value: a table's rows are its
 -- value, and a secret's is never in the conductor's records.
 SELECT line FROM (
@@ -35,5 +41,13 @@ SELECT line FROM (
         || '|' || secret || '|' || changed_by || '|' || through_delegation || '|' || client_name
         || '|' || note
       FROM config_plugin_setting_change
+    UNION ALL
+    SELECT 'install|' || listing || '|' || version || '|' || installed_by_pack || '|' || uploaded_by
+        || '|' || uploaded_through_delegation || '|' || uploaded_client_name || '|' || uploaded_note
+      FROM config_plugin_version WHERE listing <> ''
+    UNION ALL
+    SELECT 'pack|' || pack || '|' || kind || '|' || revision || '|' || changed_by
+        || '|' || through_delegation || '|' || client_name || '|' || note
+      FROM config_pack_change
 ) lines
 ORDER BY line;

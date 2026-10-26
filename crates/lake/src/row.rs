@@ -1,13 +1,16 @@
 //! One row of the lake under its envelope: a price or a bar (the 1a), a trade
 //! or a quote (the 1b, contract v19), an event contract's outcome (the 1c,
-//! contract v23), a rate (contract v27, the rates slice).
+//! contract v23), a rate (contract v27, the rates slice), a statistic and a
+//! listed series, a derived series, a saved scenario and a declared corporate
+//! action (contract v28).
 
 use std::collections::BTreeSet;
 
 use meridian_domain::exact::Exact;
 use meridian_domain::lake;
 use meridian_domain::v1::{
-    Bar, ExecutionCost, Money, ObservationMeta, Outcome, Price, Quote, Rate, Trade,
+    Bar, CorporateActionAnnounced, DerivedSeries, ExecutionCost, ListedSeries, Money,
+    ObservationMeta, Outcome, Price, Quote, Rate, SavedScenario, Statistic, Trade,
 };
 use meridian_pb::v1::Decimal;
 use prost::Message;
@@ -26,6 +29,16 @@ pub enum DataType {
     ExecutionCost,
     /// Contract v27, the rates slice (W10.4).
     Rate,
+    /// Contract v28 (G11, W10.4): open interest and volumes.
+    Statistic,
+    /// Contract v28 (ruling 561, W10.4): a series' terms, never minted.
+    Series,
+    /// Contract v28, track B (W10.4): a signal plugin's derived value.
+    Derived,
+    /// Contract v28 (W12.8): a saved scenario or scenario set.
+    Scenario,
+    /// Contract v28, the filings slice (W10.4): a declared cash dividend.
+    CorporateAction,
 }
 
 impl DataType {
@@ -40,6 +53,11 @@ impl DataType {
             lake::OUTCOME => Some(DataType::Outcome),
             lake::EXECUTION_COST => Some(DataType::ExecutionCost),
             lake::RATE => Some(DataType::Rate),
+            lake::STATISTIC => Some(DataType::Statistic),
+            lake::LISTED_SERIES => Some(DataType::Series),
+            lake::DERIVED_SERIES => Some(DataType::Derived),
+            lake::SAVED_SCENARIO => Some(DataType::Scenario),
+            lake::CORPORATE_ACTION => Some(DataType::CorporateAction),
             _ => None,
         }
     }
@@ -53,6 +71,11 @@ impl DataType {
             DataType::Outcome => lake::OUTCOME,
             DataType::ExecutionCost => lake::EXECUTION_COST,
             DataType::Rate => lake::RATE,
+            DataType::Statistic => lake::STATISTIC,
+            DataType::Series => lake::LISTED_SERIES,
+            DataType::Derived => lake::DERIVED_SERIES,
+            DataType::Scenario => lake::SAVED_SCENARIO,
+            DataType::CorporateAction => lake::CORPORATE_ACTION,
         }
     }
 
@@ -65,6 +88,11 @@ impl DataType {
             DataType::Outcome => 5,
             DataType::Rate => 6,
             DataType::ExecutionCost => 7,
+            DataType::Statistic => 8,
+            DataType::Series => 9,
+            DataType::Derived => 10,
+            DataType::Scenario => 11,
+            DataType::CorporateAction => 12,
         }
     }
 
@@ -77,6 +105,11 @@ impl DataType {
             5 => Some(DataType::Outcome),
             6 => Some(DataType::Rate),
             7 => Some(DataType::ExecutionCost),
+            8 => Some(DataType::Statistic),
+            9 => Some(DataType::Series),
+            10 => Some(DataType::Derived),
+            11 => Some(DataType::Scenario),
+            12 => Some(DataType::CorporateAction),
             _ => None,
         }
     }
@@ -93,9 +126,15 @@ impl DataType {
     pub fn dated(self) -> bool {
         // An execution cost is dated by its execution's trade date; a rate
         // by the business day it is for, in its dataset's zone.
+        // A statistic by its trading date (contract v28, W10.4).
         matches!(
             self,
-            DataType::Price | DataType::Bar | DataType::ExecutionCost | DataType::Rate
+            DataType::Price
+                | DataType::Bar
+                | DataType::ExecutionCost
+                | DataType::Rate
+                | DataType::Statistic
+                | DataType::Derived
         )
     }
 }
@@ -113,6 +152,11 @@ pub enum Observation {
     Outcome(Outcome),
     ExecutionCost(ExecutionCost),
     Rate(Rate),
+    Statistic(Statistic),
+    Series(ListedSeries),
+    Derived(DerivedSeries),
+    Scenario(SavedScenario),
+    CorporateAction(CorporateActionAnnounced),
 }
 
 impl Observation {
@@ -125,6 +169,11 @@ impl Observation {
             Observation::Outcome(_) => DataType::Outcome,
             Observation::ExecutionCost(_) => DataType::ExecutionCost,
             Observation::Rate(_) => DataType::Rate,
+            Observation::Statistic(_) => DataType::Statistic,
+            Observation::Series(_) => DataType::Series,
+            Observation::Derived(_) => DataType::Derived,
+            Observation::Scenario(_) => DataType::Scenario,
+            Observation::CorporateAction(_) => DataType::CorporateAction,
         }
     }
 
@@ -138,6 +187,11 @@ impl Observation {
             Observation::Outcome(outcome) => outcome.meta.as_ref(),
             Observation::ExecutionCost(cost) => cost.meta.as_ref(),
             Observation::Rate(rate) => rate.meta.as_ref(),
+            Observation::Statistic(statistic) => statistic.meta.as_ref(),
+            Observation::Series(series) => series.meta.as_ref(),
+            Observation::Derived(value) => value.meta.as_ref(),
+            Observation::Scenario(saved) => saved.meta.as_ref(),
+            Observation::CorporateAction(action) => action.meta.as_ref(),
         };
         meta.unwrap_or_else(|| NONE.get_or_init(ObservationMeta::default))
     }
@@ -151,27 +205,66 @@ impl Observation {
             Observation::Outcome(outcome) => outcome.meta.get_or_insert_with(Default::default),
             Observation::ExecutionCost(cost) => cost.meta.get_or_insert_with(Default::default),
             Observation::Rate(rate) => rate.meta.get_or_insert_with(Default::default),
+            Observation::Statistic(statistic) => {
+                statistic.meta.get_or_insert_with(Default::default)
+            }
+            Observation::Series(series) => series.meta.get_or_insert_with(Default::default),
+            Observation::Derived(value) => value.meta.get_or_insert_with(Default::default),
+            Observation::Scenario(saved) => saved.meta.get_or_insert_with(Default::default),
+            Observation::CorporateAction(action) => {
+                action.meta.get_or_insert_with(Default::default)
+            }
         }
     }
 
-    /// A price's kind, or from contract v27 a rate's; 0 for the other data
-    /// types.
+    /// A price's kind, or from contract v27 a rate's, from contract v28 a
+    /// statistic's and a corporate action's; 0 for the other data types.
     pub fn kind(&self) -> i32 {
         match self {
             Observation::Price(price) => price.kind,
             Observation::Rate(rate) => rate.kind,
+            Observation::Statistic(statistic) => statistic.kind,
+            Observation::CorporateAction(action) => action.kind,
             _ => 0,
         }
+    }
+
+    /// The date a read by dates is on (contract v28, W10.6): its business
+    /// date, or for a corporate action its kind's date -- a cash dividend's
+    /// ex-date, the date a holder's entitlement turns on.
+    pub fn date(&self) -> &str {
+        match self {
+            Observation::CorporateAction(action) => &action.ex_date,
+            _ => &self.meta().business_date,
+        }
+    }
+
+    /// Its series key as one text (contract v28, ruling 561), empty for a
+    /// row keyed by no series.
+    pub fn series(&self) -> String {
+        lake::series_key_text(&self.meta().series_key)
     }
 
     /// A rate's point and convention (contract v27, W10.5, W10.6): its
     /// tenor or maturity and its convention, what its latest is chosen and
     /// its deliveries conflated per beside the kind; empty for the other
     /// data types.
+    ///
+    /// From contract v28 a row keyed by a series has the series in its point
+    /// too: a chain's rows under one underlying are chosen and conflated per
+    /// series (W10.5, W10.6).
     pub fn point(&self) -> String {
-        match self {
+        let point = match self {
             Observation::Rate(rate) => lake::rate_point(rate),
+            // A derived value's latest is per its series (contract v28).
+            Observation::Derived(value) => value.series.clone(),
             _ => String::new(),
+        };
+        let series = self.series();
+        if series.is_empty() {
+            point
+        } else {
+            format!("{point}#{series}")
         }
     }
 
@@ -204,8 +297,15 @@ impl Observation {
             Observation::Quote(quote) => lake::quote_asset(quote),
             Observation::Outcome(outcome) => lake::asset_key(outcome.settlement_value.as_ref()),
             Observation::ExecutionCost(cost) => lake::asset_key(cost.execution_price.as_ref()),
-            // A rate is no amount: its unit is in its point's key.
-            Observation::Rate(_) => String::new(),
+            // A rate is no amount: its unit is in its point's key; nor is a
+            // statistic or a series' terms (contract v28).
+            Observation::Rate(_)
+            | Observation::Statistic(_)
+            | Observation::Series(_)
+            | Observation::Derived(_)
+            | Observation::Scenario(_)
+            // Never conflated nor chosen per asset (contract v28, W10.5).
+            | Observation::CorporateAction(_) => String::new(),
         }
     }
 
@@ -251,6 +351,11 @@ impl Observation {
             Observation::Outcome(outcome) => outcome.encode_to_vec(),
             Observation::ExecutionCost(cost) => cost.encode_to_vec(),
             Observation::Rate(rate) => rate.encode_to_vec(),
+            Observation::Statistic(statistic) => statistic.encode_to_vec(),
+            Observation::Series(series) => series.encode_to_vec(),
+            Observation::Derived(value) => value.encode_to_vec(),
+            Observation::Scenario(saved) => saved.encode_to_vec(),
+            Observation::CorporateAction(action) => action.encode_to_vec(),
         }
     }
 
@@ -263,6 +368,13 @@ impl Observation {
             DataType::Outcome => Observation::Outcome(Outcome::decode(bytes)?),
             DataType::ExecutionCost => Observation::ExecutionCost(ExecutionCost::decode(bytes)?),
             DataType::Rate => Observation::Rate(Rate::decode(bytes)?),
+            DataType::Statistic => Observation::Statistic(Statistic::decode(bytes)?),
+            DataType::Series => Observation::Series(ListedSeries::decode(bytes)?),
+            DataType::Derived => Observation::Derived(DerivedSeries::decode(bytes)?),
+            DataType::Scenario => Observation::Scenario(SavedScenario::decode(bytes)?),
+            DataType::CorporateAction => {
+                Observation::CorporateAction(CorporateActionAnnounced::decode(bytes)?)
+            }
         })
     }
 
@@ -293,11 +405,22 @@ impl Observation {
                 }
                 out
             }
-            Observation::Trade(trade) => trade
-                .price
-                .as_mut()
-                .map(|m| vec![("price", m)])
-                .unwrap_or_default(),
+            Observation::Trade(trade) => {
+                let mut out = Vec::new();
+                if let Some(m) = trade.price.as_mut() {
+                    out.push(("price", m));
+                }
+                // Contract v28 (G9): the quote in force at the print.
+                if let Some(quote) = trade.quote_at_trade.as_mut() {
+                    if let Some(m) = quote.bid.as_mut() {
+                        out.push(("quote_at_trade.bid", m));
+                    }
+                    if let Some(m) = quote.ask.as_mut() {
+                        out.push(("quote_at_trade.ask", m));
+                    }
+                }
+                out
+            }
             Observation::Quote(quote) => {
                 let mut out = Vec::new();
                 if let Some(m) = quote.bid.as_mut() {
@@ -331,6 +454,15 @@ impl Observation {
                 .as_mut()
                 .map(|m| vec![("volume", m)])
                 .unwrap_or_default(),
+            Observation::CorporateAction(action) => action
+                .amount_per_share
+                .as_mut()
+                .map(|m| vec![("amount_per_share", m)])
+                .unwrap_or_default(),
+            Observation::Statistic(_)
+            | Observation::Series(_)
+            | Observation::Derived(_)
+            | Observation::Scenario(_) => Vec::new(),
         }
     }
 
@@ -363,6 +495,8 @@ impl Observation {
                 meta.business_date.clone(),
                 meta.source_times.clone(),
                 meta.unconverted.clone(),
+                // Contract v28 (ruling 561).
+                lake::series_key_text(&meta.series_key),
             )
         };
         if said(self.meta()) != said(other.meta()) {
@@ -388,6 +522,7 @@ impl Observation {
                     && a.aggressor == b.aggressor
                     && a.source_sequence == b.source_sequence
                     && a.cancelled == b.cancelled
+                    && same_quote_at_trade(&a.quote_at_trade, &b.quote_at_trade)
             }
             (Observation::Quote(a), Observation::Quote(b)) => {
                 same_money(&a.bid, &b.bid)
@@ -451,6 +586,53 @@ impl Observation {
                         x.percentile == y.percentile && same_decimal(&x.value, &y.value)
                     })
             }
+            (Observation::Statistic(a), Observation::Statistic(b)) => {
+                let value = |statistic: &Statistic| statistic.value.clone().unwrap_or_default();
+                let (va, vb) = (value(a), value(b));
+                a.kind == b.kind
+                    && a.value.is_some() == b.value.is_some()
+                    && same_decimal(&va.value, &vb.value)
+                    && (va.unit, &va.index_base, &va.ucum_code)
+                        == (vb.unit, &vb.index_base, &vb.ucum_code)
+            }
+            (Observation::Series(a), Observation::Series(b)) => {
+                a.template_id == b.template_id
+                    && a.template_version == b.template_version
+                    && a.fields == b.fields
+            }
+            (Observation::Derived(a), Observation::Derived(b)) => {
+                let value = |row: &DerivedSeries| row.value.clone().unwrap_or_default();
+                let (va, vb) = (value(a), value(b));
+                a.series == b.series
+                    && a.value.is_some() == b.value.is_some()
+                    && same_decimal(&va.value, &vb.value)
+                    && (va.unit, &va.index_base, &va.ucum_code)
+                        == (vb.unit, &vb.index_base, &vb.ucum_code)
+                    && a.rule == b.rule
+                    && a.inputs == b.inputs
+            }
+            (Observation::Scenario(a), Observation::Scenario(b)) => {
+                a.scenario == b.scenario
+                    && a.scenario_set == b.scenario_set
+                    && a.description == b.description
+            }
+            (Observation::CorporateAction(a), Observation::CorporateAction(b)) => {
+                a.kind == b.kind
+                    && same_money(&a.amount_per_share, &b.amount_per_share)
+                    && (
+                        &a.declared_date,
+                        &a.ex_date,
+                        &a.record_date,
+                        &a.payment_date,
+                    ) == (
+                        &b.declared_date,
+                        &b.ex_date,
+                        &b.record_date,
+                        &b.payment_date,
+                    )
+                    && a.rule == b.rule
+                    && a.filing == b.filing
+            }
             _ => false,
         }
     }
@@ -469,7 +651,30 @@ impl Observation {
             // Read within the reader's account scope, never by entitlement.
             Observation::ExecutionCost(_) => Vec::new(),
             Observation::Rate(rate) => lake::strip_rate(rate, allowed),
+            Observation::Statistic(statistic) => lake::strip_statistic(statistic, allowed),
+            Observation::Series(series) => lake::strip_series(series, allowed),
+            // A signal plugin's own rows, read whole by whoever reads them.
+            Observation::Derived(_) | Observation::Scenario(_) => Vec::new(),
+            Observation::CorporateAction(action) => lake::strip_corporate_action(action, allowed),
         }
+    }
+}
+
+fn same_quote_at_trade(
+    a: &Option<meridian_domain::v1::QuoteAtTrade>,
+    b: &Option<meridian_domain::v1::QuoteAtTrade>,
+) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            same_money(&a.bid, &b.bid)
+                && same_money(&a.ask, &b.ask)
+                && same_decimal(&a.bid_quantity, &b.bid_quantity)
+                && same_decimal(&a.ask_quantity, &b.ask_quantity)
+                && a.source_time_ns == b.source_time_ns
+                && a.as_last_received == b.as_last_received
+        }
+        _ => false,
     }
 }
 

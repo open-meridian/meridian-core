@@ -34,6 +34,7 @@ pub mod first_run;
 pub mod health;
 pub mod html;
 pub mod kit;
+pub mod latency;
 pub mod markdown;
 pub mod mcp;
 pub mod notice;

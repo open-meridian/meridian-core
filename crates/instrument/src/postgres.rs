@@ -49,17 +49,19 @@ const SCHEMA: &[&str] = &[
     include_str!("../migrations/0011_one_id.sql"),
     include_str!("../migrations/0012_a_listing_trades_in_its_currency.sql"),
     include_str!("../migrations/0013_event_groups.sql"),
+    include_str!("../migrations/0014_listed_terms.sql"),
+    include_str!("../migrations/0015_companies.sql"),
 ];
 
 /// A table the newest file makes. A database that has it has them all, so a
 /// start can check for this one and refuse a database an older release
 /// migrated, rather than failing later on the first record.
-const NEWEST_TABLE: &str = "instrument_event_group";
+const NEWEST_TABLE: &str = "instrument_company_identifier";
 
-/// And the column the newest file adds (0008, contract v20: the prepared
-/// change a version was made from), with its table, which a table check
-/// cannot see.
-const NEWEST_COLUMN: (&str, &str) = ("instrument_identifier", "trading_currency");
+/// And the column the newest file adding one adds (0014, contract v28: a
+/// listed series' terms), with its table, which a table check cannot see;
+/// 0015 (contract v28: the company kind) adds tables only.
+const NEWEST_COLUMN: (&str, &str) = ("instrument", "listed_terms");
 
 /// Names the schema lock. An arbitrary constant, and it only has to be the same
 /// one in every process that creates this schema.
@@ -365,7 +367,7 @@ impl PostgresStore {
                 "SELECT instrument_id, asset_class, currency, exchange_mic, description,
                         lifecycle_state, version, valid_from_ns, record_time_ns,
                         instrument_type, money_market_fund, listing_venue_id,
-                        binary_event_contract, one_id
+                        binary_event_contract, one_id, listed_terms
                    FROM instrument
                   WHERE instrument_id = ANY($1)
                   ORDER BY instrument_id",
@@ -393,6 +395,7 @@ impl PostgresStore {
                 sources: Vec::new(),
                 offers: Vec::new(),
                 local: crate::store::Local::from_text(row.get::<_, &str>(13)),
+                listed_terms: row.get(14),
             })
             .collect();
         let index: std::collections::HashMap<String, usize> = instruments
@@ -749,8 +752,9 @@ impl Store for PostgresStore {
                                          description, lifecycle_state, version, valid_from_ns,
                                          record_time_ns, mint_key, instrument_type,
                                          money_market_fund, listing_venue_id,
-                                         binary_event_contract, one_id)
-                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                                         binary_event_contract, one_id, listed_terms)
+                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+                              $16)
                  ON CONFLICT (mint_key) WHERE mint_key IS NOT NULL DO NOTHING",
                 &[
                     &candidate.instrument_id,
@@ -768,6 +772,7 @@ impl Store for PostgresStore {
                     &candidate.listing_venue_id,
                     &candidate.binary_event_contract,
                     &candidate.local.to_text(),
+                    &candidate.listed_terms,
                 ],
             )
             .map_err(unavailable)?
@@ -800,7 +805,8 @@ impl Store for PostgresStore {
                     SET asset_class = $2, currency = $3, exchange_mic = $4, description = $5,
                         lifecycle_state = $6, version = $7, valid_from_ns = $8,
                         record_time_ns = $9, instrument_type = $11, money_market_fund = $12,
-                        listing_venue_id = $13, binary_event_contract = $14, one_id = $15
+                        listing_venue_id = $13, binary_event_contract = $14, one_id = $15,
+                        listed_terms = $16
                   WHERE instrument_id = $1 AND version = $10",
                 &[
                     &record.instrument_id,
@@ -818,6 +824,7 @@ impl Store for PostgresStore {
                     &record.listing_venue_id,
                     &record.binary_event_contract,
                     &record.local.to_text(),
+                    &record.listed_terms,
                 ],
             )
             .map_err(unavailable)?;
@@ -1325,6 +1332,85 @@ impl Store for PostgresStore {
                 let bytes: Vec<u8> = row.get(0);
                 meridian_domain::v1::EventGroup::decode(bytes.as_slice()).map_err(|failed| {
                     StoreError::Unavailable(format!("an event group did not read: {failed}"))
+                })
+            })
+            .collect()
+    }
+
+    fn keep_company(
+        &self,
+        company: &meridian_domain::v1::CompanyRecord,
+        now_ns: i64,
+    ) -> Result<bool> {
+        use prost::Message;
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        let kept = tx
+            .execute(
+                "INSERT INTO instrument_company (company_id, version, record, kept_at_ns)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (company_id, version) DO NOTHING",
+                &[
+                    &company.company_id,
+                    &company.version,
+                    &company.encode_to_vec(),
+                    &now_ns,
+                ],
+            )
+            .map_err(unavailable)?
+            == 1;
+        for identifier in &company.identifiers {
+            tx.execute(
+                "INSERT INTO instrument_company_identifier (scheme, value, company_id)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT DO NOTHING",
+                &[&identifier.scheme, &identifier.value, &company.company_id],
+            )
+            .map_err(unavailable)?;
+        }
+        tx.commit().map_err(unavailable)?;
+        Ok(kept)
+    }
+
+    fn company(&self, company_id: &str) -> Result<Option<meridian_domain::v1::CompanyRecord>> {
+        use prost::Message;
+        self.conn()?
+            .query_opt(
+                "SELECT record FROM instrument_company
+                  WHERE company_id = $1 ORDER BY version DESC LIMIT 1",
+                &[&company_id],
+            )
+            .map_err(unavailable)?
+            .map(|row| {
+                let bytes: Vec<u8> = row.get(0);
+                meridian_domain::v1::CompanyRecord::decode(bytes.as_slice()).map_err(|failed| {
+                    StoreError::Unavailable(format!("a company record did not read: {failed}"))
+                })
+            })
+            .transpose()
+    }
+
+    fn companies_with(
+        &self,
+        scheme: &str,
+        value: &str,
+    ) -> Result<Vec<meridian_domain::v1::CompanyRecord>> {
+        use prost::Message;
+        self.conn()?
+            .query(
+                "SELECT DISTINCT ON (c.company_id) c.record
+                   FROM instrument_company c
+                   JOIN instrument_company_identifier i ON i.company_id = c.company_id
+                  WHERE i.scheme = $1 AND i.value = $2
+                  ORDER BY c.company_id, c.version DESC",
+                &[&scheme, &value],
+            )
+            .map_err(unavailable)?
+            .into_iter()
+            .map(|row| {
+                let bytes: Vec<u8> = row.get(0);
+                meridian_domain::v1::CompanyRecord::decode(bytes.as_slice()).map_err(|failed| {
+                    StoreError::Unavailable(format!("a company record did not read: {failed}"))
                 })
             })
             .collect()

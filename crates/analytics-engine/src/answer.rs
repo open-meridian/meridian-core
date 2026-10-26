@@ -18,6 +18,11 @@ pub const HISTORICAL_DAY: &str = "SCENARIO_KIND_HISTORICAL_DAY";
 pub const OUTCOME: &str = "SCENARIO_KIND_OUTCOME";
 pub const NONE_OF_THE_NAMED: &str = "SCENARIO_KIND_NONE_OF_THE_NAMED";
 pub const EXACT: &str = "COMPUTED_AS_EXACT";
+/// Contract v28 (W12.1): a model's floating-point value, crossing at its
+/// definition's scale, rounded half to even.
+pub const MODEL: &str = "COMPUTED_AS_MODEL";
+/// Contract v28 (W12.8): one point of a scenario or a scenario set.
+pub const SCENARIO_POINT: &str = "SCENARIO_KIND_SCENARIO_POINT";
 
 pub const PRICE_MISSING: &str = "NOT_EVALUATED_REASON_PRICE_MISSING";
 pub const PRICE_STALE: &str = "NOT_EVALUATED_REASON_PRICE_STALE";
@@ -30,6 +35,13 @@ pub const GROUP_NOT_EXHAUSTIVE: &str = "NOT_EVALUATED_REASON_GROUP_NOT_EXHAUSTIV
 pub const HISTORY_INSUFFICIENT: &str = "NOT_EVALUATED_REASON_HISTORY_INSUFFICIENT";
 /// Contract v27 (ruling 325): a lot's cost the book does not record.
 pub const COST_MISSING: &str = "NOT_EVALUATED_REASON_COST_MISSING";
+/// Contract v28 (W12.1): an option quote below its intrinsic value.
+pub const BELOW_INTRINSIC: &str = "NOT_EVALUATED_REASON_BELOW_INTRINSIC";
+/// Contract v28 (W12.1): a surface fit failing a no-arbitrage check or not
+/// converging.
+pub const FIT_FAILED: &str = "NOT_EVALUATED_REASON_FIT_FAILED";
+/// Contract v28 (W12.2; ruling 421): the only input in force is invalid.
+pub const INPUT_QUARANTINED: &str = "NOT_EVALUATED_REASON_INPUT_QUARANTINED";
 
 /// How a conversion leg's rate was found (contract v27, ruling 462).
 pub const DIRECT: &str = "CONVERSION_DERIVATION_DIRECT";
@@ -44,6 +56,7 @@ pub fn scenario_order(kind: &str) -> u8 {
         HISTORICAL_DAY => 2,
         OUTCOME => 3,
         NONE_OF_THE_NAMED => 4,
+        SCENARIO_POINT => 5,
         _ => 9,
     }
 }
@@ -54,6 +67,17 @@ pub struct Scenario {
     pub kind: &'static str,
     pub business_date: String,
     pub outcome_instrument_id: String,
+    /// Contract v28 (W12.8): a scenario point's saved row key, or `inline`;
+    /// its version; and its position on each axis.
+    pub scenario_row_key: String,
+    pub scenario_version: u64,
+    pub axis_positions: Vec<u32>,
+}
+
+impl Default for Scenario {
+    fn default() -> Scenario {
+        Scenario::of(BASE)
+    }
 }
 
 impl Scenario {
@@ -62,16 +86,55 @@ impl Scenario {
             kind,
             business_date: String::new(),
             outcome_instrument_id: String::new(),
+            scenario_row_key: String::new(),
+            scenario_version: 0,
+            axis_positions: Vec::new(),
         }
     }
 
     pub fn outcome(member: &str) -> Scenario {
         Scenario {
-            kind: OUTCOME,
-            business_date: String::new(),
             outcome_instrument_id: member.to_string(),
+            ..Scenario::of(OUTCOME)
         }
     }
+
+    /// Contract v28: one point of a scenario set, by its axis positions.
+    pub fn point(row_key: &str, version: u64, axis_positions: Vec<u32>) -> Scenario {
+        Scenario {
+            scenario_row_key: row_key.to_string(),
+            scenario_version: version,
+            axis_positions,
+            ..Scenario::of(SCENARIO_POINT)
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        let mut out = json!({
+            "kind": self.kind,
+            "business_date": self.business_date,
+            "outcome_instrument_id": self.outcome_instrument_id,
+        });
+        // Contract v28: written only on a scenario point, so every earlier
+        // answer's JSON, and its hash, is unchanged.
+        if self.kind == SCENARIO_POINT {
+            out["scenario_row_key"] = json!(self.scenario_row_key);
+            out["scenario_version"] = json!(self.scenario_version.to_string());
+            out["axis_positions"] = json!(self.axis_positions);
+        }
+        out
+    }
+}
+
+/// Contract v28: a series' key, as `Identifier`s (scheme, value).
+pub type SeriesKey = Vec<(String, String)>;
+
+fn series_json(key: &SeriesKey) -> Value {
+    Value::Array(
+        key.iter()
+            .map(|(scheme, value)| json!({"scheme": scheme, "value": value}))
+            .collect(),
+    )
 }
 
 /// One figure.
@@ -85,6 +148,36 @@ pub struct Figure {
     pub numerator: Option<Dec>,
     pub denominator: Option<Dec>,
     pub currency_instrument_id: String,
+    /// Contract v28: `COMPUTED_AS_MODEL` for a model's figure, else exact.
+    pub computed_as: &'static str,
+    /// Contract v28: a series not held, named by its key.
+    pub series_key: SeriesKey,
+    /// Contract v27 (ruling 374): its oldest input's source time; 0 for a
+    /// figure that read no market data, and where the measure does not say.
+    pub oldest_input_source_ns: i64,
+}
+
+impl Default for Figure {
+    fn default() -> Figure {
+        Figure {
+            measure: MeasureKey {
+                definition: String::new(),
+                version: 1,
+                event_group_id: String::new(),
+                breakdowns: Vec::new(),
+            },
+            account_id: String::new(),
+            breakdown: Vec::new(),
+            scenario: Scenario::default(),
+            value: None,
+            numerator: None,
+            denominator: None,
+            currency_instrument_id: String::new(),
+            computed_as: EXACT,
+            series_key: Vec::new(),
+            oldest_input_source_ns: 0,
+        }
+    }
 }
 
 impl Figure {
@@ -93,31 +186,37 @@ impl Figure {
             Some(value) => Value::String(value.text()),
             None => Value::Null,
         };
-        json!({
+        let mut out = json!({
             "measure": self.measure.to_json(),
             "account_id": self.account_id,
             "breakdown": self.breakdown.iter()
                 .map(|(b, v)| json!({"breakdown": b, "value": v}))
                 .collect::<Vec<_>>(),
-            "scenario_key": {
-                "kind": self.scenario.kind,
-                "business_date": self.scenario.business_date,
-                "outcome_instrument_id": self.scenario.outcome_instrument_id,
-            },
+            "scenario_key": self.scenario.to_json(),
             "currency_instrument_id": self.currency_instrument_id,
-            "computed_as": EXACT,
+            "computed_as": self.computed_as,
             "value": text(&self.value),
             "numerator": text(&self.numerator),
             "denominator": text(&self.denominator),
-        })
+        });
+        // Contract v28: written only where held, so every earlier answer's
+        // JSON is unchanged.
+        if !self.series_key.is_empty() {
+            out["series_key"] = series_json(&self.series_key);
+        }
+        if self.oldest_input_source_ns != 0 {
+            out["oldest_input_source_ns"] = json!(self.oldest_input_source_ns.to_string());
+        }
+        out
     }
 
     /// The order figures are answered in within one measure: by account,
     /// breakdown and scenario.
-    pub fn order_key(&self) -> (&str, &[(String, String)], u8, &Scenario) {
+    pub fn order_key(&self) -> (&str, &[(String, String)], &SeriesKey, u8, &Scenario) {
         (
             &self.account_id,
             &self.breakdown,
+            &self.series_key,
             scenario_order(self.scenario.kind),
             &self.scenario,
         )
@@ -132,23 +231,30 @@ pub struct Unevaluated {
     pub measure: MeasureKey,
     pub reason: &'static str,
     pub detail: String,
+    /// Contract v28: a series not held, named by its key.
+    pub series_key: SeriesKey,
 }
 
 impl Unevaluated {
     pub fn to_json(&self) -> Value {
-        json!({
+        let mut out = json!({
             "account_id": self.account_id,
             "instrument_id": self.instrument_id,
             "measure": self.measure.to_json(),
             "reason": self.reason,
             "detail": self.detail,
-        })
+        });
+        if !self.series_key.is_empty() {
+            out["series_key"] = series_json(&self.series_key);
+        }
+        out
     }
 
-    pub fn order_key(&self) -> (&str, &str, &str, &str) {
+    pub fn order_key(&self) -> (&str, &str, &SeriesKey, &str, &str) {
         (
             &self.account_id,
             &self.instrument_id,
+            &self.series_key,
             self.reason,
             &self.detail,
         )

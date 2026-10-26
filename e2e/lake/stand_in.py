@@ -250,7 +250,9 @@ class Dgm:
         entity = self.ids.get(subject, subject)
         return ObservationMeta(
             row_key=row_key,
-            subjects=[ops.SubjectRef(entity_id=entity)],
+            # SDK 0.33.0 (contract v28): the SDK's own SubjectRef, its role
+            # an enum it converts.
+            subjects=[meridian.SubjectRef(entity_id=entity)],
             source=ops.Source(dataset=self.dataset(dataset), venue_id=venue),
             valid_from_ns=seconds * 10**9,
             valid_until_ns=seconds * 10**9 + DAY_NS,
@@ -575,7 +577,7 @@ class Reader:
 
     async def prices(self, query):
         one = lambda name, default="": query.get(name, [default])[0]
-        subjects = [ops.SubjectRef(entity_id=s) for s in query.get("subject", [])]
+        subjects = [meridian.SubjectRef(entity_id=s) for s in query.get("subject", [])]
         named = query.get("dataset", [])
         sources = SourceChoice(named=named) if named else None
         asked = {"subjects": subjects, "sources": sources}
@@ -597,7 +599,7 @@ class Reader:
         """ListRates (contract v27, W10.6)."""
         one = lambda name, default="": query.get(name, [default])[0]  # noqa: E731
         answer = await self.plugin.list_rates(
-            subjects=[ops.SubjectRef(entity_id=s) for s in query.get("subject", [])],
+            subjects=[meridian.SubjectRef(entity_id=s) for s in query.get("subject", [])],
             business_date=one("date"),
             tenors=[rate_helpers.tenor(t) for t in query.get("tenor", [])],
             published_as_of_ns=int(one("published_as_of", "0")),

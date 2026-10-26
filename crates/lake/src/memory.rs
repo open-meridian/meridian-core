@@ -370,6 +370,22 @@ impl Store for MemoryStore {
         Ok(as_of(rows, as_of_ns))
     }
 
+    fn read_dataset_versions(
+        &self,
+        dataset: &str,
+        data_type: crate::row::DataType,
+    ) -> Result<Vec<Observation>> {
+        let held = self.lock();
+        let mut rows: Vec<Observation> = held
+            .rows
+            .iter()
+            .filter(|row| row.dataset() == dataset && row.data_type() == data_type)
+            .cloned()
+            .collect();
+        rows.sort_by_key(|row| row.meta().sequence);
+        Ok(rows)
+    }
+
     fn dated_on(&self, dataset: &str, dates: &[String]) -> Result<Vec<Observation>> {
         let held = self.lock();
         let mut rows: Vec<Observation> = held

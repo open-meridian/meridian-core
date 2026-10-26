@@ -43,6 +43,10 @@ enum InstrumentLifecycleState {
   // Retired. Existing holdings stay resolvable, because history does not stop
   // being true when an instrument stops trading.
   INSTRUMENT_LIFECYCLE_STATE_DECOMMISSIONED = 3;
+  // Contract v28: A listed series past its last lifecycle date, marked by the
+  // platform: still resolvable for a date it traded, never reused; never set
+  // on a venue.
+  INSTRUMENT_LIFECYCLE_STATE_EXPIRED = 4;
 }
 
 // The kind of claim holding an instrument gives. A closed list, ruled by the
@@ -118,6 +122,18 @@ enum InstrumentType {
   INSTRUMENT_TYPE_RATE_CURVE = 4;
   // Under referential (contract v27): an index -- the SOFR Index.
   INSTRUMENT_TYPE_INDEX = 5;
+  // Contract v28: Under derivative: a listed equity, ETF or index option, one
+  // series a record, with the attributes of ListedOption.
+  INSTRUMENT_TYPE_LISTED_OPTION = 6;
+  // Contract v28: Under derivative: a listed future, one contract month a
+  // record, with the attributes of FutureContract.
+  INSTRUMENT_TYPE_FUTURE = 7;
+  // Contract v28: Under derivative: an option whose underlying is a future
+  // record, with the attributes of ListedOption.
+  INSTRUMENT_TYPE_FUTURE_OPTION = 8;
+  // Contract v28: Under referential: a commodity a future is written on, never
+  // held.
+  INSTRUMENT_TYPE_COMMODITY = 9;
 }
 
 // A binary event contract's attributes (contract v19; plans/the-lake-prices-
@@ -350,6 +366,13 @@ message InstrumentRecord {
   // Once a string, and free text; retired for the enum
   // (sdk-contract/asset-class-is-an-enum). The name carries on above.
   reserved 3;
+  // Contract v28: the series' full terms, so the record read alone is complete
+  // (ruling 575); an adjustment is a new version of them, the INS- ID kept.
+  // Unset unless the record's type is listed_option or future_option.
+  ListedOption listed_option = 22;
+  // Contract v28: one contract month's full terms. Unset unless the record's
+  // type is future.
+  FutureContract future = 23;
 }
 
 // Which value of a deployment's instrument record (W3, contract v10).
@@ -2261,6 +2284,13 @@ message SecurityTemplate {
   // question 225): its calculation package, declarative data; unset on a
   // class's base template and on a version published before v26.
   CalculationPackage calculation_package = 10;
+  // Contract v28: true: readable and runnable, so past answers recompute, and
+  // minted under no more; its instruments move to successor_version, each by a
+  // recorded change. False: in use.
+  bool withdrawn = 11;
+  // Contract v28: a published version of the same template. Empty unless
+  // withdrawn.
+  string successor_version = 12;
 }
 
 // A template version's calculation package (W1.24): the pricing model it
@@ -2280,6 +2310,10 @@ message CalculationPackage {
   // Its version, which every valuation names.
   string calculation_version = 5;
   repeated CalculationTestCase test_cases = 6;
+  // Contract v28: a table keyed by exercise style and, where it matters, the
+  // underlying's asset class; a combination with no row is refused at publish.
+  // None: the package's own model_id and model_version bind every instrument.
+  repeated ModelBinding model_bindings = 7;
 }
 
 // One test case of a calculation package: inputs and the exact answer, each
@@ -2298,6 +2332,12 @@ message TemplateField {
   string type = 2;
   // A record without it is incomplete, its missing fields listed (W3.7).
   bool required = 3;
+  // Contract v28: mint, complete or optional, the intent's three levels.
+  // Unspecified on a version published before v28.
+  FieldRequirement requirement = 4;
+  // Contract v28: true: a repeating group, as FIX's are, its values offered by
+  // path with an index (deliverable[0].quantity). False: one value.
+  bool repeated = 5;
 }
 
 // W3.24: the platform's answer to a pull of its template catalogue, the
@@ -2368,6 +2408,9 @@ message ReplacementFeedEntry {
   // The record it was merged into; empty on a decommission.
   string replaced_by = 3;
   bool decommissioned = 4;
+  // Contract v28: true: the record is expired, neither merged nor
+  // decommissioned; it moves no position. False: a merge or a decommission.
+  bool expired = 5;
 }
 
 // W3.28: the deployment's usage statistics, counts only -- never a value, a
@@ -2559,4 +2602,275 @@ message ListEventGroupsReply {
   // The sequence read to.
   int64 sequence = 2;
   string next_cursor = 3;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Contract v28, track A: listed options and futures
+// (sdk-contract/listed-options-and-futures-contract)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Contract v28 (InstrumentRecord.listed_option): carries a listed option's
+// terms.
+message ListedOption {
+  // The underlying's INS- record: an equity, a fund, an index, or for a
+  // future_option a future record (FIX UnderlyingSecurityID, 309). Never
+  // empty.
+  string underlying_instrument_id = 1;
+  // The right the holder has. Unspecified is refused.
+  PutOrCall put_or_call = 2;
+  // The price per unit of the underlying at which the option is exercised, as
+  // listed; an adjusted strike is a new version. Never unset.
+  Money strike_price = 3;
+  // A plain date, YYYY-MM-DD, the expiration the series is listed for. Never
+  // empty.
+  string expiration_date = 4;
+  // A plain date, YYYY-MM-DD. Empty until the platform's source states it: the
+  // record is then incomplete, listing it.
+  string last_trade_date = 5;
+  // The style the series is listed with; the calculation package binds its
+  // model by it (ruling 576). Unspecified is refused.
+  ExerciseStyle exercise_style = 6;
+  // Physical or cash, as listed. Unspecified is refused.
+  SettlementMethod settlement_method = 7;
+  // When the settlement value is fixed, which is where time to expiry counts
+  // to (minutes over 525,600). Unspecified: the record is incomplete on a
+  // cash-settled option, listing it.
+  SettlementTime settlement_time = 8;
+  // What one contract's premium is multiplied by: 100 on a standard equity
+  // option; an adjustment may change it apart from the deliverable. Never
+  // unset.
+  Decimal contract_multiplier = 9;
+  // Each instrument and its quantity, cash among them as its cash instrument's
+  // quantity: 100 shares on a standard option, 150 after a 3-for-2 split,
+  // shares and cash after a merger. None until the platform's source states
+  // it: the record is then incomplete, listing it; a cash-settled option's
+  // states its cash.
+  repeated DeliverableComponent deliverable = 10;
+  // The OCC root (SPX, SPXW, AAPL, AAPL1 once adjusted); on a future option,
+  // the exchange's option product code. Never empty.
+  string option_root = 11;
+  // YYYYMM. Empty on a listed_option, and on a future option whose exchange
+  // lists no serial month.
+  string contract_month = 12;
+}
+
+// Contract v28 (InstrumentRecord.future): carries a listed future's terms.
+message FutureContract {
+  // An index, an equity, a rate or a commodity's referential INS- record.
+  // Never empty.
+  string underlying_instrument_id = 1;
+  // The exchange's code for the product every month of it shares (ES, CL).
+  // Never empty.
+  string product_code = 2;
+  // YYYYMM. Never empty.
+  string contract_month = 3;
+  // A plain date, YYYY-MM-DD. Empty until the source states it: the record is
+  // then incomplete.
+  string last_trade_date = 4;
+  // A plain date, YYYY-MM-DD: after it the platform marks the record expired
+  // (ruling 579). Empty until the source states it: the record is then
+  // incomplete.
+  string final_settlement_date = 5;
+  // Physical or cash, as listed. Unspecified is refused.
+  SettlementMethod settlement_method = 6;
+  // What a one-point move in the price is worth per contract: 50 USD on ES.
+  // Never unset.
+  Decimal contract_multiplier = 7;
+  // A plain date, YYYY-MM-DD; the oms warns before it (W11.4), since v28 books
+  // no delivery. Empty on a cash-settled future; on a physically delivered one
+  // the record is incomplete until it is stated.
+  string first_notice_date = 8;
+}
+
+// Contract v28 (ListedOption.deliverable): states what one contract delivers
+// on exercise (ruling 559).
+message DeliverableComponent {
+  // An INS- record: the underlying, another company's shares after a merger,
+  // or a currency's cash instrument for cash. Never empty: a component naming
+  // no instrument is refused.
+  string instrument_id = 1;
+  // 100 shares; 150 after a 3-for-2 split; for cash, the amount in the cash
+  // instrument's major unit. Never unset.
+  Decimal quantity = 2;
+}
+
+// Contract v28 (CalculationPackage.model_bindings): binds the model by term
+// (ruling 576).
+message ModelBinding {
+  // The style an instrument's terms state. Unspecified: any style.
+  ExerciseStyle exercise_style = 1;
+  // Equity or fund (the tree with discrete dividends), referential (an index).
+  // Unspecified: any underlying.
+  AssetClass underlying_asset_class = 2;
+  // American_binomial, black_scholes, black_76 or quoted_price in v28. Never
+  // empty.
+  string model_id = 3;
+  // 1 or more. Never 0.
+  int32 model_version = 4;
+}
+
+// Contract v28 (W3.31): RequestSeriesRecords's request.
+message RequestSeriesRecordsRequest {
+  // Each series by its key and its underlying, with why it is wanted. Never
+  // empty.
+  repeated SeriesWant series = 1;
+  // Kept on the request's record (decisions/031). Empty from a plugin;
+  // required through a delegation.
+  string note = 2;
+}
+
+// Contract v28 (RequestSeriesRecordsRequest.series): names the series wanted
+// (W3.31).
+message SeriesWant {
+  // The occ_osi symbol, or a future's or future option's exchange ticker
+  // carrying its venue's ISO 10383 MIC in source. Never empty.
+  repeated Identifier series_key = 1;
+  // The INS- record the chain rows name as their subject. Never empty.
+  string underlying_instrument_id = 2;
+  // Which part of the deployment's series request rule allows it (W6.37).
+  // Unspecified is refused.
+  SeriesRequestCause cause = 3;
+}
+
+// Contract v28 (W3.31): RequestSeriesRecords's answer.
+message RequestSeriesRecordsReply {
+  // Its record, queued, or refused by the rule. One per series asked, in
+  // order.
+  repeated SeriesAnswer answers = 1;
+}
+
+// Contract v28 (RequestSeriesRecordsReply.answers): answers each series.
+message SeriesAnswer {
+  // As asked. Never empty.
+  repeated Identifier series_key = 1;
+  // The INS- record the platform matched or minted. Empty where queued or
+  // refused.
+  string instrument_id = 2;
+  // True: asked again daily, as W3.4's queued requests are. False.
+  bool pending_review = 3;
+  // True: nothing was sent to the platform. False.
+  bool refused_by_rule = 4;
+}
+
+enum PutOrCall {
+  // Refused.
+  PUT_OR_CALL_UNSPECIFIED = 0;
+  // A put: the right to sell the deliverable at the strike.
+  PUT_OR_CALL_PUT = 1;
+  // A call: the right to buy the deliverable at the strike.
+  PUT_OR_CALL_CALL = 2;
+}
+
+enum ExerciseStyle {
+  // Refused.
+  EXERCISE_STYLE_UNSPECIFIED = 0;
+  // Exercisable on any business day to expiration.
+  EXERCISE_STYLE_AMERICAN = 1;
+  // Exercisable at expiration only.
+  EXERCISE_STYLE_EUROPEAN = 2;
+}
+
+enum SettlementMethod {
+  // Refused.
+  SETTLEMENT_METHOD_UNSPECIFIED = 0;
+  // The deliverable changes hands on exercise; for a future option, the
+  // future.
+  SETTLEMENT_METHOD_PHYSICAL = 1;
+  // Cash against the settlement value on exercise.
+  SETTLEMENT_METHOD_CASH = 2;
+}
+
+enum SettlementTime {
+  // Not stated: on a physically settled option, where it does not apply.
+  SETTLEMENT_TIME_UNSPECIFIED = 0;
+  // Settled on the expiration day's opening prints (SPX's monthly series).
+  SETTLEMENT_TIME_AM = 1;
+  // Settled on the expiration day's close (SPXW).
+  SETTLEMENT_TIME_PM = 2;
+}
+
+enum FieldRequirement {
+  // A version published before v28: read from required, true as mint and false
+  // as optional.
+  FIELD_REQUIREMENT_UNSPECIFIED = 0;
+  // The platform mints an INS- record only when its source fills it.
+  FIELD_REQUIREMENT_MINT = 1;
+  // Minted without it, the record listing it missing until it is filled.
+  FIELD_REQUIREMENT_COMPLETE = 2;
+  // Never missing.
+  FIELD_REQUIREMENT_OPTIONAL = 3;
+}
+
+enum SeriesRequestCause {
+  // Refused.
+  SERIES_REQUEST_CAUSE_UNSPECIFIED = 0;
+  // An order or a proposal names it, or is about to.
+  SERIES_REQUEST_CAUSE_ORDER = 1;
+  // A standing want for an underlying's series.
+  SERIES_REQUEST_CAUSE_STANDING = 2;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Contract v28, track C (1 of 2): the filings slice
+// (sdk-contract/the-lake-holds-researchs-kinds)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Contract v28 (W3.32): ResolveCompany's request.
+message ResolveCompanyRequest {
+  // Its ENT- ID. Empty where identifiers name it.
+  string company_id = 1;
+  // A cik or an lei. None where company_id names it.
+  repeated Identifier identifiers = 2;
+  // Nanoseconds since the epoch, against the identifiers' validity windows. 0:
+  // now.
+  int64 as_of_ns = 3;
+}
+
+// Contract v28: the platform's minimal company record: its ENT- ID, name, CIK
+// and LEI as dated identifiers and former names (contract v28, FDP Q6).
+message CompanyRecord {
+  // ENT- and a ULID, the platform's, never reused. Never empty.
+  string company_id = 1;
+  // The current name. Never empty.
+  string name = 2;
+  // Cik and lei, each with its validity window. Never empty.
+  repeated Identifier identifiers = 3;
+  // Each a name and the dates it was used, as EDGAR states them. None.
+  repeated FormerName former_names = 4;
+  // Assigned by the master. Never 0.
+  int64 version = 5;
+}
+
+// Contract v28 (CompanyRecord.former_names): carries its former names, dated.
+message FormerName {
+  // As the source states it. Never empty.
+  string name = 1;
+  // A plain date. Empty where the source states none.
+  string valid_from = 2;
+  // A plain date. Never empty.
+  string valid_until = 3;
+}
+
+// W1.32 (FDP Q6): the conductor's request that the platform match or mint
+// a company, by its open identifiers only; it names no deployment and the
+// platform keeps no asker.
+message MatchOrMintCompanyRequest {
+  // A `cik`, an `lei`, each a scheme on the licence list.
+  repeated Identifier identifiers = 1;
+  // The company's name as the source states it, to verify against; empty
+  // where none is known.
+  string name = 2;
+  // Only for retrying an answer that was lost.
+  string request_key = 3;
+}
+
+message MatchOrMintCompanyReply {
+  // The `ENT-` company matched or minted, at its version; unset while
+  // queued.
+  CompanyRecord company = 1;
+  // False when the master already held it.
+  bool minted = 2;
+  // In the staff's queue: a source that does not confirm it, or a natural
+  // person's CIK, which is never minted.
+  bool pending_review = 3;
 }

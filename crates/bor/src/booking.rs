@@ -313,7 +313,7 @@ fn as_it_stands<'a>(book: &'a Book, execution_id: &str) -> Option<&'a Execution>
 }
 
 /// The executions summed, each as it stands now.
-pub fn executed(book: &Book, execution_ids: &[String]) -> Result<Executed> {
+pub fn executed(book: &Book, ctx: &Context, execution_ids: &[String]) -> Result<Executed> {
     let mut out = Executed::default();
     for id in execution_ids {
         let Some(execution) = as_it_stands(book, id) else {
@@ -329,7 +329,12 @@ pub fn executed(book: &Book, execution_ids: &[String]) -> Result<Executed> {
         out.gross = numbers::add(
             "executed gross",
             out.gross,
-            orders::multiply("gross", quantity, unit)?,
+            // Contract v28 (559): a series' fill grossed by its multiplier.
+            orders::multiply(
+                "gross",
+                orders::multiply("gross", quantity, unit)?,
+                ctx.multiplier(&execution.instrument_id),
+            )?,
         )?;
         for fee in &execution.fees {
             let amount = fee
@@ -1046,7 +1051,7 @@ fn error_alerts(ctx: &Context, book: &Book, booking: &Booking) -> Vec<Act> {
 fn held_alert(ctx: &Context, book: &Book, booking: &Booking, reason: &str) -> Act {
     // Its trade date, its first execution's as it stands (W11.34).
     let due_by = ctx.affirmation.as_ref().map_or(0, |affirmation| {
-        executed(book, &booking.execution_ids)
+        executed(book, ctx, &booking.execution_ids)
             .map(|executed| affirmation.due_by(&executed.trade_date))
             .unwrap_or(0)
     });
@@ -1245,7 +1250,7 @@ pub fn book_order(
         }
     }
     allocations_hold(book, ctx, &request.order_id, &request.allocations)?;
-    let executed = executed(book, &request.execution_ids)?;
+    let executed = executed(book, ctx, &request.execution_ids)?;
     if let Some(words) = ties_out(&executed, &request.allocations)? {
         return Err(StoreError::refused(RefusalReason::BookingUnbalanced, words));
     }
@@ -1295,7 +1300,7 @@ pub fn book_order(
     }
     // Ready-To-Book in one step (item 8; row b2): handed off in the same act
     // where the check passes, booked where it does not.
-    if let Some(why) = hand_off_check(&made.book, &booking_id)? {
+    if let Some(why) = hand_off_check(&made.book, ctx, &booking_id)? {
         let _ = why;
         return Ok(made);
     }
@@ -1313,12 +1318,12 @@ pub fn book_order(
 /// allocated, in quantity, gross and each fee kind, the executions as they
 /// stand now; no fee reported since; and, in an allocation account, nothing
 /// left in the instrument. `None` where it may, else why not.
-pub fn hand_off_check(book: &Book, booking_id: &str) -> Result<Option<String>> {
+pub fn hand_off_check(book: &Book, ctx: &Context, booking_id: &str) -> Result<Option<String>> {
     let held =
         book.ledger.bookings.get(booking_id).ok_or_else(|| {
             StoreError::Invalid(format!("the book holds no booking {booking_id}"))
         })?;
-    let executed = executed(book, &held.booking.execution_ids)?;
+    let executed = executed(book, ctx, &held.booking.execution_ids)?;
     if let Some(words) = ties_out(&executed, &held.booking.allocations)? {
         return Ok(Some(words));
     }
@@ -1385,7 +1390,7 @@ pub fn hand_off_booking(
     }
     let booking = book.ledger.booking_record(&request.booking_id)?;
     let mut acts = Vec::new();
-    let (kind, to) = match hand_off_check(book, &request.booking_id)? {
+    let (kind, to) = match hand_off_check(book, ctx, &request.booking_id)? {
         None => {
             if !held.held_alert.is_empty() {
                 acts.push(Act::AlertCleared {
@@ -1484,7 +1489,7 @@ pub fn correct_booking(
                 return Err(booking_refused("b7", from, "a replace"));
             }
             allocations_hold(book, ctx, &held.booking.order_id, &request.allocations)?;
-            let executed = executed(book, &held.booking.execution_ids)?;
+            let executed = executed(book, ctx, &held.booking.execution_ids)?;
             if let Some(words) = ties_out(&executed, &request.allocations)? {
                 return Err(StoreError::refused(RefusalReason::BookingUnbalanced, words));
             }
@@ -1590,7 +1595,7 @@ pub fn child_moves(book: &Book, booking_id: &str, ctx: &Context) -> Result<Vec<C
     let Some(held) = book.ledger.bookings.get(booking_id) else {
         return Ok(Vec::new());
     };
-    let executed = executed(book, &held.booking.execution_ids)?;
+    let executed = executed(book, ctx, &held.booking.execution_ids)?;
     let members: Vec<String> = book
         .ledger
         .orders

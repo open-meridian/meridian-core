@@ -54,6 +54,15 @@ use meridian_domain::v1::{
     SourceTimeKind, SubjectRef, TcaBenchmark, TradeCharacteristic, TradesRecordedEvent, Unanswered,
     UnansweredReason, WantWithdrawnEvent, Watermark,
 };
+use meridian_domain::v1::{
+    CorporateActionKind, CorporateActionsRecordedEvent, ListCorporateActionsReply,
+    ListCorporateActionsRequest, RecordCorporateActionsRequest, ResolveCompanyRequest,
+};
+use meridian_domain::v1::{
+    ListSeriesReply, ListSeriesRequest, ListStatisticsReply, ListStatisticsRequest,
+    RecordSeriesRequest, RecordStatisticsRequest, StatisticKind, StatisticsRecordedEvent,
+    SubjectRole,
+};
 use meridian_pb::bounds;
 use prost::Message;
 
@@ -74,6 +83,23 @@ pub const RECORD_RATES: &str = "platform.lake.command.record-rates";
 /// Contract v27 (W10.4, W10.5; ruling 418): a dataset's liveness.
 pub const RECORD_LIVENESS: &str = "platform.lake.command.record-liveness";
 pub const LIST_RATES: &str = "platform.lake.query.list-rates";
+/// Contract v28, listed options and futures (W10.4, W10.6; ruling 561).
+pub const RECORD_SERIES: &str = "platform.lake.command.record-series";
+pub const LIST_SERIES: &str = "platform.lake.query.list-series";
+pub const RECORD_STATISTICS: &str = "platform.lake.command.record-statistics";
+pub const LIST_STATISTICS: &str = "platform.lake.query.list-statistics";
+/// Contract v28, track B (W10.4, W10.6, W12.8): a signal plugin's derived
+/// series and saved scenarios.
+pub const RECORD_DERIVED_SERIES: &str = "platform.lake.command.record-derived-series";
+pub const LIST_DERIVED_SERIES: &str = "platform.lake.query.list-derived-series";
+pub const RECORD_SCENARIOS: &str = "platform.lake.command.record-scenarios";
+pub const LIST_SCENARIOS: &str = "platform.lake.query.list-scenarios";
+/// Contract v28, the filings slice (W10.4, W10.6): declared corporate
+/// actions, a cash dividend in v28.
+pub const RECORD_CORPORATE_ACTIONS: &str = "platform.lake.command.record-corporate-actions";
+pub const LIST_CORPORATE_ACTIONS: &str = "platform.lake.query.list-corporate-actions";
+/// A company subject's record (contract v28, W3.32): asked by its `ENT-` ID.
+pub const RESOLVE_COMPANY: &str = "platform.reference.query.resolve-company";
 pub const DECLINE_WANT: &str = "platform.lake.command.decline-want";
 pub const SET_SOURCE_PRIORITY: &str = "platform.lake.command.set-source-priority";
 pub const LIST_PRICES: &str = "platform.lake.query.list-prices";
@@ -102,6 +128,9 @@ pub const READ_CALENDAR: &str = "platform.reference.query.read-calendar";
 /// A calendar's new version, heard to re-check the flag (W3.17, W10.4).
 pub const CALENDAR_APPLIED: &str = "platform.reference.event.calendar-applied";
 
+/// A company's platform ID begins with this (contract v28, ruling 594).
+const COMPANY_PREFIX: &str = "ENT-";
+
 /// A dataset's subject for a data type's recorded rows.
 pub fn recorded_topic(dataset: &str, data_type: DataType) -> String {
     match data_type {
@@ -111,8 +140,20 @@ pub fn recorded_topic(dataset: &str, data_type: DataType) -> String {
         DataType::Quote => format!("platform.lake.{dataset}.event.quotes-recorded"),
         DataType::Outcome => format!("platform.lake.{dataset}.event.outcomes-recorded"),
         DataType::Rate => format!("platform.lake.{dataset}.event.rates-recorded"),
-        // Never published: read within each reader's account scope (W10.11).
-        DataType::ExecutionCost => String::new(),
+        // Contract v28 (W10.5): conflated per subject, series key, kind and
+        // business date.
+        DataType::Statistic => format!("platform.lake.{dataset}.event.statistics-recorded"),
+        // Contract v28, the filings slice (W10.5): never conflated.
+        DataType::CorporateAction => {
+            format!("platform.lake.{dataset}.event.corporate-actions-recorded")
+        }
+        // Never published: read within each reader's account scope (W10.11);
+        // a listed series is read when a chain is built (contract v28, W10.5).
+        // A signal plugin's derived values and saved scenarios are read,
+        // never published (contract v28, W10.5).
+        DataType::ExecutionCost | DataType::Series | DataType::Derived | DataType::Scenario => {
+            String::new()
+        }
     }
 }
 
@@ -263,6 +304,7 @@ fn watermark(heads: &BTreeMap<String, u64>, datasets: &BTreeSet<String>) -> Wate
 fn subject_ref(subject: &str) -> Option<SubjectRef> {
     (!subject.is_empty()).then(|| SubjectRef {
         entity_id: subject.to_string(),
+        ..Default::default()
     })
 }
 
@@ -314,6 +356,49 @@ impl Lake {
     /// remembered once it does.
     fn subject_held(&self, entity: &str) -> Result<bool, String> {
         Ok(self.subject_record(entity)?.is_some())
+    }
+
+    /// Whether the instrument store holds a company by its `ENT-` ID
+    /// (contract v28, W3.32), remembered once it does: its refusal is a
+    /// company it does not hold; no answer in time records nothing.
+    fn company_held(&self, entity: &str) -> Result<bool, String> {
+        if self
+            .held
+            .lock()
+            .expect("held poisoned")
+            .contains_key(entity)
+        {
+            return Ok(true);
+        }
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| "the lake has no runtime to ask on".to_string())?;
+        let asked = handle.block_on(
+            self.bus.call(
+                RESOLVE_COMPANY,
+                "meridian.v1.ResolveCompanyRequest",
+                ResolveCompanyRequest {
+                    company_id: entity.to_string(),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+                None,
+                Some(ASKING),
+            ),
+        );
+        match asked {
+            Ok(_) => {
+                self.held
+                    .lock()
+                    .expect("held poisoned")
+                    .insert(entity.to_string(), (0, 0));
+                Ok(true)
+            }
+            Err(meridian_bus::BusError::HandlerFailed { .. }) => Ok(false),
+            Err(failed) => Err(format!(
+                "the instrument store did not say whether it holds {entity}, and nothing was \
+                 recorded: {failed}"
+            )),
+        }
     }
 
     /// The asset class and type of the record the instrument store holds
@@ -417,6 +502,293 @@ impl Lake {
         held.0.get(instance).cloned().unwrap_or_default()
     }
 
+    /// A row's series key held to W10.4 (contract v28, ruling 561): one
+    /// identifier, an option's `occ_osi` symbol or a future's or future
+    /// option's `ticker` carrying its venue's MIC in `source`; on a quote, a trade, a
+    /// price, a bar or a statistic whose subject is the underlying, never on
+    /// an option's own record, which is the series; required on a listed
+    /// series.
+    fn series_key_refused(&self, at: &str, row: &Observation) -> Result<(), String> {
+        let meta = row.meta();
+        let key = &meta.series_key;
+        let data_type = row.data_type();
+        if key.is_empty() {
+            if data_type == DataType::Series {
+                return Err(format!(
+                    "{at}.meta.series_key is required: a listed series names its key"
+                ));
+            }
+            return Ok(());
+        }
+        if matches!(
+            data_type,
+            DataType::Outcome | DataType::Rate | DataType::ExecutionCost
+        ) {
+            return Err(format!(
+                "{at}.meta.series_key: {} is keyed by no series",
+                data_type.name()
+            ));
+        }
+        if let Some((path, why)) = lake::series_key_problem(key) {
+            return Err(format!("{at}.meta.series_key{path}: {why}"));
+        }
+        // A key names a series under its subject: a row about a held
+        // option is keyed by its record and names no key.
+        for (j, subject) in meta.subjects.iter().enumerate() {
+            if let Some((_, kind)) = self.subject_record(&subject.entity_id)? {
+                if kind == InstrumentType::ListedOption as i32
+                    || kind == InstrumentType::FutureOption as i32
+                {
+                    return Err(format!(
+                        "{at}.meta.series_key: the subject {:?} (meta.subjects[{j}]) is the \
+                         series' own record; a row about it names no key",
+                        subject.entity_id
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A saved scenario held to W12.8 (contract v28; rulings 566, 581 to
+    /// 584): one scenario or one scenario set, named; each shock its object,
+    /// a target held or every object of its kind, and a form and unit its
+    /// object takes; a set's axes and their steps within bounds.
+    fn scenario_refused(
+        &self,
+        at: &str,
+        saved: &meridian_domain::v1::SavedScenario,
+    ) -> Result<(), String> {
+        if saved.description.chars().count() > 2_000 {
+            return Err(format!("{at}.description is at most 2,000 characters"));
+        }
+        match (&saved.scenario, &saved.scenario_set) {
+            (Some(scenario), None) => self.one_scenario(&format!("{at}.scenario"), scenario),
+            (None, Some(set)) => {
+                let path = format!("{at}.scenario_set");
+                if !bounds::SCENARIO_SET_NAME_LENGTH.admits(set.name.chars().count()) {
+                    return Err(format!("{path}.name is 1 to 200 characters"));
+                }
+                if !bounds::SCENARIO_SET_AXES_COUNT.admits(set.axes.len()) {
+                    return Err(format!("{path}.axes names {}; 1 to 4", set.axes.len()));
+                }
+                for (a, axis) in set.axes.iter().enumerate() {
+                    let path = format!("{path}.axes[{a}]");
+                    if !bounds::SCENARIO_AXIS_NAME_LENGTH.admits(axis.name.chars().count()) {
+                        return Err(format!("{path}.name is 1 to 64 characters"));
+                    }
+                    if !bounds::SCENARIO_AXIS_STEPS_COUNT.admits(axis.steps.len()) {
+                        return Err(format!("{path}.steps names {}; 1 to 32", axis.steps.len()));
+                    }
+                    for (s, step) in axis.steps.iter().enumerate() {
+                        self.one_scenario(&format!("{path}.steps[{s}]"), step)?;
+                    }
+                }
+                Ok(())
+            }
+            _ => Err(format!(
+                "{at}: a saved scenario is one scenario or one scenario set, exactly one"
+            )),
+        }
+    }
+
+    fn one_scenario(
+        &self,
+        at: &str,
+        scenario: &meridian_domain::v1::Scenario,
+    ) -> Result<(), String> {
+        use meridian_domain::v1::{ShockForm, ShockObject, ShockUnit};
+        if !bounds::SCENARIO_NAME_LENGTH.admits(scenario.name.chars().count()) {
+            return Err(format!("{at}.name is 1 to 200 characters"));
+        }
+        if !bounds::SCENARIO_SHOCKS_COUNT.admits(scenario.shocks.len()) {
+            return Err(format!(
+                "{at}.shocks names {}; at most 64",
+                scenario.shocks.len()
+            ));
+        }
+        for (i, shock) in scenario.shocks.iter().enumerate() {
+            let path = format!("{at}.shocks[{i}]");
+            let object = ShockObject::try_from(shock.object).unwrap_or(ShockObject::Unspecified);
+            let form = ShockForm::try_from(shock.form).unwrap_or(ShockForm::Unspecified);
+            let unit = ShockUnit::try_from(shock.unit).unwrap_or(ShockUnit::Unspecified);
+            if object == ShockObject::Unspecified {
+                return Err(format!("{path}.object is unspecified"));
+            }
+            // Each object's forms and units (581, 584).
+            let fits = match object {
+                ShockObject::Spot => matches!(
+                    (form, unit),
+                    (ShockForm::Relative, ShockUnit::Percent)
+                        | (ShockForm::Absolute, ShockUnit::Price)
+                ),
+                ShockObject::VolSurface => matches!(
+                    (form, unit),
+                    (
+                        ShockForm::Parallel | ShockForm::Bucketed,
+                        ShockUnit::VolPoints
+                    )
+                ),
+                ShockObject::Rate => matches!(
+                    (form, unit),
+                    (
+                        ShockForm::Parallel | ShockForm::Bucketed,
+                        ShockUnit::BasisPoints
+                    )
+                ),
+                ShockObject::Time => matches!(
+                    (form, unit),
+                    (ShockForm::Absolute, ShockUnit::Days | ShockUnit::Minutes)
+                        | (ShockForm::ToSettlement, _)
+                ),
+                ShockObject::Unspecified => false,
+            };
+            if !fits {
+                return Err(format!(
+                    "{path}.form and unit: a {} shock takes {}",
+                    object
+                        .as_str_name()
+                        .trim_start_matches("SHOCK_OBJECT_")
+                        .to_lowercase(),
+                    match object {
+                        ShockObject::Spot => "relative in percent, or absolute in price",
+                        ShockObject::VolSurface => "vol points, parallel or per expiry bucket",
+                        ShockObject::Rate => "basis points, parallel or per tenor",
+                        _ => "days or minutes, or to settlement",
+                    }
+                ));
+            }
+            if form == ShockForm::Bucketed {
+                if shock.buckets.is_empty() {
+                    return Err(format!(
+                        "{path}.buckets: a bucketed shock names its buckets"
+                    ));
+                }
+            } else if form != ShockForm::ToSettlement && shock.value.is_none() {
+                return Err(format!("{path}.value is required"));
+            }
+            let target = shock.target.clone().unwrap_or_default();
+            match (target.every, target.subject_id.is_empty()) {
+                (true, true) => {}
+                (false, false) => {
+                    if !self.subject_held(&target.subject_id)? {
+                        return Err(format!(
+                            "{path}.target.subject_id {:?} is no record the deployment holds",
+                            target.subject_id
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(format!(
+                        "{path}.target: an object by its subject ID, or every object of its kind, \
+                         exactly one"
+                    ))
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// W10.6, contract v28 (track B): a signal plugin's derived values for
+    /// 1 to 64 subjects, by series and a range of business dates, every
+    /// readable derived dataset side by side, each value's latest version.
+    pub(crate) fn list_derived_series(
+        &self,
+        request: meridian_domain::v1::ListDerivedSeriesRequest,
+        envelope: &Envelope,
+    ) -> Result<meridian_domain::v1::ListDerivedSeriesReply, String> {
+        if !bounds::LIST_DERIVED_SERIES_REQUEST_SUBJECTS_COUNT.admits(request.subjects.len()) {
+            return Err(format!(
+                "subjects names {}; 1 to 64",
+                request.subjects.len()
+            ));
+        }
+        let from = meridian_domain::date::optional("from_date", &request.from_date)?
+            .unwrap_or(Date::of_utc_instant(0));
+        let to = meridian_domain::date::optional("to_date", &request.to_date)?
+            .unwrap_or(Date::of_utc_instant(self.clock.now_ns()));
+        let answer = self.read(
+            ReadRequest {
+                data_type: DataType::Derived,
+                subjects: request.subjects,
+                kinds: Vec::new(),
+                interval_ns: 0,
+                sources: Some(SourceChoice {
+                    side_by_side: true,
+                    ..Default::default()
+                }),
+                at_ns: 0,
+                business_date: String::new(),
+                valid_from_ns: 1,
+                valid_until_ns: 0,
+                as_of_ns: 0,
+                page_size: 500,
+                cursor: String::new(),
+                after: None,
+                tenors: Vec::new(),
+                published_as_of_ns: 0,
+                series_keys: Vec::new(),
+                all_series: false,
+                dates: Some((from, to)),
+            },
+            envelope,
+        )?;
+        Ok(meridian_domain::v1::ListDerivedSeriesReply {
+            values: answer
+                .rows
+                .into_iter()
+                .filter_map(|row| match row {
+                    Observation::Derived(value)
+                        if request.series.is_empty() || request.series.contains(&value.series) =>
+                    {
+                        Some(value)
+                    }
+                    _ => None,
+                })
+                .collect(),
+        })
+    }
+
+    /// W12.8, contract v28: the saved scenarios of every dataset the reader
+    /// may read, by row key, each at its latest version, or at the version
+    /// asked of one row key, whichever version that is (each edit is the
+    /// next version of its key, and a job names any).
+    pub(crate) fn list_scenarios(
+        &self,
+        request: meridian_domain::v1::ListScenariosRequest,
+        envelope: &Envelope,
+    ) -> Result<meridian_domain::v1::ListScenariosReply, String> {
+        if request.version != 0 && request.row_keys.len() != 1 {
+            return Err("version: with one row key".into());
+        }
+        let reader = reader_of(envelope);
+        let config = self.config();
+        let mut scenarios = Vec::new();
+        for dataset in config.readable(&reader, DataType::Scenario) {
+            let rows = if request.version == 0 {
+                self.store.read_dataset(&dataset, DataType::Scenario, 0)
+            } else {
+                self.store
+                    .read_dataset_versions(&dataset, DataType::Scenario)
+            }
+            .map_err(|failed| failed.to_string())?;
+            for row in rows {
+                let Observation::Scenario(saved) = row else {
+                    continue;
+                };
+                let meta = saved.meta.clone().unwrap_or_default();
+                if !request.row_keys.is_empty() && !request.row_keys.contains(&meta.row_key) {
+                    continue;
+                }
+                if request.version != 0 && meta.version != request.version {
+                    continue;
+                }
+                scenarios.push(saved);
+            }
+        }
+        Ok(meridian_domain::v1::ListScenariosReply { scenarios })
+    }
+
     /// A batch checked as W10.4 says, each Money's instrument resolved, its
     /// envelope's stamps decided: the rows to record by dataset, or the
     /// refusal naming the item and field.
@@ -463,10 +835,33 @@ impl Lake {
                     source.venue_id
                 ));
             }
-            if !(1..=8).contains(&meta.subjects.len()) {
+            // A saved scenario names its objects in its shocks, and no
+            // subject (contract v28, W12.8).
+            if data_type == DataType::Scenario {
+                if !meta.subjects.is_empty() {
+                    return Err(format!(
+                        "{at}.meta.subjects: a saved scenario names no subject; its shocks name \
+                         their objects"
+                    ));
+                }
+            } else if !(1..=8).contains(&meta.subjects.len()) {
                 return Err(format!(
                     "{at}.meta.subjects names {}; 1 to 8",
                     meta.subjects.len()
+                ));
+            }
+            // A declared corporate action's subject is the security, the
+            // company its issuer where stated (contract v28, W10.4): a
+            // company by its platform record, in that role alone.
+            if data_type == DataType::CorporateAction
+                && !meta
+                    .subjects
+                    .iter()
+                    .any(|subject| !subject.entity_id.starts_with(COMPANY_PREFIX))
+            {
+                return Err(format!(
+                    "{at}.meta.subjects names no security: a corporate action's subject is the \
+                     security, its issuer beside it where stated"
                 ));
             }
             for (j, subject) in meta.subjects.iter().enumerate() {
@@ -474,6 +869,30 @@ impl Lake {
                     return Err(format!(
                         "{at}.meta.subjects[{j}].entity_id is 1 to 64 characters"
                     ));
+                }
+                if subject.entity_id.starts_with(COMPANY_PREFIX) {
+                    if data_type != DataType::CorporateAction {
+                        return Err(format!(
+                            "{at}.meta.subjects[{j}].entity_id {:?}: a company is no subject of \
+                             {}",
+                            subject.entity_id,
+                            data_type.name()
+                        ));
+                    }
+                    if subject.role != SubjectRole::Issuer as i32 {
+                        return Err(format!(
+                            "{at}.meta.subjects[{j}].role: a company names a corporate action's \
+                             issuer, SUBJECT_ROLE_ISSUER"
+                        ));
+                    }
+                    if !self.company_held(&subject.entity_id)? {
+                        return Err(format!(
+                            "{at}.meta.subjects[{j}].entity_id {:?} is no company the deployment \
+                             holds; resolve it (W3.32) first",
+                            subject.entity_id
+                        ));
+                    }
+                    continue;
                 }
                 let Some((class, kind)) = self.subject_record(&subject.entity_id)? else {
                     return Err(format!(
@@ -504,10 +923,24 @@ impl Lake {
                     }
                 }
             }
+            // Contract v28 (ruling 561, W10.4): the series key on the
+            // envelope, the underlying the row's subject.
+            self.series_key_refused(&at, &row)?;
             meridian_domain::date::optional(
                 &format!("{at}.meta.business_date"),
                 &meta.business_date,
             )?;
+            // A statistic is a value per trading date (contract v28, W10.4).
+            if data_type == DataType::Derived && meta.business_date.is_empty() {
+                return Err(format!(
+                    "{at}.meta.business_date is required: a derived value's business date"
+                ));
+            }
+            if data_type == DataType::Statistic && meta.business_date.is_empty() {
+                return Err(format!(
+                    "{at}.meta.business_date is required: a statistic's trading date"
+                ));
+            }
             // Real-time data is keyed by UTC instants, with no business date
             // (contract v19; ruling 3 of 2026-10-09); nor is an outcome a
             // daily value (contract v23, the lake plan's vL1c, item 3).
@@ -518,6 +951,7 @@ impl Lake {
                     match data_type {
                         DataType::Trade => "a trade",
                         DataType::Quote => "a quote",
+                        DataType::CorporateAction => "a corporate action, dated by its own fields,",
                         _ => "an outcome",
                     }
                 ));
@@ -606,6 +1040,11 @@ impl Lake {
                 Observation::Quote(quote) => quote_refused(&at, quote)?,
                 Observation::Outcome(outcome) => outcome_refused(&at, outcome)?,
                 Observation::Rate(rate) => rate_refused(&at, rate)?,
+                Observation::Statistic(statistic) => statistic_refused(&at, statistic)?,
+                Observation::Series(series) => series_refused(&at, series)?,
+                Observation::Derived(value) => derived_refused(&at, value)?,
+                Observation::Scenario(saved) => self.scenario_refused(&at, saved)?,
+                Observation::CorporateAction(action) => corporate_action_refused(&at, action)?,
                 _ => {}
             }
             if let Observation::Bar(bar) = &row {
@@ -650,6 +1089,11 @@ impl Lake {
             "quotes" => bounds::RECORD_QUOTES_REQUEST_QUOTES_COUNT,
             "outcomes" => bounds::RECORD_OUTCOMES_REQUEST_OUTCOMES_COUNT,
             "rates" => bounds::RECORD_RATES_REQUEST_RATES_COUNT,
+            "statistics" => bounds::RECORD_STATISTICS_REQUEST_STATISTICS_COUNT,
+            "series" => bounds::RECORD_SERIES_REQUEST_SERIES_COUNT,
+            "values" => bounds::RECORD_DERIVED_SERIES_REQUEST_VALUES_COUNT,
+            "scenarios" => bounds::RECORD_SCENARIOS_REQUEST_SCENARIOS_COUNT,
+            "actions" => bounds::RECORD_CORPORATE_ACTIONS_REQUEST_ACTIONS_COUNT,
             _ => bounds::RECORD_BARS_REQUEST_BARS_COUNT,
         };
         if !bound.admits(rows.len()) {
@@ -686,9 +1130,20 @@ impl Lake {
             reply.recorded += done.recorded;
             reply.restated += done.restated;
             reply.unchanged += done.unchanged;
+            // Each real-time row's age at the `lake` hop, on commit (W4.16;
+            // the latency spec's "The hops"; ruling 606): sent to the
+            // monitor with the component's next report.
+            let committed = self.clock.now_ns();
             for row in &done.rows {
                 subjects.extend(row.subjects());
                 self.publish(&dataset, row);
+                if row.data_type().real_time() {
+                    meridian_domain::latency::recorder().record(
+                        &dataset,
+                        meridian_domain::v1::AgeHop::Lake,
+                        committed - meridian_domain::latency::source_ns(row.meta()),
+                    );
+                }
             }
             let trades = done
                 .rows
@@ -1086,8 +1541,28 @@ impl Lake {
 
     fn publish(&self, dataset: &str, row: &Observation) {
         let (payload_type, payload) = match row {
-            // Never published: read within each reader's scope (W10.11).
-            Observation::ExecutionCost(_) => return,
+            // Never published: read within each reader's scope (W10.11); a
+            // series' terms change rarely and are read (contract v28, W10.5).
+            Observation::ExecutionCost(_)
+            | Observation::Series(_)
+            | Observation::Derived(_)
+            | Observation::Scenario(_) => return,
+            // Every version, never conflated (contract v28, W10.5): an
+            // announcement is an event, not a value in force.
+            Observation::CorporateAction(action) => (
+                "meridian.v1.CorporateActionsRecordedEvent",
+                CorporateActionsRecordedEvent {
+                    action: Some(action.clone()),
+                }
+                .encode_to_vec(),
+            ),
+            Observation::Statistic(statistic) => (
+                "meridian.v1.StatisticsRecordedEvent",
+                StatisticsRecordedEvent {
+                    statistic: Some(statistic.clone()),
+                }
+                .encode_to_vec(),
+            ),
             Observation::Price(price) => (
                 "meridian.v1.PricesRecordedEvent",
                 PricesRecordedEvent {
@@ -1244,6 +1719,7 @@ impl Lake {
                             .iter()
                             .map(|s| SubjectRef {
                                 entity_id: s.clone(),
+                                ..Default::default()
                             })
                             .collect(),
                         kinds: kinds.clone(),
@@ -1494,8 +1970,42 @@ impl Lake {
                     }
                 }
             }
-            // A rate is read as a price is (contract v27, W10.6).
-            DataType::Price | DataType::Bar | DataType::Rate => {
+            // A listed series (contract v28): its terms in force at the as-of,
+            // never a date or a range.
+            DataType::Series => When::Latest { at_ns: 0 },
+            // A saved scenario (contract v28) is read by ListScenarios.
+            DataType::Scenario => return Err("a saved scenario is read by ListScenarios".into()),
+            // A declared corporate action (contract v28, W10.6): every row
+            // key's version in force, narrowed by its kind's date; or the
+            // versions recorded after a watermark, whatever their dates.
+            DataType::CorporateAction => match after {
+                Some(watermark) => {
+                    let mut at: BTreeMap<String, u64> = BTreeMap::new();
+                    for (i, partition) in watermark.partitions.iter().enumerate() {
+                        if at
+                            .insert(partition.partition.clone(), partition.sequence)
+                            .is_some()
+                        {
+                            return Err(format!(
+                                "after_watermark.partitions[{i}] {:?} is named twice",
+                                partition.partition
+                            ));
+                        }
+                    }
+                    When::After(at)
+                }
+                None => When::Range {
+                    from_ns: 1,
+                    until_ns: 0,
+                },
+            },
+            // A rate is read as a price is (contract v27, W10.6); and a
+            // statistic (contract v28).
+            DataType::Price
+            | DataType::Bar
+            | DataType::Rate
+            | DataType::Statistic
+            | DataType::Derived => {
                 let given = [
                     request.at_ns != 0,
                     !request.business_date.is_empty(),
@@ -1602,6 +2112,16 @@ impl Lake {
             as_of_ns: as_of,
             tenors: request.tenors,
             published_as_of_ns: request.published_as_of_ns,
+            series_keys: request.series_keys,
+            all_series: request.all_series,
+            dates: request.dates,
+            // A subject asked in a role (contract v28, W10.6).
+            roles: request
+                .subjects
+                .iter()
+                .filter(|s| s.role != SubjectRole::Unspecified as i32)
+                .map(|s| (s.entity_id.clone(), s.role))
+                .collect(),
         };
         let answered = read::answer(
             self.store.as_ref(),
@@ -1744,6 +2264,9 @@ impl Lake {
                 after: None,
                 tenors: request.tenors,
                 published_as_of_ns: request.published_as_of_ns,
+                series_keys: Vec::new(),
+                all_series: false,
+                dates: None,
             },
             envelope,
         )?;
@@ -1753,6 +2276,373 @@ impl Lake {
                 .into_iter()
                 .filter_map(|r| match r {
                     Observation::Rate(rate) => Some(rate),
+                    _ => None,
+                })
+                .collect(),
+            unanswered: answer.unanswered,
+            datasets: answer.datasets,
+            watermark: Some(answer.watermark),
+            next_cursor: answer.next_cursor,
+        })
+    }
+
+    /// W10.6, contract v28 (ruling 561): the listed series under 1 to 64
+    /// underlyings, each at its version in force at the as-of, narrowed by
+    /// listed type, expiration window and series key, and each naming the
+    /// deployment's record for it where one is held -- matched, never
+    /// minted. The type and window narrow a page once read, so a page may
+    /// hold fewer rows than its size while its cursor goes on.
+    pub(crate) fn list_series(
+        &self,
+        request: ListSeriesRequest,
+        envelope: &Envelope,
+    ) -> Result<ListSeriesReply, String> {
+        if !bounds::LIST_SERIES_REQUEST_SUBJECTS_COUNT.admits(request.subjects.len()) {
+            return Err(format!(
+                "subjects names {}; 1 to 64",
+                request.subjects.len()
+            ));
+        }
+        if !bounds::LIST_SERIES_REQUEST_SERIES_KEYS_COUNT.admits(request.series_keys.len()) {
+            return Err(format!(
+                "series_keys names {}; at most 500",
+                request.series_keys.len()
+            ));
+        }
+        let listed = [
+            InstrumentType::Unspecified,
+            InstrumentType::ListedOption,
+            InstrumentType::Future,
+            InstrumentType::FutureOption,
+        ];
+        let kind = InstrumentType::try_from(request.instrument_type)
+            .ok()
+            .filter(|kind| listed.contains(kind))
+            .ok_or("instrument_type is listed_option, future or future_option, or unspecified")?;
+        let from = meridian_domain::date::optional("expiration_from", &request.expiration_from)?;
+        let to = meridian_domain::date::optional("expiration_to", &request.expiration_to)?;
+        if let (Some(from), Some(to)) = (&from, &to) {
+            if to < from {
+                return Err("expiration_to is on or after expiration_from".into());
+            }
+        }
+        let underlyings: BTreeMap<String, i32> = request
+            .subjects
+            .iter()
+            .map(|subject| {
+                let kind = self
+                    .subject_record(&subject.entity_id)
+                    .ok()
+                    .flatten()
+                    .map_or(0, |(_, kind)| kind);
+                (subject.entity_id.clone(), kind)
+            })
+            .collect();
+        let all_series = request.series_keys.is_empty();
+        // The page asked, filled after the type and the window are applied
+        // (a filtered page is never short while rows remain): each read asks
+        // only for what the page still lacks, so the cursor it answers is the
+        // page's, never past a row left out.
+        let want = match request.page_size {
+            0 => 100,
+            n => n.min(500),
+        };
+        let mut cursor = request.cursor.clone();
+        let mut series = Vec::new();
+        let mut unanswered = Vec::new();
+        let mut datasets: Vec<meridian_domain::v1::DatasetRef> = Vec::new();
+        let mut watermark = None;
+        let next_cursor = loop {
+            let lacking = want - series.len() as u32;
+            let answer = self.read(
+                ReadRequest {
+                    data_type: DataType::Series,
+                    subjects: request.subjects.clone(),
+                    kinds: Vec::new(),
+                    interval_ns: 0,
+                    sources: request.sources.clone(),
+                    at_ns: 0,
+                    business_date: String::new(),
+                    valid_from_ns: 0,
+                    valid_until_ns: 0,
+                    as_of_ns: request.as_of_ns,
+                    page_size: lacking,
+                    cursor: cursor.clone(),
+                    after: None,
+                    tenors: Vec::new(),
+                    published_as_of_ns: 0,
+                    series_keys: request.series_keys.clone(),
+                    all_series,
+                    dates: None,
+                },
+                envelope,
+            )?;
+            if watermark.is_none() {
+                watermark = Some(answer.watermark.clone());
+                unanswered = answer.unanswered.clone();
+            }
+            for dataset in answer.datasets {
+                if !datasets.iter().any(|d| d.dataset == dataset.dataset) {
+                    datasets.push(dataset);
+                }
+            }
+            for row in answer.rows {
+                let Observation::Series(mut listed) = row else {
+                    continue;
+                };
+                let meta = listed.meta.clone().unwrap_or_default();
+                let field = |path: &str| {
+                    listed
+                        .fields
+                        .iter()
+                        .find(|field| field.path == path)
+                        .map(|field| field.value.clone())
+                        .unwrap_or_default()
+                };
+                // Its type: a future names its product code; an option on a
+                // future record is a future option (W1.24).
+                let underlying = meta
+                    .subjects
+                    .first()
+                    .and_then(|subject| underlyings.get(&subject.entity_id))
+                    .copied()
+                    .unwrap_or(0);
+                let its_kind = if !field("product_code").is_empty() {
+                    InstrumentType::Future
+                } else if underlying == InstrumentType::Future as i32 {
+                    InstrumentType::FutureOption
+                } else {
+                    InstrumentType::ListedOption
+                };
+                if kind != InstrumentType::Unspecified && kind != its_kind {
+                    continue;
+                }
+                if from.is_some() || to.is_some() {
+                    let expires = [
+                        "expiration_date",
+                        "last_trade_date",
+                        "final_settlement_date",
+                    ]
+                    .iter()
+                    .map(|path| field(path))
+                    .find(|date| !date.is_empty())
+                    .and_then(|date| Date::parse(&date).ok());
+                    let Some(expires) = expires else {
+                        continue;
+                    };
+                    if from.as_ref().is_some_and(|from| &expires < from)
+                        || to.as_ref().is_some_and(|to| &expires > to)
+                    {
+                        continue;
+                    }
+                }
+                listed.instrument_id = self.series_record(&meta.series_key);
+                series.push(listed);
+            }
+            if answer.next_cursor.is_empty() || series.len() as u32 >= want {
+                break answer.next_cursor;
+            }
+            cursor = answer.next_cursor;
+        };
+        Ok(ListSeriesReply {
+            series,
+            unanswered,
+            datasets,
+            watermark,
+            next_cursor,
+        })
+    }
+
+    /// The deployment's record for a series key, matched read-only by the
+    /// instrument store (W3.1): empty where none is held, never minted
+    /// (ruling 561).
+    fn series_record(&self, key: &[Identifier]) -> String {
+        if key.is_empty() {
+            return String::new();
+        }
+        let reply: Result<ResolveIdentifierReply, String> = self.ask(
+            RESOLVE_IDENTIFIER,
+            "meridian.v1.ResolveIdentifierRequest",
+            ResolveIdentifierRequest {
+                identifiers: key.to_vec(),
+                as_of_ns: self.clock.now_ns(),
+                ..Default::default()
+            },
+        );
+        match reply {
+            Ok(reply) if reply.found && !reply.minted && !reply.provisional => reply.instrument_id,
+            _ => String::new(),
+        }
+    }
+
+    /// W10.6, contract v28 (G11): statistics for 1 to 64 subjects, by kind,
+    /// a business date or a range of them, and series, point in time as
+    /// every read is.
+    pub(crate) fn list_statistics(
+        &self,
+        request: ListStatisticsRequest,
+        envelope: &Envelope,
+    ) -> Result<ListStatisticsReply, String> {
+        if !bounds::LIST_STATISTICS_REQUEST_SUBJECTS_COUNT.admits(request.subjects.len()) {
+            return Err(format!(
+                "subjects names {}; 1 to 64",
+                request.subjects.len()
+            ));
+        }
+        if !bounds::LIST_STATISTICS_REQUEST_SERIES_KEYS_COUNT.admits(request.series_keys.len()) {
+            return Err(format!(
+                "series_keys names {}; at most 500",
+                request.series_keys.len()
+            ));
+        }
+        for (i, kind) in request.kinds.iter().enumerate() {
+            if StatisticKind::try_from(*kind).unwrap_or(StatisticKind::Unspecified)
+                == StatisticKind::Unspecified
+            {
+                return Err(format!("kinds[{i}] is unspecified"));
+            }
+        }
+        let ranged = !request.from_date.is_empty() || !request.to_date.is_empty();
+        if ranged && !request.business_date.is_empty() {
+            return Err("business_date and from_date or to_date: at most one is given".into());
+        }
+        let dates = if ranged {
+            let from = meridian_domain::date::optional("from_date", &request.from_date)?
+                .unwrap_or(Date::of_utc_instant(0));
+            let to = match meridian_domain::date::optional("to_date", &request.to_date)? {
+                Some(to) => to,
+                None => Date::of_utc_instant(self.clock.now_ns()),
+            };
+            if to < from {
+                return Err("to_date is on or after from_date".into());
+            }
+            Some((from, to))
+        } else {
+            None
+        };
+        let answer = self.read(
+            ReadRequest {
+                data_type: DataType::Statistic,
+                subjects: request.subjects,
+                kinds: request.kinds,
+                interval_ns: 0,
+                sources: request.sources,
+                at_ns: 0,
+                business_date: request.business_date,
+                // A range of dates reads every version in force, then by
+                // the row's business date.
+                valid_from_ns: if ranged { 1 } else { 0 },
+                valid_until_ns: 0,
+                as_of_ns: request.as_of_ns,
+                page_size: request.page_size,
+                cursor: request.cursor,
+                after: None,
+                tenors: Vec::new(),
+                published_as_of_ns: 0,
+                series_keys: request.series_keys,
+                all_series: request.all_series,
+                dates,
+            },
+            envelope,
+        )?;
+        Ok(ListStatisticsReply {
+            statistics: answer
+                .rows
+                .into_iter()
+                .filter_map(|r| match r {
+                    Observation::Statistic(statistic) => Some(statistic),
+                    _ => None,
+                })
+                .collect(),
+            unanswered: answer.unanswered,
+            datasets: answer.datasets,
+            watermark: Some(answer.watermark),
+            next_cursor: answer.next_cursor,
+        })
+    }
+
+    /// W10.6, contract v28 (the filings slice): the declared corporate
+    /// actions of 1 to 64 subjects -- a security, or its issuer as a company
+    /// in the role asked -- by kind and a range of the kind's date (a cash
+    /// dividend's ex-date), point in time by recorded time or by what the
+    /// source had published; or the versions recorded after a watermark,
+    /// whatever their dates, which is how a reader that lost some catches up
+    /// (ruling 598).
+    pub(crate) fn list_corporate_actions(
+        &self,
+        request: ListCorporateActionsRequest,
+        envelope: &Envelope,
+    ) -> Result<ListCorporateActionsReply, String> {
+        if !bounds::LIST_CORPORATE_ACTIONS_REQUEST_SUBJECTS_COUNT.admits(request.subjects.len()) {
+            return Err(format!(
+                "subjects names {}; 1 to 64",
+                request.subjects.len()
+            ));
+        }
+        for (i, kind) in request.kinds.iter().enumerate() {
+            if CorporateActionKind::try_from(*kind).unwrap_or(CorporateActionKind::Unspecified)
+                == CorporateActionKind::Unspecified
+            {
+                return Err(format!("kinds[{i}] is unspecified"));
+            }
+        }
+        let caught_up = request
+            .after_watermark
+            .as_ref()
+            .is_some_and(|watermark| !watermark.partitions.is_empty());
+        let ranged = !request.from_date.is_empty() || !request.to_date.is_empty();
+        if caught_up && ranged {
+            return Err(
+                "after_watermark and from_date or to_date: a catch-up reads whatever the dates"
+                    .into(),
+            );
+        }
+        let dates = if ranged {
+            let from = meridian_domain::date::optional("from_date", &request.from_date)?
+                .unwrap_or(Date::of_utc_instant(0));
+            let to = match meridian_domain::date::optional("to_date", &request.to_date)? {
+                Some(to) => to,
+                None => Date::from_ymd(9999, 12, 31).expect("the last day"),
+            };
+            if to < from {
+                return Err("to_date is on or after from_date".into());
+            }
+            Some((from, to))
+        } else {
+            None
+        };
+        if request.published_as_of_ns < 0 {
+            return Err("published_as_of_ns is never negative".into());
+        }
+        let answer = self.read(
+            ReadRequest {
+                data_type: DataType::CorporateAction,
+                subjects: request.subjects,
+                kinds: request.kinds,
+                interval_ns: 0,
+                sources: request.sources,
+                at_ns: 0,
+                business_date: String::new(),
+                valid_from_ns: 0,
+                valid_until_ns: 0,
+                as_of_ns: request.as_of_ns,
+                page_size: request.page_size,
+                cursor: request.cursor,
+                after: request.after_watermark,
+                tenors: Vec::new(),
+                published_as_of_ns: request.published_as_of_ns,
+                series_keys: Vec::new(),
+                all_series: false,
+                dates,
+            },
+            envelope,
+        )?;
+        Ok(ListCorporateActionsReply {
+            actions: answer
+                .rows
+                .into_iter()
+                .filter_map(|r| match r {
+                    Observation::CorporateAction(action) => Some(action),
                     _ => None,
                 })
                 .collect(),
@@ -1956,6 +2846,10 @@ impl Lake {
             as_of_ns: as_of,
             tenors: Vec::new(),
             published_as_of_ns: 0,
+            series_keys: Vec::new(),
+            all_series: false,
+            dates: None,
+            roles: Vec::new(),
         };
         let answered = read::answer(
             self.store.as_ref(),
@@ -2368,6 +3262,170 @@ fn trade_refused(at: &str, trade: &meridian_domain::v1::Trade) -> Result<(), Str
 /// four. Its two sides in one asset is checked beside its amounts.
 /// An outcome held to W10.4 (contract v23): its determination and stage
 /// said, its settlement value set and never negative, its venue's word kept.
+/// A statistic held to W10.4 (contract v28, G11): its kind and its value, a
+/// count never negative; a source that does not state one records no row,
+/// never a zero.
+fn statistic_refused(at: &str, statistic: &meridian_domain::v1::Statistic) -> Result<(), String> {
+    if StatisticKind::try_from(statistic.kind).unwrap_or(StatisticKind::Unspecified)
+        == StatisticKind::Unspecified
+    {
+        return Err(format!("{at}.kind is unspecified"));
+    }
+    let Some(value) = statistic.value.as_ref() else {
+        return Err(format!(
+            "{at}.value is required: contracts, or shares for an equity"
+        ));
+    };
+    let Some(amount) = value.value.as_ref() else {
+        return Err(format!("{at}.value.value is required"));
+    };
+    let exact = meridian_domain::exact::Exact::from_wire(amount)
+        .map_err(|out| format!("{at}.value.value {out}"))?;
+    if exact < meridian_domain::exact::Exact::ZERO {
+        return Err(format!("{at}.value.value is never negative"));
+    }
+    Ok(())
+}
+
+/// A derived value held to W10.4 (contract v28, track B): its series named,
+/// its value stated, its rule a definition and version, and the datasets it
+/// was derived from.
+/// A declared corporate action held to W10.4 (contract v28, the filings
+/// slice): its kind stated; a cash dividend's amount per share and each of
+/// its four dates, a plain date, as the rule found them -- the plugin never
+/// infers one (FDP Q12); the rule named; the filing's accession and form
+/// where it names one.
+fn corporate_action_refused(
+    at: &str,
+    action: &meridian_domain::v1::CorporateActionAnnounced,
+) -> Result<(), String> {
+    let kind =
+        CorporateActionKind::try_from(action.kind).unwrap_or(CorporateActionKind::Unspecified);
+    if kind == CorporateActionKind::Unspecified {
+        return Err(format!("{at}.kind is unspecified"));
+    }
+    if kind == CorporateActionKind::CashDividend {
+        if action
+            .amount_per_share
+            .as_ref()
+            .and_then(|m| m.amount.as_ref())
+            .is_none()
+        {
+            return Err(format!(
+                "{at}.amount_per_share is required on a cash dividend, as declared"
+            ));
+        }
+        for (name, date) in [
+            ("declared_date", &action.declared_date),
+            ("ex_date", &action.ex_date),
+            ("record_date", &action.record_date),
+            ("payment_date", &action.payment_date),
+        ] {
+            if date.is_empty() {
+                return Err(format!(
+                    "{at}.{name} is required: a row is recorded only where the rule finds it"
+                ));
+            }
+            meridian_domain::date::optional(&format!("{at}.{name}"), date)?;
+        }
+    }
+    let rule = action.rule.clone().unwrap_or_default();
+    if rule.definition.trim().is_empty() || rule.version < 1 {
+        return Err(format!(
+            "{at}.rule is required: the definition that found it and its version, from 1"
+        ));
+    }
+    if let Some(filing) = &action.filing {
+        if !bounds::FILING_REF_ACCESSION_NUMBER_LENGTH
+            .admits(filing.accession_number.chars().count())
+            || filing.accession_number.trim().is_empty()
+        {
+            return Err(format!(
+                "{at}.filing.accession_number is 1 to 32 characters"
+            ));
+        }
+        if !bounds::FILING_REF_FORM_LENGTH.admits(filing.form.chars().count())
+            || filing.form.trim().is_empty()
+        {
+            return Err(format!("{at}.filing.form is 1 to 32 characters"));
+        }
+    }
+    Ok(())
+}
+
+fn derived_refused(at: &str, value: &meridian_domain::v1::DerivedSeries) -> Result<(), String> {
+    if !bounds::DERIVED_SERIES_SERIES_LENGTH.admits(value.series.chars().count()) {
+        return Err(format!("{at}.series is 1 to 64 characters"));
+    }
+    if value
+        .value
+        .as_ref()
+        .and_then(|v| v.value.as_ref())
+        .is_none()
+    {
+        return Err(format!("{at}.value is required, with its unit"));
+    }
+    let rule = value.rule.clone().unwrap_or_default();
+    if rule.definition.trim().is_empty() || rule.version < 1 {
+        return Err(format!(
+            "{at}.rule is required: the definition it was derived by and its version, from 1"
+        ));
+    }
+    if !bounds::DERIVED_SERIES_INPUTS_COUNT.admits(value.inputs.len()) {
+        return Err(format!(
+            "{at}.inputs names {}; 1 to 32, each dataset read",
+            value.inputs.len()
+        ));
+    }
+    for (i, input) in value.inputs.iter().enumerate() {
+        if input.dataset.trim().is_empty() {
+            return Err(format!("{at}.inputs[{i}].dataset is required"));
+        }
+    }
+    Ok(())
+}
+
+/// A listed series held to W10.4 (contract v28, ruling 561): its template
+/// and version named, each field by its path, and no instrument ID, which
+/// is the lake's answer on a read.
+fn series_refused(at: &str, series: &meridian_domain::v1::ListedSeries) -> Result<(), String> {
+    if !series.template_id.starts_with("TPL-") {
+        return Err(format!(
+            "{at}.template_id {:?} is not a template's TPL- ID",
+            series.template_id
+        ));
+    }
+    if series.template_version.trim().is_empty() {
+        return Err(format!(
+            "{at}.template_version is required: a published version"
+        ));
+    }
+    if !bounds::LISTED_SERIES_FIELDS_COUNT.admits(series.fields.len()) {
+        return Err(format!(
+            "{at}.fields names {}; 1 to 64",
+            series.fields.len()
+        ));
+    }
+    let mut paths = BTreeSet::new();
+    for (k, field) in series.fields.iter().enumerate() {
+        if field.path.trim().is_empty() {
+            return Err(format!("{at}.fields[{k}].path is required"));
+        }
+        if !paths.insert(field.path.as_str()) {
+            return Err(format!(
+                "{at}.fields[{k}].path {:?} is named twice",
+                field.path
+            ));
+        }
+    }
+    if !series.instrument_id.is_empty() {
+        return Err(format!(
+            "{at}.instrument_id is the lake's answer on a read, never set by a writer"
+        ));
+    }
+    Ok(())
+}
+
 /// A rate held to W10.4 (contract v27, the rates slice): its kind, its value
 /// with its unit and its convention's compounding stated; a compounded rate
 /// names its periods a year; a tenor names its unit and a count; a maturity
@@ -2519,6 +3577,14 @@ pub struct ReadRequest {
     pub tenors: Vec<meridian_domain::v1::Tenor>,
     /// A rates read's published-time cut-off (contract v27); 0 for none.
     pub published_as_of_ns: i64,
+    /// Contract v28 (ruling 561, W10.6): the series asked for by key, and
+    /// whether every series of the subjects is; neither, and rows keyed by
+    /// a series are left out.
+    pub series_keys: Vec<Identifier>,
+    pub all_series: bool,
+    /// Contract v28 (ListStatistics): a range of business dates, from and
+    /// to inclusive, over every version in force; `None` for none.
+    pub dates: Option<(Date, Date)>,
 }
 
 #[derive(Debug)]
@@ -2688,6 +3754,172 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
             )
         },
     );
+    // Contract v28, listed options and futures (W10.4, W10.6; ruling 561).
+    serve_on(
+        &bus,
+        &lake,
+        RECORD_SERIES,
+        (
+            "meridian.v1.RecordSeriesRequest",
+            "meridian.v1.RecordObservationsReply",
+        ),
+        |lake, request: RecordSeriesRequest, envelope| {
+            lake.record(
+                "series",
+                request
+                    .series
+                    .into_iter()
+                    .map(Observation::Series)
+                    .collect(),
+                &request.want_id,
+                envelope,
+            )
+        },
+    );
+    serve_on(
+        &bus,
+        &lake,
+        LIST_SERIES,
+        (
+            "meridian.v1.ListSeriesRequest",
+            "meridian.v1.ListSeriesReply",
+        ),
+        |lake, request: ListSeriesRequest, envelope| lake.list_series(request, envelope),
+    );
+    serve_on(
+        &bus,
+        &lake,
+        RECORD_STATISTICS,
+        (
+            "meridian.v1.RecordStatisticsRequest",
+            "meridian.v1.RecordObservationsReply",
+        ),
+        |lake, request: RecordStatisticsRequest, envelope| {
+            lake.record(
+                "statistics",
+                request
+                    .statistics
+                    .into_iter()
+                    .map(Observation::Statistic)
+                    .collect(),
+                &request.want_id,
+                envelope,
+            )
+        },
+    );
+    serve_on(
+        &bus,
+        &lake,
+        LIST_STATISTICS,
+        (
+            "meridian.v1.ListStatisticsRequest",
+            "meridian.v1.ListStatisticsReply",
+        ),
+        |lake, request: ListStatisticsRequest, envelope| lake.list_statistics(request, envelope),
+    );
+    // Contract v28, the filings slice (W10.4 to W10.6): declared corporate
+    // actions, published unconflated and read by subject, kind and date.
+    serve_on(
+        &bus,
+        &lake,
+        RECORD_CORPORATE_ACTIONS,
+        (
+            "meridian.v1.RecordCorporateActionsRequest",
+            "meridian.v1.RecordObservationsReply",
+        ),
+        |lake, request: RecordCorporateActionsRequest, envelope| {
+            lake.record(
+                "actions",
+                request
+                    .actions
+                    .into_iter()
+                    .map(Observation::CorporateAction)
+                    .collect(),
+                &request.want_id,
+                envelope,
+            )
+        },
+    );
+    serve_on(
+        &bus,
+        &lake,
+        LIST_CORPORATE_ACTIONS,
+        (
+            "meridian.v1.ListCorporateActionsRequest",
+            "meridian.v1.ListCorporateActionsReply",
+        ),
+        |lake, request: ListCorporateActionsRequest, envelope| {
+            lake.list_corporate_actions(request, envelope)
+        },
+    );
+    // Contract v28, track B (W10.4, W10.6, W12.8): a signal plugin's
+    // derived series and saved scenarios.
+    serve_on(
+        &bus,
+        &lake,
+        RECORD_DERIVED_SERIES,
+        (
+            "meridian.v1.RecordDerivedSeriesRequest",
+            "meridian.v1.RecordObservationsReply",
+        ),
+        |lake, request: meridian_domain::v1::RecordDerivedSeriesRequest, envelope| {
+            lake.record(
+                "values",
+                request
+                    .values
+                    .into_iter()
+                    .map(Observation::Derived)
+                    .collect(),
+                "",
+                envelope,
+            )
+        },
+    );
+    serve_on(
+        &bus,
+        &lake,
+        LIST_DERIVED_SERIES,
+        (
+            "meridian.v1.ListDerivedSeriesRequest",
+            "meridian.v1.ListDerivedSeriesReply",
+        ),
+        |lake, request: meridian_domain::v1::ListDerivedSeriesRequest, envelope| {
+            lake.list_derived_series(request, envelope)
+        },
+    );
+    serve_on(
+        &bus,
+        &lake,
+        RECORD_SCENARIOS,
+        (
+            "meridian.v1.RecordScenariosRequest",
+            "meridian.v1.RecordObservationsReply",
+        ),
+        |lake, request: meridian_domain::v1::RecordScenariosRequest, envelope| {
+            lake.record(
+                "scenarios",
+                request
+                    .scenarios
+                    .into_iter()
+                    .map(Observation::Scenario)
+                    .collect(),
+                "",
+                envelope,
+            )
+        },
+    );
+    serve_on(
+        &bus,
+        &lake,
+        LIST_SCENARIOS,
+        (
+            "meridian.v1.ListScenariosRequest",
+            "meridian.v1.ListScenariosReply",
+        ),
+        |lake, request: meridian_domain::v1::ListScenariosRequest, envelope| {
+            lake.list_scenarios(request, envelope)
+        },
+    );
     // Contract v27 (W10.4; ruling 418): a dataset's liveness.
     serve_on(
         &bus,
@@ -2775,6 +4007,10 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
                     after: request.after_watermark,
                     tenors: Vec::new(),
                     published_as_of_ns: 0,
+                    // Contract v28 (W10.6): a chain's trades, asked for.
+                    series_keys: request.series_keys,
+                    all_series: request.all_series,
+                    dates: None,
                 },
                 envelope,
             )?;
@@ -2820,6 +4056,10 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
                     after: None,
                     tenors: Vec::new(),
                     published_as_of_ns: 0,
+                    // Contract v28 (W10.6): a chain's quotes, asked for.
+                    series_keys: request.series_keys,
+                    all_series: request.all_series,
+                    dates: None,
                 },
                 envelope,
             )?;
@@ -2874,6 +4114,9 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
                     after: None,
                     tenors: Vec::new(),
                     published_as_of_ns: 0,
+                    series_keys: Vec::new(),
+                    all_series: false,
+                    dates: None,
                 },
                 envelope,
             )?;
@@ -2916,6 +4159,9 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
                     after: None,
                     tenors: Vec::new(),
                     published_as_of_ns: 0,
+                    series_keys: Vec::new(),
+                    all_series: false,
+                    dates: None,
                 },
                 envelope,
             )?;

@@ -788,7 +788,10 @@ async fn the_last_permission_to_deployment_admin_cannot_be_withdrawn() {
                 h,
                 WITHDRAW_PERMISSION,
                 "meridian.v1.WithdrawPermissionRequest",
-                WithdrawPermissionRequest { permission_id: id },
+                WithdrawPermissionRequest {
+                    permission_id: id,
+                    note: "no longer needed".into(),
+                },
             )
             .await
             .unwrap()
@@ -2830,6 +2833,7 @@ async fn all_plugins_admin_and_all_accounts_are_built_in() {
         "meridian.v1.WithdrawPermissionRequest",
         WithdrawPermissionRequest {
             permission_id: linked.permission_id,
+            note: "no longer needed".into(),
         },
     )
     .await
@@ -3152,6 +3156,7 @@ async fn every_grant_change_is_its_own_record_naming_who_and_when() {
         "meridian.v1.WithdrawPermissionRequest",
         WithdrawPermissionRequest {
             permission_id: permission.permission_id.clone(),
+            note: "no longer needed".into(),
         },
     )
     .await
@@ -3589,6 +3594,105 @@ async fn the_deployments_time_zone_is_new_york_until_set_each_change_its_own_rec
 /// set until a deployment admin orders them -- read as USD's and then EUR's
 /// -- one to four fiat cash instruments, none twice, never a token, each change
 /// saying why and its own record.
+#[tokio::test]
+async fn the_stale_reference_actions_permitted_are_refuse_only_until_a_deployment_admin_permits_warn(
+) {
+    // Contract v28 (W6.38; rulings 517, 600).
+    let h = harness("dashboard-1");
+    let read = || {
+        ask::<_, meridian_domain::v1::StaleReferenceActionsPermittedSetting>(
+            &h,
+            crate::service::READ_STALE_REFERENCE_ACTIONS_PERMITTED,
+            "meridian.v1.ReadStaleReferenceActionsPermittedRequest",
+            meridian_domain::v1::ReadStaleReferenceActionsPermittedRequest {},
+        )
+    };
+    let set = |warn: bool, reason: &str| {
+        ask::<_, meridian_domain::v1::StaleReferenceActionsPermittedSetting>(
+            &h,
+            crate::service::SET_STALE_REFERENCE_ACTIONS_PERMITTED,
+            "meridian.v1.SetStaleReferenceActionsPermittedRequest",
+            meridian_domain::v1::SetStaleReferenceActionsPermittedRequest {
+                warn_permitted: warn,
+                reason: reason.into(),
+            },
+        )
+    };
+    let default = read().await.unwrap();
+    assert!(!default.warn_permitted && default.changed_at_ns == 0);
+    assert!(set(true, " ").await.unwrap_err().contains("fields=reason"));
+    let changed = set(true, "the desk works delayed reference prices")
+        .await
+        .unwrap();
+    assert!(changed.warn_permitted && changed.changed_at_ns > 0);
+    assert!(read().await.unwrap().warn_permitted);
+}
+
+#[tokio::test]
+async fn a_permission_withdrawn_says_why_or_is_refused() {
+    // Contract v28 (W6.7, ruling 549): the note is required.
+    let h = harness("dashboard-1");
+    let refused = ask::<_, WithdrawPermissionReply>(
+        &h,
+        WITHDRAW_PERMISSION,
+        "meridian.v1.WithdrawPermissionRequest",
+        WithdrawPermissionRequest {
+            permission_id: "PRM-1".into(),
+            note: "  ".into(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(refused.contains("fields=note"), "{refused}");
+}
+
+#[tokio::test]
+async fn the_series_request_rule_is_a_deployment_admins_each_change_recorded() {
+    // Contract v28 (W6.37; rulings 561, 589): orders on, standing wants off
+    // and 500 a day by default; a limit of 0 or past 5,000 refused naming
+    // it; no reason refused; each change its own record.
+    let h = harness("dashboard-1");
+    let read = || {
+        ask::<_, meridian_domain::v1::SeriesRequestRule>(
+            &h,
+            crate::service::READ_SERIES_REQUEST_RULE,
+            "meridian.v1.ReadSeriesRequestRuleRequest",
+            meridian_domain::v1::ReadSeriesRequestRuleRequest {},
+        )
+    };
+    let set = |orders: bool, standing: bool, limit: u32, reason: &str| {
+        ask::<_, meridian_domain::v1::SeriesRequestRule>(
+            &h,
+            crate::service::SET_SERIES_REQUEST_RULE,
+            "meridian.v1.SetSeriesRequestRuleRequest",
+            meridian_domain::v1::SetSeriesRequestRuleRequest {
+                rule: Some(meridian_domain::v1::SeriesRequestRule {
+                    orders,
+                    standing_wants: standing,
+                    daily_limit: limit,
+                    ..Default::default()
+                }),
+                reason: reason.into(),
+            },
+        )
+    };
+    let default = read().await.unwrap();
+    assert!(default.orders && !default.standing_wants);
+    assert_eq!((default.daily_limit, default.changed_at_ns), (500, 0));
+    for limit in [0, 5_001] {
+        let refused = set(true, true, limit, "chains").await.unwrap_err();
+        assert!(refused.contains("fields=rule.daily_limit"), "{refused}");
+    }
+    let refused = set(true, true, 100, " ").await.unwrap_err();
+    assert!(refused.contains("fields=reason"), "{refused}");
+    let changed = set(true, true, 100, "the options views watch SPX's chain")
+        .await
+        .unwrap();
+    assert!(changed.standing_wants && changed.daily_limit == 100);
+    assert!(changed.changed_at_ns > 0 && !changed.changed_by.is_empty());
+    assert_eq!(read().await.unwrap().daily_limit, 100);
+}
+
 #[tokio::test]
 async fn the_fx_pivot_currencies_are_fiat_ordered_by_a_deployment_admin_each_change_recorded() {
     let h = harness("dashboard-1");
