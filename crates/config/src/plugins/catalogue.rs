@@ -318,6 +318,62 @@ mod tests {
         assert!(pages.last().unwrap().next_cursor.is_empty());
     }
 
+    /// A catalogue of 2,000 versions -- 100 plugins of 20 versions, each
+    /// declaring a tool documented at length -- and 2,000 launches, read
+    /// page by page: how many pages, the largest, and how long.
+    fn two_thousand_versions() -> (usize, usize, std::time::Duration) {
+        let mut held = PluginCatalogue::default();
+        for n in 0..100 {
+            for v in 0..20 {
+                held.versions
+                    .push(version(&format!("plugin-{n:03}"), &format!("0.{v}.0"), 30));
+            }
+        }
+        for at in 0..2_000 {
+            let n = at % 100;
+            held.launches.push(launch(
+                &format!("plugin-{n:03}-{at}"),
+                &format!("plugin-{n:03}"),
+                "0.19.0",
+                at as i64,
+            ));
+        }
+        let started = std::time::Instant::now();
+        let pages = every_page(&held, PluginCatalogueRequest::default());
+        let took = started.elapsed();
+        let largest = pages.iter().map(|p| p.encoded_len()).max().unwrap_or(0);
+        let versions: usize = pages.iter().map(|p| p.versions.len()).sum();
+        let launches: usize = pages.iter().map(|p| p.launches.len()).sum();
+        assert_eq!((versions, launches), (2_000, 2_000), "every record once");
+        (pages.len(), largest, took)
+    }
+
+    /// The gate's guard on the catalogue's stated capacity (H1, ruling 586):
+    /// at 2,000 versions every page stays within the budget, and reading
+    /// them all stays within a generous bound -- the paging's own work,
+    /// which a quadratic regression would blow through.
+    #[test]
+    fn two_thousand_versions_page_within_the_budget() {
+        let (pages, largest, took) = two_thousand_versions();
+        eprintln!("bench: catalogue 2000 versions 2000 launches: {pages} pages, largest {largest} bytes, {took:?}");
+        assert!(largest <= PAGE_BUDGET, "{largest} bytes");
+        // Stated: 167 ms for the six pages; a quadratic regression would
+        // blow through a second.
+        assert!(took <= std::time::Duration::from_secs(1), "{took:?}");
+    }
+
+    /// The stated capacity: `make bench` prints it.
+    #[test]
+    #[ignore = "the capacity bench: make bench"]
+    fn capacity_catalogue_at_two_thousand_versions() {
+        let (pages, largest, took) = two_thousand_versions();
+        println!(
+            "CAPACITY catalogue versions=2000 launches=2000 pages={pages} largest_page_bytes={largest} \
+             read_all_ms={:.1}",
+            took.as_secs_f64() * 1e3
+        );
+    }
+
     #[test]
     fn an_empty_request_is_answered_whole_where_it_fits() {
         let mut held = PluginCatalogue::default();

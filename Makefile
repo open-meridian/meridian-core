@@ -19,6 +19,7 @@ help:
 	@echo "  make build          compile the workspace"
 	@echo "  make test           run the unit tests"
 	@echo "  make test-store     run the Postgres store's tests against Postgres"
+	@echo "  make bench          measure the stated capacity INSTALL.md gives (by hand)"
 	@echo "  make chart-check    lint the Helm chart, and check that it refuses bad values"
 	@echo "  make check-image-version  an image built with a version reports it from every binary"
 	@echo "  make check-crate-boundaries  nothing links against another component's store"
@@ -339,11 +340,37 @@ test-store: network
 	@# Postgres, on their own: a filter after -- applies to every binary a run
 	@# selects, and would select none of the postgres suites' tests above.
 	@$(COMPOSE) run --rm -T tests \
-		run-tests -p meridian-runtime --test it -- grants:: waiting:: \
+		run-tests -p meridian-runtime --test it -- grants:: waiting:: preflight:: \
 		>>.test-store.log 2>&1 \
 		|| { echo "test-store FAILED. The last 40 lines, and the whole of it in .test-store.log:" >&2; \
 		     tail -40 .test-store.log >&2; exit 1; }
-	@echo "test-store OK: the five stores and the dashboard's tables pass against Postgres, the migration grants the serving role what it made, and a component started before its database or its migration waits for it"
+	@echo "test-store OK: the five stores and the dashboard's tables pass against Postgres, the migration grants the serving role what it made, a component started before its database or its migration waits for it, and the upgrade preflight reads every store as ready and a newer one as blocked"
+
+# The stated capacity (H1, ruling 586; INSTALL.md, "Capacity"): the lake's
+# record and read rates and its latest read as a dataset grows, the plugin
+# catalogue and the store at 2,000 versions and launches, the access
+# records' bytes a person against the broker's 1 MiB, and the engine's
+# options a second on the tree. Run by hand on the machine whose capacity is
+# stated; never in the gate, which runs each one's guard at a size it can
+# afford (test-store, test). Prints the CAPACITY lines INSTALL.md's table is.
+BENCH_LAKE_ROWS ?= 20000,100000,400000
+bench: network
+	@$(COMPOSE) run --rm -T --build -e MERIDIAN_BENCH_LAKE_ROWS=$(BENCH_LAKE_ROWS) tests \
+		run-tests -p meridian-lake --test postgres -p meridian-config --test postgres \
+		-- --ignored capacity --nocapture >.bench.log 2>&1 \
+		|| { echo "bench FAILED. The last 40 lines, and the whole of it in .bench.log:" >&2; tail -40 .bench.log >&2; exit 1; }
+	@$(COMPOSE) run --rm -T tests run-tests -p meridian-config --lib \
+		-- --ignored capacity --nocapture >>.bench.log 2>&1 \
+		|| { echo "bench FAILED. The last 40 lines, and the whole of it in .bench.log:" >&2; tail -40 .bench.log >&2; exit 1; }
+	@# The engine optimised, as BENCHMARK.md measures it: a build of its own,
+	@# in a volume of its own, never the gate's.
+	@docker run --rm -v "$(CURDIR)":/w:ro -w /w -v meridian-core-bench-target:/target \
+		-e CARGO_TARGET_DIR=/target rust:1.90-slim-bookworm \
+		cargo test --locked --release -p meridian-analytics-engine bench_a_t1_chain_refresh_on_the_tree \
+		-- --ignored --nocapture >>.bench.log 2>&1 \
+		|| { echo "bench FAILED. The last 40 lines, and the whole of it in .bench.log:" >&2; tail -40 .bench.log >&2; exit 1; }
+	@grep -E '^CAPACITY |inversions' .bench.log
+	@$(COMPOSE) --profile tests down --remove-orphans >/dev/null 2>&1 || true
 
 # First run, without a cluster: the wizard, the Job, and stand-ins for the two
 # things a deployment talks to while it is being set up.
@@ -1089,7 +1116,8 @@ e2e-settings-page:
 		if [ -z "$$session" ]; then echo "e2e-settings-page FAILED: the server did not start" >&2; \
 			docker logs settings-page >>.e2e-settings-page.log 2>&1; status=1; \
 		else \
-			docker run --rm --network $(SETTINGS_NET) -e E2E_SESSION="$$session" -e PASS=$$pass -e OUT=/out \
+			reader="$$(docker logs settings-page 2>/dev/null | sed -n 's/^READER_SESSION=//p')"; \
+			docker run --rm --network $(SETTINGS_NET) -e E2E_SESSION="$$session" -e E2E_READER_SESSION="$$reader" -e PASS=$$pass -e OUT=/out \
 				$(if $(SHOTS),-v $(abspath $(SHOTS)):/out,--tmpfs /out) \
 				$(SETTINGS_BROWSER_IMAGE) >>.e2e-settings-page.log 2>&1 || status=1; \
 		fi; \

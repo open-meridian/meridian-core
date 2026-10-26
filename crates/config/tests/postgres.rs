@@ -2513,3 +2513,88 @@ fn the_registries_state_is_kept_whole() {
         [13, 12]
     );
 }
+
+/// What the store holds at 2,000 versions and 2,000 launches (H1, ruling
+/// 586): how fast it records them, and how long a snapshot -- what every
+/// read of the catalogue starts from -- takes.
+fn catalogue_in_the_store(tag: &str) -> (f64, f64, std::time::Duration) {
+    use meridian_domain::v1::{PluginLaunch, PluginLaunchState, PluginMetadata, PluginVersion};
+    let store = store(tag);
+    let started = std::time::Instant::now();
+    for n in 0..100 {
+        for v in 0..20 {
+            let version = PluginVersion {
+                metadata: Some(PluginMetadata {
+                    name: format!("plugin-{n:03}"),
+                    version: format!("0.{v}.0"),
+                    declaration: Some(meridian_pb::v1::PluginDeclaration {
+                        tools: vec![meridian_pb::v1::ToolDeclaration {
+                            name: "read_figures".into(),
+                            description: "what it reads, as the vendor documents it. ".repeat(30),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                image_digest: format!("sha256:{n:03}-{v}"),
+                ..Default::default()
+            };
+            store.record_plugin_version(&version).unwrap();
+        }
+    }
+    let versions_per_s = 2_000.0 / started.elapsed().as_secs_f64();
+    let started = std::time::Instant::now();
+    for at in 0..2_000 {
+        let n = at % 100;
+        let launch = PluginLaunch {
+            instance_id: format!("plugin-{n:03}-{at}"),
+            name: format!("plugin-{n:03}"),
+            version: "0.19.0".into(),
+            launched_at_ns: at as i64,
+            state: PluginLaunchState::Launched as i32,
+            ..Default::default()
+        };
+        store.begin_launch(&launch, "").unwrap();
+    }
+    let launches_per_s = 2_000.0 / started.elapsed().as_secs_f64();
+    let started = std::time::Instant::now();
+    let snapshot = store.snapshot().unwrap();
+    let took = started.elapsed();
+    assert_eq!(snapshot.catalogue.versions.len(), 2_000);
+    assert_eq!(snapshot.catalogue.launches.len(), 2_000);
+    (versions_per_s, launches_per_s, took)
+}
+
+/// The gate's guard: the store keeps 2,000 versions and launches and
+/// snapshots them within generous bounds (a quarter of what the gate's
+/// container measured; INSTALL.md, "Capacity").
+#[test]
+fn the_store_keeps_two_thousand_versions_and_launches() {
+    let (versions_per_s, launches_per_s, took) = catalogue_in_the_store("bench_guard");
+    eprintln!(
+        "bench: {versions_per_s:.0} versions/s, {launches_per_s:.0} launches/s, snapshot {took:?}"
+    );
+    // Stated: 623 versions and 1,650 launches a second, the snapshot in
+    // 61 ms.
+    assert!(
+        versions_per_s >= 150.0,
+        "{versions_per_s:.0} versions a second"
+    );
+    assert!(
+        launches_per_s >= 400.0,
+        "{launches_per_s:.0} launches a second"
+    );
+    assert!(took <= std::time::Duration::from_millis(500), "{took:?}");
+}
+
+#[test]
+#[ignore = "the capacity bench: make bench"]
+fn capacity_store_at_two_thousand_versions() {
+    let (versions_per_s, launches_per_s, took) = catalogue_in_the_store("bench");
+    println!(
+        "CAPACITY store versions=2000 launches=2000 record_versions_per_s={versions_per_s:.0} \
+         record_launches_per_s={launches_per_s:.0} snapshot_ms={:.1}",
+        took.as_secs_f64() * 1e3
+    );
+}
