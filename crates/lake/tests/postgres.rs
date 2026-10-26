@@ -441,3 +441,72 @@ fn a_closed_day_flag_is_counted_and_amended_beside_its_row() {
     assert_eq!(now[0].meta().version, 1, "never a new version");
     assert_eq!(store.heads().unwrap()[&dataset], 3);
 }
+
+/// Contract v28 (W10.12; ruling 423): a signal plugin's assessment kept
+/// beside its row, its own record, raising the row's effective state as of
+/// when it was recorded; the row's body never rewritten.
+#[test]
+fn an_assessment_is_kept_beside_its_row_and_raises_its_effective_state() {
+    use meridian_domain::v1::{QualityReason, QualityState};
+    use meridian_lake::store::Assessment;
+    let store = store();
+    let dataset = unique("coinbase-1:daily");
+    let subject = unique("LCL-BTC");
+    let mut suspicious = close(&dataset, "k", &subject, "2026-10-13", 10);
+    suspicious.meta_mut().quality = QualityState::Suspicious as i32;
+    suspicious.meta_mut().quality_reasons = vec![QualityReason::Duplicate as i32];
+    let done = store.record(&dataset, vec![suspicious], 1_000).unwrap();
+    let sequence = done.rows[0].meta().sequence;
+    let held = store.row_version(&dataset, "k", 1).unwrap();
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].meta().quality, QualityState::Suspicious as i32);
+    assert!(store.row_version(&dataset, "k", 2).unwrap().is_empty());
+    store
+        .assess(&[Assessment {
+            dataset: dataset.clone(),
+            sequence,
+            row_key: "k".into(),
+            version: 1,
+            state: QualityState::Invalid as i32,
+            reasons: vec![QualityReason::PriceOutlier as i32],
+            by_instance: "signal-1".into(),
+            at_ns: 2_000,
+        }])
+        .unwrap();
+    let query = |as_of_ns: i64| Query {
+        datasets: vec![dataset.clone()],
+        subjects: vec![subject.clone()],
+        data_type: DataType::Price,
+        kinds: vec![],
+        interval_ns: 0,
+        when: When::BusinessDate(Date::parse("2026-10-13").unwrap()),
+        as_of_ns,
+        published_as_of_ns: 0,
+    };
+    let then = store.read(&query(1_500)).unwrap();
+    assert_eq!(then[0].meta().quality, QualityState::Suspicious as i32);
+    let now = store.read(&query(0)).unwrap();
+    assert_eq!(now[0].meta().quality, QualityState::Invalid as i32);
+    assert_eq!(
+        now[0].meta().quality_reasons,
+        vec![
+            QualityReason::Duplicate as i32,
+            QualityReason::PriceOutlier as i32
+        ]
+    );
+    assert_eq!(now[0].meta().version, 1, "never a new version");
+    let kept: Vec<Assessment> = store
+        .assessments()
+        .unwrap()
+        .into_iter()
+        .filter(|a| a.dataset == dataset)
+        .collect();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].by_instance, "signal-1");
+    assert_eq!(
+        store.read_dataset(&dataset, DataType::Price, 0).unwrap()[0]
+            .meta()
+            .quality,
+        QualityState::Invalid as i32
+    );
+}

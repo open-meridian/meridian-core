@@ -462,6 +462,30 @@ fn a_routed_model_answers_by_its_plugin_and_never_silently_by_the_built_in_one()
     assert_ne!(answer.answer_hash(), unanswered.answer_hash());
 }
 
+/// Contract v28 (W12.2; rulings 421 and 619): a position whose only price in
+/// force is invalid is not evaluated, INPUT_QUARANTINED naming the dataset.
+#[test]
+fn a_quarantined_price_is_not_evaluated_naming_the_dataset() {
+    let case = load("valuation", CASES[0].1);
+    let spy = "INS-01J8XQ4M7K00000000000SPY";
+    let mut inputs = case["inputs"].clone();
+    let market: Vec<Value> = inputs["market"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["subject_id"] != spy)
+        .cloned()
+        .collect();
+    inputs["market"] = Value::Array(market);
+    inputs["quarantined"] =
+        serde_json::json!([{"subject_id": spy, "kind": "close", "dataset": "alpaca-1:daily"}]);
+    let answer = compute(&inputs).unwrap();
+    let reasons = unevaluated_reasons(&answer);
+    assert!(reasons.iter().any(|(_, i, r, d)| i == spy
+        && *r == crate::answer::INPUT_QUARANTINED
+        && d == "alpaca-1:daily"));
+}
+
 #[test]
 fn an_unentitled_price_is_not_evaluated_naming_the_dataset_and_pnl_is_unrealized_alone() {
     let case = load("valuation", CASES[0].1);

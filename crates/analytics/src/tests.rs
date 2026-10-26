@@ -85,6 +85,12 @@ struct Stores {
     bus: Arc<Bus>,
     heard: Arc<Mutex<Heard>>,
     routing: Arc<Mutex<Vec<ModelRouting>>>,
+    /// Contract v28 (ruling 619): AAPL's close invalid, left out of a
+    /// default read and answered to one naming alpaca-1:daily with
+    /// include_quarantined.
+    quarantined: Arc<Mutex<bool>>,
+    /// The same, of the chain's deep call's quote in tradier-1:options.
+    quarantined_quote: Arc<Mutex<bool>>,
 }
 
 fn serve_store<Req, Rep, F>(
@@ -122,6 +128,8 @@ fn stores() -> Stores {
         bus,
         heard: Arc::default(),
         routing: Arc::new(Mutex::new(Vec::new())),
+        quarantined: Arc::default(),
+        quarantined_quote: Arc::default(),
     };
     serve_store(
         &stores,
@@ -271,11 +279,12 @@ fn stores() -> Stores {
             ..Default::default()
         },
     );
+    let quarantined = Arc::clone(&stores.quarantined);
     serve_store(
         &stores,
         topics::LIST_PRICES,
         "meridian.v1.ListPricesReply",
-        |request: ListPricesRequest| {
+        move |request: ListPricesRequest| {
             let all = vec![
                 price(AAPL, PriceKind::Close, "227.50", USD, "alpaca-1:daily"),
                 price(BTC, PriceKind::Close, "60000.50", USDT, "coinbase-1:daily"),
@@ -292,7 +301,7 @@ fn stores() -> Stores {
                 .iter()
                 .map(|s| s.entity_id.as_str())
                 .collect();
-            ListPricesReply {
+            let mut reply = ListPricesReply {
                 prices: all
                     .into_iter()
                     .filter(|p| {
@@ -301,7 +310,36 @@ fn stores() -> Stores {
                     })
                     .collect(),
                 ..Default::default()
+            };
+            if *quarantined.lock().unwrap() && wanted.contains(&AAPL) {
+                let sources = request.sources.clone().unwrap_or_default();
+                let named = sources.include_quarantined
+                    && sources.named == vec!["alpaca-1:daily".to_string()];
+                for p in reply.prices.iter_mut() {
+                    let meta = p.meta.as_mut().unwrap();
+                    if meta.subjects[0].entity_id == AAPL && p.kind == PriceKind::Close as i32 {
+                        meta.quality = QualityState::Invalid as i32;
+                        meta.quality_reasons = vec![QualityReason::PriceOutlier as i32];
+                    }
+                }
+                if named {
+                    reply.prices.retain(|p| p.kind == PriceKind::Close as i32);
+                } else {
+                    reply
+                        .prices
+                        .retain(|p| p.meta.as_ref().unwrap().quality == 0);
+                    reply.unanswered.push(Unanswered {
+                        subject: Some(SubjectRef {
+                            entity_id: AAPL.into(),
+                            ..Default::default()
+                        }),
+                        dataset: "alpaca-1:daily".into(),
+                        reason: UnansweredReason::SourceSilent as i32,
+                        ..Default::default()
+                    });
+                }
             }
+            reply
         },
     );
     serve_store(
@@ -490,6 +528,38 @@ async fn a_job_is_resolved_on_the_clients_behalf_and_answered_inline() {
         assert!(meta.account_scope_applies, "{topic}");
         assert_eq!(meta.account_scope, vec!["ACC-1".to_string()], "{topic}");
     }
+}
+
+/// Contract v28 (W12.2; rulings 421 and 619): AAPL's only close in force is
+/// invalid, left out of the job's default read; read again naming the
+/// dataset with include_quarantined, it is not evaluated,
+/// INPUT_QUARANTINED naming alpaca-1:daily, and never valued.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_price_whose_only_row_in_force_is_invalid_is_not_evaluated_as_quarantined() {
+    let stores = stores();
+    *stores.quarantined.lock().unwrap() = true;
+    coordinator(&stores, Config::default(), false);
+    let reply: RunJobReply = ask_as(
+        &stores.bus,
+        topics::RUN_JOB,
+        "meridian.v1.RunJobRequest",
+        job(&[("market_value", &[], "")]),
+        &["ACC-1"],
+    )
+    .await
+    .unwrap();
+    let answer = reply.answer.unwrap();
+    let quarantined: Vec<&NotEvaluated> = answer
+        .not_evaluated
+        .iter()
+        .filter(|u| u.reason == NotEvaluatedReason::InputQuarantined as i32)
+        .collect();
+    assert!(!quarantined.is_empty(), "{:?}", answer.not_evaluated);
+    assert!(quarantined
+        .iter()
+        .all(|u| u.instrument_id == AAPL && u.detail == "alpaca-1:daily"));
+    // 5000 + 0.5 x 60000.50 x 0.9998 + 100 x 0.42: AAPL left out, never zero.
+    assert_eq!(value(&answer, "market_value", &[]), "35036.25");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1074,6 +1144,7 @@ fn chain_stores_paying(
     dividends: Vec<meridian_domain::v1::CorporateActionAnnounced>,
 ) -> Stores {
     let stores = stores();
+    let quarantined = Arc::clone(&stores.quarantined_quote);
     serve_store(
         &stores,
         topics::RESOLVE_IDENTIFIER,
@@ -1138,12 +1209,12 @@ fn chain_stores_paying(
         &stores,
         topics::LIST_QUOTES,
         "meridian.v1.ListQuotesReply",
-        |request: ListQuotesRequest| {
+        move |request: ListQuotesRequest| {
             assert!(
                 request.all_series,
                 "a chain with no keys reads every series"
             );
-            ListQuotesReply {
+            let mut reply = ListQuotesReply {
                 quotes: vec![
                     quote_row(OSI_CALL, "8.10", "8.30"),
                     quote_row(OSI_PUT, "9.40", "9.60"),
@@ -1151,7 +1222,32 @@ fn chain_stores_paying(
                     quote_row(OSI_DEEP, "70.00", "71.00"),
                 ],
                 ..Default::default()
+            };
+            // Contract v28 (ruling 619): the deep call's quote invalid,
+            // left out of a default read, the dataset source silent; and
+            // answered with its state to a read naming it with
+            // include_quarantined.
+            if *quarantined.lock().unwrap() {
+                let sources = request.sources.clone().unwrap_or_default();
+                if sources.include_quarantined {
+                    assert_eq!(sources.named, vec!["tradier-1:options".to_string()]);
+                    let deep = reply.quotes[2].meta.as_mut().unwrap();
+                    deep.quality = QualityState::Invalid as i32;
+                    deep.quality_reasons = vec![QualityReason::CrossedQuote as i32];
+                } else {
+                    reply.quotes.truncate(2);
+                    reply.unanswered.push(Unanswered {
+                        subject: Some(SubjectRef {
+                            entity_id: AAPL.into(),
+                            ..Default::default()
+                        }),
+                        dataset: "tradier-1:options".into(),
+                        reason: UnansweredReason::SourceSilent as i32,
+                        ..Default::default()
+                    });
+                }
             }
+            reply
         },
     );
     serve_store(
@@ -1261,6 +1357,50 @@ async fn a_chain_job_answers_iv_and_greeks_naming_each_series_by_its_key() {
     assert!(provenance
         .datasets
         .contains(&"tradier-1:options".to_string()));
+}
+
+/// Contract v28 (W12.2; rulings 421 and 619): a series whose only quote in
+/// force is invalid is not evaluated, INPUT_QUARANTINED naming the dataset;
+/// the others are answered as before.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_series_whose_only_quote_in_force_is_invalid_is_not_evaluated_as_quarantined() {
+    let stores = chain_stores();
+    *stores.quarantined_quote.lock().unwrap() = true;
+    coordinator(&stores, Config::default(), false);
+    let mut request = job(&[("implied_volatility", &["series", "quote_side"], "")]);
+    let asked = request.job.as_mut().unwrap();
+    asked.account_ids.clear();
+    asked.chains = vec![ChainRef {
+        underlying_instrument_id: AAPL.into(),
+        expiration_from: "2026-11-20".into(),
+        expiration_to: "2026-11-20".into(),
+        series_keys: Vec::new(),
+    }];
+    let reply: RunJobReply = ask_as(
+        &stores.bus,
+        topics::RUN_JOB,
+        "meridian.v1.RunJobRequest",
+        request,
+        &[],
+    )
+    .await
+    .unwrap();
+    let answer = reply.answer.unwrap();
+    let quarantined: Vec<&NotEvaluated> = answer
+        .not_evaluated
+        .iter()
+        .filter(|u| u.reason == NotEvaluatedReason::InputQuarantined as i32)
+        .collect();
+    assert!(!quarantined.is_empty(), "{:?}", answer.not_evaluated);
+    assert!(quarantined
+        .iter()
+        .all(|u| u.series_key[0].value == OSI_DEEP && u.detail == "tradier-1:options"));
+    let ivs = answer
+        .figures
+        .iter()
+        .filter(|f| f.measure.as_ref().unwrap().definition == "implied_volatility")
+        .count();
+    assert_eq!(ivs, 6, "{:?}", answer.not_evaluated);
 }
 
 #[tokio::test(flavor = "multi_thread")]

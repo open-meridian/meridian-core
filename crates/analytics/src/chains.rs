@@ -332,54 +332,113 @@ pub fn chain(
         }
         cursor = reply.next_cursor;
     }
-    // Each series' latest quote at the as-of, by its key.
+    // Each series' latest quote at the as-of, by its key. Contract v28
+    // (W12.2; rulings 421 and 619): an invalid quote is never used; where a
+    // series found none and a dataset was source silent for the underlying,
+    // that dataset is read again by name with `include_quarantined`, and a
+    // series whose quote in force there is invalid is quarantined, naming it.
     let mut quotes: BTreeMap<Vec<(String, String)>, v1::Quote> = BTreeMap::new();
+    let mut invalid: BTreeMap<Vec<(String, String)>, (i64, v1::Source)> = BTreeMap::new();
+    let mut silent: BTreeSet<String> = BTreeSet::new();
     let mut quotes_refused = String::new();
-    let mut cursor = String::new();
-    loop {
-        let read: Result<ListQuotesReply, String> = ask(
-            asker,
-            topics::LIST_QUOTES,
-            "meridian.v1.ListQuotesRequest",
-            &ListQuotesRequest {
-                subjects: subject(underlying),
-                sources: sources.clone(),
-                at_ns: as_of,
-                as_of_ns: as_of,
-                page_size: PAGE,
-                cursor: cursor.clone(),
-                series_keys: chain.series_keys.clone(),
-                all_series: chain.series_keys.is_empty(),
-                ..Default::default()
-            },
-        );
-        let reply = match read {
-            Ok(reply) => reply,
-            Err(failed) => {
-                quotes_refused = format!("the chain's quotes could not be read: {failed}");
+    let mut read_quotes = |sources: &Option<v1::SourceChoice>,
+                           quotes: &mut BTreeMap<Vec<(String, String)>, v1::Quote>,
+                           invalid: &mut BTreeMap<Vec<(String, String)>, (i64, v1::Source)>,
+                           silent: &mut BTreeSet<String>|
+     -> Result<(), String> {
+        let mut cursor = String::new();
+        loop {
+            let reply: ListQuotesReply = ask(
+                asker,
+                topics::LIST_QUOTES,
+                "meridian.v1.ListQuotesRequest",
+                &ListQuotesRequest {
+                    subjects: subject(underlying),
+                    sources: sources.clone(),
+                    at_ns: as_of,
+                    as_of_ns: as_of,
+                    page_size: PAGE,
+                    cursor: cursor.clone(),
+                    series_keys: chain.series_keys.clone(),
+                    all_series: chain.series_keys.is_empty(),
+                    ..Default::default()
+                },
+            )?;
+            learn(&reply.datasets, &mut declarations);
+            for missing in &reply.unanswered {
+                if missing.reason == v1::UnansweredReason::SourceSilent as i32
+                    && !missing.dataset.is_empty()
+                {
+                    silent.insert(missing.dataset.clone());
+                }
+            }
+            for quote in reply.quotes {
+                let Some(meta) = &quote.meta else { continue };
+                let key = key_of(&meta.series_key);
+                if meta.quality == QualityState::Invalid as i32 {
+                    let newer = invalid
+                        .get(&key)
+                        .is_none_or(|(at, _)| meta.valid_from_ns >= *at);
+                    if newer {
+                        invalid.insert(
+                            key,
+                            (meta.valid_from_ns, meta.source.clone().unwrap_or_default()),
+                        );
+                    }
+                    continue;
+                }
+                if live {
+                    // Read at now (as_of is now): its age at this hop (606).
+                    crate::resolve::age_at_analytics(meta, as_of);
+                }
+                let newer = quotes
+                    .get(&key)
+                    .and_then(|q| q.meta.as_ref())
+                    .is_none_or(|held| meta.valid_from_ns >= held.valid_from_ns);
+                if newer {
+                    quotes.insert(key, quote);
+                }
+            }
+            if reply.next_cursor.is_empty() {
+                return Ok(());
+            }
+            cursor = reply.next_cursor;
+        }
+    };
+    if let Err(failed) = read_quotes(sources, &mut quotes, &mut invalid, &mut silent) {
+        quotes_refused = format!("the chain's quotes could not be read: {failed}");
+    }
+    if quotes_refused.is_empty() {
+        let unquoted = series
+            .iter()
+            .filter_map(|listed| listed.meta.as_ref())
+            .any(|meta| !quotes.contains_key(&key_of(&meta.series_key)));
+        for dataset in silent.clone() {
+            if !unquoted {
                 break;
             }
-        };
-        learn(&reply.datasets, &mut declarations);
-        for quote in reply.quotes {
-            let Some(meta) = &quote.meta else { continue };
-            if live {
-                // Read at now (as_of is now): its age at this hop (606).
-                crate::resolve::age_at_analytics(meta, as_of);
-            }
-            let key = key_of(&meta.series_key);
-            let newer = quotes
-                .get(&key)
-                .and_then(|q| q.meta.as_ref())
-                .is_none_or(|held| meta.valid_from_ns >= held.valid_from_ns);
-            if newer {
-                quotes.insert(key, quote);
+            let named = Some(v1::SourceChoice {
+                named: vec![dataset],
+                include_quarantined: true,
+                ..Default::default()
+            });
+            let mut ignored = BTreeSet::new();
+            let mut found = BTreeMap::new();
+            // A quarantine read that fails leaves the series unquoted, as
+            // before: never a refusal of the chain.
+            if read_quotes(&named, &mut found, &mut invalid, &mut ignored).is_ok() {
+                // A valid quote in force there is not the default's to
+                // answer (another dataset stood first): leave it unused.
+                for key in found.keys() {
+                    if let Some((at, _)) = invalid.get(key) {
+                        let valid_at = found[key].meta.as_ref().map_or(0, |m| m.valid_from_ns);
+                        if valid_at >= *at {
+                            invalid.remove(key);
+                        }
+                    }
+                }
             }
         }
-        if reply.next_cursor.is_empty() {
-            break;
-        }
-        cursor = reply.next_cursor;
     }
     // Open interest per series on the latest trading date and the one
     // before, and the underlying's volume, from the lake's statistics.
@@ -539,14 +598,22 @@ pub fn chain(
             .unwrap_or_default();
         let quote = quotes.get(&key);
         let quote_meta = quote.and_then(|q| q.meta.as_ref());
+        // Its quarantined quote's source, where its only quote in force is
+        // invalid: its venue still finds its sessions (W12.2; ruling 619).
+        let quarantined_source = invalid
+            .get(&key)
+            .filter(|_| quote.is_none())
+            .map(|(_, source)| source);
         let venue = quote_meta
             .and_then(|m| m.source.as_ref())
+            .or(quarantined_source)
             .map(|s| s.venue_id.clone())
             .filter(|v| !v.is_empty())
             .or_else(|| meta.source.as_ref().map(|s| s.venue_id.clone()))
             .unwrap_or_default();
         let quote_dataset = quote_meta
             .and_then(|m| m.source.as_ref())
+            .or(quarantined_source)
             .map(|s| s.dataset.clone())
             .unwrap_or_else(|| dataset.clone());
         datasets.insert(quote_dataset.clone());
@@ -598,9 +665,9 @@ pub fn chain(
         let ask_price = quote
             .and_then(|q| q.ask.as_ref())
             .and_then(|m| text_of(m.amount.as_ref()));
-        let quarantined = quote_meta
-            .filter(|m| m.quality == QualityState::Invalid as i32)
-            .map(|_| quote_dataset.clone())
+        // Its only quote in force invalid (W12.2; ruling 619).
+        let quarantined = quarantined_source
+            .map(|s| s.dataset.clone())
             .unwrap_or_default();
         let oi = interest.get(&key);
         let mut dates: Vec<&String> = oi.map(|o| o.keys().collect()).unwrap_or_default();

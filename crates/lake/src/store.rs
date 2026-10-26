@@ -9,7 +9,8 @@ use std::collections::BTreeMap;
 
 use meridian_domain::date::Date;
 use meridian_domain::v1::{
-    DateCheck, DateCheckReason, EntitlementsChangedEvent, ObservationsWantedEvent, SourcePriority,
+    DateCheck, DateCheckReason, EntitlementsChangedEvent, ObservationsWantedEvent, QualityState,
+    SourcePriority,
 };
 
 use crate::row::{DataType, Observation};
@@ -195,6 +196,75 @@ pub fn as_flagged(rows: &mut [Observation], amendments: &[ClosedDayAmendment], a
     }
 }
 
+/// A `signal` plugin's escalation of one row version's quality (contract
+/// v28, W10.12; ruling 423): its own record beside the row (decisions/031),
+/// never a rewrite of it, kept by the row's dataset and sequence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Assessment {
+    pub dataset: String,
+    pub sequence: u64,
+    pub row_key: String,
+    pub version: u64,
+    /// `QualityState`: suspicious or invalid.
+    pub state: i32,
+    /// `QualityReason`s, in the order given.
+    pub reasons: Vec<i32>,
+    /// The assessing instance, as its sidecar stamped it.
+    pub by_instance: String,
+    pub at_ns: i64,
+}
+
+/// A state's place in the escalation: unspecified reads as valid.
+pub fn rank(state: i32) -> i32 {
+    if state == QualityState::Suspicious as i32 || state == QualityState::Invalid as i32 {
+        state
+    } else {
+        QualityState::Valid as i32
+    }
+}
+
+/// Whether a row's effective state is invalid: what a default or
+/// side-by-side read leaves out (W10.6; rulings 421 and 422).
+pub fn invalid(row: &Observation) -> bool {
+    row.meta().quality == QualityState::Invalid as i32
+}
+
+/// Each row's effective quality as known at a recorded time (0 for now):
+/// the highest of the state it was recorded with and every assessment of it
+/// recorded by then, its reasons its own and then each assessment's, once
+/// each (W10.4, W10.12). A row no assessment names reads as recorded.
+pub fn as_assessed(rows: &mut [Observation], assessments: &[Assessment], as_of_ns: i64) {
+    if assessments.is_empty() {
+        return;
+    }
+    let mut of: BTreeMap<(&str, u64), Vec<&Assessment>> = BTreeMap::new();
+    for assessment in assessments {
+        if as_of_ns != 0 && assessment.at_ns > as_of_ns {
+            continue;
+        }
+        of.entry((assessment.dataset.as_str(), assessment.sequence))
+            .or_default()
+            .push(assessment);
+    }
+    for row in rows.iter_mut() {
+        let dataset = row.dataset().to_string();
+        let Some(found) = of.get(&(dataset.as_str(), row.meta().sequence)) else {
+            continue;
+        };
+        let meta = row.meta_mut();
+        for assessment in found {
+            if rank(assessment.state) > rank(meta.quality) {
+                meta.quality = assessment.state;
+            }
+            for reason in &assessment.reasons {
+                if !meta.quality_reasons.contains(reason) {
+                    meta.quality_reasons.push(*reason);
+                }
+            }
+        }
+    }
+}
+
 /// Whether a flag counts as a closed day (a weekend or a holiday) or as
 /// outside coverage, for the Data sources page (W10.9).
 pub fn counted(reason: i16) -> (u64, u64) {
@@ -330,6 +400,20 @@ pub trait Store: Send + Sync {
     /// (contract v28, W10.6, W12.8).
     fn read_dataset_versions(&self, dataset: &str, data_type: DataType)
         -> Result<Vec<Observation>>;
+
+    // ── Quality states (contract v28, W10.12; ruling 423) ──
+
+    /// The kept rows of a dataset recorded under a row key at a version,
+    /// whatever their data type, each at its effective state now: what an
+    /// assessment names. Empty where the lake holds none.
+    fn row_version(&self, dataset: &str, row_key: &str, version: u64) -> Result<Vec<Observation>>;
+
+    /// Journal a batch of assessments whole, each its own record beside its
+    /// row (decisions/031).
+    fn assess(&self, assessments: &[Assessment]) -> Result<()>;
+
+    /// Every assessment journalled, in order.
+    fn assessments(&self) -> Result<Vec<Assessment>>;
 }
 
 /// Whether a query answers every version it finds, not each row key's

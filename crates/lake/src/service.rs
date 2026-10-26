@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use meridian_bus::{Bus, Envelope};
+use meridian_bus::{refusal_with_status, Bus, Envelope, RefusalStatus};
 use meridian_domain::date::Date;
 use meridian_domain::lake;
 use meridian_domain::money::{asset_of, Asset, CashInstruments, ISO4217};
@@ -63,6 +63,9 @@ use meridian_domain::v1::{
     RecordSeriesRequest, RecordStatisticsRequest, StatisticKind, StatisticsRecordedEvent,
     SubjectRole,
 };
+use meridian_domain::v1::{
+    QualityReason, QualityState, RecordQualityAssessmentsReply, RecordQualityAssessmentsRequest,
+};
 use meridian_pb::bounds;
 use prost::Message;
 
@@ -71,7 +74,7 @@ pub use meridian_clock::Clock;
 use crate::config::{DataConfig, Reader};
 use crate::read::{self, Against, Read};
 use crate::row::{DataType, Observation};
-use crate::store::{Store, WantChange, WantChangeKind, When};
+use crate::store::{rank, Assessment, Store, WantChange, WantChangeKind, When};
 
 pub const RECORD_PRICES: &str = "platform.lake.command.record-prices";
 pub const RECORD_BARS: &str = "platform.lake.command.record-bars";
@@ -82,6 +85,8 @@ pub const RECORD_OUTCOMES: &str = "platform.lake.command.record-outcomes";
 pub const RECORD_RATES: &str = "platform.lake.command.record-rates";
 /// Contract v27 (W10.4, W10.5; ruling 418): a dataset's liveness.
 pub const RECORD_LIVENESS: &str = "platform.lake.command.record-liveness";
+/// Contract v28 (W10.12; ruling 423): a signal plugin's escalations.
+pub const RECORD_QUALITY_ASSESSMENTS: &str = "platform.lake.command.record-quality-assessments";
 pub const LIST_RATES: &str = "platform.lake.query.list-rates";
 /// Contract v28, listed options and futures (W10.4, W10.6; ruling 561).
 pub const RECORD_SERIES: &str = "platform.lake.command.record-series";
@@ -772,7 +777,9 @@ impl Lake {
                     .read_dataset_versions(&dataset, DataType::Scenario)
             }
             .map_err(|failed| failed.to_string())?;
-            for row in rows {
+            // A saved scenario whose effective state is invalid is left out,
+            // as every default read leaves one out (W10.6; ruling 421).
+            for row in rows.into_iter().filter(|row| !crate::store::invalid(row)) {
                 let Observation::Scenario(saved) = row else {
                     continue;
                 };
@@ -978,6 +985,24 @@ impl Lake {
                     "{at}.meta.unconverted names {}; at most 16",
                     meta.unconverted.len()
                 ));
+            }
+            // The edge's judgment (contract v28, W10.4): a row not valid
+            // says why, each reason one the dictionary names.
+            if rank(meta.quality) != QualityState::Valid as i32 {
+                for (j, reason) in meta.quality_reasons.iter().enumerate() {
+                    if QualityReason::try_from(*reason).unwrap_or(QualityReason::Unspecified)
+                        == QualityReason::Unspecified
+                    {
+                        return Err(refusal_with_status(
+                            RefusalStatus::InvalidArgument,
+                            &[format!("{at}.meta.quality_reasons[{j}]")],
+                            format!(
+                                "{at}.meta.quality_reasons[{j}] is unspecified on a row whose \
+                                 state is not valid"
+                            ),
+                        ));
+                    }
+                }
             }
             if let Observation::Price(price) = &row {
                 if PriceKind::try_from(price.kind).unwrap_or(PriceKind::Unspecified)
@@ -1340,6 +1365,8 @@ impl Lake {
             )
             .map_err(|failed| failed.to_string())?
             .into_iter()
+            // Left out where invalid, as a default read leaves it (W10.6).
+            .filter(|row| !crate::store::invalid(row))
             .filter_map(|row| match row {
                 Observation::ExecutionCost(cost) => Some(cost),
                 _ => None,
@@ -3022,6 +3049,146 @@ impl Lake {
         Ok(meridian_domain::v1::RecordLivenessReply { kept })
     }
 
+    /// W10.12, contract v28 (rulings 423 and 619): a `signal` plugin's
+    /// escalation of recorded rows' quality, each assessment its own record
+    /// beside the row it names (decisions/031), never a rewrite. States only
+    /// escalate: one lower than the row's effective state -- the highest of
+    /// its own and every assessment of it, those earlier in the batch
+    /// included -- is refused naming its `state`; one naming a row or
+    /// version the lake does not hold, or one the plugin may not read, its
+    /// `row_key`. Recorded whole or refused naming the item and field.
+    pub(crate) fn record_quality_assessments(
+        &self,
+        request: RecordQualityAssessmentsRequest,
+        envelope: &Envelope,
+    ) -> Result<RecordQualityAssessmentsReply, String> {
+        let refused = |field: String, words: String| {
+            refusal_with_status(RefusalStatus::InvalidArgument, &[field], words)
+        };
+        let bound = bounds::RECORD_QUALITY_ASSESSMENTS_REQUEST_ASSESSMENTS_COUNT;
+        if !bound.admits(request.assessments.len()) {
+            return Err(refused(
+                "assessments".into(),
+                format!(
+                    "assessments holds {} items; a batch is {} to {}",
+                    request.assessments.len(),
+                    bound.least,
+                    bound.most
+                ),
+            ));
+        }
+        let reader = reader_of(envelope);
+        let config = self.config();
+        let instance = publisher(envelope);
+        let now = self.clock.now_ns();
+        let mut journal: Vec<Assessment> = Vec::new();
+        // Each row's state as the batch has raised it so far.
+        let mut raised: BTreeMap<(String, u64), i32> = BTreeMap::new();
+        for (i, assessment) in request.assessments.iter().enumerate() {
+            let at = format!("assessments[{i}]");
+            if assessment.dataset.is_empty() {
+                return Err(refused(
+                    format!("{at}.dataset"),
+                    format!("{at}.dataset names the dataset of the row assessed"),
+                ));
+            }
+            if assessment.row_key.is_empty() {
+                return Err(refused(
+                    format!("{at}.row_key"),
+                    format!("{at}.row_key names the row assessed"),
+                ));
+            }
+            if assessment.version == 0 {
+                return Err(refused(
+                    format!("{at}.version"),
+                    format!("{at}.version names the row key's version assessed, never 0"),
+                ));
+            }
+            if assessment.state != QualityState::Suspicious as i32
+                && assessment.state != QualityState::Invalid as i32
+            {
+                return Err(refused(
+                    format!("{at}.state"),
+                    format!("{at}.state is suspicious or invalid"),
+                ));
+            }
+            if assessment.reasons.is_empty() {
+                return Err(refused(
+                    format!("{at}.reasons"),
+                    format!("{at}.reasons says why, never empty"),
+                ));
+            }
+            for (j, reason) in assessment.reasons.iter().enumerate() {
+                if QualityReason::try_from(*reason).unwrap_or(QualityReason::Unspecified)
+                    == QualityReason::Unspecified
+                {
+                    return Err(refused(
+                        format!("{at}.reasons[{j}]"),
+                        format!("{at}.reasons[{j}] is unspecified"),
+                    ));
+                }
+            }
+            let rows: Vec<Observation> = self
+                .store
+                .row_version(&assessment.dataset, &assessment.row_key, assessment.version)
+                .map_err(|failed| failed.to_string())?
+                .into_iter()
+                .filter(|row| {
+                    config
+                        .readable(&reader, row.data_type())
+                        .contains(&assessment.dataset)
+                })
+                .collect();
+            if rows.is_empty() {
+                return Err(refused(
+                    format!("{at}.row_key"),
+                    format!(
+                        "{at}.row_key: {} holds no row {:?} at version {} that this plugin may read",
+                        assessment.dataset, assessment.row_key, assessment.version
+                    ),
+                ));
+            }
+            for row in rows {
+                let key = (assessment.dataset.clone(), row.meta().sequence);
+                let effective =
+                    rank(row.meta().quality).max(raised.get(&key).copied().unwrap_or(0));
+                if rank(assessment.state) < effective {
+                    return Err(refused(
+                        format!("{at}.state"),
+                        format!(
+                            "{at}.state is lower than the row's effective state, {}; states only \
+                             escalate",
+                            QualityState::try_from(effective)
+                                .map_or("unknown", |state| state.as_str_name())
+                        ),
+                    ));
+                }
+                raised.insert(key, effective.max(rank(assessment.state)));
+                journal.push(Assessment {
+                    dataset: assessment.dataset.clone(),
+                    sequence: row.meta().sequence,
+                    row_key: assessment.row_key.clone(),
+                    version: assessment.version,
+                    state: assessment.state,
+                    reasons: assessment.reasons.clone(),
+                    // Stamped by the sidecar; the publisher where it is not.
+                    by_instance: if assessment.assessed_by_instance.is_empty() {
+                        instance.clone()
+                    } else {
+                        assessment.assessed_by_instance.clone()
+                    },
+                    at_ns: now,
+                });
+            }
+        }
+        self.store
+            .assess(&journal)
+            .map_err(|failed| failed.to_string())?;
+        Ok(RecordQualityAssessmentsReply {
+            recorded: request.assessments.len() as u32,
+        })
+    }
+
     pub(crate) fn set_priority(
         &self,
         request: SetSourcePriorityRequest,
@@ -3935,6 +4102,18 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
     );
     // Contract v27, the rates slice (W10.6): read as prices are, narrowed
     // by kind and tenor, and optionally as the source had published them.
+    serve_on(
+        &bus,
+        &lake,
+        RECORD_QUALITY_ASSESSMENTS,
+        (
+            "meridian.v1.RecordQualityAssessmentsRequest",
+            "meridian.v1.RecordQualityAssessmentsReply",
+        ),
+        |lake, request: RecordQualityAssessmentsRequest, envelope| {
+            lake.record_quality_assessments(request, envelope)
+        },
+    );
     serve_on(
         &bus,
         &lake,

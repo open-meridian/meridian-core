@@ -7,8 +7,8 @@ use meridian_domain::exact::Exact;
 use meridian_domain::v1::{
     Aggressor, Bar, Compounding, DayCount, ExecutionCost, LiquidityIndicator, Money,
     ObservationMeta, Outcome, OutcomeDetermination, OutcomeStage, Price, PriceBasis, PriceKind,
-    Quote, QuoteCharacteristic, Rate, RateKind, Side, TcaBenchmark, TcaUnanswered, TenorUnit,
-    TimePrecision, Trade, ValueUnit,
+    QualityReason, QualityState, Quote, QuoteCharacteristic, Rate, RateKind, Side, TcaBenchmark,
+    TcaUnanswered, TenorUnit, TimePrecision, Trade, ValueUnit,
 };
 use serde_json::{json, Map, Value};
 
@@ -33,7 +33,7 @@ fn meta(meta: Option<&ObservationMeta>) -> Value {
     let Some(m) = meta else {
         return Value::Null;
     };
-    json!({
+    let mut out = json!({
         "row_key": m.row_key,
         "subjects": m.subjects.iter().map(|s| s.entity_id.clone()).collect::<Vec<_>>(),
         "dataset": m.source.as_ref().map(|s| s.dataset.clone()).unwrap_or_default(),
@@ -42,7 +42,22 @@ fn meta(meta: Option<&ObservationMeta>) -> Value {
         "valid_until_ns": m.valid_until_ns.to_string(),
         "recorded_at_ns": m.recorded_at_ns.to_string(),
         "version": m.version,
-    })
+    });
+    // Contract v28 (W10.4, W10.6; ruling 619): the row's effective state
+    // and its reasons, absent on a row read as valid that names none.
+    let quality = named(m.quality, QualityState::try_from, |e| e.as_str_name());
+    if !quality.is_null() {
+        out["quality"] = quality;
+    }
+    if !m.quality_reasons.is_empty() {
+        out["quality_reasons"] = Value::Array(
+            m.quality_reasons
+                .iter()
+                .map(|r| named(*r, QualityReason::try_from, |e| e.as_str_name()))
+                .collect(),
+        );
+    }
+    out
 }
 
 /// A row's fields, the empty and unset left out.

@@ -23,8 +23,8 @@ use crate::memory::{as_of, number, served_of};
 use crate::migrations;
 use crate::row::Observation;
 use crate::store::{
-    as_flagged, closed_reason, ClosedDayAmendment, Query, Recorded, Removal, Result, Served, Stale,
-    Store, StoreError, WantChange, WantChangeKind, When,
+    as_assessed, as_flagged, closed_reason, Assessment, ClosedDayAmendment, Query, Recorded,
+    Removal, Result, Served, Stale, Store, StoreError, WantChange, WantChangeKind, When,
 };
 
 type Pool = r2d2::Pool<PostgresConnectionManager<NoTls>>;
@@ -144,6 +144,50 @@ fn amendments_of(
         )
         .map_err(unavailable)?;
     rows.iter().map(amendment_of).collect()
+}
+
+/// The assessments of these rows (contract v28, W10.12), in the order
+/// journalled.
+fn assessments_of(
+    client: &mut impl GenericClient,
+    rows: &[Observation],
+) -> Result<Vec<Assessment>> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (datasets, sequences): (Vec<String>, Vec<i64>) = rows
+        .iter()
+        .map(|row| (row.dataset().to_string(), row.meta().sequence as i64))
+        .unzip();
+    let found = client
+        .query(
+            "SELECT a.dataset, a.sequence, a.row_key, a.version, a.state, a.reasons,
+                    a.by_instance, a.at_ns
+               FROM lake_quality_assessment a
+               JOIN (SELECT DISTINCT * FROM unnest($1::text[], $2::bigint[])) AS asked(dataset, sequence)
+                 ON a.dataset = asked.dataset AND a.sequence = asked.sequence
+              ORDER BY a.assessment_id",
+            &[&datasets, &sequences],
+        )
+        .map_err(unavailable)?;
+    Ok(found.iter().map(assessment_of).collect())
+}
+
+fn assessment_of(row: &postgres::Row) -> Assessment {
+    Assessment {
+        dataset: row.get(0),
+        sequence: row.get::<_, i64>(1) as u64,
+        row_key: row.get(2),
+        version: row.get::<_, i64>(3) as u64,
+        state: i32::from(row.get::<_, i16>(4)),
+        reasons: row
+            .get::<_, Vec<i16>>(5)
+            .into_iter()
+            .map(i32::from)
+            .collect(),
+        by_instance: row.get(6),
+        at_ns: row.get(7),
+    }
 }
 
 fn amendment_of(row: &postgres::Row) -> Result<ClosedDayAmendment> {
@@ -328,13 +372,15 @@ impl Store for PostgresStore {
                 out.push(Observation::decode(query.data_type, &body).map_err(unreadable)?);
             }
             let amendments = amendments_of(&mut tx, &query.datasets)?;
-            tx.commit().map_err(unavailable)?;
             let mut out = if crate::store::every_version(query) {
                 crate::store::recorded_by(out, query.as_of_ns)
             } else {
                 as_of(out, query.as_of_ns)
             };
+            let assessments = assessments_of(&mut tx, &out)?;
+            tx.commit().map_err(unavailable)?;
             as_flagged(&mut out, &amendments, query.as_of_ns);
+            as_assessed(&mut out, &assessments, query.as_of_ns);
             return Ok(out);
         }
         let kinds: Vec<i16> = query.kinds.iter().map(|k| *k as i16).collect();
@@ -389,13 +435,15 @@ impl Store for PostgresStore {
             out.push(Observation::decode(query.data_type, &body).map_err(unreadable)?);
         }
         let amendments = amendments_of(&mut tx, &query.datasets)?;
-        tx.commit().map_err(unavailable)?;
         let mut out = if crate::store::every_version(query) {
             crate::store::recorded_by(out, query.as_of_ns)
         } else {
             as_of(out, query.as_of_ns)
         };
+        let assessments = assessments_of(&mut tx, &out)?;
+        tx.commit().map_err(unavailable)?;
         as_flagged(&mut out, &amendments, query.as_of_ns);
+        as_assessed(&mut out, &assessments, query.as_of_ns);
         Ok(out)
     }
 
@@ -731,8 +779,8 @@ impl Store for PostgresStore {
         as_of_ns: i64,
     ) -> Result<Vec<Observation>> {
         let cut_off = if as_of_ns == 0 { i64::MAX } else { as_of_ns };
-        let rows = self
-            .conn()?
+        let mut conn = self.conn()?;
+        let rows = conn
             .query(
                 "SELECT body FROM lake_row
                   WHERE dataset = $1 AND data_type = $2 AND recorded_at_ns <= $3
@@ -745,7 +793,10 @@ impl Store for PostgresStore {
             let body: Vec<u8> = row.get(0);
             out.push(Observation::decode(data_type, &body).map_err(unreadable)?);
         }
-        Ok(as_of(out, as_of_ns))
+        let mut out = as_of(out, as_of_ns);
+        let assessments = assessments_of(&mut *conn, &out)?;
+        as_assessed(&mut out, &assessments, as_of_ns);
+        Ok(out)
     }
 
     fn read_dataset_versions(
@@ -753,8 +804,8 @@ impl Store for PostgresStore {
         dataset: &str,
         data_type: crate::row::DataType,
     ) -> Result<Vec<Observation>> {
-        let rows = self
-            .conn()?
+        let mut conn = self.conn()?;
+        let rows = conn
             .query(
                 "SELECT body FROM lake_row
                   WHERE dataset = $1 AND data_type = $2
@@ -767,6 +818,8 @@ impl Store for PostgresStore {
             let body: Vec<u8> = row.get(0);
             out.push(Observation::decode(data_type, &body).map_err(unreadable)?);
         }
+        let assessments = assessments_of(&mut *conn, &out)?;
+        as_assessed(&mut out, &assessments, 0);
         Ok(out)
     }
 
@@ -863,6 +916,69 @@ impl Store for PostgresStore {
                     (r.get::<_, i64>(1) as u64, r.get::<_, i64>(2) as u64),
                 )
             })
+            .collect())
+    }
+
+    fn row_version(&self, dataset: &str, row_key: &str, version: u64) -> Result<Vec<Observation>> {
+        let mut conn = self.conn()?;
+        let rows = conn
+            .query(
+                "SELECT data_type, body FROM lake_row
+                  WHERE dataset = $1 AND row_key = $2 AND version = $3
+                  ORDER BY sequence",
+                &[&dataset, &row_key, &(version as i64)],
+            )
+            .map_err(unavailable)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let code: i16 = row.get(0);
+            let body: Vec<u8> = row.get(1);
+            let data_type = crate::row::DataType::from_code(code)
+                .ok_or_else(|| StoreError::Unavailable(format!("data type {code} unknown")))?;
+            out.push(Observation::decode(data_type, &body).map_err(unreadable)?);
+        }
+        let assessments = assessments_of(&mut *conn, &out)?;
+        as_assessed(&mut out, &assessments, 0);
+        Ok(out)
+    }
+
+    fn assess(&self, assessments: &[Assessment]) -> Result<()> {
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        for assessment in assessments {
+            let reasons: Vec<i16> = assessment.reasons.iter().map(|r| *r as i16).collect();
+            tx.execute(
+                "INSERT INTO lake_quality_assessment
+                        (dataset, sequence, row_key, version, state, reasons, by_instance, at_ns)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                &[
+                    &assessment.dataset,
+                    &(assessment.sequence as i64),
+                    &assessment.row_key,
+                    &(assessment.version as i64),
+                    &(assessment.state as i16),
+                    &reasons,
+                    &assessment.by_instance,
+                    &assessment.at_ns,
+                ],
+            )
+            .map_err(unavailable)?;
+        }
+        tx.commit().map_err(unavailable)?;
+        Ok(())
+    }
+
+    fn assessments(&self) -> Result<Vec<Assessment>> {
+        Ok(self
+            .conn()?
+            .query(
+                "SELECT dataset, sequence, row_key, version, state, reasons, by_instance, at_ns
+                   FROM lake_quality_assessment ORDER BY assessment_id",
+                &[],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(assessment_of)
             .collect())
     }
 }

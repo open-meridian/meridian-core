@@ -27,6 +27,12 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "closed_day",
         sql: include_str!("../migrations/0002_closed_day.sql"),
     },
+    // Contract v28's quality states (W10.12; ruling 423).
+    Migration {
+        version: 3,
+        name: "quality",
+        sql: include_str!("../migrations/0003_quality.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

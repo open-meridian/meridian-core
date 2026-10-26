@@ -64,6 +64,18 @@ harness's admin, Ben, who holds read on `book`.
    `coin:rates`, reads the curve for the date (one row per tenor), the
    20-year point as source silent, the fixing at version 2, and the
    fixing as published before the revision at version 1.
+15. Contract v28's quality states (W10.4, W10.6, W10.12; rulings 421 to 424
+   and 619): `coin` records four BTC quotes through the SDK's edge checks --
+   valid, a duplicate, one after a sequence gap, and a crossed one -- each
+   with its state; `desk` hears the crossed quote flagged invalid, reads the
+   latest in force as the last row not invalid (suspicious, flagged), the
+   crossed one only by naming coin:live with include_quarantined, and is
+   refused include_quarantined on a default read naming it. `lens`, a signal
+   plugin, escalates the first day's close to invalid, its own record: a
+   default read by `book` leaves it out, the dataset source silent, and a
+   read naming coin:daily with include_quarantined answers it with its state
+   and reasons; a lower assessment and a version not held are refused naming
+   the field.
 
 `make e2e-recorded` runs the same with STAND_IN_EXCHANGES naming RECORDED, a
 developer's recorded exchanges (plans/the-lake-prices-the-book, Q11).
@@ -183,11 +195,12 @@ def run():
     started = time.time()
     compose("--profile", "runner", "down", "-v", "--remove-orphans", check=False)
     compose("up", "-d")
-    for instance in ("coin", "book", "other", "desk"):
+    for instance in ("coin", "book", "other", "desk", "lens"):
         runner("ready", "--instance", instance)
     runner("grant", "--instance", "book", "--level", "read")
     runner("grant", "--instance", "other", "--level", "read")
     runner("grant", "--instance", "desk", "--level", "read")
+    runner("grant", "--instance", "lens", "--level", "read")
     runner("grant", "--instance", "book", "--level", "read", "--to", "ben")
     runner("mcp", "connect", "--covers", "deployment_admin")
     listed = runner("mcp", "list").split()
@@ -540,6 +553,59 @@ def run():
     must(len(published) == 1 and published[0]["value"] == "4.31" and published[0]["version"] == 1,
          f"step 14, the fixing as published before the revision: {published}")
 
+    # 15. Contract v28's quality states.
+    judged = page("coin", "admin", "/quality")
+    must(judged["recorded"] == 4 and judged["states"] == {
+        "BTC-USD-Q-21": ["valid", []],
+        "BTC-USD-Q-22": ["suspicious", ["duplicate"]],
+        "BTC-USD-Q-23": ["suspicious", ["sequence_gap"]],
+        "BTC-USD-Q-24": ["invalid", ["crossed_quote"]]},
+        f"step 15, a duplicate, a gap and a crossed quote judged at the edge: {judged}")
+    # Recorded events carry an invalid row with its state (619 (3)).
+    heard = until(60, lambda: [q for q in page("desk", "read", "/heard")["quotes"]
+                               if q["row_key"] == "BTC-USD-Q-24"],
+                  "step 15, desk did not hear the crossed quote")
+    must(heard[0]["quality"] == "QUALITY_STATE_INVALID"
+         and heard[0]["quality_reasons"] == ["QUALITY_REASON_CROSSED_QUOTE"],
+         f"step 15, the crossed quote heard flagged invalid: {heard}")
+    # A default read leaves it out before the latest is chosen (619 (4)):
+    # the gap's quote stands, served flagged (422).
+    quotes = page("desk", "read", f"/quotes?subject={btc}")["quotes"]
+    dollar = [q for q in quotes if q["row_key"].startswith("BTC-USD-")]
+    must(len(dollar) == 1 and dollar[0]["row_key"] == "BTC-USD-Q-23"
+         and dollar[0]["quality"] == "QUALITY_STATE_SUSPICIOUS"
+         and dollar[0]["quality_reasons"] == ["QUALITY_REASON_SEQUENCE_GAP"],
+         f"step 15, the latest not invalid, flagged: {quotes}")
+    named = page("desk", "read", f"/quotes?subject={btc}&dataset=coin:live&quarantined=1")["quotes"]
+    crossed = [q for q in named if q["row_key"] == "BTC-USD-Q-24"]
+    must(crossed and crossed[0]["quality"] == "QUALITY_STATE_INVALID",
+         f"step 15, the crossed quote read by name with include_quarantined: {named}")
+    refused = page("desk", "read", f"/quotes?subject={btc}&quarantined=1")
+    must("sources.include_quarantined" in refused.get("refused", ""),
+         f"step 15, include_quarantined on a default read refused naming it: {refused}")
+    # A signal's escalation, its own record (W10.12).
+    runner("entitle", "--instance", "lens", "coin:daily", "note=The lens judges the closes.")
+    escalated = until(60, lambda: (lambda said: said if said.get("recorded") == 1 else None)(
+        page("lens", "read", f"/assess?subject={btc}&date={DAY_1}&state=invalid")),
+        "step 15, lens did not record its assessment")
+    left_out = page("book", "read", f"/prices?subject={btc}&date={DAY_1}&kind=close")
+    must(not left_out["prices"] and any(u["reason"] == "UNANSWERED_REASON_SOURCE_SILENT"
+                                        and u["dataset"] == "coin:daily"
+                                        for u in left_out["unanswered"]),
+         f"step 15, a default read leaves the escalated close out, source silent: {left_out}")
+    kept = page("book", "read", f"/prices?subject={btc}&date={DAY_1}&kind=close"
+                "&dataset=coin:daily&quarantined=1")["prices"]
+    must(len(kept) == 1 and kept[0]["quality"] == "QUALITY_STATE_INVALID"
+         and kept[0]["quality_reasons"] == ["QUALITY_REASON_PRICE_OUTLIER"]
+         and kept[0]["version"] == escalated["version"],
+         f"step 15, read by name with include_quarantined, its state and reasons: {kept}")
+    lower = page("lens", "read", f"/assess?subject={btc}&date={DAY_1}&state=suspicious")
+    must("assessments[0].state" in lower.get("refused", ""),
+         f"step 15, a lower assessment refused naming its state: {lower}")
+    missing = page("lens", "read", f"/assess?subject={btc}&date={DAY_1}&state=invalid&version=9")
+    must("assessments[0].row_key" in missing.get("refused", ""),
+         f"step 15, a version not held refused naming the row key: {missing}")
+
     # 11. The store.
     lines = compose("run", "--rm", "-T", "store", "lake").stdout.split("\n")
     log("store lake:\n" + "\n".join(lines))
@@ -587,7 +653,10 @@ def run():
           "of its data plugin, recorded against the want and read through the INS- record it "
           "became; a fixing and a curve recorded against referential records, read "
           "as a curve, a tenor not published as source silent, and the fixing as published "
-          "before its revision; and `store lake` printing each version numbered with no "
+          "before its revision; a duplicate, a gap and a crossed quote judged at the edge, the "
+          "crossed one heard flagged, left out of a default read and read by name with "
+          "include_quarantined, a signal's escalation of a close leaving it out of a default "
+          "read and a lower one refused; and `store lake` printing each version numbered with no "
           "holes, the want and the priority's changes")
 
 
