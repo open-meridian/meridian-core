@@ -179,7 +179,19 @@ const MOST_PAGES: usize = 1000;
 /// page of 200 reached 1,445,337 bytes and was never sent), so a reader
 /// of the whole copy follows the cursor to the last.
 pub async fn every_listing(app: &App, subject: &str) -> Result<Vec<PluginListing>, String> {
-    let mut every = Vec::new();
+    every_page(app, subject, ListRegistryPluginsRequest::default())
+        .await
+        .map(|reply| reply.listings)
+}
+
+/// Every page `request` reads, as one answer: its listings in order and the
+/// catalogue's age.
+pub async fn every_page(
+    app: &App,
+    subject: &str,
+    request: ListRegistryPluginsRequest,
+) -> Result<ListRegistryPluginsReply, String> {
+    let mut every = ListRegistryPluginsReply::default();
     let mut cursor = String::new();
     for _ in 0..MOST_PAGES {
         let page = listings(
@@ -188,11 +200,12 @@ pub async fn every_listing(app: &App, subject: &str) -> Result<Vec<PluginListing
             ListRegistryPluginsRequest {
                 page_size: 200,
                 cursor: cursor.clone(),
-                ..Default::default()
+                ..request.clone()
             },
         )
         .await?;
-        every.extend(page.listings);
+        every.listings.extend(page.listings);
+        every.catalogue_pulled_at_ns = page.catalogue_pulled_at_ns;
         if page.next_cursor.is_empty() || page.next_cursor == cursor {
             break;
         }
@@ -477,14 +490,15 @@ async fn browse(app: &App, session: &Session, asked: &HashMap<String, String>) -
 
 async fn browse_plugins(app: &App, session: &Session, asked: &HashMap<String, String>) -> String {
     let field = |name: &str| asked.get(name).cloned().unwrap_or_default();
-    let reply = match listings(
+    // Every page, for the page's own pager: a page of the conductor's ends
+    // at its byte budget.
+    let reply = match every_page(
         app,
         &session.subject,
         ListRegistryPluginsRequest {
             search: field("search"),
             registry: field("registry"),
             role: field("role"),
-            page_size: 200,
             ..Default::default()
         },
     )
