@@ -994,6 +994,7 @@ fn serving_launched(h: &Harness) {
                     launch(INSTANCE, meridian_domain::v1::PluginLaunchState::Launched),
                     launch("stopped-1", meridian_domain::v1::PluginLaunchState::Stopped),
                 ],
+                next_cursor: String::new(),
             }
             .encode_to_vec(),
         ))
@@ -1065,6 +1066,7 @@ async fn an_admins_home_with_many_plugins_sorts_them_by_name_and_offers_a_search
             meridian_domain::v1::PluginCatalogue {
                 versions: vec![],
                 launches,
+                next_cursor: String::new(),
             }
             .encode_to_vec(),
         ))
@@ -2739,6 +2741,7 @@ async fn a_deployment_admin_reads_a_versions_documentation_before_launching_it()
         Ok((
             "meridian.v1.PluginCatalogue".into(),
             meridian_domain::v1::PluginCatalogue {
+                next_cursor: String::new(),
                 versions: vec![meridian_domain::v1::PluginVersion {
                     metadata: Some(meridian_domain::v1::PluginMetadata {
                         name: "snaptrade".into(),
@@ -2941,6 +2944,7 @@ fn serving_registries(h: &Harness) -> Asked {
         crate::catalogue::PLUGIN_CATALOGUE,
         "meridian.v1.PluginCatalogue",
         meridian_domain::v1::PluginCatalogue {
+            next_cursor: String::new(),
             versions: vec![meridian_domain::v1::PluginVersion {
                 metadata: Some(meridian_domain::v1::PluginMetadata {
                     name: "open-meridian/snaptrade".into(),

@@ -17625,15 +17625,47 @@ pub struct PluginVersion {
     #[prost(string, tag = "11")]
     pub uploaded_note: ::prost::alloc::string::String,
 }
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
-pub struct PluginCatalogueRequest {}
-/// Every version uploaded and every launch, live or stopped.
+/// Contract v28's amendment (ruling 696, 2026-10-26): the catalogue answered
+/// in pages, so its answer never outgrows what the broker carries -- on dev
+/// it reached 1,050,251 bytes past the broker's 1 MiB and every read of it
+/// timed out. A request naming nothing is answered as before, up to the
+/// page's budget.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PluginCatalogueRequest {
+    /// How many records -- versions and launches together -- a page holds at
+    /// most; 0 for as many as the page's budget takes, and past 500 answered
+    /// at 500. Whatever it says, the
+    /// conductor ends a page at about 512 KiB, and says so with next_cursor.
+    #[prost(int32, tag = "1")]
+    pub page_size: i32,
+    /// next_cursor from the page before; empty for the first page.
+    #[prost(string, tag = "2")]
+    pub cursor: ::prost::alloc::string::String,
+    /// One plugin's versions and launches alone; empty for every plugin's.
+    #[prost(string, tag = "3")]
+    pub name: ::prost::alloc::string::String,
+    /// One version of `name` alone, with the launches of it; empty for every
+    /// version. Refused without a name.
+    #[prost(string, tag = "4")]
+    pub version: ::prost::alloc::string::String,
+    /// The launches alone, no version: what the lake, the instrument store and
+    /// the dashboard's home page read, none of them needing a declaration.
+    #[prost(bool, tag = "5")]
+    pub launches_only: bool,
+}
+/// Every version uploaded and every launch, live or stopped: the versions
+/// first, by name and version, then the launches in the order they were
+/// made, one page of them.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PluginCatalogue {
     #[prost(message, repeated, tag = "1")]
     pub versions: ::prost::alloc::vec::Vec<PluginVersion>,
     #[prost(message, repeated, tag = "2")]
     pub launches: ::prost::alloc::vec::Vec<PluginLaunch>,
+    /// Where the next page starts, for the request's cursor; empty on the last
+    /// page (contract v28, ruling 696).
+    #[prost(string, tag = "3")]
+    pub next_cursor: ::prost::alloc::string::String,
 }
 /// A deployment admin launches a version. The roles are the ones they were
 /// shown and approved, and the launch is refused unless they are exactly the

@@ -228,10 +228,10 @@ pub static SPECS: &[Spec] = &[
     spec(
         "read_plugin_catalogue",
         "Read the plugin catalogue",
-        "what `meridian plugin list` reads: every version uploaded, with its roles and what it declares, and every launch, live or ended, with who launched and stopped it, when, the delegation and client they acted through, and the note given with the launch and with the stop.",
+        "what `meridian plugin list` reads: every version uploaded, with its roles and what it declares, and every launch, live or ended, with who launched and stopped it, when, the delegation and client they acted through, and the note given with the launch and with the stop. A page at a time (next_cursor): the versions by name, then the launches as they were made; one plugin's alone by name, one version of it by name and version, or the launches alone (launches_only).",
         true,
         Gate::DeploymentAdmin,
-        nothing_schema,
+        catalogue_schema,
     ),
     spec(
         "launch_plugin",
@@ -433,6 +433,22 @@ fn dictionary_schema() -> Value {
         "type": "object",
         "properties": {"name": {"type": "string", "description": "meridian.v1.Message.field"}},
         "required": ["name"],
+        "additionalProperties": false,
+    })
+}
+
+/// read_plugin_catalogue's (contract v28's amendment, ruling 696): the
+/// request's own fields.
+fn catalogue_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "description": "one plugin's versions and launches alone"},
+            "version": {"type": "string", "description": "one version of the plugin named, with its launches"},
+            "launches_only": {"type": "boolean", "description": "the launches alone, no version"},
+            "page_size": {"type": "integer", "minimum": 1, "maximum": 500},
+            "cursor": {"type": "string", "description": "next_cursor from the page before"},
+        },
         "additionalProperties": false,
     })
 }
@@ -2386,16 +2402,41 @@ impl Context<'_> {
 
     async fn read_plugin_catalogue(&self, arguments: &Value) -> (Value, String) {
         let mut problems = Problems::default();
-        top(arguments, &[], &mut problems);
+        let Some(top) = top(
+            arguments,
+            &["name", "version", "launches_only", "page_size", "cursor"],
+            &mut problems,
+        ) else {
+            return (problems.refusal(), DEPLOYMENT_ADMIN.into());
+        };
+        let name = text(top, "name", "", false, &mut problems);
+        let version = text(top, "version", "", false, &mut problems);
+        let launches_only = boolean(top, "launches_only", &mut problems);
+        let page_size = integer(top, "page_size", "", false, &mut problems);
+        let cursor = text(top, "cursor", "", false, &mut problems);
+        if !(0..=500).contains(&page_size) {
+            problems.add("page_size", "from 1 to 500");
+        }
+        if !version.is_empty() && name.is_empty() {
+            problems.add("version", "a version is read with its plugin's name");
+        }
         if !problems.is_empty() {
             return (problems.refusal(), DEPLOYMENT_ADMIN.into());
         }
+        // One page, as the conductor cuts it (contract v28's amendment,
+        // ruling 696): never more than about 512 KiB.
         let answered: Result<PluginCatalogue, _> = ask(
             self.app,
             self.caller,
             crate::catalogue::PLUGIN_CATALOGUE,
             "meridian.v1.PluginCatalogueRequest",
-            PluginCatalogueRequest {},
+            PluginCatalogueRequest {
+                page_size: page_size as i32,
+                cursor,
+                name,
+                version,
+                launches_only,
+            },
             WAIT,
         )
         .await;
@@ -2407,6 +2448,7 @@ impl Context<'_> {
                     json!({"outcome": "unchanged", "data": {
                         "versions": held.versions.iter().map(version_json).collect::<Vec<_>>(),
                         "launches": held.launches.iter().map(launch_json).collect::<Vec<_>>(),
+                        "next_cursor": held.next_cursor,
                     }}),
                     DEPLOYMENT_ADMIN.into(),
                 )

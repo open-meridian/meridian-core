@@ -139,7 +139,7 @@ async fn catalogue(bus: &Bus) -> PluginCatalogue {
         bus,
         PLUGIN_CATALOGUE,
         "meridian.v1.PluginCatalogueRequest",
-        PluginCatalogueRequest {},
+        PluginCatalogueRequest::default(),
     )
     .await
     .unwrap()

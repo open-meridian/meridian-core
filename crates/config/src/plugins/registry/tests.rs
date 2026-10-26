@@ -162,7 +162,7 @@ pub(crate) async fn catalogue(h: &Harness) -> PluginCatalogue {
         h,
         PLUGIN_CATALOGUE,
         "meridian.v1.PluginCatalogueRequest",
-        PluginCatalogueRequest {},
+        PluginCatalogueRequest::default(),
     )
     .await
     .unwrap()

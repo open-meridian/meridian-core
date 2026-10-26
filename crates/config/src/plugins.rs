@@ -105,6 +105,7 @@ struct Plugins {
     packs: packs::Jobs,
 }
 
+mod catalogue;
 pub mod packs;
 mod registry;
 pub use registry::{
@@ -1390,12 +1391,13 @@ pub fn serve_plugins_and_registries(
             "meridian.v1.PluginCatalogueRequest",
             "meridian.v1.PluginCatalogue",
         ),
-        |plugins, _: PluginCatalogueRequest, _| -> Result<PluginCatalogue, String> {
+        |plugins, request: PluginCatalogueRequest, _| -> Result<PluginCatalogue, String> {
             // A retired version is no longer listed (W8.15, contract v25);
             // its record is kept.
             let mut catalogue = plugins.snapshot()?.catalogue;
             catalogue.versions.retain(|held| held.retired_at_ns == 0);
-            Ok(catalogue)
+            // One page of it (contract v28's amendment, ruling 696).
+            catalogue::page(catalogue, &request)
         },
     );
     answer_on(

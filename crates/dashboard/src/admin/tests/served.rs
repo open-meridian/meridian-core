@@ -1758,6 +1758,7 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
         Ok((
             "meridian.v1.PluginCatalogue".into(),
             meridian_domain::v1::PluginCatalogue {
+                next_cursor: String::new(),
                 versions: (0..14)
                     .map(|n| version(&format!("0.{n}.0")))
                     .chain(registry_versions())

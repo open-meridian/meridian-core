@@ -466,7 +466,13 @@ pub(crate) async fn catalogue(app: &App) -> Result<PluginCatalogue, String> {
 /// them all. None, said in the log, when the catalogue cannot be read in
 /// time, since a page that waits on the conductor is a page that hangs.
 pub(crate) async fn launches(app: &App) -> Vec<PluginLaunch> {
-    match catalogue_within(app, Duration::from_secs(3)).await {
+    // The launches alone (contract v28's amendment, ruling 696): no page
+    // here needs a version's declaration.
+    let asked = PluginCatalogueRequest {
+        launches_only: true,
+        ..Default::default()
+    };
+    match pages_within(app, asked, Duration::from_secs(3)).await {
         Ok(held) => held
             .launches
             .into_iter()
@@ -480,21 +486,50 @@ pub(crate) async fn launches(app: &App) -> Vec<PluginLaunch> {
 }
 
 async fn catalogue_within(app: &App, within: Duration) -> Result<PluginCatalogue, String> {
-    let (_, bytes) = app
-        .bus
-        .call(
-            PLUGIN_CATALOGUE,
-            "meridian.v1.PluginCatalogueRequest",
-            PluginCatalogueRequest {}.encode_to_vec(),
-            None,
-            Some(within),
-        )
-        .await
-        .map_err(|failed| failed.to_string())?;
-    let mut held = PluginCatalogue::decode(&bytes[..]).map_err(|failed| failed.to_string())?;
+    let mut held = pages_within(app, PluginCatalogueRequest::default(), within).await?;
     sort_versions(&mut held);
     Ok(held)
 }
+
+/// Every page of the catalogue `asked` names, read in turn and held as one
+/// (contract v28's amendment, ruling 696): the conductor answers at most
+/// about 512 KiB at a time, so its answer always crosses the broker; each
+/// page waits `within`.
+pub(crate) async fn pages_within(
+    app: &App,
+    mut asked: PluginCatalogueRequest,
+    within: Duration,
+) -> Result<PluginCatalogue, String> {
+    let mut held = PluginCatalogue::default();
+    for _ in 0..MOST_PAGES {
+        let (_, bytes) = app
+            .bus
+            .call(
+                PLUGIN_CATALOGUE,
+                "meridian.v1.PluginCatalogueRequest",
+                asked.encode_to_vec(),
+                None,
+                Some(within),
+            )
+            .await
+            .map_err(|failed| failed.to_string())?;
+        let page = PluginCatalogue::decode(&bytes[..]).map_err(|failed| failed.to_string())?;
+        held.versions.extend(page.versions);
+        held.launches.extend(page.launches);
+        if page.next_cursor.is_empty() || page.next_cursor == asked.cursor {
+            return Ok(held);
+        }
+        asked.cursor = page.next_cursor;
+    }
+    Err(format!(
+        "the catalogue ran past {MOST_PAGES} pages; read it again"
+    ))
+}
+
+/// More pages than any catalogue holds: 1,000 of about 512 KiB is half a
+/// gigabyte of declarations. A conductor that never ends its pages is
+/// stopped here rather than read forever.
+const MOST_PAGES: usize = 1000;
 
 /// The catalogue's versions as every page, terminal and tool answer lists
 /// them (the product owner, 2026-10-18): by plugin name, then SemVer 2.0

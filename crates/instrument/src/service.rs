@@ -933,6 +933,31 @@ fn announce(bus: &Bus, record: &Instrument, caused_by: &Envelope, now_ns: i64) {
 
 /// The conductor's catalogue, the launch records (W8.2).
 pub const PLUGIN_CATALOGUE: &str = "platform.config.query.plugin-catalogue";
+
+/// Every launch in the catalogue, read a page at a time with
+/// `launches_only` (contract v28's amendment, ruling 696), `ask` putting
+/// each request to the conductor.
+fn launches_in_pages(
+    ask: impl Fn(
+        meridian_domain::v1::PluginCatalogueRequest,
+    ) -> Result<meridian_domain::v1::PluginCatalogue, String>,
+) -> Result<meridian_domain::v1::PluginCatalogue, String> {
+    let mut asked = meridian_domain::v1::PluginCatalogueRequest {
+        launches_only: true,
+        ..Default::default()
+    };
+    let mut held = meridian_domain::v1::PluginCatalogue::default();
+    // More pages than any catalogue's launches fill.
+    for _ in 0..1000 {
+        let page = ask(asked.clone())?;
+        held.launches.extend(page.launches);
+        if page.next_cursor.is_empty() || page.next_cursor == asked.cursor {
+            return Ok(held);
+        }
+        asked.cursor = page.next_cursor;
+    }
+    Err("the catalogue's launches ran past 1000 pages".to_string())
+}
 /// W3.3, asked by the store itself for a currency (contract v20).
 pub const ASK_PLATFORM_FOR_INSTRUMENT: &str =
     "platform.reference.query.ask-platform-for-instrument";
@@ -1063,11 +1088,15 @@ impl Asking {
                 return held.0.get(instance).cloned();
             }
         }
-        let read: Result<meridian_domain::v1::PluginCatalogue, String> = self.ask(
-            PLUGIN_CATALOGUE,
-            "meridian.v1.PluginCatalogueRequest",
-            meridian_domain::v1::PluginCatalogueRequest {},
-        );
+        // The launches alone, page by page (contract v28's amendment,
+        // ruling 696): a resolve needs no version's declaration.
+        let read = launches_in_pages(|asked| {
+            self.ask(
+                PLUGIN_CATALOGUE,
+                "meridian.v1.PluginCatalogueRequest",
+                asked,
+            )
+        });
         let mut held = self.launched.lock().ok()?;
         if let Ok(catalogue) = read {
             held.0 = catalogue
