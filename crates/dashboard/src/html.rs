@@ -163,6 +163,18 @@ border-bottom:1px solid var(--line);font-size:.88rem;flex-wrap:nowrap;overflow-x
 nav.tabs a{flex:none;white-space:nowrap;padding:.35rem .8rem;border-radius:99px;color:var(--ink-soft);font-weight:550}\
 nav.tabs a:hover{text-decoration:none;background:var(--hover)}\
 nav.tabs a.here,nav.tabs a[aria-current]{background:var(--accent-wash);color:var(--accent);font-weight:600}\
+nav.tabs.fitted{overflow:visible;position:relative}\
+nav.tabs details.tabs-more{flex:none;position:relative;margin-left:auto}\
+nav.tabs details.tabs-more>summary{list-style:none;cursor:pointer;white-space:nowrap;padding:.35rem .8rem;\
+border-radius:99px;color:var(--ink-soft);font-weight:550}\
+nav.tabs details.tabs-more>summary::-webkit-details-marker{display:none}\
+nav.tabs details.tabs-more>summary::after{content:\" \\25BE\"}\
+nav.tabs details.tabs-more>summary:hover,nav.tabs details.tabs-more[open]>summary{background:var(--hover)}\
+nav.tabs details.tabs-more>summary:focus-visible{outline:2px solid var(--accent);outline-offset:1px}\
+nav.tabs .tabs-menu{position:absolute;right:0;top:calc(100% + .25rem);z-index:20;display:flex;flex-direction:column;\
+gap:.1rem;min-width:11rem;max-width:min(18rem,calc(100vw - 2rem));max-height:60vh;overflow-y:auto;padding:.35rem;\
+background:var(--card);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow-pop,0 6px 24px rgba(0,0,0,.18))}\
+nav.tabs .tabs-menu a{border-radius:.4rem;white-space:normal}\
 .admin:not(.js) nav.tabs{display:none}\
 section.admin-section{margin:0 0 2.25rem}.admin.js section.admin-section{display:none;margin:0}\
 .admin.js section.admin-section.current{display:block}\
@@ -1128,6 +1140,60 @@ const CHROME_SCRIPT: &str = r#"(function () {
       });
     });
   });
+  // A tab row shows the tabs that fit and puts the rest under "More"
+  // (ruling 729): the current tab always shows, even where it would not
+  // fit in its place, and the menu opens by keyboard as by pointer, Escape
+  // closing it. Every row core draws (nav.tabs) is fitted again as the
+  // window changes and as a row's script moves the current tab.
+  function fitTabs(nav) {
+    var more = nav.querySelector(":scope > details.tabs-more");
+    if (!more) {
+      more = document.createElement("details");
+      more.className = "tabs-more";
+      more.innerHTML = '<summary aria-haspopup="true">More</summary><div class="tabs-menu"></div>';
+      more.addEventListener("keydown", function (event) {
+        if (event.key === "Escape" && more.open) { more.open = false; more.querySelector("summary").focus(); }
+      });
+      Array.prototype.forEach.call(nav.querySelectorAll("a"), function (a, i) { a.dataset.order = i; });
+      nav.classList.add("fitted");
+    }
+    var menu = more.querySelector(".tabs-menu");
+    var links = Array.prototype.slice.call(nav.querySelectorAll("a[data-order]"));
+    links.sort(function (a, b) { return a.dataset.order - b.dataset.order; });
+    links.forEach(function (a) { nav.insertBefore(a, more.parentNode === nav ? more : null); });
+    if (more.parentNode === nav) nav.removeChild(more);
+    if (nav.scrollWidth <= nav.clientWidth + 1) return;
+    nav.appendChild(more);
+    var current = function (a) { return a.classList.contains("here") || a.hasAttribute("aria-current"); };
+    for (var i = links.length - 1; i >= 0 && nav.scrollWidth > nav.clientWidth + 1; i--) {
+      if (current(links[i])) continue;
+      menu.insertBefore(links[i], menu.firstChild);
+    }
+    more.classList.toggle("holds-current", links.some(function (a) { return current(a) && a.parentNode === menu; }));
+  }
+  var rows = Array.prototype.slice.call(document.querySelectorAll("nav.tabs"));
+  function fitAll() { rows.forEach(fitTabs); }
+  if (rows.length) {
+    fitAll();
+    var pending = false;
+    window.addEventListener("resize", function () {
+      if (pending) return;
+      pending = true;
+      window.requestAnimationFrame(function () { pending = false; fitAll(); });
+    });
+    window.addEventListener("hashchange", fitAll);
+    window.addEventListener("load", fitAll);
+    document.addEventListener("click", function (event) {
+      rows.forEach(function (nav) {
+        var more = nav.querySelector(":scope > details.tabs-more");
+        if (more && more.open && !more.contains(event.target)) more.open = false;
+        if (nav.contains(event.target) && event.target.closest("a")) {
+          if (more) more.open = false;
+          window.setTimeout(function () { fitTabs(nav); }, 0);
+        }
+      });
+    });
+  }
 })();"#;
 
 /// Who is signed in, for the header.
@@ -1770,6 +1836,10 @@ mod tests {
     #[test]
     fn the_areas_page_sits_one_space_below_its_tab_row_as_under_every_tab_row() {
         assert!(STYLE.contains(".plugin-area nav.tabs{margin-bottom:var(--space-5)}"));
+        // Ruling 729: a row's tabs that do not fit go under "More".
+        assert!(STYLE.contains("nav.tabs .tabs-menu{position:absolute;"));
+        assert!(CHROME_SCRIPT.contains("<summary aria-haspopup=\"true\">More</summary>"));
+        assert!(CHROME_SCRIPT.contains("if (current(links[i])) continue;"));
         // --space-5 is the kit's 20px, the 1.25rem every other tab row keeps.
         assert!(STYLE.contains("nav.tabs{display:flex;gap:.25rem;margin:1rem 0 1.25rem;"));
         assert!(!STYLE.contains(".plugin-area nav.tabs{margin-bottom:0}"));
@@ -2221,5 +2291,39 @@ mod tests {
         for raw in ["#", "rgb(", "rgba(", "hsl("] {
             assert!(!STYLE.contains(raw), "a raw colour ({raw}) in the style");
         }
+    }
+
+    /// A page with a plugin's twelve tabs, written where
+    /// `MERIDIAN_TABS_OUT` says, for a browser to check the row fits
+    /// (ruling 729): `cargo test -p meridian-dashboard -- --ignored
+    /// a_page_with_a_long_tab_row`.
+    #[test]
+    #[ignore]
+    fn a_page_with_a_long_tab_row() {
+        let Ok(out) = std::env::var("MERIDIAN_TABS_OUT") else {
+            return;
+        };
+        use_kit("kit/".into());
+        let names = [
+            "Summary", "Contracts", "Exclusive groups", "Event groups", "Scores",
+            "Positions", "Ticket", "Chains", "Volatility surface", "Scenario grid",
+            "Order flow", "Settings",
+        ];
+        let links: String = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                format!(
+                    "<a href=\"#t{i}\" data-tab=\"t{i}\"{}>{name}</a>",
+                    if i == 9 { " class=\"here\" aria-current=\"page\"" } else { "" }
+                )
+            })
+            .collect();
+        let body = format!(
+            "<div class=\"plugin-area\"><h1>Options and event contracts</h1>\
+             <nav class=\"tabs view-tabs\" aria-label=\"The plugin's pages\">{links}</nav>\
+             <p>The scenario grid.</p></div>"
+        );
+        std::fs::write(out, page("Options", &body)).unwrap();
     }
 }
