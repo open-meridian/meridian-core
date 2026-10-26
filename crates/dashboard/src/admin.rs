@@ -28,7 +28,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
-use meridian_access::{person_access, Access, AccessLevel, DEPLOYMENT_ADMIN};
+use meridian_access::{person_access, Access, AccessLevel};
 use meridian_bus::BusError;
 use meridian_domain::v1::{
     AccessEntry, AccessGroup, AccessRecords, AccountGroup, ClaimCodePurpose, CloseAccountRequest,
@@ -145,11 +145,12 @@ fn list(fields: &Fields, name: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether a person holds deployment admin: a permission held only by a
+/// directory group nobody signed in with (the wizard's, misspelt) leaves the
+/// claim page open (design/a-misspelt-administrators-group, ruled
+/// 2026-10-10).
 fn has_admin(records: &AccessRecords) -> bool {
-    records
-        .permissions
-        .iter()
-        .any(|p| p.access_group_id == DEPLOYMENT_ADMIN)
+    meridian_access::deployment_admin_held(records)
 }
 
 pub(crate) fn status_page(status: StatusCode, title: &str, sentence: &str) -> Response {

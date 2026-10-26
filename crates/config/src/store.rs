@@ -811,6 +811,21 @@ pub trait Store: Send + Sync {
         at_ns: i64,
     ) -> Result<bool>;
 
+    /// Atomic, as [`Store::install_first_admin`], for a first-admin claim
+    /// code: writes the group and its permissions only while no person holds
+    /// deployment admin ([`meridian_access::deployment_admin_held`]), so a
+    /// permission held only by a directory group nobody signed in with -- a
+    /// misspelt one -- does not stop the claim (design/a-misspelt-
+    /// administrators-group, ruled 2026-10-10). That group is left as it
+    /// is, for the new admin to correct.
+    fn install_claimed_admin(
+        &self,
+        group: &UserGroup,
+        permissions: &[Permission],
+        author: &Author,
+        at_ns: i64,
+    ) -> Result<bool>;
+
     /// Every change recorded for one access group and the permissions to it,
     /// gap and rewrite records included, in the order recorded.
     fn access_changes(&self, access_group_id: &str) -> Result<Vec<AccessChangeRecord>>;

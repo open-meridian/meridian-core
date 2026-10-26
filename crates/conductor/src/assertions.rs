@@ -165,7 +165,10 @@ mod tests {
     use super::*;
 
     const DEPLOYMENT: &str = "DEP-01M26TEST0000000000000001";
-    const AUDIENCE: &str = "https://platform.example/api/v1/reference";
+    // The platform's stable base address, as a deployment signs for it
+    // (spec/hosting-and-distribution, requirement 1), never an edge's path
+    // such as `/api/v1/reference`: design/assertion-audience-has-no-contract.
+    const AUDIENCE: &str = "https://platform.example";
 
     fn parts(note: &str) -> (serde_json::Value, serde_json::Value) {
         let segments: Vec<&str> = note.split('.').collect();

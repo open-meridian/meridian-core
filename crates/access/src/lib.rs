@@ -450,6 +450,37 @@ impl Access {
     }
 }
 
+/// Whether a person holds deployment admin, or has held it, as far as the
+/// records can say: a user group holding a permission to deployment admin
+/// names a login, or names a directory group a person who signed in
+/// presented at their latest sign-in.
+///
+/// A permission held only by a directory group nobody signed in with -- the
+/// wizard's group misspelt, say -- holds for nobody, and a first-admin claim
+/// code is honoured while that is so (design/a-misspelt-administrators-group,
+/// ruled 2026-10-10; the operations-hardening track's H1, ruling 586).
+pub fn deployment_admin_held(records: &AccessRecords) -> bool {
+    records
+        .permissions
+        .iter()
+        .filter(|permission| permission.access_group_id == DEPLOYMENT_ADMIN)
+        .filter_map(|permission| {
+            records
+                .user_groups
+                .iter()
+                .find(|group| group.user_group_id == permission.user_group_id)
+        })
+        .any(|group| {
+            !group.logins.is_empty()
+                || records.people.iter().any(|person| {
+                    person
+                        .directory_groups
+                        .iter()
+                        .any(|presented| group.directory_groups.contains(presented))
+                })
+        })
+}
+
 /// The user groups a person belongs to: one of their logins, or at sign-in in
 /// one of their directory groups.
 pub fn user_groups_of<'a>(

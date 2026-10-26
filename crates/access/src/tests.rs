@@ -724,3 +724,38 @@ fn the_access_table_breaks_the_union_down_by_role_as_positions() {
         .roles
         .is_empty());
 }
+
+#[test]
+fn deployment_admin_held_by_a_misspelt_group_nobody_signed_in_with_holds_for_nobody() {
+    // design/a-misspelt-administrators-group (ruled 2026-10-10): the
+    // wizard's directory group misspelt still writes the permission, and a
+    // first-admin claim stays open while no person holds it.
+    let misspelt = UserGroup {
+        user_group_id: "ug-admins".into(),
+        name: "Deployment admins".into(),
+        directory_groups: vec!["meridain-admins".into()],
+        logins: vec![],
+    };
+    let mut records = AccessRecords {
+        user_groups: vec![misspelt.clone()],
+        permissions: vec![permission("perm-admin", "ug-admins", "", DEPLOYMENT_ADMIN)],
+        ..AccessRecords::default()
+    };
+    records.people = vec![SignInRecord {
+        subject: ADA.into(),
+        display_name: "Ada".into(),
+        directory_groups: vec!["meridian-admins".into()],
+        signed_in_at_ns: 1,
+    }];
+    assert!(!deployment_admin_held(&records), "nobody presented the misspelt name");
+
+    records.people[0].directory_groups.push("meridain-admins".into());
+    assert!(deployment_admin_held(&records), "a person who presented it holds it");
+
+    records.people.clear();
+    records.user_groups[0].logins = vec![ADA.into()];
+    assert!(deployment_admin_held(&records), "a named login holds it");
+
+    records.permissions.clear();
+    assert!(!deployment_admin_held(&records), "no permission, nobody holds it");
+}

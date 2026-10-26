@@ -2788,16 +2788,12 @@ pub fn serve_with(
                     .upstream
                     .honour_claim_code(&request.code, request.purpose);
             }
-            let has_admin = |snapshot: &Snapshot| {
-                snapshot
-                    .records
-                    .permissions
-                    .iter()
-                    .any(|p| p.access_group_id == DEPLOYMENT_ADMIN)
-            };
             // Refused here, before the platform is asked, so a code is not
-            // spent on a deployment that cannot use it.
-            if has_admin(&cx.snapshot()?) {
+            // spent on a deployment that cannot use it. A permission held
+            // only by a directory group nobody signed in with -- the
+            // wizard's, misspelt -- holds for nobody, so the claim goes on
+            // (design/a-misspelt-administrators-group, ruled 2026-10-10).
+            if meridian_access::deployment_admin_held(&cx.snapshot()?.records) {
                 return Ok(refused("this deployment already has a deployment admin"));
             }
 
@@ -2818,7 +2814,7 @@ pub fn serve_with(
             let permissions = administrators(&group.user_group_id, now);
             let installed = cx
                 .store
-                .install_first_admin(&group, &permissions, &author(envelope), now)
+                .install_claimed_admin(&group, &permissions, &author(envelope), now)
                 .map_err(|f| f.to_string())?;
             if !installed {
                 // Another redemption won between the check and now. The code

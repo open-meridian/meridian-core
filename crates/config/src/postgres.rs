@@ -84,6 +84,48 @@ impl PostgresStore {
     fn conn(&self) -> Result<Connection> {
         self.pool.get().map_err(unavailable)
     }
+
+    /// Writes the group and its permissions, each recorded as granted by
+    /// `author`, unless `held` (a query taking deployment admin's ID as `$1`)
+    /// finds a row; the permissions' table locked against another writer
+    /// for the transaction, so two at once cannot both write.
+    fn install_admin_unless(
+        &self,
+        group: &UserGroup,
+        permissions: &[Permission],
+        author: &Author,
+        at_ns: i64,
+        held: &str,
+    ) -> Result<bool> {
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        tx.batch_execute("LOCK TABLE config_permission IN SHARE ROW EXCLUSIVE MODE")
+            .map_err(unavailable)?;
+        let exists = tx
+            .query_opt(held, &[&DEPLOYMENT_ADMIN])
+            .map_err(unavailable)?
+            .is_some();
+        if exists {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO config_user_group (user_group_id, name, directory_groups, logins)
+             VALUES ($1, $2, $3, $4)",
+            &[
+                &group.user_group_id,
+                &group.name,
+                &group.directory_groups,
+                &group.logins,
+            ],
+        )
+        .map_err(unavailable)?;
+        for permission in permissions {
+            insert_permission(&mut tx, permission)?;
+            insert_access_change(&mut tx, &permission_change(permission, true, author, at_ns))?;
+        }
+        tx.commit().map_err(unavailable)?;
+        Ok(true)
+    }
 }
 
 impl Store for PostgresStore {
@@ -803,37 +845,38 @@ impl Store for PostgresStore {
         author: &Author,
         at_ns: i64,
     ) -> Result<bool> {
-        let mut conn = self.conn()?;
-        let mut tx = conn.transaction().map_err(unavailable)?;
-        tx.batch_execute("LOCK TABLE config_permission IN SHARE ROW EXCLUSIVE MODE")
-            .map_err(unavailable)?;
-        let exists = tx
-            .query_opt(
-                "SELECT 1 FROM config_permission WHERE access_group_id = $1 LIMIT 1",
-                &[&DEPLOYMENT_ADMIN],
-            )
-            .map_err(unavailable)?
-            .is_some();
-        if exists {
-            return Ok(false);
-        }
-        tx.execute(
-            "INSERT INTO config_user_group (user_group_id, name, directory_groups, logins)
-             VALUES ($1, $2, $3, $4)",
-            &[
-                &group.user_group_id,
-                &group.name,
-                &group.directory_groups,
-                &group.logins,
-            ],
+        self.install_admin_unless(
+            group,
+            permissions,
+            author,
+            at_ns,
+            "SELECT 1 FROM config_permission WHERE access_group_id = $1 LIMIT 1",
         )
-        .map_err(unavailable)?;
-        for permission in permissions {
-            insert_permission(&mut tx, permission)?;
-            insert_access_change(&mut tx, &permission_change(permission, true, author, at_ns))?;
-        }
-        tx.commit().map_err(unavailable)?;
-        Ok(true)
+    }
+
+    fn install_claimed_admin(
+        &self,
+        group: &UserGroup,
+        permissions: &[Permission],
+        author: &Author,
+        at_ns: i64,
+    ) -> Result<bool> {
+        // `meridian_access::deployment_admin_held`, in SQL: a group holding
+        // deployment admin that names a login, or a directory group a person
+        // presented at their latest sign-in.
+        self.install_admin_unless(
+            group,
+            permissions,
+            author,
+            at_ns,
+            "SELECT 1 FROM config_permission p
+               JOIN config_user_group g ON g.user_group_id = p.user_group_id
+              WHERE p.access_group_id = $1
+                AND (cardinality(g.logins) > 0
+                     OR EXISTS (SELECT 1 FROM config_sign_in s
+                                 WHERE s.directory_groups && g.directory_groups))
+              LIMIT 1",
+        )
     }
 
     fn access_changes(&self, access_group_id: &str) -> Result<Vec<AccessChangeRecord>> {

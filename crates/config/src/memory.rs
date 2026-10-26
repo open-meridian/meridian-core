@@ -5,7 +5,7 @@
 use std::sync::Mutex;
 
 use meridian_domain::v1::{
-    AccessGroup, AccountGroup, AccountRecord, ExternalAccountLink, Hold, LinkableAccounts,
+    AccessGroup, AccessRecords, AccountGroup, AccountRecord, ExternalAccountLink, Hold, LinkableAccounts,
     MoveRecord, Permission, PluginArchive, PluginLaunch, PluginLaunchState, PluginVersion,
     SettingLastChange, SignInRecord, UserGroup,
 };
@@ -82,6 +82,37 @@ pub struct MemoryStore {
 }
 
 impl MemoryStore {
+    /// Writes the group and its permissions, each recorded as granted by
+    /// `author`, unless `held` says the records already have an admin; one
+    /// lock, so two at once cannot both write.
+    fn install_admin_unless(
+        &self,
+        group: &UserGroup,
+        permissions: &[Permission],
+        author: &Author,
+        at_ns: i64,
+        held: impl Fn(&AccessRecords) -> bool,
+    ) -> Result<bool> {
+        let mut state = self.state.lock().expect("store lock poisoned");
+        if held(&state.records) {
+            return Ok(false);
+        }
+        state.records.user_groups.push(group.clone());
+        state
+            .records
+            .permissions
+            .extend(permissions.iter().cloned());
+        self.access_changes
+            .lock()
+            .expect("store lock poisoned")
+            .extend(
+                permissions
+                    .iter()
+                    .map(|permission| permission_change(permission, true, author, at_ns)),
+            );
+        Ok(true)
+    }
+
     /// Starts as a fresh deployment does: deployment admin, All plugins
     /// (admin) and All accounts exist, and nobody holds any of them.
     pub fn new() -> Self {
@@ -427,29 +458,29 @@ impl Store for MemoryStore {
         author: &Author,
         at_ns: i64,
     ) -> Result<bool> {
-        let mut state = self.state.lock().expect("store lock poisoned");
-        if state
-            .records
-            .permissions
-            .iter()
-            .any(|p| p.access_group_id == DEPLOYMENT_ADMIN)
-        {
-            return Ok(false);
-        }
-        state.records.user_groups.push(group.clone());
-        state
-            .records
-            .permissions
-            .extend(permissions.iter().cloned());
-        self.access_changes
-            .lock()
-            .expect("store lock poisoned")
-            .extend(
-                permissions
-                    .iter()
-                    .map(|permission| permission_change(permission, true, author, at_ns)),
-            );
-        Ok(true)
+        let held = |records: &AccessRecords| {
+            records
+                .permissions
+                .iter()
+                .any(|p| p.access_group_id == DEPLOYMENT_ADMIN)
+        };
+        self.install_admin_unless(group, permissions, author, at_ns, held)
+    }
+
+    fn install_claimed_admin(
+        &self,
+        group: &UserGroup,
+        permissions: &[Permission],
+        author: &Author,
+        at_ns: i64,
+    ) -> Result<bool> {
+        self.install_admin_unless(
+            group,
+            permissions,
+            author,
+            at_ns,
+            meridian_access::deployment_admin_held,
+        )
     }
 
     fn access_changes(&self, access_group_id: &str) -> Result<Vec<AccessChangeRecord>> {
