@@ -107,6 +107,19 @@ pub struct Read {
     /// role it must hold on a row, where the read gives one; none for a
     /// subject in any role.
     pub roles: Vec<(String, i32)>,
+    /// Contract v28 (the filings slice, W10.6): what else the read keeps.
+    pub narrowed: Narrowed,
+}
+
+/// What a read of the filings slice keeps besides its subjects, kinds and
+/// dates (contract v28, W10.6), before a page is cut: a reported fact's
+/// concepts, none for every concept; and a holding's reports, by dataset
+/// and row key, `None` for any report -- how ListHoldings narrows holdings by
+/// their report's kind and date.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Narrowed {
+    pub concepts: BTreeSet<String>,
+    pub reports: Option<BTreeSet<(String, String)>>,
 }
 
 /// What a source declined, by dataset, subject and the date or range its
@@ -464,7 +477,22 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
         )
     });
     if let Some((from, to)) = &read.dates {
-        rows.retain(|row| Date::parse(row.date()).is_ok_and(|date| &date >= from && &date <= to));
+        rows.retain(|row| Date::parse(&row.date()).is_ok_and(|date| &date >= from && &date <= to));
+    }
+    // A fact's concepts, a holding's reports (contract v28, W10.6).
+    if !read.narrowed.concepts.is_empty() {
+        rows.retain(|row| match row {
+            Observation::ReportedFact(fact) => read.narrowed.concepts.contains(&fact.concept),
+            _ => true,
+        });
+    }
+    if let Some(reports) = &read.narrowed.reports {
+        rows.retain(|row| match row {
+            Observation::Holding(holding) => {
+                reports.contains(&(row.dataset().to_string(), holding.report_row_key.clone()))
+            }
+            _ => true,
+        });
     }
     // A subject asked in a role (contract v28, W10.6): a row naming it in
     // another is not its; an unspecified role on a row reads as `subject`.
@@ -538,12 +566,14 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
         rows = latest_in_force(rows);
     }
 
-    // By the subject asked about, then kind. A corporate action names its
-    // security and its issuer (contract v28, W10.4), and is the answer to
-    // whichever of them was asked, once.
+    // By the subject asked about, then kind. A row of the filings slice
+    // names its subjects in roles -- a corporate action its security and
+    // its issuer, a holding its holder and what is held, a rating action
+    // the rated and the rater (contract v28, W10.4) -- and is the answer to
+    // whichever of them was asked first, once.
     let mut by_subject: BTreeMap<(String, i32), Vec<Observation>> = BTreeMap::new();
     for row in rows {
-        let subject = if read.data_type == DataType::CorporateAction {
+        let subject = if read.data_type.filings() {
             row.subjects()
                 .iter()
                 .map(|s| alias_of(s))

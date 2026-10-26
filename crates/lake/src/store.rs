@@ -424,13 +424,13 @@ pub trait Store: Send + Sync {
 /// A published-time read of rates (contract v27, W10.6) takes every version
 /// too: which is in force by published time is the read's to choose.
 ///
-/// From contract v28 a declared corporate action is caught up the same way
-/// (the amendment of 2026-10-24: an unconflated row is caught up after a
-/// watermark, as trades and outcomes are).
+/// From contract v28 a declared corporate action and a filing are caught up
+/// the same way (the amendment of 2026-10-24: an unconflated row is caught
+/// up after a watermark, as trades and outcomes are).
 pub fn every_version(query: &Query) -> bool {
     (matches!(
         query.data_type,
-        DataType::Outcome | DataType::CorporateAction
+        DataType::Outcome | DataType::CorporateAction | DataType::Filing
     ) && matches!(query.when, When::After(_)))
         || query.published_as_of_ns != 0
 }

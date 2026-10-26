@@ -115,7 +115,12 @@ fn keep_named(row: &mut Observation, named: &BTreeSet<String>) {
         | Observation::Series(_)
         | Observation::Derived(_)
         | Observation::Scenario(_)
-        | Observation::CorporateAction(_) => {}
+        | Observation::CorporateAction(_)
+        | Observation::Filing(_)
+        | Observation::ReportedFact(_)
+        | Observation::RatingAction(_)
+        | Observation::HoldingsReport(_)
+        | Observation::Holding(_) => {}
     }
 }
 
@@ -438,7 +443,12 @@ impl Lake {
                 | Observation::Series(_)
                 | Observation::Derived(_)
                 | Observation::Scenario(_)
-                | Observation::CorporateAction(_) => {}
+                | Observation::CorporateAction(_)
+                | Observation::Filing(_)
+                | Observation::ReportedFact(_)
+                | Observation::RatingAction(_)
+                | Observation::HoldingsReport(_)
+                | Observation::Holding(_) => {}
             }
         }
         Ok(reply)
