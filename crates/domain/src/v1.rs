@@ -1239,6 +1239,119 @@ pub struct EscalateInstrumentReply {
     #[prost(bool, tag = "6")]
     pub pending_review: bool,
 }
+/// W3.33 (contract v28, ruling 757): the conductor's search for the
+/// instrument picker -- one search answering the master's active records and
+/// the securities OpenFIGI maps the query to that the master does not hold
+/// (rulings 727 and 753). It mints, writes and keeps nothing on the
+/// platform's side, which never records the asker with the query; picking a
+/// candidate the master does not hold is the escalation (W3.4).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct InstrumentCandidatesRequest {
+    /// What the person typed: a ticker, a name, an ISIN, a CUSIP or a FIGI,
+    /// one line of at most 64 characters. An ISIN or a CUSIP passes only as a
+    /// person typed it into the picker, never from a plugin's record or a
+    /// bulk lookup (ruling 761); the platform sends it to OpenFIGI alone and
+    /// keeps nothing of it.
+    #[prost(string, tag = "1")]
+    pub query: ::prost::alloc::string::String,
+    /// An ISO 10383 MIC to search on; empty for none.
+    #[prost(string, tag = "2")]
+    pub mic: ::prost::alloc::string::String,
+    /// An ISO 3166 country code to search in; empty for none. A country
+    /// other than the US without a MIC is answered from the master's records
+    /// alone.
+    #[prost(string, tag = "3")]
+    pub country: ::prost::alloc::string::String,
+    /// How many candidates at most, 1 to 25; 0 asks for the platform's
+    /// default, 10.
+    #[prost(int32, tag = "4")]
+    pub limit: i32,
+    /// The moment the search is for; 0 for now.
+    #[prost(int64, tag = "5")]
+    pub as_of_ns: i64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct InstrumentCandidatesReply {
+    /// The master's own records first, then the candidates it does not hold:
+    /// for a bare ticker, the US listing first.
+    #[prost(message, repeated, tag = "1")]
+    pub candidates: ::prost::alloc::vec::Vec<InstrumentCandidate>,
+    /// Each source the search read, with what came of it: OpenFIGI not read
+    /// (a timeout, its rate reached, switched off) means the records answered
+    /// alone.
+    #[prost(message, repeated, tag = "2")]
+    pub sources: ::prost::alloc::vec::Vec<SourceRead>,
+}
+/// One candidate. A value OpenFIGI describes (its name, ticker, type or
+/// exchange code) is never one of these (ruled 2026-10-02, kept by ruling
+/// 758): the ticker, name and class come from SEC EDGAR, the MIC only where
+/// asked and mapped.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct InstrumentCandidate {
+    /// The master's INS- ID for a record it holds, which the deployment pulls
+    /// (W3.3); empty for a candidate it does not hold.
+    #[prost(string, tag = "1")]
+    pub instrument_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub ticker: ::prost::alloc::string::String,
+    /// The listing's ISO 10383 MIC, where known; a US composite listing
+    /// carries none, its MIC coming from the deployment's data plugins when
+    /// picked (ruling 759).
+    #[prost(string, tag = "3")]
+    pub mic: ::prost::alloc::string::String,
+    /// ISO 3166: the listing's country, where known.
+    #[prost(string, tag = "4")]
+    pub country: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub name: ::prost::alloc::string::String,
+    /// The class a source states (ruling 762): ASSET_CLASS_UNSPECIFIED where
+    /// none does.
+    #[prost(enumeration = "AssetClass", tag = "6")]
+    pub asset_class: i32,
+    /// ISO 4217, where a source confirms it; empty otherwise.
+    #[prost(string, tag = "7")]
+    pub currency: ::prost::alloc::string::String,
+    #[prost(string, tag = "8")]
+    pub composite_figi: ::prost::alloc::string::String,
+    #[prost(string, tag = "9")]
+    pub share_class_figi: ::prost::alloc::string::String,
+    /// What an escalation sends to bring a candidate the master does not hold
+    /// in (W3.4): its FIGI levels as the master holds them, its ticker on a
+    /// MIC where one was mapped, a fund's `sec_series` and `sec_class`. Empty
+    /// for a record the master holds.
+    #[prost(message, repeated, tag = "10")]
+    pub identifiers: ::prost::alloc::vec::Vec<Identifier>,
+}
+/// The dashboard's ask (W3.33, ruling 763), as AskPlatformForInstrument
+/// carries W3.3's: the instrument picker's search, which the conductor sends
+/// the platform as SearchInstrumentCandidates within its bounded ask. Its
+/// request is the InstrumentCandidatesRequest the conductor sends on.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AskPlatformForInstrumentCandidatesReply {
+    /// False when the platform could not be reached; `detail` says why, and
+    /// the picker answers from the deployment's own records.
+    #[prost(bool, tag = "1")]
+    pub reachable: bool,
+    #[prost(string, tag = "2")]
+    pub detail: ::prost::alloc::string::String,
+    /// The platform's answer, when it was reached.
+    #[prost(message, optional, tag = "3")]
+    pub answer: ::core::option::Option<InstrumentCandidatesReply>,
+}
+/// A source a platform answer read: its address, `found`, `not_found` or
+/// `not_read`, when it was read (UTC, to the second), and why where it
+/// was not found or not read.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SourceRead {
+    #[prost(string, tag = "1")]
+    pub source: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub outcome: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub read_at: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub why: ::prost::alloc::string::String,
+}
 /// A record of the deployment's reached a new version (W3.5): minted, joined
 /// by an identifier, completed, merged, or answered by the platform.
 #[derive(Clone, PartialEq, ::prost::Message)]
