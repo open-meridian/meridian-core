@@ -28,11 +28,10 @@ use meridian_domain::exact::Exact;
 use meridian_domain::v1::{
     self as v1, ChainRef, CorporateActionKind, DatasetRef, Identifier, InstrumentType, Job,
     ListCorporateActionsReply, ListCorporateActionsRequest, ListDatasetsReply, ListDatasetsRequest,
-    ListQuotesReply, ListQuotesRequest,
-    ListScenariosReply, ListScenariosRequest, ListSeriesReply, ListSeriesRequest,
-    ListStatisticsReply, ListStatisticsRequest, PriceKind, QualityState, ReadCalendarReply,
-    ReadCalendarRequest, ResolveInstrumentReply, ResolveInstrumentRequest, StatisticKind,
-    SubjectRef,
+    ListQuotesReply, ListQuotesRequest, ListScenariosReply, ListScenariosRequest, ListSeriesReply,
+    ListSeriesRequest, ListStatisticsReply, ListStatisticsRequest, PriceKind, QualityState,
+    ReadCalendarReply, ReadCalendarRequest, ResolveInstrumentReply, ResolveInstrumentRequest,
+    StatisticKind, SubjectRef,
 };
 use meridian_domain::zone::Zone;
 use prost::Message;
