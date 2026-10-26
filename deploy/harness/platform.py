@@ -692,6 +692,8 @@ COMPANY_SOURCE = {
     "0000320193": ("ENT-01JC28APPLEINC000000000001", "Apple Inc.", "HWUPKR0MPOU8FGXBT394",
                    [{"name": "APPLE COMPUTER INC", "valid_until": "2007-01-04"}]),
     "0001067983": ("ENT-01JC28BERKSHIRE00000000001", "Berkshire Hathaway Inc", "", []),
+    # A rating agency, the rater of e2e-lake's rating action (contract v28, FDP Q7).
+    "0001059556": ("ENT-01JC28MOODYS00000000000001", "Moody's Corp", "", []),
 }
 COMPANIES = {}
 

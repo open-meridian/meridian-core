@@ -76,6 +76,17 @@ harness's admin, Ben, who holds read on `book`.
    read naming coin:daily with include_quarantined answers it with its state
    and reasons; a lower assessment and a version not held are refused naming
    the field.
+16. Contract v28's filings slice (W10.4 to W10.6; core release C2): `coin`
+   resolves Apple, Berkshire Hathaway and Moody's by CIK (ResolveCompany,
+   W3.32) and Apple's share by its FIGI, and records on `coin:filings` an
+   8-K with Item 2.02, a quarter's basic EPS and then a later filing's
+   different value, a 13F report and its Apple holding, and Moody's
+   affirmation of Apple's rating. `lens` hears the 8-K, every version;
+   `book`, entitled to `coin:filings`, reads the 8-K by its filer, the EPS
+   restated at version 2 and as first published at version 1, the rating
+   action by the rated and by the agency in its role, and Apple's holders
+   as of the quarter with their report; a subject asked in a role the rows
+   do not give it answers nothing.
 
 `make e2e-recorded` runs the same with STAND_IN_EXCHANGES naming RECORDED, a
 developer's recorded exchanges (plans/the-lake-prices-the-book, Q11).
@@ -606,6 +617,55 @@ def run():
     must("assessments[0].row_key" in missing.get("refused", ""),
          f"step 15, a version not held refused naming the row key: {missing}")
 
+    # 16. Contract v28's filings slice: a filing, a fact restated, a holdings
+    # report and a rating action, read back point in time.
+    runner("entitle", "--instance", "book", "coin:filings", "note=The book reads filings.")
+    runner("entitle", "--instance", "lens", "coin:filings", "note=The lens reads filings.")
+    apple = "ENT-01JC28APPLEINC000000000001"
+    until(60, lambda: page("lens", "read", f"/follow-filings?subject={apple}"),
+          "step 16, lens did not follow Apple's filings")
+    filed = until(90, lambda: (lambda said: said if "recorded" in said else None)(
+        page("coin", "admin", "/filings")), "step 16, coin did not record the filings slice")
+    must(filed["recorded"] == [1, 1, 1, 1, 1] and filed["restated"] == 1
+         and filed["apple"] == apple and filed["moodys"].startswith("ENT-")
+         and filed["share"].startswith("INS-"),
+         f"step 16, a filing, a fact, a report, a holding and a rating action recorded, the "
+         f"fact restated: {filed}")
+    heard = until(60, lambda: page("lens", "read", "/filings-heard")["filings"],
+                  "step 16, lens did not hear the 8-K")
+    must(heard[0]["row_key"] == "0000320193-26-000105" and "2.02" in heard[0]["items"],
+         f"step 16, the 8-K heard with its items: {heard}")
+    by_filer = until(60, lambda: (lambda said: said if said.get("facts") else None)(
+        page("book", "read", f"/filed?subject={apple}&role=SUBJECT_ROLE_FILER")),
+        "step 16, book did not read Apple's facts")
+    must([f["items"] for f in by_filer["filings"]] == [["2.02", "9.01"]]
+         and by_filer["filings"][0]["kind"] == "FILING_KIND_CURRENT_REPORT",
+         f"step 16, the 8-K read by its filer, Item 2.02 dating the report: {by_filer}")
+    must(len(by_filer["facts"]) == 1 and by_filer["facts"][0]["amount"] == "1.86"
+         and by_filer["facts"][0]["version"] == 2,
+         f"step 16, the fact at its restatement: {by_filer}")
+    must(not by_filer["ratings"] and not by_filer["holdings"],
+         f"step 16, nothing else names Apple as its filer: {by_filer}")
+    first = page("book", "read", f"/filed?subject={apple}&role=SUBJECT_ROLE_FILER"
+                 f"&published_as_of={filed['first_published'] + 1}")
+    must(len(first["facts"]) == 1 and first["facts"][0]["amount"] == "1.85"
+         and first["facts"][0]["version"] == 1,
+         f"step 16, the fact as first published: {first}")
+    rated = page("book", "read", f"/filed?subject={apple}&role=SUBJECT_ROLE_SUBJECT")
+    must([(r["rating"], r["action"]) for r in rated["ratings"]]
+         == [("Aaa", "RATING_ACTION_KIND_AFFIRMED")] and not rated["filings"],
+         f"step 16, the rating action read by the rated: {rated}")
+    agency = page("book", "read", f"/filed?subject={filed['moodys']}&role=SUBJECT_ROLE_RATER")
+    must(len(agency["ratings"]) == 1, f"step 16, read by the agency as its rater: {agency}")
+    holders = page("book", "read", f"/filed?subject={filed['share']}&role=SUBJECT_ROLE_HELD")
+    must([h["quantity"] for h in holders["holdings"]] == ["300000000"]
+         and [(r["report_date"], r["complete"]) for r in holders["reports"]]
+         == [("2026-09-30", True)],
+         f"step 16, Apple's holders as of the quarter, with their report once: {holders}")
+    wrong_role = page("book", "read", f"/filed?subject={filed['share']}&role=SUBJECT_ROLE_HOLDER")
+    must(not wrong_role["holdings"],
+         f"step 16, a subject asked in a role the rows do not give it: {wrong_role}")
+
     # 11. The store.
     lines = compose("run", "--rm", "-T", "store", "lake").stdout.split("\n")
     log("store lake:\n" + "\n".join(lines))
@@ -656,7 +716,9 @@ def run():
           "before its revision; a duplicate, a gap and a crossed quote judged at the edge, the "
           "crossed one heard flagged, left out of a default read and read by name with "
           "include_quarantined, a signal's escalation of a close leaving it out of a default "
-          "read and a lower one refused; and `store lake` printing each version numbered with no "
+          "read and a lower one refused; a filing heard and read by its filer, a fact as first "
+          "published and restated, a rating action by the rated and its agency, and a "
+          "security's holders with their report; and `store lake` printing each version numbered with no "
           "holes, the want and the priority's changes")
 
 
