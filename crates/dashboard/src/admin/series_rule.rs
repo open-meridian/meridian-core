@@ -119,17 +119,64 @@ pub fn fields(rule: Option<&SeriesRequestRule>) -> String {
     )
 }
 
-/// The request dialog's fields (W3.31): one series by its OCC symbol, its
-/// underlying, its cause, and why.
+/// The request dialog's fields (W3.31): one series by its key -- a listed
+/// option's OCC symbol, or a future's or a future option's ticker with its
+/// venue's MIC, as `dashboard__request_series_records` takes it (the
+/// dictionary's `Identifier.scheme`: a futures key is a `ticker` with its
+/// venue's MIC in `source`) -- its underlying, its cause, and why.
 pub fn request_fields() -> String {
     "<label>Underlying<input name=\"underlying_instrument_id\" required pattern=\"INS-.+\" \
      placeholder=\"INS-\" autocomplete=\"off\"></label>\
-     <label>OCC symbol<input name=\"occ_osi\" required maxlength=\"21\" \
-     placeholder=\"AAPL  261120C00230000\" autocomplete=\"off\"></label>\
+     <label>Series key<select name=\"scheme\">\
+     <option value=\"occ_osi\">OCC symbol (a listed option)</option>\
+     <option value=\"ticker\">Ticker and venue (a future or a future option)</option>\
+     </select></label>\
+     <label>Symbol<input name=\"symbol\" required maxlength=\"64\" \
+     placeholder=\"AAPL  261120C00230000 or ESZ6\" autocomplete=\"off\"></label>\
+     <label>Venue's MIC, for a ticker<input name=\"source\" maxlength=\"4\" \
+     pattern=\"[A-Z0-9]{4}\" placeholder=\"XCME\" autocomplete=\"off\"></label>\
      <label>For<select name=\"cause\"><option value=\"order\">An order or a proposal</option>\
      <option value=\"standing\">A standing want</option></select></label>\
      <label>Why<textarea name=\"note\" required maxlength=\"2000\" rows=\"2\"></textarea></label>"
         .to_string()
+}
+
+/// The series key the dialog's fields name, as the tool takes it, or what
+/// is wrong with it in words: an OCC symbol alone, or a ticker with its
+/// venue's MIC in `source`.
+pub fn series_key(
+    scheme: &str,
+    symbol: &str,
+    source: &str,
+) -> Result<Vec<meridian_domain::v1::Identifier>, String> {
+    let key = match scheme {
+        "occ_osi" => meridian_domain::v1::Identifier {
+            scheme: "occ_osi".into(),
+            value: symbol.to_string(),
+            ..Default::default()
+        },
+        "ticker" => meridian_domain::v1::Identifier {
+            scheme: "ticker".into(),
+            value: symbol.trim().to_string(),
+            source: source.trim().to_uppercase(),
+            ..Default::default()
+        },
+        _ => return Err("a series key is an OCC symbol, or a ticker with its venue".into()),
+    };
+    if key.value.trim().is_empty() {
+        return Err("say the series' symbol".into());
+    }
+    if key.scheme == "occ_osi" && key.value.chars().count() > 21 {
+        return Err("an OCC symbol is 21 characters at most".into());
+    }
+    if key.scheme == "ticker" && key.source.is_empty() {
+        return Err("a ticker names its venue: its ISO 10383 MIC, such as XCME".into());
+    }
+    let key = vec![key];
+    match meridian_domain::lake::series_key_problem(&key) {
+        Some((_, why)) => Err(why),
+        None => Ok(key),
+    }
 }
 
 /// What a request's answer says, one phrase per series.
@@ -193,6 +240,14 @@ mod tests {
             }],
         });
         assert_eq!(said, "refused by the rule, nothing sent");
-        assert!(request_fields().contains("name=\"occ_osi\""));
+        let form = request_fields();
+        assert!(form.contains("<option value=\"occ_osi\">"), "{form}");
+        assert!(form.contains("<option value=\"ticker\">"), "{form}");
+        assert!(form.contains("name=\"source\""), "{form}");
+        assert_eq!(series_key("occ_osi", "AAPL  261120C00230000", "XCME").unwrap()[0].source, "");
+        let future = series_key("ticker", " ESZ6 ", "xcme").unwrap();
+        assert_eq!((future[0].value.as_str(), future[0].source.as_str()), ("ESZ6", "XCME"));
+        assert!(series_key("ticker", "ESZ6", "").is_err(), "a ticker needs its venue");
+        assert!(series_key("isin", "US0378331005", "").is_err());
     }
 }
