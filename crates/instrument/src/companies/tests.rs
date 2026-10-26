@@ -80,7 +80,9 @@ fn listing_cik() -> MemoryStore {
     let store = MemoryStore::new();
     let mut list: LicenceList = crate::one_id::default_licence();
     list.version = 1;
-    list.schemes.push("cik".into());
+    if !list.schemes.iter().any(|scheme| scheme == "cik") {
+        list.schemes.push("cik".into());
+    }
     store.keep_licence_list(&list, NOW).unwrap();
     store
 }
@@ -186,8 +188,21 @@ fn queued_or_unreachable_is_a_miss_with_nothing_kept_and_the_next_miss_asks_agai
 
 #[test]
 fn only_schemes_on_the_licence_list_are_asked_by() {
-    // No list read: the open schemes alone, an LEI among them, a CIK not.
+    // No list read: the open schemes, the LEI and from C2 the CIK among
+    // them (W3.25), so a company is asked about by its CIK.
+    let unread = MemoryStore::new();
+    let asking = Platform::answering(vec![answered(apple(1), true)]);
+    resolve(&unread, &asking, &by_cik("0000320193"), NOW)
+        .unwrap()
+        .unwrap();
+    assert_eq!(asking.asked()[0].identifiers, vec![id("cik", "0000320193")]);
+
+    // A list read that names no CIK: never sent by it.
     let store = MemoryStore::new();
+    let mut list: LicenceList = crate::one_id::default_licence();
+    list.version = 1;
+    list.schemes.retain(|scheme| scheme != "cik");
+    store.keep_licence_list(&list, NOW).unwrap();
     let platform = Platform::default();
     let refused = resolve(&store, &platform, &by_cik("0000320193"), NOW)
         .unwrap()

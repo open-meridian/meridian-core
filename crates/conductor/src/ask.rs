@@ -860,15 +860,16 @@ mod tests {
             name: String::new(),
             request_key: "k".into(),
         };
-        // No list read: a CIK is not among the open schemes (W3.25), so
-        // there is nothing to ask by.
-        assert!(conductor.company(&asking).await.is_err());
-        assert_eq!(transport.calls(), 0);
+        // A list read that names no CIK: nothing to ask by.
         *licence.write().unwrap() = Some(LicenceList {
             version: 2,
-            schemes: vec!["cik".into(), "lei".into()],
+            schemes: vec!["lei".into()],
             ..Default::default()
         });
+        assert!(conductor.company(&asking).await.is_err());
+        assert_eq!(transport.calls(), 0);
+        // No list read: from C2 the CIK is among the open schemes (W3.25).
+        *licence.write().unwrap() = None;
         let answered = conductor.company(&asking).await.unwrap();
         assert_eq!(
             answered.company.unwrap().company_id,

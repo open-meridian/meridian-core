@@ -36,8 +36,9 @@ use crate::store::{
 pub const LOCAL_SCHEME: &str = "open_meridian_local";
 
 /// The open schemes the contract names, sendable while no licence list has
-/// been read (W3.25).
-pub const OPEN_FAMILIES: [&str; 7] = [
+/// been read (W3.25): from contract 28's core release C2 the SEC's `cik`
+/// too, a company's public identifier (W1.32).
+pub const OPEN_FAMILIES: [&str; 8] = [
     "figi",
     "lei",
     "ticker_and_venue",
@@ -45,6 +46,7 @@ pub const OPEN_FAMILIES: [&str; 7] = [
     "iso4217",
     "sec_series",
     "sec_class",
+    "cik",
 ];
 
 /// The family an administrator's own code is licensed by (ruling 545): wire
