@@ -5,7 +5,7 @@ RUST_VERSION := 1.90
 COMPOSE := docker compose
 DOCKER := DOCKER_BUILDKIT=1 docker
 
-.PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check licence-check-test gate-start \
+.PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check licence-check-test gate-start check-leftovers check-leftovers-end \
         gate-mark-tests stage-checks stage-runtime stage-compile stage-tests stage-settings-page stage-sdk stage-dashboards stage-harness stage-first-run stage-image stage-lint \
         e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external e2e-cluster-backup \
         test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-service-account e2e-lake e2e-recorded e2e-orders e2e-one-id e2e-harness \
@@ -110,7 +110,7 @@ ci-local: gate-start stage-checks stage-runtime stage-compile stage-tests stage-
 	@echo
 	@echo "ci-local: GREEN"
 
-stage-checks:     gate-begin-checks contract-diff ci-mirror-check licence-check-test check-crate-boundaries check-one-clock check-test-targets check-local-storage
+stage-checks:     gate-begin-checks check-leftovers contract-diff ci-mirror-check licence-check-test check-crate-boundaries check-one-clock check-test-targets check-local-storage
 	@$(GATE) end checks
 stage-runtime:    gate-begin-runtime check-nats-permissions check-codegen advisories
 	@$(GATE) end runtime
@@ -145,7 +145,7 @@ stage-first-run:  gate-begin-first-run e2e-first-run e2e-first-run-brought e2e-f
 	@$(GATE) end first-run
 stage-image:      gate-begin-image check-image-version chart-check
 	@$(GATE) end image
-stage-lint:       gate-begin-lint lint
+stage-lint:       gate-begin-lint lint check-leftovers-end
 	@$(GATE) end lint
 
 gate-start:
@@ -210,6 +210,15 @@ check-one-clock:
 check-test-targets:
 	@$(PY) tools/check_test_targets.py --self-test --repo-root .
 	@$(PY) tools/check_test_targets.py --repo-root .
+
+# H1 (ruling 586): no core stack left on the shared `meridian` network
+# before the gate starts, and nothing this checkout's e2e made left after it
+# ends (tools/check_leftovers.py says why; it removes nothing).
+check-leftovers:
+	@$(PY) tools/check_leftovers.py --when start --repo-root .
+
+check-leftovers-end:
+	@$(PY) tools/check_leftovers.py --when end --repo-root .
 
 check-local-storage:
 	@for f in deploy/local/*.yaml; do \
@@ -857,7 +866,9 @@ e2e-dashboard-ldap: network
 		--dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf
 	@: >.e2e-dashboard-ldap.log
 	@$(E2E_LDAP) down -v --remove-orphans >>.e2e-dashboard-ldap.log 2>&1 || true
-	@set -e; \
+	@# H1 (586): a failed step still takes the stack down, so nothing is
+	@# left on the shared network for another checkout's run to reach.
+	@set -e; teardown() { $(E2E_LDAP) down -v --remove-orphans >>.e2e-dashboard-ldap.log 2>&1 || true; }; trap teardown EXIT; \
 	$(E2E_LDAP) build dashboard conductor >>.e2e-dashboard-ldap.log 2>&1; \
 	$(E2E_LDAP) up -d postgres nats ldap fake-platform >>.e2e-dashboard-ldap.log 2>&1; \
 	for i in $$(seq 1 60); do \
@@ -899,7 +910,9 @@ e2e-dashboard-oidc: network
 		--dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf
 	@: >.e2e-dashboard-oidc.log
 	@$(E2E_OIDC) down -v --remove-orphans >>.e2e-dashboard-oidc.log 2>&1 || true
-	@set -e; \
+	@# H1 (586): a failed step still takes the stack down, so nothing is
+	@# left on the shared network for another checkout's run to reach.
+	@set -e; teardown() { $(E2E_OIDC) down -v --remove-orphans >>.e2e-dashboard-oidc.log 2>&1 || true; }; trap teardown EXIT; \
 	$(E2E_OIDC) build dashboard conductor >>.e2e-dashboard-oidc.log 2>&1; \
 	$(E2E_OIDC) up -d postgres nats fake-platform fake-idp >>.e2e-dashboard-oidc.log 2>&1; \
 	$(E2E_OIDC) run --rm -T conductor meridian-conductor migrate >>.e2e-dashboard-oidc.log 2>&1; \
@@ -937,7 +950,9 @@ e2e-dashboard-accounts: network
 		--dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf
 	@: >.e2e-dashboard-accounts.log
 	@$(E2E_ACCOUNTS) down -v --remove-orphans >>.e2e-dashboard-accounts.log 2>&1 || true
-	@set -e; \
+	@# H1 (586): a failed step still takes the stack down, so nothing is
+	@# left on the shared network for another checkout's run to reach.
+	@set -e; teardown() { $(E2E_ACCOUNTS) down -v --remove-orphans >>.e2e-dashboard-accounts.log 2>&1 || true; }; trap teardown EXIT; \
 	$(E2E_ACCOUNTS) build dashboard conductor >>.e2e-dashboard-accounts.log 2>&1; \
 	$(E2E_ACCOUNTS) up -d postgres nats fake-platform e2e-registry >>.e2e-dashboard-accounts.log 2>&1; \
 	$(E2E_ACCOUNTS) run --rm -T conductor meridian-conductor migrate >>.e2e-dashboard-accounts.log 2>&1; \
