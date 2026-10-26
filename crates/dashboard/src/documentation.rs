@@ -901,7 +901,7 @@ pub fn section_href(base: &str, section: &str, part: &str) -> String {
     url
 }
 
-fn urlencode(text: &str) -> String {
+pub(crate) fn urlencode(text: &str) -> String {
     text.bytes()
         .map(|b| {
             if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' {

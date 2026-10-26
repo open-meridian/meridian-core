@@ -4049,6 +4049,18 @@ async fn data_sources_page(
         data_sources::datasets(&app.bus, &session.subject),
         data_sources::priorities(&app.bus, &session.subject),
     );
+    // Contract v28 (W10.13): the Use tab, the month and the counting asked.
+    let month = Some(field(&query, "month")).filter(|m| !m.is_empty());
+    let used = match &listed {
+        Ok(reply) => crate::data_use::read(&app, reply, &records, month).await,
+        Err(why) => Err(format!("the lake did not answer: {why}")),
+    };
+    let used = crate::data_use::pages::tab(
+        &used,
+        field(&query, "by") == "source",
+        &records,
+        &token_input(&session),
+    );
     let body = data_sources::page(
         &listed,
         &priorities,
@@ -4056,6 +4068,7 @@ async fn data_sources_page(
         &token_input(&session),
         field(&query, "done"),
         &crate::latency::reads(app.clock.now_ns()),
+        &used,
     );
     Html(page_with(
         "Data sources",

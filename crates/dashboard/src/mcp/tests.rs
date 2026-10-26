@@ -428,11 +428,14 @@ async fn the_list_is_what_the_person_holds_and_the_delegation_covers() {
             // Contract v27 (W10.11): an account's execution costs, at the
             // read level on it.
             &["dashboard__list_execution_costs"],
+            // Contract v28 (W10.1): a person's own answer to the
+            // professional test.
+            &["dashboard__answer_professional_test"],
             &["ops-1__confirm", "ops-1__read_things"]
         ]
         .concat()
     );
-    let listed = &said["result"]["tools"][TICKET_TOOLS.len() + PREPARED_TOOLS.len() + 7];
+    let listed = &said["result"]["tools"][TICKET_TOOLS.len() + PREPARED_TOOLS.len() + 8];
     assert_eq!(listed["annotations"]["readOnlyHint"], true);
     assert!(listed["description"]
         .as_str()
@@ -461,6 +464,8 @@ async fn the_list_is_what_the_person_holds_and_the_delegation_covers() {
             PREPARED_TOOLS.as_slice(),
             &["dashboard__list_service_accounts"],
             &["dashboard__list_execution_costs"],
+            // A person's own act, as filing a ticket is (contract v28).
+            &["dashboard__answer_professional_test"],
             &["ops-1__read_things"]
         ]
         .concat()
@@ -514,7 +519,8 @@ async fn a_deployment_admins_delegation_lists_cores_tools_first_when_it_covers_t
             ],
             PREPARED_TOOLS.as_slice(),
             &["dashboard__list_service_accounts"],
-            &["dashboard__list_execution_costs"]
+            &["dashboard__list_execution_costs"],
+            &["dashboard__answer_professional_test"]
         ]
         .concat(),
         "the Instruments tools are the deployment admin's alone; a writer lists the plugins"

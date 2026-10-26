@@ -61,6 +61,7 @@ use crate::web::App;
 pub mod book;
 pub mod bounds;
 pub mod data_sources;
+pub mod data_use;
 pub mod dictionary;
 pub mod instruments;
 pub mod lake_rows;
@@ -447,6 +448,13 @@ pub enum Area {
     /// W10.11): any level on any plugin, or the deployment admin's
     /// capabilities, each call held to the account named.
     AccountReads,
+    /// The data-use counts and their export (contract v28, W10.13): the
+    /// deployment admin's capabilities.
+    DataUse,
+    /// A person's own answer to the professional test (contract v28,
+    /// W10.1): any delegation that reaches anything; a deployment admin
+    /// may change another's with a note.
+    ProfessionalTest,
 }
 
 impl Area {
@@ -461,6 +469,8 @@ impl Area {
             Area::Accounts => "Accounts",
             Area::Trading => "Trading instructions",
             Area::AccountReads => "Accounts",
+            Area::DataUse => "Data sources",
+            Area::ProfessionalTest => "Professional test",
         }
     }
 
@@ -482,11 +492,12 @@ impl Area {
             }
             Area::Accounts => access.deployment_admin,
             Area::Trading => access.deployment_admin || access.administers_any(),
-            Area::AccountReads => {
+            Area::AccountReads | Area::ProfessionalTest => {
                 access.deployment_admin
                     || access.all_plugins_admin
                     || access.plugins.values().any(|held| held.holds_any())
             }
+            Area::DataUse => access.deployment_admin,
         }
     }
 }
@@ -579,6 +590,7 @@ impl Tool {
                             Area::DataSources => data_sources::described(spec),
                             Area::Prepared | Area::ServiceAccounts => spec.description.to_string(),
                             Area::Accounts | Area::Trading | Area::AccountReads => book::described(spec),
+                            Area::DataUse | Area::ProfessionalTest => spec.description.to_string(),
                         }
                     ),
                     "inputSchema": (spec.input_schema)(),
@@ -770,6 +782,7 @@ pub fn listed_to(
         .chain(prepared::SPECS)
         .chain(service_accounts::SPECS)
         .chain(book::SPECS)
+        .chain(data_use::SPECS)
     {
         if spec.area.open_to(access) {
             tools.push(Tool {
@@ -881,6 +894,7 @@ pub fn core_spec(name: &str) -> Option<&'static Spec> {
         .chain(prepared::SPECS)
         .chain(service_accounts::SPECS)
         .chain(book::SPECS)
+        .chain(data_use::SPECS)
         .find(|spec| spec.name == bare)
 }
 
@@ -902,6 +916,9 @@ pub async fn run_core(app: &App, caller: &Caller, spec: &'static Spec, arguments
         Area::ServiceAccounts => service_accounts::call(app, caller, spec, arguments).await.0,
         Area::Accounts | Area::Trading | Area::AccountReads => {
             book::call(app, caller, spec, arguments).await
+        }
+        Area::DataUse | Area::ProfessionalTest => {
+            data_use::call(app, caller, spec, arguments).await
         }
     }
 }
@@ -1058,6 +1075,16 @@ async fn call(app: &Arc<App>, caller: &Caller, name: &str, arguments: Value) -> 
             Area::AccountReads => (
                 book::call(app, caller, spec, arguments).await,
                 "read".to_string(),
+            ),
+            // At the deployment admin's capabilities (contract v28).
+            Area::DataUse => (
+                data_use::call(app, caller, spec, arguments).await,
+                "deployment admin".to_string(),
+            ),
+            // A person's own act, or a deployment admin's change.
+            Area::ProfessionalTest => (
+                data_use::call(app, caller, spec, arguments).await,
+                String::new(),
             ),
         },
         Owner::Plugin {

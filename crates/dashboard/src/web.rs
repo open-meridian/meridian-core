@@ -130,6 +130,9 @@ pub fn router(app: Arc<App>) -> Router {
         .merge(crate::tickets::pages::routes())
         .merge(crate::prepared::pages::routes())
         .merge(crate::service_accounts::pages::routes())
+        // Contract v28 (W10.1, W10.13): the professional test, a status
+        // changed, the counts exported.
+        .merge(crate::data_use::pages::routes())
         .merge(delegations::routes())
         .merge(reset::routes())
         .merge(crate::catalogue::routes())
