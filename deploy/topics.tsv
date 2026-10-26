@@ -232,6 +232,7 @@ platform.reference.event.venue-missing	event	data,connectivity	instrument,conduc
 platform.reference.query.ask-platform-for-company	query	instrument	conductor
 platform.reference.query.ask-platform-for-event-group	query	instrument	conductor
 platform.reference.query.ask-platform-for-instrument	query	dashboard,instrument	conductor
+platform.reference.query.ask-platform-for-instrument-candidates	query	dashboard	conductor
 platform.reference.query.compute-date	query	compliance,confirmation,connectivity,custody,data,ems,oms,operations,portfolio,reference,reporting,servicing,settlement,signal	instrument
 platform.reference.query.list-calendars	query	dashboard	instrument
 platform.reference.query.list-event-groups	query	compliance,confirmation,connectivity,custody,data,ems,oms,operations,portfolio,reference,reporting,servicing,settlement,signal,dashboard,analytics	instrument

@@ -1232,6 +1232,95 @@ message EscalateInstrumentReply {
   reserved "replaces_instrument_id";
 }
 
+// W3.33 (contract v28, ruling 757): the conductor's search for the
+// instrument picker -- one search answering the master's active records and
+// the securities OpenFIGI maps the query to that the master does not hold
+// (rulings 727 and 753). It mints, writes and keeps nothing on the
+// platform's side, which never records the asker with the query; picking a
+// candidate the master does not hold is the escalation (W3.4).
+message InstrumentCandidatesRequest {
+  // What the person typed: a ticker, a name, an ISIN, a CUSIP or a FIGI,
+  // one line of at most 64 characters. An ISIN or a CUSIP passes only as a
+  // person typed it into the picker, never from a plugin's record or a
+  // bulk lookup (ruling 761); the platform sends it to OpenFIGI alone and
+  // keeps nothing of it.
+  string query = 1;
+  // An ISO 10383 MIC to search on; empty for none.
+  string mic = 2;
+  // An ISO 3166 country code to search in; empty for none. A country
+  // other than the US without a MIC is answered from the master's records
+  // alone.
+  string country = 3;
+  // How many candidates at most, 1 to 25; 0 asks for the platform's
+  // default, 10.
+  int32 limit = 4;
+  // The moment the search is for; 0 for now.
+  int64 as_of_ns = 5;
+}
+
+message InstrumentCandidatesReply {
+  // The master's own records first, then the candidates it does not hold:
+  // for a bare ticker, the US listing first.
+  repeated InstrumentCandidate candidates = 1;
+  // Each source the search read, with what came of it: OpenFIGI not read
+  // (a timeout, its rate reached, switched off) means the records answered
+  // alone.
+  repeated SourceRead sources = 2;
+}
+
+// One candidate. A value OpenFIGI describes (its name, ticker, type or
+// exchange code) is never one of these (ruled 2026-10-02, kept by ruling
+// 758): the ticker, name and class come from SEC EDGAR, the MIC only where
+// asked and mapped.
+message InstrumentCandidate {
+  // The master's INS- ID for a record it holds, which the deployment pulls
+  // (W3.3); empty for a candidate it does not hold.
+  string instrument_id = 1;
+  string ticker = 2;
+  // The listing's ISO 10383 MIC, where known; a US composite listing
+  // carries none, its MIC coming from the deployment's data plugins when
+  // picked (ruling 759).
+  string mic = 3;
+  // ISO 3166: the listing's country, where known.
+  string country = 4;
+  string name = 5;
+  // The class a source states (ruling 762): ASSET_CLASS_UNSPECIFIED where
+  // none does.
+  AssetClass asset_class = 6;
+  // ISO 4217, where a source confirms it; empty otherwise.
+  string currency = 7;
+  string composite_figi = 8;
+  string share_class_figi = 9;
+  // What an escalation sends to bring a candidate the master does not hold
+  // in (W3.4): its FIGI levels as the master holds them, its ticker on a
+  // MIC where one was mapped, a fund's `sec_series` and `sec_class`. Empty
+  // for a record the master holds.
+  repeated Identifier identifiers = 10;
+}
+
+// The dashboard's ask (W3.33, ruling 763), as AskPlatformForInstrument
+// carries W3.3's: the instrument picker's search, which the conductor sends
+// the platform as SearchInstrumentCandidates within its bounded ask. Its
+// request is the InstrumentCandidatesRequest the conductor sends on.
+message AskPlatformForInstrumentCandidatesReply {
+  // False when the platform could not be reached; `detail` says why, and
+  // the picker answers from the deployment's own records.
+  bool reachable = 1;
+  string detail = 2;
+  // The platform's answer, when it was reached.
+  InstrumentCandidatesReply answer = 3;
+}
+
+// A source a platform answer read: its address, `found`, `not_found` or
+// `not_read`, when it was read (UTC, to the second), and why where it
+// was not found or not read.
+message SourceRead {
+  string source = 1;
+  string outcome = 2;
+  string read_at = 3;
+  string why = 4;
+}
+
 // A record of the deployment's reached a new version (W3.5): minted, joined
 // by an identifier, completed, merged, or answered by the platform.
 message InstrumentAppliedEvent {
