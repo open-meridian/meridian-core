@@ -809,7 +809,10 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
         let cadence = config.declaration(&dataset).map_or(0, |d| d.cadence);
         // Kept current: by its schedule where it has a cadence, by the
         // vendor's stream where it is streamed (contract v19, W10.7).
-        let current = cadence > 0 || config.has_mode(&dataset, ObservationMode::Stream);
+        // A dataset served, not kept, is never kept current: each read asks
+        // it again and hears what is served (ruling 734).
+        let current = (cadence > 0 || config.has_mode(&dataset, ObservationMode::Stream))
+            && config.licence(&dataset).kept;
         out.asks.push(Ask {
             dataset,
             data_type: read.data_type,
@@ -827,4 +830,110 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
         });
     }
     Ok(out)
+}
+
+/// What a dataset served, not kept, served the read that asked it, added
+/// to the answer (W10.7, "the lake answers the waiting reader"; ruling
+/// 734): narrowed and chosen as kept rows are -- the subjects, kinds and
+/// series asked, an invalid row left out unless named with
+/// `include_quarantined`, the latest per key for a read of the latest --
+/// and its fields stripped as the reader may read them. A subject and kind
+/// another dataset answered is never mixed with it but on a side-by-side
+/// read. Every dataset served, not kept, that did not answer a subject is
+/// named NOT_KEPT, never ASKED_SOURCE: nothing asked is kept to be read
+/// again.
+pub fn with_served(
+    read: &Read,
+    against: &Against<'_>,
+    answered: &mut Answered,
+    served: BTreeMap<String, Vec<Observation>>,
+) {
+    let config = against.config;
+    let alias_of = |subject: &str| -> String {
+        against
+            .aliases
+            .get(subject)
+            .filter(|stays| read.subjects.contains(stays))
+            .cloned()
+            .unwrap_or_else(|| subject.to_string())
+    };
+    let mut held: BTreeSet<(String, i32)> = answered
+        .rows
+        .iter()
+        .map(|row| (alias_of(row.subject()), row.kind()))
+        .collect();
+    let mut added = false;
+    for (dataset, rows) in served {
+        let mut rows: Vec<Observation> = rows
+            .into_iter()
+            .filter(|row| row.data_type() == read.data_type)
+            .filter(|row| read.subjects.contains(&alias_of(row.subject())))
+            .filter(|row| read.kinds.is_empty() || read.kinds.contains(&row.kind()))
+            .filter(|row| {
+                meridian_domain::lake::series_asked(
+                    &row.meta().series_key,
+                    &read.series_keys,
+                    read.all_series,
+                )
+            })
+            .filter(|row| read.sources.include_quarantined || !invalid(row))
+            .collect();
+        if matches!(read.when, When::Latest { .. }) {
+            rows = latest_in_force(rows);
+        }
+        let mut answering: BTreeSet<(String, i32)> = BTreeSet::new();
+        for mut row in rows {
+            let key = (alias_of(row.subject()), row.kind());
+            if !read.sources.side_by_side && held.contains(&key) && !answering.contains(&key) {
+                continue;
+            }
+            let allowed = config
+                .fields_for(&dataset, &read.reader)
+                .unwrap_or_default();
+            for field in row.strip(&allowed) {
+                let said = NotServed {
+                    subject: String::new(),
+                    dataset: dataset.clone(),
+                    field: field.to_string(),
+                    reason: UnansweredReason::NotEntitled,
+                };
+                if !answered.not_served.contains(&said) {
+                    answered.not_served.push(said);
+                }
+            }
+            answering.insert(key);
+            answered.rows.push(row);
+            added = true;
+        }
+        let subjects: BTreeSet<String> = answering.iter().map(|(s, _)| s.clone()).collect();
+        answered.not_served.retain(|n| {
+            !(n.dataset == dataset
+                && n.reason == UnansweredReason::AskedSource
+                && subjects.contains(&n.subject))
+        });
+        held.extend(answering);
+    }
+    for said in answered.not_served.iter_mut() {
+        if said.reason == UnansweredReason::AskedSource && !config.licence(&said.dataset).kept {
+            said.reason = UnansweredReason::NotKept;
+        }
+    }
+    if added {
+        answered.rows.sort_by(|a, b| {
+            (
+                a.subject(),
+                a.dataset(),
+                a.kind(),
+                a.meta().valid_from_ns,
+                a.meta().sequence,
+            )
+                .cmp(&(
+                    b.subject(),
+                    b.dataset(),
+                    b.kind(),
+                    b.meta().valid_from_ns,
+                    b.meta().sequence,
+                ))
+        });
+    }
 }

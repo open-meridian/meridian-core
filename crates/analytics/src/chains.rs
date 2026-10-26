@@ -523,6 +523,20 @@ pub fn chain(
             ..Default::default()
         },
     );
+    // A dataset served, not kept, that served nothing within the read is
+    // named with its licence where no price was read (ruling 734).
+    let not_kept: BTreeSet<String> = price_reply
+        .as_ref()
+        .map(|reply| {
+            reply
+                .unanswered
+                .iter()
+                .filter(|u| u.reason == v1::UnansweredReason::NotKept as i32)
+                .filter(|u| !u.dataset.is_empty())
+                .map(|u| u.dataset.clone())
+                .collect()
+        })
+        .unwrap_or_default();
     let spot = price_reply.ok().and_then(|reply| {
         reply
             .prices
@@ -718,10 +732,16 @@ pub fn chain(
         .as_ref()
         .map(|(_, money, _)| money.instrument_id.clone())
         .unwrap_or_default();
+    let spot_missing = if spot.is_none() && !not_kept.is_empty() {
+        spot_not_kept(&not_kept)
+    } else {
+        String::new()
+    };
     Ok(json!({
         "underlying_instrument_id": underlying,
         "currency_instrument_id": currency,
         "spot": spot_json,
+        "spot_missing": spot_missing,
         "rate": rate.cloned(),
         "dividends": dividends,
         "dividends_dataset": dividends_dataset,
@@ -791,6 +811,18 @@ pub fn scenario(asker: &dyn Ask, job: &Job) -> Result<Option<Value>, Refused> {
         ));
     }
     Ok(Some(scenario::set_json(&saved.row_key, version, &set)))
+}
+
+/// Why the underlying's price is missing where its datasets are served,
+/// not kept (ruling 734): each named, with its licence.
+fn spot_not_kept(datasets: &BTreeSet<String>) -> String {
+    let named: Vec<&str> = datasets.iter().map(String::as_str).collect();
+    format!(
+        "the underlying's price: {} {} served, not kept, by its licence, and served nothing \
+         within the read",
+        named.join(", "),
+        if named.len() == 1 { "is" } else { "are" }
+    )
 }
 
 /// The model a series' template version's calculation package binds for
@@ -1014,6 +1046,18 @@ mod tests {
             v1::AssetClass::Equity as i32,
             &mut BTreeMap::new(),
         )
+    }
+
+    #[test]
+    fn a_price_served_not_kept_is_named_with_its_licence() {
+        let one: BTreeSet<String> = ["tradier-1:live_delayed".to_string()].into();
+        assert_eq!(
+            spot_not_kept(&one),
+            "the underlying's price: tradier-1:live_delayed is served, not kept, by its \
+             licence, and served nothing within the read"
+        );
+        let two: BTreeSet<String> = ["a:x".to_string(), "b:y".to_string()].into();
+        assert!(spot_not_kept(&two).starts_with("the underlying's price: a:x, b:y are served"));
     }
 
     /// Found on dev 2026-10-26: a package held without its bindings named

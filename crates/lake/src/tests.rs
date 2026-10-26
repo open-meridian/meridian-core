@@ -769,6 +769,86 @@ async fn a_dataset_not_kept_is_served_and_only_that_it_was_served_is_kept() {
     assert_eq!(served[0].readers, vec!["reporting-1"]);
 }
 
+/// Ruling 734 (W10.7, "the lake answers the waiting reader"): a read that
+/// asks a source for a dataset served, not kept, hears what is served
+/// within its wait; a read that hears nothing is told the dataset is not
+/// kept, never asked forever, since nothing served is kept to be read
+/// again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_that_asks_a_dataset_served_not_kept_hears_what_is_served() {
+    let h = harness();
+    h.lake.configured(&configuration(false, &[]));
+    let mut wanted = h.bus.subscribe_every(service::OBSERVATIONS_WANTED);
+    let lake = h.lake.clone();
+    // The data plugin answers the first want of coinbase-1:daily.
+    let plugin = tokio::spawn(async move {
+        loop {
+            let delivery = wanted.recv().await.unwrap();
+            let want = ObservationsWantedEvent::decode(&delivery.envelope.payload[..]).unwrap();
+            if want.dataset != "coinbase-1:daily" {
+                continue;
+            }
+            assert!(!want.standing, "a dataset not kept is never kept current");
+            tokio::task::block_in_place(|| {
+                lake.record(
+                    "prices",
+                    vec![Observation::Price(close(
+                        "coinbase-1",
+                        "BTC-USD:2026-10-07",
+                        BTC,
+                        "2026-10-07",
+                        "62000.5",
+                    ))],
+                    &want.want_id,
+                    &envelope("coinbase-1", true, ""),
+                )
+            })
+            .unwrap();
+            return wanted;
+        }
+    });
+    let answer = read(
+        &h,
+        "reporting-1",
+        &[BTC],
+        "2026-10-07",
+        SourceChoice::default(),
+        0,
+    );
+    assert_eq!(answer.rows.len(), 1, "served to the read that asked");
+    assert_eq!(answer.rows[0].dataset(), "coinbase-1:daily");
+    assert!(answer
+        .unanswered
+        .iter()
+        .all(|u| u.reason != UnansweredReason::AskedSource as i32));
+    assert!(h.store.counts().unwrap().is_empty(), "no row kept");
+    let _wanted = plugin.await.unwrap();
+
+    // Asked again, nothing served within the wait: not kept, not asked.
+    let started = std::time::Instant::now();
+    let again = read(
+        &h,
+        "reporting-1",
+        &[BTC],
+        "2026-10-07",
+        SourceChoice::default(),
+        0,
+    );
+    assert!(started.elapsed() >= service::SERVED_WAIT);
+    assert!(again.rows.is_empty());
+    let coinbase: Vec<i32> = again
+        .unanswered
+        .iter()
+        .filter(|u| u.dataset == "coinbase-1:daily")
+        .map(|u| u.reason)
+        .collect();
+    assert_eq!(coinbase, vec![UnansweredReason::NotKept as i32]);
+    assert!(again
+        .unanswered
+        .iter()
+        .all(|u| u.reason != UnansweredReason::AskedSource as i32));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_batch_is_refused_whole_naming_the_item_and_field() {
     let h = harness();

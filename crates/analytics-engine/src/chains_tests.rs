@@ -481,3 +481,31 @@ fn no_curve_leaves_every_option_not_evaluated_naming_the_curve() {
         assert!(u.detail.contains("ust_cmt"), "{}", u.detail);
     }
 }
+
+/// Ruling 734: an underlying whose price is served, not kept, and served
+/// nothing within the read is named with its dataset and licence wherever
+/// its price is missing; with no reason given, the underlying's price.
+#[test]
+fn a_missing_price_names_a_dataset_served_not_kept() {
+    let said = "the underlying's price: tradier-1:live_delayed is served, not kept, by its \
+                licence, and served nothing within the read";
+    let mut chain = index_chain(0.22, 0.0, &[30]);
+    chain["spot"] = Value::Null;
+    chain["spot_missing"] = json!(said);
+    let doc = inputs(vec![chain], vec![("implied_volatility", 1, vec![])]);
+    let answer = crate::compute(&doc).unwrap();
+    assert!(figures(&answer, "implied_volatility").is_empty());
+    assert!(!answer.not_evaluated.is_empty());
+    for u in &answer.not_evaluated {
+        assert_eq!(u.reason, PRICE_MISSING);
+        assert_eq!(u.detail, said);
+    }
+    let mut plain = index_chain(0.22, 0.0, &[30]);
+    plain["spot"] = Value::Null;
+    let doc = inputs(vec![plain], vec![("implied_volatility", 1, vec![])]);
+    let answer = crate::compute(&doc).unwrap();
+    assert!(answer
+        .not_evaluated
+        .iter()
+        .all(|u| u.detail == "the underlying's price"));
+}

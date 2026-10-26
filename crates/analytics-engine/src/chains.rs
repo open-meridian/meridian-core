@@ -84,6 +84,10 @@ pub struct Chain {
     pub spot: Option<f64>,
     pub spot_source_ns: i64,
     pub spot_dataset: String,
+    /// Why no price of the underlying was read, where the read said
+    /// (ruling 734: a dataset served, not kept, named with its licence);
+    /// "the underlying's price" otherwise.
+    pub spot_missing: String,
     /// The risk-free curve (ruling 608; 611's `risk_free_rate`): each point
     /// its time in years and its rate, continuous; empty where none was
     /// read, `rate_missing` saying why, and every option not evaluated.
@@ -202,6 +206,9 @@ pub fn read(inputs: &Value) -> Result<Vec<Chain>> {
             },
             spot_source_ns: spot.map(|s| int(s, "source_ns")).unwrap_or(0),
             spot_dataset: spot.map(|s| text(s, "dataset")).unwrap_or_default(),
+            spot_missing: Some(text(c, "spot_missing"))
+                .filter(|said| !said.is_empty())
+                .unwrap_or_else(|| "the underlying's price".to_string()),
             rate_missing: if curve.is_empty() {
                 match rate.map(|r| text(r, "missing")).filter(|m| !m.is_empty()) {
                     Some(said) => said,
@@ -470,7 +477,7 @@ pub fn solve(chain: &Chain, as_of_ns: i64, steps: usize) -> ChainSolution {
     for (expiry, members) in &by_expiry {
         let found = (|| {
             let Some(spot) = spot else {
-                return Err((PRICE_MISSING, "the underlying's price".to_string()));
+                return Err((PRICE_MISSING, chain.spot_missing.clone()));
             };
             let first = &chain.series[members[0]];
             if first.settles_at_ns == 0 {
@@ -521,7 +528,7 @@ pub fn solve(chain: &Chain, as_of_ns: i64, steps: usize) -> ChainSolution {
         .series
         .iter()
         .map(|s| {
-            let spot = spot.ok_or((PRICE_MISSING, "the underlying's price".to_string()))?;
+            let spot = spot.ok_or((PRICE_MISSING, chain.spot_missing.clone()))?;
             if !s.quarantined.is_empty() {
                 return Err((INPUT_QUARANTINED, s.quarantined.clone()));
             }
@@ -1509,12 +1516,7 @@ fn positioning_exposure(
 /// liquidity and the 0DTE share (W12.1), on the default basis.
 fn positioning_levels(chain: &Chain, solution: &ChainSolution, steps: usize, out: &mut Out<'_>) {
     let Some(spot) = chain.spot else {
-        out.not(
-            &Vec::new(),
-            "",
-            PRICE_MISSING,
-            "the underlying's price".into(),
-        );
+        out.not(&Vec::new(), "", PRICE_MISSING, chain.spot_missing.clone());
         return;
     };
     let held: Vec<(&Series, &Solved, f64, f64)> = chain
@@ -1792,7 +1794,7 @@ pub fn scenario_grid(
                 instrument_id: position.instrument_id.clone(),
                 measure: key.clone(),
                 reason: PRICE_MISSING,
-                detail: "the underlying's price".into(),
+                detail: chain.spot_missing.clone(),
                 series_key: Vec::new(),
             });
             continue;
