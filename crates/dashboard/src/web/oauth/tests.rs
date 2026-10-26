@@ -1138,7 +1138,9 @@ async fn forty_plugins_and_three_hundred_account_groups_make_one_short_page() {
     let size = page.len();
     println!("the consent page at 40 plugins and 300 account groups: {size} bytes");
     // Each row lists the prepared change's own tools too (contract v20).
-    assert!(size < 160_000, "{size} bytes");
+    // 162,000 from 160,000 for the tab row's "More" menu (ruling 729): its
+    // 0.7 KB of style rides every page; its script is acts.js's, cached.
+    assert!(size < 162_000, "{size} bytes");
     // And finishing it is a handful of fields: one search, one level, one
     // group.
     let decided = post_form(
