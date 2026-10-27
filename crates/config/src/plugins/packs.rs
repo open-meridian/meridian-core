@@ -638,7 +638,12 @@ impl Plugins {
             },
             at_ns: self.clock.now_ns(),
         };
-        match self.store.record_pack_change(&change) {
+        let recorded = self.store.record_pack_change(&change);
+        // The job is over once its record is written (or failed to be): it
+        // ends here, before the kept job is cleared, so a job no longer kept
+        // is never still under way -- a new install is not refused for it.
+        self.packs.end(&pack.pack);
+        match recorded {
             Ok(()) => {
                 tracing::info!(
                     pack = change.pack,
@@ -663,7 +668,6 @@ impl Plugins {
                 "a starter pack's install was not recorded; its members' installs were"
             ),
         }
-        self.packs.end(&pack.pack);
     }
 
     /// The job as it stands, kept in the store (616); a failure to keep it

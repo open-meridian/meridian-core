@@ -77,14 +77,25 @@ async fn install(h: &Harness, revision: u64, members: &[&str]) -> Result<PackIns
     .await
 }
 
-/// The pack read until no member is installing: the job runs on its own.
+/// The pack read once its job has ended: the job runs on its own, and a
+/// member's last outcome is set before the `pack_installed` record is
+/// written, so no member installing is not yet the end. The kept job is
+/// cleared only after the record is written and the job has ended.
 async fn settled(h: &Harness) -> PackStatus {
     for _ in 0..200 {
-        let status = read(h).await;
-        if !status
-            .members
+        let store = Arc::clone(&h.store);
+        let kept = tokio::task::spawn_blocking(move || store.pack_jobs())
+            .await
+            .unwrap()
+            .unwrap()
             .iter()
-            .any(|m| m.state == PackMemberState::Installing as i32)
+            .any(|job| job.pack == PACK);
+        let status = read(h).await;
+        if !kept
+            && !status
+                .members
+                .iter()
+                .any(|m| m.state == PackMemberState::Installing as i32)
         {
             return status;
         }
