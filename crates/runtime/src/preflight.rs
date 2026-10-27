@@ -32,6 +32,7 @@
 //! - **Backups:** the newest backup's age.
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use prost::Message;
 use serde_json::{json, Value};
@@ -515,6 +516,10 @@ pub struct Inputs {
     pub backups: Option<String>,
     pub backup_configured: bool,
     pub now_ns: i64,
+    /// How long, in all, a database is waited for before it is said not to
+    /// answer: [`DATABASE_WAITS_AT_MOST`] from the chart's hook; nothing, one
+    /// attempt, by default.
+    pub database_waits_at_most: Duration,
 }
 
 impl Inputs {
@@ -542,16 +547,109 @@ impl Inputs {
             backups: var("MERIDIAN_PREFLIGHT_BACKUPS"),
             backup_configured: var("MERIDIAN_PREFLIGHT_BACKUP_CONFIGURED").is_some(),
             now_ns,
+            database_waits_at_most: DATABASE_WAITS_AT_MOST,
         }
     }
 }
 
-fn read_only(url: &str) -> Result<postgres::Client, String> {
-    let mut client =
-        postgres::Client::connect(url, postgres::NoTls).map_err(|failed| failed.to_string())?;
+/// How long the preflight waits for a database to answer before it says the
+/// database does not.
+///
+/// The hook's pod is new at every upgrade, and a new pod's first connections
+/// can be refused before the cluster's network policy admits it: on k3s the
+/// policy controller adds a new pod to the database's admitted sources a
+/// moment after the pod starts, and rejects it until then. Every component
+/// waits for its database for that reason ([`crate::wait_until`],
+/// [`crate::migrate_once_it_answers`]); the preflight once made one attempt,
+/// and on CI's k3d cluster every store "did not answer" and the upgrade was
+/// blocked with the database running (CI run 40423226625). A minute is
+/// far past that moment and well inside the hook's five-minute deadline; a
+/// database that is truly not there still blocks, after it, saying why.
+pub const DATABASE_WAITS_AT_MOST: Duration = Duration::from_secs(60);
+
+/// One attempt's limit: a connection the network drops rather than refuses
+/// fails in this, not in the minutes the system's own retries take.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// An error and its causes. The Postgres client's own words name only the
+/// kind -- "error connecting to server" -- and keep why (refused, timed out,
+/// no such host) as its source, which is what an operator reading a blocked
+/// upgrade needs.
+pub fn with_causes(failed: &dyn std::error::Error) -> String {
+    let mut said = failed.to_string();
+    let mut cause = failed.source();
+    while let Some(next) = cause {
+        let next_said = next.to_string();
+        if !said.ends_with(&next_said) {
+            said.push_str(": ");
+            said.push_str(&next_said);
+        }
+        cause = next.source();
+    }
+    said
+}
+
+/// `attempt` until it succeeds or `deadline` passes, looking again every
+/// `every`; at least once, however late. The last failure, and how long it
+/// was waited for, when it never does.
+pub fn answering<T>(
+    what: &str,
+    deadline: Instant,
+    every: Duration,
+    mut attempt: impl FnMut() -> Result<T, String>,
+) -> Result<T, String> {
+    let since = Instant::now();
+    let mut said = false;
+    loop {
+        match attempt() {
+            Ok(done) => {
+                if said {
+                    tracing::info!(
+                        waited_s = since.elapsed().as_secs(),
+                        "{what} is there; no longer waiting"
+                    );
+                }
+                return Ok(done);
+            }
+            Err(failed) => {
+                if Instant::now() + every > deadline {
+                    return Err(if said {
+                        format!("{failed} (waited {}s)", since.elapsed().as_secs())
+                    } else {
+                        failed
+                    });
+                }
+                if !said {
+                    tracing::info!("waiting for {what}: {failed}");
+                    said = true;
+                }
+            }
+        }
+        std::thread::sleep(every);
+    }
+}
+
+/// A read-only session, once the database at `url` answers or `deadline`
+/// passes. Only the connection is waited for: a session that connects and
+/// then fails fails at once.
+fn read_only(store: &str, url: &str, deadline: Instant) -> Result<postgres::Client, String> {
+    let mut config: postgres::Config = url
+        .parse()
+        .map_err(|failed| format!("its URL is unreadable: {}", with_causes(&failed)))?;
+    config.connect_timeout(CONNECT_TIMEOUT);
+    let mut client = answering(
+        &format!("the {store}'s database"),
+        deadline,
+        crate::WAIT_AGAIN_AFTER,
+        || {
+            config
+                .connect(postgres::NoTls)
+                .map_err(|failed| with_causes(&failed))
+        },
+    )?;
     client
         .batch_execute("SET default_transaction_read_only = on")
-        .map_err(|failed| failed.to_string())?;
+        .map_err(|failed| with_causes(&failed))?;
     Ok(client)
 }
 
@@ -636,9 +734,12 @@ fn setting_bytes(client: &mut postgres::Client, name: &str) -> Option<u64> {
 }
 
 /// Every check, against what the chart gives. A database that does not
-/// answer is a check not made, said so.
+/// answer within [`Inputs::database_waits_at_most`] blocks, saying why.
 pub fn run(inputs: &Inputs) -> Vec<Finding> {
     let mut findings = Vec::new();
+    // One limit for every store: most share one database, and one that is
+    // not there is waited for once, not once a store.
+    let deadline = Instant::now() + inputs.database_waits_at_most;
     if inputs.stores.is_empty() {
         findings.push(finding(
             "database",
@@ -651,7 +752,7 @@ pub fn run(inputs: &Inputs) -> Vec<Finding> {
     let mut seen_urls: Vec<&str> = Vec::new();
     let mut pending_all: Vec<(String, i64, &'static str, &'static str)> = Vec::new();
     for (store, url) in &inputs.stores {
-        let mut client = match read_only(url) {
+        let mut client = match read_only(store, url, deadline) {
             Ok(client) => client,
             Err(failed) => {
                 findings.push(finding(

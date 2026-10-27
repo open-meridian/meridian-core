@@ -1,10 +1,13 @@
 //! The upgrade preflight against Postgres (H1, ruling 586): a deployment
 //! whose every store is at this release's schema is ready to upgrade to it;
 //! one whose store is newer than the release is blocked, a downgrade; and
-//! nothing the check does writes. Run by `make test-store`; fails loudly
-//! without a database.
+//! nothing the check does writes; a database that answers only after the
+//! hook has started is waited for, and one that never answers blocks. Run by
+//! `make test-store`; fails loudly without a database.
 
+use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use meridian_clock::SystemClock;
 use meridian_runtime::preflight::{overall, run, Inputs, Verdict};
@@ -72,6 +75,7 @@ fn inputs(url: &str) -> Inputs {
         backups: None,
         backup_configured: false,
         now_ns: 1_792_800_000_000_000_000,
+        database_waits_at_most: Duration::from_secs(30),
     }
 }
 
@@ -131,8 +135,67 @@ fn a_store_newer_than_the_release_blocks_the_upgrade() {
 fn a_database_that_does_not_answer_blocks_rather_than_passes() {
     let mut asked = inputs("postgres://nobody:nothing@127.0.0.1:1/none");
     asked.stores.truncate(1);
+    asked.database_waits_at_most = Duration::from_secs(3);
     let findings = run(&asked);
-    assert!(findings
-        .iter()
-        .any(|f| f.check == "database" && f.verdict == Verdict::Blocked));
+    let database = findings.iter().find(|f| f.check == "database").unwrap();
+    assert_eq!(database.verdict, Verdict::Blocked, "{database:?}");
+    assert!(database.why.contains("does not answer"), "{database:?}");
+    assert!(
+        database.why.to_lowercase().contains("refused"),
+        "the cause is said, not only the kind: {database:?}"
+    );
+}
+
+/// The test database, reached through a port that refuses every connection
+/// until `after` and then forwards each to the database: what the hook's new
+/// pod met on CI's k3d cluster (CI run 40423226625), a database running and
+/// the pod's first connections refused until the network policy admitted it.
+fn answering_late(url: &str, after: Duration) -> String {
+    let (head, rest) = url.split_once('@').expect("a URL with credentials");
+    let slash = rest.find('/').unwrap_or(rest.len());
+    let target = &rest[..slash];
+    let target = if target.contains(':') {
+        target.to_string()
+    } else {
+        format!("{target}:5432")
+    };
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    std::thread::spawn(move || {
+        std::thread::sleep(after);
+        let listener = TcpListener::bind(("127.0.0.1", port)).expect("the late port is taken");
+        for client in listener.incoming().flatten() {
+            let server = TcpStream::connect(&target).expect("the test database");
+            let (mut c_in, mut s_out) = (client.try_clone().unwrap(), server.try_clone().unwrap());
+            let (mut s_in, mut c_out) = (server, client);
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut c_in, &mut s_out);
+                let _ = s_out.shutdown(std::net::Shutdown::Write);
+            });
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut s_in, &mut c_out);
+                let _ = c_out.shutdown(std::net::Shutdown::Write);
+            });
+        }
+    });
+    format!("{head}@127.0.0.1:{port}{}", &rest[slash..])
+}
+
+#[test]
+fn a_database_that_answers_after_the_hook_starts_is_waited_for() {
+    let url = answering_late(&migrated("late"), Duration::from_secs(3));
+    let findings = run(&inputs(&url));
+    for f in &findings {
+        eprintln!("{} {} {}", f.verdict.word(), f.check, f.why);
+    }
+    assert!(
+        findings.iter().all(|f| f.check != "database"),
+        "every store answered, once it could: {findings:?}"
+    );
+    let schemas: Vec<_> = findings.iter().filter(|f| f.check == "schema").collect();
+    assert_eq!(schemas.len(), 5, "{findings:?}");
+    assert_eq!(overall(&findings), Verdict::Warning, "{findings:?}");
 }

@@ -227,3 +227,100 @@ fn nothing_configured_yet_is_said_and_answers_without_a_database() {
         .any(|f| f.check == "database" && f.verdict == Verdict::NotChecked));
     assert_ne!(overall(&findings), Verdict::Blocked);
 }
+
+// A hook's pod is new at every upgrade, and its first connections can be
+// refused before the cluster's network policy admits it (CI run
+// 40423226625): the database is waited for, as every component waits for
+// its own, and one that never answers still blocks, saying why.
+
+#[test]
+fn a_database_refused_at_first_is_waited_for() {
+    let mut tries = 0;
+    let answered = answering(
+        "the test's database",
+        Instant::now() + Duration::from_secs(5),
+        Duration::from_millis(1),
+        || {
+            tries += 1;
+            if tries < 4 {
+                Err("error connecting to server: Connection refused".to_string())
+            } else {
+                Ok(tries)
+            }
+        },
+    );
+    assert_eq!(answered, Ok(4));
+}
+
+#[test]
+fn a_database_that_never_answers_is_given_up_on_with_its_last_reason() {
+    let mut tries = 0;
+    let answered: Result<(), String> = answering(
+        "the test's database",
+        Instant::now() + Duration::from_millis(30),
+        Duration::from_millis(5),
+        || {
+            tries += 1;
+            Err(format!("refused, attempt {tries}"))
+        },
+    );
+    let why = answered.unwrap_err();
+    assert!(tries > 1, "{tries}");
+    assert!(
+        why.starts_with(&format!("refused, attempt {tries}")),
+        "{why}"
+    );
+    assert!(why.contains("waited"), "{why}");
+    // Past its limit it is still asked once.
+    let mut once = 0;
+    let late: Result<(), String> = answering(
+        "the test's database",
+        Instant::now(),
+        Duration::from_millis(5),
+        || {
+            once += 1;
+            Err("refused".to_string())
+        },
+    );
+    assert_eq!((once, late), (1, Err("refused".to_string())));
+}
+
+#[test]
+fn a_database_that_does_not_answer_blocks_and_says_why() {
+    // A port nothing listens on: refused, as the k3d cluster refused the
+    // hook's first connections.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let findings = run(&Inputs {
+        stores: vec![(
+            "configuration store",
+            format!("postgres://nobody:nothing@127.0.0.1:{port}/none"),
+        )],
+        max_payload: MIB,
+        now_ns: 1,
+        database_waits_at_most: Duration::from_millis(50),
+        ..Default::default()
+    });
+    let database = findings.iter().find(|f| f.check == "database").unwrap();
+    assert_eq!(database.verdict, Verdict::Blocked, "{database:?}");
+    assert!(
+        database.why.starts_with(
+            "the configuration store's database does not answer: error connecting to server: "
+        ),
+        "{database:?}"
+    );
+    // The cause, not only the kind: the client's own words stop at "error
+    // connecting to server", which is all CI's first run said.
+    assert!(
+        database.why.to_lowercase().contains("refused"),
+        "{database:?}"
+    );
+    assert!(
+        !database.why.contains("nothing"),
+        "the password is never said: {database:?}"
+    );
+    assert_eq!(overall(&findings), Verdict::Blocked);
+}

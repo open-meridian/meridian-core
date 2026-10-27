@@ -1966,6 +1966,29 @@ chart-check:
 		| grep -qx '    "helm.sh/hook": pre-upgrade' \
 		|| { echo "chart-check FAILED: the upgrade preflight is not a pre-upgrade hook alone: it must run before every upgrade and never on an install" >&2; exit 1; }; \
 	true
+	@# And it reaches each database as the components do (CI run
+	@# 40423226625, where a new hook pod's first connections were refused):
+	@# every URL it reads is one a component's Deployment reads -- the serving
+	@# credential, never the migrating one -- and its pod carries every label
+	@# the database's NetworkPolicy admits from. Its waiting for a database
+	@# that refuses at first is test-store's and the unit tests'.
+	@rendered="$$($(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check 2>/dev/null)"; \
+	sources="$$(echo "$$rendered" | awk '/^---/{kind="";name=""} /^kind: /{kind=$$2} /^  name: /{if(name=="")name=$$2} \
+		/- name: MERIDIAN_[A-Z_]*DATABASE_URL$$/{getline;getline;getline;n=$$2;getline;print kind, name, n "/" $$2}')"; \
+	hook="$$(echo "$$sources" | awk '$$2=="check-meridian-runtime-preflight"{print $$3}' | sort -u)"; \
+	serving="$$(echo "$$sources" | awk '$$1=="Deployment"{print $$3}' | sort -u)"; \
+	{ [ -n "$$hook" ] && [ -n "$$serving" ]; } \
+		|| { echo "chart-check FAILED: found no database URL the preflight or a component reads, so the check below would prove nothing" >&2; exit 1; }; \
+	for source in $$hook; do echo "$$serving" | grep -qxF "$$source" \
+		|| { echo "chart-check FAILED: the upgrade preflight reads $$source, which no component reads: it reaches each database on the serving credential the components use" >&2; exit 1; }; \
+	done; \
+	admitted="$$(echo "$$rendered" | awk '/^---/{k="";n=""} /^kind: /{k=$$2} /^  name: /{if(n=="")n=$$2} \
+		k=="NetworkPolicy" && n=="check-meridian-runtime-database" && /^              [^ ].*: /')"; \
+	[ -n "$$admitted" ] || { echo "chart-check FAILED: found no labels the database's NetworkPolicy admits from, so the check below would prove nothing" >&2; exit 1; }; \
+	pod="$$(echo "$$rendered" | awk '/^---/{p=0} /^  name: check-meridian-runtime-preflight$$/{p=1} p && /^        [^ ].*: /')"; \
+	echo "$$admitted" | while read -r label; do echo "$$pod" | sed 's/^ *//' | grep -qxF "$$label" \
+		|| { echo "chart-check FAILED: the upgrade preflight's pod lacks $$label, so the database's NetworkPolicy refuses it" >&2; exit 1; }; \
+	done
 	@# Upgrades leave nothing behind to pile up (task kernel/upgrading-a-
 	@# deployment-in-place): four upgrades of one deployment left 26 old
 	@# ReplicaSets and Jobs from earlier revisions. Every Deployment keeps three

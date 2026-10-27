@@ -8,9 +8,14 @@
   A pre-upgrade hook, so it runs from the new image after Helm renders the
   release and before any resource changes, and a blocked check -- a schema
   newer than this release, a database or a bus answer past its limit, a
-  database that does not answer -- fails the hook, which stops the upgrade
-  with nothing changed: `helm upgrade`, `meridian upgrade-deployment` and a
-  GitOps tool honouring hooks alike. A warning passes and is said. Its report
+  database that does not answer within a minute -- fails the hook, which
+  stops the upgrade with nothing changed: `helm upgrade`, `meridian
+  upgrade-deployment` and a GitOps tool honouring hooks alike. A warning
+  passes and is said. The minute is waited because this pod is new at every
+  upgrade, and a new pod's first connections can be refused until the
+  database's NetworkPolicy admits it, as k3s's controller does for a moment
+  (CI run 40423226625); every component waits for its database the same way.
+  Its pod carries the release's labels, which that policy admits. Its report
   is one JSON object, the last line of its log: a blocked run's Job stays
   until the next upgrade's hook replaces it, so why it stopped can be read;
   one that passed goes when it succeeds, as every hook here does.
