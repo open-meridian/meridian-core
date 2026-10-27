@@ -2966,11 +2966,20 @@ async fn instrument_sources_page(
                 }
                 None => (None, None, format!("No record {id} in this deployment.")),
             },
-            Err(why) => (None, None, format!("The instrument store is not answering: {why}")),
+            Err(why) => (
+                None,
+                None,
+                format!("The instrument store is not answering: {why}"),
+            ),
         }
     };
     let body = sources_view::page(record.as_ref(), lines.as_ref(), &notice);
-    Html(page_with("Sources", &body, &instruments_chrome(&session, Some("Sources")))).into_response()
+    Html(page_with(
+        "Sources",
+        &body,
+        &instruments_chrome(&session, Some("Sources")),
+    ))
+    .into_response()
 }
 
 /// `POST /admin/instruments/bring-in` (meridian-ui 0.14.0's bring-in hook;
@@ -3000,25 +3009,41 @@ async fn bring_in_instrument(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v == "cross-site");
     if !json || cross_site {
-        return refuse(StatusCode::UNSUPPORTED_MEDIA_TYPE, "send the candidate as JSON, from this dashboard");
+        return refuse(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "send the candidate as JSON, from this dashboard",
+        );
     }
     let (session, _) = match gate(&app, &headers, true) {
         Ok(gated) => gated,
         Err(_) => return refuse(StatusCode::FORBIDDEN, "a deployment admin's"),
     };
     let candidate = match serde_json::from_slice::<serde_json::Value>(&body) {
-        Ok(asked) if asked.get("candidate").is_some_and(|c| c.is_object()) => asked["candidate"].clone(),
-        _ => return refuse(StatusCode::BAD_REQUEST, "send {\"candidate\": {...}} as the search answered it"),
+        Ok(asked) if asked.get("candidate").is_some_and(|c| c.is_object()) => {
+            asked["candidate"].clone()
+        }
+        _ => {
+            return refuse(
+                StatusCode::BAD_REQUEST,
+                "send {\"candidate\": {...}} as the search answered it",
+            )
+        }
     };
     let Some(request) = instruments::bring_in_request(&candidate) else {
-        return refuse(StatusCode::BAD_REQUEST, "the candidate carries no identifier to look for");
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            "the candidate carries no identifier to look for",
+        );
     };
     let resolved = match instruments::bring_in(&app.bus, &session.subject, request).await {
         Ok(resolved) => resolved,
         Err(why) => return refuse(StatusCode::SERVICE_UNAVAILABLE, &why),
     };
     if !resolved.found || resolved.instrument_id.is_empty() {
-        return refuse(StatusCode::UNPROCESSABLE_ENTITY, "the instrument store could not bring it in");
+        return refuse(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "the instrument store could not bring it in",
+        );
     }
     match instruments::list(&app.bus, &resolved.instrument_id).await {
         Ok(listed) => match listed.instruments.into_iter().find_map(|i| i.instrument) {

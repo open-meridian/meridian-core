@@ -39,9 +39,17 @@ const WAIT: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone, PartialEq)]
 pub enum Said {
     /// Its latest quote: bid and ask, each with its currency, and when.
-    Quote { bid: String, ask: String, at_ns: i64 },
+    Quote {
+        bid: String,
+        ask: String,
+        at_ns: i64,
+    },
     /// Its latest price, of its kind (`last`, `close`, ...), and when.
-    Price { price: String, kind: String, at_ns: i64 },
+    Price {
+        price: String,
+        kind: String,
+        at_ns: i64,
+    },
     /// It does not cover it, and why, in the lake's words.
     NotCovered(String),
     /// No plugin the person reads is entitled to the source.
@@ -67,7 +75,13 @@ async fn ask<R: Message + Default>(
     request: impl Message,
 ) -> Result<R, String> {
     let (_, bytes) = bus
-        .call(topic, request_type, request.encode_to_vec(), None, Some(WAIT))
+        .call(
+            topic,
+            request_type,
+            request.encode_to_vec(),
+            None,
+            Some(WAIT),
+        )
         .await
         .map_err(|failed| match failed {
             meridian_bus::BusError::HandlerFailed { detail, .. } => {
@@ -104,7 +118,11 @@ fn sources(listed: &ListDatasetsReply) -> Vec<(&meridian_domain::v1::DatasetRef,
 
 /// The plugin a source is read as: one entitled to it that the person reads
 /// at a data level; None where there is none.
-fn reader_for<'a>(listed: &'a ListDatasetsReply, dataset: &str, access: &Access) -> Option<&'a str> {
+fn reader_for<'a>(
+    listed: &'a ListDatasetsReply,
+    dataset: &str,
+    access: &Access,
+) -> Option<&'a str> {
     listed
         .entitlements
         .iter()
@@ -238,7 +256,11 @@ fn said_of(reply: &QueryLakeReply, kind: &str) -> (Said, String) {
 
 /// A venue by its MIC, as a person reads an exchange; its ID where it is
 /// not held.
-async fn exchange(bus: &meridian_bus::Bus, venue_id: &str, known: &mut BTreeMap<String, String>) -> String {
+async fn exchange(
+    bus: &meridian_bus::Bus,
+    venue_id: &str,
+    known: &mut BTreeMap<String, String>,
+) -> String {
     if venue_id.is_empty() {
         return String::new();
     }
@@ -372,7 +394,11 @@ fn when(at_ns: i64) -> String {
 }
 
 /// The page's body: the one search's picker, and the record's sources.
-pub fn page(record: Option<&InstrumentRecord>, lines: Option<&Result<Vec<Line>, String>>, notice: &str) -> String {
+pub fn page(
+    record: Option<&InstrumentRecord>,
+    lines: Option<&Result<Vec<Line>, String>>,
+    notice: &str,
+) -> String {
     let picker = "<form method=\"get\" action=\"/admin/instruments/sources\" class=\"field-row\" \
          id=\"pick-instrument\"><om-instrument-picker name=\"instrument\" label=\"Instrument\" \
          src=\"/admin/instruments/search?candidates=1\" bring-in=\"/admin/instruments/bring-in\" \
@@ -431,18 +457,20 @@ fn row(line: &Line) -> String {
         format!("{} ({})", line.dataset, line.vendor)
     };
     let (latest, state) = match &line.said {
-        Said::Quote { bid, ask, at_ns } => (
-            format!("{bid} / {ask} at {}", when(*at_ns)),
-            "quote",
-        ),
-        Said::Price { price, kind, at_ns } => (
-            format!("{price} {kind} at {}", when(*at_ns)),
-            "price",
-        ),
+        Said::Quote { bid, ask, at_ns } => (format!("{bid} / {ask} at {}", when(*at_ns)), "quote"),
+        Said::Price { price, kind, at_ns } => {
+            (format!("{price} {kind} at {}", when(*at_ns)), "price")
+        }
         Said::NotCovered(why) => (format!("Doesn't cover it: {why}"), "not-covered"),
         Said::NotEntitled => ("Not entitled".to_string(), "not-entitled"),
     };
-    let dash = |text: &str| if text.is_empty() { "—".to_string() } else { escape(text) };
+    let dash = |text: &str| {
+        if text.is_empty() {
+            "—".to_string()
+        } else {
+            escape(text)
+        }
+    };
     format!(
         "<tr data-source=\"{dataset}\" data-state=\"{state}\"><td title=\"{source}\">{source}</td>\
          <td title=\"{ticker}\">{ticker}</td><td class=\"wide\" title=\"{exchange}\">{exchange}</td>\

@@ -216,11 +216,12 @@ pub fn serve_all_within(
                 .as_ref()
                 .map(|meta| meta.acting_for_subject.clone())
                 .unwrap_or_default();
-            let instance = if !person.is_empty() && asking.launched_roles(&instance, now_ns).is_none() {
-                picker_for(&person)
-            } else {
-                instance
-            };
+            let instance =
+                if !person.is_empty() && asking.launched_roles(&instance, now_ns).is_none() {
+                    picker_for(&person)
+                } else {
+                    instance
+                };
             // Read-only for an instance none of whose launched roles may mint
             // (contract v20, W3.1): `reporting`, by the launch records, never
             // by anything the plugin sends.

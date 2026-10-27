@@ -1378,8 +1378,9 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
     bus.serve(
         crate::admin::instruments::ASK_PLATFORM_FOR_INSTRUMENT_CANDIDATES,
         |envelope| {
-            let asked = meridian_domain::v1::InstrumentCandidatesRequest::decode(&envelope.payload[..])
-                .map_err(|e| e.to_string())?;
+            let asked =
+                meridian_domain::v1::InstrumentCandidatesRequest::decode(&envelope.payload[..])
+                    .map_err(|e| e.to_string())?;
             let query = asked.query.trim().to_uppercase();
             let candidates = if !query.is_empty() && "SPY".starts_with(&query) {
                 vec![meridian_domain::v1::InstrumentCandidate {
@@ -1424,33 +1425,37 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
     );
     {
         let brought = Arc::clone(&brought);
-        bus.serve(crate::admin::instruments::RESOLVE_IDENTIFIER, move |envelope| {
-            let asked = meridian_domain::v1::ResolveIdentifierRequest::decode(&envelope.payload[..])
-                .map_err(|e| e.to_string())?;
-            let mut held = brought.lock().unwrap();
-            let id = "INS-01JSPY00000000000000000001".to_string();
-            if !held.iter().any(|r| r.instrument_id == id) {
-                held.push(InstrumentRecord {
-                    instrument_id: id.clone(),
-                    identifiers: asked.identifiers.clone(),
-                    asset_class: asked.stated_asset_class,
-                    currency: asked.stated_currency.clone(),
-                    description: asked.stated_description.clone(),
-                    version: 1,
-                    ..Default::default()
-                });
-            }
-            Ok((
-                "".into(),
-                meridian_domain::v1::ResolveIdentifierReply {
-                    found: true,
-                    instrument_id: id,
-                    minted: true,
-                    ..Default::default()
+        bus.serve(
+            crate::admin::instruments::RESOLVE_IDENTIFIER,
+            move |envelope| {
+                let asked =
+                    meridian_domain::v1::ResolveIdentifierRequest::decode(&envelope.payload[..])
+                        .map_err(|e| e.to_string())?;
+                let mut held = brought.lock().unwrap();
+                let id = "INS-01JSPY00000000000000000001".to_string();
+                if !held.iter().any(|r| r.instrument_id == id) {
+                    held.push(InstrumentRecord {
+                        instrument_id: id.clone(),
+                        identifiers: asked.identifiers.clone(),
+                        asset_class: asked.stated_asset_class,
+                        currency: asked.stated_currency.clone(),
+                        description: asked.stated_description.clone(),
+                        version: 1,
+                        ..Default::default()
+                    });
                 }
-                .encode_to_vec(),
-            ))
-        });
+                Ok((
+                    "".into(),
+                    meridian_domain::v1::ResolveIdentifierReply {
+                        found: true,
+                        instrument_id: id,
+                        minted: true,
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                ))
+            },
+        );
     }
     // The lake's latest close for whatever a source is read for (W10.10).
     bus.serve(crate::admin::sources_view::QUERY_LAKE, |envelope| {
@@ -1471,7 +1476,12 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
             }),
             kind: meridian_domain::v1::PriceKind::Close as i32,
             price: Some(meridian_domain::v1::Money {
-                amount: Some("687.12".parse::<meridian_domain::exact::Exact>().unwrap().to_wire()),
+                amount: Some(
+                    "687.12"
+                        .parse::<meridian_domain::exact::Exact>()
+                        .unwrap()
+                        .to_wire(),
+                ),
                 currency_code: "USD".into(),
                 ..Default::default()
             }),
@@ -1544,7 +1554,10 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
                 let found = asked.instrument_id == record.instrument_id
                     || (!search.is_empty()
                         && (record.description.to_lowercase().contains(&search)
-                            || record.identifiers.iter().any(|i| i.value.to_lowercase() == search)));
+                            || record
+                                .identifiers
+                                .iter()
+                                .any(|i| i.value.to_lowercase() == search)));
                 if found {
                     instruments.push(InstrumentToComplete {
                         instrument: Some(record.clone()),

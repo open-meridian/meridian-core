@@ -285,7 +285,11 @@ pub fn candidate_json(candidate: &meridian_domain::v1::InstrumentCandidate) -> s
         push(&identifier.scheme, &identifier.value, &identifier.source);
     }
     push("share_class_figi", &candidate.share_class_figi, "");
-    push("composite_figi", &candidate.composite_figi, &candidate.country);
+    push(
+        "composite_figi",
+        &candidate.composite_figi,
+        &candidate.country,
+    );
     serde_json::json!({
         "instrument_id": "",
         "candidate": true,
@@ -332,7 +336,12 @@ pub fn bring_in_request(
         .flatten()
         .take(16)
         .filter_map(|i| {
-            let field = |name: &str| i.get(name).and_then(|v| v.as_str()).unwrap_or_default().trim();
+            let field = |name: &str| {
+                i.get(name)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .trim()
+            };
             let (scheme, value, source) = (field("scheme"), field("value"), field("source"));
             let mic = source.len() == 4 && source.bytes().all(|b| b.is_ascii_alphanumeric());
             let venue = source.starts_with("VEN-") && source.len() <= 40;
@@ -358,7 +367,8 @@ pub fn bring_in_request(
     Some(meridian_domain::v1::ResolveIdentifierRequest {
         identifiers,
         stated_asset_class,
-        stated_currency: if currency.len() == 3 && currency.bytes().all(|b| b.is_ascii_uppercase()) {
+        stated_currency: if currency.len() == 3 && currency.bytes().all(|b| b.is_ascii_uppercase())
+        {
             currency
         } else {
             String::new()
@@ -3093,7 +3103,10 @@ mod one_search_tests {
         assert!(list[0].get("candidate").is_none());
         for fresh in &list[1..] {
             assert_eq!(fresh["candidate"], true);
-            assert_eq!(fresh["instrument_id"], "", "no platform ID is shown or submitted");
+            assert_eq!(
+                fresh["instrument_id"], "",
+                "no platform ID is shown or submitted"
+            );
         }
         assert_eq!(list[1]["exchange_mic"], "XNAS");
         assert_eq!(list[2]["description"], "SPY Trust");
@@ -3138,6 +3151,7 @@ mod one_search_tests {
         assert_eq!(request.stated_description, "SPDR S&P 500 ETF Trust");
         // Nothing open to look for: nothing is sent.
         assert!(bring_in_request(&serde_json::json!({"identifiers": [
-            {"scheme": "isin", "value": "US78462F1030", "source": ""}]})).is_none());
+            {"scheme": "isin", "value": "US78462F1030", "source": ""}]}))
+        .is_none());
     }
 }
