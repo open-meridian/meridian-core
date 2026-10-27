@@ -963,7 +963,7 @@ pub(crate) async fn frame(
                 Some("none") => "Nothing was changed.",
                 _ => "",
             };
-            let choices = match records
+            let mut choices = match records
                 .plugin_settings
                 .iter()
                 .find(|record| record.plugin_instance_id == instance)
@@ -971,6 +971,7 @@ pub(crate) async fn frame(
                 Some(record) => crate::admin::choices(&app, &instance, record, &records).await,
                 None => crate::admin::settings::Choices::default(),
             };
+            choices.bring_in = access.deployment_admin;
             // Its raw records and moves, on its Summary alone, for a plugin
             // keeping them (W6.9, contract v16).
             let on_summary = matches!(

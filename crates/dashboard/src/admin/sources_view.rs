@@ -414,7 +414,7 @@ pub fn page(
             let head = format!(
                 "<p class=\"hint\" data-instrument=\"{id}\"><strong>{name}</strong> {class}{currency}</p>",
                 id = escape(&record.instrument_id),
-                name = escape(&record.description),
+                name = escape(&crate::admin::instruments::name_of(record)),
                 class = escape(crate::admin::instruments::class_name(record.asset_class)),
                 currency = if record.currency.is_empty() {
                     String::new()
