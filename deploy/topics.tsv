@@ -244,7 +244,7 @@ platform.reference.query.read-calendar	query	compliance,confirmation,connectivit
 platform.reference.query.read-instrument-history	query	dashboard	instrument
 platform.reference.query.read-template	query	compliance,confirmation,connectivity,custody,data,ems,oms,operations,portfolio,reference,reporting,servicing,settlement,signal,dashboard,analytics	instrument
 platform.reference.query.resolve-company	query	data,lake,dashboard	instrument
-platform.reference.query.resolve-identifier	query	custody,data,lake,street,bor,reporting,connectivity,reference,analytics	instrument
+platform.reference.query.resolve-identifier	query	custody,data,lake,street,bor,reporting,connectivity,reference,analytics,dashboard	instrument
 platform.reference.query.resolve-instrument	query	street,bor,portfolio,reporting,compliance,oms,operations,conductor,lake,data,ems,connectivity,reference,analytics	instrument
 platform.reference.query.resolve-venue	query	data,connectivity,ems,dashboard	instrument
 platform.street.command.re-resolve-activity	command	custody	street
