@@ -395,9 +395,11 @@ pub fn family_held<'a>(scheme: &'a str, source: &str, list: &LicenceList) -> &'a
 /// The identifiers a request to the platform may carry (W3's invariant;
 /// W3.25): each in a scheme whose family the list names; never the `LCL-`
 /// ID, never `open_meridian_local`, never the platform's own ID scheme, and
-/// never a source-scoped code but a ticker carrying its venue and, where
-/// the list names the `administrator_symbol` family, a symbol whose source
-/// is an administrator it admits (ruling 545). A vendor's symbol never is.
+/// never a source-scoped code but a ticker carrying its venue, a listing's
+/// FIGI paired with where it lists (contract v24's FIGI levels:
+/// [`paired_listing`]) and, where the list names the `administrator_symbol`
+/// family, a symbol whose source is an administrator it admits (ruling
+/// 545). A vendor's symbol never is.
 pub fn sendable(identifiers: &[Asked], list: &LicenceList) -> Vec<PbIdentifier> {
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
@@ -410,7 +412,10 @@ pub fn sendable(identifiers: &[Asked], list: &LicenceList) -> Vec<PbIdentifier> 
             continue;
         }
         let licensed = family_held(&asked.scheme, &asked.source, list);
-        if !asked.source.is_empty() && asked.scheme != "ticker" && licensed != ADMINISTRATOR_SYMBOL
+        if !asked.source.is_empty()
+            && asked.scheme != "ticker"
+            && licensed != ADMINISTRATOR_SYMBOL
+            && !paired_listing(&asked.scheme, &asked.source)
         {
             continue;
         }
@@ -426,6 +431,24 @@ pub fn sendable(identifiers: &[Asked], list: &LicenceList) -> Vec<PbIdentifier> 
         }
     }
     out
+}
+
+/// Whether a FIGI's `source` is the pairing contract v24 gives a listing's
+/// FIGI (FIGI levels, ruled 2026-10-14): a composite FIGI with its
+/// country's ISO 3166 code, an exchange-level FIGI with its listing's ISO
+/// 10383 MIC. Such a source names where the listing is, not whose code it
+/// is, so the FIGI travels with it; a share-class FIGI takes none.
+pub fn paired_listing(scheme: &str, source: &str) -> bool {
+    match scheme {
+        "composite_figi" => source.len() == 2 && source.bytes().all(|b| b.is_ascii_uppercase()),
+        "figi" => {
+            source.len() == 4
+                && source
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+        }
+        _ => false,
+    }
 }
 
 /// Whether a resolve's source states the minimum a record needs (W3.7; the
@@ -1607,6 +1630,35 @@ mod tests {
             .map(|identifier| (identifier.scheme, identifier.source))
             .collect();
         assert_eq!(sent, vec![("ticker".to_string(), "XCME".to_string())]);
+        // A listing's FIGI travels paired with where it lists (contract
+        // v24): the composite with its country, the exchange-level FIGI with
+        // its MIC -- SPY's composite reached the platform without its "US"
+        // before (ruling 786). A FIGI under any other source is not sent.
+        let listings = vec![
+            asked("share_class_figi", "BBG001S72SM3", ""),
+            asked("composite_figi", "BBG000BDTBL9", "US"),
+            asked("figi", "BBG000BDTF76", "ARCX"),
+            asked("ticker", "SPY", "VEN-01JUSCOMPOSITE00000000001"),
+            asked("composite_figi", "BBG000BDTBL9", "snaptrade"),
+            asked("figi", "BBG000BDTF76", "us"),
+            asked("share_class_figi", "BBG001S72SM3", "US"),
+        ];
+        let sent: Vec<(String, String, String)> = sendable(&listings, &list)
+            .into_iter()
+            .map(|identifier| (identifier.scheme, identifier.value, identifier.source))
+            .collect();
+        let triple = |scheme: &str, value: &str, source: &str| {
+            (scheme.to_string(), value.to_string(), source.to_string())
+        };
+        assert_eq!(
+            sent,
+            vec![
+                triple("share_class_figi", "BBG001S72SM3", ""),
+                triple("composite_figi", "BBG000BDTBL9", "US"),
+                triple("figi", "BBG000BDTF76", "ARCX"),
+                triple("ticker", "SPY", "VEN-01JUSCOMPOSITE00000000001"),
+            ]
+        );
         // A list without FIGI sends none of its three levels.
         let mut narrow = list;
         narrow.schemes.retain(|scheme| scheme != "figi");
@@ -2359,6 +2411,76 @@ mod tests {
             .identifiers
             .iter()
             .all(|i| !i.value.starts_with("LCL-") && i.scheme != LOCAL_SCHEME));
+    }
+
+    /// Ruling 786: SPY brought in from the picker -- its ticker on the US
+    /// composite venue, its share-class FIGI and its composite FIGI paired
+    /// with "US" -- and left awaiting the platform's staff is asked again
+    /// with its composite FIGI, the identifier the platform's fund verifier
+    /// confirms it on (778, 780), and resolved by the answer (787).
+    #[test]
+    fn spy_awaiting_staff_is_asked_again_with_its_composite_figi() {
+        let store = MemoryStore::new();
+        let id = |scheme: &str, value: &str, source: &str| PbIdentifier {
+            scheme: scheme.into(),
+            value: value.into(),
+            source: source.into(),
+            ..Default::default()
+        };
+        let request = ResolveIdentifierRequest {
+            identifiers: vec![
+                id("ticker", "SPY", "VEN-01JUSCOMPOSITE00000000001"),
+                id("share_class_figi", "BBG001S72SM3", ""),
+                id("composite_figi", "BBG000BDTBL9", "US"),
+            ],
+            as_of_ns: NOW,
+            stated_asset_class: AssetClass::Fund as i32,
+            stated_description: "SPDR S&P 500 ETF Trust".into(),
+            stated_currency: "USD".into(),
+            ..Default::default()
+        };
+        let held = unmatched(&store, &request, PlatformSaid::Pending);
+        let record = store.by_id(&held.reply.instrument_id).unwrap().unwrap();
+        assert_eq!(record.local.reason, ProvisionalReason::AwaitingStaff as i32);
+        let mut spy = master("INS-01JSPY", "BBG001S72SM3");
+        spy.asset_class = AssetClass::Fund as i32;
+        // The platform's answer, whichever identifier the request leads with.
+        let says = Says(
+            std::sync::Mutex::new(
+                ["SPY", "BBG001S72SM3", "BBG000BDTBL9"]
+                    .into_iter()
+                    .map(|value| {
+                        (
+                            value.to_string(),
+                            PlatformSaid::Record(Box::new(spy.clone())).into(),
+                        )
+                    })
+                    .collect(),
+            ),
+            std::sync::Mutex::new(Vec::new()),
+        );
+        let writing = std::sync::Mutex::new(());
+        let mut asked = std::collections::HashMap::new();
+        let next_day = NOW + crate::reask::STAFF_AGAIN_NS;
+        let applied =
+            crate::reask::ask_again(&store, &says, &writing, &mut asked, 100, next_day).unwrap();
+        let sent = says.1.lock().unwrap();
+        assert_eq!(sent.len(), 1, "asked again once, a day on");
+        assert_eq!(applied.len(), 1);
+        let carried: Vec<(&str, &str)> = sent[0]
+            .identifiers
+            .iter()
+            .map(|i| (i.scheme.as_str(), i.source.as_str()))
+            .collect();
+        assert!(
+            carried.contains(&("composite_figi", "US")),
+            "the composite FIGI reaches the platform with its country: {carried:?}"
+        );
+        assert!(carried.contains(&("share_class_figi", "")));
+        assert_eq!(
+            crate::replace::current(&store, &held.reply.instrument_id).unwrap(),
+            "INS-01JSPY"
+        );
     }
 
     /// W3.26 (contract v24; the names approved 2026-10-15): the admin makes
