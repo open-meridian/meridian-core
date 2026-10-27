@@ -145,8 +145,19 @@ fn a_quote_below_intrinsic_is_not_evaluated_and_says_so() {
         .filter(|u| u.reason == BELOW_INTRINSIC)
         .collect();
     // The bid, and the mid it drags under intrinsic with it; the ask stands.
-    let sides: Vec<&str> = below.iter().map(|u| u.detail.as_str()).collect();
+    // Each names its side, its quote and the model's value with no
+    // volatility -- here the forward's intrinsic, discounted (ruling 791).
+    let sides: Vec<&str> = below
+        .iter()
+        .map(|u| u.detail.split(':').next().unwrap())
+        .collect();
     assert_eq!(sides, vec!["bid", "mid"]);
+    assert!(
+        below[0].detail.starts_with("bid: 1 is at or under 50"),
+        "{}",
+        below[0].detail
+    );
+    assert!(below[0].detail.ends_with("its value with no volatility"));
     assert!(below[0].series_key[0].1.contains("C04500000"));
 }
 
@@ -237,16 +248,21 @@ fn a_surface_fit_that_fails_says_which_expiration() {
         .retain(|s| ["4950.00", "5000.00", "5050.00"].contains(&s["strike"].as_str().unwrap()));
     let doc = inputs(vec![chain], vec![("surface_fit", 1, vec![])]);
     let answer = crate::compute(&doc).unwrap();
-    let failed: Vec<_> = answer
+    // Too few quotes is not a fit that failed (ruling 791): it says so.
+    assert!(answer.not_evaluated.iter().all(|u| u.reason != FIT_FAILED));
+    let short: Vec<_> = answer
         .not_evaluated
         .iter()
-        .filter(|u| u.reason == FIT_FAILED)
+        .filter(|u| u.reason == PRICE_MISSING)
         .collect();
-    assert_eq!(failed.len(), 1);
+    assert_eq!(short.len(), 1);
     assert!(
-        failed[0].detail.starts_with("2026-"),
+        short[0].detail.starts_with("2026-")
+            && short[0]
+                .detail
+                .contains("not enough quotes: 3 out-of-the-money strikes"),
         "{}",
-        failed[0].detail
+        short[0].detail
     );
 }
 
@@ -508,4 +524,140 @@ fn a_missing_price_names_a_dataset_served_not_kept() {
         .not_evaluated
         .iter()
         .all(|u| u.detail == "the underlying's price"));
+}
+
+/// An American chain quoted at QuantLib 1.40's prices (its finite-difference
+/// engine, 800 by 800, the SDK's pinned oracle): S 68.43, r 3.9%, no
+/// dividend, vol 78%, 46 days. The American put's early-exercise premium
+/// pulls plain parity's forward under the true one; the de-Americanised
+/// forward recovers it (ruling 791).
+#[test]
+fn an_american_chains_forward_is_its_european_equivalent() {
+    const QUANTLIB: [(f64, f64, f64); 4] = [
+        (67.0, 8.350407, 6.610352),
+        (68.0, 7.881110, 7.138146),
+        (69.0, 7.432793, 7.687065),
+        (70.0, 7.005016, 8.256676),
+    ];
+    let (spot, rate, days) = (68.43, 0.039, 46);
+    let t = days as f64 / 365.0;
+    let expiry = meridian_domain::date::Date::of_utc_instant(AS_OF + days * DAY).to_string();
+    let mut series = Vec::new();
+    for (k, call, put) in QUANTLIB {
+        for (right, p) in [("call", call), ("put", put)] {
+            series.push(json!({
+                "series_key": [{"scheme": "occ_osi", "value": format!("TQQQ {right} {k}")}],
+                "right": right,
+                "strike": format!("{k:.2}"),
+                "expiration_date": expiry,
+                "settles_at_ns": (AS_OF + days * DAY).to_string(),
+                "exercise_style": "american",
+                "model_id": "american_binomial",
+                "multiplier": "100",
+                "bid": format!("{p:.6}"),
+                "ask": format!("{p:.6}"),
+                "quote_dataset": "tradier-1:options",
+                "quote_source_ns": AS_OF.to_string(),
+            }));
+        }
+    }
+    let mut chain = index_chain(0.2, 0.0, &[30]);
+    chain["underlying_kind"] = json!("equity");
+    chain["spot"]["amount"] = json!(format!("{spot}"));
+    chain["rate"]["points"] = json!([{"years": "0.01", "rate": format!("{rate}")}, {"years": "1", "rate": format!("{rate}")}]);
+    chain["series"] = json!(series);
+    let doc = inputs(vec![chain], vec![("implied_forward", 1, vec!["expiry"])]);
+    let answer = crate::compute(&doc).unwrap();
+    let component = |name: &str| {
+        figures(&answer, "implied_forward")
+            .into_iter()
+            .find(|f| f.breakdown.contains(&("component".into(), name.into())))
+            .map(value)
+            .unwrap()
+    };
+    let truth = spot * (rate * t).exp();
+    let plain = 68.0 + (7.881110 - 7.138146) * (rate * t).exp();
+    assert!(
+        truth - plain > 0.02,
+        "plain parity is biased: {plain} against {truth}"
+    );
+    let forward = component("forward");
+    assert!((forward - truth).abs() < 0.006, "{forward} against {truth}");
+    // No borrow where none priced it: plain parity would say 0.24%.
+    assert!(component("borrow").abs() < 7e-4, "{}", component("borrow"));
+}
+
+/// A deep American call quoted between its exercise value now (S - K) and
+/// the forward's intrinsic, discounted: no volatility prices it, so it is
+/// under its intrinsic value as the tree counts it -- never a failed fit.
+#[test]
+fn a_deep_american_call_under_its_discounted_forward_is_below_intrinsic() {
+    let mut chain = index_chain(0.30, 0.0, &[45]);
+    chain["underlying_kind"] = json!("equity");
+    for s in chain["series"].as_array_mut().unwrap() {
+        s["exercise_style"] = json!("american");
+        s["model_id"] = json!("american_binomial");
+    }
+    let call = chain["series"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|s| s["strike"] == "4500.00" && s["right"] == "call")
+        .unwrap();
+    // S - K is 500; held to expiry with no volatility the call is worth
+    // S e^-qT - K e^-rT, about 512.9 (r K above q S: never exercised early).
+    call["bid"] = json!("503.00");
+    call["ask"] = json!("511.00");
+    let doc = inputs(vec![chain], vec![("implied_volatility", 1, vec![])]);
+    let answer = crate::compute(&doc).unwrap();
+    let mine: Vec<_> = answer
+        .not_evaluated
+        .iter()
+        .filter(|u| u.series_key[0].1.contains("C04500000"))
+        .collect();
+    assert_eq!(mine.len(), 3, "{mine:?}");
+    assert!(mine.iter().all(|u| u.reason == BELOW_INTRINSIC), "{mine:?}");
+}
+
+/// Ruling 788: a curve the client is not entitled to is named so, with the
+/// reason not entitled, wherever the curve is missing.
+#[test]
+fn a_curve_not_entitled_is_named_not_missing() {
+    let said = "the risk-free curve ust_cmt: sample-options is not entitled to us-treasury:ust_par";
+    let mut chain = index_chain(0.22, 0.0, &[30]);
+    chain["rate"] = json!({"missing": said, "missing_reason": "not_entitled"});
+    let doc = inputs(
+        vec![chain],
+        vec![
+            ("implied_volatility", 1, vec![]),
+            ("volatility_index", 1, vec![]),
+        ],
+    );
+    let answer = crate::compute(&doc).unwrap();
+    assert!(!answer.not_evaluated.is_empty());
+    for u in &answer.not_evaluated {
+        assert_eq!(u.reason, NOT_ENTITLED, "{u:?}");
+        assert_eq!(u.detail, said);
+    }
+}
+
+/// Ruling 791: a chain with no quote at the as-of -- a past date before the
+/// lake held it -- answers no history for the index, never a level.
+#[test]
+fn a_volatility_index_with_no_chain_held_is_no_history() {
+    let mut chain = index_chain(0.20, 0.0, &[23, 37]);
+    for s in chain["series"].as_array_mut().unwrap() {
+        s["bid"] = Value::Null;
+        s["ask"] = Value::Null;
+    }
+    let doc = inputs(vec![chain], vec![("volatility_index", 1, vec![])]);
+    let answer = crate::compute(&doc).unwrap();
+    assert!(figures(&answer, "volatility_index").is_empty());
+    assert_eq!(answer.not_evaluated.len(), 1);
+    assert_eq!(answer.not_evaluated[0].reason, PRICE_MISSING);
+    assert!(
+        answer.not_evaluated[0].detail.contains("no history"),
+        "{}",
+        answer.not_evaluated[0].detail
+    );
 }
