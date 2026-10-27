@@ -1703,6 +1703,81 @@ def the_v24_pages(browser, prefix):
         ctx.close()
 
 
+# Contract v28 (W3.33; rulings 727, 728, 774, 778): the Sources page, the
+# one search's picker and the per-source view, inside the dashboard.
+SOURCES = f"{BASE}/admin/instruments/sources"
+SOURCE_SIZES = [("phone", 375, 812), ("narrow", 582, 820), ("desktop", 1280, 800)]
+UNLABELLED = """() => [...document.querySelectorAll('main input, main button, main select, main textarea')]
+  .filter((el) => el.offsetParent !== null && el.type !== 'hidden')
+  .filter((el) => !(el.getAttribute('aria-label') || (el.labels && el.labels.length)
+    || el.textContent.trim() || el.getAttribute('title')))
+  .map((el) => el.outerHTML.slice(0, 80))"""
+SIDEWAYS = "() => document.documentElement.scrollWidth > document.documentElement.clientWidth + 1"
+
+
+def the_sources_page(browser, prefix):
+    """The Sources page at 375, 582 and 1280 px, light and dark: one screen,
+    nothing sideways, every control labelled; typing SPY lists it with no
+    record ID, Enter brings it in before the picker has a value, and Show
+    sources draws each source's line for it."""
+    for size, width, height in SOURCE_SIZES:
+        for scheme in ("light", "dark"):
+            ctx = context(browser, width, height, scheme=scheme)
+            page = ctx.new_page()
+            errors = []
+            page.on("pageerror", lambda e: errors.append(str(e)))
+            page.goto(SOURCES)
+            settled(page)
+            label = f"the Sources page at {size} ({width}px), {scheme}"
+            problems = page.evaluate(FIT)
+            check(not problems, f"{label} fits one screen{': ' + '; '.join(problems) if problems else ''}")
+            check(not page.evaluate(SIDEWAYS), f"{label} scrolls nothing sideways")
+            unlabelled = page.evaluate(UNLABELLED)
+            check(not unlabelled, f"{label} labels every control: {unlabelled}")
+            page.screenshot(path=os.path.join(OUT, f"{prefix}-sources-{size}-{scheme}.png"))
+            box = page.locator("om-instrument-picker input[role=combobox]")
+            box.fill("SPY")
+            page.wait_for_selector("om-instrument-picker [role=option]", timeout=5000)
+            options = page.eval_on_selector_all(
+                "om-instrument-picker [role=option]", "os => os.map(o => o.textContent)")
+            check(any("SPDR S&P 500 ETF Trust" in o for o in options),
+                  f"{label}: typing SPY lists it: {options}")
+            check(not any("INS-" in o for o in options),
+                  f"{label}: no record ID is shown in the list: {options}")
+            problems = page.evaluate(FIT)
+            check(not problems, f"{label} with SPY listed fits one screen"
+                  f"{': ' + '; '.join(problems) if problems else ''}")
+            page.screenshot(path=os.path.join(OUT, f"{prefix}-sources-spy-listed-{size}-{scheme}.png"))
+            box.press("Enter")
+            page.wait_for_function(
+                "() => document.querySelector('om-instrument-picker').value !== ''", timeout=8000)
+            value = page.evaluate("() => document.querySelector('om-instrument-picker').value")
+            check(value.startswith("INS-"), f"{label}: SPY chosen by Enter is brought in: {value}")
+            said = page.text_content("om-instrument-picker [role=status]") or ""
+            check("chosen" in said, f"{label}: the outcome is announced: {said!r}")
+            page.click("#pick-instrument button[type=submit]")
+            settled(page)
+            rows = page.eval_on_selector_all("#sources-table tbody tr", "rows => rows.length")
+            check(rows > 0, f"{label}: Show sources draws each source's line: {rows}")
+            states = set(page.eval_on_selector_all(
+                "#sources-table tbody tr", "rows => rows.map(r => r.dataset.state)"))
+            check(states <= {"quote", "price", "not-covered", "not-entitled"} and states,
+                  f"{label}: each line says a quote, a price, doesn't cover it or not entitled: {states}")
+            # The admin here administers every plugin and reads none at a
+            # data level, so no source's price reaches them (728's bound).
+            check("not-entitled" in states and "price" not in states,
+                  f"{label}: a source no plugin the person reads is entitled to says so: {states}")
+            problems = page.evaluate(FIT)
+            check(not problems, f"{label} with SPY's sources fits one screen"
+                  f"{': ' + '; '.join(problems) if problems else ''}")
+            check(not page.evaluate(SIDEWAYS), f"{label} with SPY's sources scrolls nothing sideways")
+            cut = page.evaluate(CUT_UNTITLED, "#sources-table")
+            check(not cut, f"{label}: no cell is cut off but one whose title holds it whole: {cut}")
+            page.screenshot(path=os.path.join(OUT, f"{prefix}-sources-spy-{size}-{scheme}.png"))
+            check(not errors, f"{label} ran without a script error: {errors}")
+            ctx.close()
+
+
 with sync_playwright() as playwright:
     browser = playwright.chromium.launch()
     prefix = "development" if PASS == "fit" else "settings"
@@ -1739,6 +1814,7 @@ with sync_playwright() as playwright:
     the_settings_sidebar(browser, prefix)
     the_model_routing_tab(browser, prefix)
     the_portal_overview(browser, prefix)
+    the_sources_page(browser, prefix)
     browser.close()
 
 if failures:

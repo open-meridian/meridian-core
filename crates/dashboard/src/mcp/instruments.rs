@@ -105,6 +105,35 @@ pub static SPECS: &[Spec] = &[
         area: Area::Instruments,
         input_schema: merge_schema,
     },
+    // Contract v28 (W3.33; rulings 727, 728, 761, 774): the one search, a
+    // candidate brought in, and the per-source view, as the Sources page.
+    Spec {
+        name: "find_instruments",
+        title: "Find an instrument",
+        description: "the one search the instrument picker makes: what was typed -- a ticker, a name, an ISIN, a CUSIP or a FIGI -- answered with the deployment's records first, then the instruments it does not hold yet, each marked candidate with an empty instrument_id; an ISIN or a CUSIP typed is sent to the platform's search alone and kept nowhere. The platform not reached, the records answer alone.",
+        reads: true,
+        open_world: true,
+        area: Area::Instruments,
+        input_schema: find_schema,
+    },
+    Spec {
+        name: "bring_in_instrument",
+        title: "Bring an instrument in",
+        description: "a candidate find_instruments answered, as it answered it, brought into the deployment: matched to a record it holds, or asked of the platform to match or mint, or kept provisional while the platform is not reached; answered with the record. Only its open identifiers travel; nobody is asked for an exchange.",
+        reads: false,
+        open_world: true,
+        area: Area::Instruments,
+        input_schema: bring_in_schema,
+    },
+    Spec {
+        name: "read_instrument_sources",
+        title: "Read an instrument's sources",
+        description: "one record as each of the deployment's sources has it, side by side: each dataset serving quotes or prices with the source's ticker, exchange and name for it and its latest quote or price with the dataset's declared delay (state quote or price); or not_covered with the lake's reason; or not_entitled where no plugin the person reads is entitled to it.",
+        reads: true,
+        open_world: false,
+        area: Area::Instruments,
+        input_schema: one_schema,
+    },
     Spec {
         name: "ask_platform_for_instrument",
         title: "Ask the platform about a record",
@@ -283,6 +312,27 @@ fn one_schema() -> Value {
         "type": "object",
         "properties": {"instrument_id": {"type": "string"}},
         "required": ["instrument_id"],
+        "additionalProperties": false,
+    })
+}
+
+fn find_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "minLength": 1, "maxLength": 64},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 25},
+        },
+        "required": ["query"],
+        "additionalProperties": false,
+    })
+}
+
+fn bring_in_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {"candidate": {"type": "object"}},
+        "required": ["candidate"],
         "additionalProperties": false,
     })
 }
@@ -1223,6 +1273,9 @@ pub async fn call(app: &App, caller: &Caller, spec: &Spec, arguments: Value) -> 
         "accept_offered_values" => accept(app, caller, &arguments).await,
         "merge_instruments" => merge(app, caller, &arguments).await,
         "ask_platform_for_instrument" => ask_platform(app, caller, &arguments).await,
+        "find_instruments" => find(app, &arguments).await,
+        "bring_in_instrument" => bring_in(app, caller, &arguments).await,
+        "read_instrument_sources" => sources(app, caller, &arguments).await,
         "list_calendars" => list_calendars(app, caller, &arguments).await,
         "read_calendar" => read_calendar(app, caller, &arguments).await,
         "set_reports_usage" => set_reports_usage(app, caller, &arguments).await,
@@ -1386,6 +1439,127 @@ async fn read(app: &App, caller: &Caller, arguments: &Value) -> Value {
             vec![json!({"path": "instrument_id"})],
         ),
         Ok(Some(item)) => json!({"outcome": "unchanged", "data": to_complete_json(&item)}),
+    }
+}
+
+/// W3.33 (contract v28): the picker's one search, as the Sources page's.
+async fn find(app: &App, arguments: &Value) -> Value {
+    let mut problems = Problems::default();
+    let Some(top) = object(arguments, "", &mut problems) else {
+        return problems.refusal();
+    };
+    only(top, &["query", "limit"], "", &mut problems);
+    let query = text(top, "query", "", true, &mut problems);
+    let limit = match top.get("limit") {
+        None => 10,
+        Some(value) => match value.as_u64() {
+            Some(n @ 1..=25) => n as usize,
+            _ => {
+                problems.add("limit", "1 to 25");
+                10
+            }
+        },
+    };
+    if query.chars().count() > 64 {
+        problems.add("query", "at most 64 characters");
+    }
+    if !problems.is_empty() {
+        return problems.refusal();
+    }
+    let (found, platform) = tokio::join!(
+        page::search(&app.bus, &query, limit),
+        page::candidates(&app.bus, &query, limit)
+    );
+    match found {
+        Err(failed) => refused("unavailable", &failed, Vec::new()),
+        Ok(found) => {
+            let held: Vec<InstrumentRecord> = found
+                .instruments
+                .into_iter()
+                .filter_map(|i| i.instrument)
+                .take(limit)
+                .collect();
+            let platform = platform.ok().and_then(|reply| reply.answer);
+            json!({"outcome": "unchanged", "data": {
+                "results": page::one_list(&held, platform.as_ref(), limit),
+            }})
+        }
+    }
+}
+
+/// W3.1 for a candidate chosen (ruling 774), as the Sources page's picker
+/// brings one in: on the person's behalf, with the delegation's stamp.
+async fn bring_in(app: &App, caller: &Caller, arguments: &Value) -> Value {
+    let mut problems = Problems::default();
+    let Some(top) = object(arguments, "", &mut problems) else {
+        return problems.refusal();
+    };
+    only(top, &["candidate"], "", &mut problems);
+    let candidate = top.get("candidate").cloned().unwrap_or_default();
+    if !candidate.is_object() {
+        problems.add("candidate", "the candidate as find_instruments answered it");
+    }
+    if !problems.is_empty() {
+        return problems.refusal();
+    }
+    let Some(request) = page::bring_in_request(&candidate) else {
+        return refused(
+            "invalid_argument",
+            "the candidate carries no open identifier to look for",
+            vec![json!({"path": "candidate.identifiers"})],
+        );
+    };
+    let resolved: Result<meridian_domain::v1::ResolveIdentifierReply, _> = ask(
+        app,
+        caller,
+        page::RESOLVE_IDENTIFIER,
+        "meridian.v1.ResolveIdentifierRequest",
+        request,
+        CHANGING,
+    )
+    .await;
+    match resolved {
+        Err(failed) => bus_refused(failed, "candidate"),
+        Ok(reply) if !reply.found || reply.instrument_id.is_empty() => refused(
+            "unavailable",
+            "the instrument store could not bring it in",
+            vec![json!({"path": "candidate"})],
+        ),
+        Ok(reply) => match list_one(app, caller, &reply.instrument_id).await {
+            Ok(Some(item)) => json!({"outcome": "made", "data": to_complete_json(&item)}),
+            Ok(None) => json!({"outcome": "made", "data": {"instrument_id": reply.instrument_id}}),
+            Err(refusal) => refusal,
+        },
+    }
+}
+
+/// Ruling 728: the per-source view, as the Sources page draws it.
+async fn sources(app: &App, caller: &Caller, arguments: &Value) -> Value {
+    let id = match one_id(arguments) {
+        Ok(id) => id,
+        Err(refusal) => return refusal,
+    };
+    let record = match list_one(app, caller, &id).await {
+        Err(refusal) => return refusal,
+        Ok(None) => {
+            return refused(
+                "REFUSAL_REASON_UNKNOWN_INSTRUMENT",
+                &format!("no record {id} in this deployment"),
+                vec![json!({"path": "instrument_id"})],
+            )
+        }
+        Ok(Some(item)) => item.instrument.unwrap_or_default(),
+    };
+    let access = match app.records.current(app.clock.now_ns()) {
+        Ok(records) => caller.access(&records),
+        Err(stale) => return refused("unavailable", &stale.to_string(), Vec::new()),
+    };
+    match crate::admin::sources_view::lines(&app.bus, &caller.subject, &access, &record).await {
+        Err(failed) => refused("unavailable", &failed, Vec::new()),
+        Ok(lines) => json!({"outcome": "unchanged", "data": {
+            "instrument_id": record.instrument_id,
+            "sources": crate::admin::sources_view::lines_json(&lines),
+        }}),
     }
 }
 

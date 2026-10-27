@@ -62,6 +62,9 @@ pub mod topics {
     /// the default risk-free curve's record, by its symbol, read-only.
     pub const RESOLVE_IDENTIFIER: &str = "platform.reference.query.resolve-identifier";
     pub const READ_CALENDAR: &str = "platform.reference.query.read-calendar";
+    /// Ruling 767: the datasets' declarations a read's answer leaves unset,
+    /// from the lake's listing, once per job.
+    pub const LIST_DATASETS: &str = "platform.lake.query.list-datasets";
 
     /// The component's own topic, coordinator to worker: a unit, asked of
     /// the worker pool's queue group and answered by one worker. A

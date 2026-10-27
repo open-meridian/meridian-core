@@ -11,7 +11,10 @@
 //! for a row with no venue, the dataset's declared `calendar_id`; where
 //! neither holds sessions, a PM series settles at 16:00 in the dataset's
 //! declared day time zone, and a series with no zone at all is answered not
-//! evaluated, naming why, never at a guessed hour.
+//! evaluated, naming why, never at a guessed hour. A read's answer leaves
+//! each dataset's declaration unset (W10.6), so the declarations come from
+//! the lake's listing of datasets (W10.9), read once per job on the
+//! client's behalf (ruling 767).
 //!
 //! Nothing is minted: a series not held is named by its key (ruling 561).
 
@@ -24,11 +27,11 @@ use meridian_domain::date::Date;
 use meridian_domain::exact::Exact;
 use meridian_domain::v1::{
     self as v1, ChainRef, CorporateActionKind, DatasetRef, Identifier, InstrumentType, Job,
-    ListCorporateActionsReply, ListCorporateActionsRequest, ListQuotesReply, ListQuotesRequest,
-    ListScenariosReply, ListScenariosRequest, ListSeriesReply, ListSeriesRequest,
-    ListStatisticsReply, ListStatisticsRequest, PriceKind, QualityState, ReadCalendarReply,
-    ReadCalendarRequest, ResolveInstrumentReply, ResolveInstrumentRequest, StatisticKind,
-    SubjectRef,
+    ListCorporateActionsReply, ListCorporateActionsRequest, ListDatasetsReply, ListDatasetsRequest,
+    ListQuotesReply, ListQuotesRequest, ListScenariosReply, ListScenariosRequest, ListSeriesReply,
+    ListSeriesRequest, ListStatisticsReply, ListStatisticsRequest, PriceKind, QualityState,
+    ReadCalendarReply, ReadCalendarRequest, ResolveInstrumentReply, ResolveInstrumentRequest,
+    StatisticKind, SubjectRef,
 };
 use meridian_domain::zone::Zone;
 use prost::Message;
@@ -153,6 +156,49 @@ fn field<'a>(series: &'a v1::ListedSeries, path: &str) -> &'a str {
 fn amount(text: &str) -> Option<String> {
     let first = text.split_whitespace().next()?;
     first.parse::<Exact>().ok().map(|e| e.to_string())
+}
+
+/// What a job reads once to place its series in time, on the client's
+/// behalf: each calendar's trading sessions, and the lake's listing of
+/// datasets (W10.9), so within the client's entitlements (ruling 767) -- a
+/// dataset's declared venue, calendar and day time zone, which a read's
+/// answer leaves unset. A listing that cannot be read holds nothing, and a
+/// row it would have placed is answered not evaluated, naming why.
+#[derive(Debug, Default)]
+pub struct Placing {
+    calendars: BTreeMap<String, Option<v1::TradingSessions>>,
+    listed: Option<BTreeMap<String, meridian_pb::v1::DatasetDeclaration>>,
+}
+
+impl Placing {
+    fn declaration(
+        &mut self,
+        asker: &dyn Ask,
+        dataset: &str,
+    ) -> Option<meridian_pb::v1::DatasetDeclaration> {
+        if dataset.is_empty() {
+            return None;
+        }
+        self.listed
+            .get_or_insert_with(|| {
+                ask::<_, ListDatasetsReply>(
+                    asker,
+                    topics::LIST_DATASETS,
+                    "meridian.v1.ListDatasetsRequest",
+                    &ListDatasetsRequest {},
+                )
+                .map(|reply| {
+                    reply
+                        .datasets
+                        .into_iter()
+                        .filter_map(|d| Some((d.dataset, d.declaration?)))
+                        .collect()
+                })
+                .unwrap_or_default()
+            })
+            .get(dataset)
+            .cloned()
+    }
 }
 
 /// The sessions a row's venue or dataset names, and their zone.
@@ -280,7 +326,7 @@ pub fn chain(
     sources: &Option<v1::SourceChoice>,
     as_of: i64,
     rate: Option<&Value>,
-    calendars: &mut BTreeMap<String, Option<v1::TradingSessions>>,
+    placing: &mut Placing,
     live: bool,
 ) -> Result<Value, Refused> {
     let underlying = chain.underlying_instrument_id.as_str();
@@ -634,6 +680,14 @@ pub fn chain(
         if !dataset.is_empty() {
             datasets.insert(dataset.clone());
         }
+        // The declarations a read did not carry, from the job's listing.
+        for name in [&quote_dataset, &dataset] {
+            if !declarations.contains_key(name) {
+                if let Some(declared) = placing.declaration(asker, name) {
+                    declarations.insert(name.clone(), declared);
+                }
+            }
+        }
         let held = sessions(
             asker,
             &venue,
@@ -641,7 +695,7 @@ pub fn chain(
                 .get(&quote_dataset)
                 .or(declarations.get(&dataset)),
             as_of,
-            calendars,
+            &mut placing.calendars,
         );
         if today_local.is_none() {
             today_local = held
@@ -1046,6 +1100,195 @@ mod tests {
             v1::AssetClass::Equity as i32,
             &mut BTreeMap::new(),
         )
+    }
+
+    /// The lake and the instrument store for one chain of one PM series in
+    /// `tradier-1:options`, its quote naming `venue` (empty: a consolidated
+    /// feed), the listing declaring `declared` for the dataset where served.
+    struct Lake {
+        venue: &'static str,
+        declared: Option<meridian_pb::v1::DatasetDeclaration>,
+        listed: std::sync::atomic::AtomicU32,
+    }
+
+    const DATASET: &str = "tradier-1:options";
+    const VENUE: &str = "VEN-XCBO";
+    /// 2026-11-20 16:00 in New York (EST), 21:00 UTC.
+    const PM_NEW_YORK_NS: i64 = 1_795_208_400_000_000_000;
+
+    impl Ask for Lake {
+        fn ask(&self, topic: &str, _: &str, _: Vec<u8>) -> Result<(String, Vec<u8>), String> {
+            let source = |venue: &str| v1::Source {
+                dataset: DATASET.into(),
+                venue_id: venue.into(),
+                ..Default::default()
+            };
+            let key = vec![Identifier {
+                scheme: "occ_osi".into(),
+                value: "AAPL  261120C00230000".into(),
+                ..Default::default()
+            }];
+            let payload = match topic {
+                topics::LIST_SERIES => ListSeriesReply {
+                    series: vec![v1::ListedSeries {
+                        meta: Some(v1::ObservationMeta {
+                            series_key: key.clone(),
+                            source: Some(source("")),
+                            ..Default::default()
+                        }),
+                        fields: [
+                            ("put_or_call", "PUT_OR_CALL_CALL"),
+                            ("strike_price", "230.00 USD"),
+                            ("expiration_date", "2026-11-20"),
+                            ("exercise_style", "EXERCISE_STYLE_AMERICAN"),
+                        ]
+                        .into_iter()
+                        .map(|(path, value)| v1::TemplateFieldValue {
+                            path: path.into(),
+                            value: value.into(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+                topics::LIST_QUOTES => ListQuotesReply {
+                    quotes: vec![v1::Quote {
+                        meta: Some(v1::ObservationMeta {
+                            series_key: key,
+                            source: Some(source(self.venue)),
+                            valid_from_ns: PM_NEW_YORK_NS - 30 * DAY_NS,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+                topics::LIST_DATASETS => {
+                    self.listed
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let Some(declared) = &self.declared else {
+                        return Err(format!("no responders on {topic}"));
+                    };
+                    ListDatasetsReply {
+                        datasets: vec![DatasetRef {
+                            dataset: DATASET.into(),
+                            instance: "tradier-1".into(),
+                            declaration: Some(declared.clone()),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }
+                    .encode_to_vec()
+                }
+                // The venue's sessions, in New York (ruling 570 (i)).
+                topics::READ_CALENDAR => ReadCalendarReply {
+                    found: true,
+                    calendar_id: VENUE.into(),
+                    trading_sessions: Some(v1::TradingSessions {
+                        time_zone: "America/New_York".into(),
+                        sessions: vec![v1::TradingSession {
+                            weekdays: (1..=5).collect(),
+                            start_minute: 570,
+                            end_minute: 960,
+                            extended: false,
+                        }],
+                        early_closes: Vec::new(),
+                    }),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+                _ => return Err(format!("no responders on {topic}")),
+            };
+            Ok(("reply".into(), payload))
+        }
+    }
+
+    fn declaring(zone: &str) -> meridian_pb::v1::DatasetDeclaration {
+        meridian_pb::v1::DatasetDeclaration {
+            key: "options".into(),
+            day_time_zone: zone.into(),
+            day_end_minute: 960,
+            ..Default::default()
+        }
+    }
+
+    /// The series' settlement instant and what left it unsessioned, two
+    /// chains in one job (one listing).
+    fn settled(lake: &Lake) -> Vec<(i64, String)> {
+        let mut placing = Placing::default();
+        let as_of = PM_NEW_YORK_NS - 30 * DAY_NS;
+        (0..2)
+            .map(|_| {
+                let answered = chain(
+                    lake,
+                    &ChainRef {
+                        underlying_instrument_id: "INS-AAPL".into(),
+                        ..Default::default()
+                    },
+                    &None,
+                    as_of,
+                    None,
+                    &mut placing,
+                    false,
+                )
+                .unwrap();
+                let row = &answered["series"][0];
+                (
+                    row["settles_at_ns"].as_str().unwrap().parse().unwrap(),
+                    row["unsessioned"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// Ruling 767: a consolidated feed's quote names no venue and its
+    /// dataset none; the listing's declared day time zone settles a PM
+    /// series at 16:00 New York, the listing read once for the job.
+    #[test]
+    fn a_consolidated_datasets_declared_zone_settles_a_pm_series_at_four_new_york() {
+        let lake = Lake {
+            venue: "",
+            declared: Some(declaring("America/New_York")),
+            listed: Default::default(),
+        };
+        for (at, why) in settled(&lake) {
+            assert_eq!((at, why.as_str()), (PM_NEW_YORK_NS, ""));
+        }
+        assert_eq!(lake.listed.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Ruling 570 (i), unchanged: the venue's sessions win over the
+    /// dataset's declared zone where the venue holds them.
+    #[test]
+    fn a_venues_sessions_win_over_the_datasets_declared_zone() {
+        let lake = Lake {
+            venue: VENUE,
+            declared: Some(declaring("America/Chicago")),
+            listed: Default::default(),
+        };
+        for (at, why) in settled(&lake) {
+            assert_eq!((at, why.as_str()), (PM_NEW_YORK_NS, ""));
+        }
+    }
+
+    /// A listing that cannot be read places nothing: the series is answered
+    /// unsessioned, naming why, never at a guessed hour.
+    #[test]
+    fn a_listing_not_read_leaves_a_venueless_series_unsessioned_naming_why() {
+        let lake = Lake {
+            venue: "",
+            declared: None,
+            listed: Default::default(),
+        };
+        for (at, why) in settled(&lake) {
+            assert_eq!(at, 0);
+            assert!(why.contains("no day time zone"), "{why}");
+        }
+        assert_eq!(lake.listed.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

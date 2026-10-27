@@ -503,6 +503,31 @@ impl Platform {
         company_reply_from_json(&value).map_err(PlatformError::Malformed)
     }
 
+    /// W3.33 (contract v28; ruling 757): the instrument picker's search,
+    /// `SearchInstrumentCandidates`. A POST although it reads, so what the
+    /// person typed -- an ISIN or a CUSIP among it (ruling 761) -- stays
+    /// out of request logs. The platform's answer whole; a platform without
+    /// the route answers as unreachable, and the picker answers from the
+    /// deployment's own records.
+    pub async fn instrument_candidates(
+        &self,
+        request: &meridian_domain::v1::InstrumentCandidatesRequest,
+        now_ns: i64,
+    ) -> Result<meridian_domain::v1::InstrumentCandidatesReply, PlatformError> {
+        let body = serde_json::to_vec(&candidates_body(request))
+            .map_err(|failed| PlatformError::Malformed(failed.to_string()))?;
+        let response = self
+            .v24_call(
+                Method::Post,
+                "/api/v1/reference/instrument-candidates",
+                Some(body),
+                now_ns,
+            )
+            .await?;
+        let value: serde_json::Value = read_json(&response)?;
+        candidates_reply_from_json(&value).map_err(PlatformError::Malformed)
+    }
+
     /// A route contract v24 added (W3.4, W3.24, W3.25, W3.27, W3.28). A
     /// platform without it answers 404 -- or 405, 410 or 501 -- and is
     /// treated as unreachable, never as an answer (the build plan's step 4):
@@ -1303,6 +1328,93 @@ pub fn company_body(request: &meridian_domain::v1::MatchOrMintCompanyRequest) ->
             .collect::<Vec<_>>(),
         "name": request.name,
         "request_key": request.request_key,
+    })
+}
+
+/// W3.33: the search as the platform's route takes it, the empty fields
+/// left out so the platform's own defaults apply.
+pub fn candidates_body(
+    request: &meridian_domain::v1::InstrumentCandidatesRequest,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({"query": request.query});
+    if !request.mic.is_empty() {
+        body["mic"] = request.mic.clone().into();
+    }
+    if !request.country.is_empty() {
+        body["country"] = request.country.clone().into();
+    }
+    if request.limit > 0 {
+        body["limit"] = request.limit.into();
+    }
+    body
+}
+
+/// W3.33: the platform's candidates, read strictly where they name a held
+/// record -- an `INS-` ID or none -- and each source it read.
+pub fn candidates_reply_from_json(
+    value: &serde_json::Value,
+) -> Result<meridian_domain::v1::InstrumentCandidatesReply, String> {
+    use meridian_domain::v1::{
+        AssetClass, InstrumentCandidate, InstrumentCandidatesReply, SourceRead,
+    };
+    let mut candidates = Vec::new();
+    for held in value
+        .get("candidates")
+        .and_then(|held| held.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let instrument_id = text_of(held.get("instrument_id"));
+        if !instrument_id.is_empty() && !instrument_id.starts_with("INS-") {
+            return Err(format!(
+                "a candidate arrived as {instrument_id:?}, not the platform's"
+            ));
+        }
+        let identifiers = held
+            .get("identifiers")
+            .and_then(|held| held.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|identifier| {
+                let scheme = text_of(identifier.get("scheme"));
+                let value = text_of(identifier.get("value"));
+                (!scheme.is_empty() && !value.is_empty()).then(|| PbIdentifier {
+                    scheme,
+                    value,
+                    source: text_of(identifier.get("source")),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        candidates.push(InstrumentCandidate {
+            instrument_id,
+            ticker: text_of(held.get("ticker")),
+            mic: text_of(held.get("mic")),
+            country: text_of(held.get("country")),
+            name: text_of(held.get("name")),
+            asset_class: AssetClass::from_str_name(&text_of(held.get("asset_class")))
+                .unwrap_or(AssetClass::Unspecified) as i32,
+            currency: text_of(held.get("currency")),
+            composite_figi: text_of(held.get("composite_figi")),
+            share_class_figi: text_of(held.get("share_class_figi")),
+            identifiers,
+        });
+    }
+    let sources = value
+        .get("sources")
+        .and_then(|held| held.as_array())
+        .into_iter()
+        .flatten()
+        .map(|read| SourceRead {
+            source: text_of(read.get("source")),
+            outcome: text_of(read.get("outcome")),
+            read_at: text_of(read.get("read_at")),
+            why: text_of(read.get("why")),
+        })
+        .collect();
+    Ok(InstrumentCandidatesReply {
+        candidates,
+        sources,
     })
 }
 

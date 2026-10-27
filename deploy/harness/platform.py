@@ -74,7 +74,18 @@ See V26 below.
 From contract v28 (W1.32; ruling 612) it answers POST
 /api/v1/reference/match-company: a company its source confirms by CIK (or
 the LEI it holds for one), minted `ENT-` on first asking and matched after,
-any other queued for its staff; its licence list carries `cik`."""
+any other queued for its staff; its licence list carries `cik`.
+
+From contract v28 (W3.33; rulings 757, 775 and 778) it answers POST
+/api/v1/reference/instrument-candidates, the instrument picker's search: the
+test equity it holds (Apple Inc., by its `INS-` ID) for a query naming it,
+then two funds it does not hold -- SPDR S&P 500 ETF Trust (SPY) on its US
+composite with no listing venue (778), its ticker on the venue "US
+composite", one with no MIC (779, 782), and Invesco QQQ (QQQ) with its Nasdaq
+listing, XNAS (775) -- each with the identifiers an escalation sends; a
+query it cannot place answers nothing, and an ISIN or a CUSIP is kept
+nowhere. A matching request naming either fund's FIGIs is answered with a
+record minted for it once, matched after. See CANDIDATES below."""
 import datetime
 import http.server
 import json
@@ -517,6 +528,12 @@ TEMPLATES += [
                             ("cap.value", "decimal"), ("cap.inclusive", "boolean"),
                             ("bound_unit", "text"))]),
 ]
+# Contract v28 (W3.33): the funds the picker's search brings in are minted
+# under the fund template, its fields the equity's.
+TEMPLATES.append({**TEMPLATES[0], "template_id": "TPL-fund", "name": "ETF and mutual fund",
+                  "asset_class": "fund",
+                  "match_rule": ["share_class_figi", "composite_figi", "figi", "ticker",
+                                 "sec_series", "sec_class"]})
 # FIGIs the platform's source confirms and mints from, and those it cannot:
 # a near match, minted and flagged; anything else, its staff's queue.
 MINTS = {f for f in (os.environ.get("HARNESS_PLATFORM_MINTS") or "BBG00NEWMINT1,BBG00NEWMINT2").split(",") if f}
@@ -654,6 +671,12 @@ def match_or_mint(asked):
             answer = {"minted": fresh, "instrument": event_contract(value, venue_record, asked),
                       "venues": [venue_record]}
             break
+        minted = candidate_minted([identifier])
+        if minted:
+            fresh, held = minted
+            answer = {"minted": fresh, "instrument": held,
+                      "venues": [XNAS] if held["listing_venue_id"] else [US_COMPOSITE]}
+            break
         if scheme in ("figi", "share_class_figi", "composite_figi") and value in EQUITIES:
             answer = {"minted": False, "instrument": EQUITIES[value], "venues": [XNAS]}
             break
@@ -725,6 +748,91 @@ def company(asked):
     if key:
         ANSWERS[key] = answer
     return answer
+
+
+# ── Contract v28 (W3.33; rulings 757, 775, 778): the picker's search ──────
+
+# Ruling 779: the platform's one venue for the "US composite" venue, with
+# no MIC, a ticker minted on a US composite held on it by its VEN- ID.
+US_COMPOSITE = {
+    "venue_id": "VEN-01JAE00000000000USCOMPOS", "name": "US composite",
+    "country_code": "US", "kind": "VENUE_KIND_REPORTING_FACILITY", "identifiers": [],
+    "operating_venue_id": "", "time_zone": "America/New_York", "version": 1,
+}
+CANDIDATE_SEEDS = {
+    "SPY": {"name": "SPDR S&P 500 ETF Trust", "mic": "", "composite": "BBG000BDTBL9",
+            "share_class": "BBG001S72SM3", "listing": ""},
+    "QQQ": {"name": "Invesco QQQ Trust, Series 1", "mic": "XNAS", "composite": "BBG000BSWKH7",
+            "share_class": "BBG001S72TT3", "listing": "BBG000BSWKJ5"},
+}
+CANDIDATES_MINTED = {}
+
+
+def candidate_identifiers(ticker, seed):
+    """What an escalation sends for a seed: its share-class FIGI, its US
+    composite paired with the country, and, where its listing is known, the
+    listing's FIGI and the ticker on its MIC."""
+    held = [{"scheme": "share_class_figi", "value": seed["share_class"], "source": ""},
+            {"scheme": "composite_figi", "value": seed["composite"], "source": "US"}]
+    if seed["mic"]:
+        held += [{"scheme": "figi", "value": seed["listing"], "source": seed["mic"]},
+                 {"scheme": "ticker", "value": ticker, "source": seed["mic"]}]
+    else:
+        held.append({"scheme": "ticker", "value": ticker, "source": US_COMPOSITE["venue_id"]})
+    return held
+
+
+def candidates(asked):
+    """The picker's search (W3.33): the record held first, then the seeds
+    the query names, by ticker or a word of the name; nothing kept."""
+    query = " ".join(str(asked.get("query") or "").split()).casefold()
+    limit = int(asked.get("limit") or 10)
+    found = []
+    apple = EQUITIES["BBG000B9XRY4"]
+    if query and (query == "aapl" or query in "apple inc."):
+        found.append({"instrument_id": apple["instrument_id"], "ticker": "AAPL", "mic": "XNAS",
+                      "country": "US", "name": apple["description"],
+                      "asset_class": "ASSET_CLASS_EQUITY", "currency": "USD",
+                      "composite_figi": "BBG000B9XRY4", "share_class_figi": "BBG001S5N8V8",
+                      "identifiers": []})
+    for ticker, seed in CANDIDATE_SEEDS.items():
+        if query and (ticker.casefold().startswith(query) or query in seed["name"].casefold()):
+            minted = CANDIDATES_MINTED.get(ticker)
+            found.append({"instrument_id": minted["instrument_id"] if minted else "",
+                          "ticker": ticker, "mic": seed["mic"], "country": "US",
+                          "name": seed["name"], "asset_class": "ASSET_CLASS_FUND",
+                          "currency": "USD", "composite_figi": seed["composite"],
+                          "share_class_figi": seed["share_class"],
+                          "identifiers": [] if minted else candidate_identifiers(ticker, seed)})
+    return {"candidates": found[:limit],
+            "sources": [{"source": "harness stand-in", "outcome": "found" if found else "not_found",
+                         "read_at": datetime.datetime.now(datetime.timezone.utc)
+                         .strftime("%Y-%m-%dT%H:%M:%SZ")}]}
+
+
+def candidate_minted(identifiers):
+    """A record minted once for a seed a matching request names by its
+    FIGIs (778: on its US composite, no listing venue where none is known)."""
+    for ticker, seed in CANDIDATE_SEEDS.items():
+        figis = {seed["composite"], seed["share_class"]}
+        if any(i.get("value") in figis for i in identifiers):
+            fresh = ticker not in CANDIDATES_MINTED
+            if fresh:
+                n = len(CANDIDATES_MINTED) + 1
+                CANDIDATES_MINTED[ticker] = {
+                    "instrument_id": f"INS-01JCAND{n:019d}",
+                    "identifiers": candidate_identifiers(ticker, seed),
+                    "asset_class": "ASSET_CLASS_FUND",
+                    "currency": "USD",
+                    "description": seed["name"],
+                    "listing_venue_id": XNAS["venue_id"] if seed["mic"] == "XNAS" else "",
+                    "lifecycle_state": "INSTRUMENT_LIFECYCLE_STATE_ACTIVE",
+                    "version": 1,
+                    "template_id": "TPL-fund",
+                    "template_version": "1",
+                }
+            return fresh, CANDIDATES_MINTED[ticker]
+    return None
 
 
 REGISTRY = os.environ.get("HARNESS_REGISTRY", "")
@@ -940,6 +1048,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Contract v28 (W1.32; ruling 612): a company, matched or minted.
             HEARD.append({"method": "POST", "path": url.path, "body": asked})
             return self.answer(200, company(asked))
+        if url.path == "/api/v1/reference/instrument-candidates" and V24:
+            # Contract v28 (W3.33): the picker's search; what was typed is
+            # neither kept nor heard (ruling 761).
+            return self.answer(200, candidates(asked))
         if url.path in ("/api/v1/reference/escalate-instrument", "/api/v1/reference/usage-reports"):
             HEARD.append({"method": "POST", "path": url.path, "body": asked})
             if not V24:

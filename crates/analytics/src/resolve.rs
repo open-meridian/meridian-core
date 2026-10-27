@@ -746,7 +746,7 @@ pub fn resolve(
             .map(|(_, p)| p.instrument_id.clone())
             .collect();
         let rate = crate::chains::rate(asker, compiled, as_of, &sources);
-        let mut calendars = BTreeMap::new();
+        let mut placing = crate::chains::Placing::default();
         let mut chains = Vec::new();
         for chain in crate::chains::refs(asker, job, compiled, &held, as_of) {
             chains.push(crate::chains::chain(
@@ -755,7 +755,7 @@ pub fn resolve(
                 &sources,
                 as_of,
                 Some(&rate),
-                &mut calendars,
+                &mut placing,
                 live,
             )?);
         }
