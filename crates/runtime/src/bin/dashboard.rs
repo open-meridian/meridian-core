@@ -349,6 +349,11 @@ fn run() -> Result<(), String> {
         meridian_dashboard::latency::notices::keep_in(Arc::new(
             meridian_dashboard::latency::notices::InPostgres::on(database.clone()),
         ));
+        // The professional test's answers and who could use each dataset
+        // each month (contract v28; W10.1, W10.13); in memory without one.
+        meridian_dashboard::data_use::keep_in(Arc::new(
+            meridian_dashboard::data_use::store::InPostgres::on(database.clone()),
+        ));
     }
     let service_account_store: Arc<
         dyn meridian_dashboard::service_accounts::store::ServiceAccountStore,
@@ -571,6 +576,9 @@ fn run() -> Result<(), String> {
                 // And what a service account no longer active left pending
                 // (contract v21).
                 meridian_dashboard::service_accounts::sweep(&lapsing, now_ns()).await;
+                // Who could use each dataset now, kept for the month
+                // (contract v28; W10.13).
+                meridian_dashboard::data_use::sweep(&lapsing, now_ns()).await;
             }
         });
         let app = router(app);

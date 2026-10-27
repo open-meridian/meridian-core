@@ -227,6 +227,8 @@ table.linkable th.actions{width:7rem}table.linkable td.actions{text-align:right}
 .eligibility{border:0;padding:0;margin:0;min-width:0;display:grid;grid-template-columns:1fr 1fr;gap:0 .75rem}\
 .eligibility legend,.eligibility .threshold{grid-column:1/-1;padding:0}.eligibility legend{font-weight:600}\
 .eligibility .threshold{display:grid;grid-template-columns:2fr 2fr 1fr;gap:.5rem}.eligibility input{min-width:0}\
+table.use th:first-child{width:24%}table.use th.num{width:5rem}table.use th.served{width:8.5rem}table.use th.svc{width:8rem}\
+@media (max-width:640px){table.use .wide{display:none}table.use th:first-child{width:auto}table.use th.num{width:4.5rem}}\
 @media (max-width:640px){table.ages .wide,table.datasets .wide,table.entitlements .wide,table.priorities .wide,table.entitlements .dates,\
 table.priorities .dates,table.priorities .actions{display:none}table.datasets th:first-child{width:42%}\
 table.datasets th.actions{width:5.5rem}table.entitlements th.actions{width:6.5rem}table.priorities th:first-child{width:36%}}\

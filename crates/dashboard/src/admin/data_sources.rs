@@ -52,12 +52,15 @@ pub const SET_DATASET_ENTITLEMENT: &str = "platform.config.command.set-dataset-e
 const WAIT: Duration = Duration::from_secs(5);
 
 /// The page's tabs, in the order an admin reaches for them.
-pub const TABS: [(&str, &str); 4] = [
+pub const TABS: [(&str, &str); 5] = [
     ("datasets", "Datasets"),
     ("entitlements", "Entitlements"),
     ("priority", "Priority"),
     // Contract v28 (W10.9): the monitor's data age and session latency.
     ("age", "Age"),
+    // Contract v28 (W10.13; 754): who could use each dataset this month,
+    // against its meters ([`crate::data_use`]).
+    ("use", "Use"),
 ];
 
 async fn read<R: Message + Default>(
@@ -152,7 +155,7 @@ impl Row {
 /// or not, whose data level on it is read or write, whatever accounts it
 /// reaches. A directory group's members are known only once each has
 /// signed in.
-fn readers_of(records: &AccessRecords, instance: &str) -> BTreeSet<String> {
+pub(crate) fn readers_of(records: &AccessRecords, instance: &str) -> BTreeSet<String> {
     let signed_in = records
         .people
         .iter()
@@ -608,6 +611,7 @@ pub fn page(
     token: &str,
     notice: &str,
     ages: &[meridian_domain::latency::Read],
+    used: &(String, String),
 ) -> String {
     let unread = |why: &str| {
         format!(
@@ -643,7 +647,7 @@ pub fn page(
                aria-label=\"Add a priority\">+ Add</button>";
     format!(
         "<div class=\"admin\"><div class=\"page-head\"><h1>Data sources</h1></div>{notice}\
-         <nav class=\"tabs\">{tabs}</nav>{}{}{}{}{datasets_dialogs}{priority_dialog}</div>\
+         <nav class=\"tabs\">{tabs}</nav>{}{}{}{}{}{datasets_dialogs}{priority_dialog}{}</div>\
          <script>{}{}{PAGER_SCRIPT}</script>",
         section(
             "datasets",
@@ -678,6 +682,15 @@ pub fn page(
             "",
             &crate::latency::tab(ages)
         ),
+        section(
+            "use",
+            "Use",
+            "Who could use each dataset in the month, from the records and entitlements: \
+             persons, plugins by category, service accounts. Yours to file; never sent.",
+            "<button type=\"button\" data-dialog-open=\"professional-status\">Change a status</button>",
+            &used.0
+        ),
+        used.1,
         super::overview::SCRIPT_START,
         super::overview::SCRIPT_END,
     )
@@ -751,6 +764,7 @@ mod tests {
             "<t>",
             "",
             &[],
+            &(String::new(), String::new()),
         );
         assert!(body.contains("data-datasets=\"1\""), "{body}");
         assert!(body.contains("<td class=\"wide num\" data-unconverted>2</td>"));
@@ -792,6 +806,7 @@ mod tests {
             "<t>",
             "",
             &[],
+            &(String::new(), String::new()),
         );
         assert!(body.contains("data-one-person"), "{body}");
         // Not one person's terms: no warning however many read.
@@ -818,6 +833,7 @@ mod tests {
             "<t>",
             "",
             &[],
+            &(String::new(), String::new()),
         );
         assert!(body.contains("Price, close"));
         assert!(body.contains("a-1:daily then b-1:daily"));
@@ -837,6 +853,7 @@ mod tests {
             "<t>",
             "",
             &[],
+            &(String::new(), String::new()),
         );
         assert!(body.contains("The lake did not answer: timed out"));
     }

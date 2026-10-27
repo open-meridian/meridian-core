@@ -1287,6 +1287,39 @@ pub fn serve(
 
 /// One sweep of settings cells naming a replaced record (requirement 10),
 /// for a test to drive without waiting for the hourly one.
+/// The dashboard's AccessRecords as the store answers them from `snapshot`
+/// (decisions/015): what the conductor serves on the bus, and what the
+/// upgrade preflight measures against the broker's 1 MiB payload limit.
+pub fn access_records_of(snapshot: Snapshot, now_ns: i64) -> meridian_domain::v1::AccessRecords {
+    // Each connectivity plugin's link and each ems's map (W11.21,
+    // W11.22, contract v22), for the dashboard's pages and its read
+    // tool.
+    let connectivity_links = snapshot.connectivity.values().cloned().collect();
+    let venue_account_maps = crate::connectivity::maps(&snapshot);
+    // Each known plugin's settings form (W6.11): what it declared,
+    // and which secrets are set, never what they are.
+    let plugin_settings = snapshot
+        .plugins
+        .iter()
+        .map(|plugin| settings_record(&snapshot, &plugin.plugin_instance_id))
+        .collect();
+    let mut records = snapshot.records;
+    records.read_at_ns = now_ns;
+    records.plugin_settings = plugin_settings;
+    // With the links, so the dashboard can tell which of the accounts
+    // a connector reports have none (W2.8, W6.4). Only the dashboard
+    // asks this, and it may already see every account.
+    records.links = snapshot.links;
+    // The holds standing, for the deployment's Settings and each
+    // edge plugin's Summary (W6.25, contract v16).
+    records.holds = snapshot.holds;
+    // Each instance's linkable accounts (W6.30, contract v20).
+    records.linkable_accounts = snapshot.linkable.into_values().collect();
+    records.connectivity_links = connectivity_links;
+    records.venue_account_maps = venue_account_maps;
+    records
+}
+
 #[cfg(test)]
 pub(crate) fn repoint_now(
     bus: Arc<Bus>,
@@ -1376,33 +1409,7 @@ pub fn serve_with(
         ),
         |cx, _: AccessRecordsRequest, _| {
             let snapshot = cx.snapshot()?;
-            // Each connectivity plugin's link and each ems's map (W11.21,
-            // W11.22, contract v22), for the dashboard's pages and its read
-            // tool.
-            let connectivity_links = snapshot.connectivity.values().cloned().collect();
-            let venue_account_maps = crate::connectivity::maps(&snapshot);
-            // Each known plugin's settings form (W6.11): what it declared,
-            // and which secrets are set, never what they are.
-            let plugin_settings = snapshot
-                .plugins
-                .iter()
-                .map(|plugin| settings_record(&snapshot, &plugin.plugin_instance_id))
-                .collect();
-            let mut records = snapshot.records;
-            records.read_at_ns = cx.clock.now_ns();
-            records.plugin_settings = plugin_settings;
-            // With the links, so the dashboard can tell which of the accounts
-            // a connector reports have none (W2.8, W6.4). Only the dashboard
-            // asks this, and it may already see every account.
-            records.links = snapshot.links;
-            // The holds standing, for the deployment's Settings and each
-            // edge plugin's Summary (W6.25, contract v16).
-            records.holds = snapshot.holds;
-            // Each instance's linkable accounts (W6.30, contract v20).
-            records.linkable_accounts = snapshot.linkable.into_values().collect();
-            records.connectivity_links = connectivity_links;
-            records.venue_account_maps = venue_account_maps;
-            Ok(records)
+            Ok(access_records_of(snapshot, cx.clock.now_ns()))
         },
     );
 
@@ -3202,6 +3209,76 @@ pub fn serve_with(
             }
         }
     });
+}
+
+/// The dashboard's access records' size as people grow (H1, ruling 586):
+/// the largest bus answer core builds from records, against the broker's
+/// 1 MiB. Each person signed in, in a user group of their own holding one
+/// permission, and an account of their own.
+#[cfg(test)]
+mod capacity_tests {
+    use meridian_domain::v1::{AccountRecord, Permission, SignInRecord, UserGroup};
+
+    use super::*;
+
+    fn records_for(people: usize) -> usize {
+        let mut snapshot = Snapshot::default();
+        for p in 0..people {
+            let subject = format!("https://login.example.com/|person-{p:05}@example.com");
+            snapshot.records.people.push(SignInRecord {
+                subject: subject.clone(),
+                display_name: format!("Person Number {p:05}"),
+                directory_groups: vec!["traders".into(), "london-desk".into()],
+                signed_in_at_ns: 1_792_800_000_000_000_000,
+            });
+            snapshot.records.user_groups.push(UserGroup {
+                user_group_id: format!("UG-{p:026}"),
+                name: format!("Person {p:05}'s group"),
+                directory_groups: vec![],
+                logins: vec![subject],
+            });
+            snapshot.records.permissions.push(Permission {
+                permission_id: format!("P-{p:026}"),
+                user_group_id: format!("UG-{p:026}"),
+                account_group_id: "AcG-ALL".into(),
+                access_group_id: "AG-TRADERS".into(),
+            });
+            snapshot.records.accounts.push(AccountRecord {
+                account_id: format!("ACC-{p:026}"),
+                name: format!("Account {p:05}"),
+                state: 1,
+                created_at_ns: 1_792_800_000_000_000_000,
+                ..Default::default()
+            });
+        }
+        access_records_of(snapshot, 1).encoded_len()
+    }
+
+    /// Bytes per person, and how many people fit in three quarters of the
+    /// broker's 1 MiB -- where the upgrade preflight starts to warn.
+    fn per_person() -> (f64, usize) {
+        let base = records_for(100);
+        let more = records_for(1_100);
+        let per = (more - base) as f64 / 1_000.0;
+        let room = (0.75 * 1_048_576.0 - base as f64) / per;
+        (per, 100 + room as usize)
+    }
+
+    /// The gate's guard: a person costs no more than it did when the
+    /// capacity was stated, with room.
+    #[test]
+    fn a_person_costs_the_access_records_what_it_did() {
+        let (per, people) = per_person();
+        eprintln!("bench: access records {per:.0} bytes a person; {people} people to the preflight's warning");
+        assert!(per <= 500.0, "{per:.0} bytes a person");
+    }
+
+    #[test]
+    #[ignore = "the capacity bench: make bench"]
+    fn capacity_access_records_per_person() {
+        let (per, people) = per_person();
+        println!("CAPACITY access_records bytes_per_person={per:.0} people_to_warning={people}");
+    }
 }
 
 #[cfg(test)]

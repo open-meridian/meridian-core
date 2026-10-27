@@ -14,7 +14,9 @@
 //! - prepared changes, the admins' levels and a person's own settings
 //!   ([`crate::prepared`], contract v20);
 //! - service accounts, each role's "runs as" and their records
-//!   ([`crate::service_accounts`], contract v21).
+//!   ([`crate::service_accounts`], contract v21);
+//! - a person's answer to the professional test and who could use each
+//!   dataset each month ([`crate::data_use`], contract v28).
 //!
 //! The schema is applied by `meridian-dashboard migrate`, once per release,
 //! as the migrating role, and a starting dashboard only verifies it: the
@@ -109,6 +111,12 @@ const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0010_a_latency_episode.sql"),
         then: None,
     },
+    Migration {
+        version: 11,
+        name: "data_use",
+        sql: include_str!("../migrations/0011_data_use.sql"),
+        then: None,
+    },
 ];
 
 /// Migration 8's record (W6.29, decisions/031): every act at may make and
@@ -135,6 +143,15 @@ CREATE TABLE IF NOT EXISTS dashboard_schema_migration (
     name          text   NOT NULL,
     applied_at_ns bigint NOT NULL
 )";
+
+/// Each migration this release carries, as the upgrade preflight reads
+/// them (H1): its version, name and SQL.
+pub fn migrations() -> Vec<(i64, &'static str, &'static str)> {
+    MIGRATIONS
+        .iter()
+        .map(|m| (m.version, m.name, m.sql))
+        .collect()
+}
 
 fn latest() -> i64 {
     MIGRATIONS.last().map(|m| m.version).unwrap_or(0)

@@ -732,50 +732,129 @@ fn a_read_of_the_latest_is_chosen_in_sql_per_series_keeping_the_last_valid_row()
     assert_eq!(keys_of(&filled), keys_of(&chosen));
 }
 
-/// The bench behind the fix: a chain of 200 series quoted 100 times each,
-/// read for the latest both ways. Prints what each loaded and how long it
-/// took; asserts the SQL choice loads one row per series.
-#[test]
-fn a_chains_latest_loads_one_row_per_series() {
-    let store = store();
-    let dataset = unique("tradier-1:options");
-    let subject = unique("INS-UNDERLYING");
-    let (series, times) = (200, 100);
+/// A chain of `series` series quoted `times` times each, recorded a quote
+/// round (one batch) at a time: how long the recording took.
+fn record_chain(
+    store: &PostgresStore,
+    dataset: &str,
+    subject: &str,
+    series: usize,
+    times: usize,
+) -> std::time::Duration {
+    let started = std::time::Instant::now();
     for time in 0..times {
         let batch: Vec<Observation> = (0..series)
             .map(|s| {
                 chain_trade(
-                    &dataset,
+                    dataset,
                     &format!("S{s:03}:q:{time}"),
-                    &subject,
+                    subject,
                     &format!("S{s:03}"),
                     1 + time as i64,
                 )
             })
             .collect();
-        store.record(&dataset, batch, 1_000 + time as i64).unwrap();
+        store.record(dataset, batch, 1_000 + time as i64).unwrap();
     }
-    let size = |rows: &[Observation]| rows.iter().map(|r| r.encode().len()).sum::<usize>();
+    started.elapsed()
+}
+
+/// What one size of chain measured: its record and read rates, and its
+/// latest read's time.
+struct LakeMeasure {
+    rows: usize,
+    record_rows_per_s: f64,
+    read_rows_per_s: f64,
+    latest: std::time::Duration,
+    latest_rows: usize,
+}
+
+fn measure_chain(store: &PostgresStore, series: usize, times: usize) -> LakeMeasure {
+    let dataset = unique("tradier-1:options");
+    let subject = unique("INS-UNDERLYING");
+    let recorded = record_chain(store, &dataset, &subject, series, times);
     let started = std::time::Instant::now();
     let every = store
         .read(&latest_query(&dataset, &subject, false))
         .unwrap();
-    let every_took = started.elapsed();
+    let read = started.elapsed();
     let started = std::time::Instant::now();
     let chosen = store.read(&latest_query(&dataset, &subject, true)).unwrap();
-    let chosen_took = started.elapsed();
-    eprintln!(
-        "bench: every row {} rows, {} bytes, {:?}; chosen in SQL {} rows, {} bytes, {:?}",
-        every.len(),
-        size(&every),
-        every_took,
-        chosen.len(),
-        size(&chosen),
-        chosen_took
-    );
+    let latest = started.elapsed();
     assert_eq!(every.len(), series * times);
     assert_eq!(chosen.len(), series);
     assert!(chosen
         .iter()
         .all(|row| row.meta().valid_from_ns == times as i64));
+    LakeMeasure {
+        rows: every.len(),
+        record_rows_per_s: every.len() as f64 / recorded.as_secs_f64(),
+        read_rows_per_s: every.len() as f64 / read.as_secs_f64(),
+        latest,
+        latest_rows: chosen.len(),
+    }
+}
+
+fn said(m: &LakeMeasure) -> String {
+    format!(
+        "rows={} record_rows_per_s={:.0} read_rows_per_s={:.0} latest_ms={:.1} latest_rows={}",
+        m.rows,
+        m.record_rows_per_s,
+        m.read_rows_per_s,
+        m.latest.as_secs_f64() * 1e3,
+        m.latest_rows
+    )
+}
+
+/// The bench behind the fix, and the gate's regression guard on the lake's
+/// stated capacity (H1, ruling 586): a chain of 200 series quoted 100 times
+/// each, recorded a round at a time, read whole and read for the latest.
+/// The floors are a quarter of what the gate's container measured
+/// (INSTALL.md, "Capacity"), so a slower CI runner passes and a
+/// regression of four times does not.
+#[test]
+fn a_chains_latest_loads_one_row_per_series() {
+    let store = store();
+    let measured = measure_chain(&store, 200, 100);
+    eprintln!("bench: {}", said(&measured));
+    assert!(
+        measured.record_rows_per_s >= GUARD_RECORD_ROWS_PER_S,
+        "the lake records {:.0} rows a second; its guard is {GUARD_RECORD_ROWS_PER_S}",
+        measured.record_rows_per_s
+    );
+    assert!(
+        measured.read_rows_per_s >= GUARD_READ_ROWS_PER_S,
+        "the lake reads {:.0} rows a second; its guard is {GUARD_READ_ROWS_PER_S}",
+        measured.read_rows_per_s
+    );
+    assert!(
+        measured.latest <= GUARD_LATEST,
+        "the latest of a 200-series chain at 20,000 rows took {:?}; its guard is {GUARD_LATEST:?}",
+        measured.latest
+    );
+}
+
+/// The guard's floors: a quarter of the stated capacity at 20,000 rows
+/// (2,449 rows a second recorded, 102,429 read, the latest in 222 ms), and
+/// four times its latest read.
+const GUARD_RECORD_ROWS_PER_S: f64 = 600.0;
+const GUARD_READ_ROWS_PER_S: f64 = 25_000.0;
+const GUARD_LATEST: std::time::Duration = std::time::Duration::from_millis(900);
+
+/// The lake's stated capacity as a dataset grows (H1): `make bench` runs
+/// it, and INSTALL.md's "Capacity" table is what it printed. A 200-series
+/// chain at each size, a fresh dataset each.
+#[test]
+#[ignore = "the capacity bench: make bench"]
+fn capacity_lake_as_a_dataset_grows() {
+    let store = store();
+    let sizes: Vec<usize> = std::env::var("MERIDIAN_BENCH_LAKE_ROWS")
+        .unwrap_or_else(|_| "20000,100000,400000".into())
+        .split(',')
+        .filter_map(|n| n.trim().parse().ok())
+        .collect();
+    for rows in sizes {
+        let measured = measure_chain(&store, 200, (rows / 200).max(1));
+        println!("CAPACITY lake {}", said(&measured));
+    }
 }

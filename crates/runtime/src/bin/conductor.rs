@@ -58,6 +58,26 @@ const SETTINGS_KEY: &str = "/run/meridian/settings-key";
 fn run() -> Result<(), String> {
     let command = std::env::args().nth(1);
 
+    // The upgrade preflight (H1; ruling 586): run from the release being
+    // installed, as the chart's pre-upgrade hook, changing nothing. Its
+    // report is one JSON object on stdout; blocked exits non-zero, which
+    // stops the upgrade before anything changes.
+    if command.as_deref() == Some("preflight") {
+        use meridian_runtime::preflight::{overall, report_json, run, Inputs, Verdict};
+        let findings = run(&Inputs::from_env(meridian_runtime::now_ns()));
+        for f in &findings {
+            eprintln!("{:<11} {:<22} {}", f.verdict.word(), f.check, f.why);
+        }
+        println!("{}", report_json(meridian_runtime::VERSION, &findings));
+        return match overall(&findings) {
+            Verdict::Blocked => Err("the upgrade preflight is blocked: nothing was changed".into()),
+            verdict => {
+                tracing::info!(preflight = verdict.word(), "the upgrade preflight passed");
+                Ok(())
+            }
+        };
+    }
+
     // Before the key, because migrating needs a database and nothing else: a
     // migration job holds no key and should not need one.
     if command.as_deref() == Some("migrate") {

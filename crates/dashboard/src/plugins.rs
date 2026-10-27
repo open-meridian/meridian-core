@@ -815,6 +815,41 @@ pub(crate) async fn frame(
             Ok(allowed) => allowed,
             Err(refusal) => return *refusal,
         };
+    // Contract v28 (W10.1; the data terms' section 2): a person's first
+    // access to a plugin entitled to data whose terms split professional
+    // and non-professional asks the professional test once, first.
+    if let Ok(records) = app.records.current(app.clock.now_ns()) {
+        let owed = crate::data_use::owed(
+            &records,
+            &session.subject,
+            &session.directory_groups,
+            &instance,
+        )
+        .await;
+        if !owed.is_empty() {
+            let mut asked_again: Vec<(&String, &String)> = asked.iter().collect();
+            asked_again.sort();
+            let query: Vec<String> = asked_again
+                .iter()
+                .map(|(k, v)| {
+                    format!(
+                        "{}={}",
+                        crate::documentation::urlencode(k),
+                        crate::documentation::urlencode(v)
+                    )
+                })
+                .collect();
+            let then = if query.is_empty() {
+                format!("/plugins/{instance}")
+            } else {
+                format!("/plugins/{instance}?{}", query.join("&"))
+            };
+            return redirect(&format!(
+                "/professional-test?then={}",
+                crate::documentation::urlencode(&then)
+            ));
+        }
+    }
     let theme = Theme::of_mode(crate::web::mode_of(&app, &headers));
     let reports = app.health.view();
     let held_roles: Vec<(String, AccessLevel)> = access

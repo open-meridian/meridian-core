@@ -380,6 +380,32 @@ Two ways on, and the first is usually what you want:
 Deleting the namespace also removes the database if this deployment brought
 one, along with everything in it. Nothing warns you and nothing backs it up.
 
+## Capacity
+
+What one deployment holds before something becomes the bottleneck, measured
+by `make bench` on the development machine: an Apple M3 Pro (12 cores), the
+stores in the gate's Linux containers under Rancher Desktop, Postgres 16, the
+store tests' own build, 2026-10-26. These are measurements on one machine,
+not promises; run `make bench` on yours. The gate runs a guard on each at a
+size it can afford, and fails where one falls to a quarter of what is stated
+here.
+
+| What | Measured |
+|---|---|
+| The lake recording a 200-series chain, a quote round at a time | 2,100 to 2,450 rows a second, flat from 20,000 to 400,000 rows |
+| The lake reading every row of it | 102,000 rows a second at 20,000 rows; 79,000 at 100,000; 63,000 at 400,000 |
+| The lake's latest read of it (one row per series) | 222 ms at 20,000 rows; 1.1 s at 100,000; 5.1 s at 400,000 |
+| The plugin catalogue at 2,000 versions and 2,000 launches | 6 pages, the largest 508 KiB of the 512 KiB budget; all six in 167 ms |
+| The configuration store at the same | 623 versions and 1,650 launches recorded a second; a snapshot in 61 ms |
+| The dashboard's access records, against the broker's 1 MiB | 361 bytes a person; about 2,180 people before the upgrade preflight warns at three quarters |
+| The analytics engine on the tree (`crates/analytics-engine/BENCHMARK.md`) | a 1,920-option chain inverted at bid, mid and ask with greeks in 1.8 s on one worker: about 1,060 options a second |
+
+The latest read grows with the rows a subject's chain keeps: past about
+100,000 rows of one underlying's quotes it takes over a second, which is the
+lake's first bottleneck. The access records are the second: one answer of
+every person, group and permission, so a deployment past about 2,000 people
+is warned at its next upgrade.
+
 ## What to back up
 
 If you pointed at a database you run, back it up as you back up any other.

@@ -164,3 +164,30 @@ deletes an archive or a volume made for one, uninstalling included.
 A hold that needs records that cannot be altered is accepted only where
 `pluginArchive.objectLock` says the bucket enforces it; on a local archive it
 is refused rather than claimed.
+
+## An upgrade checked before it changes anything
+
+Every upgrade runs a preflight first (`preflight.enabled`, on by default): a
+pre-upgrade hook running `meridian-conductor preflight` from the release being
+installed. It answers ready, warning or blocked, each check with its reason,
+and a blocked check stops `helm upgrade` -- and `meridian upgrade-deployment`
+-- before any resource changes:
+
+- the database's size against its volume and its configured memory against
+  its limit (for the database the chart brings), its connections in use;
+- the largest bus answer core builds from stored records, the dashboard's
+  access records, against the broker's 1 MiB `max_payload`;
+- each store's schema against this release's: a database newer than the
+  release is a downgrade and is blocked; pending migrations are named, each
+  additive or not;
+- the stored templates this release would read differently: fields it does
+  not know, or a model its engine does not have;
+- the launched plugins, which keep their sidecar until relaunched;
+- the newest backup's age, where backups are kept on the chart's own volume.
+
+It changes nothing: its database sessions are read-only, it holds no RBAC and
+calls nothing on the bus, and its report names stores, sizes and counts, never
+an account or a person. The last line of its log is the report as JSON; a
+blocked run's Job is kept until the next upgrade, so why it stopped can be
+read: `kubectl logs job/<release>-meridian-runtime-preflight`. Run the same
+checks by hand from the release's image with `meridian-conductor preflight`.

@@ -37,6 +37,11 @@ fn routes(source: &str) -> Vec<String> {
 #[test]
 fn every_tab_the_page_draws_names_its_tool() {
     for (id, _) in crate::admin::data_sources::TABS {
+        // The Use tab's tools are the data terms' (contract v28), whose own
+        // parity names them (crate::mcp::data_use).
+        if id == "use" {
+            continue;
+        }
         let key = format!("tab {id}");
         let by = reached(&key).unwrap_or_else(|| panic!("{key} is drawn and names no tool"));
         assert!(names_tools(by), "{key}: {by:?}");
