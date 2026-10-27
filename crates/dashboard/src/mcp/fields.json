@@ -850,7 +850,7 @@
       "type": "message JobAnswer",
       "empty": "unset when answered later",
       "intent": "carries the answer inline",
-      "meaning": "the figures, what was not evaluated and why, and the provenance",
+      "meaning": "the figures, what was not evaluated and why, and the provenance; always whole, an answer past a page's budget answered later and read in pages (ruling 794)",
       "not_meaning": "a record",
       "filled": "decided",
       "filled_by": "analytics",
@@ -907,6 +907,19 @@
       "filled": "decided",
       "filled_by": "analytics",
       "since": "v26",
+      "stability": "preview",
+      "store": "analytics"
+    },
+    {
+      "name": "meridian.v1.JobAnswer.next_cursor",
+      "type": "text",
+      "empty": "empty when nothing follows, and on an answer given inline, which is always whole",
+      "intent": "says where the next page of a job's answer starts",
+      "meaning": "opaque: ReadJobAnswer's cursor for the page after this one, of this job alone",
+      "not_meaning": "a count of the figures",
+      "filled": "decided",
+      "filled_by": "analytics",
+      "since": "v28",
       "stability": "preview",
       "store": "analytics"
     },
@@ -2569,6 +2582,40 @@
       "filled": "as-reported",
       "filled_by": "plugin",
       "since": "v26",
+      "stability": "preview",
+      "store": "analytics"
+    },
+    {
+      "name": "meridian.v1.ReadJobAnswerRequest.page_size",
+      "type": "integer",
+      "unit": "entries",
+      "bounds": {
+        "range": {
+          "least": "0",
+          "most": "500"
+        },
+        "past": "capped"
+      },
+      "empty": "0 is as many as a page's budget takes",
+      "intent": "bounds a page",
+      "meaning": "how many entries, figures and not-evaluated together, a page holds at most; the component ends a page at about 512 KiB first, whatever this says",
+      "not_meaning": "a promise that a page is full",
+      "filled": "as-reported",
+      "filled_by": "plugin",
+      "since": "v28",
+      "stability": "preview",
+      "store": "analytics"
+    },
+    {
+      "name": "meridian.v1.ReadJobAnswerRequest.cursor",
+      "type": "text",
+      "empty": "empty is the first page",
+      "intent": "continues a read where its last page ended",
+      "meaning": "the next_cursor the page before answered for this job, as given",
+      "not_meaning": "a position a plugin computes: one from another job, or from an answer the component no longer holds, is refused",
+      "filled": "as-reported",
+      "filled_by": "plugin",
+      "since": "v28",
       "stability": "preview",
       "store": "analytics"
     },

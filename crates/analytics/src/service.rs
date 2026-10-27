@@ -47,6 +47,9 @@ pub struct Config {
     pub read_timeout: Duration,
     /// How many finished answers are kept to be read (Q12: losable).
     pub answers_kept: usize,
+    /// Where a page of an answer ends, in bytes (ruling 794): an answer past
+    /// it is never given inline, and is read in pages of it.
+    pub page_budget: usize,
 }
 
 impl Default for Config {
@@ -57,6 +60,7 @@ impl Default for Config {
             price_deadline: Duration::from_secs(5),
             read_timeout: Duration::from_secs(8),
             answers_kept: 1_000,
+            page_budget: crate::pages::PAGE_BUDGET,
         }
     }
 }
@@ -228,12 +232,23 @@ impl Coordinator {
             }
         });
         match heard.recv_timeout(self.config.inline) {
-            Ok(Ok(answer)) => {
+            Ok(Ok(answer)) if crate::pages::whole_fits(&answer, self.config.page_budget) => {
                 self.keep(&job_id, &client, Ok(answer.clone()));
                 Ok(RunJobReply {
                     answered_inline: true,
                     job_id,
                     answer: Some(answer),
+                })
+            }
+            // Past a page's budget, never inline: the client is told it
+            // finished and reads it in pages (W12.1's choice by size, Q5;
+            // ruling 794), so a reply's answer is always whole.
+            Ok(Ok(answer)) => {
+                self.finished(&job_id, &client, Ok(answer));
+                Ok(RunJobReply {
+                    answered_inline: false,
+                    job_id,
+                    answer: None,
                 })
             }
             Ok(Err(refused)) => Err(refused),
@@ -353,7 +368,8 @@ impl Coordinator {
         }
     }
 
-    /// W12.4: a finished job's answer, read by the instance that ran it.
+    /// W12.4: a finished job's answer, read by the instance that ran it,
+    /// one page at a time (contract v28's amendment, ruling 794).
     pub fn read_job_answer(
         &self,
         request: ReadJobAnswerRequest,
@@ -362,11 +378,19 @@ impl Coordinator {
         let (client, _) = client_of(envelope);
         let jobs = self.jobs.lock().expect("not poisoned");
         match jobs.answers.get(&request.job_id) {
-            Some(held) if held.client == client => held.answer.clone(),
+            Some(held) if held.client == client => match &held.answer {
+                Ok(answer) => crate::pages::page(answer, &request, self.config.page_budget),
+                Err(refused) => Err(refused.clone()),
+            },
             Some(_) => Err(refusal_with_status(
                 RefusalStatus::PermissionDenied,
                 &["job_id".to_string()],
                 format!("{} was run by another instance", request.job_id),
+            )),
+            None if !request.cursor.is_empty() => Err(format!(
+                "{} is not held: its answer left the component's cache between pages, and \
+                 the job is run again (Q12)",
+                request.job_id
             )),
             None => Err(format!(
                 "{} is not held: it is still running, or its answer has left the component's \

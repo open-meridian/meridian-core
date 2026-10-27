@@ -288,5 +288,7 @@ pub fn job_answer(job_id: &str, answer: &Answer) -> Result<JobAnswer, String> {
             .collect::<Result<_, _>>()?,
         not_evaluated: answer.not_evaluated.iter().map(unevaluated).collect(),
         provenance: Some(provenance(&answer.provenance)),
+        // Whole: the coordinator pages it as it is read (ruling 794).
+        next_cursor: String::new(),
     })
 }

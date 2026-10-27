@@ -15,6 +15,7 @@
 //! figure (ruled 2026-10-12).
 
 pub mod chains;
+mod pages;
 pub mod resolve;
 pub mod service;
 pub mod wire;

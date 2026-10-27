@@ -673,11 +673,16 @@ async fn a_job_past_its_window_finishes_later_and_its_answer_is_read() {
         "meridian.v1.ReadJobAnswerRequest",
         ReadJobAnswerRequest {
             job_id: reply.job_id.clone(),
+            ..ReadJobAnswerRequest::default()
         },
         &["ACC-1"],
     )
     .await
     .unwrap();
+    assert!(
+        answer.next_cursor.is_empty(),
+        "within a page's budget: one page"
+    );
     assert_eq!(answer.provenance.unwrap().answer_hash, event.answer_hash);
     let caught_up: ListFinishedJobsReply = ask_as(
         &stores.bus,
@@ -690,6 +695,224 @@ async fn a_job_past_its_window_finishes_later_and_its_answer_is_read() {
     .unwrap();
     assert_eq!(caught_up.sequence, 1);
     assert_eq!(caught_up.finished[0].job_id, reply.job_id);
+}
+
+/// Every page of a job's answer, read in turn from the first (ruling 794).
+async fn read_every_page(
+    bus: &Bus,
+    job_id: &str,
+    page_size: i32,
+) -> Result<Vec<JobAnswer>, String> {
+    let mut pages = Vec::new();
+    let mut cursor = String::new();
+    loop {
+        let page: JobAnswer = ask_as(
+            bus,
+            topics::READ_JOB_ANSWER,
+            "meridian.v1.ReadJobAnswerRequest",
+            ReadJobAnswerRequest {
+                job_id: job_id.to_string(),
+                page_size,
+                cursor: cursor.clone(),
+            },
+            &["ACC-1"],
+        )
+        .await?;
+        cursor = page.next_cursor.clone();
+        pages.push(page);
+        if cursor.is_empty() {
+            return Ok(pages);
+        }
+    }
+}
+
+fn reassembled(pages: &[JobAnswer]) -> JobAnswer {
+    let mut whole = JobAnswer {
+        job_id: pages[0].job_id.clone(),
+        provenance: pages[0].provenance.clone(),
+        ..JobAnswer::default()
+    };
+    for page in pages {
+        assert_eq!(page.job_id, whole.job_id);
+        assert_eq!(
+            page.provenance, whole.provenance,
+            "the provenance on every page"
+        );
+        whole.figures.extend(page.figures.iter().cloned());
+        whole
+            .not_evaluated
+            .extend(page.not_evaluated.iter().cloned());
+    }
+    whole
+}
+
+fn paged_job() -> RunJobRequest {
+    job(&[
+        ("exposure", &["asset_class"], ""),
+        ("concentration", &["instrument"], ""),
+        ("market_value", &[], ""),
+    ])
+}
+
+/// Contract v28's amendment (W12.4; ruling 794): a job's answer read one
+/// page at a time reassembles equal to the answer given whole, each page
+/// with the job's provenance; a cursor is the job's own.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_answer_is_read_in_pages_and_a_cursor_is_its_jobs_own() {
+    let stores = stores();
+    coordinator(&stores, Config::default(), false);
+    let mut replies = Vec::new();
+    for _ in 0..2 {
+        let reply: RunJobReply = ask_as(
+            &stores.bus,
+            topics::RUN_JOB,
+            "meridian.v1.RunJobRequest",
+            paged_job(),
+            &["ACC-1"],
+        )
+        .await
+        .unwrap();
+        assert!(reply.answered_inline);
+        replies.push(reply);
+    }
+    let whole = replies[0].answer.clone().unwrap();
+    assert!(whole.next_cursor.is_empty(), "an inline answer is whole");
+    assert!(whole.figures.len() + whole.not_evaluated.len() > 2);
+    let pages = read_every_page(&stores.bus, &replies[0].job_id, 1)
+        .await
+        .unwrap();
+    assert_eq!(pages.len(), whole.figures.len() + whole.not_evaluated.len());
+    assert_eq!(reassembled(&pages), whole);
+
+    // The other job's cursor, read with this one: refused naming it.
+    let other: JobAnswer = ask_as(
+        &stores.bus,
+        topics::READ_JOB_ANSWER,
+        "meridian.v1.ReadJobAnswerRequest",
+        ReadJobAnswerRequest {
+            job_id: replies[1].job_id.clone(),
+            page_size: 1,
+            ..ReadJobAnswerRequest::default()
+        },
+        &["ACC-1"],
+    )
+    .await
+    .unwrap();
+    let refused = ask_as::<JobAnswer>(
+        &stores.bus,
+        topics::READ_JOB_ANSWER,
+        "meridian.v1.ReadJobAnswerRequest",
+        ReadJobAnswerRequest {
+            job_id: replies[0].job_id.clone(),
+            page_size: 1,
+            cursor: other.next_cursor,
+        },
+        &["ACC-1"],
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        refused.contains("invalid-argument") && refused.contains("cursor"),
+        "{refused}"
+    );
+}
+
+/// Ruling 794: an answer past a page's budget is never given inline -- the
+/// client is told it finished and reads it in pages -- and one that left
+/// the cache between two pages is not held, said so.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_past_a_page_is_answered_later_and_one_gone_between_pages_is_not_held() {
+    let whole = {
+        let alone = stores();
+        coordinator(&alone, Config::default(), false);
+        let reply: RunJobReply = ask_as(
+            &alone.bus,
+            topics::RUN_JOB,
+            "meridian.v1.RunJobRequest",
+            paged_job(),
+            &["ACC-1"],
+        )
+        .await
+        .unwrap();
+        reply.answer.unwrap()
+    };
+    let stores = stores();
+    let mut finished = stores.bus.subscribe_every(topics::JOB_FINISHED);
+    // A page's budget smaller than any answer: every page one entry.
+    coordinator(
+        &stores,
+        Config {
+            page_budget: 1,
+            answers_kept: 1,
+            ..Config::default()
+        },
+        false,
+    );
+    let reply: RunJobReply = ask_as(
+        &stores.bus,
+        topics::RUN_JOB,
+        "meridian.v1.RunJobRequest",
+        paged_job(),
+        &["ACC-1"],
+    )
+    .await
+    .unwrap();
+    assert!(!reply.answered_inline && reply.answer.is_none());
+    let told = tokio::time::timeout(Duration::from_secs(10), finished.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let event = JobFinishedEvent::decode(&told.envelope.payload[..]).unwrap();
+    assert_eq!(event.job_id, reply.job_id);
+    let pages = read_every_page(&stores.bus, &reply.job_id, 0)
+        .await
+        .unwrap();
+    assert_eq!(pages.len(), whole.figures.len() + whole.not_evaluated.len());
+    let mut read = reassembled(&pages);
+    assert_eq!(
+        read.provenance.as_ref().unwrap().answer_hash,
+        event.answer_hash
+    );
+    read.job_id = whole.job_id.clone();
+    assert_eq!(read, whole);
+
+    // Another job pushes this one's answer out of the cache (one kept):
+    // its next page is not held, and said to be gone between pages.
+    let first: JobAnswer = ask_as(
+        &stores.bus,
+        topics::READ_JOB_ANSWER,
+        "meridian.v1.ReadJobAnswerRequest",
+        ReadJobAnswerRequest {
+            job_id: reply.job_id.clone(),
+            ..ReadJobAnswerRequest::default()
+        },
+        &["ACC-1"],
+    )
+    .await
+    .unwrap();
+    let _: RunJobReply = ask_as(
+        &stores.bus,
+        topics::RUN_JOB,
+        "meridian.v1.RunJobRequest",
+        paged_job(),
+        &["ACC-1"],
+    )
+    .await
+    .unwrap();
+    let gone = ask_as::<JobAnswer>(
+        &stores.bus,
+        topics::READ_JOB_ANSWER,
+        "meridian.v1.ReadJobAnswerRequest",
+        ReadJobAnswerRequest {
+            job_id: reply.job_id.clone(),
+            cursor: first.next_cursor,
+            ..ReadJobAnswerRequest::default()
+        },
+        &["ACC-1"],
+    )
+    .await
+    .unwrap_err();
+    assert!(gone.contains("between pages"), "{gone}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
