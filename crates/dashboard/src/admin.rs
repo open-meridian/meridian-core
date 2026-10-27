@@ -99,6 +99,8 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/admin/instruments/accept", post(accept_offers))
         .route("/admin/instruments/merge", post(merge_instruments))
         .route("/admin/instruments/search", get(search_instruments))
+        .route("/admin/instruments/bring-in", post(bring_in_instrument))
+        .route("/admin/instruments/sources", get(instrument_sources_page))
         .route(instruments::USAGE_PATH, post(set_reports_usage))
         .route(
             instruments::LICENSED_SCHEMES_PATH,
@@ -480,6 +482,7 @@ pub mod instruments;
 pub mod model_routing;
 pub(crate) mod overview;
 pub mod series_rule;
+pub mod sources_view;
 pub mod stale_reference;
 pub mod time_zone;
 pub(crate) use overview::listing;
@@ -2877,6 +2880,13 @@ async fn set_hold(
 /// as its picker reads them; an exact ID answers too, so a table's IDs show
 /// by name. For whoever reaches core's settings: a deployment admin or a
 /// plugin's admin. It never lists every record.
+///
+/// With `candidates=1`, for a deployment admin, the one search (W3.33;
+/// rulings 727, 761, 774): the platform's candidates the deployment does not
+/// hold follow its records in one list, each marked `candidate` for the
+/// kit's picker to bring in (meridian-ui 0.14.0); the platform not reached,
+/// the records answer alone. An entry grid's column asks without it, so a
+/// cell's typing never reaches the platform.
 async fn search_instruments(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
@@ -2899,22 +2909,116 @@ async fn search_instruments(
     if words.is_empty() {
         return axum::Json(serde_json::json!({"results": []})).into_response();
     }
-    match instruments::search(&app.bus, words, limit).await {
-        Ok(found) => axum::Json(serde_json::json!({
-            "results": found
+    let one_search = field(&query, "candidates") == "1" && access.deployment_admin;
+    let (found, platform) = if one_search {
+        let (found, platform) = tokio::join!(
+            instruments::search(&app.bus, words, limit),
+            instruments::candidates(&app.bus, words, limit)
+        );
+        (found, platform.ok().and_then(|reply| reply.answer))
+    } else {
+        (instruments::search(&app.bus, words, limit).await, None)
+    };
+    match found {
+        Ok(found) => {
+            let held: Vec<_> = found
                 .instruments
                 .iter()
-                .filter_map(|each| each.instrument.as_ref())
+                .filter_map(|each| each.instrument.clone())
                 .take(limit)
-                .map(instruments::found_json)
-                .collect::<Vec<_>>(),
-        }))
-        .into_response(),
+                .collect();
+            axum::Json(serde_json::json!({
+                "results": instruments::one_list(&held, platform.as_ref(), limit),
+            }))
+            .into_response()
+        }
         Err(why) => (
             StatusCode::SERVICE_UNAVAILABLE,
             axum::Json(serde_json::json!({"error": why})),
         )
             .into_response(),
+    }
+}
+
+/// `GET /admin/instruments/sources[?instrument=]` (ruling 728): the one
+/// search's picker, and the instrument picked as each source has it, side
+/// by side; a deployment admin's.
+async fn instrument_sources_page(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Query(query): Query<Fields>,
+) -> Response {
+    let (session, records) = match gate(&app, &headers, true) {
+        Ok(gated) => gated,
+        Err(response) => return *response,
+    };
+    let access = person_access(&records, &session.subject, &session.directory_groups);
+    let id = field(&query, "instrument");
+    let (record, lines, notice) = if id.is_empty() {
+        (None, None, String::new())
+    } else {
+        match instruments::list(&app.bus, id).await {
+            Ok(listed) => match listed.instruments.into_iter().find_map(|i| i.instrument) {
+                Some(record) => {
+                    let lines =
+                        sources_view::lines(&app.bus, &session.subject, &access, &record).await;
+                    (Some(record), Some(lines), String::new())
+                }
+                None => (None, None, format!("No record {id} in this deployment.")),
+            },
+            Err(why) => (None, None, format!("The instrument store is not answering: {why}")),
+        }
+    };
+    let body = sources_view::page(record.as_ref(), lines.as_ref(), &notice);
+    Html(page_with("Sources", &body, &instruments_chrome(&session, Some("Sources")))).into_response()
+}
+
+/// `POST /admin/instruments/bring-in` (meridian-ui 0.14.0's bring-in hook;
+/// ruling 774): a candidate the one search answered, chosen by a deployment
+/// admin, brought in by the instrument store as a resolve (W3.1) -- matched,
+/// or escalated to the platform (W3.4), or kept provisional while it is not
+/// reached -- on the person's behalf, so the store records who; answered
+/// with the record as the picker reads it. Only the candidate's open
+/// identifiers travel (ruling 761); nobody is asked for an exchange (778).
+async fn bring_in_instrument(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let refuse = |status: StatusCode, why: &str| {
+        (status, axum::Json(serde_json::json!({"error": why}))).into_response()
+    };
+    let (session, _) = match gate(&app, &headers, true) {
+        Ok(gated) => gated,
+        Err(_) => return refuse(StatusCode::FORBIDDEN, "a deployment admin's"),
+    };
+    let candidate = match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(asked) if asked.get("candidate").is_some_and(|c| c.is_object()) => asked["candidate"].clone(),
+        _ => return refuse(StatusCode::BAD_REQUEST, "send {\"candidate\": {...}} as the search answered it"),
+    };
+    let Some(request) = instruments::bring_in_request(&candidate) else {
+        return refuse(StatusCode::BAD_REQUEST, "the candidate carries no identifier to look for");
+    };
+    let resolved = match instruments::bring_in(&app.bus, &session.subject, request).await {
+        Ok(resolved) => resolved,
+        Err(why) => return refuse(StatusCode::SERVICE_UNAVAILABLE, &why),
+    };
+    if !resolved.found || resolved.instrument_id.is_empty() {
+        return refuse(StatusCode::UNPROCESSABLE_ENTITY, "the instrument store could not bring it in");
+    }
+    match instruments::list(&app.bus, &resolved.instrument_id).await {
+        Ok(listed) => match listed.instruments.into_iter().find_map(|i| i.instrument) {
+            Some(record) => {
+                axum::Json(serde_json::json!({"instrument": instruments::found_json(&record)}))
+                    .into_response()
+            }
+            None => axum::Json(serde_json::json!({"instrument": {
+                "instrument_id": resolved.instrument_id,
+                "description": candidate.get("description").cloned().unwrap_or_default(),
+            }}))
+            .into_response(),
+        },
+        Err(why) => refuse(StatusCode::SERVICE_UNAVAILABLE, &why),
     }
 }
 

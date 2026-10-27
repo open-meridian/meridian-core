@@ -46,6 +46,18 @@ pub const APPLY_INSTRUMENT_MIGRATION: &str =
     "platform.reference.command.apply-instrument-migration";
 pub const ASK_PLATFORM_FOR_INSTRUMENT: &str =
     "platform.reference.query.ask-platform-for-instrument";
+/// W3.33 (contract v28; rulings 757, 763): the picker's search, the
+/// conductor asking the platform.
+pub const ASK_PLATFORM_FOR_INSTRUMENT_CANDIDATES: &str =
+    "platform.reference.query.ask-platform-for-instrument-candidates";
+/// W3.1: what a set of identifiers means, matched or brought in by the
+/// instrument store's own escalation (W3.4).
+pub const RESOLVE_IDENTIFIER: &str = "platform.reference.query.resolve-identifier";
+
+/// How long the picker waits for the platform's candidates: its source gets
+/// about three seconds (ruling 760), and the picker answers the held records
+/// alone after this.
+const CANDIDATES_WAIT: Duration = Duration::from_secs(6);
 
 /// How long a read waits for the instrument store: one page's worth, and the
 /// rest of the dashboard is drawn without it.
@@ -118,7 +130,7 @@ fn type_words(value: i32) -> &'static str {
     instrument_type::words(InstrumentType::try_from(value).unwrap_or(InstrumentType::Unspecified))
 }
 
-fn class_name(value: i32) -> &'static str {
+pub(crate) fn class_name(value: i32) -> &'static str {
     CLASSES
         .iter()
         .find(|(class, _)| *class as i32 == value)
@@ -167,6 +179,201 @@ async fn ask<R: Message + Default>(
         other => other.to_string(),
     })?;
     R::decode(&bytes[..]).map_err(|failed| format!("the answer did not read: {failed}"))
+}
+
+/// W3.33 (contract v28): the platform's candidates for what a person typed
+/// into the picker, through the conductor: sent as typed, an ISIN or a CUSIP
+/// among it (ruling 761), and nothing else of the deployment's.
+pub async fn candidates(
+    bus: &meridian_bus::Bus,
+    words: &str,
+    limit: usize,
+) -> Result<meridian_domain::v1::AskPlatformForInstrumentCandidatesReply, String> {
+    ask(
+        bus,
+        ASK_PLATFORM_FOR_INSTRUMENT_CANDIDATES,
+        "meridian.v1.InstrumentCandidatesRequest",
+        meridian_domain::v1::InstrumentCandidatesRequest {
+            query: words.chars().take(64).collect(),
+            limit: limit.clamp(1, 25) as i32,
+            ..Default::default()
+        },
+        None,
+        CANDIDATES_WAIT,
+    )
+    .await
+}
+
+/// The FIGIs a record or a candidate is known by, at any level.
+const FIGI_SCHEMES: [&str; 3] = ["figi", "composite_figi", "share_class_figi"];
+
+/// The picker's one list (rulings 727, 774): the deployment's records first,
+/// as the kit reads them, then the platform's candidates the deployment does
+/// not hold -- by the record's ID, or by a FIGI one of its records carries --
+/// each marked `candidate`, with an empty ID; at most `limit`. Nothing in
+/// it says where a result came from.
+pub fn one_list(
+    held: &[InstrumentRecord],
+    answer: Option<&meridian_domain::v1::InstrumentCandidatesReply>,
+    limit: usize,
+) -> Vec<serde_json::Value> {
+    let ids: std::collections::HashSet<&str> =
+        held.iter().map(|r| r.instrument_id.as_str()).collect();
+    let figis: std::collections::HashSet<String> = held
+        .iter()
+        .flat_map(|r| r.identifiers.iter())
+        .filter(|i| FIGI_SCHEMES.contains(&i.scheme.as_str()) && i.valid_until_ns == 0)
+        .map(|i| i.value.to_ascii_uppercase())
+        .collect();
+    let mut out: Vec<serde_json::Value> = held.iter().map(found_json).collect();
+    for candidate in answer.map(|a| a.candidates.as_slice()).unwrap_or_default() {
+        let known_by = [&candidate.composite_figi, &candidate.share_class_figi]
+            .into_iter()
+            .chain(
+                candidate
+                    .identifiers
+                    .iter()
+                    .filter(|i| FIGI_SCHEMES.contains(&i.scheme.as_str()))
+                    .map(|i| &i.value),
+            )
+            .any(|figi| !figi.is_empty() && figis.contains(&figi.to_ascii_uppercase()));
+        if ids.contains(candidate.instrument_id.as_str()) || known_by {
+            continue;
+        }
+        out.push(candidate_json(candidate));
+    }
+    out.truncate(limit);
+    out
+}
+
+/// A candidate as the kit's picker lists one (meridian-ui 0.14.0): marked,
+/// its ID empty, its fields a record's, and the identifiers a bring-in
+/// sends -- the platform's, or for a record the platform holds, its FIGIs
+/// and its ticker on its MIC.
+pub fn candidate_json(candidate: &meridian_domain::v1::InstrumentCandidate) -> serde_json::Value {
+    let class = AssetClass::try_from(candidate.asset_class)
+        .ok()
+        .filter(|class| *class != AssetClass::Unspecified)
+        .map(|class| {
+            class
+                .as_str_name()
+                .trim_start_matches("ASSET_CLASS_")
+                .to_lowercase()
+        })
+        .unwrap_or_default();
+    let mut identifiers: Vec<serde_json::Value> = Vec::new();
+    let mut push = |scheme: &str, value: &str, source: &str| {
+        if !value.is_empty()
+            && !identifiers
+                .iter()
+                .any(|i| i["scheme"] == scheme && i["value"] == value)
+        {
+            identifiers
+                .push(serde_json::json!({"scheme": scheme, "value": value, "source": source}));
+        }
+    };
+    // The ticker first, as a person reads it; on its MIC where one is known.
+    push("ticker", &candidate.ticker, &candidate.mic);
+    for identifier in &candidate.identifiers {
+        push(&identifier.scheme, &identifier.value, &identifier.source);
+    }
+    push("share_class_figi", &candidate.share_class_figi, "");
+    push("composite_figi", &candidate.composite_figi, &candidate.country);
+    serde_json::json!({
+        "instrument_id": "",
+        "candidate": true,
+        "description": candidate.name,
+        "asset_class": class,
+        "currency": candidate.currency,
+        "exchange_mic": candidate.mic,
+        "identifiers": identifiers,
+    })
+}
+
+/// The schemes a bring-in sends: the open ones an escalation may carry
+/// (W3.25), a ticker only with its venue's MIC. A licensed scheme is never
+/// among them, whatever the browser sent (ruling 761).
+const BRINGS_IN: [&str; 5] = [
+    "figi",
+    "composite_figi",
+    "share_class_figi",
+    "sec_series",
+    "sec_class",
+];
+
+/// The resolve a chosen candidate is brought in by (W3.1, the store's own
+/// escalation W3.4 where it holds none of it): its open identifiers, and
+/// what the search stated of it as offers, never in force by themselves.
+/// None where it carries nothing to look for.
+pub fn bring_in_request(
+    candidate: &serde_json::Value,
+) -> Option<meridian_domain::v1::ResolveIdentifierRequest> {
+    let text = |name: &str| {
+        candidate
+            .get(name)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
+    let identifiers: Vec<Identifier> = candidate
+        .get("identifiers")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .take(16)
+        .filter_map(|i| {
+            let field = |name: &str| i.get(name).and_then(|v| v.as_str()).unwrap_or_default().trim();
+            let (scheme, value, source) = (field("scheme"), field("value"), field("source"));
+            let mic = source.len() == 4 && source.bytes().all(|b| b.is_ascii_alphanumeric());
+            let sendable = BRINGS_IN.contains(&scheme) || (scheme == "ticker" && mic);
+            (sendable && !value.is_empty() && value.len() <= 64 && source.len() <= 16).then(|| {
+                Identifier {
+                    scheme: scheme.to_string(),
+                    value: value.to_string(),
+                    source: source.to_string(),
+                    ..Default::default()
+                }
+            })
+        })
+        .collect();
+    if identifiers.is_empty() {
+        return None;
+    }
+    let class = text("asset_class").to_ascii_uppercase();
+    let stated_asset_class = AssetClass::from_str_name(&format!("ASSET_CLASS_{class}"))
+        .map(|class| class as i32)
+        .unwrap_or_default();
+    let currency = text("currency").to_ascii_uppercase();
+    Some(meridian_domain::v1::ResolveIdentifierRequest {
+        identifiers,
+        stated_asset_class,
+        stated_currency: if currency.len() == 3 && currency.bytes().all(|b| b.is_ascii_uppercase()) {
+            currency
+        } else {
+            String::new()
+        },
+        stated_description: text("description").chars().take(200).collect(),
+        ..Default::default()
+    })
+}
+
+/// W3.1 for the person signed in: a chosen candidate brought in, matched
+/// or escalated by the instrument store, the record's ID it answers.
+pub async fn bring_in(
+    bus: &meridian_bus::Bus,
+    subject: &str,
+    request: meridian_domain::v1::ResolveIdentifierRequest,
+) -> Result<meridian_domain::v1::ResolveIdentifierReply, String> {
+    ask(
+        bus,
+        RESOLVE_IDENTIFIER,
+        "meridian.v1.ResolveIdentifierRequest",
+        request,
+        Some(subject),
+        ASKING,
+    )
+    .await
 }
 
 /// The records a picker's words find (W3.11, contract v20): by an
@@ -1589,7 +1796,8 @@ pub fn list_page_full(
     format!(
         "<div class=\"admin\"><div class=\"page-head\"><div><h1>Instruments</h1>\
          <p class=\"hint\">The deployment's own instrument records. An opening balance naming one \
-         the book cannot use is refused until it is complete.</p></div></div>{notice}\
+         the book cannot use is refused until it is complete.</p></div>\
+         <a class=\"button\" href=\"/admin/instruments/sources\">Find an instrument</a></div>{notice}\
          <nav class=\"tabs\"><a href=\"#to-complete\" data-tab=\"to-complete\">To complete</a>\
          <a href=\"#conflicts\" data-tab=\"conflicts\">Conflicts ({conflicts_n})</a>\
          {provisional_link}<a href=\"#licensed\" data-tab=\"licensed\">Licensed identifiers</a>{calendars_tab}</nav>\
@@ -2103,8 +2311,9 @@ pub fn record_page(
     format!(
         "<div class=\"admin\"><div class=\"page-head\"><div><h1>{id}</h1>\
          <p class=\"hint\">Version {version}. {book}</p></div>\
+         <div class=\"head-actions\"><a class=\"button\" href=\"/admin/instruments/sources?instrument={id}\">Sources</a>\
          <form method=\"post\" action=\"/admin/instruments/{id}/ask\">{token}\
-         <button type=\"submit\">Ask the platform</button></form></div>{asked_html}\
+         <button type=\"submit\">Ask the platform</button></form></div></div>{asked_html}\
          <nav class=\"tabs\"><a href=\"#says\" data-tab=\"says\">What it says</a>\
          <a href=\"#complete-it\" data-tab=\"complete-it\">Complete it</a>\
          <a href=\"#history\" data-tab=\"history\">History</a>{groups_tab}</nav>\
@@ -2816,5 +3025,107 @@ mod provisional_tests {
             crate::prepared::levels::default_for("dashboard__set_licensed_schemes"),
             crate::prepared::levels::Level::MayNot
         );
+    }
+}
+
+#[cfg(test)]
+mod one_search_tests {
+    use super::*;
+    use meridian_domain::v1::{InstrumentCandidate, InstrumentCandidatesReply};
+
+    fn candidate(id: &str, ticker: &str, mic: &str, composite: &str) -> InstrumentCandidate {
+        InstrumentCandidate {
+            instrument_id: id.into(),
+            ticker: ticker.into(),
+            mic: mic.into(),
+            country: "US".into(),
+            name: format!("{ticker} Trust"),
+            asset_class: AssetClass::Fund as i32,
+            currency: "USD".into(),
+            composite_figi: composite.into(),
+            share_class_figi: format!("{composite}S"),
+            identifiers: vec![Identifier {
+                scheme: "composite_figi".into(),
+                value: composite.into(),
+                source: "US".into(),
+                ..Default::default()
+            }],
+        }
+    }
+
+    #[test]
+    fn held_records_first_then_candidates_not_held_marked_with_no_id() {
+        let held = InstrumentRecord {
+            instrument_id: "INS-HELD".into(),
+            description: "Apple Inc.".into(),
+            identifiers: vec![Identifier {
+                scheme: "composite_figi".into(),
+                value: "BBG000B9XRY4".into(),
+                source: "US".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let answer = InstrumentCandidatesReply {
+            candidates: vec![
+                // Held by its ID, and by its FIGI: not repeated.
+                candidate("INS-HELD", "AAPL", "XNAS", "BBG000B9XRY4"),
+                candidate("", "AAPL", "", "bbg000b9xry4"),
+                // Not held: the platform's record, and one it does not hold.
+                candidate("INS-PLATFORM", "QQQ", "XNAS", "BBG000BSWKH7"),
+                candidate("", "SPY", "", "BBG000BDTBL9"),
+            ],
+            sources: Vec::new(),
+        };
+        let list = one_list(&[held], Some(&answer), 10);
+        assert_eq!(list.len(), 3, "{list:?}");
+        assert_eq!(list[0]["instrument_id"], "INS-HELD");
+        assert!(list[0].get("candidate").is_none());
+        for fresh in &list[1..] {
+            assert_eq!(fresh["candidate"], true);
+            assert_eq!(fresh["instrument_id"], "", "no platform ID is shown or submitted");
+        }
+        assert_eq!(list[1]["exchange_mic"], "XNAS");
+        assert_eq!(list[2]["description"], "SPY Trust");
+        assert_eq!(list[2]["asset_class"], "fund");
+        // The platform not reached: the records alone.
+        assert_eq!(one_list(&[], None, 10).len(), 0);
+        assert_eq!(one_list(&[], Some(&answer), 2).len(), 2);
+    }
+
+    #[test]
+    fn a_bring_in_sends_only_open_identifiers_never_a_typed_isin_nor_a_venueless_ticker() {
+        let asked = serde_json::json!({
+            "instrument_id": "", "candidate": true, "description": "SPDR S&P 500 ETF Trust",
+            "asset_class": "fund", "currency": "usd", "exchange_mic": "",
+            "identifiers": [
+                {"scheme": "ticker", "value": "SPY", "source": ""},
+                {"scheme": "isin", "value": "US78462F1030", "source": ""},
+                {"scheme": "cusip", "value": "78462F103", "source": ""},
+                {"scheme": "share_class_figi", "value": "BBG001S72SM3", "source": ""},
+                {"scheme": "composite_figi", "value": "BBG000BDTBL9", "source": "US"},
+                {"scheme": "ticker", "value": "QQQ", "source": "XNAS"},
+            ],
+        });
+        let request = bring_in_request(&asked).expect("something to look for");
+        let sent: Vec<(&str, &str)> = request
+            .identifiers
+            .iter()
+            .map(|i| (i.scheme.as_str(), i.value.as_str()))
+            .collect();
+        assert_eq!(
+            sent,
+            vec![
+                ("share_class_figi", "BBG001S72SM3"),
+                ("composite_figi", "BBG000BDTBL9"),
+                ("ticker", "QQQ"),
+            ]
+        );
+        assert_eq!(request.stated_asset_class, AssetClass::Fund as i32);
+        assert_eq!(request.stated_currency, "USD");
+        assert_eq!(request.stated_description, "SPDR S&P 500 ETF Trust");
+        // Nothing open to look for: nothing is sent.
+        assert!(bring_in_request(&serde_json::json!({"identifiers": [
+            {"scheme": "isin", "value": "US78462F1030", "source": ""}]})).is_none());
     }
 }
