@@ -273,7 +273,7 @@ pub fn candidate_json(candidate: &meridian_domain::v1::InstrumentCandidate) -> s
         }
     };
     // The ticker first, as a person reads it: on the venue the platform
-    // gave it (its MIC, or the US consolidated listing's `VEN-` ID, 779).
+    // gave it (its MIC, or the "US composite" venue's `VEN-` ID, 779).
     let ticker_on = candidate
         .identifiers
         .iter()
@@ -303,7 +303,7 @@ pub fn candidate_json(candidate: &meridian_domain::v1::InstrumentCandidate) -> s
 
 /// The schemes a bring-in sends: the open ones an escalation may carry
 /// (W3.25), a ticker only with its venue: its MIC, or the `VEN-` ID of a
-/// venue with none, as the platform's US consolidated listing (ruling 779).
+/// venue with none, as the platform's "US composite" venue (ruling 779).
 /// A licensed scheme is never
 /// among them, whatever the browser sent (ruling 761).
 const BRINGS_IN: [&str; 5] = [
@@ -3128,7 +3128,7 @@ mod one_search_tests {
                 {"scheme": "share_class_figi", "value": "BBG001S72SM3", "source": ""},
                 {"scheme": "composite_figi", "value": "BBG000BDTBL9", "source": "US"},
                 {"scheme": "ticker", "value": "QQQ", "source": "XNAS"},
-                {"scheme": "ticker", "value": "SPY", "source": "VEN-01JUSCONSOLIDATED000000001"},
+                {"scheme": "ticker", "value": "SPY", "source": "VEN-01JUSCOMPOSITE00000000001"},
             ],
         });
         let request = bring_in_request(&asked).expect("something to look for");

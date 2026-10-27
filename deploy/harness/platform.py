@@ -80,8 +80,8 @@ From contract v28 (W3.33; rulings 757, 775 and 778) it answers POST
 /api/v1/reference/instrument-candidates, the instrument picker's search: the
 test equity it holds (Apple Inc., by its `INS-` ID) for a query naming it,
 then two funds it does not hold -- SPDR S&P 500 ETF Trust (SPY) on its US
-composite with no listing venue (778), its ticker on the US consolidated
-listing, a venue with no MIC (779), and Invesco QQQ (QQQ) with its Nasdaq
+composite with no listing venue (778), its ticker on the venue "US
+composite", one with no MIC (779, 782), and Invesco QQQ (QQQ) with its Nasdaq
 listing, XNAS (775) -- each with the identifiers an escalation sends; a
 query it cannot place answers nothing, and an ISIN or a CUSIP is kept
 nowhere. A matching request naming either fund's FIGIs is answered with a
@@ -675,7 +675,7 @@ def match_or_mint(asked):
         if minted:
             fresh, held = minted
             answer = {"minted": fresh, "instrument": held,
-                      "venues": [XNAS] if held["listing_venue_id"] else [US_CONSOLIDATED]}
+                      "venues": [XNAS] if held["listing_venue_id"] else [US_COMPOSITE]}
             break
         if scheme in ("figi", "share_class_figi", "composite_figi") and value in EQUITIES:
             answer = {"minted": False, "instrument": EQUITIES[value], "venues": [XNAS]}
@@ -752,10 +752,10 @@ def company(asked):
 
 # ── Contract v28 (W3.33; rulings 757, 775, 778): the picker's search ──────
 
-# Ruling 779: the platform's one venue for the US consolidated listing, with
+# Ruling 779: the platform's one venue for the "US composite" venue, with
 # no MIC, a ticker minted on a US composite held on it by its VEN- ID.
-US_CONSOLIDATED = {
-    "venue_id": "VEN-01JAE0000000000000USCONS", "name": "US consolidated listing",
+US_COMPOSITE = {
+    "venue_id": "VEN-01JAE00000000000USCOMPOS", "name": "US composite",
     "country_code": "US", "kind": "VENUE_KIND_REPORTING_FACILITY", "identifiers": [],
     "operating_venue_id": "", "time_zone": "America/New_York", "version": 1,
 }
@@ -778,7 +778,7 @@ def candidate_identifiers(ticker, seed):
         held += [{"scheme": "figi", "value": seed["listing"], "source": seed["mic"]},
                  {"scheme": "ticker", "value": ticker, "source": seed["mic"]}]
     else:
-        held.append({"scheme": "ticker", "value": ticker, "source": US_CONSOLIDATED["venue_id"]})
+        held.append({"scheme": "ticker", "value": ticker, "source": US_COMPOSITE["venue_id"]})
     return held
 
 
