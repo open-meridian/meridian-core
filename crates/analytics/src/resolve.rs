@@ -42,6 +42,12 @@ use crate::topics;
 /// the stores up on an in-memory bus.
 pub trait Ask: Send + Sync {
     fn ask(&self, topic: &str, kind: &str, payload: Vec<u8>) -> Result<(String, Vec<u8>), String>;
+
+    /// The client instance the reads are made for, as its sidecar stamped
+    /// it: what a missing input it is not entitled to names (ruling 788).
+    fn client(&self) -> String {
+        String::new()
+    }
 }
 
 fn ask<Q: Message, R: Message + Default>(
@@ -745,7 +751,10 @@ pub fn resolve(
             .iter()
             .map(|(_, p)| p.instrument_id.clone())
             .collect();
-        let rate = crate::chains::rate(asker, compiled, as_of, &sources);
+        // A business date's chains are read at that date's end, as its
+        // closes are (ruling 458): never today's chain (ruling 791).
+        let at = crate::chains::read_at(&business_date, as_of);
+        let rate = crate::chains::rate(asker, compiled, at, as_of, &sources);
         let mut placing = crate::chains::Placing::default();
         let mut chains = Vec::new();
         for chain in crate::chains::refs(asker, job, compiled, &held, as_of) {
@@ -753,6 +762,7 @@ pub fn resolve(
                 asker,
                 &chain,
                 &sources,
+                at,
                 as_of,
                 Some(&rate),
                 &mut placing,

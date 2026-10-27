@@ -320,10 +320,18 @@ fn source_ns(meta: &v1::ObservationMeta) -> i64 {
 
 /// One chain, resolved into the document's form.
 #[allow(clippy::too_many_lines)]
+///
+/// `at` is the valid time the chain is read at -- the as-of, or a business
+/// date's end ([`read_at`]) -- and `as_of` the recorded time; the
+/// underlying's price is read at the instant the chain's newest quote was
+/// struck (ruling 791), so a spot printed after the options' close never
+/// prices the close's quotes.
+#[allow(clippy::too_many_arguments)]
 pub fn chain(
     asker: &dyn Ask,
     chain: &ChainRef,
     sources: &Option<v1::SourceChoice>,
+    at: i64,
     as_of: i64,
     rate: Option<&Value>,
     placing: &mut Placing,
@@ -401,7 +409,7 @@ pub fn chain(
                 &ListQuotesRequest {
                     subjects: subject(underlying),
                     sources: sources.clone(),
-                    at_ns: as_of,
+                    at_ns: at,
                     as_of_ns: as_of,
                     page_size: PAGE,
                     cursor: cursor.clone(),
@@ -488,8 +496,8 @@ pub fn chain(
     }
     // Open interest per series on the latest trading date and the one
     // before, and the underlying's volume, from the lake's statistics.
-    let today = Date::of_utc_instant(as_of);
-    let from = Date::of_utc_instant(as_of - 14 * DAY_NS).to_string();
+    let today = Date::of_utc_instant(at);
+    let from = Date::of_utc_instant(at - 14 * DAY_NS).to_string();
     let mut interest: BTreeMap<Vec<(String, String)>, BTreeMap<String, String>> = BTreeMap::new();
     let mut volume: BTreeMap<String, String> = BTreeMap::new();
     let mut stats_datasets: BTreeSet<String> = BTreeSet::new();
@@ -550,7 +558,16 @@ pub fn chain(
         }
         cursor = reply.next_cursor;
     }
-    // The underlying's price at the as-of: its latest mid, last or close.
+    // The underlying's price at the instant the chain was struck: its
+    // newest quote's source time, never after `at` (ruling 791); its
+    // latest mid, last or close in force then.
+    let struck = quotes
+        .values()
+        .filter_map(|q| q.meta.as_ref())
+        .map(source_ns)
+        .filter(|&n| n > 0 && n <= at)
+        .max()
+        .unwrap_or(at);
     let price_reply: Result<v1::ListPricesReply, String> = ask(
         asker,
         topics::LIST_PRICES,
@@ -563,12 +580,26 @@ pub fn chain(
                 PriceKind::Close as i32,
             ],
             sources: sources.clone(),
-            at_ns: as_of,
+            at_ns: struck,
             as_of_ns: as_of,
             page_size: PAGE,
             ..Default::default()
         },
     );
+    // A dataset the client is not entitled to that would have answered is
+    // named so where no price was read (ruling 788).
+    let price_unentitled: BTreeSet<String> = price_reply
+        .as_ref()
+        .map(|reply| {
+            reply
+                .unanswered
+                .iter()
+                .filter(|u| u.reason == v1::UnansweredReason::NotEntitled as i32)
+                .filter(|u| !u.dataset.is_empty())
+                .map(|u| u.dataset.clone())
+                .collect()
+        })
+        .unwrap_or_default();
     // A dataset served, not kept, that served nothing within the read is
     // named with its licence where no price was read (ruling 734).
     let not_kept: BTreeSet<String> = price_reply
@@ -701,7 +732,7 @@ pub fn chain(
             today_local = held
                 .zone
                 .as_ref()
-                .and_then(|z| z.local(as_of))
+                .and_then(|z| z.local(at))
                 .map(|(date, _)| date.to_string());
         }
         let expiry = field(listed, "expiration_date").to_string();
@@ -786,16 +817,27 @@ pub fn chain(
         .as_ref()
         .map(|(_, money, _)| money.instrument_id.clone())
         .unwrap_or_default();
-    let spot_missing = if spot.is_none() && !not_kept.is_empty() {
-        spot_not_kept(&not_kept)
+    let (spot_missing, spot_reason) = if spot.is_some() {
+        (String::new(), "")
+    } else if !price_unentitled.is_empty() {
+        (
+            format!(
+                "the underlying's price: {}",
+                not_entitled(&asker.client(), &price_unentitled)
+            ),
+            "not_entitled",
+        )
+    } else if !not_kept.is_empty() {
+        (spot_not_kept(&not_kept), "")
     } else {
-        String::new()
+        (String::new(), "")
     };
     Ok(json!({
         "underlying_instrument_id": underlying,
         "currency_instrument_id": currency,
         "spot": spot_json,
         "spot_missing": spot_missing,
+        "spot_missing_reason": spot_reason,
         "rate": rate.cloned(),
         "dividends": dividends,
         "dividends_dataset": dividends_dataset,
@@ -865,6 +907,31 @@ pub fn scenario(asker: &dyn Ask, job: &Job) -> Result<Option<Value>, Refused> {
         ));
     }
     Ok(Some(scenario::set_json(&saved.row_key, version, &set)))
+}
+
+/// The valid time a job's chains are read at (ruling 791): a business
+/// date's end -- its last instant, UTC, after every venue's close that day
+/// and before any next session's open -- never after the as-of; the as-of
+/// for a job read at now.
+pub fn read_at(business_date: &str, as_of: i64) -> i64 {
+    match Date::parse(business_date) {
+        Ok(date) if !business_date.is_empty() => {
+            ((date.days_since_epoch() + 1) * DAY_NS - 1).min(as_of)
+        }
+        _ => as_of,
+    }
+}
+
+/// A missing input's datasets the client is not entitled to, said plainly
+/// (ruling 788): `sample-options is not entitled to us-treasury:ust_par`.
+fn not_entitled(client: &str, datasets: &BTreeSet<String>) -> String {
+    let named: Vec<&str> = datasets.iter().map(String::as_str).collect();
+    let who = if client.is_empty() {
+        "this client"
+    } else {
+        client
+    };
+    format!("{who} is not entitled to {}", named.join(", "))
 }
 
 /// Why the underlying's price is missing where its datasets are served,
@@ -958,6 +1025,7 @@ const CURVES: &[(&str, &str, &str)] = &[(
 pub fn rate(
     asker: &dyn Ask,
     compiled: &Compiled,
+    at: i64,
     as_of: i64,
     sources: &Option<v1::SourceChoice>,
 ) -> Value {
@@ -993,6 +1061,7 @@ pub fn rate(
     let mut points: Vec<Value> = Vec::new();
     let mut dataset = String::new();
     let mut unanswered = String::new();
+    let mut unentitled: BTreeSet<String> = BTreeSet::new();
     let mut cursor = String::new();
     loop {
         let reply: v1::ListRatesReply = match ask(
@@ -1003,7 +1072,7 @@ pub fn rate(
                 subjects: subject(&curve),
                 kinds: vec![v1::RateKind::ParYield as i32],
                 sources: sources.clone(),
-                at_ns: as_of,
+                at_ns: at,
                 as_of_ns: as_of,
                 page_size: PAGE,
                 cursor: cursor.clone(),
@@ -1016,6 +1085,14 @@ pub fn rate(
         if let Some(first) = reply.unanswered.first() {
             unanswered = first.dataset.clone();
         }
+        unentitled.extend(
+            reply
+                .unanswered
+                .iter()
+                .filter(|u| u.reason == v1::UnansweredReason::NotEntitled as i32)
+                .filter(|u| !u.dataset.is_empty())
+                .map(|u| u.dataset.clone()),
+        );
         for r in &reply.rates {
             let Some(percent) = r
                 .value
@@ -1048,6 +1125,12 @@ pub fn rate(
             break;
         }
         cursor = reply.next_cursor;
+    }
+    if points.is_empty() && !unentitled.is_empty() {
+        // Ruling 788: the reason is the entitlement, said plainly.
+        let mut said = missing(&not_entitled(&asker.client(), &unentitled));
+        said["missing_reason"] = json!("not_entitled");
+        return said;
     }
     if points.is_empty() {
         return missing(&if unanswered.is_empty() {
@@ -1231,6 +1314,7 @@ mod tests {
                     },
                     &None,
                     as_of,
+                    as_of,
                     None,
                     &mut placing,
                     false,
@@ -1330,5 +1414,174 @@ mod tests {
         };
         assert_eq!(bound(Some(bindings)).unwrap(), "american_binomial");
         assert!(bound(None).unwrap_err().ends_with("no calculation package"));
+    }
+
+    /// What a job's reads were asked at, by topic: the lake of one quoted
+    /// series struck at the close, a price, and a curve not entitled.
+    #[derive(Default)]
+    struct Recording {
+        asked: std::sync::Mutex<Vec<(String, i64)>>,
+    }
+
+    /// 2026-10-26 20:00 UTC: the session's close, 16:00 New York.
+    const CLOSE_NS: i64 = 1_793_044_800_000_000_000;
+
+    impl Ask for Recording {
+        fn ask(&self, topic: &str, _: &str, payload: Vec<u8>) -> Result<(String, Vec<u8>), String> {
+            let at = match topic {
+                topics::LIST_QUOTES => ListQuotesRequest::decode(&payload[..]).unwrap().at_ns,
+                topics::LIST_PRICES => v1::ListPricesRequest::decode(&payload[..]).unwrap().at_ns,
+                topics::LIST_RATES => v1::ListRatesRequest::decode(&payload[..]).unwrap().at_ns,
+                _ => 0,
+            };
+            self.asked.lock().unwrap().push((topic.to_string(), at));
+            let key = vec![Identifier {
+                scheme: "occ_osi".into(),
+                value: "TQQQ  261030C00068000".into(),
+                ..Default::default()
+            }];
+            let payload = match topic {
+                topics::LIST_SERIES => ListSeriesReply {
+                    series: vec![v1::ListedSeries {
+                        meta: Some(v1::ObservationMeta {
+                            series_key: key.clone(),
+                            ..Default::default()
+                        }),
+                        fields: [
+                            ("put_or_call", "PUT_OR_CALL_CALL"),
+                            ("strike_price", "68.00 USD"),
+                            ("expiration_date", "2026-10-30"),
+                        ]
+                        .into_iter()
+                        .map(|(path, value)| v1::TemplateFieldValue {
+                            path: path.into(),
+                            value: value.into(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+                topics::LIST_QUOTES => ListQuotesReply {
+                    quotes: vec![v1::Quote {
+                        meta: Some(v1::ObservationMeta {
+                            series_key: key,
+                            valid_from_ns: CLOSE_NS,
+                            source_times: vec![v1::SourceTime {
+                                kind: v1::SourceTimeKind::Event as i32,
+                                at_ns: CLOSE_NS,
+                            }],
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+                topics::LIST_PRICES => v1::ListPricesReply {
+                    unanswered: vec![v1::Unanswered {
+                        dataset: "tradier:live_delayed".into(),
+                        reason: v1::UnansweredReason::NotEntitled as i32,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+                topics::RESOLVE_IDENTIFIER => v1::ResolveIdentifierReply {
+                    found: true,
+                    instrument_id: "INS-UST".into(),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+                topics::LIST_RATES => v1::ListRatesReply {
+                    unanswered: vec![v1::Unanswered {
+                        dataset: "us-treasury:ust_par".into(),
+                        reason: v1::UnansweredReason::NotEntitled as i32,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+                _ => return Err(format!("no responders on {topic}")),
+            };
+            Ok(("reply".into(), payload))
+        }
+
+        fn client(&self) -> String {
+            "sample-options".into()
+        }
+    }
+
+    impl Recording {
+        fn at(&self, topic: &str) -> Vec<i64> {
+            self.asked
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(t, _)| t == topic)
+                .map(|(_, at)| *at)
+                .collect()
+        }
+    }
+
+    /// Ruling 791: a business date's chain is read at that date's end, never
+    /// today's, and the underlying's price at the instant the chain's newest
+    /// quote was struck -- the close, not a print after it.
+    #[test]
+    fn a_business_dates_chain_is_read_at_its_end_and_its_spot_where_it_was_struck() {
+        let now = CLOSE_NS + 13 * 3_600_000_000_000;
+        let end = read_at("2026-10-26", now);
+        assert_eq!(
+            end,
+            CLOSE_NS + 4 * 3_600_000_000_000 - 1,
+            "23:59:59.999999999 UTC"
+        );
+        assert_eq!(read_at("", now), now);
+        assert_eq!(read_at("2026-10-27", now), now, "never after the as-of");
+        let lake = Recording::default();
+        let answered = chain(
+            &lake,
+            &ChainRef {
+                underlying_instrument_id: "INS-TQQQ".into(),
+                ..Default::default()
+            },
+            &None,
+            end,
+            now,
+            None,
+            &mut Placing::default(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(lake.at(topics::LIST_QUOTES), vec![end]);
+        assert_eq!(lake.at(topics::LIST_PRICES), vec![CLOSE_NS]);
+        assert_eq!(answered["today"], "2026-10-26");
+        // Ruling 788: the price not entitled is named so.
+        assert_eq!(
+            answered["spot_missing"],
+            "the underlying's price: sample-options is not entitled to tradier:live_delayed"
+        );
+        assert_eq!(answered["spot_missing_reason"], "not_entitled");
+    }
+
+    /// Ruling 788: a curve the client is not entitled to names the client
+    /// and the dataset, never "no par yields at the as-of".
+    #[test]
+    fn a_curve_not_entitled_names_the_client_and_its_dataset() {
+        let lake = Recording::default();
+        let compiled = Compiled {
+            measures: Vec::new(),
+            definitions: Vec::new(),
+            reads: Default::default(),
+        };
+        let said = rate(&lake, &compiled, CLOSE_NS, CLOSE_NS + 1, &None);
+        assert_eq!(
+            said["missing"],
+            "the risk-free curve ust_cmt: sample-options is not entitled to us-treasury:ust_par"
+        );
+        assert_eq!(said["missing_reason"], "not_entitled");
+        assert_eq!(lake.at(topics::LIST_RATES), vec![CLOSE_NS]);
     }
 }
