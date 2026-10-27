@@ -445,8 +445,9 @@ fn row(line: &Line) -> String {
     let dash = |text: &str| if text.is_empty() { "—".to_string() } else { escape(text) };
     format!(
         "<tr data-source=\"{dataset}\" data-state=\"{state}\"><td title=\"{source}\">{source}</td>\
-         <td>{ticker}</td><td class=\"wide\">{exchange}</td><td class=\"wide\" title=\"{name}\">{name}</td>\
-         <td title=\"{latest}\">{latest}</td><td class=\"wide\">{delay}</td></tr>",
+         <td title=\"{ticker}\">{ticker}</td><td class=\"wide\" title=\"{exchange}\">{exchange}</td>\
+         <td class=\"wide\" title=\"{name}\">{name}</td>\
+         <td title=\"{latest}\">{latest}</td><td class=\"wide\" title=\"{delay}\">{delay}</td></tr>",
         dataset = escape(&line.dataset),
         source = escape(&source),
         ticker = dash(&line.ticker),

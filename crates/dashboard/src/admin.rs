@@ -2988,6 +2988,20 @@ async fn bring_in_instrument(
     let refuse = |status: StatusCode, why: &str| {
         (status, axum::Json(serde_json::json!({"error": why}))).into_response()
     };
+    // No form token travels with the kit's fetch: a JSON body, which no
+    // page elsewhere can send without the browser asking first, and never
+    // from another site, stand in for it (the session cookie is SameSite=Lax).
+    let json = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim_start().starts_with("application/json"));
+    let cross_site = headers
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v == "cross-site");
+    if !json || cross_site {
+        return refuse(StatusCode::UNSUPPORTED_MEDIA_TYPE, "send the candidate as JSON, from this dashboard");
+    }
     let (session, _) = match gate(&app, &headers, true) {
         Ok(gated) => gated,
         Err(_) => return refuse(StatusCode::FORBIDDEN, "a deployment admin's"),

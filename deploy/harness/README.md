@@ -20,7 +20,12 @@ venue's symbol -- sent as `ticker`, its source the venue's MIC (Kalshi's
 KLSH) or, for a venue with none, its `VEN-` ID (Polymarket's) -- holds those
 two venues, matches or mints their event groups (`EVG-`), and its template
 catalogue carries v26's versions with their calculation packages, so the
-prediction plugins' e2e runs here. Every other record is the deployment's
+prediction plugins' e2e runs here. From contract v28 it answers the
+instrument picker's one search (`POST /api/v1/reference/instrument-candidates`,
+W3.33): Apple Inc. as the record it holds, and two funds it does not --
+SPY on its US composite with no listing venue, QQQ on XNAS -- each minted
+once when a matching request names its FIGIs, so a picker's bring-in runs
+here. Every other record is the deployment's
 own (contract v10), so every other row a plugin records names a record the
 deployment minted, completed by the
 runner as a deployment admin does at the dashboard's Instruments page; its dashboard runs with `MERIDIAN_DEVELOPMENT`,

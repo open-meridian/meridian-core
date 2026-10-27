@@ -207,6 +207,20 @@ pub fn serve_all_within(
                 .map(|meta| meta.publisher_instance_id.clone())
                 .unwrap_or_default();
             let now_ns = clock.now_ns();
+            // Contract v28's amendment (W3.1, ruling 781): the dashboard's
+            // resolve, the instrument picker bringing a chosen candidate in --
+            // a person's act, never a launched plugin's -- its stated values
+            // and its record's sources naming the picker and the person.
+            let person = envelope
+                .meta
+                .as_ref()
+                .map(|meta| meta.acting_for_subject.clone())
+                .unwrap_or_default();
+            let instance = if !person.is_empty() && asking.launched_roles(&instance, now_ns).is_none() {
+                picker_for(&person)
+            } else {
+                instance
+            };
             // Read-only for an instance none of whose launched roles may mint
             // (contract v20, W3.1): `reporting`, by the launch records, never
             // by anything the plugin sends.
@@ -1569,6 +1583,14 @@ pub fn publish_applied(bus: &Bus, applied: &crate::one_id::Applied, now_ns: i64)
             tracing::warn!(%failed, instrument = changed.instrument_id, "a record's new version could not be announced");
         }
     }
+}
+
+/// The words a resolve the instrument picker sent stands under (ruling 781):
+/// the picker, for the person who chose the candidate.
+pub const INSTRUMENT_PICKER: &str = "the instrument picker";
+
+fn picker_for(person: &str) -> String {
+    format!("{INSTRUMENT_PICKER} for {person}")
 }
 
 /// Who a command was sent for, as the dashboard stamped them: the person,
@@ -3001,6 +3023,37 @@ mod tests {
             assert_eq!(!reply.instrument_id.is_empty(), mints, "{instance}");
             assert_eq!(store.count().unwrap(), usize::from(mints), "{instance}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_instrument_pickers_resolve_is_the_persons_act_named_as_the_picker() {
+        // Contract v28's amendment (W3.1, ruling 781): the dashboard, never
+        // a launched plugin, resolving for a person.
+        let (store_bus, dashboard_bus) = two("dashboard-1");
+        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        launched(&store_bus, &[]);
+        serve_queries(
+            &store_bus,
+            store.clone(),
+            Arc::new(meridian_clock::ManualClock::at(NOW)),
+        );
+        let reply: ResolveIdentifierReply = ask(
+            &dashboard_bus,
+            RESOLVE_IDENTIFIER,
+            "meridian.v1.ResolveIdentifierRequest",
+            snap(),
+            "subject-ada",
+        )
+        .await
+        .unwrap();
+        assert!(reply.found && !reply.instrument_id.is_empty(), "{reply:?}");
+        let held = store.by_id(&reply.instrument_id).unwrap().unwrap();
+        let said = format!("{held:?}");
+        assert!(
+            said.contains("the instrument picker for subject-ada"),
+            "the picker and the person named: {said}"
+        );
+        assert!(!said.contains("dashboard-1"), "{said}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

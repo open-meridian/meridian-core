@@ -1370,9 +1370,126 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
             Ok(("".into(), counts.encode_to_vec()))
         },
     );
+    // Contract v28 (W3.33; rulings 727, 774, 778): the conductor's
+    // candidates for the picker's one search -- SPY, which the deployment
+    // does not hold, on its US composite with no venue -- and the store's
+    // resolve bringing one in, kept and listed after.
+    let brought: Arc<Mutex<Vec<InstrumentRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    bus.serve(
+        crate::admin::instruments::ASK_PLATFORM_FOR_INSTRUMENT_CANDIDATES,
+        |envelope| {
+            let asked = meridian_domain::v1::InstrumentCandidatesRequest::decode(&envelope.payload[..])
+                .map_err(|e| e.to_string())?;
+            let query = asked.query.trim().to_uppercase();
+            let candidates = if !query.is_empty() && "SPY".starts_with(&query) {
+                vec![meridian_domain::v1::InstrumentCandidate {
+                    ticker: "SPY".into(),
+                    country: "US".into(),
+                    name: "SPDR S&P 500 ETF Trust".into(),
+                    asset_class: meridian_domain::v1::AssetClass::Fund as i32,
+                    currency: "USD".into(),
+                    composite_figi: "BBG000BDTBL9".into(),
+                    share_class_figi: "BBG001S72SM3".into(),
+                    identifiers: vec![
+                        Identifier {
+                            scheme: "share_class_figi".into(),
+                            value: "BBG001S72SM3".into(),
+                            ..Default::default()
+                        },
+                        Identifier {
+                            scheme: "composite_figi".into(),
+                            value: "BBG000BDTBL9".into(),
+                            source: "US".into(),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }]
+            } else {
+                Vec::new()
+            };
+            Ok((
+                "".into(),
+                meridian_domain::v1::AskPlatformForInstrumentCandidatesReply {
+                    reachable: true,
+                    answer: Some(meridian_domain::v1::InstrumentCandidatesReply {
+                        candidates,
+                        sources: Vec::new(),
+                    }),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            ))
+        },
+    );
+    {
+        let brought = Arc::clone(&brought);
+        bus.serve(crate::admin::instruments::RESOLVE_IDENTIFIER, move |envelope| {
+            let asked = meridian_domain::v1::ResolveIdentifierRequest::decode(&envelope.payload[..])
+                .map_err(|e| e.to_string())?;
+            let mut held = brought.lock().unwrap();
+            let id = "INS-01JSPY00000000000000000001".to_string();
+            if !held.iter().any(|r| r.instrument_id == id) {
+                held.push(InstrumentRecord {
+                    instrument_id: id.clone(),
+                    identifiers: asked.identifiers.clone(),
+                    asset_class: asked.stated_asset_class,
+                    currency: asked.stated_currency.clone(),
+                    description: asked.stated_description.clone(),
+                    version: 1,
+                    ..Default::default()
+                });
+            }
+            Ok((
+                "".into(),
+                meridian_domain::v1::ResolveIdentifierReply {
+                    found: true,
+                    instrument_id: id,
+                    minted: true,
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            ))
+        });
+    }
+    // The lake's latest close for whatever a source is read for (W10.10).
+    bus.serve(crate::admin::sources_view::QUERY_LAKE, |envelope| {
+        let asked = meridian_domain::v1::QueryLakeRequest::decode(&envelope.payload[..])
+            .map_err(|e| e.to_string())?;
+        let dataset = asked
+            .sources
+            .and_then(|s| s.named.first().cloned())
+            .unwrap_or_default();
+        let price = meridian_domain::v1::Price {
+            meta: Some(meridian_domain::v1::ObservationMeta {
+                valid_from_ns: 1_793_000_000_000_000_000,
+                source: Some(meridian_domain::v1::Source {
+                    dataset,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            kind: meridian_domain::v1::PriceKind::Close as i32,
+            price: Some(meridian_domain::v1::Money {
+                amount: Some("687.12".parse::<meridian_domain::exact::Exact>().unwrap().to_wire()),
+                currency_code: "USD".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        Ok((
+            "".into(),
+            meridian_domain::v1::QueryLakeReply {
+                prices: vec![price],
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ))
+    });
+    let listing_brought = Arc::clone(&brought);
     bus.serve(
         crate::admin::instruments::LIST_INSTRUMENTS_TO_COMPLETE,
-        |envelope| {
+        move |envelope| {
             let asked = ListInstrumentsToCompleteRequest::decode(&envelope.payload[..])
                 .map_err(|e| e.to_string())?;
             // Contract v24 (W3.11): the provisional records, each with why,
@@ -1420,6 +1537,22 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
                     complete: true,
                     ..Default::default()
                 });
+            }
+            // A record the picker brought in (contract v28), found by its
+            // ID, its description or an identifier.
+            for record in listing_brought.lock().unwrap().iter() {
+                let found = asked.instrument_id == record.instrument_id
+                    || (!search.is_empty()
+                        && (record.description.to_lowercase().contains(&search)
+                            || record.identifiers.iter().any(|i| i.value.to_lowercase() == search)));
+                if found {
+                    instruments.push(InstrumentToComplete {
+                        instrument: Some(record.clone()),
+                        complete_for_book: true,
+                        complete: true,
+                        ..Default::default()
+                    });
+                }
             }
             Ok((
                 "".into(),
