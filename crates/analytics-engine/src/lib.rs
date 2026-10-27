@@ -45,6 +45,8 @@ mod bench;
 #[cfg(test)]
 mod chains_tests;
 #[cfg(test)]
+mod dev_chain_tests;
+#[cfg(test)]
 mod tests;
 
 pub use answer::Answer;

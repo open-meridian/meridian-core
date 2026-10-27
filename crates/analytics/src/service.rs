@@ -114,6 +114,10 @@ impl Ask for OnBehalf {
             ))
             .map_err(|failed| failed.to_string())
     }
+
+    fn client(&self) -> String {
+        self.stamp.on_behalf_of_instance_id.clone()
+    }
 }
 
 fn decode<M: Message + Default>(envelope: &Envelope, wanted: &str) -> Result<M, String> {

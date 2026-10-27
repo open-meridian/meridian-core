@@ -23,11 +23,17 @@
 //!   and charm by bump and reprice on the same tree;
 //! - [`implied_vol`]: the volatility a model prices a quote at, by a
 //!   bracketed Brent root (bid, mid and ask each their own inversion);
-//! - [`SviRaw`] and [`fit_svi`]: Gatheral's raw SVI per expiry slice, by a
-//!   bounded Levenberg-Marquardt least squares on total variance;
+//! - [`SviRaw`] and [`fit_svi_above`]: Gatheral's raw SVI per expiry slice,
+//!   by Levenberg-Marquardt from a spread of starts on total variance
+//!   relative to the slice's at-the-money level, its least variance held
+//!   non-negative by its parametrisation, the butterfly condition, Lee's
+//!   wing bound and (against the expiry before it) the calendar condition
+//!   as penalties (ruling 791);
 //! - [`Ssvi`] and [`fit_ssvi`]: the power-law SSVI across slices under
 //!   Gatheral and Jacquier's conditions (Quantitative Finance 14(1), 2014),
-//!   free of static arbitrage by construction;
+//!   free of static arbitrage by construction, fitted to every slice's
+//!   quotes (ruling 791: never the at-the-money points alone, which leave
+//!   rho and gamma where they started);
 //! - [`butterfly_free`] and [`calendar_free`]: the checks every fitted
 //!   surface is held to.
 
@@ -425,13 +431,36 @@ impl SviRaw {
             && self.a + self.b * self.sigma * (1.0 - self.rho * self.rho).sqrt() >= -1e-12
     }
 
-    fn from(p: &[f64; 5]) -> SviRaw {
+    /// Gatheral's g(k) from the closed-form derivatives: the risk-neutral
+    /// density's sign, never negative on a slice free of butterfly
+    /// arbitrage.
+    pub fn density_sign(&self, k: f64) -> f64 {
+        let x = k - self.m;
+        let root = (x * x + self.sigma * self.sigma).sqrt();
+        let w = self.total_variance(k);
+        let w1 = self.b * (self.rho + x / root);
+        let w2 = self.b * self.sigma * self.sigma / root.powi(3);
+        density_sign(w, w1, w2, k)
+    }
+
+    /// The parametrisation the fit moves in: b and sigma by their logs, rho
+    /// by its hyperbolic tangent, and a through the least total variance
+    /// (its log, against `scale`), so every point it tries stands.
+    fn from(p: &[f64; 5], scale: f64) -> SviRaw {
+        // |rho| short of one and sigma above nothing, where a flat slice
+        // leaves them free to run.
+        let (b, rho, sigma) = (
+            p[1].exp(),
+            p[2].tanh().clamp(-0.999_999, 0.999_999),
+            p[4].exp().max(1e-8),
+        );
+        let least = scale * p[0].exp();
         SviRaw {
-            a: p[0],
-            b: p[1].exp(),
-            rho: p[2].tanh(),
+            a: least - b * sigma * (1.0 - rho * rho).sqrt(),
+            b,
+            rho,
             m: p[3],
-            sigma: p[4].exp(),
+            sigma,
         }
     }
 }
@@ -463,17 +492,21 @@ pub fn calendar_free(slices: &[&dyn Fn(f64) -> f64], ks: &[f64]) -> bool {
         .all(|pair| ks.iter().all(|&k| (pair[1])(k) >= (pair[0])(k) - 1e-12))
 }
 
-/// A bounded Levenberg-Marquardt least squares over `n` parameters:
-/// `residuals(p)` the misfit at each point; finite-difference Jacobian.
+/// A Levenberg-Marquardt least squares over `n` parameters (Marquardt's
+/// diagonal scaling): `residuals(p)` the misfit at each point, always the
+/// same count; finite-difference Jacobian. Its parameters and its cost.
 fn levenberg_marquardt<const N: usize>(
     start: [f64; N],
     residuals: impl Fn(&[f64; N]) -> Vec<f64>,
-) -> [f64; N] {
+) -> ([f64; N], f64) {
     let cost = |p: &[f64; N]| residuals(p).iter().map(|r| r * r).sum::<f64>();
     let mut p = start;
     let mut lambda = 1e-3;
     let mut current = cost(&p);
-    for _ in 0..500 {
+    if !current.is_finite() {
+        return (p, f64::INFINITY);
+    }
+    for _ in 0..400 {
         let r = residuals(&p);
         let mut jac = vec![[0.0; N]; r.len()];
         for k in 0..N {
@@ -496,10 +529,10 @@ fn levenberg_marquardt<const N: usize>(
             }
         }
         let mut improved = false;
-        for _ in 0..20 {
+        for _ in 0..30 {
             let mut m = jtj;
             for a in 0..N {
-                m[a][a] += lambda * (1.0 + jtj[a][a]);
+                m[a][a] += lambda * (1e-12 + jtj[a][a]);
             }
             let Some(step) = solve(m, jtr) else {
                 lambda *= 10.0;
@@ -512,8 +545,8 @@ fn levenberg_marquardt<const N: usize>(
             let next = cost(&q);
             if next.is_finite() && next < current {
                 p = q;
-                lambda = (lambda / 3.0).max(1e-12);
-                improved = current - next > 1e-16 * (1.0 + current);
+                lambda = (lambda / 3.0).max(1e-15);
+                improved = current - next > 1e-14 * current;
                 current = next;
                 break;
             }
@@ -523,7 +556,7 @@ fn levenberg_marquardt<const N: usize>(
             break;
         }
     }
-    p
+    (p, current)
 }
 
 /// Gaussian elimination with partial pivoting; `None` for a singular system.
@@ -556,37 +589,121 @@ fn solve<const N: usize>(mut m: [[f64; N]; N], mut v: [f64; N]) -> Option<[f64; 
     Some(x)
 }
 
-/// Raw SVI fitted to one slice's (log-moneyness, total variance) points,
-/// each weighted by the given weight (vega, or 1): `None` for fewer than five
-/// points or a fit that does not stand.
+/// Each point's weight over the slice's mean weight, held within a
+/// hundredth and a hundred times it: one tight quote never fits alone.
+fn normalised(points: &[(f64, f64, f64)]) -> Vec<f64> {
+    let mean = points.iter().map(|p| p.2.max(0.0)).sum::<f64>() / points.len() as f64;
+    points
+        .iter()
+        .map(|p| {
+            if mean > 0.0 && mean.is_finite() {
+                (p.2.max(0.0) / mean).clamp(0.01, 100.0)
+            } else {
+                1.0
+            }
+        })
+        .collect()
+}
+
+/// How heavily a no-arbitrage condition weighs against the misfit.
+const PENALTY: f64 = 1_000.0;
+
+/// The least density sign the fit aims for on its grid.
+const DENSITY_MARGIN: f64 = 1e-3;
+
+/// Raw SVI fitted to one slice's (log-moneyness, total variance, weight)
+/// points: `None` for fewer than five points. See [`fit_svi_above`].
 pub fn fit_svi(points: &[(f64, f64, f64)]) -> Option<SviRaw> {
+    fit_svi_above(points, None)
+}
+
+/// Raw SVI fitted to one slice's (log-moneyness, total variance, weight)
+/// points, each misfit relative to the slice's at-the-money total variance
+/// so a one-day slice weighs as a one-year one, by Levenberg-Marquardt from
+/// a spread of starting points (the slice's level, its wings' slopes, its
+/// least variance left and right of the money), keeping the best:
+///
+/// - its least total variance held non-negative by its parametrisation;
+/// - Gatheral's butterfly condition (g >= 0) and Lee's wing bound
+///   (b (1 + |rho|) <= 2) as penalties over its strikes and past them;
+/// - with `below`, the slice before it in expiry, its total variance held
+///   at or above that slice's over the same range (the calendar
+///   condition), as a penalty.
+///
+/// `None` for fewer than five points, or no start that stands.
+pub fn fit_svi_above(
+    points: &[(f64, f64, f64)],
+    below: Option<&dyn Fn(f64) -> f64>,
+) -> Option<SviRaw> {
     if points.len() < 5 {
         return None;
     }
+    let weights = normalised(points);
+    let lo = points.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
+    let hi = points.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
+    let span = (hi - lo).max(1e-3);
     let (atm_k, atm_w) = points
         .iter()
         .min_by(|a, b| a.0.abs().total_cmp(&b.0.abs()))
         .map(|p| (p.0, p.1))?;
-    let start = [
-        atm_w * 0.5,
-        (atm_w * 0.5).max(1e-4).ln(),
-        -0.3f64.atanh(),
-        atm_k,
-        0.1f64.ln(),
-    ];
-    let fitted = levenberg_marquardt(start, |p| {
-        let svi = SviRaw::from(p);
+    let scale = atm_w.max(1e-8);
+    let least = points.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+    // The conditions' grid: the quoted range and a half-span past each end.
+    let grid: Vec<f64> = (0..=60)
+        .map(|i| lo - span / 2.0 + 2.0 * span * i as f64 / 60.0)
+        .collect();
+    let residuals = |p: &[f64; 5]| -> Vec<f64> {
+        let svi = SviRaw::from(p, scale);
         let mut r: Vec<f64> = points
             .iter()
-            .map(|(k, w, weight)| weight.sqrt() * (svi.total_variance(*k) - w))
+            .zip(&weights)
+            .map(|((k, w, _), weight)| weight.sqrt() * (svi.total_variance(*k) - w) / scale)
             .collect();
-        // Its least total variance kept non-negative.
-        let floor = svi.a + svi.b * svi.sigma * (1.0 - svi.rho * svi.rho).sqrt();
-        r.push(if floor < 0.0 { 1e3 * floor } else { 0.0 });
+        for &k in &grid {
+            // A margin, so the density stands between the grid's points.
+            r.push(PENALTY * (svi.density_sign(k) - DENSITY_MARGIN).min(0.0));
+            if let Some(before) = below {
+                let floor = before(k);
+                r.push(PENALTY * ((floor - svi.total_variance(k)) / scale).max(0.0));
+            }
+        }
+        r.push(PENALTY * (svi.b * (1.0 + svi.rho.abs()) - 2.0).max(0.0));
         r
-    });
-    let svi = SviRaw::from(&fitted);
-    svi.admissible().then_some(svi)
+    };
+    // The wings' slopes from the outermost points, and the smile's depth.
+    let slope = |far: f64| -> f64 {
+        points
+            .iter()
+            .min_by(|a, b| (a.0 - far).abs().total_cmp(&(b.0 - far).abs()))
+            .map_or(0.0, |p| (p.1 - atm_w) / (p.0 - atm_k).abs().max(1e-6))
+    };
+    let (left, right) = (slope(lo), slope(hi));
+    let b0 = ((left.max(0.0) + right.max(0.0)) / 2.0).max(1e-3 * scale / span);
+    let rho0 = ((right - left) / (right.abs() + left.abs()).max(1e-12)).clamp(-0.9, 0.9);
+    let mut best: Option<(SviRaw, f64)> = None;
+    for m in [atm_k, atm_k - span / 5.0, atm_k + span / 5.0] {
+        for sigma in [span / 10.0, span / 3.0] {
+            for rho in [rho0, -0.6, 0.0] {
+                let start = [
+                    (0.5 * least.max(1e-12) / scale).ln(),
+                    b0.ln(),
+                    rho.atanh(),
+                    m,
+                    sigma.ln(),
+                ];
+                let (p, cost) = levenberg_marquardt(start, residuals);
+                let svi = SviRaw::from(&p, scale);
+                let stands = svi.admissible()
+                    && [svi.a, svi.b, svi.rho, svi.m, svi.sigma]
+                        .iter()
+                        .all(|x| x.is_finite());
+                if stands && cost.is_finite() && best.is_none_or(|(_, c)| cost < c) {
+                    best = Some((svi, cost));
+                }
+            }
+        }
+    }
+    best.map(|(svi, _)| svi)
 }
 
 /// The power-law SSVI across slices (Gatheral and Jacquier, 2014, 4.5):
@@ -623,21 +740,56 @@ impl Ssvi {
     }
 }
 
+/// A point a slice is fitted to: its log-moneyness, its total variance and
+/// its weight.
+pub type Point = (f64, f64, f64);
+
 /// One expiry's slice for [`fit_ssvi`]: its at-the-money total variance and
 /// its (log-moneyness, total variance, weight) points.
-pub type Slice = (f64, Vec<(f64, f64, f64)>);
+pub type Slice = (f64, Vec<Point>);
 
-/// SSVI fitted across slices, each its at-the-money total variance and its
-/// (log-moneyness, total variance, weight) points, the slices' thetas not
-/// falling with expiry: the fit held to the conditions by its
-/// parametrisation. `None` with no point, or thetas that fall.
+/// Thetas made non-decreasing in expiry by pooling adjacent violators (the
+/// least-squares isotonic fit): SSVI's calendar condition needs them so,
+/// and a noisy at-the-money level must not refuse the surface.
+pub fn non_decreasing(thetas: &[f64]) -> Vec<f64> {
+    let mut blocks: Vec<(f64, usize)> = Vec::new();
+    for &theta in thetas {
+        blocks.push((theta, 1));
+        while blocks.len() > 1 {
+            let (b, nb) = blocks[blocks.len() - 1];
+            let (a, na) = blocks[blocks.len() - 2];
+            if a <= b {
+                break;
+            }
+            blocks.pop();
+            blocks.pop();
+            let n = na + nb;
+            blocks.push(((a * na as f64 + b * nb as f64) / n as f64, n));
+        }
+    }
+    blocks
+        .into_iter()
+        .flat_map(|(v, n)| std::iter::repeat_n(v, n))
+        .collect()
+}
+
+/// SSVI fitted across slices to every slice's points, each misfit relative
+/// to its slice's theta and each slice's weights normalised, so every
+/// expiry counts alike; the slices' thetas (made non-decreasing first) held,
+/// and the fit held to Gatheral and Jacquier's conditions by its
+/// parametrisation, from a spread of starting points, keeping the best.
+/// `None` with no point.
 pub fn fit_ssvi(slices: &[Slice]) -> Option<Ssvi> {
-    if slices.is_empty()
-        || slices.iter().all(|(_, points)| points.is_empty())
-        || slices.windows(2).any(|pair| pair[1].0 < pair[0].0)
-    {
+    if slices.is_empty() || slices.iter().all(|(_, points)| points.is_empty()) {
         return None;
     }
+    let thetas = non_decreasing(&slices.iter().map(|s| s.0).collect::<Vec<_>>());
+    let held: Vec<(f64, &Vec<Point>, Vec<f64>)> = slices
+        .iter()
+        .zip(&thetas)
+        .filter(|((_, points), _)| !points.is_empty())
+        .map(|((_, points), &theta)| (theta.max(1e-12), points, normalised(points)))
+        .collect();
     let make = |p: &[f64; 3]| {
         let rho = p[0].tanh();
         let gamma = 0.5 / (1.0 + (-p[2]).exp());
@@ -645,19 +797,30 @@ pub fn fit_ssvi(slices: &[Slice]) -> Option<Ssvi> {
         let eta = 2.0 / (1.0 + rho.abs()) / (1.0 + (-p[1]).exp());
         Ssvi { rho, eta, gamma }
     };
-    let fitted = levenberg_marquardt([-0.3f64.atanh(), 0.0, 0.0], |p| {
+    let residuals = |p: &[f64; 3]| -> Vec<f64> {
         let ssvi = make(p);
-        slices
-            .iter()
-            .flat_map(|(theta, points)| {
-                points.iter().map(move |(k, w, weight)| {
-                    weight.sqrt() * (ssvi.total_variance(*k, *theta) - w)
+        held.iter()
+            .flat_map(|(theta, points, weights)| {
+                let n = (points.len() as f64).sqrt();
+                points.iter().zip(weights).map(move |((k, w, _), weight)| {
+                    weight.sqrt() * (ssvi.total_variance(*k, *theta) - w) / theta / n
                 })
             })
             .collect()
-    });
-    let ssvi = make(&fitted);
-    ssvi.free_of_static_arbitrage().then_some(ssvi)
+    };
+    let mut best: Option<(Ssvi, f64)> = None;
+    for rho in [-0.7f64, -0.3, 0.3] {
+        for eta in [0.0f64, 2.0] {
+            for gamma in [-1.0f64, 1.0] {
+                let (p, cost) = levenberg_marquardt([rho.atanh(), eta, gamma], residuals);
+                if cost.is_finite() && best.is_none_or(|(_, c)| cost < c) {
+                    best = Some((make(&p), cost));
+                }
+            }
+        }
+    }
+    best.map(|(ssvi, _)| ssvi)
+        .filter(Ssvi::free_of_static_arbitrage)
 }
 
 #[cfg(test)]
@@ -1015,6 +1178,86 @@ mod tests {
         );
     }
 
+    /// Raw SVI against QuantLib 1.40's SviSmileSection (the SDK's pinned
+    /// oracle) on Gatheral and Jacquier's example 3.1 (Vogt's slice, 2014):
+    /// the same total variance, and the butterfly arbitrage the paper shows
+    /// it to admit, found by the closed-form g.
+    #[test]
+    fn raw_svi_is_quantlibs_and_finds_vogts_butterfly() {
+        let vogt = SviRaw {
+            a: -0.0410,
+            b: 0.1331,
+            rho: 0.3060,
+            m: 0.3586,
+            sigma: 0.4153,
+        };
+        for (k, quantlib) in [
+            (-0.5, 0.050_976_571_690),
+            (0.0, 0.017_426_252_555),
+            (0.3586, 0.014_276_430_000),
+            (1.0, 0.086_826_709_752),
+            (1.5, 0.167_151_699_886),
+        ] {
+            assert!(close(vogt.total_variance(k), quantlib, 1e-11), "{k}");
+        }
+        let ks: Vec<f64> = (-150..=150).map(|i| i as f64 * 0.01).collect();
+        assert!(!butterfly_free(|k| vogt.total_variance(k), &ks));
+        assert!(ks.iter().any(|&k| vogt.density_sign(k) < 0.0));
+        // The closed form agrees with the finite differences.
+        for &k in &ks {
+            let h = 1e-4;
+            let (lo, mid, hi) = (
+                vogt.total_variance(k - h),
+                vogt.total_variance(k),
+                vogt.total_variance(k + h),
+            );
+            let g = density_sign(
+                mid,
+                (hi - lo) / (2.0 * h),
+                (hi - 2.0 * mid + lo) / (h * h),
+                k,
+            );
+            assert!(close(vogt.density_sign(k), g, 1e-5), "{k}");
+        }
+        // Fitted to Vogt's own points, the butterfly penalty keeps the fit
+        // free of it: close to the slice, and arbitrage-free.
+        let points: Vec<(f64, f64, f64)> = (-30..=30)
+            .map(|i| {
+                let k = i as f64 * 0.05;
+                (k, vogt.total_variance(k), 1.0)
+            })
+            .collect();
+        let repaired = fit_svi(&points).unwrap();
+        let least = ks
+            .iter()
+            .map(|&k| repaired.density_sign(k))
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            butterfly_free(|k| repaired.total_variance(k), &ks),
+            "{repaired:?}: least g {least}"
+        );
+        let errors: Vec<f64> = points
+            .iter()
+            .map(|(k, w, _)| ((repaired.total_variance(*k) - w) / w).abs())
+            .collect();
+        let rms = (errors.iter().map(|e| e * e).sum::<f64>() / errors.len() as f64).sqrt();
+        let worst = errors.iter().copied().fold(0.0, f64::max);
+        assert!(rms < 0.15 && worst < 0.45, "rms {rms}, worst {worst}");
+    }
+
+    /// A slice whose parameters a flat smile leaves free still fits: a
+    /// short-dated slice of a thousandth of a year's variance, flat.
+    #[test]
+    fn a_flat_short_dated_slice_fits() {
+        let points: Vec<(f64, f64, f64)> = (-10..=10)
+            .map(|i| (i as f64 * 0.01, 0.8f64.powi(2) * 0.003, 1.0))
+            .collect();
+        let fitted = fit_svi(&points).unwrap();
+        for (k, w, _) in &points {
+            assert!(close(fitted.total_variance(*k), *w, 1e-6 * w), "{k}");
+        }
+    }
+
     #[test]
     fn ssvi_is_fitted_across_slices_free_of_static_arbitrage() {
         let truth = Ssvi {
@@ -1057,10 +1300,16 @@ mod tests {
         for curve in &curves {
             assert!(butterfly_free(curve, &ks));
         }
-        // Falling thetas are refused.
-        let mut falling = slices.clone();
-        falling.reverse();
-        assert!(fit_ssvi(&falling).is_none());
+        // Falling thetas are pooled to non-decreasing ones, not refused.
+        assert_eq!(
+            non_decreasing(&[1.0, 3.0, 2.0, 4.0]),
+            vec![1.0, 2.5, 2.5, 4.0]
+        );
+        assert_eq!(non_decreasing(&[3.0, 2.0, 1.0]), vec![2.0, 2.0, 2.0]);
+        let mut noisy = slices.clone();
+        noisy.swap(1, 2);
+        let pooled = fit_ssvi(&noisy).unwrap();
+        assert!(pooled.free_of_static_arbitrage(), "{pooled:?}");
     }
 
     /// The tree on a T1 chain refresh (the plan's Track B: benchmark the

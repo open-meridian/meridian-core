@@ -27,8 +27,8 @@ use crate::definitions::{Definition, COMPONENT};
 use crate::exact::Dec;
 use crate::measures::Part;
 use crate::options::{
-    american_binomial, american_greeks, black_76, black_scholes, butterfly_free, calendar_free,
-    cdf, fit_ssvi, fit_svi, implied_vol, Dividend, Greeks, Right, SviRaw,
+    american_binomial, american_greeks, black_76, black_scholes, cdf, fit_ssvi, fit_svi_above,
+    implied_vol, Dividend, Greeks, Right, SviRaw,
 };
 use crate::scenario::{Applied, MINUTES_A_YEAR};
 
@@ -88,11 +88,16 @@ pub struct Chain {
     /// (ruling 734: a dataset served, not kept, named with its licence);
     /// "the underlying's price" otherwise.
     pub spot_missing: String,
+    /// Its reason: not entitled where the read said the client is not
+    /// entitled to the dataset that holds it (ruling 788), else missing.
+    pub spot_reason: &'static str,
     /// The risk-free curve (ruling 608; 611's `risk_free_rate`): each point
     /// its time in years and its rate, continuous; empty where none was
     /// read, `rate_missing` saying why, and every option not evaluated.
     pub curve: Vec<(f64, f64)>,
     pub rate_missing: String,
+    /// Its reason, as `spot_reason`'s.
+    pub rate_reason: &'static str,
     pub rate_dataset: String,
     pub rate_subject: String,
     /// Each declared cash dividend: its ex instant and amount.
@@ -135,6 +140,16 @@ fn items<'a>(value: &'a Value, name: &str) -> &'a [Value] {
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or(&[])
+}
+
+/// A missing input's reason as the document names it: `not_entitled`
+/// (ruling 788), else missing.
+fn missing_reason(said: &str) -> &'static str {
+    if said == "not_entitled" {
+        NOT_ENTITLED
+    } else {
+        PRICE_MISSING
+    }
 }
 
 /// The chains an inputs document carries.
@@ -209,6 +224,10 @@ pub fn read(inputs: &Value) -> Result<Vec<Chain>> {
             spot_missing: Some(text(c, "spot_missing"))
                 .filter(|said| !said.is_empty())
                 .unwrap_or_else(|| "the underlying's price".to_string()),
+            spot_reason: missing_reason(&text(c, "spot_missing_reason")),
+            rate_reason: missing_reason(
+                &rate.map(|r| text(r, "missing_reason")).unwrap_or_default(),
+            ),
             rate_missing: if curve.is_empty() {
                 match rate.map(|r| text(r, "missing")).filter(|m| !m.is_empty()) {
                     Some(said) => said,
@@ -409,15 +428,6 @@ pub fn greeks_at(
     }
 }
 
-fn intrinsic(s: &Series, spot: f64, forward: f64, rate: f64, t: f64) -> f64 {
-    let w = if s.right == Right::Call { 1.0 } else { -1.0 };
-    if s.american {
-        (w * (spot - s.strike)).max(0.0)
-    } else {
-        (w * (forward - s.strike)).max(0.0) * (-rate * t).exp()
-    }
-}
-
 /// A natural cubic spline through the curve's points, read at `t` years
 /// (ruling 608; 611's `rate_interpolation` `cubic_spline`, as Cboe's VIX
 /// method derives a yield at each expiration from Treasury's curve); flat
@@ -460,24 +470,144 @@ impl Chain {
     /// The risk-free rate to `t` years, continuous: the curve's spline
     /// there, or why there is none.
     pub fn rate_at(&self, t: f64) -> std::result::Result<f64, (&'static str, String)> {
-        spline_at(&self.curve, t).ok_or((PRICE_MISSING, self.rate_missing.clone()))
+        spline_at(&self.curve, t).ok_or((self.rate_reason, self.rate_missing.clone()))
+    }
+
+    /// The instant the chain's quotes were struck (ruling 791): its newest
+    /// quote's source time, never after the job's as-of; the as-of for a
+    /// chain whose quotes carry none. Every time to settlement is measured
+    /// from here, so a delayed chain read the next morning is priced at the
+    /// close that struck it, not over a night it never saw.
+    pub fn struck_at(&self, as_of_ns: i64) -> i64 {
+        self.series
+            .iter()
+            .filter(|s| s.bid.is_some() || s.ask.is_some())
+            .map(|s| s.quote_source_ns)
+            .filter(|&at| at > 0 && at <= as_of_ns)
+            .max()
+            .unwrap_or(as_of_ns)
     }
 }
 
-/// Solve a chain at the job's as-of: each expiry's forward from put-call
-/// parity at the strike with the smallest |C - P| (W12.1), and each
-/// series' implied volatility at bid, mid and ask.
+/// How many strikes nearest the money the forward is read from.
+const FORWARD_PAIRS: usize = 3;
+
+/// The volatilities a quote is inverted between (W12.1): 0.01% to 500%.
+const VOL_FLOOR: f64 = 1e-4;
+const VOL_CEILING: f64 = 5.0;
+
+/// One strike's call and put, their mids and their spreads.
+struct Pair<'a> {
+    strike: f64,
+    call: &'a Series,
+    put: &'a Series,
+    c: f64,
+    p: f64,
+    width: f64,
+}
+
+/// The carry that makes the tree's forward -- the share less its
+/// dividends' present value, grown at r - b -- the forward given.
+fn tree_carry(spot: f64, pv: f64, forward: f64, rate: f64, t: f64) -> f64 {
+    let net = spot - pv;
+    if net > 0.0 && forward > 0.0 {
+        rate - (forward / net).ln() / t
+    } else {
+        0.0
+    }
+}
+
+/// One pair's forward from parity. For an American pair (ruling 791), its
+/// European equivalent: each leg's volatility from the tree at the forward
+/// so far, each priced European at that volatility, and parity read again
+/// on those, until the forward stands -- the early-exercise premium, which
+/// biases parity on the American quotes, taken out. Plain parity where a
+/// leg's volatility cannot be found.
+#[allow(clippy::too_many_arguments)]
+fn pair_forward(
+    pair: &Pair<'_>,
+    spot: f64,
+    t: f64,
+    rate: f64,
+    dividends: &[Dividend],
+    pv: f64,
+    steps: usize,
+) -> f64 {
+    let growth = (rate * t).exp();
+    let plain = pair.strike + (pair.c - pair.p) * growth;
+    let tree = |s: &Series| s.american && s.model == AMERICAN_BINOMIAL;
+    if !tree(pair.call) || !tree(pair.put) || plain <= 0.0 {
+        return plain;
+    }
+    let mut forward = plain;
+    for _ in 0..8 {
+        let carry = tree_carry(spot, pv, forward, rate, t);
+        let leg = |right: Right, quote: f64| {
+            implied_vol(quote, |vol| {
+                american_binomial(
+                    right,
+                    spot,
+                    pair.strike,
+                    t,
+                    rate,
+                    carry,
+                    vol,
+                    dividends,
+                    steps,
+                    true,
+                )
+            })
+        };
+        let (Some(vc), Some(vp)) = (leg(Right::Call, pair.c), leg(Right::Put, pair.p)) else {
+            return plain;
+        };
+        let net = spot - pv;
+        let c = black_scholes(Right::Call, net, pair.strike, t, rate, carry, vc).price;
+        let p = black_scholes(Right::Put, net, pair.strike, t, rate, carry, vp).price;
+        let next = pair.strike + (c - p) * growth;
+        let done = (next - forward).abs() < 1e-9 * forward;
+        forward = next;
+        if done {
+            break;
+        }
+    }
+    forward
+}
+
+/// Solve a chain at the instant its quotes were struck ([`Chain::struck_at`]):
+/// each expiry's forward from put-call parity at the strikes nearest the
+/// money (W12.1) -- the three with the smallest |C - P|, each weighted by
+/// the inverse of its two spreads, an American pair's de-Americanised --
+/// and each series' implied volatility at bid, mid and ask.
 pub fn solve(chain: &Chain, as_of_ns: i64, steps: usize) -> ChainSolution {
+    let as_of_ns = chain.struck_at(as_of_ns);
     let spot = chain.spot;
     let mut by_expiry: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
     for (i, s) in chain.series.iter().enumerate() {
         by_expiry.entry(s.expiry.as_str()).or_default().push(i);
     }
+    let dividends_to = |t: f64| -> Vec<Dividend> {
+        chain
+            .dividends
+            .iter()
+            .map(|(ex, amount)| Dividend {
+                t: years(as_of_ns, *ex),
+                amount: *amount,
+            })
+            .filter(|d| d.t > 0.0 && d.t <= t)
+            .collect()
+    };
+    let pv_of = |dividends: &[Dividend], rate: f64| -> f64 {
+        dividends
+            .iter()
+            .map(|d| d.amount * (-rate * d.t).exp())
+            .sum()
+    };
     let mut forwards = BTreeMap::new();
     for (expiry, members) in &by_expiry {
         let found = (|| {
             let Some(spot) = spot else {
-                return Err((PRICE_MISSING, chain.spot_missing.clone()));
+                return Err((chain.spot_reason, chain.spot_missing.clone()));
             };
             let first = &chain.series[members[0]];
             if first.settles_at_ns == 0 {
@@ -491,7 +621,7 @@ pub fn solve(chain: &Chain, as_of_ns: i64, steps: usize) -> ChainSolution {
             if chain.underlying_kind == "future" {
                 return Ok((spot, rate));
             }
-            let mut best: Option<(f64, f64, f64)> = None;
+            let mut pairs: Vec<Pair<'_>> = Vec::new();
             for &i in members {
                 let call = &chain.series[i];
                 if call.right != Right::Call {
@@ -505,17 +635,33 @@ pub fn solve(chain: &Chain, as_of_ns: i64, steps: usize) -> ChainSolution {
                     continue;
                 };
                 if let (Some(c), Some(p)) = (mid(call), mid(put)) {
-                    let gap = (c - p).abs();
-                    if best.is_none_or(|b| gap < (b.1 - b.2).abs()) {
-                        best = Some((call.strike, c, p));
-                    }
+                    let spread = |s: &Series| s.ask.unwrap_or(0.0) - s.bid.unwrap_or(0.0);
+                    pairs.push(Pair {
+                        strike: call.strike,
+                        call,
+                        put,
+                        c,
+                        p,
+                        width: spread(call) + spread(put),
+                    });
                 }
             }
+            pairs.sort_by(|a, b| (a.c - a.p).abs().total_cmp(&(b.c - b.p).abs()));
+            pairs.truncate(FORWARD_PAIRS);
+            let dividends = dividends_to(t);
+            let pv = pv_of(&dividends, rate);
             // Parity at the curve's rate: the forward and the borrow it
             // implies, never the rate itself (ruling 608's cross-check).
-            let forward = match best {
-                Some((k, c, p)) => k + (c - p) * (rate * t).exp(),
-                None => spot * (rate * t).exp(),
+            let forward = if pairs.is_empty() {
+                (spot - pv) * (rate * t).exp()
+            } else {
+                let (mut sum, mut weights) = (0.0, 0.0);
+                for pair in &pairs {
+                    let weight = 1.0 / pair.width.max(0.01);
+                    sum += weight * pair_forward(pair, spot, t, rate, &dividends, pv, steps);
+                    weights += weight;
+                }
+                sum / weights
             };
             if forward <= 0.0 {
                 return Err((PRICE_MISSING, format!("{expiry}: no forward")));
@@ -528,7 +674,7 @@ pub fn solve(chain: &Chain, as_of_ns: i64, steps: usize) -> ChainSolution {
         .series
         .iter()
         .map(|s| {
-            let spot = spot.ok_or((PRICE_MISSING, chain.spot_missing.clone()))?;
+            let spot = spot.ok_or((chain.spot_reason, chain.spot_missing.clone()))?;
             if !s.quarantined.is_empty() {
                 return Err((INPUT_QUARANTINED, s.quarantined.clone()));
             }
@@ -547,49 +693,58 @@ pub fn solve(chain: &Chain, as_of_ns: i64, steps: usize) -> ChainSolution {
                 .cloned()
                 .unwrap_or(Err((PRICE_MISSING, "no forward".into())))?;
             let rate = chain.rate_at(t)?;
-            let dividends: Vec<Dividend> = chain
-                .dividends
-                .iter()
-                .map(|(ex, amount)| Dividend {
-                    t: years(as_of_ns, *ex),
-                    amount: *amount,
-                })
-                .filter(|d| d.t > 0.0 && d.t <= t)
-                .collect();
-            // The tree's borrow: what makes its forward, the share less the
-            // dividends' present value grown at r - b, the parity forward.
+            let dividends = dividends_to(t);
             let carry = match s.model.as_str() {
                 BLACK_SCHOLES => implied,
                 BLACK_76 => rate,
-                _ => {
-                    let pv: f64 = dividends
-                        .iter()
-                        .map(|d| d.amount * (-rate * d.t).exp())
-                        .sum();
-                    let net = spot - pv;
-                    if net > 0.0 {
-                        rate - (forward / net).ln() / t
-                    } else {
-                        0.0
-                    }
-                }
+                _ => tree_carry(spot, pv_of(&dividends, rate), forward, rate, t),
             };
-            let floor = intrinsic(s, spot, forward, rate, t);
+            let at = |vol: f64| {
+                price(
+                    &s.model, s.right, spot, s.strike, t, rate, carry, vol, &dividends, steps,
+                    s.american,
+                )
+            };
+            // What the model prices at the bounds of the search: a quote at
+            // or under the first has no volatility -- under its intrinsic
+            // value as the model counts it (an American option's
+            // exercise now or its forward's, discounted, whichever is more)
+            // -- and is excluded with that reason, never as a failed fit.
+            // The tree cannot carry its drift at a vanishing volatility,
+            // so the bound is also taken in closed form: exercise now, or
+            // the forward's intrinsic at expiry, discounted.
+            let w = if s.right == Right::Call { 1.0 } else { -1.0 };
+            let now = if s.american {
+                (w * (spot - s.strike)).max(0.0)
+            } else {
+                0.0
+            };
+            let held = (w * (forward - s.strike)).max(0.0) * (-rate * t).exp();
+            let (floor, ceiling) = (at(VOL_FLOOR).max(now).max(held), at(VOL_CEILING));
             let quotes = [s.bid, mid(s), s.ask];
             let iv = std::array::from_fn(|side| {
                 let Some(quote) = quotes[side] else {
                     return Err((PRICE_MISSING, SIDES[side].to_string()));
                 };
                 if quote <= floor + 1e-9 {
-                    return Err((BELOW_INTRINSIC, SIDES[side].to_string()));
+                    return Err((
+                        BELOW_INTRINSIC,
+                        format!(
+                            "{}: {quote} is at or under {floor:.4}, its value with no volatility",
+                            SIDES[side]
+                        ),
+                    ));
                 }
-                implied_vol(quote, |vol| {
-                    price(
-                        &s.model, s.right, spot, s.strike, t, rate, carry, vol, &dividends, steps,
-                        s.american,
-                    )
-                })
-                .ok_or((
+                if quote >= ceiling {
+                    return Err((
+                        FIT_FAILED,
+                        format!(
+                            "{}: {quote} is over {ceiling:.4}, its value at 500% volatility",
+                            SIDES[side]
+                        ),
+                    ));
+                }
+                implied_vol(quote, at).ok_or((
                     FIT_FAILED,
                     format!(
                         "{}: no volatility within 0.01% to 500% prices it",
@@ -627,24 +782,51 @@ impl Fitted {
 }
 
 /// The surface: each expiry's raw SVI (out-of-the-money quotes, weights the
-/// inverse IV bid-ask width), each held to Gatheral's butterfly condition
-/// and the slices together to the calendar condition; SSVI across them.
+/// inverse IV bid-ask width), fitted in order of expiry, each held to
+/// Gatheral's butterfly condition and to the calendar condition against
+/// the expiry before it -- by penalty while fitting, and checked at its
+/// strikes after; SSVI across them, fitted to every slice's quotes.
 pub struct Surface {
     pub slices: BTreeMap<String, std::result::Result<Fitted, Why>>,
     pub ssvi: Option<crate::options::Ssvi>,
     /// Per expiry: the RMSE in vol points and the strikes inside the IV
     /// bid-ask over the strikes fitted.
     pub quality: BTreeMap<String, (f64, usize, usize)>,
+    /// Per fitted expiry: whether it passed the butterfly check and the
+    /// calendar check.
+    pub checks: BTreeMap<String, (bool, bool)>,
+    /// A fitted expiry's failed check, naming the strikes it failed at: it
+    /// is kept, not dropped (ruling 791), and its check reads failed.
+    pub failures: Vec<String>,
 }
 
 fn otm(s: &Series, forward: f64) -> bool {
     (s.right == Right::Call && s.strike >= forward) || (s.right == Right::Put && s.strike < forward)
 }
 
+/// The fewest out-of-the-money strikes a slice is fitted over: five
+/// parameters.
+const FIT_POINTS: usize = 5;
+
+fn strikes_named(strikes: &[f64]) -> String {
+    let shown: Vec<String> = strikes.iter().take(8).map(|k| format!("{k}")).collect();
+    let more = strikes.len().saturating_sub(8);
+    if more > 0 {
+        format!("{} and {more} more", shown.join(", "))
+    } else {
+        shown.join(", ")
+    }
+}
+
 pub fn surface(chain: &Chain, solution: &ChainSolution) -> Surface {
     let mut slices = BTreeMap::new();
     let mut quality = BTreeMap::new();
-    let mut held: Vec<(String, Fitted)> = Vec::new();
+    let mut checks = BTreeMap::new();
+    let mut failures = Vec::new();
+    // Each expiry's points: (k, total variance, weight, bid, mid, ask,
+    // strike), in order of expiry.
+    type Point = (f64, f64, f64, f64, f64, f64, f64);
+    let mut ordered: Vec<(String, f64, f64, Vec<Point>)> = Vec::new();
     for (expiry, forward) in &solution.forwards {
         let Ok((forward, _)) = forward else {
             continue;
@@ -656,8 +838,8 @@ pub fn surface(chain: &Chain, solution: &ChainSolution) -> Surface {
             if &s.expiry != expiry || !otm(s, *forward) {
                 continue;
             }
+            t = solved.t;
             if let (Ok(bid), Ok(m), Ok(ask)) = (&solved.iv[0], &solved.iv[1], &solved.iv[2]) {
-                t = solved.t;
                 let width = (ask - bid).max(1e-4);
                 points.push((
                     (s.strike / forward).ln(),
@@ -666,10 +848,34 @@ pub fn surface(chain: &Chain, solution: &ChainSolution) -> Surface {
                     *bid,
                     *m,
                     *ask,
+                    s.strike,
                 ));
             }
         }
-        let fit = fit_svi(&points.iter().map(|p| (p.0, p.1, p.2)).collect::<Vec<_>>());
+        ordered.push((expiry.clone(), t, *forward, points));
+    }
+    ordered.sort_by(|a, b| a.1.total_cmp(&b.1));
+    let mut previous: Option<(String, Fitted)> = None;
+    let mut held: Vec<(Fitted, Vec<crate::options::Point>)> = Vec::new();
+    for (expiry, t, forward, points) in ordered {
+        if points.len() < FIT_POINTS {
+            slices.insert(
+                expiry.clone(),
+                Err((
+                    PRICE_MISSING,
+                    format!(
+                        "{expiry}: not enough quotes: {} out-of-the-money strikes with a bid, \
+                         a mid and an ask volatility, and a fit needs {FIT_POINTS}",
+                        points.len()
+                    ),
+                )),
+            );
+            continue;
+        }
+        let fitting: Vec<crate::options::Point> = points.iter().map(|p| (p.0, p.1, p.2)).collect();
+        let before = previous.as_ref().map(|(_, f)| f.svi);
+        let floor = before.map(|svi| move |k: f64| svi.total_variance(k));
+        let fit = fit_svi_above(&fitting, floor.as_ref().map(|f| f as &dyn Fn(f64) -> f64));
         let Some(svi) = fit else {
             slices.insert(
                 expiry.clone(),
@@ -683,23 +889,40 @@ pub fn surface(chain: &Chain, solution: &ChainSolution) -> Surface {
             );
             continue;
         };
-        let ks: Vec<f64> = {
-            let lo = points.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
-            let hi = points.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
-            (0..=40).map(|i| lo + (hi - lo) * i as f64 / 40.0).collect()
-        };
-        if !butterfly_free(|k| svi.total_variance(k), &ks) {
-            slices.insert(
-                expiry.clone(),
-                Err((FIT_FAILED, format!("{expiry}: butterfly arbitrage"))),
-            );
-            continue;
+        let fitted = Fitted { svi, t, forward };
+        // The checks at the strikes quoted.
+        let butterflies: Vec<f64> = points
+            .iter()
+            .filter(|p| svi.density_sign(p.0) < -1e-9 || svi.total_variance(p.0) <= 0.0)
+            .map(|p| p.6)
+            .collect();
+        if !butterflies.is_empty() {
+            failures.push(format!(
+                "{expiry}: butterfly arbitrage at strikes {}",
+                strikes_named(&butterflies)
+            ));
         }
-        let fitted = Fitted {
-            svi,
-            t,
-            forward: *forward,
+        let calendars: Vec<f64> = match &previous {
+            Some((_, earlier)) => points
+                .iter()
+                .filter(|p| {
+                    let (now, then) = (svi.total_variance(p.0), earlier.svi.total_variance(p.0));
+                    now < then - 1e-9 * then.abs().max(1e-12)
+                })
+                .map(|p| p.6)
+                .collect(),
+            None => Vec::new(),
         };
+        if let (false, Some((earlier, _))) = (calendars.is_empty(), &previous) {
+            failures.push(format!(
+                "{expiry}: calendar arbitrage against {earlier} at strikes {}",
+                strikes_named(&calendars)
+            ));
+        }
+        checks.insert(
+            expiry.clone(),
+            (butterflies.is_empty(), calendars.is_empty()),
+        );
         let mut squares = 0.0;
         let mut inside = 0;
         for p in &points {
@@ -713,33 +936,15 @@ pub fn surface(chain: &Chain, solution: &ChainSolution) -> Surface {
             expiry.clone(),
             ((squares / points.len() as f64).sqrt(), inside, points.len()),
         );
-        held.push((expiry.clone(), fitted));
+        held.push((fitted, fitting));
         slices.insert(expiry.clone(), Ok(fitted));
+        previous = Some((expiry, fitted));
     }
-    // Calendar: total variance never falls as expiry lengthens.
-    held.sort_by(|a, b| a.1.t.total_cmp(&b.1.t));
-    let grid: Vec<f64> = (-20..=20).map(|i| i as f64 * 0.05).collect();
-    for pair in held.windows(2) {
-        let (a, b) = (pair[0].1.svi, pair[1].1.svi);
-        let w0 = move |k: f64| a.total_variance(k);
-        let w1 = move |k: f64| b.total_variance(k);
-        if !calendar_free(&[&w0, &w1], &grid) {
-            slices.insert(
-                pair[1].0.clone(),
-                Err((
-                    FIT_FAILED,
-                    format!("{}: calendar arbitrage against {}", pair[1].0, pair[0].0),
-                )),
-            );
-        }
-    }
+    // SSVI over every fitted slice's quotes, each slice's theta its own
+    // at-the-money total variance.
     let ssvi_slices: Vec<crate::options::Slice> = held
-        .iter()
-        .filter(|(e, _)| matches!(slices.get(e), Some(Ok(_))))
-        .map(|(_, f)| {
-            let theta = f.svi.total_variance(0.0);
-            (theta, vec![(0.0, theta, 1.0)])
-        })
+        .into_iter()
+        .map(|(f, points)| (f.svi.total_variance(0.0), points))
         .collect();
     let ssvi = if ssvi_slices.len() >= 2 {
         fit_ssvi(&ssvi_slices)
@@ -750,6 +955,8 @@ pub fn surface(chain: &Chain, solution: &ChainSolution) -> Surface {
         slices,
         ssvi,
         quality,
+        checks,
+        failures,
     }
 }
 
@@ -911,7 +1118,7 @@ pub fn compute(case: &Case, key: &MeasureKey, definition: &Definition) -> Result
         match definition.definition {
             "max_pain" => max_pain(chain, &mut out),
             "open_interest_change" => open_interest_change(chain, &mut out),
-            "volatility_index" => volatility_index(chain, as_of, &mut out),
+            "volatility_index" => volatility_index(chain, chain.struck_at(as_of), &mut out),
             _ => {
                 let solution = solve(chain, as_of, steps);
                 match definition.definition {
@@ -1090,17 +1297,24 @@ fn surface_fit(chain: &Chain, surface: &Surface, out: &mut Out<'_>) {
                         ..Default::default()
                     });
                 }
-                for check in ["butterfly", "calendar"] {
+                // 1 passed, 0 failed: a failed check keeps its slice and
+                // names its strikes (below).
+                let (butterfly, calendar) =
+                    surface.checks.get(expiry).copied().unwrap_or((true, true));
+                for (check, passed) in [("butterfly", butterfly), ("calendar", calendar)] {
                     out.figure(
                         vec![("expiry", expiry.clone()), ("parameter", check.into())],
                         &Vec::new(),
-                        1.0,
+                        if passed { 1.0 } else { 0.0 },
                         "",
                         src,
                     );
                 }
             }
         }
+    }
+    for failed in &surface.failures {
+        out.not(&Vec::new(), "", FIT_FAILED, failed.clone());
     }
     match surface.ssvi {
         Some(ssvi) => {
@@ -1282,7 +1496,30 @@ fn term_and_skew(
 /// Cboe's published method on a listed strip (W12.1): no option model.
 fn volatility_index(chain: &Chain, as_of: i64, out: &mut Out<'_>) {
     if chain.curve.is_empty() {
-        out.not(&Vec::new(), "", PRICE_MISSING, chain.rate_missing.clone());
+        out.not(
+            &Vec::new(),
+            "",
+            chain.rate_reason,
+            chain.rate_missing.clone(),
+        );
+        return;
+    }
+    // No quote of any series at the as-of: no chain is held then, and a
+    // past date's index is no history, never today's chain (ruling 791).
+    if chain
+        .series
+        .iter()
+        .all(|s| s.bid.is_none() && s.ask.is_none())
+    {
+        out.not(
+            &Vec::new(),
+            "",
+            PRICE_MISSING,
+            format!(
+                "{}: no history: the lake holds no quote of its chain at the as-of",
+                chain.underlying
+            ),
+        );
         return;
     }
     let mut terms: Vec<(f64, f64)> = Vec::new();
@@ -1516,7 +1753,12 @@ fn positioning_exposure(
 /// liquidity and the 0DTE share (W12.1), on the default basis.
 fn positioning_levels(chain: &Chain, solution: &ChainSolution, steps: usize, out: &mut Out<'_>) {
     let Some(spot) = chain.spot else {
-        out.not(&Vec::new(), "", PRICE_MISSING, chain.spot_missing.clone());
+        out.not(
+            &Vec::new(),
+            "",
+            chain.spot_reason,
+            chain.spot_missing.clone(),
+        );
         return;
     };
     let held: Vec<(&Series, &Solved, f64, f64)> = chain
@@ -1793,7 +2035,7 @@ pub fn scenario_grid(
                 account_id: account.to_string(),
                 instrument_id: position.instrument_id.clone(),
                 measure: key.clone(),
-                reason: PRICE_MISSING,
+                reason: chain.spot_reason,
                 detail: chain.spot_missing.clone(),
                 series_key: Vec::new(),
             });
