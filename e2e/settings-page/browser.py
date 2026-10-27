@@ -45,6 +45,11 @@ needed?" So, in headless Chromium:
 - a secret's field (2026-10-10): who set it and when, or "Not set", in the
   field itself; no badge and no box; a Remove beside an optional secret
   alone, which asks first, declined sending nothing and confirmed removing it.
+- the one search in a settings table (ruling 786): SPY typed in the Plan-code
+  links table's instrument cell lists the platform's candidate with no
+  record ID, Enter brings it in (provisional, as on the dev deployment), the
+  cell shows its name and ticker, never the ID, and the row saves -- at 375,
+  582 and 1280 wide, light and dark; the Sources page's chip the same;
 - the Model routing tab (contract v26, W12.6): each model id on one line,
   its implementation and since when, and its Change dialog, at 375, 582 and
   1280 wide;
@@ -67,7 +72,7 @@ import re
 import sys
 from urllib.parse import urlencode
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import expect, sync_playwright
 
 BASE = os.environ.get("E2E_DASHBOARD", "http://settings-page:8080").rstrip("/")
 SESSION = os.environ["E2E_SESSION"]
@@ -1752,9 +1757,14 @@ def the_sources_page(browser, prefix):
             page.wait_for_function(
                 "() => document.querySelector('om-instrument-picker').value !== ''", timeout=8000)
             value = page.evaluate("() => document.querySelector('om-instrument-picker').value")
-            check(value.startswith("INS-"), f"{label}: SPY chosen by Enter is brought in: {value}")
+            check(value.startswith(("INS-", "LCL-")), f"{label}: SPY chosen by Enter is brought in: {value}")
             said = page.text_content("om-instrument-picker [role=status]") or ""
             check("chosen" in said, f"{label}: the outcome is announced: {said!r}")
+            # Ruling 786: the chip names it by its name and ticker, never the
+            # record's ID, though it is still provisional.
+            chip = page.text_content("om-instrument-picker .om-picker-chosen") or ""
+            check("SPDR S&P 500 ETF Trust (SPY)" in chip and not re.search(r"LCL-|INS-|BBG", chip),
+                  f"{label}: the chosen chip shows name and ticker, no ID: {chip!r}")
             page.click("#pick-instrument button[type=submit]")
             settled(page)
             rows = page.eval_on_selector_all("#sources-table tbody tr", "rows => rows.length")
@@ -1778,6 +1788,103 @@ def the_sources_page(browser, prefix):
             ctx.close()
 
 
+# Ruling 786 (727 everywhere): a settings table's instrument column is the
+# one search for the deployment admin -- the platform's candidates too -- and
+# a candidate chosen in a cell is brought in before the row saves.
+TABLE_SIZES = [("phone", 375, 812), ("narrow", 582, 820), ("desktop", 1280, 800)]
+INSTRUMENT_IN_ROW = """code => {
+  const rows = [...document.querySelectorAll('table.om-entry > tbody > tr[data-row]')];
+  const row = rows.find((r) => [...r.querySelectorAll('input')].some((i) => i.value === code));
+  const box = row && row.querySelector('input[data-key=instrument]');
+  return box ? { value: box.value, title: box.title || '' } : null;
+}"""
+
+
+def spy_is_picked_in_a_settings_tables_instrument_cell(browser, prefix):
+    """Typing SPY in the Plan-code links table's instrument cell lists the
+    platform's candidate with no record ID; Enter brings it in, the row
+    holding the submit until it is; the cell then shows SPY's name and
+    ticker, the row saves, and the page shows it again by name -- at 375,
+    582 and 1280 wide, light and dark, each step in one screen."""
+    for size, width, height in TABLE_SIZES:
+        for scheme in ("light", "dark"):
+            ctx = context(browser, width, height, scheme=scheme)
+            page = ctx.new_page()
+            errors = []
+            page.on("pageerror", lambda e: errors.append(str(e)))
+            page.goto(AREA + PLAN)
+            settled(page)
+            label = f"the Plan-code links table at {size} ({width}px), {scheme}"
+            src = page.get_attribute("om-entry-grid", "src") or ""
+            check("candidates=1" in src and page.get_attribute("om-entry-grid", "bring-in"),
+                  f"{label}: the instrument column searches candidates and brings one in: {src!r}")
+            code = f"SPY{width}{scheme[0].upper()}"
+            page.locator("button.om-entry-add").click()
+            row = page.locator("table.om-entry > tbody > tr[data-row]:not(.om-entry-paged)").last
+            row.locator("select").nth(0).select_option("FID-IRA-2")
+            row.locator("input[data-key=code]").fill(code)
+            narrow = row.locator("button.om-entry-more").is_visible()
+            if narrow:
+                row.locator("button.om-entry-more").click()
+                box = page.locator("dialog[open] input[data-key=instrument]")
+            else:
+                box = row.locator("input[data-key=instrument]")
+            box.fill("SPY")
+            page.wait_for_selector("ul.om-picker-list:not([hidden]) [role=option]", timeout=5000)
+            options = page.eval_on_selector_all(
+                "ul.om-picker-list:not([hidden]) [role=option]", "os => os.map(o => o.textContent)")
+            check(any("SPDR S&P 500 ETF Trust" in o for o in options),
+                  f"{label}: typing SPY in the cell lists the platform's candidate: {options}")
+            check(not any(re.search(r"LCL-|INS-", o) for o in options),
+                  f"{label}: no record ID is shown in the cell's list: {options}")
+            problems = page.evaluate(FIT)
+            check(not problems, f"{label} with SPY listed fits one screen"
+                  f"{': ' + '; '.join(problems) if problems else ''}")
+            page.screenshot(path=os.path.join(OUT, f"{prefix}-table-spy-listed-{size}-{scheme}.png"))
+            box.press("Enter")
+            try:
+                page.wait_for_function(
+                    "() => !document.querySelector('om-entry-grid').bringing", timeout=8000)
+                expect(box).to_have_value("SPDR S&P 500 ETF Trust (SPY)", timeout=8000)
+            except Exception as failed:  # noqa: BLE001 -- the check below says what was shown
+                print(f"(waiting for the bring-in: {failed})", flush=True)
+            shown = box.input_value()
+            title = box.get_attribute("title") or ""
+            check(shown == "SPDR S&P 500 ETF Trust (SPY)",
+                  f"{label}: the cell shows SPY's name and ticker once brought in: {shown!r}")
+            check(not re.search(r"LCL-|INS-|BBG", shown + title),
+                  f"{label}: neither the cell nor its title shows a record ID or FIGI: {shown!r} {title!r}")
+            if narrow:
+                page.locator("dialog[open] button.om-entry-done").click()
+            problems = page.evaluate(FIT)
+            check(not problems, f"{label} with SPY chosen fits one screen"
+                  f"{': ' + '; '.join(problems) if problems else ''}")
+            check(not page.evaluate(SIDEWAYS), f"{label} with SPY chosen scrolls nothing sideways")
+            page.screenshot(path=os.path.join(OUT, f"{prefix}-table-spy-chosen-{size}-{scheme}.png"))
+            page.click("form[data-table-setting] .form-foot button[data-save]")
+            settled(page)
+            check("tab=" + PLAN in page.url and "saved=1" in page.url, f"{label}: saved, back on its tab: {page.url}")
+            # The saved row, found by the grid's own search so it is on the
+            # page shown, named again from its ID by the picker's search.
+            page.locator("om-entry-grid input[type=search]").fill(code)
+            try:
+                page.wait_for_function(
+                    f"() => (({INSTRUMENT_IN_ROW})({code!r}) || {{}}).value === 'SPDR S&P 500 ETF Trust (SPY)'",
+                    timeout=8000)
+            except Exception as failed:  # noqa: BLE001 -- the check below says what was shown
+                print(f"(waiting for the saved row's name: {failed})", flush=True)
+            held = page.evaluate(INSTRUMENT_IN_ROW, code)
+            check(held and held["value"] == "SPDR S&P 500 ETF Trust (SPY)"
+                  and not re.search(r"LCL-|INS-", held["value"] + held["title"]),
+                  f"{label}: the saved row shows SPY by name and ticker: {held}")
+            problems = page.evaluate(FIT)
+            check(not problems, f"{label} saved fits one screen"
+                  f"{': ' + '; '.join(problems) if problems else ''}")
+            page.screenshot(path=os.path.join(OUT, f"{prefix}-table-spy-saved-{size}-{scheme}.png"))
+            check(not errors, f"{label} ran without a script error: {errors}")
+            ctx.close()
+
+
 with sync_playwright() as playwright:
     browser = playwright.chromium.launch()
     prefix = "development" if PASS == "fit" else "settings"
@@ -1786,6 +1893,7 @@ with sync_playwright() as playwright:
         the_grid_adds_rows_past_four_and_posts_them(browser)
         two_hundred_are_accepted_and_two_hundred_and_one_refused(browser)
         without_script_the_plain_table_posts(browser)
+        spy_is_picked_in_a_settings_tables_instrument_cell(browser, prefix)
     the_access_editor_has_a_row_per_role(browser, prefix)
     the_raw_records_and_the_holds(browser, prefix)
     the_data_sources_page(browser, prefix)

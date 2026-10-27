@@ -424,6 +424,10 @@ pub async fn search(
 
 /// A found record as the kit's instrument picker reads one (meridian-ui
 /// 0.12.0, om-instrument-picker): the record's fields by their proto names.
+/// A record with no description in force -- one brought in and still
+/// provisional, its name only offered -- is named by the latest offered
+/// description, so the picker shows a name, never the record's ID (rulings
+/// 727, 786); nothing is put in force by it.
 pub fn found_json(record: &meridian_domain::v1::InstrumentRecord) -> serde_json::Value {
     let class = meridian_domain::v1::AssetClass::try_from(record.asset_class)
         .map(|class| {
@@ -435,7 +439,7 @@ pub fn found_json(record: &meridian_domain::v1::InstrumentRecord) -> serde_json:
         .unwrap_or_default();
     serde_json::json!({
         "instrument_id": record.instrument_id,
-        "description": record.description,
+        "description": name_of(record),
         "asset_class": if class == "unspecified" { String::new() } else { class },
         "currency": record.currency,
         "exchange_mic": record.exchange_mic,
@@ -445,6 +449,29 @@ pub fn found_json(record: &meridian_domain::v1::InstrumentRecord) -> serde_json:
             "source": identifier.source,
         })).collect::<Vec<_>>(),
     })
+}
+
+/// The name a person reads for a record: its description in force, or the
+/// latest one offered where none is.
+pub fn name_of(record: &meridian_domain::v1::InstrumentRecord) -> String {
+    use meridian_domain::v1::instrument_value::Value;
+    if !record.description.trim().is_empty() {
+        return record.description.clone();
+    }
+    record
+        .offers
+        .iter()
+        .filter_map(
+            |offer| match offer.value.as_ref().and_then(|v| v.value.as_ref()) {
+                Some(Value::Description(text)) if !text.trim().is_empty() => {
+                    Some((offer.offered_at_ns, text.trim().to_string()))
+                }
+                _ => None,
+            },
+        )
+        .max_by_key(|(at, _)| *at)
+        .map(|(_, text)| text)
+        .unwrap_or_default()
 }
 
 /// W3.11: the records to complete, or one record (`instrument_id`).
@@ -3114,6 +3141,56 @@ mod one_search_tests {
         // The platform not reached: the records alone.
         assert_eq!(one_list(&[], None, 10).len(), 0);
         assert_eq!(one_list(&[], Some(&answer), 2).len(), 2);
+    }
+
+    /// Ruling 786: a record brought in and still provisional has no
+    /// description in force, only the one offered; the picker reads that
+    /// name, never the record's ID, and the ticker on the US composite
+    /// venue travels in its identifiers. A description in force wins.
+    #[test]
+    fn a_provisional_record_is_named_by_its_offered_description() {
+        use meridian_domain::v1::{instrument_value, InstrumentValue, OfferedValue};
+        let offered = |at: i64, text: &str| OfferedValue {
+            value: Some(InstrumentValue {
+                source: "the instrument picker for Ada Admin".into(),
+                value: Some(instrument_value::Value::Description(text.into())),
+            }),
+            offered_at_ns: at,
+            ..Default::default()
+        };
+        let mut spy = InstrumentRecord {
+            instrument_id: "LCL-01M5Y1XWZ2XTFB4MRVFC2KQX5X".into(),
+            identifiers: vec![
+                Identifier {
+                    scheme: "composite_figi".into(),
+                    value: "BBG000BDTBL9".into(),
+                    source: "US".into(),
+                    ..Default::default()
+                },
+                Identifier {
+                    scheme: "ticker".into(),
+                    value: "SPY".into(),
+                    source: "VEN-01JUSCOMPOSITE00000000001".into(),
+                    ..Default::default()
+                },
+            ],
+            offers: vec![
+                offered(1, "SPDR S&P 500 ETF"),
+                offered(2, "SPDR S&P 500 ETF Trust"),
+            ],
+            ..Default::default()
+        };
+        let shown = found_json(&spy);
+        assert_eq!(
+            shown["description"], "SPDR S&P 500 ETF Trust",
+            "the latest offered"
+        );
+        assert_eq!(shown["identifiers"][1]["value"], "SPY");
+        spy.description = "SPDR S&P 500 ETF TRUST".into();
+        assert_eq!(found_json(&spy)["description"], "SPDR S&P 500 ETF TRUST");
+        spy.description.clear();
+        spy.offers.clear();
+        assert_eq!(found_json(&spy)["description"], "");
     }
 
     #[test]

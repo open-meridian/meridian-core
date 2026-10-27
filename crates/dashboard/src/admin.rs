@@ -741,10 +741,11 @@ async fn plugin_view(
         ),
         None => token_input(&session),
     };
-    let choices = match settings_of(&records, &instance) {
+    let mut choices = match settings_of(&records, &instance) {
         Some(record) => choices(&app, &instance, record, &records).await,
         None => settings::Choices::default(),
     };
+    choices.bring_in = access.deployment_admin;
     // A connectivity plugin's ems, or an ems's plugins and map (W11.21,
     // W11.22, contract v22).
     let connectivity_part = {
@@ -2885,8 +2886,9 @@ async fn set_hold(
 /// rulings 727, 761, 774): the platform's candidates the deployment does not
 /// hold follow its records in one list, each marked `candidate` for the
 /// kit's picker to bring in (meridian-ui 0.14.0); the platform not reached,
-/// the records answer alone. An entry grid's column asks without it, so a
-/// cell's typing never reaches the platform.
+/// the records answer alone. A settings table's instrument column asks with
+/// it too, for a deployment admin, and brings a chosen one in (meridian-ui
+/// 0.15.0; ruling 786: one search everywhere a person picks an instrument).
 async fn search_instruments(
     State(app): State<Arc<App>>,
     headers: HeaderMap,

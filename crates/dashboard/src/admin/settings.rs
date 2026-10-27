@@ -95,6 +95,11 @@ pub struct Choices {
     pub external_accounts: Vec<(String, String)>,
     pub instruments: Vec<(String, String)>,
     pub unread: String,
+    /// Whether the person may bring in an instrument the deployment does
+    /// not hold, a deployment admin's (W3.33; rulings 727, 786): an
+    /// instrument column then searches the platform's candidates too and
+    /// brings the one chosen in, as the Sources page's picker does.
+    pub bring_in: bool,
 }
 
 impl Choices {
@@ -1603,22 +1608,66 @@ fn table_field(
          <div class=\"table-wrap\"><table class=\"one-line\"><caption>{caption}</caption>\
          <thead><tr>{heads}</tr></thead><tbody>{body}</tbody></table></div></om-entry-grid>",
         field = escape(name),
-        // Core's own search, for an instrument column (kit 0.12.0).
-        src = if declaration
-            .columns
-            .iter()
-            .any(|column| column_kind(column) == SettingColumnType::Instrument)
-        {
-            " src=\"/admin/instruments/search\""
-        } else {
-            ""
-        },
+        src = instrument_search(declaration, choices),
     )
+}
+
+/// An entry grid's search for its instrument column: core's own (kit
+/// 0.12.0); for a person who may bring one in, the one search, the
+/// platform's candidates too, and the bring-in a chosen one goes through
+/// (kit 0.15.0; rulings 727, 786). Nothing for a table without one.
+fn instrument_search(declaration: &SettingDeclaration, choices: &Choices) -> &'static str {
+    let instrument = declaration
+        .columns
+        .iter()
+        .any(|column| column_kind(column) == SettingColumnType::Instrument);
+    match (instrument, choices.bring_in) {
+        (false, _) => "",
+        (true, false) => " src=\"/admin/instruments/search\"",
+        (true, true) => {
+            " src=\"/admin/instruments/search?candidates=1\" \
+             bring-in=\"/admin/instruments/bring-in\""
+        }
+    }
 }
 
 #[cfg(test)]
 mod grid_tests {
     use super::*;
+
+    /// Ruling 786: a settings table's instrument column is the one search
+    /// for whoever may bring an instrument in -- the platform's candidates
+    /// asked, a chosen one brought in -- and core's records alone for
+    /// anyone else; a table without one searches nothing.
+    #[test]
+    fn an_instrument_column_searches_candidates_and_brings_in_for_a_deployment_admin() {
+        let table = |kind: SettingColumnType| SettingDeclaration {
+            name: "watchlist".into(),
+            r#type: SettingType::Table as i32,
+            columns: vec![SettingColumn {
+                name: "instrument".into(),
+                label: "Instrument".into(),
+                r#type: kind as i32,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let admin = Choices {
+            bring_in: true,
+            ..Default::default()
+        };
+        let watchlist = table(SettingColumnType::Instrument);
+        let searched = instrument_search(&watchlist, &admin);
+        assert!(searched.contains("src=\"/admin/instruments/search?candidates=1\""));
+        assert!(searched.contains("bring-in=\"/admin/instruments/bring-in\""));
+        let other = instrument_search(&watchlist, &Choices::default());
+        assert_eq!(other, " src=\"/admin/instruments/search\"");
+        assert!(!other.contains("bring-in"));
+        assert_eq!(
+            instrument_search(&table(SettingColumnType::Text), &admin),
+            ""
+        );
+    }
 
     #[test]
     fn an_account_column_with_no_account_yet_is_shown_as_it_stands_not_a_choice_of_none() {

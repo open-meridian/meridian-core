@@ -755,6 +755,10 @@ fn incomplete(id: &str) -> bool {
     id[4..].parse::<usize>().is_ok_and(|n| n <= 60)
 }
 
+/// The record the picker brings SPY in as: provisional, the platform not
+/// having answered yet (ruling 786).
+pub const BROUGHT_IN: &str = "LCL-01JSPY00000000000000000001";
+
 /// A record as the stand-in instrument store answers it: a fund with its
 /// symbol, complete from the sixty-first; INS-0007 a binary event contract
 /// whose old ticker the platform ended (contract v19), offered as an end.
@@ -1441,7 +1445,9 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
     // Contract v28 (W3.33; rulings 727, 774, 778): the conductor's
     // candidates for the picker's one search -- SPY, which the deployment
     // does not hold, on its US composite with no venue -- and the store's
-    // resolve bringing one in, kept and listed after.
+    // resolve bringing one in, kept and listed after. As on the dev
+    // deployment (ruling 786), the platform has not answered yet: the record
+    // is provisional under an `LCL-` ID, its name only offered.
     let brought: Arc<Mutex<Vec<InstrumentRecord>>> = Arc::new(Mutex::new(Vec::new()));
     bus.serve(
         crate::admin::instruments::ASK_PLATFORM_FOR_INSTRUMENT_CANDIDATES,
@@ -1460,6 +1466,14 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
                     composite_figi: "BBG000BDTBL9".into(),
                     share_class_figi: "BBG001S72SM3".into(),
                     identifiers: vec![
+                        // Its ticker on the platform's "US composite" venue,
+                        // which has no MIC (779), as the platform answers it.
+                        Identifier {
+                            scheme: "ticker".into(),
+                            value: "SPY".into(),
+                            source: "VEN-01JUSCOMPOSITE00000000001".into(),
+                            ..Default::default()
+                        },
                         Identifier {
                             scheme: "share_class_figi".into(),
                             value: "BBG001S72SM3".into(),
@@ -1499,15 +1513,29 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
                 let asked =
                     meridian_domain::v1::ResolveIdentifierRequest::decode(&envelope.payload[..])
                         .map_err(|e| e.to_string())?;
+                use meridian_domain::v1::{instrument_value, InstrumentValue, OfferedValue};
                 let mut held = brought.lock().unwrap();
-                let id = "INS-01JSPY00000000000000000001".to_string();
+                let id = BROUGHT_IN.to_string();
                 if !held.iter().any(|r| r.instrument_id == id) {
+                    let offered = |value: instrument_value::Value| OfferedValue {
+                        value: Some(InstrumentValue {
+                            source: "the instrument picker for Ada Admin".into(),
+                            value: Some(value),
+                        }),
+                        offered_at_ns: 1,
+                        ..Default::default()
+                    };
                     held.push(InstrumentRecord {
                         instrument_id: id.clone(),
                         identifiers: asked.identifiers.clone(),
-                        asset_class: asked.stated_asset_class,
-                        currency: asked.stated_currency.clone(),
-                        description: asked.stated_description.clone(),
+                        offers: vec![
+                            offered(instrument_value::Value::Description(
+                                asked.stated_description.clone(),
+                            )),
+                            offered(instrument_value::Value::Currency(
+                                asked.stated_currency.clone(),
+                            )),
+                        ],
                         version: 1,
                         ..Default::default()
                     });
@@ -1621,7 +1649,10 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
             for record in listing_brought.lock().unwrap().iter() {
                 let found = asked.instrument_id == record.instrument_id
                     || (!search.is_empty()
-                        && (record.description.to_lowercase().contains(&search)
+                        && (record.instrument_id.to_lowercase() == search
+                            || crate::admin::instruments::name_of(record)
+                                .to_lowercase()
+                                .contains(&search)
                             || record
                                 .identifiers
                                 .iter()
