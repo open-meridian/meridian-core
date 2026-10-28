@@ -99,8 +99,8 @@ const CODE_NS: i64 = 60 * SECOND_NS;
 const ASSERTION_NS: i64 = 60 * SECOND_NS;
 
 /// The session a plugin host's session came from, which it ends with: a
-/// browser's on the dashboard, or a delegation's, by its id -- so no
-/// client's token is kept anywhere.
+/// browser's on the dashboard, by its token's hash (ruling 855), or a
+/// delegation's, by its id -- so no token of either is kept anywhere.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Came {
     Browser(String),
@@ -145,7 +145,7 @@ impl Came {
     /// about, which is not the same as its having ended.
     async fn who(&self, app: &App, now_ns: i64) -> Result<Option<Who>, Unavailable> {
         Ok(match self {
-            Came::Browser(key) => app.sessions.find(key, now_ns).map(|s| Who {
+            Came::Browser(hash) => app.sessions.find_hashed(hash, now_ns).map(|s| Who {
                 subject: s.subject,
                 display_name: s.display_name,
                 directory_groups: s.directory_groups,
@@ -180,7 +180,7 @@ impl Came {
         now_ns: i64,
     ) -> Result<bool, Unavailable> {
         match self {
-            Came::Browser(key) => Ok(sessions.is_live(key, now_ns)),
+            Came::Browser(hash) => Ok(sessions.is_live_hashed(hash, now_ns)),
             Came::Delegation(id) => Ok(delegations
                 .delegation(id)
                 .await?
@@ -191,7 +191,8 @@ impl Came {
 
 /// What the plugin's host needs to know about a person who came from the
 /// dashboard or a terminal, and the level their session was opened at.
-struct Entered {
+#[derive(Clone, Debug)]
+pub(crate) struct Entered {
     came: Came,
     instance: String,
     level: AccessLevel,
@@ -221,7 +222,10 @@ pub struct Plugins {
     /// Names answered without asking DNS: a test's sidecars, on loopback.
     pinned: HashMap<String, SocketAddr>,
     codes: Mutex<HashMap<String, Code>>,
+    /// The plugin hosts' sessions, by their tokens' hashes: held in memory,
+    /// and kept in the dashboard's table where it has one (ruling 855).
     entered: Mutex<HashMap<String, Entered>>,
+    kept: Option<Arc<dyn kept::PluginSessionStore>>,
 }
 
 /// A plugin's redirect goes back to the browser, which follows it on the
@@ -291,7 +295,22 @@ impl Plugins {
             pinned: HashMap::new(),
             codes: Mutex::new(HashMap::new()),
             entered: Mutex::new(HashMap::new()),
+            kept: None,
         })
+    }
+
+    /// Plugin pages' sessions kept in the dashboard's own table, so a
+    /// restart or an upgrade leaves an open page working (ruling 855).
+    pub fn keeping_in(mut self, database: crate::database::Database) -> Plugins {
+        self.kept = Some(Arc::new(kept::InPostgres::on(database)));
+        self
+    }
+
+    /// [`Plugins::keeping_in`], over any store.
+    #[cfg(test)]
+    pub(crate) fn keeping(mut self, store: Arc<dyn kept::PluginSessionStore>) -> Plugins {
+        self.kept = Some(store);
+        self
     }
 
     /// Answer `name` with `at` rather than asking DNS. The port is still the
@@ -505,53 +524,102 @@ impl Plugins {
         instance: &str,
         level: AccessLevel,
         prepared: String,
+        now_ns: i64,
     ) -> String {
         let key = token();
-        self.entered.lock().expect("entered lock poisoned").insert(
-            key.clone(),
-            Entered {
-                came,
-                instance: instance.to_string(),
-                level,
-                prepared,
-            },
-        );
-        key
-    }
-
-    /// The prepared change a plugin-host session was opened from, if any.
-    fn prepared_of(&self, key: &str) -> String {
+        let hash = crate::terminal::hashed(&key);
+        let entered = Entered {
+            came,
+            instance: instance.to_string(),
+            level,
+            prepared,
+        };
+        if let Some(store) = &self.kept {
+            if let Err(failed) = crate::session::blocking(|| store.keep(&hash, &entered, now_ns)) {
+                tracing::warn!(
+                    instance,
+                    "a plugin page's session was not kept, so a restart will end it: {failed}"
+                );
+            }
+        }
         self.entered
             .lock()
             .expect("entered lock poisoned")
-            .get(key)
-            .map(|held| held.prepared.clone())
-            .unwrap_or_default()
+            .insert(hash, entered);
+        key
     }
 
-    /// The prepared change settled or gone: later requests name it no more.
-    pub(crate) fn forget_prepared(&self, key: &str) {
+    /// The plugin host's session behind a token: held here, or read from
+    /// the table it was kept in before a restart (ruling 855).
+    fn held(&self, key: &str) -> Option<Entered> {
+        let hash = crate::terminal::hashed(key);
         if let Some(held) = self
             .entered
             .lock()
             .expect("entered lock poisoned")
-            .get_mut(key)
+            .get(&hash)
+        {
+            return Some(held.clone());
+        }
+        let store = self.kept.as_ref()?;
+        let kept = match crate::session::blocking(|| store.kept(&hash)) {
+            Ok(kept) => kept?,
+            Err(failed) => {
+                tracing::warn!("the plugin pages' sessions could not be read: {failed}");
+                return None;
+            }
+        };
+        self.entered
+            .lock()
+            .expect("entered lock poisoned")
+            .insert(hash, kept.clone());
+        Some(kept)
+    }
+
+    /// The prepared change a plugin-host session was opened from, if any.
+    fn prepared_of(&self, key: &str) -> String {
+        self.held(key).map(|held| held.prepared).unwrap_or_default()
+    }
+
+    /// The prepared change settled or gone: later requests name it no more.
+    pub(crate) fn forget_prepared(&self, key: &str) {
+        let hash = crate::terminal::hashed(key);
+        if let Some(held) = self
+            .entered
+            .lock()
+            .expect("entered lock poisoned")
+            .get_mut(&hash)
         {
             held.prepared.clear();
+        }
+        if let Some(store) = &self.kept {
+            if let Err(failed) = crate::session::blocking(|| store.forget_prepared(&hash)) {
+                tracing::warn!("a plugin page's prepared change was not cleared: {failed}");
+            }
         }
     }
 
     fn entered(&self, key: &str, instance: &str) -> Option<(Came, AccessLevel)> {
-        let entered = self.entered.lock().expect("entered lock poisoned");
-        let held = entered.get(key)?;
-        (held.instance == instance).then(|| (held.came.clone(), held.level))
+        let held = self.held(key)?;
+        (held.instance == instance).then_some((held.came, held.level))
     }
 
     fn leave(&self, key: &str) {
+        let hash = crate::terminal::hashed(key);
+        self.forget(&hash);
+    }
+
+    /// End one by its hash, here and in the table.
+    fn forget(&self, hash: &str) {
         self.entered
             .lock()
             .expect("entered lock poisoned")
-            .remove(key);
+            .remove(hash);
+        if let Some(store) = &self.kept {
+            if let Err(failed) = crate::session::blocking(|| store.end(hash)) {
+                tracing::warn!("a plugin page's session was not removed from the table: {failed}");
+            }
+        }
     }
 
     /// Forget codes past their minute and plugin sessions whose dashboard
@@ -563,26 +631,35 @@ impl Plugins {
             .lock()
             .expect("code lock poisoned")
             .retain(|_, code| code.expires_at_ns >= now_ns);
-        let held: Vec<(String, Came)> = self
+        // Those held here, and those kept in the table from before a
+        // restart that nobody has used since (ruling 855).
+        let mut held: HashMap<String, Came> = self
             .entered
             .lock()
             .expect("entered lock poisoned")
             .iter()
-            .map(|(key, held)| (key.clone(), held.came.clone()))
+            .map(|(hash, held)| (hash.clone(), held.came.clone()))
             .collect();
+        if let Some(store) = &self.kept {
+            match crate::session::blocking(|| store.held()) {
+                Ok(kept) => held.extend(kept),
+                Err(failed) => {
+                    tracing::warn!("the plugin pages' sessions were not swept: {failed}");
+                }
+            }
+        }
         let mut ended = Vec::new();
-        for (key, came) in held {
+        for (hash, came) in held {
             match came.is_live(sessions, delegations, now_ns).await {
                 Ok(true) => {}
-                Ok(false) => ended.push(key),
+                Ok(false) => ended.push(hash),
                 Err(unavailable) => {
                     tracing::warn!(%unavailable, "a plugin page's session was not swept");
                 }
             }
         }
-        let mut entered = self.entered.lock().expect("entered lock poisoned");
-        for key in ended {
-            entered.remove(&key);
+        for hash in ended {
+            self.forget(&hash);
         }
     }
 }
@@ -1254,7 +1331,7 @@ pub(crate) async fn open(
         .filter(|id| crate::prepared::is_prepared_call_id(id))
         .unwrap_or_default();
     let code = plugins.mint_from(
-        Came::Browser(key),
+        Came::Browser(crate::terminal::hashed(&key)),
         &instance,
         level,
         app.clock.now_ns(),
@@ -2092,7 +2169,7 @@ async fn enter(
     };
     // One session per plugin host in a browser: entering again, at any
     // level, replaces the last.
-    let key = plugins.enter_from(came, instance, level, prepared);
+    let key = plugins.enter_from(came, instance, level, prepared, now);
     let mut response = redirect(&landing(&asked));
     response.headers_mut().insert(
         SET_COOKIE,
@@ -2203,6 +2280,8 @@ pub(crate) async fn forward(
         .body(Body::from_stream(answer.bytes_stream()))
         .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
 }
+
+mod kept;
 
 #[cfg(test)]
 mod tests;

@@ -18,7 +18,8 @@
 //! - a person's answer to the professional test and who could use each
 //!   dataset each month ([`crate::data_use`], contract v28);
 //! - browsers' sessions, by their tokens' hashes ([`crate::session`],
-//!   ruling 811).
+//!   ruling 811), and plugin pages' sessions beside them, each ending with
+//!   the session it came from ([`crate::plugins`], ruling 855).
 //!
 //! The schema is applied by `meridian-dashboard migrate`, once per release,
 //! as the migrating role, and a starting dashboard only verifies it: the
@@ -123,6 +124,12 @@ const MIGRATIONS: &[Migration] = &[
         version: 12,
         name: "a_browser_session",
         sql: include_str!("../migrations/0012_a_browser_session.sql"),
+        then: None,
+    },
+    Migration {
+        version: 13,
+        name: "a_plugin_page_session",
+        sql: include_str!("../migrations/0013_a_plugin_page_session.sql"),
         then: None,
     },
 ];
