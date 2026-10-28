@@ -915,6 +915,176 @@ fn capacity_lake_as_a_dataset_grows() {
 /// The bytes this test binary holds allocated, now and at its peak since
 /// the peak was last reset: what a read keeps, apart from what the
 /// allocator holds back from the system (resident memory).
+/// A listed series row under `subject` keyed by `key`, expiring on `date`:
+/// a future where it names its product code, else an option.
+fn listed_series(dataset: &str, subject: &str, key: &str, date: &str, future: bool) -> Observation {
+    use meridian_domain::v1::{Identifier, ListedSeries, TemplateFieldValue};
+    let field = |path: &str, value: &str| TemplateFieldValue {
+        path: path.into(),
+        value: value.into(),
+        ..Default::default()
+    };
+    let mut fields = vec![field("underlying_instrument_id", subject)];
+    if future {
+        fields.push(field("product_code", "ES"));
+        fields.push(field("last_trade_date", date));
+    } else {
+        fields.push(field("expiration_date", date));
+    }
+    Observation::Series(ListedSeries {
+        meta: Some(ObservationMeta {
+            row_key: format!("series:{key}"),
+            subjects: vec![SubjectRef {
+                entity_id: subject.into(),
+                ..Default::default()
+            }],
+            source: Some(Source {
+                instance: "tradier-1".into(),
+                dataset: dataset.into(),
+                ..Default::default()
+            }),
+            valid_from_ns: 100,
+            series_key: vec![Identifier {
+                scheme: "occ_osi".into(),
+                value: key.into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+        template_id: "TPL-LISTED".into(),
+        template_version: "1".into(),
+        fields,
+        instrument_id: String::new(),
+    })
+}
+
+/// Rulings 856 and 858: the listing an expirations read counts, read from
+/// `lake_row_listing` alone, is what reading the rows whole answers -- each
+/// series row key at its version in force by the cut-off, an invalid one
+/// (its own state or an assessment's) left out, a series two datasets list
+/// once each, a future told by its product code -- and a row recorded
+/// before migration 7 is read whole until `migrate` fills it in.
+#[test]
+fn the_listing_is_read_from_its_index_as_the_rows_answer_it() {
+    use meridian_domain::v1::{InstrumentType, QualityState};
+    use meridian_lake::store::{listing_read, Assessment, Listed};
+    let store = store();
+    let first = unique("tradier-1:options");
+    let second = unique("cboe-1:options");
+    let subject = unique("INS-UNDERLYING");
+    let other = unique("INS-OTHER");
+    let mut invalid = listed_series(&first, &subject, "BAD", "2026-11-20", false);
+    invalid.meta_mut().quality = QualityState::Invalid as i32;
+    let done = store
+        .record(
+            &first,
+            vec![
+                listed_series(&first, &subject, "A", "2026-11-20", false),
+                listed_series(&first, &subject, "B", "2026-11-20", false),
+                listed_series(&first, &subject, "C", "2026-12-18", false),
+                listed_series(&first, &subject, "F", "2026-12-18", true),
+                listed_series(&first, &subject, "D", "2026-11-20", false),
+                invalid,
+                listed_series(&first, &other, "Z", "2026-11-20", false),
+            ],
+            1_000,
+        )
+        .unwrap();
+    assert_eq!(done.recorded, 7);
+    // The same series listed by a second dataset.
+    store
+        .record(
+            &second,
+            vec![listed_series(&second, &subject, "A", "2026-11-20", false)],
+            1_000,
+        )
+        .unwrap();
+    // An adjustment: B moves to December, recorded after the first cut-off.
+    let moved = store
+        .record(
+            &first,
+            vec![listed_series(&first, &subject, "B", "2026-12-18", false)],
+            3_000,
+        )
+        .unwrap();
+    assert_eq!(moved.restated, 1);
+    // D found invalid by an assessment after the first cut-off.
+    let d = done
+        .rows
+        .iter()
+        .find(|row| row.meta().row_key == "series:D")
+        .unwrap()
+        .meta()
+        .clone();
+    store
+        .assess(&[Assessment {
+            dataset: first.clone(),
+            sequence: d.sequence,
+            row_key: d.row_key.clone(),
+            version: d.version,
+            state: QualityState::Invalid as i32,
+            reasons: vec![],
+            by_instance: "signal-1".into(),
+            at_ns: 3_000,
+        }])
+        .unwrap();
+    let datasets = vec![first.clone(), second.clone()];
+    let subjects = vec![subject.clone()];
+    let sorted = |mut listed: Vec<Listed>| {
+        listed.sort_by(|a, b| (&a.dataset, &a.series).cmp(&(&b.dataset, &b.series)));
+        listed
+    };
+    let both = |as_of_ns: i64| {
+        let indexed = sorted(store.listing(&datasets, &subjects, as_of_ns).unwrap());
+        let whole = sorted(listing_read(&store, &datasets, &subjects, as_of_ns).unwrap());
+        assert_eq!(indexed, whole, "as of {as_of_ns}");
+        indexed
+    };
+    let at = |listed: &[Listed], date: &str| {
+        let mut series: Vec<String> = listed
+            .iter()
+            .filter(|l| {
+                l.expires.map(|d| d.to_string()).as_deref() == Some(date)
+                    && l.listed_type == InstrumentType::ListedOption
+            })
+            .map(|l| l.series.clone())
+            .collect();
+        series.sort();
+        series.dedup();
+        series.len()
+    };
+    let then = both(2_000);
+    assert_eq!(then.len(), 6, "A twice, B, C, D and F; BAD and Z left out");
+    assert_eq!((at(&then, "2026-11-20"), at(&then, "2026-12-18")), (3, 1));
+    let now = both(0);
+    assert_eq!((at(&now, "2026-11-20"), at(&now, "2026-12-18")), (1, 2));
+    assert!(now
+        .iter()
+        .any(|l| l.listed_type == InstrumentType::Future && l.dataset == first));
+
+    // A row recorded before migration 7: read whole, then filled in.
+    let url = std::env::var("MERIDIAN_TEST_DATABASE_URL").unwrap();
+    let mut sql = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let cleared = sql
+        .execute(
+            "UPDATE lake_row SET expires = NULL, listed_type = NULL WHERE dataset = $1",
+            &[&first],
+        )
+        .unwrap();
+    assert!(cleared > 0);
+    assert_eq!(both(0), now, "read whole before migrate fills it in");
+    store.migrate(&SystemClock).unwrap();
+    let unfilled: i64 = sql
+        .query_one(
+            "SELECT count(*) FROM lake_row WHERE dataset = $1 AND listed_type IS NULL",
+            &[&first],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(unfilled, 0);
+    assert_eq!(both(0), now);
+}
+
 mod counted {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -971,10 +1141,11 @@ mod chain_page {
     use meridian_clock::{Clock, SystemClock};
     use meridian_domain::v1::{
         AssetClass, DatasetEntitlement, DatasetRef, EntitlementsChangedEvent, Identifier,
-        InstrumentRecord, ListQuotesReply, ListQuotesRequest, ListSeriesReply, ListSeriesRequest,
-        ListStatisticsReply, ListStatisticsRequest, ListedSeries, Money, ObservationMeta, Quote,
-        ResolveIdentifierReply, ResolveInstrumentReply, Source, SourceChoice, Statistic,
-        StatisticKind, SubjectRef, TemplateFieldValue, UnitValue, ValueUnit,
+        InstrumentRecord, ListExpirationsReply, ListExpirationsRequest, ListQuotesReply,
+        ListQuotesRequest, ListSeriesReply, ListSeriesRequest, ListStatisticsReply,
+        ListStatisticsRequest, ListedSeries, Money, ObservationMeta, Quote, ResolveIdentifierReply,
+        ResolveInstrumentReply, Source, SourceChoice, Statistic, StatisticKind, SubjectRef,
+        TemplateFieldValue, UnitValue, ValueUnit,
     };
     use meridian_lake::row::Observation;
     use meridian_lake::service;
@@ -1449,6 +1620,63 @@ mod chain_page {
             at.elapsed()
         }
 
+        /// An options page's expirations as sample-options 0.3.4 lists
+        /// them: every series in the window, `paths=expiration_date`, every
+        /// page, each date kept once. Its calls, rows, dates, bytes and time.
+        pub async fn expirations_by_series(&self) -> (usize, usize, usize, usize, Duration) {
+            let at = Instant::now();
+            let (mut cursor, mut calls, mut rows, mut bytes) = (String::new(), 0, 0, 0);
+            let mut dates = std::collections::BTreeSet::new();
+            loop {
+                let (reply, size): (ListSeriesReply, usize) = self
+                    .ask(
+                        service::LIST_SERIES,
+                        "meridian.v1.ListSeriesRequest",
+                        ListSeriesRequest {
+                            subjects: self.subject(),
+                            expiration_from: "2026-01-01".into(),
+                            expiration_to: "2028-12-31".into(),
+                            paths: vec!["expiration_date".into()],
+                            cursor: cursor.clone(),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                calls += 1;
+                bytes += size;
+                rows += reply.series.len();
+                for series in &reply.series {
+                    for field in &series.fields {
+                        dates.insert(field.value.clone());
+                    }
+                }
+                cursor = reply.next_cursor;
+                if cursor.is_empty() {
+                    break;
+                }
+            }
+            (calls, rows, dates.len(), bytes, at.elapsed())
+        }
+
+        /// The same expirations by ListExpirations (rulings 856, 858 and
+        /// 859): one call. Its dates, bytes and time.
+        pub async fn expirations(&self) -> (usize, usize, Duration) {
+            let at = Instant::now();
+            let (reply, bytes): (ListExpirationsReply, usize) = self
+                .ask(
+                    service::LIST_EXPIRATIONS,
+                    "meridian.v1.ListExpirationsRequest",
+                    ListExpirationsRequest {
+                        underlying_id: self.underlying.clone(),
+                        expiration_from: "2026-01-01".into(),
+                        expiration_to: "2028-12-31".into(),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            (reply.expirations.len(), bytes, at.elapsed())
+        }
+
         /// The chain page's reads as a targeted read makes them (rulings
         /// 821 and 833, spec/one-data-access-model step 1): the shown
         /// expiration's series with the drawn columns' paths, and its quotes
@@ -1623,6 +1851,23 @@ async fn capacity_chain_page_reads() {
         let took = page.datasets().await;
         println!(
             "CAPACITY chain list_datasets={i} ms={:.1}",
+            took.as_secs_f64() * 1e3
+        );
+    }
+    // An options page's expirations (rulings 856 and 858): every series
+    // in the window, as sample-options 0.3.4 lists them, against one
+    // ListExpirations.
+    for i in 0..5 {
+        let (calls, rows, dates, bytes, took) = page.expirations_by_series().await;
+        println!(
+            "CAPACITY chain expirations_by_series={i} calls={calls} rows={rows} dates={dates} bytes={bytes} ms={:.1}",
+            took.as_secs_f64() * 1e3
+        );
+    }
+    for i in 0..5 {
+        let (dates, bytes, took) = page.expirations().await;
+        println!(
+            "CAPACITY chain expirations={i} calls=1 dates={dates} bytes={bytes} ms={:.1}",
             took.as_secs_f64() * 1e3
         );
     }

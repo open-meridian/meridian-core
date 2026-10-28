@@ -11,8 +11,8 @@ use meridian_domain::exact::Exact;
 use meridian_domain::lake;
 use meridian_domain::v1::{
     Bar, CorporateActionAnnounced, DerivedSeries, ExecutionCost, Filing, Holding, HoldingsReport,
-    ListedSeries, Money, ObservationMeta, Outcome, Price, Quote, Rate, RatingAction, ReportedFact,
-    SavedScenario, Statistic, Trade,
+    InstrumentType, ListedSeries, Money, ObservationMeta, Outcome, Price, Quote, Rate,
+    RatingAction, ReportedFact, SavedScenario, Statistic, Trade,
 };
 use meridian_pb::v1::Decimal;
 use prost::Message;
@@ -356,6 +356,23 @@ impl Observation {
     /// the latest in SQL.
     pub fn latest_key(&self) -> String {
         format!("{}\u{1f}{}", self.asset(), self.point())
+    }
+
+    /// What a listed series' row is listed by (contract v28, amended
+    /// 2026-10-28; ruling 856): its expiry, as a plain date where it states
+    /// one, and its listed type as recorded -- a future where it names a
+    /// product code, else an option, an option on a future record told at
+    /// read by its underlying. `None` for every other row. The Postgres
+    /// store keeps both beside the row, so an expirations read never reads
+    /// a series row whole.
+    pub fn listing(&self) -> Option<(Option<String>, InstrumentType)> {
+        match self {
+            Observation::Series(series) => Some((
+                crate::read::expires(series).map(|date| date.to_string()),
+                crate::read::listed_type(series),
+            )),
+            _ => None,
+        }
     }
 
     /// A bar's length; 0 for the other data types.

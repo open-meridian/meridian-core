@@ -51,6 +51,12 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "dataset_counts",
         sql: include_str!("../migrations/0006_dataset_counts.sql"),
     },
+    // An underlying's expirations read from the listing alone (856, 858).
+    Migration {
+        version: 7,
+        name: "listing",
+        sql: include_str!("../migrations/0007_listing.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

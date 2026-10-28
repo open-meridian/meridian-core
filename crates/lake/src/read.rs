@@ -36,7 +36,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use meridian_domain::date::Date;
-use meridian_domain::v1::{SourceChoice, SourcePriority, SourceTimeKind, Tenor, UnansweredReason};
+use meridian_domain::v1::{
+    InstrumentType, SourceChoice, SourcePriority, SourceTimeKind, Tenor, UnansweredReason,
+};
 use meridian_pb::v1::ObservationMode;
 
 use crate::config::{DataConfig, Reader};
@@ -155,6 +157,33 @@ pub fn expires(series: &meridian_domain::v1::ListedSeries) -> Option<Date> {
             .map(|field| field.value.clone())
     })
     .and_then(|date| Date::parse(&date).ok())
+}
+
+/// A listed series' type as its row states it (W1.24): a future names its
+/// product code, every other series is an option. An option whose
+/// underlying is a future record is a future option, told by the
+/// underlying ([`as_listed`]).
+pub fn listed_type(series: &meridian_domain::v1::ListedSeries) -> InstrumentType {
+    let product_code = series
+        .fields
+        .iter()
+        .any(|field| field.path == "product_code" && !field.value.is_empty());
+    if product_code {
+        InstrumentType::Future
+    } else {
+        InstrumentType::ListedOption
+    }
+}
+
+/// A series' type under its underlying (W1.24): an option on a future
+/// record is a future option; `underlying` is the record's type, 0 where
+/// the deployment holds none.
+pub fn as_listed(recorded: InstrumentType, underlying: i32) -> InstrumentType {
+    if recorded == InstrumentType::ListedOption && underlying == InstrumentType::Future as i32 {
+        InstrumentType::FutureOption
+    } else {
+        recorded
+    }
 }
 
 /// A series key as the window's listing is matched by: its scheme and
