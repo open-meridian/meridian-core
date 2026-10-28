@@ -654,6 +654,11 @@ e2e-cluster-upgrade:
 # without the restart the name resolves to nothing on a runner, and to the
 # desktop's own answer on a laptop, which hides the defect.
 #
+# The cluster is never put in this machine's kubeconfig, and the current
+# context is never switched to it (on 2026-10-28 a run left a person's
+# kubectl and `meridian` pointed at the test cluster): every step here reads
+# the cluster's own file, E2E_K3D_KUBECONFIG, as KUBECONFIG.
+#
 # Nothing uses the cluster until it is ready. `k3d cluster create --wait`
 # returns once the server has started, which is before k3s has made its own
 # deployments or its aggregated API answers, and on 2026-09-29 three runs
@@ -717,6 +722,7 @@ e2e-cluster-k3d:
 	  if $(K3D) cluster create $(E2E_K3D_CLUSTER) --network $(E2E_K3D_NETWORK) \
 		--host-alias $(E2E_K3D_GATEWAY):host.docker.internal \
 		--api-port $(E2E_K3D_API) -p "$(E2E_K3D_HTTP):80@loadbalancer" \
+		--kubeconfig-update-default=false --kubeconfig-switch-context=false \
 		--wait --timeout $(E2E_K3D_READY_SECONDS)s >>.e2e-k3d.log 2>&1; then made=yes; break; fi; \
 	  echo "e2e-cluster-k3d: making the cluster failed, attempt $$attempt of 2; the tail of .e2e-k3d.log:" >&2; \
 	  tail -20 .e2e-k3d.log >&2; \
