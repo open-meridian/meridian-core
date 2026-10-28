@@ -722,8 +722,16 @@ pub async fn badge(
     instance: &str,
 ) -> &'static str {
     let set_demo = DEMO_ENVIRONMENTS.contains(&environment_set(records, instance).as_str());
+    let reported = reported(bus, instance, mapped_codes(records, instance)).await;
+    badge_of(set_demo, &reported)
+}
+
+/// What each of these venue account codes' catalogues says the plugin's
+/// session reached (W11.20): empty for a code it has not published, or one
+/// that could not be read.
+async fn reported(bus: &meridian_bus::Bus, instance: &str, codes: Vec<String>) -> Vec<String> {
     let mut reported = Vec::new();
-    for code in mapped_codes(records, instance) {
+    for code in codes {
         let asked = bus
             .call(
                 READ_VENUE_CATALOGUE,
@@ -748,7 +756,77 @@ pub async fn badge(
                 .unwrap_or_default(),
         );
     }
-    badge_of(set_demo, &reported)
+    reported
+}
+
+/// The most venue account codes the home page asks about for one plugin.
+const HOME_CODES: usize = 8;
+
+/// The venue account codes a plugin's sessions may have published a
+/// catalogue under: those an `ems` mapped, and the external accounts linked
+/// to it or that it reports reaching -- a connectivity plugin's venue
+/// account code being the account custody reports it under.
+pub fn session_codes(
+    records: &AccessRecords,
+    reported: &[meridian_domain::v1::ExternalAccount],
+    instance: &str,
+) -> Vec<String> {
+    let mut codes = mapped_codes(records, instance);
+    codes.extend(
+        records
+            .links
+            .iter()
+            .filter(|link| link.plugin_instance_id == instance)
+            .map(|link| link.external_account_id.clone()),
+    );
+    codes.extend(
+        reported
+            .iter()
+            .map(|account| account.external_account_id.clone()),
+    );
+    codes.retain(|code| !code.trim().is_empty());
+    codes.sort();
+    codes.dedup();
+    codes.truncate(HOME_CODES);
+    codes
+}
+
+/// The home page's word for where a connection trades (ruling 831, its
+/// item 177): "Live" only where a session reported reaching a live
+/// environment; "Demo" where one reached sandbox or paper, or, with none
+/// reported yet, where it is set to; "Not reached yet" for a connection set
+/// live that has reported nothing. Never "environment not confirmed": what
+/// a session reached is said as it is. The agents' guard is unchanged: it
+/// still counts a connection demo only where both keys agree ([`badge_of`]).
+pub fn trading_word(set_demo: bool, reported: &[String]) -> &'static str {
+    if reported.iter().any(|environment| environment == "live") {
+        "Live"
+    } else if set_demo
+        || reported
+            .iter()
+            .any(|environment| DEMO_ENVIRONMENTS.contains(&environment.as_str()))
+    {
+        "Demo"
+    } else {
+        NOT_REACHED
+    }
+}
+
+/// A connection set live whose sessions have said nothing yet (ruling 831).
+pub const NOT_REACHED: &str = "Not reached yet";
+
+/// [`trading_word`] for a connectivity instance, from its setting and what
+/// its sessions reported under every code they may have published by.
+pub async fn trading(app: &App, records: &AccessRecords, instance: &str) -> &'static str {
+    let set_demo = DEMO_ENVIRONMENTS.contains(&environment_set(records, instance).as_str());
+    let heard = app.custody.view();
+    let accounts = heard
+        .reported
+        .get(instance)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let codes = session_codes(records, accounts, instance);
+    trading_word(set_demo, &reported(&app.bus, instance, codes).await)
 }
 
 /// The conductor's read of a venue's catalogue (W11.20), the dashboard's
@@ -981,6 +1059,72 @@ mod tests {
             "",
         );
         assert!(!page.contains("<form") && !page.contains("fix-2"));
+    }
+
+    #[test]
+    fn trading_is_live_only_where_a_session_reached_live_and_never_unconfirmed() {
+        // Ruling 831 (its item 177).
+        assert_eq!(trading_word(true, &["paper".into()]), "Demo");
+        assert_eq!(
+            trading_word(false, &["paper".into()]),
+            "Demo",
+            "reached paper"
+        );
+        assert_eq!(
+            trading_word(true, &[]),
+            "Demo",
+            "set demo, nothing reported yet"
+        );
+        assert_eq!(trading_word(true, &["".into()]), "Demo");
+        assert_eq!(trading_word(false, &[]), NOT_REACHED);
+        assert_eq!(trading_word(false, &["".into()]), NOT_REACHED);
+        assert_eq!(trading_word(false, &["live".into()]), "Live");
+        assert_eq!(trading_word(true, &["paper".into(), "live".into()]), "Live");
+        for set_demo in [true, false] {
+            for reported in [vec![], vec!["paper".to_string()], vec!["live".to_string()]] {
+                assert_ne!(trading_word(set_demo, &reported), LIVE_UNCONFIRMED);
+            }
+        }
+    }
+
+    #[test]
+    fn a_sessions_codes_are_the_mapped_the_linked_and_the_reported_accounts() {
+        let mut records = records();
+        records.venue_account_maps = vec![VenueAccountMap {
+            ems_instance_id: "ems-1".into(),
+            mappings: vec![VenueAccountMapping {
+                connectivity_instance_id: "fix-1".into(),
+                venue_account_code: "MAPPED-1".into(),
+                account_id: "ACC-1".into(),
+            }],
+        }];
+        records.links = vec![
+            meridian_domain::v1::ExternalAccountLink {
+                plugin_instance_id: "fix-1".into(),
+                external_account_id: "LINKED-1".into(),
+                account_id: "ACC-2".into(),
+                ..Default::default()
+            },
+            meridian_domain::v1::ExternalAccountLink {
+                plugin_instance_id: "fix-2".into(),
+                external_account_id: "OTHERS".into(),
+                ..Default::default()
+            },
+        ];
+        let reported = vec![
+            meridian_domain::v1::ExternalAccount {
+                external_account_id: "PRACTICE-1".into(),
+                ..Default::default()
+            },
+            meridian_domain::v1::ExternalAccount {
+                external_account_id: "LINKED-1".into(),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            session_codes(&records, &reported, "fix-1"),
+            vec!["LINKED-1", "MAPPED-1", "PRACTICE-1"]
+        );
     }
 
     #[test]

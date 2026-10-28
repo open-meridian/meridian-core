@@ -616,34 +616,181 @@ pub fn age_words(age_ns: i64) -> String {
     }
 }
 
-/// The home page's line for the provisional records (contract v24, W3.11):
-/// how many, and the oldest's age. Nothing when none.
-pub fn home_provisional(listed: Option<&ListInstrumentsToCompleteReply>, now_ns: i64) -> String {
-    let Some(listed) = listed else {
-        return String::new();
-    };
-    let records: Vec<&InstrumentRecord> = listed
-        .instruments
+/// What a person reads a record by on the home page: its ticker, or its
+/// name, or its ID.
+fn home_label(record: &InstrumentRecord) -> String {
+    record
+        .identifiers
         .iter()
-        .filter_map(|item| item.instrument.as_ref())
-        .filter(|record| record.provisional)
-        .collect();
-    if records.is_empty() {
+        .find(|identifier| identifier.scheme == "ticker" && !identifier.value.is_empty())
+        .map(|identifier| identifier.value.clone())
+        .or_else(|| Some(name_of(record)).filter(|name| !name.trim().is_empty()))
+        .unwrap_or_else(|| record.instrument_id.clone())
+}
+
+/// Where a record the book cannot use, or a provisional one, stands, as the
+/// home page says it (ruling 831): the platform's work, said as status, or
+/// the deployment's own, asked of a person only where the platform cannot
+/// resolve it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Standing {
+    /// The platform's staff or routine have it.
+    WithThePlatform,
+    /// Asked again once the platform is reached.
+    PlatformUnreached,
+    /// The deployment admin's own choice at the migration.
+    HeldBack,
+    /// Nothing the platform can look it up by, or no class to name its
+    /// template: only a person here can say what it is.
+    NeedsAPerson,
+}
+
+impl Standing {
+    fn of(item: &InstrumentToComplete) -> Self {
+        use meridian_domain::v1::ProvisionalReason;
+        let provisional = item
+            .instrument
+            .as_ref()
+            .is_some_and(|record| record.provisional);
+        if !provisional {
+            // A record the platform named that the book cannot use yet: the
+            // platform completes its own records.
+            return Standing::WithThePlatform;
+        }
+        match ProvisionalReason::try_from(item.provisional_reason) {
+            Ok(ProvisionalReason::AwaitingStaff) => Standing::WithThePlatform,
+            Ok(ProvisionalReason::Unreachable) => Standing::PlatformUnreached,
+            Ok(ProvisionalReason::HeldBack) => Standing::HeldBack,
+            _ => Standing::NeedsAPerson,
+        }
+    }
+
+    fn words(self) -> &'static str {
+        match self {
+            Standing::WithThePlatform => "waiting on the platform, usually within a day",
+            Standing::PlatformUnreached => {
+                "waiting on the platform, which this deployment cannot reach just now; asked \
+                 again once it can"
+            }
+            Standing::HeldBack => "held back at the migration",
+            Standing::NeedsAPerson => "the platform cannot resolve it, so it needs you",
+        }
+    }
+}
+
+/// How many names a home line spells out before "and N more".
+const HOME_NAMES: usize = 3;
+
+/// The home page's instrument-record lines, for the deployment admin alone
+/// (ruling 831; W3.11, contract v24): the records the book cannot use yet
+/// (`waiting`, one page of them, and its count across the deployment) and
+/// the provisional ones (`provisional`), each worded as where it stands --
+/// "SPY: waiting on the platform, usually within a day" -- never as a task.
+/// A person is asked only for what the platform cannot resolve. Nothing when
+/// nothing waits.
+pub fn home_status(
+    waiting: Option<&ListInstrumentsToCompleteReply>,
+    provisional: Option<&ListInstrumentsToCompleteReply>,
+) -> String {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut groups: std::collections::BTreeMap<Standing, Vec<String>> = Default::default();
+    // The provisional records first: their reason says who has them.
+    let provisional_items: Vec<&InstrumentToComplete> = provisional
+        .map(|listed| listed.instruments.iter().collect())
+        .unwrap_or_default();
+    let provisional_n = provisional_items
+        .iter()
+        .filter(|item| item.instrument.as_ref().is_some_and(|r| r.provisional))
+        .count();
+    let waiting_items = waiting
+        .map(|listed| {
+            listed
+                .instruments
+                .iter()
+                .filter(|item| !item.complete_for_book)
+        })
+        .into_iter()
+        .flatten();
+    for item in provisional_items
+        .into_iter()
+        .filter(|item| item.instrument.as_ref().is_some_and(|r| r.provisional))
+        .chain(waiting_items)
+    {
+        let Some(record) = item.instrument.as_ref() else {
+            continue;
+        };
+        if !seen.insert(record.instrument_id.clone()) {
+            continue;
+        }
+        groups
+            .entry(Standing::of(item))
+            .or_default()
+            .push(home_label(record));
+    }
+    // Records the book cannot use past the page read: counted with the
+    // platform's, unnamed.
+    let named_waiting = waiting
+        .map(|listed| {
+            listed
+                .instruments
+                .iter()
+                .filter(|item| !item.complete_for_book)
+                .count() as i64
+        })
+        .unwrap_or(0);
+    let unread = waiting
+        .map(|listed| (listed.incomplete_for_book - named_waiting).max(0) as usize)
+        .unwrap_or(0);
+    if groups.is_empty() && unread == 0 {
         return String::new();
     }
-    let oldest = records
-        .iter()
-        .map(|record| first_recorded_ns(record))
-        .min()
-        .unwrap_or(now_ns);
-    let n = records.len();
-    format!(
-        "<p class=\"notice\" id=\"provisional-records\" data-provisional=\"{n}\">{n} provisional \
-         instrument record{s}, the oldest {age}: local records, not priced, until the platform \
-         answers. <a href=\"/admin/instruments#provisional\">See why</a></p>",
-        s = if n == 1 { "" } else { "s" },
-        age = age_words(now_ns - oldest),
-    )
+    let mut out = String::new();
+    for (standing, mut names) in groups {
+        names.sort_by_key(|name| name.to_lowercase());
+        let extra = if standing == Standing::WithThePlatform {
+            unread
+        } else {
+            0
+        };
+        let more = names.len().saturating_sub(HOME_NAMES) + extra;
+        let shown: Vec<String> = names.iter().take(HOME_NAMES).map(|n| escape(n)).collect();
+        let who = match (shown.len(), more) {
+            (_, 0) if shown.len() > 1 => {
+                let (last, rest) = shown.split_last().expect("more than one");
+                format!("{} and {last}", rest.join(", "))
+            }
+            (_, 0) => shown.join(""),
+            (0, more) => format!("{more} record{}", if more == 1 { "" } else { "s" }),
+            (_, more) => format!("{} and {more} more", shown.join(", ")),
+        };
+        let n = names.len() + extra;
+        match standing {
+            Standing::NeedsAPerson => out.push_str(&format!(
+                "<p class=\"notice warn\" id=\"instruments-need-you\" data-need-you=\"{n}\">\
+                 {who}: {words}. <a href=\"/admin/instruments#provisional\">Open {it}</a></p>",
+                words = standing.words(),
+                it = if n == 1 { "it" } else { "them" },
+            )),
+            _ => out.push_str(&format!(
+                "<p class=\"notice\" data-instrument-status=\"{key}\" data-count=\"{n}\">\
+                 {who}: {words}.</p>",
+                key = match standing {
+                    Standing::WithThePlatform => "with-the-platform",
+                    Standing::PlatformUnreached => "platform-unreached",
+                    _ => "held-back",
+                },
+                words = standing.words(),
+            )),
+        }
+    }
+    // The provisional count, as the page's tab counts them, for whoever
+    // reads the page by its attributes.
+    if provisional_n > 0 {
+        out = format!(
+            "<div id=\"provisional-records\" data-provisional=\"{provisional_n}\">{out}</div>"
+        );
+    }
+    out
 }
 
 /// Whether the deployment holds a record by this ID, asked by the ID rather
@@ -1107,16 +1254,17 @@ fn lacks_words(lacks: &[i32]) -> String {
         .join(", ")
 }
 
-/// How many records the book cannot use, for the dashboard's home: a
-/// first-class number (spec/security-master-and-holdings.md). `None` when the
-/// instrument store did not answer.
-pub async fn incomplete_for_book(bus: &meridian_bus::Bus) -> Option<i64> {
+/// The records the book cannot use, one page of them and their count
+/// across the deployment, for the dashboard's home (ruling 831; a
+/// first-class number, spec/security-master-and-holdings.md). `None` when
+/// the instrument store did not answer.
+pub async fn waiting_for_home(bus: &meridian_bus::Bus) -> Option<ListInstrumentsToCompleteReply> {
     ask::<ListInstrumentsToCompleteReply>(
         bus,
         LIST_INSTRUMENTS_TO_COMPLETE,
         "meridian.v1.ListInstrumentsToCompleteRequest",
         ListInstrumentsToCompleteRequest {
-            page_size: 1,
+            page_size: 25,
             ..Default::default()
         },
         None,
@@ -1124,20 +1272,6 @@ pub async fn incomplete_for_book(bus: &meridian_bus::Bus) -> Option<i64> {
     )
     .await
     .ok()
-    .map(|listed| listed.incomplete_for_book)
-}
-
-/// The home page's line for a deployment admin, when records wait.
-pub fn home_notice(count: Option<i64>) -> String {
-    match count {
-        Some(0) | None => String::new(),
-        Some(n) => format!(
-            "<p class=\"notice warn\" id=\"instruments-waiting\">{n} instrument record{s} the book \
-             cannot use yet: {lack}. <a href=\"/admin/instruments\">Complete them</a></p>",
-            s = if n == 1 { "" } else { "s" },
-            lack = "an asset class or a currency is missing",
-        ),
-    }
 }
 
 /// The Instruments page (W3.11).
@@ -2732,12 +2866,95 @@ mod tests {
         assert!(page.contains("cannot use it"));
     }
 
+    fn ticker(value: &str) -> Identifier {
+        Identifier {
+            scheme: "ticker".into(),
+            value: value.into(),
+            source: "XNAS".into(),
+            ..Default::default()
+        }
+    }
+
+    fn to_complete(
+        id: &str,
+        name: &str,
+        provisional: Option<meridian_domain::v1::ProvisionalReason>,
+    ) -> InstrumentToComplete {
+        InstrumentToComplete {
+            instrument: Some(InstrumentRecord {
+                instrument_id: id.into(),
+                identifiers: vec![ticker(name)],
+                provisional: provisional.is_some(),
+                ..Default::default()
+            }),
+            provisional_reason: provisional.map(|r| r as i32).unwrap_or_default(),
+            ..Default::default()
+        }
+    }
+
     #[test]
-    fn the_home_says_how_many_wait_and_nothing_when_none_do() {
-        assert!(home_notice(Some(3)).contains("3 instrument records"));
-        assert!(home_notice(Some(1)).contains("1 instrument record the book"));
-        assert!(home_notice(Some(0)).is_empty());
-        assert!(home_notice(None).is_empty());
+    fn the_home_says_where_records_stand_and_asks_only_what_the_platform_cannot_resolve() {
+        use meridian_domain::v1::ProvisionalReason;
+        // Ruling 831: one record, said as status, no call to act.
+        let one = ListInstrumentsToCompleteReply {
+            instruments: vec![to_complete("INS-SPY", "SPY", None)],
+            incomplete_for_book: 1,
+            ..Default::default()
+        };
+        let home = home_status(Some(&one), None);
+        assert!(
+            home.contains("SPY: waiting on the platform, usually within a day."),
+            "{home}"
+        );
+        assert!(
+            !home.contains("Complete them") && !home.contains("<a "),
+            "{home}"
+        );
+        assert!(!home.contains("warn"), "status, not a warning: {home}");
+
+        // Several, and a provisional record only a person here can resolve.
+        let waiting = ListInstrumentsToCompleteReply {
+            instruments: vec![
+                to_complete("INS-SPY", "SPY", None),
+                to_complete("INS-QQQ", "QQQ", None),
+                to_complete("LCL-ACME", "ACME", Some(ProvisionalReason::Incomplete)),
+            ],
+            incomplete_for_book: 7,
+            ..Default::default()
+        };
+        let provisional = ListInstrumentsToCompleteReply {
+            instruments: vec![
+                to_complete("LCL-ACME", "ACME", Some(ProvisionalReason::Incomplete)),
+                to_complete("LCL-IWM", "IWM", Some(ProvisionalReason::AwaitingStaff)),
+                to_complete("LCL-DIA", "DIA", Some(ProvisionalReason::Unreachable)),
+            ],
+            ..Default::default()
+        };
+        let home = home_status(Some(&waiting), Some(&provisional));
+        assert!(home.contains("data-provisional=\"3\""), "{home}");
+        // SPY, QQQ, IWM named; the four past the page read counted.
+        assert!(
+            home.contains(
+                "IWM, QQQ, SPY and 4 more: waiting on the platform, usually within a day."
+            ),
+            "{home}"
+        );
+        assert!(home.contains("DIA: waiting on the platform, which this deployment cannot reach"));
+        assert!(
+            home.contains("ACME: the platform cannot resolve it, so it needs you.")
+                && home.contains("id=\"instruments-need-you\"")
+                && home.contains(">Open it</a>"),
+            "{home}"
+        );
+        assert_eq!(home.matches("ACME").count(), 1, "named once: {home}");
+
+        // Nothing waiting, nothing said.
+        assert!(home_status(None, None).is_empty());
+        assert!(home_status(
+            Some(&ListInstrumentsToCompleteReply::default()),
+            Some(&ListInstrumentsToCompleteReply::default())
+        )
+        .is_empty());
     }
 
     #[test]
@@ -2918,10 +3135,12 @@ mod provisional_tests {
         assert!(tab.contains(">3 days<"));
         assert!(tab.contains("Matched: <strong>4</strong>"));
         assert!(tab.contains("Still to send: <strong>1</strong>"));
-        let home = home_provisional(Some(&listed()), NOW);
+        let home = home_status(None, Some(&listed()));
         assert!(home.contains("data-provisional=\"2\""));
-        assert!(home.contains("the oldest 3 days"));
-        assert!(home_provisional(Some(&ListInstrumentsToCompleteReply::default()), NOW).is_empty());
+        assert!(
+            home.contains("ZZ Top Holdings: waiting on the platform, usually within a day"),
+            "{home}"
+        );
         // The page carries its tab and the usage report's form.
         let page = list_page_full(
             &Ok(ListInstrumentsToCompleteReply::default()),
