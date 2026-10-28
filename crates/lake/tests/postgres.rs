@@ -1384,6 +1384,101 @@ mod chain_page {
             load.total = started.elapsed();
             load
         }
+
+        /// The datasets' listing, as a plugin's first request after a
+        /// restart reads it (ruling 816: 1,068 ms on dev): its time.
+        pub async fn datasets(&self) -> Duration {
+            let at = Instant::now();
+            let _: (meridian_domain::v1::ListDatasetsReply, usize) = self
+                .ask(
+                    service::LIST_DATASETS,
+                    "meridian.v1.ListDatasetsRequest",
+                    meridian_domain::v1::ListDatasetsRequest::default(),
+                )
+                .await;
+            at.elapsed()
+        }
+
+        /// The chain page's reads as a targeted read makes them (rulings
+        /// 821 and 833, spec/one-data-access-model step 1): the shown
+        /// expiration's series with the drawn columns' paths, and its quotes
+        /// with all_series, the window and the fields the page shows. Each
+        /// read's calls, rows and time.
+        pub async fn targeted(&self, expiration: &str) -> Load {
+            let mut load = Load::default();
+            let started = Instant::now();
+            let (mut cursor, mut pages, mut rows) = (String::new(), 0, 0);
+            let at = Instant::now();
+            loop {
+                let (reply, bytes): (ListSeriesReply, usize) = self
+                    .ask(
+                        service::LIST_SERIES,
+                        "meridian.v1.ListSeriesRequest",
+                        ListSeriesRequest {
+                            subjects: self.subject(),
+                            expiration_from: expiration.into(),
+                            expiration_to: expiration.into(),
+                            paths: vec![
+                                "put_or_call".into(),
+                                "strike_price".into(),
+                                "expiration_date".into(),
+                            ],
+                            cursor: cursor.clone(),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                load.bytes += bytes;
+                pages += 1;
+                rows += reply.series.len();
+                cursor = reply.next_cursor;
+                if cursor.is_empty() {
+                    break;
+                }
+            }
+            load.series = (pages, rows, at.elapsed());
+            let (mut cursor, mut pages, mut rows) = (String::new(), 0, 0);
+            let at = Instant::now();
+            loop {
+                let (reply, bytes): (ListQuotesReply, usize) = self
+                    .ask(
+                        "platform.lake.query.list-quotes",
+                        "meridian.v1.ListQuotesRequest",
+                        ListQuotesRequest {
+                            subjects: self.subject(),
+                            sources: Some(SourceChoice {
+                                default: true,
+                                ..Default::default()
+                            }),
+                            all_series: true,
+                            expiration_from: expiration.into(),
+                            expiration_to: expiration.into(),
+                            fields: [
+                                "meridian.v1.Quote.bid",
+                                "meridian.v1.Quote.ask",
+                                "meridian.v1.Quote.bid_quantity",
+                                "meridian.v1.Quote.ask_quantity",
+                            ]
+                            .map(String::from)
+                            .to_vec(),
+                            page_size: 500,
+                            cursor: cursor.clone(),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                load.bytes += bytes;
+                pages += 1;
+                rows += reply.quotes.len();
+                cursor = reply.next_cursor;
+                if cursor.is_empty() {
+                    break;
+                }
+            }
+            load.quotes = (pages, rows, at.elapsed());
+            load.total = started.elapsed();
+            load
+        }
     }
 
     /// The process's resident memory and its high-water mark, in MiB (Linux).
@@ -1471,6 +1566,32 @@ async fn capacity_chain_page_reads() {
         let (rss, hwm) = memory();
         let (live, peak) = counted::take();
         println!("CAPACITY chain load={i} {} resolves={resolves} heap_live_mib={live:.1} heap_peak_mib={peak:.1} rss_mib={rss:.0} hwm_mib={hwm:.0}", said(&load));
+    }
+    // The datasets' listing (ruling 816), and the targeted reads of one
+    // expiration (ruling 821): the first expiration the fixture lists.
+    for i in 0..3 {
+        let took = page.datasets().await;
+        println!(
+            "CAPACITY chain list_datasets={i} ms={:.1}",
+            took.as_secs_f64() * 1e3
+        );
+    }
+    for i in 0..5 {
+        let before = page.resolves.load(std::sync::atomic::Ordering::Relaxed);
+        let load = page.targeted("2027-01-01").await;
+        let resolves = page.resolves.load(std::sync::atomic::Ordering::Relaxed) - before;
+        println!(
+            "CAPACITY chain targeted={i} calls={} total_ms={:.0} series={}p/{}r/{:.0}ms quotes={}p/{}r/{:.0}ms bytes={} resolves={resolves}",
+            load.series.0 + load.quotes.0,
+            load.total.as_secs_f64() * 1e3,
+            load.series.0,
+            load.series.1,
+            load.series.2.as_secs_f64() * 1e3,
+            load.quotes.0,
+            load.quotes.1,
+            load.quotes.2.as_secs_f64() * 1e3,
+            load.bytes,
+        );
     }
     let page = Arc::new(page);
     for round in 0..3 {
