@@ -908,3 +908,79 @@ async fn a_signal_plugins_derived_series_and_saved_scenarios_are_kept_and_read()
     assert_eq!(axes(&at(2)), 1);
     assert!(at(3).is_empty());
 }
+
+/// Rulings 798, 808: a read in pages answers its whole answer once, at the
+/// first page, and cuts each page after it from that answer, held until the
+/// last page is read; the pages are the answer a single read gives. A change
+/// to the configuration between pages is answered afresh, never from what
+/// was held under the old one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_in_pages_is_answered_once_and_held_until_its_last_page() {
+    let h = harness();
+    let keys: Vec<String> = (0..250)
+        .map(|i| format!("AAPL  261120C{:08}", 100_000 + i * 1000))
+        .collect();
+    let rows: Vec<Observation> = keys
+        .iter()
+        .map(|key| Observation::Quote(quote(key, "1.00", "1.10", NOW - HOUR)))
+        .collect();
+    for chunk in rows.chunks(100) {
+        record(&h, "quotes", chunk.to_vec()).unwrap();
+    }
+    let page = |cursor: &str, size: u32| {
+        tokio::task::block_in_place(|| {
+            h.lake.read(
+                ReadRequest {
+                    data_type: DataType::Quote,
+                    subjects: subjects(AAPL),
+                    kinds: vec![],
+                    interval_ns: 0,
+                    sources: None,
+                    at_ns: 0,
+                    business_date: String::new(),
+                    valid_from_ns: 0,
+                    valid_until_ns: 0,
+                    as_of_ns: 0,
+                    page_size: size,
+                    cursor: cursor.into(),
+                    after: None,
+                    tenors: vec![],
+                    published_as_of_ns: 0,
+                    series_keys: vec![],
+                    all_series: true,
+                    dates: None,
+                },
+                &envelope("signal-1"),
+            )
+        })
+        .unwrap()
+    };
+    let key_of = |row: &Observation| row.meta().series_key[0].value.clone();
+    let whole: Vec<String> = page("", 500).rows.iter().map(key_of).collect();
+    assert_eq!(whole.len(), 250);
+    assert_eq!(h.lake.held_pages(), 0, "one page: nothing held");
+    let first = page("", 100);
+    assert_eq!(h.lake.held_pages(), 1, "held for the pages after it");
+    let second = page(&first.next_cursor, 100);
+    assert_eq!(h.lake.held_pages(), 1);
+    let third = page(&second.next_cursor, 100);
+    assert!(third.next_cursor.is_empty());
+    assert_eq!(h.lake.held_pages(), 0, "the last page read: let go");
+    let paged: Vec<String> = [first.rows, second.rows, third.rows]
+        .iter()
+        .flatten()
+        .map(key_of)
+        .collect();
+    assert_eq!(paged, whole, "the pages are the one answer");
+    // A change to the entitlements between pages: what was held is not
+    // served; the page is answered afresh under the change.
+    let first = page("", 100);
+    let mut withdrawn = configuration();
+    withdrawn.entitlements.retain(|e| e.dataset != CHAIN);
+    h.lake.configured(&withdrawn);
+    let after = page(&first.next_cursor, 100);
+    assert!(
+        after.rows.is_empty(),
+        "not entitled now: nothing served from the held answer"
+    );
+}

@@ -236,6 +236,13 @@ const VERSIONS_FOR_NS: i64 = 300 * 1_000_000_000;
 /// reader"; ruling 734): within every reader's own read timeout.
 pub const SERVED_WAIT: Duration = Duration::from_secs(3);
 
+/// How many series' records a ListSeries asks the instrument store at once.
+const SERIES_ASKED_AT_ONCE: usize = 32;
+
+/// The most series records remembered; past it they are forgotten and
+/// asked again.
+const SERIES_RECORDS_KEPT: usize = 200_000;
+
 /// What a read waiting on a want of a dataset served, not kept, hears
 /// (ruling 734): the rows served for it, or the subjects declined.
 #[derive(Debug, Clone)]
@@ -306,6 +313,14 @@ pub struct Lake {
     /// and venue. Not a row, never kept as one: measurement a data plugin
     /// sends again within seconds, so a restart loses nothing it needs.
     liveness: Mutex<BTreeMap<(String, String), meridian_domain::v1::DatasetLiveness>>,
+    /// A read's answer held for its next pages (rulings 798, 808).
+    pages: Mutex<crate::pages::Held>,
+    /// Moved by every change a held answer was answered under -- the
+    /// entitlements, the licences, a priority -- so none is served after it.
+    generation: std::sync::atomic::AtomicU64,
+    /// Each series key's record the instrument store holds, once it holds
+    /// one (W3.1): a record's ID is never another's.
+    series_records: Mutex<BTreeMap<String, String>>,
 }
 
 /// The analytics component's instance where nothing names another (W12.2).
@@ -403,7 +418,15 @@ impl Lake {
             cash: Mutex::new(CashInstruments::default()),
             versions: Mutex::new((BTreeMap::new(), 0)),
             liveness: Mutex::new(BTreeMap::new()),
+            pages: Mutex::new(crate::pages::Held::default()),
+            generation: std::sync::atomic::AtomicU64::new(0),
+            series_records: Mutex::new(BTreeMap::new()),
         })
+    }
+
+    /// How many reads' answers are held for their next pages.
+    pub fn held_pages(&self) -> usize {
+        self.pages.lock().expect("pages poisoned").len()
     }
 
     pub fn config(&self) -> DataConfig {
@@ -2118,6 +2141,17 @@ impl Lake {
         wants: bool,
         narrowed: read::Narrowed,
     ) -> Result<ReadAnswer, String> {
+        // What a held answer is found by (rulings 798, 808): this read, but
+        // for its page, and the configuration it is answered under.
+        let held_as = {
+            let mut asked = request.clone();
+            asked.cursor.clear();
+            asked.page_size = 0;
+            format!(
+                "{}|{wants}|{reader:?}|{narrowed:?}|{asked:?}",
+                self.generation.load(std::sync::atomic::Ordering::SeqCst)
+            )
+        };
         if !bounds::LIST_PRICES_REQUEST_SUBJECTS_COUNT.admits(request.subjects.len()) {
             return Err(format!(
                 "subjects names {}; 1 to 500",
@@ -2311,6 +2345,15 @@ impl Lake {
                 when = When::Range { from_ns, until_ns };
             }
         }
+        let held_as = format!("{as_of}|{held_as}");
+        let held = (offset > 0)
+            .then(|| {
+                self.pages
+                    .lock()
+                    .expect("pages poisoned")
+                    .find(&held_as, std::time::Instant::now())
+            })
+            .flatten();
         let priorities = self
             .store
             .priorities()
@@ -2351,30 +2394,17 @@ impl Lake {
             aliases: &aliases,
             now_ns: self.clock.now_ns(),
         };
-        let mut answered = read::answer(self.store.as_ref(), &read, &against)?;
-        // A dataset served, not kept (W10.7; ruling 734): the read that
-        // asked hears what is served within its wait; any other is told it
-        // is not kept, never asked forever.
-        let served = if offset == 0 && wants {
-            // A subject another dataset answered is not waited for.
-            let answering: BTreeSet<String> = answered
-                .rows
-                .iter()
-                .flat_map(|row| row.subjects())
-                .collect();
-            let waitings = self
-                .want(answered.asks.clone(), &reader)
-                .into_iter()
-                .filter_map(|mut waiting| {
-                    waiting.subjects.retain(|s| !answering.contains(s));
-                    (!waiting.subjects.is_empty()).then_some(waiting)
-                })
-                .collect();
-            self.wait_for_served(waitings)
-        } else {
-            BTreeMap::new()
+        // A later page cut from the answer its first page made, where it is
+        // held; otherwise the whole read is answered again, as one.
+        let whole = match held {
+            Some(whole) => whole,
+            None => Arc::new(self.answer_whole(&read, &against, offset, wants, &reader)?),
         };
-        read::with_served(&read, &against, &mut answered, served);
+        let mut answered = read::Answered {
+            rows: Vec::new(),
+            not_served: whole.not_served.clone(),
+            asks: Vec::new(),
+        };
         // What a catch-up cannot answer, per partition it named (contract
         // v19): a dataset not read, one not kept, or rows since the
         // watermark that retention removed.
@@ -2416,9 +2446,19 @@ impl Lake {
                 }
             }
         }
-        let total = answered.rows.len();
-        let rows: Vec<Observation> = answered.rows.into_iter().skip(offset).take(page).collect();
+        let total = whole.rows.len();
+        let rows: Vec<Observation> = whole.rows.iter().skip(offset).take(page).cloned().collect();
         let next = (offset + rows.len() < total).then(|| cursor(as_of, offset + rows.len()));
+        {
+            let mut pages = self.pages.lock().expect("pages poisoned");
+            if next.is_none() {
+                pages.forget(&held_as);
+            } else if offset == 0 {
+                pages.hold(held_as, Arc::clone(&whole), std::time::Instant::now());
+            }
+        }
+        drop(whole);
+        noted_read(read.data_type, total, rows.len());
         let datasets: BTreeSet<String> = rows.iter().map(|r| r.dataset().to_string()).collect();
         let heads = self.store.heads().map_err(|failed| failed.to_string())?;
         let mut answered_from: BTreeSet<String> = datasets.clone();
@@ -2453,6 +2493,47 @@ impl Lake {
                 .collect(),
             watermark: watermark(&heads, &answered_from),
             next_cursor: next.unwrap_or_default(),
+        })
+    }
+
+    /// A read's whole answer, before its page is cut: the rows it finds,
+    /// and what a dataset served, not kept, serves the first page's read
+    /// within its wait (W10.7; ruling 734).
+    fn answer_whole(
+        &self,
+        read: &Read,
+        against: &Against<'_>,
+        offset: usize,
+        wants: bool,
+        reader: &Reader,
+    ) -> Result<crate::pages::Whole, String> {
+        let mut answered = read::answer(self.store.as_ref(), read, against)?;
+        // A dataset served, not kept (W10.7; ruling 734): the read that
+        // asked hears what is served within its wait; any other is told it
+        // is not kept, never asked forever.
+        let served = if offset == 0 && wants {
+            // A subject another dataset answered is not waited for.
+            let answering: BTreeSet<String> = answered
+                .rows
+                .iter()
+                .flat_map(|row| row.subjects())
+                .collect();
+            let waitings = self
+                .want(answered.asks.clone(), reader)
+                .into_iter()
+                .filter_map(|mut waiting| {
+                    waiting.subjects.retain(|s| !answering.contains(s));
+                    (!waiting.subjects.is_empty()).then_some(waiting)
+                })
+                .collect();
+            self.wait_for_served(waitings)
+        } else {
+            BTreeMap::new()
+        };
+        read::with_served(read, against, &mut answered, served);
+        Ok(crate::pages::Whole {
+            rows: answered.rows,
+            not_served: answered.not_served,
         })
     }
 
@@ -2624,7 +2705,7 @@ impl Lake {
                 }
             }
             for row in answer.rows {
-                let Observation::Series(mut listed) = row else {
+                let Observation::Series(listed) = row else {
                     continue;
                 };
                 let meta = listed.meta.clone().unwrap_or_default();
@@ -2673,7 +2754,6 @@ impl Lake {
                         continue;
                     }
                 }
-                listed.instrument_id = self.series_record(&meta.series_key);
                 series.push(listed);
             }
             if answer.next_cursor.is_empty() || series.len() as u32 >= want {
@@ -2681,6 +2761,21 @@ impl Lake {
             }
             cursor = answer.next_cursor;
         };
+        // Each series' record, asked of the instrument store together
+        // rather than one round trip a row (ruling 808).
+        let keys: Vec<Vec<Identifier>> = series
+            .iter()
+            .map(|listed| {
+                listed
+                    .meta
+                    .as_ref()
+                    .map(|meta| meta.series_key.clone())
+                    .unwrap_or_default()
+            })
+            .collect();
+        for (listed, record) in series.iter_mut().zip(self.series_records(keys)) {
+            listed.instrument_id = record;
+        }
         Ok(ListSeriesReply {
             series,
             unanswered,
@@ -2690,26 +2785,87 @@ impl Lake {
         })
     }
 
-    /// The deployment's record for a series key, matched read-only by the
-    /// instrument store (W3.1): empty where none is held, never minted
-    /// (ruling 561).
-    fn series_record(&self, key: &[Identifier]) -> String {
-        if key.is_empty() {
-            return String::new();
+    /// The deployment's record for each series key, matched read-only by
+    /// the instrument store (W3.1): empty where none is held, never minted
+    /// (ruling 561). Asked [`SERIES_ASKED_AT_ONCE`] at a time rather than
+    /// one round trip a row (a page of a 1,440-series chain was 1.4 s of
+    /// them, ruling 808), and a record found remembered: a record's ID is
+    /// never another series'. One not held is asked again each read, so a
+    /// series whose record is made later reads it at once.
+    fn series_records(&self, keys: Vec<Vec<Identifier>>) -> Vec<String> {
+        let name = |key: &[Identifier]| {
+            key.iter()
+                .map(|i| format!("{}\u{1f}{}", i.scheme, i.value))
+                .collect::<Vec<_>>()
+                .join("\u{1e}")
+        };
+        let mut out: Vec<String> = {
+            let known = self.series_records.lock().expect("series records poisoned");
+            keys.iter()
+                .map(|key| known.get(&name(key)).cloned().unwrap_or_default())
+                .collect()
+        };
+        let asking: Vec<usize> = (0..keys.len())
+            .filter(|&i| out[i].is_empty() && !keys[i].is_empty())
+            .collect();
+        if asking.is_empty() {
+            return out;
         }
-        let reply: Result<ResolveIdentifierReply, String> = self.ask(
-            RESOLVE_IDENTIFIER,
-            "meridian.v1.ResolveIdentifierRequest",
-            ResolveIdentifierRequest {
-                identifiers: key.to_vec(),
-                as_of_ns: self.clock.now_ns(),
-                ..Default::default()
-            },
-        );
-        match reply {
-            Ok(reply) if reply.found && !reply.minted && !reply.provisional => reply.instrument_id,
-            _ => String::new(),
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return out;
+        };
+        let now = self.clock.now_ns();
+        for chunk in asking.chunks(SERIES_ASKED_AT_ONCE) {
+            let mut asked = tokio::task::JoinSet::new();
+            for &i in chunk {
+                let bus = Arc::clone(&self.bus);
+                let request = ResolveIdentifierRequest {
+                    identifiers: keys[i].clone(),
+                    as_of_ns: now,
+                    ..Default::default()
+                }
+                .encode_to_vec();
+                asked.spawn_on(
+                    async move {
+                        let answered = bus
+                            .call(
+                                RESOLVE_IDENTIFIER,
+                                "meridian.v1.ResolveIdentifierRequest",
+                                request,
+                                None,
+                                Some(ASKING),
+                            )
+                            .await;
+                        (i, answered)
+                    },
+                    &handle,
+                );
+            }
+            let answers = handle.block_on(async move {
+                let mut answers = Vec::new();
+                while let Some(joined) = asked.join_next().await {
+                    if let Ok(answer) = joined {
+                        answers.push(answer);
+                    }
+                }
+                answers
+            });
+            let mut known = self.series_records.lock().expect("series records poisoned");
+            if known.len() > SERIES_RECORDS_KEPT {
+                known.clear();
+            }
+            for (i, answered) in answers {
+                let Ok((_, payload)) = answered else { continue };
+                let Ok(reply) = ResolveIdentifierReply::decode(&payload[..]) else {
+                    continue;
+                };
+                if reply.found && !reply.minted && !reply.provisional {
+                    known.insert(name(&keys[i]), reply.instrument_id.clone());
+                    out[i] = reply.instrument_id;
+                }
+            }
         }
+        out
     }
 
     /// W10.6, contract v28 (G11): statistics for 1 to 64 subjects, by kind,
@@ -3445,6 +3601,8 @@ impl Lake {
             .map_err(|failed| failed.to_string())?
         {
             Ok(set) => {
+                self.generation
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 tracing::info!(data_type = set.data_type, kind = set.kind, by = set.updated_by, "a source priority set");
                 Ok(set)
             }
@@ -3526,6 +3684,8 @@ impl Lake {
     /// The data configuration heard, applied and kept.
     pub fn configured(&self, event: &EntitlementsChangedEvent) {
         *self.config.write().expect("config poisoned") = DataConfig::from_event(event);
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if let Err(failed) = self.store.keep_configuration(event) {
             tracing::warn!(%failed, "the data configuration was not kept");
         }
@@ -3895,6 +4055,7 @@ fn quote_refused(at: &str, quote: &meridian_domain::v1::Quote) -> Result<(), Str
 
 /// A read's request: prices', bars', and from contract v19 trades' or
 /// quotes'.
+#[derive(Debug, Clone)]
 pub struct ReadRequest {
     pub data_type: DataType,
     pub subjects: Vec<SubjectRef>,
@@ -3959,6 +4120,20 @@ fn cursor_of(text: &str) -> Result<Option<(i64, usize)>, String> {
     }
 }
 
+thread_local! {
+    /// The read a handler on this thread answered last: its kind, the rows
+    /// its whole answer held and the rows its page carried, for the line
+    /// [`serve_on`] logs (ruling 798). Each handler runs on one thread
+    /// from its start to its answer.
+    static READ_NOTED: std::cell::Cell<Option<(DataType, usize, usize)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Note a read for the line its handler logs.
+fn noted_read(kind: DataType, whole: usize, page: usize) {
+    READ_NOTED.with(|noted| noted.set(Some((kind, whole, page))));
+}
+
 fn serve_on<Req, Rep, F>(
     bus: &Arc<Bus>,
     lake: &Arc<Lake>,
@@ -3972,9 +4147,37 @@ fn serve_on<Req, Rep, F>(
 {
     let (request_type, reply_type) = types;
     let lake = Arc::clone(lake);
+    // A read's line (ruling 798): its topic and kind, the rows its whole
+    // answer held and the rows its page carried, the bytes answered and its
+    // time; never a row, a subject or who asked.
+    let read = topic.contains(".query.");
     bus.serve(topic, move |envelope| {
+        let started = std::time::Instant::now();
+        if read {
+            READ_NOTED.with(|noted| noted.set(None));
+        }
         let request: Req = decode(&envelope, request_type)?;
-        let reply = handle(&lake, request, &envelope)?;
+        let answered = handle(&lake, request, &envelope);
+        if read {
+            let noted = READ_NOTED.with(std::cell::Cell::take);
+            let (kind, whole, page) = noted
+                .map(|(kind, whole, page)| (kind.name(), whole, page))
+                .unwrap_or(("", 0, 0));
+            let ms = started.elapsed().as_secs_f64() * 1e3;
+            match &answered {
+                Ok(reply) => tracing::info!(
+                    topic,
+                    kind,
+                    rows = page,
+                    of = whole,
+                    bytes = reply.encoded_len(),
+                    ms = format!("{ms:.1}"),
+                    "a read answered"
+                ),
+                Err(_) => tracing::info!(topic, kind, ms = format!("{ms:.1}"), "a read refused"),
+            }
+        }
+        let reply = answered?;
         Ok((reply_type.to_string(), reply.encode_to_vec()))
     });
 }
