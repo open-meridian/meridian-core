@@ -267,6 +267,20 @@ def node_backups():
     return sorted(line for line in done.stdout.decode().split() if line.endswith(".meridian-backup"))
 
 
+def scheduled_runs():
+    """The CronJob's own Jobs, oldest first: not the ones `meridian backup` makes."""
+    jobs = json.loads(out("get", "jobs", "-l", "meridian.dev/component=backup", "-o", "json"))["items"]
+    jobs = [j for j in jobs
+            if not j["metadata"].get("annotations", {}).get("cronjob.kubernetes.io/instantiate")]
+    jobs.sort(key=lambda j: j["metadata"]["creationTimestamp"])
+    return jobs
+
+
+def finished(job):
+    return any(c["type"] in ("Complete", "Failed") and c["status"] == "True"
+               for c in job["status"].get("conditions", []))
+
+
 def first_run_job():
     """The first-run Job's manifest, as the chart made it."""
     jobs = json.loads(out("get", "jobs", "-l", f"app.kubernetes.io/instance={RELEASE}", "-o", "json"))["items"]
@@ -406,6 +420,12 @@ def main():
             f"postgres://meridian_migrate:{migrating}@{host}:5432/meridian?sslmode=disable".encode()).decode(),
     }
     kubectl("replace", "-f", "-", input=json.dumps(database).encode())
+    # A scheduled run made before this has no database to back up, and says
+    # so: "no database yet ... the keys and values alone", no counts. With a
+    # run every minute, one can start in the seconds between the install and
+    # here (CI runs 40235294905, 40448007851 and 40614116769, each where C
+    # began 2-6s before a minute). E reads a run made after.
+    before_the_url = {j["metadata"]["name"] for j in scheduled_runs()}
     addresses = json.loads(out("get", "secret", "meridian-addresses", "-o", "json"))
     addresses["data"] = {
         "dashboard-url": base64.b64encode(b"http://backup-e2e.localhost").decode(),
@@ -462,28 +482,24 @@ def main():
     s.check(bool(key_before), "the conductor holds the deployment's key")
 
     print("E: backed up on the schedule, then by `meridian backup --to`", flush=True)
-    def completed():
-        """The scheduled runs that finished, by name, oldest first."""
-        jobs = json.loads(out("get", "jobs", "-l", "meridian.dev/component=backup", "-o", "json"))["items"]
-        done = [j for j in jobs if j["status"].get("succeeded")
-                and not j["metadata"].get("annotations", {}).get("cronjob.kubernetes.io/instantiate")]
-        done.sort(key=lambda j: j["status"].get("completionTime", ""))
-        return [j["metadata"]["name"] for j in done]
-    wait_for("a scheduled backup", lambda: bool(completed()), seconds=200)
+    def succeeded_with_the_url():
+        """The scheduled runs made after the database's URL was written that succeeded, oldest first."""
+        return [j["metadata"]["name"] for j in scheduled_runs()
+                if j["status"].get("succeeded") and j["metadata"]["name"] not in before_the_url]
+    wait_for("a scheduled backup made after the database's URL was written",
+             lambda: bool(succeeded_with_the_url()), seconds=200)
     s.check(True, "the CronJob wrote a backup on its schedule")
-    # The completed run's own log: a later scheduled run may be mid-flight,
-    # and the CronJob's label reaches its pod too, which has not yet said
-    # what it wrote (flaked 2026-10-25, run 40235294905).
-    finished = completed()[0]
-    pods = out("get", "pods", "-l", f"job-name={finished}",
+    # Suspended, and every run it made finished, before a log is read: the
+    # CronJob keeps one succeeded Job (successfulJobsHistoryLimit), and a
+    # later run finishing deletes the earlier one, its pod with it.
+    kubectl("patch", "cronjob", f"{FULL}-backup", "--type=merge", "-p", '{"spec":{"suspend":true}}')
+    wait_for("the scheduled runs to finish", lambda: all(finished(j) for j in scheduled_runs()), seconds=120)
+    newest = succeeded_with_the_url()[-1]
+    pods = out("get", "pods", "-l", f"job-name={newest}",
                "--field-selector=status.phase=Succeeded", "-o", "name").split()
     log = out("logs", pods[0], "--tail=-1") if pods else ""
     s.check("backup: wrote " in log and "tables" in log, "and said what it wrote, names and counts only")
-    s.check(SECRET_VALUE not in log and recipient not in log, "and printed no secret")
-    kubectl("patch", "cronjob", f"{FULL}-backup", "--type=merge", "-p", '{"spec":{"suspend":true}}')
-    wait_for("the scheduled runs to finish", lambda: not out(
-        "get", "pods", "-l", "meridian.dev/component=backup",
-        "--field-selector=status.phase=Running", "-o", "name"), seconds=120)
+    s.check(bool(log) and SECRET_VALUE not in log and recipient not in log, "and printed no secret")
     # What the backup below holds, read just before it.
     before = held()
     done = cli(workdir, "backup", "--release", RELEASE, "-n", NAMESPACE, "--to", "/work")
