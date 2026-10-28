@@ -153,6 +153,8 @@ pub fn router(app: Arc<App>) -> Router {
         )
         .route("/plugins/{instance}/enter", get(crate::plugins::open))
         .with_state(Arc::clone(&app))
+        // The route each request matched, for its timing line (ruling 798).
+        .route_layer(axum::middleware::from_fn(crate::timing::named))
         // The dashboard's pages are framed by nobody but itself: a plugin's
         // page, on a host below this one, could otherwise frame the admin
         // portal under something of its own and have a click land on it.
@@ -163,8 +165,14 @@ pub fn router(app: Arc<App>) -> Router {
         // Outermost, so a request for a plugin's host meets none of the
         // dashboard's pages, whatever its path.
         .layer(axum::middleware::from_fn_with_state(
-            app,
+            Arc::clone(&app),
             crate::plugins::on_plugin_host,
+        ))
+        // Outermost of all: each request's timing line (ruling 798), a
+        // plugin's host's included.
+        .layer(axum::middleware::from_fn_with_state(
+            app,
+            crate::timing::timed,
         ))
 }
 

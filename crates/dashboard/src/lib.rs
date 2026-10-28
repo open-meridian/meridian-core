@@ -49,6 +49,7 @@ pub mod session;
 pub mod signing;
 pub mod terminal;
 pub mod tickets;
+pub mod timing;
 pub mod web;
 
 /// A version's declaration as the SDK prints it, the domain's (contract v25).
