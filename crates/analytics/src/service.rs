@@ -382,20 +382,34 @@ impl Coordinator {
                 Ok(answer) => crate::pages::page(answer, &request, self.config.page_budget),
                 Err(refused) => Err(refused.clone()),
             },
+            // Another instance's job is not this caller's to know of: answered
+            // as one not held (the fixture's NOT_FOUND), never naming whose.
             Some(_) => Err(refusal_with_status(
-                RefusalStatus::PermissionDenied,
+                RefusalStatus::NotFound,
                 &["job_id".to_string()],
-                format!("{} was run by another instance", request.job_id),
+                format!(
+                    "{} is not held for this instance: it is still running, or it is not \
+                     one this instance ran",
+                    request.job_id
+                ),
             )),
-            None if !request.cursor.is_empty() => Err(format!(
-                "{} is not held: its answer left the component's cache between pages, and \
-                 the job is run again (Q12)",
-                request.job_id
+            None if !request.cursor.is_empty() => Err(refusal_with_status(
+                RefusalStatus::NotFound,
+                &["job_id".to_string()],
+                format!(
+                    "{} is not held: its answer left the component's cache between pages, \
+                     and the job is run again (Q12)",
+                    request.job_id
+                ),
             )),
-            None => Err(format!(
-                "{} is not held: it is still running, or its answer has left the component's \
-                 cache and the job is run again (Q12)",
-                request.job_id
+            None => Err(refusal_with_status(
+                RefusalStatus::NotFound,
+                &["job_id".to_string()],
+                format!(
+                    "{} is not held: it is still running, or its answer has left the \
+                     component's cache and the job is run again (Q12)",
+                    request.job_id
+                ),
             )),
         }
     }

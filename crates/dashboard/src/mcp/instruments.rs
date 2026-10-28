@@ -1216,6 +1216,7 @@ pub(super) async fn ask<R: Message + Default>(
                 match status {
                     meridian_bus::RefusalStatus::InvalidArgument => "invalid_arguments",
                     meridian_bus::RefusalStatus::PermissionDenied => "not_permitted",
+                    meridian_bus::RefusalStatus::NotFound => "not_found",
                 }
                 .into(),
                 words.to_string(),

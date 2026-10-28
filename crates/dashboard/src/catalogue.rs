@@ -993,6 +993,7 @@ fn registry_refused(reason: &str) -> Response {
             match status {
                 meridian_bus::RefusalStatus::PermissionDenied => StatusCode::FORBIDDEN,
                 meridian_bus::RefusalStatus::InvalidArgument => StatusCode::BAD_REQUEST,
+                meridian_bus::RefusalStatus::NotFound => StatusCode::NOT_FOUND,
             },
             serde_json::json!({"error": words, "fields": fields}),
         ),

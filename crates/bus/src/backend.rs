@@ -105,7 +105,9 @@ pub fn refusal_fields(detail: &str) -> Vec<String> {
 /// (contract v22): a command a component reads as malformed, naming each
 /// field (`INVALID_ARGUMENT`), or one whose record's account is outside the
 /// write scope the sidecar stamped (`PERMISSION_DENIED`, W4.9; the
-/// order-path plan's protos, point 8). The sidecar sends the status beside
+/// order-path plan's protos, point 8), or a record the component does not
+/// hold for its caller (`NOT_FOUND`: an analytics job's answer no longer
+/// held, or another instance's). The sidecar sends the status beside
 /// a refusal with no code and the fields named, as it sends its own.
 /// Carried at the front of the words, as a reason code is:
 /// `[refusal-status invalid-argument fields=quantity;cash_quantity] words`.
@@ -116,6 +118,7 @@ const REFUSAL_STATUS_PREFIX: &str = "[refusal-status ";
 pub enum RefusalStatus {
     InvalidArgument,
     PermissionDenied,
+    NotFound,
 }
 
 impl RefusalStatus {
@@ -123,6 +126,7 @@ impl RefusalStatus {
         match self {
             RefusalStatus::InvalidArgument => "invalid-argument",
             RefusalStatus::PermissionDenied => "permission-denied",
+            RefusalStatus::NotFound => "not-found",
         }
     }
 }
@@ -163,6 +167,7 @@ pub fn read_refusal_status(detail: &str) -> Option<(RefusalStatus, Vec<String>, 
     let status = match word {
         "invalid-argument" => RefusalStatus::InvalidArgument,
         "permission-denied" => RefusalStatus::PermissionDenied,
+        "not-found" => RefusalStatus::NotFound,
         _ => return None,
     };
     Some((status, fields, words))
@@ -188,6 +193,11 @@ mod refusal_status_tests {
         assert_eq!(
             read_refusal_status(&denied).map(|(status, fields, _)| (status, fields.len())),
             Some((RefusalStatus::PermissionDenied, 0))
+        );
+        let gone = refusal_with_status(RefusalStatus::NotFound, &["job_id".into()], "not held");
+        assert_eq!(
+            read_refusal_status(&gone).map(|(status, fields, _)| (status, fields)),
+            Some((RefusalStatus::NotFound, vec!["job_id".to_string()]))
         );
         assert!(read_refusal_status("[refusal-reason 21] words").is_none());
     }

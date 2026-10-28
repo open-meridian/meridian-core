@@ -1492,6 +1492,7 @@ pub(crate) fn refused(failed: BusError) -> Status {
                 match status {
                     meridian_bus::RefusalStatus::InvalidArgument => Code::InvalidArgument,
                     meridian_bus::RefusalStatus::PermissionDenied => Code::PermissionDenied,
+                    meridian_bus::RefusalStatus::NotFound => Code::NotFound,
                 },
                 words.to_string(),
                 RefusalReason::Unspecified,
