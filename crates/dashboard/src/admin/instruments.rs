@@ -676,6 +676,16 @@ impl Standing {
             Standing::NeedsAPerson => "the platform cannot resolve it, so it needs you",
         }
     }
+
+    /// The same, for several records.
+    fn words_for(self, n: usize) -> &'static str {
+        match self {
+            Standing::NeedsAPerson if n != 1 => {
+                "the platform cannot resolve them, so they need you"
+            }
+            standing => standing.words(),
+        }
+    }
 }
 
 /// How many names a home line spells out before "and N more".
@@ -744,7 +754,10 @@ pub fn home_status(
     if groups.is_empty() && unread == 0 {
         return String::new();
     }
-    let mut out = String::new();
+    // Where the platform has them, one line of a sentence each; what needs
+    // a person, a line of its own, the one that asks.
+    let mut status = Vec::new();
+    let mut asked = String::new();
     for (standing, mut names) in groups {
         names.sort_by_key(|name| name.to_lowercase());
         let extra = if standing == Standing::WithThePlatform {
@@ -764,25 +777,33 @@ pub fn home_status(
             (_, more) => format!("{} and {more} more", shown.join(", ")),
         };
         let n = names.len() + extra;
+        let words = standing.words_for(n);
         match standing {
-            Standing::NeedsAPerson => out.push_str(&format!(
-                "<p class=\"notice warn\" id=\"instruments-need-you\" data-need-you=\"{n}\">\
-                 {who}: {words}. <a href=\"/admin/instruments#provisional\">Open {it}</a></p>",
-                words = standing.words(),
-                it = if n == 1 { "it" } else { "them" },
-            )),
-            _ => out.push_str(&format!(
-                "<p class=\"notice\" data-instrument-status=\"{key}\" data-count=\"{n}\">\
-                 {who}: {words}.</p>",
+            Standing::NeedsAPerson => {
+                asked = format!(
+                    "<p class=\"notice warn\" id=\"instruments-need-you\" data-need-you=\"{n}\">\
+                     {who}: {words}. <a href=\"/admin/instruments#provisional\">Open {it}</a></p>",
+                    it = if n == 1 { "it" } else { "them" },
+                )
+            }
+            _ => status.push(format!(
+                "<span data-instrument-status=\"{key}\" data-count=\"{n}\">{who}: {words}.</span>",
                 key = match standing {
                     Standing::WithThePlatform => "with-the-platform",
                     Standing::PlatformUnreached => "platform-unreached",
                     _ => "held-back",
                 },
-                words = standing.words(),
             )),
         }
     }
+    let mut out = String::new();
+    if !status.is_empty() {
+        out.push_str(&format!(
+            "<p class=\"notice\" id=\"instrument-status\">{}</p>",
+            status.join(" ")
+        ));
+    }
+    out.push_str(&asked);
     // The provisional count, as the page's tab counts them, for whoever
     // reads the page by its attributes.
     if provisional_n > 0 {

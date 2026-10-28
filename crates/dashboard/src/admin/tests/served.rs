@@ -2027,6 +2027,16 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
                         state: meridian_domain::v1::PluginLaunchState::Launched as i32,
                         ..Default::default()
                     },
+                    // Ruling 831: the connectivity plugin on the home, its
+                    // card saying where it trades.
+                    meridian_domain::v1::PluginLaunch {
+                        instance_id: "fix-1".into(),
+                        name: "a FIX venue".into(),
+                        version: "0.2.0".into(),
+                        roles: vec!["connectivity".into()],
+                        state: meridian_domain::v1::PluginLaunchState::Launched as i32,
+                        ..Default::default()
+                    },
                 ],
             }
             .encode_to_vec(),
