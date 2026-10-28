@@ -57,8 +57,16 @@ help:
 # image -- and the largest single stage, not the sum of them all. Before it
 # starts it refuses under GATE_DISK_START GB free on Docker's own filesystem;
 # while it runs it stops itself under GATE_DISK_STOP; and a stage holding more
-# than its budget, in GB above where the gate started, fails it -- here and on
-# CI alike, so growth cannot reach main by a push that skipped the hook.
+# than its budget fails it -- here and on CI alike, so growth cannot reach
+# main by a push that skipped the hook. A budget is in GB above where the gate
+# started; for every stage after the compile, above where the compile left
+# the disk once freed, since what it leaves (the cargo caches, the images
+# later stages start) is the compile's, charged to it alone (tools/gate.py,
+# SHARED_STAGE). Warm, it leaves next to nothing; from cold caches, after a
+# prune, 5.5 to 5.7 GB, which charged again to each later stage had
+# settings-page fail its 7 at 8.9 to 11.4 GB holding 3.4 to 3.5 of its own
+# (2026-10-27); a first run after a prune now passes or fails on what each
+# stage holds.
 #
 # The budgets are one table, a row each for a developer's machine and for
 # GitHub's runner, which pulls every image fresh where a laptop holds them
@@ -90,6 +98,7 @@ help:
 # stage of its own, once those are freed.
 GATE := $(PY) tools/gate.py
 #                    stage=GB: the most each stage may hold above where the gate started
+#                    (after the compile: above where the compile left the disk)
 GATE_BUDGETS_LOCAL ?= checks=1 runtime=4 compile=9  tests=13 settings-page=7  sdk=7  dashboards=7  harness=7  first-run=7  image=7  lint=7
 GATE_BUDGETS_CI    ?= checks=2 runtime=7 compile=12 tests=15 settings-page=15 sdk=13 dashboards=13 harness=13 first-run=13 image=14 lint=13
 # The cargo caches kept between runs: a run starts them again once they are
