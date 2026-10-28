@@ -25,6 +25,10 @@ Phases:
                through /mcp, and she works hers at its page: assigned,
                resolved citing a note, closed; and nothing of either reaches
                the platform (contract v13, W6.21 to W6.23)
+  browser   -- a browser signs in, its cookie and form token kept here
+  kept      -- that browser, after a restart (the argument says which), is
+               signed in still, with the same form token (ruling 811)
+  out       -- and signs out with that form token, which ends it
   locked    -- and enough wrong passwords stop it being usable at all
 """
 import base64
@@ -389,6 +393,40 @@ def tickets_phase():
     check(not leaked, f"the platform heard nothing of a ticket: {leaked}")
 
 
+def browser_phase():
+    say("P: a browser signs in, and its session is kept (ruling 811)")
+    ada = Browser()
+    signed = sign_in(ada, NAME, PASSWORD)
+    check(signed.status == 303, f"{NAME} signs in: {signed.status}")
+    page = home(ada)
+    check(signed_in_as(page) is not None and form_token(page),
+          f"home says {signed_in_as(page)!r}, with a form token")
+    remember("browser_cookies", ada.cookies)
+    remember("browser_form", form_token(page))
+
+
+def browser_kept_phase(after):
+    say(f"Q: after {after}, the browser is signed in still (ruling 811)")
+    ada = Browser(recall("browser_cookies"))
+    page = home(ada)
+    check(page.status == 200 and signed_in_as(page) is not None,
+          f"home after {after}: {page.status}, signed in as {signed_in_as(page)!r}")
+    check(form_token(page) == recall("browser_form"),
+          "with the form token it had before, so a page open across it still posts")
+    admin = ada.get(dash("/admin"))
+    check(admin.status == 200, f"and the admin pages answer it: {admin.status}")
+
+
+def browser_out_phase():
+    say("R: the kept session signs out with the form token it had all along")
+    ada = Browser(recall("browser_cookies"))
+    out = ada.post(dash("/sign-out"), {"form_token": recall("browser_form")})
+    check(out.status == 303, f"signed out: {out.status}")
+    again = Browser(recall("browser_cookies"))
+    check(signed_in_as(home(again)) is None,
+          "and the cookie held from before opens nothing")
+
+
 def locked_phase():
     say("D: enough wrong passwords and the account stops being usable")
     guesser = Browser()
@@ -421,6 +459,12 @@ def main():
         delegation_restarted_phase()
     elif phase == "tickets":
         tickets_phase()
+    elif phase == "browser":
+        browser_phase()
+    elif phase == "kept":
+        browser_kept_phase(" ".join(sys.argv[2:]) or "a restart")
+    elif phase == "out":
+        browser_out_phase()
     elif phase == "locked":
         locked_phase()
     else:
