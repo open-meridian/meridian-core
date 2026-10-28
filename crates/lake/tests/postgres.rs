@@ -445,6 +445,56 @@ fn a_closed_day_flag_is_counted_and_amended_beside_its_row() {
     );
     assert_eq!(now[0].meta().version, 1, "never a new version");
     assert_eq!(store.heads().unwrap()[&dataset], 3);
+    // A day recorded closed and re-checked open is no longer counted: each
+    // count reads only the rows recorded flagged or re-checked since
+    // (migration 6, ruling 816), by the flag as known now.
+    store
+        .amend_closed_day(&[ClosedDayAmendment {
+            dataset: dataset.clone(),
+            sequence: done.rows[0].meta().sequence,
+            closed_day: None,
+            why: "calendar CAL-USSS version 3 applied".into(),
+            at_ns: 3_000,
+        }])
+        .unwrap();
+    assert_eq!(store.closed_day_counts().unwrap()[&dataset], (1, 1));
+}
+
+/// The datasets' listing's count of rows carrying a value as reported, read
+/// from those rows alone (migration 6, ruling 816), as every row's count
+/// says it.
+#[test]
+fn the_rows_carrying_a_value_as_reported_are_counted_per_dataset() {
+    let store = store();
+    let dataset = unique("coinbase-1:daily");
+    let subject = unique("LCL-BTC");
+    let mut reported = close(&dataset, "as-reported", &subject, "2026-10-13", 10);
+    reported.meta_mut().unconverted = vec![meridian_pb::v1::AsReported {
+        scheme: "coinbase".into(),
+        code: "X".into(),
+        text: "a value as reported".into(),
+    }];
+    store
+        .record(
+            &dataset,
+            vec![
+                reported,
+                close(&dataset, "plain", &subject, "2026-10-14", 11),
+            ],
+            1_000,
+        )
+        .unwrap();
+    assert_eq!(store.unconverted_counts().unwrap().get(&dataset), Some(&1));
+    assert_eq!(store.counts().unwrap()[&dataset], (2, 1));
+    let empty = unique("coinbase-1:daily");
+    store
+        .record(
+            &empty,
+            vec![close(&empty, "plain", &subject, "2026-10-14", 11)],
+            1_000,
+        )
+        .unwrap();
+    assert_eq!(store.unconverted_counts().unwrap().get(&empty), None);
 }
 
 /// Contract v28 (W10.12; ruling 423): a signal plugin's assessment kept
