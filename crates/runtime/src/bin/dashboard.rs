@@ -324,6 +324,14 @@ fn run() -> Result<(), String> {
         Some(database) => Arc::new(delegation::InPostgres::on(database.clone())),
         None => Arc::new(delegation::InMemory::default()),
     };
+    // Browsers' sessions beside them (ruling 811), so a restart or an
+    // upgrade signs nobody out; in memory without one.
+    let sessions = match &database {
+        Some(database) => Sessions::keeping(Arc::new(meridian_dashboard::session::InPostgres::on(
+            database.clone(),
+        ))),
+        None => Sessions::default(),
+    };
     // Tickets beside them (contract v13), so a ticket, its notes and a
     // person's notices outlive a restart; in memory without one.
     let ticket_store: Arc<dyn meridian_dashboard::tickets::TicketStore> = match &database {
@@ -408,7 +416,7 @@ fn run() -> Result<(), String> {
     on_runtime(async {
         let bus = bus_from_env(&instance_id).await?;
         let records = Arc::new(RecordsCache::default());
-        let sessions = Arc::new(Sessions::default());
+        let sessions = Arc::new(sessions);
         let delegations = Arc::new(Delegations::keeping(delegation_store.clone()));
         let tickets = Arc::new(meridian_dashboard::tickets::Tickets::keeping(
             ticket_store.clone(),
