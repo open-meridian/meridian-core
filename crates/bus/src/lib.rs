@@ -35,7 +35,9 @@ pub use backend::{
 };
 pub use memory::MemoryBackend;
 pub use nats::NatsBackend;
-pub use router::{calls_said, timed, Bus, CallObserver, RouteRule, Stamp, TimedCall};
+pub use router::{
+    calls_by_topic, calls_said, timed, Bus, CallObserver, RouteRule, Stamp, TimedCall,
+};
 
 /// Envelope and metadata, re-exported so consumers need not depend on the
 /// generated crates directly to use the bus. The envelope is the runtime's own
