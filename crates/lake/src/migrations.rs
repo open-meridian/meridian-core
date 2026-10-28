@@ -45,6 +45,12 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "latest_index",
         sql: include_str!("../migrations/0005_latest_index.sql"),
     },
+    // The datasets' listing's counts served by indexes (ruling 816).
+    Migration {
+        version: 6,
+        name: "dataset_counts",
+        sql: include_str!("../migrations/0006_dataset_counts.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

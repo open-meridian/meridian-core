@@ -491,6 +491,8 @@ impl Asked {
             series_keys: Vec::new(),
             all_series: false,
             dates,
+            window: Default::default(),
+            fields: Vec::new(),
         })
     }
 }

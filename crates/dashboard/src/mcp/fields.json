@@ -33347,6 +33347,64 @@
       "store": "lake"
     },
     {
+      "name": "meridian.v1.ObservationsWantedEvent.expiration_from",
+      "type": "date",
+      "empty": "empty: from the earliest",
+      "intent": "narrows a chain want by expiration, inclusive (amended 2026-10-28, 821)",
+      "meaning": "a plain date, read as the request's; the union of its readers' windows",
+      "not_meaning": "a trading date",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v28",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.ObservationsWantedEvent.expiration_to",
+      "type": "date",
+      "empty": "empty: to the latest",
+      "intent": "narrows a chain want by expiration, inclusive (amended 2026-10-28, 821)",
+      "meaning": "a plain date, read as the request's; the union of its readers' windows",
+      "not_meaning": "a trading date",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v28",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.ObservationsWantedEvent.series_keys",
+      "type": "repeated message Identifier",
+      "bounds": {
+        "count": [
+          0,
+          500
+        ]
+      },
+      "empty": "none: not a want of named series",
+      "intent": "names the series a chain want is of (amended 2026-10-28, 821)",
+      "meaning": "the series' keys, as ListQuotesRequest.series_keys names them",
+      "not_meaning": "INS- IDs, which subjects name",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v28",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.ObservationsWantedEvent.all_series",
+      "type": "boolean",
+      "empty": "false: the subjects' own rows only",
+      "intent": "wants every series of the subjects, within the window (amended 2026-10-28, 821)",
+      "meaning": "true: the chain's rows, narrowed by expiration_from and expiration_to",
+      "not_meaning": "a want to mint",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v28",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
       "name": "meridian.v1.WantWithdrawnEvent.want_id",
       "type": "text",
       "empty": "never empty",
@@ -36150,9 +36208,9 @@
         },
         "past": "capped"
       },
-      "empty": "0 is 100; past 500, answered at 500",
+      "empty": "0: as many rows as fill a page of about 512 KiB (rulings 816 and 823, amended 2026-10-28); past 500, answered at 500",
       "intent": "bounds a page",
-      "meaning": "how many rows a page holds at most",
+      "meaning": "how many rows a page holds at most; a page also ends within about 512 KiB, whatever it asks",
       "not_meaning": "a promise that a page is full",
       "filled": "as-reported",
       "filled_by": "signal",
@@ -36167,6 +36225,25 @@
       "intent": "asks for the next page",
       "meaning": "the previous reply's next_cursor, as given",
       "not_meaning": "a position a plugin computes",
+      "filled": "as-reported",
+      "filled_by": "signal",
+      "since": "v28",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.ListSeriesRequest.paths",
+      "type": "repeated text",
+      "bounds": {
+        "count": [
+          0,
+          64
+        ]
+      },
+      "empty": "none: every path",
+      "intent": "asks for only the terms a reader shows (amended 2026-10-28, 821)",
+      "meaning": "template paths of ListedSeries.fields (put_or_call, strike_price, expiration_date); meta, template_id, template_version and instrument_id always",
+      "not_meaning": "dictionary entries",
       "filled": "as-reported",
       "filled_by": "signal",
       "since": "v28",
@@ -36496,6 +36573,51 @@
       "store": "lake"
     },
     {
+      "name": "meridian.v1.ListStatisticsRequest.expiration_from",
+      "type": "date",
+      "empty": "empty: from the earliest",
+      "intent": "narrows the series rows all_series answers by expiration, inclusive (amended 2026-10-28, 821)",
+      "meaning": "a plain date; set only with all_series, or refused naming it; beside series_keys, refused naming series_keys",
+      "not_meaning": "a trading date",
+      "filled": "as-reported",
+      "filled_by": "signal",
+      "since": "v28",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.ListStatisticsRequest.expiration_to",
+      "type": "date",
+      "empty": "empty: to the latest",
+      "intent": "narrows the series rows all_series answers by expiration, inclusive (amended 2026-10-28, 821)",
+      "meaning": "a plain date, on or after expiration_from; set only with all_series, or refused naming expiration_from",
+      "not_meaning": "a trading date",
+      "filled": "as-reported",
+      "filled_by": "signal",
+      "since": "v28",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.ListStatisticsRequest.fields",
+      "type": "repeated text",
+      "bounds": {
+        "count": [
+          0,
+          32
+        ]
+      },
+      "empty": "none: every field",
+      "intent": "asks for only the fields a reader shows (amended 2026-10-28, 821)",
+      "meaning": "dictionary entries of meridian.v1.Statistic, each answered where filled and entitled; the envelope always; a field not asked is left unset and not named unanswered; an entry of another message is refused naming fields",
+      "not_meaning": "an entitlement: a field asked and not entitled is answered not_entitled",
+      "filled": "as-reported",
+      "filled_by": "signal",
+      "since": "v28",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
       "name": "meridian.v1.ListStatisticsRequest.sources",
       "type": "message SourceChoice",
       "empty": "unset: the deployment's default",
@@ -36654,6 +36776,51 @@
       "store": "lake"
     },
     {
+      "name": "meridian.v1.ListQuotesRequest.expiration_from",
+      "type": "date",
+      "empty": "empty: from the earliest",
+      "intent": "narrows the series rows all_series answers by expiration, inclusive (amended 2026-10-28, 821)",
+      "meaning": "a plain date; set only with all_series, or refused naming it; beside series_keys, refused naming series_keys",
+      "not_meaning": "a trading date",
+      "filled": "as-reported",
+      "filled_by": "signal",
+      "since": "v28",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.ListQuotesRequest.expiration_to",
+      "type": "date",
+      "empty": "empty: to the latest",
+      "intent": "narrows the series rows all_series answers by expiration, inclusive (amended 2026-10-28, 821)",
+      "meaning": "a plain date, on or after expiration_from; set only with all_series, or refused naming expiration_from",
+      "not_meaning": "a trading date",
+      "filled": "as-reported",
+      "filled_by": "signal",
+      "since": "v28",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.ListQuotesRequest.fields",
+      "type": "repeated text",
+      "bounds": {
+        "count": [
+          0,
+          32
+        ]
+      },
+      "empty": "none: every field",
+      "intent": "asks for only the fields a reader shows (amended 2026-10-28, 821)",
+      "meaning": "dictionary entries of meridian.v1.Quote, each answered where filled and entitled; the envelope always; a field not asked is left unset and not named unanswered; an entry of another message is refused naming fields",
+      "not_meaning": "an entitlement: a field asked and not entitled is answered not_entitled",
+      "filled": "as-reported",
+      "filled_by": "signal",
+      "since": "v28",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
       "name": "meridian.v1.ListTradesRequest.series_keys",
       "type": "repeated message Identifier",
       "bounds": {
@@ -36679,6 +36846,51 @@
       "intent": "asks for every chain row of the subjects asked (contract v28)",
       "meaning": "true: rows keyed by any series of the underlying are answered beside its own",
       "not_meaning": "a minted series' own rows, which name its INS- record",
+      "filled": "as-reported",
+      "filled_by": "signal",
+      "since": "v28",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.ListTradesRequest.expiration_from",
+      "type": "date",
+      "empty": "empty: from the earliest",
+      "intent": "narrows the series rows all_series answers by expiration, inclusive (amended 2026-10-28, 821)",
+      "meaning": "a plain date; set only with all_series, or refused naming it; beside series_keys, refused naming series_keys",
+      "not_meaning": "a trading date",
+      "filled": "as-reported",
+      "filled_by": "signal",
+      "since": "v28",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.ListTradesRequest.expiration_to",
+      "type": "date",
+      "empty": "empty: to the latest",
+      "intent": "narrows the series rows all_series answers by expiration, inclusive (amended 2026-10-28, 821)",
+      "meaning": "a plain date, on or after expiration_from; set only with all_series, or refused naming expiration_from",
+      "not_meaning": "a trading date",
+      "filled": "as-reported",
+      "filled_by": "signal",
+      "since": "v28",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.ListTradesRequest.fields",
+      "type": "repeated text",
+      "bounds": {
+        "count": [
+          0,
+          32
+        ]
+      },
+      "empty": "none: every field",
+      "intent": "asks for only the fields a reader shows (amended 2026-10-28, 821)",
+      "meaning": "dictionary entries of meridian.v1.Trade, each answered where filled and entitled; the envelope always; a field not asked is left unset and not named unanswered; an entry of another message is refused naming fields",
+      "not_meaning": "an entitlement: a field asked and not entitled is answered not_entitled",
       "filled": "as-reported",
       "filled_by": "signal",
       "since": "v28",

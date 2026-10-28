@@ -76,7 +76,7 @@ mod filings;
 use crate::config::{DataConfig, Reader};
 use crate::read::{self, Against, Read};
 use crate::row::{DataType, Observation};
-use crate::store::{rank, Assessment, Store, WantChange, WantChangeKind, When};
+use crate::store::{rank, Assessment, Query, Store, WantChange, WantChangeKind, When};
 
 pub const RECORD_PRICES: &str = "platform.lake.command.record-prices";
 pub const RECORD_BARS: &str = "platform.lake.command.record-bars";
@@ -239,6 +239,15 @@ pub const SERVED_WAIT: Duration = Duration::from_secs(3);
 /// How many series' records a ListSeries asks the instrument store at once.
 const SERIES_ASKED_AT_ONCE: usize = 32;
 
+/// A ListSeries page's rows end within this many bytes (rulings 816 and 823:
+/// filled to the broker's half, as the catalogue's and a job's answer's
+/// pages are), less room for the rest of the reply.
+pub const SERIES_PAGE_BUDGET: usize = 512 * 1024 - 4 * 1024;
+
+/// What a series adds to a page beside its own bytes: its tag and length,
+/// and the record's ID the instrument store fills after the page is cut.
+const SERIES_ROW_OVERHEAD: usize = 48;
+
 /// The most series records remembered; past it they are forgotten and
 /// asked again.
 const SERIES_RECORDS_KEPT: usize = 200_000;
@@ -270,6 +279,11 @@ struct OpenWant {
     settled: BTreeSet<String>,
 }
 
+/// A want's key: its dataset, data type, kinds, length, date, range,
+/// standing, subjects, and from contract v28 (amended 2026-10-28; ruling 821)
+/// its series named by key and whether it is of every series. A window is no
+/// part of it: readers' windows on one key are one want, its window their
+/// union.
 type WantKey = (
     String,
     String,
@@ -280,6 +294,8 @@ type WantKey = (
     i64,
     bool,
     Vec<String>,
+    Vec<String>,
+    bool,
 );
 
 #[derive(Default)]
@@ -833,6 +849,8 @@ impl Lake {
                 series_keys: Vec::new(),
                 all_series: false,
                 dates: Some((from, to)),
+                window: Default::default(),
+                fields: Vec::new(),
             },
             envelope,
         )?;
@@ -1844,62 +1862,86 @@ impl Lake {
                 until,
                 ask.standing,
                 ask.subjects.clone(),
+                {
+                    let mut named: Vec<String> =
+                        ask.series_keys.iter().map(read::series_named).collect();
+                    named.sort();
+                    named.dedup();
+                    named
+                },
+                ask.all_series,
             );
+            let (window_from, window_to) = ask.window.sides();
             let mut wants = self.wants.lock().expect("wants poisoned");
             let existing = wants.by_key.get(&key).cloned();
             let mut recent = false;
-            let (want_id, publish) = match existing
-                .and_then(|id| wants.open.get_mut(&id).map(|w| (id, w)))
-            {
-                Some((id, open)) => {
-                    open.asked_by.insert(by.clone());
-                    open.asked_at_ns = now;
-                    let again = !open.event.standing && now - open.published_at_ns >= ASK_AGAIN_NS;
-                    if again {
-                        open.published_at_ns = now;
+            let (want_id, publish) =
+                match existing.and_then(|id| wants.open.get_mut(&id).map(|w| (id, w))) {
+                    Some((id, open)) => {
+                        open.asked_by.insert(by.clone());
+                        open.asked_at_ns = now;
+                        // A reader asking outside the window held widens it to
+                        // the union, asked again at once (ruling 821).
+                        let held = want_window(&open.event);
+                        let widened = !held.covers(&ask.window);
+                        if widened {
+                            let (from, to) = held.union(&ask.window).sides();
+                            open.event.expiration_from = from;
+                            open.event.expiration_to = to;
+                        }
+                        let again = widened
+                            || (!open.event.standing && now - open.published_at_ns >= ASK_AGAIN_NS);
+                        if again {
+                            open.published_at_ns = now;
+                        }
+                        recent = now - open.published_at_ns < SERVED_WAIT.as_nanos() as i64;
+                        (id, again)
                     }
-                    recent = now - open.published_at_ns < SERVED_WAIT.as_nanos() as i64;
-                    (id, again)
-                }
-                None => {
-                    let id = uuid::Uuid::new_v4().to_string();
-                    let cadence = config
-                        .declaration(&ask.dataset)
-                        .map_or(0, |d| i64::from(d.cadence));
-                    let event = ObservationsWantedEvent {
-                        want_id: id.clone(),
-                        dataset: ask.dataset.clone(),
-                        data_type: ask.data_type.name().to_string(),
-                        subjects: ask
-                            .subjects
-                            .iter()
-                            .map(|s| SubjectRef {
-                                entity_id: s.clone(),
-                                ..Default::default()
-                            })
-                            .collect(),
-                        kinds: kinds.clone(),
-                        interval_ns: ask.interval_ns,
-                        business_date: date.clone(),
-                        valid_from_ns: from,
-                        valid_until_ns: until,
-                        standing: ask.standing,
-                    };
-                    wants.open.insert(
-                        id.clone(),
-                        OpenWant {
-                            event,
-                            asked_by: [by.clone()].into(),
-                            asked_at_ns: now,
-                            published_at_ns: now,
-                            cadence_ns: cadence * 1_000_000_000,
-                            settled: BTreeSet::new(),
-                        },
-                    );
-                    wants.by_key.insert(key, id.clone());
-                    (id, true)
-                }
-            };
+                    None => {
+                        let id = uuid::Uuid::new_v4().to_string();
+                        let cadence = config
+                            .declaration(&ask.dataset)
+                            .map_or(0, |d| i64::from(d.cadence));
+                        let event = ObservationsWantedEvent {
+                            want_id: id.clone(),
+                            dataset: ask.dataset.clone(),
+                            data_type: ask.data_type.name().to_string(),
+                            subjects: ask
+                                .subjects
+                                .iter()
+                                .map(|s| SubjectRef {
+                                    entity_id: s.clone(),
+                                    ..Default::default()
+                                })
+                                .collect(),
+                            kinds: kinds.clone(),
+                            interval_ns: ask.interval_ns,
+                            business_date: date.clone(),
+                            valid_from_ns: from,
+                            valid_until_ns: until,
+                            standing: ask.standing,
+                            // Contract v28, amended 2026-10-28 (ruling 821): a
+                            // chain want's series and window.
+                            expiration_from: window_from.clone(),
+                            expiration_to: window_to.clone(),
+                            series_keys: ask.series_keys.clone(),
+                            all_series: ask.all_series,
+                        };
+                        wants.open.insert(
+                            id.clone(),
+                            OpenWant {
+                                event,
+                                asked_by: [by.clone()].into(),
+                                asked_at_ns: now,
+                                published_at_ns: now,
+                                cadence_ns: cadence * 1_000_000_000,
+                                settled: BTreeSet::new(),
+                            },
+                        );
+                        wants.by_key.insert(key, id.clone());
+                        (id, true)
+                    }
+                };
             let event = wants.open.get(&want_id).map(|w| w.event.clone());
             drop(wants);
             let Some(event) = event else { continue };
@@ -2386,6 +2428,18 @@ impl Lake {
                 .map(|s| (s.entity_id.clone(), s.role))
                 .collect(),
             narrowed,
+            // A chain read's window (contract v28, amended 2026-10-28; ruling
+            // 821), held against the lake's listing where the whole answer is
+            // made: a listed series' own row by its own expiration.
+            listed: (held.is_none()
+                && request.window.is_set()
+                && request.data_type != DataType::Series)
+                .then(|| {
+                    self.listed_within(&config, &aliases, &request.subjects, &request.window, as_of)
+                })
+                .transpose()?,
+            window: request.window,
+            fields: request.fields.into_iter().collect(),
         };
         let against = Against {
             config: &config,
@@ -2493,6 +2547,7 @@ impl Lake {
                 .collect(),
             watermark: watermark(&heads, &answered_from),
             next_cursor: next.unwrap_or_default(),
+            as_of_ns: as_of,
         })
     }
 
@@ -2585,6 +2640,8 @@ impl Lake {
                 series_keys: Vec::new(),
                 all_series: false,
                 dates: None,
+                window: Default::default(),
+                fields: Vec::new(),
             },
             envelope,
         )?;
@@ -2657,21 +2714,40 @@ impl Lake {
             })
             .collect();
         let all_series = request.series_keys.is_empty();
-        // The page asked, filled after the type and the window are applied
-        // (a filtered page is never short while rows remain): each read asks
-        // only for what the page still lacks, so the cursor it answers is the
-        // page's, never past a row left out.
-        let want = match request.page_size {
-            0 => 100,
-            n => n.min(500),
+        // Contract v28, amended 2026-10-28 (ruling 821): the template paths
+        // answered; none for every path.
+        if !bounds::LIST_SERIES_REQUEST_PATHS_COUNT.admits(request.paths.len()) {
+            return Err(refusal_with_status(
+                RefusalStatus::InvalidArgument,
+                &["paths".to_string()],
+                format!(
+                    "paths names {}; at most {}",
+                    request.paths.len(),
+                    bounds::LIST_SERIES_REQUEST_PATHS_COUNT.most
+                ),
+            ));
+        }
+        let paths: BTreeSet<&str> = request.paths.iter().map(String::as_str).collect();
+        // The page asked, filled after the type is applied (a filtered page
+        // is never short while rows remain); the window is the read's, before
+        // its page is cut. Asked no size, a page is filled to
+        // [`SERIES_PAGE_BUDGET`] (rulings 816 and 823: a chain in a few
+        // pages, not ~70); asked one, it holds at most that many rows, 500 at
+        // most, and never more than the budget. A page ends before the row
+        // that would pass the budget, and its cursor is that row's.
+        let most = match request.page_size {
+            0 => usize::MAX,
+            n => n.min(500) as usize,
         };
         let mut cursor = request.cursor.clone();
         let mut series = Vec::new();
+        let mut bytes = 0usize;
         let mut unanswered = Vec::new();
         let mut datasets: Vec<meridian_domain::v1::DatasetRef> = Vec::new();
         let mut watermark = None;
         let next_cursor = loop {
-            let lacking = want - series.len() as u32;
+            let lacking = most.saturating_sub(series.len()).min(500) as u32;
+            let start = cursor_of(&cursor)?.map_or(0, |(_, offset)| offset);
             let answer = self.read(
                 ReadRequest {
                     data_type: DataType::Series,
@@ -2692,6 +2768,8 @@ impl Lake {
                     series_keys: request.series_keys.clone(),
                     all_series,
                     dates: None,
+                    window: read::Window { from, to },
+                    fields: Vec::new(),
                 },
                 envelope,
             )?;
@@ -2704,8 +2782,9 @@ impl Lake {
                     datasets.push(dataset);
                 }
             }
-            for row in answer.rows {
-                let Observation::Series(listed) = row else {
+            let mut full_at = None;
+            for (i, row) in answer.rows.into_iter().enumerate() {
+                let Observation::Series(mut listed) = row else {
                     continue;
                 };
                 let meta = listed.meta.clone().unwrap_or_default();
@@ -2735,28 +2814,24 @@ impl Lake {
                 if kind != InstrumentType::Unspecified && kind != its_kind {
                     continue;
                 }
-                if from.is_some() || to.is_some() {
-                    let expires = [
-                        "expiration_date",
-                        "last_trade_date",
-                        "final_settlement_date",
-                    ]
-                    .iter()
-                    .map(|path| field(path))
-                    .find(|date| !date.is_empty())
-                    .and_then(|date| Date::parse(&date).ok());
-                    let Some(expires) = expires else {
-                        continue;
-                    };
-                    if from.as_ref().is_some_and(|from| &expires < from)
-                        || to.as_ref().is_some_and(|to| &expires > to)
-                    {
-                        continue;
-                    }
+                if !paths.is_empty() {
+                    listed
+                        .fields
+                        .retain(|field| paths.contains(field.path.as_str()));
                 }
+                // Its bytes on the page, with its record's ID to come.
+                let size = listed.encoded_len() + SERIES_ROW_OVERHEAD;
+                if !series.is_empty() && bytes + size > SERIES_PAGE_BUDGET {
+                    full_at = Some(i);
+                    break;
+                }
+                bytes += size;
                 series.push(listed);
             }
-            if answer.next_cursor.is_empty() || series.len() as u32 >= want {
+            if let Some(i) = full_at {
+                break crate::service::cursor(answer.as_of_ns, start + i);
+            }
+            if answer.next_cursor.is_empty() || series.len() >= most {
                 break answer.next_cursor;
             }
             cursor = answer.next_cursor;
@@ -2783,6 +2858,67 @@ impl Lake {
             watermark,
             next_cursor,
         })
+    }
+
+    /// The series the lake's listing holds of `subjects` expiring in
+    /// `window`, named as [`read::series_named`] names them, at the
+    /// recorded-time cut-off (contract v28, amended 2026-10-28; ruling 821):
+    /// every dataset's listing, since what it answers is only which rows a
+    /// chain read keeps, never a listing row.
+    fn listed_within(
+        &self,
+        config: &DataConfig,
+        aliases: &BTreeMap<String, String>,
+        subjects: &[SubjectRef],
+        window: &read::Window,
+        as_of_ns: i64,
+    ) -> Result<BTreeSet<String>, String> {
+        let datasets: Vec<String> = config
+            .datasets
+            .keys()
+            .filter(|dataset| config.serves(dataset, DataType::Series))
+            .cloned()
+            .collect();
+        if datasets.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let named: Vec<String> = subjects.iter().map(|s| s.entity_id.clone()).collect();
+        let mut asked = named.clone();
+        for (replaced, stays) in aliases {
+            if named.contains(stays) && !asked.contains(replaced) {
+                asked.push(replaced.clone());
+            }
+        }
+        let rows = self
+            .store
+            .read(&Query {
+                datasets,
+                subjects: asked,
+                data_type: DataType::Series,
+                kinds: Vec::new(),
+                interval_ns: 0,
+                when: When::Latest { at_ns: 0 },
+                as_of_ns,
+                published_as_of_ns: 0,
+                latest_only: true,
+            })
+            .map_err(|failed| failed.to_string())?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| match row {
+                Observation::Series(series) => Some(series),
+                _ => None,
+            })
+            .filter(|series| read::expires(series).is_some_and(|date| window.holds(&date)))
+            .flat_map(|series| {
+                series
+                    .meta
+                    .as_ref()
+                    .map(|meta| meta.series_key.clone())
+                    .unwrap_or_default()
+            })
+            .map(|identifier| read::series_named(&identifier))
+            .collect())
     }
 
     /// The deployment's record for each series key, matched read-only by
@@ -2895,6 +3031,17 @@ impl Lake {
                 return Err(format!("kinds[{i}] is unspecified"));
             }
         }
+        // Contract v28, amended 2026-10-28 (ruling 821): its window and
+        // fields.
+        let (window, fields) = targeted(
+            DataType::Statistic,
+            &request.expiration_from,
+            &request.expiration_to,
+            &request.series_keys,
+            request.all_series,
+            request.fields,
+            &bounds::LIST_STATISTICS_REQUEST_FIELDS_COUNT,
+        )?;
         let ranged = !request.from_date.is_empty() || !request.to_date.is_empty();
         if ranged && !request.business_date.is_empty() {
             return Err("business_date and from_date or to_date: at most one is given".into());
@@ -2935,6 +3082,8 @@ impl Lake {
                 series_keys: request.series_keys,
                 all_series: request.all_series,
                 dates,
+                window,
+                fields,
             },
             envelope,
         )?;
@@ -3203,6 +3352,9 @@ impl Lake {
             dates: None,
             roles: Vec::new(),
             narrowed: read::Narrowed::default(),
+            window: read::Window::default(),
+            listed: None,
+            fields: BTreeSet::new(),
         };
         let answered = read::answer(
             self.store.as_ref(),
@@ -3236,7 +3388,13 @@ impl Lake {
     pub(crate) fn list_datasets(&self, envelope: &Envelope) -> Result<ListDatasetsReply, String> {
         let reader = reader_of(envelope);
         let config = self.config();
-        let counts = self.store.counts().map_err(|failed| failed.to_string())?;
+        // The rows carrying a value as reported, and those flagged on a closed
+        // day: each read from the rows it counts, never every row kept (ruling
+        // 816: one listing took 1,068 ms on dev counting a chain's rows).
+        let unconverted = self
+            .store
+            .unconverted_counts()
+            .map_err(|failed| failed.to_string())?;
         let misses = self
             .store
             .miss_counts()
@@ -3255,7 +3413,7 @@ impl Lake {
                 continue;
             }
             reply.datasets.push(DatasetRef {
-                unconverted_count: counts.get(dataset).map_or(0, |c| c.1),
+                unconverted_count: unconverted.get(dataset).copied().unwrap_or(0),
                 miss_count: misses.get(&held.instance).copied().unwrap_or(0),
                 // Contract v23 (W10.9): the rows flagged on a closed day, and
                 // those outside the calendar's coverage, counted apart.
@@ -3694,6 +3852,82 @@ impl Lake {
 
 /// What a want asked, as a decline of it is kept by: its business date, its
 /// range, or the latest (contract v19).
+/// A chain read's expiration window and fields, checked (contract v28,
+/// amended 2026-10-28; rulings 821, 833 and 835 to 838): a window only with
+/// `all_series` and never beside `series_keys`, its dates plain and in order;
+/// each field a dictionary entry of the row's message, within `bound`.
+/// Refused INVALID_ARGUMENT naming the field.
+fn targeted(
+    data_type: DataType,
+    expiration_from: &str,
+    expiration_to: &str,
+    series_keys: &[Identifier],
+    all_series: bool,
+    fields: Vec<String>,
+    bound: &bounds::Count,
+) -> Result<(read::Window, Vec<String>), String> {
+    let invalid = |field: &str, words: String| {
+        refusal_with_status(RefusalStatus::InvalidArgument, &[field.to_string()], words)
+    };
+    let window = read::Window {
+        from: meridian_domain::date::optional("expiration_from", expiration_from)
+            .map_err(|words| invalid("expiration_from", words))?,
+        to: meridian_domain::date::optional("expiration_to", expiration_to)
+            .map_err(|words| invalid("expiration_to", words))?,
+    };
+    if window.is_set() {
+        if !series_keys.is_empty() {
+            return Err(invalid(
+                "series_keys",
+                "series_keys beside an expiration window: a read names its series one way".into(),
+            ));
+        }
+        if !all_series {
+            return Err(invalid(
+                "expiration_from",
+                "an expiration window is set only with all_series, so a read of an underlying \
+                 never receives its chain unasked"
+                    .into(),
+            ));
+        }
+        if let (Some(from), Some(to)) = (&window.from, &window.to) {
+            if to < from {
+                return Err(invalid(
+                    "expiration_to",
+                    "expiration_to is on or after expiration_from".into(),
+                ));
+            }
+        }
+    }
+    if !bound.admits(fields.len()) {
+        return Err(invalid(
+            "fields",
+            format!("fields names {}; at most {}", fields.len(), bound.most),
+        ));
+    }
+    let entries = lake::fields_of(data_type.name());
+    for (i, field) in fields.iter().enumerate() {
+        if !entries.contains(&field.as_str()) {
+            return Err(invalid(
+                "fields",
+                format!(
+                    "fields[{i}] {field:?} is no dictionary entry of {}",
+                    data_type.name()
+                ),
+            ));
+        }
+    }
+    Ok((window, fields))
+}
+
+/// A want's expiration window, as its event carries it.
+fn want_window(event: &ObservationsWantedEvent) -> read::Window {
+    read::Window {
+        from: Date::parse(&event.expiration_from).ok(),
+        to: Date::parse(&event.expiration_to).ok(),
+    }
+}
+
 fn want_asked(event: &ObservationsWantedEvent) -> String {
     let when = if let Ok(date) = Date::parse(&event.business_date) {
         When::BusinessDate(date)
@@ -4084,6 +4318,13 @@ pub struct ReadRequest {
     /// Contract v28 (ListStatistics): a range of business dates, from and
     /// to inclusive, over every version in force; `None` for none.
     pub dates: Option<(Date, Date)>,
+    /// Contract v28, amended 2026-10-28 (ruling 821): the expiration window
+    /// a chain read's `all_series` is narrowed by, or a listing read's; unset
+    /// for none.
+    pub window: read::Window,
+    /// Contract v28, amended 2026-10-28 (ruling 821): the dictionary entries
+    /// of the row's message a read answers; none for every field.
+    pub fields: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -4093,6 +4334,9 @@ pub struct ReadAnswer {
     pub datasets: Vec<DatasetRef>,
     pub watermark: Watermark,
     pub next_cursor: String,
+    /// The recorded-time cut-off the read was answered at, which every page
+    /// of it reads at.
+    pub as_of_ns: i64,
 }
 
 fn cursor(as_of: i64, offset: usize) -> String {
@@ -4544,6 +4788,17 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
             if request.latest_recorded {
                 return lake.latest_recorded(&request, envelope);
             }
+            // Contract v28, amended 2026-10-28 (ruling 821): its window and
+            // fields.
+            let (window, fields) = targeted(
+                DataType::Trade,
+                &request.expiration_from,
+                &request.expiration_to,
+                &request.series_keys,
+                request.all_series,
+                request.fields,
+                &bounds::LIST_TRADES_REQUEST_FIELDS_COUNT,
+            )?;
             let answer = lake.read(
                 ReadRequest {
                     data_type: DataType::Trade,
@@ -4565,6 +4820,8 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
                     series_keys: request.series_keys,
                     all_series: request.all_series,
                     dates: None,
+                    window,
+                    fields,
                 },
                 envelope,
             )?;
@@ -4593,6 +4850,17 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
             "meridian.v1.ListQuotesReply",
         ),
         |lake, request: ListQuotesRequest, envelope| {
+            // Contract v28, amended 2026-10-28 (ruling 821): its window and
+            // fields.
+            let (window, fields) = targeted(
+                DataType::Quote,
+                &request.expiration_from,
+                &request.expiration_to,
+                &request.series_keys,
+                request.all_series,
+                request.fields,
+                &bounds::LIST_QUOTES_REQUEST_FIELDS_COUNT,
+            )?;
             let answer = lake.read(
                 ReadRequest {
                     data_type: DataType::Quote,
@@ -4614,6 +4882,8 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
                     series_keys: request.series_keys,
                     all_series: request.all_series,
                     dates: None,
+                    window,
+                    fields,
                 },
                 envelope,
             )?;
@@ -4671,6 +4941,8 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
                     series_keys: Vec::new(),
                     all_series: false,
                     dates: None,
+                    window: Default::default(),
+                    fields: Vec::new(),
                 },
                 envelope,
             )?;
@@ -4716,6 +4988,8 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
                     series_keys: Vec::new(),
                     all_series: false,
                     dates: None,
+                    window: Default::default(),
+                    fields: Vec::new(),
                 },
                 envelope,
             )?;

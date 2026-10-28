@@ -1039,6 +1039,21 @@ message ListTradesRequest {
   // answered beside its own. False: rows keyed by a series are left out, so a
   // v27 reader of an underlying never receives its chain.
   bool all_series = 11;
+  // Contract v28, amended 2026-10-28 (ruling 821): a plain date. Narrows
+  // the series rows all_series answers to the series expiring in the window,
+  // inclusive, as the lake's listing holds them. Set only with all_series, or
+  // refused naming expiration_from. Empty: from the earliest.
+  string expiration_from = 12;
+  // Contract v28, amended 2026-10-28 (ruling 821): a plain date, inclusive.
+  // Set only with all_series, or refused naming expiration_from. Empty: to
+  // the latest.
+  string expiration_to = 13;
+  // Contract v28, amended 2026-10-28 (ruling 821): the dictionary entries of
+  // meridian.v1.Trade to answer, 0 to 32. The envelope (meta) is always
+  // answered. A field not asked is left unset and is not listed as
+  // unanswered; an entry of another message is refused naming fields. None:
+  // every field.
+  repeated string fields = 14;
 }
 
 message ListTradesReply {
@@ -1077,6 +1092,21 @@ message ListQuotesRequest {
   // answered beside its own. False: rows keyed by a series are left out, so a
   // v27 reader of an underlying never receives its chain.
   bool all_series = 10;
+  // Contract v28, amended 2026-10-28 (ruling 821): a plain date. Narrows
+  // the series rows all_series answers to the series expiring in the window,
+  // inclusive, as the lake's listing holds them. Set only with all_series, or
+  // refused naming expiration_from. Empty: from the earliest.
+  string expiration_from = 11;
+  // Contract v28, amended 2026-10-28 (ruling 821): a plain date, inclusive.
+  // Set only with all_series, or refused naming expiration_from. Empty: to
+  // the latest.
+  string expiration_to = 12;
+  // Contract v28, amended 2026-10-28 (ruling 821): the dictionary entries of
+  // meridian.v1.Quote to answer, 0 to 32. The envelope (meta) is always
+  // answered. A field not asked is left unset and is not listed as
+  // unanswered; an entry of another message is refused naming fields. None:
+  // every field.
+  repeated string fields = 13;
 }
 
 message ListQuotesReply {
@@ -1143,6 +1173,18 @@ message ObservationsWantedEvent {
   // Keep the subjects current until the want is withdrawn (W10.7): by the
   // vendor's stream where the dataset is streamed, by its schedule otherwise.
   bool standing = 10;
+  // Contract v28, amended 2026-10-28 (ruling 821; the v29 plan's item E9):
+  // a chain want's window, plain dates, inclusive, the union of its readers'
+  // windows. Empty: from the earliest; to the latest.
+  string expiration_from = 11;
+  string expiration_to = 12;
+  // Contract v28, amended 2026-10-28: the series a chain want is of, by key,
+  // as ListQuotesRequest.series_keys names them, 0 to 500. None: not a want
+  // of named series.
+  repeated Identifier series_keys = 13;
+  // Contract v28, amended 2026-10-28: true: every series of the subjects,
+  // narrowed by the window. False: the subjects' own rows only.
+  bool all_series = 14;
 }
 
 // A standing want no reader has asked within the dataset's cadence.
@@ -1374,6 +1416,11 @@ message ListSeriesRequest {
   uint32 page_size = 8;
   // The previous reply's next_cursor, as given. Empty for the first page.
   string cursor = 9;
+  // Contract v28, amended 2026-10-28 (ruling 821): the template paths of
+  // ListedSeries.fields to answer, 0 to 64: put_or_call, strike_price,
+  // expiration_date. meta, template_id, template_version and instrument_id
+  // are always answered. None: every path.
+  repeated string paths = 10;
 }
 
 // Contract v28 (W10.6): ListSeries's answer.
@@ -1454,6 +1501,21 @@ message ListStatisticsRequest {
   uint32 page_size = 10;
   // The previous reply's next_cursor, as given. Empty for the first page.
   string cursor = 11;
+  // Contract v28, amended 2026-10-28 (ruling 821): a plain date. Narrows
+  // the series rows all_series answers to the series expiring in the window,
+  // inclusive, as the lake's listing holds them. Set only with all_series, or
+  // refused naming expiration_from. Empty: from the earliest.
+  string expiration_from = 12;
+  // Contract v28, amended 2026-10-28 (ruling 821): a plain date, inclusive.
+  // Set only with all_series, or refused naming expiration_from. Empty: to
+  // the latest.
+  string expiration_to = 13;
+  // Contract v28, amended 2026-10-28 (ruling 821): the dictionary entries of
+  // meridian.v1.Statistic to answer, 0 to 32. The envelope (meta) is always
+  // answered. A field not asked is left unset and is not listed as
+  // unanswered; an entry of another message is refused naming fields. None:
+  // every field.
+  repeated string fields = 14;
 }
 
 // Contract v28 (W10.6): ListStatistics's answer.

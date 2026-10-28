@@ -700,6 +700,21 @@ impl Store for PostgresStore {
             .collect())
     }
 
+    fn unconverted_counts(&self) -> Result<BTreeMap<String, u64>> {
+        // Read from lake_row_unconverted, which holds only these rows
+        // (migration 6).
+        Ok(self
+            .conn()?
+            .query(
+                "SELECT dataset, count(*) FROM lake_row WHERE unconverted GROUP BY dataset",
+                &[],
+            )
+            .map_err(unavailable)?
+            .iter()
+            .map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1) as u64))
+            .collect())
+    }
+
     fn lowest_kept(&self, dataset: &str) -> Result<Option<u64>> {
         let found: Option<i64> = self
             .conn()?
@@ -1114,19 +1129,31 @@ impl Store for PostgresStore {
 
     fn closed_day_counts(&self) -> Result<BTreeMap<String, (u64, u64)>> {
         // Each row's flag as known now: its latest re-check, else the reason
-        // it was recorded with.
+        // it was recorded with. Only a row recorded flagged (lake_row_closed,
+        // migration 6) or re-checked since (lake_closed_day) can count, so
+        // only those are read, never every row kept (ruling 816).
         Ok(self
             .conn()?
             .query(
-                "SELECT r.dataset,
-                        count(*) FILTER (WHERE coalesce(a.reason, r.closed_reason) IN (1, 2)),
-                        count(*) FILTER (WHERE coalesce(a.reason, r.closed_reason) = 3)
-                   FROM lake_row r
-                   LEFT JOIN LATERAL (
-                        SELECT c.reason FROM lake_closed_day c
-                         WHERE c.dataset = r.dataset AND c.sequence = r.sequence
-                         ORDER BY c.amendment_id DESC LIMIT 1) a ON true
-                  GROUP BY r.dataset",
+                "SELECT dataset,
+                        count(*) FILTER (WHERE reason IN (1, 2)),
+                        count(*) FILTER (WHERE reason = 3)
+                   FROM (
+                        SELECT r.dataset, coalesce(a.reason, r.closed_reason) AS reason
+                          FROM lake_row r
+                          LEFT JOIN LATERAL (
+                               SELECT c.reason FROM lake_closed_day c
+                                WHERE c.dataset = r.dataset AND c.sequence = r.sequence
+                                ORDER BY c.amendment_id DESC LIMIT 1) a ON true
+                         WHERE r.closed_reason <> 0
+                        UNION ALL
+                        (SELECT DISTINCT ON (c.dataset, c.sequence) c.dataset, c.reason
+                           FROM lake_closed_day c
+                           JOIN lake_row r ON r.dataset = c.dataset AND r.sequence = c.sequence
+                          WHERE r.closed_reason = 0
+                          ORDER BY c.dataset, c.sequence, c.amendment_id DESC)
+                   ) flagged
+                  GROUP BY dataset",
                 &[],
             )
             .map_err(unavailable)?
