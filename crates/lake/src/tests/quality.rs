@@ -71,6 +71,8 @@ fn try_read(
                 series_keys: Vec::new(),
                 all_series: false,
                 dates: None,
+                window: Default::default(),
+                fields: Vec::new(),
             },
             &envelope("reporting-1", true, ""),
         )
@@ -376,6 +378,8 @@ async fn a_signals_assessment_is_its_own_record_raising_the_rows_effective_state
                 series_keys: Vec::new(),
                 all_series: false,
                 dates: None,
+                window: Default::default(),
+                fields: Vec::new(),
             },
             &envelope("reporting-1", true, ""),
         )

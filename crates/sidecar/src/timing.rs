@@ -2,9 +2,10 @@
 //!
 //! One line at info per request the front door answers: its method, its
 //! route (the path, never its query), its status, the time to the plugin's
-//! first byte and to the answer's end, and each bus call asked while it was
-//! being answered, by topic and time. No payload and no person: the
-//! assertion's subject is not logged.
+//! first byte and to the answer's end, and the bus calls asked while it was
+//! being answered, totalled per topic: each topic's count and time
+//! (rulings 816 and 823; a line named only its first 24 calls before). No
+//! payload and no person: the assertion's subject is not logged.
 //!
 //! A plugin's reads reach the bus through this sidecar as calls of their
 //! own, not inside the page's request, so a call is named by when it was
@@ -21,9 +22,6 @@ use meridian_bus::TimedCall;
 
 /// The most recent calls kept to name; a request outlasting them says so.
 const KEPT: usize = 512;
-
-/// The most calls a line names; past it, how many more.
-pub const CALLS_NAMED: usize = 24;
 
 struct Heard {
     at: Instant,
@@ -109,7 +107,7 @@ impl Drop for Line {
             overlapping = self.overlapping,
             calls = calls.len(),
             calls_lost = lost,
-            bus = meridian_bus::calls_said(&calls, CALLS_NAMED),
+            bus = meridian_bus::calls_by_topic(&calls),
             "a request answered"
         );
     }

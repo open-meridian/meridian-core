@@ -161,6 +161,28 @@ pub fn calls_said(calls: &[TimedCall], most: usize) -> String {
     said.join(",")
 }
 
+/// The calls as one field of a line, totalled per topic (ruling 816): each
+/// topic asked, in the order it was first asked, as `topic:count:ms`, its
+/// calls' count and their time together. Every call is counted, however
+/// many: a request that paged a read twenty times says so in one entry.
+pub fn calls_by_topic(calls: &[TimedCall]) -> String {
+    let mut totals: Vec<(&str, usize, Duration)> = Vec::new();
+    for call in calls {
+        match totals.iter_mut().find(|(topic, _, _)| *topic == call.topic) {
+            Some((_, count, took)) => {
+                *count += 1;
+                *took += call.took;
+            }
+            None => totals.push((&call.topic, 1, call.took)),
+        }
+    }
+    totals
+        .into_iter()
+        .map(|(topic, count, took)| format!("{topic}:{count}:{:.0}", took.as_secs_f64() * 1e3))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 impl Bus {
     /// A bus with one backend and no routing rules, which is the shape of a
     /// single-host deployment.
@@ -578,6 +600,35 @@ mod tests {
             "{said}"
         );
         assert!(said.ends_with(",+1 more"), "{said}");
+        // Per topic, every call counted, in the order first asked.
+        let by_topic = super::calls_by_topic(&calls);
+        assert!(
+            by_topic.starts_with("platform.lake.query.list-quotes:2:"),
+            "{by_topic}"
+        );
+        assert!(
+            by_topic.contains(",platform.lake.query.nobody:1:"),
+            "{by_topic}"
+        );
+    }
+
+    #[test]
+    fn calls_are_totalled_per_topic_however_many() {
+        let calls: Vec<TimedCall> = (0..30)
+            .map(|i| TimedCall {
+                topic: if i % 10 == 9 {
+                    "platform.lake.query.list-quotes".into()
+                } else {
+                    "platform.lake.query.list-series".into()
+                },
+                took: Duration::from_millis(10),
+            })
+            .collect();
+        assert_eq!(
+            super::calls_by_topic(&calls),
+            "platform.lake.query.list-series:27:270,platform.lake.query.list-quotes:3:30"
+        );
+        assert_eq!(super::calls_by_topic(&[]), "");
     }
 
     #[tokio::test]

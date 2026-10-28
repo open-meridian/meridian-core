@@ -57,7 +57,7 @@ pub struct NotServed {
 
 /// What a read asks of a dataset's instance: the subjects no kept row
 /// answered.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Ask {
     pub dataset: String,
     pub data_type: DataType,
@@ -68,6 +68,109 @@ pub struct Ask {
     /// Keep the subjects current: a read of the latest, of a dataset with a
     /// cadence.
     pub standing: bool,
+    /// Contract v28, amended 2026-10-28 (ruling 821; the v29 plan's item
+    /// E9): the read's series, named by key or every series of the
+    /// subjects, and its expiration window, so a chain want is told apart
+    /// from the underlying's own and the data plugin fetches only that.
+    pub series_keys: Vec<meridian_domain::v1::Identifier>,
+    pub all_series: bool,
+    pub window: Window,
+}
+
+/// An expiration window, plain dates inclusive (contract v28, amended
+/// 2026-10-28; ruling 821): `None` on a side for no bound there.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Window {
+    pub from: Option<Date>,
+    pub to: Option<Date>,
+}
+
+impl Window {
+    /// Whether the window bounds anything.
+    pub fn is_set(&self) -> bool {
+        self.from.is_some() || self.to.is_some()
+    }
+
+    /// Whether a series expiring on `date` is in the window.
+    pub fn holds(&self, date: &Date) -> bool {
+        self.from.as_ref().is_none_or(|from| date >= from)
+            && self.to.as_ref().is_none_or(|to| date <= to)
+    }
+
+    /// Whether every date `other` holds, this holds.
+    pub fn covers(&self, other: &Window) -> bool {
+        let from = match (&self.from, &other.from) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(a), Some(b)) => a <= b,
+        };
+        let to = match (&self.to, &other.to) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(a), Some(b)) => a >= b,
+        };
+        from && to
+    }
+
+    /// The least window holding both: a standing want's window is the
+    /// union of its readers' windows (ruling 821).
+    pub fn union(&self, other: &Window) -> Window {
+        Window {
+            from: match (&self.from, &other.from) {
+                (Some(a), Some(b)) => Some(*a.min(b)),
+                _ => None,
+            },
+            to: match (&self.to, &other.to) {
+                (Some(a), Some(b)) => Some(*a.max(b)),
+                _ => None,
+            },
+        }
+    }
+
+    /// Its sides as a want and a request carry them: plain dates, empty for
+    /// no bound.
+    pub fn sides(&self) -> (String, String) {
+        (
+            self.from.as_ref().map(Date::to_string).unwrap_or_default(),
+            self.to.as_ref().map(Date::to_string).unwrap_or_default(),
+        )
+    }
+}
+
+/// When a listed series expires (contract v28): its template's
+/// `expiration_date`, else its `last_trade_date`, else its
+/// `final_settlement_date`; `None` where it states none of them.
+pub fn expires(series: &meridian_domain::v1::ListedSeries) -> Option<Date> {
+    [
+        "expiration_date",
+        "last_trade_date",
+        "final_settlement_date",
+    ]
+    .iter()
+    .find_map(|path| {
+        series
+            .fields
+            .iter()
+            .find(|field| field.path == *path && !field.value.is_empty())
+            .map(|field| field.value.clone())
+    })
+    .and_then(|date| Date::parse(&date).ok())
+}
+
+/// A series key as the window's listing is matched by: its scheme and
+/// value, and for a ticker its venue's MIC in `source`, as
+/// [`meridian_domain::lake::series_asked`] matches one.
+pub fn series_named(identifier: &meridian_domain::v1::Identifier) -> String {
+    if identifier.scheme == meridian_domain::lake::TICKER_SCHEME {
+        format!(
+            "{}\u{1f}{}\u{1f}{}",
+            identifier.scheme,
+            identifier.value,
+            identifier.source.to_ascii_uppercase()
+        )
+    } else {
+        format!("{}\u{1f}{}", identifier.scheme, identifier.value)
+    }
 }
 
 /// A read, answered.
@@ -109,6 +212,58 @@ pub struct Read {
     pub roles: Vec<(String, i32)>,
     /// Contract v28 (the filings slice, W10.6): what else the read keeps.
     pub narrowed: Narrowed,
+    /// Contract v28, amended 2026-10-28 (ruling 821): the expiration window
+    /// `all_series` is narrowed by. A listed series' own row is kept by its
+    /// own expiration ([`expires`]); any other row keyed by a series by
+    /// `listed`.
+    pub window: Window,
+    /// The series the lake's listing holds expiring in `window`, as
+    /// [`series_named`] names them; `None` where no window is asked. A row
+    /// about a series the listing does not hold is answered only to a read
+    /// naming it by key.
+    pub listed: Option<BTreeSet<String>>,
+    /// Contract v28, amended 2026-10-28 (ruling 821): the dictionary entries
+    /// of the row's message to answer; none for every field. The envelope
+    /// is always answered, and a field not asked is left unset without being
+    /// named unanswered.
+    pub fields: BTreeSet<String>,
+}
+
+/// Whether a read keeps a row by its series (contract v28, W10.6, amended
+/// 2026-10-28): asked by key or with `all_series`, and within the window
+/// where one is asked.
+pub fn series_kept(read: &Read, row: &Observation) -> bool {
+    let key = &row.meta().series_key;
+    if !meridian_domain::lake::series_asked(key, &read.series_keys, read.all_series) {
+        return false;
+    }
+    if !read.window.is_set() || key.is_empty() {
+        return true;
+    }
+    match row {
+        Observation::Series(series) => expires(series).is_some_and(|date| read.window.holds(&date)),
+        _ => read.listed.as_ref().is_some_and(|listed| {
+            key.iter()
+                .any(|identifier| listed.contains(&series_named(identifier)))
+        }),
+    }
+}
+
+/// A row stripped as its reader may read it and as its read asked (W10.1;
+/// contract v28, amended 2026-10-28): each field the reader may not read
+/// that the read asked for, or every one where it asked for none, returned
+/// to be named NOT_ENTITLED; then each field not asked, unset and not named.
+fn strip_for(row: &mut Observation, allowed: &BTreeSet<String>, read: &Read) -> Vec<&'static str> {
+    let mut removed = row.strip(allowed);
+    if !read.fields.is_empty() {
+        removed.retain(|field| read.fields.contains(*field));
+        let mut asked = read.fields.clone();
+        if let Some(meta) = meridian_domain::lake::fields_of(read.data_type.name()).first() {
+            asked.insert((*meta).to_string());
+        }
+        row.strip(&asked);
+    }
+    removed
 }
 
 /// What a read of the filings slice keeps besides its subjects, kinds and
@@ -478,13 +633,7 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
     }
     // A chain's rows only to a read that asks for series (contract v28,
     // W10.6): a listed series is always keyed by one, and read by ListSeries.
-    rows.retain(|row| {
-        meridian_domain::lake::series_asked(
-            &row.meta().series_key,
-            &read.series_keys,
-            read.all_series,
-        )
-    });
+    rows.retain(|row| series_kept(read, row));
     if let Some((from, to)) = &read.dates {
         rows.retain(|row| Date::parse(&row.date()).is_ok_and(|date| &date >= from && &date <= to));
     }
@@ -775,7 +924,7 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
         let allowed = config
             .fields_for(&dataset, &read.reader)
             .unwrap_or_default();
-        for field in row.strip(&allowed) {
+        for field in strip_for(row, &allowed, read) {
             if named_fields.insert((dataset.clone(), field.to_string())) {
                 out.not_served.push(NotServed {
                     subject: String::new(),
@@ -827,6 +976,9 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
             interval_ns: read.interval_ns,
             when: read.when.clone(),
             standing: standing && current,
+            series_keys: read.series_keys.clone(),
+            all_series: read.all_series,
+            window: read.window.clone(),
         });
     }
     Ok(out)
@@ -869,13 +1021,7 @@ pub fn with_served(
             .filter(|row| row.data_type() == read.data_type)
             .filter(|row| read.subjects.contains(&alias_of(row.subject())))
             .filter(|row| read.kinds.is_empty() || read.kinds.contains(&row.kind()))
-            .filter(|row| {
-                meridian_domain::lake::series_asked(
-                    &row.meta().series_key,
-                    &read.series_keys,
-                    read.all_series,
-                )
-            })
+            .filter(|row| series_kept(read, row))
             .filter(|row| read.sources.include_quarantined || !invalid(row))
             .collect();
         if matches!(read.when, When::Latest { .. }) {
@@ -890,7 +1036,7 @@ pub fn with_served(
             let allowed = config
                 .fields_for(&dataset, &read.reader)
                 .unwrap_or_default();
-            for field in row.strip(&allowed) {
+            for field in strip_for(&mut row, &allowed, read) {
                 let said = NotServed {
                     subject: String::new(),
                     dataset: dataset.clone(),

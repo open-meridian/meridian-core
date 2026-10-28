@@ -350,6 +350,8 @@ impl Lake {
                         series_keys: Vec::new(),
                         all_series: false,
                         dates: None,
+                        window: Default::default(),
+                        fields: Vec::new(),
                     }
                 };
             // Every page of one read, until the limit is passed.

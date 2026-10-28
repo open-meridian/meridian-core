@@ -315,6 +315,18 @@ pub trait Store: Send + Sync {
     /// Rows kept per dataset, and of them those carrying a value as reported.
     fn counts(&self) -> Result<BTreeMap<String, (u64, u64)>>;
 
+    /// Per dataset holding any, the rows kept carrying a value as reported:
+    /// what the datasets' listing answers (W10.9), read without counting
+    /// every row (ruling 816).
+    fn unconverted_counts(&self) -> Result<BTreeMap<String, u64>> {
+        Ok(self
+            .counts()?
+            .into_iter()
+            .filter(|(_, (_, unconverted))| *unconverted > 0)
+            .map(|(dataset, (_, unconverted))| (dataset, unconverted))
+            .collect())
+    }
+
     /// The lowest sequence a dataset's partition still keeps, where it keeps
     /// any (contract v19): a watermark below it asks for rows retention
     /// removed.

@@ -308,6 +308,8 @@ fn read_quotes(h: &Harness, keys: Vec<Identifier>, all: bool) -> Vec<Quote> {
                 series_keys: keys,
                 all_series: all,
                 dates: None,
+                window: Default::default(),
+                fields: Vec::new(),
             },
             &envelope("signal-1"),
         )
@@ -949,6 +951,8 @@ async fn a_read_in_pages_is_answered_once_and_held_until_its_last_page() {
                     series_keys: vec![],
                     all_series: true,
                     dates: None,
+                    window: Default::default(),
+                    fields: Vec::new(),
                 },
                 &envelope("signal-1"),
             )
@@ -982,5 +986,409 @@ async fn a_read_in_pages_is_answered_once_and_held_until_its_last_page() {
     assert!(
         after.rows.is_empty(),
         "not entitled now: nothing served from the held answer"
+    );
+}
+
+/// A read over the bus as core reads, every field entitled: the handler's
+/// own checks and narrowing (contract v28, amended 2026-10-28).
+async fn asked<Q: Message, R: Message + Default>(
+    h: &Harness,
+    topic: &str,
+    kind: &str,
+    request: Q,
+) -> Result<R, String> {
+    h.bus
+        .call(topic, kind, request.encode_to_vec(), None, None)
+        .await
+        .map(|(_, payload)| R::decode(&payload[..]).unwrap())
+        .map_err(|failed| failed.to_string())
+}
+
+fn refused_naming(said: &str) -> Vec<String> {
+    let at = said.find("[refusal-status").expect(said);
+    meridian_bus::read_refusal_status(&said[at..])
+        .map(|(_, fields, _)| fields)
+        .unwrap_or_default()
+}
+
+const OSI_UNLISTED: &str = "AAPL  261120P00210000";
+
+/// Rulings 821, 833 and 835 to 838 (spec/one-data-access-model, step 1): a
+/// chain read names its expiration window, answered from the lake's listing,
+/// and the fields it shows; the envelope always, a field not asked unset and
+/// never named unanswered; a window only with all_series and never beside
+/// series_keys; a field of another message refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chain_read_names_its_window_and_its_fields() {
+    let h = harness();
+    let listed = vec![
+        Observation::Series(series(OSI_CALL, "call", "230", "2026-11-20")),
+        Observation::Series(series(OSI_PUT, "put", "200", "2026-12-18")),
+    ];
+    assert_eq!(record(&h, "series", listed).unwrap(), (2, 0, 0));
+    let sized = |key: &str| {
+        let mut q = quote(key, "4.10", "4.20", NOW - HOUR);
+        q.bid_quantity = decimal("10");
+        q.ask_quantity = decimal("12");
+        Observation::Quote(q)
+    };
+    let own = Quote {
+        meta: meta("quote:AAPL", AAPL, vec![], ""),
+        bid: usd("227.50"),
+        ask: usd("227.52"),
+        ..Default::default()
+    };
+    let quotes = vec![
+        Observation::Quote(own),
+        sized(OSI_CALL),
+        sized(OSI_PUT),
+        sized(OSI_UNLISTED),
+    ];
+    assert_eq!(record(&h, "quotes", quotes).unwrap(), (4, 0, 0));
+    let november = |fields: Vec<&str>| meridian_domain::v1::ListQuotesRequest {
+        subjects: subjects(AAPL),
+        all_series: true,
+        expiration_from: "2026-11-20".into(),
+        expiration_to: "2026-11-20".into(),
+        fields: fields.into_iter().map(String::from).collect(),
+        ..Default::default()
+    };
+    let reply: meridian_domain::v1::ListQuotesReply = asked(
+        &h,
+        service::LIST_QUOTES,
+        "meridian.v1.ListQuotesRequest",
+        november(vec!["meridian.v1.Quote.bid", "meridian.v1.Quote.ask"]),
+    )
+    .await
+    .unwrap();
+    // The underlying's own quote and the November call; never the December
+    // put, nor the November put the listing does not hold.
+    let keys: Vec<Vec<Identifier>> = reply
+        .quotes
+        .iter()
+        .map(|q| q.meta.as_ref().unwrap().series_key.clone())
+        .collect();
+    assert_eq!(keys.len(), 2, "{keys:?}");
+    assert!(keys.contains(&vec![]));
+    assert!(keys.contains(&osi(OSI_CALL)));
+    for q in &reply.quotes {
+        assert!(q.meta.is_some(), "the envelope always");
+        assert!(q.bid.is_some() && q.ask.is_some());
+        assert!(q.bid_quantity.is_none() && q.ask_quantity.is_none());
+    }
+    assert!(
+        reply.unanswered.iter().all(|u| u.field.is_empty()),
+        "a field not asked is not unanswered: {:?}",
+        reply.unanswered
+    );
+    // Every field, none asked; the unlisted series by its key alone.
+    let whole: meridian_domain::v1::ListQuotesReply = asked(
+        &h,
+        service::LIST_QUOTES,
+        "meridian.v1.ListQuotesRequest",
+        november(vec![]),
+    )
+    .await
+    .unwrap();
+    assert!(whole.quotes.iter().any(|q| q.bid_quantity.is_some()));
+    let unlisted: meridian_domain::v1::ListQuotesReply = asked(
+        &h,
+        service::LIST_QUOTES,
+        "meridian.v1.ListQuotesRequest",
+        meridian_domain::v1::ListQuotesRequest {
+            subjects: subjects(AAPL),
+            series_keys: osi(OSI_UNLISTED),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(unlisted
+        .quotes
+        .iter()
+        .any(|q| q.meta.as_ref().unwrap().series_key == osi(OSI_UNLISTED)));
+    // The refusals, each naming its field.
+    let refused = |request: meridian_domain::v1::ListQuotesRequest| {
+        let h = &h;
+        async move {
+            asked::<_, meridian_domain::v1::ListQuotesReply>(
+                h,
+                service::LIST_QUOTES,
+                "meridian.v1.ListQuotesRequest",
+                request,
+            )
+            .await
+            .unwrap_err()
+        }
+    };
+    let mut no_all = november(vec![]);
+    no_all.all_series = false;
+    assert_eq!(refused_naming(&refused(no_all).await), ["expiration_from"]);
+    let mut keyed = november(vec![]);
+    keyed.series_keys = osi(OSI_CALL);
+    assert_eq!(refused_naming(&refused(keyed).await), ["series_keys"]);
+    let other = november(vec!["meridian.v1.Trade.price"]);
+    assert_eq!(refused_naming(&refused(other).await), ["fields"]);
+    let mut backwards = november(vec![]);
+    backwards.expiration_from = "2026-12-01".into();
+    assert_eq!(refused_naming(&refused(backwards).await), ["expiration_to"]);
+    // A chain's trades refuse a window without all_series as quotes do.
+    let said = asked::<_, meridian_domain::v1::ListTradesReply>(
+        &h,
+        service::LIST_TRADES,
+        "meridian.v1.ListTradesRequest",
+        meridian_domain::v1::ListTradesRequest {
+            subjects: subjects(AAPL),
+            valid_from_ns: NOW - 2 * HOUR,
+            valid_until_ns: NOW,
+            expiration_from: "2026-11-20".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refused_naming(&said), ["expiration_from"]);
+    // A chain's statistics, one expiration's.
+    let stats = vec![
+        Observation::Statistic(open_interest(OSI_CALL, "2026-10-07", "1200")),
+        Observation::Statistic(open_interest(OSI_PUT, "2026-10-07", "800")),
+    ];
+    assert_eq!(record(&h, "statistics", stats).unwrap(), (2, 0, 0));
+    let reply: meridian_domain::v1::ListStatisticsReply = asked(
+        &h,
+        service::LIST_STATISTICS,
+        "meridian.v1.ListStatisticsRequest",
+        ListStatisticsRequest {
+            subjects: subjects(AAPL),
+            all_series: true,
+            expiration_to: "2026-11-30".into(),
+            fields: vec!["meridian.v1.Statistic.value".into()],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(reply.statistics.len(), 1);
+    let only = &reply.statistics[0];
+    assert_eq!(only.meta.as_ref().unwrap().series_key, osi(OSI_CALL));
+    assert!(only.value.is_some());
+    assert_eq!(only.kind, 0, "the kind not asked is left unset");
+}
+
+/// A field asked and not entitled is answered as before: unset and named
+/// NOT_ENTITLED; one not entitled and not asked is not named.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_field_asked_and_not_entitled_is_named_one_not_asked_is_not() {
+    let h = harness();
+    let mut configuration = configuration();
+    configuration.entitlements[0].fields = vec![
+        "meridian.v1.Quote.meta".into(),
+        "meridian.v1.Quote.bid".into(),
+    ];
+    h.lake.configured(&configuration);
+    let mut q = quote(OSI_CALL, "4.10", "4.20", NOW - HOUR);
+    q.bid_quantity = decimal("10");
+    assert_eq!(
+        record(&h, "quotes", vec![Observation::Quote(q)]).unwrap(),
+        (1, 0, 0)
+    );
+    let answer = tokio::task::block_in_place(|| {
+        h.lake.read(
+            ReadRequest {
+                data_type: DataType::Quote,
+                subjects: subjects(AAPL),
+                kinds: vec![],
+                interval_ns: 0,
+                sources: None,
+                at_ns: 0,
+                business_date: String::new(),
+                valid_from_ns: 0,
+                valid_until_ns: 0,
+                as_of_ns: 0,
+                page_size: 0,
+                cursor: String::new(),
+                after: None,
+                tenors: vec![],
+                published_as_of_ns: 0,
+                series_keys: vec![],
+                all_series: true,
+                dates: None,
+                window: Default::default(),
+                fields: vec![
+                    "meridian.v1.Quote.bid".into(),
+                    "meridian.v1.Quote.ask".into(),
+                ],
+            },
+            &envelope("signal-1"),
+        )
+    })
+    .unwrap();
+    let Observation::Quote(answered) = &answer.rows[0] else {
+        panic!("a quote")
+    };
+    assert!(answered.bid.is_some());
+    assert!(answered.ask.is_none() && answered.bid_quantity.is_none());
+    let named: Vec<&str> = answer.unanswered.iter().map(|u| u.field.as_str()).collect();
+    assert_eq!(named, ["meridian.v1.Quote.ask"], "{:?}", answer.unanswered);
+}
+
+/// A listing read names its terms by template path (ruling 836), and a page
+/// asked no size is filled to about 512 KiB (rulings 816 and 823): a chain
+/// in a few pages, each within the budget, every series once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_listing_read_names_its_paths_and_fills_its_pages() {
+    let h = harness();
+    let mut rows = Vec::new();
+    for expiry in 0..10 {
+        for strike in 0..300 {
+            let key = format!("AAPL  2612{:02}C00{:03}000", expiry + 1, 100 + strike);
+            let date = format!("2026-12-{:02}", expiry + 1);
+            rows.push(Observation::Series(series(
+                &key,
+                "call",
+                &strike.to_string(),
+                &date,
+            )));
+        }
+    }
+    for batch in rows.chunks(500) {
+        record(&h, "series", batch.to_vec()).unwrap();
+    }
+    let list = |page_size: u32, cursor: &str, paths: Vec<&str>| {
+        tokio::task::block_in_place(|| {
+            h.lake.list_series(
+                ListSeriesRequest {
+                    subjects: subjects(AAPL),
+                    page_size,
+                    cursor: cursor.into(),
+                    paths: paths.into_iter().map(String::from).collect(),
+                    ..Default::default()
+                },
+                &envelope("signal-1"),
+            )
+        })
+        .unwrap()
+    };
+    // Named paths: those terms alone, the rest always.
+    let named = list(
+        5,
+        "",
+        vec!["put_or_call", "strike_price", "expiration_date"],
+    );
+    assert_eq!(named.series.len(), 5);
+    for s in &named.series {
+        let paths: Vec<&str> = s.fields.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["put_or_call", "strike_price", "expiration_date"]);
+        assert!(s.meta.is_some() && !s.template_id.is_empty() && !s.template_version.is_empty());
+    }
+    // Asked no size: filled to the budget.
+    let (mut cursor, mut pages, mut seen) = (String::new(), 0, std::collections::BTreeSet::new());
+    loop {
+        let page = list(0, &cursor, vec![]);
+        pages += 1;
+        assert!(
+            page.encoded_len() <= 512 * 1024,
+            "page {pages}: {} bytes",
+            page.encoded_len()
+        );
+        for s in &page.series {
+            assert!(
+                seen.insert(s.meta.as_ref().unwrap().row_key.clone()),
+                "once each"
+            );
+        }
+        cursor = page.next_cursor;
+        if cursor.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(seen.len(), 3_000);
+    assert!(pages <= 4, "{pages} pages");
+    assert!(pages > 1, "the budget ends a page");
+    // Asked a size: that many, never past 500.
+    assert_eq!(list(100, "", vec![]).series.len(), 100);
+    assert_eq!(list(900, "", vec![]).series.len(), 500);
+}
+
+async fn next_want(
+    wanted: &mut meridian_bus::Subscription,
+) -> Option<meridian_domain::v1::ObservationsWantedEvent> {
+    tokio::time::timeout(std::time::Duration::from_millis(500), wanted.recv())
+        .await
+        .ok()
+        .flatten()
+        .map(|delivered| {
+            meridian_domain::v1::ObservationsWantedEvent::decode(&delivered.envelope.payload[..])
+                .unwrap()
+        })
+}
+
+/// A want made from a chain read carries its window and all_series, told
+/// apart from the underlying's own quote want (ruling 821, the v29 plan's
+/// item E9); a reader asking outside it widens it to the union, asked again
+/// under the same want.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chain_want_carries_its_window_and_is_told_apart() {
+    let h = harness();
+    let mut wanted = h.bus.subscribe_every(service::OBSERVATIONS_WANTED);
+    let read = |all_series: bool, from: &str, to: &str| {
+        tokio::task::block_in_place(|| {
+            h.lake.read(
+                ReadRequest {
+                    data_type: DataType::Quote,
+                    subjects: subjects(ES),
+                    kinds: vec![],
+                    interval_ns: 0,
+                    sources: None,
+                    at_ns: 0,
+                    business_date: String::new(),
+                    valid_from_ns: 0,
+                    valid_until_ns: 0,
+                    as_of_ns: 0,
+                    page_size: 0,
+                    cursor: String::new(),
+                    after: None,
+                    tenors: vec![],
+                    published_as_of_ns: 0,
+                    series_keys: vec![],
+                    all_series,
+                    dates: None,
+                    window: crate::read::Window {
+                        from: meridian_domain::date::optional("from", from).unwrap(),
+                        to: meridian_domain::date::optional("to", to).unwrap(),
+                    },
+                    fields: Vec::new(),
+                },
+                &envelope("signal-1"),
+            )
+        })
+        .unwrap()
+    };
+    read(true, "2026-12-18", "2026-12-18");
+    let chain = next_want(&mut wanted).await.expect("a chain want");
+    assert!(chain.all_series);
+    assert_eq!(
+        (chain.expiration_from.as_str(), chain.expiration_to.as_str()),
+        ("2026-12-18", "2026-12-18")
+    );
+    read(false, "", "");
+    let own = next_want(&mut wanted)
+        .await
+        .expect("the underlying's own want");
+    assert!(!own.all_series && own.expiration_from.is_empty());
+    assert_ne!(own.want_id, chain.want_id, "told apart");
+    // The same window again: coalesced, nothing published.
+    read(true, "2026-12-18", "2026-12-18");
+    assert!(next_want(&mut wanted).await.is_none());
+    // A wider one: the same want, its window the union.
+    read(true, "2026-11-20", "2026-11-20");
+    let widened = next_want(&mut wanted).await.expect("the want asked again");
+    assert_eq!(widened.want_id, chain.want_id);
+    assert_eq!(
+        (
+            widened.expiration_from.as_str(),
+            widened.expiration_to.as_str()
+        ),
+        ("2026-11-20", "2026-12-18")
     );
 }
