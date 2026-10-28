@@ -668,10 +668,7 @@ impl Standing {
     fn words(self) -> &'static str {
         match self {
             Standing::WithThePlatform => "waiting on the platform, usually within a day",
-            Standing::PlatformUnreached => {
-                "waiting on the platform, which this deployment cannot reach just now; asked \
-                 again once it can"
-            }
+            Standing::PlatformUnreached => "waiting until the platform can be reached",
             Standing::HeldBack => "held back at the migration",
             Standing::NeedsAPerson => "the platform cannot resolve it, so it needs you",
         }
@@ -690,6 +687,22 @@ impl Standing {
 
 /// How many names a home line spells out before "and N more".
 const HOME_NAMES: usize = 3;
+
+/// Who a home line names: up to `most` of `names`, then how many more,
+/// `extra` unnamed among them; escaped.
+fn who_of(names: &[String], extra: usize, most: usize) -> String {
+    let more = names.len().saturating_sub(most) + extra;
+    let shown: Vec<String> = names.iter().take(most).map(|n| escape(n)).collect();
+    match (shown.len(), more) {
+        (_, 0) if shown.len() > 1 => {
+            let (last, rest) = shown.split_last().expect("more than one");
+            format!("{} and {last}", rest.join(", "))
+        }
+        (_, 0) => shown.join(""),
+        (0, more) => format!("{more} record{}", if more == 1 { "" } else { "s" }),
+        (_, more) => format!("{} and {more} more", shown.join(", ")),
+    }
+}
 
 /// The home page's instrument-record lines, for the deployment admin alone
 /// (ruling 831; W3.11, contract v24): the records the book cannot use yet
@@ -754,9 +767,14 @@ pub fn home_status(
     if groups.is_empty() && unread == 0 {
         return String::new();
     }
-    // Where the platform has them, one line of a sentence each; what needs
-    // a person, a line of its own, the one that asks.
+    // Where the platform has them, a sentence each; on a phone's screen,
+    // one sentence for them all, so the home still fits it (every page fits
+    // one screen). What needs a person, a line of its own, the one that
+    // asks.
     let mut status = Vec::new();
+    let mut waiting: Vec<String> = Vec::new();
+    let mut waiting_n = 0;
+    let mut held_back = false;
     let mut asked = String::new();
     for (standing, mut names) in groups {
         names.sort_by_key(|name| name.to_lowercase());
@@ -765,41 +783,57 @@ pub fn home_status(
         } else {
             0
         };
-        let more = names.len().saturating_sub(HOME_NAMES) + extra;
-        let shown: Vec<String> = names.iter().take(HOME_NAMES).map(|n| escape(n)).collect();
-        let who = match (shown.len(), more) {
-            (_, 0) if shown.len() > 1 => {
-                let (last, rest) = shown.split_last().expect("more than one");
-                format!("{} and {last}", rest.join(", "))
-            }
-            (_, 0) => shown.join(""),
-            (0, more) => format!("{more} record{}", if more == 1 { "" } else { "s" }),
-            (_, more) => format!("{} and {more} more", shown.join(", ")),
-        };
         let n = names.len() + extra;
         let words = standing.words_for(n);
         match standing {
             Standing::NeedsAPerson => {
+                let wide = who_of(&names, 0, HOME_NAMES);
+                let narrow = who_of(&names, 0, 1);
+                let who = if wide == narrow {
+                    wide
+                } else {
+                    format!(
+                        "<span class=\"names-wide\">{wide}</span>\
+                         <span class=\"names-narrow\">{narrow}</span>"
+                    )
+                };
                 asked = format!(
                     "<p class=\"notice warn\" id=\"instruments-need-you\" data-need-you=\"{n}\">\
                      {who}: {words}. <a href=\"/admin/instruments#provisional\">Open {it}</a></p>",
                     it = if n == 1 { "it" } else { "them" },
                 )
             }
-            _ => status.push(format!(
-                "<span data-instrument-status=\"{key}\" data-count=\"{n}\">{who}: {words}.</span>",
-                key = match standing {
-                    Standing::WithThePlatform => "with-the-platform",
-                    Standing::PlatformUnreached => "platform-unreached",
-                    _ => "held-back",
-                },
-            )),
+            _ => {
+                held_back |= standing == Standing::HeldBack;
+                waiting_n += n;
+                waiting.extend(names.iter().take(1).cloned());
+                status.push(format!(
+                    "<span data-instrument-status=\"{key}\" data-count=\"{n}\">{who}: {words}.</span>",
+                    key = match standing {
+                        Standing::WithThePlatform => "with-the-platform",
+                        Standing::PlatformUnreached => "platform-unreached",
+                        _ => "held-back",
+                    },
+                    who = who_of(&names, extra, HOME_NAMES),
+                ));
+            }
         }
     }
     let mut out = String::new();
     if !status.is_empty() {
+        let first = waiting.first().cloned().unwrap_or_default();
+        let narrow = format!(
+            "{who}: {words}.",
+            who = who_of(&[first], waiting_n.saturating_sub(1), 1),
+            words = if held_back {
+                "waiting on the platform or held back"
+            } else {
+                "waiting on the platform"
+            },
+        );
         out.push_str(&format!(
-            "<p class=\"notice\" id=\"instrument-status\">{}</p>",
+            "<p class=\"notice\" id=\"instrument-status\"><span class=\"names-wide\">{}</span>\
+             <span class=\"names-narrow\">{narrow}</span></p>",
             status.join(" ")
         ));
     }
@@ -2960,7 +2994,14 @@ mod tests {
             ),
             "{home}"
         );
-        assert!(home.contains("DIA: waiting on the platform, which this deployment cannot reach"));
+        // On a phone's screen, one sentence for all the platform has.
+        assert!(
+            home.contains(
+                "<span class=\"names-narrow\">IWM and 7 more: waiting on the platform.</span>"
+            ),
+            "{home}"
+        );
+        assert!(home.contains("DIA: waiting until the platform can be reached."));
         assert!(
             home.contains("ACME: the platform cannot resolve it, so it needs you.")
                 && home.contains("id=\"instruments-need-you\"")

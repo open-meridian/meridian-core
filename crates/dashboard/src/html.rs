@@ -375,6 +375,8 @@ background:var(--accent-wash);color:var(--accent);font-weight:700;font-size:1.05
 .plugin-text{display:flex;flex-direction:column;min-width:0;flex:1 1 auto}\
 .plugin-name{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}\
 .plugin-instance{font:.8rem var(--mono);color:var(--ink-faint);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}\
+.plugin-sub{display:flex;align-items:center;gap:.45rem;min-width:0}.plugin-sub .badge{flex:none;margin:0}\
+.names-narrow{display:none}@media (max-width:40rem){.names-wide{display:none}.names-narrow{display:inline}}\
 .plugin-meta{display:flex;gap:.35rem;flex-wrap:wrap;justify-content:flex-end}\
 .plugin-open{color:var(--accent);font-weight:550;white-space:nowrap}\
 .plugin-card:not(a) .plugin-open{color:var(--ink-faint);font-weight:400}\

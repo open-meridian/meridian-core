@@ -604,9 +604,16 @@ fn plugin_card(
         }
         None => String::new(),
     };
+    // On the line under the name, beside the instance, which gives way
+    // first: a narrow card never cuts the badge off (ruling 831).
+    let sub = if badge.is_empty() {
+        sub
+    } else {
+        format!("<span class=\"plugin-sub\">{sub}{badge}</span>")
+    };
     let text = format!(
         "<span class=\"plugin-icon\" aria-hidden=\"true\">{initial}</span>\
-         <span class=\"plugin-text\"><span class=\"plugin-name\">{title}{badge}</span>{sub}</span>",
+         <span class=\"plugin-text\"><span class=\"plugin-name\">{title}</span>{sub}</span>",
         initial = escape(&initial),
         title = escape(title),
     );
