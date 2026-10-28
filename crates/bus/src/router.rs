@@ -115,6 +115,50 @@ pub struct Bus {
     /// read from the wall: a bus that read its own would stamp a replay with
     /// the time it was replayed.
     clock: Arc<dyn Clock>,
+
+    /// Told of every call this bus asks, its topic and how long it took
+    /// (ruling 798): a sidecar's front door names the calls its plugin made
+    /// while a page was being answered.
+    observer: RwLock<Option<CallObserver>>,
+}
+
+/// What [`Bus::observe_calls`] is told of each call: its topic, when it was
+/// asked and how long its answer took. Never its payload.
+pub type CallObserver = Arc<dyn Fn(&str, std::time::Instant, Duration) + Send + Sync>;
+
+/// One call a request made, as its timing line names it (ruling 798).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimedCall {
+    pub topic: String,
+    pub took: Duration,
+}
+
+tokio::task_local! {
+    static TIMED: Arc<std::sync::Mutex<Vec<TimedCall>>>;
+}
+
+/// Run `work`, and say every bus call it asked while it ran on this task
+/// (ruling 798): a dashboard request's timing line. A call asked from a task
+/// it spawned is not this one's.
+pub async fn timed<F: std::future::Future>(work: F) -> (F::Output, Vec<TimedCall>) {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let output = TIMED.scope(Arc::clone(&calls), work).await;
+    let calls = std::mem::take(&mut *calls.lock().expect("timed calls poisoned"));
+    (output, calls)
+}
+
+/// The calls as one field of a line: `topic:ms` each, in the order asked,
+/// at most `most` of them and how many more.
+pub fn calls_said(calls: &[TimedCall], most: usize) -> String {
+    let mut said: Vec<String> = calls
+        .iter()
+        .take(most)
+        .map(|call| format!("{}:{:.0}", call.topic, call.took.as_secs_f64() * 1e3))
+        .collect();
+    if calls.len() > most {
+        said.push(format!("+{} more", calls.len() - most));
+    }
+    said.join(",")
 }
 
 impl Bus {
@@ -135,6 +179,7 @@ impl Bus {
             instance_id: instance_id.into(),
             default_timeout: Duration::from_secs(5),
             clock,
+            observer: RwLock::new(None),
         }
     }
 
@@ -338,6 +383,38 @@ impl Bus {
         timeout: Option<Duration>,
         stamp: &Stamp,
     ) -> crate::Result<(String, Vec<u8>)> {
+        let started = std::time::Instant::now();
+        let answered = self
+            .asked(topic, payload_type, payload, correlation_id, timeout, stamp)
+            .await;
+        let took = started.elapsed();
+        let _ = TIMED.try_with(|calls| {
+            calls.lock().expect("timed calls poisoned").push(TimedCall {
+                topic: topic.to_string(),
+                took,
+            })
+        });
+        let observer = self.observer.read().expect("observer poisoned").clone();
+        if let Some(observer) = observer {
+            observer(topic, started, took);
+        }
+        answered
+    }
+
+    /// Tell `observer` of every call this bus asks from now on (ruling 798).
+    pub fn observe_calls(&self, observer: CallObserver) {
+        *self.observer.write().expect("observer poisoned") = Some(observer);
+    }
+
+    async fn asked(
+        &self,
+        topic: &str,
+        payload_type: &str,
+        payload: Vec<u8>,
+        correlation_id: Option<&str>,
+        timeout: Option<Duration>,
+        stamp: &Stamp,
+    ) -> crate::Result<(String, Vec<u8>)> {
         let handler = self
             .handlers
             .read()
@@ -456,6 +533,51 @@ mod tests {
             Arc::new(MemoryBackend::new()),
             Arc::new(ManualClock::at(NOW)),
         )
+    }
+
+    #[tokio::test]
+    async fn a_request_names_each_call_it_asked_and_an_observer_hears_them() {
+        let bus = bus();
+        bus.serve("platform.lake.query.list-quotes", |_| {
+            Ok(("R".into(), vec![]))
+        });
+        let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hearing = Arc::clone(&heard);
+        bus.observe_calls(Arc::new(move |topic, _, _| {
+            hearing.lock().unwrap().push(topic.to_string())
+        }));
+        let ((), calls) = super::timed(async {
+            for _ in 0..2 {
+                bus.call("platform.lake.query.list-quotes", "Q", vec![], None, None)
+                    .await
+                    .unwrap();
+            }
+            // Nobody serves it: still a call, and still timed.
+            let _ = bus
+                .call("platform.lake.query.nobody", "Q", vec![], None, None)
+                .await;
+        })
+        .await;
+        assert_eq!(
+            calls.iter().map(|c| c.topic.as_str()).collect::<Vec<_>>(),
+            [
+                "platform.lake.query.list-quotes",
+                "platform.lake.query.list-quotes",
+                "platform.lake.query.nobody"
+            ]
+        );
+        assert_eq!(heard.lock().unwrap().len(), 3);
+        // Outside a timed request, nothing is gathered, and nothing fails.
+        bus.call("platform.lake.query.list-quotes", "Q", vec![], None, None)
+            .await
+            .unwrap();
+        assert_eq!(heard.lock().unwrap().len(), 4);
+        let said = super::calls_said(&calls, 2);
+        assert!(
+            said.starts_with("platform.lake.query.list-quotes:"),
+            "{said}"
+        );
+        assert!(said.ends_with(",+1 more"), "{said}");
     }
 
     #[tokio::test]
@@ -673,6 +795,7 @@ mod tests {
             instance_id: "core-1".into(),
             default_timeout: Duration::from_secs(5),
             clock: Arc::new(ManualClock::at(NOW)),
+            observer: RwLock::new(None),
         };
 
         let mut on_reference = reference_backend.subscribe("platform.reference.**");

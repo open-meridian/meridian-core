@@ -164,6 +164,51 @@ fn the_terminal_sessions_from_before_delegations_leave_no_table() {
     }
 }
 
+// ── Browsers' sessions (ruling 811) ─────────────────────────────────────────
+
+#[test]
+fn a_browser_session_survives_a_restart_and_ends_on_every_replica() {
+    use meridian_dashboard::session::{self, Sessions, IDLE_NS, RECHECK_NS};
+    use std::sync::Arc;
+    let (database, url) = migrated("browser_sessions");
+    let replica = || Sessions::keeping(Arc::new(session::InPostgres::on(database.clone())));
+    let first = replica();
+    let key = first.start("ada", "Ada", vec!["traders".into()], T0);
+    let other = first.start("ada", "Ada", vec![], T0);
+    let form = first.find(&key, T0).unwrap().form_token;
+    // A restart: a new process over the same tables.
+    drop(first);
+    let restarted = replica();
+    let found = restarted
+        .find(&key, T0 + MINUTE_NS)
+        .expect("still signed in");
+    assert_eq!(found.subject, "ada");
+    assert_eq!(found.directory_groups, vec!["traders".to_string()]);
+    assert_eq!(found.form_token, form);
+    // No token anywhere in the table: only hashes, none of them the token.
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let hashes: Vec<String> = client
+        .query("SELECT session_hash FROM dashboard_browser_session", &[])
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(hashes.len(), 2);
+    assert!(hashes.iter().all(|h| h != &key && h != &other));
+    // Signed out on one replica, ended on another past its recheck.
+    let elsewhere = replica();
+    assert!(elsewhere.find(&key, T0 + MINUTE_NS).is_some());
+    restarted.end(&key);
+    assert!(elsewhere.find(&key, T0 + MINUTE_NS + RECHECK_NS).is_none());
+    // A reset ends the rest; the sweep removes the lapsed.
+    assert_eq!(restarted.end_person("ada"), 1);
+    assert_eq!(count(&url, "dashboard_browser_session"), 0);
+    let lapsing = replica();
+    lapsing.start("bo", "Bo", vec![], T0);
+    lapsing.sweep(T0 + IDLE_NS + 1);
+    assert_eq!(count(&url, "dashboard_browser_session"), 0);
+}
+
 // ── Delegations ─────────────────────────────────────────────────────────────
 
 const DAY_NS: i64 = 24 * 60 * MINUTE_NS;

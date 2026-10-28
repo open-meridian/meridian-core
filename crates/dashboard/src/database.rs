@@ -16,7 +16,9 @@
 //! - service accounts, each role's "runs as" and their records
 //!   ([`crate::service_accounts`], contract v21);
 //! - a person's answer to the professional test and who could use each
-//!   dataset each month ([`crate::data_use`], contract v28).
+//!   dataset each month ([`crate::data_use`], contract v28);
+//! - browsers' sessions, by their tokens' hashes ([`crate::session`],
+//!   ruling 811).
 //!
 //! The schema is applied by `meridian-dashboard migrate`, once per release,
 //! as the migrating role, and a starting dashboard only verifies it: the
@@ -115,6 +117,12 @@ const MIGRATIONS: &[Migration] = &[
         version: 11,
         name: "data_use",
         sql: include_str!("../migrations/0011_data_use.sql"),
+        then: None,
+    },
+    Migration {
+        version: 12,
+        name: "a_browser_session",
+        sql: include_str!("../migrations/0012_a_browser_session.sql"),
         then: None,
     },
 ];

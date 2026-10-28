@@ -437,6 +437,29 @@ impl Observation {
             .unwrap_or_default()
     }
 
+    /// Its size encoded, without encoding it.
+    pub fn encoded_len(&self) -> usize {
+        match self {
+            Observation::Price(price) => price.encoded_len(),
+            Observation::Bar(bar) => bar.encoded_len(),
+            Observation::Trade(trade) => trade.encoded_len(),
+            Observation::Quote(quote) => quote.encoded_len(),
+            Observation::Outcome(outcome) => outcome.encoded_len(),
+            Observation::ExecutionCost(cost) => cost.encoded_len(),
+            Observation::Rate(rate) => rate.encoded_len(),
+            Observation::Statistic(statistic) => statistic.encoded_len(),
+            Observation::Series(series) => series.encoded_len(),
+            Observation::Derived(value) => value.encoded_len(),
+            Observation::Scenario(saved) => saved.encoded_len(),
+            Observation::CorporateAction(action) => action.encoded_len(),
+            Observation::Filing(filing) => filing.encoded_len(),
+            Observation::ReportedFact(fact) => fact.encoded_len(),
+            Observation::RatingAction(action) => action.encoded_len(),
+            Observation::HoldingsReport(report) => report.encoded_len(),
+            Observation::Holding(holding) => holding.encoded_len(),
+        }
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         match self {
             Observation::Price(price) => price.encode_to_vec(),

@@ -1216,6 +1216,7 @@ pub(super) async fn ask<R: Message + Default>(
                 match status {
                     meridian_bus::RefusalStatus::InvalidArgument => "invalid_arguments",
                     meridian_bus::RefusalStatus::PermissionDenied => "not_permitted",
+                    meridian_bus::RefusalStatus::NotFound => "not_found",
                 }
                 .into(),
                 words.to_string(),
@@ -1481,7 +1482,7 @@ async fn find(app: &App, arguments: &Value) -> Value {
                 .collect();
             let platform = platform.ok().and_then(|reply| reply.answer);
             json!({"outcome": "unchanged", "data": {
-                "results": page::one_list(&held, platform.as_ref(), limit),
+                "results": page::one_list(&query, &held, platform.as_ref(), limit),
             }})
         }
     }

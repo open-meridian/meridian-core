@@ -32,6 +32,7 @@
 
 pub mod config;
 pub mod migrations;
+pub mod pages;
 pub mod postgres;
 pub mod query;
 pub mod read;

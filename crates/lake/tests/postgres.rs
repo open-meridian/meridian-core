@@ -2,6 +2,7 @@
 //! answers, as the database keeps them. Run by `make test-store`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use meridian_clock::{Clock, SystemClock};
 use meridian_domain::date::Date;
@@ -857,4 +858,645 @@ fn capacity_lake_as_a_dataset_grows() {
         let measured = measure_chain(&store, 200, (rows / 200).max(1));
         println!("CAPACITY lake {}", said(&measured));
     }
+}
+
+// ── A chain page's reads, as a plugin's page makes them (rulings 798, 808) ──
+
+/// The bytes this test binary holds allocated, now and at its peak since
+/// the peak was last reset: what a read keeps, apart from what the
+/// allocator holds back from the system (resident memory).
+mod counted {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub struct Counting;
+    static LIVE: AtomicUsize = AtomicUsize::new(0);
+    static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let at = unsafe { System.alloc(layout) };
+            if !at.is_null() {
+                let live = LIVE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
+                PEAK.fetch_max(live, Ordering::Relaxed);
+            }
+            at
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) };
+            LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            let at = unsafe { System.realloc(ptr, layout, new_size) };
+            if !at.is_null() {
+                if new_size > layout.size() {
+                    let live = LIVE.fetch_add(new_size - layout.size(), Ordering::Relaxed)
+                        + (new_size - layout.size());
+                    PEAK.fetch_max(live, Ordering::Relaxed);
+                } else {
+                    LIVE.fetch_sub(layout.size() - new_size, Ordering::Relaxed);
+                }
+            }
+            at
+        }
+    }
+
+    /// Live and peak MiB; the peak starts again from now.
+    pub fn take() -> (f64, f64) {
+        let live = LIVE.load(Ordering::Relaxed);
+        let peak = PEAK.swap(live, Ordering::Relaxed);
+        (live as f64 / 1048576.0, peak as f64 / 1048576.0)
+    }
+}
+
+#[global_allocator]
+static COUNTING: counted::Counting = counted::Counting;
+
+mod chain_page {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use meridian_bus::{Bus, MemoryBackend, Stamp};
+    use meridian_clock::{Clock, SystemClock};
+    use meridian_domain::v1::{
+        AssetClass, DatasetEntitlement, DatasetRef, EntitlementsChangedEvent, Identifier,
+        InstrumentRecord, ListQuotesReply, ListQuotesRequest, ListSeriesReply, ListSeriesRequest,
+        ListStatisticsReply, ListStatisticsRequest, ListedSeries, Money, ObservationMeta, Quote,
+        ResolveIdentifierReply, ResolveInstrumentReply, Source, SourceChoice, Statistic,
+        StatisticKind, SubjectRef, TemplateFieldValue, UnitValue, ValueUnit,
+    };
+    use meridian_lake::row::Observation;
+    use meridian_lake::service;
+    use meridian_lake::{PostgresStore, Store};
+    use meridian_pb::v1::{DatasetDeclaration, DatasetLicence, Decimal, ObservationMode};
+    use prost::Message;
+
+    /// The reader: a plugin's instance, as its sidecar asks.
+    pub const READER: &str = "sample-options";
+    const DAY: i64 = 86_400 * 1_000_000_000;
+    const MINUTE: i64 = 60 * 1_000_000_000;
+
+    /// A TQQQ-shaped chain: `expiries` expirations of `strikes` strikes, a
+    /// call and a put each; quoted `rounds` times, a pass a minute, half the
+    /// series changing each pass (what an unchanged quote's dedup leaves).
+    #[derive(Clone, Copy, Debug)]
+    pub struct Shape {
+        pub expiries: usize,
+        pub strikes: usize,
+        pub rounds: usize,
+        pub days: usize,
+    }
+
+    impl Shape {
+        pub fn series(&self) -> usize {
+            self.expiries * self.strikes * 2
+        }
+    }
+
+    pub struct Page {
+        pub bus: Arc<Bus>,
+        pub resolves: Arc<AtomicU64>,
+        pub underlying: String,
+    }
+
+    fn decimal(units: u64, scale: u32) -> Option<Decimal> {
+        Some(Decimal {
+            high: 0,
+            low: units,
+            scale,
+        })
+    }
+
+    fn osi(underlying: &str, e: usize, s: usize, right: char) -> String {
+        format!(
+            "{underlying:<6}27{:02}{:02}{right}{:08}",
+            1 + e % 12,
+            1 + e % 28,
+            (10 + s) * 1000
+        )
+    }
+
+    fn key(value: &str) -> Vec<Identifier> {
+        vec![Identifier {
+            scheme: "occ_osi".into(),
+            value: value.into(),
+            ..Default::default()
+        }]
+    }
+
+    fn meta(
+        dataset: &str,
+        row_key: &str,
+        subject: &str,
+        series: &str,
+        at: i64,
+    ) -> Option<ObservationMeta> {
+        Some(ObservationMeta {
+            row_key: row_key.into(),
+            subjects: vec![SubjectRef {
+                entity_id: subject.into(),
+                ..Default::default()
+            }],
+            source: Some(Source {
+                instance: "tradier".into(),
+                dataset: dataset.into(),
+                ..Default::default()
+            }),
+            valid_from_ns: at,
+            series_key: key(series),
+            ..Default::default()
+        })
+    }
+
+    fn field(path: &str, value: String) -> TemplateFieldValue {
+        TemplateFieldValue {
+            path: path.into(),
+            value,
+            ..Default::default()
+        }
+    }
+
+    fn usd(cents: u64) -> Option<Money> {
+        Some(Money {
+            amount: decimal(cents, 2),
+            currency_code: "USD".into(),
+            instrument_id: String::new(),
+        })
+    }
+
+    fn configuration(dataset: &str) -> EntitlementsChangedEvent {
+        let (instance, key) = dataset.split_once(':').unwrap();
+        EntitlementsChangedEvent {
+            datasets: vec![DatasetRef {
+                dataset: dataset.into(),
+                instance: instance.into(),
+                vendor: "Tradier".into(),
+                declaration: Some(DatasetDeclaration {
+                    key: key.into(),
+                    vendor: "Tradier".into(),
+                    data_types: vec![
+                        "meridian.v1.ListedSeries".into(),
+                        "meridian.v1.Quote".into(),
+                        "meridian.v1.Statistic".into(),
+                    ],
+                    modes: vec![ObservationMode::Pull as i32],
+                    cadence: 60,
+                    licence_default: Some(DatasetLicence {
+                        kept: true,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            licences: vec![],
+            entitlements: vec![DatasetEntitlement {
+                dataset: dataset.into(),
+                instance: READER.into(),
+                allowed: true,
+                ..Default::default()
+            }],
+            changed_at_ns: SystemClock.now_ns(),
+        }
+    }
+
+    /// Record the fixture once per database: a dataset already holding it
+    /// is read as it is, so a change is measured against the same rows.
+    fn record_fixture(store: &PostgresStore, dataset: &str, underlying: &str, shape: Shape) {
+        let expected = (shape.series()
+            + shape.rounds * shape.series() / 2
+            + 2 * shape.days * shape.series()) as u64;
+        let head = store.heads().unwrap().get(dataset).copied().unwrap_or(0);
+        if head >= expected {
+            eprintln!("bench: fixture held, {head} rows");
+            return;
+        }
+        assert_eq!(
+            head, 0,
+            "a partial fixture: drop the bench's database and run again"
+        );
+        let started = Instant::now();
+        let now = SystemClock.now_ns();
+        let first = now - shape.days as i64 * DAY;
+        let keys: Vec<String> = (0..shape.expiries)
+            .flat_map(|e| {
+                (0..shape.strikes).flat_map(move |s| ['C', 'P'].into_iter().map(move |r| (e, s, r)))
+            })
+            .map(|(e, s, r)| osi(underlying, e, s, r))
+            .collect();
+        let series: Vec<Observation> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| {
+                let e = i / (shape.strikes * 2);
+                Observation::Series(ListedSeries {
+                    meta: meta(dataset, &format!("series:{k}"), underlying, k, first),
+                    template_id: "TPL-listed-option".into(),
+                    template_version: "1".into(),
+                    fields: vec![
+                        field("underlying_instrument_id", underlying.into()),
+                        field(
+                            "put_or_call",
+                            if k.contains('C') { "call" } else { "put" }.into(),
+                        ),
+                        field("strike_price", format!("{}", 10 + (i / 2) % shape.strikes)),
+                        field(
+                            "expiration_date",
+                            format!("2027-{:02}-{:02}", 1 + e % 12, 1 + e % 28),
+                        ),
+                        field("exercise_style", "american".into()),
+                        field("settlement_method", "physical".into()),
+                        field("contract_multiplier", "100".into()),
+                        field("option_root", underlying.chars().take(6).collect()),
+                    ],
+                    instrument_id: String::new(),
+                })
+            })
+            .collect();
+        for batch in series.chunks(2000) {
+            store.record(dataset, batch.to_vec(), now).unwrap();
+        }
+        // Quotes: a pass a minute, half the series changing each pass, the
+        // passes spread over the days.
+        let spacing = (shape.days as i64 * DAY / shape.rounds.max(1) as i64).max(MINUTE);
+        let mut batch = Vec::new();
+        for round in 0..shape.rounds {
+            let at = first + round as i64 * spacing;
+            for (i, k) in keys.iter().enumerate() {
+                if (i + round) % 2 != 0 {
+                    continue;
+                }
+                let bid = 100 + ((i * 7 + round * 3) % 500) as u64;
+                batch.push(Observation::Quote(Quote {
+                    meta: meta(dataset, &format!("{k}:q:{at}"), underlying, k, at),
+                    bid: usd(bid),
+                    ask: usd(bid + 5),
+                    bid_quantity: decimal(10 + (round % 90) as u64, 0),
+                    ask_quantity: decimal(12, 0),
+                    ..Default::default()
+                }));
+            }
+            if batch.len() >= 5000 {
+                store
+                    .record(dataset, std::mem::take(&mut batch), at)
+                    .unwrap();
+            }
+        }
+        if !batch.is_empty() {
+            store.record(dataset, batch, now).unwrap();
+        }
+        // Open interest and volume, a row each series each day.
+        for day in 0..shape.days {
+            let date =
+                meridian_domain::date::Date::of_utc_instant(first + day as i64 * DAY).to_string();
+            let mut rows = Vec::new();
+            for (i, k) in keys.iter().enumerate() {
+                for (kind, name) in [
+                    (StatisticKind::OpenInterest, "oi"),
+                    (StatisticKind::Volume, "volume"),
+                ] {
+                    let mut m = meta(
+                        dataset,
+                        &format!("{name}:{k}:{date}"),
+                        underlying,
+                        k,
+                        first + day as i64 * DAY,
+                    );
+                    m.as_mut().unwrap().business_date = date.clone();
+                    rows.push(Observation::Statistic(Statistic {
+                        meta: m,
+                        kind: kind as i32,
+                        value: Some(UnitValue {
+                            value: decimal((100 + i * 3 + day) as u64, 0),
+                            unit: ValueUnit::Count as i32,
+                            ..Default::default()
+                        }),
+                    }));
+                }
+            }
+            for chunk in rows.chunks(5000) {
+                store.record(dataset, chunk.to_vec(), now).unwrap();
+            }
+        }
+        eprintln!(
+            "bench: fixture recorded, {} rows in {:.1} s",
+            store.heads().unwrap().get(dataset).copied().unwrap_or(0),
+            started.elapsed().as_secs_f64()
+        );
+    }
+
+    /// The lake served on an in-process bus over the store, its instrument
+    /// store stood in: the underlying held, no series record held, each
+    /// series' resolve answered after `resolve_delay` (the broker's round
+    /// trip and the store's lookup on a deployment) and counted.
+    pub fn page(
+        store: Arc<PostgresStore>,
+        tag: &str,
+        shape: Shape,
+        resolve_delay: Duration,
+    ) -> Page {
+        let dataset = format!("tradier:{tag}");
+        let underlying = format!("INS-{tag}").to_uppercase();
+        record_fixture(&store, &dataset, &underlying, shape);
+        let bus = Arc::new(Bus::single(
+            READER,
+            Arc::new(MemoryBackend::new()),
+            Arc::new(SystemClock),
+        ));
+        let held = underlying.clone();
+        bus.serve(service::RESOLVE_INSTRUMENT, move |_| {
+            Ok((
+                "meridian.v1.ResolveInstrumentReply".into(),
+                ResolveInstrumentReply {
+                    found: true,
+                    instrument: Some(InstrumentRecord {
+                        instrument_id: held.clone(),
+                        asset_class: AssetClass::Equity as i32,
+                        ..Default::default()
+                    }),
+                }
+                .encode_to_vec(),
+            ))
+        });
+        let resolves = Arc::new(AtomicU64::new(0));
+        let counted = Arc::clone(&resolves);
+        bus.serve(service::RESOLVE_IDENTIFIER, move |_| {
+            counted.fetch_add(1, Ordering::Relaxed);
+            std::thread::sleep(resolve_delay);
+            Ok((
+                "meridian.v1.ResolveIdentifierReply".into(),
+                ResolveIdentifierReply::default().encode_to_vec(),
+            ))
+        });
+        bus.serve(service::PLUGIN_CATALOGUE, |_| {
+            Ok((
+                "meridian.v1.PluginCatalogue".into(),
+                meridian_domain::v1::PluginCatalogue::default().encode_to_vec(),
+            ))
+        });
+        let lake = service::serve(bus.clone(), store as Arc<dyn Store>, Arc::new(SystemClock));
+        lake.configured(&configuration(&dataset));
+        Page {
+            bus,
+            resolves,
+            underlying,
+        }
+    }
+
+    /// What one load of the page measured: each read's pages and time.
+    #[derive(Default, Debug)]
+    pub struct Load {
+        pub series: (usize, usize, Duration),
+        pub quotes: (usize, usize, Duration),
+        pub open_interest: (usize, usize, Duration),
+        pub volume: (usize, usize, Duration),
+        pub bytes: usize,
+        pub total: Duration,
+    }
+
+    impl Page {
+        async fn ask<Q: Message, R: Message + Default>(
+            &self,
+            topic: &str,
+            kind: &str,
+            q: Q,
+        ) -> (R, usize) {
+            let stamp = Stamp {
+                account_scope: Some(vec![]),
+                ..Default::default()
+            };
+            let (_, payload) = self
+                .bus
+                .call_stamped(
+                    topic,
+                    kind,
+                    q.encode_to_vec(),
+                    None,
+                    Some(Duration::from_secs(60)),
+                    &stamp,
+                )
+                .await
+                .unwrap();
+            (R::decode(&payload[..]).unwrap(), payload.len())
+        }
+
+        fn subject(&self) -> Vec<SubjectRef> {
+            vec![SubjectRef {
+                entity_id: self.underlying.clone(),
+                ..Default::default()
+            }]
+        }
+
+        /// The chain page's reads before its first byte, as sample-options
+        /// 0.3.2 makes them: every series listed within 400 days (the SDK's
+        /// read_chain, its default page), every quote of the chain (pages
+        /// of 500), its open interest and its volume (default pages).
+        pub async fn load(&self) -> Load {
+            let mut load = Load::default();
+            let started = Instant::now();
+            let (mut cursor, mut pages, mut rows) = (String::new(), 0, 0);
+            let at = Instant::now();
+            loop {
+                let (reply, bytes): (ListSeriesReply, usize) = self
+                    .ask(
+                        service::LIST_SERIES,
+                        "meridian.v1.ListSeriesRequest",
+                        ListSeriesRequest {
+                            subjects: self.subject(),
+                            expiration_from: "2026-01-01".into(),
+                            expiration_to: "2028-12-31".into(),
+                            cursor: cursor.clone(),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                load.bytes += bytes;
+                pages += 1;
+                rows += reply.series.len();
+                cursor = reply.next_cursor;
+                if cursor.is_empty() {
+                    break;
+                }
+            }
+            load.series = (pages, rows, at.elapsed());
+            let (mut cursor, mut pages, mut rows) = (String::new(), 0, 0);
+            let at = Instant::now();
+            loop {
+                let (reply, bytes): (ListQuotesReply, usize) = self
+                    .ask(
+                        "platform.lake.query.list-quotes",
+                        "meridian.v1.ListQuotesRequest",
+                        ListQuotesRequest {
+                            subjects: self.subject(),
+                            sources: Some(SourceChoice {
+                                default: true,
+                                ..Default::default()
+                            }),
+                            all_series: true,
+                            page_size: 500,
+                            cursor: cursor.clone(),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                load.bytes += bytes;
+                pages += 1;
+                rows += reply.quotes.len();
+                cursor = reply.next_cursor;
+                if cursor.is_empty() {
+                    break;
+                }
+            }
+            load.quotes = (pages, rows, at.elapsed());
+            for kind in [StatisticKind::OpenInterest, StatisticKind::Volume] {
+                let (mut cursor, mut pages, mut rows) = (String::new(), 0, 0);
+                let at = Instant::now();
+                loop {
+                    let (reply, bytes): (ListStatisticsReply, usize) = self
+                        .ask(
+                            service::LIST_STATISTICS,
+                            "meridian.v1.ListStatisticsRequest",
+                            ListStatisticsRequest {
+                                subjects: self.subject(),
+                                kinds: vec![kind as i32],
+                                all_series: true,
+                                cursor: cursor.clone(),
+                                ..Default::default()
+                            },
+                        )
+                        .await;
+                    load.bytes += bytes;
+                    pages += 1;
+                    rows += reply.statistics.len();
+                    cursor = reply.next_cursor;
+                    if cursor.is_empty() {
+                        break;
+                    }
+                }
+                let measured = (pages, rows, at.elapsed());
+                if kind == StatisticKind::OpenInterest {
+                    load.open_interest = measured;
+                } else {
+                    load.volume = measured;
+                }
+            }
+            load.total = started.elapsed();
+            load
+        }
+    }
+
+    /// The process's resident memory and its high-water mark, in MiB (Linux).
+    pub fn memory() -> (f64, f64) {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        let kb = |name: &str| {
+            status
+                .lines()
+                .find(|line| line.starts_with(name))
+                .and_then(|line| line.split_whitespace().nth(1))
+                .and_then(|n| n.parse::<f64>().ok())
+                .unwrap_or(0.0)
+                / 1024.0
+        };
+        (kb("VmRSS:"), kb("VmHWM:"))
+    }
+
+    pub fn said(load: &Load) -> String {
+        let ms = |d: Duration| d.as_secs_f64() * 1e3;
+        format!(
+            "total_ms={:.0} series={}p/{}r/{:.0}ms quotes={}p/{}r/{:.0}ms oi={}p/{}r/{:.0}ms volume={}p/{}r/{:.0}ms bytes={}",
+            ms(load.total),
+            load.series.0, load.series.1, ms(load.series.2),
+            load.quotes.0, load.quotes.1, ms(load.quotes.2),
+            load.open_interest.0, load.open_interest.1, ms(load.open_interest.2),
+            load.volume.0, load.volume.1, ms(load.volume.2),
+            load.bytes,
+        )
+    }
+
+    /// `MERIDIAN_BENCH_CHAIN`: expiries,strikes,rounds,days.
+    pub fn shape_from_env(default: Shape) -> Shape {
+        let said = std::env::var("MERIDIAN_BENCH_CHAIN").unwrap_or_default();
+        let n: Vec<usize> = said
+            .split(',')
+            .filter_map(|n| n.trim().parse().ok())
+            .collect();
+        match n.as_slice() {
+            [e, s, r, d] => Shape {
+                expiries: *e,
+                strikes: *s,
+                rounds: *r,
+                days: *d,
+            },
+            _ => default,
+        }
+    }
+}
+
+/// The chain page's reads on a TQQQ-shaped chain (rulings 798, 808): `make
+/// bench` runs it. Sequential loads, then eight at once, with the time of
+/// each read and the process's memory across them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "the capacity bench: make bench"]
+async fn capacity_chain_page_reads() {
+    use chain_page::*;
+    let shape = shape_from_env(Shape {
+        expiries: 12,
+        strikes: 60,
+        rounds: 600,
+        days: 3,
+    });
+    let store = Arc::new(tokio::task::block_in_place(store));
+    let page = tokio::task::block_in_place(|| {
+        chain_page::page(
+            Arc::clone(&store),
+            &format!(
+                "bench-{}x{}x{}x{}",
+                shape.expiries, shape.strikes, shape.rounds, shape.days
+            ),
+            shape,
+            std::time::Duration::from_millis(1),
+        )
+    });
+    let (rss, _) = memory();
+    let (live, _) = counted::take();
+    println!(
+        "CAPACITY chain shape={shape:?} series={} heap_live_mib={live:.1} rss_mib={rss:.0}",
+        shape.series()
+    );
+    for i in 0..5 {
+        let before = page.resolves.load(std::sync::atomic::Ordering::Relaxed);
+        let load = page.load().await;
+        let resolves = page.resolves.load(std::sync::atomic::Ordering::Relaxed) - before;
+        let (rss, hwm) = memory();
+        let (live, peak) = counted::take();
+        println!("CAPACITY chain load={i} {} resolves={resolves} heap_live_mib={live:.1} heap_peak_mib={peak:.1} rss_mib={rss:.0} hwm_mib={hwm:.0}", said(&load));
+    }
+    let page = Arc::new(page);
+    for round in 0..3 {
+        let started = std::time::Instant::now();
+        let loads = futures_lite_join(8, Arc::clone(&page)).await;
+        let slowest = loads.iter().map(|l| l.total).max().unwrap();
+        let (rss, hwm) = memory();
+        let (live, peak) = counted::take();
+        println!(
+            "CAPACITY chain concurrent=8 round={round} wall_ms={:.0} slowest_ms={:.0} heap_live_mib={live:.1} heap_peak_mib={peak:.1} rss_mib={rss:.0} hwm_mib={hwm:.0}",
+            started.elapsed().as_secs_f64() * 1e3,
+            slowest.as_secs_f64() * 1e3
+        );
+    }
+}
+
+async fn futures_lite_join(n: usize, page: Arc<chain_page::Page>) -> Vec<chain_page::Load> {
+    let handles: Vec<_> = (0..n)
+        .map(|_| {
+            let page = Arc::clone(&page);
+            tokio::spawn(async move { page.load().await })
+        })
+        .collect();
+    let mut out = Vec::new();
+    for handle in handles {
+        out.push(handle.await.unwrap());
+    }
+    out
 }

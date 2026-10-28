@@ -2930,7 +2930,7 @@ async fn search_instruments(
                 .take(limit)
                 .collect();
             axum::Json(serde_json::json!({
-                "results": instruments::one_list(&held, platform.as_ref(), limit),
+                "results": instruments::one_list(words, &held, platform.as_ref(), limit),
             }))
             .into_response()
         }

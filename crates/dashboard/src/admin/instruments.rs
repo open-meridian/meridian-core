@@ -207,16 +207,29 @@ pub async fn candidates(
 /// The FIGIs a record or a candidate is known by, at any level.
 const FIGI_SCHEMES: [&str; 3] = ["figi", "composite_figi", "share_class_figi"];
 
-/// The picker's one list (rulings 727, 774): the deployment's records first,
-/// as the kit reads them, then the platform's candidates the deployment does
-/// not hold -- by the record's ID, or by a FIGI one of its records carries --
-/// each marked `candidate`, with an empty ID; at most `limit`. Nothing in
-/// it says where a result came from.
+/// The picker's one list (rulings 727, 774, 810), at most `limit`, in three
+/// groups: an exact match of what was typed -- a ticker, or any identifier's
+/// value or a record's ID, case aside -- whichever side holds it, the
+/// deployment's records first; then the deployment's other records, as the
+/// kit reads them and in the instrument store's order; then the platform's
+/// other candidates the deployment does not hold -- by the record's ID, or
+/// by a FIGI one of its records carries -- each marked `candidate`, with an
+/// empty ID. Nothing in it says where a result came from.
 pub fn one_list(
+    words: &str,
     held: &[InstrumentRecord],
     answer: Option<&meridian_domain::v1::InstrumentCandidatesReply>,
     limit: usize,
 ) -> Vec<serde_json::Value> {
+    let typed = words.trim().to_lowercase();
+    let exact = |value: &str| !typed.is_empty() && value.trim().to_lowercase() == typed;
+    let held_exact = |record: &InstrumentRecord| {
+        exact(&record.instrument_id)
+            || record
+                .identifiers
+                .iter()
+                .any(|i| i.valid_until_ns == 0 && exact(&i.value))
+    };
     let ids: std::collections::HashSet<&str> =
         held.iter().map(|r| r.instrument_id.as_str()).collect();
     let figis: std::collections::HashSet<String> = held
@@ -225,7 +238,10 @@ pub fn one_list(
         .filter(|i| FIGI_SCHEMES.contains(&i.scheme.as_str()) && i.valid_until_ns == 0)
         .map(|i| i.value.to_ascii_uppercase())
         .collect();
-    let mut out: Vec<serde_json::Value> = held.iter().map(found_json).collect();
+    let (exact_held, other_held): (Vec<&InstrumentRecord>, Vec<&InstrumentRecord>) =
+        held.iter().partition(|record| held_exact(record));
+    let mut exact_candidates: Vec<serde_json::Value> = Vec::new();
+    let mut other_candidates: Vec<serde_json::Value> = Vec::new();
     for candidate in answer.map(|a| a.candidates.as_slice()).unwrap_or_default() {
         let known_by = [&candidate.composite_figi, &candidate.share_class_figi]
             .into_iter()
@@ -240,8 +256,20 @@ pub fn one_list(
         if ids.contains(candidate.instrument_id.as_str()) || known_by {
             continue;
         }
-        out.push(candidate_json(candidate));
+        let is_exact = exact(&candidate.ticker)
+            || exact(&candidate.composite_figi)
+            || exact(&candidate.share_class_figi)
+            || candidate.identifiers.iter().any(|i| exact(&i.value));
+        if is_exact {
+            exact_candidates.push(candidate_json(candidate));
+        } else {
+            other_candidates.push(candidate_json(candidate));
+        }
     }
+    let mut out: Vec<serde_json::Value> = exact_held.into_iter().map(found_json).collect();
+    out.extend(exact_candidates);
+    out.extend(other_held.into_iter().map(found_json));
+    out.extend(other_candidates);
     out.truncate(limit);
     out
 }
@@ -3124,7 +3152,7 @@ mod one_search_tests {
             ],
             sources: Vec::new(),
         };
-        let list = one_list(&[held], Some(&answer), 10);
+        let list = one_list("apple", &[held], Some(&answer), 10);
         assert_eq!(list.len(), 3, "{list:?}");
         assert_eq!(list[0]["instrument_id"], "INS-HELD");
         assert!(list[0].get("candidate").is_none());
@@ -3139,8 +3167,77 @@ mod one_search_tests {
         assert_eq!(list[2]["description"], "SPY Trust");
         assert_eq!(list[2]["asset_class"], "fund");
         // The platform not reached: the records alone.
-        assert_eq!(one_list(&[], None, 10).len(), 0);
-        assert_eq!(one_list(&[], Some(&answer), 2).len(), 2);
+        assert_eq!(one_list("apple", &[], None, 10).len(), 0);
+        assert_eq!(one_list("apple", &[], Some(&answer), 2).len(), 2);
+    }
+
+    /// Ruling 810: what was typed, matched exactly by a ticker or an
+    /// identifier, first wherever it is held -- the deployment's record
+    /// before the platform's candidate -- then the records the deployment
+    /// holds, then the platform's partial matches.
+    #[test]
+    fn an_exact_ticker_first_then_held_records_then_partial_matches() {
+        let record = |id: &str, name: &str, ticker: &str| InstrumentRecord {
+            instrument_id: id.into(),
+            description: name.into(),
+            identifiers: vec![Identifier {
+                scheme: "ticker".into(),
+                value: ticker.into(),
+                source: "XNAS".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        // Held: two whose names contain "spy", neither SPY itself.
+        let held = vec![
+            record("INS-SPYG", "SPDR Portfolio S&P 500 Growth (SPYG)", "SPYG"),
+            record(
+                "INS-SPYD",
+                "SPDR Portfolio S&P 500 High Dividend (SPYD)",
+                "SPYD",
+            ),
+        ];
+        let answer = InstrumentCandidatesReply {
+            candidates: vec![
+                candidate("", "SPYV", "", "BBG000SPYV01"),
+                candidate("", "SPY", "", "BBG000BDTBL9"),
+            ],
+            sources: Vec::new(),
+        };
+        let order = |list: &[serde_json::Value]| -> Vec<String> {
+            list.iter()
+                .map(|r| {
+                    r["identifiers"][0]["value"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string()
+                })
+                .collect()
+        };
+        let list = one_list(" spy ", &held, Some(&answer), 10);
+        assert_eq!(order(&list), ["SPY", "SPYG", "SPYD", "SPYV"], "{list:?}");
+        assert_eq!(list[0]["candidate"], true);
+        // Held exactly: the deployment's record before everything else.
+        let mut with_spy = held.clone();
+        let mut spy = record("INS-SPY", "SPDR S&P 500 ETF Trust", "SPY");
+        spy.identifiers.push(Identifier {
+            scheme: "composite_figi".into(),
+            value: "BBG000BDTBL9".into(),
+            source: "US".into(),
+            ..Default::default()
+        });
+        with_spy.push(spy);
+        let list = one_list("SPY", &with_spy, Some(&answer), 10);
+        assert_eq!(order(&list), ["SPY", "SPYG", "SPYD", "SPYV"]);
+        assert_eq!(
+            list[0]["instrument_id"], "INS-SPY",
+            "the held one, not repeated"
+        );
+        // An identifier other than a ticker, typed exactly.
+        let list = one_list("bbg000spyv01", &held, Some(&answer), 10);
+        assert_eq!(order(&list)[0], "SPYV");
+        // The limit cuts the partial matches, never the exact one.
+        assert_eq!(order(&one_list("spy", &held, Some(&answer), 1)), ["SPY"]);
     }
 
     /// Ruling 786: a record brought in and still provisional has no

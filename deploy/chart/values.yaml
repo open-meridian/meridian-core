@@ -255,6 +255,13 @@ lake:
   replicaCount: 1
   image:
     tag: ""
+  # glibc's allocator arenas, at most this many, as the book's: a chain
+  # page's reads answered on many threads otherwise kept an arena's memory
+  # per thread resident (ruling 808; found on dev at 690 to 830 MiB of the
+  # lake's 1 GiB). The capacity bench's chain page at eight at once held
+  # 441 MiB resident with the default and 121 MiB with 2, the same live
+  # heap (~62 MiB at its peak).
+  mallocArenaMax: 2
   database:
     existingSecret: ""
     key: ""

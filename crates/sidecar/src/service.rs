@@ -182,6 +182,10 @@ pub struct Sidecar {
     /// What it carried per UTC day, for the plugin usage report (W5.19,
     /// contract v25).
     pub(crate) daily: Arc<crate::daily::Daily>,
+
+    /// The calls it asked lately, which the front door's timing line names
+    /// (ruling 798).
+    pub(crate) calls: Arc<crate::timing::Calls>,
 }
 
 impl Sidecar {
@@ -224,6 +228,11 @@ impl Sidecar {
             identity.instance_id.clone(),
         );
         let entitled = crate::lake::Entitled::new(identity.instance_id.clone());
+        let calls = Arc::new(crate::timing::Calls::default());
+        let hearing = Arc::clone(&calls);
+        bus.observe_calls(Arc::new(move |topic, at, took| {
+            hearing.heard(topic, at, took)
+        }));
         Self {
             entitled,
             clock: bus.clock(),
@@ -244,6 +253,7 @@ impl Sidecar {
             filed: Arc::default(),
             harnessed: None,
             daily: Arc::default(),
+            calls,
         }
     }
 

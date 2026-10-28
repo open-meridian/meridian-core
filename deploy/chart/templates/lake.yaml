@@ -66,6 +66,10 @@ spec:
               value: {{ include "meridian-runtime.fullname" . }}-analytics
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
+            {{- with .Values.lake.mallocArenaMax }}
+            - name: MALLOC_ARENA_MAX
+              value: {{ . | quote }}
+            {{- end }}
             - name: MERIDIAN_LAKE_DATABASE_URL
               valueFrom:
                 secretKeyRef:

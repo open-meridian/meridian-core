@@ -913,6 +913,58 @@ async fn an_answer_past_a_page_is_answered_later_and_one_gone_between_pages_is_n
     .await
     .unwrap_err();
     assert!(gone.contains("between pages"), "{gone}");
+    assert!(gone.contains("[refusal-status not-found"), "{gone}");
+}
+
+/// The fixture's NOT_FOUND (fixtures/analytics/read-job-answer): an answer
+/// no longer held, or never, and another instance's job alike -- the second
+/// never told apart from the first, so nobody learns another's job exists.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_not_held_and_another_instances_job_are_both_not_found() {
+    let stores = stores();
+    let c = coordinator(&stores, Config::default(), false);
+    let reply: RunJobReply = ask_as(
+        &stores.bus,
+        topics::RUN_JOB,
+        "meridian.v1.RunJobRequest",
+        paged_job(),
+        &["ACC-1"],
+    )
+    .await
+    .unwrap();
+    let as_instance = |instance: &str| meridian_bus::Envelope {
+        meta: Some(meridian_bus::MessageMeta {
+            publisher_instance_id: instance.into(),
+            account_scope_applies: true,
+            account_scope: vec!["ACC-1".into()],
+            ..Default::default()
+        }),
+        payload_type: String::new(),
+        payload: Vec::new(),
+    };
+    let read = |job_id: &str, instance: &str| {
+        c.read_job_answer(
+            ReadJobAnswerRequest {
+                job_id: job_id.into(),
+                ..ReadJobAnswerRequest::default()
+            },
+            &as_instance(instance),
+        )
+    };
+    // Its own instance reads it.
+    let own = stores.bus.instance_id().to_string();
+    assert!(read(&reply.job_id, &own).is_ok());
+    for (job_id, instance) in [
+        (reply.job_id.as_str(), "another-instance-1"),
+        ("JOB-01JAG0A1B2C30000000000009", own.as_str()),
+    ] {
+        let refused = read(job_id, instance).unwrap_err();
+        let (status, fields, words) =
+            meridian_bus::read_refusal_status(&refused).expect("a status");
+        assert_eq!(status, meridian_bus::RefusalStatus::NotFound, "{refused}");
+        assert_eq!(fields, vec!["job_id".to_string()]);
+        assert!(!words.contains("another"), "never says whose: {words}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -295,10 +295,43 @@ async fn pass(State(front_door): State<FrontDoor>, request: Request) -> Response
     // A page or a tool request, counted for the usage report (W5.19,
     // contract v25); nothing of it is kept.
     front_door.sidecar.daily.request(now_ns);
-    match through(&front_door, request, now_ns).await {
+    // Its timing line (ruling 798), said when the answer's last byte has
+    // gone: the route without its query, never who asked.
+    let calls = Arc::clone(&front_door.sidecar.calls);
+    let overlapping = calls.arrived();
+    let mut line = crate::timing::Line {
+        calls,
+        method: request.method().to_string(),
+        route: request.uri().path().to_string(),
+        status: 0,
+        started: std::time::Instant::now(),
+        first_byte: None,
+        overlapping,
+    };
+    let response = match through(&front_door, request, now_ns).await {
         Ok(response) => response,
         Err(refusal) => refusal.into_response(),
+    };
+    line.status = response.status().as_u16();
+    line.first_byte = Some(line.started.elapsed());
+    let (mut parts, body) = response.into_parts();
+    // Its length kept as it was known, the stream below knowing none.
+    if let Some(exact) = axum::body::HttpBody::size_hint(&body).exact() {
+        parts
+            .headers
+            .entry(axum::http::header::CONTENT_LENGTH)
+            .or_insert_with(|| axum::http::HeaderValue::from(exact));
     }
+    // Carried with the body, and so dropped with it: at its end, or when
+    // the person goes away first.
+    let body = Body::from_stream(tokio_stream::StreamExt::map(
+        body.into_data_stream(),
+        move |chunk| {
+            let _carried = &line;
+            chunk
+        },
+    ));
+    Response::from_parts(parts, body)
 }
 
 async fn through(
