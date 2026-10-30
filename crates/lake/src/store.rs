@@ -235,6 +235,44 @@ pub fn invalid(row: &Observation) -> bool {
     row.meta().quality == QualityState::Invalid as i32
 }
 
+/// [`Store::listing`] by reading whole rows, as any store can: what the
+/// in-memory store answers, and what Postgres's index read is held to.
+pub fn listing_read<S: Store + ?Sized>(
+    store: &S,
+    datasets: &[String],
+    subjects: &[String],
+    as_of_ns: i64,
+) -> Result<Vec<Listed>> {
+    let rows = store.read(&Query {
+        datasets: datasets.to_vec(),
+        subjects: subjects.to_vec(),
+        data_type: DataType::Series,
+        kinds: Vec::new(),
+        interval_ns: 0,
+        when: When::Latest { at_ns: 0 },
+        as_of_ns,
+        published_as_of_ns: 0,
+        latest_only: false,
+    })?;
+    Ok(rows
+        .iter()
+        .filter(|row| !invalid(row) && subjects.iter().any(|s| s == row.subject()))
+        .filter_map(listed_of)
+        .collect())
+}
+
+/// A series row as the listing counts it ([`Listed`]); `None` for every
+/// other row.
+pub fn listed_of(row: &Observation) -> Option<Listed> {
+    let (expires, listed_type) = row.listing()?;
+    Some(Listed {
+        dataset: row.dataset().to_string(),
+        series: row.latest_key(),
+        expires: expires.and_then(|date| Date::parse(&date).ok()),
+        listed_type,
+    })
+}
+
 /// Each row's effective quality as known at a recorded time (0 for now):
 /// the highest of the state it was recorded with and every assessment of it
 /// recorded by then, its reasons its own and then each assessment's, once
@@ -288,6 +326,18 @@ pub struct Stale {
     pub standing_at_ns: i64,
 }
 
+/// One series of the lake's listing as an expirations read counts it
+/// (contract v28, amended 2026-10-28; ruling 856): the dataset listing it,
+/// the series as its latest is chosen per ([`Observation::latest_key`]), its
+/// expiry where it states one, and its listed type as recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listed {
+    pub dataset: String,
+    pub series: String,
+    pub expires: Option<Date>,
+    pub listed_type: meridian_domain::v1::InstrumentType,
+}
+
 pub trait Store: Send + Sync {
     /// Record a batch of one dataset whole (W10.4, W10.5): each row a new
     /// row key, a restatement, or unchanged; recorded at `now_ns`.
@@ -308,6 +358,22 @@ pub trait Store: Send + Sync {
     /// query's cut-off, with no choice among them made: which in force is
     /// [`crate::read`]'s.
     fn read(&self, query: &Query) -> Result<Vec<Observation>>;
+
+    /// The lake's listing of `subjects` in `datasets` (contract v28, amended
+    /// 2026-10-28; rulings 856 and 858): each series row key at its version
+    /// in force at the recorded-time cut-off (0 for now), one whose
+    /// effective state is invalid left out (ruling 619), as its dataset,
+    /// series, expiry and listed type alone. A store may read whole rows, as
+    /// this does; Postgres answers it from its listing index without reading
+    /// a series row's body.
+    fn listing(
+        &self,
+        datasets: &[String],
+        subjects: &[String],
+        as_of_ns: i64,
+    ) -> Result<Vec<Listed>> {
+        listing_read(self, datasets, subjects, as_of_ns)
+    }
 
     /// Each partition's head.
     fn heads(&self) -> Result<BTreeMap<String, u64>>;

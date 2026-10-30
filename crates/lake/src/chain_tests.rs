@@ -59,6 +59,7 @@ fn harness() -> Harness {
         let instrument = match asked.instrument_id.as_str() {
             AAPL => held(AssetClass::Equity, InstrumentType::Unspecified),
             ES => held(AssetClass::Derivative, InstrumentType::Future),
+            SPX => held(AssetClass::Referential, InstrumentType::Index),
             HELD_CALL => held(AssetClass::Derivative, InstrumentType::ListedOption),
             _ => None,
         };
@@ -1391,4 +1392,233 @@ async fn a_chain_want_carries_its_window_and_is_told_apart() {
         ),
         ("2026-11-20", "2026-12-18")
     );
+}
+
+const SPX: &str = "INS-01JC28SPX0000000000000001";
+
+/// A listed series under `underlying`, keyed by `key` and expiring on
+/// `date`: a future where it names its product code (its last trade date
+/// its expiry), else an option.
+fn listed(underlying: &str, key: Vec<Identifier>, date: &str, future: bool) -> Observation {
+    let row_key = format!(
+        "series:{}",
+        key.iter().map(|k| k.value.as_str()).collect::<String>()
+    );
+    let mut fields = vec![field("underlying_instrument_id", underlying)];
+    if future {
+        fields.push(field("product_code", "ES"));
+        fields.push(field("last_trade_date", date));
+    } else {
+        fields.push(field("put_or_call", "call"));
+        fields.push(field("expiration_date", date));
+    }
+    Observation::Series(ListedSeries {
+        meta: meta(&row_key, underlying, key, ""),
+        template_id: "TPL-LISTED".into(),
+        template_version: "1".into(),
+        fields,
+        instrument_id: String::new(),
+    })
+}
+
+fn ticker(value: &str) -> Vec<Identifier> {
+    vec![Identifier {
+        scheme: "ticker".into(),
+        value: value.into(),
+        source: "XCME".into(),
+        ..Default::default()
+    }]
+}
+
+/// Rulings 856, 858 and 859: an underlying's expirations read from the
+/// lake's listing alone, each date once in date order with its series
+/// counted; narrowed by window and listed type -- a future by its product
+/// code, an option on a future record a future option; an adjustment
+/// counted at its new expiry only; refused naming the field; a reader not
+/// entitled named in unanswered; nothing listed answered as ListSeries
+/// answers, its source asked.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_underlyings_expirations_are_read_from_the_listing() {
+    use meridian_domain::v1::{ListExpirationsReply, ListExpirationsRequest, UnansweredReason};
+    let h = harness();
+    let mut rows = Vec::new();
+    for (day, strikes) in [("2026-11-20", 3), ("2026-12-18", 2), ("2027-01-15", 1)] {
+        for strike in 0..strikes {
+            let key = format!(
+                "AAPL  {}C00{:03}000",
+                &day[2..].replace('-', ""),
+                200 + strike
+            );
+            rows.push(listed(AAPL, osi(&key), day, false));
+        }
+    }
+    rows.push(listed(SPX, ticker("ESZ6"), "2026-12-18", true));
+    rows.push(listed(SPX, ticker("ESH7"), "2027-03-19", true));
+    rows.push(listed(
+        SPX,
+        osi("SPX   261218C05000000"),
+        "2026-12-18",
+        false,
+    ));
+    rows.push(listed(ES, ticker("ESZ6 C5000"), "2026-12-18", false));
+    assert_eq!(record(&h, "series", rows).unwrap(), (10, 0, 0));
+    // An adjustment: the next version of a November series' key, now
+    // expiring in December, counted there alone.
+    let moved = listed(AAPL, osi("AAPL  261120C00202000"), "2026-12-18", false);
+    assert_eq!(record(&h, "series", vec![moved]).unwrap(), (0, 1, 0));
+
+    let list = |underlying: &str, kind: InstrumentType, from: &str, to: &str, by: &str| {
+        tokio::task::block_in_place(|| {
+            h.lake.list_expirations(
+                ListExpirationsRequest {
+                    underlying_id: underlying.into(),
+                    instrument_type: kind as i32,
+                    expiration_from: from.into(),
+                    expiration_to: to.into(),
+                },
+                &envelope(by),
+            )
+        })
+        .unwrap()
+    };
+    let dates = |reply: &ListExpirationsReply| -> Vec<(String, u32)> {
+        reply
+            .expirations
+            .iter()
+            .map(|e| (e.expiration_date.clone(), e.series_count))
+            .collect()
+    };
+    let every = list(AAPL, InstrumentType::Unspecified, "", "", "signal-1");
+    assert_eq!(
+        dates(&every),
+        [
+            ("2026-11-20".to_string(), 2),
+            ("2026-12-18".to_string(), 3),
+            ("2027-01-15".to_string(), 1)
+        ]
+    );
+    assert!(every.unanswered.is_empty());
+    assert_eq!(every.datasets.len(), 1);
+    assert_eq!(every.datasets[0].dataset, CHAIN);
+    assert!(every.watermark.is_some());
+    // A window, inclusive.
+    let december = list(
+        AAPL,
+        InstrumentType::ListedOption,
+        "2026-12-01",
+        "2026-12-31",
+        "signal-1",
+    );
+    assert_eq!(dates(&december), [("2026-12-18".to_string(), 3)]);
+    // A window with series listed only outside it: none, nothing unanswered.
+    let empty = list(
+        AAPL,
+        InstrumentType::Unspecified,
+        "2028-01-01",
+        "",
+        "signal-1",
+    );
+    assert!(empty.expirations.is_empty() && empty.unanswered.is_empty());
+    // By type: the index's futures apart from its options; an option on a
+    // future record is a future option.
+    let futures = list(SPX, InstrumentType::Future, "", "", "signal-1");
+    assert_eq!(
+        dates(&futures),
+        [("2026-12-18".to_string(), 1), ("2027-03-19".to_string(), 1)]
+    );
+    let options = list(SPX, InstrumentType::ListedOption, "", "", "signal-1");
+    assert_eq!(dates(&options), [("2026-12-18".to_string(), 1)]);
+    let on_es = list(ES, InstrumentType::FutureOption, "", "", "signal-1");
+    assert_eq!(dates(&on_es), [("2026-12-18".to_string(), 1)]);
+    assert!(list(ES, InstrumentType::ListedOption, "", "", "signal-1")
+        .expirations
+        .is_empty());
+    assert!(list(AAPL, InstrumentType::Future, "", "", "signal-1")
+        .expirations
+        .is_empty());
+    // A reader entitled to no dataset of series: named, never an empty list.
+    let other = list(AAPL, InstrumentType::Unspecified, "", "", "other-1");
+    assert!(other.expirations.is_empty());
+    assert_eq!(other.unanswered.len(), 1);
+    assert_eq!(
+        other.unanswered[0].reason,
+        UnansweredReason::NotEntitled as i32
+    );
+
+    // Refused naming the field, over the bus as a plugin's sidecar asks.
+    let refused = |request: ListExpirationsRequest| {
+        let h = &h;
+        async move {
+            asked::<_, ListExpirationsReply>(
+                h,
+                service::LIST_EXPIRATIONS,
+                "meridian.v1.ListExpirationsRequest",
+                request,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|said| refused_naming(&said))
+        }
+    };
+    assert_eq!(
+        refused(ListExpirationsRequest::default()).await,
+        Err(vec!["underlying_id".to_string()])
+    );
+    assert_eq!(
+        refused(ListExpirationsRequest {
+            underlying_id: AAPL.into(),
+            instrument_type: InstrumentType::Index as i32,
+            ..Default::default()
+        })
+        .await,
+        Err(vec!["instrument_type".to_string()])
+    );
+    assert_eq!(
+        refused(ListExpirationsRequest {
+            underlying_id: AAPL.into(),
+            expiration_from: "2026-12-18".into(),
+            expiration_to: "2026-11-20".into(),
+            ..Default::default()
+        })
+        .await,
+        Err(vec!["expiration_to".to_string()])
+    );
+    assert_eq!(
+        refused(ListExpirationsRequest {
+            underlying_id: AAPL.into(),
+            expiration_from: "2026-13-01".into(),
+            ..Default::default()
+        })
+        .await,
+        Err(vec!["expiration_from".to_string()])
+    );
+}
+
+/// Nothing listed for the underlying: answered as ListSeries answers it,
+/// its source asked for the chain (W10.7, ruling 856).
+#[tokio::test(flavor = "multi_thread")]
+async fn nothing_listed_is_answered_as_list_series_answers_it() {
+    use meridian_domain::v1::ListExpirationsRequest;
+    let h = harness();
+    let mut wanted = h.bus.subscribe_every(service::OBSERVATIONS_WANTED);
+    let reply = tokio::task::block_in_place(|| {
+        h.lake.list_expirations(
+            ListExpirationsRequest {
+                underlying_id: AAPL.into(),
+                ..Default::default()
+            },
+            &envelope("signal-1"),
+        )
+    })
+    .unwrap();
+    assert!(reply.expirations.is_empty());
+    assert!(
+        reply.unanswered.iter().any(|u| u.dataset == CHAIN),
+        "{:?}",
+        reply.unanswered
+    );
+    let want = next_want(&mut wanted)
+        .await
+        .expect("the chain asked of its source");
+    assert!(want.all_series);
 }

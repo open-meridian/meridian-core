@@ -14820,6 +14820,57 @@ pub struct ListSeriesReply {
     #[prost(string, tag = "5")]
     pub next_cursor: ::prost::alloc::string::String,
 }
+/// Contract v28, amended 2026-10-28 (W10.6; rulings 856, 858 and 859): one
+/// expiration of an underlying's listed series, as the lake's listing holds it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Expiration {
+    /// The series' expiration_date as listed, else its last_trade_date, else its
+    /// final_settlement_date. Never empty.
+    #[prost(string, tag = "1")]
+    pub expiration_date: ::prost::alloc::string::String,
+    /// The listed series of the type asked expiring on the date, each counted
+    /// once however many datasets list it. Never 0: a date no series expires on
+    /// is not answered.
+    #[prost(uint32, tag = "2")]
+    pub series_count: u32,
+}
+/// Contract v28, amended 2026-10-28 (W10.6): ListExpirations's request.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListExpirationsRequest {
+    /// The underlying's INS- record. Never empty.
+    #[prost(string, tag = "1")]
+    pub underlying_id: ::prost::alloc::string::String,
+    /// Listed_option, future or future_option, as ListSeries reads it.
+    /// Unspecified: every listed type.
+    #[prost(enumeration = "InstrumentType", tag = "2")]
+    pub instrument_type: i32,
+    /// A plain date. Empty: from the earliest.
+    #[prost(string, tag = "3")]
+    pub expiration_from: ::prost::alloc::string::String,
+    /// A plain date, on or after expiration_from. Empty: to the latest.
+    #[prost(string, tag = "4")]
+    pub expiration_to: ::prost::alloc::string::String,
+}
+/// Contract v28, amended 2026-10-28 (W10.6): ListExpirations's answer.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListExpirationsReply {
+    /// Each expiration date the lake's listing holds, once, in date order. None:
+    /// the listing holds no series of the type asked expiring in the window.
+    #[prost(message, repeated, tag = "1")]
+    pub expirations: ::prost::alloc::vec::Vec<Expiration>,
+    /// Each subject and dataset not answered, with its reason. None: every part
+    /// answered.
+    #[prost(message, repeated, tag = "2")]
+    pub unanswered: ::prost::alloc::vec::Vec<Unanswered>,
+    /// Each dataset answered, with its vendor, declaration and liveness. None
+    /// answered.
+    #[prost(message, repeated, tag = "3")]
+    pub datasets: ::prost::alloc::vec::Vec<DatasetRef>,
+    /// The sequence per partition the answer holds, from which a reader hears
+    /// what follows. Never unset on an answer.
+    #[prost(message, optional, tag = "4")]
+    pub watermark: ::core::option::Option<Watermark>,
+}
 /// Contract v28: a value per contract per trading date as its source publishes
 /// it: open interest, volume, block volume (contract v28).
 #[derive(Clone, PartialEq, ::prost::Message)]
