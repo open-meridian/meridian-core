@@ -11,9 +11,9 @@
 //! (decisions/028). Never a value, an account or an identifier.
 
 use meridian_pb::v1::{
-    AlgorithmDeclaration, Catalogue, CopyrightClass, DatasetDeclaration, DatasetLicence,
-    DerivedUse, NotCarried, NotCarriedReason, ObservationMode, PluginDeclaration,
-    PricingModelDeclaration, RawRecordKind, Redistribution, StorageDeclaration,
+    AlgorithmDeclaration, Catalogue, CopyrightClass, DataEligibility, DataUse, DatasetDeclaration,
+    DatasetLicence, Decimal, DerivedUse, NotCarried, NotCarriedReason, ObservationMode,
+    PluginDeclaration, PricingModelDeclaration, RawRecordKind, Redistribution, StorageDeclaration,
 };
 
 /// The declaration as the CLI sends it, in JSON.
@@ -162,6 +162,103 @@ pub struct DeclaredLicence {
     pub no_more_restrictive_terms: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub not_affiliated_notice: String,
+    /// Who may take the dataset under its terms (contract v28, rulings 491
+    /// and 597), as the SDK uploads it from 0.33.0: absent where the terms
+    /// state none. Without it here, a registration carrying it differed from
+    /// its uploaded declaration and was refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eligibility: Option<DeclaredEligibility>,
+}
+
+/// A licence's eligibility as the SDK's `DataEligibility._to_json` writes
+/// it: the uses by their words, each bound a decimal string (`None` for
+/// none), and the bounds' ISO 4217 code.
+#[derive(Debug, Default, Clone, serde::Deserialize, serde::Serialize)]
+pub struct DeclaredEligibility {
+    #[serde(default)]
+    pub uses: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buyer_revenue_below: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buyer_revenue_at_least: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub buyer_revenue_currency_code: String,
+}
+
+/// A use by its word (`personal`) or the enum's name.
+fn data_use_of(text: &str) -> Option<DataUse> {
+    DataUse::from_str_name(text)
+        .or_else(|| DataUse::from_str_name(&format!("DATA_USE_{}", text.to_ascii_uppercase())))
+        .filter(|used| *used != DataUse::Unspecified)
+}
+
+fn data_use_word(used: i32) -> &'static str {
+    match DataUse::try_from(used) {
+        Ok(DataUse::Personal) => "personal",
+        Ok(DataUse::Commercial) => "commercial",
+        _ => "unspecified",
+    }
+}
+
+/// A decimal as the SDK writes it (`str(Decimal)`: `1000000`, `2.5E+6`,
+/// `1E-7`) on the wire as the SDK sends it: the integer and the scale it
+/// was stated with, an exponent above zero folded into the integer, as
+/// `meridian.operations._decimal` does.
+fn wire_decimal(text: &str) -> Option<Decimal> {
+    let (mantissa, exponent) = match text.find(['e', 'E']) {
+        Some(at) => (&text[..at], text[at + 1..].parse::<i64>().ok()?),
+        None => (text, 0),
+    };
+    let stated: crate::exact::Exact = mantissa.parse().ok()?;
+    let scale = i64::from(stated.scale()) - exponent;
+    let exact = if scale >= 0 {
+        crate::exact::Exact::new(stated.integer(), u32::try_from(scale).ok()?).ok()?
+    } else {
+        let factor = 10i128.checked_pow(u32::try_from(-scale).ok()?)?;
+        crate::exact::Exact::new(stated.integer().checked_mul(factor)?, 0).ok()?
+    };
+    Some(exact.to_wire())
+}
+
+fn eligibility_from_json(
+    declared: &DeclaredEligibility,
+    at: &str,
+) -> Result<DataEligibility, String> {
+    let mut uses = Vec::new();
+    for (j, word) in declared.uses.iter().enumerate() {
+        let used = data_use_of(word)
+            .ok_or_else(|| format!("{at}.uses[{j}] {word:?} is none of personal and commercial"))?;
+        uses.push(used as i32);
+    }
+    let bound = |value: &Option<String>, name: &str| -> Result<Option<Decimal>, String> {
+        value
+            .as_deref()
+            .map(|text| {
+                wire_decimal(text).ok_or_else(|| format!("{at}.{name} {text:?} is not a decimal"))
+            })
+            .transpose()
+    };
+    Ok(DataEligibility {
+        uses,
+        buyer_revenue_below: bound(&declared.buyer_revenue_below, "buyer_revenue_below")?,
+        buyer_revenue_at_least: bound(&declared.buyer_revenue_at_least, "buyer_revenue_at_least")?,
+        buyer_revenue_currency_code: declared.buyer_revenue_currency_code.clone(),
+    })
+}
+
+fn eligibility_json(eligibility: &DataEligibility) -> serde_json::Value {
+    let bound = |value: &Option<Decimal>| {
+        value
+            .as_ref()
+            .and_then(|wire| crate::exact::Exact::from_wire(wire).ok())
+            .map(|exact| exact.to_string())
+    };
+    serde_json::json!({
+        "uses": eligibility.uses.iter().map(|u| data_use_word(*u)).collect::<Vec<_>>(),
+        "buyer_revenue_below": bound(&eligibility.buyer_revenue_below),
+        "buyer_revenue_at_least": bound(&eligibility.buyer_revenue_at_least),
+        "buyer_revenue_currency_code": eligibility.buyer_revenue_currency_code,
+    })
 }
 
 /// A mode as the wire numbers it, from its word or the enum's name.
@@ -426,6 +523,18 @@ fn catalogue_from_json(catalogue: &DeclaredCatalogue) -> Result<Catalogue, Strin
                         l.copyright_class
                     )
                 })?;
+                let eligibility = l
+                    .eligibility
+                    .as_ref()
+                    .map(|e| {
+                        eligibility_from_json(
+                            e,
+                            &format!(
+                                "declaration.catalogue.datasets[{i}].licence_default.eligibility"
+                            ),
+                        )
+                    })
+                    .transpose()?;
                 #[allow(deprecated)]
                 let mut licence = DatasetLicence {
                     kept: l.kept,
@@ -441,6 +550,7 @@ fn catalogue_from_json(catalogue: &DeclaredCatalogue) -> Result<Catalogue, Strin
                     copyright_class: copyright_class as i32,
                     no_more_restrictive_terms: l.no_more_restrictive_terms,
                     not_affiliated_notice: l.not_affiliated_notice.clone(),
+                    eligibility,
                     ..Default::default()
                 };
                 crate::lake::derived_use_both(&mut licence);
@@ -466,6 +576,14 @@ fn catalogue_from_json(catalogue: &DeclaredCatalogue) -> Result<Catalogue, Strin
     Ok(Catalogue { datasets })
 }
 
+/// A licence's JSON with its eligibility, where it states one.
+fn licence_json(licence: &DatasetLicence, mut json: serde_json::Value) -> serde_json::Value {
+    if let Some(eligibility) = &licence.eligibility {
+        json["eligibility"] = eligibility_json(eligibility);
+    }
+    json
+}
+
 /// A dataset's catalogue entry as JSON, its modes in their words.
 pub fn dataset_json(dataset: &DatasetDeclaration) -> serde_json::Value {
     serde_json::json!({
@@ -476,7 +594,7 @@ pub fn dataset_json(dataset: &DatasetDeclaration) -> serde_json::Value {
         "modes": dataset.modes.iter().map(|m| mode_word(*m)).collect::<Vec<_>>(),
         "cadence": dataset.cadence,
         "history": dataset.history,
-        "licence_default": dataset.licence_default.as_ref().map(|l| serde_json::json!({
+        "licence_default": dataset.licence_default.as_ref().map(|l| licence_json(l, serde_json::json!({
             "kept": l.kept,
             "retention_days": l.retention_days,
             "derived_use": crate::lake::derived_use_bool(l),
@@ -490,7 +608,7 @@ pub fn dataset_json(dataset: &DatasetDeclaration) -> serde_json::Value {
             "copyright_class": copyright_class_word(l.copyright_class),
             "no_more_restrictive_terms": l.no_more_restrictive_terms,
             "not_affiliated_notice": l.not_affiliated_notice,
-        })),
+        }))),
         "day_time_zone": dataset.day_time_zone,
         "day_end_minute": dataset.day_end_minute,
         "venue_id": dataset.venue_id,
@@ -686,5 +804,133 @@ mod tests {
         assert!(from_json(&bad)
             .unwrap_err()
             .contains("licence_default.redistribution"));
+    }
+
+    /// SDK 0.33.x's DatasetLicence._to_json with an eligibility (contract
+    /// v28, rulings 491 and 597), as plugin-massive declares one.
+    fn with_eligibility(eligibility: serde_json::Value) -> Declared {
+        serde_json::from_value(serde_json::json!({
+            "catalogue": {"datasets": [{
+                "key": "stocks", "vendor": "Massive", "modes": ["pull"],
+                "licence_default": {
+                    "kept": true, "retention_days": 0, "derived_use": true,
+                    "derived_use_terms": "internal_only", "display": true,
+                    "default_fields": [], "personal_use": true,
+                    "redistribution": "not_allowed",
+                    "eligibility": eligibility
+                }
+            }]}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_licences_eligibility_travels_as_the_sdk_uploads_and_registers_it() {
+        let declared = with_eligibility(serde_json::json!({
+            "uses": ["personal"], "buyer_revenue_below": "1000000",
+            "buyer_revenue_at_least": null, "buyer_revenue_currency_code": "USD"
+        }));
+        let declaration = from_json(&declared).unwrap();
+        let eligibility = declaration.catalogue.as_ref().unwrap().datasets[0]
+            .licence_default
+            .as_ref()
+            .unwrap()
+            .eligibility
+            .clone()
+            .unwrap();
+        // What the SDK registers for the same declaration, its
+        // DataEligibility._wire: so the upload and the registration agree,
+        // and the sidecar does not refuse the catalogue as differing.
+        assert_eq!(
+            eligibility,
+            DataEligibility {
+                uses: vec![DataUse::Personal as i32],
+                buyer_revenue_below: Some(Decimal {
+                    high: 0,
+                    low: 1_000_000,
+                    scale: 0
+                }),
+                buyer_revenue_at_least: None,
+                buyer_revenue_currency_code: "USD".into(),
+            }
+        );
+        // Printed back by the same words, so a second read is the same.
+        let back = to_json(&declaration);
+        let printed = &back["catalogue"]["datasets"][0]["licence_default"]["eligibility"];
+        assert_eq!(printed["uses"], serde_json::json!(["personal"]));
+        assert_eq!(printed["buyer_revenue_below"], "1000000");
+        let again: Declared = serde_json::from_value(back).unwrap();
+        assert_eq!(from_json(&again).unwrap(), declaration);
+        // None stated, none carried, and none printed.
+        let mut none = declared.clone();
+        none.catalogue.as_mut().unwrap().datasets[0]
+            .licence_default
+            .as_mut()
+            .unwrap()
+            .eligibility = None;
+        let plain = from_json(&none).unwrap();
+        assert!(plain.catalogue.as_ref().unwrap().datasets[0]
+            .licence_default
+            .as_ref()
+            .unwrap()
+            .eligibility
+            .is_none());
+        assert!(
+            to_json(&plain)["catalogue"]["datasets"][0]["licence_default"]
+                .get("eligibility")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn an_eligibilitys_decimals_keep_the_scale_the_sdk_sends_and_bad_words_are_refused() {
+        let declared = with_eligibility(serde_json::json!({
+            "uses": ["DATA_USE_COMMERCIAL", "personal"],
+            "buyer_revenue_below": "2.5E+6", "buyer_revenue_at_least": "1000.50",
+            "buyer_revenue_currency_code": "USD"
+        }));
+        let eligibility = from_json(&declared).unwrap().catalogue.unwrap().datasets[0]
+            .licence_default
+            .clone()
+            .unwrap()
+            .eligibility
+            .unwrap();
+        assert_eq!(
+            eligibility.uses,
+            [DataUse::Commercial as i32, DataUse::Personal as i32]
+        );
+        // Python's Decimal("2.5E+6"): 25 * 10^5 at scale 0; "1000.50" at scale 2.
+        assert_eq!(
+            eligibility.buyer_revenue_below,
+            Some(Decimal {
+                high: 0,
+                low: 2_500_000,
+                scale: 0
+            })
+        );
+        assert_eq!(
+            eligibility.buyer_revenue_at_least,
+            Some(Decimal {
+                high: 0,
+                low: 100_050,
+                scale: 2
+            })
+        );
+        assert_eq!(
+            wire_decimal("1E-7"),
+            Some(Decimal {
+                high: 0,
+                low: 1,
+                scale: 7
+            })
+        );
+        let refused = from_json(&with_eligibility(serde_json::json!({"uses": ["anyone"]})));
+        assert!(refused
+            .unwrap_err()
+            .contains("licence_default.eligibility.uses[0]"));
+        let refused = from_json(&with_eligibility(
+            serde_json::json!({"uses": [], "buyer_revenue_below": "lots"}),
+        ));
+        assert!(refused.unwrap_err().contains("buyer_revenue_below"));
     }
 }
