@@ -460,6 +460,11 @@ fn backfill_latest_keys(conn: &mut Connection) -> Result<u64> {
             )
             .map_err(unavailable)?;
         tx.commit().map_err(unavailable)?;
+        // Progress, batch by batch (as the listing's backfill logs it).
+        tracing::info!(
+            filled,
+            "rows given the key their latest is chosen by so far"
+        );
     }
     Ok(filled)
 }
@@ -514,6 +519,12 @@ fn backfill_listing(conn: &mut Connection) -> Result<u64> {
             )
             .map_err(unavailable)?;
         tx.commit().map_err(unavailable)?;
+        // Progress, batch by batch, so a large lake's first migrate after
+        // migration 7 says how far it has come.
+        tracing::info!(
+            filled,
+            "series rows given their expiry and listed type so far"
+        );
     }
     Ok(filled)
 }
@@ -525,17 +536,30 @@ fn backfill_listing(conn: &mut Connection) -> Result<u64> {
 /// by then (ruling 619). A body is read only for a row not yet given its
 /// listing (one a release before migration 7 recorded during a rolling
 /// upgrade), which is decoded as before.
+///
+/// Read per underlying and dataset, each in the index's own order, so a row
+/// key's versions come newest first with no sort (found 2026-10-30: dev's
+/// chains are re-listed each pass, several versions a series; one query
+/// over every underlying and dataset asked sorted every version). Measured
+/// on core's bench after VACUUM ANALYZE, the median of 15: 1,440 series at
+/// one version 10.9 ms before, 0.8 ms now; at ten versions 7.4 ms before,
+/// 3.5 ms now. A skip scan taking only each key's latest was slower at both
+/// (8.7 and 11.9 ms), one probe a key costing more than the versions it
+/// skips at the counts dev holds.
 const LISTING: &str = "
 SELECT r.dataset, r.latest_key, r.expires::text, r.listed_type,
        CASE WHEN r.listed_type IS NULL OR r.latest_key IS NULL
             THEN (SELECT b.body FROM lake_row b
                    WHERE b.dataset = r.dataset AND b.sequence = r.sequence) END
-  FROM (SELECT DISTINCT ON (dataset, row_key)
-               dataset, sequence, latest_key, expires, listed_type, quality
-          FROM lake_row
-         WHERE data_type = 9 AND subject = ANY($2) AND dataset = ANY($1)
-           AND recorded_at_ns <= $3
-         ORDER BY dataset, row_key, version DESC) r
+  FROM (SELECT DISTINCT unnest($2::text[])) AS s (subject)
+ CROSS JOIN (SELECT DISTINCT unnest($1::text[])) AS d (dataset)
+ CROSS JOIN LATERAL (
+    SELECT DISTINCT ON (l.row_key)
+           l.dataset, l.sequence, l.latest_key, l.expires, l.listed_type, l.quality
+      FROM lake_row l
+     WHERE l.data_type = 9 AND l.subject = s.subject AND l.dataset = d.dataset
+       AND l.recorded_at_ns <= $3
+     ORDER BY l.row_key, l.version DESC) AS r
  WHERE COALESCE(r.quality, 0) <> 3
    AND NOT EXISTS (SELECT 1 FROM lake_quality_assessment a
                     WHERE a.dataset = r.dataset AND a.sequence = r.sequence
