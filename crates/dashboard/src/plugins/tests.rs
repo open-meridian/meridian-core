@@ -3263,7 +3263,7 @@ async fn a_plugin_pages_session_outlives_a_dashboard_restart_and_its_form_posts(
         PLUGIN_HOST,
         Method::POST,
         "/holdings",
-        &[plugin_session.clone()],
+        std::slice::from_ref(&plugin_session),
     )
     .await;
     assert_eq!(posted.status, StatusCode::OK, "{}", posted.body);
@@ -3272,7 +3272,7 @@ async fn a_plugin_pages_session_outlives_a_dashboard_restart_and_its_form_posts(
         &app,
         PLUGIN_HOST,
         "/holdings?page=2",
-        &[plugin_session.clone()],
+        std::slice::from_ref(&plugin_session),
     )
     .await;
     assert_eq!(read.status, StatusCode::OK, "{}", read.body);

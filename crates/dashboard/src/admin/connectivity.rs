@@ -1103,7 +1103,6 @@ mod tests {
                 plugin_instance_id: "fix-1".into(),
                 external_account_id: "LINKED-1".into(),
                 account_id: "ACC-2".into(),
-                ..Default::default()
             },
             meridian_domain::v1::ExternalAccountLink {
                 plugin_instance_id: "fix-2".into(),
