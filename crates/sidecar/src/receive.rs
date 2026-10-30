@@ -258,10 +258,19 @@ impl Sidecar {
             self.note_refusal(&refusal);
             return Err(Status::invalid_argument(refusal));
         }
+        let chosen_names: BTreeSet<&'static str> = chosen.iter().map(|row| row.name).collect();
+        // Subscriptions open on this stream (contract v28, amended
+        // 2026-10-30), its generation naming it.
+        let generation = self.subscriptions.opened(
+            chosen_names.clone(),
+            Arc::new(|_: &'static Row| {}),
+        );
         let lake = Lake {
             entitled: self.entitled.clone(),
             subjects: Arc::new(request.subjects.iter().cloned().collect()),
             subscriptions: Arc::clone(&self.subscriptions),
+            chosen: Arc::new(chosen_names),
+            generation,
         };
         self.entitled.watch(&self.bus);
 
@@ -292,11 +301,7 @@ impl Sidecar {
                 )
             })
         };
-        // Subscriptions open on this stream (contract v28, amended
-        // 2026-10-30): any an earlier stream held are dropped with it.
-        let generation = self
-            .subscriptions
-            .opened(chosen.iter().map(|row| row.name).collect(), Arc::clone(&start));
+        self.subscriptions.starting(generation, Arc::clone(&start));
         crate::subscriptions::renew_every_lease(
             Arc::clone(&self.bus),
             Arc::clone(&self.subscriptions),
@@ -350,6 +355,10 @@ struct Lake {
     entitled: crate::lake::Entitled,
     subjects: Arc<BTreeSet<String>>,
     subscriptions: Arc<crate::subscriptions::Registry>,
+    /// The rows this stream itself chose, heard as before; and its
+    /// generation, which its subscriptions are delivered on.
+    chosen: Arc<BTreeSet<&'static str>>,
+    generation: u64,
 }
 
 /// One row's forwarding started on the stream: a row naming its dataset in
@@ -546,7 +555,7 @@ async fn deliver(
     let mut envelope = heard.envelope;
     // Heard by the stream's own rows, as before contract v28's amendment of
     // 2026-10-30; and by each open subscription it matches.
-    let by_stream = lake.subscriptions.is_chosen(row.name);
+    let by_stream = lake.chosen.contains(row.name);
     let mut subscription_ids = Vec::new();
     // A lake row (contract v18): a want to the instance serving its dataset
     // alone; a recorded row of a dataset the plugin is entitled to, about a
@@ -570,6 +579,7 @@ async fn deliver(
                 && (said.subjects.is_empty()
                     || said.subjects.iter().any(|s| lake.subjects.contains(s)));
             let matched = lake.subscriptions.matching_lake(
+                lake.generation,
                 row.name,
                 &said.subjects,
                 &said.series,
@@ -643,7 +653,7 @@ async fn deliver(
     if !lake_row {
         subscription_ids = lake
             .subscriptions
-            .matching_book(row.name, read.account.as_deref());
+            .matching_book(lake.generation, row.name, read.account.as_deref());
         if !by_stream && subscription_ids.is_empty() {
             return;
         }

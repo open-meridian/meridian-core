@@ -562,3 +562,30 @@ fn a_listed_series_expiry_is_read_from_its_terms() {
     assert_eq!(super::expiry(&ListedSeries::default()), None);
     assert_eq!(super::series_named(&osi(NOV)), format!("occ_osi={NOV}"));
 }
+
+/// A subscription opens on the newest stream and is delivered there alone;
+/// a stream closed drops its own subscriptions, not another's.
+#[tokio::test]
+async fn a_subscription_lives_on_the_stream_it_opened_on() {
+    let w = world().await;
+    let mut first = stream_of(&w.sidecar, &["SeriesRecorded"]).await;
+    let second = stream_of(&w.sidecar, &["SeriesRecorded"]).await;
+    w.sidecar
+        .subscribe(Request::new(own("on-second")))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    publish_quote(&w.bus, AAPL, None);
+    nothing_more(&mut first).await;
+    drop(second);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Dropped with its stream: opened again on the one left.
+    w.sidecar
+        .subscribe(Request::new(own("on-first")))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    publish_quote(&w.bus, AAPL, None);
+    let delivery = next(&mut first).await;
+    assert_eq!(delivery.meta.unwrap().subscription_ids, vec!["on-first"]);
+}

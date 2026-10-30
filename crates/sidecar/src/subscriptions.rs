@@ -23,10 +23,12 @@
 //! `fields`; the envelope always. Where a delivery matches several
 //! selectors, it carries the union of what each may read.
 //!
-//! **Tied to the stream.** A subscription lives as long as the stream it
-//! was opened on: when the plugin stops listening, its subscriptions are
-//! dropped, and the SDK opens them again on the next stream, reading each
-//! snapshot again. Subscribing with no stream open is refused.
+//! **Tied to the stream.** A subscription is opened on the plugin's newest
+//! open stream, is delivered on it alone, and lives as long as it: when the
+//! plugin stops listening there, its subscriptions are dropped, and the SDK
+//! opens them again on the stream it has, reading each snapshot again. A
+//! stream opened later leaves the earlier one's subscriptions where they
+//! are. Subscribing with no stream open is refused.
 //!
 //! **Upstream.** Each lake row's selector keeps its want alive at the lake
 //! through `RenewWants`, one message per lease for every open selector, and
@@ -144,6 +146,8 @@ struct Open {
     /// Within a window: the series the listing holds expiring in it.
     listed: BTreeSet<String>,
     fields: BTreeSet<String>,
+    /// The stream it was opened on, and is delivered on.
+    generation: u64,
 }
 
 impl Open {
@@ -197,21 +201,27 @@ impl Open {
 pub(crate) type StartRow = Arc<dyn Fn(&'static Row) + Send + Sync>;
 
 struct Stream {
-    generation: u64,
-    /// The rows the stream itself chose (ReceiveRequest.rows), heard as
-    /// before; a row only a subscription hears is delivered only where it
-    /// matches one.
-    chosen: BTreeSet<&'static str>,
-    /// The rows forwarded now, chosen or subscribed.
+    /// The rows forwarded on it now, chosen or subscribed.
     forwarded: BTreeSet<&'static str>,
     start: StartRow,
 }
 
 #[derive(Default)]
 struct Inner {
-    stream: Option<Stream>,
+    /// The plugin's open streams, by generation; the newest is the one a
+    /// subscription opens on.
+    streams: BTreeMap<u64, Stream>,
     open: BTreeMap<String, Open>,
     generations: u64,
+}
+
+impl Inner {
+    fn newest(&mut self) -> Option<(u64, &mut Stream)> {
+        self.streams
+            .iter_mut()
+            .next_back()
+            .map(|(generation, stream)| (*generation, stream))
+    }
 }
 
 /// The plugin's open subscriptions, and the stream they deliver on.
@@ -231,41 +241,49 @@ pub(crate) struct Matched {
 }
 
 impl Registry {
-    /// A stream opened: the rows it chose, and how to start another. Any
-    /// subscriptions an earlier stream held are dropped with it.
-    pub(crate) fn opened(
-        &self,
-        chosen: BTreeSet<&'static str>,
-        start: StartRow,
-    ) -> u64 {
+    /// A stream opened: the rows it forwards, and how to start another.
+    /// Its generation names it.
+    pub(crate) fn opened(&self, chosen: BTreeSet<&'static str>, start: StartRow) -> u64 {
         let mut inner = self.inner.lock().expect("subscriptions poisoned");
         inner.generations += 1;
         let generation = inner.generations;
-        inner.open.clear();
-        inner.stream = Some(Stream {
+        inner.streams.insert(
             generation,
-            forwarded: chosen.clone(),
-            chosen,
-            start,
-        });
+            Stream {
+                forwarded: chosen,
+                start,
+            },
+        );
         generation
+    }
+
+    /// How a stream starts a row it does not yet forward, given once its
+    /// forwarders' context exists.
+    pub(crate) fn starting(&self, generation: u64, start: StartRow) {
+        if let Some(stream) = self
+            .inner
+            .lock()
+            .expect("subscriptions poisoned")
+            .streams
+            .get_mut(&generation)
+        {
+            stream.start = start;
+        }
     }
 
     /// The stream of `generation` closed: its subscriptions with it.
     pub(crate) fn closed(&self, generation: u64) {
         let mut inner = self.inner.lock().expect("subscriptions poisoned");
-        if inner.stream.as_ref().is_some_and(|s| s.generation == generation) {
-            inner.stream = None;
-            inner.open.clear();
-        }
+        inner.streams.remove(&generation);
+        inner.open.retain(|_, open| open.generation != generation);
     }
 
-    pub(crate) fn is_chosen(&self, row: &str) -> bool {
-        let inner = self.inner.lock().expect("subscriptions poisoned");
-        inner
-            .stream
-            .as_ref()
-            .is_some_and(|s| s.chosen.contains(row))
+    fn is_open(&self, generation: u64) -> bool {
+        self.inner
+            .lock()
+            .expect("subscriptions poisoned")
+            .streams
+            .contains_key(&generation)
     }
 
     pub(crate) fn open_count(&self) -> usize {
@@ -274,8 +292,10 @@ impl Registry {
 
     /// A lake row heard: the subscriptions it matches, and their mask. A
     /// listed series heard first widens each open window it falls in.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn matching_lake(
         &self,
+        generation: u64,
         row: &str,
         subjects: &[String],
         series_key: &[Identifier],
@@ -308,7 +328,11 @@ impl Registry {
         let mut matched = Matched::default();
         let mut mask: Option<BTreeSet<String>> = Some(BTreeSet::new());
         for (id, open) in &inner.open {
-            if open.row != row || !open.lake || !open.holds(subjects, &series) {
+            if open.generation != generation
+                || open.row != row
+                || !open.lake
+                || !open.holds(subjects, &series)
+            {
                 continue;
             }
             matched.ids.push(id.clone());
@@ -329,13 +353,19 @@ impl Registry {
 
     /// A row naming an account, or none, heard: the subscriptions it
     /// matches, each its row's and naming that account or every one.
-    pub(crate) fn matching_book(&self, row: &str, account: Option<&str>) -> Vec<String> {
+    pub(crate) fn matching_book(
+        &self,
+        generation: u64,
+        row: &str,
+        account: Option<&str>,
+    ) -> Vec<String> {
         let inner = self.inner.lock().expect("subscriptions poisoned");
         inner
             .open
             .iter()
             .filter(|(_, open)| {
-                open.row == row
+                open.generation == generation
+                    && open.row == row
                     && !open.lake
                     && (open.subjects.is_empty()
                         || account.is_some_and(|account| open.subjects.contains(account)))
@@ -344,10 +374,16 @@ impl Registry {
             .collect()
     }
 
-    /// The wants the open lake selectors hold, as a renewal names them.
-    pub(crate) fn wants(&self) -> Vec<RenewedWant> {
+    /// The wants the open lake selectors of a stream hold, as a renewal
+    /// names them.
+    pub(crate) fn wants(&self, generation: u64) -> Vec<RenewedWant> {
         let inner = self.inner.lock().expect("subscriptions poisoned");
-        let mut wants: Vec<RenewedWant> = inner.open.values().filter_map(want_of).collect();
+        let mut wants: Vec<RenewedWant> = inner
+            .open
+            .values()
+            .filter(|open| open.generation == generation)
+            .filter_map(want_of)
+            .collect();
         wants.sort_by(|a, b| a.encode_to_vec().cmp(&b.encode_to_vec()));
         wants.dedup();
         wants
@@ -418,7 +454,7 @@ impl Sidecar {
         let open = self.selector(&request, row)?;
         {
             let inner = self.subscriptions.inner.lock().expect("subscriptions poisoned");
-            if inner.stream.is_none() {
+            if inner.streams.is_empty() {
                 drop(inner);
                 return Err(refused(
                     self,
@@ -456,9 +492,10 @@ impl Sidecar {
         let want = want_of(&open);
         {
             let mut inner = self.subscriptions.inner.lock().expect("subscriptions poisoned");
-            let Some(stream) = inner.stream.as_mut() else {
+            let Some((generation, stream)) = inner.newest() else {
                 return Err(Status::failed_precondition("the stream closed"));
             };
+            open.generation = generation;
             // A window widens on the listing's changes, so the row that
             // carries them is heard too, where the plugin may hear it.
             let mut starting: Vec<&'static Row> = Vec::new();
@@ -595,6 +632,7 @@ impl Sidecar {
             window: windowed.then_some((from, to)),
             listed: BTreeSet::new(),
             fields: request.fields.iter().cloned().collect(),
+            generation: 0,
         })
     }
 
@@ -696,17 +734,10 @@ pub(crate) fn renew_every_lease(
         every.tick().await;
         loop {
             every.tick().await;
-            let current = registry
-                .inner
-                .lock()
-                .expect("subscriptions poisoned")
-                .stream
-                .as_ref()
-                .is_some_and(|s| s.generation == generation);
-            if !current {
+            if !registry.is_open(generation) {
                 return;
             }
-            let wants = registry.wants();
+            let wants = registry.wants(generation);
             if !wants.is_empty() {
                 renew(&bus, wants).await;
             }
