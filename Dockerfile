@@ -28,6 +28,8 @@ RUN apt-get update \
 # No incremental state in the build cache, on the VM's one shared disk.
 ENV CARGO_INCREMENTAL=0
 WORKDIR /w
+# Dockerfile.rust's wrapper for the shared target cache (tools/fresh-sources.sh).
+COPY tools/fresh-sources.sh /usr/local/bin/fresh-sources
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 # The contract the sidecar and the broker grant from, compiled in
@@ -45,7 +47,7 @@ ARG MERIDIAN_VERSION=
 RUN --mount=type=cache,id=meridian-core-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=meridian-core-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=meridian-core-target,target=/w/target \
-    cargo build --release --locked -p meridian-runtime \
+    fresh-sources cargo build --release --locked -p meridian-runtime \
  && cp target/release/meridian-street target/release/meridian-bor target/release/meridian-lake \
        target/release/meridian-instrument \
        target/release/meridian-conductor target/release/meridian-sidecar \
