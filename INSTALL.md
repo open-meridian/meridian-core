@@ -17,9 +17,11 @@ Budget half an hour.
 
 ## Before you start
 
-- A Kubernetes cluster, and `kubectl` already pointing at it. A laptop cluster
-  (k3s, Rancher Desktop, kind, Docker Desktop) is fine for trying this.
-- `helm`, version 3.12 or newer; `meridian doctor` checks.
+- A Kubernetes cluster, version 1.35 or newer, and `kubectl` already pointing
+  at it. A laptop cluster (k3s, Rancher Desktop, kind, Docker Desktop) is fine
+  for trying this. The chart refuses an older cluster before it installs
+  anything, and `meridian doctor` checks.
+- `helm`, version 3.14 or newer; `meridian doctor` checks.
 - The `meridian` CLI, on macOS or Linux:
 
   ```bash
