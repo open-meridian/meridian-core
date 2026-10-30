@@ -59,9 +59,9 @@ use meridian_domain::v1::{
     ListCorporateActionsRequest, RecordCorporateActionsRequest, ResolveCompanyRequest,
 };
 use meridian_domain::v1::{
-    ListSeriesReply, ListSeriesRequest, ListStatisticsReply, ListStatisticsRequest,
-    RecordSeriesRequest, RecordStatisticsRequest, StatisticKind, StatisticsRecordedEvent,
-    SubjectRole,
+    Expiration, ListExpirationsReply, ListExpirationsRequest, ListSeriesReply, ListSeriesRequest,
+    ListStatisticsReply, ListStatisticsRequest, RecordSeriesRequest, RecordStatisticsRequest,
+    StatisticKind, StatisticsRecordedEvent, SubjectRole,
 };
 use meridian_domain::v1::{
     QualityReason, QualityState, RecordQualityAssessmentsReply, RecordQualityAssessmentsRequest,
@@ -93,6 +93,8 @@ pub const LIST_RATES: &str = "platform.lake.query.list-rates";
 /// Contract v28, listed options and futures (W10.4, W10.6; ruling 561).
 pub const RECORD_SERIES: &str = "platform.lake.command.record-series";
 pub const LIST_SERIES: &str = "platform.lake.query.list-series";
+/// Contract v28, amended 2026-10-28 (W10.6; rulings 856, 858 and 859).
+pub const LIST_EXPIRATIONS: &str = "platform.lake.query.list-expirations";
 pub const RECORD_STATISTICS: &str = "platform.lake.command.record-statistics";
 pub const LIST_STATISTICS: &str = "platform.lake.query.list-statistics";
 /// Contract v28, track B (W10.4, W10.6, W12.8): a signal plugin's derived
@@ -2788,14 +2790,6 @@ impl Lake {
                     continue;
                 };
                 let meta = listed.meta.clone().unwrap_or_default();
-                let field = |path: &str| {
-                    listed
-                        .fields
-                        .iter()
-                        .find(|field| field.path == path)
-                        .map(|field| field.value.clone())
-                        .unwrap_or_default()
-                };
                 // Its type: a future names its product code; an option on a
                 // future record is a future option (W1.24).
                 let underlying = meta
@@ -2804,13 +2798,7 @@ impl Lake {
                     .and_then(|subject| underlyings.get(&subject.entity_id))
                     .copied()
                     .unwrap_or(0);
-                let its_kind = if !field("product_code").is_empty() {
-                    InstrumentType::Future
-                } else if underlying == InstrumentType::Future as i32 {
-                    InstrumentType::FutureOption
-                } else {
-                    InstrumentType::ListedOption
-                };
+                let its_kind = read::as_listed(read::listed_type(&listed), underlying);
                 if kind != InstrumentType::Unspecified && kind != its_kind {
                     continue;
                 }
@@ -2857,6 +2845,178 @@ impl Lake {
             datasets,
             watermark,
             next_cursor,
+        })
+    }
+
+    /// W10.6, contract v28 amended 2026-10-28 (rulings 856 and 858; the
+    /// names approved 859): an underlying's distinct expirations of a listed
+    /// type, within a window where one is asked, in date order, each with
+    /// how many series the lake's listing holds expiring then -- each series
+    /// once, however many datasets list it. Answered from the listing alone
+    /// ([`Store::listing`]), never a series row read whole. Entitlement is
+    /// ListSeries': the datasets the reader may read that serve series.
+    /// Where the listing holds nothing for the underlying it is answered as
+    /// ListSeries answers, its source asked (W10.7); a window with series
+    /// listed only outside it answers no expiration and asks nothing.
+    pub(crate) fn list_expirations(
+        &self,
+        request: ListExpirationsRequest,
+        envelope: &Envelope,
+    ) -> Result<ListExpirationsReply, String> {
+        let invalid = |field: &str, words: &str| {
+            refusal_with_status(RefusalStatus::InvalidArgument, &[field.to_string()], words)
+        };
+        if request.underlying_id.is_empty() {
+            return Err(invalid(
+                "underlying_id",
+                "underlying_id names the underlying's INS- record",
+            ));
+        }
+        let listed = [
+            InstrumentType::Unspecified,
+            InstrumentType::ListedOption,
+            InstrumentType::Future,
+            InstrumentType::FutureOption,
+        ];
+        let kind = InstrumentType::try_from(request.instrument_type)
+            .ok()
+            .filter(|kind| listed.contains(kind))
+            .ok_or_else(|| {
+                invalid(
+                    "instrument_type",
+                    "instrument_type is listed_option, future or future_option, or unspecified",
+                )
+            })?;
+        let from = meridian_domain::date::optional("expiration_from", &request.expiration_from)
+            .map_err(|words| invalid("expiration_from", &words))?;
+        let to = meridian_domain::date::optional("expiration_to", &request.expiration_to)
+            .map_err(|words| invalid("expiration_to", &words))?;
+        if let (Some(from), Some(to)) = (&from, &to) {
+            if to < from {
+                return Err(invalid(
+                    "expiration_to",
+                    "expiration_to is on or after expiration_from",
+                ));
+            }
+        }
+        let window = read::Window { from, to };
+        let underlying = request.underlying_id;
+        let config = self.config();
+        let readable = config.readable(&reader_of(envelope), DataType::Series);
+        let heads = self.store.heads().map_err(|failed| failed.to_string())?;
+        if readable.is_empty() {
+            // As every read answers a reader entitled to no dataset of its
+            // kind: not entitled where one serves it, else not covered.
+            let reason = if config
+                .datasets
+                .keys()
+                .any(|dataset| config.serves(dataset, DataType::Series))
+            {
+                UnansweredReason::NotEntitled
+            } else {
+                UnansweredReason::NotCovered
+            };
+            return Ok(ListExpirationsReply {
+                expirations: Vec::new(),
+                unanswered: vec![Unanswered {
+                    subject: subject_ref(&underlying),
+                    dataset: String::new(),
+                    field: String::new(),
+                    reason: reason as i32,
+                }],
+                datasets: Vec::new(),
+                watermark: Some(watermark(&heads, &BTreeSet::new())),
+            });
+        }
+        // The underlying, and the records it replaced (W10.8).
+        let aliases = self.store.aliases().map_err(|failed| failed.to_string())?;
+        let mut subjects = vec![underlying.clone()];
+        subjects.extend(
+            aliases
+                .iter()
+                .filter(|(_, stays)| **stays == underlying)
+                .map(|(replaced, _)| replaced.clone()),
+        );
+        let listing = self
+            .store
+            .listing(&readable, &subjects, 0)
+            .map_err(|failed| failed.to_string())?;
+        if listing.is_empty() {
+            // Nothing listed: what ListSeries answers, its source asked.
+            let answer = self.read(
+                ReadRequest {
+                    data_type: DataType::Series,
+                    subjects: vec![SubjectRef {
+                        entity_id: underlying,
+                        ..Default::default()
+                    }],
+                    kinds: Vec::new(),
+                    interval_ns: 0,
+                    sources: None,
+                    at_ns: 0,
+                    business_date: String::new(),
+                    valid_from_ns: 0,
+                    valid_until_ns: 0,
+                    as_of_ns: 0,
+                    page_size: 1,
+                    cursor: String::new(),
+                    after: None,
+                    tenors: Vec::new(),
+                    published_as_of_ns: 0,
+                    series_keys: Vec::new(),
+                    all_series: true,
+                    dates: None,
+                    window: read::Window::default(),
+                    fields: Vec::new(),
+                },
+                envelope,
+            )?;
+            return Ok(ListExpirationsReply {
+                expirations: Vec::new(),
+                unanswered: answer.unanswered,
+                datasets: answer.datasets,
+                watermark: Some(answer.watermark),
+            });
+        }
+        let its_type = self
+            .subject_record(&underlying)
+            .ok()
+            .flatten()
+            .map_or(0, |(_, kind)| kind);
+        let held: BTreeSet<String> = listing.iter().map(|l| l.dataset.clone()).collect();
+        let mut by_date: BTreeMap<meridian_domain::date::Date, BTreeSet<&str>> = BTreeMap::new();
+        for entry in &listing {
+            let listed_as = read::as_listed(entry.listed_type, its_type);
+            if kind != InstrumentType::Unspecified && listed_as != kind {
+                continue;
+            }
+            let Some(date) = entry.expires else {
+                continue;
+            };
+            if window.holds(&date) {
+                by_date.entry(date).or_default().insert(&entry.series);
+            }
+        }
+        Ok(ListExpirationsReply {
+            expirations: by_date
+                .into_iter()
+                .map(|(date, series)| Expiration {
+                    expiration_date: date.to_string(),
+                    series_count: series.len() as u32,
+                })
+                .collect(),
+            unanswered: Vec::new(),
+            datasets: held
+                .iter()
+                .filter_map(|dataset| config.datasets.get(dataset))
+                .map(|dataset| DatasetRef {
+                    declaration: None,
+                    unconverted_count: 0,
+                    miss_count: 0,
+                    ..dataset.clone()
+                })
+                .collect(),
+            watermark: Some(watermark(&heads, &held)),
         })
     }
 
@@ -4570,6 +4730,16 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
             "meridian.v1.ListSeriesReply",
         ),
         |lake, request: ListSeriesRequest, envelope| lake.list_series(request, envelope),
+    );
+    serve_on(
+        &bus,
+        &lake,
+        LIST_EXPIRATIONS,
+        (
+            "meridian.v1.ListExpirationsRequest",
+            "meridian.v1.ListExpirationsReply",
+        ),
+        |lake, request: ListExpirationsRequest, envelope| lake.list_expirations(request, envelope),
     );
     serve_on(
         &bus,

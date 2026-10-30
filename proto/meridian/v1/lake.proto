@@ -1441,6 +1441,47 @@ message ListSeriesReply {
   string next_cursor = 5;
 }
 
+// Contract v28, amended 2026-10-28 (W10.6; rulings 856, 858 and 859): one
+// expiration of an underlying's listed series, as the lake's listing holds it.
+message Expiration {
+  // The series' expiration_date as listed, else its last_trade_date, else its
+  // final_settlement_date. Never empty.
+  string expiration_date = 1;
+  // The listed series of the type asked expiring on the date, each counted
+  // once however many datasets list it. Never 0: a date no series expires on
+  // is not answered.
+  uint32 series_count = 2;
+}
+
+// Contract v28, amended 2026-10-28 (W10.6): ListExpirations's request.
+message ListExpirationsRequest {
+  // The underlying's INS- record. Never empty.
+  string underlying_id = 1;
+  // Listed_option, future or future_option, as ListSeries reads it.
+  // Unspecified: every listed type.
+  InstrumentType instrument_type = 2;
+  // A plain date. Empty: from the earliest.
+  string expiration_from = 3;
+  // A plain date, on or after expiration_from. Empty: to the latest.
+  string expiration_to = 4;
+}
+
+// Contract v28, amended 2026-10-28 (W10.6): ListExpirations's answer.
+message ListExpirationsReply {
+  // Each expiration date the lake's listing holds, once, in date order. None:
+  // the listing holds no series of the type asked expiring in the window.
+  repeated Expiration expirations = 1;
+  // Each subject and dataset not answered, with its reason. None: every part
+  // answered.
+  repeated Unanswered unanswered = 2;
+  // Each dataset answered, with its vendor, declaration and liveness. None
+  // answered.
+  repeated DatasetRef datasets = 3;
+  // The sequence per partition the answer holds, from which a reader hears
+  // what follows. Never unset on an answer.
+  Watermark watermark = 4;
+}
+
 // Contract v28: a value per contract per trading date as its source publishes
 // it: open interest, volume, block volume (contract v28).
 message Statistic {

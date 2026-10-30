@@ -17,14 +17,18 @@ use postgres::{GenericClient, IsolationLevel, NoTls, Transaction};
 use prost::Message;
 use r2d2_postgres::PostgresConnectionManager;
 
-use meridian_domain::v1::{EntitlementsChangedEvent, ObservationsWantedEvent, SourcePriority};
+use meridian_domain::date::Date;
+use meridian_domain::v1::{
+    EntitlementsChangedEvent, InstrumentType, ObservationsWantedEvent, SourcePriority,
+};
 
 use crate::memory::{as_of, number, served_of};
 use crate::migrations;
-use crate::row::Observation;
+use crate::row::{DataType, Observation};
 use crate::store::{
-    as_assessed, as_flagged, closed_reason, Assessment, ClosedDayAmendment, Query, Recorded,
-    Removal, Result, Served, Stale, Store, StoreError, WantChange, WantChangeKind, When,
+    as_assessed, as_flagged, closed_reason, listed_of, Assessment, ClosedDayAmendment, Listed,
+    Query, Recorded, Removal, Result, Served, Stale, Store, StoreError, WantChange, WantChangeKind,
+    When,
 };
 
 type Pool = r2d2::Pool<PostgresConnectionManager<NoTls>>;
@@ -218,14 +222,18 @@ fn previous_of(client: &mut impl GenericClient, dataset: &str, row: &Observation
 fn insert(tx: &mut Transaction<'_>, dataset: &str, row: &Observation) -> Result<()> {
     let meta = row.meta();
     let date: Option<String> = (!meta.business_date.is_empty()).then(|| meta.business_date.clone());
+    // A series row's expiry and listed type (migration 7); none for any other.
+    let listing = row.listing();
+    let expires: Option<String> = listing.as_ref().and_then(|(expires, _)| expires.clone());
+    let listed_type: Option<i16> = listing.map(|(_, kind)| kind as i16);
     tx.execute(
         "INSERT INTO lake_row
                 (dataset, sequence, data_type, row_key, version, subject, subjects, kind,
                  interval_ns, venue_id, valid_from_ns, valid_until_ns, business_date,
                  recorded_at_ns, previous_sequence, unconverted, body, closed_reason,
-                 latest_key, quality)
+                 latest_key, quality, expires, listed_type)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::text::date, $14, $15,
-                 $16, $17, $18, $19, $20)",
+                 $16, $17, $18, $19, $20, $21::text::date, $22)",
         &[
             &dataset,
             &(meta.sequence as i64),
@@ -247,6 +255,8 @@ fn insert(tx: &mut Transaction<'_>, dataset: &str, row: &Observation) -> Result<
             &closed_reason(meta.closed_day.as_ref()),
             &row.latest_key(),
             &(meta.quality as i16),
+            &expires,
+            &listed_type,
         ],
     )
     .map_err(unavailable)?;
@@ -453,6 +463,83 @@ fn backfill_latest_keys(conn: &mut Connection) -> Result<u64> {
     }
     Ok(filled)
 }
+
+/// Fill in `expires` and `listed_type` where a series row has neither
+/// (migration 7): read from its own body, batch by batch as
+/// [`backfill_latest_keys`] does, by `lake_row_unlisted`. A row whose body
+/// does not read is passed over, and read whole by an expirations read as
+/// before. Run by `migrate`, every time.
+fn backfill_listing(conn: &mut Connection) -> Result<u64> {
+    let mut after: (String, i64) = (String::new(), 0);
+    let mut filled = 0u64;
+    loop {
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        let rows = tx
+            .query(
+                "SELECT dataset, sequence, body FROM lake_row
+                  WHERE (dataset, sequence) > ($1, $2)
+                    AND data_type = 9 AND listed_type IS NULL
+                  ORDER BY dataset, sequence
+                  LIMIT $3",
+                &[&after.0, &after.1, &BACKFILL_BATCH],
+            )
+            .map_err(unavailable)?;
+        let Some(last) = rows.last() else {
+            tx.commit().map_err(unavailable)?;
+            break;
+        };
+        after = (last.get(0), last.get(1));
+        let (mut datasets, mut sequences, mut expiries, mut types) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for row in &rows {
+            let body: Vec<u8> = row.get(2);
+            let Some((expires, kind)) = Observation::decode(DataType::Series, &body)
+                .ok()
+                .and_then(|observation| observation.listing())
+            else {
+                continue;
+            };
+            datasets.push(row.get::<_, String>(0));
+            sequences.push(row.get::<_, i64>(1));
+            expiries.push(expires);
+            types.push(kind as i16);
+        }
+        filled += tx
+            .execute(
+                "UPDATE lake_row r SET expires = f.expires::date, listed_type = f.listed_type
+                   FROM unnest($1::text[], $2::bigint[], $3::text[], $4::smallint[])
+                        AS f(dataset, sequence, expires, listed_type)
+                  WHERE r.dataset = f.dataset AND r.sequence = f.sequence",
+                &[&datasets, &sequences, &expiries, &types],
+            )
+            .map_err(unavailable)?;
+        tx.commit().map_err(unavailable)?;
+    }
+    Ok(filled)
+}
+
+/// The lake's listing, from `lake_row_listing` alone (contract v28, amended
+/// 2026-10-28; ruling 856): each series row key's version in force by the
+/// cut-off -- its latest version recorded by then, as every read takes it --
+/// left out where its effective state is invalid, its own or an assessment's
+/// by then (ruling 619). A body is read only for a row not yet given its
+/// listing (one a release before migration 7 recorded during a rolling
+/// upgrade), which is decoded as before.
+const LISTING: &str = "
+SELECT r.dataset, r.latest_key, r.expires::text, r.listed_type,
+       CASE WHEN r.listed_type IS NULL OR r.latest_key IS NULL
+            THEN (SELECT b.body FROM lake_row b
+                   WHERE b.dataset = r.dataset AND b.sequence = r.sequence) END
+  FROM (SELECT DISTINCT ON (dataset, row_key)
+               dataset, sequence, latest_key, expires, listed_type, quality
+          FROM lake_row
+         WHERE data_type = 9 AND subject = ANY($2) AND dataset = ANY($1)
+           AND recorded_at_ns <= $3
+         ORDER BY dataset, row_key, version DESC) r
+ WHERE COALESCE(r.quality, 0) <> 3
+   AND NOT EXISTS (SELECT 1 FROM lake_quality_assessment a
+                    WHERE a.dataset = r.dataset AND a.sequence = r.sequence
+                      AND a.state = 3 AND a.at_ns <= $3)";
 
 impl Store for PostgresStore {
     fn record(&self, dataset: &str, rows: Vec<Observation>, now_ns: i64) -> Result<Recorded> {
@@ -665,6 +752,46 @@ impl Store for PostgresStore {
         tx.commit().map_err(unavailable)?;
         as_flagged(&mut out, &amendments, query.as_of_ns);
         as_assessed(&mut out, &assessments, query.as_of_ns);
+        Ok(out)
+    }
+
+    fn listing(
+        &self,
+        datasets: &[String],
+        subjects: &[String],
+        as_of_ns: i64,
+    ) -> Result<Vec<Listed>> {
+        let mut conn = self.conn()?;
+        let mut tx = conn
+            .build_transaction()
+            .isolation_level(IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .map_err(unavailable)?;
+        let cut_off = if as_of_ns == 0 { i64::MAX } else { as_of_ns };
+        let rows = tx
+            .query(LISTING, &[&datasets, &subjects, &cut_off])
+            .map_err(unavailable)?;
+        tx.commit().map_err(unavailable)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let body: Option<Vec<u8>> = row.get(4);
+            if let Some(body) = body {
+                let observation =
+                    Observation::decode(DataType::Series, &body).map_err(unreadable)?;
+                out.extend(listed_of(&observation));
+                continue;
+            }
+            let expires: Option<String> = row.get(2);
+            let kind: Option<i16> = row.get(3);
+            out.push(Listed {
+                dataset: row.get(0),
+                series: row.get::<_, Option<String>>(1).unwrap_or_default(),
+                expires: expires.and_then(|date| Date::parse(&date).ok()),
+                listed_type: InstrumentType::try_from(i32::from(kind.unwrap_or(0)))
+                    .unwrap_or(InstrumentType::ListedOption),
+            });
+        }
         Ok(out)
     }
 
@@ -1250,6 +1377,10 @@ fn apply_migrations(conn: &mut Connection, clock: &dyn meridian_clock::Clock) ->
     let filled = backfill_latest_keys(conn)?;
     if filled > 0 {
         tracing::info!(filled, "rows given the key their latest is chosen by");
+    }
+    let listed = backfill_listing(conn)?;
+    if listed > 0 {
+        tracing::info!(listed, "series rows given their expiry and listed type");
     }
     Ok(())
 }

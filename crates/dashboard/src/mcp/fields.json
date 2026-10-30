@@ -401,6 +401,7 @@
     "ListDerivedSeries": "meridian.v1.ListDerivedSeriesRequest",
     "ListEventGroups": "meridian.v1.ListEventGroupsRequest",
     "ListExecutionCosts": "meridian.v1.ListExecutionCostsRequest",
+    "ListExpirations": "meridian.v1.ListExpirationsRequest",
     "ListFilings": "meridian.v1.ListFilingsRequest",
     "ListFinishedJobs": "meridian.v1.ListFinishedJobsRequest",
     "ListHoldings": "meridian.v1.ListHoldingsRequest",
@@ -36310,6 +36311,187 @@
       "meaning": "opaque, passed back as cursor",
       "not_meaning": "a count",
       "filled": "decided",
+      "filled_by": "lake",
+      "since": "v28",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.ListExpirationsRequest.underlying_id",
+      "type": "identifier instrument",
+      "empty": "never empty",
+      "intent": "names the underlying whose expirations are read (amended 2026-10-28, 856)",
+      "meaning": "the underlying's INS- record",
+      "not_meaning": "a series",
+      "filled": "as-reported",
+      "filled_by": "signal",
+      "since": "v28",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.ListExpirationsRequest.instrument_type",
+      "type": "enum InstrumentType",
+      "allowed": [
+        {
+          "value": "INSTRUMENT_TYPE_UNSPECIFIED",
+          "meaning": "no type stated: the asset class says all the record says"
+        },
+        {
+          "value": "INSTRUMENT_TYPE_MONEY_MARKET_FUND",
+          "meaning": "under fund: a fund investing in short-term debt under SEC rule 2a-7 and aiming to keep its value; held as a fund, never as cash, even where a custodian sweeps cash into it"
+        },
+        {
+          "value": "INSTRUMENT_TYPE_BINARY_EVENT_CONTRACT",
+          "meaning": "under event_contract: a contract paying a fixed amount if an event happens and nothing if it does not; a venue's YES and NO tokens are two instruments",
+          "since": "v19"
+        },
+        {
+          "value": "INSTRUMENT_TYPE_INTEREST_RATE",
+          "meaning": "under referential: a reference rate -- SOFR, EFFR, €STR, an average, a bound of the FOMC range",
+          "since": "v27"
+        },
+        {
+          "value": "INSTRUMENT_TYPE_RATE_CURVE",
+          "meaning": "under referential: a rate curve, one record whose points are the lake's rows by tenor -- Treasury's par curves, the Board's zero curve",
+          "since": "v27"
+        },
+        {
+          "value": "INSTRUMENT_TYPE_INDEX",
+          "meaning": "under referential: an index -- the SOFR Index",
+          "since": "v27"
+        },
+        {
+          "value": "INSTRUMENT_TYPE_LISTED_OPTION",
+          "meaning": "under derivative: a listed equity, ETF or index option, one series a record, with the attributes of ListedOption",
+          "since": "v28"
+        },
+        {
+          "value": "INSTRUMENT_TYPE_FUTURE",
+          "meaning": "under derivative: a listed future, one contract month a record, with the attributes of FutureContract",
+          "since": "v28"
+        },
+        {
+          "value": "INSTRUMENT_TYPE_FUTURE_OPTION",
+          "meaning": "under derivative: an option whose underlying is a future record, with the attributes of ListedOption",
+          "since": "v28"
+        },
+        {
+          "value": "INSTRUMENT_TYPE_COMMODITY",
+          "meaning": "under referential: a commodity a future is written on, never held",
+          "since": "v28"
+        }
+      ],
+      "empty": "unspecified: every listed type",
+      "intent": "narrows the expirations to one template type's series",
+      "meaning": "listed_option, future or future_option, as ListSeries reads it",
+      "not_meaning": "the underlying's type",
+      "filled": "as-reported",
+      "filled_by": "signal",
+      "since": "v28",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.ListExpirationsRequest.expiration_from",
+      "type": "date",
+      "empty": "empty: from the earliest",
+      "intent": "narrows the expirations, inclusive",
+      "meaning": "a plain date",
+      "not_meaning": "a trading date",
+      "filled": "as-reported",
+      "filled_by": "signal",
+      "since": "v28",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.ListExpirationsRequest.expiration_to",
+      "type": "date",
+      "empty": "empty: to the latest",
+      "intent": "narrows the expirations, inclusive",
+      "meaning": "a plain date, on or after expiration_from",
+      "not_meaning": "a trading date",
+      "filled": "as-reported",
+      "filled_by": "signal",
+      "since": "v28",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.ListExpirationsReply.expirations",
+      "type": "repeated message Expiration",
+      "empty": "none: the listing holds no series of the type asked expiring in the window",
+      "intent": "carries an underlying's expirations, without its series",
+      "meaning": "each expiration date the lake's listing holds, once, in date order",
+      "not_meaning": "every expiration listed: a source lists what it lists",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v28",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.ListExpirationsReply.unanswered",
+      "type": "repeated message Unanswered",
+      "empty": "none: every part answered",
+      "intent": "says what a read could not serve, and why",
+      "meaning": "each subject and dataset not answered, with its reason",
+      "not_meaning": "an empty window, which is no expiration",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v28",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.ListExpirationsReply.datasets",
+      "type": "repeated message DatasetRef",
+      "empty": "none answered",
+      "intent": "names the datasets whose listing answered",
+      "meaning": "each dataset answered, with its vendor, declaration and liveness",
+      "not_meaning": "every dataset entitled",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v28",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.ListExpirationsReply.watermark",
+      "type": "message Watermark",
+      "empty": "never unset on an answer",
+      "intent": "says where the answer stands in each dataset's sequence",
+      "meaning": "the sequence per partition the answer holds, from which a reader hears what follows",
+      "not_meaning": "a recorded time",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v28",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.Expiration.expiration_date",
+      "type": "date",
+      "empty": "never empty",
+      "intent": "names one expiration of an underlying's listed series",
+      "meaning": "the series' expiration_date as listed, else its last_trade_date, else its final_settlement_date",
+      "not_meaning": "a trading date the series trades on",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v28",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.Expiration.series_count",
+      "type": "integer",
+      "unit": "series",
+      "empty": "never 0: a date no series expires on is not answered",
+      "intent": "says how large an expiration's chain is before it is read",
+      "meaning": "the listed series of the type asked expiring on the date, each counted once however many datasets list it",
+      "not_meaning": "the series quoted, or the rows a chain read pages",
+      "filled": "derived",
       "filled_by": "lake",
       "since": "v28",
       "stability": "preview",

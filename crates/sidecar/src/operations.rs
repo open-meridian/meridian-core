@@ -2996,6 +2996,17 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.call_typed("platform.config.query.read-stale-reference-actions-permitted", "meridian.v1.ReadStaleReferenceActionsPermittedRequest", message, account, None).await
     }
 
+    /// W10.6: `platform.lake.query.list-expirations` (preview).
+    async fn list_expirations(
+        &self,
+        request: Request<plugin::ListExpirationsParams>,
+    ) -> Result<Response<plugin::ListExpirationsResult>, Status> {
+        let message: domain::ListExpirationsRequest = self.as_domain(request.into_inner())?;
+        self.known("instrument_type", message.instrument_type, domain::InstrumentType::try_from(message.instrument_type).is_ok())?;
+        let account = None;
+        self.call_typed("platform.lake.query.list-expirations", "meridian.v1.ListExpirationsRequest", message, account, None).await
+    }
+
     type ReceiveStream = crate::receive::Deliveries;
 
     /// W4.3: every row this plugin's roles hear, within its read scope.
