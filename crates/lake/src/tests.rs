@@ -2542,3 +2542,114 @@ async fn a_rows_age_at_the_lake_hop_is_recorded_on_commit_for_the_monitor() {
         "no instance: the lake is no plugin's"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_batchs_quotes_are_published_latest_value_per_key_and_every_one_recorded() {
+    // spec/one-data-access-model, "Subscriptions" (rulings 800, 820):
+    // publications batched, latest value wins. Two quotes of one key in a
+    // batch publish once, the later; another key's publishes beside it; a
+    // trade is never superseded (W10.5).
+    let h = harness();
+    h.lake.configured(&live_configuration());
+    let mut heard = h
+        .bus
+        .subscribe_every("platform.lake.coinbase-1:live.event.quotes-recorded");
+    let reply = record_rows(
+        &h,
+        "quotes",
+        vec![
+            Observation::Quote(quote("q1", NOW - 3, money("1", "USD", ""), money("2", "USD", ""))),
+            Observation::Quote(quote("q-usdc", NOW - 3, money("1", "", USDC), money("2", "", USDC))),
+            Observation::Quote(quote("q2", NOW - 2, money("1.5", "USD", ""), money("2", "USD", ""))),
+        ],
+    )
+    .unwrap();
+    assert_eq!(reply.recorded, 3, "every row recorded");
+    let mut published = Vec::new();
+    while let Ok(Some(delivery)) =
+        tokio::time::timeout(std::time::Duration::from_millis(200), heard.recv()).await
+    {
+        let event =
+            meridian_domain::v1::QuotesRecordedEvent::decode(&delivery.envelope.payload[..])
+                .unwrap();
+        published.push(event.quote.unwrap().meta.unwrap().row_key);
+    }
+    published.sort();
+    assert_eq!(published, vec!["q-usdc".to_string(), "q2".to_string()]);
+
+    let trades = vec![
+        Observation::Trade(trade("t1", NOW + 1_000, "62000")),
+        Observation::Trade(trade("t2", NOW + 2_000, "62001")),
+    ];
+    assert!(service::superseded_in_batch(&trades).is_empty(), "every trade");
+}
+
+/// Contract v28, amended 2026-10-30 (W10.7; rulings 834 and 885): a
+/// sidecar's renewal opens a standing want where none stands, of the dataset
+/// a default read would read first; renewals keep it; one no renewal names
+/// for two leases is withdrawn.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_renewal_opens_a_standing_want_keeps_it_and_its_lapse_withdraws_it() {
+    let h = harness();
+    let mut c = configuration(true, &[]);
+    c.datasets[0].declaration.as_mut().unwrap().cadence = 1;
+    h.lake.configured(&c);
+    let mut wanted = h.bus.subscribe_every(service::OBSERVATIONS_WANTED);
+    let mut withdrawn = h.bus.subscribe_every(service::WANT_WITHDRAWN);
+    let renewal = meridian_domain::v1::RenewWantsRequest {
+        wants: vec![meridian_domain::v1::RenewedWant {
+            data_type: "meridian.v1.Price".into(),
+            subjects: vec![SubjectRef {
+                entity_id: BTC.into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+    let renew = |h: &Harness| {
+        tokio::task::block_in_place(|| {
+            h.lake
+                .renew_wants(renewal.clone(), &envelope("reporting-1", true, ""))
+        })
+    };
+    renew(&h).unwrap();
+    let want = ObservationsWantedEvent::decode(&wanted.recv().await.unwrap().envelope.payload[..])
+        .unwrap();
+    assert!(want.standing, "kept current from now");
+    assert_eq!(want.subjects[0].entity_id, BTC);
+
+    // Renewed within the lease: the same want, not asked again.
+    h.clock.advance(30 * 1_000_000_000);
+    renew(&h).unwrap();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), wanted.recv())
+            .await
+            .is_err(),
+        "one standing want, however often renewed"
+    );
+    h.clock.advance(59 * 1_000_000_000);
+    h.lake.sweep_wants();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), withdrawn.recv())
+            .await
+            .is_err(),
+        "still within two leases"
+    );
+    h.clock.advance(2 * 1_000_000_000);
+    h.lake.sweep_wants();
+    let gone =
+        WantWithdrawnEvent::decode(&withdrawn.recv().await.unwrap().envelope.payload[..]).unwrap();
+    assert_eq!(gone.want_id, want.want_id);
+
+    // Refused: no wants; core is not a sidecar.
+    let empty = meridian_domain::v1::RenewWantsRequest { wants: vec![] };
+    assert!(tokio::task::block_in_place(|| h
+        .lake
+        .renew_wants(empty, &envelope("reporting-1", true, "")))
+    .unwrap_err()
+    .contains("wants"));
+    assert!(tokio::task::block_in_place(|| h
+        .lake
+        .renew_wants(renewal.clone(), &envelope("dashboard", false, "")))
+    .is_err());
+}

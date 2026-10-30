@@ -1017,3 +1017,222 @@ async fn a_plugin_asks_for_a_date_and_is_answered_from_the_calendars_pulled() {
     assert!(read.found);
     assert_eq!(read.days[0].name, "Columbus Day");
 }
+
+/// The quote-to-screen budget, end to end through core (ruling 799;
+/// spec/one-data-access-model, step 2): a data plugin's quote recorded by
+/// the lake, published, matched by a signal plugin's subscription at its
+/// sidecar and delivered on its stream, p99 within 500 ms from the quote's
+/// recorded time over a thousand quotes. The SDK's conflation and the page's
+/// draw are the SDK's and the kit's parts, measured there.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_quote_recorded_reaches_a_subscribed_plugin_within_the_budget() {
+    use meridian_domain::v1::{
+        DatasetEntitlement, DatasetRef, EntitlementsChangedEvent, InstrumentRecord, Money,
+        ObservationMeta, PluginCatalogue, PluginLaunch, PluginLaunchState, Quote,
+        RecordQuotesRequest, ResolveIdentifierReply, ResolveInstrumentReply,
+        ResolveInstrumentRequest, Source, SubjectRef,
+    };
+    use meridian_pb::plugin::v1 as plugin;
+    use meridian_pb::v1::{DatasetDeclaration, Decimal as PbDecimal, ObservationMode};
+
+    const DATASET: &str = "coinbase-1:live";
+    let backend = Arc::new(MemoryBackend::new());
+    let clock: Arc<dyn meridian_clock::Clock> = Arc::new(meridian_clock::SystemClock);
+    // The lake and the data plugin on one in-process bus, whose calls name
+    // the data plugin as their publisher; the reader's sidecar on its own,
+    // hearing the lake's publications through the shared backend as a
+    // sidecar hears them through the broker.
+    let core = Arc::new(Bus::single("coinbase-1", backend.clone(), clock.clone()));
+    core.serve(meridian_lake::service::RESOLVE_INSTRUMENT, |envelope| {
+        let asked = ResolveInstrumentRequest::decode(&envelope.payload[..]).unwrap();
+        Ok((
+            "meridian.v1.ResolveInstrumentReply".into(),
+            ResolveInstrumentReply {
+                found: true,
+                instrument: Some(InstrumentRecord {
+                    instrument_id: asked.instrument_id,
+                    ..Default::default()
+                }),
+            }
+            .encode_to_vec(),
+        ))
+    });
+    core.serve(meridian_lake::service::RESOLVE_IDENTIFIER, |_| {
+        Ok((
+            "meridian.v1.ResolveIdentifierReply".into(),
+            ResolveIdentifierReply {
+                found: true,
+                instrument_id: "LCL-USD".into(),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ))
+    });
+    core.serve(meridian_lake::service::PLUGIN_CATALOGUE, |_| {
+        Ok((
+            "meridian.v1.PluginCatalogue".into(),
+            PluginCatalogue {
+                launches: vec![PluginLaunch {
+                    instance_id: "coinbase-1".into(),
+                    version: "0.3.1".into(),
+                    state: PluginLaunchState::Launched as i32,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ))
+    });
+    core.serve("platform.config.query.plugin-configuration", |_| {
+        Ok((
+            "meridian.v1.PluginConfiguration".into(),
+            PluginConfiguration {
+                plugin_instance_id: "signal-1".into(),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ))
+    });
+    let lake = meridian_lake::service::serve(
+        Arc::clone(&core),
+        Arc::new(meridian_lake::MemoryStore::new()),
+        clock.clone(),
+    );
+    let configuration = EntitlementsChangedEvent {
+        datasets: vec![DatasetRef {
+            dataset: DATASET.into(),
+            instance: "coinbase-1".into(),
+            vendor: "Coinbase".into(),
+            declaration: Some(DatasetDeclaration {
+                key: "live".into(),
+                vendor: "Coinbase".into(),
+                data_types: vec!["meridian.v1.Quote".into()],
+                modes: vec![ObservationMode::Stream as i32],
+                day_time_zone: "Etc/UTC".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }],
+        entitlements: vec![DatasetEntitlement {
+            dataset: DATASET.into(),
+            instance: "signal-1".into(),
+            allowed: true,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    lake.configured(&configuration);
+
+    let reader = Sidecar::new(
+        Arc::new(Bus::single("signal-1", backend.clone(), clock.clone())),
+        "DEP-test",
+        Identity::new("signal-1", vec!["signal".to_string()]),
+    );
+    admitted(&reader, "signal").await;
+    let mut stream = reader
+        .receive(Request::new(plugin::ReceiveRequest {
+            rows: vec!["QuotesRecorded".into()],
+            subjects: Vec::new(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    core.publish(
+        "platform.config.event.entitlements-changed",
+        "meridian.v1.EntitlementsChangedEvent",
+        configuration.encode_to_vec(),
+        None,
+        None,
+    )
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    reader
+        .subscribe(Request::new(plugin::SubscribeRequest {
+            subscription_id: "rates".into(),
+            row: "QuotesRecorded".into(),
+            subjects: vec!["LCL-EURUSD".into()],
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+
+    let data = Arc::clone(&core);
+    let stamp = meridian_bus::Stamp {
+        account_scope: Some(Vec::new()),
+        ..Default::default()
+    };
+    let decimal = |text: &str| -> Option<PbDecimal> { Some(text.parse::<Exact>().unwrap().to_wire()) };
+    let usd = |text: &str| {
+        Some(Money {
+            amount: decimal(text),
+            currency_code: "USD".into(),
+            instrument_id: "LCL-USD".into(),
+        })
+    };
+    let mut ages_ms = Vec::new();
+    for i in 0..1000_i64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        let batch = RecordQuotesRequest {
+            quotes: vec![Quote {
+                meta: Some(ObservationMeta {
+                    row_key: format!("EURUSD:q:{i}"),
+                    subjects: vec![SubjectRef {
+                        entity_id: "LCL-EURUSD".into(),
+                        ..Default::default()
+                    }],
+                    source: Some(Source {
+                        instance: "coinbase-1".into(),
+                        dataset: DATASET.into(),
+                        ..Default::default()
+                    }),
+                    valid_from_ns: now,
+                    ..Default::default()
+                }),
+                bid: usd("1.1000"),
+                ask: usd("1.1002"),
+                bid_quantity: decimal("1000000"),
+                ask_quantity: decimal("1000000"),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        data.call_stamped(
+            meridian_lake::service::RECORD_QUOTES,
+            "meridian.v1.RecordQuotesRequest",
+            batch.encode_to_vec(),
+            None,
+            None,
+            &stamp,
+        )
+        .await
+        .expect("the batch is recorded");
+        let delivery = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+            .await
+            .expect("delivered within two seconds")
+            .expect("the stream is open")
+            .expect("a delivery");
+        let meta = delivery.meta.clone().unwrap();
+        assert_eq!(meta.subscription_ids, vec!["rates".to_string()]);
+        let Some(plugin::delivery::Item::QuotesRecorded(heard)) = delivery.item else {
+            panic!("{delivery:?}");
+        };
+        let recorded = heard.quote.unwrap().meta.unwrap().recorded_at_ns;
+        let received = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        ages_ms.push((received - recorded) as f64 / 1e6);
+    }
+    ages_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let p99 = ages_ms[ages_ms.len() * 99 / 100];
+    eprintln!(
+        "quote_recorded_to_plugin: {} quotes, p50 {:.2} ms, p99 {:.2} ms",
+        ages_ms.len(),
+        ages_ms[ages_ms.len() / 2],
+        p99
+    );
+    assert!(p99 <= 500.0, "p99 {p99} ms over the 500 ms budget");
+}

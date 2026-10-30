@@ -32189,6 +32189,19 @@
       "store": "lake"
     },
     {
+      "name": "meridian.v1.SeriesRecordedEvent.series",
+      "type": "message ListedSeries",
+      "empty": "never unset",
+      "intent": "delivers a listed series the lake recorded, so a copy of a chain follows its listing (amended 2026-10-30, 847, 886)",
+      "meaning": "the series as recorded, new or the next version of its key, with its version and sequence; its instrument_id as a read fills it",
+      "not_meaning": "every series: a reader hears what it is entitled to and asked for, latest first under load per subject, dataset and series key",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v28",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
       "name": "meridian.v1.SourceChoice.default",
       "type": "boolean",
       "empty": "false, with nothing else set, is the default too",
@@ -33514,6 +33527,115 @@
           "what": "a decline stands for the date asked only (W10.7, approved 2026-10-10)"
         }
       ],
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.RenewWantsRequest.wants",
+      "type": "repeated message RenewedWant",
+      "bounds": {
+        "count": [
+          1,
+          500
+        ]
+      },
+      "empty": "never empty",
+      "intent": "keeps upstream interest alive for a sidecar's open subscriptions (amended 2026-10-30, 885)",
+      "meaning": "each want the plugin's open subscriptions hold, renewed in one message per lease of about 30 s and at once for a subscription newly opened; the lake opens a standing want where none stands, keeps each while a renewal names it, and withdraws one no renewal named for two leases, or the dataset's cadence where longer",
+      "not_meaning": "a read, which a subscription's snapshot is; or a want's identifier, which the lake keeps",
+      "filled": "decided",
+      "filled_by": "sidecar",
+      "since": "v28",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.RenewedWant.data_type",
+      "type": "text",
+      "empty": "never empty",
+      "intent": "names the data type a subscription keeps current (amended 2026-10-30, 885)",
+      "meaning": "the data type by its message's full name, as ObservationsWantedEvent.data_type names it",
+      "not_meaning": "a row's name",
+      "filled": "decided",
+      "filled_by": "sidecar",
+      "since": "v28",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.RenewedWant.subjects",
+      "type": "repeated message SubjectRef",
+      "bounds": {
+        "count": [
+          1,
+          500
+        ]
+      },
+      "empty": "never empty",
+      "intent": "names the subjects a subscription keeps current (amended 2026-10-30, 885)",
+      "meaning": "the subscription's subjects, each an entity the lake's rows are about",
+      "not_meaning": "accounts: a book row's subscription renews no want",
+      "filled": "decided",
+      "filled_by": "sidecar",
+      "since": "v28",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.RenewedWant.series_keys",
+      "type": "repeated message Identifier",
+      "bounds": {
+        "count": [
+          0,
+          500
+        ]
+      },
+      "empty": "none: not a want of named series",
+      "intent": "names the series a chain subscription keeps current (amended 2026-10-30, 885)",
+      "meaning": "the series' keys, as ObservationsWantedEvent.series_keys names them",
+      "not_meaning": "INS- IDs, which subjects name",
+      "filled": "decided",
+      "filled_by": "sidecar",
+      "since": "v28",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.RenewedWant.all_series",
+      "type": "boolean",
+      "empty": "false: the subjects' own rows only, or the series named",
+      "intent": "keeps a whole chain current (amended 2026-10-30, 885)",
+      "meaning": "true: every series of the subjects, narrowed by the window",
+      "not_meaning": "every subject",
+      "filled": "decided",
+      "filled_by": "sidecar",
+      "since": "v28",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.RenewedWant.expiration_from",
+      "type": "date",
+      "empty": "empty: from the earliest",
+      "intent": "narrows a chain want's window, inclusive (amended 2026-10-30, 885)",
+      "meaning": "a plain date, set only with all_series; the standing want's window is the union of its renewals' windows",
+      "not_meaning": "a trading date",
+      "filled": "decided",
+      "filled_by": "sidecar",
+      "since": "v28",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.RenewedWant.expiration_to",
+      "type": "date",
+      "empty": "empty: to the latest",
+      "intent": "narrows a chain want's window, inclusive (amended 2026-10-30, 885)",
+      "meaning": "a plain date, on or after expiration_from, set only with all_series",
+      "not_meaning": "a trading date",
+      "filled": "decided",
+      "filled_by": "sidecar",
+      "since": "v28",
       "stability": "preview",
       "store": "lake"
     },
@@ -44728,6 +44850,25 @@
       "store": "sidecar"
     },
     {
+      "name": "meridian.plugin.v1.DeliveryMeta.subscription_ids",
+      "type": "repeated text",
+      "bounds": {
+        "count": [
+          0,
+          256
+        ]
+      },
+      "empty": "none: heard by the stream's own rows and subjects alone, or a Lost",
+      "intent": "routes a delivery to the views it keeps current (amended 2026-10-30)",
+      "meaning": "each open subscription the delivery matched, by its subscription_id; the sidecar the one matcher, so the SDK never matches again",
+      "not_meaning": "the subscriptions a loss concerns, which Lost.rows says by row",
+      "filled": "decided",
+      "filled_by": "sidecar",
+      "since": "v28",
+      "stability": "preview",
+      "store": "sidecar"
+    },
+    {
       "name": "meridian.plugin.v1.Lost.dropped",
       "type": "integer",
       "unit": "deliveries",
@@ -44816,6 +44957,174 @@
           "what": "narrows the unconflated rows too: the lake's trades (W4.3)"
         }
       ],
+      "stability": "preview",
+      "store": "sidecar"
+    },
+    {
+      "name": "meridian.plugin.v1.SubscribeRequest.subscription_id",
+      "type": "text",
+      "bounds": {
+        "length": [
+          1,
+          64
+        ]
+      },
+      "empty": "never empty",
+      "intent": "names a subscription so the plugin can drop it and route what it hears (amended 2026-10-30)",
+      "meaning": "the plugin's own name for it, 1 to 64 characters, unique among its open subscriptions, as FIX's MDReqID (262) is the requester's; the same id and selector again is answered as the first, another selector under an open id refused ALREADY_EXISTS",
+      "not_meaning": "an identifier the platform minted, or one any other plugin sees",
+      "filled": "minted",
+      "filled_by": "plugin",
+      "since": "v28",
+      "stability": "preview",
+      "store": "sidecar"
+    },
+    {
+      "name": "meridian.plugin.v1.SubscribeRequest.row",
+      "type": "text",
+      "empty": "never empty",
+      "intent": "names the one row a subscription hears (amended 2026-10-30)",
+      "meaning": "a row by its matrix name, as DeliveryMeta.row names it; a row no role the plugin holds hears is refused, PERMISSION_DENIED, naming it",
+      "not_meaning": "a topic, or several rows",
+      "filled": "as-reported",
+      "filled_by": "plugin",
+      "since": "v28",
+      "stability": "preview",
+      "store": "sidecar"
+    },
+    {
+      "name": "meridian.plugin.v1.SubscribeRequest.subjects",
+      "type": "repeated text",
+      "bounds": {
+        "count": [
+          0,
+          500
+        ]
+      },
+      "empty": "none: a lake row is about none, so nothing is heard of it; a book row's every account in the read scope",
+      "intent": "narrows a subscription to what a page shows (amended 2026-10-30)",
+      "meaning": "entity IDs: a lake row's subjects, as ReceiveRequest names them; a book row's accounts, within the read scope",
+      "not_meaning": "rows, which row names; an account outside the read scope, which is never heard",
+      "filled": "as-reported",
+      "filled_by": "plugin",
+      "since": "v28",
+      "stability": "preview",
+      "store": "sidecar"
+    },
+    {
+      "name": "meridian.plugin.v1.SubscribeRequest.series_keys",
+      "type": "repeated message Identifier",
+      "bounds": {
+        "count": [
+          0,
+          500
+        ]
+      },
+      "empty": "none: rows keyed by a series are heard only with all_series",
+      "intent": "narrows a lake row's subscription to named series (amended 2026-10-30)",
+      "meaning": "the series' keys, as ListQuotesRequest.series_keys names them, each row keyed by one heard with the subjects named",
+      "not_meaning": "INS- IDs, which subjects name",
+      "filled": "as-reported",
+      "filled_by": "plugin",
+      "since": "v28",
+      "stability": "preview",
+      "store": "sidecar"
+    },
+    {
+      "name": "meridian.plugin.v1.SubscribeRequest.all_series",
+      "type": "boolean",
+      "empty": "false: rows keyed by a series are heard only where series_keys names them",
+      "intent": "subscribes to a chain (amended 2026-10-30)",
+      "meaning": "true: rows keyed by any series of the subjects are heard beside their own, narrowed by the window",
+      "not_meaning": "every subject's rows",
+      "filled": "as-reported",
+      "filled_by": "plugin",
+      "since": "v28",
+      "stability": "preview",
+      "store": "sidecar"
+    },
+    {
+      "name": "meridian.plugin.v1.SubscribeRequest.expiration_from",
+      "type": "date",
+      "empty": "empty: from the earliest",
+      "intent": "narrows a chain subscription by expiration, inclusive (amended 2026-10-30)",
+      "meaning": "a plain date; set only with all_series, or refused naming it; the sidecar holds the window to the series the lake's listing holds expiring in it, and to those listed later (SeriesRecorded)",
+      "not_meaning": "a trading date",
+      "filled": "as-reported",
+      "filled_by": "plugin",
+      "since": "v28",
+      "stability": "preview",
+      "store": "sidecar"
+    },
+    {
+      "name": "meridian.plugin.v1.SubscribeRequest.expiration_to",
+      "type": "date",
+      "empty": "empty: to the latest",
+      "intent": "narrows a chain subscription by expiration, inclusive (amended 2026-10-30)",
+      "meaning": "a plain date, on or after expiration_from; set only with all_series, or refused naming expiration_from",
+      "not_meaning": "a trading date",
+      "filled": "as-reported",
+      "filled_by": "plugin",
+      "since": "v28",
+      "stability": "preview",
+      "store": "sidecar"
+    },
+    {
+      "name": "meridian.plugin.v1.SubscribeRequest.fields",
+      "type": "repeated text",
+      "bounds": {
+        "count": [
+          0,
+          32
+        ]
+      },
+      "empty": "none: every field the plugin may read",
+      "intent": "narrows what a subscription delivers to what a page shows (amended 2026-10-30)",
+      "meaning": "dictionary entries of the row's message, as the reads name them, intersected with the plugin's entitled fields when the subscription opens and again on EntitlementsChanged; the envelope always; an entry of another message is refused naming fields",
+      "not_meaning": "an entitlement: a field asked and not entitled is left unset",
+      "filled": "as-reported",
+      "filled_by": "plugin",
+      "since": "v28",
+      "stability": "preview",
+      "store": "sidecar"
+    },
+    {
+      "name": "SidecarSubscribe.limit",
+      "type": "integer",
+      "bounds": {
+        "range": {
+          "least": "0",
+          "most": "256"
+        },
+        "past": "refused"
+      },
+      "unit": "open subscriptions per plugin",
+      "empty": "not a field: the bound on a plugin's subscriptions",
+      "intent": "bounds what one sidecar matches for its plugin (amended 2026-10-30)",
+      "meaning": "at most 256 open at once; one more is refused RESOURCE_EXHAUSTED naming subscription_id; identical selectors within a plugin are one subscription in the SDK",
+      "not_meaning": "a bound on pages or readers, which the SDK's views share",
+      "filled": "decided",
+      "filled_by": "sidecar",
+      "since": "v28",
+      "stability": "preview",
+      "store": "sidecar"
+    },
+    {
+      "name": "meridian.plugin.v1.UnsubscribeRequest.subscription_id",
+      "type": "text",
+      "bounds": {
+        "length": [
+          1,
+          64
+        ]
+      },
+      "empty": "never empty",
+      "intent": "names the subscription dropped (amended 2026-10-30)",
+      "meaning": "an open subscription's id; nothing more is queued for it once answered; an id not open is answered as dropped",
+      "not_meaning": "a row",
+      "filled": "as-reported",
+      "filled_by": "plugin",
+      "since": "v28",
       "stability": "preview",
       "store": "sidecar"
     },
@@ -49549,6 +49858,19 @@
       "empty": "unset unless the delivery is a corporate action the lake recorded",
       "intent": "delivers an announced corporate action the lake recorded (W10.5; contract v28)",
       "meaning": "an announced corporate action the lake recorded, every one, never dropped for a later one; after a loss marker the plugin reads the actions after the watermark it last saw",
+      "not_meaning": "a record with a journal: a lake row carries its sequence in its own envelope",
+      "filled": "decided",
+      "filled_by": "lake",
+      "since": "v28",
+      "stability": "preview",
+      "store": "sidecar"
+    },
+    {
+      "name": "meridian.plugin.v1.Delivery.series_recorded",
+      "type": "message SeriesRecordedEvent",
+      "empty": "unset unless the delivery is a listed series the lake recorded",
+      "intent": "delivers a listed series the lake recorded, so a copy of a chain follows its listing (W10.5; amended 2026-10-30)",
+      "meaning": "a listed series the lake recorded, new or the next version of its key, latest value first per subject, dataset and series key under load; after a loss marker the plugin reads the listing again by its underlying",
       "not_meaning": "a record with a journal: a lake row carries its sequence in its own envelope",
       "filled": "decided",
       "filled_by": "lake",

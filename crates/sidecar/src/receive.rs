@@ -261,6 +261,7 @@ impl Sidecar {
         let lake = Lake {
             entitled: self.entitled.clone(),
             subjects: Arc::new(request.subjects.iter().cloned().collect()),
+            subscriptions: Arc::clone(&self.subscriptions),
         };
         self.entitled.watch(&self.bus);
 
@@ -270,34 +271,41 @@ impl Sidecar {
         };
         let waiting = Arc::new(Waiting::default());
         let (open, closed) = watch::channel(());
-        for row in chosen {
-            // A row naming its dataset in its topic is heard on the subject
-            // of each dataset the plugin is entitled to, and on no other's,
-            // as entitlements change (W10.1).
-            if row.topic.contains(crate::lake::DATASET) {
-                tokio::spawn(per_dataset(
-                    row,
-                    Arc::clone(&self.bus),
-                    Arc::clone(&waiting),
-                    self.configuration.clone(),
-                    hearer.clone(),
-                    lake.clone(),
-                    closed.clone(),
-                ));
-                continue;
-            }
-            let subscription = self.bus.subscribe_every(row.topic);
-            tokio::spawn(forward(
-                row,
-                subscription,
+        let start: crate::subscriptions::StartRow = {
+            let (bus, waiting, configuration, hearer, lake, closed) = (
+                Arc::clone(&self.bus),
                 Arc::clone(&waiting),
                 self.configuration.clone(),
                 hearer.clone(),
                 lake.clone(),
                 closed.clone(),
-                None,
-            ));
+            );
+            Arc::new(move |row: &'static Row| {
+                start_row(
+                    row,
+                    &bus,
+                    &waiting,
+                    &configuration,
+                    &hearer,
+                    &lake,
+                    &closed,
+                )
+            })
+        };
+        // Subscriptions open on this stream (contract v28, amended
+        // 2026-10-30): any an earlier stream held are dropped with it.
+        let generation = self
+            .subscriptions
+            .opened(chosen.iter().map(|row| row.name).collect(), Arc::clone(&start));
+        crate::subscriptions::renew_every_lease(
+            Arc::clone(&self.bus),
+            Arc::clone(&self.subscriptions),
+            generation,
+        );
+        for row in chosen {
+            start(row);
         }
+        let registry = Arc::clone(&self.subscriptions);
 
         // The stream: whatever waits, in order, until the plugin stops
         // listening, which ends every forwarder with it.
@@ -307,12 +315,16 @@ impl Sidecar {
             loop {
                 while let Some(item) = waiting.pop() {
                     if sending.send(Ok(item)).await.is_err() {
+                        registry.closed(generation);
                         return;
                     }
                 }
                 tokio::select! {
                     _ = waiting.ready.notified() => {}
-                    _ = sending.closed() => return,
+                    _ = sending.closed() => {
+                        registry.closed(generation);
+                        return;
+                    }
                 }
             }
         });
@@ -331,11 +343,49 @@ struct Hearer {
 }
 
 /// What a receive decides the lake's rows by: the plugin's entitlements
-/// and the subjects it named.
+/// and the subjects it named; and from contract v28, amended 2026-10-30,
+/// its open subscriptions.
 #[derive(Clone)]
 struct Lake {
     entitled: crate::lake::Entitled,
     subjects: Arc<BTreeSet<String>>,
+    subscriptions: Arc<crate::subscriptions::Registry>,
+}
+
+/// One row's forwarding started on the stream: a row naming its dataset in
+/// its topic on the subject of each dataset the plugin is entitled to, and
+/// on no other's, as entitlements change (W10.1); any other on its topic.
+fn start_row(
+    row: &'static Row,
+    bus: &Arc<meridian_bus::Bus>,
+    waiting: &Arc<Waiting>,
+    configuration: &Configuration,
+    hearer: &Hearer,
+    lake: &Lake,
+    closed: &watch::Receiver<()>,
+) {
+    if row.topic.contains(crate::lake::DATASET) {
+        tokio::spawn(per_dataset(
+            row,
+            Arc::clone(bus),
+            Arc::clone(waiting),
+            configuration.clone(),
+            hearer.clone(),
+            lake.clone(),
+            closed.clone(),
+        ));
+        return;
+    }
+    tokio::spawn(forward(
+        row,
+        bus.subscribe_every(row.topic),
+        Arc::clone(waiting),
+        configuration.clone(),
+        hearer.clone(),
+        lake.clone(),
+        closed.clone(),
+        None,
+    ));
 }
 
 /// A row naming its dataset in its topic, heard on each entitled dataset's
@@ -494,14 +544,20 @@ async fn deliver(
     lake: &Lake,
 ) {
     let mut envelope = heard.envelope;
+    // Heard by the stream's own rows, as before contract v28's amendment of
+    // 2026-10-30; and by each open subscription it matches.
+    let by_stream = lake.subscriptions.is_chosen(row.name);
+    let mut subscription_ids = Vec::new();
     // A lake row (contract v18): a want to the instance serving its dataset
     // alone; a recorded row of a dataset the plugin is entitled to, about a
-    // subject it named, its fields stripped by its entitlement, waiting
-    // under its key.
+    // subject it named or a subscription holds, its fields stripped by its
+    // entitlement and the subscriptions' fields, waiting under its key.
     let mut key = None;
-    if let Some(said) = crate::lake::said(&envelope.payload_type, &envelope.payload) {
+    let said = crate::lake::said(&envelope.payload_type, &envelope.payload);
+    let lake_row = said.is_some();
+    if let Some(said) = said {
         if said.is_want {
-            if meridian_domain::lake::instance_of(&said.dataset) != Some(instance) {
+            if !by_stream || meridian_domain::lake::instance_of(&said.dataset) != Some(instance) {
                 return;
             }
         } else {
@@ -510,12 +566,31 @@ async fn deliver(
             };
             // A dataset's liveness names no subject (contract v27): every
             // reader of the dataset hears it.
-            if !said.subjects.is_empty() && !said.subjects.iter().any(|s| lake.subjects.contains(s))
-            {
+            let named = by_stream
+                && (said.subjects.is_empty()
+                    || said.subjects.iter().any(|s| lake.subjects.contains(s)));
+            let matched = lake.subscriptions.matching_lake(
+                row.name,
+                &said.subjects,
+                &said.series,
+                &envelope.payload_type,
+                &envelope.payload,
+                &fields,
+                crate::lake::meta_entry(&envelope.payload_type),
+            );
+            if !named && matched.ids.is_empty() {
                 return;
             }
+            // Heard by the stream's own subjects: every field the plugin may
+            // read, as before; by subscriptions alone: what they read.
+            let mask = if named {
+                fields
+            } else {
+                matched.mask.clone().unwrap_or(fields)
+            };
+            subscription_ids = matched.ids;
             envelope.payload =
-                crate::lake::stripped(&envelope.payload_type, &envelope.payload, &fields);
+                crate::lake::stripped(&envelope.payload_type, &envelope.payload, &mask);
             // Its age at the `bus` hop, on delivery (W4.16; ruling 606).
             crate::lake::record_ages(
                 &envelope.payload_type,
@@ -562,6 +637,17 @@ async fn deliver(
                 .unwrap_or_default()
         ));
     }
+    // A row naming an account, or none, that is no lake row: heard by the
+    // stream's own rows, or by a subscription to its row naming the account
+    // or every one.
+    if !lake_row {
+        subscription_ids = lake
+            .subscriptions
+            .matching_book(row.name, read.account.as_deref());
+        if !by_stream && subscription_ids.is_empty() {
+            return;
+        }
+    }
     if let Some(account) = &read.account {
         match configuration.current(configuration.now_ns()).await {
             Ok(held) if held.read_account_ids.contains(account) => {}
@@ -591,6 +677,7 @@ async fn deliver(
                 journal: read.journal,
                 cause: read.cause,
                 own,
+                subscription_ids,
             }),
             item: Some(read.item),
         },

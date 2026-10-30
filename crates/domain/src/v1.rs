@@ -14544,6 +14544,52 @@ pub struct DeclineWantRequest {
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct DeclineWantReply {}
+/// Contract v28, amended 2026-10-30 (W10.7; spec/one-data-access-model, step
+/// 2; rulings 834 and 885): what a sidecar's open subscriptions want kept
+/// current, renewed in one message per lease (about 30 s), and at once for a
+/// subscription newly opened. The lake keeps a standing want for each while a
+/// renewal names it, opening one where none stands, and withdraws a want no
+/// renewal has named for two leases, or for the dataset's cadence where that
+/// is longer (W10.7's withdrawal, kept). The sidecar is the envelope's
+/// publisher; a dead sidecar's interest expires by itself.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RenewWantsRequest {
+    /// 1 to 500, each a want the plugin's subscriptions still hold. Never empty.
+    #[prost(message, repeated, tag = "1")]
+    pub wants: ::prost::alloc::vec::Vec<RenewedWant>,
+}
+/// One want renewed: what an open subscription keeps current, as a read names
+/// it. No dataset: the lake chooses each as a read does, by the plugin's
+/// entitlements and the source priority (W10.2).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RenewedWant {
+    /// The data type, by its message's full name, as ObservationsWantedEvent
+    /// names it: meridian.v1.Quote, meridian.v1.Trade, meridian.v1.Price,
+    /// meridian.v1.Bar, meridian.v1.Statistic. Never empty.
+    #[prost(string, tag = "1")]
+    pub data_type: ::prost::alloc::string::String,
+    /// 1 to 500.
+    #[prost(message, repeated, tag = "2")]
+    pub subjects: ::prost::alloc::vec::Vec<SubjectRef>,
+    /// The series, by key, as ListQuotesRequest.series_keys names them, 0 to
+    /// 500. None: not a want of named series.
+    #[prost(message, repeated, tag = "3")]
+    pub series_keys: ::prost::alloc::vec::Vec<Identifier>,
+    /// True: every series of the subjects, narrowed by the window. False: the
+    /// subjects' own rows only, or the series named.
+    #[prost(bool, tag = "4")]
+    pub all_series: bool,
+    /// Plain dates, inclusive, set only with all_series. Empty: from the
+    /// earliest; to the latest.
+    #[prost(string, tag = "5")]
+    pub expiration_from: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub expiration_to: ::prost::alloc::string::String,
+}
+/// Contract v28, amended 2026-10-30: RenewWants's answer, sent once each want
+/// is held.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct RenewWantsReply {}
 /// A plugin instance's entitlement to a dataset, as the conductor keeps it
 /// (W10.1). Set by a deployment admin; never sent to the platform.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -14745,6 +14791,17 @@ pub struct ListedSeries {
     /// writer.
     #[prost(string, tag = "5")]
     pub instrument_id: ::prost::alloc::string::String,
+}
+/// Contract v28, amended 2026-10-30 (W10.5; spec/one-data-access-model,
+/// step 2; rulings 847 and 886): a listed series the lake recorded, new or the
+/// next version of its key, on its dataset's subject, heard by ListSeries'
+/// askers so a copy of a chain follows its listing. Delivered latest value
+/// first per subject, dataset and series key (conflated); after a loss a
+/// reader reads the listing again by its underlying (ListSeries).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SeriesRecordedEvent {
+    #[prost(message, optional, tag = "1")]
+    pub series: ::core::option::Option<ListedSeries>,
 }
 /// Contract v28 (W10.4): RecordSeries's request.
 #[derive(Clone, PartialEq, ::prost::Message)]

@@ -33,7 +33,7 @@ use meridian_domain::v1::{
     LivenessRecordedEvent, ObservationMeta, ObservationsWantedEvent, OutcomesRecordedEvent,
     PricesRecordedEvent, QuotesRecordedEvent, RatesRecordedEvent, RecordBarsRequest,
     RecordPricesRequest, RecordQuotesRequest, RecordRatesRequest, RecordTradesRequest,
-    StatisticsRecordedEvent, TradesRecordedEvent, WantWithdrawnEvent,
+    SeriesRecordedEvent, StatisticsRecordedEvent, TradesRecordedEvent, WantWithdrawnEvent,
 };
 use prost::Message;
 use tokio::sync::watch;
@@ -133,6 +133,10 @@ pub(crate) struct Said {
     /// None for a trade, which is never conflated.
     pub key: Option<String>,
     pub is_want: bool,
+    /// Its series key (contract v28, ruling 561), empty for a row keyed by
+    /// none: what a subscription's series and window are held to (contract
+    /// v28, amended 2026-10-30).
+    pub series: Vec<meridian_domain::v1::Identifier>,
 }
 
 /// A row's series key as a key's last part (contract v28, ruling 561): a
@@ -147,6 +151,30 @@ fn series_said(meta: Option<&ObservationMeta>) -> String {
     } else {
         format!("|#{series}")
     }
+}
+
+/// A row's series key, empty for a row keyed by none.
+fn series_text(meta: Option<&ObservationMeta>) -> Vec<meridian_domain::v1::Identifier> {
+    meta.map(|meta| meta.series_key.clone()).unwrap_or_default()
+}
+
+/// The envelope's dictionary entry of a lake row's message, which a
+/// subscription's fields always keep (contract v28, amended 2026-10-30).
+pub(crate) fn meta_entry(payload_type: &str) -> Option<&'static str> {
+    let data_type = match payload_type {
+        "meridian.v1.PricesRecordedEvent" => meridian_domain::lake::PRICE,
+        "meridian.v1.BarsRecordedEvent" => meridian_domain::lake::BAR,
+        "meridian.v1.TradesRecordedEvent" => meridian_domain::lake::TRADE,
+        "meridian.v1.QuotesRecordedEvent" => meridian_domain::lake::QUOTE,
+        "meridian.v1.OutcomesRecordedEvent" => meridian_domain::lake::OUTCOME,
+        "meridian.v1.RatesRecordedEvent" => meridian_domain::lake::RATE,
+        "meridian.v1.StatisticsRecordedEvent" => meridian_domain::lake::STATISTIC,
+        "meridian.v1.SeriesRecordedEvent" => meridian_domain::lake::LISTED_SERIES,
+        "meridian.v1.FilingsRecordedEvent" => meridian_domain::lake::FILING,
+        "meridian.v1.CorporateActionsRecordedEvent" => meridian_domain::lake::CORPORATE_ACTION,
+        _ => return None,
+    };
+    meridian_domain::lake::fields_of(data_type).first().copied()
 }
 
 fn meta_said(meta: Option<&ObservationMeta>) -> (String, Vec<String>, String) {
@@ -219,6 +247,7 @@ pub(crate) fn said(payload_type: &str, payload: &[u8]) -> Option<Said> {
                 dataset,
                 subjects,
                 is_want: false,
+                series: series_text(price.meta.as_ref()),
             })
         }
         "meridian.v1.BarsRecordedEvent" => {
@@ -234,6 +263,7 @@ pub(crate) fn said(payload_type: &str, payload: &[u8]) -> Option<Said> {
                 dataset,
                 subjects,
                 is_want: false,
+                series: series_text(bar.meta.as_ref()),
             })
         }
         "meridian.v1.TradesRecordedEvent" => {
@@ -244,6 +274,7 @@ pub(crate) fn said(payload_type: &str, payload: &[u8]) -> Option<Said> {
                 dataset,
                 subjects,
                 is_want: false,
+                series: series_text(trade.meta.as_ref()),
             })
         }
         // Every declared corporate action, never conflated (contract v28,
@@ -259,6 +290,7 @@ pub(crate) fn said(payload_type: &str, payload: &[u8]) -> Option<Said> {
                 dataset,
                 subjects,
                 is_want: false,
+                series: Vec::new(),
             })
         }
         // Every filing, never conflated (contract v28, W10.5): narrowed to
@@ -271,6 +303,7 @@ pub(crate) fn said(payload_type: &str, payload: &[u8]) -> Option<Said> {
                 dataset,
                 subjects,
                 is_want: false,
+                series: Vec::new(),
             })
         }
         // Every version of an outcome, never conflated (contract v23).
@@ -282,6 +315,7 @@ pub(crate) fn said(payload_type: &str, payload: &[u8]) -> Option<Said> {
                 dataset,
                 subjects,
                 is_want: false,
+                series: Vec::new(),
             })
         }
         "meridian.v1.QuotesRecordedEvent" => {
@@ -297,6 +331,7 @@ pub(crate) fn said(payload_type: &str, payload: &[u8]) -> Option<Said> {
                 dataset,
                 subjects,
                 is_want: false,
+                series: series_text(quote.meta.as_ref()),
             })
         }
         // Contract v27, the rates slice (W10.5).
@@ -313,6 +348,7 @@ pub(crate) fn said(payload_type: &str, payload: &[u8]) -> Option<Said> {
                 dataset,
                 subjects,
                 is_want: false,
+                series: Vec::new(),
             })
         }
         // Contract v28 (W10.5): per subject, series key, kind and business
@@ -335,6 +371,7 @@ pub(crate) fn said(payload_type: &str, payload: &[u8]) -> Option<Said> {
                 dataset,
                 subjects,
                 is_want: false,
+                series: series_text(statistic.meta.as_ref()),
             })
         }
         // Contract v27 (W10.5; ruling 418): a dataset's liveness, about no
@@ -347,6 +384,24 @@ pub(crate) fn said(payload_type: &str, payload: &[u8]) -> Option<Said> {
                 dataset: alive.dataset,
                 subjects: Vec::new(),
                 is_want: false,
+                series: Vec::new(),
+            })
+        }
+        // Contract v28, amended 2026-10-30 (W10.5; rulings 847 and 886): a
+        // listed series, conflated per subject, dataset and series key.
+        "meridian.v1.SeriesRecordedEvent" => {
+            let series = SeriesRecordedEvent::decode(payload).ok()?.series?;
+            let (dataset, subjects, _) = meta_said(series.meta.as_ref());
+            Some(Said {
+                key: Some(format!(
+                    "series|{}|{dataset}{}",
+                    subjects.first().cloned().unwrap_or_default(),
+                    series_said(series.meta.as_ref())
+                )),
+                dataset,
+                subjects,
+                is_want: false,
+                series: series_text(series.meta.as_ref()),
             })
         }
         "meridian.v1.ObservationsWantedEvent" => {
@@ -356,6 +411,7 @@ pub(crate) fn said(payload_type: &str, payload: &[u8]) -> Option<Said> {
                 dataset: want.dataset,
                 subjects: Vec::new(),
                 is_want: true,
+                series: Vec::new(),
             })
         }
         "meridian.v1.WantWithdrawnEvent" => {
@@ -365,6 +421,7 @@ pub(crate) fn said(payload_type: &str, payload: &[u8]) -> Option<Said> {
                 dataset: withdrawn.dataset,
                 subjects: Vec::new(),
                 is_want: true,
+                series: Vec::new(),
             })
         }
         _ => None,
@@ -456,6 +513,15 @@ pub(crate) fn stripped(payload_type: &str, payload: &[u8], allowed: &BTreeSet<St
             Ok(mut event) => {
                 if let Some(statistic) = event.statistic.as_mut() {
                     meridian_domain::lake::strip_statistic(statistic, allowed);
+                }
+                event.encode_to_vec()
+            }
+            Err(_) => payload.to_vec(),
+        },
+        "meridian.v1.SeriesRecordedEvent" => match SeriesRecordedEvent::decode(payload) {
+            Ok(mut event) => {
+                if let Some(series) = event.series.as_mut() {
+                    meridian_domain::lake::strip_series(series, allowed);
                 }
                 event.encode_to_vec()
             }

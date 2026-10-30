@@ -3016,6 +3016,22 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
     ) -> Result<Response<Self::ReceiveStream>, Status> {
         self.receive_typed(request.into_inner(), DELIVERED).await
     }
+
+    /// W4.3: a targeted read kept open (contract v28, amended 2026-10-30).
+    async fn subscribe(
+        &self,
+        request: Request<plugin::SubscribeRequest>,
+    ) -> Result<Response<plugin::SubscribeReply>, Status> {
+        self.subscribe_typed(request.into_inner(), DELIVERED).await
+    }
+
+    /// W4.3: a subscription dropped.
+    async fn unsubscribe(
+        &self,
+        request: Request<plugin::UnsubscribeRequest>,
+    ) -> Result<Response<plugin::UnsubscribeReply>, Status> {
+        self.unsubscribe_typed(request.into_inner()).await
+    }
 }
 
 /// The rows a plugin's roles may hear (W4.3), each with how its message is
@@ -3267,6 +3283,13 @@ pub(crate) const DELIVERED: &[crate::receive::Row] = &[
         topic: "platform.lake.{dataset}.event.corporate-actions-recorded",
         payload_type: "meridian.v1.CorporateActionsRecordedEvent",
         read: corporate_actions_recorded,
+    },
+    crate::receive::Row {
+        name: "SeriesRecorded",
+        step: "W10.5",
+        topic: "platform.lake.{dataset}.event.series-recorded",
+        payload_type: "meridian.v1.SeriesRecordedEvent",
+        read: series_recorded,
     },
 ];
 
@@ -3687,5 +3710,17 @@ fn corporate_actions_recorded(payload: &[u8]) -> Result<crate::receive::Read, pr
         journal: None,
         cause: None,
         item: plugin::delivery::Item::CorporateActionsRecorded(message),
+    })
+}
+
+/// W10.5: a SeriesRecordedEvent, conflated, unscoped.
+fn series_recorded(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeError> {
+    let message = plugin::SeriesRecordedEvent::decode(payload)?;
+    Ok(crate::receive::Read {
+        account: None,
+        directed: Vec::new(),
+        journal: None,
+        cause: None,
+        item: plugin::delivery::Item::SeriesRecorded(message),
     })
 }

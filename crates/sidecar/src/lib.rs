@@ -35,6 +35,7 @@ pub mod roles;
 mod service;
 mod service_account;
 mod streams;
+mod subscriptions;
 mod tickets;
 pub mod timing;
 pub mod tools;
