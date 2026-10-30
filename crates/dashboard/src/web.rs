@@ -426,19 +426,17 @@ async fn home(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
             they = if owned == 1 { "it" } else { "they" },
         ));
     }
-    // W3.11: the records the book cannot use, a first-class number for the
-    // deployment admin who completes them (ruled 2026-10-02).
+    // W3.11 and contract v24 (W3.11, W11.37): the records the book cannot
+    // use yet and the provisional ones, for the deployment admin alone, said
+    // as where each stands; a person is asked only for what the platform
+    // cannot resolve (ruling 831). Then the live orders on local records --
+    // a count, naming no account.
     if access.deployment_admin {
-        body.push_str(&crate::admin::instruments::home_notice(
-            crate::admin::instruments::incomplete_for_book(&app.bus).await,
-        ));
-        // Contract v24 (W3.11, W11.37): the provisional records with the
-        // oldest's age, and the live orders on local records -- counts,
-        // naming no account.
+        let waiting = crate::admin::instruments::waiting_for_home(&app.bus).await;
         let provisional = crate::admin::instruments::provisional(&app.bus).await.ok();
-        body.push_str(&crate::admin::instruments::home_provisional(
+        body.push_str(&crate::admin::instruments::home_status(
+            waiting.as_ref(),
             provisional.as_ref(),
-            app.clock.now_ns(),
         ));
         // Contract v26 (W11.38): the agents' guard, on, with no switch.
         let guard = crate::admin::trading::read_agent_orders_demo_only(&app.bus)
@@ -489,14 +487,16 @@ async fn home(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
             } else {
                 Vec::new()
             };
-            // Contract v26 (W11.8): a connection shown Demo or Live, by its
-            // environment setting.
-            let connection = access
-                .known_roles
-                .get(instance)
-                .is_some_and(|roles| roles.iter().any(|role| role == "connectivity"));
-            let badge = if connection {
-                Some(crate::admin::connectivity::badge(&app.bus, &records, instance).await)
+            // Contract v26 (W11.8), ruling 831 (its item 177): a connection
+            // shows where it trades and, beside it, its data, each on its
+            // own: "Trading: Demo · Data: Live".
+            let roles = access.known_roles.get(instance);
+            let holds = |wanted: &str| roles.is_some_and(|roles| roles.iter().any(|r| r == wanted));
+            let badge = if holds("connectivity") {
+                Some(Badge {
+                    trading: crate::admin::connectivity::trading(&app, &records, instance).await,
+                    data: holds("data"),
+                })
             } else {
                 None
             };
@@ -543,13 +543,31 @@ const SEARCH_FROM: usize = 8;
 /// admin, open for write, view for read"). The name is only the plugin's:
 /// the buttons are the ways in (the product owner, 2026-09-30: "the plugin
 /// name is linked to the admin page (it shouldn't)").
+/// A connectivity plugin's badge on its card (ruling 831): where it trades,
+/// and whether it holds the data role, whose data is the vendor's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Badge {
+    trading: &'static str,
+    data: bool,
+}
+
+impl Badge {
+    fn words(self) -> String {
+        if self.data {
+            format!("Trading: {} \u{b7} Data: Live", self.trading)
+        } else {
+            format!("Trading: {}", self.trading)
+        }
+    }
+}
+
 fn plugin_card(
     instance: &str,
     name: Option<&str>,
     levels: &[meridian_access::AccessLevel],
     held: &meridian_access::PluginHeld,
     several: bool,
-    badge: Option<&str>,
+    badge: Option<Badge>,
 ) -> String {
     // The plugin's name where the catalogue launched it; one installed
     // otherwise is known by its instance alone.
@@ -568,19 +586,34 @@ fn plugin_card(
         .find(|c| c.is_alphanumeric())
         .map(String::from)
         .unwrap_or_default();
-    // Contract v26 (W11.8; ruling 310): Demo, Live, or Live (environment not
-    // confirmed), for a connectivity plugin.
+    // Contract v26 (W11.8), ruling 831: where a connectivity plugin trades,
+    // and its data beside it, each said on its own.
     let badge = match badge {
-        Some(said) => format!(
-            " <span class=\"badge {kind}\" data-environment=\"{said}\" title=\"{said}\">{said}</span>",
-            kind = if said == "Demo" { "good" } else { "warn" },
-            said = escape(said),
-        ),
+        Some(badge) => {
+            let said = badge.words();
+            format!(
+                " <span class=\"badge {kind}\" data-environment=\"{trading}\" title=\"{said}\">{said}</span>",
+                kind = match badge.trading {
+                    "Demo" => "good",
+                    "Live" => "warn",
+                    _ => "plain",
+                },
+                trading = escape(badge.trading),
+                said = escape(&said),
+            )
+        }
         None => String::new(),
+    };
+    // On the line under the name, beside the instance, which gives way
+    // first: a narrow card never cuts the badge off (ruling 831).
+    let sub = if badge.is_empty() {
+        sub
+    } else {
+        format!("<span class=\"plugin-sub\">{sub}{badge}</span>")
     };
     let text = format!(
         "<span class=\"plugin-icon\" aria-hidden=\"true\">{initial}</span>\
-         <span class=\"plugin-text\"><span class=\"plugin-name\">{title}{badge}</span>{sub}</span>",
+         <span class=\"plugin-text\"><span class=\"plugin-name\">{title}</span>{sub}</span>",
         initial = escape(&initial),
         title = escape(title),
     );

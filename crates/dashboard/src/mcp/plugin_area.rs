@@ -1369,8 +1369,8 @@ impl Context<'_> {
         }
         let reports: BTreeMap<String, PluginReport> = self.app.health.view();
         let reached_now = reached(Gate::Anyone, self.access, self.known);
-        // Contract v26 (W11.8; ruling 310): a connectivity plugin's badge, as
-        // its card on the home page draws it.
+        // Contract v26 (W11.8), ruling 831: where a connectivity plugin
+        // trades, as its card on the home page says it.
         let mut environments: BTreeMap<String, &'static str> = BTreeMap::new();
         if let Ok(records) = self.app.records.current(self.app.clock.now_ns()) {
             for instance in &reached_now {
@@ -1382,7 +1382,7 @@ impl Context<'_> {
                 if connection {
                     environments.insert(
                         instance.clone(),
-                        crate::admin::connectivity::badge(&self.app.bus, &records, instance).await,
+                        crate::admin::connectivity::trading(self.app, &records, instance).await,
                     );
                 }
             }

@@ -165,7 +165,7 @@ fn run() -> Result<(), String> {
                          like meridian.localhost frames them"
                     );
                 }
-                Some(Arc::new(plugins))
+                Some(plugins)
             }
         },
         _ => {
@@ -325,13 +325,25 @@ fn run() -> Result<(), String> {
         None => Arc::new(delegation::InMemory::default()),
     };
     // Browsers' sessions beside them (ruling 811), so a restart or an
-    // upgrade signs nobody out; in memory without one.
+    // upgrade signs nobody out, the time it was away not counted as anyone's
+    // idleness (ruling 854); in memory without one.
     let sessions = match &database {
-        Some(database) => Sessions::keeping(Arc::new(meridian_dashboard::session::InPostgres::on(
-            database.clone(),
-        ))),
+        Some(database) => Sessions::keeping(
+            Arc::new(meridian_dashboard::session::InPostgres::on(
+                database.clone(),
+            )),
+            now_ns(),
+        ),
         None => Sessions::default(),
     };
+    // Plugin pages' sessions beside them (ruling 855), each ending with the
+    // session it came from, so a page left open works on after a restart.
+    let plugins = plugins.map(|plugins| {
+        Arc::new(match &database {
+            Some(database) => plugins.keeping_in(database.clone()),
+            None => plugins,
+        })
+    });
     // Tickets beside them (contract v13), so a ticket, its notes and a
     // person's notices outlive a restart; in memory without one.
     let ticket_store: Arc<dyn meridian_dashboard::tickets::TicketStore> = match &database {

@@ -1004,11 +1004,25 @@ e2e-dashboard-accounts: network
 	$(E2E_ACCOUNTS) run --rm -T accounts-runner retired; \
 	$(E2E_ACCOUNTS) run --rm -T accounts-runner delegate; \
 	$(E2E_ACCOUNTS) run --rm -T accounts-runner tickets; \
+	$(E2E_ACCOUNTS) run --rm -T accounts-runner browser; \
 	$(E2E_ACCOUNTS_REGISTRY) up -d --force-recreate --no-deps dashboard >>.e2e-dashboard-accounts.log 2>&1; \
 	$(E2E_ACCOUNTS) run --rm -T accounts-runner restarted; \
+	$(E2E_ACCOUNTS) run --rm -T accounts-runner kept a dashboard restart; \
+	$(E2E_ACCOUNTS) stop dashboard >>.e2e-dashboard-accounts.log 2>&1; \
+	$(E2E_ACCOUNTS) restart postgres >>.e2e-dashboard-accounts.log 2>&1; \
+	$(E2E_ACCOUNTS_REGISTRY) up -d --no-deps dashboard >>.e2e-dashboard-accounts.log 2>&1; \
+	$(E2E_ACCOUNTS) run --rm -T accounts-runner kept a database and dashboard restart; \
+	$(E2E_ACCOUNTS) restart postgres >>.e2e-dashboard-accounts.log 2>&1; \
+	$(E2E_ACCOUNTS) run --rm -T accounts-runner kept a database restart under the dashboard; \
+	$(E2E_ACCOUNTS) stop dashboard >>.e2e-dashboard-accounts.log 2>&1; \
+	echo "UPDATE dashboard_browser_session SET last_seen_at_ns = last_seen_at_ns - 2700000000000, signed_in_at_ns = signed_in_at_ns - 2700000000000;" \
+		| $(E2E_ACCOUNTS) exec -T postgres psql -v ON_ERROR_STOP=1 -U meridian -d meridian >>.e2e-dashboard-accounts.log 2>&1; \
+	$(E2E_ACCOUNTS_REGISTRY) up -d --no-deps dashboard >>.e2e-dashboard-accounts.log 2>&1; \
+	$(E2E_ACCOUNTS) run --rm -T accounts-runner kept the dashboard away 45 minutes; \
+	$(E2E_ACCOUNTS) run --rm -T accounts-runner out; \
 	$(E2E_ACCOUNTS) run --rm -T accounts-runner locked
 	@$(E2E_ACCOUNTS) down -v --remove-orphans >>.e2e-dashboard-accounts.log 2>&1
-	@echo "e2e-dashboard-accounts OK: the account first run made signs somebody in, the terminal sessions from before delegations are served no more, a CLI's delegation outlives a dashboard restart, uploads a plugin and is revoked by a reused refresh token, the admin and its client, a problem reported on a page and through /mcp is worked only at its page with nothing of it reaching the platform, and enough wrong passwords stop it"
+	@echo "e2e-dashboard-accounts OK: the account first run made signs somebody in, the terminal sessions from before delegations are served no more, a CLI's delegation outlives a dashboard restart, a browser's session outlives a dashboard restart, a database restart and 45 minutes with the dashboard away (its time away not counted as idle) and signs out with the form token it had, a delegation uploads a plugin and is revoked by a reused refresh token, the admin and its client, a problem reported on a page and through /mcp is worked only at its page with nothing of it reaching the platform, and enough wrong passwords stop it"
 
 # A person reaches a plugin's page (W6.9, decisions/014 and 021), in processes
 # of their own: the account branch's dashboard, holding a key made as the
@@ -1058,6 +1072,11 @@ e2e-plugin-page: network
 		| $(E2E_PLUGIN_PAGE) exec -T postgres psql -v ON_ERROR_STOP=1 -v 'hash=$(E2E_ACCOUNT_HASH)' -U meridian -d meridian >>.e2e-plugin-page.log 2>&1; \
 	$(E2E_PLUGIN_PAGE) up -d conductor street dashboard sidecar plugin-page >>.e2e-plugin-page.log 2>&1; \
 	status=0; $(E2E_PLUGIN_PAGE) run --rm -T plugin-page-runner || status=$$?; \
+	if [ $$status -eq 0 ]; then \
+		$(E2E_PLUGIN_PAGE) run --rm -T plugin-page-runner kept-before || status=$$?; fi; \
+	if [ $$status -eq 0 ]; then \
+		$(E2E_PLUGIN_PAGE) up -d --force-recreate --no-deps dashboard >>.e2e-plugin-page.log 2>&1; \
+		$(E2E_PLUGIN_PAGE) run --rm -T plugin-page-runner kept-after || status=$$?; fi; \
 	if [ $$status -ne 0 ]; then $(E2E_PLUGIN_PAGE) logs dashboard sidecar plugin-page >>.e2e-plugin-page.log 2>&1; \
 		echo "e2e-plugin-page FAILED; the components' logs are in .e2e-plugin-page.log" >&2; \
 		$(E2E_PLUGIN_PAGE) down -v --remove-orphans >/dev/null 2>&1; exit 1; fi; \
@@ -1085,7 +1104,7 @@ e2e-plugin-page: network
 		echo "e2e-plugin-page FAILED: the secret set on the form left no record of its own naming who ($$formed)" >&2; \
 		$(E2E_PLUGIN_PAGE) down -v --remove-orphans >/dev/null 2>&1; exit 1; fi
 	@$(E2E_PLUGIN_PAGE) down -v --remove-orphans >>.e2e-plugin-page.log 2>&1
-	@echo "e2e-plugin-page OK: a person opens a plugin on its own host at a level she holds -- Manage, Open or View -- and is told it by its sidecar alone, the session carrying that level and the accounts it reaches; a deployment admin is its admin through All plugins (admin) and configures it no more once that link is withdrawn; under Manage she links the accounts it reaches, to an account and a new one, while the plugin as itself, an unreported account, both names and the read under View are refused; an older plugin's admin pages are read as pages at admin; a command is sent for her only under Open; a person granted admin alone sets its settings, links to an existing account and not a new one, and sees no account's data, and All accounts reaches an account no group lists; a required secret set in its settings form makes it healthy without a restart, sealed at rest and in no page, report or log; each settings change its own record naming who, a secret's only as set, the Settings tab saying who last changed them; the figures it reports on its heartbeat are drawn as tiles on its Summary, and nine are refused naming the bound; and each act sent for a person is logged with its level"
+	@echo "e2e-plugin-page OK: a person opens a plugin on its own host at a level she holds -- Manage, Open or View -- and is told it by its sidecar alone, the session carrying that level and the accounts it reaches; a deployment admin is its admin through All plugins (admin) and configures it no more once that link is withdrawn; under Manage she links the accounts it reaches, to an account and a new one, while the plugin as itself, an unreported account, both names and the read under View are refused; an older plugin's admin pages are read as pages at admin; a command is sent for her only under Open; a person granted admin alone sets its settings, links to an existing account and not a new one, and sees no account's data, and All accounts reaches an account no group lists; a required secret set in its settings form makes it healthy without a restart, sealed at rest and in no page, report or log; each settings change its own record naming who, a secret's only as set, the Settings tab saying who last changed them; the figures it reports on its heartbeat are drawn as tiles on its Summary, and nine are refused naming the bound; and each act sent for a person is logged with its level; and a plugin page open across a dashboard restart reads and posts on, its session kept"
 
 # A plugin's Settings pages in a real browser (the product owner, 2026-10-05,
 # of SnapTrade's: "why does this screen force scrolling again and do we assume

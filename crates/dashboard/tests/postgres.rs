@@ -171,7 +171,7 @@ fn a_browser_session_survives_a_restart_and_ends_on_every_replica() {
     use meridian_dashboard::session::{self, Sessions, IDLE_NS, RECHECK_NS};
     use std::sync::Arc;
     let (database, url) = migrated("browser_sessions");
-    let replica = || Sessions::keeping(Arc::new(session::InPostgres::on(database.clone())));
+    let replica = || Sessions::keeping(Arc::new(session::InPostgres::on(database.clone())), T0);
     let first = replica();
     let key = first.start("ada", "Ada", vec!["traders".into()], T0);
     let other = first.start("ada", "Ada", vec![], T0);
@@ -207,6 +207,90 @@ fn a_browser_session_survives_a_restart_and_ends_on_every_replica() {
     lapsing.start("bo", "Bo", vec![], T0);
     lapsing.sweep(T0 + IDLE_NS + 1);
     assert_eq!(count(&url, "dashboard_browser_session"), 0);
+}
+
+#[test]
+fn a_restart_more_than_30_minutes_after_the_last_use_keeps_a_browser_signed_in() {
+    // Ruling 854: the dashboard's time away is nobody's idleness.
+    use meridian_dashboard::session::{self, Sessions, IDLE_NS};
+    use std::sync::Arc;
+    let (database, url) = migrated("browser_sessions_away");
+    let at = |now: i64| Sessions::keeping(Arc::new(session::InPostgres::on(database.clone())), now);
+    let before = at(T0);
+    let key = before.start("ada", "Ada", vec![], T0);
+    let idle = before.start("bo", "Bo", vec![], T0 - 20 * MINUTE_NS);
+    drop(before);
+    let back = T0 + 45 * MINUTE_NS;
+    let after = at(back);
+    // The first sweep after the start removes nobody kept.
+    after.sweep(back);
+    assert_eq!(count(&url, "dashboard_browser_session"), 2);
+    assert!(after.find(&key, back + MINUTE_NS).is_some());
+    // Bo had been idle 20 minutes when it stopped: ten more after it is back.
+    after.sweep(back + 11 * MINUTE_NS);
+    assert_eq!(count(&url, "dashboard_browser_session"), 1);
+    assert!(after.find(&idle, back + 11 * MINUTE_NS).is_none());
+    // And idle counts again from the last use since.
+    assert!(after.find(&key, back + MINUTE_NS + IDLE_NS + 1).is_none());
+}
+
+#[test]
+fn a_plugin_pages_session_is_kept_by_hash_and_ends_with_the_browsers() {
+    // Ruling 855, migration 13: bound to the browser session it came from,
+    // or to a delegation, never both and never neither; gone with the
+    // browser's row.
+    use meridian_dashboard::session::{self, Sessions};
+    use std::sync::Arc;
+    let (database, url) = migrated("plugin_sessions");
+    let sessions = Sessions::keeping(Arc::new(session::InPostgres::on(database.clone())), T0);
+    let key = sessions.start("ada", "Ada", vec![], T0);
+    let browser = meridian_dashboard::terminal::hashed(&key);
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let insert = "INSERT INTO dashboard_plugin_session
+                      (plugin_session_hash, browser_session_hash, delegation_id,
+                       plugin_instance_id, level, entered_at_ns)
+                  VALUES ($1, $2, $3, 'snaptrade-1', $4, 0)";
+    let none: Option<&str> = None;
+    client
+        .execute(insert, &[&"P1", &Some(browser.as_str()), &none, &"admin"])
+        .unwrap();
+    client
+        .execute(insert, &[&"P2", &none, &Some("DLG-1"), &"read"])
+        .unwrap();
+    assert!(
+        client
+            .execute(insert, &[&"P3", &none, &none, &"read"])
+            .is_err(),
+        "from nothing"
+    );
+    assert!(
+        client
+            .execute(
+                insert,
+                &[&"P4", &Some(browser.as_str()), &Some("DLG-1"), &"read"]
+            )
+            .is_err(),
+        "from both"
+    );
+    assert!(
+        client
+            .execute(insert, &[&"P5", &Some("no-such-session"), &none, &"read"])
+            .is_err(),
+        "from a browser session not kept"
+    );
+    assert!(
+        client
+            .execute(insert, &[&"P6", &none, &Some("DLG-1"), &"manage"])
+            .is_err(),
+        "a level by its button's name"
+    );
+    assert_eq!(count(&url, "dashboard_plugin_session"), 2);
+    sessions.end(&key);
+    assert_eq!(
+        count(&url, "dashboard_plugin_session"),
+        1,
+        "the browser's went with it; the delegation's waits for its sweep"
+    );
 }
 
 // ── Delegations ─────────────────────────────────────────────────────────────

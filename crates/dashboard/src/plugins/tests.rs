@@ -87,6 +87,19 @@ struct Harness {
     reached: Reached,
     /// Ada's dashboard session.
     session: String,
+    /// Where its sidecar's front door is, and the key the sidecar trusts:
+    /// for a dashboard started again over the same stores.
+    door_at: std::net::SocketAddr,
+    key: SigningKey,
+    /// The tables the dashboard keeps sessions in, when it keeps them.
+    stores: Option<Stores>,
+}
+
+/// The two session tables, in memory: what a restart keeps.
+#[derive(Clone)]
+struct Stores {
+    sessions: Arc<crate::session::InMemory>,
+    plugins: Arc<kept::InMemory>,
 }
 
 /// A plugin behind its real sidecar and front door on loopback, a dashboard
@@ -97,6 +110,15 @@ async fn harness(instances: &[&str]) -> Harness {
 
 /// The same, the sidecar live on a development deployment when given a folder.
 async fn harness_with(instances: &[&str], live: Option<std::path::PathBuf>) -> Harness {
+    harness_full(instances, live, None).await
+}
+
+/// A harness whose dashboard keeps its sessions in `stores` (ruling 855).
+async fn harness_full(
+    instances: &[&str],
+    live: Option<std::path::PathBuf>,
+    stores: Option<Stores>,
+) -> Harness {
     let reached: Reached = Arc::default();
     let recorded = Arc::clone(&reached);
     let plugin = Router::new().fallback(move |request: axum::extract::Request| {
@@ -168,12 +190,28 @@ async fn harness_with(instances: &[&str], live: Option<std::path::PathBuf>) -> H
     let door_at = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, door).await.unwrap() });
 
-    let (app, session) = dashboard(instances, door_at, key);
+    let (app, session) = dashboard(instances, door_at, key.clone(), stores.as_ref(), None);
     Harness {
         app,
         reached,
         session,
+        door_at,
+        key,
+        stores,
     }
+}
+
+/// The same dashboard started again over the same stores: a restart. Ada's
+/// session is the one she had.
+fn restarted(h: &Harness, instances: &[&str]) -> Arc<App> {
+    dashboard(
+        instances,
+        h.door_at,
+        h.key.clone(),
+        h.stores.as_ref(),
+        Some(&h.session),
+    )
+    .0
 }
 
 /// A dashboard holding `key`, whose sidecar for snaptrade-1 is at `door_at`,
@@ -182,6 +220,8 @@ fn dashboard(
     instances: &[&str],
     door_at: std::net::SocketAddr,
     key: SigningKey,
+    stores: Option<&Stores>,
+    signed_in: Option<&str>,
 ) -> (Arc<App>, String) {
     let plugins = Plugins::new(
         &format!("https://{DASHBOARD}"),
@@ -191,12 +231,22 @@ fn dashboard(
     )
     .unwrap()
     .resolving("snaptrade-1.sidecars.invalid", door_at);
+    let plugins = match stores {
+        Some(stores) => plugins.keeping(Arc::clone(&stores.plugins) as _),
+        None => plugins,
+    };
 
     let clock = SystemClock;
     let cache = Arc::new(RecordsCache::default());
     cache.store(records(instances), clock.now_ns());
-    let sessions = Arc::new(Sessions::default());
-    let session = sessions.start(ADA, "Ada", vec![], clock.now_ns());
+    let sessions = Arc::new(match stores {
+        Some(stores) => Sessions::keeping(Arc::clone(&stores.sessions) as _, clock.now_ns()),
+        None => Sessions::default(),
+    });
+    let session = match signed_in {
+        Some(session) => session.to_string(),
+        None => sessions.start(ADA, "Ada", vec![], clock.now_ns()),
+    };
     let app = Arc::new(App {
         first_run: false,
         wizard: Arc::new(crate::first_run::WizardSession::default()),
@@ -421,7 +471,7 @@ async fn a_code_is_redeemed_once_on_its_own_host_within_its_minute() {
     let plugins = h.app.plugins.as_ref().unwrap();
     let now = h.app.clock.now_ns();
     let code = plugins.mint(
-        Came::Browser(h.session.clone()),
+        Came::Browser(crate::terminal::hashed(&h.session)),
         INSTANCE,
         AccessLevel::Read,
         now,
@@ -709,7 +759,7 @@ async fn a_sweep_forgets_spent_codes_and_sessions_whose_dashboard_session_ended(
     let now = h.app.clock.now_ns();
     entered(&h).await;
     let kept = plugins.mint(
-        Came::Browser(h.session.clone()),
+        Came::Browser(crate::terminal::hashed(&h.session)),
         INSTANCE,
         AccessLevel::Read,
         now,
@@ -748,15 +798,15 @@ async fn a_request_leaves_the_dashboard_carrying_the_assertion_and_nothing_it_ar
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let at = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, recorder).await.unwrap() });
-    let (app, session) = dashboard(
-        &[INSTANCE],
-        at,
-        SigningKey::generate(&mut rand::rngs::OsRng),
-    );
+    let key = SigningKey::generate(&mut rand::rngs::OsRng);
+    let (app, session) = dashboard(&[INSTANCE], at, key.clone(), None, None);
     let h = Harness {
         app,
         reached: Arc::default(),
         session,
+        door_at: at,
+        key,
+        stores: None,
     };
     let plugin_session = entered(&h).await;
 
@@ -3182,4 +3232,90 @@ async fn a_deployment_admin_browses_installs_and_keeps_from_the_plugins_page() {
     )
     .await;
     assert!(summary.body.contains("data-pulled"), "{}", summary.body);
+}
+
+#[tokio::test]
+async fn a_plugin_pages_session_outlives_a_dashboard_restart_and_its_form_posts() {
+    // Ruling 855: kept beside the browser's, a restart ends neither.
+    let stores = Stores {
+        sessions: Arc::default(),
+        plugins: Arc::default(),
+    };
+    let h = harness_full(&[INSTANCE], None, Some(stores.clone())).await;
+    let plugin_session = entered(&h).await;
+    assert_eq!(stores.plugins.kept.lock().unwrap().len(), 1);
+    assert!(
+        stores
+            .plugins
+            .kept
+            .lock()
+            .unwrap()
+            .keys()
+            .all(|hash| !plugin_session.contains(hash.as_str())),
+        "kept by hash, never the token"
+    );
+    let app = restarted(&h, &[INSTANCE]);
+    let before = h.reached.lock().unwrap().len();
+    // The page's own form posts, and a read answers, with only the plugin
+    // host's cookie, as a page on that host sends it.
+    let posted = send(
+        &app,
+        PLUGIN_HOST,
+        Method::POST,
+        "/holdings",
+        std::slice::from_ref(&plugin_session),
+    )
+    .await;
+    assert_eq!(posted.status, StatusCode::OK, "{}", posted.body);
+    assert_eq!(posted.body, "the page");
+    let read = get(
+        &app,
+        PLUGIN_HOST,
+        "/holdings?page=2",
+        std::slice::from_ref(&plugin_session),
+    )
+    .await;
+    assert_eq!(read.status, StatusCode::OK, "{}", read.body);
+    assert_eq!(h.reached.lock().unwrap().len(), before + 2);
+
+    // It ends with the browser session it came from, across the restart.
+    app.sessions.end(&h.session);
+    let plugins = app.plugins.as_ref().unwrap();
+    plugins
+        .sweep(&app.sessions, &app.delegations, app.clock.now_ns())
+        .await;
+    assert!(stores.plugins.kept.lock().unwrap().is_empty());
+    let after = send(
+        &app,
+        PLUGIN_HOST,
+        Method::POST,
+        "/holdings",
+        &[plugin_session],
+    )
+    .await;
+    assert_eq!(after.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn without_a_table_a_restart_still_ends_a_plugin_pages_session() {
+    // A dashboard given no database keeps them in memory, as before.
+    let h = harness(&[INSTANCE]).await;
+    let plugin_session = entered(&h).await;
+    let fresh = dashboard(
+        &[INSTANCE],
+        h.door_at,
+        h.key.clone(),
+        None,
+        Some(&h.session),
+    )
+    .0;
+    let posted = send(
+        &fresh,
+        PLUGIN_HOST,
+        Method::POST,
+        "/holdings",
+        &[plugin_session],
+    )
+    .await;
+    assert_eq!(posted.status, StatusCode::UNAUTHORIZED);
 }

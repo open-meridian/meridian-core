@@ -67,6 +67,8 @@ from ldap_runner import (  # noqa: E402
     check,
     dash,
     form_token,
+    recall,
+    remember,
     say,
     sign_in,
     wait_dashboard,
@@ -934,5 +936,53 @@ def main():
         sys.exit(1)
 
 
+def kept_before():
+    """Ruling 855: a plugin page's session, opened before a restart."""
+    wait_dashboard()
+    say("M: Ada opens the plugin under Open, and the dashboard is to restart")
+    ada = Browser()
+    signed = sign_in(ada, NAME, PASSWORD)
+    check(signed.status == 303, f"signs in: {signed.status}")
+    opener, why = session_at(ada, "write")
+    check(opener is not None, f"an Open session: {why}")
+    status, caller, _ = claims_on(opener) if opener else (0, {}, {})
+    check(status == 200 and caller.get("level") == 2, f"the page answers: {status} {caller}")
+    remember("plugin_page_cookies", opener.cookies if opener else {})
+
+
+def kept_after():
+    """And after it: the page's reads answer and its form posts, with only
+    the plugin host's cookie, nobody sent back through the dashboard."""
+    wait_dashboard()
+    say("N: after the dashboard's restart, the page open before it works on (ruling 855)")
+    opener = Browser(recall("plugin_page_cookies") or {})
+    deadline = time.monotonic() + 45
+    status, caller, _ = claims_on(opener)
+    while status != 200 and time.monotonic() < deadline:
+        time.sleep(2)
+        status, caller, _ = claims_on(opener)
+    check(status == 200 and caller.get("level") == 2,
+          f"a read answers at the level it was opened at: {status} {caller}")
+    written = write(opener)
+    check(written.get("ok"), f"and its form posts, acting for her: {written}")
+
+
+def finish():
+    if FAILURES:
+        say("")
+        say(f"e2e-plugin-page FAILED: {len(FAILURES)}")
+        for failure in FAILURES:
+            say(f"  - {failure}")
+        sys.exit(1)
+
+
 if __name__ == "__main__":
-    main()
+    phase = sys.argv[1] if len(sys.argv) > 1 else "main"
+    if phase == "kept-before":
+        kept_before()
+        finish()
+    elif phase == "kept-after":
+        kept_after()
+        finish()
+    else:
+        main()

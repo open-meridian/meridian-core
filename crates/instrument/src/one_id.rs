@@ -714,21 +714,32 @@ pub fn keep_platform_record(
             ));
             changes.push(identifier_change(identifier, &words));
         }
-        let offered = crate::resolve::keep_offers(&mut held, offers);
+        // What the picker brought in states, in force where the record
+        // holds nothing for the field (ruling 832); offered otherwise.
+        let person = offers
+            .iter()
+            .map(|offer| crate::resolve::picker_person(&offer.instance_id))
+            .find(|person| !person.is_empty())
+            .unwrap_or_default()
+            .to_string();
+        let (applied, offered) = crate::resolve::take_stated(&mut held, offers, now_ns);
         let listed = take_trading_currencies(&mut held, master);
         let terms = take_listed_terms(&mut held, master);
-        if changes.is_empty() && !offered && !listed && !terms {
+        if changes.is_empty() && applied.is_empty() && !offered && !listed && !terms {
             return Ok((held, false));
         }
+        let operation = if !changes.is_empty() {
+            "join"
+        } else if !applied.is_empty() {
+            "complete"
+        } else {
+            "offer"
+        };
+        changes.extend(applied);
         held.version = expected + 1;
         held.record_time_ns = now_ns;
-        let entry = version_of(
-            &held,
-            if changes.is_empty() { "offer" } else { "join" },
-            changes,
-            "",
-            now_ns,
-        );
+        let mut entry = version_of(&held, operation, changes, "", now_ns);
+        entry.person = person;
         return match store.write(held.clone(), expected, entry)? {
             Written::Stored => Ok((held, false)),
             _ => Ok((store.by_id(&master.instrument_id)?.unwrap_or(held), false)),
@@ -778,13 +789,16 @@ pub fn keep_platform_record(
             meridian_domain::instrument_type::contract_to_text(contract);
     }
     candidate.sources = sources;
-    crate::resolve::keep_offers(&mut candidate, offers);
+    // The platform's values first; what the picker brought in states fills
+    // only what the platform's record leaves empty (ruling 832).
+    let (applied, _) = crate::resolve::take_stated(&mut candidate, offers, now_ns);
     let first = version_of(
         &candidate,
         "platform",
         identifiers
             .iter()
             .map(|identifier| identifier_change(identifier, &words))
+            .chain(applied)
             .collect(),
         &format!(
             "the platform's record, matched or minted at this deployment's request with no \

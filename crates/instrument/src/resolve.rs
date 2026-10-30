@@ -34,6 +34,11 @@
 //! is kept on the record as an offer, with the instance as its source, in force
 //! only when a person accepts it (W3.10; the spec's Q6).
 //!
+//! The instrument picker is not a plugin: a person chose the platform's
+//! candidate, and what that candidate states is put in force where the record
+//! holds no value for the field, as theirs through the picker; it is offered
+//! only where it differs from a value the record already holds (ruling 832).
+//!
 //! # Every date the store holds (contract v19, decisions/034)
 //!
 //! Each identifier on a record keeps its window, and one that leaves a record
@@ -506,10 +511,18 @@ fn joined(
         });
         changes.push(identifier_change(identifier, &reported_by(instance_id)));
     }
-    let offered = keep_offers(&mut record, stated(request, instance_id, now_ns));
-    if joining.is_empty() && !offered {
+    let (applied, offered) = take_stated(&mut record, stated(request, instance_id, now_ns), now_ns);
+    if joining.is_empty() && applied.is_empty() && !offered {
         return Ok(unchanged(answered(&record, false)));
     }
+    let operation = if !joining.is_empty() {
+        "join"
+    } else if !applied.is_empty() {
+        "complete"
+    } else {
+        "offer"
+    };
+    changes.extend(applied);
 
     record.version = expected + 1;
     record.record_time_ns = now_ns;
@@ -519,9 +532,9 @@ fn joined(
         prepared_call_id: String::new(),
         instrument_id: record.instrument_id.clone(),
         version: record.version,
-        operation: if joining.is_empty() { "offer" } else { "join" }.into(),
+        operation: operation.into(),
         changes,
-        person: String::new(),
+        person: picker_person(instance_id).to_string(),
         instance_id: instance_id.to_string(),
         note: String::new(),
         merged_instrument_id: String::new(),
@@ -589,7 +602,7 @@ fn mint(
         offers: Vec::new(),
         ..Default::default()
     };
-    keep_offers(&mut candidate, stated(request, instance_id, now_ns));
+    let (applied, _) = take_stated(&mut candidate, stated(request, instance_id, now_ns), now_ns);
     let proposed = match &template {
         Some((_, true)) => {
             meridian_domain::v1::InstrumentType::try_from(request.stated_instrument_type)
@@ -610,8 +623,9 @@ fn mint(
         changes: asked
             .iter()
             .map(|identifier| identifier_change(identifier, &reported_by(instance_id)))
+            .chain(applied)
             .collect(),
-        person: String::new(),
+        person: picker_person(instance_id).to_string(),
         instance_id: instance_id.to_string(),
         note: String::new(),
         merged_instrument_id: String::new(),
@@ -891,6 +905,73 @@ pub(crate) fn keep_offers(record: &mut Instrument, offers: Vec<Offer>) -> bool {
         changed = true;
     }
     changed
+}
+
+/// The person a resolve the instrument picker sent stands for, or nothing
+/// for anybody else's.
+pub(crate) fn picker_person(instance_id: &str) -> &str {
+    instance_id
+        .strip_prefix(crate::service::INSTRUMENT_PICKER)
+        .and_then(|rest| rest.strip_prefix(" for "))
+        .unwrap_or_default()
+}
+
+/// The fields a candidate the picker brought in puts in force (ruling 832).
+const PICKER_APPLIES: [Field; 3] = [Field::AssetClass, Field::Currency, Field::Description];
+
+/// What a resolve stated, taken onto the record (ruling 832): the instrument
+/// picker's -- a person bringing in the platform's candidate -- in force for
+/// each field the record holds no value for, sourced to the picker and the
+/// person, a change of its version each; everything else, and anything that
+/// differs from a value held, kept as offers by [`keep_offers`]. The changes
+/// put in force, and whether an offer changed.
+pub(crate) fn take_stated(
+    record: &mut Instrument,
+    offers: Vec<Offer>,
+    now_ns: i64,
+) -> (Vec<Change>, bool) {
+    let mut applied = Vec::new();
+    let mut offered = Vec::new();
+    for offer in offers {
+        let person = picker_person(&offer.instance_id);
+        if person.is_empty()
+            || !PICKER_APPLIES.contains(&offer.field)
+            || !record.value(offer.field).is_empty()
+        {
+            offered.push(offer);
+            continue;
+        }
+        record.set_value(offer.field, offer.value.clone());
+        record.set_source(Source {
+            acting_through_delegation: String::new(),
+            client_name: String::new(),
+            prepared_call_id: String::new(),
+            field: offer.field,
+            identifier: None,
+            source: offer.source.clone(),
+            person: person.to_string(),
+            instance_id: offer.instance_id.clone(),
+            recorded_at_ns: now_ns,
+            note: String::new(),
+        });
+        applied.push(Change {
+            field: offer.field.name().into(),
+            scheme: String::new(),
+            namespace: String::new(),
+            before: String::new(),
+            after: crate::record::value_words(offer.field, &offer.value),
+            source: offer.source,
+        });
+    }
+    // An offer of what is now in force is an offer no longer.
+    if !applied.is_empty() {
+        let in_force = record.clone();
+        record.offers.retain(|held| {
+            held.field == Field::Identifier || in_force.value(held.field) != held.value
+        });
+    }
+    let changed = keep_offers(record, offered);
+    (applied, changed)
 }
 
 /// List a conflict for a person, or bring it up to date.
@@ -1313,6 +1394,108 @@ mod tests {
             .offers
             .iter()
             .all(|offer| offer.field != Field::Currency));
+    }
+
+    #[test]
+    fn what_the_picker_brings_in_is_in_force_and_offered_only_against_a_value_held() {
+        let store = MemoryStore::new();
+        let picker = format!("{} for local|ada", crate::service::INSTRUMENT_PICKER);
+        let mut chosen = request(vec![asked("composite_figi", "BBG000BDTBL9", "US")]);
+        chosen.stated_asset_class = AssetClass::Fund as i32;
+        chosen.stated_currency = "USD".into();
+        chosen.stated_description = "SPDR S&P 500 ETF Trust".into();
+        let minted = resolve_identifier(&store, &chosen, &picker, NOW)
+            .unwrap()
+            .changed
+            .unwrap();
+        // Ruling 832: in force, as the person's through the picker, and no offer.
+        assert_eq!(
+            minted.asset_class,
+            asset_class_name(AssetClass::Fund as i32)
+        );
+        assert_eq!(minted.currency, "USD");
+        assert_eq!(minted.description, "SPDR S&P 500 ETF Trust");
+        assert!(minted.offers.is_empty(), "{:?}", minted.offers);
+        let source = minted.source_of(Field::Currency, None).unwrap();
+        assert_eq!(source.person, "local|ada");
+        assert_eq!(source.instance_id, picker);
+        let history = store.history(&minted.instrument_id).unwrap();
+        let first = &history[0];
+        assert_eq!(first.person, "local|ada");
+        for field in ["asset_class", "currency", "description"] {
+            assert!(
+                first.changes.iter().any(|change| change.field == field),
+                "{field} is a change of the record's first version: {:?}",
+                first.changes
+            );
+        }
+
+        // A plugin later stating a different currency offers it; the value
+        // in force stays.
+        let mut other = request(vec![asked("composite_figi", "BBG000BDTBL9", "US")]);
+        other.stated_currency = "EUR".into();
+        let offered = resolve_identifier(&store, &other, "custody-snaptrade-1", NOW + 1)
+            .unwrap()
+            .changed
+            .unwrap();
+        assert_eq!(offered.currency, "USD");
+        assert!(offered
+            .offers
+            .iter()
+            .any(|offer| offer.field == Field::Currency && offer.value == "EUR"));
+
+        // Brought in again with a different description: offered, never
+        // over the one held.
+        let mut again = chosen.clone();
+        again.stated_description = "SPDR S&P 500".into();
+        let held = resolve_identifier(&store, &again, &picker, NOW + 2)
+            .unwrap()
+            .changed
+            .unwrap();
+        assert_eq!(held.description, "SPDR S&P 500 ETF Trust");
+        assert!(held
+            .offers
+            .iter()
+            .any(|offer| offer.field == Field::Description && offer.value == "SPDR S&P 500"));
+    }
+
+    #[test]
+    fn the_picker_fills_what_a_matched_record_lacks_and_a_plugin_still_only_offers() {
+        let store = MemoryStore::new();
+        // A plugin's record: its statement offered, nothing in force.
+        let mut reported = request(vec![asked("composite_figi", "BBG000B9XRY4", "US")]);
+        reported.stated_description = "Apple".into();
+        let minted = resolve_identifier(&store, &reported, "custody-snaptrade-1", NOW)
+            .unwrap()
+            .changed
+            .unwrap();
+        assert!(minted.description.is_empty() && minted.currency.is_empty());
+        // The person brings the platform's candidate in: it matches the
+        // record, and fills what it lacks; the plugin's matching offer goes.
+        let picker = format!("{} for local|ada", crate::service::INSTRUMENT_PICKER);
+        let mut chosen = request(vec![asked("composite_figi", "BBG000B9XRY4", "US")]);
+        chosen.stated_description = "Apple".into();
+        chosen.stated_currency = "USD".into();
+        chosen.stated_asset_class = AssetClass::Equity as i32;
+        let filled = resolve_identifier(&store, &chosen, &picker, NOW + 1)
+            .unwrap()
+            .changed
+            .unwrap();
+        assert_eq!(filled.instrument_id, minted.instrument_id);
+        assert_eq!(filled.description, "Apple");
+        assert_eq!(filled.currency, "USD");
+        assert!(
+            filled
+                .offers
+                .iter()
+                .all(|offer| offer.field != Field::Description),
+            "an offer of what is now in force is no offer: {:?}",
+            filled.offers
+        );
+        let latest = store.history(&filled.instrument_id).unwrap();
+        let latest = latest.iter().max_by_key(|version| version.version).unwrap();
+        assert_eq!(latest.operation, "complete");
+        assert_eq!(latest.person, "local|ada");
     }
 
     fn currency_provenance(
