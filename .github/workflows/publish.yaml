@@ -470,7 +470,12 @@ jobs:
           # first match, helm was still writing and died of SIGPIPE, and
           # pipefail made that the step's failure (exit 141) whenever the
           # match came early enough -- more often as the chart grew.
-          rendered="$(helm template check deploy/chart --set deployment.id=publish-check)"
+          # At the Kubernetes the chart declares and dev and CI run (the
+          # Makefile's KUBERNETES_VERSION): Helm holds `template` to its own
+          # default otherwise, older than the chart's kubeVersion.
+          kube="$(sed -n 's/^KUBERNETES_VERSION := //p' Makefile)"
+          test -n "$kube"
+          rendered="$(helm template check deploy/chart --kube-version "$kube" --set deployment.id=publish-check)"
           grep -q "image: \"$IMAGE:$SHA\"" <<<"$rendered"
           # And the analytics component's, published beside it above.
           grep -q "image: \"$ANALYTICS:$SHA\"" <<<"$rendered"

@@ -7,8 +7,9 @@ backed up by the chart's CronJob on its schedule and by `meridian backup
 leaving only the directory the backups were written to; then restored by
 `meridian restore`, and held to what it was: the same people and access, the
 same settings, the secret opening with the restored settings key to the
-value it was sealed from, the same book line for line, the same keys, every
-component ready, and a backup taken again after.
+value it was sealed from, the same book line for line, the same keys, an edge
+plugin's storage file for file (ruling 828), every component ready, and a
+backup taken again after.
 
 It needs a cluster that is nobody's: `make e2e-cluster-backup` refuses any
 kube context that is not a k3d or kind one, and `make e2e-cluster-k3d
@@ -50,6 +51,12 @@ BOOK_SQL = os.path.abspath("deploy/harness/book.sql")
 # survives the wipe.
 BACKUP_PATH = os.environ.get("E2E_BACKUP_PATH", "/var/lib/meridian-backup-e2e")
 PLUGIN = "e2e-plugin"
+# An edge plugin's storage (decisions/028), as the launcher makes its claim:
+# backed up by `meridian backup` and made again, filled, by `meridian restore`
+# (ruling 828). No plugin runs on it; what is proved is the claim and every
+# file in it, its owner and mode.
+STORE = "e2e-store"
+STORE_CLAIM = f"{FULL}-storage-{STORE}"
 SECRET_VALUE = "a-vendor-key-for-the-e2e-only"
 ADMIN = "local|alice"
 
@@ -350,6 +357,62 @@ def started_with_the_database():
     return True
 
 
+def store_pod(name, command, read_only):
+    """A pod of the backup image mounting the store's claim, run to its end;
+    what it printed. The image is in the node already (image-load)."""
+    pod = {
+        "apiVersion": "v1", "kind": "Pod",
+        "metadata": {"name": name, "namespace": NAMESPACE},
+        "spec": {
+            "restartPolicy": "Never",
+            "containers": [{"name": "store", "image": BACKUP_IMAGE, "imagePullPolicy": "IfNotPresent",
+                            "command": ["sh", "-c", command],
+                            "volumeMounts": [{"name": "store", "mountPath": "/store", "readOnly": read_only}]}],
+            "volumes": [{"name": "store", "persistentVolumeClaim": {"claimName": STORE_CLAIM, "readOnly": read_only}}],
+        },
+    }
+    kubectl("delete", "pod", name, "--ignore-not-found", "--wait")
+    kubectl("create", "-f", "-", input=json.dumps(pod).encode())
+    wait_for(f"the pod {name} to finish", lambda: out(
+        "get", "pod", name, "-o", "jsonpath={.status.phase}") in ("Succeeded", "Failed"), seconds=180)
+    said = out("logs", name)
+    phase = out("get", "pod", name, "-o", "jsonpath={.status.phase}")
+    kubectl("delete", "pod", name, "--wait")
+    if phase != "Succeeded":
+        raise SystemExit(f"the pod {name} failed:\n{said}")
+    return said
+
+
+def fill_store():
+    """The claim as the launcher makes one for an edge plugin, and records in
+    it as a plugin keeps them: a file of its own, one owned by another user
+    and readable by its group alone, and a directory."""
+    claim = {
+        "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+        "metadata": {"name": STORE_CLAIM, "namespace": NAMESPACE, "labels": {
+            "meridian.dev/component": "plugin-storage", "meridian.dev/instance": STORE,
+            "meridian.dev/launched": "true", "meridian.dev/plugin": STORE,
+            "app.kubernetes.io/instance": RELEASE, "app.kubernetes.io/name": "meridian-runtime"}},
+        "spec": {"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": "64Mi"}}},
+    }
+    kubectl("create", "-f", "-", input=json.dumps(claim).encode())
+    store_pod("e2e-store-fill",
+              "set -e; mkdir -p /store/session /store/statements; "
+              "head -c 300000 /dev/urandom >/store/session/messages.log; "
+              "echo 'seq 4127' >/store/session/sequence; "
+              "head -c 5000 /dev/urandom >/store/statements/2026-10-29.xml; "
+              "chown 65532:65532 /store/statements/2026-10-29.xml; chmod 0640 /store/statements/2026-10-29.xml",
+              read_only=False)
+
+
+def store_held():
+    """Every file in the store: its hash, owner, group and mode."""
+    return store_pod("e2e-store-read",
+                     "cd /store && find . -type f | LC_ALL=C sort | while read -r f; do "
+                     "echo \"$(sha256sum \"$f\" | cut -d' ' -f1) $(stat -c '%u:%g %a' \"$f\") $f\"; done",
+                     read_only=True)
+
+
 def all_ready():
     names = out("get", "deployments", "-l", f"app.kubernetes.io/instance={RELEASE}", "-o", "name").split()
     if not names:
@@ -363,6 +426,13 @@ def main():
     s = Scorecard()
     workdir = tempfile.mkdtemp(prefix="meridian-backup-e2e-", dir=os.environ.get("E2E_WORKDIR"))
     os.chmod(workdir, 0o777)
+
+    # Whether this CLI backs up plugins' storage (ruling 828), which core's
+    # CI meets at meridian-cli's main: until that lands there, the store is
+    # left out of this run, and said so.
+    stores = "plugin's storage" in cli(workdir, "backup", "--help").stdout
+    if not stores:
+        print("    skipped: this meridian does not back up plugins' storage yet", flush=True)
 
     print("A: an identity to seal backups to, by `meridian backup key`", flush=True)
     done = cli(workdir, "backup", "key", "--to", "identity.txt")
@@ -469,6 +539,8 @@ def main():
         "original_quantity, cost, cost_currency, acquired_date, source) values "
         "('ACC-e2e', 'INS-E2E', 1, 'LOT-1', 1, 100.25, 100.25, 1234.5600, 'USD', '2026-10-02', 1);\n"
     )
+    if stores:
+        fill_store()
     before = held()
     key_before = deployment_key()
     # The administrator holds what first run grants (meridian_config's
@@ -502,8 +574,13 @@ def main():
     s.check(bool(log) and SECRET_VALUE not in log and recipient not in log, "and printed no secret")
     # What the backup below holds, read just before it.
     before = held()
+    store_before = store_held() if stores else ""
+    if stores:
+        s.check(len(store_before.splitlines()) == 3, f"the store holds three files: {store_before.splitlines()}")
     done = cli(workdir, "backup", "--release", RELEASE, "-n", NAMESPACE, "--to", "/work")
     s.check(done.returncode == 0, f"meridian backup --to: exit {done.returncode}")
+    if stores:
+        s.check(f"plugin storage: {STORE_CLAIM}" in done.stdout, "and it backed up the plugin's storage")
     files = [f for f in os.listdir(workdir) if f.endswith(".meridian-backup")]
     s.check(len(files) == 1, f"and the file is here: {files}")
     on_node = node_backups()
@@ -572,6 +649,12 @@ def main():
     for what in before:
         s.check(after[what] == before[what], f"the same {what}")
     s.check(deployment_key() == key_before, "the same deployment key, now from a Secret")
+    if stores:
+        claim = json.loads(out("get", "pvc", STORE_CLAIM, "-o", "json"))
+        labels = claim["metadata"].get("labels", {})
+        s.check(labels.get("meridian.dev/launched") == "true" and labels.get("meridian.dev/plugin") == STORE,
+                "the plugin's storage is its claim again, the launcher's, for its plugin")
+        s.check(store_held() == store_before, "the same plugin storage, file for file, owner and mode")
     # Waited for: the Job starts with the URL, and the components do not wait
     # for it here, since the restored schema is already the one they verify.
     def migrated():

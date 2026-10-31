@@ -8,6 +8,13 @@ type: application
 version: 0.1.0
 appVersion: "0.1.0"
 
+# The Kubernetes it runs on (ruling 849): 1.35 and newer, which CI proves at
+# both ends -- the k3s release dev and CI run (the Makefile's
+# KUBERNETES_VERSION) and a 1.35 one. Helm refuses an install or upgrade on
+# an older cluster before it changes anything. The `-0` admits the
+# pre-release suffixes managed clusters report (1.35.2-eks-...).
+kubeVersion: ">=1.35.0-0"
+
 home: https://github.com/open-meridian/meridian-core
 sources:
   - https://github.com/open-meridian/meridian-core
