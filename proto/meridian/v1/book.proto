@@ -1746,6 +1746,20 @@ message Order {
   // Contract v28: as option brokers require it: buy to open, sell to close.
   // Unspecified on an instrument that is no option or future.
   PositionEffect position_effect = 49;
+  // Contract v29: percent of par in limit_price, a yield in limit_yield, or a
+  // spread over a benchmark in limit_spread_bps; a when-issued Treasury before
+  // its auction is priced in yield. Unspecified: per unit, as before v29.
+  PriceBasis price_basis = 50;
+  // Contract v29: the least yield on a buy, the most on a sell, in its
+  // convention (FIX Yield, 236, with YieldType, 235). Unset unless price_basis
+  // is yield.
+  QuotedYield limit_yield = 51;
+  // Contract v29: over benchmark_instrument_id, the least on a buy (FIX Spread,
+  // 218). Unset unless price_basis is spread.
+  optional Decimal limit_spread_bps = 52;
+  // Contract v29: an on-the-run Treasury's bond record, or a rate_curve record.
+  // Empty unless price_basis is spread.
+  string benchmark_instrument_id = 53;
 }
 
 // An order's status: its state, its conditions and its quantities, each
@@ -2393,6 +2407,20 @@ message ProposeOrderRequest {
   // Contract v28: as option brokers require it: buy to open, sell to close.
   // Unspecified on an instrument that is no option or future.
   PositionEffect position_effect = 39;
+  // Contract v29: percent of par in limit_price, a yield in limit_yield, or a
+  // spread over a benchmark in limit_spread_bps; a when-issued Treasury before
+  // its auction is priced in yield. Unspecified: per unit, as before v29.
+  PriceBasis price_basis = 40;
+  // Contract v29: the least yield on a buy, the most on a sell, in its
+  // convention (FIX Yield, 236, with YieldType, 235). Unset unless price_basis
+  // is yield.
+  QuotedYield limit_yield = 41;
+  // Contract v29: over benchmark_instrument_id, the least on a buy (FIX Spread,
+  // 218). Unset unless price_basis is spread.
+  optional Decimal limit_spread_bps = 42;
+  // Contract v29: an on-the-run Treasury's bond record, or a rate_curve record.
+  // Empty unless price_basis is spread.
+  string benchmark_instrument_id = 43;
 }
 
 // W11.2. A fact: never through the gate. By the `oms`, for a user, naming
@@ -3077,6 +3105,12 @@ message Allocation {
   // Each prime's answer to a give-up of the allocation, in the order
   // recorded (W11.32).
   repeated GiveUpRecord give_up_answers = 15;
+  // Contract v29: the accrued interest the customer pays or receives, a Money
+  // in the settlement currency (FIX AccruedInterestAmt, 159, on Confirmation
+  // 35=AK); final money is net_amount plus it. Unset on an allocation in an
+  // instrument that accrues nothing; on a fixed-income allocation booked before
+  // v29, unset, a backfilled record saying it was not recorded (decisions/031).
+  optional Money accrued_interest = 16;
 }
 
 // A prime's answer to a give-up (W11.32), its own record, as FIX sends each
@@ -3371,14 +3405,17 @@ message LifecycleEvent {
   string event_id = 1;
   // An account in the sender's scope. Never empty.
   string account_id = 2;
-  // A listed_option, future_option or future INS- record. Never empty.
+  // A listed_option, future_option or future INS- record; from contract v29 a
+  // debt record (bond, mbs_pool, tba, cmo_tranche, certificate_of_deposit).
+  // Never empty.
   string instrument_id = 3;
   // The event's kind, a closed list. Unspecified is refused.
   LifecycleEventKind kind = 4;
   // Decided by the book. Unset on a request.
   LifecycleEventState state = 5;
   // Contracts exercised, assigned or expired; on a variation, the contracts
-  // held at the settlement. Never unset.
+  // held at the settlement; from contract v29, on a debt record, its face
+  // (original face for a pool or a tranche). Never unset.
   Decimal quantity = 6;
   // A plain date: the exercise, assignment or expiry date, or the settlement's
   // trading date. Never empty.
@@ -3407,6 +3444,34 @@ message LifecycleEvent {
   RawRecordRef raw_record = 14;
   // Its journal entry. Unset on a request.
   JournalRef last_change = 15;
+  // Contract v29: maturity, full call, partial call, put or sinking-fund draw,
+  // as the custodian states it; a partial call by lottery can only be reported,
+  // never derived. Unspecified on any kind but redemption.
+  RedemptionEventKind redemption_kind = 16;
+  // Contract v29: per 100 of face, before accrued, as the custodian states it;
+  // the lots close at it. Unset on any kind but redemption.
+  optional Decimal redemption_price = 17;
+  // Contract v29: a plain date, the accrual start. Empty on any kind but coupon
+  // received.
+  string period_start_date = 18;
+  // Contract v29: a plain date, exclusive, the accrual end. Empty on any kind
+  // but coupon received.
+  string period_end_date = 19;
+  // Contract v29: a plain date: a coupon's, a redemption's or a paydown's.
+  // Empty where the kind has none.
+  string record_date = 20;
+  // Contract v29: the agency's published factor the paydown or accretion
+  // brought the pool or class to, an exact decimal, as the Factor row (W10.4).
+  // Unset on any kind but paydown and accretion.
+  optional Decimal factor = 21;
+  // Contract v29: the factor the event moved from; cash on a paydown is
+  // (prior_factor - factor) times original face. Unset on any kind but paydown
+  // and accretion.
+  optional Decimal prior_factor = 22;
+  // Contract v29: signed: positive a Z class's accretion, negative an IO's
+  // notional fall; no cash moves and the lots stay in original face. Unset on
+  // any kind but accretion.
+  optional Decimal face_change = 23;
 }
 
 // Contract v28 (LifecycleEvent.deliveries): states what changed hands on
@@ -3545,6 +3610,45 @@ enum LifecycleEventKind {
   // A future's day of variation against the settlement price, a cash line only
   // (ruling 562).
   LIFECYCLE_EVENT_KIND_SETTLEMENT_VARIATION = 4;
+  // Contract v29: coupon received: a debt record's interest paid to the holder
+  // of record, cash only, the period and record date stated (683).
+  LIFECYCLE_EVENT_KIND_COUPON_RECEIVED = 5;
+  // Contract v29: redemption: a maturity, a full or partial call, a put or a
+  // sinking-fund draw, closing or reducing lots at the redemption price (683).
+  LIFECYCLE_EVENT_KIND_REDEMPTION = 6;
+  // Contract v29: paydown: principal returned on a pool or tranche, cash equal
+  // to the factor's fall times original face, the lots kept in original face
+  // and their cost relieved pro rata (680).
+  LIFECYCLE_EVENT_KIND_PAYDOWN = 7;
+  // Contract v29: accretion: a Z class's face increase or an IO's notional
+  // fall, no cash (682).
+  LIFECYCLE_EVENT_KIND_ACCRETION = 8;
+  // Contract v29: tba allocation: at pool notice, the TBA's lots closed and the
+  // delivered pools' lots opened (681).
+  LIFECYCLE_EVENT_KIND_TBA_ALLOCATION = 9;
+  // Contract v29: strip: a whole bond exchanged for its STRIPS components, the
+  // basis allocated by relative value.
+  LIFECYCLE_EVENT_KIND_STRIP = 10;
+  // Contract v29: reconstitution: STRIPS components exchanged back for the
+  // whole bond.
+  LIFECYCLE_EVENT_KIND_RECONSTITUTION = 11;
+}
+
+// Contract v29 (683): what a redemption record redeemed, as the custodian
+// states it.
+enum RedemptionEventKind {
+  // Unset on any kind but redemption; refused on a redemption.
+  REDEMPTION_EVENT_KIND_UNSPECIFIED = 0;
+  // Repaid at maturity.
+  REDEMPTION_EVENT_KIND_MATURITY = 1;
+  // Called in full: CDM CorporateActionTypeEnum EarlyRedemption.
+  REDEMPTION_EVENT_KIND_FULL_CALL = 2;
+  // Called in part, by lottery or pro rata: no CDM type, held more.
+  REDEMPTION_EVENT_KIND_PARTIAL_CALL = 3;
+  // Put by the holder.
+  REDEMPTION_EVENT_KIND_PUT = 4;
+  // A mandatory sinking-fund draw: no CDM type, held more.
+  REDEMPTION_EVENT_KIND_SINKING_FUND = 5;
 }
 
 enum LifecycleEventState {
