@@ -261,10 +261,9 @@ impl Sidecar {
         let chosen_names: BTreeSet<&'static str> = chosen.iter().map(|row| row.name).collect();
         // Subscriptions open on this stream (contract v28, amended
         // 2026-10-30), its generation naming it.
-        let generation = self.subscriptions.opened(
-            chosen_names.clone(),
-            Arc::new(|_: &'static Row| {}),
-        );
+        let generation = self
+            .subscriptions
+            .opened(chosen_names.clone(), Arc::new(|_: &'static Row| {}));
         let lake = Lake {
             entitled: self.entitled.clone(),
             subjects: Arc::new(request.subjects.iter().cloned().collect()),
@@ -290,15 +289,7 @@ impl Sidecar {
                 closed.clone(),
             );
             Arc::new(move |row: &'static Row| {
-                start_row(
-                    row,
-                    &bus,
-                    &waiting,
-                    &configuration,
-                    &hearer,
-                    &lake,
-                    &closed,
-                )
+                start_row(row, &bus, &waiting, &configuration, &hearer, &lake, &closed)
             })
         };
         self.subscriptions.starting(generation, Arc::clone(&start));
@@ -651,9 +642,9 @@ async fn deliver(
     // stream's own rows, or by a subscription to its row naming the account
     // or every one.
     if !lake_row {
-        subscription_ids = lake
-            .subscriptions
-            .matching_book(lake.generation, row.name, read.account.as_deref());
+        subscription_ids =
+            lake.subscriptions
+                .matching_book(lake.generation, row.name, read.account.as_deref());
         if !by_stream && subscription_ids.is_empty() {
             return;
         }

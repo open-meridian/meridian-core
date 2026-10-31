@@ -314,7 +314,10 @@ async fn a_chains_quotes_in_its_window_are_delivered_naming_the_subscription_mas
     let quote = heard.quote.unwrap();
     assert_eq!(quote.meta.unwrap().series_key[0].value, NOV);
     assert!(quote.bid.is_some(), "the field asked kept");
-    assert!(quote.ask.is_none(), "a field entitled but not asked stripped");
+    assert!(
+        quote.ask.is_none(),
+        "a field entitled but not asked stripped"
+    );
     nothing_more(&mut stream).await;
 
     // Its want renewed at once.
@@ -405,7 +408,11 @@ async fn the_same_id_again_is_the_first_and_another_selector_under_it_is_refused
         ),
         ("no id", chain(""), Code::InvalidArgument),
     ] {
-        let refused = w.sidecar.subscribe(Request::new(request)).await.unwrap_err();
+        let refused = w
+            .sidecar
+            .subscribe(Request::new(request))
+            .await
+            .unwrap_err();
         assert_eq!(refused.code(), code, "{label}: {refused:?}");
     }
 }
@@ -439,10 +446,7 @@ async fn an_unsubscribed_selector_hears_nothing_more() {
     let w = world().await;
     // The stream names another row: quotes are the subscription's alone.
     let mut stream = stream_of(&w.sidecar, &["SeriesRecorded"]).await;
-    w.sidecar
-        .subscribe(Request::new(own("own")))
-        .await
-        .unwrap();
+    w.sidecar.subscribe(Request::new(own("own"))).await.unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     publish_quote(&w.bus, AAPL, None);
     let delivery = next(&mut stream).await;
@@ -480,10 +484,7 @@ async fn an_unsubscribed_selector_hears_nothing_more() {
 async fn entitlements_changed_while_open_change_what_it_hears() {
     let w = world().await;
     let mut stream = stream_of(&w.sidecar, &["QuotesRecorded"]).await;
-    w.sidecar
-        .subscribe(Request::new(own("own")))
-        .await
-        .unwrap();
+    w.sidecar.subscribe(Request::new(own("own"))).await.unwrap();
     w.bus
         .publish(
             crate::lake::ENTITLEMENTS_CHANGED,

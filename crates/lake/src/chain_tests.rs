@@ -1656,7 +1656,12 @@ async fn a_listed_series_recorded_is_heard_on_its_datasets_subject() {
     record(
         &h,
         "series",
-        vec![Observation::Series(series(OSI_CALL, "call", "230", "2026-11-20"))],
+        vec![Observation::Series(series(
+            OSI_CALL,
+            "call",
+            "230",
+            "2026-11-20",
+        ))],
     )
     .unwrap();
     let event = meridian_domain::v1::SeriesRecordedEvent::decode(

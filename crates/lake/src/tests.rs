@@ -2558,9 +2558,24 @@ async fn a_batchs_quotes_are_published_latest_value_per_key_and_every_one_record
         &h,
         "quotes",
         vec![
-            Observation::Quote(quote("q1", NOW - 3, money("1", "USD", ""), money("2", "USD", ""))),
-            Observation::Quote(quote("q-usdc", NOW - 3, money("1", "", USDC), money("2", "", USDC))),
-            Observation::Quote(quote("q2", NOW - 2, money("1.5", "USD", ""), money("2", "USD", ""))),
+            Observation::Quote(quote(
+                "q1",
+                NOW - 3,
+                money("1", "USD", ""),
+                money("2", "USD", ""),
+            )),
+            Observation::Quote(quote(
+                "q-usdc",
+                NOW - 3,
+                money("1", "", USDC),
+                money("2", "", USDC),
+            )),
+            Observation::Quote(quote(
+                "q2",
+                NOW - 2,
+                money("1.5", "USD", ""),
+                money("2", "USD", ""),
+            )),
         ],
     )
     .unwrap();
@@ -2581,7 +2596,10 @@ async fn a_batchs_quotes_are_published_latest_value_per_key_and_every_one_record
         Observation::Trade(trade("t1", NOW + 1_000, "62000")),
         Observation::Trade(trade("t2", NOW + 2_000, "62001")),
     ];
-    assert!(service::superseded_in_batch(&trades).is_empty(), "every trade");
+    assert!(
+        service::superseded_in_batch(&trades).is_empty(),
+        "every trade"
+    );
 }
 
 /// Contract v28, amended 2026-10-30 (W10.7; rulings 834 and 885): a

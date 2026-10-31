@@ -1161,7 +1161,8 @@ async fn a_quote_recorded_reaches_a_subscribed_plugin_within_the_budget() {
         account_scope: Some(Vec::new()),
         ..Default::default()
     };
-    let decimal = |text: &str| -> Option<PbDecimal> { Some(text.parse::<Exact>().unwrap().to_wire()) };
+    let decimal =
+        |text: &str| -> Option<PbDecimal> { Some(text.parse::<Exact>().unwrap().to_wire()) };
     let usd = |text: &str| {
         Some(Money {
             amount: decimal(text),

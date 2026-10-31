@@ -51,7 +51,8 @@ use crate::receive::Row;
 use crate::service::Sidecar;
 
 /// The most subscriptions open per plugin (SidecarSubscribe.limit).
-pub(crate) const MOST_OPEN: usize = meridian_pb::bounds::SIDECAR_SUBSCRIBE_LIMIT_RANGE.most as usize;
+pub(crate) const MOST_OPEN: usize =
+    meridian_pb::bounds::SIDECAR_SUBSCRIBE_LIMIT_RANGE.most as usize;
 
 /// A sidecar's lease on the wants it renews (ruling 885).
 pub(crate) const LEASE: Duration = Duration::from_secs(30);
@@ -65,7 +66,11 @@ const LIST_SERIES: &str = "platform.lake.query.list-series";
 /// The template paths a listed series' expiry is read from, in order: an
 /// option's expiration date, a future's last trade date, else its final
 /// settlement date -- as the lake's listing reads one (ruling 856).
-const EXPIRY_PATHS: [&str; 3] = ["expiration_date", "last_trade_date", "final_settlement_date"];
+const EXPIRY_PATHS: [&str; 3] = [
+    "expiration_date",
+    "last_trade_date",
+    "final_settlement_date",
+];
 
 /// A series key as a subscription holds it: its scheme and value, and for
 /// a ticker its venue's MIC, in capitals, as the reads match one.
@@ -287,7 +292,11 @@ impl Registry {
     }
 
     pub(crate) fn open_count(&self) -> usize {
-        self.inner.lock().expect("subscriptions poisoned").open.len()
+        self.inner
+            .lock()
+            .expect("subscriptions poisoned")
+            .open
+            .len()
     }
 
     /// A lake row heard: the subscriptions it matches, and their mask. A
@@ -384,7 +393,7 @@ impl Registry {
             .filter(|open| open.generation == generation)
             .filter_map(want_of)
             .collect();
-        wants.sort_by(|a, b| a.encode_to_vec().cmp(&b.encode_to_vec()));
+        wants.sort_by_key(|want| want.encode_to_vec());
         wants.dedup();
         wants
     }
@@ -405,7 +414,12 @@ fn want_of(open: &Open) -> Option<RenewedWant> {
                 ..Default::default()
             })
             .collect(),
-        series_keys: open.asked.series_keys.iter().map(domain_identifier).collect(),
+        series_keys: open
+            .asked
+            .series_keys
+            .iter()
+            .map(domain_identifier)
+            .collect(),
         all_series: open.all_series,
         expiration_from: open.asked.expiration_from.clone(),
         expiration_to: open.asked.expiration_to.clone(),
@@ -430,8 +444,7 @@ impl Sidecar {
     ) -> Result<Response<plugin::SubscribeReply>, Status> {
         let registration = self.admitted()?;
         let id = request.subscription_id.clone();
-        if !meridian_pb::bounds::SUBSCRIBE_REQUEST_SUBSCRIPTION_ID_LENGTH
-            .admits(id.chars().count())
+        if !meridian_pb::bounds::SUBSCRIBE_REQUEST_SUBSCRIPTION_ID_LENGTH.admits(id.chars().count())
         {
             return Err(refused(
                 self,
@@ -453,7 +466,11 @@ impl Sidecar {
         };
         let open = self.selector(&request, row)?;
         {
-            let inner = self.subscriptions.inner.lock().expect("subscriptions poisoned");
+            let inner = self
+                .subscriptions
+                .inner
+                .lock()
+                .expect("subscriptions poisoned");
             if inner.streams.is_empty() {
                 drop(inner);
                 return Err(refused(
@@ -491,7 +508,11 @@ impl Sidecar {
         }
         let want = want_of(&open);
         {
-            let mut inner = self.subscriptions.inner.lock().expect("subscriptions poisoned");
+            let mut inner = self
+                .subscriptions
+                .inner
+                .lock()
+                .expect("subscriptions poisoned");
             let Some((generation, stream)) = inner.newest() else {
                 return Err(Status::failed_precondition("the stream closed"));
             };
@@ -548,7 +569,12 @@ impl Sidecar {
 
     /// A request held to its row: the subjects, series, window and fields
     /// it may name.
-    fn selector(&self, request: &plugin::SubscribeRequest, row: &'static Row) -> Result<Open, Status> {
+    #[allow(clippy::result_large_err)] // a refusal is the call's own Status, as every operation's
+    fn selector(
+        &self,
+        request: &plugin::SubscribeRequest,
+        row: &'static Row,
+    ) -> Result<Open, Status> {
         let bad = |status: Status| Err(refused(self, status));
         if !meridian_pb::bounds::SUBSCRIBE_REQUEST_SUBJECTS_COUNT.admits(request.subjects.len()) {
             return bad(Status::invalid_argument(format!(
@@ -578,7 +604,8 @@ impl Sidecar {
                 .map(Some)
                 .map_err(|_| Status::invalid_argument(format!("{name} {text:?} is no plain date")))
         };
-        let from = side(&request.expiration_from, "expiration_from").map_err(|s| refused(self, s))?;
+        let from =
+            side(&request.expiration_from, "expiration_from").map_err(|s| refused(self, s))?;
         let to = side(&request.expiration_to, "expiration_to").map_err(|s| refused(self, s))?;
         let windowed = from.is_some() || to.is_some();
         if windowed && !request.all_series {

@@ -4016,19 +4016,32 @@ impl Lake {
                             | DataType::Statistic
                     )
                 })
-                .ok_or_else(|| format!("{at}.data_type {:?} is no data type a want keeps current", want.data_type))?;
+                .ok_or_else(|| {
+                    format!(
+                        "{at}.data_type {:?} is no data type a want keeps current",
+                        want.data_type
+                    )
+                })?;
             if !(1..=500).contains(&want.subjects.len()) {
-                return Err(format!("{at}.subjects names {}; 1 to 500", want.subjects.len()));
+                return Err(format!(
+                    "{at}.subjects names {}; 1 to 500",
+                    want.subjects.len()
+                ));
             }
             if want.series_keys.len() > 500 {
-                return Err(format!("{at}.series_keys names {}; at most 500", want.series_keys.len()));
+                return Err(format!(
+                    "{at}.series_keys names {}; at most 500",
+                    want.series_keys.len()
+                ));
             }
             let window = read::Window {
                 from: parse_window_side(&want.expiration_from, &format!("{at}.expiration_from"))?,
                 to: parse_window_side(&want.expiration_to, &format!("{at}.expiration_to"))?,
             };
             if window.is_set() && !want.all_series {
-                return Err(format!("{at}.expiration_from: a window is set only with all_series"));
+                return Err(format!(
+                    "{at}.expiration_from: a window is set only with all_series"
+                ));
             }
             let readable: Vec<String> = config
                 .readable(&reader, data_type)
