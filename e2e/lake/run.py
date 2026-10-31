@@ -88,6 +88,18 @@ harness's admin, Ben, who holds read on `book`.
    as of the quarter with their report; a subject asked in a role the rows
    do not give it answers nothing.
 
+17. Contract v29, track C (W10.4 to W10.7; rulings 680, 685 and 900):
+   `coin` resolves the harness platform's corporate bond by its FIGI and
+   its agency pool by agency_pool, and records on `coin:fixed_income` a
+   TRACE-like print of the bond -- 5MM+, capped, 98.375 per 100 of face, its
+   yield to worst beside it, a dealer the contra and the dealer principal --
+   a when-issued print in yield with no money price, a firm quote with
+   bucketed sizes, and two months of the pool's factors, October's then
+   republished. `desk` reads the prints and the quote back as recorded;
+   `book` reads the pool's factors by payment date, October's at its
+   republication, catches up the republication after the watermark it last
+   saw, and a pool asked by a record no source holds is never a factor.
+
 `make e2e-recorded` runs the same with STAND_IN_EXCHANGES naming RECORDED, a
 developer's recorded exchanges (plans/the-lake-prices-the-book, Q11).
 
@@ -667,6 +679,46 @@ def run():
     must(not wrong_role["holdings"],
          f"step 16, a subject asked in a role the rows do not give it: {wrong_role}")
 
+    # 17. Contract v29, track C: a bond's prints and quote, a pool's factors.
+    runner("entitle", "--instance", "book", "coin:fixed_income", "note=The book reads factors.")
+    runner("entitle", "--instance", "desk", "coin:fixed_income", "note=The desk reads bond prints.")
+    fixed = until(90, lambda: (lambda said: said if "factors" in said else None)(
+        page("coin", "admin", "/fixed-income")), "step 17, coin did not record the fixed-income rows")
+    must(fixed["trades"] == 2 and fixed["quotes"] == 1 and fixed["factors"] == 2
+         and fixed["republished"] == 1 and fixed["bond"].startswith("INS-")
+         and fixed["pool"].startswith("INS-"),
+         f"step 17, two prints, a quote and two factors recorded, one republished: {fixed}")
+    bond, pool = fixed["bond"], fixed["pool"]
+    prints = until(60, lambda: page("desk", "read", f"/catch-up?subject={bond}&after=0"
+                                                   "&dataset=coin:fixed_income")["trades"],
+                   "step 17, desk did not read the bond's prints")
+    capped = [t for t in prints if t["row_key"] == "TRACE-HARN36-1"]
+    must(capped and capped[0]["amount"] == "98.375" and capped[0]["quantity_capped"]
+         and capped[0]["basis"] == "PRICE_BASIS_PERCENT_OF_PAR" and capped[0]["yield"] == "5.093"
+         and capped[0]["characteristics"] == ["TRADE_CHARACTERISTIC_CONTRA_DEALER",
+                                              "TRADE_CHARACTERISTIC_PRINCIPAL_CAPACITY"],
+         f"step 17, the capped print in percent of par, its yield and characteristics: {prints}")
+    when_issued = [t for t in prints if t["row_key"] == "TRACE-HARN36-WI"]
+    must(when_issued and when_issued[0]["amount"] == "" and when_issued[0]["yield"] == "4.875"
+         and when_issued[0]["basis"] == "PRICE_BASIS_YIELD",
+         f"step 17, the when-issued print in yield, no money price: {prints}")
+    quoted = page("desk", "read", f"/quotes?subject={bond}&dataset=coin:fixed_income")["quotes"]
+    must(len(quoted) == 1 and quoted[0]["bid_size_capped"] and quoted[0]["ask_size_capped"]
+         and quoted[0]["bid_yield"] == "5.110" and quoted[0]["venue_id"].startswith("VEN-"),
+         f"step 17, the firm quote on its venue, its sizes at least: {quoted}")
+    year = until(60, lambda: (lambda said: said if said["factors"] else None)(
+        page("book", "read", f"/factors?subject={pool}&from=2025-11-01&to=2026-11-30")),
+        "step 17, book did not read the pool's factors")
+    must([(f["month"], f["factor"], f["version"]) for f in year["factors"]]
+         == [("202609", "0.84017733", 1), ("202610", "0.83102211", 2)],
+         f"step 17, a year of the pool's factors, October's at its republication: {year}")
+    caught = page("book", "read", f"/factors?subject={pool}&after={fixed['head'] - 1}")
+    must([(f["month"], f["version"]) for f in caught["factors"]] == [("202610", 2)],
+         f"step 17, the republication caught up after the watermark: {caught}")
+    none = page("book", "read", f"/factors?subject={bond}")
+    must(not none["factors"] and none["unanswered"],
+         f"step 17, a record no source holds factors for is never a factor: {none}")
+
     # 11. The store.
     lines = compose("run", "--rm", "-T", "store", "lake").stdout.split("\n")
     log("store lake:\n" + "\n".join(lines))
@@ -719,7 +771,10 @@ def run():
           "include_quarantined, a signal's escalation of a close leaving it out of a default "
           "read and a lower one refused; a filing heard and read by its filer, a fact as first "
           "published and restated, a rating action by the rated and its agency, and a "
-          "security's holders with their report; and `store lake` printing each version numbered with no "
+          "security's holders with their report; a bond's capped print in percent of par with its "
+          "yield and characteristics, a when-issued print in yield, a firm quote with bucketed "
+          "sizes, and a pool's factors read by payment date, republished and caught up; and "
+          "`store lake` printing each version numbered with no "
           "holes, the want and the priority's changes")
 
 

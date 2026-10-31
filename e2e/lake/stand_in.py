@@ -83,6 +83,18 @@ reports and holdings, pushed -- and serves:
              a later filing restating it, a 13F report and its Apple
              holding, and Moody's affirmation of Apple's rating.
 
+From contract v29 (track C; W10.4 to W10.7; rulings 680, 685, 900) it
+declares `fixed_income` -- trades, quotes and factors, pushed -- and serves:
+
+  /fixed-income
+             resolves the harness platform's corporate bond by its FIGI and
+             its agency pool by agency_pool, and records a TRACE-like print
+             of the bond (5MM+, capped, at 98.375 per 100 of face, its yield
+             to worst beside it, a dealer the contra and the reporting
+             dealer principal), a when-issued print in yield alone, a firm
+             quote with bucketed sizes, and two months of the pool's factors,
+             then October's republished.
+
 STAND_IN_LAKE=signal is a `signal` plugin serving:
 
   /assess?subject=ID&date=D&state=S[&version=N]
@@ -112,6 +124,10 @@ STAND_IN_LAKE=reader serves:
   /rates?subject=ID&date=D[&tenor=T][&published_as_of=N]
                                             ListRates (contract v27): its rows and
                                             what it left unanswered;
+  /factors?subject=ID[&from=D][&to=D][&after=N]
+                                            contract v29: ListFactors by payment
+                                            date, or after fixed_income's
+                                            sequence N;
   /filed?subject=ID&role=R[&published_as_of=N]
                                             contract v28: ListFilings,
                                             ListReportedFacts, ListRatingActions
@@ -246,6 +262,16 @@ CATALOGUE = [
         licence_default=DatasetLicence(kept=True, derived_use=True, display=True),
         day_time_zone="America/New_York",
     ),
+    # Contract v29, track C: a fixed-income source's prints, quotes and an
+    # agency's factors, pushed; named after the SDK's check, as the 1b's are.
+    _v19_types(DatasetDeclaration(
+        key="fixed_income",
+        vendor="FINRA",
+        data_types=["meridian.v1.Price"],
+        modes=["push"],
+        licence_default=DatasetLicence(kept=True, derived_use=True, display=True),
+        day_time_zone="America/New_York",
+    ), ["meridian.v1.Trade", "meridian.v1.Quote", "meridian.v1.Factor"]),
     DatasetDeclaration(
         key="fx",
         vendor="Federal Reserve",
@@ -626,6 +652,80 @@ class Dgm:
         log(filings=said)
         return said
 
+    async def fixed_income(self):
+        """Contract v29, track C (W10.4; rulings 680, 685, 900): the
+        harness platform's bond and pool, a capped print in percent of par
+        with its yield, a when-issued print in yield, a firm quote with
+        bucketed sizes, and the pool's factors, October's republished."""
+        bond = await self.plugin.resolve_identifier(
+            identifiers=[ops.Identifier(scheme="figi", value="BBG01BOND0001")],
+            stated_asset_class="debt", stated_description="Harness Corp 4.875% 2036-02-05",
+            stated_currency="USD")
+        pool = await self.plugin.resolve_identifier(
+            identifiers=[ops.Identifier(scheme="agency_pool", value="MA5123", source="FNMA")],
+            stated_asset_class="debt", stated_description="FNMA CL MA5123 5.5",
+            stated_currency="USD")
+        if not bond.instrument_id or not pool.instrument_id:
+            raise RuntimeError(f"the bond or the pool did not resolve: {bond} {pool}")
+        now = time.time_ns()
+        dataset = self.dataset("fixed_income")
+
+        def meta(row_key, subject, at, venue="", business_date=""):
+            return ops.ObservationMeta(row_key=row_key,
+                                       subjects=[ops.SubjectRef(entity_id=subject)],
+                                       source=ops.Source(dataset=dataset, venue_id=venue),
+                                       valid_from_ns=at, business_date=business_date)
+
+        def quoted(percent, kind, to_date=""):
+            return ops.QuotedYield(
+                value=ops.UnitValue(value=_decimal(percent), unit=ops.VALUE_UNIT_PERCENT),
+                convention=ops.RateConvention(day_count=ops.DAY_COUNT_THIRTY_360_BOND_BASIS,
+                                              compounding=ops.COMPOUNDING_COMPOUNDED,
+                                              periods_per_year=2),
+                kind=kind, to_date=to_date)
+
+        prints = [
+            ops.Trade(meta=meta("TRACE-HARN36-1", bond.instrument_id, now),
+                      price=self.money("98.375"), quantity=_decimal("5000000"),
+                      quantity_capped=True, basis=ops.PRICE_BASIS_PERCENT_OF_PAR,
+                      attributes=ops.TradeAttributes(characteristics=[
+                          ops.TRADE_CHARACTERISTIC_CONTRA_DEALER,
+                          ops.TRADE_CHARACTERISTIC_PRINCIPAL_CAPACITY]),
+                      **{"yield": quoted("5.093", ops.YIELD_KIND_TO_WORST, "2034-02-05")}),
+            ops.Trade(meta=meta("TRACE-HARN36-WI", bond.instrument_id, now + 1000),
+                      quantity=_decimal("250000"), basis=ops.PRICE_BASIS_YIELD,
+                      attributes=ops.TradeAttributes(characteristics=[
+                          ops.TRADE_CHARACTERISTIC_WHEN_ISSUED]),
+                      **{"yield": quoted("4.875", ops.YIELD_KIND_TO_MATURITY)}),
+        ]
+        traded = await self.plugin._operations().RecordTrades(ops.RecordTradesParams(trades=prints))
+        quote = ops.Quote(meta=meta("ATS-HARN36-Q-1", bond.instrument_id, now + 2000, VENUE),
+                          bid=self.money("98.25"), ask=self.money("98.50"),
+                          bid_quantity=_decimal("1000000"), ask_quantity=_decimal("1000000"),
+                          bid_size_capped=True, ask_size_capped=True,
+                          basis=ops.PRICE_BASIS_PERCENT_OF_PAR,
+                          bid_yield=quoted("5.110", ops.YIELD_KIND_TO_WORST, "2034-02-05"),
+                          ask_yield=quoted("5.076", ops.YIELD_KIND_TO_WORST, "2034-02-05"))
+        quoted_done = await self.plugin._operations().RecordQuotes(ops.RecordQuotesParams(quotes=[quote]))
+
+        def factor(month, value, record, payment, published):
+            return ops.Factor(meta=meta(f"FNMA:MA5123:{month}", pool.instrument_id, now,
+                                        business_date=published),
+                              factor=_decimal(value), factor_month=month,
+                              record_date=record, payment_date=payment)
+
+        factors = await self.plugin._operations().RecordFactors(ops.RecordFactorsParams(factors=[
+            factor("202609", "0.84017733", "2026-09-30", "2026-10-26", "2026-10-06"),
+            factor("202610", "0.83102210", "2026-10-31", "2026-11-25", "2026-11-04")]))
+        republished = await self.plugin._operations().RecordFactors(ops.RecordFactorsParams(
+            factors=[factor("202610", "0.83102211", "2026-10-31", "2026-11-25", "2026-11-04")]))
+        said = {"bond": bond.instrument_id, "pool": pool.instrument_id,
+                "trades": traded.recorded, "quotes": quoted_done.recorded,
+                "factors": factors.recorded, "republished": republished.restated,
+                "head": max(p.sequence for p in republished.watermark.partitions)}
+        log(fixed_income=said)
+        return said
+
     async def resolve_as_of(self, query):
         one = lambda name: query.get(name, [""])[0]
         # A security with the name and currency the venue states (from
@@ -691,6 +791,8 @@ class Dgm:
             return await self.quality()
         if path == "/filings":
             return await self.filings()
+        if path == "/fixed-income":
+            return await self.fixed_income()
         if path == "/resolve":
             return await self.resolve()
         if path == "/record":
@@ -822,6 +924,25 @@ class Reader:
                         for r in holdings.reports],
         }
 
+    async def factors(self, query):
+        """ListFactors (contract v29, W10.6): by payment date, or caught up
+        after fixed_income's sequence `after`."""
+        one = lambda name, default="": query.get(name, [default])[0]  # noqa: E731
+        after = one("after")
+        watermark = (ops.Watermark(partitions=[ops.PartitionSequence(
+            partition="coin:fixed_income", sequence=int(after))]) if after else None)
+        answer = await self.plugin.list_factors(
+            subjects=[meridian.SubjectRef(entity_id=s) for s in query.get("subject", [])],
+            from_date=one("from"), to_date=one("to"), after_watermark=watermark)
+        return {
+            "factors": [{"month": f.factor_month, "factor": _amount(f.factor),
+                         "payment_date": f.payment_date, "version": f.meta.version,
+                         "dataset": f.meta.source.dataset} for f in answer.factors],
+            "unanswered": [{"subject": u.subject.entity_id, "dataset": u.dataset,
+                            "reason": ops.UnansweredReason.Name(u.reason)}
+                           for u in answer.unanswered],
+        }
+
     async def invalid_date(self, query):
         params = ops.ListPricesParams(
             subjects=[ops.SubjectRef(entity_id=s) for s in query.get("subject", [])],
@@ -849,6 +970,8 @@ class Reader:
             return await self.rates(query)
         if path == "/filed":
             return await self.filed(query)
+        if path == "/factors":
+            return await self.factors(query)
         return {"page": "the lake's reading stand-in"}
 
 
@@ -872,8 +995,17 @@ def trade_json(trade):
     meta = trade.meta
     return {"row_key": meta.row_key, "version": meta.version, "sequence": meta.sequence,
             "dataset": meta.source.dataset, "venue_id": meta.source.venue_id,
-            "valid_from_ns": meta.valid_from_ns, "amount": _amount(trade.price.amount),
-            "instrument_id": trade.price.instrument_id, "cancelled": trade.cancelled}
+            "valid_from_ns": meta.valid_from_ns,
+            "amount": _amount(trade.price.amount) if trade.HasField("price") else "",
+            "instrument_id": trade.price.instrument_id, "cancelled": trade.cancelled,
+            # Contract v29 (ruling 685): the basis, the yield beside it, a
+            # capped size and the characteristics.
+            "basis": ops.PriceBasis.Name(trade.basis),
+            "yield": (_amount(getattr(trade, "yield").value.value)
+                      if trade.HasField("yield") else ""),
+            "quantity_capped": trade.quantity_capped,
+            "characteristics": [ops.TradeCharacteristic.Name(c)
+                                for c in trade.attributes.characteristics]}
 
 
 def quote_json(quote):
@@ -884,7 +1016,13 @@ def quote_json(quote):
             "instrument_id": side.instrument_id,
             # Contract v28: the row's state and its reasons.
             "quality": ops.QualityState.Name(meta.quality),
-            "quality_reasons": [ops.QualityReason.Name(r) for r in meta.quality_reasons]}
+            "quality_reasons": [ops.QualityReason.Name(r) for r in meta.quality_reasons],
+            # Contract v29 (rulings 685 and 900): its venue, bucketed sizes
+            # and the bid's yield.
+            "venue_id": meta.source.venue_id,
+            "bid_size_capped": quote.bid_size_capped, "ask_size_capped": quote.ask_size_capped,
+            "basis": ops.PriceBasis.Name(quote.basis),
+            "bid_yield": _amount(quote.bid_yield.value.value) if quote.HasField("bid_yield") else ""}
 
 
 class Desk:
