@@ -21,5 +21,9 @@ base64.workspace = true
 uuid.workspace = true
 tokio = { workspace = true }
 
+# malloc_trim, to hand glibc's free memory back to the system (ruling 957).
+[target.'cfg(target_env = "gnu")'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }

@@ -1,4 +1,9 @@
 {{- include "meridian-runtime.require" . -}}
+{{- /* Rulings 957, 958: a whole number from 1 to 8, or nothing renders. */ -}}
+{{- $answers := .Values.lake.maxConcurrentAnswers -}}
+{{- if not (regexMatch "^[1-8]$" (toString $answers)) -}}
+{{- fail (printf "lake.maxConcurrentAnswers is %v; a whole number from 1 to 8, how many whole answers the lake builds at once" $answers) -}}
+{{- end -}}
 {{/*
   The lake (W10, contract v18): what sources say about entities -- prices
   and bars a data plugin records, read by the reading roles under the deployment's
@@ -70,6 +75,9 @@ spec:
             - name: MALLOC_ARENA_MAX
               value: {{ . | quote }}
             {{- end }}
+            # How many whole answers it builds at once (rulings 957, 958).
+            - name: MERIDIAN_LAKE_MAX_CONCURRENT_ANSWERS
+              value: {{ $answers | int | quote }}
             - name: MERIDIAN_LAKE_DATABASE_URL
               valueFrom:
                 secretKeyRef:
