@@ -270,6 +270,10 @@ enum NotEvaluatedReason {
   // Contract v28: The only input in force is invalid, its dataset in detail
   // (ruling 421).
   NOT_EVALUATED_REASON_INPUT_QUARANTINED = 13;
+  // Contract v29: a debt record minted incomplete, its missing fields named --
+  // a callable bond without its calls -- so no yield to worst or cash flow is
+  // computed from a guess.
+  NOT_EVALUATED_REASON_TERMS_INCOMPLETE = 14;
 }
 
 // What an answer was computed from (requirements 4 and 35; Q7). Named so it
