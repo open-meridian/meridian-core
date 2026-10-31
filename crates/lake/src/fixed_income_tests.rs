@@ -55,7 +55,9 @@ pub(crate) fn harness(configuration: EntitlementsChangedEvent) -> Harness {
         let asked = ResolveInstrumentRequest::decode(&envelope.payload[..]).unwrap();
         let held = match asked.instrument_id.as_str() {
             BOND | UST => Some((AssetClass::Debt, InstrumentType::Bond)),
-            POOL => Some((AssetClass::Debt, InstrumentType::MbsPool)),
+            POOL | "INS-01JPOOL00000000000000000002" => {
+                Some((AssetClass::Debt, InstrumentType::MbsPool))
+            }
             USD => Some((AssetClass::Cash, InstrumentType::Unspecified)),
             _ => None,
         };
@@ -535,4 +537,321 @@ async fn an_ats_firm_quote_is_a_quote_on_its_venue_its_sizes_at_least_and_its_yi
         record(&h, "quotes", vec![Observation::Quote(indicative)]).unwrap(),
         (1, 0, 0)
     );
+}
+
+// ── The factor (contract v29, ruling 680; W10.4 to W10.7) ──
+
+const FANNIE: &str = "gse-disclosures-1:fannie_mae";
+const GINNIE: &str = "ginnie-mae-1:factors";
+/// A pool the deployment holds and no source covers.
+const UNCOVERED: &str = "INS-01JPOOL00000000000000000002";
+
+/// Fannie Mae's factors, pushed and asked for, kept, read by servicing-1;
+/// Ginnie Mae's beside it, read by nobody.
+fn factor_configuration() -> EntitlementsChangedEvent {
+    let (mut fannie, reader) = dataset(
+        FANNIE,
+        &["meridian.v1.Factor"],
+        &[ObservationMode::Push, ObservationMode::Pull],
+        "servicing-1",
+        &[],
+    );
+    // Its files are read daily: what keeps a want current.
+    fannie.declaration.as_mut().unwrap().cadence = 86_400;
+    let (ginnie, _) = dataset(
+        GINNIE,
+        &["meridian.v1.Factor"],
+        &[ObservationMode::Push],
+        "nobody-1",
+        &[],
+    );
+    EntitlementsChangedEvent {
+        datasets: vec![fannie, ginnie],
+        licences: vec![],
+        entitlements: vec![reader],
+        changed_at_ns: NOW,
+    }
+}
+
+/// The fixture's factor: Fannie Mae's for a UMBS pool, its month, record
+/// and payment dates, published on the fourth business day.
+fn factor(subject: &str, month: &str, value: &str, payment: &str) -> meridian_domain::v1::Factor {
+    meridian_domain::v1::Factor {
+        meta: Some(ObservationMeta {
+            row_key: format!("FNMA:MA5123:{month}"),
+            subjects: vec![SubjectRef {
+                entity_id: subject.into(),
+                ..Default::default()
+            }],
+            source: Some(Source {
+                instance: "gse-disclosures-1".into(),
+                dataset: FANNIE.into(),
+                ..Default::default()
+            }),
+            valid_from_ns: NOW,
+            business_date: "2026-11-04".into(),
+            ..Default::default()
+        }),
+        factor: decimal(value),
+        factor_month: month.into(),
+        record_date: "2026-10-31".into(),
+        payment_date: payment.into(),
+        coupon_rate: None,
+    }
+}
+
+fn record_factors(
+    h: &Harness,
+    rows: Vec<meridian_domain::v1::Factor>,
+) -> Result<(u32, u32, u32), String> {
+    tokio::task::block_in_place(|| {
+        h.lake.record(
+            "factors",
+            rows.into_iter().map(Observation::Factor).collect(),
+            "",
+            &envelope("gse-disclosures-1"),
+        )
+    })
+    .map(|reply| (reply.recorded, reply.restated, reply.unchanged))
+}
+
+fn list_factors(
+    h: &Harness,
+    request: meridian_domain::v1::ListFactorsRequest,
+) -> Result<meridian_domain::v1::ListFactorsReply, String> {
+    tokio::task::block_in_place(|| h.lake.list_factors(request, &envelope("servicing-1")))
+}
+
+fn subjects(ids: &[&str]) -> Vec<SubjectRef> {
+    ids.iter()
+        .map(|id| SubjectRef {
+            entity_id: (*id).into(),
+            ..Default::default()
+        })
+        .collect()
+}
+
+fn values(reply: &meridian_domain::v1::ListFactorsReply) -> Vec<(String, String, u64)> {
+    reply
+        .factors
+        .iter()
+        .map(|f| {
+            (
+                f.factor_month.clone(),
+                meridian_domain::exact::Exact::from_wire(f.factor.as_ref().unwrap())
+                    .unwrap()
+                    .to_string(),
+                f.meta.as_ref().unwrap().version,
+            )
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pools_factor_is_recorded_heard_every_version_and_read_by_payment_date_or_watermark() {
+    use meridian_domain::v1::{
+        FactorsRecordedEvent, ListFactorsRequest, PartitionSequence, Watermark,
+    };
+    let h = harness(factor_configuration());
+    let mut heard = h
+        .bus
+        .subscribe_every(&format!("platform.lake.{FANNIE}.event.factors-recorded"));
+    assert_eq!(
+        record_factors(
+            &h,
+            vec![
+                factor(POOL, "202609", "0.84017733", "2026-10-27"),
+                factor(POOL, "202610", "0.83102210", "2026-11-25"),
+            ]
+        )
+        .unwrap(),
+        (2, 0, 0)
+    );
+    let first = FactorsRecordedEvent::decode(&heard.recv().await.unwrap().envelope.payload[..])
+        .unwrap()
+        .factor
+        .unwrap();
+    assert_eq!(first.factor_month, "202609");
+    heard.recv().await.unwrap();
+
+    // A year of the pool's factors by payment date; November's alone.
+    let year = list_factors(
+        &h,
+        ListFactorsRequest {
+            subjects: subjects(&[POOL]),
+            from_date: "2025-11-01".into(),
+            to_date: "2026-11-30".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        values(&year),
+        vec![
+            ("202609".into(), "0.84017733".into(), 1),
+            ("202610".into(), "0.83102210".into(), 1)
+        ]
+    );
+    assert_eq!(year.datasets[0].dataset, FANNIE);
+    let november = list_factors(
+        &h,
+        ListFactorsRequest {
+            subjects: subjects(&[POOL]),
+            from_date: "2026-11-01".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(november.factors.len(), 1);
+    let watermark = november.watermark.clone().unwrap();
+
+    // Republished: the next version of its row key, heard, never conflated,
+    // and the read answers it; a reader that lost it catches up after the
+    // watermark it last saw, whatever the dates.
+    assert_eq!(
+        record_factors(&h, vec![factor(POOL, "202610", "0.83102211", "2026-11-25")]).unwrap(),
+        (0, 1, 0)
+    );
+    let republished =
+        FactorsRecordedEvent::decode(&heard.recv().await.unwrap().envelope.payload[..])
+            .unwrap()
+            .factor
+            .unwrap();
+    assert_eq!(republished.meta.as_ref().unwrap().version, 2);
+    let caught_up = list_factors(
+        &h,
+        ListFactorsRequest {
+            subjects: subjects(&[POOL]),
+            after_watermark: Some(watermark.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        values(&caught_up),
+        vec![("202610".into(), "0.83102211".into(), 2)]
+    );
+    let every = list_factors(
+        &h,
+        ListFactorsRequest {
+            subjects: subjects(&[POOL]),
+            after_watermark: Some(Watermark {
+                partitions: vec![PartitionSequence {
+                    partition: FANNIE.into(),
+                    sequence: 0,
+                }],
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(every.factors.len(), 3, "every version after the watermark");
+    let refused = list_factors(
+        &h,
+        ListFactorsRequest {
+            subjects: subjects(&[POOL]),
+            after_watermark: Some(watermark),
+            from_date: "2026-11-01".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(refused.contains("after_watermark"), "{refused}");
+    // A page holds at most 500 rows, as every lake read's.
+    let paged = list_factors(
+        &h,
+        ListFactorsRequest {
+            subjects: subjects(&[POOL]),
+            page_size: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(paged.factors.len(), 1);
+    assert!(!paged.next_cursor.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pool_no_source_covers_is_unanswered_never_a_factor_of_one_and_an_invalid_one_quarantined(
+) {
+    use meridian_domain::v1::{ListFactorsRequest, QualityReason, QualityState};
+    let h = harness(factor_configuration());
+    // Nothing recorded: the source is asked, standing, and nothing answers.
+    let mut wanted = h.bus.subscribe_every(service::OBSERVATIONS_WANTED);
+    let nothing = list_factors(
+        &h,
+        ListFactorsRequest {
+            subjects: subjects(&[UNCOVERED]),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(nothing.factors.is_empty());
+    assert_eq!(
+        nothing
+            .unanswered
+            .iter()
+            .map(|u| (u.dataset.as_str(), u.reason))
+            .collect::<Vec<_>>(),
+        vec![(FANNIE, UnansweredReason::AskedSource as i32)]
+    );
+    let want = meridian_domain::v1::ObservationsWantedEvent::decode(
+        &wanted.recv().await.unwrap().envelope.payload[..],
+    )
+    .unwrap();
+    assert_eq!(want.data_type, "meridian.v1.Factor");
+    assert!(want.standing, "a pool held is wanted standing (W10.7)");
+
+    // The pool's only row invalid: left out, named quarantined.
+    let mut judged = factor(POOL, "202610", "8.3102210", "2026-11-25");
+    let meta = judged.meta.as_mut().unwrap();
+    meta.quality = QualityState::Invalid as i32;
+    meta.quality_reasons = vec![QualityReason::PriceOutlier as i32];
+    record_factors(&h, vec![judged]).unwrap();
+    let quarantined = list_factors(
+        &h,
+        ListFactorsRequest {
+            subjects: subjects(&[POOL]),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(quarantined.factors.is_empty());
+    assert!(quarantined
+        .unanswered
+        .iter()
+        .any(|u| u.dataset == FANNIE && u.reason == UnansweredReason::Quarantined as i32));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn what_w10_4_refuses_of_a_factor_is_refused_naming_the_field() {
+    let h = harness(factor_configuration());
+    let refused = |change: &dyn Fn(&mut meridian_domain::v1::Factor)| {
+        let mut row = factor(POOL, "202610", "0.83102210", "2026-11-25");
+        change(&mut row);
+        record_factors(&h, vec![row]).unwrap_err()
+    };
+    let words = refused(&|row| row.factor_month.clear());
+    assert!(words.starts_with("factors[0].factor_month"), "{words}");
+    let words = refused(&|row| row.factor_month = "202613".into());
+    assert!(words.starts_with("factors[0].factor_month"), "{words}");
+    let words = refused(&|row| row.factor = decimal("-0.1"));
+    assert!(words.starts_with("factors[0].factor"), "{words}");
+    let words = refused(&|row| row.factor = None);
+    assert!(words.starts_with("factors[0].factor"), "{words}");
+    let words = refused(&|row| row.payment_date = "2026-11-31".into());
+    assert!(words.contains("factors[0].payment_date"), "{words}");
+    // A bond's record is no pool; a record the deployment does not hold is
+    // never minted by a factor.
+    let words = refused(&|row| row.meta.as_mut().unwrap().subjects[0].entity_id = BOND.into());
+    assert!(words.contains("no pool or REMIC class"), "{words}");
+    let words = refused(&|row| {
+        row.meta.as_mut().unwrap().subjects[0].entity_id = "INS-01JNOTHELD000000000000000".into()
+    });
+    assert!(words.contains("no record the deployment holds"), "{words}");
+    // An accreting Z class's factor is above 1, and a floater's coupon is
+    // the period's.
+    let mut z = factor(POOL, "202610", "1.0425", "2026-11-25");
+    z.coupon_rate = decimal("5.125");
+    assert_eq!(record_factors(&h, vec![z]).unwrap(), (1, 0, 0));
 }

@@ -75,6 +75,9 @@ pub const RATING_ACTION: &str = "meridian.v1.RatingAction";
 pub const HOLDINGS_REPORT: &str = "meridian.v1.HoldingsReport";
 /// One holding of a holdings report (contract v28, the filings slice).
 pub const HOLDING: &str = "meridian.v1.Holding";
+/// One month's factor of an agency pool or a REMIC class as the agency
+/// publishes it, a dated fact (contract v29, ruling 680; W10.4).
+pub const FACTOR: &str = "meridian.v1.Factor";
 
 /// The scheme a future's or a future option's series is keyed by: the
 /// exchange's ticker, one identifier carrying its venue's ISO 10383 MIC in
@@ -88,8 +91,9 @@ pub const OCC_OSI_SCHEME: &str = "occ_osi";
 /// outcome from contract v23, the rates slice's rate from contract v27, and
 /// from contract v28 statistics, listed series, derived series, saved
 /// scenarios, declared corporate actions, and the filings slice's filings,
-/// reported facts, rating actions, holdings reports and holdings.
-pub const DATA_TYPES: [&str; 16] = [
+/// reported facts, rating actions, holdings reports and holdings; from
+/// contract v29 a pool's or a class's factor.
+pub const DATA_TYPES: [&str; 17] = [
     PRICE,
     BAR,
     TRADE,
@@ -106,6 +110,7 @@ pub const DATA_TYPES: [&str; 16] = [
     RATING_ACTION,
     HOLDINGS_REPORT,
     HOLDING,
+    FACTOR,
 ];
 
 /// The data types a default read takes a priority among (W10.3): an outcome
@@ -285,6 +290,15 @@ const HOLDING_FIELDS: [&str; 5] = [
     "meridian.v1.Holding.percent_of_class",
 ];
 
+const FACTOR_FIELDS: [&str; 6] = [
+    "meridian.v1.Factor.meta",
+    "meridian.v1.Factor.factor",
+    "meridian.v1.Factor.factor_month",
+    "meridian.v1.Factor.record_date",
+    "meridian.v1.Factor.payment_date",
+    "meridian.v1.Factor.coupon_rate",
+];
+
 /// The dictionary entries of a data type's fields; none for one the lake
 /// does not have.
 pub fn fields_of(data_type: &str) -> &'static [&'static str] {
@@ -305,6 +319,7 @@ pub fn fields_of(data_type: &str) -> &'static [&'static str] {
         RATING_ACTION => &RATING_ACTION_FIELDS,
         HOLDINGS_REPORT => &HOLDINGS_REPORT_FIELDS,
         HOLDING => &HOLDING_FIELDS,
+        FACTOR => &FACTOR_FIELDS,
         _ => &[],
     }
 }
@@ -601,6 +616,40 @@ pub fn series_asked(
                     || a.source.eq_ignore_ascii_case(&identifier.source))
         })
     })
+}
+
+/// [`strip_price`], for a pool's or a class's factor (contract v29).
+pub fn strip_factor(
+    factor: &mut crate::v1::Factor,
+    allowed: &std::collections::BTreeSet<String>,
+) -> Vec<&'static str> {
+    let mut removed = Vec::new();
+    if allowed.is_empty() {
+        return removed;
+    }
+    let mut gone = |entry: &'static str| {
+        let gone = !allowed.contains(entry);
+        if gone {
+            removed.push(entry);
+        }
+        gone
+    };
+    if gone(FACTOR_FIELDS[1]) {
+        factor.factor = None;
+    }
+    if gone(FACTOR_FIELDS[2]) {
+        factor.factor_month.clear();
+    }
+    if gone(FACTOR_FIELDS[3]) {
+        factor.record_date.clear();
+    }
+    if gone(FACTOR_FIELDS[4]) {
+        factor.payment_date.clear();
+    }
+    if gone(FACTOR_FIELDS[5]) {
+        factor.coupon_rate = None;
+    }
+    removed
 }
 
 /// [`strip_price`], for a quote (contract v19).

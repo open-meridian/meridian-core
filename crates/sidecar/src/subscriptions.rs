@@ -113,6 +113,9 @@ fn wanted_type(row: &Row) -> Option<&'static str> {
         "meridian.v1.BarsRecordedEvent" => meridian_domain::lake::BAR,
         "meridian.v1.StatisticsRecordedEvent" => meridian_domain::lake::STATISTIC,
         "meridian.v1.RatesRecordedEvent" => meridian_domain::lake::RATE,
+        // Contract v29 (W10.7): a pool's or a class's factor, wanted
+        // standing for a record held.
+        "meridian.v1.FactorsRecordedEvent" => meridian_domain::lake::FACTOR,
         _ => return None,
     })
 }

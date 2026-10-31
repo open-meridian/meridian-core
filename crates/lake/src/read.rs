@@ -999,7 +999,10 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
     });
     out.rows = chosen;
 
-    let standing = matches!(read.when, When::Latest { at_ns: 0 });
+    // A pool's or a class's factor is wanted standing (contract v29, W10.7):
+    // each month's is published on the agency's schedule.
+    let standing = matches!(read.when, When::Latest { at_ns: 0 })
+        || (read.data_type == DataType::Factor && !matches!(read.when, When::After(_)));
     for (dataset, subjects) in asks {
         let cadence = config.declaration(&dataset).map_or(0, |d| d.cadence);
         // Kept current: by its schedule where it has a cadence, by the

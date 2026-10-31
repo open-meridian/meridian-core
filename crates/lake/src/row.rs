@@ -3,16 +3,17 @@
 //! contract v23), a rate (contract v27, the rates slice), a statistic and a
 //! listed series, a derived series, a saved scenario and a declared corporate
 //! action, and the filings slice's filings, reported facts, rating actions,
-//! holdings reports and holdings (contract v28).
+//! holdings reports and holdings (contract v28); a pool's or a class's
+//! factor (contract v29).
 
 use std::collections::BTreeSet;
 
 use meridian_domain::exact::Exact;
 use meridian_domain::lake;
 use meridian_domain::v1::{
-    Bar, CorporateActionAnnounced, DerivedSeries, ExecutionCost, Filing, Holding, HoldingsReport,
-    InstrumentType, ListedSeries, Money, ObservationMeta, Outcome, Price, Quote, Rate,
-    RatingAction, ReportedFact, SavedScenario, Statistic, Trade,
+    Bar, CorporateActionAnnounced, DerivedSeries, ExecutionCost, Factor, Filing, Holding,
+    HoldingsReport, InstrumentType, ListedSeries, Money, ObservationMeta, Outcome, Price, Quote,
+    Rate, RatingAction, ReportedFact, SavedScenario, Statistic, Trade,
 };
 use meridian_pb::v1::Decimal;
 use prost::Message;
@@ -52,6 +53,8 @@ pub enum DataType {
     HoldingsReport,
     /// Contract v28, the filings slice: one holding of a holdings report.
     Holding,
+    /// Contract v29 (ruling 680, W10.4): a pool's or a class's factor.
+    Factor,
 }
 
 impl DataType {
@@ -76,6 +79,7 @@ impl DataType {
             lake::RATING_ACTION => Some(DataType::RatingAction),
             lake::HOLDINGS_REPORT => Some(DataType::HoldingsReport),
             lake::HOLDING => Some(DataType::Holding),
+            lake::FACTOR => Some(DataType::Factor),
             _ => None,
         }
     }
@@ -99,6 +103,7 @@ impl DataType {
             DataType::RatingAction => lake::RATING_ACTION,
             DataType::HoldingsReport => lake::HOLDINGS_REPORT,
             DataType::Holding => lake::HOLDING,
+            DataType::Factor => lake::FACTOR,
         }
     }
 
@@ -121,6 +126,7 @@ impl DataType {
             DataType::RatingAction => 15,
             DataType::HoldingsReport => 16,
             DataType::Holding => 17,
+            DataType::Factor => 18,
         }
     }
 
@@ -143,6 +149,7 @@ impl DataType {
             15 => Some(DataType::RatingAction),
             16 => Some(DataType::HoldingsReport),
             17 => Some(DataType::Holding),
+            18 => Some(DataType::Factor),
             _ => None,
         }
     }
@@ -184,6 +191,8 @@ impl DataType {
                 | DataType::Rate
                 | DataType::Statistic
                 | DataType::Derived
+                // Contract v29 (W10.4): a factor's publication date.
+                | DataType::Factor
         )
     }
 }
@@ -211,6 +220,7 @@ pub enum Observation {
     RatingAction(RatingAction),
     HoldingsReport(HoldingsReport),
     Holding(Holding),
+    Factor(Factor),
 }
 
 impl Observation {
@@ -233,6 +243,7 @@ impl Observation {
             Observation::RatingAction(_) => DataType::RatingAction,
             Observation::HoldingsReport(_) => DataType::HoldingsReport,
             Observation::Holding(_) => DataType::Holding,
+            Observation::Factor(_) => DataType::Factor,
         }
     }
 
@@ -256,6 +267,7 @@ impl Observation {
             Observation::RatingAction(action) => action.meta.as_ref(),
             Observation::HoldingsReport(report) => report.meta.as_ref(),
             Observation::Holding(holding) => holding.meta.as_ref(),
+            Observation::Factor(factor) => factor.meta.as_ref(),
         };
         meta.unwrap_or_else(|| NONE.get_or_init(ObservationMeta::default))
     }
@@ -283,6 +295,7 @@ impl Observation {
             Observation::RatingAction(action) => action.meta.get_or_insert_with(Default::default),
             Observation::HoldingsReport(report) => report.meta.get_or_insert_with(Default::default),
             Observation::Holding(holding) => holding.meta.get_or_insert_with(Default::default),
+            Observation::Factor(factor) => factor.meta.get_or_insert_with(Default::default),
         }
     }
 
@@ -307,9 +320,14 @@ impl Observation {
     /// dividend's ex-date, the date a holder's entitlement turns on; a
     /// filing's filed date; a fact's period end; a rating action's date,
     /// its valid time's UTC day; a holdings report's report date. A
-    /// holding's is its report's, read by ListHoldings beside it.
+    /// holding's is its report's, read by ListHoldings beside it. From
+    /// contract v29 a factor's is its payment date (W10.6), or where the
+    /// agency states none its publication date.
     pub fn date(&self) -> String {
         match self {
+            Observation::Factor(factor) if !factor.payment_date.is_empty() => {
+                factor.payment_date.clone()
+            }
             Observation::CorporateAction(action) => action.ex_date.clone(),
             Observation::Filing(filing) => filing.filed_date.clone(),
             Observation::ReportedFact(fact) => fact.period_end.clone(),
@@ -453,7 +471,9 @@ impl Observation {
             | Observation::ReportedFact(_)
             | Observation::RatingAction(_)
             | Observation::HoldingsReport(_)
-            | Observation::Holding(_) => String::new(),
+            | Observation::Holding(_)
+            // A factor is a fraction of face, never conflated (contract v29).
+            | Observation::Factor(_) => String::new(),
         }
     }
 
@@ -510,6 +530,7 @@ impl Observation {
             Observation::RatingAction(action) => action.encoded_len(),
             Observation::HoldingsReport(report) => report.encoded_len(),
             Observation::Holding(holding) => holding.encoded_len(),
+            Observation::Factor(factor) => factor.encoded_len(),
         }
     }
 
@@ -532,6 +553,7 @@ impl Observation {
             Observation::RatingAction(action) => action.encode_to_vec(),
             Observation::HoldingsReport(report) => report.encode_to_vec(),
             Observation::Holding(holding) => holding.encode_to_vec(),
+            Observation::Factor(factor) => factor.encode_to_vec(),
         }
     }
 
@@ -556,6 +578,7 @@ impl Observation {
             DataType::RatingAction => Observation::RatingAction(RatingAction::decode(bytes)?),
             DataType::HoldingsReport => Observation::HoldingsReport(HoldingsReport::decode(bytes)?),
             DataType::Holding => Observation::Holding(Holding::decode(bytes)?),
+            DataType::Factor => Observation::Factor(Factor::decode(bytes)?),
         })
     }
 
@@ -657,7 +680,8 @@ impl Observation {
             | Observation::Scenario(_)
             | Observation::Filing(_)
             | Observation::RatingAction(_)
-            | Observation::HoldingsReport(_) => Vec::new(),
+            | Observation::HoldingsReport(_)
+            | Observation::Factor(_) => Vec::new(),
         }
     }
 
@@ -907,6 +931,12 @@ impl Observation {
                     && same_money(&a.market_value, &b.market_value)
                     && same_unit_value(&a.percent_of_class, &b.percent_of_class)
             }
+            (Observation::Factor(a), Observation::Factor(b)) => {
+                same_decimal(&a.factor, &b.factor)
+                    && (&a.factor_month, &a.record_date, &a.payment_date)
+                        == (&b.factor_month, &b.record_date, &b.payment_date)
+                    && same_decimal(&a.coupon_rate, &b.coupon_rate)
+            }
             _ => false,
         }
     }
@@ -935,6 +965,7 @@ impl Observation {
             Observation::RatingAction(action) => lake::strip_rating_action(action, allowed),
             Observation::HoldingsReport(report) => lake::strip_holdings_report(report, allowed),
             Observation::Holding(holding) => lake::strip_holding(holding, allowed),
+            Observation::Factor(factor) => lake::strip_factor(factor, allowed),
         }
     }
 }
