@@ -1184,6 +1184,91 @@ async fn a_routed_plugin_that_does_not_answer_leaves_its_figures_not_evaluated()
     assert_eq!(value(&answer, "market_value", &[]), "5042.00");
 }
 
+/// A routed job run on `stores`, as far as the batch its pricing plugin is
+/// handed: that batch, and what the plugin's catch-up after
+/// `after_sequence` reads.
+async fn batch_caught_up(
+    stores: &Stores,
+    c: &Coordinator,
+    after_sequence: i64,
+) -> (PriceBatchRequest, ListPriceBatchesReply) {
+    let mut handed = stores.bus.subscribe_every(topics::PRICE_BATCH);
+    let bus = Arc::clone(&stores.bus);
+    let running = tokio::spawn(async move {
+        ask_as::<RunJobReply>(
+            &bus,
+            topics::RUN_JOB,
+            "meridian.v1.RunJobRequest",
+            job(&[("market_value", &[], "")]),
+            &["ACC-1"],
+        )
+        .await
+    });
+    let heard = tokio::time::timeout(Duration::from_secs(10), handed.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let batch = PriceBatchRequest::decode(&heard.envelope.payload[..]).unwrap();
+    let caught_up = c.list_price_batches(
+        ListPriceBatchesRequest { after_sequence },
+        &meridian_bus::Envelope {
+            meta: Some(meridian_bus::MessageMeta {
+                publisher_instance_id: "sample-pricing-1".into(),
+                ..Default::default()
+            }),
+            payload_type: String::new(),
+            payload: Vec::new(),
+        },
+    );
+    running.await.unwrap().unwrap();
+    (batch, caught_up)
+}
+
+fn routed_stores() -> Stores {
+    let stores = stores();
+    stores.routing.lock().unwrap().push(ModelRouting {
+        model_id: "quoted_price".into(),
+        implementation: "sample-pricing-1".into(),
+        ..Default::default()
+    });
+    stores
+}
+
+/// Ruling 973, as for finished jobs: a coordinator restarted numbers the
+/// batches it hands a pricing plugin past the last it numbered, so the
+/// plugin, catching up after the last sequence it saw, hears the new one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restarted_coordinator_numbers_price_batches_past_the_last_a_plugin_saw() {
+    let config = Config {
+        price_deadline: Duration::from_millis(200),
+        ..Config::default()
+    };
+    let before = routed_stores();
+    let c = coordinator(&before, config.clone(), false);
+    let mut seen = 0;
+    for _ in 0..2 {
+        let (batch, caught_up) = batch_caught_up(&before, &c, seen).await;
+        assert!(batch.sequence > seen, "{} after {seen}", batch.sequence);
+        assert!(caught_up
+            .batches
+            .iter()
+            .any(|b| b.batch_id == batch.batch_id));
+        seen = batch.sequence;
+    }
+    // Restarted a second later, holding nothing; the plugin keeps its last.
+    let after = routed_stores();
+    let c = coordinator_at(&after, config, false, NOW + 1_000_000_000);
+    let (batch, caught_up) = batch_caught_up(&after, &c, seen).await;
+    assert!(batch.sequence > seen, "past {seen}: {}", batch.sequence);
+    assert!(
+        caught_up
+            .batches
+            .iter()
+            .any(|b| b.batch_id == batch.batch_id),
+        "the plugin's catch-up after {seen} hears it"
+    );
+}
+
 /// The price kind a record is marked at, from its package (the first
 /// release's Q8): the first price named; a fund's close where it is listed
 /// on a venue, its NAV where it is not or is a money-market fund.

@@ -573,8 +573,11 @@ impl Coordinator {
         let deadline = self.clock.now_ns() + self.config.price_deadline.as_nanos() as i64;
         let batch = {
             let mut batches = self.batches.lock().expect("not poisoned");
+            // Never back across a restart, as a finished job's (ruling 973):
+            // a pricing plugin catching up after the last it saw hears it.
+            let now_ms = self.clock.now_ns() / 1_000_000;
             let sequence = batches.sequences.entry(instance.to_string()).or_insert(0);
-            *sequence += 1;
+            *sequence = (*sequence + 1).max(now_ms);
             let batch = PriceBatchRequest {
                 batch_id: batch_hash.clone(),
                 pricing_instance_id: instance.to_string(),
