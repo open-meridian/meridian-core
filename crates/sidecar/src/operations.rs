@@ -1330,6 +1330,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
             self.known(&format!("prices[{i0}].kind"), held0.kind, domain::PriceKind::try_from(held0.kind).is_ok())?;
             self.exact_money(&format!("prices[{i0}].price"), held0.price.as_ref())?;
             self.known(&format!("prices[{i0}].basis"), held0.basis, domain::PriceBasis::try_from(held0.basis).is_ok())?;
+            self.exact(&format!("prices[{i0}].confidence"), held0.confidence.as_ref())?;
         }
         for stamped0 in message.prices.iter_mut() {
             let stamped1 = stamped0.meta.get_or_insert_with(Default::default);

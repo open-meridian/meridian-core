@@ -56,6 +56,7 @@ fn price(subject: &str, kind: PriceKind, amount: &str, instrument: &str, dataset
         kind: kind as i32,
         price: money(amount, instrument, ""),
         basis: PriceBasis::PerUnit as i32,
+        confidence: None,
     }
 }
 

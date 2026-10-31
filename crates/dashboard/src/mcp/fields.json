@@ -31308,6 +31308,27 @@
       "store": "lake"
     },
     {
+      "name": "meridian.v1.Price.confidence",
+      "type": "Decimal",
+      "bounds": {
+        "digits": 38,
+        "scale": [
+          0,
+          18
+        ]
+      },
+      "unit": "the price's own unit: the major unit of the asset the price names, per one unit of the subject",
+      "empty": "unset: the source states none",
+      "intent": "says how far either side of the price the source holds the price may be (amended 2026-10-31, ruling 895)",
+      "meaning": "the source's stated confidence interval around the price, plus or minus, as the source states it beside the price -- Pyth's confidence beside its aggregate price; never negative, a negative one refused naming it; a dataset filling it declares it among its data types",
+      "not_meaning": "a bid-ask spread; a percent or a probability; a figure the plugin computes",
+      "filled": "as-reported",
+      "filled_by": "data",
+      "since": "v28",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
       "name": "meridian.v1.Bar.meta",
       "type": "message ObservationMeta",
       "empty": "never unset",
@@ -48076,6 +48097,41 @@
       "store": "sidecar"
     },
     {
+      "name": "meridian.v1.DatasetDeclaration.price_source_class",
+      "type": "enum PriceSourceClass",
+      "allowed": [
+        {
+          "value": "PRICE_SOURCE_CLASS_UNSPECIFIED",
+          "meaning": "not stated, as in every catalogue before the amendment"
+        },
+        {
+          "value": "PRICE_SOURCE_CLASS_TRADED",
+          "meaning": "prices of trades done: a venue's last, its close or its settlement"
+        },
+        {
+          "value": "PRICE_SOURCE_CLASS_FIRM_QUOTE",
+          "meaning": "prices someone stands ready to deal at: a venue's or a dealer's executable bid and ask, and the mid between them"
+        },
+        {
+          "value": "PRICE_SOURCE_CLASS_COMPOSITE",
+          "meaning": "an aggregate of several contributors' prices by the vendor's stated method, as Pyth's aggregate of its publishers is"
+        },
+        {
+          "value": "PRICE_SOURCE_CLASS_EVALUATED",
+          "meaning": "a pricing service's or a model's evaluation, not a price dealt or offered, as an evaluated bond price or a vendor's model price is"
+        }
+      ],
+      "empty": "unspecified: not stated",
+      "intent": "says what class of source a dataset's prices come from (W10.1; amended 2026-10-31, ruling 906)",
+      "meaning": "one class for the dataset, beside its vendor, its aggregator and its terms' underlying source; each price keeps its real kind -- bid, mid, ask, close, last -- and the class says what stands behind it: Pyth's is a mid of class composite, an evaluated bond price a bid, mid and ask of class evaluated; shown on the Data sources page and answered by dashboard__list_datasets",
+      "not_meaning": "a price kind, of which none is added; a quality state; an order a default read takes, which the deployment's source priority sets (W10.2)",
+      "filled": "as-reported",
+      "filled_by": "data",
+      "since": "v28",
+      "stability": "preview",
+      "store": "sidecar"
+    },
+    {
       "name": "meridian.v1.DatasetLicence.terms_version",
       "type": "text",
       "empty": "empty: not stated",
@@ -48186,11 +48242,18 @@
       "type": "text",
       "empty": "empty: none behind the vendor",
       "intent": "names the licensing source behind the vendor, where one is",
-      "meaning": "the source whose terms the vendor passes on, as the vendor names it, so counts can be kept per source as well as per dataset (ruling 387)",
-      "not_meaning": "the vendor or the aggregator, which the catalogue names",
+      "meaning": "the source whose terms the vendor passes on, as the vendor names it, so counts can be kept per source as well as per dataset (ruling 387); where the vendor serves an aggregate, whose aggregate it is, in words -- Pyth's aggregate of its publishers. A data plugin declares it in its catalogue's default terms, through the SDK's typed declaration from contract 28 as amended 2026-10-31 (ruling 896); the deployment's licence keeps it unless the deployment admin changes it (W10.1); shown on the Data sources page and answered by dashboard__list_datasets",
+      "not_meaning": "the vendor or the aggregator, which the catalogue names; the class of source, which DatasetDeclaration.price_source_class says",
       "filled": "entered",
       "filled_by": "dashboard",
       "since": "v27",
+      "changes": [
+        {
+          "version": "v28",
+          "kind": "clarified",
+          "what": "amended 2026-10-31 (ruling 896): a data plugin declares it through the SDK's typed declaration, naming whose aggregate where the vendor serves one; the Data sources page shows it"
+        }
+      ],
       "stability": "preview",
       "store": "sidecar"
     },

@@ -2263,8 +2263,12 @@ async fn the_data_sources_tools_are_a_deployment_admins_noted_stamped_and_stale_
                 licence_default: Some(DatasetLicence {
                     kept: true,
                     retention_days: 30,
+                    // Contract 28, amended 2026-10-31 (ruling 896).
+                    underlying_source: "Coinbase Exchange's order book".into(),
                     ..Default::default()
                 }),
+                // Ruling 906.
+                price_source_class: meridian_pb::v1::PriceSourceClass::Traded as i32,
                 ..Default::default()
             }),
             unconverted_count: 2,
@@ -2393,6 +2397,18 @@ async fn the_data_sources_tools_are_a_deployment_admins_noted_stamped_and_stale_
     assert_eq!(dataset["licence"]["set_by_the_deployment"], false);
     assert_eq!(dataset["licence"]["retention_days"], 30);
     assert_eq!(dataset["catalogue_entry"]["modes"][0], "pull");
+    // Contract 28, amended 2026-10-31 (rulings 896, 906): the class of
+    // source by its word, and the source behind the vendor on the licence
+    // enforced and the catalogue's default terms.
+    assert_eq!(dataset["catalogue_entry"]["price_source_class"], "traded");
+    assert_eq!(
+        dataset["licence"]["underlying_source"],
+        "Coinbase Exchange's order book"
+    );
+    assert_eq!(
+        dataset["catalogue_entry"]["licence_default"]["underlying_source"],
+        "Coinbase Exchange's order book"
+    );
     assert!(dataset["entitlements"][0]["note"]
         .as_str()
         .unwrap()

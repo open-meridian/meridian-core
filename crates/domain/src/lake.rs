@@ -115,11 +115,13 @@ pub const DATA_TYPES: [&str; 16] = [
 /// From contract v28 statistics and listed series too, as any dataset's rows.
 pub const PRIORITISED: [&str; 7] = [PRICE, BAR, TRADE, QUOTE, RATE, STATISTIC, LISTED_SERIES];
 
-const PRICE_FIELDS: [&str; 4] = [
+const PRICE_FIELDS: [&str; 5] = [
     "meridian.v1.Price.meta",
     "meridian.v1.Price.kind",
     "meridian.v1.Price.price",
     "meridian.v1.Price.basis",
+    // Contract 28, amended 2026-10-31 (ruling 895).
+    "meridian.v1.Price.confidence",
 ];
 const BAR_FIELDS: [&str; 8] = [
     "meridian.v1.Bar.meta",
@@ -329,6 +331,9 @@ pub fn strip_price(
     }
     if gone(PRICE_FIELDS[3]) {
         price.basis = 0;
+    }
+    if gone(PRICE_FIELDS[4]) {
+        price.confidence = None;
     }
     removed
 }
@@ -1115,6 +1120,15 @@ pub fn catalogue_refused(catalogue: &Catalogue, roles: &[String]) -> Option<Stri
         if dataset.declared_delay_ns < 0 {
             return Some(format!(
                 "{at}.declared_delay_ns is the delay the dataset is served at, 0 or more"
+            ));
+        }
+        // Contract 28, amended 2026-10-31 (W10.1; ruling 906): the class
+        // of source its prices come from, unspecified for not stated.
+        if meridian_pb::v1::PriceSourceClass::try_from(dataset.price_source_class).is_err() {
+            return Some(format!(
+                "{at}.price_source_class is {}: traded, firm_quote, composite or evaluated, or \
+                 unspecified for not stated",
+                dataset.price_source_class
             ));
         }
         if !DATASET_DECLARATION_MODES_COUNT.admits(dataset.modes.len()) {

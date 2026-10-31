@@ -13647,6 +13647,13 @@ pub struct Price {
     pub price: ::core::option::Option<Money>,
     #[prost(enumeration = "PriceBasis", tag = "4")]
     pub basis: i32,
+    /// The source's stated interval around the price, plus or minus, in the
+    /// price's own unit (W10.4; contract 28, amended 2026-10-31, ruling 895):
+    /// Pyth's confidence beside its aggregate price. Unset where the source
+    /// states none; never negative. A dataset filling it declares
+    /// meridian.v1.Price.confidence among its data types.
+    #[prost(message, optional, tag = "5")]
+    pub confidence: ::core::option::Option<::meridian_pb::v1::Decimal>,
 }
 /// Open, high, low and close over an interval, the envelope's valid time: a
 /// daily bar names its business date. Empty `source.venue_id` is the

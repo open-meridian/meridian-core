@@ -200,6 +200,7 @@ fn close(instance: &str, row_key: &str, subject: &str, date: &str, amount: &str)
         kind: PriceKind::Close as i32,
         price: money(amount, "USD", ""),
         basis: PriceBasis::PerUnit as i32,
+        confidence: None,
     }
 }
 
@@ -376,6 +377,69 @@ async fn a_close_is_recorded_heard_restated_and_read_as_of_before_its_restatemen
         (1, "62000.5".to_string())
     );
     assert_eq!(now.datasets[0].dataset, "coinbase-1:daily");
+}
+
+/// Contract 28, amended 2026-10-31 (W10.4; ruling 895): a price's
+/// confidence is recorded as the source states it and read back; another
+/// under the same row key is a restatement; one below zero is refused
+/// naming it; and a reader entitled to some fields reads it only where it
+/// is named.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_prices_confidence_is_recorded_restated_refused_below_zero_and_cut_by_field() {
+    let h = harness();
+    let with = |confidence: &str| Price {
+        confidence: decimal(confidence),
+        ..close(
+            "coinbase-1",
+            "BTC-USD:2026-10-07",
+            BTC,
+            "2026-10-07",
+            "62000.5",
+        )
+    };
+    let first = record(&h, "coinbase-1", vec![with("18.42")], "").unwrap();
+    assert_eq!((first.recorded, first.restated, first.unchanged), (1, 0, 0));
+    let same = record(&h, "coinbase-1", vec![with("18.420")], "").unwrap();
+    assert_eq!(same.unchanged, 1, "the same interval at another scale");
+    h.clock.advance(1_000);
+    let restated = record(&h, "coinbase-1", vec![with("20")], "").unwrap();
+    assert_eq!(restated.restated, 1, "a changed interval is a restatement");
+    let read_back = read(
+        &h,
+        "reporting-1",
+        &[BTC],
+        "2026-10-07",
+        SourceChoice::default(),
+        0,
+    );
+    let Observation::Price(latest) = &read_back.rows[0] else {
+        panic!()
+    };
+    assert_eq!(
+        meridian_domain::exact::Exact::from_wire(latest.confidence.as_ref().unwrap())
+            .unwrap()
+            .to_string(),
+        "20"
+    );
+    let refused = record(&h, "coinbase-1", vec![with("-0.01")], "").unwrap_err();
+    assert!(refused.contains("prices[0].confidence"), "{refused}");
+
+    // A reader entitled to the price alone reads no confidence.
+    let mut kept = Price {
+        confidence: decimal("20"),
+        ..close("coinbase-1", "k", BTC, "2026-10-07", "1")
+    };
+    let allowed: std::collections::BTreeSet<String> = ["meridian.v1.Price.price".to_string()]
+        .into_iter()
+        .collect();
+    let removed = meridian_domain::lake::strip_price(&mut kept, &allowed);
+    assert!(removed.contains(&"meridian.v1.Price.confidence"));
+    assert!(kept.confidence.is_none());
+    assert_eq!(
+        meridian_domain::lake::type_of_entry("meridian.v1.Price.confidence"),
+        Some("meridian.v1.Price"),
+        "a dataset may declare it among its data types"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1519,6 +1583,7 @@ async fn the_latest_is_chosen_per_asset_for_prices_and_quotes() {
         kind: PriceKind::Last as i32,
         price: money,
         basis: PriceBasis::PerUnit as i32,
+        confidence: None,
     };
     record(
         &h,

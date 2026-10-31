@@ -1155,6 +1155,18 @@ impl Lake {
                         "{at}.price is required, or its value as reported in unconverted"
                     ));
                 }
+                // Contract 28, amended 2026-10-31 (W10.4; ruling 895): the
+                // source's interval around the price, plus or minus.
+                if let Some(confidence) = &price.confidence {
+                    let exact = meridian_domain::exact::Exact::from_wire(confidence)
+                        .map_err(|out| format!("{at}.confidence {out}"))?;
+                    if exact < meridian_domain::exact::Exact::ZERO {
+                        return Err(format!(
+                            "{at}.confidence is below zero: the source's interval around the \
+                             price, plus or minus, is never negative"
+                        ));
+                    }
+                }
             }
             // Each Money names its cash instrument (decisions/023 as amended).
             let mut instruments = BTreeSet::new();

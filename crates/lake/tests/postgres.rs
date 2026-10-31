@@ -62,6 +62,7 @@ fn close(dataset: &str, row_key: &str, subject: &str, date: &str, amount: i64) -
             instrument_id: "LCL-USD".into(),
         }),
         basis: 1,
+        confidence: None,
     })
 }
 

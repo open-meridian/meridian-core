@@ -5,7 +5,10 @@
 //! fits one screen at a desk and on a phone (the one-screen rule):
 //!
 //! - **Datasets**: each dataset a launched data plugin's catalogue declares, with
-//!   who originated and carried it, what it serves, the licence enforced --
+//!   who originated and carried it and, from contract 28 as amended
+//!   2026-10-31 (rulings 896 and 906), the source behind the vendor or whose
+//!   aggregate it serves and the class of source its prices come from, what
+//!   it serves, the licence enforced --
 //!   the deployment's, or the catalogue's default until one is set -- the
 //!   plugins entitled to it, and the lake's counts of values left
 //!   unconverted and of identifiers and venues its instance reported
@@ -250,6 +253,18 @@ pub fn kind_of(word: &str) -> Option<PriceKind> {
     }
 }
 
+/// A dataset's class of source, as the page says it (contract 28, amended
+/// 2026-10-31, ruling 906); not stated where its catalogue says none.
+fn class_said(class: i32) -> &'static str {
+    match meridian_pb::v1::PriceSourceClass::try_from(class) {
+        Ok(meridian_pb::v1::PriceSourceClass::Traded) => "Traded",
+        Ok(meridian_pb::v1::PriceSourceClass::FirmQuote) => "Firm quote",
+        Ok(meridian_pb::v1::PriceSourceClass::Composite) => "Composite",
+        Ok(meridian_pb::v1::PriceSourceClass::Evaluated) => "Evaluated",
+        _ => "Not stated",
+    }
+}
+
 /// The licence in a few words: kept and for how long, or served not kept.
 fn licence_said(licence: &DatasetLicence) -> String {
     if !licence.kept {
@@ -311,6 +326,16 @@ fn datasets_tab(rows: &[Row], records: &AccessRecords, token: &str) -> (String, 
             } else {
                 format!("{vendor} via {aggregator}")
             };
+            // Contract 28, amended 2026-10-31 (W10.1; ruling 896): the
+            // source behind the vendor, or whose aggregate it serves, from
+            // the licence enforced, which keeps the declared one.
+            let carried = if licence.underlying_source.is_empty() {
+                carried
+            } else {
+                format!("{carried} \u{b7} {}", licence.underlying_source)
+            };
+            // Ruling 906: the class of source its prices come from.
+            let class = class_said(declaration.price_source_class);
             let serves: Vec<&str> = lake::types_served(&declaration)
                 .into_iter()
                 .map(type_word)
@@ -341,6 +366,7 @@ fn datasets_tab(rows: &[Row], records: &AccessRecords, token: &str) -> (String, 
                 "<tr data-id=\"{id}\"><td title=\"{id}\"><button type=\"button\" class=\"link\" \
                  data-dialog-open=\"licence\" data-title=\"Licence {id}\" data-fill=\"{fill}\">{id}</button></td>\
                  <td class=\"wide\" title=\"{carried}\">{carried}</td>\
+                 <td class=\"wide\" title=\"{class}\" data-source-class>{class}</td>\
                  <td class=\"wide\" title=\"{serves}; {modes}\">{serves}</td>\
                  <td title=\"{licence_said}, {source}\">{licence_said}{badge}</td>\
                  <td class=\"wide\" title=\"{entitled_all}\" data-entitled=\"{n}\">{n}</td>\
@@ -355,6 +381,7 @@ fn datasets_tab(rows: &[Row], records: &AccessRecords, token: &str) -> (String, 
                 fill = escape(&fill.to_string()),
                 entitle = escape(&entitle.to_string()),
                 carried = escape(&crate::mcp::others_words(&carried)),
+                class = class,
                 serves = escape(&serves.join(", ")),
                 modes = escape(&modes.join(", ")),
                 licence_said = escape(&licence_said(licence)),
@@ -384,7 +411,8 @@ fn datasets_tab(rows: &[Row], records: &AccessRecords, token: &str) -> (String, 
     } else {
         format!(
             "<om-pager search=\"Search datasets\"><table class=\"list one-line datasets\" data-datasets=\"{n}\"><thead><tr>\
-             <th>Dataset</th><th class=\"wide\">Vendor</th><th class=\"wide\">Serves</th>\
+             <th>Dataset</th><th class=\"wide\" title=\"Vendor, and the source behind it\">Vendor</th>\
+             <th class=\"wide class\" title=\"Class of source\">Class</th><th class=\"wide\">Serves</th>\
              <th>Licence</th><th class=\"wide count\" title=\"Plugins entitled\">Entitled</th>\
              <th class=\"wide num\" title=\"Values left unconverted\">Unconverted</th>\
              <th class=\"wide num\" title=\"Identifiers and venues reported missing\">Misses</th>\
@@ -785,6 +813,51 @@ mod tests {
         for (id, _) in TABS {
             assert!(body.contains(&format!("id=\"{id}\"")), "{id}");
         }
+    }
+
+    /// Contract 28, amended 2026-10-31 (rulings 896, 906): the class of
+    /// source in its own cell, and whose aggregate beside the vendor, read
+    /// whole in the cell's title.
+    #[test]
+    fn a_dataset_shows_its_class_of_source_and_whose_aggregate() {
+        let mut reply = listed(false);
+        let declaration = reply.datasets[0].declaration.as_mut().unwrap();
+        declaration.price_source_class = meridian_pb::v1::PriceSourceClass::Composite as i32;
+        declaration
+            .licence_default
+            .as_mut()
+            .unwrap()
+            .underlying_source = "Pyth's aggregate of its publishers".into();
+        let body = page(
+            &Ok(reply),
+            &Ok(ListSourcePrioritiesReply::default()),
+            &AccessRecords::default(),
+            "<t>",
+            "",
+            &[],
+            &(String::new(), String::new()),
+        );
+        assert!(
+            body.contains("title=\"Composite\" data-source-class>Composite</td>"),
+            "{body}"
+        );
+        assert!(
+            body.contains("Coinbase \u{b7} Pyth&#39;s aggregate of its publishers")
+                || body.contains("Coinbase \u{b7} Pyth's aggregate of its publishers"),
+            "{body}"
+        );
+        // Not stated, as every catalogue before the amendment.
+        let body = page(
+            &Ok(listed(false)),
+            &Ok(ListSourcePrioritiesReply::default()),
+            &AccessRecords::default(),
+            "<t>",
+            "",
+            &[],
+            &(String::new(), String::new()),
+        );
+        assert!(body.contains("data-source-class>Not stated</td>"), "{body}");
+        assert!(!body.contains("Coinbase \u{b7}"), "{body}");
     }
 
     #[test]
