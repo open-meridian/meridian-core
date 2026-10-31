@@ -22064,7 +22064,7 @@
         }
       },
       "unit": "a fraction of original face",
-      "empty": "unset on a fill in a record that is no pool or tranche, or on a TBA's done at the latest; a pool's or a tranche's fill is refused unset (986) until the book reads the lake's latest Factor row (Track C), from when unset is the latest published Factor row",
+      "empty": "unset on a fill in a record that is no pool or tranche, or on a TBA's done at the latest; on a pool's or a tranche's fill, unset is the latest Factor row the lake holds for its settlement month, which the book reads (986, amended at core stage C), a fill no published row answers refused naming it",
       "intent": "states the factor a pool, tranche or TBA trade was done at (6730(d)(2)(B); FIX Factor, 228)",
       "meaning": "an exact decimal: the fill's cash is original face times it times price over 100 (986); refused on a fill in any record but a pool, a tranche or a TBA",
       "not_meaning": "a factor the book computed",
@@ -22088,7 +22088,7 @@
         }
       },
       "unit": "a fraction of original face",
-      "empty": "unset on a fill in a record that is no pool or tranche, or on a TBA's done at the latest; a pool's or a tranche's fill is refused unset (986) until the book reads the lake's latest Factor row (Track C), from when unset is the latest published Factor row",
+      "empty": "unset on a fill in a record that is no pool or tranche, or on a TBA's done at the latest; on a pool's or a tranche's fill, unset is the latest Factor row the lake holds for its settlement month, which the book reads (986, amended at core stage C), a fill no published row answers refused naming it",
       "intent": "states the factor a pool, tranche or TBA trade was done at (6730(d)(2)(B); FIX Factor, 228)",
       "meaning": "an exact decimal: the fill's cash is original face times it times price over 100 (986); refused on a fill in any record but a pool, a tranche or a TBA",
       "not_meaning": "a factor the book computed",

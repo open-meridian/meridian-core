@@ -190,7 +190,7 @@ platform.lake.query.list-datasets	query	reporting,portfolio,compliance,signal,em
 platform.lake.query.list-derived-series	query	signal,portfolio,reporting,compliance,dashboard	lake
 platform.lake.query.list-execution-costs	query	reporting,portfolio,compliance,signal,oms,ems,operations,dashboard	lake
 platform.lake.query.list-expirations	query	signal,portfolio,oms,ems	lake
-platform.lake.query.list-factors	query	servicing,portfolio,reporting,signal,operations,analytics,dashboard	lake
+platform.lake.query.list-factors	query	servicing,portfolio,reporting,signal,operations,analytics,dashboard,bor	lake
 platform.lake.query.list-filings	query	signal,portfolio,reporting,dashboard,analytics	lake
 platform.lake.query.list-holdings	query	signal,portfolio,reporting,dashboard	lake
 platform.lake.query.list-outcomes	query	reporting,portfolio,compliance,signal,operations,analytics	lake
