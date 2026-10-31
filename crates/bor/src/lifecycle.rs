@@ -80,7 +80,10 @@ fn type_of(ctx: &Context, instrument: &str) -> InstrumentType {
 
 fn date_or_refused(path: &str, text: &str, words: &str) -> Result<()> {
     if meridian_domain::date::Date::parse(text).is_err() {
-        return Err(malformed(&[path], format!("{text:?} is no plain date: {words}")));
+        return Err(malformed(
+            &[path],
+            format!("{text:?} is no plain date: {words}"),
+        ));
     }
     Ok(())
 }
@@ -116,20 +119,17 @@ fn checked(book: &Book, ctx: &Context, event: &LifecycleEvent, at: &str) -> Resu
     // Contract v29 (W9.16): a fixed-income kind on a record that is no debt
     // record, or an option's or a future's kind on a debt record.
     if debt_kind(event_kind) != debt {
-        if debt || debt_kind(event_kind) {
-            return Err(malformed(
-                &[&format!("{at}kind")],
-                if debt {
-                    "a debt record takes a coupon, a redemption, a paydown, an accretion, a TBA \
-                     allocation, a strip or a reconstitution, never an option's or a future's \
-                     event"
-                } else {
-                    "a coupon, a redemption, a paydown, an accretion, a TBA allocation, a strip \
-                     or a reconstitution is a debt record's (bond, mbs_pool, tba, cmo_tranche, \
-                     certificate_of_deposit)"
-                },
-            ));
-        }
+        return Err(malformed(
+            &[&format!("{at}kind")],
+            if debt {
+                "a debt record takes a coupon, a redemption, a paydown, an accretion, a TBA \
+                 allocation, a strip or a reconstitution, never an option's or a future's event"
+            } else {
+                "a coupon, a redemption, a paydown, an accretion, a TBA allocation, a strip or a \
+                 reconstitution is a debt record's (bond, mbs_pool, tba, cmo_tranche, \
+                 certificate_of_deposit)"
+            },
+        ));
     }
     if !debt && !option && kind != InstrumentType::Future {
         return Err(malformed(
@@ -223,7 +223,11 @@ fn debt_checked(
     at: &str,
 ) -> Result<()> {
     if !event.record_date.is_empty() {
-        date_or_refused(&format!("{at}record_date"), &event.record_date, "YYYY-MM-DD")?;
+        date_or_refused(
+            &format!("{at}record_date"),
+            &event.record_date,
+            "YYYY-MM-DD",
+        )?;
     }
     let redemption = RedemptionEventKind::try_from(event.redemption_kind)
         .unwrap_or(RedemptionEventKind::Unspecified);
@@ -483,7 +487,8 @@ pub(crate) fn share(field: &str, cost: Exact, part: Exact, whole: Exact) -> Resu
     }
     let product = crate::orders::multiply(field, cost, part)?;
     let scale = cost.scale().max(2);
-    let too_big = || StoreError::Invalid(format!("{field}: {cost} × {part} ÷ {whole} does not fit"));
+    let too_big =
+        || StoreError::Invalid(format!("{field}: {cost} × {part} ÷ {whole} does not fit"));
     // product.int × 10^(scale + whole.scale) ÷ (whole.int × 10^product.scale)
     let up = |value: i128, places: u32| -> Result<i128> {
         10i128
@@ -663,22 +668,20 @@ pub(crate) fn purchased_accrued(book: &Book, event: &LifecycleEvent) -> Result<E
             .map(|held| (held.order.side, held.order.instrument_id.clone()))
     };
     let mut paid = Exact::ZERO;
-    let mut count = |allocation: &meridian_domain::v1::Allocation,
-                     side: i32,
-                     instrument: &str|
-     -> Result<()> {
-        if side != meridian_domain::v1::Side::Buy as i32
-            || !crate::became::same(instrument, &event.instrument_id)
-            || allocation.intended_settlement_date.as_str() < event.period_start_date.as_str()
-            || allocation.intended_settlement_date.as_str() >= event.period_end_date.as_str()
-        {
-            return Ok(());
-        }
-        if let Some(accrued) = &allocation.accrued_interest {
-            paid = numbers::add("accrued", paid, numbers::amount("accrued", accrued)?)?;
-        }
-        Ok(())
-    };
+    let mut count =
+        |allocation: &meridian_domain::v1::Allocation, side: i32, instrument: &str| -> Result<()> {
+            if side != meridian_domain::v1::Side::Buy as i32
+                || !crate::became::same(instrument, &event.instrument_id)
+                || allocation.intended_settlement_date.as_str() < event.period_start_date.as_str()
+                || allocation.intended_settlement_date.as_str() >= event.period_end_date.as_str()
+            {
+                return Ok(());
+            }
+            if let Some(accrued) = &allocation.accrued_interest {
+                paid = numbers::add("accrued", paid, numbers::amount("accrued", accrued)?)?;
+            }
+            Ok(())
+        };
     for held in ledger.bookings.values() {
         if held.state == meridian_domain::v1::BookingState::Cancelled {
             continue;
@@ -803,7 +806,8 @@ fn debt_moved(
             let cash = match &event.cash {
                 Some(cash) => (cash.clone(), numbers::amount("cash", cash)?),
                 None => {
-                    let price = numbers::required("redemption_price", event.redemption_price.as_ref())?;
+                    let price =
+                        numbers::required("redemption_price", event.redemption_price.as_ref())?;
                     (
                         template(None),
                         trimmed(crate::orders::multiply(
@@ -815,9 +819,9 @@ fn debt_moved(
                 }
             };
             let earlier = moved.lines.clone();
-            moved
-                .lines
-                .extend(cash_moved(book, ctx, &cash.0, cash.1, event, method, &earlier)?);
+            moved.lines.extend(cash_moved(
+                book, ctx, &cash.0, cash.1, event, method, &earlier,
+            )?);
         }
         LifecycleEventKind::Paydown => {
             // 680: the lots stay in original face; each lot's cost relieved

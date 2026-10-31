@@ -3899,9 +3899,10 @@ fn factor_holds(
         if factor.is_zero() || factor.is_negative() {
             return Err(malformed(&["factor_used"], "a factor is above zero"));
         }
-        let tba = ctx.records.get(instrument).is_some_and(|r| {
-            r.instrument_type == meridian_domain::v1::InstrumentType::Tba as i32
-        });
+        let tba = ctx
+            .records
+            .get(instrument)
+            .is_some_and(|r| r.instrument_type == meridian_domain::v1::InstrumentType::Tba as i32);
         if !ctx.is_pooled(instrument) && !tba {
             return Err(malformed(
                 &["factor_used"],

@@ -21,7 +21,9 @@ fn bond_order(quantity: &str) -> ProposeOrderRequest {
 }
 
 fn named(detail: &str) -> Vec<String> {
-    status_of(detail).map(|(_, fields)| fields).unwrap_or_default()
+    status_of(detail)
+        .map(|(_, fields)| fields)
+        .unwrap_or_default()
 }
 
 fn cash_of(w: &Wired) -> String {
@@ -153,7 +155,10 @@ async fn a_bond_fill_is_priced_per_100_of_face_and_keeps_its_reporting_fields() 
     assert_eq!(execution.capacity, Capacity::Principal as i32);
     assert_eq!(execution.contra_party_type, ContraPartyType::Dealer as i32);
     assert_eq!(execution.trade_time_precision, TimePrecision::Second as i32);
-    assert_eq!(execution.special_price_reason, "priced away from the market");
+    assert_eq!(
+        execution.special_price_reason,
+        "priced away from the market"
+    );
     // 50,000 of face at 98.375 per 100 is 49,187.50 (987).
     assert_eq!(cash_of(&w), "-49187.50000");
 }
@@ -286,7 +291,10 @@ async fn accrued_interest_is_its_own_cash_line_and_the_coupon_returns_it_before_
     .booking
     .unwrap();
     let kept = &booked.allocations[0];
-    assert_eq!(read(&kept.accrued_interest.as_ref().unwrap().amount), "531.25");
+    assert_eq!(
+        read(&kept.accrued_interest.as_ref().unwrap().amount),
+        "531.25"
+    );
     assert_eq!(kept.capacity, Capacity::RisklessPrincipal as i32);
     assert!(kept.prevailing_market_price.is_some());
     // 988: settlement is principal plus accrued, the accrued its own line.

@@ -143,13 +143,7 @@ fn owner(store: &dyn Store, record: Record, id: &str, named: &str) -> Result<Str
 /// the lock: a series' multiplier (559) and from contract v29 a debt
 /// record's, whose fills are priced per 100 of face (986, 987), so a
 /// booking's executions gross as their fills did.
-fn order_records(
-    bus: &Bus,
-    store: &dyn Store,
-    account: &str,
-    order_id: &str,
-    ctx: &mut Context,
-) {
+fn order_records(bus: &Bus, store: &dyn Store, account: &str, order_id: &str, ctx: &mut Context) {
     let Ok(book) = store.book(account) else {
         return;
     };

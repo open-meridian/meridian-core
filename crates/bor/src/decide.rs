@@ -166,7 +166,9 @@ impl Context {
 
     /// Whether the instrument is a debt record (contract v29).
     pub fn is_debt(&self, instrument: &str) -> bool {
-        self.records.get(instrument).is_some_and(|r| r.debt.is_some())
+        self.records
+            .get(instrument)
+            .is_some_and(|r| r.debt.is_some())
     }
 
     /// Whether the instrument is a pool or a tranche, whose face is

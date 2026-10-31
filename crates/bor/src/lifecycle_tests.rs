@@ -643,7 +643,10 @@ async fn a_coupon_moves_cash_a_partial_call_reduces_lots_and_an_accretion_moves_
     .await
     .unwrap();
     assert_eq!(accretion.state, LifecycleEventState::Booked as i32);
-    assert_eq!(costs(&held(&store, CMOZ, HoldingSide::Long)), vec![("500000".to_string(), "480000.00".to_string())]);
+    assert_eq!(
+        costs(&held(&store, CMOZ, HoldingSide::Long)),
+        vec![("500000".to_string(), "480000.00".to_string())]
+    );
     assert_eq!(quantity(&held(&store, USD, HoldingSide::Long)), "61062.50");
 }
 

@@ -721,9 +721,7 @@ impl Book {
             let reference = refs[&key].clone();
             let sale = sales
                 .iter()
-                .find(|(instrument, _, _, _)| {
-                    crate::became::same(instrument, &line.instrument_id)
-                })
+                .find(|(instrument, _, _, _)| crate::became::same(instrument, &line.instrument_id))
                 .map(|(_, price, date, factored)| (price, date.as_str(), *factored));
             let quantity = numbers::required(
                 &format!("the line on {}'s quantity", line.instrument_id),
@@ -1497,7 +1495,9 @@ fn record_relief(
         relieved_by: Some(reference.clone()),
         quantity: numbers::wire(relieved),
         proceeds: proceeds(relieved)?,
-        trade_date: sale.map(|(_, date, _)| date.to_string()).unwrap_or_default(),
+        trade_date: sale
+            .map(|(_, date, _)| date.to_string())
+            .unwrap_or_default(),
     });
     Ok(())
 }
