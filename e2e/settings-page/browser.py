@@ -973,6 +973,35 @@ def the_data_sources_page(browser, prefix):
         ctx.close()
 
 
+def the_datasets_class_and_whose_aggregate(browser, prefix):
+    """Contract 28, amended 2026-10-31 (rulings 896, 906): the Datasets tab
+    says each dataset's class of source beside its prices and the source
+    behind its vendor, each cell read whole in its title where it is cut.
+    At 375, 582 and 1280 wide, light and dark, no sideways scroll, one
+    screen."""
+    for scheme in ("light", "dark"):
+        for size, width, height in V24_SIZES:
+            ctx = context(browser, width, height, scheme=scheme)
+            page = ctx.new_page()
+            errors = []
+            page.on("pageerror", lambda e: errors.append(str(e)))
+            page.goto(f"{DATA_SOURCES}#datasets")
+            settled(page)
+            measured = page.evaluate(MEASURE)
+            check(measured["wide"] <= 0, f"at {size} {scheme} the Datasets tab scrolls sideways by {measured['wide']}px")
+            problems = page.evaluate(FIT)
+            check(not problems, f"at {size} {scheme} the Datasets tab fits one screen"
+                  f"{': ' + '; '.join(problems) if problems else ''}")
+            cut = page.evaluate(CUT_UNTITLED, "#datasets table.datasets")
+            check(not cut, f"at {size} {scheme} no Datasets cell is cut off but one whose title holds it whole: {cut}")
+            html = page.inner_html("#datasets")
+            check("Price (firm quote), Bar" in html and "consolidated by the aggregator" in html,
+                  f"at {size} {scheme} a dataset's class of source and underlying source are drawn")
+            page.screenshot(path=os.path.join(OUT, f"{prefix}-data-sources-class-{size}-{scheme}.png"))
+            check(not errors, f"the Datasets tab at {size} {scheme} ran without a script error: {errors}")
+            ctx.close()
+
+
 def the_data_use_and_the_professional_test(browser, prefix):
     """Contract v28 (W10.1, W10.13; ruling 754): the Data sources page's Use
     tab -- a line a dataset, or a source, against its meters, the persons
@@ -1897,6 +1926,7 @@ with sync_playwright() as playwright:
     the_access_editor_has_a_row_per_role(browser, prefix)
     the_raw_records_and_the_holds(browser, prefix)
     the_data_sources_page(browser, prefix)
+    the_datasets_class_and_whose_aggregate(browser, prefix)
     the_data_use_and_the_professional_test(browser, prefix)
     the_accounts_tab_holds_the_book(browser, prefix)
     the_service_accounts_tab_and_runs_as(browser, prefix)

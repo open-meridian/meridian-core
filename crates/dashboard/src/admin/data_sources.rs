@@ -253,15 +253,16 @@ pub fn kind_of(word: &str) -> Option<PriceKind> {
     }
 }
 
-/// A dataset's class of source, as the page says it (contract 28, amended
-/// 2026-10-31, ruling 906); not stated where its catalogue says none.
-fn class_said(class: i32) -> &'static str {
+/// A dataset's class of source, as the page says it beside its prices
+/// (contract 28, amended 2026-10-31, ruling 906); none where its catalogue
+/// states none.
+fn class_said(class: i32) -> Option<&'static str> {
     match meridian_pb::v1::PriceSourceClass::try_from(class) {
-        Ok(meridian_pb::v1::PriceSourceClass::Traded) => "Traded",
-        Ok(meridian_pb::v1::PriceSourceClass::FirmQuote) => "Firm quote",
-        Ok(meridian_pb::v1::PriceSourceClass::Composite) => "Composite",
-        Ok(meridian_pb::v1::PriceSourceClass::Evaluated) => "Evaluated",
-        _ => "Not stated",
+        Ok(meridian_pb::v1::PriceSourceClass::Traded) => Some("traded"),
+        Ok(meridian_pb::v1::PriceSourceClass::FirmQuote) => Some("firm quote"),
+        Ok(meridian_pb::v1::PriceSourceClass::Composite) => Some("composite"),
+        Ok(meridian_pb::v1::PriceSourceClass::Evaluated) => Some("evaluated"),
+        _ => None,
     }
 }
 
@@ -334,11 +335,17 @@ fn datasets_tab(rows: &[Row], records: &AccessRecords, token: &str) -> (String, 
             } else {
                 format!("{carried} \u{b7} {}", licence.underlying_source)
             };
-            // Ruling 906: the class of source its prices come from.
+            // Ruling 906: the class of source its prices come from, said
+            // beside the prices it qualifies.
             let class = class_said(declaration.price_source_class);
-            let serves: Vec<&str> = lake::types_served(&declaration)
+            let serves: Vec<String> = lake::types_served(&declaration)
                 .into_iter()
-                .map(type_word)
+                .map(|data_type| match class {
+                    Some(class) if data_type == lake::PRICE => {
+                        format!("{} ({class})", type_word(data_type))
+                    }
+                    _ => type_word(data_type).to_string(),
+                })
                 .collect();
             let modes: Vec<&str> = declaration
                 .modes
@@ -366,7 +373,6 @@ fn datasets_tab(rows: &[Row], records: &AccessRecords, token: &str) -> (String, 
                 "<tr data-id=\"{id}\"><td title=\"{id}\"><button type=\"button\" class=\"link\" \
                  data-dialog-open=\"licence\" data-title=\"Licence {id}\" data-fill=\"{fill}\">{id}</button></td>\
                  <td class=\"wide\" title=\"{carried}\">{carried}</td>\
-                 <td class=\"wide\" title=\"{class}\" data-source-class>{class}</td>\
                  <td class=\"wide\" title=\"{serves}; {modes}\">{serves}</td>\
                  <td title=\"{licence_said}, {source}\">{licence_said}{badge}</td>\
                  <td class=\"wide\" title=\"{entitled_all}\" data-entitled=\"{n}\">{n}</td>\
@@ -381,7 +387,6 @@ fn datasets_tab(rows: &[Row], records: &AccessRecords, token: &str) -> (String, 
                 fill = escape(&fill.to_string()),
                 entitle = escape(&entitle.to_string()),
                 carried = escape(&crate::mcp::others_words(&carried)),
-                class = class,
                 serves = escape(&serves.join(", ")),
                 modes = escape(&modes.join(", ")),
                 licence_said = escape(&licence_said(licence)),
@@ -412,7 +417,7 @@ fn datasets_tab(rows: &[Row], records: &AccessRecords, token: &str) -> (String, 
         format!(
             "<om-pager search=\"Search datasets\"><table class=\"list one-line datasets\" data-datasets=\"{n}\"><thead><tr>\
              <th>Dataset</th><th class=\"wide\" title=\"Vendor, and the source behind it\">Vendor</th>\
-             <th class=\"wide class\" title=\"Class of source\">Class</th><th class=\"wide\">Serves</th>\
+             <th class=\"wide\" title=\"What it serves, its prices' class of source beside them\">Serves</th>\
              <th>Licence</th><th class=\"wide count\" title=\"Plugins entitled\">Entitled</th>\
              <th class=\"wide num\" title=\"Values left unconverted\">Unconverted</th>\
              <th class=\"wide num\" title=\"Identifiers and venues reported missing\">Misses</th>\
@@ -816,8 +821,8 @@ mod tests {
     }
 
     /// Contract 28, amended 2026-10-31 (rulings 896, 906): the class of
-    /// source in its own cell, and whose aggregate beside the vendor, read
-    /// whole in the cell's title.
+    /// source beside the prices it qualifies, and whose aggregate beside the
+    /// vendor, each read whole in its cell's title.
     #[test]
     fn a_dataset_shows_its_class_of_source_and_whose_aggregate() {
         let mut reply = listed(false);
@@ -837,10 +842,7 @@ mod tests {
             &[],
             &(String::new(), String::new()),
         );
-        assert!(
-            body.contains("title=\"Composite\" data-source-class>Composite</td>"),
-            "{body}"
-        );
+        assert!(body.contains(">Price (composite), Bar</td>"), "{body}");
         assert!(
             body.contains("Coinbase \u{b7} Pyth&#39;s aggregate of its publishers")
                 || body.contains("Coinbase \u{b7} Pyth's aggregate of its publishers"),
@@ -856,7 +858,7 @@ mod tests {
             &[],
             &(String::new(), String::new()),
         );
-        assert!(body.contains("data-source-class>Not stated</td>"), "{body}");
+        assert!(body.contains(">Price, Bar</td>"), "{body}");
         assert!(!body.contains("Coinbase \u{b7}"), "{body}");
     }
 
