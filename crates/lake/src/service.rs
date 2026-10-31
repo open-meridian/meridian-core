@@ -3740,7 +3740,8 @@ impl Lake {
 
     /// W10.12, contract v28 (rulings 423 and 619): a `signal` plugin's
     /// escalation of recorded rows' quality, each assessment its own record
-    /// beside the row it names (decisions/031), never a rewrite. States only
+    /// beside the row it names (decisions/031), never a rewrite; from
+    /// contract v29 of the kind of row it names (628). States only
     /// escalate: one lower than the row's effective state -- the highest of
     /// its own and every assessment of it, those earlier in the batch
     /// included -- is refused naming its `state`; one naming a row or
@@ -3817,11 +3818,31 @@ impl Lake {
                     ));
                 }
             }
+            // Contract v29 (628; W10.12): the kind of row assessed, by its
+            // message's full name, so a day's close and its bar, sharing a
+            // row key, escalate apart; an assessment naming none, as every
+            // one before v29, is its key's every kind.
+            let kind = if assessment.data_type.trim().is_empty() {
+                None
+            } else {
+                Some(
+                    crate::row::DataType::named(assessment.data_type.trim()).ok_or_else(|| {
+                        refused(
+                            format!("{at}.data_type"),
+                            format!(
+                                "{at}.data_type is {:?}, no kind of row the lake holds                                  (meridian.v1.Price, meridian.v1.Bar, ...)",
+                                assessment.data_type
+                            ),
+                        )
+                    })?,
+                )
+            };
             let rows: Vec<Observation> = self
                 .store
                 .row_version(&assessment.dataset, &assessment.row_key, assessment.version)
                 .map_err(|failed| failed.to_string())?
                 .into_iter()
+                .filter(|row| kind.is_none_or(|kind| row.data_type() == kind))
                 .filter(|row| {
                     config
                         .readable(&reader, row.data_type())

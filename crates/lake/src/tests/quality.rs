@@ -444,3 +444,37 @@ async fn a_signals_assessment_is_its_own_record_raising_the_rows_effective_state
     assert_eq!(fields_of(&refused), vec!["assessments[0].reasons"]);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn an_assessment_names_the_kind_of_row_it_assesses() {
+    // Contract v29 (628; W10.12): a close and its bar share a row key, so
+    // an assessment names the kind it assesses; one naming a kind the key
+    // holds no row of finds none, and a kind the lake holds none of is
+    // refused naming data_type.
+    let h = with_signal();
+    record(
+        &h,
+        "coinbase-1",
+        vec![close(
+            "coinbase-1",
+            "BTC:2026-10-07",
+            BTC,
+            "2026-10-07",
+            "62000",
+        )],
+        "",
+    )
+    .unwrap();
+    let of_kind = |kind: &str| QualityAssessment {
+        data_type: kind.into(),
+        ..assessment("BTC:2026-10-07", 1, QualityState::Suspicious)
+    };
+    let refused = assess(&h, SIGNAL, vec![of_kind("meridian.v1.Bar")]).unwrap_err();
+    assert_eq!(fields_of(&refused), vec!["assessments[0].row_key"]);
+    let refused = assess(&h, SIGNAL, vec![of_kind("meridian.v1.Nothing")]).unwrap_err();
+    assert_eq!(fields_of(&refused), vec!["assessments[0].data_type"]);
+    assert_eq!(
+        assess(&h, SIGNAL, vec![of_kind("meridian.v1.Price")]).unwrap(),
+        1
+    );
+    assert_eq!(h.store.assessments().unwrap().len(), 1);
+}
