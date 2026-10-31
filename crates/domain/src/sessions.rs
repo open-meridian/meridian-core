@@ -24,9 +24,48 @@ fn runs(session: &TradingSession, minute: u32, extended: bool) -> bool {
     (extended || !session.extended) && session.start_minute <= minute && minute < session.end_minute
 }
 
+/// The weekly sessions in force on `date` (contract v29, 657; W3.19): those
+/// naming its weekday, and of them, for regular and for extended hours
+/// apart, the rows whose `valid_from_date` is the latest on or before the
+/// date -- hours that changed are two rows, each from its date; an empty
+/// date is in force since the calendar's coverage began, and a row from a
+/// later date not yet. Its early closes are the caller's.
+pub fn in_force(sessions: &TradingSessions, date: Date) -> Vec<&TradingSession> {
+    let day = weekday(date);
+    let today = date.to_string();
+    let named: Vec<&TradingSession> = sessions
+        .sessions
+        .iter()
+        .filter(|s| s.weekdays.contains(&day))
+        .filter(|s| s.valid_from_date.is_empty() || s.valid_from_date <= today)
+        .collect();
+    let latest = |extended: bool| {
+        named
+            .iter()
+            .filter(|s| s.extended == extended)
+            .map(|s| s.valid_from_date.as_str())
+            .max()
+            .unwrap_or("")
+            .to_string()
+    };
+    let (regular, extended) = (latest(false), latest(true));
+    named
+        .into_iter()
+        .filter(|s| {
+            s.valid_from_date
+                == if s.extended {
+                    extended.as_str()
+                } else {
+                    regular.as_str()
+                }
+        })
+        .collect()
+}
+
 /// Whether `at_ns` falls in one of the calendar's sessions, read in its zone
 /// (`zone` the calendar's `time_zone`, loaded). An early close's sessions
-/// stand for its date in place of the weekday's.
+/// stand for its date in place of the weekday's; otherwise the weekday's
+/// sessions in force on the date ([`in_force`]).
 pub fn in_session(sessions: &TradingSessions, zone: &Zone, at_ns: i64, extended: bool) -> bool {
     let Some((date, seconds)) = zone.local(at_ns) else {
         return false;
@@ -36,11 +75,8 @@ pub fn in_session(sessions: &TradingSessions, zone: &Zone, at_ns: i64, extended:
     if let Some(day) = sessions.early_closes.iter().rev().find(|d| d.date == today) {
         return day.sessions.iter().any(|s| runs(s, minute, extended));
     }
-    let day = weekday(date);
-    sessions
-        .sessions
-        .iter()
-        .filter(|s| s.weekdays.contains(&day))
+    in_force(sessions, date)
+        .into_iter()
         .any(|s| runs(s, minute, extended))
 }
 
@@ -192,5 +228,40 @@ mod tests {
             at(&zone, "2026-10-19", 9, 30),
             false
         ));
+    }
+
+    #[test]
+    fn hours_that_changed_are_two_rows_each_in_force_from_its_date() {
+        // Contract v29 (657): a venue's regular hours from 2016, its
+        // after-hours session moved from 18:30 to 20:00 on 2020-03-02 -- two
+        // rows, each from its date -- the regular row untouched.
+        let zone = Zone::of_rule("EST5EDT,M3.2.0,M11.1.0").unwrap();
+        let dated = |start, end, extended, from: &str| TradingSession {
+            valid_from_date: from.into(),
+            ..session(&[Weekday::Monday], start, end, extended)
+        };
+        let venue = TradingSessions {
+            time_zone: "America/New_York".into(),
+            sessions: vec![
+                dated(570, 960, false, ""),
+                dated(960, 1110, true, "2016-01-04"),
+                dated(960, 1200, true, "2020-03-02"),
+            ],
+            early_closes: vec![],
+        };
+        let monday = |date: &str| Date::parse(date).unwrap();
+        let ends = |date: &str| {
+            in_force(&venue, monday(date))
+                .iter()
+                .map(|s| (s.extended, s.end_minute))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ends("2019-03-04"), vec![(false, 960), (true, 1110)]);
+        assert_eq!(ends("2020-03-02"), vec![(false, 960), (true, 1200)]);
+        // Before its first row's date, no extended hours were in force.
+        assert_eq!(ends("2015-03-02"), vec![(false, 960)]);
+        let seven_pm = |date: &str| at(&zone, date, 19, 0);
+        assert!(!in_session(&venue, &zone, seven_pm("2019-03-04"), true));
+        assert!(in_session(&venue, &zone, seven_pm("2026-10-19"), true));
     }
 }

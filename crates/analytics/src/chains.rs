@@ -287,13 +287,13 @@ fn settles_at(expiry: &str, am: bool, held: &Sessions) -> Result<i64, String> {
     let date = Date::parse(expiry).map_err(|_| format!("expiration_date {expiry:?}"))?;
     let zone = held.zone.as_ref().ok_or_else(|| held.why.clone())?;
     let minute = if am {
-        let weekday = meridian_domain::sessions::weekday(date);
+        // The weekday's sessions in force on the expiry (contract v29, 657).
         held.sessions
             .as_ref()
             .and_then(|s| {
-                s.sessions
-                    .iter()
-                    .filter(|x| !x.extended && x.weekdays.contains(&weekday))
+                meridian_domain::sessions::in_force(s, date)
+                    .into_iter()
+                    .filter(|x| !x.extended)
                     .map(|x| x.start_minute)
                     .min()
             })
