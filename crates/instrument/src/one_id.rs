@@ -454,8 +454,10 @@ pub fn family_held<'a>(scheme: &'a str, source: &str, list: &LicenceList) -> &'a
 /// ([`agency_pool`], contract v29) and, where the list names the
 /// `administrator_symbol` family, a symbol whose source is an administrator
 /// it admits (ruling 545). A vendor's symbol never is, nor a CUSIP or an
-/// ISIN while no list names them (ruling 677: deployment-side, the store
-/// sending the FIGI a `data` or `reference` plugin mapped it to at the edge).
+/// ISIN while no list names them (ruling 677: deployment-side; v29 maps
+/// neither to a FIGI, ruling 976, so a bond known only by one stays the
+/// deployment's local record, its CUSIP kept dated for the backfill once a
+/// list names the scheme, W3.25).
 pub fn sendable(identifiers: &[Asked], list: &LicenceList) -> Vec<PbIdentifier> {
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();

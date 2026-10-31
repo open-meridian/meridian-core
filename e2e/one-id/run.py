@@ -217,7 +217,10 @@ def run():
     must('data-tab="terms"' in said and ">30/360 (bond basis)</td>" in said
          and ">4.875%, fixed, semi-annual</td>" in said,
          "step 2, the bond's page shows its terms as the platform's record states them")
-    must("lacks: calls" in said, "step 2, minted incomplete, the bond lists the calls it lacks (574)")
+    lacks = re.search(r"lacks: ([^.<]*)\.", said)
+    must(lacks and "calls" in lacks.group(1).split(", "),
+         f"step 2, minted incomplete, the bond lists the calls it lacks (574): "
+         f"{lacks.group(0) if lacks else 'nothing said'}")
     pool = page("venue", "write", "/resolve?symbol=POOL1&agency_pool=MA5123&agency=FNMA"
                                   "&description=FNMA+CL+MA5123")
     must(pool["instrument_id"] == POOL and not pool["provisional"],
