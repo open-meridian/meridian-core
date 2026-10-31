@@ -2668,3 +2668,63 @@ async fn a_query_of_a_kind_the_roles_do_not_read_is_refused_naming_kind() {
         "asked as the plugin itself"
     );
 }
+
+/// Contract 28, amended 2026-10-31 (W10.4; ruling 955): a derived series
+/// from a plugin the row grants through `data` alone names whose figure each
+/// value is; a `signal` plugin's own measure may leave it empty; whose is at
+/// most 64 characters either way.
+#[tokio::test]
+async fn a_data_plugins_derived_series_says_whose_figure_it_is() {
+    let topic = "platform.lake.command.record-derived-series";
+    let contract = Contract::parse(
+        "topic\tkind\tpublisher\tsubscriber\n\
+         platform.lake.command.record-derived-series\tcommand\tsignal, data\tlake\n",
+        "name\tkind\nsignal\trole\ndata\trole\nlake\tcomponent\n",
+    )
+    .unwrap();
+    let as_role = |role: &str| {
+        Sidecar::under(
+            &contract,
+            Arc::new(Bus::single(
+                "lake-1",
+                Arc::new(MemoryBackend::new()),
+                Arc::new(meridian_clock::SystemClock),
+            )),
+            "dep-local-1",
+            Identity::new("plugin-1", vec![role.to_string()]),
+        )
+    };
+    let batch = |published_by: &str| {
+        meridian_domain::v1::RecordDerivedSeriesRequest {
+            values: vec![meridian_domain::v1::DerivedSeries {
+                series: "level".into(),
+                published_by: published_by.into(),
+                ..Default::default()
+            }],
+        }
+        .encode_to_vec()
+    };
+    let payload = "meridian.v1.RecordDerivedSeriesRequest";
+    let data = as_role("data");
+    let refused = data
+        .publishers_figures_stand(topic, payload, &batch(""))
+        .unwrap_err();
+    assert_eq!(refused.code(), Code::InvalidArgument);
+    assert!(refused.message().contains("values[0].published_by"));
+    assert!(data
+        .publishers_figures_stand(topic, payload, &batch("Cboe"))
+        .is_ok());
+    let signal = as_role("signal");
+    assert!(signal
+        .publishers_figures_stand(topic, payload, &batch(""))
+        .is_ok());
+    assert!(signal
+        .publishers_figures_stand(topic, payload, &batch(&"x".repeat(65)))
+        .unwrap_err()
+        .message()
+        .contains("at most 64"));
+    // Another row is not this check's.
+    assert!(data
+        .publishers_figures_stand(topic, "meridian.v1.RecordPricesRequest", &batch(""))
+        .is_ok());
+}

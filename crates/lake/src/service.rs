@@ -4473,9 +4473,21 @@ fn derived_refused(at: &str, value: &meridian_domain::v1::DerivedSeries) -> Resu
             "{at}.rule is required: the definition it was derived by and its version, from 1"
         ));
     }
-    if !bounds::DERIVED_SERIES_INPUTS_COUNT.admits(value.inputs.len()) {
+    // Contract 28, amended 2026-10-31 (W10.4; ruling 955): a publisher's
+    // figure says whose, and may name no input; a value the plugin derived
+    // names 1 to 32.
+    let published = value.published_by.trim();
+    if !bounds::DERIVED_SERIES_PUBLISHED_BY_LENGTH.admits(published.chars().count()) {
         return Err(format!(
-            "{at}.inputs names {}; 1 to 32, each dataset read",
+            "{at}.published_by is at most 64 characters: whose figure, in words"
+        ));
+    }
+    if !bounds::DERIVED_SERIES_INPUTS_COUNT.admits(value.inputs.len())
+        || (published.is_empty() && value.inputs.is_empty())
+    {
+        return Err(format!(
+            "{at}.inputs names {}; 1 to 32, each dataset read, or none on a publisher's \
+             figure, which published_by names",
             value.inputs.len()
         ));
     }

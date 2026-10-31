@@ -834,6 +834,8 @@ impl Observation {
                         == (vb.unit, &vb.index_base, &vb.ucum_code)
                     && a.rule == b.rule
                     && a.inputs == b.inputs
+                    // Contract 28, amended 2026-10-31 (ruling 955).
+                    && a.published_by == b.published_by
             }
             (Observation::Scenario(a), Observation::Scenario(b)) => {
                 a.scenario == b.scenario

@@ -1607,6 +1607,10 @@ struct WireContract {
     cap: Option<WireBound>,
     #[serde(default)]
     bound_unit: String,
+    /// The venue's category for the market (contract 28, amended
+    /// 2026-10-31, ruling 954): empty where it states none.
+    #[serde(default)]
+    category: String,
 }
 
 /// One bound of a range market as the platform's answer carries it: the
@@ -1930,6 +1934,7 @@ fn into_record(record: WireRecord) -> Result<PbInstrument, PlatformError> {
                 floor: bound(contract.floor, "floor")?,
                 cap: bound(contract.cap, "cap")?,
                 bound_unit: contract.bound_unit,
+                category: contract.category,
             })
         }
     };

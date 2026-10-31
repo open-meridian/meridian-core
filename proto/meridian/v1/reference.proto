@@ -161,6 +161,12 @@ message BinaryEventContract {
   // price, otherwise the venue's unit word (`degrees_f`, `index_points`,
   // `percent`); empty where neither bound is set.
   string bound_unit = 5;
+
+  // Contract 28, amended 2026-10-31 (W1.1; ruling 954): the venue's primary
+  // category for the market, in its own words -- a Kalshi series' category,
+  // a Polymarket or Polymarket US event's primary tag label -- 0 to 64
+  // characters; empty where the venue states none. No platform enum.
+  string category = 6;
 }
 
 // One bound of a range market (A4): Kalshi's `greater` and

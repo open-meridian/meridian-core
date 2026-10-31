@@ -407,6 +407,45 @@ impl Sidecar {
         }
     }
 
+    /// A derived series' rows held to whose they are (W10.4; contract 28,
+    /// amended 2026-10-31, ruling 955): `published_by` at most 64
+    /// characters, and, from a plugin the row grants through `data` alone,
+    /// never empty: a data plugin records only publishers' figures, each
+    /// naming whose. A `signal` plugin's own measure may leave it empty.
+    pub(crate) fn publishers_figures_stand(
+        &self,
+        topic: &str,
+        payload_type: &str,
+        payload: &[u8],
+    ) -> Result<(), Status> {
+        if payload_type != "meridian.v1.RecordDerivedSeriesRequest" {
+            return Ok(());
+        }
+        let Ok(request) = domain::RecordDerivedSeriesRequest::decode(payload) else {
+            return Ok(());
+        };
+        let own_measure = self
+            .roles_granting(topic)
+            .iter()
+            .any(|role| role == "signal");
+        for (i, value) in request.values.iter().enumerate() {
+            let whose = value.published_by.trim();
+            let refusal = if whose.chars().count() > 64 {
+                format!("values[{i}].published_by is at most 64 characters: whose figure, in words")
+            } else if whose.is_empty() && !own_measure {
+                format!(
+                    "values[{i}].published_by is required: a data plugin records a publisher's \
+                     figure, naming whose"
+                )
+            } else {
+                continue;
+            };
+            self.note_refusal(&refusal);
+            return Err(Status::invalid_argument(refusal));
+        }
+        Ok(())
+    }
+
     /// An enum value the plugin sent, refused naming its field when the
     /// contract does not define it: proto3 carries any number, so an asset
     /// class of 99 would otherwise reach the bus as though it were one
@@ -585,6 +624,7 @@ impl Sidecar {
         let message = self.kept_at_the_edge(payload_type, message)?;
         self.statement_stands(payload_type, &message.encode_to_vec())?;
         self.dates_stand(payload_type, &message.encode_to_vec())?;
+        self.publishers_figures_stand(&topic, payload_type, &message.encode_to_vec())?;
         // A record batch's rows' age at the `sidecar` hop, on accepting it
         // (W4.16; ruling 606).
         crate::lake::record_ages(

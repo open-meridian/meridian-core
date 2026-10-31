@@ -311,7 +311,11 @@ pub fn fund_words(text: &str) -> String {
 /// `|`. A range market's bounds (contract v26, W1.24) follow as three more
 /// fields -- the floor, the cap and their unit, a bound written as its value
 /// with `=` before it when inclusive, empty for an open tail -- and only when
-/// one is set, so a contract with none keeps v19's four.
+/// one is set, so a contract with none keeps v19's four. A market's category
+/// (contract 28, amended 2026-10-31, ruling 954) follows the bounds as an
+/// eighth field, the bounds' three written empty where none is set, and only
+/// when the venue states one, so a contract with none keeps its form; read
+/// as the rest of the text, so a `|` in the venue's words is kept.
 pub fn contract_to_text(contract: &BinaryEventContract) -> String {
     let payout = contract.payout.clone().unwrap_or_default();
     let amount = payout
@@ -326,13 +330,17 @@ pub fn contract_to_text(contract: &BinaryEventContract) -> String {
         payout.instrument_id.trim(),
         contract.closes_at_ns
     );
-    if contract.floor.is_some() || contract.cap.is_some() {
+    let category = contract.category.trim();
+    if contract.floor.is_some() || contract.cap.is_some() || !category.is_empty() {
         text.push_str(&format!(
             "|{}|{}|{}",
             bound_to_text(contract.floor.as_ref()),
             bound_to_text(contract.cap.as_ref()),
             contract.bound_unit.trim()
         ));
+    }
+    if !category.is_empty() {
+        text.push_str(&format!("|{category}"));
     }
     text
 }
@@ -372,7 +380,12 @@ fn bound_from_text(text: &str) -> Option<Option<EventContractBound>> {
 /// The attributes `text` holds, or `None` for empty or text this did not
 /// write.
 pub fn contract_from_text(text: &str) -> Option<BinaryEventContract> {
-    let parts: Vec<&str> = text.split('|').collect();
+    let mut parts: Vec<&str> = text.splitn(8, '|').collect();
+    let category = if parts.len() == 8 {
+        parts.pop().unwrap_or_default()
+    } else {
+        ""
+    };
     let (amount, code, instrument, closes, floor, cap, unit) = match parts.as_slice() {
         [amount, code, instrument, closes] => (amount, code, instrument, closes, None, None, ""),
         [amount, code, instrument, closes, floor, cap, unit] => (
@@ -397,6 +410,7 @@ pub fn contract_from_text(text: &str) -> Option<BinaryEventContract> {
         floor,
         cap,
         bound_unit: unit.to_string(),
+        category: category.to_string(),
     })
 }
 
@@ -433,6 +447,14 @@ pub fn contract_refused(contract: &BinaryEventContract) -> Vec<(&'static str, St
             "closes_at_ns",
             "when trading closes is a time after 1970, or 0 where the venue states none"
                 .to_string(),
+        ));
+    }
+    // Contract 28, amended 2026-10-31 (ruling 954): the venue's words, at
+    // most 64 characters.
+    if contract.category.trim().chars().count() > 64 {
+        wrong.push((
+            "category",
+            "the venue's category for the market is at most 64 characters".to_string(),
         ));
     }
     let mut bounds = Vec::new();
@@ -555,6 +577,11 @@ pub fn contract_words(text: &str) -> String {
     if contract.closes_at_ns > 0 {
         line.push_str(&format!(", closes {}", utc_minute(contract.closes_at_ns)));
     }
+    // Contract 28, amended 2026-10-31 (ruling 954): the venue's category, in
+    // its words.
+    if !contract.category.trim().is_empty() {
+        line.push_str(&format!(", in {}", contract.category.trim()));
+    }
     line
 }
 
@@ -634,6 +661,7 @@ mod tests {
             floor: Some(bound(70, true)),
             cap: Some(bound(74, false)),
             bound_unit: "degrees_f".into(),
+            category: String::new(),
         };
         assert!(contract_refused(&range).is_empty());
         let text = contract_to_text(&range);
@@ -672,6 +700,62 @@ mod tests {
             .map(|(f, _)| *f)
             .collect();
         assert_eq!(fields, vec!["bound_unit"]);
+    }
+
+    /// Contract 28, amended 2026-10-31 (ruling 954): a market's category in
+    /// the venue's words travels after the bounds, only where stated, its
+    /// `|` kept; past 64 characters it is refused.
+    #[test]
+    fn a_markets_category_round_trips_and_is_held_to_64_characters() {
+        let plain = BinaryEventContract {
+            payout: Some(Money {
+                amount: Some(Exact::new(1, 0).unwrap().to_wire()),
+                currency_code: "USD".into(),
+                instrument_id: String::new(),
+            }),
+            closes_at_ns: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            contract_to_text(&plain),
+            "1|USD||0",
+            "none stated: v19's four"
+        );
+        let economics = BinaryEventContract {
+            category: "Economics".into(),
+            ..plain.clone()
+        };
+        let text = contract_to_text(&economics);
+        assert_eq!(text, "1|USD||0||||Economics");
+        assert_eq!(contract_from_text(&text), Some(economics.clone()));
+        let piped = BinaryEventContract {
+            category: "Climate | Weather".into(),
+            ..plain.clone()
+        };
+        assert_eq!(
+            contract_from_text(&contract_to_text(&piped)),
+            Some(piped.clone())
+        );
+        let range = BinaryEventContract {
+            floor: Some(EventContractBound {
+                value: Some(Exact::new(70, 0).unwrap().to_wire()),
+                inclusive: true,
+            }),
+            bound_unit: "degrees_f".into(),
+            ..economics.clone()
+        };
+        assert_eq!(
+            contract_to_text(&range),
+            "1|USD||0|=70||degrees_f|Economics"
+        );
+        assert_eq!(contract_from_text(&contract_to_text(&range)), Some(range));
+        assert!(contract_refused(&economics).is_empty());
+        let long = BinaryEventContract {
+            category: "x".repeat(65),
+            ..plain
+        };
+        let fields: Vec<&str> = contract_refused(&long).iter().map(|(f, _)| *f).collect();
+        assert_eq!(fields, vec!["category"]);
     }
 
     #[test]

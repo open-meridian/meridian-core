@@ -28772,6 +28772,25 @@
       "store": "instrument"
     },
     {
+      "name": "meridian.v1.BinaryEventContract.category",
+      "type": "text",
+      "bounds": {
+        "length": [
+          0,
+          64
+        ]
+      },
+      "empty": "empty: the venue states none",
+      "intent": "says what a market is about, in the venue's own word for it (W1.1; amended 2026-10-31, ruling 954)",
+      "meaning": "the venue's primary category for the market, as the venue words it -- a series' category, or an event's primary tag label where the venue tags its events: Economics, Politics, Climate and Weather; recorded by the venue's plugin and carried on the platform master's record too",
+      "not_meaning": "a platform taxonomy or enum, of which there is none; the venue's other tags; an asset class",
+      "filled": "as-reported",
+      "filled_by": "instrument",
+      "since": "v28",
+      "stability": "preview",
+      "store": "instrument"
+    },
+    {
       "name": "meridian.v1.EventContractBound.value",
       "type": "Decimal",
       "bounds": {
@@ -37337,7 +37356,7 @@
       "type": "message ObservationMeta",
       "empty": "never unset",
       "intent": "carries a derived value's envelope",
-      "meaning": "its key, subject, the signal plugin's own derived dataset, its business date and version",
+      "meaning": "its key, subject, the recording plugin's own dataset -- a signal plugin's derived dataset, or a data plugin's dataset of publishers' figures (amended 2026-10-31) -- its business date and version",
       "not_meaning": "its value",
       "filled": "as-reported",
       "filled_by": "signal",
@@ -37356,7 +37375,7 @@
       },
       "empty": "never empty",
       "intent": "names the plugin's series",
-      "meaning": "its own name for it: iv30, the index's level, a positioning summary's part",
+      "meaning": "its own name for it: iv30, the index's level, a positioning summary's part; for a publisher's figure, the plugin's name for the publisher's series",
       "not_meaning": "a publisher's series ID",
       "filled": "as-reported",
       "filled_by": "signal",
@@ -37369,11 +37388,18 @@
       "type": "message UnitValue",
       "empty": "never unset",
       "intent": "carries the value with its unit",
-      "meaning": "as derived",
-      "not_meaning": "a publisher's figure",
+      "meaning": "as derived, or, where published_by is set, as the publisher states it",
+      "not_meaning": "a publisher's figure shown as our measure: published_by says whose",
       "filled": "as-reported",
       "filled_by": "signal",
       "since": "v28",
+      "changes": [
+        {
+          "version": "v28",
+          "kind": "clarified",
+          "what": "amended 2026-10-31 (ruling 955): a data plugin's row carries the publisher's figure, published_by naming whose"
+        }
+      ],
       "stability": "preview",
       "store": "lake"
     },
@@ -37382,11 +37408,18 @@
       "type": "message MeasureRef",
       "empty": "never unset",
       "intent": "names how the value was derived",
-      "meaning": "a definition and its version, an analytics measure's where one was used",
+      "meaning": "a definition and its version, an analytics measure's where one was used; for a publisher's figure, the publisher's definition (amended 2026-10-31, ruling 955)",
       "not_meaning": "an implementation",
       "filled": "as-reported",
       "filled_by": "signal",
       "since": "v28",
+      "changes": [
+        {
+          "version": "v28",
+          "kind": "clarified",
+          "what": "amended 2026-10-31 (ruling 955): a publisher's figure names the publisher's definition"
+        }
+      ],
       "stability": "preview",
       "store": "lake"
     },
@@ -37395,16 +37428,50 @@
       "type": "repeated message DerivedInput",
       "bounds": {
         "count": [
-          1,
+          0,
           32
         ]
       },
-      "empty": "never empty",
+      "empty": "never empty on a value the plugin derived; may be empty on a publisher's figure, where published_by is set (amended 2026-10-31, ruling 955)",
       "intent": "names what the value was derived from",
       "meaning": "each dataset read and the as-of it was read at, so licences and counts can follow it",
       "not_meaning": "the values themselves",
       "filled": "as-reported",
       "filled_by": "signal",
+      "since": "v28",
+      "changes": [
+        {
+          "version": "v28",
+          "kind": "widened",
+          "what": "amended 2026-10-31 (ruling 955): empty on a publisher's figure",
+          "was": {
+            "bounds": {
+              "count": [
+                1,
+                32
+              ]
+            }
+          }
+        }
+      ],
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.DerivedSeries.published_by",
+      "type": "text",
+      "bounds": {
+        "length": [
+          0,
+          64
+        ]
+      },
+      "empty": "empty: the recording plugin's own measure, derived by its rule from its inputs",
+      "intent": "marks a value as the publisher's figure and says whose (W10.4; amended 2026-10-31, ruling 955)",
+      "meaning": "the publisher whose figure the value is, in words -- an index's publisher, a vendor's own computed figure -- recorded by a data plugin as the publisher states it; a page shows it labelled with whose, never as our measure; a data plugin's row without it is refused",
+      "not_meaning": "the plugin or dataset that recorded it, which the envelope names; a contributor to an aggregate",
+      "filled": "as-reported",
+      "filled_by": "data",
       "since": "v28",
       "stability": "preview",
       "store": "lake"
@@ -37446,8 +37513,8 @@
       },
       "empty": "never empty",
       "intent": "carries a batch of derived values (W10.4)",
-      "meaning": "1 to 500 rows, recorded whole or refused naming the item and field",
-      "not_meaning": "a publisher's rows",
+      "meaning": "1 to 500 rows, recorded whole or refused naming the item and field; from a data plugin, publishers' figures, each naming whose (amended 2026-10-31, ruling 955)",
+      "not_meaning": "a publisher's figure presented as the plugin's own measure",
       "filled": "as-reported",
       "filled_by": "signal",
       "since": "v28",

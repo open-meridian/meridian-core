@@ -190,12 +190,14 @@ const LISTED_SERIES_FIELDS: [&str; 5] = [
     "meridian.v1.ListedSeries.instrument_id",
 ];
 
-const DERIVED_SERIES_FIELDS: [&str; 5] = [
+const DERIVED_SERIES_FIELDS: [&str; 6] = [
     "meridian.v1.DerivedSeries.meta",
     "meridian.v1.DerivedSeries.series",
     "meridian.v1.DerivedSeries.value",
     "meridian.v1.DerivedSeries.rule",
     "meridian.v1.DerivedSeries.inputs",
+    // Contract 28, amended 2026-10-31 (ruling 955).
+    "meridian.v1.DerivedSeries.published_by",
 ];
 
 const SAVED_SCENARIO_FIELDS: [&str; 4] = [
