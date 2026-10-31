@@ -673,9 +673,10 @@ e2e-cluster-upgrade:
 # API group discoverable, since a helm install asks for them all. A cluster
 # that fails to be created at all is made once more before giving up.
 K3D ?= k3d
-# The Kubernetes dev and CI run (ruling 849): k3s at this version, pinned
-# rather than k3d's default, which moves with k3d. CI runs one job on the
-# oldest minor the chart declares as well, naming its own E2E_K3S_IMAGE.
+# The Kubernetes dev and CI run (rulings 849, 935): k3s at this version,
+# pinned rather than k3d's default, which moves with k3d. CI runs the base
+# install on each other supported minor as well, each naming its own
+# E2E_K3S_IMAGE (.github/workflows/ci.yaml).
 KUBERNETES_VERSION := 1.36.5
 E2E_K3S_IMAGE ?= rancher/k3s:v$(KUBERNETES_VERSION)-k3s1
 E2E_K3D_CLUSTER ?= meridian-e2e
@@ -1625,14 +1626,14 @@ chart-check:
 	# cluster will accept. Found by the first install on a real one.
 	@dup="$$(grep -E '^[A-Za-z][A-Za-z0-9]*:' deploy/chart/values.yaml | cut -d: -f1 | sort | uniq -d)"; \
 	[ -z "$$dup" ] || { echo "chart-check FAILED: values.yaml says these twice, and only the second counts: $$dup" >&2; exit 1; }
-	@# The Kubernetes the chart runs on, declared (ruling 849): 1.35 and newer,
-	@# so an install on an older cluster stops before it changes anything.
-	@grep -qx 'kubeVersion: ">=1.35.0-0"' deploy/chart/Chart.yaml \
-		|| { echo "chart-check FAILED: Chart.yaml does not declare kubeVersion \">=1.35.0-0\" (ruling 849)" >&2; exit 1; }
-	@$(HELM) template check deploy/chart $(CHART_VALUES) --kube-version 1.35.0 >/dev/null 2>&1 \
-		|| { echo "chart-check FAILED: the chart does not render on Kubernetes 1.35.0, the oldest it declares" >&2; exit 1; }
-	@$(HELM) template check deploy/chart $(CHART_VALUES) --kube-version 1.34.9 >/dev/null 2>&1 \
-		&& { echo "chart-check FAILED: the chart rendered on Kubernetes 1.34, older than it declares" >&2; exit 1; }; true
+	@# The Kubernetes the chart runs on, declared (rulings 935, 936): 1.33 and
+	@# newer, so an install on an older cluster stops before it changes anything.
+	@grep -qx 'kubeVersion: ">=1.33.0-0"' deploy/chart/Chart.yaml \
+		|| { echo "chart-check FAILED: Chart.yaml does not declare kubeVersion \">=1.33.0-0\" (ruling 936)" >&2; exit 1; }
+	@$(HELM) template check deploy/chart $(CHART_VALUES) --kube-version 1.33.0 >/dev/null 2>&1 \
+		|| { echo "chart-check FAILED: the chart does not render on Kubernetes 1.33.0, the oldest it declares" >&2; exit 1; }
+	@$(HELM) template check deploy/chart $(CHART_VALUES) --kube-version 1.32.9 >/dev/null 2>&1 \
+		&& { echo "chart-check FAILED: the chart rendered on Kubernetes 1.32, older than it declares" >&2; exit 1; }; true
 	@fresh="$$($(HELM_TEMPLATE) check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check 2>/dev/null)" \
 		|| { echo "chart-check FAILED: the chart does not render as a fresh install, with only the two values the runbook gives" >&2; exit 1; }; \
 	echo "$$fresh" | grep -q "first-run" \

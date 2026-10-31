@@ -17,7 +17,7 @@ Budget half an hour.
 
 ## Before you start
 
-- A Kubernetes cluster, version 1.35 or newer, and `kubectl` already pointing
+- A Kubernetes cluster, version 1.33 or newer, and `kubectl` already pointing
   at it. A laptop cluster (k3s, Rancher Desktop, kind, Docker Desktop) is fine
   for trying this. The chart refuses an older cluster before it installs
   anything, and `meridian doctor` checks.
