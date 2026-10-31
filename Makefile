@@ -673,6 +673,11 @@ e2e-cluster-upgrade:
 # API group discoverable, since a helm install asks for them all. A cluster
 # that fails to be created at all is made once more before giving up.
 K3D ?= k3d
+# The Kubernetes dev and CI run (ruling 849): k3s at this version, pinned
+# rather than k3d's default, which moves with k3d. CI runs one job on the
+# oldest minor the chart declares as well, naming its own E2E_K3S_IMAGE.
+KUBERNETES_VERSION := 1.36.5
+E2E_K3S_IMAGE ?= rancher/k3s:v$(KUBERNETES_VERSION)-k3s1
 E2E_K3D_CLUSTER ?= meridian-e2e
 E2E_K3D_NETWORK ?= meridian-k3d
 E2E_K3D_SUBNET ?= 172.28.0.0/16
@@ -717,9 +722,9 @@ e2e-cluster-k3d:
 	@docker network inspect $(E2E_K3D_NETWORK) >/dev/null 2>&1 \
 		|| docker network create --subnet $(E2E_K3D_SUBNET) --gateway $(E2E_K3D_GATEWAY) $(E2E_K3D_NETWORK) >/dev/null
 	@$(K3D) cluster delete $(E2E_K3D_CLUSTER) >/dev/null 2>&1 || true
-	@echo "e2e-cluster-k3d: a cluster for $(E2E_CLUSTER_TARGET)"
+	@echo "e2e-cluster-k3d: a cluster for $(E2E_CLUSTER_TARGET), on $(E2E_K3S_IMAGE)"
 	@: >.e2e-k3d.log; made=; for attempt in 1 2; do \
-	  if $(K3D) cluster create $(E2E_K3D_CLUSTER) --network $(E2E_K3D_NETWORK) \
+	  if $(K3D) cluster create $(E2E_K3D_CLUSTER) --image $(E2E_K3S_IMAGE) --network $(E2E_K3D_NETWORK) \
 		--host-alias $(E2E_K3D_GATEWAY):host.docker.internal \
 		--api-port $(E2E_K3D_API) -p "$(E2E_K3D_HTTP):80@loadbalancer" \
 		--kubeconfig-update-default=false --kubeconfig-switch-context=false \
@@ -809,6 +814,11 @@ e2e-cluster-backup:
 	  exit $$held
 
 HELM := docker run --rm -v "$(CURDIR)":/w -w /w alpine/helm:3.16.2
+# The chart declares the Kubernetes it runs on (Chart.yaml's kubeVersion,
+# ruling 849: 1.35 and newer), and `helm template` holds a chart to a version
+# of its own, 1.31 for this Helm: so every render here names the version dev
+# and CI run, KUBERNETES_VERSION.
+HELM_TEMPLATE := $(HELM) template --kube-version $(KUBERNETES_VERSION)
 CHART_VALUES := --set deployment.id=DEP-check --set key.existingSecret=k --set key.generate=false --set database.existingSecret=d --set broker.existingSecret=b
 PLUGIN_VALUES := --set 'sidecars[0].instanceId=check-1' --set 'sidecars[0].roles={custody}' \
 	--set 'sidecars[0].plugin.image=example/plugin:1' --set 'sidecars[0].plugin.existingSecret=vendor'
@@ -1615,7 +1625,15 @@ chart-check:
 	# cluster will accept. Found by the first install on a real one.
 	@dup="$$(grep -E '^[A-Za-z][A-Za-z0-9]*:' deploy/chart/values.yaml | cut -d: -f1 | sort | uniq -d)"; \
 	[ -z "$$dup" ] || { echo "chart-check FAILED: values.yaml says these twice, and only the second counts: $$dup" >&2; exit 1; }
-	@fresh="$$($(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check 2>/dev/null)" \
+	@# The Kubernetes the chart runs on, declared (ruling 849): 1.35 and newer,
+	@# so an install on an older cluster stops before it changes anything.
+	@grep -qx 'kubeVersion: ">=1.35.0-0"' deploy/chart/Chart.yaml \
+		|| { echo "chart-check FAILED: Chart.yaml does not declare kubeVersion \">=1.35.0-0\" (ruling 849)" >&2; exit 1; }
+	@$(HELM) template check deploy/chart $(CHART_VALUES) --kube-version 1.35.0 >/dev/null 2>&1 \
+		|| { echo "chart-check FAILED: the chart does not render on Kubernetes 1.35.0, the oldest it declares" >&2; exit 1; }
+	@$(HELM) template check deploy/chart $(CHART_VALUES) --kube-version 1.34.9 >/dev/null 2>&1 \
+		&& { echo "chart-check FAILED: the chart rendered on Kubernetes 1.34, older than it declares" >&2; exit 1; }; true
+	@fresh="$$($(HELM_TEMPLATE) check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check 2>/dev/null)" \
 		|| { echo "chart-check FAILED: the chart does not render as a fresh install, with only the two values the runbook gives" >&2; exit 1; }; \
 	echo "$$fresh" | grep -q "first-run" \
 		|| { echo "chart-check FAILED: a fresh install rendered no first run, so the check below would prove nothing" >&2; exit 1; }; \
@@ -1634,7 +1652,7 @@ chart-check:
 	@# stops it starting. Rendered three times, because the passwords are
 	@# random and the old template drew a bad one in about three renders of four.
 	@for i in 1 2 3; do \
-		$(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check 2>/dev/null \
+		$(HELM_TEMPLATE) check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check 2>/dev/null \
 		| awk '/^kind: Secret/{s=1} /^---/{s=0} s && /-password: /{print $$2}' \
 		| while read -r encoded; do \
 			first=$$(printf '%s' "$$encoded" | base64 -d | cut -c1); \
@@ -1645,7 +1663,7 @@ chart-check:
 	@# 127.0.0.1 alone: on a node's other interfaces anybody who can reach the
 	@# node could pull a firm's plugins, and anything else holding a host port
 	@# is a pod reachable from outside the cluster by accident.
-	@rendered="$$($(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check 2>/dev/null)"; \
+	@rendered="$$($(HELM_TEMPLATE) check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check 2>/dev/null)"; \
 	ports="$$(echo "$$rendered" | grep -c 'hostPort:')"; bound="$$(echo "$$rendered" | grep -c 'hostIP: 127.0.0.1')"; \
 	[ "$$ports" = 1 ] && [ "$$bound" = 1 ] \
 		|| { echo "chart-check FAILED: $$ports host ports and $$bound bound to 127.0.0.1; the registry's node proxy is the only one, on localhost only" >&2; exit 1; }; \
@@ -1656,7 +1674,7 @@ chart-check:
 	@# restarts the pod on every upgrade: on 2026-09-29 the database restarted
 	@# under the migration Job, the Job failed, and the release never came up
 	@# (CI run 36631603926). The resources' own metadata keeps the label.
-	@rendered="$$($(HELM) template check deploy/chart $(CHART_VALUES) 2>/dev/null)"; \
+	@rendered="$$($(HELM_TEMPLATE) check deploy/chart $(CHART_VALUES) 2>/dev/null)"; \
 	for component in database registry registry-node; do \
 		labels="$$(echo "$$rendered" | awk -v n="check-meridian-runtime-$$component" ' \
 			/^---/ { doc = 0; meta = 0; tmpl = 0; lab = 0 } \
@@ -1678,7 +1696,7 @@ chart-check:
 	@# broker.existingSecret, so for weeks the bundled broker read a sidecar's
 	@# instance and role from a key the values do not have, gave it neither,
 	@# and no sidecar could have started on it.
-	@rendered="$$($(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check \
+	@rendered="$$($(HELM_TEMPLATE) check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check \
 		--set 'sidecars[0].instanceId=check-1' --set 'sidecars[0].roles={custody,reporting}' 2>/dev/null)"; \
 	echo "$$rendered" | grep -q '^  check-1: ' \
 		|| { echo "chart-check FAILED: the bundled broker makes no credential for a sidecar's instance" >&2; exit 1; }; \
@@ -1689,7 +1707,7 @@ chart-check:
 	@# repository named meridian-analytics; its own credential on the broker
 	@# this chart brings; and the lake told its instance, whose reads for a
 	@# job are its client's.
-	@rendered="$$($(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check \
+	@rendered="$$($(HELM_TEMPLATE) check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check \
 		--set image.repository=example/meridian-runtime --set image.tag=t1 2>/dev/null)"; \
 	for part in coordinator worker; do \
 		echo "$$rendered" | grep -q "args: \[\"meridian-analytics\", \"$$part\"\]" \
@@ -1709,7 +1727,7 @@ chart-check:
 	@# ValidatingAdmissionPolicy, every plugin pod is held to it.
 	@edge="--set sidecars[0].instanceId=edge-1 --set sidecars[0].roles={custody} --set sidecars[0].plugin.image=x/edge:1 \
 		--set sidecars[1].instanceId=inner-1 --set sidecars[1].roles={operations} --set sidecars[1].plugin.image=x/inner:1"; \
-	rendered="$$($(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check $$edge 2>/dev/null)"; \
+	rendered="$$($(HELM_TEMPLATE) check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check $$edge 2>/dev/null)"; \
 	echo "$$rendered" | awk '/^---/{c=0} /^kind: PersistentVolumeClaim$$/{c=1} c&&/^  name: check-meridian-runtime-storage-edge-1$$/{n=1} c&&/helm.sh\/resource-policy: keep/{k=1} END{exit !(n&&k)}' \
 		|| { echo "chart-check FAILED: a configured plugin holding an edge role has no claim of its own that the chart keeps" >&2; exit 1; }; \
 	echo "$$rendered" | grep -q 'claimName: check-meridian-runtime-storage-edge-1$$' \
@@ -1723,10 +1741,10 @@ chart-check:
 		|| { echo "chart-check FAILED: the launcher holds no edge shape or no claim to make" >&2; exit 1; }; \
 	echo "$$rendered" | grep -A1 'name: MERIDIAN_LAUNCHER_EDGE_ROLES$$' | grep -q 'value: "confirmation,connectivity,custody,data,reporting,servicing,settlement"$$' \
 		|| { echo "chart-check FAILED: the launcher is not told decisions/028's seven edge roles" >&2; exit 1; }; \
-	off="$$($(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check $$edge --set pluginStorage.enabled=false 2>/dev/null)"; \
+	off="$$($(HELM_TEMPLATE) check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check $$edge --set pluginStorage.enabled=false 2>/dev/null)"; \
 	echo "$$off" | grep -q 'storage-edge-1\|claim.json\|MERIDIAN_STORAGE_DIR\|persistentvolumeclaims' \
 		&& { echo "chart-check FAILED: with pluginStorage off, storage still renders" >&2; exit 1; }; \
-	held="$$($(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check \
+	held="$$($(HELM_TEMPLATE) check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check \
 		--api-versions admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy --show-only templates/plugin-storage.yaml 2>/dev/null)"; \
 	echo "$$held" | grep -q "'check-meridian-runtime-storage-' +" \
 		&& echo "$$held" | grep -q '(confirmation|connectivity|custody|data|reporting|servicing|settlement)' \
@@ -1739,10 +1757,10 @@ chart-check:
 	@# every mount of it to that directory; a bucket the conductor told whether
 	@# it locks; and the values that cannot stand together refused.
 	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
-	none="$$($(HELM) template check deploy/chart $$base 2>/dev/null)"; \
+	none="$$($(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null)"; \
 	echo "$$none" | grep -q 'MERIDIAN_ARCHIVE\|archive.json\|plugin-archive' \
 		&& { echo "chart-check FAILED: with no pluginArchive, an archive still renders" >&2; exit 1; }; \
-	local="$$($(HELM) template check deploy/chart $$base --set pluginArchive.path=/srv/archive \
+	local="$$($(HELM_TEMPLATE) check deploy/chart $$base --set pluginArchive.path=/srv/archive \
 		--api-versions admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy 2>/dev/null)"; \
 	echo "$$local" | awk '/^---/{c=0} /^kind: PersistentVolumeClaim$$/{c=1} c&&/^  name: check-meridian-runtime-archive$$/{n=1} c&&/helm.sh\/resource-policy: keep/{k=1} END{exit !(n&&k)}' \
 		|| { echo "chart-check FAILED: a local archive is not a claim of its own, kept on uninstall" >&2; exit 1; }; \
@@ -1752,64 +1770,64 @@ chart-check:
 		|| { echo "chart-check FAILED: the launcher's archive shape is not the instance's own directory at MERIDIAN_ARCHIVE_DIR" >&2; exit 1; }; \
 	echo "$$local" | grep -q 'm.subPath == object.metadata.labels' \
 		|| { echo "chart-check FAILED: the admission policy does not hold an archive's mount to its instance's directory" >&2; exit 1; }; \
-	bucket="$$($(HELM) template check deploy/chart $$base --set pluginArchive.bucket=s3://firm/meridian \
+	bucket="$$($(HELM_TEMPLATE) check deploy/chart $$base --set pluginArchive.bucket=s3://firm/meridian \
 		--set pluginArchive.serviceAccount=archive-writer --set pluginArchive.objectLock=true 2>/dev/null)"; \
 	echo "$$bucket" | grep -A1 'name: MERIDIAN_ARCHIVE_LOCKS$$' | grep -q 'value: "true"' \
 		&& echo "$$bucket" | grep '^  archive.json: ' | grep -q 'MERIDIAN_ARCHIVE_BUCKET.*s3://firm/meridian/__INSTANCE__.*archive-writer' \
 		|| { echo "chart-check FAILED: a bucket archive does not render its prefix, its account and whether it locks" >&2; exit 1; }; \
 	for refused in "pluginArchive.bucket=s3://x" "pluginArchive.objectLock=true" \
 		"pluginArchive.path=/a,pluginArchive.existingClaim=c" "pluginArchive.path=/a,pluginArchive.bucket=s3://x,pluginArchive.serviceAccount=s"; do \
-		$(HELM) template check deploy/chart $$base --set "$$refused" >/dev/null 2>&1 \
+		$(HELM_TEMPLATE) check deploy/chart $$base --set "$$refused" >/dev/null 2>&1 \
 			&& { echo "chart-check FAILED: pluginArchive $$refused rendered, and cannot stand" >&2; exit 1; }; \
 	done; true
 	@$(HELM) lint deploy/chart $(CHART_VALUES) >/dev/null 2>&1 \
 		|| { echo "chart-check FAILED: helm lint" >&2; \
 		     echo "  docker run --rm -v \"$(CURDIR)\":/w -w /w alpine/helm:3.16.2 lint deploy/chart $(CHART_VALUES)" >&2; exit 1; }
-	@$(HELM) template check deploy/chart $(CHART_VALUES) >/dev/null 2>&1 \
+	@$(HELM_TEMPLATE) check deploy/chart $(CHART_VALUES) >/dev/null 2>&1 \
 		|| { echo "chart-check FAILED: the chart does not render with the three required values" >&2; exit 1; }
-	@$(HELM) template check deploy/chart --set deployment.id=D --set key.generate=false >/dev/null 2>&1 \
+	@$(HELM_TEMPLATE) check deploy/chart --set deployment.id=D --set key.generate=false >/dev/null 2>&1 \
 		&& { echo "chart-check FAILED: a deployment with no key and no way to make one rendered anyway" >&2; exit 1; }; true
 	@for missing in deployment.id; do \
-		if $(HELM) template check deploy/chart $(CHART_VALUES) --set $$missing= >/dev/null 2>&1; then \
+		if $(HELM_TEMPLATE) check deploy/chart $(CHART_VALUES) --set $$missing= >/dev/null 2>&1; then \
 			echo "chart-check FAILED: the chart rendered with $$missing unset" >&2; exit 1; \
 		fi; \
 	done
-	@unset="$$($(HELM) template check deploy/chart $(CHART_VALUES) --set database.existingSecret= 2>/dev/null)" \
+	@unset="$$($(HELM_TEMPLATE) check deploy/chart $(CHART_VALUES) --set database.existingSecret= 2>/dev/null)" \
 		|| { echo "chart-check FAILED: the chart does not render without a database secret, which is how a fresh install starts" >&2; exit 1; }; \
 	echo "$$unset" | grep -q "name: check-meridian-runtime-database" \
 		|| { echo "chart-check FAILED: without a database secret the chart makes none for the wizard to fill" >&2; exit 1; }; \
 	echo "$$unset" | awk '/name: check-meridian-runtime-database$$/{f=1} f&&/^data:/{print "has data"} /^---/{f=0}' | grep -q . \
 		&& { echo "chart-check FAILED: the database secret the chart makes is not empty" >&2; exit 1; }; true
-	@rendered="$$($(HELM) template check deploy/chart $(CHART_VALUES) 2>/dev/null)"; \
+	@rendered="$$($(HELM_TEMPLATE) check deploy/chart $(CHART_VALUES) 2>/dev/null)"; \
 	for store in meridian-conductor meridian-street meridian-bor meridian-lake meridian-instrument meridian-dashboard; do \
 		echo "$$rendered" | grep -q "\"$$store\", \"migrate\"" \
 			|| { echo "chart-check FAILED: the chart renders no migration for $$store" >&2; \
 			     echo "  each store verifies its schema and refuses to serve without one" >&2; exit 1; }; \
 	done
-	@$(HELM) template check deploy/chart $(CHART_VALUES) 2>/dev/null \
+	@$(HELM_TEMPLATE) check deploy/chart $(CHART_VALUES) 2>/dev/null \
 		| grep -q "runAsUser" \
 		&& { echo "chart-check FAILED: the chart pins a uid by default" >&2; \
 		     echo "  OpenShift assigns each namespace its own range and refuses a pod asking outside it" >&2; exit 1; } \
 		|| true
-	@$(HELM) template check deploy/chart --set deployment.id=DEP-check \
+	@$(HELM_TEMPLATE) check deploy/chart --set deployment.id=DEP-check \
 		--set key.generate=true --set database.existingSecret=d --set broker.existingSecret=b 2>/dev/null \
 		| grep -q "PersistentVolumeClaim" \
 		|| { echo "chart-check FAILED: key.generate renders no volume for the key" >&2; exit 1; }
-	@if $(HELM) template check deploy/chart $(CHART_VALUES) --set key.generate=true 2>/dev/null | grep -q "PersistentVolumeClaim"; then \
+	@if $(HELM_TEMPLATE) check deploy/chart $(CHART_VALUES) --set key.generate=true 2>/dev/null | grep -q "PersistentVolumeClaim"; then \
 		echo "chart-check FAILED: a deployment that was given a key made a second one anyway" >&2; \
 		echo "  generating is the default, and a named secret is what an administrator chose" >&2; exit 1; \
 	fi
-	@if ! $(HELM) template check deploy/chart --set deployment.id=DEP-check \
+	@if ! $(HELM_TEMPLATE) check deploy/chart --set deployment.id=DEP-check \
 		--set database.existingSecret=d --set broker.existingSecret=b >/dev/null 2>&1; then \
 		echo "chart-check FAILED: an install that named only its deployment did not render" >&2; \
 		echo "  a first install supplies what the platform gave it and nothing else" >&2; exit 1; \
 	fi
 	@for component in street instrument conductor; do \
-		$(HELM) template check deploy/chart $(CHART_VALUES) 2>/dev/null \
+		$(HELM_TEMPLATE) check deploy/chart $(CHART_VALUES) 2>/dev/null \
 			| grep -q "meridian-$$component\"\]" \
 			|| { echo "chart-check FAILED: nothing starts meridian-$$component" >&2; exit 1; }; \
 	done
-	@rendered="$$($(HELM) template check deploy/chart $(CHART_VALUES) 2>/dev/null)"; \
+	@rendered="$$($(HELM_TEMPLATE) check deploy/chart $(CHART_VALUES) 2>/dev/null)"; \
 	for component in street instrument conductor; do \
 		count="$$(echo "$$rendered" | awk '/^kind: Deployment$$/{d=1} d&&/^  name: /{print $$2; d=0}' \
 			| grep -c "^check-meridian-runtime-$$component$$")"; \
@@ -1820,11 +1838,11 @@ chart-check:
 	@# decisions/011. The key authenticates as the whole deployment, so exactly
 	@# one component may mount it. A second holder is a second thing that can
 	@# speak for the customer, and the last one appeared by accident.
-	@$(HELM) template check deploy/chart $(CHART_VALUES) 2>/dev/null \
+	@$(HELM_TEMPLATE) check deploy/chart $(CHART_VALUES) 2>/dev/null \
 		| awk '/^kind: Deployment/{c=""} /meridian.dev\/component:/{c=$$2} /key.pem/{print c}' \
 		| sort -u | grep -qx "conductor" \
 		|| { echo "chart-check FAILED: the key is mounted by something that is not the conductor" >&2; exit 1; }
-	@test "$$($(HELM) template check deploy/chart $(CHART_VALUES) 2>/dev/null \
+	@test "$$($(HELM_TEMPLATE) check deploy/chart $(CHART_VALUES) 2>/dev/null \
 		| awk '/^kind: Deployment/{c=""} /meridian.dev\/component:/{c=$$2} /key.pem/{print c}' \
 		| sort -u | wc -l | tr -d ' ')" = "1" \
 		|| { echo "chart-check FAILED: more than one component mounts the deployment key" >&2; exit 1; }
@@ -1833,7 +1851,7 @@ chart-check:
 	@# delivers them, is the one workload that mounts it. The chart makes its
 	@# Secret empty and keeps it, and a Job fills it once: a key drawn by a
 	@# template would sit in the release's own record.
-	@rendered="$$($(HELM) template check deploy/chart $(CHART_VALUES) $(PLUGIN_VALUES) 2>/dev/null)"; \
+	@rendered="$$($(HELM_TEMPLATE) check deploy/chart $(CHART_VALUES) $(PLUGIN_VALUES) 2>/dev/null)"; \
 	holders="$$(echo "$$rendered" | awk '/^---/{n=""} /^  name: / && n==""{n=$$2} /secretName: check-meridian-runtime-settings-key$$/{print n}' | sort -u)"; \
 	[ "$$holders" = "check-meridian-runtime-conductor" ] \
 		|| { echo "chart-check FAILED: the settings key is mounted by: $$holders; only the conductor mounts it" >&2; exit 1; }; \
@@ -1843,7 +1861,7 @@ chart-check:
 		|| { echo "chart-check FAILED: nothing makes the settings key" >&2; exit 1; }; \
 	echo "$$rendered" | awk '/^---/{s=0;f=0} /^kind: Secret$$/{s=1} s&&/^  name: check-meridian-runtime-settings-key$$/{f=1} f&&/helm.sh\/resource-policy: keep/{print; exit}' | grep -q . \
 		|| { echo "chart-check FAILED: the settings key's Secret is not kept when the release goes" >&2; exit 1; }
-	@$(HELM) template check deploy/chart $(CHART_VALUES) \
+	@$(HELM_TEMPLATE) check deploy/chart $(CHART_VALUES) \
 		--set 'sidecars[0].instanceId=check-1' --set 'sidecars[0].roles={custody}' 2>/dev/null \
 		| grep -q "sidecar-check-1" \
 		|| { echo "chart-check FAILED: a configured plugin gets no sidecar" >&2; exit 1; }
@@ -1852,62 +1870,62 @@ chart-check:
 	@# nothing that would let it speak on the bus as itself. Each check reads
 	@# only the plugin container's block, so a credential correctly held by the
 	@# sidecar beside it cannot satisfy or fail it.
-	@$(HELM) template check deploy/chart $(CHART_VALUES) $(PLUGIN_VALUES) --show-only templates/sidecar.yaml 2>/dev/null \
+	@$(HELM_TEMPLATE) check deploy/chart $(CHART_VALUES) $(PLUGIN_VALUES) --show-only templates/sidecar.yaml 2>/dev/null \
 		| grep -q "^        - name: plugin$$" \
 		|| { echo "chart-check FAILED: a sidecar given a plugin renders no plugin container" >&2; exit 1; }
 	@for forbidden in MERIDIAN_BROKER_URL MERIDIAN_PLUGIN_ROLES MERIDIAN_PLUGIN_TAGS "name: grants"; do \
-		if $(HELM) template check deploy/chart $(CHART_VALUES) $(PLUGIN_VALUES) --show-only templates/sidecar.yaml 2>/dev/null \
+		if $(HELM_TEMPLATE) check deploy/chart $(CHART_VALUES) $(PLUGIN_VALUES) --show-only templates/sidecar.yaml 2>/dev/null \
 			| awk '/^        - name: plugin$$/{p=1;next} p&&/^        - name: /{p=0} p&&/^      [a-z]/{p=0} p' \
 			| grep -q "$$forbidden"; then \
 			echo "chart-check FAILED: the plugin container is given $$forbidden" >&2; \
 			echo "  the sidecar holds that so the plugin does not; containers share a network, not a filesystem" >&2; exit 1; \
 		fi; \
 	done
-	@$(HELM) template check deploy/chart $(CHART_VALUES) $(PLUGIN_VALUES) --show-only templates/sidecar.yaml 2>/dev/null \
+	@$(HELM_TEMPLATE) check deploy/chart $(CHART_VALUES) $(PLUGIN_VALUES) --show-only templates/sidecar.yaml 2>/dev/null \
 		| awk '/^        - name: plugin$$/{p=1;next} p&&/^        - name: /{p=0} p&&/^      [a-z]/{p=0} p' \
 		| grep -q "MERIDIAN_SIDECAR_ADDRESS" \
 		|| { echo "chart-check FAILED: the plugin container is not told where its sidecar is" >&2; exit 1; }
 	@for secret in b k; do \
-		if $(HELM) template check deploy/chart $(CHART_VALUES) $(PLUGIN_VALUES) \
+		if $(HELM_TEMPLATE) check deploy/chart $(CHART_VALUES) $(PLUGIN_VALUES) \
 			--set "sidecars[0].plugin.existingSecret=$$secret" >/dev/null 2>&1; then \
 			echo "chart-check FAILED: a plugin was allowed to read secret $$secret" >&2; \
 			echo "  the broker's and the key's secrets must never reach a plugin through envFrom" >&2; exit 1; \
 		fi; \
 	done
-	@$(HELM) template check deploy/chart $(CHART_VALUES) \
+	@$(HELM_TEMPLATE) check deploy/chart $(CHART_VALUES) \
 		--set 'sidecars[0].instanceId=check-1' --set 'sidecars[0].roles={custody}' \
 		--show-only templates/sidecar.yaml 2>/dev/null | grep -q "^        - name: plugin$$" \
 		&& { echo "chart-check FAILED: a sidecar with no plugin rendered a plugin container" >&2; exit 1; } || true
-	@bundled="$$($(HELM) template check deploy/chart --set deployment.id=D --set key.existingSecret=k 2>/dev/null)"; \
+	@bundled="$$($(HELM_TEMPLATE) check deploy/chart --set deployment.id=D --set key.existingSecret=k 2>/dev/null)"; \
 	echo "$$bundled" | grep -q 'meridian.dev/component: broker' \
 		|| { echo "chart-check FAILED: with no broker secret the chart brings no broker, so an install still needs one written by hand" >&2; exit 1; }; \
 	echo "$$bundled" | grep -q 'meridian-broker-config' \
 		|| { echo "chart-check FAILED: the bundled broker does not generate its permissions from the contract" >&2; exit 1; }; \
-	$(HELM) template check deploy/chart $(CHART_VALUES) 2>/dev/null | grep -q 'meridian.dev/component: broker' \
+	$(HELM_TEMPLATE) check deploy/chart $(CHART_VALUES) 2>/dev/null | grep -q 'meridian.dev/component: broker' \
 		&& { echo "chart-check FAILED: a deployment with its own broker got one from the chart as well" >&2; exit 1; }; true
 	@# Contract v20 (the product owner, 2026-10-11): the instrument store holds
 	@# a broker credential of its own, made by the bundled broker and read by
 	@# its pod, not the runtime's shared one.
-	@bundled="$$($(HELM) template check deploy/chart --set deployment.id=D --set key.existingSecret=k 2>/dev/null)"; \
+	@bundled="$$($(HELM_TEMPLATE) check deploy/chart --set deployment.id=D --set key.existingSecret=k 2>/dev/null)"; \
 	echo "$$bundled" | grep -q '^  instrument-password: ' \
 		|| { echo "chart-check FAILED: the bundled broker makes no credential of the instrument store's own" >&2; exit 1; }; \
 	echo "$$bundled" | grep -q '^  MERIDIAN_NATS_INSTRUMENT: ' \
 		|| { echo "chart-check FAILED: the bundled broker reads no password for the instrument store" >&2; exit 1; }; \
-	$(HELM) template check deploy/chart --set deployment.id=D --set key.existingSecret=k \
+	$(HELM_TEMPLATE) check deploy/chart --set deployment.id=D --set key.existingSecret=k \
 		--show-only templates/instrument.yaml 2>/dev/null | grep -A8 'name: MERIDIAN_BROKER_URL' | grep -q 'key: instrument$$' \
 		|| { echo "chart-check FAILED: the instrument store reads the runtime's broker credential, not its own" >&2; exit 1; }
-	@$(HELM) template check deploy/chart $(CHART_VALUES) --set dashboard.enabled=true \
+	@$(HELM_TEMPLATE) check deploy/chart $(CHART_VALUES) --set dashboard.enabled=true \
 		--set dashboard.url=https://meridian.example 2>/dev/null \
 		| grep -q '"meridian-dashboard"' \
 		|| { echo "chart-check FAILED: the dashboard does not render when enabled" >&2; exit 1; }
 	@# An address is what a directory needs, and a deployment nobody has set up
 	@# has neither: the wizard asks for both. What must not render is a second
 	@# dashboard, because one holds the wizard's single session.
-	@$(HELM) template check deploy/chart $(CHART_VALUES) --set dashboard.enabled=true \
+	@$(HELM_TEMPLATE) check deploy/chart $(CHART_VALUES) --set dashboard.enabled=true \
 		--set dashboard.url= 2>/dev/null | grep -q '"meridian-dashboard"' \
 		|| { echo "chart-check FAILED: a deployment with no address yet renders no dashboard, so nothing serves its wizard" >&2; exit 1; }
 	@for refused in "dashboard.replicaCount=2"; do \
-		if $(HELM) template check deploy/chart $(CHART_VALUES) --set dashboard.enabled=true \
+		if $(HELM_TEMPLATE) check deploy/chart $(CHART_VALUES) --set dashboard.enabled=true \
 			--set dashboard.url=https://meridian.example --set $$refused >/dev/null 2>&1; then \
 			echo "chart-check FAILED: the dashboard rendered with $$refused" >&2; exit 1; \
 		fi; \
@@ -1916,16 +1934,16 @@ chart-check:
 	@# is what makes first run possible: it does not exist until somebody has
 	@# been through the wizard, and a required key would leave the dashboard
 	@# unable to start and so unable to serve the wizard that fills it.
-	@$(HELM) template check deploy/chart $(CHART_VALUES) --set dashboard.enabled=true \
+	@$(HELM_TEMPLATE) check deploy/chart $(CHART_VALUES) --set dashboard.enabled=true \
 		--set dashboard.url=https://meridian.example 2>/dev/null \
 		| awk '/name: MERIDIAN_OIDC_CLIENT_ID/{f=1} f&&/optional: true/{print "optional"; exit}' | grep -q optional \
 		|| { echo "chart-check FAILED: the dashboard cannot start without a client id, and the wizard that makes one is what it would be serving" >&2; exit 1; }
 	@# And the firm's LDAP, on the branch where the dashboard binds it itself.
-	@$(HELM) template check deploy/chart $(CHART_VALUES) --set dashboard.enabled=true \
+	@$(HELM_TEMPLATE) check deploy/chart $(CHART_VALUES) --set dashboard.enabled=true \
 		--set dashboard.url=https://meridian.example 2>/dev/null \
 		| awk '/name: MERIDIAN_LDAP_SERVERS/{f=1} f&&/optional: true/{print "optional"; exit}' | grep -q optional \
 		|| { echo "chart-check FAILED: the dashboard cannot start without a directory, and first run is what configures one" >&2; exit 1; }
-	@role="$$($(HELM) template check deploy/chart $(CHART_VALUES) --set dashboard.enabled=true \
+	@role="$$($(HELM_TEMPLATE) check deploy/chart $(CHART_VALUES) --set dashboard.enabled=true \
 		--set dashboard.url=https://meridian.example 2>/dev/null \
 		| awk '/^kind: Role$$/{r=1} r; /^---/{r=0}' \
 		| sed -n '/name: check-meridian-runtime-first-run/,/^---/p')"; \
@@ -1937,7 +1955,7 @@ chart-check:
 		|| { echo "chart-check FAILED: a first-run rule names no resource" >&2; exit 1; }; true
 	@# The address is the wizard's to learn, so the chart renders without one
 	@# and the dashboard reads what first run wrote.
-	@without="$$($(HELM) template check deploy/chart $(CHART_VALUES) --set dashboard.enabled=true \
+	@without="$$($(HELM_TEMPLATE) check deploy/chart $(CHART_VALUES) --set dashboard.enabled=true \
 		--set dashboard.url= 2>/dev/null)"; \
 	echo "$$without" | grep -q 'key: issuer' \
 		|| { echo "chart-check FAILED: the dashboard does not read the issuer first run wrote" >&2; exit 1; }; \
@@ -1947,7 +1965,7 @@ chart-check:
 	@# dashboard's pods and nothing else, the dashboard's private key is
 	@# mounted by the dashboard alone, and the Job that makes it may create
 	@# nothing and gives its rights up.
-	@rendered="$$($(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check \
+	@rendered="$$($(HELM_TEMPLATE) check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check \
 		--set 'sidecars[0].instanceId=check-1' 2>/dev/null)"; \
 	doc() { echo "$$rendered" | awk -v k="kind: $$1" -v n="  name: $$2" \
 		'function f(){ if (a && b) printf "%s", d; d=""; a=0; b=0 } /^---/{f(); next} {d=d $$0 "\n"} $$0==k{a=1} $$0==n{b=1} END{f()}'; }; \
@@ -1978,7 +1996,7 @@ chart-check:
 	template="$$(doc ConfigMap check-meridian-runtime-launcher-template)"; \
 	echo "$$template" | grep -q 'meridian.dev/launched' && echo "$$template" | grep -q 'check-meridian-runtime-broker-launched' \
 		|| { echo "chart-check FAILED: the launcher's template does not mark its workloads, or takes their credential from anywhere but the launched plugins' Secret" >&2; exit 1; }; \
-	$(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check \
+	$(HELM_TEMPLATE) check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check \
 		--api-versions admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy 2>/dev/null | grep -q '^kind: ValidatingAdmissionPolicyBinding$$' \
 		|| { echo "chart-check FAILED: on a cluster with ValidatingAdmissionPolicy, nothing holds the launcher to its own Deployments" >&2; exit 1; }; \
 	doc Deployment check-meridian-runtime-sidecar-check-1 | grep -q '^    type: Recreate$$' \
@@ -1987,15 +2005,15 @@ chart-check:
 		|| { echo "chart-check FAILED: the plugins' NetworkPolicy does not select every sidecar by its component" >&2; exit 1; }; \
 	echo "$$rendered" | grep -q '^      subdomain: check-meridian-runtime-sidecars$$' \
 		|| { echo "chart-check FAILED: a sidecar pod is not named under the plugins' one Service, so the dashboard cannot reach it" >&2; exit 1; }; \
-	[ "$$(echo "$$rendered" | grep -c '^kind: NetworkPolicy$$')" = "$$($(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check 2>/dev/null | grep -c '^kind: NetworkPolicy$$')" ] \
+	[ "$$(echo "$$rendered" | grep -c '^kind: NetworkPolicy$$')" = "$$($(HELM_TEMPLATE) check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check 2>/dev/null | grep -c '^kind: NetworkPolicy$$')" ] \
 		|| { echo "chart-check FAILED: a plugin brought its own NetworkPolicy; every plugin shares one, so the launcher never makes one" >&2; exit 1; }
 	@# The one exception is the upgrade preflight (H1, ruling 586), whose
 	@# purpose is to stop an upgrade: before an upgrade only, never on an
 	@# install, and finishing at once where no database is configured yet.
-	@$(HELM) template check deploy/chart $(CHART_VALUES) 2>/dev/null \
+	@$(HELM_TEMPLATE) check deploy/chart $(CHART_VALUES) 2>/dev/null \
 		| awk '/^kind: Job$$/{j=1} j&&/^  name: .*-preflight$$/{j=0} j&&/helm.sh\/hook/{print} /^---/{j=0}' | grep -q 'pre-install\|pre-upgrade\|post-install' \
 		&& { echo "chart-check FAILED: a Job runs as a Helm hook. A hook must finish before the dashboard exists, and on a fresh install the wizard is what configures the database it would wait for" >&2; exit 1; }; \
-	$(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check 2>/dev/null \
+	$(HELM_TEMPLATE) check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check 2>/dev/null \
 		| awk '/^---/{p=0} /^  name: check-meridian-runtime-preflight$$/{p=1} p&&/"helm.sh\/hook":/{print}' \
 		| grep -qx '    "helm.sh/hook": pre-upgrade' \
 		|| { echo "chart-check FAILED: the upgrade preflight is not a pre-upgrade hook alone: it must run before every upgrade and never on an install" >&2; exit 1; }; \
@@ -2006,7 +2024,7 @@ chart-check:
 	@# credential, never the migrating one -- and its pod carries every label
 	@# the database's NetworkPolicy admits from. Its waiting for a database
 	@# that refuses at first is test-store's and the unit tests'.
-	@rendered="$$($(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check 2>/dev/null)"; \
+	@rendered="$$($(HELM_TEMPLATE) check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check 2>/dev/null)"; \
 	sources="$$(echo "$$rendered" | awk '/^---/{kind="";name=""} /^kind: /{kind=$$2} /^  name: /{if(name=="")name=$$2} \
 		/- name: MERIDIAN_[A-Z_]*DATABASE_URL$$/{getline;getline;getline;n=$$2;getline;print kind, name, n "/" $$2}')"; \
 	hook="$$(echo "$$sources" | awk '$$2=="check-meridian-runtime-preflight"{print $$3}' | sort -u)"; \
@@ -2031,7 +2049,7 @@ chart-check:
 	@# name, so the next upgrade removes it, and by a TTL, for the Jobs of an
 	@# upgrade that failed, which no later one removes. Rendered with a plugin,
 	@# so every Deployment and Job the chart has is in it.
-	@rendered="$$($(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check \
+	@rendered="$$($(HELM_TEMPLATE) check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check \
 		--set 'sidecars[0].instanceId=check-1' 2>/dev/null)"; \
 	[ "$$(echo "$$rendered" | grep -cE '^kind: (Deployment|Job)$$')" -ge 12 ] \
 		|| { echo "chart-check FAILED: the render has fewer Deployments and Jobs than the chart makes, so the check below would prove little" >&2; exit 1; }; \
@@ -2056,7 +2074,7 @@ chart-check:
 	@# hook, never a resource of the release: `helm upgrade --wait` waits for
 	@# every resource the release names to exist, and failed on one of these
 	@# being gone (task kernel/upgrading-a-deployment-in-place, fault 2).
-	@rendered="$$($(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check 2>/dev/null)"; \
+	@rendered="$$($(HELM_TEMPLATE) check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check 2>/dev/null)"; \
 	given_up="$$(echo "$$rendered" | grep -A1 'resources: \["rolebindings"\]' | grep resourceNames | tr -d '[]",' | sed 's/.*resourceNames://')"; \
 	[ "$$(echo $$given_up | wc -w | tr -d ' ')" -ge 3 ] \
 		|| { echo "chart-check FAILED: found fewer bindings given up than the three Jobs that give theirs up, so the check below would prove little" >&2; exit 1; }; \
@@ -2072,12 +2090,12 @@ chart-check:
 	@# a home page saying nobody administers it (task
 	@# kernel/upgrading-a-deployment-in-place). No surge, not Recreate: Helm 4's
 	@# server-side apply cannot change an existing Deployment to Recreate.
-	@$(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check 2>/dev/null \
+	@$(HELM_TEMPLATE) check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check 2>/dev/null \
 		| awk '/^---/{d=0;c=0;next} /^kind: Deployment$$/{d=1} d&&$$0=="  name: check-meridian-runtime-conductor"{c=1} c&&/^      maxSurge: 0$$/{f=1} END{exit !f}' \
 		|| { echo "chart-check FAILED: the conductor's Deployment surges, so an old conductor answers beside the new one while it waits for its schema" >&2; exit 1; }
 	@# One writer per partition of the book (W9.8): its rollout does not surge
 	@# either, so an old book never journals beside the new one.
-	@$(HELM) template check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check 2>/dev/null \
+	@$(HELM_TEMPLATE) check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check 2>/dev/null \
 		| awk '/^---/{d=0;c=0;next} /^kind: Deployment$$/{d=1} d&&$$0=="  name: check-meridian-runtime-bor"{c=1} c&&/^      maxSurge: 0$$/{f=1} END{exit !f}' \
 		|| { echo "chart-check FAILED: the book's Deployment surges, so two of it would write one partition's journal" >&2; exit 1; }
 	@# The Ingress (spec/live-plugin-development, ruling 1): none unless asked
@@ -2085,9 +2103,9 @@ chart-check:
 	@# wildcard below the host; TLS for both; the address offered to the
 	@# wizard; and a host that is an address, or none, refused.
 	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
-	[ "$$($(HELM) template check deploy/chart $$base 2>/dev/null | grep -c '^kind: Ingress$$')" = 0 ] \
+	[ "$$($(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null | grep -c '^kind: Ingress$$')" = 0 ] \
 		|| { echo "chart-check FAILED: an Ingress is rendered though none was asked for" >&2; exit 1; }; \
-	on="$$($(HELM) template check deploy/chart $$base --set ingress.enabled=true --set ingress.host=meridian.firm.example \
+	on="$$($(HELM_TEMPLATE) check deploy/chart $$base --set ingress.enabled=true --set ingress.host=meridian.firm.example \
 		--set ingress.tls.secretName=dash-tls --set ingress.tls.pluginsSecretName=plugins-tls 2>/dev/null)" \
 		|| { echo "chart-check FAILED: the chart does not render with its Ingress on" >&2; exit 1; }; \
 	ingress="$$(echo "$$on" | awk '/^---/{p=0} /^kind: Ingress$$/{p=1} p')"; \
@@ -2102,7 +2120,7 @@ chart-check:
 	echo "$$on" | grep -A1 'MERIDIAN_DASHBOARD_SUGGESTED_URL' | grep -q '"https://meridian.firm.example"' \
 		|| { echo "chart-check FAILED: the wizard is not offered the address the Ingress serves" >&2; exit 1; }; \
 	for bad in "--set ingress.host=10.0.0.7" "--set ingress.host="; do \
-		! $(HELM) template check deploy/chart $$base --set ingress.enabled=true --set ingress.tls.secretName=dash-tls $$bad >/dev/null 2>&1 \
+		! $(HELM_TEMPLATE) check deploy/chart $$base --set ingress.enabled=true --set ingress.tls.secretName=dash-tls $$bad >/dev/null 2>&1 \
 			|| { echo "chart-check FAILED: an Ingress rendered with $$bad, where plugin pages cannot have names below it" >&2; exit 1; }; \
 	done
 	@# HTTPS alone unless plain HTTP is turned on, for testing (task kernel/a-
@@ -2111,13 +2129,13 @@ chart-check:
 	@# kept to websecure; plain HTTP on is served on every entrypoint, and the
 	@# wizard is offered http.
 	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check --set ingress.enabled=true --set ingress.host=meridian.localhost"; \
-	refused="$$($(HELM) template check deploy/chart $$base 2>&1)"; \
+	refused="$$($(HELM_TEMPLATE) check deploy/chart $$base 2>&1)"; \
 	[ $$? -ne 0 ] && echo "$$refused" | grep -q 'ingress.tls.secretName is empty' && echo "$$refused" | grep -q 'ingress.plainHttp=true' \
 		|| { echo "chart-check FAILED: an Ingress with no certificate rendered with plain HTTP off, or was refused without saying how to fix it:" >&2; echo "$$refused" | tail -3 >&2; exit 1; }; \
-	served="$$($(HELM) template check deploy/chart $$base --set ingress.tls.secretName=meridian-tls 2>/dev/null | awk '/^---/{p=0} /^kind: Ingress$$/{p=1} p')"; \
+	served="$$($(HELM_TEMPLATE) check deploy/chart $$base --set ingress.tls.secretName=meridian-tls 2>/dev/null | awk '/^---/{p=0} /^kind: Ingress$$/{p=1} p')"; \
 	echo "$$served" | grep -q 'traefik.ingress.kubernetes.io/router.entrypoints: "websecure"' \
 		|| { echo "chart-check FAILED: with plain HTTP off, Traefik would serve the Ingress on port 80 too" >&2; exit 1; }; \
-	plain="$$($(HELM) template check deploy/chart $$base --set ingress.plainHttp=true 2>/dev/null)" \
+	plain="$$($(HELM_TEMPLATE) check deploy/chart $$base --set ingress.plainHttp=true 2>/dev/null)" \
 		|| { echo "chart-check FAILED: with ingress.plainHttp on, an Ingress with no certificate does not render" >&2; exit 1; }; \
 	! echo "$$plain" | grep -q 'router.entrypoints' \
 		|| { echo "chart-check FAILED: with ingress.plainHttp on, Traefik is still kept off port 80" >&2; exit 1; }; \
@@ -2125,23 +2143,23 @@ chart-check:
 		|| { echo "chart-check FAILED: with plain HTTP on and no certificate, the wizard is not offered the http address the Ingress serves" >&2; exit 1; }
 	@# Development (spec/live-plugin-development, ruling 2): only when asked.
 	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
-	! $(HELM) template check deploy/chart $$base 2>/dev/null | grep -q MERIDIAN_DEVELOPMENT \
+	! $(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null | grep -q MERIDIAN_DEVELOPMENT \
 		|| { echo "chart-check FAILED: a deployment nobody installed for development is told it is one" >&2; exit 1; }; \
-	$(HELM) template check deploy/chart $$base --set development=true 2>/dev/null | grep -A1 MERIDIAN_DEVELOPMENT | grep -q '"true"' \
+	$(HELM_TEMPLATE) check deploy/chart $$base --set development=true 2>/dev/null | grep -A1 MERIDIAN_DEVELOPMENT | grep -q '"true"' \
 		|| { echo "chart-check FAILED: a deployment installed for development does not tell its dashboard" >&2; exit 1; }
 	@# The live shape (spec/live-plugin-development): the launcher's second
 	@# template on a development deployment alone, with the shared folder, the
 	@# shared group, the step seeding it group-writable and the dev runner; the
 	@# plugin shape unchanged by it.
 	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
-	! $(HELM) template check deploy/chart $$base 2>/dev/null | grep -q 'plugin-live.json' \
+	! $(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null | grep -q 'plugin-live.json' \
 		|| { echo "chart-check FAILED: a deployment not for development renders the live shape" >&2; exit 1; }; \
-	live="$$($(HELM) template check deploy/chart $$base --set development=true 2>/dev/null | grep '^  plugin-live.json:')"; \
+	live="$$($(HELM_TEMPLATE) check deploy/chart $$base --set development=true 2>/dev/null | grep '^  plugin-live.json:')"; \
 	for said in 'meridian-dev' 'fsGroup' '/plugin/live' 'MERIDIAN_LIVE_DIR' 'meridian.dev/live' 'meridian.dev/launched' 'initContainers' 'g+rwX' 'mindepth'; do \
 		echo "$$live" | grep -q "$$said" \
 			|| { echo "chart-check FAILED: the live shape does not carry $$said" >&2; exit 1; }; \
 	done; \
-	plain="$$($(HELM) template check deploy/chart $$base --set development=true 2>/dev/null | grep '^  plugin.json:')"; \
+	plain="$$($(HELM_TEMPLATE) check deploy/chart $$base --set development=true 2>/dev/null | grep '^  plugin.json:')"; \
 	! echo "$$plain" | grep -q 'meridian-dev\|/plugin/live\|fsGroup\|initContainers' \
 		|| { echo "chart-check FAILED: the plugin shape carries the live shape's parts" >&2; exit 1; }
 	@# Backups (task kernel/a-deployment-is-backed-up-and-restored): nothing
@@ -2152,15 +2170,15 @@ chart-check:
 	@# keeps holding no enrolment code; backup.database read as the rule when
 	@# empty, as said when true or false, and anything else refused.
 	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
-	! $(HELM) template check deploy/chart $$base 2>/dev/null | grep -q 'meridian.dev/component: backup' \
+	! $(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null | grep -q 'meridian.dev/component: backup' \
 		|| { echo "chart-check FAILED: a backup renders though no recipient and no place were given" >&2; exit 1; }; \
-	refused="$$($(HELM) template check deploy/chart $$base --set backup.schedule='0 2 * * *' --set backup.path=/b 2>&1)"; \
+	refused="$$($(HELM_TEMPLATE) check deploy/chart $$base --set backup.schedule='0 2 * * *' --set backup.path=/b 2>&1)"; \
 	[ $$? -ne 0 ] && echo "$$refused" | grep -q 'backup.recipient' \
 		|| { echo "chart-check FAILED: a schedule with no recipient rendered, or was refused without naming backup.recipient" >&2; exit 1; }; \
-	refused="$$($(HELM) template check deploy/chart $$base --set backup.schedule='0 2 * * *' --set backup.recipient=age1check 2>&1)"; \
+	refused="$$($(HELM_TEMPLATE) check deploy/chart $$base --set backup.schedule='0 2 * * *' --set backup.recipient=age1check 2>&1)"; \
 	[ $$? -ne 0 ] && echo "$$refused" | grep -q 'backup.path' \
 		|| { echo "chart-check FAILED: a schedule with nowhere to write rendered, or was refused without naming backup.path" >&2; exit 1; }; \
-	asked="$$($(HELM) template check deploy/chart $$base --set backup.recipient=age1check --set backup.path=/b 2>/dev/null)" \
+	asked="$$($(HELM_TEMPLATE) check deploy/chart $$base --set backup.recipient=age1check --set backup.path=/b 2>/dev/null)" \
 		|| { echo "chart-check FAILED: the chart does not render with a recipient and a path" >&2; exit 1; }; \
 	job="$$(echo "$$asked" | awk '/^---/{p=0} /^kind: CronJob$$/{p=1} p')"; \
 	echo "$$job" | grep -q '^  suspend: true$$' \
@@ -2174,29 +2192,29 @@ chart-check:
 		|| { echo "chart-check FAILED: the backup's Jobs have no ttlSecondsAfterFinished" >&2; exit 1; }; \
 	! echo "$$asked" | awk '/^---/{p=0} /^  name: check-meridian-runtime-backup-values$$/{p=1} p' | grep -q 'ENR-check' \
 		|| { echo "chart-check FAILED: the values a backup keeps hold the enrolment code" >&2; exit 1; }; \
-	$(HELM) template check deploy/chart $$base --set backup.recipient=age1check --set backup.path=/b --set backup.schedule='0 2 * * *' 2>/dev/null \
+	$(HELM_TEMPLATE) check deploy/chart $$base --set backup.recipient=age1check --set backup.path=/b --set backup.schedule='0 2 * * *' 2>/dev/null \
 		| awk '/^---/{p=0} /^kind: CronJob$$/{p=1} p' | grep -q '^  suspend: false$$' \
 		|| { echo "chart-check FAILED: with a schedule the backup's CronJob is still suspended" >&2; exit 1; }; \
 	for said in "auto:" "true:--set backup.database=true" "false:--set backup.database=false"; do \
 		want="$${said%%:*}"; flag="$${said#*:}"; \
-		$(HELM) template check deploy/chart $$base --set backup.recipient=age1check --set backup.path=/b $$flag 2>/dev/null \
+		$(HELM_TEMPLATE) check deploy/chart $$base --set backup.recipient=age1check --set backup.path=/b $$flag 2>/dev/null \
 			| grep -A1 'name: MERIDIAN_BACKUP_DATABASE$$' | grep -q "value: \"$$want\"" \
 			|| { echo "chart-check FAILED: backup.database $${flag:-unset} does not tell the backup $$want" >&2; exit 1; }; \
 	done; \
-	! $(HELM) template check deploy/chart $$base --set backup.recipient=age1check --set backup.path=/b --set backup.database=maybe >/dev/null 2>&1 \
+	! $(HELM_TEMPLATE) check deploy/chart $$base --set backup.recipient=age1check --set backup.path=/b --set backup.database=maybe >/dev/null 2>&1 \
 		|| { echo "chart-check FAILED: backup.database=maybe rendered; it takes true, false or nothing" >&2; exit 1; }
 	@# Contract v25 (W8.10): the platform's keys reach the conductor alone,
 	@# as files it verifies against; none, and the registries are not reached.
 	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
-	keyed="$$($(HELM) template check deploy/chart $$base --set-string 'registries.platformKeys[0]=-----BEGIN PUBLIC KEY-----' 2>/dev/null)" \
+	keyed="$$($(HELM_TEMPLATE) check deploy/chart $$base --set-string 'registries.platformKeys[0]=-----BEGIN PUBLIC KEY-----' 2>/dev/null)" \
 		|| { echo "chart-check FAILED: the chart does not render with a platform key" >&2; exit 1; }; \
 	echo "$$keyed" | grep -q 'key-0.pem: |' \
 		|| { echo "chart-check FAILED: a platform key renders no ConfigMap entry" >&2; exit 1; }; \
 	[ "$$(echo "$$keyed" | grep -c 'name: MERIDIAN_PLATFORM_KEYS_DIR')" = 1 ] \
 		|| { echo "chart-check FAILED: the platform's keys reach other than the conductor alone" >&2; exit 1; }; \
-	! $(HELM) template check deploy/chart $$base --set-json 'registries.platformKeys=[]' 2>/dev/null | grep -q 'MERIDIAN_PLATFORM_KEYS_DIR\|platform-keys' \
+	! $(HELM_TEMPLATE) check deploy/chart $$base --set-json 'registries.platformKeys=[]' 2>/dev/null | grep -q 'MERIDIAN_PLATFORM_KEYS_DIR\|platform-keys' \
 		|| { echo "chart-check FAILED: no platform key still renders the keys' volume or variable" >&2; exit 1; }; \
-	$(HELM) template check deploy/chart $$base 2>/dev/null | grep -q 'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEYM0/p11OyeOPd/Wxgpt0yNiY74kY' \
+	$(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null | grep -q 'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEYM0/p11OyeOPd/Wxgpt0yNiY74kY' \
 		|| { echo "chart-check FAILED: the chart's default does not carry the platform's key (v26)" >&2; exit 1; }
 	@echo "chart-check OK: the platform's keys on the conductor alone, as files, only where the chart carries some, its current key by default; four components, the dashboard and the three ways it signs people in, the key and the settings key on the conductor alone, both key paths, refusals, migrations, no pinned uid, a plugin held to its side of the pod, its front door open to the dashboard alone, an Ingress only when asked for and HTTPS alone unless plain HTTP is, development only when asked for, the live shape there alone, a backup only when sealed and placed, and nothing an upgrade leaves behind"
 
