@@ -26358,7 +26358,7 @@
         {
           "version": "v29",
           "kind": "clarified",
-          "what": "agency_pool, an open scheme, names an agency pool by the agency's pool number with the agency in source (FNMA, FHLMC, GNMA); a debt record matches on figi and agency_pool, and cusip and isin stay deployment-side, mapped to FIGI at the edge and never sent to the platform (ruling 677)"
+          "what": "agency_pool, an open scheme, names an agency pool by the agency's pool number with the agency in source (FNMA, FHLMC, GNMA); a debt record matches on figi and agency_pool, and cusip and isin stay deployment-side, never sent to the platform and in v29 mapped to no FIGI (rulings 677, 976)"
         },
         {
           "version": "v29",
@@ -29696,13 +29696,20 @@
     {
       "name": "meridian.v1.InstrumentRecord.missing_fields",
       "type": "repeated text",
-      "empty": "empty for a record complete against its template, and for every INS- record the platform minted",
-      "intent": "lists what a local record lacks against its template (W3.7; approved 2026-10-14)",
-      "meaning": "each required field of the record's template it does not hold, by its path in the template (TemplateField.path), from the catalogue the store holds; shown on the Instruments page and filled there or by a reference plugin's offer (W3.10, W3.23); never a gate on asking the platform, which fills a template from its own source (W1.25)",
+      "empty": "empty for a record complete against its template; an INS- record the platform minted lists only the complete fields it lacks, from contract v28 (574), and none under a template before v28's levels",
+      "intent": "lists what a record lacks against its template (W3.7; approved 2026-10-14; W1.24, 574)",
+      "meaning": "each field of the record's template it does not hold, by its path in the template (TemplateField.path), from the catalogue the store holds: on a local record each mint or complete field; on an INS- record, minted when its mint fields are met, each complete field until it is filled (574), beside the paths the platform's record names as missing where only its source can say (a callable bond's calls); an optional field never; shown on the Instruments page and filled there or by a reference plugin's offer (W3.10, W3.23), an INS- record's by the platform's next version; never a gate on asking the platform, which fills a template from its own source (W1.25)",
       "not_meaning": "a refusal's fields; or the fields a person has yet to accept, which offers show",
       "filled": "derived",
       "filled_by": "instrument",
       "since": "v24",
+      "changes": [
+        {
+          "version": "v29",
+          "kind": "clarified",
+          "what": "an INS- record lists the complete fields of its template it lacks, as W1.24 has said since v28 (574), and the platform's record's own list beside them; the entry had said empty for every INS- record"
+        }
+      ],
       "stability": "preview",
       "store": "instrument"
     },
