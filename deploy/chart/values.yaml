@@ -262,6 +262,15 @@ lake:
   # 441 MiB resident with the default and 121 MiB with 2, the same live
   # heap (~62 MiB at its peak).
   mallocArenaMax: 2
+  # glibc maps an allocation of this many bytes or more of its own, and
+  # unmaps it when it is freed (ruling 972). Left to glibc, the threshold
+  # rises with the first large allocation freed, up to 32 MiB, and a whole
+  # answer's vectors are then carved from the arenas, where freeing them
+  # keeps them resident: on dev the lake reached 825 MB to 1 GiB in a
+  # startup burst while holding about 250 MiB live (2026-10-31). Fixed at
+  # 128 KiB, the probe's burst of eight chain readers peaked at 381 to 393
+  # MiB resident, not 848, in the same time.
+  mallocMmapThreshold: 131072
   # How many reads' whole answers the lake builds at once, 1 to 8 (rulings
   # 957, 958). A read answered in pages builds its whole answer once, at
   # its first page, copying its rows several times on the way: a chain's

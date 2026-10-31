@@ -366,6 +366,11 @@ fn stores() -> Stores {
 }
 
 fn coordinator(stores: &Stores, config: Config, pooled: bool) -> Arc<Coordinator> {
+    coordinator_at(stores, config, pooled, NOW)
+}
+
+/// A coordinator whose clock reads `now_ns`.
+fn coordinator_at(stores: &Stores, config: Config, pooled: bool, now_ns: i64) -> Arc<Coordinator> {
     let handle = tokio::runtime::Handle::current();
     let executor = if pooled {
         worker::serve(&stores.bus, Arc::new(Cache::new(64)));
@@ -376,7 +381,7 @@ fn coordinator(stores: &Stores, config: Config, pooled: bool) -> Arc<Coordinator
     let coordinator = Coordinator::new(
         Arc::clone(&stores.bus),
         handle,
-        Arc::new(ManualClock::at(NOW)),
+        Arc::new(ManualClock::at(now_ns)),
         Config {
             engine_version: "0.1.0".into(),
             ..config
@@ -667,7 +672,7 @@ async fn a_job_past_its_window_finishes_later_and_its_answer_is_read() {
     let event = JobFinishedEvent::decode(&told.envelope.payload[..]).unwrap();
     assert_eq!(event.job_id, reply.job_id);
     assert_eq!(event.client_instance_id, crate::INSTANCE);
-    assert_eq!(event.sequence, 1);
+    assert_eq!(event.sequence, NOW / 1_000_000, "the clock's milliseconds");
     let answer: JobAnswer = ask_as(
         &stores.bus,
         topics::READ_JOB_ANSWER,
@@ -694,7 +699,75 @@ async fn a_job_past_its_window_finishes_later_and_its_answer_is_read() {
     )
     .await
     .unwrap();
-    assert_eq!(caught_up.sequence, 1);
+    assert_eq!(caught_up.sequence, event.sequence);
+    assert_eq!(caught_up.finished[0].job_id, reply.job_id);
+}
+
+/// A job finished later, as the client hears it: the reply, then the
+/// finished events after `after_sequence` (W12.4).
+async fn finish_later(
+    stores: &Stores,
+    after_sequence: i64,
+) -> (RunJobReply, ListFinishedJobsReply) {
+    let reply: RunJobReply = ask_as(
+        &stores.bus,
+        topics::RUN_JOB,
+        "meridian.v1.RunJobRequest",
+        job(&[("market_value", &[], "")]),
+        &["ACC-1"],
+    )
+    .await
+    .unwrap();
+    assert!(!reply.answered_inline);
+    for _ in 0..100 {
+        let caught_up: ListFinishedJobsReply = ask_as(
+            &stores.bus,
+            topics::LIST_FINISHED_JOBS,
+            "meridian.v1.ListFinishedJobsRequest",
+            ListFinishedJobsRequest { after_sequence },
+            &["ACC-1"],
+        )
+        .await
+        .unwrap();
+        if caught_up.finished.iter().any(|e| e.job_id == reply.job_id) {
+            return (reply, caught_up);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!(
+        "{} was never heard after sequence {after_sequence}",
+        reply.job_id
+    );
+}
+
+/// Ruling 973: a coordinator restarted, its sequences lost, numbers its
+/// finished jobs past what it numbered before, so a plugin that outlived
+/// the restart, catching up after the last sequence it saw, hears them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restarted_coordinator_numbers_past_the_last_a_plugin_saw() {
+    let later = Config {
+        inline: Duration::ZERO,
+        ..Config::default()
+    };
+    let before = stores();
+    coordinator(&before, later.clone(), false);
+    let mut seen = 0;
+    for _ in 0..3 {
+        let (_, caught_up) = finish_later(&before, seen).await;
+        assert!(caught_up.sequence > seen, "each after the last");
+        seen = caught_up.sequence;
+    }
+    // The same plugin, its last sequence kept; the coordinator restarted a
+    // second later, holding nothing.
+    let after = stores();
+    coordinator_at(&after, later, false, NOW + 1_000_000_000);
+    let (reply, caught_up) = finish_later(&after, seen).await;
+    assert!(
+        caught_up.sequence > seen,
+        "past {seen}: {}",
+        caught_up.sequence
+    );
+    assert_eq!(caught_up.finished.len(), 1);
     assert_eq!(caught_up.finished[0].job_id, reply.job_id);
 }
 

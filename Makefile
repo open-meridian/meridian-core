@@ -2230,7 +2230,21 @@ chart-check:
 		! $(HELM_TEMPLATE) check deploy/chart $$base --set lake.maxConcurrentAnswers=$$refused >/dev/null 2>&1 \
 			|| { echo "chart-check FAILED: lake.maxConcurrentAnswers=$$refused rendered; it takes 1 to 8" >&2; exit 1; }; \
 	done
-	@echo "chart-check OK: the lake's whole answers at once, 2 by default and 1 to 8 alone; the platform's keys on the conductor alone, as files, only where the chart carries some, its current key by default; four components, the dashboard and the three ways it signs people in, the key and the settings key on the conductor alone, both key paths, refusals, migrations, no pinned uid, a plugin held to its side of the pod, its front door open to the dashboard alone, an Ingress only when asked for and HTTPS alone unless plain HTTP is, development only when asked for, the live shape there alone, a backup only when sealed and placed, and nothing an upgrade leaves behind"
+	@# Ruling 972: lake.mallocMmapThreshold reaches the lake as glibc's
+	@# MALLOC_MMAP_THRESHOLD_, 131072 by default, and only a whole number of
+	@# bytes above 0 renders.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
+	for said in "131072:" "262144:--set lake.mallocMmapThreshold=262144"; do \
+		want="$${said%%:*}"; flag="$${said#*:}"; \
+		$(HELM_TEMPLATE) check deploy/chart $$base $$flag 2>/dev/null \
+			| grep -A1 'name: MALLOC_MMAP_THRESHOLD_$$' | grep -q "value: \"$$want\"" \
+			|| { echo "chart-check FAILED: lake.mallocMmapThreshold $${flag:-unset} does not tell the lake $$want" >&2; exit 1; }; \
+	done; \
+	for refused in 0 -1 1.5 big; do \
+		! $(HELM_TEMPLATE) check deploy/chart $$base --set lake.mallocMmapThreshold=$$refused >/dev/null 2>&1 \
+			|| { echo "chart-check FAILED: lake.mallocMmapThreshold=$$refused rendered; it takes a whole number of bytes above 0" >&2; exit 1; }; \
+	done
+	@echo "chart-check OK: the lake's whole answers at once, 2 by default and 1 to 8 alone, and its mmap threshold, 128 KiB by default and whole bytes alone; the platform's keys on the conductor alone, as files, only where the chart carries some, its current key by default; four components, the dashboard and the three ways it signs people in, the key and the settings key on the conductor alone, both key paths, refusals, migrations, no pinned uid, a plugin held to its side of the pod, its front door open to the dashboard alone, an Ingress only when asked for and HTTPS alone unless plain HTTP is, development only when asked for, the live shape there alone, a backup only when sealed and placed, and nothing an upgrade leaves behind"
 
 lint:
 	@$(DOCKER) build -f Dockerfile.rust --target lint $(VERDICT) . >/dev/null 2>&1 \
