@@ -287,11 +287,16 @@ jobs:
   # by outside-pull-requests anyway. A commit ci-local has refused is not
   # worth a cluster. One job per run, so a failure names its half.
   #
-  # Each on the k3s release dev runs (the Makefile's KUBERNETES_VERSION,
-  # ruling 849), and the install once more on the oldest minor the chart
-  # declares (Chart.yaml's kubeVersion), so both ends of the range are
-  # proven. The name stays `e2e-cluster-k3d (<target>)` for the six, which
-  # are the required checks; the lower bound's names its k3s.
+  # The window (ruling 935): Kubernetes is supported on every minor a major
+  # managed cloud still supports, extended support included (about 26
+  # months; 1.33 to 1.37 when this was written). All six run on the k3s
+  # release dev runs (the Makefile's KUBERNETES_VERSION); the base install,
+  # e2e-cluster, runs once more as a smoke job on the newest k3s patch of
+  # each other minor in the window, and each of those is a required check
+  # too. A minor entering the window is added here; one leaving it is
+  # dropped, and Chart.yaml's kubeVersion, INSTALL.md, chart-check and
+  # `meridian doctor` move with the oldest (ruling 936). The name stays
+  # `e2e-cluster-k3d (<target>)` for the six; a smoke job's names its k3s.
   e2e-cluster-k3d:
     name: e2e-cluster-k3d (${{ matrix.target }}${{ matrix.k3s && format(', k3s {0}', matrix.k3s) || '' }})
     needs: ci-local
@@ -305,7 +310,13 @@ jobs:
         k3s: [""]
         include:
           - target: e2e-cluster
+            k3s: v1.33.13-k3s2
+          - target: e2e-cluster
+            k3s: v1.34.12-k3s1
+          - target: e2e-cluster
             k3s: v1.35.9-k3s1
+          - target: e2e-cluster
+            k3s: v1.37.1-k3s1
     steps:
       - uses: actions/checkout@v4
         with:
