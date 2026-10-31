@@ -345,6 +345,10 @@ pub struct Lake {
     liveness: Mutex<BTreeMap<(String, String), meridian_domain::v1::DatasetLiveness>>,
     /// A read's answer held for its next pages (rulings 798, 808).
     pages: Mutex<crate::pages::Held>,
+    /// Whole answers built at once, at most so many (rulings 957, 958).
+    building: crate::pages::Building,
+    /// Whole answers built since the lake started.
+    built: std::sync::atomic::AtomicU64,
     /// Moved by every change a held answer was answered under -- the
     /// entitlements, the licences, a priority -- so none is served after it.
     generation: std::sync::atomic::AtomicU64,
@@ -355,6 +359,45 @@ pub struct Lake {
 
 /// The analytics component's instance where nothing names another (W12.2).
 pub const ANALYTICS: &str = "analytics";
+
+/// Ruling 957 (b): glibc's free memory handed back to the system, from the
+/// top of each arena and the free pages within it; what it did said at
+/// debug. Only glibc keeps memory this way, and only glibc is asked.
+#[cfg(target_env = "gnu")]
+fn release_to_system() {
+    let told = tracing::enabled!(tracing::Level::DEBUG);
+    let before = told.then(resident_kib).flatten();
+    let started = std::time::Instant::now();
+    // SAFETY: malloc_trim takes no pointer and touches only the allocator's
+    // own state, under the allocator's own locks.
+    let released = unsafe { libc::malloc_trim(0) } == 1;
+    if told {
+        tracing::debug!(
+            released,
+            resident_before_kib = before.unwrap_or(0),
+            resident_after_kib = resident_kib().unwrap_or(0),
+            ms = format!("{:.1}", started.elapsed().as_secs_f64() * 1e3),
+            "the memory freed returned to the system"
+        );
+    }
+}
+
+#[cfg(not(target_env = "gnu"))]
+fn release_to_system() {}
+
+/// The process's resident memory, in KiB, as /proc says it.
+#[cfg(target_env = "gnu")]
+fn resident_kib() -> Option<u64> {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))?
+        .trim()
+        .trim_end_matches("kB")
+        .trim()
+        .parse()
+        .ok()
+}
 
 static ANALYTICS_INSTANCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
@@ -469,6 +512,8 @@ impl Lake {
             versions: Mutex::new((BTreeMap::new(), 0)),
             liveness: Mutex::new(BTreeMap::new()),
             pages: Mutex::new(crate::pages::Held::default()),
+            building: crate::pages::Building::default(),
+            built: std::sync::atomic::AtomicU64::new(0),
             generation: std::sync::atomic::AtomicU64::new(0),
             series_records: Mutex::new(BTreeMap::new()),
         })
@@ -477,6 +522,49 @@ impl Lake {
     /// How many reads' answers are held for their next pages.
     pub fn held_pages(&self) -> usize {
         self.pages.lock().expect("pages poisoned").len()
+    }
+
+    /// What the answers held for their next pages hold, in bytes.
+    pub fn held_bytes(&self) -> usize {
+        self.pages.lock().expect("pages poisoned").bytes()
+    }
+
+    /// Build at most this many whole answers at once (the chart's
+    /// `lake.maxConcurrentAnswers`; rulings 957, 958).
+    pub fn build_at_most(&self, most: usize) {
+        self.building.build_at_most(most);
+    }
+
+    /// Hold answers within so many bytes, not [`crate::pages::MOST_BYTES`].
+    #[cfg(test)]
+    pub(crate) fn hold_within(&self, most: usize) {
+        *self.pages.lock().expect("pages poisoned") = crate::pages::Held::within(most);
+    }
+
+    /// The whole answers being built, to hold one's place from a test.
+    #[cfg(test)]
+    pub(crate) fn building(&self) -> &crate::pages::Building {
+        &self.building
+    }
+
+    /// The most whole answers built at once since the lake started.
+    pub fn most_built_at_once(&self) -> usize {
+        self.building.peak()
+    }
+
+    /// How many whole answers the lake has built since it started.
+    pub fn answers_built(&self) -> u64 {
+        self.built.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Ruling 957 (b): what the allocator holds free, returned to the
+    /// system, while no whole answer is being built. glibc keeps what a
+    /// burst of whole answers freed: on dev the lake's live heap fell to 3
+    /// to 12 MiB after one while it stayed resident at its peak, and the
+    /// next burst took it past its limit. Run from the sweep, every
+    /// [`SWEEP_EVERY`]; true where it ran.
+    pub fn return_freed(&self) -> bool {
+        self.building.when_idle(release_to_system).is_some()
     }
 
     pub fn config(&self) -> DataConfig {
@@ -2486,7 +2574,10 @@ impl Lake {
             now_ns: self.clock.now_ns(),
         };
         // A later page cut from the answer its first page made, where it is
-        // held; otherwise the whole read is answered again, as one.
+        // held; otherwise the whole read is answered again, as one, and held
+        // in turn (ruling 957): a cursor whose answer another reader's
+        // pushed out is answered again once, not at every page after.
+        let fresh = held.is_none();
         let whole = match held {
             Some(whole) => whole,
             None => Arc::new(self.answer_whole(&read, &against, offset, wants, &reader)?),
@@ -2544,7 +2635,7 @@ impl Lake {
             let mut pages = self.pages.lock().expect("pages poisoned");
             if next.is_none() {
                 pages.forget(&held_as);
-            } else if offset == 0 {
+            } else if fresh {
                 pages.hold(held_as, Arc::clone(&whole), std::time::Instant::now());
             }
         }
@@ -2599,7 +2690,13 @@ impl Lake {
         wants: bool,
         reader: &Reader,
     ) -> Result<crate::pages::Whole, String> {
+        // At most so many built at once (rulings 957, 958); never while
+        // waiting for a source below, which builds nothing.
+        let building = self.building.enter();
+        self.built
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut answered = read::answer(self.store.as_ref(), read, against)?;
+        drop(building);
         // A dataset served, not kept (W10.7; ruling 734): the read that
         // asked hears what is served within its wait; any other is told it
         // is not kept, never asked forever.
@@ -2622,7 +2719,10 @@ impl Lake {
         } else {
             BTreeMap::new()
         };
+        let _building = (!served.is_empty()).then(|| self.building.enter());
         read::with_served(read, against, &mut answered, served);
+        // Held at what it holds, not at the room its vector grew to.
+        answered.rows.shrink_to_fit();
         Ok(crate::pages::Whole {
             rows: answered.rows,
             not_served: answered.not_served,
@@ -5492,7 +5592,11 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
         loop {
             every.tick().await;
             let lake = Arc::clone(&sweeping);
-            let _ = tokio::task::spawn_blocking(move || lake.sweep_wants()).await;
+            let _ = tokio::task::spawn_blocking(move || {
+                lake.sweep_wants();
+                lake.return_freed();
+            })
+            .await;
         }
     });
     let counting = Arc::clone(&lake);
