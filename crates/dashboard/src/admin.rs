@@ -484,6 +484,7 @@ pub(crate) mod overview;
 pub mod series_rule;
 pub mod sources_view;
 pub mod stale_reference;
+pub mod terms;
 pub mod time_zone;
 pub(crate) use overview::listing;
 pub mod people;
@@ -2577,12 +2578,19 @@ async fn instrument_page(
         }
     }
     let groups_section = event_groups::section(&instrument, &groups, &members, &as_of);
+    // Contract v29 (676): the companies a debt record's terms name, by the
+    // records the store holds.
+    let companies = match item.instrument.as_ref() {
+        Some(record) => instruments::company_names(&app.bus, &terms::company_ids(record)).await,
+        None => Default::default(),
+    };
     let mut body = instruments::record_page(
         &item,
         &versions,
         None,
         &token_input(&session),
         &groups_section,
+        &companies,
     );
     if !done.is_empty() {
         body = format!("<p class=\"passed\">{}</p>{body}", escape(done));
@@ -2796,7 +2804,18 @@ async fn ask_the_platform(
     let (item, versions) = one_record(&app, &instrument)
         .await
         .unwrap_or((item, Vec::new()));
-    let body = instruments::record_page(&item, &versions, Some(&asked), &token_input(&session), "");
+    let companies = match item.instrument.as_ref() {
+        Some(record) => instruments::company_names(&app.bus, &terms::company_ids(record)).await,
+        None => Default::default(),
+    };
+    let body = instruments::record_page(
+        &item,
+        &versions,
+        Some(&asked),
+        &token_input(&session),
+        "",
+        &companies,
+    );
     Html(page_with(
         &instrument,
         &body,

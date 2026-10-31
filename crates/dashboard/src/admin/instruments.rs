@@ -83,9 +83,12 @@ const CLASSES: [(AssetClass, &str); 7] = [
 ];
 
 /// The instrument types, as the form offers them (contract v11; the binary
-/// event contract from contract v19), each under its asset class: the form
-/// offers a type only while its class is chosen.
-const TYPES: [(InstrumentType, AssetClass, &str); 2] = [
+/// event contract from contract v19; from contract v29 the five debt types,
+/// ruling 676, so a security the platform cannot confirm -- a municipal
+/// named by its CUSIP alone, a USD supranational (675) -- is kept under its
+/// type locally), each under its asset class: the form offers a type only
+/// while its class is chosen. Its terms are the platform's record's alone.
+pub(crate) const TYPES: [(InstrumentType, AssetClass, &str); 7] = [
     (
         InstrumentType::MoneyMarketFund,
         AssetClass::Fund,
@@ -95,6 +98,15 @@ const TYPES: [(InstrumentType, AssetClass, &str); 2] = [
         InstrumentType::BinaryEventContract,
         AssetClass::EventContract,
         "Binary event contract",
+    ),
+    (InstrumentType::Bond, AssetClass::Debt, "Bond"),
+    (InstrumentType::MbsPool, AssetClass::Debt, "MBS pool"),
+    (InstrumentType::Tba, AssetClass::Debt, "TBA"),
+    (InstrumentType::CmoTranche, AssetClass::Debt, "CMO tranche"),
+    (
+        InstrumentType::CertificateOfDeposit,
+        AssetClass::Debt,
+        "Certificate of deposit",
     ),
 ];
 
@@ -500,6 +512,40 @@ pub fn name_of(record: &meridian_domain::v1::InstrumentRecord) -> String {
         .max_by_key(|(at, _)| *at)
         .map(|(_, text)| text)
         .unwrap_or_default()
+}
+
+/// W3.32 (contract v28): a company the deployment holds, by its `ENT-` ID.
+pub const RESOLVE_COMPANY: &str = "platform.reference.query.resolve-company";
+
+/// The names of the companies `ids` name, by the records the store holds
+/// (contract v29: a debt record's issuer, guarantor, obligor and insurer,
+/// 594); a company the store holds no record of is left out, and its page
+/// names it by its ID. A miss by ID alone asks the platform nothing (W3.32).
+pub async fn company_names(
+    bus: &meridian_bus::Bus,
+    ids: &[String],
+) -> std::collections::BTreeMap<String, String> {
+    let mut names = std::collections::BTreeMap::new();
+    for id in ids {
+        let held: Result<meridian_domain::v1::CompanyRecord, String> = ask(
+            bus,
+            RESOLVE_COMPANY,
+            "meridian.v1.ResolveCompanyRequest",
+            meridian_domain::v1::ResolveCompanyRequest {
+                company_id: id.clone(),
+                ..Default::default()
+            },
+            None,
+            WAIT,
+        )
+        .await;
+        if let Ok(company) = held {
+            if !company.name.is_empty() {
+                names.insert(id.clone(), company.name);
+            }
+        }
+    }
+    names
 }
 
 /// W3.11: the records to complete, or one record (`instrument_id`).
@@ -2125,9 +2171,12 @@ pub fn record_page(
     asked: Option<&Result<AskPlatformForInstrumentReply, String>>,
     token: &str,
     event_groups: &str,
+    companies: &std::collections::BTreeMap<String, String>,
 ) -> String {
     let record = item.instrument.clone().unwrap_or_default();
     let id = escape(&record.instrument_id);
+    // Contract v29 (676): a debt record's terms, a tab of their own.
+    let terms = super::terms::section(&record, companies);
 
     let field_row = |label: &str, field: InstrumentField, value: String| {
         format!(
@@ -2574,14 +2623,14 @@ pub fn record_page(
 
     format!(
         "<div class=\"admin\"><div class=\"page-head\"><div><h1>{id}</h1>\
-         <p class=\"hint\">Version {version}. {book}</p></div>\
+         <p class=\"hint\">{lacking}Version {version}. {book}</p></div>\
          <div class=\"head-actions\"><a class=\"button\" href=\"/admin/instruments/sources?instrument={id}\">Sources</a>\
          <form method=\"post\" action=\"/admin/instruments/{id}/ask\">{token}\
          <button type=\"submit\">Ask the platform</button></form></div></div>{asked_html}\
-         <nav class=\"tabs\"><a href=\"#says\" data-tab=\"says\">What it says</a>\
+         <nav class=\"tabs\"><a href=\"#says\" data-tab=\"says\">What it says</a>{terms_tab}\
          <a href=\"#complete-it\" data-tab=\"complete-it\">Complete it</a>\
          <a href=\"#history\" data-tab=\"history\">History</a>{groups_tab}</nav>\
-         <section class=\"admin-section\" id=\"says\"><div class=\"section-head\"><div><h2>What it says</h2></div></div>{values}</section>\
+         <section class=\"admin-section\" id=\"says\"><div class=\"section-head\"><div><h2>What it says</h2></div></div>{values}</section>{terms}\
          <section class=\"admin-section\" id=\"complete-it\"><div class=\"section-head\"><div><h2>Complete it</h2>\
          <p class=\"hint\">Each value says where it came from. A value offered is filled in with its \
          source; change the value and say where the new one came from.</p></div></div>{form}</section>\
@@ -2593,6 +2642,12 @@ pub fn record_page(
         super::overview::SCRIPT_END,
         super::data_sources::PAGER_SCRIPT,
         version = record.version,
+        lacking = lacking(&record),
+        terms_tab = if terms.is_empty() {
+            ""
+        } else {
+            "<a href=\"#terms\" data-tab=\"terms\">Terms</a>"
+        },
         // Contract v26 (W6.9, W3.30): a member of an event group's tab.
         groups_tab = if event_groups.is_empty() {
             ""
@@ -2604,6 +2659,22 @@ pub fn record_page(
         } else {
             "The book cannot use it until it has an asset class and a currency."
         },
+    )
+}
+
+/// What a record lacks of its template (574; W3.7, W1.24), said in the page's
+/// head: empty for a record complete against it.
+fn lacking(record: &InstrumentRecord) -> String {
+    if record.missing_fields.is_empty() {
+        return String::new();
+    }
+    format!(
+        "Its template {} lacks: {}. ",
+        escape(&format!(
+            "{} v{}",
+            record.template_id, record.template_version
+        )),
+        escape(&record.missing_fields.join(", "))
     )
 }
 
@@ -2813,7 +2884,7 @@ mod tests {
 
     #[test]
     fn a_funds_attributes_go_with_their_source_none_fee_included_and_round_trip() {
-        let page = record_page(&waiting(), &[], None, "", "");
+        let page = record_page(&waiting(), &[], None, "", "", &Default::default());
         assert!(page.contains("name=\"fund_source\""), "{page}");
         assert!(page.contains("name=\"fund_liquidity_fee\""), "{page}");
         assert!(page.contains(&format!(
@@ -2831,7 +2902,7 @@ mod tests {
                 liquidity_fee: LiquidityFeeRegime::None as i32,
             });
         }
-        let held_page = record_page(&holding, &[], None, "", "");
+        let held_page = record_page(&holding, &[], None, "", "", &Default::default());
         assert!(
             held_page.contains("government, retail, stable NAV, no liquidity fee"),
             "{held_page}"
@@ -2909,7 +2980,7 @@ mod tests {
 
     #[test]
     fn a_records_page_prefills_what_is_offered_with_its_source() {
-        let page = record_page(&waiting(), &[], None, "", "");
+        let page = record_page(&waiting(), &[], None, "", "", &Default::default());
         assert!(page.contains(&format!(
             "<option value=\"{}\" selected>Equity</option>",
             AssetClass::Equity as i32
@@ -3021,7 +3092,7 @@ mod tests {
 
     #[test]
     fn fields_gated_on_a_choice_are_read_only_with_it_and_a_contract_goes_with_its_terms() {
-        let page = record_page(&waiting(), &[], None, "", "");
+        let page = record_page(&waiting(), &[], None, "", "", &Default::default());
         assert!(
             page.contains("data-om-applies-when=\"instrument_type\""),
             "{page}"
@@ -3086,7 +3157,7 @@ mod tests {
             });
             record.identifiers[0].valid_from_ns = 5;
         }
-        let page = record_page(&item, &[], None, "", "");
+        let page = record_page(&item, &[], None, "", "", &Default::default());
         assert!(page.contains("Ended by the platform"), "{page}");
         assert!(page.contains("left 2026-11-01 00:00 UTC"), "{page}");
         let end = serde_json::json!({

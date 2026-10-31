@@ -1094,6 +1094,83 @@ fn connectivity_link<'a>(
 /// kept under it beside its ISO 4217 code (contract v23, W3.21; from v24
 /// requirement 19).
 const PLATFORM_USD: &str = "INS-01JUSD0000000000000000001";
+/// Contract v29 (676): a municipal revenue bond the platform minted, its
+/// terms with every group a page draws -- calls, a sinking fund schedule
+/// long enough to page, the municipal group -- and one complete field still
+/// to come.
+pub(crate) const SERVED_BOND: &str = "INS-01JC29MUNIREVENUE00000001";
+
+fn served_bond() -> InstrumentRecord {
+    use meridian_domain::v1::{
+        Bond, CouponType, DayCount, DebtSecurityType, FederalTaxStatus, IssuerType, MunicipalTerms,
+        RedemptionKind, RedemptionStyle, RedemptionWindow, SinkingFundPayment,
+    };
+    let decimal = |text: &str| {
+        Some(
+            text.parse::<meridian_domain::exact::Exact>()
+                .unwrap()
+                .to_wire(),
+        )
+    };
+    InstrumentRecord {
+        instrument_id: SERVED_BOND.into(),
+        identifiers: vec![Identifier {
+            scheme: "figi".into(),
+            value: "BBG01MUNIREV1".into(),
+            ..Default::default()
+        }],
+        asset_class: meridian_domain::v1::AssetClass::Debt as i32,
+        instrument_type: meridian_domain::v1::InstrumentType::Bond as i32,
+        currency: "USD".into(),
+        description: "Commonwealth Water Authority revenue 5% 2041-06-01".into(),
+        version: 3,
+        template_id: "TPL-bond".into(),
+        template_version: "1".into(),
+        missing_fields: vec!["payment_calendar_id".into()],
+        bond: Some(Bond {
+            security_type: DebtSecurityType::Rev as i32,
+            issuer_company_id: "ENT-01JC29WATERAUTHORITY0001".into(),
+            issuer_type: IssuerType::Municipal as i32,
+            country_of_issue: "US".into(),
+            state_or_province_of_issue: "MA".into(),
+            issue_date: "2021-06-15".into(),
+            dated_date: "2021-06-15".into(),
+            first_coupon_date: "2021-12-01".into(),
+            maturity_date: "2041-06-01".into(),
+            coupon_rate: decimal("5"),
+            coupon_type: CouponType::Fixed as i32,
+            coupon_frequency: 2,
+            day_count: DayCount::Thirty360Sia as i32,
+            minimum_denomination: decimal("5000"),
+            denomination_increment: decimal("5000"),
+            original_issue_amount: decimal("185000000"),
+            calls: vec![RedemptionWindow {
+                kind: RedemptionKind::Par as i32,
+                from_date: "2031-06-01".into(),
+                price: decimal("100"),
+                notice_days_min: 20,
+                notice_days_max: 60,
+                style: RedemptionStyle::Continuous as i32,
+                ..Default::default()
+            }],
+            sinking_funds: (2032..=2041)
+                .map(|year| SinkingFundPayment {
+                    date: format!("{year}-06-01"),
+                    face_amount: decimal("15000000"),
+                    price: None,
+                })
+                .collect(),
+            municipal: Some(MunicipalTerms {
+                federal_tax_status: FederalTaxStatus::Exempt as i32,
+                state_tax_exempt: true,
+                insurer_company_id: "ENT-01JC29ASSUREDGUARANTY01".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
 
 /// The calendars the stand-in instrument store holds: three seed calendars,
 /// each with its subject (contract v23), and the US equities rule, and
@@ -1654,6 +1731,15 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
                     ..Default::default()
                 });
             }
+            // Contract v29: the municipal bond, by its ID.
+            if asked.instrument_id == SERVED_BOND {
+                instruments.push(InstrumentToComplete {
+                    instrument: Some(served_bond()),
+                    complete_for_book: true,
+                    complete: true,
+                    ..Default::default()
+                });
+            }
             // A record the picker brought in (contract v28), found by its
             // ID, its description or an identifier.
             for record in listing_brought.lock().unwrap().iter() {
@@ -1765,6 +1851,29 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
         let asked = meridian_domain::v1::ReadCalendarRequest::decode(&envelope.payload[..])
             .map_err(|e| e.to_string())?;
         Ok(("".into(), calendar_year(&asked).encode_to_vec()))
+    });
+    // Contract v29: the companies the bond's terms name, as the store holds
+    // them; the insurer it holds no record of.
+    bus.serve(crate::admin::instruments::RESOLVE_COMPANY, |envelope| {
+        let asked = meridian_domain::v1::ResolveCompanyRequest::decode(&envelope.payload[..])
+            .map_err(|e| e.to_string())?;
+        if asked.company_id != "ENT-01JC29WATERAUTHORITY0001" {
+            return Err(meridian_bus::refusal_naming(
+                meridian_pb::v1::RefusalReason::Unspecified as i32,
+                &["company_id".to_string()],
+                "the store holds no such company".to_string(),
+            ));
+        }
+        Ok((
+            "meridian.v1.CompanyRecord".into(),
+            meridian_domain::v1::CompanyRecord {
+                company_id: asked.company_id,
+                name: "Commonwealth Water Authority".into(),
+                version: 1,
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ))
     });
     bus.serve(crate::admin::instruments::READ_INSTRUMENT_HISTORY, |_| {
         Ok((

@@ -45,9 +45,10 @@ stop cancels each placement it is working at once, reporting each cancel as a
 fact naming the stop's entry (W11.9; v21's Q17), then the venue's
 confirmation. It serves:
 
-  /resolve?symbol=S[&figi=F][&cusip=C][&description=D][&thin=1]
-                                  resolves its symbol, with the FIGI and a
-                                  CUSIP beside it where given (W3.1), stating
+  /resolve?symbol=S[&figi=F][&cusip=C][&agency_pool=P&agency=A][&description=D][&thin=1]
+                                  resolves its symbol, with the FIGI, a
+                                  CUSIP and an agency's pool number beside
+                                  it where given (W3.1), stating
                                   a description and USD unless thin (from
                                   v24 the minimum a record needs), answering
                                   its ID and whether it is provisional;
@@ -712,6 +713,11 @@ class Venue(Plugin):
                 # A licensed scheme (contract v24, W3.25): kept in the
                 # deployment, never sent to the platform.
                 identifiers.append(ops.Identifier(scheme="cusip", value=one(query, "cusip")))
+            if one(query, "agency_pool"):
+                # Contract v29 (W1.26): an agency's pool number, open, its
+                # agency in source.
+                identifiers.append(ops.Identifier(scheme="agency_pool", value=one(query, "agency_pool"),
+                                                  source=one(query, "agency", "FNMA")))
             # What the venue states of it: from contract v24 a record needs an
             # identifier, a description and a currency (W3.7), and a source
             # thinner than that is not found, nothing minted.

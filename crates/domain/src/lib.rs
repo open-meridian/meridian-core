@@ -22,7 +22,9 @@
 
 pub mod asset_class;
 pub mod attestation;
+pub mod conventions;
 pub mod date;
+pub mod debt;
 pub mod declaration;
 pub mod exact;
 pub mod instrument_type;

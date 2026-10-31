@@ -52,7 +52,7 @@ pub static SPECS: &[Spec] = &[
     Spec {
         name: "read_instrument",
         title: "Read an instrument record",
-        description: "one record by its ID: each value with its source, the person and the client it was set through, the values offered, what it lacks, and its version, which a completion names.",
+        description: "one record by its ID: each value with its source, the person and the client it was set through, the values offered, what it lacks, and its version, which a completion names; from contract v29 a debt record's terms as the platform's record states them (bond, mbs_pool, tba, cmo_tranche or certificate_of_deposit: enums by their names, decimals as text) and what of its template it lacks (missing_fields).",
         reads: true,
         open_world: false,
         area: Area::Instruments,
@@ -356,10 +356,14 @@ fn value_schema() -> Value {
         "description": "exactly one value, with its source",
         "properties": {
             "asset_class": enum_names(&classes()),
-            "instrument_type": enum_names(&[
-                InstrumentType::MoneyMarketFund.as_str_name(),
-                InstrumentType::BinaryEventContract.as_str_name(),
-            ]),
+            // The types the page's form offers (contract v29: the five
+            // debt types too, 676), each under its class.
+            "instrument_type": enum_names(
+                &crate::admin::instruments::TYPES
+                    .iter()
+                    .map(|(kind, _, _)| kind.as_str_name())
+                    .collect::<Vec<_>>(),
+            ),
             "binary_event_contract": {
                 "type": "object",
                 "description": "a binary event contract's terms: what one contract pays if the event happens, when trading closes (0 for none stated), and the venue's category for the market in its own words (empty for none stated)",
@@ -1105,6 +1109,16 @@ pub fn record_json(record: &InstrumentRecord) -> Value {
         "template_id": record.template_id,
         "template_version": record.template_version,
         "missing_fields": record.missing_fields,
+        // Contract v29 (676): a debt record's terms, as the platform's
+        // record states them and the page shows them; null on any other.
+        "bond": record.bond.as_ref().map(meridian_domain::debt::bond_json),
+        "mbs_pool": record.mbs_pool.as_ref().map(meridian_domain::debt::mbs_pool_json),
+        "tba": record.tba.as_ref().map(meridian_domain::debt::tba_json),
+        "cmo_tranche": record.cmo_tranche.as_ref().map(meridian_domain::debt::cmo_tranche_json),
+        "certificate_of_deposit": record
+            .certificate_of_deposit
+            .as_ref()
+            .map(meridian_domain::debt::certificate_of_deposit_json),
     })
 }
 

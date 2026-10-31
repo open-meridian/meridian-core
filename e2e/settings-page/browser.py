@@ -1749,6 +1749,40 @@ UNLABELLED = """() => [...document.querySelectorAll('main input, main button, ma
 SIDEWAYS = "() => document.documentElement.scrollWidth > document.documentElement.clientWidth + 1"
 
 
+def the_v29_bond_page(browser, prefix):
+    """Contract v29 (676; W1.24): a municipal bond's record page at 375, 582
+    and 1280 px, light and dark -- its Terms tab one line a term, the issuer
+    by its company record's name, the insurer the store holds none of by
+    its ID, the sinking fund schedule paged, and the field its template
+    still lacks said in the page's head; one screen, nothing sideways."""
+    for scheme in ("light", "dark"):
+        for size, width, height in V24_SIZES:
+            ctx = context(browser, width, height, scheme=scheme)
+            page = ctx.new_page()
+            errors = []
+            page.on("pageerror", lambda e: errors.append(str(e)))
+            label = f"the bond's page at {size}, {scheme}"
+            page.goto(f"{BASE}/admin/instruments/INS-01JC29MUNIREVENUE00000001")
+            settled(page)
+            head = page.text_content(".page-head") or ""
+            check("lacks: payment_calendar_id" in head, f"{label} says what its template lacks: {head!r}")
+            page.goto(f"{BASE}/admin/instruments/INS-01JC29MUNIREVENUE00000001#terms")
+            settled(page)
+            terms = page.text_content("#terms") or ""
+            check("Commonwealth Water Authority (ENT-01JC29WATERAUTHORITY0001), municipal" in terms,
+                  f"{label}: the issuer by its record's name")
+            check("30/360 (SIA)" in terms and "5%, fixed, semi-annual" in terms,
+                  f"{label}: the day count by FIX's name and the coupon")
+            check("insured by ENT-01JC29ASSUREDGUARANTY01" in terms,
+                  f"{label}: an insurer the store holds no record of, by its ID")
+            check("par from 2031-06-01, at 100, notice 20 to 60 days, continuous" in terms,
+                  f"{label}: the call, one line")
+            measured(page, f"The bond's terms, at {size}, {scheme}", f"v29-bond-terms-{size}-{scheme}.png")
+            check(not page.evaluate(SIDEWAYS), f"{label} scrolls nothing sideways")
+            check(not errors, f"{label} ran without a script error: {errors}")
+            ctx.close()
+
+
 def the_sources_page(browser, prefix):
     """The Sources page at 375, 582 and 1280 px, light and dark: one screen,
     nothing sideways, every control labelled; typing SPY lists it with no
@@ -1953,6 +1987,7 @@ with sync_playwright() as playwright:
     the_model_routing_tab(browser, prefix)
     the_portal_overview(browser, prefix)
     the_sources_page(browser, prefix)
+    the_v29_bond_page(browser, prefix)
     browser.close()
 
 if failures:

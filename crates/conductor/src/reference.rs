@@ -50,8 +50,9 @@ pub const LOCAL_SCHEME: &str = "open_meridian_local";
 
 /// The open schemes sendable before any list is read (W3.25): from contract
 /// 28's core release C2 the SEC's `cik` too, a company's public identifier
-/// (W1.32).
-pub const OPEN_FAMILIES: [&str; 8] = [
+/// (W1.32); from contract v29 an agency's pool number, `agency_pool`, its
+/// agency in `source` (ruling 677, W1.26).
+pub const OPEN_FAMILIES: [&str; 9] = [
     "figi",
     "lei",
     "ticker_and_venue",
@@ -60,6 +61,7 @@ pub const OPEN_FAMILIES: [&str; 8] = [
     "sec_series",
     "sec_class",
     "cik",
+    "agency_pool",
 ];
 
 /// How often the pulls run once the platform answers, and how soon they are
