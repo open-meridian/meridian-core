@@ -738,6 +738,7 @@ async fn a_signal_plugins_derived_series_and_saved_scenarios_are_kept_and_read()
             as_of_ns: NOW - HOUR,
         }],
         published_by: String::new(),
+        ..Default::default()
     };
     let record_as = |field: &str, rows: Vec<Observation>| {
         tokio::task::block_in_place(|| h.lake.record(field, rows, "", &envelope("signal-1")))

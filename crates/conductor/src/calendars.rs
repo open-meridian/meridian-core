@@ -370,6 +370,9 @@ fn sessions(value: &Value) -> Result<Vec<TradingSession>, String> {
                     .get("extended")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+                // Contract v29 (657): read in the core stage; empty is in
+                // force from the calendar's first date, as before.
+                valid_from_date: String::new(),
             })
         })
         .collect()

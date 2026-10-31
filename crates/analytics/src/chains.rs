@@ -1278,6 +1278,7 @@ mod tests {
                             start_minute: 570,
                             end_minute: 960,
                             extended: false,
+                            valid_from_date: String::new(),
                         }],
                         early_closes: Vec::new(),
                     }),

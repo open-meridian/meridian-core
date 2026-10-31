@@ -140,6 +140,11 @@ pub fn datasets(snapshot: &Snapshot) -> Vec<DatasetRef> {
                 // `dataset_thresholds`; liveness the lake's.
                 stale_after_ns,
                 liveness: Vec::new(),
+                // Contract v29 (619 (2)): the quality counts are the lake's,
+                // as the other counts are.
+                valid_count: 0,
+                suspicious_count: 0,
+                invalid_count: 0,
             });
         }
     }

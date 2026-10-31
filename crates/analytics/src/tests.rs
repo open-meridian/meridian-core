@@ -57,6 +57,7 @@ fn price(subject: &str, kind: PriceKind, amount: &str, instrument: &str, dataset
         price: money(amount, instrument, ""),
         basis: PriceBasis::PerUnit as i32,
         confidence: None,
+        ..Default::default()
     }
 }
 
@@ -1583,6 +1584,7 @@ fn chain_stores_paying(
                     start_minute: 570,
                     end_minute: 960,
                     extended: false,
+                    ..Default::default()
                 }],
                 early_closes: Vec::new(),
             }),

@@ -3109,6 +3109,7 @@ fn served_pack_status(pack: &str) -> Option<meridian_domain::v1::PackStatus> {
                     ..status("open-meridian/kraken", S::Failed)
                 },
             ],
+            ..Default::default()
         });
     }
     Some(meridian_domain::v1::PackStatus {
@@ -3139,6 +3140,7 @@ fn served_pack_status(pack: &str) -> Option<meridian_domain::v1::PackStatus> {
                 _ => status(&m.listing, S::NotInstalled),
             })
             .collect(),
+        ..Default::default()
     })
 }
 

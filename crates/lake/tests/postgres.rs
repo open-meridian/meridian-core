@@ -63,6 +63,7 @@ fn close(dataset: &str, row_key: &str, subject: &str, date: &str, amount: i64) -
         }),
         basis: 1,
         confidence: None,
+        ..Default::default()
     })
 }
 

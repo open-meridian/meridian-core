@@ -98,6 +98,7 @@ fn assessment(row_key: &str, version: u64, state: QualityState) -> QualityAssess
         state: state as i32,
         reasons: vec![QualityReason::PriceOutlier as i32],
         assessed_by_instance: SIGNAL.into(),
+        ..Default::default()
     }
 }
 

@@ -72,6 +72,13 @@ pub fn to_wire(instrument: &Instrument) -> PbInstrument {
             }
             _ => None,
         },
+        // Contract v29 (676): a debt record's terms; kept and answered in the
+        // core stage, unset until then.
+        bond: None,
+        mbs_pool: None,
+        tba: None,
+        cmo_tranche: None,
+        certificate_of_deposit: None,
     }
 }
 

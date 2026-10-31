@@ -201,6 +201,7 @@ fn close(instance: &str, row_key: &str, subject: &str, date: &str, amount: &str)
         price: money(amount, "USD", ""),
         basis: PriceBasis::PerUnit as i32,
         confidence: None,
+        ..Default::default()
     }
 }
 
@@ -1311,6 +1312,7 @@ fn trade(row_key: &str, valid_from_ns: i64, price: &str) -> meridian_domain::v1:
         source_sequence: 7,
         cancelled: false,
         quote_at_trade: None,
+        ..Default::default()
     }
 }
 
@@ -1327,6 +1329,7 @@ fn quote(
         bid_quantity: decimal("1"),
         ask_quantity: decimal("2"),
         characteristics: vec![],
+        ..Default::default()
     }
 }
 
@@ -1584,6 +1587,7 @@ async fn the_latest_is_chosen_per_asset_for_prices_and_quotes() {
         price: money,
         basis: PriceBasis::PerUnit as i32,
         confidence: None,
+        ..Default::default()
     };
     record(
         &h,

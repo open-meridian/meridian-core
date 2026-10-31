@@ -424,6 +424,13 @@ impl Plugins {
             latest_revision,
             withdrawn: catalogued.is_none_or(|p| p.withdrawn_at_ns != 0),
             members,
+            // Contract v29 (616): the pack's title as its curator states it,
+            // the latest revision's, catalogued or kept.
+            title: latest
+                .revision
+                .as_ref()
+                .map(|r| r.title.clone())
+                .unwrap_or_default(),
         })
     }
 

@@ -131,6 +131,13 @@ pub fn class_of(kind: InstrumentType) -> Option<AssetClass> {
             Some(AssetClass::Derivative)
         }
         InstrumentType::Commodity => Some(AssetClass::Referential),
+        // Contract v29, fixed income (ruling 676): the five debt templates'
+        // types, each under debt.
+        InstrumentType::Bond
+        | InstrumentType::MbsPool
+        | InstrumentType::Tba
+        | InstrumentType::CmoTranche
+        | InstrumentType::CertificateOfDeposit => Some(AssetClass::Debt),
     }
 }
 
@@ -168,13 +175,18 @@ pub fn words(kind: InstrumentType) -> &'static str {
         InstrumentType::Future => "future",
         InstrumentType::FutureOption => "future option",
         InstrumentType::Commodity => "commodity",
+        InstrumentType::Bond => "bond",
+        InstrumentType::MbsPool => "MBS pool",
+        InstrumentType::Tba => "TBA",
+        InstrumentType::CmoTranche => "CMO tranche",
+        InstrumentType::CertificateOfDeposit => "certificate of deposit",
     }
 }
 
 /// Every type the list holds, in its order: what a refusal lists. From
 /// contract v27 the referential types too (W1.1), which the platform seeds
 /// and no deployment's form offers.
-pub const TYPES: [InstrumentType; 9] = [
+pub const TYPES: [InstrumentType; 14] = [
     InstrumentType::MoneyMarketFund,
     InstrumentType::BinaryEventContract,
     InstrumentType::InterestRate,
@@ -184,6 +196,11 @@ pub const TYPES: [InstrumentType; 9] = [
     InstrumentType::Future,
     InstrumentType::FutureOption,
     InstrumentType::Commodity,
+    InstrumentType::Bond,
+    InstrumentType::MbsPool,
+    InstrumentType::Tba,
+    InstrumentType::CmoTranche,
+    InstrumentType::CertificateOfDeposit,
 ];
 
 /// A type by its name without the prefix, in lower case

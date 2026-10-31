@@ -582,6 +582,18 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
             self.known("link.kind", held0.kind, domain::OrderLinkKind::try_from(held0.kind).is_ok())?;
         }
         self.exact_money("stop_price", message.stop_price.as_ref())?;
+        if let Some(held0) = message.limit_yield.as_ref() {
+            if let Some(held1) = held0.value.as_ref() {
+                self.exact("limit_yield.value.value", held1.value.as_ref())?;
+                self.known("limit_yield.value.unit", held1.unit, domain::ValueUnit::try_from(held1.unit).is_ok())?;
+            }
+            if let Some(held1) = held0.convention.as_ref() {
+                self.known("limit_yield.convention.day_count", held1.day_count, domain::DayCount::try_from(held1.day_count).is_ok())?;
+                self.known("limit_yield.convention.compounding", held1.compounding, domain::Compounding::try_from(held1.compounding).is_ok())?;
+            }
+            self.known("limit_yield.kind", held0.kind, domain::YieldKind::try_from(held0.kind).is_ok())?;
+        }
+        self.exact("limit_spread_bps", message.limit_spread_bps.as_ref())?;
         self.known("side", message.side, domain::Side::try_from(message.side).is_ok())?;
         self.known("order_type", message.order_type, domain::OrderType::try_from(message.order_type).is_ok())?;
         self.known("time_in_force", message.time_in_force, domain::TimeInForce::try_from(message.time_in_force).is_ok())?;
@@ -593,6 +605,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
             self.known("execution_instructions", value, domain::ExecutionInstruction::try_from(value).is_ok())?;
         }
         self.known("position_effect", message.position_effect, domain::PositionEffect::try_from(message.position_effect).is_ok())?;
+        self.known("price_basis", message.price_basis, domain::PriceBasis::try_from(message.price_basis).is_ok())?;
         for stamped0 in message.parties.iter_mut() {
             for stamped1 in stamped0.identifiers.iter_mut() {
                 stamped1.valid_from_ns = Default::default();
@@ -788,17 +801,43 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         if let Some(held0) = message.counterparty.as_ref() {
             self.known("counterparty.party_role", held0.party_role, domain::PartyRole::try_from(held0.party_role).is_ok())?;
         }
+        if let Some(held0) = message.r#yield.as_ref() {
+            if let Some(held1) = held0.value.as_ref() {
+                self.exact("yield.value.value", held1.value.as_ref())?;
+                self.known("yield.value.unit", held1.unit, domain::ValueUnit::try_from(held1.unit).is_ok())?;
+            }
+            if let Some(held1) = held0.convention.as_ref() {
+                self.known("yield.convention.day_count", held1.day_count, domain::DayCount::try_from(held1.day_count).is_ok())?;
+                self.known("yield.convention.compounding", held1.compounding, domain::Compounding::try_from(held1.compounding).is_ok())?;
+            }
+            self.known("yield.kind", held0.kind, domain::YieldKind::try_from(held0.kind).is_ok())?;
+        }
+        self.exact("factor_used", message.factor_used.as_ref())?;
+        for (i0, held0) in message.parties.iter().enumerate() {
+            self.known(&format!("parties[{i0}].party_role"), held0.party_role, domain::PartyRole::try_from(held0.party_role).is_ok())?;
+        }
         self.known("kind", message.kind, domain::ExecutionKind::try_from(message.kind).is_ok())?;
         self.known("source", message.source, domain::ExecutionSource::try_from(message.source).is_ok())?;
         self.known("liquidity_indicator", message.liquidity_indicator, domain::LiquidityIndicator::try_from(message.liquidity_indicator).is_ok())?;
         self.known("side", message.side, domain::Side::try_from(message.side).is_ok())?;
         self.known("cross_rate_source", message.cross_rate_source, domain::CrossRateSource::try_from(message.cross_rate_source).is_ok())?;
         self.known("multi_leg_reporting_type", message.multi_leg_reporting_type, domain::MultiLegReportingType::try_from(message.multi_leg_reporting_type).is_ok())?;
+        self.known("price_basis", message.price_basis, domain::PriceBasis::try_from(message.price_basis).is_ok())?;
+        self.known("trade_time_precision", message.trade_time_precision, domain::TimePrecision::try_from(message.trade_time_precision).is_ok())?;
+        self.known("contra_party_type", message.contra_party_type, domain::ContraPartyType::try_from(message.contra_party_type).is_ok())?;
+        self.known("capacity", message.capacity, domain::Capacity::try_from(message.capacity).is_ok())?;
+        self.known("treasury_trade_modifier", message.treasury_trade_modifier, domain::TreasuryTradeModifier::try_from(message.treasury_trade_modifier).is_ok())?;
         message.account_id = self.venue_mapped_account("meridian.v1.ReportExecutionRequest", &message.venue_account_code, &message.account_id).await?;
         let stamped0 = message.counterparty.get_or_insert_with(Default::default);
         for stamped1 in stamped0.identifiers.iter_mut() {
             stamped1.valid_from_ns = Default::default();
             stamped1.valid_until_ns = Default::default();
+        }
+        for stamped0 in message.parties.iter_mut() {
+            for stamped1 in stamped0.identifiers.iter_mut() {
+                stamped1.valid_from_ns = Default::default();
+                stamped1.valid_until_ns = Default::default();
+            }
         }
         let account = Some(message.account_id.clone());
         self.command_typed("platform.book.command.report-execution", "meridian.v1.ReportExecutionRequest", message, account, acting_for).await
@@ -1046,6 +1085,12 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
             for (i1, held1) in held0.give_up_answers.iter().enumerate() {
                 self.known(&format!("allocations[{i0}].give_up_answers[{i1}].answer"), held1.answer, domain::GiveUpAnswer::try_from(held1.answer).is_ok())?;
             }
+            self.exact_money(&format!("allocations[{i0}].accrued_interest"), held0.accrued_interest.as_ref())?;
+            self.exact_money(&format!("allocations[{i0}].markup"), held0.markup.as_ref())?;
+            self.exact_money(&format!("allocations[{i0}].prevailing_market_price"), held0.prevailing_market_price.as_ref())?;
+            self.known(&format!("allocations[{i0}].prevailing_market_price_basis"), held0.prevailing_market_price_basis, domain::PrevailingMarketPriceBasis::try_from(held0.prevailing_market_price_basis).is_ok())?;
+            self.known(&format!("allocations[{i0}].capacity"), held0.capacity, domain::Capacity::try_from(held0.capacity).is_ok())?;
+            self.known(&format!("allocations[{i0}].execution_time_precision"), held0.execution_time_precision, domain::TimePrecision::try_from(held0.execution_time_precision).is_ok())?;
         }
         let account = None;
         self.command_typed("platform.book.command.book-order", "meridian.v1.BookOrderRequest", message, account, acting_for).await
@@ -1084,6 +1129,12 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
             for (i1, held1) in held0.give_up_answers.iter().enumerate() {
                 self.known(&format!("allocations[{i0}].give_up_answers[{i1}].answer"), held1.answer, domain::GiveUpAnswer::try_from(held1.answer).is_ok())?;
             }
+            self.exact_money(&format!("allocations[{i0}].accrued_interest"), held0.accrued_interest.as_ref())?;
+            self.exact_money(&format!("allocations[{i0}].markup"), held0.markup.as_ref())?;
+            self.exact_money(&format!("allocations[{i0}].prevailing_market_price"), held0.prevailing_market_price.as_ref())?;
+            self.known(&format!("allocations[{i0}].prevailing_market_price_basis"), held0.prevailing_market_price_basis, domain::PrevailingMarketPriceBasis::try_from(held0.prevailing_market_price_basis).is_ok())?;
+            self.known(&format!("allocations[{i0}].capacity"), held0.capacity, domain::Capacity::try_from(held0.capacity).is_ok())?;
+            self.known(&format!("allocations[{i0}].execution_time_precision"), held0.execution_time_precision, domain::TimePrecision::try_from(held0.execution_time_precision).is_ok())?;
         }
         self.known("kind", message.kind, domain::BookingCorrectionKind::try_from(message.kind).is_ok())?;
         let account = None;
@@ -1331,6 +1382,18 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
             self.exact_money(&format!("prices[{i0}].price"), held0.price.as_ref())?;
             self.known(&format!("prices[{i0}].basis"), held0.basis, domain::PriceBasis::try_from(held0.basis).is_ok())?;
             self.exact(&format!("prices[{i0}].confidence"), held0.confidence.as_ref())?;
+            if let Some(held1) = held0.r#yield.as_ref() {
+                if let Some(held2) = held1.value.as_ref() {
+                    self.exact(&format!("prices[{i0}].yield.value.value"), held2.value.as_ref())?;
+                    self.known(&format!("prices[{i0}].yield.value.unit"), held2.unit, domain::ValueUnit::try_from(held2.unit).is_ok())?;
+                }
+                if let Some(held2) = held1.convention.as_ref() {
+                    self.known(&format!("prices[{i0}].yield.convention.day_count"), held2.day_count, domain::DayCount::try_from(held2.day_count).is_ok())?;
+                    self.known(&format!("prices[{i0}].yield.convention.compounding"), held2.compounding, domain::Compounding::try_from(held2.compounding).is_ok())?;
+                }
+                self.known(&format!("prices[{i0}].yield.kind"), held1.kind, domain::YieldKind::try_from(held1.kind).is_ok())?;
+            }
+            self.exact(&format!("prices[{i0}].spread_bps"), held0.spread_bps.as_ref())?;
         }
         for stamped0 in message.prices.iter_mut() {
             let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
@@ -1477,6 +1540,19 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
                 self.exact(&format!("trades[{i0}].quote_at_trade.bid_quantity"), held1.bid_quantity.as_ref())?;
                 self.exact(&format!("trades[{i0}].quote_at_trade.ask_quantity"), held1.ask_quantity.as_ref())?;
             }
+            self.known(&format!("trades[{i0}].basis"), held0.basis, domain::PriceBasis::try_from(held0.basis).is_ok())?;
+            if let Some(held1) = held0.r#yield.as_ref() {
+                if let Some(held2) = held1.value.as_ref() {
+                    self.exact(&format!("trades[{i0}].yield.value.value"), held2.value.as_ref())?;
+                    self.known(&format!("trades[{i0}].yield.value.unit"), held2.unit, domain::ValueUnit::try_from(held2.unit).is_ok())?;
+                }
+                if let Some(held2) = held1.convention.as_ref() {
+                    self.known(&format!("trades[{i0}].yield.convention.day_count"), held2.day_count, domain::DayCount::try_from(held2.day_count).is_ok())?;
+                    self.known(&format!("trades[{i0}].yield.convention.compounding"), held2.compounding, domain::Compounding::try_from(held2.compounding).is_ok())?;
+                }
+                self.known(&format!("trades[{i0}].yield.kind"), held1.kind, domain::YieldKind::try_from(held1.kind).is_ok())?;
+            }
+            self.exact(&format!("trades[{i0}].spread_bps"), held0.spread_bps.as_ref())?;
         }
         for stamped0 in message.trades.iter_mut() {
             let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
@@ -1541,6 +1617,31 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
             for (i1, &value) in held0.characteristics.iter().enumerate() {
                 self.known(&format!("quotes[{i0}].characteristics[{i1}]"), value, domain::QuoteCharacteristic::try_from(value).is_ok())?;
             }
+            self.known(&format!("quotes[{i0}].basis"), held0.basis, domain::PriceBasis::try_from(held0.basis).is_ok())?;
+            if let Some(held1) = held0.bid_yield.as_ref() {
+                if let Some(held2) = held1.value.as_ref() {
+                    self.exact(&format!("quotes[{i0}].bid_yield.value.value"), held2.value.as_ref())?;
+                    self.known(&format!("quotes[{i0}].bid_yield.value.unit"), held2.unit, domain::ValueUnit::try_from(held2.unit).is_ok())?;
+                }
+                if let Some(held2) = held1.convention.as_ref() {
+                    self.known(&format!("quotes[{i0}].bid_yield.convention.day_count"), held2.day_count, domain::DayCount::try_from(held2.day_count).is_ok())?;
+                    self.known(&format!("quotes[{i0}].bid_yield.convention.compounding"), held2.compounding, domain::Compounding::try_from(held2.compounding).is_ok())?;
+                }
+                self.known(&format!("quotes[{i0}].bid_yield.kind"), held1.kind, domain::YieldKind::try_from(held1.kind).is_ok())?;
+            }
+            self.exact(&format!("quotes[{i0}].bid_spread_bps"), held0.bid_spread_bps.as_ref())?;
+            if let Some(held1) = held0.ask_yield.as_ref() {
+                if let Some(held2) = held1.value.as_ref() {
+                    self.exact(&format!("quotes[{i0}].ask_yield.value.value"), held2.value.as_ref())?;
+                    self.known(&format!("quotes[{i0}].ask_yield.value.unit"), held2.unit, domain::ValueUnit::try_from(held2.unit).is_ok())?;
+                }
+                if let Some(held2) = held1.convention.as_ref() {
+                    self.known(&format!("quotes[{i0}].ask_yield.convention.day_count"), held2.day_count, domain::DayCount::try_from(held2.day_count).is_ok())?;
+                    self.known(&format!("quotes[{i0}].ask_yield.convention.compounding"), held2.compounding, domain::Compounding::try_from(held2.compounding).is_ok())?;
+                }
+                self.known(&format!("quotes[{i0}].ask_yield.kind"), held1.kind, domain::YieldKind::try_from(held1.kind).is_ok())?;
+            }
+            self.exact(&format!("quotes[{i0}].ask_spread_bps"), held0.ask_spread_bps.as_ref())?;
         }
         for stamped0 in message.quotes.iter_mut() {
             let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
@@ -2287,6 +2388,11 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
             self.exact_money("event.cash", held0.cash.as_ref())?;
             self.exact_money("event.settlement_price", held0.settlement_price.as_ref())?;
             self.exact_money("event.proposal_basis", held0.proposal_basis.as_ref())?;
+            self.known("event.redemption_kind", held0.redemption_kind, domain::RedemptionEventKind::try_from(held0.redemption_kind).is_ok())?;
+            self.exact("event.redemption_price", held0.redemption_price.as_ref())?;
+            self.exact("event.factor", held0.factor.as_ref())?;
+            self.exact("event.prior_factor", held0.prior_factor.as_ref())?;
+            self.exact("event.face_change", held0.face_change.as_ref())?;
         }
         let account = None;
         self.command_typed("platform.book.command.record-lifecycle-event", "meridian.v1.RecordLifecycleEventRequest", message, account, acting_for).await
@@ -2311,6 +2417,11 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
             self.exact_money(&format!("events[{i0}].cash"), held0.cash.as_ref())?;
             self.exact_money(&format!("events[{i0}].settlement_price"), held0.settlement_price.as_ref())?;
             self.exact_money(&format!("events[{i0}].proposal_basis"), held0.proposal_basis.as_ref())?;
+            self.known(&format!("events[{i0}].redemption_kind"), held0.redemption_kind, domain::RedemptionEventKind::try_from(held0.redemption_kind).is_ok())?;
+            self.exact(&format!("events[{i0}].redemption_price"), held0.redemption_price.as_ref())?;
+            self.exact(&format!("events[{i0}].factor"), held0.factor.as_ref())?;
+            self.exact(&format!("events[{i0}].prior_factor"), held0.prior_factor.as_ref())?;
+            self.exact(&format!("events[{i0}].face_change"), held0.face_change.as_ref())?;
         }
         let account = None;
         self.command_typed("platform.book.command.propose-lifecycle-events", "meridian.v1.ProposeLifecycleEventsRequest", message, account, acting_for).await
@@ -2380,6 +2491,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
                 self.exact(&format!("values[{i0}].value.value"), held1.value.as_ref())?;
                 self.known(&format!("values[{i0}].value.unit"), held1.unit, domain::ValueUnit::try_from(held1.unit).is_ok())?;
             }
+            self.exact_money(&format!("values[{i0}].money_value"), held0.money_value.as_ref())?;
         }
         for stamped0 in message.values.iter_mut() {
             let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
@@ -2997,6 +3109,78 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
         self.call_typed("platform.config.query.read-stale-reference-actions-permitted", "meridian.v1.ReadStaleReferenceActionsPermittedRequest", message, account, None).await
     }
 
+    /// W10.4: `platform.lake.command.record-factors` (preview).
+    async fn record_factors(
+        &self,
+        request: Request<plugin::RecordFactorsParams>,
+    ) -> Result<Response<plugin::RecordFactorsResult>, Status> {
+        let mut params = request.into_inner();
+        let acting_for = params.acting_for.take();
+        let mut message: domain::RecordFactorsRequest = self.as_domain(params)?;
+        let bound = meridian_pb::bounds::RECORD_FACTORS_REQUEST_FACTORS_COUNT;
+        if !bound.admits(message.factors.len()) {
+            let refusal = format!(
+                "factors holds {} rows; a batch is {} to {}",
+                message.factors.len(),
+                bound.least,
+                bound.most
+            );
+            self.note_refusal(&refusal);
+            return Err(Status::invalid_argument(refusal));
+        }
+        for (i0, held0) in message.factors.iter().enumerate() {
+            if let Some(held1) = held0.meta.as_ref() {
+                for (i2, held2) in held1.subjects.iter().enumerate() {
+                    self.known(&format!("factors[{i0}].meta.subjects[{i2}].role"), held2.role, domain::SubjectRole::try_from(held2.role).is_ok())?;
+                }
+                for (i2, held2) in held1.source_times.iter().enumerate() {
+                    self.known(&format!("factors[{i0}].meta.source_times[{i2}].kind"), held2.kind, domain::SourceTimeKind::try_from(held2.kind).is_ok())?;
+                }
+                if let Some(held2) = held1.closed_day.as_ref() {
+                    self.known(&format!("factors[{i0}].meta.closed_day.reason"), held2.reason, domain::DateCheckReason::try_from(held2.reason).is_ok())?;
+                }
+                self.known(&format!("factors[{i0}].meta.quality"), held1.quality, domain::QualityState::try_from(held1.quality).is_ok())?;
+                for (i2, &value) in held1.quality_reasons.iter().enumerate() {
+                    self.known(&format!("factors[{i0}].meta.quality_reasons[{i2}]"), value, domain::QualityReason::try_from(value).is_ok())?;
+                }
+            }
+            self.exact(&format!("factors[{i0}].factor"), held0.factor.as_ref())?;
+            self.exact(&format!("factors[{i0}].coupon_rate"), held0.coupon_rate.as_ref())?;
+        }
+        for stamped0 in message.factors.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            let stamped2 = stamped1.source.get_or_insert_with(Default::default);
+            stamped2.instance = self.instance_id().to_string();
+            stamped2.plugin_version = Default::default();
+        }
+        for stamped0 in message.factors.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            stamped1.sent_at_ns = Default::default();
+        }
+        for stamped0 in message.factors.iter_mut() {
+            let stamped1 = stamped0.meta.get_or_insert_with(Default::default);
+            for stamped2 in stamped1.series_key.iter_mut() {
+                stamped2.valid_from_ns = Default::default();
+                stamped2.valid_until_ns = Default::default();
+            }
+        }
+        let account = None;
+        self.command_typed("platform.lake.command.record-factors", "meridian.v1.RecordFactorsRequest", message, account, acting_for).await
+    }
+
+    /// W10.6: `platform.lake.query.list-factors` (preview).
+    async fn list_factors(
+        &self,
+        request: Request<plugin::ListFactorsParams>,
+    ) -> Result<Response<plugin::ListFactorsResult>, Status> {
+        let message: domain::ListFactorsRequest = self.as_domain(request.into_inner())?;
+        for (i0, held0) in message.subjects.iter().enumerate() {
+            self.known(&format!("subjects[{i0}].role"), held0.role, domain::SubjectRole::try_from(held0.role).is_ok())?;
+        }
+        let account = None;
+        self.call_typed("platform.lake.query.list-factors", "meridian.v1.ListFactorsRequest", message, account, None).await
+    }
+
     /// W10.6: `platform.lake.query.list-expirations` (preview).
     async fn list_expirations(
         &self,
@@ -3291,6 +3475,13 @@ pub(crate) const DELIVERED: &[crate::receive::Row] = &[
         topic: "platform.lake.{dataset}.event.series-recorded",
         payload_type: "meridian.v1.SeriesRecordedEvent",
         read: series_recorded,
+    },
+    crate::receive::Row {
+        name: "FactorsRecorded",
+        step: "W10.5",
+        topic: "platform.lake.{dataset}.event.factors-recorded",
+        payload_type: "meridian.v1.FactorsRecordedEvent",
+        read: factors_recorded,
     },
 ];
 
@@ -3723,5 +3914,17 @@ fn series_recorded(payload: &[u8]) -> Result<crate::receive::Read, prost::Decode
         journal: None,
         cause: None,
         item: plugin::delivery::Item::SeriesRecorded(message),
+    })
+}
+
+/// W10.5: a FactorsRecordedEvent, unconflated, unscoped.
+fn factors_recorded(payload: &[u8]) -> Result<crate::receive::Read, prost::DecodeError> {
+    let message = plugin::FactorsRecordedEvent::decode(payload)?;
+    Ok(crate::receive::Read {
+        account: None,
+        directed: Vec::new(),
+        journal: None,
+        cause: None,
+        item: plugin::delivery::Item::FactorsRecorded(message),
     })
 }

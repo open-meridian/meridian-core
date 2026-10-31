@@ -66,6 +66,8 @@ mod tests {
             start_minute: start,
             end_minute: end,
             extended,
+            // Contract v29 (657): in force from the calendar's first date.
+            valid_from_date: String::new(),
         }
     }
 
