@@ -1813,6 +1813,11 @@ message TradingSession {
   uint32 end_minute = 3;
   // An extended session: pre-market or after-hours.
   bool extended = 4;
+  // Contract v29: a plain date, as CalendarWeekend.valid_from_date says a
+  // weekend's: a session's hours that changed are two rows, each from its date,
+  // so a backfill to 2016 states the hours in force then (FINRA's 08:00 to
+  // 20:00 among them). Empty: in force since the calendar's coverage began.
+  string valid_from_date = 5;
 }
 
 // One dated day's sessions, in place of the weekday's.

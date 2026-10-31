@@ -1310,6 +1310,8 @@ message ListRegistryPacksReply {
 
 // W8.18: install a pack, the ticked members one by one as a job.
 message InstallPackRequest {
+  // Contract v29 (616): an install of a withdrawn pack is refused
+  // FAILED_PRECONDITION naming it, never INVALID_ARGUMENT.
   string pack = 1;
   // The revision the sheet showed; another is refused FAILED_PRECONDITION
   // naming it.
@@ -1341,6 +1343,9 @@ message PackStatus {
   // Withdrawn by its curator.
   bool withdrawn = 4;
   repeated PackMemberStatus members = 5;
+  // Contract v29 (616): the pack's title as its curator states it, which the
+  // pack's page and dashboard__read_pack show.
+  string title = 6;
 }
 
 // One member's state in this deployment.
@@ -1378,6 +1383,10 @@ enum PackMemberState {
 
 // W8.19: update every launched member to its own latest.
 message UpdatePackRequest {
+  // Contract v29 (616): an update that cannot proceed as the deployment
+  // stands -- a member whose source registry is not taken -- is refused
+  // FAILED_PRECONDITION naming what is missing, never INVALID_ARGUMENT;
+  // nothing is updated.
   string pack = 1;
   string note = 2;
 }

@@ -212,6 +212,18 @@ message DatasetRef {
   // Contract v27 (W10.9; ruling 418): in a listing, the latest liveness the
   // lake keeps for the dataset, one per venue; empty in a read's answer.
   repeated DatasetLiveness liveness = 12;
+  // Contract v29: rows in force whose effective state is valid, counted by the
+  // lake as of the listing. 0 where the dataset holds no valid rows, and in a
+  // read's answer and an entitlements change.
+  uint64 valid_count = 13;
+  // Contract v29: rows in force served flagged suspicious, counted by the lake
+  // as of the listing. 0 where the dataset holds no suspicious rows, and in a
+  // read's answer and an entitlements change.
+  uint64 suspicious_count = 14;
+  // Contract v29: rows in force left out of default reads as invalid, counted
+  // by the lake as of the listing. 0 where the dataset holds no invalid rows,
+  // and in a read's answer and an entitlements change.
+  uint64 invalid_count = 15;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -989,6 +1001,10 @@ enum UnansweredReason {
   UNANSWERED_REASON_BEYOND_HISTORY = 6;
   // The dataset's licence forbids keeping it, and it was served, not kept.
   UNANSWERED_REASON_NOT_KEPT = 7;
+  // Contract v29: the dataset's only rows for the subject at the as-of are
+  // invalid: left out, never fallen back to, named so a reader can tell it from
+  // silence (ruling 619 (1)).
+  UNANSWERED_REASON_QUARANTINED = 8;
 }
 
 // Prices for subjects, at one of: the latest in force at a valid time
@@ -1752,7 +1768,8 @@ message DerivedSeries {
   // Never empty.
   string series = 2;
   // As derived, or as the publisher states it where published_by is set.
-  // Never unset.
+  // Never unset; from contract v29 (638) unset where the value is an amount
+  // of money, which money_value carries.
   UnitValue value = 3;
   // A definition and its version, an analytics measure's where one was used;
   // for a publisher's figure, the publisher's definition. Never unset.
@@ -1766,6 +1783,10 @@ message DerivedSeries {
   // publisher's figure and is refused without it; empty on a signal plugin's
   // own measure. A page shows it labelled with whose, never as our measure.
   string published_by = 6;
+  // Contract v29: a Money naming its cash instrument: a dollar volume, an
+  // expected move in the underlying's currency. Unset unless the series is an
+  // amount of money; value is then unset.
+  optional Money money_value = 7;
 }
 
 // Contract v28 (DerivedSeries.inputs): names what the value was derived from.
@@ -2372,6 +2393,11 @@ message QualityAssessment {
   repeated QualityReason reasons = 5;
   // Stamped by the sidecar. Never empty on a record; a plugin leaves it empty.
   string assessed_by_instance = 6;
+  // Contract v29: the row's message by its full name, as a want names it:
+  // meridian.v1.Price, meridian.v1.Bar; so a day's close and its bar, sharing a
+  // key, escalate apart. Never empty from v29; empty on an assessment recorded
+  // before it, read as the row key's only kind.
+  string data_type = 7;
 }
 
 // Contract v28 (W10.12): RecordQualityAssessments's request.

@@ -2475,7 +2475,9 @@ message ProposeOrderRequest {
   // SettlDate, 64); empty is spot.
   string value_date = 38;
   // Contract v28: as option brokers require it: buy to open, sell to close.
-  // Unspecified on an instrument that is no option or future.
+  // Unspecified on an instrument that is no option or future. From contract
+  // v29 (638) required on a single option or future order, refused unset
+  // naming it, as each package leg's is.
   PositionEffect position_effect = 39;
   // Contract v29: percent of par in limit_price, a yield in limit_yield, or a
   // spread over a benchmark in limit_spread_bps; a when-issued Treasury before
@@ -3713,7 +3715,9 @@ message LifecycleEventRecordedEvent {
 
 // Contract v28 (W9.19): ListLifecycleEvents's request.
 message ListLifecycleEventsRequest {
-  // An account in the reader's scope. Never empty.
+  // An account in the reader's scope. From contract v29 (740), empty answers
+  // every account in the reader's scope, each event naming its account, as
+  // the book's other reads do; v28 refused it empty.
   string account_id = 1;
   // Its INS- record. Empty: every instrument.
   string instrument_id = 2;
