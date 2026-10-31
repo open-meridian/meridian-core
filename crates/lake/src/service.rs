@@ -1150,7 +1150,14 @@ impl Lake {
                 {
                     return Err(format!("{at}.basis is unspecified"));
                 }
-                if price.price.is_none() && meta.unconverted.is_empty() {
+                // Contract v29 (ruling 685; W10.4): a yield or a spread is
+                // the price where the source states no money price.
+                let priced_otherwise = match PriceBasis::try_from(price.basis) {
+                    Ok(PriceBasis::Yield) => price.r#yield.is_some(),
+                    Ok(PriceBasis::Spread) => price.spread_bps.is_some(),
+                    _ => false,
+                };
+                if price.price.is_none() && meta.unconverted.is_empty() && !priced_otherwise {
                     return Err(format!(
                         "{at}.price is required, or its value as reported in unconverted"
                     ));
@@ -1205,6 +1212,21 @@ impl Lake {
                 return Err(format!(
                     "{at}: a quote's two sides are in one asset, and these are in {}",
                     instruments.len()
+                ));
+            }
+            // Contract v29 (ruling 685; W10.4): a price, a trade or a quote
+            // stated by its basis, its yields and spreads as the dictionary
+            // says; a spread's benchmark a record the deployment holds.
+            fixed_income_refused(&at, &row)?;
+            let benchmark = match &row {
+                Observation::Price(price) => price.benchmark_instrument_id.as_str(),
+                Observation::Trade(trade) => trade.benchmark_instrument_id.as_str(),
+                Observation::Quote(quote) => quote.benchmark_instrument_id.as_str(),
+                _ => "",
+            };
+            if !benchmark.is_empty() && !self.subject_held(benchmark)? {
+                return Err(format!(
+                    "{at}.benchmark_instrument_id {benchmark:?} is no record the deployment holds"
                 ));
             }
             match &row {
@@ -4337,7 +4359,16 @@ fn want_asked(event: &ObservationsWantedEvent) -> String {
 /// amount, a quantity more than zero, characteristics each in the list and at
 /// most sixteen, and an aggressor and eligibilities the enums hold.
 fn trade_refused(at: &str, trade: &meridian_domain::v1::Trade) -> Result<(), String> {
+    // Contract v29 (ruling 685; W10.4): a trade in yield or spread states it
+    // there, its money price unset where the source states none (a
+    // when-issued trade before its auction).
+    let priced_otherwise = match PriceBasis::try_from(trade.basis) {
+        Ok(PriceBasis::Yield) => trade.r#yield.is_some(),
+        Ok(PriceBasis::Spread) => trade.spread_bps.is_some(),
+        _ => false,
+    };
     match trade.price.as_ref() {
+        None if priced_otherwise => {}
         None => {
             return Err(format!(
                 "{at}.price is required: a trade with no price is refused"
@@ -4378,6 +4409,91 @@ fn trade_refused(at: &str, trade: &meridian_domain::v1::Trade) -> Result<(), Str
         }
     }
     Ok(())
+}
+
+/// A price, a trade or a quote held to W10.4 as contract v29 widens it
+/// (ruling 685; the dictionary): a basis the enum names; a yield in yield
+/// stated as a quoted yield must be -- its value, convention and kind --
+/// wherever one is given; a yield basis stating one, a spread basis its
+/// spread and the benchmark it is over; a spread set under no spread basis
+/// refused, and a benchmark named only beside a spread or a yield.
+fn fixed_income_refused(at: &str, row: &Observation) -> Result<(), String> {
+    type Yields<'a> = Vec<(&'static str, Option<&'a meridian_domain::v1::QuotedYield>)>;
+    type Spreads<'a> = Vec<(&'static str, Option<&'a meridian_pb::v1::Decimal>)>;
+    let (basis, yields, spreads, benchmark): (i32, Yields<'_>, Spreads<'_>, &str) = match row {
+        Observation::Price(price) => (
+            price.basis,
+            vec![("yield", price.r#yield.as_ref())],
+            vec![("spread_bps", price.spread_bps.as_ref())],
+            &price.benchmark_instrument_id,
+        ),
+        Observation::Trade(trade) => (
+            trade.basis,
+            vec![("yield", trade.r#yield.as_ref())],
+            vec![("spread_bps", trade.spread_bps.as_ref())],
+            &trade.benchmark_instrument_id,
+        ),
+        Observation::Quote(quote) => (
+            quote.basis,
+            vec![
+                ("bid_yield", quote.bid_yield.as_ref()),
+                ("ask_yield", quote.ask_yield.as_ref()),
+            ],
+            vec![
+                ("bid_spread_bps", quote.bid_spread_bps.as_ref()),
+                ("ask_spread_bps", quote.ask_spread_bps.as_ref()),
+            ],
+            &quote.benchmark_instrument_id,
+        ),
+        _ => return Ok(()),
+    };
+    let Ok(basis) = PriceBasis::try_from(basis) else {
+        return Err(format!(
+            "{at}.basis is {basis}: per unit, percent of par, a yield or a spread"
+        ));
+    };
+    for (name, quoted) in &yields {
+        if let Some(quoted) = quoted {
+            if let Some((field, words)) =
+                meridian_domain::conventions::quoted_yield_refused(quoted, &format!("{at}.{name}"))
+                    .into_iter()
+                    .next()
+            {
+                return Err(format!("{field}: {words}"));
+            }
+        }
+    }
+    for (name, spread) in &spreads {
+        if let Some(spread) = spread {
+            meridian_domain::exact::Exact::from_wire(spread)
+                .map_err(|out| format!("{at}.{name} {out}"))?;
+            if basis != PriceBasis::Spread {
+                return Err(format!(
+                    "{at}.{name} is set only on a row whose basis is spread"
+                ));
+            }
+        }
+    }
+    let any_yield = yields.iter().any(|(_, quoted)| quoted.is_some());
+    let any_spread = spreads.iter().any(|(_, spread)| spread.is_some());
+    match basis {
+        PriceBasis::Yield if !any_yield => Err(format!(
+            "{at}.{}: a row in yield states its yield",
+            yields[0].0
+        )),
+        PriceBasis::Spread if !any_spread => Err(format!(
+            "{at}.{}: a row in spread states its spread in basis points",
+            spreads[0].0
+        )),
+        PriceBasis::Spread if benchmark.is_empty() => Err(format!(
+            "{at}.benchmark_instrument_id: a spread names the benchmark it is over"
+        )),
+        _ if !benchmark.is_empty() && !any_spread && !any_yield => Err(format!(
+            "{at}.benchmark_instrument_id is named only beside a spread, or a yield stated \
+             against it"
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// A quote held to W10.4 (contract v19): each side's amount stated, each
@@ -4691,6 +4807,26 @@ fn quote_refused(at: &str, quote: &meridian_domain::v1::Quote) -> Result<(), Str
             if exact <= meridian_domain::exact::Exact::ZERO {
                 return Err(format!("{at}.{name} is more than zero"));
             }
+        }
+    }
+    // Contract v29 (ruling 900 R2): a capped size is the bucket's floor,
+    // stated in its quantity.
+    for (name, capped, quantity) in [
+        (
+            "bid_size_capped",
+            quote.bid_size_capped,
+            &quote.bid_quantity,
+        ),
+        (
+            "ask_size_capped",
+            quote.ask_size_capped,
+            &quote.ask_quantity,
+        ),
+    ] {
+        if capped && quantity.is_none() {
+            return Err(format!(
+                "{at}.{name}: a bucketed size states the bucket's floor in its quantity"
+            ));
         }
     }
     if !bounds::QUOTE_CHARACTERISTICS_COUNT.admits(quote.characteristics.len()) {

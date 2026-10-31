@@ -7,8 +7,9 @@ use meridian_domain::exact::Exact;
 use meridian_domain::v1::{
     Aggressor, Bar, Compounding, DayCount, ExecutionCost, LiquidityIndicator, Money,
     ObservationMeta, Outcome, OutcomeDetermination, OutcomeStage, Price, PriceBasis, PriceKind,
-    QualityReason, QualityState, Quote, QuoteCharacteristic, Rate, RateKind, Side, TcaBenchmark,
-    TcaUnanswered, TenorUnit, TimePrecision, Trade, ValueUnit,
+    QualityReason, QualityState, Quote, QuoteCharacteristic, QuotedYield, Rate, RateKind, Side,
+    TcaBenchmark, TcaUnanswered, TenorUnit, TimePrecision, Trade, TradeCharacteristic, ValueUnit,
+    YieldKind,
 };
 use serde_json::{json, Map, Value};
 
@@ -69,6 +70,7 @@ fn kept(pairs: Vec<(&str, Value)>) -> Value {
             Value::String(text) => text.is_empty(),
             Value::Array(items) => items.is_empty(),
             Value::Bool(b) => !b,
+            Value::Object(fields) => fields.is_empty(),
             _ => false,
         };
         if !empty {
@@ -89,6 +91,47 @@ fn named<E>(
     of(value).map_or(Value::Null, |e| Value::String(name(e).to_string()))
 }
 
+/// A yield as its source quotes it (contract v29, ruling 685): its value in
+/// percent, its convention and its kind, and the date a yield to a call or a
+/// put is to.
+fn quoted_yield(value: Option<&QuotedYield>) -> Value {
+    let Some(y) = value else {
+        return Value::Null;
+    };
+    let convention = y.convention.as_ref().map_or(Value::Null, |c| {
+        kept(vec![
+            (
+                "day_count",
+                named(c.day_count, DayCount::try_from, |e| e.as_str_name()),
+            ),
+            (
+                "compounding",
+                named(c.compounding, Compounding::try_from, |e| e.as_str_name()),
+            ),
+            (
+                "periods_per_year",
+                if c.periods_per_year == 0 {
+                    Value::Null
+                } else {
+                    json!(c.periods_per_year)
+                },
+            ),
+        ])
+    });
+    kept(vec![
+        (
+            "value",
+            decimal(y.value.as_ref().and_then(|v| v.value.as_ref())),
+        ),
+        ("convention", convention),
+        (
+            "kind",
+            named(y.kind, YieldKind::try_from, |e| e.as_str_name()),
+        ),
+        ("to_date", json!(y.to_date)),
+    ])
+}
+
 pub fn price(p: &Price) -> Value {
     kept(vec![
         ("meta", meta(p.meta.as_ref())),
@@ -101,6 +144,11 @@ pub fn price(p: &Price) -> Value {
             "basis",
             named(p.basis, PriceBasis::try_from, |e| e.as_str_name()),
         ),
+        // Contract v29 (ruling 685): a yield beside it, a spread over its
+        // benchmark.
+        ("yield", quoted_yield(p.r#yield.as_ref())),
+        ("spread_bps", decimal(p.spread_bps.as_ref())),
+        ("benchmark_instrument_id", json!(p.benchmark_instrument_id)),
     ])
 }
 
@@ -138,6 +186,31 @@ pub fn trade(t: &Trade) -> Value {
             },
         ),
         ("cancelled", json!(t.cancelled)),
+        // Contract v29 (rulings 685 and 900): the characteristics, the basis,
+        // a yield beside the price, a spread, and a capped size read as at
+        // least.
+        (
+            "attributes",
+            t.attributes.as_ref().map_or(Value::Null, |a| {
+                kept(vec![(
+                    "characteristics",
+                    Value::Array(
+                        a.characteristics
+                            .iter()
+                            .map(|c| named(*c, TradeCharacteristic::try_from, |e| e.as_str_name()))
+                            .collect(),
+                    ),
+                )])
+            }),
+        ),
+        (
+            "basis",
+            named(t.basis, PriceBasis::try_from, |e| e.as_str_name()),
+        ),
+        ("yield", quoted_yield(t.r#yield.as_ref())),
+        ("spread_bps", decimal(t.spread_bps.as_ref())),
+        ("benchmark_instrument_id", json!(t.benchmark_instrument_id)),
+        ("quantity_capped", json!(t.quantity_capped)),
     ])
 }
 
@@ -157,6 +230,19 @@ pub fn quote(q: &Quote) -> Value {
                     .collect(),
             ),
         ),
+        // Contract v29 (rulings 685 and 900): a bucketed size read as at
+        // least, the basis, each side's yield and spread, and the benchmark.
+        ("bid_size_capped", json!(q.bid_size_capped)),
+        ("ask_size_capped", json!(q.ask_size_capped)),
+        (
+            "basis",
+            named(q.basis, PriceBasis::try_from, |e| e.as_str_name()),
+        ),
+        ("bid_yield", quoted_yield(q.bid_yield.as_ref())),
+        ("bid_spread_bps", decimal(q.bid_spread_bps.as_ref())),
+        ("ask_yield", quoted_yield(q.ask_yield.as_ref())),
+        ("ask_spread_bps", decimal(q.ask_spread_bps.as_ref())),
+        ("benchmark_instrument_id", json!(q.benchmark_instrument_id)),
     ])
 }
 

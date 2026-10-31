@@ -115,13 +115,18 @@ pub const DATA_TYPES: [&str; 16] = [
 /// From contract v28 statistics and listed series too, as any dataset's rows.
 pub const PRIORITISED: [&str; 7] = [PRICE, BAR, TRADE, QUOTE, RATE, STATISTIC, LISTED_SERIES];
 
-const PRICE_FIELDS: [&str; 5] = [
+const PRICE_FIELDS: [&str; 8] = [
     "meridian.v1.Price.meta",
     "meridian.v1.Price.kind",
     "meridian.v1.Price.price",
     "meridian.v1.Price.basis",
     // Contract 28, amended 2026-10-31 (ruling 895).
     "meridian.v1.Price.confidence",
+    // Contract v29 (ruling 685; W10.4): a yield beside the price, and a
+    // spread over its benchmark.
+    "meridian.v1.Price.yield",
+    "meridian.v1.Price.spread_bps",
+    "meridian.v1.Price.benchmark_instrument_id",
 ];
 const BAR_FIELDS: [&str; 8] = [
     "meridian.v1.Bar.meta",
@@ -134,7 +139,7 @@ const BAR_FIELDS: [&str; 8] = [
     "meridian.v1.Bar.trade_count",
 ];
 
-const TRADE_FIELDS: [&str; 8] = [
+const TRADE_FIELDS: [&str; 13] = [
     "meridian.v1.Trade.meta",
     "meridian.v1.Trade.price",
     "meridian.v1.Trade.quantity",
@@ -144,14 +149,32 @@ const TRADE_FIELDS: [&str; 8] = [
     "meridian.v1.Trade.cancelled",
     // Contract v28 (G9).
     "meridian.v1.Trade.quote_at_trade",
+    // Contract v29 (ruling 685; W10.4): the basis, a yield beside the price,
+    // a spread over its benchmark, and a capped size read as at least.
+    "meridian.v1.Trade.basis",
+    "meridian.v1.Trade.yield",
+    "meridian.v1.Trade.spread_bps",
+    "meridian.v1.Trade.benchmark_instrument_id",
+    "meridian.v1.Trade.quantity_capped",
 ];
-const QUOTE_FIELDS: [&str; 6] = [
+const QUOTE_FIELDS: [&str; 14] = [
     "meridian.v1.Quote.meta",
     "meridian.v1.Quote.bid",
     "meridian.v1.Quote.ask",
     "meridian.v1.Quote.bid_quantity",
     "meridian.v1.Quote.ask_quantity",
     "meridian.v1.Quote.characteristics",
+    // Contract v29 (ruling 900 R2): a bucketed size read as at least.
+    "meridian.v1.Quote.bid_size_capped",
+    "meridian.v1.Quote.ask_size_capped",
+    // Contract v29 (ruling 685; W10.4): the basis, each side's yield and
+    // spread, and the spread's benchmark.
+    "meridian.v1.Quote.basis",
+    "meridian.v1.Quote.bid_yield",
+    "meridian.v1.Quote.bid_spread_bps",
+    "meridian.v1.Quote.ask_yield",
+    "meridian.v1.Quote.ask_spread_bps",
+    "meridian.v1.Quote.benchmark_instrument_id",
 ];
 
 const OUTCOME_FIELDS: [&str; 6] = [
@@ -337,6 +360,15 @@ pub fn strip_price(
     if gone(PRICE_FIELDS[4]) {
         price.confidence = None;
     }
+    if gone(PRICE_FIELDS[5]) {
+        price.r#yield = None;
+    }
+    if gone(PRICE_FIELDS[6]) {
+        price.spread_bps = None;
+    }
+    if gone(PRICE_FIELDS[7]) {
+        price.benchmark_instrument_id.clear();
+    }
     removed
 }
 
@@ -416,6 +448,21 @@ pub fn strip_trade(
     }
     if gone(TRADE_FIELDS[7]) {
         trade.quote_at_trade = None;
+    }
+    if gone(TRADE_FIELDS[8]) {
+        trade.basis = 0;
+    }
+    if gone(TRADE_FIELDS[9]) {
+        trade.r#yield = None;
+    }
+    if gone(TRADE_FIELDS[10]) {
+        trade.spread_bps = None;
+    }
+    if gone(TRADE_FIELDS[11]) {
+        trade.benchmark_instrument_id.clear();
+    }
+    if gone(TRADE_FIELDS[12]) {
+        trade.quantity_capped = false;
     }
     removed
 }
@@ -586,6 +633,30 @@ pub fn strip_quote(
     }
     if gone(QUOTE_FIELDS[5]) {
         quote.characteristics.clear();
+    }
+    if gone(QUOTE_FIELDS[6]) {
+        quote.bid_size_capped = false;
+    }
+    if gone(QUOTE_FIELDS[7]) {
+        quote.ask_size_capped = false;
+    }
+    if gone(QUOTE_FIELDS[8]) {
+        quote.basis = 0;
+    }
+    if gone(QUOTE_FIELDS[9]) {
+        quote.bid_yield = None;
+    }
+    if gone(QUOTE_FIELDS[10]) {
+        quote.bid_spread_bps = None;
+    }
+    if gone(QUOTE_FIELDS[11]) {
+        quote.ask_yield = None;
+    }
+    if gone(QUOTE_FIELDS[12]) {
+        quote.ask_spread_bps = None;
+    }
+    if gone(QUOTE_FIELDS[13]) {
+        quote.benchmark_instrument_id.clear();
     }
     removed
 }

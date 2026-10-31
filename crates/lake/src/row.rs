@@ -729,6 +729,10 @@ impl Observation {
                     && same_money(&a.price, &b.price)
                     // Contract 28, amended 2026-10-31 (ruling 895).
                     && same_decimal(&a.confidence, &b.confidence)
+                    // Contract v29 (ruling 685).
+                    && same_yield(&a.r#yield, &b.r#yield)
+                    && same_decimal(&a.spread_bps, &b.spread_bps)
+                    && a.benchmark_instrument_id == b.benchmark_instrument_id
             }
             (Observation::Bar(a), Observation::Bar(b)) => {
                 same_money(&a.open, &b.open)
@@ -747,6 +751,12 @@ impl Observation {
                     && a.source_sequence == b.source_sequence
                     && a.cancelled == b.cancelled
                     && same_quote_at_trade(&a.quote_at_trade, &b.quote_at_trade)
+                    // Contract v29 (ruling 685).
+                    && a.basis == b.basis
+                    && same_yield(&a.r#yield, &b.r#yield)
+                    && same_decimal(&a.spread_bps, &b.spread_bps)
+                    && a.benchmark_instrument_id == b.benchmark_instrument_id
+                    && a.quantity_capped == b.quantity_capped
             }
             (Observation::Quote(a), Observation::Quote(b)) => {
                 same_money(&a.bid, &b.bid)
@@ -754,6 +764,14 @@ impl Observation {
                     && same_decimal(&a.bid_quantity, &b.bid_quantity)
                     && same_decimal(&a.ask_quantity, &b.ask_quantity)
                     && a.characteristics == b.characteristics
+                    // Contract v29 (rulings 685 and 900).
+                    && (a.bid_size_capped, a.ask_size_capped, a.basis)
+                        == (b.bid_size_capped, b.ask_size_capped, b.basis)
+                    && same_yield(&a.bid_yield, &b.bid_yield)
+                    && same_yield(&a.ask_yield, &b.ask_yield)
+                    && same_decimal(&a.bid_spread_bps, &b.bid_spread_bps)
+                    && same_decimal(&a.ask_spread_bps, &b.ask_spread_bps)
+                    && a.benchmark_instrument_id == b.benchmark_instrument_id
             }
             (Observation::Outcome(a), Observation::Outcome(b)) => {
                 a.determination == b.determination
@@ -931,6 +949,24 @@ fn same_unit_value(
         (Some(a), Some(b)) => {
             same_decimal(&a.value, &b.value)
                 && (a.unit, &a.index_base, &a.ucum_code) == (b.unit, &b.index_base, &b.ucum_code)
+        }
+        _ => false,
+    }
+}
+
+/// Two quoted yields the same (contract v29, ruling 685): the value by its
+/// decimal and unit, the convention, the kind and the date it is to.
+fn same_yield(
+    a: &Option<meridian_domain::v1::QuotedYield>,
+    b: &Option<meridian_domain::v1::QuotedYield>,
+) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            same_unit_value(&a.value, &b.value)
+                && a.convention == b.convention
+                && a.kind == b.kind
+                && a.to_date == b.to_date
         }
         _ => false,
     }
