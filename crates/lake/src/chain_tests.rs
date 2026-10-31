@@ -1309,6 +1309,27 @@ async fn a_listing_read_names_its_paths_and_fills_its_pages() {
     // Asked a size: that many, never past 500.
     assert_eq!(list(100, "", vec![]).series.len(), 100);
     assert_eq!(list(900, "", vec![]).series.len(), 500);
+    // Its line names the whole answer and the rows this page carries, never
+    // an inner page's alone (found on dev 2026-10-30: "rows=90 of=1090").
+    let first = list(0, "", vec![]);
+    assert_eq!(
+        service::last_noted(),
+        Some((DataType::Series, 3_000, first.series.len()))
+    );
+    // An underlying's expirations: the listing's rows counted and the dates
+    // answered, never "rows=0 of=0".
+    let expirations = tokio::task::block_in_place(|| {
+        h.lake.list_expirations(
+            meridian_domain::v1::ListExpirationsRequest {
+                underlying_id: AAPL.into(),
+                ..Default::default()
+            },
+            &envelope("signal-1"),
+        )
+    })
+    .unwrap();
+    assert_eq!(expirations.expirations.len(), 10);
+    assert_eq!(service::last_noted(), Some((DataType::Series, 3_000, 10)));
 }
 
 async fn next_want(

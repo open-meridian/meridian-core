@@ -999,6 +999,18 @@ fn the_listing_is_read_from_its_index_as_the_rows_answer_it() {
             1_000,
         )
         .unwrap();
+    // C restated twice, to January and back (versions 2 and 3; dev's
+    // chains are re-listed each pass): only its version in force counts.
+    for (date, at) in [("2027-01-15", 2_500), ("2026-12-18", 2_600)] {
+        let restated = store
+            .record(
+                &first,
+                vec![listed_series(&first, &subject, "C", date, false)],
+                at,
+            )
+            .unwrap();
+        assert_eq!(restated.restated, 1);
+    }
     // An adjustment: B moves to December, recorded after the first cut-off.
     let moved = store
         .record(
@@ -1056,6 +1068,12 @@ fn the_listing_is_read_from_its_index_as_the_rows_answer_it() {
     let then = both(2_000);
     assert_eq!(then.len(), 6, "A twice, B, C, D and F; BAD and Z left out");
     assert_eq!((at(&then, "2026-11-20"), at(&then, "2026-12-18")), (3, 1));
+    let between = both(2_550);
+    assert_eq!(
+        (at(&between, "2026-11-20"), at(&between, "2026-12-18")),
+        (3, 0)
+    );
+    assert_eq!(at(&between, "2027-01-15"), 1, "C's second version in force");
     let now = both(0);
     assert_eq!((at(&now, "2026-11-20"), at(&now, "2026-12-18")), (1, 2));
     assert!(now
@@ -1420,6 +1438,71 @@ mod chain_page {
         let dataset = format!("tradier:{tag}");
         let underlying = format!("INS-{tag}").to_uppercase();
         record_fixture(&store, &dataset, &underlying, shape);
+        serve(store, &dataset, underlying, resolve_delay)
+    }
+
+    /// A chain's listing alone, each series recorded `versions` times --
+    /// a data plugin re-listing its chain and restating a term each pass,
+    /// as dev's 41,148 series rows for about 4,500 series do (found
+    /// 2026-10-30) -- served as [`page`] serves its fixture.
+    pub fn versions_page(
+        store: Arc<PostgresStore>,
+        tag: &str,
+        shape: Shape,
+        versions: usize,
+    ) -> Page {
+        let dataset = format!("tradier:{tag}");
+        let underlying = format!("INS-{tag}").to_uppercase();
+        let expected = (shape.series() * versions) as u64;
+        let head = store.heads().unwrap().get(&dataset).copied().unwrap_or(0);
+        if head < expected {
+            assert_eq!(
+                head, 0,
+                "a partial fixture: drop the bench's database and run again"
+            );
+            let now = SystemClock.now_ns();
+            for pass in 0..versions {
+                let rows: Vec<Observation> = (0..shape.expiries)
+                    .flat_map(|e| {
+                        (0..shape.strikes).flat_map(move |s| ['C', 'P'].map(|r| (e, s, r)))
+                    })
+                    .map(|(e, s, r)| {
+                        let k = osi(&underlying, e, s, r);
+                        Observation::Series(ListedSeries {
+                            meta: meta(&dataset, &format!("series:{k}"), &underlying, &k, now),
+                            template_id: "TPL-listed-option".into(),
+                            template_version: "1".into(),
+                            fields: vec![
+                                field("underlying_instrument_id", underlying.clone()),
+                                field("strike_price", format!("{}", 10 + s)),
+                                field(
+                                    "expiration_date",
+                                    format!("2027-{:02}-{:02}", 1 + e % 12, 1 + e % 28),
+                                ),
+                                field("listing_pass", pass.to_string()),
+                            ],
+                            instrument_id: String::new(),
+                        })
+                    })
+                    .collect();
+                for batch in rows.chunks(2000) {
+                    store
+                        .record(&dataset, batch.to_vec(), now + pass as i64)
+                        .unwrap();
+                }
+            }
+        }
+        serve(store, &dataset, underlying, Duration::from_millis(1))
+    }
+
+    /// The lake served on an in-process bus over the store, its instrument
+    /// store stood in, as [`page`] describes.
+    fn serve(
+        store: Arc<PostgresStore>,
+        dataset: &str,
+        underlying: String,
+        resolve_delay: Duration,
+    ) -> Page {
         let bus = Arc::new(Bus::single(
             READER,
             Arc::new(MemoryBackend::new()),
@@ -1457,7 +1540,7 @@ mod chain_page {
             ))
         });
         let lake = service::serve(bus.clone(), store as Arc<dyn Store>, Arc::new(SystemClock));
-        lake.configured(&configuration(&dataset));
+        lake.configured(&configuration(dataset));
         Page {
             bus,
             resolves,
@@ -1868,6 +1951,23 @@ async fn capacity_chain_page_reads() {
         let (dates, bytes, took) = page.expirations().await;
         println!(
             "CAPACITY chain expirations={i} calls=1 dates={dates} bytes={bytes} ms={:.1}",
+            took.as_secs_f64() * 1e3
+        );
+    }
+    // The same listing restated: each series recorded ten times, as a data
+    // plugin re-listing its chain leaves it (dev, 2026-10-30).
+    let versions = tokio::task::block_in_place(|| {
+        chain_page::versions_page(
+            Arc::clone(&store),
+            &format!("bench-versions-{}x{}x10", shape.expiries, shape.strikes),
+            shape,
+            10,
+        )
+    });
+    for i in 0..5 {
+        let (dates, bytes, took) = versions.expirations().await;
+        println!(
+            "CAPACITY chain expirations_versions=10 run={i} calls=1 dates={dates} bytes={bytes} ms={:.1}",
             took.as_secs_f64() * 1e3
         );
     }

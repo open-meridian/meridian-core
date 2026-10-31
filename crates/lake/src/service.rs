@@ -2862,6 +2862,13 @@ impl Lake {
         for (listed, record) in series.iter_mut().zip(self.series_records(keys)) {
             listed.instrument_id = record;
         }
+        // Its line (ruling 798): the rows the read's whole answer held and
+        // the series this page carries, never the last inner page's alone
+        // (found on dev 2026-10-30: "rows=90 of=1090" for a page of 1,090).
+        let whole = READ_NOTED
+            .with(std::cell::Cell::get)
+            .map_or(0, |(_, whole, _)| whole);
+        noted_read(DataType::Series, whole, series.len());
         Ok(ListSeriesReply {
             series,
             unanswered,
@@ -3020,6 +3027,9 @@ impl Lake {
                 by_date.entry(date).or_default().insert(&entry.series);
             }
         }
+        // Its line (ruling 798): the listing's rows counted and the
+        // expirations answered (found on dev 2026-10-30: "rows=0 of=0").
+        noted_read(DataType::Series, listing.len(), by_date.len());
         Ok(ListExpirationsReply {
             expirations: by_date
                 .into_iter()
@@ -4711,6 +4721,12 @@ thread_local! {
 /// Note a read for the line its handler logs.
 fn noted_read(kind: DataType, whole: usize, page: usize) {
     READ_NOTED.with(|noted| noted.set(Some((kind, whole, page))));
+}
+
+/// What this thread's last read noted for its line, for tests.
+#[cfg(test)]
+pub(crate) fn last_noted() -> Option<(DataType, usize, usize)> {
+    READ_NOTED.with(std::cell::Cell::get)
 }
 
 fn serve_on<Req, Rep, F>(
