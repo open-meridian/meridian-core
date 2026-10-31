@@ -11973,11 +11973,18 @@
       "type": "Money",
       "empty": "never unset",
       "intent": "says the price executed at",
-      "meaning": "the price per unit, a Money naming its cash instrument",
-      "not_meaning": "the order's limit",
+      "meaning": "the price per unit, a Money naming its cash instrument; on a debt record's fill from v29 the dollar price per 100 of face, clean, whatever price_basis says it was quoted in, its cash face times price times 0.01, a pool's or a tranche's original face times factor_used times price over 100 (986, 987)",
+      "not_meaning": "the order's limit; a yield or a spread, which travel in yield",
       "filled": "as-reported",
       "filled_by": "connectivity",
       "since": "v22",
+      "changes": [
+        {
+          "version": "v29",
+          "kind": "clarified",
+          "what": "a debt record's fill is priced per 100 of face, a yield or spread quote in yield beside it (987); its cash face times price times 0.01, a pool's or a tranche's at factor_used (986)"
+        }
+      ],
       "stability": "preview",
       "store": "bor"
     },
@@ -16142,11 +16149,18 @@
       "type": "Money",
       "empty": "never unset",
       "intent": "says the price executed at",
-      "meaning": "per unit, a Money naming its cash instrument",
-      "not_meaning": "a limit",
+      "meaning": "per unit, a Money naming its cash instrument; on a debt record's fill from v29 the dollar price per 100 of face, clean, whatever price_basis says it was quoted in (987)",
+      "not_meaning": "a limit; a yield or a spread, which travel in yield",
       "filled": "as-reported",
       "filled_by": "connectivity",
       "since": "v22",
+      "changes": [
+        {
+          "version": "v29",
+          "kind": "clarified",
+          "what": "a debt record's fill is priced per 100 of face, a yield or spread quote in yield beside it (987)"
+        }
+      ],
       "required": [
         {
           "row": "ReportExecution",
@@ -20939,11 +20953,18 @@
       "unit": "the major unit of the asset the Money names",
       "empty": "unset where no cash moves",
       "intent": "states the cash moved",
-      "meaning": "signed, positive received: a cash settlement's amount, a deliverable's cash component, or a day's variation",
+      "meaning": "signed, positive received: a cash settlement's amount, a deliverable's cash component, or a day's variation; from v29 a coupon's interest, booked as two cash lines, the purchased accrued returned and the income (988), or a redemption's or a paydown's principal",
       "not_meaning": "a fee, which is a charge",
       "filled": "as-reported",
       "filled_by": "custody",
       "since": "v28",
+      "changes": [
+        {
+          "version": "v29",
+          "kind": "clarified",
+          "what": "a debt record's coupon, redemption or paydown cash; a coupon's booked as the purchased accrued returned and the income, each its own cash line (988)"
+        }
+      ],
       "stability": "preview",
       "store": "bor"
     },
@@ -21691,7 +21712,7 @@
       "unit": "the major unit of the asset the Money names",
       "empty": "unset on an allocation in an instrument that accrues nothing; on a fixed-income allocation booked before v29, unset, a backfilled record saying it was not recorded (decisions/031)",
       "intent": "carries a trade's accrued interest as confirmed (720)",
-      "meaning": "the accrued interest the customer pays or receives, a Money in the settlement currency (FIX AccruedInterestAmt, 159, on Confirmation 35=AK); final money is net_amount plus it",
+      "meaning": "the accrued interest the customer pays or receives, a Money in the settlement currency (FIX AccruedInterestAmt, 159, on Confirmation 35=AK); final money is net_amount plus it; it moves cash at booking as its own cash line in the allocation's account, paid on a purchase and received on a sale, pending to the settlement date, so settlement is principal plus accrued (988), and a coupon returns what purchases paid of it apart from income",
       "not_meaning": "the position's accrued, which is computed as of a date and never stored (684); a fee",
       "filled": "as-reported",
       "filled_by": "oms",
@@ -21869,7 +21890,7 @@
       "allowed": [
         {
           "value": "PRICE_BASIS_UNSPECIFIED",
-          "meaning": "per unit, as every execution before v29"
+          "meaning": "per unit, as every execution before v29; a debt record's price per 100 of face all the same (987)"
         },
         {
           "value": "PRICE_BASIS_PER_UNIT",
@@ -21877,20 +21898,20 @@
         },
         {
           "value": "PRICE_BASIS_PERCENT_OF_PAR",
-          "meaning": "per 100 of face, clean, in limit_price (FIX PriceType 423 = 1)"
+          "meaning": "quoted per 100 of face, clean, the price itself (FIX PriceType 423 = 1)"
         },
         {
           "value": "PRICE_BASIS_YIELD",
-          "meaning": "a yield, in limit_yield (423 = 9)"
+          "meaning": "quoted in yield, the quote in yield beside the price per 100 of face (423 = 9; 987)"
         },
         {
           "value": "PRICE_BASIS_SPREAD",
-          "meaning": "a spread over benchmark_instrument_id, in limit_spread_bps (423 = 6)"
+          "meaning": "quoted in spread, the quote in yield beside the price per 100 of face (423 = 6; 987)"
         }
       ],
       "empty": "unspecified: per unit, as before v29",
-      "intent": "says how the execution's price is stated (723; FIX PriceType, 423)",
-      "meaning": "per unit, or percent of par (TRACE's decimal price), yield or spread, as the lake's PriceBasis (W10.4)",
+      "intent": "says how the execution was quoted (723; FIX PriceType, 423)",
+      "meaning": "per unit, or percent of par (TRACE's decimal price), yield or spread, as the lake's PriceBasis (W10.4); on a debt record the price stays the dollar price per 100 of face, a yield or spread quote in yield (987)",
       "not_meaning": "a lake row's basis",
       "filled": "as-reported",
       "filled_by": "connectivity",
@@ -21904,7 +21925,7 @@
       "allowed": [
         {
           "value": "PRICE_BASIS_UNSPECIFIED",
-          "meaning": "per unit, as every execution before v29"
+          "meaning": "per unit, as every execution before v29; a debt record's price per 100 of face all the same (987)"
         },
         {
           "value": "PRICE_BASIS_PER_UNIT",
@@ -21912,20 +21933,20 @@
         },
         {
           "value": "PRICE_BASIS_PERCENT_OF_PAR",
-          "meaning": "per 100 of face, clean, in limit_price (FIX PriceType 423 = 1)"
+          "meaning": "quoted per 100 of face, clean, the price itself (FIX PriceType 423 = 1)"
         },
         {
           "value": "PRICE_BASIS_YIELD",
-          "meaning": "a yield, in limit_yield (423 = 9)"
+          "meaning": "quoted in yield, the quote in yield beside the price per 100 of face (423 = 9; 987)"
         },
         {
           "value": "PRICE_BASIS_SPREAD",
-          "meaning": "a spread over benchmark_instrument_id, in limit_spread_bps (423 = 6)"
+          "meaning": "quoted in spread, the quote in yield beside the price per 100 of face (423 = 6; 987)"
         }
       ],
       "empty": "unspecified: per unit, as before v29",
-      "intent": "says how the execution's price is stated (723; FIX PriceType, 423)",
-      "meaning": "per unit, or percent of par (TRACE's decimal price), yield or spread, as the lake's PriceBasis (W10.4)",
+      "intent": "says how the execution was quoted (723; FIX PriceType, 423)",
+      "meaning": "per unit, or percent of par (TRACE's decimal price), yield or spread, as the lake's PriceBasis (W10.4); on a debt record the price stays the dollar price per 100 of face, a yield or spread quote in yield (987)",
       "not_meaning": "a lake row's basis",
       "filled": "as-reported",
       "filled_by": "connectivity",
@@ -21938,7 +21959,7 @@
       "type": "message QuotedYield",
       "empty": "unset where none is stated",
       "intent": "carries the yield the trade was done at or reported with (723)",
-      "meaning": "a when-issued Treasury's yield, a municipal's yield to worst on its confirmation, or TRACE's yield; a QuotedYield",
+      "meaning": "a when-issued Treasury's yield, a municipal's yield to worst on its confirmation, or TRACE's yield; a QuotedYield; the quote of a fill quoted in yield or spread, beside its dollar price, refused unset there (987)",
       "not_meaning": "a yield the plugin computed",
       "filled": "as-reported",
       "filled_by": "connectivity",
@@ -21951,7 +21972,7 @@
       "type": "message QuotedYield",
       "empty": "unset where none is stated",
       "intent": "carries the yield the trade was done at or reported with (723)",
-      "meaning": "a when-issued Treasury's yield, a municipal's yield to worst on its confirmation, or TRACE's yield; a QuotedYield",
+      "meaning": "a when-issued Treasury's yield, a municipal's yield to worst on its confirmation, or TRACE's yield; a QuotedYield; the quote of a fill quoted in yield or spread, beside its dollar price, refused unset there (987)",
       "not_meaning": "a yield the plugin computed",
       "filled": "as-reported",
       "filled_by": "connectivity",
@@ -22043,9 +22064,9 @@
         }
       },
       "unit": "a fraction of original face",
-      "empty": "unset: the latest published Factor row",
-      "intent": "states the factor a pool or TBA trade was done at, where not the latest (6730(d)(2)(B); FIX Factor, 228)",
-      "meaning": "an exact decimal",
+      "empty": "unset on a fill in a record that is no pool or tranche, or on a TBA's done at the latest; a pool's or a tranche's fill is refused unset (986) until the book reads the lake's latest Factor row (Track C), from when unset is the latest published Factor row",
+      "intent": "states the factor a pool, tranche or TBA trade was done at (6730(d)(2)(B); FIX Factor, 228)",
+      "meaning": "an exact decimal: the fill's cash is original face times it times price over 100 (986); refused on a fill in any record but a pool, a tranche or a TBA",
       "not_meaning": "a factor the book computed",
       "filled": "as-reported",
       "filled_by": "connectivity",
@@ -22067,9 +22088,9 @@
         }
       },
       "unit": "a fraction of original face",
-      "empty": "unset: the latest published Factor row",
-      "intent": "states the factor a pool or TBA trade was done at, where not the latest (6730(d)(2)(B); FIX Factor, 228)",
-      "meaning": "an exact decimal",
+      "empty": "unset on a fill in a record that is no pool or tranche, or on a TBA's done at the latest; a pool's or a tranche's fill is refused unset (986) until the book reads the lake's latest Factor row (Track C), from when unset is the latest published Factor row",
+      "intent": "states the factor a pool, tranche or TBA trade was done at (6730(d)(2)(B); FIX Factor, 228)",
+      "meaning": "an exact decimal: the fill's cash is original face times it times price over 100 (986); refused on a fill in any record but a pool, a tranche or a TBA",
       "not_meaning": "a factor the book computed",
       "filled": "as-reported",
       "filled_by": "connectivity",
