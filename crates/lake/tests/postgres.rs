@@ -2081,7 +2081,7 @@ fn a_held_answer_is_counted_at_what_it_holds() {
         assert!(!rows.is_empty(), "{data_type:?}");
         let before = counted::placed_here();
         let whole = Whole {
-            rows: rows.iter().cloned().collect(),
+            rows: rows.to_vec(),
             not_served: Vec::new(),
         };
         let holds = (counted::placed_here() - before) as usize;
