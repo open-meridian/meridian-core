@@ -375,6 +375,42 @@ impl Observation {
         }
     }
 
+    /// What its delivery is conflated per (W10.5; decisions/024), as the
+    /// readers' sidecars conflate it: a price per subject, dataset, kind,
+    /// venue and asset; a bar per subject, dataset, venue and interval
+    /// start; a quote per subject, dataset, venue and asset; a rate per
+    /// subject, dataset, kind and point; a statistic per subject, dataset,
+    /// kind and business date -- each per series too where it is keyed by
+    /// one (ruling 561). `None` for a row every version of which is
+    /// delivered: a trade, an outcome, the filings slice's kinds.
+    pub fn conflation_key(&self) -> Option<String> {
+        let what = match self {
+            Observation::Price(_) => "price",
+            Observation::Bar(_) => "bar",
+            Observation::Quote(_) => "quote",
+            Observation::Rate(_) => "rate",
+            Observation::Statistic(_) => "statistic",
+            _ => return None,
+        };
+        let meta = self.meta();
+        let start = match self {
+            Observation::Bar(_) => meta.valid_from_ns,
+            _ => 0,
+        };
+        let date = match self {
+            Observation::Statistic(_) => meta.business_date.as_str(),
+            _ => "",
+        };
+        Some(format!(
+            "{what}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{start}\u{1f}{date}\u{1f}{}",
+            self.subject(),
+            self.dataset(),
+            self.kind(),
+            self.venue(),
+            self.latest_key(),
+        ))
+    }
+
     /// A bar's length; 0 for the other data types.
     pub fn interval_ns(&self) -> i64 {
         match self {

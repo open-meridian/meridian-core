@@ -186,6 +186,10 @@ pub struct Sidecar {
     /// The calls it asked lately, which the front door's timing line names
     /// (ruling 798).
     pub(crate) calls: Arc<crate::timing::Calls>,
+
+    /// The plugin's open subscriptions and the stream they deliver on
+    /// (W4.3; contract v28, amended 2026-10-30).
+    pub(crate) subscriptions: Arc<crate::subscriptions::Registry>,
 }
 
 impl Sidecar {
@@ -254,6 +258,7 @@ impl Sidecar {
             harnessed: None,
             daily: Arc::default(),
             calls,
+            subscriptions: Arc::default(),
         }
     }
 

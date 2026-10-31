@@ -61,7 +61,8 @@ use meridian_domain::v1::{
 use meridian_domain::v1::{
     Expiration, ListExpirationsReply, ListExpirationsRequest, ListSeriesReply, ListSeriesRequest,
     ListStatisticsReply, ListStatisticsRequest, RecordSeriesRequest, RecordStatisticsRequest,
-    StatisticKind, StatisticsRecordedEvent, SubjectRole,
+    RenewWantsReply, RenewWantsRequest, SeriesRecordedEvent, StatisticKind,
+    StatisticsRecordedEvent, SubjectRole,
 };
 use meridian_domain::v1::{
     QualityReason, QualityState, RecordQualityAssessmentsReply, RecordQualityAssessmentsRequest,
@@ -122,6 +123,13 @@ pub const LIST_HOLDINGS: &str = "platform.lake.query.list-holdings";
 /// A company subject's record (contract v28, W3.32): asked by its `ENT-` ID.
 pub const RESOLVE_COMPANY: &str = "platform.reference.query.resolve-company";
 pub const DECLINE_WANT: &str = "platform.lake.command.decline-want";
+/// Contract v28, amended 2026-10-30 (W10.7; rulings 834 and 885): a
+/// sidecar's open subscriptions' wants, renewed once per lease.
+pub const RENEW_WANTS: &str = "platform.lake.command.renew-wants";
+/// A sidecar's lease on the wants it renews (ruling 885): renewed every
+/// lease, a want no renewal named for two is withdrawn, or after its
+/// dataset's cadence where that is longer.
+pub const WANT_LEASE_NS: i64 = 30 * 1_000_000_000;
 pub const SET_SOURCE_PRIORITY: &str = "platform.lake.command.set-source-priority";
 pub const LIST_PRICES: &str = "platform.lake.query.list-prices";
 /// W10.10 (contract v26): one bounded, read-only query over a kind.
@@ -192,19 +200,19 @@ pub fn recorded_topic(dataset: &str, data_type: DataType) -> String {
             format!("platform.lake.{dataset}.event.corporate-actions-recorded")
         }
         DataType::Filing => format!("platform.lake.{dataset}.event.filings-recorded"),
+        // Contract v28, amended 2026-10-30 (W10.5; rulings 847 and 886): a
+        // listed series, conflated per subject, dataset and series key.
+        DataType::Series => format!("platform.lake.{dataset}.event.series-recorded"),
         // Read, not heard (contract v28, W10.5): facts, holdings and rating
         // actions arrive in bulk and lag their periods by weeks.
         DataType::ReportedFact
         | DataType::RatingAction
         | DataType::HoldingsReport
         | DataType::Holding => String::new(),
-        // Never published: read within each reader's account scope (W10.11);
-        // a listed series is read when a chain is built (contract v28, W10.5).
+        // Never published: read within each reader's account scope (W10.11).
         // A signal plugin's derived values and saved scenarios are read,
         // never published (contract v28, W10.5).
-        DataType::ExecutionCost | DataType::Series | DataType::Derived | DataType::Scenario => {
-            String::new()
-        }
+        DataType::ExecutionCost | DataType::Derived | DataType::Scenario => String::new(),
     }
 }
 
@@ -279,6 +287,10 @@ struct OpenWant {
     published_at_ns: i64,
     cadence_ns: i64,
     settled: BTreeSet<String>,
+    /// When a sidecar's renewal last asked it (ruling 885); 0 for a want
+    /// only reads asked. Equal to `asked_at_ns` while a renewal is the last
+    /// ask, and then the want lapses after two leases, not two cadences.
+    renewed_at_ns: i64,
 }
 
 /// A want's key: its dataset, data type, kinds, length, date, range,
@@ -379,6 +391,26 @@ pub(crate) fn reader_of(envelope: &Envelope) -> Reader {
         }
         _ => Reader::Core,
     }
+}
+
+/// The rows of one recorded batch that a later row of the same batch
+/// supersedes under its conflation key (decisions/024; spec/one-data-access-
+/// model, "Subscriptions": batched, latest value wins): by their place in
+/// the batch, which is the lake's order. Each is recorded and answers a read
+/// as before; only its publication is left out, since every reader's sidecar
+/// would drop it for the later one anyway. A row every version of which is
+/// delivered -- a trade, an outcome, a filing -- is never superseded.
+pub(crate) fn superseded_in_batch(rows: &[Observation]) -> BTreeSet<usize> {
+    let mut last: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut superseded = BTreeSet::new();
+    for (at, row) in rows.iter().enumerate() {
+        if let Some(key) = row.conflation_key() {
+            if let Some(earlier) = last.insert(key, at) {
+                superseded.insert(earlier);
+            }
+        }
+    }
+    superseded
 }
 
 fn publisher(envelope: &Envelope) -> String {
@@ -1287,9 +1319,12 @@ impl Lake {
             // the latency spec's "The hops"; ruling 606): sent to the
             // monitor with the component's next report.
             let committed = self.clock.now_ns();
-            for row in &done.rows {
+            let superseded = superseded_in_batch(&done.rows);
+            for (at, row) in done.rows.iter().enumerate() {
                 subjects.extend(row.subjects());
-                self.publish(&dataset, row);
+                if !superseded.contains(&at) {
+                    self.publish(&dataset, row);
+                }
                 if row.data_type().real_time() {
                     meridian_domain::latency::recorder().record(
                         &dataset,
@@ -1696,12 +1731,20 @@ impl Lake {
 
     fn publish(&self, dataset: &str, row: &Observation) {
         let (payload_type, payload) = match row {
-            // Never published: read within each reader's scope (W10.11); a
-            // series' terms change rarely and are read (contract v28, W10.5).
-            Observation::ExecutionCost(_)
-            | Observation::Series(_)
-            | Observation::Derived(_)
-            | Observation::Scenario(_) => return,
+            // Never published: read within each reader's scope (W10.11).
+            Observation::ExecutionCost(_) | Observation::Derived(_) | Observation::Scenario(_) => {
+                return
+            }
+            // Contract v28, amended 2026-10-30 (W10.5; rulings 847 and 886):
+            // so a copy of a chain follows its listing. Its record's ID is
+            // a read's to fill.
+            Observation::Series(series) => (
+                "meridian.v1.SeriesRecordedEvent",
+                SeriesRecordedEvent {
+                    series: Some(series.clone()),
+                }
+                .encode_to_vec(),
+            ),
             // Read, not heard (contract v28, W10.5).
             Observation::ReportedFact(_)
             | Observation::RatingAction(_)
@@ -1854,25 +1897,7 @@ impl Lake {
             };
             let mut kinds = ask.kinds.clone();
             kinds.sort();
-            let key: WantKey = (
-                ask.dataset.clone(),
-                ask.data_type.name().to_string(),
-                kinds.clone(),
-                ask.interval_ns,
-                date.clone(),
-                from,
-                until,
-                ask.standing,
-                ask.subjects.clone(),
-                {
-                    let mut named: Vec<String> =
-                        ask.series_keys.iter().map(read::series_named).collect();
-                    named.sort();
-                    named.dedup();
-                    named
-                },
-                ask.all_series,
-            );
+            let key = want_key(&ask);
             let (window_from, window_to) = ask.window.sides();
             let mut wants = self.wants.lock().expect("wants poisoned");
             let existing = wants.by_key.get(&key).cloned();
@@ -1938,6 +1963,7 @@ impl Lake {
                                 published_at_ns: now,
                                 cadence_ns: cadence * 1_000_000_000,
                                 settled: BTreeSet::new(),
+                                renewed_at_ns: 0,
                             },
                         );
                         wants.by_key.insert(key, id.clone());
@@ -2052,7 +2078,7 @@ impl Lake {
             // want ID, and one that restarted resumes keeping it current. Not
             // a change to the want, so no record of it.
             for open in wants.open.values_mut() {
-                let window = open.cadence_ns.max(ASK_AGAIN_NS) * 2;
+                let window = lapses_after(open);
                 if open.event.standing
                     && now - open.asked_at_ns <= window
                     && now - open.published_at_ns >= REDELIVER_STANDING_NS
@@ -2064,10 +2090,7 @@ impl Lake {
             let stale: Vec<String> = wants
                 .open
                 .iter()
-                .filter(|(_, w)| {
-                    let window = w.cadence_ns.max(ASK_AGAIN_NS) * 2;
-                    w.event.standing && now - w.asked_at_ns > window
-                })
+                .filter(|(_, w)| w.event.standing && now - w.asked_at_ns > lapses_after(w))
                 .map(|(id, _)| id.clone())
                 .collect();
             for id in stale {
@@ -3945,6 +3968,123 @@ impl Lake {
         }
     }
 
+    /// W10.7, contract v28, amended 2026-10-30 (rulings 834 and 885): a
+    /// sidecar renews its plugin's open subscriptions' wants. Each is asked
+    /// of the dataset a default read of it would read first -- readable by
+    /// the plugin, kept current by schedule or stream, and kept -- as a
+    /// standing want of the latest: opened where none stands, coalesced with
+    /// readers' identical wants, and kept while renewals name it. Nothing is
+    /// read or recorded.
+    pub(crate) fn renew_wants(
+        &self,
+        request: RenewWantsRequest,
+        envelope: &Envelope,
+    ) -> Result<RenewWantsReply, String> {
+        if !(1..=500).contains(&request.wants.len()) {
+            return Err(format!("wants names {}; 1 to 500", request.wants.len()));
+        }
+        let reader = reader_of(envelope);
+        if matches!(reader, Reader::Core) {
+            return Err("a renewal is a sidecar's, for its plugin".into());
+        }
+        let config = self.config();
+        let priorities = self
+            .store
+            .priorities()
+            .map_err(|failed| failed.to_string())?;
+        let declined = read::Declined::new();
+        let aliases = BTreeMap::new();
+        let against = Against {
+            config: &config,
+            priorities: &priorities,
+            declined: &declined,
+            aliases: &aliases,
+            now_ns: self.clock.now_ns(),
+        };
+        let mut asks = Vec::new();
+        for (i, want) in request.wants.iter().enumerate() {
+            let at = format!("wants[{i}]");
+            let data_type = DataType::named(&want.data_type)
+                .filter(|t| {
+                    matches!(
+                        t,
+                        DataType::Price
+                            | DataType::Bar
+                            | DataType::Trade
+                            | DataType::Quote
+                            | DataType::Rate
+                            | DataType::Statistic
+                    )
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "{at}.data_type {:?} is no data type a want keeps current",
+                        want.data_type
+                    )
+                })?;
+            if !(1..=500).contains(&want.subjects.len()) {
+                return Err(format!(
+                    "{at}.subjects names {}; 1 to 500",
+                    want.subjects.len()
+                ));
+            }
+            if want.series_keys.len() > 500 {
+                return Err(format!(
+                    "{at}.series_keys names {}; at most 500",
+                    want.series_keys.len()
+                ));
+            }
+            let window = read::Window {
+                from: parse_window_side(&want.expiration_from, &format!("{at}.expiration_from"))?,
+                to: parse_window_side(&want.expiration_to, &format!("{at}.expiration_to"))?,
+            };
+            if window.is_set() && !want.all_series {
+                return Err(format!(
+                    "{at}.expiration_from: a window is set only with all_series"
+                ));
+            }
+            let readable: Vec<String> = config
+                .readable(&reader, data_type)
+                .into_iter()
+                .filter(|dataset| {
+                    let cadence = config.declaration(dataset).map_or(0, |d| d.cadence);
+                    (cadence > 0
+                        || config.has_mode(dataset, meridian_pb::v1::ObservationMode::Stream))
+                        && config.licence(dataset).kept
+                })
+                .collect();
+            let Some(dataset) = read::by_priority(data_type, 0, &against, &readable)
+                .into_iter()
+                .next()
+            else {
+                continue;
+            };
+            asks.push(read::Ask {
+                dataset,
+                data_type,
+                subjects: want.subjects.iter().map(|s| s.entity_id.clone()).collect(),
+                kinds: Vec::new(),
+                interval_ns: 0,
+                when: When::Latest { at_ns: 0 },
+                standing: true,
+                series_keys: want.series_keys.clone(),
+                all_series: want.all_series,
+                window,
+            });
+        }
+        let keys: Vec<WantKey> = asks.iter().map(want_key).collect();
+        let _ = self.want(asks, &reader);
+        let mut wants = self.wants.lock().expect("wants poisoned");
+        for key in keys {
+            if let Some(id) = wants.by_key.get(&key).cloned() {
+                if let Some(open) = wants.open.get_mut(&id) {
+                    open.renewed_at_ns = open.asked_at_ns;
+                }
+            }
+        }
+        Ok(RenewWantsReply {})
+    }
+
     pub(crate) fn decline(
         &self,
         request: DeclineWantRequest,
@@ -4090,7 +4230,55 @@ fn targeted(
     Ok((window, fields))
 }
 
+/// How long after its last ask a standing want is withdrawn (W10.7): two
+/// leases where a sidecar's renewal asked it last, or its dataset's cadence
+/// where that is longer (ruling 885); otherwise twice its cadence, at least
+/// two minutes, as before.
+fn lapses_after(open: &OpenWant) -> i64 {
+    if open.renewed_at_ns != 0 && open.renewed_at_ns == open.asked_at_ns {
+        open.cadence_ns.max(2 * WANT_LEASE_NS)
+    } else {
+        open.cadence_ns.max(ASK_AGAIN_NS) * 2
+    }
+}
+
+/// A want's key (W10.7): what readers' identical asks coalesce by.
+fn want_key(ask: &read::Ask) -> WantKey {
+    let (date, from, until) = match &ask.when {
+        When::BusinessDate(date) => (date.to_string(), 0, 0),
+        When::Range { from_ns, until_ns } => (String::new(), *from_ns, *until_ns),
+        When::Latest { .. } | When::After(_) => (String::new(), 0, 0),
+    };
+    let mut kinds = ask.kinds.clone();
+    kinds.sort();
+    let mut named: Vec<String> = ask.series_keys.iter().map(read::series_named).collect();
+    named.sort();
+    named.dedup();
+    (
+        ask.dataset.clone(),
+        ask.data_type.name().to_string(),
+        kinds,
+        ask.interval_ns,
+        date,
+        from,
+        until,
+        ask.standing,
+        ask.subjects.clone(),
+        named,
+        ask.all_series,
+    )
+}
+
 /// A want's expiration window, as its event carries it.
+fn parse_window_side(text: &str, at: &str) -> Result<Option<Date>, String> {
+    if text.is_empty() {
+        return Ok(None);
+    }
+    Date::parse(text)
+        .map(Some)
+        .map_err(|_| format!("{at} {text:?} is no plain date"))
+}
+
 fn want_window(event: &ObservationsWantedEvent) -> read::Window {
     read::Window {
         from: Date::parse(&event.expiration_from).ok(),
@@ -5241,6 +5429,16 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
             "meridian.v1.DeclineWantReply",
         ),
         |lake, request: DeclineWantRequest, envelope| lake.decline(request, envelope),
+    );
+    serve_on(
+        &bus,
+        &lake,
+        RENEW_WANTS,
+        (
+            "meridian.v1.RenewWantsRequest",
+            "meridian.v1.RenewWantsReply",
+        ),
+        |lake, request: RenewWantsRequest, envelope| lake.renew_wants(request, envelope),
     );
 
     // Heard, subscribed before this returns.

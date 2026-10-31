@@ -179,6 +179,7 @@ platform.lake.command.record-scenarios	command	signal	lake
 platform.lake.command.record-series	command	data	lake
 platform.lake.command.record-statistics	command	data	lake
 platform.lake.command.record-trades	command	data	lake
+platform.lake.command.renew-wants	command	sidecar	lake
 platform.lake.command.set-source-priority	command	dashboard	lake
 platform.lake.event.observations-wanted	event	lake	data
 platform.lake.event.want-withdrawn	event	lake	data
@@ -210,6 +211,7 @@ platform.lake.{dataset}.event.outcomes-recorded	event	lake	reporting,portfolio,c
 platform.lake.{dataset}.event.prices-recorded	event	lake	reporting,portfolio,compliance,signal
 platform.lake.{dataset}.event.quotes-recorded	event	lake	signal,ems
 platform.lake.{dataset}.event.rates-recorded	event	lake	reporting,portfolio,compliance,signal
+platform.lake.{dataset}.event.series-recorded	event	lake	signal,portfolio,oms,ems
 platform.lake.{dataset}.event.statistics-recorded	event	lake	reporting,portfolio,signal
 platform.lake.{dataset}.event.trades-recorded	event	lake	signal,ems
 platform.reference.command.apply-instrument-migration	command	dashboard	instrument

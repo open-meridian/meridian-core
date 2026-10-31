@@ -1643,3 +1643,37 @@ async fn nothing_listed_is_answered_as_list_series_answers_it() {
         .expect("the chain asked of its source");
     assert!(want.all_series);
 }
+
+/// Contract v28, amended 2026-10-30 (W10.5; rulings 847 and 886): a listed
+/// series recorded is published on its dataset's subject, so a copy of a
+/// chain follows its listing; its record's ID is a read's to fill.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_listed_series_recorded_is_heard_on_its_datasets_subject() {
+    let h = harness();
+    let mut heard = h
+        .bus
+        .subscribe_every(&format!("platform.lake.{CHAIN}.event.series-recorded"));
+    record(
+        &h,
+        "series",
+        vec![Observation::Series(series(
+            OSI_CALL,
+            "call",
+            "230",
+            "2026-11-20",
+        ))],
+    )
+    .unwrap();
+    let event = meridian_domain::v1::SeriesRecordedEvent::decode(
+        &tokio::time::timeout(std::time::Duration::from_secs(2), heard.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .envelope
+            .payload[..],
+    )
+    .unwrap();
+    let listed = event.series.unwrap();
+    assert_eq!(listed.meta.as_ref().unwrap().series_key, osi(OSI_CALL));
+    assert!(listed.meta.unwrap().sequence > 0, "as recorded, sequenced");
+}

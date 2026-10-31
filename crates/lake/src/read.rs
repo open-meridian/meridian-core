@@ -346,8 +346,20 @@ fn order_for(read: &Read, against: &Against<'_>, kind: i32, readable: &[String])
             .cloned()
             .collect();
     }
+    by_priority(read.data_type, kind, against, readable)
+}
+
+/// The datasets readable, in the deployment's source priority for a data
+/// type and kind (W10.2): what a default read answers from first. Every
+/// readable one, as listed, where no priority is set.
+pub fn by_priority(
+    data_type: DataType,
+    kind: i32,
+    against: &Against<'_>,
+    readable: &[String],
+) -> Vec<String> {
     // Only a price's priority names a kind (a rate's names none, W10.3).
-    let kind = if read.data_type == DataType::Price {
+    let kind = if data_type == DataType::Price {
         kind
     } else {
         0
@@ -355,7 +367,7 @@ fn order_for(read: &Read, against: &Against<'_>, kind: i32, readable: &[String])
     let set = against
         .priorities
         .iter()
-        .find(|p| p.data_type == read.data_type.name() && p.kind == kind)
+        .find(|p| p.data_type == data_type.name() && p.kind == kind)
         .filter(|p| !p.datasets.is_empty());
     match set {
         Some(priority) => priority
