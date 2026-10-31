@@ -93,3 +93,138 @@ enum ValueUnit {
   // A physical unit, named by ucum_code.
   VALUE_UNIT_UCUM = 10;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Amounts' conventions (contract v29, ruling 742): the day count, a rate's
+// convention, the price basis and a quoted yield, declared here beside
+// UnitValue from v29, since the instrument store's terms, the book's orders
+// and executions and the lake's rows all use them and the book never imports
+// the lake. Moved from lake.proto: same package, names and numbers, so the
+// wire is unchanged.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// How a rate accrues (FDP item 1).
+message RateConvention {
+  DayCount day_count = 1;
+  Compounding compounding = 2;
+  // For COMPOUNDING_COMPOUNDED, the periods a year (2 for a semi-annual
+  // bond-equivalent yield); 0 otherwise.
+  uint32 periods_per_year = 3;
+}
+
+// The accrual basis (contract v27; widened at v29 to FIX CouponDayCount
+// (1950)'s values, ruling 678), each mapped to CDM's DayCountFractionEnum
+// where it has the value.
+enum DayCount {
+  // Not stated by the source; refused on an instrument's terms.
+  DAY_COUNT_UNSPECIFIED = 0;
+  // Actual days over 360 (FIX CouponDayCount 1950 = 6; CDM ACT/360).
+  DAY_COUNT_ACT_360 = 1;
+  // Actual days over 365 (1950 = 7; CDM ACT/365.FIXED).
+  DAY_COUNT_ACT_365_FIXED = 2;
+  // Actual/actual as a rate's source states it, no variant named (v27's meaning
+  // kept for rates; 678); refused on an instrument's terms.
+  DAY_COUNT_ACT_ACT = 3;
+  // 30/360 as a rate's source states it, no variant named (v27's meaning kept
+  // for rates; 678); refused on an instrument's terms.
+  DAY_COUNT_THIRTY_360 = 4;
+  // Business days over 252 (1950 = 12; CDM has CAL/252, not BUS/252).
+  DAY_COUNT_BUS_252 = 5;
+  // 1/1 (1950 = 0; CDM 1/1).
+  DAY_COUNT_ONE_ONE = 6;
+  // 30/360, 30U/360 or bond basis (1950 = 1; CDM 30/360): a US corporate's or
+  // agency's.
+  DAY_COUNT_THIRTY_360_BOND_BASIS = 7;
+  // 30/360 (SIA), with SIFMA's end-of-February rule (1950 = 2; no CDM value:
+  // held more).
+  DAY_COUNT_THIRTY_360_SIA = 8;
+  // 30/360M (1950 = 3; no CDM value).
+  DAY_COUNT_THIRTY_360_M = 9;
+  // 30E/360, the Eurobond basis (1950 = 4; CDM 30E/360).
+  DAY_COUNT_THIRTY_E_360 = 10;
+  // 30E/360 (ISDA) (1950 = 5; CDM 30E/360.ISDA).
+  DAY_COUNT_THIRTY_E_360_ISDA = 11;
+  // Actual/actual (AFB) (1950 = 8; CDM ACT/ACT.AFB).
+  DAY_COUNT_ACT_ACT_AFB = 12;
+  // Actual/actual (ICMA) on the coupon period (1950 = 9; CDM ACT/ACT.ICMA): a
+  // Treasury note's or bond's (31 CFR 356, Appendix B).
+  DAY_COUNT_ACT_ACT_ICMA = 13;
+  // Actual/actual (ICMA ultimo) (1950 = 10; no CDM value).
+  DAY_COUNT_ACT_ACT_ICMA_ULTIMO = 14;
+  // Actual/actual (ISDA) (1950 = 11; CDM ACT/ACT.ISDA).
+  DAY_COUNT_ACT_ACT_ISDA = 15;
+  // 30E+/360 (1950 = 13; no CDM value).
+  DAY_COUNT_THIRTY_E_PLUS_360 = 16;
+  // Actual/365L (1950 = 14; CDM ACT/365L).
+  DAY_COUNT_ACT_365_L = 17;
+  // NL/365, leap days left out (1950 = 15; no CDM value).
+  DAY_COUNT_NL_365 = 18;
+  // NL/360 (1950 = 16; no CDM value).
+  DAY_COUNT_NL_360 = 19;
+  // Actual/364 (1950 = 17; CDM ACT/364).
+  DAY_COUNT_ACT_364 = 20;
+}
+
+enum Compounding {
+  // Refused.
+  COMPOUNDING_UNSPECIFIED = 0;
+  COMPOUNDING_SIMPLE = 1;
+  COMPOUNDING_COMPOUNDED = 2;
+  COMPOUNDING_CONTINUOUS = 3;
+  COMPOUNDING_DISCOUNT = 4;
+}
+
+// What one unit of a price is (contract v18; widened at v29 for fixed
+// income, ruling 685, as FIX PriceType (423) states it). Unspecified is
+// refused on a Price, and read as per unit on a Trade, a Quote, an order and
+// an execution, so every row and record before v29 stands.
+enum PriceBasis {
+  // Refused on a Price; per unit elsewhere, as before v29.
+  PRICE_BASIS_UNSPECIFIED = 0;
+  // Per unit of the subject.
+  PRICE_BASIS_PER_UNIT = 1;
+  // Contract v29: per 100 of face, clean, a Money in the instrument's currency
+  // (FIX PriceType 423 = 1; TRACE's and FINRA's price).
+  PRICE_BASIS_PERCENT_OF_PAR = 2;
+  // Contract v29: a yield, in the row's yield, its money price unset where the
+  // source states none (423 = 9; a when-issued trade before its auction).
+  PRICE_BASIS_YIELD = 3;
+  // Contract v29: a spread in basis points over benchmark_instrument_id, in the
+  // row's spread fields (423 = 6).
+  PRICE_BASIS_SPREAD = 4;
+}
+
+// Contract v29 (ruling 685; W10.4, W11.1): a yield as its source quotes it,
+// a v27 Rate-shaped value -- its value in percent, its convention and its
+// kind after FIX YieldType (235) -- never computed by the plugin.
+message QuotedYield {
+  // A percent: 4.312 percent is 4.312, never 0.04312. Never unset.
+  UnitValue value = 1;
+  // Semi-annual bond-equivalent for a US Treasury, corporate or agency; its day
+  // count the instrument's. Never unset.
+  RateConvention convention = 2;
+  // To maturity, call, put or worst, current, or discount. Unspecified is
+  // refused.
+  YieldKind kind = 3;
+  // States the date a yield to a call or put is to: a plain date. Empty unless
+  // the kind is to call or to put, or to worst where worst is a call.
+  string to_date = 4;
+}
+
+// Contract v29: what a quoted yield is to, after FIX YieldType (235).
+enum YieldKind {
+  // Refused.
+  YIELD_KIND_UNSPECIFIED = 0;
+  // To maturity (FIX YieldType 235 MATURITY).
+  YIELD_KIND_TO_MATURITY = 1;
+  // To the call date in to_date (CALL).
+  YIELD_KIND_TO_CALL = 2;
+  // To the put date in to_date (PUT).
+  YIELD_KIND_TO_PUT = 3;
+  // To the lower of call and maturity, MSRB G-15's disclosed yield (WORST).
+  YIELD_KIND_TO_WORST = 4;
+  // The coupon over the price (CURRENT).
+  YIELD_KIND_CURRENT = 5;
+  // A bill's bank-discount rate (a Treasury bill's quote).
+  YIELD_KIND_DISCOUNT = 6;
+}

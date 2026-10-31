@@ -261,13 +261,7 @@ enum PriceKind {
   PRICE_KIND_MID = 7;
 }
 
-// What one unit of a price is.
-enum PriceBasis {
-  // Refused.
-  PRICE_BASIS_UNSPECIFIED = 0;
-  // Per unit of the subject.
-  PRICE_BASIS_PER_UNIT = 1;
-}
+// PriceBasis: declared in amounts.proto from contract v29 (ruling 742).
 
 // Open, high, low and close over an interval, the envelope's valid time: a
 // daily bar names its business date. Empty `source.venue_id` is the
@@ -527,33 +521,8 @@ enum RateKind {
   RATE_KIND_COUPON_EQUIVALENT = 7;
 }
 
-// How a rate accrues (FDP item 1).
-message RateConvention {
-  DayCount day_count = 1;
-  Compounding compounding = 2;
-  // For COMPOUNDING_COMPOUNDED, the periods a year (2 for a semi-annual
-  // bond-equivalent yield); 0 otherwise.
-  uint32 periods_per_year = 3;
-}
-
-enum DayCount {
-  // Not stated by the source.
-  DAY_COUNT_UNSPECIFIED = 0;
-  DAY_COUNT_ACT_360 = 1;
-  DAY_COUNT_ACT_365_FIXED = 2;
-  DAY_COUNT_ACT_ACT = 3;
-  DAY_COUNT_THIRTY_360 = 4;
-  DAY_COUNT_BUS_252 = 5;
-}
-
-enum Compounding {
-  // Refused.
-  COMPOUNDING_UNSPECIFIED = 0;
-  COMPOUNDING_SIMPLE = 1;
-  COMPOUNDING_COMPOUNDED = 2;
-  COMPOUNDING_CONTINUOUS = 3;
-  COMPOUNDING_DISCOUNT = 4;
-}
+// RateConvention, DayCount and Compounding: declared in amounts.proto from
+// contract v29 (ruling 742).
 
 // One percentile of a rate's distribution, as the source states it.
 message RatePercentile {
