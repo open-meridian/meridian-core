@@ -192,7 +192,53 @@ fn record_says(record: &meridian_domain::v1::InstrumentRecord) -> RecordSays {
             })
             .and_then(|m| meridian_domain::exact::Exact::from_wire(m).ok())
             .filter(|m| !m.is_zero() && !m.is_negative()),
+        debt: debt_says(record),
     }
+}
+
+/// Contract v29: what a debt record's terms say that the book checks (W9.16,
+/// W11.1); None for a record that is no debt record.
+fn debt_says(record: &meridian_domain::v1::InstrumentRecord) -> Option<crate::decide::DebtSays> {
+    let exact = |d: Option<&meridian_pb::v1::Decimal>| {
+        d.and_then(|d| meridian_domain::exact::Exact::from_wire(d).ok())
+    };
+    if let Some(bond) = &record.bond {
+        return Some(crate::decide::DebtSays {
+            minimum_denomination: exact(bond.minimum_denomination.as_ref()),
+            denomination_increment: exact(bond.denomination_increment.as_ref()),
+            stripped_from: bond.stripped_from.clone(),
+            ..Default::default()
+        });
+    }
+    if let Some(pool) = &record.mbs_pool {
+        return Some(crate::decide::DebtSays {
+            agency: pool.agency,
+            program: pool.program.clone(),
+            pass_through_rate: exact(pool.pass_through_rate.as_ref()),
+            ..Default::default()
+        });
+    }
+    if let Some(tba) = &record.tba {
+        return Some(crate::decide::DebtSays {
+            agency: tba.agency,
+            program: tba.program.clone(),
+            pass_through_rate: exact(tba.pass_through_rate.as_ref()),
+            ..Default::default()
+        });
+    }
+    if let Some(tranche) = &record.cmo_tranche {
+        return Some(crate::decide::DebtSays {
+            agency: tranche.agency,
+            ..Default::default()
+        });
+    }
+    record
+        .certificate_of_deposit
+        .as_ref()
+        .map(|cd| crate::decide::DebtSays {
+            minimum_denomination: exact(cd.minimum_denomination.as_ref()),
+            ..Default::default()
+        })
 }
 
 /// Each instrument's record from the instrument store. A record the store
@@ -498,6 +544,15 @@ fn serve_lifecycle(bus: &Arc<Bus>, store: &Arc<dyn Store>, clock: &Arc<dyn Clock
             let mut named = vec![event.instrument_id.clone()];
             named.extend(event.deliveries.iter().map(|d| d.instrument_id.clone()));
             let found = references(&bus2, &named, ctx.received_at_ns);
+            // Contract v29: cash a debt record's event derives -- a
+            // maturity's, a paydown's -- is in its record's currency.
+            let codes: Vec<String> = found
+                .records
+                .values()
+                .filter(|said| said.debt.is_some() && !said.code.is_empty())
+                .map(|said| said.code.clone())
+                .collect();
+            crate::cash::ensure_blocking(&bus2, &store, &codes, clock.now_ns());
             ctx.reference_versions = found.versions;
             ctx.records = found.records;
             ctx.reference_unavailable = found.unavailable;
@@ -541,6 +596,15 @@ fn serve_lifecycle(bus: &Arc<Bus>, store: &Arc<dyn Store>, clock: &Arc<dyn Clock
                 .map(|event| event.instrument_id.clone())
                 .collect();
             let found = references(&bus2, &named, ctx.received_at_ns);
+            // Contract v29: cash a debt record's event derives -- a
+            // maturity's, a paydown's -- is in its record's currency.
+            let codes: Vec<String> = found
+                .records
+                .values()
+                .filter(|said| said.debt.is_some() && !said.code.is_empty())
+                .map(|said| said.code.clone())
+                .collect();
+            crate::cash::ensure_blocking(&bus2, &store, &codes, clock.now_ns());
             ctx.reference_versions = found.versions;
             ctx.records = found.records;
             ctx.reference_unavailable = found.unavailable;
@@ -628,6 +692,15 @@ fn serve_lifecycle(bus: &Arc<Bus>, store: &Arc<dyn Store>, clock: &Arc<dyn Clock
             let mut named = vec![proposal.instrument_id.clone()];
             named.extend(proposal.deliveries.iter().map(|d| d.instrument_id.clone()));
             let found = references(&bus2, &named, ctx.received_at_ns);
+            // Contract v29: cash a debt record's event derives -- a
+            // maturity's, a paydown's -- is in its record's currency.
+            let codes: Vec<String> = found
+                .records
+                .values()
+                .filter(|said| said.debt.is_some() && !said.code.is_empty())
+                .map(|said| said.code.clone())
+                .collect();
+            crate::cash::ensure_blocking(&bus2, &store, &codes, clock.now_ns());
             ctx.reference_versions = found.versions;
             ctx.records = found.records;
             ctx.reference_unavailable = found.unavailable;

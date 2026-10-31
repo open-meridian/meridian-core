@@ -135,6 +135,23 @@ pub struct RecordSays {
     /// `ContractMultiplier`, the premium multiplier its fills' cash and cost
     /// are priced by; None for every other record, read as one.
     pub multiplier: Option<Exact>,
+    /// Contract v29 (W9.16, W11.1): what a debt record's terms say that the
+    /// book checks; None for every other record.
+    pub debt: Option<DebtSays>,
+}
+
+/// Contract v29: a debt record's terms as the book reads them (W9.16,
+/// W11.1): the denominations an order's face keeps to, a pool's or a TBA's
+/// agency, program and pass-through rate a TBA allocation matches on, and a
+/// STRIPS component's whole bond.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DebtSays {
+    pub minimum_denomination: Option<Exact>,
+    pub denomination_increment: Option<Exact>,
+    pub agency: i32,
+    pub program: String,
+    pub pass_through_rate: Option<Exact>,
+    pub stripped_from: String,
 }
 
 impl Context {

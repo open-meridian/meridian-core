@@ -24,6 +24,17 @@ const AAPL: &str = "INS-01J8XQ4M7K0000000000AAPL";
 const CALL: &str = "INS-01J8XQ4M7K00000AAPLC230";
 const ES: &str = "INS-01J8XQ4M7K0000000000ESZ6";
 const USD: &str = "INS-01J8XQ4M7K00000000CASHUSD";
+// Contract v29: debt records.
+const CORP: &str = "INS-01JC29CORP000000000000001";
+const POOL: &str = "INS-01JC29POOL000000000000001";
+const POOLA: &str = "INS-01JC29POOLA00000000000001";
+const POOLB: &str = "INS-01JC29POOLB00000000000001";
+const POOL5: &str = "INS-01JC29POOL5PCT0000000001";
+const TBA: &str = "INS-01JC29TBA0000000000000001";
+const CMOZ: &str = "INS-01JC29CMOZ000000000000001";
+const TSY: &str = "INS-01JC29TSY0000000000000001";
+const TINT: &str = "INS-01JC29TINT000000000000001";
+const TPRN: &str = "INS-01JC29TPRN000000000000001";
 
 fn d(text: &str) -> Option<meridian_pb::v1::Decimal> {
     Some(text.parse::<Exact>().unwrap().to_wire())
@@ -55,7 +66,46 @@ fn wired() -> (Arc<Bus>, Arc<MemoryStore>) {
             version: 1,
             ..Default::default()
         };
+        let pool = |rate: &str| MbsPool {
+            agency: MortgageAgency::Fnma as i32,
+            program: "CL".into(),
+            pass_through_rate: d(rate),
+            ..Default::default()
+        };
+        let stripped = |from: &str| Bond {
+            stripped_from: from.into(),
+            ..Default::default()
+        };
         let instrument = match asked.instrument_id.as_str() {
+            CORP | TSY => Some(InstrumentRecord {
+                bond: Some(Bond::default()),
+                ..record(AssetClass::Debt, InstrumentType::Bond)
+            }),
+            TINT | TPRN => Some(InstrumentRecord {
+                bond: Some(stripped(TSY)),
+                ..record(AssetClass::Debt, InstrumentType::Bond)
+            }),
+            POOL | POOLA | POOLB => Some(InstrumentRecord {
+                mbs_pool: Some(pool("5.5")),
+                ..record(AssetClass::Debt, InstrumentType::MbsPool)
+            }),
+            POOL5 => Some(InstrumentRecord {
+                mbs_pool: Some(pool("5.0")),
+                ..record(AssetClass::Debt, InstrumentType::MbsPool)
+            }),
+            TBA => Some(InstrumentRecord {
+                tba: Some(Tba {
+                    agency: MortgageAgency::Fnma as i32,
+                    program: "CL".into(),
+                    pass_through_rate: d("5.5"),
+                    ..Default::default()
+                }),
+                ..record(AssetClass::Debt, InstrumentType::Tba)
+            }),
+            CMOZ => Some(InstrumentRecord {
+                cmo_tranche: Some(CmoTranche::default()),
+                ..record(AssetClass::Debt, InstrumentType::CmoTranche)
+            }),
             AAPL => Some(record(AssetClass::Equity, InstrumentType::Unspecified)),
             CALL => Some(record(AssetClass::Derivative, InstrumentType::ListedOption)),
             ES => Some(record(AssetClass::Derivative, InstrumentType::Future)),
@@ -453,4 +503,383 @@ async fn what_w9_16_refuses_is_refused_naming_the_field() {
             .unwrap_or_default();
         assert!(named.contains(&field.to_string()), "{field}: {refused}");
     }
+}
+
+// ── Contract v29: a debt record's seven records (W9.16 to W9.18) ──────────
+
+/// Face held: a corporate, a pool, a TBA, a Z class and a whole Treasury,
+/// each with its cost; 10,000 USD.
+async fn open_debt(bus: &Bus) {
+    send(
+        bus,
+        RECORD_OPENING_BALANCE,
+        "meridian.v1.RecordOpeningBalanceRequest",
+        &RecordOpeningBalanceRequest {
+            account_id: ACC.into(),
+            as_of_date: "2026-09-08".into(),
+            sources: vec![OpeningSource {
+                kind: OpeningSourceKind::Custodian as i32,
+                name: "A custodian".into(),
+                as_of_date: "2026-09-08".into(),
+                basis: PositionBasis::TradeDate as i32,
+                ..Default::default()
+            }],
+            positions: vec![
+                position(CORP, HoldingSide::Long, "50000", "49500.00"),
+                position(POOL, HoldingSide::Long, "1000000", "825271.48"),
+                position(TBA, HoldingSide::Long, "2000000", "1970000.00"),
+                position(CMOZ, HoldingSide::Long, "500000", "480000.00"),
+                position(TSY, HoldingSide::Long, "100000", "99000.00"),
+                position(USD, HoldingSide::Long, "10000.00", "10000.00"),
+            ],
+            reason: "Opening balance".into(),
+            replaces_entry_id: String::new(),
+            idempotency_key: "opening-debt".into(),
+        },
+        Some(PERSON),
+    )
+    .await
+    .unwrap();
+}
+
+fn debt_event(instrument: &str, kind: LifecycleEventKind, quantity: &str) -> LifecycleEvent {
+    LifecycleEvent {
+        account_id: ACC.into(),
+        instrument_id: instrument.into(),
+        kind: kind as i32,
+        quantity: d(quantity),
+        event_date: "2026-11-25".into(),
+        ..Default::default()
+    }
+}
+
+fn costs(position: &Option<BookPosition>) -> Vec<(String, String)> {
+    position
+        .as_ref()
+        .map(|p| {
+            p.lots
+                .iter()
+                .filter(|lot| {
+                    lot.open_quantity
+                        .as_ref()
+                        .is_some_and(|q| !Exact::from_wire(q).unwrap().is_zero())
+                })
+                .map(|lot| {
+                    let open = Exact::from_wire(lot.open_quantity.as_ref().unwrap()).unwrap();
+                    let cost = lot
+                        .terms
+                        .as_ref()
+                        .and_then(|t| t.cost.as_ref())
+                        .and_then(|c| c.amount.as_ref())
+                        .map(|a| Exact::from_wire(a).unwrap().to_string())
+                        .unwrap_or_default();
+                    (open.to_string(), cost)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_coupon_moves_cash_a_partial_call_reduces_lots_and_an_accretion_moves_nothing() {
+    let (bus, store) = wired();
+    open_debt(&bus).await;
+    let coupon = record(
+        &bus,
+        LifecycleEvent {
+            period_start_date: "2026-05-15".into(),
+            period_end_date: "2026-11-15".into(),
+            record_date: "2026-11-01".into(),
+            cash: usd("1062.50"),
+            external_event_id: "CPN-1".into(),
+            ..debt_event(CORP, LifecycleEventKind::CouponReceived, "50000")
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(coupon.state, LifecycleEventState::Booked as i32);
+    assert_eq!(quantity(&held(&store, USD, HoldingSide::Long)), "11062.50");
+    assert_eq!(quantity(&held(&store, CORP, HoldingSide::Long)), "50000");
+    // A partial call by lottery: 15,000 of face at par, the lots reduced.
+    record(
+        &bus,
+        LifecycleEvent {
+            redemption_kind: RedemptionEventKind::PartialCall as i32,
+            redemption_price: d("100"),
+            cash: usd("15000.00"),
+            external_event_id: "CALL-1".into(),
+            ..debt_event(CORP, LifecycleEventKind::Redemption, "15000")
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(quantity(&held(&store, CORP, HoldingSide::Long)), "35000");
+    assert_eq!(quantity(&held(&store, USD, HoldingSide::Long)), "26062.50");
+    // A maturity with no cash stated: face times the price per 100 of face.
+    record(
+        &bus,
+        LifecycleEvent {
+            redemption_kind: RedemptionEventKind::Maturity as i32,
+            redemption_price: d("100"),
+            external_event_id: "MAT-1".into(),
+            ..debt_event(CORP, LifecycleEventKind::Redemption, "35000")
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(quantity(&held(&store, CORP, HoldingSide::Long)), "0");
+    assert_eq!(quantity(&held(&store, USD, HoldingSide::Long)), "61062.50");
+    // A Z class's accretion: no cash, no lot.
+    let accretion = record(
+        &bus,
+        LifecycleEvent {
+            prior_factor: d("1.02150000"),
+            factor: d("1.02520000"),
+            face_change: d("1850.00"),
+            external_event_id: "ACC-1".into(),
+            ..debt_event(CMOZ, LifecycleEventKind::Accretion, "500000")
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(accretion.state, LifecycleEventState::Booked as i32);
+    assert_eq!(costs(&held(&store, CMOZ, HoldingSide::Long)), vec![("500000".to_string(), "480000.00".to_string())]);
+    assert_eq!(quantity(&held(&store, USD, HoldingSide::Long)), "61062.50");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_paydown_keeps_original_face_and_relieves_cost_pro_rata() {
+    let (bus, store) = wired();
+    open_debt(&bus).await;
+    let paydown = LifecycleEvent {
+        record_date: "2026-10-31".into(),
+        prior_factor: d("0.84211375"),
+        factor: d("0.83102210"),
+        ..debt_event(POOL, LifecycleEventKind::Paydown, "1000000")
+    };
+    // servicing proposes it from the Factor row; no report comes; released.
+    let proposed = ProposeLifecycleEventsReply::decode(
+        &send(
+            &bus,
+            PROPOSE_LIFECYCLE_EVENTS,
+            "meridian.v1.ProposeLifecycleEventsRequest",
+            &ProposeLifecycleEventsRequest {
+                events: vec![paydown],
+            },
+            None,
+        )
+        .await
+        .unwrap()[..],
+    )
+    .unwrap()
+    .events;
+    send(
+        &bus,
+        RELEASE_LIFECYCLE_EVENT,
+        "meridian.v1.ReleaseLifecycleEventRequest",
+        &ReleaseLifecycleEventRequest {
+            event_id: proposed[0].event_id.clone(),
+            note: "the custodian reports paydowns only as cash".into(),
+        },
+        Some(PERSON),
+    )
+    .await
+    .unwrap();
+    // Original face kept; cash the fall times original face; the cost
+    // 825,271.48 relieved by 0.01109165 / 0.84211375 of it, 10,869.82.
+    assert_eq!(
+        costs(&held(&store, POOL, HoldingSide::Long)),
+        vec![("1000000".to_string(), "814401.66".to_string())]
+    );
+    assert_eq!(quantity(&held(&store, USD, HoldingSide::Long)), "21091.65");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tba_allocation_and_a_strip_carry_the_cost_to_the_lots_they_open() {
+    let (bus, store) = wired();
+    open_debt(&bus).await;
+    let delivery = |instrument: &str, face: &str, price: Option<&str>| LifecycleDelivery {
+        instrument_id: instrument.into(),
+        quantity: d(face),
+        price: price.and_then(usd),
+    };
+    // A pool of another coupon is no good delivery.
+    let refused = record(
+        &bus,
+        LifecycleEvent {
+            deliveries: vec![delivery(POOL5, "2000000", None)],
+            ..debt_event(TBA, LifecycleEventKind::TbaAllocation, "2000000")
+        },
+    )
+    .await
+    .unwrap_err();
+    let named = meridian_bus::read_refusal_status(&refused)
+        .map(|(_, fields, _)| fields)
+        .unwrap_or_default();
+    assert!(named.contains(&"event.deliveries".to_string()), "{refused}");
+    record(
+        &bus,
+        LifecycleEvent {
+            deliveries: vec![
+                delivery(POOLA, "800000", None),
+                delivery(POOLB, "700000", None),
+                delivery(POOL, "500000", None),
+            ],
+            external_event_id: "TBA-1".into(),
+            ..debt_event(TBA, LifecycleEventKind::TbaAllocation, "2000000")
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(quantity(&held(&store, TBA, HoldingSide::Long)), "0");
+    assert_eq!(
+        costs(&held(&store, POOLA, HoldingSide::Long)),
+        vec![("800000".to_string(), "788000.00".to_string())]
+    );
+    assert_eq!(
+        costs(&held(&store, POOLB, HoldingSide::Long)),
+        vec![("700000".to_string(), "689500.00".to_string())]
+    );
+    assert_eq!(quantity(&held(&store, POOL, HoldingSide::Long)), "1500000");
+    // A strip: the basis allocated by relative value, 1.9 to 8.0.
+    record(
+        &bus,
+        LifecycleEvent {
+            deliveries: vec![
+                delivery(TINT, "20000", Some("95")),
+                delivery(TPRN, "100000", Some("80")),
+            ],
+            external_event_id: "STRIP-1".into(),
+            ..debt_event(TSY, LifecycleEventKind::Strip, "100000")
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(quantity(&held(&store, TSY, HoldingSide::Long)), "0");
+    assert_eq!(
+        costs(&held(&store, TINT, HoldingSide::Long)),
+        vec![("20000".to_string(), "19000.00".to_string())]
+    );
+    assert_eq!(
+        costs(&held(&store, TPRN, HoldingSide::Long)),
+        vec![("100000".to_string(), "80000.00".to_string())]
+    );
+    // And back: the whole bond's lot opened with both components' cost.
+    record(
+        &bus,
+        LifecycleEvent {
+            deliveries: vec![
+                delivery(TINT, "-20000", Some("95")),
+                delivery(TPRN, "-100000", Some("80")),
+            ],
+            external_event_id: "RECON-1".into(),
+            ..debt_event(TSY, LifecycleEventKind::Reconstitution, "100000")
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        costs(&held(&store, TSY, HoldingSide::Long)),
+        vec![("100000".to_string(), "99000.00".to_string())]
+    );
+    assert_eq!(quantity(&held(&store, TINT, HoldingSide::Long)), "0");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn what_w9_16_refuses_of_a_debt_record_is_refused_naming_the_field() {
+    let (bus, _store) = wired();
+    open_debt(&bus).await;
+    let cases = [
+        (
+            LifecycleEvent {
+                prior_factor: d("0.9"),
+                factor: d("0.8"),
+                ..debt_event(CORP, LifecycleEventKind::Paydown, "50000")
+            },
+            "event.kind",
+        ),
+        (
+            LifecycleEvent {
+                cash: usd("100.00"),
+                period_start_date: "2026-05-15".into(),
+                ..debt_event(CORP, LifecycleEventKind::CouponReceived, "50000")
+            },
+            "event.period_end_date",
+        ),
+        (
+            LifecycleEvent {
+                redemption_price: d("100"),
+                ..debt_event(CORP, LifecycleEventKind::Redemption, "50000")
+            },
+            "event.redemption_kind",
+        ),
+        (
+            LifecycleEvent {
+                ..debt_event(POOL, LifecycleEventKind::Paydown, "1000000")
+            },
+            "event.factor",
+        ),
+        (
+            LifecycleEvent {
+                deliveries: vec![LifecycleDelivery {
+                    instrument_id: TINT.into(),
+                    quantity: d("100000"),
+                    price: usd("80"),
+                }],
+                ..debt_event(CORP, LifecycleEventKind::Strip, "100000")
+            },
+            "event.deliveries",
+        ),
+        (
+            debt_event(CALL, LifecycleEventKind::CouponReceived, "2"),
+            "event.kind",
+        ),
+    ];
+    for (event, field) in cases {
+        let refused = record(&bus, event).await.unwrap_err();
+        let named = meridian_bus::read_refusal_status(&refused)
+            .map(|(_, fields, _)| fields)
+            .unwrap_or_default();
+        assert!(named.contains(&field.to_string()), "{field}: {refused}");
+    }
+    // A partial call is only reported, never proposed.
+    let refused = send(
+        &bus,
+        PROPOSE_LIFECYCLE_EVENTS,
+        "meridian.v1.ProposeLifecycleEventsRequest",
+        &ProposeLifecycleEventsRequest {
+            events: vec![LifecycleEvent {
+                redemption_kind: RedemptionEventKind::PartialCall as i32,
+                redemption_price: d("100"),
+                ..debt_event(CORP, LifecycleEventKind::Redemption, "15000")
+            }],
+        },
+        None,
+    )
+    .await
+    .unwrap_err();
+    let named = meridian_bus::read_refusal_status(&refused)
+        .map(|(_, fields, _)| fields)
+        .unwrap_or_default();
+    assert!(
+        named.contains(&"events[0].redemption_kind".to_string()),
+        "{refused}"
+    );
+}
+
+#[test]
+fn a_share_is_exact_where_it_ends_and_half_even_where_it_does_not() {
+    let e = |t: &str| t.parse::<Exact>().unwrap();
+    assert_eq!(
+        crate::lifecycle::share("cost", e("99000.00"), e("1900000"), e("9900000")).unwrap(),
+        e("19000.00")
+    );
+    assert_eq!(
+        crate::lifecycle::share("cost", e("100.00"), e("1"), e("3")).unwrap(),
+        e("33.33")
+    );
+    assert_eq!(
+        crate::lifecycle::share("cost", e("0.05"), e("1"), e("2")).unwrap(),
+        e("0.02")
+    );
 }
