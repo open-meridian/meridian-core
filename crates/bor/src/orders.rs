@@ -195,6 +195,12 @@ pub enum Act {
         venue_account_code: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         venue_client_order_id: String,
+        /// Contract v29 (W11.11; ruling 986, amended at core stage C): the
+        /// latest published factor a pool's or a tranche's fill stating none
+        /// was taken at, as exact decimal text; empty where it stated one,
+        /// or is no pool's. Kept with the act so a rebuild prices it alike.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        factor_taken: String,
     },
     /// Unmatched executions accepted by an `ems` (W11.23, contract v23):
     /// each linked to the order and to the placement the accept created,
@@ -406,9 +412,19 @@ pub struct ExecutionHeld {
     /// of its lines and how many (W11.23). None where the entry that
     /// recorded it moved it, or nothing did.
     pub accepted_lines: Option<(String, usize, usize)>,
+    /// Contract v29 (W11.11; ruling 986, amended at core stage C): the
+    /// published factor a pool's or a tranche's fill stating none was taken
+    /// at; empty otherwise.
+    pub factor_taken: String,
 }
 
 impl ExecutionHeld {
+    /// The factor the fill is priced at (contract v29, W11.11): the one it
+    /// states, or the published one the book took for it.
+    pub fn factor(&self) -> Option<meridian_pb::v1::Decimal> {
+        factor_of(&self.execution, &self.factor_taken)
+    }
+
     /// A bust: a superseding fact of no quantity.
     pub fn is_bust(&self) -> bool {
         !self.execution.supersedes.is_empty()
@@ -989,6 +1005,7 @@ impl Ledger {
                 sender,
                 venue_account_code,
                 venue_client_order_id,
+                factor_taken,
             } => {
                 let id = execution.execution_id.clone();
                 if !execution.supersedes.is_empty() {
@@ -1034,6 +1051,7 @@ impl Ledger {
                         venue_account_code: venue_account_code.clone(),
                         venue_client_order_id: venue_client_order_id.clone(),
                         accepted_lines: None,
+                        factor_taken: factor_taken.clone(),
                     },
                 );
             }
@@ -2204,6 +2222,18 @@ pub fn placement_changed(before: Option<&Placement>, after: &Placement) -> Vec<S
         venue_order_ids
     );
     changed
+}
+
+/// The factor a fill is priced at (contract v29, W11.11; ruling 986, amended
+/// at core stage C): the one it states, or else the published one the book
+/// took for it, kept as exact decimal text.
+pub fn factor_of(execution: &Execution, taken: &str) -> Option<meridian_pb::v1::Decimal> {
+    execution.factor_used.or_else(|| {
+        taken
+            .parse::<meridian_domain::exact::Exact>()
+            .ok()
+            .map(|factor| factor.to_wire())
+    })
 }
 
 #[cfg(test)]

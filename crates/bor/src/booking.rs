@@ -334,8 +334,15 @@ pub fn executed(book: &Book, ctx: &Context, execution_ids: &[String]) -> Result<
                 "gross",
                 orders::multiply("gross", quantity, unit)?,
                 // Contract v29 (986, 987): per 100 of face, a pool's at
-                // its factor.
-                ctx.fill_multiplier(&execution.instrument_id, execution.factor_used.as_ref()),
+                // its factor -- stated, or taken by the book for it.
+                ctx.fill_multiplier(
+                    &execution.instrument_id,
+                    book.ledger
+                        .executions
+                        .get(&execution.execution_id)
+                        .map_or(execution.factor_used, |held| held.factor())
+                        .as_ref(),
+                ),
             )?,
         )?;
         for fee in &execution.fees {

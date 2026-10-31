@@ -3247,8 +3247,22 @@ fn trade_lines(
     // priced per unit of its underlying, its cash and cost by its series'
     // multiplier -- one SPY option at 2.50 is 250.00.
     // Contract v29 (986, 987): a debt record's fill priced per 100 of face,
-    // a pool's or a tranche's at the factor it was done at.
-    let multiplier = ctx.fill_multiplier(&execution.instrument_id, execution.factor_used.as_ref());
+    // a pool's or a tranche's at the factor it was done at -- the one it
+    // states, or the published one the book took for it, held from its own
+    // act once recorded (amended at core stage C).
+    let factor = execution
+        .factor_used
+        .or_else(|| {
+            book.ledger
+                .executions
+                .get(&execution.execution_id)
+                .and_then(orders::ExecutionHeld::factor)
+        })
+        .or_else(|| {
+            ctx.factor_taken
+                .filter(|_| ctx.is_pooled(&execution.instrument_id))
+        });
+    let multiplier = ctx.fill_multiplier(&execution.instrument_id, factor.as_ref());
     let value_date = if execution.settlement_date.is_empty() {
         execution.computed_settlement_date.clone()
     } else {
@@ -3749,6 +3763,7 @@ pub fn report_execution(
     };
     let order = held(book, &order_id)?;
     factor_holds(ctx, &order.order.instrument_id, request, bust)?;
+    let taken = factor_taken(ctx, request, &order.order.instrument_id);
     let cross = cross_holds(order, request, kind, bust)?;
     let sender = ctx.instance_id.clone();
     let mut execution = Execution {
@@ -3793,6 +3808,7 @@ pub fn report_execution(
         sender: sender.clone(),
         venue_account_code: request.venue_account_code.clone(),
         venue_client_order_id: request.venue_client_order_id.clone(),
+        factor_taken: taken,
     }];
     // A fill after the order ended: accepted, recorded, late fact (row 12).
     if ended(from) {
@@ -3884,10 +3900,14 @@ fn reporting_fields_hold(request: &ReportExecutionRequest) -> Result<()> {
     Ok(())
 }
 
-/// Contract v29 (W11.11; ruling 986): a pool's or a tranche's fill states
-/// the factor it was done at (FIX Factor, 228), its cash original face times
-/// it; a factor on a fill in any record but a pool, a tranche or a TBA is
-/// refused naming it.
+/// Contract v29 (W11.11; ruling 986): a pool's or a tranche's fill is at the
+/// factor it states (FIX Factor, 228), or, amended at core stage C, where it
+/// states none at the latest `Factor` row the lake holds for its settlement
+/// month, which the service read before the lock: its cash original face
+/// times it. A fill no published row answers is refused naming
+/// `factor_used`, and one whose read the lake did not answer is refused to
+/// be tried again. A factor on a fill in any record but a pool, a tranche or
+/// a TBA is refused naming it.
 fn factor_holds(
     ctx: &Context,
     instrument: &str,
@@ -3909,13 +3929,35 @@ fn factor_holds(
                 "only a pool's, a tranche's or a TBA's fill states a factor",
             ));
         }
-    } else if !bust && ctx.is_pooled(instrument) {
+    } else if !bust && ctx.is_pooled(instrument) && ctx.factor_taken.is_none() {
+        if ctx.factors_unavailable {
+            return Err(StoreError::Unavailable(
+                "the lake did not answer for the pool's latest factor in time; nothing was \
+                 recorded, and the same fill may be sent again"
+                    .into(),
+            ));
+        }
         return Err(malformed(
             &["factor_used"],
-            "a pool's or a tranche's fill states the factor it was done at, its cash original              face times it (986)",
+            "a pool's or a tranche's fill states the factor it was done at, or takes the latest \
+             one the agency published for its settlement month, and the lake holds none (986)",
         ));
     }
     Ok(())
+}
+
+/// The published factor a pool's or a tranche's fill stating none is taken
+/// at (contract v29, W11.11): the context's, as exact decimal text; empty
+/// where it states one, or is no pool's.
+fn factor_taken(ctx: &Context, request: &ReportExecutionRequest, instrument: &str) -> String {
+    if request.factor_used.is_some() || !ctx.is_pooled(instrument) {
+        return String::new();
+    }
+    ctx.factor_taken
+        .as_ref()
+        .and_then(|factor| Exact::from_wire(factor).ok())
+        .map(|factor| factor.to_string())
+        .unwrap_or_default()
 }
 
 /// A net's internal cross (W11.11, contract v27; the gaps spec's D3 and
@@ -4216,6 +4258,9 @@ fn report_unmatched(
         sender: sender.clone(),
         venue_account_code: request.venue_account_code.clone(),
         venue_client_order_id: request.venue_client_order_id.clone(),
+        // Contract v29 (amended at core stage C): a pool's fill on no
+        // order keeps the factor taken for it, for its accept.
+        factor_taken: factor_taken(ctx, request, &execution.instrument_id),
     }];
     acts.extend(claimed_unplaced(book, &sender, &execution));
     let mut plan =

@@ -1240,15 +1240,20 @@ fn sales_of(
     let mut out = Vec::new();
     for act in &body.acts {
         match act {
-            Act::Executed { execution, .. } => {
+            Act::Executed {
+                execution,
+                factor_taken,
+                ..
+            } => {
                 let fills = execution
                     .quantity
                     .as_ref()
                     .and_then(|q| Exact::from_wire(q).ok())
                     .is_some_and(|q| !q.is_zero());
                 if let (true, Some(price)) = (fills, execution.price.as_ref()) {
-                    let factored = execution
-                        .factor_used
+                    // Contract v29: the factor stated, or the published
+                    // one the book took for it (amended at core stage C).
+                    let factored = crate::orders::factor_of(execution, factor_taken)
                         .as_ref()
                         .and_then(|f| Exact::from_wire(f).ok())
                         .and_then(|f| {

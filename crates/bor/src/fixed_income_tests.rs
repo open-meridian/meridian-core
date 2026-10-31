@@ -163,8 +163,98 @@ async fn a_bond_fill_is_priced_per_100_of_face_and_keeps_its_reporting_fields() 
     assert_eq!(cash_of(&w), "-49187.50000");
 }
 
+/// The lake, stood in on the bus (contract v29, W10.6): the pool's factors
+/// as ListFactors answers them, each row key at its latest version, while
+/// `publishing` is set; none before.
+fn lake_answering(w: &Wired, publishing: Arc<std::sync::atomic::AtomicBool>) {
+    w.bus.serve(crate::service::LIST_FACTORS, move |envelope| {
+        let asked = ListFactorsRequest::decode(&envelope.payload[..]).unwrap();
+        assert_eq!(asked.subjects[0].entity_id, POOL, "the fill's pool asked");
+        let row = |month: &str, factor: &str, version: u64| Factor {
+            meta: Some(ObservationMeta {
+                row_key: format!("FNMA:MA5123:{month}"),
+                version,
+                ..Default::default()
+            }),
+            factor: d(factor),
+            factor_month: month.into(),
+            ..Default::default()
+        };
+        let factors = if publishing.load(std::sync::atomic::Ordering::SeqCst) {
+            // August's; September's republished, at its version 2; and
+            // October's, for a fill settling in November.
+            vec![
+                row("202608", "0.52", 1),
+                row("202609", "0.505", 2),
+                row("202610", "0.49", 1),
+            ]
+        } else {
+            Vec::new()
+        };
+        Ok((
+            "meridian.v1.ListFactorsReply".into(),
+            ListFactorsReply {
+                factors,
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ))
+    });
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn a_pools_fill_states_its_factor_and_its_cash_is_original_face_times_it() {
+async fn a_pools_fill_is_at_its_factor_or_the_latest_published_for_its_settlement_month() {
+    let w = wired();
+    let publishing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    lake_answering(&w, publishing.clone());
+    let request = ProposeOrderRequest {
+        instrument_id: POOL.into(),
+        price_basis: PriceBasis::PercentOfPar as i32,
+        limit_price: usd("98.50"),
+        ..buy("1000000")
+    };
+    let (_, placement) = placed(&w, request, "1000000").await;
+    let mut filled = fill(&placement, "500000", "POOL-1");
+    filled.price = usd("98.00");
+    // No factor stated and none published: refused naming the field (986).
+    assert_eq!(
+        named(&execute(&w, &filled).await.unwrap_err()),
+        vec!["factor_used"]
+    );
+    filled.factor_used = d("0.5");
+    let execution = execute(&w, &filled).await.unwrap().execution.unwrap();
+    assert_eq!(read(&execution.factor_used), "0.5");
+    // 500,000 original face at a factor of 0.5, at 98 per 100: 245,000.
+    assert_eq!(cash_of(&w), "-245000.00000");
+
+    // Published: a fill settling on 2026-10-14 states none and takes
+    // September's, the last month before October's, at its republication
+    // (amended at core stage C) -- 500,000 x 0.505 x 0.98 is 247,450. Its
+    // factor_used stays as the fill stated it; the journal keeps the factor
+    // taken, so a rebuild prices it alike.
+    publishing.store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut second = fill(&placement, "500000", "POOL-2");
+    second.price = usd("98.00");
+    let execution = execute(&w, &second).await.unwrap().execution.unwrap();
+    assert!(execution.factor_used.is_none(), "as the fill stated it");
+    assert_eq!(cash_of(&w), "-492450.0000000");
+    let taken = w
+        .store
+        .journal(ACC)
+        .unwrap()
+        .iter()
+        .flat_map(|entry| entry.body.acts.iter())
+        .filter_map(|act| match act {
+            crate::orders::Act::Executed { factor_taken, .. } => Some(factor_taken.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(taken, vec![String::new(), "0.505".to_string()]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pools_fill_stating_no_factor_is_refused_to_be_tried_again_when_the_lake_does_not_answer()
+{
     let w = wired();
     let request = ProposeOrderRequest {
         instrument_id: POOL.into(),
@@ -175,15 +265,9 @@ async fn a_pools_fill_states_its_factor_and_its_cash_is_original_face_times_it()
     let (_, placement) = placed(&w, request, "1000000").await;
     let mut filled = fill(&placement, "1000000", "POOL-1");
     filled.price = usd("98.00");
-    assert_eq!(
-        named(&execute(&w, &filled).await.unwrap_err()),
-        vec!["factor_used"]
-    );
-    filled.factor_used = d("0.5");
-    let execution = execute(&w, &filled).await.unwrap().execution.unwrap();
-    assert_eq!(read(&execution.factor_used), "0.5");
-    // 1,000,000 original face at a factor of 0.5, at 98 per 100: 490,000.
-    assert_eq!(cash_of(&w), "-490000.00000");
+    let refused = execute(&w, &filled).await.unwrap_err();
+    assert!(refused.contains("sent again"), "{refused}");
+    assert_eq!(cash_of(&w), "0", "nothing recorded");
 }
 
 #[tokio::test(flavor = "multi_thread")]

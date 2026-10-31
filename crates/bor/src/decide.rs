@@ -109,6 +109,14 @@ pub struct Context {
     /// deployment's time zone, as the book last read them; `None` where none
     /// is declared, and a held booking's alert names no moment.
     pub affirmation: Option<crate::deadline::Affirmation>,
+    /// Contract v29 (W11.11; ruling 986, amended at core stage C): for a
+    /// pool's or a tranche's fill stating no factor, the latest `Factor`
+    /// row the lake holds for its settlement month, as the service read it
+    /// before the lock; `None` where none is published or none was asked.
+    pub factor_taken: Option<meridian_pb::v1::Decimal>,
+    /// The lake did not answer that read in time: the fill is refused to
+    /// be tried again, never priced at a factor nobody read.
+    pub factors_unavailable: bool,
 }
 
 /// What an instrument's record says that the book requires (W9.1, contract

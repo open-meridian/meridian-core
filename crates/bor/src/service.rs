@@ -85,6 +85,95 @@ pub const INSTRUMENT_REPLACED: &str = "platform.reference.event.instrument-repla
 /// and currency (W9.1), and what a merged record has become.
 pub const RESOLVE_INSTRUMENT: &str = "platform.reference.query.resolve-instrument";
 
+/// Contract v29 (W10.6, W11.11; ruling 986, amended at core stage C):
+/// asked, a pool's or a tranche's factors, for a fill stating none.
+pub const LIST_FACTORS: &str = "platform.lake.query.list-factors";
+
+/// What the lake answers for a pool's or a tranche's fill stating no
+/// factor (W11.11; ruling 986, amended at core stage C).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum FactorRead {
+    /// The latest version of the row whose factor month is the last before
+    /// the month the fill settles in.
+    Taken(meridian_pb::v1::Decimal),
+    /// No published row answers that month.
+    NonePublished,
+    /// The lake did not answer in time, or refused the read.
+    Unavailable,
+}
+
+/// The month a fill settles in, as a factor month (`YYYYMM`): its
+/// settlement date's, its computed one's, or its trade date's.
+pub(crate) fn settlement_month(dates: &[&str]) -> Option<String> {
+    let date = dates.iter().find(|d| !d.is_empty())?;
+    let parsed = meridian_domain::date::Date::parse(date).ok()?;
+    let text = parsed.to_string();
+    Some(format!("{}{}", &text[0..4], &text[5..7]))
+}
+
+/// The latest `Factor` row the lake holds for a pool's or a tranche's
+/// settlement month (W11.11): of every row it answers for the record, the
+/// one whose factor month is the last before `month`, at its latest
+/// version. The book reads as the deployment's own component, every
+/// dataset, the default source.
+pub(crate) fn latest_factor(bus: &Bus, instrument: &str, month: &str) -> FactorRead {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return FactorRead::Unavailable;
+    };
+    let mut best: Option<(String, u64, meridian_pb::v1::Decimal)> = None;
+    let mut cursor = String::new();
+    loop {
+        let asked = handle.block_on(
+            bus.call(
+                LIST_FACTORS,
+                "meridian.v1.ListFactorsRequest",
+                meridian_domain::v1::ListFactorsRequest {
+                    subjects: vec![meridian_domain::v1::SubjectRef {
+                        entity_id: instrument.to_string(),
+                        ..Default::default()
+                    }],
+                    page_size: 500,
+                    cursor: cursor.clone(),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+                None,
+                Some(VERSION_WAIT),
+            ),
+        );
+        let Ok((payload_type, payload)) = asked else {
+            return FactorRead::Unavailable;
+        };
+        if payload_type != "meridian.v1.ListFactorsReply" {
+            return FactorRead::Unavailable;
+        }
+        let Ok(reply) = meridian_domain::v1::ListFactorsReply::decode(&payload[..]) else {
+            return FactorRead::Unavailable;
+        };
+        for row in reply.factors {
+            let Some(factor) = row.factor else { continue };
+            let version = row.meta.as_ref().map_or(0, |m| m.version);
+            if row.factor_month.as_str() >= month {
+                continue;
+            }
+            let later = best.as_ref().is_none_or(|(held, held_version, _)| {
+                (&row.factor_month, version) > (held, *held_version)
+            });
+            if later {
+                best = Some((row.factor_month, version, factor));
+            }
+        }
+        if reply.next_cursor.is_empty() {
+            break;
+        }
+        cursor = reply.next_cursor;
+    }
+    match best {
+        Some((_, _, factor)) => FactorRead::Taken(factor),
+        None => FactorRead::NonePublished,
+    }
+}
+
 /// How long a command waits for the instrument store's records. Short: a
 /// store that does not answer in it is a command refused to be tried again
 /// (contract v10), never one admitted unchecked.
@@ -139,6 +228,8 @@ pub(crate) fn context_of(envelope: &Envelope, clock: &dyn Clock) -> Context {
         local_record_orders: None,
         agent_orders_demo_only: None,
         affirmation: crate::deadline::current(),
+        factor_taken: None,
+        factors_unavailable: false,
     }
 }
 

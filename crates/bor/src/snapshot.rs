@@ -258,6 +258,11 @@ struct ExecutionShape {
     venue_account_code: String,
     venue_client_order_id: String,
     accepted_lines: Option<(String, usize, usize)>,
+    /// Contract v29 (ruling 986, amended at core stage C): empty in a
+    /// snapshot made before, when no pool's fill was recorded without its
+    /// factor, so the format stands.
+    #[serde(default)]
+    factor_taken: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -540,6 +545,7 @@ fn execution_shape(held: &ExecutionHeld) -> ExecutionShape {
         venue_account_code,
         venue_client_order_id,
         accepted_lines,
+        factor_taken,
     } = held;
     ExecutionShape {
         execution: pb(execution),
@@ -549,6 +555,7 @@ fn execution_shape(held: &ExecutionHeld) -> ExecutionShape {
         venue_account_code: venue_account_code.clone(),
         venue_client_order_id: venue_client_order_id.clone(),
         accepted_lines: accepted_lines.clone(),
+        factor_taken: factor_taken.clone(),
     }
 }
 
@@ -789,6 +796,7 @@ fn execution_from(shape: ExecutionShape) -> Result<ExecutionHeld> {
         venue_account_code: shape.venue_account_code,
         venue_client_order_id: shape.venue_client_order_id,
         accepted_lines: shape.accepted_lines,
+        factor_taken: shape.factor_taken,
     })
 }
 
