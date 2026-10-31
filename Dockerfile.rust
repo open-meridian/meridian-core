@@ -27,6 +27,10 @@ ENV CARGO_INCREMENTAL=0 \
     CARGO_PROFILE_DEV_DEBUG=line-tables-only \
     CARGO_PROFILE_TEST_DEBUG=line-tables-only
 WORKDIR /w
+# Every cargo run against the shared target cache, wrapped: each source's time
+# set from what the cache last saw of its content, so another checkout's build
+# is never taken for this one's (tools/fresh-sources.sh).
+COPY tools/fresh-sources.sh /usr/local/bin/fresh-sources
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 # The contract the sidecar and the broker grant from, compiled in
@@ -45,7 +49,7 @@ FROM base AS check
 RUN --mount=type=cache,id=meridian-core-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=meridian-core-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=meridian-core-target,target=/w/target \
-    cargo build --workspace --locked
+    fresh-sources cargo build --workspace --locked
 
 # Every test binary: each crate's unit tests and every integration test, in
 # one invocation with the whole workspace's features, as `test` always built
@@ -61,7 +65,7 @@ COPY tools/run-tests.sh /usr/local/bin/run-tests
 RUN --mount=type=cache,id=meridian-core-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=meridian-core-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=meridian-core-target,target=/w/target \
-    cargo test --workspace --locked --no-run --lib --test '*' \
+    fresh-sources cargo test --workspace --locked --no-run --lib --test '*' \
       --message-format=json-render-diagnostics >/tmp/compiled.json \
  && run-tests collect </tmp/compiled.json \
  && rm /tmp/compiled.json
@@ -95,7 +99,7 @@ RUN cargo fmt --all -- --check
 RUN --mount=type=cache,id=meridian-core-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=meridian-core-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=meridian-core-target,target=/w/target \
-    cargo clippy --workspace --locked --all-targets -- -D warnings
+    fresh-sources cargo clippy --workspace --locked --all-targets -- -D warnings
 
 # Published vulnerabilities in anything the workspace links, from the RustSec
 # advisory database, read fresh on every run. A prebuilt cargo-deny at a pinned
@@ -129,7 +133,7 @@ FROM check AS settings-binary
 RUN --mount=type=cache,id=meridian-core-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=meridian-core-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=meridian-core-target,target=/w/target \
-    cargo test --workspace --locked --no-run --lib --test '*' \
+    fresh-sources cargo test --workspace --locked --no-run --lib --test '*' \
       --message-format=json-render-diagnostics >/tmp/compiled.json \
  && exe=$(sed -n 's/.*"manifest_path":"[^"]*\/crates\/dashboard\/Cargo.toml".*"target":{"kind":\["lib"\].*"executable":"\([^"]*\)".*/\1/p' /tmp/compiled.json | head -1) \
  && test -n "$exe" \

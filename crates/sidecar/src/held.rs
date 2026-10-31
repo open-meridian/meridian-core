@@ -375,6 +375,82 @@ mod tests {
         }
     }
 
+    /// A licence stating who may take the dataset (contract v28, rulings
+    /// 491 and 597; SDK 0.33.x), as uploaded and as registered: the two
+    /// agree, where the uploaded one once dropped it and the plugin was
+    /// refused as registering a catalogue that differs (plugin-massive).
+    #[test]
+    fn a_catalogue_whose_licence_states_eligibility_registers() {
+        use meridian_pb::v1::{
+            Catalogue, DataEligibility, DataUse, DatasetDeclaration, DatasetLicence, Decimal,
+            DerivedUse, ObservationMode, Redistribution,
+        };
+        let declared: meridian_domain::declaration::Declared =
+            serde_json::from_value(serde_json::json!({
+                "catalogue": {"datasets": [{
+                    "key": "stocks", "vendor": "Massive", "modes": ["pull"],
+                    "licence_default": {
+                        "kept": true, "retention_days": 0, "derived_use": true,
+                        "derived_use_terms": "not_restricted", "display": true,
+                        "default_fields": [], "personal_use": true,
+                        "redistribution": "not_allowed",
+                        "eligibility": {
+                            "uses": ["personal"], "buyer_revenue_below": "1000000.00",
+                            "buyer_revenue_at_least": null,
+                            "buyer_revenue_currency_code": "USD"
+                        }
+                    }
+                }]}
+            }))
+            .unwrap();
+        let uploaded = meridian_domain::declaration::from_json(&declared).unwrap();
+        // What DatasetLicence._wire() sends, its DataEligibility._wire() in it.
+        #[allow(deprecated)]
+        let wire = DatasetLicence {
+            kept: true,
+            derived_use: true,
+            derived_use_terms: DerivedUse::NotRestricted as i32,
+            display: true,
+            personal_use: true,
+            redistribution: Redistribution::NotAllowed as i32,
+            eligibility: Some(DataEligibility {
+                uses: vec![DataUse::Personal as i32],
+                buyer_revenue_below: Some(Decimal {
+                    high: 0,
+                    low: 100_000_000,
+                    scale: 2,
+                }),
+                buyer_revenue_at_least: None,
+                buyer_revenue_currency_code: "USD".into(),
+            }),
+            ..Default::default()
+        };
+        let registered = |licence: DatasetLicence| RegisterRequest {
+            schema_version: "v28".into(),
+            declaration: Some(PluginDeclaration {
+                catalogue: Some(Catalogue {
+                    datasets: vec![DatasetDeclaration {
+                        key: "stocks".into(),
+                        vendor: "Massive".into(),
+                        modes: vec![ObservationMode::Pull as i32],
+                        licence_default: Some(licence),
+                        ..Default::default()
+                    }],
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(difference(&registered(wire.clone()), &uploaded), None);
+        // And an eligibility that is not the uploaded one still differs.
+        let mut other = wire;
+        other.eligibility.as_mut().unwrap().uses = vec![DataUse::Commercial as i32];
+        assert_eq!(
+            difference(&registered(other), &uploaded).as_deref(),
+            Some("it registers a declaration whose catalogue differs")
+        );
+    }
+
     /// A setting named like a window setting for a kind the version does
     /// not store is compared like any other.
     #[test]

@@ -14,6 +14,10 @@
 #   key/key.pem          the deployment's key, where the conductor made it
 #   database/database.dump   pg_dump --format=custom, when the database is included
 #   database/counts.tsv  every table's row count, in the dump's own snapshot
+#   storage/<claim>.tar  each edge plugin's storage (decisions/028), as its claim
+#                        holds it, where `meridian backup` mounted the claims
+#   storage/claims.json  what restore makes each claim again from: its labels
+#                        and size, as `meridian backup` read them
 #
 # Never prints a value: only names, counts, sizes and the sealed file's hash.
 set -eu
@@ -78,6 +82,32 @@ if [ "$key" = generated ]; then
 	mkdir -p "$work/key"
 	cp /in/key/key.pem "$work/key/key.pem"
 	say "the deployment's key, from its volume"
+fi
+
+# Each edge plugin's storage (decisions/028; ruling 828). The claims are made
+# by the launcher as plugins are launched, which this Job, holding no RBAC,
+# cannot list: `meridian backup` lists them and mounts each, read-only, at
+# /in/storage/<claim>, naming them in MERIDIAN_BACKUP_STORAGE and describing
+# them in MERIDIAN_BACKUP_STORAGE_CLAIMS. A run the schedule starts has none.
+held_storage=""
+for claim in ${MERIDIAN_BACKUP_STORAGE:-}; do
+	from="/in/storage/$claim"
+	[ -d "$from" ] || fail "the plugin storage $claim is not mounted at $from"
+	mkdir -p "$work/storage"
+	# Read while its plugin runs: a file written meanwhile is taken as it
+	# stood (tar's exit 1), which is said; anything worse stops the backup.
+	if tar -C "$from" --numeric-owner -cf "$work/storage/$claim.tar" .; then
+		:
+	else
+		read_status=$?
+		[ "$read_status" -eq 1 ] || fail "the plugin storage $claim could not be read"
+		say "the plugin storage $claim changed while it was read; each file is as it stood when read"
+	fi
+	held_storage="$held_storage $claim"
+done
+if [ -n "$held_storage" ]; then
+	printf '%s\n' "${MERIDIAN_BACKUP_STORAGE_CLAIMS:-[]}" >"$work/storage/claims.json"
+	say "plugin storage:$held_storage"
 fi
 
 # The database: the one first run made, every store's tables in it.
@@ -193,7 +223,8 @@ cat >"$work/manifest.json" <<EOF
   "database": { "included": $included, "brought": $brought, "name": "$database", "secret": "${MERIDIAN_BACKUP_DATABASE_SECRET:-}" },
   "chart_secrets": $(list "$held_chart"),
   "operator_secrets": $(list "$held_operator"),
-  "config_maps": $(list "$held_maps")
+  "config_maps": $(list "$held_maps"),
+  "storage": $(list "$held_storage")
 }
 EOF
 (cd "$work" && find . -type f ! -name checksums.sha256 | LC_ALL=C sort | sed 's|^\./||' | xargs sha256sum) >"$work/checksums.sha256"
@@ -201,6 +232,13 @@ EOF
 partial="/backups/.$name.partial"
 tar -C "$work" -cf - . | age -r "$recipient" -o "$partial" || { rm -f "$partial"; fail "sealing did not finish"; }
 [ "$(head -c 21 "$partial")" = "age-encryption.org/v1" ] || { rm -f "$partial"; fail "what was written is not an age file"; }
+# `meridian backup --to` copies from the pod's own copy, which no other run
+# prunes: a scheduled run finishing meanwhile removes the oldest beyond
+# backup.keep from /backups, this one among them where keep is 1.
+if [ -n "${MERIDIAN_BACKUP_HOLD:-}" ]; then
+	mkdir -p /work/held
+	cp "$partial" "/work/held/$name" || { rm -f "$partial"; fail "the copy held for meridian backup could not be made"; }
+fi
 mv "$partial" "/backups/$name"
 rm -rf "$work"
 say "wrote $name $(wc -c <"/backups/$name" | tr -d ' ') bytes sha256 $(sha256sum "/backups/$name" | cut -d' ' -f1)"
@@ -216,7 +254,8 @@ if [ "$prune" = true ] && [ "$excess" -gt 0 ]; then
 	done
 fi
 
-# `meridian backup --to` copies the file out of this pod before it goes.
+# `meridian backup --to` copies the file out of this pod (/work/held) before
+# it goes.
 if [ -n "${MERIDIAN_BACKUP_HOLD:-}" ]; then
 	say "holding $name for copying"
 	waited=0

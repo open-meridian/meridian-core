@@ -286,7 +286,14 @@ jobs:
   # to check it out with, fails at the credentials step below, and is closed
   # by outside-pull-requests anyway. A commit ci-local has refused is not
   # worth a cluster. One job per run, so a failure names its half.
+  #
+  # Each on the k3s release dev runs (the Makefile's KUBERNETES_VERSION,
+  # ruling 849), and the install once more on the oldest minor the chart
+  # declares (Chart.yaml's kubeVersion), so both ends of the range are
+  # proven. The name stays `e2e-cluster-k3d (<target>)` for the six, which
+  # are the required checks; the lower bound's names its k3s.
   e2e-cluster-k3d:
+    name: e2e-cluster-k3d (${{ matrix.target }}${{ matrix.k3s && format(', k3s {0}', matrix.k3s) || '' }})
     needs: ci-local
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -294,6 +301,11 @@ jobs:
       fail-fast: false
       matrix:
         target: [e2e-cluster, e2e-cluster-external, e2e-cluster-ldap, e2e-cluster-oidc, e2e-cluster-upgrade, e2e-cluster-backup]
+        # Empty: the Makefile's pin.
+        k3s: [""]
+        include:
+          - target: e2e-cluster
+            k3s: v1.35.9-k3s1
     steps:
       - uses: actions/checkout@v4
         with:
@@ -369,7 +381,8 @@ jobs:
         env:
           DOCKER_BUILDKIT: "1"
           TARGET: ${{ matrix.target }}
-        run: make e2e-cluster-k3d E2E_CLUSTER_TARGET="$TARGET"
+          K3S: ${{ matrix.k3s }}
+        run: make e2e-cluster-k3d E2E_CLUSTER_TARGET="$TARGET" ${K3S:+E2E_K3S_IMAGE="rancher/k3s:$K3S"}
 
       # What failed, in the job's own log, before anything else is tried:
       # the artifact service timed out creating the upload below (2026-10-06,
@@ -396,7 +409,7 @@ jobs:
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.target }}-logs
+          name: ${{ matrix.target }}${{ matrix.k3s && format('-{0}', matrix.k3s) || '' }}-logs
           path: workspace/meridian-core/.e2e-*.log
           # The logs are dotfiles, which v4 leaves out unless told; with
           # `ignore` as well, every failure uploaded nothing and said nothing
