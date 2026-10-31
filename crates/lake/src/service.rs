@@ -4480,13 +4480,32 @@ fn derived_refused(at: &str, value: &meridian_domain::v1::DerivedSeries) -> Resu
     if !bounds::DERIVED_SERIES_SERIES_LENGTH.admits(value.series.chars().count()) {
         return Err(format!("{at}.series is 1 to 64 characters"));
     }
-    if value
-        .value
-        .as_ref()
-        .and_then(|v| v.value.as_ref())
-        .is_none()
-    {
-        return Err(format!("{at}.value is required, with its unit"));
+    // Contract v29 (638; W10.4): an amount of money in money_value, a
+    // Money naming its currency or its cash instrument, value then unset,
+    // since a UnitValue never carries a currency; any other in value.
+    let unit_value = value.value.as_ref().and_then(|v| v.value.as_ref());
+    match (&value.money_value, unit_value) {
+        (Some(_), Some(_)) => {
+            return Err(format!(
+                "{at}.value is unset where money_value carries the amount of money"
+            ));
+        }
+        (Some(money), None) => {
+            if money.amount.is_none() {
+                return Err(format!("{at}.money_value.amount is required"));
+            }
+            if money.currency_code.trim().is_empty() && money.instrument_id.trim().is_empty() {
+                return Err(format!(
+                    "{at}.money_value names its currency_code or its cash instrument_id"
+                ));
+            }
+        }
+        (None, None) => {
+            return Err(format!(
+                "{at}.value is required, with its unit, or money_value for an amount of money"
+            ));
+        }
+        (None, Some(_)) => {}
     }
     let rule = value.rule.clone().unwrap_or_default();
     if rule.definition.trim().is_empty() || rule.version < 1 {

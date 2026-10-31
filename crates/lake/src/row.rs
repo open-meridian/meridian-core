@@ -836,6 +836,8 @@ impl Observation {
                     && a.inputs == b.inputs
                     // Contract 28, amended 2026-10-31 (ruling 955).
                     && a.published_by == b.published_by
+                    // Contract v29 (638): an amount of money.
+                    && same_money(&a.money_value, &b.money_value)
             }
             (Observation::Scenario(a), Observation::Scenario(b)) => {
                 a.scenario == b.scenario
