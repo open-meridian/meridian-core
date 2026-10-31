@@ -255,7 +255,10 @@ message Identifier {
   // Contract v29 (677): agency_pool, an open scheme, names an agency pool by
   // the agency's pool number, the agency in source (FNMA, FHLMC, GNMA); a
   // debt record matches on figi and agency_pool, and its cusip and isin stay
-  // deployment-side, mapped to FIGI at the edge.
+  // deployment-side, mapped to FIGI at the edge. Contract v29 (715): mpid,
+  // clearing_number, branch_sequence and finra_symbol name market
+  // participants and a security for trade reports, finra_symbol
+  // deployment-side (745).
   string scheme = 1;
   string value = 2;
 

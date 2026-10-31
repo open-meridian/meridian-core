@@ -1547,6 +1547,11 @@ enum PartyRole {
   PARTY_ROLE_CLIENT = 1;
   // The counterparty, where known.
   PARTY_ROLE_COUNTERPARTY = 2;
+  // Contract v29: the firm a trade is given up to for TRACE (6730(c)(9); FIX
+  // PartyRole 14).
+  PARTY_ROLE_GIVE_UP_FIRM = 3;
+  // Contract v29: the contra side's introducing broker (6730(c)(10)).
+  PARTY_ROLE_INTRODUCING_BROKER = 4;
 }
 
 // Maker or taker (FIX's LastLiquidityInd, tag 851).
@@ -2198,6 +2203,71 @@ message Execution {
   // reported; on a leg recorded, the package's execution_id. Empty except on a
   // leg's fill.
   string package_execution_id = 44;
+  // Contract v29: per unit, or percent of par (TRACE's decimal price), yield or
+  // spread, as the lake's PriceBasis (W10.4). Unspecified: per unit, as before
+  // v29.
+  PriceBasis price_basis = 45;
+  // Contract v29: a when-issued Treasury's yield, a municipal's yield to worst
+  // on its confirmation, or TRACE's yield; a QuotedYield. Unset where none is
+  // stated.
+  QuotedYield yield = 46;
+  // Contract v29: second, millisecond, microsecond or nanosecond, on every
+  // execution of every asset class. Unspecified where not said; set on every
+  // execution from v29 where the source states its precision.
+  TimePrecision trade_time_precision = 47;
+  // Contract v29: states the factor a pool or TBA trade was done at, where not
+  // the latest (6730(d)(2)(B); FIX Factor, 228): an exact decimal. Unset: the
+  // latest published Factor row.
+  optional Decimal factor_used = 48;
+  // Contract v29: true for a new-issue municipal traded when issued, so an
+  // empty date is never ambiguous. False: the settlement date is known.
+  bool settlement_date_unknown = 49;
+  // Contract v29: customer, dealer, non-member affiliate or clearing broker,
+  // matching the lake's characteristics by meaning (W10.4). Unspecified where
+  // not a fixed-income street report.
+  ContraPartyType contra_party_type = 50;
+  // Contract v29: a give-up firm (PARTY_ROLE_GIVE_UP_FIRM, 6730(c)(9)) and the
+  // contra side's introducing broker (PARTY_ROLE_INTRODUCING_BROKER,
+  // 6730(c)(10)), each with its mpid. None where only the counterparty is
+  // delivered.
+  repeated Party parties = 51;
+  // Contract v29: one of the existing four but mixed: a mixed order's fills
+  // each carry one. Unspecified where not a broker's trade.
+  Capacity capacity = 52;
+  // Contract v29: true where the firm takes no transaction-based compensation.
+  // False: not so, or not stated.
+  bool no_remuneration = 53;
+  // Contract v29: true for a back-to-back with a non-member affiliate, same
+  // day, same price. False: not so, or not stated.
+  bool affiliate_back_to_back = 54;
+  // Contract v29: true where priced away from the market, its reason in
+  // special_price_reason. False: not so, or not stated.
+  bool special_price = 55;
+  // Contract v29: true where priced by a weighted-average method. False: not
+  // so, or not stated.
+  bool weighted_average_price = 56;
+  // Contract v29: true for a primary-market trade. False: not so, or not
+  // stated.
+  bool primary_market = 57;
+  // Contract v29: marks a list offering price or takedown trade (G-14 RTRS
+  // Procedures (b)(iv)(B)(1)): true where so. False: not so, or not stated.
+  bool list_offering_price_takedown = 58;
+  // Contract v29: marks a trade without accrued interest (G-14 (b)(iv)(B)(4)):
+  // true where traded flat. False: not so, or not stated.
+  bool traded_flat = 59;
+  // Contract v29: true where traded with stipulations. False: not so, or not
+  // stated.
+  bool stipulated = 60;
+  // Contract v29: true on each execution of a basket of ten or more issues at
+  // one agreed price, linked by trade_chain_reference. False: not so, or not
+  // stated.
+  bool portfolio_trade = 61;
+  // Contract v29: up to 50 characters, as the firm writes it. Empty unless
+  // special_price.
+  string special_price_reason = 62;
+  // Contract v29: a futures leg in the series, a series not priced at the
+  // market, or hedged. Unspecified: none.
+  TreasuryTradeModifier treasury_trade_modifier = 63;
 }
 
 // An execution's finality: a level, and when it reached it.
@@ -2656,6 +2726,71 @@ message ReportExecutionRequest {
   // reported; on a leg recorded, the package's execution_id. Empty except on a
   // leg's fill.
   string package_execution_id = 38;
+  // Contract v29: per unit, or percent of par (TRACE's decimal price), yield or
+  // spread, as the lake's PriceBasis (W10.4). Unspecified: per unit, as before
+  // v29.
+  PriceBasis price_basis = 39;
+  // Contract v29: a when-issued Treasury's yield, a municipal's yield to worst
+  // on its confirmation, or TRACE's yield; a QuotedYield. Unset where none is
+  // stated.
+  QuotedYield yield = 40;
+  // Contract v29: second, millisecond, microsecond or nanosecond, on every
+  // execution of every asset class. Unspecified where not said; set on every
+  // execution from v29 where the source states its precision.
+  TimePrecision trade_time_precision = 41;
+  // Contract v29: states the factor a pool or TBA trade was done at, where not
+  // the latest (6730(d)(2)(B); FIX Factor, 228): an exact decimal. Unset: the
+  // latest published Factor row.
+  optional Decimal factor_used = 42;
+  // Contract v29: true for a new-issue municipal traded when issued, so an
+  // empty date is never ambiguous. False: the settlement date is known.
+  bool settlement_date_unknown = 43;
+  // Contract v29: customer, dealer, non-member affiliate or clearing broker,
+  // matching the lake's characteristics by meaning (W10.4). Unspecified where
+  // not a fixed-income street report.
+  ContraPartyType contra_party_type = 44;
+  // Contract v29: a give-up firm (PARTY_ROLE_GIVE_UP_FIRM, 6730(c)(9)) and the
+  // contra side's introducing broker (PARTY_ROLE_INTRODUCING_BROKER,
+  // 6730(c)(10)), each with its mpid. None where only the counterparty is
+  // delivered.
+  repeated Party parties = 45;
+  // Contract v29: one of the existing four but mixed: a mixed order's fills
+  // each carry one. Unspecified where not a broker's trade.
+  Capacity capacity = 46;
+  // Contract v29: true where the firm takes no transaction-based compensation.
+  // False: not so, or not stated.
+  bool no_remuneration = 47;
+  // Contract v29: true for a back-to-back with a non-member affiliate, same
+  // day, same price. False: not so, or not stated.
+  bool affiliate_back_to_back = 48;
+  // Contract v29: true where priced away from the market, its reason in
+  // special_price_reason. False: not so, or not stated.
+  bool special_price = 49;
+  // Contract v29: true where priced by a weighted-average method. False: not
+  // so, or not stated.
+  bool weighted_average_price = 50;
+  // Contract v29: true for a primary-market trade. False: not so, or not
+  // stated.
+  bool primary_market = 51;
+  // Contract v29: marks a list offering price or takedown trade (G-14 RTRS
+  // Procedures (b)(iv)(B)(1)): true where so. False: not so, or not stated.
+  bool list_offering_price_takedown = 52;
+  // Contract v29: marks a trade without accrued interest (G-14 (b)(iv)(B)(4)):
+  // true where traded flat. False: not so, or not stated.
+  bool traded_flat = 53;
+  // Contract v29: true where traded with stipulations. False: not so, or not
+  // stated.
+  bool stipulated = 54;
+  // Contract v29: true on each execution of a basket of ten or more issues at
+  // one agreed price, linked by trade_chain_reference. False: not so, or not
+  // stated.
+  bool portfolio_trade = 55;
+  // Contract v29: up to 50 characters, as the firm writes it. Empty unless
+  // special_price.
+  string special_price_reason = 56;
+  // Contract v29: a futures leg in the series, a series not priced at the
+  // market, or hedged. Unspecified: none.
+  TreasuryTradeModifier treasury_trade_modifier = 57;
 }
 
 // W11.12.
@@ -3111,6 +3246,39 @@ message Allocation {
   // instrument that accrues nothing; on a fixed-income allocation booked before
   // v29, unset, a backfilled record saying it was not recorded (decisions/031).
   optional Money accrued_interest = 16;
+  // Contract v29: signed, a Money for the whole allocation: positive a markup
+  // on a sale to the customer, negative a markdown on a purchase from it, the
+  // name following the side as the rules name it; inside the price, never a fee
+  // (a FIX export writes MiscFeeType 8). Unset where none: an agency trade, or
+  // unset on an allocation booked before v29.
+  optional Money markup = 17;
+  // Contract v29: per unit in the instrument's price basis: per 100 of face for
+  // a bond. Unset where no markup is disclosed, or unset on an allocation
+  // booked before v29.
+  optional Money prevailing_market_price = 18;
+  // Contract v29: the rules' ladder in their order, one enum for both
+  // regulators. Unspecified where no PMP.
+  PrevailingMarketPriceBasis prevailing_market_price_basis = 19;
+  // Contract v29: an EXE- execution (the firm's own contemporaneous trade) or a
+  // lake row's dataset, row key and version (a trade, a quote, an engine
+  // result's row), with its time. Unset where no PMP.
+  PrevailingMarketPriceReference prevailing_market_price_reference = 20;
+  // Contract v29: one of the existing four but mixed. Unspecified where not a
+  // broker's trade; unset on an allocation booked before v29, each fixed-income
+  // one given a backfilled record saying it was not recorded (decisions/031).
+  Capacity capacity = 21;
+  // Contract v29: for an allocation booking one execution its time; for an
+  // average-priced allocation the time the oms fixed the customer's price, the
+  // time all terms sufficient to compute the dollar price were agreed (FINRA
+  // Rule 6710(d)'s time of execution). 0 where not a customer trade, or unset
+  // on an allocation booked before v29.
+  int64 execution_time_ns = 22;
+  // Contract v29: to the second at least for a confirmation. Unspecified where
+  // execution_time_ns is 0.
+  TimePrecision execution_time_precision = 23;
+  // Contract v29: as Execution.no_remuneration, for the same regulators. False:
+  // not so, or not stated.
+  bool no_remuneration = 24;
 }
 
 // A prime's answer to a give-up (W11.32), its own record, as FIX sends each
@@ -3583,6 +3751,75 @@ enum PositionEffect {
   POSITION_EFFECT_OPEN = 1;
   // Closes or reduces a position.
   POSITION_EFFECT_CLOSE = 2;
+}
+
+// Contract v29 (711; FINRA Rule 2121.02(b), MSRB G-30 .06(a)): what a
+// prevailing market price was read from -- an EXE- execution, the firm's own
+// contemporaneous trade, or a lake row's dataset, row key and version -- with
+// its time.
+message PrevailingMarketPriceReference {
+  // Names the firm's own contemporaneous trade: an EXE- execution. Empty where
+  // the PMP came from the lake.
+  string execution_id = 1;
+  // Names the lake dataset the row is in: as Source.dataset. Empty where the
+  // PMP came from an execution.
+  string dataset = 2;
+  // Names the lake row: its row key. Empty where the PMP came from an
+  // execution.
+  string row_key = 3;
+  // Names the row's version: the version read. 0 where the PMP came from an
+  // execution.
+  int64 version = 4;
+  // States the time of the price taken: the trade's or quote's time. Never 0
+  // when set.
+  int64 at_ns = 5;
+}
+
+// Contract v29 (711): how a prevailing market price was found, the rules'
+// ladder in their order, one enum for both regulators.
+enum PrevailingMarketPriceBasis {
+  // Not stated: no PMP, or booked before v29.
+  PREVAILING_MARKET_PRICE_BASIS_UNSPECIFIED = 0;
+  // The dealer's contemporaneous cost or proceeds, the presumption (FINRA
+  // 2121.02(b)(1); MSRB G-30 .06(a)(i)).
+  PREVAILING_MARKET_PRICE_BASIS_CONTEMPORANEOUS_COST = 1;
+  // Contemporaneous inter-dealer transactions in the security.
+  PREVAILING_MARKET_PRICE_BASIS_INTER_DEALER_TRANSACTIONS = 2;
+  // Contemporaneous dealer transactions with institutional accounts.
+  PREVAILING_MARKET_PRICE_BASIS_INSTITUTIONAL_TRANSACTIONS = 3;
+  // Contemporaneous quotations.
+  PREVAILING_MARKET_PRICE_BASIS_QUOTATIONS = 4;
+  // Similar securities.
+  PREVAILING_MARKET_PRICE_BASIS_SIMILAR_SECURITIES = 5;
+  // An economic model.
+  PREVAILING_MARKET_PRICE_BASIS_ECONOMIC_MODEL = 6;
+}
+
+// Contract v29: a fixed-income street report's contra party, matching the
+// lake's trade characteristics by meaning (W10.4).
+enum ContraPartyType {
+  // Not said: not a fixed-income street report.
+  CONTRA_PARTY_TYPE_UNSPECIFIED = 0;
+  // A customer (TRACE's C).
+  CONTRA_PARTY_TYPE_CUSTOMER = 1;
+  // A FINRA member or MSRB dealer, named by its MPID.
+  CONTRA_PARTY_TYPE_DEALER = 2;
+  // A non-member affiliate (TRACE's A1).
+  CONTRA_PARTY_TYPE_NON_MEMBER_AFFILIATE = 3;
+  // A clearing broker on an RTRS inter-dealer regulatory-only trade.
+  CONTRA_PARTY_TYPE_CLEARING_BROKER = 4;
+}
+
+// Contract v29: TRACE's Treasury trade modifiers.
+enum TreasuryTradeModifier {
+  // None.
+  TREASURY_TRADE_MODIFIER_UNSPECIFIED = 0;
+  // A leg of a series with a futures leg (TRACE's .B).
+  TREASURY_TRADE_MODIFIER_FUTURES_LEG = 1;
+  // A series not priced at the market (TRACE's .S).
+  TREASURY_TRADE_MODIFIER_NON_MARKET_SERIES = 2;
+  // Hedged (TRACE's H).
+  TREASURY_TRADE_MODIFIER_HEDGED = 3;
 }
 
 enum MultiLegReportingType {
