@@ -2217,7 +2217,20 @@ chart-check:
 		|| { echo "chart-check FAILED: no platform key still renders the keys' volume or variable" >&2; exit 1; }; \
 	$(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null | grep -q 'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEYM0/p11OyeOPd/Wxgpt0yNiY74kY' \
 		|| { echo "chart-check FAILED: the chart's default does not carry the platform's key (v26)" >&2; exit 1; }
-	@echo "chart-check OK: the platform's keys on the conductor alone, as files, only where the chart carries some, its current key by default; four components, the dashboard and the three ways it signs people in, the key and the settings key on the conductor alone, both key paths, refusals, migrations, no pinned uid, a plugin held to its side of the pod, its front door open to the dashboard alone, an Ingress only when asked for and HTTPS alone unless plain HTTP is, development only when asked for, the live shape there alone, a backup only when sealed and placed, and nothing an upgrade leaves behind"
+	@# Rulings 957, 958: lake.maxConcurrentAnswers reaches the lake, 2 by
+	@# default, and a value outside 1 to 8 renders nothing.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
+	for said in "2:" "1:--set lake.maxConcurrentAnswers=1" "8:--set lake.maxConcurrentAnswers=8"; do \
+		want="$${said%%:*}"; flag="$${said#*:}"; \
+		$(HELM_TEMPLATE) check deploy/chart $$base $$flag 2>/dev/null \
+			| grep -A1 'name: MERIDIAN_LAKE_MAX_CONCURRENT_ANSWERS$$' | grep -q "value: \"$$want\"" \
+			|| { echo "chart-check FAILED: lake.maxConcurrentAnswers $${flag:-unset} does not tell the lake $$want" >&2; exit 1; }; \
+	done; \
+	for refused in 0 9 2.5 two; do \
+		! $(HELM_TEMPLATE) check deploy/chart $$base --set lake.maxConcurrentAnswers=$$refused >/dev/null 2>&1 \
+			|| { echo "chart-check FAILED: lake.maxConcurrentAnswers=$$refused rendered; it takes 1 to 8" >&2; exit 1; }; \
+	done
+	@echo "chart-check OK: the lake's whole answers at once, 2 by default and 1 to 8 alone; the platform's keys on the conductor alone, as files, only where the chart carries some, its current key by default; four components, the dashboard and the three ways it signs people in, the key and the settings key on the conductor alone, both key paths, refusals, migrations, no pinned uid, a plugin held to its side of the pod, its front door open to the dashboard alone, an Ingress only when asked for and HTTPS alone unless plain HTTP is, development only when asked for, the live shape there alone, a backup only when sealed and placed, and nothing an upgrade leaves behind"
 
 lint:
 	@$(DOCKER) build -f Dockerfile.rust --target lint $(VERDICT) . >/dev/null 2>&1 \

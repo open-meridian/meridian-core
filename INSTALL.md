@@ -408,6 +408,18 @@ lake's first bottleneck. The access records are the second: one answer of
 every person, group and permission, so a deployment past about 2,000 people
 is warned at its next upgrade.
 
+The lake's memory follows how many readers load a chain at once, not how much
+it keeps: each read's whole answer is built once, and a chain's statistics
+peak near 80 MiB while one is built. The lake builds two at once
+(`lake.maxConcurrentAnswers`, 1 to 8) and the rest wait their turn; each
+built answer is held for its next pages within 64 MiB in all, counted at what
+it really holds in memory. Set it to
+1 where the lake's memory limit is under 512 MiB, or where it has restarted
+for its memory while many readers loaded chains; a burst of readers then
+waits longer. Raise it only with the lake's limit raised to match, about
+80 MiB for each more ([deploy/chart/README.md](deploy/chart/README.md), "The
+lake's memory").
+
 ## What to back up
 
 If you pointed at a database you run, back it up as you back up any other.

@@ -262,6 +262,15 @@ lake:
   # 441 MiB resident with the default and 121 MiB with 2, the same live
   # heap (~62 MiB at its peak).
   mallocArenaMax: 2
+  # How many reads' whole answers the lake builds at once, 1 to 8 (rulings
+  # 957, 958). A read answered in pages builds its whole answer once, at
+  # its first page, copying its rows several times on the way: a chain's
+  # statistics, about 25,000 rows, peaked near 80 MiB each, and eight
+  # readers at once took dev's lake past its 1 GiB (2026-10-31). A read
+  # past the most waits for one to finish. 1 where the lake's memory is
+  # tight -- a limit under 512 MiB -- at the cost of readers waiting longer
+  # in a burst; more only with a limit raised to match.
+  maxConcurrentAnswers: 2
   database:
     existingSecret: ""
     key: ""

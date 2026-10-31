@@ -83,6 +83,12 @@ fn run() -> Result<(), String> {
     )?);
 
     let instance_id = var("MERIDIAN_INSTANCE_ID").unwrap_or_else(|| "lake-1".into());
+    // How many whole answers are built at once (the chart's
+    // lake.maxConcurrentAnswers; rulings 957, 958): refused, not guessed,
+    // outside 1 to 8.
+    let answers_at_once = meridian_lake::pages::answers_at_once(
+        var("MERIDIAN_LAKE_MAX_CONCURRENT_ANSWERS").as_deref(),
+    )?;
     // The analytics component, whose reads for a job are its client's (W12.2).
     if let Some(analytics) = var("MERIDIAN_ANALYTICS_INSTANCE_ID") {
         meridian_lake::service::reads_for_analytics(&analytics);
@@ -91,7 +97,8 @@ fn run() -> Result<(), String> {
     on_runtime(async {
         let bus = bus_from_env(&instance_id).await?;
         // Every handler and subscription in place before this returns.
-        let _lake = meridian_lake::service::serve(bus.clone(), Arc::clone(&store), clock());
+        let lake = meridian_lake::service::serve(bus.clone(), Arc::clone(&store), clock());
+        lake.build_at_most(answers_at_once);
 
         // W5.20, said on the bus for the instrument store to carry outward:
         // the component's health and schema, never a row or a dataset.
@@ -101,7 +108,12 @@ fn run() -> Result<(), String> {
         // Its own hop's ages, to the monitor (W4.16; ruling 606).
         tokio::spawn(meridian_runtime::report_latency_forever(bus.clone()));
 
-        tracing::info!(instance_id, started_at_ns = now_ns(), "the lake is serving");
+        tracing::info!(
+            instance_id,
+            answers_at_once,
+            started_at_ns = now_ns(),
+            "the lake is serving"
+        );
         ready.serving();
         shutdown().await;
         tracing::info!("stopping");

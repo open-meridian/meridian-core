@@ -1011,6 +1011,140 @@ async fn a_read_in_pages_is_answered_once_and_held_until_its_last_page() {
     );
 }
 
+/// A chain's quotes read in pages of 100, as of a cut-off (0: now).
+fn quotes_page(h: &Harness, as_of_ns: i64, cursor: &str) -> service::ReadAnswer {
+    h.lake
+        .read(
+            ReadRequest {
+                data_type: DataType::Quote,
+                subjects: subjects(AAPL),
+                kinds: vec![],
+                interval_ns: 0,
+                sources: None,
+                at_ns: 0,
+                business_date: String::new(),
+                valid_from_ns: 0,
+                valid_until_ns: 0,
+                as_of_ns,
+                page_size: 100,
+                cursor: cursor.into(),
+                after: None,
+                tenors: vec![],
+                published_as_of_ns: 0,
+                series_keys: vec![],
+                all_series: true,
+                dates: None,
+                window: Default::default(),
+                fields: Vec::new(),
+            },
+            &envelope("signal-1"),
+        )
+        .unwrap()
+}
+
+fn a_chain_of(h: &Harness, series: usize) {
+    let rows: Vec<Observation> = (0..series)
+        .map(|i| {
+            let key = format!("AAPL  261120C{:08}", 100_000 + i * 1000);
+            Observation::Quote(quote(&key, "1.00", "1.10", NOW - HOUR))
+        })
+        .collect();
+    for chunk in rows.chunks(100) {
+        record(h, "quotes", chunk.to_vec()).unwrap();
+    }
+}
+
+/// Ruling 957: an answer another reader's pushed out is answered again
+/// once and held again, not answered again at every page after; and its
+/// pages are still the one answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_reader_costs_the_first_one_answer_again_not_one_a_page() {
+    let h = harness();
+    a_chain_of(&h, 450);
+    let key_of = |row: &Observation| row.meta().series_key[0].value.clone();
+    tokio::task::block_in_place(|| {
+        quotes_page(&h, NOW, "");
+        // Room for one of the two answers, not both.
+        h.lake.hold_within(h.lake.held_bytes() * 3 / 2);
+        let first = quotes_page(&h, NOW, "");
+        let built = h.lake.answers_built();
+        // A second reader, at its own cut-off, pushes the first's out.
+        let other = quotes_page(&h, NOW + 1, "");
+        assert!(!other.next_cursor.is_empty());
+        assert_eq!(h.lake.answers_built(), built + 1);
+        assert_eq!(h.lake.held_pages(), 1, "one answer fits");
+        let mut paged: Vec<String> = first.rows.iter().map(key_of).collect();
+        let mut cursor = first.next_cursor.clone();
+        while !cursor.is_empty() {
+            let page = quotes_page(&h, 0, &cursor);
+            paged.extend(page.rows.iter().map(key_of));
+            cursor = page.next_cursor;
+        }
+        assert_eq!(
+            h.lake.answers_built(),
+            built + 2,
+            "the first reader's answer built again once, for its four pages after"
+        );
+        assert_eq!(paged.len(), 450);
+        let mut once = paged.clone();
+        once.sort();
+        once.dedup();
+        assert_eq!(
+            once.len(),
+            450,
+            "the pages are the one answer, each row once"
+        );
+    });
+}
+
+/// Rulings 957, 958: however many read at once, no more whole answers are
+/// built at once than lake.maxConcurrentAnswers says, and every read is
+/// answered whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_more_whole_answers_are_built_at_once_than_the_chart_says() {
+    for most in [1, 2] {
+        let h = Arc::new(harness());
+        a_chain_of(&h, 450);
+        h.lake.build_at_most(most);
+        let readers: Vec<_> = (0..8)
+            .map(|reader: i64| {
+                let h = Arc::clone(&h);
+                tokio::task::spawn_blocking(move || {
+                    let mut rows = 0;
+                    let mut cursor = String::new();
+                    loop {
+                        let page = quotes_page(&h, NOW + reader, &cursor);
+                        rows += page.rows.len();
+                        cursor = page.next_cursor;
+                        if cursor.is_empty() {
+                            return rows;
+                        }
+                    }
+                })
+            })
+            .collect();
+        for reader in readers {
+            assert_eq!(reader.await.unwrap(), 450, "each read answered whole");
+        }
+        assert!(
+            (1..=most).contains(&h.lake.most_built_at_once()),
+            "at most {most} at once, {} were",
+            h.lake.most_built_at_once()
+        );
+    }
+}
+
+/// Ruling 957 (b): the sweep hands freed memory back only while no whole
+/// answer is being built.
+#[tokio::test(flavor = "multi_thread")]
+async fn freed_memory_is_returned_only_while_nothing_is_built() {
+    let h = harness();
+    let building = h.lake.building().enter();
+    assert!(!h.lake.return_freed(), "an answer being built");
+    drop(building);
+    assert!(h.lake.return_freed(), "nothing being built");
+}
+
 /// A read over the bus as core reads, every field entitled: the handler's
 /// own checks and narrowing (contract v28, amended 2026-10-28).
 async fn asked<Q: Message, R: Message + Default>(
