@@ -142,6 +142,12 @@ pub struct BinaryEventContract {
     /// `percent`); empty where neither bound is set.
     #[prost(string, tag = "5")]
     pub bound_unit: ::prost::alloc::string::String,
+    /// Contract 28, amended 2026-10-31 (W1.1; ruling 954): the venue's primary
+    /// category for the market, in its own words -- a Kalshi series' category,
+    /// a Polymarket or Polymarket US event's primary tag label -- 0 to 64
+    /// characters; empty where the venue states none. No platform enum.
+    #[prost(string, tag = "6")]
+    pub category: ::prost::alloc::string::String,
 }
 /// One bound of a range market (A4): Kalshi's `greater` and
 /// `greater_or_equal` are inclusive false and true.
@@ -13647,6 +13653,13 @@ pub struct Price {
     pub price: ::core::option::Option<Money>,
     #[prost(enumeration = "PriceBasis", tag = "4")]
     pub basis: i32,
+    /// The source's stated interval around the price, plus or minus, in the
+    /// price's own unit (W10.4; contract 28, amended 2026-10-31, ruling 895):
+    /// Pyth's confidence beside its aggregate price. Unset where the source
+    /// states none; never negative. A dataset filling it declares
+    /// meridian.v1.Price.confidence among its data types.
+    #[prost(message, optional, tag = "5")]
+    pub confidence: ::core::option::Option<::meridian_pb::v1::Decimal>,
 }
 /// Open, high, low and close over an interval, the envelope's valid time: a
 /// daily bar names its business date. Empty `source.venue_id` is the
@@ -15075,28 +15088,39 @@ pub struct QuoteAtTrade {
     pub as_last_received: bool,
 }
 /// Contract v28: one value of a signal plugin's own series, naming its rule and
-/// inputs, never presented as a publisher's figure (contract v28).
+/// inputs, never presented as a publisher's figure; from the amendment of
+/// 2026-10-31 (ruling 955), or a publisher's figure a data plugin records,
+/// marked published_by.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DerivedSeries {
-    /// Its key, subject, the signal plugin's own derived dataset, its business
-    /// date and version. Never unset.
+    /// Its key, subject, the recording plugin's own dataset, its business date
+    /// and version. Never unset.
     #[prost(message, optional, tag = "1")]
     pub meta: ::core::option::Option<ObservationMeta>,
     /// Its own name for it: iv30, the index's level, a positioning summary's
-    /// part. Never empty.
+    /// part; for a publisher's figure, its name for the publisher's series.
+    /// Never empty.
     #[prost(string, tag = "2")]
     pub series: ::prost::alloc::string::String,
-    /// As derived. Never unset.
+    /// As derived, or as the publisher states it where published_by is set.
+    /// Never unset.
     #[prost(message, optional, tag = "3")]
     pub value: ::core::option::Option<UnitValue>,
-    /// A definition and its version, an analytics measure's where one was used.
-    /// Never unset.
+    /// A definition and its version, an analytics measure's where one was used;
+    /// for a publisher's figure, the publisher's definition. Never unset.
     #[prost(message, optional, tag = "4")]
     pub rule: ::core::option::Option<MeasureRef>,
     /// Each dataset read and the as-of it was read at, so licences and counts can
-    /// follow it. Never empty.
+    /// follow it. Never empty on a value the plugin derived; may be empty on a
+    /// publisher's figure.
     #[prost(message, repeated, tag = "5")]
     pub inputs: ::prost::alloc::vec::Vec<DerivedInput>,
+    /// Contract 28, amended 2026-10-31 (W10.4; ruling 955): whose figure the
+    /// value is, in words, 0 to 64 characters -- a data plugin's row records a
+    /// publisher's figure and is refused without it; empty on a signal plugin's
+    /// own measure. A page shows it labelled with whose, never as our measure.
+    #[prost(string, tag = "6")]
+    pub published_by: ::prost::alloc::string::String,
 }
 /// Contract v28 (DerivedSeries.inputs): names what the value was derived from.
 #[derive(Clone, PartialEq, ::prost::Message)]

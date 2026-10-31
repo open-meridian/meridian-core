@@ -974,9 +974,19 @@ fn lake_listing() -> meridian_domain::v1::ListDatasetsReply {
                         kept: k != 1,
                         retention_days: if k == 2 { 3650 } else { 0 },
                         personal_use: n == 2,
+                        // Contract 28, amended 2026-10-31 (ruling 896): the
+                        // source behind the vendor, one long enough to be cut.
+                        underlying_source: match n {
+                            5 => "Nasdaq, NYSE and Cboe summary feeds, consolidated by the aggregator"
+                                .into(),
+                            6 => "US equity SIPs (CTA, UTP)".into(),
+                            _ => String::new(),
+                        },
                         ..Default::default()
                     }),
                     day_time_zone: "America/New_York".into(),
+                    // Ruling 906: each class, and not stated.
+                    price_source_class: (n % 5) as i32,
                     ..Default::default()
                 }),
                 unconverted_count: (n * 3 + k) as u64 * 7,

@@ -362,7 +362,7 @@ fn value_schema() -> Value {
             ]),
             "binary_event_contract": {
                 "type": "object",
-                "description": "a binary event contract's terms: what one contract pays if the event happens, and when trading closes (0 for none stated)",
+                "description": "a binary event contract's terms: what one contract pays if the event happens, when trading closes (0 for none stated), and the venue's category for the market in its own words (empty for none stated)",
                 "properties": {
                     "payout": {
                         "type": "object",
@@ -375,6 +375,7 @@ fn value_schema() -> Value {
                         "additionalProperties": false,
                     },
                     "closes_at_ns": {"type": "integer", "minimum": 0},
+                    "category": {"type": "string", "maxLength": 64, "description": "the venue's category for the market, in its words"},
                 },
                 "required": ["payout"],
                 "additionalProperties": false,
@@ -781,7 +782,14 @@ fn value(
             let terms = object_fields(held, &at, problems)?;
             only(
                 terms,
-                &["payout", "closes_at_ns", "floor", "cap", "bound_unit"],
+                &[
+                    "payout",
+                    "closes_at_ns",
+                    "floor",
+                    "cap",
+                    "bound_unit",
+                    "category",
+                ],
                 &at,
                 problems,
             );
@@ -822,6 +830,8 @@ fn value(
                 floor: bound_of(terms, "floor", &at, problems),
                 cap: bound_of(terms, "cap", &at, problems),
                 bound_unit: text(terms, "bound_unit", &at, false, problems),
+                // Contract 28, amended 2026-10-31 (ruling 954).
+                category: text(terms, "category", &at, false, problems),
             })
         }
         "currency" => match held.as_str() {
@@ -1053,6 +1063,8 @@ fn contract_json(contract: &meridian_domain::v1::BinaryEventContract) -> Value {
             "instrument_id": payout.instrument_id,
         },
         "closes_at_ns": contract.closes_at_ns,
+        // Contract 28, amended 2026-10-31 (ruling 954): the venue's words.
+        "category": super::others_words(&contract.category),
     })
 }
 

@@ -724,7 +724,11 @@ impl Observation {
         }
         match (self, other) {
             (Observation::Price(a), Observation::Price(b)) => {
-                a.kind == b.kind && a.basis == b.basis && same_money(&a.price, &b.price)
+                a.kind == b.kind
+                    && a.basis == b.basis
+                    && same_money(&a.price, &b.price)
+                    // Contract 28, amended 2026-10-31 (ruling 895).
+                    && same_decimal(&a.confidence, &b.confidence)
             }
             (Observation::Bar(a), Observation::Bar(b)) => {
                 same_money(&a.open, &b.open)
@@ -830,6 +834,8 @@ impl Observation {
                         == (vb.unit, &vb.index_base, &vb.ucum_code)
                     && a.rule == b.rule
                     && a.inputs == b.inputs
+                    // Contract 28, amended 2026-10-31 (ruling 955).
+                    && a.published_by == b.published_by
             }
             (Observation::Scenario(a), Observation::Scenario(b)) => {
                 a.scenario == b.scenario

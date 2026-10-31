@@ -162,7 +162,7 @@ platform.deployment.event.plugin-report	event	sidecar	dashboard,conductor
 platform.lake.command.decline-want	command	data	lake
 platform.lake.command.record-bars	command	data	lake
 platform.lake.command.record-corporate-actions	command	data	lake
-platform.lake.command.record-derived-series	command	signal	lake
+platform.lake.command.record-derived-series	command	signal,data	lake
 platform.lake.command.record-execution-costs	command	analytics	lake
 platform.lake.command.record-filings	command	data	lake
 platform.lake.command.record-holdings	command	data	lake

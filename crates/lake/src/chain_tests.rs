@@ -737,6 +737,7 @@ async fn a_signal_plugins_derived_series_and_saved_scenarios_are_kept_and_read()
             dataset: CHAIN.into(),
             as_of_ns: NOW - HOUR,
         }],
+        published_by: String::new(),
     };
     let record_as = |field: &str, rows: Vec<Observation>| {
         tokio::task::block_in_place(|| h.lake.record(field, rows, "", &envelope("signal-1")))
@@ -758,6 +759,26 @@ async fn a_signal_plugins_derived_series_and_saved_scenarios_are_kept_and_read()
     assert!(record_as("values", vec![Observation::Derived(ruleless)])
         .unwrap_err()
         .contains("values[0].rule"));
+    // Contract 28, amended 2026-10-31 (ruling 955): a publisher's figure
+    // says whose and may name no input; a value the plugin derived names
+    // its inputs; whose is at most 64 characters.
+    let mut published = iv30("2026-10-05", "16.42");
+    published.inputs.clear();
+    published.published_by = "Cboe".into();
+    assert_eq!(
+        record_as("values", vec![Observation::Derived(published.clone())]).unwrap(),
+        (1, 0, 0)
+    );
+    let mut unnamed = published.clone();
+    unnamed.published_by = String::new();
+    assert!(record_as("values", vec![Observation::Derived(unnamed)])
+        .unwrap_err()
+        .contains("values[0].inputs"));
+    let mut wordy = published;
+    wordy.published_by = "x".repeat(65);
+    assert!(record_as("values", vec![Observation::Derived(wordy)])
+        .unwrap_err()
+        .contains("values[0].published_by"));
     let listed = tokio::task::block_in_place(|| {
         h.lake.list_derived_series(
             ListDerivedSeriesRequest {

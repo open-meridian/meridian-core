@@ -28772,6 +28772,25 @@
       "store": "instrument"
     },
     {
+      "name": "meridian.v1.BinaryEventContract.category",
+      "type": "text",
+      "bounds": {
+        "length": [
+          0,
+          64
+        ]
+      },
+      "empty": "empty: the venue states none",
+      "intent": "says what a market is about, in the venue's own word for it (W1.1; amended 2026-10-31, ruling 954)",
+      "meaning": "the venue's primary category for the market, as the venue words it -- a series' category, or an event's primary tag label where the venue tags its events: Economics, Politics, Climate and Weather; recorded by the venue's plugin and carried on the platform master's record too",
+      "not_meaning": "a platform taxonomy or enum, of which there is none; the venue's other tags; an asset class",
+      "filled": "as-reported",
+      "filled_by": "instrument",
+      "since": "v28",
+      "stability": "preview",
+      "store": "instrument"
+    },
+    {
       "name": "meridian.v1.EventContractBound.value",
       "type": "Decimal",
       "bounds": {
@@ -31304,6 +31323,27 @@
       "filled": "as-reported",
       "filled_by": "data",
       "since": "v18",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.Price.confidence",
+      "type": "Decimal",
+      "bounds": {
+        "digits": 38,
+        "scale": [
+          0,
+          18
+        ]
+      },
+      "unit": "the price's own unit: the major unit of the asset the price names, per one unit of the subject",
+      "empty": "unset: the source states none",
+      "intent": "says how far either side of the price the source holds the price may be (amended 2026-10-31, ruling 895)",
+      "meaning": "the source's stated confidence interval around the price, plus or minus, as the source states it beside the price -- Pyth's confidence beside its aggregate price; never negative, a negative one refused naming it; a dataset filling it declares it among its data types",
+      "not_meaning": "a bid-ask spread; a percent or a probability; a figure the plugin computes",
+      "filled": "as-reported",
+      "filled_by": "data",
+      "since": "v28",
       "stability": "preview",
       "store": "lake"
     },
@@ -37316,7 +37356,7 @@
       "type": "message ObservationMeta",
       "empty": "never unset",
       "intent": "carries a derived value's envelope",
-      "meaning": "its key, subject, the signal plugin's own derived dataset, its business date and version",
+      "meaning": "its key, subject, the recording plugin's own dataset -- a signal plugin's derived dataset, or a data plugin's dataset of publishers' figures (amended 2026-10-31) -- its business date and version",
       "not_meaning": "its value",
       "filled": "as-reported",
       "filled_by": "signal",
@@ -37335,7 +37375,7 @@
       },
       "empty": "never empty",
       "intent": "names the plugin's series",
-      "meaning": "its own name for it: iv30, the index's level, a positioning summary's part",
+      "meaning": "its own name for it: iv30, the index's level, a positioning summary's part; for a publisher's figure, the plugin's name for the publisher's series",
       "not_meaning": "a publisher's series ID",
       "filled": "as-reported",
       "filled_by": "signal",
@@ -37348,11 +37388,18 @@
       "type": "message UnitValue",
       "empty": "never unset",
       "intent": "carries the value with its unit",
-      "meaning": "as derived",
-      "not_meaning": "a publisher's figure",
+      "meaning": "as derived, or, where published_by is set, as the publisher states it",
+      "not_meaning": "a publisher's figure shown as our measure: published_by says whose",
       "filled": "as-reported",
       "filled_by": "signal",
       "since": "v28",
+      "changes": [
+        {
+          "version": "v28",
+          "kind": "clarified",
+          "what": "amended 2026-10-31 (ruling 955): a data plugin's row carries the publisher's figure, published_by naming whose"
+        }
+      ],
       "stability": "preview",
       "store": "lake"
     },
@@ -37361,11 +37408,18 @@
       "type": "message MeasureRef",
       "empty": "never unset",
       "intent": "names how the value was derived",
-      "meaning": "a definition and its version, an analytics measure's where one was used",
+      "meaning": "a definition and its version, an analytics measure's where one was used; for a publisher's figure, the publisher's definition (amended 2026-10-31, ruling 955)",
       "not_meaning": "an implementation",
       "filled": "as-reported",
       "filled_by": "signal",
       "since": "v28",
+      "changes": [
+        {
+          "version": "v28",
+          "kind": "clarified",
+          "what": "amended 2026-10-31 (ruling 955): a publisher's figure names the publisher's definition"
+        }
+      ],
       "stability": "preview",
       "store": "lake"
     },
@@ -37374,16 +37428,50 @@
       "type": "repeated message DerivedInput",
       "bounds": {
         "count": [
-          1,
+          0,
           32
         ]
       },
-      "empty": "never empty",
+      "empty": "never empty on a value the plugin derived; may be empty on a publisher's figure, where published_by is set (amended 2026-10-31, ruling 955)",
       "intent": "names what the value was derived from",
       "meaning": "each dataset read and the as-of it was read at, so licences and counts can follow it",
       "not_meaning": "the values themselves",
       "filled": "as-reported",
       "filled_by": "signal",
+      "since": "v28",
+      "changes": [
+        {
+          "version": "v28",
+          "kind": "widened",
+          "what": "amended 2026-10-31 (ruling 955): empty on a publisher's figure",
+          "was": {
+            "bounds": {
+              "count": [
+                1,
+                32
+              ]
+            }
+          }
+        }
+      ],
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.DerivedSeries.published_by",
+      "type": "text",
+      "bounds": {
+        "length": [
+          0,
+          64
+        ]
+      },
+      "empty": "empty: the recording plugin's own measure, derived by its rule from its inputs",
+      "intent": "marks a value as the publisher's figure and says whose (W10.4; amended 2026-10-31, ruling 955)",
+      "meaning": "the publisher whose figure the value is, in words -- an index's publisher, a vendor's own computed figure -- recorded by a data plugin as the publisher states it; a page shows it labelled with whose, never as our measure; a data plugin's row without it is refused",
+      "not_meaning": "the plugin or dataset that recorded it, which the envelope names; a contributor to an aggregate",
+      "filled": "as-reported",
+      "filled_by": "data",
       "since": "v28",
       "stability": "preview",
       "store": "lake"
@@ -37425,8 +37513,8 @@
       },
       "empty": "never empty",
       "intent": "carries a batch of derived values (W10.4)",
-      "meaning": "1 to 500 rows, recorded whole or refused naming the item and field",
-      "not_meaning": "a publisher's rows",
+      "meaning": "1 to 500 rows, recorded whole or refused naming the item and field; from a data plugin, publishers' figures, each naming whose (amended 2026-10-31, ruling 955)",
+      "not_meaning": "a publisher's figure presented as the plugin's own measure",
       "filled": "as-reported",
       "filled_by": "signal",
       "since": "v28",
@@ -48076,6 +48164,41 @@
       "store": "sidecar"
     },
     {
+      "name": "meridian.v1.DatasetDeclaration.price_source_class",
+      "type": "enum PriceSourceClass",
+      "allowed": [
+        {
+          "value": "PRICE_SOURCE_CLASS_UNSPECIFIED",
+          "meaning": "not stated, as in every catalogue before the amendment"
+        },
+        {
+          "value": "PRICE_SOURCE_CLASS_TRADED",
+          "meaning": "prices of trades done: a venue's last, its close or its settlement"
+        },
+        {
+          "value": "PRICE_SOURCE_CLASS_FIRM_QUOTE",
+          "meaning": "prices someone stands ready to deal at: a venue's or a dealer's executable bid and ask, and the mid between them"
+        },
+        {
+          "value": "PRICE_SOURCE_CLASS_COMPOSITE",
+          "meaning": "an aggregate of several contributors' prices by the vendor's stated method, as Pyth's aggregate of its publishers is"
+        },
+        {
+          "value": "PRICE_SOURCE_CLASS_EVALUATED",
+          "meaning": "a pricing service's or a model's evaluation, not a price dealt or offered, as an evaluated bond price or a vendor's model price is"
+        }
+      ],
+      "empty": "unspecified: not stated",
+      "intent": "says what class of source a dataset's prices come from (W10.1; amended 2026-10-31, ruling 906)",
+      "meaning": "one class for the dataset, beside its vendor, its aggregator and its terms' underlying source; each price keeps its real kind -- bid, mid, ask, close, last -- and the class says what stands behind it: Pyth's is a mid of class composite, an evaluated bond price a bid, mid and ask of class evaluated; shown on the Data sources page and answered by dashboard__list_datasets",
+      "not_meaning": "a price kind, of which none is added; a quality state; an order a default read takes, which the deployment's source priority sets (W10.2)",
+      "filled": "as-reported",
+      "filled_by": "data",
+      "since": "v28",
+      "stability": "preview",
+      "store": "sidecar"
+    },
+    {
       "name": "meridian.v1.DatasetLicence.terms_version",
       "type": "text",
       "empty": "empty: not stated",
@@ -48186,11 +48309,18 @@
       "type": "text",
       "empty": "empty: none behind the vendor",
       "intent": "names the licensing source behind the vendor, where one is",
-      "meaning": "the source whose terms the vendor passes on, as the vendor names it, so counts can be kept per source as well as per dataset (ruling 387)",
-      "not_meaning": "the vendor or the aggregator, which the catalogue names",
+      "meaning": "the source whose terms the vendor passes on, as the vendor names it, so counts can be kept per source as well as per dataset (ruling 387); where the vendor serves an aggregate, whose aggregate it is, in words -- Pyth's aggregate of its publishers. A data plugin declares it in its catalogue's default terms, through the SDK's typed declaration from contract 28 as amended 2026-10-31 (ruling 896); the deployment's licence keeps it unless the deployment admin changes it (W10.1); shown on the Data sources page and answered by dashboard__list_datasets",
+      "not_meaning": "the vendor or the aggregator, which the catalogue names; the class of source, which DatasetDeclaration.price_source_class says",
       "filled": "entered",
       "filled_by": "dashboard",
       "since": "v27",
+      "changes": [
+        {
+          "version": "v28",
+          "kind": "clarified",
+          "what": "amended 2026-10-31 (ruling 896): a data plugin declares it through the SDK's typed declaration, naming whose aggregate where the vendor serves one; the Data sources page shows it"
+        }
+      ],
       "stability": "preview",
       "store": "sidecar"
     },

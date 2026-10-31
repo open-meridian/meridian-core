@@ -230,6 +230,13 @@ message Price {
   Money price = 3;
 
   PriceBasis basis = 4;
+
+  // The source's stated interval around the price, plus or minus, in the
+  // price's own unit (W10.4; contract 28, amended 2026-10-31, ruling 895):
+  // Pyth's confidence beside its aggregate price. Unset where the source
+  // states none; never negative. A dataset filling it declares
+  // meridian.v1.Price.confidence among its data types.
+  optional Decimal confidence = 5;
 }
 
 // Which price.
@@ -1672,22 +1679,32 @@ enum StatisticKind {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Contract v28: one value of a signal plugin's own series, naming its rule and
-// inputs, never presented as a publisher's figure (contract v28).
+// inputs, never presented as a publisher's figure; from the amendment of
+// 2026-10-31 (ruling 955), or a publisher's figure a data plugin records,
+// marked published_by.
 message DerivedSeries {
-  // Its key, subject, the signal plugin's own derived dataset, its business
-  // date and version. Never unset.
+  // Its key, subject, the recording plugin's own dataset, its business date
+  // and version. Never unset.
   ObservationMeta meta = 1;
   // Its own name for it: iv30, the index's level, a positioning summary's
-  // part. Never empty.
+  // part; for a publisher's figure, its name for the publisher's series.
+  // Never empty.
   string series = 2;
-  // As derived. Never unset.
-  UnitValue value = 3;
-  // A definition and its version, an analytics measure's where one was used.
+  // As derived, or as the publisher states it where published_by is set.
   // Never unset.
+  UnitValue value = 3;
+  // A definition and its version, an analytics measure's where one was used;
+  // for a publisher's figure, the publisher's definition. Never unset.
   MeasureRef rule = 4;
   // Each dataset read and the as-of it was read at, so licences and counts can
-  // follow it. Never empty.
+  // follow it. Never empty on a value the plugin derived; may be empty on a
+  // publisher's figure.
   repeated DerivedInput inputs = 5;
+  // Contract 28, amended 2026-10-31 (W10.4; ruling 955): whose figure the
+  // value is, in words, 0 to 64 characters -- a data plugin's row records a
+  // publisher's figure and is refused without it; empty on a signal plugin's
+  // own measure. A page shows it labelled with whose, never as our measure.
+  string published_by = 6;
 }
 
 // Contract v28 (DerivedSeries.inputs): names what the value was derived from.

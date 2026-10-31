@@ -13,7 +13,8 @@
 use meridian_pb::v1::{
     AlgorithmDeclaration, Catalogue, CopyrightClass, DataEligibility, DataUse, DatasetDeclaration,
     DatasetLicence, Decimal, DerivedUse, NotCarried, NotCarriedReason, ObservationMode,
-    PluginDeclaration, PricingModelDeclaration, RawRecordKind, Redistribution, StorageDeclaration,
+    PluginDeclaration, PriceSourceClass, PricingModelDeclaration, RawRecordKind, Redistribution,
+    StorageDeclaration,
 };
 
 /// The declaration as the CLI sends it, in JSON.
@@ -125,6 +126,11 @@ pub struct DeclaredDataset {
     /// Its declared delay (W10.1, contract v27): 0 or absent for real time.
     #[serde(default)]
     pub declared_delay_ns: i64,
+    /// What class of source its prices come from (W10.1; contract 28,
+    /// amended 2026-10-31, ruling 906), by its word (`composite`) or the
+    /// enum's name; empty or absent for not stated.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub price_source_class: String,
 }
 
 #[derive(Debug, Default, Clone, serde::Deserialize, serde::Serialize)]
@@ -162,6 +168,11 @@ pub struct DeclaredLicence {
     pub no_more_restrictive_terms: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub not_affiliated_notice: String,
+    /// The source behind the vendor, or whose aggregate it serves (ruling
+    /// 387; contract 28, amended 2026-10-31, ruling 896), as the SDK uploads
+    /// it: the plugin's words, absent where none is declared.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub underlying_source: String,
     /// Who may take the dataset under its terms (contract v28, rulings 491
     /// and 597), as the SDK uploads it from 0.33.0: absent where the terms
     /// state none. Without it here, a registration carrying it differed from
@@ -474,6 +485,34 @@ pub fn copyright_class_word(class: i32) -> &'static str {
     }
 }
 
+/// A class of source from its word (`firm_quote`) or the enum's name;
+/// empty is not stated, anything else `None` (contract 28, amended
+/// 2026-10-31, ruling 906).
+pub fn price_source_class_of(text: &str) -> Option<PriceSourceClass> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Some(PriceSourceClass::Unspecified);
+    }
+    PriceSourceClass::from_str_name(text).or_else(|| {
+        PriceSourceClass::from_str_name(&format!(
+            "PRICE_SOURCE_CLASS_{}",
+            text.to_ascii_uppercase()
+        ))
+    })
+}
+
+/// A class of source's word, as an upload carries it, the catalogue lists
+/// it and core's pages and tools say it; empty for not stated.
+pub fn price_source_class_word(class: i32) -> &'static str {
+    match PriceSourceClass::try_from(class) {
+        Ok(PriceSourceClass::Traded) => "traded",
+        Ok(PriceSourceClass::FirmQuote) => "firm_quote",
+        Ok(PriceSourceClass::Composite) => "composite",
+        Ok(PriceSourceClass::Evaluated) => "evaluated",
+        _ => "",
+    }
+}
+
 /// A derived-data answer's word, as an upload carries it.
 pub fn derived_use_word(terms: i32) -> &'static str {
     match DerivedUse::try_from(terms) {
@@ -497,6 +536,14 @@ fn catalogue_from_json(catalogue: &DeclaredCatalogue) -> Result<Catalogue, Strin
             })?;
             modes.push(mode as i32);
         }
+        let price_source_class =
+            price_source_class_of(&dataset.price_source_class).ok_or_else(|| {
+                format!(
+                    "declaration.catalogue.datasets[{i}].price_source_class {:?} is none of \
+                     traded, firm_quote, composite and evaluated",
+                    dataset.price_source_class
+                )
+            })?;
         let licence_default = match &dataset.licence_default {
             None => None,
             Some(l) => {
@@ -550,6 +597,7 @@ fn catalogue_from_json(catalogue: &DeclaredCatalogue) -> Result<Catalogue, Strin
                     copyright_class: copyright_class as i32,
                     no_more_restrictive_terms: l.no_more_restrictive_terms,
                     not_affiliated_notice: l.not_affiliated_notice.clone(),
+                    underlying_source: l.underlying_source.clone(),
                     eligibility,
                     ..Default::default()
                 };
@@ -571,6 +619,7 @@ fn catalogue_from_json(catalogue: &DeclaredCatalogue) -> Result<Catalogue, Strin
             venue_id: dataset.venue_id.clone(),
             calendar_id: dataset.calendar_id.clone(),
             declared_delay_ns: dataset.declared_delay_ns,
+            price_source_class: price_source_class as i32,
         });
     }
     Ok(Catalogue { datasets })
@@ -608,12 +657,14 @@ pub fn dataset_json(dataset: &DatasetDeclaration) -> serde_json::Value {
             "copyright_class": copyright_class_word(l.copyright_class),
             "no_more_restrictive_terms": l.no_more_restrictive_terms,
             "not_affiliated_notice": l.not_affiliated_notice,
+            "underlying_source": l.underlying_source,
         }))),
         "day_time_zone": dataset.day_time_zone,
         "day_end_minute": dataset.day_end_minute,
         "venue_id": dataset.venue_id,
         "calendar_id": dataset.calendar_id,
         "declared_delay_ns": dataset.declared_delay_ns,
+        "price_source_class": price_source_class_word(dataset.price_source_class),
     })
 }
 
@@ -804,6 +855,67 @@ mod tests {
         assert!(from_json(&bad)
             .unwrap_err()
             .contains("licence_default.redistribution"));
+    }
+
+    /// Contract 28, amended 2026-10-31 (rulings 896 and 906): a dataset's
+    /// class of source and its terms' underlying source travel as the SDK
+    /// uploads them, so a registration carrying them matches its upload.
+    #[test]
+    fn a_datasets_class_of_source_and_underlying_source_travel_as_the_sdk_uploads_them() {
+        let declared: Declared = serde_json::from_value(serde_json::json!({
+            "catalogue": {"datasets": [{
+                "key": "crypto", "vendor": "Pyth", "modes": ["stream"],
+                "data_types": ["meridian.v1.Price", "meridian.v1.Price.confidence"],
+                "price_source_class": "composite",
+                "licence_default": {
+                    "kept": true, "retention_days": 0, "derived_use": true,
+                    "derived_use_terms": "not_restricted", "display": true,
+                    "default_fields": [], "personal_use": false,
+                    "underlying_source": "Pyth's aggregate of its publishers"
+                }
+            }]}
+        }))
+        .unwrap();
+        let declaration = from_json(&declared).unwrap();
+        let dataset = &declaration.catalogue.as_ref().unwrap().datasets[0];
+        assert_eq!(
+            dataset.price_source_class,
+            PriceSourceClass::Composite as i32
+        );
+        assert_eq!(
+            dataset.licence_default.as_ref().unwrap().underlying_source,
+            "Pyth's aggregate of its publishers"
+        );
+        // Printed back by the same words, so a second read is the same.
+        let back = to_json(&declaration);
+        let printed = &back["catalogue"]["datasets"][0];
+        assert_eq!(printed["price_source_class"], "composite");
+        assert_eq!(
+            printed["licence_default"]["underlying_source"],
+            "Pyth's aggregate of its publishers"
+        );
+        let again: Declared = serde_json::from_value(back).unwrap();
+        assert_eq!(from_json(&again).unwrap(), declaration);
+        // Each word and the enum's name; absent or empty is not stated.
+        for (word, class) in [
+            ("traded", PriceSourceClass::Traded),
+            ("firm_quote", PriceSourceClass::FirmQuote),
+            ("PRICE_SOURCE_CLASS_EVALUATED", PriceSourceClass::Evaluated),
+            ("", PriceSourceClass::Unspecified),
+        ] {
+            let mut said = declared.clone();
+            said.catalogue.as_mut().unwrap().datasets[0].price_source_class = word.into();
+            assert_eq!(
+                from_json(&said).unwrap().catalogue.unwrap().datasets[0].price_source_class,
+                class as i32,
+                "{word}"
+            );
+        }
+        let mut bad = declared.clone();
+        bad.catalogue.as_mut().unwrap().datasets[0].price_source_class = "indicative".into();
+        assert!(from_json(&bad)
+            .unwrap_err()
+            .contains("catalogue.datasets[0].price_source_class"));
     }
 
     /// SDK 0.33.x's DatasetLicence._to_json with an eligibility (contract

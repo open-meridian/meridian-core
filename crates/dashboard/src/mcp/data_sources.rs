@@ -83,8 +83,10 @@ sign of life and its backlog's peak. Measured by the plugins and core, never a p
         "list_datasets",
         "List datasets",
         "every dataset a launched plugin's catalogue serves the lake: its catalogue entry (vendor, \
-aggregator, data types, modes, cadence, history, its business day's time zone and end, its venue), \
-the licence enforced -- the deployment's, or the catalogue's default until one is set -- the \
+aggregator, data types, modes, cadence, history, its business day's time zone and end, its venue, \
+the class of source its prices come from -- traded, firm_quote, composite or evaluated, empty for \
+not stated), the licence enforced -- the deployment's, or the catalogue's default until one is set, \
+with the source behind the vendor or whose aggregate it serves -- the \
 plugins entitled to it, how many of its values were left unconverted and how many identifiers \
 and venues its plugin reported missing, how many of its daily values are dated on a closed day of \
 its calendar and how many outside the calendar's coverage, and a warning where its terms are one \
@@ -290,6 +292,9 @@ fn licence_json(licence: &DatasetLicence, set: bool) -> Value {
         ),
         "no_more_restrictive_terms": licence.no_more_restrictive_terms,
         "not_affiliated_notice": others_words(&licence.not_affiliated_notice),
+        // Contract 28, amended 2026-10-31 (ruling 896): the source behind
+        // the vendor, or whose aggregate it serves, in the plugin's words.
+        "underlying_source": others_words(&licence.underlying_source),
         // Contract v28 (491, 597): who may take it, as the terms state.
         "eligibility": licence.eligibility.as_ref().map(|e| json!({
             "uses": e.uses.iter().map(|u| match meridian_pb::v1::DataUse::try_from(*u) {
