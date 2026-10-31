@@ -655,33 +655,50 @@ fn serve_lifecycle(bus: &Arc<Bus>, store: &Arc<dyn Store>, clock: &Arc<dyn Clock
         bus.serve(LIST_LIFECYCLE_EVENTS, move |envelope| {
             let request: ListLifecycleEventsRequest =
                 decode(&envelope, "meridian.v1.ListLifecycleEventsRequest")?;
-            if request.account_id.is_empty() {
-                return Err(meridian_bus::refusal_with_status(
-                    meridian_bus::RefusalStatus::InvalidArgument,
-                    &["account_id".to_string()],
-                    "account_id: an account in the reader's scope".to_string(),
-                ));
-            }
-            if !scope_of(&envelope).holds(&request.account_id) {
+            let scope = scope_of(&envelope);
+            if !request.account_id.is_empty() && !scope.holds(&request.account_id) {
                 return Err(format!(
                     "{} is outside the reader's scope",
                     request.account_id
                 ));
             }
-            let book = reading
-                .book(&request.account_id)
-                .map_err(|failed| failed.on_the_bus())?;
-            let since = crate::store::mark_of(request.since.as_ref())
-                .and_then(|mark| mark.get(&book.partition).copied())
-                .unwrap_or(0);
-            let all = crate::lifecycle::listed(
-                &book,
-                &request.instrument_id,
-                &request.kinds,
-                &request.from_date,
-                &request.to_date,
-                since,
-            );
+            // Contract v29 (ruling 740; W9.19): no account names every
+            // account in the reader's scope, as ListPositions does, each
+            // event naming its account; in account order, each account's
+            // in its book's sequence.
+            let accounts = if request.account_id.is_empty() {
+                reading
+                    .accounts()
+                    .map_err(|failed| failed.on_the_bus())?
+                    .into_iter()
+                    .filter(|account| scope.holds(account))
+                    .collect::<Vec<_>>()
+            } else {
+                vec![request.account_id.clone()]
+            };
+            let since_mark = crate::store::mark_of(request.since.as_ref());
+            let mut all = Vec::new();
+            let mut partitions = Vec::new();
+            for account in &accounts {
+                let book = reading
+                    .book(account)
+                    .map_err(|failed| failed.on_the_bus())?;
+                let since = since_mark
+                    .as_ref()
+                    .and_then(|mark| mark.get(&book.partition).copied())
+                    .unwrap_or(0);
+                all.extend(crate::lifecycle::listed(
+                    &book,
+                    &request.instrument_id,
+                    &request.kinds,
+                    &request.from_date,
+                    &request.to_date,
+                    since,
+                ));
+                if !partitions.contains(&book.partition) {
+                    partitions.push(book.partition.clone());
+                }
+            }
             let limit = crate::store::page_limit(
                 request.page_size as i32,
                 bounds::LIST_LIFECYCLE_EVENTS_REQUEST_PAGE_SIZE_RANGE,
@@ -691,8 +708,10 @@ fn serve_lifecycle(bus: &Arc<Bus>, store: &Arc<dyn Store>, clock: &Arc<dyn Clock
             let next = offset + page.len();
             let heads = reading.heads().map_err(|failed| failed.on_the_bus())?;
             let mut as_of = crate::store::Mark::new();
-            if let Some(head) = heads.get(&book.partition) {
-                as_of.insert(book.partition.clone(), *head);
+            for partition in &partitions {
+                if let Some(head) = heads.get(partition) {
+                    as_of.insert(partition.clone(), *head);
+                }
             }
             let mut reply = ListLifecycleEventsReply {
                 events: page,

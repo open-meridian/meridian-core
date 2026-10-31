@@ -377,6 +377,23 @@ async fn a_proposal_is_answered_by_the_report_and_a_variation_released_with_a_no
             .count(),
         2
     );
+    // Contract v29 (ruling 740; W9.19): naming no account answers every
+    // account in the reader's scope, each event naming its account.
+    let every = ListLifecycleEventsReply::decode(
+        &send(
+            &bus,
+            LIST_LIFECYCLE_EVENTS,
+            "meridian.v1.ListLifecycleEventsRequest",
+            &ListLifecycleEventsRequest::default(),
+            None,
+        )
+        .await
+        .unwrap()[..],
+    )
+    .unwrap();
+    assert_eq!(every.events, listed.events);
+    assert!(every.events.iter().all(|e| e.account_id == ACC));
+    assert!(every.as_of.is_some_and(|mark| !mark.partitions.is_empty()));
 }
 
 #[tokio::test(flavor = "multi_thread")]
