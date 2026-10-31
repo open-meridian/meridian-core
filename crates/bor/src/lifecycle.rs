@@ -654,7 +654,7 @@ fn spread(total: Exact, weights: &[Exact]) -> Result<Vec<Exact>> {
 /// of the instrument settling within a coupon's period -- returned by the
 /// coupon, never income -- from its bookings and the allocations it
 /// received; at most the coupon itself.
-fn purchased_accrued(book: &Book, event: &LifecycleEvent) -> Result<Exact> {
+pub(crate) fn purchased_accrued(book: &Book, event: &LifecycleEvent) -> Result<Exact> {
     let ledger = &book.ledger;
     let side_of = |order_id: &str| {
         ledger

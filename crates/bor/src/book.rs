@@ -721,8 +721,10 @@ impl Book {
             let reference = refs[&key].clone();
             let sale = sales
                 .iter()
-                .find(|(instrument, _, _)| crate::became::same(instrument, &line.instrument_id))
-                .map(|(_, price, date)| (price, date.as_str()));
+                .find(|(instrument, _, _, _)| {
+                    crate::became::same(instrument, &line.instrument_id)
+                })
+                .map(|(_, price, date, factored)| (price, date.as_str(), *factored));
             let quantity = numbers::required(
                 &format!("the line on {}'s quantity", line.instrument_id),
                 line.quantity.as_ref(),
@@ -1227,7 +1229,15 @@ pub fn side_named(side: i32) -> &'static str {
 /// entry's date, or a booking's own allocation. None for an entry with no
 /// execution behind it -- a transfer, a correction -- whose reliefs carry no
 /// proceeds.
-fn sales_of(body: &Body, effective_date: &str, account_id: &str) -> Vec<(String, Money, String)> {
+/// From contract v29 a debt fill stating its factor names the multiplier its
+/// proceeds take, per 100 of face times that factor (986, 987); every other
+/// sale's is the lot's own.
+#[allow(clippy::type_complexity)]
+fn sales_of(
+    body: &Body,
+    effective_date: &str,
+    account_id: &str,
+) -> Vec<(String, Money, String, Option<Exact>)> {
     use crate::orders::Act;
     let mut out = Vec::new();
     for act in &body.acts {
@@ -1239,23 +1249,41 @@ fn sales_of(body: &Body, effective_date: &str, account_id: &str) -> Vec<(String,
                     .and_then(|q| Exact::from_wire(q).ok())
                     .is_some_and(|q| !q.is_zero());
                 if let (true, Some(price)) = (fills, execution.price.as_ref()) {
+                    let factored = execution
+                        .factor_used
+                        .as_ref()
+                        .and_then(|f| Exact::from_wire(f).ok())
+                        .and_then(|f| {
+                            crate::orders::multiply("factor", Exact::new(1, 2).ok()?, f).ok()
+                        });
                     out.push((
                         execution.instrument_id.clone(),
                         price.clone(),
                         execution.trade_date.clone(),
+                        factored,
                     ));
                 }
             }
             Act::AllocationReceived { allocation, .. } => {
                 if let Some(price) = allocation.average_price.as_ref() {
-                    out.push((String::new(), price.clone(), effective_date.to_string()));
+                    out.push((
+                        String::new(),
+                        price.clone(),
+                        effective_date.to_string(),
+                        None,
+                    ));
                 }
             }
             Act::BookingOpened { booking, .. } => {
                 for allocation in &booking.allocations {
                     if allocation.account_id == account_id {
                         if let Some(price) = allocation.average_price.as_ref() {
-                            out.push((String::new(), price.clone(), effective_date.to_string()));
+                            out.push((
+                                String::new(),
+                                price.clone(),
+                                effective_date.to_string(),
+                                None,
+                            ));
                         }
                     }
                 }
@@ -1290,7 +1318,7 @@ fn apply_lot(
     reference: &JournalRef,
     entry_sequence: u64,
     lenient: bool,
-    sale: Option<(&Money, &str)>,
+    sale: Option<(&Money, &str, Option<Exact>)>,
 ) -> Result<()> {
     if let Some(terms) = &line.opens_lot {
         if line.lot_id.is_empty() {
@@ -1408,18 +1436,21 @@ fn lot_multiplier(lot: &Lot) -> Exact {
     if per_f == 0.0 || cost_f == 0.0 {
         return Exact::ONE;
     }
-    let guess = format!("{:.6}", (cost_f / per_f).abs());
-    let guess = guess.trim_end_matches('0').trim_end_matches('.');
-    match guess.parse::<Exact>() {
-        Ok(m)
+    // Six places for a series' multiplier; from contract v29 twelve, for a
+    // pool's per 100 of face times its factor (0.0084211375).
+    for places in [6, 12] {
+        let guess = format!("{:.*}", places, (cost_f / per_f).abs());
+        let guess = guess.trim_end_matches('0').trim_end_matches('.');
+        if let Ok(m) = guess.parse::<Exact>() {
             if !m.is_zero()
                 && crate::orders::multiply("a lot's cost", per, m)
-                    .is_ok_and(|back| back == cost || back == cost.negated()) =>
-        {
-            m
+                    .is_ok_and(|back| back == cost || back == cost.negated())
+            {
+                return m;
+            }
         }
-        _ => Exact::ONE,
     }
+    Exact::ONE
 }
 
 /// One relief of a lot (W9.10, contract v27): the entry, the quantity, and
@@ -1429,11 +1460,13 @@ fn record_relief(
     lot: &mut Lot,
     reference: &JournalRef,
     relieved: Exact,
-    sale: Option<(&Money, &str)>,
+    sale: Option<(&Money, &str, Option<Exact>)>,
 ) -> Result<()> {
-    let multiplier = lot_multiplier(lot);
+    let multiplier = sale
+        .and_then(|(_, _, factored)| factored)
+        .unwrap_or_else(|| lot_multiplier(lot));
     let proceeds = |quantity: Exact| -> Result<Option<Money>> {
-        let Some((price, _)) = sale else {
+        let Some((price, _, _)) = sale else {
             return Ok(None);
         };
         let Some(unit) = price.amount.as_ref().and_then(|a| Exact::from_wire(a).ok()) else {
@@ -1464,7 +1497,7 @@ fn record_relief(
         relieved_by: Some(reference.clone()),
         quantity: numbers::wire(relieved),
         proceeds: proceeds(relieved)?,
-        trade_date: sale.map(|(_, date)| date.to_string()).unwrap_or_default(),
+        trade_date: sale.map(|(_, date, _)| date.to_string()).unwrap_or_default(),
     });
     Ok(())
 }

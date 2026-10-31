@@ -49,6 +49,10 @@ const CALL_240: &str = "INS-01J8XQ4M7K000000AAPLC240";
 const EXPIRED_CALL: &str = "INS-01J8XQ4M7K000000AAPLC100";
 /// 2026-10-13T13:30:00Z.
 const NOW: i64 = 1_760_362_200_000_000_000;
+// Contract v29: a corporate bond and an agency pool, priced in francs here
+// so their cash is the account's base balance.
+const BOND: &str = "INS-01JC29CORP000000000000001";
+const POOL: &str = "INS-01JC29POOL000000000000001";
 
 struct Wired {
     bus: Arc<Bus>,
@@ -90,6 +94,20 @@ fn wired() -> Wired {
                     ..Default::default()
                 }),
                 ..record(AssetClass::Derivative, "USD")
+            }),
+            BOND => Some(InstrumentRecord {
+                instrument_type: InstrumentType::Bond as i32,
+                bond: Some(Bond {
+                    minimum_denomination: d("1000"),
+                    denomination_increment: d("1000"),
+                    ..Default::default()
+                }),
+                ..record(AssetClass::Debt, "CHF")
+            }),
+            POOL => Some(InstrumentRecord {
+                instrument_type: InstrumentType::MbsPool as i32,
+                mbs_pool: Some(MbsPool::default()),
+                ..record(AssetClass::Debt, "CHF")
             }),
             EXPIRED_CALL => Some(InstrumentRecord {
                 instrument_type: InstrumentType::ListedOption as i32,
@@ -3306,6 +3324,11 @@ mod booking;
 
 #[path = "order_path_v27_tests.rs"]
 mod order_path_v27;
+
+// ── Contract v29: debt orders, fills, allocations and coupons ──────────────
+
+#[path = "fixed_income_tests.rs"]
+mod fixed_income;
 
 // ── Contract v27 (W11.7, W11.8; rulings 374 and 420): checks at use ────────
 

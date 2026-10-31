@@ -163,6 +163,44 @@ impl Context {
             .and_then(|r| r.multiplier)
             .unwrap_or(Exact::ONE)
     }
+
+    /// Whether the instrument is a debt record (contract v29).
+    pub fn is_debt(&self, instrument: &str) -> bool {
+        self.records.get(instrument).is_some_and(|r| r.debt.is_some())
+    }
+
+    /// Whether the instrument is a pool or a tranche, whose face is
+    /// original face (contract v29, 680).
+    pub fn is_pooled(&self, instrument: &str) -> bool {
+        self.records.get(instrument).is_some_and(|r| {
+            matches!(
+                meridian_domain::v1::InstrumentType::try_from(r.instrument_type),
+                Ok(meridian_domain::v1::InstrumentType::MbsPool
+                    | meridian_domain::v1::InstrumentType::CmoTranche)
+            )
+        })
+    }
+
+    /// The multiplier a fill's cash and cost are priced by: a series' (559);
+    /// from contract v29 a debt record's price per 100 of face (987), times
+    /// 0.01, and a pool's, a tranche's or a TBA's original face times the
+    /// factor the fill states it was done at (986).
+    pub fn fill_multiplier(
+        &self,
+        instrument: &str,
+        factor_used: Option<&meridian_pb::v1::Decimal>,
+    ) -> Exact {
+        if !self.is_debt(instrument) {
+            return self.multiplier(instrument);
+        }
+        let hundredth = Exact::new(1, 2).expect("0.01");
+        match factor_used.and_then(|f| Exact::from_wire(f).ok()) {
+            Some(factor) => {
+                crate::orders::multiply("factor", hundredth, factor).unwrap_or(hundredth)
+            }
+            _ => hundredth,
+        }
+    }
 }
 
 impl Context {

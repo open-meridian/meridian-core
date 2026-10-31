@@ -333,7 +333,9 @@ pub fn executed(book: &Book, ctx: &Context, execution_ids: &[String]) -> Result<
             orders::multiply(
                 "gross",
                 orders::multiply("gross", quantity, unit)?,
-                ctx.multiplier(&execution.instrument_id),
+                // Contract v29 (986, 987): per 100 of face, a pool's at
+                // its factor.
+                ctx.fill_multiplier(&execution.instrument_id, execution.factor_used.as_ref()),
             )?,
         )?;
         for fee in &execution.fees {
@@ -474,6 +476,62 @@ fn is_error_account(ctx: &Context, book: &Book, account_id: &str) -> bool {
 /// Each allocation held to who may receive it, and its own fields: an account
 /// the instruction names or one marked an error account; an error-account
 /// allocation's reason and cause, text with other (W11.27).
+/// Contract v29 (W11.27; rulings 710 to 714, 720, 751): a customer leg's
+/// reporting fields, refused naming the field where they do not hold: a
+/// markup with no prevailing market price (751) and a mixed capacity (714).
+fn reporting_fields_hold(field: &str, allocation: &Allocation) -> Result<()> {
+    if allocation.markup.is_some() && allocation.prevailing_market_price.is_none() {
+        return Err(malformed(
+            &[&format!("{field}.prevailing_market_price")],
+            "a markup is stated over the prevailing market price it was taken from (751)",
+        ));
+    }
+    if allocation.capacity == meridian_domain::v1::Capacity::Mixed as i32 {
+        return Err(malformed(
+            &[&format!("{field}.capacity")],
+            "an allocation carries one capacity, never mixed (714)",
+        ));
+    }
+    Ok(())
+}
+
+/// Contract v29 (988): an allocation's accrued interest, its own cash line
+/// in the allocation's account, paid on a purchase and received on a sale,
+/// pending to the settlement date: settlement is principal plus accrued.
+#[allow(clippy::too_many_arguments)]
+fn accrued_lines(
+    book: &Book,
+    ctx: &Context,
+    allocation: &Allocation,
+    buy: bool,
+    date: &str,
+    sleeve: &str,
+    trade_date: &str,
+    method: LotReliefMethod,
+    earlier: &[MovementLine],
+) -> Result<Vec<MovementLine>> {
+    let Some(accrued) = allocation.accrued_interest.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let value = numbers::amount("accrued_interest", accrued)?;
+    if value.is_zero() {
+        return Ok(Vec::new());
+    }
+    currency_lines(
+        book,
+        ctx,
+        &cash_instrument(accrued)?,
+        if buy { value.negated() } else { value },
+        date,
+        sleeve,
+        trade_date,
+        None,
+        method,
+        &[],
+        earlier,
+    )
+}
+
 fn allocations_hold(
     book: &Book,
     ctx: &Context,
@@ -510,6 +568,7 @@ fn allocations_hold(
                 "an allocation states the average price its confirmation states",
             ));
         }
+        reporting_fields_hold(&field, allocation)?;
         let error = is_error_account(ctx, book, &allocation.account_id);
         if !error && !instructed.contains(&allocation.account_id) {
             return Err(StoreError::Refused {
@@ -802,6 +861,24 @@ fn booking_lines(
                 seen.extend(reopened.iter().cloned());
                 made.extend(reopened);
             }
+            // Contract v29 (988): the accrued, its own cash line.
+            let accrued = accrued_lines(
+                book,
+                ctx,
+                allocation,
+                buy,
+                if allocation.intended_settlement_date.is_empty() {
+                    &date
+                } else {
+                    &allocation.intended_settlement_date
+                },
+                &allocation.sleeve,
+                &executed.trade_date,
+                method,
+                &seen,
+            )?;
+            seen.extend(accrued.iter().cloned());
+            made.extend(accrued);
         } else {
             // Out of this account: the opposite of what the fills moved.
             let delta = if buy { quantity.negated() } else { quantity };
@@ -944,6 +1021,11 @@ fn received_lines(
         )?;
         lines.extend(moved);
     }
+    // Contract v29 (988): the accrued, its own cash line.
+    let accrued = accrued_lines(
+        book, ctx, allocation, buy, &date, &sleeve, trade_date, method, &lines,
+    )?;
+    lines.extend(accrued);
     Ok(lines)
 }
 

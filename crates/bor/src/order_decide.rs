@@ -212,6 +212,135 @@ fn position_effect_refused(ctx: &Context, at: &str, instrument: &str, effect: i3
     }
 }
 
+/// Contract v29 (W11.1; rulings 680, 681, 685, 750): a debt order's face
+/// at least its record's minimum denomination and in its increments, and its
+/// price stated by its basis: percent of par in `limit_price`, a yield in
+/// `limit_yield`, or a spread in `limit_spread_bps` over
+/// `benchmark_instrument_id`. A basis whose limit field is empty, or a limit
+/// field set under another basis, is refused naming the field; a basis but
+/// per unit on a record that is no debt record names `price_basis`.
+fn debt_order_holds(ctx: &Context, request: &ProposeOrderRequest) -> Result<()> {
+    use meridian_domain::v1::PriceBasis;
+    let basis = PriceBasis::try_from(request.price_basis).unwrap_or(PriceBasis::Unspecified);
+    let debt = ctx
+        .records
+        .get(&request.instrument_id)
+        .and_then(|said| said.debt.clone());
+    if debt.is_none()
+        && matches!(
+            basis,
+            PriceBasis::PercentOfPar | PriceBasis::Yield | PriceBasis::Spread
+        )
+    {
+        return Err(malformed(
+            &["price_basis"],
+            "percent of par, a yield or a spread prices a debt record's order",
+        ));
+    }
+    let yield_set = request.limit_yield.is_some();
+    let spread_set = request.limit_spread_bps.is_some();
+    let benchmark_set = !request.benchmark_instrument_id.is_empty();
+    let price_set = request.limit_price.is_some();
+    let wanted = |set: bool, field: &str, words: &str| -> Result<()> {
+        if set {
+            Ok(())
+        } else {
+            Err(malformed(&[field], words.to_string()))
+        }
+    };
+    let unwanted = |set: bool, field: &str| -> Result<()> {
+        if set {
+            Err(malformed(
+                &[field],
+                format!("{field} is set only under its own price basis"),
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    match basis {
+        PriceBasis::PercentOfPar => {
+            wanted(
+                price_set,
+                "limit_price",
+                "an order in percent of par states its limit price per 100 of face",
+            )?;
+            unwanted(yield_set, "limit_yield")?;
+            unwanted(spread_set, "limit_spread_bps")?;
+            unwanted(benchmark_set, "benchmark_instrument_id")?;
+        }
+        PriceBasis::Yield => {
+            wanted(
+                yield_set,
+                "limit_yield",
+                "an order in yield states its limit yield",
+            )?;
+            unwanted(price_set, "limit_price")?;
+            unwanted(spread_set, "limit_spread_bps")?;
+            unwanted(benchmark_set, "benchmark_instrument_id")?;
+        }
+        PriceBasis::Spread => {
+            wanted(
+                spread_set,
+                "limit_spread_bps",
+                "an order in spread states its limit spread",
+            )?;
+            wanted(
+                benchmark_set,
+                "benchmark_instrument_id",
+                "an order in spread names the benchmark it is over",
+            )?;
+            unwanted(price_set, "limit_price")?;
+            unwanted(yield_set, "limit_yield")?;
+        }
+        _ => {
+            unwanted(yield_set, "limit_yield")?;
+            unwanted(spread_set, "limit_spread_bps")?;
+            unwanted(benchmark_set, "benchmark_instrument_id")?;
+        }
+    }
+    let Some(debt) = debt else {
+        return Ok(());
+    };
+    let Some(face) = decimal("quantity", request.quantity.as_ref())? else {
+        return Ok(());
+    };
+    if let Some(minimum) = debt.minimum_denomination.filter(|m| !m.is_zero()) {
+        if face < minimum {
+            return Err(malformed(
+                &["quantity"],
+                format!("{face} of face is below the record's minimum denomination, {minimum}"),
+            ));
+        }
+        if let Some(increment) = debt.denomination_increment.filter(|i| !i.is_zero()) {
+            let above = numbers::add("quantity", face, minimum.negated())?;
+            if !multiple_of(above, increment) {
+                return Err(malformed(
+                    &["quantity"],
+                    format!(
+                        "{face} of face is not the minimum denomination, {minimum}, plus a                          multiple of its increment, {increment}"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether `value` is a whole multiple of `step`, exactly.
+fn multiple_of(value: Exact, step: Exact) -> bool {
+    let scale = value.scale().max(step.scale());
+    let at = |e: Exact| {
+        10i128
+            .checked_pow(scale - e.scale())
+            .and_then(|power| e.integer().checked_mul(power))
+    };
+    match (at(value), at(step)) {
+        (Some(v), Some(s)) if s != 0 => v % s == 0,
+        _ => false,
+    }
+}
+
 /// Contract v28 (W11.1; rulings 564, 592): a package, FIX's 35=AB -- no
 /// top-level instrument, two to 16 legs, each its instrument, side, ratio
 /// and position effect, the ratios whole and in lowest terms, at most one
@@ -711,6 +840,9 @@ pub fn propose_order(
     }
     ctx.references_answered()?;
     ctx.not_referential("", &request.instrument_id)?;
+    if !package {
+        debt_order_holds(ctx, request)?;
+    }
     let missing = if package {
         Vec::new()
     } else {
@@ -775,6 +907,12 @@ pub fn propose_order(
         value_date: request.value_date.clone(),
         // Contract v28 (W11.1): open or close, as option brokers require.
         position_effect: request.position_effect,
+        // Contract v29 (W11.1; rulings 685, 750): a debt order's price
+        // basis and the limit it states.
+        price_basis: request.price_basis,
+        limit_yield: request.limit_yield.clone(),
+        limit_spread_bps: request.limit_spread_bps,
+        benchmark_instrument_id: request.benchmark_instrument_id.clone(),
         ..Default::default()
     };
 
@@ -3108,7 +3246,9 @@ fn trade_lines(
     // Contract v28 (559; FIX 231): a listed option's or a future's fill is
     // priced per unit of its underlying, its cash and cost by its series'
     // multiplier -- one SPY option at 2.50 is 250.00.
-    let multiplier = ctx.multiplier(&execution.instrument_id);
+    // Contract v29 (986, 987): a debt record's fill priced per 100 of face,
+    // a pool's or a tranche's at the factor it was done at.
+    let multiplier = ctx.fill_multiplier(&execution.instrument_id, execution.factor_used.as_ref());
     let value_date = if execution.settlement_date.is_empty() {
         execution.computed_settlement_date.clone()
     } else {
@@ -3505,9 +3645,23 @@ pub fn report_execution(
         &request.computed_settlement_date,
     )?;
     date_field("effective_date", &request.effective_date)?;
+    reporting_fields_hold(request)?;
     // A fill with no settlement date, stated or computed, is malformed (the
     // refresh's Q39): the plugin asks the date read and sends it again.
-    if !bust && request.settlement_date.is_empty() && request.computed_settlement_date.is_empty() {
+    // Contract v29: a new-issue municipal traded when issued says so.
+    if request.settlement_date_unknown
+        && (!request.settlement_date.is_empty() || !request.computed_settlement_date.is_empty())
+    {
+        return Err(malformed(
+            &["settlement_date_unknown"],
+            "a fill whose settlement date is unknown states none",
+        ));
+    }
+    if !bust
+        && !request.settlement_date_unknown
+        && request.settlement_date.is_empty()
+        && request.computed_settlement_date.is_empty()
+    {
         return Err(malformed(
             &["settlement_date"],
             "a fill states its settlement date, or the date read's beside it where the venue \
@@ -3594,6 +3748,7 @@ pub fn report_execution(
         ));
     };
     let order = held(book, &order_id)?;
+    factor_holds(ctx, &order.order.instrument_id, request, bust)?;
     let cross = cross_holds(order, request, kind, bust)?;
     let sender = ctx.instance_id.clone();
     let mut execution = Execution {
@@ -3692,6 +3847,74 @@ pub fn report_execution(
         from,
     );
     Ok(made)
+}
+
+/// Contract v29 (W11.11; rulings 714, 722, 723, 987): the reporting fields
+/// an execution carries, refused naming the field where they do not hold: a
+/// mixed capacity (one per fill), a special price's reason over 50
+/// characters or without the flag, and a yield or spread basis with no
+/// quoted yield beside the dollar price.
+fn reporting_fields_hold(request: &ReportExecutionRequest) -> Result<()> {
+    use meridian_domain::v1::{Capacity, PriceBasis};
+    if request.capacity == Capacity::Mixed as i32 {
+        return Err(malformed(
+            &["capacity"],
+            "a fill carries one capacity: a mixed order's fills each say theirs (714)",
+        ));
+    }
+    if request.special_price_reason.chars().count() > 50 {
+        return Err(malformed(
+            &["special_price_reason"],
+            "at most 50 characters",
+        ));
+    }
+    if !request.special_price && !request.special_price_reason.is_empty() {
+        return Err(malformed(
+            &["special_price_reason"],
+            "a reason is stated only for a special price",
+        ));
+    }
+    let basis = PriceBasis::try_from(request.price_basis).unwrap_or(PriceBasis::Unspecified);
+    if matches!(basis, PriceBasis::Yield | PriceBasis::Spread) && request.r#yield.is_none() {
+        return Err(malformed(
+            &["yield"],
+            "a fill quoted in yield or spread carries the quote in yield beside its dollar              price (987)",
+        ));
+    }
+    Ok(())
+}
+
+/// Contract v29 (W11.11; ruling 986): a pool's or a tranche's fill states
+/// the factor it was done at (FIX Factor, 228), its cash original face times
+/// it; a factor on a fill in any record but a pool, a tranche or a TBA is
+/// refused naming it.
+fn factor_holds(
+    ctx: &Context,
+    instrument: &str,
+    request: &ReportExecutionRequest,
+    bust: bool,
+) -> Result<()> {
+    let factor = decimal("factor_used", request.factor_used.as_ref())?;
+    if let Some(factor) = factor {
+        if factor.is_zero() || factor.is_negative() {
+            return Err(malformed(&["factor_used"], "a factor is above zero"));
+        }
+        let tba = ctx.records.get(instrument).is_some_and(|r| {
+            r.instrument_type == meridian_domain::v1::InstrumentType::Tba as i32
+        });
+        if !ctx.is_pooled(instrument) && !tba {
+            return Err(malformed(
+                &["factor_used"],
+                "only a pool's, a tranche's or a TBA's fill states a factor",
+            ));
+        }
+    } else if !bust && ctx.is_pooled(instrument) {
+        return Err(malformed(
+            &["factor_used"],
+            "a pool's or a tranche's fill states the factor it was done at, its cash original              face times it (986)",
+        ));
+    }
+    Ok(())
 }
 
 /// A net's internal cross (W11.11, contract v27; the gaps spec's D3 and
@@ -3794,6 +4017,32 @@ fn execution_of(
         uti_generated_by: request.uti_generated_by.clone(),
         // The venue's order ID as the venue states it (contract v23).
         venue_order_id: request.venue_order_id.clone(),
+        // Contract v28 (W11.24; ruling 564): a package's own fill or a leg's,
+        // the leg naming its package's -- kept, so a package's own fill
+        // books nothing (a v28 omission, found at v29's stage B).
+        multi_leg_reporting_type: request.multi_leg_reporting_type,
+        package_execution_id: request.package_execution_id.clone(),
+        // Contract v29 (W11.11; rulings 689, 698, 709 to 723): what a TRACE
+        // or an RTRS report needs, as the session or the oms states it.
+        price_basis: request.price_basis,
+        r#yield: request.r#yield.clone(),
+        trade_time_precision: request.trade_time_precision,
+        factor_used: request.factor_used,
+        settlement_date_unknown: request.settlement_date_unknown,
+        contra_party_type: request.contra_party_type,
+        parties: request.parties.clone(),
+        capacity: request.capacity,
+        no_remuneration: request.no_remuneration,
+        affiliate_back_to_back: request.affiliate_back_to_back,
+        special_price: request.special_price,
+        weighted_average_price: request.weighted_average_price,
+        primary_market: request.primary_market,
+        list_offering_price_takedown: request.list_offering_price_takedown,
+        traded_flat: request.traded_flat,
+        stipulated: request.stipulated,
+        portfolio_trade: request.portfolio_trade,
+        special_price_reason: request.special_price_reason.clone(),
+        treasury_trade_modifier: request.treasury_trade_modifier,
         ..Default::default()
     }
 }
