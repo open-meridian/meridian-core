@@ -600,10 +600,11 @@ def run():
         page("lens", "read", f"/assess?subject={btc}&date={DAY_1}&state=invalid")),
         "step 15, lens did not record its assessment")
     left_out = page("book", "read", f"/prices?subject={btc}&date={DAY_1}&kind=close")
-    must(not left_out["prices"] and any(u["reason"] == "UNANSWERED_REASON_SOURCE_SILENT"
+    must(not left_out["prices"] and any(u["reason"] == "UNANSWERED_REASON_QUARANTINED"
                                         and u["dataset"] == "coin:daily"
                                         for u in left_out["unanswered"]),
-         f"step 15, a default read leaves the escalated close out, source silent: {left_out}")
+         f"step 15, a default read leaves the escalated close out, quarantined (contract v29, "
+         f"619 (1)): {left_out}")
     kept = page("book", "read", f"/prices?subject={btc}&date={DAY_1}&kind=close"
                 "&dataset=coin:daily&quarantined=1")["prices"]
     must(len(kept) == 1 and kept[0]["quality"] == "QUALITY_STATE_INVALID"

@@ -753,9 +753,12 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
         }
     }
     let why_not = |dataset: &str, subject: &str, kind: i32| {
-        if tenor_silent.contains(&(subject.to_string(), dataset.to_string()))
-            || left_out.contains(&(subject.to_string(), dataset.to_string(), kind))
-        {
+        if left_out.contains(&(subject.to_string(), dataset.to_string(), kind)) {
+            // Contract v29 (619 (1); W10.6): a dataset whose only rows for
+            // the subject are invalid is named quarantined, apart from a
+            // silent one; still asked nothing and never fallen back to.
+            (UnansweredReason::Quarantined, false)
+        } else if tenor_silent.contains(&(subject.to_string(), dataset.to_string())) {
             (UnansweredReason::SourceSilent, false)
         } else {
             why_not(read, against, dataset, subject)
@@ -910,6 +913,8 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
                                     .or_default()
                                     .insert(subject.clone());
                                 UnansweredReason::AskedSource
+                            } else if reason == UnansweredReason::Quarantined {
+                                reason
                             } else {
                                 UnansweredReason::SourceSilent
                             }

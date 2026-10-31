@@ -145,15 +145,13 @@ async fn an_invalid_row_is_recorded_heard_with_its_state_and_left_out_of_a_defau
         QualityState::Invalid as i32
     );
 
-    // A default read leaves it out: coinbase source silent, asked nothing,
-    // kraken asked in its place (619 (1)).
+    // A default read leaves it out: coinbase named quarantined (contract
+    // v29, 619 (1)), asked nothing, kraken asked in its place.
     let default = try_read(&h, SourceChoice::default(), 0, "2026-10-07").unwrap();
     assert!(default.rows.is_empty());
-    assert!(default
-        .unanswered
-        .iter()
-        .any(|u| u.dataset == "coinbase-1:daily"
-            && u.reason == UnansweredReason::SourceSilent as i32));
+    assert!(default.unanswered.iter().any(
+        |u| u.dataset == "coinbase-1:daily" && u.reason == UnansweredReason::Quarantined as i32
+    ));
     // Side by side, the same.
     let side = try_read(
         &h,
@@ -167,12 +165,12 @@ async fn an_invalid_row_is_recorded_heard_with_its_state_and_left_out_of_a_defau
     .unwrap();
     assert!(side.rows.is_empty());
 
-    // Named without include_quarantined: left out, source silent.
+    // Named without include_quarantined: left out, quarantined.
     let plain = try_read(&h, named("coinbase-1:daily", false), 0, "2026-10-07").unwrap();
     assert!(plain.rows.is_empty());
     assert_eq!(
         plain.unanswered[0].reason,
-        UnansweredReason::SourceSilent as i32
+        UnansweredReason::Quarantined as i32
     );
     // Named with it: answered, its state and reasons (W10.6).
     let quarantined = try_read(&h, named("coinbase-1:daily", true), 0, "2026-10-07").unwrap();
@@ -233,11 +231,9 @@ async fn a_default_read_fails_over_past_a_quarantined_dataset_and_says_why() {
     assert_eq!(answer.rows.len(), 1);
     assert_eq!(answer.rows[0].dataset(), "kraken-1:daily");
     // No read silently mixes sources: the dataset above it named.
-    assert!(answer
-        .unanswered
-        .iter()
-        .any(|u| u.dataset == "coinbase-1:daily"
-            && u.reason == UnansweredReason::SourceSilent as i32));
+    assert!(answer.unanswered.iter().any(
+        |u| u.dataset == "coinbase-1:daily" && u.reason == UnansweredReason::Quarantined as i32
+    ));
     assert!(
         h.store.want_changes().unwrap().is_empty(),
         "a quarantined dataset is asked nothing"
@@ -447,3 +443,4 @@ async fn a_signals_assessment_is_its_own_record_raising_the_rows_effective_state
     let refused = assess(&h, SIGNAL, vec![unspecified]).unwrap_err();
     assert_eq!(fields_of(&refused), vec!["assessments[0].reasons"]);
 }
+
