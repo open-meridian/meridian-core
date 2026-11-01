@@ -1589,7 +1589,11 @@ def the_model_routing_tab(browser, prefix):
         page.goto(ADMIN_PAGE + "#model-routing")
         settled(page)
         models = page.eval_on_selector_all("#model-routing [data-model-id]", "ds => ds.map(d => d.dataset.modelId)")
-        check(models == ["cash", "quoted_price", "binary_event"],
+        # v26's three, then v28's option models and calibrations and v29's
+        # debt models and curve (stage E: every model id the engine serves).
+        check(models == ["cash", "quoted_price", "binary_event", "american_binomial",
+                         "black_scholes", "black_76", "svi", "ssvi", "bond_cash_flows",
+                         "bond_yield_solver", "monotone_convex"],
               f"at {size} the Model routing tab gives each model id a line: {models}")
         said = page.inner_text("#model-routing")
         check("sample-pricing-with-a-long-instance-name-1" in said and "never routed" in said
