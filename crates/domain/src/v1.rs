@@ -15607,9 +15607,10 @@ pub struct DatasetRef {
     pub declaration: ::core::option::Option<::meridian_pb::v1::DatasetDeclaration>,
     /// For the Data sources page, in a listing of datasets (W10.9; approved
     /// 2026-10-10): the rows in force of the dataset carrying a value as
-    /// reported beside a field left not known; and the identifiers and venues
-    /// its instance reported missing (W3.2, W3.15), as the lake heard them. 0
-    /// in a read's answer and on an entitlements change.
+    /// reported beside a field left not known, each row key counted once, at
+    /// its version in force (ruling 1006); and the identifiers and venues its
+    /// instance reported missing (W3.2, W3.15), as the lake heard them. 0 in a
+    /// read's answer and on an entitlements change.
     #[prost(uint64, tag = "6")]
     pub unconverted_count: u64,
     #[prost(uint64, tag = "7")]
