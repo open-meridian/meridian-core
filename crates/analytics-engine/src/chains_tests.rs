@@ -661,3 +661,54 @@ fn a_volatility_index_with_no_chain_held_is_no_history() {
         answer.not_evaluated[0].detail
     );
 }
+
+/// Contract v29 (639; W12.1): the expected move is 0.85 times the
+/// straddle's mid at the strike where the call and the put differ least --
+/// where parity puts the forward -- with no option model.
+#[test]
+fn the_expected_move_is_085_times_the_at_the_money_straddle() {
+    let chain = index_chain(0.2, 0.05, &[30, 60]);
+    let answer = crate::compute(&inputs(
+        vec![chain.clone()],
+        vec![("expected_move", 1, vec![])],
+    ))
+    .unwrap();
+    let moves = figures(&answer, "expected_move");
+    assert_eq!(moves.len(), 2, "{:?}", answer.not_evaluated);
+    for figure in moves {
+        let expiry = &figure.breakdown[0].1;
+        let mid = |s: &Value| {
+            (s["bid"].as_str().unwrap().parse::<f64>().unwrap()
+                + s["ask"].as_str().unwrap().parse::<f64>().unwrap())
+                / 2.0
+        };
+        let rows: Vec<&Value> = chain["series"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|s| s["expiration_date"] == *expiry)
+            .collect();
+        let at = |k: &str, right: &str| {
+            rows.iter()
+                .find(|s| s["strike"] == k && s["right"] == right)
+                .map(|s| mid(s))
+                .unwrap()
+        };
+        let strikes: Vec<&str> = rows.iter().map(|s| s["strike"].as_str().unwrap()).collect();
+        let atm = strikes
+            .iter()
+            .min_by(|a, b| {
+                (at(a, "call") - at(a, "put"))
+                    .abs()
+                    .total_cmp(&(at(b, "call") - at(b, "put")).abs())
+            })
+            .unwrap();
+        let expected = 0.85 * (at(atm, "call") + at(atm, "put"));
+        assert!(
+            (value(figure) - expected).abs() < 1e-4,
+            "{expiry}: {} vs {expected}",
+            value(figure)
+        );
+        assert_eq!(figure.breakdown[0].0, "expiry");
+    }
+}

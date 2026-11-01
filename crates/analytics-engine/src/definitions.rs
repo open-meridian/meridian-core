@@ -175,7 +175,7 @@ const CURVE: &[(&str, &str)] = &[
 /// v26's at version 1, from contract v27 `execution_cost` version 1 and
 /// `pnl` version 2, from contract v28 the options measures, and from
 /// contract v29 the curve and bond measures (W12.1).
-pub const DEFINITIONS: [Definition; 33] = [
+pub const DEFINITIONS: [Definition; 34] = [
     Definition {
         definition: "market_value",
         version: 1,
@@ -572,6 +572,20 @@ pub const DEFINITIONS: [Definition; 33] = [
         description: "Each bond's make-whole redemption price per 100 and amount, if redeemed at \
                       the job's date: the greater of par and its remaining payments to the par \
                       call date discounted, less accrued",
+    },
+    Definition {
+        definition: "expected_move",
+        version: 1,
+        parameters: &[
+            ("multiplier", "0.85"),
+            (
+                "straddle",
+                "the_call_and_put_mids_at_the_strike_of_least_abs_call_less_put",
+            ),
+        ],
+        breakdowns: &["expiry"],
+        scale: 4,
+        description: "Each expiration's expected move: 0.85 times the at-the-money straddle's mid",
     },
 ];
 

@@ -279,6 +279,7 @@ pub fn is_chain_measure(definition: &str) -> bool {
             | "positioning_levels"
             | "max_pain"
             | "open_interest_change"
+            | "expected_move"
     )
 }
 
@@ -1104,7 +1105,10 @@ pub fn compute(case: &Case, key: &MeasureKey, definition: &Definition) -> Result
     let steps = steps(definition);
     let as_of = case.lake_as_of_ns;
     for chain in &case.chains {
-        let model = !matches!(definition.definition, "max_pain" | "open_interest_change");
+        let model = !matches!(
+            definition.definition,
+            "max_pain" | "open_interest_change" | "expected_move"
+        );
         read_chain(
             &mut part,
             chain,
@@ -1117,6 +1121,7 @@ pub fn compute(case: &Case, key: &MeasureKey, definition: &Definition) -> Result
         };
         match definition.definition {
             "max_pain" => max_pain(chain, &mut out),
+            "expected_move" => expected_move(chain, definition, &mut out),
             "open_interest_change" => open_interest_change(chain, &mut out),
             "volatility_index" => volatility_index(chain, chain.struck_at(as_of), &mut out),
             _ => {
@@ -1488,6 +1493,57 @@ fn term_and_skew(
                 "",
                 PRICE_MISSING,
                 format!("{name}: no fitted expiries either side of {days} days"),
+            ),
+        }
+    }
+}
+
+/// Contract v29 (639; W12.1): each expiration's expected move, 0.85 times
+/// the at-the-money straddle's mid -- the call's and the put's mids at the
+/// strike where they differ least, where put-call parity puts the forward
+/// (the implied forward's own choice) -- no option model.
+fn expected_move(chain: &Chain, definition: &Definition, out: &mut Out<'_>) {
+    let multiplier: f64 = definition
+        .parameter("multiplier")
+        .and_then(|m| m.parse().ok())
+        .unwrap_or(0.85);
+    let mut expiries: Vec<&str> = chain.series.iter().map(|s| s.expiry.as_str()).collect();
+    expiries.sort_unstable();
+    expiries.dedup();
+    for expiry in expiries {
+        let mut best: Option<(f64, f64, i64)> = None;
+        for call in chain
+            .series
+            .iter()
+            .filter(|s| s.expiry == expiry && s.right == Right::Call)
+        {
+            let Some(put) = chain.series.iter().find(|s| {
+                s.expiry == expiry && s.right == Right::Put && s.strike_exact == call.strike_exact
+            }) else {
+                continue;
+            };
+            let (Some(c), Some(p)) = (mid(call), mid(put)) else {
+                continue;
+            };
+            let gap = (c - p).abs();
+            let src = source(chain, call).max(source(chain, put));
+            if best.is_none_or(|(least, _, _)| gap < least) {
+                best = Some((gap, c + p, src));
+            }
+        }
+        match best {
+            Some((_, straddle, src)) => out.figure(
+                vec![("expiry", expiry.to_string())],
+                &Vec::new(),
+                multiplier * straddle,
+                &chain.currency_instrument_id,
+                src,
+            ),
+            None => out.not(
+                &Vec::new(),
+                "",
+                PRICE_MISSING,
+                format!("{expiry}: no call and put at one strike, each with a bid and an ask"),
             ),
         }
     }
