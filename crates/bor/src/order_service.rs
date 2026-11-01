@@ -908,8 +908,9 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
                     &request.trade_date,
                 ]);
                 match month.map(|month| crate::service::latest_factor(&bus2, &filled, &month)) {
-                    Some(crate::service::FactorRead::Taken(factor)) => {
-                        ctx.factor_taken = Some(factor)
+                    Some(crate::service::FactorRead::Taken(factor, row)) => {
+                        ctx.factor_taken = Some(factor);
+                        ctx.factor_row = row;
                     }
                     Some(crate::service::FactorRead::Unavailable) => ctx.factors_unavailable = true,
                     _ => {}

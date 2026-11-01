@@ -263,6 +263,10 @@ struct ExecutionShape {
     /// factor, so the format stands.
     #[serde(default)]
     factor_taken: String,
+    /// Contract v29 (rulings 991, 992, amended at core stage E): empty in a
+    /// snapshot made before.
+    #[serde(default)]
+    factor_row: crate::orders::FactorRow,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -546,6 +550,7 @@ fn execution_shape(held: &ExecutionHeld) -> ExecutionShape {
         venue_client_order_id,
         accepted_lines,
         factor_taken,
+        factor_row,
     } = held;
     ExecutionShape {
         execution: pb(execution),
@@ -556,6 +561,7 @@ fn execution_shape(held: &ExecutionHeld) -> ExecutionShape {
         venue_client_order_id: venue_client_order_id.clone(),
         accepted_lines: accepted_lines.clone(),
         factor_taken: factor_taken.clone(),
+        factor_row: factor_row.clone(),
     }
 }
 
@@ -797,6 +803,7 @@ fn execution_from(shape: ExecutionShape) -> Result<ExecutionHeld> {
         venue_client_order_id: shape.venue_client_order_id,
         accepted_lines: shape.accepted_lines,
         factor_taken: shape.factor_taken,
+        factor_row: shape.factor_row,
     })
 }
 

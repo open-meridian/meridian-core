@@ -282,6 +282,12 @@ pub struct Executed {
     pub value_date: String,
     /// The price's money, naming its currency, which the cash moves in.
     pub price: Money,
+    /// Contract v29 (W11.27; ruling 991): a pool's or a tranche's fills'
+    /// factor -- stated, or taken by the book -- what the sale's reliefs
+    /// record proceeds at; and the factor month a provisional one awaits
+    /// (992). None and empty on any other.
+    pub factor: Option<Exact>,
+    pub factor_month_awaited: String,
 }
 
 fn value_date_of(execution: &Execution) -> String {
@@ -326,25 +332,30 @@ pub fn executed(book: &Book, ctx: &Context, execution_ids: &[String]) -> Result<
             .ok_or_else(|| malformed(&["price"], format!("execution {id} states no price")))?;
         let unit = numbers::amount("execution.price", &price)?;
         out.quantity = numbers::add("executed quantity", out.quantity, quantity)?;
-        out.gross = numbers::add(
-            "executed gross",
-            out.gross,
-            // Contract v28 (559): a series' fill grossed by its multiplier.
-            orders::multiply(
-                "gross",
-                orders::multiply("gross", quantity, unit)?,
-                // Contract v29 (986, 987): per 100 of face, a pool's at
-                // its factor -- stated, or taken by the book for it.
-                ctx.fill_multiplier(
-                    &execution.instrument_id,
-                    book.ledger
-                        .executions
-                        .get(&execution.execution_id)
-                        .map_or(execution.factor_used, |held| held.factor())
-                        .as_ref(),
-                ),
-            )?,
+        let held = book.ledger.executions.get(&execution.execution_id);
+        let factor = held.map_or(execution.factor_used, |held| held.factor());
+        // Contract v28 (559): a series' fill grossed by its multiplier.
+        let gross = orders::multiply(
+            "gross",
+            orders::multiply("gross", quantity, unit)?,
+            // Contract v29 (986, 987): per 100 of face, a pool's at
+            // its factor -- stated, or taken by the book for it.
+            ctx.fill_multiplier(&execution.instrument_id, factor.as_ref()),
         )?;
+        // Contract v29 (993): a pool's or a tranche's fill's cash is to the
+        // cent, half-even, fill by fill, as its own lines moved it.
+        let gross = if ctx.is_pooled(&execution.instrument_id) {
+            numbers::cents("gross", gross)?
+        } else {
+            gross
+        };
+        out.gross = numbers::add("executed gross", out.gross, gross)?;
+        if out.factor.is_none() {
+            out.factor = factor.as_ref().and_then(|f| Exact::from_wire(f).ok());
+        }
+        if let Some(held) = held.filter(|held| !held.factor_row.awaited.is_empty()) {
+            out.factor_month_awaited = held.factor_row.awaited.clone();
+        }
         for fee in &execution.fees {
             let amount = fee
                 .amount
@@ -1323,6 +1334,23 @@ pub fn book_order(
             } else {
                 None
             };
+            // Contract v29 (W11.27; ruling 991): no allocation field carries
+            // a factor, so a pool's booking is at its fills' -- each
+            // override stated agreeing.
+            if let (Some(a), Some(b)) = (&first.factor_used, &execution.factor_used) {
+                let read = |d: &meridian_pb::v1::Decimal| Exact::from_wire(d).ok();
+                if read(a) != read(b) {
+                    return Err(malformed(
+                        &[&field, "factor_used"],
+                        format!(
+                            "execution {id} states factor_used {} and execution {} states {}:                              a booking's sale or purchase is at one factor, derived from its                              fills, and its fills' overrides conflict (991)",
+                            read(b).map(|f| f.to_string()).unwrap_or_default(),
+                            first.execution_id,
+                            read(a).map(|f| f.to_string()).unwrap_or_default()
+                        ),
+                    ));
+                }
+            }
             if let Some(what) = differs {
                 return Err(malformed(
                     &[&field],
@@ -1675,6 +1703,10 @@ pub struct ChildMove {
     pub side: i32,
     pub trade_date: String,
     pub value_date: String,
+    /// Contract v29 (rulings 991, 992): the fills' factor, as exact decimal
+    /// text, and the month a provisional one awaits; empty where none.
+    pub factor: String,
+    pub factor_month_awaited: String,
 }
 
 /// Each allocation of a booking to another account, as its child entry
@@ -1713,6 +1745,11 @@ pub fn child_moves(book: &Book, booking_id: &str, ctx: &Context) -> Result<Vec<C
             side: executed.side,
             trade_date: executed.trade_date.clone(),
             value_date: executed.value_date.clone(),
+            factor: executed
+                .factor
+                .map(|factor| factor.to_string())
+                .unwrap_or_default(),
+            factor_month_awaited: executed.factor_month_awaited.clone(),
         });
     }
     Ok(out)
@@ -1753,6 +1790,8 @@ pub fn receive_allocation(
             allocation: moved.allocation.clone(),
             member_order_id: moved.member_order_id.clone(),
             lines: (0, lines.len()),
+            factor: moved.factor.clone(),
+            factor_month_awaited: moved.factor_month_awaited.clone(),
         }],
     )
     .reason(&format!(

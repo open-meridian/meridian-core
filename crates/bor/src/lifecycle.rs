@@ -116,6 +116,14 @@ fn checked(book: &Book, ctx: &Context, event: &LifecycleEvent, at: &str) -> Resu
             "the event's kind is unspecified",
         ));
     }
+    // Contract v29 (W9.16; ruling 992): a factor revision is the book's own
+    // record, never reported or proposed.
+    if event_kind == LifecycleEventKind::FactorRevision {
+        return Err(malformed(
+            &[&format!("{at}kind")],
+            "a factor revision is the book's own record, written when a provisional factor is              published; it is never reported or proposed",
+        ));
+    }
     // Contract v29 (W9.16): a fixed-income kind on a record that is no debt
     // record, or an option's or a future's kind on a debt record.
     if debt_kind(event_kind) != debt {
@@ -1336,6 +1344,15 @@ pub fn release(
     if request.note.chars().count() > 2_000 {
         return Err(malformed(&["note"], "at most 2,000 characters"));
     }
+    // Contract v29 (W9.18; ruling 992): a factor revision's open claim,
+    // marked settled.
+    if let Some(claim) = book
+        .lifecycle_events
+        .get(&request.event_id)
+        .filter(|held| held.state == LifecycleEventState::ClaimOpen as i32)
+    {
+        return crate::factors::claim_settled(book, head, ctx, claim, request.note.trim());
+    }
     let proposal = book
         .lifecycle_events
         .get(&request.event_id)
@@ -1345,7 +1362,8 @@ pub fn release(
             malformed(
                 &["event_id"],
                 format!(
-                    "{:?} is no proposal waiting in {}: answered, released or never proposed",
+                    "{:?} is no proposal waiting in {}, nor a factor revision's open claim: \
+                     answered, released, settled or never proposed",
                     request.event_id, book.account_id
                 ),
             )

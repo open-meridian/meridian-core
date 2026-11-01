@@ -207,6 +207,14 @@ fn run() -> Result<(), String> {
             Ok(Err(why)) => tracing::warn!(why, "the agents' guard could not be recorded"),
             Err(failed) => tracing::warn!(%failed, "the agents' guard's backfill failed"),
         }
+        // Contract v29 (W11.11; ruling 992): the factors a pool's fills
+        // await, read from the lake on start and every quarter hour, each
+        // published one revised as the book's own record.
+        tokio::spawn(meridian_bor::factors::sweep_forever(
+            bus.clone(),
+            Arc::clone(&store),
+            meridian_bor::factors::SWEEP_EVERY,
+        ));
         tokio::spawn(meridian_bor::booking_service::sweep_forever(
             bus.clone(),
             Arc::clone(&store),

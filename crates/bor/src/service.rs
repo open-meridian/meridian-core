@@ -90,13 +90,15 @@ pub const RESOLVE_INSTRUMENT: &str = "platform.reference.query.resolve-instrumen
 pub const LIST_FACTORS: &str = "platform.lake.query.list-factors";
 
 /// What the lake answers for a pool's or a tranche's fill stating no
-/// factor (W11.11; ruling 986, amended at core stage C).
+/// factor (W11.11; rulings 986, 991, 992, amended at core stages C and E).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum FactorRead {
-    /// The latest version of the row whose factor month is the last before
-    /// the month the fill settles in.
-    Taken(meridian_pb::v1::Decimal),
-    /// No published row answers that month.
+    /// The factor published for the settlement month -- the latest version
+    /// of the row whose factor month is the one before the month the fill
+    /// settles in -- or, while that is unpublished, the latest row published
+    /// before it, provisional: its row's awaited month says which.
+    Taken(meridian_pb::v1::Decimal, crate::orders::FactorRow),
+    /// No published row answers that month or any before it.
     NonePublished,
     /// The lake did not answer in time, or refused the read.
     Unavailable,
@@ -111,16 +113,34 @@ pub(crate) fn settlement_month(dates: &[&str]) -> Option<String> {
     Some(format!("{}{}", &text[0..4], &text[5..7]))
 }
 
-/// The latest `Factor` row the lake holds for a pool's or a tranche's
-/// settlement month (W11.11): of every row it answers for the record, the
-/// one whose factor month is the last before `month`, at its latest
-/// version. The book reads as the deployment's own component, every
-/// dataset, the default source.
-pub(crate) fn latest_factor(bus: &Bus, instrument: &str, month: &str) -> FactorRead {
-    let Ok(handle) = tokio::runtime::Handle::try_current() else {
-        return FactorRead::Unavailable;
+/// The factor month before `month` (`YYYYMM`): the agency's month whose
+/// factor a fill settling in `month` trades at (W10.4: the month's factor,
+/// published early in the next, prices what settles in it).
+pub(crate) fn month_before(month: &str) -> String {
+    let (year, number) = (
+        month
+            .get(..4)
+            .and_then(|y| y.parse::<i32>().ok())
+            .unwrap_or(0),
+        month
+            .get(4..6)
+            .and_then(|m| m.parse::<i32>().ok())
+            .unwrap_or(1),
+    );
+    let (year, number) = if number <= 1 {
+        (year - 1, 12)
+    } else {
+        (year, number - 1)
     };
-    let mut best: Option<(String, u64, meridian_pb::v1::Decimal)> = None;
+    format!("{year:04}{number:02}")
+}
+
+/// Every `Factor` row the lake holds for a pool or a tranche, each version
+/// as answered; `None` where the lake did not answer. The book reads as the
+/// deployment's own component, every dataset, the default source.
+pub(crate) fn factor_rows(bus: &Bus, instrument: &str) -> Option<Vec<meridian_domain::v1::Factor>> {
+    let handle = tokio::runtime::Handle::try_current().ok()?;
+    let mut rows = Vec::new();
     let mut cursor = String::new();
     loop {
         let asked = handle.block_on(
@@ -141,36 +161,62 @@ pub(crate) fn latest_factor(bus: &Bus, instrument: &str, month: &str) -> FactorR
                 Some(VERSION_WAIT),
             ),
         );
-        let Ok((payload_type, payload)) = asked else {
-            return FactorRead::Unavailable;
-        };
+        let (payload_type, payload) = asked.ok()?;
         if payload_type != "meridian.v1.ListFactorsReply" {
-            return FactorRead::Unavailable;
+            return None;
         }
-        let Ok(reply) = meridian_domain::v1::ListFactorsReply::decode(&payload[..]) else {
-            return FactorRead::Unavailable;
-        };
-        for row in reply.factors {
-            let Some(factor) = row.factor else { continue };
-            let version = row.meta.as_ref().map_or(0, |m| m.version);
-            if row.factor_month.as_str() >= month {
-                continue;
-            }
-            let later = best.as_ref().is_none_or(|(held, held_version, _)| {
-                (&row.factor_month, version) > (held, *held_version)
-            });
-            if later {
-                best = Some((row.factor_month, version, factor));
-            }
-        }
+        let reply = meridian_domain::v1::ListFactorsReply::decode(&payload[..]).ok()?;
+        rows.extend(reply.factors);
         if reply.next_cursor.is_empty() {
             break;
         }
         cursor = reply.next_cursor;
     }
+    Some(rows)
+}
+
+/// Of the rows held, the factor for a fill settling in `month` (rulings 991
+/// and 992): the latest version of the month before's row, final; else the
+/// latest row published before it, its awaited month that month before.
+pub(crate) fn factor_for(rows: &[meridian_domain::v1::Factor], month: &str) -> FactorRead {
+    let wanted = month_before(month);
+    let mut best: Option<(&str, u64, &meridian_domain::v1::Factor)> = None;
+    for row in rows {
+        if row.factor.is_none() || row.factor_month.as_str() > wanted.as_str() {
+            continue;
+        }
+        let version = row.meta.as_ref().map_or(0, |m| m.version);
+        let later = best.is_none_or(|(held, held_version, _)| {
+            (row.factor_month.as_str(), version) > (held, held_version)
+        });
+        if later {
+            best = Some((row.factor_month.as_str(), version, row));
+        }
+    }
     match best {
-        Some((_, _, factor)) => FactorRead::Taken(factor),
+        Some((held, version, row)) => FactorRead::Taken(
+            row.factor.expect("kept only with its factor"),
+            crate::orders::FactorRow {
+                month: held.to_string(),
+                version,
+                payment_date: row.payment_date.clone(),
+                awaited: if held < wanted.as_str() {
+                    wanted
+                } else {
+                    String::new()
+                },
+            },
+        ),
         None => FactorRead::NonePublished,
+    }
+}
+
+/// The factor for a pool's or a tranche's fill settling in `month`, as the
+/// lake answers it now (W11.11).
+pub(crate) fn latest_factor(bus: &Bus, instrument: &str, month: &str) -> FactorRead {
+    match factor_rows(bus, instrument) {
+        Some(rows) => factor_for(&rows, month),
+        None => FactorRead::Unavailable,
     }
 }
 
@@ -229,6 +275,7 @@ pub(crate) fn context_of(envelope: &Envelope, clock: &dyn Clock) -> Context {
         agent_orders_demo_only: None,
         affirmation: crate::deadline::current(),
         factor_taken: None,
+        factor_row: Default::default(),
         factors_unavailable: false,
     }
 }

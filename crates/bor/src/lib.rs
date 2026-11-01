@@ -51,6 +51,7 @@ pub mod cash;
 pub mod dates;
 pub mod deadline;
 pub mod decide;
+pub mod factors;
 pub mod ids;
 pub mod journal;
 pub mod lifecycle;

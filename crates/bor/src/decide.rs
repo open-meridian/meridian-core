@@ -114,6 +114,9 @@ pub struct Context {
     /// row the lake holds for its settlement month, as the service read it
     /// before the lock; `None` where none is published or none was asked.
     pub factor_taken: Option<meridian_pb::v1::Decimal>,
+    /// Contract v29 (rulings 991, 992, amended at core stage E): the row it
+    /// was read from, and the factor month a provisional one awaits.
+    pub factor_row: crate::orders::FactorRow,
     /// The lake did not answer that read in time: the fill is refused to
     /// be tried again, never priced at a factor nobody read.
     pub factors_unavailable: bool,

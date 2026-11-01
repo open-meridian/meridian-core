@@ -201,6 +201,23 @@ pub enum Act {
         /// or is no pool's. Kept with the act so a rebuild prices it alike.
         #[serde(default, skip_serializing_if = "String::is_empty")]
         factor_taken: String,
+        /// Contract v29 (W11.11; rulings 991, 992, amended at core stage
+        /// E): the row the factor taken was read from, and the factor month
+        /// a provisional one awaits. Empty with factor_taken.
+        #[serde(default, skip_serializing_if = "FactorRow::is_empty")]
+        factor_row: FactorRow,
+    },
+    /// Contract v29 (W9.16, W11.11; ruling 992): the factor a pool's or a
+    /// tranche's fill was taken at, revised by the book when the awaited
+    /// month's row is published or the row taken republished: the new
+    /// factor and its row, and the lots the fill opened, whose provisional
+    /// mark clears. Its lines and its lifecycle event are the entry's.
+    FactorRevised {
+        execution_id: String,
+        factor_taken: String,
+        factor_row: FactorRow,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        lot_ids: Vec<String>,
     },
     /// Unmatched executions accepted by an `ems` (W11.23, contract v23):
     /// each linked to the order and to the placement the accept created,
@@ -315,6 +332,15 @@ pub enum Act {
         allocation: Allocation,
         member_order_id: String,
         lines: (usize, usize),
+        /// Contract v29 (W11.27; rulings 991, 992): a pool's or a tranche's
+        /// booking's factor, derived from its fills -- what a sale's relief
+        /// here records its proceeds at -- and the factor month its
+        /// provisional fills await, which marks the lots it opens. Empty on
+        /// any other.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        factor: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        factor_month_awaited: String,
     },
     /// An allocation received here withdrawn by its booking's cancel or
     /// replace: its lines reversed by this entry.
@@ -416,6 +442,34 @@ pub struct ExecutionHeld {
     /// published factor a pool's or a tranche's fill stating none was taken
     /// at; empty otherwise.
     pub factor_taken: String,
+    /// Contract v29 (rulings 991, 992): the row it was read from, and the
+    /// factor month a provisional factor awaits.
+    pub factor_row: FactorRow,
+}
+
+/// Contract v29 (W11.11; rulings 991, 992, amended at core stage E): the
+/// `Factor` row a factor was taken from -- its month, version and payment
+/// date -- and, where it is provisional, the factor month awaited.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct FactorRow {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub month: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub version: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub payment_date: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub awaited: String,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+impl FactorRow {
+    pub fn is_empty(&self) -> bool {
+        self == &FactorRow::default()
+    }
 }
 
 impl ExecutionHeld {
@@ -695,6 +749,9 @@ impl Ledger {
                     for id in execution_ids {
                         push_once(&mut touched.executions, id);
                     }
+                }
+                Act::FactorRevised { execution_id, .. } => {
+                    push_once(&mut touched.executions, execution_id)
                 }
                 Act::Executed { execution, .. } => {
                     push_once(&mut touched.executions, &execution.execution_id);
@@ -1006,6 +1063,7 @@ impl Ledger {
                 venue_account_code,
                 venue_client_order_id,
                 factor_taken,
+                factor_row,
             } => {
                 let id = execution.execution_id.clone();
                 if !execution.supersedes.is_empty() {
@@ -1041,6 +1099,9 @@ impl Ledger {
                     } else {
                         ExecutionState::Matched as i32
                     };
+                // Contract v29 (991, 992): the factor the book took, and the
+                // month a provisional one awaits, on the record.
+                taken_onto(&mut execution, factor_taken, factor_row);
                 self.executions.insert(
                     id,
                     ExecutionHeld {
@@ -1052,8 +1113,21 @@ impl Ledger {
                         venue_client_order_id: venue_client_order_id.clone(),
                         accepted_lines: None,
                         factor_taken: factor_taken.clone(),
+                        factor_row: factor_row.clone(),
                     },
                 );
+            }
+            Act::FactorRevised {
+                execution_id,
+                factor_taken,
+                factor_row,
+                ..
+            } => {
+                if let Some(held) = self.executions.get_mut(execution_id) {
+                    held.factor_taken = factor_taken.clone();
+                    held.factor_row = factor_row.clone();
+                    taken_onto(&mut held.execution, factor_taken, factor_row);
+                }
             }
             Act::Accepted {
                 execution_ids,
@@ -1215,6 +1289,7 @@ impl Ledger {
                 allocation,
                 member_order_id,
                 lines,
+                ..
             } => {
                 self.received.insert(
                     (booking_id.clone(), allocation.allocation_id.clone()),
@@ -2222,6 +2297,17 @@ pub fn placement_changed(before: Option<&Placement>, after: &Placement) -> Vec<S
         venue_order_ids
     );
     changed
+}
+
+/// The factor taken and the month awaited, onto the execution's record
+/// (contract v29, W11.11; rulings 991, 992): `factor_taken` and
+/// `factor_month_awaited` as the book decided them.
+pub fn taken_onto(execution: &mut Execution, taken: &str, row: &FactorRow) {
+    execution.factor_taken = taken
+        .parse::<meridian_domain::exact::Exact>()
+        .ok()
+        .map(|factor| factor.to_wire());
+    execution.factor_month_awaited = row.awaited.clone();
 }
 
 /// The factor a fill is priced at (contract v29, W11.11; ruling 986, amended

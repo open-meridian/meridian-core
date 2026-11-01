@@ -225,7 +225,7 @@ async fn a_pools_fill_is_at_its_factor_or_the_latest_published_for_its_settlemen
     let execution = execute(&w, &filled).await.unwrap().execution.unwrap();
     assert_eq!(read(&execution.factor_used), "0.5");
     // 500,000 original face at a factor of 0.5, at 98 per 100: 245,000.
-    assert_eq!(cash_of(&w), "-245000.00000");
+    assert_eq!(cash_of(&w), "-245000.00", "to the cent (993)");
 
     // Published: a fill settling on 2026-10-14 states none and takes
     // September's, the last month before October's, at its republication
@@ -237,7 +237,7 @@ async fn a_pools_fill_is_at_its_factor_or_the_latest_published_for_its_settlemen
     second.price = usd("98.00");
     let execution = execute(&w, &second).await.unwrap().execution.unwrap();
     assert!(execution.factor_used.is_none(), "as the fill stated it");
-    assert_eq!(cash_of(&w), "-492450.0000000");
+    assert_eq!(cash_of(&w), "-492450.00");
     let taken = w
         .store
         .journal(ACC)
@@ -429,5 +429,281 @@ async fn accrued_interest_is_its_own_cash_line_and_the_coupon_returns_it_before_
     assert_eq!(
         crate::lifecycle::purchased_accrued(&held, &event).unwrap(),
         paid("531.25")
+    );
+}
+
+/// The lake, stood in on the bus with rows a test publishes as it goes
+/// (contract v29, W10.6): each row as ListFactors answers it.
+fn lake_holding(w: &Wired) -> Arc<std::sync::Mutex<Vec<Factor>>> {
+    let rows: Arc<std::sync::Mutex<Vec<Factor>>> = Arc::default();
+    let held = rows.clone();
+    w.bus.serve(crate::service::LIST_FACTORS, move |_envelope| {
+        Ok((
+            "meridian.v1.ListFactorsReply".into(),
+            ListFactorsReply {
+                factors: held.lock().unwrap().clone(),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ))
+    });
+    rows
+}
+
+fn factor_row(month: &str, factor: &str, version: u64) -> Factor {
+    Factor {
+        meta: Some(ObservationMeta {
+            row_key: format!("FNMA:MA5123:{month}"),
+            version,
+            ..Default::default()
+        }),
+        factor: d(factor),
+        factor_month: month.into(),
+        payment_date: "2025-11-25".into(),
+        ..Default::default()
+    }
+}
+
+/// The book's factor sweep, as its blocking task runs it.
+fn swept(w: &Wired) -> usize {
+    tokio::task::block_in_place(|| crate::factors::sweep(&w.bus, w.store.as_ref()).unwrap())
+}
+
+fn pool_lots(w: &Wired) -> Vec<Lot> {
+    position(w, POOL, HoldingSide::Long)
+        .map(|held| held.lots)
+        .unwrap_or_default()
+}
+
+fn revisions(w: &Wired) -> Vec<LifecycleEvent> {
+    let mut events: Vec<LifecycleEvent> = w
+        .store
+        .book(ACC)
+        .unwrap()
+        .lifecycle_events
+        .into_values()
+        .filter(|event| event.kind == LifecycleEventKind::FactorRevision as i32)
+        .collect();
+    events.sort_by(|a, b| a.event_id.cmp(&b.event_id));
+    events
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pools_fill_before_its_months_factor_is_provisional_then_revised_then_claimed() {
+    // Rulings 991 to 993 (the clock at 2025-10-13): a fill settling in
+    // November takes October's
+    // factor; unpublished, September's, provisional, until the book revises
+    // it; after settlement the difference is a claim a person marks settled.
+    let w = wired();
+    let rows = lake_holding(&w);
+    rows.lock().unwrap().push(factor_row("202509", "0.505", 1));
+    let request = ProposeOrderRequest {
+        instrument_id: POOL.into(),
+        price_basis: PriceBasis::PercentOfPar as i32,
+        limit_price: usd("98.50"),
+        ..buy("1000000")
+    };
+    let (order, placement) = placed(&w, request, "1000000").await;
+    let mut filled = fill(&placement, "500000", "POOL-1");
+    filled.price = usd("98.00");
+    filled.settlement_date = "2025-11-12".into();
+    let execution = execute(&w, &filled).await.unwrap().execution.unwrap();
+    assert_eq!(read(&execution.factor_taken), "0.505");
+    assert_eq!(execution.factor_month_awaited, "202510", "provisional");
+    assert!(execution.factor_used.is_none());
+    // 500,000 x 0.98 x 0.505, to the cent (993).
+    assert_eq!(cash_of(&w), "-247450.00");
+    let lots = pool_lots(&w);
+    assert_eq!(lots.len(), 1);
+    assert_eq!(lots[0].factor_month_awaited, "202510");
+    assert_eq!(
+        read(
+            &lots[0]
+                .terms
+                .as_ref()
+                .unwrap()
+                .cost
+                .as_ref()
+                .unwrap()
+                .amount
+        ),
+        "247450.00",
+        "the lot's cost is the rounded cash"
+    );
+    // A booking of it opens its lot marked too.
+    let booked = send_from(
+        &w.bus,
+        BOOK_ORDER,
+        "meridian.v1.BookOrderRequest",
+        &BookOrderRequest {
+            order_id: order.order_id.clone(),
+            execution_ids: vec![execution.execution_id.clone()],
+            allocations: vec![Allocation {
+                account_id: ACC.into(),
+                quantity: d("500000"),
+                average_price: usd("98.00"),
+                gross_amount: usd("247450.00"),
+                net_amount: usd("247450.00"),
+                ..Default::default()
+            }],
+            hand_off: false,
+        },
+        &person(TRADER),
+    )
+    .await
+    .unwrap();
+    let booking = BookingReply::decode(&booked[..]).unwrap().booking.unwrap();
+    assert!(pool_lots(&w)
+        .iter()
+        .all(|lot| lot.factor_month_awaited == "202510"));
+
+    // Nothing published: nothing revised.
+    assert_eq!(swept(&w), 0);
+    // October's published: the book's own revision, before settlement.
+    rows.lock().unwrap().push(factor_row("202510", "0.49", 1));
+    assert_eq!(swept(&w), 1);
+    assert_eq!(swept(&w), 0);
+    // 500,000 x 0.98 x 0.49 is 240,100.00: 7,350.00 back, pending to the
+    // settlement date.
+    assert_eq!(cash_of(&w), "-240100.00");
+    let revised = revisions(&w);
+    assert_eq!(revised.len(), 1);
+    let first = &revised[0];
+    assert_eq!(first.state, LifecycleEventState::Booked as i32);
+    assert_eq!(first.execution_id, execution.execution_id);
+    assert_eq!(read(&first.prior_factor), "0.505");
+    assert_eq!(read(&first.factor), "0.49");
+    assert_eq!(read(&first.cash.as_ref().unwrap().amount), "7350.00");
+    assert_eq!(
+        read(&first.cost_change.as_ref().unwrap().amount),
+        "-7350.00"
+    );
+    let book = w.store.book(ACC).unwrap();
+    let held = &book.ledger.executions[&execution.execution_id];
+    assert_eq!(held.factor_taken, "0.49");
+    assert!(held.execution.factor_month_awaited.is_empty(), "final");
+    // The booking is held: its correction restates it (W11.27, W11.29).
+    assert_eq!(
+        book.ledger.bookings[&booking.booking_id].state,
+        BookingState::Held
+    );
+    drop(book);
+
+    // After settlement, a republication: the difference an open claim.
+    w.clock.advance(31 * 24 * 3_600 * 1_000_000_000);
+    rows.lock().unwrap().push(factor_row("202510", "0.4901", 2));
+    assert_eq!(swept(&w), 1);
+    let all = revisions(&w);
+    let claim = all
+        .iter()
+        .find(|event| event.state == LifecycleEventState::ClaimOpen as i32)
+        .cloned()
+        .unwrap_or_else(|| panic!("{all:?}"));
+    // 500,000 x 0.98 x 0.0001: 49.00 more paid.
+    assert_eq!(read(&claim.cash.as_ref().unwrap().amount), "-49.00");
+    let pending = position(&w, CHF, HoldingSide::Long).unwrap().pending;
+    assert!(
+        pending
+            .iter()
+            .any(|p| p.value_date.is_empty() && read(&p.quantity) == "-49.00"),
+        "{pending:?}"
+    );
+    let refused = send_from(
+        &w.bus,
+        crate::service::RELEASE_LIFECYCLE_EVENT,
+        "meridian.v1.ReleaseLifecycleEventRequest",
+        &ReleaseLifecycleEventRequest {
+            event_id: claim.event_id.clone(),
+            note: " ".into(),
+        },
+        &person(ADMIN),
+    )
+    .await
+    .unwrap_err();
+    assert!(refused.contains("why"), "{refused}");
+    send_from(
+        &w.bus,
+        crate::service::RELEASE_LIFECYCLE_EVENT,
+        "meridian.v1.ReleaseLifecycleEventRequest",
+        &ReleaseLifecycleEventRequest {
+            event_id: claim.event_id.clone(),
+            note: "the counterparty paid the claim".into(),
+        },
+        &person(ADMIN),
+    )
+    .await
+    .unwrap();
+    let settled = &w.store.book(ACC).unwrap().lifecycle_events[&claim.event_id];
+    assert_eq!(settled.state, LifecycleEventState::Booked as i32);
+    let pending = position(&w, CHF, HoldingSide::Long).unwrap().pending;
+    assert!(
+        pending.iter().all(|p| !p.value_date.is_empty()),
+        "{pending:?}"
+    );
+    // Marked settled once: a second is refused naming it.
+    let again = send_from(
+        &w.bus,
+        crate::service::RELEASE_LIFECYCLE_EVENT,
+        "meridian.v1.ReleaseLifecycleEventRequest",
+        &ReleaseLifecycleEventRequest {
+            event_id: claim.event_id.clone(),
+            note: "again".into(),
+        },
+        &person(ADMIN),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(named(&again), vec!["event_id"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_booking_of_fills_stating_conflicting_factors_is_refused_naming_them() {
+    // Ruling 991: no allocation field carries a factor.
+    let w = wired();
+    let request = ProposeOrderRequest {
+        instrument_id: POOL.into(),
+        price_basis: PriceBasis::PercentOfPar as i32,
+        limit_price: usd("98.50"),
+        ..buy("1000000")
+    };
+    let (order, placement) = placed(&w, request, "1000000").await;
+    let mut ids = Vec::new();
+    for (venue_id, factor) in [("POOL-1", "0.5"), ("POOL-2", "0.51")] {
+        let mut filled = fill(&placement, "500000", venue_id);
+        filled.price = usd("98.00");
+        filled.factor_used = d(factor);
+        ids.push(
+            execute(&w, &filled)
+                .await
+                .unwrap()
+                .execution
+                .unwrap()
+                .execution_id,
+        );
+    }
+    let refused = send_from(
+        &w.bus,
+        BOOK_ORDER,
+        "meridian.v1.BookOrderRequest",
+        &BookOrderRequest {
+            order_id: order.order_id.clone(),
+            execution_ids: ids,
+            allocations: vec![Allocation {
+                account_id: ACC.into(),
+                quantity: d("1000000"),
+                average_price: usd("98.00"),
+                gross_amount: usd("494900.00"),
+                net_amount: usd("494900.00"),
+                ..Default::default()
+            }],
+            hand_off: false,
+        },
+        &person(TRADER),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        named(&refused),
+        vec!["execution_ids[1]".to_string(), "factor_used".to_string()]
     );
 }

@@ -715,7 +715,12 @@ impl Book {
         // Contract v27 (W9.10; rulings 320 and 396): what the entry sold
         // each instrument at -- its execution's price, or a booking's
         // average price -- so each relief records its proceeds.
-        let sales = sales_of(body, &entry.meta.effective_date, &self.account_id);
+        let sales = sales_of(
+            body,
+            &entry.meta.effective_date,
+            &self.account_id,
+            &self.ledger,
+        );
         for line in &body.lines {
             let key = (line.instrument_id.clone(), line.side, line.sleeve.clone());
             let reference = refs[&key].clone();
@@ -747,6 +752,11 @@ impl Book {
                 sale,
             )?;
         }
+
+        // Contract v29 (992): the lots a provisional fill, or a booking of
+        // one, opened marked with the factor month awaited; a revision's
+        // cleared.
+        self.mark_awaited(body);
 
         // Basis adjustments: a lot's cost, changed or stated, and where its
         // holding period starts.
@@ -937,6 +947,109 @@ impl Book {
         }
         self.entries.push(EntryIndex::of(entry, first));
         Ok(changes)
+    }
+
+    /// Contract v29 (W11.11, W11.27; ruling 992): each lot the entry's
+    /// lines opened for a fill priced at a provisional factor, for a
+    /// booking of one, or for an allocation of one received, marked with the
+    /// factor month awaited; each lot a factor revision names cleared.
+    fn mark_awaited(&mut self, body: &Body) {
+        use crate::orders::Act;
+        let mut marks: Vec<(usize, usize, String, String)> = Vec::new();
+        let all = body.lines.len();
+        for act in &body.acts {
+            match act {
+                Act::Executed {
+                    execution,
+                    factor_row,
+                    ..
+                } if !factor_row.awaited.is_empty() => marks.push((
+                    0,
+                    all,
+                    execution.instrument_id.clone(),
+                    factor_row.awaited.clone(),
+                )),
+                Act::Accepted { execution_ids, .. } => {
+                    for id in execution_ids {
+                        if let Some(held) = self
+                            .ledger
+                            .executions
+                            .get(id)
+                            .filter(|held| !held.factor_row.awaited.is_empty())
+                        {
+                            marks.push((
+                                0,
+                                all,
+                                held.execution.instrument_id.clone(),
+                                held.factor_row.awaited.clone(),
+                            ));
+                        }
+                    }
+                }
+                Act::BookingOpened { booking, lines } => {
+                    if let Some(awaited) = self.awaited_in(&booking.execution_ids) {
+                        marks.push((lines.0, lines.1, String::new(), awaited));
+                    }
+                }
+                Act::BookingReplaced {
+                    booking_id, lines, ..
+                } => {
+                    let ids = self
+                        .ledger
+                        .bookings
+                        .get(booking_id)
+                        .map(|held| held.booking.execution_ids.clone())
+                        .unwrap_or_default();
+                    if let Some(awaited) = self.awaited_in(&ids) {
+                        marks.push((lines.0, lines.1, String::new(), awaited));
+                    }
+                }
+                Act::AllocationReceived {
+                    lines,
+                    factor_month_awaited,
+                    ..
+                } if !factor_month_awaited.is_empty() => marks.push((
+                    lines.0,
+                    lines.1,
+                    String::new(),
+                    factor_month_awaited.clone(),
+                )),
+                Act::FactorRevised { lot_ids, .. } => {
+                    for lot_id in lot_ids {
+                        if let Some(state) = self.lot_state_mut(lot_id) {
+                            state.lot.factor_month_awaited.clear();
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (start, count, instrument, awaited) in marks {
+            for line in body.lines.iter().skip(start).take(count) {
+                let opens = line.opens_lot.is_some() && !line.lot_id.is_empty();
+                let on =
+                    instrument.is_empty() || crate::became::same(&instrument, &line.instrument_id);
+                if !(opens && on) {
+                    continue;
+                }
+                if let Some(state) = self.lot_state_mut(&line.lot_id) {
+                    state.lot.factor_month_awaited = awaited.clone();
+                }
+            }
+        }
+    }
+
+    /// The month the first provisional execution of these awaits.
+    fn awaited_in(&self, execution_ids: &[String]) -> Option<String> {
+        execution_ids.iter().find_map(|id| {
+            let held = self.ledger.executions.get(id)?;
+            (!held.factor_row.awaited.is_empty()).then(|| held.factor_row.awaited.clone())
+        })
+    }
+
+    fn lot_state_mut(&mut self, lot_id: &str) -> Option<&mut LotState> {
+        let key = self.lot_owner(lot_id)?.clone();
+        self.positions.get_mut(&key)?.lots.get_mut(lot_id)
     }
 
     /// The order path's acts applied to the ledger, each record they change
@@ -1235,6 +1348,7 @@ fn sales_of(
     body: &Body,
     effective_date: &str,
     account_id: &str,
+    ledger: &crate::orders::Ledger,
 ) -> Vec<(String, Money, String, Option<Exact>)> {
     use crate::orders::Act;
     let mut out = Vec::new();
@@ -1267,17 +1381,30 @@ fn sales_of(
                     ));
                 }
             }
-            Act::AllocationReceived { allocation, .. } => {
+            Act::AllocationReceived {
+                allocation, factor, ..
+            } => {
                 if let Some(price) = allocation.average_price.as_ref() {
+                    // Contract v29 (991): a pool's sale at its fills' factor,
+                    // carried by the child entry.
                     out.push((
                         String::new(),
                         price.clone(),
                         effective_date.to_string(),
-                        None,
+                        hundredths_of(factor.parse::<Exact>().ok()),
                     ));
                 }
             }
             Act::BookingOpened { booking, .. } => {
+                // Contract v29 (991): no allocation field carries a factor;
+                // a pool's sale is at its fills', derived from them.
+                let factor = booking.execution_ids.iter().find_map(|id| {
+                    let held = ledger.executions.get(id)?;
+                    let stated_or_taken = held.factor()?;
+                    (!held.factor_taken.is_empty() || held.execution.factor_used.is_some())
+                        .then(|| Exact::from_wire(&stated_or_taken).ok())
+                        .flatten()
+                });
                 for allocation in &booking.allocations {
                     if allocation.account_id == account_id {
                         if let Some(price) = allocation.average_price.as_ref() {
@@ -1285,7 +1412,7 @@ fn sales_of(
                                 String::new(),
                                 price.clone(),
                                 effective_date.to_string(),
-                                None,
+                                hundredths_of(factor),
                             ));
                         }
                     }
@@ -1307,6 +1434,13 @@ fn sales_of(
         }
     }
     out
+}
+
+/// A pool's or a tranche's factor as a sale's multiplier: per 100 of face
+/// times the factor (contract v29, 986, 991); None where there is none.
+fn hundredths_of(factor: Option<Exact>) -> Option<Exact> {
+    let factor = factor?;
+    crate::orders::multiply("factor", Exact::new(1, 2).ok()?, factor).ok()
 }
 
 /// A line's lot: opened, carried in from another position, added to within

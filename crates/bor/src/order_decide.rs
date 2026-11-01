@@ -3263,6 +3263,16 @@ fn trade_lines(
                 .filter(|_| ctx.is_pooled(&execution.instrument_id))
         });
     let multiplier = ctx.fill_multiplier(&execution.instrument_id, factor.as_ref());
+    // Contract v29 (993): a pool's or a tranche's cash, and its lot's cost,
+    // to the cent half-even, the lot's cost the rounded cash.
+    let pooled = ctx.is_pooled(&execution.instrument_id);
+    let pooled_cents = |field: &str, value: Exact| -> Result<Exact> {
+        if pooled {
+            numbers::cents(field, value)
+        } else {
+            Ok(value)
+        }
+    };
     let value_date = if execution.settlement_date.is_empty() {
         execution.computed_settlement_date.clone()
     } else {
@@ -3300,10 +3310,13 @@ fn trade_lines(
             (
                 Some(price.clone()),
                 Some(Money {
-                    amount: numbers::wire(orders::multiply(
+                    amount: numbers::wire(pooled_cents(
                         "cost",
-                        orders::multiply("cost", magnitude, unit)?,
-                        multiplier,
+                        orders::multiply(
+                            "cost",
+                            orders::multiply("cost", magnitude, unit)?,
+                            multiplier,
+                        )?,
                     )?),
                     ..price.clone()
                 }),
@@ -3375,10 +3388,13 @@ fn trade_lines(
     // -- the account's base currency a balance, any other opening or
     // relieving lots (contract v24, option (c)), a receipt's lot costed in
     // the base where the fill's other leg is the base currency itself.
-    let notional = orders::multiply(
+    let notional = pooled_cents(
         "cash",
-        orders::multiply("cash", quantity, unit)?,
-        multiplier,
+        orders::multiply(
+            "cash",
+            orders::multiply("cash", quantity, unit)?,
+            multiplier,
+        )?,
     )?;
     let cash = cash_instrument(&price)?;
     let signed = if side == Side::Buy {
@@ -3763,7 +3779,7 @@ pub fn report_execution(
     };
     let order = held(book, &order_id)?;
     factor_holds(ctx, &order.order.instrument_id, request, bust)?;
-    let taken = factor_taken(ctx, request, &order.order.instrument_id);
+    let (taken, factor_row) = factor_taken(ctx, request, &order.order.instrument_id);
     let cross = cross_holds(order, request, kind, bust)?;
     let sender = ctx.instance_id.clone();
     let mut execution = Execution {
@@ -3809,6 +3825,7 @@ pub fn report_execution(
         venue_account_code: request.venue_account_code.clone(),
         venue_client_order_id: request.venue_client_order_id.clone(),
         factor_taken: taken,
+        factor_row,
     }];
     // A fill after the order ended: accepted, recorded, late fact (row 12).
     if ended(from) {
@@ -3949,15 +3966,24 @@ fn factor_holds(
 /// The published factor a pool's or a tranche's fill stating none is taken
 /// at (contract v29, W11.11): the context's, as exact decimal text; empty
 /// where it states one, or is no pool's.
-fn factor_taken(ctx: &Context, request: &ReportExecutionRequest, instrument: &str) -> String {
+fn factor_taken(
+    ctx: &Context,
+    request: &ReportExecutionRequest,
+    instrument: &str,
+) -> (String, orders::FactorRow) {
     if request.factor_used.is_some() || !ctx.is_pooled(instrument) {
-        return String::new();
+        return (String::new(), orders::FactorRow::default());
     }
-    ctx.factor_taken
+    let taken = ctx
+        .factor_taken
         .as_ref()
         .and_then(|factor| Exact::from_wire(factor).ok())
         .map(|factor| factor.to_string())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if taken.is_empty() {
+        return (taken, orders::FactorRow::default());
+    }
+    (taken, ctx.factor_row.clone())
 }
 
 /// A net's internal cross (W11.11, contract v27; the gaps spec's D3 and
@@ -4253,6 +4279,7 @@ fn report_unmatched(
     }
     let from = superseded.and_then(|held| ExecutionState::try_from(held.execution.state).ok());
     let execution_id = execution.execution_id.clone();
+    let (taken, factor_row) = factor_taken(ctx, request, &execution.instrument_id);
     let mut acts = vec![Act::Executed {
         execution: execution.clone(),
         sender: sender.clone(),
@@ -4260,7 +4287,8 @@ fn report_unmatched(
         venue_client_order_id: request.venue_client_order_id.clone(),
         // Contract v29 (amended at core stage C): a pool's fill on no
         // order keeps the factor taken for it, for its accept.
-        factor_taken: factor_taken(ctx, request, &execution.instrument_id),
+        factor_taken: taken,
+        factor_row,
     }];
     acts.extend(claimed_unplaced(book, &sender, &execution));
     let mut plan =
