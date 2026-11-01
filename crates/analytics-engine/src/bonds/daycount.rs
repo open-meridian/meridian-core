@@ -52,6 +52,26 @@ pub fn not_computed(name: &str) -> String {
     format!("day_count: {name} is not computed by bond_cash_flows v1")
 }
 
+/// The counts v29's engine does not compute though a record may hold them
+/// (ruling 997): answered `NOT_EVALUATED_REASON_NOT_SUPPORTED`, the count
+/// named; an empty count, or one naming no variant, is the terms'
+/// incompleteness instead.
+pub const NOT_SUPPORTED: [&str; 3] = [
+    "DAY_COUNT_BUS_252",
+    "DAY_COUNT_ACT_ACT_AFB",
+    "DAY_COUNT_ACT_ACT_ICMA_ULTIMO",
+];
+
+/// The reason a count is not computed for: NOT_SUPPORTED for the three v29
+/// does not compute, TERMS_INCOMPLETE otherwise.
+pub fn reason_for(name: &str) -> &'static str {
+    if NOT_SUPPORTED.contains(&name) {
+        crate::answer::NOT_SUPPORTED
+    } else {
+        crate::answer::TERMS_INCOMPLETE
+    }
+}
+
 impl DayCount {
     /// The day count a terms' name states, or why it is not computed.
     pub fn named(name: &str) -> Result<DayCount, String> {

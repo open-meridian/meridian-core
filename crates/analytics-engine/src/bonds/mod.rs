@@ -207,7 +207,7 @@ impl Held {
     pub fn valuation_gap(&self) -> Option<Why> {
         match &self.debt {
             Debt::Bond(bond) if bond.security_type == DebtSecurityType::Tips as i32 => Some((
-                crate::answer::PRICE_MISSING,
+                crate::answer::NOT_SUPPORTED,
                 "the CPI-U index ratio a TIPS's principal accretes by".to_string(),
             )),
             _ => None,
@@ -231,14 +231,14 @@ impl Held {
                     CouponType::try_from(bond.coupon_type).unwrap_or(CouponType::Unspecified);
                 if coupon == CouponType::Floating || bond.floating.is_some() {
                     return Err((
-                        crate::answer::PRICE_MISSING,
+                        crate::answer::NOT_SUPPORTED,
                         "a floater's index projection: its coupons are not projected in v29"
                             .to_string(),
                     ));
                 }
                 if bond.security_type == DebtSecurityType::Tips as i32 {
                     return Err((
-                        crate::answer::PRICE_MISSING,
+                        crate::answer::NOT_SUPPORTED,
                         "the CPI-U index ratio a TIPS's principal accretes by".to_string(),
                     ));
                 }
@@ -258,8 +258,9 @@ impl Held {
                 let day_count = if zero && bond.day_count == 0 {
                     DayCount::ActActIcma
                 } else {
-                    DayCount::named(name_of_day_count(bond.day_count))
-                        .map_err(|why| (crate::answer::TERMS_INCOMPLETE, why))?
+                    DayCount::named(name_of_day_count(bond.day_count)).map_err(|why| {
+                        (daycount::reason_for(name_of_day_count(bond.day_count)), why)
+                    })?
                 };
                 let rate = if zero {
                     Ratio::zero()
@@ -297,7 +298,7 @@ impl Held {
                 let maturity = date(&cd.maturity_date, "maturity_date")?;
                 let accrues_from = date(&cd.issue_date, "issue_date")?;
                 let day_count = DayCount::named(name_of_day_count(cd.day_count))
-                    .map_err(|why| (crate::answer::TERMS_INCOMPLETE, why))?;
+                    .map_err(|why| (daycount::reason_for(name_of_day_count(cd.day_count)), why))?;
                 Ok(Shape {
                     accrues_from,
                     first_coupon: None,

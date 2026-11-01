@@ -384,3 +384,32 @@ fn g33s_one_period_formula_prices_a_municipal_in_its_last_period() {
     let ytm = figure(&answer, "bond_yield", "INS-BOND0", "to_maturity").unwrap();
     assert_eq!(ytm, 3.5);
 }
+
+#[test]
+fn a_term_the_engine_does_not_compute_is_not_supported_and_named() {
+    // Ruling 997: BUS/252, actual/actual (AFB) and (ICMA ultimo), a
+    // floater's index projection and a TIPS's index ratio.
+    for count in [
+        "DAY_COUNT_BUS_252",
+        "DAY_COUNT_ACT_ACT_AFB",
+        "DAY_COUNT_ACT_ACT_ICMA_ULTIMO",
+    ] {
+        let mut doc = bonds_document(&[corporate()], &curve(), &["bond_yield"], "2026-10-16");
+        doc["instruments"][1]["debt"]["terms"]["day_count"] = json!(count);
+        let answer = crate::compute(&doc).unwrap();
+        let said = reasons(&answer);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert_eq!(said[0].1, NOT_SUPPORTED, "{said:?}");
+        assert!(said[0].2.contains(count), "{said:?}");
+    }
+    let mut doc = bonds_document(&[corporate()], &curve(), &["bond_yield"], "2026-10-16");
+    doc["instruments"][1]["debt"]["terms"]["coupon_type"] = json!("COUPON_TYPE_FLOATING");
+    let answer = crate::compute(&doc).unwrap();
+    assert_eq!(answer.not_evaluated[0].reason, NOT_SUPPORTED);
+    assert!(answer.not_evaluated[0].detail.contains("index projection"));
+    // An empty count is the terms' incompleteness, as before.
+    let mut doc = bonds_document(&[corporate()], &curve(), &["bond_yield"], "2026-10-16");
+    doc["instruments"][1]["debt"]["terms"]["day_count"] = json!("");
+    let answer = crate::compute(&doc).unwrap();
+    assert_eq!(answer.not_evaluated[0].reason, TERMS_INCOMPLETE);
+}

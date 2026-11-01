@@ -45,6 +45,10 @@ pub const INPUT_QUARANTINED: &str = "NOT_EVALUATED_REASON_INPUT_QUARANTINED";
 /// Contract v29 (W12.1): a debt record minted without the terms a measure
 /// needs, the fields named.
 pub const TERMS_INCOMPLETE: &str = "NOT_EVALUATED_REASON_TERMS_INCOMPLETE";
+/// Contract v29 (W12.1; ruling 997): a term v29's engine does not compute
+/// -- a floater's index projection, a TIPS's index ratio, BUS/252,
+/// actual/actual (AFB) or (ICMA ultimo) -- the term named.
+pub const NOT_SUPPORTED: &str = "NOT_EVALUATED_REASON_NOT_SUPPORTED";
 
 /// How a conversion leg's rate was found (contract v27, ruling 462).
 pub const DIRECT: &str = "CONVERSION_DERIVATION_DIRECT";
