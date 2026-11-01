@@ -46,7 +46,7 @@ import "meridian/v1/scenarios.proto";
 message ObservationMeta {
   // The data plugin's identity for this observation, made from its raw record, so
   // the same observation recorded again changes nothing and a changed value
-  // under it is a restatement. 1 to 128 characters.
+  // or quality state under it is a restatement. 1 to 128 characters.
   string row_key = 1;
 
   // The entities the row is about, each resolved through W3.1: 1 to 8.
@@ -188,16 +188,17 @@ message DatasetRef {
   DatasetDeclaration declaration = 5;
 
   // For the Data sources page, in a listing of datasets (W10.9; approved
-  // 2026-10-10): the rows the lake keeps of the dataset carrying a value as
+  // 2026-10-10): the rows in force of the dataset carrying a value as
   // reported beside a field left not known; and the identifiers and venues
   // its instance reported missing (W3.2, W3.15), as the lake heard them. 0
   // in a read's answer and on an entitlements change.
   uint64 unconverted_count = 6;
   uint64 miss_count = 7;
 
-  // Contract v23 (W10.9): the rows the lake keeps of the dataset flagged on
-  // a closed day of its calendar, a weekend or a holiday; and those flagged
-  // outside its coverage, counted apart. 0 in a read's answer and on an
+  // Contract v23 (W10.9): the rows in force of the dataset flagged on a
+  // closed day of its calendar, a weekend or a holiday; and those flagged
+  // outside its coverage, counted apart. Each row key counts once, at its
+  // version in force (ruling 1006). 0 in a read's answer and on an
   // entitlements change.
   uint64 closed_day_count = 8;
   uint64 outside_coverage_count = 9;
