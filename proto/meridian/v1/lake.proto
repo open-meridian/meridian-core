@@ -2479,6 +2479,18 @@ message Factor {
   // The annual rate the agency's reset file states. Unset on a fixed-rate pool
   // or class.
   optional Decimal coupon_rate = 6;
+  // Contract v29 (995): the pool's or class's weighted average coupon for the
+  // month, percent per year, as the agency's monthly disclosure states it (FIX
+  // stipulation WAC). Unset where the agency states none.
+  optional Decimal wac = 7;
+  // Contract v29 (995): the weighted average remaining maturity in months, as
+  // the agency's monthly disclosure states it (FIX stipulation WAM). Unset
+  // where the agency states none.
+  optional uint32 wam = 8;
+  // Contract v29 (995): the weighted average loan age in months, as the
+  // agency's monthly disclosure states it (FIX stipulation WALA). Unset where
+  // the agency states none; 0 for a pool in its first month.
+  optional uint32 wala = 9;
 }
 
 // Contract v29 (W10.4): RecordFactors's command, batched, recorded whole or

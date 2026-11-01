@@ -2393,6 +2393,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
             self.exact("event.factor", held0.factor.as_ref())?;
             self.exact("event.prior_factor", held0.prior_factor.as_ref())?;
             self.exact("event.face_change", held0.face_change.as_ref())?;
+            self.exact_money("event.cost_change", held0.cost_change.as_ref())?;
         }
         let account = None;
         self.command_typed("platform.book.command.record-lifecycle-event", "meridian.v1.RecordLifecycleEventRequest", message, account, acting_for).await
@@ -2422,6 +2423,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
             self.exact(&format!("events[{i0}].factor"), held0.factor.as_ref())?;
             self.exact(&format!("events[{i0}].prior_factor"), held0.prior_factor.as_ref())?;
             self.exact(&format!("events[{i0}].face_change"), held0.face_change.as_ref())?;
+            self.exact_money(&format!("events[{i0}].cost_change"), held0.cost_change.as_ref())?;
         }
         let account = None;
         self.command_typed("platform.book.command.propose-lifecycle-events", "meridian.v1.ProposeLifecycleEventsRequest", message, account, acting_for).await
@@ -3146,6 +3148,7 @@ impl plugin::plugin_operations_server::PluginOperations for Sidecar {
             }
             self.exact(&format!("factors[{i0}].factor"), held0.factor.as_ref())?;
             self.exact(&format!("factors[{i0}].coupon_rate"), held0.coupon_rate.as_ref())?;
+            self.exact(&format!("factors[{i0}].wac"), held0.wac.as_ref())?;
         }
         for stamped0 in message.factors.iter_mut() {
             let stamped1 = stamped0.meta.get_or_insert_with(Default::default);

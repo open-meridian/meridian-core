@@ -785,6 +785,9 @@ mod tests {
             record_date: "2026-10-31".into(),
             payment_date: "2026-11-25".into(),
             coupon_rate: Some(meridian_pb::v1::Decimal::default()),
+            wac: None,
+            wam: None,
+            wala: None,
         };
         let event = FactorsRecordedEvent {
             factor: Some(row.clone()),

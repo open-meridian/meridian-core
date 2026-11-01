@@ -274,6 +274,10 @@ enum NotEvaluatedReason {
   // a callable bond without its calls -- so no yield to worst or cash flow is
   // computed from a guess.
   NOT_EVALUATED_REASON_TERMS_INCOMPLETE = 14;
+  // Contract v29 (997): a term v29's engine does not compute, named in detail
+  // -- a floater's index projection, a TIPS's index ratio, BUS/252, actual/
+  // actual (AFB) or (ICMA ultimo) -- so no figure is computed from a guess.
+  NOT_EVALUATED_REASON_NOT_SUPPORTED = 15;
 }
 
 // What an answer was computed from (requirements 4 and 35; Q7). Named so it

@@ -597,6 +597,9 @@ fn factor(subject: &str, month: &str, value: &str, payment: &str) -> meridian_do
         record_date: "2026-10-31".into(),
         payment_date: payment.into(),
         coupon_rate: None,
+        wac: None,
+        wam: None,
+        wala: None,
     }
 }
 

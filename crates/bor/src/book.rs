@@ -1356,6 +1356,9 @@ fn apply_lot(
                     adjusted_by: Vec::new(),
                     sleeve: line.sleeve.clone(),
                     reliefs: Vec::new(),
+                    // Contract v29 (992): marked by the entry's acts, once
+                    // its lines are applied.
+                    factor_month_awaited: String::new(),
                 },
                 opened_in: entry_sequence,
                 ordinal: position.opened_lots,

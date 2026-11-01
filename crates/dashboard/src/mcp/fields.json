@@ -1302,6 +1302,11 @@
           "value": "NOT_EVALUATED_REASON_TERMS_INCOMPLETE",
           "meaning": "a debt record minted incomplete, its missing fields named -- a callable bond without its calls -- so no yield to worst or cash flow is computed from a guess",
           "since": "v29"
+        },
+        {
+          "value": "NOT_EVALUATED_REASON_NOT_SUPPORTED",
+          "meaning": "a term v29's engine does not compute, named in detail -- a floater's index projection, a TIPS's index ratio, BUS/252, actual/actual (AFB) or (ICMA ultimo) -- so no figure is computed from a guess (997)",
+          "since": "v29"
         }
       ],
       "empty": "never unspecified",
@@ -4760,6 +4765,25 @@
       "filled": "decided",
       "filled_by": "bor",
       "since": "v27",
+      "stability": "preview",
+      "store": "bor"
+    },
+    {
+      "name": "meridian.v1.Lot.factor_month_awaited",
+      "type": "text",
+      "bounds": {
+        "length": [
+          0,
+          6
+        ]
+      },
+      "empty": "empty where the lot's cost is final, and on a lot opened by anything but a pool's or a tranche's provisional fill or a booking of one",
+      "intent": "marks a lot whose cost is at a provisional factor (992)",
+      "meaning": "YYYYMM, the factor month whose Factor row the lot's cost waits for; a fill's lot is cleared by its factor revision, its cost adjusted by the revision's cost_change; a booking's lot by the booking's correction (W11.29)",
+      "not_meaning": "the lot's settlement date",
+      "filled": "decided",
+      "filled_by": "bor",
+      "since": "v29",
       "stability": "preview",
       "store": "bor"
     },
@@ -20767,6 +20791,11 @@
           "value": "LIFECYCLE_EVENT_KIND_RECONSTITUTION",
           "meaning": "reconstitution: STRIPS components exchanged back for the whole bond",
           "since": "v29"
+        },
+        {
+          "value": "LIFECYCLE_EVENT_KIND_FACTOR_REVISION",
+          "meaning": "factor revision: the book's own record when the factor a pool's or a tranche's fill was provisionally priced at is published, or its row republished: the old and new factor, the cash and the lots' cost difference (992); refused on a report or a proposal",
+          "since": "v29"
         }
       ],
       "required": [
@@ -20843,6 +20872,11 @@
         {
           "value": "LIFECYCLE_EVENT_STATE_SUPERSEDED",
           "meaning": "a booked event a later correction names"
+        },
+        {
+          "value": "LIFECYCLE_EVENT_STATE_CLAIM_OPEN",
+          "meaning": "a factor revision written on or after the fill's settlement date: its cash difference an open receivable or payable, pending and dated nothing, until a person marks it settled (W9.18; 992)",
+          "since": "v29"
         }
       ],
       "empty": "unset on a request",
@@ -21193,8 +21227,8 @@
       "name": "meridian.v1.ReleaseLifecycleEventRequest.event_id",
       "type": "text",
       "empty": "never empty",
-      "intent": "names the proposal released",
-      "meaning": "a proposal no report answered",
+      "intent": "names the proposal released, or the open claim marked settled",
+      "meaning": "a proposal no report answered; from v29 a factor revision in LIFECYCLE_EVENT_STATE_CLAIM_OPEN, marked settled (992)",
       "not_meaning": "a report",
       "filled": "entered",
       "filled_by": "operations",
@@ -21378,6 +21412,11 @@
         {
           "value": "LIFECYCLE_EVENT_KIND_RECONSTITUTION",
           "meaning": "reconstitution: STRIPS components exchanged back for the whole bond",
+          "since": "v29"
+        },
+        {
+          "value": "LIFECYCLE_EVENT_KIND_FACTOR_REVISION",
+          "meaning": "factor revision: the book's own record of a provisional factor published or republished (992)",
           "since": "v29"
         }
       ],
@@ -21702,6 +21741,33 @@
       "not_meaning": "a paydown, which moves cash",
       "filled": "as-reported",
       "filled_by": "custody",
+      "since": "v29",
+      "stability": "preview",
+      "store": "bor"
+    },
+    {
+      "name": "meridian.v1.LifecycleEvent.cost_change",
+      "type": "Money",
+      "unit": "the major unit of the asset the Money names",
+      "empty": "unset on any kind but factor revision",
+      "intent": "states the change a factor revision made to the cost of the lots the fill opened (992)",
+      "meaning": "signed: the lots' cost at the new factor less at the old, each rounded to the cent half-even (993), adjusted on the fill's lots in the revision's entry",
+      "not_meaning": "the cash difference, which cash states; a realized gain",
+      "filled": "decided",
+      "filled_by": "bor",
+      "since": "v29",
+      "stability": "preview",
+      "store": "bor"
+    },
+    {
+      "name": "meridian.v1.LifecycleEvent.execution_id",
+      "type": "text",
+      "empty": "empty on any kind but factor revision",
+      "intent": "names the fill a factor revision revised (992)",
+      "meaning": "its EXE- execution in the event's account",
+      "not_meaning": "a booking, which the revision holds (W11.27)",
+      "filled": "decided",
+      "filled_by": "bor",
       "since": "v29",
       "stability": "preview",
       "store": "bor"
@@ -22064,9 +22130,9 @@
         }
       },
       "unit": "a fraction of original face",
-      "empty": "unset on a fill in a record that is no pool or tranche, or on a TBA's done at the latest; on a pool's or a tranche's fill, unset is the latest Factor row the lake holds for its settlement month, which the book reads (986, amended at core stage C), a fill no published row answers refused naming it",
-      "intent": "states the factor a pool, tranche or TBA trade was done at (6730(d)(2)(B); FIX Factor, 228)",
-      "meaning": "an exact decimal: the fill's cash is original face times it times price over 100 (986); refused on a fill in any record but a pool, a tranche or a TBA",
+      "empty": "unset on a fill in a record that is no pool or tranche, or on a TBA's done at the latest; on a pool's or a tranche's fill, unset is the factor the agency published for its settlement month, which the book takes (factor_taken; 991, amended at core stage E), provisional while that month's row is unpublished (992), a fill no published row answers refused naming it",
+      "intent": "overrides the security's factor where a pool, tranche or TBA trade was not done at the one published for its settlement month (991; 6730(d)(2)(B); FIX Factor, 228)",
+      "meaning": "an exact decimal, final, changed only by a correction of the fill: the fill's cash is original face times it times price over 100, rounded to the cent half-even (993); refused on a fill in any record but a pool, a tranche or a TBA",
       "not_meaning": "a factor the book computed",
       "filled": "as-reported",
       "filled_by": "connectivity",
@@ -22088,9 +22154,9 @@
         }
       },
       "unit": "a fraction of original face",
-      "empty": "unset on a fill in a record that is no pool or tranche, or on a TBA's done at the latest; on a pool's or a tranche's fill, unset is the latest Factor row the lake holds for its settlement month, which the book reads (986, amended at core stage C), a fill no published row answers refused naming it",
-      "intent": "states the factor a pool, tranche or TBA trade was done at (6730(d)(2)(B); FIX Factor, 228)",
-      "meaning": "an exact decimal: the fill's cash is original face times it times price over 100 (986); refused on a fill in any record but a pool, a tranche or a TBA",
+      "empty": "unset on a fill in a record that is no pool or tranche, or on a TBA's done at the latest; on a pool's or a tranche's fill, unset is the factor the agency published for its settlement month, which the book takes (factor_taken; 991, amended at core stage E), provisional while that month's row is unpublished (992), a fill no published row answers refused naming it",
+      "intent": "overrides the security's factor where a pool, tranche or TBA trade was not done at the one published for its settlement month (991; 6730(d)(2)(B); FIX Factor, 228)",
+      "meaning": "an exact decimal, final, changed only by a correction of the fill: the fill's cash is original face times it times price over 100, rounded to the cent half-even (993); refused on a fill in any record but a pool, a tranche or a TBA",
       "not_meaning": "a factor the book computed",
       "filled": "as-reported",
       "filled_by": "connectivity",
@@ -22103,7 +22169,7 @@
       "type": "boolean",
       "empty": "false: the settlement date is known",
       "intent": "says a settlement date is not yet known",
-      "meaning": "true for a new-issue municipal traded when issued, so an empty date is never ambiguous",
+      "meaning": "true for a new-issue municipal traded when issued, so an empty date is never ambiguous; its security and cash stay pending, dated nothing, until a correction of the fill states the date (amended at core stage E)",
       "not_meaning": "a fill with no settlement date, which stays refused otherwise",
       "filled": "as-reported",
       "filled_by": "connectivity",
@@ -22116,7 +22182,7 @@
       "type": "boolean",
       "empty": "false: the settlement date is known",
       "intent": "says a settlement date is not yet known",
-      "meaning": "true for a new-issue municipal traded when issued, so an empty date is never ambiguous",
+      "meaning": "true for a new-issue municipal traded when issued, so an empty date is never ambiguous; its security and cash stay pending, dated nothing, until a correction of the fill states the date (amended at core stage E)",
       "not_meaning": "a fill with no settlement date, which stays refused otherwise",
       "filled": "as-reported",
       "filled_by": "connectivity",
@@ -22601,6 +22667,49 @@
       "not_meaning": "when-issued, derived from the issue date",
       "filled": "as-reported",
       "filled_by": "oms",
+      "since": "v29",
+      "stability": "preview",
+      "store": "bor"
+    },
+    {
+      "name": "meridian.v1.Execution.factor_taken",
+      "type": "Decimal",
+      "bounds": {
+        "digits": 38,
+        "scale": [
+          0,
+          18
+        ],
+        "range": {
+          "least": "0"
+        }
+      },
+      "unit": "a fraction of original face",
+      "empty": "unset where factor_used is stated, and on a fill in a record that is no pool or tranche",
+      "intent": "says the factor the book priced a pool's or a tranche's fill stating none at (991, 992)",
+      "meaning": "the agency's factor for the fill's settlement month, the latest version of its Factor row; while that row is unpublished the latest row published before it, provisional (factor_month_awaited); a factor revision replaces it (W11.11)",
+      "not_meaning": "a factor the fill stated, which factor_used keeps as reported",
+      "filled": "decided",
+      "filled_by": "bor",
+      "since": "v29",
+      "stability": "preview",
+      "store": "bor"
+    },
+    {
+      "name": "meridian.v1.Execution.factor_month_awaited",
+      "type": "text",
+      "bounds": {
+        "length": [
+          0,
+          6
+        ]
+      },
+      "empty": "empty where the fill's factor is final: stated, or the settlement month's own",
+      "intent": "marks a fill priced at a provisional factor (992)",
+      "meaning": "YYYYMM, the factor month whose Factor row the fill waits for; its current face, cash, accrued and lots are provisional until the book revises them (LIFECYCLE_EVENT_KIND_FACTOR_REVISION)",
+      "not_meaning": "the fill's settlement month",
+      "filled": "decided",
+      "filled_by": "bor",
       "since": "v29",
       "stability": "preview",
       "store": "bor"
@@ -45232,6 +45341,58 @@
       "intent": "states a floater's coupon for the period",
       "meaning": "the annual rate the agency's reset file states",
       "not_meaning": "the index's rate",
+      "filled": "as-reported",
+      "filled_by": "data",
+      "since": "v29",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.Factor.wac",
+      "type": "Decimal",
+      "bounds": {
+        "digits": 38,
+        "scale": [
+          0,
+          18
+        ],
+        "range": {
+          "least": "0"
+        }
+      },
+      "unit": "percent per year",
+      "empty": "unset where the agency's disclosure states none",
+      "intent": "states the pool's or class's weighted average coupon for the month (995; FIX stipulation WAC)",
+      "meaning": "the weighted average of the underlying loans' note rates, as the agency's monthly disclosure states it; the engine schedules amortization at it where stated (W12.1)",
+      "not_meaning": "the pass-through coupon, which the terms state; a floater's period coupon_rate",
+      "filled": "as-reported",
+      "filled_by": "data",
+      "since": "v29",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.Factor.wam",
+      "type": "integer",
+      "unit": "months",
+      "empty": "unset where the agency's disclosure states none",
+      "intent": "states the pool's or class's weighted average remaining maturity (995; FIX stipulation WAM)",
+      "meaning": "the weighted average of the underlying loans' remaining terms in months, as the agency's monthly disclosure states it",
+      "not_meaning": "the months to the security's maturity date",
+      "filled": "as-reported",
+      "filled_by": "data",
+      "since": "v29",
+      "stability": "preview",
+      "store": "lake"
+    },
+    {
+      "name": "meridian.v1.Factor.wala",
+      "type": "integer",
+      "unit": "months",
+      "empty": "unset where the agency's disclosure states none; 0 is a value, a pool in its first month",
+      "intent": "states the pool's or class's weighted average loan age (995; FIX stipulation WALA)",
+      "meaning": "the weighted average of the underlying loans' ages in months, as the agency's monthly disclosure states it",
+      "not_meaning": "the months since the security's issue date",
       "filled": "as-reported",
       "filled_by": "data",
       "since": "v29",
