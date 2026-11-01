@@ -967,7 +967,17 @@ fn lake_listing() -> meridian_domain::v1::ListDatasetsReply {
                     key: key.to_string(),
                     vendor: vendor.to_string(),
                     aggregator: aggregator.to_string(),
-                    data_types: vec!["meridian.v1.Price".into(), "meridian.v1.Bar".into()],
+                    // Contract v29: one serving the factor kind too, its
+                    // Serves cell the widest.
+                    data_types: if n == 6 {
+                        vec![
+                            "meridian.v1.Price".into(),
+                            "meridian.v1.Bar".into(),
+                            "meridian.v1.Factor".into(),
+                        ]
+                    } else {
+                        vec!["meridian.v1.Price".into(), "meridian.v1.Bar".into()]
+                    },
                     modes: vec![1, 2],
                     cadence: 86_400,
                     licence_default: Some(DatasetLicence {
@@ -995,6 +1005,11 @@ fn lake_listing() -> meridian_domain::v1::ListDatasetsReply {
                 // the browser sees both in the one cell.
                 closed_day_count: (n * 2 + k) as u64 * 11,
                 outside_coverage_count: if k == 1 { (n + 1) as u64 * 3 } else { 0 },
+                // Contract v29 (619 (2)): the rows kept by effective state,
+                // a large dataset among them.
+                valid_count: (n * 3 + k) as u64 * 104_729,
+                suspicious_count: (n + k) as u64 * 13,
+                invalid_count: if k == 1 { (n + 1) as u64 * 2 } else { 0 },
                 ..Default::default()
             });
             if n < 2 || (n == 2 && k == 0) {
@@ -2225,7 +2240,19 @@ async fn serve_a_plugins_settings_pages_for_a_browser() {
                         implementation: "built-in".into(),
                         ..Default::default()
                     },
-                ],
+                ]
+                .into_iter()
+                // Contract v29 (stage E): v28's and v29's models, built-in.
+                .chain(
+                    crate::admin::model_routing::MODEL_IDS[3..]
+                        .iter()
+                        .map(|model| meridian_domain::v1::ModelRouting {
+                            model_id: model.to_string(),
+                            implementation: "built-in".into(),
+                            ..Default::default()
+                        }),
+                )
+                .collect(),
                 version: 2,
             }
             .encode_to_vec(),

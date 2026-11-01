@@ -208,7 +208,7 @@ table.holds .actions{display:none}table.holds th:first-child{width:38%}table.hol
 table.datasets td button.link,table.priorities td button.link{border:0;background:none;box-shadow:none;padding:0;\
 min-height:0;color:var(--accent);font:inherit;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;\
 display:block;text-align:left}\
-table.datasets th:first-child{width:18%}table.datasets th.num{width:6.5rem}table.datasets th.count{width:5.5rem}table.datasets th.actions{width:10.5rem}\
+table.datasets th:first-child{width:13%}table.datasets th.num{width:4.5rem}table.datasets th.count{width:4.5rem}table.datasets th.licence{width:5rem}table.datasets th.actions{width:6rem}\
 table.entitlements th.actions{width:11.5rem}table.priorities th:first-child{width:12rem}table.priorities th.actions{width:5rem}\
 table.datasets td.actions,table.entitlements td.actions,table.priorities td.actions{text-align:right}\
 table.entitlements form.inline{display:inline}\

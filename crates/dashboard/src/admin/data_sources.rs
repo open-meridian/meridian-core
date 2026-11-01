@@ -369,7 +369,7 @@ fn datasets_tab(rows: &[Row], records: &AccessRecords, token: &str) -> (String, 
                 thousands(d.invalid_count)
             );
             let quality_said = format!(
-                "{} valid, {} suspicious, {} invalid (left out of default reads)",
+                "{quality}: {} valid, {} suspicious, {} invalid (left out of default reads)",
                 thousands(d.valid_count),
                 thousands(d.suspicious_count),
                 thousands(d.invalid_count)
@@ -393,9 +393,7 @@ fn datasets_tab(rows: &[Row], records: &AccessRecords, token: &str) -> (String, 
                  <td class=\"wide num\" data-misses>{misses}</td>\
                  <td class=\"wide num\" data-closed-days title=\"{closed_said}\">{closed}</td>\
                  <td class=\"wide num\" data-quality title=\"{quality_said}\">{quality}</td>\
-                 <td class=\"actions\"><button type=\"button\" class=\"wide\" data-dialog-open=\"licence\" \
-                 data-title=\"Licence {id}\" data-fill=\"{fill}\">Licence</button> \
-                 <button type=\"button\" data-dialog-open=\"entitle\" data-title=\"Entitle a plugin to {id}\" \
+                 <td class=\"actions\"><button type=\"button\" data-dialog-open=\"entitle\" data-title=\"Entitle a plugin to {id}\" \
                  data-fill=\"{entitle}\">Entitle</button></td></tr>",
                 id = escape(&d.dataset),
                 fill = escape(&fill.to_string()),
@@ -434,7 +432,7 @@ fn datasets_tab(rows: &[Row], records: &AccessRecords, token: &str) -> (String, 
             "<om-pager search=\"Search datasets\"><table class=\"list one-line datasets\" data-datasets=\"{n}\"><thead><tr>\
              <th>Dataset</th><th class=\"wide\" title=\"Vendor, and the source behind it\">Vendor</th>\
              <th class=\"wide\" title=\"What it serves, its prices' class of source beside them\">Serves</th>\
-             <th>Licence</th><th class=\"wide count\" title=\"Plugins entitled\">Entitled</th>\
+             <th class=\"licence\" title=\"The dataset's name opens its licence\">Licence</th><th class=\"wide count\" title=\"Plugins entitled\">Entitled</th>\
              <th class=\"wide num\" title=\"Values left unconverted\">Unconverted</th>\
              <th class=\"wide num\" title=\"Identifiers and venues reported missing\">Misses</th>\
              <th class=\"wide num\" title=\"Daily values dated on a closed day of its calendar, and outside its coverage\">Closed days</th>\
