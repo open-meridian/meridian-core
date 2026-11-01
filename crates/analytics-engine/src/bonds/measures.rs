@@ -20,7 +20,7 @@
 use meridian_domain::date::Date;
 
 use super::curve::{maturity_of, Curve, ParPoint};
-use super::dates::{plus_days, Calendar};
+use super::dates::{days, plus_days, Calendar};
 use super::daycount::DayCount;
 use super::pricing::{g33_yield, Grid, Method, Priceable};
 use super::schedule::{accrued, flows_to, hundred, Schedule, Shape};
@@ -370,6 +370,7 @@ pub fn compute(
             },
             "historical_prepayment" => historical_prepayment(case, &position, &mut out),
             "wal_at_cpr" => wal_at_cpr(case, &position, definition, &mut out),
+            "make_whole_amount" => make_whole_amount(case, &position, &base, &mut out),
             other => return Err(CaseError(format!("no computation for {other}"))),
         };
         if let Err((reason, detail)) = done {
@@ -1258,6 +1259,107 @@ fn wal_at_cpr(
             format!("no yield prices {clean} per 1 of face"),
         ),
     }
+    Ok(())
+}
+
+/// A par curve's rate in percent at `on`, straight-line between the
+/// tenors either side by actual days, flat past the ends (a prospectus's
+/// "Treasury Rate", interpolated to the par call date).
+fn interpolated(curve: &ParCurve, date: Date, on: Date) -> Option<f64> {
+    let mut points: Vec<(i64, f64)> = curve
+        .points
+        .iter()
+        .filter_map(|(_, count, unit, par)| {
+            Some((days(date, maturity_of(date, *count, unit)?), par.to_f64()))
+        })
+        .collect();
+    points.sort_by_key(|p| p.0);
+    let target = days(date, on);
+    let first = *points.first()?;
+    let last = *points.last()?;
+    if target <= first.0 {
+        return Some(first.1);
+    }
+    if target >= last.0 {
+        return Some(last.1);
+    }
+    let pair = points
+        .windows(2)
+        .find(|w| w[0].0 <= target && target <= w[1].0)?;
+    let (a, b) = (pair[0], pair[1]);
+    Some(a.1 + (b.1 - a.1) * (target - a.0) as f64 / (b.0 - a.0) as f64)
+}
+
+fn make_whole_amount(
+    case: &Case,
+    position: &Position<'_>,
+    base: &str,
+    out: &mut Out<'_>,
+) -> std::result::Result<(), Why> {
+    let date = Date::parse(&case.valuation_date)
+        .map_err(|_| (PRICE_MISSING, "the job's date".to_string()))?;
+    let calls = position.held.calls();
+    let Some(window) = calls
+        .iter()
+        .find(|w| w.make_whole && w.from <= date && w.to.is_none_or(|to| date <= to))
+    else {
+        // No make-whole window in force: no figure.
+        return Ok(());
+    };
+    let calendar = calendar(case, position.held);
+    let shape = position.held.shape(&calendar)?;
+    let schedule = shape.build();
+    // The par call date: the first par window's opening after it, else
+    // maturity (R2).
+    let par_call = calls
+        .iter()
+        .filter(|w| !w.make_whole && w.from > date)
+        .map(|w| w.from)
+        .min()
+        .unwrap_or(schedule.maturity);
+    let curve = case.curves.get(&window.benchmark).ok_or((
+        PRICE_MISSING,
+        format!("the make-whole benchmark {}", window.benchmark),
+    ))?;
+    if !curve.missing.is_empty() {
+        return Err((PRICE_MISSING, curve.missing.clone()));
+    }
+    if !curve.dataset.is_empty() {
+        out.part.reads.datasets.insert(curve.dataset.clone());
+    }
+    let treasury = interpolated(curve, date, par_call).ok_or((
+        PRICE_MISSING,
+        format!("{}: no constant maturities at the as-of", window.benchmark),
+    ))?;
+    let rate =
+        (treasury + window.spread_bps.as_ref().map(Dec::to_f64).unwrap_or(0.0) / 100.0) / 100.0;
+    let flows = flows_to(&shape, &schedule, date, par_call, &hundred());
+    let pv: f64 = flows
+        .iter()
+        .map(|flow| {
+            let periods = DayCount::Thirty360BondBasis.days(date, flow.date, None) as f64 / 180.0;
+            flow.amount.to_f64() / (1.0 + rate / 2.0).powf(periods)
+        })
+        .sum();
+    let accrued = accrued(&shape, &schedule, date).to_f64();
+    let per_100 = (pv - accrued).max(100.0);
+    let src = curve.source_ns;
+    out.model(
+        position.id,
+        vec![(COMPONENT, "price".into())],
+        per_100,
+        "",
+        src,
+    );
+    let currency = position.record.currency_instrument_id.clone();
+    let fx = rate_to_base(case, &currency, base, out)?;
+    out.model(
+        position.id,
+        vec![(COMPONENT, "amount".into())],
+        per_100 * position.face.to_f64() / 100.0 * fx.to_f64(),
+        base,
+        src,
+    );
     Ok(())
 }
 

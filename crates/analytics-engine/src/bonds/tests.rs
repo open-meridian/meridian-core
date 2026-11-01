@@ -327,6 +327,37 @@ fn a_tba_reads_its_price_basis() {
 }
 
 #[test]
+fn the_make_whole_amount_is_par_or_more_and_discounts_at_the_constant_maturity_plus_its_spread() {
+    let mut bond = corporate();
+    bond["clean"] = json!("90.5");
+    let mut doc = bonds_document(&[bond], &curve(), &["make_whole_amount"], "2026-10-16");
+    doc["instruments"][1]["debt"]["terms"]["calls"] = json!([
+        {"kind": "REDEMPTION_KIND_MAKE_WHOLE", "from_date": "2026-02-23", "to_date": "2045-08-22",
+         "make_whole_spread_bps": "15", "make_whole_benchmark_instrument_id": "INS-UST",
+         "style": "REDEMPTION_STYLE_CONTINUOUS"},
+        {"kind": "REDEMPTION_KIND_PAR", "from_date": "2045-08-23", "price": "100",
+         "style": "REDEMPTION_STYLE_CONTINUOUS"},
+    ]);
+    doc["par_curves"] = json!([doc["treasury_curve"].clone()]);
+    let answer = crate::compute(&doc).unwrap();
+    assert!(answer.not_evaluated.is_empty(), "{:?}", reasons(&answer));
+    // 4.65% against the Treasury rate near 5.4% plus 15: below par, so par.
+    assert_eq!(
+        figure(&answer, "make_whole_amount", "INS-BOND0", "price").unwrap(),
+        100.0
+    );
+    // At 3% it is above par.
+    for point in doc["par_curves"][0]["points"].as_array_mut().unwrap() {
+        point["par_yield"] = json!("3");
+    }
+    let answer = crate::compute(&doc).unwrap();
+    let price = figure(&answer, "make_whole_amount", "INS-BOND0", "price").unwrap();
+    assert!(price > 115.0 && price < 130.0, "{price}");
+    let amount = figure(&answer, "make_whole_amount", "INS-BOND0", "amount").unwrap();
+    assert!((amount - price).abs() < 1e-2, "100 of face");
+}
+
+#[test]
 fn g33s_one_period_formula_prices_a_municipal_in_its_last_period() {
     // MSRB Rule G-33(b)(i)(A): P = (RV + 100R/M) / (1 + ((E - A)/E)(Y/M))
     // - (A/E)(100R/M), a 5% municipal maturing 2027-01-15, settled

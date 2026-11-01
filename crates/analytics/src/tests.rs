@@ -606,7 +606,7 @@ async fn an_account_outside_the_scope_and_a_definition_not_served_are_refused_na
     // contract v28 the twelve options measures, positioning_exposure at a
     // version per basis (ruling 591), and from contract v29 the eleven
     // curve and bond measures (ruling 688).
-    assert_eq!(definitions.definitions.len(), 32);
+    assert_eq!(definitions.definitions.len(), 33);
 }
 
 #[tokio::test(flavor = "multi_thread")]

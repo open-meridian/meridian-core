@@ -175,7 +175,7 @@ const CURVE: &[(&str, &str)] = &[
 /// v26's at version 1, from contract v27 `execution_cost` version 1 and
 /// `pnl` version 2, from contract v28 the options measures, and from
 /// contract v29 the curve and bond measures (W12.1).
-pub const DEFINITIONS: [Definition; 32] = [
+pub const DEFINITIONS: [Definition; 33] = [
     Definition {
         definition: "market_value",
         version: 1,
@@ -554,6 +554,24 @@ pub const DEFINITIONS: [Definition; 32] = [
         scale: 4,
         description: "Each pool's or class's weighted average life and yield at a constant CPR \
                       of 6, static",
+    },
+    Definition {
+        definition: "make_whole_amount",
+        version: 1,
+        parameters: &[
+            (
+                "benchmark",
+                "h15_constant_maturities_straight_line_to_the_par_call_date",
+            ),
+            ("discounting", "semi_annual_thirty_360"),
+            ("redemption_date", "the_job_date"),
+            ("floor", "par"),
+        ],
+        breakdowns: &["instrument", "component"],
+        scale: 6,
+        description: "Each bond's make-whole redemption price per 100 and amount, if redeemed at \
+                      the job's date: the greater of par and its remaining payments to the par \
+                      call date discounted, less accrued",
     },
 ];
 
