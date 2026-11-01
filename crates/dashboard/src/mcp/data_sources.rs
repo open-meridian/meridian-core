@@ -87,10 +87,10 @@ aggregator, data types, modes, cadence, history, its business day's time zone an
 the class of source its prices come from -- traded, firm_quote, composite or evaluated, empty for \
 not stated), the licence enforced -- the deployment's, or the catalogue's default until one is set, \
 with the source behind the vendor or whose aggregate it serves -- the \
-plugins entitled to it, how many of its values were left unconverted and how many identifiers \
-and venues its plugin reported missing, how many of its daily values are dated on a closed day of \
-its calendar and how many outside the calendar's coverage, how many of its rows in force are valid, \
-suspicious and invalid by their effective state (contract v29), and a warning where its terms are one \
+plugins entitled to it, how many of its rows in force carry a value left unconverted and how many \
+identifiers and venues its plugin reported missing, how many of its rows in force are dated on a \
+closed day of its calendar and how many outside the calendar's coverage, how many of its rows in \
+force are valid, suspicious and invalid by their effective state (contract v29), and a warning where its terms are one \
 person's and more than one person holds read on a plugin entitled to it. Never a price. Answers \
 `unchanged`, as every read does (`read` before contract v23).",
         true,

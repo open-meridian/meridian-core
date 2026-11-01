@@ -2740,3 +2740,76 @@ async fn a_renewal_opens_a_standing_want_keeps_it_and_its_lapse_withdraws_it() {
         .renew_wants(renewal.clone(), &envelope("dashboard", false, "")))
     .is_err());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_corrected_row_counts_once_in_force_as_reported_and_on_a_closed_day() {
+    // Ruling 1006 (c): unconverted_count and closed_day_count count the
+    // rows in force, as the quality counts do -- a row key once, at the
+    // version a default read serves -- so every DatasetRef count means the
+    // same.
+    let h = harness();
+    h.lake.configured(&calendar_configuration());
+    calendar_held(&h);
+    let listed = |h: &Harness| {
+        let listed = tokio::task::block_in_place(|| {
+            h.lake
+                .list_datasets(&envelope("dashboard-1", false, ""))
+                .unwrap()
+        });
+        let held = listed
+            .datasets
+            .iter()
+            .find(|d| d.dataset == "coinbase-1:daily")
+            .unwrap()
+            .clone();
+        (
+            held.unconverted_count,
+            held.closed_day_count,
+            held.outside_coverage_count,
+        )
+    };
+    let mut as_reported = close("coinbase-1", "tue", BTC, "2026-10-13", "1");
+    as_reported.price = None;
+    as_reported.meta.as_mut().unwrap().unconverted = vec![AsReported {
+        scheme: "coinbase".into(),
+        code: String::new(),
+        text: "n/a".into(),
+    }];
+    record(
+        &h,
+        "coinbase-1",
+        vec![
+            as_reported,
+            close("coinbase-1", "sat", BTC, "2026-10-10", "62001"),
+            close("coinbase-1", "late", BTC, "2027-03-01", "62003"),
+        ],
+        "",
+    )
+    .unwrap();
+    assert_eq!(listed(&h), (1, 1, 1));
+
+    // Each restated: the as-reported value converted, the closed day's and
+    // the uncovered day's values corrected. Every key counts once.
+    let restated = record(
+        &h,
+        "coinbase-1",
+        vec![
+            close("coinbase-1", "tue", BTC, "2026-10-13", "62000"),
+            close("coinbase-1", "sat", BTC, "2026-10-10", "62005"),
+            close("coinbase-1", "late", BTC, "2027-03-01", "62007"),
+        ],
+        "",
+    )
+    .unwrap();
+    assert_eq!(restated.restated, 3);
+    assert_eq!(
+        listed(&h),
+        (0, 1, 1),
+        "the rows in force, never every version"
+    );
+    assert_eq!(
+        h.store.counts().unwrap()["coinbase-1:daily"],
+        (6, 1),
+        "kept"
+    );
+}

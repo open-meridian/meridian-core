@@ -381,17 +381,12 @@ pub trait Store: Send + Sync {
     /// Rows kept per dataset, and of them those carrying a value as reported.
     fn counts(&self) -> Result<BTreeMap<String, (u64, u64)>>;
 
-    /// Per dataset holding any, the rows kept carrying a value as reported:
-    /// what the datasets' listing answers (W10.9), read without counting
-    /// every row (ruling 816).
-    fn unconverted_counts(&self) -> Result<BTreeMap<String, u64>> {
-        Ok(self
-            .counts()?
-            .into_iter()
-            .filter(|(_, (_, unconverted))| *unconverted > 0)
-            .map(|(dataset, (_, unconverted))| (dataset, unconverted))
-            .collect())
-    }
+    /// Per dataset holding any, the rows in force carrying a value as
+    /// reported -- each row key at its version in force ([`force_order`];
+    /// ruling 1006 (c)), so a key corrected by a converted value counts no
+    /// more: what the datasets' listing answers (W10.9), read without
+    /// counting every row (ruling 816).
+    fn unconverted_counts(&self) -> Result<BTreeMap<String, u64>>;
 
     /// The lowest sequence a dataset's partition still keeps, where it keeps
     /// any (contract v19): a watermark below it asks for rows retention
@@ -461,9 +456,10 @@ pub trait Store: Send + Sync {
     /// Every re-check journalled, in order.
     fn closed_day_amendments(&self) -> Result<Vec<ClosedDayAmendment>>;
 
-    /// Per dataset: the kept rows flagged on a closed day (a weekend or a
-    /// holiday), and those flagged outside coverage, by the flag as known
-    /// now.
+    /// Per dataset: the rows in force flagged on a closed day (a weekend or
+    /// a holiday), and those flagged outside coverage, by the flag as known
+    /// now -- each row key at its version in force ([`force_order`]; ruling
+    /// 1006 (c)), as every count of a dataset's rows is.
     fn closed_day_counts(&self) -> Result<BTreeMap<String, (u64, u64)>>;
 
     /// Per dataset holding any (contract v29, W10.9; ruling 619 (2)): the

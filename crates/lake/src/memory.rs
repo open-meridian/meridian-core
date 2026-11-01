@@ -433,9 +433,22 @@ impl Store for MemoryStore {
         Ok(counts)
     }
 
-    fn closed_day_counts(&self) -> Result<BTreeMap<String, (u64, u64)>> {
+    fn unconverted_counts(&self) -> Result<BTreeMap<String, u64>> {
+        // The rows in force (ruling 1006 (c)).
         let held = self.lock();
-        let mut rows = held.rows.clone();
+        let mut counts: BTreeMap<String, u64> = BTreeMap::new();
+        for row in as_of(held.rows.iter().cloned(), 0) {
+            if !row.meta().unconverted.is_empty() {
+                *counts.entry(row.dataset().to_string()).or_default() += 1;
+            }
+        }
+        Ok(counts)
+    }
+
+    fn closed_day_counts(&self) -> Result<BTreeMap<String, (u64, u64)>> {
+        // The rows in force (ruling 1006 (c)), by the flag as known now.
+        let held = self.lock();
+        let mut rows = as_of(held.rows.iter().cloned(), 0);
         as_flagged(&mut rows, &held.amendments, 0);
         let mut counts: BTreeMap<String, (u64, u64)> = BTreeMap::new();
         for row in &rows {

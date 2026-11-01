@@ -952,11 +952,16 @@ impl Store for PostgresStore {
 
     fn unconverted_counts(&self) -> Result<BTreeMap<String, u64>> {
         // Read from lake_row_unconverted, which holds only these rows
-        // (migration 6).
+        // (migration 6), each counted while it is its row key's version in
+        // force (ruling 1006 (c)).
         Ok(self
             .conn()?
             .query(
-                "SELECT dataset, count(*) FROM lake_row WHERE unconverted GROUP BY dataset",
+                &format!(
+                    "SELECT r.dataset, count(*) FROM lake_row r
+                      WHERE r.unconverted AND NOT {SUPERSEDED}
+                      GROUP BY r.dataset"
+                ),
                 &[],
             )
             .map_err(unavailable)?
@@ -1463,11 +1468,13 @@ impl Store for PostgresStore {
         // Each row's flag as known now: its latest re-check, else the reason
         // it was recorded with. Only a row recorded flagged (lake_row_closed,
         // migration 6) or re-checked since (lake_closed_day) can count, so
-        // only those are read, never every row kept (ruling 816).
+        // only those are read, never every row kept (ruling 816); each while
+        // it is its row key's version in force (ruling 1006 (c)).
         Ok(self
             .conn()?
             .query(
-                "SELECT dataset,
+                &format!(
+                    "SELECT dataset,
                         count(*) FILTER (WHERE reason IN (1, 2)),
                         count(*) FILTER (WHERE reason = 3)
                    FROM (
@@ -1477,15 +1484,16 @@ impl Store for PostgresStore {
                                SELECT c.reason FROM lake_closed_day c
                                 WHERE c.dataset = r.dataset AND c.sequence = r.sequence
                                 ORDER BY c.amendment_id DESC LIMIT 1) a ON true
-                         WHERE r.closed_reason <> 0
+                         WHERE r.closed_reason <> 0 AND NOT {SUPERSEDED}
                         UNION ALL
                         (SELECT DISTINCT ON (c.dataset, c.sequence) c.dataset, c.reason
                            FROM lake_closed_day c
                            JOIN lake_row r ON r.dataset = c.dataset AND r.sequence = c.sequence
-                          WHERE r.closed_reason = 0
+                          WHERE r.closed_reason = 0 AND NOT {SUPERSEDED}
                           ORDER BY c.dataset, c.sequence, c.amendment_id DESC)
                    ) flagged
-                  GROUP BY dataset",
+                  GROUP BY dataset"
+                ),
                 &[],
             )
             .map_err(unavailable)?

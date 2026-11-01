@@ -3732,7 +3732,9 @@ impl Lake {
         let config = self.config();
         // The rows carrying a value as reported, and those flagged on a closed
         // day: each read from the rows it counts, never every row kept (ruling
-        // 816: one listing took 1,068 ms on dev counting a chain's rows).
+        // 816: one listing took 1,068 ms on dev counting a chain's rows), and
+        // each of the rows in force, as the quality counts are (ruling 1006
+        // (c)).
         let unconverted = self
             .store
             .unconverted_counts()

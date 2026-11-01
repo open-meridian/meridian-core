@@ -499,6 +499,146 @@ fn the_rows_carrying_a_value_as_reported_are_counted_per_dataset() {
     assert_eq!(store.unconverted_counts().unwrap().get(&empty), None);
 }
 
+/// Ruling 1006 (c): the rows carrying a value as reported and those flagged
+/// on a closed day are counted in force -- a row key once, at the version a
+/// default read serves -- as the quality counts are; a re-check of a
+/// replaced version, and a rate's late-arriving older publication, count
+/// nothing.
+#[test]
+fn the_rows_as_reported_and_on_a_closed_day_are_counted_in_force() {
+    use meridian_domain::v1::{DateCheck, DateCheckReason, QualityState};
+    use meridian_lake::store::ClosedDayAmendment;
+    let store = store();
+    let dataset = unique("coinbase-1:daily");
+    let subject = unique("LCL-BTC");
+    let as_reported = |mut row: Observation| {
+        row.meta_mut().unconverted = vec![meridian_pb::v1::AsReported {
+            scheme: "coinbase".into(),
+            code: "X".into(),
+            text: "a value as reported".into(),
+        }];
+        row
+    };
+    let on = |reason: DateCheckReason, date: &str, mut row: Observation| {
+        row.meta_mut().closed_day = Some(DateCheck {
+            date: date.into(),
+            reason: reason as i32,
+            ..Default::default()
+        });
+        row
+    };
+    let first = store
+        .record(
+            &dataset,
+            vec![
+                as_reported(close(&dataset, "tue", &subject, "2026-10-13", 10)),
+                on(
+                    DateCheckReason::Weekend,
+                    "2026-10-10",
+                    close(&dataset, "sat", &subject, "2026-10-10", 11),
+                ),
+                on(
+                    DateCheckReason::OutsideCoverage,
+                    "2027-03-01",
+                    close(&dataset, "late", &subject, "2027-03-01", 12),
+                ),
+                close(&dataset, "wed", &subject, "2026-10-14", 13),
+            ],
+            1_000,
+        )
+        .unwrap();
+    let unconverted = |store: &PostgresStore| {
+        store
+            .unconverted_counts()
+            .unwrap()
+            .get(&dataset)
+            .copied()
+            .unwrap_or(0)
+    };
+    let closed = |store: &PostgresStore| {
+        store
+            .closed_day_counts()
+            .unwrap()
+            .get(&dataset)
+            .copied()
+            .unwrap_or_default()
+    };
+    assert_eq!((unconverted(&store), closed(&store)), (1, (1, 1)));
+
+    // Each restated: converted, and corrected on the same days.
+    store
+        .record(
+            &dataset,
+            vec![
+                close(&dataset, "tue", &subject, "2026-10-13", 20),
+                on(
+                    DateCheckReason::Weekend,
+                    "2026-10-10",
+                    close(&dataset, "sat", &subject, "2026-10-10", 21),
+                ),
+                on(
+                    DateCheckReason::OutsideCoverage,
+                    "2027-03-01",
+                    close(&dataset, "late", &subject, "2027-03-01", 22),
+                ),
+            ],
+            2_000,
+        )
+        .unwrap();
+    assert_eq!((unconverted(&store), closed(&store)), (0, (1, 1)));
+    assert_eq!(
+        store.counts().unwrap()[&dataset],
+        (7, 1),
+        "every version kept"
+    );
+
+    // A re-check of a replaced version counts nothing; of the version in
+    // force, it counts.
+    let recheck = |row: &Observation| ClosedDayAmendment {
+        dataset: dataset.clone(),
+        sequence: row.meta().sequence,
+        closed_day: Some(DateCheck {
+            date: row.meta().business_date.clone(),
+            reason: DateCheckReason::Holiday as i32,
+            holiday_name: "A closure".into(),
+            ..Default::default()
+        }),
+        why: "calendar CAL-USSS version 2 applied".into(),
+        at_ns: 3_000,
+    };
+    store.amend_closed_day(&[recheck(&first.rows[0])]).unwrap();
+    assert_eq!(closed(&store), (1, 1), "a replaced version");
+    store.amend_closed_day(&[recheck(&first.rows[3])]).unwrap();
+    assert_eq!(closed(&store), (2, 1));
+
+    // A rate's late-arriving older publication, as reported: never in
+    // force, never counted.
+    let rates = unique("ny-fed-1:rates");
+    let rate = unique("INS-SOFR");
+    store
+        .record(
+            &rates,
+            vec![rate_row(
+                &rates,
+                "k",
+                &rate,
+                432,
+                2_000,
+                QualityState::Valid,
+            )],
+            1_000,
+        )
+        .unwrap();
+    let mut late = rate_row(&rates, "k", &rate, 431, 1_000, QualityState::Valid);
+    late.meta_mut().unconverted = vec![meridian_pb::v1::AsReported {
+        scheme: "ny-fed".into(),
+        code: "X".into(),
+        text: "a value as reported".into(),
+    }];
+    store.record(&rates, vec![late], 2_000).unwrap();
+    assert_eq!(store.unconverted_counts().unwrap().get(&rates), None);
+}
+
 /// Contract v28 (W10.12; ruling 423): a signal plugin's assessment kept
 /// beside its row, its own record, raising the row's effective state as of
 /// when it was recorded; the row's body never rewritten.
