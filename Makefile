@@ -1199,7 +1199,8 @@ e2e-settings-page:
 # unlinked; the dashboard counts that one not linked; a second plugin is
 # opened at write only once the admin is granted it; and `store book` prints
 # the book empty but for the upgrade's records, each once on its control
-# partition: v24's escape hatch and v26's agents' guard (decisions/031).
+# partition: v24's escape hatch, v26's agents' guard and v29's fixed-income
+# backfill begun and done (decisions/031).
 HARNESS_IMAGE := meridian-harness:local
 HARNESS_FILES := README.md activity.sql book.sql compose.yaml harness.py lake.sql moves.sql platform.py street.sql tickets.sql
 HARNESS_SECRET := sk-test-harness-not-a-real-key
@@ -1317,7 +1318,11 @@ harness-check:
 	guard='^entry|~control|agent-orders-demo-only-backfilled|[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}|instance bor-1$$'; \
 	[ "$$(grep -c "$$guard" .harness/book || true)" = 1 ] \
 		|| fail "the book does not hold contract v26's agents' guard record exactly once, on its control partition, written by bor (W11.38, decisions/031): $$(head -3 .harness/book)"; \
-	grep -v -e "$$backfill" -e "$$guard" .harness/book >.harness/book-written || true; \
+	begun='^entry|~control|fixed-income-backfill-begun|[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}|instance bor-1$$'; \
+	done_='^entry|~control|fixed-income-backfill-done|[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}|instance bor-1$$'; \
+	[ "$$(grep -c "$$begun" .harness/book || true)" = 1 ] && [ "$$(grep -c "$$done_" .harness/book || true)" = 1 ] \
+		|| fail "the book does not hold contract v29's fixed-income backfill begun and done exactly once each, on its control partition, written by bor (W11.11, W11.27, decisions/031): $$(head -4 .harness/book)"; \
+	grep -v -e "$$backfill" -e "$$guard" -e "$$begun" -e "$$done_" .harness/book >.harness/book-written || true; \
 	[ ! -s .harness/book-written ] || fail "the book holds something nobody wrote: $$(head -3 .harness/book-written)"; \
 	$(HARNESS_STORE) ledger >/dev/null 2>&1 && fail "store printed a store it does not have"; \
 	$(HARNESS) exec -T -u 65532 custody python -c 'import os, pathlib; pathlib.Path(os.environ["MERIDIAN_STORAGE_DIR"], "kept").write_text("a raw record")' \
