@@ -3449,7 +3449,22 @@ fn trade_lines(
         earlier_and_own.extend(moved.iter().cloned());
         lines.extend(moved);
     }
+    // Contract v29 (W11.11, amended at core stage E): a fill whose
+    // settlement date is not yet known keeps its security and its cash
+    // pending, dated nothing -- never settled -- until a correction states
+    // the date.
+    if execution.settlement_date_unknown {
+        undated_pending(&mut lines);
+    }
     Ok(lines)
+}
+
+/// Each line dated nothing made pending, never settled (contract v29: a
+/// settlement date not yet known, W11.11).
+pub(crate) fn undated_pending(lines: &mut [MovementLine]) {
+    for line in lines.iter_mut().filter(|line| line.value_date.is_empty()) {
+        line.bucket = SettlementBucket::Pending as i32;
+    }
 }
 
 /// A fee as a cash line: signed as the contract signs it, a rebate negative,

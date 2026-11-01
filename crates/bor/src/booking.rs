@@ -288,6 +288,9 @@ pub struct Executed {
     /// (992). None and empty on any other.
     pub factor: Option<Exact>,
     pub factor_month_awaited: String,
+    /// Contract v29 (W11.11): a fill's settlement date not yet known, so
+    /// the booking's lines dated nothing stay pending.
+    pub settlement_date_unknown: bool,
 }
 
 fn value_date_of(execution: &Execution) -> String {
@@ -356,6 +359,7 @@ pub fn executed(book: &Book, ctx: &Context, execution_ids: &[String]) -> Result<
         if let Some(held) = held.filter(|held| !held.factor_row.awaited.is_empty()) {
             out.factor_month_awaited = held.factor_row.awaited.clone();
         }
+        out.settlement_date_unknown |= execution.settlement_date_unknown;
         for fee in &execution.fees {
             let amount = fee
                 .amount
@@ -953,6 +957,9 @@ fn booking_lines(
             }
         }
         lines.extend(made);
+    }
+    if executed.settlement_date_unknown {
+        crate::order_decide::undated_pending(&mut lines);
     }
     Ok(lines)
 }
@@ -1707,6 +1714,8 @@ pub struct ChildMove {
     /// text, and the month a provisional one awaits; empty where none.
     pub factor: String,
     pub factor_month_awaited: String,
+    /// Contract v29 (W11.11): the fills' settlement date not yet known.
+    pub settlement_date_unknown: bool,
 }
 
 /// Each allocation of a booking to another account, as its child entry
@@ -1750,6 +1759,7 @@ pub fn child_moves(book: &Book, booking_id: &str, ctx: &Context) -> Result<Vec<C
                 .map(|factor| factor.to_string())
                 .unwrap_or_default(),
             factor_month_awaited: executed.factor_month_awaited.clone(),
+            settlement_date_unknown: executed.settlement_date_unknown,
         });
     }
     Ok(out)
@@ -1771,7 +1781,7 @@ pub fn receive_allocation(
     if book.ledger.received.contains_key(&key) {
         return Ok(None);
     }
-    let lines = received_lines(
+    let mut lines = received_lines(
         book,
         ctx,
         &moved.allocation,
@@ -1781,6 +1791,9 @@ pub fn receive_allocation(
         &moved.value_date,
         false,
     )?;
+    if moved.settlement_date_unknown {
+        crate::order_decide::undated_pending(&mut lines);
+    }
     let mut plan = Plan::new(
         ALLOCATION_MOVED,
         ctx.actor(),

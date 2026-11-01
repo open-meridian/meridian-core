@@ -707,3 +707,24 @@ async fn a_booking_of_fills_stating_conflicting_factors_is_refused_naming_them()
         vec!["execution_ids[1]".to_string(), "factor_used".to_string()]
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fill_whose_settlement_date_is_unknown_keeps_its_cash_pending_undated() {
+    // Contract v29 (W11.11, amended at core stage E): never settled.
+    let w = wired();
+    let (_, placement) = placed(&w, bond_order("50000"), "50000").await;
+    let mut filled = fill(&placement, "50000", "WI-1");
+    filled.price = usd("98.375");
+    filled.computed_settlement_date = String::new();
+    filled.settlement_date_unknown = true;
+    execute(&w, &filled).await.unwrap();
+    let cash = position(&w, CHF, HoldingSide::Long).unwrap();
+    assert_eq!(read(&cash.settled_quantity), "0");
+    assert!(
+        cash.pending
+            .iter()
+            .any(|p| p.value_date.is_empty() && read(&p.quantity) == "-49187.50000"),
+        "{:?}",
+        cash.pending
+    );
+}
