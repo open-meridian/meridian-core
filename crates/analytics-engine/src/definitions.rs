@@ -20,8 +20,9 @@ pub const REALIZED_SINCE: &str = "since the account opened";
 pub const BUILT_IN: &str = "built-in";
 
 /// v26's model ids, each at version 1 (the first release's §1); from
-/// contract v28 (ruling 565) the option models and the calibrations.
-pub const MODELS: [&str; 8] = [
+/// contract v28 (ruling 565) the option models and the calibrations; from
+/// contract v29 (ruling 688) the debt models and the curve's calibration.
+pub const MODELS: [&str; 10] = [
     "cash",
     "quoted_price",
     "binary_event",
@@ -30,6 +31,8 @@ pub const MODELS: [&str; 8] = [
     "black_76",
     "svi",
     "ssvi",
+    "bond_cash_flows",
+    "bond_yield_solver",
 ];
 
 /// The breakdowns the linear measures allow (requirement 17).
@@ -133,10 +136,32 @@ const POSITIONING_SHORT_ALL: &[(&str, &str)] = &[
     ("rate_interpolation", "cubic_spline"),
 ];
 
+/// The debt measures' settlement and solver (contract v29; W12.1).
+const BOND_SOLVER: &[(&str, &str)] = &[
+    ("models", "bond_cash_flows_and_bond_yield_solver"),
+    ("price", "the_close_in_percent_of_par"),
+    (
+        "settlement",
+        "the_next_business_day_on_the_payment_calendar",
+    ),
+    (
+        "treasury",
+        "31_cfr_356_appendix_b_simple_interest_over_the_fractional_half_year",
+    ),
+    ("bill", "31_cfr_356_appendix_b_investment_rate"),
+    ("street", "sifma_standard_formula_msrb_g33_for_a_municipal"),
+    (
+        "worst",
+        "the_least_over_maturity_and_each_call_window_but_a_make_whole_one",
+    ),
+    ("municipal_yield", "truncated_to_4_places_then_rounded_to_3"),
+];
+
 /// Every definition the component serves, in the order it lists them:
 /// v26's at version 1, from contract v27 `execution_cost` version 1 and
-/// `pnl` version 2, and from contract v28 the options measures (W12.1).
-pub const DEFINITIONS: [Definition; 23] = [
+/// `pnl` version 2, from contract v28 the options measures, and from
+/// contract v29 the curve and bond measures (W12.1).
+pub const DEFINITIONS: [Definition; 27] = [
     Definition {
         definition: "market_value",
         version: 1,
@@ -388,6 +413,62 @@ pub const DEFINITIONS: [Definition; 23] = [
         breakdowns: &["series"],
         scale: 0,
         description: "Each series' open interest less the trading date's before, exact",
+    },
+    // Contract v29 (W12.1; ruling 688; ENG1 §3).
+    Definition {
+        definition: "accrued_interest",
+        version: 1,
+        parameters: &[
+            ("model", "bond_cash_flows"),
+            ("as_of", "the_job_date"),
+            ("accrual", "the_terms_day_count_from_the_period_start"),
+            ("pool_accrual", "thirty_360_from_the_first_of_the_month"),
+            ("clean", "the_close_in_percent_of_par_times_face_outstanding"),
+        ],
+        breakdowns: &["instrument", "component"],
+        scale: 2,
+        description: "Each debt position's clean value, its accrued interest as of the job's date \
+                      from its terms (never a stored balance), and its dirty value",
+    },
+    Definition {
+        definition: "bond_yield",
+        version: 1,
+        parameters: BOND_SOLVER,
+        breakdowns: &["instrument", "yield_kind", "to_date"],
+        scale: 6,
+        description: "Each bond's yield in percent from its close: to maturity, to the next call \
+                      and put, to worst (the date named) and current",
+    },
+    Definition {
+        definition: "bond_price",
+        version: 1,
+        parameters: &[
+            ("models", "bond_cash_flows_and_bond_yield_solver"),
+            (
+                "from",
+                "the_close_or_its_quoted_yield_or_its_spread_over_the_benchmark",
+            ),
+            ("settlement", "the_next_business_day_on_the_payment_calendar"),
+            ("treasury", "31_cfr_356_appendix_b_exact"),
+        ],
+        breakdowns: &["instrument", "component"],
+        scale: 6,
+        description: "Each bond's clean and dirty price per 100 of face from a yield or a spread, \
+                      the inverse of its yield",
+    },
+    Definition {
+        definition: "bond_risk",
+        version: 1,
+        parameters: &[
+            ("models", "bond_cash_flows_and_bond_yield_solver"),
+            ("at", "the_yield_to_worst"),
+            ("dv01", "modified_duration_times_dirty_price_over_10000"),
+            ("settlement", "the_next_business_day_on_the_payment_calendar"),
+        ],
+        breakdowns: &["instrument", "component"],
+        scale: 6,
+        description: "Each bond's Macaulay and modified duration, convexity and DV01 per 100 of \
+                      face and per position, to worst for a callable bond",
     },
 ];
 

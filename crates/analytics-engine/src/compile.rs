@@ -51,6 +51,13 @@ pub struct Reads {
     /// the scenario grid reads the accounts' options' chains.
     pub chains: bool,
     pub held_chains: bool,
+    /// Contract v29 (W12.1, W12.2): whether a measure reads the debt
+    /// records' terms and the job's date, the factors' history, and the
+    /// Treasury curve (and the make-whole benchmarks' curves).
+    pub debt: bool,
+    pub factors: bool,
+    pub treasury_curve: bool,
+    pub benchmark_curves: bool,
 }
 
 /// A job, compiled: its measures as the answer names them back, and its
@@ -82,11 +89,11 @@ fn key(measure: &MeasureRef) -> MeasureKey {
 pub fn compile(job: &Job) -> Result<Compiled, Refused> {
     // Contract v28 (W12.1): a job asking only chain measures may name no
     // account; any other measure is over one account or more.
+    // Contract v29: nor a job asking only the Treasury curve.
     let chains_only = !job.measures.is_empty()
-        && job
-            .measures
-            .iter()
-            .all(|m| crate::chains::is_chain_measure(&m.definition));
+        && job.measures.iter().all(|m| {
+            crate::chains::is_chain_measure(&m.definition) || m.definition == "treasury_curve"
+        });
     if job.account_ids.is_empty() && !chains_only {
         return Err(refused("account_ids", "a job is over one account or more"));
     }
@@ -193,6 +200,24 @@ pub fn compile(job: &Job) -> Result<Compiled, Refused> {
             }
             reads.chains = true;
             reads.held_chains = true;
+        }
+        // Contract v29 (W12.1, W12.2).
+        if crate::bonds::measures::is_position_measure(definition.definition)
+            || definition.definition == "treasury_curve"
+        {
+            reads.debt = true;
+        }
+        if crate::bonds::measures::reads_factors(definition.definition) {
+            reads.factors = true;
+        }
+        if crate::bonds::measures::reads_curve(definition.definition) {
+            reads.treasury_curve = true;
+        }
+        if matches!(
+            definition.definition,
+            "make_whole_amount" | "bond_spread" | "bond_price"
+        ) {
+            reads.benchmark_curves = true;
         }
         if matches!(
             definition.definition,

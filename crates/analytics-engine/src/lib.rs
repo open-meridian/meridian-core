@@ -26,6 +26,7 @@
 //! its tests.
 
 pub mod answer;
+pub mod bonds;
 pub mod canonical;
 pub mod case;
 pub mod chains;

@@ -1,0 +1,230 @@
+//! The debt measures over an inputs document (contract v29; W12.1): what a
+//! job answers, and what it leaves not evaluated and why.
+
+use serde_json::{json, Value};
+
+use super::oracle::{bonds_document, figure};
+use crate::answer::*;
+
+const CURVES: &str = include_str!("../../oracle_cases/treasury-curve.json");
+const BONDS: &str = include_str!("../../oracle_cases/bond-functions.json");
+
+fn curve() -> Value {
+    let curves: Value = serde_json::from_str(CURVES).unwrap();
+    curves["cases"][0].clone()
+}
+
+fn corporate() -> Value {
+    let bonds: Value = serde_json::from_str(BONDS).unwrap();
+    bonds["bonds"][0].clone()
+}
+
+fn reasons(answer: &crate::Answer) -> Vec<(&str, &str, &str)> {
+    answer
+        .not_evaluated
+        .iter()
+        .map(|u| (u.measure.definition.as_str(), u.reason, u.detail.as_str()))
+        .collect()
+}
+
+#[test]
+fn a_bonds_market_value_is_face_times_its_clean_price_and_its_accrued_its_own() {
+    let doc = bonds_document(
+        &[corporate()],
+        &curve(),
+        &["market_value", "accrued_interest"],
+        "2026-10-16",
+    );
+    let answer = crate::compute(&doc).unwrap();
+    assert!(answer.not_evaluated.is_empty(), "{:?}", reasons(&answer));
+    let mv = answer
+        .figures
+        .iter()
+        .find(|f| f.measure.definition == "market_value")
+        .unwrap();
+    // 100 of face at 90.5: 90.50.
+    assert_eq!(mv.value.as_ref().unwrap().text(), "90.50");
+    // 4.65% on 30/360 from 2026-08-23 to 2026-10-16: 53 days, 0.684583...
+    // per 100 as of the job's date.
+    let accrued = figure(&answer, "accrued_interest", "INS-BOND0", "accrued").unwrap();
+    let clean = figure(&answer, "accrued_interest", "INS-BOND0", "clean").unwrap();
+    let dirty = figure(&answer, "accrued_interest", "INS-BOND0", "dirty").unwrap();
+    assert_eq!(accrued, 0.68);
+    assert_eq!(clean, 90.5);
+    assert_eq!(dirty, 91.18);
+}
+
+#[test]
+fn a_callable_bond_minted_without_its_calls_is_not_evaluated_naming_them() {
+    let mut doc = bonds_document(
+        &[corporate()],
+        &curve(),
+        &["bond_yield", "market_value"],
+        "2026-10-16",
+    );
+    doc["instruments"][1]["debt"]["missing_fields"] = json!(["calls"]);
+    let answer = crate::compute(&doc).unwrap();
+    assert_eq!(
+        reasons(&answer),
+        vec![("bond_yield", TERMS_INCOMPLETE, "calls")],
+        "never a yield to maturity in its place"
+    );
+    // Its close still marks it.
+    assert!(answer
+        .figures
+        .iter()
+        .any(|f| f.measure.definition == "market_value"));
+    assert!(!answer
+        .figures
+        .iter()
+        .any(|f| f.measure.definition == "bond_yield"));
+}
+
+#[test]
+fn yield_to_worst_names_the_call_date_it_is_to() {
+    let mut bond = corporate();
+    bond["clean"] = json!("104");
+    let mut doc = bonds_document(&[bond], &curve(), &["bond_yield"], "2026-10-16");
+    doc["instruments"][1]["debt"]["terms"]["calls"] = json!([
+        {"kind": "REDEMPTION_KIND_MAKE_WHOLE", "from_date": "2026-02-23", "to_date": "2028-02-22",
+         "make_whole_spread_bps": "15", "style": "REDEMPTION_STYLE_CONTINUOUS"},
+        {"kind": "REDEMPTION_KIND_PAR", "from_date": "2028-02-23", "price": "100",
+         "style": "REDEMPTION_STYLE_CONTINUOUS"},
+    ]);
+    let answer = crate::compute(&doc).unwrap();
+    assert!(answer.not_evaluated.is_empty(), "{:?}", reasons(&answer));
+    let worst = answer
+        .figures
+        .iter()
+        .find(|f| {
+            f.breakdown
+                .contains(&("yield_kind".into(), "to_worst".into()))
+        })
+        .unwrap();
+    // Above par, the par call is the worst; the make-whole window is never
+    // a yield's date.
+    assert!(
+        worst
+            .breakdown
+            .contains(&("to_date".into(), "2028-02-23".into())),
+        "{:?}",
+        worst.breakdown
+    );
+    let to_call = figure(&answer, "bond_yield", "INS-BOND0", "to_call").unwrap();
+    let to_maturity = figure(&answer, "bond_yield", "INS-BOND0", "to_maturity").unwrap();
+    assert_eq!(worst.value.as_ref().unwrap().to_f64(), to_call);
+    assert!(to_call < to_maturity);
+}
+
+#[test]
+fn a_price_from_a_quoted_yield_is_the_inverse_of_the_yield_and_a_treasurys_exact() {
+    // Treasury's 10-year note, a when-issued print in yield alone.
+    let bonds: Value = serde_json::from_str(BONDS).unwrap();
+    let note = bonds["bonds"][1].clone();
+    let mut doc = bonds_document(&[note], &curve(), &["bond_price"], "2026-10-16");
+    doc["market"] = json!([]);
+    doc["quoted_yields"] = json!([{
+        "subject_id": "INS-BOND0", "kind": "last", "instrument_id": "INS-USD",
+        "dataset": "trace:prints", "valid_at_ns": "1", "row_key": "p1", "version": "1",
+        "basis": "PRICE_BASIS_YIELD",
+        "yield": {"value": "4.687528", "kind": "YIELD_KIND_TO_MATURITY"},
+    }]);
+    let answer = crate::compute(&doc).unwrap();
+    assert!(answer.not_evaluated.is_empty(), "{:?}", reasons(&answer));
+    let clean = figure(&answer, "bond_price", "INS-BOND0", "clean").unwrap();
+    // The yield 99.5 is at, to six places, back to 99.5 within its rounding.
+    assert!((clean - 99.5).abs() < 1e-4, "{clean}");
+    let exact = answer
+        .figures
+        .iter()
+        .find(|f| f.breakdown.contains(&("component".into(), "clean".into())))
+        .unwrap();
+    assert_eq!(exact.computed_as, EXACT, "Appendix B's price is exact");
+}
+
+/// A pool of 1,000,000 original face at 6%, 360 months from 2025-01-01,
+/// with factors for `months` months before 2026-10.
+fn pool_document(months: &[(&str, &str)], measures: &[&str]) -> Value {
+    let mut doc = bonds_document(&[], &curve(), measures, "2026-10-16");
+    doc["instruments"].as_array_mut().unwrap().push(json!({
+        "instrument_id": "INS-POOL", "model_id": "bond_cash_flows", "asset_class": "debt",
+        "currency_instrument_id": "INS-USD", "price_kind": "close",
+        "debt": {"type": "mbs_pool", "terms": {
+            "agency": "MORTGAGE_AGENCY_FNMA", "program": "UMBS 30-year", "pool_number": "MA0001",
+            "pass_through_rate": "6", "issue_date": "2025-01-01", "maturity_date": "2055-01-01",
+            "original_face": "1000000", "original_term_months": 360,
+            "day_count": "DAY_COUNT_THIRTY_360_BOND_BASIS", "payment_delay_days": 55, "payment_day": 25,
+        }, "missing_fields": []},
+    }));
+    doc["positions"] = json!([{"account_id": "ACC-1", "instrument_id": "INS-POOL", "quantity": "1000000", "cost": "1000000"}]);
+    doc["market"] = json!([{
+        "subject_id": "INS-POOL", "kind": "close", "amount": "101.5", "instrument_id": "INS-USD",
+        "dataset": "pools:closes", "valid_at_ns": "1", "row_key": "INS-POOL", "version": "1",
+        "basis": "PRICE_BASIS_PERCENT_OF_PAR",
+    }]);
+    doc["factors"] = Value::Array(
+        months
+            .iter()
+            .map(|(month, factor)| json!({
+                "subject_id": "INS-POOL", "factor": factor, "factor_month": month,
+                "dataset": "gse:factors", "row_key": format!("INS-POOL:{month}"), "version": "1", "source_ns": "1",
+            }))
+            .collect(),
+    );
+    doc
+}
+
+#[test]
+fn a_pool_with_no_factor_is_not_valued() {
+    let doc = pool_document(&[], &["market_value"]);
+    let answer = crate::compute(&doc).unwrap();
+    assert_eq!(
+        reasons(&answer),
+        vec![("market_value", PRICE_MISSING, "factor")]
+    );
+}
+
+#[test]
+fn a_tba_reads_its_price_basis() {
+    let mut doc = pool_document(&[], &["market_value"]);
+    doc["instruments"][1] = json!({
+        "instrument_id": "INS-POOL", "model_id": "quoted_price", "asset_class": "debt",
+        "currency_instrument_id": "INS-USD", "price_kind": "close",
+        "debt": {"type": "tba", "terms": {"agency": "MORTGAGE_AGENCY_FNMA",
+            "program": "UMBS 30-year", "pass_through_rate": "6", "original_term_months": 360,
+            "settlement_month": "202611"}, "missing_fields": []},
+    });
+    doc["market"][0]["amount"] = json!("101.15625");
+    let answer = crate::compute(&doc).unwrap();
+    // The platform's case: 1,000,000 at 101.15625 percent of par.
+    assert_eq!(
+        answer.figures[0].value.as_ref().unwrap().text(),
+        "1011562.50"
+    );
+    doc["market"][0]["basis"] = json!("PRICE_BASIS_YIELD");
+    let answer = crate::compute(&doc).unwrap();
+    assert_eq!(answer.not_evaluated[0].reason, PRICE_MISSING);
+    assert!(answer.not_evaluated[0].detail.contains("PRICE_BASIS_YIELD"));
+}
+
+#[test]
+fn g33s_one_period_formula_prices_a_municipal_in_its_last_period() {
+    // MSRB Rule G-33(b)(i)(A): P = (RV + 100R/M) / (1 + ((E - A)/E)(Y/M))
+    // - (A/E)(100R/M), a 5% municipal maturing 2027-01-15, settled
+    // 2026-10-19 at a yield of 3.5%.
+    let bonds: Value = serde_json::from_str(BONDS).unwrap();
+    let mut muni = bonds["bonds"][2].clone();
+    muni["issue"] = json!("2025-01-15");
+    muni["dated"] = json!("2025-01-15");
+    muni["first"] = json!("2025-07-15");
+    muni["maturity"] = json!("2027-01-15");
+    let (e, a) = (180.0, 94.0); // 2026-07-15 to 2026-10-19 on 30/360.
+    let (r, y, m) = (0.05, 0.035, 2.0);
+    let price =
+        (100.0 + 100.0 * r / m) / (1.0 + ((e - a) / e) * (y / m)) - (a / e) * (100.0 * r / m);
+    muni["clean"] = json!(format!("{price:.9}"));
+    let doc = bonds_document(&[muni], &curve(), &["bond_yield"], "2026-10-16");
+    let answer = crate::compute(&doc).unwrap();
+    let ytm = figure(&answer, "bond_yield", "INS-BOND0", "to_maturity").unwrap();
+    assert_eq!(ytm, 3.5);
+}

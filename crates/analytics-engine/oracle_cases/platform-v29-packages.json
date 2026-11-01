@@ -1,0 +1,159 @@
+[
+ {
+  "calculation_package": {
+   "calculation_version": "1",
+   "corporate_action_factors": "a dated term version for each event: an auction's coupon, a pre-refunding (decisions/034)",
+   "model_id": "bond_cash_flows",
+   "model_version": 1,
+   "pricing_inputs": [
+    "close"
+   ],
+   "test_cases": [
+    {
+     "expected": "{\"accrued_per100\":\"0.000000\",\"price_per100\":\"99.842840\"}",
+     "inputs": "{\"coupon_frequency\":\"2\",\"coupon_rate\":\"4.875\",\"dated_date\":\"2026-10-15\",\"day_count\":\"DAY_COUNT_ACT_ACT_ICMA\",\"first_coupon_date\":\"2027-04-15\",\"high_yield\":\"4.932\",\"maturity_date\":\"2029-10-15\",\"settlement_date\":\"2026-10-15\"}",
+     "name": "Treasury's 3-year note auctioned 2026-10-06: 4.875% at a high yield of 4.932, settled 2026-10-15 (31 CFR 356 Appendix B)"
+    },
+    {
+     "expected": "{\"accrued_per100\":\"0.000000\",\"price_per100\":\"99.504596\"}",
+     "inputs": "{\"coupon_frequency\":\"2\",\"coupon_rate\":\"5\",\"dated_date\":\"2026-09-30\",\"day_count\":\"DAY_COUNT_ACT_ACT_ICMA\",\"first_coupon_date\":\"2027-03-31\",\"high_yield\":\"5.085\",\"maturity_date\":\"2033-09-30\",\"settlement_date\":\"2026-09-30\"}",
+     "name": "Treasury's 7-year note auctioned 2026-09-24: 5% at a high yield of 5.085, settled 2026-09-30 (31 CFR 356 Appendix B)"
+    },
+    {
+     "expected": "{\"accrued_per100\":\"0.000000\",\"price_per100\":\"99.849966\"}",
+     "inputs": "{\"coupon_frequency\":\"2\",\"coupon_rate\":\"4.125\",\"dated_date\":\"2026-08-31\",\"day_count\":\"DAY_COUNT_ACT_ACT_ICMA\",\"first_coupon_date\":\"2027-02-28\",\"high_yield\":\"4.204\",\"maturity_date\":\"2028-08-31\",\"settlement_date\":\"2026-08-31\"}",
+     "name": "Treasury's 2-year note auctioned 2026-08-25: 4.125% at a high yield of 4.204, settled 2026-08-31 (31 CFR 356 Appendix B)"
+    },
+    {
+     "expected": "{\"accrued_per100\":\"0.000000\",\"price_per100\":\"99.292811\"}",
+     "inputs": "{\"coupon_frequency\":\"2\",\"coupon_rate\":\"5\",\"dated_date\":\"2026-05-15\",\"day_count\":\"DAY_COUNT_ACT_ACT_ICMA\",\"first_coupon_date\":\"2026-11-15\",\"high_yield\":\"5.046\",\"maturity_date\":\"2056-05-15\",\"settlement_date\":\"2026-05-15\"}",
+     "name": "Treasury's 30-year bond auctioned 2026-05-13: 5% at a high yield of 5.046, settled 2026-05-15 (31 CFR 356 Appendix B)"
+    },
+    {
+     "expected": "{\"accrued_per100\":\"0.025136\",\"price_per100\":\"99.540696\"}",
+     "inputs": "{\"coupon_frequency\":\"2\",\"coupon_rate\":\"4.625\",\"dated_date\":\"2026-08-15\",\"day_count\":\"DAY_COUNT_ACT_ACT_ICMA\",\"first_coupon_date\":\"2027-02-15\",\"high_yield\":\"4.683\",\"maturity_date\":\"2036-08-15\",\"settlement_date\":\"2026-08-17\"}",
+     "name": "Treasury's 10-year note auctioned 2026-08-12: 4.625% at a high yield of 4.683, settled 2026-08-17 (31 CFR 356 Appendix B)"
+    },
+    {
+     "expected": "{\"accrued_per100\":\"0.011270\",\"price_per100\":\"99.745106\"}",
+     "inputs": "{\"coupon_frequency\":\"2\",\"coupon_rate\":\"4.125\",\"dated_date\":\"2026-05-31\",\"day_count\":\"DAY_COUNT_ACT_ACT_ICMA\",\"first_coupon_date\":\"2026-11-30\",\"high_yield\":\"4.182\",\"maturity_date\":\"2031-05-31\",\"settlement_date\":\"2026-06-01\"}",
+     "name": "Treasury's 5-year note auctioned 2026-05-27: 4.125% at a high yield of 4.182, settled 2026-06-01 (31 CFR 356 Appendix B)"
+    },
+    {
+     "expected": "{\"accrued_per100\":\"0.849524\",\"price_per100\":\"92.889131\"}",
+     "inputs": "{\"coupon_frequency\":\"2\",\"coupon_rate\":\"5.125\",\"dated_date\":\"2026-08-15\",\"day_count\":\"DAY_COUNT_ACT_ACT_ICMA\",\"first_coupon_date\":\"2027-02-15\",\"high_yield\":\"5.618\",\"maturity_date\":\"2056-08-15\",\"settlement_date\":\"2026-10-15\"}",
+     "name": "Treasury's 29-year 10-month bond (a reopening) auctioned 2026-10-08: 5.125% at a high yield of 5.618, settled 2026-10-15 (31 CFR 356 Appendix B)"
+    },
+    {
+     "expected": "{\"accrued_per100\":\"0.516304\",\"price_per100\":\"100.909218\"}",
+     "inputs": "{\"coupon_frequency\":\"2\",\"coupon_rate\":\"5\",\"dated_date\":\"2026-05-15\",\"day_count\":\"DAY_COUNT_ACT_ACT_ICMA\",\"first_coupon_date\":\"2026-11-15\",\"high_yield\":\"4.927\",\"maturity_date\":\"2046-05-15\",\"settlement_date\":\"2026-06-22\"}",
+     "name": "Treasury's 19-year 11-month bond (a reopening, above par) auctioned 2026-06-16: 5% at a high yield of 4.927, settled 2026-06-22 (31 CFR 356 Appendix B)"
+    },
+    {
+     "expected": "{\"accrued_per100\":\"0.951087\",\"price_per100\":\"97.977958\"}",
+     "inputs": "{\"coupon_frequency\":\"2\",\"coupon_rate\":\"5\",\"dated_date\":\"2026-05-15\",\"day_count\":\"DAY_COUNT_ACT_ACT_ICMA\",\"first_coupon_date\":\"2026-11-15\",\"high_yield\":\"5.163\",\"maturity_date\":\"2046-05-15\",\"settlement_date\":\"2026-07-24\"}",
+     "name": "Treasury's 19-year 10-month bond (a reopening) auctioned 2026-07-22: 5% at a high yield of 5.163, settled 2026-07-24 (31 CFR 356 Appendix B)"
+    },
+    {
+     "expected": "{\"price_per100\":\"98.985097\"}",
+     "inputs": "{\"coupon_rate\":\"0\",\"day_count\":\"DAY_COUNT_ACT_360\",\"high_discount_rate\":\"4.015\",\"maturity_date\":\"2026-12-24\",\"settlement_date\":\"2026-09-24\"}",
+     "name": "Treasury's 13-week bill auctioned 2026-09-21: a high discount rate of 4.015, settled 2026-09-24 (31 CFR 356 Appendix B)"
+    },
+    {
+     "expected": "{\"accrued_per100\":\"1\"}",
+     "inputs": "{\"accrual_start_date\":\"2026-05-15\",\"coupon_rate\":\"5\",\"day_count\":\"DAY_COUNT_THIRTY_360_BOND_BASIS\",\"settlement_date\":\"2026-07-27\"}",
+     "name": "A municipal's accrued interest, 5% from 2026-05-15 to settlement 2026-07-27: 72 days on 30/360 (MSRB Rule G-33(b)(i)(B))"
+    },
+    {
+     "expected": "{\"accrued_per100\":\"0.75\"}",
+     "inputs": "{\"accrual_start_date\":\"2026-01-31\",\"coupon_rate\":\"4.5\",\"day_count\":\"DAY_COUNT_THIRTY_360_BOND_BASIS\",\"settlement_date\":\"2026-03-31\"}",
+     "name": "A municipal's accrued interest, 4.5% from 2026-01-31 to settlement 2026-03-31: 60 days on 30/360 (MSRB Rule G-33(b)(i)(B))"
+    }
+   ]
+  },
+  "instrument_type": "bond",
+  "template_id": "TPL-bond"
+ },
+ {
+  "calculation_package": {
+   "calculation_version": "1",
+   "corporate_action_factors": "",
+   "model_id": "bond_cash_flows",
+   "model_version": 1,
+   "pricing_inputs": [
+    "close",
+    "factor"
+   ],
+   "test_cases": [
+    {
+     "expected": "{\"interest\":\"4250.00\",\"principal\":\"10000.00\"}",
+     "inputs": "{\"day_count\":\"DAY_COUNT_THIRTY_360_BOND_BASIS\",\"factor\":\"0.84\",\"original_face\":\"1000000\",\"pass_through_rate\":\"6\",\"prior_factor\":\"0.85\"}",
+     "name": "A pool's month: 1,000,000 original face at 6%, its factor falling from 0.85 to 0.84, 30/360, rounded once to cents"
+    }
+   ]
+  },
+  "instrument_type": "mbs_pool",
+  "template_id": "TPL-mbs-pool"
+ },
+ {
+  "calculation_package": {
+   "calculation_version": "1",
+   "corporate_action_factors": "",
+   "model_id": "quoted_price",
+   "model_version": 1,
+   "pricing_inputs": [
+    "close"
+   ],
+   "test_cases": [
+    {
+     "expected": "{\"market_value\":\"1011562.50\"}",
+     "inputs": "{\"basis\":\"PRICE_BASIS_PERCENT_OF_PAR\",\"close\":\"101.15625\",\"fx\":\"1\",\"quantity\":\"1000000\"}",
+     "name": "1,000,000 original face at a close of 101.15625 percent of par, base USD, rounded once to 2 places"
+    }
+   ]
+  },
+  "instrument_type": "tba",
+  "template_id": "TPL-tba"
+ },
+ {
+  "calculation_package": {
+   "calculation_version": "1",
+   "corporate_action_factors": "",
+   "model_id": "bond_cash_flows",
+   "model_version": 1,
+   "pricing_inputs": [
+    "close",
+    "factor"
+   ],
+   "test_cases": [
+    {
+     "expected": "{\"interest\":\"3750.00\",\"principal\":\"40000.00\"}",
+     "inputs": "{\"coupon_rate\":\"4.5\",\"day_count\":\"DAY_COUNT_THIRTY_360_BOND_BASIS\",\"factor\":\"0.48\",\"original_face\":\"2000000\",\"prior_factor\":\"0.5\"}",
+     "name": "A fixed class's month: 2,000,000 original face at 4.5%, its factor falling from 0.5 to 0.48, 30/360, rounded once to cents"
+    }
+   ]
+  },
+  "instrument_type": "cmo_tranche",
+  "template_id": "TPL-cmo-tranche"
+ },
+ {
+  "calculation_package": {
+   "calculation_version": "1",
+   "corporate_action_factors": "",
+   "model_id": "bond_cash_flows",
+   "model_version": 1,
+   "pricing_inputs": [
+    "close"
+   ],
+   "test_cases": [
+    {
+     "expected": "{\"accrued_per100\":\"2.231507\"}",
+     "inputs": "{\"accrual_start_date\":\"2026-01-15\",\"coupon_rate\":\"4.5\",\"day_count\":\"DAY_COUNT_ACT_365_FIXED\",\"settlement_date\":\"2026-07-15\"}",
+     "name": "A CD's accrued interest, 4.5% on actual/365 fixed from 2026-01-15 to 2026-07-15 (181 days), rounded once to 6 places"
+    }
+   ]
+  },
+  "instrument_type": "certificate_of_deposit",
+  "template_id": "TPL-certificate-of-deposit"
+ }
+]

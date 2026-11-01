@@ -15,18 +15,20 @@ use crate::v1::{
     ModelBinding,
 };
 
-/// The models the packages bind (W12.3): v26's built-in three, and from
+/// The models the packages bind (W12.3): v26's built-in three, from
 /// contract v28 the listed options' (ruling 565): the binomial tree with
-/// discrete cash dividends, Black-Scholes and Black-76. A package naming
-/// another is refused rather than kept, since no implementation exists to
-/// equal its test cases.
-pub const MODELS: [&str; 6] = [
+/// discrete cash dividends, Black-Scholes and Black-76, and from contract
+/// v29 the debt templates' `bond_cash_flows` (ruling 984: the platform's
+/// packages name it). A package naming another is refused rather than kept,
+/// since no implementation exists to equal its test cases.
+pub const MODELS: [&str; 7] = [
     "cash",
     "quoted_price",
     "binary_event",
     "american_binomial",
     "black_scholes",
     "black_76",
+    "bond_cash_flows",
 ];
 
 /// The model a package binds for an instrument's terms (contract v28,

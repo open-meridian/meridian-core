@@ -90,6 +90,50 @@ pub struct Price {
     pub row_key: String,
     pub version: i64,
     pub source_ns: i64,
+    /// Contract v29 (W10.4; ruling 984): its price basis where not per unit
+    /// (`PRICE_BASIS_PERCENT_OF_PAR`, `_YIELD`, `_SPREAD`); empty per unit.
+    pub basis: String,
+    /// Contract v29: the yield beside it, where the source states one.
+    pub quoted_yield: Option<QuotedYield>,
+    /// Contract v29: a spread in basis points over its benchmark.
+    pub spread_bps: Option<Dec>,
+    pub benchmark_instrument_id: String,
+}
+
+/// Contract v29 (W10.4): a yield as its source quotes it -- percent, its
+/// kind after FIX YieldType (235), and the date a yield to call or put is
+/// to.
+#[derive(Debug, Clone)]
+pub struct QuotedYield {
+    pub value: Dec,
+    pub kind: String,
+    pub to_date: String,
+}
+
+/// Contract v29 (W10.4, W10.6): a pool's or a class's factor row.
+#[derive(Debug, Clone)]
+pub struct FactorRow {
+    pub factor: Dec,
+    pub factor_month: String,
+    pub dataset: String,
+    pub row_key: String,
+    pub version: i64,
+    pub source_ns: i64,
+}
+
+/// Contract v29 (W12.2): a par curve's points at a date, as the lake holds
+/// them -- Treasury's par yield curve, or H.15's constant maturities on the
+/// same record -- or why none was read.
+#[derive(Debug, Clone, Default)]
+pub struct ParCurve {
+    pub subject_id: String,
+    pub dataset: String,
+    pub date: String,
+    /// Each point's tenor label, count, unit and par yield in percent.
+    pub points: Vec<(String, i32, String, Dec)>,
+    pub source_ns: i64,
+    pub missing: String,
+    pub missing_reason: String,
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +154,9 @@ pub struct Instrument {
     /// instrument, whose legs alone are inverted or crossed; empty for a
     /// token.
     pub currency_code: String,
+    /// Contract v29 (W1.1, W1.24): a debt record's terms and the fields it
+    /// lacks; None for any other record.
+    pub debt: Option<crate::bonds::Held>,
 }
 
 #[derive(Debug, Clone)]
@@ -262,6 +309,102 @@ fn execution(e: &Value) -> Result<Execution> {
     })
 }
 
+/// A market row as the document carries it; a quoted yield's row has no
+/// amount (`with_amount` false), its amount 0.
+fn market_price(row: &Value, with_amount: bool) -> Result<Price> {
+    let valid_at_ns = integer(row.get("valid_at_ns"), "valid_at_ns")?;
+    let source_ns = integer(row.get("source_ns"), "source_ns")?;
+    let price = Price {
+        subject_id: text(row, "subject_id"),
+        kind: text(row, "kind"),
+        amount: if with_amount {
+            decimal(row.get("amount"), "a market row's amount")?
+        } else {
+            Dec::zero()
+        },
+        instrument_id: text(row, "instrument_id"),
+        dataset: text(row, "dataset"),
+        valid_at_ns,
+        row_key: text(row, "row_key"),
+        version: integer(row.get("version"), "version")?,
+        source_ns: if source_ns == 0 {
+            valid_at_ns
+        } else {
+            source_ns
+        },
+        basis: text(row, "basis"),
+        quoted_yield: quoted_yield(row.get("yield"))?,
+        spread_bps: match row.get("spread_bps") {
+            None | Some(Value::Null) => None,
+            some => Some(decimal(some, "a market row's spread_bps")?),
+        },
+        benchmark_instrument_id: text(row, "benchmark_instrument_id"),
+    };
+    Ok(price)
+}
+
+/// A quoted yield as a row carries it, or None.
+fn quoted_yield(value: Option<&Value>) -> Result<Option<QuotedYield>> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(y) => Ok(Some(QuotedYield {
+            value: decimal(y.get("value"), "a quoted yield's value")?,
+            kind: text(y, "kind"),
+            to_date: text(y, "to_date"),
+        })),
+    }
+}
+
+/// Each subject's factor rows, by factor month (the latest version of a
+/// month kept).
+fn factor_rows(inputs: &Value) -> Result<BTreeMap<String, Vec<FactorRow>>> {
+    let mut by: BTreeMap<String, BTreeMap<String, FactorRow>> = BTreeMap::new();
+    for f in items(inputs, "factors") {
+        let row = FactorRow {
+            factor: decimal(f.get("factor"), "a factor")?,
+            factor_month: text(f, "factor_month"),
+            dataset: text(f, "dataset"),
+            row_key: text(f, "row_key"),
+            version: integer(f.get("version"), "a factor's version")?,
+            source_ns: integer(f.get("source_ns"), "a factor's source_ns")?,
+        };
+        let months = by.entry(text(f, "subject_id")).or_default();
+        let newer = months
+            .get(&row.factor_month)
+            .is_none_or(|held| row.version >= held.version);
+        if newer {
+            months.insert(row.factor_month.clone(), row);
+        }
+    }
+    Ok(by
+        .into_iter()
+        .map(|(subject, months)| (subject, months.into_values().collect()))
+        .collect())
+}
+
+/// A par curve as the document carries it.
+fn par_curve(c: &Value) -> Result<ParCurve> {
+    Ok(ParCurve {
+        subject_id: text(c, "subject_id"),
+        dataset: text(c, "dataset"),
+        date: text(c, "date"),
+        points: items(c, "points")
+            .iter()
+            .map(|p| {
+                Ok((
+                    text(p, "tenor"),
+                    integer(p.get("count"), "a tenor's count")? as i32,
+                    text(p, "unit"),
+                    decimal(p.get("par_yield"), "a par yield")?,
+                ))
+            })
+            .collect::<Result<_>>()?,
+        source_ns: integer(c.get("source_ns"), "a curve's source_ns")?,
+        missing: text(c, "missing"),
+        missing_reason: text(c, "missing_reason"),
+    })
+}
+
 /// An inputs document, read once.
 #[derive(Debug, Clone)]
 pub struct Case {
@@ -312,6 +455,19 @@ pub struct Case {
     /// scenario set its points are generated from (W12.8).
     pub chains: Vec<crate::chains::Chain>,
     pub scenario: Option<crate::scenario::Set>,
+    /// Contract v29 (W12.1, W12.2): the job's date -- its business date,
+    /// else the as-of's date in New York -- which a debt measure is as of;
+    /// each pool's and class's factor rows by subject, in factor-month
+    /// order; the par curves read, by subject, and the Treasury curve's
+    /// subject; and the payment calendars' holidays.
+    pub valuation_date: String,
+    pub factors: BTreeMap<String, Vec<FactorRow>>,
+    pub curves: BTreeMap<String, ParCurve>,
+    pub treasury_curve: Option<ParCurve>,
+    pub calendars: BTreeMap<String, crate::bonds::dates::Calendar>,
+    /// Contract v29 (W10.4): rows in yield with no money price (a
+    /// when-issued trade before its auction), by subject; their amount 0.
+    pub quoted_yields: BTreeMap<String, Vec<Price>>,
 }
 
 /// A model id routed to a `pricing` plugin, for one job.
@@ -355,25 +511,17 @@ impl Case {
         };
         let mut market: BTreeMap<(String, String), Vec<Price>> = BTreeMap::new();
         for row in items(inputs, "market") {
-            let valid_at_ns = integer(row.get("valid_at_ns"), "valid_at_ns")?;
-            let source_ns = integer(row.get("source_ns"), "source_ns")?;
-            let price = Price {
-                subject_id: text(row, "subject_id"),
-                kind: text(row, "kind"),
-                amount: decimal(row.get("amount"), "a market row's amount")?,
-                instrument_id: text(row, "instrument_id"),
-                dataset: text(row, "dataset"),
-                valid_at_ns,
-                row_key: text(row, "row_key"),
-                version: integer(row.get("version"), "version")?,
-                source_ns: if source_ns == 0 {
-                    valid_at_ns
-                } else {
-                    source_ns
-                },
-            };
+            let price = market_price(row, true)?;
             market
                 .entry((price.subject_id.clone(), price.kind.clone()))
+                .or_default()
+                .push(price);
+        }
+        let mut quoted_yields: BTreeMap<String, Vec<Price>> = BTreeMap::new();
+        for row in items(inputs, "quoted_yields") {
+            let price = market_price(row, false)?;
+            quoted_yields
+                .entry(price.subject_id.clone())
                 .or_default()
                 .push(price);
         }
@@ -448,6 +596,10 @@ impl Case {
                         payout,
                         country: text(i, "country"),
                         currency_code: text(i, "currency_code"),
+                        debt: match i.get("debt") {
+                            None | Some(Value::Null) => None,
+                            Some(debt) => Some(crate::bonds::read(debt).map_err(error)?),
+                        },
                     };
                     Ok((record.instrument_id.clone(), record))
                 })
@@ -488,6 +640,7 @@ impl Case {
                 })
                 .collect::<Result<_>>()?,
             market,
+            quoted_yields,
             dates: items(history, "dates")
                 .iter()
                 .map(|d| d.as_str().unwrap_or_default().to_string())
@@ -578,6 +731,32 @@ impl Case {
             )?,
             chains: crate::chains::read(inputs)?,
             scenario: crate::scenario::Set::read(inputs)?,
+            valuation_date: text(inputs, "valuation_date"),
+            factors: factor_rows(inputs)?,
+            curves: items(inputs, "par_curves")
+                .iter()
+                .map(|c| Ok((text(c, "subject_id"), par_curve(c)?)))
+                .collect::<Result<_>>()?,
+            treasury_curve: match inputs.get("treasury_curve") {
+                None | Some(Value::Null) => None,
+                Some(c) => Some(par_curve(c)?),
+            },
+            calendars: items(inputs, "calendars")
+                .iter()
+                .map(|c| {
+                    let holidays = items(c, "holidays")
+                        .iter()
+                        .map(|d| {
+                            meridian_domain::date::Date::parse(d.as_str().unwrap_or_default())
+                                .map_err(|why| error(format!("a calendar's holiday: {why}")))
+                        })
+                        .collect::<Result<_>>()?;
+                    Ok((
+                        text(c, "calendar_id"),
+                        crate::bonds::dates::Calendar { holidays },
+                    ))
+                })
+                .collect::<Result<_>>()?,
         })
     }
 
