@@ -686,8 +686,9 @@ impl Observation {
     }
 
     /// Whether two rows say the same thing (Q31): every value the source
-    /// gave, decimals compared by value so 764.2 is 764.20, and none of what
-    /// the lake decides or the sidecar stamps.
+    /// gave, decimals compared by value so 764.2 is 764.20, and the quality
+    /// state it was sent with (ruling 1006 (a)); none of what the lake
+    /// decides or the sidecar stamps.
     pub fn same_value(&self, other: &Observation) -> bool {
         self.same_but_raw(other) && self.meta().raw == other.meta().raw
     }
@@ -741,6 +742,12 @@ impl Observation {
                 meta.unconverted.clone(),
                 // Contract v28 (ruling 561).
                 lake::series_key_text(&meta.series_key),
+                // Ruling 1006 (a): the quality state it was sent with, so a
+                // republish whose only change is its state is the next
+                // version, a restatement -- a quarantined row sent again
+                // valid replaces it -- never dropped as unchanged.
+                // Unspecified reads as valid.
+                crate::store::rank(meta.quality),
             )
         };
         if said(self.meta()) != said(other.meta()) {

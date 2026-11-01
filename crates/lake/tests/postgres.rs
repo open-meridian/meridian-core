@@ -741,6 +741,48 @@ fn a_new_version_moves_its_row_key_from_the_last_versions_state_to_its_own() {
 }
 
 #[test]
+fn a_quarantined_row_resent_valid_with_the_same_value_is_the_next_version() {
+    // Ruling 1006 (a): a republish whose only change is its quality state
+    // is a restatement, never dropped as unchanged; the same state again
+    // changes nothing.
+    use meridian_domain::v1::QualityState;
+    let store = store();
+    let dataset = unique("coinbase-1:daily");
+    let subject = unique("LCL-BTC");
+    let row = || close(&dataset, "a", &subject, "2026-10-13", 10);
+    let mut quarantined = row();
+    quarantined.meta_mut().quality = QualityState::Invalid as i32;
+    store.record(&dataset, vec![quarantined], 1_000).unwrap();
+    assert_eq!(counts_of(&store, &dataset), (0, 0, 1));
+
+    let resent = store.record(&dataset, vec![row()], 2_000).unwrap();
+    assert_eq!(
+        (resent.recorded, resent.restated, resent.unchanged),
+        (0, 1, 0)
+    );
+    assert_eq!(resent.rows[0].meta().version, 2);
+    assert_eq!(counts_of(&store, &dataset), (1, 0, 0));
+    let query = Query {
+        datasets: vec![dataset.clone()],
+        subjects: vec![subject.clone()],
+        data_type: DataType::Price,
+        kinds: vec![],
+        interval_ns: 0,
+        when: When::Latest { at_ns: 0 },
+        as_of_ns: 0,
+        published_as_of_ns: 0,
+        latest_only: true,
+    };
+    let read = store.read(&query).unwrap();
+    assert_eq!(read.len(), 1);
+    assert_eq!(read[0].meta().version, 2);
+    assert_ne!(read[0].meta().quality, QualityState::Invalid as i32);
+
+    let again = store.record(&dataset, vec![row()], 3_000).unwrap();
+    assert_eq!((again.unchanged, again.head), (1, 2), "nothing numbered");
+}
+
+#[test]
 fn migrating_counts_the_rows_in_force_the_lake_already_keeps() {
     // Contract v29 (ruling 619 (2)): migration 8 fills each dataset's rows
     // in force from the rows kept, one per row key, so a lake upgraded with

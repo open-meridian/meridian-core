@@ -478,3 +478,84 @@ async fn an_assessment_names_the_kind_of_row_it_assesses() {
     );
     assert_eq!(h.store.assessments().unwrap().len(), 1);
 }
+
+/// The listing's quality counts of coinbase's daily (contract v29, W10.9):
+/// valid, suspicious and invalid, of the rows in force.
+fn quality_counts(h: &Harness) -> (u64, u64, u64) {
+    let listed = tokio::task::block_in_place(|| {
+        h.lake
+            .list_datasets(&envelope("dashboard-1", false, ""))
+            .unwrap()
+    });
+    let held = listed
+        .datasets
+        .iter()
+        .find(|d| d.dataset == "coinbase-1:daily")
+        .unwrap();
+    (held.valid_count, held.suspicious_count, held.invalid_count)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_republish_whose_only_change_is_its_quality_state_is_a_restatement() {
+    // Ruling 1006 (a): the same values sent again with another quality
+    // state are the next version, a restatement, as a change in any field
+    // is -- a quarantined row sent again valid replaces it -- and the same
+    // state again changes nothing.
+    let h = harness();
+    let row = || close("coinbase-1", "BTC:2026-10-07", BTC, "2026-10-07", "62000");
+    let tally = |reply: meridian_domain::v1::RecordObservationsReply| {
+        (reply.recorded, reply.restated, reply.unchanged)
+    };
+    let quarantined = record(
+        &h,
+        "coinbase-1",
+        vec![judged(
+            row(),
+            QualityState::Invalid,
+            &[QualityReason::ImplausibleTimestamp],
+        )],
+        "",
+    )
+    .unwrap();
+    assert_eq!(tally(quarantined), (1, 0, 0));
+    assert!(
+        try_read(&h, named("coinbase-1:daily", false), 0, "2026-10-07")
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    assert_eq!(quality_counts(&h), (0, 0, 1));
+
+    // Sent again valid, the same value: the next version, in force.
+    let resent = record(&h, "coinbase-1", vec![row()], "").unwrap();
+    assert_eq!(tally(resent), (0, 1, 0), "a restatement, never unchanged");
+    let answer = try_read(&h, named("coinbase-1:daily", false), 0, "2026-10-07").unwrap();
+    assert_eq!(answer.rows.len(), 1, "{:?}", answer.unanswered);
+    assert_eq!(answer.rows[0].meta().version, 2);
+    assert_eq!(
+        crate::store::rank(answer.rows[0].meta().quality),
+        QualityState::Valid as i32
+    );
+    assert_eq!(quality_counts(&h), (1, 0, 0));
+
+    // Valid again, stated or left unspecified: unchanged.
+    let mut stated = row();
+    stated.meta.as_mut().unwrap().quality = QualityState::Valid as i32;
+    let again = record(&h, "coinbase-1", vec![stated, row()], "").unwrap();
+    assert_eq!(tally(again), (0, 0, 2));
+
+    // Suspicious, the same value: the next version again.
+    let flagged = record(
+        &h,
+        "coinbase-1",
+        vec![judged(
+            row(),
+            QualityState::Suspicious,
+            &[QualityReason::PriceOutlier],
+        )],
+        "",
+    )
+    .unwrap();
+    assert_eq!(tally(flagged), (0, 1, 0));
+    assert_eq!(quality_counts(&h), (0, 1, 0));
+}
