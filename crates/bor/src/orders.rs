@@ -219,6 +219,21 @@ pub enum Act {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         lot_ids: Vec<String>,
     },
+    /// Contract v29 (W11.11; decisions/031): a fixed-income execution held
+    /// before v29, its capacity backfilled from its order's single one, at
+    /// the backfill's own time.
+    CapacityBackfilled { execution_id: String, capacity: i32 },
+    /// Contract v29 (W11.27; decisions/031): a fixed-income booking held
+    /// before v29, its allocations' accrued interest and reporting fields
+    /// not recorded at the time -- never invented -- said in its own record.
+    NotRecordedBackfilled {
+        booking_id: String,
+        allocation_ids: Vec<String>,
+    },
+    /// Contract v29 (W11.11, W11.27): the control partition's record of the
+    /// upgrade's fixed-income backfill: begun, with the time it takes as
+    /// v29's start, and done.
+    FixedIncomeBackfill { cutoff_ns: i64, done: bool },
     /// Unmatched executions accepted by an `ems` (W11.23, contract v23):
     /// each linked to the order and to the placement the accept created,
     /// matched (transition e3). `line_counts` is how many of the entry's
@@ -569,6 +584,10 @@ pub struct Ledger {
     /// The agents' guard, where the control partition states it (contract
     /// v26, W11.38): `None` before any entry has, which reads as on.
     pub agent_orders_demo_only: Option<bool>,
+    /// The upgrade's fixed-income backfill, where the control partition
+    /// states it (contract v29): the time it takes as v29's start, and
+    /// whether it is done.
+    pub fixed_income_backfill: Option<(i64, bool)>,
 }
 
 /// The records an entry's acts change, each once, in the order they are
@@ -750,8 +769,15 @@ impl Ledger {
                         push_once(&mut touched.executions, id);
                     }
                 }
-                Act::FactorRevised { execution_id, .. } => {
+                Act::FactorRevised { execution_id, .. }
+                | Act::CapacityBackfilled { execution_id, .. } => {
                     push_once(&mut touched.executions, execution_id)
+                }
+                Act::NotRecordedBackfilled { booking_id, .. } => {
+                    push_once(&mut touched.bookings, booking_id)
+                }
+                Act::FixedIncomeBackfill { .. } => {
+                    push_once(&mut touched.settings, "fixed-income-backfill")
                 }
                 Act::Executed { execution, .. } => {
                     push_once(&mut touched.executions, &execution.execution_id);
@@ -1385,6 +1411,18 @@ impl Ledger {
             }
             Act::AgentOrdersDemoOnlySet { on } => {
                 self.agent_orders_demo_only = Some(*on);
+            }
+            Act::CapacityBackfilled {
+                execution_id,
+                capacity,
+            } => {
+                if let Some(held) = self.executions.get_mut(execution_id) {
+                    held.execution.capacity = *capacity;
+                }
+            }
+            Act::NotRecordedBackfilled { .. } => {}
+            Act::FixedIncomeBackfill { cutoff_ns, done } => {
+                self.fixed_income_backfill = Some((*cutoff_ns, *done));
             }
         }
     }

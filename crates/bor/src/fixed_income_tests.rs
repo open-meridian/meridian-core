@@ -728,3 +728,70 @@ async fn a_fill_whose_settlement_date_is_unknown_keeps_its_cash_pending_undated(
         cash.pending
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_upgrades_backfill_gives_a_bonds_fill_its_orders_capacity_and_says_what_was_not_recorded(
+) {
+    // W11.11, W11.27, decisions/031: once, at the backfill's own time.
+    let w = wired();
+    let order = ProposeOrderRequest {
+        capacity: Capacity::Principal as i32,
+        ..bond_order("50000")
+    };
+    let (order, placement) = placed(&w, order, "50000").await;
+    let mut filled = fill(&placement, "50000", "TRACE-OLD");
+    filled.price = usd("98.375");
+    let execution = execute(&w, &filled).await.unwrap().execution.unwrap();
+    assert_eq!(execution.capacity, Capacity::Unspecified as i32);
+    send_from(
+        &w.bus,
+        BOOK_ORDER,
+        "meridian.v1.BookOrderRequest",
+        &BookOrderRequest {
+            order_id: order.order_id.clone(),
+            execution_ids: vec![execution.execution_id.clone()],
+            allocations: vec![Allocation {
+                account_id: ACC.into(),
+                quantity: d("50000"),
+                average_price: usd("98.375"),
+                gross_amount: usd("49187.50"),
+                net_amount: usd("49187.50"),
+                ..Default::default()
+            }],
+            hand_off: false,
+        },
+        &person(TRADER),
+    )
+    .await
+    .unwrap();
+    // The upgrade, a second later.
+    w.clock.advance(1_000_000_000);
+    let backfill = || {
+        tokio::task::block_in_place(|| {
+            crate::fixed_income_backfill::backfill(&w.bus, w.store.as_ref()).unwrap()
+        })
+    };
+    assert_eq!(backfill(), 1);
+    let book = w.store.book(ACC).unwrap();
+    assert_eq!(
+        book.ledger.executions[&execution.execution_id]
+            .execution
+            .capacity,
+        Capacity::Principal as i32,
+        "the order's single capacity"
+    );
+    let last = w.store.journal(ACC).unwrap().pop().unwrap();
+    assert_eq!(last.meta.kind, crate::fixed_income_backfill::BACKFILLED);
+    assert!(last
+        .body
+        .acts
+        .iter()
+        .any(|act| matches!(act, crate::orders::Act::NotRecordedBackfilled { .. })));
+    // Done: never again, and a fill after it is v29's own.
+    assert_eq!(backfill(), 0);
+    let control = w.store.book(crate::store::CONTROL_ACCOUNT).unwrap();
+    assert!(matches!(
+        control.ledger.fixed_income_backfill,
+        Some((_, true))
+    ));
+}

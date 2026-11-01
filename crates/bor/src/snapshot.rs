@@ -214,6 +214,9 @@ struct LedgerShape {
     local_record_orders: Option<bool>,
     #[serde(default)]
     agent_orders_demo_only: Option<bool>,
+    /// Contract v29: none in a snapshot made before.
+    #[serde(default)]
+    fixed_income_backfill: Option<(i64, bool)>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -424,6 +427,7 @@ fn ledger_shape(ledger: &Ledger) -> LedgerShape {
         alerts,
         local_record_orders,
         agent_orders_demo_only,
+        fixed_income_backfill,
     } = ledger;
     LedgerShape {
         orders: orders
@@ -473,6 +477,7 @@ fn ledger_shape(ledger: &Ledger) -> LedgerShape {
         alerts: map_pb(alerts),
         local_record_orders: *local_record_orders,
         agent_orders_demo_only: *agent_orders_demo_only,
+        fixed_income_backfill: *fixed_income_backfill,
     }
 }
 
@@ -749,6 +754,7 @@ fn ledger_from(shape: LedgerShape) -> Result<Ledger> {
         alerts: unmap_pb(&shape.alerts)?,
         local_record_orders: shape.local_record_orders,
         agent_orders_demo_only: shape.agent_orders_demo_only,
+        fixed_income_backfill: shape.fixed_income_backfill,
     })
 }
 
