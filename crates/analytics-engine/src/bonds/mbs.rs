@@ -5,8 +5,9 @@
 //! **Scheduled amortization.** A factor's fall is scheduled principal and
 //! prepayment together. The pool's terms hold no WAC or WAM, so the
 //! schedule is a level-payment mortgage at the pass-through rate (a class's
-//! coupon) over the months left to its maturity date, the definitions' stated
-//! parameter: over a window of `n` months from factor `F0` to `F1`, the
+//! coupon) over the months left to its maturity date -- or, where the
+//! agency's row states them (ruling 995), at its WAC over WALA plus WAM --
+//! the definitions' stated parameter: over a window of `n` months from factor `F0` to `F1`, the
 //! survival from prepayment is `(F1 / F0) / (S1 / S0)`, `S` the scheduled
 //! balance, and `SMM = 1 - survival^(1/n)`, `CPR = 1 - (1 - SMM)^12`
 //! (SIFMA's Uniform Practices' definitions). A window reaching before the
@@ -57,12 +58,14 @@ pub struct Projection {
     pub months: Vec<(u32, f64, f64)>,
 }
 
-/// The pool projected from now, `left` months to run, at the coupon `rate`
-/// (a fraction) and `cpr` (a fraction): scheduled principal on a level
-/// payment over the months left, prepayment the SMM of what remains.
-pub fn project(rate: f64, left: u32, cpr: f64) -> Projection {
+/// The pool projected from now, `left` months to run, paying the holder its
+/// `coupon` (a fraction), its loans amortizing on a level payment at
+/// `amortization` (the WAC where stated, 995; else the coupon) and
+/// prepaying at `cpr` (a fraction): scheduled principal on the level payment
+/// over the months left, prepayment the SMM of what remains.
+pub fn project(coupon: f64, amortization: f64, left: u32, cpr: f64) -> Projection {
     let smm = 1.0 - (1.0 - cpr).powf(1.0 / 12.0);
-    let c = rate / 12.0;
+    let (c, a) = (coupon / 12.0, amortization / 12.0);
     let mut balance = 1.0;
     let mut months = Vec::with_capacity(left as usize);
     for k in 1..=left {
@@ -70,16 +73,15 @@ pub fn project(rate: f64, left: u32, cpr: f64) -> Projection {
             break;
         }
         let remaining = f64::from(left - k + 1);
-        let payment = if c == 0.0 {
+        let payment = if a == 0.0 {
             balance / remaining
         } else {
-            balance * c / (1.0 - (1.0 + c).powf(-remaining))
+            balance * a / (1.0 - (1.0 + a).powf(-remaining))
         };
-        let interest = balance * c;
-        let scheduled = (payment - interest).min(balance);
+        let scheduled = (payment - balance * a).min(balance);
         let prepaid = smm * (balance - scheduled);
         let principal = scheduled + prepaid;
-        months.push((k, interest, principal));
+        months.push((k, balance * c, principal));
         balance -= principal;
     }
     Projection { months }
@@ -151,7 +153,7 @@ mod tests {
 
     #[test]
     fn a_zero_cpr_projection_is_its_schedule_and_its_yield_its_coupon_at_par() {
-        let projected = project(0.06, 360, 0.0);
+        let projected = project(0.06, 0.06, 360, 0.0);
         let principal: f64 = projected.months.iter().map(|(_, _, p)| p).sum();
         assert!((principal - 1.0).abs() < 1e-9);
         // A 30-year 6% mortgage's WAL is about 19.3 years.

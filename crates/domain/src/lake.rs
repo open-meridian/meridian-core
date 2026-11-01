@@ -290,13 +290,18 @@ const HOLDING_FIELDS: [&str; 5] = [
     "meridian.v1.Holding.percent_of_class",
 ];
 
-const FACTOR_FIELDS: [&str; 6] = [
+const FACTOR_FIELDS: [&str; 9] = [
     "meridian.v1.Factor.meta",
     "meridian.v1.Factor.factor",
     "meridian.v1.Factor.factor_month",
     "meridian.v1.Factor.record_date",
     "meridian.v1.Factor.payment_date",
     "meridian.v1.Factor.coupon_rate",
+    // Contract v29 (995): the agency's monthly disclosure values, licensed
+    // and entitled as the row's other fields.
+    "meridian.v1.Factor.wac",
+    "meridian.v1.Factor.wam",
+    "meridian.v1.Factor.wala",
 ];
 
 /// The dictionary entries of a data type's fields; none for one the lake
@@ -648,6 +653,15 @@ pub fn strip_factor(
     }
     if gone(FACTOR_FIELDS[5]) {
         factor.coupon_rate = None;
+    }
+    if gone(FACTOR_FIELDS[6]) {
+        factor.wac = None;
+    }
+    if gone(FACTOR_FIELDS[7]) {
+        factor.wam = None;
+    }
+    if gone(FACTOR_FIELDS[8]) {
+        factor.wala = None;
     }
     removed
 }

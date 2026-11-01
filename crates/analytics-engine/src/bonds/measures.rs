@@ -369,7 +369,7 @@ pub fn compute(
                 Err(why) => Err(why.clone()),
             },
             "historical_prepayment" => historical_prepayment(case, &position, &mut out),
-            "wal_at_cpr" => wal_at_cpr(case, &position, definition, &mut out),
+            "wal_at_cpr" => wal_at_cpr(case, &position, &mut out),
             "make_whole_amount" => make_whole_amount(case, &position, &base, &mut out),
             other => return Err(CaseError(format!("no computation for {other}"))),
         };
@@ -1129,16 +1129,62 @@ fn amortizing(held: &Held) -> std::result::Result<(Date, Date, u32, f64), Why> {
     Ok((issue, maturity, term, rate))
 }
 
-fn historical_prepayment(
+/// The schedule a pool's or a class's factors are read against (W12.1;
+/// ruling 995): a level payment at the WAC over WALA plus WAM, aged WALA at
+/// the latest row, where that row states all three; else at the coupon over
+/// the original term from the issue month.
+struct Amortization {
+    rate: f64,
+    term: u32,
+    /// Months since issue at the latest row's month.
+    age: i32,
+    /// Months left to run from the latest row's month.
+    left: u32,
+}
+
+fn amortization_of(
+    held: &Held,
+    latest: &FactorRow,
+) -> std::result::Result<(Amortization, Date), Why> {
+    let (issue, maturity, term, rate) = amortizing(held)?;
+    let issued = month_of(issue);
+    if let (Some(wac), Some(wam), Some(wala)) = (latest.wac.as_ref(), latest.wam, latest.wala) {
+        return Ok((
+            Amortization {
+                rate: wac.to_f64() / 100.0,
+                term: wala.saturating_add(wam).max(1),
+                age: i32::try_from(wala).unwrap_or(i32::MAX),
+                left: wam,
+            },
+            issue,
+        ));
+    }
+    let age = months_between(&issued, &latest.factor_month).unwrap_or(0);
+    let left = months_between(&latest.factor_month, &month_of(maturity))
+        .unwrap_or(0)
+        .max(0) as u32;
+    Ok((
+        Amortization {
+            rate,
+            term,
+            age,
+            left,
+        },
+        issue,
+    ))
+}
+
+/// Each window's SMM and CPR (fractions) from the pool's factors, or why
+/// not: 1, 3, 6 and 12 months and life, in that order.
+type Speeds = Vec<(String, std::result::Result<(f64, f64), String>)>;
+
+fn speeds(
     case: &Case,
     position: &Position<'_>,
     out: &mut Out<'_>,
-) -> std::result::Result<(), Why> {
-    if !position.held.factored() {
-        return Ok(());
-    }
-    let (issue, _, term, rate) = amortizing(position.held)?;
+) -> std::result::Result<(FactorRow, Speeds), Why> {
     let latest = factor_at(case, position.id)?;
+    let (schedule, issue) = amortization_of(position.held, &latest)?;
     let rows = case.factors.get(position.id).cloned().unwrap_or_default();
     for row in &rows {
         if !row.dataset.is_empty() {
@@ -1147,7 +1193,6 @@ fn historical_prepayment(
     }
     let at = |month: &str| rows.iter().find(|r| r.factor_month == month);
     let issued = month_of(issue);
-    let src = latest.source_ns;
     let mut windows: Vec<(String, Option<(f64, i32)>)> = Vec::new();
     for n in [1, 3, 6, 12] {
         let from = month_back(&latest.factor_month, n);
@@ -1163,22 +1208,44 @@ fn historical_prepayment(
     let life = months_between(&issued, &latest.factor_month).filter(|n| *n > 0);
     windows.push(("life".to_string(), life.map(|n| (1.0, n))));
     let end = latest.factor.to_f64();
+    let mut answered = Vec::new();
     for (window, start) in windows {
         let Some((start, n)) = start else {
-            out.not(
-                position.id,
-                HISTORY_INSUFFICIENT,
-                format!(
+            answered.push((
+                window.clone(),
+                Err(format!(
                     "{window}: the factor {} months before {} is not held",
                     window.trim_end_matches('m'),
                     latest.factor_month
-                ),
-            );
+                )),
+            ));
             continue;
         };
-        let age = months_between(&issued, &latest.factor_month).unwrap_or(0) - n;
-        match super::mbs::smm_cpr(start, end, n as u32, age.max(0) as u32, term, rate) {
-            Some((smm, cpr)) => {
+        let age = (schedule.age - n).max(0) as u32;
+        match super::mbs::smm_cpr(start, end, n as u32, age, schedule.term, schedule.rate) {
+            Some(speed) => answered.push((window, Ok(speed))),
+            None => answered.push((
+                window.clone(),
+                Err(format!("{window}: no scheduled balance")),
+            )),
+        }
+    }
+    Ok((latest, answered))
+}
+
+fn historical_prepayment(
+    case: &Case,
+    position: &Position<'_>,
+    out: &mut Out<'_>,
+) -> std::result::Result<(), Why> {
+    if !position.held.factored() {
+        return Ok(());
+    }
+    let (latest, answered) = speeds(case, position, out)?;
+    let src = latest.source_ns;
+    for (window, speed) in answered {
+        match speed {
+            Ok((smm, cpr)) => {
                 out.model(
                     position.id,
                     vec![("window", window.clone()), (COMPONENT, "smm".into())],
@@ -1194,43 +1261,55 @@ fn historical_prepayment(
                     src,
                 );
             }
-            None => out.not(
-                position.id,
-                HISTORY_INSUFFICIENT,
-                format!("{window}: no scheduled balance"),
-            ),
+            Err(why) => out.not(position.id, HISTORY_INSUFFICIENT, why),
         }
     }
     Ok(())
 }
 
+/// Version 1 (ruling 996): at the pool's own 3-month historical CPR, else
+/// its life CPR, the speed used named by the `window` breakdown and its own
+/// `cpr` figure; not evaluated where neither is. Amortized at the WAC over
+/// the WAM where the latest row states WAC, WAM and WALA (995), else at the
+/// coupon to maturity; the holder paid the coupon either way.
 fn wal_at_cpr(
     case: &Case,
     position: &Position<'_>,
-    definition: &Definition,
     out: &mut Out<'_>,
 ) -> std::result::Result<(), Why> {
     if !position.held.factored() {
         return Ok(());
     }
-    let (_, maturity, _, rate) = amortizing(position.held)?;
-    let latest = factor_at(case, position.id)?;
-    if !latest.dataset.is_empty() {
-        out.part.reads.datasets.insert(latest.dataset.clone());
-    }
-    let cpr: f64 = definition
-        .parameter("cpr")
-        .and_then(|c| c.parse().ok())
-        .unwrap_or(6.0)
-        / 100.0;
-    let left = months_between(&latest.factor_month, &month_of(maturity))
-        .unwrap_or(0)
-        .max(0) as u32;
-    let projection = super::mbs::project(rate, left, cpr);
+    let (_, _, _, coupon) = amortizing(position.held)?;
+    let (latest, answered) = speeds(case, position, out)?;
+    let (schedule, _) = amortization_of(position.held, &latest)?;
+    let speed = ["3m", "life"].iter().find_map(|wanted| {
+        answered.iter().find_map(|(window, speed)| match speed {
+            Ok((_, cpr)) if window == wanted => Some((window.clone(), *cpr)),
+            _ => None,
+        })
+    });
+    let Some((window, cpr)) = speed else {
+        return Err((
+            HISTORY_INSUFFICIENT,
+            format!(
+                "no 3-month or life CPR from the factors to {}",
+                latest.factor_month
+            ),
+        ));
+    };
+    let projection = super::mbs::project(coupon, schedule.rate, schedule.left, cpr);
     let src = latest.source_ns;
     out.model(
         position.id,
-        vec![(COMPONENT, "wal".into())],
+        vec![("window", window.clone()), (COMPONENT, "cpr".into())],
+        cpr * 100.0,
+        "",
+        src,
+    );
+    out.model(
+        position.id,
+        vec![("window", window.clone()), (COMPONENT, "wal".into())],
         projection.wal(),
         "",
         src,
@@ -1248,7 +1327,7 @@ fn wal_at_cpr(
     match projection.yield_of(clean + accrued, delay) {
         Some((_, bey)) => out.model(
             position.id,
-            vec![(COMPONENT, "yield".into())],
+            vec![("window", window), (COMPONENT, "yield".into())],
             bey * 100.0,
             "",
             price.source_ns,

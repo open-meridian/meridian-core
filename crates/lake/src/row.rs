@@ -936,6 +936,8 @@ impl Observation {
                     && (&a.factor_month, &a.record_date, &a.payment_date)
                         == (&b.factor_month, &b.record_date, &b.payment_date)
                     && same_decimal(&a.coupon_rate, &b.coupon_rate)
+                    && same_decimal(&a.wac, &b.wac)
+                    && (a.wam, a.wala) == (b.wam, b.wala)
             }
             _ => false,
         }

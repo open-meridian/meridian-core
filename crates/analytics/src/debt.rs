@@ -153,7 +153,8 @@ pub fn calendars(asker: &dyn Ask, ids: &BTreeSet<String>, date: &str) -> Vec<Val
 
 /// Each pool's and class's factor rows at the as-of, every month the lake
 /// holds to the job's date: `[{subject_id, factor, factor_month, dataset,
-/// row_key, version, source_ns}]`, in one order.
+/// row_key, version, source_ns}]`, with `wac`, `wam` and `wala` where the
+/// row states them (995), in one order.
 pub fn factors(
     asker: &dyn Ask,
     subjects: &[String],
@@ -204,7 +205,7 @@ pub fn factors(
                     .map(|t| t.at_ns)
                     .min()
                     .unwrap_or(meta.valid_from_ns);
-                out.push(json!({
+                let mut kept = json!({
                     "subject_id": subject,
                     "factor": factor,
                     "factor_month": row.factor_month,
@@ -212,7 +213,19 @@ pub fn factors(
                     "row_key": meta.row_key,
                     "version": meta.version.to_string(),
                     "source_ns": source_ns.to_string(),
-                }));
+                });
+                // Contract v29 (995): the disclosure's WAC, WAM and WALA,
+                // where the agency states them.
+                if let Some(wac) = text_of(row.wac.as_ref()) {
+                    kept["wac"] = json!(wac);
+                }
+                if let Some(wam) = row.wam {
+                    kept["wam"] = json!(wam.to_string());
+                }
+                if let Some(wala) = row.wala {
+                    kept["wala"] = json!(wala.to_string());
+                }
+                out.push(kept);
             }
             if reply.next_cursor.is_empty() {
                 break;

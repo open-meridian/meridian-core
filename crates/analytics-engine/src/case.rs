@@ -119,6 +119,12 @@ pub struct FactorRow {
     pub row_key: String,
     pub version: i64,
     pub source_ns: i64,
+    /// Contract v29 (995): the agency's monthly disclosure values, where
+    /// stated: the weighted average coupon (percent a year), remaining
+    /// maturity and loan age (months).
+    pub wac: Option<Dec>,
+    pub wam: Option<u32>,
+    pub wala: Option<u32>,
 }
 
 /// Contract v29 (W12.2): a par curve's points at a date, as the lake holds
@@ -355,6 +361,16 @@ fn quoted_yield(value: Option<&Value>) -> Result<Option<QuotedYield>> {
     }
 }
 
+/// A whole number of months, where stated.
+fn months(value: Option<&Value>, what: &str) -> Result<Option<u32>> {
+    match value {
+        Some(Value::Null) | None => Ok(None),
+        held => u32::try_from(integer(held, what)?)
+            .map(Some)
+            .map_err(|_| error(format!("{what} is a whole number of months"))),
+    }
+}
+
 /// Each subject's factor rows, by factor month (the latest version of a
 /// month kept).
 fn factor_rows(inputs: &Value) -> Result<BTreeMap<String, Vec<FactorRow>>> {
@@ -367,6 +383,12 @@ fn factor_rows(inputs: &Value) -> Result<BTreeMap<String, Vec<FactorRow>>> {
             row_key: text(f, "row_key"),
             version: integer(f.get("version"), "a factor's version")?,
             source_ns: integer(f.get("source_ns"), "a factor's source_ns")?,
+            wac: match f.get("wac") {
+                Some(Value::Null) | None => None,
+                held => Some(decimal(held, "a factor's wac")?),
+            },
+            wam: months(f.get("wam"), "a factor's wam")?,
+            wala: months(f.get("wala"), "a factor's wala")?,
         };
         let months = by.entry(text(f, "subject_id")).or_default();
         let newer = months

@@ -385,6 +385,106 @@ fn g33s_one_period_formula_prices_a_municipal_in_its_last_period() {
     assert_eq!(ytm, 3.5);
 }
 
+/// The CPR a figure states, by its window.
+fn cpr_of(answer: &crate::Answer, definition: &str, window: &str) -> Option<f64> {
+    answer
+        .figures
+        .iter()
+        .find(|f| {
+            f.measure.definition == definition
+                && f.breakdown.contains(&("window".into(), window.into()))
+                && f.breakdown.contains(&("component".into(), "cpr".into()))
+        })
+        .and_then(|f| f.value.as_ref())
+        .map(|v| v.to_f64())
+}
+
+#[test]
+fn wal_at_cpr_runs_at_the_pools_own_three_month_speed_and_names_it() {
+    // Ruling 996: the 3-month historical CPR, named; then life where three
+    // months are not held; not evaluated where neither is.
+    let months = [
+        ("202606", "0.9501"),
+        ("202607", "0.9452"),
+        ("202608", "0.9398"),
+        ("202609", "0.9351"),
+    ];
+    let doc = pool_document(&months, &["historical_prepayment", "wal_at_cpr"]);
+    let answer = crate::compute(&doc).unwrap();
+    let three = cpr_of(&answer, "historical_prepayment", "3m").unwrap();
+    assert_eq!(cpr_of(&answer, "wal_at_cpr", "3m"), Some(three));
+    let wal = answer
+        .figures
+        .iter()
+        .find(|f| {
+            f.measure.definition == "wal_at_cpr"
+                && f.breakdown.contains(&("window".into(), "3m".into()))
+                && f.breakdown.contains(&("component".into(), "wal".into()))
+        })
+        .unwrap();
+    assert!(wal.value.as_ref().unwrap().to_f64() > 1.0);
+
+    let doc = pool_document(&[("202609", "0.9351")], &["wal_at_cpr"]);
+    let answer = crate::compute(&doc).unwrap();
+    assert!(cpr_of(&answer, "wal_at_cpr", "3m").is_none());
+    assert!(
+        cpr_of(&answer, "wal_at_cpr", "life").is_some(),
+        "{:?}",
+        reasons(&answer)
+    );
+
+    // A pool in its issue month has no speed of its own.
+    let mut doc = pool_document(&[("202609", "1")], &["wal_at_cpr"]);
+    doc["instruments"][1]["debt"]["terms"]["issue_date"] = json!("2026-09-01");
+    let answer = crate::compute(&doc).unwrap();
+    assert_eq!(answer.not_evaluated.len(), 1, "{:?}", reasons(&answer));
+    assert_eq!(answer.not_evaluated[0].reason, HISTORY_INSUFFICIENT);
+    assert!(answer
+        .figures
+        .iter()
+        .all(|f| f.measure.definition != "wal_at_cpr"));
+}
+
+#[test]
+fn a_pool_amortizing_on_its_stated_wac_over_wala_and_wam_prepays_nothing() {
+    // Ruling 995: the disclosure's WAC 6.75 over WALA 21 + WAM 339 months;
+    // factors falling exactly on that schedule are no prepayment, which the
+    // coupon's 6% over 360 from issue would not read so.
+    let at = |age: u32| super::mbs::scheduled(0.0675, 360, age);
+    let months: Vec<(String, String)> = (0..4)
+        .map(|k| (format!("20260{}", 6 + k), format!("{:.12}", at(18 + k))))
+        .collect();
+    let named: Vec<(&str, &str)> = months
+        .iter()
+        .map(|(m, f)| (m.as_str(), f.as_str()))
+        .collect();
+    let mut doc = pool_document(&named, &["historical_prepayment"]);
+    let without = cpr_of(
+        &crate::compute(&doc).unwrap(),
+        "historical_prepayment",
+        "3m",
+    )
+    .unwrap();
+    assert!(
+        without.abs() > 0.01,
+        "the coupon's schedule reads a speed: {without}"
+    );
+    for row in doc["factors"].as_array_mut().unwrap() {
+        if row["factor_month"] == "202609" {
+            row["wac"] = json!("6.75");
+            row["wam"] = json!("339");
+            row["wala"] = json!("21");
+        }
+    }
+    let with = cpr_of(
+        &crate::compute(&doc).unwrap(),
+        "historical_prepayment",
+        "3m",
+    )
+    .unwrap();
+    assert!(with.abs() < 1e-6, "{with}");
+}
+
 #[test]
 fn a_term_the_engine_does_not_compute_is_not_supported_and_named() {
     // Ruling 997: BUS/252, actual/actual (AFB) and (ICMA ultimo), a

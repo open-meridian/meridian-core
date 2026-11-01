@@ -532,7 +532,7 @@ pub const DEFINITIONS: [Definition; 34] = [
             ("windows", "1_3_6_12_months_and_life"),
             (
                 "scheduled_amortization",
-                "level_payment_at_the_coupon_over_the_original_term",
+                "level_payment_at_the_wac_over_wala_plus_wam_where_stated_else_the_coupon_over_the_original_term",
             ),
             ("units", "percent"),
         ],
@@ -545,15 +545,18 @@ pub const DEFINITIONS: [Definition; 34] = [
         definition: "wal_at_cpr",
         version: 1,
         parameters: &[
-            ("cpr", "6"),
+            ("cpr", "the_pools_3_month_historical_cpr_else_its_life_cpr"),
             ("prepayment", "a_constant_cpr_no_model"),
-            ("amortization", "level_payment_at_the_coupon_to_maturity"),
+            (
+                "amortization",
+                "level_payment_at_the_wac_over_the_wam_where_stated_else_the_coupon_to_maturity",
+            ),
             ("yield", "bond_equivalent_from_monthly"),
         ],
-        breakdowns: &["instrument", "component"],
+        breakdowns: &["instrument", "window", "component"],
         scale: 4,
-        description: "Each pool's or class's weighted average life and yield at a constant CPR \
-                      of 6, static",
+        description: "Each pool's or class's weighted average life and yield at its own 3-month \
+                      historical CPR, else its life CPR, the speed named; static",
     },
     Definition {
         definition: "make_whole_amount",

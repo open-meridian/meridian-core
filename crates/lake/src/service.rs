@@ -4564,6 +4564,17 @@ fn factor_refused(at: &str, factor: &meridian_domain::v1::Factor) -> Result<(), 
             ));
         }
     }
+    // Contract v29 (995): the disclosure's weighted average coupon, never
+    // below zero; WAM and WALA are whole months by their type.
+    if let Some(wac) = factor.wac.as_ref() {
+        let exact = meridian_domain::exact::Exact::from_wire(wac)
+            .map_err(|out| format!("{at}.wac {out}"))?;
+        if exact.is_negative() {
+            return Err(format!(
+                "{at}.wac is never below zero: the weighted average coupon, percent a year"
+            ));
+        }
+    }
     Ok(())
 }
 
