@@ -3745,8 +3745,8 @@ impl Lake {
             .store
             .closed_day_counts()
             .map_err(|failed| failed.to_string())?;
-        // Contract v29 (W10.9; ruling 619 (2)): the rows kept by effective
-        // state.
+        // Contract v29 (W10.9; ruling 619 (2)): the rows in force by
+        // effective state.
         let quality = self
             .store
             .quality_counts()

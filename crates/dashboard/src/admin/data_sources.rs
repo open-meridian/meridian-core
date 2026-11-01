@@ -361,7 +361,7 @@ fn datasets_tab(rows: &[Row], records: &AccessRecords, token: &str) -> (String, 
                 ),
                 None => String::new(),
             };
-            // Contract v29 (W10.9; ruling 619 (2)): the rows kept by their
+            // Contract v29 (W10.9; ruling 619 (2)): the rows in force by their
             // effective state, the flagged ones in the cell.
             let quality = format!(
                 "{} \u{b7} {}",
@@ -436,7 +436,7 @@ fn datasets_tab(rows: &[Row], records: &AccessRecords, token: &str) -> (String, 
              <th class=\"wide num\" title=\"Values left unconverted\">Unconverted</th>\
              <th class=\"wide num\" title=\"Identifiers and venues reported missing\">Misses</th>\
              <th class=\"wide num\" title=\"Daily values dated on a closed day of its calendar, and outside its coverage\">Closed days</th>\
-             <th class=\"wide num\" title=\"Rows kept flagged suspicious, and invalid; valid in each cell's hover\">Flagged</th>\
+             <th class=\"wide num\" title=\"Rows in force flagged suspicious, and invalid; valid in each cell's hover\">Flagged</th>\
              <th class=\"actions\"></th></tr></thead><tbody>{lines}</tbody></table></om-pager>",
             n = rows.len()
         )

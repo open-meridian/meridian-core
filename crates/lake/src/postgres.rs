@@ -104,12 +104,14 @@ impl PostgresStore {
         Ok(head as u64)
     }
 
-    fn move_head(tx: &mut Transaction<'_>, dataset: &str, head: u64) -> Result<()> {
+    /// Moves the partition's head, and its rows in force by the row keys
+    /// the batch kept that it held no version of (contract v29, ruling 619
+    /// (2); migration 8): a new version of a key held replaces its last, and
+    /// a row served unkept is never in force.
+    fn move_head(tx: &mut Transaction<'_>, dataset: &str, head: u64, new_keys: u64) -> Result<()> {
         tx.execute(
-            // Contract v29 (ruling 619 (2)): the rows kept move with the
-            // head (migration 8).
-            "UPDATE lake_partition SET kept = kept + ($2 - head), head = $2 WHERE dataset = $1",
-            &[&dataset, &(head as i64)],
+            "UPDATE lake_partition SET in_force = in_force + $3, head = $2 WHERE dataset = $1",
+            &[&dataset, &(head as i64), &(new_keys as i64)],
         )
         .map_err(unavailable)?;
         Ok(())
@@ -606,7 +608,9 @@ impl Store for PostgresStore {
         for row in &done.rows {
             insert(&mut tx, dataset, row)?;
         }
-        Self::move_head(&mut tx, dataset, head)?;
+        // Each row numbered version 1 is a key the partition held no
+        // version of; every other replaces its key's last.
+        Self::move_head(&mut tx, dataset, head, u64::from(done.recorded))?;
         tx.commit().map_err(unavailable)?;
         Ok(done)
     }
@@ -641,7 +645,7 @@ impl Store for PostgresStore {
             )
             .map_err(unavailable)?;
         }
-        Self::move_head(&mut tx, dataset, head)?;
+        Self::move_head(&mut tx, dataset, head, 0)?;
         tx.commit().map_err(unavailable)?;
         Ok(done)
     }
@@ -1037,16 +1041,38 @@ impl Store for PostgresStore {
     ) -> Result<u64> {
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
-        let removed = tx
-            .execute(
-                "DELETE FROM lake_row WHERE dataset = $1 AND recorded_at_ns < $2",
+        // The partition held as a batch holds it, so no row key's next
+        // version is recorded between finding a key left with none and
+        // counting it out of the rows in force (contract v29, ruling 619
+        // (2); migration 8).
+        tx.execute(
+            "SELECT 1 FROM lake_partition WHERE dataset = $1 FOR UPDATE",
+            &[&dataset],
+        )
+        .map_err(unavailable)?;
+        // The rows removed, and the row keys left with no version kept: a
+        // key whose later version stays is still in force at it.
+        let gone = tx
+            .query_one(
+                "WITH gone AS (
+                    DELETE FROM lake_row WHERE dataset = $1 AND recorded_at_ns < $2
+                    RETURNING data_type, row_key)
+                 SELECT (SELECT count(*) FROM gone),
+                        (SELECT count(*)
+                           FROM (SELECT DISTINCT data_type, row_key FROM gone) g
+                          WHERE NOT EXISTS (
+                                SELECT 1 FROM lake_row k
+                                 WHERE k.dataset = $1 AND k.data_type = g.data_type
+                                   AND k.row_key = g.row_key AND k.recorded_at_ns >= $2))",
                 &[&dataset, &recorded_before_ns],
             )
             .map_err(unavailable)?;
+        let removed = gone.get::<_, i64>(0) as u64;
+        let keys_gone = gone.get::<_, i64>(1);
         if removed > 0 {
             tx.execute(
-                "UPDATE lake_partition SET kept = greatest(kept - $2, 0) WHERE dataset = $1",
-                &[&dataset, &(removed as i64)],
+                "UPDATE lake_partition SET in_force = greatest(in_force - $2, 0) WHERE dataset = $1",
+                &[&dataset, &keys_gone],
             )
             .map_err(unavailable)?;
             tx.execute(
@@ -1286,35 +1312,46 @@ impl Store for PostgresStore {
     }
 
     fn quality_counts(&self) -> Result<BTreeMap<String, (u64, u64, u64)>> {
-        // The rows kept from lake_partition, the flagged from the rows
+        // The rows in force from lake_partition, the flagged from the rows
         // recorded flagged (lake_row_quality) and the escalations
-        // (lake_quality_assessment): never every row kept (ruling 816).
+        // (lake_quality_assessment), each counted only while no later
+        // version of its row key is kept (lake_row_version): never every
+        // row kept (ruling 816). One snapshot, so the two agree.
         let mut conn = self.conn()?;
+        let mut tx = conn
+            .build_transaction()
+            .isolation_level(IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .map_err(unavailable)?;
         let mut counts: BTreeMap<String, (u64, u64, u64)> = BTreeMap::new();
-        for row in conn
+        for row in tx
             .query(
-                "SELECT dataset, kept FROM lake_partition WHERE kept > 0",
+                "SELECT dataset, in_force FROM lake_partition WHERE in_force > 0",
                 &[],
             )
             .map_err(unavailable)?
         {
             counts.insert(row.get::<_, String>(0), (row.get::<_, i64>(1) as u64, 0, 0));
         }
-        for row in conn
+        for row in tx
             .query(
-                "SELECT dataset,
-                        count(*) FILTER (WHERE state = 2),
-                        count(*) FILTER (WHERE state = 3)
+                "SELECT r.dataset,
+                        count(*) FILTER (WHERE e.state = 2),
+                        count(*) FILTER (WHERE e.state = 3)
                    FROM (SELECT dataset, sequence, max(state) AS state
                            FROM (SELECT dataset, sequence, quality AS state
                                    FROM lake_row WHERE quality IN (2, 3)
                                  UNION ALL
-                                 SELECT a.dataset, a.sequence, a.state
-                                   FROM lake_quality_assessment a
-                                   JOIN lake_row r
-                                     ON r.dataset = a.dataset AND r.sequence = a.sequence) flagged
-                          GROUP BY dataset, sequence) effective
-                  GROUP BY dataset",
+                                 SELECT dataset, sequence, state
+                                   FROM lake_quality_assessment) flagged
+                          GROUP BY dataset, sequence) e
+                   JOIN lake_row r ON r.dataset = e.dataset AND r.sequence = e.sequence
+                  WHERE NOT EXISTS (
+                        SELECT 1 FROM lake_row n
+                         WHERE n.dataset = r.dataset AND n.data_type = r.data_type
+                           AND n.row_key = r.row_key AND n.version > r.version)
+                  GROUP BY r.dataset",
                 &[],
             )
             .map_err(unavailable)?
@@ -1326,6 +1363,7 @@ impl Store for PostgresStore {
             count.1 = suspicious;
             count.2 = invalid;
         }
+        tx.commit().map_err(unavailable)?;
         Ok(counts)
     }
 

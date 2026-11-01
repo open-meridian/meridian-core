@@ -467,8 +467,12 @@ pub trait Store: Send + Sync {
     fn closed_day_counts(&self) -> Result<BTreeMap<String, (u64, u64)>>;
 
     /// Per dataset holding any (contract v29, W10.9; ruling 619 (2)): the
-    /// rows kept whose effective state -- the state recorded, raised by
-    /// every assessment since -- is valid, suspicious and invalid.
+    /// rows in force -- each row key at its latest version kept -- whose
+    /// effective state (the state recorded, raised by every assessment of
+    /// that version since) is valid, suspicious and invalid. A new version
+    /// moves its key from the last version's state to its own; a row served
+    /// unkept is never in force; retention takes out a key it leaves no
+    /// version of.
     fn quality_counts(&self) -> Result<BTreeMap<String, (u64, u64, u64)>>;
 
     fn configuration(&self) -> Result<Option<EntitlementsChangedEvent>>;

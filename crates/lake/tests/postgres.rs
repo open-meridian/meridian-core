@@ -569,14 +569,42 @@ fn an_assessment_is_kept_beside_its_row_and_raises_its_effective_state() {
     );
 }
 
-/// A chain row: a trade of the underlying keyed by `series` (none for the
-/// underlying's own), at `valid_from_ns`.
+/// The quality counts of `dataset` (contract v29, W10.9; ruling 619 (2)):
+/// valid, suspicious and invalid, of the rows in force.
+fn counts_of(store: &PostgresStore, dataset: &str) -> (u64, u64, u64) {
+    store
+        .quality_counts()
+        .unwrap()
+        .get(dataset)
+        .copied()
+        .unwrap_or_default()
+}
+
+/// An escalation of one row version by a signal plugin (contract v28, W10.12).
+fn escalation(
+    dataset: &str,
+    row: &Observation,
+    state: meridian_domain::v1::QualityState,
+    at_ns: i64,
+) -> meridian_lake::store::Assessment {
+    meridian_lake::store::Assessment {
+        dataset: dataset.into(),
+        sequence: row.meta().sequence,
+        row_key: row.meta().row_key.clone(),
+        version: row.meta().version,
+        state: state as i32,
+        reasons: vec![],
+        by_instance: "signal-1".into(),
+        at_ns,
+    }
+}
+
 #[test]
-fn the_rows_kept_are_counted_by_their_effective_state_without_reading_every_row() {
+fn the_rows_in_force_are_counted_by_their_effective_state_without_reading_every_row() {
     // Contract v29 (W10.9; ruling 619 (2)): valid, suspicious and invalid,
-    // an escalation counted at its state; retention moving the kept count.
+    // an escalation counted at its state; a row served unkept never in
+    // force; retention moving the count.
     use meridian_domain::v1::QualityState;
-    use meridian_lake::store::Assessment;
     let store = store();
     let dataset = unique("coinbase-1:daily");
     let subject = unique("LCL-BTC");
@@ -588,30 +616,190 @@ fn the_rows_kept_are_counted_by_their_effective_state_without_reading_every_row(
         close(&dataset, "c", &subject, "2026-10-15", 12),
     ];
     let done = store.record(&dataset, rows, 1_000).unwrap();
-    assert_eq!(store.quality_counts().unwrap()[&dataset], (2, 1, 0));
+    assert_eq!(counts_of(&store, &dataset), (2, 1, 0));
     store
-        .assess(&[Assessment {
-            dataset: dataset.clone(),
-            sequence: done.rows[1].meta().sequence,
-            row_key: "b".into(),
-            version: 1,
-            state: QualityState::Invalid as i32,
-            reasons: vec![],
-            by_instance: "signal-1".into(),
-            at_ns: 2_000,
-        }])
+        .assess(&[escalation(
+            &dataset,
+            &done.rows[1],
+            QualityState::Invalid,
+            2_000,
+        )])
         .unwrap();
-    assert_eq!(store.quality_counts().unwrap()[&dataset], (1, 1, 1));
+    assert_eq!(counts_of(&store, &dataset), (1, 1, 1));
+    store
+        .serve_unkept(
+            &dataset,
+            vec![close(&dataset, "d", &subject, "2026-10-16", 13)],
+            &["reporting-1".to_string()],
+            2_500,
+        )
+        .unwrap();
+    assert_eq!(counts_of(&store, &dataset), (1, 1, 1), "served, not kept");
     store
         .remove_before(&dataset, 2_000, "retention", 3_000)
         .unwrap();
-    assert!(store
-        .quality_counts()
-        .unwrap()
-        .get(&dataset)
-        .is_none_or(|counts| *counts == (0, 0, 0)));
+    assert_eq!(counts_of(&store, &dataset), (0, 0, 0));
 }
 
+#[test]
+fn a_new_version_moves_its_row_key_from_the_last_versions_state_to_its_own() {
+    // Contract v29 (W10.9; ruling 619 (2), the counts of rows in force): a
+    // row key counts once, at its latest version kept, so a correction
+    // stops it counting under its last version's state.
+    use meridian_domain::v1::QualityState;
+    let store = store();
+    let dataset = unique("coinbase-1:daily");
+    let subject = unique("LCL-BTC");
+    let at = |state: QualityState, mut row: Observation| {
+        row.meta_mut().quality = state as i32;
+        row
+    };
+    let first = store
+        .record(
+            &dataset,
+            vec![
+                close(&dataset, "a", &subject, "2026-10-13", 10),
+                at(
+                    QualityState::Invalid,
+                    close(&dataset, "b", &subject, "2026-10-14", 11),
+                ),
+                close(&dataset, "c", &subject, "2026-10-15", 12),
+            ],
+            1_000,
+        )
+        .unwrap();
+    assert_eq!(counts_of(&store, &dataset), (2, 0, 1));
+
+    // A quarantined row republished valid: corrected, it counts valid.
+    let fixed = store
+        .record(
+            &dataset,
+            vec![close(&dataset, "b", &subject, "2026-10-14", 21)],
+            2_000,
+        )
+        .unwrap();
+    assert_eq!((fixed.recorded, fixed.restated), (0, 1));
+    assert_eq!(counts_of(&store, &dataset), (3, 0, 0));
+
+    // A valid row republished suspicious.
+    store
+        .record(
+            &dataset,
+            vec![at(
+                QualityState::Suspicious,
+                close(&dataset, "a", &subject, "2026-10-13", 20),
+            )],
+            2_000,
+        )
+        .unwrap();
+    assert_eq!(counts_of(&store, &dataset), (2, 1, 0));
+
+    // A row escalated invalid, then corrected valid by its source; an
+    // escalation of a version since replaced moves nothing.
+    store
+        .assess(&[escalation(
+            &dataset,
+            &first.rows[2],
+            QualityState::Invalid,
+            2_500,
+        )])
+        .unwrap();
+    assert_eq!(counts_of(&store, &dataset), (1, 1, 1));
+    store
+        .record(
+            &dataset,
+            vec![close(&dataset, "c", &subject, "2026-10-15", 22)],
+            3_000,
+        )
+        .unwrap();
+    assert_eq!(counts_of(&store, &dataset), (2, 1, 0));
+    store
+        .assess(&[escalation(
+            &dataset,
+            &first.rows[0],
+            QualityState::Invalid,
+            3_500,
+        )])
+        .unwrap();
+    assert_eq!(counts_of(&store, &dataset), (2, 1, 0), "a replaced version");
+
+    // A restart: the counts are the database's, read again the same.
+    drop(store);
+    let store = self::store();
+    assert_eq!(counts_of(&store, &dataset), (2, 1, 0));
+
+    // Retention of the replaced versions leaves every key in force; of
+    // every version, none.
+    store
+        .remove_before(&dataset, 2_000, "retention", 4_000)
+        .unwrap();
+    assert_eq!(counts_of(&store, &dataset), (2, 1, 0));
+    store
+        .remove_before(&dataset, 3_001, "retention", 4_000)
+        .unwrap();
+    assert_eq!(counts_of(&store, &dataset), (0, 0, 0));
+}
+
+#[test]
+fn migrating_counts_the_rows_in_force_the_lake_already_keeps() {
+    // Contract v29 (ruling 619 (2)): migration 8 fills each dataset's rows
+    // in force from the rows kept, one per row key, so a lake upgraded with
+    // corrected rows counts each key at its latest version.
+    let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let name = format!("lake_in_force_{}_{seq}", SystemClock.now_ns());
+    let base = std::env::var("MERIDIAN_TEST_DATABASE_URL").expect("the test database");
+    postgres::Client::connect(&base, postgres::NoTls)
+        .expect("could not reach the test database")
+        .batch_execute(&format!("CREATE SCHEMA {name}"))
+        .expect("could not create a schema");
+    let url = format!("{base}?options=-c%20search_path%3D{name}");
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("connects");
+
+    // The lake as the release before this one left it.
+    let before: Vec<_> = meridian_lake::migrations::MIGRATIONS
+        .iter()
+        .take_while(|m| m.name != "quality_counts")
+        .collect();
+    assert_eq!(before.len(), 7, "every migration before the counts");
+    client
+        .batch_execute(meridian_lake::migrations::HISTORY)
+        .unwrap();
+    for migration in before {
+        let mut tx = client.transaction().unwrap();
+        tx.batch_execute(migration.sql).unwrap();
+        meridian_lake::migrations::record(&mut tx, migration, 1).unwrap();
+        tx.commit().unwrap();
+    }
+    // Key a: invalid, then corrected valid. Key b: suspicious. Key c:
+    // valid, escalated invalid. Key d: valid, then corrected suspicious.
+    client
+        .batch_execute(
+            "INSERT INTO lake_partition (dataset, head) VALUES ('x-1:daily', 6);
+             INSERT INTO lake_row (dataset, sequence, data_type, row_key, version, subject,
+                                   subjects, kind, interval_ns, venue_id, valid_from_ns,
+                                   valid_until_ns, recorded_at_ns, previous_sequence,
+                                   unconverted, body, latest_key, quality)
+             VALUES ('x-1:daily', 1, 1, 'a', 1, 'S', '{S}', 1, 0, '', 1, 2, 10, 0, false, '', '', 3),
+                    ('x-1:daily', 2, 1, 'b', 1, 'S', '{S}', 1, 0, '', 1, 2, 10, 1, false, '', '', 2),
+                    ('x-1:daily', 3, 1, 'c', 1, 'S', '{S}', 1, 0, '', 1, 2, 10, 2, false, '', '', 1),
+                    ('x-1:daily', 4, 1, 'd', 1, 'S', '{S}', 1, 0, '', 1, 2, 10, 3, false, '', '', 1),
+                    ('x-1:daily', 5, 1, 'a', 2, 'S', '{S}', 1, 0, '', 1, 2, 20, 4, false, '', '', 1),
+                    ('x-1:daily', 6, 1, 'd', 2, 'S', '{S}', 1, 0, '', 1, 2, 20, 5, false, '', '', 2);
+             INSERT INTO lake_quality_assessment
+                    (dataset, sequence, row_key, version, state, reasons, by_instance, at_ns)
+             VALUES ('x-1:daily', 3, 'c', 1, 3, '{}', 'signal-1', 15);",
+        )
+        .unwrap();
+
+    let store = PostgresStore::connect(&url, 2).expect("connects");
+    assert!(store.verify().is_err(), "migrations behind");
+    store.migrate(&SystemClock).expect("migrates");
+    store.verify().expect("recognised after migrating");
+    assert_eq!(counts_of(&store, "x-1:daily"), (1, 2, 1));
+}
+
+/// A chain row: a trade of the underlying keyed by `series` (none for the
+/// underlying's own), at `valid_from_ns`.
 fn chain_trade(
     dataset: &str,
     row_key: &str,

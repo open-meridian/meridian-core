@@ -415,7 +415,8 @@ impl Store for MemoryStore {
     fn quality_counts(&self) -> Result<BTreeMap<String, (u64, u64, u64)>> {
         use meridian_domain::v1::QualityState;
         let held = self.lock();
-        let mut rows = held.rows.clone();
+        // The rows in force: each row key at its latest version kept.
+        let mut rows = as_of(held.rows.iter().cloned(), 0);
         as_assessed(&mut rows, &held.assessments, 0);
         let mut counts: BTreeMap<String, (u64, u64, u64)> = BTreeMap::new();
         for row in &rows {

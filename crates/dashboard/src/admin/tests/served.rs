@@ -1005,7 +1005,7 @@ fn lake_listing() -> meridian_domain::v1::ListDatasetsReply {
                 // the browser sees both in the one cell.
                 closed_day_count: (n * 2 + k) as u64 * 11,
                 outside_coverage_count: if k == 1 { (n + 1) as u64 * 3 } else { 0 },
-                // Contract v29 (619 (2)): the rows kept by effective state,
+                // Contract v29 (619 (2)): the rows in force by effective state,
                 // a large dataset among them.
                 valid_count: (n * 3 + k) as u64 * 104_729,
                 suspicious_count: (n + k) as u64 * 13,
