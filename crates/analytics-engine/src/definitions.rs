@@ -175,7 +175,7 @@ const CURVE: &[(&str, &str)] = &[
 /// v26's at version 1, from contract v27 `execution_cost` version 1 and
 /// `pnl` version 2, from contract v28 the options measures, and from
 /// contract v29 the curve and bond measures (W12.1).
-pub const DEFINITIONS: [Definition; 30] = [
+pub const DEFINITIONS: [Definition; 32] = [
     Definition {
         definition: "market_value",
         version: 1,
@@ -524,6 +524,36 @@ pub const DEFINITIONS: [Definition; 30] = [
         scale: 8,
         description: "The Treasury par, zero and discount curves at the job's date, monotone \
                       convex over the par yields",
+    },
+    Definition {
+        definition: "historical_prepayment",
+        version: 1,
+        parameters: &[
+            ("windows", "1_3_6_12_months_and_life"),
+            (
+                "scheduled_amortization",
+                "level_payment_at_the_coupon_over_the_original_term",
+            ),
+            ("units", "percent"),
+        ],
+        breakdowns: &["instrument", "window", "component"],
+        scale: 4,
+        description: "Each pool's or class's SMM and CPR over 1, 3, 6 and 12 months and life, \
+                      from its factors",
+    },
+    Definition {
+        definition: "wal_at_cpr",
+        version: 1,
+        parameters: &[
+            ("cpr", "6"),
+            ("prepayment", "a_constant_cpr_no_model"),
+            ("amortization", "level_payment_at_the_coupon_to_maturity"),
+            ("yield", "bond_equivalent_from_monthly"),
+        ],
+        breakdowns: &["instrument", "component"],
+        scale: 4,
+        description: "Each pool's or class's weighted average life and yield at a constant CPR \
+                      of 6, static",
     },
 ];
 

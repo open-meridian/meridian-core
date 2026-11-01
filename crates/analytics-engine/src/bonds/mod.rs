@@ -22,6 +22,7 @@
 pub mod curve;
 pub mod dates;
 pub mod daycount;
+pub mod mbs;
 pub mod measures;
 pub mod package;
 pub mod pricing;

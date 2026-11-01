@@ -606,7 +606,7 @@ async fn an_account_outside_the_scope_and_a_definition_not_served_are_refused_na
     // contract v28 the twelve options measures, positioning_exposure at a
     // version per basis (ruling 591), and from contract v29 the eleven
     // curve and bond measures (ruling 688).
-    assert_eq!(definitions.definitions.len(), 30);
+    assert_eq!(definitions.definitions.len(), 32);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2218,6 +2218,7 @@ async fn a_bond_funds_job_reads_its_debt_inputs_on_the_clients_behalf() {
         ("accrued_interest", &[], ""),
         ("bond_yield", &[], ""),
         ("bond_spread", &[], ""),
+        ("historical_prepayment", &[], ""),
         ("treasury_curve", &[], ""),
     ]);
     request.job.as_mut().unwrap().business_date = "2026-10-16".into();
@@ -2251,15 +2252,21 @@ async fn a_bond_funds_job_reads_its_debt_inputs_on_the_clients_behalf() {
         "accrued_interest",
         "bond_yield",
         "bond_spread",
+        "historical_prepayment",
         "treasury_curve",
     ] {
         assert!(has(definition), "{definition}: {:?}", answer.not_evaluated);
     }
-    assert!(
-        answer.not_evaluated.is_empty(),
-        "{:?}",
-        answer.not_evaluated
-    );
+    // Four months of factors: 6 and 12 months not evaluated, as the
+    // fixture's case says.
+    let short: Vec<&str> = answer
+        .not_evaluated
+        .iter()
+        .filter(|u| u.reason == NotEvaluatedReason::HistoryInsufficient as i32)
+        .map(|u| u.detail.split(':').next().unwrap())
+        .collect();
+    assert_eq!(short, vec!["12m", "6m"]);
+    assert_eq!(answer.not_evaluated.len(), 2, "{:?}", answer.not_evaluated);
     // Each debt read on the client's behalf, as every read is (W12.2).
     let heard = stores.heard.lock().unwrap();
     for topic in [

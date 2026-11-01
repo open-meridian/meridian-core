@@ -368,6 +368,8 @@ pub fn compute(
                 }
                 Err(why) => Err(why.clone()),
             },
+            "historical_prepayment" => historical_prepayment(case, &position, &mut out),
+            "wal_at_cpr" => wal_at_cpr(case, &position, definition, &mut out),
             other => return Err(CaseError(format!("no computation for {other}"))),
         };
         if let Err((reason, detail)) = done {
@@ -1066,6 +1068,195 @@ fn key_rate_durations(
             "",
             src,
         );
+    }
+    Ok(())
+}
+
+/// Months between two YYYYMM months, `to` after `from`.
+fn months_between(from: &str, to: &str) -> Option<i32> {
+    let read = |m: &str| -> Option<i32> {
+        if m.len() != 6 {
+            return None;
+        }
+        Some(m[..4].parse::<i32>().ok()? * 12 + m[4..].parse::<i32>().ok()? - 1)
+    };
+    Some(read(to)? - read(from)?)
+}
+
+fn month_of(date: Date) -> String {
+    format!("{:04}{:02}", date.year(), date.month())
+}
+
+fn month_back(month: &str, n: i32) -> String {
+    let index = month[..4].parse::<i32>().unwrap_or(0) * 12
+        + month[4..].parse::<i32>().unwrap_or(1)
+        - 1
+        - n;
+    format!("{:04}{:02}", index.div_euclid(12), index.rem_euclid(12) + 1)
+}
+
+/// A pool's or a class's issue and maturity, term in months and rate (a
+/// fraction).
+fn amortizing(held: &Held) -> std::result::Result<(Date, Date, u32, f64), Why> {
+    if let Some(why) = held.incomplete() {
+        return Err(why);
+    }
+    let (issue, maturity, term) = match &held.debt {
+        super::Debt::Pool(pool) => (
+            pool.issue_date.as_str(),
+            pool.maturity_date.as_str(),
+            pool.original_term_months,
+        ),
+        super::Debt::Tranche(class) => (class.issue_date.as_str(), class.maturity_date.as_str(), 0),
+        _ => return Err((TERMS_INCOMPLETE, "a pool's or a class's terms".to_string())),
+    };
+    let issue = Date::parse(issue).map_err(|_| (TERMS_INCOMPLETE, "issue_date".to_string()))?;
+    let maturity =
+        Date::parse(maturity).map_err(|_| (TERMS_INCOMPLETE, "maturity_date".to_string()))?;
+    let term = if term > 0 {
+        term
+    } else {
+        months_between(&month_of(issue), &month_of(maturity))
+            .unwrap_or(0)
+            .max(1) as u32
+    };
+    let rate = held
+        .coupon_percent()
+        .ok_or((TERMS_INCOMPLETE, "coupon_rate".to_string()))?
+        .to_f64()
+        / 100.0;
+    Ok((issue, maturity, term, rate))
+}
+
+fn historical_prepayment(
+    case: &Case,
+    position: &Position<'_>,
+    out: &mut Out<'_>,
+) -> std::result::Result<(), Why> {
+    if !position.held.factored() {
+        return Ok(());
+    }
+    let (issue, _, term, rate) = amortizing(position.held)?;
+    let latest = factor_at(case, position.id)?;
+    let rows = case.factors.get(position.id).cloned().unwrap_or_default();
+    for row in &rows {
+        if !row.dataset.is_empty() {
+            out.part.reads.datasets.insert(row.dataset.clone());
+        }
+    }
+    let at = |month: &str| rows.iter().find(|r| r.factor_month == month);
+    let issued = month_of(issue);
+    let src = latest.source_ns;
+    let mut windows: Vec<(String, Option<(f64, i32)>)> = Vec::new();
+    for n in [1, 3, 6, 12] {
+        let from = month_back(&latest.factor_month, n);
+        let start = if from == issued {
+            Some(1.0)
+        } else if from < issued {
+            None
+        } else {
+            at(&from).map(|r| r.factor.to_f64())
+        };
+        windows.push((format!("{n}m"), start.map(|s| (s, n))));
+    }
+    let life = months_between(&issued, &latest.factor_month).filter(|n| *n > 0);
+    windows.push(("life".to_string(), life.map(|n| (1.0, n))));
+    let end = latest.factor.to_f64();
+    for (window, start) in windows {
+        let Some((start, n)) = start else {
+            out.not(
+                position.id,
+                HISTORY_INSUFFICIENT,
+                format!(
+                    "{window}: the factor {} months before {} is not held",
+                    window.trim_end_matches('m'),
+                    latest.factor_month
+                ),
+            );
+            continue;
+        };
+        let age = months_between(&issued, &latest.factor_month).unwrap_or(0) - n;
+        match super::mbs::smm_cpr(start, end, n as u32, age.max(0) as u32, term, rate) {
+            Some((smm, cpr)) => {
+                out.model(
+                    position.id,
+                    vec![("window", window.clone()), (COMPONENT, "smm".into())],
+                    smm * 100.0,
+                    "",
+                    src,
+                );
+                out.model(
+                    position.id,
+                    vec![("window", window.clone()), (COMPONENT, "cpr".into())],
+                    cpr * 100.0,
+                    "",
+                    src,
+                );
+            }
+            None => out.not(
+                position.id,
+                HISTORY_INSUFFICIENT,
+                format!("{window}: no scheduled balance"),
+            ),
+        }
+    }
+    Ok(())
+}
+
+fn wal_at_cpr(
+    case: &Case,
+    position: &Position<'_>,
+    definition: &Definition,
+    out: &mut Out<'_>,
+) -> std::result::Result<(), Why> {
+    if !position.held.factored() {
+        return Ok(());
+    }
+    let (_, maturity, _, rate) = amortizing(position.held)?;
+    let latest = factor_at(case, position.id)?;
+    if !latest.dataset.is_empty() {
+        out.part.reads.datasets.insert(latest.dataset.clone());
+    }
+    let cpr: f64 = definition
+        .parameter("cpr")
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(6.0)
+        / 100.0;
+    let left = months_between(&latest.factor_month, &month_of(maturity))
+        .unwrap_or(0)
+        .max(0) as u32;
+    let projection = super::mbs::project(rate, left, cpr);
+    let src = latest.source_ns;
+    out.model(
+        position.id,
+        vec![(COMPONENT, "wal".into())],
+        projection.wal(),
+        "",
+        src,
+    );
+    let date = Date::parse(&case.valuation_date)
+        .map_err(|_| (PRICE_MISSING, "the job's date".to_string()))?;
+    let price = close(case, position, out)?;
+    let clean = clean_of(price)?.to_f64() / 100.0;
+    let accrued = accrued_per_100(case, position.held, date)?.to_f64() / 100.0;
+    let delay = match &position.held.debt {
+        super::Debt::Pool(pool) => pool.payment_delay_days,
+        super::Debt::Tranche(class) => class.payment_delay_days,
+        _ => 0,
+    };
+    match projection.yield_of(clean + accrued, delay) {
+        Some((_, bey)) => out.model(
+            position.id,
+            vec![(COMPONENT, "yield".into())],
+            bey * 100.0,
+            "",
+            price.source_ns,
+        ),
+        None => out.not(
+            position.id,
+            PRICE_MISSING,
+            format!("no yield prices {clean} per 1 of face"),
+        ),
     }
     Ok(())
 }

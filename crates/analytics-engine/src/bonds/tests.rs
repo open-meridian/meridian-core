@@ -250,6 +250,50 @@ fn pool_document(months: &[(&str, &str)], measures: &[&str]) -> Value {
 }
 
 #[test]
+fn a_pool_with_four_months_of_factors_is_not_evaluated_for_six_and_twelve() {
+    let doc = pool_document(
+        &[
+            ("202606", "0.9501"),
+            ("202607", "0.9452"),
+            ("202608", "0.9398"),
+            ("202609", "0.9351"),
+        ],
+        &["historical_prepayment", "market_value", "wal_at_cpr"],
+    );
+    let answer = crate::compute(&doc).unwrap();
+    let insufficient: Vec<&str> = answer
+        .not_evaluated
+        .iter()
+        .filter(|u| u.reason == HISTORY_INSUFFICIENT)
+        .map(|u| u.detail.split(':').next().unwrap())
+        .collect();
+    assert_eq!(insufficient, vec!["12m", "6m"], "{:?}", reasons(&answer));
+    for window in ["1m", "3m", "life"] {
+        let cpr = answer
+            .figures
+            .iter()
+            .find(|f| {
+                f.breakdown.contains(&("window".into(), window.into()))
+                    && f.breakdown.contains(&("component".into(), "cpr".into()))
+            })
+            .and_then(|f| f.value.as_ref())
+            .unwrap()
+            .to_f64();
+        assert!(cpr > 0.0 && cpr < 100.0, "{window}: {cpr}");
+    }
+    // Its market value: original face times the factor times the close.
+    let mv = answer
+        .figures
+        .iter()
+        .find(|f| f.measure.definition == "market_value")
+        .unwrap();
+    assert_eq!(mv.value.as_ref().unwrap().text(), "949126.50");
+    let wal = figure(&answer, "wal_at_cpr", "INS-POOL", "wal").unwrap();
+    assert!(wal > 5.0 && wal < 20.0, "{wal}");
+    assert!(figure(&answer, "wal_at_cpr", "INS-POOL", "yield").is_some());
+}
+
+#[test]
 fn a_pool_with_no_factor_is_not_valued() {
     let doc = pool_document(&[], &["market_value"]);
     let answer = crate::compute(&doc).unwrap();
