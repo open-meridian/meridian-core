@@ -1533,6 +1533,7 @@ pub(crate) fn refused(failed: BusError) -> Status {
                     meridian_bus::RefusalStatus::InvalidArgument => Code::InvalidArgument,
                     meridian_bus::RefusalStatus::PermissionDenied => Code::PermissionDenied,
                     meridian_bus::RefusalStatus::NotFound => Code::NotFound,
+                    meridian_bus::RefusalStatus::FailedPrecondition => Code::FailedPrecondition,
                 },
                 words.to_string(),
                 RefusalReason::Unspecified,

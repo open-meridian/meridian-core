@@ -119,6 +119,10 @@ pub enum RefusalStatus {
     InvalidArgument,
     PermissionDenied,
     NotFound,
+    /// Contract v29 (616): a well-formed act that cannot proceed as the
+    /// deployment stands -- an install of a withdrawn pack, an update whose
+    /// member's source registry is not taken -- naming what is missing.
+    FailedPrecondition,
 }
 
 impl RefusalStatus {
@@ -127,6 +131,7 @@ impl RefusalStatus {
             RefusalStatus::InvalidArgument => "invalid-argument",
             RefusalStatus::PermissionDenied => "permission-denied",
             RefusalStatus::NotFound => "not-found",
+            RefusalStatus::FailedPrecondition => "failed-precondition",
         }
     }
 }
@@ -168,6 +173,7 @@ pub fn read_refusal_status(detail: &str) -> Option<(RefusalStatus, Vec<String>, 
         "invalid-argument" => RefusalStatus::InvalidArgument,
         "permission-denied" => RefusalStatus::PermissionDenied,
         "not-found" => RefusalStatus::NotFound,
+        "failed-precondition" => RefusalStatus::FailedPrecondition,
         _ => return None,
     };
     Some((status, fields, words))
@@ -198,6 +204,15 @@ mod refusal_status_tests {
         assert_eq!(
             read_refusal_status(&gone).map(|(status, fields, _)| (status, fields)),
             Some((RefusalStatus::NotFound, vec!["job_id".to_string()]))
+        );
+        let stands = refusal_with_status(
+            RefusalStatus::FailedPrecondition,
+            &["pack".into()],
+            "withdrawn",
+        );
+        assert_eq!(
+            read_refusal_status(&stands).map(|(status, fields, _)| (status, fields)),
+            Some((RefusalStatus::FailedPrecondition, vec!["pack".to_string()]))
         );
         assert!(read_refusal_status("[refusal-reason 21] words").is_none());
     }

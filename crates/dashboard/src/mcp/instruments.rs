@@ -1243,6 +1243,7 @@ pub(super) async fn ask<R: Message + Default>(
                     meridian_bus::RefusalStatus::InvalidArgument => "invalid_arguments",
                     meridian_bus::RefusalStatus::PermissionDenied => "not_permitted",
                     meridian_bus::RefusalStatus::NotFound => "not_found",
+                    meridian_bus::RefusalStatus::FailedPrecondition => "failed_precondition",
                 }
                 .into(),
                 words.to_string(),
