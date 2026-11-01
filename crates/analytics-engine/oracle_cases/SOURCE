@@ -23,3 +23,11 @@ read by src/bonds/oracle.rs and src/bonds/tests.rs; never edited by hand.
 
 QuantLib is a test oracle only: its answers are pinned here from the pinned
 release (the SDK's, 1.40), never a dependency of this crate or the image.
+
+tools/ql_curve.py and tools/ql_bonds.py wrote treasury-curve.json and
+bond-functions.json (test-only tooling, never shipped or run by a gate):
+`python3 tools/ql_curve.py <responses>` then `python3 tools/ql_bonds.py
+<responses>`, in a Python with QuantLib 1.40, <responses> holding the two
+plugins' recorded par-202609.csv.gz, par-202610.csv.gz and
+feds200628.csv.gz. Rerun on 2026-10-31, they reproduce both files byte for
+byte.
