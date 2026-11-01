@@ -22,7 +22,7 @@ pub const BUILT_IN: &str = "built-in";
 /// v26's model ids, each at version 1 (the first release's §1); from
 /// contract v28 (ruling 565) the option models and the calibrations; from
 /// contract v29 (ruling 688) the debt models and the curve's calibration.
-pub const MODELS: [&str; 10] = [
+pub const MODELS: [&str; 11] = [
     "cash",
     "quoted_price",
     "binary_event",
@@ -33,6 +33,7 @@ pub const MODELS: [&str; 10] = [
     "ssvi",
     "bond_cash_flows",
     "bond_yield_solver",
+    "monotone_convex",
 ];
 
 /// The breakdowns the linear measures allow (requirement 17).
@@ -157,11 +158,24 @@ const BOND_SOLVER: &[(&str, &str)] = &[
     ("municipal_yield", "truncated_to_4_places_then_rounded_to_3"),
 ];
 
+/// The curve's fit (contract v29; W12.1, W12.3).
+const CURVE: &[(&str, &str)] = &[
+    ("model", "monotone_convex"),
+    ("par_yields", "ust_cmt"),
+    (
+        "instruments",
+        "par_bonds_semi_annual_actual_actual_icma_from_the_date",
+    ),
+    ("time", "actual_365_fixed"),
+    ("zero", "continuously_compounded"),
+    ("date", "the_job_date"),
+];
+
 /// Every definition the component serves, in the order it lists them:
 /// v26's at version 1, from contract v27 `execution_cost` version 1 and
 /// `pnl` version 2, from contract v28 the options measures, and from
 /// contract v29 the curve and bond measures (W12.1).
-pub const DEFINITIONS: [Definition; 27] = [
+pub const DEFINITIONS: [Definition; 30] = [
     Definition {
         definition: "market_value",
         version: 1,
@@ -469,6 +483,47 @@ pub const DEFINITIONS: [Definition; 27] = [
         scale: 6,
         description: "Each bond's Macaulay and modified duration, convexity and DV01 per 100 of \
                       face and per position, to worst for a callable bond",
+    },
+    Definition {
+        definition: "key_rate_durations",
+        version: 1,
+        parameters: &[
+            ("curve", "treasury_curve_v1"),
+            ("bump_bp", "1"),
+            ("spread", "the_z_spread_held"),
+            ("at", "the_yield_to_worst"),
+        ],
+        breakdowns: &["instrument", "tenor"],
+        scale: 6,
+        description: "Each bond's duration to each curve tenor's par yield moved one basis point, \
+                      by bump scenarios through the graph",
+    },
+    Definition {
+        definition: "bond_spread",
+        version: 1,
+        parameters: &[
+            ("curve", "treasury_curve_v1"),
+            ("g_spread", "the_yield_less_the_fitted_par_curve_at_its_date"),
+            (
+                "z_spread",
+                "semi_annual_over_the_fitted_zero_curve_actual_365_fixed",
+            ),
+            ("benchmark", "the_yield_less_the_named_benchmark_yield"),
+            ("at", "the_yield_to_worst"),
+        ],
+        breakdowns: &["instrument", "spread_kind"],
+        scale: 4,
+        description: "Each bond's G-spread, Z-spread and spread to a named benchmark, in basis \
+                      points; I-spread waits for a swap curve",
+    },
+    Definition {
+        definition: "treasury_curve",
+        version: 1,
+        parameters: CURVE,
+        breakdowns: &["curve", "tenor"],
+        scale: 8,
+        description: "The Treasury par, zero and discount curves at the job's date, monotone \
+                      convex over the par yields",
     },
 ];
 

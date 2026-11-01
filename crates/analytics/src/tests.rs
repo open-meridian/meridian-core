@@ -606,7 +606,7 @@ async fn an_account_outside_the_scope_and_a_definition_not_served_are_refused_na
     // contract v28 the twelve options measures, positioning_exposure at a
     // version per basis (ruling 591), and from contract v29 the eleven
     // curve and bond measures (ruling 688).
-    assert_eq!(definitions.definitions.len(), 27);
+    assert_eq!(definitions.definitions.len(), 30);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2217,6 +2217,8 @@ async fn a_bond_funds_job_reads_its_debt_inputs_on_the_clients_behalf() {
         ("market_value", &["instrument"], ""),
         ("accrued_interest", &[], ""),
         ("bond_yield", &[], ""),
+        ("bond_spread", &[], ""),
+        ("treasury_curve", &[], ""),
     ]);
     request.job.as_mut().unwrap().business_date = "2026-10-16".into();
     let reply: RunJobReply = ask_as(
@@ -2245,7 +2247,12 @@ async fn a_bond_funds_job_reads_its_debt_inputs_on_the_clients_behalf() {
             .iter()
             .any(|f| f.measure.as_ref().unwrap().definition == definition)
     };
-    for definition in ["accrued_interest", "bond_yield"] {
+    for definition in [
+        "accrued_interest",
+        "bond_yield",
+        "bond_spread",
+        "treasury_curve",
+    ] {
         assert!(has(definition), "{definition}: {:?}", answer.not_evaluated);
     }
     assert!(
@@ -2255,7 +2262,11 @@ async fn a_bond_funds_job_reads_its_debt_inputs_on_the_clients_behalf() {
     );
     // Each debt read on the client's behalf, as every read is (W12.2).
     let heard = stores.heard.lock().unwrap();
-    for topic in [crate::debt::LIST_FACTORS, topics::READ_CALENDAR] {
+    for topic in [
+        crate::debt::LIST_FACTORS,
+        topics::LIST_RATES,
+        topics::READ_CALENDAR,
+    ] {
         let (_, meta) = heard
             .stamps
             .iter()
@@ -2264,7 +2275,7 @@ async fn a_bond_funds_job_reads_its_debt_inputs_on_the_clients_behalf() {
         assert_eq!(meta.on_behalf_of_instance_id, crate::INSTANCE, "{topic}");
     }
     let provenance = answer.provenance.unwrap();
-    for dataset in ["bonds-1:closes", "gse-1:factors"] {
+    for dataset in ["bonds-1:closes", "gse-1:factors", "us-treasury-1:ust_par"] {
         assert!(
             provenance.datasets.contains(&dataset.to_string()),
             "{dataset}"
@@ -2275,7 +2286,7 @@ async fn a_bond_funds_job_reads_its_debt_inputs_on_the_clients_behalf() {
         .iter()
         .map(|m| m.model_id.as_str())
         .collect();
-    for model in ["bond_cash_flows", "bond_yield_solver"] {
+    for model in ["bond_cash_flows", "bond_yield_solver", "monotone_convex"] {
         assert!(models.contains(&model), "{models:?}");
     }
 }

@@ -19,13 +19,14 @@
 
 use meridian_domain::date::Date;
 
+use super::curve::{maturity_of, Curve, ParPoint};
 use super::dates::{plus_days, Calendar};
 use super::daycount::DayCount;
 use super::pricing::{g33_yield, Grid, Method, Priceable};
 use super::schedule::{accrued, flows_to, hundred, Schedule, Shape};
 use super::{Held, Why};
 use crate::answer::*;
-use crate::case::{Case, CaseError, FactorRow, MeasureKey, Price, Result};
+use crate::case::{Case, CaseError, FactorRow, MeasureKey, ParCurve, Price, Result};
 use crate::chains::exact;
 use crate::definitions::{Definition, COMPONENT};
 use crate::exact::{Dec, Ratio};
@@ -312,6 +313,12 @@ pub fn compute(
         scale: definition.scale,
         part: &mut part,
     };
+    // The curve, fitted once for the unit where the measure reads it.
+    let curve = if reads_curve(definition.definition) {
+        Some(fit(case, out.part))
+    } else {
+        None
+    };
     for p in &positions {
         if p.instrument_id.starts_with("LCL-") {
             // A local record is never priced; only a debt one is asked of.
@@ -351,6 +358,16 @@ pub fn compute(
             "bond_yield" => bond_yield(case, &position, &mut out),
             "bond_price" => bond_price(case, &position, &mut out),
             "bond_risk" => bond_risk(case, &position, &base, &mut out),
+            "key_rate_durations" | "bond_spread" => match curve.as_ref().expect("fitted") {
+                Ok(curve) => {
+                    if definition.definition == "bond_spread" {
+                        bond_spread(case, &position, curve, &mut out)
+                    } else {
+                        key_rate_durations(case, &position, curve, &mut out)
+                    }
+                }
+                Err(why) => Err(why.clone()),
+            },
             other => return Err(CaseError(format!("no computation for {other}"))),
         };
         if let Err((reason, detail)) = done {
@@ -650,7 +667,12 @@ fn quoted(
             .spread_bps
             .as_ref()
             .ok_or((PRICE_MISSING, "spread_bps".to_string()))?;
-        let benchmark = benchmark_yield(case, &price.benchmark_instrument_id, out)?;
+        let benchmark = benchmark_yield(
+            case,
+            &price.benchmark_instrument_id,
+            b.schedule.maturity,
+            out,
+        )?;
         return Ok((
             benchmark + spread.to_f64() / 10_000.0,
             b.schedule.maturity,
@@ -748,15 +770,25 @@ fn bond_price(
     Ok(())
 }
 
-/// The yield (a fraction) of a named benchmark: a bond's from its
-/// close.
+/// The yield (a fraction) of a named benchmark at `maturity`: a bond's
+/// from its close, or a curve's par yield interpolated there.
 fn benchmark_yield(
     case: &Case,
     benchmark: &str,
+    maturity: Date,
     out: &mut Out<'_>,
 ) -> std::result::Result<f64, Why> {
     if benchmark.is_empty() {
         return Err((PRICE_MISSING, "the benchmark: none named".to_string()));
+    }
+    if let Some(curve) = case.curves.get(benchmark) {
+        let date = Date::parse(&case.valuation_date)
+            .map_err(|_| (PRICE_MISSING, "the job's date".to_string()))?;
+        if !curve.dataset.is_empty() {
+            out.part.reads.datasets.insert(curve.dataset.clone());
+        }
+        let fitted = fitted(curve, date)?;
+        return Ok(fitted.par(maturity) / 100.0);
     }
     let record = case
         .instruments
@@ -859,4 +891,225 @@ fn bond_risk(
         src,
     );
     Ok(())
+}
+
+/// A par curve's points fitted at the job's date.
+fn fitted(curve: &ParCurve, date: Date) -> std::result::Result<Curve, Why> {
+    if !curve.missing.is_empty() {
+        let reason = if curve.missing_reason == "not_entitled" {
+            NOT_ENTITLED
+        } else {
+            PRICE_MISSING
+        };
+        return Err((reason, curve.missing.clone()));
+    }
+    let points: Vec<ParPoint> = curve
+        .points
+        .iter()
+        .filter_map(|(label, count, unit, par)| {
+            Some(ParPoint {
+                tenor: label.clone(),
+                maturity: maturity_of(date, *count, unit)?,
+                par: par.to_f64(),
+            })
+        })
+        .collect();
+    if points.is_empty() {
+        return Err((
+            PRICE_MISSING,
+            format!("{}: no par yields at the as-of", curve.subject_id),
+        ));
+    }
+    Curve::fit(date, points).ok_or((
+        FIT_FAILED,
+        format!("{}: the par yields did not fit", curve.subject_id),
+    ))
+}
+
+/// The Treasury curve at the job's date, its read named.
+fn fit(case: &Case, part: &mut Part) -> std::result::Result<Curve, Why> {
+    let curve = case.treasury_curve.as_ref().ok_or((
+        PRICE_MISSING,
+        "the Treasury par curve: none read".to_string(),
+    ))?;
+    let date = Date::parse(&case.valuation_date)
+        .map_err(|_| (PRICE_MISSING, "the job's date".to_string()))?;
+    if !curve.dataset.is_empty() {
+        part.reads.datasets.insert(curve.dataset.clone());
+    }
+    part.reads
+        .models
+        .insert((super::MONOTONE_CONVEX.to_string(), 1));
+    fitted(curve, date)
+}
+
+/// The dirty price per 100 at settlement of flows discounted on the curve
+/// plus a spread `s` (a fraction), semi-annual on actual/365 fixed.
+pub fn on_curve(curve: &Curve, settle: Date, flows: &[super::schedule::Flow], s: f64) -> f64 {
+    let discount = |on: Date| {
+        let t = super::curve::years(curve.date, on);
+        if t <= 0.0 {
+            return 1.0;
+        }
+        let z = 2.0 * ((curve.zero(on) / 2.0).exp() - 1.0);
+        (1.0 + (z + s) / 2.0).powf(-2.0 * t)
+    };
+    let at = discount(settle);
+    flows
+        .iter()
+        .map(|flow| flow.amount.to_f64() * discount(flow.date) / at)
+        .sum()
+}
+
+/// The spread (a fraction) over the curve the flows' dirty price is at.
+pub fn z_spread(
+    curve: &Curve,
+    settle: Date,
+    flows: &[super::schedule::Flow],
+    dirty: f64,
+) -> Option<f64> {
+    let (mut lo, mut hi) = (-0.2, 1.0);
+    let g = |s: f64| on_curve(curve, settle, flows, s) - dirty;
+    if g(lo).signum() == g(hi).signum() {
+        return None;
+    }
+    for _ in 0..200 {
+        let mid = 0.5 * (lo + hi);
+        if g(mid) > 0.0 {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    Some(0.5 * (lo + hi))
+}
+
+fn bond_spread(
+    case: &Case,
+    position: &Position<'_>,
+    curve: &Curve,
+    out: &mut Out<'_>,
+) -> std::result::Result<(), Why> {
+    let b = bond(case, position.held)?;
+    let (y, on, redemption, dirty, src) = at_worst(case, position, &b, out)?;
+    let flows = b.to(on, &redemption).flows;
+    out.model(
+        position.id,
+        vec![("spread_kind", "g_spread".into())],
+        (y * 100.0 - curve.par(on)) * 100.0,
+        "",
+        src,
+    );
+    match z_spread(curve, b.settle, &flows, dirty) {
+        Some(z) => out.model(
+            position.id,
+            vec![("spread_kind", "z_spread".into())],
+            z * 10_000.0,
+            "",
+            src,
+        ),
+        None => out.not(
+            position.id,
+            FIT_FAILED,
+            "z_spread: no spread prices the close".to_string(),
+        ),
+    }
+    let price = close(case, position, out)?;
+    if price.basis == "PRICE_BASIS_SPREAD" || !price.benchmark_instrument_id.is_empty() {
+        match benchmark_yield(
+            case,
+            &price.benchmark_instrument_id,
+            b.schedule.maturity,
+            out,
+        ) {
+            Ok(benchmark) => out.model(
+                position.id,
+                vec![("spread_kind", "benchmark".into())],
+                (y - benchmark) * 10_000.0,
+                "",
+                src,
+            ),
+            Err((reason, detail)) => out.not(position.id, reason, format!("benchmark: {detail}")),
+        }
+    }
+    Ok(())
+}
+
+fn key_rate_durations(
+    case: &Case,
+    position: &Position<'_>,
+    curve: &Curve,
+    out: &mut Out<'_>,
+) -> std::result::Result<(), Why> {
+    let b = bond(case, position.held)?;
+    let (_, on, redemption, dirty, src) = at_worst(case, position, &b, out)?;
+    let flows = b.to(on, &redemption).flows;
+    let z = z_spread(curve, b.settle, &flows, dirty).ok_or((
+        FIT_FAILED,
+        "z_spread: no spread prices the close".to_string(),
+    ))?;
+    let base = on_curve(curve, b.settle, &flows, z);
+    for (i, point) in curve.points.iter().enumerate() {
+        let Some(bumped) = curve.bumped(i, 1.0) else {
+            out.not(
+                position.id,
+                FIT_FAILED,
+                format!("{}: the bumped curve did not fit", point.tenor),
+            );
+            continue;
+        };
+        let moved = on_curve(&bumped, b.settle, &flows, z);
+        out.model(
+            position.id,
+            vec![("tenor", point.tenor.clone())],
+            (base - moved) / (base * 0.0001),
+            "",
+            src,
+        );
+    }
+    Ok(())
+}
+
+/// `treasury_curve`: the fitted curve's par, zero and discount at each of
+/// its tenors, at the job's date.
+pub fn treasury_curve(case: &Case, key: &MeasureKey, definition: &Definition) -> Result<Part> {
+    let mut part = Part::default();
+    let curve = fit(case, &mut part);
+    let src = case
+        .treasury_curve
+        .as_ref()
+        .map(|c| c.source_ns)
+        .unwrap_or(0);
+    let mut out = Out {
+        key,
+        account: "",
+        scale: definition.scale,
+        part: &mut part,
+    };
+    match curve {
+        Err((reason, detail)) => out.not("", reason, detail),
+        Ok(curve) => {
+            for point in &curve.points {
+                let mut figure = |kind: &str, value: f64| {
+                    if let Some(v) = exact(value, definition.scale) {
+                        out.part.figures.push(Figure {
+                            measure: key.clone(),
+                            breakdown: vec![
+                                ("curve".to_string(), kind.to_string()),
+                                ("tenor".to_string(), point.tenor.clone()),
+                            ],
+                            value: Some(v),
+                            computed_as: MODEL,
+                            oldest_input_source_ns: src,
+                            ..Default::default()
+                        });
+                    }
+                };
+                figure("par", curve.par(point.maturity));
+                figure("zero", curve.zero(point.maturity) * 100.0);
+                figure("discount", curve.discount(point.maturity));
+            }
+        }
+    }
+    Ok(part)
 }

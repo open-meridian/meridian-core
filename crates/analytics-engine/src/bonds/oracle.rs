@@ -66,9 +66,90 @@ fn every_platform_case_is_answered_exactly() {
     assert_eq!(count, 16);
 }
 
-// ── Bond functions (`bond_cash_flows`, `bond_yield_solver`) ─────────────────
+// ── The Treasury curve (`monotone_convex` v1) ──────────────────────────────
+
+/// The tolerances, in basis points of a continuous zero rate: 0.29 and
+/// 8.70 seen on 2026-10-01 and 2026-10-16.
+pub(super) const CURVE_VS_QUANTLIB_BP: f64 = 0.5;
+pub(super) const CURVE_VS_BOARD_BP: f64 = 10.0;
 
 const CURVES: &str = include_str!("../../oracle_cases/treasury-curve.json");
+
+pub(super) fn fitted(case: &Value) -> super::curve::Curve {
+    use super::curve::{maturity_of, Curve, ParPoint};
+    let date = meridian_domain::date::Date::parse(case["date"].as_str().unwrap()).unwrap();
+    let points = case["par"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            let (count, unit) = tenor(p["tenor"].as_str().unwrap());
+            ParPoint {
+                tenor: p["tenor"].as_str().unwrap().to_string(),
+                maturity: maturity_of(date, count, unit).unwrap(),
+                par: p["par_yield"].as_str().unwrap().parse().unwrap(),
+            }
+        })
+        .collect();
+    Curve::fit(date, points).expect("the par curve fits")
+}
+
+#[test]
+fn the_curve_reprices_treasurys_par_yields_and_stays_near_quantlibs_and_the_boards() {
+    use super::curve::maturity_of;
+    let cases: Value = serde_json::from_str(CURVES).unwrap();
+    let mut worst_quantlib: f64 = 0.0;
+    let mut worst_board: f64 = 0.0;
+    for case in cases["cases"].as_array().unwrap() {
+        let curve = fitted(case);
+        // Treasury's own par yields, its method's inputs, round-trip.
+        for p in &curve.points {
+            let back = curve.par(p.maturity);
+            assert!(
+                (back - p.par).abs() < 1e-9,
+                "{} {}: {back} for {}",
+                case["date"],
+                p.tenor,
+                p.par
+            );
+        }
+        for (label, zero) in case["quantlib_convex_monotone_forward_zero"]
+            .as_object()
+            .unwrap()
+        {
+            let (count, unit) = tenor(label);
+            let on = maturity_of(curve.date, count, unit).unwrap();
+            let ours = curve.zero(on) * 100.0;
+            let theirs: f64 = zero.as_str().unwrap().parse().unwrap();
+            println!(
+                "{} {label}: ours {ours:.6} quantlib {theirs:.6} diff {:.4}bp",
+                case["date"],
+                (ours - theirs) * 100.0
+            );
+            worst_quantlib = worst_quantlib.max((ours - theirs).abs() * 100.0);
+        }
+        for (label, zero) in case["fed_zero"].as_object().unwrap() {
+            let (count, unit) = tenor(label);
+            let on = maturity_of(curve.date, count, unit).unwrap();
+            let ours = curve.zero(on) * 100.0;
+            let theirs: f64 = zero.as_str().unwrap().parse().unwrap();
+            println!(
+                "{} {label}: ours {ours:.6} board {theirs:.6} diff {:.4}bp",
+                case["date"],
+                (ours - theirs) * 100.0
+            );
+            worst_board = worst_board.max((ours - theirs).abs() * 100.0);
+        }
+    }
+    println!("worst against QuantLib {worst_quantlib:.4}bp, against the Board {worst_board:.4}bp");
+    // QuantLib's convex monotone forward is Hagan and West's ameliorated
+    // form (its quadraticity and monotonicity blend); the Board's is
+    // Gurkaynak, Sack and Wright's Svensson fit to off-the-run coupons.
+    assert!(worst_quantlib < CURVE_VS_QUANTLIB_BP, "{worst_quantlib}bp");
+    assert!(worst_board < CURVE_VS_BOARD_BP, "{worst_board}bp");
+}
+
+// ── Bond functions (`bond_cash_flows`, `bond_yield_solver`) ─────────────────
 
 const BONDS: &str = include_str!("../../oracle_cases/bond-functions.json");
 
@@ -76,11 +157,13 @@ const BONDS: &str = include_str!("../../oracle_cases/bond-functions.json");
 /// years on the street's formula, which QuantLib's compounding equals, to
 /// the figure's six places (half of its last); a
 /// Treasury's on Appendix B's simple interest over the fractional
-/// half-year, which QuantLib compounds.
+/// half-year, which QuantLib compounds; a Z-spread in basis points over
+/// the two curves (0.29bp apart at most, above).
 pub(super) const STREET_YIELD_PERCENT: f64 = 5e-7;
 pub(super) const TREASURY_YIELD_PERCENT: f64 = 1e-3;
 pub(super) const DURATION_YEARS: f64 = 1e-6;
 pub(super) const TREASURY_DURATION_YEARS: f64 = 2e-3;
+pub(super) const Z_SPREAD_BP: f64 = 0.5;
 
 /// An inputs document holding one account's bonds at their closes, each
 /// 100 of face, the Treasury curve of `curve` and the measures asked.
@@ -167,7 +250,7 @@ pub(super) fn figure(
 }
 
 #[test]
-fn bond_yields_and_risk_are_quantlibs_within_their_tolerances() {
+fn bond_yields_risk_and_spreads_are_quantlibs_within_their_tolerances() {
     let bonds: Value = serde_json::from_str(BONDS).unwrap();
     let curves: Value = serde_json::from_str(CURVES).unwrap();
     let curve = curves["cases"]
@@ -180,7 +263,7 @@ fn bond_yields_and_risk_are_quantlibs_within_their_tolerances() {
     let document = bonds_document(
         list,
         curve,
-        &["bond_yield", "bond_risk"],
+        &["bond_yield", "bond_risk", "bond_spread"],
         bonds["valuation_date"].as_str().unwrap(),
     );
     let answer = crate::compute(&document).expect("answered");
@@ -252,6 +335,14 @@ fn bond_yields_and_risk_are_quantlibs_within_their_tolerances() {
             (dv01 + q("bps")).abs() <= 1e-4 * dv01.abs().max(1e-6) + 1e-6,
             "{} dv01",
             b["name"]
+        );
+        let z = figure(&answer, "bond_spread", &id, "z_spread").unwrap();
+        println!("{} z ours {z} quantlib {}", b["name"], q("z_spread_bp"));
+        assert!(
+            (z - q("z_spread_bp")).abs() <= Z_SPREAD_BP,
+            "{} z_spread: {z} vs {}",
+            b["name"],
+            q("z_spread_bp")
         );
     }
 }

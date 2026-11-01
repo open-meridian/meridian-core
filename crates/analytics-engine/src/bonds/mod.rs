@@ -19,6 +19,7 @@
 //!
 //! [`measures`] answers the eleven measure definitions over them.
 
+pub mod curve;
 pub mod dates;
 pub mod daycount;
 pub mod measures;

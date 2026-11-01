@@ -142,6 +142,81 @@ fn a_price_from_a_quoted_yield_is_the_inverse_of_the_yield_and_a_treasurys_exact
     assert_eq!(exact.computed_as, EXACT, "Appendix B's price is exact");
 }
 
+#[test]
+fn the_treasury_curve_answers_par_zero_and_discount_at_each_tenor() {
+    let doc = bonds_document(&[], &curve(), &["treasury_curve"], "2026-10-16");
+    let mut doc = doc;
+    doc["job"]["account_ids"] = json!([]);
+    let answer = crate::compute(&doc).unwrap();
+    assert!(answer.not_evaluated.is_empty(), "{:?}", reasons(&answer));
+    let at = |kind: &str, tenor: &str| {
+        answer
+            .figures
+            .iter()
+            .find(|f| {
+                f.breakdown
+                    == vec![
+                        ("curve".to_string(), kind.to_string()),
+                        ("tenor".to_string(), tenor.to_string()),
+                    ]
+            })
+            .and_then(|f| f.value.as_ref())
+            .map(|v| v.to_f64())
+            .unwrap()
+    };
+    // Treasury's 10-year par yield on 2026-10-16 was 5.09.
+    assert!((at("par", "10Y") - 5.09).abs() < 1e-8);
+    assert_eq!(answer.figures.len(), 14 * 3);
+    let zero = at("zero", "10Y") / 100.0;
+    let discount = at("discount", "10Y");
+    // 2026-10-16 to 2036-10-16: 3,653 days, three February 29ths.
+    let years = 3653.0 / 365.0;
+    assert!((discount - (-zero * years).exp()).abs() < 1e-7);
+    let models: Vec<&str> = answer.provenance["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["model_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(models, vec!["monotone_convex"]);
+}
+
+#[test]
+fn a_treasury_curve_missing_is_not_evaluated_naming_it() {
+    let mut doc = bonds_document(&[], &curve(), &["treasury_curve"], "2026-10-16");
+    doc["job"]["account_ids"] = json!([]);
+    doc["treasury_curve"] =
+        json!({"missing": "the risk-free curve ust_cmt: no par yields at the as-of"});
+    let answer = crate::compute(&doc).unwrap();
+    assert_eq!(answer.not_evaluated[0].reason, PRICE_MISSING);
+}
+
+#[test]
+fn key_rate_durations_sum_to_about_the_effective_duration() {
+    let doc = bonds_document(
+        &[corporate()],
+        &curve(),
+        &["key_rate_durations", "bond_risk"],
+        "2026-10-16",
+    );
+    let answer = crate::compute(&doc).unwrap();
+    assert!(answer.not_evaluated.is_empty(), "{:?}", reasons(&answer));
+    let sum: f64 = answer
+        .figures
+        .iter()
+        .filter(|f| f.measure.definition == "key_rate_durations")
+        .map(|f| f.value.as_ref().unwrap().to_f64())
+        .sum();
+    let modified = figure(&answer, "bond_risk", "INS-BOND0", "modified_duration").unwrap();
+    // Bumping each par yield a basis point is a parallel shift in sum; a
+    // spread-duration, so within a few per cent of the yield's modified
+    // duration.
+    assert!(
+        (sum - modified).abs() / modified < 0.05,
+        "{sum} vs {modified}"
+    );
+}
+
 /// A pool of 1,000,000 original face at 6%, 360 months from 2025-01-01,
 /// with factors for `months` months before 2026-10.
 fn pool_document(months: &[(&str, &str)], measures: &[&str]) -> Value {
