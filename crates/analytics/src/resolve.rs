@@ -143,6 +143,9 @@ struct Record {
     iso_code: String,
     price_kind: String,
     payout: Option<(String, String, String)>,
+    /// Contract v29 (W1.1, W1.24): a debt record's terms and the fields it
+    /// lacks, as the engine reads them.
+    debt: Option<Value>,
 }
 
 /// The pricing input kinds that are a price, as the lake names them.
@@ -398,6 +401,7 @@ pub fn resolve(
     // template's kind, a group member's bid, ask and last, and each
     // conversion leg, leg by leg, at most three deep (Q10).
     let mut market: Vec<Value> = Vec::new();
+    let mut quoted_yields: Vec<Value> = Vec::new();
     let mut unentitled: BTreeMap<(String, String), String> = BTreeMap::new();
     // Contract v28 (W12.2; ruling 619): inputs whose row in force is
     // invalid, by subject and kind, naming the dataset.
@@ -475,9 +479,15 @@ pub fn resolve(
                     &mut quarantined,
                 )?;
                 for price in rows {
-                    let Some(row) = market_row(&price) else {
+                    let Some(mut row) = market_row(&price) else {
+                        // Contract v29 (W10.4): a print in yield alone, its
+                        // money price unset, kept for the debt measures.
+                        if let Some(row) = quoted_row(&price) {
+                            quoted_yields.push(row);
+                        }
                         continue;
                     };
+                    crate::debt::extras(&price, &mut row);
                     if live {
                         if let Some(meta) = price.meta.as_ref() {
                             age_at_analytics(meta, now_ns);
@@ -627,6 +637,111 @@ pub fn resolve(
         (Vec::new(), Vec::new())
     };
 
+    // Contract v29 (W12.1, W12.2; ruling 688): a debt record's inputs --
+    // the job's date, the payment calendars, the pools' and classes'
+    // factors, the benchmarks a make-whole window or a price names, and the
+    // Treasury curve -- read only where a debt record is held or a debt
+    // measure asks.
+    let mut debt_inputs: Vec<(&str, Value)> = Vec::new();
+    if compiled.reads.debt || records.values().any(|r| r.debt.is_some()) {
+        let date = crate::debt::valuation_date(&business_date, as_of);
+        let at = crate::chains::read_at(&business_date, as_of);
+        let mut benchmarks: BTreeSet<String> = BTreeSet::new();
+        if compiled.reads.benchmark_curves {
+            for r in records.values() {
+                if let Some(debt) = &r.debt {
+                    benchmarks.extend(crate::debt::benchmarks_of(debt));
+                }
+            }
+            for row in market.iter().chain(quoted_yields.iter()) {
+                if let Some(b) = row["benchmark_instrument_id"]
+                    .as_str()
+                    .filter(|b| !b.is_empty())
+                {
+                    benchmarks.insert(b.to_string());
+                }
+            }
+        }
+        let mut par_curves = Vec::new();
+        for benchmark in benchmarks {
+            if records.contains_key(&benchmark) {
+                continue;
+            }
+            match record(asker, &benchmark, as_of, &mut templates) {
+                Ok(Some(held)) if held.debt.is_some() => {
+                    // An on-the-run Treasury: its record and its close.
+                    if let Some(kind) = kind_of(&held.price_kind) {
+                        let rows = prices(
+                            asker,
+                            std::slice::from_ref(&benchmark),
+                            &[kind as i32],
+                            &sources,
+                            as_of,
+                            &business_date,
+                            &mut unentitled,
+                            &mut quarantined,
+                        )?;
+                        for price in rows {
+                            if let Some(mut row) = market_row(&price) {
+                                crate::debt::extras(&price, &mut row);
+                                market.push(row);
+                            }
+                        }
+                    }
+                    records.insert(benchmark, held);
+                }
+                // A rate curve's record: its par yields.
+                _ => par_curves.push(crate::debt::par_curve(
+                    asker, &benchmark, at, as_of, &sources, &date,
+                )),
+            }
+        }
+        let calendar_ids: BTreeSet<String> = records
+            .values()
+            .filter_map(|r| r.debt.as_ref())
+            .map(crate::debt::calendar_of)
+            .filter(|c| !c.is_empty())
+            .collect();
+        let calendars = crate::debt::calendars(asker, &calendar_ids, &date);
+        let factored: Vec<String> = records
+            .iter()
+            .filter(|(_, r)| r.debt.as_ref().is_some_and(crate::debt::factored))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let factors = if factored.is_empty() {
+            Vec::new()
+        } else {
+            crate::debt::factors(asker, &factored, &date, as_of, &sources)?
+        };
+        if compiled.reads.treasury_curve {
+            let curve = match crate::debt::treasury_curve_record(asker, as_of) {
+                Ok(subject) => crate::debt::par_curve(asker, &subject, at, as_of, &sources, &date),
+                Err(why) => json!({"missing": why}),
+            };
+            debt_inputs.push(("treasury_curve", curve));
+        }
+        debt_inputs.push(("valuation_date", json!(date)));
+        if !calendars.is_empty() {
+            debt_inputs.push(("calendars", Value::Array(calendars)));
+        }
+        if !factors.is_empty() {
+            debt_inputs.push(("factors", Value::Array(factors)));
+        }
+        if !par_curves.is_empty() {
+            debt_inputs.push(("par_curves", Value::Array(par_curves)));
+        }
+        if !quoted_yields.is_empty() {
+            quoted_yields.sort_by_key(|row| {
+                (
+                    row["subject_id"].as_str().unwrap_or_default().to_string(),
+                    row["valid_at_ns"].as_str().unwrap_or_default().to_string(),
+                    row["dataset"].as_str().unwrap_or_default().to_string(),
+                )
+            });
+            debt_inputs.push(("quoted_yields", Value::Array(quoted_yields)));
+        }
+    }
+
     // The document, every list in one order.
     let mut accounts = Vec::new();
     for (i, (account, code)) in base_codes.iter().enumerate() {
@@ -667,7 +782,7 @@ pub fn resolve(
     let instruments: Vec<Value> = records
         .iter()
         .map(|(id, r)| {
-            json!({
+            let mut out = json!({
                 "instrument_id": id,
                 "record_version": r.record_version,
                 "template_id": r.template_id,
@@ -682,7 +797,12 @@ pub fn resolve(
                 "country": "",
                 // Contract v27 (ruling 462): fiat alone is inverted or crossed.
                 "currency_code": r.iso_code,
-            })
+            });
+            // Contract v29: a debt record's terms, only where it is one.
+            if let Some(debt) = &r.debt {
+                out["debt"] = debt.clone();
+            }
+            out
         })
         .collect();
     // The pivots in force: the setting's, or never set, USD's cash
@@ -743,6 +863,9 @@ pub fn resolve(
     });
     if compiled.reads.executions {
         document["executions"] = Value::Array(measured.iter().map(Measured::to_json).collect());
+    }
+    for (name, value) in debt_inputs {
+        document[name] = value;
     }
     // Contract v28 (W12.1, W12.2, W12.8): the chains, resolved, and the
     // scenario set; written only where the job reads them.
@@ -1209,9 +1332,12 @@ fn record(
             p.calculation_version.clone(),
         ),
         _ => {
+            // Contract v29: a debt record's terms are bond_cash_flows' to
+            // value (W12.3), as the platform's debt templates bind it.
             let model = match asset_class.as_str() {
                 "cash" => "cash",
                 "event_contract" => "binary_event",
+                _ if crate::debt::record_json(&record).is_some() => "bond_cash_flows",
                 _ => "quoted_price",
             };
             let kind = match (asset_class.as_str(), &record.money_market_fund) {
@@ -1242,7 +1368,9 @@ fn record(
             text_of(m.amount.as_ref())
                 .map(|amount| (amount, m.instrument_id.clone(), m.currency_code.clone()))
         });
+    let debt = crate::debt::record_json(&record);
     Ok(Some(Record {
+        debt,
         record_version: record.version.to_string(),
         template_id: record.template_id,
         template_version: record.template_version,
@@ -1502,6 +1630,28 @@ fn market_row(price: &v1::Price) -> Option<Value> {
         "version": meta.version.to_string(),
         "source_ns": source_ns.to_string(),
     }))
+}
+
+/// Contract v29 (W10.4): a row quoted in yield alone -- a when-issued print
+/// before its auction -- as the engine reads it, with no amount.
+fn quoted_row(price: &v1::Price) -> Option<Value> {
+    if price.price.is_some() || price.r#yield.is_none() {
+        return None;
+    }
+    let meta = price.meta.as_ref()?;
+    let subject = meta.subjects.first()?.entity_id.clone();
+    let mut row = json!({
+        "subject_id": subject,
+        "kind": kind_name(price.kind),
+        "instrument_id": "",
+        "dataset": meta.source.as_ref().map(|s| s.dataset.clone()).unwrap_or_default(),
+        "valid_at_ns": meta.valid_from_ns.to_string(),
+        "row_key": meta.row_key,
+        "version": meta.version.to_string(),
+        "source_ns": meta.source_times.iter().map(|t| t.at_ns).min().unwrap_or(meta.valid_from_ns).to_string(),
+    });
+    crate::debt::extras(price, &mut row);
+    Some(row)
 }
 
 /// The closes of each subject by business date over the window's reach,

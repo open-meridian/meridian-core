@@ -29,11 +29,12 @@ use std::sync::{Arc, RwLock};
 use meridian_bus::Bus;
 use meridian_domain::v1::{
     AgeHop, BarsRecordedEvent, CorporateActionsRecordedEvent, EntitlementsChangedEvent,
-    FilingsRecordedEvent, ListBarsRequest, ListPricesRequest, ListRatesRequest,
-    LivenessRecordedEvent, ObservationMeta, ObservationsWantedEvent, OutcomesRecordedEvent,
-    PricesRecordedEvent, QuotesRecordedEvent, RatesRecordedEvent, RecordBarsRequest,
-    RecordPricesRequest, RecordQuotesRequest, RecordRatesRequest, RecordTradesRequest,
-    SeriesRecordedEvent, StatisticsRecordedEvent, TradesRecordedEvent, WantWithdrawnEvent,
+    FactorsRecordedEvent, FilingsRecordedEvent, ListBarsRequest, ListFactorsRequest,
+    ListPricesRequest, ListRatesRequest, LivenessRecordedEvent, ObservationMeta,
+    ObservationsWantedEvent, OutcomesRecordedEvent, PricesRecordedEvent, QuotesRecordedEvent,
+    RatesRecordedEvent, RecordBarsRequest, RecordFactorsRequest, RecordPricesRequest,
+    RecordQuotesRequest, RecordRatesRequest, RecordTradesRequest, SeriesRecordedEvent,
+    StatisticsRecordedEvent, TradesRecordedEvent, WantWithdrawnEvent,
 };
 use prost::Message;
 use tokio::sync::watch;
@@ -172,6 +173,7 @@ pub(crate) fn meta_entry(payload_type: &str) -> Option<&'static str> {
         "meridian.v1.SeriesRecordedEvent" => meridian_domain::lake::LISTED_SERIES,
         "meridian.v1.FilingsRecordedEvent" => meridian_domain::lake::FILING,
         "meridian.v1.CorporateActionsRecordedEvent" => meridian_domain::lake::CORPORATE_ACTION,
+        "meridian.v1.FactorsRecordedEvent" => meridian_domain::lake::FACTOR,
         _ => return None,
     };
     meridian_domain::lake::fields_of(data_type).first().copied()
@@ -298,6 +300,19 @@ pub(crate) fn said(payload_type: &str, payload: &[u8]) -> Option<Said> {
         "meridian.v1.FilingsRecordedEvent" => {
             let filing = FilingsRecordedEvent::decode(payload).ok()?.filing?;
             let (dataset, subjects, _) = meta_said(filing.meta.as_ref());
+            Some(Said {
+                key: None,
+                dataset,
+                subjects,
+                is_want: false,
+                series: Vec::new(),
+            })
+        }
+        // Every factor, never conflated (contract v29, W10.5): narrowed to
+        // the pools and classes a receive names.
+        "meridian.v1.FactorsRecordedEvent" => {
+            let factor = FactorsRecordedEvent::decode(payload).ok()?.factor?;
+            let (dataset, subjects, _) = meta_said(factor.meta.as_ref());
             Some(Said {
                 key: None,
                 dataset,
@@ -500,6 +515,15 @@ pub(crate) fn stripped(payload_type: &str, payload: &[u8], allowed: &BTreeSet<St
                 Err(_) => payload.to_vec(),
             }
         }
+        "meridian.v1.FactorsRecordedEvent" => match FactorsRecordedEvent::decode(payload) {
+            Ok(mut event) => {
+                if let Some(factor) = event.factor.as_mut() {
+                    meridian_domain::lake::strip_factor(factor, allowed);
+                }
+                event.encode_to_vec()
+            }
+            Err(_) => payload.to_vec(),
+        },
         "meridian.v1.FilingsRecordedEvent" => match FilingsRecordedEvent::decode(payload) {
             Ok(mut event) => {
                 if let Some(filing) = event.filing.as_mut() {
@@ -582,6 +606,26 @@ pub(crate) fn dates_refused(payload_type: &str, payload: &[u8]) -> Option<String
         "meridian.v1.ListRatesRequest" => {
             let request = ListRatesRequest::decode(payload).ok()?;
             check("business_date".into(), &request.business_date)
+        }
+        // Contract v29 (W10.4, W10.6): a factor's publication, record and
+        // payment dates, and a read's payment dates.
+        "meridian.v1.RecordFactorsRequest" => {
+            let request = RecordFactorsRequest::decode(payload).ok()?;
+            request.factors.iter().enumerate().find_map(|(i, factor)| {
+                let date = factor
+                    .meta
+                    .as_ref()
+                    .map(|m| m.business_date.as_str())
+                    .unwrap_or("");
+                check(format!("factors[{i}].meta.business_date"), date)
+                    .or_else(|| check(format!("factors[{i}].record_date"), &factor.record_date))
+                    .or_else(|| check(format!("factors[{i}].payment_date"), &factor.payment_date))
+            })
+        }
+        "meridian.v1.ListFactorsRequest" => {
+            let request = ListFactorsRequest::decode(payload).ok()?;
+            check("from_date".into(), &request.from_date)
+                .or_else(|| check("to_date".into(), &request.to_date))
         }
         _ => None,
     }
@@ -717,6 +761,73 @@ mod tests {
         assert!(kept.items.is_empty() && kept.filing.is_none());
         assert_eq!(kept.filed_date, "2026-10-30");
         assert_eq!(kept.kind, 3, "what the row is is never stripped");
+    }
+
+    #[test]
+    fn a_factor_is_never_conflated_heard_by_its_pool_stripped_and_its_dates_checked() {
+        // Contract v29 (ruling 680; W10.4, W10.5).
+        use meridian_domain::v1::Factor;
+        let row = Factor {
+            meta: Some(ObservationMeta {
+                subjects: vec![SubjectRef {
+                    entity_id: "INS-POOL".into(),
+                    ..Default::default()
+                }],
+                source: Some(Source {
+                    dataset: "gse-disclosures-1:fannie_mae".into(),
+                    ..Default::default()
+                }),
+                business_date: "2026-11-04".into(),
+                ..Default::default()
+            }),
+            factor: Some(meridian_pb::v1::Decimal::default()),
+            factor_month: "202610".into(),
+            record_date: "2026-10-31".into(),
+            payment_date: "2026-11-25".into(),
+            coupon_rate: Some(meridian_pb::v1::Decimal::default()),
+            wac: None,
+            wam: None,
+            wala: None,
+        };
+        let event = FactorsRecordedEvent {
+            factor: Some(row.clone()),
+        }
+        .encode_to_vec();
+        let heard = said("meridian.v1.FactorsRecordedEvent", &event).unwrap();
+        assert!(heard.key.is_none(), "every factor is delivered");
+        assert_eq!(heard.subjects, vec!["INS-POOL"]);
+        assert_eq!(
+            meta_entry("meridian.v1.FactorsRecordedEvent"),
+            Some("meridian.v1.Factor.meta")
+        );
+        let allowed: BTreeSet<String> = ["meridian.v1.Factor.meta", "meridian.v1.Factor.factor"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let kept = FactorsRecordedEvent::decode(
+            &stripped("meridian.v1.FactorsRecordedEvent", &event, &allowed)[..],
+        )
+        .unwrap()
+        .factor
+        .unwrap();
+        assert!(kept.factor.is_some() && kept.coupon_rate.is_none());
+        assert!(kept.factor_month.is_empty() && kept.payment_date.is_empty());
+        let mut wrong = row;
+        wrong.payment_date = "2026-11-31".into();
+        let batch = RecordFactorsRequest {
+            factors: vec![wrong],
+            want_id: String::new(),
+        };
+        let refused =
+            dates_refused("meridian.v1.RecordFactorsRequest", &batch.encode_to_vec()).unwrap();
+        assert!(refused.starts_with("factors[0].payment_date"), "{refused}");
+        let read = ListFactorsRequest {
+            to_date: "2026-02-30".into(),
+            ..Default::default()
+        };
+        let refused =
+            dates_refused("meridian.v1.ListFactorsRequest", &read.encode_to_vec()).unwrap();
+        assert!(refused.starts_with("to_date"), "{refused}");
     }
 
     #[test]

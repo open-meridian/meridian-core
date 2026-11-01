@@ -362,6 +362,15 @@ fn sessions(value: &Value) -> Result<Vec<TradingSession>, String> {
                     .filter(|n| *n <= 1440)
                     .ok_or_else(|| format!("{key} {n} is not a minute of a day"))
             };
+            // Contract v29 (657; W3.19): the date the row's hours are in
+            // force from, a plain date; empty is in force since the
+            // calendar's coverage began, as every row before v29.
+            let valid_from_date = text(session, "valid_from_date").trim().to_string();
+            if !valid_from_date.is_empty() && !meridian_domain::date::is_date(&valid_from_date) {
+                return Err(format!(
+                    "valid_from_date {valid_from_date:?} is not a plain date (YYYY-MM-DD)"
+                ));
+            }
             Ok(TradingSession {
                 weekdays: weekdays(session)?,
                 start_minute: minute("start_minute")?,
@@ -370,6 +379,7 @@ fn sessions(value: &Value) -> Result<Vec<TradingSession>, String> {
                     .get("extended")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+                valid_from_date,
             })
         })
         .collect()
@@ -651,6 +661,7 @@ mod tests {
         assert_eq!(sessions.sessions[0].weekdays, vec![Weekday::Sunday as i32]);
         assert_eq!(sessions.sessions[2].end_minute, 1020);
         assert_eq!(sessions.early_closes[0].sessions[0].end_minute, 780);
+        assert!(sessions.sessions[0].valid_from_date.is_empty());
         let mut past = fx.clone();
         past["trading_sessions"]["sessions"][0]["end_minute"] = json!(1441);
         assert!(calendar(&past).unwrap_err().contains("end_minute"));

@@ -117,9 +117,25 @@ pub const MOST_PIVOTS: usize = 4;
 /// W12.6 (contract v26; ruling 285): the analytics routing table, held here.
 pub const SET_MODEL_ROUTING: &str = "platform.analytics.command.set-model-routing";
 pub const LIST_MODEL_ROUTING: &str = "platform.analytics.query.list-model-routing";
-/// v26's model ids, in the order the table lists them (the first release's
-/// §1), and the implementation every one has.
-pub const MODEL_IDS: [&str; 3] = ["cash", "quoted_price", "binary_event"];
+/// The model ids, in the order the table lists them, and the implementation
+/// every one has: v26's (the first release's §1); from contract v28 (ruling
+/// 565) the option models and the calibrations; from contract v29 (ruling
+/// 688) the debt models and the curve's calibration -- the analytics
+/// engine's own list (meridian-analytics-engine's definitions::MODELS),
+/// written here since the conductor links no engine.
+pub const MODEL_IDS: [&str; 11] = [
+    "cash",
+    "quoted_price",
+    "binary_event",
+    "american_binomial",
+    "black_scholes",
+    "black_76",
+    "svi",
+    "ssvi",
+    "bond_cash_flows",
+    "bond_yield_solver",
+    "monotone_convex",
+];
 pub const BUILT_IN: &str = "built-in";
 /// The deployment's time zone with nothing set (the v26 plan's question
 /// 229: US first).
@@ -1904,7 +1920,7 @@ pub fn serve_with(
                     meridian_bus::RefusalStatus::InvalidArgument,
                     &["model_id".to_string()],
                     format!(
-                        "model_id: {model:?} is not a model id v26 serves ({})",
+                        "model_id: {model:?} is not a model id this release serves ({})",
                         MODEL_IDS.join(", ")
                     ),
                 ));

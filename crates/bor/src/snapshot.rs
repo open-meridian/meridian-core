@@ -214,6 +214,9 @@ struct LedgerShape {
     local_record_orders: Option<bool>,
     #[serde(default)]
     agent_orders_demo_only: Option<bool>,
+    /// Contract v29: none in a snapshot made before.
+    #[serde(default)]
+    fixed_income_backfill: Option<(i64, bool)>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -258,6 +261,15 @@ struct ExecutionShape {
     venue_account_code: String,
     venue_client_order_id: String,
     accepted_lines: Option<(String, usize, usize)>,
+    /// Contract v29 (ruling 986, amended at core stage C): empty in a
+    /// snapshot made before, when no pool's fill was recorded without its
+    /// factor, so the format stands.
+    #[serde(default)]
+    factor_taken: String,
+    /// Contract v29 (rulings 991, 992, amended at core stage E): empty in a
+    /// snapshot made before.
+    #[serde(default)]
+    factor_row: crate::orders::FactorRow,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -415,6 +427,7 @@ fn ledger_shape(ledger: &Ledger) -> LedgerShape {
         alerts,
         local_record_orders,
         agent_orders_demo_only,
+        fixed_income_backfill,
     } = ledger;
     LedgerShape {
         orders: orders
@@ -464,6 +477,7 @@ fn ledger_shape(ledger: &Ledger) -> LedgerShape {
         alerts: map_pb(alerts),
         local_record_orders: *local_record_orders,
         agent_orders_demo_only: *agent_orders_demo_only,
+        fixed_income_backfill: *fixed_income_backfill,
     }
 }
 
@@ -540,6 +554,8 @@ fn execution_shape(held: &ExecutionHeld) -> ExecutionShape {
         venue_account_code,
         venue_client_order_id,
         accepted_lines,
+        factor_taken,
+        factor_row,
     } = held;
     ExecutionShape {
         execution: pb(execution),
@@ -549,6 +565,8 @@ fn execution_shape(held: &ExecutionHeld) -> ExecutionShape {
         venue_account_code: venue_account_code.clone(),
         venue_client_order_id: venue_client_order_id.clone(),
         accepted_lines: accepted_lines.clone(),
+        factor_taken: factor_taken.clone(),
+        factor_row: factor_row.clone(),
     }
 }
 
@@ -736,6 +754,7 @@ fn ledger_from(shape: LedgerShape) -> Result<Ledger> {
         alerts: unmap_pb(&shape.alerts)?,
         local_record_orders: shape.local_record_orders,
         agent_orders_demo_only: shape.agent_orders_demo_only,
+        fixed_income_backfill: shape.fixed_income_backfill,
     })
 }
 
@@ -789,6 +808,8 @@ fn execution_from(shape: ExecutionShape) -> Result<ExecutionHeld> {
         venue_account_code: shape.venue_account_code,
         venue_client_order_id: shape.venue_client_order_id,
         accepted_lines: shape.accepted_lines,
+        factor_taken: shape.factor_taken,
+        factor_row: shape.factor_row,
     })
 }
 

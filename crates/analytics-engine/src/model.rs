@@ -380,42 +380,91 @@ fn built_in(
                 }));
             }
         }
-        "quoted_price" => {}
+        "quoted_price" | crate::bonds::BOND_CASH_FLOWS => {}
         other => {
             return Err(CaseError(format!(
-                "{instrument_id}'s model {other:?} is not one of v26's"
+                "{instrument_id}'s model {other:?} is not one the engine ships"
             )))
         }
     }
-    let Some(price) = case.price(instrument_id, &record.price_kind) else {
-        if let Some(dataset) = case
-            .unentitled
-            .get(&(instrument_id.to_string(), record.price_kind.clone()))
-        {
-            return Ok(Err((NOT_ENTITLED, dataset.clone())));
-        }
-        // Contract v28 (W12.2; ruling 619): its only row in force invalid.
-        if let Some(dataset) = case
-            .quarantined
-            .get(&(instrument_id.to_string(), record.price_kind.clone()))
-        {
-            return Ok(Err((INPUT_QUARANTINED, dataset.clone())));
-        }
-        return Ok(Err((PRICE_MISSING, record.price_kind.clone())));
+    let price = match own_price(case, instrument_id, &record.price_kind) {
+        Ok(price) => price,
+        Err(why) => return Ok(Err(why)),
     };
-    if case.stale(price) {
-        return Ok(Err((PRICE_STALE, price.dataset.clone())));
+    // Contract v29 (ruling 984): the price read in its basis -- percent of
+    // par is times 0.01, a yield or a spread no price per unit -- and a
+    // pool's or a class's face times its factor (680).
+    let per_face = match crate::bonds::package::per_unit_in_basis(&price.amount, &price.basis) {
+        Ok(per_face) => per_face,
+        Err(words) => return Ok(Err((PRICE_MISSING, words))),
+    };
+    let mut factors_read = Vec::new();
+    let per_unit = match (record.model_id.as_str(), record.debt.as_ref()) {
+        (crate::bonds::BOND_CASH_FLOWS, Some(held)) => {
+            if let Some(why) = held.valuation_gap() {
+                return Ok(Err(why));
+            }
+            if held.factored() {
+                match crate::bonds::measures::factor_at(case, instrument_id) {
+                    Ok(row) => {
+                        let factor = row.factor.clone();
+                        factors_read.push(row);
+                        per_face.mul(&factor)
+                    }
+                    Err(why) => return Ok(Err(why)),
+                }
+            } else {
+                per_face
+            }
+        }
+        (crate::bonds::BOND_CASH_FLOWS, None) => {
+            return Err(CaseError(format!(
+                "{instrument_id} is priced by bond_cash_flows and the inputs hold no debt terms"
+            )))
+        }
+        _ => per_face,
+    };
+    for row in factors_read {
+        if !row.dataset.is_empty() {
+            reads.datasets.insert(row.dataset.clone());
+        }
     }
     Ok(conversion(case, &price.instrument_id, base).map(|legs| {
         // Contract v27 (rulings 453 and 486): a quoted price's value per
         // unit rounded half to even to 18 places; its market value that
         // times the quantity, exact.
-        let per_unit = price
-            .amount
-            .mul(&product(&legs))
-            .round_half_even(RATE_SCALE);
+        let per_unit = per_unit.mul(&product(&legs)).round_half_even(RATE_SCALE);
         valued(per_unit, legs, Some(price.clone()))
     }))
+}
+
+/// The instrument's own price of its kind at the as-of, or why there is
+/// none: not entitled, quarantined (contract v28), missing or stale.
+pub fn own_price<'a>(
+    case: &'a Case,
+    instrument_id: &str,
+    kind: &str,
+) -> std::result::Result<&'a Price, Why> {
+    let Some(price) = case.price(instrument_id, kind) else {
+        if let Some(dataset) = case
+            .unentitled
+            .get(&(instrument_id.to_string(), kind.to_string()))
+        {
+            return Err((NOT_ENTITLED, dataset.clone()));
+        }
+        // Contract v28 (W12.2; ruling 619): its only row in force invalid.
+        if let Some(dataset) = case
+            .quarantined
+            .get(&(instrument_id.to_string(), kind.to_string()))
+        {
+            return Err((INPUT_QUARANTINED, dataset.clone()));
+        }
+        return Err((PRICE_MISSING, kind.to_string()));
+    };
+    if case.stale(price) {
+        return Err((PRICE_STALE, price.dataset.clone()));
+    }
+    Ok(price)
 }
 
 /// What a used value read, for the provenance: its datasets, its own price

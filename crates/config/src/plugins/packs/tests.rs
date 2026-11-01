@@ -156,7 +156,16 @@ async fn a_pack_installs_member_by_member_past_a_failure_each_install_naming_it(
     pull(&h).await;
     // Checked whole before anything moves.
     let stale = install(&h, 2, &[LISTING]).await.unwrap_err();
-    assert!(stale.contains("revision"), "{stale}");
+    // Contract v29 (616): the deployment's state, never the request's.
+    assert_eq!(
+        meridian_bus::read_refusal_status(&stale[stale.find("[refusal-status").unwrap_or(0)..])
+            .map(|(status, fields, _)| (status, fields)),
+        Some((
+            meridian_bus::RefusalStatus::FailedPrecondition,
+            vec!["revision".to_string()]
+        )),
+        "{stale}"
+    );
     let stranger = install(&h, 1, &[LISTING, "open-meridian/stranger"])
         .await
         .unwrap_err();
@@ -476,7 +485,19 @@ async fn a_withdrawn_pack_leaves_browse_and_reads_withdrawn() {
     let status = read(&h).await;
     assert!(status.withdrawn);
     assert_eq!(status.installed_revision, 1);
-    assert!(install(&h, 1, &[LISTING]).await.is_err());
+    let withdrawn = install(&h, 1, &[LISTING]).await.unwrap_err();
+    // Contract v29 (616): refused FAILED_PRECONDITION naming the pack.
+    assert_eq!(
+        meridian_bus::read_refusal_status(
+            &withdrawn[withdrawn.find("[refusal-status").unwrap_or(0)..],
+        )
+        .map(|(status, fields, _)| (status, fields)),
+        Some((
+            meridian_bus::RefusalStatus::FailedPrecondition,
+            vec!["pack".to_string()]
+        )),
+        "{withdrawn}"
+    );
 }
 
 #[test]

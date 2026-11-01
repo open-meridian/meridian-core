@@ -442,6 +442,8 @@ pub fn member_json(member: &PackMemberStatus) -> Value {
 pub fn status_json(status: &PackStatus) -> Value {
     json!({
         "pack": status.pack,
+        // Contract v29 (616): the pack's title as its curator states it.
+        "title": crate::mcp::others_words(&status.title),
         "installed_revision": status.installed_revision,
         "latest_revision": status.latest_revision,
         "withdrawn": status.withdrawn,
@@ -1158,7 +1160,13 @@ async fn pack_page(
         .await
         .ok()
         .flatten();
-    let title = held.as_ref().map(title_of).unwrap_or_else(|| name.clone());
+    // Contract v29 (616): the title the curator states, from the status
+    // where the catalogue no longer offers the pack (withdrawn).
+    let title = held
+        .as_ref()
+        .map(title_of)
+        .or_else(|| Some(status.title.trim().to_string()).filter(|t| !t.is_empty()))
+        .unwrap_or_else(|| name.clone());
     let definitions: Vec<PackMember> = held
         .as_ref()
         .map(|p| members_of(p).to_vec())

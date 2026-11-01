@@ -1716,18 +1716,18 @@ impl Store for PostgresStore {
                             meridian_domain::v1::Order::decode(bytes.as_slice())
                                 .map_err(unreadable)?,
                         )),
-                        1 => order_reads::Item::Placement(
+                        1 => order_reads::Item::Placement(Box::new(
                             meridian_domain::v1::Placement::decode(bytes.as_slice())
                                 .map_err(unreadable)?,
-                        ),
-                        2 => order_reads::Item::Execution(
+                        )),
+                        2 => order_reads::Item::Execution(Box::new(
                             meridian_domain::v1::Execution::decode(bytes.as_slice())
                                 .map_err(unreadable)?,
-                        ),
-                        _ => order_reads::Item::Unplaced(
+                        )),
+                        _ => order_reads::Item::Unplaced(Box::new(
                             meridian_domain::v1::UnplacedFact::decode(bytes.as_slice())
                                 .map_err(unreadable)?,
-                        ),
+                        )),
                     };
                     items.push(((kind, account, record_id), item));
                 }

@@ -46,7 +46,7 @@ import "meridian/v1/scenarios.proto";
 message ObservationMeta {
   // The data plugin's identity for this observation, made from its raw record, so
   // the same observation recorded again changes nothing and a changed value
-  // under it is a restatement. 1 to 128 characters.
+  // or quality state under it is a restatement. 1 to 128 characters.
   string row_key = 1;
 
   // The entities the row is about, each resolved through W3.1: 1 to 8.
@@ -188,16 +188,18 @@ message DatasetRef {
   DatasetDeclaration declaration = 5;
 
   // For the Data sources page, in a listing of datasets (W10.9; approved
-  // 2026-10-10): the rows the lake keeps of the dataset carrying a value as
-  // reported beside a field left not known; and the identifiers and venues
-  // its instance reported missing (W3.2, W3.15), as the lake heard them. 0
-  // in a read's answer and on an entitlements change.
+  // 2026-10-10): the rows in force of the dataset carrying a value as
+  // reported beside a field left not known, each row key counted once, at
+  // its version in force (ruling 1006); and the identifiers and venues its
+  // instance reported missing (W3.2, W3.15), as the lake heard them. 0 in a
+  // read's answer and on an entitlements change.
   uint64 unconverted_count = 6;
   uint64 miss_count = 7;
 
-  // Contract v23 (W10.9): the rows the lake keeps of the dataset flagged on
-  // a closed day of its calendar, a weekend or a holiday; and those flagged
-  // outside its coverage, counted apart. 0 in a read's answer and on an
+  // Contract v23 (W10.9): the rows in force of the dataset flagged on a
+  // closed day of its calendar, a weekend or a holiday; and those flagged
+  // outside its coverage, counted apart. Each row key counts once, at its
+  // version in force (ruling 1006). 0 in a read's answer and on an
   // entitlements change.
   uint64 closed_day_count = 8;
   uint64 outside_coverage_count = 9;
@@ -212,6 +214,18 @@ message DatasetRef {
   // Contract v27 (W10.9; ruling 418): in a listing, the latest liveness the
   // lake keeps for the dataset, one per venue; empty in a read's answer.
   repeated DatasetLiveness liveness = 12;
+  // Contract v29: rows in force whose effective state is valid, counted by the
+  // lake as of the listing. 0 where the dataset holds no valid rows, and in a
+  // read's answer and an entitlements change.
+  uint64 valid_count = 13;
+  // Contract v29: rows in force served flagged suspicious, counted by the lake
+  // as of the listing. 0 where the dataset holds no suspicious rows, and in a
+  // read's answer and an entitlements change.
+  uint64 suspicious_count = 14;
+  // Contract v29: rows in force left out of default reads as invalid, counted
+  // by the lake as of the listing. 0 where the dataset holds no invalid rows,
+  // and in a read's answer and an entitlements change.
+  uint64 invalid_count = 15;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -237,6 +251,15 @@ message Price {
   // states none; never negative. A dataset filling it declares
   // meridian.v1.Price.confidence among its data types.
   optional Decimal confidence = 5;
+  // Contract v29: its value, convention and kind: TRACE's yield, Treasury's
+  // high yield, a broker's YTM or YTW. Unset where the source states no yield.
+  QuotedYield yield = 6;
+  // Contract v29: basis points over benchmark_instrument_id. Unset unless the
+  // basis is spread.
+  optional Decimal spread_bps = 7;
+  // Contract v29: an on-the-run Treasury's bond record or a rate_curve record.
+  // Empty unless the basis is spread, or a yield stated against a benchmark.
+  string benchmark_instrument_id = 8;
 }
 
 // Which price.
@@ -261,13 +284,7 @@ enum PriceKind {
   PRICE_KIND_MID = 7;
 }
 
-// What one unit of a price is.
-enum PriceBasis {
-  // Refused.
-  PRICE_BASIS_UNSPECIFIED = 0;
-  // Per unit of the subject.
-  PRICE_BASIS_PER_UNIT = 1;
-}
+// PriceBasis: declared in amounts.proto from contract v29 (ruling 742).
 
 // Open, high, low and close over an interval, the envelope's valid time: a
 // daily bar names its business date. Empty `source.venue_id` is the
@@ -323,12 +340,30 @@ message Trade {
   // The source's own sequence number; 0 when it gives none. Not the lake's.
   uint64 source_sequence = 6;
 
-  // True in a version saying the source withdrew the trade.
+  // True in a version saying the source withdrew the trade. A source stating
+  // no cancels or corrections declares so on its suite's a-trade-withdrawn
+  // case (contract v29, ruling 900).
   bool cancelled = 7;
   // Contract v28: the bid and ask, their sizes and the quote's own source
   // time. Unset: the source states none and the plugin kept none; never joined
   // from kept quotes.
   QuoteAtTrade quote_at_trade = 8;
+  // Contract v29: per unit, percent of par, a yield or a spread, as
+  // Price.basis. Unspecified: per unit, as every trade before v29.
+  PriceBasis basis = 9;
+  // Contract v29: its value, convention and kind: TRACE's yield, Treasury's
+  // high yield, a broker's YTM or YTW. Unset where the source states no yield.
+  QuotedYield yield = 10;
+  // Contract v29: basis points over benchmark_instrument_id. Unset unless the
+  // basis is spread.
+  optional Decimal spread_bps = 11;
+  // Contract v29: an on-the-run Treasury's bond record or a rate_curve record.
+  // Empty unless the basis is spread, or a yield stated against a benchmark.
+  string benchmark_instrument_id = 12;
+  // Contract v29: true where the source disseminates a cap -- TRACE's 5MM+
+  // investment grade, 1MM+ high yield, 25MM+ good-delivery TBA -- and quantity
+  // is the cap, the least it was. False: the quantity is as traded.
+  bool quantity_capped = 13;
 }
 
 // What a trade may count for (spec/the-lake, "Trade attributes"): written on
@@ -341,7 +376,9 @@ message TradeAttributes {
   Eligibility market_centre = 2;
 
   // Its characteristics: 0 to 16. None is a regular trade, unless
-  // `meta.unconverted` names a code that did not convert.
+  // `meta.unconverted` names a code that did not convert; from contract v29
+  // (900), none listed means none the source states, a source that never
+  // states one marking its suite case not presented.
   repeated TradeCharacteristic characteristics = 3;
 }
 
@@ -413,6 +450,40 @@ enum TradeCharacteristic {
   TRADE_CHARACTERISTIC_STOCK_OPTION_TIED = 16;
   // Contract v28: A trade made on an exchange's floor.
   TRADE_CHARACTERISTIC_FLOOR = 17;
+  // Contract v29: fixed income: the reporting dealer's contra was a customer
+  // (TRACE's C).
+  TRADE_CHARACTERISTIC_CONTRA_CUSTOMER = 18;
+  // Contract v29: fixed income: an inter-dealer trade (TRACE's D).
+  TRADE_CHARACTERISTIC_CONTRA_DEALER = 19;
+  // Contract v29: fixed income: the contra was a non-member affiliate (TRACE's
+  // A).
+  TRADE_CHARACTERISTIC_CONTRA_AFFILIATE = 20;
+  // Contract v29: fixed income: executed on an alternative trading system.
+  TRADE_CHARACTERISTIC_ATS_EXECUTED = 21;
+  // Contract v29: fixed income: the reporting dealer acted as agent.
+  TRADE_CHARACTERISTIC_AGENCY_CAPACITY = 22;
+  // Contract v29: fixed income: the reporting dealer acted as principal or
+  // riskless principal.
+  TRADE_CHARACTERISTIC_PRINCIPAL_CAPACITY = 23;
+  // Contract v29: fixed income: traded when issued, before the security's issue
+  // date.
+  TRADE_CHARACTERISTIC_WHEN_ISSUED = 24;
+  // Contract v29: fixed income: a primary-market trade, not secondary.
+  TRADE_CHARACTERISTIC_PRIMARY_MARKET = 25;
+  // Contract v29: fixed income: priced away from the market for a reason the
+  // report states (TRACE's special price).
+  TRADE_CHARACTERISTIC_SPECIAL_PRICE = 26;
+  // Contract v29: municipal: a primary-market sale at the list offering price,
+  // or a takedown (RTRS's list offering price or takedown indicator, G-14 RTRS
+  // Procedures).
+  TRADE_CHARACTERISTIC_LIST_OFFERING_PRICE_TAKEDOWN = 27;
+  // Contract v29: municipal: the dealer took no markup, markdown or commission
+  // in the price, compensated otherwise (RTRS's non-transaction-based
+  // compensation indicator).
+  TRADE_CHARACTERISTIC_NON_TRANSACTION_COMPENSATION = 28;
+  // Contract v29: fixed income: traded without accrued interest, as a bond in
+  // default (RTRS's traded flat indicator).
+  TRADE_CHARACTERISTIC_TRADED_FLAT = 29;
 }
 
 // The best bid and offer, on a venue or consolidated: in force from its valid
@@ -433,6 +504,34 @@ message Quote {
 
   // The quote's state: 0 to 4. None is firm and trading.
   repeated QuoteCharacteristic characteristics = 6;
+  // Contract v29: true where the source states a size bucket rather than a
+  // size, and bid_quantity is the bucket's floor, the least it was, as
+  // Trade.quantity_capped reads TRACE's caps. False: bid_quantity is the size
+  // as stated.
+  bool bid_size_capped = 7;
+  // Contract v29: true where the source states a size bucket rather than a
+  // size, and ask_quantity is the bucket's floor, the least it was. False:
+  // ask_quantity is the size as stated.
+  bool ask_size_capped = 8;
+  // Contract v29: per unit or percent of par in bid and ask; a yield in
+  // bid_yield and ask_yield; a spread in bid_spread_bps and ask_spread_bps.
+  // Unspecified: per unit, as every quote before v29.
+  PriceBasis basis = 9;
+  // Contract v29: its value, convention and kind. Unset unless the basis is
+  // yield, or the source states a yield beside the price.
+  QuotedYield bid_yield = 10;
+  // Contract v29: basis points over benchmark_instrument_id. Unset unless the
+  // basis is spread.
+  optional Decimal bid_spread_bps = 11;
+  // Contract v29: its value, convention and kind. Unset unless the basis is
+  // yield, or the source states a yield beside the price.
+  QuotedYield ask_yield = 12;
+  // Contract v29: basis points over benchmark_instrument_id. Unset unless the
+  // basis is spread.
+  optional Decimal ask_spread_bps = 13;
+  // Contract v29: as Trade.benchmark_instrument_id. Empty unless the basis is
+  // spread.
+  string benchmark_instrument_id = 14;
 }
 
 // A quote's state in the platform's words.
@@ -527,33 +626,8 @@ enum RateKind {
   RATE_KIND_COUPON_EQUIVALENT = 7;
 }
 
-// How a rate accrues (FDP item 1).
-message RateConvention {
-  DayCount day_count = 1;
-  Compounding compounding = 2;
-  // For COMPOUNDING_COMPOUNDED, the periods a year (2 for a semi-annual
-  // bond-equivalent yield); 0 otherwise.
-  uint32 periods_per_year = 3;
-}
-
-enum DayCount {
-  // Not stated by the source.
-  DAY_COUNT_UNSPECIFIED = 0;
-  DAY_COUNT_ACT_360 = 1;
-  DAY_COUNT_ACT_365_FIXED = 2;
-  DAY_COUNT_ACT_ACT = 3;
-  DAY_COUNT_THIRTY_360 = 4;
-  DAY_COUNT_BUS_252 = 5;
-}
-
-enum Compounding {
-  // Refused.
-  COMPOUNDING_UNSPECIFIED = 0;
-  COMPOUNDING_SIMPLE = 1;
-  COMPOUNDING_COMPOUNDED = 2;
-  COMPOUNDING_CONTINUOUS = 3;
-  COMPOUNDING_DISCOUNT = 4;
-}
+// RateConvention, DayCount and Compounding: declared in amounts.proto from
+// contract v29 (ruling 742).
 
 // One percentile of a rate's distribution, as the source states it.
 message RatePercentile {
@@ -929,6 +1003,10 @@ enum UnansweredReason {
   UNANSWERED_REASON_BEYOND_HISTORY = 6;
   // The dataset's licence forbids keeping it, and it was served, not kept.
   UNANSWERED_REASON_NOT_KEPT = 7;
+  // Contract v29: the dataset's only rows for the subject at the as-of are
+  // invalid: left out, never fallen back to, named so a reader can tell it from
+  // silence (ruling 619 (1)).
+  UNANSWERED_REASON_QUARANTINED = 8;
 }
 
 // Prices for subjects, at one of: the latest in force at a valid time
@@ -1159,7 +1237,8 @@ message ObservationsWantedEvent {
 
   // The data type, by its message's full name: meridian.v1.Price,
   // meridian.v1.Bar, and from contract v19 meridian.v1.Trade or
-  // meridian.v1.Quote.
+  // meridian.v1.Quote; from contract v29 meridian.v1.Factor, for a pool or a
+  // class held (W10.7).
   string data_type = 3;
 
   // 1 to 500.
@@ -1691,7 +1770,8 @@ message DerivedSeries {
   // Never empty.
   string series = 2;
   // As derived, or as the publisher states it where published_by is set.
-  // Never unset.
+  // Never unset; from contract v29 (638) unset where the value is an amount
+  // of money, which money_value carries.
   UnitValue value = 3;
   // A definition and its version, an analytics measure's where one was used;
   // for a publisher's figure, the publisher's definition. Never unset.
@@ -1705,6 +1785,10 @@ message DerivedSeries {
   // publisher's figure and is refused without it; empty on a signal plugin's
   // own measure. A page shows it labelled with whose, never as our measure.
   string published_by = 6;
+  // Contract v29: a Money naming its cash instrument: a dollar volume, an
+  // expected move in the underlying's currency. Unset unless the series is an
+  // amount of money; value is then unset.
+  optional Money money_value = 7;
 }
 
 // Contract v28 (DerivedSeries.inputs): names what the value was derived from.
@@ -2311,6 +2395,11 @@ message QualityAssessment {
   repeated QualityReason reasons = 5;
   // Stamped by the sidecar. Never empty on a record; a plugin leaves it empty.
   string assessed_by_instance = 6;
+  // Contract v29: the row's message by its full name, as a want names it:
+  // meridian.v1.Price, meridian.v1.Bar; so a day's close and its bar, sharing a
+  // key, escalate apart. Never empty from v29; empty on an assessment recorded
+  // before it, read as the row key's only kind.
+  string data_type = 7;
 }
 
 // Contract v28 (W10.12): RecordQualityAssessments's request.
@@ -2361,4 +2450,104 @@ enum QualityReason {
   // Apart from another dataset for the same subject beyond tolerance, a signal
   // plugin's judgment.
   QUALITY_REASON_CROSS_SOURCE_DISAGREEMENT = 9;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W10.4 to W10.6 -- the factor (contract v29; sdk-contract/fixed-income-contract,
+// ruling 680): an agency pool's or REMIC class's factor as a dated fact, its
+// subject the pool's or class's INS- record, recorded only for the records
+// the deployment's wants name (749), never minting one.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Contract v29 (W10.4): one month's factor of a pool or a REMIC class, as the
+// agency publishes it; current face is original face times the latest row.
+message Factor {
+  // Its subject the pool's or tranche's INS- record, its source the agency's
+  // dataset, its business date the factor's publication date, version and
+  // sequence; a republished factor is the next version. Never unset.
+  ObservationMeta meta = 1;
+  // The fraction of original face outstanding after the month's payment, an
+  // exact decimal as the agency publishes it (rounded, not truncated, by
+  // Freddie Mac since 2016); above 1 on an accreting Z class. Never unset.
+  Decimal factor = 2;
+  // YYYYMM, the agency's factor month. Never empty.
+  string factor_month = 3;
+  // States the record date of the month's payment: a plain date. Empty where
+  // the agency states none.
+  string record_date = 4;
+  // A plain date: the 25th for UMBS, the 15th or 20th for Ginnie Mae I and II,
+  // rolled. Empty where the agency states none.
+  string payment_date = 5;
+  // The annual rate the agency's reset file states. Unset on a fixed-rate pool
+  // or class.
+  optional Decimal coupon_rate = 6;
+  // Contract v29 (995): the pool's or class's weighted average coupon for the
+  // month, percent per year, as the agency's monthly disclosure states it (FIX
+  // stipulation WAC). Unset where the agency states none.
+  optional Decimal wac = 7;
+  // Contract v29 (995): the weighted average remaining maturity in months, as
+  // the agency's monthly disclosure states it (FIX stipulation WAM). Unset
+  // where the agency states none.
+  optional uint32 wam = 8;
+  // Contract v29 (995): the weighted average loan age in months, as the
+  // agency's monthly disclosure states it (FIX stipulation WALA). Unset where
+  // the agency states none; 0 for a pool in its first month.
+  optional uint32 wala = 9;
+}
+
+// Contract v29 (W10.4): RecordFactors's command, batched, recorded whole or
+// refused naming the item and field.
+message RecordFactorsRequest {
+  // Up to the lake's batch size, each its own row. Never empty.
+  repeated Factor factors = 1;
+  // As RecordPricesRequest.want_id. Empty unless the batch answers a want.
+  string want_id = 2;
+}
+
+// Contract v29 (W10.5): FactorsRecorded's event, unconflated.
+message FactorsRecordedEvent {
+  // Carries a factor after it commits: the row as kept. Never unset.
+  Factor factor = 1;
+}
+
+// Contract v29 (W10.6): ListFactors's request, point in time as every read is.
+message ListFactorsRequest {
+  // Names the pools and tranches read: each subject's INS- record. Never empty.
+  repeated SubjectRef subjects = 1;
+  // Bounds the read by payment date: a plain date, inclusive. Empty: from the
+  // first.
+  string from_date = 2;
+  // Bounds the read by payment date: a plain date, inclusive. Empty: to the
+  // latest.
+  string to_date = 3;
+  // Names the source: as every read. Unset: the default source.
+  SourceChoice sources = 4;
+  // Reads as of a recorded time: point in time, as every read. 0: now.
+  int64 as_of_ns = 5;
+  // How many rows a page holds at most, as every lake read's. 0 is 100; past
+  // 500, answered at 500.
+  uint32 page_size = 6;
+  // The cursor the last page answered. Empty: the first page.
+  string cursor = 7;
+  // The watermark the reader last saw: answered the rows each dataset partition
+  // it names recorded after its sequence there, for the subjects asked,
+  // whatever their dates (an unconflated row is caught up after a watermark, as
+  // trades, outcomes and corporate actions are). Unset: a read by dates, or as
+  // of as_of_ns.
+  Watermark after_watermark = 8;
+}
+
+// Contract v29 (W10.6): ListFactors's answer.
+message ListFactorsReply {
+  // Answers the factors: each row at the as-of. None where nothing was found.
+  repeated Factor factors = 1;
+  // Each subject and dataset with its reason. None where every subject was
+  // answered.
+  repeated Unanswered unanswered = 2;
+  // Each with its terms and counts. Never empty when a row is answered.
+  repeated DatasetRef datasets = 3;
+  // States the read's watermark: as every read. Never unset.
+  Watermark watermark = 4;
+  // Continues the read: pass it as cursor. Empty on the last page.
+  string next_cursor = 5;
 }

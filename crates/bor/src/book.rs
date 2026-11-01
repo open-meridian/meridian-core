@@ -715,14 +715,19 @@ impl Book {
         // Contract v27 (W9.10; rulings 320 and 396): what the entry sold
         // each instrument at -- its execution's price, or a booking's
         // average price -- so each relief records its proceeds.
-        let sales = sales_of(body, &entry.meta.effective_date, &self.account_id);
+        let sales = sales_of(
+            body,
+            &entry.meta.effective_date,
+            &self.account_id,
+            &self.ledger,
+        );
         for line in &body.lines {
             let key = (line.instrument_id.clone(), line.side, line.sleeve.clone());
             let reference = refs[&key].clone();
             let sale = sales
                 .iter()
-                .find(|(instrument, _, _)| crate::became::same(instrument, &line.instrument_id))
-                .map(|(_, price, date)| (price, date.as_str()));
+                .find(|(instrument, _, _, _)| crate::became::same(instrument, &line.instrument_id))
+                .map(|(_, price, date, factored)| (price, date.as_str(), *factored));
             let quantity = numbers::required(
                 &format!("the line on {}'s quantity", line.instrument_id),
                 line.quantity.as_ref(),
@@ -747,6 +752,11 @@ impl Book {
                 sale,
             )?;
         }
+
+        // Contract v29 (992): the lots a provisional fill, or a booking of
+        // one, opened marked with the factor month awaited; a revision's
+        // cleared.
+        self.mark_awaited(body);
 
         // Basis adjustments: a lot's cost, changed or stated, and where its
         // holding period starts.
@@ -937,6 +947,109 @@ impl Book {
         }
         self.entries.push(EntryIndex::of(entry, first));
         Ok(changes)
+    }
+
+    /// Contract v29 (W11.11, W11.27; ruling 992): each lot the entry's
+    /// lines opened for a fill priced at a provisional factor, for a
+    /// booking of one, or for an allocation of one received, marked with the
+    /// factor month awaited; each lot a factor revision names cleared.
+    fn mark_awaited(&mut self, body: &Body) {
+        use crate::orders::Act;
+        let mut marks: Vec<(usize, usize, String, String)> = Vec::new();
+        let all = body.lines.len();
+        for act in &body.acts {
+            match act {
+                Act::Executed {
+                    execution,
+                    factor_row,
+                    ..
+                } if !factor_row.awaited.is_empty() => marks.push((
+                    0,
+                    all,
+                    execution.instrument_id.clone(),
+                    factor_row.awaited.clone(),
+                )),
+                Act::Accepted { execution_ids, .. } => {
+                    for id in execution_ids {
+                        if let Some(held) = self
+                            .ledger
+                            .executions
+                            .get(id)
+                            .filter(|held| !held.factor_row.awaited.is_empty())
+                        {
+                            marks.push((
+                                0,
+                                all,
+                                held.execution.instrument_id.clone(),
+                                held.factor_row.awaited.clone(),
+                            ));
+                        }
+                    }
+                }
+                Act::BookingOpened { booking, lines } => {
+                    if let Some(awaited) = self.awaited_in(&booking.execution_ids) {
+                        marks.push((lines.0, lines.1, String::new(), awaited));
+                    }
+                }
+                Act::BookingReplaced {
+                    booking_id, lines, ..
+                } => {
+                    let ids = self
+                        .ledger
+                        .bookings
+                        .get(booking_id)
+                        .map(|held| held.booking.execution_ids.clone())
+                        .unwrap_or_default();
+                    if let Some(awaited) = self.awaited_in(&ids) {
+                        marks.push((lines.0, lines.1, String::new(), awaited));
+                    }
+                }
+                Act::AllocationReceived {
+                    lines,
+                    factor_month_awaited,
+                    ..
+                } if !factor_month_awaited.is_empty() => marks.push((
+                    lines.0,
+                    lines.1,
+                    String::new(),
+                    factor_month_awaited.clone(),
+                )),
+                Act::FactorRevised { lot_ids, .. } => {
+                    for lot_id in lot_ids {
+                        if let Some(state) = self.lot_state_mut(lot_id) {
+                            state.lot.factor_month_awaited.clear();
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (start, count, instrument, awaited) in marks {
+            for line in body.lines.iter().skip(start).take(count) {
+                let opens = line.opens_lot.is_some() && !line.lot_id.is_empty();
+                let on =
+                    instrument.is_empty() || crate::became::same(&instrument, &line.instrument_id);
+                if !(opens && on) {
+                    continue;
+                }
+                if let Some(state) = self.lot_state_mut(&line.lot_id) {
+                    state.lot.factor_month_awaited = awaited.clone();
+                }
+            }
+        }
+    }
+
+    /// The month the first provisional execution of these awaits.
+    fn awaited_in(&self, execution_ids: &[String]) -> Option<String> {
+        execution_ids.iter().find_map(|id| {
+            let held = self.ledger.executions.get(id)?;
+            (!held.factor_row.awaited.is_empty()).then(|| held.factor_row.awaited.clone())
+        })
+    }
+
+    fn lot_state_mut(&mut self, lot_id: &str) -> Option<&mut LotState> {
+        let key = self.lot_owner(lot_id)?.clone();
+        self.positions.get_mut(&key)?.lots.get_mut(lot_id)
     }
 
     /// The order path's acts applied to the ledger, each record they change
@@ -1227,35 +1340,80 @@ pub fn side_named(side: i32) -> &'static str {
 /// entry's date, or a booking's own allocation. None for an entry with no
 /// execution behind it -- a transfer, a correction -- whose reliefs carry no
 /// proceeds.
-fn sales_of(body: &Body, effective_date: &str, account_id: &str) -> Vec<(String, Money, String)> {
+/// From contract v29 a debt fill stating its factor names the multiplier its
+/// proceeds take, per 100 of face times that factor (986, 987); every other
+/// sale's is the lot's own.
+#[allow(clippy::type_complexity)]
+fn sales_of(
+    body: &Body,
+    effective_date: &str,
+    account_id: &str,
+    ledger: &crate::orders::Ledger,
+) -> Vec<(String, Money, String, Option<Exact>)> {
     use crate::orders::Act;
     let mut out = Vec::new();
     for act in &body.acts {
         match act {
-            Act::Executed { execution, .. } => {
+            Act::Executed {
+                execution,
+                factor_taken,
+                ..
+            } => {
                 let fills = execution
                     .quantity
                     .as_ref()
                     .and_then(|q| Exact::from_wire(q).ok())
                     .is_some_and(|q| !q.is_zero());
                 if let (true, Some(price)) = (fills, execution.price.as_ref()) {
+                    // Contract v29: the factor stated, or the published
+                    // one the book took for it (amended at core stage C).
+                    let factored = crate::orders::factor_of(execution, factor_taken)
+                        .as_ref()
+                        .and_then(|f| Exact::from_wire(f).ok())
+                        .and_then(|f| {
+                            crate::orders::multiply("factor", Exact::new(1, 2).ok()?, f).ok()
+                        });
                     out.push((
                         execution.instrument_id.clone(),
                         price.clone(),
                         execution.trade_date.clone(),
+                        factored,
                     ));
                 }
             }
-            Act::AllocationReceived { allocation, .. } => {
+            Act::AllocationReceived {
+                allocation, factor, ..
+            } => {
                 if let Some(price) = allocation.average_price.as_ref() {
-                    out.push((String::new(), price.clone(), effective_date.to_string()));
+                    // Contract v29 (991): a pool's sale at its fills' factor,
+                    // carried by the child entry.
+                    out.push((
+                        String::new(),
+                        price.clone(),
+                        effective_date.to_string(),
+                        hundredths_of(factor.parse::<Exact>().ok()),
+                    ));
                 }
             }
             Act::BookingOpened { booking, .. } => {
+                // Contract v29 (991): no allocation field carries a factor;
+                // a pool's sale is at its fills', derived from them.
+                let factor = booking.execution_ids.iter().find_map(|id| {
+                    let held = ledger.executions.get(id)?;
+                    let stated_or_taken = held.factor()?;
+                    (!held.factor_taken.is_empty() || held.execution.factor_used.is_some())
+                        .then(|| Exact::from_wire(&stated_or_taken).ok())
+                        .flatten()
+                });
                 for allocation in &booking.allocations {
                     if allocation.account_id == account_id {
                         if let Some(price) = allocation.average_price.as_ref() {
-                            out.push((String::new(), price.clone(), effective_date.to_string()));
+                            out.push((
+                                String::new(),
+                                price.clone(),
+                                effective_date.to_string(),
+                                hundredths_of(factor),
+                            ));
                         }
                     }
                 }
@@ -1278,6 +1436,13 @@ fn sales_of(body: &Body, effective_date: &str, account_id: &str) -> Vec<(String,
     out
 }
 
+/// A pool's or a tranche's factor as a sale's multiplier: per 100 of face
+/// times the factor (contract v29, 986, 991); None where there is none.
+fn hundredths_of(factor: Option<Exact>) -> Option<Exact> {
+    let factor = factor?;
+    crate::orders::multiply("factor", Exact::new(1, 2).ok()?, factor).ok()
+}
+
 /// A line's lot: opened, carried in from another position, added to within
 /// the entry that opened it, or relieved; a relief recorded with what the
 /// quantity relieved was sold for, where the entry sold it (contract v27).
@@ -1290,7 +1455,7 @@ fn apply_lot(
     reference: &JournalRef,
     entry_sequence: u64,
     lenient: bool,
-    sale: Option<(&Money, &str)>,
+    sale: Option<(&Money, &str, Option<Exact>)>,
 ) -> Result<()> {
     if let Some(terms) = &line.opens_lot {
         if line.lot_id.is_empty() {
@@ -1325,6 +1490,9 @@ fn apply_lot(
                     adjusted_by: Vec::new(),
                     sleeve: line.sleeve.clone(),
                     reliefs: Vec::new(),
+                    // Contract v29 (992): marked by the entry's acts, once
+                    // its lines are applied.
+                    factor_month_awaited: String::new(),
                 },
                 opened_in: entry_sequence,
                 ordinal: position.opened_lots,
@@ -1408,18 +1576,21 @@ fn lot_multiplier(lot: &Lot) -> Exact {
     if per_f == 0.0 || cost_f == 0.0 {
         return Exact::ONE;
     }
-    let guess = format!("{:.6}", (cost_f / per_f).abs());
-    let guess = guess.trim_end_matches('0').trim_end_matches('.');
-    match guess.parse::<Exact>() {
-        Ok(m)
+    // Six places for a series' multiplier; from contract v29 twelve, for a
+    // pool's per 100 of face times its factor (0.0084211375).
+    for places in [6, 12] {
+        let guess = format!("{:.*}", places, (cost_f / per_f).abs());
+        let guess = guess.trim_end_matches('0').trim_end_matches('.');
+        if let Ok(m) = guess.parse::<Exact>() {
             if !m.is_zero()
                 && crate::orders::multiply("a lot's cost", per, m)
-                    .is_ok_and(|back| back == cost || back == cost.negated()) =>
-        {
-            m
+                    .is_ok_and(|back| back == cost || back == cost.negated())
+            {
+                return m;
+            }
         }
-        _ => Exact::ONE,
     }
+    Exact::ONE
 }
 
 /// One relief of a lot (W9.10, contract v27): the entry, the quantity, and
@@ -1429,11 +1600,13 @@ fn record_relief(
     lot: &mut Lot,
     reference: &JournalRef,
     relieved: Exact,
-    sale: Option<(&Money, &str)>,
+    sale: Option<(&Money, &str, Option<Exact>)>,
 ) -> Result<()> {
-    let multiplier = lot_multiplier(lot);
+    let multiplier = sale
+        .and_then(|(_, _, factored)| factored)
+        .unwrap_or_else(|| lot_multiplier(lot));
     let proceeds = |quantity: Exact| -> Result<Option<Money>> {
-        let Some((price, _)) = sale else {
+        let Some((price, _, _)) = sale else {
             return Ok(None);
         };
         let Some(unit) = price.amount.as_ref().and_then(|a| Exact::from_wire(a).ok()) else {
@@ -1464,7 +1637,9 @@ fn record_relief(
         relieved_by: Some(reference.clone()),
         quantity: numbers::wire(relieved),
         proceeds: proceeds(relieved)?,
-        trade_date: sale.map(|(_, date)| date.to_string()).unwrap_or_default(),
+        trade_date: sale
+            .map(|(_, date, _)| date.to_string())
+            .unwrap_or_default(),
     });
     Ok(())
 }

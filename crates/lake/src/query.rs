@@ -120,7 +120,9 @@ fn keep_named(row: &mut Observation, named: &BTreeSet<String>) {
         | Observation::ReportedFact(_)
         | Observation::RatingAction(_)
         | Observation::HoldingsReport(_)
-        | Observation::Holding(_) => {}
+        | Observation::Holding(_)
+        // Nor, in contract v29, a factor (ListFactors).
+        | Observation::Factor(_) => {}
     }
 }
 
@@ -450,7 +452,8 @@ impl Lake {
                 | Observation::ReportedFact(_)
                 | Observation::RatingAction(_)
                 | Observation::HoldingsReport(_)
-                | Observation::Holding(_) => {}
+                | Observation::Holding(_)
+                | Observation::Factor(_) => {}
             }
         }
         Ok(reply)

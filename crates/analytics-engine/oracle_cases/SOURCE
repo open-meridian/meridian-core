@@ -1,0 +1,33 @@
+The debt models' oracle cases (contract v29; W12.3; ENG1 §4; ruling 565),
+read by src/bonds/oracle.rs and src/bonds/tests.rs; never edited by hand.
+
+- platform-v29-packages.json: the five debt templates' calculation packages
+  as open-meridian/meridian-platform publishes them, at c701ce6
+  (platform_site/domain/data/templates-v29.json, its `calculation_package`
+  per template): Treasury's published auction results (Fiscal Data's
+  auctions_query) under 31 CFR 356 Appendix B, a bill's discount, MSRB Rule
+  G-33's 30/360 accrual, a pool's and a class's month, a CD's accrual and a
+  TBA's market value in percent of par. Every case is answered exactly.
+- treasury-curve.json: Treasury's daily par yield curve for 2026-10-01 and
+  2026-10-16 and the Board's zero curve (feds200628, SVENY01 to SVENY30) for
+  the same dates, as plugin-us-treasury and plugin-fed-board recorded them
+  (src/us_treasury/responses/par-202610.csv.gz,
+  src/fed_board/responses/feds200628.csv.gz); and QuantLib 1.40's
+  PiecewiseConvexMonotoneForward fitted to the par yields through
+  FixedRateBondHelpers at par (semi-annual, ActualActual Bond, Backward,
+  unadjusted), Actual365Fixed, its continuous zero rates.
+- bond-functions.json: QuantLib 1.40's BondFunctions (bondYield, duration
+  Macaulay and Modified, convexity, basisPointValue, accruedAmount and
+  zSpread over the curve above) for four fixed-rate bonds settled
+  2026-10-19 for a close on 2026-10-16.
+
+QuantLib is a test oracle only: its answers are pinned here from the pinned
+release (the SDK's, 1.40), never a dependency of this crate or the image.
+
+tools/ql_curve.py and tools/ql_bonds.py wrote treasury-curve.json and
+bond-functions.json (test-only tooling, never shipped or run by a gate):
+`python3 tools/ql_curve.py <responses>` then `python3 tools/ql_bonds.py
+<responses>`, in a Python with QuantLib 1.40, <responses> holding the two
+plugins' recorded par-202609.csv.gz, par-202610.csv.gz and
+feds200628.csv.gz. Rerun on 2026-10-31, they reproduce both files byte for
+byte.

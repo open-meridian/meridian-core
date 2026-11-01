@@ -139,6 +139,24 @@ fn owner(store: &dyn Store, record: Record, id: &str, named: &str) -> Result<Str
         .ok_or_else(|| StoreError::Invalid(format!("the book holds no record {id}")).on_the_bus())
 }
 
+/// What the instrument store says of the order's instrument, read before
+/// the lock: a series' multiplier (559) and from contract v29 a debt
+/// record's, whose fills are priced per 100 of face (986, 987), so a
+/// booking's executions gross as their fills did.
+fn order_records(bus: &Bus, store: &dyn Store, account: &str, order_id: &str, ctx: &mut Context) {
+    let Ok(book) = store.book(account) else {
+        return;
+    };
+    let Some(held) = book.ledger.orders.get(order_id) else {
+        return;
+    };
+    let mut named: Vec<String> = vec![held.order.instrument_id.clone()];
+    named.extend(held.order.legs.iter().map(|leg| leg.instrument_id.clone()));
+    named.retain(|id| !id.is_empty());
+    let found = references(bus, &named, ctx.received_at_ns);
+    ctx.records.extend(found.records);
+}
+
 /// Each account's attributes, read before the lock (W11.27): which are
 /// marked error accounts or allocation accounts.
 pub fn account_marks(
@@ -658,6 +676,7 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
                 account_marks(store.as_ref(), allocation_accounts(&request.allocations));
             let members = block_members(store.as_ref(), &account, &request.order_id);
             ctx.members = member_views(store.as_ref(), &members);
+            order_records(&bus2, store.as_ref(), &account, &request.order_id, &mut ctx);
             let decided_ctx = ctx.clone();
             let booked = std::sync::Mutex::new(None::<(String, Book)>);
             let answer = act(
@@ -709,13 +728,15 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
         bus.serve(HAND_OFF_BOOKING, move |envelope| {
             let request: HandOffBookingRequest =
                 decode(&envelope, "meridian.v1.HandOffBookingRequest")?;
-            let ctx = context_of(&envelope, clock.as_ref());
+            let mut ctx = context_of(&envelope, clock.as_ref());
             let account = owner(
                 store.as_ref(),
                 Record::Booking,
                 &request.booking_id,
                 "booking_id",
             )?;
+            let order_id = booking_order(store.as_ref(), &account, &request.booking_id);
+            order_records(&bus2, store.as_ref(), &account, &order_id, &mut ctx);
             act(
                 &bus2,
                 store.as_ref(),
@@ -757,6 +778,7 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
             let order_id = booking_order(store.as_ref(), &account, &request.booking_id);
             let members = block_members(store.as_ref(), &account, &order_id);
             ctx.members = member_views(store.as_ref(), &members);
+            order_records(&bus2, store.as_ref(), &account, &order_id, &mut ctx);
             let decided_ctx = ctx.clone();
             let corrected = std::sync::Mutex::new(None::<(Book, Book)>);
             let answer = act(

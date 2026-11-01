@@ -12,7 +12,9 @@ brokerage and no trading API of any kind is reached.
    awaiting its staff; a licensed-only one (CUSIP) and a symbol-only one
    are kept local, provisional, nothing sent; a source thinner than the
    minimum is not found, nothing minted -- the street keeps it a
-   placeholder (W2.4).
+   placeholder (W2.4). From contract v29 a corporate bond matched by its
+   FIGI, its CUSIP kept here, its page showing its terms and the calls it
+   lacks, and an agency pool by agency_pool, its agency in source.
 3. The licence-list filter: what reached the platform -- only schemes on
    the list, never an LCL- ID, never open_meridian_local, never the CUSIP;
    CUSIP added to the platform's list and pulled again, the licensed-only
@@ -64,6 +66,12 @@ KEPT_BEFORE_V24 = (("LCL-01J8XQ4M7K0000000000GBP1", "GBP", "Pound sterling, a v2
                    ("LCL-01J8XQ4M7K0000000000GBP2", "GBP", "GBP cash, another custodian"),
                    ("LCL-01J8XQ4M7K0000000000CHF1", "CHF", "Swiss franc, a v20 statement"))
 GBP = f"INS-01JGBP{'0' * 19}1"
+# Contract v29: the harness platform's corporate bond and agency pool
+# (deploy/harness/platform.py's BONDS and POOLS), and the CUSIP a custodian
+# would state for the bond, kept in the deployment.
+BOND = "INS-01JBOND00000000000000000001"
+POOL = "INS-01JPOOL00000000000000000001"
+BOND_CUSIP = "999999AA1"
 CHF = f"INS-01JCHF{'0' * 19}1"
 
 
@@ -197,6 +205,29 @@ def run():
     thin = page("venue", "write", "/resolve?symbol=THIN&thin=1")
     must(not thin["found"] and not thin["instrument_id"],
          f"step 2, thinner than the minimum: not found, nothing minted: {thin}")
+    # Contract v29 (W1.1, W1.25, W3.25; rulings 676, 677): a corporate bond
+    # by its FIGI, the CUSIP its source states beside it kept here and never
+    # sent, minted with its terms and incomplete listing its calls (the
+    # plan's risk 3); an agency pool by its pool number, its agency in source.
+    bond = page("venue", "write", f"/resolve?symbol=HARN36&figi=BBG01BOND0001&cusip={BOND_CUSIP}"
+                                  "&description=Harness+Corp+4.875%25+2036")
+    must(bond["instrument_id"] == BOND and not bond["provisional"],
+         f"step 2, a bond matched by its FIGI is kept under the platform's ID: {bond}")
+    said = runner("core-page", f"/admin/instruments/{BOND}")
+    must('data-tab="terms"' in said and ">30/360 (bond basis)</td>" in said
+         and ">4.875%, fixed, semi-annual</td>" in said,
+         "step 2, the bond's page shows its terms as the platform's record states them")
+    lacks = re.search(r"lacks: ([^.<]*)\.", said)
+    must(lacks and "calls" in lacks.group(1).split(", "),
+         f"step 2, minted incomplete, the bond lists the calls it lacks (574): "
+         f"{lacks.group(0) if lacks else 'nothing said'}")
+    pool = page("venue", "write", "/resolve?symbol=POOL1&agency_pool=MA5123&agency=FNMA"
+                                  "&description=FNMA+CL+MA5123")
+    must(pool["instrument_id"] == POOL and not pool["provisional"],
+         f"step 2, an agency pool matched by agency_pool: {pool}")
+    said = runner("core-page", f"/admin/instruments/{POOL}")
+    must(">FNMA CL MA5123</td>" in said and "55-day delay" in said,
+         "step 2, the pool's page shows its agency, number and delay")
     listing = runner("core-page", "/admin/instruments")
     must("Provisional (" in listing and pending["instrument_id"] in listing,
          "step 2, the Instruments page lists the provisional records")
@@ -207,15 +238,20 @@ def run():
     sent = escalations()
     flat = json.dumps(sent)
     must(sent, "step 3, the platform was asked to match or mint")
-    must("LCL-" not in flat and "open_meridian_local" not in flat and CUSIP not in flat,
+    must("LCL-" not in flat and "open_meridian_local" not in flat and CUSIP not in flat
+         and BOND_CUSIP not in flat,
          f"step 3, never an LCL- ID, open_meridian_local or a licensed scheme: {flat[:600]}")
     schemes = {i["scheme"] for body in sent for i in body.get("identifiers", [])}
     must(schemes <= {"figi", "share_class_figi", "composite_figi", "iso4217", "ticker", "lei",
-                     "caip19", "sec_series", "sec_class"},
+                     "caip19", "sec_series", "sec_class", "agency_pool"},
          f"step 3, only schemes on the licence list: {schemes}")
+    must({"scheme": "agency_pool", "value": "MA5123", "source": "FNMA"} in
+         [{k: i.get(k, "") for k in ("scheme", "value", "source")}
+          for body in sent for i in body.get("identifiers", [])],
+         "step 3, an agency's pool number is sent with its agency (contract v29, W1.26)")
     must(all(body.get("request_key") for body in sent), "step 3, each request carries its key")
     platform("/e2e/licence", {"schemes": ["figi", "lei", "ticker_and_venue", "caip19", "iso4217",
-                                          "sec_series", "sec_class", "cusip"]})
+                                          "sec_series", "sec_class", "agency_pool", "cusip"]})
     compose("restart", "conductor")
     until(180, lambda: CUSIP in json.dumps(escalations()),
           "step 3, the licensed-only record is sent once the platform lists CUSIP")

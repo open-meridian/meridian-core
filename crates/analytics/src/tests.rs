@@ -57,6 +57,7 @@ fn price(subject: &str, kind: PriceKind, amount: &str, instrument: &str, dataset
         price: money(amount, instrument, ""),
         basis: PriceBasis::PerUnit as i32,
         confidence: None,
+        ..Default::default()
     }
 }
 
@@ -608,8 +609,9 @@ async fn an_account_outside_the_scope_and_a_definition_not_served_are_refused_na
     .unwrap();
     // v26's eight, from contract v27 execution_cost v1 and pnl v2, and from
     // contract v28 the twelve options measures, positioning_exposure at a
-    // version per basis (ruling 591).
-    assert_eq!(definitions.definitions.len(), 23);
+    // version per basis (ruling 591), and from contract v29 the eleven
+    // curve and bond measures (ruling 688).
+    assert_eq!(definitions.definitions.len(), 34);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1741,6 +1743,7 @@ fn chain_stores_paying(
                     start_minute: 570,
                     end_minute: 960,
                     extended: false,
+                    ..Default::default()
                 }],
                 early_closes: Vec::new(),
             }),
@@ -2097,4 +2100,358 @@ async fn a_dividend_going_ex_the_day_before_expiry_moves_an_american_calls_price
     // Going ex after expiry, it is no dividend of this option's.
     let (after, _) = iv_of(vec![declared("2026-11-23", "3.00")]).await;
     assert!((after - none).abs() < 1e-9, "{none} and {after}");
+}
+
+// ── Contract v29: the curve and bond measures (W12.1, W12.2) ───────────────
+
+const BOND: &str = "INS-BOND1";
+const POOL: &str = "INS-POOL1";
+const SIFMA: &str = "CAL-SIFMA";
+
+/// The stores for a bond fund: a corporate bond and an agency pool held,
+/// their closes in percent of par, the pool's factors, Treasury's par
+/// curve and the SIFMA calendar.
+fn bond_stores() -> Stores {
+    let bus = Arc::new(Bus::single(
+        crate::INSTANCE,
+        Arc::new(MemoryBackend::new()),
+        Arc::new(ManualClock::at(NOW)),
+    ));
+    let stores = Stores {
+        bus,
+        heard: Arc::default(),
+        routing: Arc::new(Mutex::new(Vec::new())),
+        quarantined: Arc::default(),
+        quarantined_quote: Arc::default(),
+    };
+    serve_store(
+        &stores,
+        topics::LIST_ACCOUNT_ATTRIBUTES,
+        "meridian.v1.ListAccountAttributesReply",
+        |request: ListAccountAttributesRequest| ListAccountAttributesReply {
+            attributes: vec![AccountAttributes {
+                account_id: request.account_id,
+                base_currency_code: "USD".into(),
+                base_cash_instrument_id: USD.into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    );
+    serve_store(
+        &stores,
+        topics::LIST_POSITIONS,
+        "meridian.v1.ListPositionsReply",
+        |request: ListPositionsRequest| {
+            let position = |id: &str, quantity: &str, cost: &str| BookPosition {
+                account_id: request.account_id.clone(),
+                instrument_id: id.into(),
+                side: HoldingSide::Long as i32,
+                trade_date_quantity: d(quantity),
+                lots: vec![Lot {
+                    open_quantity: d(quantity),
+                    terms: Some(LotTerms {
+                        cost: money(cost, USD, "USD"),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            ListPositionsReply {
+                positions: vec![
+                    position(BOND, "50000", "49187.50"),
+                    position(POOL, "1000000", "1015000.00"),
+                ],
+                ..Default::default()
+            }
+        },
+    );
+    serve_store(
+        &stores,
+        topics::RESOLVE_INSTRUMENT,
+        "meridian.v1.ResolveInstrumentReply",
+        |request: ResolveInstrumentRequest| {
+            let found = match request.instrument_id.as_str() {
+                USD => Some(record(USD, AssetClass::Cash, "USD", "TPL-cash")),
+                BOND => Some(InstrumentRecord {
+                    instrument_type: InstrumentType::Bond as i32,
+                    bond: Some(
+                        meridian_domain::debt::bond_from(
+                            &serde_json::json!({
+                                "security_type": "DEBT_SECURITY_TYPE_CORP",
+                                "issuer_type": "ISSUER_TYPE_CORPORATE",
+                                "issue_date": "2026-02-23", "dated_date": "2026-02-23",
+                                "maturity_date": "2046-02-23", "coupon_rate": "4.65",
+                                "coupon_type": "COUPON_TYPE_FIXED", "coupon_frequency": 2,
+                                "day_count": "DAY_COUNT_THIRTY_360_BOND_BASIS",
+                                "payment_calendar_id": SIFMA,
+                            }),
+                            "bond",
+                        )
+                        .unwrap(),
+                    ),
+                    ..record(BOND, AssetClass::Debt, "USD", "TPL-bond")
+                }),
+                POOL => Some(InstrumentRecord {
+                    instrument_type: InstrumentType::MbsPool as i32,
+                    mbs_pool: Some(
+                        meridian_domain::debt::mbs_pool_from(
+                            &serde_json::json!({
+                                "agency": "MORTGAGE_AGENCY_FNMA", "program": "UMBS 30-year",
+                                "pool_number": "MA0001", "pass_through_rate": "6",
+                                "issue_date": "2025-01-01", "maturity_date": "2055-01-01",
+                                "original_face": "1000000", "original_term_months": 360,
+                                "day_count": "DAY_COUNT_THIRTY_360_BOND_BASIS",
+                                "payment_delay_days": 55, "payment_day": 25,
+                            }),
+                            "mbs_pool",
+                        )
+                        .unwrap(),
+                    ),
+                    ..record(POOL, AssetClass::Debt, "USD", "TPL-mbs-pool")
+                }),
+                UST => Some(record(UST, AssetClass::Unspecified, "USD", "")),
+                _ => None,
+            };
+            ResolveInstrumentReply {
+                found: found.is_some(),
+                instrument: found,
+            }
+        },
+    );
+    serve_store(
+        &stores,
+        topics::READ_TEMPLATE,
+        "meridian.v1.ReadTemplateReply",
+        |request: ReadTemplateRequest| {
+            let (model, inputs): (&str, &[&str]) = match request.template_id.as_str() {
+                "TPL-cash" => ("cash", &["fx"]),
+                "TPL-mbs-pool" => ("bond_cash_flows", &["close", "factor"]),
+                _ => ("bond_cash_flows", &["close"]),
+            };
+            ReadTemplateReply {
+                template: Some(SecurityTemplate {
+                    template_id: request.template_id,
+                    template_version: request.template_version,
+                    calculation_package: Some(CalculationPackage {
+                        model_id: model.into(),
+                        model_version: 1,
+                        pricing_inputs: inputs.iter().map(|i| i.to_string()).collect(),
+                        calculation_version: "1".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            }
+        },
+    );
+    serve_store(
+        &stores,
+        topics::LIST_PRICES,
+        "meridian.v1.ListPricesReply",
+        |request: ListPricesRequest| {
+            let par = |subject: &str, amount: &str| Price {
+                basis: PriceBasis::PercentOfPar as i32,
+                ..price(subject, PriceKind::Close, amount, USD, "bonds-1:closes")
+            };
+            let wanted: Vec<&str> = request
+                .subjects
+                .iter()
+                .map(|s| s.entity_id.as_str())
+                .collect();
+            ListPricesReply {
+                prices: [par(BOND, "90.5"), par(POOL, "101.5")]
+                    .into_iter()
+                    .filter(|p| {
+                        wanted.contains(&p.meta.as_ref().unwrap().subjects[0].entity_id.as_str())
+                    })
+                    .collect(),
+                ..Default::default()
+            }
+        },
+    );
+    serve_store(
+        &stores,
+        crate::debt::LIST_FACTORS,
+        "meridian.v1.ListFactorsReply",
+        |_request: ListFactorsRequest| {
+            let row = |month: &str, factor: &str| Factor {
+                meta: Some(ObservationMeta {
+                    subjects: vec![SubjectRef {
+                        entity_id: POOL.into(),
+                        ..Default::default()
+                    }],
+                    source: Some(Source {
+                        dataset: "gse-1:factors".into(),
+                        ..Default::default()
+                    }),
+                    row_key: format!("{POOL}:{month}"),
+                    version: 1,
+                    valid_from_ns: NOW - 10,
+                    ..Default::default()
+                }),
+                factor: d(factor),
+                factor_month: month.into(),
+                ..Default::default()
+            };
+            ListFactorsReply {
+                factors: vec![
+                    row("202606", "0.9501"),
+                    row("202607", "0.9452"),
+                    row("202608", "0.9398"),
+                    row("202609", "0.9351"),
+                    // Not yet in force at the job's date.
+                    row("202611", "0.9200"),
+                ],
+                ..Default::default()
+            }
+        },
+    );
+    serve_store(
+        &stores,
+        topics::RESOLVE_IDENTIFIER,
+        "meridian.v1.ResolveIdentifierReply",
+        |_request: ResolveIdentifierRequest| ResolveIdentifierReply {
+            found: true,
+            instrument_id: UST.into(),
+            ..Default::default()
+        },
+    );
+    serve_store(
+        &stores,
+        topics::LIST_RATES,
+        "meridian.v1.ListRatesReply",
+        |_request: ListRatesRequest| ListRatesReply {
+            rates: vec![
+                par(3, TenorUnit::Month, "4.26"),
+                par(1, TenorUnit::Year, "4.46"),
+                par(2, TenorUnit::Year, "4.74"),
+                par(5, TenorUnit::Year, "4.89"),
+                par(10, TenorUnit::Year, "5.09"),
+                par(30, TenorUnit::Year, "5.43"),
+            ],
+            ..Default::default()
+        },
+    );
+    serve_store(
+        &stores,
+        topics::READ_CALENDAR,
+        "meridian.v1.ReadCalendarReply",
+        |request: ReadCalendarRequest| ReadCalendarReply {
+            found: request.calendar_id == SIFMA,
+            calendar_id: request.calendar_id,
+            days: vec![CalendarDay {
+                date: "2026-11-11".into(),
+                kind: CalendarDayKind::Closed as i32,
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    );
+    serve_store(
+        &stores,
+        topics::LIST_OUTCOMES,
+        "meridian.v1.ListOutcomesReply",
+        |_request: ListOutcomesRequest| ListOutcomesReply::default(),
+    );
+    serve_store(
+        &stores,
+        topics::LIST_MODEL_ROUTING,
+        "meridian.v1.ListModelRoutingReply",
+        |_request: ListModelRoutingRequest| ListModelRoutingReply {
+            version: 1,
+            routes: Vec::new(),
+        },
+    );
+    stores
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bond_funds_job_reads_its_debt_inputs_on_the_clients_behalf() {
+    let stores = bond_stores();
+    coordinator(&stores, Config::default(), false);
+    let mut request = job(&[
+        ("market_value", &["instrument"], ""),
+        ("accrued_interest", &[], ""),
+        ("bond_yield", &[], ""),
+        ("bond_spread", &[], ""),
+        ("historical_prepayment", &[], ""),
+        ("treasury_curve", &[], ""),
+    ]);
+    request.job.as_mut().unwrap().business_date = "2026-10-16".into();
+    let reply: RunJobReply = ask_as(
+        &stores.bus,
+        topics::RUN_JOB,
+        "meridian.v1.RunJobRequest",
+        request,
+        &["ACC-1"],
+    )
+    .await
+    .unwrap();
+    let answer = reply.answer.expect("answered inline");
+    // 50,000 of face at 90.5; 1,000,000 of original face at 101.5 times
+    // the factor in force on 2026-10-16, September's 0.9351.
+    assert_eq!(
+        value(&answer, "market_value", &[("instrument", BOND)]),
+        "45250.00"
+    );
+    assert_eq!(
+        value(&answer, "market_value", &[("instrument", POOL)]),
+        "949126.50"
+    );
+    let has = |definition: &str| {
+        answer
+            .figures
+            .iter()
+            .any(|f| f.measure.as_ref().unwrap().definition == definition)
+    };
+    for definition in [
+        "accrued_interest",
+        "bond_yield",
+        "bond_spread",
+        "historical_prepayment",
+        "treasury_curve",
+    ] {
+        assert!(has(definition), "{definition}: {:?}", answer.not_evaluated);
+    }
+    // Four months of factors: 6 and 12 months not evaluated, as the
+    // fixture's case says.
+    let short: Vec<&str> = answer
+        .not_evaluated
+        .iter()
+        .filter(|u| u.reason == NotEvaluatedReason::HistoryInsufficient as i32)
+        .map(|u| u.detail.split(':').next().unwrap())
+        .collect();
+    assert_eq!(short, vec!["12m", "6m"]);
+    assert_eq!(answer.not_evaluated.len(), 2, "{:?}", answer.not_evaluated);
+    // Each debt read on the client's behalf, as every read is (W12.2).
+    let heard = stores.heard.lock().unwrap();
+    for topic in [
+        crate::debt::LIST_FACTORS,
+        topics::LIST_RATES,
+        topics::READ_CALENDAR,
+    ] {
+        let (_, meta) = heard
+            .stamps
+            .iter()
+            .find(|(t, _)| t == topic)
+            .unwrap_or_else(|| panic!("{topic} was not asked"));
+        assert_eq!(meta.on_behalf_of_instance_id, crate::INSTANCE, "{topic}");
+    }
+    let provenance = answer.provenance.unwrap();
+    for dataset in ["bonds-1:closes", "gse-1:factors", "us-treasury-1:ust_par"] {
+        assert!(
+            provenance.datasets.contains(&dataset.to_string()),
+            "{dataset}"
+        );
+    }
+    let models: Vec<&str> = provenance
+        .models
+        .iter()
+        .map(|m| m.model_id.as_str())
+        .collect();
+    for model in ["bond_cash_flows", "bond_yield_solver", "monotone_convex"] {
+        assert!(models.contains(&model), "{models:?}");
+    }
 }

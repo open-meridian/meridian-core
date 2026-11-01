@@ -104,10 +104,14 @@ impl PostgresStore {
         Ok(head as u64)
     }
 
-    fn move_head(tx: &mut Transaction<'_>, dataset: &str, head: u64) -> Result<()> {
+    /// Moves the partition's head, and its rows in force by the row keys
+    /// the batch kept that it held no version of (contract v29, ruling 619
+    /// (2); migration 8): a new version of a key held replaces its last, and
+    /// a row served unkept is never in force.
+    fn move_head(tx: &mut Transaction<'_>, dataset: &str, head: u64, new_keys: u64) -> Result<()> {
         tx.execute(
-            "UPDATE lake_partition SET head = $2 WHERE dataset = $1",
-            &[&dataset, &(head as i64)],
+            "UPDATE lake_partition SET in_force = in_force + $3, head = $2 WHERE dataset = $1",
+            &[&dataset, &(head as i64), &(new_keys as i64)],
         )
         .map_err(unavailable)?;
         Ok(())
@@ -231,9 +235,9 @@ fn insert(tx: &mut Transaction<'_>, dataset: &str, row: &Observation) -> Result<
                 (dataset, sequence, data_type, row_key, version, subject, subjects, kind,
                  interval_ns, venue_id, valid_from_ns, valid_until_ns, business_date,
                  recorded_at_ns, previous_sequence, unconverted, body, closed_reason,
-                 latest_key, quality, expires, listed_type)
+                 latest_key, quality, expires, listed_type, published_at_ns)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::text::date, $14, $15,
-                 $16, $17, $18, $19, $20, $21::text::date, $22)",
+                 $16, $17, $18, $19, $20, $21::text::date, $22, $23)",
         &[
             &dataset,
             &(meta.sequence as i64),
@@ -257,6 +261,9 @@ fn insert(tx: &mut Transaction<'_>, dataset: &str, row: &Observation) -> Result<
             &(meta.quality as i16),
             &expires,
             &listed_type,
+            // A rate's published time, its versions' order in force
+            // (ruling 1006 (b); migration 8).
+            &crate::store::published_order(row),
         ],
     )
     .map_err(unavailable)?;
@@ -279,10 +286,20 @@ fn insert(tx: &mut Transaction<'_>, dataset: &str, row: &Observation) -> Result<
 /// subject after its first is found by `lake_row_by_later_subjects` and
 /// chosen as before; a row not yet given its key (`lake_row_unkeyed`) is
 /// one of its own. "In force" is the same test the whole read applies: the
-/// latest version of its row key among the rows the read would load. Each
-/// part is written so a table without statistics yet (a fresh deployment,
-/// the gate's) is read by the same indexes.
-static LATEST: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+/// latest version of its row key among the rows the read would load, a
+/// rate's by published time ([`LATEST_BY_PUBLISHED`]). Each part is written
+/// so a table without statistics yet (a fresh deployment, the gate's) is
+/// read by the same indexes.
+static LATEST: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| latest(false));
+
+/// [`LATEST`] for rates (ruling 1006 (b)): a row key's version in force is
+/// its latest by published time, then by version
+/// ([`crate::store::force_order`]), read from `lake_row.published_at_ns`
+/// (migration 8), so a late-arriving older publication never takes force.
+/// A rate row not yet given its published time orders first.
+static LATEST_BY_PUBLISHED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| latest(true));
+
+fn latest(by_published: bool) -> String {
     // The read's own conditions on a row, as the whole read applies them.
     let window = |a: &str| {
         format!(
@@ -303,13 +320,25 @@ static LATEST: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     // A scalar subquery, never a join: each row's own key bound, so the
     // planner reads its row key's versions by `lake_row_version` whatever
     // the statistics say (a fresh table's had it scan the dataset a row).
-    let in_force = format!(
-        "r.version = (SELECT max(v.version) FROM lake_row v
-                       WHERE v.dataset = r.dataset AND v.data_type = r.data_type
-                         AND v.row_key = r.row_key
-                         AND v.subjects && $2::text[] AND {})",
-        narrowed("v")
-    );
+    let in_force = if by_published {
+        format!(
+            "r.version = (SELECT v.version FROM lake_row v
+                           WHERE v.dataset = r.dataset AND v.data_type = r.data_type
+                             AND v.row_key = r.row_key
+                             AND v.subjects && $2::text[] AND {}
+                           ORDER BY COALESCE(v.published_at_ns, 0) DESC, v.version DESC
+                           LIMIT 1)",
+            narrowed("v")
+        )
+    } else {
+        format!(
+            "r.version = (SELECT max(v.version) FROM lake_row v
+                           WHERE v.dataset = r.dataset AND v.data_type = r.data_type
+                             AND v.row_key = r.row_key
+                             AND v.subjects && $2::text[] AND {})",
+            narrowed("v")
+        )
+    };
     let invalid = "(COALESCE(r.quality, 0) = 3
           OR EXISTS (SELECT 1 FROM lake_quality_assessment a
                       WHERE a.dataset = r.dataset AND a.sequence = r.sequence
@@ -405,7 +434,20 @@ SELECT r.body FROM lake_row r
         narrowed_r = narrowed("r"),
         window_r = window("r"),
     )
-});
+}
+
+/// Whether the row `r` is no longer its row key's version in force (ruling
+/// 1006 (b)): a version of its key is kept that a default read would serve
+/// in its place -- later by published time, then by version, for a rate;
+/// later by version for any other data type, whose `published_at_ns` is
+/// NULL ([`crate::store::force_order`]; migration 8). Read by
+/// `lake_row_version`, a key's few versions; what every count of rows in
+/// force tests a counted row by.
+const SUPERSEDED: &str = "EXISTS (
+    SELECT 1 FROM lake_row n
+     WHERE n.dataset = r.dataset AND n.data_type = r.data_type AND n.row_key = r.row_key
+       AND (COALESCE(n.published_at_ns, 0), n.version)
+           > (COALESCE(r.published_at_ns, 0), r.version))";
 
 /// How many rows a backfill of `latest_key` and `quality` reads at a time.
 const BACKFILL_BATCH: i64 = 2000;
@@ -529,6 +571,59 @@ fn backfill_listing(conn: &mut Connection) -> Result<u64> {
     Ok(filled)
 }
 
+/// Fill in `published_at_ns` where a rate row has none (migration 8; ruling
+/// 1006 (b)): its published time, read from its own body, batch by batch
+/// as [`backfill_latest_keys`] does, by `lake_row_unpublished`. A row whose
+/// body does not read is passed over, ordered first among its key's
+/// versions. Run by `migrate`, every time.
+fn backfill_published(conn: &mut Connection) -> Result<u64> {
+    let mut after: (String, i64) = (String::new(), 0);
+    let mut filled = 0u64;
+    loop {
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        let rows = tx
+            .query(
+                "SELECT dataset, sequence, body FROM lake_row
+                  WHERE (dataset, sequence) > ($1, $2)
+                    AND data_type = 6 AND published_at_ns IS NULL
+                  ORDER BY dataset, sequence
+                  LIMIT $3",
+                &[&after.0, &after.1, &BACKFILL_BATCH],
+            )
+            .map_err(unavailable)?;
+        let Some(last) = rows.last() else {
+            tx.commit().map_err(unavailable)?;
+            break;
+        };
+        after = (last.get(0), last.get(1));
+        let (mut datasets, mut sequences, mut published) = (Vec::new(), Vec::new(), Vec::new());
+        for row in &rows {
+            let body: Vec<u8> = row.get(2);
+            let Some(at) = Observation::decode(DataType::Rate, &body)
+                .ok()
+                .and_then(|observation| crate::store::published_order(&observation))
+            else {
+                continue;
+            };
+            datasets.push(row.get::<_, String>(0));
+            sequences.push(row.get::<_, i64>(1));
+            published.push(at);
+        }
+        filled += tx
+            .execute(
+                "UPDATE lake_row r SET published_at_ns = f.published_at_ns
+                   FROM unnest($1::text[], $2::bigint[], $3::bigint[])
+                        AS f(dataset, sequence, published_at_ns)
+                  WHERE r.dataset = f.dataset AND r.sequence = f.sequence",
+                &[&datasets, &sequences, &published],
+            )
+            .map_err(unavailable)?;
+        tx.commit().map_err(unavailable)?;
+        tracing::info!(filled, "rate rows given their published time so far");
+    }
+    Ok(filled)
+}
+
 /// The lake's listing, from `lake_row_listing` alone (contract v28, amended
 /// 2026-10-28; ruling 856): each series row key's version in force by the
 /// cut-off -- its latest version recorded by then, as every read takes it --
@@ -604,7 +699,9 @@ impl Store for PostgresStore {
         for row in &done.rows {
             insert(&mut tx, dataset, row)?;
         }
-        Self::move_head(&mut tx, dataset, head)?;
+        // Each row numbered version 1 is a key the partition held no
+        // version of; every other replaces its key's last.
+        Self::move_head(&mut tx, dataset, head, u64::from(done.recorded))?;
         tx.commit().map_err(unavailable)?;
         Ok(done)
     }
@@ -639,7 +736,7 @@ impl Store for PostgresStore {
             )
             .map_err(unavailable)?;
         }
-        Self::move_head(&mut tx, dataset, head)?;
+        Self::move_head(&mut tx, dataset, head, 0)?;
         tx.commit().map_err(unavailable)?;
         Ok(done)
     }
@@ -735,7 +832,9 @@ impl Store for PostgresStore {
         }
         let rows = tx
             .query(
-                if latest {
+                if latest && query.data_type == DataType::Rate {
+                    LATEST_BY_PUBLISHED.as_str()
+                } else if latest {
                     LATEST.as_str()
                 } else {
                     "SELECT body FROM lake_row
@@ -853,11 +952,16 @@ impl Store for PostgresStore {
 
     fn unconverted_counts(&self) -> Result<BTreeMap<String, u64>> {
         // Read from lake_row_unconverted, which holds only these rows
-        // (migration 6).
+        // (migration 6), each counted while it is its row key's version in
+        // force (ruling 1006 (c)).
         Ok(self
             .conn()?
             .query(
-                "SELECT dataset, count(*) FROM lake_row WHERE unconverted GROUP BY dataset",
+                &format!(
+                    "SELECT r.dataset, count(*) FROM lake_row r
+                      WHERE r.unconverted AND NOT {SUPERSEDED}
+                      GROUP BY r.dataset"
+                ),
                 &[],
             )
             .map_err(unavailable)?
@@ -1035,13 +1139,40 @@ impl Store for PostgresStore {
     ) -> Result<u64> {
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
-        let removed = tx
-            .execute(
-                "DELETE FROM lake_row WHERE dataset = $1 AND recorded_at_ns < $2",
+        // The partition held as a batch holds it, so no row key's next
+        // version is recorded between finding a key left with none and
+        // counting it out of the rows in force (contract v29, ruling 619
+        // (2); migration 8).
+        tx.execute(
+            "SELECT 1 FROM lake_partition WHERE dataset = $1 FOR UPDATE",
+            &[&dataset],
+        )
+        .map_err(unavailable)?;
+        // The rows removed, and the row keys left with no version kept: a
+        // key whose later version stays is still in force at it.
+        let gone = tx
+            .query_one(
+                "WITH gone AS (
+                    DELETE FROM lake_row WHERE dataset = $1 AND recorded_at_ns < $2
+                    RETURNING data_type, row_key)
+                 SELECT (SELECT count(*) FROM gone),
+                        (SELECT count(*)
+                           FROM (SELECT DISTINCT data_type, row_key FROM gone) g
+                          WHERE NOT EXISTS (
+                                SELECT 1 FROM lake_row k
+                                 WHERE k.dataset = $1 AND k.data_type = g.data_type
+                                   AND k.row_key = g.row_key AND k.recorded_at_ns >= $2))",
                 &[&dataset, &recorded_before_ns],
             )
             .map_err(unavailable)?;
+        let removed = gone.get::<_, i64>(0) as u64;
+        let keys_gone = gone.get::<_, i64>(1);
         if removed > 0 {
+            tx.execute(
+                "UPDATE lake_partition SET in_force = greatest(in_force - $2, 0) WHERE dataset = $1",
+                &[&dataset, &keys_gone],
+            )
+            .map_err(unavailable)?;
             tx.execute(
                 "INSERT INTO lake_removal (dataset, rows_removed, recorded_before_ns, why, at_ns)
                  VALUES ($1, $2, $3, $4, $5)",
@@ -1278,15 +1409,72 @@ impl Store for PostgresStore {
             .collect()
     }
 
+    fn quality_counts(&self) -> Result<BTreeMap<String, (u64, u64, u64)>> {
+        // The rows in force from lake_partition, the flagged from the rows
+        // recorded flagged (lake_row_quality) and the escalations
+        // (lake_quality_assessment), each counted only while it is its row
+        // key's version in force (SUPERSEDED, by lake_row_version): never
+        // every row kept (ruling 816). One snapshot, so the two agree.
+        let mut conn = self.conn()?;
+        let mut tx = conn
+            .build_transaction()
+            .isolation_level(IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .map_err(unavailable)?;
+        let mut counts: BTreeMap<String, (u64, u64, u64)> = BTreeMap::new();
+        for row in tx
+            .query(
+                "SELECT dataset, in_force FROM lake_partition WHERE in_force > 0",
+                &[],
+            )
+            .map_err(unavailable)?
+        {
+            counts.insert(row.get::<_, String>(0), (row.get::<_, i64>(1) as u64, 0, 0));
+        }
+        for row in tx
+            .query(
+                &format!(
+                    "SELECT r.dataset,
+                        count(*) FILTER (WHERE e.state = 2),
+                        count(*) FILTER (WHERE e.state = 3)
+                   FROM (SELECT dataset, sequence, max(state) AS state
+                           FROM (SELECT dataset, sequence, quality AS state
+                                   FROM lake_row WHERE quality IN (2, 3)
+                                 UNION ALL
+                                 SELECT dataset, sequence, state
+                                   FROM lake_quality_assessment) flagged
+                          GROUP BY dataset, sequence) e
+                   JOIN lake_row r ON r.dataset = e.dataset AND r.sequence = e.sequence
+                  WHERE NOT {SUPERSEDED}
+                  GROUP BY r.dataset"
+                ),
+                &[],
+            )
+            .map_err(unavailable)?
+        {
+            let dataset = row.get::<_, String>(0);
+            let (suspicious, invalid) = (row.get::<_, i64>(1) as u64, row.get::<_, i64>(2) as u64);
+            let count = counts.entry(dataset).or_default();
+            count.0 = count.0.saturating_sub(suspicious + invalid);
+            count.1 = suspicious;
+            count.2 = invalid;
+        }
+        tx.commit().map_err(unavailable)?;
+        Ok(counts)
+    }
+
     fn closed_day_counts(&self) -> Result<BTreeMap<String, (u64, u64)>> {
         // Each row's flag as known now: its latest re-check, else the reason
         // it was recorded with. Only a row recorded flagged (lake_row_closed,
         // migration 6) or re-checked since (lake_closed_day) can count, so
-        // only those are read, never every row kept (ruling 816).
+        // only those are read, never every row kept (ruling 816); each while
+        // it is its row key's version in force (ruling 1006 (c)).
         Ok(self
             .conn()?
             .query(
-                "SELECT dataset,
+                &format!(
+                    "SELECT dataset,
                         count(*) FILTER (WHERE reason IN (1, 2)),
                         count(*) FILTER (WHERE reason = 3)
                    FROM (
@@ -1296,15 +1484,16 @@ impl Store for PostgresStore {
                                SELECT c.reason FROM lake_closed_day c
                                 WHERE c.dataset = r.dataset AND c.sequence = r.sequence
                                 ORDER BY c.amendment_id DESC LIMIT 1) a ON true
-                         WHERE r.closed_reason <> 0
+                         WHERE r.closed_reason <> 0 AND NOT {SUPERSEDED}
                         UNION ALL
                         (SELECT DISTINCT ON (c.dataset, c.sequence) c.dataset, c.reason
                            FROM lake_closed_day c
                            JOIN lake_row r ON r.dataset = c.dataset AND r.sequence = c.sequence
-                          WHERE r.closed_reason = 0
+                          WHERE r.closed_reason = 0 AND NOT {SUPERSEDED}
                           ORDER BY c.dataset, c.sequence, c.amendment_id DESC)
                    ) flagged
-                  GROUP BY dataset",
+                  GROUP BY dataset"
+                ),
                 &[],
             )
             .map_err(unavailable)?
@@ -1405,6 +1594,10 @@ fn apply_migrations(conn: &mut Connection, clock: &dyn meridian_clock::Clock) ->
     let listed = backfill_listing(conn)?;
     if listed > 0 {
         tracing::info!(listed, "series rows given their expiry and listed type");
+    }
+    let published = backfill_published(conn)?;
+    if published > 0 {
+        tracing::info!(published, "rate rows given their published time");
     }
     Ok(())
 }

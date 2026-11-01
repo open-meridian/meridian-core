@@ -40,6 +40,26 @@ fn families<'a>(schemes: impl Iterator<Item = &'a str>) -> BTreeSet<String> {
         .collect()
 }
 
+/// The families a record or a miss resolves only through, as the "only by"
+/// counts read them (ruling 978): its families, a vendor's source-scoped
+/// `symbol` left out -- it names the security to its source alone and never
+/// reaches the platform -- so a bond a custodian names by its CUSIP and its
+/// own code counts as the CUSIP's alone, ready for the backfill once a list
+/// names the scheme (W3.25). An administrator's symbol the list admits
+/// stays (ruling 545).
+fn only_through<'a>(
+    identifiers: impl Iterator<Item = (&'a str, &'a str)>,
+    list: &meridian_domain::v1::LicenceList,
+) -> BTreeSet<String> {
+    families(
+        identifiers
+            .filter(|(scheme, source)| {
+                crate::one_id::family_held(scheme, source, list) != "symbol" || source.is_empty()
+            })
+            .map(|(scheme, _)| scheme),
+    )
+}
+
 /// A scheme name the platform takes: letters, digits, `_` and `-`, at most
 /// 32, starting with a letter or a digit.
 fn reportable(name: &str) -> bool {
@@ -56,10 +76,11 @@ fn reportable(name: &str) -> bool {
 /// identifiers name only one, on the day it arrived. Called under the
 /// store's write lock.
 pub fn note_miss(store: &dyn Store, identifiers: &[PbIdentifier], now_ns: i64) -> Result<()> {
-    let named = families(
+    let named = only_through(
         identifiers
             .iter()
-            .map(|identifier| identifier.scheme.as_str()),
+            .map(|identifier| (identifier.scheme.as_str(), identifier.source.as_str())),
+        &crate::one_id::licence(store),
     );
     if named.len() != 1 {
         return Ok(());
@@ -179,6 +200,7 @@ pub fn list_identifier_usage(
         )));
     }
     let mut counts: BTreeMap<String, SchemeUsageCount> = BTreeMap::new();
+    let list = crate::one_id::licence(store);
     // The records as the period ends: those standing, not replaced.
     for record in store.all()? {
         if !counts_as_standing(store, &record)? {
@@ -192,8 +214,14 @@ pub fn list_identifier_usage(
         for name in &named {
             slot(&mut counts, name).instruments_carrying += 1;
         }
-        if named.len() == 1 {
-            if let Some(only) = named.iter().next() {
+        let only = only_through(
+            record
+                .held_now()
+                .map(|identifier| (identifier.scheme.as_str(), identifier.source.as_str())),
+            &list,
+        );
+        if only.len() == 1 {
+            if let Some(only) = only.iter().next() {
                 slot(&mut counts, only).instruments_only_by += 1;
             }
         }
@@ -354,6 +382,73 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert_eq!(refused.0, "period_start");
+    }
+
+    #[test]
+    fn a_bond_named_by_its_cusip_and_a_custodians_code_counts_as_the_cusips_alone() {
+        // Ruling 978: a security only a licensed scheme names is counted
+        // against it, a vendor's source-scoped symbol beside it left out,
+        // whether held or missed; two open schemes still count against none.
+        let store = MemoryStore::default();
+        let custodian = |scheme: &str, value: &str| PbIdentifier {
+            source: "snaptrade".into(),
+            ..identifier(scheme, value)
+        };
+        note_miss(
+            &store,
+            &[
+                custodian("symbol", "MUNI41"),
+                identifier("cusip", "64971XQM3"),
+            ],
+            NOW,
+        )
+        .unwrap();
+        let mut bond = crate::record::dated(&crate::store::Asked {
+            scheme: "cusip".into(),
+            value: "64971XQM4".into(),
+            source: String::new(),
+        });
+        bond.valid_from_ns = 0;
+        let vendor = crate::record::dated(&crate::store::Asked {
+            scheme: "symbol".into(),
+            value: "MUNI42".into(),
+            source: "snaptrade".into(),
+        });
+        let held = Instrument {
+            instrument_id: "LCL-BOND".into(),
+            identifiers: vec![bond, vendor],
+            lifecycle_state: "INSTRUMENT_LIFECYCLE_STATE_ACTIVE".into(),
+            version: 1,
+            ..Default::default()
+        };
+        store
+            .mint(
+                held.clone(),
+                "lcl:bond",
+                crate::one_id::version_of(&held, "mint", Vec::new(), "", NOW),
+            )
+            .unwrap();
+        let reply = list_identifier_usage(&store, &ask("2026-10-05", "2026-10-11"))
+            .unwrap()
+            .unwrap();
+        let cusip = reply
+            .scheme_counts
+            .iter()
+            .find(|count| count.scheme == "cusip")
+            .unwrap();
+        assert_eq!(
+            (
+                cusip.instruments_carrying,
+                cusip.instruments_only_by,
+                cusip.misses_only_by
+            ),
+            (1, 1, 1)
+        );
+        assert!(reply
+            .scheme_counts
+            .iter()
+            .filter(|count| count.scheme == "symbol")
+            .all(|count| count.instruments_only_by == 0));
     }
 
     #[test]

@@ -15,6 +15,7 @@
 //! figure (ruled 2026-10-12).
 
 pub mod chains;
+pub mod debt;
 mod pages;
 pub mod resolve;
 pub mod service;

@@ -22,7 +22,10 @@
 //! per its tenor, maturity and convention besides (contract v27, W10.6).
 //! A rate read as published by a time (contract v27, shared additions 1 and
 //! 2) answers each row key at the version in force by published time among
-//! those recorded by the recorded-time cut. A catch-up
+//! those recorded by the recorded-time cut. A default read of rates takes
+//! each row key's version in force by published time too (ruling 1006 (b);
+//! [`crate::store::force_order`]): a late-arriving older publication is the
+//! next version, kept, and never takes force. A catch-up
 //! after a watermark (trades, the plan's Q33) asks no source: what was not
 //! recorded since is nothing new.
 //!
@@ -753,9 +756,12 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
         }
     }
     let why_not = |dataset: &str, subject: &str, kind: i32| {
-        if tenor_silent.contains(&(subject.to_string(), dataset.to_string()))
-            || left_out.contains(&(subject.to_string(), dataset.to_string(), kind))
-        {
+        if left_out.contains(&(subject.to_string(), dataset.to_string(), kind)) {
+            // Contract v29 (619 (1); W10.6): a dataset whose only rows for
+            // the subject are invalid is named quarantined, apart from a
+            // silent one; still asked nothing and never fallen back to.
+            (UnansweredReason::Quarantined, false)
+        } else if tenor_silent.contains(&(subject.to_string(), dataset.to_string())) {
             (UnansweredReason::SourceSilent, false)
         } else {
             why_not(read, against, dataset, subject)
@@ -910,6 +916,8 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
                                     .or_default()
                                     .insert(subject.clone());
                                 UnansweredReason::AskedSource
+                            } else if reason == UnansweredReason::Quarantined {
+                                reason
                             } else {
                                 UnansweredReason::SourceSilent
                             }
@@ -994,7 +1002,10 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
     });
     out.rows = chosen;
 
-    let standing = matches!(read.when, When::Latest { at_ns: 0 });
+    // A pool's or a class's factor is wanted standing (contract v29, W10.7):
+    // each month's is published on the agency's schedule.
+    let standing = matches!(read.when, When::Latest { at_ns: 0 })
+        || (read.data_type == DataType::Factor && !matches!(read.when, When::After(_)));
     for (dataset, subjects) in asks {
         let cadence = config.declaration(&dataset).map_or(0, |d| d.cadence);
         // Kept current: by its schedule where it has a cadence, by the

@@ -1577,6 +1577,24 @@ struct WireRecord {
     listed_option: Option<WireListedOption>,
     #[serde(default)]
     future: Option<WireFuture>,
+    /// A debt record's terms (contract v29, W1.1; ruling 676), read by
+    /// meridian_domain::debt as the platform answers them -- enums by their
+    /// names, decimals as text; null on every other record.
+    #[serde(default)]
+    bond: Option<serde_json::Value>,
+    #[serde(default)]
+    mbs_pool: Option<serde_json::Value>,
+    #[serde(default)]
+    tba: Option<serde_json::Value>,
+    #[serde(default)]
+    cmo_tranche: Option<serde_json::Value>,
+    #[serde(default)]
+    certificate_of_deposit: Option<serde_json::Value>,
+    /// What the platform's record says it lacks of its template (574;
+    /// W1.24): an `INS-` record minted incomplete, listing what only its
+    /// source can say (a callable bond's calls). Empty where complete.
+    #[serde(default)]
+    missing_fields: Vec<String>,
     #[serde(default)]
     lifecycle_state: String,
     #[serde(default)]
@@ -1946,6 +1964,54 @@ fn into_record(record: WireRecord) -> Result<PbInstrument, PlatformError> {
         .future
         .map(|terms| future_contract(id, terms))
         .transpose()?;
+    // Contract v29 (676): a debt record's terms, each read as the domain
+    // reads them; a name or a decimal the schema refuses names its path.
+    let debt = |what: &str| PlatformError::Malformed(format!("{id} arrived with {what}"));
+    let bond = record
+        .bond
+        .map(|terms| meridian_domain::debt::bond_from(&terms, "bond"))
+        .transpose()
+        .map_err(|why| debt(&why))?;
+    let mbs_pool = record
+        .mbs_pool
+        .map(|terms| meridian_domain::debt::mbs_pool_from(&terms, "mbs_pool"))
+        .transpose()
+        .map_err(|why| debt(&why))?;
+    let tba = record
+        .tba
+        .map(|terms| meridian_domain::debt::tba_from(&terms, "tba"))
+        .transpose()
+        .map_err(|why| debt(&why))?;
+    let cmo_tranche = record
+        .cmo_tranche
+        .map(|terms| meridian_domain::debt::cmo_tranche_from(&terms, "cmo_tranche"))
+        .transpose()
+        .map_err(|why| debt(&why))?;
+    let certificate_of_deposit = record
+        .certificate_of_deposit
+        .map(|terms| {
+            meridian_domain::debt::certificate_of_deposit_from(&terms, "certificate_of_deposit")
+        })
+        .transpose()
+        .map_err(|why| debt(&why))?;
+    // A record carries its own type's terms and no other's: terms of
+    // another type are no record the store can keep.
+    let kind = meridian_domain::v1::InstrumentType::try_from(instrument_type)
+        .unwrap_or(meridian_domain::v1::InstrumentType::Unspecified);
+    for (carried, field) in [
+        (bond.is_some(), "bond"),
+        (mbs_pool.is_some(), "mbs_pool"),
+        (tba.is_some(), "tba"),
+        (cmo_tranche.is_some(), "cmo_tranche"),
+        (certificate_of_deposit.is_some(), "certificate_of_deposit"),
+    ] {
+        if carried && meridian_domain::debt::terms_field(kind) != Some(field) {
+            return Err(debt(&format!(
+                "{field} terms on a record of type {:?}",
+                record.instrument_type
+            )));
+        }
+    }
 
     Ok(PbInstrument {
         instrument_id: record.instrument_id,
@@ -1969,6 +2035,12 @@ fn into_record(record: WireRecord) -> Result<PbInstrument, PlatformError> {
         template_version: record.template_version,
         listed_option,
         future,
+        bond,
+        mbs_pool,
+        tba,
+        cmo_tranche,
+        certificate_of_deposit,
+        missing_fields: record.missing_fields,
         ..Default::default()
     })
 }
@@ -2799,7 +2871,7 @@ pub(crate) mod tests {
             ("AAPL", "2026-11-20")
         );
         // What the store keeps reads back as the same terms.
-        let kept = meridian_domain::instrument_type::listed_terms_to_text(&record);
+        let kept = meridian_domain::instrument_type::terms_to_text(&record);
         assert_eq!(
             meridian_domain::instrument_type::listed_option_from_text(&kept),
             record.listed_option
@@ -2875,11 +2947,97 @@ pub(crate) mod tests {
                 .to_string(),
             "50"
         );
-        let kept = meridian_domain::instrument_type::listed_terms_to_text(&record);
+        let kept = meridian_domain::instrument_type::terms_to_text(&record);
         assert_eq!(
             meridian_domain::instrument_type::future_from_text(&kept),
             record.future
         );
+    }
+
+    /// A debt record as the platform answers it (contract v29, W1.1): the
+    /// fixture's corporate, minted from OpenFIGI and its pricing supplement,
+    /// its calls still to read (the plan's risk 3).
+    fn minted_bond(day_count: &str, kind: &str) -> String {
+        serde_json::json!({
+            "found": true,
+            "minted": true,
+            "instrument": {
+                "instrument_id": "INS-AXP2036",
+                "identifiers": [{"scheme": "figi", "value": "BBG01BOND001", "source": "",
+                                 "valid_from_ns": AS_OF, "valid_until_ns": 0}],
+                "asset_class": "debt",
+                "currency": "USD",
+                "description": "AXP 4.875 2036-02-05",
+                "instrument_type": kind,
+                "bond": {
+                    "security_type": "DEBT_SECURITY_TYPE_CORP",
+                    "issuer_company_id": "ENT-01JAXP",
+                    "issuer_type": "ISSUER_TYPE_CORPORATE",
+                    "issue_date": "2026-02-05",
+                    "maturity_date": "2036-02-05",
+                    "coupon_rate": "4.875",
+                    "coupon_type": "COUPON_TYPE_FIXED",
+                    "coupon_frequency": 2,
+                    "day_count": day_count,
+                    "calls": []
+                },
+                "missing_fields": ["calls"],
+                "lifecycle_state": "INSTRUMENT_LIFECYCLE_STATE_ACTIVE",
+                "template_id": "TPL-bond",
+                "template_version": "1",
+                "version": 1
+            }
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn a_minted_bond_arrives_with_its_terms_and_what_it_lacks() {
+        use meridian_domain::v1::{DayCount, DebtSecurityType};
+        let answer = platform(Fake::new(vec![Ok(reply(
+            201,
+            &minted_bond("DAY_COUNT_THIRTY_360_BOND_BASIS", "bond"),
+        ))]))
+        .escalate(&escalation(), NOW)
+        .await
+        .unwrap();
+        let record = answer.instrument.unwrap();
+        let bond = record.bond.clone().unwrap();
+        assert_eq!(bond.security_type, DebtSecurityType::Corp as i32);
+        assert_eq!(bond.day_count, DayCount::Thirty360BondBasis as i32);
+        assert_eq!(bond.issuer_company_id, "ENT-01JAXP");
+        assert_eq!(
+            meridian_domain::exact::Exact::from_wire(&bond.coupon_rate.unwrap())
+                .unwrap()
+                .to_string(),
+            "4.875"
+        );
+        assert_eq!(record.missing_fields, vec!["calls".to_string()]);
+        // Kept as the store keeps it, and read back the same.
+        let kept = meridian_domain::instrument_type::terms_to_text(&record);
+        assert_eq!(
+            meridian_domain::instrument_type::terms_from_text::<meridian_domain::v1::Bond>(&kept),
+            record.bond
+        );
+        // A day count the schema does not define, and bond terms on a
+        // record of another type, are refused naming them.
+        for (day_count, kind, said) in [
+            ("DAY_COUNT_THIRTY_365", "bond", "bond.day_count"),
+            (
+                "DAY_COUNT_THIRTY_360_BOND_BASIS",
+                "mbs_pool",
+                "bond terms on a record",
+            ),
+        ] {
+            let refused = platform(Fake::new(vec![Ok(reply(
+                201,
+                &minted_bond(day_count, kind),
+            ))]))
+            .escalate(&escalation(), NOW)
+            .await
+            .unwrap_err();
+            assert!(refused.to_string().contains(said), "{refused}");
+        }
     }
 
     #[tokio::test]

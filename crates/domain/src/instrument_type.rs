@@ -22,17 +22,56 @@ use crate::v1::{
     MoneyMarketFund, MoneyMarketFundCategory, MoneyMarketFundInvestors, MoneyMarketFundNav,
 };
 
-/// A listed series' terms as the store holds them (contract v28; rulings
-/// 559 and 575): the platform record's listed option or future, the
-/// message's bytes in hex; empty for a record with neither.
-pub fn listed_terms_to_text(record: &crate::v1::InstrumentRecord) -> String {
+/// A record's terms as the store holds them, the message's bytes in hex:
+/// a listed series' (contract v28; rulings 559 and 575), the platform
+/// record's listed option or future, and from contract v29 a debt record's
+/// (ruling 676), its bond, pool, TBA, tranche or CD; empty for a record with
+/// none. A record carries one set of terms, its type's.
+pub fn terms_to_text(record: &crate::v1::InstrumentRecord) -> String {
     use prost::Message;
-    let bytes = match (&record.listed_option, &record.future) {
-        (Some(option), _) => option.encode_to_vec(),
-        (None, Some(future)) => future.encode_to_vec(),
-        (None, None) => return String::new(),
+    let bytes = if let Some(option) = &record.listed_option {
+        option.encode_to_vec()
+    } else if let Some(future) = &record.future {
+        future.encode_to_vec()
+    } else if let Some(bond) = &record.bond {
+        bond.encode_to_vec()
+    } else if let Some(pool) = &record.mbs_pool {
+        pool.encode_to_vec()
+    } else if let Some(tba) = &record.tba {
+        tba.encode_to_vec()
+    } else if let Some(tranche) = &record.cmo_tranche {
+        tranche.encode_to_vec()
+    } else if let Some(cd) = &record.certificate_of_deposit {
+        cd.encode_to_vec()
+    } else {
+        return String::new();
     };
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// A record's terms from the store's text, as the message its type carries
+/// (`terms_to_text`), or `None` where it holds none.
+pub fn terms_from_text<M: prost::Message + Default>(text: &str) -> Option<M> {
+    M::decode(&unhex(text)?[..]).ok()
+}
+
+/// The record's terms on the wire, by its type: each message set only on
+/// the type that carries it.
+pub fn put_terms(kind: InstrumentType, text: &str, record: &mut crate::v1::InstrumentRecord) {
+    match kind {
+        InstrumentType::ListedOption | InstrumentType::FutureOption => {
+            record.listed_option = terms_from_text(text);
+        }
+        InstrumentType::Future => record.future = terms_from_text(text),
+        InstrumentType::Bond => record.bond = terms_from_text(text),
+        InstrumentType::MbsPool => record.mbs_pool = terms_from_text(text),
+        InstrumentType::Tba => record.tba = terms_from_text(text),
+        InstrumentType::CmoTranche => record.cmo_tranche = terms_from_text(text),
+        InstrumentType::CertificateOfDeposit => {
+            record.certificate_of_deposit = terms_from_text(text);
+        }
+        _ => {}
+    }
 }
 
 fn unhex(text: &str) -> Option<Vec<u8>> {
@@ -49,23 +88,44 @@ fn unhex(text: &str) -> Option<Vec<u8>> {
 /// A listed option's or a future option's terms from the store's text, or
 /// `None` where the record holds none.
 pub fn listed_option_from_text(text: &str) -> Option<crate::v1::ListedOption> {
-    use prost::Message;
-    crate::v1::ListedOption::decode(&unhex(text)?[..]).ok()
+    terms_from_text(text)
 }
 
 /// A future's terms from the store's text, or `None` where it holds none.
 pub fn future_from_text(text: &str) -> Option<crate::v1::FutureContract> {
-    use prost::Message;
-    crate::v1::FutureContract::decode(&unhex(text)?[..]).ok()
+    terms_from_text(text)
 }
 
-/// Whether a listed series' terms leave a template path unfilled (contract
-/// v28, W1.24): an underlying, a right, a strike, a date, a style, a method,
-/// a multiplier, a root, a deliverable or a month not stated; a settlement
-/// time missing only on a cash-settled option, a first notice date only on a
-/// physically delivered future. False for a path the terms do not carry.
-pub fn listed_path_missing(kind: InstrumentType, text: &str, path: &str) -> bool {
+/// Whether a record's terms leave a template path unfilled (contract v28,
+/// W1.24): a listed series' underlying, right, strike, date, style, method,
+/// multiplier, root, deliverable or month not stated; a settlement time
+/// missing only on a cash-settled option, a first notice date only on a
+/// physically delivered future. From contract v29 a debt record's terms, as
+/// [`crate::debt`] reads them, a record holding none read as terms stating
+/// nothing. False for a path the terms do not carry.
+pub fn terms_path_missing(kind: InstrumentType, text: &str, path: &str) -> bool {
+    use crate::debt;
     use crate::v1::{SettlementMethod, SettlementTime};
+    if debt::is_debt(kind) {
+        return match kind {
+            InstrumentType::Bond => {
+                debt::bond_path_missing(&terms_from_text(text).unwrap_or_default(), path)
+            }
+            InstrumentType::MbsPool => {
+                debt::mbs_pool_path_missing(&terms_from_text(text).unwrap_or_default(), path)
+            }
+            InstrumentType::Tba => {
+                debt::tba_path_missing(&terms_from_text(text).unwrap_or_default(), path)
+            }
+            InstrumentType::CmoTranche => {
+                debt::cmo_tranche_path_missing(&terms_from_text(text).unwrap_or_default(), path)
+            }
+            _ => debt::certificate_of_deposit_path_missing(
+                &terms_from_text(text).unwrap_or_default(),
+                path,
+            ),
+        };
+    }
     match kind {
         InstrumentType::ListedOption | InstrumentType::FutureOption => {
             let Some(terms) = listed_option_from_text(text) else {
@@ -131,6 +191,13 @@ pub fn class_of(kind: InstrumentType) -> Option<AssetClass> {
             Some(AssetClass::Derivative)
         }
         InstrumentType::Commodity => Some(AssetClass::Referential),
+        // Contract v29, fixed income (ruling 676): the five debt templates'
+        // types, each under debt.
+        InstrumentType::Bond
+        | InstrumentType::MbsPool
+        | InstrumentType::Tba
+        | InstrumentType::CmoTranche
+        | InstrumentType::CertificateOfDeposit => Some(AssetClass::Debt),
     }
 }
 
@@ -168,13 +235,18 @@ pub fn words(kind: InstrumentType) -> &'static str {
         InstrumentType::Future => "future",
         InstrumentType::FutureOption => "future option",
         InstrumentType::Commodity => "commodity",
+        InstrumentType::Bond => "bond",
+        InstrumentType::MbsPool => "MBS pool",
+        InstrumentType::Tba => "TBA",
+        InstrumentType::CmoTranche => "CMO tranche",
+        InstrumentType::CertificateOfDeposit => "certificate of deposit",
     }
 }
 
 /// Every type the list holds, in its order: what a refusal lists. From
 /// contract v27 the referential types too (W1.1), which the platform seeds
 /// and no deployment's form offers.
-pub const TYPES: [InstrumentType; 9] = [
+pub const TYPES: [InstrumentType; 14] = [
     InstrumentType::MoneyMarketFund,
     InstrumentType::BinaryEventContract,
     InstrumentType::InterestRate,
@@ -184,6 +256,11 @@ pub const TYPES: [InstrumentType; 9] = [
     InstrumentType::Future,
     InstrumentType::FutureOption,
     InstrumentType::Commodity,
+    InstrumentType::Bond,
+    InstrumentType::MbsPool,
+    InstrumentType::Tba,
+    InstrumentType::CmoTranche,
+    InstrumentType::CertificateOfDeposit,
 ];
 
 /// A type by its name without the prefix, in lower case

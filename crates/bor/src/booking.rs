@@ -282,6 +282,15 @@ pub struct Executed {
     pub value_date: String,
     /// The price's money, naming its currency, which the cash moves in.
     pub price: Money,
+    /// Contract v29 (W11.27; ruling 991): a pool's or a tranche's fills'
+    /// factor -- stated, or taken by the book -- what the sale's reliefs
+    /// record proceeds at; and the factor month a provisional one awaits
+    /// (992). None and empty on any other.
+    pub factor: Option<Exact>,
+    pub factor_month_awaited: String,
+    /// Contract v29 (W11.11): a fill's settlement date not yet known, so
+    /// the booking's lines dated nothing stay pending.
+    pub settlement_date_unknown: bool,
 }
 
 fn value_date_of(execution: &Execution) -> String {
@@ -326,16 +335,31 @@ pub fn executed(book: &Book, ctx: &Context, execution_ids: &[String]) -> Result<
             .ok_or_else(|| malformed(&["price"], format!("execution {id} states no price")))?;
         let unit = numbers::amount("execution.price", &price)?;
         out.quantity = numbers::add("executed quantity", out.quantity, quantity)?;
-        out.gross = numbers::add(
-            "executed gross",
-            out.gross,
-            // Contract v28 (559): a series' fill grossed by its multiplier.
-            orders::multiply(
-                "gross",
-                orders::multiply("gross", quantity, unit)?,
-                ctx.multiplier(&execution.instrument_id),
-            )?,
+        let held = book.ledger.executions.get(&execution.execution_id);
+        let factor = held.map_or(execution.factor_used, |held| held.factor());
+        // Contract v28 (559): a series' fill grossed by its multiplier.
+        let gross = orders::multiply(
+            "gross",
+            orders::multiply("gross", quantity, unit)?,
+            // Contract v29 (986, 987): per 100 of face, a pool's at
+            // its factor -- stated, or taken by the book for it.
+            ctx.fill_multiplier(&execution.instrument_id, factor.as_ref()),
         )?;
+        // Contract v29 (993): a pool's or a tranche's fill's cash is to the
+        // cent, half-even, fill by fill, as its own lines moved it.
+        let gross = if ctx.is_pooled(&execution.instrument_id) {
+            numbers::cents("gross", gross)?
+        } else {
+            gross
+        };
+        out.gross = numbers::add("executed gross", out.gross, gross)?;
+        if out.factor.is_none() {
+            out.factor = factor.as_ref().and_then(|f| Exact::from_wire(f).ok());
+        }
+        if let Some(held) = held.filter(|held| !held.factor_row.awaited.is_empty()) {
+            out.factor_month_awaited = held.factor_row.awaited.clone();
+        }
+        out.settlement_date_unknown |= execution.settlement_date_unknown;
         for fee in &execution.fees {
             let amount = fee
                 .amount
@@ -474,6 +498,62 @@ fn is_error_account(ctx: &Context, book: &Book, account_id: &str) -> bool {
 /// Each allocation held to who may receive it, and its own fields: an account
 /// the instruction names or one marked an error account; an error-account
 /// allocation's reason and cause, text with other (W11.27).
+/// Contract v29 (W11.27; rulings 710 to 714, 720, 751): a customer leg's
+/// reporting fields, refused naming the field where they do not hold: a
+/// markup with no prevailing market price (751) and a mixed capacity (714).
+fn reporting_fields_hold(field: &str, allocation: &Allocation) -> Result<()> {
+    if allocation.markup.is_some() && allocation.prevailing_market_price.is_none() {
+        return Err(malformed(
+            &[&format!("{field}.prevailing_market_price")],
+            "a markup is stated over the prevailing market price it was taken from (751)",
+        ));
+    }
+    if allocation.capacity == meridian_domain::v1::Capacity::Mixed as i32 {
+        return Err(malformed(
+            &[&format!("{field}.capacity")],
+            "an allocation carries one capacity, never mixed (714)",
+        ));
+    }
+    Ok(())
+}
+
+/// Contract v29 (988): an allocation's accrued interest, its own cash line
+/// in the allocation's account, paid on a purchase and received on a sale,
+/// pending to the settlement date: settlement is principal plus accrued.
+#[allow(clippy::too_many_arguments)]
+fn accrued_lines(
+    book: &Book,
+    ctx: &Context,
+    allocation: &Allocation,
+    buy: bool,
+    date: &str,
+    sleeve: &str,
+    trade_date: &str,
+    method: LotReliefMethod,
+    earlier: &[MovementLine],
+) -> Result<Vec<MovementLine>> {
+    let Some(accrued) = allocation.accrued_interest.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let value = numbers::amount("accrued_interest", accrued)?;
+    if value.is_zero() {
+        return Ok(Vec::new());
+    }
+    currency_lines(
+        book,
+        ctx,
+        &cash_instrument(accrued)?,
+        if buy { value.negated() } else { value },
+        date,
+        sleeve,
+        trade_date,
+        None,
+        method,
+        &[],
+        earlier,
+    )
+}
+
 fn allocations_hold(
     book: &Book,
     ctx: &Context,
@@ -510,6 +590,7 @@ fn allocations_hold(
                 "an allocation states the average price its confirmation states",
             ));
         }
+        reporting_fields_hold(&field, allocation)?;
         let error = is_error_account(ctx, book, &allocation.account_id);
         if !error && !instructed.contains(&allocation.account_id) {
             return Err(StoreError::Refused {
@@ -802,6 +883,24 @@ fn booking_lines(
                 seen.extend(reopened.iter().cloned());
                 made.extend(reopened);
             }
+            // Contract v29 (988): the accrued, its own cash line.
+            let accrued = accrued_lines(
+                book,
+                ctx,
+                allocation,
+                buy,
+                if allocation.intended_settlement_date.is_empty() {
+                    &date
+                } else {
+                    &allocation.intended_settlement_date
+                },
+                &allocation.sleeve,
+                &executed.trade_date,
+                method,
+                &seen,
+            )?;
+            seen.extend(accrued.iter().cloned());
+            made.extend(accrued);
         } else {
             // Out of this account: the opposite of what the fills moved.
             let delta = if buy { quantity.negated() } else { quantity };
@@ -858,6 +957,9 @@ fn booking_lines(
             }
         }
         lines.extend(made);
+    }
+    if executed.settlement_date_unknown {
+        crate::order_decide::undated_pending(&mut lines);
     }
     Ok(lines)
 }
@@ -944,6 +1046,11 @@ fn received_lines(
         )?;
         lines.extend(moved);
     }
+    // Contract v29 (988): the accrued, its own cash line.
+    let accrued = accrued_lines(
+        book, ctx, allocation, buy, &date, &sleeve, trade_date, method, &lines,
+    )?;
+    lines.extend(accrued);
     Ok(lines)
 }
 
@@ -1234,6 +1341,23 @@ pub fn book_order(
             } else {
                 None
             };
+            // Contract v29 (W11.27; ruling 991): no allocation field carries
+            // a factor, so a pool's booking is at its fills' -- each
+            // override stated agreeing.
+            if let (Some(a), Some(b)) = (&first.factor_used, &execution.factor_used) {
+                let read = |d: &meridian_pb::v1::Decimal| Exact::from_wire(d).ok();
+                if read(a) != read(b) {
+                    return Err(malformed(
+                        &[&field, "factor_used"],
+                        format!(
+                            "execution {id} states factor_used {} and execution {} states {}:                              a booking's sale or purchase is at one factor, derived from its                              fills, and its fills' overrides conflict (991)",
+                            read(b).map(|f| f.to_string()).unwrap_or_default(),
+                            first.execution_id,
+                            read(a).map(|f| f.to_string()).unwrap_or_default()
+                        ),
+                    ));
+                }
+            }
             if let Some(what) = differs {
                 return Err(malformed(
                     &[&field],
@@ -1586,6 +1710,12 @@ pub struct ChildMove {
     pub side: i32,
     pub trade_date: String,
     pub value_date: String,
+    /// Contract v29 (rulings 991, 992): the fills' factor, as exact decimal
+    /// text, and the month a provisional one awaits; empty where none.
+    pub factor: String,
+    pub factor_month_awaited: String,
+    /// Contract v29 (W11.11): the fills' settlement date not yet known.
+    pub settlement_date_unknown: bool,
 }
 
 /// Each allocation of a booking to another account, as its child entry
@@ -1624,6 +1754,12 @@ pub fn child_moves(book: &Book, booking_id: &str, ctx: &Context) -> Result<Vec<C
             side: executed.side,
             trade_date: executed.trade_date.clone(),
             value_date: executed.value_date.clone(),
+            factor: executed
+                .factor
+                .map(|factor| factor.to_string())
+                .unwrap_or_default(),
+            factor_month_awaited: executed.factor_month_awaited.clone(),
+            settlement_date_unknown: executed.settlement_date_unknown,
         });
     }
     Ok(out)
@@ -1645,7 +1781,7 @@ pub fn receive_allocation(
     if book.ledger.received.contains_key(&key) {
         return Ok(None);
     }
-    let lines = received_lines(
+    let mut lines = received_lines(
         book,
         ctx,
         &moved.allocation,
@@ -1655,6 +1791,9 @@ pub fn receive_allocation(
         &moved.value_date,
         false,
     )?;
+    if moved.settlement_date_unknown {
+        crate::order_decide::undated_pending(&mut lines);
+    }
     let mut plan = Plan::new(
         ALLOCATION_MOVED,
         ctx.actor(),
@@ -1664,6 +1803,8 @@ pub fn receive_allocation(
             allocation: moved.allocation.clone(),
             member_order_id: moved.member_order_id.clone(),
             lines: (0, lines.len()),
+            factor: moved.factor.clone(),
+            factor_month_awaited: moved.factor_month_awaited.clone(),
         }],
     )
     .reason(&format!(

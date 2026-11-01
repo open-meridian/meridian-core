@@ -158,6 +158,27 @@ pub fn plan(case: &Case, index: usize) -> Result<Planned> {
                 Vec::new()
             }
         }
+        // Contract v29 (W12.1): a debt measure is one unit per account over
+        // its debt positions; the curve one unit for the job.
+        name if crate::bonds::measures::is_position_measure(name) => {
+            preamble.not_evaluated = unknown(definition.breakdowns);
+            if preamble.not_evaluated.is_empty() {
+                per_account()
+            } else {
+                Vec::new()
+            }
+        }
+        "treasury_curve" => {
+            preamble.not_evaluated = unknown(definition.breakdowns);
+            if preamble.not_evaluated.is_empty() {
+                vec![Unit {
+                    measure: index,
+                    account: None,
+                }]
+            } else {
+                Vec::new()
+            }
+        }
         other => return Err(CaseError(format!("no computation for {other}"))),
     };
     Ok(Planned { preamble, units })
@@ -182,6 +203,10 @@ pub fn compute(case: &Case, unit: &Unit) -> Result<Part> {
             part = crate::chains::compute(case, key, definition)?
         }
         "scenario_grid" => part = crate::chains::scenario_grid(case, key, definition, account)?,
+        name if crate::bonds::measures::is_position_measure(name) => {
+            part = crate::bonds::measures::compute(case, key, definition, account)?
+        }
+        "treasury_curve" => part = crate::bonds::measures::treasury_curve(case, key, definition)?,
         other => return Err(CaseError(format!("no computation for {other}"))),
     }
     Ok(part)

@@ -461,7 +461,7 @@ LICENCE = {
     "version": 1,
     "schemes": [s for s in (os.environ.get("HARNESS_LICENCE")
                             or "figi,lei,ticker_and_venue,caip19,iso4217,sec_series,sec_class,"
-                               "administrator_symbol,cik").split(",") if s],
+                               "administrator_symbol,cik,agency_pool").split(",") if s],
     "pace": {"batch_size": 100, "batches_per_minute": 6},
     "administrators": ["nyfed", "frb", "ecb", "ustreasury"],
 }
@@ -534,6 +534,77 @@ TEMPLATES.append({**TEMPLATES[0], "template_id": "TPL-fund", "name": "ETF and mu
                   "asset_class": "fund",
                   "match_rule": ["share_class_figi", "composite_figi", "figi", "ticker",
                                  "sec_series", "sec_class"]})
+# Contract v29 (W1.1, W1.24; rulings 676 to 680): the bond and pool
+# templates with their requirement levels, and the debt records its sources
+# confirm -- a corporate by its FIGI, minted with its calls still to read
+# from the pricing supplement (the plan's risk 3), its own record saying so,
+# and an agency pool by its pool number under the open scheme agency_pool,
+# its agency in source (677). The deployment's CUSIP for either is never
+# heard (W3.25).
+def debt_field(path, requirement, repeated=False):
+    return {"path": path, "type": "text", "requirement": requirement, "repeated": repeated}
+
+
+TEMPLATES += [
+    {"template_id": "TPL-bond", "template_version": "1", "name": "Bond", "asset_class": "debt",
+     "instrument_type": "bond", "base": False, "calculation": "",
+     "fields": [debt_field(path, "mint") for path in (
+         "identifiers", "description", "currency", "instrument_type", "security_type",
+         "issuer_company_id", "issuer_type", "issue_date", "maturity_date", "coupon_rate",
+         "coupon_type", "coupon_frequency", "day_count")]
+     + [debt_field(path, "complete") for path in (
+         "dated_date", "first_coupon_date", "business_day_convention", "payment_calendar_id")]
+     + [debt_field("calls", "complete", True), debt_field("puts", "optional", True),
+        debt_field("governing_law", "optional")],
+     "match_rule": ["figi"]},
+    {"template_id": "TPL-mbs-pool", "template_version": "1", "name": "Agency MBS pool",
+     "asset_class": "debt", "instrument_type": "mbs_pool", "base": False, "calculation": "",
+     "fields": [debt_field(path, "mint") for path in (
+         "identifiers", "description", "currency", "instrument_type", "agency", "program",
+         "pool_number", "pass_through_rate", "issue_date", "maturity_date")]
+     + [debt_field(path, "complete") for path in (
+         "original_face", "day_count", "payment_delay_days", "payment_day", "record_date_rule")],
+     "match_rule": ["agency_pool", "figi"]},
+]
+BONDS = {
+    "BBG01BOND0001": {
+        "instrument_id": "INS-01JBOND00000000000000000001",
+        "identifiers": [{"scheme": "figi", "value": "BBG01BOND0001", "source": ""}],
+        "asset_class": "debt", "instrument_type": "bond", "currency": "USD",
+        "description": "Harness Corp 4.875% 2036-02-05",
+        "lifecycle_state": "INSTRUMENT_LIFECYCLE_STATE_ACTIVE", "version": 1,
+        "template_id": "TPL-bond", "template_version": "1",
+        "bond": {
+            "security_type": "DEBT_SECURITY_TYPE_CORP",
+            "issuer_company_id": "ENT-01JC29HARNESSCORP00000001",
+            "issuer_type": "ISSUER_TYPE_CORPORATE", "country_of_issue": "US",
+            "issue_date": "2026-02-05", "dated_date": "2026-02-05",
+            "first_coupon_date": "2026-08-05", "maturity_date": "2036-02-05",
+            "coupon_rate": "4.875", "coupon_type": "COUPON_TYPE_FIXED", "coupon_frequency": 2,
+            "day_count": "DAY_COUNT_THIRTY_360_BOND_BASIS",
+            "business_day_convention": "BUSINESS_DAY_CONVENTION_FOLLOWING",
+            "minimum_denomination": "2000", "denomination_increment": "1000",
+            "seniority": "SENIORITY_SENIOR", "calls": []},
+        "missing_fields": ["calls"],
+    },
+}
+POOLS = {
+    ("MA5123", "FNMA"): {
+        "instrument_id": "INS-01JPOOL00000000000000000001",
+        "identifiers": [{"scheme": "agency_pool", "value": "MA5123", "source": "FNMA"}],
+        "asset_class": "debt", "instrument_type": "mbs_pool", "currency": "USD",
+        "description": "FNMA CL MA5123 5.5",
+        "lifecycle_state": "INSTRUMENT_LIFECYCLE_STATE_ACTIVE", "version": 1,
+        "template_id": "TPL-mbs-pool", "template_version": "1",
+        "mbs_pool": {
+            "agency": "MORTGAGE_AGENCY_FNMA", "program": "CL", "pool_number": "MA5123",
+            "pass_through_rate": "5.5", "issue_date": "2023-09-01",
+            "maturity_date": "2053-09-01", "original_face": "1250000000",
+            "original_term_months": 360, "day_count": "DAY_COUNT_THIRTY_360_BOND_BASIS",
+            "payment_delay_days": 55, "payment_day": 25,
+            "record_date_rule": "RECORD_DATE_RULE_LAST_DAY_OF_PRIOR_MONTH"},
+    },
+}
 # FIGIs the platform's source confirms and mints from, and those it cannot:
 # a near match, minted and flagged; anything else, its staff's queue.
 MINTS = {f for f in (os.environ.get("HARNESS_PLATFORM_MINTS") or "BBG00NEWMINT1,BBG00NEWMINT2").split(",") if f}
@@ -701,6 +772,13 @@ def match_or_mint(asked):
             break
         if scheme in ("figi", "share_class_figi") and value in MINTS:
             answer = {"minted": True, "instrument": minted_record(value)}
+            break
+        # Contract v29: a bond by its FIGI, a pool by its agency's number.
+        if scheme == "figi" and value in BONDS:
+            answer = {"minted": True, "instrument": BONDS[value]}
+            break
+        if scheme == "agency_pool" and (value, identifier.get("source", "")) in POOLS:
+            answer = {"minted": True, "instrument": POOLS[(value, identifier.get("source", ""))]}
             break
     if key:
         ANSWERS[key] = answer

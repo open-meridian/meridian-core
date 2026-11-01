@@ -134,6 +134,22 @@ enum InstrumentType {
   // Contract v28: Under referential: a commodity a future is written on, never
   // held.
   INSTRUMENT_TYPE_COMMODITY = 9;
+  // Contract v29: under debt: a bond -- a Treasury, a STRIPS component, an
+  // agency debenture or discount note, a corporate, a municipal; FIX
+  // SecurityType (167) a field of Bond.
+  INSTRUMENT_TYPE_BOND = 10;
+  // Contract v29: under debt: an agency pass-through pool, with the attributes
+  // of MbsPool; its factor the lake's.
+  INSTRUMENT_TYPE_MBS_POOL = 11;
+  // Contract v29: under debt: an agency TBA by program, coupon, term and
+  // settlement month, with the attributes of Tba.
+  INSTRUMENT_TYPE_TBA = 12;
+  // Contract v29: under debt: an agency REMIC class, with the attributes of
+  // CmoTranche.
+  INSTRUMENT_TYPE_CMO_TRANCHE = 13;
+  // Contract v29: under debt: a brokered certificate of deposit, with the
+  // attributes of CertificateOfDeposit.
+  INSTRUMENT_TYPE_CERTIFICATE_OF_DEPOSIT = 14;
 }
 
 // A binary event contract's attributes (contract v19; plans/the-lake-prices-
@@ -236,6 +252,13 @@ enum LiquidityFeeRegime {
 // identifier is only meaningful alongside its source, which is why `source` is
 // present and why a bare symbol can never drive a global resolve.
 message Identifier {
+  // Contract v29 (677): agency_pool, an open scheme, names an agency pool by
+  // the agency's pool number, the agency in source (FNMA, FHLMC, GNMA); a
+  // debt record matches on figi and agency_pool, and its cusip and isin stay
+  // deployment-side, mapped to FIGI at the edge. Contract v29 (715): mpid,
+  // clearing_number, branch_sequence and finra_symbol name market
+  // participants and a security for trade reports, finra_symbol
+  // deployment-side (745).
   string scheme = 1;
   string value = 2;
 
@@ -379,6 +402,22 @@ message InstrumentRecord {
   // Contract v28: one contract month's full terms. Unset unless the record's
   // type is future.
   FutureContract future = 23;
+  // Contract v29: a bond's terms: a Treasury, STRIPS component, agency,
+  // corporate, municipal or (booked, not minted) SSA bond (676). Unset unless
+  // the record's type is bond.
+  Bond bond = 24;
+  // Contract v29: an agency pool's terms (680). Unset unless the record's type
+  // is mbs_pool.
+  MbsPool mbs_pool = 25;
+  // Contract v29: an agency TBA's terms (681). Unset unless the record's type
+  // is tba.
+  Tba tba = 26;
+  // Contract v29: an agency REMIC class's terms (682, 588). Unset unless the
+  // record's type is cmo_tranche.
+  CmoTranche cmo_tranche = 27;
+  // Contract v29: a brokered CD's terms (676). Unset unless the record's type
+  // is certificate_of_deposit.
+  CertificateOfDeposit certificate_of_deposit = 28;
 }
 
 // Which value of a deployment's instrument record (W3, contract v10).
@@ -1774,6 +1813,11 @@ message TradingSession {
   uint32 end_minute = 3;
   // An extended session: pre-market or after-hours.
   bool extended = 4;
+  // Contract v29: a plain date, as CalendarWeekend.valid_from_date says a
+  // weekend's: a session's hours that changed are two rows, each from its date,
+  // so a backfill to 2016 states the hours in force then (FINRA's 08:00 to
+  // 20:00 among them). Empty: in force since the calendar's coverage began.
+  string valid_from_date = 5;
 }
 
 // One dated day's sessions, in place of the weekday's.
@@ -2373,7 +2417,9 @@ message SecurityTemplate {
   // Each by its path, its type and whether it is required.
   repeated TemplateField fields = 8;
   // The identifier schemes it matches on, each by its scheme's spelling,
-  // share_class_figi first.
+  // share_class_figi first. Contract v29 (677): a debt template matches on
+  // figi and agency_pool, the terms (issuer, coupon, maturity) checked on
+  // mint, a disagreement a near-match.
   repeated string match_rule = 9;
   // Contract v26 (W1.24; the intent's rulings 9 and 11; the v26 plan's
   // question 225): its calculation package, declarative data; unset on a
@@ -2968,4 +3014,575 @@ message MatchOrMintCompanyReply {
   // In the staff's queue: a source that does not confirm it, or a natural
   // person's CIK, which is never minted.
   bool pending_review = 3;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The debt templates (contract v29; sdk-contract/fixed-income-contract,
+// plans/the-v29-build Track A, rulings 676 to 682; W1.24): bond, mbs_pool,
+// tba, cmo_tranche and certificate_of_deposit, after FIX's instrument block
+// where it has a tag. A debt record's quantity is face in its currency's
+// major unit, original face for a pool, a TBA and a tranche.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Contract v29 (InstrumentRecord.bond; 676): a bond's terms -- a Treasury, a
+// STRIPS component, an agency debenture or discount note, a corporate, a
+// municipal, or (booked, not minted) an SSA bond -- with FIX SecurityType (167)
+// a field.
+message Bond {
+  // One of FIX's debt values, so one template carries every bond as FIX carries
+  // every debt type in one instrument block (676). Never unspecified on a
+  // record.
+  DebtSecurityType security_type = 1;
+  // The issuer's ENT- company record (W1.32); a STRIPS component's is its whole
+  // bond's issuer. Never empty on a record.
+  string issuer_company_id = 2;
+  // One of six values, mapped to CDM's CollateralEntityTypeEnum; municipal and
+  // sub-sovereign held apart because MSRB's rules and tax status follow
+  // municipal. Never unspecified on a record.
+  IssuerType issuer_type = 3;
+  // The guarantor's ENT- company record. Empty where none guarantees it.
+  string guarantor_company_id = 4;
+  // An ISO 3166-1 alpha-2 country code, or ISO 3166-2 for a state: US-NY. Empty
+  // where the platform's source states none.
+  string governing_law = 5;
+  // States where the bond was issued (FIX CountryOfIssue, 470): an ISO 3166-1
+  // alpha-2 code. Empty until the platform's source states it.
+  string country_of_issue = 6;
+  // An ISO 3166-2 subdivision code without its country: NY. Empty on a bond
+  // issued under no state.
+  string state_or_province_of_issue = 7;
+  // A plain date; a trade before it is when-issued (the reporting intent's
+  // derived row). Never empty on a record.
+  string issue_date = 8;
+  // States the date interest accrues from (FIX DatedDate, 873): a plain date.
+  // Empty until the source states it; a zero coupon's is its issue date.
+  string dated_date = 9;
+  // A plain date; a short or long first period follows from it and the dated
+  // date. Empty on a zero coupon.
+  string first_coupon_date = 10;
+  // States when principal is repaid (FIX MaturityDate, 541): a plain date,
+  // unadjusted. Never empty on a record.
+  string maturity_date = 11;
+  // The annual rate; on a floater the current period's rate is the engine's,
+  // never stored here. 0 on a zero coupon; on a when-issued Treasury empty
+  // until the auction, the record incomplete listing it, filled as a dated term
+  // version (decisions/034).
+  Decimal coupon_rate = 12;
+  // States how the coupon is set (FIX CouponType, 1946): fixed, floating, zero
+  // or step. Never unspecified on a record.
+  CouponType coupon_type = 13;
+  // Payments a year: 2 semi-annual, 12 monthly. 0 on a zero coupon.
+  uint32 coupon_frequency = 14;
+  // One of FIX 1950's values, its variant exact: a corporate's 30/360 bond
+  // basis, a Treasury's actual/actual ICMA. Never unspecified on a record;
+  // DAY_COUNT_ACT_ACT and DAY_COUNT_THIRTY_360, which name no variant, are
+  // refused here.
+  DayCount day_count = 15;
+  // Following unless the terms say otherwise; accrual stays unadjusted.
+  // Unspecified until stated.
+  BusinessDayConvention business_day_convention = 16;
+  // A CAL- calendar: the SIFMA US government securities calendar for a Treasury
+  // or an agency. Empty until stated.
+  string payment_calendar_id = 17;
+  // True where a coupon date on a month's last day stays on each month's last
+  // day. False: dates keep their day of month.
+  bool end_of_month = 18;
+  // The rule, its days in record_date_days. Unspecified until stated.
+  RecordDateRule record_date_rule = 19;
+  // Days before the payment date, as the rule counts them. 0 where the rule
+  // needs no days.
+  uint32 record_date_days = 20;
+  // Face, in the record's currency. Unset until stated.
+  Decimal minimum_denomination = 21;
+  // Face, in the record's currency. Unset until stated.
+  Decimal denomination_increment = 22;
+  // Face, in the record's currency, at issue. Unset where not stated.
+  Decimal original_issue_amount = 23;
+  // Secured, senior or subordinated. Unspecified where not stated.
+  Seniority seniority = 24;
+  // True where sold under SEC Rule 144A. False: not a Rule 144A issue, or not
+  // stated.
+  bool rule_144a = 25;
+  // True where sold under SEC Regulation S. False: not a Regulation S issue, or
+  // not stated.
+  bool reg_s = 26;
+  // Its index, spread, multiplier, cap, floor, reset and lookback. Unset unless
+  // the coupon type is floating; refused set otherwise.
+  FloatingRateTerms floating = 27;
+  // A referential index record: CPI-U for TIPS (31 CFR 356, Appendix B). Empty
+  // unless the security type is TIPS.
+  string inflation_index_instrument_id = 28;
+  // The reference CPI the index ratio is taken against. Unset unless the
+  // security type is TIPS.
+  Decimal base_index_level = 29;
+  // States a step-up's rates by date: each row a rate from its date. None
+  // unless the coupon type is step.
+  repeated CouponStep coupon_steps = 30;
+  // Each row a window: kind, dates, price or make-whole spread, notice and
+  // style; yield to worst reads every row. None on a bond the issuer may not
+  // call; a callable bond minted without them is incomplete, listing them (the
+  // plan's risk 3).
+  repeated RedemptionWindow calls = 31;
+  // States the holder's put schedule (679): each row a window, as calls. None
+  // on a bond with no put.
+  repeated RedemptionWindow puts = 32;
+  // Each row a date, the face redeemed and its price. None on a bond with no
+  // mandatory sinking fund.
+  repeated SinkingFundPayment sinking_funds = 33;
+  // Its tax status, bank qualification, obligor, insurer and refunding. Unset
+  // on a bond that is no municipal.
+  MunicipalTerms municipal = 34;
+  // The whole bond's INS- record, a term on the record and never inferred.
+  // Empty unless the security type is TINT or TPRN.
+  string stripped_from = 35;
+}
+
+// Contract v29: a floater's terms -- its index, spread, multiplier, cap, floor,
+// reset and lookback (ARRC's in-arrears convention) -- on a bond or a tranche.
+message FloatingRateTerms {
+  // A referential record: SOFR, the 13-week bill's high rate (a Treasury FRN),
+  // EFFR. Never empty when the terms are set.
+  string index_instrument_id = 1;
+  // Signed, added to the index times the multiplier. 0 is a value.
+  Decimal spread_bps = 2;
+  // Signed: negative on an inverse floater. Unset: 1.
+  Decimal multiplier = 3;
+  // States the most the rate may be: the cap. Unset: no cap.
+  optional Decimal cap_rate = 4;
+  // States the least the rate may be: the floor. Unset: no floor; 0 is a value
+  // (a Treasury FRN's floor).
+  optional Decimal floor_rate = 5;
+  // Resets a year: 52 for a Treasury FRN's weekly reset, 4 quarterly. 0 until
+  // stated.
+  uint32 reset_frequency = 6;
+  // Business days before each accrual day. 0: no lookback.
+  uint32 lookback_days = 7;
+  // True for a SOFR in-arrears floater. False: set in advance.
+  bool in_arrears = 8;
+}
+
+// Contract v29: one row of a step-up bond's schedule (574's repeated group).
+message CouponStep {
+  // States when a step's rate starts: a plain date. Never empty.
+  string from_date = 1;
+  // The annual rate from from_date. Never unset.
+  Decimal coupon_rate = 2;
+}
+
+// Contract v29 (679, 747): one row of a call or put schedule, as US
+// prospectuses state optional redemption: its kind, dates, price or the
+// make-whole's spread and benchmark, notice and style. One message for calls
+// and puts.
+message RedemptionWindow {
+  // Make-whole, par, premium or sinking fund; a put's is par or premium. Never
+  // unspecified.
+  RedemptionKind kind = 1;
+  // A plain date, inclusive: the par call date opens the par window. Never
+  // empty.
+  string from_date = 2;
+  // States when the window closes: a plain date, inclusive. Empty: to maturity.
+  string to_date = 3;
+  // Per 100 of face, before accrued. Unset on a make-whole window.
+  optional Decimal price = 4;
+  // Added to the benchmark to discount remaining payments, semi-annually on
+  // 30/360, to the par call date (R2). Unset unless the kind is make-whole.
+  optional Decimal make_whole_spread_bps = 5;
+  // A rate_curve record: the H.15 Treasury constant maturities, interpolated to
+  // the par call date. Empty unless the kind is make-whole.
+  string make_whole_benchmark_instrument_id = 6;
+  // Calendar days before the redemption date. 0 where not stated.
+  uint32 notice_days_min = 7;
+  // Calendar days before the redemption date. 0 where not stated.
+  uint32 notice_days_max = 8;
+  // One date, each coupon date, or any business day. Never unspecified.
+  RedemptionStyle style = 9;
+}
+
+// Contract v29 (679): one mandatory sinking-fund redemption.
+message SinkingFundPayment {
+  // States a mandatory redemption's date: a plain date. Never empty.
+  string date = 1;
+  // Face, in the record's currency. Never unset.
+  Decimal face_amount = 2;
+  // States the sinking-fund price: per 100 of face. Unset: par.
+  Decimal price = 3;
+}
+
+// Contract v29: a municipal bond's terms, an optional group on bond (676).
+message MunicipalTerms {
+  // States the federal tax status: exempt or taxable. Unspecified until stated.
+  FederalTaxStatus federal_tax_status = 1;
+  // True where interest is a preference item for the AMT. False: not subject to
+  // the alternative minimum tax, or not stated.
+  bool subject_to_amt = 2;
+  // True where exempt in state_or_province_of_issue. False: not stated.
+  bool state_tax_exempt = 3;
+  // True where designated under IRC 265(b)(3). False: not bank qualified, or
+  // not stated.
+  bool bank_qualified = 4;
+  // Names the conduit obligor: the obligor's ENT- record. Empty unless a
+  // conduit issue.
+  string obligor_company_id = 5;
+  // Names the bond insurer: the insurer's ENT- record. Empty unless insured.
+  string insurer_company_id = 6;
+  // Set by a dated term version on the event (decisions/034), refunded_to_date
+  // with it. Unspecified: none.
+  RefundingStatus refunding_status = 7;
+  // States the date a pre-refunded bond is redeemed on: a plain date. Empty
+  // unless pre-refunded.
+  string refunded_to_date = 8;
+}
+
+// Contract v29 (InstrumentRecord.mbs_pool; 680): an agency pass-through pool's
+// terms. Its factor is the lake's Factor row (W10.4), never a term; lots stay
+// in original face.
+message MbsPool {
+  // Fannie Mae, Freddie Mac or Ginnie Mae. Never unspecified.
+  MortgageAgency agency = 1;
+  // As the agency's disclosure names its prefix or program: UMBS 30-year,
+  // Ginnie Mae II. Never empty.
+  string program = 2;
+  // The agency's pool number, also the record's agency_pool identifier. Never
+  // empty.
+  string pool_number = 3;
+  // States the coupon passed to holders: the annual pass-through rate. Never
+  // unset.
+  Decimal pass_through_rate = 4;
+  // States the pool's issue date: a plain date. Never empty.
+  string issue_date = 5;
+  // States the pool's final payment date: a plain date. Never empty.
+  string maturity_date = 6;
+  // Face at issue; current face is original face times the latest Factor row
+  // (680). Unset until stated.
+  Decimal original_face = 7;
+  // States the loans' original term: months: 360, 180. 0 until stated.
+  uint32 original_term_months = 8;
+  // 30/360 bond basis for agency pools. Unspecified until stated.
+  DayCount day_count = 9;
+  // Days from the accrual period's start to payment: 55 for UMBS, 45 for Ginnie
+  // Mae I, 50 for Ginnie Mae II. 0 until stated.
+  uint32 payment_delay_days = 10;
+  // 25 for UMBS, 15 for Ginnie Mae I, 20 for Ginnie Mae II, rolled on the
+  // payment calendar. 0 until stated.
+  uint32 payment_day = 11;
+  // The last day of the month before the payment month for agency pools.
+  // Unspecified until stated.
+  RecordDateRule record_date_rule = 12;
+  // Names the payment calendar: a CAL- calendar. Empty until stated.
+  string payment_calendar_id = 13;
+}
+
+// Contract v29 (InstrumentRecord.tba; 681): an agency TBA by agency or program,
+// coupon, term and settlement month, held as a forward in original face until a
+// tba allocation record names the pools delivered.
+message Tba {
+  // Fannie Mae or Freddie Mac for a UMBS TBA (either delivers), Ginnie Mae for
+  // its own. Never unspecified.
+  MortgageAgency agency = 1;
+  // UMBS 30-year, UMBS 15-year, Ginnie Mae II 30-year. Never empty.
+  string program = 2;
+  // The pass-through rate the delivered pools carry. Never unset.
+  Decimal pass_through_rate = 3;
+  // States the term: 360 or 180. Never 0.
+  uint32 original_term_months = 4;
+  // YYYYMM; the settlement date is SIFMA's class date in it. Never empty.
+  string settlement_month = 5;
+  // Which of SIFMA's monthly class dates it settles on. Unspecified until
+  // stated.
+  SifmaSettlementClass sifma_class = 6;
+  // A plain date from SIFMA's calendar; pools are notified 48 hours before.
+  // Empty until SIFMA publishes the month's date.
+  string settlement_date = 7;
+}
+
+// Contract v29 (InstrumentRecord.cmo_tranche; 682, 588): an agency REMIC
+// class's terms, book-first: held, valued and paid down from the agency's
+// published factors. No waterfall model is held.
+message CmoTranche {
+  // Fannie Mae, Freddie Mac or Ginnie Mae (agency REMICs only, 588). Never
+  // unspecified.
+  MortgageAgency agency = 1;
+  // The series as the agency's prospectus supplement names it: 2024-12. Never
+  // empty.
+  string deal = 2;
+  // As the prospectus supplement names it: PA, Z, IO. Never empty.
+  string class_name = 3;
+  // Each as the supplement's principal-type column lists it. None until stated.
+  repeated PrincipalType principal_types = 4;
+  // Each as the supplement's interest-type column lists it; a Z's accretion and
+  // an IO's notional fall are accretion records (W9.16). None until stated.
+  repeated InterestType interest_types = 5;
+  // Face at issue, or an IO's original notional. Unset until stated.
+  Decimal original_face = 6;
+  // States a fixed class's coupon: the annual rate. 0 on a PO; unset on a
+  // floater, whose rate floating sets.
+  Decimal coupon_rate = 7;
+  // Carries a floater's index, multiplier, cap and floor: as on a bond. Unset
+  // unless a floater or an inverse floater.
+  FloatingRateTerms floating = 8;
+  // States the deal's closing date: a plain date. Never empty.
+  string issue_date = 9;
+  // States the class's final distribution date: a plain date. Empty until
+  // stated.
+  string maturity_date = 10;
+  // States the accrual basis: as the supplement states it. Unspecified until
+  // stated.
+  DayCount day_count = 11;
+  // Days from the accrual period's start to payment. 0: no delay (a floater
+  // often has none).
+  uint32 payment_delay_days = 12;
+  // Rolled on the payment calendar. 0 until stated.
+  uint32 payment_day = 13;
+  // States the class's record date rule: as the supplement states it.
+  // Unspecified until stated.
+  RecordDateRule record_date_rule = 14;
+  // States the record date's offset: days before the payment date. 0 where the
+  // rule needs none.
+  uint32 record_date_days = 15;
+}
+
+// Contract v29 (InstrumentRecord.certificate_of_deposit; 676): a brokered
+// certificate of deposit's terms.
+message CertificateOfDeposit {
+  // Its ENT- record, its FDIC certificate number an identifier there. Never
+  // empty.
+  string issuer_company_id = 1;
+  // States the issue date: a plain date. Never empty.
+  string issue_date = 2;
+  // States the maturity: a plain date. Never empty.
+  string maturity_date = 3;
+  // States the rate: the annual rate. 0 on a zero-coupon CD.
+  Decimal coupon_rate = 4;
+  // Payments a year. 0 on a CD paying at maturity.
+  uint32 coupon_frequency = 5;
+  // As the disclosure states it, often actual/365 fixed. Unspecified until
+  // stated.
+  DayCount day_count = 6;
+  // States how a payment date moves: following unless stated. Unspecified until
+  // stated.
+  BusinessDayConvention business_day_convention = 7;
+  // Names the payment calendar: a CAL- calendar. Empty until stated.
+  string payment_calendar_id = 8;
+  // Face, in the record's currency. Unset until stated.
+  Decimal minimum_denomination = 9;
+  // True where the disclosure states FDIC insurance, to the FDIC's limit per
+  // depositor and bank. False: not stated as insured.
+  bool deposit_insured = 10;
+  // States the bank's call schedule: each row a window. None on a non-callable
+  // CD.
+  repeated RedemptionWindow calls = 11;
+  // True where an estate may redeem at par on the holder's death. False: none,
+  // or not stated.
+  bool survivor_option = 12;
+}
+
+// Contract v29 (676): which kind of debt security a bond is, after FIX
+// SecurityType (167).
+enum DebtSecurityType {
+  // Refused.
+  DEBT_SECURITY_TYPE_UNSPECIFIED = 0;
+  // A US Treasury bill (FIX 167 TBILL), a zero coupon.
+  DEBT_SECURITY_TYPE_TBILL = 1;
+  // A US Treasury note (TNOTE).
+  DEBT_SECURITY_TYPE_TNOTE = 2;
+  // A US Treasury bond (TBOND).
+  DEBT_SECURITY_TYPE_TBOND = 3;
+  // A Treasury inflation-protected security (TIPS).
+  DEBT_SECURITY_TYPE_TIPS = 4;
+  // A floating rate note (FRN): a Treasury FRN indexed to the 13-week bill, or
+  // an agency or corporate floater.
+  DEBT_SECURITY_TYPE_FRN = 5;
+  // A STRIPS interest component (TINT), a zero coupon.
+  DEBT_SECURITY_TYPE_TINT = 6;
+  // A STRIPS principal component (TPRN), a zero coupon.
+  DEBT_SECURITY_TYPE_TPRN = 7;
+  // A US agency coupon debenture (FAC).
+  DEBT_SECURITY_TYPE_FAC = 8;
+  // A US agency discount note (FADN).
+  DEBT_SECURITY_TYPE_FADN = 9;
+  // A corporate bond (CORP).
+  DEBT_SECURITY_TYPE_CORP = 10;
+  // A Yankee bond: a USD bond of a foreign issuer registered in the US (YANK).
+  DEBT_SECURITY_TYPE_YANK = 11;
+  // A municipal general obligation bond (GO).
+  DEBT_SECURITY_TYPE_GO = 12;
+  // A municipal revenue bond (REV).
+  DEBT_SECURITY_TYPE_REV = 13;
+  // A supranational bond (SUPRA); booked, its minting and curation wait for USD
+  // EM (675).
+  DEBT_SECURITY_TYPE_SUPRA = 14;
+}
+
+// Contract v29 (587, 677): the issuer's class, mapped to CDM's
+// CollateralEntityTypeEnum.
+enum IssuerType {
+  // Refused.
+  ISSUER_TYPE_UNSPECIFIED = 0;
+  // A national government or its treasury: CDM SovereignCentralBank.
+  ISSUER_TYPE_SOVEREIGN = 1;
+  // A government agency or sponsored enterprise (FHLB, Farm Credit, Fannie Mae,
+  // Freddie Mac, TVA, Ginnie Mae): CDM QuasiGovernment.
+  ISSUER_TYPE_AGENCY = 2;
+  // A supranational entity: CDM SupraNational.
+  ISSUER_TYPE_SUPRANATIONAL = 3;
+  // A state, province or region issuing outside a municipal regime: CDM
+  // RegionalGovernment.
+  ISSUER_TYPE_SUB_SOVEREIGN = 4;
+  // A company: CDM Corporate.
+  ISSUER_TYPE_CORPORATE = 5;
+  // A US state or local issuer under MSRB's rules: CDM RegionalGovernment, held
+  // apart on purpose.
+  ISSUER_TYPE_MUNICIPAL = 6;
+}
+
+// Contract v29: how a coupon is set (FIX CouponType, 1946).
+enum CouponType {
+  // Refused.
+  COUPON_TYPE_UNSPECIFIED = 0;
+  // A fixed rate (FIX CouponType 1946 = 1, fixed rate).
+  COUPON_TYPE_FIXED = 1;
+  // An index plus a spread, reset by `floating` (1946 = 2, floating rate).
+  COUPON_TYPE_FLOATING = 2;
+  // No coupon: a bill, a STRIPS component, a zero (1946 = 0, zero).
+  COUPON_TYPE_ZERO = 3;
+  // Fixed rates stepping on dates in `coupon_steps` (1946 = 3, structured).
+  COUPON_TYPE_STEP = 4;
+}
+
+// Contract v29: a bond's claim rank (CDM DebtSeniorityEnum).
+enum Seniority {
+  // Not stated by the platform's source.
+  SENIORITY_UNSPECIFIED = 0;
+  // Secured: CDM DebtSeniorityEnum Secured.
+  SENIORITY_SECURED = 1;
+  // Senior unsecured: CDM Senior.
+  SENIORITY_SENIOR = 2;
+  // Subordinated: CDM Subordinated.
+  SENIORITY_SUBORDINATED = 3;
+}
+
+// Contract v29: how a payment's record date is set.
+enum RecordDateRule {
+  // Not stated: the record is incomplete, listing it.
+  RECORD_DATE_RULE_UNSPECIFIED = 0;
+  // Record_date_days calendar days before each payment date (a corporate's 15th
+  // of the month before).
+  RECORD_DATE_RULE_CALENDAR_DAYS_BEFORE_PAYMENT = 1;
+  // Record_date_days business days before each payment date, on the payment
+  // calendar.
+  RECORD_DATE_RULE_BUSINESS_DAYS_BEFORE_PAYMENT = 2;
+  // The last calendar day of the month before the payment month, as agency
+  // pools record holders.
+  RECORD_DATE_RULE_LAST_DAY_OF_PRIOR_MONTH = 3;
+}
+
+// Contract v29 (679): a redemption window's kind.
+enum RedemptionKind {
+  // Refused.
+  REDEMPTION_KIND_UNSPECIFIED = 0;
+  // The greater of par and the present value of the remaining payments at the
+  // benchmark plus a spread, to the par call date (a corporate's make-whole).
+  REDEMPTION_KIND_MAKE_WHOLE = 1;
+  // At par, 100.
+  REDEMPTION_KIND_PAR = 2;
+  // At a stated price above par, stepping down by row.
+  REDEMPTION_KIND_PREMIUM = 3;
+  // An optional redemption at the sinking-fund price, beside the mandatory
+  // schedule in sinking_funds.
+  REDEMPTION_KIND_SINKING_FUND = 4;
+}
+
+// Contract v29 (679): when in its window a redemption may be made.
+enum RedemptionStyle {
+  // Refused.
+  REDEMPTION_STYLE_UNSPECIFIED = 0;
+  // On from_date only.
+  REDEMPTION_STYLE_ONE_DATE = 1;
+  // On each coupon date from from_date to to_date.
+  REDEMPTION_STYLE_BERMUDAN = 2;
+  // On any business day from from_date to to_date, after its notice.
+  REDEMPTION_STYLE_CONTINUOUS = 3;
+}
+
+// Contract v29: a municipal's federal tax status.
+enum FederalTaxStatus {
+  // Not stated: the record is incomplete, listing it.
+  FEDERAL_TAX_STATUS_UNSPECIFIED = 0;
+  // Interest exempt from federal income tax.
+  FEDERAL_TAX_STATUS_EXEMPT = 1;
+  // Interest taxable federally (a taxable municipal).
+  FEDERAL_TAX_STATUS_TAXABLE = 2;
+}
+
+// Contract v29: a municipal's refunding, a dated term version on the event
+// (decisions/034).
+enum RefundingStatus {
+  // None stated.
+  REFUNDING_STATUS_UNSPECIFIED = 0;
+  // Pre-refunded: escrowed to a call date, refunded_to_date.
+  REFUNDING_STATUS_PRE_REFUNDED = 1;
+  // Escrowed to maturity.
+  REFUNDING_STATUS_ESCROWED_TO_MATURITY = 2;
+}
+
+// Contract v29: the agency of a pool, a TBA or a REMIC class.
+enum MortgageAgency {
+  // Refused.
+  MORTGAGE_AGENCY_UNSPECIFIED = 0;
+  // Fannie Mae.
+  MORTGAGE_AGENCY_FNMA = 1;
+  // Freddie Mac.
+  MORTGAGE_AGENCY_FHLMC = 2;
+  // Ginnie Mae.
+  MORTGAGE_AGENCY_GNMA = 3;
+}
+
+// Contract v29 (681): which of SIFMA's monthly class dates a TBA settles on.
+enum SifmaSettlementClass {
+  // Not stated: the record is incomplete, listing it.
+  SIFMA_SETTLEMENT_CLASS_UNSPECIFIED = 0;
+  // SIFMA class A: 30-year UMBS.
+  SIFMA_SETTLEMENT_CLASS_A = 1;
+  // SIFMA class B: 15-year UMBS and Ginnie Mae.
+  SIFMA_SETTLEMENT_CLASS_B = 2;
+  // SIFMA class C: 30-year Ginnie Mae.
+  SIFMA_SETTLEMENT_CLASS_C = 3;
+  // SIFMA class D: balloons and ARMs.
+  SIFMA_SETTLEMENT_CLASS_D = 4;
+}
+
+// Contract v29 (682): a REMIC class's principal type, as the prospectus
+// supplement's principal-type column lists it.
+enum PrincipalType {
+  // Refused.
+  PRINCIPAL_TYPE_UNSPECIFIED = 0;
+  // Sequential pay.
+  PRINCIPAL_TYPE_SEQUENTIAL = 1;
+  // Planned amortization class.
+  PRINCIPAL_TYPE_PAC = 2;
+  // Targeted amortization class.
+  PRINCIPAL_TYPE_TAC = 3;
+  // Support (companion) class.
+  PRINCIPAL_TYPE_SUPPORT = 4;
+  // Notional: no principal, an IO's balance a notional amount.
+  PRINCIPAL_TYPE_NOTIONAL = 5;
+}
+
+// Contract v29 (682): a REMIC class's interest type, as the prospectus
+// supplement's interest-type column lists it.
+enum InterestType {
+  // Refused.
+  INTEREST_TYPE_UNSPECIFIED = 0;
+  // Fixed rate.
+  INTEREST_TYPE_FIXED = 1;
+  // Floating rate, by `floating`.
+  INTEREST_TYPE_FLOATER = 2;
+  // Inverse floater: a negative multiplier in `floating`.
+  INTEREST_TYPE_INVERSE_FLOATER = 3;
+  // Interest only.
+  INTEREST_TYPE_IO = 4;
+  // Principal only.
+  INTEREST_TYPE_PO = 5;
+  // Accrual (Z): interest accretes to face until it pays.
+  INTEREST_TYPE_Z = 6;
 }

@@ -381,17 +381,12 @@ pub trait Store: Send + Sync {
     /// Rows kept per dataset, and of them those carrying a value as reported.
     fn counts(&self) -> Result<BTreeMap<String, (u64, u64)>>;
 
-    /// Per dataset holding any, the rows kept carrying a value as reported:
-    /// what the datasets' listing answers (W10.9), read without counting
-    /// every row (ruling 816).
-    fn unconverted_counts(&self) -> Result<BTreeMap<String, u64>> {
-        Ok(self
-            .counts()?
-            .into_iter()
-            .filter(|(_, (_, unconverted))| *unconverted > 0)
-            .map(|(dataset, (_, unconverted))| (dataset, unconverted))
-            .collect())
-    }
+    /// Per dataset holding any, the rows in force carrying a value as
+    /// reported -- each row key at its version in force ([`force_order`];
+    /// ruling 1006 (c)), so a key corrected by a converted value counts no
+    /// more: what the datasets' listing answers (W10.9), read without
+    /// counting every row (ruling 816).
+    fn unconverted_counts(&self) -> Result<BTreeMap<String, u64>>;
 
     /// The lowest sequence a dataset's partition still keeps, where it keeps
     /// any (contract v19): a watermark below it asks for rows retention
@@ -461,10 +456,22 @@ pub trait Store: Send + Sync {
     /// Every re-check journalled, in order.
     fn closed_day_amendments(&self) -> Result<Vec<ClosedDayAmendment>>;
 
-    /// Per dataset: the kept rows flagged on a closed day (a weekend or a
-    /// holiday), and those flagged outside coverage, by the flag as known
-    /// now.
+    /// Per dataset: the rows in force flagged on a closed day (a weekend or
+    /// a holiday), and those flagged outside coverage, by the flag as known
+    /// now -- each row key at its version in force ([`force_order`]; ruling
+    /// 1006 (c)), as every count of a dataset's rows is.
     fn closed_day_counts(&self) -> Result<BTreeMap<String, (u64, u64)>>;
+
+    /// Per dataset holding any (contract v29, W10.9; ruling 619 (2)): the
+    /// rows in force -- each row key at its version in force, the one a
+    /// default read serves ([`force_order`]; ruling 1006 (b)) -- whose
+    /// effective state (the state recorded, raised by every assessment of
+    /// that version since) is valid, suspicious and invalid. A version
+    /// taking force moves its key from the last one's state to its own; a
+    /// rate's late-arriving older publication moves nothing; a row served
+    /// unkept is never in force; retention takes out a key it leaves no
+    /// version of.
+    fn quality_counts(&self) -> Result<BTreeMap<String, (u64, u64, u64)>>;
 
     fn configuration(&self) -> Result<Option<EntitlementsChangedEvent>>;
 
@@ -510,13 +517,35 @@ pub trait Store: Send + Sync {
 ///
 /// From contract v28 a declared corporate action and a filing are caught up
 /// the same way (the amendment of 2026-10-24: an unconflated row is caught
-/// up after a watermark, as trades and outcomes are).
+/// up after a watermark, as trades and outcomes are). From contract v29 a
+/// factor too (W10.6).
 pub fn every_version(query: &Query) -> bool {
     (matches!(
         query.data_type,
-        DataType::Outcome | DataType::CorporateAction | DataType::Filing
+        DataType::Outcome | DataType::CorporateAction | DataType::Filing | DataType::Factor
     ) && matches!(query.when, When::After(_)))
         || query.published_as_of_ns != 0
+}
+
+/// The order a row key's versions take force in (ruling 1006 (b)): the
+/// version in force is the one a default read serves, the greatest by this
+/// order among those it would load, and every count of rows in force
+/// follows it.
+///
+/// A rate's versions are ordered by published time, then by version
+/// (contract v27, W10.4: a publisher's revision is the next version of the
+/// row key, ordered by published time), so a late-arriving older
+/// publication is kept as the next version but never takes force; every
+/// other data type's by version alone. What `lake_row.published_at_ns`
+/// keeps (migration 8).
+pub fn force_order(row: &Observation) -> (i64, u64) {
+    (published_order(row).unwrap_or(0), row.meta().version)
+}
+
+/// A rate's published time, by which its versions take force (ruling 1006
+/// (b)); none for any other data type.
+pub fn published_order(row: &Observation) -> Option<i64> {
+    (row.data_type() == DataType::Rate).then(|| crate::read::published_at(row))
 }
 
 /// Each row recorded at or before a cut-off (0 for none), every version.

@@ -109,6 +109,17 @@ pub struct Context {
     /// deployment's time zone, as the book last read them; `None` where none
     /// is declared, and a held booking's alert names no moment.
     pub affirmation: Option<crate::deadline::Affirmation>,
+    /// Contract v29 (W11.11; ruling 986, amended at core stage C): for a
+    /// pool's or a tranche's fill stating no factor, the latest `Factor`
+    /// row the lake holds for its settlement month, as the service read it
+    /// before the lock; `None` where none is published or none was asked.
+    pub factor_taken: Option<meridian_pb::v1::Decimal>,
+    /// Contract v29 (rulings 991, 992, amended at core stage E): the row it
+    /// was read from, and the factor month a provisional one awaits.
+    pub factor_row: crate::orders::FactorRow,
+    /// The lake did not answer that read in time: the fill is refused to
+    /// be tried again, never priced at a factor nobody read.
+    pub factors_unavailable: bool,
 }
 
 /// What an instrument's record says that the book requires (W9.1, contract
@@ -135,6 +146,23 @@ pub struct RecordSays {
     /// `ContractMultiplier`, the premium multiplier its fills' cash and cost
     /// are priced by; None for every other record, read as one.
     pub multiplier: Option<Exact>,
+    /// Contract v29 (W9.16, W11.1): what a debt record's terms say that the
+    /// book checks; None for every other record.
+    pub debt: Option<DebtSays>,
+}
+
+/// Contract v29: a debt record's terms as the book reads them (W9.16,
+/// W11.1): the denominations an order's face keeps to, a pool's or a TBA's
+/// agency, program and pass-through rate a TBA allocation matches on, and a
+/// STRIPS component's whole bond.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DebtSays {
+    pub minimum_denomination: Option<Exact>,
+    pub denomination_increment: Option<Exact>,
+    pub agency: i32,
+    pub program: String,
+    pub pass_through_rate: Option<Exact>,
+    pub stripped_from: String,
 }
 
 impl Context {
@@ -145,6 +173,46 @@ impl Context {
             .get(instrument)
             .and_then(|r| r.multiplier)
             .unwrap_or(Exact::ONE)
+    }
+
+    /// Whether the instrument is a debt record (contract v29).
+    pub fn is_debt(&self, instrument: &str) -> bool {
+        self.records
+            .get(instrument)
+            .is_some_and(|r| r.debt.is_some())
+    }
+
+    /// Whether the instrument is a pool or a tranche, whose face is
+    /// original face (contract v29, 680).
+    pub fn is_pooled(&self, instrument: &str) -> bool {
+        self.records.get(instrument).is_some_and(|r| {
+            matches!(
+                meridian_domain::v1::InstrumentType::try_from(r.instrument_type),
+                Ok(meridian_domain::v1::InstrumentType::MbsPool
+                    | meridian_domain::v1::InstrumentType::CmoTranche)
+            )
+        })
+    }
+
+    /// The multiplier a fill's cash and cost are priced by: a series' (559);
+    /// from contract v29 a debt record's price per 100 of face (987), times
+    /// 0.01, and a pool's, a tranche's or a TBA's original face times the
+    /// factor the fill states it was done at (986).
+    pub fn fill_multiplier(
+        &self,
+        instrument: &str,
+        factor_used: Option<&meridian_pb::v1::Decimal>,
+    ) -> Exact {
+        if !self.is_debt(instrument) {
+            return self.multiplier(instrument);
+        }
+        let hundredth = Exact::new(1, 2).expect("0.01");
+        match factor_used.and_then(|f| Exact::from_wire(f).ok()) {
+            Some(factor) => {
+                crate::orders::multiply("factor", hundredth, factor).unwrap_or(hundredth)
+            }
+            _ => hundredth,
+        }
     }
 }
 

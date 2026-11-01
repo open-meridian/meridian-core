@@ -122,6 +122,9 @@ pub const RECORD_HOLDINGS: &str = "platform.lake.command.record-holdings";
 pub const LIST_HOLDINGS: &str = "platform.lake.query.list-holdings";
 /// A company subject's record (contract v28, W3.32): asked by its `ENT-` ID.
 pub const RESOLVE_COMPANY: &str = "platform.reference.query.resolve-company";
+/// Contract v29 (ruling 680; W10.4 to W10.6): a pool's or a class's factor.
+pub const RECORD_FACTORS: &str = "platform.lake.command.record-factors";
+pub const LIST_FACTORS: &str = "platform.lake.query.list-factors";
 pub const DECLINE_WANT: &str = "platform.lake.command.decline-want";
 /// Contract v28, amended 2026-10-30 (W10.7; rulings 834 and 885): a
 /// sidecar's open subscriptions' wants, renewed once per lease.
@@ -200,6 +203,8 @@ pub fn recorded_topic(dataset: &str, data_type: DataType) -> String {
             format!("platform.lake.{dataset}.event.corporate-actions-recorded")
         }
         DataType::Filing => format!("platform.lake.{dataset}.event.filings-recorded"),
+        // Contract v29 (W10.5): every version, never conflated.
+        DataType::Factor => format!("platform.lake.{dataset}.event.factors-recorded"),
         // Contract v28, amended 2026-10-30 (W10.5; rulings 847 and 886): a
         // listed series, conflated per subject, dataset and series key.
         DataType::Series => format!("platform.lake.{dataset}.event.series-recorded"),
@@ -1128,6 +1133,19 @@ impl Lake {
                         subject.entity_id
                     ));
                 };
+                // A factor's subject is a pool or a REMIC class (contract
+                // v29, W10.4): the record the deployment holds, never one a
+                // factor mints.
+                if data_type == DataType::Factor
+                    && kind != InstrumentType::MbsPool as i32
+                    && kind != InstrumentType::CmoTranche as i32
+                {
+                    return Err(format!(
+                        "{at}.meta.subjects[{j}].entity_id {:?} is no pool or REMIC class; a \
+                         factor's subject is the pool's or the class's record",
+                        subject.entity_id
+                    ));
+                }
                 // A rate's subject is a referential record (contract v27,
                 // W1.1, W10.4): an interest rate, a rate curve or an index.
                 if data_type == DataType::Rate {
@@ -1238,7 +1256,14 @@ impl Lake {
                 {
                     return Err(format!("{at}.basis is unspecified"));
                 }
-                if price.price.is_none() && meta.unconverted.is_empty() {
+                // Contract v29 (ruling 685; W10.4): a yield or a spread is
+                // the price where the source states no money price.
+                let priced_otherwise = match PriceBasis::try_from(price.basis) {
+                    Ok(PriceBasis::Yield) => price.r#yield.is_some(),
+                    Ok(PriceBasis::Spread) => price.spread_bps.is_some(),
+                    _ => false,
+                };
+                if price.price.is_none() && meta.unconverted.is_empty() && !priced_otherwise {
                     return Err(format!(
                         "{at}.price is required, or its value as reported in unconverted"
                     ));
@@ -1295,6 +1320,21 @@ impl Lake {
                     instruments.len()
                 ));
             }
+            // Contract v29 (ruling 685; W10.4): a price, a trade or a quote
+            // stated by its basis, its yields and spreads as the dictionary
+            // says; a spread's benchmark a record the deployment holds.
+            fixed_income_refused(&at, &row)?;
+            let benchmark = match &row {
+                Observation::Price(price) => price.benchmark_instrument_id.as_str(),
+                Observation::Trade(trade) => trade.benchmark_instrument_id.as_str(),
+                Observation::Quote(quote) => quote.benchmark_instrument_id.as_str(),
+                _ => "",
+            };
+            if !benchmark.is_empty() && !self.subject_held(benchmark)? {
+                return Err(format!(
+                    "{at}.benchmark_instrument_id {benchmark:?} is no record the deployment holds"
+                ));
+            }
             match &row {
                 Observation::Trade(trade) => trade_refused(&at, trade)?,
                 Observation::Quote(quote) => quote_refused(&at, quote)?,
@@ -1312,6 +1352,7 @@ impl Lake {
                     filings::holdings_report_refused(&at, report)?
                 }
                 Observation::Holding(holding) => filings::holding_refused(&at, holding)?,
+                Observation::Factor(factor) => factor_refused(&at, factor)?,
                 _ => {}
             }
             if let Observation::Bar(bar) = &row {
@@ -1373,6 +1414,7 @@ impl Lake {
             "facts" => bounds::RECORD_REPORTED_FACTS_REQUEST_FACTS_COUNT,
             "reports" => bounds::RECORD_HOLDINGS_REPORTS_REQUEST_REPORTS_COUNT,
             "holdings" => bounds::RECORD_HOLDINGS_REQUEST_HOLDINGS_COUNT,
+            "factors" => bounds::RECORD_FACTORS_REQUEST_FACTORS_COUNT,
             _ => bounds::RECORD_BARS_REQUEST_BARS_COUNT,
         };
         if !bound.admits(rows.len()) {
@@ -1856,6 +1898,15 @@ impl Lake {
                 "meridian.v1.FilingsRecordedEvent",
                 meridian_domain::v1::FilingsRecordedEvent {
                     filing: Some(filing.clone()),
+                }
+                .encode_to_vec(),
+            ),
+            // Every version, never conflated (contract v29, W10.5): each
+            // month's factor is a fact servicing proposes a paydown from.
+            Observation::Factor(factor) => (
+                "meridian.v1.FactorsRecordedEvent",
+                meridian_domain::v1::FactorsRecordedEvent {
+                    factor: Some(factor.clone()),
                 }
                 .encode_to_vec(),
             ),
@@ -2390,7 +2441,9 @@ impl Lake {
             // A declared corporate action (contract v28, W10.6): every row
             // key's version in force, narrowed by its kind's date; or the
             // versions recorded after a watermark, whatever their dates.
-            DataType::CorporateAction | DataType::Filing => match after {
+            // A pool's or a class's factor (contract v29, W10.6) the same
+            // way, narrowed by its payment date.
+            DataType::CorporateAction | DataType::Filing | DataType::Factor => match after {
                 Some(watermark) => {
                     let mut at: BTreeMap<String, u64> = BTreeMap::new();
                     for (i, partition) in watermark.partitions.iter().enumerate() {
@@ -2406,8 +2459,10 @@ impl Lake {
                     }
                     When::After(at)
                 }
+                // A factor whose envelope states no valid time is read too:
+                // it is dated by its payment date.
                 None => When::Range {
-                    from_ns: 1,
+                    from_ns: i64::from(request.data_type != DataType::Factor),
                     until_ns: 0,
                 },
             },
@@ -3458,6 +3513,88 @@ impl Lake {
         })
     }
 
+    /// W10.6, contract v29 (ruling 680): the factors of 1 to 500 pools and
+    /// classes, by payment date, point in time as every read is; or every
+    /// version recorded after a watermark, whatever its dates, how a reader
+    /// that lost some catches up. A pool no source covers is named
+    /// unanswered, never a factor of 1.
+    pub(crate) fn list_factors(
+        &self,
+        request: meridian_domain::v1::ListFactorsRequest,
+        envelope: &Envelope,
+    ) -> Result<meridian_domain::v1::ListFactorsReply, String> {
+        if !bounds::LIST_FACTORS_REQUEST_SUBJECTS_COUNT.admits(request.subjects.len()) {
+            return Err(format!(
+                "subjects names {}; 1 to 500",
+                request.subjects.len()
+            ));
+        }
+        let caught_up = request
+            .after_watermark
+            .as_ref()
+            .is_some_and(|watermark| !watermark.partitions.is_empty());
+        let ranged = !request.from_date.is_empty() || !request.to_date.is_empty();
+        if caught_up && ranged {
+            return Err(
+                "after_watermark and from_date or to_date: a catch-up reads whatever the dates"
+                    .into(),
+            );
+        }
+        let dates = if ranged {
+            let from = meridian_domain::date::optional("from_date", &request.from_date)?
+                .unwrap_or(Date::of_utc_instant(0));
+            let to = match meridian_domain::date::optional("to_date", &request.to_date)? {
+                Some(to) => to,
+                None => Date::from_ymd(9999, 12, 31).expect("the last day"),
+            };
+            if to < from {
+                return Err("to_date is on or after from_date".into());
+            }
+            Some((from, to))
+        } else {
+            None
+        };
+        let answer = self.read(
+            ReadRequest {
+                data_type: DataType::Factor,
+                subjects: request.subjects,
+                kinds: Vec::new(),
+                interval_ns: 0,
+                sources: request.sources,
+                at_ns: 0,
+                business_date: String::new(),
+                valid_from_ns: 0,
+                valid_until_ns: 0,
+                as_of_ns: request.as_of_ns,
+                page_size: request.page_size,
+                cursor: request.cursor,
+                after: request.after_watermark,
+                tenors: Vec::new(),
+                published_as_of_ns: 0,
+                series_keys: Vec::new(),
+                all_series: false,
+                dates,
+                window: Default::default(),
+                fields: Vec::new(),
+            },
+            envelope,
+        )?;
+        Ok(meridian_domain::v1::ListFactorsReply {
+            factors: answer
+                .rows
+                .into_iter()
+                .filter_map(|row| match row {
+                    Observation::Factor(factor) => Some(factor),
+                    _ => None,
+                })
+                .collect(),
+            unanswered: answer.unanswered,
+            datasets: answer.datasets,
+            watermark: Some(answer.watermark),
+            next_cursor: answer.next_cursor,
+        })
+    }
+
     pub(crate) fn latest_recorded(
         &self,
         request: &ListTradesRequest,
@@ -3695,7 +3832,9 @@ impl Lake {
         let config = self.config();
         // The rows carrying a value as reported, and those flagged on a closed
         // day: each read from the rows it counts, never every row kept (ruling
-        // 816: one listing took 1,068 ms on dev counting a chain's rows).
+        // 816: one listing took 1,068 ms on dev counting a chain's rows), and
+        // each of the rows in force, as the quality counts are (ruling 1006
+        // (c)).
         let unconverted = self
             .store
             .unconverted_counts()
@@ -3707,6 +3846,12 @@ impl Lake {
         let flagged = self
             .store
             .closed_day_counts()
+            .map_err(|failed| failed.to_string())?;
+        // Contract v29 (W10.9; ruling 619 (2)): the rows in force by
+        // effective state.
+        let quality = self
+            .store
+            .quality_counts()
             .map_err(|failed| failed.to_string())?;
         let mut reply = ListDatasetsReply::default();
         for (dataset, held) in &config.datasets {
@@ -3724,6 +3869,9 @@ impl Lake {
                 // those outside the calendar's coverage, counted apart.
                 closed_day_count: flagged.get(dataset).map_or(0, |c| c.0),
                 outside_coverage_count: flagged.get(dataset).map_or(0, |c| c.1),
+                valid_count: quality.get(dataset).map_or(0, |c| c.0),
+                suspicious_count: quality.get(dataset).map_or(0, |c| c.1),
+                invalid_count: quality.get(dataset).map_or(0, |c| c.2),
                 // Contract v27 (W10.9; ruling 418): the latest liveness the
                 // lake keeps, one per venue.
                 liveness: self
@@ -3840,7 +3988,8 @@ impl Lake {
 
     /// W10.12, contract v28 (rulings 423 and 619): a `signal` plugin's
     /// escalation of recorded rows' quality, each assessment its own record
-    /// beside the row it names (decisions/031), never a rewrite. States only
+    /// beside the row it names (decisions/031), never a rewrite; from
+    /// contract v29 of the kind of row it names (628). States only
     /// escalate: one lower than the row's effective state -- the highest of
     /// its own and every assessment of it, those earlier in the batch
     /// included -- is refused naming its `state`; one naming a row or
@@ -3917,11 +4066,32 @@ impl Lake {
                     ));
                 }
             }
+            // Contract v29 (628; W10.12): the kind of row assessed, by its
+            // message's full name, so a day's close and its bar, sharing a
+            // row key, escalate apart; an assessment naming none, as every
+            // one before v29, is its key's every kind.
+            let kind = if assessment.data_type.trim().is_empty() {
+                None
+            } else {
+                Some(
+                    crate::row::DataType::named(assessment.data_type.trim()).ok_or_else(|| {
+                        refused(
+                            format!("{at}.data_type"),
+                            format!(
+                                "{at}.data_type is {:?}, no kind of row the lake holds \
+                                 (meridian.v1.Price, meridian.v1.Bar, ...)",
+                                assessment.data_type
+                            ),
+                        )
+                    })?,
+                )
+            };
             let rows: Vec<Observation> = self
                 .store
                 .row_version(&assessment.dataset, &assessment.row_key, assessment.version)
                 .map_err(|failed| failed.to_string())?
                 .into_iter()
+                .filter(|row| kind.is_none_or(|kind| row.data_type() == kind))
                 .filter(|row| {
                     config
                         .readable(&reader, row.data_type())
@@ -4126,6 +4296,9 @@ impl Lake {
                             | DataType::Quote
                             | DataType::Rate
                             | DataType::Statistic
+                            // Contract v29 (W10.7): a pool's or a class's
+                            // factor, wanted standing for a record held.
+                            | DataType::Factor
                     )
                 })
                 .ok_or_else(|| {
@@ -4416,7 +4589,16 @@ fn want_asked(event: &ObservationsWantedEvent) -> String {
 /// amount, a quantity more than zero, characteristics each in the list and at
 /// most sixteen, and an aggressor and eligibilities the enums hold.
 fn trade_refused(at: &str, trade: &meridian_domain::v1::Trade) -> Result<(), String> {
+    // Contract v29 (ruling 685; W10.4): a trade in yield or spread states it
+    // there, its money price unset where the source states none (a
+    // when-issued trade before its auction).
+    let priced_otherwise = match PriceBasis::try_from(trade.basis) {
+        Ok(PriceBasis::Yield) => trade.r#yield.is_some(),
+        Ok(PriceBasis::Spread) => trade.spread_bps.is_some(),
+        _ => false,
+    };
     match trade.price.as_ref() {
+        None if priced_otherwise => {}
         None => {
             return Err(format!(
                 "{at}.price is required: a trade with no price is refused"
@@ -4457,6 +4639,140 @@ fn trade_refused(at: &str, trade: &meridian_domain::v1::Trade) -> Result<(), Str
         }
     }
     Ok(())
+}
+
+/// A factor held to W10.4 (contract v29, ruling 680; the dictionary): the
+/// factor stated, never below zero (above 1 on an accreting Z class); its
+/// month YYYYMM; its record and payment dates plain dates where stated; a
+/// floater's period coupon never below zero.
+fn factor_refused(at: &str, factor: &meridian_domain::v1::Factor) -> Result<(), String> {
+    let Some(value) = factor.factor.as_ref() else {
+        return Err(format!(
+            "{at}.factor is required: the fraction of original face outstanding"
+        ));
+    };
+    let exact = meridian_domain::exact::Exact::from_wire(value)
+        .map_err(|out| format!("{at}.factor {out}"))?;
+    if exact.is_negative() {
+        return Err(format!("{at}.factor is never below zero"));
+    }
+    let month = factor.factor_month.as_str();
+    let month_reads = month.len() == 6
+        && month.bytes().all(|b| b.is_ascii_digit())
+        && (1..=12).contains(&month[4..].parse::<u32>().unwrap_or(0));
+    if !month_reads {
+        return Err(format!(
+            "{at}.factor_month {month:?} is the agency's factor month, YYYYMM"
+        ));
+    }
+    meridian_domain::date::optional(&format!("{at}.record_date"), &factor.record_date)?;
+    meridian_domain::date::optional(&format!("{at}.payment_date"), &factor.payment_date)?;
+    if let Some(rate) = factor.coupon_rate.as_ref() {
+        let exact = meridian_domain::exact::Exact::from_wire(rate)
+            .map_err(|out| format!("{at}.coupon_rate {out}"))?;
+        if exact.is_negative() {
+            return Err(format!(
+                "{at}.coupon_rate is never below zero: the period's annual rate"
+            ));
+        }
+    }
+    // Contract v29 (995): the disclosure's weighted average coupon, never
+    // below zero; WAM and WALA are whole months by their type.
+    if let Some(wac) = factor.wac.as_ref() {
+        let exact = meridian_domain::exact::Exact::from_wire(wac)
+            .map_err(|out| format!("{at}.wac {out}"))?;
+        if exact.is_negative() {
+            return Err(format!(
+                "{at}.wac is never below zero: the weighted average coupon, percent a year"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A price, a trade or a quote held to W10.4 as contract v29 widens it
+/// (ruling 685; the dictionary): a basis the enum names; a yield in yield
+/// stated as a quoted yield must be -- its value, convention and kind --
+/// wherever one is given; a yield basis stating one, a spread basis its
+/// spread and the benchmark it is over; a spread set under no spread basis
+/// refused, and a benchmark named only beside a spread or a yield.
+fn fixed_income_refused(at: &str, row: &Observation) -> Result<(), String> {
+    type Yields<'a> = Vec<(&'static str, Option<&'a meridian_domain::v1::QuotedYield>)>;
+    type Spreads<'a> = Vec<(&'static str, Option<&'a meridian_pb::v1::Decimal>)>;
+    let (basis, yields, spreads, benchmark): (i32, Yields<'_>, Spreads<'_>, &str) = match row {
+        Observation::Price(price) => (
+            price.basis,
+            vec![("yield", price.r#yield.as_ref())],
+            vec![("spread_bps", price.spread_bps.as_ref())],
+            &price.benchmark_instrument_id,
+        ),
+        Observation::Trade(trade) => (
+            trade.basis,
+            vec![("yield", trade.r#yield.as_ref())],
+            vec![("spread_bps", trade.spread_bps.as_ref())],
+            &trade.benchmark_instrument_id,
+        ),
+        Observation::Quote(quote) => (
+            quote.basis,
+            vec![
+                ("bid_yield", quote.bid_yield.as_ref()),
+                ("ask_yield", quote.ask_yield.as_ref()),
+            ],
+            vec![
+                ("bid_spread_bps", quote.bid_spread_bps.as_ref()),
+                ("ask_spread_bps", quote.ask_spread_bps.as_ref()),
+            ],
+            &quote.benchmark_instrument_id,
+        ),
+        _ => return Ok(()),
+    };
+    let Ok(basis) = PriceBasis::try_from(basis) else {
+        return Err(format!(
+            "{at}.basis is {basis}: per unit, percent of par, a yield or a spread"
+        ));
+    };
+    for (name, quoted) in &yields {
+        if let Some(quoted) = quoted {
+            if let Some((field, words)) =
+                meridian_domain::conventions::quoted_yield_refused(quoted, &format!("{at}.{name}"))
+                    .into_iter()
+                    .next()
+            {
+                return Err(format!("{field}: {words}"));
+            }
+        }
+    }
+    for (name, spread) in &spreads {
+        if let Some(spread) = spread {
+            meridian_domain::exact::Exact::from_wire(spread)
+                .map_err(|out| format!("{at}.{name} {out}"))?;
+            if basis != PriceBasis::Spread {
+                return Err(format!(
+                    "{at}.{name} is set only on a row whose basis is spread"
+                ));
+            }
+        }
+    }
+    let any_yield = yields.iter().any(|(_, quoted)| quoted.is_some());
+    let any_spread = spreads.iter().any(|(_, spread)| spread.is_some());
+    match basis {
+        PriceBasis::Yield if !any_yield => Err(format!(
+            "{at}.{}: a row in yield states its yield",
+            yields[0].0
+        )),
+        PriceBasis::Spread if !any_spread => Err(format!(
+            "{at}.{}: a row in spread states its spread in basis points",
+            spreads[0].0
+        )),
+        PriceBasis::Spread if benchmark.is_empty() => Err(format!(
+            "{at}.benchmark_instrument_id: a spread names the benchmark it is over"
+        )),
+        _ if !benchmark.is_empty() && !any_spread && !any_yield => Err(format!(
+            "{at}.benchmark_instrument_id is named only beside a spread, or a yield stated \
+             against it"
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// A quote held to W10.4 (contract v19): each side's amount stated, each
@@ -4559,13 +4875,32 @@ fn derived_refused(at: &str, value: &meridian_domain::v1::DerivedSeries) -> Resu
     if !bounds::DERIVED_SERIES_SERIES_LENGTH.admits(value.series.chars().count()) {
         return Err(format!("{at}.series is 1 to 64 characters"));
     }
-    if value
-        .value
-        .as_ref()
-        .and_then(|v| v.value.as_ref())
-        .is_none()
-    {
-        return Err(format!("{at}.value is required, with its unit"));
+    // Contract v29 (638; W10.4): an amount of money in money_value, a
+    // Money naming its currency or its cash instrument, value then unset,
+    // since a UnitValue never carries a currency; any other in value.
+    let unit_value = value.value.as_ref().and_then(|v| v.value.as_ref());
+    match (&value.money_value, unit_value) {
+        (Some(_), Some(_)) => {
+            return Err(format!(
+                "{at}.value is unset where money_value carries the amount of money"
+            ));
+        }
+        (Some(money), None) => {
+            if money.amount.is_none() {
+                return Err(format!("{at}.money_value.amount is required"));
+            }
+            if money.currency_code.trim().is_empty() && money.instrument_id.trim().is_empty() {
+                return Err(format!(
+                    "{at}.money_value names its currency_code or its cash instrument_id"
+                ));
+            }
+        }
+        (None, None) => {
+            return Err(format!(
+                "{at}.value is required, with its unit, or money_value for an amount of money"
+            ));
+        }
+        (None, Some(_)) => {}
     }
     let rule = value.rule.clone().unwrap_or_default();
     if rule.definition.trim().is_empty() || rule.version < 1 {
@@ -4751,6 +5086,26 @@ fn quote_refused(at: &str, quote: &meridian_domain::v1::Quote) -> Result<(), Str
             if exact <= meridian_domain::exact::Exact::ZERO {
                 return Err(format!("{at}.{name} is more than zero"));
             }
+        }
+    }
+    // Contract v29 (ruling 900 R2): a capped size is the bucket's floor,
+    // stated in its quantity.
+    for (name, capped, quantity) in [
+        (
+            "bid_size_capped",
+            quote.bid_size_capped,
+            &quote.bid_quantity,
+        ),
+        (
+            "ask_size_capped",
+            quote.ask_size_capped,
+            &quote.ask_quantity,
+        ),
+    ] {
+        if capped && quantity.is_none() {
+            return Err(format!(
+                "{at}.{name}: a bucketed size states the bucket's floor in its quantity"
+            ));
         }
     }
     if !bounds::QUOTE_CHARACTERISTICS_COUNT.admits(quote.characteristics.len()) {
@@ -5136,6 +5491,41 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
         },
     );
     filings::serve(&bus, &lake);
+    // Contract v29 (ruling 680; W10.4 to W10.6): a pool's or a class's
+    // factor, published unconflated and read by subject and payment date.
+    serve_on(
+        &bus,
+        &lake,
+        RECORD_FACTORS,
+        (
+            "meridian.v1.RecordFactorsRequest",
+            "meridian.v1.RecordObservationsReply",
+        ),
+        |lake, request: meridian_domain::v1::RecordFactorsRequest, envelope| {
+            lake.record(
+                "factors",
+                request
+                    .factors
+                    .into_iter()
+                    .map(Observation::Factor)
+                    .collect(),
+                &request.want_id,
+                envelope,
+            )
+        },
+    );
+    serve_on(
+        &bus,
+        &lake,
+        LIST_FACTORS,
+        (
+            "meridian.v1.ListFactorsRequest",
+            "meridian.v1.ListFactorsReply",
+        ),
+        |lake, request: meridian_domain::v1::ListFactorsRequest, envelope| {
+            lake.list_factors(request, envelope)
+        },
+    );
     // Contract v28, track B (W10.4, W10.6, W12.8): a signal plugin's
     // derived series and saved scenarios.
     serve_on(

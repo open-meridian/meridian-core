@@ -8,8 +8,8 @@ use meridian_domain::v1::{EntitlementsChangedEvent, SourcePriority};
 
 use crate::row::Observation;
 use crate::store::{
-    as_assessed, as_flagged, closed_reason, counted, matches, Assessment, ClosedDayAmendment,
-    Query, Recorded, Removal, Result, Served, Stale, Store, WantChange,
+    as_assessed, as_flagged, closed_reason, counted, force_order, matches, Assessment,
+    ClosedDayAmendment, Query, Recorded, Removal, Result, Served, Stale, Store, WantChange,
 };
 
 #[derive(Default)]
@@ -103,7 +103,9 @@ pub(crate) fn number(
     done
 }
 
-/// Each row key at its latest version recorded by `as_of_ns` (0 for now).
+/// Each row key at its version in force among those recorded by `as_of_ns`
+/// (0 for now): its latest version, a rate's by published time (ruling
+/// 1006 (b); [`crate::store::force_order`]).
 pub(crate) fn as_of(
     rows: impl IntoIterator<Item = Observation>,
     as_of_ns: i64,
@@ -120,7 +122,7 @@ pub(crate) fn as_of(
             meta.row_key.clone(),
         );
         match latest.get(&key) {
-            Some(held) if held.meta().version >= meta.version => {}
+            Some(held) if force_order(held) >= force_order(&row) => {}
             _ => {
                 latest.insert(key, row);
             }
@@ -412,9 +414,41 @@ impl Store for MemoryStore {
         Ok(self.lock().amendments.clone())
     }
 
-    fn closed_day_counts(&self) -> Result<BTreeMap<String, (u64, u64)>> {
+    fn quality_counts(&self) -> Result<BTreeMap<String, (u64, u64, u64)>> {
+        use meridian_domain::v1::QualityState;
         let held = self.lock();
-        let mut rows = held.rows.clone();
+        // The rows in force: each row key at its version in force, as a
+        // default read takes it (ruling 1006 (b)).
+        let mut rows = as_of(held.rows.iter().cloned(), 0);
+        as_assessed(&mut rows, &held.assessments, 0);
+        let mut counts: BTreeMap<String, (u64, u64, u64)> = BTreeMap::new();
+        for row in &rows {
+            let count = counts.entry(row.dataset().to_string()).or_default();
+            match crate::store::rank(row.meta().quality) {
+                state if state == QualityState::Invalid as i32 => count.2 += 1,
+                state if state == QualityState::Suspicious as i32 => count.1 += 1,
+                _ => count.0 += 1,
+            }
+        }
+        Ok(counts)
+    }
+
+    fn unconverted_counts(&self) -> Result<BTreeMap<String, u64>> {
+        // The rows in force (ruling 1006 (c)).
+        let held = self.lock();
+        let mut counts: BTreeMap<String, u64> = BTreeMap::new();
+        for row in as_of(held.rows.iter().cloned(), 0) {
+            if !row.meta().unconverted.is_empty() {
+                *counts.entry(row.dataset().to_string()).or_default() += 1;
+            }
+        }
+        Ok(counts)
+    }
+
+    fn closed_day_counts(&self) -> Result<BTreeMap<String, (u64, u64)>> {
+        // The rows in force (ruling 1006 (c)), by the flag as known now.
+        let held = self.lock();
+        let mut rows = as_of(held.rows.iter().cloned(), 0);
         as_flagged(&mut rows, &held.amendments, 0);
         let mut counts: BTreeMap<String, (u64, u64)> = BTreeMap::new();
         for row in &rows {

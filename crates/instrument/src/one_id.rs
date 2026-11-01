@@ -37,8 +37,9 @@ pub const LOCAL_SCHEME: &str = "open_meridian_local";
 
 /// The open schemes the contract names, sendable while no licence list has
 /// been read (W3.25): from contract 28's core release C2 the SEC's `cik`
-/// too, a company's public identifier (W1.32).
-pub const OPEN_FAMILIES: [&str; 8] = [
+/// too, a company's public identifier (W1.32); from contract v29 an
+/// agency's pool number, `agency_pool` (ruling 677, W1.26).
+pub const OPEN_FAMILIES: [&str; 9] = [
     "figi",
     "lei",
     "ticker_and_venue",
@@ -47,7 +48,16 @@ pub const OPEN_FAMILIES: [&str; 8] = [
     "sec_series",
     "sec_class",
     "cik",
+    AGENCY_POOL,
 ];
+
+/// An agency's pool number (contract v29, ruling 677; W1.26): an open
+/// scheme, the agency that publishes it in the identifier's `source`.
+pub const AGENCY_POOL: &str = "agency_pool";
+
+/// The agencies whose pool numbers `agency_pool` carries, as its `source`
+/// names them (`MortgageAgency`'s values).
+pub const POOL_AGENCIES: [&str; 3] = ["FNMA", "FHLMC", "GNMA"];
 
 /// The family an administrator's own code is licensed by (ruling 545): wire
 /// `symbol` with the administrator in its `source`, sent only for an
@@ -286,10 +296,13 @@ pub fn missing_fields(record: &Instrument, template: &SecurityTemplate) -> Vec<S
     };
     let kind = meridian_domain::instrument_type::read(&record.instrument_type)
         .unwrap_or(InstrumentType::Unspecified);
-    let listed = matches!(
+    // A listed series' terms (contract v28) and a debt record's (contract
+    // v29, 676): its template's paths beyond the record's own are its
+    // terms'.
+    let termed = matches!(
         kind,
         InstrumentType::ListedOption | InstrumentType::Future | InstrumentType::FutureOption
-    );
+    ) || meridian_domain::debt::is_debt(kind);
     template
         .fields
         .iter()
@@ -306,7 +319,7 @@ pub fn missing_fields(record: &Instrument, template: &SecurityTemplate) -> Vec<S
             }
         })
         .filter(|field| match field.path.as_str() {
-            path if listed
+            path if termed
                 && ![
                     "identifiers",
                     "description",
@@ -316,7 +329,7 @@ pub fn missing_fields(record: &Instrument, template: &SecurityTemplate) -> Vec<S
                 ]
                 .contains(&path) =>
             {
-                meridian_domain::instrument_type::listed_path_missing(
+                meridian_domain::instrument_type::terms_path_missing(
                     kind,
                     &record.listed_terms,
                     path,
@@ -335,6 +348,46 @@ pub fn missing_fields(record: &Instrument, template: &SecurityTemplate) -> Vec<S
         })
         .map(|field| field.path.clone())
         .collect()
+}
+
+/// What an `INS-` record lacks against its template (574; W1.24): minted
+/// when its `mint` fields are met, it stays incomplete, listing the
+/// `complete` fields it does not hold, until they are; and beside them what
+/// the platform's record names as missing, what only its source can say (a
+/// callable bond's calls, the plan's risk 3). A template before v28's levels
+/// lists nothing of its own: its `INS-` records are complete as minted.
+pub fn platform_missing(
+    store: &dyn Store,
+    record: &Instrument,
+    master: &InstrumentRecord,
+) -> Vec<String> {
+    let complete = meridian_domain::v1::FieldRequirement::Complete as i32;
+    let mut missing = read_template(
+        &catalogue(store),
+        &record.local.template_id,
+        &record.local.template_version,
+    )
+    .map(|template| {
+        missing_fields(
+            record,
+            &SecurityTemplate {
+                fields: template
+                    .fields
+                    .into_iter()
+                    .filter(|field| field.requirement == complete)
+                    .collect(),
+                ..template
+            },
+        )
+    })
+    .unwrap_or_default();
+    for path in &master.missing_fields {
+        let path = path.trim();
+        if !path.is_empty() && !missing.iter().any(|held| held == path) {
+            missing.push(path.to_string());
+        }
+    }
+    missing
 }
 
 // ── The licence list (W3.25) ───────────────────────────────────────────────
@@ -397,9 +450,14 @@ pub fn family_held<'a>(scheme: &'a str, source: &str, list: &LicenceList) -> &'a
 /// ID, never `open_meridian_local`, never the platform's own ID scheme, and
 /// never a source-scoped code but a ticker carrying its venue, a listing's
 /// FIGI paired with where it lists (contract v24's FIGI levels:
-/// [`paired_listing`]) and, where the list names the `administrator_symbol`
-/// family, a symbol whose source is an administrator it admits (ruling
-/// 545). A vendor's symbol never is.
+/// [`paired_listing`]), an agency's pool number with its agency
+/// ([`agency_pool`], contract v29) and, where the list names the
+/// `administrator_symbol` family, a symbol whose source is an administrator
+/// it admits (ruling 545). A vendor's symbol never is, nor a CUSIP or an
+/// ISIN while no list names them (ruling 677: deployment-side; v29 maps
+/// neither to a FIGI, ruling 976, so a bond known only by one stays the
+/// deployment's local record, its CUSIP kept dated for the backfill once a
+/// list names the scheme, W3.25).
 pub fn sendable(identifiers: &[Asked], list: &LicenceList) -> Vec<PbIdentifier> {
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
@@ -416,7 +474,13 @@ pub fn sendable(identifiers: &[Asked], list: &LicenceList) -> Vec<PbIdentifier> 
             && asked.scheme != "ticker"
             && licensed != ADMINISTRATOR_SYMBOL
             && !paired_listing(&asked.scheme, &asked.source)
+            && !agency_pool(&asked.scheme, &asked.source)
         {
+            continue;
+        }
+        // A pool number means something only beside the agency that
+        // published it (W1.26): one naming none, or another, never travels.
+        if asked.scheme == AGENCY_POOL && !agency_pool(&asked.scheme, &asked.source) {
             continue;
         }
         if !list.schemes.iter().any(|scheme| scheme == licensed) {
@@ -431,6 +495,12 @@ pub fn sendable(identifiers: &[Asked], list: &LicenceList) -> Vec<PbIdentifier> 
         }
     }
     out
+}
+
+/// Whether an identifier is an agency's pool number with its agency in
+/// `source` (contract v29, W1.26): `FNMA`, `FHLMC` or `GNMA`.
+pub fn agency_pool(scheme: &str, source: &str) -> bool {
+    scheme == AGENCY_POOL && POOL_AGENCIES.contains(&source)
 }
 
 /// Whether a FIGI's `source` is the pairing contract v24 gives a listing's
@@ -643,11 +713,13 @@ fn master_identifiers(master: &InstrumentRecord) -> Vec<Asked> {
         .collect()
 }
 
-/// A listed series' terms as the platform's record states them (contract
-/// v28; rulings 559, 575): taken whole where they differ, an adjustment being
-/// the record's next version with its ID kept. True when they changed.
+/// A record's terms as the platform's record states them: a listed
+/// series' (contract v28; rulings 559, 575) and a debt record's (contract
+/// v29, 676), taken whole where they differ, an adjustment or a term filled
+/// at the auction being the record's next version with its ID kept
+/// (decisions/034). True when they changed.
 pub fn take_listed_terms(record: &mut Instrument, master: &InstrumentRecord) -> bool {
-    let terms = meridian_domain::instrument_type::listed_terms_to_text(master);
+    let terms = meridian_domain::instrument_type::terms_to_text(master);
     if terms.is_empty() || terms == record.listed_terms {
         return false;
     }
@@ -725,20 +797,44 @@ pub fn keep_platform_record(
         let (applied, offered) = crate::resolve::take_stated(&mut held, offers, now_ns);
         let listed = take_trading_currencies(&mut held, master);
         let terms = take_listed_terms(&mut held, master);
-        if changes.is_empty() && applied.is_empty() && !offered && !listed && !terms {
+        let lacking = platform_missing(store, &held, master);
+        let incomplete = lacking != held.local.missing_fields;
+        held.local.missing_fields = lacking;
+        if changes.is_empty() && applied.is_empty() && !offered && !listed && !terms && !incomplete
+        {
             return Ok((held, false));
         }
         let operation = if !changes.is_empty() {
             "join"
         } else if !applied.is_empty() {
             "complete"
-        } else {
+        } else if offered || listed {
             "offer"
+        } else {
+            // The platform's next version of the record's terms, or what
+            // of its template it lacks (contract v29; 574).
+            "platform"
         };
         changes.extend(applied);
         held.version = expected + 1;
         held.record_time_ns = now_ns;
-        let mut entry = version_of(&held, operation, changes, "", now_ns);
+        let note = if terms || incomplete {
+            format!(
+                "the platform's record at its version {}: {}",
+                master.version,
+                if held.local.missing_fields.is_empty() {
+                    "its terms as it states them, complete".to_string()
+                } else {
+                    format!(
+                        "its terms as it states them, lacking {}",
+                        held.local.missing_fields.join(", ")
+                    )
+                }
+            )
+        } else {
+            String::new()
+        };
+        let mut entry = version_of(&held, operation, changes, &note, now_ns);
         entry.person = person;
         return match store.write(held.clone(), expected, entry)? {
             Written::Stored => Ok((held, false)),
@@ -765,14 +861,23 @@ pub fn keep_platform_record(
         listing_venue_id: master.listing_venue_id.clone(),
         version: 1,
         record_time_ns: now_ns,
-        local: Local {
-            template_id: template
-                .map(|t| t.template_id.clone())
-                .unwrap_or_else(|| master.template_id.clone()),
-            template_version: template
-                .map(|t| t.template_version.clone())
-                .unwrap_or_else(|| master.template_version.clone()),
-            ..Default::default()
+        // The template the platform minted it from (W1.25, W3.4), which
+        // its record names; the one the source's statement picked only
+        // where the platform names none.
+        local: if master.template_id.is_empty() {
+            Local {
+                template_id: template.map(|t| t.template_id.clone()).unwrap_or_default(),
+                template_version: template
+                    .map(|t| t.template_version.clone())
+                    .unwrap_or_default(),
+                ..Default::default()
+            }
+        } else {
+            Local {
+                template_id: master.template_id.clone(),
+                template_version: master.template_version.clone(),
+                ..Default::default()
+            }
         },
         ..Default::default()
     };
@@ -784,6 +889,7 @@ pub fn keep_platform_record(
     }
     take_trading_currencies(&mut candidate, master);
     take_listed_terms(&mut candidate, master);
+    candidate.local.missing_fields = platform_missing(store, &candidate, master);
     if let Some(contract) = &master.binary_event_contract {
         candidate.binary_event_contract =
             meridian_domain::instrument_type::contract_to_text(contract);
@@ -1008,6 +1114,7 @@ pub fn resolve_to_as(
             stays.identifiers.retain(|identifier| identifier.open());
             take_trading_currencies(&mut stays, master);
             take_listed_terms(&mut stays, master);
+            stays.local.missing_fields = platform_missing(store, &stays, master);
             // The open_meridian identifier stops being written (requirement 2).
             for identifier in stays.identifiers.iter_mut() {
                 if identifier.scheme == meridian_symbology::GLOBAL_ID {
@@ -2237,6 +2344,148 @@ mod tests {
         assert_eq!(
             crate::replace::current(&store, "INS-AAPLC230").unwrap(),
             "INS-AAPLC230"
+        );
+    }
+
+    #[test]
+    fn a_debt_record_keeps_its_terms_and_lists_what_it_lacks_until_the_auction_fills_it() {
+        // Contract v29 (rulings 676, 677; W1.1, W1.24; 574): a when-issued
+        // Treasury note minted with its mint fields, its coupon a complete
+        // field filled at the auction as the record's next version
+        // (decisions/034); the platform's own list kept beside the store's.
+        use meridian_domain::v1::{
+            Bond, CouponType, DayCount, DebtSecurityType, FieldRequirement, IssuerType,
+            TemplateField,
+        };
+        let store = MemoryStore::new();
+        let field = |path: &str, requirement: FieldRequirement| TemplateField {
+            path: path.into(),
+            r#type: "text".into(),
+            required: requirement == FieldRequirement::Mint,
+            requirement: requirement as i32,
+            repeated: path == "calls",
+        };
+        let template = SecurityTemplate {
+            template_id: "TPL-bond".into(),
+            template_version: "1".into(),
+            asset_class: AssetClass::Debt as i32,
+            instrument_type: InstrumentType::Bond as i32,
+            fields: vec![
+                field("identifiers", FieldRequirement::Mint),
+                field("description", FieldRequirement::Mint),
+                field("security_type", FieldRequirement::Mint),
+                field("issuer_company_id", FieldRequirement::Mint),
+                field("maturity_date", FieldRequirement::Mint),
+                field("coupon_rate", FieldRequirement::Complete),
+                field("dated_date", FieldRequirement::Complete),
+                field("calls", FieldRequirement::Complete),
+                field("governing_law", FieldRequirement::Optional),
+            ],
+            ..Default::default()
+        };
+        store.keep_template(&template, NOW).unwrap();
+        let mut terms = Bond {
+            security_type: DebtSecurityType::Tnote as i32,
+            issuer_company_id: "ENT-01JUSTREASURY".into(),
+            issuer_type: IssuerType::Sovereign as i32,
+            issue_date: "2026-11-17".into(),
+            dated_date: "2026-11-15".into(),
+            maturity_date: "2036-11-15".into(),
+            coupon_type: CouponType::Fixed as i32,
+            coupon_frequency: 2,
+            day_count: DayCount::ActActIcma as i32,
+            ..Default::default()
+        };
+        let mut note = InstrumentRecord {
+            instrument_id: "INS-01JTNOTE10Y".into(),
+            identifiers: vec![PbIdentifier {
+                scheme: "figi".into(),
+                value: "BBG01TNOTE10".into(),
+                ..Default::default()
+            }],
+            asset_class: AssetClass::Debt as i32,
+            instrument_type: InstrumentType::Bond as i32,
+            currency: "USD".into(),
+            description: "T 2036-11-15, when issued".into(),
+            version: 1,
+            template_id: "TPL-bond".into(),
+            template_version: "1".into(),
+            bond: Some(terms.clone()),
+            ..Default::default()
+        };
+        let request = ResolveIdentifierRequest {
+            identifiers: note.identifiers.clone(),
+            as_of_ns: NOW,
+            stated_asset_class: AssetClass::Debt as i32,
+            ..Default::default()
+        };
+        unmatched(
+            &store,
+            &request,
+            PlatformSaid::Record(Box::new(note.clone())),
+        );
+        let held = store.by_id("INS-01JTNOTE10Y").unwrap().unwrap();
+        let wire = crate::record::to_wire(&held);
+        assert_eq!(wire.bond.as_ref(), Some(&terms));
+        assert!(wire.listed_option.is_none() && wire.mbs_pool.is_none());
+        // Its coupon is complete, not mint: listed until the auction; an
+        // optional field never; a callable's calls only where the platform
+        // says so.
+        assert_eq!(wire.missing_fields, vec!["coupon_rate".to_string()]);
+        assert!(!wire.provisional);
+
+        // The auction: the platform's next version with the coupon, and its
+        // own word that the calls are still to read.
+        terms.coupon_rate = Some(
+            "4.125"
+                .parse::<meridian_domain::exact::Exact>()
+                .unwrap()
+                .to_wire(),
+        );
+        note.bond = Some(terms.clone());
+        note.version = 2;
+        note.missing_fields = vec!["calls".into()];
+        let (kept, minted) =
+            keep_platform_record(&store, &[], &note, None, Vec::new(), NOW + 1).unwrap();
+        assert!(!minted);
+        assert_eq!(kept.version, held.version + 1);
+        let wire = crate::record::to_wire(&kept);
+        assert_eq!(wire.bond, Some(terms.clone()));
+        assert_eq!(wire.missing_fields, vec!["calls".to_string()]);
+        // Its own record: the history says the platform's version came in.
+        assert_eq!(store.history("INS-01JTNOTE10Y").unwrap().len(), 2);
+
+        // The same answer again changes nothing.
+        let (again, _) =
+            keep_platform_record(&store, &[], &note, None, Vec::new(), NOW + 2).unwrap();
+        assert_eq!(again.version, kept.version);
+    }
+
+    #[test]
+    fn an_agency_pool_number_is_sent_with_its_agency_and_a_cusip_never() {
+        // Contract v29 (ruling 677; W1.26, W3.25): agency_pool is open, sent
+        // with no list read, its agency in source; CUSIP and ISIN stay
+        // deployment-side.
+        let list = default_licence();
+        assert!(list.schemes.iter().any(|scheme| scheme == AGENCY_POOL));
+        let held = vec![
+            asked(AGENCY_POOL, "MA5123", "FNMA"),
+            asked(AGENCY_POOL, "MA5124", ""),
+            asked(AGENCY_POOL, "MA5125", "snaptrade"),
+            asked("cusip", "31418EAB6", ""),
+            asked("isin", "US31418EAB61", ""),
+        ];
+        let sent: Vec<(String, String, String)> = sendable(&held, &list)
+            .into_iter()
+            .map(|identifier| (identifier.scheme, identifier.value, identifier.source))
+            .collect();
+        assert_eq!(
+            sent,
+            vec![(
+                AGENCY_POOL.to_string(),
+                "MA5123".to_string(),
+                "FNMA".to_string()
+            )]
         );
     }
 

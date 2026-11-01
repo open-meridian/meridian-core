@@ -57,6 +57,13 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "listing",
         sql: include_str!("../migrations/0007_listing.sql"),
     },
+    // The listing's quality counts, served without counting every row
+    // (contract v29; rulings 619 and 816).
+    Migration {
+        version: 8,
+        name: "quality_counts",
+        sql: include_str!("../migrations/0008_quality_counts.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

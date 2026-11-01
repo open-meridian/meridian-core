@@ -53,6 +53,20 @@ no brokerage, no paper account, no trading API of any kind is reached.
    overfill's excess booked to the error account with its cause; and
    operations' correction by replace after the hand-off, each fund holding
    the corrected allocation.
+13. Fixed income (contract v29; W11.1, W11.11, W11.27, W9.16; rulings 986
+   to 988): a bond fund opened with cash by operations; the harness
+   platform's corporate bond, minimum 2,000 and in 1,000s, ordered in face
+   and percent of par -- 2,500 refused naming quantity -- placed, and filled
+   whole at 98.375 per 100 of face, quoted in percent of par, a dealer the
+   contra and the firm principal, a mixed capacity refused; its lot costs
+   50,000 x 98.375 x 0.01; booked to the fund with its accrued interest, a
+   cash line of its own; and the broker's coupon over the period the
+   purchase settled in booked as the record, the cash in. Then (W12.1;
+   ruling 688) the portfolio plugin's job on the fund: the bond's accrued
+   interest as of today, from its terms and the date, exact; its clean and
+   dirty values not evaluated, the harness lake holding no close; and its
+   yields not evaluated naming `calls`, which the harness platform's bond
+   was minted without -- never a yield to maturity in its place.
 12. Execution costs (contract v27; W10.11, W11.17, ruling 510): the orders'
    account given its base currency, the portfolio plugin runs an
    execution_cost job on it; the analytics component reads the account's
@@ -71,6 +85,9 @@ import re
 import subprocess
 import sys
 import time
+import zoneinfo
+from datetime import date, datetime
+from decimal import Decimal
 
 NAME = "e2e-orders"
 PROJECT = f"meridian-core-{NAME}"
@@ -482,6 +499,96 @@ def run():
          == sorted((r["row_key"], r["version"]) for r in tca["rows"]),
          f"step 12, the same job again records nothing new: {again}")
 
+    # 13. Fixed income (contract v29; W11.1, W11.11, W11.27, W9.16; rulings
+    # 986 to 988): a bond ordered in face and percent of par, filled, booked
+    # with its accrued interest and paid its coupon.
+    bond_fund = runner("account", "Bond fund", "--instance", "desk").strip().splitlines()[-1]
+    everything = ",".join([account] + funds + [bond_fund])
+    for role in ("oms", "ems"):
+        runner("grant", "--instance", "desk", "--level", "write", "--role", role,
+               "--accounts", everything)
+    runner("grant", "--instance", "ops", "--level", "write", "--role", "operations",
+           "--accounts", everything)
+    runner("core-form", "/admin", "/admin/accounts/book", f"account_id={bond_fund}",
+           "base_currency_code=USD", "lot_relief_default=0", "waits_for_compliance=no-wait",
+           "note=The bond fund reports in dollars.")
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    page("ops", "write", f"/opening?account={bond_fund}&date={today}&cash=100000.00"
+         f"&cash_instrument={PLATFORM_USD}")
+    page("desk", "admin", f"/map?account={bond_fund}&code=SIM-BOND-1&connectivity=venue")
+    bond = page("venue", "write", "/resolve?symbol=HARN36&figi=BBG01BOND0001")["instrument_id"]
+    must(bond == "INS-01JBOND" + "0" * 19 + "1", f"step 13, the harness platform's bond: {bond}")
+    odd = refusal(page("pm", "write", f"/propose?account={bond_fund}&instrument={bond}"
+                       "&quantity=2500&basis=percent_of_par&limit=99.125&key=f0"))
+    must(odd.get("fields") == ["quantity"],
+         f"step 13, 2,500 of face is not 2,000 plus a multiple of 1,000: {odd}")
+    bought = page("pm", "write", f"/propose?account={bond_fund}&instrument={bond}"
+                  "&quantity=50000&basis=percent_of_par&limit=99.125&key=f1")
+    must(bought.get("state") == "ORDER_STATE_PROPOSED", f"step 13, a bond order in face: {bought}")
+    page("desk", "write", f"/release?order={bought['order_id']}")
+    page("desk", "write", f"/claim?order={bought['order_id']}")
+    working = page("desk", "write", f"/place?order={bought['order_id']}&quantity=50000"
+                   "&connectivity=venue&code=SIM-BOND-1")
+    until(60, lambda: working["placement_id"] in page("venue", "write", "/heard")["working"],
+          "step 13, the venue is working the bond")
+    mixed = refusal(page("venue", "write", f"/bondfill?placement={working['placement_id']}"
+                         "&price=98.375&capacity=mixed"))
+    must(mixed.get("fields") == ["capacity"], f"step 13, a mixed capacity refused: {mixed}")
+    fill = page("venue", "write", f"/bondfill?placement={working['placement_id']}&price=98.375")
+    must(fill["price_basis"] == "PRICE_BASIS_PERCENT_OF_PAR" and fill["capacity"] == "CAPACITY_PRINCIPAL"
+         and fill["contra_party_type"] == "CONTRA_PARTY_TYPE_DEALER",
+         f"step 13, the fill keeps its reporting fields: {fill}")
+    until(60, lambda: (lambda o: o if o["state"] == "ORDER_STATE_FILLED" else None)(
+        order_of(orders("desk"), bought["order_id"])), "step 13, the bond order was not filled")
+    book = store_book()
+    bond_lots = [line.split("|") for line in book.splitlines()
+                 if line.startswith(f"lot|Bond fund|{bond}|")]
+    must(len(bond_lots) == 1 and bond_lots[0][7].split(" ")[0].rstrip("0").rstrip(".") == "49187.5",
+         f"step 13, the lot costs 50,000 x 98.375 x 0.01 (987): {bond_lots}")
+    cash = lambda text: [line.split("|")[4] for line in text.splitlines()
+                         if line.startswith(f"position|Bond fund|{PLATFORM_USD}|")]
+    before = cash(book)
+    booked = page("desk", "write",
+                  f"/book?order={bought['order_id']}&executions={fill['execution_id']}"
+                  f"&alloc={bond_fund}:50000:49187.50&price=98.375&accrued=531.25")
+    must(booked.get("state") == "BOOKING_STATE_BOOKED", f"step 13, booked: {booked}")
+    after = cash(store_book())
+    must(before and after and Decimal(after[0]) - Decimal(before[0]) == Decimal("-531.25"),
+         f"step 13, the accrued its own cash line, paid (988): {before} -> {after}")
+    start = time.strftime("%Y-%m-%d", time.gmtime(time.time() - 90 * 86400))
+    end = time.strftime("%Y-%m-%d", time.gmtime(time.time() + 90 * 86400))
+    coupon = page("venue", "write", f"/coupon?account={bond_fund}&instrument={bond}&quantity=50000"
+                  f"&date={end}&start={start}&end={end}&record={today}&cash=1218.75")
+    must(coupon.get("state") == "LIFECYCLE_EVENT_STATE_BOOKED"
+         and coupon.get("event_id", "").startswith("LCE-"),
+         f"step 13, the broker's coupon booked as the record: {coupon}")
+    paid = cash(store_book())
+    must(Decimal(paid[0]) - Decimal(after[0]) == Decimal("1218.75"),
+         f"step 13, the coupon's cash in: {after} -> {paid}")
+    # The fund's accrued interest and yields (contract v29; W12.1): 50,000
+    # of face at 4.875% on 30/360 from the last 5 February or 5 August to the
+    # job's date in New York.
+    def accrued_on(day):
+        last = max(date(y, m, 5) for y in (day.year - 1, day.year) for m in (2, 8)
+                   if date(y, m, 5) <= day)
+        days = 360 * (day.year - last.year) + 30 * (day.month - last.month) + (day.day - last.day)
+        return (Decimal("50000") * Decimal("4.875") / 100 * days / 360).quantize(Decimal("0.01"))
+    new_york = zoneinfo.ZoneInfo("America/New_York")
+    before_job = datetime.now(new_york).date()
+    job = page("pm", "write", f"/bond-job?account={bond_fund}")
+    after_job = datetime.now(new_york).date()
+    accrued = [f for f in job["figures"] if f["measure"] == "accrued_interest"]
+    must(len(accrued) == 1 and accrued[0]["breakdown"] == {"instrument": bond, "component": "accrued"}
+         and Decimal(accrued[0]["value"]) in {accrued_on(before_job), accrued_on(after_job)},
+         f"step 13, the bond's accrued interest from its terms and the date, exact: {job}")
+    lines = sorted((u["measure"], u["reason"], u["detail"].split(":")[0]) for u in job["not_evaluated"])
+    must(len(lines) == 2
+         and lines[0] == ("accrued_interest", "NOT_EVALUATED_REASON_PRICE_MISSING", "clean and dirty")
+         and lines[1][:2] == ("bond_yield", "NOT_EVALUATED_REASON_TERMS_INCOMPLETE")
+         and "calls" in lines[1][2].split(", "),
+         f"step 13, no close for its values, and no yield without its calls: {job}")
+    must("bond_cash_flows" in job["models"], f"step 13, the model named: {job}")
+
     # 10. The book printed, and rebuilt from its journal line for line.
     before = store_book()
     for wanted in ("order|Orders fund|", "placement|Orders fund|", "execution|Orders fund|",
@@ -512,7 +619,9 @@ def run():
           "a block across two funds booked and handed off, each member filled by its allocation; "
           "an overfill's excess booked to the error account; a correction by replace after the "
           "hand-off; execution costs recorded by the analytics component from the order "
-          "path's orders, placements, executions and history, once; and meridian-bor rebuild "
+          "path's orders, placements, executions and history, once; a bond ordered in face "
+          "and percent of par, filled per 100 of face, booked with its accrued interest as "
+          "its own cash line and paid its coupon; and meridian-bor rebuild "
           "reproducing the book "
           "line for line")
 

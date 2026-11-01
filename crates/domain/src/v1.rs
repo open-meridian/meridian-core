@@ -55,6 +55,39 @@ pub struct UnitValue {
     #[prost(string, tag = "4")]
     pub ucum_code: ::prost::alloc::string::String,
 }
+/// How a rate accrues (FDP item 1).
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct RateConvention {
+    #[prost(enumeration = "DayCount", tag = "1")]
+    pub day_count: i32,
+    #[prost(enumeration = "Compounding", tag = "2")]
+    pub compounding: i32,
+    /// For COMPOUNDING_COMPOUNDED, the periods a year (2 for a semi-annual
+    /// bond-equivalent yield); 0 otherwise.
+    #[prost(uint32, tag = "3")]
+    pub periods_per_year: u32,
+}
+/// Contract v29 (ruling 685; W10.4, W11.1): a yield as its source quotes it,
+/// a v27 Rate-shaped value -- its value in percent, its convention and its
+/// kind after FIX YieldType (235) -- never computed by the plugin.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct QuotedYield {
+    /// A percent: 4.312 percent is 4.312, never 0.04312. Never unset.
+    #[prost(message, optional, tag = "1")]
+    pub value: ::core::option::Option<UnitValue>,
+    /// Semi-annual bond-equivalent for a US Treasury, corporate or agency; its day
+    /// count the instrument's. Never unset.
+    #[prost(message, optional, tag = "2")]
+    pub convention: ::core::option::Option<RateConvention>,
+    /// To maturity, call, put or worst, current, or discount. Unspecified is
+    /// refused.
+    #[prost(enumeration = "YieldKind", tag = "3")]
+    pub kind: i32,
+    /// States the date a yield to a call or put is to: a plain date. Empty unless
+    /// the kind is to call or to put, or to worst where worst is a call.
+    #[prost(string, tag = "4")]
+    pub to_date: ::prost::alloc::string::String,
+}
 /// The closed list of units a UnitValue takes (contract v27).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -109,6 +142,250 @@ impl ValueUnit {
             "VALUE_UNIT_DAYS" => Some(Self::Days),
             "VALUE_UNIT_INDEX" => Some(Self::Index),
             "VALUE_UNIT_UCUM" => Some(Self::Ucum),
+            _ => None,
+        }
+    }
+}
+/// The accrual basis (contract v27; widened at v29 to FIX CouponDayCount
+/// (1950)'s values, ruling 678), each mapped to CDM's DayCountFractionEnum
+/// where it has the value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum DayCount {
+    /// Not stated by the source; refused on an instrument's terms.
+    Unspecified = 0,
+    /// Actual days over 360 (FIX CouponDayCount 1950 = 6; CDM ACT/360).
+    Act360 = 1,
+    /// Actual days over 365 (1950 = 7; CDM ACT/365.FIXED).
+    Act365Fixed = 2,
+    /// Actual/actual as a rate's source states it, no variant named (v27's meaning
+    /// kept for rates; 678); refused on an instrument's terms.
+    ActAct = 3,
+    /// 30/360 as a rate's source states it, no variant named (v27's meaning kept
+    /// for rates; 678); refused on an instrument's terms.
+    Thirty360 = 4,
+    /// Business days over 252 (1950 = 12; CDM has CAL/252, not BUS/252).
+    Bus252 = 5,
+    /// 1/1 (1950 = 0; CDM 1/1).
+    OneOne = 6,
+    /// 30/360, 30U/360 or bond basis (1950 = 1; CDM 30/360): a US corporate's or
+    /// agency's.
+    Thirty360BondBasis = 7,
+    /// 30/360 (SIA), with SIFMA's end-of-February rule (1950 = 2; no CDM value:
+    /// held more).
+    Thirty360Sia = 8,
+    /// 30/360M (1950 = 3; no CDM value).
+    Thirty360M = 9,
+    /// 30E/360, the Eurobond basis (1950 = 4; CDM 30E/360).
+    ThirtyE360 = 10,
+    /// 30E/360 (ISDA) (1950 = 5; CDM 30E/360.ISDA).
+    ThirtyE360Isda = 11,
+    /// Actual/actual (AFB) (1950 = 8; CDM ACT/ACT.AFB).
+    ActActAfb = 12,
+    /// Actual/actual (ICMA) on the coupon period (1950 = 9; CDM ACT/ACT.ICMA): a
+    /// Treasury note's or bond's (31 CFR 356, Appendix B).
+    ActActIcma = 13,
+    /// Actual/actual (ICMA ultimo) (1950 = 10; no CDM value).
+    ActActIcmaUltimo = 14,
+    /// Actual/actual (ISDA) (1950 = 11; CDM ACT/ACT.ISDA).
+    ActActIsda = 15,
+    /// 30E+/360 (1950 = 13; no CDM value).
+    ThirtyEPlus360 = 16,
+    /// Actual/365L (1950 = 14; CDM ACT/365L).
+    Act365L = 17,
+    /// NL/365, leap days left out (1950 = 15; no CDM value).
+    Nl365 = 18,
+    /// NL/360 (1950 = 16; no CDM value).
+    Nl360 = 19,
+    /// Actual/364 (1950 = 17; CDM ACT/364).
+    Act364 = 20,
+}
+impl DayCount {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "DAY_COUNT_UNSPECIFIED",
+            Self::Act360 => "DAY_COUNT_ACT_360",
+            Self::Act365Fixed => "DAY_COUNT_ACT_365_FIXED",
+            Self::ActAct => "DAY_COUNT_ACT_ACT",
+            Self::Thirty360 => "DAY_COUNT_THIRTY_360",
+            Self::Bus252 => "DAY_COUNT_BUS_252",
+            Self::OneOne => "DAY_COUNT_ONE_ONE",
+            Self::Thirty360BondBasis => "DAY_COUNT_THIRTY_360_BOND_BASIS",
+            Self::Thirty360Sia => "DAY_COUNT_THIRTY_360_SIA",
+            Self::Thirty360M => "DAY_COUNT_THIRTY_360_M",
+            Self::ThirtyE360 => "DAY_COUNT_THIRTY_E_360",
+            Self::ThirtyE360Isda => "DAY_COUNT_THIRTY_E_360_ISDA",
+            Self::ActActAfb => "DAY_COUNT_ACT_ACT_AFB",
+            Self::ActActIcma => "DAY_COUNT_ACT_ACT_ICMA",
+            Self::ActActIcmaUltimo => "DAY_COUNT_ACT_ACT_ICMA_ULTIMO",
+            Self::ActActIsda => "DAY_COUNT_ACT_ACT_ISDA",
+            Self::ThirtyEPlus360 => "DAY_COUNT_THIRTY_E_PLUS_360",
+            Self::Act365L => "DAY_COUNT_ACT_365_L",
+            Self::Nl365 => "DAY_COUNT_NL_365",
+            Self::Nl360 => "DAY_COUNT_NL_360",
+            Self::Act364 => "DAY_COUNT_ACT_364",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "DAY_COUNT_UNSPECIFIED" => Some(Self::Unspecified),
+            "DAY_COUNT_ACT_360" => Some(Self::Act360),
+            "DAY_COUNT_ACT_365_FIXED" => Some(Self::Act365Fixed),
+            "DAY_COUNT_ACT_ACT" => Some(Self::ActAct),
+            "DAY_COUNT_THIRTY_360" => Some(Self::Thirty360),
+            "DAY_COUNT_BUS_252" => Some(Self::Bus252),
+            "DAY_COUNT_ONE_ONE" => Some(Self::OneOne),
+            "DAY_COUNT_THIRTY_360_BOND_BASIS" => Some(Self::Thirty360BondBasis),
+            "DAY_COUNT_THIRTY_360_SIA" => Some(Self::Thirty360Sia),
+            "DAY_COUNT_THIRTY_360_M" => Some(Self::Thirty360M),
+            "DAY_COUNT_THIRTY_E_360" => Some(Self::ThirtyE360),
+            "DAY_COUNT_THIRTY_E_360_ISDA" => Some(Self::ThirtyE360Isda),
+            "DAY_COUNT_ACT_ACT_AFB" => Some(Self::ActActAfb),
+            "DAY_COUNT_ACT_ACT_ICMA" => Some(Self::ActActIcma),
+            "DAY_COUNT_ACT_ACT_ICMA_ULTIMO" => Some(Self::ActActIcmaUltimo),
+            "DAY_COUNT_ACT_ACT_ISDA" => Some(Self::ActActIsda),
+            "DAY_COUNT_THIRTY_E_PLUS_360" => Some(Self::ThirtyEPlus360),
+            "DAY_COUNT_ACT_365_L" => Some(Self::Act365L),
+            "DAY_COUNT_NL_365" => Some(Self::Nl365),
+            "DAY_COUNT_NL_360" => Some(Self::Nl360),
+            "DAY_COUNT_ACT_364" => Some(Self::Act364),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum Compounding {
+    /// Refused.
+    Unspecified = 0,
+    Simple = 1,
+    Compounded = 2,
+    Continuous = 3,
+    Discount = 4,
+}
+impl Compounding {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "COMPOUNDING_UNSPECIFIED",
+            Self::Simple => "COMPOUNDING_SIMPLE",
+            Self::Compounded => "COMPOUNDING_COMPOUNDED",
+            Self::Continuous => "COMPOUNDING_CONTINUOUS",
+            Self::Discount => "COMPOUNDING_DISCOUNT",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "COMPOUNDING_UNSPECIFIED" => Some(Self::Unspecified),
+            "COMPOUNDING_SIMPLE" => Some(Self::Simple),
+            "COMPOUNDING_COMPOUNDED" => Some(Self::Compounded),
+            "COMPOUNDING_CONTINUOUS" => Some(Self::Continuous),
+            "COMPOUNDING_DISCOUNT" => Some(Self::Discount),
+            _ => None,
+        }
+    }
+}
+/// What one unit of a price is (contract v18; widened at v29 for fixed
+/// income, ruling 685, as FIX PriceType (423) states it). Unspecified is
+/// refused on a Price, and read as per unit on a Trade, a Quote, an order and
+/// an execution, so every row and record before v29 stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum PriceBasis {
+    /// Refused on a Price; per unit elsewhere, as before v29.
+    Unspecified = 0,
+    /// Per unit of the subject.
+    PerUnit = 1,
+    /// Contract v29: per 100 of face, clean, a Money in the instrument's currency
+    /// (FIX PriceType 423 = 1; TRACE's and FINRA's price).
+    PercentOfPar = 2,
+    /// Contract v29: a yield, in the row's yield, its money price unset where the
+    /// source states none (423 = 9; a when-issued trade before its auction).
+    Yield = 3,
+    /// Contract v29: a spread in basis points over benchmark_instrument_id, in the
+    /// row's spread fields (423 = 6).
+    Spread = 4,
+}
+impl PriceBasis {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "PRICE_BASIS_UNSPECIFIED",
+            Self::PerUnit => "PRICE_BASIS_PER_UNIT",
+            Self::PercentOfPar => "PRICE_BASIS_PERCENT_OF_PAR",
+            Self::Yield => "PRICE_BASIS_YIELD",
+            Self::Spread => "PRICE_BASIS_SPREAD",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "PRICE_BASIS_UNSPECIFIED" => Some(Self::Unspecified),
+            "PRICE_BASIS_PER_UNIT" => Some(Self::PerUnit),
+            "PRICE_BASIS_PERCENT_OF_PAR" => Some(Self::PercentOfPar),
+            "PRICE_BASIS_YIELD" => Some(Self::Yield),
+            "PRICE_BASIS_SPREAD" => Some(Self::Spread),
+            _ => None,
+        }
+    }
+}
+/// Contract v29: what a quoted yield is to, after FIX YieldType (235).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum YieldKind {
+    /// Refused.
+    Unspecified = 0,
+    /// To maturity (FIX YieldType 235 MATURITY).
+    ToMaturity = 1,
+    /// To the call date in to_date (CALL).
+    ToCall = 2,
+    /// To the put date in to_date (PUT).
+    ToPut = 3,
+    /// To the lower of call and maturity, MSRB G-15's disclosed yield (WORST).
+    ToWorst = 4,
+    /// The coupon over the price (CURRENT).
+    Current = 5,
+    /// A bill's bank-discount rate (a Treasury bill's quote).
+    Discount = 6,
+}
+impl YieldKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "YIELD_KIND_UNSPECIFIED",
+            Self::ToMaturity => "YIELD_KIND_TO_MATURITY",
+            Self::ToCall => "YIELD_KIND_TO_CALL",
+            Self::ToPut => "YIELD_KIND_TO_PUT",
+            Self::ToWorst => "YIELD_KIND_TO_WORST",
+            Self::Current => "YIELD_KIND_CURRENT",
+            Self::Discount => "YIELD_KIND_DISCOUNT",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "YIELD_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "YIELD_KIND_TO_MATURITY" => Some(Self::ToMaturity),
+            "YIELD_KIND_TO_CALL" => Some(Self::ToCall),
+            "YIELD_KIND_TO_PUT" => Some(Self::ToPut),
+            "YIELD_KIND_TO_WORST" => Some(Self::ToWorst),
+            "YIELD_KIND_CURRENT" => Some(Self::Current),
+            "YIELD_KIND_DISCOUNT" => Some(Self::Discount),
             _ => None,
         }
     }
@@ -181,6 +458,13 @@ pub struct MoneyMarketFund {
 /// present and why a bare symbol can never drive a global resolve.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Identifier {
+    /// Contract v29 (677): agency_pool, an open scheme, names an agency pool by
+    /// the agency's pool number, the agency in source (FNMA, FHLMC, GNMA); a
+    /// debt record matches on figi and agency_pool, and its cusip and isin stay
+    /// deployment-side, mapped to FIGI at the edge. Contract v29 (715): mpid,
+    /// clearing_number, branch_sequence and finra_symbol name market
+    /// participants and a security for trade reports, finra_symbol
+    /// deployment-side (745).
     #[prost(string, tag = "1")]
     pub scheme: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
@@ -327,6 +611,27 @@ pub struct InstrumentRecord {
     /// type is future.
     #[prost(message, optional, tag = "23")]
     pub future: ::core::option::Option<FutureContract>,
+    /// Contract v29: a bond's terms: a Treasury, STRIPS component, agency,
+    /// corporate, municipal or (booked, not minted) SSA bond (676). Unset unless
+    /// the record's type is bond.
+    #[prost(message, optional, tag = "24")]
+    pub bond: ::core::option::Option<Bond>,
+    /// Contract v29: an agency pool's terms (680). Unset unless the record's type
+    /// is mbs_pool.
+    #[prost(message, optional, tag = "25")]
+    pub mbs_pool: ::core::option::Option<MbsPool>,
+    /// Contract v29: an agency TBA's terms (681). Unset unless the record's type
+    /// is tba.
+    #[prost(message, optional, tag = "26")]
+    pub tba: ::core::option::Option<Tba>,
+    /// Contract v29: an agency REMIC class's terms (682, 588). Unset unless the
+    /// record's type is cmo_tranche.
+    #[prost(message, optional, tag = "27")]
+    pub cmo_tranche: ::core::option::Option<CmoTranche>,
+    /// Contract v29: a brokered CD's terms (676). Unset unless the record's type
+    /// is certificate_of_deposit.
+    #[prost(message, optional, tag = "28")]
+    pub certificate_of_deposit: ::core::option::Option<CertificateOfDeposit>,
 }
 /// One value for a deployment's record, set or offered, with where it came
 /// from (W3.10, W3.1, W3.3).
@@ -1774,6 +2079,12 @@ pub struct TradingSession {
     /// An extended session: pre-market or after-hours.
     #[prost(bool, tag = "4")]
     pub extended: bool,
+    /// Contract v29: a plain date, as CalendarWeekend.valid_from_date says a
+    /// weekend's: a session's hours that changed are two rows, each from its date,
+    /// so a backfill to 2016 states the hours in force then (FINRA's 08:00 to
+    /// 20:00 among them). Empty: in force since the calendar's coverage began.
+    #[prost(string, tag = "5")]
+    pub valid_from_date: ::prost::alloc::string::String,
 }
 /// One dated day's sessions, in place of the weekday's.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -2523,7 +2834,9 @@ pub struct SecurityTemplate {
     #[prost(message, repeated, tag = "8")]
     pub fields: ::prost::alloc::vec::Vec<TemplateField>,
     /// The identifier schemes it matches on, each by its scheme's spelling,
-    /// share_class_figi first.
+    /// share_class_figi first. Contract v29 (677): a debt template matches on
+    /// figi and agency_pool, the terms (issuer, coupon, maturity) checked on
+    /// mint, a disagreement a near-match.
     #[prost(string, repeated, tag = "9")]
     pub match_rule: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     /// Contract v26 (W1.24; the intent's rulings 9 and 11; the v26 plan's
@@ -3184,6 +3497,470 @@ pub struct MatchOrMintCompanyReply {
     #[prost(bool, tag = "3")]
     pub pending_review: bool,
 }
+/// Contract v29 (InstrumentRecord.bond; 676): a bond's terms -- a Treasury, a
+/// STRIPS component, an agency debenture or discount note, a corporate, a
+/// municipal, or (booked, not minted) an SSA bond -- with FIX SecurityType (167)
+/// a field.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Bond {
+    /// One of FIX's debt values, so one template carries every bond as FIX carries
+    /// every debt type in one instrument block (676). Never unspecified on a
+    /// record.
+    #[prost(enumeration = "DebtSecurityType", tag = "1")]
+    pub security_type: i32,
+    /// The issuer's ENT- company record (W1.32); a STRIPS component's is its whole
+    /// bond's issuer. Never empty on a record.
+    #[prost(string, tag = "2")]
+    pub issuer_company_id: ::prost::alloc::string::String,
+    /// One of six values, mapped to CDM's CollateralEntityTypeEnum; municipal and
+    /// sub-sovereign held apart because MSRB's rules and tax status follow
+    /// municipal. Never unspecified on a record.
+    #[prost(enumeration = "IssuerType", tag = "3")]
+    pub issuer_type: i32,
+    /// The guarantor's ENT- company record. Empty where none guarantees it.
+    #[prost(string, tag = "4")]
+    pub guarantor_company_id: ::prost::alloc::string::String,
+    /// An ISO 3166-1 alpha-2 country code, or ISO 3166-2 for a state: US-NY. Empty
+    /// where the platform's source states none.
+    #[prost(string, tag = "5")]
+    pub governing_law: ::prost::alloc::string::String,
+    /// States where the bond was issued (FIX CountryOfIssue, 470): an ISO 3166-1
+    /// alpha-2 code. Empty until the platform's source states it.
+    #[prost(string, tag = "6")]
+    pub country_of_issue: ::prost::alloc::string::String,
+    /// An ISO 3166-2 subdivision code without its country: NY. Empty on a bond
+    /// issued under no state.
+    #[prost(string, tag = "7")]
+    pub state_or_province_of_issue: ::prost::alloc::string::String,
+    /// A plain date; a trade before it is when-issued (the reporting intent's
+    /// derived row). Never empty on a record.
+    #[prost(string, tag = "8")]
+    pub issue_date: ::prost::alloc::string::String,
+    /// States the date interest accrues from (FIX DatedDate, 873): a plain date.
+    /// Empty until the source states it; a zero coupon's is its issue date.
+    #[prost(string, tag = "9")]
+    pub dated_date: ::prost::alloc::string::String,
+    /// A plain date; a short or long first period follows from it and the dated
+    /// date. Empty on a zero coupon.
+    #[prost(string, tag = "10")]
+    pub first_coupon_date: ::prost::alloc::string::String,
+    /// States when principal is repaid (FIX MaturityDate, 541): a plain date,
+    /// unadjusted. Never empty on a record.
+    #[prost(string, tag = "11")]
+    pub maturity_date: ::prost::alloc::string::String,
+    /// The annual rate; on a floater the current period's rate is the engine's,
+    /// never stored here. 0 on a zero coupon; on a when-issued Treasury empty
+    /// until the auction, the record incomplete listing it, filled as a dated term
+    /// version (decisions/034).
+    #[prost(message, optional, tag = "12")]
+    pub coupon_rate: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// States how the coupon is set (FIX CouponType, 1946): fixed, floating, zero
+    /// or step. Never unspecified on a record.
+    #[prost(enumeration = "CouponType", tag = "13")]
+    pub coupon_type: i32,
+    /// Payments a year: 2 semi-annual, 12 monthly. 0 on a zero coupon.
+    #[prost(uint32, tag = "14")]
+    pub coupon_frequency: u32,
+    /// One of FIX 1950's values, its variant exact: a corporate's 30/360 bond
+    /// basis, a Treasury's actual/actual ICMA. Never unspecified on a record;
+    /// DAY_COUNT_ACT_ACT and DAY_COUNT_THIRTY_360, which name no variant, are
+    /// refused here.
+    #[prost(enumeration = "DayCount", tag = "15")]
+    pub day_count: i32,
+    /// Following unless the terms say otherwise; accrual stays unadjusted.
+    /// Unspecified until stated.
+    #[prost(enumeration = "BusinessDayConvention", tag = "16")]
+    pub business_day_convention: i32,
+    /// A CAL- calendar: the SIFMA US government securities calendar for a Treasury
+    /// or an agency. Empty until stated.
+    #[prost(string, tag = "17")]
+    pub payment_calendar_id: ::prost::alloc::string::String,
+    /// True where a coupon date on a month's last day stays on each month's last
+    /// day. False: dates keep their day of month.
+    #[prost(bool, tag = "18")]
+    pub end_of_month: bool,
+    /// The rule, its days in record_date_days. Unspecified until stated.
+    #[prost(enumeration = "RecordDateRule", tag = "19")]
+    pub record_date_rule: i32,
+    /// Days before the payment date, as the rule counts them. 0 where the rule
+    /// needs no days.
+    #[prost(uint32, tag = "20")]
+    pub record_date_days: u32,
+    /// Face, in the record's currency. Unset until stated.
+    #[prost(message, optional, tag = "21")]
+    pub minimum_denomination: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// Face, in the record's currency. Unset until stated.
+    #[prost(message, optional, tag = "22")]
+    pub denomination_increment: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// Face, in the record's currency, at issue. Unset where not stated.
+    #[prost(message, optional, tag = "23")]
+    pub original_issue_amount: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// Secured, senior or subordinated. Unspecified where not stated.
+    #[prost(enumeration = "Seniority", tag = "24")]
+    pub seniority: i32,
+    /// True where sold under SEC Rule 144A. False: not a Rule 144A issue, or not
+    /// stated.
+    #[prost(bool, tag = "25")]
+    pub rule_144a: bool,
+    /// True where sold under SEC Regulation S. False: not a Regulation S issue, or
+    /// not stated.
+    #[prost(bool, tag = "26")]
+    pub reg_s: bool,
+    /// Its index, spread, multiplier, cap, floor, reset and lookback. Unset unless
+    /// the coupon type is floating; refused set otherwise.
+    #[prost(message, optional, tag = "27")]
+    pub floating: ::core::option::Option<FloatingRateTerms>,
+    /// A referential index record: CPI-U for TIPS (31 CFR 356, Appendix B). Empty
+    /// unless the security type is TIPS.
+    #[prost(string, tag = "28")]
+    pub inflation_index_instrument_id: ::prost::alloc::string::String,
+    /// The reference CPI the index ratio is taken against. Unset unless the
+    /// security type is TIPS.
+    #[prost(message, optional, tag = "29")]
+    pub base_index_level: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// States a step-up's rates by date: each row a rate from its date. None
+    /// unless the coupon type is step.
+    #[prost(message, repeated, tag = "30")]
+    pub coupon_steps: ::prost::alloc::vec::Vec<CouponStep>,
+    /// Each row a window: kind, dates, price or make-whole spread, notice and
+    /// style; yield to worst reads every row. None on a bond the issuer may not
+    /// call; a callable bond minted without them is incomplete, listing them (the
+    /// plan's risk 3).
+    #[prost(message, repeated, tag = "31")]
+    pub calls: ::prost::alloc::vec::Vec<RedemptionWindow>,
+    /// States the holder's put schedule (679): each row a window, as calls. None
+    /// on a bond with no put.
+    #[prost(message, repeated, tag = "32")]
+    pub puts: ::prost::alloc::vec::Vec<RedemptionWindow>,
+    /// Each row a date, the face redeemed and its price. None on a bond with no
+    /// mandatory sinking fund.
+    #[prost(message, repeated, tag = "33")]
+    pub sinking_funds: ::prost::alloc::vec::Vec<SinkingFundPayment>,
+    /// Its tax status, bank qualification, obligor, insurer and refunding. Unset
+    /// on a bond that is no municipal.
+    #[prost(message, optional, tag = "34")]
+    pub municipal: ::core::option::Option<MunicipalTerms>,
+    /// The whole bond's INS- record, a term on the record and never inferred.
+    /// Empty unless the security type is TINT or TPRN.
+    #[prost(string, tag = "35")]
+    pub stripped_from: ::prost::alloc::string::String,
+}
+/// Contract v29: a floater's terms -- its index, spread, multiplier, cap, floor,
+/// reset and lookback (ARRC's in-arrears convention) -- on a bond or a tranche.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FloatingRateTerms {
+    /// A referential record: SOFR, the 13-week bill's high rate (a Treasury FRN),
+    /// EFFR. Never empty when the terms are set.
+    #[prost(string, tag = "1")]
+    pub index_instrument_id: ::prost::alloc::string::String,
+    /// Signed, added to the index times the multiplier. 0 is a value.
+    #[prost(message, optional, tag = "2")]
+    pub spread_bps: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// Signed: negative on an inverse floater. Unset: 1.
+    #[prost(message, optional, tag = "3")]
+    pub multiplier: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// States the most the rate may be: the cap. Unset: no cap.
+    #[prost(message, optional, tag = "4")]
+    pub cap_rate: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// States the least the rate may be: the floor. Unset: no floor; 0 is a value
+    /// (a Treasury FRN's floor).
+    #[prost(message, optional, tag = "5")]
+    pub floor_rate: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// Resets a year: 52 for a Treasury FRN's weekly reset, 4 quarterly. 0 until
+    /// stated.
+    #[prost(uint32, tag = "6")]
+    pub reset_frequency: u32,
+    /// Business days before each accrual day. 0: no lookback.
+    #[prost(uint32, tag = "7")]
+    pub lookback_days: u32,
+    /// True for a SOFR in-arrears floater. False: set in advance.
+    #[prost(bool, tag = "8")]
+    pub in_arrears: bool,
+}
+/// Contract v29: one row of a step-up bond's schedule (574's repeated group).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CouponStep {
+    /// States when a step's rate starts: a plain date. Never empty.
+    #[prost(string, tag = "1")]
+    pub from_date: ::prost::alloc::string::String,
+    /// The annual rate from from_date. Never unset.
+    #[prost(message, optional, tag = "2")]
+    pub coupon_rate: ::core::option::Option<::meridian_pb::v1::Decimal>,
+}
+/// Contract v29 (679, 747): one row of a call or put schedule, as US
+/// prospectuses state optional redemption: its kind, dates, price or the
+/// make-whole's spread and benchmark, notice and style. One message for calls
+/// and puts.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RedemptionWindow {
+    /// Make-whole, par, premium or sinking fund; a put's is par or premium. Never
+    /// unspecified.
+    #[prost(enumeration = "RedemptionKind", tag = "1")]
+    pub kind: i32,
+    /// A plain date, inclusive: the par call date opens the par window. Never
+    /// empty.
+    #[prost(string, tag = "2")]
+    pub from_date: ::prost::alloc::string::String,
+    /// States when the window closes: a plain date, inclusive. Empty: to maturity.
+    #[prost(string, tag = "3")]
+    pub to_date: ::prost::alloc::string::String,
+    /// Per 100 of face, before accrued. Unset on a make-whole window.
+    #[prost(message, optional, tag = "4")]
+    pub price: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// Added to the benchmark to discount remaining payments, semi-annually on
+    /// 30/360, to the par call date (R2). Unset unless the kind is make-whole.
+    #[prost(message, optional, tag = "5")]
+    pub make_whole_spread_bps: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// A rate_curve record: the H.15 Treasury constant maturities, interpolated to
+    /// the par call date. Empty unless the kind is make-whole.
+    #[prost(string, tag = "6")]
+    pub make_whole_benchmark_instrument_id: ::prost::alloc::string::String,
+    /// Calendar days before the redemption date. 0 where not stated.
+    #[prost(uint32, tag = "7")]
+    pub notice_days_min: u32,
+    /// Calendar days before the redemption date. 0 where not stated.
+    #[prost(uint32, tag = "8")]
+    pub notice_days_max: u32,
+    /// One date, each coupon date, or any business day. Never unspecified.
+    #[prost(enumeration = "RedemptionStyle", tag = "9")]
+    pub style: i32,
+}
+/// Contract v29 (679): one mandatory sinking-fund redemption.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SinkingFundPayment {
+    /// States a mandatory redemption's date: a plain date. Never empty.
+    #[prost(string, tag = "1")]
+    pub date: ::prost::alloc::string::String,
+    /// Face, in the record's currency. Never unset.
+    #[prost(message, optional, tag = "2")]
+    pub face_amount: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// States the sinking-fund price: per 100 of face. Unset: par.
+    #[prost(message, optional, tag = "3")]
+    pub price: ::core::option::Option<::meridian_pb::v1::Decimal>,
+}
+/// Contract v29: a municipal bond's terms, an optional group on bond (676).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MunicipalTerms {
+    /// States the federal tax status: exempt or taxable. Unspecified until stated.
+    #[prost(enumeration = "FederalTaxStatus", tag = "1")]
+    pub federal_tax_status: i32,
+    /// True where interest is a preference item for the AMT. False: not subject to
+    /// the alternative minimum tax, or not stated.
+    #[prost(bool, tag = "2")]
+    pub subject_to_amt: bool,
+    /// True where exempt in state_or_province_of_issue. False: not stated.
+    #[prost(bool, tag = "3")]
+    pub state_tax_exempt: bool,
+    /// True where designated under IRC 265(b)(3). False: not bank qualified, or
+    /// not stated.
+    #[prost(bool, tag = "4")]
+    pub bank_qualified: bool,
+    /// Names the conduit obligor: the obligor's ENT- record. Empty unless a
+    /// conduit issue.
+    #[prost(string, tag = "5")]
+    pub obligor_company_id: ::prost::alloc::string::String,
+    /// Names the bond insurer: the insurer's ENT- record. Empty unless insured.
+    #[prost(string, tag = "6")]
+    pub insurer_company_id: ::prost::alloc::string::String,
+    /// Set by a dated term version on the event (decisions/034), refunded_to_date
+    /// with it. Unspecified: none.
+    #[prost(enumeration = "RefundingStatus", tag = "7")]
+    pub refunding_status: i32,
+    /// States the date a pre-refunded bond is redeemed on: a plain date. Empty
+    /// unless pre-refunded.
+    #[prost(string, tag = "8")]
+    pub refunded_to_date: ::prost::alloc::string::String,
+}
+/// Contract v29 (InstrumentRecord.mbs_pool; 680): an agency pass-through pool's
+/// terms. Its factor is the lake's Factor row (W10.4), never a term; lots stay
+/// in original face.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MbsPool {
+    /// Fannie Mae, Freddie Mac or Ginnie Mae. Never unspecified.
+    #[prost(enumeration = "MortgageAgency", tag = "1")]
+    pub agency: i32,
+    /// As the agency's disclosure names its prefix or program: UMBS 30-year,
+    /// Ginnie Mae II. Never empty.
+    #[prost(string, tag = "2")]
+    pub program: ::prost::alloc::string::String,
+    /// The agency's pool number, also the record's agency_pool identifier. Never
+    /// empty.
+    #[prost(string, tag = "3")]
+    pub pool_number: ::prost::alloc::string::String,
+    /// States the coupon passed to holders: the annual pass-through rate. Never
+    /// unset.
+    #[prost(message, optional, tag = "4")]
+    pub pass_through_rate: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// States the pool's issue date: a plain date. Never empty.
+    #[prost(string, tag = "5")]
+    pub issue_date: ::prost::alloc::string::String,
+    /// States the pool's final payment date: a plain date. Never empty.
+    #[prost(string, tag = "6")]
+    pub maturity_date: ::prost::alloc::string::String,
+    /// Face at issue; current face is original face times the latest Factor row
+    /// (680). Unset until stated.
+    #[prost(message, optional, tag = "7")]
+    pub original_face: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// States the loans' original term: months: 360, 180. 0 until stated.
+    #[prost(uint32, tag = "8")]
+    pub original_term_months: u32,
+    /// 30/360 bond basis for agency pools. Unspecified until stated.
+    #[prost(enumeration = "DayCount", tag = "9")]
+    pub day_count: i32,
+    /// Days from the accrual period's start to payment: 55 for UMBS, 45 for Ginnie
+    /// Mae I, 50 for Ginnie Mae II. 0 until stated.
+    #[prost(uint32, tag = "10")]
+    pub payment_delay_days: u32,
+    /// 25 for UMBS, 15 for Ginnie Mae I, 20 for Ginnie Mae II, rolled on the
+    /// payment calendar. 0 until stated.
+    #[prost(uint32, tag = "11")]
+    pub payment_day: u32,
+    /// The last day of the month before the payment month for agency pools.
+    /// Unspecified until stated.
+    #[prost(enumeration = "RecordDateRule", tag = "12")]
+    pub record_date_rule: i32,
+    /// Names the payment calendar: a CAL- calendar. Empty until stated.
+    #[prost(string, tag = "13")]
+    pub payment_calendar_id: ::prost::alloc::string::String,
+}
+/// Contract v29 (InstrumentRecord.tba; 681): an agency TBA by agency or program,
+/// coupon, term and settlement month, held as a forward in original face until a
+/// tba allocation record names the pools delivered.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Tba {
+    /// Fannie Mae or Freddie Mac for a UMBS TBA (either delivers), Ginnie Mae for
+    /// its own. Never unspecified.
+    #[prost(enumeration = "MortgageAgency", tag = "1")]
+    pub agency: i32,
+    /// UMBS 30-year, UMBS 15-year, Ginnie Mae II 30-year. Never empty.
+    #[prost(string, tag = "2")]
+    pub program: ::prost::alloc::string::String,
+    /// The pass-through rate the delivered pools carry. Never unset.
+    #[prost(message, optional, tag = "3")]
+    pub pass_through_rate: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// States the term: 360 or 180. Never 0.
+    #[prost(uint32, tag = "4")]
+    pub original_term_months: u32,
+    /// YYYYMM; the settlement date is SIFMA's class date in it. Never empty.
+    #[prost(string, tag = "5")]
+    pub settlement_month: ::prost::alloc::string::String,
+    /// Which of SIFMA's monthly class dates it settles on. Unspecified until
+    /// stated.
+    #[prost(enumeration = "SifmaSettlementClass", tag = "6")]
+    pub sifma_class: i32,
+    /// A plain date from SIFMA's calendar; pools are notified 48 hours before.
+    /// Empty until SIFMA publishes the month's date.
+    #[prost(string, tag = "7")]
+    pub settlement_date: ::prost::alloc::string::String,
+}
+/// Contract v29 (InstrumentRecord.cmo_tranche; 682, 588): an agency REMIC
+/// class's terms, book-first: held, valued and paid down from the agency's
+/// published factors. No waterfall model is held.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CmoTranche {
+    /// Fannie Mae, Freddie Mac or Ginnie Mae (agency REMICs only, 588). Never
+    /// unspecified.
+    #[prost(enumeration = "MortgageAgency", tag = "1")]
+    pub agency: i32,
+    /// The series as the agency's prospectus supplement names it: 2024-12. Never
+    /// empty.
+    #[prost(string, tag = "2")]
+    pub deal: ::prost::alloc::string::String,
+    /// As the prospectus supplement names it: PA, Z, IO. Never empty.
+    #[prost(string, tag = "3")]
+    pub class_name: ::prost::alloc::string::String,
+    /// Each as the supplement's principal-type column lists it. None until stated.
+    #[prost(enumeration = "PrincipalType", repeated, tag = "4")]
+    pub principal_types: ::prost::alloc::vec::Vec<i32>,
+    /// Each as the supplement's interest-type column lists it; a Z's accretion and
+    /// an IO's notional fall are accretion records (W9.16). None until stated.
+    #[prost(enumeration = "InterestType", repeated, tag = "5")]
+    pub interest_types: ::prost::alloc::vec::Vec<i32>,
+    /// Face at issue, or an IO's original notional. Unset until stated.
+    #[prost(message, optional, tag = "6")]
+    pub original_face: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// States a fixed class's coupon: the annual rate. 0 on a PO; unset on a
+    /// floater, whose rate floating sets.
+    #[prost(message, optional, tag = "7")]
+    pub coupon_rate: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// Carries a floater's index, multiplier, cap and floor: as on a bond. Unset
+    /// unless a floater or an inverse floater.
+    #[prost(message, optional, tag = "8")]
+    pub floating: ::core::option::Option<FloatingRateTerms>,
+    /// States the deal's closing date: a plain date. Never empty.
+    #[prost(string, tag = "9")]
+    pub issue_date: ::prost::alloc::string::String,
+    /// States the class's final distribution date: a plain date. Empty until
+    /// stated.
+    #[prost(string, tag = "10")]
+    pub maturity_date: ::prost::alloc::string::String,
+    /// States the accrual basis: as the supplement states it. Unspecified until
+    /// stated.
+    #[prost(enumeration = "DayCount", tag = "11")]
+    pub day_count: i32,
+    /// Days from the accrual period's start to payment. 0: no delay (a floater
+    /// often has none).
+    #[prost(uint32, tag = "12")]
+    pub payment_delay_days: u32,
+    /// Rolled on the payment calendar. 0 until stated.
+    #[prost(uint32, tag = "13")]
+    pub payment_day: u32,
+    /// States the class's record date rule: as the supplement states it.
+    /// Unspecified until stated.
+    #[prost(enumeration = "RecordDateRule", tag = "14")]
+    pub record_date_rule: i32,
+    /// States the record date's offset: days before the payment date. 0 where the
+    /// rule needs none.
+    #[prost(uint32, tag = "15")]
+    pub record_date_days: u32,
+}
+/// Contract v29 (InstrumentRecord.certificate_of_deposit; 676): a brokered
+/// certificate of deposit's terms.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CertificateOfDeposit {
+    /// Its ENT- record, its FDIC certificate number an identifier there. Never
+    /// empty.
+    #[prost(string, tag = "1")]
+    pub issuer_company_id: ::prost::alloc::string::String,
+    /// States the issue date: a plain date. Never empty.
+    #[prost(string, tag = "2")]
+    pub issue_date: ::prost::alloc::string::String,
+    /// States the maturity: a plain date. Never empty.
+    #[prost(string, tag = "3")]
+    pub maturity_date: ::prost::alloc::string::String,
+    /// States the rate: the annual rate. 0 on a zero-coupon CD.
+    #[prost(message, optional, tag = "4")]
+    pub coupon_rate: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// Payments a year. 0 on a CD paying at maturity.
+    #[prost(uint32, tag = "5")]
+    pub coupon_frequency: u32,
+    /// As the disclosure states it, often actual/365 fixed. Unspecified until
+    /// stated.
+    #[prost(enumeration = "DayCount", tag = "6")]
+    pub day_count: i32,
+    /// States how a payment date moves: following unless stated. Unspecified until
+    /// stated.
+    #[prost(enumeration = "BusinessDayConvention", tag = "7")]
+    pub business_day_convention: i32,
+    /// Names the payment calendar: a CAL- calendar. Empty until stated.
+    #[prost(string, tag = "8")]
+    pub payment_calendar_id: ::prost::alloc::string::String,
+    /// Face, in the record's currency. Unset until stated.
+    #[prost(message, optional, tag = "9")]
+    pub minimum_denomination: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// True where the disclosure states FDIC insurance, to the FDIC's limit per
+    /// depositor and bank. False: not stated as insured.
+    #[prost(bool, tag = "10")]
+    pub deposit_insured: bool,
+    /// States the bank's call schedule: each row a window. None on a non-callable
+    /// CD.
+    #[prost(message, repeated, tag = "11")]
+    pub calls: ::prost::alloc::vec::Vec<RedemptionWindow>,
+    /// True where an estate may redeem at par on the holder's death. False: none,
+    /// or not stated.
+    #[prost(bool, tag = "12")]
+    pub survivor_option: bool,
+}
 /// Lifecycle. The transition verbs are the commands; nothing sets this directly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -3340,6 +4117,22 @@ pub enum InstrumentType {
     /// Contract v28: Under referential: a commodity a future is written on, never
     /// held.
     Commodity = 9,
+    /// Contract v29: under debt: a bond -- a Treasury, a STRIPS component, an
+    /// agency debenture or discount note, a corporate, a municipal; FIX
+    /// SecurityType (167) a field of Bond.
+    Bond = 10,
+    /// Contract v29: under debt: an agency pass-through pool, with the attributes
+    /// of MbsPool; its factor the lake's.
+    MbsPool = 11,
+    /// Contract v29: under debt: an agency TBA by program, coupon, term and
+    /// settlement month, with the attributes of Tba.
+    Tba = 12,
+    /// Contract v29: under debt: an agency REMIC class, with the attributes of
+    /// CmoTranche.
+    CmoTranche = 13,
+    /// Contract v29: under debt: a brokered certificate of deposit, with the
+    /// attributes of CertificateOfDeposit.
+    CertificateOfDeposit = 14,
 }
 impl InstrumentType {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -3358,6 +4151,11 @@ impl InstrumentType {
             Self::Future => "INSTRUMENT_TYPE_FUTURE",
             Self::FutureOption => "INSTRUMENT_TYPE_FUTURE_OPTION",
             Self::Commodity => "INSTRUMENT_TYPE_COMMODITY",
+            Self::Bond => "INSTRUMENT_TYPE_BOND",
+            Self::MbsPool => "INSTRUMENT_TYPE_MBS_POOL",
+            Self::Tba => "INSTRUMENT_TYPE_TBA",
+            Self::CmoTranche => "INSTRUMENT_TYPE_CMO_TRANCHE",
+            Self::CertificateOfDeposit => "INSTRUMENT_TYPE_CERTIFICATE_OF_DEPOSIT",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -3373,6 +4171,11 @@ impl InstrumentType {
             "INSTRUMENT_TYPE_FUTURE" => Some(Self::Future),
             "INSTRUMENT_TYPE_FUTURE_OPTION" => Some(Self::FutureOption),
             "INSTRUMENT_TYPE_COMMODITY" => Some(Self::Commodity),
+            "INSTRUMENT_TYPE_BOND" => Some(Self::Bond),
+            "INSTRUMENT_TYPE_MBS_POOL" => Some(Self::MbsPool),
+            "INSTRUMENT_TYPE_TBA" => Some(Self::Tba),
+            "INSTRUMENT_TYPE_CMO_TRANCHE" => Some(Self::CmoTranche),
+            "INSTRUMENT_TYPE_CERTIFICATE_OF_DEPOSIT" => Some(Self::CertificateOfDeposit),
             _ => None,
         }
     }
@@ -4362,6 +5165,590 @@ impl SeriesRequestCause {
             "SERIES_REQUEST_CAUSE_UNSPECIFIED" => Some(Self::Unspecified),
             "SERIES_REQUEST_CAUSE_ORDER" => Some(Self::Order),
             "SERIES_REQUEST_CAUSE_STANDING" => Some(Self::Standing),
+            _ => None,
+        }
+    }
+}
+/// Contract v29 (676): which kind of debt security a bond is, after FIX
+/// SecurityType (167).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum DebtSecurityType {
+    /// Refused.
+    Unspecified = 0,
+    /// A US Treasury bill (FIX 167 TBILL), a zero coupon.
+    Tbill = 1,
+    /// A US Treasury note (TNOTE).
+    Tnote = 2,
+    /// A US Treasury bond (TBOND).
+    Tbond = 3,
+    /// A Treasury inflation-protected security (TIPS).
+    Tips = 4,
+    /// A floating rate note (FRN): a Treasury FRN indexed to the 13-week bill, or
+    /// an agency or corporate floater.
+    Frn = 5,
+    /// A STRIPS interest component (TINT), a zero coupon.
+    Tint = 6,
+    /// A STRIPS principal component (TPRN), a zero coupon.
+    Tprn = 7,
+    /// A US agency coupon debenture (FAC).
+    Fac = 8,
+    /// A US agency discount note (FADN).
+    Fadn = 9,
+    /// A corporate bond (CORP).
+    Corp = 10,
+    /// A Yankee bond: a USD bond of a foreign issuer registered in the US (YANK).
+    Yank = 11,
+    /// A municipal general obligation bond (GO).
+    Go = 12,
+    /// A municipal revenue bond (REV).
+    Rev = 13,
+    /// A supranational bond (SUPRA); booked, its minting and curation wait for USD
+    /// EM (675).
+    Supra = 14,
+}
+impl DebtSecurityType {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "DEBT_SECURITY_TYPE_UNSPECIFIED",
+            Self::Tbill => "DEBT_SECURITY_TYPE_TBILL",
+            Self::Tnote => "DEBT_SECURITY_TYPE_TNOTE",
+            Self::Tbond => "DEBT_SECURITY_TYPE_TBOND",
+            Self::Tips => "DEBT_SECURITY_TYPE_TIPS",
+            Self::Frn => "DEBT_SECURITY_TYPE_FRN",
+            Self::Tint => "DEBT_SECURITY_TYPE_TINT",
+            Self::Tprn => "DEBT_SECURITY_TYPE_TPRN",
+            Self::Fac => "DEBT_SECURITY_TYPE_FAC",
+            Self::Fadn => "DEBT_SECURITY_TYPE_FADN",
+            Self::Corp => "DEBT_SECURITY_TYPE_CORP",
+            Self::Yank => "DEBT_SECURITY_TYPE_YANK",
+            Self::Go => "DEBT_SECURITY_TYPE_GO",
+            Self::Rev => "DEBT_SECURITY_TYPE_REV",
+            Self::Supra => "DEBT_SECURITY_TYPE_SUPRA",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "DEBT_SECURITY_TYPE_UNSPECIFIED" => Some(Self::Unspecified),
+            "DEBT_SECURITY_TYPE_TBILL" => Some(Self::Tbill),
+            "DEBT_SECURITY_TYPE_TNOTE" => Some(Self::Tnote),
+            "DEBT_SECURITY_TYPE_TBOND" => Some(Self::Tbond),
+            "DEBT_SECURITY_TYPE_TIPS" => Some(Self::Tips),
+            "DEBT_SECURITY_TYPE_FRN" => Some(Self::Frn),
+            "DEBT_SECURITY_TYPE_TINT" => Some(Self::Tint),
+            "DEBT_SECURITY_TYPE_TPRN" => Some(Self::Tprn),
+            "DEBT_SECURITY_TYPE_FAC" => Some(Self::Fac),
+            "DEBT_SECURITY_TYPE_FADN" => Some(Self::Fadn),
+            "DEBT_SECURITY_TYPE_CORP" => Some(Self::Corp),
+            "DEBT_SECURITY_TYPE_YANK" => Some(Self::Yank),
+            "DEBT_SECURITY_TYPE_GO" => Some(Self::Go),
+            "DEBT_SECURITY_TYPE_REV" => Some(Self::Rev),
+            "DEBT_SECURITY_TYPE_SUPRA" => Some(Self::Supra),
+            _ => None,
+        }
+    }
+}
+/// Contract v29 (587, 677): the issuer's class, mapped to CDM's
+/// CollateralEntityTypeEnum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum IssuerType {
+    /// Refused.
+    Unspecified = 0,
+    /// A national government or its treasury: CDM SovereignCentralBank.
+    Sovereign = 1,
+    /// A government agency or sponsored enterprise (FHLB, Farm Credit, Fannie Mae,
+    /// Freddie Mac, TVA, Ginnie Mae): CDM QuasiGovernment.
+    Agency = 2,
+    /// A supranational entity: CDM SupraNational.
+    Supranational = 3,
+    /// A state, province or region issuing outside a municipal regime: CDM
+    /// RegionalGovernment.
+    SubSovereign = 4,
+    /// A company: CDM Corporate.
+    Corporate = 5,
+    /// A US state or local issuer under MSRB's rules: CDM RegionalGovernment, held
+    /// apart on purpose.
+    Municipal = 6,
+}
+impl IssuerType {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "ISSUER_TYPE_UNSPECIFIED",
+            Self::Sovereign => "ISSUER_TYPE_SOVEREIGN",
+            Self::Agency => "ISSUER_TYPE_AGENCY",
+            Self::Supranational => "ISSUER_TYPE_SUPRANATIONAL",
+            Self::SubSovereign => "ISSUER_TYPE_SUB_SOVEREIGN",
+            Self::Corporate => "ISSUER_TYPE_CORPORATE",
+            Self::Municipal => "ISSUER_TYPE_MUNICIPAL",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "ISSUER_TYPE_UNSPECIFIED" => Some(Self::Unspecified),
+            "ISSUER_TYPE_SOVEREIGN" => Some(Self::Sovereign),
+            "ISSUER_TYPE_AGENCY" => Some(Self::Agency),
+            "ISSUER_TYPE_SUPRANATIONAL" => Some(Self::Supranational),
+            "ISSUER_TYPE_SUB_SOVEREIGN" => Some(Self::SubSovereign),
+            "ISSUER_TYPE_CORPORATE" => Some(Self::Corporate),
+            "ISSUER_TYPE_MUNICIPAL" => Some(Self::Municipal),
+            _ => None,
+        }
+    }
+}
+/// Contract v29: how a coupon is set (FIX CouponType, 1946).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum CouponType {
+    /// Refused.
+    Unspecified = 0,
+    /// A fixed rate (FIX CouponType 1946 = 1, fixed rate).
+    Fixed = 1,
+    /// An index plus a spread, reset by `floating` (1946 = 2, floating rate).
+    Floating = 2,
+    /// No coupon: a bill, a STRIPS component, a zero (1946 = 0, zero).
+    Zero = 3,
+    /// Fixed rates stepping on dates in `coupon_steps` (1946 = 3, structured).
+    Step = 4,
+}
+impl CouponType {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "COUPON_TYPE_UNSPECIFIED",
+            Self::Fixed => "COUPON_TYPE_FIXED",
+            Self::Floating => "COUPON_TYPE_FLOATING",
+            Self::Zero => "COUPON_TYPE_ZERO",
+            Self::Step => "COUPON_TYPE_STEP",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "COUPON_TYPE_UNSPECIFIED" => Some(Self::Unspecified),
+            "COUPON_TYPE_FIXED" => Some(Self::Fixed),
+            "COUPON_TYPE_FLOATING" => Some(Self::Floating),
+            "COUPON_TYPE_ZERO" => Some(Self::Zero),
+            "COUPON_TYPE_STEP" => Some(Self::Step),
+            _ => None,
+        }
+    }
+}
+/// Contract v29: a bond's claim rank (CDM DebtSeniorityEnum).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum Seniority {
+    /// Not stated by the platform's source.
+    Unspecified = 0,
+    /// Secured: CDM DebtSeniorityEnum Secured.
+    Secured = 1,
+    /// Senior unsecured: CDM Senior.
+    Senior = 2,
+    /// Subordinated: CDM Subordinated.
+    Subordinated = 3,
+}
+impl Seniority {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "SENIORITY_UNSPECIFIED",
+            Self::Secured => "SENIORITY_SECURED",
+            Self::Senior => "SENIORITY_SENIOR",
+            Self::Subordinated => "SENIORITY_SUBORDINATED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "SENIORITY_UNSPECIFIED" => Some(Self::Unspecified),
+            "SENIORITY_SECURED" => Some(Self::Secured),
+            "SENIORITY_SENIOR" => Some(Self::Senior),
+            "SENIORITY_SUBORDINATED" => Some(Self::Subordinated),
+            _ => None,
+        }
+    }
+}
+/// Contract v29: how a payment's record date is set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum RecordDateRule {
+    /// Not stated: the record is incomplete, listing it.
+    Unspecified = 0,
+    /// Record_date_days calendar days before each payment date (a corporate's 15th
+    /// of the month before).
+    CalendarDaysBeforePayment = 1,
+    /// Record_date_days business days before each payment date, on the payment
+    /// calendar.
+    BusinessDaysBeforePayment = 2,
+    /// The last calendar day of the month before the payment month, as agency
+    /// pools record holders.
+    LastDayOfPriorMonth = 3,
+}
+impl RecordDateRule {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "RECORD_DATE_RULE_UNSPECIFIED",
+            Self::CalendarDaysBeforePayment => {
+                "RECORD_DATE_RULE_CALENDAR_DAYS_BEFORE_PAYMENT"
+            }
+            Self::BusinessDaysBeforePayment => {
+                "RECORD_DATE_RULE_BUSINESS_DAYS_BEFORE_PAYMENT"
+            }
+            Self::LastDayOfPriorMonth => "RECORD_DATE_RULE_LAST_DAY_OF_PRIOR_MONTH",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "RECORD_DATE_RULE_UNSPECIFIED" => Some(Self::Unspecified),
+            "RECORD_DATE_RULE_CALENDAR_DAYS_BEFORE_PAYMENT" => {
+                Some(Self::CalendarDaysBeforePayment)
+            }
+            "RECORD_DATE_RULE_BUSINESS_DAYS_BEFORE_PAYMENT" => {
+                Some(Self::BusinessDaysBeforePayment)
+            }
+            "RECORD_DATE_RULE_LAST_DAY_OF_PRIOR_MONTH" => Some(Self::LastDayOfPriorMonth),
+            _ => None,
+        }
+    }
+}
+/// Contract v29 (679): a redemption window's kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum RedemptionKind {
+    /// Refused.
+    Unspecified = 0,
+    /// The greater of par and the present value of the remaining payments at the
+    /// benchmark plus a spread, to the par call date (a corporate's make-whole).
+    MakeWhole = 1,
+    /// At par, 100.
+    Par = 2,
+    /// At a stated price above par, stepping down by row.
+    Premium = 3,
+    /// An optional redemption at the sinking-fund price, beside the mandatory
+    /// schedule in sinking_funds.
+    SinkingFund = 4,
+}
+impl RedemptionKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "REDEMPTION_KIND_UNSPECIFIED",
+            Self::MakeWhole => "REDEMPTION_KIND_MAKE_WHOLE",
+            Self::Par => "REDEMPTION_KIND_PAR",
+            Self::Premium => "REDEMPTION_KIND_PREMIUM",
+            Self::SinkingFund => "REDEMPTION_KIND_SINKING_FUND",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "REDEMPTION_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "REDEMPTION_KIND_MAKE_WHOLE" => Some(Self::MakeWhole),
+            "REDEMPTION_KIND_PAR" => Some(Self::Par),
+            "REDEMPTION_KIND_PREMIUM" => Some(Self::Premium),
+            "REDEMPTION_KIND_SINKING_FUND" => Some(Self::SinkingFund),
+            _ => None,
+        }
+    }
+}
+/// Contract v29 (679): when in its window a redemption may be made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum RedemptionStyle {
+    /// Refused.
+    Unspecified = 0,
+    /// On from_date only.
+    OneDate = 1,
+    /// On each coupon date from from_date to to_date.
+    Bermudan = 2,
+    /// On any business day from from_date to to_date, after its notice.
+    Continuous = 3,
+}
+impl RedemptionStyle {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "REDEMPTION_STYLE_UNSPECIFIED",
+            Self::OneDate => "REDEMPTION_STYLE_ONE_DATE",
+            Self::Bermudan => "REDEMPTION_STYLE_BERMUDAN",
+            Self::Continuous => "REDEMPTION_STYLE_CONTINUOUS",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "REDEMPTION_STYLE_UNSPECIFIED" => Some(Self::Unspecified),
+            "REDEMPTION_STYLE_ONE_DATE" => Some(Self::OneDate),
+            "REDEMPTION_STYLE_BERMUDAN" => Some(Self::Bermudan),
+            "REDEMPTION_STYLE_CONTINUOUS" => Some(Self::Continuous),
+            _ => None,
+        }
+    }
+}
+/// Contract v29: a municipal's federal tax status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum FederalTaxStatus {
+    /// Not stated: the record is incomplete, listing it.
+    Unspecified = 0,
+    /// Interest exempt from federal income tax.
+    Exempt = 1,
+    /// Interest taxable federally (a taxable municipal).
+    Taxable = 2,
+}
+impl FederalTaxStatus {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "FEDERAL_TAX_STATUS_UNSPECIFIED",
+            Self::Exempt => "FEDERAL_TAX_STATUS_EXEMPT",
+            Self::Taxable => "FEDERAL_TAX_STATUS_TAXABLE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "FEDERAL_TAX_STATUS_UNSPECIFIED" => Some(Self::Unspecified),
+            "FEDERAL_TAX_STATUS_EXEMPT" => Some(Self::Exempt),
+            "FEDERAL_TAX_STATUS_TAXABLE" => Some(Self::Taxable),
+            _ => None,
+        }
+    }
+}
+/// Contract v29: a municipal's refunding, a dated term version on the event
+/// (decisions/034).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum RefundingStatus {
+    /// None stated.
+    Unspecified = 0,
+    /// Pre-refunded: escrowed to a call date, refunded_to_date.
+    PreRefunded = 1,
+    /// Escrowed to maturity.
+    EscrowedToMaturity = 2,
+}
+impl RefundingStatus {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "REFUNDING_STATUS_UNSPECIFIED",
+            Self::PreRefunded => "REFUNDING_STATUS_PRE_REFUNDED",
+            Self::EscrowedToMaturity => "REFUNDING_STATUS_ESCROWED_TO_MATURITY",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "REFUNDING_STATUS_UNSPECIFIED" => Some(Self::Unspecified),
+            "REFUNDING_STATUS_PRE_REFUNDED" => Some(Self::PreRefunded),
+            "REFUNDING_STATUS_ESCROWED_TO_MATURITY" => Some(Self::EscrowedToMaturity),
+            _ => None,
+        }
+    }
+}
+/// Contract v29: the agency of a pool, a TBA or a REMIC class.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum MortgageAgency {
+    /// Refused.
+    Unspecified = 0,
+    /// Fannie Mae.
+    Fnma = 1,
+    /// Freddie Mac.
+    Fhlmc = 2,
+    /// Ginnie Mae.
+    Gnma = 3,
+}
+impl MortgageAgency {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "MORTGAGE_AGENCY_UNSPECIFIED",
+            Self::Fnma => "MORTGAGE_AGENCY_FNMA",
+            Self::Fhlmc => "MORTGAGE_AGENCY_FHLMC",
+            Self::Gnma => "MORTGAGE_AGENCY_GNMA",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "MORTGAGE_AGENCY_UNSPECIFIED" => Some(Self::Unspecified),
+            "MORTGAGE_AGENCY_FNMA" => Some(Self::Fnma),
+            "MORTGAGE_AGENCY_FHLMC" => Some(Self::Fhlmc),
+            "MORTGAGE_AGENCY_GNMA" => Some(Self::Gnma),
+            _ => None,
+        }
+    }
+}
+/// Contract v29 (681): which of SIFMA's monthly class dates a TBA settles on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum SifmaSettlementClass {
+    /// Not stated: the record is incomplete, listing it.
+    Unspecified = 0,
+    /// SIFMA class A: 30-year UMBS.
+    A = 1,
+    /// SIFMA class B: 15-year UMBS and Ginnie Mae.
+    B = 2,
+    /// SIFMA class C: 30-year Ginnie Mae.
+    C = 3,
+    /// SIFMA class D: balloons and ARMs.
+    D = 4,
+}
+impl SifmaSettlementClass {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "SIFMA_SETTLEMENT_CLASS_UNSPECIFIED",
+            Self::A => "SIFMA_SETTLEMENT_CLASS_A",
+            Self::B => "SIFMA_SETTLEMENT_CLASS_B",
+            Self::C => "SIFMA_SETTLEMENT_CLASS_C",
+            Self::D => "SIFMA_SETTLEMENT_CLASS_D",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "SIFMA_SETTLEMENT_CLASS_UNSPECIFIED" => Some(Self::Unspecified),
+            "SIFMA_SETTLEMENT_CLASS_A" => Some(Self::A),
+            "SIFMA_SETTLEMENT_CLASS_B" => Some(Self::B),
+            "SIFMA_SETTLEMENT_CLASS_C" => Some(Self::C),
+            "SIFMA_SETTLEMENT_CLASS_D" => Some(Self::D),
+            _ => None,
+        }
+    }
+}
+/// Contract v29 (682): a REMIC class's principal type, as the prospectus
+/// supplement's principal-type column lists it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum PrincipalType {
+    /// Refused.
+    Unspecified = 0,
+    /// Sequential pay.
+    Sequential = 1,
+    /// Planned amortization class.
+    Pac = 2,
+    /// Targeted amortization class.
+    Tac = 3,
+    /// Support (companion) class.
+    Support = 4,
+    /// Notional: no principal, an IO's balance a notional amount.
+    Notional = 5,
+}
+impl PrincipalType {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "PRINCIPAL_TYPE_UNSPECIFIED",
+            Self::Sequential => "PRINCIPAL_TYPE_SEQUENTIAL",
+            Self::Pac => "PRINCIPAL_TYPE_PAC",
+            Self::Tac => "PRINCIPAL_TYPE_TAC",
+            Self::Support => "PRINCIPAL_TYPE_SUPPORT",
+            Self::Notional => "PRINCIPAL_TYPE_NOTIONAL",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "PRINCIPAL_TYPE_UNSPECIFIED" => Some(Self::Unspecified),
+            "PRINCIPAL_TYPE_SEQUENTIAL" => Some(Self::Sequential),
+            "PRINCIPAL_TYPE_PAC" => Some(Self::Pac),
+            "PRINCIPAL_TYPE_TAC" => Some(Self::Tac),
+            "PRINCIPAL_TYPE_SUPPORT" => Some(Self::Support),
+            "PRINCIPAL_TYPE_NOTIONAL" => Some(Self::Notional),
+            _ => None,
+        }
+    }
+}
+/// Contract v29 (682): a REMIC class's interest type, as the prospectus
+/// supplement's interest-type column lists it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum InterestType {
+    /// Refused.
+    Unspecified = 0,
+    /// Fixed rate.
+    Fixed = 1,
+    /// Floating rate, by `floating`.
+    Floater = 2,
+    /// Inverse floater: a negative multiplier in `floating`.
+    InverseFloater = 3,
+    /// Interest only.
+    Io = 4,
+    /// Principal only.
+    Po = 5,
+    /// Accrual (Z): interest accretes to face until it pays.
+    Z = 6,
+}
+impl InterestType {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "INTEREST_TYPE_UNSPECIFIED",
+            Self::Fixed => "INTEREST_TYPE_FIXED",
+            Self::Floater => "INTEREST_TYPE_FLOATER",
+            Self::InverseFloater => "INTEREST_TYPE_INVERSE_FLOATER",
+            Self::Io => "INTEREST_TYPE_IO",
+            Self::Po => "INTEREST_TYPE_PO",
+            Self::Z => "INTEREST_TYPE_Z",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "INTEREST_TYPE_UNSPECIFIED" => Some(Self::Unspecified),
+            "INTEREST_TYPE_FIXED" => Some(Self::Fixed),
+            "INTEREST_TYPE_FLOATER" => Some(Self::Floater),
+            "INTEREST_TYPE_INVERSE_FLOATER" => Some(Self::InverseFloater),
+            "INTEREST_TYPE_IO" => Some(Self::Io),
+            "INTEREST_TYPE_PO" => Some(Self::Po),
+            "INTEREST_TYPE_Z" => Some(Self::Z),
             _ => None,
         }
     }
@@ -7434,6 +8821,12 @@ pub struct Lot {
     /// backfill from its execution.
     #[prost(message, repeated, tag = "9")]
     pub reliefs: ::prost::alloc::vec::Vec<LotRelief>,
+    /// Contract v29 (992): YYYYMM, the factor month whose Factor row the lot's
+    /// cost waits for: a lot opened by a pool's or a tranche's fill, or a booking
+    /// of one, priced at the latest factor published while its settlement month's
+    /// was not, its cost provisional. Empty where final, and on any other lot.
+    #[prost(string, tag = "10")]
+    pub factor_month_awaited: ::prost::alloc::string::String,
 }
 /// One relief of a lot (contract v27; W9.10).
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -8402,6 +9795,24 @@ pub struct Order {
     /// Unspecified on an instrument that is no option or future.
     #[prost(enumeration = "PositionEffect", tag = "49")]
     pub position_effect: i32,
+    /// Contract v29: percent of par in limit_price, a yield in limit_yield, or a
+    /// spread over a benchmark in limit_spread_bps; a when-issued Treasury before
+    /// its auction is priced in yield. Unspecified: per unit, as before v29.
+    #[prost(enumeration = "PriceBasis", tag = "50")]
+    pub price_basis: i32,
+    /// Contract v29: the least yield on a buy, the most on a sell, in its
+    /// convention (FIX Yield, 236, with YieldType, 235). Unset unless price_basis
+    /// is yield.
+    #[prost(message, optional, tag = "51")]
+    pub limit_yield: ::core::option::Option<QuotedYield>,
+    /// Contract v29: over benchmark_instrument_id, the least on a buy (FIX Spread,
+    /// 218). Unset unless price_basis is spread.
+    #[prost(message, optional, tag = "52")]
+    pub limit_spread_bps: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// Contract v29: an on-the-run Treasury's bond record, or a rate_curve record.
+    /// Empty unless price_basis is spread.
+    #[prost(string, tag = "53")]
+    pub benchmark_instrument_id: ::prost::alloc::string::String,
 }
 /// An order's status: its state, its conditions and its quantities, each
 /// derived.
@@ -8990,6 +10401,106 @@ pub struct Execution {
     /// leg's fill.
     #[prost(string, tag = "44")]
     pub package_execution_id: ::prost::alloc::string::String,
+    /// Contract v29: per unit, or percent of par (TRACE's decimal price), yield or
+    /// spread, as the lake's PriceBasis (W10.4). Unspecified: per unit, as before
+    /// v29.
+    #[prost(enumeration = "PriceBasis", tag = "45")]
+    pub price_basis: i32,
+    /// Contract v29: a when-issued Treasury's yield, a municipal's yield to worst
+    /// on its confirmation, or TRACE's yield; a QuotedYield. Unset where none is
+    /// stated.
+    #[prost(message, optional, tag = "46")]
+    pub r#yield: ::core::option::Option<QuotedYield>,
+    /// Contract v29: second, millisecond, microsecond or nanosecond, on every
+    /// execution of every asset class. Unspecified where not said; set on every
+    /// execution from v29 where the source states its precision.
+    #[prost(enumeration = "TimePrecision", tag = "47")]
+    pub trade_time_precision: i32,
+    /// Contract v29 (991): an override of the security's factor, where the trade
+    /// was not done at the one published for its settlement month (6730(d)(2)(B);
+    /// FIX Factor, 228): an exact decimal, final, changed only by a correction of
+    /// the fill. Unset: the factor the agency published for the settlement month,
+    /// which the book takes (factor_taken).
+    #[prost(message, optional, tag = "48")]
+    pub factor_used: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// Contract v29: true for a new-issue municipal traded when issued, so an
+    /// empty date is never ambiguous; its cash stays pending, dated nothing, until
+    /// a correction of the fill states the date. False: the settlement date is
+    /// known.
+    #[prost(bool, tag = "49")]
+    pub settlement_date_unknown: bool,
+    /// Contract v29: customer, dealer, non-member affiliate or clearing broker,
+    /// matching the lake's characteristics by meaning (W10.4). Unspecified where
+    /// not a fixed-income street report.
+    #[prost(enumeration = "ContraPartyType", tag = "50")]
+    pub contra_party_type: i32,
+    /// Contract v29: a give-up firm (PARTY_ROLE_GIVE_UP_FIRM, 6730(c)(9)) and the
+    /// contra side's introducing broker (PARTY_ROLE_INTRODUCING_BROKER,
+    /// 6730(c)(10)), each with its mpid. None where only the counterparty is
+    /// delivered.
+    #[prost(message, repeated, tag = "51")]
+    pub parties: ::prost::alloc::vec::Vec<Party>,
+    /// Contract v29: one of the existing four but mixed: a mixed order's fills
+    /// each carry one. Unspecified where not a broker's trade.
+    #[prost(enumeration = "Capacity", tag = "52")]
+    pub capacity: i32,
+    /// Contract v29: true where the firm takes no transaction-based compensation.
+    /// False: not so, or not stated.
+    #[prost(bool, tag = "53")]
+    pub no_remuneration: bool,
+    /// Contract v29: true for a back-to-back with a non-member affiliate, same
+    /// day, same price. False: not so, or not stated.
+    #[prost(bool, tag = "54")]
+    pub affiliate_back_to_back: bool,
+    /// Contract v29: true where priced away from the market, its reason in
+    /// special_price_reason. False: not so, or not stated.
+    #[prost(bool, tag = "55")]
+    pub special_price: bool,
+    /// Contract v29: true where priced by a weighted-average method. False: not
+    /// so, or not stated.
+    #[prost(bool, tag = "56")]
+    pub weighted_average_price: bool,
+    /// Contract v29: true for a primary-market trade. False: not so, or not
+    /// stated.
+    #[prost(bool, tag = "57")]
+    pub primary_market: bool,
+    /// Contract v29: marks a list offering price or takedown trade (G-14 RTRS
+    /// Procedures (b)(iv)(B)(1)): true where so. False: not so, or not stated.
+    #[prost(bool, tag = "58")]
+    pub list_offering_price_takedown: bool,
+    /// Contract v29: marks a trade without accrued interest (G-14 (b)(iv)(B)(4)):
+    /// true where traded flat. False: not so, or not stated.
+    #[prost(bool, tag = "59")]
+    pub traded_flat: bool,
+    /// Contract v29: true where traded with stipulations. False: not so, or not
+    /// stated.
+    #[prost(bool, tag = "60")]
+    pub stipulated: bool,
+    /// Contract v29: true on each execution of a basket of ten or more issues at
+    /// one agreed price, linked by trade_chain_reference. False: not so, or not
+    /// stated.
+    #[prost(bool, tag = "61")]
+    pub portfolio_trade: bool,
+    /// Contract v29: up to 50 characters, as the firm writes it. Empty unless
+    /// special_price.
+    #[prost(string, tag = "62")]
+    pub special_price_reason: ::prost::alloc::string::String,
+    /// Contract v29: a futures leg in the series, a series not priced at the
+    /// market, or hedged. Unspecified: none.
+    #[prost(enumeration = "TreasuryTradeModifier", tag = "63")]
+    pub treasury_trade_modifier: i32,
+    /// Contract v29 (991, 992): the factor the book priced a pool's or a
+    /// tranche's fill stating no factor_used at: the agency's for its settlement
+    /// month, or while that is unpublished the latest published, provisional.
+    /// Unset where factor_used is stated, and on any other fill.
+    #[prost(message, optional, tag = "64")]
+    pub factor_taken: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// Contract v29 (992): YYYYMM, the factor month whose Factor row a
+    /// provisional factor_taken waits for; its cash, current face and lots are
+    /// provisional until then, when the book revises them (a factor revision,
+    /// LIFECYCLE_EVENT_KIND_FACTOR_REVISION). Empty where final.
+    #[prost(string, tag = "65")]
+    pub factor_month_awaited: ::prost::alloc::string::String,
 }
 /// An execution's finality: a level, and when it reached it.
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
@@ -9293,9 +10804,29 @@ pub struct ProposeOrderRequest {
     #[prost(string, tag = "38")]
     pub value_date: ::prost::alloc::string::String,
     /// Contract v28: as option brokers require it: buy to open, sell to close.
-    /// Unspecified on an instrument that is no option or future.
+    /// Unspecified on an instrument that is no option or future. From contract
+    /// v29 (638) required on a single option or future order, refused unset
+    /// naming it, as each package leg's is.
     #[prost(enumeration = "PositionEffect", tag = "39")]
     pub position_effect: i32,
+    /// Contract v29: percent of par in limit_price, a yield in limit_yield, or a
+    /// spread over a benchmark in limit_spread_bps; a when-issued Treasury before
+    /// its auction is priced in yield. Unspecified: per unit, as before v29.
+    #[prost(enumeration = "PriceBasis", tag = "40")]
+    pub price_basis: i32,
+    /// Contract v29: the least yield on a buy, the most on a sell, in its
+    /// convention (FIX Yield, 236, with YieldType, 235). Unset unless price_basis
+    /// is yield.
+    #[prost(message, optional, tag = "41")]
+    pub limit_yield: ::core::option::Option<QuotedYield>,
+    /// Contract v29: over benchmark_instrument_id, the least on a buy (FIX Spread,
+    /// 218). Unset unless price_basis is spread.
+    #[prost(message, optional, tag = "42")]
+    pub limit_spread_bps: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// Contract v29: an on-the-run Treasury's bond record, or a rate_curve record.
+    /// Empty unless price_basis is spread.
+    #[prost(string, tag = "43")]
+    pub benchmark_instrument_id: ::prost::alloc::string::String,
 }
 /// W11.2. A fact: never through the gate. By the `oms`, for a user, naming
 /// the account: a telephoned or outside order. A connectivity plugin records
@@ -9645,6 +11176,94 @@ pub struct ReportExecutionRequest {
     /// leg's fill.
     #[prost(string, tag = "38")]
     pub package_execution_id: ::prost::alloc::string::String,
+    /// Contract v29: per unit, or percent of par (TRACE's decimal price), yield or
+    /// spread, as the lake's PriceBasis (W10.4). Unspecified: per unit, as before
+    /// v29.
+    #[prost(enumeration = "PriceBasis", tag = "39")]
+    pub price_basis: i32,
+    /// Contract v29: a when-issued Treasury's yield, a municipal's yield to worst
+    /// on its confirmation, or TRACE's yield; a QuotedYield. Unset where none is
+    /// stated.
+    #[prost(message, optional, tag = "40")]
+    pub r#yield: ::core::option::Option<QuotedYield>,
+    /// Contract v29: second, millisecond, microsecond or nanosecond, on every
+    /// execution of every asset class. Unspecified where not said; set on every
+    /// execution from v29 where the source states its precision.
+    #[prost(enumeration = "TimePrecision", tag = "41")]
+    pub trade_time_precision: i32,
+    /// Contract v29 (991): an override of the security's factor, where the trade
+    /// was not done at the one published for its settlement month (6730(d)(2)(B);
+    /// FIX Factor, 228): an exact decimal, final, changed only by a correction of
+    /// the fill. Unset: the factor the agency published for the settlement month,
+    /// which the book takes.
+    #[prost(message, optional, tag = "42")]
+    pub factor_used: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// Contract v29: true for a new-issue municipal traded when issued, so an
+    /// empty date is never ambiguous; its cash stays pending, dated nothing, until
+    /// a correction of the fill states the date. False: the settlement date is
+    /// known.
+    #[prost(bool, tag = "43")]
+    pub settlement_date_unknown: bool,
+    /// Contract v29: customer, dealer, non-member affiliate or clearing broker,
+    /// matching the lake's characteristics by meaning (W10.4). Unspecified where
+    /// not a fixed-income street report.
+    #[prost(enumeration = "ContraPartyType", tag = "44")]
+    pub contra_party_type: i32,
+    /// Contract v29: a give-up firm (PARTY_ROLE_GIVE_UP_FIRM, 6730(c)(9)) and the
+    /// contra side's introducing broker (PARTY_ROLE_INTRODUCING_BROKER,
+    /// 6730(c)(10)), each with its mpid. None where only the counterparty is
+    /// delivered.
+    #[prost(message, repeated, tag = "45")]
+    pub parties: ::prost::alloc::vec::Vec<Party>,
+    /// Contract v29: one of the existing four but mixed: a mixed order's fills
+    /// each carry one. Unspecified where not a broker's trade.
+    #[prost(enumeration = "Capacity", tag = "46")]
+    pub capacity: i32,
+    /// Contract v29: true where the firm takes no transaction-based compensation.
+    /// False: not so, or not stated.
+    #[prost(bool, tag = "47")]
+    pub no_remuneration: bool,
+    /// Contract v29: true for a back-to-back with a non-member affiliate, same
+    /// day, same price. False: not so, or not stated.
+    #[prost(bool, tag = "48")]
+    pub affiliate_back_to_back: bool,
+    /// Contract v29: true where priced away from the market, its reason in
+    /// special_price_reason. False: not so, or not stated.
+    #[prost(bool, tag = "49")]
+    pub special_price: bool,
+    /// Contract v29: true where priced by a weighted-average method. False: not
+    /// so, or not stated.
+    #[prost(bool, tag = "50")]
+    pub weighted_average_price: bool,
+    /// Contract v29: true for a primary-market trade. False: not so, or not
+    /// stated.
+    #[prost(bool, tag = "51")]
+    pub primary_market: bool,
+    /// Contract v29: marks a list offering price or takedown trade (G-14 RTRS
+    /// Procedures (b)(iv)(B)(1)): true where so. False: not so, or not stated.
+    #[prost(bool, tag = "52")]
+    pub list_offering_price_takedown: bool,
+    /// Contract v29: marks a trade without accrued interest (G-14 (b)(iv)(B)(4)):
+    /// true where traded flat. False: not so, or not stated.
+    #[prost(bool, tag = "53")]
+    pub traded_flat: bool,
+    /// Contract v29: true where traded with stipulations. False: not so, or not
+    /// stated.
+    #[prost(bool, tag = "54")]
+    pub stipulated: bool,
+    /// Contract v29: true on each execution of a basket of ten or more issues at
+    /// one agreed price, linked by trade_chain_reference. False: not so, or not
+    /// stated.
+    #[prost(bool, tag = "55")]
+    pub portfolio_trade: bool,
+    /// Contract v29: up to 50 characters, as the firm writes it. Empty unless
+    /// special_price.
+    #[prost(string, tag = "56")]
+    pub special_price_reason: ::prost::alloc::string::String,
+    /// Contract v29: a futures leg in the series, a series not priced at the
+    /// market, or hedged. Unspecified: none.
+    #[prost(enumeration = "TreasuryTradeModifier", tag = "57")]
+    pub treasury_trade_modifier: i32,
 }
 /// W11.12.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -10153,6 +11772,56 @@ pub struct Allocation {
     /// recorded (W11.32).
     #[prost(message, repeated, tag = "15")]
     pub give_up_answers: ::prost::alloc::vec::Vec<GiveUpRecord>,
+    /// Contract v29: the accrued interest the customer pays or receives, a Money
+    /// in the settlement currency (FIX AccruedInterestAmt, 159, on Confirmation
+    /// 35=AK); final money is net_amount plus it. Unset on an allocation in an
+    /// instrument that accrues nothing; on a fixed-income allocation booked before
+    /// v29, unset, a backfilled record saying it was not recorded (decisions/031).
+    #[prost(message, optional, tag = "16")]
+    pub accrued_interest: ::core::option::Option<Money>,
+    /// Contract v29: signed, a Money for the whole allocation: positive a markup
+    /// on a sale to the customer, negative a markdown on a purchase from it, the
+    /// name following the side as the rules name it; inside the price, never a fee
+    /// (a FIX export writes MiscFeeType 8). Unset where none: an agency trade, or
+    /// unset on an allocation booked before v29.
+    #[prost(message, optional, tag = "17")]
+    pub markup: ::core::option::Option<Money>,
+    /// Contract v29: per unit in the instrument's price basis: per 100 of face for
+    /// a bond. Unset where no markup is disclosed, or unset on an allocation
+    /// booked before v29.
+    #[prost(message, optional, tag = "18")]
+    pub prevailing_market_price: ::core::option::Option<Money>,
+    /// Contract v29: the rules' ladder in their order, one enum for both
+    /// regulators. Unspecified where no PMP.
+    #[prost(enumeration = "PrevailingMarketPriceBasis", tag = "19")]
+    pub prevailing_market_price_basis: i32,
+    /// Contract v29: an EXE- execution (the firm's own contemporaneous trade) or a
+    /// lake row's dataset, row key and version (a trade, a quote, an engine
+    /// result's row), with its time. Unset where no PMP.
+    #[prost(message, optional, tag = "20")]
+    pub prevailing_market_price_reference: ::core::option::Option<
+        PrevailingMarketPriceReference,
+    >,
+    /// Contract v29: one of the existing four but mixed. Unspecified where not a
+    /// broker's trade; unset on an allocation booked before v29, each fixed-income
+    /// one given a backfilled record saying it was not recorded (decisions/031).
+    #[prost(enumeration = "Capacity", tag = "21")]
+    pub capacity: i32,
+    /// Contract v29: for an allocation booking one execution its time; for an
+    /// average-priced allocation the time the oms fixed the customer's price, the
+    /// time all terms sufficient to compute the dollar price were agreed (FINRA
+    /// Rule 6710(d)'s time of execution). 0 where not a customer trade, or unset
+    /// on an allocation booked before v29.
+    #[prost(int64, tag = "22")]
+    pub execution_time_ns: i64,
+    /// Contract v29: to the second at least for a confirmation. Unspecified where
+    /// execution_time_ns is 0.
+    #[prost(enumeration = "TimePrecision", tag = "23")]
+    pub execution_time_precision: i32,
+    /// Contract v29: as Execution.no_remuneration, for the same regulators. False:
+    /// not so, or not stated.
+    #[prost(bool, tag = "24")]
+    pub no_remuneration: bool,
 }
 /// A prime's answer to a give-up (W11.32), its own record, as FIX sends each
 /// AllocationReport (AS) as its own message.
@@ -10544,7 +12213,9 @@ pub struct LifecycleEvent {
     /// An account in the sender's scope. Never empty.
     #[prost(string, tag = "2")]
     pub account_id: ::prost::alloc::string::String,
-    /// A listed_option, future_option or future INS- record. Never empty.
+    /// A listed_option, future_option or future INS- record; from contract v29 a
+    /// debt record (bond, mbs_pool, tba, cmo_tranche, certificate_of_deposit).
+    /// Never empty.
     #[prost(string, tag = "3")]
     pub instrument_id: ::prost::alloc::string::String,
     /// The event's kind, a closed list. Unspecified is refused.
@@ -10554,7 +12225,8 @@ pub struct LifecycleEvent {
     #[prost(enumeration = "LifecycleEventState", tag = "5")]
     pub state: i32,
     /// Contracts exercised, assigned or expired; on a variation, the contracts
-    /// held at the settlement. Never unset.
+    /// held at the settlement; from contract v29, on a debt record, its face
+    /// (original face for a pool or a tranche). Never unset.
     #[prost(message, optional, tag = "6")]
     pub quantity: ::core::option::Option<::meridian_pb::v1::Decimal>,
     /// A plain date: the exercise, assignment or expiry date, or the settlement's
@@ -10593,6 +12265,51 @@ pub struct LifecycleEvent {
     /// Its journal entry. Unset on a request.
     #[prost(message, optional, tag = "15")]
     pub last_change: ::core::option::Option<JournalRef>,
+    /// Contract v29: maturity, full call, partial call, put or sinking-fund draw,
+    /// as the custodian states it; a partial call by lottery can only be reported,
+    /// never derived. Unspecified on any kind but redemption.
+    #[prost(enumeration = "RedemptionEventKind", tag = "16")]
+    pub redemption_kind: i32,
+    /// Contract v29: per 100 of face, before accrued, as the custodian states it;
+    /// the lots close at it. Unset on any kind but redemption.
+    #[prost(message, optional, tag = "17")]
+    pub redemption_price: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// Contract v29: a plain date, the accrual start. Empty on any kind but coupon
+    /// received.
+    #[prost(string, tag = "18")]
+    pub period_start_date: ::prost::alloc::string::String,
+    /// Contract v29: a plain date, exclusive, the accrual end. Empty on any kind
+    /// but coupon received.
+    #[prost(string, tag = "19")]
+    pub period_end_date: ::prost::alloc::string::String,
+    /// Contract v29: a plain date: a coupon's, a redemption's or a paydown's.
+    /// Empty where the kind has none.
+    #[prost(string, tag = "20")]
+    pub record_date: ::prost::alloc::string::String,
+    /// Contract v29: the agency's published factor the paydown or accretion
+    /// brought the pool or class to, an exact decimal, as the Factor row (W10.4).
+    /// Unset on any kind but paydown and accretion.
+    #[prost(message, optional, tag = "21")]
+    pub factor: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// Contract v29: the factor the event moved from; cash on a paydown is
+    /// (prior_factor - factor) times original face. Unset on any kind but paydown
+    /// and accretion.
+    #[prost(message, optional, tag = "22")]
+    pub prior_factor: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// Contract v29: signed: positive a Z class's accretion, negative an IO's
+    /// notional fall; no cash moves and the lots stay in original face. Unset on
+    /// any kind but accretion.
+    #[prost(message, optional, tag = "23")]
+    pub face_change: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// Contract v29 (992): signed, the change a factor revision made to the cost
+    /// of the lots the fill opened, rounded to the cent half-even (993). Unset on
+    /// any kind but factor revision.
+    #[prost(message, optional, tag = "24")]
+    pub cost_change: ::core::option::Option<Money>,
+    /// Contract v29 (992): the EXE- execution a factor revision revised. Empty on
+    /// any kind but factor revision.
+    #[prost(string, tag = "25")]
+    pub execution_id: ::prost::alloc::string::String,
 }
 /// Contract v28 (LifecycleEvent.deliveries): states what changed hands on
 /// physical delivery.
@@ -10646,7 +12363,8 @@ pub struct ProposeLifecycleEventsReply {
 /// Contract v28 (W9.18): ReleaseLifecycleEvent's request.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ReleaseLifecycleEventRequest {
-    /// A proposal no report answered. Never empty.
+    /// A proposal no report answered; from contract v29 (992) also a factor
+    /// revision's open claim, marked settled. Never empty.
     #[prost(string, tag = "1")]
     pub event_id: ::prost::alloc::string::String,
     /// Kept on the release's entry (decisions/031). Never empty: refused
@@ -10680,7 +12398,9 @@ pub struct LifecycleEventRecordedEvent {
 /// Contract v28 (W9.19): ListLifecycleEvents's request.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ListLifecycleEventsRequest {
-    /// An account in the reader's scope. Never empty.
+    /// An account in the reader's scope. From contract v29 (740), empty answers
+    /// every account in the reader's scope, each event naming its account, as
+    /// the book's other reads do; v28 refused it empty.
     #[prost(string, tag = "1")]
     pub account_id: ::prost::alloc::string::String,
     /// Its INS- record. Empty: every instrument.
@@ -10719,6 +12439,33 @@ pub struct ListLifecycleEventsReply {
     /// Opaque. Empty when nothing follows.
     #[prost(string, tag = "3")]
     pub next_cursor: ::prost::alloc::string::String,
+}
+/// Contract v29 (711; FINRA Rule 2121.02(b), MSRB G-30 .06(a)): what a
+/// prevailing market price was read from -- an EXE- execution, the firm's own
+/// contemporaneous trade, or a lake row's dataset, row key and version -- with
+/// its time.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PrevailingMarketPriceReference {
+    /// Names the firm's own contemporaneous trade: an EXE- execution. Empty where
+    /// the PMP came from the lake.
+    #[prost(string, tag = "1")]
+    pub execution_id: ::prost::alloc::string::String,
+    /// Names the lake dataset the row is in: as Source.dataset. Empty where the
+    /// PMP came from an execution.
+    #[prost(string, tag = "2")]
+    pub dataset: ::prost::alloc::string::String,
+    /// Names the lake row: its row key. Empty where the PMP came from an
+    /// execution.
+    #[prost(string, tag = "3")]
+    pub row_key: ::prost::alloc::string::String,
+    /// Names the row's version: the version read. 0 where the PMP came from an
+    /// execution.
+    #[prost(int64, tag = "4")]
+    pub version: i64,
+    /// States the time of the price taken: the trade's or quote's time. Never 0
+    /// when set.
+    #[prost(int64, tag = "5")]
+    pub at_ns: i64,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -12619,6 +14366,11 @@ pub enum PartyRole {
     Client = 1,
     /// The counterparty, where known.
     Counterparty = 2,
+    /// Contract v29: the firm a trade is given up to for TRACE (6730(c)(9); FIX
+    /// PartyRole 14).
+    GiveUpFirm = 3,
+    /// Contract v29: the contra side's introducing broker (6730(c)(10)).
+    IntroducingBroker = 4,
 }
 impl PartyRole {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -12630,6 +14382,8 @@ impl PartyRole {
             Self::Unspecified => "PARTY_ROLE_UNSPECIFIED",
             Self::Client => "PARTY_ROLE_CLIENT",
             Self::Counterparty => "PARTY_ROLE_COUNTERPARTY",
+            Self::GiveUpFirm => "PARTY_ROLE_GIVE_UP_FIRM",
+            Self::IntroducingBroker => "PARTY_ROLE_INTRODUCING_BROKER",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -12638,6 +14392,8 @@ impl PartyRole {
             "PARTY_ROLE_UNSPECIFIED" => Some(Self::Unspecified),
             "PARTY_ROLE_CLIENT" => Some(Self::Client),
             "PARTY_ROLE_COUNTERPARTY" => Some(Self::Counterparty),
+            "PARTY_ROLE_GIVE_UP_FIRM" => Some(Self::GiveUpFirm),
+            "PARTY_ROLE_INTRODUCING_BROKER" => Some(Self::IntroducingBroker),
             _ => None,
         }
     }
@@ -13111,6 +14867,150 @@ impl PositionEffect {
         }
     }
 }
+/// Contract v29 (711): how a prevailing market price was found, the rules'
+/// ladder in their order, one enum for both regulators.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum PrevailingMarketPriceBasis {
+    /// Not stated: no PMP, or booked before v29.
+    Unspecified = 0,
+    /// The dealer's contemporaneous cost or proceeds, the presumption (FINRA
+    /// 2121.02(b)(1); MSRB G-30 .06(a)(i)).
+    ContemporaneousCost = 1,
+    /// Contemporaneous inter-dealer transactions in the security.
+    InterDealerTransactions = 2,
+    /// Contemporaneous dealer transactions with institutional accounts.
+    InstitutionalTransactions = 3,
+    /// Contemporaneous quotations.
+    Quotations = 4,
+    /// Similar securities.
+    SimilarSecurities = 5,
+    /// An economic model.
+    EconomicModel = 6,
+}
+impl PrevailingMarketPriceBasis {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "PREVAILING_MARKET_PRICE_BASIS_UNSPECIFIED",
+            Self::ContemporaneousCost => {
+                "PREVAILING_MARKET_PRICE_BASIS_CONTEMPORANEOUS_COST"
+            }
+            Self::InterDealerTransactions => {
+                "PREVAILING_MARKET_PRICE_BASIS_INTER_DEALER_TRANSACTIONS"
+            }
+            Self::InstitutionalTransactions => {
+                "PREVAILING_MARKET_PRICE_BASIS_INSTITUTIONAL_TRANSACTIONS"
+            }
+            Self::Quotations => "PREVAILING_MARKET_PRICE_BASIS_QUOTATIONS",
+            Self::SimilarSecurities => "PREVAILING_MARKET_PRICE_BASIS_SIMILAR_SECURITIES",
+            Self::EconomicModel => "PREVAILING_MARKET_PRICE_BASIS_ECONOMIC_MODEL",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "PREVAILING_MARKET_PRICE_BASIS_UNSPECIFIED" => Some(Self::Unspecified),
+            "PREVAILING_MARKET_PRICE_BASIS_CONTEMPORANEOUS_COST" => {
+                Some(Self::ContemporaneousCost)
+            }
+            "PREVAILING_MARKET_PRICE_BASIS_INTER_DEALER_TRANSACTIONS" => {
+                Some(Self::InterDealerTransactions)
+            }
+            "PREVAILING_MARKET_PRICE_BASIS_INSTITUTIONAL_TRANSACTIONS" => {
+                Some(Self::InstitutionalTransactions)
+            }
+            "PREVAILING_MARKET_PRICE_BASIS_QUOTATIONS" => Some(Self::Quotations),
+            "PREVAILING_MARKET_PRICE_BASIS_SIMILAR_SECURITIES" => {
+                Some(Self::SimilarSecurities)
+            }
+            "PREVAILING_MARKET_PRICE_BASIS_ECONOMIC_MODEL" => Some(Self::EconomicModel),
+            _ => None,
+        }
+    }
+}
+/// Contract v29: a fixed-income street report's contra party, matching the
+/// lake's trade characteristics by meaning (W10.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ContraPartyType {
+    /// Not said: not a fixed-income street report.
+    Unspecified = 0,
+    /// A customer (TRACE's C).
+    Customer = 1,
+    /// A FINRA member or MSRB dealer, named by its MPID.
+    Dealer = 2,
+    /// A non-member affiliate (TRACE's A1).
+    NonMemberAffiliate = 3,
+    /// A clearing broker on an RTRS inter-dealer regulatory-only trade.
+    ClearingBroker = 4,
+}
+impl ContraPartyType {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "CONTRA_PARTY_TYPE_UNSPECIFIED",
+            Self::Customer => "CONTRA_PARTY_TYPE_CUSTOMER",
+            Self::Dealer => "CONTRA_PARTY_TYPE_DEALER",
+            Self::NonMemberAffiliate => "CONTRA_PARTY_TYPE_NON_MEMBER_AFFILIATE",
+            Self::ClearingBroker => "CONTRA_PARTY_TYPE_CLEARING_BROKER",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "CONTRA_PARTY_TYPE_UNSPECIFIED" => Some(Self::Unspecified),
+            "CONTRA_PARTY_TYPE_CUSTOMER" => Some(Self::Customer),
+            "CONTRA_PARTY_TYPE_DEALER" => Some(Self::Dealer),
+            "CONTRA_PARTY_TYPE_NON_MEMBER_AFFILIATE" => Some(Self::NonMemberAffiliate),
+            "CONTRA_PARTY_TYPE_CLEARING_BROKER" => Some(Self::ClearingBroker),
+            _ => None,
+        }
+    }
+}
+/// Contract v29: TRACE's Treasury trade modifiers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum TreasuryTradeModifier {
+    /// None.
+    Unspecified = 0,
+    /// A leg of a series with a futures leg (TRACE's .B).
+    FuturesLeg = 1,
+    /// A series not priced at the market (TRACE's .S).
+    NonMarketSeries = 2,
+    /// Hedged (TRACE's H).
+    Hedged = 3,
+}
+impl TreasuryTradeModifier {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "TREASURY_TRADE_MODIFIER_UNSPECIFIED",
+            Self::FuturesLeg => "TREASURY_TRADE_MODIFIER_FUTURES_LEG",
+            Self::NonMarketSeries => "TREASURY_TRADE_MODIFIER_NON_MARKET_SERIES",
+            Self::Hedged => "TREASURY_TRADE_MODIFIER_HEDGED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "TREASURY_TRADE_MODIFIER_UNSPECIFIED" => Some(Self::Unspecified),
+            "TREASURY_TRADE_MODIFIER_FUTURES_LEG" => Some(Self::FuturesLeg),
+            "TREASURY_TRADE_MODIFIER_NON_MARKET_SERIES" => Some(Self::NonMarketSeries),
+            "TREASURY_TRADE_MODIFIER_HEDGED" => Some(Self::Hedged),
+            _ => None,
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum MultiLegReportingType {
@@ -13163,6 +15063,34 @@ pub enum LifecycleEventKind {
     /// A future's day of variation against the settlement price, a cash line only
     /// (ruling 562).
     SettlementVariation = 4,
+    /// Contract v29: coupon received: a debt record's interest paid to the holder
+    /// of record, cash only, the period and record date stated (683).
+    CouponReceived = 5,
+    /// Contract v29: redemption: a maturity, a full or partial call, a put or a
+    /// sinking-fund draw, closing or reducing lots at the redemption price (683).
+    Redemption = 6,
+    /// Contract v29: paydown: principal returned on a pool or tranche, cash equal
+    /// to the factor's fall times original face, the lots kept in original face
+    /// and their cost relieved pro rata (680).
+    Paydown = 7,
+    /// Contract v29: accretion: a Z class's face increase or an IO's notional
+    /// fall, no cash (682).
+    Accretion = 8,
+    /// Contract v29: tba allocation: at pool notice, the TBA's lots closed and the
+    /// delivered pools' lots opened (681).
+    TbaAllocation = 9,
+    /// Contract v29: strip: a whole bond exchanged for its STRIPS components, the
+    /// basis allocated by relative value.
+    Strip = 10,
+    /// Contract v29: reconstitution: STRIPS components exchanged back for the
+    /// whole bond.
+    Reconstitution = 11,
+    /// Contract v29 (992): factor revision: the book's own record, when the
+    /// factor a pool's or a tranche's fill was provisionally priced at is
+    /// published or republished: the old and new factor, the cash and the lots'
+    /// cost difference, cash pending to the fill's settlement date, or after it an
+    /// open claim (LIFECYCLE_EVENT_STATE_CLAIM_OPEN).
+    FactorRevision = 12,
 }
 impl LifecycleEventKind {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -13176,6 +15104,14 @@ impl LifecycleEventKind {
             Self::Assignment => "LIFECYCLE_EVENT_KIND_ASSIGNMENT",
             Self::Expiry => "LIFECYCLE_EVENT_KIND_EXPIRY",
             Self::SettlementVariation => "LIFECYCLE_EVENT_KIND_SETTLEMENT_VARIATION",
+            Self::CouponReceived => "LIFECYCLE_EVENT_KIND_COUPON_RECEIVED",
+            Self::Redemption => "LIFECYCLE_EVENT_KIND_REDEMPTION",
+            Self::Paydown => "LIFECYCLE_EVENT_KIND_PAYDOWN",
+            Self::Accretion => "LIFECYCLE_EVENT_KIND_ACCRETION",
+            Self::TbaAllocation => "LIFECYCLE_EVENT_KIND_TBA_ALLOCATION",
+            Self::Strip => "LIFECYCLE_EVENT_KIND_STRIP",
+            Self::Reconstitution => "LIFECYCLE_EVENT_KIND_RECONSTITUTION",
+            Self::FactorRevision => "LIFECYCLE_EVENT_KIND_FACTOR_REVISION",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -13188,6 +15124,60 @@ impl LifecycleEventKind {
             "LIFECYCLE_EVENT_KIND_SETTLEMENT_VARIATION" => {
                 Some(Self::SettlementVariation)
             }
+            "LIFECYCLE_EVENT_KIND_COUPON_RECEIVED" => Some(Self::CouponReceived),
+            "LIFECYCLE_EVENT_KIND_REDEMPTION" => Some(Self::Redemption),
+            "LIFECYCLE_EVENT_KIND_PAYDOWN" => Some(Self::Paydown),
+            "LIFECYCLE_EVENT_KIND_ACCRETION" => Some(Self::Accretion),
+            "LIFECYCLE_EVENT_KIND_TBA_ALLOCATION" => Some(Self::TbaAllocation),
+            "LIFECYCLE_EVENT_KIND_STRIP" => Some(Self::Strip),
+            "LIFECYCLE_EVENT_KIND_RECONSTITUTION" => Some(Self::Reconstitution),
+            "LIFECYCLE_EVENT_KIND_FACTOR_REVISION" => Some(Self::FactorRevision),
+            _ => None,
+        }
+    }
+}
+/// Contract v29 (683): what a redemption record redeemed, as the custodian
+/// states it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum RedemptionEventKind {
+    /// Unset on any kind but redemption; refused on a redemption.
+    Unspecified = 0,
+    /// Repaid at maturity.
+    Maturity = 1,
+    /// Called in full: CDM CorporateActionTypeEnum EarlyRedemption.
+    FullCall = 2,
+    /// Called in part, by lottery or pro rata: no CDM type, held more.
+    PartialCall = 3,
+    /// Put by the holder.
+    Put = 4,
+    /// A mandatory sinking-fund draw: no CDM type, held more.
+    SinkingFund = 5,
+}
+impl RedemptionEventKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "REDEMPTION_EVENT_KIND_UNSPECIFIED",
+            Self::Maturity => "REDEMPTION_EVENT_KIND_MATURITY",
+            Self::FullCall => "REDEMPTION_EVENT_KIND_FULL_CALL",
+            Self::PartialCall => "REDEMPTION_EVENT_KIND_PARTIAL_CALL",
+            Self::Put => "REDEMPTION_EVENT_KIND_PUT",
+            Self::SinkingFund => "REDEMPTION_EVENT_KIND_SINKING_FUND",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "REDEMPTION_EVENT_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "REDEMPTION_EVENT_KIND_MATURITY" => Some(Self::Maturity),
+            "REDEMPTION_EVENT_KIND_FULL_CALL" => Some(Self::FullCall),
+            "REDEMPTION_EVENT_KIND_PARTIAL_CALL" => Some(Self::PartialCall),
+            "REDEMPTION_EVENT_KIND_PUT" => Some(Self::Put),
+            "REDEMPTION_EVENT_KIND_SINKING_FUND" => Some(Self::SinkingFund),
             _ => None,
         }
     }
@@ -13205,6 +15195,10 @@ pub enum LifecycleEventState {
     Booked = 3,
     /// A booked event a later correction names.
     Superseded = 4,
+    /// Contract v29 (992): a factor revision written after the fill settled: its
+    /// cash difference an open receivable or payable, pending and dated nothing,
+    /// until a person marks it settled (ReleaseLifecycleEvent), when it is booked.
+    ClaimOpen = 5,
 }
 impl LifecycleEventState {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -13218,6 +15212,7 @@ impl LifecycleEventState {
             Self::Answered => "LIFECYCLE_EVENT_STATE_ANSWERED",
             Self::Booked => "LIFECYCLE_EVENT_STATE_BOOKED",
             Self::Superseded => "LIFECYCLE_EVENT_STATE_SUPERSEDED",
+            Self::ClaimOpen => "LIFECYCLE_EVENT_STATE_CLAIM_OPEN",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -13228,6 +15223,7 @@ impl LifecycleEventState {
             "LIFECYCLE_EVENT_STATE_ANSWERED" => Some(Self::Answered),
             "LIFECYCLE_EVENT_STATE_BOOKED" => Some(Self::Booked),
             "LIFECYCLE_EVENT_STATE_SUPERSEDED" => Some(Self::Superseded),
+            "LIFECYCLE_EVENT_STATE_CLAIM_OPEN" => Some(Self::ClaimOpen),
             _ => None,
         }
     }
@@ -13475,7 +15471,7 @@ impl ShockUnit {
 pub struct ObservationMeta {
     /// The data plugin's identity for this observation, made from its raw record, so
     /// the same observation recorded again changes nothing and a changed value
-    /// under it is a restatement. 1 to 128 characters.
+    /// or quality state under it is a restatement. 1 to 128 characters.
     #[prost(string, tag = "1")]
     pub row_key: ::prost::alloc::string::String,
     /// The entities the row is about, each resolved through W3.1: 1 to 8.
@@ -13610,17 +15606,19 @@ pub struct DatasetRef {
     #[prost(message, optional, tag = "5")]
     pub declaration: ::core::option::Option<::meridian_pb::v1::DatasetDeclaration>,
     /// For the Data sources page, in a listing of datasets (W10.9; approved
-    /// 2026-10-10): the rows the lake keeps of the dataset carrying a value as
-    /// reported beside a field left not known; and the identifiers and venues
-    /// its instance reported missing (W3.2, W3.15), as the lake heard them. 0
-    /// in a read's answer and on an entitlements change.
+    /// 2026-10-10): the rows in force of the dataset carrying a value as
+    /// reported beside a field left not known, each row key counted once, at
+    /// its version in force (ruling 1006); and the identifiers and venues its
+    /// instance reported missing (W3.2, W3.15), as the lake heard them. 0 in a
+    /// read's answer and on an entitlements change.
     #[prost(uint64, tag = "6")]
     pub unconverted_count: u64,
     #[prost(uint64, tag = "7")]
     pub miss_count: u64,
-    /// Contract v23 (W10.9): the rows the lake keeps of the dataset flagged on
-    /// a closed day of its calendar, a weekend or a holiday; and those flagged
-    /// outside its coverage, counted apart. 0 in a read's answer and on an
+    /// Contract v23 (W10.9): the rows in force of the dataset flagged on a
+    /// closed day of its calendar, a weekend or a holiday; and those flagged
+    /// outside its coverage, counted apart. Each row key counts once, at its
+    /// version in force (ruling 1006). 0 in a read's answer and on an
     /// entitlements change.
     #[prost(uint64, tag = "8")]
     pub closed_day_count: u64,
@@ -13638,6 +15636,21 @@ pub struct DatasetRef {
     /// lake keeps for the dataset, one per venue; empty in a read's answer.
     #[prost(message, repeated, tag = "12")]
     pub liveness: ::prost::alloc::vec::Vec<DatasetLiveness>,
+    /// Contract v29: rows in force whose effective state is valid, counted by the
+    /// lake as of the listing. 0 where the dataset holds no valid rows, and in a
+    /// read's answer and an entitlements change.
+    #[prost(uint64, tag = "13")]
+    pub valid_count: u64,
+    /// Contract v29: rows in force served flagged suspicious, counted by the lake
+    /// as of the listing. 0 where the dataset holds no suspicious rows, and in a
+    /// read's answer and an entitlements change.
+    #[prost(uint64, tag = "14")]
+    pub suspicious_count: u64,
+    /// Contract v29: rows in force left out of default reads as invalid, counted
+    /// by the lake as of the listing. 0 where the dataset holds no invalid rows,
+    /// and in a read's answer and an entitlements change.
+    #[prost(uint64, tag = "15")]
+    pub invalid_count: u64,
 }
 /// A price of one kind for one subject. An FX rate is the price of one
 /// currency's cash instrument in another (spec/the-lake, Q3); the lake never
@@ -13660,6 +15673,18 @@ pub struct Price {
     /// meridian.v1.Price.confidence among its data types.
     #[prost(message, optional, tag = "5")]
     pub confidence: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// Contract v29: its value, convention and kind: TRACE's yield, Treasury's
+    /// high yield, a broker's YTM or YTW. Unset where the source states no yield.
+    #[prost(message, optional, tag = "6")]
+    pub r#yield: ::core::option::Option<QuotedYield>,
+    /// Contract v29: basis points over benchmark_instrument_id. Unset unless the
+    /// basis is spread.
+    #[prost(message, optional, tag = "7")]
+    pub spread_bps: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// Contract v29: an on-the-run Treasury's bond record or a rate_curve record.
+    /// Empty unless the basis is spread, or a yield stated against a benchmark.
+    #[prost(string, tag = "8")]
+    pub benchmark_instrument_id: ::prost::alloc::string::String,
 }
 /// Open, high, low and close over an interval, the envelope's valid time: a
 /// daily bar names its business date. Empty `source.venue_id` is the
@@ -13716,7 +15741,9 @@ pub struct Trade {
     /// The source's own sequence number; 0 when it gives none. Not the lake's.
     #[prost(uint64, tag = "6")]
     pub source_sequence: u64,
-    /// True in a version saying the source withdrew the trade.
+    /// True in a version saying the source withdrew the trade. A source stating
+    /// no cancels or corrections declares so on its suite's a-trade-withdrawn
+    /// case (contract v29, ruling 900).
     #[prost(bool, tag = "7")]
     pub cancelled: bool,
     /// Contract v28: the bid and ask, their sizes and the quote's own source
@@ -13724,6 +15751,27 @@ pub struct Trade {
     /// from kept quotes.
     #[prost(message, optional, tag = "8")]
     pub quote_at_trade: ::core::option::Option<QuoteAtTrade>,
+    /// Contract v29: per unit, percent of par, a yield or a spread, as
+    /// Price.basis. Unspecified: per unit, as every trade before v29.
+    #[prost(enumeration = "PriceBasis", tag = "9")]
+    pub basis: i32,
+    /// Contract v29: its value, convention and kind: TRACE's yield, Treasury's
+    /// high yield, a broker's YTM or YTW. Unset where the source states no yield.
+    #[prost(message, optional, tag = "10")]
+    pub r#yield: ::core::option::Option<QuotedYield>,
+    /// Contract v29: basis points over benchmark_instrument_id. Unset unless the
+    /// basis is spread.
+    #[prost(message, optional, tag = "11")]
+    pub spread_bps: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// Contract v29: an on-the-run Treasury's bond record or a rate_curve record.
+    /// Empty unless the basis is spread, or a yield stated against a benchmark.
+    #[prost(string, tag = "12")]
+    pub benchmark_instrument_id: ::prost::alloc::string::String,
+    /// Contract v29: true where the source disseminates a cap -- TRACE's 5MM+
+    /// investment grade, 1MM+ high yield, 25MM+ good-delivery TBA -- and quantity
+    /// is the cap, the least it was. False: the quantity is as traded.
+    #[prost(bool, tag = "13")]
+    pub quantity_capped: bool,
 }
 /// What a trade may count for (spec/the-lake, "Trade attributes"): written on
 /// each trade, so no reader needs a table to compute a bar.
@@ -13736,7 +15784,9 @@ pub struct TradeAttributes {
     #[prost(message, optional, tag = "2")]
     pub market_centre: ::core::option::Option<Eligibility>,
     /// Its characteristics: 0 to 16. None is a regular trade, unless
-    /// `meta.unconverted` names a code that did not convert.
+    /// `meta.unconverted` names a code that did not convert; from contract v29
+    /// (900), none listed means none the source states, a source that never
+    /// states one marking its suite case not presented.
     #[prost(enumeration = "TradeCharacteristic", repeated, tag = "3")]
     pub characteristics: ::prost::alloc::vec::Vec<i32>,
 }
@@ -13774,6 +15824,42 @@ pub struct Quote {
     /// The quote's state: 0 to 4. None is firm and trading.
     #[prost(enumeration = "QuoteCharacteristic", repeated, tag = "6")]
     pub characteristics: ::prost::alloc::vec::Vec<i32>,
+    /// Contract v29: true where the source states a size bucket rather than a
+    /// size, and bid_quantity is the bucket's floor, the least it was, as
+    /// Trade.quantity_capped reads TRACE's caps. False: bid_quantity is the size
+    /// as stated.
+    #[prost(bool, tag = "7")]
+    pub bid_size_capped: bool,
+    /// Contract v29: true where the source states a size bucket rather than a
+    /// size, and ask_quantity is the bucket's floor, the least it was. False:
+    /// ask_quantity is the size as stated.
+    #[prost(bool, tag = "8")]
+    pub ask_size_capped: bool,
+    /// Contract v29: per unit or percent of par in bid and ask; a yield in
+    /// bid_yield and ask_yield; a spread in bid_spread_bps and ask_spread_bps.
+    /// Unspecified: per unit, as every quote before v29.
+    #[prost(enumeration = "PriceBasis", tag = "9")]
+    pub basis: i32,
+    /// Contract v29: its value, convention and kind. Unset unless the basis is
+    /// yield, or the source states a yield beside the price.
+    #[prost(message, optional, tag = "10")]
+    pub bid_yield: ::core::option::Option<QuotedYield>,
+    /// Contract v29: basis points over benchmark_instrument_id. Unset unless the
+    /// basis is spread.
+    #[prost(message, optional, tag = "11")]
+    pub bid_spread_bps: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// Contract v29: its value, convention and kind. Unset unless the basis is
+    /// yield, or the source states a yield beside the price.
+    #[prost(message, optional, tag = "12")]
+    pub ask_yield: ::core::option::Option<QuotedYield>,
+    /// Contract v29: basis points over benchmark_instrument_id. Unset unless the
+    /// basis is spread.
+    #[prost(message, optional, tag = "13")]
+    pub ask_spread_bps: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// Contract v29: as Trade.benchmark_instrument_id. Empty unless the basis is
+    /// spread.
+    #[prost(string, tag = "14")]
+    pub benchmark_instrument_id: ::prost::alloc::string::String,
 }
 /// An event contract's outcome, as its venue determined it, at one stage
 /// (W10.4; the lake plan's "vL1c"). One row key per contract: each change of
@@ -13838,18 +15924,6 @@ pub struct Rate {
     pub transaction_count: ::core::option::Option<u64>,
     #[prost(message, repeated, tag = "10")]
     pub percentiles: ::prost::alloc::vec::Vec<RatePercentile>,
-}
-/// How a rate accrues (FDP item 1).
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
-pub struct RateConvention {
-    #[prost(enumeration = "DayCount", tag = "1")]
-    pub day_count: i32,
-    #[prost(enumeration = "Compounding", tag = "2")]
-    pub compounding: i32,
-    /// For COMPOUNDING_COMPOUNDED, the periods a year (2 for a semi-annual
-    /// bond-equivalent yield); 0 otherwise.
-    #[prost(uint32, tag = "3")]
-    pub periods_per_year: u32,
 }
 /// One percentile of a rate's distribution, as the source states it.
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
@@ -14491,7 +16565,8 @@ pub struct ObservationsWantedEvent {
     pub dataset: ::prost::alloc::string::String,
     /// The data type, by its message's full name: meridian.v1.Price,
     /// meridian.v1.Bar, and from contract v19 meridian.v1.Trade or
-    /// meridian.v1.Quote.
+    /// meridian.v1.Quote; from contract v29 meridian.v1.Factor, for a pool or a
+    /// class held (W10.7).
     #[prost(string, tag = "3")]
     pub data_type: ::prost::alloc::string::String,
     /// 1 to 500.
@@ -15103,7 +17178,8 @@ pub struct DerivedSeries {
     #[prost(string, tag = "2")]
     pub series: ::prost::alloc::string::String,
     /// As derived, or as the publisher states it where published_by is set.
-    /// Never unset.
+    /// Never unset; from contract v29 (638) unset where the value is an amount
+    /// of money, which money_value carries.
     #[prost(message, optional, tag = "3")]
     pub value: ::core::option::Option<UnitValue>,
     /// A definition and its version, an analytics measure's where one was used;
@@ -15121,6 +17197,11 @@ pub struct DerivedSeries {
     /// own measure. A page shows it labelled with whose, never as our measure.
     #[prost(string, tag = "6")]
     pub published_by: ::prost::alloc::string::String,
+    /// Contract v29: a Money naming its cash instrument: a dollar volume, an
+    /// expected move in the underlying's currency. Unset unless the series is an
+    /// amount of money; value is then unset.
+    #[prost(message, optional, tag = "7")]
+    pub money_value: ::core::option::Option<Money>,
 }
 /// Contract v28 (DerivedSeries.inputs): names what the value was derived from.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -15790,6 +17871,12 @@ pub struct QualityAssessment {
     /// Stamped by the sidecar. Never empty on a record; a plugin leaves it empty.
     #[prost(string, tag = "6")]
     pub assessed_by_instance: ::prost::alloc::string::String,
+    /// Contract v29: the row's message by its full name, as a want names it:
+    /// meridian.v1.Price, meridian.v1.Bar; so a day's close and its bar, sharing a
+    /// key, escalate apart. Never empty from v29; empty on an assessment recorded
+    /// before it, read as the row key's only kind.
+    #[prost(string, tag = "7")]
+    pub data_type: ::prost::alloc::string::String,
 }
 /// Contract v28 (W10.12): RecordQualityAssessments's request.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -15805,6 +17892,124 @@ pub struct RecordQualityAssessmentsReply {
     /// Each its own record. 0: none recorded.
     #[prost(uint32, tag = "1")]
     pub recorded: u32,
+}
+/// Contract v29 (W10.4): one month's factor of a pool or a REMIC class, as the
+/// agency publishes it; current face is original face times the latest row.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Factor {
+    /// Its subject the pool's or tranche's INS- record, its source the agency's
+    /// dataset, its business date the factor's publication date, version and
+    /// sequence; a republished factor is the next version. Never unset.
+    #[prost(message, optional, tag = "1")]
+    pub meta: ::core::option::Option<ObservationMeta>,
+    /// The fraction of original face outstanding after the month's payment, an
+    /// exact decimal as the agency publishes it (rounded, not truncated, by
+    /// Freddie Mac since 2016); above 1 on an accreting Z class. Never unset.
+    #[prost(message, optional, tag = "2")]
+    pub factor: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// YYYYMM, the agency's factor month. Never empty.
+    #[prost(string, tag = "3")]
+    pub factor_month: ::prost::alloc::string::String,
+    /// States the record date of the month's payment: a plain date. Empty where
+    /// the agency states none.
+    #[prost(string, tag = "4")]
+    pub record_date: ::prost::alloc::string::String,
+    /// A plain date: the 25th for UMBS, the 15th or 20th for Ginnie Mae I and II,
+    /// rolled. Empty where the agency states none.
+    #[prost(string, tag = "5")]
+    pub payment_date: ::prost::alloc::string::String,
+    /// The annual rate the agency's reset file states. Unset on a fixed-rate pool
+    /// or class.
+    #[prost(message, optional, tag = "6")]
+    pub coupon_rate: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// Contract v29 (995): the pool's or class's weighted average coupon for the
+    /// month, percent per year, as the agency's monthly disclosure states it (FIX
+    /// stipulation WAC). Unset where the agency states none.
+    #[prost(message, optional, tag = "7")]
+    pub wac: ::core::option::Option<::meridian_pb::v1::Decimal>,
+    /// Contract v29 (995): the weighted average remaining maturity in months, as
+    /// the agency's monthly disclosure states it (FIX stipulation WAM). Unset
+    /// where the agency states none.
+    #[prost(uint32, optional, tag = "8")]
+    pub wam: ::core::option::Option<u32>,
+    /// Contract v29 (995): the weighted average loan age in months, as the
+    /// agency's monthly disclosure states it (FIX stipulation WALA). Unset where
+    /// the agency states none; 0 for a pool in its first month.
+    #[prost(uint32, optional, tag = "9")]
+    pub wala: ::core::option::Option<u32>,
+}
+/// Contract v29 (W10.4): RecordFactors's command, batched, recorded whole or
+/// refused naming the item and field.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RecordFactorsRequest {
+    /// Up to the lake's batch size, each its own row. Never empty.
+    #[prost(message, repeated, tag = "1")]
+    pub factors: ::prost::alloc::vec::Vec<Factor>,
+    /// As RecordPricesRequest.want_id. Empty unless the batch answers a want.
+    #[prost(string, tag = "2")]
+    pub want_id: ::prost::alloc::string::String,
+}
+/// Contract v29 (W10.5): FactorsRecorded's event, unconflated.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FactorsRecordedEvent {
+    /// Carries a factor after it commits: the row as kept. Never unset.
+    #[prost(message, optional, tag = "1")]
+    pub factor: ::core::option::Option<Factor>,
+}
+/// Contract v29 (W10.6): ListFactors's request, point in time as every read is.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListFactorsRequest {
+    /// Names the pools and tranches read: each subject's INS- record. Never empty.
+    #[prost(message, repeated, tag = "1")]
+    pub subjects: ::prost::alloc::vec::Vec<SubjectRef>,
+    /// Bounds the read by payment date: a plain date, inclusive. Empty: from the
+    /// first.
+    #[prost(string, tag = "2")]
+    pub from_date: ::prost::alloc::string::String,
+    /// Bounds the read by payment date: a plain date, inclusive. Empty: to the
+    /// latest.
+    #[prost(string, tag = "3")]
+    pub to_date: ::prost::alloc::string::String,
+    /// Names the source: as every read. Unset: the default source.
+    #[prost(message, optional, tag = "4")]
+    pub sources: ::core::option::Option<SourceChoice>,
+    /// Reads as of a recorded time: point in time, as every read. 0: now.
+    #[prost(int64, tag = "5")]
+    pub as_of_ns: i64,
+    /// How many rows a page holds at most, as every lake read's. 0 is 100; past
+    /// 500, answered at 500.
+    #[prost(uint32, tag = "6")]
+    pub page_size: u32,
+    /// The cursor the last page answered. Empty: the first page.
+    #[prost(string, tag = "7")]
+    pub cursor: ::prost::alloc::string::String,
+    /// The watermark the reader last saw: answered the rows each dataset partition
+    /// it names recorded after its sequence there, for the subjects asked,
+    /// whatever their dates (an unconflated row is caught up after a watermark, as
+    /// trades, outcomes and corporate actions are). Unset: a read by dates, or as
+    /// of as_of_ns.
+    #[prost(message, optional, tag = "8")]
+    pub after_watermark: ::core::option::Option<Watermark>,
+}
+/// Contract v29 (W10.6): ListFactors's answer.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListFactorsReply {
+    /// Answers the factors: each row at the as-of. None where nothing was found.
+    #[prost(message, repeated, tag = "1")]
+    pub factors: ::prost::alloc::vec::Vec<Factor>,
+    /// Each subject and dataset with its reason. None where every subject was
+    /// answered.
+    #[prost(message, repeated, tag = "2")]
+    pub unanswered: ::prost::alloc::vec::Vec<Unanswered>,
+    /// Each with its terms and counts. Never empty when a row is answered.
+    #[prost(message, repeated, tag = "3")]
+    pub datasets: ::prost::alloc::vec::Vec<DatasetRef>,
+    /// States the read's watermark: as every read. Never unset.
+    #[prost(message, optional, tag = "4")]
+    pub watermark: ::core::option::Option<Watermark>,
+    /// Continues the read: pass it as cursor. Empty on the last page.
+    #[prost(string, tag = "5")]
+    pub next_cursor: ::prost::alloc::string::String,
 }
 /// Which of the source's clocks a timestamp is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
@@ -15902,35 +18107,6 @@ impl PriceKind {
             "PRICE_KIND_BID" => Some(Self::Bid),
             "PRICE_KIND_ASK" => Some(Self::Ask),
             "PRICE_KIND_MID" => Some(Self::Mid),
-            _ => None,
-        }
-    }
-}
-/// What one unit of a price is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
-#[repr(i32)]
-pub enum PriceBasis {
-    /// Refused.
-    Unspecified = 0,
-    /// Per unit of the subject.
-    PerUnit = 1,
-}
-impl PriceBasis {
-    /// String value of the enum field names used in the ProtoBuf definition.
-    ///
-    /// The values are not transformed in any way and thus are considered stable
-    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
-    pub fn as_str_name(&self) -> &'static str {
-        match self {
-            Self::Unspecified => "PRICE_BASIS_UNSPECIFIED",
-            Self::PerUnit => "PRICE_BASIS_PER_UNIT",
-        }
-    }
-    /// Creates an enum from field names used in the ProtoBuf definition.
-    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
-        match value {
-            "PRICE_BASIS_UNSPECIFIED" => Some(Self::Unspecified),
-            "PRICE_BASIS_PER_UNIT" => Some(Self::PerUnit),
             _ => None,
         }
     }
@@ -16043,6 +18219,40 @@ pub enum TradeCharacteristic {
     StockOptionTied = 16,
     /// Contract v28: A trade made on an exchange's floor.
     Floor = 17,
+    /// Contract v29: fixed income: the reporting dealer's contra was a customer
+    /// (TRACE's C).
+    ContraCustomer = 18,
+    /// Contract v29: fixed income: an inter-dealer trade (TRACE's D).
+    ContraDealer = 19,
+    /// Contract v29: fixed income: the contra was a non-member affiliate (TRACE's
+    /// A).
+    ContraAffiliate = 20,
+    /// Contract v29: fixed income: executed on an alternative trading system.
+    AtsExecuted = 21,
+    /// Contract v29: fixed income: the reporting dealer acted as agent.
+    AgencyCapacity = 22,
+    /// Contract v29: fixed income: the reporting dealer acted as principal or
+    /// riskless principal.
+    PrincipalCapacity = 23,
+    /// Contract v29: fixed income: traded when issued, before the security's issue
+    /// date.
+    WhenIssued = 24,
+    /// Contract v29: fixed income: a primary-market trade, not secondary.
+    PrimaryMarket = 25,
+    /// Contract v29: fixed income: priced away from the market for a reason the
+    /// report states (TRACE's special price).
+    SpecialPrice = 26,
+    /// Contract v29: municipal: a primary-market sale at the list offering price,
+    /// or a takedown (RTRS's list offering price or takedown indicator, G-14 RTRS
+    /// Procedures).
+    ListOfferingPriceTakedown = 27,
+    /// Contract v29: municipal: the dealer took no markup, markdown or commission
+    /// in the price, compensated otherwise (RTRS's non-transaction-based
+    /// compensation indicator).
+    NonTransactionCompensation = 28,
+    /// Contract v29: fixed income: traded without accrued interest, as a bond in
+    /// default (RTRS's traded flat indicator).
+    TradedFlat = 29,
 }
 impl TradeCharacteristic {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -16069,6 +18279,22 @@ impl TradeCharacteristic {
             Self::MultiLeg => "TRADE_CHARACTERISTIC_MULTI_LEG",
             Self::StockOptionTied => "TRADE_CHARACTERISTIC_STOCK_OPTION_TIED",
             Self::Floor => "TRADE_CHARACTERISTIC_FLOOR",
+            Self::ContraCustomer => "TRADE_CHARACTERISTIC_CONTRA_CUSTOMER",
+            Self::ContraDealer => "TRADE_CHARACTERISTIC_CONTRA_DEALER",
+            Self::ContraAffiliate => "TRADE_CHARACTERISTIC_CONTRA_AFFILIATE",
+            Self::AtsExecuted => "TRADE_CHARACTERISTIC_ATS_EXECUTED",
+            Self::AgencyCapacity => "TRADE_CHARACTERISTIC_AGENCY_CAPACITY",
+            Self::PrincipalCapacity => "TRADE_CHARACTERISTIC_PRINCIPAL_CAPACITY",
+            Self::WhenIssued => "TRADE_CHARACTERISTIC_WHEN_ISSUED",
+            Self::PrimaryMarket => "TRADE_CHARACTERISTIC_PRIMARY_MARKET",
+            Self::SpecialPrice => "TRADE_CHARACTERISTIC_SPECIAL_PRICE",
+            Self::ListOfferingPriceTakedown => {
+                "TRADE_CHARACTERISTIC_LIST_OFFERING_PRICE_TAKEDOWN"
+            }
+            Self::NonTransactionCompensation => {
+                "TRADE_CHARACTERISTIC_NON_TRANSACTION_COMPENSATION"
+            }
+            Self::TradedFlat => "TRADE_CHARACTERISTIC_TRADED_FLAT",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -16096,6 +18322,22 @@ impl TradeCharacteristic {
             "TRADE_CHARACTERISTIC_MULTI_LEG" => Some(Self::MultiLeg),
             "TRADE_CHARACTERISTIC_STOCK_OPTION_TIED" => Some(Self::StockOptionTied),
             "TRADE_CHARACTERISTIC_FLOOR" => Some(Self::Floor),
+            "TRADE_CHARACTERISTIC_CONTRA_CUSTOMER" => Some(Self::ContraCustomer),
+            "TRADE_CHARACTERISTIC_CONTRA_DEALER" => Some(Self::ContraDealer),
+            "TRADE_CHARACTERISTIC_CONTRA_AFFILIATE" => Some(Self::ContraAffiliate),
+            "TRADE_CHARACTERISTIC_ATS_EXECUTED" => Some(Self::AtsExecuted),
+            "TRADE_CHARACTERISTIC_AGENCY_CAPACITY" => Some(Self::AgencyCapacity),
+            "TRADE_CHARACTERISTIC_PRINCIPAL_CAPACITY" => Some(Self::PrincipalCapacity),
+            "TRADE_CHARACTERISTIC_WHEN_ISSUED" => Some(Self::WhenIssued),
+            "TRADE_CHARACTERISTIC_PRIMARY_MARKET" => Some(Self::PrimaryMarket),
+            "TRADE_CHARACTERISTIC_SPECIAL_PRICE" => Some(Self::SpecialPrice),
+            "TRADE_CHARACTERISTIC_LIST_OFFERING_PRICE_TAKEDOWN" => {
+                Some(Self::ListOfferingPriceTakedown)
+            }
+            "TRADE_CHARACTERISTIC_NON_TRANSACTION_COMPENSATION" => {
+                Some(Self::NonTransactionCompensation)
+            }
+            "TRADE_CHARACTERISTIC_TRADED_FLAT" => Some(Self::TradedFlat),
             _ => None,
         }
     }
@@ -16182,81 +18424,6 @@ impl RateKind {
             "RATE_KIND_ZERO" => Some(Self::Zero),
             "RATE_KIND_DISCOUNT" => Some(Self::Discount),
             "RATE_KIND_COUPON_EQUIVALENT" => Some(Self::CouponEquivalent),
-            _ => None,
-        }
-    }
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
-#[repr(i32)]
-pub enum DayCount {
-    /// Not stated by the source.
-    Unspecified = 0,
-    Act360 = 1,
-    Act365Fixed = 2,
-    ActAct = 3,
-    Thirty360 = 4,
-    Bus252 = 5,
-}
-impl DayCount {
-    /// String value of the enum field names used in the ProtoBuf definition.
-    ///
-    /// The values are not transformed in any way and thus are considered stable
-    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
-    pub fn as_str_name(&self) -> &'static str {
-        match self {
-            Self::Unspecified => "DAY_COUNT_UNSPECIFIED",
-            Self::Act360 => "DAY_COUNT_ACT_360",
-            Self::Act365Fixed => "DAY_COUNT_ACT_365_FIXED",
-            Self::ActAct => "DAY_COUNT_ACT_ACT",
-            Self::Thirty360 => "DAY_COUNT_THIRTY_360",
-            Self::Bus252 => "DAY_COUNT_BUS_252",
-        }
-    }
-    /// Creates an enum from field names used in the ProtoBuf definition.
-    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
-        match value {
-            "DAY_COUNT_UNSPECIFIED" => Some(Self::Unspecified),
-            "DAY_COUNT_ACT_360" => Some(Self::Act360),
-            "DAY_COUNT_ACT_365_FIXED" => Some(Self::Act365Fixed),
-            "DAY_COUNT_ACT_ACT" => Some(Self::ActAct),
-            "DAY_COUNT_THIRTY_360" => Some(Self::Thirty360),
-            "DAY_COUNT_BUS_252" => Some(Self::Bus252),
-            _ => None,
-        }
-    }
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
-#[repr(i32)]
-pub enum Compounding {
-    /// Refused.
-    Unspecified = 0,
-    Simple = 1,
-    Compounded = 2,
-    Continuous = 3,
-    Discount = 4,
-}
-impl Compounding {
-    /// String value of the enum field names used in the ProtoBuf definition.
-    ///
-    /// The values are not transformed in any way and thus are considered stable
-    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
-    pub fn as_str_name(&self) -> &'static str {
-        match self {
-            Self::Unspecified => "COMPOUNDING_UNSPECIFIED",
-            Self::Simple => "COMPOUNDING_SIMPLE",
-            Self::Compounded => "COMPOUNDING_COMPOUNDED",
-            Self::Continuous => "COMPOUNDING_CONTINUOUS",
-            Self::Discount => "COMPOUNDING_DISCOUNT",
-        }
-    }
-    /// Creates an enum from field names used in the ProtoBuf definition.
-    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
-        match value {
-            "COMPOUNDING_UNSPECIFIED" => Some(Self::Unspecified),
-            "COMPOUNDING_SIMPLE" => Some(Self::Simple),
-            "COMPOUNDING_COMPOUNDED" => Some(Self::Compounded),
-            "COMPOUNDING_CONTINUOUS" => Some(Self::Continuous),
-            "COMPOUNDING_DISCOUNT" => Some(Self::Discount),
             _ => None,
         }
     }
@@ -16437,6 +18604,10 @@ pub enum UnansweredReason {
     BeyondHistory = 6,
     /// The dataset's licence forbids keeping it, and it was served, not kept.
     NotKept = 7,
+    /// Contract v29: the dataset's only rows for the subject at the as-of are
+    /// invalid: left out, never fallen back to, named so a reader can tell it from
+    /// silence (ruling 619 (1)).
+    Quarantined = 8,
 }
 impl UnansweredReason {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -16453,6 +18624,7 @@ impl UnansweredReason {
             Self::Unresolved => "UNANSWERED_REASON_UNRESOLVED",
             Self::BeyondHistory => "UNANSWERED_REASON_BEYOND_HISTORY",
             Self::NotKept => "UNANSWERED_REASON_NOT_KEPT",
+            Self::Quarantined => "UNANSWERED_REASON_QUARANTINED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -16466,6 +18638,7 @@ impl UnansweredReason {
             "UNANSWERED_REASON_UNRESOLVED" => Some(Self::Unresolved),
             "UNANSWERED_REASON_BEYOND_HISTORY" => Some(Self::BeyondHistory),
             "UNANSWERED_REASON_NOT_KEPT" => Some(Self::NotKept),
+            "UNANSWERED_REASON_QUARANTINED" => Some(Self::Quarantined),
             _ => None,
         }
     }
@@ -17652,6 +19825,14 @@ pub enum NotEvaluatedReason {
     /// Contract v28: The only input in force is invalid, its dataset in detail
     /// (ruling 421).
     InputQuarantined = 13,
+    /// Contract v29: a debt record minted incomplete, its missing fields named --
+    /// a callable bond without its calls -- so no yield to worst or cash flow is
+    /// computed from a guess.
+    TermsIncomplete = 14,
+    /// Contract v29 (997): a term v29's engine does not compute, named in detail
+    /// -- a floater's index projection, a TIPS's index ratio, BUS/252, actual/
+    /// actual (AFB) or (ICMA ultimo) -- so no figure is computed from a guess.
+    NotSupported = 15,
 }
 impl NotEvaluatedReason {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -17676,6 +19857,8 @@ impl NotEvaluatedReason {
             Self::BelowIntrinsic => "NOT_EVALUATED_REASON_BELOW_INTRINSIC",
             Self::FitFailed => "NOT_EVALUATED_REASON_FIT_FAILED",
             Self::InputQuarantined => "NOT_EVALUATED_REASON_INPUT_QUARANTINED",
+            Self::TermsIncomplete => "NOT_EVALUATED_REASON_TERMS_INCOMPLETE",
+            Self::NotSupported => "NOT_EVALUATED_REASON_NOT_SUPPORTED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -17699,6 +19882,8 @@ impl NotEvaluatedReason {
             "NOT_EVALUATED_REASON_BELOW_INTRINSIC" => Some(Self::BelowIntrinsic),
             "NOT_EVALUATED_REASON_FIT_FAILED" => Some(Self::FitFailed),
             "NOT_EVALUATED_REASON_INPUT_QUARANTINED" => Some(Self::InputQuarantined),
+            "NOT_EVALUATED_REASON_TERMS_INCOMPLETE" => Some(Self::TermsIncomplete),
+            "NOT_EVALUATED_REASON_NOT_SUPPORTED" => Some(Self::NotSupported),
             _ => None,
         }
     }
@@ -19336,6 +21521,8 @@ pub struct ListRegistryPacksReply {
 /// W8.18: install a pack, the ticked members one by one as a job.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct InstallPackRequest {
+    /// Contract v29 (616): an install of a withdrawn pack is refused
+    /// FAILED_PRECONDITION naming it, never INVALID_ARGUMENT.
     #[prost(string, tag = "1")]
     pub pack: ::prost::alloc::string::String,
     /// The revision the sheet showed; another is refused FAILED_PRECONDITION
@@ -19380,6 +21567,10 @@ pub struct PackStatus {
     pub withdrawn: bool,
     #[prost(message, repeated, tag = "5")]
     pub members: ::prost::alloc::vec::Vec<PackMemberStatus>,
+    /// Contract v29 (616): the pack's title as its curator states it, which the
+    /// pack's page and dashboard__read_pack show.
+    #[prost(string, tag = "6")]
+    pub title: ::prost::alloc::string::String,
 }
 /// One member's state in this deployment.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -19414,6 +21605,10 @@ pub struct PackMemberStatus {
 /// W8.19: update every launched member to its own latest.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct UpdatePackRequest {
+    /// Contract v29 (616): an update that cannot proceed as the deployment
+    /// stands -- a member whose source registry is not taken -- is refused
+    /// FAILED_PRECONDITION naming what is missing, never INVALID_ARGUMENT;
+    /// nothing is updated.
     #[prost(string, tag = "1")]
     pub pack: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]

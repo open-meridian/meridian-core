@@ -45,9 +45,10 @@ stop cancels each placement it is working at once, reporting each cancel as a
 fact naming the stop's entry (W11.9; v21's Q17), then the venue's
 confirmation. It serves:
 
-  /resolve?symbol=S[&figi=F][&cusip=C][&description=D][&thin=1]
-                                  resolves its symbol, with the FIGI and a
-                                  CUSIP beside it where given (W3.1), stating
+  /resolve?symbol=S[&figi=F][&cusip=C][&agency_pool=P&agency=A][&description=D][&thin=1]
+                                  resolves its symbol, with the FIGI, a
+                                  CUSIP and an agency's pool number beside
+                                  it where given (W3.1), stating
                                   a description and USD unless thin (from
                                   v24 the minimum a record needs), answering
                                   its ID and whether it is provisional;
@@ -170,7 +171,11 @@ def fill_json(execution):
             "state": ops.ExecutionState.Name(execution.state),
             "venue_order_id": execution.venue_order_id, "order_id": execution.order_id,
             "placement_id": execution.placement_id, "trade_date": execution.trade_date,
-            "dk_reason": ops.DkReason.Name(execution.dk_reason)}
+            "dk_reason": ops.DkReason.Name(execution.dk_reason),
+            # Contract v29 (W11.11): the reporting fields, as kept.
+            "price_basis": ops.PriceBasis.Name(execution.price_basis),
+            "capacity": ops.Capacity.Name(execution.capacity),
+            "contra_party_type": ops.ContraPartyType.Name(execution.contra_party_type)}
 
 
 # ── Contract v23: the ems's page for venue-originated fills ────────────────
@@ -337,7 +342,11 @@ class Pm(Plugin):
             if one(query, "cash"):
                 params.cash_quantity.CopyFrom(usd(one(query, "cash")))
             if params.order_type == ops.OrderType.ORDER_TYPE_LIMIT:
-                params.limit_price.CopyFrom(usd("230.00"))
+                params.limit_price.CopyFrom(usd(one(query, "limit", "230.00")))
+            if one(query, "basis"):
+                # Contract v29 (W11.1): a debt order's price basis, its limit
+                # per 100 of face.
+                params.price_basis = ops.PriceBasis.Value("PRICE_BASIS_" + one(query, "basis").upper())
             done = await self.call("ProposeOrder", params)
             return order_json(done.order)
         if path == "/release":
@@ -355,7 +364,32 @@ class Pm(Plugin):
             return await self.orders(query)
         if path == "/tca":
             return await self.tca(query)
+        if path == "/bond-job":
+            return await self.bond_job(query)
         return {"page": "the portfolio stand-in"}
+
+    async def bond_job(self, query):
+        """Contract v29 (W12.1; ruling 688): the bond fund's accrued interest
+        and yields, which the analytics component answers from the book's
+        position, the instrument store's terms and the lake at the as-of:
+        each figure and each line not evaluated, in brief."""
+        account = one(query, "account")
+        ran = await self.call("RunJob", ops.RunJobParams(job=ops.Job(
+            account_ids=[account],
+            measures=[ops.MeasureRef(definition="accrued_interest", version=1),
+                      ops.MeasureRef(definition="bond_yield", version=1)])))
+        answer = ran.answer
+        return {
+            "answered_inline": ran.answered_inline,
+            "figures": [{"measure": f.measure.definition,
+                         "breakdown": {b.breakdown: b.value for b in f.breakdown},
+                         "value": number(f.value) if f.HasField("value") else ""}
+                        for f in answer.figures],
+            "not_evaluated": [{"measure": u.measure.definition, "instrument": u.instrument_id,
+                               "reason": ops.NotEvaluatedReason.Name(u.reason), "detail": u.detail}
+                              for u in answer.not_evaluated],
+            "models": sorted(m.model_id for m in answer.provenance.models),
+        }
 
     async def tca(self, query):
         """Contract v27 (W10.11, W12.1; ruling 510): an execution_cost job on
@@ -453,6 +487,10 @@ class Desk(Plugin):
                 allocation = ops.Allocation(account_id=account, quantity=decimal(quantity),
                                             average_price=usd(one(query, "price", PRICE)),
                                             gross_amount=usd(gross))
+                if one(query, "accrued"):
+                    # Contract v29 (W11.27; 720, 988): the accrued interest
+                    # as confirmed, its own cash line at booking.
+                    allocation.accrued_interest.CopyFrom(usd(one(query, "accrued")))
                 if error:
                     allocation.error_cause = ops.ErrorCause.ERROR_CAUSE_OVERFILL
                     allocation.reason = "the venue filled more than ordered"
@@ -626,15 +664,15 @@ class Venue(Plugin):
             placement_id=placement_id, event=event, raw_record=self.raw(f"orders/{placement_id}/{event}"),
             **fields))
 
-    async def fill(self, placement, quantity, cumulative):
+    async def fill(self, placement, quantity, cumulative, price=PRICE, **fields):
         today = datetime.now(timezone.utc).date()
-        await self.call("ReportExecution", ops.ReportExecutionParams(
+        return await self.call("ReportExecution", ops.ReportExecutionParams(
             placement_id=placement.placement_id,
             venue_account_code=placement.venue_account_code,
             venue_execution_id=f"SIM-{placement.placement_id}:{cumulative}",
             kind=ops.ExecutionKind.EXECUTION_KIND_VENUE_REPORTED,
             source=ops.ExecutionSource.EXECUTION_SOURCE_PRIMARY,
-            quantity=decimal(quantity), price=usd(PRICE),
+            quantity=decimal(quantity), price=usd(price), **fields,
             trade_time_ns=time.time_ns(), trade_date=today.isoformat(),
             finality=ops.Finality(level=ops.FinalityLevel.FINALITY_LEVEL_FINAL, at_ns=time.time_ns()),
             settlement_date=settles(today).isoformat(),
@@ -712,6 +750,11 @@ class Venue(Plugin):
                 # A licensed scheme (contract v24, W3.25): kept in the
                 # deployment, never sent to the platform.
                 identifiers.append(ops.Identifier(scheme="cusip", value=one(query, "cusip")))
+            if one(query, "agency_pool"):
+                # Contract v29 (W1.26): an agency's pool number, open, its
+                # agency in source.
+                identifiers.append(ops.Identifier(scheme="agency_pool", value=one(query, "agency_pool"),
+                                                  source=one(query, "agency", "FNMA")))
             # What the venue states of it: from contract v24 a record needs an
             # identifier, a description and a currency (W3.7), and a source
             # thinner than that is not found, nothing minted.
@@ -768,6 +811,42 @@ class Venue(Plugin):
                 venue_order_id=venue_order, venue_client_order_id=f"CL-{venue_order}",
                 raw_record=self.raw(f"fills/own/{venue_order}/{self.sent}")))
             return fill_json(done.execution)
+        if path == "/bondfill":
+            # Contract v29 (W11.11; 986, 987): a working placement in a debt
+            # record filled whole, its price per 100 of face, quoted in
+            # percent of par, the time to the second, a dealer the contra.
+            placement = self.worked[one(query, "placement")]
+            quantity = number(placement.quantity)
+            try:
+                done = await self.fill(
+                    placement, quantity, quantity, price=one(query, "price"),
+                    price_basis=ops.PriceBasis.PRICE_BASIS_PERCENT_OF_PAR,
+                    trade_time_precision=ops.TimePrecision.TIME_PRECISION_SECOND,
+                    contra_party_type=ops.ContraPartyType.CONTRA_PARTY_TYPE_DEALER,
+                    capacity=ops.Capacity.Value("CAPACITY_" + one(query, "capacity", "principal").upper()))
+            except Refusal as failed:
+                return failed.said
+            self.worked.pop(placement.placement_id, None)
+            return fill_json(done.execution)
+        if path == "/coupon":
+            # Contract v29 (W9.16; 683, 988): the broker's report of a
+            # coupon paid, the record; its cash the interest.
+            try:
+                done = await self.call("RecordLifecycleEvent", ops.RecordLifecycleEventParams(
+                    event=ops.LifecycleEvent(
+                        account_id=one(query, "account"), instrument_id=one(query, "instrument"),
+                        kind=ops.LifecycleEventKind.LIFECYCLE_EVENT_KIND_COUPON_RECEIVED,
+                        quantity=decimal(one(query, "quantity")), event_date=one(query, "date"),
+                        period_start_date=one(query, "start"), period_end_date=one(query, "end"),
+                        record_date=one(query, "record"), cash=usd(one(query, "cash")),
+                        external_event_id=f"SIM-CPN-{one(query, 'instrument')}-{one(query, 'date')}",
+                        raw_record=self.raw(f"lifecycle/coupon/{one(query, 'date')}")),
+                    idempotency_key=f"coupon:{one(query, 'account')}:{one(query, 'date')}"))
+            except Refusal as failed:
+                return failed.said
+            return {"event_id": done.event.event_id,
+                    "state": ops.LifecycleEventState.Name(done.event.state),
+                    "kind": ops.LifecycleEventKind.Name(done.event.kind)}
         if path == "/astray":
             today = datetime.now(timezone.utc).date()
             done = await self.call("ReportExecution", ops.ReportExecutionParams(
@@ -862,6 +941,23 @@ class Ops(Plugin):
     (W11.31)."""
 
     async def answer(self, path, query, caller):
+        if path == "/opening":
+            # W9.1: an account's opening balance as the custodian states it,
+            # its cash alone (contract v29's run opens a bond fund).
+            cash = one(query, "cash")
+            done = await self.call("RecordOpeningBalance", ops.RecordOpeningBalanceParams(
+                account_id=one(query, "account"), as_of_date=one(query, "date"),
+                sources=[ops.OpeningSource(
+                    kind=ops.OpeningSourceKind.OPENING_SOURCE_KIND_CUSTODIAN,
+                    name="The simulated custodian", as_of_date=one(query, "date"),
+                    basis=ops.PositionBasis.POSITION_BASIS_TRADE_DATE)],
+                positions=[ops.OpeningPosition(
+                    instrument_id=one(query, "cash_instrument"),
+                    side=ops.HoldingSide.HOLDING_SIDE_LONG,
+                    trade_date_quantity=decimal(cash), settled_quantity=decimal(cash))],
+                reason="Opening balance", idempotency_key=f"opening:{one(query, 'account')}",
+                acting_for=caller))
+            return {"entry_id": done.entry.entry_id}
         if path == "/correct":
             allocations = [ops.Allocation(account_id=a, quantity=decimal(q),
                                           average_price=usd(one(query, "price", PRICE)),

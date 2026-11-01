@@ -319,10 +319,12 @@ pub struct Instrument {
     /// the platform's answer to a person's ask; empty where none is known.
     pub listing_venue_id: String,
 
-    /// A listed series' full terms, as the platform's record states them
-    /// (contract v28; rulings 559 and 575): the listed option's or the
-    /// future's message, its bytes in hex
-    /// (`instrument_type::listed_terms_to_text`); empty for any other record.
+    /// A record's full terms, as the platform's record states them: a listed
+    /// series' (contract v28; rulings 559 and 575), the listed option's or
+    /// the future's message, and from contract v29 a debt record's (676),
+    /// its bond's, pool's, TBA's, tranche's or CD's, its bytes in hex
+    /// (`instrument_type::terms_to_text`); empty for any other record. The
+    /// column keeps v28's name, `listed_terms`.
     pub listed_terms: String,
 
     /// Where each value in force came from.

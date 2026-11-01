@@ -4228,13 +4228,14 @@ async fn a_model_id_is_built_in_until_routed_to_a_running_pricing_instance() {
         .iter()
         .map(|r| (r.model_id.as_str(), r.implementation.as_str()))
         .collect();
+    // Every model id the engine serves, v28's and v29's among them (stage
+    // D's routing table), built-in until routed.
     assert_eq!(
         named,
-        vec![
-            ("cash", "built-in"),
-            ("quoted_price", "built-in"),
-            ("binary_event", "built-in")
-        ]
+        crate::service::MODEL_IDS
+            .iter()
+            .map(|model| (*model, "built-in"))
+            .collect::<Vec<_>>()
     );
     let refused = set("quoted_price", "oms-1", "prove the seam")
         .await
@@ -4244,8 +4245,17 @@ async fn a_model_id_is_built_in_until_routed_to_a_running_pricing_instance() {
         .await
         .unwrap_err();
     assert!(refused.contains("fields=reason"), "{refused}");
-    let refused = set("black_scholes", "built-in", "later").await.unwrap_err();
+    let refused = set("heston", "built-in", "later").await.unwrap_err();
     assert!(refused.contains("fields=model_id"), "{refused}");
+    // A v29 model routes as any other.
+    assert_eq!(
+        set("bond_cash_flows", "built-in", "the engine's own")
+            .await
+            .unwrap()
+            .version,
+        1,
+        "already built-in: nothing changes"
+    );
     let routed = set("quoted_price", "sample-pricing-1", "Prove the pricing seam")
         .await
         .unwrap();

@@ -248,7 +248,7 @@ fn provenance(case: &Case, reads: &Reads, hash: &str) -> Value {
 // ── A part over the wire, between the coordinator and a worker ──────────────
 
 /// The enum names a part may carry, as `&'static str`.
-const NAMES: [&str; 21] = [
+const NAMES: [&str; 22] = [
     BASE,
     WHAT_IF,
     HISTORICAL_DAY,
@@ -271,6 +271,8 @@ const NAMES: [&str; 21] = [
     BELOW_INTRINSIC,
     FIT_FAILED,
     INPUT_QUARANTINED,
+    // Contract v29.
+    TERMS_INCOMPLETE,
 ];
 
 fn series_key(value: &Value) -> Vec<(String, String)> {

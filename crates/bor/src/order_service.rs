@@ -894,7 +894,27 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
                     .unwrap_or_default()
             };
             if !filled.is_empty() {
-                ctx.records = references(&bus2, &[filled], ctx.received_at_ns).records;
+                ctx.records =
+                    references(&bus2, std::slice::from_ref(&filled), ctx.received_at_ns).records;
+            }
+            // Contract v29 (W11.11; ruling 986, amended at core stage C): a
+            // pool's or a tranche's fill stating no factor takes the latest
+            // Factor row for its settlement month, read before the lock.
+            if request.factor_used.is_none() && request.quantity.is_some() && ctx.is_pooled(&filled)
+            {
+                let month = crate::service::settlement_month(&[
+                    &request.settlement_date,
+                    &request.computed_settlement_date,
+                    &request.trade_date,
+                ]);
+                match month.map(|month| crate::service::latest_factor(&bus2, &filled, &month)) {
+                    Some(crate::service::FactorRead::Taken(factor, row)) => {
+                        ctx.factor_taken = Some(factor);
+                        ctx.factor_row = row;
+                    }
+                    Some(crate::service::FactorRead::Unavailable) => ctx.factors_unavailable = true,
+                    _ => {}
+                }
             }
             let fact = unplaced_fact::Fact::Execution(request.clone());
             if request.account_id.is_empty() {

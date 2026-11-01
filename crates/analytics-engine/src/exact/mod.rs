@@ -463,6 +463,37 @@ impl Ratio {
             scale,
         )
     }
+
+    /// Rounded once, half away from zero, to `scale` places: 31 CFR 356
+    /// Appendix B's rounding of a dirty price and its accrued interest
+    /// (contract v29).
+    pub fn round_half_up(&self, scale: u32) -> Dec {
+        self.toward(scale, true)
+    }
+
+    /// Cut toward zero at `scale` places: MSRB Rule G-33's yield, truncated
+    /// to four places before it is rounded to three (contract v29).
+    pub fn truncate(&self, scale: u32) -> Dec {
+        self.toward(scale, false)
+    }
+
+    fn toward(&self, scale: u32, half_up: bool) -> Dec {
+        let shifted = self.numerator.mul(&Big::pow10(scale)).abs();
+        let (mut whole, rest) = shifted.divmod_floor(&self.denominator);
+        if half_up && rest.mul_small(2).cmp(&self.denominator) != Ordering::Less {
+            whole = whole.add(&Big::from_u128(1));
+        }
+        if self.numerator.is_negative() {
+            whole = whole.negated();
+        }
+        Dec::new(Num::from_big(whole), scale)
+    }
+
+    /// The nearest double, for a model's floating-point inputs (contract
+    /// v29): never a figure.
+    pub fn to_f64(&self) -> f64 {
+        self.round_half_even(18).to_f64()
+    }
 }
 
 impl PartialEq for Ratio {

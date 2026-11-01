@@ -20,8 +20,9 @@ pub const REALIZED_SINCE: &str = "since the account opened";
 pub const BUILT_IN: &str = "built-in";
 
 /// v26's model ids, each at version 1 (the first release's §1); from
-/// contract v28 (ruling 565) the option models and the calibrations.
-pub const MODELS: [&str; 8] = [
+/// contract v28 (ruling 565) the option models and the calibrations; from
+/// contract v29 (ruling 688) the debt models and the curve's calibration.
+pub const MODELS: [&str; 11] = [
     "cash",
     "quoted_price",
     "binary_event",
@@ -30,6 +31,9 @@ pub const MODELS: [&str; 8] = [
     "black_76",
     "svi",
     "ssvi",
+    "bond_cash_flows",
+    "bond_yield_solver",
+    "monotone_convex",
 ];
 
 /// The breakdowns the linear measures allow (requirement 17).
@@ -133,10 +137,45 @@ const POSITIONING_SHORT_ALL: &[(&str, &str)] = &[
     ("rate_interpolation", "cubic_spline"),
 ];
 
+/// The debt measures' settlement and solver (contract v29; W12.1).
+const BOND_SOLVER: &[(&str, &str)] = &[
+    ("models", "bond_cash_flows_and_bond_yield_solver"),
+    ("price", "the_close_in_percent_of_par"),
+    (
+        "settlement",
+        "the_next_business_day_on_the_payment_calendar",
+    ),
+    (
+        "treasury",
+        "31_cfr_356_appendix_b_simple_interest_over_the_fractional_half_year",
+    ),
+    ("bill", "31_cfr_356_appendix_b_investment_rate"),
+    ("street", "sifma_standard_formula_msrb_g33_for_a_municipal"),
+    (
+        "worst",
+        "the_least_over_maturity_and_each_call_window_but_a_make_whole_one",
+    ),
+    ("municipal_yield", "truncated_to_4_places_then_rounded_to_3"),
+];
+
+/// The curve's fit (contract v29; W12.1, W12.3).
+const CURVE: &[(&str, &str)] = &[
+    ("model", "monotone_convex"),
+    ("par_yields", "ust_cmt"),
+    (
+        "instruments",
+        "par_bonds_semi_annual_actual_actual_icma_from_the_date",
+    ),
+    ("time", "actual_365_fixed"),
+    ("zero", "continuously_compounded"),
+    ("date", "the_job_date"),
+];
+
 /// Every definition the component serves, in the order it lists them:
 /// v26's at version 1, from contract v27 `execution_cost` version 1 and
-/// `pnl` version 2, and from contract v28 the options measures (W12.1).
-pub const DEFINITIONS: [Definition; 23] = [
+/// `pnl` version 2, from contract v28 the options measures, and from
+/// contract v29 the curve and bond measures (W12.1).
+pub const DEFINITIONS: [Definition; 34] = [
     Definition {
         definition: "market_value",
         version: 1,
@@ -388,6 +427,168 @@ pub const DEFINITIONS: [Definition; 23] = [
         breakdowns: &["series"],
         scale: 0,
         description: "Each series' open interest less the trading date's before, exact",
+    },
+    // Contract v29 (W12.1; ruling 688; ENG1 §3).
+    Definition {
+        definition: "accrued_interest",
+        version: 1,
+        parameters: &[
+            ("model", "bond_cash_flows"),
+            ("as_of", "the_job_date"),
+            ("accrual", "the_terms_day_count_from_the_period_start"),
+            ("pool_accrual", "thirty_360_from_the_first_of_the_month"),
+            ("clean", "the_close_in_percent_of_par_times_face_outstanding"),
+        ],
+        breakdowns: &["instrument", "component"],
+        scale: 2,
+        description: "Each debt position's clean value, its accrued interest as of the job's date \
+                      from its terms (never a stored balance), and its dirty value",
+    },
+    Definition {
+        definition: "bond_yield",
+        version: 1,
+        parameters: BOND_SOLVER,
+        breakdowns: &["instrument", "yield_kind", "to_date"],
+        scale: 6,
+        description: "Each bond's yield in percent from its close: to maturity, to the next call \
+                      and put, to worst (the date named) and current",
+    },
+    Definition {
+        definition: "bond_price",
+        version: 1,
+        parameters: &[
+            ("models", "bond_cash_flows_and_bond_yield_solver"),
+            (
+                "from",
+                "the_close_or_its_quoted_yield_or_its_spread_over_the_benchmark",
+            ),
+            ("settlement", "the_next_business_day_on_the_payment_calendar"),
+            ("treasury", "31_cfr_356_appendix_b_exact"),
+        ],
+        breakdowns: &["instrument", "component"],
+        scale: 6,
+        description: "Each bond's clean and dirty price per 100 of face from a yield or a spread, \
+                      the inverse of its yield",
+    },
+    Definition {
+        definition: "bond_risk",
+        version: 1,
+        parameters: &[
+            ("models", "bond_cash_flows_and_bond_yield_solver"),
+            ("at", "the_yield_to_worst"),
+            ("dv01", "modified_duration_times_dirty_price_over_10000"),
+            ("settlement", "the_next_business_day_on_the_payment_calendar"),
+        ],
+        breakdowns: &["instrument", "component"],
+        scale: 6,
+        description: "Each bond's Macaulay and modified duration, convexity and DV01 per 100 of \
+                      face and per position, to worst for a callable bond",
+    },
+    Definition {
+        definition: "key_rate_durations",
+        version: 1,
+        parameters: &[
+            ("curve", "treasury_curve_v1"),
+            ("bump_bp", "1"),
+            ("spread", "the_z_spread_held"),
+            ("at", "the_yield_to_worst"),
+        ],
+        breakdowns: &["instrument", "tenor"],
+        scale: 6,
+        description: "Each bond's duration to each curve tenor's par yield moved one basis point, \
+                      by bump scenarios through the graph",
+    },
+    Definition {
+        definition: "bond_spread",
+        version: 1,
+        parameters: &[
+            ("curve", "treasury_curve_v1"),
+            ("g_spread", "the_yield_less_the_fitted_par_curve_at_its_date"),
+            (
+                "z_spread",
+                "semi_annual_over_the_fitted_zero_curve_actual_365_fixed",
+            ),
+            ("benchmark", "the_yield_less_the_named_benchmark_yield"),
+            ("at", "the_yield_to_worst"),
+        ],
+        breakdowns: &["instrument", "spread_kind"],
+        scale: 4,
+        description: "Each bond's G-spread, Z-spread and spread to a named benchmark, in basis \
+                      points; I-spread waits for a swap curve",
+    },
+    Definition {
+        definition: "treasury_curve",
+        version: 1,
+        parameters: CURVE,
+        breakdowns: &["curve", "tenor"],
+        scale: 8,
+        description: "The Treasury par, zero and discount curves at the job's date, monotone \
+                      convex over the par yields",
+    },
+    Definition {
+        definition: "historical_prepayment",
+        version: 1,
+        parameters: &[
+            ("windows", "1_3_6_12_months_and_life"),
+            (
+                "scheduled_amortization",
+                "level_payment_at_the_wac_over_wala_plus_wam_where_stated_else_the_coupon_over_the_original_term",
+            ),
+            ("units", "percent"),
+        ],
+        breakdowns: &["instrument", "window", "component"],
+        scale: 4,
+        description: "Each pool's or class's SMM and CPR over 1, 3, 6 and 12 months and life, \
+                      from its factors",
+    },
+    Definition {
+        definition: "wal_at_cpr",
+        version: 1,
+        parameters: &[
+            ("cpr", "the_pools_3_month_historical_cpr_else_its_life_cpr"),
+            ("prepayment", "a_constant_cpr_no_model"),
+            (
+                "amortization",
+                "level_payment_at_the_wac_over_the_wam_where_stated_else_the_coupon_to_maturity",
+            ),
+            ("yield", "bond_equivalent_from_monthly"),
+        ],
+        breakdowns: &["instrument", "window", "component"],
+        scale: 4,
+        description: "Each pool's or class's weighted average life and yield at its own 3-month \
+                      historical CPR, else its life CPR, the speed named; static",
+    },
+    Definition {
+        definition: "make_whole_amount",
+        version: 1,
+        parameters: &[
+            (
+                "benchmark",
+                "h15_constant_maturities_straight_line_to_the_par_call_date",
+            ),
+            ("discounting", "semi_annual_thirty_360"),
+            ("redemption_date", "the_job_date"),
+            ("floor", "par"),
+        ],
+        breakdowns: &["instrument", "component"],
+        scale: 6,
+        description: "Each bond's make-whole redemption price per 100 and amount, if redeemed at \
+                      the job's date: the greater of par and its remaining payments to the par \
+                      call date discounted, less accrued",
+    },
+    Definition {
+        definition: "expected_move",
+        version: 1,
+        parameters: &[
+            ("multiplier", "0.85"),
+            (
+                "straddle",
+                "the_call_and_put_mids_at_the_strike_of_least_abs_call_less_put",
+            ),
+        ],
+        breakdowns: &["expiry"],
+        scale: 4,
+        description: "Each expiration's expected move: 0.85 times the at-the-money straddle's mid",
     },
 ];
 

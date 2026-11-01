@@ -76,6 +76,10 @@ pub fn unit_inputs(case: &Case, instrument_id: &str, base: &str) -> Option<Vec<P
                 row_key: String::new(),
                 version: 0,
                 source_ns: 0,
+                basis: String::new(),
+                quoted_yield: None,
+                spread_bps: None,
+                benchmark_instrument_id: String::new(),
             });
             currency.clone()
         }
@@ -104,6 +108,10 @@ pub fn unit_inputs(case: &Case, instrument_id: &str, base: &str) -> Option<Vec<P
                     row_key: String::new(),
                     version: 0,
                     source_ns: 0,
+                    basis: String::new(),
+                    quoted_yield: None,
+                    spread_bps: None,
+                    benchmark_instrument_id: String::new(),
                 },
             }),
     );

@@ -1,0 +1,94 @@
+{
+ "about": "QuantLib 1.40 BondFunctions over FixedRateBond (semi-annual, Backward, unadjusted, end of month where maturity is; Thirty360 BondBasis or ActualActual Bond), settled 2026-10-19 for a close on 2026-10-16: yield Compounded Semiannual on the bond's day count; zSpread over PiecewiseConvexMonotoneForward fitted to Treasury's 2026-10-16 par yields, Actual365Fixed, Compounded Semiannual",
+ "valuation_date": "2026-10-16",
+ "bonds": [
+  {
+   "name": "a corporate, 4.65% to 2046-02-23 on 30/360, at 90.5",
+   "security_type": "DEBT_SECURITY_TYPE_CORP",
+   "issuer_type": "ISSUER_TYPE_CORPORATE",
+   "issue": "2026-02-23",
+   "dated": "2026-02-23",
+   "first": "",
+   "maturity": "2046-02-23",
+   "coupon": "4.65",
+   "dc": "DAY_COUNT_THIRTY_360_BOND_BASIS",
+   "clean": "90.5",
+   "quantlib": {
+    "accrued": "0.723333333333",
+    "yield_percent": "5.450170378080",
+    "macaulay": "12.500088506666",
+    "modified": "12.168486873155",
+    "convexity": "199.481585506915",
+    "bps": "-0.111004083550",
+    "z_spread_bp": "-3.0598172751",
+    "clean_at_yield_plus_10bp": "89.398993783554"
+   }
+  },
+  {
+   "name": "Treasury's 10-year note, 4.625% to 2036-08-15, at 99.5",
+   "security_type": "DEBT_SECURITY_TYPE_TNOTE",
+   "issuer_type": "ISSUER_TYPE_SOVEREIGN",
+   "issue": "2026-08-17",
+   "dated": "2026-08-15",
+   "first": "2027-02-15",
+   "maturity": "2036-08-15",
+   "coupon": "4.625",
+   "dc": "DAY_COUNT_ACT_ACT_ICMA",
+   "clean": "99.5",
+   "quantlib": {
+    "accrued": "0.816915760870",
+    "yield_percent": "4.688316508115",
+    "macaulay": "7.935628147876",
+    "modified": "7.753865275023",
+    "convexity": "72.647853009813",
+    "bps": "-0.077784020571",
+    "z_spread_bp": "-39.7700859274",
+    "clean_at_yield_plus_10bp": "98.725787713678"
+   }
+  },
+  {
+   "name": "a municipal, 5% to 2046-05-15 on 30/360, at 104",
+   "security_type": "DEBT_SECURITY_TYPE_GO",
+   "issuer_type": "ISSUER_TYPE_MUNICIPAL",
+   "issue": "2026-05-15",
+   "dated": "2026-05-15",
+   "first": "2026-11-15",
+   "maturity": "2046-05-15",
+   "coupon": "5",
+   "dc": "DAY_COUNT_THIRTY_360_BOND_BASIS",
+   "clean": "104",
+   "quantlib": {
+    "accrued": "2.138888888889",
+    "yield_percent": "4.685290070606",
+    "macaulay": "12.590822496889",
+    "modified": "12.302615876838",
+    "convexity": "204.840412780276",
+    "bps": "-0.130577510883",
+    "z_spread_bp": "-79.8304109226",
+    "clean_at_yield_plus_10bp": "102.705018198226"
+   }
+  },
+  {
+   "name": "an agency debenture, 4.125% to 2029-03-20 on 30/360, at 98.875",
+   "security_type": "DEBT_SECURITY_TYPE_FAC",
+   "issuer_type": "ISSUER_TYPE_AGENCY",
+   "issue": "2026-03-20",
+   "dated": "2026-03-20",
+   "first": "2026-09-20",
+   "maturity": "2029-03-20",
+   "coupon": "4.125",
+   "dc": "DAY_COUNT_THIRTY_360_BOND_BASIS",
+   "clean": "98.875",
+   "quantlib": {
+    "accrued": "0.332291666667",
+    "yield_percent": "4.620399609422",
+    "macaulay": "2.319744870717",
+    "modified": "2.267364226778",
+    "convexity": "6.383479563712",
+    "bps": "-0.022493874752",
+    "z_spread_bp": "-15.6805008906",
+    "clean_at_yield_plus_10bp": "98.650377229616"
+   }
+  }
+ ]
+}

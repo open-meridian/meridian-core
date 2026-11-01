@@ -59,9 +59,10 @@ pub fn book_answers(scope: &Scope, named: &str, key: &str) -> bool {
 /// One record of the stream, whole.
 pub enum Item {
     Order(Box<meridian_domain::v1::Order>),
-    Placement(meridian_domain::v1::Placement),
-    Execution(meridian_domain::v1::Execution),
-    Unplaced(meridian_domain::v1::UnplacedFact),
+    // Each boxed: contract v29 widened the execution past its neighbours.
+    Placement(Box<meridian_domain::v1::Placement>),
+    Execution(Box<meridian_domain::v1::Execution>),
+    Unplaced(Box<meridian_domain::v1::UnplacedFact>),
 }
 
 fn wanted(since: &Option<Mark>, last_change: Option<&JournalRef>) -> bool {
@@ -100,7 +101,7 @@ pub fn items_of(
             {
                 out.push((
                     (2, key.to_string(), id.clone()),
-                    Item::Execution(held.execution.clone()),
+                    Item::Execution(Box::new(held.execution.clone())),
                 ));
             }
         }
@@ -118,7 +119,7 @@ pub fn items_of(
         if wanted(since, held.last_change.as_ref()) {
             out.push((
                 (1, key.to_string(), id.clone()),
-                Item::Placement(ledger.placement_record(id)?),
+                Item::Placement(Box::new(ledger.placement_record(id)?)),
             ));
         }
     }
@@ -126,7 +127,7 @@ pub fn items_of(
         if wanted(since, held.execution.last_change.as_ref()) {
             out.push((
                 (2, key.to_string(), id.clone()),
-                Item::Execution(held.execution.clone()),
+                Item::Execution(Box::new(held.execution.clone())),
             ));
         }
     }
@@ -134,7 +135,7 @@ pub fn items_of(
         if wanted(since, held.last_change.as_ref()) {
             out.push((
                 (3, key.to_string(), id.clone()),
-                Item::Unplaced(held.clone()),
+                Item::Unplaced(Box::new(held.clone())),
             ));
         }
     }
@@ -170,9 +171,9 @@ pub fn orders_page(
     for (_, item) in items {
         match item {
             Item::Order(order) => page.orders.push(*order),
-            Item::Placement(placement) => page.placements.push(placement),
-            Item::Execution(execution) => page.executions.push(execution),
-            Item::Unplaced(unplaced) => page.unplaced.push(unplaced),
+            Item::Placement(placement) => page.placements.push(*placement),
+            Item::Execution(execution) => page.executions.push(*execution),
+            Item::Unplaced(unplaced) => page.unplaced.push(*unplaced),
         }
     }
     Ok(page)

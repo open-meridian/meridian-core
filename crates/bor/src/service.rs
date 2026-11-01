@@ -85,6 +85,141 @@ pub const INSTRUMENT_REPLACED: &str = "platform.reference.event.instrument-repla
 /// and currency (W9.1), and what a merged record has become.
 pub const RESOLVE_INSTRUMENT: &str = "platform.reference.query.resolve-instrument";
 
+/// Contract v29 (W10.6, W11.11; ruling 986, amended at core stage C):
+/// asked, a pool's or a tranche's factors, for a fill stating none.
+pub const LIST_FACTORS: &str = "platform.lake.query.list-factors";
+
+/// What the lake answers for a pool's or a tranche's fill stating no
+/// factor (W11.11; rulings 986, 991, 992, amended at core stages C and E).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum FactorRead {
+    /// The factor published for the settlement month -- the latest version
+    /// of the row whose factor month is the one before the month the fill
+    /// settles in -- or, while that is unpublished, the latest row published
+    /// before it, provisional: its row's awaited month says which.
+    Taken(meridian_pb::v1::Decimal, crate::orders::FactorRow),
+    /// No published row answers that month or any before it.
+    NonePublished,
+    /// The lake did not answer in time, or refused the read.
+    Unavailable,
+}
+
+/// The month a fill settles in, as a factor month (`YYYYMM`): its
+/// settlement date's, its computed one's, or its trade date's.
+pub(crate) fn settlement_month(dates: &[&str]) -> Option<String> {
+    let date = dates.iter().find(|d| !d.is_empty())?;
+    let parsed = meridian_domain::date::Date::parse(date).ok()?;
+    let text = parsed.to_string();
+    Some(format!("{}{}", &text[0..4], &text[5..7]))
+}
+
+/// The factor month before `month` (`YYYYMM`): the agency's month whose
+/// factor a fill settling in `month` trades at (W10.4: the month's factor,
+/// published early in the next, prices what settles in it).
+pub(crate) fn month_before(month: &str) -> String {
+    let (year, number) = (
+        month
+            .get(..4)
+            .and_then(|y| y.parse::<i32>().ok())
+            .unwrap_or(0),
+        month
+            .get(4..6)
+            .and_then(|m| m.parse::<i32>().ok())
+            .unwrap_or(1),
+    );
+    let (year, number) = if number <= 1 {
+        (year - 1, 12)
+    } else {
+        (year, number - 1)
+    };
+    format!("{year:04}{number:02}")
+}
+
+/// Every `Factor` row the lake holds for a pool or a tranche, each version
+/// as answered; `None` where the lake did not answer. The book reads as the
+/// deployment's own component, every dataset, the default source.
+pub(crate) fn factor_rows(bus: &Bus, instrument: &str) -> Option<Vec<meridian_domain::v1::Factor>> {
+    let handle = tokio::runtime::Handle::try_current().ok()?;
+    let mut rows = Vec::new();
+    let mut cursor = String::new();
+    loop {
+        let asked = handle.block_on(
+            bus.call(
+                LIST_FACTORS,
+                "meridian.v1.ListFactorsRequest",
+                meridian_domain::v1::ListFactorsRequest {
+                    subjects: vec![meridian_domain::v1::SubjectRef {
+                        entity_id: instrument.to_string(),
+                        ..Default::default()
+                    }],
+                    page_size: 500,
+                    cursor: cursor.clone(),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+                None,
+                Some(VERSION_WAIT),
+            ),
+        );
+        let (payload_type, payload) = asked.ok()?;
+        if payload_type != "meridian.v1.ListFactorsReply" {
+            return None;
+        }
+        let reply = meridian_domain::v1::ListFactorsReply::decode(&payload[..]).ok()?;
+        rows.extend(reply.factors);
+        if reply.next_cursor.is_empty() {
+            break;
+        }
+        cursor = reply.next_cursor;
+    }
+    Some(rows)
+}
+
+/// Of the rows held, the factor for a fill settling in `month` (rulings 991
+/// and 992): the latest version of the month before's row, final; else the
+/// latest row published before it, its awaited month that month before.
+pub(crate) fn factor_for(rows: &[meridian_domain::v1::Factor], month: &str) -> FactorRead {
+    let wanted = month_before(month);
+    let mut best: Option<(&str, u64, &meridian_domain::v1::Factor)> = None;
+    for row in rows {
+        if row.factor.is_none() || row.factor_month.as_str() > wanted.as_str() {
+            continue;
+        }
+        let version = row.meta.as_ref().map_or(0, |m| m.version);
+        let later = best.is_none_or(|(held, held_version, _)| {
+            (row.factor_month.as_str(), version) > (held, held_version)
+        });
+        if later {
+            best = Some((row.factor_month.as_str(), version, row));
+        }
+    }
+    match best {
+        Some((held, version, row)) => FactorRead::Taken(
+            row.factor.expect("kept only with its factor"),
+            crate::orders::FactorRow {
+                month: held.to_string(),
+                version,
+                payment_date: row.payment_date.clone(),
+                awaited: if held < wanted.as_str() {
+                    wanted
+                } else {
+                    String::new()
+                },
+            },
+        ),
+        None => FactorRead::NonePublished,
+    }
+}
+
+/// The factor for a pool's or a tranche's fill settling in `month`, as the
+/// lake answers it now (W11.11).
+pub(crate) fn latest_factor(bus: &Bus, instrument: &str, month: &str) -> FactorRead {
+    match factor_rows(bus, instrument) {
+        Some(rows) => factor_for(&rows, month),
+        None => FactorRead::Unavailable,
+    }
+}
+
 /// How long a command waits for the instrument store's records. Short: a
 /// store that does not answer in it is a command refused to be tried again
 /// (contract v10), never one admitted unchecked.
@@ -139,6 +274,9 @@ pub(crate) fn context_of(envelope: &Envelope, clock: &dyn Clock) -> Context {
         local_record_orders: None,
         agent_orders_demo_only: None,
         affirmation: crate::deadline::current(),
+        factor_taken: None,
+        factor_row: Default::default(),
+        factors_unavailable: false,
     }
 }
 
@@ -192,7 +330,53 @@ fn record_says(record: &meridian_domain::v1::InstrumentRecord) -> RecordSays {
             })
             .and_then(|m| meridian_domain::exact::Exact::from_wire(m).ok())
             .filter(|m| !m.is_zero() && !m.is_negative()),
+        debt: debt_says(record),
     }
+}
+
+/// Contract v29: what a debt record's terms say that the book checks (W9.16,
+/// W11.1); None for a record that is no debt record.
+fn debt_says(record: &meridian_domain::v1::InstrumentRecord) -> Option<crate::decide::DebtSays> {
+    let exact = |d: Option<&meridian_pb::v1::Decimal>| {
+        d.and_then(|d| meridian_domain::exact::Exact::from_wire(d).ok())
+    };
+    if let Some(bond) = &record.bond {
+        return Some(crate::decide::DebtSays {
+            minimum_denomination: exact(bond.minimum_denomination.as_ref()),
+            denomination_increment: exact(bond.denomination_increment.as_ref()),
+            stripped_from: bond.stripped_from.clone(),
+            ..Default::default()
+        });
+    }
+    if let Some(pool) = &record.mbs_pool {
+        return Some(crate::decide::DebtSays {
+            agency: pool.agency,
+            program: pool.program.clone(),
+            pass_through_rate: exact(pool.pass_through_rate.as_ref()),
+            ..Default::default()
+        });
+    }
+    if let Some(tba) = &record.tba {
+        return Some(crate::decide::DebtSays {
+            agency: tba.agency,
+            program: tba.program.clone(),
+            pass_through_rate: exact(tba.pass_through_rate.as_ref()),
+            ..Default::default()
+        });
+    }
+    if let Some(tranche) = &record.cmo_tranche {
+        return Some(crate::decide::DebtSays {
+            agency: tranche.agency,
+            ..Default::default()
+        });
+    }
+    record
+        .certificate_of_deposit
+        .as_ref()
+        .map(|cd| crate::decide::DebtSays {
+            minimum_denomination: exact(cd.minimum_denomination.as_ref()),
+            ..Default::default()
+        })
 }
 
 /// Each instrument's record from the instrument store. A record the store
@@ -498,6 +682,15 @@ fn serve_lifecycle(bus: &Arc<Bus>, store: &Arc<dyn Store>, clock: &Arc<dyn Clock
             let mut named = vec![event.instrument_id.clone()];
             named.extend(event.deliveries.iter().map(|d| d.instrument_id.clone()));
             let found = references(&bus2, &named, ctx.received_at_ns);
+            // Contract v29: cash a debt record's event derives -- a
+            // maturity's, a paydown's -- is in its record's currency.
+            let codes: Vec<String> = found
+                .records
+                .values()
+                .filter(|said| said.debt.is_some() && !said.code.is_empty())
+                .map(|said| said.code.clone())
+                .collect();
+            crate::cash::ensure_blocking(&bus2, &store, &codes, clock.now_ns());
             ctx.reference_versions = found.versions;
             ctx.records = found.records;
             ctx.reference_unavailable = found.unavailable;
@@ -541,6 +734,15 @@ fn serve_lifecycle(bus: &Arc<Bus>, store: &Arc<dyn Store>, clock: &Arc<dyn Clock
                 .map(|event| event.instrument_id.clone())
                 .collect();
             let found = references(&bus2, &named, ctx.received_at_ns);
+            // Contract v29: cash a debt record's event derives -- a
+            // maturity's, a paydown's -- is in its record's currency.
+            let codes: Vec<String> = found
+                .records
+                .values()
+                .filter(|said| said.debt.is_some() && !said.code.is_empty())
+                .map(|said| said.code.clone())
+                .collect();
+            crate::cash::ensure_blocking(&bus2, &store, &codes, clock.now_ns());
             ctx.reference_versions = found.versions;
             ctx.records = found.records;
             ctx.reference_unavailable = found.unavailable;
@@ -628,6 +830,15 @@ fn serve_lifecycle(bus: &Arc<Bus>, store: &Arc<dyn Store>, clock: &Arc<dyn Clock
             let mut named = vec![proposal.instrument_id.clone()];
             named.extend(proposal.deliveries.iter().map(|d| d.instrument_id.clone()));
             let found = references(&bus2, &named, ctx.received_at_ns);
+            // Contract v29: cash a debt record's event derives -- a
+            // maturity's, a paydown's -- is in its record's currency.
+            let codes: Vec<String> = found
+                .records
+                .values()
+                .filter(|said| said.debt.is_some() && !said.code.is_empty())
+                .map(|said| said.code.clone())
+                .collect();
+            crate::cash::ensure_blocking(&bus2, &store, &codes, clock.now_ns());
             ctx.reference_versions = found.versions;
             ctx.records = found.records;
             ctx.reference_unavailable = found.unavailable;
@@ -655,33 +866,50 @@ fn serve_lifecycle(bus: &Arc<Bus>, store: &Arc<dyn Store>, clock: &Arc<dyn Clock
         bus.serve(LIST_LIFECYCLE_EVENTS, move |envelope| {
             let request: ListLifecycleEventsRequest =
                 decode(&envelope, "meridian.v1.ListLifecycleEventsRequest")?;
-            if request.account_id.is_empty() {
-                return Err(meridian_bus::refusal_with_status(
-                    meridian_bus::RefusalStatus::InvalidArgument,
-                    &["account_id".to_string()],
-                    "account_id: an account in the reader's scope".to_string(),
-                ));
-            }
-            if !scope_of(&envelope).holds(&request.account_id) {
+            let scope = scope_of(&envelope);
+            if !request.account_id.is_empty() && !scope.holds(&request.account_id) {
                 return Err(format!(
                     "{} is outside the reader's scope",
                     request.account_id
                 ));
             }
-            let book = reading
-                .book(&request.account_id)
-                .map_err(|failed| failed.on_the_bus())?;
-            let since = crate::store::mark_of(request.since.as_ref())
-                .and_then(|mark| mark.get(&book.partition).copied())
-                .unwrap_or(0);
-            let all = crate::lifecycle::listed(
-                &book,
-                &request.instrument_id,
-                &request.kinds,
-                &request.from_date,
-                &request.to_date,
-                since,
-            );
+            // Contract v29 (ruling 740; W9.19): no account names every
+            // account in the reader's scope, as ListPositions does, each
+            // event naming its account; in account order, each account's
+            // in its book's sequence.
+            let accounts = if request.account_id.is_empty() {
+                reading
+                    .accounts()
+                    .map_err(|failed| failed.on_the_bus())?
+                    .into_iter()
+                    .filter(|account| scope.holds(account))
+                    .collect::<Vec<_>>()
+            } else {
+                vec![request.account_id.clone()]
+            };
+            let since_mark = crate::store::mark_of(request.since.as_ref());
+            let mut all = Vec::new();
+            let mut partitions = Vec::new();
+            for account in &accounts {
+                let book = reading
+                    .book(account)
+                    .map_err(|failed| failed.on_the_bus())?;
+                let since = since_mark
+                    .as_ref()
+                    .and_then(|mark| mark.get(&book.partition).copied())
+                    .unwrap_or(0);
+                all.extend(crate::lifecycle::listed(
+                    &book,
+                    &request.instrument_id,
+                    &request.kinds,
+                    &request.from_date,
+                    &request.to_date,
+                    since,
+                ));
+                if !partitions.contains(&book.partition) {
+                    partitions.push(book.partition.clone());
+                }
+            }
             let limit = crate::store::page_limit(
                 request.page_size as i32,
                 bounds::LIST_LIFECYCLE_EVENTS_REQUEST_PAGE_SIZE_RANGE,
@@ -691,8 +919,10 @@ fn serve_lifecycle(bus: &Arc<Bus>, store: &Arc<dyn Store>, clock: &Arc<dyn Clock
             let next = offset + page.len();
             let heads = reading.heads().map_err(|failed| failed.on_the_bus())?;
             let mut as_of = crate::store::Mark::new();
-            if let Some(head) = heads.get(&book.partition) {
-                as_of.insert(book.partition.clone(), *head);
+            for partition in &partitions {
+                if let Some(head) = heads.get(partition) {
+                    as_of.insert(partition.clone(), *head);
+                }
             }
             let mut reply = ListLifecycleEventsReply {
                 events: page,

@@ -27,6 +27,23 @@ pub const PATH: &str = "/admin/model-routing";
 /// The implementation every model id has.
 pub const BUILT_IN: &str = "built-in";
 
+/// The model ids the conductor routes (W12.6): v26's, v28's option models
+/// and calibrations (565), v29's debt models and curve (688), as the
+/// conductor's table lists them.
+pub const MODEL_IDS: [&str; 11] = [
+    "cash",
+    "quoted_price",
+    "binary_event",
+    "american_binomial",
+    "black_scholes",
+    "black_76",
+    "svi",
+    "ssvi",
+    "bond_cash_flows",
+    "bond_yield_solver",
+    "monotone_convex",
+];
+
 /// The routing table in force, from the conductor.
 pub async fn read(bus: &meridian_bus::Bus) -> Result<ListModelRoutingReply, String> {
     let (_, bytes) = bus
@@ -59,8 +76,10 @@ pub async fn definitions(bus: &meridian_bus::Bus) -> Option<ListMeasureDefinitio
     ListMeasureDefinitionsReply::decode(&bytes[..]).ok()
 }
 
-/// The table as a tool answers it.
-pub fn json(table: &ListModelRoutingReply) -> Value {
+/// The table as a tool answers it, with the measures the analytics
+/// component serves beside it, as the tab's "Measures served" line reads
+/// them (MCP parity; null where the component does not answer).
+pub fn json(table: &ListModelRoutingReply, served: Option<&ListMeasureDefinitionsReply>) -> Value {
     json!({
         "version": table.version.to_string(),
         "routes": table.routes.iter().map(|r| json!({
@@ -70,6 +89,10 @@ pub fn json(table: &ListModelRoutingReply) -> Value {
             "changed_by": r.changed_by,
             "reason": r.reason,
         })).collect::<Vec<_>>(),
+        "measures_served": served.map(|served| served.definitions.iter().map(|d| json!({
+            "definition": d.definition,
+            "version": d.version,
+        })).collect::<Vec<_>>()),
     })
 }
 
@@ -194,7 +217,13 @@ mod tests {
         assert!(said.contains("historical_var v1"), "{said}");
         assert!(lines(Some(&table), None, |s| s.to_string()).contains("not answering"));
         assert!(lines(None, None, |s| s.to_string()).contains("could not be read"));
-        assert_eq!(json(&table)["version"], "2");
+        assert_eq!(json(&table, None)["version"], "2");
+        // MCP parity with the tab's Measures served line.
+        assert!(json(&table, None)["measures_served"].is_null());
+        assert_eq!(
+            json(&table, Some(&served))["measures_served"][0]["definition"],
+            "historical_var"
+        );
         assert!(fields(Some(&table)).contains("<option value=\"quoted_price\">"));
         // A figure is a figure: nothing here speaks of compliance.
         assert!(!said.to_ascii_lowercase().contains("complian"));

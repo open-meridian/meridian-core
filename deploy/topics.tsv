@@ -164,6 +164,7 @@ platform.lake.command.record-bars	command	data	lake
 platform.lake.command.record-corporate-actions	command	data	lake
 platform.lake.command.record-derived-series	command	signal,data	lake
 platform.lake.command.record-execution-costs	command	analytics	lake
+platform.lake.command.record-factors	command	data	lake
 platform.lake.command.record-filings	command	data	lake
 platform.lake.command.record-holdings	command	data	lake
 platform.lake.command.record-holdings-reports	command	data	lake
@@ -189,6 +190,7 @@ platform.lake.query.list-datasets	query	reporting,portfolio,compliance,signal,em
 platform.lake.query.list-derived-series	query	signal,portfolio,reporting,compliance,dashboard	lake
 platform.lake.query.list-execution-costs	query	reporting,portfolio,compliance,signal,oms,ems,operations,dashboard	lake
 platform.lake.query.list-expirations	query	signal,portfolio,oms,ems	lake
+platform.lake.query.list-factors	query	servicing,portfolio,reporting,signal,operations,analytics,dashboard,bor	lake
 platform.lake.query.list-filings	query	signal,portfolio,reporting,dashboard,analytics	lake
 platform.lake.query.list-holdings	query	signal,portfolio,reporting,dashboard	lake
 platform.lake.query.list-outcomes	query	reporting,portfolio,compliance,signal,operations,analytics	lake
@@ -205,6 +207,7 @@ platform.lake.query.list-trades	query	signal,ems,data	lake
 platform.lake.query.query-lake	query	reporting,portfolio,compliance,signal,ems,operations,data,dashboard	lake
 platform.lake.{dataset}.event.bars-recorded	event	lake	reporting,portfolio,compliance,signal
 platform.lake.{dataset}.event.corporate-actions-recorded	event	lake	signal,reporting
+platform.lake.{dataset}.event.factors-recorded	event	lake	servicing,portfolio,reporting,signal,operations
 platform.lake.{dataset}.event.filings-recorded	event	lake	signal,reporting
 platform.lake.{dataset}.event.liveness-recorded	event	lake	reporting,portfolio,compliance,signal,ems
 platform.lake.{dataset}.event.outcomes-recorded	event	lake	reporting,portfolio,compliance,signal,operations

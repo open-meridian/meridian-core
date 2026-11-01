@@ -738,6 +738,7 @@ async fn a_signal_plugins_derived_series_and_saved_scenarios_are_kept_and_read()
             as_of_ns: NOW - HOUR,
         }],
         published_by: String::new(),
+        ..Default::default()
     };
     let record_as = |field: &str, rows: Vec<Observation>| {
         tokio::task::block_in_place(|| h.lake.record(field, rows, "", &envelope("signal-1")))
@@ -779,6 +780,36 @@ async fn a_signal_plugins_derived_series_and_saved_scenarios_are_kept_and_read()
     assert!(record_as("values", vec![Observation::Derived(wordy)])
         .unwrap_err()
         .contains("values[0].published_by"));
+    // Contract v29 (638): an amount of money in money_value, naming its
+    // currency, value unset; both set, or a Money naming no currency or
+    // cash record, refused.
+    let mut moved = iv30("2026-10-04", "0");
+    moved.series = "expected_move".into();
+    moved.value = None;
+    moved.money_value = Some(meridian_domain::v1::Money {
+        amount: decimal("6.12"),
+        currency_code: "USD".into(),
+        instrument_id: String::new(),
+    });
+    assert_eq!(
+        record_as("values", vec![Observation::Derived(moved.clone())]).unwrap(),
+        (1, 0, 0)
+    );
+    assert_eq!(
+        record_as("values", vec![Observation::Derived(moved.clone())]).unwrap(),
+        (0, 0, 1),
+        "the same amount again is unchanged"
+    );
+    let mut both = moved.clone();
+    both.value = iv30("2026-10-04", "1").value;
+    assert!(record_as("values", vec![Observation::Derived(both)])
+        .unwrap_err()
+        .contains("values[0].value"));
+    let mut nameless = moved;
+    nameless.money_value.as_mut().unwrap().currency_code = String::new();
+    assert!(record_as("values", vec![Observation::Derived(nameless)])
+        .unwrap_err()
+        .contains("values[0].money_value"));
     let listed = tokio::task::block_in_place(|| {
         h.lake.list_derived_series(
             ListDerivedSeriesRequest {

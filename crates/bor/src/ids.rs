@@ -34,6 +34,18 @@ pub fn mint(prefix: &str, now_ns: i64) -> String {
     )
 }
 
+/// Whether an identifier the book minted was minted before `at_ns`: its
+/// time, the ten characters after its prefix, sorting as the clock did
+/// (contract v29: what an upgrade's backfill takes as held before it).
+pub fn minted_before(id: &str, at_ns: i64) -> bool {
+    let Some((_, rest)) = id.split_once('-') else {
+        return false;
+    };
+    let millis = (at_ns.max(0) / 1_000_000) as u128;
+    rest.get(..10)
+        .is_some_and(|time| time < encode(millis, 10).as_str())
+}
+
 pub const ENTRY: &str = "ENT";
 pub const LOT: &str = "LOT";
 pub const BREAK: &str = "BRK";
@@ -60,5 +72,8 @@ mod tests {
         assert_eq!(earlier.len(), "ENT-".len() + 26);
         assert!(earlier < later);
         assert_ne!(mint(LOT, 1), mint(LOT, 1));
+        assert!(minted_before(&earlier, 1_757_376_001_000_000_000));
+        assert!(!minted_before(&later, 1_757_376_001_000_000_000));
+        assert!(!minted_before("no-identifier", 1_757_376_001_000_000_000));
     }
 }

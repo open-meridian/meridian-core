@@ -25,7 +25,7 @@ pub const ISO_4217: &str = "ISO 4217";
 pub fn to_wire(instrument: &Instrument) -> PbInstrument {
     let mut offers: Vec<OfferedValue> = instrument.offers.iter().map(offer_to_wire).collect();
     offers.extend(derived_offers(instrument).iter().map(offer_to_wire));
-    PbInstrument {
+    let mut wire = PbInstrument {
         instrument_id: instrument.instrument_id.clone(),
         // Each with its window (contract v19, the plan's Q34): one that left
         // the record is answered closed, never left out.
@@ -58,21 +58,14 @@ pub fn to_wire(instrument: &Instrument) -> PbInstrument {
         template_id: instrument.local.template_id.clone(),
         template_version: instrument.local.template_version.clone(),
         missing_fields: instrument.local.missing_fields.clone(),
-        // Contract v28 (rulings 559, 575): a listed series' full terms, by
-        // its type.
-        listed_option: match instrument_type::read(&instrument.instrument_type) {
-            Some(InstrumentType::ListedOption | InstrumentType::FutureOption) => {
-                instrument_type::listed_option_from_text(&instrument.listed_terms)
-            }
-            _ => None,
-        },
-        future: match instrument_type::read(&instrument.instrument_type) {
-            Some(InstrumentType::Future) => {
-                instrument_type::future_from_text(&instrument.listed_terms)
-            }
-            _ => None,
-        },
+        // A listed series' full terms (contract v28; rulings 559, 575) and
+        // a debt record's (contract v29, 676), by its type, below.
+        ..Default::default()
+    };
+    if let Some(kind) = instrument_type::read(&instrument.instrument_type) {
+        instrument_type::put_terms(kind, &instrument.listed_terms, &mut wire);
     }
+    wire
 }
 
 /// An identifier on a record with its window: from, inclusive, and until,

@@ -424,6 +424,13 @@ impl Plugins {
             latest_revision,
             withdrawn: catalogued.is_none_or(|p| p.withdrawn_at_ns != 0),
             members,
+            // Contract v29 (616): the pack's title as its curator states it,
+            // the latest revision's, catalogued or kept.
+            title: latest
+                .revision
+                .as_ref()
+                .map(|r| r.title.clone())
+                .unwrap_or_default(),
         })
     }
 
@@ -500,6 +507,22 @@ impl Plugins {
             return Err(refusal);
         }
         let held = self.held_catalogue()?;
+        // Contract v29 (616): a withdrawn pack is the deployment's state,
+        // not a malformed request.
+        if held
+            .packs
+            .iter()
+            .any(|p| p.pack == request.pack && p.withdrawn_at_ns != 0)
+        {
+            return Err(refusal_with_status(
+                RefusalStatus::FailedPrecondition,
+                &["pack".to_string()],
+                format!(
+                    "{} was withdrawn by its curator; a withdrawn pack is not installed",
+                    request.pack
+                ),
+            ));
+        }
         let Some(pack) = held
             .packs
             .iter()
@@ -517,10 +540,14 @@ impl Plugins {
         };
         let revision = revision_of(&pack);
         if request.revision != revision {
-            return Err(format!(
-                "revision: {} is at revision {revision} in the catalogue, and {} was read; read \
-                 the pack again",
-                request.pack, request.revision
+            return Err(refusal_with_status(
+                RefusalStatus::FailedPrecondition,
+                &["revision".to_string()],
+                format!(
+                    "{} is at revision {revision} in the catalogue, and {} was read; read the \
+                     pack again",
+                    request.pack, request.revision
+                ),
             ));
         }
         let members = members_of(&pack);
@@ -846,6 +873,51 @@ impl Plugins {
             .unwrap_or_else(|| kept.held.clone());
         let before = self.pack_status(&request.pack)?;
         let snapshot = self.snapshot()?;
+        // Contract v29 (616): a member whose source registry this deployment
+        // does not take stops the update before anything moves.
+        let hold = self.registries()?;
+        for status in &before.members {
+            let held = status.state == PackMemberState::Launched as i32
+                || status.state == PackMemberState::Installed as i32;
+            let Some(member) = members_of(&latest)
+                .iter()
+                .chain(members_of(&kept.held))
+                .find(|m| m.listing == status.listing)
+            else {
+                continue;
+            };
+            if !held {
+                continue;
+            }
+            // The registry its launched version came from, as the update
+            // would read it; else the one the pack names.
+            let source = snapshot
+                .catalogue
+                .launches
+                .iter()
+                .filter(|l| status.instance_ids.contains(&l.instance_id))
+                .find_map(|launch| {
+                    snapshot.catalogue.versions.iter().find(|v| {
+                        v.listing == member.listing
+                            && v.metadata
+                                .as_ref()
+                                .is_some_and(|m| m.version == launch.version)
+                    })
+                })
+                .map(|v| v.source_registry.clone())
+                .unwrap_or_else(|| member.registry.clone());
+            if let Some(why) = hold.taken_refused(&source) {
+                return Err(refusal_with_status(
+                    RefusalStatus::FailedPrecondition,
+                    &["pack".to_string()],
+                    format!(
+                        "{}'s member {} comes from the {source} registry: {why}; nothing was \
+                         updated",
+                        request.pack, member.listing
+                    ),
+                ));
+            }
+        }
         let definition = |listing: &str| {
             members_of(&latest)
                 .iter()

@@ -195,7 +195,45 @@ pub enum Act {
         venue_account_code: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         venue_client_order_id: String,
+        /// Contract v29 (W11.11; ruling 986, amended at core stage C): the
+        /// latest published factor a pool's or a tranche's fill stating none
+        /// was taken at, as exact decimal text; empty where it stated one,
+        /// or is no pool's. Kept with the act so a rebuild prices it alike.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        factor_taken: String,
+        /// Contract v29 (W11.11; rulings 991, 992, amended at core stage
+        /// E): the row the factor taken was read from, and the factor month
+        /// a provisional one awaits. Empty with factor_taken.
+        #[serde(default, skip_serializing_if = "FactorRow::is_empty")]
+        factor_row: FactorRow,
     },
+    /// Contract v29 (W9.16, W11.11; ruling 992): the factor a pool's or a
+    /// tranche's fill was taken at, revised by the book when the awaited
+    /// month's row is published or the row taken republished: the new
+    /// factor and its row, and the lots the fill opened, whose provisional
+    /// mark clears. Its lines and its lifecycle event are the entry's.
+    FactorRevised {
+        execution_id: String,
+        factor_taken: String,
+        factor_row: FactorRow,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        lot_ids: Vec<String>,
+    },
+    /// Contract v29 (W11.11; decisions/031): a fixed-income execution held
+    /// before v29, its capacity backfilled from its order's single one, at
+    /// the backfill's own time.
+    CapacityBackfilled { execution_id: String, capacity: i32 },
+    /// Contract v29 (W11.27; decisions/031): a fixed-income booking held
+    /// before v29, its allocations' accrued interest and reporting fields
+    /// not recorded at the time -- never invented -- said in its own record.
+    NotRecordedBackfilled {
+        booking_id: String,
+        allocation_ids: Vec<String>,
+    },
+    /// Contract v29 (W11.11, W11.27): the control partition's record of the
+    /// upgrade's fixed-income backfill: begun, with the time it takes as
+    /// v29's start, and done.
+    FixedIncomeBackfill { cutoff_ns: i64, done: bool },
     /// Unmatched executions accepted by an `ems` (W11.23, contract v23):
     /// each linked to the order and to the placement the accept created,
     /// matched (transition e3). `line_counts` is how many of the entry's
@@ -309,6 +347,15 @@ pub enum Act {
         allocation: Allocation,
         member_order_id: String,
         lines: (usize, usize),
+        /// Contract v29 (W11.27; rulings 991, 992): a pool's or a tranche's
+        /// booking's factor, derived from its fills -- what a sale's relief
+        /// here records its proceeds at -- and the factor month its
+        /// provisional fills await, which marks the lots it opens. Empty on
+        /// any other.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        factor: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        factor_month_awaited: String,
     },
     /// An allocation received here withdrawn by its booking's cancel or
     /// replace: its lines reversed by this entry.
@@ -406,9 +453,47 @@ pub struct ExecutionHeld {
     /// of its lines and how many (W11.23). None where the entry that
     /// recorded it moved it, or nothing did.
     pub accepted_lines: Option<(String, usize, usize)>,
+    /// Contract v29 (W11.11; ruling 986, amended at core stage C): the
+    /// published factor a pool's or a tranche's fill stating none was taken
+    /// at; empty otherwise.
+    pub factor_taken: String,
+    /// Contract v29 (rulings 991, 992): the row it was read from, and the
+    /// factor month a provisional factor awaits.
+    pub factor_row: FactorRow,
+}
+
+/// Contract v29 (W11.11; rulings 991, 992, amended at core stage E): the
+/// `Factor` row a factor was taken from -- its month, version and payment
+/// date -- and, where it is provisional, the factor month awaited.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct FactorRow {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub month: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub version: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub payment_date: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub awaited: String,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+impl FactorRow {
+    pub fn is_empty(&self) -> bool {
+        self == &FactorRow::default()
+    }
 }
 
 impl ExecutionHeld {
+    /// The factor the fill is priced at (contract v29, W11.11): the one it
+    /// states, or the published one the book took for it.
+    pub fn factor(&self) -> Option<meridian_pb::v1::Decimal> {
+        factor_of(&self.execution, &self.factor_taken)
+    }
+
     /// A bust: a superseding fact of no quantity.
     pub fn is_bust(&self) -> bool {
         !self.execution.supersedes.is_empty()
@@ -499,6 +584,10 @@ pub struct Ledger {
     /// The agents' guard, where the control partition states it (contract
     /// v26, W11.38): `None` before any entry has, which reads as on.
     pub agent_orders_demo_only: Option<bool>,
+    /// The upgrade's fixed-income backfill, where the control partition
+    /// states it (contract v29): the time it takes as v29's start, and
+    /// whether it is done.
+    pub fixed_income_backfill: Option<(i64, bool)>,
 }
 
 /// The records an entry's acts change, each once, in the order they are
@@ -679,6 +768,16 @@ impl Ledger {
                     for id in execution_ids {
                         push_once(&mut touched.executions, id);
                     }
+                }
+                Act::FactorRevised { execution_id, .. }
+                | Act::CapacityBackfilled { execution_id, .. } => {
+                    push_once(&mut touched.executions, execution_id)
+                }
+                Act::NotRecordedBackfilled { booking_id, .. } => {
+                    push_once(&mut touched.bookings, booking_id)
+                }
+                Act::FixedIncomeBackfill { .. } => {
+                    push_once(&mut touched.settings, "fixed-income-backfill")
                 }
                 Act::Executed { execution, .. } => {
                     push_once(&mut touched.executions, &execution.execution_id);
@@ -989,6 +1088,8 @@ impl Ledger {
                 sender,
                 venue_account_code,
                 venue_client_order_id,
+                factor_taken,
+                factor_row,
             } => {
                 let id = execution.execution_id.clone();
                 if !execution.supersedes.is_empty() {
@@ -1024,6 +1125,9 @@ impl Ledger {
                     } else {
                         ExecutionState::Matched as i32
                     };
+                // Contract v29 (991, 992): the factor the book took, and the
+                // month a provisional one awaits, on the record.
+                taken_onto(&mut execution, factor_taken, factor_row);
                 self.executions.insert(
                     id,
                     ExecutionHeld {
@@ -1034,8 +1138,22 @@ impl Ledger {
                         venue_account_code: venue_account_code.clone(),
                         venue_client_order_id: venue_client_order_id.clone(),
                         accepted_lines: None,
+                        factor_taken: factor_taken.clone(),
+                        factor_row: factor_row.clone(),
                     },
                 );
+            }
+            Act::FactorRevised {
+                execution_id,
+                factor_taken,
+                factor_row,
+                ..
+            } => {
+                if let Some(held) = self.executions.get_mut(execution_id) {
+                    held.factor_taken = factor_taken.clone();
+                    held.factor_row = factor_row.clone();
+                    taken_onto(&mut held.execution, factor_taken, factor_row);
+                }
             }
             Act::Accepted {
                 execution_ids,
@@ -1197,6 +1315,7 @@ impl Ledger {
                 allocation,
                 member_order_id,
                 lines,
+                ..
             } => {
                 self.received.insert(
                     (booking_id.clone(), allocation.allocation_id.clone()),
@@ -1292,6 +1411,18 @@ impl Ledger {
             }
             Act::AgentOrdersDemoOnlySet { on } => {
                 self.agent_orders_demo_only = Some(*on);
+            }
+            Act::CapacityBackfilled {
+                execution_id,
+                capacity,
+            } => {
+                if let Some(held) = self.executions.get_mut(execution_id) {
+                    held.execution.capacity = *capacity;
+                }
+            }
+            Act::NotRecordedBackfilled { .. } => {}
+            Act::FixedIncomeBackfill { cutoff_ns, done } => {
+                self.fixed_income_backfill = Some((*cutoff_ns, *done));
             }
         }
     }
@@ -2204,6 +2335,29 @@ pub fn placement_changed(before: Option<&Placement>, after: &Placement) -> Vec<S
         venue_order_ids
     );
     changed
+}
+
+/// The factor taken and the month awaited, onto the execution's record
+/// (contract v29, W11.11; rulings 991, 992): `factor_taken` and
+/// `factor_month_awaited` as the book decided them.
+pub fn taken_onto(execution: &mut Execution, taken: &str, row: &FactorRow) {
+    execution.factor_taken = taken
+        .parse::<meridian_domain::exact::Exact>()
+        .ok()
+        .map(|factor| factor.to_wire());
+    execution.factor_month_awaited = row.awaited.clone();
+}
+
+/// The factor a fill is priced at (contract v29, W11.11; ruling 986, amended
+/// at core stage C): the one it states, or else the published one the book
+/// took for it, kept as exact decimal text.
+pub fn factor_of(execution: &Execution, taken: &str) -> Option<meridian_pb::v1::Decimal> {
+    execution.factor_used.or_else(|| {
+        taken
+            .parse::<meridian_domain::exact::Exact>()
+            .ok()
+            .map(|factor| factor.to_wire())
+    })
 }
 
 #[cfg(test)]
