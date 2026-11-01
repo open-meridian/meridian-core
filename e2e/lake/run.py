@@ -63,7 +63,11 @@ harness's admin, Ben, who holds read on `book`.
    point unpublished, then the fixing revised; `book`, entitled to
    `coin:rates`, reads the curve for the date (one row per tenor), the
    20-year point as source silent, the fixing at version 2, and the
-   fixing as published before the revision at version 1.
+   fixing as published before the revision at version 1. Then (contract
+   v29; W12.1; ruling 688) `book`'s treasury_curve job at that date: the
+   curve fitted monotone convex over the three par yields, its par, zero
+   and discount at each tenor, each par yield repriced to its own, read
+   from coin:rates on its behalf.
 15. Contract v28's quality states (W10.4, W10.6, W10.12; rulings 421 to 424
    and 619): `coin` records four BTC quotes through the SDK's edge checks --
    valid, a duplicate, one after a sequence gap, and a crossed one -- each
@@ -575,6 +579,14 @@ def run():
                      f"&published_as_of={rated['first_published'] + 1}")["rates"]
     must(len(published) == 1 and published[0]["value"] == "4.31" and published[0]["version"] == 1,
          f"step 14, the fixing as published before the revision: {published}")
+    # Contract v29 (W12.1; ruling 688): the Treasury curve at that date, fitted
+    # monotone convex over the three par yields, each repriced to its own.
+    fitted = page("book", "read", f"/curve?date={DAY_0}")
+    pars = {f["tenor"]: f["value"] for f in fitted["figures"] if f["curve"] == "par"}
+    must(not fitted["not_evaluated"] and len(fitted["figures"]) == 9
+         and pars == {"3M": "4.05000000", "2Y": "3.60000000", "10Y": "4.12000000"}
+         and fitted["models"] == ["monotone_convex"] and "coin:rates" in fitted["datasets"],
+         f"step 14, the curve's par, zero and discount at each tenor, from coin:rates: {fitted}")
 
     # 15. Contract v28's quality states.
     judged = page("coin", "admin", "/quality")

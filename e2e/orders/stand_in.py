@@ -364,7 +364,32 @@ class Pm(Plugin):
             return await self.orders(query)
         if path == "/tca":
             return await self.tca(query)
+        if path == "/bond-job":
+            return await self.bond_job(query)
         return {"page": "the portfolio stand-in"}
+
+    async def bond_job(self, query):
+        """Contract v29 (W12.1; ruling 688): the bond fund's accrued interest
+        and yields, which the analytics component answers from the book's
+        position, the instrument store's terms and the lake at the as-of:
+        each figure and each line not evaluated, in brief."""
+        account = one(query, "account")
+        ran = await self.call("RunJob", ops.RunJobParams(job=ops.Job(
+            account_ids=[account],
+            measures=[ops.MeasureRef(definition="accrued_interest", version=1),
+                      ops.MeasureRef(definition="bond_yield", version=1)])))
+        answer = ran.answer
+        return {
+            "answered_inline": ran.answered_inline,
+            "figures": [{"measure": f.measure.definition,
+                         "breakdown": {b.breakdown: b.value for b in f.breakdown},
+                         "value": number(f.value) if f.HasField("value") else ""}
+                        for f in answer.figures],
+            "not_evaluated": [{"measure": u.measure.definition, "instrument": u.instrument_id,
+                               "reason": ops.NotEvaluatedReason.Name(u.reason), "detail": u.detail}
+                              for u in answer.not_evaluated],
+            "models": sorted(m.model_id for m in answer.provenance.models),
+        }
 
     async def tca(self, query):
         """Contract v27 (W10.11, W12.1; ruling 510): an execution_cost job on

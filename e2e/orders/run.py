@@ -61,7 +61,12 @@ no brokerage, no paper account, no trading API of any kind is reached.
    contra and the firm principal, a mixed capacity refused; its lot costs
    50,000 x 98.375 x 0.01; booked to the fund with its accrued interest, a
    cash line of its own; and the broker's coupon over the period the
-   purchase settled in booked as the record, the cash in.
+   purchase settled in booked as the record, the cash in. Then (W12.1;
+   ruling 688) the portfolio plugin's job on the fund: the bond's accrued
+   interest as of today, from its terms and the date, exact; its clean and
+   dirty values not evaluated, the harness lake holding no close; and its
+   yields not evaluated naming `calls`, which the harness platform's bond
+   was minted without -- never a yield to maturity in its place.
 12. Execution costs (contract v27; W10.11, W11.17, ruling 510): the orders'
    account given its base currency, the portfolio plugin runs an
    execution_cost job on it; the analytics component reads the account's
@@ -80,6 +85,8 @@ import re
 import subprocess
 import sys
 import time
+import zoneinfo
+from datetime import date, datetime
 from decimal import Decimal
 
 NAME = "e2e-orders"
@@ -558,6 +565,29 @@ def run():
     paid = cash(store_book())
     must(Decimal(paid[0]) - Decimal(after[0]) == Decimal("1218.75"),
          f"step 13, the coupon's cash in: {after} -> {paid}")
+    # The fund's accrued interest and yields (contract v29; W12.1): 50,000
+    # of face at 4.875% on 30/360 from the last 5 February or 5 August to the
+    # job's date in New York.
+    def accrued_on(day):
+        last = max(date(y, m, 5) for y in (day.year - 1, day.year) for m in (2, 8)
+                   if date(y, m, 5) <= day)
+        days = 360 * (day.year - last.year) + 30 * (day.month - last.month) + (day.day - last.day)
+        return (Decimal("50000") * Decimal("4.875") / 100 * days / 360).quantize(Decimal("0.01"))
+    new_york = zoneinfo.ZoneInfo("America/New_York")
+    before_job = datetime.now(new_york).date()
+    job = page("pm", "write", f"/bond-job?account={bond_fund}")
+    after_job = datetime.now(new_york).date()
+    accrued = [f for f in job["figures"] if f["measure"] == "accrued_interest"]
+    must(len(accrued) == 1 and accrued[0]["breakdown"] == {"instrument": bond, "component": "accrued"}
+         and Decimal(accrued[0]["value"]) in {accrued_on(before_job), accrued_on(after_job)},
+         f"step 13, the bond's accrued interest from its terms and the date, exact: {job}")
+    lines = sorted((u["measure"], u["reason"], u["detail"].split(":")[0]) for u in job["not_evaluated"])
+    must(len(lines) == 2
+         and lines[0] == ("accrued_interest", "NOT_EVALUATED_REASON_PRICE_MISSING", "clean and dirty")
+         and lines[1][:2] == ("bond_yield", "NOT_EVALUATED_REASON_TERMS_INCOMPLETE")
+         and "calls" in lines[1][2].split(", "),
+         f"step 13, no close for its values, and no yield without its calls: {job}")
+    must("bond_cash_flows" in job["models"], f"step 13, the model named: {job}")
 
     # 10. The book printed, and rebuilt from its journal line for line.
     before = store_book()

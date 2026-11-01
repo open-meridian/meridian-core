@@ -972,7 +972,29 @@ class Reader:
             return await self.filed(query)
         if path == "/factors":
             return await self.factors(query)
+        if path == "/curve":
+            return await self.curve(query)
         return {"page": "the lake's reading stand-in"}
+
+    async def curve(self, query):
+        """Contract v29 (W12.1, W12.3; ruling 688): the Treasury curve at a
+        business date, which the analytics component fits monotone convex
+        over the par yields the lake holds, read on this plugin's behalf:
+        each figure by its curve and tenor, and each line not evaluated."""
+        one = lambda name, default="": query.get(name, [default])[0]  # noqa: E731
+        ran = await self.plugin._operations().RunJob(ops.RunJobParams(job=ops.Job(
+            business_date=one("date"),
+            measures=[ops.MeasureRef(definition="treasury_curve", version=1)])))
+        answer = ran.answer
+        return {
+            "figures": [{"curve": {b.breakdown: b.value for b in f.breakdown}.get("curve", ""),
+                         "tenor": {b.breakdown: b.value for b in f.breakdown}.get("tenor", ""),
+                         "value": _amount(f.value)} for f in answer.figures],
+            "not_evaluated": [{"reason": ops.NotEvaluatedReason.Name(u.reason), "detail": u.detail}
+                              for u in answer.not_evaluated],
+            "datasets": list(answer.provenance.datasets),
+            "models": sorted(m.model_id for m in answer.provenance.models),
+        }
 
 
 # ── The desk: an ems plugin hearing trades and quotes (contract v19) ────
