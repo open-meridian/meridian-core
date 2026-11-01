@@ -106,7 +106,9 @@ impl PostgresStore {
 
     fn move_head(tx: &mut Transaction<'_>, dataset: &str, head: u64) -> Result<()> {
         tx.execute(
-            "UPDATE lake_partition SET head = $2 WHERE dataset = $1",
+            // Contract v29 (ruling 619 (2)): the rows kept move with the
+            // head (migration 8).
+            "UPDATE lake_partition SET kept = kept + ($2 - head), head = $2 WHERE dataset = $1",
             &[&dataset, &(head as i64)],
         )
         .map_err(unavailable)?;
@@ -1043,6 +1045,11 @@ impl Store for PostgresStore {
             .map_err(unavailable)?;
         if removed > 0 {
             tx.execute(
+                "UPDATE lake_partition SET kept = greatest(kept - $2, 0) WHERE dataset = $1",
+                &[&dataset, &(removed as i64)],
+            )
+            .map_err(unavailable)?;
+            tx.execute(
                 "INSERT INTO lake_removal (dataset, rows_removed, recorded_before_ns, why, at_ns)
                  VALUES ($1, $2, $3, $4, $5)",
                 &[
@@ -1276,6 +1283,50 @@ impl Store for PostgresStore {
             .iter()
             .map(amendment_of)
             .collect()
+    }
+
+    fn quality_counts(&self) -> Result<BTreeMap<String, (u64, u64, u64)>> {
+        // The rows kept from lake_partition, the flagged from the rows
+        // recorded flagged (lake_row_quality) and the escalations
+        // (lake_quality_assessment): never every row kept (ruling 816).
+        let mut conn = self.conn()?;
+        let mut counts: BTreeMap<String, (u64, u64, u64)> = BTreeMap::new();
+        for row in conn
+            .query(
+                "SELECT dataset, kept FROM lake_partition WHERE kept > 0",
+                &[],
+            )
+            .map_err(unavailable)?
+        {
+            counts.insert(row.get::<_, String>(0), (row.get::<_, i64>(1) as u64, 0, 0));
+        }
+        for row in conn
+            .query(
+                "SELECT dataset,
+                        count(*) FILTER (WHERE state = 2),
+                        count(*) FILTER (WHERE state = 3)
+                   FROM (SELECT dataset, sequence, max(state) AS state
+                           FROM (SELECT dataset, sequence, quality AS state
+                                   FROM lake_row WHERE quality IN (2, 3)
+                                 UNION ALL
+                                 SELECT a.dataset, a.sequence, a.state
+                                   FROM lake_quality_assessment a
+                                   JOIN lake_row r
+                                     ON r.dataset = a.dataset AND r.sequence = a.sequence) flagged
+                          GROUP BY dataset, sequence) effective
+                  GROUP BY dataset",
+                &[],
+            )
+            .map_err(unavailable)?
+        {
+            let dataset = row.get::<_, String>(0);
+            let (suspicious, invalid) = (row.get::<_, i64>(1) as u64, row.get::<_, i64>(2) as u64);
+            let count = counts.entry(dataset).or_default();
+            count.0 = count.0.saturating_sub(suspicious + invalid);
+            count.1 = suspicious;
+            count.2 = invalid;
+        }
+        Ok(counts)
     }
 
     fn closed_day_counts(&self) -> Result<BTreeMap<String, (u64, u64)>> {

@@ -89,7 +89,8 @@ not stated), the licence enforced -- the deployment's, or the catalogue's defaul
 with the source behind the vendor or whose aggregate it serves -- the \
 plugins entitled to it, how many of its values were left unconverted and how many identifiers \
 and venues its plugin reported missing, how many of its daily values are dated on a closed day of \
-its calendar and how many outside the calendar's coverage, and a warning where its terms are one \
+its calendar and how many outside the calendar's coverage, how many of its rows kept are valid, \
+suspicious and invalid by their effective state (contract v29), and a warning where its terms are one \
 person's and more than one person holds read on a plugin entitled to it. Never a price. Answers \
 `unchanged`, as every read does (`read` before contract v23).",
         true,
@@ -408,6 +409,10 @@ async fn list_datasets(app: &App, caller: &Caller, arguments: &Value) -> Value {
                 "miss_count": row.dataset.miss_count,
                 "closed_day_count": row.dataset.closed_day_count,
                 "outside_coverage_count": row.dataset.outside_coverage_count,
+                // Contract v29 (W10.9; ruling 619 (2)).
+                "valid_count": row.dataset.valid_count,
+                "suspicious_count": row.dataset.suspicious_count,
+                "invalid_count": row.dataset.invalid_count,
                 "one_person_warning": row.warning(&records),
             })
         })

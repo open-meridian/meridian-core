@@ -3745,6 +3745,12 @@ impl Lake {
             .store
             .closed_day_counts()
             .map_err(|failed| failed.to_string())?;
+        // Contract v29 (W10.9; ruling 619 (2)): the rows kept by effective
+        // state.
+        let quality = self
+            .store
+            .quality_counts()
+            .map_err(|failed| failed.to_string())?;
         let mut reply = ListDatasetsReply::default();
         for (dataset, held) in &config.datasets {
             // A data plugin learns its own datasets' licences (contract v20,
@@ -3761,6 +3767,9 @@ impl Lake {
                 // those outside the calendar's coverage, counted apart.
                 closed_day_count: flagged.get(dataset).map_or(0, |c| c.0),
                 outside_coverage_count: flagged.get(dataset).map_or(0, |c| c.1),
+                valid_count: quality.get(dataset).map_or(0, |c| c.0),
+                suspicious_count: quality.get(dataset).map_or(0, |c| c.1),
+                invalid_count: quality.get(dataset).map_or(0, |c| c.2),
                 // Contract v27 (W10.9; ruling 418): the latest liveness the
                 // lake keeps, one per venue.
                 liveness: self

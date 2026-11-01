@@ -571,6 +571,47 @@ fn an_assessment_is_kept_beside_its_row_and_raises_its_effective_state() {
 
 /// A chain row: a trade of the underlying keyed by `series` (none for the
 /// underlying's own), at `valid_from_ns`.
+#[test]
+fn the_rows_kept_are_counted_by_their_effective_state_without_reading_every_row() {
+    // Contract v29 (W10.9; ruling 619 (2)): valid, suspicious and invalid,
+    // an escalation counted at its state; retention moving the kept count.
+    use meridian_domain::v1::QualityState;
+    use meridian_lake::store::Assessment;
+    let store = store();
+    let dataset = unique("coinbase-1:daily");
+    let subject = unique("LCL-BTC");
+    let mut flagged = close(&dataset, "a", &subject, "2026-10-13", 10);
+    flagged.meta_mut().quality = QualityState::Suspicious as i32;
+    let rows = vec![
+        flagged,
+        close(&dataset, "b", &subject, "2026-10-14", 11),
+        close(&dataset, "c", &subject, "2026-10-15", 12),
+    ];
+    let done = store.record(&dataset, rows, 1_000).unwrap();
+    assert_eq!(store.quality_counts().unwrap()[&dataset], (2, 1, 0));
+    store
+        .assess(&[Assessment {
+            dataset: dataset.clone(),
+            sequence: done.rows[1].meta().sequence,
+            row_key: "b".into(),
+            version: 1,
+            state: QualityState::Invalid as i32,
+            reasons: vec![],
+            by_instance: "signal-1".into(),
+            at_ns: 2_000,
+        }])
+        .unwrap();
+    assert_eq!(store.quality_counts().unwrap()[&dataset], (1, 1, 1));
+    store
+        .remove_before(&dataset, 2_000, "retention", 3_000)
+        .unwrap();
+    assert!(store
+        .quality_counts()
+        .unwrap()
+        .get(&dataset)
+        .is_none_or(|counts| *counts == (0, 0, 0)));
+}
+
 fn chain_trade(
     dataset: &str,
     row_key: &str,

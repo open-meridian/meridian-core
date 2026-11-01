@@ -412,6 +412,23 @@ impl Store for MemoryStore {
         Ok(self.lock().amendments.clone())
     }
 
+    fn quality_counts(&self) -> Result<BTreeMap<String, (u64, u64, u64)>> {
+        use meridian_domain::v1::QualityState;
+        let held = self.lock();
+        let mut rows = held.rows.clone();
+        as_assessed(&mut rows, &held.assessments, 0);
+        let mut counts: BTreeMap<String, (u64, u64, u64)> = BTreeMap::new();
+        for row in &rows {
+            let count = counts.entry(row.dataset().to_string()).or_default();
+            match crate::store::rank(row.meta().quality) {
+                state if state == QualityState::Invalid as i32 => count.2 += 1,
+                state if state == QualityState::Suspicious as i32 => count.1 += 1,
+                _ => count.0 += 1,
+            }
+        }
+        Ok(counts)
+    }
+
     fn closed_day_counts(&self) -> Result<BTreeMap<String, (u64, u64)>> {
         let held = self.lock();
         let mut rows = held.rows.clone();

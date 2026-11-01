@@ -361,6 +361,19 @@ fn datasets_tab(rows: &[Row], records: &AccessRecords, token: &str) -> (String, 
                 ),
                 None => String::new(),
             };
+            // Contract v29 (W10.9; ruling 619 (2)): the rows kept by their
+            // effective state, the flagged ones in the cell.
+            let quality = format!(
+                "{} \u{b7} {}",
+                thousands(d.suspicious_count),
+                thousands(d.invalid_count)
+            );
+            let quality_said = format!(
+                "{} valid, {} suspicious, {} invalid (left out of default reads)",
+                thousands(d.valid_count),
+                thousands(d.suspicious_count),
+                thousands(d.invalid_count)
+            );
             let source = if row.licence_set {
                 format!(
                     "set by {}",
@@ -379,6 +392,7 @@ fn datasets_tab(rows: &[Row], records: &AccessRecords, token: &str) -> (String, 
                  <td class=\"wide num\" data-unconverted>{unconverted}</td>\
                  <td class=\"wide num\" data-misses>{misses}</td>\
                  <td class=\"wide num\" data-closed-days title=\"{closed_said}\">{closed}</td>\
+                 <td class=\"wide num\" data-quality title=\"{quality_said}\">{quality}</td>\
                  <td class=\"actions\"><button type=\"button\" class=\"wide\" data-dialog-open=\"licence\" \
                  data-title=\"Licence {id}\" data-fill=\"{fill}\">Licence</button> \
                  <button type=\"button\" data-dialog-open=\"entitle\" data-title=\"Entitle a plugin to {id}\" \
@@ -406,6 +420,8 @@ fn datasets_tab(rows: &[Row], records: &AccessRecords, token: &str) -> (String, 
                     d.closed_day_count,
                     d.outside_coverage_count
                 )),
+                quality = quality,
+                quality_said = escape(&quality_said),
             )
         })
         .collect();
@@ -422,6 +438,7 @@ fn datasets_tab(rows: &[Row], records: &AccessRecords, token: &str) -> (String, 
              <th class=\"wide num\" title=\"Values left unconverted\">Unconverted</th>\
              <th class=\"wide num\" title=\"Identifiers and venues reported missing\">Misses</th>\
              <th class=\"wide num\" title=\"Daily values dated on a closed day of its calendar, and outside its coverage\">Closed days</th>\
+             <th class=\"wide num\" title=\"Rows kept flagged suspicious, and invalid; valid in each cell's hover\">Flagged</th>\
              <th class=\"actions\"></th></tr></thead><tbody>{lines}</tbody></table></om-pager>",
             n = rows.len()
         )
