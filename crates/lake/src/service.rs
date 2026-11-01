@@ -3976,7 +3976,8 @@ impl Lake {
                         refused(
                             format!("{at}.data_type"),
                             format!(
-                                "{at}.data_type is {:?}, no kind of row the lake holds                                  (meridian.v1.Price, meridian.v1.Bar, ...)",
+                                "{at}.data_type is {:?}, no kind of row the lake holds \
+                                 (meridian.v1.Price, meridian.v1.Bar, ...)",
                                 assessment.data_type
                             ),
                         )
