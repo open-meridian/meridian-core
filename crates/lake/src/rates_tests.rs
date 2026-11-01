@@ -776,3 +776,109 @@ async fn query_lake_answers_rates_within_its_bounds() {
     assert!(reply.rates[0].value.is_some());
     assert!(reply.rates[0].percentiles.is_empty(), "a field not named");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_arriving_older_publication_is_kept_and_never_takes_force() {
+    // Ruling 1006 (b): a rate's version in force is its latest by published
+    // time, as a default read serves it, and the counts follow it. An older
+    // publication heard late is the next version, kept and read as
+    // published then, never in force; a newer one takes force.
+    use meridian_domain::v1::QualityState;
+    let h = harness();
+    let revised_published = NOW - HOUR;
+    let first_published = NOW - 3 * HOUR;
+    record(
+        &h,
+        "ny-fed-1",
+        vec![sofr("4.32", revised_published, "sofr/2")],
+    )
+    .unwrap();
+    let before_late = h.clock.now_ns();
+    h.clock.advance(HOUR);
+    let mut late = sofr("4.31", first_published, "sofr/1");
+    late.meta.as_mut().unwrap().quality = QualityState::Invalid as i32;
+    late.meta.as_mut().unwrap().quality_reasons =
+        vec![meridian_domain::v1::QualityReason::ImplausibleTimestamp as i32];
+    let heard = record(&h, "ny-fed-1", vec![late]).unwrap();
+    assert_eq!(
+        (heard.recorded, heard.restated, heard.unchanged),
+        (0, 1, 0),
+        "kept, the next version"
+    );
+
+    let on_the_day = |request: ListRatesRequest| {
+        let read = list(
+            &h,
+            ListRatesRequest {
+                subjects: subjects(&[SOFR]),
+                ..request
+            },
+        );
+        assert_eq!(read.rates.len(), 1, "{:?}", read.unanswered);
+        let meta = read.rates[0].meta.clone().unwrap();
+        (value_of(&read.rates[0]), meta.version)
+    };
+    // The default read, for the date and the latest: the later publication.
+    assert_eq!(
+        on_the_day(ListRatesRequest {
+            business_date: "2026-10-07".into(),
+            ..Default::default()
+        }),
+        ("4.32".to_string(), 1)
+    );
+    assert_eq!(
+        on_the_day(ListRatesRequest::default()),
+        ("4.32".to_string(), 1)
+    );
+    // As of before it was heard, the same; as published then, the older.
+    assert_eq!(
+        on_the_day(ListRatesRequest {
+            business_date: "2026-10-07".into(),
+            as_of_ns: before_late,
+            ..Default::default()
+        }),
+        ("4.32".to_string(), 1)
+    );
+    let as_published = list(
+        &h,
+        ListRatesRequest {
+            subjects: subjects(&[SOFR]),
+            business_date: "2026-10-07".into(),
+            published_as_of_ns: first_published + 1,
+            sources: Some(SourceChoice {
+                named: vec![NYFED.into()],
+                include_quarantined: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    );
+    assert_eq!(value_of(&as_published.rates[0]), "4.31");
+
+    // The counts follow the version in force: the late, invalid one counts
+    // nowhere.
+    let counted = |h: &Harness| {
+        let listed = tokio::task::block_in_place(|| {
+            h.lake
+                .list_datasets(&envelope("dashboard-1", false, ""))
+                .unwrap()
+        });
+        let held = listed
+            .datasets
+            .iter()
+            .find(|d| d.dataset == NYFED)
+            .unwrap()
+            .clone();
+        (held.valid_count, held.suspicious_count, held.invalid_count)
+    };
+    assert_eq!(counted(&h), (1, 0, 0));
+
+    // A newer publication takes force.
+    h.clock.advance(HOUR);
+    record(&h, "ny-fed-1", vec![sofr("4.33", NOW + HOUR, "sofr/3")]).unwrap();
+    assert_eq!(
+        on_the_day(ListRatesRequest::default()),
+        ("4.33".to_string(), 3)
+    );
+    assert_eq!(counted(&h), (1, 0, 0));
+}

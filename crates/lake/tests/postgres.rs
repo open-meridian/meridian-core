@@ -782,6 +782,153 @@ fn a_quarantined_row_resent_valid_with_the_same_value_is_the_next_version() {
     assert_eq!((again.unchanged, again.head), (1, 2), "nothing numbered");
 }
 
+/// A rate of `subject` under `row_key` (contract v27, W10.4): `value`
+/// hundredths of a percent, published at `published_ns`, in `state`.
+fn rate_row(
+    dataset: &str,
+    row_key: &str,
+    subject: &str,
+    value: u64,
+    published_ns: i64,
+    state: meridian_domain::v1::QualityState,
+) -> Observation {
+    use meridian_domain::v1::{Rate, RateKind, SourceTime, SourceTimeKind, UnitValue, ValueUnit};
+    Observation::Rate(Rate {
+        meta: Some(ObservationMeta {
+            row_key: row_key.into(),
+            subjects: vec![SubjectRef {
+                entity_id: subject.into(),
+                ..Default::default()
+            }],
+            source: Some(Source {
+                instance: "ny-fed-1".into(),
+                dataset: dataset.into(),
+                ..Default::default()
+            }),
+            valid_from_ns: 100,
+            business_date: "2026-10-07".into(),
+            source_times: vec![SourceTime {
+                kind: SourceTimeKind::Published as i32,
+                at_ns: published_ns,
+            }],
+            quality: state as i32,
+            ..Default::default()
+        }),
+        kind: RateKind::Fixing as i32,
+        value: Some(UnitValue {
+            value: Some(meridian_pb::v1::Decimal {
+                high: 0,
+                low: value,
+                scale: 2,
+            }),
+            unit: ValueUnit::Percent as i32,
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+}
+
+#[test]
+fn a_rates_version_in_force_is_its_latest_by_published_time() {
+    // Ruling 1006 (b): a rate's version in force is the one a default read
+    // serves, its latest by published time, so a late-arriving older
+    // publication is kept and never takes force -- read by the latest's
+    // index and by every row alike -- and the counts follow it; `migrate`
+    // gives a rate row recorded before migration 8 its published time.
+    use meridian_domain::v1::QualityState;
+    let store = store();
+    let dataset = unique("ny-fed-1:rates");
+    let subject = unique("INS-SOFR");
+    let row = |value, published, state| rate_row(&dataset, "k", &subject, value, published, state);
+    let first = store
+        .record(&dataset, vec![row(432, 2_000, QualityState::Valid)], 10_000)
+        .unwrap();
+    let late = store
+        .record(
+            &dataset,
+            vec![row(431, 1_000, QualityState::Invalid)],
+            20_000,
+        )
+        .unwrap();
+    assert_eq!((late.restated, late.rows[0].meta().version), (1, 2));
+    let in_force = |store: &PostgresStore| {
+        let mut seen = Vec::new();
+        for latest_only in [true, false] {
+            let read = store
+                .read(&Query {
+                    datasets: vec![dataset.clone()],
+                    subjects: vec![subject.clone()],
+                    data_type: DataType::Rate,
+                    kinds: vec![],
+                    interval_ns: 0,
+                    when: When::Latest { at_ns: 0 },
+                    as_of_ns: 0,
+                    published_as_of_ns: 0,
+                    latest_only,
+                })
+                .unwrap();
+            assert_eq!(read.len(), 1, "latest_only {latest_only}");
+            seen.push(read[0].meta().version);
+        }
+        assert_eq!(seen[0], seen[1], "the index and every row agree");
+        seen[0]
+    };
+    assert_eq!(in_force(&store), 1);
+    assert_eq!(
+        counts_of(&store, &dataset),
+        (1, 0, 0),
+        "the late one counts nowhere"
+    );
+
+    // An escalation of the version in force counts; of the late one, not.
+    store
+        .assess(&[escalation(
+            &dataset,
+            &first.rows[0],
+            QualityState::Suspicious,
+            21_000,
+        )])
+        .unwrap();
+    store
+        .assess(&[escalation(
+            &dataset,
+            &late.rows[0],
+            QualityState::Invalid,
+            21_000,
+        )])
+        .unwrap();
+    assert_eq!(counts_of(&store, &dataset), (0, 1, 0));
+
+    // Recorded before migration 8: its published time read from its body.
+    let url = std::env::var("MERIDIAN_TEST_DATABASE_URL").unwrap();
+    let mut raw = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    raw.execute(
+        "UPDATE lake_row SET published_at_ns = NULL WHERE dataset = $1",
+        &[&dataset],
+    )
+    .unwrap();
+    store.migrate(&SystemClock).unwrap();
+    let kept: Vec<(i64, Option<i64>)> = raw
+        .query(
+            "SELECT version, published_at_ns FROM lake_row WHERE dataset = $1 ORDER BY version",
+            &[&dataset],
+        )
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    assert_eq!(kept, vec![(1, Some(2_000)), (2, Some(1_000))]);
+    assert_eq!(in_force(&store), 1);
+
+    // A newer publication takes force, its state counted in place of the
+    // escalated one's.
+    store
+        .record(&dataset, vec![row(433, 3_000, QualityState::Valid)], 30_000)
+        .unwrap();
+    assert_eq!(in_force(&store), 3);
+    assert_eq!(counts_of(&store, &dataset), (1, 0, 0));
+}
+
 #[test]
 fn migrating_counts_the_rows_in_force_the_lake_already_keeps() {
     // Contract v29 (ruling 619 (2)): migration 8 fills each dataset's rows

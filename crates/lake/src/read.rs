@@ -22,7 +22,10 @@
 //! per its tenor, maturity and convention besides (contract v27, W10.6).
 //! A rate read as published by a time (contract v27, shared additions 1 and
 //! 2) answers each row key at the version in force by published time among
-//! those recorded by the recorded-time cut. A catch-up
+//! those recorded by the recorded-time cut. A default read of rates takes
+//! each row key's version in force by published time too (ruling 1006 (b);
+//! [`crate::store::force_order`]): a late-arriving older publication is the
+//! next version, kept, and never takes force. A catch-up
 //! after a watermark (trades, the plan's Q33) asks no source: what was not
 //! recorded since is nothing new.
 //!
