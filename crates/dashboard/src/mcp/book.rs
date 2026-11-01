@@ -296,10 +296,12 @@ Read on the account is needed.",
     spec(
         "list_model_routing",
         "List the model routing",
-        "which implementation prices each of v26's model ids (cash, quoted_price, binary_event) \
-across the deployment -- built-in, or a launched pricing plugin's instance -- each with since \
-when, who routed it and why, and the table's version, which every analytics answer's provenance \
-names.",
+        "which implementation prices each model id across the deployment -- v26's cash, \
+quoted_price and binary_event, v28's option models and calibrations, v29's debt models and curve \
+-- built-in, or a launched pricing plugin's instance, each with since when, who routed it and \
+why; the table's version, which every analytics answer's provenance names; and the measures the \
+analytics component serves, each definition and version (measures_served, null where it does not \
+answer), as the tab's Measures served line.",
         true,
         Area::Accounts,
         nothing_schema,
@@ -498,7 +500,7 @@ fn model_routing_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "model_id": {"type": "string", "enum": ["cash", "quoted_price", "binary_event"]},
+            "model_id": {"type": "string", "enum": crate::admin::model_routing::MODEL_IDS},
             "implementation": {"type": "string", "minLength": 1, "maxLength": 128, "description": "built-in, or a launched pricing plugin's instance ID"},
             "note": note(),
         },
@@ -1606,7 +1608,8 @@ async fn list_model_routing(app: &App, caller: &Caller) -> Value {
     }
     match crate::admin::model_routing::read(&app.bus).await {
         Ok(table) => {
-            json!({"outcome": "unchanged", "data": crate::admin::model_routing::json(&table)})
+            let served = crate::admin::model_routing::definitions(&app.bus).await;
+            json!({"outcome": "unchanged", "data": crate::admin::model_routing::json(&table, served.as_ref())})
         }
         Err(failed) => refused("unavailable", &failed, Vec::new()),
     }
@@ -1626,10 +1629,12 @@ async fn set_model_routing(app: &App, caller: &Caller, arguments: &Value) -> Val
         &mut problems,
     );
     let model_id = text(top, "model_id", "", true, &mut problems);
-    if !model_id.is_empty()
-        && !["cash", "quoted_price", "binary_event"].contains(&model_id.as_str())
+    if !model_id.is_empty() && !crate::admin::model_routing::MODEL_IDS.contains(&model_id.as_str())
     {
-        problems.add("model_id", "cash, quoted_price or binary_event");
+        problems.add(
+            "model_id",
+            crate::admin::model_routing::MODEL_IDS.join(", "),
+        );
     }
     let implementation = text(top, "implementation", "", true, &mut problems);
     let reason = text(top, "note", "", true, &mut problems);
@@ -1662,7 +1667,10 @@ async fn set_model_routing(app: &App, caller: &Caller, arguments: &Value) -> Val
     .await;
     match reply {
         Err(failed) => bus_refused(failed, "implementation"),
-        Ok(reply) => json!({"outcome": "made", "data": crate::admin::model_routing::json(&reply)}),
+        Ok(reply) => {
+            let served = crate::admin::model_routing::definitions(&app.bus).await;
+            json!({"outcome": "made", "data": crate::admin::model_routing::json(&reply, served.as_ref())})
+        }
     }
 }
 
