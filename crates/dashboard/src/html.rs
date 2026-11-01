@@ -223,6 +223,7 @@ form.prepared-act input[name=note]{flex:1 1 12rem;min-width:0}form.prepared-act 
 .prepared-change .stack>.panel{margin:0}}\
 @media (max-width:640px){table.delegations :is(th,td):is(:nth-child(3),:nth-child(5),:nth-child(6)),table.calls :is(th,td):is(:nth-child(1),:nth-child(4),:nth-child(6)),table.prepared-by-clients :is(th,td):is(:nth-child(1),:nth-child(2),:nth-child(6)){display:none}table.calls code{overflow-wrap:anywhere}}\
 table.linkable th.actions{width:7rem}table.linkable td.actions{text-align:right}\
+@media (max-width:640px){dl[data-routing-version]{row-gap:0}}\
 @media (max-width:640px){table.agents .wide,table.linkable .wide{display:none}}\
 .eligibility{border:0;padding:0;margin:0;min-width:0;display:grid;grid-template-columns:1fr 1fr;gap:0 .75rem}\
 .eligibility legend,.eligibility .threshold{grid-column:1/-1;padding:0}.eligibility legend{font-weight:600}\
