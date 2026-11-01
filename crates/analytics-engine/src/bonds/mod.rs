@@ -159,18 +159,43 @@ impl Held {
         self.lacking(true)
     }
 
-    /// The fields it lacks that a measure needs: a yield, risk or spread
-    /// reads its calls, puts and sinking funds (to worst); accrual and a
-    /// mark read its coupon terms alone. A path counts by its last name
-    /// (`calls`, `bond.calls`).
+    /// The fields it lacks that a measure reads: accrual and a mark read
+    /// the coupon's terms alone; a yield, risk or spread its redemptions
+    /// (to worst) and its settlement's calendar too. A field no
+    /// computation reads -- a denomination, a record date, a municipal's
+    /// tax status -- never holds a figure back. A path counts by its last
+    /// name (`calls`, `bond.calls`).
     pub fn lacking(&self, redemptions: bool) -> Option<Why> {
+        const ACCRUAL: [&str; 14] = [
+            "dated_date",
+            "issue_date",
+            "first_coupon_date",
+            "maturity_date",
+            "coupon_rate",
+            "coupon_type",
+            "coupon_frequency",
+            "day_count",
+            "end_of_month",
+            "coupon_steps",
+            "floating",
+            "pass_through_rate",
+            "original_term_months",
+            "original_face",
+        ];
+        const REDEMPTION: [&str; 5] = [
+            "calls",
+            "puts",
+            "sinking_funds",
+            "payment_calendar_id",
+            "business_day_convention",
+        ];
         let named: Vec<&str> = self
             .missing
             .iter()
             .map(String::as_str)
             .filter(|path| {
                 let last = path.rsplit('.').next().unwrap_or(path);
-                redemptions || !matches!(last, "calls" | "puts" | "sinking_funds")
+                ACCRUAL.contains(&last) || (redemptions && REDEMPTION.contains(&last))
             })
             .collect();
         (!named.is_empty()).then(|| (crate::answer::TERMS_INCOMPLETE, named.join(", ")))

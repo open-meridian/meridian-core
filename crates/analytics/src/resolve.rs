@@ -1332,9 +1332,12 @@ fn record(
             p.calculation_version.clone(),
         ),
         _ => {
+            // Contract v29: a debt record's terms are bond_cash_flows' to
+            // value (W12.3), as the platform's debt templates bind it.
             let model = match asset_class.as_str() {
                 "cash" => "cash",
                 "event_contract" => "binary_event",
+                _ if crate::debt::record_json(&record).is_some() => "bond_cash_flows",
                 _ => "quoted_price",
             };
             let kind = match (asset_class.as_str(), &record.money_market_fund) {

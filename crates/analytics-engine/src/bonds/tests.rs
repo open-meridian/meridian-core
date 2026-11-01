@@ -59,17 +59,23 @@ fn a_callable_bond_minted_without_its_calls_is_not_evaluated_naming_them() {
     let mut doc = bonds_document(
         &[corporate()],
         &curve(),
-        &["bond_yield", "market_value"],
+        &["bond_yield", "market_value", "accrued_interest"],
         "2026-10-16",
     );
-    doc["instruments"][1]["debt"]["missing_fields"] = json!(["calls"]);
+    doc["instruments"][1]["debt"]["missing_fields"] =
+        json!(["calls", "minimum_denomination", "payment_calendar_id"]);
     let answer = crate::compute(&doc).unwrap();
     assert_eq!(
         reasons(&answer),
-        vec![("bond_yield", TERMS_INCOMPLETE, "calls")],
+        vec![("bond_yield", TERMS_INCOMPLETE, "calls, payment_calendar_id")],
         "never a yield to maturity in its place"
     );
-    // Its close still marks it.
+    // Its close still marks it, and its accrual reads its coupon's terms
+    // alone; a denomination holds no figure back.
+    assert!(answer
+        .figures
+        .iter()
+        .any(|f| f.measure.definition == "accrued_interest"));
     assert!(answer
         .figures
         .iter()
