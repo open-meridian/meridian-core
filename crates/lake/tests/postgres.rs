@@ -1671,18 +1671,40 @@ mod counted {
     static LIVE: AtomicUsize = AtomicUsize::new(0);
     static PEAK: AtomicUsize = AtomicUsize::new(0);
 
+    std::thread_local! {
+        /// This thread's allocations, as glibc's 64-bit malloc places
+        /// them: a header and rounding to 16 bytes, 32 at the least.
+        static PLACED: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn placed(size: usize) -> isize {
+        ((size + 8 + 15) & !15).max(32) as isize
+    }
+
+    fn place(by: isize) {
+        let _ = PLACED.try_with(|placed| placed.set(placed.get() + by));
+    }
+
+    /// What this thread has allocated and not freed, in bytes as glibc
+    /// places them.
+    pub fn placed_here() -> isize {
+        PLACED.with(std::cell::Cell::get)
+    }
+
     unsafe impl GlobalAlloc for Counting {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
             let at = unsafe { System.alloc(layout) };
             if !at.is_null() {
                 let live = LIVE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
                 PEAK.fetch_max(live, Ordering::Relaxed);
+                place(placed(layout.size()));
             }
             at
         }
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
             unsafe { System.dealloc(ptr, layout) };
             LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+            place(-placed(layout.size()));
         }
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
             let at = unsafe { System.realloc(ptr, layout, new_size) };
@@ -1694,6 +1716,7 @@ mod counted {
                 } else {
                     LIVE.fetch_sub(layout.size() - new_size, Ordering::Relaxed);
                 }
+                place(placed(new_size) - placed(layout.size()));
             }
             at
         }
@@ -1862,7 +1885,7 @@ mod chain_page {
 
     /// Record the fixture once per database: a dataset already holding it
     /// is read as it is, so a change is measured against the same rows.
-    fn record_fixture(store: &PostgresStore, dataset: &str, underlying: &str, shape: Shape) {
+    pub fn record_fixture(store: &PostgresStore, dataset: &str, underlying: &str, shape: Shape) {
         let expected = (shape.series()
             + shape.rounds * shape.series() / 2
             + 2 * shape.days * shape.series()) as u64;
@@ -2575,4 +2598,66 @@ async fn futures_lite_join(n: usize, page: Arc<chain_page::Page>) -> Vec<chain_p
         out.push(handle.await.unwrap());
     }
     out
+}
+
+/// Ruling 957: a held answer is counted at what it holds -- every row's
+/// place in the vector and each row's own strings and lists as the
+/// allocator places them -- never at less, so the held answers' budget is
+/// what they take; and at no more than half again, so an answer is not
+/// turned away for what it does not hold. The rows as the store reads them
+/// back, cloned into an answer as the read copies them.
+#[test]
+fn a_held_answer_is_counted_at_what_it_holds() {
+    use meridian_lake::pages::Whole;
+    let store = store();
+    let tag = unique("held");
+    let dataset = format!("tradier:{tag}");
+    let underlying = format!("INS-{tag}").to_uppercase();
+    let shape = chain_page::Shape {
+        expiries: 2,
+        strikes: 10,
+        rounds: 4,
+        days: 2,
+    };
+    chain_page::record_fixture(&store, &dataset, &underlying, shape);
+    for data_type in [DataType::Series, DataType::Quote, DataType::Statistic] {
+        let rows = store
+            .read(&Query {
+                datasets: vec![dataset.clone()],
+                subjects: vec![underlying.clone()],
+                data_type,
+                kinds: vec![],
+                interval_ns: 0,
+                when: When::Range {
+                    from_ns: 0,
+                    until_ns: i64::MAX,
+                },
+                as_of_ns: SystemClock.now_ns(),
+                published_as_of_ns: 0,
+                latest_only: false,
+            })
+            .unwrap();
+        assert!(!rows.is_empty(), "{data_type:?}");
+        let before = counted::placed_here();
+        let whole = Whole {
+            rows: rows.to_vec(),
+            not_served: Vec::new(),
+        };
+        let holds = (counted::placed_here() - before) as usize;
+        let counted = whole.held_bytes();
+        println!(
+            "HELD {data_type:?}: {} rows hold {holds} bytes, {} a row; counted {counted}, {} a row",
+            whole.rows.len(),
+            holds / whole.rows.len(),
+            counted / whole.rows.len()
+        );
+        assert!(
+            counted >= holds,
+            "{data_type:?}: counted {counted} of {holds}"
+        );
+        assert!(
+            counted <= holds * 3 / 2,
+            "{data_type:?}: counted {counted}, more than half again {holds}"
+        );
+    }
 }

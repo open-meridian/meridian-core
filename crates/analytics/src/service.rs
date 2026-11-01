@@ -329,7 +329,14 @@ impl Coordinator {
     }
 
     /// A job answered later has finished: its answer kept, and the client
-    /// told, sequenced for its catch-up (W12.4).
+    /// told, sequenced for its catch-up (W12.4). The sequence never goes
+    /// back (ruling 973): it is at least the clock's milliseconds, so a
+    /// coordinator restarted, its sequences lost, numbers past what its
+    /// clients last saw, and a client's catch-up after the last it saw
+    /// hears every job finished since. Counted from 0 again, a plugin that
+    /// outlived the restart asked after a sequence the coordinator would not
+    /// reach for hundreds of jobs, and every job it waited on timed out
+    /// (dev, 2026-10-31).
     fn finished(&self, job_id: &str, client: &str, answer: Result<JobAnswer, String>) {
         let answer_hash = answer
             .as_ref()
@@ -340,8 +347,9 @@ impl Coordinator {
         self.keep(job_id, client, answer);
         let event = {
             let mut jobs = self.jobs.lock().expect("not poisoned");
+            let now_ms = self.clock.now_ns() / 1_000_000;
             let sequence = jobs.sequences.entry(client.to_string()).or_insert(0);
-            *sequence += 1;
+            *sequence = (*sequence + 1).max(now_ms);
             let event = JobFinishedEvent {
                 job_id: job_id.to_string(),
                 client_instance_id: client.to_string(),
@@ -565,8 +573,11 @@ impl Coordinator {
         let deadline = self.clock.now_ns() + self.config.price_deadline.as_nanos() as i64;
         let batch = {
             let mut batches = self.batches.lock().expect("not poisoned");
+            // Never back across a restart, as a finished job's (ruling 973):
+            // a pricing plugin catching up after the last it saw hears it.
+            let now_ms = self.clock.now_ns() / 1_000_000;
             let sequence = batches.sequences.entry(instance.to_string()).or_insert(0);
-            *sequence += 1;
+            *sequence = (*sequence + 1).max(now_ms);
             let batch = PriceBatchRequest {
                 batch_id: batch_hash.clone(),
                 pricing_instance_id: instance.to_string(),

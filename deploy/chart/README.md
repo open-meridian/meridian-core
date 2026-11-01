@@ -165,6 +165,29 @@ A hold that needs records that cannot be altered is accepted only where
 `pluginArchive.objectLock` says the bucket enforces it; on a local archive it
 is refused rather than claimed.
 
+## The lake's memory
+
+A read answered in pages builds its whole answer once, at its first page, and
+holds it for the pages after. Building one copies its rows several times on
+the way: a chain's statistics, about 25,000 rows, peak near 80 MiB while being
+built. `lake.maxConcurrentAnswers` says how many the lake builds at once, 1 to
+8, 2 by default; a read past them waits its turn, and the chart refuses any
+other value. A built answer is held for its next pages within 64 MiB in all,
+each counted at what it really holds in memory, not its encoded size: a
+chain's statistics hold 34 to 37 MiB, so one is held at a time beside
+another's building. Choose 1 where the lake's memory limit is under 512 MiB, or where
+many readers load chains at once and the lake has restarted for its memory;
+readers wait longer in a burst. Raise it only with the lake's limit raised to
+match, about 80 MiB for each more. Between bursts the lake hands the memory it
+freed back to the system. `lake.mallocArenaMax` (2) keeps glibc's arenas few,
+for the same reason, and `lake.mallocMmapThreshold` (131072 bytes, any whole
+number above 0) fixes the size from which glibc maps an allocation on its own
+and unmaps it when freed. Left to glibc, that size rises to 32 MiB after the
+first large free, an answer's vectors are carved from the arenas, and a burst
+leaves the lake resident near its peak: 825 MB to 1 GiB on dev at startup
+while holding about 250 MiB live. At 128 KiB the same burst of eight chain
+readers peaked at 381 to 393 MiB resident, not 848.
+
 ## An upgrade checked before it changes anything
 
 Every upgrade runs a preflight first (`preflight.enabled`, on by default): a
