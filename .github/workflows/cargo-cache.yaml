@@ -1,0 +1,108 @@
+# The release build's cargo caches, kept where every pull request can read
+# them (ruling 1069).
+#
+# actions/cache scopes what a run saves to its branch: a pull request's run
+# reads its own and main's, never another pull request's. ci does not run on
+# main, so a new pull request's images job read the newest cache main ever
+# saved -- weeks old on 2026-11-02, when PR #85's first run compiled for
+# twelve minutes what a warm cache compiles in five. This keeps main's
+# current: on every merge, the runtime image built as runtime-image builds it
+# over the newest caches, and the caches it leaves saved under the lock's key.
+# And the CLI's e2e image, which ci's backup run restores with, built once
+# per commit of meridian-cli's main and kept here for the same reason.
+# It checks nothing and gates nothing: ci's images job builds the same.
+name: cargo-cache
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cargo-cache
+  cancel-in-progress: true
+
+jobs:
+  cargo-cache:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: workspace/meridian-core
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: workspace/meridian-core
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/meridian-cli
+          persist-credentials: false
+          path: workspace/meridian-cli
+
+      - name: The cargo caches' key
+        id: cargo
+        run: |
+          rust="$(sed -n 's/^ARG RUST_VERSION=//p' Dockerfile | head -1)"
+          echo "prefix=cargo-release-${RUNNER_OS}-rust${rust}-" >> "$GITHUB_OUTPUT"
+          echo "key=cargo-release-${RUNNER_OS}-rust${rust}-${{ hashFiles('workspace/meridian-core/Cargo.lock') }}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the cargo caches
+        id: cargo-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/cargo
+          key: ${{ steps.cargo.outputs.key }}
+          restore-keys: ${{ steps.cargo.outputs.prefix }}
+
+      # A key is written once: main's caches for this lock are kept already.
+      - name: Put the cargo caches in place
+        if: steps.cargo-cache.outputs.cache-hit != 'true'
+        run: tools/ci-cargo-cache.sh put "$RUNNER_TEMP/cargo"
+
+      - name: make runtime-image
+        if: steps.cargo-cache.outputs.cache-hit != 'true'
+        env:
+          DOCKER_BUILDKIT: "1"
+        run: make runtime-image
+
+      - name: Take the cargo caches
+        if: steps.cargo-cache.outputs.cache-hit != 'true'
+        run: tools/ci-cargo-cache.sh take "$RUNNER_TEMP/cargo"
+
+      - name: Keep the cargo caches
+        if: steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/cargo
+          key: ${{ steps.cargo.outputs.key }}
+
+      - name: The CLI's commit
+        id: cli
+        run: echo "sha=$(git -C ../meridian-cli rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the CLI's image
+        id: cli-image
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/cli-image
+          key: cli-e2e-image-${{ steps.cli.outputs.sha }}
+          lookup-only: true
+
+      - name: make backup-cli-image
+        if: steps.cli-image.outputs.cache-hit != 'true'
+        env:
+          DOCKER_BUILDKIT: "1"
+        run: |
+          make backup-cli-image CLI=../meridian-cli
+          tools/ci-images.sh save "$RUNNER_TEMP/cli-image" backup-cli
+
+      - name: Keep the CLI's image
+        if: steps.cli-image.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/cli-image
+          key: cli-e2e-image-${{ steps.cli.outputs.sha }}

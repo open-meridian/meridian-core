@@ -66,14 +66,17 @@ PROBE_IMAGE = "python:3.12-alpine"  # in every gate already; busybox df
 SAMPLE_SECONDS = 2
 GB = 1024 * 1024  # in the KB df reports
 
-# The stage whose build every later stage shares: what it leaves on the disk
-# once freed -- the cargo caches, the images later stages start -- is charged
-# to it alone, and a later stage is charged what it holds above that. On a
-# warm machine it leaves next to nothing; from cold caches, after a prune, it
-# leaves the caches it filled (5.5 to 5.7 GB on 2026-10-27), which charged to
-# every later stage again had settings-page fail its 7 GB at 8.9 to 11.4 GB
-# while holding 3.4 to 3.5 GB of its own.
-SHARED_STAGE = "compile"
+# The stages whose builds every later stage shares: what each leaves on the
+# disk once freed -- the cargo caches, the images later stages start -- is
+# charged to it alone, and a later stage is charged what it holds above what
+# they left. On a warm machine they leave next to nothing; from cold caches,
+# after a prune, the caches they filled (5.5 to 5.7 GB on 2026-10-27), which
+# charged to every later stage again had settings-page fail its 7 GB at 8.9
+# to 11.4 GB while holding 3.4 to 3.5 GB of its own. Two since ruling 1068:
+# the images stage builds the release images and the compile stage the test
+# binaries, and the stages after them build none.
+SHARED_STAGES = ("images", "compile")
+SHARED = " and ".join(SHARED_STAGES) + " stages"
 
 
 def docker(*args: str, check: bool = False) -> subprocess.CompletedProcess:
@@ -419,14 +422,14 @@ def close(run: dict, stage: str, began: float, drops: list[str], failed: str | N
     ended = time.time()
     lowest = min(samples(began, ended) + [now_kb])
     above_kb = max(0, run["start_free_kb"] - lowest)
-    shared_kb = 0 if stage == SHARED_STAGE else run.get("shared_kb", 0)
+    shared_kb = run.get("shared_kb", 0)
     peak_kb = max(0, above_kb - shared_kb)
     budget = run["budgets"].get(stage)
     over = budget is not None and peak_kb > budget * GB
     free_stage(run, drops)
     after = free_kb()
     record(after)
-    if stage == SHARED_STAGE:
+    if stage in SHARED_STAGES:
         run["shared_kb"] = max(0, run["start_free_kb"] - after)
         (STATE / "run.json").write_text(json.dumps(run))
     verdict = failed or ("OVER" if over else "ok")
@@ -435,22 +438,22 @@ def close(run: dict, stage: str, began: float, drops: list[str], failed: str | N
                 f"{gb(lowest)}\t{gb(after)}\t{ended - began:.0f}\t{verdict}\n")
     (STATE / "current").unlink()
     (STATE / "dropping.json").unlink(missing_ok=True)
-    shared_said = (f", {gb(shared_kb)} of it the {SHARED_STAGE}'s, {gb(peak_kb)} its own"
+    shared_said = (f", {gb(shared_kb)} of it what the {SHARED} left, {gb(peak_kb)} its own"
                    if shared_kb else "")
     print(f"-- gate: {stage} peaked {gb(above_kb)} GB above the start{shared_said} (budget "
           f"{budget if budget is not None else 'none'}), {gb(lowest)} GB free at its lowest, "
           f"{gb(after)} GB once freed", flush=True)
     if failed:
         return 1
-    if stage == SHARED_STAGE and run["shared_kb"]:
-        print(f"-- gate: the {SHARED_STAGE} leaves {gb(run['shared_kb'])} GB every later stage "
+    if stage in SHARED_STAGES and run["shared_kb"]:
+        print(f"-- gate: the {SHARED} leave {gb(run['shared_kb'])} GB every later stage "
               f"shares; each is charged what it holds above that", flush=True)
     if budget is None:
         print(f"gate: FAILED -- stage {stage} has no budget in GATE_BUDGETS", file=sys.stderr)
         return 1
     if over:
         print(f"gate: FAILED -- stage {stage} held {gb(peak_kb)} GB above where the gate started"
-              f"{f' and the {SHARED_STAGE} left' if shared_kb else ''}, "
+              f"{f' and the {SHARED} left' if shared_kb else ''}, "
               f"over its {budget:g} GB budget (GATE_BUDGETS_LOCAL or GATE_BUDGETS_CI in the "
               f"Makefile).\n"
               f"  A stage that needs more disk than it did is a finding: free what it builds "
@@ -474,14 +477,14 @@ def finish(_: argparse.Namespace) -> int:
     shared = run.get("shared_kb", 0)
     print("\ngate: per-stage peak, GB above the start "
           f"({gb(run['start_free_kb'])} GB free then)"
-          + (f", after the {SHARED_STAGE} above the {gb(shared)} GB it left" if shared else "")
+          + (f", after the {SHARED} above the {gb(shared)} GB they left" if shared else "")
           + ":")
     for stage, peak, budget, lowest, after, secs, verdict in rows:
         print(f"  {stage:<14} peak {peak:>5} of {budget:>4}  lowest free {lowest:>5}  "
               f"freed to {after:>5}  {int(secs) // 60:>3}m{int(secs) % 60:02d}s  {verdict}")
     worst = max(rows, key=lambda r: float(r[1]))
     print(f"gate: the most a stage held was {worst[1]} GB, in {worst[0]}"
-          + (f", above the {gb(shared)} GB the {SHARED_STAGE} left" if shared and worst[0] != SHARED_STAGE else ""))
+          + (f", above the {gb(shared)} GB the {SHARED} left" if shared and worst[0] not in SHARED_STAGES else ""))
     print(f"gate: measured peaks, a budget row before headroom: {measured()}")
     docker("rm", "-f", PROBE)
     (STATE / "run.json").unlink()

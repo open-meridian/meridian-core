@@ -6,7 +6,7 @@ COMPOSE := docker compose
 DOCKER := DOCKER_BUILDKIT=1 docker
 
 .PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check licence-check-test gate-start check-leftovers check-leftovers-end \
-        gate-mark-tests stage-checks stage-runtime stage-compile stage-tests stage-settings-page stage-sdk stage-dashboards stage-harness stage-first-run stage-image stage-lint \
+        gate-mark-tests ci-stage images runtime-images test-images ci-images runtime-image analytics-image harness-image interop-image version-check-image tests-image settings-binary-image backup-cli-image stage-checks stage-images stage-compile stage-tests stage-settings-page stage-sdk stage-dashboards stage-harness stage-first-run stage-image stage-lint \
         e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external e2e-cluster-backup \
         test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-service-account e2e-lake e2e-recorded e2e-orders e2e-one-id e2e-harness \
         build test test-store check-image-version chart-check check-crate-boundaries check-one-clock check-test-targets check-local-storage \
@@ -99,8 +99,8 @@ help:
 GATE := $(PY) tools/gate.py
 #                    stage=GB: the most each stage may hold above where the gate started
 #                    (after the compile: above where the compile left the disk)
-GATE_BUDGETS_LOCAL ?= checks=1 runtime=4 compile=9  tests=13 settings-page=7  sdk=7  dashboards=7  harness=7  first-run=7  image=7  lint=7
-GATE_BUDGETS_CI    ?= checks=2 runtime=7 compile=12 tests=15 settings-page=15 sdk=13 dashboards=13 harness=13 first-run=13 image=14 lint=13
+GATE_BUDGETS_LOCAL ?= checks=4 images=9  compile=9  tests=13 settings-page=7  sdk=7  dashboards=7  harness=7  first-run=7  image=7  lint=7
+GATE_BUDGETS_CI    ?= checks=7 images=12 compile=12 tests=15 settings-page=15 sdk=13 dashboards=13 harness=13 first-run=13 image=14 lint=13
 # The cargo caches kept between runs: a run starts them again once they are
 # this many days old, so what cargo built for a dependency nothing uses any
 # more does not stay on the disk for good.
@@ -115,18 +115,36 @@ GATE_DISK_START ?= 20
 GATE_DISK_STOP  ?= 16
 endif
 
-ci-local: gate-start stage-checks stage-runtime stage-compile stage-tests stage-settings-page stage-sdk stage-dashboards stage-harness stage-first-run stage-image stage-lint
+# The stages, in order. CI runs each as a job of its own (ruling 1069, 443):
+# the checks and lint, which need no image, beside the images and compile
+# stages, which build every image the others run, and the rest once those
+# are pushed, each pulling what it runs (.github/workflows/ci.yaml); the
+# harness stage's suites are the e2e-harness jobs. ci-mirror-check holds
+# that to this list: every stage in exactly one CI job.
+ci-local: gate-start stage-checks stage-images stage-compile stage-tests stage-settings-page stage-sdk stage-dashboards stage-harness stage-first-run stage-image stage-lint
 	@$(GATE) finish
 	@echo
 	@echo "ci-local: GREEN"
 
-stage-checks:     gate-begin-checks check-leftovers contract-diff ci-mirror-check licence-check-test check-crate-boundaries check-one-clock check-test-targets check-local-storage
+# A stage, or several in order (STAGE="sdk first-run image"), measured as
+# ci-local measures each: what a CI job runs.
+ci-stage: gate-start $(addprefix stage-,$(STAGE))
+	@$(GATE) finish
+
+# The stages after the compile run the images it and the images stage built,
+# and build none again, a submake included (IMAGES, above). Only within
+# ci-local: a stage run alone, or by CI, says where its images come from.
+ifneq ($(filter ci-local ci-local-deep,$(MAKECMDGOALS)),)
+stage-tests stage-settings-page stage-sdk stage-dashboards stage-harness stage-first-run stage-image stage-lint: export IMAGES = built
+endif
+
+stage-checks:     gate-begin-checks check-leftovers contract-diff ci-mirror-check licence-check-test check-crate-boundaries check-one-clock check-test-targets check-local-storage check-codegen advisories chart-check
 	@$(GATE) end checks
-stage-runtime:    gate-begin-runtime check-nats-permissions check-codegen advisories
-	@$(GATE) end runtime
-stage-compile:    gate-begin-compile build test
+stage-images:     gate-begin-images runtime-images
+	@$(GATE) end images
+stage-compile:    gate-begin-compile test-images build
 	@$(GATE) end compile
-stage-tests:      gate-begin-tests gate-mark-tests test-store test-broker test-directory
+stage-tests:      gate-begin-tests gate-mark-tests test test-store test-broker test-directory
 	@$(GATE) release tests
 	@$(GATE) end tests --drop $(GATE_DROP_tests)
 stage-settings-page: gate-begin-settings-page e2e-settings-page
@@ -153,7 +171,7 @@ e2e-harness: $(E2E_HARNESS_TARGET)
 		|| { echo "e2e-harness FAILED: $$not is no harness suite; they are $(HARNESS_SUITES)" >&2; exit 1; }
 stage-first-run:  gate-begin-first-run e2e-first-run e2e-first-run-brought e2e-first-run-oidc
 	@$(GATE) end first-run
-stage-image:      gate-begin-image check-image-version chart-check
+stage-image:      gate-begin-image check-nats-permissions check-image-version
 	@$(GATE) end image
 stage-lint:       gate-begin-lint lint check-leftovers-end
 	@$(GATE) end lint
@@ -161,7 +179,7 @@ stage-lint:       gate-begin-lint lint check-leftovers-end
 gate-start:
 	@$(GATE) start --make-pid $$PPID --floor-start $(GATE_DISK_START) --floor-stop $(GATE_DISK_STOP) \
 		--budgets "$(GATE_BUDGETS)" --cache-days $(GATE_CACHE_DAYS) \
-		--images "$(RUNTIME_IMAGE) $(HARNESS_IMAGE) meridian-python-interop $(SETTINGS_PAGE_IMAGE) $(SETTINGS_BROWSER_IMAGE)"
+		--images "$(RUNTIME_IMAGE) $(HARNESS_IMAGE) $(INTEROP_IMAGE) $(TESTS_IMAGE) $(SETTINGS_BINARY_IMAGE) $(SETTINGS_PAGE_IMAGE) $(SETTINGS_BROWSER_IMAGE)"
 
 # What a stage frees as it ends, by stage, named once: its `end` drops them;
 # and where it never ends -- a target in it failed under `make -k`, as CI's
@@ -169,9 +187,9 @@ gate-start:
 # -- the next stage's `begin` releases the containers it marked and drops
 # these, so the stages after it start clean and inside their budgets. The
 # local gate and the pre-push hook stay fail-fast.
-GATE_DROP_tests = compose:tests
-GATE_DROP_settings-page = $(SETTINGS_PAGE_IMAGE) $(SETTINGS_BROWSER_IMAGE)
-GATE_DROP_harness = meridian-python-interop $(HARNESS_IMAGE)
+GATE_DROP_tests = $(TESTS_IMAGE)
+GATE_DROP_settings-page = $(SETTINGS_PAGE_IMAGE) $(SETTINGS_BROWSER_IMAGE) $(SETTINGS_BINARY_IMAGE)
+GATE_DROP_harness = $(INTEROP_IMAGE) $(HARNESS_IMAGE)
 
 gate-begin-%:
 	@$(GATE) begin $* --drop $(GATE_DROP_$*)
@@ -329,16 +347,22 @@ build:
 		     echo "  DOCKER_BUILDKIT=1 docker build -f Dockerfile.rust --target check ." >&2; exit 1; }
 	@echo "build OK: workspace compiles"
 
+# Everything that needs nothing but a toolchain: the unit tests, and the
+# integration tests that stand up their own world in-process -- the runtime's
+# wiring module on its own run, since a filter after -- applies to every
+# binary a run selects, the unit tests' too -- run from the test binaries'
+# image, which nothing compiles again (ruling 1068).
+#
 # The run's own output is kept, and on a failure the failing tests' is
 # printed from it: a run on CI is not repeatable at will, and a test that
 # fails once must be named by the run it failed in, not by a second one.
-test:
+test: tests-image
 	@log=$$(mktemp); \
-	if $(DOCKER) build -f Dockerfile.rust --target test $(VERDICT) --progress=plain . >$$log 2>&1; then \
+	if docker run --rm $(TESTS_IMAGE) sh -c 'run-tests --workspace --lib && run-tests -p meridian-runtime --test it -- wiring::' >$$log 2>&1; then \
 		rm -f $$log; echo "test OK: workspace tests pass"; \
 	else \
 		echo "test FAILED; the failing tests and their output:" >&2; \
-		grep -E -e '---- .* stdout ----' -e 'panicked at' -e '^#[0-9]+ [0-9.]+ test .* FAILED$$' \
+		grep -E -e '---- .* stdout ----' -e 'panicked at' -e '^test .* FAILED$$' \
 			-e 'test result: FAILED' -e 'run-tests:' -e 'error:' $$log | cut -c1-400 >&2; \
 		echo "-- the last 120 lines:" >&2; tail -n 120 $$log | cut -c1-400 >&2; \
 		rm -f $$log; exit 1; \
@@ -347,8 +371,8 @@ test:
 # The store's tests need a database. A build stage has none, and a lightweight
 # in-process substitute is exactly what must not exist: a store that behaves
 # differently in development is a store nobody has tested.
-test-store: network
-	@$(COMPOSE) run --rm -T --build tests \
+test-store: network tests-image
+	@$(COMPOSE) run --rm -T tests \
 		run-tests -p meridian-instrument --test postgres -p meridian-street --test postgres \
 			-p meridian-bor --test postgres -p meridian-lake --test postgres \
 			-p meridian-config --test postgres -p meridian-dashboard --test postgres \
@@ -406,11 +430,16 @@ E2E_ROUTE_SAID = $(if $(filter brought,$(E2E_DB_ROUTE)), on a database it brough
 E2E_BACKEND ?= local
 E2E_BACKEND_SAID = $(if $(filter oidc,$(E2E_BACKEND)), signing people in through the firm's own directory,)
 
-e2e-first-run: network
+e2e-first-run: network runtime-image
 	@rm -f .e2e-first-run.log
+	@# The broker's development configuration, as every compose suite writes
+	@# it: generated, never committed. This one read whatever an earlier
+	@# stage had left, until a stage ran on a runner of its own (ruling 1069)
+	@# and its broker stopped at start, finding none.
+	@$(BROKER_CONFIG) --instances /w/deploy/nats/dev-instances.json \
+		--dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf
 	@$(E2E_FIRST_RUN) --profile e2e down -v --remove-orphans >>.e2e-first-run.log 2>&1 || true
 	@set -e; \
-	$(E2E_FIRST_RUN) build dashboard-first-run conductor-first-run first-run >>.e2e-first-run.log 2>&1; \
 	$(E2E_FIRST_RUN) up -d postgres nats fr-pki fr-kube fr-platform fake-idp >>.e2e-first-run.log 2>&1; \
 	$(E2E_FIRST_RUN) run --rm -T fr-database >>.e2e-first-run.log 2>&1; \
 	$(E2E_FIRST_RUN) up -d conductor-first-run dashboard-first-run first-run >>.e2e-first-run.log 2>&1; \
@@ -482,15 +511,13 @@ E2E_LDAP_PORT ?= 15389
 E2E_IDP_CONTAINER ?= meridian-e2e-idp
 E2E_IDP_PORT ?= 18100
 E2E_PLATFORM_FROM_POD ?= http://host.docker.internal:9290
-e2e-cluster: network
+e2e-cluster: network runtime-image analytics-image
 	@command -v kubectl >/dev/null && kubectl cluster-info >/dev/null 2>&1 \
 		|| { echo "e2e-cluster needs a cluster; point KUBECONFIG at one" >&2; exit 1; }
 	@test -f "$(PLATFORM)/docker-compose.yaml" \
 		|| { echo "no platform at $(PLATFORM); set PLATFORM=<path>" >&2; exit 1; }
-	@echo "e2e-cluster: building the images this cluster will run"
-	@$(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
-	@$(DOCKER) build -q --target analytics -t $(ANALYTICS_IMAGE) . >/dev/null
-	@# And the browser the password branches are signed in with, in a pod.
+	@# The runtime and analytics images are its prerequisites; and the browser
+	@# the password branches are signed in with, in a pod.
 	@$(DOCKER) build -q -t $(E2E_BROWSER_IMAGE) -f e2e/cluster/browser.Dockerfile e2e/cluster >/dev/null
 	@# A cluster on the daemon that built the images sees them already; one
 	@# that is not (k3d, kind) is handed them, or its pods pull tags that exist
@@ -809,16 +836,12 @@ E2E_BACKUP_NAMESPACE ?= meridian-backup-e2e
 E2E_BACKUP_IMAGE ?= meridian-backup:local
 E2E_BACKUP_RUNTIME ?=
 E2E_BACKUP_CLI_IMAGE ?= meridian-cli-e2e:local
-e2e-cluster-backup:
+e2e-cluster-backup: backup-cli-image $(if $(E2E_BACKUP_RUNTIME),,runtime-image analytics-image)
 	@ctx="$$(kubectl config current-context 2>/dev/null)"; \
 	case "$$ctx" in k3d-*|kind-*) ;; \
 	*) echo "e2e-cluster-backup: the kube context is '$$ctx', which is not a k3d or kind cluster's. It installs, wipes and restores: run it on a cluster made for it, make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-backup" >&2; exit 1;; esac
-	@test -f "$(CLI)/Dockerfile.rust" || { echo "e2e-cluster-backup: no meridian-cli at $(CLI); set CLI=<path>" >&2; exit 1; }
-	@echo "e2e-cluster-backup: building the backup image, the CLI$(if $(E2E_BACKUP_RUNTIME),, and the runtime)"
+	@echo "e2e-cluster-backup: building the backup image"
 	@$(DOCKER) build -q -t $(E2E_BACKUP_IMAGE) deploy/backup >/dev/null
-	@$(DOCKER) build -q -f "$(CLI)/Dockerfile.rust" --target e2e -t $(E2E_BACKUP_CLI_IMAGE) "$(CLI)" >/dev/null
-	@$(if $(E2E_BACKUP_RUNTIME),:,$(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null)
-	@$(if $(E2E_BACKUP_RUNTIME),:,$(DOCKER) build -q --target analytics -t $(ANALYTICS_IMAGE) . >/dev/null)
 	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(or $(E2E_BACKUP_RUNTIME),$(RUNTIME_IMAGE)) $(if $(E2E_BACKUP_RUNTIME),,$(ANALYTICS_IMAGE)) $(E2E_BACKUP_IMAGE) postgres:16-alpine,:)
 	@kubectl delete namespace $(E2E_BACKUP_NAMESPACE) --ignore-not-found --wait >/dev/null 2>&1
 	@E2E_NAMESPACE=$(E2E_BACKUP_NAMESPACE) E2E_IMAGE=$(or $(E2E_BACKUP_RUNTIME),$(RUNTIME_IMAGE)) \
@@ -868,12 +891,10 @@ FAILURE ?=
 e2e-cluster-scaled:
 	@$(MAKE) --no-print-directory e2e-cluster-failover PROFILE=scaled FAILURE=
 
-e2e-cluster-failover:
+e2e-cluster-failover: $(if $(E2E_FAILOVER_RUNTIME),,runtime-image analytics-image)
 	@ctx="$$(kubectl config current-context 2>/dev/null)"; \
 	case "$$ctx" in k3d-*|kind-*) ;; \
 	*) echo "e2e-cluster-failover: the kube context is '$$ctx', which is not a k3d or kind cluster's. It stops, pauses and cuts nodes: run it on a cluster made for it, make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover" >&2; exit 1;; esac
-	@$(if $(E2E_FAILOVER_RUNTIME),:,$(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null)
-	@$(if $(E2E_FAILOVER_RUNTIME),:,$(DOCKER) build -q --target analytics -t $(ANALYTICS_IMAGE) . >/dev/null)
 	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(or $(E2E_FAILOVER_RUNTIME),$(RUNTIME_IMAGE)) $(if $(E2E_FAILOVER_RUNTIME),,$(ANALYTICS_IMAGE)) postgres:16-alpine,:)
 	@kubectl delete namespace $(E2E_FAILOVER_NAMESPACE) --ignore-not-found --wait >/dev/null 2>&1
 	@rm -f .e2e-failover-claims.jsonl
@@ -915,8 +936,106 @@ RUNTIME_IMAGE = meridian-runtime:local
 ANALYTICS_IMAGE = $(subst meridian-runtime,meridian-analytics,$(RUNTIME_IMAGE))
 BROKER_CONFIG = $(DOCKER) run --rm -v "$(CURDIR)":/w -w /w $(RUNTIME_IMAGE) meridian-broker-config
 
+# The gate's images, each built once (ruling 1068). A target that runs one
+# names it as a prerequisite, rather than building it again in its recipe, so
+# one `make` builds each image at most once however many targets run it, and
+# the images below are the only places this repository's Rust is compiled
+# for a run (lint's clippy and the advisories' scan are analyses of their own).
+#
+# IMAGES says where they come from:
+#   build   the default: built here, from this checkout;
+#   pulled  CI's stage jobs, given the images the images and compile jobs
+#           built and pushed for the run: each target proves its image is
+#           here and builds nothing, so no stage job compiles;
+#   built   ci-local's stages after the compile, which built them: the same,
+#           so a target run again by a submake builds nothing either.
+IMAGES ?= build
+ifeq ($(filter build pulled built,$(IMAGES)),)
+$(error IMAGES is build, pulled or built, not "$(IMAGES)")
+endif
+TESTS_IMAGE := meridian-core-tests:local
+SETTINGS_BINARY_IMAGE := meridian-core-settings-binary:local
+INTEROP_IMAGE := meridian-python-interop
+# The names compose's services run (docker-compose.yaml).
+export MERIDIAN_RUNTIME_IMAGE = $(RUNTIME_IMAGE)
+export MERIDIAN_TESTS_IMAGE = $(TESTS_IMAGE)
+
+# Each image target, and the image it makes. CI's jobs move them by these
+# names (tools/ci-images.sh, which reads this list from `make ci-images`).
+IMAGE_TARGETS := runtime-image analytics-image harness-image interop-image version-check-image \
+	tests-image settings-binary-image backup-cli-image
+IMAGE_OF_runtime-image = $(RUNTIME_IMAGE)
+IMAGE_OF_analytics-image = $(ANALYTICS_IMAGE)
+IMAGE_OF_harness-image = $(HARNESS_IMAGE)
+IMAGE_OF_interop-image = $(INTEROP_IMAGE)
+IMAGE_OF_version-check-image = $(IMAGE_VERSION_TAG)
+IMAGE_OF_tests-image = $(TESTS_IMAGE)
+IMAGE_OF_settings-binary-image = $(SETTINGS_BINARY_IMAGE)
+IMAGE_OF_backup-cli-image = $(E2E_BACKUP_CLI_IMAGE)
+
+# What the images stage builds: the release build's images and the SDK's.
+# And the compile stage: the debug build's, every test binary and the
+# settings pages' server. The analytics image is the runtime's build's, so
+# built in the same stage, before the gate frees that build; only the
+# cluster runs start it. backup-cli-image, the CLI's, CI builds apart.
+runtime-images: runtime-image analytics-image harness-image interop-image version-check-image
+test-images: tests-image settings-binary-image
+images: runtime-images test-images
+
+ci-images:
+	@$(foreach t,$(IMAGE_TARGETS),echo "$(t:-image=) $(IMAGE_OF_$(t))";)
+
+ifeq ($(IMAGES),build)
 runtime-image:
-	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
+	@$(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
+
+analytics-image:
+	@$(DOCKER) build -q --target analytics -t $(ANALYTICS_IMAGE) . >/dev/null
+
+harness-image:
+	@$(DOCKER) build -q --target harness -t $(HARNESS_IMAGE) . >/dev/null \
+		|| { echo "harness-image FAILED: the harness image did not build" >&2; exit 1; }
+
+interop-image:
+	@test -d "$(SDK)" \
+		|| { echo "no SDK at $(SDK); set SDK=<path to meridian-python>" >&2; exit 1; }
+	@$(DOCKER) build --build-context core-proto="$(CURDIR)/proto" $(SCHEMA_PROTO) -f "$(SDK)/Dockerfile.python" --target interop -t $(INTEROP_IMAGE) "$(SDK)" >/dev/null 2>&1 \
+		|| { echo "interop-image FAILED: the SDK's image did not build. See it with:" >&2; \
+		     echo "  DOCKER_BUILDKIT=1 docker build --build-context core-proto=$(CURDIR)/proto $(SCHEMA_PROTO) -f $(SDK)/Dockerfile.python --target interop --progress=plain $(SDK)" >&2; exit 1; }
+
+# The runtime image again, as publish builds it, with a version compiled in:
+# after runtime-image, whose cargo caches leave it the runtime crate alone to
+# rebuild. check-image-version asks each of its binaries.
+version-check-image: runtime-image
+	@$(DOCKER) build --target runtime --build-arg MERIDIAN_VERSION=$(IMAGE_VERSION_CHECK) \
+		-t $(IMAGE_VERSION_TAG) . >.check-image-version.log 2>&1 \
+		|| { echo "version-check-image FAILED: the image did not build. The last 20 lines, and the whole of it in .check-image-version.log:" >&2; \
+		     tail -20 .check-image-version.log >&2; exit 1; }
+
+# Every test binary, in Dockerfile.rust's `compile`: the debug build of the
+# workspace and each crate's tests, compiled once, which `test` and the
+# services' suites (compose's `tests`) run. A compile error is said here.
+tests-image:
+	@$(DOCKER) build -f Dockerfile.rust --target compile --progress=plain -t $(TESTS_IMAGE) . >.tests-image.log 2>&1 \
+		|| { echo "tests-image FAILED: the workspace or its tests did not compile. What cargo said, and the whole of it in .tests-image.log:" >&2; \
+		     grep -E -A12 -e 'error(\[E[0-9]+\])?:' .tests-image.log | cut -c1-400 | head -160 >&2; \
+		     echo "-- the last 30 lines:" >&2; tail -n 30 .tests-image.log | cut -c1-400 >&2; exit 1; }
+
+settings-binary-image:
+	@$(DOCKER) build -q -f Dockerfile.rust --target settings-binary-image -t $(SETTINGS_BINARY_IMAGE) . >/dev/null \
+		|| { echo "settings-binary-image FAILED: the settings pages' server did not build. See it with:" >&2; \
+		     echo "  DOCKER_BUILDKIT=1 docker build -f Dockerfile.rust --target settings-binary-image --progress=plain ." >&2; exit 1; }
+
+# meridian-cli's e2e image, for the backup run's `meridian backup` and
+# `meridian restore`, from the checkout beside this one.
+backup-cli-image:
+	@test -f "$(CLI)/Dockerfile.rust" || { echo "backup-cli-image: no meridian-cli at $(CLI); set CLI=<path>" >&2; exit 1; }
+	@$(DOCKER) build -q -f "$(CLI)/Dockerfile.rust" --target e2e -t $(E2E_BACKUP_CLI_IMAGE) "$(CLI)" >/dev/null
+else
+$(IMAGE_TARGETS):
+	@docker image inspect $(IMAGE_OF_$@) >/dev/null 2>&1 \
+		|| { echo "$@ FAILED: $(IMAGE_OF_$@) is not here, and IMAGES=$(IMAGES) builds nothing: $(if $(filter pulled,$(IMAGES)),the CI job pulls it before make (tools/ci-images.sh),the gate's images and compile stages build it)" >&2; exit 1; }
+endif
 
 # The committed file is the harness's: it carries the instances this
 # repository launches for its own tests. What each may do is the contract's,
@@ -942,8 +1061,7 @@ check-nats-permissions: runtime-image
 # Two backends on one broker is the whole point: an in-process test proves
 # routing, which the memory backend already does, and proves nothing about a
 # message leaving a process.
-test-broker: network
-	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
+test-broker: network runtime-image tests-image
 	@$(BROKER_CONFIG) --instances /w/deploy/nats/dev-instances.json \
 		--dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf
 	@$(COMPOSE) up -d nats >/dev/null
@@ -954,7 +1072,7 @@ test-broker: network
 	@$(COMPOSE) restart nats >/dev/null
 	@$(COMPOSE) exec -T nats sh -c 'for i in $$(seq 1 30); do nc -z localhost 4222 && exit 0; sleep 0.5; done; exit 1' \
 		|| { echo "test-broker FAILED: the broker did not come back" >&2; exit 1; }
-	@$(COMPOSE) run --rm -T --build tests \
+	@$(COMPOSE) run --rm -T tests \
 		run-tests -p meridian-bus --test nats \
 		>.test-broker.log 2>&1 \
 		|| { echo "test-broker FAILED. The last 40 lines, and the whole of it in .test-broker.log:" >&2; \
@@ -988,8 +1106,7 @@ LDAP_DIR = -x -H ldap://localhost:1389 -D cn=admin,dc=example,dc=org -w ldap-adm
 # with nothing said -- twice in a pre-push on 2026-09-27, straight after the
 # OIDC branch, never alone. A container that exits before "slapd starting" is
 # replaced by a fresh one rather than failing the gate on the image's race.
-e2e-dashboard-ldap: network
-	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
+e2e-dashboard-ldap: network runtime-image
 	@$(BROKER_CONFIG) --instances /w/deploy/nats/dev-instances.json \
 		--dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf
 	@: >.e2e-dashboard-ldap.log
@@ -997,7 +1114,6 @@ e2e-dashboard-ldap: network
 	@# H1 (586): a failed step still takes the stack down, so nothing is
 	@# left on the shared network for another checkout's run to reach.
 	@set -e; teardown() { $(E2E_LDAP) down -v --remove-orphans >>.e2e-dashboard-ldap.log 2>&1 || true; }; trap teardown EXIT; \
-	$(E2E_LDAP) build dashboard conductor >>.e2e-dashboard-ldap.log 2>&1; \
 	$(E2E_LDAP) up -d postgres nats ldap fake-platform >>.e2e-dashboard-ldap.log 2>&1; \
 	for i in $$(seq 1 60); do \
 	  $(E2E_LDAP) logs ldap 2>&1 | grep -q "slapd starting" && break; \
@@ -1032,8 +1148,7 @@ E2E_OIDC := MERIDIAN_DEPLOYMENT_ID=DEP-e2e MERIDIAN_PLATFORM_ADDRESS=http://fake
 	E2E_CLAIM_CODE=E2E-7KQ2-MX4P \
 	$(COMPOSE) --profile e2e
 
-e2e-dashboard-oidc: network
-	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
+e2e-dashboard-oidc: network runtime-image
 	@$(BROKER_CONFIG) --instances /w/deploy/nats/dev-instances.json \
 		--dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf
 	@: >.e2e-dashboard-oidc.log
@@ -1041,7 +1156,6 @@ e2e-dashboard-oidc: network
 	@# H1 (586): a failed step still takes the stack down, so nothing is
 	@# left on the shared network for another checkout's run to reach.
 	@set -e; teardown() { $(E2E_OIDC) down -v --remove-orphans >>.e2e-dashboard-oidc.log 2>&1 || true; }; trap teardown EXIT; \
-	$(E2E_OIDC) build dashboard conductor >>.e2e-dashboard-oidc.log 2>&1; \
 	$(E2E_OIDC) up -d postgres nats fake-platform fake-idp >>.e2e-dashboard-oidc.log 2>&1; \
 	$(E2E_OIDC) run --rm -T conductor meridian-conductor migrate >>.e2e-dashboard-oidc.log 2>&1; \
 	$(E2E_OIDC) up -d conductor dashboard >>.e2e-dashboard-oidc.log 2>&1; \
@@ -1072,8 +1186,7 @@ E2E_ACCOUNTS := MERIDIAN_DEPLOYMENT_ID=DEP-e2e MERIDIAN_PLATFORM_ADDRESS=http://
 # plugin-page suite that shares E2E_ACCOUNTS keeps serving none.
 E2E_ACCOUNTS_REGISTRY := MERIDIAN_REGISTRY_UPSTREAM=http://e2e-registry:5000 $(E2E_ACCOUNTS)
 
-e2e-dashboard-accounts: network
-	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
+e2e-dashboard-accounts: network runtime-image
 	@$(BROKER_CONFIG) --instances /w/deploy/nats/dev-instances.json \
 		--dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf
 	@: >.e2e-dashboard-accounts.log
@@ -1081,7 +1194,6 @@ e2e-dashboard-accounts: network
 	@# H1 (586): a failed step still takes the stack down, so nothing is
 	@# left on the shared network for another checkout's run to reach.
 	@set -e; teardown() { $(E2E_ACCOUNTS) down -v --remove-orphans >>.e2e-dashboard-accounts.log 2>&1 || true; }; trap teardown EXIT; \
-	$(E2E_ACCOUNTS) build dashboard conductor >>.e2e-dashboard-accounts.log 2>&1; \
 	$(E2E_ACCOUNTS) up -d postgres nats fake-platform e2e-registry >>.e2e-dashboard-accounts.log 2>&1; \
 	$(E2E_ACCOUNTS) run --rm -T conductor meridian-conductor migrate >>.e2e-dashboard-accounts.log 2>&1; \
 	$(E2E_ACCOUNTS) run --rm -T dashboard meridian-dashboard migrate >>.e2e-dashboard-accounts.log 2>&1; \
@@ -1136,18 +1248,14 @@ E2E_PLUGIN_PAGE := MERIDIAN_PLUGIN_FRONT_DOOR='http://sidecar-{instance}:9292' \
 	E2E_SETTING_SECRET=$(E2E_SETTING_SECRET) \
 	$(E2E_ACCOUNTS)
 
-e2e-plugin-page: network
+e2e-plugin-page: network runtime-image interop-image
 	@test -d "$(SDK)" \
 		|| { echo "no SDK at $(SDK); set SDK=<path to meridian-python>" >&2; exit 1; }
-	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
-	@$(DOCKER) build --build-context core-proto="$(CURDIR)/proto" $(SCHEMA_PROTO) -f "$(SDK)/Dockerfile.python" --target interop -t meridian-python-interop "$(SDK)" >/dev/null 2>&1 \
-		|| { echo "e2e-plugin-page FAILED: the SDK's image did not build" >&2; exit 1; }
 	@$(BROKER_CONFIG) --instances /w/deploy/nats/dev-instances.json \
 		--dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf
 	@: >.e2e-plugin-page.log
 	@$(E2E_PLUGIN_PAGE) down -v --remove-orphans >>.e2e-plugin-page.log 2>&1 || true
 	@set -e; \
-	$(E2E_PLUGIN_PAGE) build dashboard conductor sidecar street >>.e2e-plugin-page.log 2>&1; \
 	$(E2E_PLUGIN_PAGE) up -d postgres nats fake-platform >>.e2e-plugin-page.log 2>&1; \
 	$(E2E_PLUGIN_PAGE) run --rm -T plugin-page-keys >>.e2e-plugin-page.log 2>&1; \
 	$(E2E_PLUGIN_PAGE) run --rm -T settings-key >>.e2e-plugin-page.log 2>&1; \
@@ -1213,9 +1321,9 @@ SETTINGS_BROWSER_IMAGE := meridian-e2e-settings-browser:local
 SETTINGS_NET := meridian-core-settings-page
 SHOTS ?=
 
-e2e-settings-page:
-	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
+e2e-settings-page: runtime-image settings-binary-image
 	@$(DOCKER) build -f Dockerfile.rust --target settings-page --build-arg RUNTIME_IMAGE=$(RUNTIME_IMAGE) \
+		--build-arg SETTINGS_BINARY=$(SETTINGS_BINARY_IMAGE) \
 		-t $(SETTINGS_PAGE_IMAGE) . >.e2e-settings-page.log 2>&1 \
 		|| { echo "e2e-settings-page FAILED: the server did not build; see .e2e-settings-page.log" >&2; exit 1; }
 	@$(DOCKER) build -q -f e2e/settings-page/browser.Dockerfile -t $(SETTINGS_BROWSER_IMAGE) e2e/settings-page >/dev/null
@@ -1286,18 +1394,13 @@ HARNESS := MERIDIAN_RUNTIME_IMAGE=$(RUNTIME_IMAGE) \
 HARNESS_RUN := $(HARNESS) run --rm -T runner
 HARNESS_STORE := $(HARNESS) run --rm -T store
 
-harness-check:
+harness-check: runtime-image harness-image interop-image
 	@test -d "$(SDK)" \
 		|| { echo "no SDK at $(SDK); set SDK=<path to meridian-python>" >&2; exit 1; }
 	@$(PY) e2e/harness/known_passwords.py --self-test
 	@# One list of edge roles (decisions/028): the harness gives storage to the
 	@# plugins the chart does.
 	@$(PY) -c 'import re, sys; chart = re.search(r"define \"meridian-runtime.edgeRoles\" -}}\n(.*)\n", open("deploy/chart/templates/_helpers.tpl").read()).group(1).split(","); harness = list(eval(re.search(r"^EDGE_ROLES = (\(.*\))$$", open("deploy/harness/harness.py").read(), re.M).group(1))); sys.exit(0 if chart == harness else f"harness-check FAILED: the harness gives storage to {harness}, the chart to {chart}")'
-	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
-	@DOCKER_BUILDKIT=1 $(DOCKER) build -q --target harness -t $(HARNESS_IMAGE) . >/dev/null \
-		|| { echo "harness-check FAILED: the harness image did not build" >&2; exit 1; }
-	@$(DOCKER) build --build-context core-proto="$(CURDIR)/proto" $(SCHEMA_PROTO) -f "$(SDK)/Dockerfile.python" --target interop -t meridian-python-interop "$(SDK)" >/dev/null 2>&1 \
-		|| { echo "harness-check FAILED: the SDK's image did not build" >&2; exit 1; }
 	@$(DOCKER) run --rm --entrypoint sh $(RUNTIME_IMAGE) -c 'test ! -e /usr/share/meridian/harness' \
 		|| { echo "harness-check FAILED: the runtime image still carries the harness at /usr/share/meridian/harness" >&2; exit 1; }
 	@rm -rf .harness && id="$$($(DOCKER) create $(HARNESS_IMAGE) none)" \
@@ -1421,14 +1524,9 @@ harness-check:
 # role, two people beside the admin, every step a person's page, an agent's
 # /mcp or the stand-in's page (e2e/tickets/run.py says each). Its own compose
 # project, so it never meets harness-check's.
-e2e-tickets:
+e2e-tickets: runtime-image harness-image interop-image
 	@test -d "$(SDK)" \
 		|| { echo "no SDK at $(SDK); set SDK=<path to meridian-python>" >&2; exit 1; }
-	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
-	@DOCKER_BUILDKIT=1 $(DOCKER) build -q --target harness -t $(HARNESS_IMAGE) . >/dev/null \
-		|| { echo "e2e-tickets FAILED: the harness image did not build" >&2; exit 1; }
-	@$(DOCKER) build --build-context core-proto="$(CURDIR)/proto" $(SCHEMA_PROTO) -f "$(SDK)/Dockerfile.python" --target interop -t meridian-python-interop "$(SDK)" >/dev/null 2>&1 \
-		|| { echo "e2e-tickets FAILED: the SDK's image did not build" >&2; exit 1; }
 	@rm -rf .harness && id="$$($(DOCKER) create $(HARNESS_IMAGE) none)" \
 		&& $(DOCKER) cp "$$id:/harness" .harness >/dev/null && $(DOCKER) rm "$$id" >/dev/null
 	@$(DOCKER) run --rm -i -v "$(CURDIR)/.harness":/harness:ro python:3.12-alpine python /harness/harness.py compose \
@@ -1441,14 +1539,9 @@ e2e-tickets:
 # one reading them and recording a break linked to the reinvestment, the book
 # moving only when the person confirms (e2e/activity/run.py says each step).
 # Its own compose project, so it never meets harness-check's or e2e-tickets'.
-e2e-activity:
+e2e-activity: runtime-image harness-image interop-image
 	@test -d "$(SDK)" \
 		|| { echo "no SDK at $(SDK); set SDK=<path to meridian-python>" >&2; exit 1; }
-	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
-	@DOCKER_BUILDKIT=1 $(DOCKER) build -q --target harness -t $(HARNESS_IMAGE) . >/dev/null \
-		|| { echo "e2e-activity FAILED: the harness image did not build" >&2; exit 1; }
-	@$(DOCKER) build --build-context core-proto="$(CURDIR)/proto" $(SCHEMA_PROTO) -f "$(SDK)/Dockerfile.python" --target interop -t meridian-python-interop "$(SDK)" >/dev/null 2>&1 \
-		|| { echo "e2e-activity FAILED: the SDK's image did not build" >&2; exit 1; }
 	@rm -rf .harness && id="$$($(DOCKER) create $(HARNESS_IMAGE) none)" \
 		&& $(DOCKER) cp "$$id:/harness" .harness >/dev/null && $(DOCKER) rm "$$id" >/dev/null
 	@$(DOCKER) run --rm -i -v "$(CURDIR)/.harness":/harness:ro python:3.12-alpine python /harness/harness.py compose \
@@ -1461,14 +1554,9 @@ e2e-activity:
 # or the other, the sidecar refusing an act of a role the person does not
 # write naming the role, admin per role at the link and at a setting serving
 # both (e2e/access-per-role/run.py says each step). Its own compose project.
-e2e-access-per-role:
+e2e-access-per-role: runtime-image harness-image interop-image
 	@test -d "$(SDK)" \
 		|| { echo "no SDK at $(SDK); set SDK=<path to meridian-python>" >&2; exit 1; }
-	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
-	@DOCKER_BUILDKIT=1 $(DOCKER) build -q --target harness -t $(HARNESS_IMAGE) . >/dev/null \
-		|| { echo "e2e-access-per-role FAILED: the harness image did not build" >&2; exit 1; }
-	@$(DOCKER) build --build-context core-proto="$(CURDIR)/proto" $(SCHEMA_PROTO) -f "$(SDK)/Dockerfile.python" --target interop -t meridian-python-interop "$(SDK)" >/dev/null 2>&1 \
-		|| { echo "e2e-access-per-role FAILED: the SDK's image did not build" >&2; exit 1; }
 	@rm -rf .harness && id="$$($(DOCKER) create $(HARNESS_IMAGE) none)" \
 		&& $(DOCKER) cp "$$id:/harness" .harness >/dev/null && $(DOCKER) rm "$$id" >/dev/null
 	@$(DOCKER) run --rm -i -v "$(CURDIR)/.harness":/harness:ro python:3.12-alpine python /harness/harness.py compose \
@@ -1482,14 +1570,9 @@ e2e-access-per-role:
 # its window, a person restoring it and reading it back, its return, and the
 # deletions and the window the hold refuses (e2e/archive/run.py says each
 # step). Its own compose project.
-e2e-archive:
+e2e-archive: runtime-image harness-image interop-image
 	@test -d "$(SDK)" \
 		|| { echo "no SDK at $(SDK); set SDK=<path to meridian-python>" >&2; exit 1; }
-	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
-	@DOCKER_BUILDKIT=1 $(DOCKER) build -q --target harness -t $(HARNESS_IMAGE) . >/dev/null \
-		|| { echo "e2e-archive FAILED: the harness image did not build" >&2; exit 1; }
-	@$(DOCKER) build --build-context core-proto="$(CURDIR)/proto" $(SCHEMA_PROTO) -f "$(SDK)/Dockerfile.python" --target interop -t meridian-python-interop "$(SDK)" >/dev/null 2>&1 \
-		|| { echo "e2e-archive FAILED: the SDK's image did not build" >&2; exit 1; }
 	@rm -rf .harness && id="$$($(DOCKER) create $(HARNESS_IMAGE) none)" \
 		&& $(DOCKER) cp "$$id:/harness" .harness >/dev/null && $(DOCKER) rm "$$id" >/dev/null
 	@$(DOCKER) run --rm -i -v "$(CURDIR)/.harness":/harness:ro python:3.12-alpine python /harness/harness.py compose \
@@ -1505,14 +1588,9 @@ e2e-archive:
 # answered, each change its own record naming the person, the delegation,
 # the client and the note (e2e/plugin-area/run.py says each step). Its own
 # compose project.
-e2e-plugin-area:
+e2e-plugin-area: runtime-image harness-image interop-image
 	@test -d "$(SDK)" \
 		|| { echo "no SDK at $(SDK); set SDK=<path to meridian-python>" >&2; exit 1; }
-	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
-	@DOCKER_BUILDKIT=1 $(DOCKER) build -q --target harness -t $(HARNESS_IMAGE) . >/dev/null \
-		|| { echo "e2e-plugin-area FAILED: the harness image did not build" >&2; exit 1; }
-	@$(DOCKER) build --build-context core-proto="$(CURDIR)/proto" $(SCHEMA_PROTO) -f "$(SDK)/Dockerfile.python" --target interop -t meridian-python-interop "$(SDK)" >/dev/null 2>&1 \
-		|| { echo "e2e-plugin-area FAILED: the SDK's image did not build" >&2; exit 1; }
 	@rm -rf .harness && id="$$($(DOCKER) create $(HARNESS_IMAGE) none)" \
 		&& $(DOCKER) cp "$$id:/harness" .harness >/dev/null && $(DOCKER) rm "$$id" >/dev/null
 	@$(DOCKER) run --rm -i -v "$(CURDIR)/.harness":/harness:ro python:3.12-alpine python /harness/harness.py compose \
@@ -1524,14 +1602,9 @@ e2e-plugin-area:
 # agent's change prepared and made by the person in the Inbox and at the
 # Settings form, the levels and the second pair of eyes holding a direct
 # call back (e2e/prepared/run.py says each step). Its own compose project.
-e2e-prepared:
+e2e-prepared: runtime-image harness-image interop-image
 	@test -d "$(SDK)" \
 		|| { echo "no SDK at $(SDK); set SDK=<path to meridian-python>" >&2; exit 1; }
-	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
-	@DOCKER_BUILDKIT=1 $(DOCKER) build -q --target harness -t $(HARNESS_IMAGE) . >/dev/null \
-		|| { echo "e2e-prepared FAILED: the harness image did not build" >&2; exit 1; }
-	@$(DOCKER) build --build-context core-proto="$(CURDIR)/proto" $(SCHEMA_PROTO) -f "$(SDK)/Dockerfile.python" --target interop -t meridian-python-interop "$(SDK)" >/dev/null 2>&1 \
-		|| { echo "e2e-prepared FAILED: the SDK's image did not build" >&2; exit 1; }
 	@rm -rf .harness && id="$$($(DOCKER) create $(HARNESS_IMAGE) none)" \
 		&& $(DOCKER) cp "$$id:/harness" .harness >/dev/null && $(DOCKER) rm "$$id" >/dev/null
 	@$(DOCKER) run --rm -i -v "$(CURDIR)/.harness":/harness:ro python:3.12-alpine python /harness/harness.py compose \
@@ -1545,14 +1618,9 @@ e2e-prepared:
 # owner, then made in the book naming the account and its owner; the levels,
 # the gate and its setting binding it; its owner disabling it
 # (e2e/service-account/run.py says each step). Its own compose project.
-e2e-service-account:
+e2e-service-account: runtime-image harness-image interop-image
 	@test -d "$(SDK)" \
 		|| { echo "no SDK at $(SDK); set SDK=<path to meridian-python>" >&2; exit 1; }
-	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
-	@DOCKER_BUILDKIT=1 $(DOCKER) build -q --target harness -t $(HARNESS_IMAGE) . >/dev/null \
-		|| { echo "e2e-service-account FAILED: the harness image did not build" >&2; exit 1; }
-	@$(DOCKER) build --build-context core-proto="$(CURDIR)/proto" $(SCHEMA_PROTO) -f "$(SDK)/Dockerfile.python" --target interop -t meridian-python-interop "$(SDK)" >/dev/null 2>&1 \
-		|| { echo "e2e-service-account FAILED: the SDK's image did not build" >&2; exit 1; }
 	@rm -rf .harness && id="$$($(DOCKER) create $(HARNESS_IMAGE) none)" \
 		&& $(DOCKER) cp "$$id:/harness" .harness >/dev/null && $(DOCKER) rm "$$id" >/dev/null
 	@$(DOCKER) run --rm -i -v "$(CURDIR)/.harness":/harness:ro python:3.12-alpine python /harness/harness.py compose \
@@ -1573,18 +1641,15 @@ e2e-service-account:
 # date; and `store lake` (e2e/lake/run.py says each step). Its own compose project. The exchanges are the synthetic
 # ones committed in e2e/lake/exchanges.
 E2E_LAKE_SETUP = \
-	DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null && \
-	DOCKER_BUILDKIT=1 $(DOCKER) build -q --target harness -t $(HARNESS_IMAGE) . >/dev/null && \
-	$(DOCKER) build --build-context core-proto="$(CURDIR)/proto" $(SCHEMA_PROTO) -f "$(SDK)/Dockerfile.python" --target interop -t meridian-python-interop "$(SDK)" >/dev/null 2>&1 && \
 	rm -rf .harness && id="$$($(DOCKER) create $(HARNESS_IMAGE) none)" \
 	&& $(DOCKER) cp "$$id:/harness" .harness >/dev/null && $(DOCKER) rm "$$id" >/dev/null && \
 	$(DOCKER) run --rm -i -v "$(CURDIR)/.harness":/harness:ro python:3.12-alpine python /harness/harness.py compose \
 		<e2e/lake/plugins.json >.harness/plugins.yaml
 
-e2e-lake:
+e2e-lake: runtime-image harness-image interop-image
 	@test -d "$(SDK)" \
 		|| { echo "no SDK at $(SDK); set SDK=<path to meridian-python>" >&2; exit 1; }
-	@$(E2E_LAKE_SETUP) || { echo "e2e-lake FAILED: the images or the harness did not build" >&2; exit 1; }
+	@$(E2E_LAKE_SETUP) || { echo "e2e-lake FAILED: the harness did not copy out" >&2; exit 1; }
 	@MERIDIAN_RUNTIME_IMAGE=$(RUNTIME_IMAGE) $(PY) e2e/lake/run.py
 
 # The same run on recorded exchanges (plans/the-lake-prices-the-book, Q11):
@@ -1595,13 +1660,13 @@ e2e-lake:
 # developer's, never CI's.
 RECORDED ?=
 
-e2e-recorded:
+e2e-recorded: runtime-image harness-image interop-image
 	@test -d "$(SDK)" \
 		|| { echo "no SDK at $(SDK); set SDK=<path to meridian-python>" >&2; exit 1; }
 	@if [ -n "$(RECORDED)" ]; then test -f "$(RECORDED)/exchange.json" \
 		|| { echo "e2e-recorded FAILED: no exchange.json in $(RECORDED)" >&2; exit 1; }; \
 	else echo "e2e-recorded: RECORDED names no recorded exchanges; replaying the synthetic ones in e2e/lake/exchanges"; fi
-	@$(E2E_LAKE_SETUP) || { echo "e2e-recorded FAILED: the images or the harness did not build" >&2; exit 1; }
+	@$(E2E_LAKE_SETUP) || { echo "e2e-recorded FAILED: the harness did not copy out" >&2; exit 1; }
 	@MERIDIAN_RUNTIME_IMAGE=$(RUNTIME_IMAGE) E2E_LAKE_NAME=e2e-recorded \
 		STAND_IN_EXCHANGES="$(or $(RECORDED),e2e/lake/exchanges)" $(PY) e2e/lake/run.py
 
@@ -1612,32 +1677,29 @@ e2e-recorded:
 # reaches a broker, a brokerage or a trading API: the venue is a file of
 # this repository.
 E2E_ORDERS_SETUP = \
-	DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null && \
-	DOCKER_BUILDKIT=1 $(DOCKER) build -q --target harness -t $(HARNESS_IMAGE) . >/dev/null && \
-	$(DOCKER) build --build-context core-proto="$(CURDIR)/proto" $(SCHEMA_PROTO) -f "$(SDK)/Dockerfile.python" --target interop -t meridian-python-interop "$(SDK)" >/dev/null 2>&1 && \
 	rm -rf .harness && id="$$($(DOCKER) create $(HARNESS_IMAGE) none)" \
 	&& $(DOCKER) cp "$$id:/harness" .harness >/dev/null && $(DOCKER) rm "$$id" >/dev/null && \
 	$(DOCKER) run --rm -i -v "$(CURDIR)/.harness":/harness:ro python:3.12-alpine python /harness/harness.py compose \
 		<e2e/orders/plugins.json >.harness/plugins.yaml
 
-e2e-orders:
+e2e-orders: runtime-image harness-image interop-image
 	@test -d "$(SDK)" \
 		|| { echo "no SDK at $(SDK); set SDK=<path to meridian-python>" >&2; exit 1; }
-	@$(E2E_ORDERS_SETUP) || { echo "e2e-orders FAILED: the images or the harness did not build" >&2; exit 1; }
+	@$(E2E_ORDERS_SETUP) || { echo "e2e-orders FAILED: the harness did not copy out" >&2; exit 1; }
 	@MERIDIAN_RUNTIME_IMAGE=$(RUNTIME_IMAGE) $(PY) e2e/orders/run.py
 
 # One ID (contract v24; decisions/037; the one-ID spec's requirement 26) on
 # e2e-orders' harness, images and stand-ins, against the harness's platform
 # stand-in and its v24 routes (e2e/one-id/run.py says what it proves). No
 # image of its own: the runtime, the harness and the SDK's interop image,
-# built as e2e-orders builds them, cached when it ran first.
-e2e-one-id:
+# the targets e2e-orders names too.
+e2e-one-id: runtime-image harness-image interop-image
 	@test -d "$(SDK)" \
 		|| { echo "no SDK at $(SDK); set SDK=<path to meridian-python>" >&2; exit 1; }
-	@$(E2E_ORDERS_SETUP) || { echo "e2e-one-id FAILED: the images or the harness did not build" >&2; exit 1; }
+	@$(E2E_ORDERS_SETUP) || { echo "e2e-one-id FAILED: the harness did not copy out" >&2; exit 1; }
 	@MERIDIAN_RUNTIME_IMAGE=$(RUNTIME_IMAGE) $(PY) e2e/one-id/run.py
 
-test-directory: network
+test-directory: network tests-image
 	@# Recreated, with a fresh volume, every time. The image keeps its data in
 	@# an anonymous volume and treats what it finds there as set up: a
 	@# container whose first start was interrupted before it set the admin
@@ -1668,7 +1730,7 @@ test-directory: network
 	@$(COMPOSE) --profile e2e up -d --force-recreate --renew-anon-volumes ldap-tls >/dev/null
 	@for i in $$(seq 1 60); do $(COMPOSE) logs ldap-tls 2>&1 | grep -q "slapd starting" && exit 0; sleep 1; done; \
 		echo "test-directory FAILED: the ldaps:// directory did not come up" >&2; exit 1
-	@$(COMPOSE) run --rm -T --build tests \
+	@$(COMPOSE) run --rm -T tests \
 		run-tests -p meridian-dashboard --test directory \
 		>.test-directory.log 2>&1 \
 		|| { echo "test-directory FAILED. The last 40 lines, and the whole of it in .test-directory.log:" >&2; \
@@ -1679,15 +1741,11 @@ test-directory: network
 # builds it: the components said `0.1.0`, the crate's, whatever release they
 # ran (plans/a-plugin-moves-with-its-deployment). Asked of the finished image,
 # as `meridian-<binary> --version`, rather than trusting the build's own check.
-# After the e2e targets, whose compose builds leave the cargo cache this one
-# rebuilds only the runtime crate from.
+# The image is version-check-image's, built with the images after the runtime
+# image, whose cargo caches leave it only the runtime crate to rebuild.
 IMAGE_VERSION_CHECK := 0.0.0+image-version-check
 IMAGE_VERSION_TAG   := meridian-core-version-check:local
-check-image-version:
-	@$(DOCKER) build --target runtime --build-arg MERIDIAN_VERSION=$(IMAGE_VERSION_CHECK) \
-		-t $(IMAGE_VERSION_TAG) . >.check-image-version.log 2>&1 \
-		|| { echo "check-image-version FAILED: the image did not build. The last 20 lines, and the whole of it in .check-image-version.log:" >&2; \
-		     tail -20 .check-image-version.log >&2; exit 1; }
+check-image-version: version-check-image
 	@bins="$$(docker run --rm --entrypoint sh $(IMAGE_VERSION_TAG) -c 'ls /usr/local/bin/meridian-*')"; \
 	[ -n "$$bins" ] || { echo "check-image-version FAILED: the image holds no binaries, so the check would prove nothing" >&2; docker rmi -f $(IMAGE_VERSION_TAG) >/dev/null; exit 1; }; \
 	for bin in $$bins; do \
@@ -2472,18 +2530,15 @@ down:
 # out.
 SDK ?= ../meridian-python
 
-interop: network
+interop: network interop-image runtime-image
 	@test -d "$(SDK)" \
 		|| { echo "no SDK at $(SDK); set SDK=<path to meridian-python>" >&2; exit 1; }
-	@$(DOCKER) build --build-context core-proto="$(CURDIR)/proto" $(SCHEMA_PROTO) -f "$(SDK)/Dockerfile.python" --target interop -t meridian-python-interop "$(SDK)" >/dev/null 2>&1 \
-		|| { echo "interop FAILED: the SDK's image did not build. See it with:" >&2; \
-		     echo "  DOCKER_BUILDKIT=1 docker build --build-context core-proto=$(CURDIR)/proto $(SCHEMA_PROTO) -f $(SDK)/Dockerfile.python --target interop --progress=plain $(SDK)" >&2; exit 1; }
 	@$(COMPOSE) up -d postgres >/dev/null 2>&1
-	@$(COMPOSE) run --rm --build -T instrument meridian-instrument migrate
-	@# Each with --build: a service's image is its own tag, and one left from
-	@# an earlier run would apply an earlier release's migrations.
-	@{ $(COMPOSE) run --rm --build -T street meridian-street migrate \
-	   && $(COMPOSE) run --rm --build -T conductor meridian-conductor migrate; } >/dev/null 2>&1 \
+	@$(COMPOSE) run --rm -T instrument meridian-instrument migrate
+	@# Every service runs the one runtime image, built (or, in CI, pulled) for
+	@# this checkout before anything here starts: never an earlier run's.
+	@{ $(COMPOSE) run --rm -T street meridian-street migrate \
+	   && $(COMPOSE) run --rm -T conductor meridian-conductor migrate; } >/dev/null 2>&1 \
 		|| { echo "interop FAILED: the schema could not be applied" >&2; exit 1; }
 	@$(COMPOSE) exec -T postgres psql -U meridian -d meridian -v ON_ERROR_STOP=1 -q \
 		<e2e/interop/a-linked-account.sql >/dev/null \
@@ -2491,13 +2546,12 @@ interop: network
 	@# All three components, because the surface under test is the sidecar's
 	@# and the answers come from the other two across a broker. Before the
 	@# split this was one process, and the test could not tell the difference.
-	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
 	@$(BROKER_CONFIG) --instances /w/deploy/nats/dev-instances.json \
 		--dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf
 	@$(COMPOSE) up -d nats >/dev/null 2>&1 && $(COMPOSE) restart nats >/dev/null 2>&1
 	@# The conductor's platform the master's stand-in (contract v20): a currency
 	@# is pulled from it, never minted.
-	@MERIDIAN_DEPLOYMENT_ID=DEP-interop MERIDIAN_PLATFORM_ADDRESS=http://master:8000 $(COMPOSE) --profile interop up -d --build master street instrument conductor sidecar sidecar-operations sidecar-operations-unscoped >/dev/null 2>&1 \
+	@MERIDIAN_DEPLOYMENT_ID=DEP-interop MERIDIAN_PLATFORM_ADDRESS=http://master:8000 $(COMPOSE) --profile interop up -d master street instrument conductor sidecar sidecar-operations sidecar-operations-unscoped >/dev/null 2>&1 \
 		|| { echo "interop FAILED: the components did not start" >&2; exit 1; }
 	@# The master answering, and the conductor connected, before the suite
 	@# resolves a currency (contract v20): one asked before either listens is
@@ -2598,17 +2652,15 @@ prompt-attacks:
 # Then `meridian-bor rebuild`, and the book as deploy/harness/book.sql prints it
 # before and after must be the same, character for character: positions,
 # lots, pending settlements, breaks, figures and entries.
-e2e-book: network
+e2e-book: network interop-image runtime-image
 	@test -d "$(SDK)" \
 		|| { echo "no SDK at $(SDK); set SDK=<path to meridian-python>" >&2; exit 1; }
-	@$(DOCKER) build --build-context core-proto="$(CURDIR)/proto" $(SCHEMA_PROTO) -f "$(SDK)/Dockerfile.python" --target interop -t meridian-python-interop "$(SDK)" >/dev/null 2>&1 \
-		|| { echo "e2e-book FAILED: the SDK's image did not build" >&2; exit 1; }
 	@$(COMPOSE) --profile book down -v --remove-orphans >/dev/null 2>&1 || true
 	@$(COMPOSE) up -d postgres >/dev/null 2>&1
-	@{ $(COMPOSE) run --rm --build -T instrument meridian-instrument migrate \
-	   && $(COMPOSE) run --rm --build -T street meridian-street migrate \
-	   && $(COMPOSE) run --rm --build -T bor meridian-bor migrate \
-	   && $(COMPOSE) run --rm --build -T conductor meridian-conductor migrate; } >.e2e-book.log 2>&1 \
+	@{ $(COMPOSE) run --rm -T instrument meridian-instrument migrate \
+	   && $(COMPOSE) run --rm -T street meridian-street migrate \
+	   && $(COMPOSE) run --rm -T bor meridian-bor migrate \
+	   && $(COMPOSE) run --rm -T conductor meridian-conductor migrate; } >.e2e-book.log 2>&1 \
 		|| { echo "e2e-book FAILED: the schema could not be applied; see .e2e-book.log" >&2; exit 1; }
 	@$(COMPOSE) exec -T postgres psql -U meridian -d meridian -v ON_ERROR_STOP=1 -q \
 		<e2e/book/accounts.sql >/dev/null \
@@ -2616,11 +2668,10 @@ e2e-book: network
 	@$(COMPOSE) exec -T postgres psql -U meridian -d meridian -v ON_ERROR_STOP=1 -q \
 		<e2e/book/instruments.sql >/dev/null \
 		|| { echo "e2e-book FAILED: the instrument records could not be written" >&2; exit 1; }
-	@DOCKER_BUILDKIT=1 $(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
 	@$(BROKER_CONFIG) --instances /w/deploy/nats/dev-instances.json \
 		--dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf
 	@$(COMPOSE) up -d nats >/dev/null 2>&1 && $(COMPOSE) restart nats >/dev/null 2>&1
-	@MERIDIAN_DEPLOYMENT_ID=DEP-book $(COMPOSE) --profile book up -d --build street instrument conductor bor \
+	@MERIDIAN_DEPLOYMENT_ID=DEP-book $(COMPOSE) --profile book up -d street instrument conductor bor \
 		sidecar-book sidecar-book-operations sidecar-book-reporting sidecar-book-unscoped >>.e2e-book.log 2>&1 \
 		|| { echo "e2e-book FAILED: the components did not start; see .e2e-book.log" >&2; exit 1; }
 	@# --no-deps, as interop: everything the suite reaches is up already, and a
