@@ -27,7 +27,12 @@ concurrency:
 
 jobs:
   cargo-cache:
-    runs-on: ubuntu-latest
+    # Each architecture's own (ruling 1071): ci builds the release candidate
+    # on both.
+    strategy:
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     defaults:
       run:
@@ -47,8 +52,10 @@ jobs:
         id: cargo
         run: |
           rust="$(sed -n 's/^ARG RUST_VERSION=//p' Dockerfile | head -1)"
-          echo "prefix=cargo-release-${RUNNER_OS}-rust${rust}-" >> "$GITHUB_OUTPUT"
-          echo "key=cargo-release-${RUNNER_OS}-rust${rust}-${{ hashFiles('workspace/meridian-core/Cargo.lock') }}" >> "$GITHUB_OUTPUT"
+          # amd64's keys name no architecture, as ci's images job names them.
+          arch=; [ "$RUNNER_ARCH" = X64 ] || arch="${RUNNER_ARCH}-"
+          echo "prefix=cargo-release-${RUNNER_OS}-${arch}rust${rust}-" >> "$GITHUB_OUTPUT"
+          echo "key=cargo-release-${RUNNER_OS}-${arch}rust${rust}-${{ hashFiles('workspace/meridian-core/Cargo.lock') }}" >> "$GITHUB_OUTPUT"
 
       - name: Restore the cargo caches
         id: cargo-cache
@@ -82,10 +89,12 @@ jobs:
 
       - name: The CLI's commit
         id: cli
+        if: matrix.runner == 'ubuntu-latest'
         run: echo "sha=$(git -C ../meridian-cli rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Restore the CLI's image
         id: cli-image
+        if: matrix.runner == 'ubuntu-latest'
         uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/cli-image
@@ -93,7 +102,7 @@ jobs:
           lookup-only: true
 
       - name: make backup-cli-image
-        if: steps.cli-image.outputs.cache-hit != 'true'
+        if: matrix.runner == 'ubuntu-latest' && steps.cli-image.outputs.cache-hit != 'true'
         env:
           DOCKER_BUILDKIT: "1"
         run: |
@@ -101,7 +110,7 @@ jobs:
           tools/ci-images.sh save "$RUNNER_TEMP/cli-image" backup-cli
 
       - name: Keep the CLI's image
-        if: steps.cli-image.outputs.cache-hit != 'true'
+        if: matrix.runner == 'ubuntu-latest' && steps.cli-image.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: ${{ runner.temp }}/cli-image

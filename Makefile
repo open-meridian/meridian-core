@@ -887,6 +887,23 @@ BROKER_CONFIG = $(DOCKER) run --rm -v "$(CURDIR)":/w -w /w $(RUNTIME_IMAGE) meri
 #   built   ci-local's stages after the compile, which built them: the same,
 #           so a target run again by a submake builds nothing either.
 IMAGES ?= build
+# The release the runtime and analytics images' binaries report, compiled in
+# (ruling 1071): CI's images jobs build the release candidate as
+# <series>.<ci run number>+<commit>, which publish promotes unchanged. Empty,
+# as every other build leaves it, a binary says its crate version marked
+# `-dev`.
+MERIDIAN_VERSION ?=
+VERSION_ARG = $(if $(MERIDIAN_VERSION),--build-arg MERIDIAN_VERSION=$(MERIDIAN_VERSION))
+# Where CI's images jobs push the release candidate (ruling 1071), on a
+# builder that pushes: the build that loads the runtime and analytics images
+# for the run's jobs to test also pushes them there, by digest and untagged,
+# and says what it pushed in .candidate-<image>.json
+# (tools/release-candidate.sh). Empty, as everywhere but CI, it only loads.
+CANDIDATE_REGISTRY ?=
+comma := ,
+candidate = $(if $(CANDIDATE_REGISTRY),--output type=docker$(comma)name=$(1) \
+	--output type=image$(comma)name=$(CANDIDATE_REGISTRY)/$(2)$(comma)push-by-digest=true$(comma)name-canonical=true$(comma)push=true \
+	--metadata-file .candidate-$(2).json,-t $(1))
 ifeq ($(filter build pulled built,$(IMAGES)),)
 $(error IMAGES is build, pulled or built, not "$(IMAGES)")
 endif
@@ -924,10 +941,10 @@ ci-images:
 
 ifeq ($(IMAGES),build)
 runtime-image:
-	@$(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null
+	@$(DOCKER) build -q $(VERSION_ARG) $(call candidate,$(RUNTIME_IMAGE),meridian-runtime) . >/dev/null
 
 analytics-image:
-	@$(DOCKER) build -q --target analytics -t $(ANALYTICS_IMAGE) . >/dev/null
+	@$(DOCKER) build -q $(VERSION_ARG) --target analytics $(call candidate,$(ANALYTICS_IMAGE),meridian-analytics) . >/dev/null
 
 harness-image:
 	@$(DOCKER) build -q --target harness -t $(HARNESS_IMAGE) . >/dev/null \
@@ -940,14 +957,20 @@ interop-image:
 		|| { echo "interop-image FAILED: the SDK's image did not build. See it with:" >&2; \
 		     echo "  DOCKER_BUILDKIT=1 docker build --build-context core-proto=$(CURDIR)/proto $(SCHEMA_PROTO) -f $(SDK)/Dockerfile.python --target interop --progress=plain $(SDK)" >&2; exit 1; }
 
-# The runtime image again, as publish builds it, with a version compiled in:
-# after runtime-image, whose cargo caches leave it the runtime crate alone to
-# rebuild. check-image-version asks each of its binaries.
+# The runtime image with a version compiled in, which check-image-version
+# asks each binary of. Given MERIDIAN_VERSION, as CI's release candidate is,
+# the runtime image is that image already. Otherwise the runtime image again,
+# built with a version: after runtime-image, whose cargo caches leave it the
+# runtime crate alone to rebuild.
 version-check-image: runtime-image
+ifneq ($(MERIDIAN_VERSION),)
+	@docker tag $(RUNTIME_IMAGE) $(IMAGE_VERSION_TAG)
+else
 	@$(DOCKER) build --target runtime --build-arg MERIDIAN_VERSION=$(IMAGE_VERSION_CHECK) \
 		-t $(IMAGE_VERSION_TAG) . >.check-image-version.log 2>&1 \
 		|| { echo "version-check-image FAILED: the image did not build. The last 20 lines, and the whole of it in .check-image-version.log:" >&2; \
 		     tail -20 .check-image-version.log >&2; exit 1; }
+endif
 
 # Every test binary, in Dockerfile.rust's `compile`: the debug build of the
 # workspace and each crate's tests, compiled once, which `test` and the
@@ -1678,9 +1701,10 @@ test-directory: network tests-image
 # builds it: the components said `0.1.0`, the crate's, whatever release they
 # ran (plans/a-plugin-moves-with-its-deployment). Asked of the finished image,
 # as `meridian-<binary> --version`, rather than trusting the build's own check.
-# The image is version-check-image's, built with the images after the runtime
-# image, whose cargo caches leave it only the runtime crate to rebuild.
-IMAGE_VERSION_CHECK := 0.0.0+image-version-check
+# The image is version-check-image's: CI's release candidate, given
+# MERIDIAN_VERSION, or one built with a version of its own. Its label says
+# the same version (publish reads it).
+IMAGE_VERSION_CHECK := $(or $(MERIDIAN_VERSION),0.0.0+image-version-check)
 IMAGE_VERSION_TAG   := meridian-core-version-check:local
 check-image-version: version-check-image
 	@bins="$$(docker run --rm --entrypoint sh $(IMAGE_VERSION_TAG) -c 'ls /usr/local/bin/meridian-*')"; \
@@ -1690,8 +1714,11 @@ check-image-version: version-check-image
 		[ "$$said" = "$(IMAGE_VERSION_CHECK)" ] \
 			|| { echo "check-image-version FAILED: $$bin says '$$said', built as $(IMAGE_VERSION_CHECK)" >&2; docker rmi -f $(IMAGE_VERSION_TAG) >/dev/null; exit 1; }; \
 	done; \
+	label="$$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' $(IMAGE_VERSION_TAG))"; \
+	[ "$$label" = "$(IMAGE_VERSION_CHECK)" ] \
+		|| { echo "check-image-version FAILED: the image's label says '$$label', built as $(IMAGE_VERSION_CHECK)" >&2; docker rmi -f $(IMAGE_VERSION_TAG) >/dev/null; exit 1; }; \
 	docker rmi -f $(IMAGE_VERSION_TAG) >/dev/null; \
-	echo "check-image-version OK: every binary in an image built as $(IMAGE_VERSION_CHECK) says so"
+	echo "check-image-version OK: every binary in an image built as $(IMAGE_VERSION_CHECK) says so, and so does its label"
 
 chart-check:
 	# A key written twice is not an error to YAML or to Helm: the second wins

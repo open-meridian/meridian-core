@@ -51,3 +51,4 @@ meridian-backup-e2e-*/
 # Written by `make ci-local` while it runs: the gate's disk samples and stages
 # (tools/gate.py).
 .gate/
+.candidate-*.json

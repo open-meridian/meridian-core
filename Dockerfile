@@ -99,6 +99,11 @@ RUN apt-get update \
 COPY --from=build /usr/local/bin/meridian-analytics /usr/local/bin/meridian-analytics
 # A command is chosen -- coordinator or worker -- never inherited.
 ENTRYPOINT []
+# The release its binary reports, said on the image too: publish reads it to
+# package the chart at the version the image was built and tested as
+# (ruling 1071). Last, so a version changes no layer.
+ARG MERIDIAN_VERSION=
+LABEL org.opencontainers.image.version=${MERIDIAN_VERSION}
 
 FROM debian:bookworm-slim AS runtime
 # tzdata: the instrument store reads a spot-date rule's cut, 17:00
@@ -137,3 +142,6 @@ COPY --from=ui /ui/dist/ /usr/share/meridian/ui/
 # No default: a component is chosen, never inherited. An image that starts
 # something when nobody said which is an image that starts the wrong thing.
 ENTRYPOINT []
+# The release its binaries report, said on the image too (ruling 1071).
+ARG MERIDIAN_VERSION=
+LABEL org.opencontainers.image.version=${MERIDIAN_VERSION}
