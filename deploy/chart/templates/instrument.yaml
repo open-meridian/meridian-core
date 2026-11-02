@@ -8,8 +8,11 @@ metadata:
     meridian.dev/component: instrument
     {{- include "meridian-runtime.labels" . | nindent 4 }}
 spec:
-  replicas: {{ .Values.instrument.replicaCount }}
+  replicas: {{ include "meridian-runtime.memberCount" (dict "component" "instrument" "values" .Values.instrument) }}
   revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
+  {{- if include "meridian-runtime.leased" (dict "component" "instrument" "values" .Values.instrument) }}
+  {{- include "meridian-runtime.memberStrategy" (dict "component" "instrument" "values" .Values.instrument) | nindent 2 }}
+  {{- end }}
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
@@ -25,6 +28,7 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
+      {{- include "meridian-runtime.memberPlacement" (dict "top" $ "component" "instrument" "values" $.Values.instrument) | nindent 6 }}
       {{- with .Values.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
@@ -42,6 +46,7 @@ spec:
           env:
             - name: MERIDIAN_INSTANCE_ID
               value: {{ include "meridian-runtime.fullname" . }}-instrument
+            {{- include "meridian-runtime.memberEnv" (dict "top" $ "component" "instrument" "values" $.Values.instrument) | nindent 12 }}
             # The deployment each change of its log is made in (step 3a,
             # the change log's origin; ruling 1049).
             - name: MERIDIAN_DEPLOYMENT_ID
@@ -82,15 +87,4 @@ spec:
             {{- toYaml .Values.resources | nindent 12 }}
       volumes:
         {{- include "meridian-runtime.readyVolume" . | nindent 8 }}
-      {{- with .Values.nodeSelector }}
-      nodeSelector:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.tolerations }}
-      tolerations:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.affinity }}
-      affinity:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+{{ include "meridian-runtime.memberBudget" (dict "top" $ "component" "instrument" "values" $.Values.instrument) }}

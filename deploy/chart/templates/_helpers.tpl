@@ -52,17 +52,213 @@ the operator the same thing far less clearly.
 One writer per ordering domain (ruling 1060). The lake, the book, the
 instrument store, the street store and the conductor's configuration store
 each order their changes in one sequence per partition, taken under a lock
-by the one process that writes it. A second replica is a second writer over
-the same partitions: two processes taking turns at one sequence, each with
-its own memory of the head, which corrupts the order a follower reads. Until
-the chart runs a standby and readers in their own modes (step 3b), a store's
-replicaCount is at most 1, and above it nothing renders.
+by the one process that writes it, and the launcher launches as one. A second
+replica is a second writer over the same partitions, so a component's
+replicaCount is at most 1, and above it nothing renders: a copy is added by
+the value that adds one in its mode (step 3b, spec/a-deployment-scales-out-
+and-fails-over-by-configuration section 1), `<component>.standby`.
 */}}
 {{- define "meridian-runtime.oneWriter" -}}
-{{- $count := index .values "replicaCount" -}}
+{{- $count := 1 -}}
+{{- if hasKey .values "replicaCount" -}}{{- $count = .values.replicaCount -}}{{- end -}}
 {{- if gt (int $count) 1 -}}
-{{- fail (printf "%s.replicaCount is %v; it takes 0 or 1. The %s orders its changes in one sequence per partition with one writer, and a second replica is a second writer over the same partitions, which corrupts that order (ruling 1060). A standby and readers come with step 3b's modes, as values of their own." .component $count .what) -}}
+{{- fail (printf "%s.replicaCount is %v; it takes 0 or 1. The %s writes as one member: a second replica is a second writer over the same partitions, which corrupts the order its change log keeps (ruling 1060). Add a warm standby with %s.standby: 1, which takes over when the writer's lease lapses, its epoch fencing the old writer (step 3b)." .component $count .what .component) -}}
 {{- end -}}
+{{- $_ := include "meridian-runtime.standbys" . -}}
+{{- end -}}
+
+{{/*
+A component's standbys (step 3b; spec section 1, plan 5c): 0, the tolerant
+default, or 1, a warm standby holding no lease that takes the writer's over
+when it lapses. More are refused: a count CI does not test is not offered
+(requirement 1, ruling 1047). Takes a dict: component, values.
+*/}}
+{{- define "meridian-runtime.standbys" -}}
+{{- $standby := index .values "standby" | default 0 -}}
+{{- if not (regexMatch "^[01]$" (toString $standby)) -}}
+{{- fail (printf "%s.standby is %v; it takes 0 or 1: one warm standby per writer, which CI tests (e2e-cluster-failover). Readers come with their own value." .component $standby) -}}
+{{- end -}}
+{{- $standby -}}
+{{- end -}}
+
+{{/*
+"true" when a component runs a standby, so its members take a lease
+(coordination.k8s.io/v1, in the release's namespace) to say which writes.
+Takes a dict: component, values.
+*/}}
+{{- define "meridian-runtime.leased" -}}
+{{- if eq (include "meridian-runtime.standbys" .) "1" -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+How many members a component runs: none where its replicaCount is 0, else
+its writer and its standby. Takes a dict: component, values.
+*/}}
+{{- define "meridian-runtime.memberCount" -}}
+{{- $count := 1 -}}
+{{- if hasKey .values "replicaCount" -}}{{- $count = .values.replicaCount -}}{{- end -}}
+{{- if eq (int $count) 0 -}}0{{- else -}}{{ add 1 (include "meridian-runtime.standbys" .) }}{{- end -}}
+{{- end -}}
+
+{{/*
+A member set's rollout. With a standby, a new member may start beside the
+writer: it waits as a standby, the writer hands its lease over as it stops,
+and the epoch fences anything it began. With none, the one writer stops
+before the new one starts, as ever. Takes a dict: component, values.
+*/}}
+{{- define "meridian-runtime.memberStrategy" -}}
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+{{- if include "meridian-runtime.leased" . }}
+    maxSurge: 1
+    maxUnavailable: 0
+{{- else }}
+    maxSurge: 0
+    maxUnavailable: 1
+{{- end }}
+{{- end -}}
+
+{{/*
+What a member is told of itself (step 3b): its pod's name, its zone where
+the cluster labels it, and with a standby its lease, the lease's timing
+(leases.renewSeconds, leases.durationSeconds) and the lag a standby is ready
+under (`<component>.readyLagMs`). Takes a dict: top, component, values.
+*/}}
+{{- define "meridian-runtime.memberEnv" -}}
+- name: MERIDIAN_POD_NAME
+  valueFrom:
+    fieldRef:
+      fieldPath: metadata.name
+- name: MERIDIAN_ZONE
+  valueFrom:
+    fieldRef:
+      fieldPath: metadata.labels['topology.kubernetes.io/zone']
+{{- if include "meridian-runtime.leased" . }}
+- name: MERIDIAN_LEASE_NAME
+  value: {{ printf "%s-%s" (include "meridian-runtime.fullname" .top) .component | quote }}
+- name: MERIDIAN_LEASE_RENEW_SECONDS
+  value: {{ .top.Values.leases.renewSeconds | quote }}
+- name: MERIDIAN_LEASE_DURATION_SECONDS
+  value: {{ .top.Values.leases.durationSeconds | quote }}
+- name: MERIDIAN_READY_LAG_MS
+  value: {{ index .values "readyLagMs" | default 5000 | quote }}
+{{- end }}
+{{- end -}}
+
+{{/*
+Where a member's pod may run (step 3b; spec section 2, plan 5a). Every
+component tolerates a node not ready or unreachable for 30 s, not
+Kubernetes' 300 (question 22), in both configurations. A member set of two
+spreads over nodes (and zones, where `zones` names them), the writer and
+its standby repelling each other, and runs under the members' service
+account, whose one right is its Leases. Takes a dict: top, component,
+values, and `account` where the component has a service account of its own
+that holds the lease right too.
+*/}}
+{{- define "meridian-runtime.memberPlacement" -}}
+{{- $leased := include "meridian-runtime.leased" . -}}
+{{- if and $leased (not .account) }}
+serviceAccountName: {{ include "meridian-runtime.fullname" .top }}-member
+{{- end }}
+{{- with .top.Values.nodeSelector }}
+nodeSelector:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{ include "meridian-runtime.nodeTolerations" .top }}
+{{- if .top.Values.affinity }}
+affinity:
+  {{- toYaml .top.Values.affinity | nindent 2 }}
+{{- else if or $leased .top.Values.zones }}
+affinity:
+  {{- if .top.Values.zones }}
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: topology.kubernetes.io/zone
+              operator: In
+              values:
+                {{- toYaml .top.Values.zones | nindent 16 }}
+  {{- end }}
+  {{- if $leased }}
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          topologyKey: kubernetes.io/hostname
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .top.Release.Name }}
+              meridian.dev/component: {{ .component }}
+  {{- end }}
+{{- end }}
+{{- if $leased }}
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: DoNotSchedule
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/instance: {{ .top.Release.Name }}
+        meridian.dev/component: {{ .component }}
+  {{- if .top.Values.zones }}
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: DoNotSchedule
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/instance: {{ .top.Release.Name }}
+        meridian.dev/component: {{ .component }}
+  {{- end }}
+{{- end }}
+{{- end -}}
+
+{{/*
+The node tolerations every stateless component carries (step 3b; spec
+section 2, question 22): a pod on a node not ready or unreachable is moved
+after 30 s, not Kubernetes' 300, in both configurations; and the chart's own
+`tolerations` after them. The brought database is not stateless and keeps
+Kubernetes' own: it waits for its node, never force-deleted. Takes the chart.
+*/}}
+{{- define "meridian-runtime.nodeTolerations" -}}
+tolerations:
+  - key: node.kubernetes.io/not-ready
+    operator: Exists
+    effect: NoExecute
+    tolerationSeconds: 30
+  - key: node.kubernetes.io/unreachable
+    operator: Exists
+    effect: NoExecute
+    tolerationSeconds: 30
+  {{- with .Values.tolerations }}
+  {{- toYaml . | nindent 2 }}
+  {{- end }}
+{{- end -}}
+
+{{/*
+A member set's PodDisruptionBudget (step 3b, plan 5a): with a standby, a
+drain never takes the writer and its standby together. Takes a dict: top,
+component, values.
+*/}}
+{{- define "meridian-runtime.memberBudget" -}}
+{{- if include "meridian-runtime.leased" . }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "meridian-runtime.fullname" .top }}-{{ .component }}
+  labels:
+    meridian.dev/component: {{ .component }}
+    {{- include "meridian-runtime.labels" .top | nindent 4 }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "meridian-runtime.name" .top }}
+      app.kubernetes.io/instance: {{ .top.Release.Name }}
+      meridian.dev/component: {{ .component }}
+{{- end }}
 {{- end -}}
 
 {{/*

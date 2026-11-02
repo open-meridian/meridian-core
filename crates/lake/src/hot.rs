@@ -881,8 +881,12 @@ impl Store for HotStore {
         self.inner.epoch()
     }
 
-    fn take_over(&self) -> Result<u64> {
-        self.inner.take_over()
+    fn take_over(&self, by: &meridian_changes::TookOver) -> Result<u64> {
+        self.inner.take_over(by)
+    }
+
+    fn head_epoch(&self) -> Result<u64> {
+        self.inner.head_epoch()
     }
 
     fn read_changes(

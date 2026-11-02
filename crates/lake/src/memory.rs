@@ -31,6 +31,9 @@ struct Held {
     kept_from: BTreeMap<String, u64>,
     /// The epoch each row and range served was written under.
     epochs: BTreeMap<(String, u64), u64>,
+    /// The `control` partition's log (step 3b): assessments, amendments,
+    /// priorities and aliases, in the order committed.
+    control: Vec<meridian_changes::Change>,
 }
 
 #[derive(Default)]
@@ -40,12 +43,32 @@ pub struct MemoryStore {
 }
 
 impl MemoryStore {
+    /// Hold this store's writer at `epoch`, as a deposed writer holds the
+    /// one it had: what a test of the fence does.
+    #[cfg(test)]
+    pub(crate) fn fence_for_test(&self, epoch: u64) {
+        self.fence.adopt(epoch);
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Held> {
         self.held.lock().expect("lake store poisoned")
+    }
+
+    /// Log what is not a dataset's row in the `control` partition (step
+    /// 3b), under the writer's epoch as Postgres checks it.
+    fn log_control(&self, held: &mut Held, entries: Vec<(&str, Vec<u8>, i64)>) -> Result<()> {
+        let epoch = self.fenced(held)?;
+        for (kind, body, at_ns) in entries {
+            let sequence = held.control.len() as u64 + 1;
+            held.control.push(crate::store::control_change(
+                sequence, epoch, at_ns, kind, body,
+            ));
+        }
+        Ok(())
     }
 
     /// The batch's epoch, checked against the partitions' as Postgres
@@ -281,6 +304,14 @@ impl Store for MemoryStore {
                 standing_at_ns: standing,
             }));
         }
+        self.log_control(
+            &mut held,
+            vec![(
+                crate::store::CONTROL_PRIORITY,
+                prost::Message::encode_to_vec(priority),
+                priority.updated_at_ns,
+            )],
+        )?;
         held.priorities.push(priority.clone());
         Ok(Ok(priority.clone()))
     }
@@ -362,10 +393,20 @@ impl Store for MemoryStore {
         Ok(self.lock().misses.clone())
     }
 
-    fn keep_alias(&self, replaced: &str, stays: &str, _at_ns: i64) -> Result<()> {
-        self.lock()
-            .aliases
-            .insert(replaced.to_string(), stays.to_string());
+    fn keep_alias(&self, replaced: &str, stays: &str, at_ns: i64) -> Result<()> {
+        let mut held = self.lock();
+        if held.aliases.contains_key(replaced) {
+            return Ok(());
+        }
+        self.log_control(
+            &mut held,
+            vec![(
+                crate::store::CONTROL_ALIAS,
+                crate::store::alias_body(replaced, stays, at_ns),
+                at_ns,
+            )],
+        )?;
+        held.aliases.insert(replaced.to_string(), stays.to_string());
         Ok(())
     }
 
@@ -444,7 +485,19 @@ impl Store for MemoryStore {
     }
 
     fn amend_closed_day(&self, amendments: &[ClosedDayAmendment]) -> Result<()> {
-        self.lock().amendments.extend(amendments.iter().cloned());
+        let mut held = self.lock();
+        let logged = amendments
+            .iter()
+            .map(|a| {
+                (
+                    crate::store::CONTROL_CLOSED_DAY,
+                    crate::store::amendment_body(a),
+                    a.at_ns,
+                )
+            })
+            .collect();
+        self.log_control(&mut held, logged)?;
+        held.amendments.extend(amendments.iter().cloned());
         Ok(())
     }
 
@@ -515,7 +568,19 @@ impl Store for MemoryStore {
     }
 
     fn assess(&self, assessments: &[Assessment]) -> Result<()> {
-        self.lock().assessments.extend(assessments.iter().cloned());
+        let mut held = self.lock();
+        let logged = assessments
+            .iter()
+            .map(|a| {
+                (
+                    crate::store::CONTROL_ASSESSMENT,
+                    crate::store::assessment_body(a),
+                    a.at_ns,
+                )
+            })
+            .collect();
+        self.log_control(&mut held, logged)?;
+        held.assessments.extend(assessments.iter().cloned());
         Ok(())
     }
 
@@ -535,11 +600,15 @@ impl Store for MemoryStore {
         self.fence.epoch()
     }
 
-    fn take_over(&self) -> Result<u64> {
+    fn take_over(&self, _by: &meridian_changes::TookOver) -> Result<u64> {
         let mut held = self.lock();
         held.epoch = held.epoch.max(1) + 1;
         self.fence.adopt(held.epoch);
         Ok(held.epoch)
+    }
+
+    fn head_epoch(&self) -> Result<u64> {
+        Ok(self.lock().epoch.max(1))
     }
 
     fn read_changes(
@@ -552,11 +621,21 @@ impl Store for MemoryStore {
         let held = self.lock();
         let epoch = held.epoch.max(1);
         if partition == meridian_changes::CONTROL {
+            let head = held.control.len() as u64;
+            let lowest_kept = u64::from(head > 0);
+            meridian_changes::check_kept(after, lowest_kept, head)?;
+            let mut page = meridian_changes::Page::new(most_bytes);
+            for change in held.control.iter().filter(|c| c.sequence > after) {
+                if !page.take(change.clone()) {
+                    break;
+                }
+            }
             return Ok(ReadChangesReply {
-                changes: Vec::new(),
-                head: 0,
-                lowest_kept: 0,
+                changes: page.changes,
+                head,
+                lowest_kept,
                 epoch,
+                after_sequence: 0,
             });
         }
         let head = *held
@@ -602,6 +681,7 @@ impl Store for MemoryStore {
             head,
             lowest_kept,
             epoch,
+            after_sequence: 0,
         })
     }
 }

@@ -366,6 +366,32 @@ message ComponentReport {
   // When this component last started, so "restarting repeatedly" is visible as
   // a fact rather than as an inference from a report arriving twice.
   int64 started_at_ns = 6;
+
+  // Step 3b (spec/a-deployment-scales-out-and-fails-over-by-configuration
+  // section 11; ruling 1060): what each member of a component reports, so
+  // `meridian status` shows a component's members, their modes, lag and
+  // partitions. Working state, never a record (decisions/031).
+
+  // The member's mode: "writer", "standby" or "reader"; empty for a
+  // component with no modes (the dashboard, the analytics component).
+  string mode = 7;
+
+  // The zone its node is in (`topology.kubernetes.io/zone`), where the
+  // cluster says; empty where it does not.
+  string zone = 8;
+
+  // How far a standby or reader is behind its writer's change log, in
+  // milliseconds; 0 for a writer and for one caught up.
+  uint64 lag_ms = 9;
+
+  // The partitions it writes (a writer) or follows (a standby): the store's
+  // partition names -- a dataset key, `P0`, `control` -- never an account,
+  // an instrument or a person.
+  repeated string partitions = 10;
+
+  // Which member this is: its pod's name. Two members of one component each
+  // report; the conductor keeps the latest of each.
+  string member = 11;
 }
 
 message ReportDeploymentComponentsRequest {

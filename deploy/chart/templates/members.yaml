@@ -1,0 +1,50 @@
+{{/*
+  The members' lease right (step 3b; spec/a-deployment-scales-out-and-fails-
+  over-by-configuration section 2; decisions/016): where any component runs a
+  standby, its members take a coordination.k8s.io/v1 Lease in this namespace
+  to say which of them writes, under this account. Its one right is its
+  Leases: read, make and renew them, in this namespace only, never a
+  cluster-wide one. The launcher holds the same right under its own account.
+  With no standby anywhere, as by default, none of this renders.
+*/}}
+{{- $leased := false -}}
+{{- range $component := list "lake" "bor" "instrument" "street" "conductor" -}}
+{{- if include "meridian-runtime.leased" (dict "component" $component "values" (index $.Values $component)) -}}
+{{- $leased = true -}}
+{{- end -}}
+{{- end -}}
+{{- if $leased }}
+{{- $name := printf "%s-member" (include "meridian-runtime.fullname" .) }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ $name }}
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}

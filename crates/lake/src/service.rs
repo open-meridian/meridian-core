@@ -376,6 +376,10 @@ pub struct Lake {
     /// Each series key's record the instrument store holds, once it holds
     /// one (W3.1): a record's ID is never another's.
     series_records: Mutex<BTreeMap<String, String>>,
+    /// The `control` partition's sequence its tail has published to (step
+    /// 3b): what an assessment, an amendment, a priority or an alias
+    /// committed after it is published from.
+    control_published: Mutex<u64>,
 }
 
 /// The lake's change log, read from its store.
@@ -535,7 +539,6 @@ impl Lake {
             .unwrap_or_default();
         Arc::new(Lake {
             bus,
-            store,
             clock,
             config: RwLock::new(config),
             wants: Mutex::new(Wants::default()),
@@ -552,7 +555,42 @@ impl Lake {
             built: std::sync::atomic::AtomicU64::new(0),
             generation: std::sync::atomic::AtomicU64::new(0),
             series_records: Mutex::new(BTreeMap::new()),
+            control_published: Mutex::new(
+                store
+                    .read_changes(meridian_changes::CONTROL, i64::MAX as u64, 1)
+                    .map_or(0, |at| at.head),
+            ),
+            store,
         })
+    }
+
+    /// Publish what the `control` partition committed since it was last
+    /// published, after commit (step 3b; ruling 1062's carried item): read
+    /// back from the log, so a follower's quality states, flags, priorities
+    /// and aliases match the writer's whichever act wrote them.
+    fn publish_control(&self) {
+        let mut published = self.control_published.lock().expect("control poisoned");
+        loop {
+            let page = match self.store.read_changes(
+                meridian_changes::CONTROL,
+                *published,
+                meridian_changes::PAGE_MOST,
+            ) {
+                Ok(page) => page,
+                Err(failed) => {
+                    tracing::warn!(%failed, "the control partition's changes were not published");
+                    return;
+                }
+            };
+            let Some(last) = page.changes.last().map(|change| change.sequence) else {
+                return;
+            };
+            meridian_changes::publish(&self.bus, "lake", *published, &page.changes);
+            *published = last;
+            if last >= page.head {
+                return;
+            }
+        }
     }
 
     /// How many reads' answers are held for their next pages.
@@ -1930,6 +1968,7 @@ impl Lake {
             self.store
                 .amend_closed_day(&amendments)
                 .map_err(|failed| failed.to_string())?;
+            self.publish_control();
             tracing::info!(
                 dataset,
                 calendar_id = event.calendar_id,
@@ -2065,6 +2104,12 @@ impl Lake {
         }
         let epoch = self.store.epoch();
         let origin = meridian_changes::origin();
+        // The partition's head before this batch: what its page follows.
+        let after = done
+            .rows
+            .first()
+            .map_or(done.head, |row| row.meta().sequence)
+            .saturating_sub(1);
         let changes: Vec<meridian_changes::Change> = match served_to {
             None => done
                 .rows
@@ -2082,7 +2127,7 @@ impl Lake {
                 vec![crate::store::served_change(&served, epoch, origin)]
             }
         };
-        meridian_changes::publish(&self.bus, "lake", &changes);
+        meridian_changes::publish(&self.bus, "lake", after, &changes);
     }
 
     /// A want's subjects answered or declined, recorded; a want every
@@ -4258,6 +4303,7 @@ impl Lake {
         self.store
             .assess(&journal)
             .map_err(|failed| failed.to_string())?;
+        self.publish_control();
         Ok(RecordQualityAssessmentsReply {
             recorded: request.assessments.len() as u32,
         })
@@ -4349,6 +4395,7 @@ impl Lake {
             .map_err(|failed| failed.to_string())?
         {
             Ok(set) => {
+                self.publish_control();
                 self.generation
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 tracing::info!(data_type = set.data_type, kind = set.kind, by = set.updated_by, "a source priority set");
@@ -6177,6 +6224,7 @@ impl Lake {
                         {
                             tracing::warn!(%failed, "a replacement was not kept");
                         }
+                        self.publish_control();
                         self.unsettled
                             .lock()
                             .expect("unsettled poisoned")

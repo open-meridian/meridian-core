@@ -50,6 +50,14 @@ message ReadChangesReply {
 
   // The partition's epoch now: the writer whose commits it takes.
   uint64 epoch = 4;
+
+  // On the tail (step 3b, ruling 1062), where one committed transaction's
+  // changes are published as one page: the sequence the page follows, the
+  // partition's head before its first change. A follower at this sequence
+  // applies the page and stands at `head`; one below it missed a page and
+  // reads what it missed. 0 on a read's reply, which starts after the
+  // request's own `after_sequence`.
+  uint64 after_sequence = 5;
 }
 
 // One committed change of a partition, as the store that is its record wrote it.

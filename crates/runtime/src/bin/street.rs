@@ -87,10 +87,7 @@ fn run() -> Result<(), String> {
     // epoch, adopted before it serves (step 3a; ruling 1060).
     meridian_changes::set_origin(&var("MERIDIAN_DEPLOYMENT_ID").unwrap_or_default());
     meridian_changes::set_clock(clock());
-    let epoch = postgres
-        .adopt()
-        .map_err(|failed| format!("the street store could not adopt its epoch: {failed}"))?;
-    tracing::info!(epoch, "the street store writes under its epoch");
+    let member = meridian_runtime::member::Member::from_env("street", Some("street"))?;
     let store: Arc<dyn meridian_street::Store> = postgres.clone();
 
     let instance_id = var("MERIDIAN_INSTANCE_ID").unwrap_or_else(|| "street-1".into());
@@ -99,6 +96,29 @@ fn run() -> Result<(), String> {
     // (meridian_runtime::on_runtime).
     on_runtime(async {
         let bus = bus_from_env(&instance_id).await?;
+        // A standby waits here (step 3b): following the writer's change log,
+        // serving nothing, until it takes the lease. With no lease -- the
+        // tolerant default, one member -- it writes at once, as it always has.
+        let holding = member.wait_to_write(&bus).await?;
+        let epoch = tokio::task::block_in_place(|| {
+            holding.epoch(
+                || {
+                    postgres.adopt().map_err(|failed| {
+                        format!("the street store could not adopt its epoch: {failed}")
+                    })
+                },
+                |by| {
+                    postgres
+                        .take_over(by)
+                        .map_err(|failed| format!("the street store could not take over: {failed}"))
+                },
+            )
+        })?;
+        tracing::info!(epoch, "the street store writes under its epoch");
+        let watched = postgres.clone();
+        holding.keep(epoch, move || {
+            watched.head_epoch().map_err(|failed| failed.to_string())
+        });
 
         // Registered before anything can call them. A component that
         // announces itself and then cannot answer is worse than one that
@@ -163,6 +183,7 @@ fn run() -> Result<(), String> {
         ready.serving();
         shutdown().await;
         tracing::info!("stopping");
+        holding.release().await;
         Ok(())
     })
 }

@@ -99,10 +99,16 @@ pub const CHANGES: meridian_changes::captured::Spec = meridian_changes::captured
         "config_venue_account_mapping",
         "config_venue_catalogue",
     ],
-    not_captured: &[(
-        "config_registry_catalogue",
-        "the platform's catalogue, replaced whole at each pull and pulled again by whoever runs",
-    )],
+    not_captured: &[
+        (
+            "config_registry_catalogue",
+            "the platform's catalogue, replaced whole at each pull and pulled again by whoever runs",
+        ),
+        (
+            "config_writer_took_over",
+            "the store's takeovers, written as the epoch is raised, beside its control partition",
+        ),
+    ],
 };
 
 impl PostgresStore {
@@ -127,13 +133,21 @@ impl PostgresStore {
         Ok(self.fence.adopt_once(epoch))
     }
 
-    /// Take the store over: raise its epoch, and adopt it. Every commit
-    /// under the old one is refused in its own transaction.
-    pub fn take_over(&self) -> Result<u64> {
+    /// Take the store over: raise its epoch, record who took it over and
+    /// why, and adopt it (step 3b). Every commit under the old one is
+    /// refused in its own transaction.
+    pub fn take_over(&self, by: &meridian_changes::TookOver) -> Result<u64> {
         let mut conn = self.conn()?;
-        let epoch = CHANGES.take_over(&mut *conn).map_err(unavailable)?;
+        let epoch = CHANGES.take_over(&mut *conn, by).map_err(unavailable)?;
         self.fence.adopt(epoch);
         Ok(epoch)
+    }
+
+    /// The store's epoch now, as its head row says (step 3b): a writer
+    /// steps down once it moves past its own.
+    pub fn head_epoch(&self) -> Result<u64> {
+        let mut conn = self.conn()?;
+        CHANGES.head_epoch(&mut *conn).map_err(unavailable)
     }
 
     /// Apply every migration not yet recorded, under a lock. Run once per

@@ -13,6 +13,8 @@
 pub mod broker;
 pub mod launched;
 pub mod launcher;
+pub mod lease;
+pub mod member;
 pub mod preflight;
 
 use std::collections::BTreeMap;
@@ -347,7 +349,11 @@ impl Ready {
     pub fn serving(&self) {
         let Some(path) = &self.0 else { return };
         match std::fs::write(path, b"serving\n") {
-            Ok(()) => tracing::debug!(path = %path.display(), "marked ready"),
+            Ok(()) => {
+                tracing::debug!(path = %path.display(), "marked ready");
+                // And its member's state beside it (step 3b).
+                mark_ready(true);
+            }
             Err(failed) => tracing::warn!(
                 path = %path.display(),
                 %failed,
@@ -363,6 +369,34 @@ impl Drop for Ready {
         if let Some(path) = &self.0 {
             let _ = std::fs::remove_file(path);
         }
+    }
+}
+
+/// Say whether this member serves, by its readiness file, from anywhere in
+/// the process: a standby is ready while its lag is under its bound, and a
+/// member stepping down is not (step 3b). Nothing where the variable is
+/// unset. Beside it, `member.json` says the member's mode, lag and
+/// partitions, which `meridian status` reads in the pod (the probe shape).
+pub fn mark_ready(serving: bool) {
+    let Some(path) = var("MERIDIAN_READY_FILE").map(std::path::PathBuf::from) else {
+        return;
+    };
+    if serving {
+        let _ = std::fs::write(&path, b"serving\n");
+    } else {
+        let _ = std::fs::remove_file(&path);
+    }
+    if let Some(dir) = path.parent() {
+        let said = member::said();
+        let member = serde_json::json!({
+            "member": member::member_name(),
+            "mode": said.mode(),
+            "zone": member::zone(),
+            "lag_ms": said.lag_ms(),
+            "partitions": said.partitions(),
+            "ready": serving,
+        });
+        let _ = std::fs::write(dir.join("member.json"), member.to_string());
     }
 }
 
@@ -436,14 +470,8 @@ pub async fn report_inward_forever(bus: Arc<Bus>, component: &'static str, schem
     let started_at_ns = now_ns();
 
     loop {
-        let report = meridian_domain::v1::ComponentReport {
-            component: component.to_string(),
-            version: VERSION.to_string(),
-            schema_version: schema,
-            health: meridian_domain::v1::ComponentHealth::Serving as i32,
-            detail: String::new(),
-            started_at_ns,
-        };
+        // With its member's mode, zone, lag, partitions and name (step 3b).
+        let report = member::member_report(component, schema, started_at_ns);
 
         if let Err(failed) = bus.publish(
             COMPONENT_REPORT_TOPIC,
@@ -522,6 +550,12 @@ pub fn collect_inward(bus: Arc<Bus>) -> Arc<Mutex<BTreeMap<String, ComponentRepo
                 tracing::warn!("a component report did not decode");
                 continue;
             };
+            // The platform hears of each component once, as it always has:
+            // from its writer. A standby's report is its members' (step 3b),
+            // read in the deployment, never carried outward.
+            if report.mode == member::Mode::Standby.as_str() {
+                continue;
+            }
 
             collecting.lock().expect("report lock poisoned").insert(
                 report.component.clone(),

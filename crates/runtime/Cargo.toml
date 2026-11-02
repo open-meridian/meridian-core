@@ -76,6 +76,9 @@ meridian-pb.workspace = true
 meridian-domain.workspace = true
 postgres.workspace = true
 serde_json.workspace = true
+# A writer's lease, a Kubernetes Lease in its own namespace (step 3b), over
+# the in-cluster API with the pod's service account, as first run reaches it.
+reqwest.workspace = true
 rand.workspace = true
 # The broker checks a launched plugin's password against a hash of it, so
 # the configuration it reloads holds no password (the registry spec, decision 3).

@@ -17,8 +17,11 @@ metadata:
     meridian.dev/component: street
     {{- include "meridian-runtime.labels" . | nindent 4 }}
 spec:
-  replicas: {{ .Values.street.replicaCount }}
+  replicas: {{ include "meridian-runtime.memberCount" (dict "component" "street" "values" .Values.street) }}
   revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
+  {{- if include "meridian-runtime.leased" (dict "component" "street" "values" .Values.street) }}
+  {{- include "meridian-runtime.memberStrategy" (dict "component" "street" "values" .Values.street) | nindent 2 }}
+  {{- end }}
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
@@ -34,6 +37,7 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
+      {{- include "meridian-runtime.memberPlacement" (dict "top" $ "component" "street" "values" $.Values.street) | nindent 6 }}
       {{- with .Values.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
@@ -51,6 +55,7 @@ spec:
           env:
             - name: MERIDIAN_INSTANCE_ID
               value: {{ include "meridian-runtime.fullname" . }}-street
+            {{- include "meridian-runtime.memberEnv" (dict "top" $ "component" "street" "values" $.Values.street) | nindent 12 }}
             # The deployment each change of its log is made in (step 3a,
             # the change log's origin; ruling 1049).
             - name: MERIDIAN_DEPLOYMENT_ID
@@ -75,3 +80,4 @@ spec:
             {{- toYaml .Values.resources | nindent 12 }}
       volumes:
         {{- include "meridian-runtime.readyVolume" . | nindent 8 }}
+{{ include "meridian-runtime.memberBudget" (dict "top" $ "component" "street" "values" $.Values.street) }}

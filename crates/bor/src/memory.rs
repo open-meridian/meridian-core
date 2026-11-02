@@ -179,11 +179,15 @@ impl Store for MemoryStore {
         self.fence.epoch()
     }
 
-    fn take_over(&self) -> Result<u64> {
+    fn take_over(&self, _by: &meridian_changes::TookOver) -> Result<u64> {
         let mut state = self.state();
         state.epoch += 1;
         self.fence.adopt(state.epoch);
         Ok(state.epoch)
+    }
+
+    fn head_epoch(&self) -> Result<u64> {
+        Ok(self.state().epoch)
     }
 
     fn read_changes(
@@ -216,6 +220,7 @@ impl Store for MemoryStore {
             head,
             lowest_kept: u64::from(head > 0),
             epoch: state.epoch,
+            after_sequence: 0,
         })
     }
 

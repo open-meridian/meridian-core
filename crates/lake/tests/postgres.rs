@@ -2781,7 +2781,28 @@ fn a_deposed_writers_batch_is_refused_after_a_takeover_and_leaves_no_hole() {
         )
         .unwrap();
     let standby = PostgresStore::connect(&url, 1).unwrap();
-    assert_eq!(standby.take_over().unwrap(), 2);
+    assert_eq!(
+        standby
+            .take_over(&meridian_changes::TookOver::unnamed("a test"))
+            .unwrap(),
+        2
+    );
+    // The takeover is its own record, in its own transaction with the
+    // epoch it raised (step 3b, `WriterTookOver`).
+    let took = {
+        let url = url.clone();
+        let read = move || {
+            let mut held = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+            let row = held.query_one("SELECT why, coalesce(array_length(partitions, 1), 0) FROM lake_writer_took_over WHERE epoch = 2", &[]).unwrap();
+            (row.get::<_, String>(0), row.get::<_, i32>(1))
+        };
+        read()
+    };
+    assert_eq!(took.0, "a test");
+    assert!(
+        took.1 >= 2,
+        "the partitions it took, control among them: {took:?}"
+    );
     // The deposed writer's next batch, to a partition held and to a new one.
     let refused = writer
         .record(
@@ -2879,4 +2900,85 @@ fn a_follower_behind_retention_is_refused_naming_after_sequence_and_reloads() {
         .map(|c| Observation::decode(DataType::Price, &c.body).unwrap())
         .collect();
     assert_eq!(state, followed);
+}
+
+/// Step 3b (ruling 1062's carried item): an assessment, a closed-day
+/// amendment, a priority and an alias each a change of the `control`
+/// partition, in the order committed, read back a page at a time; an alias
+/// heard again is not logged again; and a deposed writer is refused them.
+#[test]
+fn the_control_partition_logs_what_is_not_a_row_and_is_fenced() {
+    use meridian_lake::store::{
+        Assessment, ClosedDayAmendment, CONTROL_ALIAS, CONTROL_ASSESSMENT, CONTROL_CLOSED_DAY,
+        CONTROL_PRIORITY,
+    };
+    let (url, writer) = isolated("lake-control");
+    assert_eq!(writer.adopt().unwrap(), 1);
+    writer
+        .assess(&[Assessment {
+            dataset: "d-1".into(),
+            sequence: 1,
+            row_key: "k".into(),
+            version: 1,
+            state: 3,
+            reasons: vec![1],
+            by_instance: "signal-1".into(),
+            at_ns: 1,
+        }])
+        .unwrap();
+    writer
+        .amend_closed_day(&[ClosedDayAmendment {
+            dataset: "d-1".into(),
+            sequence: 1,
+            closed_day: None,
+            why: "calendar 2 applied".into(),
+            at_ns: 2,
+        }])
+        .unwrap();
+    let priority = SourcePriority {
+        data_type: "quote".into(),
+        updated_at_ns: 3,
+        ..Default::default()
+    };
+    writer.set_priority(&priority, 0).unwrap().unwrap();
+    writer.keep_alias("INS-OLD", "INS-NEW", 4).unwrap();
+    writer.keep_alias("INS-OLD", "INS-NEW", 5).unwrap();
+    let control = writer
+        .read_changes(meridian_changes::CONTROL, 0, meridian_changes::PAGE_MOST)
+        .unwrap();
+    let kinds: Vec<&str> = control.changes.iter().map(|c| c.kind.as_str()).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            CONTROL_ASSESSMENT,
+            CONTROL_CLOSED_DAY,
+            CONTROL_PRIORITY,
+            CONTROL_ALIAS
+        ]
+    );
+    assert_eq!((control.head, control.lowest_kept), (4, 1));
+    let paged = writer
+        .read_changes(meridian_changes::CONTROL, 1, 1)
+        .unwrap();
+    assert_eq!(
+        paged.changes.len(),
+        1,
+        "a page of one byte holds one change"
+    );
+    assert_eq!(paged.changes[0].sequence, 2);
+    let standby = PostgresStore::connect(&url, 1).unwrap();
+    standby
+        .take_over(&meridian_changes::TookOver::unnamed("a test"))
+        .unwrap();
+    let refused = writer.keep_alias("INS-A", "INS-B", 6).unwrap_err();
+    assert!(
+        refused.to_string().starts_with(meridian_changes::FENCED),
+        "{refused}"
+    );
+    standby.keep_alias("INS-A", "INS-B", 6).unwrap();
+    let after = standby
+        .read_changes(meridian_changes::CONTROL, 4, meridian_changes::PAGE_MOST)
+        .unwrap();
+    assert_eq!(after.changes.len(), 1);
+    assert_eq!(after.changes[0].epoch, 2);
 }

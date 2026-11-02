@@ -2656,7 +2656,28 @@ fn a_deposed_conductors_commit_is_refused_after_a_takeover_and_takes_no_sequence
     };
     writer.put_account(&account("ACC-A")).unwrap();
     let standby = PostgresStore::connect(&url, 1).unwrap();
-    assert_eq!(standby.take_over().unwrap(), 2);
+    assert_eq!(
+        standby
+            .take_over(&meridian_changes::TookOver::unnamed("a test"))
+            .unwrap(),
+        2
+    );
+    // The takeover is its own record, in its own transaction with the
+    // epoch it raised (step 3b, `WriterTookOver`).
+    let took = {
+        let url = url.clone();
+        let read = move || {
+            let mut held = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+            let row = held.query_one("SELECT why, coalesce(array_length(partitions, 1), 0) FROM config_writer_took_over WHERE epoch = 2", &[]).unwrap();
+            (row.get::<_, String>(0), row.get::<_, i32>(1))
+        };
+        read()
+    };
+    assert_eq!(took.0, "a test");
+    assert!(
+        took.1 >= 2,
+        "the partitions it took, control among them: {took:?}"
+    );
     let refused = writer.put_account(&account("ACC-B")).unwrap_err();
     assert!(
         refused.to_string().contains(meridian_changes::FENCED),

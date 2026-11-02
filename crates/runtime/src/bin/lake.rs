@@ -97,10 +97,7 @@ fn run() -> Result<(), String> {
     // The deployment every change is made in, and the writer's epoch,
     // adopted before the first batch (step 3a; ruling 1060).
     meridian_changes::set_origin(&var("MERIDIAN_DEPLOYMENT_ID").unwrap_or_default());
-    let epoch = store
-        .adopt()
-        .map_err(|failed| format!("the lake could not adopt its epoch: {failed}"))?;
-    tracing::info!(epoch, "the lake writes under its epoch");
+    let member = meridian_runtime::member::Member::from_env("lake", Some("lake"))?;
     let instance_id = var("MERIDIAN_INSTANCE_ID").unwrap_or_else(|| "lake-1".into());
     // How many whole answers are built at once (the chart's
     // lake.maxConcurrentAnswers; rulings 957, 958): refused, not guessed,
@@ -115,6 +112,29 @@ fn run() -> Result<(), String> {
 
     on_runtime(async {
         let bus = bus_from_env(&instance_id).await?;
+        // A standby waits here (step 3b): following the writer's change log,
+        // serving nothing, until it takes the lease. With no lease -- the
+        // tolerant default, one member -- it writes at once, as it always has.
+        let holding = member.wait_to_write(&bus).await?;
+        let epoch = tokio::task::block_in_place(|| {
+            holding.epoch(
+                || {
+                    store
+                        .adopt()
+                        .map_err(|failed| format!("the lake could not adopt its epoch: {failed}"))
+                },
+                |by| {
+                    store
+                        .take_over(by)
+                        .map_err(|failed| format!("the lake could not take over: {failed}"))
+                },
+            )
+        })?;
+        tracing::info!(epoch, "the lake writes under its epoch");
+        let watched = Arc::clone(&store);
+        holding.keep(epoch, move || {
+            watched.head_epoch().map_err(|failed| failed.to_string())
+        });
         // Every handler and subscription in place before this returns.
         let lake = meridian_lake::service::serve(bus.clone(), Arc::clone(&store), clock());
         lake.build_at_most(answers_at_once);
@@ -136,6 +156,7 @@ fn run() -> Result<(), String> {
         ready.serving();
         shutdown().await;
         tracing::info!("stopping");
+        holding.release().await;
         Ok(())
     })
 }

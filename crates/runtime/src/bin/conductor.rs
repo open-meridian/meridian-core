@@ -169,14 +169,11 @@ fn run() -> Result<(), String> {
                     })
                 },
             )?;
-            // The deployment every change is made in, its time, and the
-            // writer's epoch, adopted before it serves (step 3a; ruling 1060).
+            // The deployment every change is made in and its time; the
+            // writer's epoch is adopted, or taken over, once this member may
+            // write (step 3a; step 3b).
             meridian_changes::set_origin(&var("MERIDIAN_DEPLOYMENT_ID").unwrap_or_default());
             meridian_changes::set_clock(clock());
-            let epoch = store.adopt().map_err(|failed| {
-                format!("the configuration store could not adopt its epoch: {failed}")
-            })?;
-            tracing::info!(epoch, "the configuration store writes under its epoch");
             let store = Arc::new(store);
             logged = Some((url, Arc::clone(&store)));
             store as Arc<dyn meridian_config::Store>
@@ -190,7 +187,11 @@ fn run() -> Result<(), String> {
         }
     };
 
-    install_named_administrator(store.as_ref());
+    // A standby conductor writes nothing and asks the platform nothing until
+    // it holds the lease (decisions/011: a standby is not a second
+    // conductor). With no lease, the one conductor writes at once.
+    let member =
+        meridian_runtime::member::Member::from_env("conductor", logged.as_ref().map(|_| "config"))?;
 
     let instance_id = var("MERIDIAN_INSTANCE_ID").unwrap_or_else(|| "conductor-1".into());
     let public_key_pem = key.public_key_pem().map_err(|failed| failed.to_string())?;
@@ -199,6 +200,31 @@ fn run() -> Result<(), String> {
     // The store is borrowed, never moved in, so it outlives the runtime
     // (meridian_runtime::on_runtime).
     on_runtime(async {
+        let bus = bus_from_env(&instance_id).await?;
+        let holding = member.wait_to_write(&bus).await?;
+        if let Some((_, postgres)) = logged.as_ref() {
+            let epoch = tokio::task::block_in_place(|| {
+                holding.epoch(
+                    || {
+                        postgres.adopt().map_err(|failed| {
+                            format!("the configuration store could not adopt its epoch: {failed}")
+                        })
+                    },
+                    |by| {
+                        postgres.take_over(by).map_err(|failed| {
+                            format!("the configuration store could not take over: {failed}")
+                        })
+                    },
+                )
+            })?;
+            tracing::info!(epoch, "the configuration store writes under its epoch");
+            let watched = Arc::clone(postgres);
+            holding.keep(epoch, move || {
+                watched.head_epoch().map_err(|failed| failed.to_string())
+            });
+        }
+        tokio::task::block_in_place(|| install_named_administrator(store.as_ref()));
+
         // W5.24, before anything asks the platform for anything: a fresh
         // deployment has generated a key nothing has registered, and an
         // enrolment code is what registers it. Never fatal. A deployment
@@ -209,7 +235,6 @@ fn run() -> Result<(), String> {
             enrol(&platform, &public_key_pem, &key_path).await,
         ));
 
-        let bus = bus_from_env(&instance_id).await?;
         // The change log, served a page at a time and its tail published
         // after each commit (step 3a; topics.md, "Component topics").
         if let Some((url, postgres)) = logged.take() {
@@ -374,6 +399,7 @@ fn run() -> Result<(), String> {
 
         shutdown().await;
         tracing::info!("stopping");
+        holding.release().await;
         Ok(())
     })
 }

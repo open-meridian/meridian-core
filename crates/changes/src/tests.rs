@@ -85,6 +85,7 @@ fn a_follower_given_the_log_in_any_page_split_applies_every_change_in_order() {
                     head: 200,
                     lowest_kept: 1,
                     epoch: 1,
+                    after_sequence: 0,
                 })
             };
             let mut applied = Vec::new();
@@ -107,6 +108,7 @@ fn a_log_out_of_order_is_refused_never_inferred_over() {
             head: 3,
             lowest_kept: 1,
             epoch: 1,
+            after_sequence: 0,
         })
     };
     assert!(catch_up(read, 0, |_| {}).is_err());
@@ -165,6 +167,7 @@ async fn read_changes_is_served_on_its_component_topic() {
                 head: 2,
                 lowest_kept: 1,
                 epoch: 1,
+                after_sequence: 0,
             })
         }
     }

@@ -2290,7 +2290,39 @@ chart-check:
 		echo "$$said" | grep -q "$$store.replicaCount is 2; it takes 0 or 1.*ruling 1060" \
 			|| { echo "chart-check FAILED: $$store.replicaCount=2 was refused without saying why: $$said" >&2; exit 1; }; \
 	done
-	@echo "chart-check OK: one writer per store (ruling 1060); the lake's whole answers at once, 2 by default and 1 to 8 alone, and its mmap threshold, 128 KiB by default and whole bytes alone; the platform's keys on the conductor alone, as files, only where the chart carries some, its current key by default; four components, the dashboard and the three ways it signs people in, the key and the settings key on the conductor alone, both key paths, refusals, migrations, no pinned uid, a plugin held to its side of the pod, its front door open to the dashboard alone, an Ingress only when asked for and HTTPS alone unless plain HTTP is, development only when asked for, the live shape there alone, a backup only when sealed and placed, and nothing an upgrade leaves behind"
+	@# Step 3b: a warm standby is a value. With `<component>.standby: 1` a
+	@# component runs two members spread over nodes under the members' lease
+	@# right, a PodDisruptionBudget, a surging rollout and its lease named;
+	@# 2 is refused, and the default renders no lease, no account and no
+	@# budget. Every stateless component tolerates a lost node for 30 s.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check --set key.generate=false --set key.existingSecret=k"; \
+	plain="$$($(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null)"; \
+	for absent in "kind: PodDisruptionBudget" "MERIDIAN_LEASE_NAME" "coordination.k8s.io"; do \
+		echo "$$plain" | grep -q "$$absent" \
+			&& { echo "chart-check FAILED: the default profile renders $$absent; standbys are configuration (ruling 1052)" >&2; exit 1; }; \
+	done; \
+	echo "$$plain" | grep -q "tolerationSeconds: 30" \
+		|| { echo "chart-check FAILED: no component tolerates a lost node for 30 s (question 22)" >&2; exit 1; }; \
+	for store in lake bor instrument street conductor launcher; do \
+		made="$$($(HELM_TEMPLATE) check deploy/chart $$base --set $$store.standby=1 2>&1)" \
+			|| { echo "chart-check FAILED: $$store.standby=1 did not render: $$made" >&2; exit 1; }; \
+		echo "$$made" | grep -A1 "name: MERIDIAN_LEASE_NAME" | grep -q "check-meridian-runtime-$$store" \
+			|| { echo "chart-check FAILED: $$store.standby=1 names no lease" >&2; exit 1; }; \
+		echo "$$made" | grep -q "name: check-meridian-runtime-$$store$$" \
+			&& echo "$$made" | grep -q "kind: PodDisruptionBudget" \
+			&& echo "$$made" | grep -q "topologyKey: kubernetes.io/hostname" \
+			&& echo "$$made" | grep -q "resources: \[\"leases\"\]" \
+			|| { echo "chart-check FAILED: $$store.standby=1 lacks its budget, spread or lease right" >&2; exit 1; }; \
+		said="$$($(HELM_TEMPLATE) check deploy/chart $$base --set $$store.standby=2 2>&1 >/dev/null)" \
+			&& { echo "chart-check FAILED: $$store.standby=2 rendered; a count CI does not test is refused (ruling 1047)" >&2; exit 1; }; \
+		echo "$$said" | grep -q "$$store.standby is 2; it takes 0 or 1" \
+			|| { echo "chart-check FAILED: $$store.standby=2 was refused without saying why: $$said" >&2; exit 1; }; \
+	done; \
+	said="$$($(HELM_TEMPLATE) check deploy/chart --set deployment.id=DEP-check --set conductor.standby=1 2>&1 >/dev/null)" \
+		&& { echo "chart-check FAILED: a conductor standby rendered with a generated key no second node can mount" >&2; exit 1; }; \
+	echo "$$said" | grep -q "key.existingSecret for a conductor standby" \
+		|| { echo "chart-check FAILED: a conductor standby with a generated key was refused without saying why: $$said" >&2; exit 1; }
+	@echo "chart-check OK: one writer per store (ruling 1060), a warm standby by value with its lease, budget and spread, none by default, 30 s node tolerations; the lake's whole answers at once, 2 by default and 1 to 8 alone, and its mmap threshold, 128 KiB by default and whole bytes alone; the platform's keys on the conductor alone, as files, only where the chart carries some, its current key by default; four components, the dashboard and the three ways it signs people in, the key and the settings key on the conductor alone, both key paths, refusals, migrations, no pinned uid, a plugin held to its side of the pod, its front door open to the dashboard alone, an Ingress only when asked for and HTTPS alone unless plain HTTP is, development only when asked for, the live shape there alone, a backup only when sealed and placed, and nothing an upgrade leaves behind"
 
 lint:
 	@$(DOCKER) build -f Dockerfile.rust --target lint $(VERDICT) . >/dev/null 2>&1 \

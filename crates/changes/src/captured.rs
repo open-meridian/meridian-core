@@ -294,10 +294,17 @@ impl Spec {
     }
 
     /// Take the store over: raise the epoch of its partition and its control
-    /// partition in one transaction, and answer the new one, which the
-    /// writer taking over adopts. Every commit under the old one fails.
-    pub fn take_over(&self, client: &mut impl GenericClient) -> Result<u64, postgres::Error> {
-        let epoch: i64 = client
+    /// partition, and record who took it over and why (`WriterTookOver`, in
+    /// `{prefix}_writer_took_over`), in one transaction; answer the new
+    /// epoch, which the writer taking over adopts. Every commit under the
+    /// old one fails.
+    pub fn take_over(
+        &self,
+        client: &mut impl GenericClient,
+        by: &crate::TookOver,
+    ) -> Result<u64, postgres::Error> {
+        let mut tx = client.transaction()?;
+        let epoch: i64 = tx
             .query_one(
                 &format!(
                     "WITH raised AS (
@@ -306,6 +313,35 @@ impl Spec {
                      SELECT max(epoch) FROM raised",
                     head = self.head
                 ),
+                &[&self.partition],
+            )?
+            .get(0);
+        let partitions = vec![self.partition.to_string(), CONTROL.to_string()];
+        tx.execute(
+            &format!(
+                "INSERT INTO {}_writer_took_over (epoch, member, partitions, why, origin, at_ns)
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+                self.prefix
+            ),
+            &[
+                &epoch,
+                &by.member,
+                &partitions,
+                &by.why,
+                &origin(),
+                &by.at_ns,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(epoch as u64)
+    }
+
+    /// The partition's epoch now, as its head row says: what a writer
+    /// compares its own with, to step down once another took it over.
+    pub fn head_epoch(&self, client: &mut impl GenericClient) -> Result<u64, postgres::Error> {
+        let epoch: i64 = client
+            .query_one(
+                &format!("SELECT epoch FROM {} WHERE partition = $1", self.head),
                 &[&self.partition],
             )?
             .get(0);
@@ -439,6 +475,7 @@ impl Spec {
             head,
             lowest_kept,
             epoch,
+            after_sequence: 0,
         })
     }
 }
@@ -520,10 +557,12 @@ impl Tail {
                 let page = spec
                     .read(&mut client, spec.partition, after, crate::PAGE_MOST)
                     .map_err(|e| e.to_string())?;
-                if let Some(last) = page.changes.last() {
-                    after = last.sequence;
+                // One transaction is one change here (each transaction's
+                // rows share its sequence), so each is its own page.
+                for change in &page.changes {
+                    crate::publish(bus, domain, after, std::slice::from_ref(change));
+                    after = change.sequence;
                 }
-                crate::publish(bus, domain, &page.changes);
                 if page.changes.is_empty() || after >= page.head {
                     break;
                 }

@@ -226,6 +226,75 @@ pub struct Assessment {
     pub at_ns: i64,
 }
 
+/// The lake's control partition's kinds (step 3b; ruling 1062's carried
+/// item): what is not a dataset's row, in the order it was committed, so a
+/// follower's quality states, flags, priorities and aliases match the
+/// writer's.
+pub const CONTROL_ASSESSMENT: &str = "assessment";
+pub const CONTROL_CLOSED_DAY: &str = "closed_day_amendment";
+pub const CONTROL_PRIORITY: &str = "meridian.v1.SourcePriority";
+pub const CONTROL_ALIAS: &str = "alias";
+
+/// An assessment as its control change's body.
+pub fn assessment_body(assessment: &Assessment) -> Vec<u8> {
+    serde_json::json!({
+        "dataset": assessment.dataset,
+        "sequence": assessment.sequence,
+        "row_key": assessment.row_key,
+        "version": assessment.version,
+        "state": assessment.state,
+        "reasons": assessment.reasons,
+        "by_instance": assessment.by_instance,
+        "at_ns": assessment.at_ns,
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// A closed-day amendment as its control change's body: the flag as
+/// re-checked, encoded, where the day is still closed.
+pub fn amendment_body(amendment: &ClosedDayAmendment) -> Vec<u8> {
+    use base64::Engine as _;
+    use prost::Message as _;
+    serde_json::json!({
+        "dataset": amendment.dataset,
+        "sequence": amendment.sequence,
+        "closed_day": amendment.closed_day.as_ref().map(|check| {
+            base64::engine::general_purpose::STANDARD.encode(check.encode_to_vec())
+        }),
+        "why": amendment.why,
+        "at_ns": amendment.at_ns,
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// An alias kept as its control change's body.
+pub fn alias_body(replaced: &str, stays: &str, at_ns: i64) -> Vec<u8> {
+    serde_json::json!({ "replaced": replaced, "stays": stays, "at_ns": at_ns })
+        .to_string()
+        .into_bytes()
+}
+
+/// A control change, as the log carries it.
+pub fn control_change(
+    sequence: u64,
+    epoch: u64,
+    at_ns: i64,
+    kind: &str,
+    body: Vec<u8>,
+) -> meridian_changes::Change {
+    meridian_changes::Change {
+        partition: meridian_changes::CONTROL.to_string(),
+        sequence,
+        epoch,
+        origin: meridian_changes::origin().to_string(),
+        committed_at_ns: at_ns,
+        kind: kind.to_string(),
+        body,
+    }
+}
+
 /// A state's place in the escalation: unspecified reads as valid.
 pub fn rank(state: i32) -> i32 {
     if state == QualityState::Suspicious as i32 || state == QualityState::Invalid as i32 {
@@ -521,9 +590,14 @@ pub trait Store: Send + Sync {
     fn epoch(&self) -> u64;
 
     /// Take the lake over: raise the epoch of the `control` partition and
-    /// of every dataset's head in one transaction, and adopt it. Every batch
+    /// of every dataset's head in one transaction, record who took it over
+    /// and why (step 3b, `WriterTookOver`), and adopt it. Every batch
     /// another writer commits under the old one is refused.
-    fn take_over(&self) -> Result<u64>;
+    fn take_over(&self, by: &meridian_changes::TookOver) -> Result<u64>;
+
+    /// The `control` partition's epoch now, as the record says (step 3b): a
+    /// writer steps down once it moves past its own.
+    fn head_epoch(&self) -> Result<u64>;
 
     /// A page of `partition`'s change log after `after` (step 3a): its rows
     /// in sequence, each range it served and did not keep as one change, at

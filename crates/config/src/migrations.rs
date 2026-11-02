@@ -195,6 +195,12 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0028_change_log.sql"),
         then: None,
     },
+    Migration {
+        version: 29,
+        name: "writer_took_over",
+        sql: include_str!("../migrations/0029_writer_took_over.sql"),
+        then: None,
+    },
 ];
 
 /// Migration 18 (contract v22; W11.21, decisions/031): each instance holding
