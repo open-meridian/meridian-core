@@ -7,7 +7,7 @@ name: gate-images
 description: Load the images this run's images and compile jobs built.
 inputs:
   artifacts:
-    description: The artifacts holding them, space-separated (images, cluster-images, test-images).
+    description: The artifacts holding them, space-separated (images, cluster-images, test-images, settings-binary).
     required: true
   names:
     description: The images, by their names in the Makefile's `make ci-images`, space-separated.

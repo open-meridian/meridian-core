@@ -309,12 +309,21 @@ jobs:
 
       - name: Save the images
         working-directory: workspace/meridian-core
-        run: tools/ci-images.sh save "$RUNNER_TEMP/test-images" tests settings-binary
+        run: |
+          tools/ci-images.sh save "$RUNNER_TEMP/test-images" tests
+          tools/ci-images.sh save "$RUNNER_TEMP/settings-binary" settings-binary
 
       - uses: actions/upload-artifact@v4
         with:
           name: test-images
           path: ${{ runner.temp }}/test-images
+          compression-level: 0
+          retention-days: 1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: settings-binary
+          path: ${{ runner.temp }}/settings-binary
           compression-level: 0
           retention-days: 1
 
@@ -332,19 +341,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - stage: tests
-            artifacts: images test-images
-            images: runtime tests
+          # Stages share runners, each leg running its stages in order: the
+          # organisation runs at most 20 jobs at once (GitHub Free, ruling
+          # 1073), and a run keeps room for a plugin's or the SDK's beside
+          # it. A leg a stage again where more run at once.
           - stage: settings-page
-            artifacts: images test-images
+            artifacts: images settings-binary
             images: runtime settings-binary
-          - stage: dashboards
-            artifacts: images
-            images: runtime interop
-          # Three short stages on one runner, in order: the organisation runs
-          # at most 20 jobs at once (GitHub Free), and a run's stages, harness
-          # groups and cluster runs together came to 21. A leg each again
-          # where more run at once.
+          - stage: tests dashboards
+            artifacts: images test-images
+            images: runtime tests interop
           - stage: sdk first-run image
             artifacts: images
             images: runtime interop version-check

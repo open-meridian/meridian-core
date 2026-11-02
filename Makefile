@@ -432,6 +432,12 @@ E2E_BACKEND_SAID = $(if $(filter oidc,$(E2E_BACKEND)), signing people in through
 
 e2e-first-run: network runtime-image
 	@rm -f .e2e-first-run.log
+	@# The broker's development configuration, as every compose suite writes
+	@# it: generated, never committed. This one read whatever an earlier
+	@# stage had left, until a stage ran on a runner of its own (ruling 1069)
+	@# and its broker stopped at start, finding none.
+	@$(BROKER_CONFIG) --instances /w/deploy/nats/dev-instances.json \
+		--dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf
 	@$(E2E_FIRST_RUN) --profile e2e down -v --remove-orphans >>.e2e-first-run.log 2>&1 || true
 	@set -e; \
 	$(E2E_FIRST_RUN) up -d postgres nats fr-pki fr-kube fr-platform fake-idp >>.e2e-first-run.log 2>&1; \
