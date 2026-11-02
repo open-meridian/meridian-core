@@ -7,6 +7,13 @@
 #
 # The two projects meet on a shared network. Either may create it, so neither
 # has to come up first.
+#
+# Every component runs the one runtime image, named (MERIDIAN_RUNTIME_IMAGE,
+# which the Makefile sets), and the tests the one image of test binaries
+# (MERIDIAN_TESTS_IMAGE): the gate builds each once and every target runs it
+# (ruling 1068). The make targets build them before compose starts anything,
+# so compose builds nothing of its own; `docker compose up --build` still
+# builds them from here.
 
 services:
   postgres:
@@ -73,6 +80,7 @@ services:
   # The street store. Its own process, its own database credential, and no key:
   # it does not talk to the platform, which is why it cannot.
   street:
+    image: ${MERIDIAN_RUNTIME_IMAGE:-meridian-runtime:local}
     build:
       context: .
       target: runtime
@@ -93,6 +101,7 @@ services:
   # sharing no key, join or transaction with it (decisions/012); here in the
   # same database, its tables prefixed book_.
   bor:
+    image: ${MERIDIAN_RUNTIME_IMAGE:-meridian-runtime:local}
     build:
       context: .
       target: runtime
@@ -114,6 +123,7 @@ services:
   # store beside the street's and the book's (decisions/032); here in the
   # same database, its tables prefixed lake_. No key and no platform address.
   lake:
+    image: ${MERIDIAN_RUNTIME_IMAGE:-meridian-runtime:local}
     build:
       context: .
       target: runtime
@@ -134,6 +144,7 @@ services:
   # process, no store and no key; it reads for a job's client through the
   # stores, the lake told its instance.
   analytics:
+    image: ${MERIDIAN_RUNTIME_IMAGE:-meridian-runtime:local}
     build:
       context: .
       target: runtime
@@ -151,6 +162,7 @@ services:
   # address, no network beyond the broker. Decision 011 moved all three to the
   # conductor below.
   instrument:
+    image: ${MERIDIAN_RUNTIME_IMAGE:-meridian-runtime:local}
     build:
       context: .
       target: runtime
@@ -172,6 +184,7 @@ services:
   # The conductor. The key, the platform connection, and nothing else: no database,
   # because what the platform published can be fetched again.
   conductor:
+    image: ${MERIDIAN_RUNTIME_IMAGE:-meridian-runtime:local}
     build:
       context: .
       target: runtime
@@ -203,6 +216,7 @@ services:
   # own; it reads who may do what from the conductor over the broker, as the
   # instance dashboard-1 with the admin role's grants.
   dashboard:
+    image: ${MERIDIAN_RUNTIME_IMAGE:-meridian-runtime:local}
     build:
       context: .
       target: runtime
@@ -258,6 +272,7 @@ services:
   # network namespace rather than the other way round, because the sidecar
   # binds loopback and holds the broker credential.
   sidecar:
+    image: ${MERIDIAN_RUNTIME_IMAGE:-meridian-runtime:local}
     build:
       context: .
       target: runtime
@@ -294,6 +309,7 @@ services:
   # nothing. Each speaks to the bus as its own instance.
   sidecar-operations:
     profiles: [interop]
+    image: ${MERIDIAN_RUNTIME_IMAGE:-meridian-runtime:local}
     build:
       context: .
       target: runtime
@@ -313,6 +329,7 @@ services:
 
   sidecar-operations-unscoped:
     profiles: [interop]
+    image: ${MERIDIAN_RUNTIME_IMAGE:-meridian-runtime:local}
     build:
       context: .
       target: runtime
@@ -360,6 +377,7 @@ services:
 
   sidecar-book:
     profiles: [book]
+    image: ${MERIDIAN_RUNTIME_IMAGE:-meridian-runtime:local}
     build:
       context: .
       target: runtime
@@ -378,6 +396,7 @@ services:
 
   sidecar-book-operations:
     profiles: [book]
+    image: ${MERIDIAN_RUNTIME_IMAGE:-meridian-runtime:local}
     build:
       context: .
       target: runtime
@@ -402,6 +421,7 @@ services:
 
   sidecar-book-reporting:
     profiles: [book]
+    image: ${MERIDIAN_RUNTIME_IMAGE:-meridian-runtime:local}
     build:
       context: .
       target: runtime
@@ -421,6 +441,7 @@ services:
 
   sidecar-book-unscoped:
     profiles: [book]
+    image: ${MERIDIAN_RUNTIME_IMAGE:-meridian-runtime:local}
     build:
       context: .
       target: runtime
@@ -481,6 +502,7 @@ services:
   # compiles the workspace again.
   tests:
     profiles: [tests]
+    image: ${MERIDIAN_TESTS_IMAGE:-meridian-core-tests:local}
     build:
       context: .
       dockerfile: Dockerfile.rust
@@ -679,6 +701,7 @@ services:
   # wizard applies one, which is the only way the wizard can run at all.
   conductor-first-run:
     profiles: [first-run]
+    image: ${MERIDIAN_RUNTIME_IMAGE:-meridian-runtime:local}
     build:
       context: .
       target: runtime
@@ -702,6 +725,7 @@ services:
 
   dashboard-first-run:
     profiles: [first-run]
+    image: ${MERIDIAN_RUNTIME_IMAGE:-meridian-runtime:local}
     build:
       context: .
       target: runtime
@@ -718,6 +742,7 @@ services:
 
   first-run:
     profiles: [first-run]
+    image: ${MERIDIAN_RUNTIME_IMAGE:-meridian-runtime:local}
     build:
       context: .
       target: runtime
