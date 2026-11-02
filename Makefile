@@ -708,7 +708,12 @@ E2E_K3D_HTTP ?= 80
 # .e2e-cluster.log when it fails: the backup run's own for that run. CI run
 # 38188494317's backup failure logged no pod at all, read from meridian-e2e,
 # which that run never makes.
-E2E_K3D_NAMESPACE = $(if $(filter e2e-cluster-backup,$(E2E_CLUSTER_TARGET)),$(E2E_BACKUP_NAMESPACE),$(E2E_CLUSTER_NAMESPACE))
+E2E_K3D_NAMESPACE = $(if $(filter e2e-cluster-backup,$(E2E_CLUSTER_TARGET)),$(E2E_BACKUP_NAMESPACE),$(if $(filter e2e-cluster-failover e2e-cluster-scaled,$(E2E_CLUSTER_TARGET)),$(E2E_FAILOVER_NAMESPACE),$(E2E_CLUSTER_NAMESPACE)))
+# Agents beside the server, and the zones they are labelled into, one each
+# in order (step 3b): the HA configuration's runs make three, in three
+# zones. None by default: one node, as a desktop runs.
+E2E_K3D_AGENTS ?= 0
+E2E_K3D_ZONES ?=
 
 # `ready <what> <command...>`: the command, every two seconds until it
 # succeeds or E2E_K3D_READY_SECONDS have passed.
@@ -734,8 +739,13 @@ e2e-cluster-k3d:
 		|| docker network create --subnet $(E2E_K3D_SUBNET) --gateway $(E2E_K3D_GATEWAY) $(E2E_K3D_NETWORK) >/dev/null
 	@$(K3D) cluster delete $(E2E_K3D_CLUSTER) >/dev/null 2>&1 || true
 	@echo "e2e-cluster-k3d: a cluster for $(E2E_CLUSTER_TARGET), on $(E2E_K3S_IMAGE)"
-	@: >.e2e-k3d.log; made=; for attempt in 1 2; do \
-	  if $(K3D) cluster create $(E2E_K3D_CLUSTER) --image $(E2E_K3S_IMAGE) --network $(E2E_K3D_NETWORK) \
+	@: >.e2e-k3d.log; made=; nodes=; at=0; \
+	if [ "$(E2E_K3D_AGENTS)" != 0 ]; then nodes="--agents $(E2E_K3D_AGENTS)"; fi; \
+	for zone in $(E2E_K3D_ZONES); do \
+	  nodes="$$nodes --k3s-node-label topology.kubernetes.io/zone=$$zone@agent:$$at"; at=$$((at + 1)); \
+	done; \
+	for attempt in 1 2; do \
+	  if $(K3D) cluster create $(E2E_K3D_CLUSTER) --image $(E2E_K3S_IMAGE) --network $(E2E_K3D_NETWORK) $$nodes \
 		--host-alias $(E2E_K3D_GATEWAY):host.docker.internal \
 		--api-port $(E2E_K3D_API) -p "$(E2E_K3D_HTTP):80@loadbalancer" \
 		--kubeconfig-update-default=false --kubeconfig-switch-context=false \
@@ -833,6 +843,51 @@ FOOTPRINT_PEAKS ?= $(wildcard .e2e-footprint-peak*.txt)
 footprint-judge:
 	@test -n "$(FOOTPRINT_PEAKS)" || { echo "footprint-judge: no job's peak to judge; set FOOTPRINT_PEAKS=<files>" >&2; exit 1; }
 	@$(PY) tools/footprint.py judge --baseline deploy/footprint-baseline.yaml $(FOOTPRINT_PEAKS)
+
+# Failure classes injected and timed (step 3b; spec/a-deployment-scales-out-
+# and-fails-over-by-configuration sections 10 and 15; plan Track 7): the
+# chart installed in a profile -- PROFILE=tolerant, the default, one member
+# each; PROFILE=ha, a warm standby per writer over three zones -- and each
+# FAILURE= class injected (comma-separated; the profile's all by default),
+# its recovery measured and held to its bound (rulings 1048, 1056), a
+# CLAIM line each, kept in .e2e-failover-claims.jsonl. e2e-cluster-scaled
+# is the HA configuration installed and held to its shape. Each refuses a
+# kube context that is not a k3d or kind cluster's; the HA ones need three
+# agents labelled into zones:
+#
+#   make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=tolerant E2E_K3D_HTTP=18081
+#   make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha \
+#     E2E_K3D_AGENTS=3 E2E_K3D_ZONES="zone-a zone-b zone-c"
+#
+# No platform. E2E_FAILOVER_RUNTIME names a runtime image already built
+# instead of building it.
+E2E_FAILOVER_NAMESPACE ?= meridian-failover-e2e
+E2E_FAILOVER_RUNTIME ?=
+PROFILE ?= tolerant
+FAILURE ?=
+e2e-cluster-scaled:
+	@$(MAKE) --no-print-directory e2e-cluster-failover PROFILE=scaled FAILURE=
+
+e2e-cluster-failover:
+	@ctx="$$(kubectl config current-context 2>/dev/null)"; \
+	case "$$ctx" in k3d-*|kind-*) ;; \
+	*) echo "e2e-cluster-failover: the kube context is '$$ctx', which is not a k3d or kind cluster's. It stops, pauses and cuts nodes: run it on a cluster made for it, make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover" >&2; exit 1;; esac
+	@$(if $(E2E_FAILOVER_RUNTIME),:,$(DOCKER) build -q -t $(RUNTIME_IMAGE) . >/dev/null)
+	@$(if $(E2E_FAILOVER_RUNTIME),:,$(DOCKER) build -q --target analytics -t $(ANALYTICS_IMAGE) . >/dev/null)
+	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(or $(E2E_FAILOVER_RUNTIME),$(RUNTIME_IMAGE)) $(if $(E2E_FAILOVER_RUNTIME),,$(ANALYTICS_IMAGE)) postgres:16-alpine,:)
+	@kubectl delete namespace $(E2E_FAILOVER_NAMESPACE) --ignore-not-found --wait >/dev/null 2>&1
+	@rm -f .e2e-failover-claims.jsonl
+	@E2E_NAMESPACE=$(E2E_FAILOVER_NAMESPACE) E2E_IMAGE=$(or $(E2E_FAILOVER_RUNTIME),$(RUNTIME_IMAGE)) \
+	 PROFILE=$(PROFILE) FAILURE=$(FAILURE) E2E_K3D_CLUSTER=$(E2E_K3D_CLUSTER) E2E_K3D_SUBNET=$(E2E_K3D_SUBNET) \
+		$(PY) e2e/failover/run.py; \
+	  held=$$?; \
+	  if [ $$held -ne 0 ] || [ -n "$(E2E_CLUSTER_KEEP)" ]; then \
+	    echo "e2e-cluster-failover: the namespace is left for reading. Remove it with:" >&2; \
+	    echo "  kubectl delete namespace $(E2E_FAILOVER_NAMESPACE)" >&2; \
+	  else \
+	    kubectl delete namespace $(E2E_FAILOVER_NAMESPACE) --wait >/dev/null 2>&1; \
+	  fi; \
+	  exit $$held
 
 HELM := docker run --rm -v "$(CURDIR)":/w -w /w alpine/helm:3.16.2
 # The chart declares the Kubernetes it runs on (Chart.yaml's kubeVersion,
