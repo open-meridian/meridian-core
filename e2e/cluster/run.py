@@ -1274,6 +1274,20 @@ def footprint(s):
     cluster's metrics, and the disk its record takes, each printed and held
     to the baseline's figure where the baseline has one."""
     print("F2: the footprint", flush=True)
+
+    def settled():
+        # Every workload of the release at its replicas, ready: the profile
+        # whole, so a pod still starting is never left out of the figures.
+        said = json.loads(kubectl("get", "deployments,statefulsets", "-o", "json") or "{}")
+        ours = [w for w in said.get("items", [])
+                if w["metadata"].get("labels", {}).get("app.kubernetes.io/instance") == RELEASE]
+        return ours and all((w.get("status", {}).get("readyReplicas") or 0) >= (w["spec"].get("replicas") or 0)
+                            for w in ours)
+
+    for _ in range(60):
+        if settled():
+            break
+        time.sleep(5)
     held = json.loads(kubectl("get", "pods", "-o", "json") or "{}").get("items", [])
     ours = {
         pod["metadata"]["name"]
