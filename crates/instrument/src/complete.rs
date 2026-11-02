@@ -878,6 +878,7 @@ pub fn keep_platform_answer(
         offered_at_ns: now_ns,
         valid_until_ns: 0,
         provenance: Vec::new(),
+        path: String::new(),
     };
     let mut offers = Vec::new();
     let class = asset_class_name(answer.asset_class);

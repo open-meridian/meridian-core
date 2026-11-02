@@ -322,6 +322,7 @@ impl PostgresStore {
                     offered_at_ns: record.record_time_ns,
                     valid_until_ns: 0,
                     provenance: Vec::new(),
+                    path: String::new(),
                 });
             }
             let entry = Version {
@@ -466,7 +467,7 @@ impl PostgresStore {
                         offered_at_ns, valid_until_ns, provenance
                    FROM instrument_offer
                   WHERE instrument_id = ANY($1)
-                  ORDER BY instrument_id, offered_at_ns, field, value",
+                  ORDER BY instrument_id, offered_at_ns, field, value, scheme, namespace",
                 &[&ids],
             )
             .map_err(unavailable)?
@@ -477,6 +478,12 @@ impl PostgresStore {
             };
             if let Some(&at) = index.get(&owner) {
                 let value: String = row.get(4);
+                // A term's path is kept in the scheme column (W3.23).
+                let path: String = if field == Field::Term {
+                    row.get(2)
+                } else {
+                    String::new()
+                };
                 instruments[at].offers.push(Offer {
                     field,
                     identifier: identifier_of(field, row.get(2), row.get(3), &value),
@@ -486,6 +493,7 @@ impl PostgresStore {
                     offered_at_ns: row.get(7),
                     valid_until_ns: row.get(8),
                     provenance: row.get(9),
+                    path,
                 });
             }
         }
@@ -555,7 +563,13 @@ impl PostgresStore {
             .map_err(unavailable)?;
         }
         for offer in &record.offers {
-            let (scheme, namespace, _) = parts_of(offer.identifier.as_ref());
+            let (mut scheme, namespace, _) = parts_of(offer.identifier.as_ref());
+            // A term offered (W3.23) keeps its template path where an
+            // identifier keeps its scheme: no column added, and the key
+            // tells two paths' offers apart.
+            if offer.field == Field::Term {
+                scheme = offer.path.clone();
+            }
             tx.execute(
                 "INSERT INTO instrument_offer
                         (instrument_id, field, scheme, namespace, value, source, instance_id,

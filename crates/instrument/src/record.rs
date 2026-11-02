@@ -23,8 +23,9 @@ pub const ISO_4217: &str = "ISO 4217";
 /// The held record as the wire carries it: its values with their sources, and
 /// beside them every offer, those this store derives itself included (W3.6).
 pub fn to_wire(instrument: &Instrument) -> PbInstrument {
-    let mut offers: Vec<OfferedValue> = instrument.offers.iter().map(offer_to_wire).collect();
-    offers.extend(derived_offers(instrument).iter().map(offer_to_wire));
+    let mut offers: Vec<OfferedValue> =
+        instrument.offers.iter().filter_map(offer_to_wire).collect();
+    offers.extend(derived_offers(instrument).iter().filter_map(offer_to_wire));
     let mut wire = PbInstrument {
         instrument_id: instrument.instrument_id.clone(),
         // Each with its window (contract v19, the plan's Q34): one that left
@@ -117,10 +118,14 @@ fn source_to_wire(source: &Source) -> InstrumentValueSource {
     }
 }
 
-fn offer_to_wire(offer: &Offer) -> OfferedValue {
-    OfferedValue {
+/// An offer as the wire carries it; `None` for a term offered at its
+/// template path (W3.23), which `InstrumentValue` has no member for until
+/// the contract gives it one: kept in the store, its provenance with it.
+fn offer_to_wire(offer: &Offer) -> Option<OfferedValue> {
+    Some(OfferedValue {
         value: Some(InstrumentValue {
             value: Some(match offer.field {
+                Field::Term => return None,
                 Field::AssetClass => {
                     instrument_value::Value::AssetClass(asset_class_value(&offer.value))
                 }
@@ -149,7 +154,7 @@ fn offer_to_wire(offer: &Offer) -> OfferedValue {
         }),
         instance_id: offer.instance_id.clone(),
         offered_at_ns: offer.offered_at_ns,
-    }
+    })
 }
 
 pub fn asked_to_wire(asked: &Asked) -> PbIdentifier {
@@ -191,6 +196,8 @@ pub fn field_to_wire(field: Field) -> InstrumentField {
         Field::InstrumentType => InstrumentField::InstrumentType,
         Field::MoneyMarketFund => InstrumentField::MoneyMarketFund,
         Field::BinaryEventContract => InstrumentField::BinaryEventContract,
+        // No member names a term until the contract gives it one.
+        Field::Term => InstrumentField::Unspecified,
     }
 }
 
@@ -275,6 +282,7 @@ fn derived(field: Field, value: String, instrument: &Instrument) -> Offer {
         offered_at_ns: instrument.record_time_ns,
         valid_until_ns: 0,
         provenance: Vec::new(),
+        path: String::new(),
     }
 }
 
