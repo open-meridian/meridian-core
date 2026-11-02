@@ -53,7 +53,8 @@ import time
 PROJECT = "meridian-core-archive"
 LOG = ".e2e-archive.log"
 COMPOSE = ["docker", "compose", "-p", PROJECT, "-f", ".harness/compose.yaml",
-           "-f", ".harness/plugins.yaml", "-f", "e2e/archive/stand-in.yaml"]
+           "-f", ".harness/plugins.yaml", "-f", "e2e/archive/stand-in.yaml",
+           "-f", "e2e/postgres-for-tests.yaml"]
 ENV = dict(os.environ, MERIDIAN_HARNESS_STAND_IN=os.path.abspath("e2e/plugin-page"))
 ARCHIVED = "activity/ACC-1/2019-03"
 RECENT = "activity/ACC-1/recent"

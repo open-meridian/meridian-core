@@ -50,7 +50,8 @@ PROJECT = "meridian-core-prepared"
 PEOPLE = "cat=Cat Ruiz"
 LOG = ".e2e-prepared.log"
 COMPOSE = ["docker", "compose", "-p", PROJECT, "-f", ".harness/compose.yaml",
-           "-f", ".harness/plugins.yaml", "-f", "e2e/prepared/stand-in.yaml"]
+           "-f", ".harness/plugins.yaml", "-f", "e2e/prepared/stand-in.yaml",
+           "-f", "e2e/postgres-for-tests.yaml"]
 ENV = dict(os.environ, MERIDIAN_HARNESS_PEOPLE=PEOPLE,
            MERIDIAN_HARNESS_STAND_IN=os.path.abspath("e2e/plugin-page"))
 INSTANCE = "area"
