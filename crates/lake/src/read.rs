@@ -802,7 +802,17 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
     let mut chosen: Vec<Observation> = Vec::new();
     let catching_up = matches!(read.when, When::After(_));
     let series_asked = read.all_series || !read.series_keys.is_empty();
+    // How many times each subject is still to be answered: its rows move
+    // into the answer at its last, and are copied only for one asked twice.
+    let mut still: BTreeMap<&String, usize> = BTreeMap::new();
     for subject in &read.subjects {
+        *still.entry(subject).or_default() += 1;
+    }
+    for subject in &read.subjects {
+        let last = still.get_mut(subject).is_some_and(|left| {
+            *left -= 1;
+            *left == 0
+        });
         // The kinds to answer: those asked, or those any dataset holds; a
         // bar's is 0.
         let mut kinds: Vec<i32> = kinds_asked.clone();
@@ -827,10 +837,15 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
             kinds.push(0);
         }
         for kind in kinds {
-            let held = by_subject
-                .get(&(subject.clone(), kind))
-                .cloned()
-                .unwrap_or_default();
+            // Taken, never copied (ruling 959): each subject and kind is
+            // chosen from once, and its rows move into the answer.
+            let key = (subject.clone(), kind);
+            let mut held = if last {
+                by_subject.remove(&key)
+            } else {
+                by_subject.get(&key).cloned()
+            }
+            .unwrap_or_default();
             let order = if read.sources.side_by_side {
                 candidates.clone()
             } else {
@@ -844,8 +859,11 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
             }
             if read.sources.side_by_side {
                 for dataset in &order {
-                    let of: Vec<&Observation> =
-                        held.iter().filter(|r| r.dataset() == dataset).collect();
+                    let (of, rest): (Vec<Observation>, Vec<Observation>) =
+                        std::mem::take(&mut held)
+                            .into_iter()
+                            .partition(|r| r.dataset() == dataset);
+                    held = rest;
                     if of.is_empty() {
                         let (reason, ask) = why_not(dataset, subject, kind);
                         if ask {
@@ -860,7 +878,7 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
                             reason,
                         });
                     } else {
-                        chosen.extend(of.into_iter().cloned());
+                        chosen.extend(of);
                     }
                 }
                 continue;
@@ -886,15 +904,15 @@ pub fn answer(store: &dyn Store, read: &Read, against: &Against<'_>) -> Result<A
             // first that can be.
             let mut asked_of: Option<String> = None;
             let mut fallen: Vec<NotServed> = Vec::new();
-            for group in groups {
+            for mut group in groups {
                 let mut answered = false;
                 let mut first_silent: Option<Vec<Observation>> = None;
                 for dataset in &order {
-                    let of: Vec<Observation> = group
-                        .iter()
-                        .filter(|r| r.dataset() == dataset)
-                        .cloned()
-                        .collect();
+                    let (of, rest): (Vec<Observation>, Vec<Observation>) =
+                        std::mem::take(&mut group)
+                            .into_iter()
+                            .partition(|r| r.dataset() == dataset);
+                    group = rest;
                     let latest_silent = !of.is_empty()
                         && matches!(read.when, When::Latest { .. })
                         && of.iter().all(|r| silent(r, against));

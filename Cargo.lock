@@ -1750,6 +1750,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "meridian-bus",
+ "meridian-changes",
  "meridian-clock",
  "meridian-domain",
  "meridian-pb",
@@ -1780,6 +1781,19 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "meridian-changes"
+version = "0.1.0"
+dependencies = [
+ "meridian-bus",
+ "meridian-clock",
+ "meridian-domain",
+ "postgres",
+ "prost",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1818,6 +1832,7 @@ dependencies = [
  "hex",
  "meridian-access",
  "meridian-bus",
+ "meridian-changes",
  "meridian-clock",
  "meridian-domain",
  "meridian-first-run",
@@ -1907,6 +1922,7 @@ name = "meridian-instrument"
 version = "0.1.0"
 dependencies = [
  "meridian-bus",
+ "meridian-changes",
  "meridian-clock",
  "meridian-domain",
  "meridian-pb",
@@ -1930,6 +1946,7 @@ dependencies = [
  "base64 0.22.1",
  "libc",
  "meridian-bus",
+ "meridian-changes",
  "meridian-clock",
  "meridian-domain",
  "meridian-pb",
@@ -1964,6 +1981,7 @@ dependencies = [
  "meridian-analytics-engine",
  "meridian-bor",
  "meridian-bus",
+ "meridian-changes",
  "meridian-clock",
  "meridian-conductor",
  "meridian-config",
@@ -2014,6 +2032,7 @@ name = "meridian-street"
 version = "0.1.0"
 dependencies = [
  "meridian-bus",
+ "meridian-changes",
  "meridian-clock",
  "meridian-domain",
  "meridian-pb",

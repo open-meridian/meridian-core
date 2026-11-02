@@ -351,3 +351,63 @@ fn the_analytics_component_holds_its_own_credential_and_its_own_topic() {
         );
     }
 }
+
+/// Step 3a: each store's change log is a component topic, held by the
+/// store's own credential -- the runtime's for the lake, the book, the street
+/// store and the conductor, the instrument store's own for its -- and the
+/// lake's and the book's by the analytics component too; never by a plugin
+/// or the dashboard.
+#[test]
+fn each_stores_change_log_is_held_by_its_members_and_no_plugin() {
+    let contract = Contract::embedded();
+    let users =
+        users(contract, &[Instance::plugin("reporting-1", &["reporting"])]).expect("generates");
+    let holds = |user: &User, topic: &str| {
+        user.publish.contains(&topic.to_string()) && user.subscribe.contains(&topic.to_string())
+    };
+    let runtime = user(&users, "runtime");
+    for domain in ["lake", "book", "street", "config"] {
+        assert!(
+            holds(runtime, &format!("platform.{domain}.internal.read-changes")),
+            "{domain}"
+        );
+        assert!(
+            holds(runtime, &format!("platform.{domain}.internal.changes.*")),
+            "{domain}"
+        );
+    }
+    assert!(!holds(runtime, "platform.reference.internal.read-changes"));
+    let instrument = user(&users, "instrument");
+    assert!(holds(
+        instrument,
+        "platform.reference.internal.read-changes"
+    ));
+    assert!(holds(instrument, "platform.reference.internal.changes.*"));
+    assert!(!holds(instrument, "platform.lake.internal.changes.*"));
+    let analytics = user(&users, "analytics");
+    for domain in ["lake", "book"] {
+        assert!(holds(
+            analytics,
+            &format!("platform.{domain}.internal.read-changes")
+        ));
+        assert!(holds(
+            analytics,
+            &format!("platform.{domain}.internal.changes.*")
+        ));
+    }
+    assert!(!holds(analytics, "platform.street.internal.changes.*"));
+    for other in users
+        .iter()
+        .filter(|u| !["runtime", "instrument", "analytics"].contains(&u.user.as_str()))
+    {
+        assert!(
+            !other
+                .publish
+                .iter()
+                .chain(&other.subscribe)
+                .any(|s| s.contains(".internal.")),
+            "{} carries a component's own topic",
+            other.user
+        );
+    }
+}

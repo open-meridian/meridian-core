@@ -1,4 +1,5 @@
 {{- include "meridian-runtime.require" . -}}
+{{- include "meridian-runtime.oneWriter" (dict "component" "street" "what" "street store" "values" .Values.street) -}}
 {{/*
   The street store. Its own Deployment and its own image tag, which is the whole
   point of the split: the instrument store holds what the platform can send again, this
@@ -50,6 +51,10 @@ spec:
           env:
             - name: MERIDIAN_INSTANCE_ID
               value: {{ include "meridian-runtime.fullname" . }}-street
+            # The deployment each change of its log is made in (step 3a,
+            # the change log's origin; ruling 1049).
+            - name: MERIDIAN_DEPLOYMENT_ID
+              value: {{ .Values.deployment.id | quote }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
             - name: MERIDIAN_STREET_DATABASE_URL

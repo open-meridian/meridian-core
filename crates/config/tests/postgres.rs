@@ -2598,3 +2598,78 @@ fn capacity_store_at_two_thousand_versions() {
         took.as_secs_f64() * 1e3
     );
 }
+
+// ── The change log (step 3a) ──
+
+#[test]
+fn a_follower_that_reloaded_and_is_given_the_log_in_any_page_split_builds_the_stores_tables() {
+    let (store, url) = store_at("log");
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let reloaded = meridian_config::postgres::CHANGES
+        .snapshot(&mut client)
+        .unwrap();
+    for n in 0..5 {
+        let account = AccountRecord {
+            account_id: format!("ACC-{n}"),
+            name: format!("Growth {n}"),
+            state: AccountState::Open as i32,
+            created_at_ns: 7,
+            ..AccountRecord::default()
+        };
+        store.put_account(&account).unwrap();
+        store
+            .put_account(&AccountRecord {
+                name: format!("Growth Fund {n}"),
+                ..account
+            })
+            .unwrap();
+        store
+            .put_user_group(&user_group(&format!("UG-{n}"), "ada"))
+            .unwrap();
+    }
+    let followed = meridian_config::postgres::CHANGES
+        .check_follows(&mut client, &reloaded)
+        .unwrap();
+    assert!(followed >= 10, "{followed} changes");
+    meridian_config::postgres::CHANGES
+        .check_tables(&mut client, &[])
+        .unwrap();
+    // The built-in groups the migrations wrote were held before the log
+    // began: a follower with nothing is sent to reload.
+    let refused = meridian_changes::ChangeLog::read_changes(&store, "config", 0, 4096).unwrap_err();
+    assert!(
+        meridian_changes::is_behind(&refused.to_string()),
+        "{refused}"
+    );
+}
+
+#[test]
+fn a_deposed_conductors_commit_is_refused_after_a_takeover_and_takes_no_sequence() {
+    let (writer, url) = store_at("fence");
+    assert_eq!(writer.adopt().unwrap(), 1);
+    let account = |id: &str| AccountRecord {
+        account_id: id.into(),
+        name: id.into(),
+        state: AccountState::Open as i32,
+        created_at_ns: 7,
+        ..AccountRecord::default()
+    };
+    writer.put_account(&account("ACC-A")).unwrap();
+    let standby = PostgresStore::connect(&url, 1).unwrap();
+    assert_eq!(standby.take_over().unwrap(), 2);
+    let refused = writer.put_account(&account("ACC-B")).unwrap_err();
+    assert!(
+        refused.to_string().contains(meridian_changes::FENCED),
+        "{refused}"
+    );
+    standby.put_account(&account("ACC-C")).unwrap();
+    let page = meridian_changes::ChangeLog::read_changes(
+        &standby,
+        "config",
+        1,
+        meridian_changes::PAGE_MOST,
+    )
+    .unwrap();
+    let numbered: Vec<(u64, u64)> = page.changes.iter().map(|c| (c.sequence, c.epoch)).collect();
+    assert_eq!(numbered, vec![(2, 1), (3, 2)]);
+}

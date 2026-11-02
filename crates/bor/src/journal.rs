@@ -252,3 +252,68 @@ mod tests {
         assert_eq!(Body::from_bytes(&body.to_bytes()).unwrap(), body);
     }
 }
+
+/// An entry as its partition's change (step 3a): carried whole, its records
+/// in their protobuf encodings, so a follower applies it as the book does.
+#[derive(Serialize, Deserialize)]
+struct Carried {
+    entry_id: String,
+    account_id: String,
+    first_sequence: u64,
+    last_sequence: u64,
+    message_id: String,
+    idempotency_key: String,
+    meta: String,
+    cause: String,
+    body: String,
+}
+
+impl Entry {
+    /// The entry as its partition's change, written under `epoch` in the
+    /// deployment `origin`.
+    pub fn to_change(&self, epoch: u64, origin: &str) -> meridian_changes::Change {
+        let carried = Carried {
+            entry_id: self.entry_id.clone(),
+            account_id: self.account_id.clone(),
+            first_sequence: self.first_sequence,
+            last_sequence: self.last_sequence,
+            message_id: self.message_id.clone(),
+            idempotency_key: self.idempotency_key.clone(),
+            meta: STANDARD.encode(self.meta.encode_to_vec()),
+            cause: STANDARD.encode(self.cause.encode_to_vec()),
+            body: STANDARD.encode(self.body.to_bytes()),
+        };
+        meridian_changes::Change {
+            partition: self.partition.clone(),
+            sequence: self.last_sequence,
+            epoch,
+            origin: origin.to_string(),
+            committed_at_ns: self.cause.committed_at_ns,
+            kind: self.meta.kind.clone(),
+            body: serde_json::to_vec(&carried).expect("an entry is plain data"),
+        }
+    }
+
+    /// The entry a change carries.
+    pub fn from_change(change: &meridian_changes::Change) -> Result<Entry> {
+        let unreadable =
+            |failed: String| StoreError::Unavailable(format!("a change did not read: {failed}"));
+        let carried: Carried =
+            serde_json::from_slice(&change.body).map_err(|e| unreadable(e.to_string()))?;
+        let bytes = |text: &str| STANDARD.decode(text).map_err(|e| unreadable(e.to_string()));
+        Ok(Entry {
+            entry_id: carried.entry_id,
+            account_id: carried.account_id,
+            partition: change.partition.clone(),
+            first_sequence: carried.first_sequence,
+            last_sequence: carried.last_sequence,
+            message_id: carried.message_id,
+            idempotency_key: carried.idempotency_key,
+            meta: EntryMeta::decode(bytes(&carried.meta)?.as_slice())
+                .map_err(|e| unreadable(e.to_string()))?,
+            cause: ChangeCause::decode(bytes(&carried.cause)?.as_slice())
+                .map_err(|e| unreadable(e.to_string()))?,
+            body: Body::from_bytes(&bytes(&carried.body)?)?,
+        })
+    }
+}

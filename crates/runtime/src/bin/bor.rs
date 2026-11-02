@@ -107,12 +107,33 @@ fn run() -> Result<(), String> {
             })
         },
     )?);
-    let store: Arc<dyn meridian_bor::Store> = postgres.clone();
+    // The deployment every change is made in, and the writer's epoch,
+    // adopted before the first command (step 3a; ruling 1060).
+    meridian_changes::set_origin(&var("MERIDIAN_DEPLOYMENT_ID").unwrap_or_default());
+    let epoch = meridian_bor::Store::adopt(postgres.as_ref())
+        .map_err(|failed| format!("the book could not adopt its epoch: {failed}"))?;
+    tracing::info!(epoch, "the book writes under its epoch");
+
+    let books_bound =
+        meridian_bor::writer::books_bytes_from_mib(var("MERIDIAN_BOR_HOT_BOOKS_MIB").as_deref())?;
+    tracing::info!(
+        books_mib = books_bound >> 20,
+        "the book's hot layer is bounded"
+    );
 
     let instance_id = var("MERIDIAN_INSTANCE_ID").unwrap_or_else(|| "bor-1".into());
 
     on_runtime(async {
         let bus = bus_from_env(&instance_id).await?;
+        // Every commit, whichever path makes it, told on its partition's
+        // tail (step 3a).
+        // and each account's book at its head held in memory, bounded by
+        // bor.hotLayer.booksMiB (the hot layer).
+        let store: Arc<dyn meridian_bor::Store> = Arc::new(meridian_bor::writer::Writer::bounded(
+            postgres.clone(),
+            bus.clone(),
+            books_bound,
+        ));
 
         meridian_bor::service::serve(bus.clone(), Arc::clone(&store), clock());
         // The start's snapshots (v26; W9.10): every account whose journal

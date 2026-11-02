@@ -464,7 +464,7 @@ async fn a_fact_restated_and_confirmed_reads_as_first_published_and_as_latest() 
     let first = NOW - 20 * DAY;
     let confirmed = NOW - 10 * DAY;
     let restated = NOW - DAY;
-    let fact = |row: ReportedFact| vec![Observation::ReportedFact(row)];
+    let fact = |row: ReportedFact| vec![Observation::ReportedFact(Box::new(row))];
     assert_eq!(
         record(
             &h,
@@ -635,9 +635,9 @@ async fn holdings_are_read_by_holder_and_by_security_with_their_report_once() {
     ];
     assert_eq!(record(&h, "reports", reports).unwrap(), (2, 0, 0));
     let holdings = vec![
-        Observation::Holding(holding(q3, AAPL, "300000000", filed)),
-        Observation::Holding(holding(q3, KO, "400000000", filed)),
-        Observation::Holding(holding(q2, AAPL, "280000000", filed - 90 * DAY)),
+        Observation::Holding(Box::new(holding(q3, AAPL, "300000000", filed))),
+        Observation::Holding(Box::new(holding(q3, KO, "400000000", filed))),
+        Observation::Holding(Box::new(holding(q2, AAPL, "280000000", filed - 90 * DAY))),
     ];
     assert_eq!(record(&h, "holdings", holdings).unwrap(), (3, 0, 0));
     let read = |request: ListHoldingsRequest| {
@@ -713,7 +713,7 @@ async fn a_stakes_amendment_is_its_next_version_read_as_published() {
                 "SC 13D",
                 published,
             )),
-            Observation::Holding(row),
+            Observation::Holding(Box::new(row)),
         )
     };
     let (report_v1, holding_v1) = thirteen_d(crossed, "2026-10-09", "460000000", "10.6");
@@ -810,7 +810,7 @@ async fn what_w10_4_refuses_of_the_filings_slice_is_refused_naming_the_field() {
     // A fact with neither amount nor value, and with both.
     let mut row = eps("1.85", "0000320193-26-000107", NOW);
     row.amount = None;
-    let words = refused("facts", Observation::ReportedFact(row));
+    let words = refused("facts", Observation::ReportedFact(Box::new(row)));
     assert!(words.starts_with("facts[0].amount"), "{words}");
     let mut row = eps("1.85", "0000320193-26-000107", NOW);
     row.value = Some(UnitValue {
@@ -818,14 +818,14 @@ async fn what_w10_4_refuses_of_the_filings_slice_is_refused_naming_the_field() {
         unit: ValueUnit::Ratio as i32,
         ..Default::default()
     });
-    let words = refused("facts", Observation::ReportedFact(row));
+    let words = refused("facts", Observation::ReportedFact(Box::new(row)));
     assert!(words.starts_with("facts[0].value"), "{words}");
     let mut row = eps("1.85", "0000320193-26-000107", NOW);
     row.dimensions.push(FactDimension {
         axis: "us-gaap:StatementBusinessSegmentsAxis".into(),
         member: String::new(),
     });
-    let words = refused("facts", Observation::ReportedFact(row));
+    let words = refused("facts", Observation::ReportedFact(Box::new(row)));
     assert!(
         words.starts_with("facts[0].dimensions[0].member"),
         "{words}"
@@ -862,11 +862,11 @@ async fn what_w10_4_refuses_of_the_filings_slice_is_refused_naming_the_field() {
     assert!(words.starts_with("reports[0].kind"), "{words}");
     let mut row = holding("0001067983-26-000045", AAPL, "1", NOW);
     row.report_row_key.clear();
-    let words = refused("holdings", Observation::Holding(row));
+    let words = refused("holdings", Observation::Holding(Box::new(row)));
     assert!(words.starts_with("holdings[0].report_row_key"), "{words}");
     let mut row = holding("0001067983-26-000045", AAPL, "1", NOW);
     row.meta.as_mut().unwrap().subjects.pop();
-    let words = refused("holdings", Observation::Holding(row));
+    let words = refused("holdings", Observation::Holding(Box::new(row)));
     assert!(words.contains("names nothing held"), "{words}");
     // A read naming an unspecified kind.
     let reads = tokio::task::block_in_place(|| {

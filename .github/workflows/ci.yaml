@@ -284,13 +284,16 @@ jobs:
   # job above had passed -- one of them published, because `publish` waited
   # on this workflow and this workflow had never installed a chart.
   #
-  # So they run on every pull request, after ci-local, and each is a required
-  # check: `publish` runs on the merge without CI again, so a red run here
-  # keeps the change off main and publishes nothing. They need a cluster and
-  # the platform, which is private: a pull request from a fork gets no secret
-  # to check it out with, fails at the credentials step below, and is closed
-  # by outside-pull-requests anyway. A commit ci-local has refused is not
-  # worth a cluster. One job per run, so a failure names its half.
+  # So they run on every pull request, alongside ci-local (ruling 1066), and
+  # each is a required check: `publish` runs on the merge without CI again,
+  # so a red run here keeps the change off main and publishes nothing. They
+  # build their own images and take nothing from ci-local, so a pull
+  # request's cluster findings come back even when ci-local fails, and the
+  # run finishes in about 42 minutes rather than about 63. They need a
+  # cluster and the platform, which is private: a pull request from a fork
+  # gets no secret to check it out with, fails at the credentials step
+  # below, and is closed by outside-pull-requests anyway. One job per run,
+  # so a failure names its half.
   #
   # The window (ruling 935): Kubernetes is supported on every minor a major
   # managed cloud still supports, extended support included (about 26
@@ -304,7 +307,6 @@ jobs:
   # `e2e-cluster-k3d (<target>)` for the six; a smoke job's names its k3s.
   e2e-cluster-k3d:
     name: e2e-cluster-k3d (${{ matrix.target }}${{ matrix.k3s && format(', k3s {0}', matrix.k3s) || '' }})
-    needs: ci-local
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:

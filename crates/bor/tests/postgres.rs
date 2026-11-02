@@ -1254,3 +1254,181 @@ async fn a_quiet_or_upgraded_account_is_snapshotted_at_start_and_by_a_read() {
     assert_eq!(read, whole);
     assert_eq!(since(), 0);
 }
+
+// ── The change log (step 3a) ──
+
+/// A store of a small pool: the suite's tests run at once, and the test
+/// database admits so many connections.
+fn small() -> Arc<PostgresStore> {
+    let store = PostgresStore::connect(&url(), 2).expect("could not reach the test database");
+    store
+        .migrate(&meridian_clock::SystemClock)
+        .expect("could not create the schema");
+    Arc::new(store)
+}
+
+/// A store over a schema of its own, so a takeover raises no other test's
+/// epoch.
+fn isolated() -> (String, Arc<PostgresStore>) {
+    let schema = unique("bor_fence").replace('-', "_");
+    let mut admin = postgres::Client::connect(&url(), postgres::NoTls).expect("the test database");
+    admin
+        .batch_execute(&format!("CREATE SCHEMA {schema}"))
+        .expect("a schema of its own");
+    let joined = if url().contains('?') { "&" } else { "?" };
+    let url = format!("{}{joined}options=-csearch_path%3D{schema}", url());
+    let store = PostgresStore::connect(&url, 2).expect("could not reach the test database");
+    store
+        .migrate(&meridian_clock::SystemClock)
+        .expect("could not create the schema");
+    (url, Arc::new(store))
+}
+
+fn followed(store: &PostgresStore, partition: &str, page: usize) -> Vec<meridian_changes::Change> {
+    let mut out = Vec::new();
+    meridian_changes::catch_up(
+        |after| store.read_changes(partition, after, page),
+        0,
+        |change| out.push(change.clone()),
+    )
+    .expect("the log reads");
+    out
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_follower_given_the_journal_in_any_page_split_builds_the_writers_books() {
+    let (bus, store) = wired_with(blocking(small));
+    let accounts: Vec<String> = (0..3).map(|_| unique("ACC")).collect();
+    for account in &accounts {
+        open(&bus, account, &unique("INS")).await;
+    }
+    for page in [1usize, 2_000, meridian_changes::PAGE_MOST] {
+        let changes = blocking(|| followed(&store, "P0", page));
+        // No holes: each entry starts where the one before it ended.
+        let entries: Vec<meridian_bor::journal::Entry> = changes
+            .iter()
+            .map(|change| meridian_bor::journal::Entry::from_change(change).unwrap())
+            .collect();
+        for pair in entries.windows(2) {
+            assert_eq!(
+                pair[1].first_sequence,
+                pair[0].last_sequence + 1,
+                "page {page}"
+            );
+        }
+        for account in &accounts {
+            let mine: Vec<_> = entries
+                .iter()
+                .filter(|entry| &entry.account_id == account)
+                .cloned()
+                .collect();
+            let journal = blocking(|| store.journal(account)).unwrap();
+            assert_eq!(mine, journal, "page {page}");
+            let built = meridian_bor::book::Book::replay(account, "P0", &mine).unwrap();
+            let held = blocking(|| store.book(account)).unwrap();
+            assert_eq!(built.positions, held.positions, "page {page}");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deposed_writers_command_is_refused_after_a_takeover_and_leaves_no_hole() {
+    let (url, writer) = blocking(isolated);
+    let (bus, writer) = wired_with(writer);
+    assert_eq!(blocking(|| writer.adopt()).unwrap(), 1);
+    let account = unique("ACC");
+    open(&bus, &account, &unique("INS")).await;
+    let standby = Arc::new(PostgresStore::connect(&url, 1).unwrap());
+    assert_eq!(blocking(|| standby.take_over()).unwrap(), 2);
+    let refused = send(
+        &bus,
+        RECORD_OPENING_BALANCE,
+        &opening(&unique("ACC"), &unique("INS")),
+        Some(PERSON),
+    )
+    .await
+    .unwrap_err();
+    assert!(refused.contains(meridian_changes::FENCED), "{refused}");
+    assert!(blocking(|| writer.rebuild()).is_err());
+    let (bus, standby) = wired_with(standby);
+    open(&bus, &unique("ACC"), &unique("INS")).await;
+    let changes = blocking(|| followed(&standby, "P0", meridian_changes::PAGE_MOST));
+    let epochs: Vec<u64> = changes.iter().map(|change| change.epoch).collect();
+    assert_eq!(epochs, vec![1, 2]);
+    let entries: Vec<_> = changes
+        .iter()
+        .map(|change| meridian_bor::journal::Entry::from_change(change).unwrap())
+        .collect();
+    assert_eq!(entries[1].first_sequence, entries[0].last_sequence + 1);
+    let reply =
+        blocking(|| standby.read_changes("control", 0, meridian_changes::PAGE_MOST)).unwrap();
+    assert_eq!(reply.epoch, 2);
+}
+
+// ── The hot layer (step 3a) ──
+
+/// Each account's book at its head, held by the writer, is the book the
+/// record builds from its snapshot and tail, under any bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_book_held_at_its_head_is_the_book_the_record_builds() {
+    let record = blocking(small);
+    for bound in [meridian_bor::writer::DEFAULT_BOOKS_BYTES, 3_000] {
+        let bus = Arc::new(Bus::single(
+            "operations-test-1",
+            Arc::new(MemoryBackend::new()),
+            Arc::new(meridian_clock::SystemClock),
+        ));
+        let writer = Arc::new(meridian_bor::writer::Writer::bounded(
+            record.clone(),
+            bus.clone(),
+            bound,
+        ));
+        serve(bus.clone(), writer.clone(), bus.clock());
+        // The instrument store, stood in, as wired_with does.
+        bus.serve(RESOLVE_INSTRUMENT, |envelope| {
+            let asked = ResolveInstrumentRequest::decode(&envelope.payload[..]).unwrap();
+            Ok((
+                "meridian.v1.ResolveInstrumentReply".into(),
+                ResolveInstrumentReply {
+                    found: true,
+                    instrument: Some(InstrumentRecord {
+                        instrument_id: asked.instrument_id,
+                        asset_class: AssetClass::Equity as i32,
+                        currency: "USD".into(),
+                        version: 1,
+                        ..Default::default()
+                    }),
+                }
+                .encode_to_vec(),
+            ))
+        });
+        let accounts: Vec<String> = (0..4).map(|_| unique("ACC")).collect();
+        for account in &accounts {
+            // Asked before it holds anything, then after each commit.
+            let before = blocking(|| writer.book(account)).unwrap();
+            assert_eq!(before, blocking(|| record.book(account)).unwrap());
+            open(&bus, account, &unique("INS")).await;
+        }
+        for account in &accounts {
+            let held = blocking(|| writer.book(account)).unwrap();
+            let built = blocking(|| record.book(account)).unwrap();
+            assert_eq!(held, built, "bound {bound}");
+        }
+        let (_, bytes) = writer.held();
+        assert!(bound == meridian_bor::writer::DEFAULT_BOOKS_BYTES || bytes <= bound);
+    }
+}
+
+/// The writer adopts its epoch before it takes a connection: a store of one
+/// connection -- `meridian-bor rebuild`'s -- rebuilds, never waiting on
+/// itself for a second (found by e2e-book, step 3a).
+#[test]
+fn a_store_of_one_connection_adopts_its_epoch_and_rebuilds() {
+    let migrated = PostgresStore::connect(&url(), 1).unwrap();
+    migrated.migrate(&meridian_clock::SystemClock).unwrap();
+    drop(migrated);
+    let alone = PostgresStore::connect(&url(), 1).unwrap();
+    let _held = REBUILDS.blocking_lock();
+    alone.rebuild().unwrap();
+    assert!(alone.epoch() >= 1);
+}

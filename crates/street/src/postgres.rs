@@ -48,7 +48,38 @@ const SCHEMA_LOCK: i64 = 0x6b65_726e_656c_0001_u64 as i64;
 
 pub struct PostgresStore {
     pool: Pool,
+    /// The epoch this writer's commits are fenced by (step 3a); none until
+    /// it adopts one, as the migration Job never does.
+    fence: meridian_changes::Fence,
 }
+
+/// The street store's change log (step 3a): its one partition's sequence,
+/// as it has numbered its changes since 0005, with every row of each change
+/// captured beside it.
+pub const CHANGES: meridian_changes::captured::Spec = meridian_changes::captured::Spec {
+    prefix: "street",
+    head: "partition_head",
+    partition: PARTITION,
+    tables: &[
+        "statement",
+        "statement_figures",
+        "statement_collateral",
+        "statement_provenance",
+        "holding",
+        "holding_lot",
+        "holding_encumbrance",
+        "holding_provenance",
+        "holding_pending",
+        "holding_amendment",
+        "custodial_position",
+        "activity",
+        "activity_re_resolution",
+        "sync_status",
+        "account_chain",
+        "street_cash_instrument",
+    ],
+    not_captured: &[],
+};
 
 impl PostgresStore {
     pub fn connect(url: &str, pool_size: u32) -> Result<Self> {
@@ -59,7 +90,27 @@ impl PostgresStore {
             .build(manager)
             .map_err(unavailable)?;
 
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            fence: meridian_changes::Fence::new(),
+        })
+    }
+
+    /// The store's epoch, adopted: what a starting street store does before
+    /// it serves (step 3a; ruling 1060).
+    pub fn adopt(&self) -> Result<u64> {
+        let mut conn = self.conn()?;
+        let epoch = CHANGES.adopt(&mut *conn).map_err(unavailable)?;
+        Ok(self.fence.adopt_once(epoch))
+    }
+
+    /// Take the store over: raise its epoch, and adopt it. Every commit
+    /// under the old one is refused in its own transaction.
+    pub fn take_over(&self) -> Result<u64> {
+        let mut conn = self.conn()?;
+        let epoch = CHANGES.take_over(&mut *conn).map_err(unavailable)?;
+        self.fence.adopt(epoch);
+        Ok(epoch)
     }
 
     /// Apply every migration not yet recorded, under a lock.
@@ -75,7 +126,8 @@ impl PostgresStore {
 
         conn.execute("SELECT pg_advisory_lock($1)", &[&SCHEMA_LOCK])
             .map_err(unavailable)?;
-        let outcome = apply_migrations(&mut conn, clock);
+        let outcome = apply_migrations(&mut conn, clock)
+            .and_then(|()| CHANGES.install(&mut *conn).map_err(unavailable));
         let _ = conn.execute("SELECT pg_advisory_unlock($1)", &[&SCHEMA_LOCK]);
 
         outcome
@@ -98,8 +150,14 @@ impl PostgresStore {
         migrations::verify(applied)
     }
 
+    /// A connection, named with the writer's epoch and the deployment's
+    /// time for the change log its writes are captured in.
     fn conn(&self) -> Result<Connection> {
-        self.pool.get().map_err(unavailable)
+        let mut conn = self.pool.get().map_err(unavailable)?;
+        CHANGES
+            .prepare(&mut *conn, self.fence.epoch(), meridian_changes::now_ns())
+            .map_err(unavailable)?;
+        Ok(conn)
     }
 }
 
@@ -1594,9 +1652,20 @@ fn head(client: &mut impl GenericClient) -> Result<u64> {
 /// orders every change, and a rollback takes its number back with it, so
 /// there are no holes (design decision 5).
 fn next_change(tx: &mut Transaction<'_>, chain: Chain, account_id: &str) -> Result<Change> {
+    // The rows this change writes are captured under this sequence (step
+    // 3a): the head names the transaction that took it. Where the
+    // transaction's rows written before it already took one for the log,
+    // this change is that one, so a transaction is one change.
     let sequence: i64 = tx
         .query_one(
-            "UPDATE partition_head SET sequence = sequence + 1 WHERE partition = $1
+            "UPDATE partition_head
+                SET sequence = CASE WHEN tx = pg_current_xact_id() AND NOT claimed
+                                    THEN sequence ELSE sequence + 1 END,
+                    ordinal = CASE WHEN tx = pg_current_xact_id() AND NOT claimed
+                                   THEN ordinal ELSE -1 END,
+                    tx = pg_current_xact_id(),
+                    claimed = true
+              WHERE partition = $1
              RETURNING sequence",
             &[&PARTITION],
         )
@@ -2633,4 +2702,20 @@ fn unavailable(failed: impl std::error::Error) -> StoreError {
         cause = next.source();
     }
     StoreError::Unavailable(detail)
+}
+
+/// The street store's change log, read a page at a time (step 3a).
+impl meridian_changes::ChangeLog for PostgresStore {
+    fn read_changes(
+        &self,
+        partition: &str,
+        after: u64,
+        most_bytes: usize,
+    ) -> std::result::Result<meridian_changes::ReadChangesReply, meridian_changes::ReadError> {
+        let mut conn = self
+            .pool
+            .get()
+            .map_err(|failed| meridian_changes::ReadError::Unavailable(failed.to_string()))?;
+        CHANGES.read(&mut *conn, partition, after, most_bytes)
+    }
 }

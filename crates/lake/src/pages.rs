@@ -88,7 +88,7 @@ impl Whole {
             + self
                 .rows
                 .iter()
-                .map(|row| row.encoded_len() * heap_per_encoded_byte(row))
+                .map(|row| row.encoded_len() * heap_per_encoded_byte(row) + row.boxed_bytes())
                 .sum::<usize>()
             + self.not_served.capacity() * std::mem::size_of::<NotServed>()
     }
@@ -287,13 +287,13 @@ mod tests {
         Arc::new(Whole {
             rows: (0..rows)
                 .map(|i| {
-                    Observation::Quote(Quote {
+                    Observation::Quote(Box::new(Quote {
                         meta: Some(ObservationMeta {
                             row_key: format!("q{i}"),
                             ..Default::default()
                         }),
                         ..Default::default()
-                    })
+                    }))
                 })
                 .collect(),
             not_served: Vec::new(),

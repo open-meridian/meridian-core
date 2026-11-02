@@ -1000,3 +1000,141 @@ fn every_company_version_is_kept_once_and_an_identifier_it_carried_finds_it() {
         None
     );
 }
+
+// ── The change log (step 3a) ──
+
+/// A store over a schema of its own: its log begins with it, and a takeover
+/// raises no other test's epoch.
+fn isolated() -> (String, PostgresStore) {
+    let url = std::env::var("MERIDIAN_TEST_DATABASE_URL").expect("MERIDIAN_TEST_DATABASE_URL");
+    let schema = unique("ins_log").replace('-', "_").to_lowercase();
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).expect("the test database");
+    admin
+        .batch_execute(&format!("CREATE SCHEMA {schema}"))
+        .expect("a schema of its own");
+    let joined = if url.contains('?') { "&" } else { "?" };
+    let url = format!("{url}{joined}options=-csearch_path%3D{schema}");
+    let store = PostgresStore::connect(&url, 2).expect("could not reach the test database");
+    store
+        .migrate(&meridian_clock::SystemClock)
+        .expect("could not create the schema");
+    (url, store)
+}
+
+#[test]
+fn a_follower_given_the_log_in_any_page_split_builds_the_stores_tables() {
+    let (url, store) = isolated();
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let reloaded = meridian_instrument::postgres::CHANGES
+        .snapshot(&mut client)
+        .unwrap();
+    for tag in ["AAA", "BBB", "CCC", "DDD"] {
+        let mut held = minted(&store, tag);
+        held.version = 2;
+        let id = held.instrument_id.clone();
+        held.offers.push(Offer {
+            field: Field::Currency,
+            value: "USD".into(),
+            identifier: None,
+            source: "supplied".into(),
+            instance_id: "custody-1".into(),
+            offered_at_ns: 200,
+            valid_until_ns: 0,
+            provenance: Vec::new(),
+            path: String::new(),
+        });
+        assert_eq!(
+            store.write(held, 1, entry(&id, 2, "resolve")).unwrap(),
+            Written::Stored
+        );
+    }
+    let followed = meridian_instrument::postgres::CHANGES
+        .check_follows(&mut client, &reloaded)
+        .unwrap();
+    assert!(followed >= 8, "{followed} changes");
+    meridian_instrument::postgres::CHANGES
+        .check_tables(&mut client, &[])
+        .unwrap();
+}
+
+#[test]
+fn a_deposed_writers_commit_is_refused_after_a_takeover_and_takes_no_sequence() {
+    use meridian_changes::ChangeLog;
+    let (url, writer) = isolated();
+    assert_eq!(writer.adopt().unwrap(), 1);
+    minted(&writer, "EEE");
+    let standby = PostgresStore::connect(&url, 1).unwrap();
+    assert_eq!(standby.take_over().unwrap(), 2);
+    let id = unique("LCL");
+    let symbol = unique("FFF");
+    let key = IdentifierSet::new([asked("symbol", &symbol, "snaptrade")]).key();
+    let refused = writer
+        .mint(
+            record(&id, vec![identifier("symbol", &symbol, "snaptrade", 0)]),
+            &key,
+            entry(&id, 1, "mint"),
+        )
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains(meridian_changes::FENCED),
+        "{refused}"
+    );
+    assert!(
+        writer.by_id(&id).unwrap().is_none(),
+        "nothing of it committed"
+    );
+    minted(&standby, "GGG");
+    let page = standby
+        .read_changes("instrument", 0, meridian_changes::PAGE_MOST)
+        .unwrap();
+    let numbered: Vec<(u64, u64)> = page.changes.iter().map(|c| (c.sequence, c.epoch)).collect();
+    assert_eq!(
+        numbered,
+        vec![(1, 1), (2, 2)],
+        "no hole where the refused commit was"
+    );
+    assert_eq!(page.epoch, 2);
+    assert!(standby
+        .read_changes("control", 0, meridian_changes::PAGE_MOST)
+        .unwrap()
+        .changes
+        .is_empty());
+    assert!(standby
+        .read_changes("elsewhere", 0, meridian_changes::PAGE_MOST)
+        .is_err());
+}
+
+#[test]
+fn a_store_that_held_rows_before_its_log_sends_a_follower_from_the_start_to_reload() {
+    use meridian_changes::ChangeLog;
+    let (url, store) = isolated();
+    minted(&store, "HHH");
+    // As if the log were installed over a store already holding rows.
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    admin
+        .batch_execute(
+            "DELETE FROM instrument_change; UPDATE instrument_change_head SET kept_from = NULL;
+             COMMENT ON FUNCTION instrument_capture() IS NULL",
+        )
+        .unwrap();
+    store.migrate(&meridian_clock::SystemClock).unwrap();
+    let refused = store
+        .read_changes("instrument", 0, meridian_changes::PAGE_MOST)
+        .unwrap_err();
+    assert!(
+        meridian_changes::is_behind(&refused.to_string()),
+        "{refused}"
+    );
+    // Its sequence is not moved: the reload is at the head, and the log
+    // follows from there.
+    let head = store
+        .read_changes("instrument", 1, meridian_changes::PAGE_MOST)
+        .unwrap();
+    assert_eq!(head.head, 1);
+    minted(&store, "III");
+    let after = store
+        .read_changes("instrument", 1, meridian_changes::PAGE_MOST)
+        .unwrap();
+    assert_eq!(after.changes.len(), 1);
+    assert_eq!(after.lowest_kept, 2);
+}

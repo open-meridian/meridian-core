@@ -69,6 +69,7 @@ pub mod snapshot;
 pub mod store;
 #[rustfmt::skip]
 pub mod transitions;
+pub mod writer;
 
 mod memory;
 

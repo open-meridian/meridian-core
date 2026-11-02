@@ -1,4 +1,5 @@
 {{- include "meridian-runtime.require" . -}}
+{{- include "meridian-runtime.oneWriter" (dict "component" "bor" "what" "book of record" "values" .Values.bor) -}}
 {{/*
   The book of record (W9): the firm's own positions, breaks and figures, an
   append-only journal per account partition and the projections rebuilt from
@@ -61,6 +62,13 @@ spec:
           env:
             - name: MERIDIAN_INSTANCE_ID
               value: {{ include "meridian-runtime.fullname" . }}-bor
+            # The deployment each change of its log is made in (step 3a,
+            # the change log's origin; ruling 1049).
+            - name: MERIDIAN_DEPLOYMENT_ID
+              value: {{ .Values.deployment.id | quote }}
+            # The hot layer's bound, in MiB (step 3a).
+            - name: MERIDIAN_BOR_HOT_BOOKS_MIB
+              value: {{ .Values.bor.hotLayer.booksMiB | quote }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
             {{- with .Values.bor.mallocArenaMax }}

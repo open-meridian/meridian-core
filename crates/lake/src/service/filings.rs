@@ -584,7 +584,7 @@ impl Lake {
                 .rows
                 .into_iter()
                 .filter_map(|row| match row {
-                    Observation::ReportedFact(fact) => Some(fact),
+                    Observation::ReportedFact(fact) => Some(*fact),
                     _ => None,
                 })
                 .collect(),
@@ -765,7 +765,7 @@ impl Lake {
                         answered.push(report.clone());
                     }
                 }
-                holdings.push(holding);
+                holdings.push(*holding);
             }
         }
         Ok(ListHoldingsReply {
@@ -826,7 +826,7 @@ pub(super) fn serve(bus: &Arc<Bus>, lake: &Arc<Lake>) {
                 request
                     .facts
                     .into_iter()
-                    .map(Observation::ReportedFact)
+                    .map(|row| Observation::ReportedFact(Box::new(row)))
                     .collect(),
                 &request.want_id,
                 envelope,
@@ -914,7 +914,7 @@ pub(super) fn serve(bus: &Arc<Bus>, lake: &Arc<Lake>) {
                 request
                     .holdings
                     .into_iter()
-                    .map(Observation::Holding)
+                    .map(|row| Observation::Holding(Box::new(row)))
                     .collect(),
                 &request.want_id,
                 envelope,

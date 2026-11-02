@@ -35,7 +35,7 @@ use crate::reads;
 use crate::store::{
     first_partition_of, Acted, AttributesRead, BreaksRead, Decide, FiguresRead, HistoryRead,
     InstructionsRead, LocatesRead, Mark, OrdersPage, OrdersRead, Page, PositionsRead, Record,
-    Result, Scope, Store, StoreError, FIRST_PARTITION,
+    Result, Scope, Store, StoreError, CONTROL_PARTITION, FIRST_PARTITION,
 };
 
 type Pool = r2d2::Pool<PostgresConnectionManager<NoTls>>;
@@ -53,6 +53,8 @@ pub struct PostgresStore {
     /// How many entries an account's journal grows by between snapshots
     /// (contract v25, W9.10; the chart's `bor.snapshotInterval`).
     snapshot_interval: u64,
+    /// The epoch this writer's commands commit under (step 3a).
+    fence: meridian_changes::Fence,
 }
 
 impl PostgresStore {
@@ -66,6 +68,7 @@ impl PostgresStore {
         Ok(Self {
             pool,
             snapshot_interval: crate::snapshot::DEFAULT_INTERVAL,
+            fence: meridian_changes::Fence::new(),
         })
     }
 
@@ -1045,6 +1048,12 @@ impl Store for PostgresStore {
         request: &[u8],
         decide: &mut Decide<'_>,
     ) -> Result<Acted> {
+        // The writer's epoch, adopted before a connection is taken, so a
+        // store of one connection never waits on itself (step 3a).
+        let epoch = match self.fence.epoch() {
+            0 => self.adopt()?,
+            epoch => epoch,
+        };
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
         let partition: String = tx
@@ -1060,13 +1069,16 @@ impl Store for PostgresStore {
             &[&partition_lock(&partition)],
         )
         .map_err(unavailable)?;
-        let head: i64 = tx
+        // The head under its lock, its epoch the writer's (step 3a): a
+        // command commits only while the head row's epoch is its own.
+        let held = tx
             .query_one(
-                "SELECT sequence FROM book_partition_head WHERE partition = $1 FOR UPDATE",
+                "SELECT sequence, epoch FROM book_partition_head WHERE partition = $1 FOR UPDATE",
                 &[&partition],
             )
-            .map_err(unavailable)?
-            .get(0);
+            .map_err(unavailable)?;
+        self.fence.admits(held.get::<_, i64>(1) as u64)?;
+        let head: i64 = held.get(0);
 
         // A duplicate is answered with the first's reply, nothing applied:
         // the same message, or the same command under the same key. Another
@@ -1120,8 +1132,9 @@ impl Store for PostgresStore {
         tx.execute(
             "INSERT INTO book_entry (entry_id, account_id, partition, first_sequence, last_sequence,
                                      kind, effective_date, message_id, idempotency_key,
-                                     committed_at_ns, meta, cause, body, reply, actor, request)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
+                                     committed_at_ns, meta, cause, body, reply, actor, request,
+                                     epoch)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
             &[
                 &entry.entry_id,
                 &entry.account_id,
@@ -1139,6 +1152,7 @@ impl Store for PostgresStore {
                 &decided.reply,
                 &actor_named(entry.meta.actor.as_ref()),
                 &request,
+                &(epoch as i64),
             ],
         )
         .map_err(unavailable)?;
@@ -1166,6 +1180,113 @@ impl Store for PostgresStore {
 
     fn journal(&self, account_id: &str) -> Result<Vec<Entry>> {
         journal_of(&mut *self.conn()?, account_id)
+    }
+
+    fn adopt(&self) -> Result<u64> {
+        let mut conn = self.conn()?;
+        conn.execute(
+            "UPDATE book_partition_head SET origin = $1 WHERE origin = '' AND $1 <> ''",
+            &[&meridian_changes::origin()],
+        )
+        .map_err(unavailable)?;
+        let epoch: i64 = conn
+            .query_one(
+                "SELECT epoch FROM book_partition_head WHERE partition = $1",
+                &[&CONTROL_PARTITION],
+            )
+            .map_err(unavailable)?
+            .get(0);
+        Ok(self.fence.adopt_once(epoch as u64))
+    }
+
+    fn epoch(&self) -> u64 {
+        self.fence.epoch()
+    }
+
+    fn take_over(&self) -> Result<u64> {
+        let mut conn = self.conn()?;
+        let epoch: i64 = conn
+            .query_one(
+                "WITH raised AS (
+                    UPDATE book_partition_head
+                       SET epoch = (SELECT max(epoch) + 1 FROM book_partition_head)
+                    RETURNING epoch)
+                 SELECT max(epoch) FROM raised",
+                &[],
+            )
+            .map_err(unavailable)?
+            .get(0);
+        self.fence.adopt(epoch as u64);
+        Ok(epoch as u64)
+    }
+
+    fn read_changes(
+        &self,
+        partition: &str,
+        after: u64,
+        most_bytes: usize,
+    ) -> std::result::Result<meridian_changes::ReadChangesReply, meridian_changes::ReadError> {
+        use meridian_changes::{ReadChangesReply, ReadError};
+        let failed = |failed: StoreError| ReadError::Unavailable(failed.to_string());
+        let mut conn = self.conn().map_err(failed)?;
+        let mut tx = conn
+            .build_transaction()
+            .isolation_level(postgres::IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .map_err(|e| failed(unavailable(e)))?;
+        let held = tx
+            .query_opt(
+                "SELECT sequence, epoch, origin FROM book_partition_head WHERE partition = $1",
+                &[&partition],
+            )
+            .map_err(|e| failed(unavailable(e)))?
+            .ok_or_else(|| ReadError::UnknownPartition(partition.to_string()))?;
+        let head = held.get::<_, i64>(0) as u64;
+        let epoch = held.get::<_, i64>(1) as u64;
+        let own_origin: String = held.get(2);
+        // The journal is kept for good: nothing is ever behind it.
+        let lowest_kept = u64::from(head > 0);
+        const BATCH: i64 = 256;
+        let mut page = meridian_changes::Page::new(most_bytes);
+        let mut from = after;
+        'pages: while from < head {
+            let rows = tx
+                .query(
+                    &format!(
+                        "SELECT {ENTRY_COLUMNS}, epoch, origin FROM book_entry
+                          WHERE partition = $1 AND last_sequence > $2
+                          ORDER BY last_sequence LIMIT $3"
+                    ),
+                    &[&partition, &(from as i64), &BATCH],
+                )
+                .map_err(|e| failed(unavailable(e)))?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in &rows {
+                let entry = entry_of(row).map_err(failed)?;
+                let origin: Option<String> = row.get(11);
+                let change = entry.to_change(
+                    row.get::<_, i64>(10) as u64,
+                    &origin.unwrap_or_else(|| own_origin.clone()),
+                );
+                from = change.sequence;
+                if !page.take(change) {
+                    break 'pages;
+                }
+            }
+            if page.is_full() {
+                break;
+            }
+        }
+        let _ = tx.commit();
+        Ok(ReadChangesReply {
+            changes: page.changes,
+            head,
+            lowest_kept,
+            epoch,
+        })
     }
 
     fn bodies(&self, account_id: &str, entry_ids: &[String]) -> Result<Vec<(String, Body)>> {
@@ -1525,6 +1646,9 @@ impl Store for PostgresStore {
     }
 
     fn rebuild(&self) -> Result<usize> {
+        if self.fence.epoch() == 0 {
+            self.adopt()?;
+        }
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
         // Every partition's writer held off for the length of it.
@@ -1544,8 +1668,13 @@ impl Store for PostgresStore {
             )
             .map_err(unavailable)?;
         }
-        tx.execute("SELECT 1 FROM book_partition_head FOR UPDATE", &[])
+        // Rebuilt only by the writer whose epoch every partition holds.
+        let epochs = tx
+            .query("SELECT epoch FROM book_partition_head FOR UPDATE", &[])
             .map_err(unavailable)?;
+        for row in epochs {
+            self.fence.admits(row.get::<_, i64>(0) as u64)?;
+        }
         tx.batch_execute(
             "DELETE FROM book_snapshot;
              DELETE FROM book_position; DELETE FROM book_lot; DELETE FROM book_pending;

@@ -43,7 +43,67 @@ const SCHEMA_LOCK: i64 = 0x636f_6e66_6967_0001_u64 as i64;
 
 pub struct PostgresStore {
     pool: Pool,
+    /// The epoch this writer's commits are fenced by (step 3a); none until
+    /// it adopts one, as the migration Job never does.
+    fence: meridian_changes::Fence,
 }
+
+/// The configuration store's change log (step 3a): every table the
+/// conductor writes, captured in its own transaction under one sequence,
+/// but the platform's catalogue, which each pull replaces whole.
+pub const CHANGES: meridian_changes::captured::Spec = meridian_changes::captured::Spec {
+    prefix: "config",
+    head: "config_change_head",
+    partition: "config",
+    tables: &[
+        "config_access_change",
+        "config_access_entry",
+        "config_access_group",
+        "config_account",
+        "config_account_group",
+        "config_archive_change",
+        "config_connectivity_link",
+        "config_connectivity_link_change",
+        "config_dataset_entitlement_change",
+        "config_dataset_licence_change",
+        "config_external_account_link",
+        "config_fx_pivot_change",
+        "config_hold_change",
+        "config_known_plugin",
+        "config_licensed_schemes_change",
+        "config_linkable_account",
+        "config_linkable_accounts_change",
+        "config_model_routing_change",
+        "config_pack_change",
+        "config_pack_job",
+        "config_permission",
+        "config_plugin_catalogue",
+        "config_plugin_documentation",
+        "config_plugin_launch",
+        "config_plugin_launch_gap",
+        "config_plugin_setting",
+        "config_plugin_setting_change",
+        "config_plugin_setting_declaration",
+        "config_plugin_usage_report",
+        "config_plugin_version",
+        "config_record_move",
+        "config_reports_plugin_usage_change",
+        "config_reports_usage_change",
+        "config_role_rename",
+        "config_setting_change",
+        "config_sign_in",
+        "config_time_zone_change",
+        "config_usage_report",
+        "config_user_group",
+        "config_venue_account_map_change",
+        "config_venue_account_mapping",
+        "config_venue_catalogue",
+    ],
+    not_captured: &[(
+        "config_registry_catalogue",
+        "the platform's catalogue, replaced whole at each pull and pulled again by whoever runs",
+    )],
+};
 
 impl PostgresStore {
     pub fn connect(url: &str, pool_size: u32) -> Result<Self> {
@@ -53,7 +113,27 @@ impl PostgresStore {
             .max_size(pool_size.max(1))
             .build(manager)
             .map_err(unavailable)?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            fence: meridian_changes::Fence::new(),
+        })
+    }
+
+    /// The store's epoch, adopted: what a starting conductor does before it
+    /// serves (step 3a; ruling 1060).
+    pub fn adopt(&self) -> Result<u64> {
+        let mut conn = self.conn()?;
+        let epoch = CHANGES.adopt(&mut *conn).map_err(unavailable)?;
+        Ok(self.fence.adopt_once(epoch))
+    }
+
+    /// Take the store over: raise its epoch, and adopt it. Every commit
+    /// under the old one is refused in its own transaction.
+    pub fn take_over(&self) -> Result<u64> {
+        let mut conn = self.conn()?;
+        let epoch = CHANGES.take_over(&mut *conn).map_err(unavailable)?;
+        self.fence.adopt(epoch);
+        Ok(epoch)
     }
 
     /// Apply every migration not yet recorded, under a lock. Run once per
@@ -64,7 +144,8 @@ impl PostgresStore {
         let mut conn = self.conn()?;
         conn.execute("SELECT pg_advisory_lock($1)", &[&SCHEMA_LOCK])
             .map_err(unavailable)?;
-        let outcome = apply_migrations(&mut conn, clock);
+        let outcome = apply_migrations(&mut conn, clock)
+            .and_then(|()| CHANGES.install(&mut *conn).map_err(unavailable));
         let _ = conn.execute("SELECT pg_advisory_unlock($1)", &[&SCHEMA_LOCK]);
         outcome
     }
@@ -81,8 +162,14 @@ impl PostgresStore {
         migrations::verify(applied)
     }
 
+    /// A connection, named with the writer's epoch and the deployment's
+    /// time for the change log its writes are captured in.
     fn conn(&self) -> Result<Connection> {
-        self.pool.get().map_err(unavailable)
+        let mut conn = self.pool.get().map_err(unavailable)?;
+        CHANGES
+            .prepare(&mut *conn, self.fence.epoch(), meridian_changes::now_ns())
+            .map_err(unavailable)?;
+        Ok(conn)
     }
 
     /// Writes the group and its permissions, each recorded as granted by
@@ -3032,4 +3119,20 @@ fn unavailable(failed: impl std::error::Error) -> StoreError {
         cause = next.source();
     }
     StoreError::Unavailable(detail)
+}
+
+/// The configuration store's change log, read a page at a time (step 3a).
+impl meridian_changes::ChangeLog for PostgresStore {
+    fn read_changes(
+        &self,
+        partition: &str,
+        after: u64,
+        most_bytes: usize,
+    ) -> std::result::Result<meridian_changes::ReadChangesReply, meridian_changes::ReadError> {
+        let mut conn = self
+            .pool
+            .get()
+            .map_err(|failed| meridian_changes::ReadError::Unavailable(failed.to_string()))?;
+        CHANGES.read(&mut *conn, partition, after, most_bytes)
+    }
 }

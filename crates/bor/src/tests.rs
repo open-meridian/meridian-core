@@ -446,6 +446,12 @@ const ZZTP_KEPT: &str = "LCL-01J8XQ4M7K0000000000ZZT2";
 /// which holds no record of anything else.
 fn wired() -> (Arc<Bus>, Arc<MemoryStore>) {
     let (bus, store) = wired_alone();
+    resolving(&bus);
+    (bus, store)
+}
+
+/// The instrument store, stood in.
+fn resolving(bus: &Bus) {
     bus.serve(RESOLVE_INSTRUMENT, |envelope| {
         let asked = ResolveInstrumentRequest::decode(&envelope.payload[..]).unwrap();
         let record = |asset_class: AssetClass, currency: &str| InstrumentRecord {
@@ -471,7 +477,6 @@ fn wired() -> (Arc<Bus>, Arc<MemoryStore>) {
             .encode_to_vec(),
         ))
     });
-    (bus, store)
 }
 
 fn wired_with_records() -> (Arc<Bus>, Arc<MemoryStore>) {
@@ -2279,4 +2284,45 @@ async fn replay_benchmark() {
         );
     }
     CHECK_EVERY_ACT.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Step 3a: every entry, whichever path commits it, is told on its
+/// partition's tail by the writer, and read back a page at a time.
+#[tokio::test(flavor = "multi_thread")]
+async fn each_entry_is_told_on_its_partitions_tail_and_read_back() {
+    let bus = Arc::new(Bus::single(
+        "operations-sample-1",
+        Arc::new(MemoryBackend::new()),
+        Arc::new(meridian_clock::ManualClock::at(1_757_462_400_000_000_000)),
+    ));
+    let store = Arc::new(MemoryStore::new());
+    let writer: Arc<dyn Store> = Arc::new(crate::writer::Writer::new(store.clone(), bus.clone()));
+    serve(bus.clone(), writer, bus.clock());
+    resolving(&bus);
+    let mut tail = bus.subscribe_every("platform.book.internal.changes.*");
+    let reply = open(&bus).await;
+    let heard = tail.recv().await.unwrap();
+    let change = meridian_changes::Change::decode(heard.envelope.payload.as_slice()).unwrap();
+    assert_eq!((change.partition.as_str(), change.epoch), ("P0", 1));
+    let entry = crate::journal::Entry::from_change(&change).unwrap();
+    assert_eq!(entry.entry_id, reply.entry.unwrap().entry_id);
+    assert_eq!(change.sequence, entry.last_sequence);
+    let asked = meridian_changes::ReadChangesRequest {
+        partition: "P0".into(),
+        after_sequence: 0,
+        page_size: 0,
+    };
+    let (_, body) = bus
+        .call(
+            "platform.book.internal.read-changes",
+            "meridian.v1.ReadChangesRequest",
+            asked.encode_to_vec(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let page = meridian_changes::ReadChangesReply::decode(body.as_slice()).unwrap();
+    assert_eq!(page.changes, vec![change]);
+    assert_eq!(page.head, entry.last_sequence);
 }

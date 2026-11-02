@@ -290,7 +290,10 @@ fn record(
     tokio::task::block_in_place(|| {
         h.lake.record(
             "rates",
-            rates.into_iter().map(Observation::Rate).collect(),
+            rates
+                .into_iter()
+                .map(|row| Observation::Rate(Box::new(row)))
+                .collect(),
             "",
             &envelope(instance, true, ""),
         )

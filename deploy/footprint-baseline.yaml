@@ -1,0 +1,33 @@
+# The desktop footprint's baseline (ruling 1058; spec/a-deployment-scales-
+# out-and-fails-over-by-configuration section 13; plan Track 7): v29's
+# default profile -- core 3f99222, the chart dev runs as 0.1.339,
+# `resilience.profile: tolerant` as it will be named, one node, no plugin --
+# against which every later chart is held by tools/footprint.py: no new
+# pod; memory requested and at its peak each at most 15% over; CPU
+# requested at most 15% over; disk at most 10% over. Raising a figure here
+# is a reviewed change with its reason, never a fix.
+#
+# The pods and what they request are the chart's own, read from what v29's
+# chart renders with the values a first install gives it (`helm template
+# --set deployment.id=... --set deployment.enrolmentCode=...`, then
+# `tools/footprint.py render`), the same on any machine; chart-check holds
+# every chart to them. The database the wizard brings is not among them:
+# it is the deployment's choice at first run, and is measured below.
+#
+# What a deployment holds at its peak and the disk its record takes are
+# measured where it runs, on CI's runner, by e2e-cluster's footprint step:
+# once the wizard has applied and every workload of the release is ready
+# (13 pods with the database it brought), the release's memory summed over
+# its pods at its highest across a minute of the cluster's metrics, and the
+# size of its databases. Set from v29's chart -- core main 897b37d, which is
+# 3f99222 with #82's e2e stand-ins and pulldown-cmark 0.13.6, plus that step
+# alone (branch footprint-v29, run 41464704832, 2026-11-02) -- on the five
+# e2e-cluster jobs, the pinned k3s and 1.33 to 1.37: peak 160 to 162 MiB,
+# disk 34.9 MiB each; the highest is kept.
+v29:
+  pods: 12
+  memory_requested_mib: 1216
+  memory_limited_mib: 6912
+  cpu_requested_millicores: 700
+  memory_peak_mib: 162
+  disk_mib: 34.9

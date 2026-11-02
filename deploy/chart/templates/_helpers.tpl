@@ -49,6 +49,23 @@ the operator the same thing far less clearly.
 {{- end -}}
 
 {{/*
+One writer per ordering domain (ruling 1060). The lake, the book, the
+instrument store, the street store and the conductor's configuration store
+each order their changes in one sequence per partition, taken under a lock
+by the one process that writes it. A second replica is a second writer over
+the same partitions: two processes taking turns at one sequence, each with
+its own memory of the head, which corrupts the order a follower reads. Until
+the chart runs a standby and readers in their own modes (step 3b), a store's
+replicaCount is at most 1, and above it nothing renders.
+*/}}
+{{- define "meridian-runtime.oneWriter" -}}
+{{- $count := index .values "replicaCount" -}}
+{{- if gt (int $count) 1 -}}
+{{- fail (printf "%s.replicaCount is %v; it takes 0 or 1. The %s orders its changes in one sequence per partition with one writer, and a second replica is a second writer over the same partitions, which corrupts that order (ruling 1060). A standby and readers come with step 3b's modes, as values of their own." .component $count .what) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 The Secret holding the runtime's Postgres URL.
 
 A name the administrator gives, or one this chart makes and leaves empty for

@@ -55,8 +55,47 @@ const OWN_CREDENTIAL: [&str; 3] = ["first-run", "instrument", "analytics"];
 /// "Analytics": "component topics, not rows"): the analytics coordinator
 /// asking its worker pool for a unit (ruling 315, 2026-10-18), granted to
 /// that component's credential alone, publish and subscribe.
-const COMPONENT_TOPICS: [(&str, &str); 1] =
-    [("analytics", "platform.analytics.internal.compute-unit")];
+///
+/// From step 3a, each store's change log (topics.md, "Component topics";
+/// spec/one-data-access-model section 3): its `read-changes` query and its
+/// tail, `changes.{partition}`, held by the store's own members -- the
+/// runtime's credential for the lake, the book, the street store and the
+/// conductor, the instrument store's own for its -- and the lake's and the
+/// book's by the analytics component too, so a standing job can catch up a
+/// gap. Published and subscribed alike: a member asks and answers, tells
+/// and hears.
+const COMPONENT_TOPICS: [(&str, &str); 11] = [
+    ("analytics", "platform.analytics.internal.compute-unit"),
+    ("lake", "platform.lake.internal.read-changes"),
+    ("lake", "platform.lake.internal.changes.*"),
+    ("bor", "platform.book.internal.read-changes"),
+    ("bor", "platform.book.internal.changes.*"),
+    ("instrument", "platform.reference.internal.read-changes"),
+    ("instrument", "platform.reference.internal.changes.*"),
+    ("street", "platform.street.internal.read-changes"),
+    ("street", "platform.street.internal.changes.*"),
+    ("conductor", "platform.config.internal.read-changes"),
+    ("conductor", "platform.config.internal.changes.*"),
+];
+
+/// Who else holds a component's topic (topics.md's "Who else is granted
+/// it"): the analytics component, the lake's and the book's change logs.
+const COMPONENT_TOPICS_ALSO: [(&str, &str); 4] = [
+    ("analytics", "platform.lake.internal.read-changes"),
+    ("analytics", "platform.lake.internal.changes.*"),
+    ("analytics", "platform.book.internal.read-changes"),
+    ("analytics", "platform.book.internal.changes.*"),
+];
+
+/// Every component topic a credential holding `components` is granted.
+fn component_topics(components: &[&str]) -> Vec<&'static str> {
+    COMPONENT_TOPICS
+        .iter()
+        .chain(COMPONENT_TOPICS_ALSO.iter())
+        .filter(|(owner, _)| components.contains(owner))
+        .map(|(_, topic)| *topic)
+        .collect()
+}
 
 /// Why a component holds a credential of its own, as its user's note says.
 fn own_credential_note(component: &str) -> String {
@@ -273,11 +312,9 @@ pub fn users(contract: &Contract, instances: &[Instance]) -> Result<Vec<User>, S
         if publish.is_empty() && subscribe.is_empty() {
             continue;
         }
-        for (owner, topic) in COMPONENT_TOPICS {
-            if owner == component {
-                publish.push(topic.to_string());
-                subscribe.push(topic.to_string());
-            }
+        for topic in component_topics(&[component]) {
+            publish.push(topic.to_string());
+            subscribe.push(topic.to_string());
         }
         publish.push(INBOX.to_string());
         subscribe.push(INBOX.to_string());
@@ -291,6 +328,10 @@ pub fn users(contract: &Contract, instances: &[Instance]) -> Result<Vec<User>, S
     }
 
     let (mut publish, mut subscribe) = component_subjects(contract, &RUNTIME_COMPONENTS);
+    for topic in component_topics(&RUNTIME_COMPONENTS) {
+        publish.push(topic.to_string());
+        subscribe.push(topic.to_string());
+    }
     publish.push(INBOX.to_string());
     subscribe.push(INBOX.to_string());
     users.push(User {

@@ -188,6 +188,11 @@ instrument:
   replicaCount: 1
   image:
     tag: ""
+  # The hot layer (step 3a): records by ID and what each became, answered
+  # from the store's memory, bounded in MiB, the least recently read
+  # evicted first.
+  hotLayer:
+    recordsMiB: 32
 
 conductor:
   replicaCount: 1
@@ -245,6 +250,11 @@ bor:
   # book's start for every account past it with none current. The default is
   # from core's replay benchmark; 10 to 100000.
   snapshotInterval: 1000
+  # The hot layer (step 3a): each account's book at its head, answered from
+  # the book's memory, bounded in MiB, the least recently read evicted
+  # first, within its 512 MiB.
+  hotLayer:
+    booksMiB: 128
 
 # The lake (W10, contract v18). One replica: every batch takes its dataset's
 # head in Postgres, so a second would wait rather than help, and the rollout
@@ -280,6 +290,16 @@ lake:
   # tight -- a limit under 512 MiB -- at the cost of readers waiting longer
   # in a burst; more only with a limit raised to match.
   maxConcurrentAnswers: 2
+  # The hot layer (step 3a; spec/one-data-access-model section 3): what the
+  # lake answers from its own memory, Postgres the record, each layer
+  # bounded in MiB, the least recently read evicted first, within the
+  # lake's 1 GiB (ruling 808). latestMiB: each dataset's latest rows per
+  # subject, what a live page reads. listingsMiB: a chain's series per
+  # underlying and dataset. Raising the lake's memory limit is not the fix
+  # for a layer that does not fit; a smaller bound is (808).
+  hotLayer:
+    latestMiB: 64
+    listingsMiB: 32
   database:
     existingSecret: ""
     key: ""

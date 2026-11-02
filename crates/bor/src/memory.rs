@@ -27,10 +27,14 @@ struct State {
     by_message: HashMap<String, String>,
     by_key: HashMap<(String, String), String>,
     cash: BTreeMap<String, meridian_domain::money::Resolution>,
+    /// Every partition's epoch (step 3a), and each entry's, by its ID.
+    epoch: u64,
+    epochs: HashMap<String, u64>,
 }
 
 pub struct MemoryStore {
     state: Mutex<State>,
+    fence: meridian_changes::Fence,
 }
 
 impl Default for MemoryStore {
@@ -44,8 +48,10 @@ impl MemoryStore {
         let mut state = State::default();
         state.heads.insert(FIRST_PARTITION.to_string(), 0);
         state.heads.insert(CONTROL_PARTITION.to_string(), 0);
+        state.epoch = 1;
         MemoryStore {
             state: Mutex::new(state),
+            fence: meridian_changes::Fence::new(),
         }
     }
 
@@ -88,6 +94,8 @@ impl Store for MemoryStore {
             .get(account_id)
             .cloned()
             .unwrap_or_else(|| Book::new(account_id, first_partition_of(account_id)));
+        let epoch = self.fence.adopt_once(state.epoch);
+        self.fence.admits(state.epoch)?;
         let head = state.heads.get(&book.partition).copied().unwrap_or(0);
         // The book holds no entry's body, as a store's never does (contract
         // v26, W9.10): each one a decision asks for is read from the journal,
@@ -114,6 +122,7 @@ impl Store for MemoryStore {
         state
             .heads
             .insert(entry.partition.clone(), entry.last_sequence);
+        state.epochs.insert(entry.entry_id.clone(), epoch);
         state
             .replies
             .insert(entry.entry_id.clone(), decided.reply.clone());
@@ -159,6 +168,55 @@ impl Store for MemoryStore {
             .get(account_id)
             .cloned()
             .unwrap_or_default())
+    }
+
+    fn adopt(&self) -> Result<u64> {
+        let state = self.state();
+        Ok(self.fence.adopt_once(state.epoch))
+    }
+
+    fn epoch(&self) -> u64 {
+        self.fence.epoch()
+    }
+
+    fn take_over(&self) -> Result<u64> {
+        let mut state = self.state();
+        state.epoch += 1;
+        self.fence.adopt(state.epoch);
+        Ok(state.epoch)
+    }
+
+    fn read_changes(
+        &self,
+        partition: &str,
+        after: u64,
+        most_bytes: usize,
+    ) -> std::result::Result<meridian_changes::ReadChangesReply, meridian_changes::ReadError> {
+        let state = self.state();
+        let head = *state
+            .heads
+            .get(partition)
+            .ok_or_else(|| meridian_changes::ReadError::UnknownPartition(partition.to_string()))?;
+        let mut entries: Vec<&Entry> = state
+            .journals
+            .values()
+            .flatten()
+            .filter(|entry| entry.partition == partition && entry.last_sequence > after)
+            .collect();
+        entries.sort_by_key(|entry| entry.last_sequence);
+        let mut page = meridian_changes::Page::new(most_bytes);
+        for entry in entries {
+            let epoch = state.epochs.get(&entry.entry_id).copied().unwrap_or(1);
+            if !page.take(entry.to_change(epoch, meridian_changes::origin())) {
+                break;
+            }
+        }
+        Ok(meridian_changes::ReadChangesReply {
+            changes: page.changes,
+            head,
+            lowest_kept: u64::from(head > 0),
+            epoch: state.epoch,
+        })
     }
 
     fn accounts(&self) -> Result<Vec<String>> {

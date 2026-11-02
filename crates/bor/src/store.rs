@@ -30,6 +30,11 @@ pub enum StoreError {
     #[error("the book is unavailable: {0}")]
     Unavailable(String),
 
+    /// A command refused by its partition's epoch: another writer took the
+    /// book over, and this one steps down (step 3a; ruling 1060).
+    #[error("{0}")]
+    Fenced(#[from] meridian_changes::Fenced),
+
     /// The database was migrated by a newer release than this binary: the
     /// one refusal at start that waiting never fixes.
     #[error("{0}")]
@@ -491,6 +496,28 @@ pub trait Store: Send + Sync {
 
     /// An account's journal, in order.
     fn journal(&self, account_id: &str) -> Result<Vec<Entry>>;
+
+    /// The writer's epoch, adopted from the `control` partition where none
+    /// was yet (step 3a): what a starting book does before its first
+    /// command, and what a store not started as a writer does at its first.
+    fn adopt(&self) -> Result<u64>;
+
+    /// The epoch this store's commands commit under; 0 before it adopted one.
+    fn epoch(&self) -> u64;
+
+    /// Take the book over: raise every partition's epoch in one transaction
+    /// and adopt it. Every command another writer commits under the old one
+    /// is refused.
+    fn take_over(&self) -> Result<u64>;
+
+    /// A page of `partition`'s change log after `after` (step 3a): its
+    /// journal's entries in sequence, each one change, at most `most_bytes`.
+    fn read_changes(
+        &self,
+        partition: &str,
+        after: u64,
+        most_bytes: usize,
+    ) -> std::result::Result<meridian_changes::ReadChangesReply, meridian_changes::ReadError>;
 
     /// The bodies of the named entries of an account's journal (contract
     /// v26, W9.10), each with its entry: what a decision asks for that the

@@ -64,6 +64,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "quality_counts",
         sql: include_str!("../migrations/0008_quality_counts.sql"),
     },
+    Migration {
+        version: 9,
+        name: "change_log",
+        sql: include_str!("../migrations/0009_change_log.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

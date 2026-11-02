@@ -295,7 +295,12 @@ async fn a_bonds_print_keeps_its_basis_yield_cap_and_characteristics_and_a_new_y
         .bus
         .subscribe_every(&format!("platform.lake.{TRACE}.event.trades-recorded"));
     assert_eq!(
-        record(&h, "trades", vec![Observation::Trade(print("T-1"))]).unwrap(),
+        record(
+            &h,
+            "trades",
+            vec![Observation::Trade(Box::new(print("T-1")))]
+        )
+        .unwrap(),
         (1, 0, 0)
     );
     let published = TradesRecordedEvent::decode(&heard.recv().await.unwrap().envelope.payload[..])
@@ -323,20 +328,25 @@ async fn a_bonds_print_keeps_its_basis_yield_cap_and_characteristics_and_a_new_y
     // The same print again is a repeat; its yield corrected, a restatement,
     // never counted unchanged.
     assert_eq!(
-        record(&h, "trades", vec![Observation::Trade(print("T-1"))]).unwrap(),
+        record(
+            &h,
+            "trades",
+            vec![Observation::Trade(Box::new(print("T-1")))]
+        )
+        .unwrap(),
         (0, 0, 1)
     );
     let mut corrected = print("T-1");
     corrected.r#yield = quoted("5.094", YieldKind::ToWorst, "2034-02-05");
     assert_eq!(
-        record(&h, "trades", vec![Observation::Trade(corrected)]).unwrap(),
+        record(&h, "trades", vec![Observation::Trade(Box::new(corrected))]).unwrap(),
         (0, 1, 0)
     );
     let mut uncapped = print("T-1");
     uncapped.quantity_capped = false;
     uncapped.r#yield = quoted("5.094", YieldKind::ToWorst, "2034-02-05");
     assert_eq!(
-        record(&h, "trades", vec![Observation::Trade(uncapped)]).unwrap(),
+        record(&h, "trades", vec![Observation::Trade(Box::new(uncapped))]).unwrap(),
         (0, 1, 0),
         "a cap lifted is a restatement"
     );
@@ -364,7 +374,10 @@ async fn a_when_issued_print_in_yield_and_a_spread_over_its_benchmark_need_no_mo
         record(
             &h,
             "trades",
-            vec![Observation::Trade(when_issued), Observation::Trade(spread)]
+            vec![
+                Observation::Trade(Box::new(when_issued)),
+                Observation::Trade(Box::new(spread))
+            ]
         )
         .unwrap(),
         (2, 0, 0)
@@ -381,7 +394,7 @@ async fn a_when_issued_print_in_yield_and_a_spread_over_its_benchmark_need_no_mo
         ..Default::default()
     };
     assert_eq!(
-        record(&h, "prices", vec![Observation::Price(high_yield)]).unwrap(),
+        record(&h, "prices", vec![Observation::Price(Box::new(high_yield))]).unwrap(),
         (1, 0, 0)
     );
     let answer = read(&h, DataType::Price, UST);
@@ -397,7 +410,7 @@ async fn what_w10_4_refuses_of_a_fixed_income_row_is_refused_naming_the_field() 
     let refused = |change: &dyn Fn(&mut Trade)| {
         let mut row = print("T-X");
         change(&mut row);
-        record(&h, "trades", vec![Observation::Trade(row)]).unwrap_err()
+        record(&h, "trades", vec![Observation::Trade(Box::new(row))]).unwrap_err()
     };
     let words = refused(&|row| {
         row.basis = PriceBasis::Yield as i32;
@@ -452,11 +465,11 @@ async fn what_w10_4_refuses_of_a_fixed_income_row_is_refused_naming_the_field() 
         benchmark_instrument_id: UST.into(),
         ..Default::default()
     };
-    let words = record(&h, "prices", vec![Observation::Price(spreadless)]).unwrap_err();
+    let words = record(&h, "prices", vec![Observation::Price(Box::new(spreadless))]).unwrap_err();
     assert!(words.starts_with("prices[0].price"), "{words}");
     let mut floorless = firm_quote("Q-X");
     floorless.ask_quantity = None;
-    let words = record(&h, "quotes", vec![Observation::Quote(floorless)]).unwrap_err();
+    let words = record(&h, "quotes", vec![Observation::Quote(Box::new(floorless))]).unwrap_err();
     assert!(words.starts_with("quotes[0].ask_size_capped"), "{words}");
 }
 
@@ -497,7 +510,12 @@ async fn an_ats_firm_quote_is_a_quote_on_its_venue_its_sizes_at_least_and_its_yi
         "meridian.v1.Quote.benchmark_instrument_id",
     ]));
     assert_eq!(
-        record(&h, "quotes", vec![Observation::Quote(firm_quote("Q-1"))]).unwrap(),
+        record(
+            &h,
+            "quotes",
+            vec![Observation::Quote(Box::new(firm_quote("Q-1")))]
+        )
+        .unwrap(),
         (1, 0, 0)
     );
     let answer = read(&h, DataType::Quote, BOND);
@@ -534,7 +552,7 @@ async fn an_ats_firm_quote_is_a_quote_on_its_venue_its_sizes_at_least_and_its_yi
     let mut indicative = firm_quote("Q-2");
     indicative.characteristics = vec![QuoteCharacteristic::Indicative as i32];
     assert_eq!(
-        record(&h, "quotes", vec![Observation::Quote(indicative)]).unwrap(),
+        record(&h, "quotes", vec![Observation::Quote(Box::new(indicative))]).unwrap(),
         (1, 0, 0)
     );
 }
@@ -610,7 +628,9 @@ fn record_factors(
     tokio::task::block_in_place(|| {
         h.lake.record(
             "factors",
-            rows.into_iter().map(Observation::Factor).collect(),
+            rows.into_iter()
+                .map(|row| Observation::Factor(Box::new(row)))
+                .collect(),
             "",
             &envelope("gse-disclosures-1"),
         )
