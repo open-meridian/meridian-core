@@ -732,6 +732,8 @@ def main():
         "and the serving role may not create tables",
     )
 
+    footprint(s)
+
     print("G: the administrator the wizard named", flush=True)
     # The thing no other test here can reach: the Job wrote the name into a
     # Secret, the chart handed it to the conductor, and the conductor wrote
@@ -1261,6 +1263,50 @@ def edge_storage(s):
     ]:
         ok, said = admitted(roles, volume)
         s.check(not ok and words in said, f"a plugin's pod mounting {why} is refused: {said}")
+
+
+def footprint(s):
+    """The desktop footprint (ruling 1058): the default profile, as the wizard
+    left it -- one node, no plugin -- held to v29's baseline in
+    deploy/footprint-baseline.yaml. Its pods, and the memory and CPU they
+    request, are the chart's (chart-check holds them); what is measured here
+    is the memory its pods hold at their peak over a minute, by the
+    cluster's metrics, and the disk its record takes, each printed and held
+    to the baseline's figure where the baseline has one."""
+    print("F2: the footprint", flush=True)
+    held = json.loads(kubectl("get", "pods", "-o", "json") or "{}").get("items", [])
+    ours = {
+        pod["metadata"]["name"]
+        for pod in held
+        if pod["metadata"].get("labels", {}).get("app.kubernetes.io/instance") == RELEASE
+        and "meridian.dev/component" in pod["metadata"].get("labels", {})
+        and pod.get("status", {}).get("phase") == "Running"
+    }
+    peak = None
+    for _ in range(12):
+        said = kubectl("top", "pods", "--no-headers")
+        total = 0.0
+        for line in said.splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[0] in ours and parts[2].endswith("Mi"):
+                total += float(parts[2][:-2])
+        if said:
+            peak = total if peak is None else max(peak, total)
+        time.sleep(5)
+    disk = None
+    if ROUTE == "brought":
+        size = psql("select sum(pg_database_size(datname)) from pg_database")
+        disk = round(int(size) / 1048576, 1) if size.isdigit() else None
+    s.note(f"footprint: {len(ours)} pods running, memory at its peak {peak} MiB, disk {disk} MiB")
+    command = [sys.executable, "tools/footprint.py", "measured",
+               "--baseline", "deploy/footprint-baseline.yaml"]
+    if peak is not None:
+        command += ["--peak-mib", f"{peak:.1f}"]
+    if disk is not None:
+        command += ["--disk-mib", f"{disk:.1f}"]
+    done = subprocess.run(command, capture_output=True, text=True)
+    s.note((done.stdout + done.stderr).strip())
+    s.check(done.returncode == 0, "the default profile's footprint is within v29's baseline (ruling 1058)")
 
 
 def verdict(s):

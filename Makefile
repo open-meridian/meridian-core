@@ -2260,6 +2260,14 @@ chart-check:
 		$(HELM_TEMPLATE) check deploy/chart $$base --set $$value=7 2>/dev/null | grep -A1 "name: $$name$$" | grep -q 'value: "7"' \
 			|| { echo "chart-check FAILED: $$value=7 does not reach its store" >&2; exit 1; }; \
 	done
+	@# Ruling 1058: the desktop footprint. The default profile's pods and
+	@# what they request, as this chart renders them for a first install,
+	@# held to v29's baseline (deploy/footprint-baseline.yaml): no new pod,
+	@# memory and CPU requested at most 15% over. What it holds at its peak
+	@# and on disk is e2e-cluster's to measure.
+	@$(PY) tools/footprint.py --self-test >/dev/null
+	@$(HELM_TEMPLATE) check deploy/chart --set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check 2>/dev/null \
+		| $(PY) tools/footprint.py check --baseline deploy/footprint-baseline.yaml
 	@# Ruling 1060: one writer per ordering domain until step 3b's modes, so
 	@# the lake, the book, the instrument store, the street store and the
 	@# conductor each render at 1 and refuse 2, naming why.

@@ -1,0 +1,27 @@
+# The desktop footprint's baseline (ruling 1058; spec/a-deployment-scales-
+# out-and-fails-over-by-configuration section 13; plan Track 7): v29's
+# default profile -- core 3f99222, the chart dev runs as 0.1.339,
+# `resilience.profile: tolerant` as it will be named, one node, no plugin --
+# against which every later chart is held by tools/footprint.py: no new
+# pod; memory requested and at its peak each at most 15% over; CPU
+# requested at most 15% over; disk at most 10% over. Raising a figure here
+# is a reviewed change with its reason, never a fix.
+#
+# The pods and what they request are the chart's own, read from what v29's
+# chart renders with the values a first install gives it (`helm template
+# --set deployment.id=... --set deployment.enrolmentCode=...`, then
+# `tools/footprint.py render`), the same on any machine; chart-check holds
+# every chart to them. The database the wizard brings is not among them:
+# it is the deployment's choice at first run, and is measured below.
+#
+# What a deployment holds at its peak and the disk its record takes are
+# measured where it runs, on CI's runner, by e2e-cluster's footprint step,
+# and held to these figures once they are set from a run of v29's chart.
+# Until then they are null, and the step prints what it measured.
+v29:
+  pods: 12
+  memory_requested_mib: 1216
+  memory_limited_mib: 6912
+  cpu_requested_millicores: 700
+  memory_peak_mib: null
+  disk_mib: null
