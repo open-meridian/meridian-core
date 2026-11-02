@@ -1679,6 +1679,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 
 [[package]]
+name = "lz4_flex"
+version = "0.11.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "373f5eceeeab7925e0c1098212f2fbc4d416adec9d35051a6ab251e824c1854a"
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1787,6 +1793,7 @@ dependencies = [
 name = "meridian-changes"
 version = "0.1.0"
 dependencies = [
+ "lz4_flex",
  "meridian-bus",
  "meridian-clock",
  "meridian-domain",
@@ -1954,6 +1961,7 @@ dependencies = [
  "prost",
  "r2d2",
  "r2d2_postgres",
+ "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -1996,6 +2004,7 @@ dependencies = [
  "postgres",
  "prost",
  "rand 0.8.8",
+ "reqwest",
  "serde_json",
  "tokio",
  "tokio-stream",
@@ -2192,7 +2201,7 @@ version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
 dependencies = [
- "base64 0.21.7",
+ "base64 0.22.1",
  "chrono",
  "getrandom 0.2.17",
  "http",
