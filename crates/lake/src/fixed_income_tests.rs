@@ -909,24 +909,38 @@ async fn a_pool_completed_after_its_factor_was_refused_takes_its_factor_without_
             meridian_domain::v1::PluginCatalogue::default().encode_to_vec(),
         ))
     });
-    let lake = service::serve(bus.clone(), Arc::new(crate::MemoryStore::new()), clock.clone());
+    let lake = service::serve(
+        bus.clone(),
+        Arc::new(crate::MemoryStore::new()),
+        clock.clone(),
+    );
     lake.configured(&factor_configuration());
     let h = Harness { bus, lake };
 
-    let refused = record_factors(&h, vec![factor(LOCAL, "202610", "0.83102210", "2026-11-25")])
-        .unwrap_err();
+    let refused = record_factors(
+        &h,
+        vec![factor(LOCAL, "202610", "0.83102210", "2026-11-25")],
+    )
+    .unwrap_err();
     assert!(refused.contains("no pool or REMIC class"), "{refused}");
     // A person accepts the offered class and type; within the window the
     // answer held stands, and the store is not asked for every row.
     completed.store(true, Ordering::SeqCst);
-    let again = record_factors(&h, vec![factor(LOCAL, "202610", "0.83102210", "2026-11-25")])
-        .unwrap_err();
+    let again = record_factors(
+        &h,
+        vec![factor(LOCAL, "202610", "0.83102210", "2026-11-25")],
+    )
+    .unwrap_err();
     assert!(again.contains("no pool or REMIC class"), "{again}");
     assert_eq!(asked.load(Ordering::SeqCst), 1);
     // After it, asked again: the pool's factor is recorded, no restart.
     clock.advance(16 * 1_000_000_000);
     assert_eq!(
-        record_factors(&h, vec![factor(LOCAL, "202610", "0.83102210", "2026-11-25")]).unwrap(),
+        record_factors(
+            &h,
+            vec![factor(LOCAL, "202610", "0.83102210", "2026-11-25")]
+        )
+        .unwrap(),
         (1, 0, 0)
     );
     assert_eq!(asked.load(Ordering::SeqCst), 2);

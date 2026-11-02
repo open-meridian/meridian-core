@@ -246,6 +246,10 @@ pub const TRADES_LOGGED_EVERY: Duration = Duration::from_secs(60);
 /// How long the catalogue's launched versions are read again after.
 const VERSIONS_FOR_NS: i64 = 300 * 1_000_000_000;
 
+/// A record's class and type the instrument store answered while it was
+/// still to be completed, and when.
+type Unsettled = ((i32, i32), i64);
+
 /// How long the lake keeps a record's class and type the instrument store
 /// answered while the record was still to be completed -- provisional, or
 /// its class not yet in force -- before asking again: a person
@@ -353,7 +357,7 @@ pub struct Lake {
     /// Each record the instrument store answered still to be completed,
     /// with what it answered and when: asked again after
     /// [`UNSETTLED_FOR_NS`].
-    unsettled: Mutex<BTreeMap<String, ((i32, i32), i64)>>,
+    unsettled: Mutex<BTreeMap<String, Unsettled>>,
     cash: Mutex<CashInstruments>,
     versions: Mutex<(BTreeMap<String, String>, i64)>,
     /// Contract v27 (W10.4; ruling 418): the latest liveness per dataset
