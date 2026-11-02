@@ -1,0 +1,42 @@
+# The images a job runs, as the run's images and compile jobs built them
+# (ruling 1068): their artifacts downloaded and each image loaded under the
+# name the make targets run (tools/ci-images.sh), refused unless it is the
+# image those jobs built. The job then runs make with IMAGES=pulled, so no
+# target builds an image again and nothing compiles.
+name: gate-images
+description: Load the images this run's images and compile jobs built.
+inputs:
+  artifacts:
+    description: The artifacts holding them, space-separated (images, cluster-images, test-images).
+    required: true
+  names:
+    description: The images, by their names in the Makefile's `make ci-images`, space-separated.
+    required: true
+  core:
+    description: Where core is checked out.
+    default: workspace/meridian-core
+runs:
+  using: composite
+  steps:
+    - name: Download the run's images
+      shell: bash
+      env:
+        ARTIFACTS: ${{ inputs.artifacts }}
+      # A glob: {a,b} for several, the name alone for one (a brace with no
+      # comma matches nothing).
+      run: |
+        set -- $ARTIFACTS
+        if [ $# -gt 1 ]; then pattern="{$(IFS=,; echo "$*")}"; else pattern="$1"; fi
+        echo "pattern=$pattern" >> "$GITHUB_OUTPUT"
+      id: pattern
+    - uses: actions/download-artifact@v4
+      with:
+        pattern: ${{ steps.pattern.outputs.pattern }}
+        path: ${{ runner.temp }}/gate-images
+        merge-multiple: true
+    - name: Load them
+      shell: bash
+      working-directory: ${{ inputs.core }}
+      env:
+        NAMES: ${{ inputs.names }}
+      run: tools/ci-images.sh load "$RUNNER_TEMP/gate-images" $NAMES

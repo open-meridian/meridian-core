@@ -12,6 +12,11 @@ ARG RUST_VERSION=1.90
 # The runtime image, for the settings pages' server below: the dashboard's
 # base and the kit the image carries. Built first by the target that uses it.
 ARG RUNTIME_IMAGE=meridian-runtime:local
+# Where the settings pages' server takes its executable from: the
+# settings-binary-image stage below, which compiles it, or an image of it
+# already built (make passes $(SETTINGS_BINARY_IMAGE)), from which nothing
+# compiles (ruling 1068).
+ARG SETTINGS_BINARY=settings-binary-image
 
 FROM rust:${RUST_VERSION}-slim-bookworm AS base
 # tzdata: the instrument store reads a spot-date rule's cut in its zone from
@@ -71,10 +76,14 @@ RUN --mount=type=cache,id=meridian-core-registry,target=/usr/local/cargo/registr
  && rm /tmp/compiled.json
 RUN run-tests link
 
-# Everything that needs nothing but a toolchain: the unit tests, and the
-# integration tests that stand up their own world in-process.
+# The unit tests, and the integration tests that stand up their own world
+# in-process, are run from this image by `make test` (`run-tests --workspace
+# --lib`, and the runtime's wiring module on its own run), as the services'
+# suites are: the image is built once and every stage that needs a test
+# binary runs it (ruling 1068), rather than a build stage of its own running
+# them again on top of it.
 #
-# `--lib` alone was the whole of this stage until the runtime's wiring test
+# `--lib` alone was the whole of that run until the runtime's wiring test
 # existed and never ran. An integration test that no target names is not a
 # slower test, it is an absent one, so check-test-targets refuses a tests/ file
 # that no make target reaches.
@@ -84,11 +93,6 @@ RUN run-tests link
 # prove themselves against (`make demo`). A lightweight in-process substitute is
 # deliberately not offered for any of them, so a store or a platform client that
 # behaves differently in development cannot exist.
-FROM compile AS test
-# The runtime's wiring module on its own run: a filter after -- applies to
-# every binary a run selects, the unit tests' too.
-RUN run-tests --workspace --lib \
- && run-tests -p meridian-runtime --test it -- wiring::
 
 # Clippy is an analysis, not a build: it checks every target, tests included,
 # with nothing to copy from the compile above, and keeps what it checks in the
@@ -140,10 +144,20 @@ RUN --mount=type=cache,id=meridian-core-registry,target=/usr/local/cargo/registr
  && cp "$exe" /settings-page \
  && rm /tmp/compiled.json
 
+# The one executable on its own, an image of nothing else (make
+# settings-binary-image): what CI's compile job pushes beside the test
+# binaries, so the settings-page stage puts it on the runtime image without
+# compiling (ruling 1068).
+FROM scratch AS settings-binary-image
+COPY --from=settings-binary /settings-page /settings-page
+
+# Where the executable is taken from (SETTINGS_BINARY, above).
+FROM ${SETTINGS_BINARY} AS settings-binary-from
+
 # A plugin's Settings pages served for a real browser (make e2e-settings-page):
 # the dashboard's unit-test binary, whose ignored server
 # (crates/dashboard/src/admin/tests/served.rs) stands up its own world in-process,
 # on the runtime image so it serves the kit that image carries.
 FROM ${RUNTIME_IMAGE} AS settings-page
-COPY --from=settings-binary /settings-page /usr/local/bin/settings-page
+COPY --from=settings-binary-from /settings-page /usr/local/bin/settings-page
 ENTRYPOINT ["settings-page", "--ignored", "--exact", "admin::tests::served::serve_a_plugins_settings_pages_for_a_browser", "--nocapture"]
