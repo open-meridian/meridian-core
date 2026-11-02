@@ -1257,6 +1257,16 @@ async fn a_quiet_or_upgraded_account_is_snapshotted_at_start_and_by_a_read() {
 
 // ── The change log (step 3a) ──
 
+/// A store of a small pool: the suite's tests run at once, and the test
+/// database admits so many connections.
+fn small() -> Arc<PostgresStore> {
+    let store = PostgresStore::connect(&url(), 2).expect("could not reach the test database");
+    store
+        .migrate(&meridian_clock::SystemClock)
+        .expect("could not create the schema");
+    Arc::new(store)
+}
+
 /// A store over a schema of its own, so a takeover raises no other test's
 /// epoch.
 fn isolated() -> (String, Arc<PostgresStore>) {
@@ -1267,7 +1277,7 @@ fn isolated() -> (String, Arc<PostgresStore>) {
         .expect("a schema of its own");
     let joined = if url().contains('?') { "&" } else { "?" };
     let url = format!("{}{joined}options=-csearch_path%3D{schema}", url());
-    let store = PostgresStore::connect(&url, 4).expect("could not reach the test database");
+    let store = PostgresStore::connect(&url, 2).expect("could not reach the test database");
     store
         .migrate(&meridian_clock::SystemClock)
         .expect("could not create the schema");
@@ -1287,7 +1297,7 @@ fn followed(store: &PostgresStore, partition: &str, page: usize) -> Vec<meridian
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_follower_given_the_journal_in_any_page_split_builds_the_writers_books() {
-    let (bus, store) = wired();
+    let (bus, store) = wired_with(blocking(small));
     let accounts: Vec<String> = (0..3).map(|_| unique("ACC")).collect();
     for account in &accounts {
         open(&bus, account, &unique("INS")).await;
@@ -1328,7 +1338,7 @@ async fn a_deposed_writers_command_is_refused_after_a_takeover_and_leaves_no_hol
     assert_eq!(blocking(|| writer.adopt()).unwrap(), 1);
     let account = unique("ACC");
     open(&bus, &account, &unique("INS")).await;
-    let standby = Arc::new(PostgresStore::connect(&url, 2).unwrap());
+    let standby = Arc::new(PostgresStore::connect(&url, 1).unwrap());
     assert_eq!(blocking(|| standby.take_over()).unwrap(), 2);
     let refused = send(
         &bus,
@@ -1361,7 +1371,7 @@ async fn a_deposed_writers_command_is_refused_after_a_takeover_and_leaves_no_hol
 /// record builds from its snapshot and tail, under any bound.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_book_held_at_its_head_is_the_book_the_record_builds() {
-    let record = blocking(store);
+    let record = blocking(small);
     for bound in [meridian_bor::writer::DEFAULT_BOOKS_BYTES, 3_000] {
         let bus = Arc::new(Bus::single(
             "operations-test-1",

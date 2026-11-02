@@ -2682,7 +2682,7 @@ fn isolated(tag: &str) -> (String, PostgresStore) {
         .expect("a schema of its own");
     let joined = if url.contains('?') { "&" } else { "?" };
     let url = format!("{url}{joined}options=-csearch_path%3D{schema}");
-    let store = PostgresStore::connect(&url, 4).expect("could not reach the test database");
+    let store = PostgresStore::connect(&url, 2).expect("could not reach the test database");
     store
         .migrate(&SystemClock)
         .expect("could not create the schema");
@@ -2780,7 +2780,7 @@ fn a_deposed_writers_batch_is_refused_after_a_takeover_and_leaves_no_hole() {
             10,
         )
         .unwrap();
-    let standby = PostgresStore::connect(&url, 2).unwrap();
+    let standby = PostgresStore::connect(&url, 1).unwrap();
     assert_eq!(standby.take_over().unwrap(), 2);
     // The deposed writer's next batch, to a partition held and to a new one.
     let refused = writer

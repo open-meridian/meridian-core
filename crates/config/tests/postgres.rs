@@ -2655,7 +2655,7 @@ fn a_deposed_conductors_commit_is_refused_after_a_takeover_and_takes_no_sequence
         ..AccountRecord::default()
     };
     writer.put_account(&account("ACC-A")).unwrap();
-    let standby = PostgresStore::connect(&url, 2).unwrap();
+    let standby = PostgresStore::connect(&url, 1).unwrap();
     assert_eq!(standby.take_over().unwrap(), 2);
     let refused = writer.put_account(&account("ACC-B")).unwrap_err();
     assert!(
