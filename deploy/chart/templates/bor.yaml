@@ -1,4 +1,5 @@
 {{- include "meridian-runtime.require" . -}}
+{{- include "meridian-runtime.oneWriter" (dict "component" "bor" "what" "book of record" "values" .Values.bor) -}}
 {{/*
   The book of record (W9): the firm's own positions, breaks and figures, an
   append-only journal per account partition and the projections rebuilt from

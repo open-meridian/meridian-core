@@ -2249,7 +2249,19 @@ chart-check:
 		! $(HELM_TEMPLATE) check deploy/chart $$base --set lake.mallocMmapThreshold=$$refused >/dev/null 2>&1 \
 			|| { echo "chart-check FAILED: lake.mallocMmapThreshold=$$refused rendered; it takes a whole number of bytes above 0" >&2; exit 1; }; \
 	done
-	@echo "chart-check OK: the lake's whole answers at once, 2 by default and 1 to 8 alone, and its mmap threshold, 128 KiB by default and whole bytes alone; the platform's keys on the conductor alone, as files, only where the chart carries some, its current key by default; four components, the dashboard and the three ways it signs people in, the key and the settings key on the conductor alone, both key paths, refusals, migrations, no pinned uid, a plugin held to its side of the pod, its front door open to the dashboard alone, an Ingress only when asked for and HTTPS alone unless plain HTTP is, development only when asked for, the live shape there alone, a backup only when sealed and placed, and nothing an upgrade leaves behind"
+	@# Ruling 1060: one writer per ordering domain until step 3b's modes, so
+	@# the lake, the book, the instrument store, the street store and the
+	@# conductor each render at 1 and refuse 2, naming why.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
+	for store in lake bor instrument street conductor; do \
+		$(HELM_TEMPLATE) check deploy/chart $$base --set $$store.replicaCount=1 >/dev/null 2>&1 \
+			|| { echo "chart-check FAILED: $$store.replicaCount=1 did not render" >&2; exit 1; }; \
+		said="$$($(HELM_TEMPLATE) check deploy/chart $$base --set $$store.replicaCount=2 2>&1 >/dev/null)" \
+			&& { echo "chart-check FAILED: $$store.replicaCount=2 rendered; two writers over one partition corrupt its order (ruling 1060)" >&2; exit 1; }; \
+		echo "$$said" | grep -q "$$store.replicaCount is 2; it takes 0 or 1.*ruling 1060" \
+			|| { echo "chart-check FAILED: $$store.replicaCount=2 was refused without saying why: $$said" >&2; exit 1; }; \
+	done
+	@echo "chart-check OK: one writer per store (ruling 1060); the lake's whole answers at once, 2 by default and 1 to 8 alone, and its mmap threshold, 128 KiB by default and whole bytes alone; the platform's keys on the conductor alone, as files, only where the chart carries some, its current key by default; four components, the dashboard and the three ways it signs people in, the key and the settings key on the conductor alone, both key paths, refusals, migrations, no pinned uid, a plugin held to its side of the pod, its front door open to the dashboard alone, an Ingress only when asked for and HTTPS alone unless plain HTTP is, development only when asked for, the live shape there alone, a backup only when sealed and placed, and nothing an upgrade leaves behind"
 
 lint:
 	@$(DOCKER) build -f Dockerfile.rust --target lint $(VERDICT) . >/dev/null 2>&1 \

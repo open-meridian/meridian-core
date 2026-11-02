@@ -1,4 +1,5 @@
 {{- include "meridian-runtime.require" . -}}
+{{- include "meridian-runtime.oneWriter" (dict "component" "conductor" "what" "conductor's configuration store" "values" .Values.conductor) -}}
 {{/*
   The conductor. The one component holding the deployment's key, and therefore the
   only one that can reach the platform at all. Decision 011.

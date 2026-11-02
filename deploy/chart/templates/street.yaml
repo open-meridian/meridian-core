@@ -1,4 +1,5 @@
 {{- include "meridian-runtime.require" . -}}
+{{- include "meridian-runtime.oneWriter" (dict "component" "street" "what" "street store" "values" .Values.street) -}}
 {{/*
   The street store. Its own Deployment and its own image tag, which is the whole
   point of the split: the instrument store holds what the platform can send again, this
