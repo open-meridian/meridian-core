@@ -16,6 +16,7 @@ pub mod launcher;
 pub mod lease;
 pub mod member;
 pub mod preflight;
+pub mod probe;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, OnceLock};

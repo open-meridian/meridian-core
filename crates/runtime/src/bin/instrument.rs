@@ -34,6 +34,15 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
+    // Every path this member needs, probed from inside its pod: what
+    // `meridian status` and `doctor` read (step 3b).
+    if std::env::args().nth(1).as_deref() == Some("probe") {
+        return meridian_runtime::probe::run(&meridian_runtime::probe::Paths {
+            component: "instrument",
+            domain: Some("reference"),
+            database: Some("MERIDIAN_DATABASE_URL"),
+        });
+    }
     let url = required("MERIDIAN_DATABASE_URL")?;
 
     // Before the key is touched: a migration job holds database credentials and

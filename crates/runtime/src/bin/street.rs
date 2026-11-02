@@ -39,6 +39,15 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
+    // Every path this member needs, probed from inside its pod: what
+    // `meridian status` and `doctor` read (step 3b).
+    if std::env::args().nth(1).as_deref() == Some("probe") {
+        return meridian_runtime::probe::run(&meridian_runtime::probe::Paths {
+            component: "street",
+            domain: Some("street"),
+            database: Some("MERIDIAN_STREET_DATABASE_URL"),
+        });
+    }
     let url = required("MERIDIAN_STREET_DATABASE_URL")?;
 
     if std::env::args().nth(1).as_deref() == Some("migrate") {

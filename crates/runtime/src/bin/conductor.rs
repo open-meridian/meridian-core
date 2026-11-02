@@ -56,6 +56,15 @@ const ENROL_WITH_CODE: &str = "platform.config.command.enrol-with-code";
 const SETTINGS_KEY: &str = "/run/meridian/settings-key";
 
 fn run() -> Result<(), String> {
+    // Every path this member needs, probed from inside its pod: what
+    // `meridian status` and `doctor` read (step 3b).
+    if std::env::args().nth(1).as_deref() == Some("probe") {
+        return meridian_runtime::probe::run(&meridian_runtime::probe::Paths {
+            component: "conductor",
+            domain: meridian_runtime::var("MERIDIAN_CONFIG_DATABASE_URL").map(|_| "config"),
+            database: Some("MERIDIAN_CONFIG_DATABASE_URL"),
+        });
+    }
     let command = std::env::args().nth(1);
 
     // The upgrade preflight (H1; ruling 586): run from the release being
