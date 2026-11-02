@@ -9,6 +9,7 @@ use meridian_domain::date::Date;
 use meridian_domain::v1::{
     EntitlementsChangedEvent, Money, ObservationMeta, Price, Source, SourcePriority, SubjectRef,
 };
+use meridian_lake::postgres::SCHEMA_LOCK;
 use meridian_lake::row::{DataType, Observation};
 use meridian_lake::store::{Query, Store, When};
 use meridian_lake::PostgresStore;
@@ -1321,14 +1322,24 @@ fn a_read_of_the_latest_is_chosen_in_sql_per_series_keeping_the_last_valid_row()
     // Rows recorded without the key (before migration 4, or by the release
     // before during a rolling upgrade): each a key of its own, then filled
     // in by the next migrate.
+    //
+    // Under migrate's own lock until they are read: every other test's
+    // store() migrates, and its backfill fills in every row with no key, so
+    // one running between the keys taken away and the read had the read
+    // choose as if they were never gone (a flake; ruling 1069, 448). Taking
+    // the lock waits for a migrate under way and holds off the next.
     let url = std::env::var("MERIDIAN_TEST_DATABASE_URL").unwrap();
     let mut raw = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    raw.execute("SELECT pg_advisory_lock($1)", &[&SCHEMA_LOCK])
+        .unwrap();
     raw.execute(
         "UPDATE lake_row SET latest_key = NULL, quality = NULL WHERE dataset = $1",
         &[&dataset],
     )
     .unwrap();
     let unkeyed = store.read(&latest_query(&dataset, &subject, true)).unwrap();
+    raw.execute("SELECT pg_advisory_unlock($1)", &[&SCHEMA_LOCK])
+        .unwrap();
     assert_eq!(keys_of(&unkeyed), keys_of(&every), "every row, as before");
     store.migrate(&SystemClock).unwrap();
     let missing: i64 = raw

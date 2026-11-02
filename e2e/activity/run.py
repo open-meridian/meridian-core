@@ -39,7 +39,8 @@ import time
 PROJECT = "meridian-core-activity"
 LOG = ".e2e-activity.log"
 COMPOSE = ["docker", "compose", "-p", PROJECT, "-f", ".harness/compose.yaml",
-           "-f", ".harness/plugins.yaml", "-f", "e2e/harness/stand-in.yaml"]
+           "-f", ".harness/plugins.yaml", "-f", "e2e/harness/stand-in.yaml",
+           "-f", "e2e/postgres-for-tests.yaml"]
 ENV = dict(os.environ, MERIDIAN_HARNESS_STAND_IN=os.path.abspath("e2e/plugin-page"))
 ACCOUNT = "Activity Brokerage"
 FUND = "local(symbol:MMF@stand-in)"
