@@ -86,7 +86,8 @@ import html
 
 import grpc
 import meridian
-from meridian import Interface, Page
+from meridian import Declaration, Interface, Page
+from meridian.roles import compliance, connectivity, ems, oms, operations, portfolio
 from meridian.plugin.v1 import operations_pb2 as ops
 from meridian.v1 import sidecar_pb2
 
@@ -292,10 +293,22 @@ def fills_html(fills, told, said, code):
 
 
 class Plugin:
-    def __init__(self, plugin):
-        self.plugin = plugin
-        self.ops = plugin._operations()
+    """A stand-in's page, its acts made on the wire through the role class
+    the plugin runs (SDK 0.35: each role one class, `roles(...)` below), as
+    a page acts through the role object the plugin gives it (ruling
+    1014)."""
+
+    def __init__(self):
+        self.role = None
         self.heard = []
+
+    @property
+    def plugin(self):
+        return self.role.plugin
+
+    @property
+    def ops(self):
+        return self.role._operations()
 
     async def call(self, operation, params):
         try:
@@ -419,8 +432,8 @@ class Pm(Plugin):
 
 
 class Desk(Plugin):
-    def __init__(self, plugin):
-        super().__init__(plugin)
+    def __init__(self):
+        super().__init__()
         self.instructions = []
 
     async def on_instruction(self, heard):
@@ -636,9 +649,8 @@ def settles(trade_date):
 
 
 class Venue(Plugin):
-    def __init__(self, plugin):
-        super().__init__(plugin)
-        self.me = plugin.identity.instance_id
+    def __init__(self):
+        super().__init__()
         self.worked = {}
         self.halted = None
         self.sent = 0
@@ -652,6 +664,10 @@ class Venue(Plugin):
             self.answers.append({"execution_id": execution.execution_id, "not_ours": True})
             return
         self.answers.append(fill_json(execution))
+
+    @property
+    def me(self):
+        return self.plugin.identity.instance_id
 
     def raw(self, key):
         return self.plugin.raw_record(key)
@@ -1020,6 +1036,108 @@ class DeskInterface(Interface):
         ]
 
 
+# ── The role classes (SDK 0.35) ─────────────────────────────────────────────
+#
+# Each role a stand-in holds is one class (ruling 1005), registered on one
+# connection by `meridian.run_async`; the events it hears are its `on_<row>`
+# methods, those it ignores handled empty (ruling 1043). None reads the store
+# when its stream opens (`seed`): each hears only the changes from then on,
+# as the stand-ins' `receive(..., seed=False)` did before 0.35.
+
+
+class Holding(portfolio.Role):
+    seed = False
+
+
+class Managing(oms.Role):
+    seed = False
+
+    async def on_order_updated(self, heard):
+        pass
+
+    async def on_booking_updated(self, heard):
+        pass
+
+    async def on_alert_changed(self, heard):
+        pass
+
+
+class Executing(ems.Role):
+    """The desk's ems: the trading instructions heard (W11.9)."""
+
+    seed = False
+
+    def __init__(self, desk):
+        self.desk = desk
+
+    async def on_order_updated(self, heard):
+        pass
+
+    async def on_execution_recorded(self, heard):
+        pass
+
+    async def on_placement_updated(self, heard):
+        pass
+
+    async def on_trading_instruction_changed(self, heard):
+        await self.desk.on_instruction(heard)
+
+
+class Checking(compliance.Role):
+    seed = False
+
+    async def on_order_updated(self, heard):
+        pass
+
+    async def on_placement_updated(self, heard):
+        pass
+
+    async def on_execution_recorded(self, heard):
+        pass
+
+    async def on_alert_changed(self, heard):
+        pass
+
+
+class Connecting(connectivity.Role):
+    """The simulated venue: each placement naming it worked, the trading
+    instructions honoured, each execution's answer heard."""
+
+    seed = False
+
+    def __init__(self, venue):
+        self.venue = venue
+
+    async def on_placement_updated(self, heard):
+        await self.venue.on_placement(heard)
+
+    async def on_trading_instruction_changed(self, heard):
+        await self.venue.on_instruction(heard)
+
+    async def on_execution_recorded(self, heard):
+        await self.venue.on_execution(heard)
+
+
+class Operating(operations.Role):
+    seed = False
+
+    async def on_activity_recorded(self, heard):
+        pass
+
+
+def roles(served):
+    """The kind's role classes, the first the one its page acts through."""
+    if isinstance(served, Desk):
+        return [Executing(served), Managing()]
+    if isinstance(served, Venue):
+        return [Connecting(served)]
+    if isinstance(served, Comp):
+        return [Checking()]
+    if isinstance(served, Ops):
+        return [Operating()]
+    return [Holding()]
+
+
 async def main():
     title, kind, levels = {
         "pm": ("Portfolio stand-in", Pm, ["write", "admin"]),
@@ -1028,29 +1146,19 @@ async def main():
         "venue": ("Simulated venue", Venue, ["write", "admin"]),
         "ops": ("Operations stand-in", Ops, ["write", "admin"]),
     }[KIND]
-    roles = {"desk": ["oms", "ems"]}.get(KIND, [])
-    pages = [Page("/", title, levels=levels, roles=roles)]
+    held = {"desk": ["oms", "ems"]}.get(KIND, [])
+    pages = [Page("/", title, levels=levels, roles=held)]
     interface = Interface(PORT, title, pages=pages)
     if KIND == "desk":
         # Contract v23: the ems's page for unmatched fills, and its tools.
         pages.append(Page("/fills", "Unmatched fills", levels=["write"], roles=["ems"]))
         interface = DeskInterface(PORT, title, pages=pages)
-    plugin = await meridian.connect(interface=interface)
-    served = kind(plugin)
-    # Heard through the SDK's receive (W4.3): seeded by one read at start,
-    # nothing handed on for it, then each change in order.
-    if KIND == "venue":
-        asyncio.ensure_future(plugin.receive(placement_updated=served.on_placement,
-                                             trading_instruction_changed=served.on_instruction,
-                                             execution_recorded=served.on_execution,
-                                             seed=False))
-    elif KIND == "desk":
-        asyncio.ensure_future(plugin.receive(trading_instruction_changed=served.on_instruction,
-                                             seed=False))
-    log(registered=plugin.identity.instance_id, kind=KIND)
+    served = kind()
+    classes = roles(served)
+    served.role = classes[0]
     threading.Thread(target=serve, args=(served,), daemon=True).start()
-    while True:
-        await asyncio.sleep(3600)
+    log(kind=KIND)
+    await meridian.run_async(Declaration(interface=interface), classes)
 
 
 if __name__ == "__main__":
