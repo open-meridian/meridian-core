@@ -34,9 +34,11 @@ on:
 permissions:
   contents: read
 
+# A pull request's newer push cancels its older run (ruling 1069, 446); a run
+# of the merge queue, or by hand, is never cancelled and cancels nothing.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # The two stages that need no image: beside the builds, not after them.
