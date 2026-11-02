@@ -15,13 +15,19 @@
 # it is the deployment's choice at first run, and is measured below.
 #
 # What a deployment holds at its peak and the disk its record takes are
-# measured where it runs, on CI's runner, by e2e-cluster's footprint step,
-# and held to these figures once they are set from a run of v29's chart.
-# Until then they are null, and the step prints what it measured.
+# measured where it runs, on CI's runner, by e2e-cluster's footprint step:
+# once the wizard has applied and every workload of the release is ready
+# (13 pods with the database it brought), the release's memory summed over
+# its pods at its highest across a minute of the cluster's metrics, and the
+# size of its databases. Set from v29's chart -- core main 897b37d, which is
+# 3f99222 with #82's e2e stand-ins and pulldown-cmark 0.13.6, plus that step
+# alone (branch footprint-v29, run 41464704832, 2026-11-02) -- on the five
+# e2e-cluster jobs, the pinned k3s and 1.33 to 1.37: peak 160 to 162 MiB,
+# disk 34.9 MiB each; the highest is kept.
 v29:
   pods: 12
   memory_requested_mib: 1216
   memory_limited_mib: 6912
   cpu_requested_millicores: 700
-  memory_peak_mib: null
-  disk_mib: null
+  memory_peak_mib: 162
+  disk_mib: 34.9
