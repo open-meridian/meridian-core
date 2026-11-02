@@ -46,12 +46,12 @@ async fn each_batch_is_on_its_partitions_tail_and_read_back_in_any_page_split() 
     for at in 0..40 {
         let quotes: Vec<Observation> = (0..5)
             .map(|i| {
-                Observation::Quote(quote(
+                Observation::Quote(Box::new(quote(
                     &format!("q-{at}-{i}"),
                     NOW + at * 1_000 + i,
                     money("100.5", "USD", ""),
                     money("100.7", "USD", ""),
-                ))
+                )))
             })
             .collect();
         record_rows(&h, "quotes", quotes).unwrap();
@@ -100,12 +100,12 @@ async fn a_follower_behind_retention_is_refused_and_reloads_at_the_head() {
         record_rows(
             &h,
             "quotes",
-            vec![Observation::Quote(quote(
+            vec![Observation::Quote(Box::new(quote(
                 &format!("q-{at}"),
                 NOW + at * DAY,
                 money("1", "USD", ""),
                 None,
-            ))],
+            )))],
         )
         .unwrap();
     }
@@ -159,12 +159,12 @@ async fn the_tail_beside_the_row_events_is_measured() {
         for at in 0..batches {
             let quotes: Vec<Observation> = (0..per_batch)
                 .map(|i| {
-                    Observation::Quote(quote(
+                    Observation::Quote(Box::new(quote(
                         &format!("m-{at}-{i}"),
                         NOW + at * 1_000 + i,
                         money("100.51", "USD", ""),
                         money("100.73", "USD", ""),
-                    ))
+                    )))
                 })
                 .collect();
             record_rows(&h, "quotes", quotes).unwrap();

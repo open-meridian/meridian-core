@@ -202,28 +202,59 @@ impl DataType {
 /// wire whole.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
+///
+/// The variants larger than a chain's own rows are boxed (ruling 959): a
+/// vector of rows is sized by its smallest kinds -- a chain's statistics and
+/// series, about 550 bytes a slot -- not by a trade's 1,088, and each boxed
+/// row takes only its own size beside its pointer.
 pub enum Observation {
-    Price(Price),
-    Bar(Bar),
-    Trade(Trade),
-    Quote(Quote),
-    Outcome(Outcome),
-    ExecutionCost(ExecutionCost),
-    Rate(Rate),
+    Price(Box<Price>),
+    Bar(Box<Bar>),
+    Trade(Box<Trade>),
+    Quote(Box<Quote>),
+    Outcome(Box<Outcome>),
+    ExecutionCost(Box<ExecutionCost>),
+    Rate(Box<Rate>),
     Statistic(Statistic),
     Series(ListedSeries),
-    Derived(DerivedSeries),
+    Derived(Box<DerivedSeries>),
     Scenario(SavedScenario),
-    CorporateAction(CorporateActionAnnounced),
+    CorporateAction(Box<CorporateActionAnnounced>),
     Filing(Filing),
-    ReportedFact(ReportedFact),
+    ReportedFact(Box<ReportedFact>),
     RatingAction(RatingAction),
     HoldingsReport(HoldingsReport),
-    Holding(Holding),
-    Factor(Factor),
+    Holding(Box<Holding>),
+    Factor(Box<Factor>),
 }
 
 impl Observation {
+    /// The heap a boxed row's message takes beside its pointer (ruling
+    /// 959); 0 for a row held inline.
+    pub fn boxed_bytes(&self) -> usize {
+        use std::mem::size_of_val;
+        match self {
+            Observation::Price(row) => size_of_val(&**row),
+            Observation::Bar(row) => size_of_val(&**row),
+            Observation::Trade(row) => size_of_val(&**row),
+            Observation::Quote(row) => size_of_val(&**row),
+            Observation::Outcome(row) => size_of_val(&**row),
+            Observation::ExecutionCost(row) => size_of_val(&**row),
+            Observation::Rate(row) => size_of_val(&**row),
+            Observation::Derived(row) => size_of_val(&**row),
+            Observation::CorporateAction(row) => size_of_val(&**row),
+            Observation::ReportedFact(row) => size_of_val(&**row),
+            Observation::Holding(row) => size_of_val(&**row),
+            Observation::Factor(row) => size_of_val(&**row),
+            Observation::Statistic(_)
+            | Observation::Series(_)
+            | Observation::Scenario(_)
+            | Observation::Filing(_)
+            | Observation::RatingAction(_)
+            | Observation::HoldingsReport(_) => 0,
+        }
+    }
+
     pub fn data_type(&self) -> DataType {
         match self {
             Observation::Price(_) => DataType::Price,
@@ -559,26 +590,30 @@ impl Observation {
 
     pub fn decode(data_type: DataType, bytes: &[u8]) -> Result<Observation, prost::DecodeError> {
         Ok(match data_type {
-            DataType::Price => Observation::Price(Price::decode(bytes)?),
-            DataType::Bar => Observation::Bar(Bar::decode(bytes)?),
-            DataType::Trade => Observation::Trade(Trade::decode(bytes)?),
-            DataType::Quote => Observation::Quote(Quote::decode(bytes)?),
-            DataType::Outcome => Observation::Outcome(Outcome::decode(bytes)?),
-            DataType::ExecutionCost => Observation::ExecutionCost(ExecutionCost::decode(bytes)?),
-            DataType::Rate => Observation::Rate(Rate::decode(bytes)?),
+            DataType::Price => Observation::Price(Box::new(Price::decode(bytes)?)),
+            DataType::Bar => Observation::Bar(Box::new(Bar::decode(bytes)?)),
+            DataType::Trade => Observation::Trade(Box::new(Trade::decode(bytes)?)),
+            DataType::Quote => Observation::Quote(Box::new(Quote::decode(bytes)?)),
+            DataType::Outcome => Observation::Outcome(Box::new(Outcome::decode(bytes)?)),
+            DataType::ExecutionCost => {
+                Observation::ExecutionCost(Box::new(ExecutionCost::decode(bytes)?))
+            }
+            DataType::Rate => Observation::Rate(Box::new(Rate::decode(bytes)?)),
             DataType::Statistic => Observation::Statistic(Statistic::decode(bytes)?),
             DataType::Series => Observation::Series(ListedSeries::decode(bytes)?),
-            DataType::Derived => Observation::Derived(DerivedSeries::decode(bytes)?),
+            DataType::Derived => Observation::Derived(Box::new(DerivedSeries::decode(bytes)?)),
             DataType::Scenario => Observation::Scenario(SavedScenario::decode(bytes)?),
             DataType::CorporateAction => {
-                Observation::CorporateAction(CorporateActionAnnounced::decode(bytes)?)
+                Observation::CorporateAction(Box::new(CorporateActionAnnounced::decode(bytes)?))
             }
             DataType::Filing => Observation::Filing(Filing::decode(bytes)?),
-            DataType::ReportedFact => Observation::ReportedFact(ReportedFact::decode(bytes)?),
+            DataType::ReportedFact => {
+                Observation::ReportedFact(Box::new(ReportedFact::decode(bytes)?))
+            }
             DataType::RatingAction => Observation::RatingAction(RatingAction::decode(bytes)?),
             DataType::HoldingsReport => Observation::HoldingsReport(HoldingsReport::decode(bytes)?),
-            DataType::Holding => Observation::Holding(Holding::decode(bytes)?),
-            DataType::Factor => Observation::Factor(Factor::decode(bytes)?),
+            DataType::Holding => Observation::Holding(Box::new(Holding::decode(bytes)?)),
+            DataType::Factor => Observation::Factor(Box::new(Factor::decode(bytes)?)),
         })
     }
 
@@ -714,7 +749,7 @@ impl Observation {
                     meta.source_times.clear();
                     meta.valid_from_ns = 0;
                     meta.valid_until_ns = 0;
-                    Observation::ReportedFact(fact)
+                    Observation::ReportedFact(Box::new(fact))
                 };
                 (a.filing != b.filing || self.meta().raw != other.meta().raw)
                     && restated(a).same_but_raw(&restated(b))
@@ -828,7 +863,7 @@ impl Observation {
                         cost_bps: None,
                         fees_bps: None,
                         financing_bps: None,
-                        ..a.clone()
+                        ..*a.clone()
                     } == ExecutionCost {
                         meta: None,
                         benchmark_price: None,
@@ -837,7 +872,7 @@ impl Observation {
                         cost_bps: None,
                         fees_bps: None,
                         financing_bps: None,
-                        ..b.clone()
+                        ..*b.clone()
                     }
             }
             (Observation::Rate(a), Observation::Rate(b)) => {

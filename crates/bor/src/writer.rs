@@ -1,15 +1,29 @@
 //! What the book's writer does after each commit (step 3a): the entry on its
-//! partition's change log's tail, published after commit and at most once.
+//! partition's change log's tail, published after commit and at most once,
+//! and each account's book at its head held in memory -- the book's hot
+//! layer (spec/one-data-access-model section 3).
 //!
 //! A store wrapped, so no command path can commit without it: every path
 //! reaches the journal through [`Store::act`].
+//!
+//! **Books at their head.** `book(account)` -- what the order path, the
+//! booking path and the reads ask before deciding -- is answered from memory
+//! once the account's book is held: the book the commit made, which is the
+//! journal replayed to that entry, the same the record builds from its
+//! snapshot and tail. A book loaded from the record is held only if no
+//! later commit of the account was held meanwhile (each book carries the
+//! sequence of its last entry). Bounded by `bor.hotLayer.booksMiB`, the
+//! least recently read evicted first; a rebuild empties it. Any other read
+//! -- as of a time, a page of positions -- is the record's.
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use meridian_bus::Bus;
 
 use meridian_domain::v1::{AccountAttributes, AccountFigures, BookPosition, Break};
 
+use crate::book::{Bodies, Book};
 use crate::journal::Entry;
 use crate::store::{
     Acted, AlertsRead, AttributesRead, BookingsRead, BreaksRead, Decide, FiguresRead, HistoryRead,
@@ -20,15 +34,130 @@ use crate::store::{
 /// The book's change log's domain in its component topics.
 pub const DOMAIN: &str = "book";
 
-/// A store whose every commit is told on its partition's tail.
+/// The default bound: 128 MiB of books, within the book's 512 MiB.
+pub const DEFAULT_BOOKS_BYTES: usize = 128 * 1024 * 1024;
+
+/// The bound from the chart's value, MiB; the default where unset.
+pub fn books_bytes_from_mib(said: Option<&str>) -> std::result::Result<usize, String> {
+    match said {
+        None | Some("") => Ok(DEFAULT_BOOKS_BYTES),
+        Some(text) => text
+            .parse::<usize>()
+            .ok()
+            .filter(|mib| *mib > 0 && *mib <= 4096)
+            .map(|mib| mib * 1024 * 1024)
+            .ok_or_else(|| {
+                format!("bor.hotLayer.booksMiB is {text:?}; a whole number of MiB from 1 to 4096")
+            }),
+    }
+}
+
+/// The sequence of a book's last entry: how far into its journal it is.
+fn reached(book: &Book) -> u64 {
+    book.entries.last().map_or(0, |entry| entry.first.sequence)
+}
+
+/// What a book costs held, roughly.
+fn cost(book: &Book) -> usize {
+    1_024
+        + book.positions.len() * 640
+        + book.entries.len() * 160
+        + book.breaks.len() * 512
+        + book.figures.len() * 512
+        + book.lifecycle_events.len() * 512
+        + (book.ledger.orders.len()
+            + book.ledger.placements.len()
+            + book.ledger.executions.len()
+            + book.ledger.instructions.len())
+            * 768
+}
+
+#[derive(Default)]
+struct Books {
+    held: BTreeMap<String, (Book, usize, u64)>,
+    by_use: BTreeMap<u64, String>,
+    bytes: usize,
+    tick: u64,
+}
+
+impl Books {
+    fn put(&mut self, mut book: Book, bound: usize) {
+        // A book held answers as the record's does: no entry's body in it.
+        book.bodies = Bodies::default();
+        let account = book.account_id.clone();
+        if let Some((held, _, _)) = self.held.get(&account) {
+            if reached(held) > reached(&book) {
+                return;
+            }
+        }
+        self.forget(&account);
+        let size = cost(&book);
+        self.tick += 1;
+        self.bytes += size;
+        self.by_use.insert(self.tick, account.clone());
+        self.held.insert(account, (book, size, self.tick));
+        while self.bytes > bound {
+            let Some((_, oldest)) = self.by_use.pop_first() else {
+                break;
+            };
+            if let Some((_, size, _)) = self.held.remove(&oldest) {
+                self.bytes -= size;
+            }
+        }
+    }
+
+    fn get(&mut self, account: &str) -> Option<Book> {
+        let (book, _, used) = self.held.get(account)?;
+        let (book, used) = (book.clone(), *used);
+        self.by_use.remove(&used);
+        self.tick += 1;
+        self.by_use.insert(self.tick, account.to_string());
+        if let Some(held) = self.held.get_mut(account) {
+            held.2 = self.tick;
+        }
+        Some(book)
+    }
+
+    fn forget(&mut self, account: &str) {
+        if let Some((_, size, used)) = self.held.remove(account) {
+            self.bytes -= size;
+            self.by_use.remove(&used);
+        }
+    }
+}
+
+/// A store whose every commit is told on its partition's tail, and whose
+/// accounts' books at their head are held in memory.
 pub struct Writer {
     inner: Arc<dyn Store>,
     bus: Arc<Bus>,
+    books: Mutex<Books>,
+    bound: usize,
 }
 
 impl Writer {
     pub fn new(inner: Arc<dyn Store>, bus: Arc<Bus>) -> Self {
-        Self { inner, bus }
+        Self::bounded(inner, bus, DEFAULT_BOOKS_BYTES)
+    }
+
+    /// The same, its books bounded by `bound` bytes.
+    pub fn bounded(inner: Arc<dyn Store>, bus: Arc<Bus>, bound: usize) -> Self {
+        Self {
+            inner,
+            bus,
+            books: Mutex::new(Books::default()),
+            bound,
+        }
+    }
+
+    fn books(&self) -> std::sync::MutexGuard<'_, Books> {
+        self.books.lock().expect("the book's hot layer is poisoned")
+    }
+
+    /// How many books it holds, and their bytes.
+    pub fn held(&self) -> (usize, usize) {
+        let books = self.books();
+        (books.held.len(), books.bytes)
     }
 }
 
@@ -45,6 +174,7 @@ impl Store for Writer {
             .inner
             .act(account_id, message_id, idempotency_key, request, decide)?;
         if let Acted::Committed(decided) = &acted {
+            self.books().put(decided.book.clone(), self.bound);
             let change = decided
                 .entry
                 .to_change(self.inner.epoch(), meridian_changes::origin());
@@ -87,7 +217,12 @@ impl Store for Writer {
     }
 
     fn book(&self, account_id: &str) -> Result<crate::book::Book> {
-        self.inner.book(account_id)
+        if let Some(held) = self.books().get(account_id) {
+            return Ok(held);
+        }
+        let book = self.inner.book(account_id)?;
+        self.books().put(book.clone(), self.bound);
+        Ok(book)
     }
 
     fn book_health(
@@ -141,7 +276,9 @@ impl Store for Writer {
     }
 
     fn rebuild(&self) -> Result<usize> {
-        self.inner.rebuild()
+        let rebuilt = self.inner.rebuild();
+        *self.books() = Books::default();
+        rebuilt
     }
 
     fn cash_instruments(&self) -> Result<Vec<meridian_domain::money::Resolution>> {

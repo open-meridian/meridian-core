@@ -1003,7 +1003,7 @@ impl Lake {
                     Observation::Derived(value)
                         if request.series.is_empty() || request.series.contains(&value.series) =>
                     {
-                        Some(value)
+                        Some(*value)
                     }
                     _ => None,
                 })
@@ -1609,7 +1609,7 @@ impl Lake {
             meta.previous_sequence = 0;
             meta.recorded_at_ns = 0;
             meta.closed_day = None;
-            rows.push(Observation::ExecutionCost(cost));
+            rows.push(Observation::ExecutionCost(Box::new(cost)));
         }
         let done = self
             .store
@@ -1692,7 +1692,7 @@ impl Lake {
             // Left out where invalid, as a default read leaves it (W10.6).
             .filter(|row| !crate::store::invalid(row))
             .filter_map(|row| match row {
-                Observation::ExecutionCost(cost) => Some(cost),
+                Observation::ExecutionCost(cost) => Some(*cost),
                 _ => None,
             })
             .filter(|cost| cost.account_id == request.account_id)
@@ -1925,7 +1925,7 @@ impl Lake {
             Observation::Factor(factor) => (
                 "meridian.v1.FactorsRecordedEvent",
                 meridian_domain::v1::FactorsRecordedEvent {
-                    factor: Some(factor.clone()),
+                    factor: Some(*factor.clone()),
                 }
                 .encode_to_vec(),
             ),
@@ -1934,7 +1934,7 @@ impl Lake {
             Observation::CorporateAction(action) => (
                 "meridian.v1.CorporateActionsRecordedEvent",
                 CorporateActionsRecordedEvent {
-                    action: Some(action.clone()),
+                    action: Some(*action.clone()),
                 }
                 .encode_to_vec(),
             ),
@@ -1948,28 +1948,28 @@ impl Lake {
             Observation::Price(price) => (
                 "meridian.v1.PricesRecordedEvent",
                 PricesRecordedEvent {
-                    price: Some(price.clone()),
+                    price: Some(*price.clone()),
                 }
                 .encode_to_vec(),
             ),
             Observation::Bar(bar) => (
                 "meridian.v1.BarsRecordedEvent",
                 BarsRecordedEvent {
-                    bar: Some(bar.clone()),
+                    bar: Some(*bar.clone()),
                 }
                 .encode_to_vec(),
             ),
             Observation::Trade(trade) => (
                 "meridian.v1.TradesRecordedEvent",
                 TradesRecordedEvent {
-                    trade: Some(trade.clone()),
+                    trade: Some(*trade.clone()),
                 }
                 .encode_to_vec(),
             ),
             Observation::Quote(quote) => (
                 "meridian.v1.QuotesRecordedEvent",
                 QuotesRecordedEvent {
-                    quote: Some(quote.clone()),
+                    quote: Some(*quote.clone()),
                 }
                 .encode_to_vec(),
             ),
@@ -1978,7 +1978,7 @@ impl Lake {
             Observation::Outcome(outcome) => (
                 "meridian.v1.OutcomesRecordedEvent",
                 OutcomesRecordedEvent {
-                    outcome: Some(outcome.clone()),
+                    outcome: Some(*outcome.clone()),
                 }
                 .encode_to_vec(),
             ),
@@ -1987,7 +1987,7 @@ impl Lake {
             Observation::Rate(rate) => (
                 "meridian.v1.RatesRecordedEvent",
                 RatesRecordedEvent {
-                    rate: Some(rate.clone()),
+                    rate: Some(*rate.clone()),
                 }
                 .encode_to_vec(),
             ),
@@ -2738,8 +2738,9 @@ impl Lake {
             }
         }
         let total = whole.rows.len();
-        let rows: Vec<Observation> = whole.rows.iter().skip(offset).take(page).cloned().collect();
-        let next = (offset + rows.len() < total).then(|| cursor(as_of, offset + rows.len()));
+        let start = offset.min(total);
+        let end = start.saturating_add(page).min(total);
+        let next = (end < total).then(|| cursor(as_of, end));
         {
             let mut pages = self.pages.lock().expect("pages poisoned");
             if next.is_none() {
@@ -2748,7 +2749,16 @@ impl Lake {
                 pages.hold(held_as, Arc::clone(&whole), std::time::Instant::now());
             }
         }
-        drop(whole);
+        // A whole answer that is its only page, held by nothing else, is
+        // moved into the reply, never staged as a copy (ruling 959).
+        let rows: Vec<Observation> = if start == 0 && next.is_none() {
+            match Arc::try_unwrap(whole) {
+                Ok(owned) => owned.rows,
+                Err(shared) => shared.rows.clone(),
+            }
+        } else {
+            whole.rows[start..end].to_vec()
+        };
         noted_read(read.data_type, total, rows.len());
         let datasets: BTreeSet<String> = rows.iter().map(|r| r.dataset().to_string()).collect();
         let heads = self.store.heads().map_err(|failed| failed.to_string())?;
@@ -2896,7 +2906,7 @@ impl Lake {
                 .rows
                 .into_iter()
                 .filter_map(|r| match r {
-                    Observation::Rate(rate) => Some(rate),
+                    Observation::Rate(rate) => Some(*rate),
                     _ => None,
                 })
                 .collect(),
@@ -3556,7 +3566,7 @@ impl Lake {
                 .rows
                 .into_iter()
                 .filter_map(|r| match r {
-                    Observation::CorporateAction(action) => Some(action),
+                    Observation::CorporateAction(action) => Some(*action),
                     _ => None,
                 })
                 .collect(),
@@ -3638,7 +3648,7 @@ impl Lake {
                 .rows
                 .into_iter()
                 .filter_map(|row| match row {
-                    Observation::Factor(factor) => Some(factor),
+                    Observation::Factor(factor) => Some(*factor),
                     _ => None,
                 })
                 .collect(),
@@ -3745,7 +3755,7 @@ impl Lake {
                                 > (held_at, held.source_sequence)
                         });
                         if later {
-                            latest.insert(key, trade.clone());
+                            latest.insert(key, *trade.clone());
                         }
                         found = true;
                     }
@@ -3873,7 +3883,7 @@ impl Lake {
                 .rows
                 .into_iter()
                 .filter_map(|row| match row {
-                    Observation::Outcome(outcome) => Some(outcome),
+                    Observation::Outcome(outcome) => Some(*outcome),
                     _ => None,
                 })
                 .collect(),
@@ -5296,6 +5306,7 @@ fn serve_on<Req, Rep, F>(
         let started = std::time::Instant::now();
         if read {
             READ_NOTED.with(|noted| noted.set(None));
+            crate::hot::noted::begin();
         }
         let request: Req = decode(&envelope, request_type)?;
         let answered = handle(&lake, request, &envelope);
@@ -5305,6 +5316,9 @@ fn serve_on<Req, Rep, F>(
                 .map(|(kind, whole, page)| (kind.name(), whole, page))
                 .unwrap_or(("", 0, 0));
             let ms = started.elapsed().as_secs_f64() * 1e3;
+            // Step 3a: whether memory answered the rows it read, and which
+            // layer (the hot layer), beside 812's fields.
+            let (from_memory, layer) = crate::hot::noted::take();
             match &answered {
                 Ok(reply) => tracing::info!(
                     topic,
@@ -5313,6 +5327,8 @@ fn serve_on<Req, Rep, F>(
                     of = whole,
                     bytes = reply.encoded_len(),
                     ms = format!("{ms:.1}"),
+                    from_memory,
+                    layer,
                     "a read answered"
                 ),
                 Err(_) => tracing::info!(topic, kind, ms = format!("{ms:.1}"), "a read refused"),
@@ -5343,7 +5359,11 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
         |lake, request: RecordPricesRequest, envelope| {
             lake.record(
                 "prices",
-                request.prices.into_iter().map(Observation::Price).collect(),
+                request
+                    .prices
+                    .into_iter()
+                    .map(|row| Observation::Price(Box::new(row)))
+                    .collect(),
                 &request.want_id,
                 envelope,
             )
@@ -5360,7 +5380,11 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
         |lake, request: RecordBarsRequest, envelope| {
             lake.record(
                 "bars",
-                request.bars.into_iter().map(Observation::Bar).collect(),
+                request
+                    .bars
+                    .into_iter()
+                    .map(|row| Observation::Bar(Box::new(row)))
+                    .collect(),
                 &request.want_id,
                 envelope,
             )
@@ -5377,7 +5401,11 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
         |lake, request: RecordTradesRequest, envelope| {
             lake.record(
                 "trades",
-                request.trades.into_iter().map(Observation::Trade).collect(),
+                request
+                    .trades
+                    .into_iter()
+                    .map(|row| Observation::Trade(Box::new(row)))
+                    .collect(),
                 &request.want_id,
                 envelope,
             )
@@ -5394,7 +5422,11 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
         |lake, request: RecordQuotesRequest, envelope| {
             lake.record(
                 "quotes",
-                request.quotes.into_iter().map(Observation::Quote).collect(),
+                request
+                    .quotes
+                    .into_iter()
+                    .map(|row| Observation::Quote(Box::new(row)))
+                    .collect(),
                 &request.want_id,
                 envelope,
             )
@@ -5414,7 +5446,7 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
                 request
                     .outcomes
                     .into_iter()
-                    .map(Observation::Outcome)
+                    .map(|row| Observation::Outcome(Box::new(row)))
                     .collect(),
                 "",
                 envelope,
@@ -5433,7 +5465,11 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
         |lake, request: RecordRatesRequest, envelope| {
             lake.record(
                 "rates",
-                request.rates.into_iter().map(Observation::Rate).collect(),
+                request
+                    .rates
+                    .into_iter()
+                    .map(|row| Observation::Rate(Box::new(row)))
+                    .collect(),
                 &request.want_id,
                 envelope,
             )
@@ -5528,7 +5564,7 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
                 request
                     .actions
                     .into_iter()
-                    .map(Observation::CorporateAction)
+                    .map(|row| Observation::CorporateAction(Box::new(row)))
                     .collect(),
                 &request.want_id,
                 envelope,
@@ -5564,7 +5600,7 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
                 request
                     .factors
                     .into_iter()
-                    .map(Observation::Factor)
+                    .map(|row| Observation::Factor(Box::new(row)))
                     .collect(),
                 &request.want_id,
                 envelope,
@@ -5599,7 +5635,7 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
                 request
                     .values
                     .into_iter()
-                    .map(Observation::Derived)
+                    .map(|row| Observation::Derived(Box::new(row)))
                     .collect(),
                 "",
                 envelope,
@@ -5775,7 +5811,7 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
                     .rows
                     .into_iter()
                     .filter_map(|r| match r {
-                        Observation::Trade(t) => Some(t),
+                        Observation::Trade(t) => Some(*t),
                         _ => None,
                     })
                     .collect(),
@@ -5837,7 +5873,7 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
                     .rows
                     .into_iter()
                     .filter_map(|r| match r {
-                        Observation::Quote(q) => Some(q),
+                        Observation::Quote(q) => Some(*q),
                         _ => None,
                     })
                     .collect(),
@@ -5896,7 +5932,7 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
                     .rows
                     .into_iter()
                     .filter_map(|r| match r {
-                        Observation::Price(p) => Some(p),
+                        Observation::Price(p) => Some(*p),
                         _ => None,
                     })
                     .collect(),
@@ -5943,7 +5979,7 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
                     .rows
                     .into_iter()
                     .filter_map(|r| match r {
-                        Observation::Bar(b) => Some(b),
+                        Observation::Bar(b) => Some(*b),
                         _ => None,
                     })
                     .collect(),

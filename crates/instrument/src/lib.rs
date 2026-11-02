@@ -27,6 +27,7 @@ pub mod calendars;
 pub mod companies;
 pub mod complete;
 pub mod event_groups;
+pub mod hot;
 pub mod ids;
 pub mod list;
 pub mod one_id;

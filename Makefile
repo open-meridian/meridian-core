@@ -2249,6 +2249,17 @@ chart-check:
 		! $(HELM_TEMPLATE) check deploy/chart $$base --set lake.mallocMmapThreshold=$$refused >/dev/null 2>&1 \
 			|| { echo "chart-check FAILED: lake.mallocMmapThreshold=$$refused rendered; it takes a whole number of bytes above 0" >&2; exit 1; }; \
 	done
+	@# Step 3a: each hot layer's bound reaches its store, in MiB, by default
+	@# and as set.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
+	for said in "MERIDIAN_LAKE_HOT_LATEST_MIB:64:lake.hotLayer.latestMiB" "MERIDIAN_LAKE_HOT_LISTINGS_MIB:32:lake.hotLayer.listingsMiB" \
+		"MERIDIAN_INSTRUMENT_HOT_RECORDS_MIB:32:instrument.hotLayer.recordsMiB" "MERIDIAN_BOR_HOT_BOOKS_MIB:128:bor.hotLayer.booksMiB"; do \
+		name="$${said%%:*}"; rest="$${said#*:}"; want="$${rest%%:*}"; value="$${rest#*:}"; \
+		$(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null | grep -A1 "name: $$name$$" | grep -q "value: \"$$want\"" \
+			|| { echo "chart-check FAILED: $$value does not reach its store as $$name=$$want by default" >&2; exit 1; }; \
+		$(HELM_TEMPLATE) check deploy/chart $$base --set $$value=7 2>/dev/null | grep -A1 "name: $$name$$" | grep -q 'value: "7"' \
+			|| { echo "chart-check FAILED: $$value=7 does not reach its store" >&2; exit 1; }; \
+	done
 	@# Ruling 1060: one writer per ordering domain until step 3b's modes, so
 	@# the lake, the book, the instrument store, the street store and the
 	@# conductor each render at 1 and refuse 2, naming why.

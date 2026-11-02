@@ -1354,3 +1354,57 @@ async fn a_deposed_writers_command_is_refused_after_a_takeover_and_leaves_no_hol
         blocking(|| standby.read_changes("control", 0, meridian_changes::PAGE_MOST)).unwrap();
     assert_eq!(reply.epoch, 2);
 }
+
+// ── The hot layer (step 3a) ──
+
+/// Each account's book at its head, held by the writer, is the book the
+/// record builds from its snapshot and tail, under any bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_book_held_at_its_head_is_the_book_the_record_builds() {
+    let record = blocking(store);
+    for bound in [meridian_bor::writer::DEFAULT_BOOKS_BYTES, 3_000] {
+        let bus = Arc::new(Bus::single(
+            "operations-test-1",
+            Arc::new(MemoryBackend::new()),
+            Arc::new(meridian_clock::SystemClock),
+        ));
+        let writer = Arc::new(meridian_bor::writer::Writer::bounded(
+            record.clone(),
+            bus.clone(),
+            bound,
+        ));
+        serve(bus.clone(), writer.clone(), bus.clock());
+        // The instrument store, stood in, as wired_with does.
+        bus.serve(RESOLVE_INSTRUMENT, |envelope| {
+            let asked = ResolveInstrumentRequest::decode(&envelope.payload[..]).unwrap();
+            Ok((
+                "meridian.v1.ResolveInstrumentReply".into(),
+                ResolveInstrumentReply {
+                    found: true,
+                    instrument: Some(InstrumentRecord {
+                        instrument_id: asked.instrument_id,
+                        asset_class: AssetClass::Equity as i32,
+                        currency: "USD".into(),
+                        version: 1,
+                        ..Default::default()
+                    }),
+                }
+                .encode_to_vec(),
+            ))
+        });
+        let accounts: Vec<String> = (0..4).map(|_| unique("ACC")).collect();
+        for account in &accounts {
+            // Asked before it holds anything, then after each commit.
+            let before = blocking(|| writer.book(account)).unwrap();
+            assert_eq!(before, blocking(|| record.book(account)).unwrap());
+            open(&bus, account, &unique("INS")).await;
+        }
+        for account in &accounts {
+            let held = blocking(|| writer.book(account)).unwrap();
+            let built = blocking(|| record.book(account)).unwrap();
+            assert_eq!(held, built, "bound {bound}");
+        }
+        let (_, bytes) = writer.held();
+        assert!(bound == meridian_bor::writer::DEFAULT_BOOKS_BYTES || bytes <= bound);
+    }
+}

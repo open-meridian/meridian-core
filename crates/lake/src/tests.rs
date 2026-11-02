@@ -22,6 +22,7 @@ use crate::store::Store;
 use crate::MemoryStore;
 
 mod changes;
+mod hot;
 mod quality;
 
 const NOW: i64 = 1_791_417_600_000_000_000; // 2026-10-08T00:00Z
@@ -215,7 +216,10 @@ fn record(
     tokio::task::block_in_place(|| {
         h.lake.record(
             "prices",
-            prices.into_iter().map(Observation::Price).collect(),
+            prices
+                .into_iter()
+                .map(|row| Observation::Price(Box::new(row)))
+                .collect(),
             want,
             &envelope(instance, true, ""),
         )
@@ -500,7 +504,7 @@ async fn a_reader_not_entitled_is_refused_per_dataset_and_a_field_it_may_not_rea
     tokio::task::block_in_place(|| {
         h.lake.record(
             "bars",
-            vec![Observation::Bar(bar)],
+            vec![Observation::Bar(Box::new(bar))],
             "",
             &envelope("coinbase-1", true, ""),
         )
@@ -862,13 +866,13 @@ async fn a_read_that_asks_a_dataset_served_not_kept_hears_what_is_served() {
             tokio::task::block_in_place(|| {
                 lake.record(
                     "prices",
-                    vec![Observation::Price(close(
+                    vec![Observation::Price(Box::new(close(
                         "coinbase-1",
                         "BTC-USD:2026-10-07",
                         BTC,
                         "2026-10-07",
                         "62000.5",
-                    ))],
+                    )))],
                     &want.want_id,
                     &envelope("coinbase-1", true, ""),
                 )
@@ -1009,7 +1013,7 @@ async fn a_batch_is_refused_whole_naming_the_item_and_field() {
     let refused = tokio::task::block_in_place(|| {
         h.lake.record(
             "bars",
-            vec![Observation::Bar(two_assets)],
+            vec![Observation::Bar(Box::new(two_assets))],
             "",
             &envelope("coinbase-1", true, ""),
         )
@@ -1395,8 +1399,8 @@ async fn trades_are_heard_every_one_and_a_loss_is_caught_up_by_watermark_late_pr
         &h,
         "trades",
         vec![
-            Observation::Trade(trade("t1", NOW + 1_000, "62000")),
-            Observation::Trade(trade("t2", NOW + 2_000, "62001")),
+            Observation::Trade(Box::new(trade("t1", NOW + 1_000, "62000"))),
+            Observation::Trade(Box::new(trade("t2", NOW + 2_000, "62001"))),
         ],
     )
     .unwrap();
@@ -1425,8 +1429,8 @@ async fn trades_are_heard_every_one_and_a_loss_is_caught_up_by_watermark_late_pr
         &h,
         "trades",
         vec![
-            Observation::Trade(trade("late", NOW - DAY / 2, "61990")),
-            Observation::Trade(withdrawn),
+            Observation::Trade(Box::new(trade("late", NOW - DAY / 2, "61990"))),
+            Observation::Trade(Box::new(withdrawn)),
         ],
     )
     .unwrap();
@@ -1477,8 +1481,8 @@ async fn a_restarted_data_plugin_reads_its_own_last_trade_and_its_datasets_licen
         &h,
         "trades",
         vec![
-            Observation::Trade(trade("t1", NOW + 1_000, "62000")),
-            Observation::Trade(trade("t2", NOW + 2_000, "62001")),
+            Observation::Trade(Box::new(trade("t1", NOW + 1_000, "62000"))),
+            Observation::Trade(Box::new(trade("t2", NOW + 2_000, "62001"))),
         ],
     )
     .unwrap();
@@ -1544,22 +1548,22 @@ async fn a_trade_or_quote_is_refused_naming_its_field() {
     let refused = |row: Observation, field: &str| record_rows(&h, field, vec![row]).unwrap_err();
     let mut nothing = trade("t", NOW, "1");
     nothing.quantity = decimal("0");
-    assert!(refused(Observation::Trade(nothing), "trades").contains("trades[0].quantity"));
+    assert!(refused(Observation::Trade(Box::new(nothing)), "trades").contains("trades[0].quantity"));
     let mut dated = trade("t", NOW, "1");
     dated.meta.as_mut().unwrap().business_date = "2026-10-08".into();
-    assert!(refused(Observation::Trade(dated), "trades").contains("business_date"));
+    assert!(refused(Observation::Trade(Box::new(dated)), "trades").contains("business_date"));
     let mut unconverted = trade("t", NOW, "1");
     unconverted.attributes = Some(meridian_domain::v1::TradeAttributes {
         characteristics: vec![0],
         ..Default::default()
     });
-    assert!(refused(Observation::Trade(unconverted), "trades")
+    assert!(refused(Observation::Trade(Box::new(unconverted)), "trades")
         .contains("trades[0].attributes.characteristics[0]"));
     let mut priceless = trade("t", NOW, "1");
     priceless.price = None;
-    assert!(refused(Observation::Trade(priceless), "trades").contains("trades[0].price"));
+    assert!(refused(Observation::Trade(Box::new(priceless)), "trades").contains("trades[0].price"));
     let two = quote("q", NOW, money("1", "USD", ""), money("1.01", "", USDC));
-    assert!(refused(Observation::Quote(two), "quotes").contains("one asset"));
+    assert!(refused(Observation::Quote(Box::new(two)), "quotes").contains("one asset"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1615,19 +1619,24 @@ async fn the_latest_is_chosen_per_asset_for_prices_and_quotes() {
         &h,
         "quotes",
         vec![
-            Observation::Quote(quote(
+            Observation::Quote(Box::new(quote(
                 "q-usd-1",
                 NOW - 3,
                 money("1", "USD", ""),
                 money("2", "USD", ""),
-            )),
-            Observation::Quote(quote("q-usd-2", NOW - 2, money("1.5", "USD", ""), None)),
-            Observation::Quote(quote(
+            ))),
+            Observation::Quote(Box::new(quote(
+                "q-usd-2",
+                NOW - 2,
+                money("1.5", "USD", ""),
+                None,
+            ))),
+            Observation::Quote(Box::new(quote(
                 "q-usdc",
                 NOW - 4,
                 money("1", "", USDC),
                 money("2", "", USDC),
-            )),
+            ))),
         ],
     )
     .unwrap();
@@ -1811,7 +1820,9 @@ fn record_outcomes(
     tokio::task::block_in_place(|| {
         h.lake.record(
             "outcomes",
-            rows.into_iter().map(Observation::Outcome).collect(),
+            rows.into_iter()
+                .map(|row| Observation::Outcome(Box::new(row)))
+                .collect(),
             "",
             &envelope("kalshi-1", true, ""),
         )
@@ -2591,12 +2602,12 @@ async fn a_rows_age_at_the_lake_hop_is_recorded_on_commit_for_the_monitor() {
     record_rows(
         &h,
         "quotes",
-        vec![Observation::Quote(quote(
+        vec![Observation::Quote(Box::new(quote(
             "q-age-1",
             now - 3_000_000,
             money("100", "USD", ""),
             money("101", "USD", ""),
-        ))],
+        )))],
     )
     .unwrap();
     let taken = meridian_domain::latency::recorder().take(now + 1);
@@ -2628,24 +2639,24 @@ async fn a_batchs_quotes_are_published_latest_value_per_key_and_every_one_record
         &h,
         "quotes",
         vec![
-            Observation::Quote(quote(
+            Observation::Quote(Box::new(quote(
                 "q1",
                 NOW - 3,
                 money("1", "USD", ""),
                 money("2", "USD", ""),
-            )),
-            Observation::Quote(quote(
+            ))),
+            Observation::Quote(Box::new(quote(
                 "q-usdc",
                 NOW - 3,
                 money("1", "", USDC),
                 money("2", "", USDC),
-            )),
-            Observation::Quote(quote(
+            ))),
+            Observation::Quote(Box::new(quote(
                 "q2",
                 NOW - 2,
                 money("1.5", "USD", ""),
                 money("2", "USD", ""),
-            )),
+            ))),
         ],
     )
     .unwrap();
@@ -2663,8 +2674,8 @@ async fn a_batchs_quotes_are_published_latest_value_per_key_and_every_one_record
     assert_eq!(published, vec!["q-usdc".to_string(), "q2".to_string()]);
 
     let trades = vec![
-        Observation::Trade(trade("t1", NOW + 1_000, "62000")),
-        Observation::Trade(trade("t2", NOW + 2_000, "62001")),
+        Observation::Trade(Box::new(trade("t1", NOW + 1_000, "62000"))),
+        Observation::Trade(Box::new(trade("t2", NOW + 2_000, "62001"))),
     ];
     assert!(
         service::superseded_in_batch(&trades).is_empty(),

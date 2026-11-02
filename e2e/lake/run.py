@@ -731,6 +731,33 @@ def run():
     must(not none["factors"] and none["unanswered"],
          f"step 17, a record no source holds factors for is never a factor: {none}")
 
+    # 18. The hot layer (step 3a): a read of the latest answered from the
+    # lake's memory once its key is loaded, the same as the record's answer;
+    # and after the lake restarts, from the record until loaded, then from
+    # memory again, the same.
+    def latest_closes():
+        answer = page("book", "read", f"/prices?subject={btc}&kind=close")
+        must(answer["prices"] and not answer.get("refused"), f"step 18, the latest close: {answer}")
+        return answer["prices"]
+
+    def memory_answered():
+        said = compose("logs", "--no-color", "lake", check=False).stdout
+        plain = [re.sub(r"\x1b\[[0-9;]*m", "", line) for line in said.splitlines()]
+        return [line for line in plain if "a read answered" in line and "from_memory=true" in line]
+
+    record = latest_closes()
+    loaded = until(30, lambda: (latest_closes() == record and memory_answered()) or None,
+                   "step 18, no read of the latest was answered from memory")
+    log(f"step 18, from memory: {loaded[-1]}")
+    compose("restart", "lake")
+    until(90, lambda: (lambda d: d if "coin:daily" in d else None)(datasets_listed()),
+          "step 18, the lake did not come back")
+    restarted = until(60, lambda: latest_closes() or None, "step 18, no answer after the restart")
+    must(restarted == record, f"step 18, after the restart, the same answer: {restarted} != {record}")
+    seen = len(memory_answered())
+    until(30, lambda: (latest_closes() == record and len(memory_answered()) > seen) or None,
+          "step 18, after the restart no read was answered from memory again")
+
     # 11. The store.
     lines = compose("run", "--rm", "-T", "store", "lake").stdout.split("\n")
     log("store lake:\n" + "\n".join(lines))
@@ -766,7 +793,8 @@ def run():
           "a venue ID in dollars' cash instrument and a USDC price on USDC's; a restatement heard "
           "and read as version 2, version 1 read as of before it; a reader not entitled refused, "
           "and an invalid date refused naming business_date; a day not recorded asked once for two "
-          "reads and recorded against the want, a standing want withdrawn; the priority set at the "
+          "reads and recorded against the want, a standing want withdrawn; the latest answered from "
+          "the lake's memory the same as the record, before and after a restart; the priority set at the "
           "page, a stale change refused by the tool and a current one taken; trades heard every "
           "one by an ems plugin and a loss caught up by watermark, a late print included, the "
           "latest quote per asset and a standing want of a streamed dataset; an ambiguous resolve "

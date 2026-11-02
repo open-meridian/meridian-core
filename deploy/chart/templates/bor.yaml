@@ -66,6 +66,9 @@ spec:
             # the change log's origin; ruling 1049).
             - name: MERIDIAN_DEPLOYMENT_ID
               value: {{ .Values.deployment.id | quote }}
+            # The hot layer's bound, in MiB (step 3a).
+            - name: MERIDIAN_BOR_HOT_BOOKS_MIB
+              value: {{ .Values.bor.hotLayer.booksMiB | quote }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
             {{- with .Values.bor.mallocArenaMax }}

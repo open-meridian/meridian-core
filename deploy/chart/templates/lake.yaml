@@ -81,6 +81,11 @@ spec:
             # the change log's origin; ruling 1049).
             - name: MERIDIAN_DEPLOYMENT_ID
               value: {{ .Values.deployment.id | quote }}
+            # The hot layer's bounds, in MiB (step 3a).
+            - name: MERIDIAN_LAKE_HOT_LATEST_MIB
+              value: {{ .Values.lake.hotLayer.latestMiB | quote }}
+            - name: MERIDIAN_LAKE_HOT_LISTINGS_MIB
+              value: {{ .Values.lake.hotLayer.listingsMiB | quote }}
             # The analytics component, whose reads for a job are its
             # client's (contract v26, W12.2).
             - name: MERIDIAN_ANALYTICS_INSTANCE_ID

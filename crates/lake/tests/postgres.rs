@@ -34,7 +34,7 @@ fn store() -> PostgresStore {
 }
 
 fn close(dataset: &str, row_key: &str, subject: &str, date: &str, amount: i64) -> Observation {
-    Observation::Price(Price {
+    Observation::Price(Box::new(Price {
         meta: Some(ObservationMeta {
             row_key: row_key.into(),
             subjects: vec![SubjectRef {
@@ -64,7 +64,7 @@ fn close(dataset: &str, row_key: &str, subject: &str, date: &str, amount: i64) -
         basis: 1,
         confidence: None,
         ..Default::default()
-    })
+    }))
 }
 
 #[test]
@@ -206,7 +206,7 @@ fn a_priority_carries_the_stale_guard_and_what_is_served_wants_and_misses_are_ke
 /// A trade, as the 1b records it (contract v19): keyed by its valid time,
 /// with no business date.
 fn trade(dataset: &str, row_key: &str, subject: &str, valid_from_ns: i64) -> Observation {
-    Observation::Trade(meridian_domain::v1::Trade {
+    Observation::Trade(Box::new(meridian_domain::v1::Trade {
         meta: Some(ObservationMeta {
             row_key: row_key.into(),
             subjects: vec![SubjectRef {
@@ -236,7 +236,7 @@ fn trade(dataset: &str, row_key: &str, subject: &str, valid_from_ns: i64) -> Obs
             scale: 1,
         }),
         ..Default::default()
-    })
+    }))
 }
 
 #[test]
@@ -283,7 +283,7 @@ fn trades_recorded_after_a_watermark_are_read_whatever_their_valid_time() {
 }
 
 fn outcome(dataset: &str, subject: &str, stage: i32, value: u64) -> Observation {
-    Observation::Outcome(meridian_domain::v1::Outcome {
+    Observation::Outcome(Box::new(meridian_domain::v1::Outcome {
         meta: Some(ObservationMeta {
             row_key: "KXFED-26OCT".into(),
             subjects: vec![SubjectRef {
@@ -316,7 +316,7 @@ fn outcome(dataset: &str, subject: &str, stage: i32, value: u64) -> Observation 
             text: String::new(),
         }),
         challenge_ends_at_ns: 0,
-    })
+    }))
 }
 
 /// Contract v23: an outcome's stages are versions of one row key; the
@@ -933,7 +933,7 @@ fn rate_row(
     state: meridian_domain::v1::QualityState,
 ) -> Observation {
     use meridian_domain::v1::{Rate, RateKind, SourceTime, SourceTimeKind, UnitValue, ValueUnit};
-    Observation::Rate(Rate {
+    Observation::Rate(Box::new(Rate {
         meta: Some(ObservationMeta {
             row_key: row_key.into(),
             subjects: vec![SubjectRef {
@@ -965,7 +965,7 @@ fn rate_row(
             ..Default::default()
         }),
         ..Default::default()
-    })
+    }))
 }
 
 #[test]
@@ -1950,14 +1950,14 @@ mod chain_page {
                     continue;
                 }
                 let bid = 100 + ((i * 7 + round * 3) % 500) as u64;
-                batch.push(Observation::Quote(Quote {
+                batch.push(Observation::Quote(Box::new(Quote {
                     meta: meta(dataset, &format!("{k}:q:{at}"), underlying, k, at),
                     bid: usd(bid),
                     ask: usd(bid + 5),
                     bid_quantity: decimal(10 + (round % 90) as u64, 0),
                     ask_quantity: decimal(12, 0),
                     ..Default::default()
-                }));
+                })));
             }
             if batch.len() >= 5000 {
                 store
@@ -2122,7 +2122,14 @@ mod chain_page {
                 meridian_domain::v1::PluginCatalogue::default().encode_to_vec(),
             ))
         });
-        let lake = service::serve(bus.clone(), store as Arc<dyn Store>, Arc::new(SystemClock));
+        // Step 3a: the hot layer in front of the record, where the bench
+        // asks for it (MERIDIAN_BENCH_HOT=1), as the lake runs it.
+        let store: Arc<dyn Store> = if std::env::var("MERIDIAN_BENCH_HOT").as_deref() == Ok("1") {
+            meridian_lake::hot::HotStore::new(store, meridian_lake::hot::Bounds::DEFAULT)
+        } else {
+            store
+        };
+        let lake = service::serve(bus.clone(), store, Arc::new(SystemClock));
         lake.configured(&configuration(dataset));
         Page {
             bus,

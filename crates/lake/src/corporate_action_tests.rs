@@ -214,7 +214,9 @@ fn record(h: &Harness, rows: Vec<CorporateActionAnnounced>) -> Result<(u32, u32,
     tokio::task::block_in_place(|| {
         h.lake.record(
             "actions",
-            rows.into_iter().map(Observation::CorporateAction).collect(),
+            rows.into_iter()
+                .map(|row| Observation::CorporateAction(Box::new(row)))
+                .collect(),
             "",
             &envelope("sec-edgar-1"),
         )

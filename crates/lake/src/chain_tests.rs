@@ -40,6 +40,10 @@ struct Harness {
 }
 
 fn harness() -> Harness {
+    harness_with(Arc::new(crate::MemoryStore::new()))
+}
+
+fn harness_with(store: Arc<dyn crate::Store>) -> Harness {
     let clock = Arc::new(ManualClock::at(NOW));
     let bus = Arc::new(Bus::single(
         "lake-1",
@@ -98,7 +102,6 @@ fn harness() -> Harness {
             meridian_domain::v1::PluginCatalogue::default().encode_to_vec(),
         ))
     });
-    let store = Arc::new(crate::MemoryStore::new());
     let lake = service::serve(bus.clone(), store, clock);
     lake.configured(&configuration());
     Harness { bus, lake }
@@ -319,7 +322,7 @@ fn read_quotes(h: &Harness, keys: Vec<Identifier>, all: bool) -> Vec<Quote> {
     .rows
     .into_iter()
     .filter_map(|row| match row {
-        Observation::Quote(quote) => Some(quote),
+        Observation::Quote(quote) => Some(*quote),
         _ => None,
     })
     .collect()
@@ -446,9 +449,9 @@ async fn chain_quotes_are_answered_only_to_a_read_asking_for_series() {
         ..Default::default()
     };
     let rows = vec![
-        Observation::Quote(own),
-        Observation::Quote(quote(OSI_CALL, "4.10", "4.20", NOW - HOUR)),
-        Observation::Quote(quote(OSI_PUT, "1.05", "1.10", NOW - HOUR)),
+        Observation::Quote(Box::new(own)),
+        Observation::Quote(Box::new(quote(OSI_CALL, "4.10", "4.20", NOW - HOUR))),
+        Observation::Quote(Box::new(quote(OSI_PUT, "1.05", "1.10", NOW - HOUR))),
     ];
     assert_eq!(record(&h, "quotes", rows).unwrap(), (3, 0, 0));
     // A v27 reader of the underlying hears its own quote alone.
@@ -501,12 +504,12 @@ async fn a_default_read_of_a_chain_chooses_its_source_per_series() {
         ..Default::default()
     };
     assert_eq!(
-        record(&h, "quotes", vec![Observation::Quote(own)]).unwrap(),
+        record(&h, "quotes", vec![Observation::Quote(Box::new(own))]).unwrap(),
         (1, 0, 0)
     );
     let chain = vec![
-        Observation::Quote(quote(OSI_CALL, "4.10", "4.20", NOW - HOUR)),
-        Observation::Quote(quote(OSI_PUT, "1.05", "1.10", NOW - HOUR)),
+        Observation::Quote(Box::new(quote(OSI_CALL, "4.10", "4.20", NOW - HOUR))),
+        Observation::Quote(Box::new(quote(OSI_PUT, "1.05", "1.10", NOW - HOUR))),
     ];
     assert_eq!(record(&h, "quotes", chain).unwrap(), (2, 0, 0));
 
@@ -614,7 +617,7 @@ async fn a_trade_keeps_the_quote_in_force_at_its_print() {
         ..Default::default()
     };
     assert_eq!(
-        record(&h, "trades", vec![Observation::Trade(trade)]).unwrap(),
+        record(&h, "trades", vec![Observation::Trade(Box::new(trade))]).unwrap(),
         (1, 0, 0)
     );
 }
@@ -625,7 +628,7 @@ async fn what_w10_4_refuses_of_a_chain_is_refused_naming_the_field() {
     // A key on a row about the series' own record.
     let mut on_held = quote(OSI_CALL, "4.10", "4.20", NOW - HOUR);
     on_held.meta.as_mut().unwrap().subjects = subjects(HELD_CALL);
-    let said = record(&h, "quotes", vec![Observation::Quote(on_held)]).unwrap_err();
+    let said = record(&h, "quotes", vec![Observation::Quote(Box::new(on_held))]).unwrap_err();
     assert!(said.contains("meta.series_key"), "{said}");
     assert!(said.contains("own record"), "{said}");
     // A futures key in the third amendment's spelling, a symbol beside a
@@ -634,7 +637,7 @@ async fn what_w10_4_refuses_of_a_chain_is_refused_naming_the_field() {
     let keyed = |key: Vec<Identifier>| {
         let mut row = quote(OSI_CALL, "4.10", "4.20", NOW - HOUR);
         row.meta.as_mut().unwrap().series_key = key;
-        record(&h, "quotes", vec![Observation::Quote(row)]).unwrap_err()
+        record(&h, "quotes", vec![Observation::Quote(Box::new(row))]).unwrap_err()
     };
     let identifier = |scheme: &str, value: &str, source: &str| Identifier {
         scheme: scheme.into(),
@@ -686,7 +689,12 @@ async fn what_w10_4_refuses_of_a_chain_is_refused_naming_the_field() {
         ..Default::default()
     }];
     assert_eq!(
-        record(&h, "quotes", vec![Observation::Quote(future_chain)]).unwrap(),
+        record(
+            &h,
+            "quotes",
+            vec![Observation::Quote(Box::new(future_chain))]
+        )
+        .unwrap(),
         (1, 0, 0)
     );
 }
@@ -748,8 +756,8 @@ async fn a_signal_plugins_derived_series_and_saved_scenarios_are_kept_and_read()
         record_as(
             "values",
             vec![
-                Observation::Derived(iv30("2026-10-06", "27.4")),
-                Observation::Derived(iv30("2026-10-07", "28.1")),
+                Observation::Derived(Box::new(iv30("2026-10-06", "27.4"))),
+                Observation::Derived(Box::new(iv30("2026-10-07", "28.1"))),
             ]
         )
         .unwrap(),
@@ -757,9 +765,11 @@ async fn a_signal_plugins_derived_series_and_saved_scenarios_are_kept_and_read()
     );
     let mut ruleless = iv30("2026-10-07", "28.1");
     ruleless.rule = None;
-    assert!(record_as("values", vec![Observation::Derived(ruleless)])
-        .unwrap_err()
-        .contains("values[0].rule"));
+    assert!(
+        record_as("values", vec![Observation::Derived(Box::new(ruleless))])
+            .unwrap_err()
+            .contains("values[0].rule")
+    );
     // Contract 28, amended 2026-10-31 (ruling 955): a publisher's figure
     // says whose and may name no input; a value the plugin derived names
     // its inputs; whose is at most 64 characters.
@@ -767,19 +777,27 @@ async fn a_signal_plugins_derived_series_and_saved_scenarios_are_kept_and_read()
     published.inputs.clear();
     published.published_by = "Cboe".into();
     assert_eq!(
-        record_as("values", vec![Observation::Derived(published.clone())]).unwrap(),
+        record_as(
+            "values",
+            vec![Observation::Derived(Box::new(published.clone()))]
+        )
+        .unwrap(),
         (1, 0, 0)
     );
     let mut unnamed = published.clone();
     unnamed.published_by = String::new();
-    assert!(record_as("values", vec![Observation::Derived(unnamed)])
-        .unwrap_err()
-        .contains("values[0].inputs"));
+    assert!(
+        record_as("values", vec![Observation::Derived(Box::new(unnamed))])
+            .unwrap_err()
+            .contains("values[0].inputs")
+    );
     let mut wordy = published;
     wordy.published_by = "x".repeat(65);
-    assert!(record_as("values", vec![Observation::Derived(wordy)])
-        .unwrap_err()
-        .contains("values[0].published_by"));
+    assert!(
+        record_as("values", vec![Observation::Derived(Box::new(wordy))])
+            .unwrap_err()
+            .contains("values[0].published_by")
+    );
     // Contract v29 (638): an amount of money in money_value, naming its
     // currency, value unset; both set, or a Money naming no currency or
     // cash record, refused.
@@ -792,24 +810,36 @@ async fn a_signal_plugins_derived_series_and_saved_scenarios_are_kept_and_read()
         instrument_id: String::new(),
     });
     assert_eq!(
-        record_as("values", vec![Observation::Derived(moved.clone())]).unwrap(),
+        record_as(
+            "values",
+            vec![Observation::Derived(Box::new(moved.clone()))]
+        )
+        .unwrap(),
         (1, 0, 0)
     );
     assert_eq!(
-        record_as("values", vec![Observation::Derived(moved.clone())]).unwrap(),
+        record_as(
+            "values",
+            vec![Observation::Derived(Box::new(moved.clone()))]
+        )
+        .unwrap(),
         (0, 0, 1),
         "the same amount again is unchanged"
     );
     let mut both = moved.clone();
     both.value = iv30("2026-10-04", "1").value;
-    assert!(record_as("values", vec![Observation::Derived(both)])
-        .unwrap_err()
-        .contains("values[0].value"));
+    assert!(
+        record_as("values", vec![Observation::Derived(Box::new(both))])
+            .unwrap_err()
+            .contains("values[0].value")
+    );
     let mut nameless = moved;
     nameless.money_value.as_mut().unwrap().currency_code = String::new();
-    assert!(record_as("values", vec![Observation::Derived(nameless)])
-        .unwrap_err()
-        .contains("values[0].money_value"));
+    assert!(
+        record_as("values", vec![Observation::Derived(Box::new(nameless))])
+            .unwrap_err()
+            .contains("values[0].money_value")
+    );
     let listed = tokio::task::block_in_place(|| {
         h.lake.list_derived_series(
             ListDerivedSeriesRequest {
@@ -977,7 +1007,7 @@ async fn a_read_in_pages_is_answered_once_and_held_until_its_last_page() {
         .collect();
     let rows: Vec<Observation> = keys
         .iter()
-        .map(|key| Observation::Quote(quote(key, "1.00", "1.10", NOW - HOUR)))
+        .map(|key| Observation::Quote(Box::new(quote(key, "1.00", "1.10", NOW - HOUR))))
         .collect();
     for chunk in rows.chunks(100) {
         record(&h, "quotes", chunk.to_vec()).unwrap();
@@ -1077,7 +1107,7 @@ fn a_chain_of(h: &Harness, series: usize) {
     let rows: Vec<Observation> = (0..series)
         .map(|i| {
             let key = format!("AAPL  261120C{:08}", 100_000 + i * 1000);
-            Observation::Quote(quote(&key, "1.00", "1.10", NOW - HOUR))
+            Observation::Quote(Box::new(quote(&key, "1.00", "1.10", NOW - HOUR)))
         })
         .collect();
     for chunk in rows.chunks(100) {
@@ -1217,7 +1247,7 @@ async fn a_chain_read_names_its_window_and_its_fields() {
         let mut q = quote(key, "4.10", "4.20", NOW - HOUR);
         q.bid_quantity = decimal("10");
         q.ask_quantity = decimal("12");
-        Observation::Quote(q)
+        Observation::Quote(Box::new(q))
     };
     let own = Quote {
         meta: meta("quote:AAPL", AAPL, vec![], ""),
@@ -1226,7 +1256,7 @@ async fn a_chain_read_names_its_window_and_its_fields() {
         ..Default::default()
     };
     let quotes = vec![
-        Observation::Quote(own),
+        Observation::Quote(Box::new(own)),
         sized(OSI_CALL),
         sized(OSI_PUT),
         sized(OSI_UNLISTED),
@@ -1376,7 +1406,7 @@ async fn a_field_asked_and_not_entitled_is_named_one_not_asked_is_not() {
     let mut q = quote(OSI_CALL, "4.10", "4.20", NOW - HOUR);
     q.bid_quantity = decimal("10");
     assert_eq!(
-        record(&h, "quotes", vec![Observation::Quote(q)]).unwrap(),
+        record(&h, "quotes", vec![Observation::Quote(Box::new(q))]).unwrap(),
         (1, 0, 0)
     );
     let answer = tokio::task::block_in_place(|| {
@@ -1862,4 +1892,55 @@ async fn a_listed_series_recorded_is_heard_on_its_datasets_subject() {
     let listed = event.series.unwrap();
     assert_eq!(listed.meta.as_ref().unwrap().series_key, osi(OSI_CALL));
     assert!(listed.meta.unwrap().sequence > 0, "as recorded, sequenced");
+}
+
+/// Step 3a: a chain's listing per underlying and dataset, from the hot layer
+/// once loaded, the same as the record's, and again after a series is
+/// recorded (which evicts the key until it is loaded again).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chains_listing_from_memory_is_the_records() {
+    let record: Arc<crate::MemoryStore> = Arc::new(crate::MemoryStore::new());
+    let hot = crate::hot::HotStore::new(record.clone(), crate::hot::Bounds::DEFAULT);
+    let h = harness_with(hot.clone());
+    record_rows(
+        &h,
+        vec![Observation::Series(series(
+            OSI_CALL,
+            "call",
+            "230",
+            "2026-11-20",
+        ))],
+    );
+    let datasets = [CHAIN.to_string()];
+    let subjects = [AAPL.to_string()];
+    let sorted = |mut listed: Vec<crate::store::Listed>| {
+        listed.sort_by(|a, b| (&a.dataset, &a.series).cmp(&(&b.dataset, &b.series)));
+        format!("{listed:?}")
+    };
+    let read =
+        |from: &dyn crate::store::Store| sorted(from.listing(&datasets, &subjects, 0).unwrap());
+    crate::hot::noted::begin();
+    assert_eq!(read(hot.as_ref()), read(record.as_ref()));
+    assert_eq!(crate::hot::noted::take(), (false, "record"));
+    hot.load_wanted();
+    assert_eq!(read(hot.as_ref()), read(record.as_ref()));
+    assert_eq!(crate::hot::noted::take(), (true, "listings"));
+    record_rows(
+        &h,
+        vec![Observation::Series(series(
+            OSI_PUT,
+            "put",
+            "200",
+            "2026-12-18",
+        ))],
+    );
+    assert_eq!(read(hot.as_ref()), read(record.as_ref()));
+    hot.load_wanted();
+    crate::hot::noted::begin();
+    assert_eq!(read(hot.as_ref()), read(record.as_ref()));
+    assert!(crate::hot::noted::take().0, "loaded again: memory answers");
+}
+
+fn record_rows(h: &Harness, rows: Vec<Observation>) {
+    record(h, "series", rows).unwrap();
 }

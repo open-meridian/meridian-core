@@ -328,7 +328,12 @@ impl Lake {
                     ..Default::default()
                 },
             )?;
-            rows.extend(answered.outcomes.into_iter().map(Observation::Outcome));
+            rows.extend(
+                answered
+                    .outcomes
+                    .into_iter()
+                    .map(|row| Observation::Outcome(Box::new(row))),
+            );
             watermark = answered.watermark.unwrap_or_default();
         } else {
             let ask =
@@ -436,12 +441,12 @@ impl Lake {
         };
         for row in rows {
             match row {
-                Observation::Price(price) => reply.prices.push(price),
-                Observation::Bar(bar) => reply.bars.push(bar),
-                Observation::Trade(trade) => reply.trades.push(trade),
-                Observation::Quote(quote) => reply.quotes.push(quote),
-                Observation::Outcome(outcome) => reply.outcomes.push(outcome),
-                Observation::Rate(rate) => reply.rates.push(rate),
+                Observation::Price(price) => reply.prices.push(*price),
+                Observation::Bar(bar) => reply.bars.push(*bar),
+                Observation::Trade(trade) => reply.trades.push(*trade),
+                Observation::Quote(quote) => reply.quotes.push(*quote),
+                Observation::Outcome(outcome) => reply.outcomes.push(*outcome),
+                Observation::Rate(rate) => reply.rates.push(*rate),
                 Observation::ExecutionCost(_)
                 | Observation::Statistic(_)
                 | Observation::Series(_)

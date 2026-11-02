@@ -79,7 +79,18 @@ fn run() -> Result<(), String> {
         .adopt()
         .map_err(|failed| format!("the instrument store could not adopt its epoch: {failed}"))?;
     tracing::info!(epoch, "the instrument store writes under its epoch");
-    let store: Arc<dyn meridian_instrument::Store> = postgres.clone();
+    // The hot layer in front of the record (step 3a): records by ID and what
+    // each became, bounded by instrument.hotLayer.recordsMiB.
+    let bound = meridian_instrument::hot::bytes_from_mib(
+        var("MERIDIAN_INSTRUMENT_HOT_RECORDS_MIB").as_deref(),
+    )?;
+    tracing::info!(
+        records_mib = bound >> 20,
+        "the instrument store's hot layer is bounded"
+    );
+    let store: Arc<dyn meridian_instrument::Store> = Arc::new(
+        meridian_instrument::hot::HotStore::new(postgres.clone(), bound),
+    );
 
     let instance_id = var("MERIDIAN_INSTANCE_ID").unwrap_or_else(|| "instrument-1".into());
     // The analytics component, whose resolves are read-only (contract v28's

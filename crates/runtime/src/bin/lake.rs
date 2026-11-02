@@ -70,7 +70,7 @@ fn run() -> Result<(), String> {
     }
 
     let ready = Ready::from_env();
-    let store: Arc<dyn meridian_lake::Store> = Arc::new(wait_for_store(
+    let record: Arc<dyn meridian_lake::Store> = Arc::new(wait_for_store(
         "the lake's database",
         &url,
         |url| PostgresStore::connect(url, 8).map_err(|failed| failed.to_string()),
@@ -82,6 +82,18 @@ fn run() -> Result<(), String> {
         },
     )?);
 
+    // The hot layer in front of the record (step 3a), each layer bounded by
+    // its chart value: lake.hotLayer.latestMiB, lake.hotLayer.listingsMiB.
+    let bounds = meridian_lake::hot::Bounds::from_mib(
+        var("MERIDIAN_LAKE_HOT_LATEST_MIB").as_deref(),
+        var("MERIDIAN_LAKE_HOT_LISTINGS_MIB").as_deref(),
+    )?;
+    let store: Arc<dyn meridian_lake::Store> = meridian_lake::hot::HotStore::new(record, bounds);
+    tracing::info!(
+        latest_mib = bounds.latest_bytes >> 20,
+        listings_mib = bounds.listings_bytes >> 20,
+        "the lake's hot layer is bounded"
+    );
     // The deployment every change is made in, and the writer's epoch,
     // adopted before the first batch (step 3a; ruling 1060).
     meridian_changes::set_origin(&var("MERIDIAN_DEPLOYMENT_ID").unwrap_or_default());

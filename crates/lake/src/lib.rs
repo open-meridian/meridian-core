@@ -31,6 +31,7 @@
 //! the platform, and no row, licence or entitlement is in any report.
 
 pub mod config;
+pub mod hot;
 pub mod migrations;
 pub mod pages;
 pub mod postgres;

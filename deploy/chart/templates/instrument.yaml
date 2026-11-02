@@ -46,6 +46,9 @@ spec:
             # the change log's origin; ruling 1049).
             - name: MERIDIAN_DEPLOYMENT_ID
               value: {{ .Values.deployment.id | quote }}
+            # The hot layer's bound, in MiB (step 3a).
+            - name: MERIDIAN_INSTRUMENT_HOT_RECORDS_MIB
+              value: {{ .Values.instrument.hotLayer.recordsMiB | quote }}
             # The analytics component, whose resolves are read-only
             # (contract v28's fourth amendment, W3.1).
             - name: MERIDIAN_ANALYTICS_INSTANCE_ID
