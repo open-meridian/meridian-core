@@ -63,7 +63,8 @@ PROJECT = "meridian-core-access-per-role"
 PEOPLE = "ada=Ada Park,ben=Ben Ito,cat=Cat Ruiz,dan=Dan Oyelaran"
 LOG = ".e2e-access-per-role.log"
 COMPOSE = ["docker", "compose", "-p", PROJECT, "-f", ".harness/compose.yaml",
-           "-f", ".harness/plugins.yaml", "-f", "e2e/access-per-role/stand-in.yaml"]
+           "-f", ".harness/plugins.yaml", "-f", "e2e/access-per-role/stand-in.yaml",
+           "-f", "e2e/postgres-for-tests.yaml"]
 # Step 4: `both`'s sidecar holding a third role.
 THIRD_ROLE = ["-f", "e2e/access-per-role/third-role.yaml"]
 ENV = dict(os.environ, MERIDIAN_HARNESS_PEOPLE=PEOPLE,

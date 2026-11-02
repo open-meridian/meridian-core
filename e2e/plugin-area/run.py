@@ -104,7 +104,8 @@ PROJECT = "meridian-core-plugin-area"
 PEOPLE = "cat=Cat Ruiz,ben=Ben Ito"
 LOG = ".e2e-plugin-area.log"
 COMPOSE = ["docker", "compose", "-p", PROJECT, "-f", ".harness/compose.yaml",
-           "-f", ".harness/plugins.yaml", "-f", "e2e/plugin-area/stand-in.yaml"]
+           "-f", ".harness/plugins.yaml", "-f", "e2e/plugin-area/stand-in.yaml",
+           "-f", "e2e/postgres-for-tests.yaml"]
 ENV = dict(os.environ, MERIDIAN_HARNESS_PEOPLE=PEOPLE,
            MERIDIAN_HARNESS_STAND_IN=os.path.abspath("e2e/plugin-page"),
            MERIDIAN_HARNESS_REGISTRY=os.path.abspath("e2e/plugin-area/registry"))
