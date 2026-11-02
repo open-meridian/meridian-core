@@ -157,6 +157,22 @@ jobs:
           persist-credentials: false
           path: workspace/meridian-cli
 
+      # Its e2e image depends on nothing but that commit, so it is built
+      # once per commit of meridian-cli's main and kept (cargo-cache.yaml
+      # keeps it where every pull request reads it), rather than compiled
+      # on every run's longest path.
+      - name: The CLI's commit
+        id: cli
+        run: echo "sha=$(git -C workspace/meridian-cli rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the CLI's image
+        id: cli-image
+        uses: actions/cache/restore@v4
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/cli-image
+          key: cli-e2e-image-${{ steps.cli.outputs.sha }}
+
       # Before anything builds an image: the runner's preinstalled toolsets
       # and preloaded images, which core never uses, so the gate's disk
       # budget meets the headroom it was set for (tools/free-runner-disk.sh).
@@ -198,19 +214,37 @@ jobs:
           STAGE: ${{ matrix.stage }}
         run: make -k ci-stage STAGE="$STAGE"
 
-      # The analytics image (the same build stage, nothing compiled again)
-      # and the CLI's, which only the cluster runs start.
-      - name: make cluster-images
+      # The analytics image, which only the cluster runs start: the same
+      # build stage, nothing compiled again.
+      - name: make analytics-image
         working-directory: workspace/meridian-core
         env:
           DOCKER_BUILDKIT: "1"
-        run: make cluster-images CLI=../meridian-cli
+        run: make analytics-image
+
+      - name: make backup-cli-image
+        if: steps.cli-image.outputs.cache-hit != 'true'
+        working-directory: workspace/meridian-core
+        env:
+          DOCKER_BUILDKIT: "1"
+        run: |
+          make backup-cli-image CLI=../meridian-cli
+          tools/ci-images.sh save "$RUNNER_TEMP/cli-image" backup-cli
+
+      - name: Keep the CLI's image
+        if: steps.cli-image.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/cli-image
+          key: cli-e2e-image-${{ steps.cli.outputs.sha }}
 
       - name: Save the images
         working-directory: workspace/meridian-core
         run: |
           tools/ci-images.sh save "$RUNNER_TEMP/images" runtime harness interop version-check
-          tools/ci-images.sh save "$RUNNER_TEMP/cluster-images" analytics backup-cli
+          tools/ci-images.sh save "$RUNNER_TEMP/cluster-images" analytics
+          cp "$RUNNER_TEMP"/cli-image/backup-cli.* "$RUNNER_TEMP/cluster-images/"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -284,7 +318,8 @@ jobs:
           compression-level: 0
           retention-days: 1
 
-  # The rest of ci-local's stages, each on the images it runs.
+  # The rest of ci-local's stages, each on the images it runs: a leg a stage,
+  # or a few short ones run in order on one runner.
   stages:
     name: ci-local (${{ matrix.stage }})
     needs: [images, compile]
@@ -303,18 +338,16 @@ jobs:
           - stage: settings-page
             artifacts: images test-images
             images: runtime settings-binary
-          - stage: sdk
-            artifacts: images
-            images: runtime interop
           - stage: dashboards
             artifacts: images
             images: runtime interop
-          - stage: first-run
+          # Three short stages on one runner, in order: the organisation runs
+          # at most 20 jobs at once (GitHub Free), and a run's stages, harness
+          # groups and cluster runs together came to 21. A leg each again
+          # where more run at once.
+          - stage: sdk first-run image
             artifacts: images
-            images: runtime
-          - stage: image
-            artifacts: images
-            images: runtime version-check
+            images: runtime interop version-check
     steps:
       - name: The images were built
         env:
@@ -361,7 +394,7 @@ jobs:
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: e2e-logs-${{ matrix.stage }}
+          name: e2e-logs-${{ strategy.job-index }}
           path: workspace/meridian-core/.e2e-*.log
           # The logs are dotfiles, which v4 leaves out unless told; with
           # `ignore` as well, every failure uploaded nothing and said nothing

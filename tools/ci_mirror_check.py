@@ -65,7 +65,7 @@ RUNS_A_STAGE = "make -k ci-stage STAGE="
 
 def workflow_stages(workflows_dir: pathlib.Path) -> dict[str, list[str]]:
     """Map job id -> the ci-local stages its matrix names, as `stage: x`,
-    `- stage: x` or `stage: [x, y]`. A job naming stages that never runs
+    `- stage: x y` (one leg, several stages) or `stage: [x, y]`. A job naming stages that never runs
     `make -k ci-stage STAGE=...` runs none of them, and names none here."""
     stages: dict[str, list[str]] = {}
     runs: set[str] = set()
@@ -89,7 +89,9 @@ def workflow_stages(workflows_dir: pathlib.Path) -> dict[str, list[str]]:
                 m = re.match(r"^\s+(?:-\s+)?stage:\s*(.+?)\s*$", line)
                 if m and job:
                     value = m.group(1)
-                    names = (value.strip("[]").split(",") if value.startswith("[") else [value])
+                    # A list is a leg each; one leg's value may name several
+                    # stages, which it runs in order.
+                    names = (value.strip("[]").split(",") if value.startswith("[") else value.split())
                     stages.setdefault(job, []).extend(n.strip() for n in names if n.strip())
     return {job: names for job, names in stages.items() if job in runs}
 

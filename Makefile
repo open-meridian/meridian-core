@@ -6,7 +6,7 @@ COMPOSE := docker compose
 DOCKER := DOCKER_BUILDKIT=1 docker
 
 .PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check licence-check-test gate-start check-leftovers check-leftovers-end \
-        gate-mark-tests ci-stage images runtime-images test-images cluster-images ci-images runtime-image analytics-image harness-image interop-image version-check-image tests-image settings-binary-image backup-cli-image stage-checks stage-images stage-compile stage-tests stage-settings-page stage-sdk stage-dashboards stage-harness stage-first-run stage-image stage-lint \
+        gate-mark-tests ci-stage images runtime-images test-images ci-images runtime-image analytics-image harness-image interop-image version-check-image tests-image settings-binary-image backup-cli-image stage-checks stage-images stage-compile stage-tests stage-settings-page stage-sdk stage-dashboards stage-harness stage-first-run stage-image stage-lint \
         e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external e2e-cluster-backup \
         test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-service-account e2e-lake e2e-recorded e2e-orders e2e-one-id e2e-harness \
         build test test-store check-image-version chart-check check-crate-boundaries check-one-clock check-test-targets check-local-storage \
@@ -126,8 +126,9 @@ ci-local: gate-start stage-checks stage-images stage-compile stage-tests stage-s
 	@echo
 	@echo "ci-local: GREEN"
 
-# One stage, measured as ci-local measures each: what a CI job runs.
-ci-stage: gate-start stage-$(STAGE)
+# A stage, or several in order (STAGE="sdk first-run image"), measured as
+# ci-local measures each: what a CI job runs.
+ci-stage: gate-start $(addprefix stage-,$(STAGE))
 	@$(GATE) finish
 
 # The stages after the compile run the images it and the images stage built,
@@ -906,10 +907,10 @@ IMAGE_OF_backup-cli-image = $(E2E_BACKUP_CLI_IMAGE)
 # What the images stage builds: the release build's images and the SDK's.
 # And the compile stage: the debug build's, every test binary and the
 # settings pages' server. The cluster runs' own two, which ci-local never
-# runs, CI's images job builds beside them.
+# runs, CI builds beside them: analytics-image after the images stage, from
+# its build, and backup-cli-image after the compile stage.
 runtime-images: runtime-image harness-image interop-image version-check-image
 test-images: tests-image settings-binary-image
-cluster-images: analytics-image backup-cli-image
 images: runtime-images test-images
 
 ci-images:
