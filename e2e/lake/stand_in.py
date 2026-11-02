@@ -94,6 +94,13 @@ declares `fixed_income` -- trades, quotes and factors, pushed -- and serves:
              dealer principal), a when-issued print in yield alone, a firm
              quote with bucketed sizes, and two months of the pool's factors,
              then October's republished.
+  /provisional-pool
+             resolves a pool the harness platform's source cannot confirm,
+             stating its class and type (debt, an MBS pool): a provisional
+             LCL- record, its class and type offered;
+  /pool-factor?subject=ID
+             records one month's factor of that pool, answering what was
+             recorded or the lake's refusal.
 
 STAND_IN_LAKE=signal is a `signal` plugin serving:
 
@@ -730,6 +737,35 @@ class Dgm(data.Role):
         log(fixed_income=said)
         return said
 
+    async def provisional_pool(self):
+        """v29's fixes: a pool its source states as debt, an MBS pool, which
+        the harness platform cannot confirm -- a provisional LCL- record, its
+        class and type only offered until a person accepts them (W3.7,
+        W3.10)."""
+        pool = await self.plugin.resolve_identifier(
+            identifiers=[ops.Identifier(scheme="agency_pool", value="MA9999", source="FNMA")],
+            stated_asset_class="ASSET_CLASS_DEBT", stated_instrument_type="INSTRUMENT_TYPE_MBS_POOL",
+            stated_description="FNMA CL MA9999 6.0", stated_currency="USD")
+        said = {"instrument_id": pool.instrument_id, "provisional": pool.provisional}
+        log(provisional_pool=said)
+        return said
+
+    async def pool_factor(self, query):
+        subject = query.get("subject", [""])[0]
+        row = ops.Factor(meta=ops.ObservationMeta(
+            row_key="FNMA:MA9999:202610", subjects=[ops.SubjectRef(entity_id=subject)],
+            source=ops.Source(dataset=self.dataset("fixed_income")),
+            valid_from_ns=time.time_ns(), business_date="2026-11-05"),
+            factor=_decimal("0.91234567"), factor_month="202610",
+            record_date="2026-10-31", payment_date="2026-11-25")
+        try:
+            done = await self.plugin._operations().RecordFactors(
+                ops.RecordFactorsParams(factors=[row]))
+        except Exception as refused:  # the sidecar's refusal, as gRPC carries it
+            details = getattr(refused, "details", None)
+            return {"refused": details() if callable(details) else str(refused)}
+        return {"recorded": done.recorded}
+
     async def resolve_as_of(self, query):
         one = lambda name: query.get(name, [""])[0]
         # A security with the name and currency the venue states (from
@@ -797,6 +833,10 @@ class Dgm(data.Role):
             return await self.filings()
         if path == "/fixed-income":
             return await self.fixed_income()
+        if path == "/provisional-pool":
+            return await self.provisional_pool()
+        if path == "/pool-factor":
+            return await self.pool_factor(query)
         if path == "/resolve":
             return await self.resolve()
         if path == "/record":
