@@ -22,12 +22,14 @@ one of its pods (`meridian-<component> probe`), asked every half second: so
 each time measured includes the probe's own round trip through kubectl.
 
 Failure classes (`FAILURE=`, comma-separated; all the profile's by default):
-`lake-writer`, `bor-writer`, `street-writer`, `instrument-writer` (the writer
-killed with no grace); `node-freeze` (the writer's node paused past its
+`lake-writer`, `bor-writer`, `street-writer`, `instrument-writer` (the
+writer's process killed outright, SIGKILL from its node, so its lease lapses
+unreleased); `node-freeze` (the writer's node paused past its
 lease, then resumed: nothing it does after the lease is kept, and it steps
 down); `split-brain` (the writer cut from the broker and the API server but
-not the database: it steps down before its lease ends, the standby takes
-over, and nothing it writes is kept); `node` (the writer's node stopped);
+not the database, by packets dropped on its node, established connections
+included: it steps down before its lease ends, the standby takes over, and
+nothing it writes is kept); `node` (the writer's node stopped);
 `network-policy` (a component cut from its database by a NetworkPolicy: the
 probe names the path and its address, and it heals with no restart).
 
@@ -246,7 +248,8 @@ def install(s):
         "--set", "deployment.id=DEP-failover-e2e",
         "--set", "platform.address=http://127.0.0.1:9",
         "--set", f"image.repository={repository}", "--set", f"image.tag={tag}",
-        "--set", "registry.enabled=false",
+        # The registry stays on: the launcher, a member set of its own,
+        # renders only beside it.
         "--set", "pluginStorage.enabled=false",
     ]
     if PROFILE in ("ha", "scaled"):
@@ -340,9 +343,16 @@ def members_settled(component):
 
 # ── The shape of the HA configuration (e2e-cluster-scaled) ─────────────────
 
+def rendered(component):
+    return kubectl("get", "deployment", f"{FULL}-{component}", check=False).returncode == 0
+
+
 def shape(s):
     print("S: the HA configuration's shape", flush=True)
     for component in STORES:
+        if not rendered(component):
+            s.check(False, f"{component}: the chart rendered no {component}")
+            continue
         wait_for(f"{component}'s two members ready", lambda c=component: members_settled(c), seconds=300)
         live = pods(component)
         on = {p["spec"]["nodeName"] for p in live}
@@ -373,16 +383,28 @@ def writer_pod(component):
     return holder(component)
 
 
+def crash(pod_name, component):
+    """The member's process killed outright (SIGKILL), from its node: no
+    signal it can answer, so its lease is never released and lapses. A pod
+    deleted, even with no grace, is told to stop first, and hands over."""
+    node = node_of(pod_name)
+    script = ("for c in $(crictl ps -q --name '^" + component + "$' --label io.kubernetes.pod.name=" + pod_name + "); do "
+              "kill -9 $(crictl inspect --output go-template --template '{{.info.pid}}' $c); done")
+    run("docker", "exec", node, "sh", "-c", script)
+
+
 def kill_writer(s, failure, component):
-    print(f"F: {failure}: the {component} writer killed with no grace", flush=True)
+    print(f"F: {failure}: the {component} writer's process killed outright (SIGKILL)", flush=True)
     wait_for(f"{component} settled", lambda: members_settled(component), seconds=300)
     writer = writer_pod(component)
     epoch = epoch_now(component)
+    before = restarts(writer)
     began = time.time()
-    kubectl("delete", "pod", writer, "--grace-period=0", "--force", "--wait=false")
+    crash(writer, component)
     if PROFILE == "tolerant":
         bound = TOLERANT_POD
-        back = happens(lambda: answering(component, avoid=(writer,)), bound + 30, every=0.5)
+        # The one member restarts in its pod: answering again once it has.
+        back = happens(lambda: restarts(writer) > before and answering(component), bound + 30, every=0.5)
     else:
         bound = HA[component]
         back = happens(lambda: answering(component, avoid=(writer,), above_epoch=epoch), bound + 30, every=0.5)
@@ -438,29 +460,34 @@ def node_freeze(s):
     s.check(epoch_now(component) == epoch + 1, "node-freeze: one takeover, no flapping back")
 
 
+def pod_ip(pod_name):
+    return json.loads(out("get", "pod", pod_name, "-o", "json"))["status"].get("podIP", "")
+
+
+def cut_rules(pod_name, targets, verb):
+    """Drop every packet between a pod and each target, on the pod's node,
+    first in FORWARD: established connections too, which a NetworkPolicy
+    (kube-router's, as most) lets carry on."""
+    node, ip = node_of(pod_name), pod_ip(pod_name)
+    for target in targets:
+        for rule in (["-s", ip, "-d", target], ["-s", target, "-d", ip]):
+            run("docker", "exec", node, "iptables", verb, "FORWARD", *(["1"] if verb == "-I" else []),
+                *rule, "-j", "DROP", check=verb == "-I")
+
+
 def split_brain(s):
     component = "lake"
     print(f"F: split-brain: the {component} writer cut from the broker and the API server, not the database", flush=True)
     wait_for(f"{component} settled", lambda: members_settled(component), seconds=300)
     writer = writer_pod(component)
     epoch = epoch_now(component)
-    kubectl("label", "pod", writer, "meridian.dev/cut=split-brain", "--overwrite")
-    policy = {
-        "apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
-        "metadata": {"name": "e2e-split-brain", "namespace": NAMESPACE},
-        "spec": {
-            "podSelector": {"matchLabels": {"meridian.dev/cut": "split-brain"}},
-            "policyTypes": ["Egress"],
-            "egress": [
-                {"to": [{"podSelector": {"matchLabels": {"meridian.dev/component": "database"}}}],
-                 "ports": [{"port": 5432, "protocol": "TCP"}]},
-                {"to": [{"namespaceSelector": {}, "podSelector": {"matchLabels": {"k8s-app": "kube-dns"}}}],
-                 "ports": [{"port": 53, "protocol": "UDP"}, {"port": 53, "protocol": "TCP"}]},
-            ],
-        },
-    }
+    broker = [pod_ip(p["metadata"]["name"]) for p in pods("broker")]
+    api = run("kubectl", "get", "endpoints", "kubernetes", "-o",
+              "jsonpath={.subsets[*].addresses[*].ip}").stdout.decode().split()
+    targets = [t for t in broker + api if t]
+    s.note(f"cut from {len(broker)} broker and {len(api)} API server address(es)")
     began = time.time()
-    kubectl("apply", "-f", "-", input=json.dumps(policy).encode())
+    cut_rules(writer, targets, "-I")
     try:
         back = happens(lambda: answering(component, avoid=(writer,), above_epoch=epoch), HA[component] + 30, every=0.5)
         took = time.time() - began
@@ -474,8 +501,7 @@ def split_brain(s):
                 "split-brain: the cut member is no longer ready")
         s.check(holder(component) != writer, "split-brain: the lease is the standby's: one writer")
     finally:
-        kubectl("delete", "networkpolicy", "e2e-split-brain", "--ignore-not-found")
-        kubectl("label", "pod", writer, "meridian.dev/cut-", check=False)
+        cut_rules(writer, targets, "-D")
     healed = happens(lambda: members_settled(component), 180)
     s.check(healed, "split-brain: healed once the cut is lifted, the cut member back as the standby")
 
