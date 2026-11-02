@@ -172,6 +172,7 @@ from meridian import (  # noqa: E402
 )
 from meridian.operations import as_decimal, as_money  # noqa: E402
 from meridian.plugin.v1 import operations_pb2 as ops  # noqa: E402
+from meridian.roles import data, ems, reporting, signal  # noqa: E402
 from meridian.roles.data import rates as rate_helpers  # noqa: E402
 from meridian.roles.data.quality import EdgeChecks, assessment  # noqa: E402
 
@@ -284,9 +285,12 @@ CATALOGUE = [
 ]
 
 
-class Dgm:
-    def __init__(self, plugin):
-        self.plugin = plugin
+class Dgm(data.Role):
+    """The data role's one class (SDK 0.35): its acts on itself, its wants
+    heard as its `on_<row>` methods; the connection, `self.plugin`, for what
+    is plugin-wide."""
+
+    def __init__(self):
         self.ids = {}
         self.wants = []
         self.withdrawn = []
@@ -318,7 +322,7 @@ class Dgm:
         for name, (identifiers, stated, described) in asked.items():
             if name in self.ids:
                 continue
-            found = await self.plugin.resolve_identifier(
+            found = await self.resolve_identifier(
                 identifiers=identifiers, stated_asset_class=stated, stated_description=described)
             if not found.instrument_id:
                 raise RuntimeError(f"{name} did not resolve: {found}")
@@ -376,12 +380,12 @@ class Dgm:
             price=Money(Decimal(last), instrument_id=self.ids["usdc"]),
             basis="per_unit",
         ))
-        recorded = await self.plugin.record_prices(prices=prices)
-        bars = await self.plugin.record_bars(bars=[self.bar(first)])
+        recorded = await self.record_prices(prices=prices)
+        bars = await self.record_bars(bars=[self.bar(first)])
         # An FX rate: the price of EUR's cash instrument, in dollars.
         day, rate = held["rates"]["EUR"][0]
         at = int(datetime.fromisoformat(day).replace(tzinfo=timezone.utc).timestamp())
-        fx = await self.plugin.record_prices(prices=[Price(
+        fx = await self.record_prices(prices=[Price(
             meta=self.meta(f"EUR-USD:{day}", "eur", "fx", at),
             kind="close",
             price=Money(Decimal(rate), "USD"),
@@ -395,7 +399,7 @@ class Dgm:
     async def restate(self):
         await self.resolve()
         candle = exchange()["restated"]["BTC-USD"][0]
-        done = await self.plugin.record_prices(prices=[self.close(candle)])
+        done = await self.record_prices(prices=[self.close(candle)])
         said = {"recorded": done.recorded, "restated": done.restated, "unchanged": done.unchanged}
         log(restated=said)
         return said
@@ -418,14 +422,14 @@ class Dgm:
                 attributes=ops.TradeAttributes(),
             ) for subject in want.subjects]
             try:
-                done = await self.plugin._operations().RecordTrades(
+                done = await self._operations().RecordTrades(
                     ops.RecordTradesParams(trades=trades, want_id=want.want_id))
                 self.streamed += done.recorded
             except Exception as failed:  # said, and the stream goes on
                 log(stream_failed=str(failed))
             await asyncio.sleep(2)
 
-    async def on_want(self, heard):
+    async def on_observations_wanted(self, heard):
         want = heard.message
         self.wants.append({"want_id": want.want_id, "dataset": want.dataset,
                            "business_date": want.business_date, "standing": want.standing,
@@ -445,13 +449,13 @@ class Dgm:
         subjects = ["btc" if s.entity_id == btc else s.entity_id for s in want.subjects]
         for candle in exchange()["candles"]["BTC-USD"]:
             if day_of(candle[0]) == wanted:
-                done = await self.plugin.record_prices(
+                done = await self.record_prices(
                     prices=[self.close(candle, subject) for subject in subjects],
                     want_id=want.want_id)
                 log(answered={"want_id": want.want_id, "recorded": done.recorded})
                 return
 
-    async def on_withdrawn(self, heard):
+    async def on_want_withdrawn(self, heard):
         streaming = self.streams.pop(heard.message.want_id, None)
         if streaming:
             streaming.cancel()
@@ -487,7 +491,7 @@ class Dgm:
         now = time.time_ns()
         self.at = now
         trades = [self.trade(f"BTC-USD-T-{n}", now + n * 1000, f"62000.{n}") for n in (1, 2, 3)]
-        done = await self.plugin._operations().RecordTrades(ops.RecordTradesParams(trades=trades))
+        done = await self._operations().RecordTrades(ops.RecordTradesParams(trades=trades))
         quotes = [
             ops.Quote(meta=self.live_meta("BTC-USD-Q-1", now), bid=self.money("61999"),
                       ask=self.money("62001"), bid_quantity=_decimal("1"), ask_quantity=_decimal("2")),
@@ -497,7 +501,7 @@ class Dgm:
                       bid=self.money("61998", "", self.ids["usdc"]),
                       ask=self.money("62003", "", self.ids["usdc"])),
         ]
-        quoted = await self.plugin._operations().RecordQuotes(ops.RecordQuotesParams(quotes=quotes))
+        quoted = await self._operations().RecordQuotes(ops.RecordQuotesParams(quotes=quotes))
         said = {"trades": done.recorded, "quotes": quoted.recorded,
                 "head": max(p.sequence for p in quoted.watermark.partitions)}
         log(trades=said)
@@ -507,7 +511,7 @@ class Dgm:
         await self.resolve()
         rows = [self.trade("BTC-USD-T-9", self.at - DAY_NS, "61500.9"),
                 self.trade("BTC-USD-T-1", self.at + 1000, "62000.1", cancelled=True)]
-        done = await self.plugin._operations().RecordTrades(ops.RecordTradesParams(trades=rows))
+        done = await self._operations().RecordTrades(ops.RecordTradesParams(trades=rows))
         said = {"recorded": done.recorded, "restated": done.restated}
         log(late=said)
         return said
@@ -539,7 +543,7 @@ class Dgm:
         rows += edge.judged(live, [quote("BTC-USD-Q-23", now + 3000, "62011", "62013")])
         edge.resynced(live)
         rows += edge.judged(live, [quote("BTC-USD-Q-24", now + 4000, "62020", "62015")])
-        done = await self.plugin.record_quotes(quotes=rows)
+        done = await self.record_quotes(quotes=rows)
         said = {"recorded": done.recorded,
                 "states": {r.meta.row_key: [str(r.meta.quality or "valid"),
                                             list(r.meta.quality_reasons)] for r in rows}}
@@ -550,7 +554,7 @@ class Dgm:
         """Contract v27 (W10.4): SOFR's fixing and Treasury's par curve for
         one date, through the SDK's rates helpers; then the fixing revised,
         published later, as the next version of its row key."""
-        feed = rate_helpers.Feed(self.plugin, "lake", day_zone="America/New_York")
+        feed = rate_helpers.Feed(self, "lake", day_zone="America/New_York")
         # By the administrator's own code, the administrator its source
         # (ruling 545).
         sofr = await feed.subject(("symbol", "SOFR", "nyfed"),
@@ -571,8 +575,8 @@ class Dgm:
                            {"3M": "4.05", "2Y": "3.60", "10Y": "4.12", "20Y": None},
                            business_date=day, published_ns=first,
                            convention=rate_helpers.BOND_EQUIVALENT, raw_key=f"par/{day}")
-        done = await self.plugin.record_rates(rates=[fixing("4.31", first)] + curve)
-        again = await self.plugin.record_rates(rates=[fixing("4.32", revised)])
+        done = await self.record_rates(rates=[fixing("4.31", first)] + curve)
+        again = await self.record_rates(rates=[fixing("4.32", revised)])
         said = {"sofr": sofr, "par": par, "recorded": done.recorded,
                 "restated": again.restated, "first_published": first,
                 "revised_published": revised}
@@ -587,10 +591,10 @@ class Dgm:
         companies = {}
         for name, cik in (("apple", "0000320193"), ("berkshire", "0001067983"),
                           ("moodys", "0001059556")):
-            found = await self.plugin.resolve_company(
+            found = await self.resolve_company(
                 identifiers=[ops.Identifier(scheme="cik", value=cik)])
             companies[name] = found.company_id
-        share = await self.plugin.resolve_identifier(
+        share = await self.resolve_identifier(
             identifiers=[ops.Identifier(scheme="figi", value="BBG000B9XRY4")],
             stated_asset_class="equity", stated_description="Apple Inc.", stated_currency="USD")
         if not share.instrument_id:
@@ -609,7 +613,7 @@ class Dgm:
                 raw=self.plugin.raw_record(f"edgar/{row_key}"))
 
         eight_k = "0000320193-26-000105"
-        filed = await self.plugin.record_filings(filings=[meridian.Filing(
+        filed = await self.record_filings(filings=[meridian.Filing(
             meta=meta(eight_k, [(apple, "filer")], first, first),
             filing=ops.FilingRef(accession_number=eight_k, form="8-K"),
             kind="current_report", items=["2.02", "9.01"], filed_date="2026-10-30")])
@@ -622,24 +626,24 @@ class Dgm:
                 period_start="2026-06-28", period_end="2026-09-27",
                 filing=ops.FilingRef(accession_number=accession, form="10-K"))
 
-        fact = await self.plugin.record_reported_facts(
+        fact = await self.record_reported_facts(
             facts=[eps("1.85", "0000320193-26-000107", first)])
-        fact_again = await self.plugin.record_reported_facts(
+        fact_again = await self.record_reported_facts(
             facts=[eps("1.86", "0000320193-26-000121", restated)])
         q3 = "0001067983-26-000045"
         quarter_end = int(datetime(2026, 9, 30, tzinfo=timezone.utc).timestamp()) * 10**9
-        reported = await self.plugin.record_holdings_reports(reports=[meridian.HoldingsReport(
+        reported = await self.record_holdings_reports(reports=[meridian.HoldingsReport(
             meta=meta(q3, [(berkshire, "holder")], quarter_end, first),
             kind="form_13f", report_date="2026-09-30", complete=True,
             filing=ops.FilingRef(accession_number=q3, form="13F-HR"))])
-        held = await self.plugin.record_holdings(holdings=[meridian.Holding(
+        held = await self.record_holdings(holdings=[meridian.Holding(
             meta=meta(f"{q3}:037833100", [(berkshire, "holder"), (share.instrument_id, "held")],
                       quarter_end, first),
             report_row_key=q3,
             quantity=meridian.UnitValue(value=Decimal("300000000"), unit="shares"),
             market_value=Money(Decimal("69000000000"), "USD"))])
         affirmed = int(datetime(2026, 5, 2, tzinfo=timezone.utc).timestamp()) * 10**9
-        rated = await self.plugin.record_rating_actions(actions=[meridian.RatingAction(
+        rated = await self.record_rating_actions(actions=[meridian.RatingAction(
             meta=meta(f"moodys:issuer:{apple}:2026-05-02", [(apple, "subject"), (moodys, "rater")],
                       affirmed, first),
             rating="Aaa", rating_class="long-term issuer", action="affirmed")])
@@ -657,11 +661,11 @@ class Dgm:
         harness platform's bond and pool, a capped print in percent of par
         with its yield, a when-issued print in yield, a firm quote with
         bucketed sizes, and the pool's factors, October's republished."""
-        bond = await self.plugin.resolve_identifier(
+        bond = await self.resolve_identifier(
             identifiers=[ops.Identifier(scheme="figi", value="BBG01BOND0001")],
             stated_asset_class="debt", stated_description="Harness Corp 4.875% 2036-02-05",
             stated_currency="USD")
-        pool = await self.plugin.resolve_identifier(
+        pool = await self.resolve_identifier(
             identifiers=[ops.Identifier(scheme="agency_pool", value="MA5123", source="FNMA")],
             stated_asset_class="debt", stated_description="FNMA CL MA5123 5.5",
             stated_currency="USD")
@@ -698,7 +702,7 @@ class Dgm:
                           ops.TRADE_CHARACTERISTIC_WHEN_ISSUED]),
                       **{"yield": quoted("4.875", ops.YIELD_KIND_TO_MATURITY)}),
         ]
-        traded = await self.plugin._operations().RecordTrades(ops.RecordTradesParams(trades=prints))
+        traded = await self._operations().RecordTrades(ops.RecordTradesParams(trades=prints))
         quote = ops.Quote(meta=meta("ATS-HARN36-Q-1", bond.instrument_id, now + 2000, VENUE),
                           bid=self.money("98.25"), ask=self.money("98.50"),
                           bid_quantity=_decimal("1000000"), ask_quantity=_decimal("1000000"),
@@ -706,7 +710,7 @@ class Dgm:
                           basis=ops.PRICE_BASIS_PERCENT_OF_PAR,
                           bid_yield=quoted("5.110", ops.YIELD_KIND_TO_WORST, "2034-02-05"),
                           ask_yield=quoted("5.076", ops.YIELD_KIND_TO_WORST, "2034-02-05"))
-        quoted_done = await self.plugin._operations().RecordQuotes(ops.RecordQuotesParams(quotes=[quote]))
+        quoted_done = await self._operations().RecordQuotes(ops.RecordQuotesParams(quotes=[quote]))
 
         def factor(month, value, record, payment, published):
             return ops.Factor(meta=meta(f"FNMA:MA5123:{month}", pool.instrument_id, now,
@@ -714,10 +718,10 @@ class Dgm:
                               factor=_decimal(value), factor_month=month,
                               record_date=record, payment_date=payment)
 
-        factors = await self.plugin._operations().RecordFactors(ops.RecordFactorsParams(factors=[
+        factors = await self._operations().RecordFactors(ops.RecordFactorsParams(factors=[
             factor("202609", "0.84017733", "2026-09-30", "2026-10-26", "2026-10-06"),
             factor("202610", "0.83102210", "2026-10-31", "2026-11-25", "2026-11-04")]))
-        republished = await self.plugin._operations().RecordFactors(ops.RecordFactorsParams(
+        republished = await self._operations().RecordFactors(ops.RecordFactorsParams(
             factors=[factor("202610", "0.83102211", "2026-10-31", "2026-11-25", "2026-11-04")]))
         said = {"bond": bond.instrument_id, "pool": pool.instrument_id,
                 "trades": traded.recorded, "quotes": quoted_done.recorded,
@@ -734,7 +738,7 @@ class Dgm:
         stated = ({} if one("scheme") == "iso4217" else
                   {"stated_description": f"{one('value')}, as the venue names it",
                    "stated_currency": "USD"})
-        found = await self.plugin._operations().ResolveIdentifier(ops.ResolveIdentifierParams(
+        found = await self._operations().ResolveIdentifier(ops.ResolveIdentifierParams(
             identifiers=[ops.Identifier(scheme=one("scheme"), value=one("value"), source=one("source"))],
             as_of_ns=int(one("as_of") or 0), **stated))
         return {"found": found.found, "instrument_id": found.instrument_id,
@@ -744,11 +748,11 @@ class Dgm:
         symbol = ops.Identifier(scheme="symbol", value="ZZAMB", source="coinbase")
         figi = ops.Identifier(scheme="figi", value="BBG000ZZAMB1")
         stated = {"stated_description": "ZZAMB, as the venue names it", "stated_currency": "USD"}
-        first = await self.plugin._operations().ResolveIdentifier(
+        first = await self._operations().ResolveIdentifier(
             ops.ResolveIdentifierParams(identifiers=[symbol], **stated))
-        second = await self.plugin._operations().ResolveIdentifier(
+        second = await self._operations().ResolveIdentifier(
             ops.ResolveIdentifierParams(identifiers=[figi], **stated))
-        both = await self.plugin._operations().ResolveIdentifier(
+        both = await self._operations().ResolveIdentifier(
             ops.ResolveIdentifierParams(identifiers=[symbol, figi]))
         said = {"symbol": first.instrument_id, "figi": second.instrument_id,
                 "both": {"found": both.found, "miss_reason": ops.MissReason.Name(both.miss_reason),
@@ -760,14 +764,14 @@ class Dgm:
         """Contract v20 (W10.6): the last trade this instance recorded of
         each subject asked, for a restart's backfill."""
         refs = [ops.SubjectRef(entity_id=s) for s in query.get("subject", [])]
-        answer = await self.plugin._operations().ListTrades(
+        answer = await self._operations().ListTrades(
             ops.ListTradesParams(subjects=refs, latest_recorded=True))
         return {"trades": [trade_json(t) for t in answer.trades],
                 "watermark": [[p.partition, p.sequence] for p in answer.watermark.partitions]}
 
     async def licences(self):
         """Contract v20 (W10.9): its own datasets' licences."""
-        answer = await self.plugin._operations().ListDatasets(ops.ListDatasetsParams())
+        answer = await self._operations().ListDatasets(ops.ListDatasetsParams())
         return {"datasets": [d.dataset for d in answer.datasets],
                 "licences": [{"dataset": l.dataset, "kept": l.kept, "updated_by": l.updated_by}
                              for l in answer.licences]}
@@ -835,20 +839,25 @@ def refusal_of(failed):
     return details() if callable(details) else str(failed)
 
 
-class Reader:
-    def __init__(self, plugin):
-        self.plugin = plugin
+class Reader(reporting.Role):
+    """The reporting role's one class: prices heard for the subjects it
+    follows, its stream opened again when it first follows them."""
+
+    def __init__(self):
         self.heard = []
         self.following = None
 
-    async def on_price(self, heard):
+    def subjects(self):
+        return tuple(self.following or ())
+
+    async def on_prices_recorded(self, heard):
         self.heard.append(price_json(heard.message.price))
         log(heard=self.heard[-1])
 
     async def follow(self, subjects):
         if self.following is None:
-            self.following = asyncio.ensure_future(
-                self.plugin.receive(prices_recorded=self.on_price, subjects=subjects))
+            self.following = list(subjects)
+            self.hear_again()
         return {"following": subjects}
 
     async def prices(self, query):
@@ -866,7 +875,7 @@ class Reader:
         if one("as_of"):
             asked["as_of_ns"] = int(one("as_of"))
         try:
-            answer = await self.plugin.list_prices(**asked)
+            answer = await self.list_prices(**asked)
         except Exception as failed:  # the lake's refusal, said back
             return {"refused": refusal_of(failed), "prices": [], "unanswered": []}
         return {
@@ -879,7 +888,7 @@ class Reader:
     async def rates(self, query):
         """ListRates (contract v27, W10.6)."""
         one = lambda name, default="": query.get(name, [default])[0]  # noqa: E731
-        answer = await self.plugin.list_rates(
+        answer = await self.list_rates(
             subjects=[meridian.SubjectRef(entity_id=s) for s in query.get("subject", [])],
             business_date=one("date"),
             tenors=[rate_helpers.tenor(t) for t in query.get("tenor", [])],
@@ -904,12 +913,12 @@ class Reader:
         published = int(one("published_as_of", "0"))
         brief = lambda meta: {"row_key": meta.row_key, "version": meta.version,  # noqa: E731
                               "dataset": meta.source.dataset}
-        filings = await self.plugin.list_filings(subjects=subjects, published_as_of_ns=published)
-        facts = await self.plugin.list_reported_facts(subjects=subjects,
+        filings = await self.list_filings(subjects=subjects, published_as_of_ns=published)
+        facts = await self.list_reported_facts(subjects=subjects,
                                                       published_as_of_ns=published)
-        ratings = await self.plugin.list_rating_actions(subjects=subjects,
+        ratings = await self.list_rating_actions(subjects=subjects,
                                                         published_as_of_ns=published)
-        holdings = await self.plugin.list_holdings(subjects=subjects, published_as_of_ns=published,
+        holdings = await self.list_holdings(subjects=subjects, published_as_of_ns=published,
                                                    kinds=["form_13f"], from_date="2026-09-30")
         return {
             "filings": [dict(brief(f.meta), items=list(f.items), filed_date=f.filed_date,
@@ -931,7 +940,7 @@ class Reader:
         after = one("after")
         watermark = (ops.Watermark(partitions=[ops.PartitionSequence(
             partition="coin:fixed_income", sequence=int(after))]) if after else None)
-        answer = await self.plugin.list_factors(
+        answer = await self.list_factors(
             subjects=[meridian.SubjectRef(entity_id=s) for s in query.get("subject", [])],
             from_date=one("from"), to_date=one("to"), after_watermark=watermark)
         return {
@@ -948,7 +957,7 @@ class Reader:
             subjects=[ops.SubjectRef(entity_id=s) for s in query.get("subject", [])],
             business_date="2026-02-30")
         try:
-            await self.plugin._operations().ListPrices(params)
+            await self._operations().ListPrices(params)
         except Exception as refused:  # the sidecar's refusal, as gRPC carries it
             details = getattr(refused, "details", None)
             return {"refused": details() if callable(details) else str(refused)}
@@ -962,7 +971,7 @@ class Reader:
         if path == "/prices":
             return await self.prices(query)
         if path == "/datasets":
-            listed = await self.plugin.list_datasets()
+            listed = await self.list_datasets()
             return {"datasets": [d.dataset for d in listed.datasets]}
         if path == "/invalid-date":
             return await self.invalid_date(query)
@@ -982,7 +991,7 @@ class Reader:
         over the par yields the lake holds, read on this plugin's behalf:
         each figure by its curve and tenor, and each line not evaluated."""
         one = lambda name, default="": query.get(name, [default])[0]  # noqa: E731
-        ran = await self.plugin._operations().RunJob(ops.RunJobParams(job=ops.Job(
+        ran = await self._operations().RunJob(ops.RunJobParams(job=ops.Job(
             business_date=one("date"),
             measures=[ops.MeasureRef(definition="treasury_curve", version=1)])))
         answer = ran.answer
@@ -1047,41 +1056,54 @@ def quote_json(quote):
             "bid_yield": _amount(quote.bid_yield.value.value) if quote.HasField("bid_yield") else ""}
 
 
-class Desk:
-    def __init__(self, plugin):
-        self.plugin = plugin
+class Desk(ems.Role):
+    """The ems role's one class: every trade and the quotes heard for the
+    subjects it follows, nothing read from the store when its stream opens
+    (`seed`); the role's required order events handled, empty: the desk
+    works no order here (ruling 1043)."""
+
+    seed = False
+
+    def __init__(self):
         self.trades = []
         self.quotes = []
         self.lost = 0
         self.following = None
 
-    async def hear(self, subjects):
-        call = self.plugin._operations().Receive(
-            ops.ReceiveRequest(rows=["TradesRecorded", "QuotesRecorded"], subjects=subjects))
-        async for delivery in call:
-            which = delivery.WhichOneof("item")
-            if which == "trades_recorded":
-                self.trades.append(trade_json(delivery.trades_recorded.trade))
-                log(heard_trade=self.trades[-1])
-            elif which == "quotes_recorded":
-                self.quotes.append(quote_json(delivery.quotes_recorded.quote))
-                log(heard_quote=self.quotes[-1])
-            elif which == "lost":
-                self.lost += 1
+    def subjects(self):
+        return tuple(self.following or ())
+
+    async def on_order_updated(self, heard):
+        pass
+
+    async def on_execution_recorded(self, heard):
+        pass
+
+    async def on_placement_updated(self, heard):
+        pass
+
+    async def on_trades_recorded(self, heard):
+        self.trades.append(trade_json(heard.message.trade))
+        log(heard_trade=self.trades[-1])
+
+    async def on_quotes_recorded(self, heard):
+        self.quotes.append(quote_json(heard.message.quote))
+        log(heard_quote=self.quotes[-1])
 
     async def answer(self, path, query):
         subjects = query.get("subject", [])
         refs = [ops.SubjectRef(entity_id=s) for s in subjects]
         if path == "/follow":
             if self.following is None:
-                self.following = asyncio.ensure_future(self.hear(subjects))
+                self.following = list(subjects)
+                self.hear_again()
             return {"following": subjects}
         if path == "/heard":
             return {"trades": self.trades, "quotes": self.quotes, "lost": self.lost}
         if path == "/catch-up":
             after = int(query.get("after", ["0"])[0])
             dataset = query.get("dataset", ["coin:live"])[0]
-            answer = await self.plugin._operations().ListTrades(ops.ListTradesParams(
+            answer = await self._operations().ListTrades(ops.ListTradesParams(
                 subjects=refs, after_watermark=ops.Watermark(
                     partitions=[ops.PartitionSequence(partition=dataset, sequence=after)])))
             return {"trades": [trade_json(t) for t in answer.trades],
@@ -1089,7 +1111,7 @@ class Desk:
         if path == "/latest":
             # Not a data plugin's: refused (contract v20, W10.6).
             try:
-                await self.plugin._operations().ListTrades(
+                await self._operations().ListTrades(
                     ops.ListTradesParams(subjects=refs, latest_recorded=True))
                 return {"refused": ""}
             except Exception as refused:  # the sidecar's answer, said back
@@ -1102,7 +1124,7 @@ class Desk:
                 params.sources.CopyFrom(ops.SourceChoice(named=named,
                                                          include_quarantined=quarantined))
             try:
-                answer = await self.plugin._operations().ListQuotes(params)
+                answer = await self._operations().ListQuotes(params)
             except Exception as failed:  # the lake's refusal, said back
                 return {"refused": refusal_of(failed), "quotes": [], "unanswered": []}
             return {"quotes": [quote_json(q) for q in answer.quotes],
@@ -1113,13 +1135,18 @@ class Desk:
 # ── The lens: a signal plugin escalating a close's quality (contract v28) ──
 
 
-class Lens:
-    def __init__(self, plugin):
-        self.plugin = plugin
+class Lens(signal.Role):
+    """The signal role's one class: the filings recorded about the subjects
+    it follows, heard every one."""
+
+    def __init__(self):
         self.filings = []
         self.hearing = None
 
-    async def on_filing(self, heard):
+    def subjects(self):
+        return tuple(self.hearing or ())
+
+    async def on_filings_recorded(self, heard):
         filing = heard.message.filing
         self.filings.append({"row_key": filing.meta.row_key, "version": filing.meta.version,
                              "items": list(filing.items)})
@@ -1129,7 +1156,7 @@ class Lens:
         """W10.12: read the close, then record its assessment, as a signal
         plugin does once its baseline finds it an outlier."""
         one = lambda name, default="": query.get(name, [default])[0]  # noqa: E731
-        read = await self.plugin.list_prices(
+        read = await self.list_prices(
             subjects=[meridian.SubjectRef(entity_id=one("subject"))], kinds=["close"],
             business_date=one("date"),
             sources=ops.SourceChoice(named=["coin:daily"], include_quarantined=True))
@@ -1139,7 +1166,7 @@ class Lens:
         if one("version"):
             found = dataclasses.replace(found, version=int(one("version")))
         try:
-            done = await self.plugin.record_quality_assessments(assessments=[found])
+            done = await self.record_quality_assessments(assessments=[found])
         except Exception as failed:  # the lake's refusal, said back
             return {"refused": refusal_of(failed)}
         said = {"recorded": done.recorded, "row_key": found.row_key, "version": found.version}
@@ -1152,8 +1179,8 @@ class Lens:
         if path == "/follow-filings":
             # Contract v28 (W10.5): every filing, never conflated.
             if self.hearing is None:
-                self.hearing = asyncio.ensure_future(self.plugin.receive(
-                    filings_recorded=self.on_filing, subjects=query.get("subject", [])))
+                self.hearing = list(query.get("subject", []))
+                self.hear_again()
             return {"following": query.get("subject", [])}
         if path == "/filings-heard":
             return {"filings": self.filings}
@@ -1187,33 +1214,20 @@ def serve(served):
 
 
 async def main():
-    if KIND == "data":
-        plugin = await meridian.connect(
-            interface=Interface(PORT, "Lake stand-in", pages=[Page("/", "Datasets", levels=["admin"])]),
-            declaration=Declaration(catalogue=CATALOGUE),
-        )
-        served = Dgm(plugin)
-        asyncio.ensure_future(plugin.receive(observations_wanted=served.on_want,
-                                             want_withdrawn=served.on_withdrawn))
-    elif KIND == "signal":
-        plugin = await meridian.connect(
-            interface=Interface(PORT, "Signal stand-in", pages=[Page("/", "Quality", levels=["read"])]),
-        )
-        served = Lens(plugin)
-    elif KIND == "desk":
-        plugin = await meridian.connect(
-            interface=Interface(PORT, "Desk stand-in", pages=[Page("/", "Trades", levels=["read"])]),
-        )
-        served = Desk(plugin)
-    else:
-        plugin = await meridian.connect(
-            interface=Interface(PORT, "Reader stand-in", pages=[Page("/", "Prices", levels=["read"])]),
-        )
-        served = Reader(plugin)
-    log(registered=plugin.identity.instance_id, kind=KIND)
+    """Each kind one role class, run on one connection (SDK 0.35:
+    `meridian.run_async`); its page served here, on the plugin's port."""
+    title, page, served = {
+        "data": ("Lake stand-in", Page("/", "Datasets", levels=["admin"]), Dgm),
+        "signal": ("Signal stand-in", Page("/", "Quality", levels=["read"]), Lens),
+        "desk": ("Desk stand-in", Page("/", "Trades", levels=["read"]), Desk),
+    }.get(KIND, ("Reader stand-in", Page("/", "Prices", levels=["read"]), Reader))
+    served = served()
+    interface = Interface(PORT, title, pages=[page])
+    declaration = (Declaration(catalogue=CATALOGUE, interface=interface) if KIND == "data"
+                   else Declaration(interface=interface))
     threading.Thread(target=serve, args=(served,), daemon=True).start()
-    while True:
-        await asyncio.sleep(3600)
+    log(kind=KIND)
+    await meridian.run_async(declaration, [served])
 
 
 if __name__ == "__main__":
