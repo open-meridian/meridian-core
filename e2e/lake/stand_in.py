@@ -101,6 +101,12 @@ declares `fixed_income` -- trades, quotes and factors, pushed -- and serves:
   /pool-factor?subject=ID
              records one month's factor of that pool, answering what was
              recorded or the lake's refusal.
+  /offer-terms?subject=ID&case=C
+             with its `reference` role, offers the bond's terms on TPL-bond
+             (OfferTemplateFields, W3.23): `good` a call's row by its index
+             and a field of its own, `path` a row with no index, `value` a
+             kind the schema does not define; answering the record's new
+             version or the refusal.
 
 STAND_IN_LAKE=signal is a `signal` plugin serving:
 
@@ -766,6 +772,23 @@ class Dgm(data.Role):
             return {"refused": details() if callable(details) else str(refused)}
         return {"recorded": done.recorded}
 
+    async def offer_terms(self, query):
+        one = lambda name: query.get(name, [""])[0]  # noqa: E731
+        fields = {
+            "good": [("calls[0].kind", "REDEMPTION_KIND_PAR"), ("calls[0].from_date", "2035-11-05"),
+                     ("calls[0].price", "100"), ("governing_law", "US-NY")],
+            "path": [("calls.kind", "REDEMPTION_KIND_PAR")],
+            "value": [("calls[0].kind", "REDEMPTION_KIND_SOMETIMES")],
+        }[one("case")]
+        try:
+            done = await self.plugin.offer_template_fields(
+                instrument_id=one("subject"), template_id="TPL-bond", template_version="1",
+                fields=[meridian.TemplateFieldValue(path=path, value=value) for path, value in fields])
+        except Exception as refused:  # the store's refusal, as the SDK raises it
+            details = getattr(refused, "details", None)
+            return {"refused": details() if callable(details) else str(refused)}
+        return {"version": done.instrument.version}
+
     async def resolve_as_of(self, query):
         one = lambda name: query.get(name, [""])[0]
         # A security with the name and currency the venue states (from
@@ -837,6 +860,8 @@ class Dgm(data.Role):
             return await self.provisional_pool()
         if path == "/pool-factor":
             return await self.pool_factor(query)
+        if path == "/offer-terms":
+            return await self.offer_terms(query)
         if path == "/resolve":
             return await self.resolve()
         if path == "/record":

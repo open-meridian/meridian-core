@@ -108,7 +108,10 @@ harness's admin, Ben, who holds read on `book`.
    TPL-mbs-pool, its class and type only offered -- and its factor is
    refused; the admin accepts the offered values through
    `dashboard__accept_offered_values`, the type with the class, and the
-   lake, asking again, takes the factor with no restart.
+   lake, asking again, takes the factor with no restart. With its
+   `reference` role `coin` offers the bond's terms on TPL-bond: a call's row
+   by its index kept, a new version; a row with no index refused naming its
+   path, a kind the schema does not define naming its value.
 
 `make e2e-recorded` runs the same with STAND_IN_EXCHANGES naming RECORDED, a
 developer's recorded exchanges (plans/the-lake-prices-the-book, Q11).
@@ -764,6 +767,19 @@ def run():
         page("coin", "admin", f"/pool-factor?subject={pending_pool}")),
         "step 18, the lake did not take the completed pool's factor without a restart")
     log(f"step 18: {taken}")
+    # A reference plugin's terms of the bond (W3.23, W1.24): a call's row by
+    # its index kept as offers, a new version; a row with no index refused
+    # naming its path, a kind the schema does not define naming its value.
+    before = call("dashboard__read_instrument", {"instrument_id": bond}, "unchanged")["data"]
+    offered = page("coin", "admin", f"/offer-terms?subject={bond}&case=good")
+    must(offered.get("version") == before["version"] + 1,
+         f"step 18, a call's row offered by its index is kept, a new version: {offered}")
+    no_index = page("coin", "admin", f"/offer-terms?subject={bond}&case=path")
+    must("fields[0].path" in (no_index.get("refused") or ""),
+         f"step 18, a repeated group's row with no index refused naming its path: {no_index}")
+    no_kind = page("coin", "admin", f"/offer-terms?subject={bond}&case=value")
+    must("fields[0].value" in (no_kind.get("refused") or ""),
+         f"step 18, a kind the schema does not define refused naming its value: {no_kind}")
 
     # 11. The store.
     lines = compose("run", "--rm", "-T", "store", "lake").stdout.split("\n")
@@ -821,7 +837,8 @@ def run():
           "yield and characteristics, a when-issued print in yield, a firm quote with bucketed "
           "sizes, and a pool's factors read by payment date, republished and caught up; a "
           "provisional pool's factor refused, its offered class and type accepted together and "
-          "its factor then taken with no restart; and "
+          "its factor then taken with no restart; a bond's call offered by its row's index and "
+          "kept, a row with no index and an undefined kind refused naming each; and "
           "`store lake` printing each version numbered with no "
           "holes, the want and the priority's changes")
 
