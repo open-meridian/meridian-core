@@ -1048,6 +1048,12 @@ impl Store for PostgresStore {
         request: &[u8],
         decide: &mut Decide<'_>,
     ) -> Result<Acted> {
+        // The writer's epoch, adopted before a connection is taken, so a
+        // store of one connection never waits on itself (step 3a).
+        let epoch = match self.fence.epoch() {
+            0 => self.adopt()?,
+            epoch => epoch,
+        };
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
         let partition: String = tx
@@ -1065,10 +1071,6 @@ impl Store for PostgresStore {
         .map_err(unavailable)?;
         // The head under its lock, its epoch the writer's (step 3a): a
         // command commits only while the head row's epoch is its own.
-        let epoch = match self.fence.epoch() {
-            0 => self.adopt()?,
-            epoch => epoch,
-        };
         let held = tx
             .query_one(
                 "SELECT sequence, epoch FROM book_partition_head WHERE partition = $1 FOR UPDATE",
@@ -1644,6 +1646,9 @@ impl Store for PostgresStore {
     }
 
     fn rebuild(&self) -> Result<usize> {
+        if self.fence.epoch() == 0 {
+            self.adopt()?;
+        }
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
         // Every partition's writer held off for the length of it.
@@ -1667,9 +1672,6 @@ impl Store for PostgresStore {
         let epochs = tx
             .query("SELECT epoch FROM book_partition_head FOR UPDATE", &[])
             .map_err(unavailable)?;
-        if self.fence.epoch() == 0 {
-            self.adopt()?;
-        }
         for row in epochs {
             self.fence.admits(row.get::<_, i64>(0) as u64)?;
         }

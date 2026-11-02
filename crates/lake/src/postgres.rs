@@ -695,6 +695,9 @@ SELECT r.dataset, r.latest_key, r.expires::text, r.listed_type,
 
 impl Store for PostgresStore {
     fn record(&self, dataset: &str, rows: Vec<Observation>, now_ns: i64) -> Result<Recorded> {
+        // Adopted before a connection is taken: one store never waits on
+        // itself for a second (step 3a).
+        self.epoch_now()?;
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
         let mut head = self.head(&mut tx, dataset)?;
@@ -747,6 +750,7 @@ impl Store for PostgresStore {
         readers: &[String],
         now_ns: i64,
     ) -> Result<Recorded> {
+        self.epoch_now()?;
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
         let mut head = self.head(&mut tx, dataset)?;
@@ -1174,6 +1178,7 @@ impl Store for PostgresStore {
         why: &str,
         now_ns: i64,
     ) -> Result<u64> {
+        self.epoch_now()?;
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
         // The partition held as a batch holds it, so no row key's next
@@ -1187,7 +1192,6 @@ impl Store for PostgresStore {
             )
             .map_err(unavailable)?;
         if let Some(held) = held {
-            self.epoch_now()?;
             self.fence.admits(held.get::<_, i64>(0) as u64)?;
         }
         // The rows removed, and the row keys left with no version kept: a

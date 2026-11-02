@@ -1418,3 +1418,17 @@ async fn a_book_held_at_its_head_is_the_book_the_record_builds() {
         assert!(bound == meridian_bor::writer::DEFAULT_BOOKS_BYTES || bytes <= bound);
     }
 }
+
+/// The writer adopts its epoch before it takes a connection: a store of one
+/// connection -- `meridian-bor rebuild`'s -- rebuilds, never waiting on
+/// itself for a second (found by e2e-book, step 3a).
+#[test]
+fn a_store_of_one_connection_adopts_its_epoch_and_rebuilds() {
+    let migrated = PostgresStore::connect(&url(), 1).unwrap();
+    migrated.migrate(&meridian_clock::SystemClock).unwrap();
+    drop(migrated);
+    let alone = PostgresStore::connect(&url(), 1).unwrap();
+    let _held = REBUILDS.blocking_lock();
+    alone.rebuild().unwrap();
+    assert!(alone.epoch() >= 1);
+}
