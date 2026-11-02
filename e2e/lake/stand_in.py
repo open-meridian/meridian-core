@@ -185,7 +185,7 @@ from meridian import (  # noqa: E402
 )
 from meridian.operations import as_decimal, as_money  # noqa: E402
 from meridian.plugin.v1 import operations_pb2 as ops  # noqa: E402
-from meridian.roles import data, ems, reporting, signal  # noqa: E402
+from meridian.roles import data, ems, reference, reporting, signal  # noqa: E402
 from meridian.roles.data import rates as rate_helpers  # noqa: E402
 from meridian.roles.data.quality import EdgeChecks, assessment  # noqa: E402
 
@@ -298,12 +298,18 @@ CATALOGUE = [
 ]
 
 
+class Terms(reference.Role):
+    """coin's reference role, its one class: the terms it offers
+    (OfferTemplateFields, W3.23), made through it."""
+
+
 class Dgm(data.Role):
     """The data role's one class (SDK 0.35): its acts on itself, its wants
     heard as its `on_<row>` methods; the connection, `self.plugin`, for what
-    is plugin-wide."""
+    is plugin-wide; its terms offered through its reference role's class."""
 
     def __init__(self):
+        self.reference = Terms()
         self.ids = {}
         self.wants = []
         self.withdrawn = []
@@ -748,7 +754,7 @@ class Dgm(data.Role):
         the harness platform cannot confirm -- a provisional LCL- record, its
         class and type only offered until a person accepts them (W3.7,
         W3.10)."""
-        pool = await self.plugin.resolve_identifier(
+        pool = await self.resolve_identifier(
             identifiers=[ops.Identifier(scheme="agency_pool", value="MA9999", source="FNMA")],
             stated_asset_class="ASSET_CLASS_DEBT", stated_instrument_type="INSTRUMENT_TYPE_MBS_POOL",
             stated_description="FNMA CL MA9999 6.0", stated_currency="USD")
@@ -765,7 +771,7 @@ class Dgm(data.Role):
             factor=_decimal("0.91234567"), factor_month="202610",
             record_date="2026-10-31", payment_date="2026-11-25")
         try:
-            done = await self.plugin._operations().RecordFactors(
+            done = await self._operations().RecordFactors(
                 ops.RecordFactorsParams(factors=[row]))
         except Exception as refused:  # the sidecar's refusal, as gRPC carries it
             details = getattr(refused, "details", None)
@@ -781,7 +787,7 @@ class Dgm(data.Role):
             "value": [("calls[0].kind", "REDEMPTION_KIND_SOMETIMES")],
         }[one("case")]
         try:
-            done = await self.plugin.offer_template_fields(
+            done = await self.reference.offer_template_fields(
                 instrument_id=one("subject"), template_id="TPL-bond", template_version="1",
                 fields=[meridian.TemplateFieldValue(path=path, value=value) for path, value in fields])
         except Exception as refused:  # the store's refusal, as the SDK raises it
@@ -1292,7 +1298,9 @@ async def main():
                    else Declaration(interface=interface))
     threading.Thread(target=serve, args=(served,), daemon=True).start()
     log(kind=KIND)
-    await meridian.run_async(declaration, [served])
+    # coin holds reference too (contract v29's step 18): its class beside.
+    roles = [served, served.reference] if KIND == "data" else [served]
+    await meridian.run_async(declaration, roles)
 
 
 if __name__ == "__main__":
