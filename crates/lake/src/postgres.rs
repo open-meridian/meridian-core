@@ -39,6 +39,8 @@ const SCHEMA_LOCK: i64 = 0x6c61_6b65_0000_0001_u64 as i64;
 
 pub struct PostgresStore {
     pool: Pool,
+    /// The epoch this writer's batches commit under (step 3a).
+    fence: meridian_changes::Fence,
 }
 
 impl PostgresStore {
@@ -49,7 +51,10 @@ impl PostgresStore {
             .max_size(pool_size.max(1))
             .build(manager)
             .map_err(unavailable)?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            fence: meridian_changes::Fence::new(),
+        })
     }
 
     /// Apply every migration not yet recorded, under a lock. Run once per
@@ -88,20 +93,47 @@ impl PostgresStore {
         self.pool.get().map_err(unavailable)
     }
 
-    fn head(tx: &mut Transaction<'_>, dataset: &str) -> Result<u64> {
-        tx.execute(
-            "INSERT INTO lake_partition (dataset, head) VALUES ($1, 0) ON CONFLICT DO NOTHING",
-            &[&dataset],
-        )
-        .map_err(unavailable)?;
-        let head: i64 = tx
+    /// The writer's epoch, adopted at its first batch where it was not
+    /// started as one.
+    fn epoch_now(&self) -> Result<u64> {
+        match self.fence.epoch() {
+            0 => self.adopt(),
+            epoch => Ok(epoch),
+        }
+    }
+
+    /// The partition's head, taken under its lock, its epoch checked against
+    /// the writer's (step 3a): a batch commits only while the head row's
+    /// epoch is its own. A dataset begun here takes the writer's epoch, the
+    /// `control` partition's checked first, so a takeover that raised it is
+    /// never undone by a dataset its deposed writer begins.
+    fn head(&self, tx: &mut Transaction<'_>, dataset: &str) -> Result<u64> {
+        let epoch = self.epoch_now()?;
+        let begun = tx
+            .execute(
+                "INSERT INTO lake_partition (dataset, head, epoch, origin) VALUES ($1, 0, $2, $3)
+                 ON CONFLICT DO NOTHING",
+                &[&dataset, &(epoch as i64), &meridian_changes::origin()],
+            )
+            .map_err(unavailable)?;
+        if begun == 1 {
+            let control: i64 = tx
+                .query_one(
+                    "SELECT epoch FROM lake_change_head WHERE partition = 'control' FOR SHARE",
+                    &[],
+                )
+                .map_err(unavailable)?
+                .get(0);
+            self.fence.admits(control as u64)?;
+        }
+        let row = tx
             .query_one(
-                "SELECT head FROM lake_partition WHERE dataset = $1 FOR UPDATE",
+                "SELECT head, epoch FROM lake_partition WHERE dataset = $1 FOR UPDATE",
                 &[&dataset],
             )
-            .map_err(unavailable)?
-            .get(0);
-        Ok(head as u64)
+            .map_err(unavailable)?;
+        self.fence.admits(row.get::<_, i64>(1) as u64)?;
+        Ok(row.get::<_, i64>(0) as u64)
     }
 
     /// Moves the partition's head, and its rows in force by the row keys
@@ -223,7 +255,7 @@ fn previous_of(client: &mut impl GenericClient, dataset: &str, row: &Observation
     Ok(found.unwrap_or(0) as u64)
 }
 
-fn insert(tx: &mut Transaction<'_>, dataset: &str, row: &Observation) -> Result<()> {
+fn insert(tx: &mut Transaction<'_>, dataset: &str, row: &Observation, epoch: u64) -> Result<()> {
     let meta = row.meta();
     let date: Option<String> = (!meta.business_date.is_empty()).then(|| meta.business_date.clone());
     // A series row's expiry and listed type (migration 7); none for any other.
@@ -235,9 +267,9 @@ fn insert(tx: &mut Transaction<'_>, dataset: &str, row: &Observation) -> Result<
                 (dataset, sequence, data_type, row_key, version, subject, subjects, kind,
                  interval_ns, venue_id, valid_from_ns, valid_until_ns, business_date,
                  recorded_at_ns, previous_sequence, unconverted, body, closed_reason,
-                 latest_key, quality, expires, listed_type, published_at_ns)
+                 latest_key, quality, expires, listed_type, published_at_ns, epoch)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::text::date, $14, $15,
-                 $16, $17, $18, $19, $20, $21::text::date, $22, $23)",
+                 $16, $17, $18, $19, $20, $21::text::date, $22, $23, $24)",
         &[
             &dataset,
             &(meta.sequence as i64),
@@ -264,6 +296,7 @@ fn insert(tx: &mut Transaction<'_>, dataset: &str, row: &Observation) -> Result<
             // A rate's published time, its versions' order in force
             // (ruling 1006 (b); migration 8).
             &crate::store::published_order(row),
+            &(epoch as i64),
         ],
     )
     .map_err(unavailable)?;
@@ -664,7 +697,8 @@ impl Store for PostgresStore {
     fn record(&self, dataset: &str, rows: Vec<Observation>, now_ns: i64) -> Result<Recorded> {
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
-        let mut head = Self::head(&mut tx, dataset)?;
+        let mut head = self.head(&mut tx, dataset)?;
+        let epoch = self.fence.epoch();
         // Read what each row is decided against first, then number: the
         // closures cannot borrow the transaction the inserts need.
         let mut latest = BTreeMap::new();
@@ -697,7 +731,7 @@ impl Store for PostgresStore {
             },
         );
         for row in &done.rows {
-            insert(&mut tx, dataset, row)?;
+            insert(&mut tx, dataset, row, epoch)?;
         }
         // Each row numbered version 1 is a key the partition held no
         // version of; every other replaces its key's last.
@@ -715,15 +749,17 @@ impl Store for PostgresStore {
     ) -> Result<Recorded> {
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
-        let mut head = Self::head(&mut tx, dataset)?;
+        let mut head = self.head(&mut tx, dataset)?;
+        let epoch = self.fence.epoch();
         let first = head + 1;
         let done = number(rows, &mut head, now_ns, |_| None, |_| 0);
         if !done.rows.is_empty() {
             let served = served_of(dataset, &done.rows, first, head, readers, now_ns);
             tx.execute(
                 "INSERT INTO lake_served
-                        (dataset, first_sequence, last_sequence, subjects, fields, readers, at_ns)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                        (dataset, first_sequence, last_sequence, subjects, fields, readers, at_ns,
+                         epoch)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
                 &[
                     &served.dataset,
                     &(served.first_sequence as i64),
@@ -732,6 +768,7 @@ impl Store for PostgresStore {
                     &served.fields,
                     &served.readers,
                     &served.at_ns,
+                    &(epoch as i64),
                 ],
             )
             .map_err(unavailable)?;
@@ -1143,19 +1180,24 @@ impl Store for PostgresStore {
         // version is recorded between finding a key left with none and
         // counting it out of the rows in force (contract v29, ruling 619
         // (2); migration 8).
-        tx.execute(
-            "SELECT 1 FROM lake_partition WHERE dataset = $1 FOR UPDATE",
-            &[&dataset],
-        )
-        .map_err(unavailable)?;
+        let held = tx
+            .query_opt(
+                "SELECT epoch FROM lake_partition WHERE dataset = $1 FOR UPDATE",
+                &[&dataset],
+            )
+            .map_err(unavailable)?;
+        if let Some(held) = held {
+            self.epoch_now()?;
+            self.fence.admits(held.get::<_, i64>(0) as u64)?;
+        }
         // The rows removed, and the row keys left with no version kept: a
         // key whose later version stays is still in force at it.
         let gone = tx
             .query_one(
                 "WITH gone AS (
                     DELETE FROM lake_row WHERE dataset = $1 AND recorded_at_ns < $2
-                    RETURNING data_type, row_key)
-                 SELECT (SELECT count(*) FROM gone),
+                    RETURNING data_type, row_key, sequence)
+                 SELECT (SELECT count(*) FROM gone), (SELECT max(sequence) FROM gone),
                         (SELECT count(*)
                            FROM (SELECT DISTINCT data_type, row_key FROM gone) g
                           WHERE NOT EXISTS (
@@ -1166,11 +1208,16 @@ impl Store for PostgresStore {
             )
             .map_err(unavailable)?;
         let removed = gone.get::<_, i64>(0) as u64;
-        let keys_gone = gone.get::<_, i64>(1);
+        let last_gone: Option<i64> = gone.get(1);
+        let keys_gone = gone.get::<_, i64>(2);
         if removed > 0 {
+            // The log reaches no lower than the rows removed (step 3a): a
+            // follower behind them reloads the partition at its head.
             tx.execute(
-                "UPDATE lake_partition SET in_force = greatest(in_force - $2, 0) WHERE dataset = $1",
-                &[&dataset, &keys_gone],
+                "UPDATE lake_partition SET in_force = greatest(in_force - $2, 0),
+                        kept_from = greatest(kept_from, $3)
+                  WHERE dataset = $1",
+                &[&dataset, &keys_gone, &(last_gone.unwrap_or(0) + 1)],
             )
             .map_err(unavailable)?;
             tx.execute(
@@ -1568,6 +1615,174 @@ impl Store for PostgresStore {
             .iter()
             .map(assessment_of)
             .collect())
+    }
+
+    fn adopt(&self) -> Result<u64> {
+        let mut conn = self.conn()?;
+        conn.execute(
+            "UPDATE lake_change_head SET origin = $1 WHERE origin = '' AND $1 <> ''",
+            &[&meridian_changes::origin()],
+        )
+        .map_err(unavailable)?;
+        let epoch: i64 = conn
+            .query_one(
+                "SELECT epoch FROM lake_change_head WHERE partition = 'control'",
+                &[],
+            )
+            .map_err(unavailable)?
+            .get(0);
+        Ok(self.fence.adopt_once(epoch as u64))
+    }
+
+    fn epoch(&self) -> u64 {
+        self.fence.epoch()
+    }
+
+    fn take_over(&self) -> Result<u64> {
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        // The control partition first: a dataset a deposed writer is
+        // beginning holds it shared until it commits, and is then raised
+        // with the rest.
+        let control: i64 = tx
+            .query_one(
+                "UPDATE lake_change_head SET epoch = epoch + 1 WHERE partition = 'control'
+                 RETURNING epoch",
+                &[],
+            )
+            .map_err(unavailable)?
+            .get(0);
+        let highest: Option<i64> = tx
+            .query_one("SELECT max(epoch) FROM lake_partition", &[])
+            .map_err(unavailable)?
+            .get(0);
+        let epoch = control.max(highest.unwrap_or(0) + 1);
+        tx.execute(
+            "UPDATE lake_change_head SET epoch = $1 WHERE partition = 'control'",
+            &[&epoch],
+        )
+        .map_err(unavailable)?;
+        tx.execute("UPDATE lake_partition SET epoch = $1", &[&epoch])
+            .map_err(unavailable)?;
+        tx.commit().map_err(unavailable)?;
+        self.fence.adopt(epoch as u64);
+        Ok(epoch as u64)
+    }
+
+    fn read_changes(
+        &self,
+        partition: &str,
+        after: u64,
+        most_bytes: usize,
+    ) -> std::result::Result<meridian_changes::ReadChangesReply, meridian_changes::ReadError> {
+        use meridian_changes::{ReadChangesReply, ReadError};
+        let failed = |failed: StoreError| ReadError::Unavailable(failed.to_string());
+        let mut conn = self.conn().map_err(failed)?;
+        let mut tx = conn
+            .build_transaction()
+            .isolation_level(IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .map_err(|e| failed(unavailable(e)))?;
+        if partition == meridian_changes::CONTROL {
+            let row = tx
+                .query_one(
+                    "SELECT sequence, epoch FROM lake_change_head WHERE partition = 'control'",
+                    &[],
+                )
+                .map_err(|e| failed(unavailable(e)))?;
+            return Ok(ReadChangesReply {
+                changes: Vec::new(),
+                head: row.get::<_, i64>(0) as u64,
+                lowest_kept: 0,
+                epoch: row.get::<_, i64>(1) as u64,
+            });
+        }
+        let row = tx
+            .query_opt(
+                "SELECT head, epoch, origin, kept_from FROM lake_partition WHERE dataset = $1",
+                &[&partition],
+            )
+            .map_err(|e| failed(unavailable(e)))?
+            .ok_or_else(|| ReadError::UnknownPartition(partition.to_string()))?;
+        let head = row.get::<_, i64>(0) as u64;
+        let epoch = row.get::<_, i64>(1) as u64;
+        let own_origin: String = row.get(2);
+        let kept_from = row.get::<_, i64>(3) as u64;
+        let lowest_kept = if head >= kept_from { kept_from } else { 0 };
+        meridian_changes::check_kept(after, lowest_kept, head)?;
+        // Read a window of sequences at a time: its rows and the ranges it
+        // served, merged in sequence order, until the page is full.
+        const WINDOW: i64 = 512;
+        let mut page = meridian_changes::Page::new(most_bytes);
+        let mut from = after.max(kept_from.saturating_sub(1));
+        let mut full = false;
+        while from < head && !full {
+            let until = (from as i64).saturating_add(WINDOW);
+            let mut window: Vec<meridian_changes::Change> = Vec::new();
+            for row in tx
+                .query(
+                    "SELECT sequence, epoch, origin, recorded_at_ns, data_type, body FROM lake_row
+                      WHERE dataset = $1 AND sequence > $2 AND sequence <= $3 ORDER BY sequence",
+                    &[&partition, &(from as i64), &until],
+                )
+                .map_err(|e| failed(unavailable(e)))?
+            {
+                let origin: Option<String> = row.get(2);
+                let kind = DataType::from_code(row.get(4)).map_or("row", DataType::name);
+                window.push(meridian_changes::Change {
+                    partition: partition.to_string(),
+                    sequence: row.get::<_, i64>(0) as u64,
+                    epoch: row.get::<_, i64>(1) as u64,
+                    origin: origin.unwrap_or_else(|| own_origin.clone()),
+                    committed_at_ns: row.get(3),
+                    kind: kind.to_string(),
+                    body: row.get(5),
+                });
+            }
+            for row in tx
+                .query(
+                    "SELECT first_sequence, last_sequence, subjects, fields, readers, at_ns, epoch,
+                            origin
+                       FROM lake_served
+                      WHERE dataset = $1 AND last_sequence > $2 AND last_sequence <= $3",
+                    &[&partition, &(from as i64), &until],
+                )
+                .map_err(|e| failed(unavailable(e)))?
+            {
+                let served = Served {
+                    dataset: partition.to_string(),
+                    first_sequence: row.get::<_, i64>(0) as u64,
+                    last_sequence: row.get::<_, i64>(1) as u64,
+                    subjects: row.get(2),
+                    fields: row.get(3),
+                    readers: row.get(4),
+                    at_ns: row.get(5),
+                };
+                let origin: Option<String> = row.get(7);
+                window.push(crate::store::served_change(
+                    &served,
+                    row.get::<_, i64>(6) as u64,
+                    &origin.unwrap_or_else(|| own_origin.clone()),
+                ));
+            }
+            window.sort_by_key(|change| change.sequence);
+            from = until as u64;
+            for change in window {
+                if !page.take(change) {
+                    full = true;
+                    break;
+                }
+            }
+            full = full || page.is_full();
+        }
+        let _ = tx.commit();
+        Ok(ReadChangesReply {
+            changes: page.changes,
+            head,
+            lowest_kept,
+            epoch,
+        })
     }
 }
 

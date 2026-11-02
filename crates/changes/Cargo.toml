@@ -1,0 +1,18 @@
+[package]
+name = "meridian-changes"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The change log each Meridian store keeps: its pages, its tail, its fence, and the log a store captures in Postgres"
+
+[dependencies]
+meridian-bus = { path = "../bus" }
+meridian-clock.workspace = true
+meridian-domain.workspace = true
+postgres.workspace = true
+prost.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }

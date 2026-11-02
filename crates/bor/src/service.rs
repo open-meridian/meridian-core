@@ -944,6 +944,15 @@ fn serve_lifecycle(bus: &Arc<Bus>, store: &Arc<dyn Store>, clock: &Arc<dyn Clock
 
 /// Register every handler the book serves.
 pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) {
+    // The change log served a page at a time to the book's own members and
+    // the analytics component (step 3a; topics.md, "Component topics"); the
+    // process wraps its store in a [`crate::writer::Writer`] so every commit
+    // is told on its partition's tail.
+    meridian_changes::serve(
+        &bus,
+        crate::writer::DOMAIN,
+        Arc::new(crate::writer::Log(Arc::clone(&store))),
+    );
     {
         let (bus2, store, clock) = (bus.clone(), store.clone(), clock.clone());
         bus.serve(RECORD_OPENING_BALANCE, move |envelope| {

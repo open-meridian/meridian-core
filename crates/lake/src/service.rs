@@ -362,6 +362,20 @@ pub struct Lake {
     series_records: Mutex<BTreeMap<String, String>>,
 }
 
+/// The lake's change log, read from its store.
+struct LakeLog(Arc<dyn Store>);
+
+impl meridian_changes::ChangeLog for LakeLog {
+    fn read_changes(
+        &self,
+        partition: &str,
+        after: u64,
+        most_bytes: usize,
+    ) -> std::result::Result<meridian_changes::ReadChangesReply, meridian_changes::ReadError> {
+        self.0.read_changes(partition, after, most_bytes)
+    }
+}
+
 /// The analytics component's instance where nothing names another (W12.2).
 pub const ANALYTICS: &str = "analytics";
 
@@ -1435,7 +1449,11 @@ impl Lake {
             datasets.insert(dataset.clone());
             self.flag_closed_days(&dataset, &mut rows);
             let done = if config.licence(&dataset).kept {
-                self.store.record(&dataset, rows, now)
+                let done = self.store.record(&dataset, rows, now);
+                if let Ok(done) = &done {
+                    self.publish_changes(&dataset, done, None, now);
+                }
+                done
             } else {
                 let readers: Vec<String> = self
                     .wants
@@ -1449,6 +1467,7 @@ impl Lake {
                 // The reads waiting on the want hear what was served
                 // (W10.7; ruling 734): the lake keeps none of it.
                 if let Ok(done) = &served {
+                    self.publish_changes(&dataset, done, Some(&readers), now);
                     self.hand_to_waiting(want_id, Heard::Served(done.rows.clone()));
                 }
                 served
@@ -1978,6 +1997,41 @@ impl Lake {
             // Recorded is recorded: a reader catches up by subject.
             tracing::warn!(topic, %failed, "a row was recorded and not published");
         }
+    }
+
+    /// A batch's changes on its partition's tail (step 3a), after commit and
+    /// at most once: each row kept as its own change, or the rows served and
+    /// not kept, to `served_to`, as one.
+    fn publish_changes(
+        &self,
+        dataset: &str,
+        done: &crate::store::Recorded,
+        served_to: Option<&[String]>,
+        now_ns: i64,
+    ) {
+        if done.rows.is_empty() {
+            return;
+        }
+        let epoch = self.store.epoch();
+        let origin = meridian_changes::origin();
+        let changes: Vec<meridian_changes::Change> = match served_to {
+            None => done
+                .rows
+                .iter()
+                .map(|row| crate::store::row_change(dataset, row, epoch, origin))
+                .collect(),
+            Some(readers) => {
+                let first = done
+                    .rows
+                    .first()
+                    .map_or(done.head, |row| row.meta().sequence);
+                let served = crate::memory::served_of(
+                    dataset, &done.rows, first, done.head, readers, now_ns,
+                );
+                vec![crate::store::served_change(&served, epoch, origin)]
+            }
+        };
+        meridian_changes::publish(&self.bus, "lake", &changes);
     }
 
     /// A want's subjects answered or declined, recorded; a want every
@@ -5275,6 +5329,9 @@ pub fn serve(bus: Arc<Bus>, store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Arc
     // Lake::new reads the configuration last heard from the store, which
     // blocks: off the runtime's own threads.
     let lake = tokio::task::block_in_place(|| Lake::new(Arc::clone(&bus), store, clock));
+    // The change log, asked a page at a time by the lake's own members and
+    // the analytics component (step 3a; topics.md, "Component topics").
+    meridian_changes::serve(&bus, "lake", Arc::new(LakeLog(Arc::clone(&lake.store))));
     serve_on(
         &bus,
         &lake,

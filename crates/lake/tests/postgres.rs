@@ -2661,3 +2661,215 @@ fn a_held_answer_is_counted_at_what_it_holds() {
         );
     }
 }
+
+// ── The change log (step 3a) ──
+
+/// A store over a schema of its own, so a takeover raises no other test's
+/// epoch: the lake's tables made there, as `migrate` makes them anywhere.
+fn isolated(tag: &str) -> (String, PostgresStore) {
+    let url = std::env::var("MERIDIAN_TEST_DATABASE_URL").expect("MERIDIAN_TEST_DATABASE_URL");
+    let schema = unique(tag).replace(['-', ':'], "_").to_lowercase();
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).expect("the test database");
+    admin
+        .batch_execute(&format!("CREATE SCHEMA {schema}"))
+        .expect("a schema of its own");
+    let joined = if url.contains('?') { "&" } else { "?" };
+    let url = format!("{url}{joined}options=-csearch_path%3D{schema}");
+    let store = PostgresStore::connect(&url, 4).expect("could not reach the test database");
+    store
+        .migrate(&SystemClock)
+        .expect("could not create the schema");
+    (url, store)
+}
+
+fn every_change(
+    store: &PostgresStore,
+    dataset: &str,
+    page: usize,
+) -> Vec<meridian_changes::Change> {
+    let mut out = Vec::new();
+    meridian_changes::catch_up(
+        |after| store.read_changes(dataset, after, page),
+        0,
+        |change| out.push(change.clone()),
+    )
+    .expect("the log reads");
+    out
+}
+
+#[test]
+fn a_follower_given_the_log_in_any_page_split_holds_the_writers_rows() {
+    let store = store();
+    let dataset = unique("coinbase-1:daily");
+    let subject = unique("LCL-BTC");
+    for day in 1..=30 {
+        let date = format!("2026-09-{day:02}");
+        store
+            .record(
+                &dataset,
+                vec![
+                    close(&dataset, &format!("a-{day}"), &subject, &date, day),
+                    close(&dataset, &format!("b-{day}"), &subject, &date, day * 2),
+                ],
+                1_000 + day,
+            )
+            .unwrap();
+    }
+    // Restatements: a new version of keys held.
+    store
+        .record(
+            &dataset,
+            (1..=10)
+                .map(|day| {
+                    close(
+                        &dataset,
+                        &format!("a-{day}"),
+                        &subject,
+                        "2026-09-01",
+                        day + 500,
+                    )
+                })
+                .collect(),
+            2_000,
+        )
+        .unwrap();
+    let kept = store
+        .read_dataset_versions(&dataset, DataType::Price)
+        .unwrap();
+    assert_eq!(kept.len(), 70);
+    for page in [1usize, 200, 2_000, meridian_changes::PAGE_MOST] {
+        let changes = every_change(&store, &dataset, page);
+        let sequences: Vec<u64> = changes.iter().map(|c| c.sequence).collect();
+        assert_eq!(
+            sequences,
+            (1..=70).collect::<Vec<_>>(),
+            "no holes, page {page}"
+        );
+        let rows: Vec<Observation> = changes
+            .iter()
+            .map(|c| Observation::decode(DataType::Price, &c.body).unwrap())
+            .collect();
+        assert_eq!(rows, kept, "page {page}");
+        assert!(changes
+            .iter()
+            .all(|c| c.epoch >= 1 && c.kind == "meridian.v1.Price"));
+    }
+    let reply = store
+        .read_changes(&dataset, 70, meridian_changes::PAGE_MOST)
+        .unwrap();
+    assert_eq!((reply.head, reply.lowest_kept), (70, 1));
+}
+
+#[test]
+fn a_deposed_writers_batch_is_refused_after_a_takeover_and_leaves_no_hole() {
+    let (url, writer) = isolated("lake-fence");
+    let dataset = unique("coinbase-1:daily");
+    let subject = unique("LCL-BTC");
+    assert_eq!(writer.adopt().unwrap(), 1);
+    writer
+        .record(
+            &dataset,
+            vec![close(&dataset, "a", &subject, "2026-10-01", 1)],
+            10,
+        )
+        .unwrap();
+    let standby = PostgresStore::connect(&url, 2).unwrap();
+    assert_eq!(standby.take_over().unwrap(), 2);
+    // The deposed writer's next batch, to a partition held and to a new one.
+    let refused = writer
+        .record(
+            &dataset,
+            vec![close(&dataset, "b", &subject, "2026-10-02", 2)],
+            20,
+        )
+        .unwrap_err();
+    assert!(
+        refused.to_string().starts_with(meridian_changes::FENCED),
+        "{refused}"
+    );
+    let fresh = unique("coinbase-1:other");
+    assert!(writer
+        .record(
+            &fresh,
+            vec![close(&fresh, "a", &subject, "2026-10-02", 2)],
+            20
+        )
+        .is_err());
+    assert!(writer
+        .remove_before(&dataset, i64::MAX, "retention", 30)
+        .is_err());
+    // The writer that took over numbers on from the head: the refused batch
+    // took nothing.
+    standby
+        .record(
+            &dataset,
+            vec![close(&dataset, "c", &subject, "2026-10-03", 3)],
+            30,
+        )
+        .unwrap();
+    let changes = every_change(&standby, &dataset, meridian_changes::PAGE_MOST);
+    let numbered: Vec<(u64, u64)> = changes.iter().map(|c| (c.sequence, c.epoch)).collect();
+    assert_eq!(numbered, vec![(1, 1), (2, 2)]);
+    assert_eq!(
+        standby
+            .read_changes(&dataset, 0, meridian_changes::PAGE_MOST)
+            .unwrap()
+            .epoch,
+        2
+    );
+    assert_eq!(
+        standby
+            .read_changes("control", 0, meridian_changes::PAGE_MOST)
+            .unwrap()
+            .epoch,
+        2
+    );
+}
+
+#[test]
+fn a_follower_behind_retention_is_refused_naming_after_sequence_and_reloads() {
+    let store = store();
+    let dataset = unique("coinbase-1:daily");
+    let subject = unique("LCL-BTC");
+    for day in 1..=4 {
+        store
+            .record(
+                &dataset,
+                vec![close(
+                    &dataset,
+                    &format!("k-{day}"),
+                    &subject,
+                    "2026-10-01",
+                    day,
+                )],
+                day * 100,
+            )
+            .unwrap();
+    }
+    store
+        .remove_before(&dataset, 300, "retention", 500)
+        .unwrap();
+    let refused = store
+        .read_changes(&dataset, 0, meridian_changes::PAGE_MOST)
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("after_sequence 0"),
+        "{refused}"
+    );
+    assert!(meridian_changes::is_behind(&refused.to_string()));
+    // The state at the head, then the log from there, is the writer's.
+    let reply = store
+        .read_changes(&dataset, 2, meridian_changes::PAGE_MOST)
+        .unwrap();
+    assert_eq!(reply.lowest_kept, 3);
+    assert_eq!(reply.changes.len(), 2);
+    let state = store
+        .read_dataset_versions(&dataset, DataType::Price)
+        .unwrap();
+    let followed: Vec<Observation> = reply
+        .changes
+        .iter()
+        .map(|c| Observation::decode(DataType::Price, &c.body).unwrap())
+        .collect();
+    assert_eq!(state, followed);
+}

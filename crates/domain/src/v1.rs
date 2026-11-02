@@ -20016,6 +20016,74 @@ pub struct Envelope {
     #[prost(bytes = "vec", tag = "3")]
     pub payload: ::prost::alloc::vec::Vec<u8>,
 }
+/// Ask a partition's changes after a sequence, a page at a time.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReadChangesRequest {
+    /// The partition whose changes are asked.
+    #[prost(string, tag = "1")]
+    pub partition: ::prost::alloc::string::String,
+    /// The sequence the asker holds; the page starts at the change after it.
+    /// 0 asks from the first change kept. Below the partition's lowest kept,
+    /// the read is refused naming this field, and the asker reloads the
+    /// partition's state at its head and follows from there.
+    #[prost(uint64, tag = "2")]
+    pub after_sequence: u64,
+    /// The most bytes the page's changes may hold, encoded; at most 512 KiB, and
+    /// 512 KiB where 0 or more is asked. A page holds at least one change
+    /// whatever its size, so a change larger than the page is never stuck.
+    #[prost(uint64, tag = "3")]
+    pub page_size: u64,
+}
+/// A page of a partition's changes, in sequence order.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReadChangesReply {
+    /// The changes after `after_sequence`, in order, as many as the page holds.
+    #[prost(message, repeated, tag = "1")]
+    pub changes: ::prost::alloc::vec::Vec<Change>,
+    /// The partition's sequence now: the asker is caught up when the last
+    /// change it applied is this.
+    #[prost(uint64, tag = "2")]
+    pub head: u64,
+    /// The lowest sequence the partition still keeps; 0 where it keeps none.
+    #[prost(uint64, tag = "3")]
+    pub lowest_kept: u64,
+    /// The partition's epoch now: the writer whose commits it takes.
+    #[prost(uint64, tag = "4")]
+    pub epoch: u64,
+}
+/// One committed change of a partition, as the store that is its record wrote it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Change {
+    /// The partition it was committed to.
+    #[prost(string, tag = "1")]
+    pub partition: ::prost::alloc::string::String,
+    /// Its sequence in the partition: the partition's head once it is applied.
+    /// A change that numbered several records -- a book entry, rows the lake
+    /// served and did not keep -- carries the last of them, and its body says
+    /// the first.
+    #[prost(uint64, tag = "2")]
+    pub sequence: u64,
+    /// The epoch it was written under: the partition's head row's, checked under
+    /// the writer's lock in the change's own transaction.
+    #[prost(uint64, tag = "3")]
+    pub epoch: u64,
+    /// The deployment it was made in: this deployment's ID for a change made
+    /// here, so a later bridge can tell one brought in (1049).
+    #[prost(string, tag = "4")]
+    pub origin: ::prost::alloc::string::String,
+    /// When it was committed, in the deployment's time; 0 where a migration made
+    /// it and no time was given.
+    #[prost(int64, tag = "5")]
+    pub committed_at_ns: i64,
+    /// What it is, in its store's words: a lake row's data type, a book entry's
+    /// kind, or a table and what was done to its row.
+    #[prost(string, tag = "6")]
+    pub kind: ::prost::alloc::string::String,
+    /// The change itself, as the store keeps it: a lake row's message encoded, a
+    /// book entry, or a row's columns as JSON.
+    #[prost(bytes = "vec", tag = "7")]
+    pub body: ::prost::alloc::vec::Vec<u8>,
+}
 /// What a plugin says about itself, from `\[tool.meridian\]` in its
 /// pyproject.toml. Declarations for an administrator to approve, not grants.
 #[derive(Clone, PartialEq, ::prost::Message)]

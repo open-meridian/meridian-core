@@ -150,6 +150,9 @@ fn run() -> Result<(), String> {
     // component, which enrols the deployment and relays its claim code. What
     // the conductor holds in the meantime is nothing anybody has authored
     // yet, so memory is the honest place for it.
+    // The configuration store's change log, where it is in a database: its
+    // URL and its store, for the log served and its tail (step 3a).
+    let mut logged: Option<(String, Arc<PostgresStore>)> = None;
     let store: Arc<dyn meridian_config::Store> = match var("MERIDIAN_CONFIG_DATABASE_URL") {
         Some(url) => {
             // Verified, never applied, for the reason every store gives; and
@@ -166,7 +169,17 @@ fn run() -> Result<(), String> {
                     })
                 },
             )?;
-            Arc::new(store)
+            // The deployment every change is made in, its time, and the
+            // writer's epoch, adopted before it serves (step 3a; ruling 1060).
+            meridian_changes::set_origin(&var("MERIDIAN_DEPLOYMENT_ID").unwrap_or_default());
+            meridian_changes::set_clock(clock());
+            let epoch = store.adopt().map_err(|failed| {
+                format!("the configuration store could not adopt its epoch: {failed}")
+            })?;
+            tracing::info!(epoch, "the configuration store writes under its epoch");
+            let store = Arc::new(store);
+            logged = Some((url, Arc::clone(&store)));
+            store as Arc<dyn meridian_config::Store>
         }
         None => {
             tracing::info!(
@@ -197,6 +210,17 @@ fn run() -> Result<(), String> {
         ));
 
         let bus = bus_from_env(&instance_id).await?;
+        // The change log, served a page at a time and its tail published
+        // after each commit (step 3a; topics.md, "Component topics").
+        if let Some((url, postgres)) = logged.take() {
+            meridian_changes::serve(&bus, "config", postgres);
+            meridian_changes::captured::Tail::spawn(
+                url,
+                meridian_config::postgres::CHANGES,
+                Arc::clone(&bus),
+                "config",
+            );
+        }
 
         // W7.2. The wizard's first page, and everything it shows until a
         // claim code is redeemed. The conductor holds the key and is what

@@ -61,7 +61,7 @@ fn run() -> Result<(), String> {
 
     // Waited for rather than refused: in an upgrade this starts beside the Job
     // that migrates for it.
-    let store: Arc<dyn meridian_instrument::Store> = Arc::new(wait_for_store(
+    let postgres = Arc::new(wait_for_store(
         "the instrument store's database",
         &url,
         |url| PostgresStore::connect(url, 8).map_err(|failed| failed.to_string()),
@@ -71,6 +71,15 @@ fn run() -> Result<(), String> {
                 .map_err(|failed| Wait::NotYet(failed.to_string()))
         },
     )?);
+    // The deployment every change is made in, its time, and the writer's
+    // epoch, adopted before it serves (step 3a; ruling 1060).
+    meridian_changes::set_origin(&var("MERIDIAN_DEPLOYMENT_ID").unwrap_or_default());
+    meridian_changes::set_clock(clock());
+    let epoch = postgres
+        .adopt()
+        .map_err(|failed| format!("the instrument store could not adopt its epoch: {failed}"))?;
+    tracing::info!(epoch, "the instrument store writes under its epoch");
+    let store: Arc<dyn meridian_instrument::Store> = postgres.clone();
 
     let instance_id = var("MERIDIAN_INSTANCE_ID").unwrap_or_else(|| "instrument-1".into());
     // The analytics component, whose resolves are read-only (contract v28's
@@ -84,6 +93,15 @@ fn run() -> Result<(), String> {
     on_runtime(async {
         let bus = bus_from_env(&instance_id).await?;
         let reporting_bus = Arc::clone(&bus);
+        // The change log, served a page at a time and its tail published
+        // after each commit (step 3a; topics.md, "Component topics").
+        meridian_changes::serve(&bus, "reference", postgres.clone());
+        meridian_changes::captured::Tail::spawn(
+            url.clone(),
+            meridian_instrument::postgres::CHANGES,
+            Arc::clone(&bus),
+            "reference",
+        );
 
         let service = InstrumentService::new(bus, Arc::clone(&store), clock());
 

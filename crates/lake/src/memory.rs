@@ -25,11 +25,18 @@ struct Held {
     configuration: Option<EntitlementsChangedEvent>,
     amendments: Vec<ClosedDayAmendment>,
     assessments: Vec<Assessment>,
+    /// The `control` partition's epoch, every dataset's with it (step 3a).
+    epoch: u64,
+    /// Each dataset's lowest sequence its log still reaches.
+    kept_from: BTreeMap<String, u64>,
+    /// The epoch each row and range served was written under.
+    epochs: BTreeMap<(String, u64), u64>,
 }
 
 #[derive(Default)]
 pub struct MemoryStore {
     held: Mutex<Held>,
+    fence: meridian_changes::Fence,
 }
 
 impl MemoryStore {
@@ -39,6 +46,17 @@ impl MemoryStore {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Held> {
         self.held.lock().expect("lake store poisoned")
+    }
+
+    /// The batch's epoch, checked against the partitions' as Postgres
+    /// checks it under the head's lock.
+    fn fenced(&self, held: &mut Held) -> Result<u64> {
+        if held.epoch == 0 {
+            held.epoch = 1;
+        }
+        let epoch = self.fence.adopt_once(held.epoch);
+        self.fence.admits(held.epoch)?;
+        Ok(epoch)
     }
 }
 
@@ -136,6 +154,7 @@ pub(crate) fn as_of(
 impl Store for MemoryStore {
     fn record(&self, dataset: &str, rows: Vec<Observation>, now_ns: i64) -> Result<Recorded> {
         let mut held = self.lock();
+        let epoch = self.fenced(&mut held)?;
         let mut head = held.heads.get(dataset).copied().unwrap_or(0);
         let stored = held.rows.clone();
         let done = number(
@@ -167,6 +186,10 @@ impl Store for MemoryStore {
             },
         );
         held.heads.insert(dataset.to_string(), head);
+        for row in &done.rows {
+            held.epochs
+                .insert((dataset.to_string(), row.meta().sequence), epoch);
+        }
         held.rows.extend(done.rows.iter().cloned());
         Ok(done)
     }
@@ -179,11 +202,13 @@ impl Store for MemoryStore {
         now_ns: i64,
     ) -> Result<Recorded> {
         let mut held = self.lock();
+        let epoch = self.fenced(&mut held)?;
         let mut head = held.heads.get(dataset).copied().unwrap_or(0);
         let first = head + 1;
         let done = number(rows, &mut head, now_ns, |_| None, |_| 0);
         held.heads.insert(dataset.to_string(), head);
         if !done.rows.is_empty() {
+            held.epochs.insert((dataset.to_string(), head), epoch);
             let served = served_of(dataset, &done.rows, first, head, readers, now_ns);
             held.served.push(served);
         }
@@ -294,11 +319,24 @@ impl Store for MemoryStore {
         now_ns: i64,
     ) -> Result<u64> {
         let mut held = self.lock();
+        self.fenced(&mut held)?;
+        let last_gone = held
+            .rows
+            .iter()
+            .filter(|row| {
+                row.dataset() == dataset && row.meta().recorded_at_ns < recorded_before_ns
+            })
+            .map(|row| row.meta().sequence)
+            .max();
         let before = held.rows.len();
         held.rows.retain(|row| {
             row.dataset() != dataset || row.meta().recorded_at_ns >= recorded_before_ns
         });
         let removed = (before - held.rows.len()) as u64;
+        if let Some(last) = last_gone {
+            let kept = held.kept_from.entry(dataset.to_string()).or_insert(1);
+            *kept = (*kept).max(last + 1);
+        }
         if removed > 0 {
             held.removals.push(Removal {
                 dataset: dataset.to_string(),
@@ -483,6 +521,88 @@ impl Store for MemoryStore {
 
     fn assessments(&self) -> Result<Vec<Assessment>> {
         Ok(self.lock().assessments.clone())
+    }
+
+    fn adopt(&self) -> Result<u64> {
+        let mut held = self.lock();
+        if held.epoch == 0 {
+            held.epoch = 1;
+        }
+        Ok(self.fence.adopt_once(held.epoch))
+    }
+
+    fn epoch(&self) -> u64 {
+        self.fence.epoch()
+    }
+
+    fn take_over(&self) -> Result<u64> {
+        let mut held = self.lock();
+        held.epoch = held.epoch.max(1) + 1;
+        self.fence.adopt(held.epoch);
+        Ok(held.epoch)
+    }
+
+    fn read_changes(
+        &self,
+        partition: &str,
+        after: u64,
+        most_bytes: usize,
+    ) -> std::result::Result<meridian_changes::ReadChangesReply, meridian_changes::ReadError> {
+        use meridian_changes::{ReadChangesReply, ReadError};
+        let held = self.lock();
+        let epoch = held.epoch.max(1);
+        if partition == meridian_changes::CONTROL {
+            return Ok(ReadChangesReply {
+                changes: Vec::new(),
+                head: 0,
+                lowest_kept: 0,
+                epoch,
+            });
+        }
+        let head = *held
+            .heads
+            .get(partition)
+            .ok_or_else(|| ReadError::UnknownPartition(partition.to_string()))?;
+        let kept_from = held.kept_from.get(partition).copied().unwrap_or(1);
+        let lowest_kept = if head >= kept_from { kept_from } else { 0 };
+        meridian_changes::check_kept(after, lowest_kept, head)?;
+        let origin = meridian_changes::origin();
+        let written = |sequence: u64| {
+            held.epochs
+                .get(&(partition.to_string(), sequence))
+                .copied()
+                .unwrap_or(epoch)
+        };
+        let from = after.max(kept_from.saturating_sub(1));
+        let mut changes: Vec<meridian_changes::Change> = held
+            .rows
+            .iter()
+            .filter(|row| row.dataset() == partition && row.meta().sequence > from)
+            .map(|row| {
+                crate::store::row_change(partition, row, written(row.meta().sequence), origin)
+            })
+            .chain(
+                held.served
+                    .iter()
+                    .filter(|served| served.dataset == partition && served.last_sequence > from)
+                    .map(|served| {
+                        crate::store::served_change(served, written(served.last_sequence), origin)
+                    }),
+            )
+            .collect();
+        changes.sort_by_key(|change| change.sequence);
+        let mut page = meridian_changes::Page::new(most_bytes);
+        for change in changes {
+            if !page.take(change) {
+                break;
+            }
+        }
+        Ok(ReadChangesReply {
+            changes: page.changes,
+            head,
+            lowest_kept,
+            epoch,
+        })
     }
 }
 

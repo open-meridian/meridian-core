@@ -14,6 +14,7 @@ use meridian_domain::v1::{
 };
 
 use crate::row::{DataType, Observation};
+use meridian_changes::{Change, ReadChangesReply, ReadError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -22,6 +23,11 @@ pub enum StoreError {
 
     #[error("{0}")]
     SchemaAhead(String),
+
+    /// A commit refused by its partition's epoch: another writer took the
+    /// lake over, and this one steps down (step 3a; ruling 1060).
+    #[error("{0}")]
+    Fenced(#[from] meridian_changes::Fenced),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -505,6 +511,29 @@ pub trait Store: Send + Sync {
 
     /// Every assessment journalled, in order.
     fn assessments(&self) -> Result<Vec<Assessment>>;
+
+    /// The writer's epoch, adopted from the `control` partition where none
+    /// was yet (step 3a): what a starting lake does before its first batch,
+    /// and what a store not started as a writer does at its first.
+    fn adopt(&self) -> Result<u64>;
+
+    /// The epoch this store's batches commit under; 0 before it adopted one.
+    fn epoch(&self) -> u64;
+
+    /// Take the lake over: raise the epoch of the `control` partition and
+    /// of every dataset's head in one transaction, and adopt it. Every batch
+    /// another writer commits under the old one is refused.
+    fn take_over(&self) -> Result<u64>;
+
+    /// A page of `partition`'s change log after `after` (step 3a): its rows
+    /// in sequence, each range it served and did not keep as one change, at
+    /// most `most_bytes`; the `control` partition's none yet.
+    fn read_changes(
+        &self,
+        partition: &str,
+        after: u64,
+        most_bytes: usize,
+    ) -> std::result::Result<ReadChangesReply, ReadError>;
 }
 
 /// Whether a query answers every version it finds, not each row key's
@@ -580,5 +609,49 @@ pub fn matches(row: &Observation, query: &Query) -> bool {
         When::After(watermark) => watermark
             .get(row.dataset())
             .is_some_and(|after| meta.sequence > *after),
+    }
+}
+
+/// A row as its partition's change: its data type, its message encoded, the
+/// epoch it was written under and the deployment it was made in.
+pub fn row_change(dataset: &str, row: &Observation, epoch: u64, origin: &str) -> Change {
+    Change {
+        partition: dataset.to_string(),
+        sequence: row.meta().sequence,
+        epoch,
+        origin: origin.to_string(),
+        committed_at_ns: row.meta().recorded_at_ns,
+        kind: row.data_type().name().to_string(),
+        body: row.encode(),
+    }
+}
+
+/// Rows served and not kept, as one change: the last sequence they took,
+/// and the first, their subjects and fields and who they reached in its
+/// body, as JSON.
+pub fn served_change(served: &Served, epoch: u64, origin: &str) -> Change {
+    let list = |items: &[String]| {
+        items
+            .iter()
+            .map(|item| format!("{item:?}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    Change {
+        partition: served.dataset.clone(),
+        sequence: served.last_sequence,
+        epoch,
+        origin: origin.to_string(),
+        committed_at_ns: served.at_ns,
+        kind: "served".to_string(),
+        body: format!(
+            "{{\"first_sequence\":{},\"last_sequence\":{},\"subjects\":[{}],\"fields\":[{}],\"readers\":[{}]}}",
+            served.first_sequence,
+            served.last_sequence,
+            list(&served.subjects),
+            list(&served.fields),
+            list(&served.readers)
+        )
+        .into_bytes(),
     }
 }

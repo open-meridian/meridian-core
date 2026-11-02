@@ -1,0 +1,379 @@
+//! The change log each store keeps (step 3, plan Track 1;
+//! spec/one-data-access-model section 3, "The change log"; rulings 1046,
+//! 1056, 1057, 1060).
+//!
+//! Each partition of each store keeps one ordered log of its committed
+//! changes. It is not a new record: it is the store's own committed changes
+//! read in their order -- the lake's rows, the book's journal, and for the
+//! instrument store, the street store and the conductor's configuration store
+//! every row their transactions write, captured in the same transaction
+//! ([`captured`]).
+//!
+//! - **Ordering.** A change takes the next sequence of its partition from the
+//!   partition's head row inside its own transaction; a rollback takes it
+//!   back, so there are no holes. A follower applies changes in that order.
+//! - **Catch-up.** A follower asks for the changes after a sequence on
+//!   `platform.{domain}.internal.read-changes`, a page of at most 512 KiB at a
+//!   time ([`serve`]), and hears new ones on
+//!   `platform.{domain}.internal.changes.{partition}`, published after commit,
+//!   at most once ([`publish`]). A delivery missed is caught up by the read,
+//!   never inferred.
+//! - **Behind retention.** A follower whose sequence is below the partition's
+//!   lowest kept is refused naming `after_sequence` ([`ReadError::Behind`]);
+//!   it reloads the partition's state at its head and follows from there.
+//! - **Fencing.** Each partition's head row carries an `epoch`; a writer
+//!   commits only while the head row's epoch is its own, checked under the
+//!   lock it already takes ([`Fence`]). A takeover raises it; a deposed
+//!   writer's next commit fails.
+//! - **Origin.** Every change carries the deployment it was made in (1049).
+//!
+//! These are component topics and core's own protos: the plugin contract and
+//! `CONTRACT_CURRENT` do not move for them.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+
+use meridian_bus::Bus;
+pub use meridian_domain::v1::{Change, ReadChangesReply, ReadChangesRequest};
+use prost::Message;
+
+pub mod captured;
+
+/// The most a page of changes holds, encoded (1056: 512 KiB pages).
+pub const PAGE_MOST: usize = 512 * 1024;
+
+/// The partition every store keeps beside its others for its own control:
+/// assignments, takeovers, moves, switches and findings (ruling 1060). The
+/// book has kept one since its first migration.
+pub const CONTROL: &str = "control";
+
+/// Where a store's members ask a partition's changes after a sequence.
+pub fn read_changes_topic(domain: &str) -> String {
+    format!("platform.{domain}.internal.read-changes")
+}
+
+/// Where a store's members hear each new change of a partition.
+pub fn changes_topic(domain: &str, partition: &str) -> String {
+    format!("platform.{domain}.internal.changes.{partition}")
+}
+
+/// Every partition's tail of a domain, as one subscription names it.
+pub fn every_changes_topic(domain: &str) -> String {
+    format!("platform.{domain}.internal.changes.*")
+}
+
+/// The bytes a page may hold for what was asked: 512 KiB where nothing, or
+/// more than that, was.
+pub fn page_most(asked: u64) -> usize {
+    if asked == 0 || asked > PAGE_MOST as u64 {
+        PAGE_MOST
+    } else {
+        asked as usize
+    }
+}
+
+/// Why a read of changes was not answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadError {
+    /// The store keeps no such partition.
+    UnknownPartition(String),
+    /// The asker is below the partition's lowest kept: it reloads the
+    /// partition's state at its head and follows from there.
+    Behind {
+        after_sequence: u64,
+        lowest_kept: u64,
+    },
+    /// The store could not be read.
+    Unavailable(String),
+}
+
+/// The words a refusal behind retention starts with, which a follower reads
+/// to know it must reload rather than retry.
+pub const BEHIND: &str = "after_sequence is behind the partition's lowest kept";
+
+impl std::fmt::Display for ReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadError::UnknownPartition(partition) => {
+                write!(f, "no partition {partition} is kept here")
+            }
+            ReadError::Behind {
+                after_sequence,
+                lowest_kept,
+            } => write!(
+                f,
+                "{BEHIND}: after_sequence {after_sequence}, lowest kept {lowest_kept}; \
+                 reload the partition at its head and follow from there"
+            ),
+            ReadError::Unavailable(detail) => write!(f, "the store could not be read: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for ReadError {}
+
+/// Whether a refusal's words say the asker is behind retention.
+pub fn is_behind(detail: &str) -> bool {
+    detail.contains(BEHIND)
+}
+
+/// The floor below which a partition's log no longer reaches: its lowest
+/// kept sequence, or past its head where it keeps none. An asker after a
+/// sequence below `floor - 1` would need changes no longer kept.
+pub fn check_kept(after_sequence: u64, lowest_kept: u64, head: u64) -> Result<(), ReadError> {
+    let floor = if lowest_kept == 0 {
+        head + 1
+    } else {
+        lowest_kept
+    };
+    if after_sequence + 1 < floor && after_sequence < head {
+        return Err(ReadError::Behind {
+            after_sequence,
+            lowest_kept,
+        });
+    }
+    Ok(())
+}
+
+/// A page of changes being filled: at least one change whatever its size,
+/// then as many as fit within the page's bytes.
+#[derive(Debug)]
+pub struct Page {
+    most: usize,
+    used: usize,
+    pub changes: Vec<Change>,
+}
+
+impl Page {
+    pub fn new(most: usize) -> Self {
+        Self {
+            most,
+            used: 0,
+            changes: Vec::new(),
+        }
+    }
+
+    /// Take the change if it fits; false once the page is full, the change
+    /// left for the next page.
+    pub fn take(&mut self, change: Change) -> bool {
+        let size = change.encoded_len() + 4;
+        if !self.changes.is_empty() && self.used + size > self.most {
+            return false;
+        }
+        self.used += size;
+        self.changes.push(change);
+        true
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.used >= self.most
+    }
+}
+
+/// A store's change log, read a page at a time.
+pub trait ChangeLog: Send + Sync {
+    /// The changes of `partition` after `after_sequence`, in order, at most
+    /// `most_bytes` encoded (and always at least one, where there is one),
+    /// with the partition's head, lowest kept and epoch.
+    fn read_changes(
+        &self,
+        partition: &str,
+        after_sequence: u64,
+        most_bytes: usize,
+    ) -> Result<ReadChangesReply, ReadError>;
+}
+
+/// Serve `platform.{domain}.internal.read-changes` from `log`.
+pub fn serve(bus: &Arc<Bus>, domain: &str, log: Arc<dyn ChangeLog>) {
+    let topic = read_changes_topic(domain);
+    let named = topic.clone();
+    bus.serve(&topic, move |envelope| {
+        if envelope.payload_type != "meridian.v1.ReadChangesRequest" {
+            return Err(format!(
+                "{named} takes meridian.v1.ReadChangesRequest, not {}",
+                envelope.payload_type
+            ));
+        }
+        let request = ReadChangesRequest::decode(envelope.payload.as_slice())
+            .map_err(|failed| format!("a ReadChangesRequest did not read: {failed}"))?;
+        if request.partition.is_empty() {
+            return Err("partition is empty; name the partition whose changes are asked".into());
+        }
+        let started = std::time::Instant::now();
+        let reply = log
+            .read_changes(
+                &request.partition,
+                request.after_sequence,
+                page_most(request.page_size),
+            )
+            .map_err(|failed| failed.to_string())?;
+        tracing::debug!(
+            topic = named.as_str(),
+            changes = reply.changes.len(),
+            head = reply.head,
+            bytes = reply.encoded_len(),
+            ms = format!("{:.1}", started.elapsed().as_secs_f64() * 1e3),
+            "a page of changes read"
+        );
+        Ok((
+            "meridian.v1.ReadChangesReply".to_string(),
+            reply.encode_to_vec(),
+        ))
+    });
+}
+
+/// Bytes published on the change log's tail since the process started,
+/// with the count of changes: what step 3a's duplicate-traffic measurement
+/// reads beside the lake's row events.
+pub static TAIL_BYTES: AtomicU64 = AtomicU64::new(0);
+pub static TAIL_CHANGES: AtomicU64 = AtomicU64::new(0);
+
+/// Publish each committed change on its partition's tail, after commit, at
+/// most once: a member that misses one catches up by the read.
+pub fn publish(bus: &Bus, domain: &str, changes: &[Change]) {
+    for change in changes {
+        let topic = changes_topic(domain, &change.partition);
+        let payload = change.encode_to_vec();
+        TAIL_BYTES.fetch_add(payload.len() as u64, Ordering::Relaxed);
+        TAIL_CHANGES.fetch_add(1, Ordering::Relaxed);
+        if let Err(failed) = bus.publish(&topic, "meridian.v1.Change", payload, None, None) {
+            // Committed is committed: a follower catches up by the read.
+            tracing::warn!(topic, %failed, "a change was committed and not published");
+        }
+    }
+}
+
+/// Follow a partition from `after`: read pages until the head, applying each
+/// change in order, and answer the sequence reached. A page that does not
+/// start where the follower is, or a change out of order, is refused: a hole
+/// is never inferred over.
+pub fn catch_up<R, A>(mut read: R, mut after: u64, mut apply: A) -> Result<u64, ReadError>
+where
+    R: FnMut(u64) -> Result<ReadChangesReply, ReadError>,
+    A: FnMut(&Change),
+{
+    loop {
+        let page = read(after)?;
+        for change in &page.changes {
+            if change.sequence <= after {
+                return Err(ReadError::Unavailable(format!(
+                    "change {} came after {after}: the log is out of order",
+                    change.sequence
+                )));
+            }
+            apply(change);
+            after = change.sequence;
+        }
+        if page.changes.is_empty() || after >= page.head {
+            return Ok(after);
+        }
+    }
+}
+
+/// The deployment a store's changes are made in: its ID, set once at start
+/// from what the chart says (`MERIDIAN_DEPLOYMENT_ID`), and empty where
+/// nothing said (a test, a local stack).
+static ORIGIN: OnceLock<String> = OnceLock::new();
+
+/// Name this process's deployment, once.
+pub fn set_origin(deployment_id: &str) {
+    let _ = ORIGIN.set(deployment_id.to_string());
+}
+
+/// This process's deployment, as every change it makes carries it.
+pub fn origin() -> &'static str {
+    ORIGIN.get().map(String::as_str).unwrap_or("")
+}
+
+/// The deployment's clock, as the composition root hands it over: what a
+/// captured log dates each change by.
+static CLOCK: OnceLock<Arc<dyn meridian_clock::Clock>> = OnceLock::new();
+
+/// Hand this process's clock over, once.
+pub fn set_clock(clock: Arc<dyn meridian_clock::Clock>) {
+    let _ = CLOCK.set(clock);
+}
+
+/// The deployment's time now; 0 where no clock was handed over.
+pub fn now_ns() -> i64 {
+    CLOCK.get().map_or(0, |clock| clock.now_ns())
+}
+
+/// A writer's fencing token (Kleppmann's): the epoch it adopted when it
+/// started writing. The store that is the record checks it against the
+/// partition's head row under the lock each commit already takes; a takeover
+/// raises the head row's, and a deposed writer's next commit fails.
+#[derive(Debug, Default)]
+pub struct Fence {
+    /// 0 until adopted.
+    epoch: AtomicU64,
+}
+
+impl Fence {
+    pub const fn new() -> Self {
+        Self {
+            epoch: AtomicU64::new(0),
+        }
+    }
+
+    /// The epoch adopted; 0 if none yet.
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::SeqCst)
+    }
+
+    /// Adopt `epoch`: what a writer does at start, and after it takes over.
+    pub fn adopt(&self, epoch: u64) {
+        self.epoch.store(epoch, Ordering::SeqCst);
+    }
+
+    /// Adopt `epoch` where nothing was adopted yet, and answer the one held.
+    pub fn adopt_once(&self, epoch: u64) -> u64 {
+        match self
+            .epoch
+            .compare_exchange(0, epoch, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => epoch,
+            Err(held) => held,
+        }
+    }
+
+    /// Whether a commit under this fence may proceed against a head row at
+    /// `head_epoch`.
+    pub fn admits(&self, head_epoch: u64) -> Result<(), Fenced> {
+        let mine = self.epoch();
+        if mine == head_epoch {
+            Ok(())
+        } else {
+            Err(Fenced {
+                mine,
+                head: head_epoch,
+            })
+        }
+    }
+}
+
+/// A commit refused by the epoch: another writer took the partition over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fenced {
+    pub mine: u64,
+    pub head: u64,
+}
+
+/// The words a fenced commit is refused with, everywhere.
+pub const FENCED: &str = "fenced: this writer's epoch is no longer the partition's";
+
+impl std::fmt::Display for Fenced {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{FENCED} (this writer's {}, the partition's {}); another writer took it over, \
+             and this one steps down",
+            self.mine, self.head
+        )
+    }
+}
+
+impl std::error::Error for Fenced {}
+
+#[cfg(test)]
+mod tests;

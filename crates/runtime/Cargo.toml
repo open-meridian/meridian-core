@@ -63,6 +63,7 @@ meridian-instrument = { path = "../instrument" }
 meridian-street = { path = "../street" }
 meridian-bor = { path = "../bor" }
 meridian-lake = { path = "../lake" }
+meridian-changes = { path = "../changes" }
 meridian-conductor = { path = "../conductor" }
 meridian-config = { path = "../config" }
 meridian-dashboard = { path = "../dashboard" }

@@ -108,6 +108,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "a_computed_date_keeps_its_basis",
         sql: include_str!("../migrations/0012_a_computed_date_keeps_its_basis.sql"),
     },
+    Migration {
+        version: 13,
+        name: "change_log",
+        sql: include_str!("../migrations/0013_change_log.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

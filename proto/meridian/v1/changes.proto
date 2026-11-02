@@ -1,0 +1,85 @@
+// The change log each store keeps (step 3, plan Track 1; spec/one-data-access-model
+// section 3, "The change log"; rulings 1046, 1056, 1057).
+//
+// Core's own traffic, never the plugin contract: each store's members, and the
+// analytics component for the lake and the book, ask a partition's changes
+// after a sequence on `platform.{domain}.internal.read-changes` and hear each
+// new one on `platform.{domain}.internal.changes.{partition}` (topics.md,
+// "Component topics"), granted by core's COMPONENT_TOPICS alone. Nothing here
+// moves CONTRACT_CURRENT.
+//
+// A partition is the lake's dataset, the book's account partition (`P0`) or
+// `control`, the instrument store's, the street store's or the conductor's
+// configuration store's one partition, or any store's `control`. Its changes
+// are its committed changes read in their order, one sequence per partition
+// with no holes, taken from the partition's head row inside the change's own
+// transaction. Partition IDs, epochs and sequences are never reused (1049).
+
+syntax = "proto3";
+
+package meridian.v1;
+
+// Ask a partition's changes after a sequence, a page at a time.
+message ReadChangesRequest {
+  // The partition whose changes are asked.
+  string partition = 1;
+
+  // The sequence the asker holds; the page starts at the change after it.
+  // 0 asks from the first change kept. Below the partition's lowest kept,
+  // the read is refused naming this field, and the asker reloads the
+  // partition's state at its head and follows from there.
+  uint64 after_sequence = 2;
+
+  // The most bytes the page's changes may hold, encoded; at most 512 KiB, and
+  // 512 KiB where 0 or more is asked. A page holds at least one change
+  // whatever its size, so a change larger than the page is never stuck.
+  uint64 page_size = 3;
+}
+
+// A page of a partition's changes, in sequence order.
+message ReadChangesReply {
+  // The changes after `after_sequence`, in order, as many as the page holds.
+  repeated Change changes = 1;
+
+  // The partition's sequence now: the asker is caught up when the last
+  // change it applied is this.
+  uint64 head = 2;
+
+  // The lowest sequence the partition still keeps; 0 where it keeps none.
+  uint64 lowest_kept = 3;
+
+  // The partition's epoch now: the writer whose commits it takes.
+  uint64 epoch = 4;
+}
+
+// One committed change of a partition, as the store that is its record wrote it.
+message Change {
+  // The partition it was committed to.
+  string partition = 1;
+
+  // Its sequence in the partition: the partition's head once it is applied.
+  // A change that numbered several records -- a book entry, rows the lake
+  // served and did not keep -- carries the last of them, and its body says
+  // the first.
+  uint64 sequence = 2;
+
+  // The epoch it was written under: the partition's head row's, checked under
+  // the writer's lock in the change's own transaction.
+  uint64 epoch = 3;
+
+  // The deployment it was made in: this deployment's ID for a change made
+  // here, so a later bridge can tell one brought in (1049).
+  string origin = 4;
+
+  // When it was committed, in the deployment's time; 0 where a migration made
+  // it and no time was given.
+  int64 committed_at_ns = 5;
+
+  // What it is, in its store's words: a lake row's data type, a book entry's
+  // kind, or a table and what was done to its row.
+  string kind = 6;
+
+  // The change itself, as the store keeps it: a lake row's message encoded, a
+  // book entry, or a row's columns as JSON.
+  bytes body = 7;
+}

@@ -16,6 +16,7 @@ chacha20poly1305.workspace = true
 meridian-first-run = { path = "../first-run" }
 meridian-access.workspace = true
 meridian-bus = { path = "../bus" }
+meridian-changes = { path = "../changes" }
 meridian-domain.workspace = true
 meridian-pb.workspace = true
 # The deployment's fixed roles and components, which an upload's are held to

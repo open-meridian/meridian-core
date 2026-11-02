@@ -82,6 +82,13 @@ fn run() -> Result<(), String> {
         },
     )?);
 
+    // The deployment every change is made in, and the writer's epoch,
+    // adopted before the first batch (step 3a; ruling 1060).
+    meridian_changes::set_origin(&var("MERIDIAN_DEPLOYMENT_ID").unwrap_or_default());
+    let epoch = store
+        .adopt()
+        .map_err(|failed| format!("the lake could not adopt its epoch: {failed}"))?;
+    tracing::info!(epoch, "the lake writes under its epoch");
     let instance_id = var("MERIDIAN_INSTANCE_ID").unwrap_or_else(|| "lake-1".into());
     // How many whole answers are built at once (the chart's
     // lake.maxConcurrentAnswers; rulings 957, 958): refused, not guessed,

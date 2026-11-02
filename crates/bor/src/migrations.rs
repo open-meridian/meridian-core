@@ -48,6 +48,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "book_snapshots",
         sql: include_str!("../migrations/0006_book_snapshots.sql"),
     },
+    Migration {
+        version: 7,
+        name: "change_log",
+        sql: include_str!("../migrations/0007_change_log.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

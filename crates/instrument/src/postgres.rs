@@ -51,12 +51,13 @@ const SCHEMA: &[&str] = &[
     include_str!("../migrations/0013_event_groups.sql"),
     include_str!("../migrations/0014_listed_terms.sql"),
     include_str!("../migrations/0015_companies.sql"),
+    include_str!("../migrations/0016_change_log.sql"),
 ];
 
 /// A table the newest file makes. A database that has it has them all, so a
 /// start can check for this one and refuse a database an older release
 /// migrated, rather than failing later on the first record.
-const NEWEST_TABLE: &str = "instrument_company_identifier";
+const NEWEST_TABLE: &str = "instrument_change";
 
 /// And the column the newest file adding one adds (0014, contract v28: a
 /// listed series' terms), with its table, which a table check cannot see;
@@ -78,7 +79,41 @@ const REPORTED_BEFORE_V10: &str = "reported before contract v10";
 /// The instrument store, in a database.
 pub struct PostgresStore {
     pool: Pool,
+    /// The epoch this writer's commits are fenced by (step 3a); none until
+    /// it adopts one, as the migration Job never does.
+    fence: meridian_changes::Fence,
 }
+
+/// The instrument store's change log (step 3a): every table its writes
+/// touch, captured in their own transaction under one store-wide sequence.
+pub const CHANGES: meridian_changes::captured::Spec = meridian_changes::captured::Spec {
+    prefix: "instrument",
+    head: "instrument_change_head",
+    partition: "instrument",
+    tables: &[
+        "instrument",
+        "instrument_identifier",
+        "instrument_value_source",
+        "instrument_offer",
+        "instrument_version",
+        "instrument_conflict",
+        "instrument_placeholder",
+        "instrument_placeholder_identifier",
+        "instrument_replacement",
+        "instrument_venue",
+        "instrument_calendar_version",
+        "instrument_date_rule_version",
+        "instrument_template",
+        "instrument_licence_list",
+        "instrument_event_group",
+        "instrument_company",
+        "instrument_company_identifier",
+    ],
+    not_captured: &[(
+        "instrument_state",
+        "the store's own runs: the replacement feed's sequence read to and the migration's",
+    )],
+};
 
 impl PostgresStore {
     /// Open a pool. Does not create the schema; call [`PostgresStore::migrate`].
@@ -90,7 +125,27 @@ impl PostgresStore {
             .build(manager)
             .map_err(unavailable)?;
 
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            fence: meridian_changes::Fence::new(),
+        })
+    }
+
+    /// The store's epoch, adopted: what a starting instrument store does
+    /// before it serves (step 3a; ruling 1060).
+    pub fn adopt(&self) -> Result<u64> {
+        let mut conn = self.conn()?;
+        let epoch = CHANGES.adopt(&mut *conn).map_err(unavailable)?;
+        Ok(self.fence.adopt_once(epoch))
+    }
+
+    /// Take the store over: raise its epoch, and adopt it. Every commit
+    /// under the old one is refused in its own transaction.
+    pub fn take_over(&self) -> Result<u64> {
+        let mut conn = self.conn()?;
+        let epoch = CHANGES.take_over(&mut *conn).map_err(unavailable)?;
+        self.fence.adopt(epoch);
+        Ok(epoch)
     }
 
     /// What a start does instead of migrating: check the schema is there.
@@ -145,6 +200,7 @@ impl PostgresStore {
         let created = SCHEMA
             .iter()
             .try_for_each(|file| conn.batch_execute(file).map_err(unavailable))
+            .and_then(|()| CHANGES.install(&mut *conn).map_err(unavailable))
             .and_then(|()| Self::classes_to_the_enum(&mut conn))
             .and_then(|()| Self::sources_from_before_v10(&mut conn));
 
@@ -352,8 +408,14 @@ impl PostgresStore {
         Ok(())
     }
 
+    /// A connection, named with the writer's epoch and the deployment's
+    /// time for the change log its writes are captured in.
     fn conn(&self) -> Result<Connection> {
-        self.pool.get().map_err(unavailable)
+        let mut conn = self.pool.get().map_err(unavailable)?;
+        CHANGES
+            .prepare(&mut *conn, self.fence.epoch(), meridian_changes::now_ns())
+            .map_err(unavailable)?;
+        Ok(conn)
     }
 
     /// The records with these IDs, whole, ordered by ID.
@@ -1466,4 +1528,20 @@ fn unavailable(failed: impl std::error::Error) -> StoreError {
     }
 
     StoreError::Unavailable(detail)
+}
+
+/// The instrument store's change log, read a page at a time (step 3a).
+impl meridian_changes::ChangeLog for PostgresStore {
+    fn read_changes(
+        &self,
+        partition: &str,
+        after: u64,
+        most_bytes: usize,
+    ) -> std::result::Result<meridian_changes::ReadChangesReply, meridian_changes::ReadError> {
+        let mut conn = self
+            .pool
+            .get()
+            .map_err(|failed| meridian_changes::ReadError::Unavailable(failed.to_string()))?;
+        CHANGES.read(&mut *conn, partition, after, most_bytes)
+    }
 }

@@ -1754,17 +1754,19 @@ fn migration_five_numbers_nothing_old_and_moves_a_statements_figures_into_a_set(
             since: None,
         })
         .unwrap();
-    assert_eq!(page.as_of, 0);
+    // The rows held before the change log began (step 3a) are its first
+    // sequence, never kept, so a follower from nothing reloads.
+    assert_eq!(page.as_of, 1);
 
-    // The next change is the partition's first, chained to nothing.
+    // The next change chains to nothing. From step 3a every committed
+    // transaction takes the partition's next sequence (its change log): the
+    // statement's opening is the partition's first, and the move its next.
     let mut moved = resolved(&statement_open(&store, "ACC-4"), "INS");
     moved.quantity = units("13");
     match store.record(moved, &at(NOW)).unwrap().0 {
         Settled::Changed { position, .. } => {
-            assert_eq!(
-                (position.last_change.sequence, position.last_change.previous),
-                (1, 0)
-            )
+            assert_eq!(position.last_change.previous, 0);
+            assert!(position.last_change.sequence > 1);
         }
         other => panic!("{other:?}"),
     }
@@ -2310,4 +2312,101 @@ fn a_codes_resolution_is_kept_once_and_the_codes_held_are_read() {
     for code in store.currency_codes().unwrap() {
         assert!(meridian_domain::money::is_iso4217(&code), "{code}");
     }
+}
+
+// ── The change log (step 3a) ──
+
+/// A store over a schema of its own: its log begins with it, and a takeover
+/// raises no other test's epoch.
+fn isolated() -> (String, PostgresStore) {
+    let url = std::env::var("MERIDIAN_TEST_DATABASE_URL").expect("MERIDIAN_TEST_DATABASE_URL");
+    let schema = unique("street_log").replace('-', "_").to_lowercase();
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).expect("the test database");
+    admin
+        .batch_execute(&format!("CREATE SCHEMA {schema}"))
+        .expect("a schema of its own");
+    let joined = if url.contains('?') { "&" } else { "?" };
+    let url = format!("{url}{joined}options=-csearch_path%3D{schema}");
+    let store = PostgresStore::connect(&url, 4).expect("could not reach the test database");
+    store
+        .migrate(&meridian_clock::SystemClock)
+        .expect("could not create the schema");
+    (url, store)
+}
+
+#[test]
+fn a_follower_given_the_log_in_any_page_split_builds_the_stores_tables() {
+    let (url, store) = isolated();
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let reloaded = meridian_street::postgres::CHANGES
+        .snapshot(&mut client)
+        .unwrap();
+    for _ in 0..3 {
+        let statement = opened(&store);
+        let instrument = unique("INS");
+        let holding = resolved(&statement, &instrument);
+        let account = holding.account_id.clone();
+        store.record(holding, &at(NOW)).unwrap();
+        let later = opened(&store);
+        let mut grown = resolved(&later, &instrument);
+        grown.account_id = account;
+        grown.quantity = units("20");
+        store.record(grown, &at(NOW + 1)).unwrap();
+    }
+    let followed = meridian_street::postgres::CHANGES
+        .check_follows(&mut client, &reloaded)
+        .unwrap();
+    assert!(followed >= 6, "{followed} changes");
+    meridian_street::postgres::CHANGES
+        .check_tables(
+            &mut client,
+            &[
+                "statement",
+                "statement_figures",
+                "statement_collateral",
+                "statement_provenance",
+                "holding",
+                "holding_lot",
+                "holding_encumbrance",
+                "holding_provenance",
+                "holding_pending",
+                "holding_amendment",
+                "custodial_position",
+                "activity",
+                "activity_re_resolution",
+                "sync_status",
+                "account_chain",
+            ],
+        )
+        .unwrap();
+}
+
+#[test]
+fn a_deposed_writers_commit_is_refused_after_a_takeover_and_takes_no_sequence() {
+    use meridian_changes::ChangeLog;
+    let (url, writer) = isolated();
+    assert_eq!(writer.adopt().unwrap(), 1);
+    let statement = opened(&writer);
+    let standby = PostgresStore::connect(&url, 2).unwrap();
+    assert_eq!(standby.take_over().unwrap(), 2);
+    let refused = writer
+        .record(resolved(&statement, &unique("INS")), &at(NOW))
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains(meridian_changes::FENCED),
+        "{refused}"
+    );
+    standby
+        .record(resolved(&statement, &unique("INS")), &at(NOW))
+        .unwrap();
+    let page = standby
+        .read_changes("street", 0, meridian_changes::PAGE_MOST)
+        .unwrap();
+    let sequences: Vec<u64> = page.changes.iter().map(|c| c.sequence).collect();
+    for pair in sequences.windows(2) {
+        assert_eq!(pair[1], pair[0] + 1, "no holes: {sequences:?}");
+    }
+    assert_eq!(page.changes.first().map(|c| c.epoch), Some(1));
+    assert_eq!(page.changes.last().map(|c| c.epoch), Some(2));
+    assert_eq!(page.epoch, 2);
 }

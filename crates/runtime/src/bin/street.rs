@@ -72,7 +72,7 @@ fn run() -> Result<(), String> {
     // customer's database because somebody restarted a pod. So a schema the
     // migration Job has not reached yet is waited for, not applied, and one a
     // newer release made is refused.
-    let store: Arc<dyn meridian_street::Store> = Arc::new(wait_for_store(
+    let postgres = Arc::new(wait_for_store(
         "the street store's database",
         &url,
         |url| PostgresStore::connect(url, 8).map_err(|failed| failed.to_string()),
@@ -83,6 +83,15 @@ fn run() -> Result<(), String> {
             })
         },
     )?);
+    // The deployment every change is made in, its time, and the writer's
+    // epoch, adopted before it serves (step 3a; ruling 1060).
+    meridian_changes::set_origin(&var("MERIDIAN_DEPLOYMENT_ID").unwrap_or_default());
+    meridian_changes::set_clock(clock());
+    let epoch = postgres
+        .adopt()
+        .map_err(|failed| format!("the street store could not adopt its epoch: {failed}"))?;
+    tracing::info!(epoch, "the street store writes under its epoch");
+    let store: Arc<dyn meridian_street::Store> = postgres.clone();
 
     let instance_id = var("MERIDIAN_INSTANCE_ID").unwrap_or_else(|| "street-1".into());
 
@@ -95,6 +104,15 @@ fn run() -> Result<(), String> {
         // announces itself and then cannot answer is worse than one that
         // has not arrived.
         meridian_street::service::serve(bus.clone(), Arc::clone(&store), clock());
+        // The change log, served a page at a time and its tail published
+        // after each commit (step 3a; topics.md, "Component topics").
+        meridian_changes::serve(&bus, "street", postgres.clone());
+        meridian_changes::captured::Tail::spawn(
+            url.clone(),
+            meridian_street::postgres::CHANGES,
+            Arc::clone(&bus),
+            "street",
+        );
         // Each currency's cash instrument (contract v18): the codes held
         // before resolved once and said to be filled in, then any the
         // instrument store did not answer for.
