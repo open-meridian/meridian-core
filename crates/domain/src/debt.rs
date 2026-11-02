@@ -578,6 +578,218 @@ pub fn certificate_of_deposit_json(cd: &CertificateOfDeposit) -> Value {
     })
 }
 
+// ── A term offered at its path (W3.23, W1.24) ─────────────────────────────
+
+/// The most rows a repeated group's offered path may index: a long sinking
+/// fund schedule is tens of rows, never a thousand.
+pub const MOST_ROWS: usize = 1000;
+
+/// One step of a template path: a field, and a repeated group's row.
+fn steps(path: &str) -> Option<Vec<(&str, Option<usize>)>> {
+    path.split('.')
+        .map(|step| {
+            let (name, row) = match step.split_once('[') {
+                Some((name, rest)) => {
+                    let row = rest.strip_suffix(']')?;
+                    if row.is_empty() || !row.bytes().all(|b| b.is_ascii_digit()) {
+                        return None;
+                    }
+                    (name, Some(row.parse::<usize>().ok()?))
+                }
+                None => (step, None),
+            };
+            let named = !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+            named.then_some((name, row))
+        })
+        .collect()
+}
+
+/// Every term a type's message carries, each optional group and each
+/// repeated group's row present once, as the JSON writes them: what an
+/// offered path is read against.
+fn every_term(kind: InstrumentType) -> Option<Value> {
+    Some(match kind {
+        InstrumentType::Bond => bond_json(&Bond {
+            floating: Some(FloatingRateTerms::default()),
+            coupon_steps: vec![CouponStep::default()],
+            calls: vec![RedemptionWindow::default()],
+            puts: vec![RedemptionWindow::default()],
+            sinking_funds: vec![SinkingFundPayment::default()],
+            municipal: Some(MunicipalTerms::default()),
+            ..Default::default()
+        }),
+        InstrumentType::MbsPool => mbs_pool_json(&MbsPool::default()),
+        InstrumentType::Tba => tba_json(&Tba::default()),
+        InstrumentType::CmoTranche => cmo_tranche_json(&CmoTranche {
+            principal_types: vec![0],
+            interest_types: vec![0],
+            floating: Some(FloatingRateTerms::default()),
+            ..Default::default()
+        }),
+        InstrumentType::CertificateOfDeposit => {
+            certificate_of_deposit_json(&CertificateOfDeposit {
+                calls: vec![RedemptionWindow::default()],
+                ..Default::default()
+            })
+        }
+        _ => return None,
+    })
+}
+
+/// The terms' JSON holding `value` at `path` alone: a repeated group's
+/// earlier rows empty.
+fn placed(path: &[(&str, Option<usize>)], value: Value, scalar_rows: bool) -> Value {
+    let Some(((name, row), rest)) = path.split_first() else {
+        return value;
+    };
+    let inner = placed(rest, value, scalar_rows);
+    let at = match row {
+        Some(row) => {
+            let empty = if scalar_rows && rest.is_empty() {
+                Value::from("")
+            } else {
+                json!({})
+            };
+            let mut rows = vec![empty; *row];
+            rows.push(inner);
+            Value::Array(rows)
+        }
+        None => inner,
+    };
+    let mut object = Map::new();
+    object.insert((*name).to_string(), at);
+    Value::Object(object)
+}
+
+/// A debt type's terms read from the JSON at the offered path's value.
+fn read_terms(kind: InstrumentType, value: &Value) -> Result<(), String> {
+    match kind {
+        InstrumentType::Bond => bond_from(value, "").map(drop),
+        InstrumentType::MbsPool => mbs_pool_from(value, "").map(drop),
+        InstrumentType::Tba => tba_from(value, "").map(drop),
+        InstrumentType::CmoTranche => cmo_tranche_from(value, "").map(drop),
+        _ => certificate_of_deposit_from(value, "").map(drop),
+    }
+}
+
+/// Whether `value` offered at `path` is a term of a debt type's terms
+/// (W3.23): `Err(("path", why))` where the terms carry no such field, a
+/// repeated group's row is not named by its index (`calls[0].kind`, W1.24)
+/// or a field that does not repeat is; `Err(("value", why))` where the value
+/// is not of the field's type -- an enum by its value's name, a decimal as
+/// text, a whole number, true or false, a plain date, a whole group as its
+/// JSON. `Ok` for a type with no debt terms: its paths are its template's.
+pub fn term_refused(
+    kind: InstrumentType,
+    path: &str,
+    value: &str,
+) -> Result<(), (&'static str, String)> {
+    let Some(every) = every_term(kind) else {
+        return Ok(());
+    };
+    let Some(parts) = steps(path) else {
+        return Err((
+            "path",
+            format!("{path:?} is no template path: fields by name, a row by its index"),
+        ));
+    };
+    let mut shape = &every;
+    let mut scalar_rows = false;
+    for (n, (name, row)) in parts.iter().enumerate() {
+        let Some(next) = shape.as_object().and_then(|object| object.get(*name)) else {
+            return Err(("path", format!("the terms carry no {name} at {path}")));
+        };
+        shape = match (next, row) {
+            (Value::Array(rows), Some(row)) if *row < MOST_ROWS => {
+                let Some(first) = rows.first() else {
+                    return Err(("path", format!("the terms carry no {name} at {path}")));
+                };
+                scalar_rows = !first.is_object();
+                first
+            }
+            (Value::Array(_), Some(_)) => {
+                return Err((
+                    "path",
+                    format!("{name} is offered at most {MOST_ROWS} rows, at {path}"),
+                ))
+            }
+            (Value::Array(_), None) => {
+                return Err((
+                    "path",
+                    format!("{name} repeats: a row is offered by its index ({name}[0])"),
+                ))
+            }
+            (_, Some(_)) => return Err(("path", format!("{name} does not repeat, at {path}"))),
+            (other, None) => other,
+        };
+        if n + 1 < parts.len() && !shape.is_object() {
+            return Err(("path", format!("{name} has no fields, at {path}")));
+        }
+    }
+    let trimmed = value.trim();
+    let leaf = parts.last().map(|(name, _)| *name).unwrap_or_default();
+    let said = if shape.is_object() {
+        serde_json::from_str::<Value>(trimmed)
+            .ok()
+            .filter(Value::is_object)
+            .ok_or_else(|| {
+                (
+                    "value",
+                    format!("{leaf} is a group: its value is its JSON object"),
+                )
+            })?
+    } else if shape.is_boolean() {
+        match trimmed {
+            "true" => Value::Bool(true),
+            "false" => Value::Bool(false),
+            _ => return Err(("value", format!("{leaf} is true or false, not {trimmed:?}"))),
+        }
+    } else {
+        if (leaf == "date" || leaf.ends_with("_date"))
+            && !trimmed.is_empty()
+            && !crate::date::is_date(trimmed)
+        {
+            return Err(("value", format!("{leaf} is a plain date, not {trimmed:?}")));
+        }
+        Value::from(trimmed)
+    };
+    read_terms(kind, &placed(&parts, said, scalar_rows))
+        .map_err(|why| ("value", why.trim_start_matches('.').to_string()))
+}
+
+/// The term in force at `path` in a debt record's terms, as the JSON writes
+/// it (an enum by its name, a decimal as text, a flag as true or false);
+/// `None` where the terms hold nothing there, or carry no such path.
+pub fn term_at(kind: InstrumentType, terms: &str, path: &str) -> Option<String> {
+    use crate::instrument_type::terms_from_text;
+    let held = match kind {
+        InstrumentType::Bond => bond_json(&terms_from_text(terms)?),
+        InstrumentType::MbsPool => mbs_pool_json(&terms_from_text(terms)?),
+        InstrumentType::Tba => tba_json(&terms_from_text(terms)?),
+        InstrumentType::CmoTranche => cmo_tranche_json(&terms_from_text(terms)?),
+        InstrumentType::CertificateOfDeposit => {
+            certificate_of_deposit_json(&terms_from_text(terms)?)
+        }
+        _ => return None,
+    };
+    let mut at = &held;
+    for (name, row) in steps(path)? {
+        at = at.as_object()?.get(name)?;
+        if let Some(row) = row {
+            at = at.as_array()?.get(row)?;
+        }
+    }
+    match at {
+        Value::String(text) if !text.is_empty() => Some(text.clone()),
+        Value::Bool(flag) => Some(flag.to_string()),
+        Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    }
+}
+
 // ── What a record lacks (574) ──────────────────────────────────────────────
 
 /// A path as the terms read it: a template's path with the record's field
@@ -1026,5 +1238,88 @@ mod tests {
             value_words("DEBT_SECURITY_TYPE_TBILL", "DEBT_SECURITY_TYPE_", true),
             "TBILL"
         );
+    }
+
+    #[test]
+    fn a_term_offered_is_read_at_its_path_a_rows_index_and_a_groups_field_included() {
+        use crate::v1::{InterestType, PrincipalType};
+        let pool = InstrumentType::MbsPool;
+        assert_eq!(term_refused(pool, "agency", "MORTGAGE_AGENCY_GNMA"), Ok(()));
+        assert_eq!(term_refused(pool, "payment_delay_days", "50"), Ok(()));
+        let (part, why) = term_refused(pool, "payment_delay_days", "fifty").unwrap_err();
+        assert!(part == "value" && why.contains("whole number"), "{why}");
+        let (part, why) = term_refused(pool, "coupon_rate", "5").unwrap_err();
+        assert!(part == "path" && why.contains("no coupon_rate"), "{why}");
+        // A repeated enum's row, and a group's field, on a REMIC class.
+        let tranche = InstrumentType::CmoTranche;
+        assert_eq!(
+            term_refused(
+                tranche,
+                "principal_types[1]",
+                PrincipalType::Pac.as_str_name()
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            term_refused(
+                tranche,
+                "interest_types[0]",
+                InterestType::Floater.as_str_name()
+            ),
+            Ok(())
+        );
+        assert_eq!(term_refused(tranche, "floating.cap_rate", "7.5"), Ok(()));
+        let (part, _) = term_refused(tranche, "floating[0].cap_rate", "7.5").unwrap_err();
+        assert_eq!(part, "path");
+        let (part, _) = term_refused(tranche, "principal_types", "PRINCIPAL_TYPE_PAC").unwrap_err();
+        assert_eq!(part, "path");
+        // A whole group as its JSON; a group's field that is no group.
+        assert_eq!(
+            term_refused(InstrumentType::Bond, "floating", r#"{"spread_bps": "45"}"#),
+            Ok(())
+        );
+        let (part, _) = term_refused(InstrumentType::Bond, "floating", "45").unwrap_err();
+        assert_eq!(part, "value");
+        let (part, _) = term_refused(InstrumentType::Bond, "coupon_rate.x", "1").unwrap_err();
+        assert_eq!(part, "path");
+        let (part, _) = term_refused(
+            InstrumentType::Bond,
+            "calls[1000].kind",
+            "REDEMPTION_KIND_PAR",
+        )
+        .unwrap_err();
+        assert_eq!(part, "path");
+        // A type with no debt terms is its template's to say.
+        assert_eq!(
+            term_refused(
+                InstrumentType::ListedOption,
+                "deliverable[0].instrument_id",
+                "x"
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn the_term_in_force_at_a_path_is_read_as_the_json_writes_it() {
+        use crate::instrument_type::terms_to_text;
+        let record = crate::v1::InstrumentRecord {
+            bond: Some(bond_from(&corporate(), "bond").unwrap()),
+            ..Default::default()
+        };
+        let text = terms_to_text(&record);
+        let bond = InstrumentType::Bond;
+        assert_eq!(
+            term_at(bond, &text, "coupon_rate").as_deref(),
+            Some("4.875")
+        );
+        assert_eq!(
+            term_at(bond, &text, "calls[1].kind").as_deref(),
+            Some("REDEMPTION_KIND_PAR")
+        );
+        assert_eq!(term_at(bond, &text, "calls[9].kind"), None);
+        assert_eq!(term_at(bond, &text, "rule_144a").as_deref(), Some("false"));
+        assert_eq!(term_at(bond, &text, "guarantor_company_id"), None);
+        assert_eq!(term_at(bond, "", "coupon_rate"), None);
     }
 }

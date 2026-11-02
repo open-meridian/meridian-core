@@ -105,6 +105,7 @@ fn record(instrument_id: &str, identifiers: Vec<Identifier>) -> Instrument {
             offered_at_ns: 100,
             valid_until_ns: 0,
             provenance: Vec::new(),
+            path: String::new(),
         }],
         ..Default::default()
     }
@@ -201,6 +202,7 @@ fn a_currency_offer_keeps_the_provenance_it_came_with() {
         offered_at_ns: 200,
         valid_until_ns: 0,
         provenance: entry_bytes.clone(),
+        path: String::new(),
     });
     held.version = 2;
     let id = held.instrument_id.clone();
@@ -225,6 +227,60 @@ fn a_currency_offer_keeps_the_provenance_it_came_with() {
         .find(|offer| offer.field == Field::AssetClass)
         .unwrap();
     assert!(class.provenance.is_empty(), "a stated value carries none");
+}
+
+#[test]
+fn a_term_offered_keeps_its_path_and_provenance_two_rows_apart() {
+    // W3.23 (found by v29's reference plugins): a term offered at its
+    // template path, a repeated group's row by its index, kept with the
+    // provenance it came with and read back at its path; two rows' offers of
+    // the same value stay two.
+    let store = store();
+    let mut held = minted(&store, "TERM");
+    let provenance = prost::Message::encode_to_vec(&meridian_pb::v1::Provenance {
+        field: "calls[0].kind".into(),
+        kind: meridian_pb::v1::ProvenanceKind::Reported as i32,
+        source: "terrapin".into(),
+        ..Default::default()
+    });
+    for path in ["calls[0].kind", "calls[1].kind"] {
+        held.offers.push(Offer {
+            field: Field::Term,
+            value: "REDEMPTION_KIND_PAR".into(),
+            identifier: None,
+            source: "offered by terrapin-1 from terrapin".into(),
+            instance_id: "terrapin-1".into(),
+            offered_at_ns: 300,
+            valid_until_ns: 0,
+            provenance: provenance.clone(),
+            path: path.into(),
+        });
+    }
+    held.version = 2;
+    let id = held.instrument_id.clone();
+    assert_eq!(
+        store.write(held, 1, entry(&id, 2, "offer")).unwrap(),
+        Written::Stored
+    );
+    let back = store.by_id(&id).unwrap().unwrap();
+    let terms: Vec<(&str, &[u8])> = back
+        .offers
+        .iter()
+        .filter(|offer| offer.field == Field::Term)
+        .map(|offer| (offer.path.as_str(), offer.provenance.as_slice()))
+        .collect();
+    assert_eq!(
+        terms,
+        vec![
+            ("calls[0].kind", provenance.as_slice()),
+            ("calls[1].kind", provenance.as_slice())
+        ]
+    );
+    assert!(back
+        .offers
+        .iter()
+        .filter(|offer| offer.field == Field::Term)
+        .all(|offer| offer.identifier.is_none()));
 }
 
 #[test]
@@ -646,6 +702,7 @@ fn a_closed_window_an_ended_offer_a_contract_and_a_conflicts_reason_are_kept() {
         offered_at_ns: 400,
         valid_until_ns: 450,
         provenance: Vec::new(),
+        path: String::new(),
     });
     held.version = 2;
     assert_eq!(

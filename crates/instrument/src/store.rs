@@ -82,6 +82,12 @@ pub enum Field {
     MoneyMarketFund,
     /// Contract v19: a binary event contract's attributes.
     BinaryEventContract,
+    /// A term of the record's template beyond its own fields -- a debt
+    /// record's coupon, a call's row -- at its path ([`Offer::path`]),
+    /// offered by a `reference` plugin (W3.23; W1.24's repeated groups by
+    /// index). Offered only: a term in force is the record's terms'
+    /// (`listed_terms`).
+    Term,
 }
 
 impl Field {
@@ -95,6 +101,7 @@ impl Field {
             Field::InstrumentType => "instrument_type",
             Field::MoneyMarketFund => "money_market_fund",
             Field::BinaryEventContract => "binary_event_contract",
+            Field::Term => "term",
         }
     }
 
@@ -107,6 +114,7 @@ impl Field {
             "instrument_type" => Some(Field::InstrumentType),
             "money_market_fund" => Some(Field::MoneyMarketFund),
             "binary_event_contract" => Some(Field::BinaryEventContract),
+            "term" => Some(Field::Term),
             _ => None,
         }
     }
@@ -180,6 +188,10 @@ pub struct Offer {
     /// plugin sent it. Empty for a value the source stated, and for every
     /// offer of the platform's.
     pub provenance: Vec<u8>,
+
+    /// For [`Field::Term`], the template path offered, a repeated group's
+    /// row by its index (`calls[0].kind`); empty for every other field.
+    pub path: String,
 }
 
 impl Offer {
@@ -192,6 +204,7 @@ impl Offer {
             && self.instance_id == other.instance_id
             && self.valid_until_ns == other.valid_until_ns
             && self.provenance == other.provenance
+            && self.path == other.path
     }
 }
 
@@ -396,7 +409,7 @@ impl Instrument {
             Field::AssetClass => &self.asset_class,
             Field::Currency => &self.currency,
             Field::Description => &self.description,
-            Field::Identifier => "",
+            Field::Identifier | Field::Term => "",
             Field::InstrumentType => &self.instrument_type,
             Field::MoneyMarketFund => &self.money_market_fund,
             Field::BinaryEventContract => &self.binary_event_contract,
@@ -408,7 +421,7 @@ impl Instrument {
             Field::AssetClass => self.asset_class = value,
             Field::Currency => self.currency = value,
             Field::Description => self.description = value,
-            Field::Identifier => {}
+            Field::Identifier | Field::Term => {}
             Field::InstrumentType => self.instrument_type = value,
             Field::MoneyMarketFund => self.money_market_fund = value,
             Field::BinaryEventContract => self.binary_event_contract = value,
