@@ -1288,7 +1288,9 @@ async def main():
     """Each kind one role class, run on one connection (SDK 0.35:
     `meridian.run_async`); its page served here, on the plugin's port."""
     title, page, served = {
-        "data": ("Lake stand-in", Page("/", "Datasets", levels=["admin"]), Dgm),
+        # coin holds data and reference (contract v29's step 18): on a plugin
+        # holding several roles each page names the roles it serves.
+        "data": ("Lake stand-in", Page("/", "Datasets", levels=["admin"], roles=["data"]), Dgm),
         "signal": ("Signal stand-in", Page("/", "Quality", levels=["read"]), Lens),
         "desk": ("Desk stand-in", Page("/", "Trades", levels=["read"]), Desk),
     }.get(KIND, ("Reader stand-in", Page("/", "Prices", levels=["read"]), Reader))
