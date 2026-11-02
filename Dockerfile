@@ -22,14 +22,17 @@ WORKDIR /ui
 RUN node tools/build.mjs
 
 FROM rust:${RUST_VERSION}-slim-bookworm AS build
-# lld: the linker on arm64 too, as Rust's own LLD is on x86_64 (ruling 1069,
-# 449; Dockerfile.rust says why).
+# The release links with the C compiler's linker on arm64, not Debian's lld:
+# lld's arm64 binaries came out larger (the arm64 runtime image 108.8 MB
+# compressed with bfd, 120.9 MB with lld) and held 33 MiB more at the
+# footprint's peak (172 against 205 MiB, past ruling 1058's baseline; the
+# arm64 smoke of #88). Test builds still link with lld (Dockerfile.rust),
+# whose size does not ship.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git ca-certificates lld \
+ && apt-get install -y --no-install-recommends git ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 # No incremental state in the build cache, on the VM's one shared disk.
-ENV CARGO_INCREMENTAL=0 \
-    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=lld"
+ENV CARGO_INCREMENTAL=0
 WORKDIR /w
 # Dockerfile.rust's wrapper for the shared target cache (tools/fresh-sources.sh).
 COPY tools/fresh-sources.sh /usr/local/bin/fresh-sources
@@ -102,6 +105,11 @@ RUN apt-get update \
 COPY --from=build /usr/local/bin/meridian-analytics /usr/local/bin/meridian-analytics
 # A command is chosen -- coordinator or worker -- never inherited.
 ENTRYPOINT []
+# The release its binary reports, said on the image too: publish reads it to
+# package the chart at the version the image was built and tested as
+# (ruling 1071). Last, so a version changes no layer.
+ARG MERIDIAN_VERSION=
+LABEL org.opencontainers.image.version=${MERIDIAN_VERSION}
 
 FROM debian:bookworm-slim AS runtime
 # tzdata: the instrument store reads a spot-date rule's cut, 17:00
@@ -140,3 +148,6 @@ COPY --from=ui /ui/dist/ /usr/share/meridian/ui/
 # No default: a component is chosen, never inherited. An image that starts
 # something when nobody said which is an image that starts the wrong thing.
 ENTRYPOINT []
+# The release its binaries report, said on the image too (ruling 1071).
+ARG MERIDIAN_VERSION=
+LABEL org.opencontainers.image.version=${MERIDIAN_VERSION}

@@ -18,9 +18,13 @@
 # an Apple laptop, anything ordered in the last three years. An amd64-only image
 # fails at the first command in the README, which is how this was found.
 #
-# Native runners rather than QEMU because the build is Rust. Emulated
-# compilation turns a two-minute job into a twenty-minute one, and a slow
-# publish is a publish people start skipping.
+# Built by ci, not here (ruling 1071): the run that tests the tree main will
+# hold builds the release candidate on a native runner of each architecture,
+# stamped <series>.<ci run number>+<commit>, tests both, and tags them
+# tested-<tree> once green; this promotes them. The chart's version is the
+# release the images say, so a chart and its images are one build. (Until
+# 1071 the release was numbered by this workflow's runs, up to 0.1.342; it is
+# numbered by ci's from then, about 0.1.400 on, a one-time jump.)
 
 name: publish
 
@@ -45,114 +49,17 @@ env:
   ANALYTICS: ghcr.io/open-meridian/meridian-analytics
 
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-latest
-            platform: linux/amd64
-          - runner: ubuntu-24.04-arm
-            platform: linux/arm64
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          # The merge commit and both its parents, for the step below.
-          fetch-depth: 2
-
-      # The commit the branch carried, rather than the merge commit (see the
-      # header): its tree is the merge's, and its SHA is the one other
-      # repositories pin.
-      - name: The commit the branch carried
-        run: |
-          set -euo pipefail
-          if git rev-parse -q --verify 'HEAD^2' >/dev/null; then
-            if [ "$(git rev-parse 'HEAD^{tree}')" != "$(git rev-parse 'HEAD^2^{tree}')" ]; then
-              echo "::error::merge $(git rev-parse --short HEAD) holds a tree its branch never had: the branch was not up to date with main, so no pull-request check passed on this tree"
-              exit 1
-            fi
-            git checkout -q --detach 'HEAD^2'
-          fi
-          echo "publishing $(git rev-parse HEAD)"
-
-      # Before anything builds an image: the runner's preinstalled toolsets
-      # and preloaded images (tools/free-runner-disk.sh).
-      - name: Free the runner's disk
-        run: tools/free-runner-disk.sh
-
-      # The release the binaries report, compiled in: the chart version the
-      # `chart` job below publishes from this run, computed as it computes it,
-      # and the commit. Nothing in the chart says it, so nothing can disagree.
-      - id: version
-        run: |
-          set -euo pipefail
-          series=$(awk '/^version:/ {print $2}' deploy/chart/Chart.yaml)
-          echo "runtime=${series%.*}.${{ github.run_number }}+$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
-
-      - uses: docker/setup-buildx-action@v3
-
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      # Pushed by digest, untagged. The tags are applied once, in the merge
-      # below, so a half-finished publish never leaves `latest` pointing at one
-      # architecture.
-      - id: build
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          target: runtime
-          platforms: ${{ matrix.platform }}
-          build-args: MERIDIAN_VERSION=${{ steps.version.outputs.runtime }}
-          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=${{ matrix.platform }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
-
-      # The analytics image from the same build stage and cache, so no
-      # second compile: its own stage, one binary.
-      - id: analytics
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          target: analytics
-          platforms: ${{ matrix.platform }}
-          build-args: MERIDIAN_VERSION=${{ steps.version.outputs.runtime }}
-          outputs: type=image,name=${{ env.ANALYTICS }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=${{ matrix.platform }}
-
-      - name: Keep the digest
-        env:
-          DIGEST: ${{ steps.build.outputs.digest }}
-          ANALYTICS_DIGEST: ${{ steps.analytics.outputs.digest }}
-        run: |
-          mkdir -p /tmp/digests /tmp/analytics-digests
-          # Through an environment variable: the prefix has to come off in the
-          # shell, and shell expansion cannot happen inside a GitHub expression.
-          # Nor can a GitHub expression appear in a comment, even an empty one:
-          # they are evaluated anywhere in the file, and an empty one fails the
-          # whole workflow to parse. That is how this comment broke it once.
-          touch "/tmp/digests/${DIGEST#sha256:}"
-          touch "/tmp/analytics-digests/${ANALYTICS_DIGEST#sha256:}"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: digest-${{ strategy.job-index }}
-          path: /tmp/digests/*
-          retention-days: 1
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: analytics-digest-${{ strategy.job-index }}
-          path: /tmp/analytics-digests/*
-          retention-days: 1
-
+  # The runtime and analytics images, promoted (ruling 1071): the release
+  # candidate the CI run of this tree built and tested, amd64 and arm64,
+  # tagged with the commit the branch carried and as latest. Nothing is built
+  # here: the images published are the images tested, their digests
+  # unchanged. A tree no green run tested has no candidate, and is refused,
+  # so nothing is published that the gates have not seen. The release the
+  # images say is the chart's version below.
   publish:
-    needs: build
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.promote.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -173,18 +80,6 @@ jobs:
             git checkout -q --detach 'HEAD^2'
           fi
           echo "publishing $(git rev-parse HEAD)"
-
-      - uses: actions/download-artifact@v4
-        with:
-          path: /tmp/digests
-          pattern: digest-*
-          merge-multiple: true
-
-      - uses: actions/download-artifact@v4
-        with:
-          path: /tmp/analytics-digests
-          pattern: analytics-digest-*
-          merge-multiple: true
 
       - uses: docker/setup-buildx-action@v3
 
@@ -195,17 +90,25 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - id: tag
-        run: echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
-
-      # One manifest list carrying both architectures, tagged by commit and as
-      # latest. A release names a tag, so a rollback has a tag to find.
-      - name: Combine
-        working-directory: /tmp/digests
         run: |
-          docker buildx imagetools create \
-            -t "$IMAGE:${{ steps.tag.outputs.sha }}" \
-            -t "$IMAGE:latest" \
-            $(printf "$IMAGE@sha256:%s " *)
+          echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "tree=$(git rev-parse 'HEAD^{tree}')" >> "$GITHUB_OUTPUT"
+
+      # The candidate tested-<tree>, tagged <commit> and latest: one
+      # manifest list carrying both architectures. A release names a tag, so
+      # a rollback has a tag to find.
+      - name: Promote the tested images
+        id: promote
+        env:
+          SHA: ${{ steps.tag.outputs.sha }}
+          TREE: ${{ steps.tag.outputs.tree }}
+        run: |
+          set -euo pipefail
+          version=$(tools/release-candidate.sh promote "$TREE" "$SHA" "$IMAGE")
+          analytics=$(tools/release-candidate.sh promote "$TREE" "$SHA" "$ANALYTICS")
+          [ "$version" = "$analytics" ] \
+            || { echo "::error::the runtime candidate says $version and the analytics one $analytics"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       # Parsed rather than grepped. The first version of this matched the raw
       # JSON for `"architecture":"amd64"` and failed against a correct image,
@@ -220,33 +123,14 @@ jobs:
           TAG: ${{ steps.tag.outputs.sha }}
         run: |
           set -euo pipefail
-          found=$(docker buildx imagetools inspect "$IMAGE:$TAG" --raw \
-            | jq -r '.manifests[]?.platform.architecture' \
-            | grep -v '^unknown$' | sort -u)
-          echo "architectures: $(echo $found | tr '\n' ' ')"
-          echo "$found" | grep -qx amd64
-          echo "$found" | grep -qx arm64
-
-      # The analytics image, combined and tagged the same way.
-      - name: Combine the analytics image
-        working-directory: /tmp/analytics-digests
-        run: |
-          docker buildx imagetools create \
-            -t "$ANALYTICS:${{ steps.tag.outputs.sha }}" \
-            -t "$ANALYTICS:latest" \
-            $(printf "$ANALYTICS@sha256:%s " *)
-
-      - name: Check both architectures of the analytics image are there
-        env:
-          TAG: ${{ steps.tag.outputs.sha }}
-        run: |
-          set -euo pipefail
-          found=$(docker buildx imagetools inspect "$ANALYTICS:$TAG" --raw \
-            | jq -r '.manifests[]?.platform.architecture' \
-            | grep -v '^unknown$' | sort -u)
-          echo "architectures: $(echo $found | tr '\n' ' ')"
-          echo "$found" | grep -qx amd64
-          echo "$found" | grep -qx arm64
+          for image in "$IMAGE" "$ANALYTICS"; do
+            found=$(docker buildx imagetools inspect "$image:$TAG" --raw \
+              | jq -r '.manifests[]?.platform.architecture' \
+              | grep -v '^unknown$' | sort -u)
+            echo "$image: $(echo $found | tr '\n' ' ')"
+            echo "$found" | grep -qx amd64
+            echo "$found" | grep -qx arm64
+          done
 
   # The plugin harness, its own image (kernel/the-plugin-harness-is-its-own-image):
   # files only, built from the same commit and tagged with the same commit as
@@ -430,16 +314,21 @@ jobs:
           echo "publishing $(git rev-parse HEAD)"
 
       - id: version
+        env:
+          RELEASE: ${{ needs.publish.outputs.version }}
         run: |
           set -euo pipefail
           sha=$(git rev-parse --short HEAD)
-          # The series comes from Chart.yaml and the patch from this run, so
-          # published versions increase -- which is what lets Helm resolve
-          # `oci://.../meridian-runtime` with no --version at all -- and
-          # bumping Chart.yaml still starts a new series.
-          series=$(awk '/^version:/ {print $2}' deploy/chart/Chart.yaml)
+          # The release the promoted images say, without its commit: the
+          # series from Chart.yaml and the patch from the ci run that built
+          # and tested them (ruling 1071), so published versions increase --
+          # which is what lets Helm resolve `oci://.../meridian-runtime` with
+          # no --version at all -- and bumping Chart.yaml still starts a new
+          # series.
+          version="$RELEASE"
+          [ "${version##*+}" = "$sha" ] || { echo "::error::the images say $version, not a release of $sha"; exit 1; }
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "chart=${series%.*}.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          echo "chart=${version%%+*}" >> "$GITHUB_OUTPUT"
 
       # A chart and the image it runs are one build, or they are two things
       # that drift. The repository's own copy keeps `latest`, because somebody
