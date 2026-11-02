@@ -246,6 +246,18 @@ pub const TRADES_LOGGED_EVERY: Duration = Duration::from_secs(60);
 /// How long the catalogue's launched versions are read again after.
 const VERSIONS_FOR_NS: i64 = 300 * 1_000_000_000;
 
+/// A record's class and type the instrument store answered while it was
+/// still to be completed, and when.
+type Unsettled = ((i32, i32), i64);
+
+/// How long the lake keeps a record's class and type the instrument store
+/// answered while the record was still to be completed -- provisional, or
+/// its class not yet in force -- before asking again: a person
+/// completing it later (W3.10) is heard within this, never only after a
+/// restart. A complete record's is kept for good, a replacement's from its
+/// announcement.
+const UNSETTLED_FOR_NS: i64 = 15 * 1_000_000_000;
+
 /// How long a read that asked a source for a dataset served, not kept,
 /// waits for the served answer (W10.7, "the lake answers the waiting
 /// reader"; ruling 734): within every reader's own read timeout.
@@ -342,6 +354,10 @@ pub struct Lake {
     /// Each record the instrument store said it holds, with its asset class
     /// and type: a rate's subject is a referential record (contract v27).
     held: Mutex<BTreeMap<String, (i32, i32)>>,
+    /// Each record the instrument store answered still to be completed,
+    /// with what it answered and when: asked again after
+    /// [`UNSETTLED_FOR_NS`].
+    unsettled: Mutex<BTreeMap<String, Unsettled>>,
     cash: Mutex<CashInstruments>,
     versions: Mutex<(BTreeMap<String, String>, i64)>,
     /// Contract v27 (W10.4; ruling 418): the latest liveness per dataset
@@ -527,6 +543,7 @@ impl Lake {
             declined: Mutex::new(BTreeMap::new()),
             trades_recorded: std::sync::atomic::AtomicU64::new(0),
             held: Mutex::new(BTreeMap::new()),
+            unsettled: Mutex::new(BTreeMap::new()),
             cash: Mutex::new(CashInstruments::default()),
             versions: Mutex::new((BTreeMap::new(), 0)),
             liveness: Mutex::new(BTreeMap::new()),
@@ -608,8 +625,17 @@ impl Lake {
     }
 
     /// Whether the instrument store holds a record by this ID (W3.6),
-    /// remembered once it does.
+    /// remembered once it does: a record held stays held, whatever is
+    /// still to be completed on it.
     fn subject_held(&self, entity: &str) -> Result<bool, String> {
+        if self
+            .unsettled
+            .lock()
+            .expect("unsettled poisoned")
+            .contains_key(entity)
+        {
+            return Ok(true);
+        }
         Ok(self.subject_record(entity)?.is_some())
     }
 
@@ -657,10 +683,25 @@ impl Lake {
     }
 
     /// The asset class and type of the record the instrument store holds
-    /// by this ID, remembered once it does; `None` where it holds none.
+    /// by this ID, remembered once it does; `None` where it holds none. A
+    /// record still to be completed -- provisional, or its class not in
+    /// force -- is remembered only for [`UNSETTLED_FOR_NS`], so a
+    /// person's completion reaches the lake without a restart (a pool's
+    /// type accepted after its factors were first refused).
     fn subject_record(&self, entity: &str) -> Result<Option<(i32, i32)>, String> {
         if let Some(held) = self.held.lock().expect("held poisoned").get(entity) {
             return Ok(Some(*held));
+        }
+        let now = self.clock.now_ns();
+        if let Some((said, at)) = self
+            .unsettled
+            .lock()
+            .expect("unsettled poisoned")
+            .get(entity)
+        {
+            if now - at < UNSETTLED_FOR_NS {
+                return Ok(Some(*said));
+            }
         }
         let reply: ResolveInstrumentReply = self
             .ask(
@@ -676,10 +717,20 @@ impl Lake {
             return Ok(None);
         };
         let said = (record.asset_class, record.instrument_type);
-        self.held
-            .lock()
-            .expect("held poisoned")
-            .insert(entity.to_string(), said);
+        // A type is no type's absence to wait for: an equity's or a
+        // crypto asset's record has none. A provisional record, or one
+        // with no class in force, has its values still to come.
+        let settled = !record.provisional && record.asset_class != AssetClass::Unspecified as i32;
+        let mut unsettled = self.unsettled.lock().expect("unsettled poisoned");
+        if settled {
+            unsettled.remove(entity);
+            self.held
+                .lock()
+                .expect("held poisoned")
+                .insert(entity.to_string(), said);
+        } else {
+            unsettled.insert(entity.to_string(), (said, now));
+        }
         Ok(Some(said))
     }
 
@@ -6126,6 +6177,10 @@ impl Lake {
                         {
                             tracing::warn!(%failed, "a replacement was not kept");
                         }
+                        self.unsettled
+                            .lock()
+                            .expect("unsettled poisoned")
+                            .remove(&stays);
                         self.held.lock().expect("held poisoned").insert(stays, said);
                     }
                 }

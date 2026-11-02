@@ -131,9 +131,14 @@ jobs:
           echo "CONTRACT_DIFF_BASE=$base" >> "$GITHUB_ENV"
 
       # The harness's suites are the e2e-harness jobs below (ruling 556).
+      # With -k (ruling 1065): a failing stage does not stop the stages after
+      # it, so one run reports every failing stage, and the job still fails
+      # (make exits non-zero) and the k3d jobs that need it do not run. A
+      # stage that failed is freed by the next stage's begin (tools/gate.py).
+      # Locally `make ci-local` and the pre-push hook stay fail-fast.
       - name: make ci-local
         working-directory: workspace/meridian-core
-        run: make ci-local E2E_HARNESS_TARGET=
+        run: make -k ci-local E2E_HARNESS_TARGET=
         # build, test and lint each run in Dockerfile.rust at the pinned toolchain.
         # No Rust is installed on the runner, deliberately: the container is the
         # only place a version is chosen.

@@ -94,6 +94,19 @@ declares `fixed_income` -- trades, quotes and factors, pushed -- and serves:
              dealer principal), a when-issued print in yield alone, a firm
              quote with bucketed sizes, and two months of the pool's factors,
              then October's republished.
+  /provisional-pool
+             resolves a pool the harness platform's source cannot confirm,
+             stating its class and type (debt, an MBS pool): a provisional
+             LCL- record, its class and type offered;
+  /pool-factor?subject=ID
+             records one month's factor of that pool, answering what was
+             recorded or the lake's refusal.
+  /offer-terms?subject=ID&case=C
+             with its `reference` role, offers the bond's terms on TPL-bond
+             (OfferTemplateFields, W3.23): `good` a call's row by its index
+             and a field of its own, `path` a row with no index, `value` a
+             kind the schema does not define; answering the record's new
+             version or the refusal.
 
 STAND_IN_LAKE=signal is a `signal` plugin serving:
 
@@ -172,7 +185,7 @@ from meridian import (  # noqa: E402
 )
 from meridian.operations import as_decimal, as_money  # noqa: E402
 from meridian.plugin.v1 import operations_pb2 as ops  # noqa: E402
-from meridian.roles import data, ems, reporting, signal  # noqa: E402
+from meridian.roles import data, ems, reference, reporting, signal  # noqa: E402
 from meridian.roles.data import rates as rate_helpers  # noqa: E402
 from meridian.roles.data.quality import EdgeChecks, assessment  # noqa: E402
 
@@ -285,12 +298,18 @@ CATALOGUE = [
 ]
 
 
+class Terms(reference.Role):
+    """coin's reference role, its one class: the terms it offers
+    (OfferTemplateFields, W3.23), made through it."""
+
+
 class Dgm(data.Role):
     """The data role's one class (SDK 0.35): its acts on itself, its wants
     heard as its `on_<row>` methods; the connection, `self.plugin`, for what
-    is plugin-wide."""
+    is plugin-wide; its terms offered through its reference role's class."""
 
     def __init__(self):
+        self.reference = Terms()
         self.ids = {}
         self.wants = []
         self.withdrawn = []
@@ -730,6 +749,52 @@ class Dgm(data.Role):
         log(fixed_income=said)
         return said
 
+    async def provisional_pool(self):
+        """v29's fixes: a pool its source states as debt, an MBS pool, which
+        the harness platform cannot confirm -- a provisional LCL- record, its
+        class and type only offered until a person accepts them (W3.7,
+        W3.10)."""
+        pool = await self.resolve_identifier(
+            identifiers=[ops.Identifier(scheme="agency_pool", value="MA9999", source="FNMA")],
+            stated_asset_class="ASSET_CLASS_DEBT", stated_instrument_type="INSTRUMENT_TYPE_MBS_POOL",
+            stated_description="FNMA CL MA9999 6.0", stated_currency="USD")
+        said = {"instrument_id": pool.instrument_id, "provisional": pool.provisional}
+        log(provisional_pool=said)
+        return said
+
+    async def pool_factor(self, query):
+        subject = query.get("subject", [""])[0]
+        row = ops.Factor(meta=ops.ObservationMeta(
+            row_key="FNMA:MA9999:202610", subjects=[ops.SubjectRef(entity_id=subject)],
+            source=ops.Source(dataset=self.dataset("fixed_income")),
+            valid_from_ns=time.time_ns(), business_date="2026-11-05"),
+            factor=_decimal("0.91234567"), factor_month="202610",
+            record_date="2026-10-31", payment_date="2026-11-25")
+        try:
+            done = await self._operations().RecordFactors(
+                ops.RecordFactorsParams(factors=[row]))
+        except Exception as refused:  # the sidecar's refusal, as gRPC carries it
+            details = getattr(refused, "details", None)
+            return {"refused": details() if callable(details) else str(refused)}
+        return {"recorded": done.recorded}
+
+    async def offer_terms(self, query):
+        one = lambda name: query.get(name, [""])[0]  # noqa: E731
+        fields = {
+            "good": [("calls[0].kind", "REDEMPTION_KIND_PAR"), ("calls[0].from_date", "2035-11-05"),
+                     ("calls[0].price", "100"), ("governing_law", "US-NY")],
+            "path": [("calls.kind", "REDEMPTION_KIND_PAR")],
+            "value": [("calls[0].kind", "REDEMPTION_KIND_SOMETIMES")],
+        }[one("case")]
+        try:
+            done = await self.reference.offer_template_fields(
+                instrument_id=one("subject"), template_id="TPL-bond", template_version="1",
+                fields=[meridian.TemplateFieldValue(path=path, value=value) for path, value in fields])
+        except Exception as refused:  # the store's refusal, as the SDK raises it
+            details = getattr(refused, "details", None)
+            return {"refused": details() if callable(details) else str(refused)}
+        return {"version": done.instrument.version}
+
     async def resolve_as_of(self, query):
         one = lambda name: query.get(name, [""])[0]
         # A security with the name and currency the venue states (from
@@ -797,6 +862,12 @@ class Dgm(data.Role):
             return await self.filings()
         if path == "/fixed-income":
             return await self.fixed_income()
+        if path == "/provisional-pool":
+            return await self.provisional_pool()
+        if path == "/pool-factor":
+            return await self.pool_factor(query)
+        if path == "/offer-terms":
+            return await self.offer_terms(query)
         if path == "/resolve":
             return await self.resolve()
         if path == "/record":
@@ -1217,7 +1288,9 @@ async def main():
     """Each kind one role class, run on one connection (SDK 0.35:
     `meridian.run_async`); its page served here, on the plugin's port."""
     title, page, served = {
-        "data": ("Lake stand-in", Page("/", "Datasets", levels=["admin"]), Dgm),
+        # coin holds data and reference (contract v29's step 18): on a plugin
+        # holding several roles each page names the roles it serves.
+        "data": ("Lake stand-in", Page("/", "Datasets", levels=["admin"], roles=["data"]), Dgm),
         "signal": ("Signal stand-in", Page("/", "Quality", levels=["read"]), Lens),
         "desk": ("Desk stand-in", Page("/", "Trades", levels=["read"]), Desk),
     }.get(KIND, ("Reader stand-in", Page("/", "Prices", levels=["read"]), Reader))
@@ -1227,7 +1300,9 @@ async def main():
                    else Declaration(interface=interface))
     threading.Thread(target=serve, args=(served,), daemon=True).start()
     log(kind=KIND)
-    await meridian.run_async(declaration, [served])
+    # coin holds reference too (contract v29's step 18): its class beside.
+    roles = [served, served.reference] if KIND == "data" else [served]
+    await meridian.run_async(declaration, roles)
 
 
 if __name__ == "__main__":

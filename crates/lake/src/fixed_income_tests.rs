@@ -878,3 +878,90 @@ async fn what_w10_4_refuses_of_a_factor_is_refused_naming_the_field() {
     z.coupon_rate = decimal("5.125");
     assert_eq!(record_factors(&h, vec![z]).unwrap(), (1, 0, 0));
 }
+
+/// A provisional pool, its class and type only offered when the lake first
+/// asks: its factor is refused, and once a person has accepted them (W3.10)
+/// the lake asks again within its window, so the factor is recorded with no
+/// restart (found by the agencies' plugins, v29).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pool_completed_after_its_factor_was_refused_takes_its_factor_without_a_restart() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    const LOCAL: &str = "LCL-01JC29POOLPROVISIONAL00001";
+    let clock = Arc::new(ManualClock::at(NOW));
+    let bus = Arc::new(Bus::single(
+        "lake-1",
+        Arc::new(MemoryBackend::new()),
+        clock.clone(),
+    ));
+    let completed = Arc::new(AtomicBool::new(false));
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    {
+        let (completed, asked) = (completed.clone(), asked.clone());
+        bus.serve(service::RESOLVE_INSTRUMENT, move |envelope| {
+            let wanted = ResolveInstrumentRequest::decode(&envelope.payload[..]).unwrap();
+            assert_eq!(wanted.instrument_id, LOCAL);
+            asked.fetch_add(1, Ordering::SeqCst);
+            let (class, kind) = if completed.load(Ordering::SeqCst) {
+                (AssetClass::Debt, InstrumentType::MbsPool)
+            } else {
+                (AssetClass::Unspecified, InstrumentType::Unspecified)
+            };
+            Ok((
+                "meridian.v1.ResolveInstrumentReply".into(),
+                ResolveInstrumentReply {
+                    found: true,
+                    instrument: Some(InstrumentRecord {
+                        instrument_id: LOCAL.into(),
+                        asset_class: class as i32,
+                        instrument_type: kind as i32,
+                        provisional: true,
+                        template_id: "TPL-mbs-pool".into(),
+                        ..Default::default()
+                    }),
+                }
+                .encode_to_vec(),
+            ))
+        });
+    }
+    bus.serve(service::PLUGIN_CATALOGUE, |_| {
+        Ok((
+            "meridian.v1.PluginCatalogue".into(),
+            meridian_domain::v1::PluginCatalogue::default().encode_to_vec(),
+        ))
+    });
+    let lake = service::serve(
+        bus.clone(),
+        Arc::new(crate::MemoryStore::new()),
+        clock.clone(),
+    );
+    lake.configured(&factor_configuration());
+    let h = Harness { bus, lake };
+
+    let refused = record_factors(
+        &h,
+        vec![factor(LOCAL, "202610", "0.83102210", "2026-11-25")],
+    )
+    .unwrap_err();
+    assert!(refused.contains("no pool or REMIC class"), "{refused}");
+    // A person accepts the offered class and type; within the window the
+    // answer held stands, and the store is not asked for every row.
+    completed.store(true, Ordering::SeqCst);
+    let again = record_factors(
+        &h,
+        vec![factor(LOCAL, "202610", "0.83102210", "2026-11-25")],
+    )
+    .unwrap_err();
+    assert!(again.contains("no pool or REMIC class"), "{again}");
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+    // After it, asked again: the pool's factor is recorded, no restart.
+    clock.advance(16 * 1_000_000_000);
+    assert_eq!(
+        record_factors(
+            &h,
+            vec![factor(LOCAL, "202610", "0.83102210", "2026-11-25")]
+        )
+        .unwrap(),
+        (1, 0, 0)
+    );
+    assert_eq!(asked.load(Ordering::SeqCst), 2);
+}

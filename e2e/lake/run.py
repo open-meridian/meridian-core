@@ -103,6 +103,15 @@ harness's admin, Ben, who holds read on `book`.
    `book` reads the pool's factors by payment date, October's at its
    republication, catches up the republication after the watermark it last
    saw, and a pool asked by a record no source holds is never a factor.
+18. v29's fixes: `coin` resolves a pool the platform cannot confirm,
+   stating it debt and an MBS pool -- a provisional LCL- record naming
+   TPL-mbs-pool, its class and type only offered -- and its factor is
+   refused; the admin accepts the offered values through
+   `dashboard__accept_offered_values`, the type with the class, and the
+   lake, asking again, takes the factor with no restart. With its
+   `reference` role `coin` offers the bond's terms on TPL-bond: a call's row
+   by its index kept, a new version; a row with no index refused naming its
+   path, a kind the schema does not define naming its value.
 
 `make e2e-recorded` runs the same with STAND_IN_EXCHANGES naming RECORDED, a
 developer's recorded exchanges (plans/the-lake-prices-the-book, Q11).
@@ -731,13 +740,54 @@ def run():
     must(not none["factors"] and none["unanswered"],
          f"step 17, a record no source holds factors for is never a factor: {none}")
 
-    # 18. The hot layer (step 3a): a read of the latest answered from the
+    # 18. v29's fixes: a pool its source states, provisional, its class and
+    # type only offered; its factor refused; a person accepts the offered
+    # values, the type with the class; the lake asks again and takes the
+    # factor, no restart.
+    local = page("coin", "admin", "/provisional-pool")
+    pending_pool = local["instrument_id"]
+    must(local["provisional"] and pending_pool.startswith("LCL-"),
+         f"step 18, a pool the platform cannot confirm is a provisional record: {local}")
+    refused = page("coin", "admin", f"/pool-factor?subject={pending_pool}")
+    must("no pool or REMIC class" in (refused.get("refused") or ""),
+         f"step 18, its factor refused while its type is only offered: {refused}")
+    held = call("dashboard__read_instrument", {"instrument_id": pending_pool}, "unchanged")["data"]
+    must(held["instrument_type"] is None and held["template_id"] == "TPL-mbs-pool"
+         and any((o.get("value") or {}).get("instrument_type") == "INSTRUMENT_TYPE_MBS_POOL"
+                 for o in held["offers"]),
+         f"step 18, the provisional record names its template, its type offered: {held}")
+    call("dashboard__accept_offered_values",
+         {"records": [{"instrument_id": pending_pool, "against_version": held["version"]}],
+          "note": "The agency's disclosure states it: a Fannie Mae pool."}, "made")
+    accepted = call("dashboard__read_instrument", {"instrument_id": pending_pool}, "unchanged")["data"]
+    must(accepted["asset_class"] == "ASSET_CLASS_DEBT"
+         and accepted["instrument_type"] == "INSTRUMENT_TYPE_MBS_POOL",
+         f"step 18, the offered type accepted with its class: {accepted}")
+    taken = until(60, lambda: (lambda said: said if said.get("recorded") == 1 else None)(
+        page("coin", "admin", f"/pool-factor?subject={pending_pool}")),
+        "step 18, the lake did not take the completed pool's factor without a restart")
+    log(f"step 18: {taken}")
+    # A reference plugin's terms of the bond (W3.23, W1.24): a call's row by
+    # its index kept as offers, a new version; a row with no index refused
+    # naming its path, a kind the schema does not define naming its value.
+    before = call("dashboard__read_instrument", {"instrument_id": bond}, "unchanged")["data"]
+    offered = page("coin", "admin", f"/offer-terms?subject={bond}&case=good")
+    must(offered.get("version") == before["version"] + 1,
+         f"step 18, a call's row offered by its index is kept, a new version: {offered}")
+    no_index = page("coin", "admin", f"/offer-terms?subject={bond}&case=path")
+    must("fields[0].path" in (no_index.get("refused") or ""),
+         f"step 18, a repeated group's row with no index refused naming its path: {no_index}")
+    no_kind = page("coin", "admin", f"/offer-terms?subject={bond}&case=value")
+    must("fields[0].value" in (no_kind.get("refused") or ""),
+         f"step 18, a kind the schema does not define refused naming its value: {no_kind}")
+
+    # 19. The hot layer (step 3a): a read of the latest answered from the
     # lake's memory once its key is loaded, the same as the record's answer;
     # and after the lake restarts, from the record until loaded, then from
     # memory again, the same.
     def latest_closes():
         answer = page("book", "read", f"/prices?subject={btc}&kind=close")
-        must(answer["prices"] and not answer.get("refused"), f"step 18, the latest close: {answer}")
+        must(answer["prices"] and not answer.get("refused"), f"step 19, the latest close: {answer}")
         return answer["prices"]
 
     def memory_answered():
@@ -747,16 +797,16 @@ def run():
 
     record = latest_closes()
     loaded = until(30, lambda: (latest_closes() == record and memory_answered()) or None,
-                   "step 18, no read of the latest was answered from memory")
-    log(f"step 18, from memory: {loaded[-1]}")
+                   "step 19, no read of the latest was answered from memory")
+    log(f"step 19, from memory: {loaded[-1]}")
     compose("restart", "lake")
     until(90, lambda: (lambda d: d if "coin:daily" in d else None)(datasets_listed()),
-          "step 18, the lake did not come back")
-    restarted = until(60, lambda: latest_closes() or None, "step 18, no answer after the restart")
-    must(restarted == record, f"step 18, after the restart, the same answer: {restarted} != {record}")
+          "step 19, the lake did not come back")
+    restarted = until(60, lambda: latest_closes() or None, "step 19, no answer after the restart")
+    must(restarted == record, f"step 19, after the restart, the same answer: {restarted} != {record}")
     seen = len(memory_answered())
     until(30, lambda: (latest_closes() == record and len(memory_answered()) > seen) or None,
-          "step 18, after the restart no read was answered from memory again")
+          "step 19, after the restart no read was answered from memory again")
 
     # 11. The store.
     lines = compose("run", "--rm", "-T", "store", "lake").stdout.split("\n")
@@ -813,7 +863,10 @@ def run():
           "published and restated, a rating action by the rated and its agency, and a "
           "security's holders with their report; a bond's capped print in percent of par with its "
           "yield and characteristics, a when-issued print in yield, a firm quote with bucketed "
-          "sizes, and a pool's factors read by payment date, republished and caught up; and "
+          "sizes, and a pool's factors read by payment date, republished and caught up; a "
+          "provisional pool's factor refused, its offered class and type accepted together and "
+          "its factor then taken with no restart; a bond's call offered by its row's index and "
+          "kept, a row with no index and an undefined kind refused naming each; and "
           "`store lake` printing each version numbered with no "
           "holes, the want and the priority's changes")
 

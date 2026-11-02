@@ -16,7 +16,7 @@ Docker's own filesystem, on a Docker Desktop VM and a CI runner alike.
 
     gate.py start --make-pid PID --floor-start GB --floor-stop GB
                   --budgets "stage=GB ..." --images "..."
-    gate.py begin STAGE
+    gate.py begin STAGE [--drop IMAGE ...]
     gate.py drop IMAGE ...
     gate.py mark STAGE SERVICE ...
     gate.py release STAGE
@@ -38,6 +38,13 @@ that the stage's targets created -- those there at `release` and not at
 Never a container that was there before the stage, so a developer's own
 stack keeps running; never a named volume; and never the services' images,
 which later stages start again.
+
+A stage that never ends -- a target in it failed, and make carried on with
+`-k`, as CI's ci-local does so one run reports every failing stage (ruling
+1065) -- is closed by the next stage's `begin`: its marked containers
+released and the images its `begin` named (--drop, what its `end` would
+drop) dropped, its row kept as failed, so the stages after it start clean
+and are charged only what they hold themselves.
 """
 
 from __future__ import annotations
@@ -201,7 +208,8 @@ def start(args: argparse.Namespace) -> int:
         except (ProcessLookupError, ValueError):
             pass
     docker("rm", "-f", PROBE)
-    for f in ("samples", "stages", "current", "breach", "finished", "daemon.pid", "marked.json"):
+    for f in ("samples", "stages", "current", "breach", "finished", "daemon.pid", "marked.json",
+              "dropping.json"):
         (STATE / f).unlink(missing_ok=True)
     STATE.mkdir(exist_ok=True)
 
@@ -275,11 +283,30 @@ def started() -> bool:
 def begin(args: argparse.Namespace) -> int:
     if not started():
         return 0
+    if (STATE / "current").exists():
+        abandon(load(), args.stage)
     kb = free_kb()
     record(kb)
     (STATE / "current").write_text(f"{args.stage} {time.time():.1f}")
+    (STATE / "dropping.json").write_text(json.dumps(args.drop))
     print(f"\n== gate: {args.stage} ({gb(kb)} GB free)")
     return 0
+
+
+def abandon(run: dict, following: str) -> None:
+    """A stage begun and never ended: a target in it failed under `make -k`.
+    What it marked released and what its `end` would drop dropped, before
+    `following` begins; its row kept, failed."""
+    stage, began = (STATE / "current").read_text().split()
+    path = STATE / "dropping.json"
+    drops = json.loads(path.read_text()) if path.exists() else []
+    print(f"-- gate: {stage} did not end (a target in it failed); freed before {following}",
+          flush=True)
+    marked_path = STATE / "marked.json"
+    marked = json.loads(marked_path.read_text()) if marked_path.exists() else {}
+    if stage in marked:
+        free_marked(stage)
+    close(run, stage, float(began), drops, "failed")
 
 
 def free_stage(run: dict, drop: list[str]) -> None:
@@ -351,7 +378,16 @@ def release(args: argparse.Namespace) -> int:
     marked = json.loads(path.read_text()) if path.exists() else {}
     if args.stage not in marked:
         sys.exit(f"gate: releasing {args.stage}, which marked no services")
-    entry = marked.pop(args.stage)
+    free_marked(args.stage)
+    return 0
+
+
+def free_marked(stage: str) -> None:
+    """The containers `stage`'s targets created for the services it marked,
+    with their anonymous volumes, removed."""
+    path = STATE / "marked.json"
+    marked = json.loads(path.read_text())
+    entry = marked.pop(stage)
     path.write_text(json.dumps(marked))
     before = free_kb()
     record(before)
@@ -363,7 +399,6 @@ def release(args: argparse.Namespace) -> int:
     print(f"-- gate: released {len(created)} container(s) of {' '.join(entry['services'])} "
           f"the stage made, with their volumes: {gb(before)} GB free, {gb(after)} GB once freed",
           flush=True)
-    return 0
 
 
 def end(args: argparse.Namespace) -> int:
@@ -373,31 +408,40 @@ def end(args: argparse.Namespace) -> int:
     stage, began = (STATE / "current").read_text().split()
     if stage != args.stage:
         sys.exit(f"gate: ending {args.stage}, but {stage} is the stage running")
+    return close(run, stage, float(began), args.drop, None)
+
+
+def close(run: dict, stage: str, began: float, drops: list[str], failed: str | None) -> int:
+    """A stage's measure taken and its row kept, what it built freed: at its
+    `end`, or, `failed`, at the next stage's `begin`."""
     now_kb = free_kb()
     record(now_kb)
     ended = time.time()
-    lowest = min(samples(float(began), ended) + [now_kb])
+    lowest = min(samples(began, ended) + [now_kb])
     above_kb = max(0, run["start_free_kb"] - lowest)
     shared_kb = 0 if stage == SHARED_STAGE else run.get("shared_kb", 0)
     peak_kb = max(0, above_kb - shared_kb)
     budget = run["budgets"].get(stage)
     over = budget is not None and peak_kb > budget * GB
-    free_stage(run, args.drop)
+    free_stage(run, drops)
     after = free_kb()
     record(after)
     if stage == SHARED_STAGE:
         run["shared_kb"] = max(0, run["start_free_kb"] - after)
         (STATE / "run.json").write_text(json.dumps(run))
-    verdict = "OVER" if over else "ok"
+    verdict = failed or ("OVER" if over else "ok")
     with open(STATE / "stages", "a") as f:
         f.write(f"{stage}\t{gb(peak_kb)}\t{budget if budget is not None else '-'}\t"
-                f"{gb(lowest)}\t{gb(after)}\t{ended - float(began):.0f}\t{verdict}\n")
+                f"{gb(lowest)}\t{gb(after)}\t{ended - began:.0f}\t{verdict}\n")
     (STATE / "current").unlink()
+    (STATE / "dropping.json").unlink(missing_ok=True)
     shared_said = (f", {gb(shared_kb)} of it the {SHARED_STAGE}'s, {gb(peak_kb)} its own"
                    if shared_kb else "")
     print(f"-- gate: {stage} peaked {gb(above_kb)} GB above the start{shared_said} (budget "
           f"{budget if budget is not None else 'none'}), {gb(lowest)} GB free at its lowest, "
           f"{gb(after)} GB once freed", flush=True)
+    if failed:
+        return 1
     if stage == SHARED_STAGE and run["shared_kb"]:
         print(f"-- gate: the {SHARED_STAGE} leaves {gb(run['shared_kb'])} GB every later stage "
               f"shares; each is charged what it holds above that", flush=True)
@@ -456,6 +500,7 @@ def main() -> int:
     s.add_argument("--cache-days", default="14")
     b = sub.add_parser("begin")
     b.add_argument("stage")
+    b.add_argument("--drop", nargs="*", default=[])
     e = sub.add_parser("end")
     e.add_argument("stage")
     e.add_argument("--drop", nargs="*", default=[])

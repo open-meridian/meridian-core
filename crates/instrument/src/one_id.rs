@@ -1161,6 +1161,7 @@ pub fn resolve_to_as(
                         offered_at_ns: now_ns,
                         valid_until_ns: 0,
                         provenance: Vec::new(),
+                        path: String::new(),
                     });
                 }
             }
@@ -1236,6 +1237,7 @@ pub fn resolve_to_as(
                         offered_at_ns: now_ns,
                         valid_until_ns: 0,
                         provenance: Vec::new(),
+                        path: String::new(),
                     });
                 }
             }
@@ -1552,6 +1554,13 @@ pub fn decommission(
 
 /// W3.23: a `reference` plugin's offer of a record's template fields, kept as
 /// offers with the plugin the source, never in force, never over a person's.
+/// Every field of the template is offered: the record's own four as before,
+/// and from contract v29 each term beyond them at its path -- a field of a
+/// group (`municipal.federal_tax_status`), a repeated group's row by its
+/// index (`calls[0].kind`, W1.24) -- each read against the type's terms and
+/// refused naming its path or value where it is none of theirs. A plugin's
+/// later offer of a repeated group stands for the whole group: its earlier
+/// rows not offered again are dropped.
 pub fn offer_template_fields(
     store: &dyn Store,
     request: &meridian_domain::v1::OfferTemplateFieldsRequest,
@@ -1577,26 +1586,71 @@ pub fn offer_template_fields(
             format!("the store holds no record {}", request.instrument_id),
         )));
     };
+    let kind =
+        InstrumentType::try_from(template.instrument_type).unwrap_or(InstrumentType::Unspecified);
     let mut offers = Vec::new();
+    // The repeated groups offered, by the plugin's paths in them.
+    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
     for (index, field) in request.fields.iter().enumerate() {
-        if !template.fields.iter().any(|held| held.path == field.path) {
+        let path = field.path.trim();
+        let top = &path[..path.find(['.', '[']).unwrap_or(path.len())];
+        let Some(held) = template.fields.iter().find(|held| held.path == top) else {
             return Ok(Err((
                 format!("fields[{index}].path"),
                 format!("{} has no field {}", template.template_id, field.path),
             )));
-        }
-        let target = match field.path.as_str() {
+        };
+        let target = match path {
             "description" => Field::Description,
             "currency" => Field::Currency,
             "instrument_type" => Field::InstrumentType,
             "asset_class" => Field::AssetClass,
-            _ => continue,
+            // Identifiers join by a resolve (W3.1) and the venue is the
+            // platform's (W3.5): no offer here names either.
+            "identifiers" | "listing_venue_id" => continue,
+            _ => Field::Term,
         };
         if target == Field::Currency && !crate::record::is_currency(field.value.trim()) {
             return Ok(Err((
                 format!("fields[{index}].value"),
                 format!("{:?} is not an ISO 4217 code", field.value),
             )));
+        }
+        if target == Field::Term {
+            let indexed = path[top.len()..].starts_with('[');
+            let grouped = path.len() > top.len();
+            let refused = if held.repeated && !indexed {
+                Some(format!(
+                    "{top} repeats: a row is offered by its index ({top}[0])"
+                ))
+            } else if !held.repeated && indexed {
+                Some(format!("{top} does not repeat"))
+            } else if grouped && !held.repeated && held.r#type != "message" {
+                Some(format!(
+                    "{top} is a {}, with no fields of its own",
+                    held.r#type
+                ))
+            } else {
+                None
+            };
+            if let Some(words) = refused {
+                return Ok(Err((format!("fields[{index}].path"), words)));
+            }
+            if let Err((part, words)) =
+                meridian_domain::debt::term_refused(kind, path, &field.value)
+            {
+                return Ok(Err((format!("fields[{index}].{part}"), words)));
+            }
+            // A term with no value states nothing: no offer.
+            if field.value.trim().is_empty() {
+                continue;
+            }
+            if held.repeated {
+                match groups.iter_mut().find(|(group, _)| group == top) {
+                    Some((_, paths)) => paths.push(path.to_string()),
+                    None => groups.push((top.to_string(), vec![path.to_string()])),
+                }
+            }
         }
         let source = field
             .provenance
@@ -1617,10 +1671,26 @@ pub fn offer_template_fields(
                 .as_ref()
                 .map(prost::Message::encode_to_vec)
                 .unwrap_or_default(),
+            path: if target == Field::Term {
+                path.to_string()
+            } else {
+                String::new()
+            },
         });
     }
     let expected = record.version;
-    if !crate::resolve::keep_offers(&mut record, offers) {
+    // The plugin's rows of a group it offers again, not among them: the
+    // group as it offers it now, never a row its source no longer states.
+    let before = record.offers.len();
+    record.offers.retain(|held| {
+        held.field != Field::Term
+            || held.instance_id != instance_id
+            || !groups.iter().any(|(group, paths)| {
+                held.path.starts_with(&format!("{group}[")) && !paths.contains(&held.path)
+            })
+    });
+    let dropped = record.offers.len() != before;
+    if !crate::resolve::keep_offers(&mut record, offers) && !dropped {
         return Ok(Ok(record));
     }
     record.version = expected + 1;
@@ -2459,6 +2529,231 @@ mod tests {
         let (again, _) =
             keep_platform_record(&store, &[], &note, None, Vec::new(), NOW + 2).unwrap();
         assert_eq!(again.version, kept.version);
+    }
+
+    #[test]
+    fn a_reference_plugins_terms_are_kept_as_offers_at_their_paths_repeated_groups_by_index() {
+        // W3.23 and W1.24 (found by v29's reference plugins): every template
+        // field is offered, a call's row by its index, kept with its
+        // provenance; none is put in force, and none is offered over the
+        // terms in force.
+        use meridian_domain::v1::{
+            Bond, CouponType, DayCount, DebtSecurityType, FieldRequirement, IssuerType,
+            OfferTemplateFieldsRequest, TemplateField, TemplateFieldValue,
+        };
+        use meridian_pb::v1::{Provenance, ProvenanceKind};
+        let store = MemoryStore::new();
+        let field = |path: &str, kind: &str, requirement: FieldRequirement| TemplateField {
+            path: path.into(),
+            r#type: kind.into(),
+            required: requirement == FieldRequirement::Mint,
+            requirement: requirement as i32,
+            repeated: path == "calls",
+        };
+        store
+            .keep_template(
+                &SecurityTemplate {
+                    template_id: "TPL-bond".into(),
+                    template_version: "1".into(),
+                    asset_class: AssetClass::Debt as i32,
+                    instrument_type: InstrumentType::Bond as i32,
+                    fields: vec![
+                        field("identifiers", "identifier", FieldRequirement::Mint),
+                        field("description", "text", FieldRequirement::Mint),
+                        field("maturity_date", "date", FieldRequirement::Mint),
+                        field("coupon_rate", "Decimal", FieldRequirement::Mint),
+                        field("day_count", "enum", FieldRequirement::Mint),
+                        field("calls", "message", FieldRequirement::Complete),
+                        field("municipal", "message", FieldRequirement::Optional),
+                        field("rule_144a", "boolean", FieldRequirement::Optional),
+                    ],
+                    ..Default::default()
+                },
+                NOW,
+            )
+            .unwrap();
+        let terms = Bond {
+            security_type: DebtSecurityType::Corp as i32,
+            issuer_company_id: "ENT-01JC29HARNESSCORP00000001".into(),
+            issuer_type: IssuerType::Corporate as i32,
+            maturity_date: "2036-02-05".into(),
+            coupon_type: CouponType::Fixed as i32,
+            day_count: DayCount::Thirty360BondBasis as i32,
+            ..Default::default()
+        };
+        let bond = InstrumentRecord {
+            instrument_id: "INS-01JBOND".into(),
+            identifiers: vec![PbIdentifier {
+                scheme: "figi".into(),
+                value: "BBG01BOND0001".into(),
+                ..Default::default()
+            }],
+            asset_class: AssetClass::Debt as i32,
+            instrument_type: InstrumentType::Bond as i32,
+            currency: "USD".into(),
+            description: "Harness Corp 2036".into(),
+            version: 1,
+            template_id: "TPL-bond".into(),
+            template_version: "1".into(),
+            bond: Some(terms),
+            ..Default::default()
+        };
+        unmatched(
+            &store,
+            &ResolveIdentifierRequest {
+                identifiers: bond.identifiers.clone(),
+                as_of_ns: NOW,
+                stated_asset_class: AssetClass::Debt as i32,
+                ..Default::default()
+            },
+            PlatformSaid::Record(Box::new(bond)),
+        );
+        let held = store.by_id("INS-01JBOND").unwrap().unwrap();
+        let offer = |fields: &[(&str, &str)]| OfferTemplateFieldsRequest {
+            instrument_id: "INS-01JBOND".into(),
+            template_id: "TPL-bond".into(),
+            template_version: "1".into(),
+            fields: fields
+                .iter()
+                .map(|(path, value)| TemplateFieldValue {
+                    path: (*path).into(),
+                    value: (*value).into(),
+                    provenance: Some(Provenance {
+                        kind: ProvenanceKind::Reported as i32,
+                        source: "terrapin".into(),
+                        field: (*path).into(),
+                        ..Default::default()
+                    }),
+                })
+                .collect(),
+        };
+        let offered = |fields: &[(&str, &str)], at: i64| {
+            offer_template_fields(&store, &offer(fields), "terrapin-1", at).unwrap()
+        };
+        let terms_offered = |record: &Instrument| -> Vec<(String, String)> {
+            record
+                .offers
+                .iter()
+                .filter(|offer| offer.field == Field::Term)
+                .map(|offer| (offer.path.clone(), offer.value.clone()))
+                .collect()
+        };
+
+        // A bond's terms and its calls, each row by its index.
+        let kept = offered(
+            &[
+                ("coupon_rate", "4.875"),
+                ("day_count", "DAY_COUNT_THIRTY_360_BOND_BASIS"),
+                ("calls[0].kind", "REDEMPTION_KIND_MAKE_WHOLE"),
+                ("calls[0].make_whole_spread_bps", "20"),
+                ("calls[1].kind", "REDEMPTION_KIND_PAR"),
+                ("calls[1].from_date", "2035-11-05"),
+                ("calls[1].price", "100"),
+                ("municipal.federal_tax_status", "FEDERAL_TAX_STATUS_TAXABLE"),
+                ("rule_144a", "false"),
+            ],
+            NOW + 1,
+        )
+        .unwrap();
+        assert_eq!(kept.version, held.version + 1);
+        // The day count and the flag say what the terms in force say: no
+        // offer.
+        assert_eq!(
+            terms_offered(&kept),
+            vec![
+                ("coupon_rate".to_string(), "4.875".to_string()),
+                ("calls[0].kind".into(), "REDEMPTION_KIND_MAKE_WHOLE".into()),
+                ("calls[0].make_whole_spread_bps".into(), "20".into()),
+                ("calls[1].kind".into(), "REDEMPTION_KIND_PAR".into()),
+                ("calls[1].from_date".into(), "2035-11-05".into()),
+                ("calls[1].price".into(), "100".into()),
+                (
+                    "municipal.federal_tax_status".into(),
+                    "FEDERAL_TAX_STATUS_TAXABLE".into()
+                ),
+            ]
+        );
+        let coupon = kept
+            .offers
+            .iter()
+            .find(|offer| offer.path == "coupon_rate")
+            .unwrap();
+        assert_eq!(coupon.source, "offered by terrapin-1 from terrapin");
+        assert_eq!(coupon.instance_id, "terrapin-1");
+        let provenance: Provenance = prost::Message::decode(&coupon.provenance[..]).unwrap();
+        assert_eq!(provenance.field, "coupon_rate");
+        // Never in force: the terms are the platform's as they were, and no
+        // wire member names a term until the contract gives one.
+        assert_eq!(kept.listed_terms, held.listed_terms);
+        assert_eq!(
+            crate::record::to_wire(&kept).offers.len(),
+            crate::record::to_wire(&held).offers.len()
+        );
+        assert_eq!(store.by_id("INS-01JBOND").unwrap().unwrap(), kept);
+
+        // The same offer again changes nothing.
+        let again = offered(&[("coupon_rate", "4.875")], NOW + 2).unwrap();
+        assert_eq!(again.version, kept.version);
+        // The calls offered again as one row: the second row is dropped, the
+        // group as the source states it now; the coupon offer stays.
+        let fewer = offered(
+            &[
+                ("calls[0].kind", "REDEMPTION_KIND_PAR"),
+                ("calls[0].from_date", "2035-11-05"),
+            ],
+            NOW + 3,
+        )
+        .unwrap();
+        assert_eq!(fewer.version, kept.version + 1);
+        assert_eq!(
+            terms_offered(&fewer),
+            vec![
+                ("coupon_rate".to_string(), "4.875".to_string()),
+                (
+                    "municipal.federal_tax_status".into(),
+                    "FEDERAL_TAX_STATUS_TAXABLE".into()
+                ),
+                ("calls[0].kind".into(), "REDEMPTION_KIND_PAR".into()),
+                ("calls[0].from_date".into(), "2035-11-05".into()),
+            ]
+        );
+
+        // Refused, naming the field: a path the template lacks, a group's
+        // row without its index, a field the terms do not carry, a value
+        // not of its type.
+        for (path, value, named, words) in [
+            ("colour", "red", "fields[0].path", "has no field colour"),
+            (
+                "calls.kind",
+                "REDEMPTION_KIND_PAR",
+                "fields[0].path",
+                "by its index",
+            ),
+            ("coupon_rate[0]", "4", "fields[0].path", "does not repeat"),
+            ("calls[0].colour", "red", "fields[0].path", "no colour"),
+            ("coupon_rate", "four", "fields[0].value", "no decimal"),
+            (
+                "calls[0].kind",
+                "REDEMPTION_KIND_SOMETIMES",
+                "fields[0].value",
+                "does not define",
+            ),
+            (
+                "maturity_date",
+                "2036-02-30",
+                "fields[0].value",
+                "a plain date",
+            ),
+            ("rule_144a", "maybe", "fields[0].value", "true or false"),
+        ] {
+            let (refused, why) = offered(&[(path, value)], NOW + 4).unwrap_err();
+            assert_eq!(refused, named, "{path}: {why}");
+            assert!(why.contains(words), "{path}: {why}");
+        }
+        assert_eq!(
+            store.by_id("INS-01JBOND").unwrap().unwrap().version,
+            fewer.version
+        );
     }
 
     #[test]

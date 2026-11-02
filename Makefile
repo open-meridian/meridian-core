@@ -128,15 +128,15 @@ stage-compile:    gate-begin-compile build test
 	@$(GATE) end compile
 stage-tests:      gate-begin-tests gate-mark-tests test-store test-broker test-directory
 	@$(GATE) release tests
-	@$(GATE) end tests --drop compose:tests
+	@$(GATE) end tests --drop $(GATE_DROP_tests)
 stage-settings-page: gate-begin-settings-page e2e-settings-page
-	@$(GATE) end settings-page --drop $(SETTINGS_PAGE_IMAGE) $(SETTINGS_BROWSER_IMAGE)
+	@$(GATE) end settings-page --drop $(GATE_DROP_settings-page)
 stage-sdk:        gate-begin-sdk check-reference-cases interop e2e-book
 	@$(GATE) end sdk
 stage-dashboards: gate-begin-dashboards e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page
 	@$(GATE) end dashboards
 stage-harness:    gate-begin-harness e2e-harness
-	@$(GATE) end harness --drop meridian-python-interop $(HARNESS_IMAGE)
+	@$(GATE) end harness --drop $(GATE_DROP_harness)
 
 # The plugin harness's suites (ruling 556). Each builds the images it needs
 # and runs in its own compose project, writing .harness afresh, so none needs
@@ -163,8 +163,18 @@ gate-start:
 		--budgets "$(GATE_BUDGETS)" --cache-days $(GATE_CACHE_DAYS) \
 		--images "$(RUNTIME_IMAGE) $(HARNESS_IMAGE) meridian-python-interop $(SETTINGS_PAGE_IMAGE) $(SETTINGS_BROWSER_IMAGE)"
 
+# What a stage frees as it ends, by stage, named once: its `end` drops them;
+# and where it never ends -- a target in it failed under `make -k`, as CI's
+# ci-local runs (ruling 1065), so every failing stage is reported in one run
+# -- the next stage's `begin` releases the containers it marked and drops
+# these, so the stages after it start clean and inside their budgets. The
+# local gate and the pre-push hook stay fail-fast.
+GATE_DROP_tests = compose:tests
+GATE_DROP_settings-page = $(SETTINGS_PAGE_IMAGE) $(SETTINGS_BROWSER_IMAGE)
+GATE_DROP_harness = meridian-python-interop $(HARNESS_IMAGE)
+
 gate-begin-%:
-	@$(GATE) begin $*
+	@$(GATE) begin $* --drop $(GATE_DROP_$*)
 
 # The tests stage runs the test binaries (compose's `tests`, 1.6 GB of debug
 # test binaries in a fresh run, 2.5 before the runtime's integration tests

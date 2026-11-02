@@ -1265,7 +1265,11 @@ pub fn completion(filled: &Filled) -> Result<CompleteInstrumentsRequest, String>
 
 /// "Accept offered values" for the records chosen: for each, every field the
 /// book or the list lacks that something offers, the first offer for it, with
-/// that offer's source (W3.10, the spec's requirement 8). One command.
+/// that offer's source (W3.10, the spec's requirement 8); and its type within
+/// its class where none is in force, the first offer of one under the class
+/// in force or the one accepted with it (contract v11): a pool's class
+/// accepted with its type, never its class alone (found by the agencies'
+/// plugins, v29). One command.
 pub fn accepting(listed: &[InstrumentToComplete], chosen: &[String]) -> CompleteInstrumentsRequest {
     let mut completions = Vec::new();
     for item in listed {
@@ -1282,6 +1286,31 @@ pub fn accepting(listed: &[InstrumentToComplete], chosen: &[String]) -> Complete
                 .iter()
                 .filter_map(|offered| offered.value.as_ref())
                 .find(|value| field_of(value) == *lacking)
+            {
+                values.push(offer.clone());
+            }
+        }
+        if record.instrument_type == InstrumentType::Unspecified as i32 {
+            let class = values
+                .iter()
+                .find_map(|value| match value.value {
+                    Some(instrument_value::Value::AssetClass(class)) => Some(class),
+                    _ => None,
+                })
+                .unwrap_or(record.asset_class);
+            if let Some(offer) = record
+                .offers
+                .iter()
+                .filter_map(|offered| offered.value.as_ref())
+                .find(|value| match value.value {
+                    Some(instrument_value::Value::InstrumentType(kind)) => {
+                        InstrumentType::try_from(kind)
+                            .ok()
+                            .and_then(instrument_type::class_of)
+                            .is_some_and(|under| under as i32 == class)
+                    }
+                    _ => false,
+                })
             {
                 values.push(offer.clone());
             }
@@ -2954,6 +2983,59 @@ mod tests {
         assert_eq!(values[0].source, "stated by custody-snaptrade-1");
         assert_eq!(request.completions[0].against_version, 2);
         assert!(accepting(&[waiting()], &[]).completions.is_empty());
+    }
+
+    #[test]
+    fn accepting_offers_takes_the_offered_type_with_the_class_it_is_under() {
+        // A provisional pool its source stated as debt, an MBS pool: its
+        // type accepted with its class, never left offered (v29's agencies'
+        // plugins found the class alone accepted).
+        let offered = |value: instrument_value::Value| OfferedValue {
+            value: Some(InstrumentValue {
+                value: Some(value),
+                source: "stated by ginnie-mae-1".into(),
+            }),
+            instance_id: "ginnie-mae-1".into(),
+            offered_at_ns: 1,
+        };
+        let mut pool = waiting();
+        if let Some(record) = pool.instrument.as_mut() {
+            record.offers = vec![
+                offered(instrument_value::Value::InstrumentType(
+                    InstrumentType::MbsPool as i32,
+                )),
+                offered(instrument_value::Value::AssetClass(AssetClass::Debt as i32)),
+            ];
+        }
+        let request = accepting(&[pool.clone()], &["LCL-1".into()]);
+        let values = &request.completions[0].values;
+        assert_eq!(
+            values.iter().map(|v| v.value.clone()).collect::<Vec<_>>(),
+            vec![
+                Some(instrument_value::Value::AssetClass(AssetClass::Debt as i32)),
+                Some(instrument_value::Value::InstrumentType(
+                    InstrumentType::MbsPool as i32
+                )),
+            ]
+        );
+        assert!(values.iter().all(|v| v.source == "stated by ginnie-mae-1"));
+        // A type under another class than the one accepted or in force is
+        // never taken; one already in force is never offered over.
+        if let Some(record) = pool.instrument.as_mut() {
+            record.offers[0] = offered(instrument_value::Value::InstrumentType(
+                InstrumentType::MoneyMarketFund as i32,
+            ));
+        }
+        let request = accepting(&[pool.clone()], &["LCL-1".into()]);
+        assert_eq!(request.completions[0].values.len(), 1);
+        if let Some(record) = pool.instrument.as_mut() {
+            record.offers[0] = offered(instrument_value::Value::InstrumentType(
+                InstrumentType::Bond as i32,
+            ));
+            record.instrument_type = InstrumentType::MbsPool as i32;
+        }
+        let request = accepting(&[pool], &["LCL-1".into()]);
+        assert_eq!(request.completions[0].values.len(), 1);
     }
 
     #[test]

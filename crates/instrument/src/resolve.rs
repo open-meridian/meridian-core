@@ -805,6 +805,7 @@ pub(crate) fn stated(
         offered_at_ns: now_ns,
         valid_until_ns: 0,
         provenance: Vec::new(),
+        path: String::new(),
     };
     let mut offers = Vec::new();
     if let Ok(class) = AssetClass::try_from(request.stated_asset_class) {
@@ -886,17 +887,26 @@ pub(crate) fn keep_offers(record: &mut Instrument, offers: Vec<Offer>) -> bool {
                 .identifier
                 .as_ref()
                 .is_some_and(|identifier| record.holds(identifier) == (offer.valid_until_ns == 0)),
+            // A term offered (W3.23) is in force where the record's terms
+            // say the same at its path.
+            Field::Term => meridian_domain::instrument_type::read(&record.instrument_type)
+                .and_then(|kind| {
+                    meridian_domain::debt::term_at(kind, &record.listed_terms, &offer.path)
+                })
+                .is_some_and(|held| held == offer.value),
             field => record.value(field) == offer.value,
         };
         if in_force || record.offers.iter().any(|held| held.same_as(&offer)) {
             continue;
         }
         if offer.field != Field::Identifier {
-            // A plugin's later offer for a field replaces its earlier one,
+            // A plugin's later offer for a field -- a term's at its path --
+            // replaces its earlier one,
             // however it said the value came (contract v23); the platform's
             // offers, under no instance, are told apart by their words.
             record.offers.retain(|held| {
                 !(held.field == offer.field
+                    && held.path == offer.path
                     && held.instance_id == offer.instance_id
                     && (!offer.instance_id.is_empty() || held.source == offer.source))
             });

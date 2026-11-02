@@ -187,6 +187,7 @@ fn offer_bounds(
         offered_at_ns: now_ns,
         valid_until_ns: 0,
         provenance: Vec::new(),
+        path: String::new(),
     };
     let expected = record.version;
     if !crate::resolve::keep_offers(&mut record, vec![offer]) {
