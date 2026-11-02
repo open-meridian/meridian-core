@@ -16,12 +16,21 @@ Usage:
   footprint.py render < rendered.yaml          the default profile's figures, as YAML
   footprint.py check --baseline B < rendered.yaml   the rendered chart held to B's limits
   footprint.py measured --baseline B --peak-mib N --disk-mib N   a run's figures held to B's
+  footprint.py measured --baseline B --disk-mib N --peak-mib N --peak-to F
+                                               the same, the peak written to F for `judge`
+  footprint.py judge --baseline B F...         the median of the cluster jobs' peaks held to B's
   footprint.py --self-test
+
+Peak memory is judged by the median of the cluster jobs' peaks, never by one
+job's (step 3b, decided under A): one runner's peak moves by about 10 MiB run
+to run, and on core#81 one job peaked at 185 MiB beside four at 168 to 171.
+`judge` prints every job's peak and the highest, and holds the median.
 Exit: 0 within the limits, 1 past one, 2 unreadable input.
 """
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 
@@ -142,6 +151,20 @@ def held_to(baseline: dict, figures: dict) -> list[str]:
     return problems
 
 
+def median(values: list[float]) -> float:
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def judge(baseline: dict, peaks: dict[str, float]) -> tuple[float, list[str]]:
+    """The median of the jobs' peaks, and what is past the baseline."""
+    held = median(list(peaks.values()))
+    return held, held_to(baseline, {"memory_peak_mib": held})
+
+
 def self_test() -> None:
     chart = """
 apiVersion: apps/v1
@@ -184,6 +207,12 @@ metadata:
     assert held_to(base, {"disk_mib": 11.0}) == []
     assert held_to(base, {"disk_mib": 11.1})
     assert quantity_mib("1Gi") == 1024 and quantity_millicores("0.5") == 500
+    # core#81: one job at 185 beside four at 168 to 171 is judged by 170.
+    held, past = judge({"memory_peak_mib": 162}, {"a": 185, "b": 170, "c": 171, "d": 168, "e": 170})
+    assert held == 170 and past == [], (held, past)
+    held, past = judge({"memory_peak_mib": 162}, {"a": 190, "b": 188, "c": 160})
+    assert held == 188 and past, (held, past)
+    assert median([1, 2, 3, 4]) == 2.5
 
 
 def main() -> int:
@@ -192,6 +221,8 @@ def main() -> int:
     parser.add_argument("--baseline")
     parser.add_argument("--peak-mib", type=float)
     parser.add_argument("--disk-mib", type=float)
+    parser.add_argument("--peak-to")
+    parser.add_argument("peaks", nargs="*")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     if args.self_test:
@@ -207,6 +238,33 @@ def main() -> int:
             else:
                 print(f"  {key}: {value:g}")
         return 0
+    if args.command == "judge":
+        if not args.baseline or not args.peaks:
+            print("footprint: judge needs --baseline and each job's peak file", file=sys.stderr)
+            return 2
+        baseline = read_baseline(args.baseline)
+        peaks = {}
+        for path in args.peaks:
+            for line in open(path, encoding="utf-8"):
+                job, _, peak = line.strip().rpartition(" ")
+                if job and peak:
+                    peaks[job] = float(peak)
+        if not peaks:
+            print("footprint: no job's peak was read", file=sys.stderr)
+            return 2
+        held, problems = judge(baseline, peaks)
+        for job, peak in sorted(peaks.items()):
+            print(f"  {job}: peak {peak:g} MiB")
+        print(f"  the highest {max(peaks.values()):g} MiB; the median {held:g} MiB, "
+              f"held to {baseline.get('memory_peak_mib', 0) * (1 + LIMITS['memory_peak_mib']):g} "
+              f"(15% over v29's {baseline.get('memory_peak_mib', 0):g})")
+        if problems:
+            print("footprint FAILED: the cluster jobs' median peak is past v29's baseline (ruling 1058):", file=sys.stderr)
+            for problem in problems:
+                print(f"  {problem}", file=sys.stderr)
+            return 1
+        print(f"footprint OK: the median of {len(peaks)} jobs' peaks is within v29's baseline")
+        return 0
     if args.command in ("check", "measured"):
         if not args.baseline:
             print("footprint: --baseline is needed", file=sys.stderr)
@@ -216,7 +274,13 @@ def main() -> int:
             figures = render(sys.stdin.read())
         else:
             figures = {}
-            if args.peak_mib is not None:
+            if args.peak_mib is not None and args.peak_to:
+                # One job's peak is written for `judge`, never held alone.
+                job = os.environ.get("E2E_FOOTPRINT_JOB") or os.path.basename(args.peak_to)
+                with open(args.peak_to, "w", encoding="utf-8") as out:
+                    out.write(f"{job} {args.peak_mib:g}\n")
+                print(f"footprint: this job's peak {args.peak_mib:g} MiB, judged with the others' by their median")
+            elif args.peak_mib is not None:
                 figures["memory_peak_mib"] = args.peak_mib
             if args.disk_mib is not None:
                 figures["disk_mib"] = args.disk_mib

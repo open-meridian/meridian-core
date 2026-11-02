@@ -400,7 +400,21 @@ jobs:
           DOCKER_BUILDKIT: "1"
           TARGET: ${{ matrix.target }}
           K3S: ${{ matrix.k3s }}
+          # The desktop footprint's peak, this job's, for footprint-judge.
+          E2E_FOOTPRINT_PEAK: .e2e-footprint-peak.txt
+          E2E_FOOTPRINT_JOB: ${{ matrix.target }}${{ matrix.k3s && format(' k3s {0}', matrix.k3s) || '' }}
         run: make e2e-cluster-k3d E2E_CLUSTER_TARGET="$TARGET" ${K3S:+E2E_K3S_IMAGE="rancher/k3s:$K3S"}
+
+      - name: Keep this job's footprint peak
+        if: matrix.target == 'e2e-cluster' && !cancelled()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: footprint-peak${{ matrix.k3s && format('-{0}', matrix.k3s) || '' }}
+          path: workspace/meridian-core/.e2e-footprint-peak.txt
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 14
 
       # What failed, in the job's own log, before anything else is tried:
       # the artifact service timed out creating the upload below (2026-10-06,
@@ -435,3 +449,26 @@ jobs:
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 14
+
+  # The desktop footprint's peak memory (ruling 1058), judged by the median
+  # of the e2e-cluster jobs' peaks and never by one job's (step 3b, decided
+  # under A): one runner's peak moves by about 10 MiB run to run, and on
+  # core#81 one job peaked at 185 MiB beside four at 168 to 171. Each job
+  # keeps its peak; this holds their median to v29's baseline, printing
+  # every job's and the highest.
+  footprint-judge:
+    needs: e2e-cluster-k3d
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: workspace/meridian-core
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: footprint-peak*
+          path: workspace/meridian-core/.footprint-peaks
+      - name: make footprint-judge
+        working-directory: workspace/meridian-core
+        run: make footprint-judge FOOTPRINT_PEAKS="$(find .footprint-peaks -name '*.txt' | sort | tr '\n' ' ')"

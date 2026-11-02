@@ -824,6 +824,16 @@ e2e-cluster-backup:
 	  rm -rf "$(CURDIR)"/meridian-backup-e2e-*; \
 	  exit $$held
 
+# The desktop footprint's peak, judged by the median of the cluster jobs'
+# peaks (step 3b, decided under A): each e2e-cluster job writes its own
+# (E2E_FOOTPRINT_PEAK), and this holds their median to v29's baseline,
+# printing every job's and the highest. CI's footprint-judge job runs it on
+# every job's file; locally, on whatever runs were kept.
+FOOTPRINT_PEAKS ?= $(wildcard .e2e-footprint-peak*.txt)
+footprint-judge:
+	@test -n "$(FOOTPRINT_PEAKS)" || { echo "footprint-judge: no job's peak to judge; set FOOTPRINT_PEAKS=<files>" >&2; exit 1; }
+	@$(PY) tools/footprint.py judge --baseline deploy/footprint-baseline.yaml $(FOOTPRINT_PEAKS)
+
 HELM := docker run --rm -v "$(CURDIR)":/w -w /w alpine/helm:3.16.2
 # The chart declares the Kubernetes it runs on (Chart.yaml's kubeVersion,
 # ruling 849: 1.35 and newer), and `helm template` holds a chart to a version

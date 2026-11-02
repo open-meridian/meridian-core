@@ -1315,7 +1315,11 @@ def footprint(s):
     command = [sys.executable, "tools/footprint.py", "measured",
                "--baseline", "deploy/footprint-baseline.yaml"]
     if peak is not None:
-        command += ["--peak-mib", f"{peak:.1f}"]
+        # Judged by the median of the cluster jobs' peaks, never one job's
+        # (step 3b, decided under A): written where CI's footprint-judge
+        # job reads every job's.
+        command += ["--peak-mib", f"{peak:.1f}",
+                    "--peak-to", os.environ.get("E2E_FOOTPRINT_PEAK", ".e2e-footprint-peak.txt")]
     if disk is not None:
         command += ["--disk-mib", f"{disk:.1f}"]
     done = subprocess.run(command, capture_output=True, text=True)
