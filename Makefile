@@ -912,10 +912,10 @@ IMAGE_OF_backup-cli-image = $(E2E_BACKUP_CLI_IMAGE)
 
 # What the images stage builds: the release build's images and the SDK's.
 # And the compile stage: the debug build's, every test binary and the
-# settings pages' server. The cluster runs' own two, which ci-local never
-# runs, CI builds beside them: analytics-image after the images stage, from
-# its build, and backup-cli-image after the compile stage.
-runtime-images: runtime-image harness-image interop-image version-check-image
+# settings pages' server. The analytics image is the runtime's build's, so
+# built in the same stage, before the gate frees that build; only the
+# cluster runs start it. backup-cli-image, the CLI's, CI builds apart.
+runtime-images: runtime-image analytics-image harness-image interop-image version-check-image
 test-images: tests-image settings-binary-image
 images: runtime-images test-images
 

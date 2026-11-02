@@ -214,14 +214,6 @@ jobs:
           STAGE: ${{ matrix.stage }}
         run: make -k ci-stage STAGE="$STAGE"
 
-      # The analytics image, which only the cluster runs start: the same
-      # build stage, nothing compiled again.
-      - name: make analytics-image
-        working-directory: workspace/meridian-core
-        env:
-          DOCKER_BUILDKIT: "1"
-        run: make analytics-image
-
       - name: make backup-cli-image
         if: steps.cli-image.outputs.cache-hit != 'true'
         working-directory: workspace/meridian-core
