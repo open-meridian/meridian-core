@@ -43,7 +43,8 @@ PROJECT = "meridian-core-tickets"
 PEOPLE = "ada=Ada Park,ben=Ben Ito"
 LOG = ".e2e-tickets.log"
 COMPOSE = ["docker", "compose", "-p", PROJECT, "-f", ".harness/compose.yaml",
-           "-f", ".harness/plugins.yaml", "-f", "e2e/harness/stand-in.yaml"]
+           "-f", ".harness/plugins.yaml", "-f", "e2e/harness/stand-in.yaml",
+           "-f", "e2e/postgres-for-tests.yaml"]
 ENV = dict(os.environ, MERIDIAN_HARNESS_PEOPLE=PEOPLE,
            MERIDIAN_HARNESS_STAND_IN=os.path.abspath("e2e/plugin-page"))
 WITHHELD = "withheld until a person releases it on the ticket's page"

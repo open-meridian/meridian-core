@@ -1,0 +1,15 @@
+# The test database, fast (ruling 1069, 447): its data on tmpfs and never
+# synced -- fsync, synchronous_commit and full_page_writes off -- for the
+# suites that start a database, use it and throw it away. Laid over core's
+# docker-compose.yaml by the gate's test targets and over the plugin
+# harness's compose by core's harness suites (the shipped harness is
+# unchanged: a plugin's own e2e keeps Postgres as it comes).
+#
+# Never for a test of durability, a backup, a restore or a failover: those
+# keep real storage, synced, by not naming this file. e2e-dashboard-accounts
+# restarts its database and holds the sign-in that outlives it, so it is one.
+services:
+  postgres:
+    command: [postgres, -c, fsync=off, -c, synchronous_commit=off, -c, full_page_writes=off]
+    tmpfs:
+      - /var/lib/postgresql/data

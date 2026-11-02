@@ -3,6 +3,10 @@ PY     := python3
 
 RUST_VERSION := 1.90
 COMPOSE := docker compose
+# The gate's suites that start a database, use it and throw it away start it
+# fast, on tmpfs and never synced (e2e/postgres-for-tests.yaml, ruling 1069,
+# 447); a suite proving the database outlives a restart keeps COMPOSE.
+COMPOSE_TEST := $(COMPOSE) -f docker-compose.yaml -f e2e/postgres-for-tests.yaml
 DOCKER := DOCKER_BUILDKIT=1 docker
 
 .PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check licence-check-test gate-start check-leftovers check-leftovers-end \
@@ -372,7 +376,7 @@ test: tests-image
 # in-process substitute is exactly what must not exist: a store that behaves
 # differently in development is a store nobody has tested.
 test-store: network tests-image
-	@$(COMPOSE) run --rm -T tests \
+	@$(COMPOSE_TEST) run --rm -T tests \
 		run-tests -p meridian-instrument --test postgres -p meridian-street --test postgres \
 			-p meridian-bor --test postgres -p meridian-lake --test postgres \
 			-p meridian-config --test postgres -p meridian-dashboard --test postgres \
@@ -382,7 +386,7 @@ test-store: network tests-image
 	@# The runtime's two modules of its one integration-test binary that want
 	@# Postgres, on their own: a filter after -- applies to every binary a run
 	@# selects, and would select none of the postgres suites' tests above.
-	@$(COMPOSE) run --rm -T tests \
+	@$(COMPOSE_TEST) run --rm -T tests \
 		run-tests -p meridian-runtime --test it -- grants:: waiting:: preflight:: \
 		>>.test-store.log 2>&1 \
 		|| { echo "test-store FAILED. The last 40 lines, and the whole of it in .test-store.log:" >&2; \
@@ -417,7 +421,7 @@ bench: network
 
 # First run, without a cluster: the wizard, the Job, and stand-ins for the two
 # things a deployment talks to while it is being set up.
-E2E_FIRST_RUN = $(COMPOSE) --profile first-run
+E2E_FIRST_RUN = $(COMPOSE_TEST) --profile first-run
 
 # The wizard's two database routes, each proven end to end. `external` points
 # at a database somebody already runs; `brought` starts one and makes
@@ -1024,15 +1028,15 @@ check-nats-permissions: runtime-image
 test-broker: network runtime-image tests-image
 	@$(BROKER_CONFIG) --instances /w/deploy/nats/dev-instances.json \
 		--dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf
-	@$(COMPOSE) up -d nats >/dev/null
+	@$(COMPOSE_TEST) up -d nats >/dev/null
 	@# Restarted rather than left running: a broker holds its permissions from
 	@# start, so a config generated a moment ago is not in force until it does.
 	@# Skipping this meant a permissions change that had not applied, which is a
 	@# gate passing on the wrong configuration.
-	@$(COMPOSE) restart nats >/dev/null
-	@$(COMPOSE) exec -T nats sh -c 'for i in $$(seq 1 30); do nc -z localhost 4222 && exit 0; sleep 0.5; done; exit 1' \
+	@$(COMPOSE_TEST) restart nats >/dev/null
+	@$(COMPOSE_TEST) exec -T nats sh -c 'for i in $$(seq 1 30); do nc -z localhost 4222 && exit 0; sleep 0.5; done; exit 1' \
 		|| { echo "test-broker FAILED: the broker did not come back" >&2; exit 1; }
-	@$(COMPOSE) run --rm -T tests \
+	@$(COMPOSE_TEST) run --rm -T tests \
 		run-tests -p meridian-bus --test nats \
 		>.test-broker.log 2>&1 \
 		|| { echo "test-broker FAILED. The last 40 lines, and the whole of it in .test-broker.log:" >&2; \
@@ -1058,7 +1062,7 @@ E2E_LDAP := MERIDIAN_DEPLOYMENT_ID=DEP-e2e MERIDIAN_PLATFORM_ADDRESS=http://fake
 	MERIDIAN_LDAP_BIND_DN=cn=admin,dc=example,dc=org \
 	MERIDIAN_LDAP_BIND_PASSWORD=ldap-admin-dev-only \
 	E2E_CLAIM_CODE=E2E-7KQ2-MX4P \
-	$(COMPOSE) --profile e2e
+	$(COMPOSE_TEST) --profile e2e
 LDAP_DIR = -x -H ldap://localhost:1389 -D cn=admin,dc=example,dc=org -w ldap-admin-dev-only
 
 # The directory image configures its admin against a slapd it has just
@@ -1106,7 +1110,7 @@ E2E_OIDC := MERIDIAN_DEPLOYMENT_ID=DEP-e2e MERIDIAN_PLATFORM_ADDRESS=http://fake
 	MERIDIAN_OIDC_CLIENT_ID=meridian-dashboard \
 	MERIDIAN_OIDC_CLIENT_SECRET=idp-dev-only-secret \
 	E2E_CLAIM_CODE=E2E-7KQ2-MX4P \
-	$(COMPOSE) --profile e2e
+	$(COMPOSE_TEST) --profile e2e
 
 e2e-dashboard-oidc: network runtime-image
 	@$(BROKER_CONFIG) --instances /w/deploy/nats/dev-instances.json \
@@ -1350,7 +1354,7 @@ HARNESS_SECRET := sk-test-harness-not-a-real-key
 HARNESS := MERIDIAN_RUNTIME_IMAGE=$(RUNTIME_IMAGE) \
 	MERIDIAN_HARNESS_STAND_IN="$(CURDIR)/e2e/plugin-page" \
 	$(COMPOSE) -p meridian-core-harness -f .harness/compose.yaml -f .harness/plugins.yaml -f e2e/harness/stand-in.yaml \
-	-f e2e/harness/declared.yaml
+	-f e2e/harness/declared.yaml -f e2e/postgres-for-tests.yaml
 HARNESS_RUN := $(HARNESS) run --rm -T runner
 HARNESS_STORE := $(HARNESS) run --rm -T store
 
@@ -1665,18 +1669,18 @@ test-directory: network tests-image
 	@# container whose first start was interrupted before it set the admin
 	@# password came back "Using persisted data", refused every bind, and
 	@# failed this as "the directory did not come up".
-	@$(COMPOSE) --profile e2e up -d --force-recreate --renew-anon-volumes ldap >/dev/null
+	@$(COMPOSE_TEST) --profile e2e up -d --force-recreate --renew-anon-volumes ldap >/dev/null
 	@# After its own setup server has stopped and the real one started: the
 	@# port answers during setup too, and the overlay loaded then is lost.
-	@for i in $$(seq 1 60); do $(COMPOSE) logs ldap 2>&1 | grep -q "slapd starting" && exit 0; sleep 1; done; exit 1
-	@$(COMPOSE) exec -T ldap sh -c 'for i in $$(seq 1 60); do ldapsearch $(LDAP_DIR) -b "" -s base >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1' \
+	@for i in $$(seq 1 60); do $(COMPOSE_TEST) logs ldap 2>&1 | grep -q "slapd starting" && exit 0; sleep 1; done; exit 1
+	@$(COMPOSE_TEST) exec -T ldap sh -c 'for i in $$(seq 1 60); do ldapsearch $(LDAP_DIR) -b "" -s base >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1' \
 		|| { echo "test-directory FAILED: the directory did not come up" >&2; exit 1; }
 	@# memberOf is an overlay, not a stored attribute. Without it every person
 	@# signs in holding no groups, which is a deployment where nobody can do
 	@# anything and nothing says why.
-	@$(COMPOSE) exec -T ldap ldapmodify -Q -Y EXTERNAL -H ldapi:/// \
+	@$(COMPOSE_TEST) exec -T ldap ldapmodify -Q -Y EXTERNAL -H ldapi:/// \
 		<e2e/dashboard/ldap/01-memberof.ldif >>.test-directory.log 2>&1 || true
-	@$(COMPOSE) exec -T ldap ldapadd $(LDAP_DIR) \
+	@$(COMPOSE_TEST) exec -T ldap ldapadd $(LDAP_DIR) \
 		<e2e/dashboard/ldap/02-tree.ldif >>.test-directory.log 2>&1 || true
 	@# And the same over ldaps://, with a certificate signed by a CA made now
 	@# and trusted by nothing: an encrypted connection is made and verified.
@@ -1687,10 +1691,10 @@ test-directory: network tests-image
 		printf "subjectAltName=DNS:ldap-tls\n" > ext.cnf && \
 		openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 1 -extfile ext.cnf -out server.crt && \
 		chmod 644 server.key' >>.test-directory.log 2>&1
-	@$(COMPOSE) --profile e2e up -d --force-recreate --renew-anon-volumes ldap-tls >/dev/null
-	@for i in $$(seq 1 60); do $(COMPOSE) logs ldap-tls 2>&1 | grep -q "slapd starting" && exit 0; sleep 1; done; \
+	@$(COMPOSE_TEST) --profile e2e up -d --force-recreate --renew-anon-volumes ldap-tls >/dev/null
+	@for i in $$(seq 1 60); do $(COMPOSE_TEST) logs ldap-tls 2>&1 | grep -q "slapd starting" && exit 0; sleep 1; done; \
 		echo "test-directory FAILED: the ldaps:// directory did not come up" >&2; exit 1
-	@$(COMPOSE) run --rm -T tests \
+	@$(COMPOSE_TEST) run --rm -T tests \
 		run-tests -p meridian-dashboard --test directory \
 		>.test-directory.log 2>&1 \
 		|| { echo "test-directory FAILED. The last 40 lines, and the whole of it in .test-directory.log:" >&2; \
@@ -2465,14 +2469,14 @@ SDK ?= ../meridian-python
 interop: network interop-image runtime-image
 	@test -d "$(SDK)" \
 		|| { echo "no SDK at $(SDK); set SDK=<path to meridian-python>" >&2; exit 1; }
-	@$(COMPOSE) up -d postgres >/dev/null 2>&1
-	@$(COMPOSE) run --rm -T instrument meridian-instrument migrate
+	@$(COMPOSE_TEST) up -d postgres >/dev/null 2>&1
+	@$(COMPOSE_TEST) run --rm -T instrument meridian-instrument migrate
 	@# Every service runs the one runtime image, built (or, in CI, pulled) for
 	@# this checkout before anything here starts: never an earlier run's.
-	@{ $(COMPOSE) run --rm -T street meridian-street migrate \
-	   && $(COMPOSE) run --rm -T conductor meridian-conductor migrate; } >/dev/null 2>&1 \
+	@{ $(COMPOSE_TEST) run --rm -T street meridian-street migrate \
+	   && $(COMPOSE_TEST) run --rm -T conductor meridian-conductor migrate; } >/dev/null 2>&1 \
 		|| { echo "interop FAILED: the schema could not be applied" >&2; exit 1; }
-	@$(COMPOSE) exec -T postgres psql -U meridian -d meridian -v ON_ERROR_STOP=1 -q \
+	@$(COMPOSE_TEST) exec -T postgres psql -U meridian -d meridian -v ON_ERROR_STOP=1 -q \
 		<e2e/interop/a-linked-account.sql >/dev/null \
 		|| { echo "interop FAILED: the linked account could not be written" >&2; exit 1; }
 	@# All three components, because the surface under test is the sidecar's
@@ -2480,18 +2484,18 @@ interop: network interop-image runtime-image
 	@# split this was one process, and the test could not tell the difference.
 	@$(BROKER_CONFIG) --instances /w/deploy/nats/dev-instances.json \
 		--dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf
-	@$(COMPOSE) up -d nats >/dev/null 2>&1 && $(COMPOSE) restart nats >/dev/null 2>&1
+	@$(COMPOSE_TEST) up -d nats >/dev/null 2>&1 && $(COMPOSE_TEST) restart nats >/dev/null 2>&1
 	@# The conductor's platform the master's stand-in (contract v20): a currency
 	@# is pulled from it, never minted.
-	@MERIDIAN_DEPLOYMENT_ID=DEP-interop MERIDIAN_PLATFORM_ADDRESS=http://master:8000 $(COMPOSE) --profile interop up -d master street instrument conductor sidecar sidecar-operations sidecar-operations-unscoped >/dev/null 2>&1 \
+	@MERIDIAN_DEPLOYMENT_ID=DEP-interop MERIDIAN_PLATFORM_ADDRESS=http://master:8000 $(COMPOSE_TEST) --profile interop up -d master street instrument conductor sidecar sidecar-operations sidecar-operations-unscoped >/dev/null 2>&1 \
 		|| { echo "interop FAILED: the components did not start" >&2; exit 1; }
 	@# The master answering, and the conductor connected, before the suite
 	@# resolves a currency (contract v20): one asked before either listens is
 	@# not reached, and the resolve is a miss, nothing minted.
 	@for i in $$(seq 1 60); do \
-		MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE) --profile interop exec -T master \
+		MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE_TEST) --profile interop exec -T master \
 			wget -q -O /dev/null "http://127.0.0.1:8000/api/v1/reference/identifiers/resolve?scheme=iso4217&value=USD" 2>/dev/null \
-		&& MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE) --profile interop logs conductor 2>/dev/null | grep -q "the conductor is connected" \
+		&& MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE_TEST) --profile interop logs conductor 2>/dev/null | grep -q "the conductor is connected" \
 		&& exit 0; sleep 1; done; \
 		echo "interop FAILED: the master's stand-in or the conductor did not come up" >&2; exit 1
 	@# --no-deps: everything the suite reaches is up already, and the three
@@ -2500,14 +2504,14 @@ interop: network interop-image runtime-image
 	@# leave a Bake-built container's image label empty and recreate it on the
 	@# next convergence (docker/compose#13047) -- and the suite would join the
 	@# new namespace, where 9191 answers and 9192 and 9193 never do.
-	@MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE) run --rm --no-deps -T interop \
+	@MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE_TEST) run --rm --no-deps -T interop \
 		python -m pytest -q tests/test_interop.py >.interop.log 2>&1; \
 		status=$$?; \
-		$(COMPOSE) exec -T postgres psql -U meridian -d meridian -At -v ON_ERROR_STOP=1 \
+		$(COMPOSE_TEST) exec -T postgres psql -U meridian -d meridian -At -v ON_ERROR_STOP=1 \
 			<deploy/harness/street.sql 2>>.interop.log \
 			| awk -F'|' '$$2 == "Interop" && !($$1 == "statement" && $$3 == "interop")' \
 			>.interop.positions; \
-		MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE) --profile interop down -v >/dev/null 2>&1; \
+		MERIDIAN_DEPLOYMENT_ID=DEP-interop $(COMPOSE_TEST) --profile interop down -v >/dev/null 2>&1; \
 		if [ $$status -ne 0 ]; then \
 			echo "interop FAILED. The last 40 lines, and the whole of it in .interop.log:" >&2; \
 			tail -40 .interop.log >&2; exit 1; \
@@ -2587,39 +2591,39 @@ prompt-attacks:
 e2e-book: network interop-image runtime-image
 	@test -d "$(SDK)" \
 		|| { echo "no SDK at $(SDK); set SDK=<path to meridian-python>" >&2; exit 1; }
-	@$(COMPOSE) --profile book down -v --remove-orphans >/dev/null 2>&1 || true
-	@$(COMPOSE) up -d postgres >/dev/null 2>&1
-	@{ $(COMPOSE) run --rm -T instrument meridian-instrument migrate \
-	   && $(COMPOSE) run --rm -T street meridian-street migrate \
-	   && $(COMPOSE) run --rm -T bor meridian-bor migrate \
-	   && $(COMPOSE) run --rm -T conductor meridian-conductor migrate; } >.e2e-book.log 2>&1 \
+	@$(COMPOSE_TEST) --profile book down -v --remove-orphans >/dev/null 2>&1 || true
+	@$(COMPOSE_TEST) up -d postgres >/dev/null 2>&1
+	@{ $(COMPOSE_TEST) run --rm -T instrument meridian-instrument migrate \
+	   && $(COMPOSE_TEST) run --rm -T street meridian-street migrate \
+	   && $(COMPOSE_TEST) run --rm -T bor meridian-bor migrate \
+	   && $(COMPOSE_TEST) run --rm -T conductor meridian-conductor migrate; } >.e2e-book.log 2>&1 \
 		|| { echo "e2e-book FAILED: the schema could not be applied; see .e2e-book.log" >&2; exit 1; }
-	@$(COMPOSE) exec -T postgres psql -U meridian -d meridian -v ON_ERROR_STOP=1 -q \
+	@$(COMPOSE_TEST) exec -T postgres psql -U meridian -d meridian -v ON_ERROR_STOP=1 -q \
 		<e2e/book/accounts.sql >/dev/null \
 		|| { echo "e2e-book FAILED: the accounts and grants could not be written" >&2; exit 1; }
-	@$(COMPOSE) exec -T postgres psql -U meridian -d meridian -v ON_ERROR_STOP=1 -q \
+	@$(COMPOSE_TEST) exec -T postgres psql -U meridian -d meridian -v ON_ERROR_STOP=1 -q \
 		<e2e/book/instruments.sql >/dev/null \
 		|| { echo "e2e-book FAILED: the instrument records could not be written" >&2; exit 1; }
 	@$(BROKER_CONFIG) --instances /w/deploy/nats/dev-instances.json \
 		--dev-users /w/deploy/nats/dev-users.json --out /w/deploy/nats/dev.conf
-	@$(COMPOSE) up -d nats >/dev/null 2>&1 && $(COMPOSE) restart nats >/dev/null 2>&1
-	@MERIDIAN_DEPLOYMENT_ID=DEP-book $(COMPOSE) --profile book up -d street instrument conductor bor \
+	@$(COMPOSE_TEST) up -d nats >/dev/null 2>&1 && $(COMPOSE_TEST) restart nats >/dev/null 2>&1
+	@MERIDIAN_DEPLOYMENT_ID=DEP-book $(COMPOSE_TEST) --profile book up -d street instrument conductor bor \
 		sidecar-book sidecar-book-operations sidecar-book-reporting sidecar-book-unscoped >>.e2e-book.log 2>&1 \
 		|| { echo "e2e-book FAILED: the components did not start; see .e2e-book.log" >&2; exit 1; }
 	@# --no-deps, as interop: everything the suite reaches is up already, and a
 	@# run that converged its dependencies could recreate sidecar-book under
 	@# Compose 2.38.x and leave the suite in a namespace nothing answers in.
-	@MERIDIAN_DEPLOYMENT_ID=DEP-book $(COMPOSE) --profile book run --rm --no-deps -T book \
+	@MERIDIAN_DEPLOYMENT_ID=DEP-book $(COMPOSE_TEST) --profile book run --rm --no-deps -T book \
 		python -m pytest -q tests/test_book.py >>.e2e-book.log 2>&1; \
 		status=$$?; \
-		$(COMPOSE) exec -T postgres psql -U meridian -d meridian -At -v ON_ERROR_STOP=1 \
+		$(COMPOSE_TEST) exec -T postgres psql -U meridian -d meridian -At -v ON_ERROR_STOP=1 \
 			<deploy/harness/book.sql >.e2e-book.before 2>>.e2e-book.log; \
-		$(COMPOSE) stop bor >>.e2e-book.log 2>&1; \
-		$(COMPOSE) run --rm --no-deps -T bor meridian-bor rebuild >>.e2e-book.log 2>&1 || status=$$?; \
-		$(COMPOSE) exec -T postgres psql -U meridian -d meridian -At -v ON_ERROR_STOP=1 \
+		$(COMPOSE_TEST) stop bor >>.e2e-book.log 2>&1; \
+		$(COMPOSE_TEST) run --rm --no-deps -T bor meridian-bor rebuild >>.e2e-book.log 2>&1 || status=$$?; \
+		$(COMPOSE_TEST) exec -T postgres psql -U meridian -d meridian -At -v ON_ERROR_STOP=1 \
 			<deploy/harness/book.sql >.e2e-book.after 2>>.e2e-book.log; \
-		$(COMPOSE) --profile book logs --no-color >>.e2e-book.log 2>&1; \
-		MERIDIAN_DEPLOYMENT_ID=DEP-book $(COMPOSE) --profile book down -v >/dev/null 2>&1; \
+		$(COMPOSE_TEST) --profile book logs --no-color >>.e2e-book.log 2>&1; \
+		MERIDIAN_DEPLOYMENT_ID=DEP-book $(COMPOSE_TEST) --profile book down -v >/dev/null 2>&1; \
 		if [ $$status -ne 0 ]; then \
 			echo "e2e-book FAILED. The suite's last 60 lines, and every component's in .e2e-book.log:" >&2; \
 			grep -v '^[a-z-]*-1  |' .e2e-book.log | tail -60 >&2; exit 1; \

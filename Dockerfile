@@ -22,11 +22,14 @@ WORKDIR /ui
 RUN node tools/build.mjs
 
 FROM rust:${RUST_VERSION}-slim-bookworm AS build
+# lld: the linker on arm64 too, as Rust's own LLD is on x86_64 (ruling 1069,
+# 449; Dockerfile.rust says why).
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git ca-certificates \
+ && apt-get install -y --no-install-recommends git ca-certificates lld \
  && rm -rf /var/lib/apt/lists/*
 # No incremental state in the build cache, on the VM's one shared disk.
-ENV CARGO_INCREMENTAL=0
+ENV CARGO_INCREMENTAL=0 \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=lld"
 WORKDIR /w
 # Dockerfile.rust's wrapper for the shared target cache (tools/fresh-sources.sh).
 COPY tools/fresh-sources.sh /usr/local/bin/fresh-sources

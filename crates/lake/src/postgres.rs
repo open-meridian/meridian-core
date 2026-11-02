@@ -34,8 +34,10 @@ use crate::store::{
 type Pool = r2d2::Pool<PostgresConnectionManager<NoTls>>;
 type Connection = r2d2::PooledConnection<PostgresConnectionManager<NoTls>>;
 
-/// Names the schema lock: distinct from every other store's.
-const SCHEMA_LOCK: i64 = 0x6c61_6b65_0000_0001_u64 as i64;
+/// Names the schema lock: distinct from every other store's. `migrate`
+/// holds it, its backfills included, so whatever else takes it waits for a
+/// migrate under way to finish and keeps the next from starting.
+pub const SCHEMA_LOCK: i64 = 0x6c61_6b65_0000_0001_u64 as i64;
 
 pub struct PostgresStore {
     pool: Pool,

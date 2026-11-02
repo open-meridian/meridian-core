@@ -21,8 +21,11 @@ ARG SETTINGS_BINARY=settings-binary-image
 FROM rust:${RUST_VERSION}-slim-bookworm AS base
 # tzdata: the instrument store reads a spot-date rule's cut in its zone from
 # the host's tz database (contract v22, W3.20), and its tests do too.
+# lld: the linker on arm64 too (ruling 1069, 449). Rust links with its own
+# LLD on x86_64 Linux since 1.90; on aarch64 it still asks the C compiler,
+# whose default is bfd, and a Mac's gate runs here on aarch64.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git ca-certificates tzdata \
+ && apt-get install -y --no-install-recommends git ca-certificates tzdata lld \
  && rm -rf /var/lib/apt/lists/*
 # Smaller build caches on the VM's one disk, which the gates and the dev
 # deployment share: no incremental state, which a fresh build never reuses
@@ -30,7 +33,8 @@ RUN apt-get update \
 # stack trace stays readable at about half the artifacts' size.
 ENV CARGO_INCREMENTAL=0 \
     CARGO_PROFILE_DEV_DEBUG=line-tables-only \
-    CARGO_PROFILE_TEST_DEBUG=line-tables-only
+    CARGO_PROFILE_TEST_DEBUG=line-tables-only \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=lld"
 WORKDIR /w
 # Every cargo run against the shared target cache, wrapped: each source's time
 # set from what the cache last saw of its content, so another checkout's build
