@@ -41,7 +41,7 @@ max_payload: 1MB
 # queue group's requests, which a frozen writer never answers, while the
 # standby that took its lease serves the rest. The broker's own default
 # (two minutes, two pings) held them for four.
-ping_interval: "2s"
+ping_interval: \"2s\"
 ping_max: 2
 
 ";
