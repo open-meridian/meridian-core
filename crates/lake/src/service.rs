@@ -2787,6 +2787,12 @@ impl Lake {
             Some(whole) => whole,
             None => Arc::new(self.answer_whole(&read, &against, offset, wants, &reader)?),
         };
+        // core#67's hold is the record's (step 3b; ruling 1062's carried
+        // item 3): an answer made wholly from the hot layer -- the latest, a
+        // listing -- is not held for its next pages, each of which memory
+        // answers again at the cursor's cut-off where nothing it holds has
+        // moved since, and the record where something has.
+        let from_memory = fresh && crate::hot::noted::peek().0;
         let mut answered = read::Answered {
             rows: Vec::new(),
             not_served: whole.not_served.clone(),
@@ -2841,7 +2847,7 @@ impl Lake {
             let mut pages = self.pages.lock().expect("pages poisoned");
             if next.is_none() {
                 pages.forget(&held_as);
-            } else if fresh {
+            } else if fresh && !from_memory {
                 pages.hold(held_as, Arc::clone(&whole), std::time::Instant::now());
             }
         }

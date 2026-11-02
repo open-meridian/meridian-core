@@ -1072,6 +1072,76 @@ async fn a_read_in_pages_is_answered_once_and_held_until_its_last_page() {
     );
 }
 
+/// Step 3b (ruling 1062's carried item 3): core#67's hold is the record's.
+/// The same read answered from the hot layer is not held between pages:
+/// each page is answered again from memory at the cursor's cut-off, and the
+/// pages are still the one answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_in_pages_from_memory_is_not_held() {
+    let kept: Arc<crate::MemoryStore> = Arc::new(crate::MemoryStore::new());
+    let hot = crate::hot::HotStore::new(kept.clone(), crate::hot::Bounds::DEFAULT);
+    let h = harness_with(hot.clone());
+    let keys: Vec<String> = (0..250)
+        .map(|i| format!("AAPL  261120C{:08}", 100_000 + i * 1000))
+        .collect();
+    let rows: Vec<Observation> = keys
+        .iter()
+        .map(|key| Observation::Quote(Box::new(quote(key, "1.00", "1.10", NOW - HOUR))))
+        .collect();
+    for chunk in rows.chunks(100) {
+        record(&h, "quotes", chunk.to_vec()).unwrap();
+    }
+    let page = |cursor: &str, size: u32| {
+        tokio::task::block_in_place(|| {
+            crate::hot::noted::begin();
+            let answered = h.lake.read(
+                ReadRequest {
+                    data_type: DataType::Quote,
+                    subjects: subjects(AAPL),
+                    kinds: vec![],
+                    interval_ns: 0,
+                    sources: None,
+                    at_ns: 0,
+                    business_date: String::new(),
+                    valid_from_ns: 0,
+                    valid_until_ns: 0,
+                    as_of_ns: 0,
+                    page_size: size,
+                    cursor: cursor.into(),
+                    after: None,
+                    tenors: vec![],
+                    published_as_of_ns: 0,
+                    series_keys: vec![],
+                    all_series: true,
+                    dates: None,
+                    window: Default::default(),
+                    fields: Vec::new(),
+                },
+                &envelope("signal-1"),
+            );
+            (answered.unwrap(), crate::hot::noted::take().0)
+        })
+    };
+    let key_of = |row: &Observation| row.meta().series_key[0].value.clone();
+    // Read once from the record, which asks the layer to load the key.
+    let (whole, _) = page("", 500);
+    let whole: Vec<String> = whole.rows.iter().map(key_of).collect();
+    hot.load_wanted();
+    let (first, memory) = page("", 100);
+    assert!(memory, "answered from memory once loaded");
+    assert_eq!(h.lake.held_pages(), 0, "from memory: nothing held");
+    let (second, _) = page(&first.next_cursor, 100);
+    let (third, _) = page(&second.next_cursor, 100);
+    assert!(third.next_cursor.is_empty());
+    assert_eq!(h.lake.held_pages(), 0);
+    let paged: Vec<String> = [first.rows, second.rows, third.rows]
+        .iter()
+        .flatten()
+        .map(key_of)
+        .collect();
+    assert_eq!(paged, whole, "the pages are the one answer");
+}
+
 /// A chain's quotes read in pages of 100, as of a cut-off (0: now).
 fn quotes_page(h: &Harness, as_of_ns: i64, cursor: &str) -> service::ReadAnswer {
     h.lake

@@ -122,6 +122,17 @@ pub mod noted {
         }
     }
 
+    /// What [`take`] would answer, leaving it to be taken: whether every
+    /// row read so far came from memory.
+    pub fn peek() -> (bool, &'static str) {
+        let (memory, record, layer) = READS.with(|held| held.get());
+        if record > 0 {
+            (false, "record")
+        } else {
+            (memory > 0, layer.unwrap_or(""))
+        }
+    }
+
     pub(crate) fn memory(layer: &'static str) {
         READS.with(|held| {
             let (memory, record, _) = held.get();
