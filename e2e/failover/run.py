@@ -159,7 +159,9 @@ def holder(component):
     done = kubectl("get", "lease", f"{FULL}-{component}", "-o", "json", check=False)
     if done.returncode != 0:
         return ""
-    return json.loads(done.stdout).get("spec", {}).get("holderIdentity") or ""
+    # The holder is a process: its pod's name, then `_` and its start.
+    held = json.loads(done.stdout).get("spec", {}).get("holderIdentity") or ""
+    return held.split("_", 1)[0]
 
 
 def probe(pod_name, component):
@@ -568,7 +570,17 @@ def network_policy(s):
         for name in live), 120, every=1)
     took = time.time() - began
     s.check(healed, "network-policy: every path answers again once the policy is removed")
-    s.check(all(restarts(name) == before[name] for name in live), "network-policy: healed with no restart")
+    if PROFILE == "tolerant":
+        s.check(all(restarts(name) == before[name] for name in live), "network-policy: healed with no restart")
+    else:
+        # With a standby, a writer cut from its database may step down and the
+        # standby take over: held to one writer, the members back.
+        settled = happens(lambda: members_settled(component), 180)
+        modes = sorted((probe(p["metadata"]["name"], component) or {}).get("member", {}).get("mode", "")
+                       for p in pods(component))
+        s.check(settled and modes == ["standby", "writer"] and holder(component) in
+                {p["metadata"]["name"] for p in pods(component)},
+                f"network-policy: one writer and its standby once healed ({modes})")
     if healed:
         claim(s, "network-policy", component, took, 60)
 

@@ -135,7 +135,12 @@ impl Member {
         let lease = match var("MERIDIAN_LEASE_NAME") {
             None => None,
             Some(name) => {
-                let holder = member_name();
+                // This process, not only its pod: a writer's container
+                // restarted in the same pod is a new member, which comes back
+                // as the standby (spec section 3) rather than finding its pod's
+                // name on the lease and taking it back as its own. Pod names
+                // never hold an underscore.
+                let holder = format!("{}_{:x}", member_name(), now_ns());
                 let settings = Settings {
                     name,
                     holder,
