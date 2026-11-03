@@ -587,13 +587,13 @@ jobs:
   # `meridian doctor` move with the oldest (ruling 936). The name stays
   # `e2e-cluster-k3d (<target>)` for the six; a smoke job's names its k3s.
   e2e-cluster-k3d:
-    name: e2e-cluster-k3d (${{ matrix.target }}${{ matrix.k3s && format(', k3s {0}', matrix.k3s) || '' }})
+    name: e2e-cluster-k3d (${{ matrix.target }}${{ matrix.profile && format(', {0}', matrix.profile) || '' }}${{ matrix.k3s && format(', k3s {0}', matrix.k3s) || '' }})
     needs: [images]
     # Run even when the images failed, to fail by name rather than be
     # skipped: GitHub counts a skipped required check as passed.
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: ${{ matrix.timeout || 45 }}
     strategy:
       fail-fast: false
       matrix:
@@ -609,6 +609,18 @@ jobs:
             k3s: v1.35.9-k3s1
           - target: e2e-cluster
             k3s: v1.37.1-k3s1
+          # Step 3b (spec/a-deployment-scales-out-and-fails-over-by-
+          # configuration section 15): the HA configuration's shape on three
+          # agents in three zones, and the failure classes injected in both
+          # profiles, each recovery timed against its bound (1048, 1056).
+          - target: e2e-cluster-scaled
+            agents: 3
+          - target: e2e-cluster-failover
+            profile: tolerant
+          - target: e2e-cluster-failover
+            profile: ha
+            agents: 3
+            timeout: 70
     steps:
       - name: The images were built
         env:
@@ -689,7 +701,39 @@ jobs:
           DOCKER_BUILDKIT: "1"
           TARGET: ${{ matrix.target }}
           K3S: ${{ matrix.k3s }}
-        run: make e2e-cluster-k3d E2E_CLUSTER_TARGET="$TARGET" IMAGES=pulled ${K3S:+E2E_K3S_IMAGE="rancher/k3s:$K3S"}
+          # The desktop footprint's peak, this job's, for footprint-judge.
+          E2E_FOOTPRINT_PEAK: .e2e-footprint-peak.txt
+          E2E_FOOTPRINT_JOB: ${{ matrix.target }}${{ matrix.k3s && format(' k3s {0}', matrix.k3s) || '' }}
+          # Step 3b's runs: the profile, and the agents (in three zones).
+          PROFILE: ${{ matrix.profile || 'tolerant' }}
+          AGENTS: ${{ matrix.agents || 0 }}
+        run: |
+          zones=""
+          if [ "$AGENTS" != 0 ]; then zones="zone-a zone-b zone-c"; fi
+          make e2e-cluster-k3d E2E_CLUSTER_TARGET="$TARGET" IMAGES=pulled ${K3S:+E2E_K3S_IMAGE="rancher/k3s:$K3S"} \
+            PROFILE="$PROFILE" E2E_K3D_AGENTS="$AGENTS" E2E_K3D_ZONES="$zones"
+
+      - name: Keep the failure classes' measurements
+        if: matrix.target == 'e2e-cluster-failover' && !cancelled()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: failover-claims-${{ matrix.profile }}
+          path: workspace/meridian-core/.e2e-failover-claims.jsonl
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Keep this job's footprint peak
+        if: matrix.target == 'e2e-cluster' && !cancelled()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: footprint-peak${{ matrix.k3s && format('-{0}', matrix.k3s) || '' }}
+          path: workspace/meridian-core/.e2e-footprint-peak.txt
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 14
 
       # What failed, in the job's own log, before anything else is tried:
       # the artifact service timed out creating the upload below (2026-10-06,
@@ -716,7 +760,7 @@ jobs:
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.target }}${{ matrix.k3s && format('-{0}', matrix.k3s) || '' }}-logs
+          name: ${{ matrix.target }}${{ matrix.profile && format('-{0}', matrix.profile) || '' }}${{ matrix.k3s && format('-{0}', matrix.k3s) || '' }}-logs
           path: workspace/meridian-core/.e2e-*.log
           # The logs are dotfiles, which v4 leaves out unless told; with
           # `ignore` as well, every failure uploaded nothing and said nothing
@@ -950,3 +994,26 @@ jobs:
           set -euo pipefail
           tools/release-candidate.sh tag "$TREE" "ghcr.io/$OWNER/meridian-runtime" "$RUNTIME_AMD64" "$RUNTIME_ARM64"
           tools/release-candidate.sh tag "$TREE" "ghcr.io/$OWNER/meridian-analytics" "$ANALYTICS_AMD64" "$ANALYTICS_ARM64"
+
+  # The desktop footprint's peak memory (ruling 1058), judged by the median
+  # of the e2e-cluster jobs' peaks and never by one job's (step 3b, decided
+  # under A): one runner's peak moves by about 10 MiB run to run, and on
+  # core#81 one job peaked at 185 MiB beside four at 168 to 171. Each job
+  # keeps its peak; this holds their median to v29's baseline, printing
+  # every job's and the highest.
+  footprint-judge:
+    needs: e2e-cluster-k3d
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: workspace/meridian-core
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: footprint-peak*
+          path: workspace/meridian-core/.footprint-peaks
+      - name: make footprint-judge
+        working-directory: workspace/meridian-core
+        run: make footprint-judge FOOTPRINT_PEAKS="$(find .footprint-peaks -name '*.txt' | sort | tr '\n' ' ')"

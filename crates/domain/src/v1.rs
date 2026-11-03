@@ -6021,6 +6021,27 @@ pub struct ComponentReport {
     /// a fact rather than as an inference from a report arriving twice.
     #[prost(int64, tag = "6")]
     pub started_at_ns: i64,
+    /// The member's mode: "writer", "standby" or "reader"; empty for a
+    /// component with no modes (the dashboard, the analytics component).
+    #[prost(string, tag = "7")]
+    pub mode: ::prost::alloc::string::String,
+    /// The zone its node is in (`topology.kubernetes.io/zone`), where the
+    /// cluster says; empty where it does not.
+    #[prost(string, tag = "8")]
+    pub zone: ::prost::alloc::string::String,
+    /// How far a standby or reader is behind its writer's change log, in
+    /// milliseconds; 0 for a writer and for one caught up.
+    #[prost(uint64, tag = "9")]
+    pub lag_ms: u64,
+    /// The partitions it writes (a writer) or follows (a standby): the store's
+    /// partition names -- a dataset key, `P0`, `control` -- never an account,
+    /// an instrument or a person.
+    #[prost(string, repeated, tag = "10")]
+    pub partitions: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Which member this is: its pod's name. Two members of one component each
+    /// report; the conductor keeps the latest of each.
+    #[prost(string, tag = "11")]
+    pub member: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ReportDeploymentComponentsRequest {
@@ -20050,6 +20071,14 @@ pub struct ReadChangesReply {
     /// The partition's epoch now: the writer whose commits it takes.
     #[prost(uint64, tag = "4")]
     pub epoch: u64,
+    /// On the tail (step 3b, ruling 1062), where one committed transaction's
+    /// changes are published as one page: the sequence the page follows, the
+    /// partition's head before its first change. A follower at this sequence
+    /// applies the page and stands at `head`; one below it missed a page and
+    /// reads what it missed. 0 on a read's reply, which starts after the
+    /// request's own `after_sequence`.
+    #[prost(uint64, tag = "5")]
+    pub after_sequence: u64,
 }
 /// One committed change of a partition, as the store that is its record wrote it.
 #[derive(Clone, PartialEq, ::prost::Message)]

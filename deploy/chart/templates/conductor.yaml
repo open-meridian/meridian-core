@@ -1,5 +1,10 @@
 {{- include "meridian-runtime.require" . -}}
 {{- include "meridian-runtime.oneWriter" (dict "component" "conductor" "what" "conductor's configuration store" "values" .Values.conductor) -}}
+{{- /* Step 3b: the generated key is in a volume one node mounts at a time,
+       so a standby on another node could not start. */ -}}
+{{- if and (include "meridian-runtime.leased" (dict "component" "conductor" "values" .Values.conductor)) (include "meridian-runtime.generatedKey" .) -}}
+{{- fail "conductor.standby is 1 and the deployment's key is generated into a volume, which one node mounts at a time: a standby on another node could not start. Name the key in key.existingSecret for a conductor standby." -}}
+{{- end -}}
 {{/*
   The conductor. The one component holding the deployment's key, and therefore the
   only one that can reach the platform at all. Decision 011.
@@ -17,7 +22,7 @@ metadata:
     meridian.dev/component: conductor
     {{- include "meridian-runtime.labels" . | nindent 4 }}
 spec:
-  replicas: {{ .Values.conductor.replicaCount }}
+  replicas: {{ include "meridian-runtime.memberCount" (dict "component" "conductor" "values" .Values.conductor) }}
   revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
   # The old conductor stops before the new one starts. A rolling update that
   # surges keeps the old one answering the bus until the new one is ready,
@@ -31,11 +36,7 @@ spec:
   # conductor, and unlike Recreate it can be applied over the rolling update
   # every earlier chart made: server-side apply (Helm 4) keeps the
   # rollingUpdate Kubernetes filled in, which Recreate may not carry.
-  strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxSurge: 0
-      maxUnavailable: 1
+  {{- include "meridian-runtime.memberStrategy" (dict "component" "conductor" "values" .Values.conductor) | nindent 2 }}
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
@@ -51,6 +52,7 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
+      {{- include "meridian-runtime.memberPlacement" (dict "top" $ "component" "conductor" "values" $.Values.conductor) | nindent 6 }}
       {{- with .Values.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
@@ -144,6 +146,7 @@ spec:
             {{- end }}
             - name: MERIDIAN_INSTANCE_ID
               value: {{ include "meridian-runtime.fullname" . }}-conductor
+            {{- include "meridian-runtime.memberEnv" (dict "top" $ "component" "conductor" "values" $.Values.conductor) | nindent 12 }}
             # Optional, and that is what lets first run happen at all: the
             # database is what the wizard configures, and the wizard needs the
             # conductor up to enrol this deployment and to relay its claim
@@ -233,15 +236,4 @@ spec:
                     - key: {{ .Values.key.key }}
                       path: key.pem
               {{- end }}
-      {{- with .Values.nodeSelector }}
-      nodeSelector:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.tolerations }}
-      tolerations:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.affinity }}
-      affinity:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+{{ include "meridian-runtime.memberBudget" (dict "top" $ "component" "conductor" "values" $.Values.conductor) }}

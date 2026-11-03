@@ -41,6 +41,15 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
+    // Every path this member needs, probed from inside its pod: what
+    // `meridian status` and `doctor` read (step 3b).
+    if std::env::args().nth(1).as_deref() == Some("probe") {
+        return meridian_runtime::probe::run(&meridian_runtime::probe::Paths {
+            component: "bor",
+            domain: Some("book"),
+            database: Some("MERIDIAN_BOR_DATABASE_URL"),
+        });
+    }
     let url = required("MERIDIAN_BOR_DATABASE_URL")?;
     // How many entries an account's journal grows by between snapshots
     // (contract v25, W9.10): the chart's `bor.snapshotInterval`.
@@ -110,9 +119,7 @@ fn run() -> Result<(), String> {
     // The deployment every change is made in, and the writer's epoch,
     // adopted before the first command (step 3a; ruling 1060).
     meridian_changes::set_origin(&var("MERIDIAN_DEPLOYMENT_ID").unwrap_or_default());
-    let epoch = meridian_bor::Store::adopt(postgres.as_ref())
-        .map_err(|failed| format!("the book could not adopt its epoch: {failed}"))?;
-    tracing::info!(epoch, "the book writes under its epoch");
+    let member = meridian_runtime::member::Member::from_env("bor", Some("book"))?;
 
     let books_bound =
         meridian_bor::writer::books_bytes_from_mib(var("MERIDIAN_BOR_HOT_BOOKS_MIB").as_deref())?;
@@ -125,6 +132,27 @@ fn run() -> Result<(), String> {
 
     on_runtime(async {
         let bus = bus_from_env(&instance_id).await?;
+        // A standby waits here (step 3b): following the writer's change log,
+        // serving nothing, until it takes the lease. With no lease -- the
+        // tolerant default, one member -- it writes at once, as it always has.
+        let holding = member.wait_to_write(&bus).await?;
+        let epoch = tokio::task::block_in_place(|| {
+            holding.epoch(
+                || {
+                    meridian_bor::Store::adopt(postgres.as_ref())
+                        .map_err(|failed| format!("the book could not adopt its epoch: {failed}"))
+                },
+                |by| {
+                    meridian_bor::Store::take_over(postgres.as_ref(), by)
+                        .map_err(|failed| format!("the book could not take over: {failed}"))
+                },
+            )
+        })?;
+        tracing::info!(epoch, "the book writes under its epoch");
+        let watched = postgres.clone();
+        holding.keep(epoch, move || {
+            meridian_bor::Store::head_epoch(watched.as_ref()).map_err(|failed| failed.to_string())
+        });
         // Every commit, whichever path makes it, told on its partition's
         // tail (step 3a).
         // and each account's book at its head held in memory, bounded by
@@ -276,6 +304,7 @@ fn run() -> Result<(), String> {
         ready.serving();
         shutdown().await;
         tracing::info!("stopping");
+        holding.release().await;
         Ok(())
     })
 }

@@ -104,6 +104,43 @@ impl PostgresStore {
         }
     }
 
+    /// Log what is not a dataset's row in the `control` partition, in this
+    /// transaction (step 3b): its head taken under its lock, the writer's
+    /// epoch checked against it as a batch's is, one change each.
+    fn log_control(
+        &self,
+        tx: &mut Transaction<'_>,
+        entries: &[(&str, Vec<u8>, i64)],
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let row = tx
+            .query_one(
+                "SELECT sequence, epoch FROM lake_change_head WHERE partition = 'control' FOR UPDATE",
+                &[],
+            )
+            .map_err(unavailable)?;
+        let epoch: i64 = row.get(1);
+        self.fence.admits(epoch as u64)?;
+        let mut sequence: i64 = row.get(0);
+        for (kind, body, at_ns) in entries {
+            sequence += 1;
+            tx.execute(
+                "INSERT INTO lake_control_change (sequence, epoch, committed_at_ns, kind, body)
+                 VALUES ($1, $2, $3, $4, $5)",
+                &[&sequence, &epoch, at_ns, kind, body],
+            )
+            .map_err(unavailable)?;
+        }
+        tx.execute(
+            "UPDATE lake_change_head SET sequence = $1 WHERE partition = 'control'",
+            &[&sequence],
+        )
+        .map_err(unavailable)?;
+        Ok(())
+    }
+
     /// The partition's head, taken under its lock, its epoch checked against
     /// the writer's (step 3a): a batch commits only while the head row's
     /// epoch is its own. A dataset begun here takes the writer's epoch, the
@@ -1030,6 +1067,7 @@ impl Store for PostgresStore {
         priority: &SourcePriority,
         against_updated_at_ns: i64,
     ) -> Result<std::result::Result<SourcePriority, Stale>> {
+        self.epoch_now()?;
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
         // One change to a priority at a time, so two against one read cannot
@@ -1065,6 +1103,14 @@ impl Store for PostgresStore {
             ],
         )
         .map_err(unavailable)?;
+        self.log_control(
+            &mut tx,
+            &[(
+                crate::store::CONTROL_PRIORITY,
+                priority.encode_to_vec(),
+                priority.updated_at_ns,
+            )],
+        )?;
         tx.commit().map_err(unavailable)?;
         Ok(Ok(priority.clone()))
     }
@@ -1286,13 +1332,28 @@ impl Store for PostgresStore {
     }
 
     fn keep_alias(&self, replaced: &str, stays: &str, at_ns: i64) -> Result<()> {
-        self.conn()?
+        self.epoch_now()?;
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        let kept = tx
             .execute(
                 "INSERT INTO lake_alias (replaced, stays, heard_at_ns) VALUES ($1, $2, $3)
                  ON CONFLICT (replaced) DO NOTHING",
                 &[&replaced, &stays, &at_ns],
             )
             .map_err(unavailable)?;
+        // Logged once, when first kept: an alias heard again changes nothing.
+        if kept == 1 {
+            self.log_control(
+                &mut tx,
+                &[(
+                    crate::store::CONTROL_ALIAS,
+                    crate::store::alias_body(replaced, stays, at_ns),
+                    at_ns,
+                )],
+            )?;
+        }
+        tx.commit().map_err(unavailable)?;
         Ok(())
     }
 
@@ -1425,6 +1486,7 @@ impl Store for PostgresStore {
     }
 
     fn amend_closed_day(&self, amendments: &[ClosedDayAmendment]) -> Result<()> {
+        self.epoch_now()?;
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
         for amendment in amendments {
@@ -1445,6 +1507,17 @@ impl Store for PostgresStore {
             )
             .map_err(unavailable)?;
         }
+        let logged: Vec<(&str, Vec<u8>, i64)> = amendments
+            .iter()
+            .map(|a| {
+                (
+                    crate::store::CONTROL_CLOSED_DAY,
+                    crate::store::amendment_body(a),
+                    a.at_ns,
+                )
+            })
+            .collect();
+        self.log_control(&mut tx, &logged)?;
         tx.commit().map_err(unavailable)?;
         Ok(())
     }
@@ -1584,6 +1657,7 @@ impl Store for PostgresStore {
     }
 
     fn assess(&self, assessments: &[Assessment]) -> Result<()> {
+        self.epoch_now()?;
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
         for assessment in assessments {
@@ -1605,6 +1679,17 @@ impl Store for PostgresStore {
             )
             .map_err(unavailable)?;
         }
+        let logged: Vec<(&str, Vec<u8>, i64)> = assessments
+            .iter()
+            .map(|a| {
+                (
+                    crate::store::CONTROL_ASSESSMENT,
+                    crate::store::assessment_body(a),
+                    a.at_ns,
+                )
+            })
+            .collect();
+        self.log_control(&mut tx, &logged)?;
         tx.commit().map_err(unavailable)?;
         Ok(())
     }
@@ -1644,7 +1729,7 @@ impl Store for PostgresStore {
         self.fence.epoch()
     }
 
-    fn take_over(&self) -> Result<u64> {
+    fn take_over(&self, by: &meridian_changes::TookOver) -> Result<u64> {
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
         // The control partition first: a dataset a deposed writer is
@@ -1670,8 +1755,36 @@ impl Store for PostgresStore {
         .map_err(unavailable)?;
         tx.execute("UPDATE lake_partition SET epoch = $1", &[&epoch])
             .map_err(unavailable)?;
+        // Who took it over and why, in the same transaction (step 3b).
+        tx.execute(
+            "INSERT INTO lake_writer_took_over (epoch, member, partitions, why, origin, at_ns)
+             SELECT $1, $2,
+                    array_append(coalesce(array_agg(dataset ORDER BY dataset), '{}'), 'control'),
+                    $3, $4, $5
+               FROM lake_partition",
+            &[
+                &epoch,
+                &by.member,
+                &by.why,
+                &meridian_changes::origin(),
+                &by.at_ns,
+            ],
+        )
+        .map_err(unavailable)?;
         tx.commit().map_err(unavailable)?;
         self.fence.adopt(epoch as u64);
+        Ok(epoch as u64)
+    }
+
+    fn head_epoch(&self) -> Result<u64> {
+        let epoch: i64 = self
+            .conn()?
+            .query_one(
+                "SELECT epoch FROM lake_change_head WHERE partition = 'control'",
+                &[],
+            )
+            .map_err(unavailable)?
+            .get(0);
         Ok(epoch as u64)
     }
 
@@ -1693,15 +1806,55 @@ impl Store for PostgresStore {
         if partition == meridian_changes::CONTROL {
             let row = tx
                 .query_one(
-                    "SELECT sequence, epoch FROM lake_change_head WHERE partition = 'control'",
+                    "SELECT sequence, epoch, origin FROM lake_change_head WHERE partition = 'control'",
                     &[],
                 )
                 .map_err(|e| failed(unavailable(e)))?;
+            let head = row.get::<_, i64>(0) as u64;
+            let own_origin: String = row.get(2);
+            // Kept for good: the log reaches from its first change.
+            let lowest_kept = u64::from(head > 0);
+            meridian_changes::check_kept(after, lowest_kept, head)?;
+            let mut page = meridian_changes::Page::new(most_bytes);
+            let mut from = after.min(i64::MAX as u64) as i64;
+            'pages: while (from as u64) < head {
+                let rows = tx
+                    .query(
+                        "SELECT sequence, epoch, origin, committed_at_ns, kind, body
+                           FROM lake_control_change WHERE sequence > $1 ORDER BY sequence LIMIT 512",
+                        &[&from],
+                    )
+                    .map_err(|e| failed(unavailable(e)))?;
+                if rows.is_empty() {
+                    break;
+                }
+                for row in rows {
+                    let origin: Option<String> = row.get(2);
+                    from = row.get(0);
+                    let change = meridian_changes::Change {
+                        partition: meridian_changes::CONTROL.to_string(),
+                        sequence: from as u64,
+                        epoch: row.get::<_, i64>(1) as u64,
+                        origin: origin.unwrap_or_else(|| own_origin.clone()),
+                        committed_at_ns: row.get(3),
+                        kind: row.get(4),
+                        body: row.get(5),
+                    };
+                    if !page.take(change) {
+                        break 'pages;
+                    }
+                }
+                if page.is_full() {
+                    break;
+                }
+            }
+            let _ = tx.commit();
             return Ok(ReadChangesReply {
-                changes: Vec::new(),
-                head: row.get::<_, i64>(0) as u64,
-                lowest_kept: 0,
+                changes: page.changes,
+                head,
+                lowest_kept,
                 epoch: row.get::<_, i64>(1) as u64,
+                after_sequence: 0,
             });
         }
         let row = tx
@@ -1788,6 +1941,7 @@ impl Store for PostgresStore {
             head,
             lowest_kept,
             epoch,
+            after_sequence: 0,
         })
     }
 }

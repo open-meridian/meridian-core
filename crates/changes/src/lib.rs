@@ -187,6 +187,7 @@ pub trait ChangeLog: Send + Sync {
 pub fn serve(bus: &Arc<Bus>, domain: &str, log: Arc<dyn ChangeLog>) {
     let topic = read_changes_topic(domain);
     let named = topic.clone();
+    let serving = interest_key(bus, domain);
     bus.serve(&topic, move |envelope| {
         if envelope.payload_type != "meridian.v1.ReadChangesRequest" {
             return Err(format!(
@@ -199,6 +200,9 @@ pub fn serve(bus: &Arc<Bus>, domain: &str, log: Arc<dyn ChangeLog>) {
         if request.partition.is_empty() {
             return Err("partition is empty; name the partition whose changes are asked".into());
         }
+        // A follower asking is a follower holding interest: the tail is
+        // published while one does (ruling 1062).
+        note_interest(&serving);
         let started = std::time::Instant::now();
         let reply = log
             .read_changes(
@@ -222,25 +226,136 @@ pub fn serve(bus: &Arc<Bus>, domain: &str, log: Arc<dyn ChangeLog>) {
     });
 }
 
-/// Bytes published on the change log's tail since the process started,
-/// with the count of changes: what step 3a's duplicate-traffic measurement
-/// reads beside the lake's row events.
+/// What the tail has published since the process started (ruling 1062):
+/// pages, their bytes as published (compressed), the changes they held, and
+/// the changes committed while no follower held interest, published as
+/// nothing. What the tail's traffic measurement reads.
+pub static TAIL_MESSAGES: AtomicU64 = AtomicU64::new(0);
 pub static TAIL_BYTES: AtomicU64 = AtomicU64::new(0);
 pub static TAIL_CHANGES: AtomicU64 = AtomicU64::new(0);
+pub static TAIL_WITHHELD: AtomicU64 = AtomicU64::new(0);
 
-/// Publish each committed change on its partition's tail, after commit, at
-/// most once: a member that misses one catches up by the read.
-pub fn publish(bus: &Bus, domain: &str, changes: &[Change]) {
-    for change in changes {
-        let topic = changes_topic(domain, &change.partition);
-        let payload = change.encode_to_vec();
-        TAIL_BYTES.fetch_add(payload.len() as u64, Ordering::Relaxed);
-        TAIL_CHANGES.fetch_add(1, Ordering::Relaxed);
-        if let Err(failed) = bus.publish(&topic, "meridian.v1.Change", payload, None, None) {
-            // Committed is committed: a follower catches up by the read.
-            tracing::warn!(topic, %failed, "a change was committed and not published");
-        }
+/// The tail's payload: one page, a `ReadChangesReply`, LZ4-compressed with
+/// its length before it (ruling 1062: one compressed message per committed
+/// transaction, as Postgres ships a commit and Kafka a producer's batch).
+pub const TAIL_PAYLOAD: &str = "meridian.v1.ReadChangesReply+lz4";
+
+/// How long a follower's last read keeps the tail published. A standby or
+/// reader asks at least once a second (`Member`'s follower), so a follower
+/// that stopped asking is gone well within this; with none, the writer
+/// publishes nothing (the desktop; ruling 1062).
+pub const INTEREST_LASTS: std::time::Duration = std::time::Duration::from_secs(10);
+
+static INTEREST: OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> =
+    OnceLock::new();
+
+fn interest(
+) -> std::sync::MutexGuard<'static, std::collections::HashMap<String, std::time::Instant>> {
+    INTEREST
+        .get_or_init(Default::default)
+        .lock()
+        .expect("the tail's interest is poisoned")
+}
+
+/// Which writer a follower's interest is in: this process's bus (one per
+/// process; a test may hold several) and the store's domain.
+fn interest_key(bus: &Bus, domain: &str) -> String {
+    format!("{:p}/{domain}", bus as *const Bus)
+}
+
+fn note_interest(key: &str) {
+    interest().insert(key.to_string(), std::time::Instant::now());
+}
+
+/// Whether a follower of `domain` on this bus asked within
+/// [`INTEREST_LASTS`].
+pub fn followed(bus: &Bus, domain: &str) -> bool {
+    interest()
+        .get(&interest_key(bus, domain))
+        .is_some_and(|at| at.elapsed() < INTEREST_LASTS)
+}
+
+/// Publish one committed transaction's changes on their partition's tail,
+/// after commit, at most once: one page (or, past 512 KiB, a page per 512
+/// KiB), compressed, saying the sequence it follows (`after`, the
+/// partition's head before the transaction) so a follower knows whether it
+/// missed one. A member that misses one catches up by the read. Published
+/// only while a follower holds interest; with none, nothing (ruling 1062).
+pub fn publish(bus: &Bus, domain: &str, after: u64, changes: &[Change]) {
+    if changes.is_empty() {
+        return;
     }
+    if !followed(bus, domain) {
+        TAIL_WITHHELD.fetch_add(changes.len() as u64, Ordering::Relaxed);
+        return;
+    }
+    let mut after = after;
+    let mut start = 0;
+    while start < changes.len() {
+        let partition = changes[start].partition.as_str();
+        let end = changes[start..]
+            .iter()
+            .position(|change| change.partition != partition)
+            .map_or(changes.len(), |at| start + at);
+        let mut page = Page::new(PAGE_MOST);
+        for change in &changes[start..end] {
+            if !page.take(change.clone()) {
+                after = publish_page(
+                    bus,
+                    domain,
+                    partition,
+                    after,
+                    std::mem::take(&mut page.changes),
+                );
+                page = Page::new(PAGE_MOST);
+                page.take(change.clone());
+            }
+        }
+        publish_page(bus, domain, partition, after, page.changes);
+        // A transaction over two partitions does not say where the second
+        // starts: its follower reads what it lacks.
+        after = 0;
+        start = end;
+    }
+}
+
+/// One page on the tail; answers its head, which the next page follows.
+fn publish_page(bus: &Bus, domain: &str, partition: &str, after: u64, changes: Vec<Change>) -> u64 {
+    let Some(last) = changes.last() else {
+        return after;
+    };
+    let page = ReadChangesReply {
+        head: last.sequence,
+        lowest_kept: 0,
+        epoch: last.epoch,
+        after_sequence: after,
+        changes,
+    };
+    let head = page.head;
+    let count = page.changes.len() as u64;
+    let payload = lz4_flex::compress_prepend_size(&page.encode_to_vec());
+    let topic = changes_topic(domain, partition);
+    TAIL_MESSAGES.fetch_add(1, Ordering::Relaxed);
+    TAIL_BYTES.fetch_add(payload.len() as u64, Ordering::Relaxed);
+    TAIL_CHANGES.fetch_add(count, Ordering::Relaxed);
+    if let Err(failed) = bus.publish(&topic, TAIL_PAYLOAD, payload, None, None) {
+        // Committed is committed: a follower catches up by the read.
+        tracing::warn!(topic, %failed, "a change was committed and not published");
+    }
+    head
+}
+
+/// A page heard on the tail, decompressed and read.
+pub fn read_tail(payload_type: &str, payload: &[u8]) -> Result<ReadChangesReply, String> {
+    if payload_type != TAIL_PAYLOAD {
+        return Err(format!(
+            "the tail carries {TAIL_PAYLOAD}, not {payload_type}"
+        ));
+    }
+    let raw = lz4_flex::decompress_size_prepended(payload)
+        .map_err(|failed| format!("a page on the tail did not decompress: {failed}"))?;
+    ReadChangesReply::decode(raw.as_slice())
+        .map_err(|failed| format!("a page on the tail did not read: {failed}"))
 }
 
 /// Follow a partition from `after`: read pages until the head, applying each
@@ -338,18 +453,63 @@ impl Fence {
     }
 
     /// Whether a commit under this fence may proceed against a head row at
-    /// `head_epoch`.
+    /// `head_epoch`. A refusal is also said to the process
+    /// ([`fenced_seen`]), whose member steps down (step 3b).
     pub fn admits(&self, head_epoch: u64) -> Result<(), Fenced> {
         let mine = self.epoch();
         if mine == head_epoch {
             Ok(())
         } else {
+            if head_epoch > mine && mine != 0 {
+                FENCED_SEEN.store(true, Ordering::SeqCst);
+            }
             Err(Fenced {
                 mine,
                 head: head_epoch,
             })
         }
     }
+}
+
+/// Who took a store's partitions over, and why: written as the store's
+/// `WriterTookOver` record in the same transaction that raises the epoch
+/// (step 3b; spec/a-deployment-scales-out-and-fails-over-by-configuration
+/// section 3; decisions/031). Kept for good, one per epoch raised.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TookOver {
+    /// The member taking over: its pod's name.
+    pub member: String,
+    /// Why: the lease lapsed, the writer released it, or nobody held it.
+    pub why: String,
+    /// When, in the deployment's time.
+    pub at_ns: i64,
+}
+
+impl TookOver {
+    /// A takeover where no member is named: a test's, or a store's tool.
+    pub fn unnamed(why: &str) -> Self {
+        Self {
+            member: String::new(),
+            why: why.to_string(),
+            at_ns: now_ns(),
+        }
+    }
+}
+
+/// The words each takeover is recorded with.
+pub const LEASE_LAPSED: &str = "the writer's lease lapsed";
+pub const LEASE_RELEASED: &str = "the writer released its lease";
+pub const LEASE_FREE: &str = "no member held the lease";
+
+/// Set once a commit of this process was refused by a newer epoch: another
+/// member took the partition over, and this one steps down and follows as a
+/// standby (spec/a-deployment-scales-out-and-fails-over-by-configuration
+/// section 3, "A frozen writer").
+static FENCED_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a commit of this process was refused by a newer epoch.
+pub fn fenced_seen() -> bool {
+    FENCED_SEEN.load(Ordering::SeqCst)
 }
 
 /// A commit refused by the epoch: another writer took the partition over.

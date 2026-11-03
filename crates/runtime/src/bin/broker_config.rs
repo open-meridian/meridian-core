@@ -35,6 +35,15 @@ const HEADER: &str = "\
 # catalogue's page ends at 512 KiB). Never raised to fit an answer: page it.
 max_payload: 1MB
 
+# A client that stops answering -- a frozen machine, a paused process -- is
+# dropped within about 6 s: pinged every 2 s, and let go after two pings
+# unanswered (step 3b). Until then the broker still hands it its share of a
+# queue group's requests, which a frozen writer never answers, while the
+# standby that took its lease serves the rest. The broker's own default
+# (two minutes, two pings) held them for four.
+ping_interval: \"2s\"
+ping_max: 2
+
 ";
 
 fn main() {

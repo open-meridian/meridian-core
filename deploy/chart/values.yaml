@@ -184,8 +184,31 @@ revisionHistoryLimit: 3
 # "upgrade one without the others" a values change rather than a redesign.
 # Empty means image.tag, so a deployment that moves everything together still
 # names one version.
+# Step 3b (spec/a-deployment-scales-out-and-fails-over-by-configuration
+# sections 1 to 3, 11; plan Track 5): every count is a value, small by
+# default (ruling 1047). With a component's `standby` at 1, it runs a warm
+# standby beside its writer: the same image, holding no lease and serving
+# nothing, following the writer's change log, which takes the writer's
+# lease when it lapses and fences the old writer by its partitions' epoch.
+# The lease is a coordination.k8s.io/v1 Lease in this namespace (the
+# members' one right); the epoch, kept by the store that is the record, is
+# the fence. A standby is ready while its lag is under `readyLagMs`.
+leases:
+  # How often a writer renews its lease, and a standby looks at it.
+  renewSeconds: 2
+  # How long a lease lasts unrenewed: a standby takes it after this.
+  durationSeconds: 6
+
+# The zones members spread over (topology.kubernetes.io/zone), and are kept
+# within; empty, as by default, spreads over nodes only.
+zones: []
+
 instrument:
   replicaCount: 1
+  # A warm standby (step 3b): 0 or 1.
+  standby: 0
+  # A standby's readiness bound: its lag behind the writer's change log.
+  readyLagMs: 5000
   image:
     tag: ""
   # The hot layer (step 3a): records by ID and what each became, answered
@@ -196,6 +219,9 @@ instrument:
 
 conductor:
   replicaCount: 1
+  # A warm standby (step 3b): 0 or 1. It needs the key in key.existingSecret.
+  standby: 0
+  readyLagMs: 5000
   image:
     # Its own tag, so the component that talks to the platform can be moved
     # without touching either store. Empty falls back to image.tag.
@@ -209,6 +235,8 @@ conductor:
 
 street:
   replicaCount: 1
+  standby: 0
+  readyLagMs: 5000
   image:
     tag: ""
   # Its own database, or the same one. Two schemas on one server is supported
@@ -225,6 +253,8 @@ street:
 # kept apart from the street's by the credential.
 bor:
   replicaCount: 1
+  standby: 0
+  readyLagMs: 5000
   image:
     tag: ""
   database:
@@ -263,6 +293,8 @@ bor:
 # credential.
 lake:
   replicaCount: 1
+  standby: 0
+  readyLagMs: 5000
   image:
     tag: ""
   # glibc's allocator arenas, at most this many, as the book's: a chain
@@ -528,6 +560,9 @@ registries:
 launcher:
   enabled: true
   instanceId: launcher-1
+  # A standby launcher (step 3b): 0 or 1; it launches only once it holds
+  # the lease.
+  standby: 0
 
 # Storage for a plugin at the edge (decisions/028): a plugin holding an edge
 # role (confirmation, connectivity, custody, data, reporting, servicing, settlement) keeps an

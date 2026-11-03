@@ -2300,11 +2300,31 @@ async fn each_entry_is_told_on_its_partitions_tail_and_read_back() {
     serve(bus.clone(), writer, bus.clock());
     resolving(&bus);
     let mut tail = bus.subscribe_every("platform.book.internal.changes.*");
+    // A follower asking is the interest that has the tail published (step
+    // 3b, ruling 1062).
+    let interest = meridian_changes::ReadChangesRequest {
+        partition: "control".into(),
+        after_sequence: i64::MAX as u64,
+        page_size: 1,
+    };
+    bus.call(
+        "platform.book.internal.read-changes",
+        "meridian.v1.ReadChangesRequest",
+        interest.encode_to_vec(),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     let reply = open(&bus).await;
     let heard = tail.recv().await.unwrap();
-    let change = meridian_changes::Change::decode(heard.envelope.payload.as_slice()).unwrap();
+    let page =
+        meridian_changes::read_tail(&heard.envelope.payload_type, &heard.envelope.payload).unwrap();
+    assert_eq!(page.changes.len(), 1, "one page an entry");
+    let change = page.changes[0].clone();
     assert_eq!((change.partition.as_str(), change.epoch), ("P0", 1));
     let entry = crate::journal::Entry::from_change(&change).unwrap();
+    assert_eq!(page.after_sequence, entry.first_sequence - 1);
     assert_eq!(entry.entry_id, reply.entry.unwrap().entry_id);
     assert_eq!(change.sequence, entry.last_sequence);
     let asked = meridian_changes::ReadChangesRequest {

@@ -1203,9 +1203,10 @@ impl Store for PostgresStore {
         self.fence.epoch()
     }
 
-    fn take_over(&self) -> Result<u64> {
+    fn take_over(&self, by: &meridian_changes::TookOver) -> Result<u64> {
         let mut conn = self.conn()?;
-        let epoch: i64 = conn
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        let epoch: i64 = tx
             .query_one(
                 "WITH raised AS (
                     UPDATE book_partition_head
@@ -1216,7 +1217,34 @@ impl Store for PostgresStore {
             )
             .map_err(unavailable)?
             .get(0);
+        // Who took it over and why, in the same transaction (step 3b).
+        tx.execute(
+            "INSERT INTO book_writer_took_over (epoch, member, partitions, why, origin, at_ns)
+             SELECT $1, $2, array_agg(partition ORDER BY partition), $3, $4, $5
+               FROM book_partition_head",
+            &[
+                &epoch,
+                &by.member,
+                &by.why,
+                &meridian_changes::origin(),
+                &by.at_ns,
+            ],
+        )
+        .map_err(unavailable)?;
+        tx.commit().map_err(unavailable)?;
         self.fence.adopt(epoch as u64);
+        Ok(epoch as u64)
+    }
+
+    fn head_epoch(&self) -> Result<u64> {
+        let epoch: i64 = self
+            .conn()?
+            .query_one(
+                "SELECT epoch FROM book_partition_head WHERE partition = $1",
+                &[&CONTROL_PARTITION],
+            )
+            .map_err(unavailable)?
+            .get(0);
         Ok(epoch as u64)
     }
 
@@ -1286,6 +1314,7 @@ impl Store for PostgresStore {
             head,
             lowest_kept,
             epoch,
+            after_sequence: 0,
         })
     }
 

@@ -178,7 +178,8 @@ impl Store for Writer {
             let change = decided
                 .entry
                 .to_change(self.inner.epoch(), meridian_changes::origin());
-            meridian_changes::publish(&self.bus, DOMAIN, &[change]);
+            let after = decided.entry.first_sequence.saturating_sub(1);
+            meridian_changes::publish(&self.bus, DOMAIN, after, &[change]);
         }
         Ok(acted)
     }
@@ -195,8 +196,12 @@ impl Store for Writer {
         self.inner.epoch()
     }
 
-    fn take_over(&self) -> Result<u64> {
-        self.inner.take_over()
+    fn take_over(&self, by: &meridian_changes::TookOver) -> Result<u64> {
+        self.inner.take_over(by)
+    }
+
+    fn head_epoch(&self) -> Result<u64> {
+        self.inner.head_epoch()
     }
 
     fn read_changes(

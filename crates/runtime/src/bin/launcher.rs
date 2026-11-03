@@ -199,6 +199,15 @@ impl Launcher {
 }
 
 fn run() -> Result<(), String> {
+    // Every path this member needs, probed from inside its pod: what
+    // `meridian status` and `doctor` read (step 3b).
+    if std::env::args().nth(1).as_deref() == Some("probe") {
+        return meridian_runtime::probe::run(&meridian_runtime::probe::Paths {
+            component: "launcher",
+            domain: None,
+            database: None,
+        });
+    }
     // Not ready until it serves, whatever this pod said before.
     let ready = Ready::from_env();
 
@@ -230,6 +239,9 @@ fn run() -> Result<(), String> {
         None => None,
     };
     let instance_id = var("MERIDIAN_INSTANCE_ID").unwrap_or_else(|| "launcher-1".into());
+    // One launcher launches (step 3b): a standby holds no lease and does
+    // nothing until it takes it. With no lease, the one launcher launches.
+    let member = meridian_runtime::member::Member::from_env("launcher", None)?;
     let api = ApiServer::in_cluster(meridian_runtime::clock()).map_err(|failed| failed.0)?;
     let launcher = Arc::new(Launcher {
         api,
@@ -250,6 +262,11 @@ fn run() -> Result<(), String> {
         .build()
         .map_err(|failed| failed.to_string())?
         .block_on(async {
+            let bus = bus_from_env(&instance_id).await?;
+            let holding = member.wait_to_write(&bus).await?;
+            // The launcher keeps no store, so no epoch: its lease alone says
+            // which member launches, and a member that loses it stops.
+            holding.keep(0, || Ok(0));
             // Not, or no longer, a development deployment: nothing it made live
             // stays (spec/live-plugin-development, ruling 2). The launcher
             // restarts when the chart changes, so this is the next moment
@@ -279,7 +296,6 @@ fn run() -> Result<(), String> {
                     );
                 }
             }
-            let bus = bus_from_env(&instance_id).await?;
             let creating = Arc::clone(&launcher);
             bus.serve(CREATE_PLUGIN, move |envelope| {
                 let request = CreatePluginRequest::decode(&envelope.payload[..])
@@ -315,6 +331,7 @@ fn run() -> Result<(), String> {
             ready.serving();
             shutdown().await;
             tracing::info!("stopping");
+            holding.release().await;
             Ok(())
         })
 }

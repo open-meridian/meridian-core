@@ -52,12 +52,13 @@ const SCHEMA: &[&str] = &[
     include_str!("../migrations/0014_listed_terms.sql"),
     include_str!("../migrations/0015_companies.sql"),
     include_str!("../migrations/0016_change_log.sql"),
+    include_str!("../migrations/0017_writer_took_over.sql"),
 ];
 
 /// A table the newest file makes. A database that has it has them all, so a
 /// start can check for this one and refuse a database an older release
 /// migrated, rather than failing later on the first record.
-const NEWEST_TABLE: &str = "instrument_change";
+const NEWEST_TABLE: &str = "instrument_writer_took_over";
 
 /// And the column the newest file adding one adds (0014, contract v28: a
 /// listed series' terms), with its table, which a table check cannot see;
@@ -109,10 +110,16 @@ pub const CHANGES: meridian_changes::captured::Spec = meridian_changes::captured
         "instrument_company",
         "instrument_company_identifier",
     ],
-    not_captured: &[(
-        "instrument_state",
-        "the store's own runs: the replacement feed's sequence read to and the migration's",
-    )],
+    not_captured: &[
+        (
+            "instrument_state",
+            "the store's own runs: the replacement feed's sequence read to and the migration's",
+        ),
+        (
+            "instrument_writer_took_over",
+            "the store's takeovers, written as the epoch is raised, beside its control partition",
+        ),
+    ],
 };
 
 impl PostgresStore {
@@ -139,13 +146,21 @@ impl PostgresStore {
         Ok(self.fence.adopt_once(epoch))
     }
 
-    /// Take the store over: raise its epoch, and adopt it. Every commit
-    /// under the old one is refused in its own transaction.
-    pub fn take_over(&self) -> Result<u64> {
+    /// Take the store over: raise its epoch, record who took it over and
+    /// why, and adopt it (step 3b). Every commit under the old one is
+    /// refused in its own transaction.
+    pub fn take_over(&self, by: &meridian_changes::TookOver) -> Result<u64> {
         let mut conn = self.conn()?;
-        let epoch = CHANGES.take_over(&mut *conn).map_err(unavailable)?;
+        let epoch = CHANGES.take_over(&mut *conn, by).map_err(unavailable)?;
         self.fence.adopt(epoch);
         Ok(epoch)
+    }
+
+    /// The store's epoch now, as its head row says (step 3b): a writer
+    /// steps down once it moves past its own.
+    pub fn head_epoch(&self) -> Result<u64> {
+        let mut conn = self.conn()?;
+        CHANGES.head_epoch(&mut *conn).map_err(unavailable)
     }
 
     /// What a start does instead of migrating: check the schema is there.

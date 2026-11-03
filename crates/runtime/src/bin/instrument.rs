@@ -34,6 +34,15 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
+    // Every path this member needs, probed from inside its pod: what
+    // `meridian status` and `doctor` read (step 3b).
+    if std::env::args().nth(1).as_deref() == Some("probe") {
+        return meridian_runtime::probe::run(&meridian_runtime::probe::Paths {
+            component: "instrument",
+            domain: Some("reference"),
+            database: Some("MERIDIAN_DATABASE_URL"),
+        });
+    }
     let url = required("MERIDIAN_DATABASE_URL")?;
 
     // Before the key is touched: a migration job holds database credentials and
@@ -75,10 +84,7 @@ fn run() -> Result<(), String> {
     // epoch, adopted before it serves (step 3a; ruling 1060).
     meridian_changes::set_origin(&var("MERIDIAN_DEPLOYMENT_ID").unwrap_or_default());
     meridian_changes::set_clock(clock());
-    let epoch = postgres
-        .adopt()
-        .map_err(|failed| format!("the instrument store could not adopt its epoch: {failed}"))?;
-    tracing::info!(epoch, "the instrument store writes under its epoch");
+    let member = meridian_runtime::member::Member::from_env("instrument", Some("reference"))?;
     // The hot layer in front of the record (step 3a): records by ID and what
     // each became, bounded by instrument.hotLayer.recordsMiB.
     let bound = meridian_instrument::hot::bytes_from_mib(
@@ -103,6 +109,29 @@ fn run() -> Result<(), String> {
     // (meridian_runtime::on_runtime).
     on_runtime(async {
         let bus = bus_from_env(&instance_id).await?;
+        // A standby waits here (step 3b): following the writer's change log,
+        // serving nothing, until it takes the lease. With no lease -- the
+        // tolerant default, one member -- it writes at once, as it always has.
+        let holding = member.wait_to_write(&bus).await?;
+        let epoch = tokio::task::block_in_place(|| {
+            holding.epoch(
+                || {
+                    postgres.adopt().map_err(|failed| {
+                        format!("the instrument store could not adopt its epoch: {failed}")
+                    })
+                },
+                |by| {
+                    postgres.take_over(by).map_err(|failed| {
+                        format!("the instrument store could not take over: {failed}")
+                    })
+                },
+            )
+        })?;
+        tracing::info!(epoch, "the instrument store writes under its epoch");
+        let watched = postgres.clone();
+        holding.keep(epoch, move || {
+            watched.head_epoch().map_err(|failed| failed.to_string())
+        });
         let reporting_bus = Arc::clone(&bus);
         // The change log, served a page at a time and its tail published
         // after each commit (step 3a; topics.md, "Component topics").
@@ -135,6 +164,7 @@ fn run() -> Result<(), String> {
             }
             _ = shutdown() => {
                 tracing::info!("stopping");
+                holding.release().await;
                 Ok(())
             }
         }

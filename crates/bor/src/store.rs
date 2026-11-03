@@ -505,10 +505,15 @@ pub trait Store: Send + Sync {
     /// The epoch this store's commands commit under; 0 before it adopted one.
     fn epoch(&self) -> u64;
 
-    /// Take the book over: raise every partition's epoch in one transaction
-    /// and adopt it. Every command another writer commits under the old one
-    /// is refused.
-    fn take_over(&self) -> Result<u64>;
+    /// Take the book over: raise every partition's epoch in one transaction,
+    /// record who took it over and why (step 3b, `WriterTookOver`), and
+    /// adopt it. Every command another writer commits under the old one is
+    /// refused.
+    fn take_over(&self, by: &meridian_changes::TookOver) -> Result<u64>;
+
+    /// The `control` partition's epoch now, as the record says (step 3b): a
+    /// writer steps down once it moves past its own.
+    fn head_epoch(&self) -> Result<u64>;
 
     /// A page of `partition`'s change log after `after` (step 3a): its
     /// journal's entries in sequence, each one change, at most `most_bytes`.

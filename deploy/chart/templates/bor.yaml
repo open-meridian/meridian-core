@@ -23,13 +23,9 @@ metadata:
     meridian.dev/component: bor
     {{- include "meridian-runtime.labels" . | nindent 4 }}
 spec:
-  replicas: {{ .Values.bor.replicaCount }}
+  replicas: {{ include "meridian-runtime.memberCount" (dict "component" "bor" "values" .Values.bor) }}
   revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
-  strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxSurge: 0
-      maxUnavailable: 1
+  {{- include "meridian-runtime.memberStrategy" (dict "component" "bor" "values" .Values.bor) | nindent 2 }}
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
@@ -45,6 +41,7 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
+      {{- include "meridian-runtime.memberPlacement" (dict "top" $ "component" "bor" "values" $.Values.bor) | nindent 6 }}
       {{- with .Values.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
@@ -62,6 +59,7 @@ spec:
           env:
             - name: MERIDIAN_INSTANCE_ID
               value: {{ include "meridian-runtime.fullname" . }}-bor
+            {{- include "meridian-runtime.memberEnv" (dict "top" $ "component" "bor" "values" $.Values.bor) | nindent 12 }}
             # The deployment each change of its log is made in (step 3a,
             # the change log's origin; ruling 1049).
             - name: MERIDIAN_DEPLOYMENT_ID
@@ -97,3 +95,4 @@ spec:
             {{- toYaml (.Values.bor.resources | default .Values.resources) | nindent 12 }}
       volumes:
         {{- include "meridian-runtime.readyVolume" . | nindent 8 }}
+{{ include "meridian-runtime.memberBudget" (dict "top" $ "component" "bor" "values" $.Values.bor) }}

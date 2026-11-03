@@ -1339,7 +1339,26 @@ async fn a_deposed_writers_command_is_refused_after_a_takeover_and_leaves_no_hol
     let account = unique("ACC");
     open(&bus, &account, &unique("INS")).await;
     let standby = Arc::new(PostgresStore::connect(&url, 1).unwrap());
-    assert_eq!(blocking(|| standby.take_over()).unwrap(), 2);
+    assert_eq!(
+        blocking(|| standby.take_over(&meridian_changes::TookOver::unnamed("a test"))).unwrap(),
+        2
+    );
+    // The takeover is its own record, in its own transaction with the
+    // epoch it raised (step 3b, `WriterTookOver`).
+    let took = {
+        let url = url.clone();
+        let read = move || {
+            let mut held = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+            let row = held.query_one("SELECT why, coalesce(array_length(partitions, 1), 0) FROM book_writer_took_over WHERE epoch = 2", &[]).unwrap();
+            (row.get::<_, String>(0), row.get::<_, i32>(1))
+        };
+        blocking(read)
+    };
+    assert_eq!(took.0, "a test");
+    assert!(
+        took.1 >= 2,
+        "the partitions it took, control among them: {took:?}"
+    );
     let refused = send(
         &bus,
         RECORD_OPENING_BALANCE,

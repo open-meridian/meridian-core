@@ -739,7 +739,12 @@ E2E_K3D_HTTP ?= 80
 # .e2e-cluster.log when it fails: the backup run's own for that run. CI run
 # 38188494317's backup failure logged no pod at all, read from meridian-e2e,
 # which that run never makes.
-E2E_K3D_NAMESPACE = $(if $(filter e2e-cluster-backup,$(E2E_CLUSTER_TARGET)),$(E2E_BACKUP_NAMESPACE),$(E2E_CLUSTER_NAMESPACE))
+E2E_K3D_NAMESPACE = $(if $(filter e2e-cluster-backup,$(E2E_CLUSTER_TARGET)),$(E2E_BACKUP_NAMESPACE),$(if $(filter e2e-cluster-failover e2e-cluster-scaled,$(E2E_CLUSTER_TARGET)),$(E2E_FAILOVER_NAMESPACE),$(E2E_CLUSTER_NAMESPACE)))
+# Agents beside the server, and the zones they are labelled into, one each
+# in order (step 3b): the HA configuration's runs make three, in three
+# zones. None by default: one node, as a desktop runs.
+E2E_K3D_AGENTS ?= 0
+E2E_K3D_ZONES ?=
 
 # `ready <what> <command...>`: the command, every two seconds until it
 # succeeds or E2E_K3D_READY_SECONDS have passed.
@@ -765,8 +770,13 @@ e2e-cluster-k3d:
 		|| docker network create --subnet $(E2E_K3D_SUBNET) --gateway $(E2E_K3D_GATEWAY) $(E2E_K3D_NETWORK) >/dev/null
 	@$(K3D) cluster delete $(E2E_K3D_CLUSTER) >/dev/null 2>&1 || true
 	@echo "e2e-cluster-k3d: a cluster for $(E2E_CLUSTER_TARGET), on $(E2E_K3S_IMAGE)"
-	@: >.e2e-k3d.log; made=; for attempt in 1 2; do \
-	  if $(K3D) cluster create $(E2E_K3D_CLUSTER) --image $(E2E_K3S_IMAGE) --network $(E2E_K3D_NETWORK) \
+	@: >.e2e-k3d.log; made=; nodes=; at=0; \
+	if [ "$(E2E_K3D_AGENTS)" != 0 ]; then nodes="--agents $(E2E_K3D_AGENTS)"; fi; \
+	for zone in $(E2E_K3D_ZONES); do \
+	  nodes="$$nodes --k3s-node-label topology.kubernetes.io/zone=$$zone@agent:$$at"; at=$$((at + 1)); \
+	done; \
+	for attempt in 1 2; do \
+	  if $(K3D) cluster create $(E2E_K3D_CLUSTER) --image $(E2E_K3S_IMAGE) --network $(E2E_K3D_NETWORK) $$nodes \
 		--host-alias $(E2E_K3D_GATEWAY):host.docker.internal \
 		--api-port $(E2E_K3D_API) -p "$(E2E_K3D_HTTP):80@loadbalancer" \
 		--kubeconfig-update-default=false --kubeconfig-switch-context=false \
@@ -849,6 +859,59 @@ e2e-cluster-backup: backup-cli-image $(if $(E2E_BACKUP_RUNTIME),,runtime-image a
 	    kubectl delete namespace $(E2E_BACKUP_NAMESPACE) --wait >/dev/null 2>&1; \
 	  fi; \
 	  rm -rf "$(CURDIR)"/meridian-backup-e2e-*; \
+	  exit $$held
+
+# The desktop footprint's peak, judged by the median of the cluster jobs'
+# peaks (step 3b, decided under A): each e2e-cluster job writes its own
+# (E2E_FOOTPRINT_PEAK), and this holds their median to v29's baseline,
+# printing every job's and the highest. CI's footprint-judge job runs it on
+# every job's file; locally, on whatever runs were kept.
+FOOTPRINT_PEAKS ?= $(wildcard .e2e-footprint-peak*.txt)
+footprint-judge:
+	@test -n "$(FOOTPRINT_PEAKS)" || { echo "footprint-judge: no job's peak to judge; set FOOTPRINT_PEAKS=<files>" >&2; exit 1; }
+	@$(PY) tools/footprint.py judge --baseline deploy/footprint-baseline.yaml $(FOOTPRINT_PEAKS)
+
+# Failure classes injected and timed (step 3b; spec/a-deployment-scales-out-
+# and-fails-over-by-configuration sections 10 and 15; plan Track 7): the
+# chart installed in a profile -- PROFILE=tolerant, the default, one member
+# each; PROFILE=ha, a warm standby per writer over three zones -- and each
+# FAILURE= class injected (comma-separated; the profile's all by default),
+# its recovery measured and held to its bound (rulings 1048, 1056), a
+# CLAIM line each, kept in .e2e-failover-claims.jsonl. e2e-cluster-scaled
+# is the HA configuration installed and held to its shape. Each refuses a
+# kube context that is not a k3d or kind cluster's; the HA ones need three
+# agents labelled into zones:
+#
+#   make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=tolerant E2E_K3D_HTTP=18081
+#   make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha \
+#     E2E_K3D_AGENTS=3 E2E_K3D_ZONES="zone-a zone-b zone-c"
+#
+# No platform. E2E_FAILOVER_RUNTIME names a runtime image already built
+# instead of building it.
+E2E_FAILOVER_NAMESPACE ?= meridian-failover-e2e
+E2E_FAILOVER_RUNTIME ?=
+PROFILE ?= tolerant
+FAILURE ?=
+e2e-cluster-scaled:
+	@$(MAKE) --no-print-directory e2e-cluster-failover PROFILE=scaled FAILURE=
+
+e2e-cluster-failover: $(if $(E2E_FAILOVER_RUNTIME),,runtime-image analytics-image)
+	@ctx="$$(kubectl config current-context 2>/dev/null)"; \
+	case "$$ctx" in k3d-*|kind-*) ;; \
+	*) echo "e2e-cluster-failover: the kube context is '$$ctx', which is not a k3d or kind cluster's. It stops, pauses and cuts nodes: run it on a cluster made for it, make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover" >&2; exit 1;; esac
+	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(or $(E2E_FAILOVER_RUNTIME),$(RUNTIME_IMAGE)) $(if $(E2E_FAILOVER_RUNTIME),,$(ANALYTICS_IMAGE)) postgres:16-alpine,:)
+	@kubectl delete namespace $(E2E_FAILOVER_NAMESPACE) --ignore-not-found --wait >/dev/null 2>&1
+	@rm -f .e2e-failover-claims.jsonl
+	@E2E_NAMESPACE=$(E2E_FAILOVER_NAMESPACE) E2E_IMAGE=$(or $(E2E_FAILOVER_RUNTIME),$(RUNTIME_IMAGE)) \
+	 PROFILE=$(PROFILE) FAILURE=$(FAILURE) E2E_K3D_CLUSTER=$(E2E_K3D_CLUSTER) E2E_K3D_SUBNET=$(E2E_K3D_SUBNET) \
+		$(PY) e2e/failover/run.py; \
+	  held=$$?; \
+	  if [ $$held -ne 0 ] || [ -n "$(E2E_CLUSTER_KEEP)" ]; then \
+	    echo "e2e-cluster-failover: the namespace is left for reading. Remove it with:" >&2; \
+	    echo "  kubectl delete namespace $(E2E_FAILOVER_NAMESPACE)" >&2; \
+	  else \
+	    kubectl delete namespace $(E2E_FAILOVER_NAMESPACE) --wait >/dev/null 2>&1; \
+	  fi; \
 	  exit $$held
 
 HELM := docker run --rm -v "$(CURDIR)":/w -w /w alpine/helm:3.16.2
@@ -2381,7 +2444,39 @@ chart-check:
 		echo "$$said" | grep -q "$$store.replicaCount is 2; it takes 0 or 1.*ruling 1060" \
 			|| { echo "chart-check FAILED: $$store.replicaCount=2 was refused without saying why: $$said" >&2; exit 1; }; \
 	done
-	@echo "chart-check OK: one writer per store (ruling 1060); the lake's whole answers at once, 2 by default and 1 to 8 alone, and its mmap threshold, 128 KiB by default and whole bytes alone; the platform's keys on the conductor alone, as files, only where the chart carries some, its current key by default; four components, the dashboard and the three ways it signs people in, the key and the settings key on the conductor alone, both key paths, refusals, migrations, no pinned uid, a plugin held to its side of the pod, its front door open to the dashboard alone, an Ingress only when asked for and HTTPS alone unless plain HTTP is, development only when asked for, the live shape there alone, a backup only when sealed and placed, and nothing an upgrade leaves behind"
+	@# Step 3b: a warm standby is a value. With `<component>.standby: 1` a
+	@# component runs two members spread over nodes under the members' lease
+	@# right, a PodDisruptionBudget, a surging rollout and its lease named;
+	@# 2 is refused, and the default renders no lease, no account and no
+	@# budget. Every stateless component tolerates a lost node for 30 s.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check --set key.generate=false --set key.existingSecret=k"; \
+	plain="$$($(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null)"; \
+	for absent in "kind: PodDisruptionBudget" "MERIDIAN_LEASE_NAME" "coordination.k8s.io"; do \
+		echo "$$plain" | grep -q "$$absent" \
+			&& { echo "chart-check FAILED: the default profile renders $$absent; standbys are configuration (ruling 1052)" >&2; exit 1; }; \
+	done; \
+	echo "$$plain" | grep -q "tolerationSeconds: 30" \
+		|| { echo "chart-check FAILED: no component tolerates a lost node for 30 s (question 22)" >&2; exit 1; }; \
+	for store in lake bor instrument street conductor launcher; do \
+		made="$$($(HELM_TEMPLATE) check deploy/chart $$base --set $$store.standby=1 2>&1)" \
+			|| { echo "chart-check FAILED: $$store.standby=1 did not render: $$made" >&2; exit 1; }; \
+		echo "$$made" | grep -A1 "name: MERIDIAN_LEASE_NAME" | grep -q "check-meridian-runtime-$$store" \
+			|| { echo "chart-check FAILED: $$store.standby=1 names no lease" >&2; exit 1; }; \
+		echo "$$made" | grep -q "name: check-meridian-runtime-$$store$$" \
+			&& echo "$$made" | grep -q "kind: PodDisruptionBudget" \
+			&& echo "$$made" | grep -q "topologyKey: kubernetes.io/hostname" \
+			&& echo "$$made" | grep -q "resources: \[\"leases\"\]" \
+			|| { echo "chart-check FAILED: $$store.standby=1 lacks its budget, spread or lease right" >&2; exit 1; }; \
+		said="$$($(HELM_TEMPLATE) check deploy/chart $$base --set $$store.standby=2 2>&1 >/dev/null)" \
+			&& { echo "chart-check FAILED: $$store.standby=2 rendered; a count CI does not test is refused (ruling 1047)" >&2; exit 1; }; \
+		echo "$$said" | grep -q "$$store.standby is 2; it takes 0 or 1" \
+			|| { echo "chart-check FAILED: $$store.standby=2 was refused without saying why: $$said" >&2; exit 1; }; \
+	done; \
+	said="$$($(HELM_TEMPLATE) check deploy/chart --set deployment.id=DEP-check --set conductor.standby=1 2>&1 >/dev/null)" \
+		&& { echo "chart-check FAILED: a conductor standby rendered with a generated key no second node can mount" >&2; exit 1; }; \
+	echo "$$said" | grep -q "key.existingSecret for a conductor standby" \
+		|| { echo "chart-check FAILED: a conductor standby with a generated key was refused without saying why: $$said" >&2; exit 1; }
+	@echo "chart-check OK: one writer per store (ruling 1060), a warm standby by value with its lease, budget and spread, none by default, 30 s node tolerations; the lake's whole answers at once, 2 by default and 1 to 8 alone, and its mmap threshold, 128 KiB by default and whole bytes alone; the platform's keys on the conductor alone, as files, only where the chart carries some, its current key by default; four components, the dashboard and the three ways it signs people in, the key and the settings key on the conductor alone, both key paths, refusals, migrations, no pinned uid, a plugin held to its side of the pod, its front door open to the dashboard alone, an Ingress only when asked for and HTTPS alone unless plain HTTP is, development only when asked for, the live shape there alone, a backup only when sealed and placed, and nothing an upgrade leaves behind"
 
 lint:
 	@$(DOCKER) build -f Dockerfile.rust --target lint $(VERDICT) . >/dev/null 2>&1 \
