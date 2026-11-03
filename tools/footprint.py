@@ -224,7 +224,7 @@ def main() -> int:
     parser.add_argument("--peak-to")
     parser.add_argument("peaks", nargs="*")
     parser.add_argument("--self-test", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_intermixed_args()
     if args.self_test:
         self_test()
         print("footprint: self-test OK")
