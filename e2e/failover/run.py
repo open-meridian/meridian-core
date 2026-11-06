@@ -829,6 +829,11 @@ def relation_file(table):
     return node_of(pod), f"{path}/pgdata/{relative}"
 
 
+# Tables a class corrupted on purpose in this run, which a later class's
+# read of every page passes over.
+CORRUPTED = set()
+
+
 def bit_rot(s):
     print("F: bit-rot: a captured row altered beneath the configuration store; a page's byte flipped", flush=True)
     wait_for("conductor settled", lambda: members_settled("conductor"), seconds=300)
@@ -854,7 +859,7 @@ def bit_rot(s):
     probed = probe(writer_pod("conductor"), "conductor") or {}
     database = next((p for p in probed.get("paths", []) if p.get("path") == "database"), {})
     s.check(any(f.get("sequence") == int(sequence) for f in (database.get("integrity") or {}).get("findings", [])),
-            "bit-rot: the probe status reads says so")
+            "bit-rot: the probe that status reads says so")
     if named:
         claim(s, "bit-rot", "conductor", took, TOLERANT_POD if PROFILE == "tolerant" else 60,
               {"detected_by": "the scrub", "partition": partition, "sequence": int(sequence)})
@@ -863,6 +868,7 @@ def bit_rot(s):
     # A byte of a page flipped beneath the stopped database: read back, the
     # page fails its checksum, loudly, and the scrub records it.
     node, path = relation_file("config_change")
+    CORRUPTED.add("config_change")
     kubectl("scale", "statefulset", f"{FULL}-database", "--replicas=0")
     wait_for("the database stopped", lambda: not pods("database"), seconds=180)
     run("docker", "exec", node, "sh", "-c",
@@ -888,6 +894,9 @@ def torn_write(s):
     tables = psql("select string_agg(format('%I', tablename), ' ') from pg_tables where schemaname = 'public'")
     failed = []
     for table in tables.split():
+        if table in CORRUPTED:
+            s.note(f"torn-write: {table} passed over: bit-rot corrupted it on purpose in this run")
+            continue
         done = kubectl("exec", primary(), "-c", "postgres", "--", "psql", "-X", "-At", "-U", "postgres",
                        "-d", "meridian", "-c", f"select count(*) from {table}", check=False)
         if done.returncode != 0:
