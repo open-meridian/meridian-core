@@ -892,6 +892,9 @@ E2E_FAILOVER_NAMESPACE ?= meridian-failover-e2e
 E2E_FAILOVER_RUNTIME ?=
 PROFILE ?= tolerant
 FAILURE ?=
+# The brought database's image under Patroni (deploy/database), which the HA
+# profiles run: built here, as the backup run builds its own.
+E2E_POSTGRES_IMAGE ?= meridian-postgres:local
 e2e-cluster-scaled:
 	@$(MAKE) --no-print-directory e2e-cluster-failover PROFILE=scaled FAILURE=
 
@@ -899,11 +902,12 @@ e2e-cluster-failover: $(if $(E2E_FAILOVER_RUNTIME),,runtime-image analytics-imag
 	@ctx="$$(kubectl config current-context 2>/dev/null)"; \
 	case "$$ctx" in k3d-*|kind-*) ;; \
 	*) echo "e2e-cluster-failover: the kube context is '$$ctx', which is not a k3d or kind cluster's. It stops, pauses and cuts nodes: run it on a cluster made for it, make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover" >&2; exit 1;; esac
-	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(or $(E2E_FAILOVER_RUNTIME),$(RUNTIME_IMAGE)) $(if $(E2E_FAILOVER_RUNTIME),,$(ANALYTICS_IMAGE)) postgres:16-alpine,:)
+	@$(if $(filter tolerant,$(PROFILE)),:,echo "e2e-cluster-failover: building the database's image under Patroni" && $(DOCKER) build -q -t $(E2E_POSTGRES_IMAGE) deploy/database >/dev/null)
+	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(or $(E2E_FAILOVER_RUNTIME),$(RUNTIME_IMAGE)) $(if $(E2E_FAILOVER_RUNTIME),,$(ANALYTICS_IMAGE)) postgres:16-alpine $(if $(filter tolerant,$(PROFILE)),,$(E2E_POSTGRES_IMAGE)),:)
 	@kubectl delete namespace $(E2E_FAILOVER_NAMESPACE) --ignore-not-found --wait >/dev/null 2>&1
 	@rm -f .e2e-failover-claims.jsonl
 	@E2E_NAMESPACE=$(E2E_FAILOVER_NAMESPACE) E2E_IMAGE=$(or $(E2E_FAILOVER_RUNTIME),$(RUNTIME_IMAGE)) \
-	 PROFILE=$(PROFILE) FAILURE=$(FAILURE) E2E_K3D_CLUSTER=$(E2E_K3D_CLUSTER) E2E_K3D_SUBNET=$(E2E_K3D_SUBNET) \
+	 E2E_POSTGRES_IMAGE=$(E2E_POSTGRES_IMAGE) PROFILE=$(PROFILE) FAILURE=$(FAILURE) E2E_K3D_CLUSTER=$(E2E_K3D_CLUSTER) E2E_K3D_SUBNET=$(E2E_K3D_SUBNET) \
 		$(PY) e2e/failover/run.py; \
 	  held=$$?; \
 	  if [ $$held -ne 0 ] || [ -n "$(E2E_CLUSTER_KEEP)" ]; then \
@@ -2476,7 +2480,55 @@ chart-check:
 		&& { echo "chart-check FAILED: a conductor standby rendered with a generated key no second node can mount" >&2; exit 1; }; \
 	echo "$$said" | grep -q "key.existingSecret for a conductor standby" \
 		|| { echo "chart-check FAILED: a conductor standby with a generated key was refused without saying why: $$said" >&2; exit 1; }
-	@echo "chart-check OK: one writer per store (ruling 1060), a warm standby by value with its lease, budget and spread, none by default, 30 s node tolerations; the lake's whole answers at once, 2 by default and 1 to 8 alone, and its mmap threshold, 128 KiB by default and whole bytes alone; the platform's keys on the conductor alone, as files, only where the chart carries some, its current key by default; four components, the dashboard and the three ways it signs people in, the key and the settings key on the conductor alone, both key paths, refusals, migrations, no pinned uid, a plugin held to its side of the pod, its front door open to the dashboard alone, an Ingress only when asked for and HTTPS alone unless plain HTTP is, development only when asked for, the live shape there alone, a backup only when sealed and placed, and nothing an upgrade leaves behind"
+	@# Step 3b part 2: resilience.profile. `tolerant`, the default, is one of
+	@# everything: one broker server as a StatefulSet, the database alone on
+	@# postgres:16-alpine with page checksums at initdb, one dashboard. `ha`
+	@# turns every count on in one value -- a standby per store, the database
+	@# with two standbys under Patroni behind a primary-only Service, the
+	@# broker at three with routes and JetStream, the dashboard and analytics
+	@# at two -- each still overridable, and is refused without the key in a
+	@# Secret (ruling 1074). Counts CI does not test are refused.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
+	plain="$$($(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null)"; \
+	echo "$$plain" | grep -q "meridian.dev/database-manager: patroni\|--route\|MERIDIAN_ANALYTICS_UNITS" \
+		&& { echo "chart-check FAILED: the tolerant default renders Patroni, broker routes or JetStream" >&2; exit 1; }; \
+	echo "$$plain" | grep -A1 "name: POSTGRES_INITDB_ARGS" | grep -q "value: --data-checksums" \
+		|| { echo "chart-check FAILED: a database made by a fresh install has no page checksums" >&2; exit 1; }; \
+	said="$$($(HELM_TEMPLATE) check deploy/chart $$base --set resilience.profile=ha 2>&1 >/dev/null)" \
+		&& { echo "chart-check FAILED: the ha profile rendered with a generated key (ruling 1074)" >&2; exit 1; }; \
+	echo "$$said" | grep -q "ruling 1074" \
+		|| { echo "chart-check FAILED: the ha profile with a generated key was refused without saying why: $$said" >&2; exit 1; }; \
+	said="$$($(HELM_TEMPLATE) check deploy/chart $$base --set resilience.profile=warm 2>&1 >/dev/null)" \
+		&& { echo "chart-check FAILED: resilience.profile=warm rendered" >&2; exit 1; }; true
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check --set key.generate=false --set key.existingSecret=k"; \
+	ha="$$($(HELM_TEMPLATE) check deploy/chart $$base --set resilience.profile=ha 2>/dev/null)" \
+		|| { echo "chart-check FAILED: the ha profile did not render with the key in a Secret" >&2; exit 1; }; \
+	for store in lake bor instrument street conductor launcher; do \
+		echo "$$ha" | grep -A1 "name: MERIDIAN_LEASE_NAME" | grep -q "check-meridian-runtime-$$store\"" \
+			|| { echo "chart-check FAILED: the ha profile gives $$store no standby" >&2; exit 1; }; \
+	done; \
+	for held in "meridian.dev/database-manager: patroni" "meridian.dev/database-role: primary" \
+		"synchronous_mode_strict: true" "--route" "--jetstream" "MERIDIAN_ANALYTICS_UNITS" \
+		"name: check-meridian-runtime-broker-members" "name: check-meridian-runtime-database-members"; do \
+		echo "$$ha" | grep -q -- "$$held" \
+			|| { echo "chart-check FAILED: the ha profile renders no $$held" >&2; exit 1; }; \
+	done; \
+	[ "$$(echo "$$ha" | grep -c 'kind: PodDisruptionBudget')" = 11 ] \
+		|| { echo "chart-check FAILED: the ha profile renders $$(echo "$$ha" | grep -c 'kind: PodDisruptionBudget') disruption budgets, not 11 (six stores, the database, the broker, the dashboard, two analytics sets)" >&2; exit 1; }; \
+	echo "$$ha" | grep -q "runAsUser" \
+		&& { echo "chart-check FAILED: the ha profile pins a uid" >&2; exit 1; }; \
+	over="$$($(HELM_TEMPLATE) check deploy/chart $$base --set resilience.profile=ha --set lake.standby=0 \
+		--set broker.replicas=1 --set broker.jetstream.replicas=0 --set database.brought.standbys=0 --set dashboard.replicaCount=1 2>/dev/null)" \
+		|| { echo "chart-check FAILED: the ha profile did not render with its counts overridden" >&2; exit 1; }; \
+	echo "$$over" | grep -A1 "name: MERIDIAN_LEASE_NAME" | grep -q "check-meridian-runtime-lake\"" \
+		&& { echo "chart-check FAILED: lake.standby=0 under the ha profile still gives the lake a standby" >&2; exit 1; }; \
+	echo "$$over" | grep -q "\-\-route\|meridian.dev/database-manager: patroni" \
+		&& { echo "chart-check FAILED: the ha profile's broker and database counts are not overridable" >&2; exit 1; }; \
+	for refused in "database.brought.standbys=1" "broker.replicas=2" "broker.jetstream.replicas=3" "broker.jetstream.replicas=1"; do \
+		$(HELM_TEMPLATE) check deploy/chart $$base --set "$$refused" >/dev/null 2>&1 \
+			&& { echo "chart-check FAILED: $$refused rendered; a count CI does not test is refused (ruling 1047)" >&2; exit 1; }; \
+	done; true
+	@echo "chart-check OK: one writer per store (ruling 1060), a warm standby by value with its lease, budget and spread, none by default, 30 s node tolerations; resilience.profile tolerant by default and ha in one value, each count overridable, refused without the key in a Secret (1074), the database under Patroni and the broker at three only there; the lake's whole answers at once, 2 by default and 1 to 8 alone, and its mmap threshold, 128 KiB by default and whole bytes alone; the platform's keys on the conductor alone, as files, only where the chart carries some, its current key by default; four components, the dashboard and the three ways it signs people in, the key and the settings key on the conductor alone, both key paths, refusals, migrations, no pinned uid, a plugin held to its side of the pod, its front door open to the dashboard alone, an Ingress only when asked for and HTTPS alone unless plain HTTP is, development only when asked for, the live shape there alone, a backup only when sealed and placed, and nothing an upgrade leaves behind"
 
 lint:
 	@$(DOCKER) build -f Dockerfile.rust --target lint $(VERDICT) . >/dev/null 2>&1 \
