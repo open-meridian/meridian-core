@@ -292,6 +292,12 @@ impl Holding {
     /// deadline, when `epoch_now` -- the store's head epoch, read from the
     /// record -- moves past `mine`, or when a commit of its own was fenced.
     /// Nothing is kept where no lease is held.
+    ///
+    /// The epoch is read on a loop of its own: a read waits on the store's
+    /// pool, up to its connection timeout while the database's primary is
+    /// replaced, and a renewal waiting behind it let the lease lapse under a
+    /// writer that was serving (CI 42291353103: the book's writer renewed
+    /// nothing for 15 s of a database switchover, and its standby took over).
     pub fn keep<E>(&self, mine: u64, epoch_now: E)
     where
         E: Fn() -> Result<u64, String> + Send + Sync + 'static,
@@ -306,6 +312,25 @@ impl Holding {
                 let held = elector.lock().await;
                 (held.settings().renew, held.settings().renew_deadline())
             };
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(renew).await;
+                    let reading = Arc::clone(&epoch_now);
+                    match tokio::task::spawn_blocking(move || reading()).await {
+                        Ok(Ok(head)) if head > mine => step_down(
+                            component,
+                            &format!("the store's epoch is {head}, past this writer's {mine}"),
+                        ),
+                        Ok(Ok(_)) => {}
+                        Ok(Err(failed)) => {
+                            tracing::warn!(component, %failed, "the store's epoch could not be read")
+                        }
+                        Err(failed) => {
+                            tracing::warn!(component, %failed, "the epoch check failed")
+                        }
+                    }
+                }
+            });
             let mut last_renewed = Instant::now();
             loop {
                 tokio::time::sleep(renew).await;
@@ -335,18 +360,6 @@ impl Holding {
                             deadline.as_secs()
                         ),
                     );
-                }
-                let reading = Arc::clone(&epoch_now);
-                match tokio::task::spawn_blocking(move || reading()).await {
-                    Ok(Ok(head)) if head > mine => step_down(
-                        component,
-                        &format!("the store's epoch is {head}, past this writer's {mine}"),
-                    ),
-                    Ok(Ok(_)) => {}
-                    Ok(Err(failed)) => {
-                        tracing::warn!(component, %failed, "the store's epoch could not be read")
-                    }
-                    Err(failed) => tracing::warn!(component, %failed, "the epoch check failed"),
                 }
             }
         });
