@@ -93,47 +93,19 @@ impl PostgresStore {
     /// page's checksum as it reads it from disk.
     pub fn scrub(&self) -> Result<meridian_changes::integrity::Scrubbed> {
         let mut conn = self.conn()?;
-        let mut filled = 0u64;
-        loop {
-            let done = conn
-                .execute(
-                    "UPDATE lake_row SET digest = sha256(body)
-                      WHERE (dataset, sequence) IN (
-                          SELECT dataset, sequence FROM lake_row WHERE digest IS NULL LIMIT 2000)",
-                    &[],
-                )
-                .map_err(unavailable)?;
-            filled += done;
-            if done == 0 {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+        match scrub_rows(&mut *conn) {
+            Err(failed) => match meridian_changes::integrity::page_finding(
+                &failed,
+                "a page of lake_row failed its checksum",
+            ) {
+                Some(finding) => Ok(meridian_changes::integrity::Scrubbed {
+                    findings: vec![finding],
+                    ..Default::default()
+                }),
+                None => Err(unavailable(failed)),
+            },
+            Ok(scrubbed) => Ok(scrubbed),
         }
-        let checked = conn
-            .query_one("SELECT count(*) FROM lake_row", &[])
-            .map_err(unavailable)?
-            .get::<_, i64>(0) as u64;
-        let findings = conn
-            .query(
-                "SELECT dataset, min(sequence), min(recorded_at_ns) FROM lake_row
-                  WHERE digest <> sha256(body) GROUP BY dataset ORDER BY dataset",
-                &[],
-            )
-            .map_err(unavailable)?
-            .iter()
-            .map(|row| meridian_changes::integrity::Finding {
-                partition: row.get(0),
-                sequence: row.get::<_, i64>(1) as u64,
-                committed_at_ns: row.get(2),
-                what: "a row does not match its digest: the record changed beneath the lake"
-                    .to_string(),
-            })
-            .collect();
-        Ok(meridian_changes::integrity::Scrubbed {
-            checked,
-            filled,
-            findings,
-        })
     }
 
     /// Keep a scrub's findings and its run (`IntegrityFinding`).
@@ -2036,6 +2008,50 @@ impl Store for PostgresStore {
             after_sequence: 0,
         })
     }
+}
+
+/// [`PostgresStore::scrub`]'s reading, its errors Postgres's own so a page
+/// failing its checksum is told apart.
+fn scrub_rows(
+    conn: &mut impl postgres::GenericClient,
+) -> std::result::Result<meridian_changes::integrity::Scrubbed, postgres::Error> {
+    let mut filled = 0u64;
+    loop {
+        let done = conn.execute(
+            "UPDATE lake_row SET digest = sha256(body)
+                      WHERE (dataset, sequence) IN (
+                          SELECT dataset, sequence FROM lake_row WHERE digest IS NULL LIMIT 2000)",
+            &[],
+        )?;
+        filled += done;
+        if done == 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let checked = conn
+        .query_one("SELECT count(*) FROM lake_row", &[])?
+        .get::<_, i64>(0) as u64;
+    let findings = conn
+        .query(
+            "SELECT dataset, min(sequence), min(recorded_at_ns) FROM lake_row
+                  WHERE digest <> sha256(body) GROUP BY dataset ORDER BY dataset",
+            &[],
+        )?
+        .iter()
+        .map(|row| meridian_changes::integrity::Finding {
+            partition: row.get(0),
+            sequence: row.get::<_, i64>(1) as u64,
+            committed_at_ns: row.get(2),
+            what: "a row does not match its digest: the record changed beneath the lake"
+                .to_string(),
+        })
+        .collect();
+    Ok(meridian_changes::integrity::Scrubbed {
+        checked,
+        filled,
+        findings,
+    })
 }
 
 fn apply_migrations(conn: &mut Connection, clock: &dyn meridian_clock::Clock) -> Result<()> {

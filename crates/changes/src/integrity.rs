@@ -38,6 +38,19 @@ pub fn chained(previous: &[u8], body: &[u8]) -> Vec<u8> {
     hash.finalize().to_vec()
 }
 
+/// A read the database refused because a page failed its checksum
+/// (SQLSTATE XX001, `data_corrupted`): a finding of the scrub's, not a
+/// failure of it. Anything else is the scrub's own failure.
+pub fn page_finding(failed: &postgres::Error, what: &str) -> Option<Finding> {
+    let db = failed.as_db_error()?;
+    (db.code() == &postgres::error::SqlState::DATA_CORRUPTED).then(|| Finding {
+        partition: String::new(),
+        sequence: 0,
+        committed_at_ns: 0,
+        what: format!("{what}: {}", db.message()),
+    })
+}
+
 /// A digest as people read it, short: its first eight bytes in hex.
 pub fn short(digest: &[u8]) -> String {
     digest.iter().take(8).map(|b| format!("{b:02x}")).collect()

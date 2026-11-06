@@ -58,6 +58,25 @@ impl Spec {
         &self,
         client: &mut impl GenericClient,
     ) -> Result<crate::integrity::Scrubbed, postgres::Error> {
+        match self.scrub_pages(client) {
+            Err(failed) => match crate::integrity::page_finding(
+                &failed,
+                &format!("a page of {} failed its checksum", self.change_table()),
+            ) {
+                Some(finding) => Ok(crate::integrity::Scrubbed {
+                    findings: vec![finding],
+                    ..Default::default()
+                }),
+                None => Err(failed),
+            },
+            scrubbed => scrubbed,
+        }
+    }
+
+    fn scrub_pages(
+        &self,
+        client: &mut impl GenericClient,
+    ) -> Result<crate::integrity::Scrubbed, postgres::Error> {
         let change = self.change_table();
         let filled = client.execute(
             &format!(
