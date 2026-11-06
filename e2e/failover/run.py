@@ -641,12 +641,19 @@ def pod_ip(pod_name):
 def cut_rules(pod_name, targets, verb):
     """Drop every packet between a pod and each target, on the pod's node,
     first in FORWARD: established connections too, which a NetworkPolicy
-    (kube-router's, as most) lets carry on."""
+    (kube-router's, as most) lets carry on.
+
+    Every rule in one exec on the node, so the cut starts (and ends) at
+    once: a docker exec per rule, some thirty for the broker class, spent
+    four to six seconds of the measured bound putting the cut in place and
+    taking it out (broker 9.46 s of 10 in a local run)."""
     node, ip = node_of(pod_name), pod_ip(pod_name)
-    for target in targets:
-        for rule in (["-s", ip, "-d", target], ["-s", target, "-d", ip]):
-            run("docker", "exec", node, "iptables", verb, "FORWARD", *(["1"] if verb == "-I" else []),
-                *rule, "-j", "DROP", check=verb == "-I")
+    at = "1 " if verb == "-I" else ""
+    rules = [f"iptables {verb} FORWARD {at}-s {a} -d {b} -j DROP"
+             for target in targets for a, b in ((ip, target), (target, ip))]
+    # Put in, every one must hold; taken out, each is gone whether or not.
+    joined = " && ".join(rules) if verb == "-I" else "; ".join(f"{r} || true" for r in rules)
+    run("docker", "exec", node, "sh", "-c", joined or "true")
 
 
 def split_brain(s):
