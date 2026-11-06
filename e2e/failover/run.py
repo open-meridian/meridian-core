@@ -191,7 +191,12 @@ def holder(component):
 
 def probe(pod_name, component):
     """The member's probe of every path, as JSON; None where it could not run."""
-    done = kubectl("exec", pod_name, "-c", component, "--", BINARY[component], "probe", check=False)
+    # Never left hanging: an exec through a node going away can wait on it.
+    try:
+        done = subprocess.run(["kubectl", "--namespace", NAMESPACE, "exec", pod_name, "-c", component, "--",
+                               BINARY[component], "probe"], capture_output=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        return None
     for line in done.stdout.decode(errors="replace").splitlines():
         line = line.strip()
         if line.startswith("{"):
@@ -592,6 +597,13 @@ def node_lost(s):
             claim(s, "node", component, took, HA[component], {"epoch_before": epoch})
         else:
             s.check(False, "node: the standby never took over from the stopped node")
+            # What each member said, for reading: its mode, and what its
+            # change log answered.
+            for pod in pods(component):
+                said = probe(pod["metadata"]["name"], component) or {}
+                s.note(f"node: {pod['metadata']['name']} on {pod['spec'].get('nodeName')}: "
+                       f"member {json.dumps(said.get('member'))}, answers {json.dumps(said.get('answers'))}, "
+                       f"lease held by {holder(component)}")
     finally:
         run("docker", "start", node)
     wait_for("the node back", lambda: all(
