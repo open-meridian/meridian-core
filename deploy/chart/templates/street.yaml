@@ -1,5 +1,5 @@
 {{- include "meridian-runtime.require" . -}}
-{{- include "meridian-runtime.oneWriter" (dict "component" "street" "what" "street store" "values" .Values.street) -}}
+{{- include "meridian-runtime.oneWriter" (dict "top" $ "component" "street" "what" "street store" "values" .Values.street) -}}
 {{/*
   The street store. Its own Deployment and its own image tag, which is the whole
   point of the split: the instrument store holds what the platform can send again, this
@@ -17,10 +17,10 @@ metadata:
     meridian.dev/component: street
     {{- include "meridian-runtime.labels" . | nindent 4 }}
 spec:
-  replicas: {{ include "meridian-runtime.memberCount" (dict "component" "street" "values" .Values.street) }}
+  replicas: {{ include "meridian-runtime.memberCount" (dict "top" $ "component" "street" "values" .Values.street) }}
   revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
-  {{- if include "meridian-runtime.leased" (dict "component" "street" "values" .Values.street) }}
-  {{- include "meridian-runtime.memberStrategy" (dict "component" "street" "values" .Values.street) | nindent 2 }}
+  {{- if include "meridian-runtime.leased" (dict "top" $ "component" "street" "values" .Values.street) }}
+  {{- include "meridian-runtime.memberStrategy" (dict "top" $ "component" "street" "values" .Values.street) | nindent 2 }}
   {{- end }}
   selector:
     matchLabels:

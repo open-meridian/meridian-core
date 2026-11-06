@@ -47,7 +47,22 @@ pub struct PostgresStore {
 
 impl PostgresStore {
     pub fn connect(url: &str, pool_size: u32) -> Result<Self> {
-        let config: postgres::Config = url.parse().map_err(unavailable)?;
+        let mut config = meridian_changes::database_config(url).map_err(unavailable)?;
+        // The lake's batches commit locally, never waiting on a synchronous
+        // standby (step 3b, spec section 4, question 5): its rows are
+        // re-fetchable from their sources, and its standby's lag is bounded
+        // and alarmed instead. The book's, the street store's, the
+        // instrument store's and the configuration's commits wait for it.
+        // Harmless on a database with no synchronous standby.
+        // Beside whatever options the URL names (a search_path, say), never
+        // in their place.
+        let options = match config.get_options() {
+            Some(named) if !named.trim().is_empty() => {
+                format!("{named} -c synchronous_commit=local")
+            }
+            _ => "-c synchronous_commit=local".to_string(),
+        };
+        config.options(&options);
         let manager = PostgresConnectionManager::new(config, NoTls);
         let pool = r2d2::Pool::builder()
             .max_size(pool_size.max(1))

@@ -9,7 +9,7 @@
 */}}
 {{- $leased := false -}}
 {{- range $component := list "lake" "bor" "instrument" "street" "conductor" -}}
-{{- if include "meridian-runtime.leased" (dict "component" $component "values" (index $.Values $component)) -}}
+{{- if include "meridian-runtime.leased" (dict "top" $ "component" $component "values" (index $.Values $component)) -}}
 {{- $leased = true -}}
 {{- end -}}
 {{- end -}}

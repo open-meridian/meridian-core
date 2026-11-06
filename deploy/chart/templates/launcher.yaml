@@ -141,7 +141,7 @@ rules:
     resources: ["persistentvolumeclaims"]
     verbs: ["create", "get"]
   {{- end }}
-  {{- if include "meridian-runtime.leased" (dict "component" "launcher" "values" .Values.launcher) }}
+  {{- if include "meridian-runtime.leased" (dict "top" $ "component" "launcher" "values" .Values.launcher) }}
   # One launcher launches (step 3b): with a standby, its lease says which.
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
@@ -171,10 +171,10 @@ metadata:
     meridian.dev/component: launcher
     {{- include "meridian-runtime.labels" . | nindent 4 }}
 spec:
-  replicas: {{ include "meridian-runtime.memberCount" (dict "component" "launcher" "values" .Values.launcher) }}
+  replicas: {{ include "meridian-runtime.memberCount" (dict "top" $ "component" "launcher" "values" .Values.launcher) }}
   revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
-  {{- if include "meridian-runtime.leased" (dict "component" "launcher" "values" .Values.launcher) }}
-  {{- include "meridian-runtime.memberStrategy" (dict "component" "launcher" "values" .Values.launcher) | nindent 2 }}
+  {{- if include "meridian-runtime.leased" (dict "top" $ "component" "launcher" "values" .Values.launcher) }}
+  {{- include "meridian-runtime.memberStrategy" (dict "top" $ "component" "launcher" "values" .Values.launcher) | nindent 2 }}
   {{- end }}
   selector:
     matchLabels:

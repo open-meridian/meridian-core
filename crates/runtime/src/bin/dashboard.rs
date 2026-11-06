@@ -336,9 +336,20 @@ fn run() -> Result<(), String> {
         ),
         None => Sessions::default(),
     };
+    // What is in flight between two requests -- a directory sign-in, a
+    // plugin page's one-time code, an agent's authorisation -- beside them
+    // (step 3b), so any copy of the dashboard answers a step another began;
+    // in memory without one.
+    let in_flight: Arc<dyn meridian_dashboard::in_flight::InFlightStore> = match &database {
+        Some(database) => Arc::new(meridian_dashboard::in_flight::InPostgres::on(
+            database.clone(),
+        )),
+        None => Arc::new(meridian_dashboard::in_flight::InMemory::default()),
+    };
     // Plugin pages' sessions beside them (ruling 855), each ending with the
     // session it came from, so a page left open works on after a restart.
     let plugins = plugins.map(|plugins| {
+        let plugins = plugins.in_flight(Arc::clone(&in_flight));
         Arc::new(match &database {
             Some(database) => plugins.keeping_in(database.clone()),
             None => plugins,
@@ -429,7 +440,9 @@ fn run() -> Result<(), String> {
         let bus = bus_from_env(&instance_id).await?;
         let records = Arc::new(RecordsCache::default());
         let sessions = Arc::new(sessions);
-        let delegations = Arc::new(Delegations::keeping(delegation_store.clone()));
+        let delegations = Arc::new(
+            Delegations::keeping(delegation_store.clone()).in_flight(Arc::clone(&in_flight)),
+        );
         let tickets = Arc::new(meridian_dashboard::tickets::Tickets::keeping(
             ticket_store.clone(),
         ));
@@ -499,7 +512,7 @@ fn run() -> Result<(), String> {
 
         let oidc = match &provider {
             Some(config) => {
-                let oidc = Arc::new(discover(config).await?);
+                let oidc = Arc::new(discover(config).await?.in_flight(Arc::clone(&in_flight)));
                 // The directory's keys, read again every 15 minutes, so a
                 // rotation is picked up without a restart. A sign-in that
                 // meets a key it does not know also reads them at once.

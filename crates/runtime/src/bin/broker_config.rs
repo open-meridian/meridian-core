@@ -99,6 +99,13 @@ mod serve {
         secret: String,
         broker: String,
         every: Duration,
+        /// The cluster this server is one of, with three (step 3b): its
+        /// name, and every server's route by name, its own included.
+        cluster: String,
+        routes: Vec<String>,
+        /// JetStream's memory for the analytics units' work queue, with
+        /// three servers; empty for none.
+        jetstream: String,
     }
 
     fn args() -> Result<Args, String> {
@@ -109,6 +116,9 @@ mod serve {
             secret: String::new(),
             broker: String::new(),
             every: Duration::from_secs(5),
+            cluster: String::new(),
+            routes: Vec::new(),
+            jetstream: String::new(),
         };
         let mut args = std::env::args().skip(2);
         while let Some(argument) = args.next() {
@@ -124,6 +134,9 @@ mod serve {
                 "--secret" => parsed.secret = value,
                 // Where a sidecar reaches the broker, for its connection string.
                 "--broker" => parsed.broker = value,
+                "--cluster" => parsed.cluster = value,
+                "--route" => parsed.routes.push(value),
+                "--jetstream" => parsed.jetstream = value,
                 "--every" => {
                     parsed.every = Duration::from_secs(
                         value
@@ -143,7 +156,18 @@ mod serve {
                 return Err(format!("serve needs {name}"));
             }
         }
+        if !parsed.routes.is_empty() && parsed.cluster.is_empty() {
+            return Err("--route needs --cluster".into());
+        }
         Ok(parsed)
+    }
+
+    /// The header, with this server's cluster and JetStream where it has them.
+    fn header(args: &Args) -> String {
+        format!(
+            "{HEADER}{}",
+            super::clustered(&args.cluster, &args.routes, &args.jetstream)
+        )
     }
 
     /// Hashes made once per password: bcrypt is slow on purpose.
@@ -197,8 +221,13 @@ mod serve {
             by_instance.insert(instance.clone(), hashes[&key].clone());
         }
         hashes.retain(|(instance, _), _| reconciled.passwords.contains_key(instance));
-        let (configuration, left_out) =
-            launched::configuration(HEADER, Contract::embedded(), chart, &launched, &by_instance)?;
+        let (configuration, left_out) = launched::configuration(
+            &header(args),
+            Contract::embedded(),
+            chart,
+            &launched,
+            &by_instance,
+        )?;
         for why in left_out {
             tracing::warn!("a launched plugin is not admitted: {why}");
         }
@@ -235,7 +264,7 @@ mod serve {
             Err(failed) => {
                 tracing::warn!("launched plugins could not be read yet: {failed}");
                 launched::configuration(
-                    HEADER,
+                    &header(&args),
                     Contract::embedded(),
                     &chart,
                     &[],
@@ -287,6 +316,45 @@ mod serve {
             }
         }
     }
+}
+
+/// A server's cluster and JetStream (step 3b; spec/a-deployment-scales-out-
+/// and-fails-over-by-configuration section 4, question 6), as the broker's
+/// configuration says them; nothing for a server alone.
+///
+/// Its name from `MERIDIAN_BROKER_SERVER_NAME`, its pod's. Its routes, one
+/// per server, each by the variable holding its URL with the cluster's own
+/// credential, which `cluster.authorization` checks (read from
+/// `MERIDIAN_NATS__ROUTES`, like every other password here): no client
+/// credential can join the cluster, and nothing in this file is a password. JetStream in memory only, for the
+/// analytics units' work queue: never a record (decisions/024); its Raft
+/// state beside this file, in the pod's own directory.
+fn clustered(cluster: &str, routes: &[String], jetstream: &str) -> String {
+    let mut said = String::new();
+    if !cluster.is_empty() {
+        said.push_str(
+            "# One of a cluster (step 3b): this server by its pod's name, its routes to\n\
+             # every server by theirs, joined with the cluster's own credential.\n\
+             server_name: $MERIDIAN_BROKER_SERVER_NAME\n",
+        );
+        said.push_str(&format!(
+            "cluster {{\n  name: {cluster:?}\n  listen: \"0.0.0.0:6222\"\n  \
+             authorization {{\n    user: \"routes\"\n    password: $MERIDIAN_NATS__ROUTES\n  }}\n  \
+             routes: [\n"
+        ));
+        for route in routes {
+            said.push_str(&format!("    ${route}\n"));
+        }
+        said.push_str("  ]\n}\n\n");
+    }
+    if !jetstream.is_empty() {
+        said.push_str(&format!(
+            "# The analytics units' work queue, kept on three servers in memory.\n\
+             jetstream {{\n  store_dir: \"/etc/nats/jetstream\"\n  \
+             max_memory_store: {jetstream}\n  max_file_store: 16MB\n}}\n\n"
+        ));
+    }
+    said
 }
 
 /// An instance entry: `{"instance_id", "roles": [...]}` for a plugin's
@@ -440,5 +508,26 @@ mod tests {
         // H1 (ruling 586): stated, never the broker's default, so the 512 KiB
         // page budget is set against a limit the chart says.
         assert!(super::HEADER.contains("\nmax_payload: 1MB\n"));
+    }
+
+    #[test]
+    fn a_server_alone_says_no_cluster_and_three_say_one_with_no_password() {
+        assert_eq!(super::clustered("", &[], ""), "");
+        let routes = [
+            "MERIDIAN_NATS__ROUTE_0".to_string(),
+            "MERIDIAN_NATS__ROUTE_1".to_string(),
+        ];
+        let said = super::clustered("b", &routes, "64MB");
+        assert!(said.contains("server_name: $MERIDIAN_BROKER_SERVER_NAME\n"));
+        assert!(said.contains("cluster {\n  name: \"b\"\n"));
+        assert!(said.contains("password: $MERIDIAN_NATS__ROUTES\n"));
+        assert!(said.contains("    $MERIDIAN_NATS__ROUTE_0\n"));
+        assert!(said.contains("    $MERIDIAN_NATS__ROUTE_1\n"));
+        assert!(said.contains("jetstream {\n"));
+        // Sizes bare, as the broker reads them: quoted, they are strings.
+        assert!(said.contains("max_memory_store: 64MB\n"));
+        assert!(said.contains("max_file_store: 16MB\n"));
+        // The routes are variables: no credential is in the file.
+        assert!(!said.contains('@'));
     }
 }

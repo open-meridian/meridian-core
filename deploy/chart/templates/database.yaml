@@ -36,6 +36,25 @@
 {{- $existing := lookup "v1" "Secret" .Release.Namespace (printf "%s-passwords" $name) }}
 {{- $held := dict }}
 {{- if $existing }}{{ $held = ($existing.data | default dict) }}{{ end }}
+{{- $standbys := int (include "meridian-runtime.databaseStandbys" .) }}
+{{- $live := lookup "apps/v1" "StatefulSet" .Release.Namespace $name }}
+{{/*
+  Two ways to run it (step 3b; spec/a-deployment-scales-out-and-fails-over-
+  by-configuration section 4, question 4). Alone, as it always has, from
+  postgres:16-alpine, restarted on its volume (the tolerant default and the
+  desktop). Or under Patroni, from database.brought.patroniImage -- the same
+  Postgres with Patroni and pgBackRest -- as a primary and
+  database.brought.standbys standbys, each on its own volume, one of them
+  synchronous and strict, so a primary cut off from its standbys cannot
+  acknowledge a commit alone; Patroni keeps its state in this namespace's
+  ConfigMaps and the members' labels, under a namespaced Role (no CRD, no
+  cluster-wide right: decisions/016), and the Service follows the primary's
+  label. Once a database has run under Patroni it stays under it, standbys
+  or none: its data directory is Patroni's.
+*/}}
+{{- $wasPatroni := eq (dig "spec" "template" "metadata" "labels" "meridian.dev/database-manager" "" (default (dict) $live)) "patroni" }}
+{{- $patroni := or (gt $standbys 0) $wasPatroni }}
+{{- $scope := $name | trunc 63 | trimSuffix "-" }}
 ---
 # Made once and kept. These and the disk beside them are a pair, and the
 # reason is Postgres's: POSTGRES_PASSWORD is read by initdb on an empty data
@@ -70,6 +89,10 @@ data:
   superuser: {{ index $held "superuser" | default (randAlphaNum 32 | b64enc) }}
   serving: {{ index $held "serving" | default (randAlphaNum 32 | b64enc) }}
   migrating: {{ index $held "migrating" | default (randAlphaNum 32 | b64enc) }}
+  # Patroni's REST API's, which members ask each other for their positions
+  # and the chart's start-up asks to hold the dynamic settings to the
+  # chart's. Made beside the others on any install, used under Patroni.
+  patroni: {{ index $held "patroni" | default (randAlphaNum 32 | b64enc) }}
 ---
 apiVersion: v1
 kind: Service
@@ -82,10 +105,135 @@ spec:
     app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
     app.kubernetes.io/instance: {{ .Release.Name }}
     meridian.dev/component: database
+    {{- if $patroni }}
+    # The primary alone: Patroni labels each member with its role, and moves
+    # the label with a failover, so every store's next connection reaches
+    # the promoted primary at the same address.
+    meridian.dev/database-role: primary
+    {{- end }}
   ports:
     - name: postgres
       port: 5432
       targetPort: 5432
+{{- if $patroni }}
+---
+# Every member by its own name (`<name>-0.<name>-members`), which Patroni's
+# standbys stream from and its members' REST APIs answer at.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-members
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    meridian.dev/component: database
+  ports:
+    - name: postgres
+      port: 5432
+    - name: patroni
+      port: 8008
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+---
+# Patroni's one right: its own state, in this namespace's ConfigMaps
+# (`<name>-leader`, `-config`, `-sync`, `-failover`), and its members' role
+# labels. Namespaced; nothing cluster-wide (decisions/016).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ $name }}
+  apiGroup: rbac.authorization.k8s.io
+---
+# How Patroni runs this database: the static half. Its timing is set for
+# the database tier, a primary lost answered for within 30 s (ruling 1048):
+# its leader key lasts `ttl` (Patroni's least, 20 s) unrenewed, renewed every
+# `loop_wait` (2 s). The dynamic half -- synchronous, strict, the timings --
+# lives in Patroni's ConfigMap once it has started, and is held to these
+# values by every member's start (files/database.sh).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-patroni
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+data:
+  database.sh: |
+    {{- .Files.Get "files/database.sh" | nindent 4 }}
+  patroni.yml: |
+    scope: {{ $scope }}
+    restapi:
+      listen: 0.0.0.0:8008
+    kubernetes:
+      use_endpoints: false
+      bypass_api_service: false
+      scope_label: meridian.dev/database-scope
+      role_label: meridian.dev/database-role
+      leader_label_value: primary
+      follower_label_value: replica
+      standby_leader_label_value: primary
+      labels:
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        meridian.dev/component: database
+    bootstrap:
+      dcs:
+        {{- include "meridian-runtime.patroniDynamic" (dict "top" . "standbys" $standbys) | nindent 8 }}
+      # Page checksums on every database made here (step 3b, 5j): Postgres
+      # 16 makes none by default.
+      initdb:
+        - data-checksums
+        - encoding: UTF8
+    postgresql:
+      listen: 0.0.0.0:5432
+      data_dir: /var/lib/postgresql/data/pgdata
+      bin_dir: /usr/local/bin
+      pgpass: /tmp/pgpass
+      authentication:
+        superuser:
+          username: postgres
+        replication:
+          username: postgres
+        rewind:
+          username: postgres
+      pg_hba:
+        - local all all trust
+        - host all all 127.0.0.1/32 trust
+        - host replication postgres 0.0.0.0/0 scram-sha-256
+        - host all all 0.0.0.0/0 scram-sha-256
+        - host all all ::/0 scram-sha-256
+{{- end }}
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -105,8 +253,11 @@ spec:
   # it. `lookup` answers nothing when there is no cluster to ask, which is
   # every `helm template` and every dry run, and zero is the right answer
   # there because that is what a fresh install gets.
-  {{- $live := lookup "apps/v1" "StatefulSet" .Release.Namespace $name }}
-  replicas: {{ dig "spec" "replicas" 0 (default (dict) $live) }}
+  #
+  # Once chosen, its members: the primary and database.brought.standbys
+  # (step 3b), so turning the profile up or down is a scale.
+  {{- $running := dig "spec" "replicas" 0 (default (dict) $live) }}
+  replicas: {{ if gt (int $running) 0 }}{{ add 1 $standbys }}{{ else }}0{{ end }}
   serviceName: {{ $name }}
   selector:
     matchLabels:
@@ -120,15 +271,114 @@ spec:
       labels:
         {{- include "meridian-runtime.unversionedLabels" . | nindent 8 }}
         meridian.dev/component: database
+        {{- if $patroni }}
+        meridian.dev/database-manager: patroni
+        meridian.dev/database-scope: {{ $scope }}
+        {{- end }}
     spec:
+      {{- if $patroni }}
+      serviceAccountName: {{ $name }}
       {{- with .Values.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- if gt $standbys 0 }}
+      {{- include "meridian-runtime.spread" (dict "top" . "component" "database") | nindent 6 }}
+      {{- end }}
+      {{- else }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- end }}
       containers:
         - name: postgres
-          image: {{ .Values.database.brought.image | quote }}
+          image: {{ if $patroni }}{{ .Values.database.brought.patroniImage | quote }}{{ else }}{{ .Values.database.brought.image | quote }}{{ end }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if $patroni }}
+          command: ["/bin/sh", "/etc/patroni/database.sh"]
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: PATRONI_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: PATRONI_KUBERNETES_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
+            - name: PATRONI_KUBERNETES_POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            # Where the other members reach this one: its standbys stream
+            # from it, and Patroni asks its REST API, by its pod's address.
+            - name: PATRONI_POSTGRESQL_CONNECT_ADDRESS
+              value: "$(POD_IP):5432"
+            - name: PATRONI_RESTAPI_CONNECT_ADDRESS
+              value: "$(POD_IP):8008"
+            - name: PATRONI_SUPERUSER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $name }}-passwords
+                  key: superuser
+            - name: PATRONI_REPLICATION_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $name }}-passwords
+                  key: superuser
+            - name: PATRONI_REWIND_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $name }}-passwords
+                  key: superuser
+            - name: PATRONI_RESTAPI_USERNAME
+              value: patroni
+            - name: PATRONI_RESTAPI_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $name }}-passwords
+                  key: patroni
+            - name: PATRONI_DYNAMIC
+              value: {{ include "meridian-runtime.patroniDynamic" (dict "top" . "standbys" $standbys) | fromYaml | toJson | quote }}
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - name: postgres
+              containerPort: 5432
+            - name: patroni
+              containerPort: 8008
+          readinessProbe:
+            httpGet:
+              path: /readiness
+              port: 8008
+            periodSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /liveness
+              port: 8008
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 6
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: patroni
+              mountPath: /etc/patroni
+              readOnly: true
+          resources:
+            {{- toYaml (.Values.database.brought.resources | default .Values.resources) | nindent 12 }}
+      volumes:
+        - name: patroni
+          configMap:
+            name: {{ $name }}-patroni
+          {{- else }}
           env:
             - name: POSTGRES_USER
               value: postgres
@@ -143,6 +393,24 @@ spec:
               value: postgres
             - name: PGDATA
               value: /var/lib/postgresql/data/pgdata
+            {{- /* Said only on a StatefulSet made with it: a pod template
+                   changed under an upgrade restarts the database beneath
+                   the migration Job (see _helpers), and on a volume already
+                   made it would change nothing. */}}
+            {{- $initdb := not $live }}
+            {{- range (dig "spec" "template" "spec" "containers" (list) (default (dict) $live)) }}
+            {{- range (.env | default list) }}
+            {{- if eq .name "POSTGRES_INITDB_ARGS" }}{{ $initdb = true }}{{ end }}
+            {{- end }}
+            {{- end }}
+            {{- if $initdb }}
+            # Page checksums on a database made here (step 3b, 5j), read
+            # only by initdb on an empty volume: one made before keeps what
+            # it had, and `meridian upgrade-deployment --enable-checksums`
+            # turns them on (ruling 1058).
+            - name: POSTGRES_INITDB_ARGS
+              value: --data-checksums
+            {{- end }}
           ports:
             - name: postgres
               containerPort: 5432
@@ -151,6 +419,7 @@ spec:
               mountPath: /var/lib/postgresql/data
           resources:
             {{- toYaml (.Values.database.brought.resources | default .Values.resources) | nindent 12 }}
+          {{- end }}
   volumeClaimTemplates:
     - metadata:
         name: data
@@ -184,4 +453,17 @@ spec:
               app.kubernetes.io/instance: {{ .Release.Name }}
       ports:
         - port: 5432
+    {{- if $patroni }}
+    # Patroni's REST API: its own members, asking each other's positions.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              meridian.dev/component: database
+      ports:
+        - port: 8008
+    {{- end }}
+{{- if gt $standbys 0 }}
+{{ include "meridian-runtime.budget" (dict "top" . "component" "database") }}
+{{- end }}
 {{- end }}

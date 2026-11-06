@@ -6,9 +6,14 @@
   directory, which sends people back to it after signing in, and the dashboard
   refuses to serve a directory without one rather than guessing.
 */}}
-{{- if gt (int .Values.dashboard.replicaCount) 1 }}
-{{- fail "dashboard.replicaCount must be 1: browser sessions live in the dashboard's memory, and a second replica would sign people out at random" }}
-{{- end }}
+{{/*
+  Stateless, so any number of copies (step 3b, spec section 4): browser and
+  plugin pages' sessions are in its tables (812, 855), and so is every
+  sign-in, plugin-page code and agent's authorisation in flight
+  (`dashboard_in_flight`), so a sign-in begun on one copy finishes on
+  another. One by default, two in the HA profile.
+*/}}
+{{- $copies := include "meridian-runtime.copies" (dict "top" . "value" .Values.dashboard.replicaCount "what" "dashboard.replicaCount") }}
 {{/*
   The dashboard: the one address a firm's staff use. It signs people in
   through the firm's directory, holds no deployment key, keeps terminal
@@ -26,16 +31,20 @@ metadata:
     meridian.dev/component: dashboard
     {{- include "meridian-runtime.labels" . | nindent 4 }}
 spec:
-  replicas: 1
+  replicas: {{ $copies }}
   revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
-  # Recreate, for the reason replicaCount is 1: a rolling update starts the
-  # new pod beside the old one, and for as long as both serve, the Ingress
-  # sends a request to either -- a person signed in on one is nobody on the
-  # other. The cluster run found it the moment after the wizard's apply
-  # restarts the dashboard: signed in, then home said nothing about it.
-  # Sessions end with a restart either way; this ends them once, cleanly.
+  # One copy is replaced, not doubled, so a desktop's upgrade never runs
+  # two; with more, one at a time, the others serving. Every copy reads
+  # the same sessions and sign-ins in flight from the dashboard's tables.
   strategy:
+  {{- if gt (int $copies) 1 }}
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  {{- else }}
     type: Recreate
+  {{- end }}
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
@@ -52,6 +61,9 @@ spec:
       {{- end }}
     spec:
       {{- include "meridian-runtime.nodeTolerations" . | nindent 6 }}
+      {{- if gt (int $copies) 1 }}
+      {{- include "meridian-runtime.spread" (dict "top" . "component" "dashboard") | nindent 6 }}
+      {{- end }}
       {{- with .Values.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
@@ -319,7 +331,23 @@ metadata:
   labels:
     meridian.dev/component: dashboard
     {{- include "meridian-runtime.labels" . | nindent 4 }}
+  {{- if gt (int $copies) 1 }}
+  # With more than one copy, a browser keeps to the one it reached (Traefik's
+  # sticky cookie, nginx's affinity on the Ingress, the client's address in
+  # the cluster): every session and sign-in in flight is in the tables, but
+  # the first-run wizard's one session is held by the copy that started it,
+  # before the deployment has a database (first_run.rs), and a terminal's
+  # stream stays where it began.
+  annotations:
+    traefik.ingress.kubernetes.io/service.sticky.cookie: "true"
+    traefik.ingress.kubernetes.io/service.sticky.cookie.name: meridian_dashboard_copy
+    traefik.ingress.kubernetes.io/service.sticky.cookie.secure: "true"
+    traefik.ingress.kubernetes.io/service.sticky.cookie.httponly: "true"
+  {{- end }}
 spec:
+  {{- if gt (int $copies) 1 }}
+  sessionAffinity: ClientIP
+  {{- end }}
   selector:
     app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
     app.kubernetes.io/instance: {{ .Release.Name }}
@@ -328,4 +356,7 @@ spec:
     - name: http
       port: 80
       targetPort: http
+{{- if gt (int $copies) 1 }}
+{{ include "meridian-runtime.budget" (dict "top" . "component" "dashboard") }}
+{{- end }}
 {{- end }}

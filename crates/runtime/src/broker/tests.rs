@@ -343,10 +343,20 @@ fn the_analytics_component_holds_its_own_credential_and_its_own_topic() {
         analytics.password,
         Password::Env("MERIDIAN_NATS_ANALYTICS".into())
     );
+    // JetStream's API and acknowledgements, for the units' work queue (step
+    // 3b), to the analytics component alone.
+    let api = "$JS.API.>".to_string();
+    let ack = "$JS.ACK.>".to_string();
+    assert!(analytics.publish.contains(&api) && analytics.publish.contains(&ack));
     for other in users.iter().filter(|u| u.user != "analytics") {
         assert!(
             !other.publish.contains(&unit) && !other.subscribe.contains(&unit),
             "{} carries the analytics component's own topic",
+            other.user
+        );
+        assert!(
+            !other.publish.iter().any(|s| s.starts_with("$JS")),
+            "{} may speak to JetStream",
             other.user
         );
     }

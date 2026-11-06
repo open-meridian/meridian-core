@@ -279,6 +279,66 @@ jobs:
           set -euo pipefail
           docker run --rm "$BACKUP:$TAG" sh -c 'pg_dump --version && age --version'
 
+  # The brought database's image under Patroni (step 3b; deploy/database):
+  # postgres:16-alpine's server with Patroni and pgBackRest, nothing of the
+  # runtime's, which the chart's database runs once it has standbys. Tagged
+  # with the runtime's commit and pinned by the chart below, as the backup
+  # image is. Both architectures.
+  postgres-image:
+    needs: publish
+    runs-on: ubuntu-latest
+    env:
+      POSTGRES: ghcr.io/open-meridian/meridian-postgres
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: The commit the branch carried
+        run: |
+          set -euo pipefail
+          if git rev-parse -q --verify 'HEAD^2' >/dev/null; then
+            if [ "$(git rev-parse 'HEAD^{tree}')" != "$(git rev-parse 'HEAD^2^{tree}')" ]; then
+              echo "::error::merge $(git rev-parse --short HEAD) holds a tree its branch never had: the branch was not up to date with main, so no pull-request check passed on this tree"
+              exit 1
+            fi
+            git checkout -q --detach 'HEAD^2'
+          fi
+          echo "publishing $(git rev-parse HEAD)"
+
+      - name: Free the runner's disk
+        run: tools/free-runner-disk.sh
+
+      - id: tag
+        run: echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: deploy/database
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ${{ env.POSTGRES }}:${{ steps.tag.outputs.sha }}
+            ${{ env.POSTGRES }}:latest
+          push: true
+
+      # Run as the database runs it, rather than trusting a push that exited 0.
+      - name: Check it holds Postgres, Patroni and pgBackRest
+        env:
+          TAG: ${{ steps.tag.outputs.sha }}
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint sh "$POSTGRES:$TAG" -c 'postgres --version && patroni --version && pgbackrest version'
+
   # The chart, pushed beside the image it names.
   #
   # Until this existed, a customer reached the chart by having the repository,
@@ -290,7 +350,7 @@ jobs:
   # After `publish` rather than beside it: a chart whose image tag names a
   # manifest that does not exist yet is a chart that installs and cannot pull.
   chart:
-    needs: [publish, backup-image]
+    needs: [publish, backup-image, postgres-image]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -346,6 +406,9 @@ jobs:
           # And the backup image, published beside it by backup-image.
           sed -i "s|^  image: ghcr.io/open-meridian/meridian-backup:latest$|  image: \"ghcr.io/open-meridian/meridian-backup:$SHA\"|" deploy/chart/values.yaml
           grep -qx "  image: \"ghcr.io/open-meridian/meridian-backup:$SHA\"" deploy/chart/values.yaml
+          # And the database's image under Patroni, by postgres-image.
+          sed -i "s|^    patroniImage: ghcr.io/open-meridian/meridian-postgres:latest$|    patroniImage: \"ghcr.io/open-meridian/meridian-postgres:$SHA\"|" deploy/chart/values.yaml
+          grep -qx "    patroniImage: \"ghcr.io/open-meridian/meridian-postgres:$SHA\"" deploy/chart/values.yaml
 
       # Asserted by rendering rather than by trusting the edit above: a sed
       # that matches nothing exits 0, and the failure would be a published

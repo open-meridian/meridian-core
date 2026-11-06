@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use crate::clock::SECOND_NS;
 
 /// Who a credential names: the person who signed in to grant it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Person {
     pub subject: String,
     pub display_name: String,

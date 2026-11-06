@@ -64,8 +64,16 @@ const OWN_CREDENTIAL: [&str; 3] = ["first-run", "instrument", "analytics"];
 /// book's by the analytics component too, so a standing job can catch up a
 /// gap. Published and subscribed alike: a member asks and answers, tells
 /// and hears.
-const COMPONENT_TOPICS: [(&str, &str); 11] = [
+///
+/// From step 3b, with JetStream at three for the analytics units' work queue
+/// (spec/a-deployment-scales-out-and-fails-over-by-configuration section 4):
+/// JetStream's API and its acknowledgements, to the analytics component's
+/// credential alone, so its coordinators make and fill the queue and its
+/// workers take and acknowledge from it. No other credential holds either.
+const COMPONENT_TOPICS: [(&str, &str); 13] = [
     ("analytics", "platform.analytics.internal.compute-unit"),
+    ("analytics", "$JS.API.>"),
+    ("analytics", "$JS.ACK.>"),
     ("lake", "platform.lake.internal.read-changes"),
     ("lake", "platform.lake.internal.changes.*"),
     ("bor", "platform.book.internal.read-changes"),

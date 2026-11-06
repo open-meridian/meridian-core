@@ -131,6 +131,20 @@ impl NatsBackend {
         })
     }
 
+    /// A client of its own on the broker the URL names, with its credential,
+    /// for a component that speaks to JetStream itself (step 3b: the
+    /// analytics units' work queue). Everything else goes by the bus.
+    pub async fn client(url: &str) -> Result<async_nats::Client, BusError> {
+        let (options, address) = credential_in(url);
+        options
+            .connect(&address)
+            .await
+            .map_err(|failed| BusError::HandlerFailed {
+                topic: redacted(url),
+                detail: failed.to_string(),
+            })
+    }
+
     /// Our pattern as a NATS subject.
     ///
     /// Only the tail wildcard differs, and the grammar already restricts `**`
@@ -160,24 +174,42 @@ impl NatsBackend {
 /// second place for it to be wrong. The client library does not read it from
 /// there itself, which is the kind of thing that fails as an authentication
 /// error naming no user at all.
-fn credential_in(url: &str) -> (async_nats::ConnectOptions, String) {
+///
+/// A cluster of servers (step 3b, `broker.replicas: 3`) is every server, by
+/// its name, after the one credential: `nats://user:password@a:4222,b:4222`,
+/// each tried in turn and reconnected to when one is lost.
+fn credential_in(url: &str) -> (async_nats::ConnectOptions, Vec<String>) {
     let (scheme, rest) = url.split_once("://").unwrap_or(("nats", url));
 
-    let Some((credential, host)) = rest.rsplit_once('@') else {
-        return (async_nats::ConnectOptions::new(), url.to_string());
+    let (options, hosts) = match rest.rsplit_once('@') {
+        None => (async_nats::ConnectOptions::new(), rest),
+        Some((credential, hosts)) => {
+            let (user, password) = credential.split_once(':').unwrap_or((credential, ""));
+            (
+                async_nats::ConnectOptions::with_user_and_password(
+                    user.to_string(),
+                    password.to_string(),
+                ),
+                hosts,
+            )
+        }
     };
-
-    let (user, password) = credential.split_once(':').unwrap_or((credential, ""));
-    (
-        async_nats::ConnectOptions::with_user_and_password(user.to_string(), password.to_string()),
-        format!("{scheme}://{host}"),
-    )
+    let servers = hosts
+        .split(',')
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .map(|host| match host.split_once("://") {
+            Some(_) => host.to_string(),
+            None => format!("{scheme}://{host}"),
+        })
+        .collect();
+    (options, servers)
 }
 
 /// The address without its credential, for anything anybody will read.
 fn redacted(url: &str) -> String {
-    let (_, address) = credential_in(url);
-    address
+    let (_, servers) = credential_in(url);
+    servers.join(",")
 }
 
 impl Backend for NatsBackend {
@@ -606,5 +638,35 @@ mod bounded_tests {
         let most = most.load(Ordering::SeqCst);
         assert!(most <= HANDLERS_AT_ONCE, "{most} answered at once");
         assert!(most > 1, "answered concurrently all the same: {most}");
+    }
+}
+
+#[cfg(test)]
+mod address_tests {
+    use super::*;
+
+    #[test]
+    fn one_server_or_every_server_of_a_cluster_with_one_credential() {
+        assert_eq!(
+            credential_in("nats://lake:pw@broker.ns.svc:4222").1,
+            vec!["nats://broker.ns.svc:4222".to_string()]
+        );
+        assert_eq!(
+            credential_in("nats://lake:pw@b-0.m:4222,b-1.m:4222,b-2.m:4222").1,
+            vec![
+                "nats://b-0.m:4222".to_string(),
+                "nats://b-1.m:4222".to_string(),
+                "nats://b-2.m:4222".to_string()
+            ]
+        );
+        assert_eq!(
+            credential_in("nats://127.0.0.1:4222").1,
+            vec!["nats://127.0.0.1:4222".to_string()]
+        );
+        // Never the credential, in anything said.
+        assert_eq!(
+            redacted("nats://lake:pw@b-0.m:4222,b-1.m:4222"),
+            "nats://b-0.m:4222,nats://b-1.m:4222"
+        );
     }
 }

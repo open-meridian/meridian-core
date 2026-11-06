@@ -51,6 +51,9 @@ NAMESPACE = os.environ.get("E2E_NAMESPACE", "meridian-failover-e2e")
 RELEASE = os.environ.get("E2E_RELEASE", "fo")
 FULL = f"{RELEASE}-meridian-runtime"
 IMAGE = os.environ["E2E_IMAGE"]
+# The brought database's image under Patroni (deploy/database), built by the
+# make target for the HA profiles.
+POSTGRES_IMAGE = os.environ.get("E2E_POSTGRES_IMAGE", "meridian-postgres:local")
 CHART = os.path.abspath(os.environ.get("E2E_CHART", "deploy/chart"))
 PROFILE = os.environ.get("PROFILE", "tolerant")
 CLAIMS = os.environ.get("E2E_FAILOVER_CLAIMS", ".e2e-failover-claims.jsonl")
@@ -63,12 +66,16 @@ BINARY = {c: f"meridian-{c}" for c in STORES}
 
 # The bounds each profile is held to (rulings 1048 and 1056), in seconds.
 TOLERANT_POD = 120
+TOLERANT_BROKER = 60
 HA = {"bor": 10, "street": 10, "instrument": 10, "conductor": 10, "launcher": 10, "lake": 15}
+# The database tier (1048): the record's commits back within 30 s of the
+# primary lost, RPO 0; the lake within 30 s.
+HA_DATABASE = {"bor": 30, "lake": 30}
 
 DEFAULT_FAILURES = {
-    "tolerant": ["lake-writer", "bor-writer", "network-policy"],
+    "tolerant": ["lake-writer", "bor-writer", "network-policy", "db-primary", "broker"],
     "ha": ["lake-writer", "bor-writer", "street-writer", "instrument-writer",
-           "split-brain", "node-freeze", "node", "network-policy"],
+           "split-brain", "node-freeze", "node", "network-policy", "db-primary", "broker"],
     "scaled": [],
 }
 
@@ -125,12 +132,28 @@ def secret(name):
     return {key: base64.b64decode(value) for key, value in data.items()}
 
 
-def psql(sql, database="meridian", quiet=False):
+def primary(avoid=()):
+    """The database's primary pod: under Patroni the one it labels so (not
+    one of `avoid`, an old primary cut off and still labelled), else the one
+    member."""
+    said = json.loads(out("get", "pods", "-l",
+                          f"app.kubernetes.io/instance={RELEASE},meridian.dev/component=database,"
+                          "meridian.dev/database-role=primary", "-o", "json"))["items"]
+    live = [p["metadata"]["name"] for p in said
+            if not p["metadata"].get("deletionTimestamp") and p["metadata"]["name"] not in avoid]
+    return live[0] if live else f"{FULL}-database-0"
+
+
+def psql(sql, database="meridian", quiet=False, pod=None):
     return kubectl(
-        "exec", "-i", f"{FULL}-database-0", "--",
+        "exec", "-i", pod or primary(), "-c", "postgres", "--",
         "psql", "-X", "-q", "-At", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", database,
         input=sql.encode(), quiet=quiet,
     ).stdout.decode().strip()
+
+
+def database_members():
+    return 3 if PROFILE in ("ha", "scaled") else 1
 
 
 def pods(component):
@@ -264,19 +287,24 @@ def install(s):
         kubectl("create", "secret", "generic", "failover-key", f"--from-file=key.pem={key}", quiet=True)
         os.remove(key)
         values += ["--set", "key.generate=false", "--set", "key.existingSecret=failover-key"]
-        for component in STORES:
-            values += ["--set", f"{component}.standby=1"]
+        # The HA preset in one value (step 3b): a standby per writer, the
+        # database with two standbys, the broker at three with JetStream,
+        # the dashboard and analytics at two.
+        values += ["--set", "resilience.profile=ha"]
         values += ["--set", "zones={" + ",".join(ZONES) + "}"]
+        values += ["--set", f"database.brought.patroniImage={POSTGRES_IMAGE}"]
     run("helm", "install", RELEASE, CHART, "--namespace", NAMESPACE, "--create-namespace", *values)
     s.check(True, f"helm install, profile {PROFILE}")
-    if PROFILE in ("ha", "scaled"):
-        # The database and the broker kept on the server node, so a test
-        # that stops or pauses an agent never stops them (theirs are 3b's
-        # database and broker classes, injected apart).
-        pin = json.dumps({"spec": {"template": {"spec": {"nodeSelector": {
-            "kubernetes.io/hostname": server_node()}}}}})
+    if PROFILE == "ha":
+        # The database's and the broker's members kept on the server node,
+        # so a test that stops or pauses an agent never stops them: theirs
+        # are the db-primary and broker classes, injected apart. The shape
+        # run (scaled) leaves them spread over the zones.
+        pin = json.dumps({"spec": {"template": {"spec": {
+            "nodeSelector": {"kubernetes.io/hostname": server_node()},
+            "affinity": None, "topologySpreadConstraints": None}}}})
         kubectl("patch", "statefulset", f"{FULL}-database", "--type", "merge", "-p", pin)
-        kubectl("patch", "deployment", f"{FULL}-broker", "--type", "merge", "-p", pin, check=False)
+        kubectl("patch", "statefulset", f"{FULL}-broker", "--type", "merge", "-p", pin)
 
 
 def first_run(s):
@@ -285,10 +313,11 @@ def first_run(s):
     restarted; the Job ended and its rights given up (as e2e/backup)."""
     wait_for("the database's StatefulSet", lambda: kubectl(
         "get", "statefulset", f"{FULL}-database", check=False).returncode == 0)
-    kubectl("scale", "statefulset", f"{FULL}-database", "--replicas=1")
-    wait_for("the database", lambda: kubectl(
-        "exec", f"{FULL}-database-0", "--", "pg_isready", "-h", "127.0.0.1", "-U", "postgres",
-        check=False).returncode == 0)
+    kubectl("scale", "statefulset", f"{FULL}-database", f"--replicas={database_members()}")
+    wait_for("the database's primary", lambda: kubectl(
+        "exec", primary(), "-c", "postgres", "--", "pg_isready", "-h", "127.0.0.1", "-U", "postgres",
+        check=False).returncode == 0
+        and psql("select not pg_is_in_recovery()", database="postgres") == "t")
     passwords = secret(f"{FULL}-database-passwords")
     serving, migrating = passwords["serving"].decode(), passwords["migrating"].decode()
     psql(f"create role meridian_app login password '{serving}';\n"
@@ -374,6 +403,38 @@ def shape(s):
             for t in p["spec"].get("tolerations", []))
         for c in STORES + ["dashboard"] for p in pods(c))
     s.check(tolerated, "every stateless pod tolerates an unreachable node for 30 s")
+    # The sets the preset turns up beside the stores (step 3b part 2): the
+    # database's three members under Patroni, the broker's three servers,
+    # the dashboard's two copies and analytics' two of each, every set spread
+    # over three zones (or two, for two), with a budget over it.
+    for component, want in (("database", 3), ("broker", 3), ("dashboard", 2),
+                            ("analytics-coordinator", 2), ("analytics-worker", 2)):
+        settled = happens(lambda c=component, n=want: len(pods(c)) == n and all(ready(p) for p in pods(c)), 300)
+        live = pods(component)
+        s.check(settled, f"{component}: {want} members ready ({len(live)})")
+        if PROFILE == "ha" and component in ("database", "broker"):
+            # Kept on the server node in the failover run (install), so the
+            # agents' classes are injected apart; the shape run spreads them.
+            s.note(f"{component}: kept on the server node for this run")
+        else:
+            zones = {zone_of(p["spec"]["nodeName"]) for p in live}
+            s.check(len(zones) == want and "" not in zones,
+                    f"{component}: one member per zone ({', '.join(sorted(zones))})")
+        budget = kubectl("get", "pdb", f"{FULL}-{component}", check=False).returncode == 0
+        s.check(budget, f"{component}: a disruption budget over its members")
+    roles = sorted(p["metadata"]["labels"].get("meridian.dev/database-role", "") for p in pods("database"))
+    s.check(roles == ["primary", "replica", "replica"], f"database: one primary, two standbys ({roles})")
+    sync = psql("select count(*) from pg_stat_replication where sync_state = 'sync'", database="postgres")
+    s.check(sync == "1", f"database: one standby synchronous ({sync})")
+    checksums = psql("show data_checksums", database="postgres")
+    s.check(checksums == "on", f"database: made with page checksums ({checksums})")
+    # Every store's probe names the primary it reaches, and its checksums.
+    for component in ("bor", "lake"):
+        said = probe(pods(component)[0]["metadata"]["name"], component) or {}
+        database = next((p for p in said.get("paths", []) if p.get("path") == "database"), {})
+        s.check(database.get("primary") is True and database.get("data_checksums") == "on",
+                f"{component}: its probe names a primary with checksums ({database.get('primary')}, "
+                f"{database.get('data_checksums')})")
 
 
 # ── Failure classes ────────────────────────────────────────────────────────
@@ -427,6 +488,11 @@ def kill_writer(s, failure, component):
         modes = sorted((probe(p["metadata"]["name"], component) or {}).get("member", {}).get("mode", "")
                        for p in pods(component))
         s.check(modes == ["standby", "writer"], f"{failure}: the killed writer came back as the standby ({modes})")
+
+
+def zone_of(node_name):
+    return next((n["metadata"]["labels"].get("topology.kubernetes.io/zone", "") for n in nodes()
+                 if n["metadata"]["name"] == node_name), "")
 
 
 def node_of(pod_name):
@@ -585,6 +651,156 @@ def network_policy(s):
         claim(s, "network-policy", component, took, 60)
 
 
+# ── The database and the broker (step 3b part 2) ────────────────────────────
+
+WRITER = r"""
+export PGPASSWORD="${PATRONI_SUPERUSER_PASSWORD:-$POSTGRES_PASSWORD}"
+end=$(( $(date +%s) + SECONDS_ ))
+while [ "$(date +%s)" -lt "$end" ]; do
+  id=$(psql -X -q -At -h HOST -U postgres -d meridian -v ON_ERROR_STOP=1 \
+       -c "insert into failover_marks (at) values (clock_timestamp()) returning id" 2>/dev/null) \
+    && echo "ACKED $id"
+  sleep 0.05
+done
+"""
+
+
+def marks_table():
+    psql("create table if not exists failover_marks (id bigserial primary key, at timestamptz not null)")
+
+
+def write_marks(pod_name, seconds):
+    """Commits, one every 50 ms through the database's Service, from inside
+    a member that is not killed, each acknowledged id printed; started in
+    the background. Its output names every commit the database acknowledged
+    (RPO under load, at the database)."""
+    host = f"{FULL}-database.{NAMESPACE}.svc.cluster.local"
+    script = WRITER.replace("HOST", host).replace("SECONDS_", str(int(seconds)))
+    return subprocess.Popen(
+        ["kubectl", "--namespace", NAMESPACE, "exec", "-i", pod_name, "-c", "postgres", "--",
+         "sh", "-c", script],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+
+def acknowledged(writer):
+    said = writer.communicate(timeout=300)[0].decode(errors="replace")
+    return {int(line.split()[1]) for line in said.splitlines()
+            if line.startswith("ACKED ") and line.split()[1].isdigit()}
+
+
+def database_writes(avoid=()):
+    """The database's primary takes a commit: it is serving."""
+    try:
+        psql("insert into failover_marks (at) values (clock_timestamp())", pod=primary(avoid))
+        return True
+    except SystemExit:
+        return False
+
+
+def db_primary(s):
+    print("F: db-primary: the database's primary killed outright (SIGKILL), under commits", flush=True)
+    for component in ("bor", "lake"):
+        wait_for(f"{component} settled", lambda c=component: members_settled(c), seconds=300)
+    marks_table()
+    victim = primary()
+    members = [p["metadata"]["name"] for p in pods("database")]
+    # Commits made from a member that is not killed. The tolerant profile has
+    # one member, killed with its writer: there the commits before the kill
+    # are what is held.
+    writing_in = next((m for m in members if m != victim), None)
+    writer = write_marks(writing_in, 45) if writing_in else None
+    time.sleep(3)
+    psql("insert into failover_marks (at) values (clock_timestamp())")
+    acked_before = int(psql("select max(id) from failover_marks") or 0)
+    began = time.time()
+    # With standbys, the primary is kept down: cut off from everything on
+    # its node, then killed, so its Patroni cannot renew the leader key as
+    # its container comes back and a standby is promoted -- the failover
+    # timed, not a restart. Alone, it is killed and restarts on its volume.
+    isolated = PROFILE != "tolerant"
+    if isolated:
+        isolate(victim, "-I")
+    crash(victim, "postgres")
+    bound = {"bor": TOLERANT_POD, "lake": TOLERANT_POD} if PROFILE == "tolerant" else HA_DATABASE
+    took = {}
+
+    def back():
+        if not database_writes(avoid=(victim,) if isolated else ()):
+            return False
+        for component in ("bor", "lake"):
+            if component not in took and answering(component):
+                took[component] = time.time() - began
+        return len(took) == 2
+
+    try:
+        happens(back, max(bound.values()) + 30, every=0.5)
+    finally:
+        if isolated:
+            isolate(victim, "-D")
+    new_primary = primary(avoid=(victim,) if isolated else ())
+    acked = acknowledged(writer) if writer else set()
+    acked.add(acked_before)
+    kept = {int(i) for i in psql("select id from failover_marks", pod=new_primary).split()}
+    lost = sorted(acked - kept)
+    if PROFILE != "tolerant":
+        s.check(new_primary != victim, f"db-primary: a standby promoted ({new_primary})")
+    s.check(not lost, f"db-primary: every acknowledged commit kept ({len(acked)} acknowledged, "
+            f"{len(lost)} lost{': ' + ', '.join(map(str, lost[:5])) if lost else ''})")
+    for component in ("bor", "lake"):
+        if component not in took:
+            s.check(False, f"db-primary: {component} never answered again within {bound[component] + 30}s")
+            continue
+        claim(s, "db-primary", component, took[component], bound[component],
+              {"acknowledged_commits": len(acked), "rpo_commits_lost": len(lost)})
+    healed = happens(lambda: len(pods("database")) == database_members()
+                     and all(ready(p) for p in pods("database")), 300)
+    s.check(healed, "db-primary: the killed member back, as a standby where there are standbys")
+
+
+def isolate(pod_name, verb):
+    """Every packet to and from a pod dropped on its node, whatever its
+    peer: routed through the node (FORWARD) or the node itself (INPUT,
+    OUTPUT), the API server and the kubelet included."""
+    node, ip = node_of(pod_name), pod_ip(pod_name)
+    for chain, rule in (("FORWARD", ["-s", ip]), ("FORWARD", ["-d", ip]),
+                        ("INPUT", ["-s", ip]), ("OUTPUT", ["-d", ip])):
+        run("docker", "exec", node, "iptables", verb, chain, *(["1"] if verb == "-I" else []),
+            *rule, "-j", "DROP", check=verb == "-I")
+
+
+def broker_lost(s):
+    print("F: broker: a broker server cut off from every member, then killed outright", flush=True)
+    wait_for("bor settled", lambda: members_settled("bor"), seconds=300)
+    servers = [p["metadata"]["name"] for p in pods("broker")]
+    victim = servers[0]
+    epoch = epoch_now("bor")
+    others = [pod_ip(p["metadata"]["name"])
+              for c in ("bor", "lake", "street", "instrument", "conductor", "broker", "dashboard")
+              for p in pods(c) if p["metadata"]["name"] != victim]
+    others = [ip for ip in others if ip]
+    began = time.time()
+    if len(servers) > 1:
+        cut_rules(victim, others, "-I")
+    try:
+        time.sleep(2)
+        crash(victim, "broker")
+    finally:
+        if len(servers) > 1:
+            cut_rules(victim, others, "-D")
+    bound = TOLERANT_BROKER if PROFILE == "tolerant" else HA["bor"]
+    back = happens(lambda: answering("bor") is not None, bound + 30, every=0.5)
+    took = time.time() - began
+    if not back:
+        s.check(False, f"broker: the book never answered again within {bound + 30}s")
+        return
+    claim(s, "broker", "bor", took, bound, {"servers": len(servers)})
+    if PROFILE != "tolerant":
+        s.check(epoch_now("bor") == epoch, "broker: no takeover for a broker server lost")
+    healed = happens(lambda: len(pods("broker")) == len(servers)
+                     and all(ready(p) for p in pods("broker")), 180)
+    s.check(healed, "broker: the killed server back")
+
+
 FAILURES = {
     "lake-writer": lambda s: kill_writer(s, "lake-writer", "lake"),
     "bor-writer": lambda s: kill_writer(s, "bor-writer", "bor"),
@@ -596,6 +812,8 @@ FAILURES = {
     "split-brain": split_brain,
     "node": node_lost,
     "network-policy": network_policy,
+    "db-primary": db_primary,
+    "broker": broker_lost,
 }
 
 

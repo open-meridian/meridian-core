@@ -1030,7 +1030,7 @@ async fn callback(
 
     // Whether this sign-in was a client's, asked before it is finished so a
     // state is matched to at most one request, whatever happens next.
-    let client = app.delegations.for_provider_state(state);
+    let client = app.delegations.for_provider_state(state, now);
     let identity = match oidc.finish(state, code, now).await {
         Ok(identity) => identity,
         Err(failed) => return bad_request(&failed),

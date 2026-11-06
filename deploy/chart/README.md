@@ -188,6 +188,39 @@ leaves the lake resident near its peak: 825 MB to 1 GiB on dev at startup
 while holding about 250 MiB live. At 128 KiB the same burst of eight chain
 readers peaked at 381 to 393 MiB resident, not 848.
 
+## Resilience: one value for the HA configuration
+
+`resilience.profile` is `tolerant` by default: one member of everything,
+healed by Kubernetes restarting it, which is what a desktop and a small
+deployment run. `ha` turns every count of the HA configuration on at once,
+each still overridable by its own value:
+
+| Value | `tolerant` | `ha` |
+|---|---|---|
+| `<store>.standby` (lake, bor, instrument, street, conductor, launcher) | 0 | 1 |
+| `database.brought.standbys` | 0 | 2, under Patroni |
+| `broker.replicas` | 1 | 3, a NATS cluster |
+| `broker.jetstream.replicas` | 0 | 3, the analytics units' work queue |
+| `dashboard.replicaCount` | 1 | 2 |
+| `analytics.coordinator.replicaCount`, `analytics.worker.replicaCount` | 1 | 2 |
+
+`ha` needs the deployment's key in a Kubernetes Secret named by
+`key.existingSecret`: the conductor's standby runs on another node, and a key
+the conductor generated into a volume is mounted on one node at a time. The
+chart refuses `ha` without one.
+
+The brought database with standbys runs `database.brought.patroniImage`, the
+same Postgres 16 with Patroni and pgBackRest: a primary and two standbys,
+each on its own volume and node, one standby synchronous and strict, so a
+primary cut off from every standby cannot acknowledge a commit alone. The
+book's, the street store's, the instrument store's and the configuration's
+commits wait for that standby; the lake's commit locally. Patroni keeps its
+state in this namespace's ConfigMaps and its members' labels, under a
+namespaced Role, and the database's Service follows the primary. A database
+made by this chart has page checksums from initdb on; one made before keeps
+what it had. Every count the chart takes is one CI tests, and any other is
+refused.
+
 ## An upgrade checked before it changes anything
 
 Every upgrade runs a preflight first (`preflight.enabled`, on by default): a

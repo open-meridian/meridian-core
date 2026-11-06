@@ -78,6 +78,7 @@ use prost::Message;
 use crate::clock::SECOND_NS;
 use crate::delegation::Delegations;
 use crate::html::{escape, page};
+use crate::in_flight::{kind, InFlightStore, InMemory};
 use crate::session::{token, Sessions, ABSOLUTE_NS};
 use crate::signing::Signer;
 use crate::terminal::Unavailable;
@@ -101,7 +102,7 @@ const ASSERTION_NS: i64 = 60 * SECOND_NS;
 /// The session a plugin host's session came from, which it ends with: a
 /// browser's on the dashboard, by its token's hash (ruling 855), or a
 /// delegation's, by its id -- so no token of either is kept anywhere.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Came {
     Browser(String),
     Delegation(String),
@@ -209,6 +210,31 @@ struct Code {
     prepared: String,
 }
 
+/// Most codes in flight at once.
+const MOST_CODES: usize = 4_096;
+
+impl Code {
+    fn held(&self) -> serde_json::Value {
+        serde_json::json!({
+            "came": self.came,
+            "instance": self.instance,
+            "level": level_name(self.level),
+            "expires_at_ns": self.expires_at_ns,
+            "prepared": self.prepared,
+        })
+    }
+
+    fn from_held(held: &serde_json::Value) -> Option<Code> {
+        Some(Code {
+            came: serde_json::from_value(held["came"].clone()).ok()?,
+            instance: held["instance"].as_str()?.to_string(),
+            level: parse_level(held["level"].as_str()?)?,
+            expires_at_ns: held["expires_at_ns"].as_i64()?,
+            prepared: held["prepared"].as_str().unwrap_or_default().to_string(),
+        })
+    }
+}
+
 pub struct Plugins {
     scheme: String,
     /// The dashboard's own host, without a port. Plugin hosts sit below it.
@@ -221,7 +247,10 @@ pub struct Plugins {
     client: reqwest::Client,
     /// Names answered without asking DNS: a test's sidecars, on loopback.
     pinned: HashMap<String, SocketAddr>,
-    codes: Mutex<HashMap<String, Code>>,
+    /// One-time codes minted and not yet presented: in the dashboard's table
+    /// where it has one, so a code minted on one copy is redeemed on
+    /// another (step 3b).
+    codes: Arc<dyn InFlightStore>,
     /// The plugin hosts' sessions, by their tokens' hashes: held in memory,
     /// and kept in the dashboard's table where it has one (ruling 855).
     entered: Mutex<HashMap<String, Entered>>,
@@ -293,7 +322,7 @@ impl Plugins {
             signer,
             client: client(&HashMap::new())?,
             pinned: HashMap::new(),
-            codes: Mutex::new(HashMap::new()),
+            codes: Arc::new(InMemory::default()),
             entered: Mutex::new(HashMap::new()),
             kept: None,
         })
@@ -303,6 +332,13 @@ impl Plugins {
     /// restart or an upgrade leaves an open page working (ruling 855).
     pub fn keeping_in(mut self, database: crate::database::Database) -> Plugins {
         self.kept = Some(Arc::new(kept::InPostgres::on(database)));
+        self
+    }
+
+    /// One-time codes in flight kept in `store`, the dashboard's table, so
+    /// any copy redeems a code any other minted (step 3b).
+    pub fn in_flight(mut self, store: Arc<dyn InFlightStore>) -> Plugins {
+        self.codes = store;
         self
     }
 
@@ -478,16 +514,26 @@ impl Plugins {
         prepared: &str,
     ) -> String {
         let code = token();
-        self.codes.lock().expect("code lock poisoned").insert(
-            code.clone(),
-            Code {
-                came,
-                instance: instance.to_string(),
-                level,
-                expires_at_ns: now_ns + CODE_NS,
-                prepared: prepared.to_string(),
-            },
-        );
+        let held = Code {
+            came,
+            instance: instance.to_string(),
+            level,
+            expires_at_ns: now_ns + CODE_NS,
+            prepared: prepared.to_string(),
+        };
+        let kept = crate::session::blocking(|| {
+            self.codes.put(
+                kind::PLUGIN_CODE,
+                &code,
+                &held.held(),
+                held.expires_at_ns,
+                MOST_CODES,
+            )
+        });
+        if let Err(failed) = kept {
+            // Presented, it is refused, and the page is opened again.
+            tracing::warn!(instance, "a plugin page's code was not kept: {failed}");
+        }
         code
     }
 
@@ -506,11 +552,14 @@ impl Plugins {
         instance: &str,
         now_ns: i64,
     ) -> Option<(Came, AccessLevel, String)> {
-        let held = self
-            .codes
-            .lock()
-            .expect("code lock poisoned")
-            .remove(code)?;
+        let held =
+            match crate::session::blocking(|| self.codes.take(kind::PLUGIN_CODE, code, now_ns)) {
+                Ok(held) => Code::from_held(&held?)?,
+                Err(failed) => {
+                    tracing::warn!("the plugin pages' codes could not be read: {failed}");
+                    return None;
+                }
+            };
         (held.instance == instance && now_ns <= held.expires_at_ns).then_some((
             held.came,
             held.level,
@@ -627,10 +676,9 @@ impl Plugins {
     /// asked about is kept for the next sweep: a database briefly away has
     /// ended nobody's session.
     pub async fn sweep(&self, sessions: &Sessions, delegations: &Delegations, now_ns: i64) {
-        self.codes
-            .lock()
-            .expect("code lock poisoned")
-            .retain(|_, code| code.expires_at_ns >= now_ns);
+        if let Err(failed) = crate::session::blocking(|| self.codes.sweep(now_ns)) {
+            tracing::warn!("the plugin pages' codes were not swept: {failed}");
+        }
         // Those held here, and those kept in the table from before a
         // restart that nobody has used since (ruling 855).
         let mut held: HashMap<String, Came> = self

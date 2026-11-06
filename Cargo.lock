@@ -1727,6 +1727,7 @@ dependencies = [
 name = "meridian-analytics"
 version = "0.1.0"
 dependencies = [
+ "async-nats",
  "futures-util",
  "meridian-analytics-engine",
  "meridian-bus",

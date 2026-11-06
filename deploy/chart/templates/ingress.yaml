@@ -53,6 +53,12 @@ metadata:
     {{- if not .Values.ingress.plainHttp }}
     {{- $_ := set $defaults "traefik.ingress.kubernetes.io/router.entrypoints" "websecure" }}
     {{- end }}
+    {{- /* A browser kept to the dashboard copy it reached, where there are
+           several (see the dashboard's Service). */}}
+    {{- if gt (int (include "meridian-runtime.copies" (dict "top" . "value" .Values.dashboard.replicaCount "what" "dashboard.replicaCount"))) 1 }}
+    {{- $_ := set $defaults "nginx.ingress.kubernetes.io/affinity" "cookie" }}
+    {{- $_ := set $defaults "nginx.ingress.kubernetes.io/session-cookie-name" "meridian_dashboard_copy" }}
+    {{- end }}
     {{- range $name, $value := merge (.Values.ingress.annotations | default dict) $defaults }}
     {{ $name }}: {{ $value | quote }}
     {{- end }}
