@@ -278,9 +278,42 @@ struct Carried {
     previous_digest: String,
 }
 
+/// The columns an entry is kept with, but its reply, as stored.
+pub struct Stored<'a> {
+    pub entry_id: &'a str,
+    pub account_id: &'a str,
+    pub first_sequence: u64,
+    pub last_sequence: u64,
+    pub message_id: &'a str,
+    pub idempotency_key: &'a str,
+    pub meta: &'a [u8],
+    pub cause: &'a [u8],
+    pub body: &'a [u8],
+    pub previous_digest: &'a [u8],
+}
+
+impl Stored<'_> {
+    /// The entry as its digest is taken: its change's body, built from the
+    /// bytes it is kept as, so an entry is chained and checked without
+    /// being decoded (step 3b, integrity at rest).
+    pub fn canonical(&self) -> Vec<u8> {
+        let carried = Carried {
+            entry_id: self.entry_id.to_string(),
+            account_id: self.account_id.to_string(),
+            first_sequence: self.first_sequence,
+            last_sequence: self.last_sequence,
+            message_id: self.message_id.to_string(),
+            idempotency_key: self.idempotency_key.to_string(),
+            meta: STANDARD.encode(self.meta),
+            cause: STANDARD.encode(self.cause),
+            body: STANDARD.encode(self.body),
+            previous_digest: STANDARD.encode(self.previous_digest),
+        };
+        serde_json::to_vec(&carried).expect("an entry is plain data")
+    }
+}
+
 impl Entry {
-    /// The entry as its partition's change, written under `epoch` in the
-    /// deployment `origin`.
     /// The entry as its digest is taken: its change's body, which names
     /// every column it was kept with but its reply.
     pub fn canonical(&self) -> Vec<u8> {
@@ -307,6 +340,8 @@ impl Entry {
         )))
     }
 
+    /// The entry as its partition's change, written under `epoch` in the
+    /// deployment `origin`.
     pub fn to_change(&self, epoch: u64, origin: &str) -> meridian_changes::Change {
         let carried = Carried {
             entry_id: self.entry_id.clone(),

@@ -241,35 +241,33 @@ pub fn scrub_chain(conn: &mut Connection) -> Result<meridian_changes::integrity:
             }
             for row in &rows {
                 scrubbed.checked += 1;
-                let entry = entry_of(row)?;
-                after = entry.first_sequence as i64;
+                after = row.get::<_, i64>(3);
+                let last_sequence = row.get::<_, i64>(4) as u64;
                 let at: i64 = row.get(12);
+                let (_, entry_previous, entry_digest) = stored_of(row);
                 let broken = |what: &str| meridian_changes::integrity::Finding {
                     partition: partition.clone(),
-                    sequence: entry.last_sequence,
+                    sequence: last_sequence,
                     committed_at_ns: at,
                     what: what.to_string(),
                 };
-                if entry.digest.is_empty() {
+                if entry_digest.is_empty() {
                     previous = None;
                     continue;
                 }
-                if previous
-                    .as_ref()
-                    .is_some_and(|p| *p != entry.previous_digest)
-                {
+                if previous.as_ref().is_some_and(|p| *p != entry_previous) {
                     scrubbed.findings.push(broken(
                         "an entry does not follow the one before it: one was changed or removed",
                     ));
                     break 'partition;
                 }
-                if entry.verify().is_err() {
+                if !stored_verifies(row) {
                     scrubbed.findings.push(broken(
                         "an entry does not match its digest: it changed beneath the book",
                     ));
                     break 'partition;
                 }
-                previous = Some(entry.digest.clone());
+                previous = Some(entry_digest);
             }
         }
     }
@@ -303,21 +301,37 @@ fn chain(conn: &mut Connection) -> Result<()> {
             )
             .map_err(unavailable)?;
         let mut previous: Vec<u8> = Vec::new();
+        // Each entry as it is stored, never decoded: an entry the book could
+        // not read is chained all the same, and never stops the upgrade.
         for row in &rows {
-            let mut entry = entry_of(row)?;
-            if entry.digest.is_empty() {
-                entry.previous_digest = previous.clone();
-                entry.digest = meridian_changes::integrity::chained(
-                    &entry.previous_digest,
-                    &entry.canonical(),
-                );
-                tx.execute(
-                    "UPDATE book_entry SET previous_digest = $2, digest = $3 WHERE entry_id = $1",
-                    &[&entry.entry_id, &entry.previous_digest, &entry.digest],
-                )
-                .map_err(unavailable)?;
-            }
-            previous = entry.digest;
+            let entry_id: String = row.get(0);
+            let digest: Option<Vec<u8>> = row.get(11);
+            let digest = match digest {
+                Some(digest) => digest,
+                None => {
+                    let canonical = crate::journal::Stored {
+                        entry_id: &entry_id,
+                        account_id: row.get(1),
+                        first_sequence: row.get::<_, i64>(3) as u64,
+                        last_sequence: row.get::<_, i64>(4) as u64,
+                        message_id: row.get(5),
+                        idempotency_key: row.get(6),
+                        meta: row.get(7),
+                        cause: row.get(8),
+                        body: row.get(9),
+                        previous_digest: &previous,
+                    }
+                    .canonical();
+                    let digest = meridian_changes::integrity::chained(&previous, &canonical);
+                    tx.execute(
+                        "UPDATE book_entry SET previous_digest = $2, digest = $3 WHERE entry_id = $1",
+                        &[&entry_id, &previous, &digest],
+                    )
+                    .map_err(unavailable)?;
+                    digest
+                }
+            };
+            previous = digest;
         }
         tx.execute(
             "UPDATE book_partition_head SET last_digest = $2 WHERE partition = $1",
@@ -331,6 +345,34 @@ fn chain(conn: &mut Connection) -> Result<()> {
 
 const ENTRY_COLUMNS: &str = "entry_id, account_id, partition, first_sequence, last_sequence,
         message_id, idempotency_key, meta, cause, body, previous_digest, digest";
+
+/// A row of [`ENTRY_COLUMNS`] as its digest is taken, never decoded:
+/// its canonical form, its previous digest and its digest.
+fn stored_of(row: &Row) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let previous: Vec<u8> = row.get::<_, Option<Vec<u8>>>(10).unwrap_or_default();
+    let digest: Vec<u8> = row.get::<_, Option<Vec<u8>>>(11).unwrap_or_default();
+    let canonical = crate::journal::Stored {
+        entry_id: row.get(0),
+        account_id: row.get(1),
+        first_sequence: row.get::<_, i64>(3) as u64,
+        last_sequence: row.get::<_, i64>(4) as u64,
+        message_id: row.get(5),
+        idempotency_key: row.get(6),
+        meta: row.get(7),
+        cause: row.get(8),
+        body: row.get(9),
+        previous_digest: &previous,
+    }
+    .canonical();
+    (canonical, previous, digest)
+}
+
+/// Whether a row is the entry its digest was taken of; one kept before
+/// digests is taken as it is.
+fn stored_verifies(row: &Row) -> bool {
+    let (canonical, previous, digest) = stored_of(row);
+    digest.is_empty() || meridian_changes::integrity::chained(&previous, &canonical) == digest
+}
 
 fn entry_of(row: &Row) -> Result<Entry> {
     let meta: Vec<u8> = row.get(7);
@@ -365,7 +407,20 @@ fn journal_of(client: &mut impl GenericClient, account_id: &str) -> Result<Vec<E
         .iter()
         // Each entry replayed is the one its digest was taken of (step 3b):
         // a record changed beneath the book fails the replay loudly.
-        .map(|row| entry_of(row).and_then(|entry| entry.verify().map(|()| entry)))
+        .map(|row| {
+            if !stored_verifies(row) {
+                let (_, _, digest) = stored_of(row);
+                return Err(StoreError::Unavailable(format!(
+                    "entry {} of partition {} (account {}) does not match its digest {}: the \
+                     record changed beneath the book, and it is not replayed from it",
+                    row.get::<_, i64>(4),
+                    row.get::<_, String>(2),
+                    row.get::<_, String>(1),
+                    meridian_changes::integrity::short(&digest)
+                )));
+            }
+            entry_of(row)
+        })
         .collect()
 }
 

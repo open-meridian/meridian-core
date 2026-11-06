@@ -1519,3 +1519,33 @@ async fn the_journal_is_a_chain_its_scrub_names_a_changed_entry_and_a_replay_ref
         "{refused}"
     );
 }
+
+#[test]
+fn an_entry_kept_before_digests_is_chained_by_migrate_even_one_the_book_cannot_read() {
+    let (url, store) = isolated();
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    // As a restore of an older book leaves it: no digest, and here a body
+    // that does not decode.
+    client
+        .execute(
+            "INSERT INTO book_entry (entry_id, account_id, partition, first_sequence, last_sequence,
+                                     kind, effective_date, committed_at_ns, meta, cause, body, reply)
+             VALUES ('ENT-OLD', 'ACC-OLD', 'P0', 900001, 900001, 'opening-balance', '2026-01-01',
+                     1, ''::bytea, ''::bytea, ''::bytea, ''::bytea)",
+            &[],
+        )
+        .unwrap();
+    store
+        .migrate(&meridian_clock::SystemClock)
+        .expect("migrating chains it, whatever it holds");
+    let chained: bool = client
+        .query_one(
+            "SELECT digest IS NOT NULL FROM book_entry WHERE entry_id = 'ENT-OLD'",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert!(chained);
+    let scrubbed = store.scrub().expect("scrubs");
+    assert!(scrubbed.findings.is_empty(), "{:?}", scrubbed.findings);
+}
