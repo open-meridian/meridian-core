@@ -52,6 +52,18 @@ const REFUSAL_HEADER: &str = "Meridian-Refusal";
 /// rest wait their turn on a cheap task.
 pub const HANDLERS_AT_ONCE: usize = 16;
 
+/// How often a client asks its server to hand a message back to it, and how
+/// long it waits for it before moving to another server (step 3b): the
+/// servers' 2 s rule for a client, said from the client's side. A server
+/// cut off from its clients, or on a node that stopped, sends no reset and
+/// no error, and the library's own ping waits a minute -- and is put off by
+/// every message the client sends, so a client that publishes often never
+/// pings at all. Meanwhile its subscriptions, a writer's change log among
+/// them, are served by nobody. The round trip is on an inbox of its own,
+/// which every credential holds (`_INBOX.>`).
+const HEARTBEAT: Duration = Duration::from_secs(1);
+const UNANSWERED: Duration = Duration::from_secs(2);
+
 /// The bound a process runs with: `MERIDIAN_HANDLERS_AT_ONCE` where it is a
 /// positive number, so a deployment lowers one component's without a
 /// release; otherwise [`HANDLERS_AT_ONCE`].
@@ -85,9 +97,23 @@ pub struct NatsBackend {
     /// Every served topic's handlers share it: at most [`HANDLERS_AT_ONCE`]
     /// answering at once.
     answering: Arc<tokio::sync::Semaphore>,
+
+    /// The client's heartbeat, stopped with it.
+    heartbeat: tokio::task::AbortHandle,
+}
+
+impl Drop for NatsBackend {
+    fn drop(&mut self) {
+        self.heartbeat.abort();
+    }
 }
 
 impl NatsBackend {
+    /// How often its client hands itself a message by its server.
+    pub const HEARTBEAT: Duration = HEARTBEAT;
+    /// How long it waits for one before moving to another server.
+    pub const UNANSWERED: Duration = UNANSWERED;
+
     /// Connect, or say why not.
     ///
     /// The credential is in the URL, because that is where a broker's client
@@ -109,6 +135,7 @@ impl NatsBackend {
                 topic: redacted(url),
                 detail: failed.to_string(),
             })?;
+        let heartbeat = tokio::spawn(heartbeat(client.clone())).abort_handle();
 
         let (outbox, mut sending) = mpsc::unbounded_channel::<(String, Vec<u8>)>();
         let publishing = client.clone();
@@ -128,21 +155,25 @@ impl NatsBackend {
             answering: Arc::new(tokio::sync::Semaphore::new(handlers_at_once(
                 std::env::var("MERIDIAN_HANDLERS_AT_ONCE").ok().as_deref(),
             ))),
+            heartbeat,
         })
     }
 
     /// A client of its own on the broker the URL names, with its credential,
     /// for a component that speaks to JetStream itself (step 3b: the
     /// analytics units' work queue). Everything else goes by the bus.
+    /// Its heartbeat runs as long as the process does.
     pub async fn client(url: &str) -> Result<async_nats::Client, BusError> {
         let (options, address) = credential_in(url);
-        options
+        let client = options
             .connect(&address)
             .await
             .map_err(|failed| BusError::HandlerFailed {
                 topic: redacted(url),
                 detail: failed.to_string(),
-            })
+            })?;
+        tokio::spawn(heartbeat(client.clone()));
+        Ok(client)
     }
 
     /// Our pattern as a NATS subject.
@@ -167,6 +198,61 @@ impl NatsBackend {
     }
 }
 
+/// Hand a message to this client by its server every [`HEARTBEAT`]; where
+/// none comes back within [`UNANSWERED`], move to another server. Ends when
+/// the client does.
+async fn heartbeat(client: async_nats::Client) {
+    use async_nats::connection::State;
+    use futures_util::StreamExt as _;
+
+    let inbox = client.new_inbox();
+    let Ok(mut back) = client.subscribe(inbox.clone()).await else {
+        return;
+    };
+    let mut sent: u64 = 0;
+    loop {
+        tokio::time::sleep(HEARTBEAT).await;
+        // Already moving: the library reconnects, and resubscribes this.
+        if client.connection_state() != State::Connected {
+            continue;
+        }
+        sent += 1;
+        if client
+            .publish(inbox.clone(), sent.to_be_bytes().to_vec().into())
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        // This one back, past any a slow server handed back late.
+        let heard = tokio::time::timeout(UNANSWERED, async {
+            while let Some(message) = back.next().await {
+                if message.payload.as_ref() == sent.to_be_bytes() {
+                    return true;
+                }
+            }
+            false
+        })
+        .await;
+        match heard {
+            Ok(true) => {}
+            // The client is gone, and with it what this watched.
+            Ok(false) => return,
+            Err(_) if client.connection_state() == State::Connected => {
+                tracing::warn!(
+                    server = %client.server_info().server_name,
+                    "the broker's server did not answer within {} s: moving to another",
+                    UNANSWERED.as_secs()
+                );
+                if client.force_reconnect().await.is_err() {
+                    return;
+                }
+            }
+            Err(_) => {}
+        }
+    }
+}
+
 /// Split `nats://user:password@host` into what to present and where.
 ///
 /// Taken from the URL rather than from a second setting, because that is where
@@ -181,7 +267,7 @@ impl NatsBackend {
 fn credential_in(url: &str) -> (async_nats::ConnectOptions, Vec<String>) {
     let (scheme, rest) = url.split_once("://").unwrap_or(("nats", url));
 
-    let (options, hosts) = match rest.rsplit_once('@') {
+    let (options, hosts): (async_nats::ConnectOptions, &str) = match rest.rsplit_once('@') {
         None => (async_nats::ConnectOptions::new(), rest),
         Some((credential, hosts)) => {
             let (user, password) = credential.split_once(':').unwrap_or((credential, ""));
@@ -203,7 +289,9 @@ fn credential_in(url: &str) -> (async_nats::ConnectOptions, Vec<String>) {
             None => format!("{scheme}://{host}"),
         })
         .collect();
-    (options, servers)
+    // A server that does not answer is given as long as the heartbeat
+    // gives one, before the next is tried.
+    (options.connection_timeout(UNANSWERED), servers)
 }
 
 /// The address without its credential, for anything anybody will read.
