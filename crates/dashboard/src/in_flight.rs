@@ -85,10 +85,14 @@ fn unset(held: &Value, field: &str) -> bool {
     )
 }
 
+/// What one thing in flight holds in memory: its value, when it expires and
+/// its place in the order things were put, by its kind and its key's hash.
+type Held = HashMap<(String, String), (Value, i64, i64)>;
+
 /// In this process alone: tests, and a dashboard given no database.
 #[derive(Default)]
 pub struct InMemory {
-    held: Mutex<HashMap<(String, String), (Value, i64, i64)>>,
+    held: Mutex<Held>,
     /// Puts so far, ordering each kind's oldest.
     put: Mutex<i64>,
 }
