@@ -132,13 +132,15 @@ def secret(name):
     return {key: base64.b64decode(value) for key, value in data.items()}
 
 
-def primary():
-    """The database's primary pod: under Patroni the one it labels so, else
-    the one member."""
+def primary(avoid=()):
+    """The database's primary pod: under Patroni the one it labels so (not
+    one of `avoid`, an old primary cut off and still labelled), else the one
+    member."""
     said = json.loads(out("get", "pods", "-l",
                           f"app.kubernetes.io/instance={RELEASE},meridian.dev/component=database,"
                           "meridian.dev/database-role=primary", "-o", "json"))["items"]
-    live = [p["metadata"]["name"] for p in said if not p["metadata"].get("deletionTimestamp")]
+    live = [p["metadata"]["name"] for p in said
+            if not p["metadata"].get("deletionTimestamp") and p["metadata"]["name"] not in avoid]
     return live[0] if live else f"{FULL}-database-0"
 
 
@@ -410,9 +412,14 @@ def shape(s):
         settled = happens(lambda c=component, n=want: len(pods(c)) == n and all(ready(p) for p in pods(c)), 300)
         live = pods(component)
         s.check(settled, f"{component}: {want} members ready ({len(live)})")
-        zones = {zone_of(p["spec"]["nodeName"]) for p in live}
-        s.check(len(zones) == want and "" not in zones,
-                f"{component}: one member per zone ({', '.join(sorted(zones))})")
+        if PROFILE == "ha" and component in ("database", "broker"):
+            # Kept on the server node in the failover run (install), so the
+            # agents' classes are injected apart; the shape run spreads them.
+            s.note(f"{component}: kept on the server node for this run")
+        else:
+            zones = {zone_of(p["spec"]["nodeName"]) for p in live}
+            s.check(len(zones) == want and "" not in zones,
+                    f"{component}: one member per zone ({', '.join(sorted(zones))})")
         budget = kubectl("get", "pdb", f"{FULL}-{component}", check=False).returncode == 0
         s.check(budget, f"{component}: a disruption budget over its members")
     roles = sorted(p["metadata"]["labels"].get("meridian.dev/database-role", "") for p in pods("database"))
@@ -681,10 +688,10 @@ def acknowledged(writer):
             if line.startswith("ACKED ") and line.split()[1].isdigit()}
 
 
-def database_writes():
-    """The database's Service takes a commit: its primary is serving."""
+def database_writes(avoid=()):
+    """The database's primary takes a commit: it is serving."""
     try:
-        psql("insert into failover_marks (at) values (clock_timestamp())")
+        psql("insert into failover_marks (at) values (clock_timestamp())", pod=primary(avoid))
         return True
     except SystemExit:
         return False
@@ -706,23 +713,34 @@ def db_primary(s):
     psql("insert into failover_marks (at) values (clock_timestamp())")
     acked_before = int(psql("select max(id) from failover_marks") or 0)
     began = time.time()
+    # With standbys, the primary is kept down: cut off from everything on
+    # its node, then killed, so its Patroni cannot renew the leader key as
+    # its container comes back and a standby is promoted -- the failover
+    # timed, not a restart. Alone, it is killed and restarts on its volume.
+    isolated = PROFILE != "tolerant"
+    if isolated:
+        isolate(victim, "-I")
     crash(victim, "postgres")
     bound = {"bor": TOLERANT_POD, "lake": TOLERANT_POD} if PROFILE == "tolerant" else HA_DATABASE
     took = {}
 
     def back():
-        if not database_writes():
+        if not database_writes(avoid=(victim,) if isolated else ()):
             return False
         for component in ("bor", "lake"):
             if component not in took and answering(component):
                 took[component] = time.time() - began
         return len(took) == 2
 
-    happens(back, max(bound.values()) + 30, every=0.5)
-    new_primary = primary()
+    try:
+        happens(back, max(bound.values()) + 30, every=0.5)
+    finally:
+        if isolated:
+            isolate(victim, "-D")
+    new_primary = primary(avoid=(victim,) if isolated else ())
     acked = acknowledged(writer) if writer else set()
     acked.add(acked_before)
-    kept = {int(i) for i in psql("select id from failover_marks").split()}
+    kept = {int(i) for i in psql("select id from failover_marks", pod=new_primary).split()}
     lost = sorted(acked - kept)
     if PROFILE != "tolerant":
         s.check(new_primary != victim, f"db-primary: a standby promoted ({new_primary})")
@@ -737,6 +755,17 @@ def db_primary(s):
     healed = happens(lambda: len(pods("database")) == database_members()
                      and all(ready(p) for p in pods("database")), 300)
     s.check(healed, "db-primary: the killed member back, as a standby where there are standbys")
+
+
+def isolate(pod_name, verb):
+    """Every packet to and from a pod dropped on its node, whatever its
+    peer: routed through the node (FORWARD) or the node itself (INPUT,
+    OUTPUT), the API server and the kubelet included."""
+    node, ip = node_of(pod_name), pod_ip(pod_name)
+    for chain, rule in (("FORWARD", ["-s", ip]), ("FORWARD", ["-d", ip]),
+                        ("INPUT", ["-s", ip]), ("OUTPUT", ["-d", ip])):
+        run("docker", "exec", node, "iptables", verb, chain, *(["1"] if verb == "-I" else []),
+            *rule, "-j", "DROP", check=verb == "-I")
 
 
 def broker_lost(s):
