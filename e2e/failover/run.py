@@ -113,12 +113,16 @@ def out(*args, check=True):
 
 
 def happens(ready, seconds, every=2.0):
+    """Whether `ready` comes true within `seconds`, asked every `every`. A
+    command it runs that fails is "not yet": `run` stops with SystemExit,
+    which `except Exception` let through, and a claim deleted between two
+    reads of it ended a local run's volume-lost class."""
     started = time.time()
     while time.time() - started < seconds:
         try:
             if ready():
                 return True
-        except Exception:
+        except (Exception, SystemExit):
             pass
         time.sleep(every)
     return False
@@ -1054,10 +1058,12 @@ def volume_lost(s):
     kubectl("delete", "pod", standby, "--grace-period=0", "--force")
     # The claim goes once its pod has; a pod made again before that waits on
     # a claim being deleted, and is made again once it is gone.
-    wait_for("the lost claim gone", lambda: kubectl("get", "pvc", f"data-{standby}", "-o",
-             "jsonpath={.metadata.uid}", check=False).returncode != 0
-             or out("get", "pvc", f"data-{standby}", "-o", "jsonpath={.metadata.deletionTimestamp}") == "",
-             seconds=120)
+    def gone():
+        # Read once: gone, or a new claim with no deletion pending.
+        said = kubectl("get", "pvc", f"data-{standby}", "-o", "jsonpath={.metadata.deletionTimestamp}",
+                       check=False)
+        return said.returncode != 0 or said.stdout.decode().strip() == ""
+    wait_for("the lost claim gone", gone, seconds=120)
     pending = [p for p in json.loads(out("get", "pods", "-l", "meridian.dev/component=database", "-o", "json"))["items"]
                if p["metadata"]["name"] == standby and p["status"].get("phase") == "Pending"]
     if pending:
