@@ -424,6 +424,7 @@ fn a_database_to_be_made_is_not_made_by_testing_it() {
     let mut run = first_run(Box::new(Refusing("secret")), vec![]);
     run.brought = Some(BroughtServer {
         workload: "m-database".into(),
+        members: 1,
         host: "m-database".into(),
         port: 5432,
         superuser: "postgres".into(),

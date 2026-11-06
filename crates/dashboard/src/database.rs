@@ -132,6 +132,12 @@ const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0013_a_plugin_page_session.sql"),
         then: None,
     },
+    Migration {
+        version: 14,
+        name: "in_flight",
+        sql: include_str!("../migrations/0014_in_flight.sql"),
+        then: None,
+    },
 ];
 
 /// Migration 8's record (W6.29, decisions/031): every act at may make and
@@ -199,7 +205,17 @@ pub struct Database {
 
 impl Database {
     pub fn connect(url: &str, pool_size: u32) -> Result<Self, String> {
-        let config: postgres::Config = url.parse().map_err(|failed| format!("{failed}"))?;
+        let mut config: postgres::Config = url.parse().map_err(|failed| format!("{failed}"))?;
+        // A database failed over (step 3b): a connection to a primary that
+        // is gone is given up within seconds, not the kernel's minutes, so
+        // the pool's next one reaches the promoted primary.
+        let give_up = std::time::Duration::from_secs(5);
+        if config.get_connect_timeout().is_none() {
+            config.connect_timeout(give_up);
+        }
+        if config.get_tcp_user_timeout().is_none() {
+            config.tcp_user_timeout(give_up);
+        }
         let manager = r2d2_postgres::PostgresConnectionManager::new(config, postgres::NoTls);
         let pool = r2d2::Pool::builder()
             .max_size(pool_size.max(1))

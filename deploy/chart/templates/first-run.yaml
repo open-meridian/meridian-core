@@ -162,6 +162,9 @@ spec:
               value: {{ printf "%s-database.%s.svc.cluster.local" (include "meridian-runtime.fullname" .) .Release.Namespace | quote }}
             - name: MERIDIAN_FIRST_RUN_BROUGHT_PORT
               value: "5432"
+            # Its members once chosen: the primary and its standbys (step 3b).
+            - name: MERIDIAN_FIRST_RUN_BROUGHT_MEMBERS
+              value: {{ add 1 (include "meridian-runtime.databaseStandbys" .) | quote }}
             - name: MERIDIAN_FIRST_RUN_BROUGHT_SUPERUSER
               value: postgres
             - name: MERIDIAN_FIRST_RUN_BROUGHT_SUPERUSER_PASSWORD

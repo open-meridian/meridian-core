@@ -76,6 +76,9 @@ pub struct Names {
 pub struct BroughtServer {
     /// The StatefulSet to scale up. At zero it has no claim and no disk.
     pub workload: String,
+    /// How many members it runs once chosen: one, or a primary and its
+    /// standbys under Patroni (step 3b, database.brought.standbys).
+    pub members: u32,
     pub host: String,
     pub port: u32,
     pub superuser: String,
@@ -480,7 +483,11 @@ impl FirstRun {
             .ok_or("this deployment was installed with no database to bring")?;
 
         self.cluster
-            .scale(Workload::StatefulSet, &server.workload, 1)
+            .scale(
+                Workload::StatefulSet,
+                &server.workload,
+                server.members.max(1),
+            )
             .await
             .map_err(|failed| format!("the database could not be started: {failed}"))?;
 

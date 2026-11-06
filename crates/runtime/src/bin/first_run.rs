@@ -397,6 +397,9 @@ fn brought_server() -> Option<BroughtServer> {
         port: var("MERIDIAN_FIRST_RUN_BROUGHT_PORT")
             .and_then(|port| port.parse().ok())
             .unwrap_or(5432),
+        members: var("MERIDIAN_FIRST_RUN_BROUGHT_MEMBERS")
+            .and_then(|members| members.parse().ok())
+            .unwrap_or(1),
         superuser: var("MERIDIAN_FIRST_RUN_BROUGHT_SUPERUSER").unwrap_or_else(|| "postgres".into()),
         superuser_password: var("MERIDIAN_FIRST_RUN_BROUGHT_SUPERUSER_PASSWORD")?,
         serving_password: var("MERIDIAN_FIRST_RUN_BROUGHT_SERVING_PASSWORD")?,

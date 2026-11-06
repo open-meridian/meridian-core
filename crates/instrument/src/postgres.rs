@@ -125,7 +125,7 @@ pub const CHANGES: meridian_changes::captured::Spec = meridian_changes::captured
 impl PostgresStore {
     /// Open a pool. Does not create the schema; call [`PostgresStore::migrate`].
     pub fn connect(url: &str, pool_size: u32) -> Result<Self> {
-        let config: postgres::Config = url.parse().map_err(unavailable)?;
+        let config = meridian_changes::database_config(url).map_err(unavailable)?;
         let manager = PostgresConnectionManager::new(config, NoTls);
         let pool = r2d2::Pool::builder()
             .max_size(pool_size.max(1))

@@ -47,6 +47,35 @@ pub const PAGE_MOST: usize = 512 * 1024;
 /// book has kept one since its first migration.
 pub const CONTROL: &str = "control";
 
+/// How long a store waits on a database that has stopped answering before
+/// it gives the connection up (step 3b; spec section 4): a primary lost
+/// mid-connection -- its pod gone, its node cut -- sends no reset, and a
+/// connection left to the kernel's defaults waits minutes for one. Each
+/// bound is the URL's where it names one.
+pub const DATABASE_GIVE_UP: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A store's database URL read, with the bounds above where it names none,
+/// so after a failover the pool's next connection reaches the promoted
+/// primary through the database's Service rather than waiting on the old.
+pub fn database_config(url: &str) -> Result<postgres::Config, postgres::Error> {
+    let mut config: postgres::Config = url.parse()?;
+    if config.get_connect_timeout().is_none() {
+        config.connect_timeout(DATABASE_GIVE_UP);
+    }
+    if config.get_tcp_user_timeout().is_none() {
+        config.tcp_user_timeout(DATABASE_GIVE_UP);
+    }
+    // The kernel's own idle time, two hours, unless the URL said otherwise.
+    if config.get_keepalives_idle() == std::time::Duration::from_secs(2 * 60 * 60) {
+        config
+            .keepalives(true)
+            .keepalives_idle(DATABASE_GIVE_UP)
+            .keepalives_interval(std::time::Duration::from_secs(2))
+            .keepalives_retries(2);
+    }
+    Ok(config)
+}
+
 /// Where a store's members ask a partition's changes after a sequence.
 pub fn read_changes_topic(domain: &str) -> String {
     format!("platform.{domain}.internal.read-changes")
