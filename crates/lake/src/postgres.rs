@@ -54,7 +54,15 @@ impl PostgresStore {
         // and alarmed instead. The book's, the street store's, the
         // instrument store's and the configuration's commits wait for it.
         // Harmless on a database with no synchronous standby.
-        config.options("-c synchronous_commit=local");
+        // Beside whatever options the URL names (a search_path, say), never
+        // in their place.
+        let options = match config.get_options() {
+            Some(named) if !named.trim().is_empty() => {
+                format!("{named} -c synchronous_commit=local")
+            }
+            _ => "-c synchronous_commit=local".to_string(),
+        };
+        config.options(&options);
         let manager = PostgresConnectionManager::new(config, NoTls);
         let pool = r2d2::Pool::builder()
             .max_size(pool_size.max(1))
