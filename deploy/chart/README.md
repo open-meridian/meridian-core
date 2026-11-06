@@ -221,6 +221,13 @@ made by this chart has page checksums from initdb on; one made before keeps
 what it had. Every count the chart takes is one CI tests, and any other is
 refused.
 
+The broker's three servers keep JetStream -- the analytics units' work queue
+and their own Raft state -- on a volume each (`broker.jetstream.size`, 1Gi,
+and `broker.jetstream.storageClassName`), so a server restarted, one at a
+time as an upgrade rolls them, rejoins with what it held. Without JetStream
+the broker keeps nothing on disk. Every client checks its server answers
+each second and moves to another when one has not for 2 s.
+
 ## An upgrade checked before it changes anything
 
 Every upgrade runs a preflight first (`preflight.enabled`, on by default): a

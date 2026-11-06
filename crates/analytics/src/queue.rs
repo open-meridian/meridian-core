@@ -3,7 +3,7 @@
 //! JetStream at three only for the analytics units).
 //!
 //! On a broker of three with `broker.jetstream.replicas: 3`, the coordinator
-//! puts each unit on a work queue kept in memory on the three servers,
+//! puts each unit on a work queue kept on file on the three servers,
 //! rather than asking the pool's queue group: a worker takes a unit and
 //! acknowledges it only once its part is sent, so a worker that dies
 //! mid-unit leaves it for another (the queue-group task's "a queue member
@@ -39,7 +39,7 @@ pub const PART_TO: &str = "Meridian-Part-To";
 const HELD: Duration = Duration::from_secs(30);
 /// The most a unit is taken before it is left to the coordinator.
 const TAKEN: i64 = 4;
-/// What the queue may hold at once, under the servers' 64 MB of memory: a
+/// What the queue may hold at once, under the servers' 256 MB of file: a
 /// unit past it is refused, and the coordinator computes it itself.
 const MOST_BYTES: i64 = 48 * 1024 * 1024;
 
@@ -68,7 +68,9 @@ impl Units {
                 name: STREAM.to_string(),
                 subjects: vec![topics::COMPUTE_UNIT.to_string()],
                 retention: stream::RetentionPolicy::WorkQueue,
-                storage: stream::StorageType::Memory,
+                // On file, on each server's own volume: a server
+                // restarted rejoins with it (the chart's broker.jetstream).
+                storage: stream::StorageType::File,
                 num_replicas: 3,
                 max_bytes: MOST_BYTES,
                 discard: stream::DiscardPolicy::New,

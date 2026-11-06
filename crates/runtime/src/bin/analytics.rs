@@ -90,7 +90,10 @@ fn run() -> Result<(), String> {
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
             match made {
-                Ok(units) => Some(units),
+                Ok(units) => {
+                    tracing::info!("the units go by JetStream's work queue");
+                    Some(units)
+                }
                 Err(failed) => {
                     tracing::warn!(%failed, "the units' work queue is not there; units go by the queue group");
                     None
