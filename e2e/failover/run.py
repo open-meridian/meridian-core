@@ -481,6 +481,7 @@ def kill_writer(s, failure, component):
     took = time.time() - began
     if not back:
         s.check(False, f"{failure}: {component} never answered again within {bound + 30}s")
+        explain(s, failure, component)
         return
     extra = {}
     if PROFILE != "tolerant":
@@ -525,6 +526,7 @@ def node_freeze(s):
         run("docker", "unpause", node)
     if not back:
         s.check(False, "node-freeze: the standby never took over while the writer's node was paused")
+        explain(s, "node-freeze", component)
         return
     claim(s, "node-freeze", component, took, HA[component], {"epoch_before": epoch})
     # The old writer wakes, finds the lease another's, and steps down.
@@ -570,6 +572,7 @@ def split_brain(s):
             claim(s, "split-brain", component, took, HA[component], {"epoch_before": epoch})
         else:
             s.check(False, "split-brain: the standby never took over from the cut writer")
+            explain(s, "split-brain", component)
         # The cut writer stepped down before its lease ended, and cannot
         # come back as anything but an unready standby while cut.
         s.check(happens(lambda: not ready(json.loads(out("get", "pod", writer, "-o", "json"))), 60),
@@ -579,6 +582,16 @@ def split_brain(s):
         cut_rules(writer, targets, "-D")
     healed = happens(lambda: members_settled(component), 180)
     s.check(healed, "split-brain: healed once the cut is lifted, the cut member back as the standby")
+
+
+def explain(s, failure, component):
+    """What each member said, for reading a takeover not seen: its node, its
+    mode, what its change log answered, and who holds the lease."""
+    for pod in pods(component):
+        said = probe(pod["metadata"]["name"], component) or {}
+        s.note(f"{failure}: {pod['metadata']['name']} on {pod['spec'].get('nodeName')}: "
+               f"member {json.dumps(said.get('member'))}, answers {json.dumps(said.get('answers'))}, "
+               f"lease held by {holder(component)}")
 
 
 def node_lost(s):
