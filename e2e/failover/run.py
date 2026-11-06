@@ -73,9 +73,11 @@ HA = {"bor": 10, "street": 10, "instrument": 10, "conductor": 10, "launcher": 10
 HA_DATABASE = {"bor": 30, "lake": 30}
 
 DEFAULT_FAILURES = {
-    "tolerant": ["lake-writer", "bor-writer", "network-policy", "db-primary", "broker"],
+    "tolerant": ["lake-writer", "bor-writer", "network-policy", "db-primary", "broker",
+                 "bit-rot", "torn-write"],
     "ha": ["lake-writer", "bor-writer", "street-writer", "instrument-writer",
-           "split-brain", "node-freeze", "node", "network-policy", "db-primary", "broker"],
+           "split-brain", "node-freeze", "node", "network-policy", "db-primary", "broker",
+           "bit-rot", "torn-write", "volume-lost"],
     "scaled": [],
 }
 
@@ -669,13 +671,14 @@ def marks_table():
     psql("create table if not exists failover_marks (id bigserial primary key, at timestamptz not null)")
 
 
-def write_marks(pod_name, seconds):
+def write_marks(pod_name, seconds, pause=0.05):
     """Commits, one every 50 ms through the database's Service, from inside
     a member that is not killed, each acknowledged id printed; started in
     the background. Its output names every commit the database acknowledged
     (RPO under load, at the database)."""
     host = f"{FULL}-database.{NAMESPACE}.svc.cluster.local"
-    script = WRITER.replace("HOST", host).replace("SECONDS_", str(int(seconds)))
+    script = (WRITER.replace("HOST", host).replace("SECONDS_", str(int(seconds)))
+              .replace("sleep 0.05", f"sleep {pause}" if pause else ":"))
     return subprocess.Popen(
         ["kubectl", "--namespace", NAMESPACE, "exec", "-i", pod_name, "-c", "postgres", "--",
          "sh", "-c", script],
@@ -697,8 +700,9 @@ def database_writes(avoid=()):
         return False
 
 
-def db_primary(s):
-    print("F: db-primary: the database's primary killed outright (SIGKILL), under commits", flush=True)
+def db_primary(s, failure="db-primary"):
+    if failure == "db-primary":
+        print("F: db-primary: the database's primary killed outright (SIGKILL), under commits", flush=True)
     for component in ("bor", "lake"):
         wait_for(f"{component} settled", lambda c=component: members_settled(c), seconds=300)
     marks_table()
@@ -708,7 +712,7 @@ def db_primary(s):
     # one member, killed with its writer: there the commits before the kill
     # are what is held.
     writing_in = next((m for m in members if m != victim), None)
-    writer = write_marks(writing_in, 45) if writing_in else None
+    writer = write_marks(writing_in, 45, pause=0 if failure == "torn-write" else 0.05) if writing_in else None
     time.sleep(3)
     psql("insert into failover_marks (at) values (clock_timestamp())")
     acked_before = int(psql("select max(id) from failover_marks") or 0)
@@ -743,18 +747,18 @@ def db_primary(s):
     kept = {int(i) for i in psql("select id from failover_marks", pod=new_primary).split()}
     lost = sorted(acked - kept)
     if PROFILE != "tolerant":
-        s.check(new_primary != victim, f"db-primary: a standby promoted ({new_primary})")
-    s.check(not lost, f"db-primary: every acknowledged commit kept ({len(acked)} acknowledged, "
+        s.check(new_primary != victim, f"{failure}: a standby promoted ({new_primary})")
+    s.check(not lost, f"{failure}: every acknowledged commit kept ({len(acked)} acknowledged, "
             f"{len(lost)} lost{': ' + ', '.join(map(str, lost[:5])) if lost else ''})")
     for component in ("bor", "lake"):
         if component not in took:
-            s.check(False, f"db-primary: {component} never answered again within {bound[component] + 30}s")
+            s.check(False, f"{failure}: {component} never answered again within {bound[component] + 30}s")
             continue
-        claim(s, "db-primary", component, took[component], bound[component],
+        claim(s, failure, component, took[component], bound[component],
               {"acknowledged_commits": len(acked), "rpo_commits_lost": len(lost)})
     healed = happens(lambda: len(pods("database")) == database_members()
                      and all(ready(p) for p in pods("database")), 300)
-    s.check(healed, "db-primary: the killed member back, as a standby where there are standbys")
+    s.check(healed, f"{failure}: the killed member back, as a standby where there are standbys")
 
 
 def isolate(pod_name, verb):
@@ -801,6 +805,132 @@ def broker_lost(s):
     s.check(healed, "broker: the killed server back")
 
 
+# ── Storage: bit rot, a torn write, a volume lost (step 3b part 2) ─────────
+
+
+def scrub(component, container=None):
+    """One scrub, run in the component's writer, as its JSON."""
+    pod = writer_pod(component)
+    done = kubectl("exec", pod, "-c", container or component, "--", BINARY[component], "scrub", check=False)
+    for line in done.stdout.decode(errors="replace").splitlines():
+        if line.strip().startswith("{"):
+            return json.loads(line)
+    raise SystemExit(f"{component}'s scrub said nothing it could read: {done.stderr.decode(errors='replace')[-400:]}")
+
+
+def relation_file(table):
+    """A table's first data file on its member's node: the node, and the path."""
+    pod = primary()
+    relative = psql(f"select pg_relation_filepath('{table}')", pod=pod)
+    claim = f"data-{pod}"
+    volume = out("get", "pvc", claim, "-o", "jsonpath={.spec.volumeName}")
+    pv = json.loads(run("kubectl", "get", "pv", volume, "-o", "json").stdout)
+    path = (pv["spec"].get("hostPath") or pv["spec"].get("local") or {}).get("path", "")
+    return node_of(pod), f"{path}/pgdata/{relative}"
+
+
+def bit_rot(s):
+    print("F: bit-rot: a captured row altered beneath the configuration store; a page's byte flipped", flush=True)
+    wait_for("conductor settled", lambda: members_settled("conductor"), seconds=300)
+    # A row of the configuration store's log altered beneath it.
+    target = psql("select partition || ' ' || sequence || ' ' || ordinal from config_change "
+                  "order by sequence desc, ordinal limit 1").split()
+    s.check(len(target) == 3, "bit-rot: the configuration store's log holds a row to alter")
+    if len(target) != 3:
+        return
+    partition, sequence, ordinal = target
+    began = time.time()
+    psql(f"update config_change set body = body || '{{\"rot\": true}}'::jsonb "
+         f"where partition = '{partition}' and sequence = {sequence} and ordinal = {ordinal}")
+    said = scrub("conductor")
+    took = time.time() - began
+    named = [f for f in said.get("findings", [])
+             if f.get("partition") == partition and str(f.get("sequence")) == sequence]
+    s.check(bool(named), f"bit-rot: the scrub names partition {partition}, sequence {sequence} "
+            f"({len(said.get('findings', []))} finding(s))")
+    kept = psql(f"select count(*) from config_integrity_finding where partition = '{partition}' "
+                f"and sequence = {sequence}")
+    s.check(kept == "1", f"bit-rot: kept as an IntegrityFinding ({kept})")
+    probed = probe(writer_pod("conductor"), "conductor") or {}
+    database = next((p for p in probed.get("paths", []) if p.get("path") == "database"), {})
+    s.check(any(f.get("sequence") == int(sequence) for f in (database.get("integrity") or {}).get("findings", [])),
+            "bit-rot: the probe status reads says so")
+    if named:
+        claim(s, "bit-rot", "conductor", took, TOLERANT_POD if PROFILE == "tolerant" else 60,
+              {"detected_by": "the scrub", "partition": partition, "sequence": int(sequence)})
+    if PROFILE != "tolerant":
+        return
+    # A byte of a page flipped beneath the stopped database: read back, the
+    # page fails its checksum, loudly, and the scrub records it.
+    node, path = relation_file("config_change")
+    kubectl("scale", "statefulset", f"{FULL}-database", "--replicas=0")
+    wait_for("the database stopped", lambda: not pods("database"), seconds=180)
+    run("docker", "exec", node, "sh", "-c",
+        f"printf '\\377\\377\\377\\377' | dd of='{path}' bs=1 seek=4000 conv=notrunc 2>/dev/null")
+    kubectl("scale", "statefulset", f"{FULL}-database", "--replicas=1")
+    wait_for("the database back", lambda: pods("database") and all(ready(p) for p in pods("database"))
+             and psql("select 1", database="postgres") == "1", seconds=300)
+    refused = kubectl("exec", primary(), "-c", "postgres", "--", "psql", "-X", "-At", "-U", "postgres",
+                      "-d", "meridian", "-c", "select count(*) from config_change", check=False)
+    s.check(refused.returncode != 0 and b"invalid page" in refused.stderr,
+            "bit-rot: a page whose byte was flipped fails its checksum when read")
+    wait_for("conductor settled", lambda: answering("conductor"), seconds=300)
+    said = scrub("conductor")
+    s.check(any("checksum" in f.get("what", "") for f in said.get("findings", [])),
+            "bit-rot: the scrub records the page that failed its checksum")
+
+
+def torn_write(s):
+    """The database killed outright under heavy commits; every table's pages
+    read back after crash recovery (or on the promoted standby)."""
+    print("F: torn-write: the database killed outright under heavy commits, every page read back", flush=True)
+    db_primary(s, failure="torn-write")
+    tables = psql("select string_agg(format('%I', tablename), ' ') from pg_tables where schemaname = 'public'")
+    failed = []
+    for table in tables.split():
+        done = kubectl("exec", primary(), "-c", "postgres", "--", "psql", "-X", "-At", "-U", "postgres",
+                       "-d", "meridian", "-c", f"select count(*) from {table}", check=False)
+        if done.returncode != 0:
+            failed.append(table)
+    s.check(not failed, f"torn-write: every table's pages read back after recovery "
+            f"({len(tables.split())} tables{', failed: ' + ', '.join(failed) if failed else ''})")
+
+
+def volume_lost(s):
+    """A standby's volume lost: its claim and its pod deleted, and Patroni
+    clones it again from the primary, nothing felt by the stores."""
+    print("F: volume-lost: a database standby's claim deleted", flush=True)
+    if PROFILE == "tolerant":
+        s.note("volume-lost: the tolerant database's one volume lost is a restore, the admin's act "
+               "(e2e-cluster-backup); not injected here")
+        return
+    standby = next(p["metadata"]["name"] for p in pods("database")
+                   if p["metadata"]["labels"].get("meridian.dev/database-role") == "replica")
+    epoch = epoch_now("bor")
+    began = time.time()
+    kubectl("delete", "pvc", f"data-{standby}", "--wait=false")
+    kubectl("delete", "pod", standby, "--grace-period=0", "--force")
+    # The claim goes once its pod has; a pod made again before that waits on
+    # a claim being deleted, and is made again once it is gone.
+    wait_for("the lost claim gone", lambda: kubectl("get", "pvc", f"data-{standby}", "-o",
+             "jsonpath={.metadata.uid}", check=False).returncode != 0
+             or out("get", "pvc", f"data-{standby}", "-o", "jsonpath={.metadata.deletionTimestamp}") == "",
+             seconds=120)
+    pending = [p for p in json.loads(out("get", "pods", "-l", "meridian.dev/component=database", "-o", "json"))["items"]
+               if p["metadata"]["name"] == standby and p["status"].get("phase") == "Pending"]
+    if pending:
+        kubectl("delete", "pod", standby, "--grace-period=0", "--force", check=False)
+    back = happens(lambda: len(pods("database")) == database_members()
+                   and all(ready(p) for p in pods("database"))
+                   and kubectl("get", "pvc", f"data-{standby}", check=False).returncode == 0, 300, every=2)
+    took = time.time() - began
+    s.check(back, "volume-lost: the standby re-cloned onto a new volume and ready")
+    s.check(answering("bor") is not None and epoch_now("bor") == epoch,
+            "volume-lost: the book answered throughout, no takeover")
+    if back:
+        claim(s, "volume-lost", "database", took, 300, {"member": standby, "re_cloned": True})
+
+
 FAILURES = {
     "lake-writer": lambda s: kill_writer(s, "lake-writer", "lake"),
     "bor-writer": lambda s: kill_writer(s, "bor-writer", "bor"),
@@ -814,6 +944,9 @@ FAILURES = {
     "network-policy": network_policy,
     "db-primary": db_primary,
     "broker": broker_lost,
+    "bit-rot": bit_rot,
+    "torn-write": torn_write,
+    "volume-lost": volume_lost,
 }
 
 
