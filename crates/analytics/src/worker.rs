@@ -109,11 +109,21 @@ pub struct Pool {
     pub bus: Arc<Bus>,
     pub handle: tokio::runtime::Handle,
     pub timeout: Duration,
+    /// The units' work queue on JetStream, where the broker keeps one
+    /// (step 3b, [`crate::queue`]); the queue group otherwise.
+    pub queue: Option<Arc<crate::queue::Units>>,
 }
 
 impl Pool {
     async fn ask(&self, payload: Vec<u8>) -> Result<Part, String> {
         let mut last = String::new();
+        if let Some(queue) = &self.queue {
+            // Put once: the queue hands it to another worker if the one
+            // that took it dies, so waiting longer is asking again.
+            let within = self.timeout * ASKS as u32;
+            let value = queue.ask(payload, within).await?;
+            return Part::from_json(&value).map_err(|failed| failed.0);
+        }
         for _ in 0..ASKS {
             match self
                 .bus

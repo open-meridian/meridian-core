@@ -776,10 +776,22 @@ pub fn pool(
     handle: tokio::runtime::Handle,
     timeout: Duration,
 ) -> Arc<dyn Executor> {
+    pool_queued(bus, handle, timeout, None)
+}
+
+/// The same, its units put on the JetStream work queue where there is one
+/// (step 3b, [`crate::queue`]).
+pub fn pool_queued(
+    bus: &Arc<Bus>,
+    handle: tokio::runtime::Handle,
+    timeout: Duration,
+    queue: Option<Arc<crate::queue::Units>>,
+) -> Arc<dyn Executor> {
     Arc::new(crate::worker::Pool {
         bus: Arc::clone(bus),
         handle,
         timeout,
+        queue,
     })
 }
 

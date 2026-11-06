@@ -17,6 +17,7 @@
 pub mod chains;
 pub mod debt;
 mod pages;
+pub mod queue;
 pub mod resolve;
 pub mod service;
 pub mod wire;

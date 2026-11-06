@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use meridian_analytics::service::{self, Config, Coordinator};
-use meridian_analytics::{engine_version, worker, INSTANCE};
+use meridian_analytics::{engine_version, queue, worker, INSTANCE};
 use meridian_analytics_engine::graph::Cache;
 use meridian_runtime::{bus_from_env, clock, on_runtime, shutdown, var, Ready, VERSION};
 
@@ -72,12 +72,32 @@ fn run() -> Result<(), String> {
         let bus = bus_from_env(&instance_id).await?;
         // Its own hop's ages, to the monitor (W4.16; ruling 606).
         tokio::spawn(meridian_runtime::report_latency_forever(Arc::clone(&bus)));
+        // The units' work queue on JetStream, where the broker keeps one
+        // (step 3b; broker.jetstream.replicas: 3); the queue group otherwise.
+        let queue = if queue::on() {
+            let url = var("MERIDIAN_BROKER_URL").ok_or("MERIDIAN_BROKER_URL is not set")?;
+            Some(queue::Units::connect(&url).await?)
+        } else {
+            None
+        };
         if works {
-            worker::serve(&bus, Arc::new(Cache::new(UNITS_KEPT)));
+            let cache = Arc::new(Cache::new(UNITS_KEPT));
+            match &queue {
+                Some(units) => {
+                    let units = Arc::clone(units);
+                    tokio::spawn(async move {
+                        if let Err(failed) = units.work(cache).await {
+                            tracing::error!("{failed}; stopping, to be restarted");
+                            std::process::exit(1);
+                        }
+                    });
+                }
+                None => worker::serve(&bus, cache),
+            }
         }
         if coordinates {
             let handle = tokio::runtime::Handle::current();
-            let executor = service::pool(&bus, handle.clone(), unit_timeout);
+            let executor = service::pool_queued(&bus, handle.clone(), unit_timeout, queue.clone());
             let coordinator = Coordinator::new(Arc::clone(&bus), handle, clock(), config, executor);
             service::serve(&bus, &coordinator);
         }

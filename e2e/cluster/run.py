@@ -979,7 +979,7 @@ spec:
         seconds=300,
     )
     s.check(True, "the launcher reached the cluster's API and the bus as itself")
-    broker_log = kubectl("logs", f"deployment/{RELEASE}-meridian-runtime-broker")
+    broker_log = kubectl("logs", f"statefulset/{RELEASE}-meridian-runtime-broker")
     s.check(
         "the broker is running" in broker_log
         and "launched plugins could not be read" not in broker_log,
