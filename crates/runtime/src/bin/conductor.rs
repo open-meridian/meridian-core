@@ -98,8 +98,7 @@ fn run() -> Result<(), String> {
             || {
                 let store =
                     PostgresStore::connect(&scrub_url, 1).map_err(|failed| failed.to_string())?;
-                let scrubbed = store.scrub().map_err(|failed| failed.to_string());
-                scrubbed
+                store.scrub().map_err(|failed| failed.to_string())
             },
             |scrubbed, member, started, finished| {
                 PostgresStore::connect(&scrub_url, 1)
@@ -260,8 +259,7 @@ fn run() -> Result<(), String> {
                     || {
                         let store = PostgresStore::connect(&scrubbing, 1)
                             .map_err(|failed| failed.to_string())?;
-                        let scrubbed = store.scrub().map_err(|failed| failed.to_string());
-                        scrubbed
+                        store.scrub().map_err(|failed| failed.to_string())
                     },
                     |scrubbed, member, started, finished| {
                         PostgresStore::connect(&scrubbing, 1)
