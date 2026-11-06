@@ -45,7 +45,81 @@ the operator the same thing far less clearly.
 {{- if and (not .Values.key.existingSecret) (not .Values.key.generate) -}}
 {{- fail "key.generate is off and key.existingSecret names nothing, so this deployment has no way to get a key. Leave key.generate on to have the conductor make its own inside the cluster, or name a secret holding one." -}}
 {{- end -}}
+{{- /* Ruling 1074: the HA profile's conductor has a standby, and a key the
+       conductor generated into a volume is mounted on one node at a time. */ -}}
+{{- if and (eq (include "meridian-runtime.profile" .) "ha") (not .Values.key.existingSecret) -}}
+{{- fail "resilience.profile is ha and the deployment's key is generated into a volume, which one node mounts at a time, so the conductor's standby on another node could not start (ruling 1074). Put the key in a Kubernetes Secret and name it in key.existingSecret (from Vault or cert-manager where you keep keys there), then set resilience.profile: ha." -}}
+{{- end -}}
 
+{{- end -}}
+
+{{/*
+The resilience profile (step 3b; spec/a-deployment-scales-out-and-fails-
+over-by-configuration section 11, question 23; ruling 1052): `tolerant`, the
+default, today's single-instance shape with the 30 s tolerations; `ha`,
+every count the HA configuration needs turned on by one value, each still
+overridable. Anything else is refused. Takes the chart.
+*/}}
+{{- define "meridian-runtime.profile" -}}
+{{- $profile := (.Values.resilience | default dict).profile | default "tolerant" -}}
+{{- if not (has $profile (list "tolerant" "ha")) -}}
+{{- fail (printf "resilience.profile is %v; it takes tolerant (the default: one member each, healed by restart) or ha (a standby per writer, the brought database with two standbys, the broker at three; each count still overridable)." $profile) -}}
+{{- end -}}
+{{- $profile -}}
+{{- end -}}
+
+{{/*
+A count by the profile: the value given where one is, 0 included, else the
+profile's. Each count the profile sets is left unset in values.yaml, so
+"not given" is told from 0. Takes a dict: top, value, tolerant, ha.
+*/}}
+{{- define "meridian-runtime.byProfile" -}}
+{{- if kindIs "invalid" .value -}}
+{{- if eq (include "meridian-runtime.profile" .top) "ha" -}}{{ .ha }}{{- else -}}{{ .tolerant }}{{- end -}}
+{{- else -}}
+{{- .value -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+The counts outside the stores' standbys, each by the profile (section 11):
+the brought database's standbys (0 or 2), the broker's servers (1 or 3), its
+JetStream replicas (0 or 3, only with three servers), the dashboard's copies
+and the analytics coordinators and workers (1 or 2). A count CI does not test
+is refused (requirement 1, ruling 1047). Each takes the chart.
+*/}}
+{{- define "meridian-runtime.databaseStandbys" -}}
+{{- $n := include "meridian-runtime.byProfile" (dict "top" . "value" (index .Values.database.brought "standbys") "tolerant" 0 "ha" 2) -}}
+{{- if not (has (toString $n) (list "0" "2")) -}}
+{{- fail (printf "database.brought.standbys is %v; it takes 0 (one database, restarted on its volume) or 2 (a primary and two standbys under Patroni, one synchronous), the shapes CI tests." $n) -}}
+{{- end -}}
+{{- $n -}}
+{{- end -}}
+
+{{- define "meridian-runtime.brokerReplicas" -}}
+{{- $n := include "meridian-runtime.byProfile" (dict "top" . "value" .Values.broker.replicas "tolerant" 1 "ha" 3) -}}
+{{- if not (has (toString $n) (list "1" "3")) -}}
+{{- fail (printf "broker.replicas is %v; it takes 1 or 3 (a NATS cluster keeping its majority when one server is lost), the shapes CI tests." $n) -}}
+{{- end -}}
+{{- $n -}}
+{{- end -}}
+
+{{- define "meridian-runtime.jetstreamReplicas" -}}
+{{- $n := include "meridian-runtime.byProfile" (dict "top" . "value" (index (.Values.broker.jetstream | default dict) "replicas") "tolerant" 0 "ha" 3) -}}
+{{- if not (has (toString $n) (list "0" "3")) -}}
+{{- fail (printf "broker.jetstream.replicas is %v; it takes 0 (the analytics units asked again on a timeout) or 3 (their work queue kept on three servers)." $n) -}}
+{{- end -}}
+{{- if and (eq (toString $n) "3") (ne (include "meridian-runtime.brokerReplicas" .) "3") -}}
+{{- fail "broker.jetstream.replicas is 3 and broker.replicas is not: a stream kept on three servers needs three. Set broker.replicas: 3, or broker.jetstream.replicas: 0." -}}
+{{- end -}}
+{{- $n -}}
+{{- end -}}
+
+{{/* A stateless set's copies: 1 or 2 by the profile, at least 1. Takes a dict: top, value. */}}
+{{- define "meridian-runtime.copies" -}}
+{{- $n := include "meridian-runtime.byProfile" (dict "top" .top "value" .value "tolerant" 1 "ha" 2) -}}
+{{- if lt (int $n) 0 -}}{{- fail (printf "%s is %v; a count is never below 0" .what $n) -}}{{- end -}}
+{{- $n -}}
 {{- end -}}
 
 {{/*
@@ -74,7 +148,7 @@ when it lapses. More are refused: a count CI does not test is not offered
 (requirement 1, ruling 1047). Takes a dict: component, values.
 */}}
 {{- define "meridian-runtime.standbys" -}}
-{{- $standby := index .values "standby" | default 0 -}}
+{{- $standby := include "meridian-runtime.byProfile" (dict "top" .top "value" (index .values "standby") "tolerant" 0 "ha" 1) -}}
 {{- if not (regexMatch "^[01]$" (toString $standby)) -}}
 {{- fail (printf "%s.standby is %v; it takes 0 or 1: one warm standby per writer, which CI tests (e2e-cluster-failover). Readers come with their own value." .component $standby) -}}
 {{- end -}}
@@ -259,6 +333,81 @@ spec:
       app.kubernetes.io/instance: {{ .top.Release.Name }}
       meridian.dev/component: {{ .component }}
 {{- end }}
+{{- end -}}
+
+{{/*
+A set of several copies' spread (step 3b, plan 5a): over nodes, and over
+zones where `zones` names them, each copy kept from the others where it can
+be; for the stateless sets (the dashboard, analytics) and the broker's and
+the brought database's members. Placed under a pod's spec. Takes a dict:
+top, component.
+*/}}
+{{- define "meridian-runtime.spread" -}}
+{{- if .top.Values.affinity }}
+affinity:
+  {{- toYaml .top.Values.affinity | nindent 2 }}
+{{- else }}
+affinity:
+  {{- if .top.Values.zones }}
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: topology.kubernetes.io/zone
+              operator: In
+              values:
+                {{- toYaml .top.Values.zones | nindent 16 }}
+  {{- end }}
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          topologyKey: kubernetes.io/hostname
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .top.Release.Name }}
+              meridian.dev/component: {{ .component }}
+{{- end }}
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/instance: {{ .top.Release.Name }}
+        meridian.dev/component: {{ .component }}
+  {{- if .top.Values.zones }}
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: DoNotSchedule
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/instance: {{ .top.Release.Name }}
+        meridian.dev/component: {{ .component }}
+  {{- end }}
+{{- end -}}
+
+{{/*
+A set of several copies' PodDisruptionBudget: a drain never takes more than
+`unavailable` of them at once (one of two copies, one of three broker or
+database members). Takes a dict: top, component, unavailable.
+*/}}
+{{- define "meridian-runtime.budget" -}}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "meridian-runtime.fullname" .top }}-{{ .component }}
+  labels:
+    meridian.dev/component: {{ .component }}
+    {{- include "meridian-runtime.labels" .top | nindent 4 }}
+spec:
+  maxUnavailable: {{ .unavailable | default 1 }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "meridian-runtime.name" .top }}
+      app.kubernetes.io/instance: {{ .top.Release.Name }}
+      meridian.dev/component: {{ .component }}
 {{- end -}}
 
 {{/*
@@ -508,4 +657,36 @@ spec:
 {{- if kindIs "bool" $said -}}{{ ternary "true" "false" $said }}
 {{- else if or (kindIs "invalid" $said) (eq (toString $said) "") (eq (toString $said) "auto") -}}auto
 {{- else -}}{{ toString $said }}{{- end -}}
+{{- end -}}
+
+{{/*
+Patroni's dynamic settings for the brought database (step 3b, section 4):
+the timings set for the database tier (1048: a primary lost answered for
+within 30 s -- the leader key's 20 s, Patroni's least, then a promotion),
+and with standbys, one synchronous and strict (question 5), so a primary
+cut off from every standby cannot acknowledge a commit on its own. With
+none, neither: a database alone has nothing to wait for. Pages written
+whole after a checkpoint (full_page_writes) and hint bits logged, so a
+torn write is replayed and a rejoining primary rewound. Takes a dict: top,
+standbys.
+*/}}
+{{- define "meridian-runtime.patroniDynamic" -}}
+ttl: 20
+loop_wait: 2
+retry_timeout: 5
+maximum_lag_on_failover: 1048576
+synchronous_mode: {{ gt (int .standbys) 0 }}
+synchronous_mode_strict: {{ gt (int .standbys) 0 }}
+synchronous_node_count: 1
+postgresql:
+  use_pg_rewind: true
+  use_slots: true
+  parameters:
+    wal_level: replica
+    hot_standby: "on"
+    wal_log_hints: "on"
+    full_page_writes: "on"
+    max_wal_senders: 10
+    max_replication_slots: 10
+    wal_keep_size: 128MB
 {{- end -}}

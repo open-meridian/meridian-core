@@ -78,6 +78,21 @@ database:
         memory: 256Mi
       limits:
         memory: 1Gi
+    # Standbys beside the primary (step 3b; spec/a-deployment-scales-out-
+    # and-fails-over-by-configuration section 4): 0, the tolerant default,
+    # one database restarted on its volume; or 2, a primary and two standbys
+    # under Patroni, each on its own volume and node, one synchronous and
+    # strict, so the book's, the street store's, the instrument store's and
+    # the configuration's commits survive the primary (RPO 0) and a primary
+    # lost is answered for within 30 s (ruling 1048). By the profile: 0
+    # tolerant, 2 ha. Patroni keeps its state in this namespace's ConfigMaps.
+    # A firm running Postgres for production names an external managed one
+    # with its provider's synchronous standby instead (database.existingSecret).
+    # standbys:
+    # The image the members run under Patroni: postgres:16-alpine's server
+    # with Patroni and pgBackRest (deploy/database). Once a database has run
+    # under Patroni it keeps this image, standbys or none.
+    patroniImage: ghcr.io/open-meridian/meridian-postgres:latest
 
 key:
   # Let the instrument store make its own key, inside the cluster, in a volume only it
@@ -193,6 +208,19 @@ revisionHistoryLimit: 3
 # The lease is a coordination.k8s.io/v1 Lease in this namespace (the
 # members' one right); the epoch, kept by the store that is the record, is
 # the fence. A standby is ready while its lag is under `readyLagMs`.
+#
+# `resilience.profile` turns every count on at once (section 11, question
+# 23): `tolerant`, the default, one member of everything, healed by
+# Kubernetes restarting it within the tolerant bounds (ruling 1056); `ha`, a
+# standby per writer, the brought database with two standbys under Patroni,
+# the broker at three with JetStream at three, the dashboard and analytics at
+# two. Each count below that says "by the profile" is left unset here so the
+# profile decides it; set it to override the profile either way. `ha` needs
+# the key in key.existingSecret (ruling 1074). The profile is what is
+# configured, never a claim: `meridian status --profile` reads what runs.
+resilience:
+  profile: tolerant
+
 leases:
   # How often a writer renews its lease, and a standby looks at it.
   renewSeconds: 2
@@ -205,8 +233,8 @@ zones: []
 
 instrument:
   replicaCount: 1
-  # A warm standby (step 3b): 0 or 1.
-  standby: 0
+  # A warm standby (step 3b): 0 or 1, by the profile (0 tolerant, 1 ha).
+  # standby:
   # A standby's readiness bound: its lag behind the writer's change log.
   readyLagMs: 5000
   image:
@@ -219,8 +247,9 @@ instrument:
 
 conductor:
   replicaCount: 1
-  # A warm standby (step 3b): 0 or 1. It needs the key in key.existingSecret.
-  standby: 0
+  # A warm standby (step 3b): 0 or 1, by the profile. It needs the key in
+  # key.existingSecret.
+  # standby:
   readyLagMs: 5000
   image:
     # Its own tag, so the component that talks to the platform can be moved
@@ -235,7 +264,7 @@ conductor:
 
 street:
   replicaCount: 1
-  standby: 0
+  # standby: by the profile, 0 or 1
   readyLagMs: 5000
   image:
     tag: ""
@@ -253,7 +282,7 @@ street:
 # kept apart from the street's by the credential.
 bor:
   replicaCount: 1
-  standby: 0
+  # standby: by the profile, 0 or 1
   readyLagMs: 5000
   image:
     tag: ""
@@ -293,7 +322,7 @@ bor:
 # credential.
 lake:
   replicaCount: 1
-  standby: 0
+  # standby: by the profile, 0 or 1
   readyLagMs: 5000
   image:
     tag: ""
@@ -353,7 +382,8 @@ analytics:
     repository: ""
     tag: ""
   coordinator:
-    replicaCount: 1
+    # By the profile: 1 tolerant, 2 ha.
+    # replicaCount:
     resources:
       requests:
         cpu: 100m
@@ -361,7 +391,8 @@ analytics:
       limits:
         memory: 2Gi
   worker:
-    replicaCount: 1
+    # By the profile: 1 tolerant, 2 ha.
+    # replicaCount:
     resources:
       requests:
         cpu: 100m
@@ -418,8 +449,9 @@ ingress:
 
 # The dashboard: the one address staff use. Signs people in through the firm's
 # directory over OpenID Connect; a SAML or LDAP directory is brokered by a
-# One replica: browser sessions live in memory. Terminal sessions are kept in
-# the dashboard's own tables, so a restart leaves them standing.
+# directory that speaks it. Browser sessions, plugin pages' sessions and
+# sign-ins in flight are kept in the dashboard's own tables, so a restart
+# leaves them standing and any copy answers any of them.
 #
 # On. It was off until its sign-in had run end to end against a real
 # directory, and that is now what `make e2e-dashboard` proves on every run.
@@ -429,7 +461,9 @@ dashboard:
   # directory it holds is answered there (spec/installation-and-first-run,
   # requirement 5).
   enabled: true
-  replicaCount: 1
+  # Copies, by the profile (1 tolerant, 2 ha): stateless, each reading the
+  # same sessions and sign-ins in flight from the dashboard's tables.
+  # replicaCount:
   image:
     tag: ""
   # Where people reach it, https in any real deployment. Cookies are marked
@@ -560,9 +594,9 @@ registries:
 launcher:
   enabled: true
   instanceId: launcher-1
-  # A standby launcher (step 3b): 0 or 1; it launches only once it holds
-  # the lease.
-  standby: 0
+  # A standby launcher (step 3b): 0 or 1, by the profile; it launches only
+  # once it holds the lease.
+  # standby:
 
 # Storage for a plugin at the edge (decisions/028): a plugin holding an edge
 # role (confirmation, connectivity, custody, data, reporting, servicing, settlement) keeps an

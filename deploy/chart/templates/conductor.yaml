@@ -1,8 +1,8 @@
 {{- include "meridian-runtime.require" . -}}
-{{- include "meridian-runtime.oneWriter" (dict "component" "conductor" "what" "conductor's configuration store" "values" .Values.conductor) -}}
+{{- include "meridian-runtime.oneWriter" (dict "top" $ "component" "conductor" "what" "conductor's configuration store" "values" .Values.conductor) -}}
 {{- /* Step 3b: the generated key is in a volume one node mounts at a time,
        so a standby on another node could not start. */ -}}
-{{- if and (include "meridian-runtime.leased" (dict "component" "conductor" "values" .Values.conductor)) (include "meridian-runtime.generatedKey" .) -}}
+{{- if and (include "meridian-runtime.leased" (dict "top" $ "component" "conductor" "values" .Values.conductor)) (include "meridian-runtime.generatedKey" .) -}}
 {{- fail "conductor.standby is 1 and the deployment's key is generated into a volume, which one node mounts at a time: a standby on another node could not start. Name the key in key.existingSecret for a conductor standby." -}}
 {{- end -}}
 {{/*
@@ -22,7 +22,7 @@ metadata:
     meridian.dev/component: conductor
     {{- include "meridian-runtime.labels" . | nindent 4 }}
 spec:
-  replicas: {{ include "meridian-runtime.memberCount" (dict "component" "conductor" "values" .Values.conductor) }}
+  replicas: {{ include "meridian-runtime.memberCount" (dict "top" $ "component" "conductor" "values" .Values.conductor) }}
   revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
   # The old conductor stops before the new one starts. A rolling update that
   # surges keeps the old one answering the bus until the new one is ready,
@@ -36,7 +36,7 @@ spec:
   # conductor, and unlike Recreate it can be applied over the rolling update
   # every earlier chart made: server-side apply (Helm 4) keeps the
   # rollingUpdate Kubernetes filled in, which Recreate may not carry.
-  {{- include "meridian-runtime.memberStrategy" (dict "component" "conductor" "values" .Values.conductor) | nindent 2 }}
+  {{- include "meridian-runtime.memberStrategy" (dict "top" $ "component" "conductor" "values" .Values.conductor) | nindent 2 }}
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}

@@ -20,6 +20,8 @@
 {{- $full := include "meridian-runtime.fullname" . }}
 {{- range $part := list "coordinator" "worker" }}
 {{- $values := index $.Values.analytics $part }}
+{{- /* One of each by default, two of each in the HA profile (section 11). */}}
+{{- $copies := include "meridian-runtime.copies" (dict "top" $ "value" $values.replicaCount "what" (printf "analytics.%s.replicaCount" $part)) }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -29,7 +31,7 @@ metadata:
     meridian.dev/component: analytics-{{ $part }}
     {{- include "meridian-runtime.labels" $ | nindent 4 }}
 spec:
-  replicas: {{ $values.replicaCount }}
+  replicas: {{ $copies }}
   revisionHistoryLimit: {{ $.Values.revisionHistoryLimit }}
   selector:
     matchLabels:
@@ -47,6 +49,9 @@ spec:
       {{- end }}
     spec:
       {{- include "meridian-runtime.nodeTolerations" $ | nindent 6 }}
+      {{- if gt (int $copies) 1 }}
+      {{- include "meridian-runtime.spread" (dict "top" $ "component" (printf "analytics-%s" $part)) | nindent 6 }}
+      {{- end }}
       {{- with $.Values.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
@@ -66,6 +71,11 @@ spec:
               value: {{ $full }}-analytics
             - name: RUST_LOG
               value: {{ $.Values.logLevel | quote }}
+            {{- if gt (int (include "meridian-runtime.jetstreamReplicas" $)) 0 }}
+            # The units' work queue on JetStream (step 3b).
+            - name: MERIDIAN_ANALYTICS_UNITS
+              value: jetstream
+            {{- end }}
             - name: MERIDIAN_BROKER_URL
               valueFrom:
                 secretKeyRef:
@@ -85,4 +95,7 @@ spec:
             {{- toYaml $values.resources | nindent 12 }}
       volumes:
         {{- include "meridian-runtime.readyVolume" $ | nindent 8 }}
+{{- if gt (int $copies) 1 }}
+{{ include "meridian-runtime.budget" (dict "top" $ "component" (printf "analytics-%s" $part)) }}
+{{- end }}
 {{- end }}

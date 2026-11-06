@@ -1,5 +1,5 @@
 {{- include "meridian-runtime.require" . -}}
-{{- include "meridian-runtime.oneWriter" (dict "component" "instrument" "what" "instrument store" "values" .Values.instrument) -}}
+{{- include "meridian-runtime.oneWriter" (dict "top" $ "component" "instrument" "what" "instrument store" "values" .Values.instrument) -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -8,10 +8,10 @@ metadata:
     meridian.dev/component: instrument
     {{- include "meridian-runtime.labels" . | nindent 4 }}
 spec:
-  replicas: {{ include "meridian-runtime.memberCount" (dict "component" "instrument" "values" .Values.instrument) }}
+  replicas: {{ include "meridian-runtime.memberCount" (dict "top" $ "component" "instrument" "values" .Values.instrument) }}
   revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
-  {{- if include "meridian-runtime.leased" (dict "component" "instrument" "values" .Values.instrument) }}
-  {{- include "meridian-runtime.memberStrategy" (dict "component" "instrument" "values" .Values.instrument) | nindent 2 }}
+  {{- if include "meridian-runtime.leased" (dict "top" $ "component" "instrument" "values" .Values.instrument) }}
+  {{- include "meridian-runtime.memberStrategy" (dict "top" $ "component" "instrument" "values" .Values.instrument) | nindent 2 }}
   {{- end }}
   selector:
     matchLabels:

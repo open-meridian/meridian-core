@@ -1,5 +1,5 @@
 {{- include "meridian-runtime.require" . -}}
-{{- include "meridian-runtime.oneWriter" (dict "component" "bor" "what" "book of record" "values" .Values.bor) -}}
+{{- include "meridian-runtime.oneWriter" (dict "top" $ "component" "bor" "what" "book of record" "values" .Values.bor) -}}
 {{/*
   The book of record (W9): the firm's own positions, breaks and figures, an
   append-only journal per account partition and the projections rebuilt from
@@ -23,9 +23,9 @@ metadata:
     meridian.dev/component: bor
     {{- include "meridian-runtime.labels" . | nindent 4 }}
 spec:
-  replicas: {{ include "meridian-runtime.memberCount" (dict "component" "bor" "values" .Values.bor) }}
+  replicas: {{ include "meridian-runtime.memberCount" (dict "top" $ "component" "bor" "values" .Values.bor) }}
   revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
-  {{- include "meridian-runtime.memberStrategy" (dict "component" "bor" "values" .Values.bor) | nindent 2 }}
+  {{- include "meridian-runtime.memberStrategy" (dict "top" $ "component" "bor" "values" .Values.bor) | nindent 2 }}
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
