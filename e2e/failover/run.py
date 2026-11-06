@@ -226,9 +226,19 @@ def answering(component, avoid=(), above_epoch=None):
     return None
 
 
-def epoch_now(component):
-    said = answering(component)
-    return ((said or {}).get("answers") or {}).get("epoch", 0)
+def epoch_now(component, seconds=30):
+    """The epoch the component answers at, asked until it answers: one
+    probe that did not answer read as epoch 0, and CI 42291353103 called a
+    broker class with no takeover a takeover."""
+    found = {}
+
+    def answered():
+        said = answering(component)
+        if said is not None:
+            found["epoch"] = (said.get("answers") or {}).get("epoch", 0)
+        return said is not None
+    happens(answered, seconds, every=0.5)
+    return found.get("epoch", 0)
 
 
 def claim(s, failure, component, seconds, bound, extra=None):
@@ -310,8 +320,56 @@ def install(s):
         pin = json.dumps({"spec": {"template": {"spec": {
             "nodeSelector": {"kubernetes.io/hostname": server_node()},
             "affinity": None, "topologySpreadConstraints": None}}}})
+        # The database's members are made by first run, after this.
         kubectl("patch", "statefulset", f"{FULL}-database", "--type", "merge", "-p", pin)
+        # The broker's servers are made at install, each with JetStream's
+        # volume on the node it landed on: stopped, their claims let go,
+        # and made again on the server node, before anything has used them.
+        servers = json.loads(out("get", "statefulset", f"{FULL}-broker", "-o", "json"))["spec"]["replicas"]
+        kubectl("scale", "statefulset", f"{FULL}-broker", "--replicas=0")
+        wait_for("the broker's servers stopped", lambda: not out(
+            "get", "pods", "-l", f"app.kubernetes.io/instance={RELEASE},meridian.dev/component=broker",
+            "-o", "name"), seconds=180)
+        kubectl("delete", "pvc", "--ignore-not-found", "--wait", "--timeout=120s",
+                *[f"jetstream-{FULL}-broker-{i}" for i in range(servers)])
         kubectl("patch", "statefulset", f"{FULL}-broker", "--type", "merge", "-p", pin)
+        kubectl("scale", "statefulset", f"{FULL}-broker", f"--replicas={servers}")
+        cluster_services_on_server()
+
+
+# The cluster's own services, of which k3s runs one each, on any node.
+CLUSTER_SERVICES = ["coredns", "local-path-provisioner", "metrics-server"]
+
+
+def cluster_services_on_server():
+    """The cluster's own services kept on the server node, beside its API
+    server, so an agent stopped or paused never takes them. CI runs
+    42288351455 and 42300989974 stopped the agent holding k3s's one CoreDNS
+    (42298349697 paused it): every name in the cluster went unanswered until
+    the node was marked lost, so the probe, resolving the broker's name,
+    could not answer on the live member either. What a failure class
+    measures is a member's node lost, not the cluster's DNS, which a cluster
+    built for HA runs replicated across its nodes."""
+    pin = json.dumps({"spec": {"template": {"spec": {
+        "nodeSelector": {"kubernetes.io/hostname": server_node()}}}}})
+    for name in CLUSTER_SERVICES:
+        run("kubectl", "--namespace", "kube-system", "patch", "deployment", name,
+            "--type", "merge", "-p", pin)
+    for name in CLUSTER_SERVICES:
+        run("kubectl", "--namespace", "kube-system", "rollout", "status", f"deployment/{name}",
+            "--timeout=180s")
+
+
+def cluster_services_where():
+    """The node each of the cluster's own services runs on."""
+    said = json.loads(run("kubectl", "--namespace", "kube-system", "get", "pods", "-o", "json").stdout)
+    where = {}
+    for pod in said["items"]:
+        name = pod["metadata"]["name"]
+        service = next((s for s in CLUSTER_SERVICES if name.startswith(f"{s}-")), None)
+        if service and pod["status"].get("phase") == "Running" and not pod["metadata"].get("deletionTimestamp"):
+            where.setdefault(service, set()).add(pod["spec"].get("nodeName", ""))
+    return where
 
 
 def first_run(s):
@@ -442,6 +500,45 @@ def shape(s):
         s.check(database.get("primary") is True and database.get("data_checksums") == "on",
                 f"{component}: its probe names a primary with checksums ({database.get('primary')}, "
                 f"{database.get('data_checksums')})")
+    if PROFILE == "ha":
+        where = cluster_services_where()
+        s.check(all(on == {server_node()} for on in where.values()) and len(where) == len(CLUSTER_SERVICES),
+                f"the cluster's own services on the server node, apart from the classes "
+                f"({', '.join(f'{k}: {sorted(v)}' for k, v in sorted(where.items()))})")
+    jetstream_rolled(s)
+
+
+# What analytics says once it has its stream, and where it could not make one.
+QUEUE_MADE = "the units go by JetStream's work queue"
+QUEUE_NOT_THERE = "the units' work queue is not there"
+
+
+def jetstream_rolled(s):
+    """The broker's servers restarted one at a time, as an upgrade rolls
+    them, and JetStream still there after: each analytics copy restarted
+    makes or finds its stream at three, rather than going by the queue
+    group. CI 42294258528: with the stream in memory, a roll left the three
+    answering "no suitable peers for placement" for twelve minutes."""
+    kubectl("rollout", "restart", f"statefulset/{FULL}-broker")
+    rolled = kubectl("rollout", "status", f"statefulset/{FULL}-broker", "--timeout=300s",
+                     check=False).returncode == 0
+    s.check(rolled, "broker: its servers restarted one at a time")
+    parts = ("analytics-coordinator", "analytics-worker")
+    for part in parts:
+        kubectl("rollout", "restart", f"deployment/{FULL}-{part}")
+    for part in parts:
+        kubectl("rollout", "status", f"deployment/{FULL}-{part}", "--timeout=300s", check=False)
+
+    def said():
+        return {p["metadata"]["name"]: kubectl("logs", p["metadata"]["name"], "--all-containers",
+                                               check=False).stdout.decode(errors="replace")
+                for c in parts for p in pods(c)}
+    made = happens(lambda: all(QUEUE_MADE in log or QUEUE_NOT_THERE in log for log in said().values()), 120)
+    logs = said()
+    fell_back = sorted(name for name, log in logs.items() if QUEUE_MADE not in log)
+    s.check(made and not fell_back,
+            f"analytics: every copy has JetStream's work queue after the roll ({len(logs) - len(fell_back)} "
+            f"of {len(logs)}{'; not: ' + ', '.join(fell_back) if fell_back else ''})")
 
 
 # ── Failure classes ────────────────────────────────────────────────────────
