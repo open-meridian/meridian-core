@@ -208,6 +208,11 @@ under (`<component>.readyLagMs`). Takes a dict: top, component, values.
   valueFrom:
     fieldRef:
       fieldPath: metadata.labels['topology.kubernetes.io/zone']
+{{- /* How often its writer re-reads its record (step 3b, integrity at rest):
+       `<store>.scrub.intervalDays`, 7 by default, Ceph's deep scrub; 0 for
+       never. */}}
+- name: MERIDIAN_SCRUB_INTERVAL_DAYS
+  value: {{ dig "scrub" "intervalDays" 7 .values | toString | quote }}
 {{- if include "meridian-runtime.leased" . }}
 - name: MERIDIAN_LEASE_NAME
   value: {{ printf "%s-%s" (include "meridian-runtime.fullname" .top) .component | quote }}

@@ -90,4 +90,12 @@ message Change {
   // The change itself, as the store keeps it: a lake row's message encoded, a
   // book entry, or a row's columns as JSON.
   bytes body = 7;
+
+  // Its digest, kept beside it where it rests (step 3b; integrity at rest):
+  // SHA-256 of `body` for a lake row and a captured row; for a book entry,
+  // SHA-256 of the previous entry's digest in its partition and then
+  // `body`, so the journal is a chain. A follower verifies what it applies
+  // by it, and copies nothing that does not verify. Empty where the record
+  // keeps none yet: a row recorded before digests, until the scrub fills it.
+  bytes digest = 8;
 }

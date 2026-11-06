@@ -163,6 +163,32 @@ impl PostgresStore {
         CHANGES.head_epoch(&mut *conn).map_err(unavailable)
     }
 
+    /// Re-read the captured log (step 3b, integrity at rest).
+    pub fn scrub(&self) -> Result<meridian_changes::integrity::Scrubbed> {
+        let mut conn = self.conn()?;
+        CHANGES.scrub(&mut *conn).map_err(unavailable)
+    }
+
+    /// Keep a scrub's findings and its run (`IntegrityFinding`).
+    pub fn record_scrub(
+        &self,
+        scrubbed: &meridian_changes::integrity::Scrubbed,
+        member: &str,
+        started_at_ns: i64,
+        finished_at_ns: i64,
+    ) -> Result<()> {
+        let mut conn = self.conn()?;
+        meridian_changes::integrity::record(
+            &mut *conn,
+            CHANGES.prefix,
+            scrubbed,
+            member,
+            started_at_ns,
+            finished_at_ns,
+        )
+        .map_err(unavailable)
+    }
+
     /// What a start does instead of migrating: check the schema is there.
     ///
     /// A deployment gives the runtime no right to create a table, so a start

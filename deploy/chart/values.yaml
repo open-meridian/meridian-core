@@ -233,6 +233,11 @@ zones: []
 
 instrument:
   replicaCount: 1
+  # How often its writer re-reads its record, at low priority (step 3b,
+  # integrity at rest): every row and digest checked, the journal's chain
+  # followed, each finding kept as an IntegrityFinding. 0 for never.
+  scrub:
+    intervalDays: 7
   # A warm standby (step 3b): 0 or 1, by the profile (0 tolerant, 1 ha).
   # standby:
   # A standby's readiness bound: its lag behind the writer's change log.
@@ -247,6 +252,11 @@ instrument:
 
 conductor:
   replicaCount: 1
+  # How often its writer re-reads its record, at low priority (step 3b,
+  # integrity at rest): every row and digest checked, the journal's chain
+  # followed, each finding kept as an IntegrityFinding. 0 for never.
+  scrub:
+    intervalDays: 7
   # A warm standby (step 3b): 0 or 1, by the profile. It needs the key in
   # key.existingSecret.
   # standby:
@@ -264,6 +274,11 @@ conductor:
 
 street:
   replicaCount: 1
+  # How often its writer re-reads its record, at low priority (step 3b,
+  # integrity at rest): every row and digest checked, the journal's chain
+  # followed, each finding kept as an IntegrityFinding. 0 for never.
+  scrub:
+    intervalDays: 7
   # standby: by the profile, 0 or 1
   readyLagMs: 5000
   image:
@@ -282,6 +297,11 @@ street:
 # kept apart from the street's by the credential.
 bor:
   replicaCount: 1
+  # How often its writer re-reads its record, at low priority (step 3b,
+  # integrity at rest): every row and digest checked, the journal's chain
+  # followed, each finding kept as an IntegrityFinding. 0 for never.
+  scrub:
+    intervalDays: 7
   # standby: by the profile, 0 or 1
   readyLagMs: 5000
   image:
@@ -322,6 +342,11 @@ bor:
 # credential.
 lake:
   replicaCount: 1
+  # How often its writer re-reads its record, at low priority (step 3b,
+  # integrity at rest): every row and digest checked, the journal's chain
+  # followed, each finding kept as an IntegrityFinding. 0 for never.
+  scrub:
+    intervalDays: 7
   # standby: by the profile, 0 or 1
   readyLagMs: 5000
   image:

@@ -291,6 +291,7 @@ pub fn control_change(
         origin: meridian_changes::origin().to_string(),
         committed_at_ns: at_ns,
         kind: kind.to_string(),
+        digest: meridian_changes::integrity::digest(&body),
         body,
     }
 }
@@ -696,6 +697,7 @@ pub fn row_change(dataset: &str, row: &Observation, epoch: u64, origin: &str) ->
         origin: origin.to_string(),
         committed_at_ns: row.meta().recorded_at_ns,
         kind: row.data_type().name().to_string(),
+        digest: meridian_changes::integrity::digest(&row.encode()),
         body: row.encode(),
     }
 }
@@ -727,5 +729,6 @@ pub fn served_change(served: &Served, epoch: u64, origin: &str) -> Change {
             list(&served.readers)
         )
         .into_bytes(),
+        digest: Vec::new(),
     }
 }

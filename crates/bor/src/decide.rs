@@ -414,6 +414,8 @@ pub(crate) fn made(book: &Book, head: u64, ctx: &Context, draft: Draft) -> Resul
         idempotency_key: draft.idempotency_key.clone(),
     };
     let mut entry = Entry {
+        previous_digest: Vec::new(),
+        digest: Vec::new(),
         entry_id: meta.entry_id.clone(),
         account_id: book.account_id.clone(),
         partition: book.partition.clone(),

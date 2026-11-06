@@ -46,6 +46,7 @@ fn run() -> Result<(), String> {
             component: "lake",
             domain: Some("lake"),
             database: Some("MERIDIAN_LAKE_DATABASE_URL"),
+            record: Some("lake"),
         });
     }
     let url = required("MERIDIAN_LAKE_DATABASE_URL")?;
@@ -74,7 +75,27 @@ fn run() -> Result<(), String> {
                 None => Ok(()),
             };
         }
-        Some(other) => return Err(format!("{other:?} is not a command; migrate")),
+        // One scrub at once, from inside the pod (step 3b): what it found,
+        // as JSON.
+        Some("scrub") => {
+            let said = meridian_runtime::scrub::run_once(
+                "lake",
+                || {
+                    let store =
+                        PostgresStore::connect(&url, 1).map_err(|failed| failed.to_string())?;
+                    let scrubbed = store.scrub().map_err(|failed| failed.to_string());
+                    scrubbed
+                },
+                |scrubbed, member, started, finished| {
+                    PostgresStore::connect(&url, 1)
+                        .and_then(|store| store.record_scrub(scrubbed, member, started, finished))
+                        .map_err(|failed| failed.to_string())
+                },
+            )?;
+            println!("{said}");
+            return Ok(());
+        }
+        Some(other) => return Err(format!("{other:?} is not a command; migrate or scrub")),
         None => {}
     }
 
@@ -143,6 +164,24 @@ fn run() -> Result<(), String> {
         let watched = Arc::clone(&store);
         holding.keep(epoch, move || {
             watched.head_epoch().map_err(|failed| failed.to_string())
+        });
+        // The scrub, under the lease (step 3b, integrity at rest).
+        let scrubbing = url.clone();
+        meridian_runtime::scrub::forever("lake", move || {
+            meridian_runtime::scrub::run_once(
+                "lake",
+                || {
+                    let store = PostgresStore::connect(&scrubbing, 1)
+                        .map_err(|failed| failed.to_string())?;
+                    let scrubbed = store.scrub().map_err(|failed| failed.to_string());
+                    scrubbed
+                },
+                |scrubbed, member, started, finished| {
+                    PostgresStore::connect(&scrubbing, 1)
+                        .and_then(|store| store.record_scrub(scrubbed, member, started, finished))
+                        .map_err(|failed| failed.to_string())
+                },
+            )
         });
         // Every handler and subscription in place before this returns.
         let lake = meridian_lake::service::serve(bus.clone(), Arc::clone(&store), clock());

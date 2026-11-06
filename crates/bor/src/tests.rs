@@ -2220,6 +2220,8 @@ async fn replay_benchmark() {
         let entries: Vec<Entry> = rows
             .iter()
             .map(|(entry, body)| Entry {
+                previous_digest: Vec::new(),
+                digest: Vec::new(),
                 body: crate::journal::Body::from_bytes(body).unwrap(),
                 ..entry.clone()
             })
@@ -2255,6 +2257,8 @@ async fn replay_benchmark() {
         // One entry of tail.
         let (last, body) = rows.last().unwrap();
         let tail = Entry {
+            previous_digest: Vec::new(),
+            digest: Vec::new(),
             body: crate::journal::Body::from_bytes(body).unwrap(),
             ..last.clone()
         };

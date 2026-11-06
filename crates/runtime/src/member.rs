@@ -425,6 +425,7 @@ const ASK_EVERY: Duration = Duration::from_secs(1);
 async fn follow(bus: Arc<Bus>, domain: &'static str, bound: Duration) {
     let mut tail = bus.subscribe_every(&meridian_changes::every_changes_topic(domain));
     let mut at: HashMap<String, u64> = HashMap::new();
+    let mut chains: HashMap<String, meridian_changes::integrity::Chain> = HashMap::new();
     // Behind since a page was missed and not yet read; unanswered since the
     // writer last failed to answer. The lag is the longer.
     let mut gap_since: Option<Instant> = None;
@@ -447,6 +448,22 @@ async fn follow(bus: Arc<Bus>, domain: &'static str, bound: Duration) {
                 let Some(partition) = page.changes.first().map(|c| c.partition.clone()) else {
                     continue;
                 };
+                // Integrity at rest (step 3b): every change it takes in order
+                // verified by its digest, the book's by its chain; one that
+                // does not verify is never taken, and the standby stays
+                // behind, unready, saying so. A page after a gap is checked
+                // as the gap is read, in order.
+                let contiguous = match at.get(&partition).copied() {
+                    None => true,
+                    Some(held) => page.head > held && page.after_sequence == held,
+                };
+                if contiguous {
+                    if let Err(failed) = verified(domain, &mut chains, &page.changes) {
+                        tracing::error!(domain, partition, %failed, "a change did not verify; not followed");
+                        gap_since.get_or_insert_with(Instant::now);
+                        continue;
+                    }
+                }
                 match at.get(&partition).copied() {
                     None => {
                         at.insert(partition, page.head);
@@ -458,7 +475,7 @@ async fn follow(bus: Arc<Bus>, domain: &'static str, bound: Duration) {
                     Some(held) => {
                         // A page missed: read it from the writer, never infer it.
                         gap_since.get_or_insert_with(Instant::now);
-                        match catch_up(&bus, domain, &partition, held).await {
+                        match catch_up(&bus, domain, &partition, held, &mut chains).await {
                             Ok(head) => {
                                 at.insert(partition, head.max(page.head));
                                 gap_since = None;
@@ -514,7 +531,32 @@ async fn ask_writer(bus: &Bus, domain: &str) -> Result<(), String> {
 
 /// Read a partition's changes after `after` from the writer, page by page,
 /// to its head.
-async fn catch_up(bus: &Bus, domain: &str, partition: &str, mut after: u64) -> Result<u64, String> {
+/// Each change verified by its digest, and the book's by its chain too.
+fn verified(
+    domain: &str,
+    chains: &mut HashMap<String, meridian_changes::integrity::Chain>,
+    changes: &[meridian_changes::Change],
+) -> Result<(), String> {
+    for change in changes {
+        if domain == "book" {
+            chains
+                .entry(change.partition.clone())
+                .or_default()
+                .follow(change)?;
+        } else {
+            meridian_changes::integrity::verify(change)?;
+        }
+    }
+    Ok(())
+}
+
+async fn catch_up(
+    bus: &Bus,
+    domain: &str,
+    partition: &str,
+    mut after: u64,
+    chains: &mut HashMap<String, meridian_changes::integrity::Chain>,
+) -> Result<u64, String> {
     loop {
         let asked = meridian_changes::ReadChangesRequest {
             partition: partition.to_string(),
@@ -533,6 +575,7 @@ async fn catch_up(bus: &Bus, domain: &str, partition: &str, mut after: u64) -> R
             .map_err(|failed| failed.to_string())?;
         let page = meridian_changes::ReadChangesReply::decode(body.as_slice())
             .map_err(|failed| failed.to_string())?;
+        verified(domain, chains, &page.changes)?;
         for change in &page.changes {
             if change.sequence <= after {
                 return Err(format!(

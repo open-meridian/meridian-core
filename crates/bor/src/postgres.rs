@@ -84,9 +84,34 @@ impl PostgresStore {
         let mut conn = self.conn()?;
         conn.execute("SELECT pg_advisory_lock($1)", &[&SCHEMA_LOCK])
             .map_err(unavailable)?;
-        let outcome = apply_migrations(&mut conn, clock);
+        let outcome = apply_migrations(&mut conn, clock).and_then(|()| chain(&mut conn));
         let _ = conn.execute("SELECT pg_advisory_unlock($1)", &[&SCHEMA_LOCK]);
         outcome
+    }
+
+    /// Re-read the record (step 3b, integrity at rest): [`scrub_chain`].
+    pub fn scrub(&self) -> Result<meridian_changes::integrity::Scrubbed> {
+        scrub_chain(&mut self.conn()?)
+    }
+
+    /// Keep a scrub's findings and its run (`IntegrityFinding`).
+    pub fn record_scrub(
+        &self,
+        scrubbed: &meridian_changes::integrity::Scrubbed,
+        member: &str,
+        started_at_ns: i64,
+        finished_at_ns: i64,
+    ) -> Result<()> {
+        let mut conn = self.conn()?;
+        meridian_changes::integrity::record(
+            &mut *conn,
+            "book",
+            scrubbed,
+            member,
+            started_at_ns,
+            finished_at_ns,
+        )
+        .map_err(unavailable)
     }
 
     /// What a start does instead: one read, no lock.
@@ -181,8 +206,131 @@ impl PostgresStore {
     }
 }
 
+/// Follow every partition's chain (step 3b, integrity at rest): each
+/// entry's digest taken again of its canonical form after the digest it
+/// names, and the digest it names the one before it in its partition, so a
+/// changed entry and a missing one are each named by sequence -- the first
+/// bad one in each partition.
+pub fn scrub_chain(conn: &mut Connection) -> Result<meridian_changes::integrity::Scrubbed> {
+    let mut scrubbed = meridian_changes::integrity::Scrubbed::default();
+    let partitions: Vec<String> = conn
+        .query(
+            "SELECT partition FROM book_partition_head ORDER BY partition",
+            &[],
+        )
+        .map_err(unavailable)?
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    for partition in partitions {
+        let mut after: i64 = 0;
+        let mut previous: Option<Vec<u8>> = None;
+        'partition: loop {
+            let rows = conn
+                .query(
+                    &format!(
+                        "SELECT {ENTRY_COLUMNS}, committed_at_ns FROM book_entry
+                          WHERE partition = $1 AND first_sequence > $2
+                          ORDER BY first_sequence LIMIT 500"
+                    ),
+                    &[&partition, &after],
+                )
+                .map_err(unavailable)?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in &rows {
+                scrubbed.checked += 1;
+                let entry = entry_of(row)?;
+                after = entry.first_sequence as i64;
+                let at: i64 = row.get(12);
+                let broken = |what: &str| meridian_changes::integrity::Finding {
+                    partition: partition.clone(),
+                    sequence: entry.last_sequence,
+                    committed_at_ns: at,
+                    what: what.to_string(),
+                };
+                if entry.digest.is_empty() {
+                    previous = None;
+                    continue;
+                }
+                if previous
+                    .as_ref()
+                    .is_some_and(|p| *p != entry.previous_digest)
+                {
+                    scrubbed.findings.push(broken(
+                        "an entry does not follow the one before it: one was changed or removed",
+                    ));
+                    break 'partition;
+                }
+                if entry.verify().is_err() {
+                    scrubbed.findings.push(broken(
+                        "an entry does not match its digest: it changed beneath the book",
+                    ));
+                    break 'partition;
+                }
+                previous = Some(entry.digest.clone());
+            }
+        }
+    }
+    Ok(scrubbed)
+}
+
+/// Chain every entry kept before digests (step 3b, integrity at rest;
+/// migration 9): each partition's entries in their order, each given the
+/// previous one's digest and its own, and the partition's head its last.
+/// Run by `migrate`, under its lock; an entry already chained is left as it
+/// is, so it may run again, and a partition chained whole is passed over.
+fn chain(conn: &mut Connection) -> Result<()> {
+    let partitions: Vec<String> = conn
+        .query(
+            "SELECT DISTINCT partition FROM book_entry WHERE digest IS NULL",
+            &[],
+        )
+        .map_err(unavailable)?
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    for partition in partitions {
+        let mut tx = conn.transaction().map_err(unavailable)?;
+        let rows = tx
+            .query(
+                &format!(
+                    "SELECT {ENTRY_COLUMNS} FROM book_entry WHERE partition = $1
+                      ORDER BY first_sequence"
+                ),
+                &[&partition],
+            )
+            .map_err(unavailable)?;
+        let mut previous: Vec<u8> = Vec::new();
+        for row in &rows {
+            let mut entry = entry_of(row)?;
+            if entry.digest.is_empty() {
+                entry.previous_digest = previous.clone();
+                entry.digest = meridian_changes::integrity::chained(
+                    &entry.previous_digest,
+                    &entry.canonical(),
+                );
+                tx.execute(
+                    "UPDATE book_entry SET previous_digest = $2, digest = $3 WHERE entry_id = $1",
+                    &[&entry.entry_id, &entry.previous_digest, &entry.digest],
+                )
+                .map_err(unavailable)?;
+            }
+            previous = entry.digest;
+        }
+        tx.execute(
+            "UPDATE book_partition_head SET last_digest = $2 WHERE partition = $1",
+            &[&partition, &previous],
+        )
+        .map_err(unavailable)?;
+        tx.commit().map_err(unavailable)?;
+    }
+    Ok(())
+}
+
 const ENTRY_COLUMNS: &str = "entry_id, account_id, partition, first_sequence, last_sequence,
-        message_id, idempotency_key, meta, cause, body";
+        message_id, idempotency_key, meta, cause, body, previous_digest, digest";
 
 fn entry_of(row: &Row) -> Result<Entry> {
     let meta: Vec<u8> = row.get(7);
@@ -199,6 +347,8 @@ fn entry_of(row: &Row) -> Result<Entry> {
         meta: EntryMeta::decode(meta.as_slice()).map_err(unreadable)?,
         cause: ChangeCause::decode(cause.as_slice()).map_err(unreadable)?,
         body: Body::from_bytes(&body)?,
+        previous_digest: row.get::<_, Option<Vec<u8>>>(10).unwrap_or_default(),
+        digest: row.get::<_, Option<Vec<u8>>>(11).unwrap_or_default(),
     })
 }
 
@@ -213,7 +363,9 @@ fn journal_of(client: &mut impl GenericClient, account_id: &str) -> Result<Vec<E
         )
         .map_err(unavailable)?
         .iter()
-        .map(entry_of)
+        // Each entry replayed is the one its digest was taken of (step 3b):
+        // a record changed beneath the book fails the replay loudly.
+        .map(|row| entry_of(row).and_then(|entry| entry.verify().map(|()| entry)))
         .collect()
 }
 
@@ -1073,12 +1225,14 @@ impl Store for PostgresStore {
         // command commits only while the head row's epoch is its own.
         let held = tx
             .query_one(
-                "SELECT sequence, epoch FROM book_partition_head WHERE partition = $1 FOR UPDATE",
+                "SELECT sequence, epoch, last_digest FROM book_partition_head WHERE partition = $1 FOR UPDATE",
                 &[&partition],
             )
             .map_err(unavailable)?;
         self.fence.admits(held.get::<_, i64>(1) as u64)?;
         let head: i64 = held.get(0);
+        // The partition's last digest, its chain's end (step 3b).
+        let last_digest: Vec<u8> = held.get::<_, Option<Vec<u8>>>(2).unwrap_or_default();
 
         // A duplicate is answered with the first's reply, nothing applied:
         // the same message, or the same command under the same key. Another
@@ -1116,11 +1270,17 @@ impl Store for PostgresStore {
         let (mut book, replayed) = book_from(&mut tx, account_id, &partition)?;
         // Each entry's body the decision asks for, read in this transaction
         // (contract v26, W9.10), and the decision made again with it.
-        let decided = crate::store::with_bodies(
+        let mut decided = crate::store::with_bodies(
             &mut book,
             |account, ids| bodies_of(&mut tx, account, ids),
             |book| decide(book, head.max(0) as u64),
         )?;
+        // Its place in the partition's chain (step 3b, integrity at rest).
+        decided.entry.previous_digest = last_digest;
+        decided.entry.digest = meridian_changes::integrity::chained(
+            &decided.entry.previous_digest,
+            &decided.entry.canonical(),
+        );
         let entry = &decided.entry;
 
         tx.execute(
@@ -1133,8 +1293,9 @@ impl Store for PostgresStore {
             "INSERT INTO book_entry (entry_id, account_id, partition, first_sequence, last_sequence,
                                      kind, effective_date, message_id, idempotency_key,
                                      committed_at_ns, meta, cause, body, reply, actor, request,
-                                     epoch)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
+                                     epoch, previous_digest, digest)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
+                     $18, $19)",
             &[
                 &entry.entry_id,
                 &entry.account_id,
@@ -1153,12 +1314,18 @@ impl Store for PostgresStore {
                 &actor_named(entry.meta.actor.as_ref()),
                 &request,
                 &(epoch as i64),
+                &entry.previous_digest,
+                &entry.digest,
             ],
         )
         .map_err(unavailable)?;
         tx.execute(
-            "UPDATE book_partition_head SET sequence = $1 WHERE partition = $2",
-            &[&(entry.last_sequence as i64), &entry.partition],
+            "UPDATE book_partition_head SET sequence = $1, last_digest = $3 WHERE partition = $2",
+            &[
+                &(entry.last_sequence as i64),
+                &entry.partition,
+                &entry.digest,
+            ],
         )
         .map_err(unavailable)?;
         project(&mut tx, account_id, &decided.changes)?;
@@ -1294,9 +1461,9 @@ impl Store for PostgresStore {
             }
             for row in &rows {
                 let entry = entry_of(row).map_err(failed)?;
-                let origin: Option<String> = row.get(11);
+                let origin: Option<String> = row.get(13);
                 let change = entry.to_change(
-                    row.get::<_, i64>(10) as u64,
+                    row.get::<_, i64>(12) as u64,
                     &origin.unwrap_or_else(|| own_origin.clone()),
                 );
                 from = change.sequence;

@@ -48,6 +48,7 @@ fn run() -> Result<(), String> {
             component: "bor",
             domain: Some("book"),
             database: Some("MERIDIAN_BOR_DATABASE_URL"),
+            record: Some("book"),
         });
     }
     let url = required("MERIDIAN_BOR_DATABASE_URL")?;
@@ -96,7 +97,31 @@ fn run() -> Result<(), String> {
             );
             return Ok(());
         }
-        Some(other) => return Err(format!("{other:?} is not a command; migrate or rebuild")),
+        // One scrub at once, from inside the pod (step 3b): what it found,
+        // as JSON.
+        Some("scrub") => {
+            let said = meridian_runtime::scrub::run_once(
+                "book",
+                || {
+                    let store =
+                        PostgresStore::connect(&url, 1).map_err(|failed| failed.to_string())?;
+                    let scrubbed = store.scrub().map_err(|failed| failed.to_string());
+                    scrubbed
+                },
+                |scrubbed, member, started, finished| {
+                    PostgresStore::connect(&url, 1)
+                        .and_then(|store| store.record_scrub(scrubbed, member, started, finished))
+                        .map_err(|failed| failed.to_string())
+                },
+            )?;
+            println!("{said}");
+            return Ok(());
+        }
+        Some(other) => {
+            return Err(format!(
+                "{other:?} is not a command; migrate, rebuild or scrub"
+            ))
+        }
         None => {}
     }
 
@@ -152,6 +177,24 @@ fn run() -> Result<(), String> {
         let watched = postgres.clone();
         holding.keep(epoch, move || {
             meridian_bor::Store::head_epoch(watched.as_ref()).map_err(|failed| failed.to_string())
+        });
+        // The scrub, under the lease (step 3b, integrity at rest).
+        let scrubbing = url.clone();
+        meridian_runtime::scrub::forever("book", move || {
+            meridian_runtime::scrub::run_once(
+                "book",
+                || {
+                    let store = PostgresStore::connect(&scrubbing, 1)
+                        .map_err(|failed| failed.to_string())?;
+                    let scrubbed = store.scrub().map_err(|failed| failed.to_string());
+                    scrubbed
+                },
+                |scrubbed, member, started, finished| {
+                    PostgresStore::connect(&scrubbing, 1)
+                        .and_then(|store| store.record_scrub(scrubbed, member, started, finished))
+                        .map_err(|failed| failed.to_string())
+                },
+            )
         });
         // Every commit, whichever path makes it, told on its partition's
         // tail (step 3a).

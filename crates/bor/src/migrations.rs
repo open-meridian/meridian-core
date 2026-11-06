@@ -58,6 +58,13 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "writer_took_over",
         sql: include_str!("../migrations/0008_writer_took_over.sql"),
     },
+    // Integrity at rest (step 3b): the journal's chain, its findings and
+    // its scrubs.
+    Migration {
+        version: 9,
+        name: "journal_chain",
+        sql: include_str!("../migrations/0009_journal_chain.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

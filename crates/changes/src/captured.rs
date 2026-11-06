@@ -23,6 +23,8 @@ use postgres::GenericClient;
 use crate::{check_kept, origin, Change, Page, ReadChangesReply, ReadError, CONTROL, FENCED};
 
 /// The SQLSTATE a fenced commit is refused with.
+///
+/// (Integrity at rest's scrub of a captured log: [`Spec::scrub`].)
 pub const FENCED_STATE: &str = "MF001";
 
 /// What a store captures, and where.
@@ -46,6 +48,50 @@ pub struct Spec {
 impl Spec {
     fn change_table(&self) -> String {
         format!("{}_change", self.prefix)
+    }
+
+    /// Re-read the log (step 3b, integrity at rest): every row's digest
+    /// checked against its body, a row kept before digests given its own, a
+    /// row that no longer matches named by its partition's first bad
+    /// sequence. Postgres verifies each page's checksum as it reads it.
+    pub fn scrub(
+        &self,
+        client: &mut impl GenericClient,
+    ) -> Result<crate::integrity::Scrubbed, postgres::Error> {
+        let change = self.change_table();
+        let filled = client.execute(
+            &format!(
+                "UPDATE {change} SET digest = sha256(convert_to(body::text, 'UTF8'))
+                  WHERE digest IS NULL"
+            ),
+            &[],
+        )?;
+        let checked = client
+            .query_one(&format!("SELECT count(*) FROM {change}"), &[])?
+            .get::<_, i64>(0) as u64;
+        let findings = client
+            .query(
+                &format!(
+                    "SELECT partition, min(sequence), min(committed_at_ns) FROM {change}
+                      WHERE digest <> sha256(convert_to(body::text, 'UTF8'))
+                      GROUP BY partition ORDER BY partition"
+                ),
+                &[],
+            )?
+            .iter()
+            .map(|row| crate::integrity::Finding {
+                partition: row.get(0),
+                sequence: row.get::<_, i64>(1) as u64,
+                committed_at_ns: row.get(2),
+                what: "a row does not match its digest: the record changed beneath the store"
+                    .to_string(),
+            })
+            .collect();
+        Ok(crate::integrity::Scrubbed {
+            checked,
+            filled,
+            findings,
+        })
     }
 
     /// The connection setting a writer names its epoch in.
@@ -113,6 +159,28 @@ impl Spec {
                 body            jsonb   NOT NULL,
                 PRIMARY KEY (partition, sequence, ordinal)
             );
+            -- Each row's digest, SHA-256 of its body as text (step 3b,
+            -- integrity at rest): checked when it is read and by the scrub.
+            ALTER TABLE {change} ADD COLUMN IF NOT EXISTS digest bytea;
+            CREATE TABLE IF NOT EXISTS {prefix}_integrity_finding (
+                id              bigserial PRIMARY KEY,
+                partition       text   NOT NULL,
+                sequence        bigint NOT NULL,
+                committed_at_ns bigint NOT NULL,
+                what            text   NOT NULL,
+                member          text   NOT NULL,
+                origin          text   NOT NULL,
+                found_at_ns     bigint NOT NULL,
+                UNIQUE (partition, sequence, what)
+            );
+            CREATE TABLE IF NOT EXISTS {prefix}_scrub (
+                started_at_ns  bigint PRIMARY KEY,
+                finished_at_ns bigint NOT NULL,
+                checked        bigint NOT NULL,
+                filled         bigint NOT NULL,
+                findings       bigint NOT NULL,
+                member         text   NOT NULL
+            );
             CREATE OR REPLACE FUNCTION {prefix}_capture() RETURNS trigger
                 LANGUAGE plpgsql AS $f$
             DECLARE
@@ -142,10 +210,12 @@ impl Spec {
                 ELSE
                     body := to_jsonb(NEW);
                 END IF;
-                INSERT INTO {change} (partition, sequence, ordinal, epoch, committed_at_ns, kind, body)
+                INSERT INTO {change} (partition, sequence, ordinal, epoch, committed_at_ns, kind, body,
+                                      digest)
                 VALUES ('{partition}', seq, ord, h.epoch,
                         coalesce(nullif(current_setting('{now_setting}', true), '')::bigint, 0),
-                        TG_TABLE_NAME || '.' || lower(TG_OP), body);
+                        TG_TABLE_NAME || '.' || lower(TG_OP), body,
+                        sha256(convert_to(body::text, 'UTF8')));
                 -- Heard after commit by the tail's publisher, once a
                 -- transaction: Postgres folds a channel's equal payloads.
                 PERFORM pg_notify('{prefix}_changes', '');
@@ -395,7 +465,8 @@ impl Spec {
             let rows = client
                 .query(
                     &format!(
-                        "SELECT sequence, epoch, origin, committed_at_ns, kind, body::text
+                        "SELECT sequence, epoch, origin, committed_at_ns, kind, body::text,
+                                coalesce(digest = sha256(convert_to(body::text, 'UTF8')), true)
                            FROM {} WHERE partition = $1 AND sequence > $2
                           ORDER BY sequence, ordinal LIMIT $3",
                         self.change_table()
@@ -411,6 +482,14 @@ impl Spec {
             let mut bodies: Vec<Vec<String>> = Vec::new();
             for row in &rows {
                 let sequence = row.get::<_, i64>(0) as u64;
+                // A row changed beneath the store is never served: the
+                // follower stays behind, and the scrub records it.
+                if !row.get::<_, bool>(6) {
+                    return Err(ReadError::Unavailable(format!(
+                        "change {sequence} of partition {partition} does not match its digest: \
+                         the record changed beneath the store"
+                    )));
+                }
                 let entry = format!(
                     "{{\"kind\":{},\"row\":{}}}",
                     json_string(row.get::<_, &str>(4)),
@@ -431,6 +510,7 @@ impl Spec {
                     committed_at_ns: row.get(3),
                     kind: "rows".to_string(),
                     body: Vec::new(),
+                    digest: Vec::new(),
                 });
                 bodies.push(vec![entry]);
             }
@@ -461,6 +541,9 @@ impl Spec {
             }
             for (mut change, body) in groups.into_iter().zip(bodies) {
                 change.body = format!("[{}]", body.join(",")).into_bytes();
+                // The transaction's rows, as carried, verified by whoever
+                // applies them.
+                change.digest = crate::integrity::digest(&change.body);
                 from = change.sequence;
                 if !page.take(change) {
                     break 'pages;
@@ -836,8 +919,13 @@ impl Spec {
             let ours = table.starts_with(&prefix)
                 || table == self.prefix
                 || also.contains(&table.as_str());
+            // The log's own, and integrity at rest's beside it (step 3b):
+            // its findings and its scrubs are the log's working records,
+            // never the store's changes.
             let own = table == self.head
                 || table == format!("{}_change", self.prefix)
+                || table == format!("{}_integrity_finding", self.prefix)
+                || table == format!("{}_scrub", self.prefix)
                 || table.ends_with("_schema_migration");
             if !ours || own {
                 continue;

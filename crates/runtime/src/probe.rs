@@ -35,6 +35,10 @@ pub struct Paths {
     pub domain: Option<&'static str>,
     /// The variable its database's URL is in, if it has one.
     pub database: Option<&'static str>,
+    /// The prefix its record's tables are kept under, whose last scrub and
+    /// integrity findings the probe reports (step 3b); none for a component
+    /// with no record.
+    pub record: Option<&'static str>,
 }
 
 /// `host:port` of a URL, nothing else of it: never a user or a password.
@@ -83,7 +87,7 @@ fn reach(path: &str, address: &str) -> Value {
 }
 
 /// The database reached, and what integrity at rest asks of it.
-fn database(url: &str) -> Value {
+fn database(url: &str, record: Option<&str>) -> Value {
     let Some(address) = address_of(url, 5432) else {
         return json!({ "path": "database", "ok": false, "why": "no database address is set" });
     };
@@ -115,6 +119,12 @@ fn database(url: &str) -> Value {
                 .query_one("SELECT NOT pg_is_in_recovery()", &[])
                 .map(|row| row.get::<_, bool>(0))
                 .unwrap_or(false));
+            // Its record's last scrub and findings, where it keeps them.
+            if let Some(prefix) = record {
+                if let Ok(said) = meridian_changes::integrity::last(&mut client, prefix) {
+                    found["integrity"] = said;
+                }
+            }
             found["ms"] = json!(started.elapsed().as_millis() as u64);
         }
         Err(failed) => {
@@ -200,7 +210,7 @@ pub fn run(paths: &Paths) -> Result<(), String> {
         }
     }
     if let Some(url) = paths.database.and_then(var) {
-        found.push(database(&url));
+        found.push(database(&url, paths.record));
     }
     if var("MERIDIAN_LEASE_NAME").is_some() {
         if let Some(host) = var("KUBERNETES_SERVICE_HOST") {
