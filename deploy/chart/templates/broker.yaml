@@ -118,6 +118,11 @@ metadata:
 type: Opaque
 data:
   MERIDIAN_NATS__ROUTES: {{ $routes }}
+{{- /* Each server's route, whole, with the cluster's credential: the
+       broker's configuration names these variables and never holds one. */}}
+{{- range $i := until $servers }}
+  {{ printf "MERIDIAN_NATS__ROUTE_%d" $i }}: {{ printf "nats-route://routes:%s@%s-%d.%s:6222" (b64dec $routes) $name $i $members | b64enc }}
+{{- end }}
 {{- range $user, $password := $passwords }}
   {{ printf "MERIDIAN_NATS_%s" (upper (replace "-" "_" $user)) }}: {{ $password }}
 {{- end }}
@@ -326,13 +331,14 @@ spec:
             - --broker
             - {{ $address }}
             {{- if gt $servers 1 }}
-            # Its routes to the other servers, by their names, its own
-            # included (a server ignores its route to itself).
+            # Its routes to the other servers, its own included (a server
+            # ignores its route to itself), each named by the variable
+            # holding it with the cluster's credential.
             - --cluster
             - {{ $name | quote }}
             {{- range $i := until $servers }}
             - --route
-            - {{ printf "%s-%d.%s:6222" $name $i $members }}
+            - {{ printf "MERIDIAN_NATS__ROUTE_%d" $i }}
             {{- end }}
             {{- end }}
             {{- if gt $jetstream 0 }}

@@ -322,11 +322,11 @@ mod serve {
 /// and-fails-over-by-configuration section 4, question 6), as the broker's
 /// configuration says them; nothing for a server alone.
 ///
-/// Its name from `MERIDIAN_BROKER_SERVER_NAME`, its pod's. Its routes by
-/// every server's name, solicited with the cluster's own credential (the
-/// server's `cluster.authorization`, read from `MERIDIAN_NATS__ROUTES` like
-/// every other password here), so no client credential can join it, and
-/// nothing in this file is a password. JetStream in memory only, for the
+/// Its name from `MERIDIAN_BROKER_SERVER_NAME`, its pod's. Its routes, one
+/// per server, each by the variable holding its URL with the cluster's own
+/// credential, which `cluster.authorization` checks (read from
+/// `MERIDIAN_NATS__ROUTES`, like every other password here): no client
+/// credential can join the cluster, and nothing in this file is a password. JetStream in memory only, for the
 /// analytics units' work queue: never a record (decisions/024); its Raft
 /// state beside this file, in the pod's own directory.
 fn clustered(cluster: &str, routes: &[String], jetstream: &str) -> String {
@@ -343,7 +343,7 @@ fn clustered(cluster: &str, routes: &[String], jetstream: &str) -> String {
              routes: [\n"
         ));
         for route in routes {
-            said.push_str(&format!("    \"nats-route://{route}\"\n"));
+            said.push_str(&format!("    ${route}\n"));
         }
         said.push_str("  ]\n}\n\n");
     }
@@ -513,18 +513,21 @@ mod tests {
     #[test]
     fn a_server_alone_says_no_cluster_and_three_say_one_with_no_password() {
         assert_eq!(super::clustered("", &[], ""), "");
-        let routes = ["b-0.m:6222".to_string(), "b-1.m:6222".to_string()];
+        let routes = [
+            "MERIDIAN_NATS__ROUTE_0".to_string(),
+            "MERIDIAN_NATS__ROUTE_1".to_string(),
+        ];
         let said = super::clustered("b", &routes, "64MB");
         assert!(said.contains("server_name: $MERIDIAN_BROKER_SERVER_NAME\n"));
         assert!(said.contains("cluster {\n  name: \"b\"\n"));
         assert!(said.contains("password: $MERIDIAN_NATS__ROUTES\n"));
-        assert!(said.contains("\"nats-route://b-0.m:6222\"\n"));
-        assert!(said.contains("\"nats-route://b-1.m:6222\"\n"));
+        assert!(said.contains("    $MERIDIAN_NATS__ROUTE_0\n"));
+        assert!(said.contains("    $MERIDIAN_NATS__ROUTE_1\n"));
         assert!(said.contains("jetstream {\n"));
         // Sizes bare, as the broker reads them: quoted, they are strings.
         assert!(said.contains("max_memory_store: 64MB\n"));
         assert!(said.contains("max_file_store: 16MB\n"));
-        // The routes carry no credential: the cluster's own is solicited.
+        // The routes are variables: no credential is in the file.
         assert!(!said.contains('@'));
     }
 }
