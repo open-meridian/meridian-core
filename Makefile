@@ -2093,17 +2093,18 @@ chart-check:
 		| grep -q '"meridian-dashboard"' \
 		|| { echo "chart-check FAILED: the dashboard does not render when enabled" >&2; exit 1; }
 	@# An address is what a directory needs, and a deployment nobody has set up
-	@# has neither: the wizard asks for both. What must not render is a second
-	@# dashboard, because one holds the wizard's single session.
+	@# has neither: the wizard asks for both. A second dashboard renders from
+	@# step 3b, sessions and sign-ins in flight in its tables, a browser kept
+	@# to the copy it reached (the wizard's one session is that copy's).
 	@$(HELM_TEMPLATE) check deploy/chart $(CHART_VALUES) --set dashboard.enabled=true \
 		--set dashboard.url= 2>/dev/null | grep -q '"meridian-dashboard"' \
 		|| { echo "chart-check FAILED: a deployment with no address yet renders no dashboard, so nothing serves its wizard" >&2; exit 1; }
-	@for refused in "dashboard.replicaCount=2"; do \
-		if $(HELM_TEMPLATE) check deploy/chart $(CHART_VALUES) --set dashboard.enabled=true \
-			--set dashboard.url=https://meridian.example --set $$refused >/dev/null 2>&1; then \
-			echo "chart-check FAILED: the dashboard rendered with $$refused" >&2; exit 1; \
-		fi; \
-	done
+	@two="$$($(HELM_TEMPLATE) check deploy/chart $(CHART_VALUES) --set dashboard.enabled=true \
+		--set dashboard.url=https://meridian.example --set dashboard.replicaCount=2 2>/dev/null)" \
+		|| { echo "chart-check FAILED: the dashboard did not render with dashboard.replicaCount=2" >&2; exit 1; }; \
+	echo "$$two" | grep -q "sessionAffinity: ClientIP" \
+		&& echo "$$two" | grep -q 'traefik.ingress.kubernetes.io/service.sticky.cookie: "true"' \
+		|| { echo "chart-check FAILED: two dashboards do not keep a browser to the copy it reached" >&2; exit 1; }
 	@# The client id the dashboard signs people in with is optional, and that
 	@# is what makes first run possible: it does not exist until somebody has
 	@# been through the wizard, and a required key would leave the dashboard

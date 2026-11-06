@@ -331,7 +331,23 @@ metadata:
   labels:
     meridian.dev/component: dashboard
     {{- include "meridian-runtime.labels" . | nindent 4 }}
+  {{- if gt (int $copies) 1 }}
+  # With more than one copy, a browser keeps to the one it reached (Traefik's
+  # sticky cookie, nginx's affinity on the Ingress, the client's address in
+  # the cluster): every session and sign-in in flight is in the tables, but
+  # the first-run wizard's one session is held by the copy that started it,
+  # before the deployment has a database (first_run.rs), and a terminal's
+  # stream stays where it began.
+  annotations:
+    traefik.ingress.kubernetes.io/service.sticky.cookie: "true"
+    traefik.ingress.kubernetes.io/service.sticky.cookie.name: meridian_dashboard_copy
+    traefik.ingress.kubernetes.io/service.sticky.cookie.secure: "true"
+    traefik.ingress.kubernetes.io/service.sticky.cookie.httponly: "true"
+  {{- end }}
 spec:
+  {{- if gt (int $copies) 1 }}
+  sessionAffinity: ClientIP
+  {{- end }}
   selector:
     app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
     app.kubernetes.io/instance: {{ .Release.Name }}
