@@ -74,26 +74,44 @@ fn run() -> Result<(), String> {
         tokio::spawn(meridian_runtime::report_latency_forever(Arc::clone(&bus)));
         // The units' work queue on JetStream, where the broker keeps one
         // (step 3b; broker.jetstream.replicas: 3); the queue group otherwise.
+        // Never an outage of its own: where the stream cannot be made in a
+        // minute (its servers still forming their group after a rolling
+        // restart: "no suitable peers for placement"), the units go by the
+        // queue group as without one, and a worker serves the queue group
+        // always, so a coordinator on either path is answered.
         let queue = if queue::on() {
             let url = var("MERIDIAN_BROKER_URL").ok_or("MERIDIAN_BROKER_URL is not set")?;
-            Some(queue::Units::connect(&url).await?)
+            let mut made = Err(String::new());
+            for _ in 0..12 {
+                made = queue::Units::connect(&url).await;
+                if made.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            match made {
+                Ok(units) => Some(units),
+                Err(failed) => {
+                    tracing::warn!(%failed, "the units' work queue is not there; units go by the queue group");
+                    None
+                }
+            }
         } else {
             None
         };
         if works {
             let cache = Arc::new(Cache::new(UNITS_KEPT));
-            match &queue {
-                Some(units) => {
-                    let units = Arc::clone(units);
-                    tokio::spawn(async move {
-                        if let Err(failed) = units.work(cache).await {
-                            tracing::error!("{failed}; stopping, to be restarted");
-                            std::process::exit(1);
-                        }
-                    });
-                }
-                None => worker::serve(&bus, cache),
+            if let Some(units) = &queue {
+                let units = Arc::clone(units);
+                let taking = Arc::clone(&cache);
+                tokio::spawn(async move {
+                    if let Err(failed) = units.work(taking).await {
+                        tracing::error!("{failed}; stopping, to be restarted");
+                        std::process::exit(1);
+                    }
+                });
             }
+            worker::serve(&bus, cache);
         }
         if coordinates {
             let handle = tokio::runtime::Handle::current();
