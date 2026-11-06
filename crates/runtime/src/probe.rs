@@ -60,25 +60,52 @@ pub fn address_of(url: &str, default_port: u16) -> Option<String> {
     }
 }
 
-/// Reach `address` by TCP within [`WITHIN`].
+/// `work`'s answer, or `None` where it took longer than `within`. The work
+/// is left running on a thread of its own, never waited for: the probe
+/// answers in its bound and exits.
+fn within<T, F>(within: Duration, work: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (said, heard) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = said.send(work());
+    });
+    heard.recv_timeout(within).ok()
+}
+
+/// `address` resolved within [`WITHIN`]. The system's resolver is never
+/// waited on past it: with the cluster's DNS gone (CI 42300989974: the one
+/// CoreDNS was on the node stopped), a name's lookup is retried for tens of
+/// seconds, and a probe that waited would answer nothing at all -- not even
+/// the member's own mode, which it reads from a file.
+fn resolved(address: &str) -> Result<std::net::SocketAddr, String> {
+    let asked = address.to_string();
+    match within(WITHIN, move || {
+        asked.to_socket_addrs().map(|mut addrs| addrs.next())
+    }) {
+        None => Err(format!(
+            "{address} did not resolve within {} s: is the cluster's DNS answering?",
+            WITHIN.as_secs()
+        )),
+        Some(Err(failed)) => Err(format!("{address} did not resolve: {failed}")),
+        Some(Ok(None)) => Err(format!("{address} resolved to nothing")),
+        Some(Ok(Some(socket))) => Ok(socket),
+    }
+}
+
+/// Reach `address` by TCP within [`WITHIN`], its name resolved within it.
 fn reach(path: &str, address: &str) -> Value {
     let started = Instant::now();
-    let reached = address
-        .to_socket_addrs()
-        .map_err(|failed| format!("{address} did not resolve: {failed}"))
-        .and_then(|mut addrs| {
-            addrs
-                .next()
-                .ok_or_else(|| format!("{address} resolved to nothing"))
+    let reached = resolved(address).and_then(|socket| {
+        std::net::TcpStream::connect_timeout(&socket, WITHIN).map_err(|failed| {
+            format!(
+                "{address} did not answer within {} s: {failed}",
+                WITHIN.as_secs()
+            )
         })
-        .and_then(|socket| {
-            std::net::TcpStream::connect_timeout(&socket, WITHIN).map_err(|failed| {
-                format!(
-                    "{address} did not answer within {} s: {failed}",
-                    WITHIN.as_secs()
-                )
-            })
-        });
+    });
     let ms = started.elapsed().as_millis() as u64;
     match reached {
         Ok(_) => json!({ "path": path, "address": address, "ok": true, "ms": ms }),
@@ -96,7 +123,7 @@ fn database(url: &str, record: Option<&str>) -> Value {
         return found;
     }
     let started = Instant::now();
-    let mut config: postgres::Config = match url.parse() {
+    let config: postgres::Config = match url.parse() {
         Ok(config) => config,
         Err(failed) => {
             found["ok"] = json!(false);
@@ -104,40 +131,68 @@ fn database(url: &str, record: Option<&str>) -> Value {
             return found;
         }
     };
-    config.connect_timeout(WITHIN);
-    match config.connect(postgres::NoTls) {
-        Ok(mut client) => {
-            let setting = |client: &mut postgres::Client, name: &str| {
-                client
-                    .query_one(&format!("SHOW {name}"), &[])
-                    .map(|row| row.get::<_, String>(0))
-                    .unwrap_or_default()
-            };
-            found["data_checksums"] = json!(setting(&mut client, "data_checksums"));
-            found["full_page_writes"] = json!(setting(&mut client, "full_page_writes"));
-            found["primary"] = json!(client
-                .query_one("SELECT NOT pg_is_in_recovery()", &[])
-                .map(|row| row.get::<_, bool>(0))
-                .unwrap_or(false));
-            // Its record's last scrub and findings, where it keeps them.
-            if let Some(prefix) = record {
-                if let Ok(said) = meridian_changes::integrity::last(&mut client, prefix) {
-                    found["integrity"] = said;
-                }
+    // A session, and what it is asked, never waited on past twice the
+    // bound: a primary being replaced can take a connection and not answer.
+    let record = record.map(str::to_string);
+    let session = within(WITHIN * 2, move || session(config, record.as_deref()));
+    match session {
+        Some(Ok(said)) => {
+            for (key, value) in said {
+                found[key] = value;
             }
             found["ms"] = json!(started.elapsed().as_millis() as u64);
         }
-        Err(failed) => {
+        Some(Err(failed)) => {
+            found["ok"] = json!(false);
+            found["why"] = json!(format!("{address} refused a session: {failed}"));
+        }
+        None => {
             found["ok"] = json!(false);
             found["why"] = json!(format!(
-                "{address} refused a session: {}",
-                failed
-                    .as_db_error()
-                    .map_or(failed.to_string(), |e| e.message().to_string())
+                "{address} did not answer a session within {} s",
+                (WITHIN * 2).as_secs()
             ));
         }
     }
     found
+}
+
+/// One session's answers: the settings integrity at rest needs, whether it
+/// is a primary, and the record's last scrub and findings.
+fn session(
+    mut config: postgres::Config,
+    record: Option<&str>,
+) -> Result<Vec<(&'static str, Value)>, String> {
+    config.connect_timeout(WITHIN);
+    let mut client = config.connect(postgres::NoTls).map_err(|failed| {
+        failed
+            .as_db_error()
+            .map_or(failed.to_string(), |e| e.message().to_string())
+    })?;
+    let mut setting = |name: &str| {
+        client
+            .query_one(&format!("SHOW {name}"), &[])
+            .map(|row| row.get::<_, String>(0))
+            .unwrap_or_default()
+    };
+    let mut said = vec![
+        ("data_checksums", json!(setting("data_checksums"))),
+        ("full_page_writes", json!(setting("full_page_writes"))),
+    ];
+    said.push((
+        "primary",
+        json!(client
+            .query_one("SELECT NOT pg_is_in_recovery()", &[])
+            .map(|row| row.get::<_, bool>(0))
+            .unwrap_or(false)),
+    ));
+    // Its record's last scrub and findings, where it keeps them.
+    if let Some(prefix) = record {
+        if let Ok(found) = meridian_changes::integrity::last(&mut client, prefix) {
+            said.push(("integrity", found));
+        }
+    }
+    Ok(said)
 }
 
 /// Ask the component's change log on the bus, as a follower asks it.
@@ -229,7 +284,11 @@ pub fn run(paths: &Paths) -> Result<(), String> {
                 .enable_all()
                 .build()
                 .map_err(|failed| failed.to_string())?;
-            Some(runtime.block_on(answers(domain)))
+            let answered = runtime.block_on(answers(domain));
+            // Never waiting on a lookup the broker's client left running
+            // on the blocking pool: the answer is in, within its bound.
+            runtime.shutdown_background();
+            Some(answered)
         }
         None => None,
     };
@@ -256,6 +315,30 @@ pub fn run(paths: &Paths) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn work_past_its_bound_is_not_waited_for() {
+        let started = Instant::now();
+        let said = within(Duration::from_millis(50), || {
+            std::thread::sleep(Duration::from_secs(5));
+            1
+        });
+        assert_eq!(said, None);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(within(Duration::from_secs(1), || 2), Some(2));
+    }
+
+    #[test]
+    fn a_name_that_does_not_resolve_says_so_in_its_bound() {
+        let started = Instant::now();
+        let said = reach("broker", "no-such-name.invalid:4222");
+        assert_eq!(said["ok"], json!(false));
+        assert!(said["why"]
+            .as_str()
+            .unwrap()
+            .contains("no-such-name.invalid:4222"));
+        assert!(started.elapsed() <= WITHIN + Duration::from_millis(500));
+    }
 
     #[test]
     fn an_address_never_carries_a_credential() {
