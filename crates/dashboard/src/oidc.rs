@@ -22,8 +22,7 @@
 //! presented. Nothing else from the token is stored, and nothing in it
 //! decides what the person may do.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -38,6 +37,7 @@ use openidconnect::{
 };
 
 use crate::clock::{MINUTE_NS, SECOND_NS};
+use crate::in_flight::{kind, InFlightStore, InMemory};
 
 /// How long a started sign-in may take to come back.
 pub const PENDING_NS: i64 = 10 * MINUTE_NS;
@@ -97,7 +97,31 @@ pub struct Oidc {
     http: reqwest::Client,
     groups_claim: String,
     trusted_audiences: Vec<String>,
-    pending: Mutex<HashMap<String, Pending>>,
+    /// Sign-ins begun and not yet finished, by their state: in the
+    /// dashboard's table where it has one, so a sign-in begun on one copy
+    /// finishes on another (step 3b).
+    pending: Arc<dyn InFlightStore>,
+}
+
+/// Most sign-ins in flight at once, as the map before the table kept.
+const MOST_PENDING: usize = 4_096;
+
+impl Pending {
+    fn held(&self) -> serde_json::Value {
+        serde_json::json!({
+            "verifier": self.verifier.secret(),
+            "nonce": self.nonce.secret(),
+            "started_at_ns": self.started_at_ns,
+        })
+    }
+
+    fn from_held(held: &serde_json::Value) -> Option<Pending> {
+        Some(Pending {
+            verifier: PkceCodeVerifier::new(held["verifier"].as_str()?.to_string()),
+            nonce: Nonce::new(held["nonce"].as_str()?.to_string()),
+            started_at_ns: held["started_at_ns"].as_i64()?,
+        })
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -141,8 +165,15 @@ impl Oidc {
             http,
             groups_claim: config.groups_claim.clone(),
             trusted_audiences: config.trusted_audiences.clone(),
-            pending: Mutex::new(HashMap::new()),
+            pending: Arc::new(InMemory::default()),
         })
+    }
+
+    /// Sign-ins in flight kept in `store`, the dashboard's table, so any copy
+    /// finishes one any other began (step 3b).
+    pub fn in_flight(mut self, store: Arc<dyn InFlightStore>) -> Self {
+        self.pending = store;
+        self
     }
 
     /// Read the discovery document and keys again. A directory rotates the
@@ -176,28 +207,36 @@ impl Oidc {
             .add_prompt(CoreAuthPrompt::Login)
             .set_max_age(Duration::ZERO)
             .url();
-        let mut pending = self.pending.lock().expect("pending lock poisoned");
-        pending.retain(|_, p| now_ns - p.started_at_ns <= PENDING_NS);
-        pending.insert(
-            state.secret().clone(),
-            Pending {
-                verifier,
-                nonce,
-                started_at_ns: now_ns,
-            },
-        );
+        let pending = Pending {
+            verifier,
+            nonce,
+            started_at_ns: now_ns,
+        };
+        let kept = crate::session::blocking(|| {
+            self.pending.put(
+                kind::SIGN_IN,
+                state.secret(),
+                &pending.held(),
+                now_ns + PENDING_NS,
+                MOST_PENDING,
+            )
+        });
+        if let Err(failed) = kept {
+            // Its callback will be refused as not started here, and the
+            // person starts again: no sign-in proceeds unbound.
+            tracing::warn!("a sign-in in flight was not kept: {failed}");
+        }
         (url.to_string(), state.secret().clone())
     }
 
     /// Finish one: exchange the code, verify the token, and insist it is a
     /// fresh authentication. A state is used once, whatever the outcome.
     pub async fn finish(&self, state: &str, code: &str, now_ns: i64) -> Result<Identity, String> {
-        let pending = self
-            .pending
-            .lock()
-            .expect("pending lock poisoned")
-            .remove(state)
-            .ok_or("this sign-in was not started here, or has already been used")?;
+        let held = crate::session::blocking(|| self.pending.take(kind::SIGN_IN, state, now_ns))
+            .map_err(|failed| format!("the sign-ins in flight could not be read: {failed}"))?;
+        let pending = held.as_ref().and_then(Pending::from_held).ok_or(
+            "this sign-in was not started here, or has already been used, or took too long",
+        )?;
         if now_ns - pending.started_at_ns > PENDING_NS {
             return Err("this sign-in took too long; start again".into());
         }

@@ -387,7 +387,7 @@ async fn authorize(
     // The provider sends everybody back to /callback; this is how it will
     // know this one was a client's.
     let (url, provider_state) = oidc.begin(now);
-    app.delegations.through_provider(&provider_state, &id);
+    app.delegations.through_provider(&provider_state, &id, now);
     let mut response = redirect(&url);
     response.headers_mut().insert(
         SET_COOKIE,

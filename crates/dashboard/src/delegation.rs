@@ -33,13 +33,14 @@
 //! The bounds -- ten minutes, 90 days, a week's notice, a week's groups --
 //! are constants here rather than configuration, as decisions/015's are.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::{Arc, Mutex};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use meridian_access::{AccessLevel, Held, Levels};
 use meridian_domain::v1::AccessRecords;
 
 use crate::clock::{HOUR_NS, MINUTE_NS, SECOND_NS};
+use crate::in_flight::{kind, InFlightStore, Marked};
 use crate::session::token;
 use crate::terminal::{hashed, same, unreserved, url_safe, verifies, Person, Unavailable};
 
@@ -113,7 +114,7 @@ pub const CLI_SOFTWARE_ID: &str = "meridian-cli";
 
 /// A token's one resource (requirement 8; RFC 8707): the CLI's surface, or
 /// the deployment's MCP surface (W6.20, contract v12).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Resource {
     /// The CLI's surface, `/terminal/`.
     Terminal,
@@ -493,7 +494,7 @@ pub fn narrow(
 }
 
 /// A registered client. Public: it holds no secret (requirement 13).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Client {
     pub client_id: String,
     /// Its own choice, and shown as that.
@@ -771,7 +772,7 @@ pub struct Issued {
 }
 
 /// What an authorisation asked for, checked.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Asked {
     pub client: Client,
     pub redirect_uri: String,
@@ -849,12 +850,16 @@ enum Redeemed {
     Granted(String, Resource),
 }
 
+/// An authorisation waiting for its person, as kept in flight.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Waiting {
     asked: Asked,
     opened_at_ns: i64,
     signed_in: Option<(Person, String)>,
 }
 
+/// A code issued to a client, as kept in flight.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Code {
     client_id: String,
     redirect_uri: String,
@@ -865,16 +870,24 @@ struct Code {
     redeemed: bool,
 }
 
-#[derive(Default)]
-struct Pending {
-    waiting: HashMap<String, Waiting>,
-    by_provider_state: HashMap<String, String>,
-    codes: HashMap<String, Code>,
+/// A redeemed code is kept a little past its minute, so its second
+/// presentation still finds what its first one bought.
+const CODE_KEPT_NS: i64 = 10 * CODE_NS;
+
+fn kept<T: serde::Serialize>(value: &T) -> serde_json::Value {
+    serde_json::to_value(value).expect("what is kept in flight is JSON")
 }
 
-/// The delegations, and the authorisations in flight.
+fn read<T: serde::de::DeserializeOwned>(held: serde_json::Value) -> Option<T> {
+    serde_json::from_value(held).ok()
+}
+
+/// The delegations, and the authorisations in flight: the waiting, the
+/// provider sign-ins made for them and the codes issued, kept in the
+/// dashboard's table where it has one, so an agent's sign-in begun on one
+/// copy of the dashboard finishes on another (step 3b).
 pub struct Delegations {
-    pending: Mutex<Pending>,
+    pending: Arc<dyn InFlightStore>,
     store: Arc<dyn DelegationStore>,
 }
 
@@ -888,13 +901,27 @@ impl Default for Delegations {
 impl Delegations {
     pub fn keeping(store: Arc<dyn DelegationStore>) -> Self {
         Self {
-            pending: Mutex::default(),
+            pending: Arc::new(crate::in_flight::InMemory::default()),
             store,
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Pending> {
-        self.pending.lock().expect("delegation lock poisoned")
+    /// The authorisations in flight kept in `store`, the dashboard's table.
+    pub fn in_flight(mut self, store: Arc<dyn InFlightStore>) -> Self {
+        self.pending = store;
+        self
+    }
+
+    /// Something in flight asked of its store, blocking off the runtime's
+    /// workers; a store away is said once and answered as nothing found.
+    fn flight<T>(&self, ask: impl FnOnce(&dyn InFlightStore) -> Result<T, String>) -> Option<T> {
+        match crate::session::blocking(|| ask(self.pending.as_ref())) {
+            Ok(found) => Some(found),
+            Err(failed) => {
+                tracing::warn!("the authorisations in flight could not be read: {failed}");
+                None
+            }
+        }
     }
 
     /// Ask the store off the async runtime: it may be the blocking Postgres
@@ -950,63 +977,75 @@ impl Delegations {
 
     /// Hold a checked authorisation, and return the id its sign-in carries.
     pub fn open(&self, asked: Asked, now_ns: i64) -> String {
-        let mut pending = self.lock();
-        pending
-            .waiting
-            .retain(|_, w| now_ns - w.opened_at_ns <= REQUEST_NS);
-        while pending.waiting.len() >= MAX_REQUESTS {
-            let oldest = pending
-                .waiting
-                .iter()
-                .min_by_key(|(_, w)| w.opened_at_ns)
-                .map(|(id, _)| id.clone())
-                .expect("a full map has an oldest");
-            pending.waiting.remove(&oldest);
-        }
         let id = token();
-        pending.waiting.insert(
-            id.clone(),
-            Waiting {
-                asked,
-                opened_at_ns: now_ns,
-                signed_in: None,
-            },
-        );
+        let waiting = Waiting {
+            asked,
+            opened_at_ns: now_ns,
+            signed_in: None,
+        };
+        self.flight(|store| {
+            store.put(
+                kind::AUTHORISATION,
+                &id,
+                &kept(&waiting),
+                now_ns + REQUEST_NS,
+                MAX_REQUESTS,
+            )
+        });
         id
     }
 
     /// Note that a provider sign-in with this state is for this
-    /// authorisation.
-    pub fn through_provider(&self, provider_state: &str, id: &str) {
-        self.lock()
-            .by_provider_state
-            .insert(provider_state.to_string(), id.to_string());
+    /// authorisation, for as long as an authorisation waits.
+    pub fn through_provider(&self, provider_state: &str, id: &str, now_ns: i64) {
+        self.flight(|store| {
+            store.put(
+                kind::PROVIDER_STATE,
+                provider_state,
+                &serde_json::json!({ "id": id }),
+                now_ns + REQUEST_NS,
+                MAX_REQUESTS,
+            )
+        });
     }
 
     /// The authorisation a provider sign-in was for, if it was for one.
     /// Taken, so a state is matched once.
-    pub fn for_provider_state(&self, provider_state: &str) -> Option<String> {
-        self.lock().by_provider_state.remove(provider_state)
+    pub fn for_provider_state(&self, provider_state: &str, now_ns: i64) -> Option<String> {
+        let held =
+            self.flight(|store| store.take(kind::PROVIDER_STATE, provider_state, now_ns))??;
+        held["id"].as_str().map(str::to_string)
     }
 
     /// Somebody signed in to this authorisation: what it asked for, and the
-    /// token their consent must carry; or nothing when it has gone.
+    /// token their consent must carry; or nothing when it has gone, or
+    /// somebody signed in to it already. Marked in one step, so two copies
+    /// never both sign one in.
     pub fn signed_in(&self, id: &str, person: Person, now_ns: i64) -> Option<(Asked, String)> {
-        let mut pending = self.lock();
-        let waiting = pending.waiting.get_mut(id)?;
-        if now_ns - waiting.opened_at_ns > REQUEST_NS || waiting.signed_in.is_some() {
-            return None;
-        }
         let confirm = token();
-        waiting.signed_in = Some((person, confirm.clone()));
-        Some((waiting.asked.clone(), confirm))
+        let marked = self.flight(|store| {
+            store.mark(
+                kind::AUTHORISATION,
+                id,
+                "signed_in",
+                &kept(&(person, confirm.clone())),
+                now_ns,
+            )
+        })?;
+        match marked {
+            Marked::Now(held) => {
+                let waiting: Waiting = read(held)?;
+                (now_ns - waiting.opened_at_ns <= REQUEST_NS).then_some((waiting.asked, confirm))
+            }
+            Marked::Already(_) | Marked::Gone => None,
+        }
     }
 
     /// The person behind a consent form, if it is still waiting and the form
     /// is theirs. Nothing is spent.
     pub fn consenting(&self, id: &str, confirm: &str, now_ns: i64) -> Option<(Asked, Person)> {
-        let pending = self.lock();
-        let waiting = pending.waiting.get(id)?;
+        let waiting: Waiting =
+            read(self.flight(|store| store.get(kind::AUTHORISATION, id, now_ns))??)?;
         let (person, expected) = waiting.signed_in.as_ref()?;
         (now_ns - waiting.opened_at_ns <= REQUEST_NS
             && same(expected.as_bytes(), confirm.as_bytes()))
@@ -1024,8 +1063,12 @@ impl Delegations {
         now_ns: i64,
     ) -> Result<Result<(Asked, Option<String>), &'static str>, Unavailable> {
         let (asked, person) = {
-            let mut pending = self.lock();
-            let Some(waiting) = pending.waiting.get(id) else {
+            let held = self
+                .flight(|store| store.get(kind::AUTHORISATION, id, now_ns))
+                .ok_or_else(|| {
+                    Unavailable("the authorisations in flight could not be read".into())
+                })?;
+            let Some(waiting) = held.and_then(read::<Waiting>) else {
                 return Ok(Err("this authorisation has expired or was already used"));
             };
             let Some((_, expected)) = &waiting.signed_in else {
@@ -1034,11 +1077,21 @@ impl Delegations {
             if !same(expected.as_bytes(), confirm.as_bytes()) {
                 return Ok(Err("this answer did not come from this sign-in"));
             }
-            let waiting = pending.waiting.remove(id).expect("found above");
+            // Spent here: of two answers at once, one takes it.
+            let taken = self
+                .flight(|store| store.take(kind::AUTHORISATION, id, now_ns))
+                .ok_or_else(|| {
+                    Unavailable("the authorisations in flight could not be read".into())
+                })?;
+            let Some(waiting) = taken.and_then(read::<Waiting>) else {
+                return Ok(Err("this authorisation has expired or was already used"));
+            };
             if now_ns - waiting.opened_at_ns > REQUEST_NS {
                 return Ok(Err("this authorisation has expired or was already used"));
             }
-            let (person, _) = waiting.signed_in.expect("checked above");
+            let Some((person, _)) = waiting.signed_in else {
+                return Ok(Err("nobody has signed in to this authorisation"));
+            };
             (waiting.asked, person)
         };
         let Some(consent) = consent else {
@@ -1057,18 +1110,29 @@ impl Delegations {
             .stored(move |store| store.grant(&grant, now_ns))
             .await?;
         let code = token();
-        self.lock().codes.insert(
-            code.clone(),
-            Code {
-                client_id: asked.client.client_id.clone(),
-                redirect_uri: asked.redirect_uri.clone(),
-                challenge: asked.challenge.clone(),
-                resource: asked.resource,
-                delegation_id: delegation.id,
-                issued_at_ns: now_ns,
-                redeemed: false,
-            },
-        );
+        let issued = Code {
+            client_id: asked.client.client_id.clone(),
+            redirect_uri: asked.redirect_uri.clone(),
+            challenge: asked.challenge.clone(),
+            resource: asked.resource,
+            delegation_id: delegation.id,
+            issued_at_ns: now_ns,
+            redeemed: false,
+        };
+        let issuing = code.clone();
+        let pending = Arc::clone(&self.pending);
+        tokio::task::spawn_blocking(move || {
+            pending.put(
+                kind::AGENT_CODE,
+                &issuing,
+                &kept(&issued),
+                now_ns + CODE_KEPT_NS,
+                MAX_REQUESTS,
+            )
+        })
+        .await
+        .map_err(|failed| Unavailable(failed.to_string()))?
+        .map_err(Unavailable)?;
         Ok(Ok((asked, Some(code))))
     }
 
@@ -1086,14 +1150,34 @@ impl Delegations {
         now_ns: i64,
     ) -> Result<Result<(Delegation, Resource), (Refusal, &'static str)>, Unavailable> {
         let redeemed = {
-            let mut pending = self.lock();
-            match pending.codes.get_mut(code) {
-                None => Redeemed::Refused("unknown code"),
+            // Marked redeemed in one step, so of two presentations at once
+            // on two copies, one is the first.
+            let marking = code.to_string();
+            let pending = Arc::clone(&self.pending);
+            let marked = tokio::task::spawn_blocking(move || {
+                pending.mark(
+                    kind::AGENT_CODE,
+                    &marking,
+                    "redeemed",
+                    &serde_json::json!(true),
+                    now_ns,
+                )
+            })
+            .await
+            .map_err(|failed| Unavailable(failed.to_string()))?
+            .map_err(Unavailable)?;
+            match marked {
+                Marked::Gone => Redeemed::Refused("unknown code"),
                 // Somebody else holds it too: what it bought is theirs as
                 // well, and ends.
-                Some(held) if held.redeemed => Redeemed::Twice(held.delegation_id.clone()),
-                Some(held) => {
-                    held.redeemed = true;
+                Marked::Already(held) => match read::<Code>(held) {
+                    Some(held) => Redeemed::Twice(held.delegation_id),
+                    None => Redeemed::Refused("unknown code"),
+                },
+                Marked::Now(held) => {
+                    let Some(held) = read::<Code>(held) else {
+                        return Ok(Err((Refusal::Unknown, "unknown code")));
+                    };
                     if now_ns - held.issued_at_ns > CODE_NS {
                         Redeemed::Refused("code expired")
                     } else if held.client_id != client_id {
@@ -1438,22 +1522,11 @@ impl Delegations {
     }
 
     pub async fn sweep(&self, now_ns: i64) -> Result<(), Unavailable> {
-        {
-            let mut pending = self.lock();
-            pending
-                .waiting
-                .retain(|_, w| now_ns - w.opened_at_ns <= REQUEST_NS);
-            let waiting: std::collections::HashSet<String> =
-                pending.waiting.keys().cloned().collect();
-            pending
-                .by_provider_state
-                .retain(|_, id| waiting.contains(id));
-            // A redeemed code is kept a little past its minute, so its second
-            // presentation still finds what its first one bought.
-            pending
-                .codes
-                .retain(|_, c| now_ns - c.issued_at_ns <= 10 * CODE_NS);
-        }
+        let pending = Arc::clone(&self.pending);
+        tokio::task::spawn_blocking(move || pending.sweep(now_ns))
+            .await
+            .map_err(|failed| Unavailable(failed.to_string()))?
+            .map_err(Unavailable)?;
         self.stored(move |store| store.sweep(now_ns)).await
     }
 }

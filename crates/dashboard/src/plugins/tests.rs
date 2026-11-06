@@ -499,15 +499,16 @@ async fn somebody_without_access_is_refused_before_any_code_is_minted() {
         "{}",
         answer.body
     );
-    assert!(h
-        .app
-        .plugins
-        .as_ref()
-        .unwrap()
-        .codes
-        .lock()
-        .unwrap()
-        .is_empty());
+    assert!(
+        h.app
+            .plugins
+            .as_ref()
+            .unwrap()
+            .codes
+            .count(crate::in_flight::kind::PLUGIN_CODE)
+            .unwrap()
+            == 0
+    );
 }
 
 #[tokio::test]
@@ -773,14 +774,24 @@ async fn a_sweep_forgets_spent_codes_and_sessions_whose_dashboard_session_ended(
         1,
         "a live session is kept"
     );
-    assert!(plugins.codes.lock().unwrap().contains_key(&kept));
+    assert!(plugins
+        .codes
+        .get(crate::in_flight::kind::PLUGIN_CODE, &kept, now)
+        .unwrap()
+        .is_some());
 
     h.app.sessions.end(&h.session);
     plugins
         .sweep(&h.app.sessions, &h.app.delegations, now + CODE_NS + 1)
         .await;
     assert!(plugins.entered.lock().unwrap().is_empty());
-    assert!(plugins.codes.lock().unwrap().is_empty());
+    assert_eq!(
+        plugins
+            .codes
+            .count(crate::in_flight::kind::PLUGIN_CODE)
+            .unwrap(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -1426,15 +1437,16 @@ async fn a_terminal_is_held_to_what_opening_the_page_is_held_to() {
         let nobody = develop(&h.app, method, &path, "not-a-session", "").await;
         assert_eq!(nobody.status, StatusCode::UNAUTHORIZED, "{path}");
     }
-    assert!(h
-        .app
-        .plugins
-        .as_ref()
-        .unwrap()
-        .codes
-        .lock()
-        .unwrap()
-        .is_empty());
+    assert!(
+        h.app
+            .plugins
+            .as_ref()
+            .unwrap()
+            .codes
+            .count(crate::in_flight::kind::PLUGIN_CODE)
+            .unwrap()
+            == 0
+    );
     assert!(h.reached.lock().unwrap().is_empty());
 }
 

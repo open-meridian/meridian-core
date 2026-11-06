@@ -849,3 +849,81 @@ fn service_accounts_are_kept_each_change_its_own_record_as_the_memory_store_does
     assert_eq!(store.changes(id).unwrap().len(), 5);
     assert_eq!(count(&url, "dashboard_service_account_change"), 5);
 }
+
+// ── What is in flight between two copies (step 3b) ──────────────────────────
+
+#[test]
+fn a_thing_in_flight_put_on_one_copy_is_spent_once_on_another() {
+    use meridian_dashboard::in_flight::{kind, InFlightStore, InPostgres, Marked};
+    use serde_json::json;
+    let (database, url) = migrated("in_flight");
+    let one = InPostgres::on(database.clone());
+    let other = InPostgres::on(database.clone());
+    one.put(
+        kind::SIGN_IN,
+        "the-state",
+        &json!({"verifier": "v"}),
+        T0 + MINUTE_NS,
+        10,
+    )
+    .unwrap();
+    // The key is nowhere in the table: its hash alone.
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let hash: String = client
+        .query_one("SELECT key_hash FROM dashboard_in_flight", &[])
+        .unwrap()
+        .get(0);
+    assert_ne!(hash, "the-state");
+    assert_eq!(
+        other.get(kind::SIGN_IN, "the-state", T0).unwrap(),
+        Some(json!({"verifier": "v"}))
+    );
+    assert_eq!(other.get(kind::PLUGIN_CODE, "the-state", T0).unwrap(), None);
+    assert_eq!(
+        other.take(kind::SIGN_IN, "the-state", T0).unwrap(),
+        Some(json!({"verifier": "v"}))
+    );
+    assert_eq!(
+        one.take(kind::SIGN_IN, "the-state", T0).unwrap(),
+        None,
+        "spent once"
+    );
+    // Taken after it expired: gone, and nothing given.
+    one.put(kind::SIGN_IN, "late", &json!(1), T0, 10).unwrap();
+    assert_eq!(other.take(kind::SIGN_IN, "late", T0 + 1).unwrap(), None);
+    assert_eq!(one.count(kind::SIGN_IN).unwrap(), 0);
+    // Marked once, whichever copy marks first.
+    one.put(
+        kind::AGENT_CODE,
+        "code",
+        &json!({"redeemed": false}),
+        T0 + MINUTE_NS,
+        10,
+    )
+    .unwrap();
+    assert_eq!(
+        other
+            .mark(kind::AGENT_CODE, "code", "redeemed", &json!(true), T0)
+            .unwrap(),
+        Marked::Now(json!({"redeemed": true}))
+    );
+    assert_eq!(
+        one.mark(kind::AGENT_CODE, "code", "redeemed", &json!(true), T0)
+            .unwrap(),
+        Marked::Already(json!({"redeemed": true}))
+    );
+    assert_eq!(
+        one.mark(kind::AGENT_CODE, "none", "redeemed", &json!(true), T0)
+            .unwrap(),
+        Marked::Gone
+    );
+    // The newest of a kind kept past the most, and the expired swept.
+    for key in ["a", "b", "c"] {
+        one.put(kind::AUTHORISATION, key, &json!(key), T0 + MINUTE_NS, 2)
+            .unwrap();
+    }
+    assert_eq!(one.count(kind::AUTHORISATION).unwrap(), 2);
+    assert_eq!(one.get(kind::AUTHORISATION, "a", T0).unwrap(), None);
+    other.sweep(T0 + 2 * MINUTE_NS).unwrap();
+    assert_eq!(count(&url, "dashboard_in_flight"), 0);
+}
