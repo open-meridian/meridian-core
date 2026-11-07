@@ -615,6 +615,9 @@ jobs:
           # profiles, each recovery timed against its bound (1048, 1056).
           - target: e2e-cluster-scaled
             agents: 3
+          # A live install moved tolerant -> ha -> tolerant under commits.
+          - target: e2e-cluster-reconfigure
+            agents: 3
           - target: e2e-cluster-failover
             profile: tolerant
           - target: e2e-cluster-failover
@@ -714,11 +717,11 @@ jobs:
             PROFILE="$PROFILE" E2E_K3D_AGENTS="$AGENTS" E2E_K3D_ZONES="$zones"
 
       - name: Keep the failure classes' measurements
-        if: matrix.target == 'e2e-cluster-failover' && !cancelled()
+        if: (matrix.target == 'e2e-cluster-failover' || matrix.target == 'e2e-cluster-reconfigure') && !cancelled()
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: failover-claims-${{ matrix.profile }}
+          name: ${{ matrix.target == 'e2e-cluster-reconfigure' && 'reconfigure-claims' || format('failover-claims-{0}', matrix.profile) }}
           path: workspace/meridian-core/.e2e-failover-claims.jsonl
           include-hidden-files: true
           if-no-files-found: warn
@@ -1030,3 +1033,28 @@ jobs:
       - name: make footprint-judge
         working-directory: workspace/meridian-core
         run: make footprint-judge FOOTPRINT_PEAKS="$(find .footprint-peaks -name '*.txt' | sort | tr '\n' ' ')"
+
+  # The claims ledger (366; ruling 1113): every measurement this run's
+  # cluster jobs made held to its bound, and every class the ledger holds
+  # measured again by them, none dropped silently -- a job that failed or
+  # kept nothing fails this by name. The ledger against this run is the
+  # job's summary.
+  claims-check:
+    needs: e2e-cluster-k3d
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: workspace/meridian-core
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: '*-claims*'
+          path: workspace/meridian-core/.claims
+      - name: make claims-check
+        working-directory: workspace/meridian-core
+        run: |
+          files="$(find .claims -name '*.jsonl' 2>/dev/null | sort | tr '\n' ' ')"
+          [ -n "$files" ] || { echo "::error::no cluster job kept its claims, so nothing measured could be held to the ledger"; exit 1; }
+          make claims-check CLAIMS_RUN="$files"

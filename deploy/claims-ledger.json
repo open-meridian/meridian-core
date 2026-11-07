@@ -1,0 +1,522 @@
+{
+  "about": "The claims ledger (366; ruling 1113): each failure class's recovery as measured by CI's green runs, per profile and component, beside the bound it is held to (rulings 1048, 1056) and its RPO. Written by `make claims-ledger` from the runs' claims files; checked by `make claims-check` in the gate and against every run in CI. A figure is stated elsewhere only from here. Times in seconds.",
+  "entries": [
+    {
+      "class": "bit-rot",
+      "profile": "ha",
+      "component": "conductor",
+      "bound_s": 60,
+      "measured_s": {
+        "runs": 3,
+        "min": 0.51,
+        "median": 0.72,
+        "max": 0.72
+      },
+      "rpo": {},
+      "runs": [
+        "42346277866",
+        "42352743788",
+        "42378507809"
+      ],
+      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=bit-rot"
+    },
+    {
+      "class": "bor-writer",
+      "profile": "ha",
+      "component": "bor",
+      "bound_s": 10,
+      "measured_s": {
+        "runs": 3,
+        "min": 4.85,
+        "median": 6.39,
+        "max": 7.13
+      },
+      "rpo": {},
+      "runs": [
+        "42346277866",
+        "42352743788",
+        "42378507809"
+      ],
+      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=bor-writer"
+    },
+    {
+      "class": "broker",
+      "profile": "ha",
+      "component": "bor",
+      "bound_s": 10,
+      "measured_s": {
+        "runs": 3,
+        "min": 3.11,
+        "median": 3.37,
+        "max": 3.41
+      },
+      "rpo": {},
+      "runs": [
+        "42346277866",
+        "42352743788",
+        "42378507809"
+      ],
+      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=broker"
+    },
+    {
+      "class": "db-primary",
+      "profile": "ha",
+      "component": "bor",
+      "bound_s": 30,
+      "measured_s": {
+        "runs": 3,
+        "min": 22.2,
+        "median": 22.23,
+        "max": 23.33
+      },
+      "rpo": {
+        "acknowledged_commits_min": 122,
+        "commits_lost_max": 0
+      },
+      "runs": [
+        "42346277866",
+        "42352743788",
+        "42378507809"
+      ],
+      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=db-primary"
+    },
+    {
+      "class": "db-primary",
+      "profile": "ha",
+      "component": "lake",
+      "bound_s": 30,
+      "measured_s": {
+        "runs": 3,
+        "min": 22.46,
+        "median": 22.54,
+        "max": 23.66
+      },
+      "rpo": {
+        "acknowledged_commits_min": 122,
+        "commits_lost_max": 0
+      },
+      "runs": [
+        "42346277866",
+        "42352743788",
+        "42378507809"
+      ],
+      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=db-primary"
+    },
+    {
+      "class": "instrument-writer",
+      "profile": "ha",
+      "component": "instrument",
+      "bound_s": 10,
+      "measured_s": {
+        "runs": 3,
+        "min": 5.47,
+        "median": 5.57,
+        "max": 5.59
+      },
+      "rpo": {},
+      "runs": [
+        "42346277866",
+        "42352743788",
+        "42378507809"
+      ],
+      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=instrument-writer"
+    },
+    {
+      "class": "lake-writer",
+      "profile": "ha",
+      "component": "lake",
+      "bound_s": 15,
+      "measured_s": {
+        "runs": 3,
+        "min": 5.4,
+        "median": 5.6,
+        "max": 7.08
+      },
+      "rpo": {},
+      "runs": [
+        "42346277866",
+        "42352743788",
+        "42378507809"
+      ],
+      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=lake-writer"
+    },
+    {
+      "class": "network-policy",
+      "profile": "ha",
+      "component": "street",
+      "bound_s": 60,
+      "measured_s": {
+        "runs": 3,
+        "min": 0.42,
+        "median": 4.31,
+        "max": 5.41
+      },
+      "rpo": {},
+      "runs": [
+        "42346277866",
+        "42352743788",
+        "42378507809"
+      ],
+      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=network-policy"
+    },
+    {
+      "class": "node",
+      "profile": "ha",
+      "component": "bor",
+      "bound_s": 10,
+      "measured_s": {
+        "runs": 3,
+        "min": 5.28,
+        "median": 6.0,
+        "max": 6.2
+      },
+      "rpo": {},
+      "runs": [
+        "42346277866",
+        "42352743788",
+        "42378507809"
+      ],
+      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=node"
+    },
+    {
+      "class": "node-freeze",
+      "profile": "ha",
+      "component": "bor",
+      "bound_s": 10,
+      "measured_s": {
+        "runs": 3,
+        "min": 5.69,
+        "median": 8.69,
+        "max": 8.71
+      },
+      "rpo": {},
+      "runs": [
+        "42346277866",
+        "42352743788",
+        "42378507809"
+      ],
+      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=node-freeze"
+    },
+    {
+      "class": "split-brain",
+      "profile": "ha",
+      "component": "lake",
+      "bound_s": 15,
+      "measured_s": {
+        "runs": 3,
+        "min": 5.87,
+        "median": 6.16,
+        "max": 8.93
+      },
+      "rpo": {},
+      "runs": [
+        "42346277866",
+        "42352743788",
+        "42378507809"
+      ],
+      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=split-brain"
+    },
+    {
+      "class": "street-writer",
+      "profile": "ha",
+      "component": "street",
+      "bound_s": 10,
+      "measured_s": {
+        "runs": 3,
+        "min": 5.47,
+        "median": 5.77,
+        "max": 7.2
+      },
+      "rpo": {},
+      "runs": [
+        "42346277866",
+        "42352743788",
+        "42378507809"
+      ],
+      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=street-writer"
+    },
+    {
+      "class": "torn-write",
+      "profile": "ha",
+      "component": "bor",
+      "bound_s": 30,
+      "measured_s": {
+        "runs": 3,
+        "min": 22.03,
+        "median": 22.62,
+        "max": 23.09
+      },
+      "rpo": {
+        "acknowledged_commits_min": 373,
+        "commits_lost_max": 0
+      },
+      "runs": [
+        "42346277866",
+        "42352743788",
+        "42378507809"
+      ],
+      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=torn-write"
+    },
+    {
+      "class": "torn-write",
+      "profile": "ha",
+      "component": "lake",
+      "bound_s": 30,
+      "measured_s": {
+        "runs": 3,
+        "min": 22.35,
+        "median": 22.99,
+        "max": 23.32
+      },
+      "rpo": {
+        "acknowledged_commits_min": 373,
+        "commits_lost_max": 0
+      },
+      "runs": [
+        "42346277866",
+        "42352743788",
+        "42378507809"
+      ],
+      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=torn-write"
+    },
+    {
+      "class": "volume-lost",
+      "profile": "ha",
+      "component": "database",
+      "bound_s": 300,
+      "measured_s": {
+        "runs": 3,
+        "min": 26.42,
+        "median": 27.18,
+        "max": 30.59
+      },
+      "rpo": {},
+      "runs": [
+        "42346277866",
+        "42352743788",
+        "42378507809"
+      ],
+      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=volume-lost"
+    },
+    {
+      "class": "bit-rot",
+      "profile": "tolerant",
+      "component": "conductor",
+      "bound_s": 120,
+      "measured_s": {
+        "runs": 3,
+        "min": 0.3,
+        "median": 0.4,
+        "max": 0.54
+      },
+      "rpo": {},
+      "runs": [
+        "42346277866",
+        "42352743788",
+        "42378507809"
+      ],
+      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=tolerant FAILURE=bit-rot"
+    },
+    {
+      "class": "bor-writer",
+      "profile": "tolerant",
+      "component": "bor",
+      "bound_s": 120,
+      "measured_s": {
+        "runs": 3,
+        "min": 1.01,
+        "median": 1.16,
+        "max": 1.93
+      },
+      "rpo": {},
+      "runs": [
+        "42346277866",
+        "42352743788",
+        "42378507809"
+      ],
+      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=tolerant FAILURE=bor-writer"
+    },
+    {
+      "class": "broker",
+      "profile": "tolerant",
+      "component": "bor",
+      "bound_s": 60,
+      "measured_s": {
+        "runs": 3,
+        "min": 4.35,
+        "median": 4.49,
+        "max": 4.65
+      },
+      "rpo": {},
+      "runs": [
+        "42346277866",
+        "42352743788",
+        "42378507809"
+      ],
+      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=tolerant FAILURE=broker"
+    },
+    {
+      "class": "db-primary",
+      "profile": "tolerant",
+      "component": "bor",
+      "bound_s": 120,
+      "measured_s": {
+        "runs": 3,
+        "min": 2.31,
+        "median": 2.37,
+        "max": 2.67
+      },
+      "rpo": {
+        "acknowledged_commits_min": 1,
+        "commits_lost_max": 0
+      },
+      "runs": [
+        "42346277866",
+        "42352743788",
+        "42378507809"
+      ],
+      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=tolerant FAILURE=db-primary"
+    },
+    {
+      "class": "db-primary",
+      "profile": "tolerant",
+      "component": "lake",
+      "bound_s": 120,
+      "measured_s": {
+        "runs": 3,
+        "min": 2.47,
+        "median": 2.6,
+        "max": 2.95
+      },
+      "rpo": {
+        "acknowledged_commits_min": 1,
+        "commits_lost_max": 0
+      },
+      "runs": [
+        "42346277866",
+        "42352743788",
+        "42378507809"
+      ],
+      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=tolerant FAILURE=db-primary"
+    },
+    {
+      "class": "enable-checksums",
+      "profile": "tolerant",
+      "component": "database",
+      "bound_s": null,
+      "measured_s": {
+        "runs": 1,
+        "min": 4.86,
+        "median": 4.86,
+        "max": 4.86
+      },
+      "rpo": {},
+      "runs": [
+        "42378507809"
+      ],
+      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-backup"
+    },
+    {
+      "class": "lake-writer",
+      "profile": "tolerant",
+      "component": "lake",
+      "bound_s": 120,
+      "measured_s": {
+        "runs": 3,
+        "min": 0.98,
+        "median": 1.14,
+        "max": 1.94
+      },
+      "rpo": {},
+      "runs": [
+        "42346277866",
+        "42352743788",
+        "42378507809"
+      ],
+      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=tolerant FAILURE=lake-writer"
+    },
+    {
+      "class": "network-policy",
+      "profile": "tolerant",
+      "component": "street",
+      "bound_s": 60,
+      "measured_s": {
+        "runs": 3,
+        "min": 0.1,
+        "median": 0.13,
+        "max": 0.17
+      },
+      "rpo": {},
+      "runs": [
+        "42346277866",
+        "42352743788",
+        "42378507809"
+      ],
+      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=tolerant FAILURE=network-policy"
+    },
+    {
+      "class": "restore-to-time",
+      "profile": "tolerant",
+      "component": "database",
+      "bound_s": 7200,
+      "measured_s": {
+        "runs": 1,
+        "min": 23.22,
+        "median": 23.22,
+        "max": 23.22
+      },
+      "rpo": {
+        "seconds_max": 60,
+        "seconds_bound": 300
+      },
+      "runs": [
+        "42378507809"
+      ],
+      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-backup"
+    },
+    {
+      "class": "torn-write",
+      "profile": "tolerant",
+      "component": "bor",
+      "bound_s": 120,
+      "measured_s": {
+        "runs": 3,
+        "min": 1.69,
+        "median": 2.45,
+        "max": 2.83
+      },
+      "rpo": {
+        "acknowledged_commits_min": 1,
+        "commits_lost_max": 0
+      },
+      "runs": [
+        "42346277866",
+        "42352743788",
+        "42378507809"
+      ],
+      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=tolerant FAILURE=torn-write"
+    },
+    {
+      "class": "torn-write",
+      "profile": "tolerant",
+      "component": "lake",
+      "bound_s": 120,
+      "measured_s": {
+        "runs": 3,
+        "min": 1.98,
+        "median": 2.69,
+        "max": 2.99
+      },
+      "rpo": {
+        "acknowledged_commits_min": 1,
+        "commits_lost_max": 0
+      },
+      "runs": [
+        "42346277866",
+        "42352743788",
+        "42378507809"
+      ],
+      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=tolerant FAILURE=torn-write"
+    }
+  ]
+}

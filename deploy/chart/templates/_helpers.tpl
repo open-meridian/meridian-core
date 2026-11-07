@@ -237,8 +237,13 @@ that holds the lease right too.
 */}}
 {{- define "meridian-runtime.memberPlacement" -}}
 {{- $leased := include "meridian-runtime.leased" . -}}
-{{- if and $leased (not .account) }}
-serviceAccountName: {{ include "meridian-runtime.fullname" .top }}-member
+{{- if not .account }}
+{{- /* Said either way (step 3b part 3, found by e2e-cluster-reconfigure):
+       a pod template that once named the members' account keeps it when
+       the name is merely left out -- the API server's deprecated
+       serviceAccount field stays -- and a member set turned down to one
+       then named an account the chart had removed, and no pod was made. */}}
+serviceAccountName: {{ if $leased }}{{ include "meridian-runtime.fullname" .top }}-member{{ else }}default{{ end }}
 {{- end }}
 {{- with .top.Values.nodeSelector }}
 nodeSelector:

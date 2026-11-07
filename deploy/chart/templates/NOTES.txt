@@ -62,3 +62,15 @@ below it, which an IP address cannot have. The chart's Ingress
 A component showing CreateContainerConfigError before first run is waiting
 for a Secret key the wizard writes, not failing. If the release itself
 refuses to render, the message names the value that is wrong.
+{{- if .Values.database.brought.enabled }}
+{{- $db := printf "%s-database" (include "meridian-runtime.fullname" .) }}
+{{- $live := lookup "apps/v1" "StatefulSet" .Release.Namespace $db }}
+{{- $running := int (dig "spec" "replicas" 0 (default (dict) $live)) }}
+{{- $wasPatroni := eq (dig "spec" "template" "metadata" "labels" "meridian.dev/database-manager" "" (default (dict) $live)) "patroni" }}
+{{- if and (gt $running 0) (not $wasPatroni) (gt (int (include "meridian-runtime.databaseStandbys" .)) 0) }}
+
+The database moves under Patroni with this upgrade, alone; upgrade again with
+the same values to add its standbys, which clone from it (meridian
+upgrade-deployment does).
+{{- end }}
+{{- end }}

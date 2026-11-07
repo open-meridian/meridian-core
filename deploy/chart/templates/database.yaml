@@ -54,6 +54,13 @@
 */}}
 {{- $wasPatroni := eq (dig "spec" "template" "metadata" "labels" "meridian.dev/database-manager" "" (default (dict) $live)) "patroni" }}
 {{- $patroni := or (gt $standbys 0) $wasPatroni }}
+{{- /* Moving under Patroni from alone, in the first of two upgrades (see
+       the StatefulSet's replicas): member 0 runs alone, so nothing waits
+       for a synchronous standby it does not have yet -- strict, every
+       commit would wait, and the connections waiting filled the server. */}}
+{{- $running := dig "spec" "replicas" 0 (default (dict) $live) }}
+{{- $converting := and (gt (int $running) 0) (gt $standbys 0) (not $wasPatroni) }}
+{{- $synchronous := ternary 0 $standbys $converting }}
 {{- $scope := $name | trunc 63 | trimSuffix "-" }}
 {{- $archive := include "meridian-runtime.walArchive" . }}
 ---
@@ -222,7 +229,7 @@ data:
         meridian.dev/component: database
     bootstrap:
       dcs:
-        {{- include "meridian-runtime.patroniDynamic" (dict "top" . "standbys" $standbys) | nindent 8 }}
+        {{- include "meridian-runtime.patroniDynamic" (dict "top" . "standbys" $synchronous) | nindent 8 }}
       # Page checksums on every database made here (step 3b, 5j): Postgres
       # 16 makes none by default.
       initdb:
@@ -279,8 +286,15 @@ spec:
   #
   # Once chosen, its members: the primary and database.brought.standbys
   # (step 3b), so turning the profile up or down is a scale.
-  {{- $running := dig "spec" "replicas" 0 (default (dict) $live) }}
-  replicas: {{ if gt (int $running) 0 }}{{ add 1 $standbys }}{{ else }}0{{ end }}
+  #
+  # A database turned up from alone to standbys moves under Patroni in two
+  # upgrades (step 3b part 3, found by e2e-cluster-reconfigure): the first
+  # runs member 0 alone under Patroni, which takes its existing data as the
+  # cluster's; the second adds the standbys, which clone from it. Added in
+  # the same upgrade, they started before member 0 was moved, and the first
+  # of them made a new, empty cluster that the Service then followed.
+  # `meridian upgrade-deployment` runs the second when the chart says so.
+  replicas: {{ if gt (int $running) 0 }}{{ if $converting }}1{{ else }}{{ add 1 $standbys }}{{ end }}{{ else }}0{{ end }}
   serviceName: {{ $name }}
   selector:
     matchLabels:
@@ -317,6 +331,20 @@ spec:
       {{- with .Values.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if and .Values.zones (not .Values.affinity) }}
+      # Within the zones named, as its standbys would be: its volume is made
+      # on the node it first runs on, and a database turned up to standbys
+      # later is held to the zones.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: topology.kubernetes.io/zone
+                    operator: In
+                    values:
+                      {{- toYaml .Values.zones | nindent 22 }}
       {{- end }}
       {{- end }}
       containers:
@@ -375,7 +403,7 @@ spec:
                   name: {{ $name }}-passwords
                   key: patroni
             - name: PATRONI_DYNAMIC
-              value: {{ include "meridian-runtime.patroniDynamic" (dict "top" . "standbys" $standbys) | fromYaml | toJson | quote }}
+              value: {{ include "meridian-runtime.patroniDynamic" (dict "top" . "standbys" $synchronous) | fromYaml | toJson | quote }}
             - name: PGDATA
               value: /var/lib/postgresql/data/pgdata
             {{- if $archive }}
