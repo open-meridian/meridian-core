@@ -2538,7 +2538,8 @@ chart-check:
 	done; \
 	for held in "meridian.dev/database-manager: patroni" "meridian.dev/database-role: primary" \
 		"synchronous_mode_strict: true" "--route" "--jetstream" "MERIDIAN_ANALYTICS_UNITS" \
-		"name: check-meridian-runtime-broker-members" "name: check-meridian-runtime-database-members"; do \
+		"name: check-meridian-runtime-broker-jetstream-members" "name: check-meridian-runtime-database-members" \
+		"meridian.dev/broker-set: check-meridian-runtime-broker-jetstream"; do \
 		echo "$$ha" | grep -q -- "$$held" \
 			|| { echo "chart-check FAILED: the ha profile renders no $$held" >&2; exit 1; }; \
 	done; \

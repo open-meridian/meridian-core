@@ -228,6 +228,18 @@ time as an upgrade rolls them, rejoins with what it held. Without JetStream
 the broker keeps nothing on disk. Every client checks its server answers
 each second and moves to another when one has not for 2 s.
 
+A profile is changed on a live install by an upgrade (`meridian
+upgrade-deployment --set resilience.profile=ha`, and back). A StatefulSet's
+volume claims cannot change in place, so the broker's servers with
+JetStream's volumes are a set of their own,
+`<release>-meridian-runtime-broker-jetstream`, and the upgrade makes the one
+set and removes the other; the client Service follows the current set.
+Deliveries in flight across the change are caught up by sequence and
+requests not answered are asked again, as for a lost server. JetStream's
+volumes are kept when its set goes, and found again when it comes back. The
+database turned up to standbys runs under Patroni from then on, standbys or
+none.
+
 ## The WAL archive: restoring to a point in time
 
 `backup.walArchive.enabled` (off by default) archives the brought database's
