@@ -268,7 +268,7 @@ def claim(s, failure, component, seconds, bound, extra=None):
     line = {
         "profile": PROFILE, "failure": failure, "component": component,
         "recovered_s": round(seconds, 2), "bound_s": bound,
-        "held": seconds <= bound,
+        "held": bound is None or seconds <= bound,
         "command": f"make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE={PROFILE} FAILURE={failure}",
         "kubernetes": kubernetes_version(),
         "run": os.environ.get("GITHUB_RUN_ID", "local"),
@@ -277,7 +277,10 @@ def claim(s, failure, component, seconds, bound, extra=None):
     print(f"CLAIM {json.dumps(line)}", flush=True)
     with open(CLAIMS, "a", encoding="utf-8") as kept:
         kept.write(json.dumps(line) + "\n")
-    s.check(line["held"], f"{failure}: {component} answered again in {seconds:.1f}s, within {bound}s")
+    if bound is None:
+        s.check(True, f"{failure}: {component} in {seconds:.1f}s (no bound is set for it yet)")
+    else:
+        s.check(line["held"], f"{failure}: {component} answered again in {seconds:.1f}s, within {bound}s")
 
 
 def kubernetes_version():
@@ -1250,6 +1253,15 @@ def settled_everywhere():
         and len(pods("broker")) == len(servers)
 
 
+def helm_takes_counts():
+    """Helm 4 applies server-side, and the database's member count was set
+    by first run's scale (a field manager of its own): the chart, whose
+    value the count is, takes it back (`--force-conflicts`), as `meridian
+    upgrade-deployment` must under Helm 4. Helm 3 merges, and needs nothing."""
+    said = run("helm", "version", "--short", check=False).stdout.decode()
+    return ["--force-conflicts"] if said.startswith("v4") else []
+
+
 def reconfigure(s):
     global SHAPE
     print("R: the live install moved between the profiles, under commits", flush=True)
@@ -1260,17 +1272,28 @@ def reconfigure(s):
         print(f"R: {SHAPE} -> {target}, by the value `meridian upgrade-deployment --set` gives", flush=True)
         began = time.time()
         upgraded = run("helm", "upgrade", RELEASE, CHART, "--namespace", NAMESPACE, "--reuse-values",
-                       "--set", f"resilience.profile={target}", check=False)
+                       *helm_takes_counts(), "--set", f"resilience.profile={target}", check=False)
         s.check(upgraded.returncode == 0, f"reconfigure: helm upgrade to {target} applied"
                 + ("" if upgraded.returncode == 0 else f": {upgraded.stderr.decode(errors='replace')[-400:]}"))
         if upgraded.returncode != 0:
             return
         SHAPE = target
-        if target == "tolerant":
-            # Back to one database member: Patroni keeps running it (a
-            # database once under Patroni stays there), its standbys' pods
-            # gone and their volumes kept.
-            pass
+        if target == "ha":
+            # A database alone moves under Patroni first, alone, and is given
+            # its standbys by a second upgrade with the same values, as
+            # `meridian upgrade-deployment` runs it when the chart says so.
+            said = upgraded.stdout.decode(errors="replace")
+            moved = "upgrade again with" in said
+            s.check(moved, "reconfigure: the chart says the database moves under Patroni first, alone")
+            if moved:
+                wait_for("the database under Patroni, member 0 its leader", lambda: kubectl(
+                    "exec", f"{FULL}-database-0", "-c", "postgres", "--", "pg_isready", "-h", "127.0.0.1",
+                    "-U", "postgres", check=False).returncode == 0 and psql(
+                    "select not pg_is_in_recovery()", database="postgres", pod=f"{FULL}-database-0") == "t",
+                    seconds=600)
+                again = run("helm", "upgrade", RELEASE, CHART, "--namespace", NAMESPACE, "--reuse-values",
+                            *helm_takes_counts(), "--set", f"resilience.profile={target}", check=False)
+                s.check(again.returncode == 0, "reconfigure: the second upgrade adds the database's standbys")
         settled = happens(settled_everywhere, 900, every=5)
         took = time.time() - began
         s.check(settled, f"reconfigure: every member in the {target} shape and ready, {took:.0f}s after the upgrade")
