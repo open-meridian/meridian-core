@@ -1336,6 +1336,10 @@ def properties(s, after):
     per epoch with none skipped."""
     broken = []
     for store, table, partition, first, last, took in CHANGE_LOGS:
+        if table in CORRUPTED:
+            # Its only copy's page flipped on purpose (bit-rot, tolerant):
+            # read, it fails its checksum, as that class proved.
+            continue
         said = psql(
             f"with d as (select distinct {partition} as p, {first} as f, {last} as l, epoch from {table}), "
             f"c as (select p, f, l, epoch, lag(l) over w as prev_l, lag(epoch) over w as prev_epoch "
