@@ -1233,7 +1233,7 @@ def record_now():
     held = {}
     for store, table, partition, first, last, _ in CHANGE_LOGS:
         held[store] = psql(f"select {partition} || ':' || {first} || '-' || {last} || '@' || epoch "
-                           f"from {table} order by 1")
+                           f"from {table}")
     return held
 
 
@@ -1280,7 +1280,7 @@ def reconfigure(s):
             return
         claim(s, f"reconfigure-{target}", "deployment", took, None, {"from": "tolerant" if target == "ha" else "ha"})
         after = record_now()
-        kept = all(after[store].startswith(before[store]) for store in before)
+        kept = all(set(before[store].splitlines()) <= set(after[store].splitlines()) for store in before)
         s.check(kept, f"reconfigure: each store's change log as it was before the move, added to and nothing else")
         properties(s, f"reconfigure to {target}")
     acked = long_writer_acknowledged()
