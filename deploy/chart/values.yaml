@@ -736,6 +736,47 @@ backup:
   database: ""
   # pg_dump at the brought database's major version, and age.
   image: ghcr.io/open-meridian/meridian-backup:latest
+  # The brought database's write-ahead log archived off the cluster, for a
+  # restore to any time since the oldest backup kept (step 3b; spec/a-
+  # deployment-scales-out-and-fails-over-by-configuration sections 4 and 9).
+  # pgBackRest, in database.brought.patroniImage: the database archives
+  # each WAL segment as it fills, or after timeoutSeconds, whichever is
+  # first; each backup the schedule or `meridian backup` takes adds a full
+  # base backup beside its sealed file, and the newest backup.keep of those
+  # are kept with the WAL they need. Restored by `meridian restore
+  # --to-time`. Off by default, so a desktop keeps no archive (ruling 1058).
+  # It needs backup.recipient and a place for the backups: its base backups
+  # are taken with them, and its passphrase travels sealed in them.
+  walArchive:
+    enabled: false
+    # Where the archive is kept: `volume`, beside the sealed backups
+    # (backup.path or backup.existingClaim) under `path`; or an object
+    # store, at `path` in `bucket`: `s3` (or a store speaking its API, at
+    # `endpoint`), `gcs` or `azure` (`bucket` is its container).
+    store: volume
+    path: /wal-archive
+    bucket: ""
+    # s3: the store's address and region (s3.<region>.amazonaws.com and
+    # <region> on AWS). gcs and azure: empty for the cloud's own.
+    endpoint: ""
+    region: ""
+    # A Secret holding the store's credentials: s3 `key` and `secret`; gcs
+    # `key`, a service account's JSON; azure `account` and `key`. Empty for
+    # s3 or gcs: the pod's own identity (an IAM role or workload identity).
+    existingSecret: ""
+    # The archive is always encrypted, AES-256-CBC, with a passphrase this
+    # Secret holds as `pass` (ruling 1084). Empty: the chart makes one and
+    # keeps it beside the database's passwords, and every backup carries it
+    # sealed, so a restore into a new cluster reads the archive.
+    cipherSecret: ""
+    # s3: the customer-managed key (an AWS KMS key's ID or ARN) the store
+    # encrypts each object with (SSE-KMS). Empty: the bucket's own default.
+    # On gcs and azure a customer-managed key is the bucket's or the
+    # storage account's setting, made there.
+    kmsKeyId: ""
+    # The longest a committed transaction waits to be archived: what a
+    # restore into a new cluster can lose (the region row asks 5 minutes).
+    timeoutSeconds: 60
 
 
 resources:

@@ -55,6 +55,7 @@
 {{- $wasPatroni := eq (dig "spec" "template" "metadata" "labels" "meridian.dev/database-manager" "" (default (dict) $live)) "patroni" }}
 {{- $patroni := or (gt $standbys 0) $wasPatroni }}
 {{- $scope := $name | trunc 63 | trimSuffix "-" }}
+{{- $archive := include "meridian-runtime.walArchive" . }}
 ---
 # Made once and kept. These and the disk beside them are a pair, and the
 # reason is Postgres's: POSTGRES_PASSWORD is read by initdb on an empty data
@@ -93,6 +94,11 @@ data:
   # and the chart's start-up asks to hold the dynamic settings to the
   # chart's. Made beside the others on any install, used under Patroni.
   patroni: {{ index $held "patroni" | default (randAlphaNum 32 | b64enc) }}
+  # The WAL archive's passphrase (backup.walArchive, ruling 1084), unless
+  # backup.walArchive.cipherSecret names the administrator's own. Made on
+  # any install, used where the archive is on, and carried sealed in every
+  # backup with the rest of this Secret.
+  archive: {{ index $held "archive" | default (randAlphaNum 64 | b64enc) }}
 ---
 apiVersion: v1
 kind: Service
@@ -115,6 +121,13 @@ spec:
     - name: postgres
       port: 5432
       targetPort: 5432
+    {{- if $archive }}
+    # pgBackRest's server on the primary, which the backup Job takes base
+    # backups through, over TLS with the chart's certificates.
+    - name: archive
+      port: 8432
+      targetPort: 8432
+    {{- end }}
 {{- if $patroni }}
 ---
 # Every member by its own name (`<name>-0.<name>-members`), which Patroni's
@@ -220,6 +233,16 @@ data:
       data_dir: /var/lib/postgresql/data/pgdata
       bin_dir: /usr/local/bin
       pgpass: /tmp/pgpass
+      {{- if $archive }}
+      # The WAL archived off the cluster by whichever member is primary,
+      # each segment as it fills or after backup.walArchive.timeoutSeconds
+      # (step 3b, section 4): local settings, which Patroni lays over its
+      # dynamic ones.
+      parameters:
+        archive_mode: "on"
+        archive_command: pgbackrest --stanza=meridian archive-push %p
+        archive_timeout: {{ .Values.backup.walArchive.timeoutSeconds | default 60 | int }}
+      {{- end }}
       authentication:
         superuser:
           username: postgres
@@ -266,6 +289,11 @@ spec:
       meridian.dev/component: database
   template:
     metadata:
+      {{- if $archive }}
+      # The database's own container for `kubectl exec`, beside the archive's.
+      annotations:
+        kubectl.kubernetes.io/default-container: postgres
+      {{- end }}
       # Not the release's version: postgres is the same image whichever
       # release this is, and a label that changes restarts it (see _helpers).
       labels:
@@ -293,7 +321,9 @@ spec:
       {{- end }}
       containers:
         - name: postgres
-          image: {{ if $patroni }}{{ .Values.database.brought.patroniImage | quote }}{{ else }}{{ .Values.database.brought.image | quote }}{{ end }}
+          {{- /* The archive's pgBackRest is in the image Patroni runs in,
+                 so a database archiving its WAL runs from it, alone or not. */}}
+          image: {{ if or $patroni $archive }}{{ .Values.database.brought.patroniImage | quote }}{{ else }}{{ .Values.database.brought.image | quote }}{{ end }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           {{- if $patroni }}
           command: ["/bin/sh", "/etc/patroni/database.sh"]
@@ -348,6 +378,9 @@ spec:
               value: {{ include "meridian-runtime.patroniDynamic" (dict "top" . "standbys" $standbys) | fromYaml | toJson | quote }}
             - name: PGDATA
               value: /var/lib/postgresql/data/pgdata
+            {{- if $archive }}
+            {{- include "meridian-runtime.walArchiveEnv" . | nindent 12 }}
+            {{- end }}
           ports:
             - name: postgres
               containerPort: 5432
@@ -372,13 +405,26 @@ spec:
             - name: patroni
               mountPath: /etc/patroni
               readOnly: true
+            {{- if $archive }}
+            - name: socket
+              mountPath: /var/run/postgresql
+            {{- include "meridian-runtime.walArchiveMounts" (dict "top" . "role" "database") | nindent 12 }}
+            {{- end }}
           resources:
             {{- toYaml (.Values.database.brought.resources | default .Values.resources) | nindent 12 }}
-      volumes:
-        - name: patroni
-          configMap:
-            name: {{ $name }}-patroni
           {{- else }}
+          {{- if $archive }}
+          # Archiving its WAL (backup.walArchive): the image's own entrypoint
+          # and server, told to archive through pgBackRest.
+          args:
+            - postgres
+            - -c
+            - archive_mode=on
+            - -c
+            - archive_command=pgbackrest --stanza=meridian archive-push %p
+            - -c
+            - archive_timeout={{ .Values.backup.walArchive.timeoutSeconds | default 60 | int }}
+          {{- end }}
           env:
             - name: POSTGRES_USER
               value: postgres
@@ -411,15 +457,85 @@ spec:
             - name: POSTGRES_INITDB_ARGS
               value: --data-checksums
             {{- end }}
+            {{- if $archive }}
+            {{- include "meridian-runtime.walArchiveEnv" . | nindent 12 }}
+            {{- end }}
           ports:
             - name: postgres
               containerPort: 5432
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
+            {{- if $archive }}
+            - name: socket
+              mountPath: /var/run/postgresql
+            {{- include "meridian-runtime.walArchiveMounts" (dict "top" . "role" "database") | nindent 12 }}
+            {{- end }}
           resources:
             {{- toYaml (.Values.database.brought.resources | default .Values.resources) | nindent 12 }}
           {{- end }}
+        {{- if $archive }}
+        # Beside the server (backup.walArchive): pgBackRest's own server,
+        # which the backup Job takes base backups through over TLS, and the
+        # archive's stanza made, or moved to a database made again, once
+        # this member is primary (files/archive.sh). Its own process, so a
+        # backup never runs inside the database's container.
+        - name: archive
+          image: {{ .Values.database.brought.patroniImage | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/sh", "/etc/archive/archive.sh"]
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+            {{- if eq .Values.backup.walArchive.store "volume" }}
+            - name: MERIDIAN_ARCHIVE_DIRECTORY
+              value: /backups{{ .Values.backup.walArchive.path }}
+            {{- end }}
+            {{- include "meridian-runtime.walArchiveEnv" . | nindent 12 }}
+          ports:
+            - name: archive
+              containerPort: 8432
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: socket
+              mountPath: /var/run/postgresql
+            - name: archive-script
+              mountPath: /etc/archive
+              readOnly: true
+            - name: archive-tls
+              mountPath: /etc/archive-tls
+              readOnly: true
+            {{- include "meridian-runtime.walArchiveMounts" (dict "top" . "role" "database") | nindent 12 }}
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 256Mi
+        {{- end }}
+      {{- if or $patroni $archive }}
+      volumes:
+        {{- if $patroni }}
+        - name: patroni
+          configMap:
+            name: {{ $name }}-patroni
+        {{- end }}
+        {{- if $archive }}
+        - name: socket
+          emptyDir: {}
+        - name: archive-script
+          configMap:
+            name: {{ $full }}-pgbackrest
+            items:
+              - key: archive.sh
+                path: archive.sh
+        - name: archive-tls
+          secret:
+            secretName: {{ $name }}-tls
+        {{- include "meridian-runtime.walArchiveVolumes" (dict "top" . "role" "database") | nindent 8 }}
+        {{- end }}
+      {{- end }}
   volumeClaimTemplates:
     - metadata:
         name: data
@@ -453,6 +569,16 @@ spec:
               app.kubernetes.io/instance: {{ .Release.Name }}
       ports:
         - port: 5432
+    {{- if $archive }}
+    # pgBackRest's server: the backup Job alone, taking a base backup.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              meridian.dev/component: backup
+      ports:
+        - port: 8432
+    {{- end }}
     {{- if $patroni }}
     # Patroni's REST API: its own members, asking each other's positions.
     - from:

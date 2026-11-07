@@ -1,0 +1,69 @@
+{{- include "meridian-runtime.require" . -}}
+{{- if include "meridian-runtime.walArchive" . }}
+{{/*
+  The brought database's WAL archive (values.yaml's backup.walArchive; step
+  3b, spec/a-deployment-scales-out-and-fails-over-by-configuration sections
+  4 and 9): pgBackRest's configuration for each of its three users, the
+  scripts they run, and the certificates its server and the backup Job
+  know each other by.
+
+  Each member archives its WAL from the database's own container while it
+  is primary, and serves pgBackRest's protocol beside it (files/archive.sh);
+  the backup Job, on the schedule or for `meridian backup`, takes a full
+  base backup through that server before it seals its file (files/archive-
+  backup.sh), and expires those beyond backup.keep; the offline Job restores
+  a stopped member's volume to a time (files/database-offline.sh, for
+  `meridian restore --to-time`). The archive is encrypted with a passphrase
+  the chart keeps and every backup carries sealed (ruling 1084).
+*/}}
+{{- $full := include "meridian-runtime.fullname" . }}
+{{- $tlsName := printf "%s-database-tls" $full }}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace $tlsName }}
+{{- $tls := dict }}
+{{- if and $existing $existing.data }}
+{{- $tls = $existing.data }}
+{{- else }}
+{{- $ca := genCA "meridian-archive" 3650 }}
+{{- $host := printf "%s-database" $full }}
+{{- $names := list $host (printf "%s.%s" $host .Release.Namespace) (printf "%s.%s.svc" $host .Release.Namespace) (printf "%s.%s.svc.cluster.local" $host .Release.Namespace) }}
+{{- $server := genSignedCert $host nil $names 3650 $ca }}
+{{- $client := genSignedCert "meridian-backup" nil nil 3650 $ca }}
+{{- $tls = dict "ca.crt" ($ca.Cert | b64enc) "tls.crt" ($server.Cert | b64enc) "tls.key" ($server.Key | b64enc) "client.crt" ($client.Cert | b64enc) "client.key" ($client.Key | b64enc) }}
+{{- end }}
+---
+# pgBackRest's server's and the backup Job's certificates, from a CA made
+# here for them alone: the server knows the Job by its certificate's name,
+# meridian-backup, and the Job the server by the database Service's. Kept
+# across upgrades (read back), so a running server and a new Job agree.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $tlsName }}
+  labels:
+    meridian.dev/component: database
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+type: Opaque
+data:
+  {{- range $key := list "ca.crt" "tls.crt" "tls.key" "client.crt" "client.key" }}
+  {{ $key }}: {{ index $tls $key | quote }}
+  {{- end }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $full }}-pgbackrest
+  labels:
+    meridian.dev/component: database
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+data:
+  database.conf: |
+    {{- include "meridian-runtime.pgbackrestConf" (dict "top" . "role" "database") | nindent 4 }}
+  backup.conf: |
+    {{- include "meridian-runtime.pgbackrestConf" (dict "top" . "role" "backup") | nindent 4 }}
+  offline.conf: |
+    {{- include "meridian-runtime.pgbackrestConf" (dict "top" . "role" "offline") | nindent 4 }}
+  archive.sh: |
+    {{- .Files.Get "files/archive.sh" | nindent 4 }}
+  archive-backup.sh: |
+    {{- .Files.Get "files/archive-backup.sh" | nindent 4 }}
+{{- end }}

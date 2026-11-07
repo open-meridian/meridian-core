@@ -359,10 +359,10 @@ fn run() -> Result<(), String> {
         // report.
         let registries = registries_from_env(&platform, &store);
         if let Some(hold) = &registries {
-            tokio::spawn(meridian_config::registries::usage::pull_hourly(Arc::clone(
-                hold,
-            )));
-            tokio::spawn(
+            meridian_runtime::background(meridian_config::registries::usage::pull_hourly(
+                Arc::clone(hold),
+            ));
+            meridian_runtime::background(
                 Arc::new(meridian_config::registries::usage::UsageSender::new(
                     Arc::clone(hold),
                 ))
@@ -389,12 +389,12 @@ fn run() -> Result<(), String> {
             Arc::clone(&platform),
             clock(),
         );
-        tokio::spawn(Arc::clone(&calendars).start());
+        meridian_runtime::background(Arc::clone(&calendars).start());
         // Contract v24 (W3.24, W3.25, W3.27): the licence list, the template
         // catalogue and the replacement feed, pulled on start, daily and on
         // reconnecting, for the instrument store; the list is what every
         // ask sends by.
-        tokio::spawn(
+        meridian_runtime::background(
             Arc::new(meridian_conductor::reference::ReferencePuller::new(
                 Arc::clone(&bus),
                 Arc::clone(&platform),
@@ -405,7 +405,7 @@ fn run() -> Result<(), String> {
         );
         // W3.28 (contract v24): the weekly usage report, the store's counts,
         // unless the deployment admin turned it off.
-        tokio::spawn(
+        meridian_runtime::background(
             Arc::new(meridian_conductor::usage::UsageSender::new(
                 Arc::clone(&bus),
                 Arc::clone(&platform),
@@ -421,7 +421,7 @@ fn run() -> Result<(), String> {
 
         // W3.15 (contract v18): a venue a plugin reported missing, asked of
         // the platform by its public codes and kept by the instrument store.
-        tokio::spawn(
+        meridian_runtime::background(
             meridian_conductor::VenueAsker::new(Arc::clone(&bus), Arc::clone(&platform), clock())
                 .with_calendars(calendars)
                 .start(),
@@ -433,9 +433,9 @@ fn run() -> Result<(), String> {
         let reporting = Arc::clone(&platform);
         let collecting = Arc::clone(&bus);
         let schema = meridian_config::migrations::latest();
-        tokio::spawn(
-            async move { report_forever(reporting, collecting, "conductor", schema).await },
-        );
+        meridian_runtime::background(async move {
+            report_forever(reporting, collecting, "conductor", schema).await
+        });
 
         tracing::info!(
             instance_id,
