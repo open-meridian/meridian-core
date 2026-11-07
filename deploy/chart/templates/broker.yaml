@@ -32,12 +32,27 @@
   after commit. With three, JetStream at three replicas keeps the analytics
   units' work queue, and nothing else (decisions/024).
 */}}
-{{- $members := printf "%s-members.%s.svc.cluster.local" $name .Release.Namespace }}
+{{/*
+  The servers' set is named by what it keeps on disk (step 3b part 3): a
+  StatefulSet's volume claims cannot change in place, so the set with
+  JetStream's volumes is a set of its own, <name>-jetstream, and turning
+  JetStream on or off (resilience.profile, broker.jetstream.replicas) is
+  Helm making the one set and removing the other in the same upgrade,
+  which `meridian upgrade-deployment --set` drives: no manual step. The
+  client Service follows the set by its label, and each server is named
+  under its own set's members. Deliveries in flight across the change are
+  caught up by sequence and requests not answered are asked again, as for
+  a lost server (section 4). A set's volumes are kept when it goes, as a
+  StatefulSet's are, and found again if JetStream comes back.
+*/}}
+{{- $set := $name }}
+{{- if gt $jetstream 0 }}{{ $set = printf "%s-jetstream" $name }}{{ end }}
+{{- $members := printf "%s-members.%s.svc.cluster.local" $set .Release.Namespace }}
 {{- $address := printf "%s.%s.svc.cluster.local:4222" $name .Release.Namespace }}
 {{- if gt $servers 1 }}
 {{- $each := list }}
 {{- range $i := until $servers }}
-{{- $each = append $each (printf "%s-%d.%s:4222" $name $i $members) }}
+{{- $each = append $each (printf "%s-%d.%s:4222" $set $i $members) }}
 {{- end }}
 {{- $address = join "," $each }}
 {{- end }}
@@ -121,7 +136,7 @@ data:
 {{- /* Each server's route, whole, with the cluster's credential: the
        broker's configuration names these variables and never holds one. */}}
 {{- range $i := until $servers }}
-  {{ printf "MERIDIAN_NATS__ROUTE_%d" $i }}: {{ printf "nats-route://routes:%s@%s-%d.%s:6222" (b64dec $routes) $name $i $members | b64enc }}
+  {{ printf "MERIDIAN_NATS__ROUTE_%d" $i }}: {{ printf "nats-route://routes:%s@%s-%d.%s:6222" (b64dec $routes) $set $i $members | b64enc }}
 {{- end }}
 {{- range $user, $password := $passwords }}
   {{ printf "MERIDIAN_NATS_%s" (upper (replace "-" "_" $user)) }}: {{ $password }}
@@ -223,10 +238,12 @@ metadata:
   labels:
     {{- include "meridian-runtime.labels" . | nindent 4 }}
 spec:
+  # The current set's servers alone, never the set an upgrade is removing.
   selector:
     app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
     app.kubernetes.io/instance: {{ .Release.Name }}
     meridian.dev/component: broker
+    meridian.dev/broker-set: {{ $set }}
   ports:
     - name: client
       port: 4222
@@ -237,7 +254,7 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ $name }}-members
+  name: {{ $set }}-members
   labels:
     {{- include "meridian-runtime.labels" . | nindent 4 }}
 spec:
@@ -246,6 +263,7 @@ spec:
     app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
     app.kubernetes.io/instance: {{ .Release.Name }}
     meridian.dev/component: broker
+    meridian.dev/broker-set: {{ $set }}
   ports:
     - name: client
       port: 4222
@@ -261,24 +279,31 @@ spec:
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: {{ $name }}
+  name: {{ $set }}
   labels:
     {{- include "meridian-runtime.labels" . | nindent 4 }}
 spec:
   replicas: {{ $servers }}
-  serviceName: {{ $name }}-members
+  serviceName: {{ $set }}-members
   podManagementPolicy: Parallel
   revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
+  # The set without volumes keeps the selector it was made with (a
+  # selector cannot change in place); the set with them is selected by its
+  # name as well.
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "meridian-runtime.name" . }}
       app.kubernetes.io/instance: {{ .Release.Name }}
       meridian.dev/component: broker
+      {{- if ne $set $name }}
+      meridian.dev/broker-set: {{ $set }}
+      {{- end }}
   template:
     metadata:
       labels:
         {{- include "meridian-runtime.labels" . | nindent 8 }}
         meridian.dev/component: broker
+        meridian.dev/broker-set: {{ $set }}
     spec:
       {{- with .Values.podSecurityContext }}
       securityContext:

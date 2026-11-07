@@ -11,10 +11,10 @@ DOCKER := DOCKER_BUILDKIT=1 docker
 
 .PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check licence-check-test gate-start check-leftovers check-leftovers-end \
         gate-mark-tests ci-stage images runtime-images test-images ci-images runtime-image analytics-image harness-image interop-image version-check-image tests-image settings-binary-image backup-cli-image stage-checks stage-images stage-compile stage-tests stage-settings-page stage-sdk stage-dashboards stage-harness stage-first-run stage-image stage-lint \
-        e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external e2e-cluster-backup \
+        e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external e2e-cluster-backup e2e-cluster-reconfigure \
         test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-service-account e2e-lake e2e-recorded e2e-orders e2e-one-id e2e-harness \
         build test test-store check-image-version chart-check check-crate-boundaries check-one-clock check-test-targets check-local-storage \
-        interop e2e-book check-reference-cases reference-cases prompt-attacks lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-first-run
+        interop e2e-book check-reference-cases reference-cases prompt-attacks lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-first-run claims-check claims-ledger
 
 help:
 	@echo "  make ci-local       run every gate (the pre-push gate, and what CI mirrors)"
@@ -142,7 +142,7 @@ ifneq ($(filter ci-local ci-local-deep,$(MAKECMDGOALS)),)
 stage-tests stage-settings-page stage-sdk stage-dashboards stage-harness stage-first-run stage-image stage-lint: export IMAGES = built
 endif
 
-stage-checks:     gate-begin-checks check-leftovers contract-diff ci-mirror-check licence-check-test check-crate-boundaries check-one-clock check-test-targets check-local-storage check-codegen advisories chart-check
+stage-checks:     gate-begin-checks check-leftovers contract-diff ci-mirror-check licence-check-test check-crate-boundaries check-one-clock check-test-targets check-local-storage check-codegen advisories chart-check claims-check
 	@$(GATE) end checks
 stage-images:     gate-begin-images runtime-images
 	@$(GATE) end images
@@ -878,6 +878,27 @@ footprint-judge:
 	@test -n "$(FOOTPRINT_PEAKS)" || { echo "footprint-judge: no job's peak to judge; set FOOTPRINT_PEAKS=<files>" >&2; exit 1; }
 	@$(PY) tools/footprint.py judge --baseline deploy/footprint-baseline.yaml $(FOOTPRINT_PEAKS)
 
+# The claims ledger (366; ruling 1113; spec/a-deployment-scales-out-and-
+# fails-over-by-configuration section 15): each failure class's recovery as
+# CI's green runs measured it, per profile and component, beside its bound
+# and RPO, in deploy/claims-ledger.json (tools/claims.py). claims-check holds
+# the ledger to its bounds in the gate; CI's claims-check job holds it, and
+# every one of the run's measurements, to them, and fails a class the ledger
+# holds that the run did not measure. claims-ledger writes it again from
+# runs' claims files -- CI keeps each as an artifact (failover-claims-<profile>,
+# backup-claims) -- a reviewed change naming the runs:
+#
+#   gh run download <run> -p 'failover-claims-*' -p backup-claims -D .claims
+#   make claims-ledger CLAIMS="$(find .claims -name '*.jsonl')"
+CLAIMS ?= $(wildcard .e2e-*-claims.jsonl)
+claims-check:
+	@$(PY) tools/claims.py --self-test >/dev/null
+	@$(PY) tools/claims.py check --ledger deploy/claims-ledger.json $(if $(CLAIMS_RUN),--every $(CLAIMS_RUN))
+
+claims-ledger:
+	@test -n "$(CLAIMS)" || { echo "claims-ledger: no runs' claims to write from; set CLAIMS=<files>" >&2; exit 1; }
+	@$(PY) tools/claims.py ledger --out deploy/claims-ledger.json $(CLAIMS)
+
 # Failure classes injected and timed (step 3b; spec/a-deployment-scales-out-
 # and-fails-over-by-configuration sections 10 and 15; plan Track 7): the
 # chart installed in a profile -- PROFILE=tolerant, the default, one member
@@ -904,6 +925,19 @@ FAILURE ?=
 E2E_POSTGRES_IMAGE ?= meridian-postgres:local
 e2e-cluster-scaled:
 	@$(MAKE) --no-print-directory e2e-cluster-failover PROFILE=scaled FAILURE=
+
+# A live install moved between the profiles (step 3b part 3; spec section
+# 15): installed tolerant, with its key in a Secret as ha needs (1074), then
+# `resilience.profile` set to ha and back by an upgrade, as `meridian
+# upgrade-deployment --set` sets it, under commits through the database's
+# Service: every member in each shape and ready, each store's change log
+# kept as it was, the record's properties held, and every acknowledged
+# commit kept. Three agents in zones, as the HA runs:
+#
+#   make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-reconfigure \
+#     E2E_K3D_AGENTS=3 E2E_K3D_ZONES="zone-a zone-b zone-c"
+e2e-cluster-reconfigure:
+	@$(MAKE) --no-print-directory e2e-cluster-failover PROFILE=reconfigure FAILURE=
 
 e2e-cluster-failover: $(if $(E2E_FAILOVER_RUNTIME),,runtime-image analytics-image)
 	@ctx="$$(kubectl config current-context 2>/dev/null)"; \
@@ -2517,7 +2551,8 @@ chart-check:
 	done; \
 	for held in "meridian.dev/database-manager: patroni" "meridian.dev/database-role: primary" \
 		"synchronous_mode_strict: true" "--route" "--jetstream" "MERIDIAN_ANALYTICS_UNITS" \
-		"name: check-meridian-runtime-broker-members" "name: check-meridian-runtime-database-members"; do \
+		"name: check-meridian-runtime-broker-jetstream-members" "name: check-meridian-runtime-database-members" \
+		"meridian.dev/broker-set: check-meridian-runtime-broker-jetstream"; do \
 		echo "$$ha" | grep -q -- "$$held" \
 			|| { echo "chart-check FAILED: the ha profile renders no $$held" >&2; exit 1; }; \
 	done; \
@@ -2819,6 +2854,19 @@ e2e-book: network interop-image runtime-image
 	@MERIDIAN_DEPLOYMENT_ID=DEP-book $(COMPOSE_TEST) --profile book up -d street instrument conductor bor \
 		sidecar-book sidecar-book-operations sidecar-book-reporting sidecar-book-unscoped >>.e2e-book.log 2>&1 \
 		|| { echo "e2e-book FAILED: the components did not start; see .e2e-book.log" >&2; exit 1; }
+	@# Started is not serving: the suite's first call reached the book a
+	@# second before it served (a local gate, 2026-11-07: "nothing serves
+	@# platform.book.query.list-account-attributes", the book serving 1 s
+	@# later). Each store the suite reaches is waited for until it says it
+	@# serves, at most a minute.
+	@ready=; for i in $$(seq 1 60); do \
+		said="$$($(COMPOSE_TEST) --profile book logs --no-color bor street instrument 2>/dev/null)"; \
+		echo "$$said" | grep -q "the book is serving" \
+			&& echo "$$said" | grep -q "the street store is serving" \
+			&& echo "$$said" | grep -q "the instrument store is serving" && { ready=1; break; }; \
+		sleep 1; \
+	done; \
+	[ -n "$$ready" ] || { echo "e2e-book FAILED: the book, the street store and the instrument store did not all serve within 60 s; see .e2e-book.log" >&2; exit 1; }
 	@# --no-deps, as interop: everything the suite reaches is up already, and a
 	@# run that converged its dependencies could recreate sidecar-book under
 	@# Compose 2.38.x and leave the suite in a namespace nothing answers in.
