@@ -253,8 +253,9 @@ pub fn notices_of(
 }
 
 /// Judge the monitor's whole minutes every [`JUDGE_EVERY_SECS`] from now on,
-/// keeping each episode's notices.
-pub fn judge_forever(app: Arc<App>) {
+/// keeping each episode's notices. The task is handed back, for the
+/// component to end before its runtime stops (meridian_runtime::keep).
+pub fn judge_forever(app: Arc<App>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut every = tokio::time::interval(std::time::Duration::from_secs(JUDGE_EVERY_SECS));
         loop {
@@ -283,7 +284,7 @@ pub fn judge_forever(app: Arc<App>) {
                 tracing::error!("a latency episode's notices were not kept");
             }
         }
-    });
+    })
 }
 
 /// A notice as `dashboard__read_inbox` answers it.

@@ -71,7 +71,7 @@ fn run() -> Result<(), String> {
     on_runtime(async move {
         let bus = bus_from_env(&instance_id).await?;
         // Its own hop's ages, to the monitor (W4.16; ruling 606).
-        tokio::spawn(meridian_runtime::report_latency_forever(Arc::clone(&bus)));
+        meridian_runtime::background(meridian_runtime::report_latency_forever(Arc::clone(&bus)));
         // The units' work queue on JetStream, where the broker keeps one
         // (step 3b; broker.jetstream.replicas: 3); the queue group otherwise.
         // Never an outage of its own: where the stream cannot be made in a
@@ -107,7 +107,7 @@ fn run() -> Result<(), String> {
             if let Some(units) = &queue {
                 let units = Arc::clone(units);
                 let taking = Arc::clone(&cache);
-                tokio::spawn(async move {
+                meridian_runtime::background(async move {
                     if let Err(failed) = units.work(taking).await {
                         tracing::error!("{failed}; stopping, to be restarted");
                         std::process::exit(1);

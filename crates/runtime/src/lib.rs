@@ -308,6 +308,15 @@ pub fn wait_for_store<S>(
 /// The rule this keeps: a store is made before this is called and held by the
 /// caller, the future borrows it, and the runtime is gone before the caller's
 /// last reference is. Only a drop outside any runtime closes a connection.
+///
+/// And every task the component started with [`background`] is ended before
+/// the runtime is: aborted, and awaited, so each is dropped at an await point
+/// while the runtime still runs. Left to the runtime's own drop, a task in
+/// the middle of its loop was polled once more as the runtime shut down --
+/// the blocking task it awaited cancelled under it -- went on to its next
+/// timer, and panicked ("A Tokio 1.x context was found, but it is being
+/// shutdown"): the dashboard's sweep, stopped by SIGTERM during its first
+/// tick (core#91's merge-queue run, 2026-11-07).
 pub fn on_runtime<F>(serving: F) -> Result<(), String>
 where
     F: std::future::Future<Output = Result<(), String>>,
@@ -316,11 +325,67 @@ where
         .enable_all()
         .build()
         .map_err(|failed| failed.to_string())?;
-    let served = runtime.block_on(serving);
+    served_on(runtime, serving)
+}
+
+/// [`on_runtime`]'s body, on a runtime given.
+fn served_on<F>(runtime: tokio::runtime::Runtime, serving: F) -> Result<(), String>
+where
+    F: std::future::Future<Output = Result<(), String>>,
+{
+    let served = runtime.block_on(async {
+        let served = serving.await;
+        end_background().await;
+        served
+    });
     // Every task, and every store reference a task held, goes here, while the
     // caller still holds its own.
     drop(runtime);
     served
+}
+
+/// The tasks a component runs beside its serving, ended before its runtime is
+/// ([`on_runtime`]).
+static BACKGROUND: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Run `work` beside the component's serving until it ends, or until the
+/// serving does: then it is aborted and awaited before the runtime stops.
+/// Every loop a component starts -- its sweeps, its refreshes, its reports --
+/// is started here, never with a bare `tokio::spawn`.
+pub fn background<F>(work: F)
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    keep(tokio::spawn(async move {
+        work.await;
+    }));
+}
+
+/// A task a library started, kept to be ended with the component's own.
+pub fn keep(task: tokio::task::JoinHandle<()>) {
+    let mut held = BACKGROUND
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    held.retain(|task| !task.is_finished());
+    held.push(task);
+}
+
+/// Every background task aborted, then awaited: each dropped at an await
+/// point, inside the runtime, before it is shut down.
+async fn end_background() {
+    let tasks = std::mem::take(
+        &mut *BACKGROUND
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    );
+    for task in &tasks {
+        task.abort();
+    }
+    for task in tasks {
+        let _ = task.await;
+    }
 }
 
 /// Whether this component serves, as the file its readiness probe looks for.
@@ -995,6 +1060,64 @@ mod tests {
 
     const EVERY: Duration = Duration::from_millis(1);
     const AT_MOST: Duration = Duration::from_secs(5);
+
+    /// A sweep stopped mid-tick (core#91's merge-queue run): a background
+    /// loop still in its poll -- its store's blocking work in hand -- when the
+    /// serving ends. Left to the runtime's drop, that poll ran on as the
+    /// runtime shut down: its next blocking work was cancelled at once, and
+    /// it reached for a timer the stopping runtime no longer had, and
+    /// panicked. Ended first, it finishes its poll on a running runtime and
+    /// is dropped where it next waits.
+    #[test]
+    fn a_background_loop_mid_poll_is_ended_before_the_runtime_stops() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let polling = Arc::new(tokio::sync::Notify::new());
+        let (d, c, p) = (
+            Arc::clone(&dropped),
+            Arc::clone(&cancelled),
+            Arc::clone(&polling),
+        );
+        let served = super::served_on(runtime, async move {
+            super::background(async move {
+                let _guard = Dropped(d);
+                p.notify_one();
+                // Still in this poll when the serving ends: a store's
+                // blocking client, synchronous on the worker.
+                std::thread::sleep(Duration::from_millis(300));
+                if tokio::task::spawn_blocking(|| ()).await.is_err() {
+                    c.store(true, Ordering::SeqCst);
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            });
+            polling.notified().await;
+            Ok(())
+        });
+        assert_eq!(served, Ok(()));
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the loop was not ended with the serving"
+        );
+        assert!(
+            !cancelled.load(Ordering::SeqCst),
+            "the loop ran on into the runtime's shutdown: its blocking work was cancelled under it"
+        );
+    }
 
     #[test]
     fn a_build_never_reports_the_bare_crate_version() {
