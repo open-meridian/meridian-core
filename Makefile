@@ -2548,7 +2548,7 @@ chart-check:
 	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
 	backups="--set backup.recipient=age1check --set backup.path=/var/lib/check"; \
 	plain="$$($(HELM_TEMPLATE) check deploy/chart $$base $$backups 2>/dev/null)"; \
-	echo "$$plain" | grep -q "pgbackrest\|archive_mode\|database-tls" \
+	echo "$$plain" | grep -q "name: check-meridian-runtime-database-tls\|name: check-meridian-runtime-pgbackrest\|PGBACKREST_REPO1_CIPHER_PASS" \
 		&& { echo "chart-check FAILED: with backup.walArchive off, an archive still renders" >&2; exit 1; }; \
 	echo "$$plain" | grep -q "name: check-meridian-runtime-database-offline" \
 		|| { echo "chart-check FAILED: the brought database has no offline CronJob for restore --to-time and --enable-checksums" >&2; exit 1; }; \
