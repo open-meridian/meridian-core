@@ -33,6 +33,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -45,6 +46,9 @@ FULL = f"{RELEASE}-meridian-runtime"
 IMAGE = os.environ["E2E_IMAGE"]
 BACKUP_IMAGE = os.environ["E2E_BACKUP_IMAGE"]
 CLI_IMAGE = os.environ["E2E_CLI_IMAGE"]
+# The brought database's image under Patroni, which holds pgBackRest: the
+# database archiving its WAL (backup.walArchive) runs from it.
+POSTGRES_IMAGE = os.environ["E2E_POSTGRES_IMAGE"]
 CHART = os.path.abspath(os.environ.get("E2E_CHART", "deploy/chart"))
 BOOK_SQL = os.path.abspath("deploy/harness/book.sql")
 # A directory on the node, as a laptop's would be under the Mac's home: what
@@ -125,7 +129,7 @@ def digest(data):
 
 def psql(sql, database="meridian", quiet=False):
     return kubectl(
-        "exec", "-i", f"{FULL}-database-0", "--",
+        "exec", "-i", f"{FULL}-database-0", "-c", "postgres", "--",
         "psql", "-X", "-q", "-At", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", database,
         input=sql.encode(), quiet=quiet,
     ).stdout.decode().strip()
@@ -461,7 +465,10 @@ def main():
         "--set", f"backup.recipient={recipient}",
         "--set", f"backup.path={BACKUP_PATH}",
         "--set", "backup.schedule=*/1 * * * *",
-        "--set", "backup.keep=1")
+        "--set", "backup.keep=1",
+        # The WAL archived beside the backups, for a restore to a time (J).
+        "--set", "backup.walArchive.enabled=true",
+        "--set", f"database.brought.patroniImage={POSTGRES_IMAGE}")
     s.check(True, "helm install")
 
     print("C: first run, as the wizard's Job writes it", flush=True)
@@ -592,6 +599,9 @@ def main():
         head = sealed_file.read(64)
     s.check(head.startswith(b"age-encryption.org/v1"), "the file is sealed with age")
 
+    restored_to_a_time(s, before)
+    checksums_enabled(s, before)
+
     print("F: wiped, as a reset of the cluster wipes it; the node's directory is left", flush=True)
     run("helm", "uninstall", RELEASE, "--namespace", NAMESPACE, "--wait")
     run("kubectl", "delete", "namespace", NAMESPACE, "--wait", "--timeout=300s")
@@ -668,7 +678,204 @@ def main():
     done = cli(workdir, "backup", "--release", RELEASE, "-n", NAMESPACE, "--to", "/work")
     s.check(done.returncode == 0, f"meridian backup after the restore: exit {done.returncode}")
     s.check(len(node_backups()) == 1, "the node keeps the newest one alone")
+    # The restored database is a new one to the archive (its system
+    # identifier is new): the stanza moved to it, and a base backup of it.
+    s.check(happens(lambda: archive_said("the stanza moved to this database"), 120),
+            "the archive moved to the restored database, a new one to it, keeping the one before as history")
+    s.check(happens(lambda: "a full base backup taken" in newest_base_backup_log(), 180),
+            "and a backup took a base backup of it into the archive")
     return verdict(s)
+
+
+# ── J and K: what the core side of `meridian restore --to-time` and of
+# `meridian upgrade-deployment --enable-checksums` does, driven here as the
+# CLI drives it: every component and the database stopped, a Job made from
+# the database's offline CronJob with the act named, and everything started
+# again (templates/database-offline.yaml). ──
+
+
+def archive_said(words):
+    """Whether the archive's container beside the database said `words`."""
+    done = kubectl("logs", f"{FULL}-database-0", "-c", "archive", "--tail=-1", check=False)
+    return words in done.stdout.decode()
+
+
+def newest_base_backup_log():
+    """What the newest backup Job's archive step said."""
+    jobs = json.loads(out("get", "jobs", "-l", "meridian.dev/component=backup", "-o", "json"))["items"]
+    jobs.sort(key=lambda j: j["metadata"]["creationTimestamp"])
+    for job in reversed(jobs):
+        pods = out("get", "pods", "-l", f"job-name={job['metadata']['name']}", "-o", "name").split()
+        for pod in pods:
+            done = kubectl("logs", pod, "-c", "archive", check=False)
+            if done.returncode == 0:
+                return done.stdout.decode()
+    return ""
+
+
+def deployments():
+    """Each of the release's Deployments, and the replicas it runs."""
+    listed = json.loads(out("get", "deployments", "-l", f"app.kubernetes.io/instance={RELEASE}", "-o", "json"))
+    return {d["metadata"]["name"]: d["spec"].get("replicas", 1) for d in listed["items"]}
+
+
+def stopped(running):
+    """Every component and the database stopped, as the CLI stops them, and
+    their pods gone. The broker uses no database and keeps running."""
+    for name in running:
+        kubectl("scale", "deployment", name, "--replicas=0")
+    kubectl("scale", "statefulset", f"{FULL}-database", "--replicas=0")
+
+    def gone():
+        listed = json.loads(out("get", "deployments,statefulsets", "-l", f"app.kubernetes.io/instance={RELEASE}",
+                                "-o", "json"))["items"]
+        counted = [i for i in listed if i["kind"] == "Deployment" or i["metadata"]["name"] == f"{FULL}-database"]
+        return all(not i["status"].get("replicas") for i in counted) and kubectl(
+            "get", "pod", f"{FULL}-database-0", check=False).returncode != 0
+    wait_for("every component and the database to stop", gone, seconds=300)
+
+
+def started(running):
+    """The database, then every component, started again and ready."""
+    kubectl("scale", "statefulset", f"{FULL}-database", "--replicas=1")
+    wait_for("the database", lambda: kubectl(
+        "exec", f"{FULL}-database-0", "-c", "postgres", "--", "pg_isready", "-h", "127.0.0.1", "-U", "postgres",
+        check=False).returncode == 0, seconds=300)
+    for name, replicas in running.items():
+        kubectl("scale", "deployment", name, f"--replicas={replicas}")
+    wait_for("every component ready", all_ready, seconds=600)
+
+
+def offline(act, **env):
+    """A Job from the offline CronJob with the act named, as the CLI makes
+    it, run to its end: whether it succeeded, and what it said."""
+    cron = json.loads(out("get", "cronjob", f"{FULL}-database-offline", "-o", "json"))
+    template = cron["spec"]["jobTemplate"]
+    name = f"{FULL}-database-{act}"[:63]
+    job = {"apiVersion": "batch/v1", "kind": "Job",
+           "metadata": {"name": name, "namespace": NAMESPACE, "labels": template["metadata"].get("labels", {})},
+           "spec": template["spec"]}
+    said = {"MERIDIAN_DATABASE_ACT": act, **env}
+    container = job["spec"]["template"]["spec"]["containers"][0]
+    container["env"] = [e for e in container.get("env", []) if e["name"] not in said] + [
+        {"name": k, "value": v} for k, v in said.items()]
+    kubectl("delete", "job", name, "--ignore-not-found", "--wait")
+    kubectl("create", "-f", "-", input=json.dumps(job).encode())
+    wait_for(f"the {act} Job to finish", lambda: any(
+        c["type"] in ("Complete", "Failed") and c["status"] == "True"
+        for c in json.loads(out("get", "job", name, "-o", "json"))["status"].get("conditions", [])), seconds=900)
+    status = json.loads(out("get", "job", name, "-o", "json"))["status"]
+    log = kubectl("logs", f"job/{name}", "--tail=-1", check=False).stdout.decode()
+    for line in log.splitlines():
+        print(f"    | {line}", flush=True)
+    return bool(status.get("succeeded")), log
+
+
+def claim(s, failure, component, seconds, bound, extra=None):
+    """A measurement, kept as the failover run keeps its own (366): the
+    claims ledger is written from these lines."""
+    line = {
+        "profile": "tolerant", "failure": failure, "component": component,
+        "recovered_s": round(seconds, 2), "bound_s": bound,
+        "held": bound is None or seconds <= bound,
+        "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-backup",
+        "run": os.environ.get("GITHUB_RUN_ID", "local"),
+    }
+    line.update(extra or {})
+    print(f"CLAIM {json.dumps(line)}", flush=True)
+    with open(os.environ.get("E2E_BACKUP_CLAIMS", ".e2e-backup-claims.jsonl"), "a", encoding="utf-8") as kept:
+        kept.write(json.dumps(line) + "\n")
+    if bound is not None:
+        s.check(line["held"], f"{failure}: {component} in {seconds:.1f}s, within {bound}s")
+
+
+PROBE = "e2e_point_in_time"
+
+
+def probe_rows():
+    return psql(f"select n || '|' || at::text || '|' || said from {PROBE} order by n")
+
+
+def restored_to_a_time(s, before):
+    print("J: restored to a time between two commits, from the WAL archive", flush=True)
+    s.check(archive_said("the stanza holds this database"), "the archive's stanza holds the database")
+    s.check("a full base backup taken" in newest_base_backup_log(),
+            "the backup took a full base backup into the archive")
+    psql(f"create table {PROBE} (n int primary key, at timestamptz not null default clock_timestamp(), "
+         "said text not null)")
+    for n in (1, 2, 3):
+        psql(f"insert into {PROBE} (n, said) values ({n}, 'before')")
+    time.sleep(1.5)
+    to = psql("select to_char(clock_timestamp() at time zone 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') || '+00'")
+    time.sleep(1.5)
+    held_at_the_time = probe_rows()
+    for n in (4, 5, 6):
+        psql(f"insert into {PROBE} (n, said) values ({n}, 'after')")
+    s.check(len(probe_rows().splitlines()) == 6, "six rows committed, three on each side of the time")
+    # The segment holding the last commit archived, as archive_timeout would
+    # within backup.walArchive.timeoutSeconds.
+    wal = psql("select pg_walfile_name(pg_switch_wal())")
+    wait_for("the last segment to be archived", lambda: psql(
+        "select last_archived_wal from pg_stat_archiver") >= wal, seconds=120)
+    s.check(True, f"the WAL through {wal} is archived")
+    running = deployments()
+    began = time.time()
+    stopped(running)
+    ok, log = offline("restore-to-time", MERIDIAN_RESTORE_TO_TIME=to)
+    s.check(ok, f"the offline Job restored the database to {to}")
+    s.check("promoted at" in log and "on timeline" in log, "and said where it was promoted")
+    started(running)
+    took = time.time() - began
+    s.check(probe_rows() == held_at_the_time and len(held_at_the_time.splitlines()) == 3,
+            "row for row as it stood at the time: the three before it, none after")
+    s.check(held()["book"] == before["book"], "the book as it was")
+    # The region row (ruling 1048: a region lost, back within 2 h); what a
+    # restore into a new cluster can lose is what the archive had not yet
+    # taken, at most backup.walArchive.timeoutSeconds (60 s here, 5 min asked).
+    claim(s, "restore-to-time", "database", took, 7200, {"rpo_s": 60, "rpo_bound_s": 300})
+    timeline = psql("select timeline_id from pg_control_checkpoint()")
+    s.check(timeline not in ("", "1"), f"on a timeline of its own ({timeline})")
+    wait_for("the archive to take the new timeline", lambda: archive_said("the stanza holds this database"),
+             seconds=60)
+
+
+def checksums_enabled(s, before):
+    print("K: page checksums turned on in a database made without them", flush=True)
+    s.check(psql("show data_checksums") == "on", "a database this chart makes has page checksums")
+    rows = probe_rows()
+    running = deployments()
+    stopped(running)
+    # A database made before step 3b, as `meridian upgrade-deployment` finds
+    # one: its checksums turned off here, on the stopped volume.
+    pod = {
+        "apiVersion": "v1", "kind": "Pod",
+        "metadata": {"name": "e2e-checksums-off", "namespace": NAMESPACE},
+        "spec": {
+            "restartPolicy": "Never",
+            "containers": [{"name": "off", "image": POSTGRES_IMAGE, "imagePullPolicy": "IfNotPresent",
+                            "command": ["su-exec", "postgres", "pg_checksums", "--disable",
+                                        "-D", "/var/lib/postgresql/data/pgdata"],
+                            "volumeMounts": [{"name": "data", "mountPath": "/var/lib/postgresql/data"}]}],
+            "volumes": [{"name": "data", "persistentVolumeClaim": {"claimName": f"data-{FULL}-database-0"}}],
+        },
+    }
+    kubectl("create", "-f", "-", input=json.dumps(pod).encode())
+    wait_for("the checksums to be turned off", lambda: out(
+        "get", "pod", "e2e-checksums-off", "-o", "jsonpath={.status.phase}") in ("Succeeded", "Failed"), seconds=180)
+    s.check(out("get", "pod", "e2e-checksums-off", "-o", "jsonpath={.status.phase}") == "Succeeded",
+            "page checksums turned off on the stopped volume, as a database made before 3b has none")
+    kubectl("delete", "pod", "e2e-checksums-off", "--wait")
+    began = time.time()
+    ok, log = offline("enable-checksums")
+    took = time.time() - began
+    s.check(ok and "page checksums enabled" in log, "the offline Job turned page checksums on")
+    size = re.search(r"checksums on (\d+) KiB", log)
+    claim(s, "enable-checksums", "database", took, None, {"database_kib": int(size.group(1)) if size else 0})
+    again, log = offline("enable-checksums")
+    s.check(again and "on already" in log, "and a second run finds them on and changes nothing")
+    started(running)
+    s.check(psql("show data_checksums") == "on", "the database reports page checksums on")
+    s.check(probe_rows() == rows and held()["book"] == before["book"], "every row as it was")
 
 
 def verdict(s):

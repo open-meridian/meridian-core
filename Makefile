@@ -825,7 +825,11 @@ e2e-cluster-k3d:
 # restored): a deployment with people, access, settings with a secret sealed,
 # and a book, backed up by the chart's CronJob on its schedule and by
 # `meridian backup --to`, wiped as a reset of the cluster wipes it, restored by
-# `meridian restore`, and held to what it was (e2e/backup/run.py). The real
+# `meridian restore`, and held to what it was (e2e/backup/run.py). With its WAL
+# archived (step 3b): restored in place to a time between two commits and held
+# to it row for row, and page checksums turned on in a database without them,
+# each the offline Job's act the CLI drives, timed into .e2e-backup-claims.jsonl.
+# The real
 # CLI, built from meridian-cli beside this checkout; the backup image from
 # deploy/backup. No platform and no Ingress.
 #
@@ -844,12 +848,15 @@ e2e-cluster-backup: backup-cli-image $(if $(E2E_BACKUP_RUNTIME),,runtime-image a
 	@ctx="$$(kubectl config current-context 2>/dev/null)"; \
 	case "$$ctx" in k3d-*|kind-*) ;; \
 	*) echo "e2e-cluster-backup: the kube context is '$$ctx', which is not a k3d or kind cluster's. It installs, wipes and restores: run it on a cluster made for it, make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-backup" >&2; exit 1;; esac
-	@echo "e2e-cluster-backup: building the backup image"
+	@echo "e2e-cluster-backup: building the backup image, and the database's with pgBackRest for its WAL archive"
 	@$(DOCKER) build -q -t $(E2E_BACKUP_IMAGE) deploy/backup >/dev/null
-	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(or $(E2E_BACKUP_RUNTIME),$(RUNTIME_IMAGE)) $(if $(E2E_BACKUP_RUNTIME),,$(ANALYTICS_IMAGE)) $(E2E_BACKUP_IMAGE) postgres:16-alpine,:)
+	@$(DOCKER) build -q -t $(E2E_POSTGRES_IMAGE) deploy/database >/dev/null
+	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(or $(E2E_BACKUP_RUNTIME),$(RUNTIME_IMAGE)) $(if $(E2E_BACKUP_RUNTIME),,$(ANALYTICS_IMAGE)) $(E2E_BACKUP_IMAGE) $(E2E_POSTGRES_IMAGE) postgres:16-alpine,:)
 	@kubectl delete namespace $(E2E_BACKUP_NAMESPACE) --ignore-not-found --wait >/dev/null 2>&1
+	@rm -f .e2e-backup-claims.jsonl
 	@E2E_NAMESPACE=$(E2E_BACKUP_NAMESPACE) E2E_IMAGE=$(or $(E2E_BACKUP_RUNTIME),$(RUNTIME_IMAGE)) \
 	 E2E_BACKUP_IMAGE=$(E2E_BACKUP_IMAGE) E2E_CLI_IMAGE=$(E2E_BACKUP_CLI_IMAGE) E2E_WORKDIR="$(CURDIR)" \
+	 E2E_POSTGRES_IMAGE=$(E2E_POSTGRES_IMAGE) \
 		$(PY) e2e/backup/run.py; \
 	  held=$$?; \
 	  if [ $$held -ne 0 ] || [ -n "$(E2E_CLUSTER_KEEP)" ]; then \

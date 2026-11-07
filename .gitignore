@@ -47,6 +47,10 @@ deploy/nats/dev.conf
 
 # Written by `make e2e-cluster-backup` while it runs: an identity and a backup.
 meridian-backup-e2e-*/
+# The cluster runs' measurements, kept for the claims ledger (CI keeps each
+# as an artifact).
+.e2e-failover-claims.jsonl
+.e2e-backup-claims.jsonl
 
 # Written by `make ci-local` while it runs: the gate's disk samples and stages
 # (tools/gate.py).
