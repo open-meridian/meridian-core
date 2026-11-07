@@ -11,7 +11,7 @@ DOCKER := DOCKER_BUILDKIT=1 docker
 
 .PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check licence-check-test gate-start check-leftovers check-leftovers-end \
         gate-mark-tests ci-stage images runtime-images test-images ci-images runtime-image analytics-image harness-image interop-image version-check-image tests-image settings-binary-image backup-cli-image stage-checks stage-images stage-compile stage-tests stage-settings-page stage-sdk stage-dashboards stage-harness stage-first-run stage-image stage-lint \
-        e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external e2e-cluster-backup \
+        e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external e2e-cluster-backup e2e-cluster-reconfigure \
         test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-service-account e2e-lake e2e-recorded e2e-orders e2e-one-id e2e-harness \
         build test test-store check-image-version chart-check check-crate-boundaries check-one-clock check-test-targets check-local-storage \
         interop e2e-book check-reference-cases reference-cases prompt-attacks lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-first-run claims-check claims-ledger
@@ -925,6 +925,19 @@ FAILURE ?=
 E2E_POSTGRES_IMAGE ?= meridian-postgres:local
 e2e-cluster-scaled:
 	@$(MAKE) --no-print-directory e2e-cluster-failover PROFILE=scaled FAILURE=
+
+# A live install moved between the profiles (step 3b part 3; spec section
+# 15): installed tolerant, with its key in a Secret as ha needs (1074), then
+# `resilience.profile` set to ha and back by an upgrade, as `meridian
+# upgrade-deployment --set` sets it, under commits through the database's
+# Service: every member in each shape and ready, each store's change log
+# kept as it was, the record's properties held, and every acknowledged
+# commit kept. Three agents in zones, as the HA runs:
+#
+#   make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-reconfigure \
+#     E2E_K3D_AGENTS=3 E2E_K3D_ZONES="zone-a zone-b zone-c"
+e2e-cluster-reconfigure:
+	@$(MAKE) --no-print-directory e2e-cluster-failover PROFILE=reconfigure FAILURE=
 
 e2e-cluster-failover: $(if $(E2E_FAILOVER_RUNTIME),,runtime-image analytics-image)
 	@ctx="$$(kubectl config current-context 2>/dev/null)"; \

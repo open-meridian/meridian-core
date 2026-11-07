@@ -64,6 +64,9 @@ IMAGE = os.environ["E2E_IMAGE"]
 POSTGRES_IMAGE = os.environ.get("E2E_POSTGRES_IMAGE", "meridian-postgres:local")
 CHART = os.path.abspath(os.environ.get("E2E_CHART", "deploy/chart"))
 PROFILE = os.environ.get("PROFILE", "tolerant")
+# The shape the install is in now: the profile's, except while
+# e2e-cluster-reconfigure moves a live install from one to the other.
+SHAPE = {"reconfigure": "tolerant"}.get(PROFILE, PROFILE)
 CLAIMS = os.environ.get("E2E_FAILOVER_CLAIMS", ".e2e-failover-claims.jsonl")
 CLUSTER = os.environ.get("E2E_K3D_CLUSTER", "meridian-e2e")
 ADMIN = "local|alice"
@@ -83,6 +86,10 @@ HA_DATABASE = {"bor": 30, "lake": 30}
 # over within 2 min.
 HA_ZONE = 120
 
+# The live install moved between the profiles, in order (e2e-cluster-
+# reconfigure): up to ha, and back.
+RECONFIGURE = ["ha", "tolerant"]
+
 DEFAULT_FAILURES = {
     "tolerant": ["lake-writer", "bor-writer", "network-policy", "db-primary", "broker",
                  "bit-rot", "torn-write"],
@@ -90,6 +97,7 @@ DEFAULT_FAILURES = {
            "split-brain", "node-freeze", "node", "zone", "network-policy", "db-primary", "broker",
            "bit-rot", "torn-write", "volume-lost"],
     "scaled": [],
+    "reconfigure": [],
 }
 
 
@@ -170,7 +178,7 @@ def psql(sql, database="meridian", quiet=False, pod=None):
 
 
 def database_members():
-    return 3 if PROFILE in ("ha", "scaled") else 1
+    return 3 if SHAPE in ("ha", "scaled") else 1
 
 
 def pods(component):
@@ -299,6 +307,12 @@ def server_node():
     return nodes()[0]["metadata"]["name"]
 
 
+def broker_set():
+    """The broker's StatefulSet: named by what it keeps on disk, so the set
+    with JetStream's volumes (the HA profiles) is a set of its own."""
+    return f"{FULL}-broker-jetstream" if SHAPE in ("ha", "scaled") else f"{FULL}-broker"
+
+
 def install(s):
     repository, _, tag = IMAGE.rpartition(":")
     values = [
@@ -309,9 +323,10 @@ def install(s):
         # renders only beside it.
         "--set", "pluginStorage.enabled=false",
     ]
-    if PROFILE in ("ha", "scaled"):
+    if PROFILE in ("ha", "scaled", "reconfigure"):
         # The conductor's standby needs the key as a Secret: the generated
-        # one's volume attaches to one node.
+        # one's volume attaches to one node. A tolerant install that is to
+        # be turned up to ha has it there from the start (ruling 1074).
         workdir = tempfile.mkdtemp(prefix="failover-key-")
         key = os.path.join(workdir, "key.pem")
         run("openssl", "genpkey", "-algorithm", "ed25519", "-out", key)
@@ -322,7 +337,8 @@ def install(s):
         # The HA preset in one value (step 3b): a standby per writer, the
         # database with two standbys, the broker at three with JetStream,
         # the dashboard and analytics at two.
-        values += ["--set", "resilience.profile=ha"]
+        if PROFILE != "reconfigure":
+            values += ["--set", "resilience.profile=ha"]
         values += ["--set", "zones={" + ",".join(ZONES) + "}"]
         values += ["--set", f"database.brought.patroniImage={POSTGRES_IMAGE}"]
     run("helm", "install", RELEASE, CHART, "--namespace", NAMESPACE, "--create-namespace", *values)
@@ -340,15 +356,15 @@ def install(s):
         # The broker's servers are made at install, each with JetStream's
         # volume on the node it landed on: stopped, their claims let go,
         # and made again on the server node, before anything has used them.
-        servers = json.loads(out("get", "statefulset", f"{FULL}-broker", "-o", "json"))["spec"]["replicas"]
-        kubectl("scale", "statefulset", f"{FULL}-broker", "--replicas=0")
+        servers = json.loads(out("get", "statefulset", broker_set(), "-o", "json"))["spec"]["replicas"]
+        kubectl("scale", "statefulset", broker_set(), "--replicas=0")
         wait_for("the broker's servers stopped", lambda: not out(
             "get", "pods", "-l", f"app.kubernetes.io/instance={RELEASE},meridian.dev/component=broker",
             "-o", "name"), seconds=180)
         kubectl("delete", "pvc", "--ignore-not-found", "--wait", "--timeout=120s",
-                *[f"jetstream-{FULL}-broker-{i}" for i in range(servers)])
-        kubectl("patch", "statefulset", f"{FULL}-broker", "--type", "merge", "-p", pin)
-        kubectl("scale", "statefulset", f"{FULL}-broker", f"--replicas={servers}")
+                *[f"jetstream-{broker_set()}-{i}" for i in range(servers)])
+        kubectl("patch", "statefulset", broker_set(), "--type", "merge", "-p", pin)
+        kubectl("scale", "statefulset", broker_set(), f"--replicas={servers}")
         cluster_services_on_server()
 
 
@@ -447,7 +463,7 @@ def all_ready():
 
 def members_settled(component):
     """Every member running and ready: two with a standby."""
-    want = 2 if PROFILE in ("ha", "scaled") else 1
+    want = 2 if SHAPE in ("ha", "scaled") else 1
     live = pods(component)
     return len(live) == want and all(ready(p) for p in live)
 
@@ -549,8 +565,8 @@ def jetstream_rolled(s):
     makes or finds its stream at three, rather than going by the queue
     group. CI 42294258528: with the stream in memory, a roll left the three
     answering "no suitable peers for placement" for twelve minutes."""
-    kubectl("rollout", "restart", f"statefulset/{FULL}-broker")
-    rolled = kubectl("rollout", "status", f"statefulset/{FULL}-broker", "--timeout=300s",
+    kubectl("rollout", "restart", f"statefulset/{broker_set()}")
+    rolled = kubectl("rollout", "status", f"statefulset/{broker_set()}", "--timeout=300s",
                      check=False).returncode == 0
     s.check(rolled, "broker: its servers restarted one at a time")
     parts = ("analytics-coordinator", "analytics-worker")
@@ -1164,6 +1180,116 @@ def zone_lost(s):
     s.check(healed, f"zone: zone {zone}'s members back, as standbys")
 
 
+# ── e2e-cluster-reconfigure: a live install moved between the profiles ────
+
+# Commits through the database's Service for the whole move, from a pod of
+# its own (every member the move restarts is not one to write from), each
+# acknowledged id printed, the connection made again after a refusal.
+LONG_WRITER = r"""
+export PGPASSWORD="$POSTGRES_PASSWORD"
+while [ ! -e /tmp/stop ]; do
+  id=$(psql -X -q -At -h HOST -U postgres -d meridian -v ON_ERROR_STOP=1 \
+       -c "insert into failover_marks (at) values (clock_timestamp()) returning id" 2>/dev/null) \
+    && echo "ACKED $id"
+  sleep 0.2
+done
+echo DONE
+"""
+
+
+def long_writer():
+    host = f"{FULL}-database.{NAMESPACE}.svc.cluster.local"
+    pod = {
+        "apiVersion": "v1", "kind": "Pod",
+        "metadata": {"name": "e2e-writer", "namespace": NAMESPACE,
+                     "labels": {"app.kubernetes.io/instance": RELEASE}},
+        "spec": {
+            "restartPolicy": "Never",
+            "nodeSelector": {"kubernetes.io/hostname": server_node()},
+            "containers": [{
+                "name": "writer", "image": POSTGRES_IMAGE, "imagePullPolicy": "IfNotPresent",
+                "command": ["sh", "-c", LONG_WRITER.replace("HOST", host)],
+                "env": [{"name": "POSTGRES_PASSWORD", "valueFrom": {"secretKeyRef": {
+                    "name": f"{FULL}-database-passwords", "key": "superuser"}}}],
+            }],
+        },
+    }
+    kubectl("create", "-f", "-", input=json.dumps(pod).encode())
+    wait_for("the writer to commit", lambda: "ACKED" in out("logs", "e2e-writer", check=False), seconds=120)
+
+
+def long_writer_acknowledged():
+    kubectl("exec", "e2e-writer", "--", "touch", "/tmp/stop")
+    wait_for("the writer to stop", lambda: "DONE" in out("logs", "e2e-writer", check=False), seconds=60)
+    said = out("logs", "e2e-writer")
+    kubectl("delete", "pod", "e2e-writer", "--wait")
+    return {int(line.split()[1]) for line in said.splitlines()
+            if line.startswith("ACKED ") and line.split()[1].isdigit()}
+
+
+def record_now():
+    """Each store's change log as it stands, by partition: its sequences
+    and epochs, which a move between profiles must keep as they were."""
+    held = {}
+    for store, table, partition, first, last, _ in CHANGE_LOGS:
+        held[store] = psql(f"select {partition} || ':' || {first} || '-' || {last} || '@' || epoch "
+                           f"from {table} order by 1")
+    return held
+
+
+def settled_everywhere():
+    if not all_ready():
+        return False
+    if not all(members_settled(c) for c in STORES):
+        return False
+    database = pods("database")
+    if len(database) != database_members() or not all(ready(p) for p in database):
+        return False
+    servers = [p for p in pods("broker") if p["metadata"]["labels"].get("meridian.dev/broker-set") == broker_set()]
+    return len(servers) == (3 if SHAPE == "ha" else 1) and all(ready(p) for p in servers) \
+        and len(pods("broker")) == len(servers)
+
+
+def reconfigure(s):
+    global SHAPE
+    print("R: the live install moved between the profiles, under commits", flush=True)
+    marks_table()
+    long_writer()
+    for target in RECONFIGURE:
+        before = record_now()
+        print(f"R: {SHAPE} -> {target}, by the value `meridian upgrade-deployment --set` gives", flush=True)
+        began = time.time()
+        upgraded = run("helm", "upgrade", RELEASE, CHART, "--namespace", NAMESPACE, "--reuse-values",
+                       "--set", f"resilience.profile={target}", check=False)
+        s.check(upgraded.returncode == 0, f"reconfigure: helm upgrade to {target} applied"
+                + ("" if upgraded.returncode == 0 else f": {upgraded.stderr.decode(errors='replace')[-400:]}"))
+        if upgraded.returncode != 0:
+            return
+        SHAPE = target
+        if target == "tolerant":
+            # Back to one database member: Patroni keeps running it (a
+            # database once under Patroni stays there), its standbys' pods
+            # gone and their volumes kept.
+            pass
+        settled = happens(settled_everywhere, 900, every=5)
+        took = time.time() - began
+        s.check(settled, f"reconfigure: every member in the {target} shape and ready, {took:.0f}s after the upgrade")
+        if not settled:
+            for component in STORES:
+                explain(s, f"reconfigure to {target}", component)
+            return
+        claim(s, f"reconfigure-{target}", "deployment", took, None, {"from": "tolerant" if target == "ha" else "ha"})
+        after = record_now()
+        kept = all(after[store].startswith(before[store]) for store in before)
+        s.check(kept, f"reconfigure: each store's change log as it was before the move, added to and nothing else")
+        properties(s, f"reconfigure to {target}")
+    acked = long_writer_acknowledged()
+    kept = {int(i) for i in psql("select id from failover_marks").split()}
+    lost = sorted(acked - kept)
+    s.check(acked and not lost, f"reconfigure: every acknowledged commit kept across both moves "
+            f"({len(acked)} acknowledged, {len(lost)} lost{': ' + ', '.join(map(str, lost[:5])) if lost else ''})")
+
+
 # ── The record's properties, held after every class (ruling 1105) ─────────
 
 # Each store's change log: its table, how a row names its partition and its
@@ -1250,7 +1376,7 @@ def main():
     unknown = [f for f in failures if f not in FAILURES]
     if unknown:
         raise SystemExit(f"no such failure class: {', '.join(unknown)}; one of {', '.join(FAILURES)}")
-    if PROFILE in ("ha", "scaled"):
+    if PROFILE in ("ha", "scaled", "reconfigure"):
         agents = [n for n in nodes() if "topology.kubernetes.io/zone" in n["metadata"].get("labels", {})]
         if len(agents) < 3:
             raise SystemExit("the HA profile needs three agents labelled into zones: "
@@ -1261,6 +1387,11 @@ def main():
     if PROFILE in ("ha", "scaled"):
         shape(s)
     properties(s, "the install")
+    if PROFILE == "reconfigure":
+        try:
+            reconfigure(s)
+        except SystemExit as stopped:
+            s.check(False, f"reconfigure: {stopped}")
     for failure in failures:
         try:
             FAILURES[failure](s)

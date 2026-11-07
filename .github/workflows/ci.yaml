@@ -615,6 +615,9 @@ jobs:
           # profiles, each recovery timed against its bound (1048, 1056).
           - target: e2e-cluster-scaled
             agents: 3
+          # A live install moved tolerant -> ha -> tolerant under commits.
+          - target: e2e-cluster-reconfigure
+            agents: 3
           - target: e2e-cluster-failover
             profile: tolerant
           - target: e2e-cluster-failover
@@ -714,11 +717,11 @@ jobs:
             PROFILE="$PROFILE" E2E_K3D_AGENTS="$AGENTS" E2E_K3D_ZONES="$zones"
 
       - name: Keep the failure classes' measurements
-        if: matrix.target == 'e2e-cluster-failover' && !cancelled()
+        if: (matrix.target == 'e2e-cluster-failover' || matrix.target == 'e2e-cluster-reconfigure') && !cancelled()
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: failover-claims-${{ matrix.profile }}
+          name: ${{ matrix.target == 'e2e-cluster-reconfigure' && 'reconfigure-claims' || format('failover-claims-{0}', matrix.profile) }}
           path: workspace/meridian-core/.e2e-failover-claims.jsonl
           include-hidden-files: true
           if-no-files-found: warn
