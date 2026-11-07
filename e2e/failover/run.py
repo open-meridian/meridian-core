@@ -31,7 +31,15 @@ not the database, by packets dropped on its node, established connections
 included: it steps down before its lease ends, the standby takes over, and
 nothing it writes is kept); `node` (the writer's node stopped);
 `network-policy` (a component cut from its database by a NetworkPolicy: the
-probe names the path and its address, and it heals with no restart).
+probe names the path and its address, and it heals with no restart);
+`zone` (HA only: every node of the zone holding the most writers stopped at
+once; every store answers again from another zone within the zone tier).
+
+After the install and after every class, the record's own properties are
+held (ruling 1105): in each store's change log no sequence missing or
+taken twice, no epoch going back along the sequence (a fenced writer's
+commit never kept after its successor's), and every epoch above the first
+raised by a takeover the store recorded, one per epoch, none skipped.
 
 Each measurement is printed as a claims line (`CLAIM {json}`) and kept in
 .e2e-failover-claims.jsonl beside the checkout, with the command and the
@@ -71,12 +79,15 @@ HA = {"bor": 10, "street": 10, "instrument": 10, "conductor": 10, "launcher": 10
 # The database tier (1048): the record's commits back within 30 s of the
 # primary lost, RPO 0; the lake within 30 s.
 HA_DATABASE = {"bor": 30, "lake": 30}
+# The zone tier (1048): a zone's node pool lost, every member there taken
+# over within 2 min.
+HA_ZONE = 120
 
 DEFAULT_FAILURES = {
     "tolerant": ["lake-writer", "bor-writer", "network-policy", "db-primary", "broker",
                  "bit-rot", "torn-write"],
     "ha": ["lake-writer", "bor-writer", "street-writer", "instrument-writer",
-           "split-brain", "node-freeze", "node", "network-policy", "db-primary", "broker",
+           "split-brain", "node-freeze", "node", "zone", "network-policy", "db-primary", "broker",
            "bit-rot", "torn-write", "volume-lost"],
     "scaled": [],
 }
@@ -1094,6 +1105,113 @@ def volume_lost(s):
         claim(s, "volume-lost", "database", took, 300, {"member": standby, "re_cloned": True})
 
 
+# ── The zone class ────────────────────────────────────────────────────────
+
+def zone_lost(s):
+    """Every node of one zone stopped at once: the zone holding the most
+    writers, so as many stores as can lose their writer together do. The
+    database's members and the broker's servers are on the server node in
+    this profile (their classes are their own), so what is measured is the
+    stores' members' loss. Every store answers again within the zone tier,
+    each from a member outside the zone, at a raised epoch where its writer
+    was there."""
+    print("F: zone: every node of one zone stopped at once, the zone holding the most writers", flush=True)
+    for component in STORES:
+        wait_for(f"{component} settled", lambda c=component: members_settled(c), seconds=300)
+    writers = {c: writer_pod(c) for c in STORES}
+    by_zone = {}
+    for component, pod in writers.items():
+        if pod:
+            by_zone.setdefault(zone_of(node_of(pod)), []).append(component)
+    zone, there = max(by_zone.items(), key=lambda held: len(held[1]))
+    lost = [n["metadata"]["name"] for n in nodes()
+            if n["metadata"].get("labels", {}).get("topology.kubernetes.io/zone") == zone]
+    epochs = {c: epoch_now(c) for c in there if c != "launcher"}
+    s.note(f"zone {zone}: {', '.join(lost)}; the writers there: {', '.join(sorted(there))}")
+    began = time.time()
+    for node in lost:
+        run("docker", "stop", "--time", "0", node)
+    took = {}
+
+    def one(component):
+        avoid = tuple(p["metadata"]["name"] for p in pods(component) if p["spec"].get("nodeName") in lost)
+        return answering(component, avoid=avoid, above_epoch=epochs.get(component)) is not None
+
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=len(STORES)) as asking:
+            def back():
+                left = [c for c in STORES if c not in took]
+                for component, answered in zip(left, asking.map(one, left)):
+                    if answered:
+                        took[component] = time.time() - began
+                return len(took) == len(STORES)
+            happens(back, HA_ZONE + 30, every=0.5)
+    finally:
+        for node in lost:
+            run("docker", "start", node)
+    for component in STORES:
+        if component not in took:
+            s.check(False, f"zone: {component} never answered again from outside zone {zone} within {HA_ZONE + 30}s")
+            explain(s, "zone", component)
+            continue
+        claim(s, "zone", component, took[component], HA_ZONE,
+              {"zone": zone, "nodes": len(lost), "writer_in_zone": component in there})
+    wait_for("the zone's nodes back", lambda: all(
+        any(c["type"] == "Ready" and c["status"] == "True" for c in n["status"]["conditions"])
+        for n in nodes()), seconds=300)
+    healed = all(happens(lambda c=component: members_settled(c), 300) for component in STORES)
+    s.check(healed, f"zone: zone {zone}'s members back, as standbys")
+
+
+# ── The record's properties, held after every class (ruling 1105) ─────────
+
+# Each store's change log: its table, how a row names its partition and its
+# sequences, and the store's takeovers.
+CHANGE_LOGS = [
+    ("config", "config_change", "partition", "sequence", "sequence", "config_writer_took_over"),
+    ("street", "street_change", "partition", "sequence", "sequence", "street_writer_took_over"),
+    ("instrument", "instrument_change", "partition", "sequence", "sequence", "instrument_writer_took_over"),
+    ("lake", "lake_row", "dataset", "sequence", "sequence", "lake_writer_took_over"),
+    ("lake control", "lake_control_change", "'control'", "sequence", "sequence", "lake_writer_took_over"),
+    ("book", "book_entry", "partition", "first_sequence", "last_sequence", "book_writer_took_over"),
+]
+
+
+def properties(s, after):
+    """The record's own properties, read from each store's change log and
+    its takeovers: no sequence missing or taken twice in a partition (a gap
+    or two writers at one sequence), no epoch going back along the sequence
+    (a fenced writer's commit kept after its successor's), every epoch
+    above the first raised by a recorded takeover, and the takeovers one
+    per epoch with none skipped."""
+    broken = []
+    for store, table, partition, first, last, took in CHANGE_LOGS:
+        said = psql(
+            f"with d as (select distinct {partition} as p, {first} as f, {last} as l, epoch from {table}), "
+            f"c as (select p, f, l, epoch, lag(l) over w as prev_l, lag(epoch) over w as prev_epoch "
+            f"from d window w as (partition by p order by f, l, epoch)) "
+            f"select count(*), "
+            f"count(*) filter (where prev_l is not null and f <> prev_l + 1), "
+            f"count(*) filter (where prev_epoch is not null and epoch < prev_epoch), "
+            f"count(*) filter (where epoch > 1 and epoch not in (select epoch from {took})) "
+            f"from c")
+        rows, gaps, back, unrecorded = (int(x) for x in said.split("|"))
+        if gaps:
+            broken.append(f"{store}: {gaps} sequence(s) missing or taken twice")
+        if back:
+            broken.append(f"{store}: {back} commit(s) at an epoch below one before it")
+        if unrecorded:
+            broken.append(f"{store}: {unrecorded} commit(s) at an epoch no takeover recorded")
+    for store in ("book", "lake", "config", "street", "instrument"):
+        said = psql(f"select count(*), coalesce(max(epoch) - min(epoch) + 1, 0) from {store}_writer_took_over")
+        recorded, spanned = (int(x) for x in said.split("|"))
+        if recorded != spanned:
+            broken.append(f"{store}: {recorded} takeovers recorded over {spanned} epochs")
+    s.check(not broken, f"properties after {after}: each change log whole and in epoch order, "
+            f"each epoch one recorded takeover{': ' + '; '.join(broken) if broken else ''}")
+
+
 FAILURES = {
     "lake-writer": lambda s: kill_writer(s, "lake-writer", "lake"),
     "bor-writer": lambda s: kill_writer(s, "bor-writer", "bor"),
@@ -1110,6 +1228,7 @@ FAILURES = {
     "bit-rot": bit_rot,
     "torn-write": torn_write,
     "volume-lost": volume_lost,
+    "zone": zone_lost,
 }
 
 
@@ -1141,11 +1260,16 @@ def main():
     first_run(s)
     if PROFILE in ("ha", "scaled"):
         shape(s)
+    properties(s, "the install")
     for failure in failures:
         try:
             FAILURES[failure](s)
         except SystemExit as stopped:
             s.check(False, f"{failure}: {stopped}")
+        try:
+            properties(s, failure)
+        except SystemExit as stopped:
+            s.check(False, f"properties after {failure}: the change logs could not be read: {stopped}")
     return verdict(s)
 
 
