@@ -1030,3 +1030,28 @@ jobs:
       - name: make footprint-judge
         working-directory: workspace/meridian-core
         run: make footprint-judge FOOTPRINT_PEAKS="$(find .footprint-peaks -name '*.txt' | sort | tr '\n' ' ')"
+
+  # The claims ledger (366; ruling 1113): every measurement this run's
+  # cluster jobs made held to its bound, and every class the ledger holds
+  # measured again by them, none dropped silently -- a job that failed or
+  # kept nothing fails this by name. The ledger against this run is the
+  # job's summary.
+  claims-check:
+    needs: e2e-cluster-k3d
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: workspace/meridian-core
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: '*-claims*'
+          path: workspace/meridian-core/.claims
+      - name: make claims-check
+        working-directory: workspace/meridian-core
+        run: |
+          files="$(find .claims -name '*.jsonl' 2>/dev/null | sort | tr '\n' ' ')"
+          [ -n "$files" ] || { echo "::error::no cluster job kept its claims, so nothing measured could be held to the ledger"; exit 1; }
+          make claims-check CLAIMS_RUN="$files"

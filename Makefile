@@ -14,7 +14,7 @@ DOCKER := DOCKER_BUILDKIT=1 docker
         e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external e2e-cluster-backup \
         test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-service-account e2e-lake e2e-recorded e2e-orders e2e-one-id e2e-harness \
         build test test-store check-image-version chart-check check-crate-boundaries check-one-clock check-test-targets check-local-storage \
-        interop e2e-book check-reference-cases reference-cases prompt-attacks lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-first-run
+        interop e2e-book check-reference-cases reference-cases prompt-attacks lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-first-run claims-check claims-ledger
 
 help:
 	@echo "  make ci-local       run every gate (the pre-push gate, and what CI mirrors)"
@@ -142,7 +142,7 @@ ifneq ($(filter ci-local ci-local-deep,$(MAKECMDGOALS)),)
 stage-tests stage-settings-page stage-sdk stage-dashboards stage-harness stage-first-run stage-image stage-lint: export IMAGES = built
 endif
 
-stage-checks:     gate-begin-checks check-leftovers contract-diff ci-mirror-check licence-check-test check-crate-boundaries check-one-clock check-test-targets check-local-storage check-codegen advisories chart-check
+stage-checks:     gate-begin-checks check-leftovers contract-diff ci-mirror-check licence-check-test check-crate-boundaries check-one-clock check-test-targets check-local-storage check-codegen advisories chart-check claims-check
 	@$(GATE) end checks
 stage-images:     gate-begin-images runtime-images
 	@$(GATE) end images
@@ -877,6 +877,27 @@ FOOTPRINT_PEAKS ?= $(wildcard .e2e-footprint-peak*.txt)
 footprint-judge:
 	@test -n "$(FOOTPRINT_PEAKS)" || { echo "footprint-judge: no job's peak to judge; set FOOTPRINT_PEAKS=<files>" >&2; exit 1; }
 	@$(PY) tools/footprint.py judge --baseline deploy/footprint-baseline.yaml $(FOOTPRINT_PEAKS)
+
+# The claims ledger (366; ruling 1113; spec/a-deployment-scales-out-and-
+# fails-over-by-configuration section 15): each failure class's recovery as
+# CI's green runs measured it, per profile and component, beside its bound
+# and RPO, in deploy/claims-ledger.json (tools/claims.py). claims-check holds
+# the ledger to its bounds in the gate; CI's claims-check job holds it, and
+# every one of the run's measurements, to them, and fails a class the ledger
+# holds that the run did not measure. claims-ledger writes it again from
+# runs' claims files -- CI keeps each as an artifact (failover-claims-<profile>,
+# backup-claims) -- a reviewed change naming the runs:
+#
+#   gh run download <run> -p 'failover-claims-*' -p backup-claims -D .claims
+#   make claims-ledger CLAIMS="$(find .claims -name '*.jsonl')"
+CLAIMS ?= $(wildcard .e2e-*-claims.jsonl)
+claims-check:
+	@$(PY) tools/claims.py --self-test >/dev/null
+	@$(PY) tools/claims.py check --ledger deploy/claims-ledger.json $(if $(CLAIMS_RUN),--every $(CLAIMS_RUN))
+
+claims-ledger:
+	@test -n "$(CLAIMS)" || { echo "claims-ledger: no runs' claims to write from; set CLAIMS=<files>" >&2; exit 1; }
+	@$(PY) tools/claims.py ledger --out deploy/claims-ledger.json $(CLAIMS)
 
 # Failure classes injected and timed (step 3b; spec/a-deployment-scales-out-
 # and-fails-over-by-configuration sections 10 and 15; plan Track 7): the
