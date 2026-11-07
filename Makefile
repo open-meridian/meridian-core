@@ -2854,6 +2854,19 @@ e2e-book: network interop-image runtime-image
 	@MERIDIAN_DEPLOYMENT_ID=DEP-book $(COMPOSE_TEST) --profile book up -d street instrument conductor bor \
 		sidecar-book sidecar-book-operations sidecar-book-reporting sidecar-book-unscoped >>.e2e-book.log 2>&1 \
 		|| { echo "e2e-book FAILED: the components did not start; see .e2e-book.log" >&2; exit 1; }
+	@# Started is not serving: the suite's first call reached the book a
+	@# second before it served (a local gate, 2026-11-07: "nothing serves
+	@# platform.book.query.list-account-attributes", the book serving 1 s
+	@# later). Each store the suite reaches is waited for until it says it
+	@# serves, at most a minute.
+	@ready=; for i in $$(seq 1 60); do \
+		said="$$($(COMPOSE_TEST) --profile book logs --no-color bor street instrument 2>/dev/null)"; \
+		echo "$$said" | grep -q "the book is serving" \
+			&& echo "$$said" | grep -q "the street store is serving" \
+			&& echo "$$said" | grep -q "the instrument store is serving" && { ready=1; break; }; \
+		sleep 1; \
+	done; \
+	[ -n "$$ready" ] || { echo "e2e-book FAILED: the book, the street store and the instrument store did not all serve within 60 s; see .e2e-book.log" >&2; exit 1; }
 	@# --no-deps, as interop: everything the suite reaches is up already, and a
 	@# run that converged its dependencies could recreate sidecar-book under
 	@# Compose 2.38.x and leave the suite in a namespace nothing answers in.
