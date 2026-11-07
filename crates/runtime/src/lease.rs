@@ -486,4 +486,6 @@ fn first_line(body: &str) -> &str {
 }
 
 #[cfg(test)]
+mod sim;
+#[cfg(test)]
 mod tests;
