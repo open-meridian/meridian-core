@@ -462,14 +462,14 @@ fn run() -> Result<(), String> {
         if let Err(failed) = refresh(&bus, &records, clock.as_ref()).await {
             tracing::warn!("the access records could not be read yet: {failed}");
         }
-        tokio::spawn(refresh_forever(
+        meridian_runtime::background(refresh_forever(
             Arc::clone(&bus),
             Arc::clone(&records),
             clock.clone(),
         ));
         // A delegation's rows recorded before access per role, rewritten once
         // to name each plugin's role, after the first records read (W6.17).
-        tokio::spawn(
+        meridian_runtime::background(
             meridian_dashboard::delegation::rewrite_once_records_are_read(
                 Arc::clone(&delegations),
                 Arc::clone(&records),
@@ -490,7 +490,7 @@ fn run() -> Result<(), String> {
         let sweeping_delegations = Arc::clone(&delegations);
         let sweeping_tickets = Arc::clone(&tickets);
         let sweeping_plugins = plugins.clone();
-        tokio::spawn(async move {
+        meridian_runtime::background(async move {
             let mut every = tokio::time::interval(Duration::from_secs(60));
             loop {
                 every.tick().await;
@@ -517,7 +517,7 @@ fn run() -> Result<(), String> {
                 // rotation is picked up without a restart. A sign-in that
                 // meets a key it does not know also reads them at once.
                 let refreshing = Arc::clone(&oidc);
-                tokio::spawn(async move {
+                meridian_runtime::background(async move {
                     let mut every = tokio::time::interval(Duration::from_secs(15 * 60));
                     every.tick().await;
                     loop {
@@ -585,7 +585,9 @@ fn run() -> Result<(), String> {
         meridian_dashboard::latency::serve(Arc::clone(&app));
         // Its judge: each whole minute, each episode opened or closed a
         // notice to the people it concerns (W4.16; ruling 427).
-        meridian_dashboard::latency::notices::judge_forever(Arc::clone(&app));
+        meridian_runtime::keep(meridian_dashboard::latency::notices::judge_forever(
+            Arc::clone(&app),
+        ));
         // The prepared change a page was opened from, and a person's own
         // settings (W4.14, W6.31, contract v20).
         meridian_dashboard::prepared::serve(Arc::clone(&app));
@@ -601,7 +603,7 @@ fn run() -> Result<(), String> {
         // period, prepared through a delegation that ended, or naming an act
         // set to may not, lapses, each its own record.
         let lapsing = Arc::clone(&app);
-        tokio::spawn(async move {
+        meridian_runtime::background(async move {
             let mut every = tokio::time::interval(Duration::from_secs(60));
             loop {
                 every.tick().await;

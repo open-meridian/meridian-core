@@ -189,7 +189,9 @@ fn run() -> Result<(), String> {
         // W5.20. Said on the bus for the conductor to carry outward. This
         // process holds no key, and giving it one so it could report
         // directly would put the deployment's identity back in a store.
-        tokio::spawn(async move { report_inward_forever(reporting_bus, "instrument", 0).await });
+        meridian_runtime::background(async move {
+            report_inward_forever(reporting_bus, "instrument", 0).await
+        });
 
         tracing::info!(instance_id, "the instrument store is serving");
         ready.serving();
