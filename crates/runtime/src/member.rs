@@ -221,8 +221,14 @@ impl Member {
             }
             tokio::time::sleep(look_every).await;
         }
+        // Stopped, and waited for: a follower aborted mid-poll on another
+        // thread still finished that poll, and its readiness written then
+        // -- mode "standby", maybe not ready -- landed after the writer's
+        // own (a local run: the street's writer served, said "standby"
+        // and the takeover's member set never settled).
         if let Some(following) = following {
             following.abort();
+            let _ = following.await;
         }
         crate::mark_ready(false);
         said().set_lag_ms(0);
