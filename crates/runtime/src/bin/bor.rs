@@ -217,7 +217,7 @@ fn run() -> Result<(), String> {
         // before resolved once and said to be filled in.
         // Read from the store, which blocks: off the runtime's own threads.
         tokio::task::block_in_place(|| meridian_bor::cash::load(store.as_ref()));
-        tokio::spawn(meridian_bor::cash::sweep_forever(
+        meridian_runtime::background(meridian_bor::cash::sweep_forever(
             bus.clone(),
             Arc::clone(&store),
             meridian_bor::cash::SWEEP_EVERY,
@@ -225,11 +225,11 @@ fn run() -> Result<(), String> {
 
         // W9.9: subscribed before this returns; only the following is
         // spawned. And swept, for a replacement said while this was away.
-        tokio::spawn(meridian_bor::service::follow_replacements(
+        meridian_runtime::background(meridian_bor::service::follow_replacements(
             bus.clone(),
             Arc::clone(&store),
         ));
-        tokio::spawn(meridian_bor::service::sweep_forever(
+        meridian_runtime::background(meridian_bor::service::sweep_forever(
             bus.clone(),
             Arc::clone(&store),
             meridian_bor::service::SWEEP_EVERY,
@@ -257,7 +257,7 @@ fn run() -> Result<(), String> {
             ),
             Err(failed) => tracing::warn!(%failed, "the waiting backfill failed"),
         }
-        tokio::spawn(meridian_bor::order_service::expire_forever(
+        meridian_runtime::background(meridian_bor::order_service::expire_forever(
             bus.clone(),
             Arc::clone(&store),
             meridian_bor::order_service::EXPIRE_EVERY,
@@ -317,12 +317,12 @@ fn run() -> Result<(), String> {
         // Contract v29 (W11.11; ruling 992): the factors a pool's fills
         // await, read from the lake on start and every quarter hour, each
         // published one revised as the book's own record.
-        tokio::spawn(meridian_bor::factors::sweep_forever(
+        meridian_runtime::background(meridian_bor::factors::sweep_forever(
             bus.clone(),
             Arc::clone(&store),
             meridian_bor::factors::SWEEP_EVERY,
         ));
-        tokio::spawn(meridian_bor::booking_service::sweep_forever(
+        meridian_runtime::background(meridian_bor::booking_service::sweep_forever(
             bus.clone(),
             Arc::clone(&store),
             meridian_bor::booking_service::SWEEP_EVERY,
@@ -331,7 +331,7 @@ fn run() -> Result<(), String> {
         // Contract v26 (W11.34): the affirmation deadline and the
         // deployment's time zone, read from the conductor now and again, for
         // a held booking's due_by.
-        tokio::spawn(meridian_bor::deadline::follow_forever(
+        meridian_runtime::background(meridian_bor::deadline::follow_forever(
             bus.clone(),
             meridian_bor::deadline::READ_EVERY,
         ));
@@ -339,7 +339,9 @@ fn run() -> Result<(), String> {
         // W5.20, said on the bus for the instrument store to carry outward.
         let reporting = bus.clone();
         let schema = meridian_bor::migrations::latest();
-        tokio::spawn(async move { report_inward_forever(reporting, "bor", schema).await });
+        meridian_runtime::background(async move {
+            report_inward_forever(reporting, "bor", schema).await
+        });
 
         tracing::info!(instance_id, started_at_ns = now_ns(), "the book is serving");
         ready.serving();

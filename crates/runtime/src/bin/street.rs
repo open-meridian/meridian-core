@@ -184,7 +184,7 @@ fn run() -> Result<(), String> {
         // instrument store did not answer for.
         // Read from the store, which blocks: off the runtime's own threads.
         tokio::task::block_in_place(|| meridian_street::cash::load(store.as_ref()));
-        tokio::spawn(meridian_street::cash::sweep_forever(
+        meridian_runtime::background(meridian_street::cash::sweep_forever(
             bus.clone(),
             Arc::clone(&store),
             meridian_street::cash::SWEEP_EVERY,
@@ -192,21 +192,21 @@ fn run() -> Result<(), String> {
 
         // W3.9. Subscribed before this returns, like the handlers above;
         // only the moving is spawned.
-        tokio::spawn(meridian_street::service::follow_replacements(
+        meridian_runtime::background(meridian_street::service::follow_replacements(
             bus.clone(),
             Arc::clone(&store),
         ));
 
         // W2.13 (contract v14): every custody plugin's sync status, kept
         // and announced. Subscribed before this returns, as above.
-        tokio::spawn(meridian_street::service::follow_sync_statuses(
+        meridian_runtime::background(meridian_street::service::follow_sync_statuses(
             bus.clone(),
             Arc::clone(&store),
         ));
 
         // And asked about, for a replacement said while this process was
         // not listening.
-        tokio::spawn(meridian_street::service::sweep_forever(
+        meridian_runtime::background(meridian_street::service::sweep_forever(
             bus.clone(),
             Arc::clone(&store),
             clock(),
@@ -219,7 +219,9 @@ fn run() -> Result<(), String> {
         // the whole deployment.
         let reporting = bus.clone();
         let schema = meridian_street::migrations::latest();
-        tokio::spawn(async move { report_inward_forever(reporting, "street", schema).await });
+        meridian_runtime::background(async move {
+            report_inward_forever(reporting, "street", schema).await
+        });
 
         tracing::info!(
             instance_id,

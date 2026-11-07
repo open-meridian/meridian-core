@@ -189,9 +189,11 @@ fn run() -> Result<(), String> {
         // the component's health and schema, never a row or a dataset.
         let reporting = bus.clone();
         let schema = meridian_lake::migrations::latest();
-        tokio::spawn(async move { report_inward_forever(reporting, "lake", schema).await });
+        meridian_runtime::background(async move {
+            report_inward_forever(reporting, "lake", schema).await
+        });
         // Its own hop's ages, to the monitor (W4.16; ruling 606).
-        tokio::spawn(meridian_runtime::report_latency_forever(bus.clone()));
+        meridian_runtime::background(meridian_runtime::report_latency_forever(bus.clone()));
 
         tracing::info!(
             instance_id,

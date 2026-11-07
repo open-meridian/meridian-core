@@ -1051,15 +1051,32 @@ def bit_rot(s):
     # page fails its checksum, loudly, and the scrub records it.
     node, path = relation_file("config_change")
     CORRUPTED.add("config_change")
+    member = primary()
     kubectl("scale", "statefulset", f"{FULL}-database", "--replicas=0")
-    wait_for("the database stopped", lambda: not pods("database"), seconds=180)
+    # Gone, not going: a pod being deleted is not among pods(), and the flip
+    # once landed while Postgres was still in its shutdown checkpoint, which
+    # wrote the page the alteration above had dirtied back over it (#92's
+    # merge-queue run 42418064524: shut down cleanly at 22:09:33, the flip
+    # within that second, and the page read back whole by the select and the
+    # scrub alike).
+    wait_for("the database's pod gone", lambda: kubectl(
+        "get", "pod", member, check=False).returncode != 0, seconds=180)
+    flipped = "ffffffff"
     run("docker", "exec", node, "sh", "-c",
         f"printf '\\377\\377\\377\\377' | dd of='{path}' bs=1 seek=4000 conv=notrunc 2>/dev/null")
     kubectl("scale", "statefulset", f"{FULL}-database", "--replicas=1")
     wait_for("the database back", lambda: pods("database") and all(ready(p) for p in pods("database"))
              and psql("select 1", database="postgres") == "1", seconds=300)
+    # The bytes still flipped on disk once it serves: nothing wrote the page
+    # again (a crash recovery replaying its full-page image would have).
+    on_disk = run("docker", "exec", node, "sh", "-c",
+                  f"dd if='{path}' bs=1 skip=4000 count=4 2>/dev/null | od -An -tx1 | tr -d ' \\n'",
+                  check=False).stdout.decode().strip()
+    s.check(on_disk == flipped, f"bit-rot: the flipped bytes are on disk as the database serves ({on_disk or 'unread'})")
+    # Read through the heap, whatever the plan: count(body) needs every
+    # tuple's body, which no index holds.
     refused = kubectl("exec", primary(), "-c", "postgres", "--", "psql", "-X", "-At", "-U", "postgres",
-                      "-d", "meridian", "-c", "select count(*) from config_change", check=False)
+                      "-d", "meridian", "-c", "select count(body) from config_change", check=False)
     s.check(refused.returncode != 0 and b"invalid page" in refused.stderr,
             "bit-rot: a page whose byte was flipped fails its checksum when read")
     wait_for("conductor settled", lambda: answering("conductor"), seconds=300)
