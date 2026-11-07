@@ -695,3 +695,207 @@ postgresql:
     max_replication_slots: 10
     wal_keep_size: 128MB
 {{- end -}}
+
+{{/*
+The brought database's WAL archive (values.yaml's backup.walArchive; step
+3b, spec/a-deployment-scales-out-and-fails-over-by-configuration sections 4
+and 9): "true" where it is on, once what cannot stand is refused; nothing
+where it is off. Takes the chart.
+*/}}
+{{- define "meridian-runtime.walArchive" -}}
+{{- $b := .Values.backup | default dict -}}
+{{- $w := $b.walArchive | default dict -}}
+{{- if $w.enabled -}}
+{{- if not .Values.database.brought.enabled -}}
+{{- fail "backup.walArchive is on and the database is not one this chart brings. An external database's point-in-time recovery is its provider's own (spec section 4): turn the archive on there." -}}
+{{- end -}}
+{{- if not (and $b.recipient (or $b.path $b.existingClaim)) -}}
+{{- fail "backup.walArchive is on without backups: its base backups are taken with each backup, and the passphrase it is encrypted with travels sealed in them. Set backup.recipient and backup.path or backup.existingClaim as well." -}}
+{{- end -}}
+{{- $store := $w.store | default "volume" -}}
+{{- if not (has $store (list "volume" "s3" "gcs" "azure")) -}}
+{{- fail (printf "backup.walArchive.store is %v; it takes volume (beside the sealed backups), s3, gcs or azure." $store) -}}
+{{- end -}}
+{{- if not (hasPrefix "/" ($w.path | default "")) -}}
+{{- fail (printf "backup.walArchive.path is %q; it is a path from the store's root, beginning with /." ($w.path | default "")) -}}
+{{- end -}}
+{{- if and (eq $store "volume") $b.path (gt (int (include "meridian-runtime.databaseStandbys" .)) 0) -}}
+{{- fail "backup.walArchive is kept on backup.path, a directory on one node, and the database has standbys on other nodes: whichever is primary archives, so the archive would be split across nodes. Name backup.existingClaim on storage every node mounts, or an object store (backup.walArchive.store)." -}}
+{{- end -}}
+{{- if and (ne $store "volume") (not $w.bucket) -}}
+{{- fail (printf "backup.walArchive.store is %s and backup.walArchive.bucket names none." $store) -}}
+{{- end -}}
+{{- if and (eq $store "s3") (not (and $w.endpoint $w.region)) -}}
+{{- fail "backup.walArchive.store is s3 and its endpoint or region is not set: on AWS, s3.<region>.amazonaws.com and <region>; for a store speaking S3's API, its own." -}}
+{{- end -}}
+{{- if and (eq $store "azure") (not $w.existingSecret) -}}
+{{- fail "backup.walArchive.store is azure and backup.walArchive.existingSecret names no Secret with the storage account's `account` and `key`." -}}
+{{- end -}}
+{{- if and $w.kmsKeyId (ne $store "s3") -}}
+{{- fail (printf "backup.walArchive.kmsKeyId is set and the store is %s: on gcs and azure a customer-managed key is the bucket's or the storage account's own setting, made there." $store) -}}
+{{- end -}}
+{{- if lt (int ($w.timeoutSeconds | default 60)) 1 -}}
+{{- fail "backup.walArchive.timeoutSeconds is below 1." -}}
+{{- end -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/*
+pgBackRest's configuration for the archive, as each of its three users
+reads it: `database`, each member's server and archiver; `backup`, the
+backup Job taking a base backup from the primary over TLS; `offline`, the
+Job restoring or checking a stopped member's volume. The secrets are not
+here: the passphrase and the store's credentials reach each as variables
+(walArchiveEnv). Takes a dict: top, role.
+*/}}
+{{- define "meridian-runtime.pgbackrestConf" -}}
+{{- $top := .top -}}
+{{- $w := $top.Values.backup.walArchive -}}
+{{- $store := $w.store | default "volume" -}}
+{{- $full := include "meridian-runtime.fullname" $top -}}
+[global]
+repo1-type={{ ternary "posix" $store (eq $store "volume") }}
+repo1-path={{ if eq $store "volume" }}/backups{{ end }}{{ $w.path }}
+repo1-cipher-type=aes-256-cbc
+repo1-retention-full-type=count
+repo1-retention-full={{ $top.Values.backup.keep | default 14 }}
+{{- if eq $store "s3" }}
+repo1-s3-bucket={{ $w.bucket }}
+repo1-s3-endpoint={{ $w.endpoint }}
+repo1-s3-region={{ $w.region }}
+{{- if not $w.existingSecret }}
+repo1-s3-key-type=auto
+{{- end }}
+{{- with $w.kmsKeyId }}
+repo1-s3-kms-key-id={{ . }}
+{{- end }}
+{{- else if eq $store "gcs" }}
+repo1-gcs-bucket={{ $w.bucket }}
+{{- with $w.endpoint }}
+repo1-gcs-endpoint={{ . }}
+{{- end }}
+{{- if $w.existingSecret }}
+repo1-gcs-key-type=service
+repo1-gcs-key=/etc/pgbackrest-store/key
+{{- else }}
+repo1-gcs-key-type=auto
+{{- end }}
+{{- else if eq $store "azure" }}
+repo1-azure-container={{ $w.bucket }}
+{{- with $w.endpoint }}
+repo1-azure-endpoint={{ . }}
+{{- end }}
+{{- end }}
+start-fast=y
+archive-timeout=120
+log-level-console=info
+log-level-stderr=off
+log-level-file=off
+lock-path=/tmp/pgbackrest
+{{- if eq .role "database" }}
+tls-server-address=0.0.0.0
+tls-server-ca-file=/run/archive/tls/ca.crt
+tls-server-cert-file=/run/archive/tls/tls.crt
+tls-server-key-file=/run/archive/tls/tls.key
+tls-server-auth=meridian-backup=meridian
+{{- end }}
+
+[meridian]
+pg1-path=/var/lib/postgresql/data/pgdata
+pg1-socket-path=/var/run/postgresql
+{{- if eq .role "backup" }}
+pg1-host={{ $full }}-database
+pg1-host-type=tls
+pg1-host-ca-file=/run/archive/tls/ca.crt
+pg1-host-cert-file=/run/archive/tls/client.crt
+pg1-host-key-file=/run/archive/tls/client.key
+{{- end }}
+{{- end -}}
+
+{{/*
+The archive's secrets as pgBackRest reads them, from variables: the
+passphrase it is encrypted with, and the object store's credentials where
+the values name them. Placed under a container's env. Takes the chart.
+*/}}
+{{- define "meridian-runtime.walArchiveEnv" -}}
+{{- $w := .Values.backup.walArchive -}}
+{{- $full := include "meridian-runtime.fullname" . -}}
+- name: PGBACKREST_REPO1_CIPHER_PASS
+  valueFrom:
+    secretKeyRef:
+      {{- if $w.cipherSecret }}
+      name: {{ $w.cipherSecret | quote }}
+      key: pass
+      {{- else }}
+      name: {{ $full }}-database-passwords
+      key: archive
+      {{- end }}
+{{- if and (eq $w.store "s3") $w.existingSecret }}
+- name: PGBACKREST_REPO1_S3_KEY
+  valueFrom:
+    secretKeyRef:
+      name: {{ $w.existingSecret | quote }}
+      key: key
+- name: PGBACKREST_REPO1_S3_KEY_SECRET
+  valueFrom:
+    secretKeyRef:
+      name: {{ $w.existingSecret | quote }}
+      key: secret
+{{- else if eq $w.store "azure" }}
+- name: PGBACKREST_REPO1_AZURE_ACCOUNT
+  valueFrom:
+    secretKeyRef:
+      name: {{ $w.existingSecret | quote }}
+      key: account
+- name: PGBACKREST_REPO1_AZURE_KEY
+  valueFrom:
+    secretKeyRef:
+      name: {{ $w.existingSecret | quote }}
+      key: key
+{{- end }}
+{{- end -}}
+
+{{/*
+Where the archive is reached from a pod: its configuration for the role,
+the volume beside the sealed backups where it is kept there, and a gcs
+service account's key. Mounts under a container's volumeMounts, volumes
+under the pod's. Each takes a dict: top, role.
+*/}}
+{{- define "meridian-runtime.walArchiveMounts" -}}
+{{- $w := .top.Values.backup.walArchive -}}
+- name: archive-config
+  mountPath: /etc/pgbackrest
+  readOnly: true
+{{- if eq $w.store "volume" }}
+- name: archive-store
+  mountPath: /backups
+{{- else if and (eq $w.store "gcs") $w.existingSecret }}
+- name: archive-store
+  mountPath: /etc/pgbackrest-store
+  readOnly: true
+{{- end }}
+{{- end -}}
+
+{{- define "meridian-runtime.walArchiveVolumes" -}}
+{{- $w := .top.Values.backup.walArchive -}}
+{{- $full := include "meridian-runtime.fullname" .top -}}
+- name: archive-config
+  configMap:
+    name: {{ $full }}-pgbackrest
+    items:
+      - key: {{ .role }}.conf
+        path: pgbackrest.conf
+{{- if eq $w.store "volume" }}
+- name: archive-store
+  persistentVolumeClaim:
+    claimName: {{ .top.Values.backup.existingClaim | default (printf "%s-backup" $full) }}
+{{- else if and (eq $w.store "gcs") $w.existingSecret }}
+- name: archive-store
+  secret:
+    secretName: {{ $w.existingSecret | quote }}
+    items:
+      - key: key
+        path: key
+{{- end }}
+{{- end -}}

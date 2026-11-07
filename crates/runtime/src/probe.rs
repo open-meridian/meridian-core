@@ -9,8 +9,10 @@
 //! - `member`: this member's mode, lag and partitions, as it wrote them
 //!   beside its readiness (`member.json`), and whether it is ready.
 //! - `paths`: the broker, the database (with its `data_checksums` and
-//!   `full_page_writes`, which integrity at rest needs on, and whether it is
-//!   a primary), and the API server where the member holds a lease.
+//!   `full_page_writes`, which integrity at rest needs on, whether it is a
+//!   primary, and where it archives its WAL, the archiver's last segment
+//!   and whether it is failing), and the API server where the member holds
+//!   a lease.
 //! - `answers`: the component's change log asked on the bus, as a follower
 //!   asks it -- answered by whichever member writes -- with the epoch and
 //!   head it answered.
@@ -179,6 +181,7 @@ fn session(
         ("data_checksums", json!(setting("data_checksums"))),
         ("full_page_writes", json!(setting("full_page_writes"))),
     ];
+    let archiving = setting("archive_mode");
     said.push((
         "primary",
         json!(client
@@ -186,6 +189,12 @@ fn session(
             .map(|row| row.get::<_, bool>(0))
             .unwrap_or(false)),
     ));
+    // The WAL archive (backup.walArchive), where the database keeps one:
+    // when it last archived, and whether it is failing now -- the newest
+    // point a restore into a new cluster reaches is no later than that.
+    if archiving == "on" {
+        said.push(("archive", archived(&mut client)));
+    }
     // Its record's last scrub and findings, where it keeps them.
     if let Some(prefix) = record {
         if let Ok(found) = meridian_changes::integrity::last(&mut client, prefix) {
@@ -193,6 +202,34 @@ fn session(
         }
     }
     Ok(said)
+}
+
+/// The archiver's own account (`pg_stat_archiver`): its last segment
+/// archived, how long ago, and whether its newest attempt failed. Times in
+/// UTC; nothing of a segment's content.
+fn archived(client: &mut postgres::Client) -> Value {
+    let asked = client.query_one(
+        "SELECT coalesce(to_char(last_archived_time AT TIME ZONE 'UTC', \
+         'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), ''), \
+         coalesce(extract(epoch FROM now() - last_archived_time)::bigint, -1), \
+         failed_count, \
+         coalesce(last_failed_time > coalesce(last_archived_time, '-infinity'), false) \
+         FROM pg_stat_archiver",
+        &[],
+    );
+    match asked {
+        Ok(row) => {
+            let at: String = row.get(0);
+            let ago: i64 = row.get(1);
+            json!({
+                "last_archived_at": at,
+                "seconds_since": (ago >= 0).then_some(ago),
+                "failed": row.get::<_, i64>(2),
+                "failing": row.get::<_, bool>(3),
+            })
+        }
+        Err(failed) => json!({ "why": failed.to_string() }),
+    }
 }
 
 /// Ask the component's change log on the bus, as a follower asks it.

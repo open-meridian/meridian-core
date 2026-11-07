@@ -724,6 +724,19 @@ jobs:
           if-no-files-found: warn
           retention-days: 90
 
+      # The restore to a time and the checksum step's measurements (step 3b
+      # part 3), kept for the claims ledger as the failover runs' are.
+      - name: Keep the backup run's measurements
+        if: matrix.target == 'e2e-cluster-backup' && !cancelled()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: backup-claims
+          path: workspace/meridian-core/.e2e-backup-claims.jsonl
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 90
+
       - name: Keep this job's footprint peak
         if: matrix.target == 'e2e-cluster' && !cancelled()
         continue-on-error: true
