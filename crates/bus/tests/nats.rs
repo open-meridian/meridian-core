@@ -1001,3 +1001,119 @@ async fn a_question_past_the_brokers_limit_is_refused_before_it_is_sent() {
         "{refused}"
     );
 }
+
+/// A TCP relay to the test broker that can go silent: every connection kept
+/// open, nothing carried either way -- a server cut off, or on a node that
+/// stopped, which sends no reset and no error.
+struct Relay {
+    port: u16,
+    silent: Arc<std::sync::atomic::AtomicBool>,
+    carrying: Arc<AtomicU64>,
+}
+
+impl Relay {
+    async fn to(broker: &str) -> Relay {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let silent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let carrying = Arc::new(AtomicU64::new(0));
+        let (quiet, count, broker) = (silent.clone(), carrying.clone(), broker.to_string());
+        tokio::spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                let Ok(server) = tokio::net::TcpStream::connect(&broker).await else {
+                    continue;
+                };
+                count.fetch_add(1, Ordering::SeqCst);
+                let (from_client, to_client) = client.into_split();
+                let (from_server, to_server) = server.into_split();
+                tokio::spawn(carry(from_client, to_server, quiet.clone()));
+                tokio::spawn(carry(from_server, to_client, quiet.clone()));
+            }
+        });
+        Relay {
+            port,
+            silent,
+            carrying,
+        }
+    }
+}
+
+/// Bytes from one side to the other, until either closes; while silent,
+/// read and dropped, as packets are.
+async fn carry(
+    mut from: impl tokio::io::AsyncRead + Unpin,
+    mut to: impl tokio::io::AsyncWrite + Unpin,
+    quiet: Arc<std::sync::atomic::AtomicBool>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        match from.read(&mut buf).await {
+            Ok(0) | Err(_) => return,
+            Ok(_) if quiet.load(Ordering::SeqCst) => {}
+            Ok(n) => {
+                if to.write_all(&buf[..n]).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_server_gone_silent_is_left_for_another_within_the_heartbeat() {
+    // Step 3b: a broker server cut off, then lost, sends its clients nothing.
+    // A client publishing often never pinged it (each publish puts the ping
+    // off), and a writer's subscriptions on it were served by nobody until
+    // the lease's own bound. The heartbeat moves the client within
+    // UNANSWERED of the silence, and its subscriptions with it.
+    let url =
+        std::env::var("MERIDIAN_TEST_BROKER_URL").expect("MERIDIAN_TEST_BROKER_URL is not set");
+    let (scheme, rest) = url.split_once("://").unwrap_or(("nats", &url));
+    let (credential, hosts) = match rest.rsplit_once('@') {
+        Some((credential, hosts)) => (format!("{credential}@"), hosts),
+        None => (String::new(), rest),
+    };
+    let broker = hosts.split(',').next().unwrap().trim().to_string();
+    let (a, b) = (Relay::to(&broker).await, Relay::to(&broker).await);
+    let through = format!(
+        "{scheme}://{credential}127.0.0.1:{},127.0.0.1:{}",
+        a.port, b.port
+    );
+    let hearing = NatsBackend::connect(&through)
+        .await
+        .expect("the relays carry the broker");
+    let telling = backend().await;
+    let topic = topic("event.heard-after-a-silence");
+    let mut subscription = hearing.subscribe(&topic);
+    settle().await;
+
+    let used = if a.carrying.load(Ordering::SeqCst) > 0 {
+        &a
+    } else {
+        &b
+    };
+    used.silent.store(true, Ordering::SeqCst);
+    let silenced = std::time::Instant::now();
+    let mut heard = None;
+    while silenced.elapsed() < Duration::from_secs(15) {
+        telling
+            .publish(&topic, envelope("DEP-after"))
+            .expect("the publish should have been accepted");
+        if let Ok(Some(delivery)) =
+            tokio::time::timeout(Duration::from_millis(250), subscription.recv()).await
+        {
+            heard = Some((delivery, silenced.elapsed()));
+            break;
+        }
+    }
+    let (delivery, after) = heard.expect("never heard again after its server went silent");
+    assert_eq!(delivery.envelope.meta.unwrap().message_id, "DEP-after");
+    // The silence noticed within HEARTBEAT + UNANSWERED, the silent server
+    // perhaps tried once more (its own UNANSWERED), and the other taken.
+    let most = NatsBackend::HEARTBEAT + NatsBackend::UNANSWERED * 2 + Duration::from_secs(2);
+    assert!(
+        after < most,
+        "heard again only {after:?} after the silence (at most {most:?})"
+    );
+}

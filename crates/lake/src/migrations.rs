@@ -79,6 +79,13 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "control_log",
         sql: include_str!("../migrations/0011_control_log.sql"),
     },
+    // Integrity at rest (step 3b): each row's digest, its findings and its
+    // scrubs.
+    Migration {
+        version: 12,
+        name: "row_digest",
+        sql: include_str!("../migrations/0012_row_digest.sql"),
+    },
 ];
 
 pub const HISTORY: &str = "\

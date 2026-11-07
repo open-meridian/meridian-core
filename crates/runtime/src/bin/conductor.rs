@@ -63,6 +63,7 @@ fn run() -> Result<(), String> {
             component: "conductor",
             domain: meridian_runtime::var("MERIDIAN_CONFIG_DATABASE_URL").map(|_| "config"),
             database: Some("MERIDIAN_CONFIG_DATABASE_URL"),
+            record: Some("config"),
         });
     }
     let command = std::env::args().nth(1);
@@ -89,6 +90,25 @@ fn run() -> Result<(), String> {
 
     // Before the key, because migrating needs a database and nothing else: a
     // migration job holds no key and should not need one.
+    let scrub_url = var("MERIDIAN_CONFIG_DATABASE_URL").unwrap_or_default();
+    // One scrub at once, from inside the pod (step 3b): what it found, as JSON.
+    if command.as_deref() == Some("scrub") {
+        let said = meridian_runtime::scrub::run_once(
+            "config",
+            || {
+                let store =
+                    PostgresStore::connect(&scrub_url, 1).map_err(|failed| failed.to_string())?;
+                store.scrub().map_err(|failed| failed.to_string())
+            },
+            |scrubbed, member, started, finished| {
+                PostgresStore::connect(&scrub_url, 1)
+                    .and_then(|store| store.record_scrub(scrubbed, member, started, finished))
+                    .map_err(|failed| failed.to_string())
+            },
+        )?;
+        println!("{said}");
+        return Ok(());
+    }
     if command.as_deref() == Some("migrate") {
         let url = required("MERIDIAN_CONFIG_DATABASE_URL")?;
         meridian_runtime::migrate_once_it_answers(
@@ -230,6 +250,25 @@ fn run() -> Result<(), String> {
             let watched = Arc::clone(postgres);
             holding.keep(epoch, move || {
                 watched.head_epoch().map_err(|failed| failed.to_string())
+            });
+            // The scrub, under the lease (step 3b, integrity at rest).
+            let scrubbing = scrub_url.clone();
+            meridian_runtime::scrub::forever("config", move || {
+                meridian_runtime::scrub::run_once(
+                    "config",
+                    || {
+                        let store = PostgresStore::connect(&scrubbing, 1)
+                            .map_err(|failed| failed.to_string())?;
+                        store.scrub().map_err(|failed| failed.to_string())
+                    },
+                    |scrubbed, member, started, finished| {
+                        PostgresStore::connect(&scrubbing, 1)
+                            .and_then(|store| {
+                                store.record_scrub(scrubbed, member, started, finished)
+                            })
+                            .map_err(|failed| failed.to_string())
+                    },
+                )
             });
         }
         tokio::task::block_in_place(|| install_named_administrator(store.as_ref()));

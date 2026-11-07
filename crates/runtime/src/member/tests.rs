@@ -18,6 +18,7 @@ fn change(sequence: u64) -> Change {
         committed_at_ns: sequence as i64,
         kind: "entry".into(),
         body: vec![1; 16],
+        digest: Vec::new(),
     }
 }
 

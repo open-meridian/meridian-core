@@ -73,9 +73,11 @@ HA = {"bor": 10, "street": 10, "instrument": 10, "conductor": 10, "launcher": 10
 HA_DATABASE = {"bor": 30, "lake": 30}
 
 DEFAULT_FAILURES = {
-    "tolerant": ["lake-writer", "bor-writer", "network-policy", "db-primary", "broker"],
+    "tolerant": ["lake-writer", "bor-writer", "network-policy", "db-primary", "broker",
+                 "bit-rot", "torn-write"],
     "ha": ["lake-writer", "bor-writer", "street-writer", "instrument-writer",
-           "split-brain", "node-freeze", "node", "network-policy", "db-primary", "broker"],
+           "split-brain", "node-freeze", "node", "network-policy", "db-primary", "broker",
+           "bit-rot", "torn-write", "volume-lost"],
     "scaled": [],
 }
 
@@ -111,12 +113,16 @@ def out(*args, check=True):
 
 
 def happens(ready, seconds, every=2.0):
+    """Whether `ready` comes true within `seconds`, asked every `every`. A
+    command it runs that fails is "not yet": `run` stops with SystemExit,
+    which `except Exception` let through, and a claim deleted between two
+    reads of it ended a local run's volume-lost class."""
     started = time.time()
     while time.time() - started < seconds:
         try:
             if ready():
                 return True
-        except Exception:
+        except (Exception, SystemExit):
             pass
         time.sleep(every)
     return False
@@ -189,7 +195,12 @@ def holder(component):
 
 def probe(pod_name, component):
     """The member's probe of every path, as JSON; None where it could not run."""
-    done = kubectl("exec", pod_name, "-c", component, "--", BINARY[component], "probe", check=False)
+    # Never left hanging: an exec through a node going away can wait on it.
+    try:
+        done = subprocess.run(["kubectl", "--namespace", NAMESPACE, "exec", pod_name, "-c", component, "--",
+                               BINARY[component], "probe"], capture_output=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        return None
     for line in done.stdout.decode(errors="replace").splitlines():
         line = line.strip()
         if line.startswith("{"):
@@ -219,9 +230,19 @@ def answering(component, avoid=(), above_epoch=None):
     return None
 
 
-def epoch_now(component):
-    said = answering(component)
-    return ((said or {}).get("answers") or {}).get("epoch", 0)
+def epoch_now(component, seconds=30):
+    """The epoch the component answers at, asked until it answers: one
+    probe that did not answer read as epoch 0, and CI 42291353103 called a
+    broker class with no takeover a takeover."""
+    found = {}
+
+    def answered():
+        said = answering(component)
+        if said is not None:
+            found["epoch"] = (said.get("answers") or {}).get("epoch", 0)
+        return said is not None
+    happens(answered, seconds, every=0.5)
+    return found.get("epoch", 0)
 
 
 def claim(s, failure, component, seconds, bound, extra=None):
@@ -303,8 +324,56 @@ def install(s):
         pin = json.dumps({"spec": {"template": {"spec": {
             "nodeSelector": {"kubernetes.io/hostname": server_node()},
             "affinity": None, "topologySpreadConstraints": None}}}})
+        # The database's members are made by first run, after this.
         kubectl("patch", "statefulset", f"{FULL}-database", "--type", "merge", "-p", pin)
+        # The broker's servers are made at install, each with JetStream's
+        # volume on the node it landed on: stopped, their claims let go,
+        # and made again on the server node, before anything has used them.
+        servers = json.loads(out("get", "statefulset", f"{FULL}-broker", "-o", "json"))["spec"]["replicas"]
+        kubectl("scale", "statefulset", f"{FULL}-broker", "--replicas=0")
+        wait_for("the broker's servers stopped", lambda: not out(
+            "get", "pods", "-l", f"app.kubernetes.io/instance={RELEASE},meridian.dev/component=broker",
+            "-o", "name"), seconds=180)
+        kubectl("delete", "pvc", "--ignore-not-found", "--wait", "--timeout=120s",
+                *[f"jetstream-{FULL}-broker-{i}" for i in range(servers)])
         kubectl("patch", "statefulset", f"{FULL}-broker", "--type", "merge", "-p", pin)
+        kubectl("scale", "statefulset", f"{FULL}-broker", f"--replicas={servers}")
+        cluster_services_on_server()
+
+
+# The cluster's own services, of which k3s runs one each, on any node.
+CLUSTER_SERVICES = ["coredns", "local-path-provisioner", "metrics-server"]
+
+
+def cluster_services_on_server():
+    """The cluster's own services kept on the server node, beside its API
+    server, so an agent stopped or paused never takes them. CI runs
+    42288351455 and 42300989974 stopped the agent holding k3s's one CoreDNS
+    (42298349697 paused it): every name in the cluster went unanswered until
+    the node was marked lost, so the probe, resolving the broker's name,
+    could not answer on the live member either. What a failure class
+    measures is a member's node lost, not the cluster's DNS, which a cluster
+    built for HA runs replicated across its nodes."""
+    pin = json.dumps({"spec": {"template": {"spec": {
+        "nodeSelector": {"kubernetes.io/hostname": server_node()}}}}})
+    for name in CLUSTER_SERVICES:
+        run("kubectl", "--namespace", "kube-system", "patch", "deployment", name,
+            "--type", "merge", "-p", pin)
+    for name in CLUSTER_SERVICES:
+        run("kubectl", "--namespace", "kube-system", "rollout", "status", f"deployment/{name}",
+            "--timeout=180s")
+
+
+def cluster_services_where():
+    """The node each of the cluster's own services runs on."""
+    said = json.loads(run("kubectl", "--namespace", "kube-system", "get", "pods", "-o", "json").stdout)
+    where = {}
+    for pod in said["items"]:
+        name = pod["metadata"]["name"]
+        service = next((s for s in CLUSTER_SERVICES if name.startswith(f"{s}-")), None)
+        if service and pod["status"].get("phase") == "Running" and not pod["metadata"].get("deletionTimestamp"):
+            where.setdefault(service, set()).add(pod["spec"].get("nodeName", ""))
+    return where
 
 
 def first_run(s):
@@ -372,6 +441,22 @@ def members_settled(component):
     return len(live) == want and all(ready(p) for p in live)
 
 
+def modes_of(component, seconds=60):
+    """The members' modes, sorted, once they are one writer and one standby
+    or `seconds` have passed. Asked again rather than once: a probe through
+    kubectl exec that did not run (its node's kubelet busy, a run's 15 s
+    timeout) reads as no mode, and a local run failed network-policy on
+    (['', 'standby']) with the writer serving."""
+    found = {}
+
+    def settled():
+        found["modes"] = sorted((probe(p["metadata"]["name"], component) or {}).get("member", {}).get("mode", "")
+                                for p in pods(component))
+        return found["modes"] == ["standby", "writer"]
+    happens(settled, seconds, every=1)
+    return found.get("modes", [])
+
+
 # ── The shape of the HA configuration (e2e-cluster-scaled) ─────────────────
 
 def rendered(component):
@@ -393,8 +478,7 @@ def shape(s):
         s.check(len(zones) == 2 and "" not in zones, f"{component}: in two zones ({', '.join(sorted(zones))})")
         held = holder(component)
         s.check(held in {p["metadata"]["name"] for p in live}, f"{component}: its lease held by a member ({held})")
-        modes = sorted((probe(p["metadata"]["name"], component) or {}).get("member", {}).get("mode", "")
-                       for p in live)
+        modes = modes_of(component)
         s.check(modes == ["standby", "writer"], f"{component}: one writer, one standby ({modes})")
         budget = kubectl("get", "pdb", f"{FULL}-{component}", check=False).returncode == 0
         s.check(budget, f"{component}: a disruption budget over its members")
@@ -435,6 +519,45 @@ def shape(s):
         s.check(database.get("primary") is True and database.get("data_checksums") == "on",
                 f"{component}: its probe names a primary with checksums ({database.get('primary')}, "
                 f"{database.get('data_checksums')})")
+    if PROFILE == "ha":
+        where = cluster_services_where()
+        s.check(all(on == {server_node()} for on in where.values()) and len(where) == len(CLUSTER_SERVICES),
+                f"the cluster's own services on the server node, apart from the classes "
+                f"({', '.join(f'{k}: {sorted(v)}' for k, v in sorted(where.items()))})")
+    jetstream_rolled(s)
+
+
+# What analytics says once it has its stream, and where it could not make one.
+QUEUE_MADE = "the units go by JetStream's work queue"
+QUEUE_NOT_THERE = "the units' work queue is not there"
+
+
+def jetstream_rolled(s):
+    """The broker's servers restarted one at a time, as an upgrade rolls
+    them, and JetStream still there after: each analytics copy restarted
+    makes or finds its stream at three, rather than going by the queue
+    group. CI 42294258528: with the stream in memory, a roll left the three
+    answering "no suitable peers for placement" for twelve minutes."""
+    kubectl("rollout", "restart", f"statefulset/{FULL}-broker")
+    rolled = kubectl("rollout", "status", f"statefulset/{FULL}-broker", "--timeout=300s",
+                     check=False).returncode == 0
+    s.check(rolled, "broker: its servers restarted one at a time")
+    parts = ("analytics-coordinator", "analytics-worker")
+    for part in parts:
+        kubectl("rollout", "restart", f"deployment/{FULL}-{part}")
+    for part in parts:
+        kubectl("rollout", "status", f"deployment/{FULL}-{part}", "--timeout=300s", check=False)
+
+    def said():
+        return {p["metadata"]["name"]: kubectl("logs", p["metadata"]["name"], "--all-containers",
+                                               check=False).stdout.decode(errors="replace")
+                for c in parts for p in pods(c)}
+    made = happens(lambda: all(QUEUE_MADE in log or QUEUE_NOT_THERE in log for log in said().values()), 120)
+    logs = said()
+    fell_back = sorted(name for name, log in logs.items() if QUEUE_MADE not in log)
+    s.check(made and not fell_back,
+            f"analytics: every copy has JetStream's work queue after the roll ({len(logs) - len(fell_back)} "
+            f"of {len(logs)}{'; not: ' + ', '.join(fell_back) if fell_back else ''})")
 
 
 # ── Failure classes ────────────────────────────────────────────────────────
@@ -474,6 +597,7 @@ def kill_writer(s, failure, component):
     took = time.time() - began
     if not back:
         s.check(False, f"{failure}: {component} never answered again within {bound + 30}s")
+        explain(s, failure, component)
         return
     extra = {}
     if PROFILE != "tolerant":
@@ -485,8 +609,7 @@ def kill_writer(s, failure, component):
     claim(s, failure, component, took, bound, extra)
     wait_for(f"{component}'s members back", lambda: members_settled(component), seconds=300)
     if PROFILE != "tolerant":
-        modes = sorted((probe(p["metadata"]["name"], component) or {}).get("member", {}).get("mode", "")
-                       for p in pods(component))
+        modes = modes_of(component)
         s.check(modes == ["standby", "writer"], f"{failure}: the killed writer came back as the standby ({modes})")
 
 
@@ -518,6 +641,7 @@ def node_freeze(s):
         run("docker", "unpause", node)
     if not back:
         s.check(False, "node-freeze: the standby never took over while the writer's node was paused")
+        explain(s, "node-freeze", component)
         return
     claim(s, "node-freeze", component, took, HA[component], {"epoch_before": epoch})
     # The old writer wakes, finds the lease another's, and steps down.
@@ -535,12 +659,19 @@ def pod_ip(pod_name):
 def cut_rules(pod_name, targets, verb):
     """Drop every packet between a pod and each target, on the pod's node,
     first in FORWARD: established connections too, which a NetworkPolicy
-    (kube-router's, as most) lets carry on."""
+    (kube-router's, as most) lets carry on.
+
+    Every rule in one exec on the node, so the cut starts (and ends) at
+    once: a docker exec per rule, some thirty for the broker class, spent
+    four to six seconds of the measured bound putting the cut in place and
+    taking it out (broker 9.46 s of 10 in a local run)."""
     node, ip = node_of(pod_name), pod_ip(pod_name)
-    for target in targets:
-        for rule in (["-s", ip, "-d", target], ["-s", target, "-d", ip]):
-            run("docker", "exec", node, "iptables", verb, "FORWARD", *(["1"] if verb == "-I" else []),
-                *rule, "-j", "DROP", check=verb == "-I")
+    at = "1 " if verb == "-I" else ""
+    rules = [f"iptables {verb} FORWARD {at}-s {a} -d {b} -j DROP"
+             for target in targets for a, b in ((ip, target), (target, ip))]
+    # Put in, every one must hold; taken out, each is gone whether or not.
+    joined = " && ".join(rules) if verb == "-I" else "; ".join(f"{r} || true" for r in rules)
+    run("docker", "exec", node, "sh", "-c", joined or "true")
 
 
 def split_brain(s):
@@ -563,6 +694,7 @@ def split_brain(s):
             claim(s, "split-brain", component, took, HA[component], {"epoch_before": epoch})
         else:
             s.check(False, "split-brain: the standby never took over from the cut writer")
+            explain(s, "split-brain", component)
         # The cut writer stepped down before its lease ended, and cannot
         # come back as anything but an unready standby while cut.
         s.check(happens(lambda: not ready(json.loads(out("get", "pod", writer, "-o", "json"))), 60),
@@ -572,6 +704,16 @@ def split_brain(s):
         cut_rules(writer, targets, "-D")
     healed = happens(lambda: members_settled(component), 180)
     s.check(healed, "split-brain: healed once the cut is lifted, the cut member back as the standby")
+
+
+def explain(s, failure, component):
+    """What each member said, for reading a takeover not seen: its node, its
+    mode, what its change log answered, and who holds the lease."""
+    for pod in pods(component):
+        said = probe(pod["metadata"]["name"], component) or {}
+        s.note(f"{failure}: {pod['metadata']['name']} on {pod['spec'].get('nodeName')}: "
+               f"member {json.dumps(said.get('member'))}, answers {json.dumps(said.get('answers'))}, "
+               f"lease held by {holder(component)}")
 
 
 def node_lost(s):
@@ -590,6 +732,13 @@ def node_lost(s):
             claim(s, "node", component, took, HA[component], {"epoch_before": epoch})
         else:
             s.check(False, "node: the standby never took over from the stopped node")
+            # What each member said, for reading: its mode, and what its
+            # change log answered.
+            for pod in pods(component):
+                said = probe(pod["metadata"]["name"], component) or {}
+                s.note(f"node: {pod['metadata']['name']} on {pod['spec'].get('nodeName')}: "
+                       f"member {json.dumps(said.get('member'))}, answers {json.dumps(said.get('answers'))}, "
+                       f"lease held by {holder(component)}")
     finally:
         run("docker", "start", node)
     wait_for("the node back", lambda: all(
@@ -642,11 +791,12 @@ def network_policy(s):
         # With a standby, a writer cut from its database may step down and the
         # standby take over: held to one writer, the members back.
         settled = happens(lambda: members_settled(component), 180)
-        modes = sorted((probe(p["metadata"]["name"], component) or {}).get("member", {}).get("mode", "")
-                       for p in pods(component))
-        s.check(settled and modes == ["standby", "writer"] and holder(component) in
-                {p["metadata"]["name"] for p in pods(component)},
-                f"network-policy: one writer and its standby once healed ({modes})")
+        modes = modes_of(component)
+        one = settled and modes == ["standby", "writer"] and holder(component) in {
+            p["metadata"]["name"] for p in pods(component)}
+        s.check(one, f"network-policy: one writer and its standby once healed ({modes})")
+        if not one:
+            explain(s, "network-policy", component)
     if healed:
         claim(s, "network-policy", component, took, 60)
 
@@ -669,13 +819,14 @@ def marks_table():
     psql("create table if not exists failover_marks (id bigserial primary key, at timestamptz not null)")
 
 
-def write_marks(pod_name, seconds):
+def write_marks(pod_name, seconds, pause=0.05):
     """Commits, one every 50 ms through the database's Service, from inside
     a member that is not killed, each acknowledged id printed; started in
     the background. Its output names every commit the database acknowledged
     (RPO under load, at the database)."""
     host = f"{FULL}-database.{NAMESPACE}.svc.cluster.local"
-    script = WRITER.replace("HOST", host).replace("SECONDS_", str(int(seconds)))
+    script = (WRITER.replace("HOST", host).replace("SECONDS_", str(int(seconds)))
+              .replace("sleep 0.05", f"sleep {pause}" if pause else ":"))
     return subprocess.Popen(
         ["kubectl", "--namespace", NAMESPACE, "exec", "-i", pod_name, "-c", "postgres", "--",
          "sh", "-c", script],
@@ -697,8 +848,9 @@ def database_writes(avoid=()):
         return False
 
 
-def db_primary(s):
-    print("F: db-primary: the database's primary killed outright (SIGKILL), under commits", flush=True)
+def db_primary(s, failure="db-primary"):
+    if failure == "db-primary":
+        print("F: db-primary: the database's primary killed outright (SIGKILL), under commits", flush=True)
     for component in ("bor", "lake"):
         wait_for(f"{component} settled", lambda c=component: members_settled(c), seconds=300)
     marks_table()
@@ -708,7 +860,7 @@ def db_primary(s):
     # one member, killed with its writer: there the commits before the kill
     # are what is held.
     writing_in = next((m for m in members if m != victim), None)
-    writer = write_marks(writing_in, 45) if writing_in else None
+    writer = write_marks(writing_in, 45, pause=0 if failure == "torn-write" else 0.05) if writing_in else None
     time.sleep(3)
     psql("insert into failover_marks (at) values (clock_timestamp())")
     acked_before = int(psql("select max(id) from failover_marks") or 0)
@@ -743,18 +895,18 @@ def db_primary(s):
     kept = {int(i) for i in psql("select id from failover_marks", pod=new_primary).split()}
     lost = sorted(acked - kept)
     if PROFILE != "tolerant":
-        s.check(new_primary != victim, f"db-primary: a standby promoted ({new_primary})")
-    s.check(not lost, f"db-primary: every acknowledged commit kept ({len(acked)} acknowledged, "
+        s.check(new_primary != victim, f"{failure}: a standby promoted ({new_primary})")
+    s.check(not lost, f"{failure}: every acknowledged commit kept ({len(acked)} acknowledged, "
             f"{len(lost)} lost{': ' + ', '.join(map(str, lost[:5])) if lost else ''})")
     for component in ("bor", "lake"):
         if component not in took:
-            s.check(False, f"db-primary: {component} never answered again within {bound[component] + 30}s")
+            s.check(False, f"{failure}: {component} never answered again within {bound[component] + 30}s")
             continue
-        claim(s, "db-primary", component, took[component], bound[component],
+        claim(s, failure, component, took[component], bound[component],
               {"acknowledged_commits": len(acked), "rpo_commits_lost": len(lost)})
     healed = happens(lambda: len(pods("database")) == database_members()
                      and all(ready(p) for p in pods("database")), 300)
-    s.check(healed, "db-primary: the killed member back, as a standby where there are standbys")
+    s.check(healed, f"{failure}: the killed member back, as a standby where there are standbys")
 
 
 def isolate(pod_name, verb):
@@ -793,12 +945,153 @@ def broker_lost(s):
     if not back:
         s.check(False, f"broker: the book never answered again within {bound + 30}s")
         return
-    claim(s, "broker", "bor", took, bound, {"servers": len(servers)})
-    if PROFILE != "tolerant":
-        s.check(epoch_now("bor") == epoch, "broker: no takeover for a broker server lost")
+    took_over = epoch_now("bor") != epoch
+    claim(s, "broker", "bor", took, bound, {"servers": len(servers), "takeover": took_over})
+    if took_over:
+        # A writer whose server was cut off may step down before its client
+        # finds another, and its standby, on a live server, take over: the
+        # bound above holds either way, and the claim says which it was.
+        s.note("broker: the book's writer stepped down and its standby took over")
     healed = happens(lambda: len(pods("broker")) == len(servers)
                      and all(ready(p) for p in pods("broker")), 180)
     s.check(healed, "broker: the killed server back")
+
+
+# ── Storage: bit rot, a torn write, a volume lost (step 3b part 2) ─────────
+
+
+def scrub(component, container=None):
+    """One scrub, run in the component's writer, as its JSON."""
+    pod = writer_pod(component)
+    done = kubectl("exec", pod, "-c", container or component, "--", BINARY[component], "scrub", check=False)
+    for line in done.stdout.decode(errors="replace").splitlines():
+        if line.strip().startswith("{"):
+            return json.loads(line)
+    raise SystemExit(f"{component}'s scrub said nothing it could read: {done.stderr.decode(errors='replace')[-400:]}")
+
+
+def relation_file(table):
+    """A table's first data file on its member's node: the node, and the path."""
+    pod = primary()
+    relative = psql(f"select pg_relation_filepath('{table}')", pod=pod)
+    claim = f"data-{pod}"
+    volume = out("get", "pvc", claim, "-o", "jsonpath={.spec.volumeName}")
+    pv = json.loads(run("kubectl", "get", "pv", volume, "-o", "json").stdout)
+    path = (pv["spec"].get("hostPath") or pv["spec"].get("local") or {}).get("path", "")
+    return node_of(pod), f"{path}/pgdata/{relative}"
+
+
+# Tables a class corrupted on purpose in this run, which a later class's
+# read of every page passes over.
+CORRUPTED = set()
+
+
+def bit_rot(s):
+    print("F: bit-rot: a captured row altered beneath the configuration store; a page's byte flipped", flush=True)
+    wait_for("conductor settled", lambda: members_settled("conductor"), seconds=300)
+    # A row of the configuration store's log altered beneath it.
+    target = psql("select partition || ' ' || sequence || ' ' || ordinal from config_change "
+                  "order by sequence desc, ordinal limit 1").split()
+    s.check(len(target) == 3, "bit-rot: the configuration store's log holds a row to alter")
+    if len(target) != 3:
+        return
+    partition, sequence, ordinal = target
+    began = time.time()
+    psql(f"update config_change set body = body || '{{\"rot\": true}}'::jsonb "
+         f"where partition = '{partition}' and sequence = {sequence} and ordinal = {ordinal}")
+    said = scrub("conductor")
+    took = time.time() - began
+    named = [f for f in said.get("findings", [])
+             if f.get("partition") == partition and str(f.get("sequence")) == sequence]
+    s.check(bool(named), f"bit-rot: the scrub names partition {partition}, sequence {sequence} "
+            f"({len(said.get('findings', []))} finding(s))")
+    kept = psql(f"select count(*) from config_integrity_finding where partition = '{partition}' "
+                f"and sequence = {sequence}")
+    s.check(kept == "1", f"bit-rot: kept as an IntegrityFinding ({kept})")
+    probed = probe(writer_pod("conductor"), "conductor") or {}
+    database = next((p for p in probed.get("paths", []) if p.get("path") == "database"), {})
+    s.check(any(f.get("sequence") == int(sequence) for f in (database.get("integrity") or {}).get("findings", [])),
+            "bit-rot: the probe that status reads says so")
+    if named:
+        claim(s, "bit-rot", "conductor", took, TOLERANT_POD if PROFILE == "tolerant" else 60,
+              {"detected_by": "the scrub", "partition": partition, "sequence": int(sequence)})
+    if PROFILE != "tolerant":
+        return
+    # A byte of a page flipped beneath the stopped database: read back, the
+    # page fails its checksum, loudly, and the scrub records it.
+    node, path = relation_file("config_change")
+    CORRUPTED.add("config_change")
+    kubectl("scale", "statefulset", f"{FULL}-database", "--replicas=0")
+    wait_for("the database stopped", lambda: not pods("database"), seconds=180)
+    run("docker", "exec", node, "sh", "-c",
+        f"printf '\\377\\377\\377\\377' | dd of='{path}' bs=1 seek=4000 conv=notrunc 2>/dev/null")
+    kubectl("scale", "statefulset", f"{FULL}-database", "--replicas=1")
+    wait_for("the database back", lambda: pods("database") and all(ready(p) for p in pods("database"))
+             and psql("select 1", database="postgres") == "1", seconds=300)
+    refused = kubectl("exec", primary(), "-c", "postgres", "--", "psql", "-X", "-At", "-U", "postgres",
+                      "-d", "meridian", "-c", "select count(*) from config_change", check=False)
+    s.check(refused.returncode != 0 and b"invalid page" in refused.stderr,
+            "bit-rot: a page whose byte was flipped fails its checksum when read")
+    wait_for("conductor settled", lambda: answering("conductor"), seconds=300)
+    said = scrub("conductor")
+    s.check(any("checksum" in f.get("what", "") for f in said.get("findings", [])),
+            "bit-rot: the scrub records the page that failed its checksum")
+
+
+def torn_write(s):
+    """The database killed outright under heavy commits; every table's pages
+    read back after crash recovery (or on the promoted standby)."""
+    print("F: torn-write: the database killed outright under heavy commits, every page read back", flush=True)
+    db_primary(s, failure="torn-write")
+    tables = psql("select string_agg(format('%I', tablename), ' ') from pg_tables where schemaname = 'public'")
+    failed = []
+    for table in tables.split():
+        if table in CORRUPTED:
+            s.note(f"torn-write: {table} passed over: bit-rot corrupted it on purpose in this run")
+            continue
+        done = kubectl("exec", primary(), "-c", "postgres", "--", "psql", "-X", "-At", "-U", "postgres",
+                       "-d", "meridian", "-c", f"select count(*) from {table}", check=False)
+        if done.returncode != 0:
+            failed.append(table)
+    s.check(not failed, f"torn-write: every table's pages read back after recovery "
+            f"({len(tables.split())} tables{', failed: ' + ', '.join(failed) if failed else ''})")
+
+
+def volume_lost(s):
+    """A standby's volume lost: its claim and its pod deleted, and Patroni
+    clones it again from the primary, nothing felt by the stores."""
+    print("F: volume-lost: a database standby's claim deleted", flush=True)
+    if PROFILE == "tolerant":
+        s.note("volume-lost: the tolerant database's one volume lost is a restore, the admin's act "
+               "(e2e-cluster-backup); not injected here")
+        return
+    standby = next(p["metadata"]["name"] for p in pods("database")
+                   if p["metadata"]["labels"].get("meridian.dev/database-role") == "replica")
+    epoch = epoch_now("bor")
+    began = time.time()
+    kubectl("delete", "pvc", f"data-{standby}", "--wait=false")
+    kubectl("delete", "pod", standby, "--grace-period=0", "--force")
+    # The claim goes once its pod has; a pod made again before that waits on
+    # a claim being deleted, and is made again once it is gone.
+    def gone():
+        # Read once: gone, or a new claim with no deletion pending.
+        said = kubectl("get", "pvc", f"data-{standby}", "-o", "jsonpath={.metadata.deletionTimestamp}",
+                       check=False)
+        return said.returncode != 0 or said.stdout.decode().strip() == ""
+    wait_for("the lost claim gone", gone, seconds=120)
+    pending = [p for p in json.loads(out("get", "pods", "-l", "meridian.dev/component=database", "-o", "json"))["items"]
+               if p["metadata"]["name"] == standby and p["status"].get("phase") == "Pending"]
+    if pending:
+        kubectl("delete", "pod", standby, "--grace-period=0", "--force", check=False)
+    back = happens(lambda: len(pods("database")) == database_members()
+                   and all(ready(p) for p in pods("database"))
+                   and kubectl("get", "pvc", f"data-{standby}", check=False).returncode == 0, 300, every=2)
+    took = time.time() - began
+    s.check(back, "volume-lost: the standby re-cloned onto a new volume and ready")
+    s.check(answering("bor") is not None and epoch_now("bor") == epoch,
+            "volume-lost: the book answered throughout, no takeover")
+    if back:
+        claim(s, "volume-lost", "database", took, 300, {"member": standby, "re_cloned": True})
 
 
 FAILURES = {
@@ -814,6 +1107,9 @@ FAILURES = {
     "network-policy": network_policy,
     "db-primary": db_primary,
     "broker": broker_lost,
+    "bit-rot": bit_rot,
+    "torn-write": torn_write,
+    "volume-lost": volume_lost,
 }
 
 

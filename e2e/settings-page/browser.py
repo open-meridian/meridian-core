@@ -113,9 +113,54 @@ FIT = """async () => {
 }"""
 
 
+# A page is measured once it has settled, never after a fixed wait. The load
+# event comes before the kit's pagers first lay out: om-pager counts the rows
+# that fit on an animation frame after the document is parsed, and again on
+# the resizes the page dispatches once its sidebar is drawn. CI run
+# 42328926533 measured the Data sources page 400 ms after load with no frame
+# drawn yet, all 24 rows still shown (858px too tall). So: the fonts, every
+# om-* element on the page defined, two frames, then frames until the layout
+# and each pager's page have held still for three in a row. An element never
+# defined, or a layout that never holds, stops waiting at a bound and is left
+# to the checks.
+SETTLE = """async () => {
+  const frame = () => new Promise((done) => requestAnimationFrame(() => done()));
+  const bound = (promise, ms) => Promise.race([promise, new Promise((done) => setTimeout(done, ms))]);
+  await bound(document.fonts.ready, 10000);
+  const names = new Set([...document.querySelectorAll("*")].map((e) => e.localName).filter((n) => n.startsWith("om-")));
+  await bound(Promise.all([...names].map((n) => customElements.whenDefined(n).catch(() => {}))), 10000);
+  await frame();
+  await frame();
+  const now = () => [
+    document.documentElement.scrollHeight,
+    document.documentElement.scrollWidth,
+    ...[...document.querySelectorAll("om-pager")].map((p) => JSON.stringify(p.shown ?? null)),
+  ].join(" ");
+  let last = now();
+  for (let i = 0, still = 0; i < 300 && still < 3; i++) {
+    await frame();
+    const seen = now();
+    still = seen === last ? still + 1 : 0;
+    last = seen;
+  }
+}"""
+
+
 def settled(page):
     page.wait_for_load_state("load")
+    # The old 400 ms stays as a floor, for what a page fetches after load;
+    # the layout is waited for after it. A post's answer may still be
+    # navigating: wait for its page and settle that.
     page.wait_for_timeout(400)
+    for attempt in range(3):
+        try:
+            page.evaluate(SETTLE)
+            return
+        except Exception as e:  # the context went with a navigation
+            gone = "context was destroyed" in str(e) or "navigat" in str(e)
+            if attempt == 2 or not gone:
+                raise
+            page.wait_for_load_state("load")
 
 
 def fits(browser, name, url, prefix):

@@ -206,6 +206,7 @@ fn run() -> Result<(), String> {
             component: "launcher",
             domain: None,
             database: None,
+            record: None,
         });
     }
     // Not ready until it serves, whatever this pod said before.

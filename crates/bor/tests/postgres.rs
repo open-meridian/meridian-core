@@ -1451,3 +1451,101 @@ fn a_store_of_one_connection_adopts_its_epoch_and_rebuilds() {
     alone.rebuild().unwrap();
     assert!(alone.epoch() >= 1);
 }
+
+// ── Integrity at rest (step 3b) ─────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_journal_is_a_chain_its_scrub_names_a_changed_entry_and_a_replay_refuses_it() {
+    let (url, store) = blocking(isolated);
+    let (bus, store) = wired_with(store);
+    let accounts: Vec<String> = (0..3).map(|n| unique(&format!("CHAIN{n}"))).collect();
+    for account in &accounts {
+        open(&bus, account, "INS-AAPL").await;
+    }
+    // Every entry chained to the one before it in its partition, the head
+    // holding the chain's end, and the change carrying the entry's digest.
+    let changes = blocking(|| followed(&store, "P0", 0));
+    assert_eq!(changes.len(), 3);
+    let mut chain = meridian_changes::integrity::Chain::default();
+    for change in &changes {
+        assert!(
+            !change.digest.is_empty(),
+            "entry {} has no digest",
+            change.sequence
+        );
+        chain
+            .follow(change)
+            .expect("each entry follows the one before it");
+    }
+    let clean = blocking(|| store.scrub()).expect("scrubs");
+    assert_eq!(clean.checked, 3);
+    assert!(clean.findings.is_empty(), "{:?}", clean.findings);
+
+    // An entry altered beneath the book (its append-only rule set aside,
+    // as only someone with the database's own rights could).
+    let altered = changes[1].sequence as i64;
+    blocking(|| {
+        let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        client
+            .batch_execute(&format!(
+                "ALTER TABLE book_entry DISABLE TRIGGER book_entry_append_only;
+                 UPDATE book_entry SET message_id = message_id || '-altered'
+                  WHERE last_sequence = {altered};
+                 ALTER TABLE book_entry ENABLE TRIGGER book_entry_append_only;"
+            ))
+            .unwrap();
+    });
+    let found = blocking(|| store.scrub()).expect("scrubs");
+    assert_eq!(found.findings.len(), 1, "{:?}", found.findings);
+    assert_eq!(found.findings[0].partition, "P0");
+    assert_eq!(found.findings[0].sequence as i64, altered);
+    blocking(|| store.record_scrub(&found, "test", 1, 2)).expect("kept");
+    blocking(|| store.record_scrub(&found, "test", 3, 4)).expect("kept again, once");
+    let kept: i64 = blocking(|| {
+        postgres::Client::connect(&url, postgres::NoTls)
+            .unwrap()
+            .query_one("SELECT count(*) FROM book_integrity_finding", &[])
+            .unwrap()
+            .get(0)
+    });
+    assert_eq!(kept, 1, "a finding is kept once");
+    // The altered entry's account no longer replays: loudly, by sequence.
+    let replayed = blocking(|| store.journal(&accounts[1]));
+    let refused = replayed.expect_err("an altered entry is not replayed");
+    assert!(
+        refused
+            .to_string()
+            .contains(&format!("entry {altered} of partition P0")),
+        "{refused}"
+    );
+}
+
+#[test]
+fn an_entry_kept_before_digests_is_chained_by_migrate_even_one_the_book_cannot_read() {
+    let (url, store) = isolated();
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    // As a restore of an older book leaves it: no digest, and here a body
+    // that does not decode.
+    client
+        .execute(
+            "INSERT INTO book_entry (entry_id, account_id, partition, first_sequence, last_sequence,
+                                     kind, effective_date, committed_at_ns, meta, cause, body, reply)
+             VALUES ('ENT-OLD', 'ACC-OLD', 'P0', 900001, 900001, 'opening-balance', '2026-01-01',
+                     1, ''::bytea, ''::bytea, ''::bytea, ''::bytea)",
+            &[],
+        )
+        .unwrap();
+    store
+        .migrate(&meridian_clock::SystemClock)
+        .expect("migrating chains it, whatever it holds");
+    let chained: bool = client
+        .query_one(
+            "SELECT digest IS NOT NULL FROM book_entry WHERE entry_id = 'ENT-OLD'",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert!(chained);
+    let scrubbed = store.scrub().expect("scrubs");
+    assert!(scrubbed.findings.is_empty(), "{:?}", scrubbed.findings);
+}

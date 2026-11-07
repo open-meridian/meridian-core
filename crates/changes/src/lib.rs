@@ -38,6 +38,7 @@ pub use meridian_domain::v1::{Change, ReadChangesReply, ReadChangesRequest};
 use prost::Message;
 
 pub mod captured;
+pub mod integrity;
 
 /// The most a page of changes holds, encoded (1056: 512 KiB pages).
 pub const PAGE_MOST: usize = 512 * 1024;

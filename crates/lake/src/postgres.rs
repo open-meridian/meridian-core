@@ -85,6 +85,49 @@ impl PostgresStore {
         outcome
     }
 
+    /// Re-read the record (step 3b, integrity at rest; plan 5j): rows kept
+    /// before digests given theirs a batch at a time, a pause between, so
+    /// the writer's own work goes first; then every row's digest checked
+    /// against its body, a dataset whose rows no longer match named by its
+    /// first bad sequence and when it was recorded. Postgres verifies each
+    /// page's checksum as it reads it from disk.
+    pub fn scrub(&self) -> Result<meridian_changes::integrity::Scrubbed> {
+        let mut conn = self.conn()?;
+        match scrub_rows(&mut *conn) {
+            Err(failed) => match meridian_changes::integrity::page_finding(
+                &failed,
+                "a page of lake_row failed its checksum",
+            ) {
+                Some(finding) => Ok(meridian_changes::integrity::Scrubbed {
+                    findings: vec![finding],
+                    ..Default::default()
+                }),
+                None => Err(unavailable(failed)),
+            },
+            Ok(scrubbed) => Ok(scrubbed),
+        }
+    }
+
+    /// Keep a scrub's findings and its run (`IntegrityFinding`).
+    pub fn record_scrub(
+        &self,
+        scrubbed: &meridian_changes::integrity::Scrubbed,
+        member: &str,
+        started_at_ns: i64,
+        finished_at_ns: i64,
+    ) -> Result<()> {
+        let mut conn = self.conn()?;
+        meridian_changes::integrity::record(
+            &mut *conn,
+            "lake",
+            scrubbed,
+            member,
+            started_at_ns,
+            finished_at_ns,
+        )
+        .map_err(unavailable)
+    }
+
     /// What a start does instead: one read, no lock.
     pub fn verify(&self) -> Result<()> {
         let mut conn = self.conn()?;
@@ -316,14 +359,17 @@ fn insert(tx: &mut Transaction<'_>, dataset: &str, row: &Observation, epoch: u64
     let listing = row.listing();
     let expires: Option<String> = listing.as_ref().and_then(|(expires, _)| expires.clone());
     let listed_type: Option<i16> = listing.map(|(_, kind)| kind as i16);
+    // Its digest, kept beside it (step 3b, integrity at rest).
+    let body = row.encode();
+    let digest = meridian_changes::integrity::digest(&body);
     tx.execute(
         "INSERT INTO lake_row
                 (dataset, sequence, data_type, row_key, version, subject, subjects, kind,
                  interval_ns, venue_id, valid_from_ns, valid_until_ns, business_date,
                  recorded_at_ns, previous_sequence, unconverted, body, closed_reason,
-                 latest_key, quality, expires, listed_type, published_at_ns, epoch)
+                 latest_key, quality, expires, listed_type, published_at_ns, epoch, digest)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::text::date, $14, $15,
-                 $16, $17, $18, $19, $20, $21::text::date, $22, $23, $24)",
+                 $16, $17, $18, $19, $20, $21::text::date, $22, $23, $24, $25)",
         &[
             &dataset,
             &(meta.sequence as i64),
@@ -341,7 +387,7 @@ fn insert(tx: &mut Transaction<'_>, dataset: &str, row: &Observation, epoch: u64
             &meta.recorded_at_ns,
             &(meta.previous_sequence as i64),
             &!meta.unconverted.is_empty(),
-            &row.encode(),
+            &body,
             &closed_reason(meta.closed_day.as_ref()),
             &row.latest_key(),
             &(meta.quality as i16),
@@ -351,6 +397,7 @@ fn insert(tx: &mut Transaction<'_>, dataset: &str, row: &Observation, epoch: u64
             // (ruling 1006 (b); migration 8).
             &crate::store::published_order(row),
             &(epoch as i64),
+            &digest,
         ],
     )
     .map_err(unavailable)?;
@@ -1853,6 +1900,7 @@ impl Store for PostgresStore {
                         origin: origin.unwrap_or_else(|| own_origin.clone()),
                         committed_at_ns: row.get(3),
                         kind: row.get(4),
+                        digest: meridian_changes::integrity::digest(&row.get::<_, Vec<u8>>(5)),
                         body: row.get(5),
                     };
                     if !page.take(change) {
@@ -1896,7 +1944,7 @@ impl Store for PostgresStore {
             let mut window: Vec<meridian_changes::Change> = Vec::new();
             for row in tx
                 .query(
-                    "SELECT sequence, epoch, origin, recorded_at_ns, data_type, body FROM lake_row
+                    "SELECT sequence, epoch, origin, recorded_at_ns, data_type, body, digest FROM lake_row
                       WHERE dataset = $1 AND sequence > $2 AND sequence <= $3 ORDER BY sequence",
                     &[&partition, &(from as i64), &until],
                 )
@@ -1912,6 +1960,7 @@ impl Store for PostgresStore {
                     committed_at_ns: row.get(3),
                     kind: kind.to_string(),
                     body: row.get(5),
+                    digest: row.get::<_, Option<Vec<u8>>>(6).unwrap_or_default(),
                 });
             }
             for row in tx
@@ -1959,6 +2008,50 @@ impl Store for PostgresStore {
             after_sequence: 0,
         })
     }
+}
+
+/// [`PostgresStore::scrub`]'s reading, its errors Postgres's own so a page
+/// failing its checksum is told apart.
+fn scrub_rows(
+    conn: &mut impl postgres::GenericClient,
+) -> std::result::Result<meridian_changes::integrity::Scrubbed, postgres::Error> {
+    let mut filled = 0u64;
+    loop {
+        let done = conn.execute(
+            "UPDATE lake_row SET digest = sha256(body)
+                      WHERE (dataset, sequence) IN (
+                          SELECT dataset, sequence FROM lake_row WHERE digest IS NULL LIMIT 2000)",
+            &[],
+        )?;
+        filled += done;
+        if done == 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let checked = conn
+        .query_one("SELECT count(*) FROM lake_row", &[])?
+        .get::<_, i64>(0) as u64;
+    let findings = conn
+        .query(
+            "SELECT dataset, min(sequence), min(recorded_at_ns) FROM lake_row
+                  WHERE digest <> sha256(body) GROUP BY dataset ORDER BY dataset",
+            &[],
+        )?
+        .iter()
+        .map(|row| meridian_changes::integrity::Finding {
+            partition: row.get(0),
+            sequence: row.get::<_, i64>(1) as u64,
+            committed_at_ns: row.get(2),
+            what: "a row does not match its digest: the record changed beneath the lake"
+                .to_string(),
+        })
+        .collect();
+    Ok(meridian_changes::integrity::Scrubbed {
+        checked,
+        filled,
+        findings,
+    })
 }
 
 fn apply_migrations(conn: &mut Connection, clock: &dyn meridian_clock::Clock) -> Result<()> {

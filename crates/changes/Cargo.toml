@@ -12,6 +12,9 @@ meridian-clock.workspace = true
 meridian-domain.workspace = true
 postgres.workspace = true
 prost.workspace = true
+# Integrity at rest (step 3b): each change's digest, and the scrub's report.
+sha2.workspace = true
+serde_json.workspace = true
 # The tail's pages, compressed (ruling 1062): LZ4's block format, in safe
 # Rust, with no other dependency; the frame format is not needed.
 lz4_flex = { version = "0.11", default-features = false, features = ["std", "safe-encode", "safe-decode"] }

@@ -221,8 +221,14 @@ impl Member {
             }
             tokio::time::sleep(look_every).await;
         }
+        // Stopped, and waited for: a follower aborted mid-poll on another
+        // thread still finished that poll, and its readiness written then
+        // -- mode "standby", maybe not ready -- landed after the writer's
+        // own (a local run: the street's writer served, said "standby"
+        // and the takeover's member set never settled).
         if let Some(following) = following {
             following.abort();
+            let _ = following.await;
         }
         crate::mark_ready(false);
         said().set_lag_ms(0);
@@ -292,6 +298,12 @@ impl Holding {
     /// deadline, when `epoch_now` -- the store's head epoch, read from the
     /// record -- moves past `mine`, or when a commit of its own was fenced.
     /// Nothing is kept where no lease is held.
+    ///
+    /// The epoch is read on a loop of its own: a read waits on the store's
+    /// pool, up to its connection timeout while the database's primary is
+    /// replaced, and a renewal waiting behind it let the lease lapse under a
+    /// writer that was serving (CI 42291353103: the book's writer renewed
+    /// nothing for 15 s of a database switchover, and its standby took over).
     pub fn keep<E>(&self, mine: u64, epoch_now: E)
     where
         E: Fn() -> Result<u64, String> + Send + Sync + 'static,
@@ -306,6 +318,25 @@ impl Holding {
                 let held = elector.lock().await;
                 (held.settings().renew, held.settings().renew_deadline())
             };
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(renew).await;
+                    let reading = Arc::clone(&epoch_now);
+                    match tokio::task::spawn_blocking(move || reading()).await {
+                        Ok(Ok(head)) if head > mine => step_down(
+                            component,
+                            &format!("the store's epoch is {head}, past this writer's {mine}"),
+                        ),
+                        Ok(Ok(_)) => {}
+                        Ok(Err(failed)) => {
+                            tracing::warn!(component, %failed, "the store's epoch could not be read")
+                        }
+                        Err(failed) => {
+                            tracing::warn!(component, %failed, "the epoch check failed")
+                        }
+                    }
+                }
+            });
             let mut last_renewed = Instant::now();
             loop {
                 tokio::time::sleep(renew).await;
@@ -335,18 +366,6 @@ impl Holding {
                             deadline.as_secs()
                         ),
                     );
-                }
-                let reading = Arc::clone(&epoch_now);
-                match tokio::task::spawn_blocking(move || reading()).await {
-                    Ok(Ok(head)) if head > mine => step_down(
-                        component,
-                        &format!("the store's epoch is {head}, past this writer's {mine}"),
-                    ),
-                    Ok(Ok(_)) => {}
-                    Ok(Err(failed)) => {
-                        tracing::warn!(component, %failed, "the store's epoch could not be read")
-                    }
-                    Err(failed) => tracing::warn!(component, %failed, "the epoch check failed"),
                 }
             }
         });
@@ -425,6 +444,7 @@ const ASK_EVERY: Duration = Duration::from_secs(1);
 async fn follow(bus: Arc<Bus>, domain: &'static str, bound: Duration) {
     let mut tail = bus.subscribe_every(&meridian_changes::every_changes_topic(domain));
     let mut at: HashMap<String, u64> = HashMap::new();
+    let mut chains: HashMap<String, meridian_changes::integrity::Chain> = HashMap::new();
     // Behind since a page was missed and not yet read; unanswered since the
     // writer last failed to answer. The lag is the longer.
     let mut gap_since: Option<Instant> = None;
@@ -447,6 +467,22 @@ async fn follow(bus: Arc<Bus>, domain: &'static str, bound: Duration) {
                 let Some(partition) = page.changes.first().map(|c| c.partition.clone()) else {
                     continue;
                 };
+                // Integrity at rest (step 3b): every change it takes in order
+                // verified by its digest, the book's by its chain; one that
+                // does not verify is never taken, and the standby stays
+                // behind, unready, saying so. A page after a gap is checked
+                // as the gap is read, in order.
+                let contiguous = match at.get(&partition).copied() {
+                    None => true,
+                    Some(held) => page.head > held && page.after_sequence == held,
+                };
+                if contiguous {
+                    if let Err(failed) = verified(domain, &mut chains, &page.changes) {
+                        tracing::error!(domain, partition, %failed, "a change did not verify; not followed");
+                        gap_since.get_or_insert_with(Instant::now);
+                        continue;
+                    }
+                }
                 match at.get(&partition).copied() {
                     None => {
                         at.insert(partition, page.head);
@@ -458,7 +494,7 @@ async fn follow(bus: Arc<Bus>, domain: &'static str, bound: Duration) {
                     Some(held) => {
                         // A page missed: read it from the writer, never infer it.
                         gap_since.get_or_insert_with(Instant::now);
-                        match catch_up(&bus, domain, &partition, held).await {
+                        match catch_up(&bus, domain, &partition, held, &mut chains).await {
                             Ok(head) => {
                                 at.insert(partition, head.max(page.head));
                                 gap_since = None;
@@ -514,7 +550,32 @@ async fn ask_writer(bus: &Bus, domain: &str) -> Result<(), String> {
 
 /// Read a partition's changes after `after` from the writer, page by page,
 /// to its head.
-async fn catch_up(bus: &Bus, domain: &str, partition: &str, mut after: u64) -> Result<u64, String> {
+/// Each change verified by its digest, and the book's by its chain too.
+fn verified(
+    domain: &str,
+    chains: &mut HashMap<String, meridian_changes::integrity::Chain>,
+    changes: &[meridian_changes::Change],
+) -> Result<(), String> {
+    for change in changes {
+        if domain == "book" {
+            chains
+                .entry(change.partition.clone())
+                .or_default()
+                .follow(change)?;
+        } else {
+            meridian_changes::integrity::verify(change)?;
+        }
+    }
+    Ok(())
+}
+
+async fn catch_up(
+    bus: &Bus,
+    domain: &str,
+    partition: &str,
+    mut after: u64,
+    chains: &mut HashMap<String, meridian_changes::integrity::Chain>,
+) -> Result<u64, String> {
     loop {
         let asked = meridian_changes::ReadChangesRequest {
             partition: partition.to_string(),
@@ -533,6 +594,7 @@ async fn catch_up(bus: &Bus, domain: &str, partition: &str, mut after: u64) -> R
             .map_err(|failed| failed.to_string())?;
         let page = meridian_changes::ReadChangesReply::decode(body.as_slice())
             .map_err(|failed| failed.to_string())?;
+        verified(domain, chains, &page.changes)?;
         for change in &page.changes {
             if change.sequence <= after {
                 return Err(format!(

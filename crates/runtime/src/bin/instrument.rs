@@ -41,12 +41,32 @@ fn run() -> Result<(), String> {
             component: "instrument",
             domain: Some("reference"),
             database: Some("MERIDIAN_DATABASE_URL"),
+            record: Some("instrument"),
         });
     }
     let url = required("MERIDIAN_DATABASE_URL")?;
 
     // Before the key is touched: a migration job holds database credentials and
     // has no business holding the deployment's private key.
+    // One scrub at once, from inside the pod (step 3b): what it found, as JSON.
+    let scrub_url = var("MERIDIAN_DATABASE_URL").unwrap_or_default();
+    if std::env::args().nth(1).as_deref() == Some("scrub") {
+        let said = meridian_runtime::scrub::run_once(
+            "instrument",
+            || {
+                let store =
+                    PostgresStore::connect(&scrub_url, 1).map_err(|failed| failed.to_string())?;
+                store.scrub().map_err(|failed| failed.to_string())
+            },
+            |scrubbed, member, started, finished| {
+                PostgresStore::connect(&scrub_url, 1)
+                    .and_then(|store| store.record_scrub(scrubbed, member, started, finished))
+                    .map_err(|failed| failed.to_string())
+            },
+        )?;
+        println!("{said}");
+        return Ok(());
+    }
     if std::env::args().nth(1).as_deref() == Some("migrate") {
         meridian_runtime::migrate_once_it_answers(
             "the instrument store's database",
@@ -131,6 +151,23 @@ fn run() -> Result<(), String> {
         let watched = postgres.clone();
         holding.keep(epoch, move || {
             watched.head_epoch().map_err(|failed| failed.to_string())
+        });
+        // The scrub, under the lease (step 3b, integrity at rest).
+        let scrubbing = scrub_url.clone();
+        meridian_runtime::scrub::forever("instrument", move || {
+            meridian_runtime::scrub::run_once(
+                "instrument",
+                || {
+                    let store = PostgresStore::connect(&scrubbing, 1)
+                        .map_err(|failed| failed.to_string())?;
+                    store.scrub().map_err(|failed| failed.to_string())
+                },
+                |scrubbed, member, started, finished| {
+                    PostgresStore::connect(&scrubbing, 1)
+                        .and_then(|store| store.record_scrub(scrubbed, member, started, finished))
+                        .map_err(|failed| failed.to_string())
+                },
+            )
         });
         let reporting_bus = Arc::clone(&bus);
         // The change log, served a page at a time and its tail published

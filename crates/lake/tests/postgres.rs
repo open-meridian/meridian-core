@@ -2993,3 +2993,69 @@ fn the_control_partition_logs_what_is_not_a_row_and_is_fenced() {
     assert_eq!(after.changes.len(), 1);
     assert_eq!(after.changes[0].epoch, 2);
 }
+
+// ── Integrity at rest (step 3b) ─────────────────────────────────────────────
+
+#[test]
+fn each_row_keeps_its_digest_and_the_scrub_names_one_changed_beneath_the_lake() {
+    let store = store();
+    let dataset = unique("integrity-1:daily");
+    let subject = unique("LCL-ETH");
+    store
+        .record(
+            &dataset,
+            vec![
+                close(&dataset, "a", &subject, "2026-10-07", 10),
+                close(&dataset, "b", &subject, "2026-10-08", 11),
+                close(&dataset, "c", &subject, "2026-10-09", 12),
+            ],
+            1_000,
+        )
+        .unwrap();
+    // Each row's change carries its digest, which verifies.
+    let mut changes = Vec::new();
+    meridian_changes::catch_up(
+        |after| store.read_changes(&dataset, after, 0),
+        0,
+        |change| changes.push(change.clone()),
+    )
+    .expect("the log reads");
+    assert_eq!(changes.len(), 3);
+    for change in &changes {
+        assert!(!change.digest.is_empty());
+        meridian_changes::integrity::verify(change).expect("verifies");
+    }
+    let url = std::env::var("MERIDIAN_TEST_DATABASE_URL").unwrap();
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    // A row kept before digests is given its own; a row changed beneath the
+    // lake is named by its dataset's first bad sequence.
+    client
+        .execute(
+            "UPDATE lake_row SET digest = NULL WHERE dataset = $1 AND sequence = 3",
+            &[&dataset],
+        )
+        .unwrap();
+    client
+        .execute(
+            "UPDATE lake_row SET body = body || '\\x00'::bytea WHERE dataset = $1 AND sequence = 2",
+            &[&dataset],
+        )
+        .unwrap();
+    let scrubbed = store.scrub().expect("scrubs");
+    assert!(scrubbed.filled >= 1);
+    let ours: Vec<_> = scrubbed
+        .findings
+        .iter()
+        .filter(|finding| finding.partition == dataset)
+        .collect();
+    assert_eq!(ours.len(), 1, "{:?}", scrubbed.findings);
+    assert_eq!(ours[0].sequence, 2);
+    let filled: bool = client
+        .query_one(
+            "SELECT digest = sha256(body) FROM lake_row WHERE dataset = $1 AND sequence = 3",
+            &[&dataset],
+        )
+        .unwrap()
+        .get(0);
+    assert!(filled, "the row kept before digests now has its own");
+}

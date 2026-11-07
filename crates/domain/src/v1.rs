@@ -20112,6 +20112,14 @@ pub struct Change {
     /// book entry, or a row's columns as JSON.
     #[prost(bytes = "vec", tag = "7")]
     pub body: ::prost::alloc::vec::Vec<u8>,
+    /// Its digest, kept beside it where it rests (step 3b; integrity at rest):
+    /// SHA-256 of `body` for a lake row and a captured row; for a book entry,
+    /// SHA-256 of the previous entry's digest in its partition and then
+    /// `body`, so the journal is a chain. A follower verifies what it applies
+    /// by it, and copies nothing that does not verify. Empty where the record
+    /// keeps none yet: a row recorded before digests, until the scrub fills it.
+    #[prost(bytes = "vec", tag = "8")]
+    pub digest: ::prost::alloc::vec::Vec<u8>,
 }
 /// What a plugin says about itself, from `\[tool.meridian\]` in its
 /// pyproject.toml. Declarations for an administrator to approve, not grants.

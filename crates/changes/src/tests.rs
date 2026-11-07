@@ -9,6 +9,7 @@ fn change(sequence: u64, size: usize) -> Change {
         committed_at_ns: sequence as i64,
         kind: "rows".into(),
         body: vec![7; size],
+        digest: Vec::new(),
     }
 }
 

@@ -253,8 +253,11 @@ spec:
       port: 6222
 ---
 # A StatefulSet (step 3b), so each server has a name its routes and its
-# clients reach; nothing is kept on disk: JetStream's work queue is held in
-# memory on three servers.
+# clients reach. With JetStream (three servers), each server keeps the
+# analytics units' work queue and its own Raft state on a volume of its own
+# (the NATS chart's way for a stream at three): a server restarted, one at a
+# time as an upgrade rolls them, rejoins with what it held. Without, nothing
+# is kept on disk.
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -342,9 +345,12 @@ spec:
             {{- end }}
             {{- end }}
             {{- if gt $jetstream 0 }}
-            # JetStream for the analytics units' work queue, in memory.
+            # JetStream for the analytics units' work queue, on this
+            # server's own volume, at most this much of it.
             - --jetstream
-            - "64MB"
+            - "256MB"
+            - --jetstream-store
+            - /data/jetstream
             {{- end }}
           securityContext:
             allowPrivilegeEscalation: false
@@ -377,6 +383,10 @@ spec:
             - name: nats-server
               mountPath: /opt/nats
               readOnly: true
+            {{- if gt $jetstream 0 }}
+            - name: jetstream
+              mountPath: /data/jetstream
+            {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       volumes:
@@ -387,6 +397,19 @@ spec:
         - name: instances
           configMap:
             name: {{ $name }}-instances
+  {{- if gt $jetstream 0 }}
+  volumeClaimTemplates:
+    - metadata:
+        name: jetstream
+      spec:
+        accessModes: [ReadWriteOnce]
+        {{- with (.Values.broker.jetstream | default dict).storageClassName }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ (.Values.broker.jetstream | default dict).size | default "1Gi" | quote }}
+  {{- end }}
 ---
 # Reached by this deployment's own components and by nothing else. A broker a
 # plugin could reach directly is a bus with its enforcement bypassed

@@ -37,6 +37,12 @@ pub struct Entry {
     pub meta: EntryMeta,
     pub cause: ChangeCause,
     pub body: Body,
+    /// Its place in its partition's chain (step 3b, integrity at rest): the
+    /// previous entry's digest, and its own, SHA-256 of that and its
+    /// canonical form ([`Entry::canonical`]). Empty for an entry not yet
+    /// kept, or kept before digests until the migration chains it.
+    pub previous_digest: Vec<u8>,
+    pub digest: Vec<u8>,
 }
 
 /// What an entry did, as the projection replays it.
@@ -266,9 +272,74 @@ struct Carried {
     meta: String,
     cause: String,
     body: String,
+    /// The previous entry's digest in its partition (step 3b), so the
+    /// entry carried is the entry kept, and its own digest is taken of it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    previous_digest: String,
+}
+
+/// The columns an entry is kept with, but its reply, as stored.
+pub struct Stored<'a> {
+    pub entry_id: &'a str,
+    pub account_id: &'a str,
+    pub first_sequence: u64,
+    pub last_sequence: u64,
+    pub message_id: &'a str,
+    pub idempotency_key: &'a str,
+    pub meta: &'a [u8],
+    pub cause: &'a [u8],
+    pub body: &'a [u8],
+    pub previous_digest: &'a [u8],
+}
+
+impl Stored<'_> {
+    /// The entry as its digest is taken: its change's body, built from the
+    /// bytes it is kept as, so an entry is chained and checked without
+    /// being decoded (step 3b, integrity at rest).
+    pub fn canonical(&self) -> Vec<u8> {
+        let carried = Carried {
+            entry_id: self.entry_id.to_string(),
+            account_id: self.account_id.to_string(),
+            first_sequence: self.first_sequence,
+            last_sequence: self.last_sequence,
+            message_id: self.message_id.to_string(),
+            idempotency_key: self.idempotency_key.to_string(),
+            meta: STANDARD.encode(self.meta),
+            cause: STANDARD.encode(self.cause),
+            body: STANDARD.encode(self.body),
+            previous_digest: STANDARD.encode(self.previous_digest),
+        };
+        serde_json::to_vec(&carried).expect("an entry is plain data")
+    }
 }
 
 impl Entry {
+    /// The entry as its digest is taken: its change's body, which names
+    /// every column it was kept with but its reply.
+    pub fn canonical(&self) -> Vec<u8> {
+        self.to_change(0, "").body
+    }
+
+    /// Whether the entry is the one its digest was taken of, after the
+    /// previous digest it names: what a replay checks of every entry it
+    /// reads. An entry kept before digests is taken as it is.
+    pub fn verify(&self) -> Result<()> {
+        if self.digest.is_empty()
+            || meridian_changes::integrity::chained(&self.previous_digest, &self.canonical())
+                == self.digest
+        {
+            return Ok(());
+        }
+        Err(StoreError::Unavailable(format!(
+            "entry {} of partition {} (account {}) does not match its digest {}: the record \
+             changed beneath the book, and it is not replayed from it",
+            self.last_sequence,
+            self.partition,
+            self.account_id,
+            meridian_changes::integrity::short(&self.digest)
+        )))
+    }
+
     /// The entry as its partition's change, written under `epoch` in the
     /// deployment `origin`.
     pub fn to_change(&self, epoch: u64, origin: &str) -> meridian_changes::Change {
@@ -282,6 +353,7 @@ impl Entry {
             meta: STANDARD.encode(self.meta.encode_to_vec()),
             cause: STANDARD.encode(self.cause.encode_to_vec()),
             body: STANDARD.encode(self.body.to_bytes()),
+            previous_digest: STANDARD.encode(&self.previous_digest),
         };
         meridian_changes::Change {
             partition: self.partition.clone(),
@@ -291,6 +363,7 @@ impl Entry {
             committed_at_ns: self.cause.committed_at_ns,
             kind: self.meta.kind.clone(),
             body: serde_json::to_vec(&carried).expect("an entry is plain data"),
+            digest: self.digest.clone(),
         }
     }
 
@@ -314,6 +387,8 @@ impl Entry {
             cause: ChangeCause::decode(bytes(&carried.cause)?.as_slice())
                 .map_err(|e| unreadable(e.to_string()))?,
             body: Body::from_bytes(&bytes(&carried.body)?)?,
+            previous_digest: bytes(&carried.previous_digest)?,
+            digest: change.digest.clone(),
         })
     }
 }
