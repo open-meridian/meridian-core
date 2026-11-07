@@ -825,7 +825,11 @@ e2e-cluster-k3d:
 # restored): a deployment with people, access, settings with a secret sealed,
 # and a book, backed up by the chart's CronJob on its schedule and by
 # `meridian backup --to`, wiped as a reset of the cluster wipes it, restored by
-# `meridian restore`, and held to what it was (e2e/backup/run.py). The real
+# `meridian restore`, and held to what it was (e2e/backup/run.py). With its WAL
+# archived (step 3b): restored in place to a time between two commits and held
+# to it row for row, and page checksums turned on in a database without them,
+# each the offline Job's act the CLI drives, timed into .e2e-backup-claims.jsonl.
+# The real
 # CLI, built from meridian-cli beside this checkout; the backup image from
 # deploy/backup. No platform and no Ingress.
 #
@@ -844,12 +848,15 @@ e2e-cluster-backup: backup-cli-image $(if $(E2E_BACKUP_RUNTIME),,runtime-image a
 	@ctx="$$(kubectl config current-context 2>/dev/null)"; \
 	case "$$ctx" in k3d-*|kind-*) ;; \
 	*) echo "e2e-cluster-backup: the kube context is '$$ctx', which is not a k3d or kind cluster's. It installs, wipes and restores: run it on a cluster made for it, make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-backup" >&2; exit 1;; esac
-	@echo "e2e-cluster-backup: building the backup image"
+	@echo "e2e-cluster-backup: building the backup image, and the database's with pgBackRest for its WAL archive"
 	@$(DOCKER) build -q -t $(E2E_BACKUP_IMAGE) deploy/backup >/dev/null
-	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(or $(E2E_BACKUP_RUNTIME),$(RUNTIME_IMAGE)) $(if $(E2E_BACKUP_RUNTIME),,$(ANALYTICS_IMAGE)) $(E2E_BACKUP_IMAGE) postgres:16-alpine,:)
+	@$(DOCKER) build -q -t $(E2E_POSTGRES_IMAGE) deploy/database >/dev/null
+	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(or $(E2E_BACKUP_RUNTIME),$(RUNTIME_IMAGE)) $(if $(E2E_BACKUP_RUNTIME),,$(ANALYTICS_IMAGE)) $(E2E_BACKUP_IMAGE) $(E2E_POSTGRES_IMAGE) postgres:16-alpine,:)
 	@kubectl delete namespace $(E2E_BACKUP_NAMESPACE) --ignore-not-found --wait >/dev/null 2>&1
+	@rm -f .e2e-backup-claims.jsonl
 	@E2E_NAMESPACE=$(E2E_BACKUP_NAMESPACE) E2E_IMAGE=$(or $(E2E_BACKUP_RUNTIME),$(RUNTIME_IMAGE)) \
 	 E2E_BACKUP_IMAGE=$(E2E_BACKUP_IMAGE) E2E_CLI_IMAGE=$(E2E_BACKUP_CLI_IMAGE) E2E_WORKDIR="$(CURDIR)" \
+	 E2E_POSTGRES_IMAGE=$(E2E_POSTGRES_IMAGE) \
 		$(PY) e2e/backup/run.py; \
 	  held=$$?; \
 	  if [ $$held -ne 0 ] || [ -n "$(E2E_CLUSTER_KEEP)" ]; then \
@@ -2529,7 +2536,61 @@ chart-check:
 		$(HELM_TEMPLATE) check deploy/chart $$base --set "$$refused" >/dev/null 2>&1 \
 			&& { echo "chart-check FAILED: $$refused rendered; a count CI does not test is refused (ruling 1047)" >&2; exit 1; }; \
 	done; true
-	@echo "chart-check OK: one writer per store (ruling 1060), a warm standby by value with its lease, budget and spread, none by default, 30 s node tolerations; resilience.profile tolerant by default and ha in one value, each count overridable, refused without the key in a Secret (1074), the database under Patroni and the broker at three only there; the lake's whole answers at once, 2 by default and 1 to 8 alone, and its mmap threshold, 128 KiB by default and whole bytes alone; the platform's keys on the conductor alone, as files, only where the chart carries some, its current key by default; four components, the dashboard and the three ways it signs people in, the key and the settings key on the conductor alone, both key paths, refusals, migrations, no pinned uid, a plugin held to its side of the pod, its front door open to the dashboard alone, an Ingress only when asked for and HTTPS alone unless plain HTTP is, development only when asked for, the live shape there alone, a backup only when sealed and placed, and nothing an upgrade leaves behind"
+	@# Step 3b part 3: the WAL archive (backup.walArchive). Off by default,
+	@# so a desktop renders none of it but the offline CronJob, which runs
+	@# nothing until the CLI makes a Job from it. On: the database archives
+	@# through pgBackRest from the image that holds it, a server beside it
+	@# over TLS for the backup Job alone, the passphrase from the kept
+	@# passwords, and the backup Job's base backup before it seals. Refused
+	@# where it cannot stand: an external database, no backups, a node's
+	@# directory under standbys on other nodes, an object store with no
+	@# bucket, s3 with no endpoint, a KMS key on a store that sets its own.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
+	backups="--set backup.recipient=age1check --set backup.path=/var/lib/check"; \
+	plain="$$($(HELM_TEMPLATE) check deploy/chart $$base $$backups 2>/dev/null)"; \
+	echo "$$plain" | grep -q "name: check-meridian-runtime-database-tls\|name: check-meridian-runtime-pgbackrest\|PGBACKREST_REPO1_CIPHER_PASS" \
+		&& { echo "chart-check FAILED: with backup.walArchive off, an archive still renders" >&2; exit 1; }; \
+	echo "$$plain" | grep -q "name: check-meridian-runtime-database-offline" \
+		|| { echo "chart-check FAILED: the brought database has no offline CronJob for restore --to-time and --enable-checksums" >&2; exit 1; }; \
+	echo "$$plain" | awk '/^kind: CronJob/{c=1} /^---/{c=0} c && /name: check-meridian-runtime-database-offline/{f=1} f && /suspend: true/{ok=1} END{exit !ok}' \
+		|| { echo "chart-check FAILED: the database's offline CronJob is not suspended" >&2; exit 1; }; \
+	on="$$($(HELM_TEMPLATE) check deploy/chart $$base $$backups --set backup.walArchive.enabled=true 2>/dev/null)" \
+		|| { echo "chart-check FAILED: backup.walArchive did not render with backups placed" >&2; exit 1; }; \
+	for held in "archive_command=pgbackrest --stanza=meridian archive-push %p" "archive_timeout=60" \
+		"name: check-meridian-runtime-database-tls" "tls-server-auth=meridian-backup=meridian" \
+		"pg1-host=check-meridian-runtime-database" "repo1-cipher-type=aes-256-cbc" "repo1-path=/backups/wal-archive" \
+		"repo1-retention-full=14" "key: archive" "PGBACKREST_REPO1_CIPHER_PASS" "/etc/archive/archive-backup.sh" \
+		"port: 8432" "meridian-postgres:latest"; do \
+		echo "$$on" | grep -q -- "$$held" \
+			|| { echo "chart-check FAILED: backup.walArchive renders no $$held" >&2; exit 1; }; \
+	done; \
+	ha="$$($(HELM_TEMPLATE) check deploy/chart $$base --set key.generate=false --set key.existingSecret=k \
+		--set resilience.profile=ha --set backup.recipient=age1check --set backup.existingClaim=shared \
+		--set backup.walArchive.enabled=true 2>/dev/null)" \
+		|| { echo "chart-check FAILED: backup.walArchive did not render under Patroni on a shared claim" >&2; exit 1; }; \
+	echo "$$ha" | grep -q "archive_command: pgbackrest --stanza=meridian archive-push %p" \
+		|| { echo "chart-check FAILED: under Patroni the archive is not in Patroni's own settings" >&2; exit 1; }; \
+	s3="$$($(HELM_TEMPLATE) check deploy/chart $$base $$backups --set backup.walArchive.enabled=true \
+		--set backup.walArchive.store=s3 --set backup.walArchive.bucket=b --set backup.walArchive.endpoint=s3.eu-west-2.amazonaws.com \
+		--set backup.walArchive.region=eu-west-2 --set backup.walArchive.kmsKeyId=arn-check 2>/dev/null)" \
+		|| { echo "chart-check FAILED: an s3 archive with a KMS key did not render" >&2; exit 1; }; \
+	for held in "repo1-type=s3" "repo1-s3-kms-key-id=arn-check" "repo1-s3-key-type=auto"; do \
+		echo "$$s3" | grep -q -- "$$held" || { echo "chart-check FAILED: an s3 archive renders no $$held" >&2; exit 1; }; \
+	done; \
+	for refused in "--set backup.walArchive.enabled=true" \
+		"$$backups --set backup.walArchive.enabled=true --set database.brought.enabled=false --set database.existingSecret=d" \
+		"$$backups --set backup.walArchive.enabled=true --set key.generate=false --set key.existingSecret=k --set resilience.profile=ha" \
+		"$$backups --set backup.walArchive.enabled=true --set backup.walArchive.store=gcs" \
+		"$$backups --set backup.walArchive.enabled=true --set backup.walArchive.store=s3 --set backup.walArchive.bucket=b" \
+		"$$backups --set backup.walArchive.enabled=true --set backup.walArchive.store=ftp" \
+		"$$backups --set backup.walArchive.enabled=true --set backup.walArchive.path=relative" \
+		"$$backups --set backup.walArchive.enabled=true --set backup.walArchive.store=gcs --set backup.walArchive.bucket=b --set backup.walArchive.kmsKeyId=k"; do \
+		said="$$($(HELM_TEMPLATE) check deploy/chart $$base $$refused 2>&1 >/dev/null)" \
+			&& { echo "chart-check FAILED: backup.walArchive rendered and cannot stand: $$refused" >&2; exit 1; }; \
+		echo "$$said" | grep -q "backup.walArchive" \
+			|| { echo "chart-check FAILED: backup.walArchive was refused without saying why ($$refused): $$said" >&2; exit 1; }; \
+	done; true
+	@echo "chart-check OK: one writer per store (ruling 1060), a warm standby by value with its lease, budget and spread, none by default, 30 s node tolerations; resilience.profile tolerant by default and ha in one value, each count overridable, refused without the key in a Secret (1074), the database under Patroni and the broker at three only there; the lake's whole answers at once, 2 by default and 1 to 8 alone, and its mmap threshold, 128 KiB by default and whole bytes alone; the platform's keys on the conductor alone, as files, only where the chart carries some, its current key by default; four components, the dashboard and the three ways it signs people in, the key and the settings key on the conductor alone, both key paths, refusals, migrations, no pinned uid, a plugin held to its side of the pod, its front door open to the dashboard alone, an Ingress only when asked for and HTTPS alone unless plain HTTP is, development only when asked for, the live shape there alone, a backup only when sealed and placed, its WAL archive only when asked for and refused where it cannot stand, the offline CronJob suspended, and nothing an upgrade leaves behind"
 
 lint:
 	@$(DOCKER) build -f Dockerfile.rust --target lint $(VERDICT) . >/dev/null 2>&1 \

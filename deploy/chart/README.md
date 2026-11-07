@@ -228,6 +228,48 @@ time as an upgrade rolls them, rejoins with what it held. Without JetStream
 the broker keeps nothing on disk. Every client checks its server answers
 each second and moves to another when one has not for 2 s.
 
+## The WAL archive: restoring to a point in time
+
+`backup.walArchive.enabled` (off by default) archives the brought database's
+write-ahead log off the cluster with pgBackRest, so it can be restored to any
+time since the oldest backup kept. It needs the backups set up first
+(`backup.recipient` and `backup.path` or `backup.existingClaim`): each backup
+the schedule or `meridian backup` takes adds a full base backup to the
+archive, and the newest `backup.keep` of them are kept with the WAL they need.
+
+- **Where:** `backup.walArchive.store` is `volume` (beside the sealed backups,
+  under `backup.walArchive.path`), or an object store at `path` in `bucket`:
+  `s3` (or one speaking its API, at `endpoint`, with `region`), `gcs` or
+  `azure`. Credentials are a Secret named by `existingSecret`; on s3 and gcs
+  an empty one uses the pod's own identity. A directory on one node
+  (`backup.path`) is refused for a database with standbys on other nodes.
+- **Encrypted:** always, AES-256-CBC, with a passphrase the chart keeps beside
+  the database's passwords (or the administrator's own, `cipherSecret`); every
+  backup carries it sealed, so a restore into a new cluster reads the archive.
+  On s3, `kmsKeyId` names a customer-managed key the store encrypts each
+  object with; on gcs and azure a customer-managed key is the bucket's or the
+  storage account's own setting. The database's volume is encrypted by its
+  storage class (`database.brought.storageClassName`), where the cloud's
+  storage class takes a key.
+- **How much can be lost:** a segment is archived as it fills, or after
+  `timeoutSeconds` (60) when it does not, which bounds what a restore into a
+  new cluster loses.
+- **Restoring:** `meridian restore --to-time` stops every component and the
+  database, makes a Job from the suspended CronJob
+  `<release>-meridian-runtime-database-offline` with the act
+  `restore-to-time` and the time, and starts everything again: the archive's
+  newest base backup before that time restored, the WAL replayed to it, and
+  the database promoted there on a timeline of its own.
+- **Page checksums on an older database:** the same CronJob's act
+  `enable-checksums` runs `pg_checksums --enable` on the stopped volume, for
+  `meridian upgrade-deployment --enable-checksums`; a database made by this
+  chart has them from initdb.
+
+The database runs `database.brought.patroniImage` while it archives, with
+pgBackRest's server beside it (TLS, certificates the chart makes) through
+which the backup Job takes base backups; `meridian-<store> probe` reports the
+archiver's last segment and whether it is failing.
+
 ## An upgrade checked before it changes anything
 
 Every upgrade runs a preflight first (`preflight.enabled`, on by default): a

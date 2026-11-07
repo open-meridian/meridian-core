@@ -709,7 +709,7 @@ pub const MODE_COOKIE: &str = "meridian_mode";
 pub fn inline_script_hashes() -> Vec<String> {
     use base64::Engine;
     use sha2::Digest;
-    [HEAD_SCRIPT, CHROME_SCRIPT, INBOX_SCRIPT]
+    [HEAD_SCRIPT, CHROME_SCRIPT, INBOX_SCRIPT, SHELL_SCRIPT]
         .iter()
         .map(|script| {
             format!(
@@ -1607,6 +1607,17 @@ const SIDEBAR: [(&str, &[SidebarItem]); 5] = [
 /// The header bar's height, which the sticky sidebar sits under.
 const HEADER_HEIGHT: &str = "56px";
 
+/// The shell's first child: what is above it -- the header, and the
+/// development banner where one is drawn -- measured as the shell is parsed,
+/// so `--om-sidebar-top` is right before the kit's modules run and its
+/// pagers first measure. Set later, by the chrome's script, a slow machine's
+/// pager fitted its rows beside a sidebar as tall as the screen and stuck at
+/// one (step 3b part 2's probe); the chrome's script still measures again on
+/// a resize and once the sidebar is defined.
+const SHELL_SCRIPT: &str = "(function(s){if(!s)return;var t=s.getBoundingClientRect().top+\
+window.scrollY;if(t>0)s.style.setProperty(\"--om-sidebar-top\",Math.round(t)+\"px\");})\
+(document.currentScript&&document.currentScript.parentNode);";
+
 /// The sidebar and the page beside it (kit 0.13.0's `om-sidebar`): its
 /// groups as data, and the same links as a plain list for a browser
 /// without the kit.
@@ -1657,6 +1668,7 @@ pub fn shell(current: &str, body: &str) -> String {
     };
     format!(
         "<div class=\"om-shell\" style=\"--om-sidebar-top:{HEADER_HEIGHT}\">\
+         <script>{SHELL_SCRIPT}</script>\
          <om-sidebar label=\"Settings\" remember=\"admin\"{current}>\
          <script type=\"application/json\">{data}</script>\
          <nav aria-label=\"Settings\"><ul>{links}</ul></nav></om-sidebar>\

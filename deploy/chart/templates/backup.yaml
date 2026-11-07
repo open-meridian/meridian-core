@@ -54,7 +54,8 @@
 {{- end }}
 {{/* The administrator's own, named in these values: theirs to have made, and
      a restore needs them as much as the chart's. */}}
-{{- $operator := list .Values.database.existingSecret .Values.migrate.existingSecret .Values.migrate.streetSecret .Values.migrate.configSecret .Values.migrate.borSecret .Values.migrate.lakeSecret .Values.conductor.database.existingSecret .Values.street.database.existingSecret .Values.bor.database.existingSecret .Values.lake.database.existingSecret .Values.broker.existingSecret .Values.firstRun.directorySecretName .Values.dashboard.oidc.existingSecret .Values.key.existingSecret .Values.ingress.tls.secretName .Values.ingress.tls.pluginsSecretName }}
+{{- $archive := include "meridian-runtime.walArchive" . }}
+{{- $operator := list (ternary ((.Values.backup.walArchive | default dict).cipherSecret | default "") "" (not (empty $archive))) .Values.database.existingSecret .Values.migrate.existingSecret .Values.migrate.streetSecret .Values.migrate.configSecret .Values.migrate.borSecret .Values.migrate.lakeSecret .Values.conductor.database.existingSecret .Values.street.database.existingSecret .Values.bor.database.existingSecret .Values.lake.database.existingSecret .Values.broker.existingSecret .Values.firstRun.directorySecretName .Values.dashboard.oidc.existingSecret .Values.key.existingSecret .Values.ingress.tls.secretName .Values.ingress.tls.pluginsSecretName }}
 {{- range .Values.sidecars }}
 {{- with .plugin }}
 {{- $operator = append $operator (.existingSecret | default "") }}
@@ -178,6 +179,48 @@ spec:
                       app.kubernetes.io/instance: {{ .Release.Name }}
                       meridian.dev/component: conductor
           {{- end }}
+          {{- if $archive }}
+          # The WAL archive's full base backup (backup.walArchive), taken
+          # first through the primary's pgBackRest server over TLS, in the
+          # database's own image, as the database's user (files/archive-
+          # backup.sh); a failure fails the run before anything is sealed.
+          initContainers:
+            - name: archive
+              image: {{ .Values.database.brought.patroniImage | quote }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              command: ["/bin/sh", "/etc/archive/archive-backup.sh"]
+              env:
+                - name: MERIDIAN_ARCHIVE_URL_KEY
+                  value: {{ .Values.database.key | default "url" | quote }}
+                {{- include "meridian-runtime.walArchiveEnv" . | nindent 16 }}
+              volumeMounts:
+                - name: archive-script
+                  mountPath: /etc/archive
+                  readOnly: true
+                - name: archive-tls
+                  mountPath: /etc/archive-tls
+                  readOnly: true
+                - name: archive-database
+                  mountPath: /in/database
+                  readOnly: true
+                - name: archive-config
+                  mountPath: /etc/pgbackrest
+                  readOnly: true
+                {{- if eq .Values.backup.walArchive.store "volume" }}
+                - name: backups
+                  mountPath: /backups
+                {{- else if and (eq .Values.backup.walArchive.store "gcs") .Values.backup.walArchive.existingSecret }}
+                - name: archive-store
+                  mountPath: /etc/pgbackrest-store
+                  readOnly: true
+                {{- end }}
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  memory: 512Mi
+          {{- end }}
           containers:
             - name: backup
               image: {{ $b.image | quote }}
@@ -261,6 +304,36 @@ spec:
             - name: backups
               persistentVolumeClaim:
                 claimName: {{ $claim }}
+            {{- if $archive }}
+            - name: archive-script
+              configMap:
+                name: {{ $full }}-pgbackrest
+                items:
+                  - key: archive-backup.sh
+                    path: archive-backup.sh
+            - name: archive-tls
+              secret:
+                secretName: {{ $full }}-database-tls
+            # Whether first run has written the database's URL yet.
+            - name: archive-database
+              secret:
+                secretName: {{ include "meridian-runtime.databaseSecret" . | quote }}
+                optional: true
+            - name: archive-config
+              configMap:
+                name: {{ $full }}-pgbackrest
+                items:
+                  - key: backup.conf
+                    path: pgbackrest.conf
+            {{- if and (eq .Values.backup.walArchive.store "gcs") .Values.backup.walArchive.existingSecret }}
+            - name: archive-store
+              secret:
+                secretName: {{ .Values.backup.walArchive.existingSecret | quote }}
+                items:
+                  - key: key
+                    path: key
+            {{- end }}
+            {{- end }}
             # Plain text until sealed, removed by the script on any exit and
             # with the pod.
             - name: work
