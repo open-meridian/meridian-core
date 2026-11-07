@@ -441,6 +441,22 @@ def members_settled(component):
     return len(live) == want and all(ready(p) for p in live)
 
 
+def modes_of(component, seconds=60):
+    """The members' modes, sorted, once they are one writer and one standby
+    or `seconds` have passed. Asked again rather than once: a probe through
+    kubectl exec that did not run (its node's kubelet busy, a run's 15 s
+    timeout) reads as no mode, and a local run failed network-policy on
+    (['', 'standby']) with the writer serving."""
+    found = {}
+
+    def settled():
+        found["modes"] = sorted((probe(p["metadata"]["name"], component) or {}).get("member", {}).get("mode", "")
+                                for p in pods(component))
+        return found["modes"] == ["standby", "writer"]
+    happens(settled, seconds, every=1)
+    return found.get("modes", [])
+
+
 # ── The shape of the HA configuration (e2e-cluster-scaled) ─────────────────
 
 def rendered(component):
@@ -462,8 +478,7 @@ def shape(s):
         s.check(len(zones) == 2 and "" not in zones, f"{component}: in two zones ({', '.join(sorted(zones))})")
         held = holder(component)
         s.check(held in {p["metadata"]["name"] for p in live}, f"{component}: its lease held by a member ({held})")
-        modes = sorted((probe(p["metadata"]["name"], component) or {}).get("member", {}).get("mode", "")
-                       for p in live)
+        modes = modes_of(component)
         s.check(modes == ["standby", "writer"], f"{component}: one writer, one standby ({modes})")
         budget = kubectl("get", "pdb", f"{FULL}-{component}", check=False).returncode == 0
         s.check(budget, f"{component}: a disruption budget over its members")
@@ -594,8 +609,7 @@ def kill_writer(s, failure, component):
     claim(s, failure, component, took, bound, extra)
     wait_for(f"{component}'s members back", lambda: members_settled(component), seconds=300)
     if PROFILE != "tolerant":
-        modes = sorted((probe(p["metadata"]["name"], component) or {}).get("member", {}).get("mode", "")
-                       for p in pods(component))
+        modes = modes_of(component)
         s.check(modes == ["standby", "writer"], f"{failure}: the killed writer came back as the standby ({modes})")
 
 
@@ -777,11 +791,12 @@ def network_policy(s):
         # With a standby, a writer cut from its database may step down and the
         # standby take over: held to one writer, the members back.
         settled = happens(lambda: members_settled(component), 180)
-        modes = sorted((probe(p["metadata"]["name"], component) or {}).get("member", {}).get("mode", "")
-                       for p in pods(component))
-        s.check(settled and modes == ["standby", "writer"] and holder(component) in
-                {p["metadata"]["name"] for p in pods(component)},
-                f"network-policy: one writer and its standby once healed ({modes})")
+        modes = modes_of(component)
+        one = settled and modes == ["standby", "writer"] and holder(component) in {
+            p["metadata"]["name"] for p in pods(component)}
+        s.check(one, f"network-policy: one writer and its standby once healed ({modes})")
+        if not one:
+            explain(s, "network-policy", component)
     if healed:
         claim(s, "network-policy", component, took, 60)
 
