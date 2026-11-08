@@ -70,8 +70,18 @@ jobs:
         if: steps.cargo-cache.outputs.cache-hit != 'true'
         run: tools/ci-cargo-cache.sh put "$RUNNER_TEMP/cargo"
 
+      # The release build through GitHub's cache for sccache (ruling 1104;
+      # step 3b part 5) on every push to main, so what it compiles is kept in
+      # main's scope, which every pull request's and the merge queue's runs
+      # read (a run's own entries are its ref's alone). The token a BuildKit
+      # secret alone (tools/with-sccache.sh). Pinned by commit (v3.1.0).
+      - uses: ./workspace/meridian-core/.github/actions/ci-tools
+        with:
+          tools: sccache
+
+      - uses: crazy-max/ghaction-github-runtime@3cb05d89e1f492524af3d41a1c98c83bc3025124
+
       - name: make runtime-image
-        if: steps.cargo-cache.outputs.cache-hit != 'true'
         env:
           DOCKER_BUILDKIT: "1"
         run: make runtime-image

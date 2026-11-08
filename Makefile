@@ -1203,9 +1203,15 @@ ci-images:
 	@$(foreach t,$(IMAGE_TARGETS),echo "$(t:-image=) $(IMAGE_OF_$(t))";)
 
 ifeq ($(IMAGES),build)
+# The release build's log kept (.runtime-image.log), so what sccache did --
+# its hits and misses, where CI gives it GitHub's cache -- is said beside
+# the time it took.
 runtime-image:
-	@began=$$(date +%s); $(DOCKER) build -q $(VERSION_ARG) $(FETCHED) $(SCCACHE_SECRETS) $(call candidate,$(RUNTIME_IMAGE),meridian-runtime) . >/dev/null \
-		&& echo "runtime-image: built in $$(( $$(date +%s) - began ))s"
+	@began=$$(date +%s); $(DOCKER) build --progress=plain $(VERSION_ARG) $(FETCHED) $(SCCACHE_SECRETS) $(call candidate,$(RUNTIME_IMAGE),meridian-runtime) . >.runtime-image.log 2>&1 \
+		|| { echo "runtime-image FAILED: the runtime image did not build. The last 40 lines, and the whole of it in .runtime-image.log:" >&2; \
+		     tail -n 40 .runtime-image.log | cut -c1-400 >&2; exit 1; }; \
+		cached="$$(grep -oE 'Cache (hits|misses) +[0-9]+' .runtime-image.log | head -n 2 | tr -s ' ' | paste -sd ',' -)"; \
+		echo "runtime-image: built in $$(( $$(date +%s) - began ))s$${cached:+ (sccache: $$cached)}"
 
 analytics-image:
 	@began=$$(date +%s); $(DOCKER) build -q $(VERSION_ARG) $(FETCHED) $(SCCACHE_SECRETS) --target analytics $(call candidate,$(ANALYTICS_IMAGE),meridian-analytics) . >/dev/null \
