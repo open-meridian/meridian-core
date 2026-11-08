@@ -1367,8 +1367,14 @@ def zone_lost(s):
 # acknowledged id printed, the connection made again after a refusal.
 LONG_WRITER = r"""
 export PGPASSWORD="$POSTGRES_PASSWORD"
+# Each attempt bounded, so a stop is heard within seconds: a connection to a
+# database member that moved away (a reconfigure replaces them all) otherwise
+# waits out TCP's own timeout, and the writer missed its 60 s to stop (CI run
+# 42460520211). An attempt cut short prints nothing, so it is never counted
+# acknowledged; a commit is never cancelled from the server's side.
+export PGCONNECT_TIMEOUT=5
 while [ ! -e /tmp/stop ]; do
-  id=$(psql -X -q -At -h HOST -U postgres -d meridian -v ON_ERROR_STOP=1 \
+  id=$(timeout 15 psql -X -q -At -h HOST -U postgres -d meridian -v ON_ERROR_STOP=1 \
        -c "insert into failover_marks (at) values (clock_timestamp()) returning id" 2>/dev/null) \
     && echo "ACKED $id"
   sleep 0.2
@@ -1470,7 +1476,8 @@ def reconfigure(s):
                     seconds=600)
                 again = run("helm", "upgrade", RELEASE, CHART, "--namespace", NAMESPACE, "--reuse-values",
                             *helm_takes_counts(), "--set", f"resilience.profile={target}", check=False)
-                s.check(again.returncode == 0, "reconfigure: the second upgrade adds the database's standbys")
+                s.check(again.returncode == 0, "reconfigure: the second upgrade adds the database's standbys"
+                        + ("" if again.returncode == 0 else f": {again.stderr.decode(errors='replace')[-400:]}"))
         settled = happens(settled_everywhere, 900, every=5)
         took = time.time() - began
         s.check(settled, f"reconfigure: every member in the {target} shape and ready, {took:.0f}s after the upgrade")

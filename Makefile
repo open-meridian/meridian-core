@@ -9,7 +9,7 @@ COMPOSE := docker compose
 COMPOSE_TEST := $(COMPOSE) -f docker-compose.yaml -f e2e/postgres-for-tests.yaml
 DOCKER := DOCKER_BUILDKIT=1 docker
 
-.PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep install-hooks ci-mirror-check licence-check-test gate-start check-leftovers check-leftovers-end \
+.PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep pre-push pre-push-run fast-rust install-hooks ci-mirror-check licence-check-test gate-start check-leftovers check-leftovers-end \
         gate-mark-tests ci-stage images runtime-images test-images ci-images runtime-image analytics-image harness-image interop-image version-check-image tests-image settings-binary-image backup-cli-image stage-checks stage-images stage-compile stage-tests stage-settings-page stage-sdk stage-dashboards stage-harness stage-first-run stage-image stage-lint \
         e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external e2e-cluster-backup e2e-cluster-reconfigure \
         test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-service-account e2e-lake e2e-recorded e2e-orders e2e-one-id e2e-harness \
@@ -17,7 +17,9 @@ DOCKER := DOCKER_BUILDKIT=1 docker
         interop e2e-book check-reference-cases reference-cases prompt-attacks lint fmt lock contract-diff up down demo network codegen check-codegen advisories e2e-first-run claims-check claims-ledger
 
 help:
-	@echo "  make ci-local       run every gate (the pre-push gate, and what CI mirrors)"
+	@echo "  make pre-push       the fast gate the pre-push hook runs: lint, build, the changed crates' tests, the stages a path selects"
+	@echo "  make ci-local       every stage, as CI runs them: optional, for when CI is down (CI and the merge queue decide)"
+	@echo "  make ci-stage STAGE=<stage>  one CI stage, as its job runs it (reproduce a failing job before pushing again)"
 	@echo "  make codegen        regenerate the domain bindings from proto/"
 	@echo "  make check-codegen  fail if crates/domain/src/v1.rs or the book's transition table is stale"
 	@echo "  make build          compile the workspace"
@@ -47,9 +49,12 @@ help:
 	@echo "  make demo           register this deployment and prove the round trip"
 	@echo "  make lint           rustfmt --check and clippy with warnings denied"
 	@echo "  make lock           regenerate Cargo.lock"
-	@echo "  make install-hooks  point git at hooks/ so push fires ci-local"
+	@echo "  make install-hooks  point git at hooks/ so push fires pre-push"
 
-# Local green is the completion signal; CI is confirmation.
+# CI on the pull request runs every stage below, and the merge queue is the
+# only authority for main (accepted 2026-11-07, superseding ruling 1075's
+# full local gate). `make ci-local` runs them all here too, for when CI is
+# down; the pre-push hook runs the fast gate, `make pre-push`, after them.
 #
 # In stages, inside a disk budget (tools/gate.py). The gates share one disk
 # with the development deployment, whose kubelet evicted every pod at 14 GB
@@ -186,6 +191,100 @@ stage-image:      gate-begin-image check-nats-permissions check-image-version
 	@$(GATE) end image
 stage-lint:       gate-begin-lint lint check-leftovers-end
 	@$(GATE) end lint
+
+# The fast gate (accepted 2026-11-07; the pre-push hook runs it): ten minutes
+# or less on a warm cache, because CI on the pull request runs everything and
+# the merge queue decides what reaches main. Every push runs the checks that
+# need no image -- the contract diff, the mirror, the boundaries, the clock,
+# the test targets, the claims ledger -- and RustSec's advisories; the rest
+# only when a path the branch changed against PRE_PUSH_BASE maps to them here:
+#
+#   rust      cargo fmt --check, clippy and the debug build of the workspace,
+#             on the warm cargo caches, so only what a change touched and what
+#             depends on it is redone; then the unit tests of the crates the
+#             branch changed and of every crate depending on them
+#             (Dockerfile.rust's fast). `crate` maps a path to the crate it is
+#             in, or else to the crates whose sources name it; `workspace` to
+#             every crate.
+#   codegen   check-codegen: the generated domain bindings, transitions and
+#             dictionary against a fresh generation
+#   chart     chart-check: helm lint, the renders and the refusals
+#   contract  the SDK stage: the reference cases, interop and e2e-book, the
+#             Python SDK against this runtime (SDK, beside this checkout)
+#   image     the runtime image's broker permissions and version
+#
+# Which ran and why is printed first (tools/pre_push.py). Whatever this does
+# not run, CI does; reproduce a failing job with `make ci-stage STAGE=<x>`
+# before pushing again. The whole run is measured as ci-local's stages are
+# (tools/gate.py), and prints each stage's peak disk and time at the end.
+PRE_PUSH_BASE ?= origin/main
+PRE_PUSH_ALWAYS := checks
+PRE_PUSH_ORDER := checks rust codegen chart contract image
+PRE_PUSH_MAP := \
+	crates/*=crate \
+	deploy/*=crate \
+	Cargo.toml=workspace,codegen \
+	Cargo.lock=workspace \
+	Dockerfile.rust=workspace \
+	.config/*=workspace \
+	tools/fresh-sources.sh=workspace \
+	proto/*=codegen,contract \
+	codegen/*=codegen \
+	Dockerfile.codegen=codegen \
+	tools/generate_transitions.py=codegen \
+	crates/domain/src/v1.rs=codegen \
+	crates/bor/src/transitions.rs=codegen \
+	crates/dashboard/src/mcp/fields.json=codegen \
+	e2e/interop/*=contract \
+	e2e/book/*=contract \
+	crates/analytics-engine/reference_cases/*=contract \
+	deploy/chart/*=chart \
+	Dockerfile=image \
+	deploy/nats/*=image
+# The fast gate's budgets, GB above the start as GATE_BUDGETS; the rust stage
+# is charged like the compile, and the stages after it above what it left.
+PRE_PUSH_BUDGETS ?= checks=4 rust=9 codegen=4 chart=4 contract=9 image=9
+PRE_PUSH_BUDGETS_COLD ?= rust=11 contract=11 image=11
+# The nextest filterset of the crates whose tests run; set by pre-push.
+PRE_PUSH_TESTS ?=
+
+pre-push:
+	@$(PY) tools/pre_push.py --self-test >/dev/null
+	@mkdir -p .gate
+	@$(PY) tools/pre_push.py plan --base "$(PRE_PUSH_BASE)" --always "$(PRE_PUSH_ALWAYS)" \
+		--order "$(PRE_PUSH_ORDER)" --map "$(PRE_PUSH_MAP)" --out .gate/pre-push.plan
+	@began=$$(date +%s); \
+	eval "$(MAKE) --no-print-directory pre-push-run $$(cat .gate/pre-push.plan)" \
+		|| { echo "pre-push: FAILED after $$(( $$(date +%s) - began ))s" >&2; exit 1; }; \
+	took=$$(( $$(date +%s) - began )); \
+	echo; echo "pre-push: GREEN in $$((took / 60))m$$(printf %02d $$((took % 60)))s; CI runs everything else"
+
+pre-push-run: GATE_BUDGETS = $(PRE_PUSH_BUDGETS)
+pre-push-run: GATE_BUDGETS_COLD = $(PRE_PUSH_BUDGETS_COLD)
+pre-push-run: gate-start $(addprefix pre-push-,$(PRE_PUSH_STAGES))
+	@$(GATE) finish
+
+pre-push-checks:   gate-begin-checks contract-diff ci-mirror-check licence-check-test check-crate-boundaries check-one-clock check-test-targets check-local-storage claims-check advisories
+	@$(GATE) end checks
+pre-push-rust:     gate-begin-rust fast-rust
+	@$(GATE) end rust
+pre-push-codegen:  gate-begin-codegen check-codegen
+	@$(GATE) end codegen
+pre-push-chart:    gate-begin-chart chart-check
+	@$(GATE) end chart
+pre-push-contract: gate-begin-contract check-leftovers check-reference-cases interop e2e-book
+	@$(GATE) end contract
+pre-push-image:    gate-begin-image check-nats-permissions check-image-version
+	@$(GATE) end image
+
+fast-rust:
+	@$(DOCKER) build -f Dockerfile.rust --target fast --build-arg FAST_TESTS="$(PRE_PUSH_TESTS)" \
+		--progress=plain $(VERDICT) . >.pre-push-rust.log 2>&1 \
+		|| { echo "rust FAILED. What cargo said, and the whole of it in .pre-push-rust.log:" >&2; \
+		     grep -E -A12 -e 'error(\[E[0-9]+\])?:' -e 'Diff in ' -e ' FAIL \[' .pre-push-rust.log \
+		       | cut -c1-400 | head -160 >&2; \
+		     echo "-- the last 30 lines:" >&2; tail -n 30 .pre-push-rust.log | cut -c1-400 >&2; exit 1; }
+	@echo "rust OK: formatted, clippy clean, the workspace builds$(if $(PRE_PUSH_TESTS),$(comma) and the unit tests of $(words $(filter package%,$(PRE_PUSH_TESTS))) crate(s) pass,; no crate's tests selected)"
 
 gate-start:
 	@$(GATE) start --make-pid $$PPID --floor-start $(GATE_DISK_START) --floor-stop $(GATE_DISK_STOP) \
@@ -346,11 +445,22 @@ VERDICT := --output type=cacheonly
 
 # Published vulnerabilities in anything the workspace links, from RustSec,
 # read fresh each run. Every exception is in deny.toml with its reason.
+# A failure says which it is: a finding names its advisory (cargo-deny's
+# error[vulnerability], [unsound], [unmaintained] or [yanked], with its
+# RUSTSEC id), and anything else -- a download that failed, the database
+# not fetched -- is said as that, never as a vulnerability.
 advisories:
-	@$(DOCKER) build -f Dockerfile.rust --target advisories $(VERDICT) . >/dev/null 2>&1 \
-		|| { echo "advisories FAILED: a published vulnerability reaches this workspace. See it with:" >&2; \
-		     echo "  DOCKER_BUILDKIT=1 docker build -f Dockerfile.rust --target advisories --progress=plain ." >&2; exit 1; }
-	@echo "advisories OK: no published vulnerability reaches the workspace unexplained"
+	@out=$$($(DOCKER) build -f Dockerfile.rust --target advisories --progress=plain $(VERDICT) . 2>&1) \
+		&& { echo "advisories OK: no published vulnerability reaches the workspace unexplained"; exit 0; }; \
+	if printf '%s\n' "$$out" | grep -qE 'error\[(vulnerability|unsound|unmaintained|yanked|notice)\]'; then \
+		echo "advisories FAILED: a published vulnerability reaches this workspace:" >&2; \
+		printf '%s\n' "$$out" | grep -oE 'error\[[a-z]+\]: .*|RUSTSEC-[0-9]{4}-[0-9]{4}' | sort -u | cut -c1-200 >&2; \
+	else \
+		echo "advisories FAILED: the check could not run -- a download or the network, not a finding. The end of what the build said:" >&2; \
+		printf '%s\n' "$$out" | grep -vE '^#[0-9]+ (DONE|CACHED|\[)' | tail -n 12 | cut -c1-300 >&2; \
+	fi; \
+	echo "See it with:  DOCKER_BUILDKIT=1 docker build -f Dockerfile.rust --target advisories --progress=plain ." >&2; \
+	exit 1
 
 build:
 	@$(DOCKER) build -f Dockerfile.rust --target check $(SCCACHE_SECRETS) $(VERDICT) . >/dev/null 2>&1 \
@@ -752,7 +862,7 @@ E2E_K3D_HTTP ?= $(E2E_CLUSTER_HTTP_PORT)
 # .e2e-cluster.log when it fails: the backup run's own for that run. CI run
 # 38188494317's backup failure logged no pod at all, read from meridian-e2e,
 # which that run never makes.
-E2E_K3D_NAMESPACE = $(if $(filter e2e-cluster-backup,$(E2E_CLUSTER_TARGET)),$(E2E_BACKUP_NAMESPACE),$(if $(filter e2e-cluster-failover e2e-cluster-scaled,$(E2E_CLUSTER_TARGET)),$(E2E_FAILOVER_NAMESPACE),$(E2E_CLUSTER_NAMESPACE)))
+E2E_K3D_NAMESPACE = $(if $(filter e2e-cluster-backup,$(E2E_CLUSTER_TARGET)),$(E2E_BACKUP_NAMESPACE),$(if $(filter e2e-cluster-failover e2e-cluster-scaled e2e-cluster-reconfigure,$(E2E_CLUSTER_TARGET)),$(E2E_FAILOVER_NAMESPACE),$(E2E_CLUSTER_NAMESPACE)))
 # Agents beside the server, and the zones they are labelled into, one each
 # in order (step 3b): the HA configuration's runs make three, in three
 # zones. None by default: one node, as a desktop runs.
@@ -2672,7 +2782,7 @@ lock:
 
 install-hooks:
 	@git config core.hooksPath hooks
-	@echo "hooks installed: git push now runs 'make ci-local' first"
+	@echo "hooks installed: git push now runs 'make pre-push' first"
 
 # Migration before start, because a starting runtime verifies the street store's
 # schema and refuses to serve against one it does not recognise. One command

@@ -101,12 +101,16 @@ every commit with three of core's stand-in plugins.
 
 ## Working on it
 
-    make ci-local
+    make pre-push
 
-Local green is the completion signal, and `make install-hooks` runs it before
-every push. It runs in stages inside a disk budget, compiling the workspace
-once: it wants 20 GB free on Docker's disk to start and stops itself under 16
-(`GATE_DISK_START`, `GATE_DISK_STOP` and the budgets are in the Makefile).
+The fast gate, which `make install-hooks` runs before every push: lint, the
+build, the changed crates' unit tests and the stages the changed paths select,
+each named with why. CI on the pull request runs everything, and the merge
+queue decides what reaches `main`. `make ci-local` runs every stage locally,
+for when CI is down; `make ci-stage STAGE=<stage>` runs one CI job. Both run
+in stages inside a disk budget: they want 20 GB free on Docker's disk to start
+and stop themselves under 16 (`GATE_DISK_START`, `GATE_DISK_STOP` and the
+budgets are in the Makefile).
 `docker compose up` runs every component locally with a database
 and a broker. `make demo` proves the round trip against a platform -- resolve,
 miss, pull, apply, then take the platform away and watch resolution keep

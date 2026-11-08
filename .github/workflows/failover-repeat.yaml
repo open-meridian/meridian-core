@@ -1,0 +1,196 @@
+# The failure classes, injected and timed, run several times over on the same
+# images, and green only when every run is (accepted 2026-11-07: the fast
+# local gate, CI decides). It replaces the five local runs a step 3b change
+# was proved by: `make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover`
+# in a profile, `repeat` times, each on its own runner and its own cluster,
+# from one build of the runtime and analytics images.
+#
+#   gh workflow run failover-repeat --ref <branch> -f profile=ha -f repeat=5
+#
+# By hand only. Each run keeps its claims (failover-claims-<profile>-<n>), as
+# ci's failover jobs keep theirs for the claims ledger.
+name: failover-repeat
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: The profile installed (tolerant; ha on three agents in three zones; or reconfigure, a live install moved tolerant -> ha -> tolerant, as e2e-cluster-reconfigure runs)
+        type: choice
+        options: [ha, tolerant, reconfigure]
+        default: ha
+      failure:
+        description: The failure classes injected, comma-separated (FAILURE=); empty for the profile's all (reconfigure takes none)
+        type: string
+        default: ""
+      repeat:
+        description: How many runs, each of which must be green (1 to 10)
+        type: string
+        default: "5"
+
+permissions:
+  contents: read
+
+jobs:
+  # The images every run installs, built once, as ci's images job builds
+  # them (make runtime-image analytics-image), over the release build's cargo
+  # caches main keeps (cargo-cache.yaml); read, never written, here.
+  failover-images:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      runs: ${{ steps.runs.outputs.runs }}
+    defaults:
+      run:
+        working-directory: workspace/meridian-core
+    steps:
+      - name: The runs
+        id: runs
+        working-directory: .
+        env:
+          REPEAT: ${{ inputs.repeat }}
+          FAILURE: ${{ inputs.failure }}
+        run: |
+          case "$REPEAT" in
+            [1-9] | 10) ;;
+            *) echo "::error::repeat is a whole number from 1 to 10, not '$REPEAT'"; exit 1 ;;
+          esac
+          case "$FAILURE" in
+            *[!a-z0-9,-]*) echo "::error::failure is class names, comma-separated, not '$FAILURE'"; exit 1 ;;
+          esac
+          echo "runs=[$(seq -s, 1 "$REPEAT")]" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          path: workspace/meridian-core
+
+      - name: Free the runner's disk
+        run: tools/free-runner-disk.sh
+
+      - name: The cargo caches' key
+        id: cargo
+        run: |
+          rust="$(sed -n 's/^ARG RUST_VERSION=//p' Dockerfile | head -1)"
+          echo "prefix=cargo-release-${RUNNER_OS}-rust${rust}-" >> "$GITHUB_OUTPUT"
+          echo "key=cargo-release-${RUNNER_OS}-rust${rust}-${{ hashFiles('workspace/meridian-core/Cargo.lock') }}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the cargo caches
+        uses: actions/cache/restore@v4
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/cargo
+          key: ${{ steps.cargo.outputs.key }}
+          restore-keys: ${{ steps.cargo.outputs.prefix }}
+
+      - name: Put the cargo caches in place
+        continue-on-error: true
+        run: tools/ci-cargo-cache.sh put "$RUNNER_TEMP/cargo"
+
+      - name: make runtime-image analytics-image
+        env:
+          DOCKER_BUILDKIT: "1"
+        run: make runtime-image analytics-image
+
+      - name: Save the images
+        run: tools/ci-images.sh save "$RUNNER_TEMP/failover-images" runtime analytics
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: failover-images
+          path: ${{ runner.temp }}/failover-images
+          compression-level: 0
+          retention-days: 1
+
+  # Each run as ci's e2e-cluster-k3d job runs e2e-cluster-failover: its own
+  # runner, its own k3d cluster, the images above.
+  failover-repeat:
+    name: failover-repeat (${{ inputs.profile }}, run ${{ matrix.run }})
+    needs: [failover-images]
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.profile == 'tolerant' && 45 || 70 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        run: ${{ fromJSON(needs.failover-images.outputs.runs) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: workspace/meridian-core
+
+      - name: Free the runner's disk
+        working-directory: workspace/meridian-core
+        run: tools/free-runner-disk.sh
+
+      - uses: ./workspace/meridian-core/.github/actions/gate-images
+        with:
+          artifacts: failover-images
+          names: runtime analytics
+
+      # Pinned, and checked against the release's own checksum, as ci's.
+      - name: k3d
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 6 --retry-all-errors --retry-delay 10 --retry-max-time 300 -o /tmp/k3d https://github.com/k3d-io/k3d/releases/download/v5.9.0/k3d-linux-amd64
+          echo "06d8f25bc3a971c4eb29e0ff08429b180402db0f4dec838c9eac427e296800a0  /tmp/k3d" | sha256sum -c -
+          sudo install -m 0755 /tmp/k3d /usr/local/bin/k3d
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+
+      - name: make e2e-cluster-k3d
+        working-directory: workspace/meridian-core
+        env:
+          DOCKER_BUILDKIT: "1"
+          PROFILE: ${{ inputs.profile }}
+          FAILURE: ${{ inputs.failure }}
+        run: |
+          agents=0 zones=""
+          if [ "$PROFILE" != tolerant ]; then agents=3 zones="zone-a zone-b zone-c"; fi
+          if [ "$PROFILE" = reconfigure ]; then FAILURE=""; fi
+          make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover IMAGES=pulled \
+            PROFILE="$PROFILE" FAILURE="$FAILURE" E2E_K3D_AGENTS="$agents" E2E_K3D_ZONES="$zones"
+
+      - name: Keep the failure classes' measurements
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: failover-claims-${{ inputs.profile }}-${{ matrix.run }}
+          path: workspace/meridian-core/.e2e-failover-claims.jsonl
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Say what the cluster said
+        if: failure()
+        working-directory: workspace/meridian-core
+        run: |
+          for log in .e2e-*.log; do
+            [ -f "$log" ] || continue
+            echo "::group::$log, its last 300 lines"
+            tail -n 300 "$log"
+            echo "::endgroup::"
+          done
+
+  # Green only when every run was.
+  failover-verdict:
+    name: failover-repeat (every run green)
+    needs: [failover-images, failover-repeat]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every run green
+        env:
+          IMAGES: ${{ needs.failover-images.result }}
+          RUNS: ${{ needs.failover-repeat.result }}
+          PROFILE: ${{ inputs.profile }}
+          REPEAT: ${{ inputs.repeat }}
+        run: |
+          if [ "$IMAGES" = success ] && [ "$RUNS" = success ]; then
+            echo "failover-repeat: $REPEAT of $REPEAT runs green in $PROFILE"
+          else
+            echo "::error::failover-repeat: not every run was green in $PROFILE (images $IMAGES, runs $RUNS)"
+            exit 1
+          fi

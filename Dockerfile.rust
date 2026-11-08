@@ -18,7 +18,7 @@ ARG RUNTIME_IMAGE=meridian-runtime:local
 # compiles (ruling 1068).
 ARG SETTINGS_BINARY=settings-binary-image
 
-FROM rust:${RUST_VERSION}-slim-bookworm AS base
+FROM rust:${RUST_VERSION}-slim-bookworm AS toolchain
 # tzdata: the instrument store reads a spot-date rule's cut in its zone from
 # the host's tz database (contract v22, W3.20), and its tests do too.
 # lld: the linker on arm64 too (ruling 1069, 449). Rust links with its own
@@ -27,6 +27,11 @@ FROM rust:${RUST_VERSION}-slim-bookworm AS base
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git ca-certificates tzdata lld curl \
  && rm -rf /var/lib/apt/lists/*
+# Every download here is retried with backoff: GitHub's release downloads
+# answer 504 at times (2026-11-08, one merge-queue run lost each time), and a
+# tool that could not be fetched is no verdict on the change. What was
+# fetched is still checked against its published digest, as before.
+#
 # sccache (ruling 1104; step 3b part 4): the compiles CI runs from cold
 # fetch what an earlier run compiled from GitHub's cache, keyed by what
 # rustc is given. A pinned release, checked against its published digest.
@@ -42,7 +47,7 @@ RUN case "${TARGETARCH}" in \
       arm64) ARCH=aarch64; SUM="${SCCACHE_SHA256_ARM64}" ;; \
       *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
     esac \
- && curl -fsSL -o /tmp/sccache.tgz \
+ && curl -fsSL --retry 6 --retry-all-errors --retry-delay 10 --retry-max-time 300 -o /tmp/sccache.tgz \
       "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-${ARCH}-unknown-linux-musl.tar.gz" \
  && echo "${SUM}  /tmp/sccache.tgz" | sha256sum -c - \
  && tar -xzf /tmp/sccache.tgz -C /tmp \
@@ -62,6 +67,11 @@ WORKDIR /w
 # set from what the cache last saw of its content, so another checkout's build
 # is never taken for this one's (tools/fresh-sources.sh).
 COPY tools/fresh-sources.sh /usr/local/bin/fresh-sources
+
+# The workspace's sources over the toolchain: every stage that compiles
+# starts here. What needs no source (nextest, below) starts from the
+# toolchain, so a change to a crate never downloads it again.
+FROM toolchain AS base
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 # The contract the sidecar and the broker grant from, compiled in
@@ -86,6 +96,27 @@ RUN --mount=type=cache,id=meridian-core-registry,target=/usr/local/cargo/registr
     --mount=type=secret,id=gha-cache-v2,required=false \
     with-sccache fresh-sources cargo build --workspace --locked
 
+# cargo-nextest (ruling 1104; step 3b part 4), which run-tests runs every
+# test binary under: each test its own process, its result in JUnit (the
+# checks' test reports), a flaky one -- failed, then passed on its retry --
+# named as such. A pinned release, checked against its published digest;
+# the compile below and the fast gate's tests copy it from here.
+FROM toolchain AS nextest
+ARG TARGETARCH
+ARG NEXTEST_VERSION=0.9.149
+ARG NEXTEST_SHA256_AMD64=d65c7f14bcb5c1566d1ecd534c5da8dedb81ba58586e478b0ab81c877d2bd8ad
+ARG NEXTEST_SHA256_ARM64=533c9b431c2bb1dcb216e02e474263db0cdcd556373b72cc34830fb417058a6b
+RUN case "${TARGETARCH}" in \
+      amd64) ARCH=x86_64; SUM="${NEXTEST_SHA256_AMD64}" ;; \
+      arm64) ARCH=aarch64; SUM="${NEXTEST_SHA256_ARM64}" ;; \
+      *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+ && curl -fsSL --retry 6 --retry-all-errors --retry-delay 10 --retry-max-time 300 -o /tmp/nextest.tgz \
+      "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${NEXTEST_VERSION}/cargo-nextest-${NEXTEST_VERSION}-${ARCH}-unknown-linux-musl.tar.gz" \
+ && echo "${SUM}  /tmp/nextest.tgz" | sha256sum -c - \
+ && tar -xzf /tmp/nextest.tgz -C /usr/local/bin \
+ && rm /tmp/nextest.tgz
+
 # Every test binary: each crate's unit tests and every integration test, in
 # one invocation with the whole workspace's features, as `test` always built
 # them. Kept, with a manifest saying whose each is, in /tests -- with the
@@ -96,23 +127,7 @@ RUN --mount=type=cache,id=meridian-core-registry,target=/usr/local/cargo/registr
 # beside their services (docker-compose.yaml's `tests`), where each used to
 # compile the workspace again from nothing in a container's own layer.
 FROM check AS compile
-# cargo-nextest (ruling 1104; step 3b part 4), which run-tests runs every
-# test binary under: each test its own process, its result in JUnit (the
-# checks' test reports), a flaky one -- failed, then passed on its retry --
-# named as such. A pinned release, checked against its published digest.
-ARG NEXTEST_VERSION=0.9.149
-ARG NEXTEST_SHA256_AMD64=d65c7f14bcb5c1566d1ecd534c5da8dedb81ba58586e478b0ab81c877d2bd8ad
-ARG NEXTEST_SHA256_ARM64=533c9b431c2bb1dcb216e02e474263db0cdcd556373b72cc34830fb417058a6b
-RUN case "${TARGETARCH}" in \
-      amd64) ARCH=x86_64; SUM="${NEXTEST_SHA256_AMD64}" ;; \
-      arm64) ARCH=aarch64; SUM="${NEXTEST_SHA256_ARM64}" ;; \
-      *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
-    esac \
- && curl -fsSL -o /tmp/nextest.tgz \
-      "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${NEXTEST_VERSION}/cargo-nextest-${NEXTEST_VERSION}-${ARCH}-unknown-linux-musl.tar.gz" \
- && echo "${SUM}  /tmp/nextest.tgz" | sha256sum -c - \
- && tar -xzf /tmp/nextest.tgz -C /usr/local/bin \
- && rm /tmp/nextest.tgz
+COPY --from=nextest /usr/local/bin/cargo-nextest /usr/local/bin/cargo-nextest
 COPY .config/ .config/
 COPY tools/run-tests.sh /usr/local/bin/run-tests
 RUN --mount=type=cache,id=meridian-core-registry,target=/usr/local/cargo/registry \
@@ -161,6 +176,39 @@ RUN --mount=type=cache,id=meridian-core-registry,target=/usr/local/cargo/registr
     --mount=type=cache,id=meridian-core-target,target=/w/target \
     fresh-sources cargo clippy --workspace --locked --all-targets -- -D warnings
 
+# The fast pre-push gate's Rust (make pre-push; accepted 2026-11-07: CI and
+# the merge queue are the authority for main, local is fast and targeted):
+# formatting, clippy and the debug build of the whole workspace, as lint and
+# check run them -- over the same cargo caches, with the same features, so on
+# a warm cache cargo redoes only the crates a change touched and those
+# depending on them -- and then the unit tests of the crates the branch
+# changed and of every crate depending on them, FAST_TESTS, a nextest
+# filterset the Makefile has from tools/pre_push.py. The test binaries are
+# compiled for the whole workspace, as `cargo test --workspace --lib` would,
+# so a selection never changes the features a dependency is built with, and
+# only the selection's run. Each step a layer of its own: a tree already
+# checked is answered from the build cache.
+FROM base AS fast
+RUN rustup component add clippy rustfmt
+COPY --from=nextest /usr/local/bin/cargo-nextest /usr/local/bin/cargo-nextest
+COPY .config/ .config/
+RUN cargo fmt --all -- --check
+RUN --mount=type=cache,id=meridian-core-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=meridian-core-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=meridian-core-target,target=/w/target \
+    fresh-sources cargo clippy --workspace --locked --all-targets -- -D warnings
+RUN --mount=type=cache,id=meridian-core-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=meridian-core-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=meridian-core-target,target=/w/target \
+    fresh-sources cargo build --workspace --locked
+ARG FAST_TESTS=
+RUN --mount=type=cache,id=meridian-core-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=meridian-core-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=meridian-core-target,target=/w/target \
+    if [ -n "$FAST_TESTS" ]; then \
+      fresh-sources cargo nextest run --workspace --locked --lib --no-tests=pass -E "$FAST_TESTS"; \
+    fi
+
 # Published vulnerabilities in anything the workspace links, from the RustSec
 # advisory database, read fresh on every run. A prebuilt cargo-deny at a pinned
 # release rather than `cargo install`, which would compile it every time the
@@ -175,15 +223,22 @@ RUN case "${TARGETARCH}" in \
       *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
     esac \
  && apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/* \
- && curl -fsSL -o /tmp/deny.tgz \
+ && curl -fsSL --retry 6 --retry-all-errors --retry-delay 10 --retry-max-time 300 -o /tmp/deny.tgz \
       "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/cargo-deny-${CARGO_DENY_VERSION}-${ARCH}-unknown-linux-musl.tar.gz" \
  && tar -xzf /tmp/deny.tgz -C /tmp \
  && mv /tmp/cargo-deny-*/cargo-deny /usr/local/bin/ \
  && rm -rf /tmp/deny.tgz /tmp/cargo-deny-*
 COPY deny.toml ./
+# The database fetched first, retried with backoff, and said plainly when it
+# cannot be (the Makefile tells that from a finding); then checked offline.
 RUN --mount=type=cache,id=meridian-core-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=meridian-core-git,target=/usr/local/cargo/git \
-    cargo deny --locked check advisories
+    for i in 1 2 3 4 5 6; do \
+      cargo deny --locked fetch && break; \
+      [ "$i" = 6 ] && { echo "advisories: the advisory database and the index could not be fetched, six times over: a network failure, not a finding" >&2; exit 3; }; \
+      sleep 10; \
+    done \
+ && cargo deny --offline check advisories
 
 # The dashboard's unit-test binary alone, for the Settings pages below: the
 # compile's own invocation again over the same cache, so nothing compiles

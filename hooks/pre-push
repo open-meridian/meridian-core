@@ -1,34 +1,31 @@
 #!/usr/bin/env bash
-# Pre-push gate. Local green is the completion signal; CI is confirmation.
+# Pre-push gate: the fast one. CI on the pull request runs everything, and CI
+# and the merge queue decide what reaches main (accepted 2026-11-07,
+# superseding ruling 1075's full local gate).
+#
+# Canonical in meridian-design (hooks/pre-push); every repository's copy is
+# byte-identical to it (pattern-drift).
 #
 # Activate on a fresh clone with:  make install-hooks
 # (sets core.hooksPath=hooks, so this actually fires)
 #
-# Two tiers, promoted automatically. A diff touching build inputs, workflow
-# definitions or the wire schema gets the deep gate, because those are the
-# paths ci-local cannot fully cover by construction.
+# `make pre-push` is the repository's fast gate: lint, the build, the tests of
+# what changed and the stages the changed paths select (PRE_PUSH_MAP in its
+# Makefile), each named with why. A repository with no fast gate yet runs
+# `make ci-local`. `make ci-local` stays the full run, for when CI is down,
+# and `make ci-stage STAGE=<x>` reproduces one CI job before pushing again.
 #
 # --no-verify bypasses this. It is not recommended and settings.json denies it
 # to agent sessions.
 
 set -euo pipefail
 
-RISKY='(^|/)(Dockerfile|docker-compose.*\.ya?ml|Makefile|Cargo\.lock|pyproject\.toml|poetry\.lock|uv\.lock|requirements.*\.txt|\.github/workflows/)|\.proto$'
-
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
-upstream="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)"
-if [ -n "$upstream" ]; then
-  changed="$(git diff --name-only "$upstream"...HEAD 2>/dev/null || true)"
-else
-  changed="$(git diff --name-only HEAD 2>/dev/null || true)"
-fi
-
 target="ci-local"
-if echo "$changed" | grep -qE "$RISKY"; then
-  target="ci-local-deep"
-  echo "pre-push: diff touches a risky path, promoting to $target"
+if grep -q '^pre-push:' Makefile; then
+  target="pre-push"
 fi
 
 echo "pre-push: running make $target"

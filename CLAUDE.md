@@ -45,12 +45,16 @@ to another (decisions/028).
 
 ## Verification
 
-    make ci-local
+    make pre-push
 
-Local green is the completion signal; CI is confirmation, not the first place a
-failure is discovered. `make install-hooks` wires that to `git push` on a fresh
-clone. A diff touching a Dockerfile, a lock file, a workflow definition or a
-`.proto` is promoted to `ci-local-deep` automatically.
+The fast gate (accepted 2026-11-07, superseding ruling 1075's full local
+gate): lint, the build, the changed crates' unit tests and the stages the
+changed paths select (`PRE_PUSH_MAP` in the Makefile). `make install-hooks`
+wires it to `git push` on a fresh clone. CI on the pull request runs
+everything, and the merge queue is the only authority for main. A failing CI
+job is reproduced with `make ci-stage STAGE=<stage>` before pushing again,
+never rerun until green; `make ci-local` runs every stage, for when CI is
+down.
 
 ## Review
 

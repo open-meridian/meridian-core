@@ -74,9 +74,10 @@ GB = 1024 * 1024  # in the KB df reports
 # charged to every later stage again had settings-page fail its 7 GB at 8.9
 # to 11.4 GB while holding 3.4 to 3.5 GB of its own. Two since ruling 1068:
 # the images stage builds the release images and the compile stage the test
-# binaries, and the stages after them build none.
-SHARED_STAGES = ("images", "compile")
-SHARED = " and ".join(SHARED_STAGES) + " stages"
+# binaries, and the stages after them build none. And the fast gate's rust
+# stage (make pre-push), whose debug build is the same cargo caches'.
+SHARED_STAGES = ("images", "compile", "rust")
+SHARED = ", ".join(SHARED_STAGES[:-1]) + " and " + SHARED_STAGES[-1] + " stages"
 
 
 def docker(*args: str, check: bool = False) -> subprocess.CompletedProcess:
