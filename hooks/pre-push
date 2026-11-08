@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
-# Pre-push gate: the fast one. CI on the pull request runs everything, and the
-# merge queue is the only authority for main (accepted 2026-11-07, superseding
-# ruling 1075's full local gate).
+# Pre-push gate: the fast one. CI on the pull request runs everything, and CI
+# and the merge queue decide what reaches main (accepted 2026-11-07,
+# superseding ruling 1075's full local gate).
+#
+# Canonical in meridian-design (hooks/pre-push); every repository's copy is
+# byte-identical to it (pattern-drift).
 #
 # Activate on a fresh clone with:  make install-hooks
 # (sets core.hooksPath=hooks, so this actually fires)
 #
-# `make pre-push` runs lint, the build, the changed crates' unit tests and the
-# stages the changed paths select (PRE_PUSH_MAP in the Makefile), and says
-# which and why. `make ci-local` is still the whole gate, run by hand when CI
-# is down; `make ci-stage STAGE=<x>` reproduces one CI job.
+# `make pre-push` is the repository's fast gate: lint, the build, the tests of
+# what changed and the stages the changed paths select (PRE_PUSH_MAP in its
+# Makefile), each named with why. A repository with no fast gate yet runs
+# `make ci-local`. `make ci-local` stays the full run, for when CI is down,
+# and `make ci-stage STAGE=<x>` reproduces one CI job before pushing again.
 #
 # --no-verify bypasses this. It is not recommended and settings.json denies it
 # to agent sessions.
@@ -19,10 +23,15 @@ set -euo pipefail
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
-echo "pre-push: running make pre-push"
-if ! make pre-push; then
+target="ci-local"
+if grep -q '^pre-push:' Makefile; then
+  target="pre-push"
+fi
+
+echo "pre-push: running make $target"
+if ! make "$target"; then
   echo
-  echo "pre-push: BLOCKED -- make pre-push failed."
+  echo "pre-push: BLOCKED -- make $target failed."
   echo "Fix it locally. Pushing red turns CI into a remote debugger."
   exit 1
 fi

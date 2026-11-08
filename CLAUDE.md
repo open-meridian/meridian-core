@@ -64,7 +64,7 @@ review whose absence is invisible.
 
 Mechanical checks do not belong in a review. Formatting, link targets, the
 derivation chain, codegen staleness and the task ledger are enforced by
-the gates CI runs. Attention spent on something a gate could catch is a missing
+`make ci-local`. Attention spent on something a gate could catch is a missing
 gate, and the fix is to write the gate.
 
 Run the passes in order. Report at the first pass that finds an Important
