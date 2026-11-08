@@ -156,7 +156,13 @@ endif
 
 stage-checks:     gate-begin-checks check-leftovers contract-diff ci-mirror-check licence-check-test check-crate-boundaries check-one-clock check-test-targets check-local-storage check-codegen advisories chart-check claims-check
 	@$(GATE) end checks
-stage-images:     gate-begin-images runtime-images
+# The images at once (the CI images job is the run's critical path; step 3b
+# part 5): the release build beside the SDK's image and the harness's, which
+# share nothing with it; then the analytics and version images, from its
+# build. Each says how long it took.
+stage-images:     gate-begin-images
+	@$(MAKE) --no-print-directory -j3 runtime-image interop-image harness-image
+	@$(MAKE) --no-print-directory analytics-image version-check-image
 	@$(GATE) end images
 stage-compile:    gate-begin-compile test-images build
 	@$(GATE) end compile
@@ -278,7 +284,7 @@ pre-push-image:    gate-begin-image check-nats-permissions check-image-version
 	@$(GATE) end image
 
 fast-rust:
-	@$(DOCKER) build -f Dockerfile.rust --target fast --build-arg FAST_TESTS="$(PRE_PUSH_TESTS)" \
+	@$(DOCKER) build -f Dockerfile.rust $(FETCHED) --target fast --build-arg FAST_TESTS="$(PRE_PUSH_TESTS)" \
 		--progress=plain $(VERDICT) . >.pre-push-rust.log 2>&1 \
 		|| { echo "rust FAILED. What cargo said, and the whole of it in .pre-push-rust.log:" >&2; \
 		     grep -E -A12 -e 'error(\[E[0-9]+\])?:' -e 'Diff in ' -e ' FAIL \[' .pre-push-rust.log \
@@ -408,7 +414,7 @@ SCHEMA_BOUNDARIES := --build-context schema-boundaries=https://github.com/open-m
 # Regenerate in place. The only sanctioned way to change $(DOMAIN_RS).
 codegen:
 	@rm -rf $(SCRATCH)
-	@$(DOCKER) build $(SCHEMA_PROTO) $(SCHEMA_BOUNDARIES) -f Dockerfile.codegen --target export \
+	@$(DOCKER) build $(SCHEMA_PROTO) $(SCHEMA_BOUNDARIES) -f Dockerfile.codegen $(FETCHED) --target export \
 		--output type=local,dest=$(SCRATCH) .
 	@mv $(SCRATCH)/v1.rs $(DOMAIN_RS) && mv $(SCRATCH)/transitions.rs $(TRANSITIONS_RS) \
 		&& mv $(SCRATCH)/fields.json $(FIELDS_JSON) && rm -rf $(SCRATCH)
@@ -420,7 +426,7 @@ codegen:
 check-codegen:
 	@rm -rf $(SCRATCH)
 	@$(PY) tools/generate_transitions.py --self-test >/dev/null
-	@$(DOCKER) build $(SCHEMA_PROTO) $(SCHEMA_BOUNDARIES) -f Dockerfile.codegen --target export \
+	@$(DOCKER) build $(SCHEMA_PROTO) $(SCHEMA_BOUNDARIES) -f Dockerfile.codegen $(FETCHED) --target export \
 		--output type=local,dest=$(SCRATCH) . >/dev/null 2>&1 \
 		|| { echo "check-codegen: generation failed; run 'make codegen' to see why" >&2; exit 1; }
 	@for pair in "$(DOMAIN_RS) v1.rs" "$(TRANSITIONS_RS) transitions.rs" "$(FIELDS_JSON) fields.json"; do \
@@ -450,7 +456,7 @@ VERDICT := --output type=cacheonly
 # RUSTSEC id), and anything else -- a download that failed, the database
 # not fetched -- is said as that, never as a vulnerability.
 advisories:
-	@out=$$($(DOCKER) build -f Dockerfile.rust --target advisories --progress=plain $(VERDICT) . 2>&1) \
+	@out=$$($(DOCKER) build -f Dockerfile.rust $(FETCHED) --target advisories --progress=plain $(VERDICT) . 2>&1) \
 		&& { echo "advisories OK: no published vulnerability reaches the workspace unexplained"; exit 0; }; \
 	if printf '%s\n' "$$out" | grep -qE 'error\[(vulnerability|unsound|unmaintained|yanked|notice)\]'; then \
 		echo "advisories FAILED: a published vulnerability reaches this workspace:" >&2; \
@@ -463,7 +469,7 @@ advisories:
 	exit 1
 
 build:
-	@$(DOCKER) build -f Dockerfile.rust --target check $(SCCACHE_SECRETS) $(VERDICT) . >/dev/null 2>&1 \
+	@$(DOCKER) build -f Dockerfile.rust $(FETCHED) --target check $(SCCACHE_SECRETS) $(VERDICT) . >/dev/null 2>&1 \
 		|| { echo "build FAILED; see it with:" >&2; \
 		     echo "  DOCKER_BUILDKIT=1 docker build -f Dockerfile.rust --target check ." >&2; exit 1; }
 	@echo "build OK: workspace compiles"
@@ -1062,15 +1068,19 @@ e2e-cluster-scaled:
 e2e-cluster-reconfigure:
 	@$(MAKE) --no-print-directory e2e-cluster-failover PROFILE=reconfigure FAILURE=
 
-e2e-cluster-failover: $(if $(E2E_FAILOVER_RUNTIME),,runtime-image analytics-image)
+# The write driver's runs (every profile but scaled) run it in the SDK's
+# interop image (e2e/failover/driver.py), loaded into the cluster beside the
+# runtime's.
+E2E_FAILOVER_DRIVEN = $(if $(filter scaled,$(PROFILE)),,yes)
+e2e-cluster-failover: $(if $(E2E_FAILOVER_RUNTIME),,runtime-image analytics-image) $(if $(E2E_FAILOVER_DRIVEN),interop-image)
 	@ctx="$$(kubectl config current-context 2>/dev/null)"; \
 	case "$$ctx" in k3d-*|kind-*) ;; \
 	*) echo "e2e-cluster-failover: the kube context is '$$ctx', which is not a k3d or kind cluster's. It stops, pauses and cuts nodes: run it on a cluster made for it, make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover" >&2; exit 1;; esac
 	@$(if $(filter tolerant,$(PROFILE)),:,echo "e2e-cluster-failover: building the database's image under Patroni" && $(DOCKER) build -q -t $(E2E_POSTGRES_IMAGE) deploy/database >/dev/null)
-	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(or $(E2E_FAILOVER_RUNTIME),$(RUNTIME_IMAGE)) $(if $(E2E_FAILOVER_RUNTIME),,$(ANALYTICS_IMAGE)) postgres:16-alpine $(if $(filter tolerant,$(PROFILE)),,$(E2E_POSTGRES_IMAGE)),:)
+	@$(if $(E2E_IMAGE_LOAD),$(E2E_IMAGE_LOAD) $(or $(E2E_FAILOVER_RUNTIME),$(RUNTIME_IMAGE)) $(if $(E2E_FAILOVER_RUNTIME),,$(ANALYTICS_IMAGE)) postgres:16-alpine $(if $(filter tolerant,$(PROFILE)),,$(E2E_POSTGRES_IMAGE)) $(if $(E2E_FAILOVER_DRIVEN),$(INTEROP_IMAGE)),:)
 	@kubectl delete namespace $(E2E_FAILOVER_NAMESPACE) --ignore-not-found --wait >/dev/null 2>&1
-	@rm -f .e2e-failover-claims.jsonl
-	@E2E_NAMESPACE=$(E2E_FAILOVER_NAMESPACE) E2E_IMAGE=$(or $(E2E_FAILOVER_RUNTIME),$(RUNTIME_IMAGE)) \
+	@rm -f .e2e-failover-claims.jsonl .e2e-failover-history.edn
+	@E2E_NAMESPACE=$(E2E_FAILOVER_NAMESPACE) E2E_INTEROP_IMAGE=$(INTEROP_IMAGE) E2E_IMAGE=$(or $(E2E_FAILOVER_RUNTIME),$(RUNTIME_IMAGE)) \
 	 E2E_POSTGRES_IMAGE=$(E2E_POSTGRES_IMAGE) PROFILE=$(PROFILE) FAILURE=$(FAILURE) E2E_K3D_CLUSTER=$(E2E_K3D_CLUSTER) E2E_K3D_SUBNET=$(E2E_K3D_SUBNET) \
 		$(PY) e2e/failover/run.py; \
 	  held=$$?; \
@@ -1145,6 +1155,12 @@ SCCACHE_SECRETS = $(if $(ACTIONS_RUNTIME_TOKEN),--secret id=gha-runtime-token$(c
 	$(if $(ACTIONS_RESULTS_URL),--secret id=gha-results-url$(comma)env=ACTIONS_RESULTS_URL) \
 	$(if $(ACTIONS_CACHE_URL),--secret id=gha-cache-url$(comma)env=ACTIONS_CACHE_URL) \
 	$(if $(ACTIONS_CACHE_SERVICE_V2),--secret id=gha-cache-v2$(comma)env=ACTIONS_CACHE_SERVICE_V2)
+# CI's pinned tools, kept in GitHub's cache (tools/ci-tools.txt; the ci-tools
+# action sets CI_TOOLS): handed to Dockerfile.rust's and Dockerfile.codegen's
+# builds as their `fetched` context, which they copy each tool from before
+# fetching it, checking its digest either way. Elsewhere none is given and
+# each build fetches its own, as it always has.
+FETCHED = $(if $(CI_TOOLS),--build-context fetched=$(CI_TOOLS))
 # nextest's profile for the test runs (tools/run-tests.sh): CI sets ci, which
 # retries a failed test once and names one that then passes flaky.
 NEXTEST_PROFILE ?= default
@@ -1188,21 +1204,25 @@ ci-images:
 
 ifeq ($(IMAGES),build)
 runtime-image:
-	@$(DOCKER) build -q $(VERSION_ARG) $(call candidate,$(RUNTIME_IMAGE),meridian-runtime) . >/dev/null
+	@began=$$(date +%s); $(DOCKER) build -q $(VERSION_ARG) $(FETCHED) $(SCCACHE_SECRETS) $(call candidate,$(RUNTIME_IMAGE),meridian-runtime) . >/dev/null \
+		&& echo "runtime-image: built in $$(( $$(date +%s) - began ))s"
 
 analytics-image:
-	@$(DOCKER) build -q $(VERSION_ARG) --target analytics $(call candidate,$(ANALYTICS_IMAGE),meridian-analytics) . >/dev/null
+	@began=$$(date +%s); $(DOCKER) build -q $(VERSION_ARG) $(FETCHED) $(SCCACHE_SECRETS) --target analytics $(call candidate,$(ANALYTICS_IMAGE),meridian-analytics) . >/dev/null \
+		&& echo "analytics-image: built in $$(( $$(date +%s) - began ))s"
 
 harness-image:
-	@$(DOCKER) build -q --target harness -t $(HARNESS_IMAGE) . >/dev/null \
-		|| { echo "harness-image FAILED: the harness image did not build" >&2; exit 1; }
+	@began=$$(date +%s); $(DOCKER) build -q $(FETCHED) --target harness -t $(HARNESS_IMAGE) . >/dev/null \
+		|| { echo "harness-image FAILED: the harness image did not build" >&2; exit 1; }; \
+		echo "harness-image: built in $$(( $$(date +%s) - began ))s"
 
 interop-image:
 	@test -d "$(SDK)" \
 		|| { echo "no SDK at $(SDK); set SDK=<path to meridian-python>" >&2; exit 1; }
-	@$(DOCKER) build --build-context core-proto="$(CURDIR)/proto" $(SCHEMA_PROTO) -f "$(SDK)/Dockerfile.python" --target interop -t $(INTEROP_IMAGE) "$(SDK)" >/dev/null 2>&1 \
+	@began=$$(date +%s); $(DOCKER) build --build-context core-proto="$(CURDIR)/proto" $(SCHEMA_PROTO) -f "$(SDK)/Dockerfile.python" --target interop -t $(INTEROP_IMAGE) "$(SDK)" >/dev/null 2>&1 \
 		|| { echo "interop-image FAILED: the SDK's image did not build. See it with:" >&2; \
-		     echo "  DOCKER_BUILDKIT=1 docker build --build-context core-proto=$(CURDIR)/proto $(SCHEMA_PROTO) -f $(SDK)/Dockerfile.python --target interop --progress=plain $(SDK)" >&2; exit 1; }
+		     echo "  DOCKER_BUILDKIT=1 docker build --build-context core-proto=$(CURDIR)/proto $(SCHEMA_PROTO) -f $(SDK)/Dockerfile.python --target interop --progress=plain $(SDK)" >&2; exit 1; }; \
+		echo "interop-image: built in $$(( $$(date +%s) - began ))s"
 
 # The runtime image with a version compiled in, which check-image-version
 # asks each binary of. Given MERIDIAN_VERSION, as CI's release candidate is,
@@ -1223,13 +1243,13 @@ endif
 # workspace and each crate's tests, compiled once, which `test` and the
 # services' suites (compose's `tests`) run. A compile error is said here.
 tests-image:
-	@$(DOCKER) build -f Dockerfile.rust --target compile --progress=plain $(SCCACHE_SECRETS) -t $(TESTS_IMAGE) . >.tests-image.log 2>&1 \
+	@$(DOCKER) build -f Dockerfile.rust $(FETCHED) --target compile --progress=plain $(SCCACHE_SECRETS) -t $(TESTS_IMAGE) . >.tests-image.log 2>&1 \
 		|| { echo "tests-image FAILED: the workspace or its tests did not compile. What cargo said, and the whole of it in .tests-image.log:" >&2; \
 		     grep -E -A12 -e 'error(\[E[0-9]+\])?:' .tests-image.log | cut -c1-400 | head -160 >&2; \
 		     echo "-- the last 30 lines:" >&2; tail -n 30 .tests-image.log | cut -c1-400 >&2; exit 1; }
 
 settings-binary-image:
-	@$(DOCKER) build -q -f Dockerfile.rust --target settings-binary-image $(SCCACHE_SECRETS) -t $(SETTINGS_BINARY_IMAGE) . >/dev/null \
+	@$(DOCKER) build -q -f Dockerfile.rust $(FETCHED) --target settings-binary-image $(SCCACHE_SECRETS) -t $(SETTINGS_BINARY_IMAGE) . >/dev/null \
 		|| { echo "settings-binary-image FAILED: the settings pages' server did not build. See it with:" >&2; \
 		     echo "  DOCKER_BUILDKIT=1 docker build -f Dockerfile.rust --target settings-binary-image --progress=plain ." >&2; exit 1; }
 
@@ -1529,7 +1549,7 @@ SETTINGS_NET := meridian-core-settings-page
 SHOTS ?=
 
 e2e-settings-page: runtime-image settings-binary-image
-	@$(DOCKER) build -f Dockerfile.rust --target settings-page --build-arg RUNTIME_IMAGE=$(RUNTIME_IMAGE) \
+	@$(DOCKER) build -f Dockerfile.rust $(FETCHED) --target settings-page --build-arg RUNTIME_IMAGE=$(RUNTIME_IMAGE) \
 		--build-arg SETTINGS_BINARY=$(SETTINGS_BINARY_IMAGE) \
 		-t $(SETTINGS_PAGE_IMAGE) . >.e2e-settings-page.log 2>&1 \
 		|| { echo "e2e-settings-page FAILED: the server did not build; see .e2e-settings-page.log" >&2; exit 1; }
@@ -2763,7 +2783,7 @@ chart-check:
 	@echo "chart-check OK: one writer per store (ruling 1060), a warm standby by value with its lease, budget and spread, none by default, 30 s node tolerations; resilience.profile tolerant by default and ha in one value, each count overridable, refused without the key in a Secret (1074), the database under Patroni and the broker at three only there; the lake's whole answers at once, 2 by default and 1 to 8 alone, and its mmap threshold, 128 KiB by default and whole bytes alone; the platform's keys on the conductor alone, as files, only where the chart carries some, its current key by default; four components, the dashboard and the three ways it signs people in, the key and the settings key on the conductor alone, both key paths, refusals, migrations, no pinned uid, a plugin held to its side of the pod, its front door open to the dashboard alone, an Ingress only when asked for and HTTPS alone unless plain HTTP is, development only when asked for, the live shape there alone, a backup only when sealed and placed, its WAL archive only when asked for and refused where it cannot stand, the offline CronJob suspended, and nothing an upgrade leaves behind"
 
 lint:
-	@$(DOCKER) build -f Dockerfile.rust --target lint $(VERDICT) . >/dev/null 2>&1 \
+	@$(DOCKER) build -f Dockerfile.rust $(FETCHED) --target lint $(VERDICT) . >/dev/null 2>&1 \
 		|| { echo "lint FAILED; see it with:" >&2; \
 		     echo "  DOCKER_BUILDKIT=1 docker build -f Dockerfile.rust --target lint --progress=plain ." >&2; exit 1; }
 	@echo "lint OK: formatting and clippy clean"

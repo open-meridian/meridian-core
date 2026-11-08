@@ -64,6 +64,13 @@ jobs:
         with:
           path: workspace/meridian-core
 
+      # The SDK at its main, for the write driver's interop image
+      # (e2e/failover/driver.py), as ci's images job builds it.
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/meridian-python
+          path: workspace/meridian-python
+
       - name: Free the runner's disk
         run: tools/free-runner-disk.sh
 
@@ -86,13 +93,13 @@ jobs:
         continue-on-error: true
         run: tools/ci-cargo-cache.sh put "$RUNNER_TEMP/cargo"
 
-      - name: make runtime-image analytics-image
+      - name: make runtime-image analytics-image interop-image
         env:
           DOCKER_BUILDKIT: "1"
-        run: make runtime-image analytics-image
+        run: make runtime-image analytics-image interop-image
 
       - name: Save the images
-        run: tools/ci-images.sh save "$RUNNER_TEMP/failover-images" runtime analytics
+        run: tools/ci-images.sh save "$RUNNER_TEMP/failover-images" runtime analytics interop
 
       - uses: actions/upload-artifact@v4
         with:
@@ -124,15 +131,16 @@ jobs:
       - uses: ./workspace/meridian-core/.github/actions/gate-images
         with:
           artifacts: failover-images
-          names: runtime analytics
+          names: runtime analytics interop
 
-      # Pinned, and checked against the release's own checksum, as ci's.
+      # Pinned, and checked against the release's own checksum, as ci's,
+      # from GitHub's cache where a run kept it (tools/ci-tools.txt).
+      - uses: ./workspace/meridian-core/.github/actions/ci-tools
+        with:
+          tools: k3d
+
       - name: k3d
-        run: |
-          set -euo pipefail
-          curl -fsSL --retry 6 --retry-all-errors --retry-delay 10 --retry-max-time 300 -o /tmp/k3d https://github.com/k3d-io/k3d/releases/download/v5.9.0/k3d-linux-amd64
-          echo "06d8f25bc3a971c4eb29e0ff08429b180402db0f4dec838c9eac427e296800a0  /tmp/k3d" | sha256sum -c -
-          sudo install -m 0755 /tmp/k3d /usr/local/bin/k3d
+        run: sudo install -m 0755 "$CI_TOOLS/k3d-linux-amd64" /usr/local/bin/k3d
 
       - uses: azure/setup-helm@v4
         with:

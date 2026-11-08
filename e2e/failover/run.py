@@ -35,6 +35,14 @@ probe names the path and its address, and it heals with no restart);
 `zone` (HA only: every node of the zone holding the most writers stopped at
 once; every store answers again from another zone within the zone tier).
 
+The write driver (driver.py, step 3b part 5) writes through the stores for
+the whole run, from test-only plugin instances in the chart's sidecars[]
+set here at install: prices to the lake and orders to the book. After
+every class each acknowledged one is looked for in the stores' own rows --
+RPO through the stores, said in the claims of db-primary, torn-write, zone
+and reconfigure -- and the oms instance's history (invoke, ok, fail, info)
+is kept, for Elle (.e2e-failover-history.edn).
+
 After the install and after every class, the record's own properties are
 held (ruling 1105): in each store's change log no sequence missing or
 taken twice, no epoch going back along the sequence (a fenced writer's
@@ -101,6 +109,30 @@ TLS = PROFILE == "ha"
 # The live install moved between the profiles, in order (e2e-cluster-
 # reconfigure): up to ha, and back.
 RECONFIGURE = ["ha", "tolerant"]
+
+# The store-level write driver (step 3b part 5; driver.py): two test-only
+# plugin instances in the chart's sidecars[], set here at install and in no
+# values file, writing through the stores' own write paths for the whole
+# run: prices to the lake (data) and orders to the book (oms). What a class
+# lost is read in the stores' own rows against what each acknowledged.
+DRIVEN = PROFILE in ("tolerant", "ha", "reconfigure")
+DRIVERS = {"drive-data": "data", "drive-oms": "oms"}
+DRIVER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "driver.py")
+DRIVER_FIXTURES = ["e2e/book/instruments.sql", "e2e/failover/driver.sql"]
+DRIVER_ACCOUNTS = [f"ACC-DRIVE-{i:02d}" for i in range(12)]
+DRIVER_INSTRUMENT = "LCL-01J8XQ4M7K00000000E2EAAPL"
+DRIVER_CASH = "LCL-01J8XQ4M7K000000000E2EUSD"
+# The run's signer, which vouches for the driver's person (a recorded order
+# is a user's act): its seed in a Secret only the oms driver's container
+# reads, its public half beside the dashboard's keys.
+DRIVER_SIGNER = "e2e-drive-signer"
+DRIVER_SIGNER_KEY_ID = "e2e-drive"
+INTEROP_IMAGE = os.environ.get("E2E_INTEROP_IMAGE", "meridian-python-interop")
+# The classes that read RPO through the stores themselves, and say it in
+# their claims; after every other, the driver's rows are held all the same.
+RPO_IN_CLASS = {"db-primary", "torn-write", "zone"}
+# The oms driver's history (Jepsen's invoke/ok/fail/info), kept for Elle.
+HISTORY = os.environ.get("E2E_FAILOVER_HISTORY", ".e2e-failover-history.edn")
 
 DEFAULT_FAILURES = {
     "tolerant": ["lake-writer", "bor-writer", "network-policy", "db-primary", "broker",
@@ -358,9 +390,22 @@ def install(s):
             values += ["--set", "tls.internal.enabled=true"]
         values += ["--set", "zones={" + ",".join(ZONES) + "}"]
         values += ["--set", f"database.brought.patroniImage={POSTGRES_IMAGE}"]
+    public = None
+    if DRIVEN:
+        public = driver_signer()
+        values += driver_values()
     run("helm", "install", RELEASE, CHART, "--namespace", NAMESPACE, "--create-namespace", *values)
     s.check(True, f"helm install, profile {PROFILE}")
+    if public:
+        driver_trusted(public)
     if PROFILE == "ha":
+        # The write driver's pods beside the database and the broker on the
+        # server node: what a class measures is the stores' loss, and the
+        # driver is how it is read, never its subject.
+        for instance in DRIVERS:
+            kubectl("patch", "deployment", f"{FULL}-sidecar-{instance}", "--type", "merge", "-p",
+                    json.dumps({"spec": {"template": {"spec": {
+                        "nodeSelector": {"kubernetes.io/hostname": server_node()}}}}}))
         # The database's and the broker's members kept on the server node,
         # so a test that stops or pauses an agent never stops them: theirs
         # are the db-primary and broker classes, injected apart. The shape
@@ -647,6 +692,200 @@ def jetstream_rolled(s):
     s.check(made and not fell_back,
             f"analytics: every copy has JetStream's work queue after the roll ({len(logs) - len(fell_back)} "
             f"of {len(logs)}{'; not: ' + ', '.join(fell_back) if fell_back else ''})")
+
+
+# ── The write driver (step 3b part 5) ──────────────────────────────────────
+
+def driver_values():
+    """The driver's two instances as sidecars[] values: the SDK's interop
+    image running driver.py, handed over whole as MERIDIAN_DRIVER by
+    --set-file, so nothing of it is in a values file or an image."""
+    sidecars = []
+    for instance, role in DRIVERS.items():
+        sidecars.append({"instanceId": instance, "roles": [role], "plugin": {
+            "image": INTEROP_IMAGE, "pullPolicy": "IfNotPresent",
+            "args": ["python", "-c",
+                     "import os; exec(compile(os.environ['MERIDIAN_DRIVER'], 'driver.py', 'exec'))"],
+            "env": {"DRIVER_ROLE": role, "DRIVER_INSTRUMENT": DRIVER_INSTRUMENT, "DRIVER_CASH": DRIVER_CASH,
+                    "DRIVER_ACCOUNTS": ",".join(DRIVER_ACCOUNTS)},
+        }})
+        if role == "oms":
+            sidecars[-1]["plugin"]["existingSecret"] = DRIVER_SIGNER
+    path = os.path.join(tempfile.mkdtemp(prefix="failover-driver-"), "driver.json")
+    with open(path, "w", encoding="utf-8") as kept:
+        json.dump({"sidecars": sidecars}, kept)
+    said = ["-f", path]
+    for at in range(len(sidecars)):
+        said += ["--set-file", f"sidecars[{at}].plugin.env.MERIDIAN_DRIVER={DRIVER_SCRIPT}"]
+    return said
+
+
+def driver_signer():
+    """A key made for the run (Ed25519, as the dashboard signs with): its
+    seed and id in a Secret the oms driver's container reads, and its
+    public half, returned, for the keys every sidecar trusts. Nothing of it
+    is printed."""
+    workdir = tempfile.mkdtemp(prefix="failover-signer-")
+    key, public = os.path.join(workdir, "key.pem"), os.path.join(workdir, "public.pem")
+    run("openssl", "genpkey", "-algorithm", "ed25519", "-out", key)
+    run("openssl", "pkey", "-in", key, "-pubout", "-out", public)
+    seed = run("openssl", "pkey", "-in", key, "-outform", "DER", quiet=True).stdout[-32:].hex()
+    run("kubectl", "create", "namespace", NAMESPACE, check=False)
+    kubectl("create", "secret", "generic", DRIVER_SIGNER, f"--from-literal=DRIVER_SIGNER_SEED={seed}",
+            f"--from-literal=DRIVER_SIGNER_KEY_ID={DRIVER_SIGNER_KEY_ID}", quiet=True)
+    with open(public, encoding="utf-8") as held:
+        said = held.read()
+    os.remove(key)
+    del seed
+    return said
+
+
+def driver_trusted(public):
+    """The run's signer's public half beside the dashboard's own, in the
+    ConfigMap every sidecar mounts whole (a key arrives without a restart),
+    merged as the dashboard's key Job merges its own."""
+    keys = f"{FULL}-dashboard-keys"
+    wait_for("the dashboard's keys ConfigMap", lambda: kubectl("get", "configmap", keys, check=False).returncode == 0,
+             seconds=120)
+    kubectl("patch", "configmap", keys, "--type", "merge", "-p",
+            json.dumps({"data": {f"{DRIVER_SIGNER_KEY_ID}.pem": public}}))
+
+
+def driver_fixtures(s):
+    """What an admin would have done before the driver can write: its
+    accounts and their grant, and the instrument its rows name (as e2e-book's
+    are written), then the driver writing both kinds."""
+    for path in DRIVER_FIXTURES:
+        with open(path, encoding="utf-8") as held:
+            psql(held.read())
+    s.check(True, "the driver's accounts, grant and instrument written")
+    writing = happens(lambda: all(driver_acked().get(kind) for kind in ("price", "order")), 300, every=3)
+    s.check(writing, "the write driver writing through the stores: prices to the lake, orders to the book "
+            f"({', '.join(f'{k} {len(v)}' for k, v in sorted(driver_acked().items())) or 'nothing acknowledged'})")
+    if not writing:
+        for instance in DRIVERS:
+            said = kubectl("logs", driver_pod(instance), "-c", "plugin", "--tail=15", check=False)
+            s.note(f"{instance} said: {said.stdout.decode(errors='replace')[-1500:]}")
+
+
+def driver_pod(instance):
+    said = json.loads(out("get", "pods", "-l", f"app.kubernetes.io/instance={RELEASE},meridian.dev/instance={instance}",
+                          "-o", "json"))["items"]
+    live = [p["metadata"]["name"] for p in said if not p["metadata"].get("deletionTimestamp")]
+    return live[0] if live else ""
+
+
+def driver_file(instance, path):
+    pod = driver_pod(instance)
+    if not pod:
+        return ""
+    done = kubectl("exec", pod, "-c", "plugin", "--", "cat", path, check=False)
+    return done.stdout.decode(errors="replace") if done.returncode == 0 else ""
+
+
+def driver_acked():
+    """What the driver's instances were told was recorded, by kind: each
+    id, and when (unix ms)."""
+    acked = {}
+    for instance in DRIVERS:
+        for line in driver_file(instance, "/tmp/acked").splitlines():
+            parts = line.split()
+            if len(parts) == 4 and parts[0] == "ACKED" and parts[3].isdigit():
+                acked.setdefault(parts[1], {})[parts[2]] = int(parts[3])
+    return acked
+
+
+def driver_kept(pod=None):
+    """What the stores hold of it: the book's orders in the driver's
+    accounts, the lake's rows in its dataset."""
+    orders = psql("select order_id from book_order where account_id like 'ACC-DRIVE-%'", pod=pod)
+    placements = psql("select placement_id from book_placement where account_id like 'ACC-DRIVE-%'", pod=pod)
+    prices = psql("select row_key from lake_row where dataset = 'drive-data:drive'", pod=pod)
+    return {"order": set(orders.split()), "placement": set(placements.split()), "price": set(prices.split())}
+
+
+# What a class lost, kept as it is found, so a later class is not charged
+# with it again.
+DRIVER_LOST = {"order": set(), "placement": set(), "price": set()}
+
+
+def store_rpo(since_ms=0, pod=None):
+    """RPO through the stores: every acknowledged order and price looked
+    for in the book's and the lake's own rows (read after what was
+    acknowledged, so nothing acknowledged after is counted). Says the
+    acknowledgements since `since_ms`, and what is newly lost."""
+    acked = driver_acked()
+    kept = driver_kept(pod)
+    said = {}
+    for name, kinds in (("book", ("order", "placement")), ("lake", ("price",))):
+        held = {}
+        lost = set()
+        for kind in kinds:
+            mine = acked.get(kind, {})
+            gone = {i for i in mine if i not in kept[kind]} - DRIVER_LOST[kind]
+            DRIVER_LOST[kind] |= gone
+            held.update(mine)
+            lost |= gone
+        said[name] = {"acknowledged": sum(1 for at in held.values() if at >= since_ms),
+                      "lost": sorted(lost), "lost_s": round(
+                          (max(held[i] for i in lost) - min(held[i] for i in lost)) / 1000, 2) if lost else 0}
+    return said
+
+
+def rpo_extra(rpo):
+    """The claims' RPO fields: the book's acknowledged orders and those
+    lost (none may be: RPO 0 for the record), and the lake's, which
+    commits locally (spec section 4, durability) and whose loss is measured
+    and said, its bound not yet ruled."""
+    return {"through": "the stores: RecordOrder to the book, RecordPrices to the lake",
+            "acknowledged_commits": rpo["book"]["acknowledged"], "rpo_commits_lost": len(rpo["book"]["lost"]),
+            "lake_rows_acknowledged": rpo["lake"]["acknowledged"], "lake_rows_lost": len(rpo["lake"]["lost"]),
+            "lake_rpo_s": rpo["lake"]["lost_s"]}
+
+
+def driver_rpo_held(s, after, rpo=None, lake_may_lose=False):
+    """Every acknowledged order kept, after a class; and every price, but
+    where the class took the database's primary, whose lake commits are
+    local (measured and said there)."""
+    rpo = rpo or store_rpo()
+    book, lake = rpo["book"], rpo["lake"]
+    s.check(not book["lost"], f"{after}: every order and placement the book acknowledged is in it "
+            f"({len(book['lost'])} lost{': ' + ', '.join(book['lost'][:5]) if book['lost'] else ''})")
+    if lake_may_lose:
+        s.note(f"{after}: the lake lost {len(lake['lost'])} acknowledged row(s), within {lake['lost_s']}s "
+               "(its commits are local)")
+    else:
+        s.check(not lake["lost"], f"{after}: every price the lake acknowledged is in it "
+                f"({len(lake['lost'])} lost{': ' + ', '.join(lake['lost'][:5]) if lake['lost'] else ''})")
+    return rpo
+
+
+def acks_again(began_ms, seconds=90):
+    """The driver acknowledged by both stores again after `began_ms`."""
+    return happens(lambda: all(any(at > began_ms for at in driver_acked().get(kind, {}).values())
+                               for kind in ("price", "order")), seconds, every=2)
+
+
+def driver_history(s):
+    """The driver stopped, within its calls' bound, and the oms instance's
+    history kept for Elle (the ha failover CI job checks it)."""
+    for instance in DRIVERS:
+        pod = driver_pod(instance)
+        if pod:
+            kubectl("exec", pod, "-c", "plugin", "--", "touch", "/tmp/stop", check=False)
+    stopped = happens(lambda: all("DONE" in driver_file(i, "/tmp/done") for i in DRIVERS), 60, every=2)
+    s.check(stopped, "the write driver stopped when told, within a minute")
+    history = driver_file("drive-oms", "/tmp/history.edn")
+    with open(HISTORY, "w", encoding="utf-8") as kept:
+        kept.write(history)
+    counts = {}
+    for line in history.splitlines():
+        kind = line.split(":type :", 1)[-1].split(",", 1)[0]
+        f = "read" if "[[:r " in line else "append"
+        counts[f"{f} {kind}"] = counts.get(f"{f} {kind}", 0) + 1
+    s.check(counts.get("append ok", 0) > 0 and counts.get("read ok", 0) > 0,
+            f"the driver's history kept for Elle in {HISTORY}: "
+            + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
 
 
 # ── Failure classes ────────────────────────────────────────────────────────
@@ -938,21 +1177,29 @@ def database_writes(avoid=()):
 
 
 def db_primary(s, failure="db-primary"):
+    """The database's primary killed outright under the write driver's
+    load: RPO read through the stores, every order the book acknowledged
+    kept (RPO 0 for the record), the lake's loss measured and said (its
+    commits are local). torn-write adds heavy commits straight to the
+    database from a member that is not killed, as its load, each
+    acknowledged one held too."""
     if failure == "db-primary":
-        print("F: db-primary: the database's primary killed outright (SIGKILL), under commits", flush=True)
+        print("F: db-primary: the database's primary killed outright (SIGKILL), under the driver's writes", flush=True)
     for component in ("bor", "lake"):
         wait_for(f"{component} settled", lambda c=component: members_settled(c), seconds=300)
     marks_table()
     victim = primary()
     members = [p["metadata"]["name"] for p in pods("database")]
-    # Commits made from a member that is not killed. The tolerant profile has
-    # one member, killed with its writer: there the commits before the kill
-    # are what is held.
-    writing_in = next((m for m in members if m != victim), None)
-    writer = write_marks(writing_in, 45, pause=0 if failure == "torn-write" else 0.05) if writing_in else None
-    time.sleep(3)
-    psql("insert into failover_marks (at) values (clock_timestamp())")
-    acked_before = int(psql("select max(id) from failover_marks") or 0)
+    writer, acked_before = None, None
+    if failure == "torn-write":
+        # The heavy load, from a member that is not killed. The tolerant
+        # profile has one member, killed with its writer: there the commits
+        # before the kill are what is held.
+        writing_in = next((m for m in members if m != victim), None)
+        writer = write_marks(writing_in, 45, pause=0) if writing_in else None
+        time.sleep(3)
+        psql("insert into failover_marks (at) values (clock_timestamp())")
+        acked_before = int(psql("select max(id) from failover_marks") or 0)
     began = time.time()
     # With standbys, the primary is kept down: cut off from everything on
     # its node, then killed, so its Patroni cannot renew the leader key as
@@ -979,20 +1226,30 @@ def db_primary(s, failure="db-primary"):
         if isolated:
             isolate(victim, "-D")
     new_primary = primary(avoid=(victim,) if isolated else ())
-    acked = acknowledged(writer) if writer else set()
-    acked.add(acked_before)
-    kept = {int(i) for i in psql("select id from failover_marks", pod=new_primary).split()}
-    lost = sorted(acked - kept)
     if PROFILE != "tolerant":
         s.check(new_primary != victim, f"{failure}: a standby promoted ({new_primary})")
-    s.check(not lost, f"{failure}: every acknowledged commit kept ({len(acked)} acknowledged, "
-            f"{len(lost)} lost{': ' + ', '.join(map(str, lost[:5])) if lost else ''})")
+    extra = {}
+    if DRIVEN:
+        # The driver acknowledged by both stores again: what it wrote across
+        # the failover is all in, and read once it is.
+        again = acks_again(int(began * 1000))
+        s.check(again, f"{failure}: the write driver acknowledged by the book and the lake again")
+        rpo = driver_rpo_held(s, failure, store_rpo(int(began * 1000) - 30_000, pod=new_primary),
+                              lake_may_lose=PROFILE != "tolerant")
+        extra = rpo_extra(rpo)
+    if acked_before is not None:
+        acked = acknowledged(writer) if writer else set()
+        acked.add(acked_before)
+        kept = {int(i) for i in psql("select id from failover_marks", pod=new_primary).split()}
+        lost = sorted(acked - kept)
+        s.check(not lost, f"{failure}: every commit the database acknowledged under the heavy load kept "
+                f"({len(acked)} acknowledged, {len(lost)} lost{': ' + ', '.join(map(str, lost[:5])) if lost else ''})")
+        extra.update({"database_commits_acknowledged": len(acked), "database_commits_lost": len(lost)})
     for component in ("bor", "lake"):
         if component not in took:
             s.check(False, f"{failure}: {component} never answered again within {bound[component] + 30}s")
             continue
-        claim(s, failure, component, took[component], bound[component],
-              {"acknowledged_commits": len(acked), "rpo_commits_lost": len(lost)})
+        claim(s, failure, component, took[component], bound[component], extra)
     healed = happens(lambda: len(pods("database")) == database_members()
                      and all(ready(p) for p in pods("database")), 300)
     s.check(healed, f"{failure}: the killed member back, as a standby where there are standbys")
@@ -1346,13 +1603,19 @@ def zone_lost(s):
     finally:
         for node in lost:
             run("docker", "start", node)
+    extra = {"zone": zone, "nodes": len(lost)}
+    if DRIVEN:
+        # RPO through the stores across the zone's loss: the database is on
+        # the server node in this profile, so nothing acknowledged may go,
+        # the lake's included.
+        s.check(acks_again(int(began * 1000)), "zone: the write driver acknowledged by the book and the lake again")
+        extra.update(rpo_extra(driver_rpo_held(s, "zone", store_rpo(int(began * 1000) - 30_000))))
     for component in STORES:
         if component not in took:
             s.check(False, f"zone: {component} never answered again from outside zone {zone} within {HA_ZONE + 30}s")
             explain(s, "zone", component)
             continue
-        claim(s, "zone", component, took[component], HA_ZONE,
-              {"zone": zone, "nodes": len(lost), "writer_in_zone": component in there})
+        claim(s, "zone", component, took[component], HA_ZONE, dict(extra, writer_in_zone=component in there))
     wait_for("the zone's nodes back", lambda: all(
         any(c["type"] == "Ready" and c["status"] == "True" for c in n["status"]["conditions"])
         for n in nodes()), seconds=300)
@@ -1361,57 +1624,6 @@ def zone_lost(s):
 
 
 # ── e2e-cluster-reconfigure: a live install moved between the profiles ────
-
-# Commits through the database's Service for the whole move, from a pod of
-# its own (every member the move restarts is not one to write from), each
-# acknowledged id printed, the connection made again after a refusal.
-LONG_WRITER = r"""
-export PGPASSWORD="$POSTGRES_PASSWORD"
-# Each attempt bounded, so a stop is heard within seconds: a connection to a
-# database member that moved away (a reconfigure replaces them all) otherwise
-# waits out TCP's own timeout, and the writer missed its 60 s to stop (CI run
-# 42460520211). An attempt cut short prints nothing, so it is never counted
-# acknowledged; a commit is never cancelled from the server's side.
-export PGCONNECT_TIMEOUT=5
-while [ ! -e /tmp/stop ]; do
-  id=$(timeout 15 psql -X -q -At -h HOST -U postgres -d meridian -v ON_ERROR_STOP=1 \
-       -c "insert into failover_marks (at) values (clock_timestamp()) returning id" 2>/dev/null) \
-    && echo "ACKED $id"
-  sleep 0.2
-done
-echo DONE
-"""
-
-
-def long_writer():
-    host = f"{FULL}-database.{NAMESPACE}.svc.cluster.local"
-    pod = {
-        "apiVersion": "v1", "kind": "Pod",
-        "metadata": {"name": "e2e-writer", "namespace": NAMESPACE,
-                     "labels": {"app.kubernetes.io/instance": RELEASE}},
-        "spec": {
-            "restartPolicy": "Never",
-            "nodeSelector": {"kubernetes.io/hostname": server_node()},
-            "containers": [{
-                "name": "writer", "image": POSTGRES_IMAGE, "imagePullPolicy": "IfNotPresent",
-                "command": ["sh", "-c", LONG_WRITER.replace("HOST", host)],
-                "env": [{"name": "POSTGRES_PASSWORD", "valueFrom": {"secretKeyRef": {
-                    "name": f"{FULL}-database-passwords", "key": "superuser"}}}],
-            }],
-        },
-    }
-    kubectl("create", "-f", "-", input=json.dumps(pod).encode())
-    wait_for("the writer to commit", lambda: "ACKED" in out("logs", "e2e-writer", check=False), seconds=120)
-
-
-def long_writer_acknowledged():
-    kubectl("exec", "e2e-writer", "--", "touch", "/tmp/stop")
-    wait_for("the writer to stop", lambda: "DONE" in out("logs", "e2e-writer", check=False), seconds=60)
-    said = out("logs", "e2e-writer")
-    kubectl("delete", "pod", "e2e-writer", "--wait")
-    return {int(line.split()[1]) for line in said.splitlines()
-            if line.startswith("ACKED ") and line.split()[1].isdigit()}
-
 
 def record_now():
     """Each store's change log as it stands, by partition: its sequences
@@ -1447,9 +1659,7 @@ def helm_takes_counts():
 
 def reconfigure(s):
     global SHAPE
-    print("R: the live install moved between the profiles, under commits", flush=True)
-    marks_table()
-    long_writer()
+    print("R: the live install moved between the profiles, under the write driver's load", flush=True)
     for target in RECONFIGURE:
         before = record_now()
         print(f"R: {SHAPE} -> {target}, by the value `meridian upgrade-deployment --set` gives", flush=True)
@@ -1485,16 +1695,19 @@ def reconfigure(s):
             for component in STORES:
                 explain(s, f"reconfigure to {target}", component)
             return
-        claim(s, f"reconfigure-{target}", "deployment", took, None, {"from": "tolerant" if target == "ha" else "ha"})
+        extra = {"from": "tolerant" if target == "ha" else "ha"}
+        if DRIVEN:
+            # RPO through the stores across the move: the database moved
+            # under Patroni and back, every member replaced, and nothing
+            # acknowledged lost, the lake's included (no primary was lost).
+            s.check(acks_again(int(began * 1000), seconds=180),
+                    f"reconfigure to {target}: the write driver acknowledged by the book and the lake again")
+            extra.update(rpo_extra(driver_rpo_held(s, f"reconfigure to {target}", store_rpo(int(began * 1000)))))
+        claim(s, f"reconfigure-{target}", "deployment", took, None, extra)
         after = record_now()
         kept = all(set(before[store].splitlines()) <= set(after[store].splitlines()) for store in before)
         s.check(kept, f"reconfigure: each store's change log as it was before the move, added to and nothing else")
         properties(s, f"reconfigure to {target}")
-    acked = long_writer_acknowledged()
-    kept = {int(i) for i in psql("select id from failover_marks").split()}
-    lost = sorted(acked - kept)
-    s.check(acked and not lost, f"reconfigure: every acknowledged commit kept across both moves "
-            f"({len(acked)} acknowledged, {len(lost)} lost{': ' + ', '.join(map(str, lost[:5])) if lost else ''})")
 
 
 # ── The record's properties, held after every class (ruling 1105) ─────────
@@ -1596,6 +1809,8 @@ def main():
     print(f"A: installed in the {PROFILE} profile", flush=True)
     install(s)
     first_run(s)
+    if DRIVEN:
+        driver_fixtures(s)
     if TLS:
         internal_tls(s)
     if PROFILE in ("ha", "scaled"):
@@ -1615,6 +1830,17 @@ def main():
             properties(s, failure)
         except SystemExit as stopped:
             s.check(False, f"properties after {failure}: the change logs could not be read: {stopped}")
+        if DRIVEN and failure not in RPO_IN_CLASS:
+            try:
+                driver_rpo_held(s, failure)
+            except SystemExit as stopped:
+                s.check(False, f"{failure}: the stores' rows could not be read against the driver's: {stopped}")
+    if DRIVEN:
+        try:
+            driver_rpo_held(s, "the whole run", lake_may_lose=PROFILE == "ha")
+            driver_history(s)
+        except SystemExit as stopped:
+            s.check(False, f"the write driver's record could not be read: {stopped}")
     return verdict(s)
 
 

@@ -1,0 +1,48 @@
+# The tools a job fetches from GitHub's release downloads (tools/ci-tools.txt),
+# kept in GitHub's cache, keyed by each tool's name, architecture, URL (its
+# version) and digest: a release-download outage costs a run nothing once a
+# run has kept them, and each is checked against its digest every time
+# (tools/ci-tools.sh). CI_TOOLS names the directory after this step, which
+# the Makefile hands to the Docker builds as the `fetched` build context and
+# the jobs install k3d and elle-cli from.
+name: ci-tools
+description: The run's pinned tools, from GitHub's cache or fetched and checked.
+inputs:
+  tools:
+    description: The tools, by their names in tools/ci-tools.txt, space-separated.
+    required: true
+  core:
+    description: Where core is checked out.
+    default: workspace/meridian-core
+runs:
+  using: composite
+  steps:
+    - name: The tools' cache key
+      id: key
+      shell: bash
+      working-directory: ${{ inputs.core }}
+      env:
+        TOOLS: ${{ inputs.tools }}
+      run: echo "key=$(tools/ci-tools.sh key $TOOLS)" >> "$GITHUB_OUTPUT"
+    - name: The tools, as kept
+      id: restore
+      uses: actions/cache/restore@v4
+      continue-on-error: true
+      with:
+        path: ${{ runner.temp }}/ci-tools
+        key: ${{ steps.key.outputs.key }}
+    - name: Each checked, and fetched where missing
+      shell: bash
+      working-directory: ${{ inputs.core }}
+      env:
+        TOOLS: ${{ inputs.tools }}
+      run: |
+        tools/ci-tools.sh fetch "$RUNNER_TEMP/ci-tools" $TOOLS
+        echo "CI_TOOLS=$RUNNER_TEMP/ci-tools" >> "$GITHUB_ENV"
+    - name: Kept for the next run
+      if: steps.restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      continue-on-error: true
+      with:
+        path: ${{ runner.temp }}/ci-tools
+        key: ${{ steps.key.outputs.key }}

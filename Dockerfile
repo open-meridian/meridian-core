@@ -21,6 +21,10 @@ ADD https://github.com/open-meridian/meridian-ui.git#${MERIDIAN_UI_REV} /ui
 WORKDIR /ui
 RUN node tools/build.mjs
 
+# The tools CI keeps in GitHub's cache (tools/ci-tools.txt), given as the
+# `fetched` build context there and empty here (Dockerfile.rust's too).
+FROM scratch AS fetched
+
 FROM rust:${RUST_VERSION}-slim-bookworm AS build
 # The release links with the C compiler's linker on arm64, not Debian's lld:
 # lld's arm64 binaries came out larger (the arm64 runtime image 108.8 MB
@@ -29,8 +33,34 @@ FROM rust:${RUST_VERSION}-slim-bookworm AS build
 # arm64 smoke of #88). Test builds still link with lld (Dockerfile.rust),
 # whose size does not ship.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git ca-certificates \
+ && apt-get install -y --no-install-recommends git ca-certificates curl \
  && rm -rf /var/lib/apt/lists/*
+# sccache (ruling 1104), as Dockerfile.rust's compiles have it: the release
+# build CI runs fetches from GitHub's cache what an earlier run compiled,
+# keyed by everything rustc is given, so the binaries are what rustc makes
+# of these sources either way. Used only where the build is given GitHub's
+# cache token, as a BuildKit secret alone (tools/with-sccache.sh); every
+# other build -- a laptop's -- compiles as it always has, and the token is
+# in no layer. A pinned release, checked against its published digest.
+ARG TARGETARCH
+ARG SCCACHE_VERSION=0.18.0
+ARG SCCACHE_SHA256_AMD64=45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89
+ARG SCCACHE_SHA256_ARM64=2b3284d5da3b46a47dc4229e75bb7b88ac4aa99c8d754fb7d2f84997e5a4354a
+RUN --mount=type=bind,from=fetched,target=/fetched \
+    case "${TARGETARCH}" in \
+      amd64) ARCH=x86_64; SUM="${SCCACHE_SHA256_AMD64}" ;; \
+      arm64) ARCH=aarch64; SUM="${SCCACHE_SHA256_ARM64}" ;; \
+      *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+ && file="sccache-v${SCCACHE_VERSION}-${ARCH}-unknown-linux-musl.tar.gz" \
+ && { cp "/fetched/$file" /tmp/sccache.tgz 2>/dev/null \
+      || curl -fsSL --retry 6 --retry-all-errors --retry-delay 10 --retry-max-time 300 -o /tmp/sccache.tgz \
+           "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/$file"; } \
+ && echo "${SUM}  /tmp/sccache.tgz" | sha256sum -c - \
+ && tar -xzf /tmp/sccache.tgz -C /tmp \
+ && mv /tmp/sccache-*/sccache /usr/local/bin/sccache \
+ && rm -rf /tmp/sccache.tgz /tmp/sccache-*
+COPY tools/with-sccache.sh /usr/local/bin/with-sccache
 # No incremental state in the build cache, on the VM's one shared disk.
 ENV CARGO_INCREMENTAL=0
 WORKDIR /w
@@ -53,7 +83,11 @@ ARG MERIDIAN_VERSION=
 RUN --mount=type=cache,id=meridian-core-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=meridian-core-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=meridian-core-target,target=/w/target \
-    fresh-sources cargo build --release --locked -p meridian-runtime \
+    --mount=type=secret,id=gha-runtime-token,required=false \
+    --mount=type=secret,id=gha-results-url,required=false \
+    --mount=type=secret,id=gha-cache-url,required=false \
+    --mount=type=secret,id=gha-cache-v2,required=false \
+    with-sccache fresh-sources cargo build --release --locked -p meridian-runtime \
  && cp target/release/meridian-street target/release/meridian-bor target/release/meridian-lake \
        target/release/meridian-instrument \
        target/release/meridian-conductor target/release/meridian-sidecar \

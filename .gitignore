@@ -50,6 +50,7 @@ meridian-backup-e2e-*/
 # The cluster runs' measurements, kept for the claims ledger (CI keeps each
 # as an artifact).
 .e2e-failover-claims.jsonl
+.e2e-failover-history.edn
 .e2e-backup-claims.jsonl
 
 # Written by `make ci-local` while it runs: the gate's disk samples and stages

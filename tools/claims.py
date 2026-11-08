@@ -78,6 +78,12 @@ def rpo_of(said: list[dict]) -> dict:
         rpo["acknowledged_commits_min"] = min(acked)
     if lost:
         rpo["commits_lost_max"] = max(lost)
+    # Through the stores (step 3b part 5): the lake's rows lost, which its
+    # local commits allow and which are measured and said, not yet bounded.
+    lake = [c["lake_rows_lost"] for c in said if "lake_rows_lost" in c]
+    if lake:
+        rpo["lake_rows_lost_max"] = max(lake)
+        rpo["lake_rpo_s_max"] = max(c.get("lake_rpo_s", 0) for c in said if "lake_rows_lost" in c)
     seconds = [c["rpo_s"] for c in said if "rpo_s" in c]
     if seconds:
         rpo["seconds_max"] = max(seconds)
@@ -212,6 +218,10 @@ def self_test() -> int:
     except SystemExit:
         pass
     assert "bor-writer" in table(book, runs)
+    # Through the stores: the lake's loss said, and held to no bound yet.
+    made = ledger([dict(db, recovered_s=22.0, run="1", lake_rows_lost=3, lake_rpo_s=0.8)])
+    assert made["entries"][0]["rpo"]["lake_rows_lost_max"] == 3
+    assert check_ledger(made) == []
     print("claims: self-test OK")
     return 0
 

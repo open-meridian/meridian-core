@@ -12,20 +12,32 @@
 ARG PROTOC_VERSION=29.3
 ARG RUST_VERSION=1.90
 
+# The tools CI keeps in GitHub's cache (tools/ci-tools.txt), given as the
+# `fetched` build context there and empty here: protoc is copied from it
+# where it is, and fetched otherwise; checked against its digest either way.
+FROM scratch AS fetched
+
 FROM debian:bookworm-slim AS protoc
 ARG PROTOC_VERSION
 ARG TARGETARCH
 RUN apt-get update \
  && apt-get install -y --no-install-recommends curl unzip ca-certificates \
  && rm -rf /var/lib/apt/lists/*
-# protoc publishes aarch_64, not arm64.
-RUN case "${TARGETARCH}" in \
-      amd64) PROTOC_ARCH=x86_64 ;; \
-      arm64) PROTOC_ARCH=aarch_64 ;; \
+# protoc publishes aarch_64, not arm64, and no digest: these are the ones its
+# release first served (tools/ci-tools.txt).
+ARG PROTOC_SHA256_AMD64=3e866620c5be27664f3d2fa2d656b5f3e09b5152b42f1bedbf427b333e90021a
+ARG PROTOC_SHA256_ARM64=6427349140e01f06e049e707a58709a4f221ae73ab9a0425bc4a00c8d0e1ab32
+RUN --mount=type=bind,from=fetched,target=/fetched \
+    case "${TARGETARCH}" in \
+      amd64) PROTOC_ARCH=x86_64; SUM="${PROTOC_SHA256_AMD64}" ;; \
+      arm64) PROTOC_ARCH=aarch_64; SUM="${PROTOC_SHA256_ARM64}" ;; \
       *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
     esac \
- && curl -fsSL --retry 6 --retry-all-errors --retry-delay 10 --retry-max-time 300 -o /tmp/protoc.zip \
-      "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-${PROTOC_ARCH}.zip" \
+ && file="protoc-${PROTOC_VERSION}-linux-${PROTOC_ARCH}.zip" \
+ && { cp "/fetched/$file" /tmp/protoc.zip 2>/dev/null \
+      || curl -fsSL --retry 6 --retry-all-errors --retry-delay 10 --retry-max-time 300 -o /tmp/protoc.zip \
+           "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/$file"; } \
+ && echo "${SUM}  /tmp/protoc.zip" | sha256sum -c - \
  && unzip -q /tmp/protoc.zip -d /usr/local \
  && chmod +x /usr/local/bin/protoc \
  && rm /tmp/protoc.zip \
