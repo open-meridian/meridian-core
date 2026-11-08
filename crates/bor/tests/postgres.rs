@@ -1348,7 +1348,8 @@ async fn a_takeover_is_not_held_up_by_a_deposed_writer_stopped_mid_transaction()
     let standby = Arc::new(PostgresStore::connect(&url, 1).unwrap());
     let began = std::time::Instant::now();
     assert_eq!(
-        blocking(|| standby.take_over(&meridian_changes::TookOver::unnamed("a stalled writer"))).unwrap(),
+        blocking(|| standby.take_over(&meridian_changes::TookOver::unnamed("a stalled writer")))
+            .unwrap(),
         2
     );
     assert!(
