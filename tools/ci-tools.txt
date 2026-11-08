@@ -5,7 +5,8 @@
 # from the `fetched` build context where CI gives it, and fetches it itself
 # otherwise; its digest is checked either way. The digest is the release's
 # published one where it publishes one (sccache, nextest, cargo-deny, k3d),
-# and the one first fetched where it does not (protoc).
+# and the one first fetched where it does not (protoc, elle-cli's as the
+# step 3b part 5 brief gives it).
 #
 # name        arch     url                                                                                                                         sha256
 sccache       x86_64   https://github.com/mozilla/sccache/releases/download/v0.18.0/sccache-v0.18.0-x86_64-unknown-linux-musl.tar.gz             45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89
@@ -18,3 +19,4 @@ protoc        x86_64   https://github.com/protocolbuffers/protobuf/releases/down
 protoc        aarch64  https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-linux-aarch_64.zip                          6427349140e01f06e049e707a58709a4f221ae73ab9a0425bc4a00c8d0e1ab32
 k3d           x86_64   https://github.com/k3d-io/k3d/releases/download/v5.9.0/k3d-linux-amd64                                                    06d8f25bc3a971c4eb29e0ff08429b180402db0f4dec838c9eac427e296800a0
 k3d           aarch64  https://github.com/k3d-io/k3d/releases/download/v5.9.0/k3d-linux-arm64                                                    03cde5cf23e6e8e67de5a039ecf26e5b85aca82fba3e5d13dadf904cd218a250
+elle-cli      x86_64   https://github.com/ligurio/elle-cli/releases/download/0.1.11/elle-cli-bin-0.1.11.zip                                      9d3c72eaf3ccc4d0c7dc1da710264dee01f03af58c9fa177fec3f78ff5af1779
