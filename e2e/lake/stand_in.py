@@ -803,11 +803,16 @@ class Dgm(data.Role):
         stated = ({} if one("scheme") == "iso4217" else
                   {"stated_description": f"{one('value')}, as the venue names it",
                    "stated_currency": "USD"})
+        # How long the resolve itself took, timed here in the running
+        # plugin: the test's bound is the resolve's, not the runner's start.
+        began = time.monotonic()
         found = await self._operations().ResolveIdentifier(ops.ResolveIdentifierParams(
             identifiers=[ops.Identifier(scheme=one("scheme"), value=one("value"), source=one("source"))],
             as_of_ns=int(one("as_of") or 0), **stated))
+        took = time.monotonic() - began
         return {"found": found.found, "instrument_id": found.instrument_id,
-                "miss_reason": ops.MissReason.Name(found.miss_reason), "minted": found.minted}
+                "miss_reason": ops.MissReason.Name(found.miss_reason), "minted": found.minted,
+                "took_s": round(took, 3)}
 
     async def identity(self):
         symbol = ops.Identifier(scheme="symbol", value="ZZAMB", source="coinbase")
