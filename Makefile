@@ -874,6 +874,10 @@ E2E_K3D_NAMESPACE = $(if $(filter e2e-cluster-backup,$(E2E_CLUSTER_TARGET)),$(E2
 # zones. None by default: one node, as a desktop runs.
 E2E_K3D_AGENTS ?= 0
 E2E_K3D_ZONES ?=
+# How much of each container's log .e2e-cluster.log keeps when a run fails,
+# timestamped: enough of a database member's (Patroni says something every
+# two seconds) to reach back past a reconfigure's first upgrade.
+E2E_K3D_LOG_LINES ?= 400
 
 # `ready <what> <command...>`: the command, every two seconds until it
 # succeeds or E2E_K3D_READY_SECONDS have passed.
@@ -936,9 +940,9 @@ e2e-cluster-k3d:
 	        for c in $$(KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl -n $(E2E_K3D_NAMESPACE) get $$pod \
 	            -o jsonpath='{.spec.initContainers[*].name} {.spec.containers[*].name}'); do \
 	          echo "== $$pod, $$c"; \
-	          KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl -n $(E2E_K3D_NAMESPACE) logs $$pod -c $$c --tail=80; \
+	          KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl -n $(E2E_K3D_NAMESPACE) logs $$pod -c $$c --timestamps --tail=$(E2E_K3D_LOG_LINES); \
 	          echo "== $$pod, $$c before, if it restarted"; \
-	          KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl -n $(E2E_K3D_NAMESPACE) logs $$pod -c $$c --previous --tail=80; \
+	          KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl -n $(E2E_K3D_NAMESPACE) logs $$pod -c $$c --previous --timestamps --tail=$(E2E_K3D_LOG_LINES); \
 	        done; \
 	      done; } > .e2e-cluster.log 2>&1; \
 	  fi; \

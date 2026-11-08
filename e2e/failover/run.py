@@ -1657,6 +1657,23 @@ def helm_takes_counts():
     return ["--force-conflicts"] if said.startswith("v4") else []
 
 
+def database_said(s, when):
+    """What the database and the preflight said, where an upgrade's hook
+    refused: each member's pod, when it was made, its manager and its role
+    label, the Service's endpoints, and the preflight's own report."""
+    said = json.loads(out("get", "pods", "-l", f"app.kubernetes.io/instance={RELEASE},meridian.dev/component=database",
+                          "-o", "json", check=False) or '{"items": []}')["items"]
+    for pod in said:
+        labels = pod["metadata"].get("labels", {})
+        s.note(f"{when}: {pod['metadata']['name']} {pod['status'].get('phase')}, ready {ready(pod)}, "
+               f"made {pod['metadata'].get('creationTimestamp')}, manager "
+               f"{labels.get('meridian.dev/database-manager', 'none')}, role {labels.get('meridian.dev/database-role', 'none')}")
+    s.note(f"{when}: the database Service's endpoints: "
+           + (out("get", "endpoints", f"{FULL}-database", "-o", "jsonpath={.subsets}", check=False) or "none"))
+    logs = kubectl("logs", f"job/{FULL}-preflight", "--all-containers", "--timestamps", "--tail=20", check=False)
+    s.note(f"{when}: the preflight said: {logs.stdout.decode(errors='replace').strip()[-2000:] or 'nothing'}")
+
+
 def reconfigure(s):
     global SHAPE
     print("R: the live install moved between the profiles, under the write driver's load", flush=True)
@@ -1684,10 +1701,14 @@ def reconfigure(s):
                     "-U", "postgres", check=False).returncode == 0 and psql(
                     "select not pg_is_in_recovery()", database="postgres", pod=f"{FULL}-database-0") == "t",
                     seconds=600)
+                print(f"R: member 0 answers as the primary, {time.time() - began:.0f}s after the first upgrade; "
+                      "the second upgrade", flush=True)
                 again = run("helm", "upgrade", RELEASE, CHART, "--namespace", NAMESPACE, "--reuse-values",
                             *helm_takes_counts(), "--set", f"resilience.profile={target}", check=False)
                 s.check(again.returncode == 0, "reconfigure: the second upgrade adds the database's standbys"
                         + ("" if again.returncode == 0 else f": {again.stderr.decode(errors='replace')[-400:]}"))
+                if again.returncode != 0:
+                    database_said(s, "the second upgrade")
         settled = happens(settled_everywhere, 900, every=5)
         took = time.time() - began
         s.check(settled, f"reconfigure: every member in the {target} shape and ready, {took:.0f}s after the upgrade")
