@@ -6,7 +6,7 @@ from the chart's `sidecars[]` at install, in the SDK's interop image, with
 this file passed as `MERIDIAN_DRIVER`; it is in no values file, no catalogue
 and no image. Nothing here reaches a broker, a brokerage or a vendor.
 
-DRIVER_ROLE says which of its two instances it is:
+DRIVER_ROLE says which of its instances it is:
 
 - `data`: one dataset declared at registration (`<instance>:drive`), and a
   price recorded into it every half second (RecordPrices, data -> lake),
@@ -14,7 +14,9 @@ DRIVER_ROLE says which of its two instances it is:
 - `oms`: telephoned orders recorded in the accounts of DRIVER_ACCOUNTS
   (RecordOrder, oms -> book), each the next number in its account, and the
   accounts read back through the book's writer (ListOrders), by two
-  workers at once.
+  workers at once;
+- `desk`: the ems stand-in, holding oms and ems, the order-plugin class's
+  subject (below): orders recorded in its own account and placed.
 
 Each acknowledgement is printed and kept in /tmp/acked as `ACKED <kind>
 <id> <unix ms>`. The `oms` instance also keeps a Jepsen-style history in
@@ -46,7 +48,7 @@ import grpc
 from meridian import DatasetDeclaration, DatasetLicence, Declaration
 from meridian.client import connect
 from meridian.plugin.v1 import operations_pb2 as ops
-from meridian.roles import data, oms
+from meridian.roles import data, ems, oms
 from meridian.v1 import sidecar_pb2
 
 ROLE = os.environ.get("DRIVER_ROLE", "")
@@ -189,8 +191,14 @@ class Person:
     for this instance: made again before it is 30 seconds old (it lives
     50), so every command carries one in date."""
 
-    def __init__(self, instance):
+    def __init__(self, instance, roles=()):
         self.instance = instance
+        # On a plugin holding several roles, the claims say what the person
+        # holds on each (contract v15): write on every account, on each.
+        everything = list(range(len(ACCOUNTS)))
+        self.roles = [sidecar_pb2.RoleAccess(role=role, level=sidecar_pb2.ACCESS_LEVEL_WRITE,
+                                             read_positions=everything, write_positions=everything)
+                      for role in roles]
         self.made = 0
         self.held = None
 
@@ -201,7 +209,7 @@ class Person:
                 subject=PERSON, display_name="E2E driver", audience_instance_id=self.instance,
                 level=sidecar_pb2.ACCESS_LEVEL_WRITE, read_account_ids=ACCOUNTS,
                 write_account_ids=ACCOUNTS, issued_at_ns=now - 1_000_000_000,
-                expires_at_ns=now + 50_000_000_000, assertion_id=str(uuid.uuid4()),
+                expires_at_ns=now + 50_000_000_000, assertion_id=str(uuid.uuid4()), roles=self.roles,
             ).SerializeToString()
             self.held = sidecar_pb2.CallerAssertion(
                 claims=claims, signature=_sign(bytes.fromhex(SIGNER_SEED), claims), key_id=SIGNER_KEY_ID)
@@ -415,6 +423,106 @@ async def drive_oms(plugin, gen):
     await asyncio.gather(*(worker(book, slot, gen) for slot in range(WORKERS)))
 
 
+# ── The ems stand-in: the order-plugin class's subject ─────────────────────
+#
+# DRIVER_ROLE=desk holds `oms` and `ems`, as e2e/orders/stand_in.py's desk
+# does: it records an order in its account (DRIVER_ACCOUNTS, one) and places
+# it manually, agreed by phone (no connectivity plugin to reach), each act
+# acknowledged and kept as `ACKED order <id>` and `ACKED placement <id>`,
+# and each placement said as `PLACED <placement> <order>`. Nothing of its
+# work is kept but in the book (stateless compute, owned storage): started
+# again it reads its account back, places any order of its own the book
+# holds unplaced, and goes on numbering after the highest. Each act carries
+# an idempotency key made from its order's number, so one sent twice -- the
+# second time after a restart -- is one in the book.
+
+
+class Desking(ems.Role):
+    seed = False
+
+    async def on_order_updated(self, heard):
+        pass
+
+    async def on_execution_recorded(self, heard):
+        pass
+
+    async def on_placement_updated(self, heard):
+        pass
+
+    async def on_trading_instruction_changed(self, heard):
+        pass
+
+
+VENUE = "VEN-01JE2EDR1VEDESK000000000"
+
+
+class Desk:
+    def __init__(self, plugin):
+        self.stub = plugin._operations()
+        self.person = Person(plugin.identity.instance_id, roles=("oms", "ems"))
+        self.account = ACCOUNTS[0]
+
+    async def held(self):
+        """The book's own orders of this desk, by number, and whether each
+        is placed."""
+        numbered, cursor = {}, ""
+        while True:
+            listed = await bounded(self.stub.ListOrders(ops.ListOrdersParams(
+                account_id=self.account, page_size=500, cursor=cursor)))
+            placed = {p.order_id for p in listed.placements}
+            for order in listed.orders:
+                if order.venue_order_id.isdigit():
+                    numbered[int(order.venue_order_id)] = (order.order_id,
+                                                           order.order_id in placed or bool(order.placements))
+            cursor = listed.next_cursor
+            if not cursor:
+                return numbered
+
+    async def place(self, number, order_id):
+        done = await bounded(self.stub.CreatePlacement(ops.CreatePlacementParams(
+            order_id=order_id, quantity=decimal("1"), time_in_force=ops.TimeInForce.TIME_IN_FORCE_DAY,
+            placement_type=ops.PlacementType.PLACEMENT_TYPE_MANUAL, destination=VENUE,
+            idempotency_key=f"desk-place-{number}", acting_for=self.person.assertion())))
+        say(f"PLACED {done.placement.placement_id} {order_id}")
+        acked("placement", done.placement.placement_id)
+
+    async def run(self):
+        held = await self.held()
+        for number, (order_id, placed) in sorted(held.items()):
+            if not placed:
+                say(f"driver: desk: order {order_id} ({number}) unplaced on start; placing it")
+                await self.place(number, order_id)
+        number = max(held, default=0)
+        while not stopped():
+            number += 1
+            try:
+                done = await bounded(self.stub.RecordOrder(ops.RecordOrderParams(
+                    account_id=self.account, instrument_id=INSTRUMENT, side=ops.Side.SIDE_BUY,
+                    quantity=decimal("1"), order_type=ops.OrderType.ORDER_TYPE_MARKET,
+                    time_in_force=ops.TimeInForce.TIME_IN_FORCE_DAY, venue_order_id=str(number),
+                    origin=ops.OrderOrigin.ORDER_ORIGIN_TELEPHONED, idempotency_key=f"desk-{number}",
+                    acting_for=self.person.assertion())))
+                acked("order", done.order.order_id)
+                await self.place(number, done.order.order_id)
+            except (asyncio.TimeoutError, grpc.aio.AioRpcError) as failed:
+                say(f"UNPLACED {number}: {words(failed)}")
+                # Read back before going on: what the book holds decides.
+                await asyncio.sleep(1.0)
+                return
+            await asyncio.sleep(0.5)
+
+
+async def drive_desk(plugin):
+    # Each pass reads the book back first, so a call whose outcome was not
+    # heard is settled by what the book holds before the next.
+    while not stopped():
+        try:
+            await Desk(plugin).run()
+        except (asyncio.TimeoutError, grpc.aio.AioRpcError) as failed:
+            say(f"driver: desk: the book could not be read back ({words(failed)})")
+            await asyncio.sleep(1.0)
+
+
 # ── Start ───────────────────────────────────────────────────────────────────
 
 
@@ -428,13 +536,13 @@ def declaration():
 
 
 async def main():
-    if ROLE not in ("data", "oms") or not INSTRUMENT or (
-            ROLE == "oms" and not (ACCOUNTS and SIGNER_SEED and SIGNER_KEY_ID)):
-        raise SystemExit("driver: DRIVER_ROLE is data or oms, with DRIVER_INSTRUMENT (and, for oms, "
-                         "DRIVER_ACCOUNTS and the run's signer, DRIVER_SIGNER_SEED and DRIVER_SIGNER_KEY_ID)")
+    if ROLE not in ("data", "oms", "desk") or not INSTRUMENT or (
+            ROLE != "data" and not (ACCOUNTS and SIGNER_SEED and SIGNER_KEY_ID)):
+        raise SystemExit("driver: DRIVER_ROLE is data, oms or desk, with DRIVER_INSTRUMENT (and, for oms and "
+                         "desk, DRIVER_ACCOUNTS and the run's signer, DRIVER_SIGNER_SEED and DRIVER_SIGNER_KEY_ID)")
     gen = generation()
     say(f"driver: {ROLE}, start {gen}")
-    roles = {"data": [Recording()], "oms": [Managing()]}[ROLE]
+    roles = {"data": [Recording()], "oms": [Managing()], "desk": [Desking(), Managing()]}[ROLE]
     # Registered once the sidecar and the stores behind it answer: refused
     # while the deployment is not yet configured, asked again.
     while not stopped():
@@ -442,7 +550,8 @@ async def main():
             async with await connect(declaration=declaration(), roles=roles) as plugin:
                 say(f"driver: registered as {plugin.identity.instance_id}")
                 kept("/tmp/registered", f"REGISTERED {int(time.time() * 1000)}")
-                await (drive_data(plugin, gen) if ROLE == "data" else drive_oms(plugin, gen))
+                await {"data": lambda: drive_data(plugin, gen), "oms": lambda: drive_oms(plugin, gen),
+                       "desk": lambda: drive_desk(plugin)}[ROLE]()
             break
         except Exception as failed:  # noqa: BLE001 - every start failure is waited out
             say(f"driver: not registered yet ({type(failed).__name__}: {str(failed)[:200]})")
