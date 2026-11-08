@@ -9,7 +9,7 @@ COMPOSE := docker compose
 COMPOSE_TEST := $(COMPOSE) -f docker-compose.yaml -f e2e/postgres-for-tests.yaml
 DOCKER := DOCKER_BUILDKIT=1 docker
 
-.PHONY: migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep pre-push pre-push-run fast-rust install-hooks ci-mirror-check licence-check-test gate-start check-leftovers check-leftovers-end \
+.PHONY: ci-tier-check migrate test-broker nats-permissions check-nats-permissions help ci-local ci-local-deep pre-push pre-push-run fast-rust install-hooks ci-mirror-check licence-check-test gate-start check-leftovers check-leftovers-end \
         gate-mark-tests ci-stage images runtime-images test-images ci-images runtime-image analytics-image harness-image interop-image version-check-image tests-image settings-binary-image backup-cli-image stage-checks stage-images stage-compile stage-tests stage-settings-page stage-sdk stage-dashboards stage-harness stage-first-run stage-image stage-lint \
         e2e-first-run-brought e2e-first-run-oidc e2e-cluster e2e-cluster-external e2e-cluster-backup e2e-cluster-reconfigure \
         test-directory e2e-dashboard-oidc e2e-dashboard-ldap e2e-dashboard-accounts e2e-plugin-page e2e-settings-page harness-check e2e-tickets e2e-activity e2e-access-per-role e2e-archive e2e-plugin-area e2e-prepared e2e-service-account e2e-lake e2e-recorded e2e-orders e2e-one-id e2e-harness \
@@ -154,7 +154,7 @@ ifneq ($(filter ci-local ci-local-deep,$(MAKECMDGOALS)),)
 stage-tests stage-settings-page stage-sdk stage-dashboards stage-harness stage-first-run stage-image stage-lint: export IMAGES = built
 endif
 
-stage-checks:     gate-begin-checks check-leftovers contract-diff ci-mirror-check licence-check-test check-crate-boundaries check-one-clock check-test-targets check-local-storage check-codegen advisories chart-check claims-check
+stage-checks:     gate-begin-checks check-leftovers contract-diff ci-mirror-check ci-tier-check licence-check-test check-crate-boundaries check-one-clock check-test-targets check-local-storage check-codegen advisories chart-check claims-check
 	@$(GATE) end checks
 # The images at once (the CI images job is the run's critical path; step 3b
 # part 5): the release build beside the SDK's image and the harness's, which
@@ -329,8 +329,10 @@ ci-local-deep: ci-local
 ci-mirror-check:
 	@$(PY) tools/ci_mirror_check.py --repo-root .
 	@# Ruling 556: every harness suite in exactly one of CI's e2e-harness
-	@# groups, so a suite added here is never one no job runs.
-	@grouped="$$(sed -n 's/^ *suites: //p' .github/workflows/ci.yaml | tr ' ' '\n' | grep . | LC_ALL=C sort)"; \
+	@# groups, so a suite added here is never one no job runs. The groups
+	@# are the tier plan's (tools/ci_tier.py HARNESS_GROUPS), which ci.yaml's
+	@# harness job takes its matrix from.
+	@grouped="$$($(PY) tools/ci_tier.py suites | LC_ALL=C sort)"; \
 	suites="$$(printf '%s\n' $(HARNESS_SUITES) | LC_ALL=C sort)"; \
 	[ "$$grouped" = "$$suites" ] \
 		|| { echo "ci-mirror-check FAILED: CI's e2e-harness groups run $$(echo $$grouped), and HARNESS_SUITES is $$(echo $$suites); each suite in exactly one group" >&2; exit 1; }
@@ -1020,6 +1022,15 @@ footprint-judge:
 #   gh run download <run> -p 'failover-claims-*' -p backup-claims -D .claims
 #   make claims-ledger CLAIMS="$(find .claims -name '*.jsonl')"
 CLAIMS ?= $(wildcard .e2e-*-claims.jsonl)
+# CI's two tiers (the PO's ruling of 2026-11-08; tools/ci_tier.py): the
+# merge queue's plan runs every stage of ci-local, every harness group and
+# every cluster run, and ci.yaml takes each tiered job from the plan and
+# fails a queue run where a job did not succeed. `ci_tier.py table` lists
+# every job by event.
+ci-tier-check:
+	@$(PY) tools/ci_tier.py --self-test >/dev/null
+	@$(PY) tools/ci_tier.py check
+
 claims-check:
 	@$(PY) tools/claims.py --self-test >/dev/null
 	@$(PY) tools/claims.py check --ledger deploy/claims-ledger.json $(if $(CLAIMS_RUN),--every $(CLAIMS_RUN))
