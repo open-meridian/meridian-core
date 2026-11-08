@@ -1008,12 +1008,52 @@ alone (internalTlsServerVolume, by server: database, broker, sidecars).
 {{- end -}}
 
 {{/* libpq's own variables, for a container whose tools are psql and
-pg_dump: verified against the internal CA by the name connected to. */}}
+pg_dump: verified by the name connected to, against an external
+database's private CA where database.caSecret names one, else the internal
+CA. */}}
 {{- define "meridian-runtime.internalTlsLibpqEnv" -}}
-{{- if .Values.tls.internal.enabled }}
+{{- if .Values.database.caSecret }}
+- name: PGSSLMODE
+  value: verify-full
+- name: PGSSLROOTCERT
+  value: /etc/meridian-database-ca/ca.crt
+{{- else if .Values.tls.internal.enabled }}
 - name: PGSSLMODE
   value: verify-full
 - name: PGSSLROOTCERT
   value: /etc/meridian-internal-tls/ca.crt
+{{- end }}
+{{- end -}}
+
+{{/*
+An external database's private CA (database.caSecret; ruled 2026-11-08): the
+Secret it names, its `ca.crt`, mounted in every pod that connects to the
+database, and named to the runtime at MERIDIAN_DATABASE_CA. With it every
+connection is over TLS or not at all, the server verified against that CA by
+the name connected to (sslmode verify-full).
+*/}}
+{{- define "meridian-runtime.databaseCaEnv" -}}
+{{- if .Values.database.caSecret }}
+- name: MERIDIAN_DATABASE_CA
+  value: /etc/meridian-database-ca/ca.crt
+{{- end }}
+{{- end -}}
+
+{{- define "meridian-runtime.databaseCaMount" -}}
+{{- if .Values.database.caSecret }}
+- name: database-ca
+  mountPath: /etc/meridian-database-ca
+  readOnly: true
+{{- end }}
+{{- end -}}
+
+{{- define "meridian-runtime.databaseCaVolume" -}}
+{{- if .Values.database.caSecret }}
+- name: database-ca
+  secret:
+    secretName: {{ .Values.database.caSecret | quote }}
+    items:
+      - key: ca.crt
+        path: ca.crt
 {{- end }}
 {{- end -}}
