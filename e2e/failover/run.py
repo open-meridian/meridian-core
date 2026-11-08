@@ -1194,20 +1194,23 @@ def replica_rot(s):
     Patroni, and keeps the finding with its outcome."""
     print("F: replica-rot: a standby's page flipped beneath it; the replica scrub re-clones it", flush=True)
     member = standby()
-    # A store's log of more than one page, so its first is full and no
-    # append rewrites it: the configuration store's, as bit-rot's.
-    size = int(psql("select pg_relation_size('config_change')") or 0)
-    s.check(size >= 16384, f"replica-rot: the configuration store's log is more than a page ({size} bytes)")
+    # The largest store log, so its first page is the likeliest full, which
+    # no append then writes again before the scrub reads it.
+    sizes = psql("select relname || ' ' || pg_relation_size(oid) from pg_class "
+                 "where relname in ('config_change', 'instrument_change', 'street_change', "
+                 "'lake_row', 'book_entry') and relkind = 'r'")
+    table, size = max((line.split() for line in sizes.splitlines()), key=lambda t: int(t[1]))
+    s.note(f"replica-rot: {table}, {size} bytes, its first page flipped")
     # The page settled everywhere first, so nothing replays over the flip:
     # frozen (no hint bit to set again and log), checkpointed on the
     # primary, replayed and restartpointed on the standby.
-    psql("vacuum (freeze) config_change")
+    psql(f"vacuum (freeze) {table}")
     psql("checkpoint")
     lsn = psql("select pg_current_wal_lsn()")
     wait_for("the standby to replay the checkpoint", lambda: psql(
         f"select pg_last_wal_replay_lsn() >= '{lsn}'::pg_lsn", pod=member) == "t", seconds=120)
     psql("checkpoint", pod=member)
-    node, path = member_file(member, "config_change")
+    node, path = member_file(member, table)
     before = on_disk(node, path)
     run("docker", "exec", node, "sh", "-c",
         f"printf '\\377\\377\\377\\377' | dd of='{path}' bs=1 seek=4000 conv=notrunc 2>/dev/null")
@@ -1244,7 +1247,8 @@ def replica_rot(s):
     finding = found[0]
     s.check("matches the primary's again" in finding.get("outcome", ""),
             f"replica-rot: {member} re-cloned through Patroni and matching ({finding.get('outcome', '')})")
-    kept = psql(f"select count(*) from config_integrity_finding where member = '{member}' "
+    prefix = {"lake_row": "lake", "book_entry": "book"}.get(table, table.removesuffix("_change"))
+    kept = psql(f"select count(*) from {prefix}_integrity_finding where member = '{member}' "
                 "and partition = 'replicas' and what like '%re-cloned through Patroni%'")
     s.check(kept != "0", f"replica-rot: kept as an IntegrityFinding with its outcome ({kept})")
     s.check(on_disk(node, path) != "ffffffff", "replica-rot: the re-cloned copy's page is whole on disk")

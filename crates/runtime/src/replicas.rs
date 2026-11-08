@@ -153,11 +153,14 @@ pub fn common_ranges(each: &[BTreeMap<String, (i64, i64)>]) -> BTreeMap<String, 
     common
 }
 
-fn connect(url: &str, host: &str) -> Result<postgres::Client, String> {
+/// A member by its address: the URL's own host kept, so a TLS connection
+/// is verified against the name every store connects by (internal TLS), and
+/// the connection made to the member's address beside it (`hostaddr`).
+fn connect(url: &str, address: std::net::IpAddr) -> Result<postgres::Client, String> {
     let mut config: postgres::Config = url
         .parse()
         .map_err(|failed| format!("the database URL is unreadable: {failed}"))?;
-    config.host(host);
+    config.hostaddr(address);
     config.connect_timeout(Duration::from_secs(10));
     let (config, tls) =
         meridian_changes::tls::secured(config, meridian_changes::tls::names_ssl_mode(url))
@@ -232,42 +235,39 @@ fn digests(
     }
 }
 
-/// A member of the brought database, by its own name.
+/// A member of the brought database: Patroni's name for it (its pod's) and
+/// its address.
 #[derive(Debug, Clone)]
 pub struct Member {
     pub name: String,
-    pub host: String,
+    pub address: std::net::IpAddr,
 }
 
 /// Where the Job finds the database's members and Patroni.
 pub struct Setup {
     /// The serving URL, whose role reads every store's tables.
     pub url: String,
-    pub members: Vec<Member>,
+    /// The members' headless Service, which names every member's address,
+    /// ready or not.
+    pub service: String,
+    /// How many members the chart runs.
+    pub expected: usize,
     /// Patroni's REST credential, this Job's alone; none to compare only.
     pub patroni: Option<(String, String)>,
     pub reclone: bool,
 }
 
 impl Setup {
-    /// From the chart's environment: MERIDIAN_DATABASE_URL, the members as
-    /// MERIDIAN_REPLICAS_MEMBERS (`name=host,...`), Patroni's credential
-    /// as MERIDIAN_PATRONI_USERNAME/_PASSWORD, and MERIDIAN_REPLICAS_RECLONE.
+    /// From the chart's environment: MERIDIAN_DATABASE_URL, the members'
+    /// headless Service as MERIDIAN_REPLICAS_SERVICE and how many it runs as
+    /// MERIDIAN_REPLICAS_MEMBERS, Patroni's credential as
+    /// MERIDIAN_PATRONI_USERNAME/_PASSWORD, and MERIDIAN_REPLICAS_RECLONE.
     pub fn from_env() -> Result<Self, String> {
         let url = crate::required("MERIDIAN_DATABASE_URL")?;
-        let members = crate::required("MERIDIAN_REPLICAS_MEMBERS")?
-            .split(',')
-            .filter_map(|each| {
-                let (name, host) = each.trim().split_once('=')?;
-                Some(Member {
-                    name: name.to_string(),
-                    host: host.to_string(),
-                })
-            })
-            .collect::<Vec<_>>();
-        if members.len() < 2 {
-            return Err("MERIDIAN_REPLICAS_MEMBERS names fewer than two members".into());
-        }
+        let service = crate::required("MERIDIAN_REPLICAS_SERVICE")?;
+        let expected: usize = crate::required("MERIDIAN_REPLICAS_MEMBERS")?
+            .parse()
+            .map_err(|_| "MERIDIAN_REPLICAS_MEMBERS is not a count".to_string())?;
         let patroni = match (
             crate::var("MERIDIAN_PATRONI_USERNAME"),
             crate::var("MERIDIAN_PATRONI_PASSWORD"),
@@ -278,11 +278,51 @@ impl Setup {
         let reclone = crate::var("MERIDIAN_REPLICAS_RECLONE").as_deref() == Some("true");
         Ok(Self {
             url,
-            members,
+            service,
+            expected,
             patroni,
             reclone,
         })
     }
+}
+
+/// Every member, by the headless Service's addresses, each named by
+/// Patroni's own word for it. All of them, or none: a member that cannot
+/// be found is one whose copy cannot be compared.
+async fn discover(http: &reqwest::Client, setup: &Setup) -> Result<Vec<Member>, String> {
+    use std::net::ToSocketAddrs as _;
+    let addresses: std::collections::BTreeSet<std::net::IpAddr> = format!("{}:5432", setup.service)
+        .to_socket_addrs()
+        .map_err(|failed| {
+            format!(
+                "the members' Service {} did not resolve: {failed}",
+                setup.service
+            )
+        })?
+        .map(|at| at.ip())
+        .collect();
+    let mut members = Vec::new();
+    for address in addresses {
+        let name = patroni_said(http, address)
+            .await
+            .and_then(|said| said["patroni"]["name"].as_str().map(str::to_string))
+            .unwrap_or_else(|| address.to_string());
+        members.push(Member { name, address });
+    }
+    members.sort_by(|a, b| a.name.cmp(&b.name));
+    if members.len() != setup.expected {
+        return Err(format!(
+            "{} member(s) found of the {} the chart runs: {}",
+            members.len(),
+            setup.expected,
+            members
+                .iter()
+                .map(|m| m.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    Ok(members)
 }
 
 /// Whether a member is the primary, and how far it has replayed or written.
@@ -314,12 +354,12 @@ fn replayed_past(client: &mut postgres::Client, lsn: &str) -> bool {
 
 /// One comparison of every member against the primary: each standby's
 /// findings by log, and which member is primary.
-fn compare(setup: &Setup) -> Result<(String, Found), String> {
+fn compare(setup: &Setup, members: &[Member]) -> Result<(String, Found), String> {
     let mut clients = Vec::new();
     let mut primary = None;
     let mut primary_lsn = String::new();
-    for (i, member) in setup.members.iter().enumerate() {
-        let mut client = connect(&setup.url, &member.host)
+    for (i, member) in members.iter().enumerate() {
+        let mut client = connect(&setup.url, member.address)
             .map_err(|failed| format!("{} could not be reached: {failed}", member.name))?;
         let (is_primary, lsn) = position(&mut client)?;
         if is_primary {
@@ -383,20 +423,28 @@ fn compare(setup: &Setup) -> Result<(String, Found), String> {
             ));
         }
     }
-    Ok((setup.members[primary].name.clone(), found))
+    Ok((members[primary].name.clone(), found))
 }
 
-/// Patroni's own word on a member: its role and state.
-async fn patroni_state(http: &reqwest::Client, member: &Member) -> Option<(String, String)> {
+/// Patroni's own word on a member (GET /patroni).
+async fn patroni_said(http: &reqwest::Client, address: std::net::IpAddr) -> Option<Value> {
     let body = http
-        .get(format!("http://{}:8008/patroni", member.host))
+        .get(format!(
+            "http://{}/patroni",
+            std::net::SocketAddr::new(address, 8008)
+        ))
         .send()
         .await
         .ok()?
         .bytes()
         .await
         .ok()?;
-    let said: Value = serde_json::from_slice(&body).ok()?;
+    serde_json::from_slice(&body).ok()
+}
+
+/// A member's role and state, by Patroni.
+async fn patroni_state(http: &reqwest::Client, member: &Member) -> Option<(String, String)> {
+    let said = patroni_said(http, member.address).await?;
     Some((
         said["role"].as_str().unwrap_or_default().to_string(),
         said["state"].as_str().unwrap_or_default().to_string(),
@@ -412,7 +460,10 @@ async fn reinit(
     within: Duration,
 ) -> Result<(), String> {
     let answered = http
-        .post(format!("http://{}:8008/reinit", member.host))
+        .post(format!(
+            "http://{}/reinit",
+            std::net::SocketAddr::new(member.address, 8008)
+        ))
         .basic_auth(&credential.0, Some(&credential.1))
         .header("Content-Type", "application/json")
         .body(json!({ "force": true }).to_string())
@@ -449,12 +500,12 @@ async fn reinit(
 /// Keep a finding in the store whose log differed, on the primary.
 fn keep(
     setup: &Setup,
-    primary_host: &str,
+    primary: std::net::IpAddr,
     prefix: &str,
     member: &str,
     what: &str,
 ) -> Result<(), String> {
-    let mut client = connect(&setup.url, primary_host)?;
+    let mut client = connect(&setup.url, primary)?;
     let clock = crate::clock();
     let scrubbed = meridian_changes::integrity::Scrubbed {
         checked: 0,
@@ -475,31 +526,6 @@ fn keep(
 /// and say it as JSON.
 pub fn run(setup: &Setup) -> Result<Value, String> {
     let started = Instant::now();
-    let (primary, first) = compare(setup)?;
-    if first.is_empty() {
-        return Ok(json!({
-            "replicas": "matching", "primary": primary,
-            "members": setup.members.len(), "ms": started.elapsed().as_millis() as u64,
-        }));
-    }
-    // Once more, before anything is done: a copy that only lagged matches
-    // by now.
-    let (primary, found) = compare(setup)?;
-    let detected_ms = started.elapsed().as_millis() as u64;
-    let primary_host = setup
-        .members
-        .iter()
-        .find(|m| m.name == primary)
-        .map(|m| m.host.clone())
-        .unwrap_or_default();
-    let mut bad: BTreeMap<usize, Vec<(String, String)>> = BTreeMap::new();
-    for (prefix, members) in &found {
-        for (i, why) in members {
-            bad.entry(*i)
-                .or_default()
-                .push((prefix.clone(), why.clone()));
-        }
-    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -508,9 +534,34 @@ pub fn run(setup: &Setup) -> Result<Value, String> {
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|failed| failed.to_string())?;
+    let members = runtime.block_on(discover(&http, setup))?;
+    let (primary, first) = compare(setup, &members)?;
+    if first.is_empty() {
+        return Ok(json!({
+            "replicas": "matching", "primary": primary,
+            "members": members.len(), "ms": started.elapsed().as_millis() as u64,
+        }));
+    }
+    // Once more, before anything is done: a copy that only lagged matches
+    // by now.
+    let (primary, found) = compare(setup, &members)?;
+    let detected_ms = started.elapsed().as_millis() as u64;
+    let primary_address = members
+        .iter()
+        .find(|m| m.name == primary)
+        .map(|m| m.address)
+        .ok_or("the primary is not among the members")?;
+    let mut bad: BTreeMap<usize, Vec<(String, String)>> = BTreeMap::new();
+    for (prefix, members) in &found {
+        for (i, why) in members {
+            bad.entry(*i)
+                .or_default()
+                .push((prefix.clone(), why.clone()));
+        }
+    }
     let mut said = Vec::new();
     for (i, logs) in &bad {
-        let member = &setup.members[*i];
+        let member = &members[*i];
         let why = logs
             .iter()
             .map(|(prefix, why)| format!("{prefix}: {why}"))
@@ -537,12 +588,12 @@ pub fn run(setup: &Setup) -> Result<Value, String> {
                 Err(why) => (format!("re-clone failed: {why}"), Some(took)),
                 Ok(()) => {
                     // Compared again, now it streams.
-                    let still = compare(setup)
+                    let still = compare(setup, &members)
                         .map(|(_, again)| {
                             again
                                 .values()
                                 .flatten()
-                                .any(|(j, _)| setup.members[*j].name == member.name)
+                                .any(|(j, _)| members[*j].name == member.name)
                         })
                         .unwrap_or(true);
                     if still {
@@ -573,7 +624,7 @@ pub fn run(setup: &Setup) -> Result<Value, String> {
         );
         tracing::error!(member = member.name, "integrity finding: {what}");
         for (prefix, _) in logs {
-            if let Err(failed) = keep(setup, &primary_host, prefix, &member.name, &what) {
+            if let Err(failed) = keep(setup, primary_address, prefix, &member.name, &what) {
                 tracing::error!(prefix, "the finding could not be kept: {failed}");
             }
         }
@@ -583,7 +634,7 @@ pub fn run(setup: &Setup) -> Result<Value, String> {
         }));
     }
     Ok(json!({
-        "replicas": "differed", "primary": primary, "members": setup.members.len(),
+        "replicas": "differed", "primary": primary, "members": members.len(),
         "findings": said, "ms": started.elapsed().as_millis() as u64,
     }))
 }
