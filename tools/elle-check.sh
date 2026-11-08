@@ -47,14 +47,15 @@ printf 'elle-check: %s operations, %s acknowledged appends, %s reads\n' \
 	"$(grep -c ':type :ok, :f :txn, :value \[\[:append' "$work/history.edn" || true)" \
 	"$(grep -c ':type :ok, :f :txn, :value \[\[:r' "$work/history.edn" || true)"
 
-# elle-cli prints each file, a tab, and true, false or unknown. jdk.random
+# elle-cli prints each file, then true, false or unknown (#99's third ha
+# run: "/w/history.edn \t true", spaces about the tab). jdk.random
 # named, as a jar on the class path resolves a module exporting nothing
 # only by service binding.
 verdict() {
 	docker run --rm --network none -v "$work":/w:ro "$JVM" \
 		java --add-modules jdk.random -jar /w/elle-cli.jar --model list-append --consistency-models strict-serializable \
 		"/w/$1" 2>&1 | tee "$work/$1.said" | tail -n 40 >&2 || true
-	awk -F '\t' -v f="/w/$1" '$1 == f { print $2 }' "$work/$1.said" | tail -n 1
+	grep -F "/w/$1" "$work/$1.said" | awk '{ print $NF }' | tail -n 1
 }
 said="$(verdict history.edn)"
 [ "$said" = true ] || { echo "elle-check FAILED: the driver's history is not strict-serializable per key ($said)" >&2; exit 1; }
