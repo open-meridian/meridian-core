@@ -511,6 +511,10 @@ pub struct Inputs {
     pub stores: Vec<(&'static str, String)>,
     pub volume: Option<u64>,
     pub memory_limit: Option<u64>,
+    /// The brought database's max_connections once the upgrade is applied,
+    /// counted by the chart from what it deploys: the memory is judged by
+    /// it rather than by the server's count before the upgrade.
+    pub max_connections: Option<u64>,
     pub max_payload: u64,
     /// The backups' directory, mounted read-only, where backups are kept.
     pub backups: Option<String>,
@@ -541,6 +545,8 @@ impl Inputs {
             stores,
             volume: var("MERIDIAN_PREFLIGHT_DATABASE_VOLUME").and_then(|q| quantity(&q)),
             memory_limit: var("MERIDIAN_PREFLIGHT_DATABASE_MEMORY").and_then(|q| quantity(&q)),
+            max_connections: var("MERIDIAN_PREFLIGHT_DATABASE_MAX_CONNECTIONS")
+                .and_then(|n| n.parse().ok()),
             max_payload: var("MERIDIAN_PREFLIGHT_MAX_PAYLOAD")
                 .and_then(|q| quantity(&q))
                 .unwrap_or(1024 * 1024),
@@ -562,10 +568,16 @@ impl Inputs {
 /// waits for its database for that reason ([`crate::wait_until`],
 /// [`crate::migrate_once_it_answers`]); the preflight once made one attempt,
 /// and on CI's k3d cluster every store "did not answer" and the upgrade was
-/// blocked with the database running (CI run 40423226625). A minute is
-/// far past that moment and well inside the hook's five-minute deadline; a
-/// database that is truly not there still blocks, after it, saying why.
-pub const DATABASE_WAITS_AT_MOST: Duration = Duration::from_secs(60);
+/// blocked with the database running (CI run 40423226625).
+///
+/// And a database whose member is new answers nobody through its Service
+/// until it is ready: a second upgrade run by hand right after the one that
+/// moved the database under Patroni met its preflight refused for 2 to 38 s
+/// on ten CI runs, and past a minute on two (step 3b part 5; CI runs
+/// 42462993343 and 42482853675). Three minutes covers that and stays well
+/// inside the hook's five-minute deadline; a database that is truly not
+/// there still blocks, after it, saying why.
+pub const DATABASE_WAITS_AT_MOST: Duration = Duration::from_secs(180);
 
 /// One attempt's limit: a connection the network drops rather than refuses
 /// fails in this, not in the minutes the system's own retries take.
@@ -785,7 +797,12 @@ pub fn run(inputs: &Inputs) -> Vec<Finding> {
                 setting_bytes(&mut client, "max_connections"),
             ) {
                 (Some(shared), Some(work), Some(max)) => {
-                    findings.push(judge_memory(shared, work, max, inputs.memory_limit));
+                    findings.push(judge_memory(
+                        shared,
+                        work,
+                        inputs.max_connections.unwrap_or(max),
+                        inputs.memory_limit,
+                    ));
                     if let Ok(row) = client.query_one("SELECT count(*) FROM pg_stat_activity", &[])
                     {
                         findings.push(judge_connections(row.get::<_, i64>(0).max(0) as u64, max));

@@ -670,6 +670,60 @@ spec:
 {{- end -}}
 
 {{/*
+The connections the deployment's own pods and jobs hold on the brought
+database at most, counted from what this chart deploys (ruled 2026-11-08):
+each store member -- the instrument store, the conductor's configuration
+store, the street store, the book and the lake, writer and standby, and
+during a rollout the one more a standby's surge starts -- holds its pool of
+8 and 2 beside it (its change log's tail, a scrub or a probe); each
+dashboard copy its pool of 4 and 1 beside it; and the jobs that may run at
+once, 6 (the preflight's 1, a migration's 2, a backup's 2 and the members'
+comparison's 1). A store whose database is its own (<store>.database.
+existingSecret) is not counted. Kept in step with the pools the binaries
+open (crates/runtime/src/bin). Takes the chart.
+*/}}
+{{- define "meridian-runtime.databaseConnections" -}}
+{{- $held := 6 -}}
+{{- range $component := list "instrument" "conductor" "street" "bor" "lake" -}}
+{{- $values := index $.Values $component -}}
+{{- if not (dig "database" "existingSecret" "" $values) -}}
+{{- $members := int (include "meridian-runtime.memberCount" (dict "top" $ "component" $component "values" $values)) -}}
+{{- if and (gt $members 0) (include "meridian-runtime.leased" (dict "top" $ "component" $component "values" $values)) -}}
+{{- $members = add1 $members -}}
+{{- end -}}
+{{- $held = add $held (mul $members 10) -}}
+{{- end -}}
+{{- end -}}
+{{- if .Values.dashboard.enabled -}}
+{{- $copies := int (include "meridian-runtime.copies" (dict "top" . "value" .Values.dashboard.replicaCount "what" "dashboard.replicaCount")) -}}
+{{- $held = add $held (mul $copies 5) -}}
+{{- end -}}
+{{- $held -}}
+{{- end -}}
+
+{{/*
+The brought database's max_connections (ruled 2026-11-08): what the
+deployment holds at most (databaseConnections), 4 kept for the superuser
+(Postgres's superuser_reserved_connections, 3) and Patroni's own, and a
+quarter over that, rounded up -- room for a lost node's connections the
+server has not yet let go and for somebody's psql. database.brought.
+maxConnections sets it instead, and one below what the deployment holds
+with the 4 kept is refused here, before anything is changed, rather than
+found as connections refused while the new pods start. Takes the chart.
+*/}}
+{{- define "meridian-runtime.databaseMaxConnections" -}}
+{{- $needed := add 4 (int (include "meridian-runtime.databaseConnections" .)) -}}
+{{- $set := index .Values.database.brought "maxConnections" -}}
+{{- if or (kindIs "invalid" $set) (eq (toString $set) "") -}}
+{{- add $needed (div (add $needed 3) 4) -}}
+{{- else if lt (int $set) $needed -}}
+{{- fail (printf "database.brought.maxConnections is %v, and this deployment's pods and jobs hold up to %d connections on the database at once with 4 kept for its superuser and Patroni: %d at least. Leave it empty for %d, that count with a quarter's room, or set it to %d or more." $set (sub $needed 4) $needed (add $needed (div (add $needed 3) 4)) $needed) -}}
+{{- else -}}
+{{- int $set -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Patroni's dynamic settings for the brought database (step 3b, section 4):
 the timings set for the database tier (1048: a primary lost answered for
 within 30 s -- the leader key's 20 s, Patroni's least, then a promotion),
@@ -677,8 +731,9 @@ and with standbys, one synchronous and strict (question 5), so a primary
 cut off from every standby cannot acknowledge a commit on its own. With
 none, neither: a database alone has nothing to wait for. Pages written
 whole after a checkpoint (full_page_writes) and hint bits logged, so a
-torn write is replayed and a rejoining primary rewound. Takes a dict: top,
-standbys.
+torn write is replayed and a rejoining primary rewound. And the
+connections the deployment holds (databaseMaxConnections). Takes a dict:
+top, standbys.
 */}}
 {{- define "meridian-runtime.patroniDynamic" -}}
 ttl: 20
@@ -699,6 +754,7 @@ postgresql:
     max_wal_senders: 10
     max_replication_slots: 10
     wal_keep_size: 128MB
+    max_connections: {{ include "meridian-runtime.databaseMaxConnections" .top }}
 {{- end -}}
 
 {{/*

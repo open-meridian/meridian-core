@@ -352,7 +352,9 @@ spec:
   # cluster's; the second adds the standbys, which clone from it. Added in
   # the same upgrade, they started before member 0 was moved, and the first
   # of them made a new, empty cluster that the Service then followed.
-  # `meridian upgrade-deployment` runs the second when the chart says so.
+  # The second runs once the first has rolled out: the Service routes to
+  # member 0 only once Patroni says it is ready, and a second upgrade
+  # started before then meets its preflight refused (NOTES.txt says so).
   replicas: {{ if gt (int $running) 0 }}{{ if $converting }}1{{ else }}{{ add 1 $standbys }}{{ end }}{{ else }}0{{ end }}
   serviceName: {{ $name }}
   selector:
@@ -520,9 +522,12 @@ spec:
               exec docker-entrypoint.sh "$@"
             - --
           {{- end }}
-          {{- if or $archive $tls }}
+          # Its connections counted from what this chart deploys
+          # (databaseMaxConnections, ruled 2026-11-08), not Postgres's 100.
           args:
             - postgres
+            - -c
+            - max_connections={{ include "meridian-runtime.databaseMaxConnections" . }}
             {{- if $archive }}
             # Archiving its WAL (backup.walArchive): the image's own
             # entrypoint and server, told to archive through pgBackRest.
@@ -545,7 +550,6 @@ spec:
             - -c
             - hba_file=/etc/meridian-hba/pg_hba.conf
             {{- end }}
-          {{- end }}
           env:
             - name: POSTGRES_USER
               value: postgres

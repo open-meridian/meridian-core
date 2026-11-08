@@ -1805,6 +1805,142 @@ def helm_takes_counts():
     return ["--force-conflicts"] if said.startswith("v4") else []
 
 
+def database_said(s, when):
+    """What the database and the preflight said, where an upgrade's hook
+    refused: each member's pod, when it was made, its manager and its role
+    label, the Service's endpoints, and the preflight's own report."""
+    said = json.loads(out("get", "pods", "-l", f"app.kubernetes.io/instance={RELEASE},meridian.dev/component=database",
+                          "-o", "json", check=False) or '{"items": []}')["items"]
+    for pod in said:
+        labels = pod["metadata"].get("labels", {})
+        s.note(f"{when}: {pod['metadata']['name']} {pod['status'].get('phase')}, ready {ready(pod)}, "
+               f"made {pod['metadata'].get('creationTimestamp')}, manager "
+               f"{labels.get('meridian.dev/database-manager', 'none')}, role {labels.get('meridian.dev/database-role', 'none')}")
+    s.note(f"{when}: the database Service's endpoints: "
+           + (out("get", "endpoints", f"{FULL}-database", "-o", "jsonpath={.subsets}", check=False) or "none"))
+    logs = kubectl("logs", f"job/{FULL}-preflight", "--all-containers", "--timestamps", "--tail=20", check=False)
+    s.note(f"{when}: the preflight said: {logs.stdout.decode(errors='replace').strip()[-2000:] or 'nothing'}")
+
+
+def rollout_unfinished():
+    """Each Deployment and StatefulSet of the release whose rollout is not
+    finished, and why, judged as `meridian upgrade-deployment` judges it
+    before it says an upgrade is done (meridian-cli, upgrade_deployment.rs):
+    its template seen by its controller, every replica on it and ready,
+    and nothing old left -- a StatefulSet's current revision its update's."""
+    left = []
+    for kind in ("deployments", "statefulsets"):
+        items = json.loads(out("get", kind, "-l", f"app.kubernetes.io/instance={RELEASE}", "-o", "json"))["items"]
+        for item in items:
+            name, spec, status = item["metadata"]["name"], item["spec"], item.get("status", {})
+            wanted = spec.get("replicas", 1)
+            if item["metadata"].get("generation", 0) > status.get("observedGeneration", 0):
+                left.append(f"{name}: its new template not yet seen")
+            elif status.get("updatedReplicas", 0) < wanted:
+                left.append(f"{name}: {status.get('updatedReplicas', 0)} of {wanted} on the new template")
+            elif status.get("readyReplicas", 0) < wanted:
+                left.append(f"{name}: {status.get('readyReplicas', 0)} of {wanted} ready")
+            elif kind == "deployments" and (status.get("replicas", 0) > wanted
+                                            or status.get("availableReplicas", 0) < wanted):
+                left.append(f"{name}: old pods still being replaced")
+            elif kind == "statefulsets" and spec.get("updateStrategy", {}).get("type") != "OnDelete" \
+                    and status.get("currentRevision") != status.get("updateRevision"):
+                left.append(f"{name}: its update not finished")
+    return left
+
+
+def ready_of(pod):
+    return bool(pod) and ready(pod)
+
+
+class HookLog:
+    """A hook Job's log, read every second while an upgrade runs, the last
+    read kept: a hook that passes is deleted with its pod when it succeeds,
+    so what it said -- how long it waited for the database, and why -- is
+    read while it runs or never."""
+
+    def __init__(self, job):
+        import threading
+        self.job = f"{FULL}-{job}"
+        self.said = ""
+        self.seen = []
+        self.done = threading.Event()
+        self.thread = threading.Thread(target=self.follow, daemon=True)
+
+    def follow(self):
+        last = None
+        while not self.done.is_set():
+            done = kubectl("logs", f"job/{self.job}", "--all-containers", "--timestamps", "--tail=60", check=False)
+            text = done.stdout.decode(errors="replace").strip()
+            if done.returncode == 0 and text:
+                self.said = text
+            # Beside it, what the database's Service routes to and what
+            # member 0 says of itself, each change kept with its time: a
+            # refused connection is either no endpoint behind the Service,
+            # or a new pod not yet admitted by the database's policy.
+            ready = out("get", "endpoints", f"{FULL}-database", "-o",
+                        "jsonpath={.subsets[*].addresses[*].ip}/{.subsets[*].notReadyAddresses[*].ip}", check=False)
+            pod = json.loads(out("get", "pod", f"{FULL}-database-0", "-o", "json", check=False) or "{}")
+            now = (f"endpoints {ready or '/'}; member 0 {pod.get('status', {}).get('podIP', '')} role "
+                   f"{pod.get('metadata', {}).get('labels', {}).get('meridian.dev/database-role', 'none')} "
+                   f"ready {ready_of(pod)}")
+            if now != last:
+                self.seen.append(f"{time.strftime('%H:%M:%S', time.gmtime())} {now}")
+                last = now
+            self.done.wait(1)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_):
+        self.done.set()
+        self.thread.join(timeout=20)
+
+
+def member_now(when):
+    """Which of the database's StatefulSet revisions member 0 is from, and
+    what it is: printed, for reading a move under Patroni."""
+    sts = json.loads(out("get", "statefulset", f"{FULL}-database", "-o", "json", check=False) or "{}")
+    pod = json.loads(out("get", "pod", f"{FULL}-database-0", "-o", "json", check=False) or "{}")
+    labels = pod.get("metadata", {}).get("labels", {})
+    revision = labels.get("controller-revision-hash", "")
+    status = sts.get("status", {})
+    print(f"R: {when}: member 0 from revision {revision} (the set's current {status.get('currentRevision')}, "
+          f"update {status.get('updateRevision')}), made {pod.get('metadata', {}).get('creationTimestamp')}, "
+          f"manager {labels.get('meridian.dev/database-manager', 'none')}, "
+          f"role {labels.get('meridian.dev/database-role', 'none')}, ready {ready(pod) if pod else False}, "
+          f"going {bool(pod.get('metadata', {}).get('deletionTimestamp'))}", flush=True)
+
+
+def connections_held(s, when):
+    """The database's max_connections against the count the chart gave it
+    (ruled 2026-11-08: counted from what the chart deploys), on every
+    member, and the connections in use. A member still at another count --
+    a start-only setting changed under Patroni and its restart never asked
+    for -- refuses the new pods' connections once they pass it."""
+    set_ = json.loads(out("get", "statefulset", f"{FULL}-database", "-o", "json"))
+    container = next(c for c in set_["spec"]["template"]["spec"]["containers"] if c["name"] == "postgres")
+    counted = None
+    for arg in container.get("args", []):
+        if arg.startswith("max_connections="):
+            counted = int(arg.split("=", 1)[1])
+    for env in container.get("env", []):
+        if env["name"] == "PATRONI_DYNAMIC":
+            counted = int(json.loads(env["value"])["postgresql"]["parameters"]["max_connections"])
+    members = [p["metadata"]["name"] for p in json.loads(out(
+        "get", "pods", "-l", f"app.kubernetes.io/instance={RELEASE},meridian.dev/component=database",
+        "-o", "json"))["items"] if not p["metadata"].get("deletionTimestamp")]
+    allowed = {member: psql("show max_connections", pod=member, quiet=True) for member in sorted(members)}
+    in_use = psql("select count(*) from pg_stat_activity where backend_type = 'client backend'", quiet=True)
+    print(f"R: {when}: the chart counted {counted} connections; the members allow "
+          f"{', '.join(f'{m} {n}' for m, n in allowed.items())}; {in_use} in use", flush=True)
+    s.check(counted is not None and all(n == str(counted) for n in allowed.values()),
+            f"{when}: every database member allows the {counted} connections the chart counted")
+    s.check(counted is not None and int(in_use or 0) < counted,
+            f"{when}: {in_use} connections in use, under the {counted} allowed")
+
+
 def reconfigure(s):
     global SHAPE
     print("R: the live install moved between the profiles, under the write driver's load", flush=True)
@@ -1821,21 +1957,35 @@ def reconfigure(s):
         SHAPE = target
         if target == "ha":
             # A database alone moves under Patroni first, alone, and is given
-            # its standbys by a second upgrade with the same values, as
-            # `meridian upgrade-deployment` runs it when the chart says so.
+            # its standbys by a second upgrade with the same values, as the
+            # chart says. Run once the first has rolled out, as `meridian
+            # upgrade-deployment` waits for every workload of the release
+            # before it returns: member 0's postgres answering on its own
+            # address is not the Service routing to it, which it does only
+            # once Patroni says the member is ready, and a second upgrade
+            # started before that met its preflight refused (CI runs
+            # 42453056096, 42462993343 and 42482853675's run 3: no ready
+            # endpoint for over a minute).
             said = upgraded.stdout.decode(errors="replace")
             moved = "upgrade again with" in said
             s.check(moved, "reconfigure: the chart says the database moves under Patroni first, alone")
             if moved:
-                wait_for("the database under Patroni, member 0 its leader", lambda: kubectl(
-                    "exec", f"{FULL}-database-0", "-c", "postgres", "--", "pg_isready", "-h", "127.0.0.1",
-                    "-U", "postgres", check=False).returncode == 0 and psql(
-                    "select not pg_is_in_recovery()", database="postgres", pod=f"{FULL}-database-0") == "t",
-                    seconds=600)
-                again = run("helm", "upgrade", RELEASE, CHART, "--namespace", NAMESPACE, "--reuse-values",
-                            *helm_takes_counts(), "--set", f"resilience.profile={target}", check=False)
+                wait_for("the first upgrade rolled out, as meridian upgrade-deployment waits for it",
+                         lambda: not rollout_unfinished(), seconds=600)
+                print(f"R: the first upgrade rolled out, {time.time() - began:.0f}s after it; the second upgrade",
+                      flush=True)
+                member_now("before the second upgrade")
+                with HookLog("preflight") as preflight:
+                    again = run("helm", "upgrade", RELEASE, CHART, "--namespace", NAMESPACE, "--reuse-values",
+                                *helm_takes_counts(), "--set", f"resilience.profile={target}", check=False)
+                print(f"R: the second upgrade's preflight said, {time.time() - began:.0f}s after the first "
+                      f"upgrade:\n{preflight.said or '(nothing read)'}", flush=True)
+                print("R: the database's Service and member 0 meanwhile:\n" + "\n".join(preflight.seen), flush=True)
+                member_now("after the second upgrade")
                 s.check(again.returncode == 0, "reconfigure: the second upgrade adds the database's standbys"
                         + ("" if again.returncode == 0 else f": {again.stderr.decode(errors='replace')[-400:]}"))
+                if again.returncode != 0:
+                    database_said(s, "the second upgrade")
         settled = happens(settled_everywhere, 900, every=5)
         took = time.time() - began
         s.check(settled, f"reconfigure: every member in the {target} shape and ready, {took:.0f}s after the upgrade")
@@ -1843,6 +1993,7 @@ def reconfigure(s):
             for component in STORES:
                 explain(s, f"reconfigure to {target}", component)
             return
+        connections_held(s, f"reconfigure to {target}")
         extra = {"from": "tolerant" if target == "ha" else "ha"}
         if DRIVEN:
             # RPO through the stores across the move: the database moved

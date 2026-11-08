@@ -876,6 +876,10 @@ E2E_K3D_NAMESPACE = $(if $(filter e2e-cluster-backup,$(E2E_CLUSTER_TARGET)),$(E2
 # zones. None by default: one node, as a desktop runs.
 E2E_K3D_AGENTS ?= 0
 E2E_K3D_ZONES ?=
+# How much of each container's log .e2e-cluster.log keeps when a run fails,
+# timestamped: enough of a database member's (Patroni says something every
+# two seconds) to reach back past a reconfigure's first upgrade.
+E2E_K3D_LOG_LINES ?= 400
 
 # `ready <what> <command...>`: the command, every two seconds until it
 # succeeds or E2E_K3D_READY_SECONDS have passed.
@@ -938,9 +942,9 @@ e2e-cluster-k3d:
 	        for c in $$(KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl -n $(E2E_K3D_NAMESPACE) get $$pod \
 	            -o jsonpath='{.spec.initContainers[*].name} {.spec.containers[*].name}'); do \
 	          echo "== $$pod, $$c"; \
-	          KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl -n $(E2E_K3D_NAMESPACE) logs $$pod -c $$c --tail=80; \
+	          KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl -n $(E2E_K3D_NAMESPACE) logs $$pod -c $$c --timestamps --tail=$(E2E_K3D_LOG_LINES); \
 	          echo "== $$pod, $$c before, if it restarted"; \
-	          KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl -n $(E2E_K3D_NAMESPACE) logs $$pod -c $$c --previous --tail=80; \
+	          KUBECONFIG=$(E2E_K3D_KUBECONFIG) kubectl -n $(E2E_K3D_NAMESPACE) logs $$pod -c $$c --previous --timestamps --tail=$(E2E_K3D_LOG_LINES); \
 	        done; \
 	      done; } > .e2e-cluster.log 2>&1; \
 	  fi; \
@@ -2743,6 +2747,31 @@ chart-check:
 		$(HELM_TEMPLATE) check deploy/chart $$base --set "$$refused" >/dev/null 2>&1 \
 			&& { echo "chart-check FAILED: $$refused rendered; a count CI does not test is refused (ruling 1047)" >&2; exit 1; }; \
 	done; true
+	@# The brought database's max_connections, counted from what the chart
+	@# deploys (ruled 2026-11-08): each store member's pool and what is
+	@# beside it, a rollout's surge, the dashboard's copies, the jobs, the
+	@# superuser's and Patroni's reserve, and a quarter's room -- 82
+	@# tolerant, 213 ha -- given to the server alone and under Patroni and
+	@# to the preflight's memory judge; one set below what the pods hold is
+	@# refused, saying how many they hold.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check"; \
+	ha="--set resilience.profile=ha --set key.generate=false --set key.existingSecret=k"; \
+	plain="$$($(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null)"; \
+	echo "$$plain" | grep -q -- "- max_connections=82$$" \
+		|| { echo "chart-check FAILED: the tolerant database is not given max_connections=82, the count of what the chart deploys" >&2; exit 1; }; \
+	echo "$$plain" | grep -A1 "name: MERIDIAN_PREFLIGHT_DATABASE_MAX_CONNECTIONS" | grep -q 'value: "82"' \
+		|| { echo "chart-check FAILED: the preflight does not judge the tolerant database's memory by its 82 connections" >&2; exit 1; }; \
+	patroni="$$($(HELM_TEMPLATE) check deploy/chart $$base $$ha 2>/dev/null)"; \
+	echo "$$patroni" | grep -q "^ *max_connections: 213$$" \
+		|| { echo "chart-check FAILED: the ha database is not given max_connections: 213 under Patroni" >&2; exit 1; }; \
+	echo "$$patroni" | grep -q 'max_connections\\":213' \
+		|| { echo "chart-check FAILED: the ha database's members do not hold Patroni's max_connections to 213" >&2; exit 1; }; \
+	said="$$($(HELM_TEMPLATE) check deploy/chart $$base $$ha --set database.brought.maxConnections=100 2>&1 >/dev/null)" \
+		&& { echo "chart-check FAILED: database.brought.maxConnections=100 rendered under ha, below what its pods hold" >&2; exit 1; }; \
+	echo "$$said" | grep -q "hold up to 166 connections" \
+		|| { echo "chart-check FAILED: a max_connections below what the pods hold was refused without saying how many: $$said" >&2; exit 1; }; \
+	$(HELM_TEMPLATE) check deploy/chart $$base --set database.brought.maxConnections=300 2>/dev/null | grep -q -- "- max_connections=300$$" \
+		|| { echo "chart-check FAILED: database.brought.maxConnections=300 is not what the database is given" >&2; exit 1; }
 	@# Step 3b part 3: the WAL archive (backup.walArchive). Off by default,
 	@# so a desktop renders none of it but the offline CronJob, which runs
 	@# nothing until the CLI makes a Job from it. On: the database archives

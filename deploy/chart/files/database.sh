@@ -37,6 +37,26 @@ trap 'kill -TERM "$pid" 2>/dev/null; wait "$pid"; exit $?' TERM INT
           -H 'Content-Type: application/json' --data "${PATRONI_DYNAMIC}" \
           http://127.0.0.1:8008/config 2>/dev/null; then
         echo "database.sh: Patroni's dynamic settings held to the chart's"
+        # A setting Postgres reads only as it starts -- max_connections,
+        # counted from what the chart deploys -- changed by the PATCH
+        # leaves this member's server running on the old one, pending a
+        # restart nothing else asks for: a primary still at the old count
+        # refuses the new pods' connections. Restarted once, in place, on
+        # this member alone; members started after the PATCH start on the
+        # new one, and a standby takes the primary's where it is higher.
+        for _ in $(seq 1 10); do
+          sleep 2
+          if curl -fsS http://127.0.0.1:8008/patroni 2>/dev/null | grep -q '"pending_restart": *true'; then
+            if curl -fsS -o /dev/null -u "patroni:${PATRONI_RESTAPI_PASSWORD}" -X POST \
+                -H 'Content-Type: application/json' --data '{"restart_pending": true}' \
+                http://127.0.0.1:8008/restart 2>/dev/null; then
+              echo "database.sh: restarted for a setting read only at start"
+            else
+              echo "database.sh: a setting read only at start is pending and the restart was refused" >&2
+            fi
+            break
+          fi
+        done
         exit 0
       fi
     fi

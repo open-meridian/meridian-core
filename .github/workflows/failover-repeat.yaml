@@ -181,6 +181,24 @@ jobs:
             echo "::endgroup::"
           done
 
+      # What the cluster said, whole, as ci's cluster jobs keep it: every pod
+      # of the run's namespace, each container's log and its previous one,
+      # a failed hook's Job (the preflight) and a migration's included
+      # (e2e-cluster-k3d writes .e2e-cluster.log when the run fails). The
+      # step above prints only its tail, which on run 42482853675 was the
+      # registry's probes and none of the preflight's report.
+      - name: Keep what the cluster said
+        if: failure()
+        timeout-minutes: 5
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: failover-repeat-logs-${{ inputs.profile }}-${{ matrix.run }}
+          path: workspace/meridian-core/.e2e-*.log
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 14
+
   # Green only when every run was.
   failover-verdict:
     name: failover-repeat (every run green)
