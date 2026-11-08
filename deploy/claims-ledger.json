@@ -91,7 +91,8 @@
         "acknowledged_commits_min": 122,
         "commits_lost_max": 0,
         "lake_rows_lost_max": 0,
-        "lake_rpo_s_max": 0
+        "lake_rpo_s_max": 0,
+        "lake_seconds_bound": 5
       },
       "runs": [
         "42346277866",
@@ -104,7 +105,8 @@
         "42514396835",
         "42516067588"
       ],
-      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=db-primary"
+      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=db-primary",
+      "ruled": "Ruled 2026-11-08: in ha the lake loses at most ~5 s of rows when the database's primary fails over (lake_seconds_bound). Its recovery path -- the lake telling each data plugin the last row it holds per dataset, the SDK's ~30 s replay buffer, and datasets that cannot be fetched again committed synchronously -- lands in step 3c."
     },
     {
       "class": "db-primary",
@@ -121,7 +123,8 @@
         "acknowledged_commits_min": 122,
         "commits_lost_max": 0,
         "lake_rows_lost_max": 0,
-        "lake_rpo_s_max": 0
+        "lake_rpo_s_max": 0,
+        "lake_seconds_bound": 5
       },
       "runs": [
         "42346277866",
@@ -134,7 +137,8 @@
         "42514396835",
         "42516067588"
       ],
-      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=db-primary"
+      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=db-primary",
+      "ruled": "Ruled 2026-11-08: in ha the lake loses at most ~5 s of rows when the database's primary fails over (lake_seconds_bound). Its recovery path -- the lake telling each data plugin the last row it holds per dataset, the SDK's ~30 s replay buffer, and datasets that cannot be fetched again committed synchronously -- lands in step 3c."
     },
     {
       "class": "instrument-writer",
@@ -285,7 +289,8 @@
         "42514396835",
         "42516067588"
       ],
-      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=order-plugin"
+      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=order-plugin",
+      "ruled": "Ruled 2026-11-08: an order plugin lost is detected within 10 s and recovered within 30 s in ha and 120 s in tolerant."
     },
     {
       "class": "replica-rot",
@@ -396,7 +401,8 @@
         "acknowledged_commits_min": 103,
         "commits_lost_max": 0,
         "lake_rows_lost_max": 0,
-        "lake_rpo_s_max": 0
+        "lake_rpo_s_max": 0,
+        "lake_seconds_bound": 5
       },
       "runs": [
         "42346277866",
@@ -409,7 +415,8 @@
         "42514396835",
         "42516067588"
       ],
-      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=torn-write"
+      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=torn-write",
+      "ruled": "Ruled 2026-11-08: in ha the lake loses at most ~5 s of rows when the database's primary fails over (lake_seconds_bound). Its recovery path -- the lake telling each data plugin the last row it holds per dataset, the SDK's ~30 s replay buffer, and datasets that cannot be fetched again committed synchronously -- lands in step 3c."
     },
     {
       "class": "torn-write",
@@ -426,7 +433,8 @@
         "acknowledged_commits_min": 103,
         "commits_lost_max": 0,
         "lake_rows_lost_max": 0,
-        "lake_rpo_s_max": 0
+        "lake_rpo_s_max": 0,
+        "lake_seconds_bound": 5
       },
       "runs": [
         "42346277866",
@@ -439,7 +447,8 @@
         "42514396835",
         "42516067588"
       ],
-      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=torn-write"
+      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=torn-write",
+      "ruled": "Ruled 2026-11-08: in ha the lake loses at most ~5 s of rows when the database's primary fails over (lake_seconds_bound). Its recovery path -- the lake telling each data plugin the last row it holds per dataset, the SDK's ~30 s replay buffer, and datasets that cannot be fetched again committed synchronously -- lands in step 3c."
     },
     {
       "class": "volume-lost",
@@ -481,7 +490,8 @@
         "acknowledged_commits_min": 113,
         "commits_lost_max": 0,
         "lake_rows_lost_max": 0,
-        "lake_rpo_s_max": 0
+        "lake_rpo_s_max": 0,
+        "lake_seconds_bound": 5
       },
       "runs": [
         "42488878203",
@@ -491,7 +501,8 @@
         "42514396835",
         "42516067588"
       ],
-      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=zone"
+      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=zone",
+      "ruled": "Ruled 2026-11-08: in ha the lake loses at most ~5 s of rows when the database's primary fails over (lake_seconds_bound). Its recovery path -- the lake telling each data plugin the last row it holds per dataset, the SDK's ~30 s replay buffer, and datasets that cannot be fetched again committed synchronously -- lands in step 3c."
     },
     {
       "class": "zone",
@@ -508,7 +519,8 @@
         "acknowledged_commits_min": 113,
         "commits_lost_max": 0,
         "lake_rows_lost_max": 0,
-        "lake_rpo_s_max": 0
+        "lake_rpo_s_max": 0,
+        "lake_seconds_bound": 5
       },
       "runs": [
         "42488878203",
@@ -518,7 +530,8 @@
         "42514396835",
         "42516067588"
       ],
-      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=zone"
+      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=zone",
+      "ruled": "Ruled 2026-11-08: in ha the lake loses at most ~5 s of rows when the database's primary fails over (lake_seconds_bound). Its recovery path -- the lake telling each data plugin the last row it holds per dataset, the SDK's ~30 s replay buffer, and datasets that cannot be fetched again committed synchronously -- lands in step 3c."
     },
     {
       "class": "zone",
@@ -535,7 +548,8 @@
         "acknowledged_commits_min": 113,
         "commits_lost_max": 0,
         "lake_rows_lost_max": 0,
-        "lake_rpo_s_max": 0
+        "lake_rpo_s_max": 0,
+        "lake_seconds_bound": 5
       },
       "runs": [
         "42488878203",
@@ -545,7 +559,8 @@
         "42514396835",
         "42516067588"
       ],
-      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=zone"
+      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=zone",
+      "ruled": "Ruled 2026-11-08: in ha the lake loses at most ~5 s of rows when the database's primary fails over (lake_seconds_bound). Its recovery path -- the lake telling each data plugin the last row it holds per dataset, the SDK's ~30 s replay buffer, and datasets that cannot be fetched again committed synchronously -- lands in step 3c."
     },
     {
       "class": "zone",
@@ -562,7 +577,8 @@
         "acknowledged_commits_min": 113,
         "commits_lost_max": 0,
         "lake_rows_lost_max": 0,
-        "lake_rpo_s_max": 0
+        "lake_rpo_s_max": 0,
+        "lake_seconds_bound": 5
       },
       "runs": [
         "42488878203",
@@ -572,7 +588,8 @@
         "42514396835",
         "42516067588"
       ],
-      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=zone"
+      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=zone",
+      "ruled": "Ruled 2026-11-08: in ha the lake loses at most ~5 s of rows when the database's primary fails over (lake_seconds_bound). Its recovery path -- the lake telling each data plugin the last row it holds per dataset, the SDK's ~30 s replay buffer, and datasets that cannot be fetched again committed synchronously -- lands in step 3c."
     },
     {
       "class": "zone",
@@ -589,7 +606,8 @@
         "acknowledged_commits_min": 113,
         "commits_lost_max": 0,
         "lake_rows_lost_max": 0,
-        "lake_rpo_s_max": 0
+        "lake_rpo_s_max": 0,
+        "lake_seconds_bound": 5
       },
       "runs": [
         "42488878203",
@@ -599,7 +617,8 @@
         "42514396835",
         "42516067588"
       ],
-      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=zone"
+      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=zone",
+      "ruled": "Ruled 2026-11-08: in ha the lake loses at most ~5 s of rows when the database's primary fails over (lake_seconds_bound). Its recovery path -- the lake telling each data plugin the last row it holds per dataset, the SDK's ~30 s replay buffer, and datasets that cannot be fetched again committed synchronously -- lands in step 3c."
     },
     {
       "class": "zone",
@@ -616,7 +635,8 @@
         "acknowledged_commits_min": 113,
         "commits_lost_max": 0,
         "lake_rows_lost_max": 0,
-        "lake_rpo_s_max": 0
+        "lake_rpo_s_max": 0,
+        "lake_seconds_bound": 5
       },
       "runs": [
         "42488878203",
@@ -626,7 +646,8 @@
         "42514396835",
         "42516067588"
       ],
-      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=zone"
+      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=ha FAILURE=zone",
+      "ruled": "Ruled 2026-11-08: in ha the lake loses at most ~5 s of rows when the database's primary fails over (lake_seconds_bound). Its recovery path -- the lake telling each data plugin the last row it holds per dataset, the SDK's ~30 s replay buffer, and datasets that cannot be fetched again committed synchronously -- lands in step 3c."
     },
     {
       "class": "reconfigure-ha",
@@ -914,7 +935,8 @@
         "42514396835",
         "42516067588"
       ],
-      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=tolerant FAILURE=order-plugin"
+      "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover PROFILE=tolerant FAILURE=order-plugin",
+      "ruled": "Ruled 2026-11-08: an order plugin lost is detected within 10 s and recovered within 30 s in ha and 120 s in tolerant."
     },
     {
       "class": "restore-to-time",

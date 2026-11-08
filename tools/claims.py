@@ -63,11 +63,33 @@ def read_claims(paths: list[str]) -> list[dict]:
     return lines
 
 
+# The lake's rows lost when the database's primary fails over, at most, in
+# seconds of rows, by profile (ruled 2026-11-08): ~5 s in ha. Its local
+# commits are what allow it; the recovery path that closes it is step 3c's.
+LAKE_RPO_BOUND_S = {"ha": 5}
+
+# What was ruled for a class, written beside its entry: the bound's source,
+# and what the bound leaves to later work.
+RULED = {
+    "order-plugin": (
+        "Ruled 2026-11-08: an order plugin lost is detected within 10 s and "
+        "recovered within 30 s in ha and 120 s in tolerant."
+    ),
+}
+LAKE_RULED = (
+    "Ruled 2026-11-08: in ha the lake loses at most ~5 s of rows when the "
+    "database's primary fails over (lake_seconds_bound). Its recovery path "
+    "-- the lake telling each data plugin the last row it holds per dataset, "
+    "the SDK's ~30 s replay buffer, and datasets that cannot be fetched again "
+    "committed synchronously -- lands in step 3c."
+)
+
+
 def key_of(said: dict) -> tuple[str, str, str]:
     return (said["profile"], said["failure"], said["component"])
 
 
-def rpo_of(said: list[dict]) -> dict:
+def rpo_of(said: list[dict], profile: str = "") -> dict:
     """What the measurements say of the data lost: the commits acknowledged
     under load and the most lost, where the class wrote under load; the
     archive's bound, where it is one."""
@@ -79,12 +101,14 @@ def rpo_of(said: list[dict]) -> dict:
     if lost:
         rpo["commits_lost_max"] = max(lost)
     # Through the stores (step 3b part 5): the lake's rows lost, which its
-    # local commits allow and which are measured and said, not yet bounded;
-    # anything kept twice, which nothing allows.
+    # local commits allow, measured and said, and in ha held to ~5 s of rows
+    # (ruled 2026-11-08); anything kept twice, which nothing allows.
     lake = [c["lake_rows_lost"] for c in said if "lake_rows_lost" in c]
     if lake:
         rpo["lake_rows_lost_max"] = max(lake)
         rpo["lake_rpo_s_max"] = max(c.get("lake_rpo_s", 0) for c in said if "lake_rows_lost" in c)
+        if profile in LAKE_RPO_BOUND_S:
+            rpo["lake_seconds_bound"] = LAKE_RPO_BOUND_S[profile]
     twice = [c["duplicated"] for c in said if "duplicated" in c]
     if twice:
         rpo["duplicated_max"] = max(twice)
@@ -119,13 +143,18 @@ def ledger(claims: list[dict]) -> dict:
                 "median": round(statistics.median(times), 2),
                 "max": round(times[-1], 2),
             },
-            "rpo": rpo_of(said),
+            "rpo": rpo_of(said, profile),
             **({"detected_s": {"max": round(max(detected), 2),
                                "bound": next(c.get("detect_bound_s") for c in said if "detected_s" in c)}}
                if detected else {}),
             "runs": sorted({str(c.get("run", "local")) for c in said}),
             "command": said[-1].get("command", ""),
         }
+        ruled = [RULED[failure]] if failure in RULED else []
+        if "lake_seconds_bound" in entry["rpo"]:
+            ruled.append(LAKE_RULED)
+        if ruled:
+            entry["ruled"] = " ".join(ruled)
         entries.append(entry)
     return {"about": ABOUT, "entries": entries}
 
@@ -151,6 +180,9 @@ def check_ledger(book: dict) -> list[str]:
         rpo = entry.get("rpo", {})
         if "seconds_bound" in rpo and rpo.get("seconds_max", 0) > rpo["seconds_bound"]:
             missed.append(f"{name}: an RPO of {rpo['seconds_max']}s past its bound {rpo['seconds_bound']}s")
+        if "lake_seconds_bound" in rpo and rpo.get("lake_rpo_s_max", 0) > rpo["lake_seconds_bound"]:
+            missed.append(f"{name}: the lake lost {rpo['lake_rpo_s_max']}s of rows, past its bound "
+                          f"{rpo['lake_seconds_bound']}s")
     return missed
 
 
@@ -170,6 +202,9 @@ def check_run(book: dict, claims: list[dict], every: bool = False) -> list[str]:
             missed.append(f"{name}: {said['duplicated']} kept twice")
         if said.get("detect_bound_s") is not None and float(said.get("detected_s", 0)) > said["detect_bound_s"]:
             missed.append(f"{name}: detected in {said['detected_s']}s, past its bound {said['detect_bound_s']}s")
+        lake_bound = LAKE_RPO_BOUND_S.get(said["profile"])
+        if "lake_rows_lost" in said and lake_bound is not None and float(said.get("lake_rpo_s", 0)) > lake_bound:
+            missed.append(f"{name}: the lake lost {said['lake_rpo_s']}s of rows, past its bound {lake_bound}s")
     for entry in book.get("entries", []):
         key = (entry["profile"], entry["class"], entry["component"])
         target = entry.get("command", "").split("E2E_CLUSTER_TARGET=")[-1].split()[0] if entry.get("command") else ""
@@ -247,6 +282,14 @@ def self_test() -> int:
     assert check_ledger(made) == []
     assert any("twice" in m for m in check_run(made, [dict(plug, recovered_s=5.0, detected_s=1.0, duplicated=1)]))
     assert any("detected" in m for m in check_run(made, [dict(plug, recovered_s=5.0, detected_s=11.0)]))
+    # What was ruled written beside the entry; the lake's ~5 s in ha held.
+    assert "10 s" in entry["ruled"] and "120 s" in entry["ruled"], entry
+    lake_entry = next(e for e in made["entries"] if e["class"] == "db-primary")
+    assert lake_entry["rpo"]["lake_seconds_bound"] == 5 and "3c" in lake_entry["ruled"], lake_entry
+    assert any("lake lost" in m for m in check_run(made, [dict(db, recovered_s=22.0, lake_rows_lost=40,
+                                                                lake_rpo_s=6.2)]))
+    past = ledger([dict(db, recovered_s=22.0, run="1", lake_rows_lost=40, lake_rpo_s=6.2)])
+    assert any("lake lost" in m for m in check_ledger(past)), past
     print("claims: self-test OK")
     return 0
 
