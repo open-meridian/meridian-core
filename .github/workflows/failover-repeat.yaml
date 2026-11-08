@@ -15,12 +15,12 @@ on:
   workflow_dispatch:
     inputs:
       profile:
-        description: The profile installed (tolerant, or ha on three agents in three zones)
+        description: The profile installed (tolerant; ha on three agents in three zones; or reconfigure, a live install moved tolerant -> ha -> tolerant, as e2e-cluster-reconfigure runs)
         type: choice
-        options: [ha, tolerant]
+        options: [ha, tolerant, reconfigure]
         default: ha
       failure:
-        description: The failure classes injected, comma-separated (FAILURE=); empty for the profile's all
+        description: The failure classes injected, comma-separated (FAILURE=); empty for the profile's all (reconfigure takes none)
         type: string
         default: ""
       repeat:
@@ -107,7 +107,7 @@ jobs:
     name: failover-repeat (${{ inputs.profile }}, run ${{ matrix.run }})
     needs: [failover-images]
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ inputs.profile == 'ha' && 70 || 45 }}
+    timeout-minutes: ${{ inputs.profile == 'tolerant' && 45 || 70 }}
     strategy:
       fail-fast: false
       matrix:
@@ -146,7 +146,8 @@ jobs:
           FAILURE: ${{ inputs.failure }}
         run: |
           agents=0 zones=""
-          if [ "$PROFILE" = ha ]; then agents=3 zones="zone-a zone-b zone-c"; fi
+          if [ "$PROFILE" != tolerant ]; then agents=3 zones="zone-a zone-b zone-c"; fi
+          if [ "$PROFILE" = reconfigure ]; then FAILURE=""; fi
           make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover IMAGES=pulled \
             PROFILE="$PROFILE" FAILURE="$FAILURE" E2E_K3D_AGENTS="$agents" E2E_K3D_ZONES="$zones"
 
