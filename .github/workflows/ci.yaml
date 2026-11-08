@@ -44,6 +44,45 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # The run's tier (the PO's ruling of 2026-11-08): a pull request runs the
+  # fast tier and the jobs the paths it touches select; the merge queue,
+  # and a run by hand, run everything, every job that ran before the tiers
+  # (tools/ci_tier.py, whose `check` the checks stage runs, and whose
+  # `table` lists every job by event). What each tiered job runs comes from
+  # here; a run whose plan cannot be read fails its tiered jobs rather than
+  # skipping them, and the aggregate ci-local fails a run that is not a pull
+  # request's where any job did not succeed.
+  tier:
+    name: ci-tier
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      full: ${{ steps.plan.outputs.full }}
+      stage_names: ${{ steps.plan.outputs.stage_names }}
+      harness: ${{ steps.plan.outputs.harness }}
+      harness_any: ${{ steps.plan.outputs.harness_any }}
+      harness_left: ${{ steps.plan.outputs.harness_left }}
+      harness_left_any: ${{ steps.plan.outputs.harness_left_any }}
+      clusters: ${{ steps.plan.outputs.clusters }}
+      clusters_left: ${{ steps.plan.outputs.clusters_left }}
+      clusters_left_any: ${{ steps.plan.outputs.clusters_left_any }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          path: workspace/meridian-core
+
+      - name: The plan
+        id: plan
+        working-directory: workspace/meridian-core
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 tools/ci_tier.py plan --event "$EVENT" ${BASE:+--base "$BASE" --head "$HEAD"} | tee -a "$GITHUB_OUTPUT"
+          { echo "## This run's tier ($EVENT)"; echo; python3 tools/ci_tier.py table; } >> "$GITHUB_STEP_SUMMARY"
+
   # The two stages that need no image: beside the builds, not after them.
   static:
     name: ci-local (${{ matrix.stage }})
@@ -433,7 +472,7 @@ jobs:
   # or a few short ones run in order on one runner.
   stages:
     name: ci-local (${{ matrix.stage }})
-    needs: [images, compile]
+    needs: [tier, images, compile]
     # checks: the test report below, a check of its own per leg (ruling 1104).
     permissions:
       contents: read
@@ -461,7 +500,18 @@ jobs:
             artifacts: images
             images: runtime interop version-check
     steps:
+      # Run or left to the merge queue by the plan (the tier job): a leg
+      # the pull request's tier leaves says so and runs nothing.
+      - name: In this run's tier
+        id: tier
+        env:
+          RUN: ${{ needs.tier.outputs.full == 'true' || contains(fromJSON(needs.tier.outputs.stage_names), matrix.stage) }}
+        run: |
+          echo "run=$RUN" >> "$GITHUB_OUTPUT"
+          [ "$RUN" = true ] || echo "::notice::ci-local (${{ matrix.stage }}) is not in this pull request's tier: the merge queue runs it"
+
       - name: The images were built
+        if: steps.tier.outputs.run == 'true'
         env:
           IMAGES: ${{ needs.images.result }}
           COMPILE: ${{ needs.compile.result }}
@@ -470,20 +520,24 @@ jobs:
             || { echo "::error::the images stage was $IMAGES and the compile stage $COMPILE: this stage runs what they build, so it cannot run"; exit 1; }
 
       - uses: actions/checkout@v4
+        if: steps.tier.outputs.run == 'true'
         with:
           path: workspace/meridian-core
 
       - uses: actions/checkout@v4
+        if: steps.tier.outputs.run == 'true'
         with:
           repository: ${{ github.repository_owner }}/meridian-python
           ref: ${{ needs.images.outputs.sdk }}
           path: workspace/meridian-python
 
       - name: Free the runner's disk
+        if: steps.tier.outputs.run == 'true'
         working-directory: workspace/meridian-core
         run: tools/free-runner-disk.sh
 
       - uses: ./workspace/meridian-core/.github/actions/gate-images
+        if: steps.tier.outputs.run == 'true'
         with:
           artifacts: ${{ matrix.artifacts }}
           names: ${{ matrix.images }}
@@ -492,10 +546,12 @@ jobs:
       # cache where a run kept them (tools/ci-tools.txt): a release-download
       # outage is no verdict on a change.
       - uses: ./workspace/meridian-core/.github/actions/ci-tools
+        if: steps.tier.outputs.run == 'true'
         with:
           tools: sccache nextest
 
       - name: make ci-stage
+        if: steps.tier.outputs.run == 'true'
         working-directory: workspace/meridian-core
         env:
           DOCKER_BUILDKIT: "1"
@@ -507,7 +563,7 @@ jobs:
       # profile) named on the run and in its summary (tools/ci-flaky.py):
       # flaky on this commit, never hidden by the retry (ruling 1104).
       - name: Flaky tests, named
-        if: ${{ !cancelled() }}
+        if: steps.tier.outputs.run == 'true' && (!cancelled())
         working-directory: workspace/meridian-core
         run: python3 tools/ci-flaky.py .junit
 
@@ -515,7 +571,7 @@ jobs:
       # from the JUnit nextest wrote (tools/run-tests.sh). Pinned by commit
       # (v2.6.0).
       - name: Test report
-        if: ${{ !cancelled() && hashFiles('workspace/meridian-core/.junit/*.xml') != '' }}
+        if: steps.tier.outputs.run == 'true' && (!cancelled() && hashFiles('workspace/meridian-core/.junit/*.xml') != '')
         uses: dorny/test-reporter@3d76b34a4535afbd0600d347b09a6ee5deb3ed7f
         with:
           name: tests (${{ matrix.stage }})
@@ -532,7 +588,7 @@ jobs:
       # 2026-09-23 had to be diagnosed from the assertion output alone because
       # the one file explaining it was discarded with the machine.
       - name: Keep what the e2e services said
-        if: failure()
+        if: steps.tier.outputs.run == 'true' && (failure())
         timeout-minutes: 5
         continue-on-error: true
         uses: actions/upload-artifact@v4
@@ -550,18 +606,32 @@ jobs:
   # check named ci-local means what it meant before ci-local was split.
   ci-local:
     name: ci-local
-    needs: [static, images, compile, stages]
+    needs: [tier, static, images, compile, stages, e2e-harness, e2e-cluster-k3d, e2e-cluster-arm64]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Every stage passed
+      # The stages, every run. And -- because a skipped job passes a
+      # required check -- on a run that is not a pull request's, every job
+      # of the tiers too, each succeeded, none skipped, the plan everything:
+      # the merge queue can never pass by a job not running.
+      - name: Every stage passed, and on the queue every job of the merge queue's run succeeded
         env:
           NEEDS: ${{ toJSON(needs) }}
+          EVENT: ${{ github.event_name }}
+          FULL: ${{ needs.tier.outputs.full }}
         run: |
           echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
-          echo "$NEEDS" | jq -e 'all(.[]; .result == "success")' >/dev/null \
+          echo "$NEEDS" | jq -e '[.tier, .static, .images, .compile, .stages] | all(.result == "success")' >/dev/null \
             || { echo "::error::a stage of ci-local did not pass"; exit 1; }
+          if [ "$EVENT" = pull_request ]; then
+            echo "$NEEDS" | jq -e '[.["e2e-harness"], .["e2e-cluster-k3d"], .["e2e-cluster-arm64"]] | all(.result == "success" or .result == "skipped")' >/dev/null \
+              || { echo "::error::a job in this pull request's tier did not pass"; exit 1; }
+          else
+            [ "$FULL" = true ] || { echo "::error::the plan for $EVENT is not every job"; exit 1; }
+            echo "$NEEDS" | jq -e 'all(.[]; .result == "success")' >/dev/null \
+              || { echo "::error::not every job of the merge queue's run succeeded: none may pass the queue skipped"; exit 1; }
+          fi
 
   # The plugin harness's suites (ruling 556): `make e2e-harness`, a few suites
   # per job, beside the stages rather than in one, so the longest of them is
@@ -571,20 +641,16 @@ jobs:
   # alone is six minutes). A suite added to HARNESS_SUITES is added to a group
   # here, or no job runs it.
   e2e-harness:
-    needs: [images]
-    if: ${{ !cancelled() }}
+    needs: [tier, images]
+    # Its groups the plan's (tools/ci_tier.py HARNESS_GROUPS): every one on
+    # the queue; on a pull request, those its paths select. Run unless the
+    # plan says none, so a plan that could not be read fails it.
+    if: ${{ !cancelled() && needs.tier.outputs.harness_any != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - group: lake
-            suites: e2e-lake e2e-prepared e2e-activity
-          - group: orders
-            suites: e2e-orders e2e-access-per-role e2e-plugin-area harness-check
-          - group: tickets
-            suites: e2e-tickets e2e-one-id e2e-service-account e2e-archive
+      matrix: ${{ fromJSON(needs.tier.outputs.harness) }}
     name: e2e-harness (${{ matrix.group }})
     steps:
       - name: The images were built
@@ -633,6 +699,21 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  # A required check the pull request's tier leaves to the merge queue,
+  # under its own name, so the pull request can be queued: it runs nothing
+  # and says so. Never on the queue, whose plan leaves nothing.
+  e2e-harness-left:
+    needs: tier
+    if: ${{ needs.tier.outputs.harness_left_any == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      matrix: ${{ fromJSON(needs.tier.outputs.harness_left) }}
+    name: e2e-harness (${{ matrix.group }})
+    steps:
+      - name: Left to the merge queue
+        run: echo "::notice::e2e-harness (${{ matrix.group }}) is not in this pull request's tier; the merge queue runs it"
+
   # The four runs that install the chart on a real cluster and sign a person
   # in: spec/installation-and-first-run, paths 1 and 2 and path 1's other two
   # ways in. And a fifth that upgrades one in place from the chart published
@@ -664,42 +745,25 @@ jobs:
   # `e2e-cluster-k3d (<target>)` for the six; a smoke job's names its k3s.
   e2e-cluster-k3d:
     name: e2e-cluster-k3d (${{ matrix.target }}${{ matrix.profile && format(', {0}', matrix.profile) || '' }}${{ matrix.k3s && format(', k3s {0}', matrix.k3s) || '' }})
-    needs: [images]
+    needs: [tier, images]
     # Run even when the images failed, to fail by name rather than be
-    # skipped: GitHub counts a skipped required check as passed.
+    # skipped: GitHub counts a skipped required check as passed. A plan
+    # that could not be read fails it too.
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: ${{ matrix.timeout || 45 }}
     strategy:
       fail-fast: false
-      matrix:
-        target: [e2e-cluster, e2e-cluster-external, e2e-cluster-ldap, e2e-cluster-oidc, e2e-cluster-upgrade, e2e-cluster-backup]
-        # Empty: the Makefile's pin.
-        k3s: [""]
-        include:
-          - target: e2e-cluster
-            k3s: v1.33.13-k3s2
-          - target: e2e-cluster
-            k3s: v1.34.12-k3s1
-          - target: e2e-cluster
-            k3s: v1.35.9-k3s1
-          - target: e2e-cluster
-            k3s: v1.37.1-k3s1
-          # Step 3b (spec/a-deployment-scales-out-and-fails-over-by-
-          # configuration section 15): the HA configuration's shape on three
-          # agents in three zones, and the failure classes injected in both
-          # profiles, each recovery timed against its bound (1048, 1056).
-          - target: e2e-cluster-scaled
-            agents: 3
-          # A live install moved tolerant -> ha -> tolerant under commits.
-          - target: e2e-cluster-reconfigure
-            agents: 3
-          - target: e2e-cluster-failover
-            profile: tolerant
-          - target: e2e-cluster-failover
-            profile: ha
-            agents: 3
-            timeout: 70
+      # The plan's runs (tools/ci_tier.py CLUSTERS): every one on the queue;
+      # on a pull request the base install and those its paths select. The
+      # runs, as they were here: the six targets on the Makefile's k3s pin;
+      # the base install on the newest patch of each other minor in the
+      # window (ruling 935); and step 3b's (spec/a-deployment-scales-out-
+      # and-fails-over-by-configuration section 15): the HA configuration's
+      # shape, a live install moved tolerant -> ha -> tolerant, and the
+      # failure classes in both profiles, three agents in three zones where
+      # the run is HA.
+      matrix: ${{ fromJSON(needs.tier.outputs.clusters) }}
     steps:
       - name: The images were built
         env:
@@ -887,6 +951,21 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  # The cluster runs the pull request's tier leaves to the merge queue, each
+  # under its own name, as e2e-harness-left: running nothing, saying so,
+  # never on the queue.
+  e2e-cluster-left:
+    needs: tier
+    if: ${{ needs.tier.outputs.clusters_left_any == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      matrix: ${{ fromJSON(needs.tier.outputs.clusters_left) }}
+    name: e2e-cluster-k3d (${{ matrix.target }}${{ matrix.profile && format(', {0}', matrix.profile) || '' }}${{ matrix.k3s && format(', k3s {0}', matrix.k3s) || '' }})
+    steps:
+      - name: Left to the merge queue
+        run: echo "::notice::this cluster run is not in this pull request's tier; the merge queue runs it"
+
   # arm64, tested and not only built (ruling 1071): the release candidate's
   # arm64 images, built natively on GitHub's arm64 runner as the amd64 ones
   # are by the images job, stamped with the same release and pushed by digest
@@ -895,6 +974,11 @@ jobs:
   # promotes the arm64 image beside the amd64 one, so it is tested first.
   e2e-cluster-arm64:
     name: e2e-cluster-k3d (e2e-cluster, arm64)
+    needs: tier
+    # The merge queue's, which builds the release candidate's arm64 images;
+    # skipped only where the plan says a pull request's tier, so a plan that
+    # could not be read runs it.
+    if: ${{ !cancelled() && needs.tier.outputs.full != 'false' }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     permissions:
@@ -1154,8 +1238,11 @@ jobs:
   # kept nothing fails this by name. The ledger against this run is the
   # job's summary.
   claims-check:
-    needs: e2e-cluster-k3d
-    if: ${{ !cancelled() }}
+    needs: [tier, e2e-cluster-k3d]
+    # Every class the ledger holds, measured again: the full set's, so the
+    # queue's (and a pull request's whose plan is everything); a failover
+    # run on a pull request holds its own claims to their bounds itself.
+    if: ${{ !cancelled() && needs.tier.outputs.full != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
