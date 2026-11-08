@@ -1476,7 +1476,8 @@ def reconfigure(s):
                     seconds=600)
                 again = run("helm", "upgrade", RELEASE, CHART, "--namespace", NAMESPACE, "--reuse-values",
                             *helm_takes_counts(), "--set", f"resilience.profile={target}", check=False)
-                s.check(again.returncode == 0, "reconfigure: the second upgrade adds the database's standbys")
+                s.check(again.returncode == 0, "reconfigure: the second upgrade adds the database's standbys"
+                        + ("" if again.returncode == 0 else f": {again.stderr.decode(errors='replace')[-400:]}"))
         settled = happens(settled_everywhere, 900, every=5)
         took = time.time() - began
         s.check(settled, f"reconfigure: every member in the {target} shape and ready, {took:.0f}s after the upgrade")

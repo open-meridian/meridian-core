@@ -851,7 +851,7 @@ E2E_K3D_HTTP ?= $(E2E_CLUSTER_HTTP_PORT)
 # .e2e-cluster.log when it fails: the backup run's own for that run. CI run
 # 38188494317's backup failure logged no pod at all, read from meridian-e2e,
 # which that run never makes.
-E2E_K3D_NAMESPACE = $(if $(filter e2e-cluster-backup,$(E2E_CLUSTER_TARGET)),$(E2E_BACKUP_NAMESPACE),$(if $(filter e2e-cluster-failover e2e-cluster-scaled,$(E2E_CLUSTER_TARGET)),$(E2E_FAILOVER_NAMESPACE),$(E2E_CLUSTER_NAMESPACE)))
+E2E_K3D_NAMESPACE = $(if $(filter e2e-cluster-backup,$(E2E_CLUSTER_TARGET)),$(E2E_BACKUP_NAMESPACE),$(if $(filter e2e-cluster-failover e2e-cluster-scaled e2e-cluster-reconfigure,$(E2E_CLUSTER_TARGET)),$(E2E_FAILOVER_NAMESPACE),$(E2E_CLUSTER_NAMESPACE)))
 # Agents beside the server, and the zones they are labelled into, one each
 # in order (step 3b): the HA configuration's runs make three, in three
 # zones. None by default: one node, as a desktop runs.
