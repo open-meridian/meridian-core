@@ -731,7 +731,7 @@ jobs:
       - name: k3d
         run: |
           set -euo pipefail
-          curl -fsSL -o /tmp/k3d https://github.com/k3d-io/k3d/releases/download/v5.9.0/k3d-linux-amd64
+          curl -fsSL --retry 6 --retry-all-errors --retry-delay 10 --retry-max-time 300 -o /tmp/k3d https://github.com/k3d-io/k3d/releases/download/v5.9.0/k3d-linux-amd64
           echo "06d8f25bc3a971c4eb29e0ff08429b180402db0f4dec838c9eac427e296800a0  /tmp/k3d" | sha256sum -c -
           sudo install -m 0755 /tmp/k3d /usr/local/bin/k3d
 
@@ -959,7 +959,7 @@ jobs:
       - name: k3d
         run: |
           set -euo pipefail
-          curl -fsSL -o /tmp/k3d https://github.com/k3d-io/k3d/releases/download/v5.9.0/k3d-linux-arm64
+          curl -fsSL --retry 6 --retry-all-errors --retry-delay 10 --retry-max-time 300 -o /tmp/k3d https://github.com/k3d-io/k3d/releases/download/v5.9.0/k3d-linux-arm64
           echo "03cde5cf23e6e8e67de5a039ecf26e5b85aca82fba3e5d13dadf904cd218a250  /tmp/k3d" | sha256sum -c -
           sudo install -m 0755 /tmp/k3d /usr/local/bin/k3d
 

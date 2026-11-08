@@ -445,11 +445,22 @@ VERDICT := --output type=cacheonly
 
 # Published vulnerabilities in anything the workspace links, from RustSec,
 # read fresh each run. Every exception is in deny.toml with its reason.
+# A failure says which it is: a finding names its advisory (cargo-deny's
+# error[vulnerability], [unsound], [unmaintained] or [yanked], with its
+# RUSTSEC id), and anything else -- a download that failed, the database
+# not fetched -- is said as that, never as a vulnerability.
 advisories:
-	@$(DOCKER) build -f Dockerfile.rust --target advisories $(VERDICT) . >/dev/null 2>&1 \
-		|| { echo "advisories FAILED: a published vulnerability reaches this workspace. See it with:" >&2; \
-		     echo "  DOCKER_BUILDKIT=1 docker build -f Dockerfile.rust --target advisories --progress=plain ." >&2; exit 1; }
-	@echo "advisories OK: no published vulnerability reaches the workspace unexplained"
+	@out=$$($(DOCKER) build -f Dockerfile.rust --target advisories --progress=plain $(VERDICT) . 2>&1) \
+		&& { echo "advisories OK: no published vulnerability reaches the workspace unexplained"; exit 0; }; \
+	if printf '%s\n' "$$out" | grep -qE 'error\[(vulnerability|unsound|unmaintained|yanked|notice)\]'; then \
+		echo "advisories FAILED: a published vulnerability reaches this workspace:" >&2; \
+		printf '%s\n' "$$out" | grep -oE 'error\[[a-z]+\]: .*|RUSTSEC-[0-9]{4}-[0-9]{4}' | sort -u | cut -c1-200 >&2; \
+	else \
+		echo "advisories FAILED: the check could not run -- a download or the network, not a finding. The end of what the build said:" >&2; \
+		printf '%s\n' "$$out" | grep -vE '^#[0-9]+ (DONE|CACHED|\[)' | tail -n 12 | cut -c1-300 >&2; \
+	fi; \
+	echo "See it with:  DOCKER_BUILDKIT=1 docker build -f Dockerfile.rust --target advisories --progress=plain ." >&2; \
+	exit 1
 
 build:
 	@$(DOCKER) build -f Dockerfile.rust --target check $(SCCACHE_SECRETS) $(VERDICT) . >/dev/null 2>&1 \
