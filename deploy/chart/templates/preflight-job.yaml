@@ -121,6 +121,10 @@ spec:
             # limit, which the check measures it against.
             - name: MERIDIAN_PREFLIGHT_DATABASE_VOLUME
               value: {{ .Values.database.brought.size | quote }}
+            # And the connections it will allow once this upgrade is
+            # applied, which the memory is judged by.
+            - name: MERIDIAN_PREFLIGHT_DATABASE_MAX_CONNECTIONS
+              value: {{ include "meridian-runtime.databaseMaxConnections" . | quote }}
             {{- with .Values.database.brought.resources.limits }}
             {{- with .memory }}
             - name: MERIDIAN_PREFLIGHT_DATABASE_MEMORY

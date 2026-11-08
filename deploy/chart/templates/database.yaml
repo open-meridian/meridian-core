@@ -522,9 +522,12 @@ spec:
               exec docker-entrypoint.sh "$@"
             - --
           {{- end }}
-          {{- if or $archive $tls }}
+          # Its connections counted from what this chart deploys
+          # (databaseMaxConnections, ruled 2026-11-08), not Postgres's 100.
           args:
             - postgres
+            - -c
+            - max_connections={{ include "meridian-runtime.databaseMaxConnections" . }}
             {{- if $archive }}
             # Archiving its WAL (backup.walArchive): the image's own
             # entrypoint and server, told to archive through pgBackRest.
@@ -547,7 +550,6 @@ spec:
             - -c
             - hba_file=/etc/meridian-hba/pg_hba.conf
             {{- end }}
-          {{- end }}
           env:
             - name: POSTGRES_USER
               value: postgres

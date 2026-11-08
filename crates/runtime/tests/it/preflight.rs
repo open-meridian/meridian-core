@@ -71,6 +71,7 @@ fn inputs(url: &str) -> Inputs {
         ],
         volume: Some(64 * 1024 * 1024 * 1024),
         memory_limit: None,
+        max_connections: None,
         max_payload: 1024 * 1024,
         backups: None,
         backup_configured: false,
@@ -109,6 +110,23 @@ fn a_deployment_at_this_releases_schema_is_ready_to_upgrade() {
         .unwrap()
         .get(0);
     assert_eq!(lake as usize, meridian_lake::migrations::MIGRATIONS.len());
+}
+
+#[test]
+fn the_memory_is_judged_by_the_connections_the_upgrade_allows() {
+    // The chart counts the brought database's max_connections from what it
+    // deploys (ruled 2026-11-08), and the upgrade that changes it is judged
+    // by the new count, not by the server's before it.
+    let url = migrated("connections");
+    let mut asked = inputs(&url);
+    asked.memory_limit = Some(1024 * 1024 * 1024);
+    asked.max_connections = Some(213);
+    let findings = run(&asked);
+    let memory = findings
+        .iter()
+        .find(|f| f.check == "database_memory")
+        .unwrap();
+    assert!(memory.why.contains("each of 213 connections"), "{memory:?}");
 }
 
 #[test]

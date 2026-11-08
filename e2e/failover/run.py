@@ -1913,6 +1913,34 @@ def member_now(when):
           f"going {bool(pod.get('metadata', {}).get('deletionTimestamp'))}", flush=True)
 
 
+def connections_held(s, when):
+    """The database's max_connections against the count the chart gave it
+    (ruled 2026-11-08: counted from what the chart deploys), on every
+    member, and the connections in use. A member still at another count --
+    a start-only setting changed under Patroni and its restart never asked
+    for -- refuses the new pods' connections once they pass it."""
+    set_ = json.loads(out("get", "statefulset", f"{FULL}-database", "-o", "json"))
+    container = next(c for c in set_["spec"]["template"]["spec"]["containers"] if c["name"] == "postgres")
+    counted = None
+    for arg in container.get("args", []):
+        if arg.startswith("max_connections="):
+            counted = int(arg.split("=", 1)[1])
+    for env in container.get("env", []):
+        if env["name"] == "PATRONI_DYNAMIC":
+            counted = int(json.loads(env["value"])["postgresql"]["parameters"]["max_connections"])
+    members = [p["metadata"]["name"] for p in json.loads(out(
+        "get", "pods", "-l", f"app.kubernetes.io/instance={RELEASE},meridian.dev/component=database",
+        "-o", "json"))["items"] if not p["metadata"].get("deletionTimestamp")]
+    allowed = {member: psql("show max_connections", pod=member, quiet=True) for member in sorted(members)}
+    in_use = psql("select count(*) from pg_stat_activity where backend_type = 'client backend'", quiet=True)
+    print(f"R: {when}: the chart counted {counted} connections; the members allow "
+          f"{', '.join(f'{m} {n}' for m, n in allowed.items())}; {in_use} in use", flush=True)
+    s.check(counted is not None and all(n == str(counted) for n in allowed.values()),
+            f"{when}: every database member allows the {counted} connections the chart counted")
+    s.check(counted is not None and int(in_use or 0) < counted,
+            f"{when}: {in_use} connections in use, under the {counted} allowed")
+
+
 def reconfigure(s):
     global SHAPE
     print("R: the live install moved between the profiles, under the write driver's load", flush=True)
@@ -1965,6 +1993,7 @@ def reconfigure(s):
             for component in STORES:
                 explain(s, f"reconfigure to {target}", component)
             return
+        connections_held(s, f"reconfigure to {target}")
         extra = {"from": "tolerant" if target == "ha" else "ha"}
         if DRIVEN:
             # RPO through the stores across the move: the database moved

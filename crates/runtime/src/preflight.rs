@@ -511,6 +511,10 @@ pub struct Inputs {
     pub stores: Vec<(&'static str, String)>,
     pub volume: Option<u64>,
     pub memory_limit: Option<u64>,
+    /// The brought database's max_connections once the upgrade is applied,
+    /// counted by the chart from what it deploys: the memory is judged by
+    /// it rather than by the server's count before the upgrade.
+    pub max_connections: Option<u64>,
     pub max_payload: u64,
     /// The backups' directory, mounted read-only, where backups are kept.
     pub backups: Option<String>,
@@ -541,6 +545,8 @@ impl Inputs {
             stores,
             volume: var("MERIDIAN_PREFLIGHT_DATABASE_VOLUME").and_then(|q| quantity(&q)),
             memory_limit: var("MERIDIAN_PREFLIGHT_DATABASE_MEMORY").and_then(|q| quantity(&q)),
+            max_connections: var("MERIDIAN_PREFLIGHT_DATABASE_MAX_CONNECTIONS")
+                .and_then(|n| n.parse().ok()),
             max_payload: var("MERIDIAN_PREFLIGHT_MAX_PAYLOAD")
                 .and_then(|q| quantity(&q))
                 .unwrap_or(1024 * 1024),
@@ -791,7 +797,12 @@ pub fn run(inputs: &Inputs) -> Vec<Finding> {
                 setting_bytes(&mut client, "max_connections"),
             ) {
                 (Some(shared), Some(work), Some(max)) => {
-                    findings.push(judge_memory(shared, work, max, inputs.memory_limit));
+                    findings.push(judge_memory(
+                        shared,
+                        work,
+                        inputs.max_connections.unwrap_or(max),
+                        inputs.memory_limit,
+                    ));
                     if let Ok(row) = client.query_one("SELECT count(*) FROM pg_stat_activity", &[])
                     {
                         findings.push(judge_connections(row.get::<_, i64>(0).max(0) as u64, max));
