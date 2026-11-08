@@ -42,10 +42,14 @@ printf 'elle-check: %s operations, %s acknowledged appends, %s reads\n' \
 	"$(grep -c ':type :ok, :f :txn, :value \[\[:append' "$work/history.edn" || true)" \
 	"$(grep -c ':type :ok, :f :txn, :value \[\[:r' "$work/history.edn" || true)"
 
-# elle-cli prints each file, a tab, and true, false or unknown.
+# elle-cli prints each file, a tab, and true, false or unknown. Jepsen's
+# random numbers are L64X128MixRandom, which only jdk.random provides; the
+# JRE image holds it, and a jar on the class path resolves it only when
+# named (#99's first run: "No implementation of the random number
+# generator algorithm").
 verdict() {
 	docker run --rm --network none -v "$work":/w:ro "$JVM" \
-		java -jar /w/elle-cli.jar --model list-append --consistency-models strict-serializable \
+		java --add-modules jdk.random -jar /w/elle-cli.jar --model list-append --consistency-models strict-serializable \
 		"/w/$1" 2>&1 | tee "$work/$1.said" | tail -n 40 >&2 || true
 	awk -F '\t' -v f="/w/$1" '$1 == f { print $2 }' "$work/$1.said" | tail -n 1
 }
