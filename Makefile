@@ -353,7 +353,7 @@ advisories:
 	@echo "advisories OK: no published vulnerability reaches the workspace unexplained"
 
 build:
-	@$(DOCKER) build -f Dockerfile.rust --target check $(VERDICT) . >/dev/null 2>&1 \
+	@$(DOCKER) build -f Dockerfile.rust --target check $(SCCACHE_SECRETS) $(VERDICT) . >/dev/null 2>&1 \
 		|| { echo "build FAILED; see it with:" >&2; \
 		     echo "  DOCKER_BUILDKIT=1 docker build -f Dockerfile.rust --target check ." >&2; exit 1; }
 	@echo "build OK: workspace compiles"
@@ -369,7 +369,9 @@ build:
 # fails once must be named by the run it failed in, not by a second one.
 test: tests-image
 	@log=$$(mktemp); \
-	if docker run --rm $(TESTS_IMAGE) sh -c 'run-tests --workspace --lib && run-tests -p meridian-runtime --test it -- wiring::' >$$log 2>&1; then \
+	mkdir -p .junit; \
+	if docker run --rm -e NEXTEST_PROFILE=$(NEXTEST_PROFILE) -e MERIDIAN_JUNIT_DIR=/junit -v "$(CURDIR)/.junit:/junit" \
+	    $(TESTS_IMAGE) sh -c 'run-tests --workspace --lib && run-tests -p meridian-runtime --test it -- wiring::' >$$log 2>&1; then \
 		rm -f $$log; echo "test OK: workspace tests pass"; \
 	else \
 		echo "test FAILED; the failing tests and their output:" >&2; \
@@ -1024,6 +1026,17 @@ VERSION_ARG = $(if $(MERIDIAN_VERSION),--build-arg MERIDIAN_VERSION=$(MERIDIAN_V
 # (tools/release-candidate.sh). Empty, as everywhere but CI, it only loads.
 CANDIDATE_REGISTRY ?=
 comma := ,
+# GitHub's cache, for sccache in Dockerfile.rust's compiles (ruling 1104;
+# tools/with-sccache.sh): handed to the build as BuildKit secrets, never as
+# build arguments, so the token is in no layer and no image's history, and
+# only where the environment has it -- CI's compile job, from its runtime.
+# Elsewhere none is given and the build compiles as it always has.
+SCCACHE_SECRETS = $(if $(ACTIONS_RUNTIME_TOKEN),--secret id=gha-runtime-token$(comma)env=ACTIONS_RUNTIME_TOKEN) \
+	$(if $(ACTIONS_RESULTS_URL),--secret id=gha-results-url$(comma)env=ACTIONS_RESULTS_URL) \
+	$(if $(ACTIONS_CACHE_URL),--secret id=gha-cache-url$(comma)env=ACTIONS_CACHE_URL)
+# nextest's profile for the test runs (tools/run-tests.sh): CI sets ci, which
+# retries a failed test once and names one that then passes flaky.
+NEXTEST_PROFILE ?= default
 candidate = $(if $(CANDIDATE_REGISTRY),--output type=docker$(comma)name=$(1) \
 	--output type=image$(comma)name=$(CANDIDATE_REGISTRY)/$(2)$(comma)push-by-digest=true$(comma)name-canonical=true$(comma)push=true \
 	--metadata-file .candidate-$(2).json,-t $(1))
@@ -1099,13 +1112,13 @@ endif
 # workspace and each crate's tests, compiled once, which `test` and the
 # services' suites (compose's `tests`) run. A compile error is said here.
 tests-image:
-	@$(DOCKER) build -f Dockerfile.rust --target compile --progress=plain -t $(TESTS_IMAGE) . >.tests-image.log 2>&1 \
+	@$(DOCKER) build -f Dockerfile.rust --target compile --progress=plain $(SCCACHE_SECRETS) -t $(TESTS_IMAGE) . >.tests-image.log 2>&1 \
 		|| { echo "tests-image FAILED: the workspace or its tests did not compile. What cargo said, and the whole of it in .tests-image.log:" >&2; \
 		     grep -E -A12 -e 'error(\[E[0-9]+\])?:' .tests-image.log | cut -c1-400 | head -160 >&2; \
 		     echo "-- the last 30 lines:" >&2; tail -n 30 .tests-image.log | cut -c1-400 >&2; exit 1; }
 
 settings-binary-image:
-	@$(DOCKER) build -q -f Dockerfile.rust --target settings-binary-image -t $(SETTINGS_BINARY_IMAGE) . >/dev/null \
+	@$(DOCKER) build -q -f Dockerfile.rust --target settings-binary-image $(SCCACHE_SECRETS) -t $(SETTINGS_BINARY_IMAGE) . >/dev/null \
 		|| { echo "settings-binary-image FAILED: the settings pages' server did not build. See it with:" >&2; \
 		     echo "  DOCKER_BUILDKIT=1 docker build -f Dockerfile.rust --target settings-binary-image --progress=plain ." >&2; exit 1; }
 

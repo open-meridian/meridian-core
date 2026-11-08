@@ -537,8 +537,14 @@ services:
       # has to prove itself to the platform exactly as the runtime does, so it
       # signs with the key that was registered rather than one of its own.
       MERIDIAN_TEST_KEY_PATH: /var/lib/meridian/key.pem
+      # nextest's profile (CI's retries a failed test once, to name it flaky)
+      # and where each binary's JUnit is copied for the checks' test reports
+      # (ruling 1104; tools/run-tests.sh).
+      NEXTEST_PROFILE: ${NEXTEST_PROFILE:-default}
+      MERIDIAN_JUNIT_DIR: /junit
     volumes:
       - runtime-keys:/var/lib/meridian:ro
+      - ./.junit:/junit
     networks: [meridian]
 
   # ── the dashboard's three ways of signing people in ───────────────────────

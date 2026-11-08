@@ -56,3 +56,4 @@ meridian-backup-e2e-*/
 # (tools/gate.py).
 .gate/
 .candidate-*.json
+.junit/
