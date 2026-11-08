@@ -9,7 +9,7 @@
   compares their digests (crates/runtime/src/replicas.rs). A standby whose
   copy differs, or fails a page, is kept as an IntegrityFinding in the
   store whose log it is, and with `reclone` re-cloned from the primary
-  through Patroni's REST API (`POST /reinit`) and compared again.
+  through Patroni's REST API (`POST /reinitialize`) and compared again.
 
   It reads with the serving role the stores already hold, and is the one
   workload beside the database's own members given Patroni's REST

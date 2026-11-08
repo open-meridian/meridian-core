@@ -21,7 +21,7 @@
 //!   The primary is never re-cloned: where both standbys agree against it,
 //!   that is said, for a person to switch over.
 //! - **What is done.** In `ha` (`--reclone`), the standby is re-cloned from
-//!   the primary through Patroni's REST API (`POST /reinit`), with the
+//!   the primary through Patroni's REST API (`POST /reinitialize`), with the
 //!   Patroni credential the chart mounts in this Job alone, and its copy is
 //!   compared again once it streams. Each finding is kept as an
 //!   `IntegrityFinding` in the store whose log differed, naming the member
@@ -442,26 +442,34 @@ async fn patroni_said(http: &reqwest::Client, address: std::net::IpAddr) -> Opti
     serde_json::from_slice(&body).ok()
 }
 
-/// A member's role and state, by Patroni.
-async fn patroni_state(http: &reqwest::Client, member: &Member) -> Option<(String, String)> {
+/// A member's role, state, replication and server start, by Patroni.
+async fn patroni_state(http: &reqwest::Client, member: &Member) -> Option<[String; 4]> {
     let said = patroni_said(http, member.address).await?;
-    Some((
-        said["role"].as_str().unwrap_or_default().to_string(),
-        said["state"].as_str().unwrap_or_default().to_string(),
-    ))
+    let text = |key: &str| said[key].as_str().unwrap_or_default().to_string();
+    Some([
+        text("role"),
+        text("state"),
+        text("replication_state"),
+        text("postmaster_start_time"),
+    ])
 }
 
-/// Re-clone a standby from the primary through Patroni (`POST /reinit`),
-/// and wait for it to stream again.
+/// Re-clone a standby from the primary through Patroni (`POST
+/// /reinitialize`), and wait for it to stream again: a server started
+/// since the request, a replica, streaming.
 async fn reinit(
     http: &reqwest::Client,
     member: &Member,
     credential: &(String, String),
     within: Duration,
 ) -> Result<(), String> {
+    let before = patroni_state(http, member)
+        .await
+        .map(|[_, _, _, started]| started)
+        .unwrap_or_default();
     let answered = http
         .post(format!(
-            "http://{}/reinit",
+            "http://{}/reinitialize",
             std::net::SocketAddr::new(member.address, 8008)
         ))
         .basic_auth(&credential.0, Some(&credential.1))
@@ -473,16 +481,24 @@ async fn reinit(
     if !answered.status().is_success() {
         let status = answered.status();
         let body = answered.text().await.unwrap_or_default();
-        return Err(format!("Patroni refused the re-clone ({status}): {body}"));
+        // Patroni's own words, not a page of HTML.
+        let said: String = body
+            .lines()
+            .find(|line| !line.trim_start().starts_with('<') && !line.trim().is_empty())
+            .unwrap_or_default()
+            .chars()
+            .take(200)
+            .collect();
+        return Err(format!("Patroni refused the re-clone ({status}) {said}"));
     }
     let until = Instant::now() + within;
-    // It leaves `running` while its data directory is made again, and
-    // comes back to it streaming.
-    tokio::time::sleep(Duration::from_secs(2)).await;
     loop {
-        if let Some((role, state)) = patroni_state(http, member).await {
-            if (role == "replica" || role == "sync_standby")
-                && (state == "running" || state == "streaming")
+        if let Some([role, state, replication, started]) = patroni_state(http, member).await {
+            if started != before
+                && !started.is_empty()
+                && (role == "replica" || role == "sync_standby")
+                && state == "running"
+                && replication == "streaming"
             {
                 return Ok(());
             }
@@ -493,7 +509,7 @@ async fn reinit(
                 within.as_secs()
             ));
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 

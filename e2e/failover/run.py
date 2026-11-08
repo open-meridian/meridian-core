@@ -1255,11 +1255,13 @@ def replica_rot(s):
     others = [f for f in said.get("findings", []) if f.get("member") != member]
     s.check(not others, f"replica-rot: no other member is named ({len(others)})")
     detected = (finding.get("detected_ms") or 0) / 1000
-    recloned = (finding.get("recloned_ms") or 0) / 1000
     claim(s, "replica-rot", "database-scrub", detected, REPLICA_DETECT,
           {"member": member, "job_s": round(took, 2)})
-    claim(s, "replica-rot", "database", recloned, REPLICA_RECLONE,
-          {"member": member, "outcome": "re-cloned, matching"})
+    # The re-clone's time only where it re-cloned and matched: a failed one
+    # is a failure above, never a figure.
+    if "matches the primary's again" in finding.get("outcome", "") and finding.get("recloned_ms"):
+        claim(s, "replica-rot", "database", finding["recloned_ms"] / 1000, REPLICA_RECLONE,
+              {"member": member, "outcome": "re-cloned, matching"})
 
 
 def volume_lost(s):
