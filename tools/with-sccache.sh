@@ -24,7 +24,12 @@ export SCCACHE_GHA_ENABLED=true RUSTC_WRAPPER=sccache
 export SCCACHE_GHA_VERSION="meridian-core-1"
 # Unreachable, it compiles as if there were none.
 export SCCACHE_IGNORE_SERVER_IO_ERROR=1
-sccache --start-server >/dev/null 2>&1 || { unset RUSTC_WRAPPER; exec "$@"; }
+sccache --start-server >/dev/null 2>&1 || {
+	echo "with-sccache: the cache did not start; compiling without it" >&2
+	unset RUSTC_WRAPPER
+	exec "$@"
+}
+echo "with-sccache: compiling through GitHub's cache" >&2
 status=0
 "$@" || status=$?
 sccache --show-stats 2>/dev/null | sed -n '1,12p' >&2 || true

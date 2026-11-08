@@ -369,6 +369,13 @@ jobs:
           STAGE: ${{ matrix.stage }}
         run: make -k ci-stage STAGE="$STAGE"
 
+      # What sccache did for the compile (ruling 1104): its requests, hits
+      # and misses, from the build's own log, or that it did not start.
+      - name: What sccache did
+        if: ${{ !cancelled() }}
+        working-directory: workspace/meridian-core
+        run: grep -E -A14 'with-sccache|Compile requests' .tests-image.log | cut -c1-200 || echo "sccache said nothing"
+
       - name: Say what the compile said
         if: failure()
         working-directory: workspace/meridian-core
@@ -477,7 +484,10 @@ jobs:
         uses: dorny/test-reporter@3d76b34a4535afbd0600d347b09a6ee5deb3ed7f
         with:
           name: tests (${{ matrix.stage }})
-          path: workspace/meridian-core/.junit/*.xml
+          # The repository is checked out below the workspace, and the
+          # action lists its files from where it is told it is.
+          working-directory: workspace/meridian-core
+          path: .junit/*.xml
           reporter: java-junit
           fail-on-error: false
 
