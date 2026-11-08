@@ -306,7 +306,7 @@ async fn discover(http: &reqwest::Client, setup: &Setup) -> Result<Vec<Member>, 
         let name = patroni_said(http, address)
             .await
             .and_then(|said| said["patroni"]["name"].as_str().map(str::to_string))
-            .unwrap_or_else(|| address.to_string());
+            .ok_or_else(|| format!("Patroni at {address} did not say which member it is"))?;
         members.push(Member { name, address });
     }
     members.sort_by(|a, b| a.name.cmp(&b.name));
@@ -534,7 +534,29 @@ pub fn run(setup: &Setup) -> Result<Value, String> {
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|failed| failed.to_string())?;
-    let members = runtime.block_on(discover(&http, setup))?;
+    // A Job's pod is admitted by the database's NetworkPolicy once the
+    // cluster's policy controller has seen it, which can be seconds after it
+    // starts (refused until then): asked again for up to a minute.
+    let until = Instant::now() + Duration::from_secs(60);
+    let members = loop {
+        let found = runtime
+            .block_on(discover(&http, setup))
+            .and_then(|members| {
+                let primary = members.first().map(|m| m.address);
+                match primary {
+                    Some(address) => connect(&setup.url, address).map(|_| members),
+                    None => Err("no member found".into()),
+                }
+            });
+        match found {
+            Ok(members) => break members,
+            Err(failed) if Instant::now() < until => {
+                tracing::info!("the database's members not reached yet: {failed}");
+                std::thread::sleep(Duration::from_secs(2));
+            }
+            Err(failed) => return Err(failed),
+        }
+    };
     let (primary, first) = compare(setup, &members)?;
     if first.is_empty() {
         return Ok(json!({
