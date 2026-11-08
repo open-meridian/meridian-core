@@ -25,7 +25,7 @@
 {{- end }}
 {{- $within := printf "%s.svc.cluster.local" $ns }}
 {{- $servers := dict
-      "database" (list (printf "%s-database" $full) (printf "%s-database.%s" $full $ns) (printf "%s-database.%s.svc" $full $ns) (printf "%s-database.%s" $full $within) (printf "*.%s-database-members.%s" $full $within))
+      "database" (list (printf "%s-database" $full) (printf "%s-database.%s" $full $ns) (printf "%s-database.%s.svc" $full $ns) (printf "%s-database.%s" $full $within) (printf "*.%s-database-members.%s" $full $within) (printf "%s-database-0.%s" $full $within) (printf "%s-database-1.%s" $full $within) (printf "%s-database-2.%s" $full $within))
       "broker" (list (printf "%s-broker" $full) (printf "%s-broker.%s" $full $ns) (printf "%s-broker.%s.svc" $full $ns) (printf "%s-broker.%s" $full $within) (printf "*.%s-broker-members.%s" $full $within) (printf "*.%s-broker-jetstream-members.%s" $full $within))
       "sidecars" (list (printf "*.%s-sidecars.%s" $full $within) (printf "*.%s-sidecars.%s.svc" $full $ns)) }}
 ---
@@ -46,10 +46,15 @@ data:
 {{- $name := printf "%s-internal-tls-%s" $full $server }}
 {{- $held := lookup "v1" "Secret" $ns $name }}
 {{- $tls := dict }}
-{{- if and $held $held.data (index $held.data "tls.key") (eq (index $held.data "ca.crt") ($ca.Cert | b64enc)) }}
+{{- $names := index $servers $server }}
+{{- /* The names a certificate was made under, kept on its Secret: one made
+       under others -- the database's before its members were named by
+       their own Services (Patroni's REST API over TLS, ruled 2026-11-08) --
+       is made again, from the same CA, which every client still trusts. */}}
+{{- $namesHeld := dig "metadata" "annotations" "meridian.dev/names" "" (default (dict) $held) }}
+{{- if and $held $held.data (index $held.data "tls.key") (eq (index $held.data "ca.crt") ($ca.Cert | b64enc)) (eq $namesHeld (join "," $names)) }}
 {{- $tls = $held.data }}
 {{- else }}
-{{- $names := index $servers $server }}
 {{- $made := genSignedCert (first $names) nil $names 3650 $ca }}
 {{- $tls = dict "ca.crt" ($ca.Cert | b64enc) "tls.crt" ($made.Cert | b64enc) "tls.key" ($made.Key | b64enc) }}
 {{- end }}
@@ -63,6 +68,8 @@ metadata:
   labels:
     meridian.dev/component: internal-tls
     {{- include "meridian-runtime.labels" $ | nindent 4 }}
+  annotations:
+    meridian.dev/names: {{ join "," $names | quote }}
 type: kubernetes.io/tls
 data:
   {{- range $key := list "ca.crt" "tls.crt" "tls.key" }}

@@ -506,12 +506,14 @@ def run():
     # resolve's bounded ask of eight and within the conductor's ten-second request (contract v24, the one-ID spec's
     # requirement 15; until then the sidecar's five-second call); a stopped
     # master is a name that resolves nowhere.
-    started_at = time.time()
+    # Timed by the plugin around the resolve itself, from a component
+    # already running: the runner's own start-up for the page is not the
+    # resolve's (ruled 2026-11-08).
     yen = page("coin", "admin", "/resolve-as-of?scheme=iso4217&value=JPY")
     must(not yen["found"] and not yen["minted"] and not yen["instrument_id"],
          f"step 12, a slow master: a miss, nothing minted: {yen}")
-    must(time.time() - started_at < 9.5, f"step 12, the resolve waited on the master past its "
-         f"eight-second bound: {time.time() - started_at:.1f}s")
+    must(yen["took_s"] < 9.5, f"step 12, the resolve waited on the master past its "
+         f"eight-second bound: {yen['took_s']:.1f}s")
     yen = {}
     for _ in range(20):
         time.sleep(1)

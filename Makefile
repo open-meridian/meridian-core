@@ -2772,6 +2772,27 @@ chart-check:
 		|| { echo "chart-check FAILED: a max_connections below what the pods hold was refused without saying how many: $$said" >&2; exit 1; }; \
 	$(HELM_TEMPLATE) check deploy/chart $$base --set database.brought.maxConnections=300 2>/dev/null | grep -q -- "- max_connections=300$$" \
 		|| { echo "chart-check FAILED: database.brought.maxConnections=300 is not what the database is given" >&2; exit 1; }
+	@# Patroni's REST API over TLS whenever internal TLS is on (ruled
+	@# 2026-11-08): served with the database's certificate, each member
+	@# reached by its own Service's name (one per member, which the
+	@# certificate carries), the members trusting the internal CA, the
+	@# kubelet's probes over HTTPS; in the clear, as before, without it.
+	@base="--set deployment.id=DEP-check --set deployment.enrolmentCode=ENR-check --set key.generate=false --set key.existingSecret=k --set resilience.profile=ha"; \
+	tls="$$($(HELM_TEMPLATE) check deploy/chart $$base --set tls.internal.enabled=true 2>/dev/null)" \
+		|| { echo "chart-check FAILED: the ha profile did not render with internal TLS" >&2; exit 1; }; \
+	for held in "name: PATRONI_RESTAPI_CERTFILE" "name: PATRONI_RESTAPI_KEYFILE" "name: PATRONI_CTL_CACERT" \
+		'value: "$$(POD_NAME).default.svc.cluster.local:8008"' "scheme: HTTPS" \
+		"check-meridian-runtime-database-0.default.svc.cluster.local" "check-meridian-runtime-database-2.default.svc.cluster.local"; do \
+		echo "$$tls" | grep -qF -- "$$held" \
+			|| { echo "chart-check FAILED: Patroni's REST API under internal TLS renders no $$held" >&2; exit 1; }; \
+	done; \
+	[ "$$(echo "$$tls" | grep -c 'statefulset.kubernetes.io/pod-name: check-meridian-runtime-database-')" = 3 ] \
+		|| { echo "chart-check FAILED: the members are not each named by a Service of their own under internal TLS" >&2; exit 1; }; \
+	plain="$$($(HELM_TEMPLATE) check deploy/chart $$base 2>/dev/null)"; \
+	echo "$$plain" | grep -q "name: PATRONI_RESTAPI_CERTFILE\|scheme: HTTPS" \
+		&& { echo "chart-check FAILED: Patroni's REST API is given TLS with internal TLS off" >&2; exit 1; }; \
+	echo "$$plain" | grep -qF 'value: "$$(POD_IP):8008"' \
+		|| { echo "chart-check FAILED: without internal TLS Patroni's members no longer reach each other by address" >&2; exit 1; }
 	@# Step 3b part 3: the WAL archive (backup.walArchive). Off by default,
 	@# so a desktop renders none of it but the offline CronJob, which runs
 	@# nothing until the CLI makes a Job from it. On: the database archives
