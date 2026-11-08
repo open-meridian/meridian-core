@@ -23,15 +23,24 @@ chmod 0600 /run/archive/tls/*
 as_postgres() { su-exec postgres "$@"; }
 # The primary's server answers once the stanza exists; a database just
 # chosen, or one restarting under an upgrade, is waited for, two minutes.
+# The base backup too, within the same two minutes: a database just
+# restored has its stanza moved to it by the archive's own container
+# beside it (archive.sh) while this runs, and a backup begun in that moment
+# finds no primary (pgBackRest's error 056, CI run 42446040044: `meridian
+# backup` straight after `meridian restore`). Asked again until it answers,
+# never past the two minutes.
 waited=0
-until as_postgres pgbackrest --stanza=meridian check >/tmp/pgbackrest/check.log 2>&1; do
-	[ "$waited" -lt 120 ] || fail "the archive did not answer within 120s: $(grep -m1 ERROR /tmp/pgbackrest/check.log || tail -1 /tmp/pgbackrest/check.log)"
-	[ "$waited" -gt 0 ] || say "waiting for the archive to answer"
+until as_postgres pgbackrest --stanza=meridian check >/tmp/pgbackrest/check.log 2>&1 \
+	&& as_postgres pgbackrest --stanza=meridian backup --type=full >/tmp/pgbackrest/backup.log 2>&1; do
+	if [ "$waited" -ge 120 ]; then
+		[ -s /tmp/pgbackrest/backup.log ] \
+			&& fail "the base backup did not finish within 120s: $(grep -m1 ERROR /tmp/pgbackrest/backup.log || tail -1 /tmp/pgbackrest/backup.log)"
+		fail "the archive did not answer within 120s: $(grep -m1 ERROR /tmp/pgbackrest/check.log || tail -1 /tmp/pgbackrest/check.log)"
+	fi
+	[ "$waited" -gt 0 ] || say "waiting for the archive to answer and take the base backup"
 	sleep 5
 	waited=$((waited + 5))
 done
-as_postgres pgbackrest --stanza=meridian backup --type=full >/tmp/pgbackrest/backup.log 2>&1 \
-	|| fail "the base backup did not finish: $(grep -m1 ERROR /tmp/pgbackrest/backup.log || tail -1 /tmp/pgbackrest/backup.log)"
 as_postgres pgbackrest --stanza=meridian expire >/tmp/pgbackrest/expire.log 2>&1 \
 	|| fail "the archive's old backups could not be expired: $(grep -m1 ERROR /tmp/pgbackrest/expire.log || tail -1 /tmp/pgbackrest/expire.log)"
 # What the archive holds now: its backups, the oldest and newest time it can
