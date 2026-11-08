@@ -1674,6 +1674,10 @@ def database_said(s, when):
     s.note(f"{when}: the preflight said: {logs.stdout.decode(errors='replace').strip()[-2000:] or 'nothing'}")
 
 
+def ready_of(pod):
+    return bool(pod) and ready(pod)
+
+
 class HookLog:
     """A hook Job's log, read every second while an upgrade runs, the last
     read kept: a hook that passes is deleted with its pod when it succeeds,
@@ -1684,15 +1688,30 @@ class HookLog:
         import threading
         self.job = f"{FULL}-{job}"
         self.said = ""
+        self.seen = []
         self.done = threading.Event()
         self.thread = threading.Thread(target=self.follow, daemon=True)
 
     def follow(self):
+        last = None
         while not self.done.is_set():
             done = kubectl("logs", f"job/{self.job}", "--all-containers", "--timestamps", "--tail=60", check=False)
             text = done.stdout.decode(errors="replace").strip()
             if done.returncode == 0 and text:
                 self.said = text
+            # Beside it, what the database's Service routes to and what
+            # member 0 says of itself, each change kept with its time: a
+            # refused connection is either no endpoint behind the Service,
+            # or a new pod not yet admitted by the database's policy.
+            ready = out("get", "endpoints", f"{FULL}-database", "-o",
+                        "jsonpath={.subsets[*].addresses[*].ip}/{.subsets[*].notReadyAddresses[*].ip}", check=False)
+            pod = json.loads(out("get", "pod", f"{FULL}-database-0", "-o", "json", check=False) or "{}")
+            now = (f"endpoints {ready or '/'}; member 0 {pod.get('status', {}).get('podIP', '')} role "
+                   f"{pod.get('metadata', {}).get('labels', {}).get('meridian.dev/database-role', 'none')} "
+                   f"ready {ready_of(pod)}")
+            if now != last:
+                self.seen.append(f"{time.strftime('%H:%M:%S', time.gmtime())} {now}")
+                last = now
             self.done.wait(1)
 
     def __enter__(self):
@@ -1754,6 +1773,7 @@ def reconfigure(s):
                                 *helm_takes_counts(), "--set", f"resilience.profile={target}", check=False)
                 print(f"R: the second upgrade's preflight said, {time.time() - began:.0f}s after the first "
                       f"upgrade:\n{preflight.said or '(nothing read)'}", flush=True)
+                print("R: the database's Service and member 0 meanwhile:\n" + "\n".join(preflight.seen), flush=True)
                 member_now("after the second upgrade")
                 s.check(again.returncode == 0, "reconfigure: the second upgrade adds the database's standbys"
                         + ("" if again.returncode == 0 else f": {again.stderr.decode(errors='replace')[-400:]}"))
