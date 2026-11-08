@@ -506,8 +506,9 @@ ingress:
 # and a front door serves nothing in the clear. A database somebody else runs
 # (database.brought.enabled false, or another chosen in the wizard) is then
 # reached over TLS too, verified against the public roots and this CA: one
-# that offers no TLS is refused. Patroni's REST API between members stays as
-# it is, behind its NetworkPolicy and its password.
+# that offers no TLS is refused. Patroni's REST API is served over TLS
+# alone, and its members and the members' comparison Job reach it by each
+# member's own name, verified against this CA (ruled 2026-11-08).
 tls:
   internal:
     enabled: false

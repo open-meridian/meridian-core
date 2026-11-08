@@ -28,7 +28,10 @@
 //!   and the outcome: re-cloned and matching, or not.
 //!
 //! The stores hold no new credential for any of it: the Job reads with the
-//! serving role every store already has, and only it holds Patroni's.
+//! serving role every store already has, and only it holds Patroni's. With
+//! internal TLS, Patroni's REST API is asked over TLS by each member's own
+//! name, its certificate verified by that name against the internal CA
+//! (ruled 2026-11-08).
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -286,11 +289,92 @@ impl Setup {
     }
 }
 
-/// Every member, by the headless Service's addresses, each named by
-/// Patroni's own word for it. All of them, or none: a member that cannot
-/// be found is one whose copy cannot be compared.
-async fn discover(http: &reqwest::Client, setup: &Setup) -> Result<Vec<Member>, String> {
+/// Patroni's REST API as this Job reaches it: by each member's address, or,
+/// with internal TLS, over TLS by the member's own Service's name
+/// (`<set>-<n>.<namespace>.svc.cluster.local`, which its certificate
+/// carries), verified by that name against the internal CA (ruled
+/// 2026-11-08).
+pub struct Api {
+    http: reqwest::Client,
+    /// With internal TLS: the database's StatefulSet, and the domain each
+    /// member's own Service is named in.
+    named: Option<(String, String)>,
+}
+
+impl Api {
+    pub fn new(setup: &Setup) -> Result<Self, String> {
+        let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(10));
+        let named = match meridian_changes::tls::internal_ca() {
+            None => None,
+            Some(path) => {
+                let pem = std::fs::read(&path).map_err(|failed| {
+                    format!("the internal CA at {path} is unreadable: {failed}")
+                })?;
+                for certificate in reqwest::Certificate::from_pem_bundle(&pem)
+                    .map_err(|failed| format!("the internal CA at {path} is not one: {failed}"))?
+                {
+                    builder = builder.add_root_certificate(certificate);
+                }
+                Some(named_by(&setup.service)?)
+            }
+        };
+        let http = builder
+            .build()
+            .map_err(|failed| format!("Patroni's client could not be built: {failed}"))?;
+        Ok(Self { http, named })
+    }
+
+    /// Where a member's `path` is asked.
+    pub fn url(&self, name: &str, address: std::net::IpAddr, path: &str) -> String {
+        match &self.named {
+            Some((_, within)) => format!("https://{name}.{within}:8008/{path}"),
+            None => format!("http://{}/{path}", std::net::SocketAddr::new(address, 8008)),
+        }
+    }
+}
+
+/// The database's StatefulSet and the domain its members' own Services are
+/// named in, from the members' headless Service
+/// (`<set>-members.<namespace>.svc.cluster.local`).
+pub fn named_by(service: &str) -> Result<(String, String), String> {
+    service
+        .split_once('.')
+        .and_then(|(members, within)| {
+            members
+                .strip_suffix("-members")
+                .map(|set| (set.to_string(), within.to_string()))
+        })
+        .ok_or_else(|| format!("the members' Service {service} is not <set>-members.<domain>"))
+}
+
+/// Every member, each named by Patroni's own word for it: by the headless
+/// Service's addresses, or with internal TLS by each member's own
+/// Service. All of them, or none: a member that cannot be found is one
+/// whose copy cannot be compared.
+async fn discover(api: &Api, setup: &Setup) -> Result<Vec<Member>, String> {
     use std::net::ToSocketAddrs as _;
+    if let Some((set, within)) = &api.named {
+        let mut members = Vec::new();
+        for n in 0..setup.expected {
+            let name = format!("{set}-{n}");
+            let address = format!("{name}.{within}:5432")
+                .to_socket_addrs()
+                .map_err(|failed| format!("member {name}'s Service did not resolve: {failed}"))?
+                .map(|at| at.ip())
+                .next()
+                .ok_or_else(|| format!("member {name}'s Service names no address"))?;
+            let said = patroni_said(api, &name, address)
+                .await
+                .and_then(|said| said["patroni"]["name"].as_str().map(str::to_string));
+            if said.as_deref() != Some(name.as_str()) {
+                return Err(format!(
+                    "Patroni at {name} did not say it is {name}, over TLS verified by that name"
+                ));
+            }
+            members.push(Member { name, address });
+        }
+        return Ok(members);
+    }
     let addresses: std::collections::BTreeSet<std::net::IpAddr> = format!("{}:5432", setup.service)
         .to_socket_addrs()
         .map_err(|failed| {
@@ -303,7 +387,7 @@ async fn discover(http: &reqwest::Client, setup: &Setup) -> Result<Vec<Member>, 
         .collect();
     let mut members = Vec::new();
     for address in addresses {
-        let name = patroni_said(http, address)
+        let name = patroni_said(api, "", address)
             .await
             .and_then(|said| said["patroni"]["name"].as_str().map(str::to_string))
             .ok_or_else(|| format!("Patroni at {address} did not say which member it is"))?;
@@ -427,12 +511,10 @@ fn compare(setup: &Setup, members: &[Member]) -> Result<(String, Found), String>
 }
 
 /// Patroni's own word on a member (GET /patroni).
-async fn patroni_said(http: &reqwest::Client, address: std::net::IpAddr) -> Option<Value> {
-    let body = http
-        .get(format!(
-            "http://{}/patroni",
-            std::net::SocketAddr::new(address, 8008)
-        ))
+async fn patroni_said(api: &Api, name: &str, address: std::net::IpAddr) -> Option<Value> {
+    let body = api
+        .http
+        .get(api.url(name, address, "patroni"))
         .send()
         .await
         .ok()?
@@ -443,8 +525,8 @@ async fn patroni_said(http: &reqwest::Client, address: std::net::IpAddr) -> Opti
 }
 
 /// A member's role, state, replication and server start, by Patroni.
-async fn patroni_state(http: &reqwest::Client, member: &Member) -> Option<[String; 4]> {
-    let said = patroni_said(http, member.address).await?;
+async fn patroni_state(api: &Api, member: &Member) -> Option<[String; 4]> {
+    let said = patroni_said(api, &member.name, member.address).await?;
     let text = |key: &str| said[key].as_str().unwrap_or_default().to_string();
     Some([
         text("role"),
@@ -458,20 +540,18 @@ async fn patroni_state(http: &reqwest::Client, member: &Member) -> Option<[Strin
 /// /reinitialize`), and wait for it to stream again: a server started
 /// since the request, a replica, streaming.
 async fn reinit(
-    http: &reqwest::Client,
+    api: &Api,
     member: &Member,
     credential: &(String, String),
     within: Duration,
 ) -> Result<(), String> {
-    let before = patroni_state(http, member)
+    let before = patroni_state(api, member)
         .await
         .map(|[_, _, _, started]| started)
         .unwrap_or_default();
-    let answered = http
-        .post(format!(
-            "http://{}/reinitialize",
-            std::net::SocketAddr::new(member.address, 8008)
-        ))
+    let answered = api
+        .http
+        .post(api.url(&member.name, member.address, "reinitialize"))
         .basic_auth(&credential.0, Some(&credential.1))
         .header("Content-Type", "application/json")
         .body(json!({ "force": true }).to_string())
@@ -493,7 +573,7 @@ async fn reinit(
     }
     let until = Instant::now() + within;
     loop {
-        if let Some([role, state, replication, started]) = patroni_state(http, member).await {
+        if let Some([role, state, replication, started]) = patroni_state(api, member).await {
             if started != before
                 && !started.is_empty()
                 && (role == "replica" || role == "sync_standby")
@@ -546,24 +626,19 @@ pub fn run(setup: &Setup) -> Result<Value, String> {
         .enable_all()
         .build()
         .map_err(|failed| failed.to_string())?;
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|failed| failed.to_string())?;
+    let api = Api::new(setup)?;
     // A Job's pod is admitted by the database's NetworkPolicy once the
     // cluster's policy controller has seen it, which can be seconds after it
     // starts (refused until then): asked again for up to a minute.
     let until = Instant::now() + Duration::from_secs(60);
     let members = loop {
-        let found = runtime
-            .block_on(discover(&http, setup))
-            .and_then(|members| {
-                let primary = members.first().map(|m| m.address);
-                match primary {
-                    Some(address) => connect(&setup.url, address).map(|_| members),
-                    None => Err("no member found".into()),
-                }
-            });
+        let found = runtime.block_on(discover(&api, setup)).and_then(|members| {
+            let primary = members.first().map(|m| m.address);
+            match primary {
+                Some(address) => connect(&setup.url, address).map(|_| members),
+                None => Err("no member found".into()),
+            }
+        });
         match found {
             Ok(members) => break members,
             Err(failed) if Instant::now() < until => {
@@ -619,8 +694,7 @@ pub fn run(setup: &Setup) -> Result<Value, String> {
             )
         } else if let Some(credential) = &setup.patroni {
             let began = Instant::now();
-            let done =
-                runtime.block_on(reinit(&http, member, credential, Duration::from_secs(300)));
+            let done = runtime.block_on(reinit(&api, member, credential, Duration::from_secs(300)));
             let took = began.elapsed().as_millis() as u64;
             match done {
                 Err(why) => (format!("re-clone failed: {why}"), Some(took)),
@@ -722,5 +796,31 @@ mod tests {
             "a partition a member lacks is not compared"
         );
         assert!(!common.contains_key("z"));
+    }
+
+    #[test]
+    fn with_internal_tls_a_member_is_asked_by_its_own_services_name() {
+        let (set, within) =
+            named_by("om-meridian-runtime-database-members.om.svc.cluster.local").unwrap();
+        assert_eq!(set, "om-meridian-runtime-database");
+        assert_eq!(within, "om.svc.cluster.local");
+        assert!(named_by("om-database.om.svc.cluster.local").is_err());
+        let address: std::net::IpAddr = "10.42.0.7".parse().unwrap();
+        let named = Api {
+            http: reqwest::Client::new(),
+            named: Some((set, within)),
+        };
+        assert_eq!(
+            named.url("om-meridian-runtime-database-1", address, "patroni"),
+            "https://om-meridian-runtime-database-1.om.svc.cluster.local:8008/patroni"
+        );
+        let plain = Api {
+            http: reqwest::Client::new(),
+            named: None,
+        };
+        assert_eq!(
+            plain.url("om-meridian-runtime-database-1", address, "patroni"),
+            "http://10.42.0.7:8008/patroni"
+        );
     }
 }

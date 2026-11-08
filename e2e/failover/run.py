@@ -526,11 +526,29 @@ def first_run(s):
     s.check(True, "first run applied; every component ready")
 
 
+def patroni_api(path, member=None, method="GET", body=None):
+    """A shell command, run in a database member, asking Patroni's REST API
+    there for `path`: over TLS by the member's own Service's name, verified
+    against the internal CA, where internal TLS is on (ruled 2026-11-08);
+    by 127.0.0.1 in the clear otherwise. Unsafe methods carry Patroni's
+    credential, from the member's own environment."""
+    auth = '-u "patroni:$PATRONI_RESTAPI_PASSWORD" ' if method != "GET" else ""
+    data = f"-H 'Content-Type: application/json' -d '{body}' " if body is not None else ""
+    if TLS:
+        name = f"{member or '$POD_NAME'}.{NAMESPACE}.svc.cluster.local"
+        return (f"curl -fsS --cacert /run/meridian-tls/ca.crt -X {method} {auth}{data}"
+                f"https://{name}:8008/{path}")
+    return f"curl -fsS -X {method} {auth}{data}http://127.0.0.1:8008/{path}"
+
+
 def internal_tls(s):
     """Internal TLS on (ruling 1084): every store's connection to the
     database over TLS, and a plaintext one refused, by the database and by
     the broker; a TLS one verified against the chart's CA by the name the
-    stores use."""
+    stores use. And Patroni's REST API over TLS alone (ruled 2026-11-08):
+    each member reached by another by its own name, verified against the
+    CA, a plaintext request answered nothing, and no member's Patroni
+    saying a request to another failed its certificate."""
     print("T: internal TLS: plaintext refused", flush=True)
     host = f"{FULL}-database.{NAMESPACE}.svc.cluster.local"
     member = primary()
@@ -569,6 +587,30 @@ def internal_tls(s):
             "the broker requires TLS of every client and answers a plaintext one nothing "
             f"({'tls_required' if 'tls_required' in said else 'no greeting'}"
             f"{', PONG' if 'PONG' in said else ''})")
+    # Patroni's REST API: every other member asked from this one by its own
+    # name over TLS, and in the clear by its address answered nothing.
+    members = [p["metadata"]["name"] for p in pods("database")]
+    for other in members:
+        if other == member:
+            continue
+        done = kubectl("exec", member, "-c", "postgres", "--", "sh", "-c",
+                       patroni_api("patroni", member=other), check=False)
+        said = done.stdout.decode(errors="replace")
+        s.check(done.returncode == 0 and f'"name": "{other}"' in said.replace('":"', '": "'),
+                f"Patroni's REST API on {other} answers {member} over TLS, verified by {other}'s own name"
+                + ("" if done.returncode == 0 else f": {done.stderr.decode(errors='replace').strip()[-200:]}"))
+        address = next(p["status"]["podIP"] for p in pods("database") if p["metadata"]["name"] == other)
+        clear = kubectl("exec", member, "-c", "postgres", "--", "sh", "-c",
+                        f"curl -fsS -m 5 http://{address}:8008/patroni", check=False)
+        s.check(clear.returncode != 0,
+                f"Patroni's REST API on {other} answers a plaintext request nothing")
+    for each in members:
+        logs = kubectl("logs", each, "-c", "postgres", check=False).stdout.decode(errors="replace")
+        failed = [line for line in logs.splitlines()
+                  if "CERTIFICATE_VERIFY_FAILED" in line or "certificate verify failed" in line
+                  or "SSLError" in line]
+        s.check(not failed, f"{each}'s Patroni reached the other members' REST APIs with their "
+                f"certificates verified" + (f": {failed[-1][-200:]}" if failed else ""))
 
 
 def all_ready():
@@ -1622,8 +1664,7 @@ def replica_rot(s):
     # Its server restarted, so the page is read again from disk; a clean
     # page in memory is never written back over it.
     kubectl("exec", member, "-c", "postgres", "--", "sh", "-c",
-            'curl -fsS -o /dev/null -u "patroni:$PATRONI_RESTAPI_PASSWORD" -X POST '
-            "-H 'Content-Type: application/json' -d '{}' http://127.0.0.1:8008/restart", quiet=True)
+            patroni_api("restart", method="POST", body="{}") + " >/dev/null", quiet=True)
     wait_for("the standby streaming again", lambda: psql(
         "select pg_is_in_recovery()", pod=member) == "t", seconds=180)
     flipped = on_disk(node, path)

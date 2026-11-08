@@ -161,6 +161,33 @@ spec:
       port: 5432
     - name: patroni
       port: 8008
+{{- if $tls }}
+{{- range $i := until 3 }}
+---
+# Member {{ $i }} by a name of its own (`<name>-{{ $i }}.<namespace>.svc`), which its
+# certificate carries: Patroni's members reach each other's REST API by it
+# over TLS, each verified by that name (ruled 2026-11-08). A Service per
+# member, because a StatefulSet's pods have DNS names only under the
+# Service it was made with, which here is the primary's.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-{{ $i }}
+  labels:
+    {{- include "meridian-runtime.labels" $ | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: {{ include "meridian-runtime.name" $ }}
+    app.kubernetes.io/instance: {{ $.Release.Name }}
+    meridian.dev/component: database
+    statefulset.kubernetes.io/pod-name: {{ $name }}-{{ $i }}
+  ports:
+    - name: patroni
+      port: 8008
+{{- end }}
+{{- end }}
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -436,11 +463,26 @@ spec:
                 fieldRef:
                   fieldPath: status.podIP
             # Where the other members reach this one: its standbys stream
-            # from it, and Patroni asks its REST API, by its pod's address.
+            # from it by its pod's address, and Patroni asks its REST API
+            # there too -- or, with internal TLS, by its own Service's name,
+            # over TLS, its certificate verified by that name against the
+            # internal CA (ruled 2026-11-08). Patroni asks the other members
+            # with the same CA (its ctl cacert).
             - name: PATRONI_POSTGRESQL_CONNECT_ADDRESS
               value: "$(POD_IP):5432"
+            {{- if $tls }}
+            - name: PATRONI_RESTAPI_CONNECT_ADDRESS
+              value: "$(POD_NAME).{{ .Release.Namespace }}.svc.cluster.local:8008"
+            - name: PATRONI_RESTAPI_CERTFILE
+              value: /run/meridian-tls/tls.crt
+            - name: PATRONI_RESTAPI_KEYFILE
+              value: /run/meridian-tls/tls.key
+            - name: PATRONI_CTL_CACERT
+              value: /run/meridian-tls/ca.crt
+            {{- else }}
             - name: PATRONI_RESTAPI_CONNECT_ADDRESS
               value: "$(POD_IP):8008"
+            {{- end }}
             - name: PATRONI_SUPERUSER_PASSWORD
               valueFrom:
                 secretKeyRef:
@@ -479,12 +521,18 @@ spec:
             httpGet:
               path: /readiness
               port: 8008
+              {{- if $tls }}
+              scheme: HTTPS
+              {{- end }}
             periodSeconds: 2
             failureThreshold: 3
           livenessProbe:
             httpGet:
               path: /liveness
               port: 8008
+              {{- if $tls }}
+              scheme: HTTPS
+              {{- end }}
             initialDelaySeconds: 30
             periodSeconds: 10
             failureThreshold: 6
