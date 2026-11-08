@@ -1432,6 +1432,8 @@ impl Store for PostgresStore {
     fn take_over(&self, by: &meridian_changes::TookOver) -> Result<u64> {
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
+        // A deposed writer stopped mid-entry holds the head row it took.
+        meridian_changes::end_deposed_writers(&mut tx, &["book_partition_head"]).map_err(unavailable)?;
         let epoch: i64 = tx
             .query_one(
                 "WITH raised AS (
