@@ -562,10 +562,16 @@ impl Inputs {
 /// waits for its database for that reason ([`crate::wait_until`],
 /// [`crate::migrate_once_it_answers`]); the preflight once made one attempt,
 /// and on CI's k3d cluster every store "did not answer" and the upgrade was
-/// blocked with the database running (CI run 40423226625). A minute is
-/// far past that moment and well inside the hook's five-minute deadline; a
-/// database that is truly not there still blocks, after it, saying why.
-pub const DATABASE_WAITS_AT_MOST: Duration = Duration::from_secs(60);
+/// blocked with the database running (CI run 40423226625).
+///
+/// And a database whose member is new answers nobody through its Service
+/// until it is ready: a second upgrade run by hand right after the one that
+/// moved the database under Patroni met its preflight refused for 2 to 38 s
+/// on ten CI runs, and past a minute on two (step 3b part 5; CI runs
+/// 42462993343 and 42482853675). Three minutes covers that and stays well
+/// inside the hook's five-minute deadline; a database that is truly not
+/// there still blocks, after it, saying why.
+pub const DATABASE_WAITS_AT_MOST: Duration = Duration::from_secs(180);
 
 /// One attempt's limit: a connection the network drops rather than refuses
 /// fails in this, not in the minutes the system's own retries take.
