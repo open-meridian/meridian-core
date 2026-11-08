@@ -434,6 +434,48 @@ pub fn origin() -> &'static str {
     ORIGIN.get().map(String::as_str).unwrap_or("")
 }
 
+/// How long a takeover waits for each deposed writer's session it ends to
+/// go, in milliseconds (`pg_terminate_backend`'s timeout).
+pub const DEPOSED_GONE_WITHIN_MS: i64 = 5_000;
+
+/// End every other session holding a writer's lock on a store's head tables
+/// -- a row taken `FOR UPDATE`, or written -- before a takeover raises the
+/// epoch there: a deposed writer stopped mid-transaction (its node paused,
+/// its process frozen) holds the head row it locked until its own client
+/// moves again, and the server never hears it go (the frozen node's kernel
+/// still answers TCP). The takeover's raise waited on it for 35 s in CI
+/// (#99's ha run 42496994613, node-freeze, under the write driver's load),
+/// past the component tier (1048). Its transaction was never acknowledged
+/// and is aborted; a commit it had made already stays. Readers, which take
+/// no row lock, are left alone. A session of the store's own role may end
+/// another of that role, so no new right is needed. Answers how many ended.
+pub fn end_deposed_writers(
+    client: &mut impl postgres::GenericClient,
+    heads: &[&str],
+) -> Result<i64, postgres::Error> {
+    let heads: Vec<String> = heads.iter().map(|head| head.to_string()).collect();
+    let ended: i64 = client
+        .query_one(
+            "SELECT count(*) FILTER (WHERE pg_terminate_backend(pid, $2))
+               FROM (SELECT DISTINCT l.pid
+                       FROM pg_locks l
+                      WHERE l.locktype = 'relation' AND l.granted
+                        AND l.pid <> pg_backend_pid()
+                        AND l.mode IN ('RowShareLock', 'RowExclusiveLock')
+                        AND l.relation = ANY (SELECT to_regclass(name)::oid
+                                                FROM unnest($1::text[]) AS name)) AS held",
+            &[&heads, &DEPOSED_GONE_WITHIN_MS],
+        )?
+        .get(0);
+    if ended > 0 {
+        tracing::warn!(
+            sessions = ended,
+            "ended the deposed writer's sessions still holding the head rows, so the takeover is not held up by them"
+        );
+    }
+    Ok(ended)
+}
+
 /// The deployment's clock, as the composition root hands it over: what a
 /// captured log dates each change by.
 static CLOCK: OnceLock<Arc<dyn meridian_clock::Clock>> = OnceLock::new();

@@ -1331,6 +1331,37 @@ async fn a_follower_given_the_journal_in_any_page_split_builds_the_writers_books
     }
 }
 
+/// A writer stopped mid-entry -- its node paused, its process frozen --
+/// holds the head row it took until its client moves again, and the server
+/// never hears it go: the takeover ends its session rather than wait on it
+/// (#99's ha run 42496994613: node-freeze's raise waited 35 s, under load).
+#[test]
+fn a_takeover_is_not_held_up_by_a_deposed_writer_stopped_mid_transaction() {
+    // Synchronous throughout: the stalled writer is a plain client, and a
+    // client dropped on an async runtime's worker cannot close itself.
+    let (url, writer) = isolated();
+    assert_eq!(writer.adopt().unwrap(), 1);
+    let mut stalled = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    stalled
+        .batch_execute("BEGIN; SELECT epoch FROM book_partition_head FOR UPDATE")
+        .unwrap();
+    let standby = PostgresStore::connect(&url, 1).unwrap();
+    let began = std::time::Instant::now();
+    assert_eq!(
+        standby
+            .take_over(&meridian_changes::TookOver::unnamed("a stalled writer"))
+            .unwrap(),
+        2
+    );
+    assert!(
+        began.elapsed() < std::time::Duration::from_secs(5),
+        "the takeover waited {:?} on the stalled writer",
+        began.elapsed()
+    );
+    // Its transaction ended with its session: nothing it does commits.
+    assert!(stalled.batch_execute("COMMIT").is_err());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_deposed_writers_command_is_refused_after_a_takeover_and_leaves_no_hole() {
     let (url, writer) = blocking(isolated);
