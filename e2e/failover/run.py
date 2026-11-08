@@ -33,15 +33,19 @@ nothing it writes is kept); `node` (the writer's node stopped);
 `network-policy` (a component cut from its database by a NetworkPolicy: the
 probe names the path and its address, and it heals with no restart);
 `zone` (HA only: every node of the zone holding the most writers stopped at
-once; every store answers again from another zone within the zone tier).
+once; every store answers again from another zone within the zone tier);
+`order-plugin` (the ems stand-in's pod's processes killed outright mid-flow:
+found not ready, registered again, and the book's orders and placements
+held to what it was told, none lost and none twice).
 
 The write driver (driver.py, step 3b part 5) writes through the stores for
 the whole run, from test-only plugin instances in the chart's sidecars[]
-set here at install: prices to the lake and orders to the book. After
-every class each acknowledged one is looked for in the stores' own rows --
-RPO through the stores, said in the claims of db-primary, torn-write, zone
-and reconfigure -- and the oms instance's history (invoke, ok, fail, info)
-is kept, for Elle (.e2e-failover-history.edn).
+set here at install: prices to the lake, orders to the book, and the ems
+stand-in's orders and placements. After every class each acknowledged one
+is looked for in the stores' own rows -- RPO through the stores, said in
+the claims of db-primary, torn-write, zone and reconfigure -- and the oms
+instance's history (invoke, ok, fail, info) is kept for Elle, which CI's
+ha failover job runs on it (tools/elle-check.sh).
 
 After the install and after every class, the record's own properties are
 held (ruling 1105): in each store's change log no sequence missing or
@@ -110,16 +114,22 @@ TLS = PROFILE == "ha"
 # reconfigure): up to ha, and back.
 RECONFIGURE = ["ha", "tolerant"]
 
-# The store-level write driver (step 3b part 5; driver.py): two test-only
-# plugin instances in the chart's sidecars[], set here at install and in no
-# values file, writing through the stores' own write paths for the whole
-# run: prices to the lake (data) and orders to the book (oms). What a class
-# lost is read in the stores' own rows against what each acknowledged.
+# The store-level write driver (step 3b part 5; driver.py): test-only plugin
+# instances in the chart's sidecars[], set here at install and in no values
+# file, writing through the stores' own write paths for the whole run:
+# prices to the lake (data), orders to the book (oms), and orders placed by
+# the ems stand-in (desk). What a class lost is read in the stores' own rows
+# against what each acknowledged.
 DRIVEN = PROFILE in ("tolerant", "ha", "reconfigure")
-DRIVERS = {"drive-data": "data", "drive-oms": "oms"}
+DRIVERS = {"drive-data": "data", "drive-oms": "oms", "drive-desk": "desk"}
+# What each instance is launched with: the ems stand-in (desk) holds oms and
+# ems, as e2e/orders/stand_in.py's desk does; it is the order-plugin class's
+# subject.
+DRIVER_ROLES = {"data": ["data"], "oms": ["oms"], "desk": ["oms", "ems"]}
 DRIVER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "driver.py")
 DRIVER_FIXTURES = ["e2e/book/instruments.sql", "e2e/failover/driver.sql"]
 DRIVER_ACCOUNTS = [f"ACC-DRIVE-{i:02d}" for i in range(12)]
+DESK_ACCOUNT = "ACC-DRIVE-DESK"
 DRIVER_INSTRUMENT = "LCL-01J8XQ4M7K00000000E2EAAPL"
 DRIVER_CASH = "LCL-01J8XQ4M7K000000000E2EUSD"
 # The run's signer, which vouches for the driver's person (a recorded order
@@ -136,10 +146,10 @@ HISTORY = os.environ.get("E2E_FAILOVER_HISTORY", ".e2e-failover-history.edn")
 
 DEFAULT_FAILURES = {
     "tolerant": ["lake-writer", "bor-writer", "network-policy", "db-primary", "broker",
-                 "bit-rot", "torn-write"],
+                 "bit-rot", "torn-write", "order-plugin"],
     "ha": ["lake-writer", "bor-writer", "street-writer", "instrument-writer",
            "split-brain", "node-freeze", "node", "zone", "network-policy", "db-primary", "broker",
-           "bit-rot", "torn-write", "volume-lost", "replica-rot"],
+           "bit-rot", "torn-write", "volume-lost", "replica-rot", "order-plugin"],
     "scaled": [],
     "reconfigure": [],
 }
@@ -697,19 +707,19 @@ def jetstream_rolled(s):
 # ── The write driver (step 3b part 5) ──────────────────────────────────────
 
 def driver_values():
-    """The driver's two instances as sidecars[] values: the SDK's interop
+    """The driver's instances as sidecars[] values: the SDK's interop
     image running driver.py, handed over whole as MERIDIAN_DRIVER by
     --set-file, so nothing of it is in a values file or an image."""
     sidecars = []
     for instance, role in DRIVERS.items():
-        sidecars.append({"instanceId": instance, "roles": [role], "plugin": {
+        sidecars.append({"instanceId": instance, "roles": DRIVER_ROLES[role], "plugin": {
             "image": INTEROP_IMAGE, "pullPolicy": "IfNotPresent",
             "args": ["python", "-c",
                      "import os; exec(compile(os.environ['MERIDIAN_DRIVER'], 'driver.py', 'exec'))"],
             "env": {"DRIVER_ROLE": role, "DRIVER_INSTRUMENT": DRIVER_INSTRUMENT, "DRIVER_CASH": DRIVER_CASH,
-                    "DRIVER_ACCOUNTS": ",".join(DRIVER_ACCOUNTS)},
+                    "DRIVER_ACCOUNTS": DESK_ACCOUNT if role == "desk" else ",".join(DRIVER_ACCOUNTS)},
         }})
-        if role == "oms":
+        if role != "data":
             sidecars[-1]["plugin"]["existingSecret"] = DRIVER_SIGNER
     path = os.path.join(tempfile.mkdtemp(prefix="failover-driver-"), "driver.json")
     with open(path, "w", encoding="utf-8") as kept:
@@ -886,6 +896,144 @@ def driver_history(s):
     s.check(counts.get("append ok", 0) > 0 and counts.get("read ok", 0) > 0,
             f"the driver's history kept for Elle in {HISTORY}: "
             + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
+
+
+# ── The order-plugin class (step 3b part 5) ────────────────────────────────
+
+# Proposed against 1048 and 1056: a plugin's pod lost is found by Kubernetes
+# within the order path's component tier, 10 s, in either profile; it is
+# back, registered again with its sidecar, within the tolerant bound for a
+# pod, 2 min (1056), and within the database tier, 30 s, in ha, where a
+# plugin has no standby of its own yet (spec section 2, item 7) and comes
+# back by restart there too. RPO is the record's: nothing it was told was
+# kept is lost, and nothing it sent twice is kept twice.
+ORDER_PLUGIN_DETECT = 10
+ORDER_PLUGIN_RECOVER = {"tolerant": 120, "ha": 30}
+
+
+def field_of(record, number):
+    """A protobuf message's string field, by number, read from its bytes
+    (the book keeps each order whole, as meridian.v1.Order): the first
+    one, or ''."""
+    at = 0
+
+    def varint():
+        nonlocal at
+        shift = value = 0
+        while True:
+            byte = record[at]
+            at += 1
+            value |= (byte & 0x7F) << shift
+            if not byte & 0x80:
+                return value
+            shift += 7
+    while at < len(record):
+        key = varint()
+        field, wire = key >> 3, key & 7
+        if wire == 0:
+            varint()
+        elif wire == 1:
+            at += 8
+        elif wire == 5:
+            at += 4
+        elif wire == 2:
+            size = varint()
+            if field == number:
+                return record[at:at + size].decode(errors="replace")
+            at += size
+        else:
+            return ""
+    return ""
+
+
+def desk_in_book():
+    """The ems stand-in's account as the book holds it: each order's number
+    (its venue order ID, Order field 32) and the placements of each."""
+    orders = {}
+    for line in psql(f"select order_id || ' ' || encode(record, 'hex') from book_order "
+                     f"where account_id = '{DESK_ACCOUNT}'").splitlines():
+        order_id, _, record = line.partition(" ")
+        orders[order_id] = field_of(bytes.fromhex(record), 32)
+    placements = {}
+    for line in psql(f"select placement_id || ' ' || order_id from book_placement "
+                     f"where account_id = '{DESK_ACCOUNT}'").splitlines():
+        placement_id, _, order_id = line.partition(" ")
+        placements.setdefault(order_id, []).append(placement_id)
+    return orders, placements
+
+
+def desk_acked():
+    acked = {}
+    for line in driver_file("drive-desk", "/tmp/acked").splitlines():
+        parts = line.split()
+        if len(parts) == 4 and parts[0] == "ACKED" and parts[3].isdigit():
+            acked.setdefault(parts[1], {})[parts[2]] = int(parts[3])
+    return acked
+
+
+def order_plugin(s):
+    """The ems stand-in's pod lost mid-flow (step 3b part 5): every process
+    in it killed outright from its node, its sidecar's and its plugin's, as
+    a pod's processes go when it is lost, and the pod kept, so what the
+    plugin kept and logged is read after. Detection is the pod not ready;
+    recovery, the plugin registered with its sidecar again; then the book's
+    changes held against what the stand-in was told: no order or placement
+    it was told was kept is missing, and none is in the book twice."""
+    instance = "drive-desk"
+    print("F: order-plugin: the ems stand-in's pod's processes killed outright, mid-flow", flush=True)
+    placed = lambda: len(desk_acked().get("placement", {}))
+    wait_for("the ems stand-in placing", lambda: placed() >= 3, seconds=300)
+    pod = driver_pod(instance)
+    before = restarts(pod)
+    began = time.time()
+    began_ms = int(began * 1000)
+    for container in ("plugin", "sidecar"):
+        crash(pod, container)
+
+    def found():
+        # Not ready, or already restarted by the kubelet that found it: a
+        # restart can be quicker than one look at the pod.
+        held = json.loads(out("get", "pod", pod, "-o", "json"))
+        return not ready(held) or sum(c.get("restartCount", 0)
+                                      for c in held["status"].get("containerStatuses", [])) > before
+    detected = happens(found, 60, every=0.2)
+    detect_s = time.time() - began
+    bound = ORDER_PLUGIN_RECOVER["tolerant" if PROFILE == "tolerant" else "ha"]
+
+    def registered():
+        return any(line.startswith("REGISTERED ") and int(line.split()[1]) > began_ms
+                   for line in driver_file(instance, "/tmp/registered").splitlines())
+    back = happens(registered, bound + 30, every=0.5)
+    recover_s = time.time() - began
+    s.check(detected, f"order-plugin: the pod not ready, found in {detect_s:.1f}s")
+    if not back:
+        s.check(False, f"order-plugin: the stand-in never registered again within {bound + 30}s")
+        return
+    placing = happens(lambda: any(at > began_ms for at in desk_acked().get("placement", {}).values()), 120, every=1)
+    s.check(placing, "order-plugin: the stand-in placing again after its restart")
+    acked = desk_acked()
+    orders, placements = desk_in_book()
+    lost = sorted([i for i in acked.get("order", {}) if i not in orders]
+                  + [i for i in acked.get("placement", {}) if not any(i in held for held in placements.values())])
+    numbers = {}
+    for order_id, number in orders.items():
+        numbers.setdefault(number, []).append(order_id)
+    twice = sorted([f"order {n}: {', '.join(ids)}" for n, ids in numbers.items() if len(ids) > 1]
+                   + [f"placements of {o}: {', '.join(ids)}" for o, ids in placements.items() if len(ids) > 1])
+    s.check(not lost, f"order-plugin: every order and placement the stand-in was told was kept is in the book "
+            f"({len(acked.get('order', {}))} orders, {len(acked.get('placement', {}))} placements; "
+            f"{len(lost)} lost{': ' + ', '.join(lost[:5]) if lost else ''})")
+    s.check(not twice, f"order-plugin: none is in the book twice ({len(twice)}{': ' + '; '.join(twice[:3]) if twice else ''})")
+    unplaced = sorted(o for o in orders if o not in placements)
+    claim(s, "order-plugin", "ems-plugin", recover_s, bound,
+          {"detected_s": round(detect_s, 2), "detect_bound_s": ORDER_PLUGIN_DETECT,
+           "orders_acknowledged": len(acked.get("order", {})),
+           "placements_acknowledged": len(acked.get("placement", {})),
+           "acknowledged_commits": len(acked.get("order", {})) + len(acked.get("placement", {})),
+           "rpo_commits_lost": len(lost), "duplicated": len(twice), "unplaced_after": len(unplaced)})
+    s.check(detected and detect_s <= ORDER_PLUGIN_DETECT,
+            f"order-plugin: detected within {ORDER_PLUGIN_DETECT}s ({detect_s:.1f}s)")
+    wait_for("the stand-in's pod ready", lambda: ready(json.loads(out("get", "pod", pod, "-o", "json"))), seconds=180)
 
 
 # ── Failure classes ────────────────────────────────────────────────────────
@@ -1902,6 +2050,7 @@ FAILURES = {
     "volume-lost": volume_lost,
     "zone": zone_lost,
     "replica-rot": replica_rot,
+    "order-plugin": order_plugin,
 }
 
 
