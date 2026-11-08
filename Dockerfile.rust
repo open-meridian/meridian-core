@@ -25,8 +25,30 @@ FROM rust:${RUST_VERSION}-slim-bookworm AS base
 # LLD on x86_64 Linux since 1.90; on aarch64 it still asks the C compiler,
 # whose default is bfd, and a Mac's gate runs here on aarch64.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git ca-certificates tzdata lld \
+ && apt-get install -y --no-install-recommends git ca-certificates tzdata lld curl \
  && rm -rf /var/lib/apt/lists/*
+# sccache (ruling 1104; step 3b part 4): the compiles CI runs from cold
+# fetch what an earlier run compiled from GitHub's cache, keyed by what
+# rustc is given. A pinned release, checked against its published digest.
+# Used only where a build is given GitHub's cache token, and only as a
+# BuildKit secret (tools/with-sccache.sh): a build without one -- every
+# laptop's -- compiles as it always has, and the token is in no layer.
+ARG TARGETARCH
+ARG SCCACHE_VERSION=0.18.0
+ARG SCCACHE_SHA256_AMD64=45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89
+ARG SCCACHE_SHA256_ARM64=2b3284d5da3b46a47dc4229e75bb7b88ac4aa99c8d754fb7d2f84997e5a4354a
+RUN case "${TARGETARCH}" in \
+      amd64) ARCH=x86_64; SUM="${SCCACHE_SHA256_AMD64}" ;; \
+      arm64) ARCH=aarch64; SUM="${SCCACHE_SHA256_ARM64}" ;; \
+      *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+ && curl -fsSL -o /tmp/sccache.tgz \
+      "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-${ARCH}-unknown-linux-musl.tar.gz" \
+ && echo "${SUM}  /tmp/sccache.tgz" | sha256sum -c - \
+ && tar -xzf /tmp/sccache.tgz -C /tmp \
+ && mv /tmp/sccache-*/sccache /usr/local/bin/sccache \
+ && rm -rf /tmp/sccache.tgz /tmp/sccache-*
+COPY tools/with-sccache.sh /usr/local/bin/with-sccache
 # Smaller build caches on the VM's one disk, which the gates and the dev
 # deployment share: no incremental state, which a fresh build never reuses
 # across stages, and line tables alone for debug builds and tests, so a
@@ -58,7 +80,11 @@ FROM base AS check
 RUN --mount=type=cache,id=meridian-core-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=meridian-core-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=meridian-core-target,target=/w/target \
-    fresh-sources cargo build --workspace --locked
+    --mount=type=secret,id=gha-runtime-token,required=false \
+    --mount=type=secret,id=gha-results-url,required=false \
+    --mount=type=secret,id=gha-cache-url,required=false \
+    --mount=type=secret,id=gha-cache-v2,required=false \
+    with-sccache fresh-sources cargo build --workspace --locked
 
 # Every test binary: each crate's unit tests and every integration test, in
 # one invocation with the whole workspace's features, as `test` always built
@@ -70,14 +96,40 @@ RUN --mount=type=cache,id=meridian-core-registry,target=/usr/local/cargo/registr
 # beside their services (docker-compose.yaml's `tests`), where each used to
 # compile the workspace again from nothing in a container's own layer.
 FROM check AS compile
+# cargo-nextest (ruling 1104; step 3b part 4), which run-tests runs every
+# test binary under: each test its own process, its result in JUnit (the
+# checks' test reports), a flaky one -- failed, then passed on its retry --
+# named as such. A pinned release, checked against its published digest.
+ARG NEXTEST_VERSION=0.9.149
+ARG NEXTEST_SHA256_AMD64=d65c7f14bcb5c1566d1ecd534c5da8dedb81ba58586e478b0ab81c877d2bd8ad
+ARG NEXTEST_SHA256_ARM64=533c9b431c2bb1dcb216e02e474263db0cdcd556373b72cc34830fb417058a6b
+RUN case "${TARGETARCH}" in \
+      amd64) ARCH=x86_64; SUM="${NEXTEST_SHA256_AMD64}" ;; \
+      arm64) ARCH=aarch64; SUM="${NEXTEST_SHA256_ARM64}" ;; \
+      *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+ && curl -fsSL -o /tmp/nextest.tgz \
+      "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${NEXTEST_VERSION}/cargo-nextest-${NEXTEST_VERSION}-${ARCH}-unknown-linux-musl.tar.gz" \
+ && echo "${SUM}  /tmp/nextest.tgz" | sha256sum -c - \
+ && tar -xzf /tmp/nextest.tgz -C /usr/local/bin \
+ && rm /tmp/nextest.tgz
+COPY .config/ .config/
 COPY tools/run-tests.sh /usr/local/bin/run-tests
 RUN --mount=type=cache,id=meridian-core-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=meridian-core-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=meridian-core-target,target=/w/target \
-    fresh-sources cargo test --workspace --locked --no-run --lib --test '*' \
+    --mount=type=secret,id=gha-runtime-token,required=false \
+    --mount=type=secret,id=gha-results-url,required=false \
+    --mount=type=secret,id=gha-cache-url,required=false \
+    --mount=type=secret,id=gha-cache-v2,required=false \
+    with-sccache fresh-sources cargo test --workspace --locked --no-run --lib --test '*' \
       --message-format=json-render-diagnostics >/tmp/compiled.json \
  && run-tests collect </tmp/compiled.json \
- && rm /tmp/compiled.json
+ && rm /tmp/compiled.json \
+ && with-sccache cargo nextest list --workspace --locked --lib --test '*' --list-type binaries-only \
+      --message-format json >/tests/binaries.json \
+ && cargo metadata --format-version 1 --locked \
+      --filter-platform "$(rustc -vV | sed -n 's/^host: //p')" >/tests/cargo-metadata.json
 RUN run-tests link
 
 # The unit tests, and the integration tests that stand up their own world

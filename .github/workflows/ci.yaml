@@ -355,12 +355,26 @@ jobs:
         working-directory: workspace/meridian-core
         run: tools/free-runner-disk.sh
 
+      # GitHub's cache for sccache (ruling 1104): the runtime's token and the
+      # cache service's addresses put in this job's environment, from which
+      # the Makefile hands them to Dockerfile.rust's compiles as BuildKit
+      # secrets alone (SCCACHE_SECRETS, tools/with-sccache.sh): in no layer,
+      # no build argument and no log. Pinned by commit (v3.1.0).
+      - uses: crazy-max/ghaction-github-runtime@3cb05d89e1f492524af3d41a1c98c83bc3025124
+
       - name: make ci-stage
         working-directory: workspace/meridian-core
         env:
           DOCKER_BUILDKIT: "1"
           STAGE: ${{ matrix.stage }}
         run: make -k ci-stage STAGE="$STAGE"
+
+      # What sccache did for the compile (ruling 1104): its requests, hits
+      # and misses, from the build's own log, or that it did not start.
+      - name: What sccache did
+        if: ${{ !cancelled() }}
+        working-directory: workspace/meridian-core
+        run: grep -E -A14 'with-sccache|Compile requests' .tests-image.log | cut -c1-200 || echo "sccache said nothing"
 
       - name: Say what the compile said
         if: failure()
@@ -392,6 +406,10 @@ jobs:
   stages:
     name: ci-local (${{ matrix.stage }})
     needs: [images, compile]
+    # checks: the test report below, a check of its own per leg (ruling 1104).
+    permissions:
+      contents: read
+      checks: write
     # Run even when a build failed, to fail by name here rather than be
     # skipped: GitHub counts a skipped required check as passed.
     if: ${{ !cancelled() }}
@@ -448,7 +466,30 @@ jobs:
           DOCKER_BUILDKIT: "1"
           STAGE: ${{ matrix.stage }}
           MERIDIAN_VERSION: ${{ needs.images.outputs.version }}
-        run: make -k ci-stage STAGE="$STAGE" IMAGES=pulled MERIDIAN_VERSION="$MERIDIAN_VERSION"
+        run: make -k ci-stage STAGE="$STAGE" IMAGES=pulled MERIDIAN_VERSION="$MERIDIAN_VERSION" NEXTEST_PROFILE=ci
+
+      # A test that failed and then passed on its retry (nextest's ci
+      # profile) named on the run and in its summary (tools/ci-flaky.py):
+      # flaky on this commit, never hidden by the retry (ruling 1104).
+      - name: Flaky tests, named
+        if: ${{ !cancelled() }}
+        working-directory: workspace/meridian-core
+        run: python3 tools/ci-flaky.py .junit
+
+      # Every test binary's results, as a check of their own (ruling 1104),
+      # from the JUnit nextest wrote (tools/run-tests.sh). Pinned by commit
+      # (v2.6.0).
+      - name: Test report
+        if: ${{ !cancelled() && hashFiles('workspace/meridian-core/.junit/*.xml') != '' }}
+        uses: dorny/test-reporter@3d76b34a4535afbd0600d347b09a6ee5deb3ed7f
+        with:
+          name: tests (${{ matrix.stage }})
+          # The repository is checked out below the workspace, and the
+          # action lists its files from where it is told it is.
+          working-directory: workspace/meridian-core
+          path: .junit/*.xml
+          reporter: java-junit
+          fail-on-error: false
 
       # What the services said, kept only when something failed. The e2e
       # targets write these beside the checkout and the runner names them on

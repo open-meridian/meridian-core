@@ -23,10 +23,16 @@
 #       back at the path cargo built it at, as a link to its copy.
 #
 #   run-tests.sh [--workspace | -p <package>...] [--lib] [--test <name>...] [-- <args>]
-#       Run the selected binaries as `cargo test` selects and runs them: every
-#       named target of every named package that has it, a test named that no
-#       package has refused, each binary from its package's directory, and the
-#       first that fails stopping the run with its status.
+#       Run the selected binaries as `cargo test` selects them: every named
+#       target of every named package that has it, a test named that no
+#       package has refused, and the first that fails stopping the run with
+#       its status. Each binary under cargo-nextest (ruling 1104; step 3b part
+#       4), from the binaries' list the compile stage kept: each test its own
+#       process, from its package's directory; its results in JUnit, copied
+#       to $MERIDIAN_JUNIT_DIR where that is set; and under NEXTEST_PROFILE=ci
+#       (CI's) a failed test run once more, a test that fails and then passes
+#       named flaky there. <args> are libtest's: filters, --ignored,
+#       --include-ignored, --exact, --nocapture.
 
 set -euo pipefail
 
@@ -49,8 +55,11 @@ if [ "${1:-}" = collect ]; then
           && ! grep -rqF "CARGO_BIN_EXE_$name\"" "$(dirname "$manifest")"; then
           continue
         fi
-        mkdir -p "$DIR/$pkg"
-        cp "$exe" "$DIR/$pkg/$name"
+        # Where cargo built it, under this directory's target/, so the
+        # binaries' list nextest reads finds it there (--target-dir-remap).
+        kept="$DIR/target/${exe#/w/target/}"
+        mkdir -p "$(dirname "$kept")"
+        cp "$exe" "$kept"
         printf '%s\t%s\t%s\t%s\t%s\n' "$pkg" "$kind" "$name" "$(dirname "$manifest")" "$exe"
       done >"$rows"
   [ -s "$rows" ] || { echo "run-tests: cargo reported no test executables" >&2; exit 1; }
@@ -64,7 +73,7 @@ if [ "${1:-}" = link ]; then
   while IFS=$'\t' read -r pkg kind name _ built; do
     [ "$kind" = bin ] || continue
     mkdir -p "$(dirname "$built")"
-    ln -sf "$DIR/$pkg/$name" "$built"
+    ln -sf "$DIR/target/${built#/w/target/}" "$built"
   done <"$MANIFEST"
   exit 0
 fi
@@ -99,16 +108,46 @@ for t in "${tests[@]+"${tests[@]}"}"; do
     || { echo "run-tests: no test target named $t" >&2; exit 101; }
 done
 
+# libtest's arguments as nextest takes them: filters stay filters.
+filters=() options=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --ignored) options+=(--run-ignored only) ;;
+    --include-ignored) options+=(--run-ignored all) ;;
+    --nocapture) options+=(--no-capture) ;;
+    --exact) filters+=(--exact) ;;
+    -*) echo "run-tests: libtest's '$1' is not one this runner passes on" >&2; exit 2 ;;
+    *) filters+=("$1") ;;
+  esac
+  shift
+done
+
+profile=${NEXTEST_PROFILE:-default}
 ran=0
 while IFS=$'\t' read -r -u 3 pkg kind name dir _; do
   [ $every = 1 ] || among "$pkg" "${packages[@]}" || continue
   case "$kind" in
-    lib) [ $lib = 1 ] || continue ;;
-    test) among "$name" "${tests[@]+"${tests[@]}"}" || continue ;;
+    lib) [ $lib = 1 ] || continue; id="$pkg" ;;
+    test) among "$name" "${tests[@]+"${tests[@]}"}" || continue; id="$pkg::$name" ;;
     *) continue ;;
   esac
   echo "     Running $pkg ($kind $name)" >&2
-  ( cd "$dir" && CARGO_MANIFEST_DIR="$dir" CARGO_PKG_NAME="$pkg" "$DIR/$pkg/$name" "$@" ) || exit $?
+  status=0
+  marker=$(mktemp)
+  cargo-nextest nextest run --binaries-metadata "$DIR/binaries.json" \
+    --cargo-metadata "$DIR/cargo-metadata.json" --target-dir-remap "$DIR/target" \
+    --workspace-remap /w --profile "$profile" --no-tests=pass -E "binary_id($id)" \
+    "${options[@]+"${options[@]}"}" ${filters[@]+-- "${filters[@]}"} || status=$?
+  # nextest keeps its JUnit in its store, under the target directory: the
+  # one cargo's metadata names or the one it was remapped to. The file
+  # written by this run, whichever.
+  if [ -n "${MERIDIAN_JUNIT_DIR:-}" ]; then
+    junit=$(find "$DIR/target/nextest" /w/target/nextest -path "*/$profile/junit.xml" \
+      -newer "$marker" 2>/dev/null | head -1 || true)
+    [ -z "$junit" ] || cp "$junit" "$MERIDIAN_JUNIT_DIR/$pkg.$kind.$name.xml" || true
+  fi
+  rm -f "$marker"
+  [ $status = 0 ] || exit $status
   ran=$((ran + 1))
 done 3<"$MANIFEST"
 

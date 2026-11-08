@@ -1,0 +1,28 @@
+# cargo-nextest, which tools/run-tests.sh runs every test binary under
+# (ruling 1104; step 3b part 4).
+
+[profile.default]
+# Each binary's results in JUnit, which run-tests copies out for the
+# checks' test reports.
+junit = { path = "junit.xml", store-success-output = false, store-failure-output = true }
+failure-output = "immediate-final"
+fail-fast = true
+
+# CI's: a test that fails is run once more, and one that then passes is
+# reported flaky in its JUnit (`flakyFailure`), which the checks flag
+# (tools/ci-flaky.py). A test that fails twice fails the run.
+[profile.ci]
+retries = 1
+junit = { path = "junit.xml", store-success-output = false, store-failure-output = true }
+failure-output = "immediate-final"
+fail-fast = true
+
+# The book's snapshot tests share one process's lock under libtest
+# (crates/bor/tests/postgres.rs, REBUILDS): under nextest each test is its
+# own process, so its binary's tests run one at a time instead.
+[test-groups]
+book-rebuilds = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'package(meridian-bor) & binary(postgres)'
+test-group = 'book-rebuilds'
