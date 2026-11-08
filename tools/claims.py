@@ -78,10 +78,15 @@ RULED = {
 }
 LAKE_RULED = (
     "Ruled 2026-11-08: in ha the lake loses at most ~5 s of rows when the "
-    "database's primary fails over (lake_seconds_bound). Its recovery path "
-    "-- the lake telling each data plugin the last row it holds per dataset, "
-    "the SDK's ~30 s replay buffer, and datasets that cannot be fetched again "
-    "committed synchronously -- lands in step 3c."
+    "database's primary fails over (lake_seconds_bound). Recovery lands in "
+    "step 3c; none of it is built yet. In ha, lake writes go through a "
+    "JetStream stream kept on three servers, and a data plugin's write is "
+    "acknowledged once the stream holds it. The lake's writer commits each "
+    "batch with its position in the stream in the same transaction, and after "
+    "a database failover resumes from that position, so no acknowledged row "
+    "is lost. Each dataset declares how it recovers: history fetched again "
+    "through the plugin's backfill, a buffer only, or not fetchable again; a "
+    "gap is marked on the dataset's quality state. Tolerant is unchanged."
 )
 
 
