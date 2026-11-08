@@ -157,9 +157,13 @@ def parse_map(text: str) -> list[tuple[str, list[str]]]:
 def plan(root: pathlib.Path, rules: list[tuple[str, list[str]]], always: list[str],
          order: list[str], paths: list[str] | None) -> tuple[list[str], list[str], list[str]]:
     """(stages in order, crates whose tests run, lines saying why)."""
-    by_dir, deps = workspace(root)
+    # A Cargo workspace's crates only where the map names them: the same
+    # tool serves the repositories with no Rust, or one crate.
+    uses_crates = any(s in (CRATE, WORKSPACE) for _, ss in rules for s in ss)
+    by_dir, deps = workspace(root) if uses_crates else ({}, {})
     every_stage = list(dict.fromkeys(always + [s for _, ss in rules for s in ss
-                                               if s not in (CRATE, WORKSPACE)] + [RUST]))
+                                               if s not in (CRATE, WORKSPACE)]
+                                     + ([RUST] if uses_crates else [])))
     why: dict[str, list[str]] = {s: ["every push"] for s in always}
     crates: set[str] = set()
     because: dict[str, str] = {}
@@ -272,6 +276,14 @@ def self_test() -> int:
             stages, tested, _ = plan(root, rules, ["checks"], order, paths)
             if stages != want_stages or tested != want_crates:
                 problems.append(f"{paths}: got {stages} {tested}, want {want_stages} {want_crates}")
+        stages, tested, _ = plan(root, parse_map("src/*=test docs/*=docs"), ["lint"],
+                                 ["lint", "test", "docs"], ["src/a.py", "README.md"])
+        if stages != ["lint", "test"] or tested != []:
+            problems.append(f"no crates: got {stages} {tested}")
+        stages, _, _ = plan(root, parse_map("src/*=test docs/*=docs"), ["lint"],
+                            ["lint", "test", "docs"], None)
+        if stages != ["lint", "test", "docs"]:
+            problems.append(f"no crates, no base: got {stages}")
     if filterset(["a", "b"]) != "package(a) | package(b)":
         problems.append("filterset")
     for p in problems:
