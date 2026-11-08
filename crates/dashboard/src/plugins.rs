@@ -269,6 +269,18 @@ fn client(pinned: &HashMap<String, SocketAddr>) -> Result<reqwest::Client, Strin
     for (name, at) in pinned {
         builder = builder.resolve(name, *at);
     }
+    // The front doors' certificates, where the deployment's internal TLS is
+    // on (ruling 1084): the chart makes them from its internal CA, and its
+    // front door address is then https.
+    if let Some(path) = meridian_changes::tls::internal_ca() {
+        let pem = std::fs::read(&path)
+            .map_err(|failed| format!("the internal CA at {path} is unreadable: {failed}"))?;
+        for certificate in reqwest::Certificate::from_pem_bundle(&pem)
+            .map_err(|failed| format!("the internal CA at {path} is not one: {failed}"))?
+        {
+            builder = builder.add_root_certificate(certificate);
+        }
+    }
     builder
         .build()
         .map_err(|failed| format!("the plugin client could not be built: {failed}"))

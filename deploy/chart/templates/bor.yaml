@@ -88,11 +88,14 @@ spec:
                   name: {{ include "meridian-runtime.brokerSecret" $ }}
                   key: {{ include "meridian-runtime.runtimeBrokerKey" (dict "Values" .Values "key" .Values.broker.borKey) }}
             {{- include "meridian-runtime.readyEnv" . | nindent 12 }}
+            {{- with (include "meridian-runtime.internalTlsEnv" .) }}{{ . | nindent 12 }}{{- end }}
           {{- include "meridian-runtime.readyProbe" . | nindent 10 }}
           volumeMounts:
             {{- include "meridian-runtime.readyMount" . | nindent 12 }}
+            {{- with (include "meridian-runtime.internalTlsMount" .) }}{{ . | nindent 12 }}{{- end }}
           resources:
             {{- toYaml (.Values.bor.resources | default .Values.resources) | nindent 12 }}
       volumes:
         {{- include "meridian-runtime.readyVolume" . | nindent 8 }}
+        {{- with (include "meridian-runtime.internalTlsVolume" .) }}{{ . | nindent 8 }}{{- end }}
 {{ include "meridian-runtime.memberBudget" (dict "top" $ "component" "bor" "values" $.Values.bor) }}

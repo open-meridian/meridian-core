@@ -904,3 +904,60 @@ under the pod's. Each takes a dict: top, role.
         path: key
 {{- end }}
 {{- end -}}
+
+{{/*
+Internal TLS (values.yaml's tls.internal; ruling 1084; templates/internal-
+tls.yaml). A client's three pieces -- the CA's certificate at
+MERIDIAN_INTERNAL_TLS_CA, its mount, its volume -- each nothing with it off,
+so every component that reaches the database or the broker includes all
+three beside its others. A server's certificate and key are its own pods'
+alone (internalTlsServerVolume, by server: database, broker, sidecars).
+*/}}
+{{- define "meridian-runtime.internalTlsEnv" -}}
+{{- if .Values.tls.internal.enabled }}
+- name: MERIDIAN_INTERNAL_TLS_CA
+  value: /etc/meridian-internal-tls/ca.crt
+{{- end }}
+{{- end -}}
+
+{{- define "meridian-runtime.internalTlsMount" -}}
+{{- if .Values.tls.internal.enabled }}
+- name: internal-tls-ca
+  mountPath: /etc/meridian-internal-tls
+  readOnly: true
+{{- end }}
+{{- end -}}
+
+{{- define "meridian-runtime.internalTlsVolume" -}}
+{{- if .Values.tls.internal.enabled }}
+- name: internal-tls-ca
+  secret:
+    secretName: {{ include "meridian-runtime.fullname" . }}-internal-tls-ca
+    items:
+      - key: ca.crt
+        path: ca.crt
+{{- end }}
+{{- end -}}
+
+{{/* A server's own certificate, key and the CA: a dict, top and server. */}}
+{{- define "meridian-runtime.internalTlsServerVolume" -}}
+{{- if .top.Values.tls.internal.enabled }}
+- name: internal-tls-server
+  secret:
+    secretName: {{ include "meridian-runtime.fullname" .top }}-internal-tls-{{ .server }}
+    # Readable by the pod's group, as the dashboard's signing key is: a
+    # server that runs as its own user is given the group (fsGroup).
+    defaultMode: 0440
+{{- end }}
+{{- end -}}
+
+{{/* libpq's own variables, for a container whose tools are psql and
+pg_dump: verified against the internal CA by the name connected to. */}}
+{{- define "meridian-runtime.internalTlsLibpqEnv" -}}
+{{- if .Values.tls.internal.enabled }}
+- name: PGSSLMODE
+  value: verify-full
+- name: PGSSLROOTCERT
+  value: /etc/meridian-internal-tls/ca.crt
+{{- end }}
+{{- end -}}

@@ -136,22 +136,29 @@ spec:
             {{- end }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
-          {{- if and $backups $b.path }}
+            {{- with (include "meridian-runtime.internalTlsEnv" $) }}{{ . | nindent 12 }}{{- end }}
+          {{- if or (and $backups $b.path) .Values.tls.internal.enabled }}
           volumeMounts:
+            {{- if and $backups $b.path }}
             - name: backups
               mountPath: /backups
               readOnly: true
+            {{- end }}
+            {{- with (include "meridian-runtime.internalTlsMount" $) }}{{ . | nindent 12 }}{{- end }}
           {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
-      {{- if and $backups $b.path }}
-      {{/* Only the chart's own backup volume, a node directory every pod
-           may share; a claim of the administrator's own may be one that
-           only one pod at a time can hold, which a hook must never wait on. */}}
+      {{- if or (and $backups $b.path) .Values.tls.internal.enabled }}
       volumes:
+        {{- if and $backups $b.path }}
+        {{/* Only the chart's own backup volume, a node directory every pod
+             may share; a claim of the administrator's own may be one that
+             only one pod at a time can hold, which a hook must never wait on. */}}
         - name: backups
           persistentVolumeClaim:
             claimName: {{ printf "%s-backup" (include "meridian-runtime.fullname" .) }}
             readOnly: true
+        {{- end }}
+        {{- with (include "meridian-runtime.internalTlsVolume" $) }}{{ . | nindent 8 }}{{- end }}
       {{- end }}
 {{- end }}

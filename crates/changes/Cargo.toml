@@ -19,6 +19,10 @@ serde_json.workspace = true
 # Rust, with no other dependency; the frame format is not needed.
 lz4_flex = { version = "0.11", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
 tracing.workspace = true
+# Internal TLS (ruling 1084): the one Postgres connector (`tls`).
+rustls.workspace = true
+tokio-postgres-rustls.workspace = true
+webpki-roots.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }

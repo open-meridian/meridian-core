@@ -102,7 +102,12 @@ fn run() -> Result<(), String> {
             let at: std::net::SocketAddr = address
                 .parse()
                 .map_err(|failed| format!("{address} is not an address: {failed}"))?;
-            Some((at, verifier))
+            // Over TLS where the deployment's internal TLS is on (ruling
+            // 1084): the chart's certificate for the sidecars' names, and
+            // nothing in the clear.
+            let tls = meridian_changes::tls::server_config()?
+                .map(|config| tokio_rustls::TlsAcceptor::from(Arc::new(config)));
+            Some((at, verifier, tls))
         }
     };
 
@@ -159,13 +164,13 @@ fn run() -> Result<(), String> {
 
             let door = match front {
                 None => None,
-                Some((at, verifier)) => {
+                Some((at, verifier, tls)) => {
                     let door = FrontDoor::new(Arc::clone(&sidecar), verifier)?;
                     let listener = tokio::net::TcpListener::bind(at)
                         .await
                         .map_err(|failed| format!("the front door could not bind {at}: {failed}"))?;
-                    tracing::info!(%at, "the front door is open to the dashboard");
-                    Some(axum::serve(listener, front_door::router(door)))
+                    tracing::info!(%at, tls = tls.is_some(), "the front door is open to the dashboard");
+                    Some(serve_door(listener, front_door::router(door), tls))
                 }
             };
             let front_door = async {
@@ -204,4 +209,36 @@ fn run() -> Result<(), String> {
                 }
             }
         })
+}
+
+/// The front door served: over TLS where the deployment's internal TLS is
+/// on, each connection's handshake its own task so one slow client holds up
+/// no other; in the clear, as axum serves it, otherwise.
+fn serve_door(
+    listener: tokio::net::TcpListener,
+    router: axum::Router,
+    tls: Option<tokio_rustls::TlsAcceptor>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>> {
+    let Some(tls) = tls else {
+        return Box::pin(async move { axum::serve(listener, router).await });
+    };
+    Box::pin(async move {
+        loop {
+            let (stream, _) = listener.accept().await?;
+            let tls = tls.clone();
+            let service = hyper_util::service::TowerToHyperService::new(router.clone());
+            tokio::spawn(async move {
+                // A client that does not speak TLS -- plaintext, the
+                // refusal internal TLS promises -- ends here.
+                let Ok(stream) = tls.accept(stream).await else {
+                    return;
+                };
+                let _ = hyper_util::server::conn::auto::Builder::new(
+                    hyper_util::rt::TokioExecutor::new(),
+                )
+                .serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(stream), service)
+                .await;
+            });
+        }
+    })
 }

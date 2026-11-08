@@ -472,6 +472,27 @@ ingress:
     # then has to cover both.
     pluginsSecretName: ""
 
+# TLS on the deployment's own paths inside the cluster (ruling 1084): every
+# store's, the dashboard's and the Jobs' connections to the database this
+# chart brings, every component's and sidecar's to the broker, the brokers'
+# routes to each other, Patroni's standbys streaming from their primary, and
+# the dashboard's requests to each plugin's front door. Off by default: the
+# desktop's one node has none of these paths on a network.
+#
+# On, the chart makes a CA of its own and each server's certificate from it
+# (kept across upgrades, as the WAL archive's are), gives every client the
+# CA's certificate, and a plaintext connection is refused, not merely
+# discouraged: the database admits TLS alone (pg_hba's hostssl, every other
+# remote line rejected), the broker refuses a client that does not speak it,
+# and a front door serves nothing in the clear. A database somebody else runs
+# (database.brought.enabled false, or another chosen in the wizard) is then
+# reached over TLS too, verified against the public roots and this CA: one
+# that offers no TLS is refused. Patroni's REST API between members stays as
+# it is, behind its NetworkPolicy and its password.
+tls:
+  internal:
+    enabled: false
+
 # The dashboard: the one address staff use. Signs people in through the firm's
 # directory over OpenID Connect; a SAML or LDAP directory is brokered by a
 # directory that speaks it. Browser sessions, plugin pages' sessions and

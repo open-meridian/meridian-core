@@ -269,6 +269,7 @@ spec:
                   value: {{ join " " $maps | quote }}
                 - name: MERIDIAN_BACKUP_KEY
                   value: {{ ternary "generated" "secret" (not (empty $generated)) }}
+                {{- with (include "meridian-runtime.internalTlsLibpqEnv" .) }}{{ . | nindent 16 }}{{- end }}
               volumeMounts:
                 - name: backups
                   mountPath: /backups
@@ -294,6 +295,7 @@ spec:
                   mountPath: /in/configmaps/{{ $map }}
                   readOnly: true
                 {{- end }}
+                {{- with (include "meridian-runtime.internalTlsMount" .) }}{{ . | nindent 16 }}{{- end }}
               resources:
                 requests:
                   cpu: 50m
@@ -364,4 +366,5 @@ spec:
                 name: {{ $map | quote }}
                 optional: true
             {{- end }}
+            {{- with (include "meridian-runtime.internalTlsVolume" .) }}{{ . | nindent 12 }}{{- end }}
 {{- end }}

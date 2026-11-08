@@ -178,6 +178,7 @@ spec:
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
             {{- include "meridian-runtime.readyEnv" . | nindent 12 }}
+            {{- with (include "meridian-runtime.internalTlsEnv" .) }}{{ . | nindent 12 }}{{- end }}
           {{- include "meridian-runtime.readyProbe" . | nindent 10 }}
           # No port and no Service. It speaks outward over HTTPS and inward over
           # the broker; nothing needs to reach it.
@@ -198,6 +199,7 @@ spec:
               readOnly: true
             {{- end }}
             {{- include "meridian-runtime.readyMount" . | nindent 12 }}
+            {{- with (include "meridian-runtime.internalTlsMount" .) }}{{ . | nindent 12 }}{{- end }}
             {{- if include "meridian-runtime.generatedKey" . }}
             # The key this component made, in a volume only it mounts. Writable,
             # because the first start is what creates the pair; after that
@@ -209,6 +211,7 @@ spec:
             {{- toYaml .Values.resources | nindent 12 }}
       volumes:
         {{- include "meridian-runtime.readyVolume" . | nindent 8 }}
+        {{- with (include "meridian-runtime.internalTlsVolume" .) }}{{ . | nindent 8 }}{{- end }}
         {{- if and .Values.registry.enabled .Values.registries.platformKeys }}
         - name: platform-keys
           configMap:

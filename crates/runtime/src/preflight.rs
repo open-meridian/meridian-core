@@ -637,13 +637,16 @@ fn read_only(store: &str, url: &str, deadline: Instant) -> Result<postgres::Clie
         .parse()
         .map_err(|failed| format!("its URL is unreadable: {}", with_causes(&failed)))?;
     config.connect_timeout(CONNECT_TIMEOUT);
+    let (config, tls) =
+        meridian_changes::tls::secured(config, meridian_changes::tls::names_ssl_mode(url))
+            .map_err(|failed| format!("the database's TLS: {failed}"))?;
     let mut client = answering(
         &format!("the {store}'s database"),
         deadline,
         crate::WAIT_AGAIN_AFTER,
         || {
             config
-                .connect(postgres::NoTls)
+                .connect(tls.clone())
                 .map_err(|failed| with_causes(&failed))
         },
     )?;

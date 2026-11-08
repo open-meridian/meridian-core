@@ -108,6 +108,10 @@ mod serve {
         jetstream: String,
         /// Where JetStream keeps it: the server's own volume.
         jetstream_store: String,
+        /// The directory of this server's certificate, key and the
+        /// internal CA, where the deployment's internal TLS is on; empty
+        /// for none (ruling 1084).
+        tls: String,
     }
 
     fn args() -> Result<Args, String> {
@@ -122,6 +126,7 @@ mod serve {
             routes: Vec::new(),
             jetstream: String::new(),
             jetstream_store: "/data/jetstream".into(),
+            tls: String::new(),
         };
         let mut args = std::env::args().skip(2);
         while let Some(argument) = args.next() {
@@ -141,6 +146,7 @@ mod serve {
                 "--route" => parsed.routes.push(value),
                 "--jetstream" => parsed.jetstream = value,
                 "--jetstream-store" => parsed.jetstream_store = value,
+                "--tls" => parsed.tls = value,
                 "--every" => {
                     parsed.every = Duration::from_secs(
                         value
@@ -169,12 +175,14 @@ mod serve {
     /// The header, with this server's cluster and JetStream where it has them.
     fn header(args: &Args) -> String {
         format!(
-            "{HEADER}{}",
+            "{HEADER}{}{}",
+            super::secured(&args.tls),
             super::clustered(
                 &args.cluster,
                 &args.routes,
                 &args.jetstream,
-                &args.jetstream_store
+                &args.jetstream_store,
+                &args.tls,
             )
         )
     }
@@ -342,7 +350,34 @@ mod serve {
 /// them -- rejoins with what it held. Held in memory, a rolling restart left
 /// the three answering "no suitable peers for placement" for twelve minutes
 /// (CI 42294258528).
-fn clustered(cluster: &str, routes: &[String], jetstream: &str, store: &str) -> String {
+/// TLS on every connection to this server, where the deployment's internal
+/// TLS is on (the chart's `tls.internal.enabled`; ruling 1084): its
+/// certificate and key from `dir`, made by the chart from the internal CA.
+/// A server with `tls` refuses a client that does not speak it, so a
+/// plaintext connection is refused, not merely discouraged. Nothing for
+/// none.
+fn secured(dir: &str) -> String {
+    if dir.is_empty() {
+        return String::new();
+    }
+    format!(
+        "# Internal TLS (ruling 1084): every client over TLS, or not at all.\n\
+         tls {{\n{}}}\n\n",
+        tls_block(dir)
+    )
+}
+
+/// The certificate, key and CA of a `tls` block, under `dir`.
+fn tls_block(dir: &str) -> String {
+    format!(
+        "  cert_file: {:?}\n  key_file: {:?}\n  ca_file: {:?}\n  timeout: 2\n",
+        format!("{dir}/tls.crt"),
+        format!("{dir}/tls.key"),
+        format!("{dir}/ca.crt"),
+    )
+}
+
+fn clustered(cluster: &str, routes: &[String], jetstream: &str, store: &str, tls: &str) -> String {
     let mut said = String::new();
     if !cluster.is_empty() {
         said.push_str(
@@ -358,7 +393,17 @@ fn clustered(cluster: &str, routes: &[String], jetstream: &str, store: &str) -> 
         for route in routes {
             said.push_str(&format!("    ${route}\n"));
         }
-        said.push_str("  ]\n}\n\n");
+        said.push_str("  ]\n");
+        if !tls.is_empty() {
+            // The routes between servers too, each verified by the name
+            // its route gives it.
+            said.push_str("  tls {\n");
+            for line in tls_block(tls).lines() {
+                said.push_str(&format!("  {line}\n"));
+            }
+            said.push_str("  }\n");
+        }
+        said.push_str("}\n\n");
     }
     if !jetstream.is_empty() {
         said.push_str(&format!(
@@ -525,12 +570,12 @@ mod tests {
 
     #[test]
     fn a_server_alone_says_no_cluster_and_three_say_one_with_no_password() {
-        assert_eq!(super::clustered("", &[], "", "/data/jetstream"), "");
+        assert_eq!(super::clustered("", &[], "", "/data/jetstream", ""), "");
         let routes = [
             "MERIDIAN_NATS__ROUTE_0".to_string(),
             "MERIDIAN_NATS__ROUTE_1".to_string(),
         ];
-        let said = super::clustered("b", &routes, "256MB", "/data/jetstream");
+        let said = super::clustered("b", &routes, "256MB", "/data/jetstream", "");
         assert!(said.contains("server_name: $MERIDIAN_BROKER_SERVER_NAME\n"));
         assert!(said.contains("cluster {\n  name: \"b\"\n"));
         assert!(said.contains("password: $MERIDIAN_NATS__ROUTES\n"));
@@ -544,5 +589,21 @@ mod tests {
         assert!(said.contains("max_memory_store: 16MB\n"));
         // The routes are variables: no credential is in the file.
         assert!(!said.contains('@'));
+        assert!(!said.contains("tls {"));
+    }
+
+    #[test]
+    fn internal_tls_puts_every_client_and_route_on_tls_and_none_says_nothing() {
+        assert_eq!(super::secured(""), "");
+        let said = super::secured("/etc/meridian-tls");
+        assert!(said.starts_with("# Internal TLS"));
+        assert!(said.contains("tls {\n  cert_file: \"/etc/meridian-tls/tls.crt\"\n"));
+        assert!(said.contains("  key_file: \"/etc/meridian-tls/tls.key\"\n"));
+        assert!(said.contains("  ca_file: \"/etc/meridian-tls/ca.crt\"\n"));
+        // No allow_non_tls: a server with tls refuses a plaintext client.
+        assert!(!said.contains("allow_non_tls"));
+        let routes = ["MERIDIAN_NATS__ROUTE_0".to_string()];
+        let clustered = super::clustered("b", &routes, "", "/data/jetstream", "/etc/meridian-tls");
+        assert!(clustered.contains("  ]\n  tls {\n    cert_file: \"/etc/meridian-tls/tls.crt\"\n"));
     }
 }

@@ -136,7 +136,10 @@ fn database(url: &str, record: Option<&str>) -> Value {
     // A session, and what it is asked, never waited on past twice the
     // bound: a primary being replaced can take a connection and not answer.
     let record = record.map(str::to_string);
-    let session = within(WITHIN * 2, move || session(config, record.as_deref()));
+    let named = meridian_changes::tls::names_ssl_mode(url);
+    let session = within(WITHIN * 2, move || {
+        session(config, named, record.as_deref())
+    });
     match session {
         Some(Ok(said)) => {
             for (key, value) in said {
@@ -163,10 +166,14 @@ fn database(url: &str, record: Option<&str>) -> Value {
 /// is a primary, and the record's last scrub and findings.
 fn session(
     mut config: postgres::Config,
+    named: bool,
     record: Option<&str>,
 ) -> Result<Vec<(&'static str, Value)>, String> {
     config.connect_timeout(WITHIN);
-    let mut client = config.connect(postgres::NoTls).map_err(|failed| {
+    // Over TLS where the deployment's internal TLS is on (ruling 1084).
+    let (config, tls) = meridian_changes::tls::secured(config, named)
+        .map_err(|failed| format!("the database's TLS: {failed}"))?;
+    let mut client = config.connect(tls).map_err(|failed| {
         failed
             .as_db_error()
             .map_or(failed.to_string(), |e| e.message().to_string())

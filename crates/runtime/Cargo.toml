@@ -71,6 +71,11 @@ meridian-first-run = { path = "../first-run" }
 meridian-analytics = { path = "../analytics" }
 meridian-analytics-engine = { path = "../analytics-engine" }
 axum.workspace = true
+# A plugin's front door over TLS where internal TLS is on (ruling 1084):
+# the connections axum's own server takes, behind a TLS handshake. Both in
+# the tree already, through reqwest and axum.
+tokio-rustls.workspace = true
+hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio", "service", "http1", "http2"] }
 meridian-sidecar = { path = "../sidecar" }
 meridian-pb.workspace = true
 meridian-domain.workspace = true

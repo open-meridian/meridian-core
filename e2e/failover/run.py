@@ -86,6 +86,11 @@ HA_DATABASE = {"bor": 30, "lake": 30}
 # over within 2 min.
 HA_ZONE = 120
 
+# Internal TLS (ruling 1084; tls.internal.enabled) in the ha run: every
+# class there is injected with every store, Job and member on TLS, and
+# after the install a plaintext connection is shown refused (internal_tls).
+TLS = PROFILE == "ha"
+
 # The live install moved between the profiles, in order (e2e-cluster-
 # reconfigure): up to ha, and back.
 RECONFIGURE = ["ha", "tolerant"]
@@ -342,6 +347,8 @@ def install(s):
         # the dashboard and analytics at two.
         if PROFILE != "reconfigure":
             values += ["--set", "resilience.profile=ha"]
+        if TLS:
+            values += ["--set", "tls.internal.enabled=true"]
         values += ["--set", "zones={" + ",".join(ZONES) + "}"]
         values += ["--set", f"database.brought.patroniImage={POSTGRES_IMAGE}"]
     run("helm", "install", RELEASE, CHART, "--namespace", NAMESPACE, "--create-namespace", *values)
@@ -455,6 +462,51 @@ def first_run(s):
     kubectl("delete", "rolebinding", env["MERIDIAN_FIRST_RUN_BINDING"], "--ignore-not-found")
     wait_for("every component ready", all_ready, seconds=900)
     s.check(True, "first run applied; every component ready")
+
+
+def internal_tls(s):
+    """Internal TLS on (ruling 1084): every store's connection to the
+    database over TLS, and a plaintext one refused, by the database and by
+    the broker; a TLS one verified against the chart's CA by the name the
+    stores use."""
+    print("T: internal TLS: plaintext refused", flush=True)
+    host = f"{FULL}-database.{NAMESPACE}.svc.cluster.local"
+    member = primary()
+
+    def connects(mode):
+        script = (f'PGPASSWORD="${{PATRONI_SUPERUSER_PASSWORD:-$POSTGRES_PASSWORD}}" '
+                  f'psql "host={host} dbname=meridian user=postgres {mode} connect_timeout=5" '
+                  "-X -At -c 'select ssl from pg_stat_ssl where pid = pg_backend_pid()' 2>&1")
+        done = kubectl("exec", member, "-c", "postgres", "--", "sh", "-c", script, check=False)
+        return done.returncode, done.stdout.decode(errors="replace").strip()
+
+    code, said = connects("sslmode=disable")
+    s.check(code != 0 and "no encryption" in said,
+            "the database refuses a plaintext connection from another pod's address "
+            f"({said.splitlines()[-1] if said else 'nothing said'})")
+    code, said = connects("sslmode=verify-full sslrootcert=/run/meridian-tls/ca.crt")
+    s.check(code == 0 and said == "t",
+            "the database serves TLS under the chart's CA, verified by the stores' name for it")
+    # Every serving connection from a store over TLS, none in the clear.
+    counted = psql("select coalesce(sum(case when s.ssl then 1 else 0 end), 0) || ' ' || "
+                   "coalesce(sum(case when s.ssl then 0 else 1 end), 0) "
+                   "from pg_stat_activity a join pg_stat_ssl s using (pid) "
+                   "where a.usename in ('meridian_app', 'meridian_migrate') "
+                   "and a.client_addr is not null")
+    secured, clear = (int(n) for n in counted.split())
+    s.check(secured > 0 and clear == 0,
+            f"the stores' connections: {secured} over TLS, {clear} in the clear")
+    # The broker: a client that does not speak TLS gets no further than the
+    # server's greeting, which says it is required.
+    broker = f"{FULL}-broker.{NAMESPACE}.svc.cluster.local"
+    script = (f"(printf 'CONNECT {{\"verbose\":false}}\\r\\nPING\\r\\n'; sleep 2) "
+              f"| nc -w 4 {broker} 4222 2>&1")
+    said = kubectl("exec", member, "-c", "postgres", "--", "sh", "-c", script,
+                   check=False).stdout.decode(errors="replace")
+    s.check('"tls_required":true' in said and "PONG" not in said,
+            "the broker requires TLS of every client and answers a plaintext one nothing "
+            f"({'tls_required' if 'tls_required' in said else 'no greeting'}"
+            f"{', PONG' if 'PONG' in said else ''})")
 
 
 def all_ready():
@@ -1428,6 +1480,8 @@ def main():
     print(f"A: installed in the {PROFILE} profile", flush=True)
     install(s)
     first_run(s)
+    if TLS:
+        internal_tls(s)
     if PROFILE in ("ha", "scaled"):
         shape(s)
     properties(s, "the install")
