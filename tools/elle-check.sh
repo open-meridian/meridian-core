@@ -25,7 +25,12 @@ history="$1"
 tools="$2"
 [ -n "${GITHUB_ACTIONS:-}" ] || { echo "elle-check: runs in CI's ha failover job only (ruling of 2026-11-07)" >&2; exit 2; }
 ELLE_ZIP="elle-cli-bin-0.1.11.zip"
-JVM="eclipse-temurin:21.0.8_9-jre-alpine@sha256:990397e0495ac088ab6ee3d949a2e97b715a134d8b96c561c5d130b3786a489d"
+# The JDK image of the release the brief pinned, not its JRE: the JRE is
+# linked without jdk.random (49 modules against the JDK's 69), and Jepsen's
+# random numbers are L64X128MixRandom, which only jdk.random provides (#99's
+# first ha run: "No implementation of the random number generator
+# algorithm"; its second: "Module jdk.random not found").
+JVM="eclipse-temurin:21.0.8_9-jdk-alpine@sha256:89517925fa675c6c4b770bee7c44d38a7763212741b0d6fca5a5103caab21a97"
 [ -s "$history" ] || { echo "elle-check FAILED: no history at $history" >&2; exit 1; }
 [ -f "$tools/$ELLE_ZIP" ] || { echo "elle-check FAILED: $ELLE_ZIP is not in $tools (tools/ci-tools.sh fetch)" >&2; exit 1; }
 work="$(mktemp -d)"
@@ -42,11 +47,9 @@ printf 'elle-check: %s operations, %s acknowledged appends, %s reads\n' \
 	"$(grep -c ':type :ok, :f :txn, :value \[\[:append' "$work/history.edn" || true)" \
 	"$(grep -c ':type :ok, :f :txn, :value \[\[:r' "$work/history.edn" || true)"
 
-# elle-cli prints each file, a tab, and true, false or unknown. Jepsen's
-# random numbers are L64X128MixRandom, which only jdk.random provides; the
-# JRE image holds it, and a jar on the class path resolves it only when
-# named (#99's first run: "No implementation of the random number
-# generator algorithm").
+# elle-cli prints each file, a tab, and true, false or unknown. jdk.random
+# named, as a jar on the class path resolves a module exporting nothing
+# only by service binding.
 verdict() {
 	docker run --rm --network none -v "$work":/w:ro "$JVM" \
 		java --add-modules jdk.random -jar /w/elle-cli.jar --model list-append --consistency-models strict-serializable \
