@@ -83,6 +83,13 @@ jobs:
         working-directory: workspace/meridian-core
         run: tools/free-runner-disk.sh
 
+      # The tools its builds fetch from GitHub's releases, from GitHub's
+      # cache where a run kept them (tools/ci-tools.txt): a release-download
+      # outage is no verdict on a change.
+      - uses: ./workspace/meridian-core/.github/actions/ci-tools
+        with:
+          tools: sccache nextest cargo-deny protoc
+
       # build, test and lint each run in Dockerfile.rust at the pinned toolchain.
       # No Rust is installed on the runner, deliberately: the container is the
       # only place a version is chosen.
@@ -266,6 +273,17 @@ jobs:
         continue-on-error: true
         run: tools/ci-cargo-cache.sh put "$RUNNER_TEMP/cargo"
 
+      - uses: ./workspace/meridian-core/.github/actions/ci-tools
+        with:
+          tools: sccache
+
+      # GitHub's cache for sccache in the release build (ruling 1104; step 3b
+      # part 5), as the compile job's: the runtime's token and the cache
+      # service's addresses, handed to the build as BuildKit secrets alone
+      # (the Makefile's SCCACHE_SECRETS, tools/with-sccache.sh). Pinned by
+      # commit (v3.1.0).
+      - uses: crazy-max/ghaction-github-runtime@3cb05d89e1f492524af3d41a1c98c83bc3025124
+
       - name: make ci-stage
         working-directory: workspace/meridian-core
         env:
@@ -357,6 +375,13 @@ jobs:
       - name: Free the runner's disk
         working-directory: workspace/meridian-core
         run: tools/free-runner-disk.sh
+
+      # The tools its builds fetch from GitHub's releases, from GitHub's
+      # cache where a run kept them (tools/ci-tools.txt): a release-download
+      # outage is no verdict on a change.
+      - uses: ./workspace/meridian-core/.github/actions/ci-tools
+        with:
+          tools: sccache nextest
 
       # GitHub's cache for sccache (ruling 1104): the runtime's token and the
       # cache service's addresses put in this job's environment, from which
@@ -462,6 +487,13 @@ jobs:
         with:
           artifacts: ${{ matrix.artifacts }}
           names: ${{ matrix.images }}
+
+      # The tools its builds fetch from GitHub's releases, from GitHub's
+      # cache where a run kept them (tools/ci-tools.txt): a release-download
+      # outage is no verdict on a change.
+      - uses: ./workspace/meridian-core/.github/actions/ci-tools
+        with:
+          tools: sccache nextest
 
       - name: make ci-stage
         working-directory: workspace/meridian-core
@@ -724,16 +756,19 @@ jobs:
       - uses: ./workspace/meridian-core/.github/actions/gate-images
         with:
           artifacts: images cluster-images
-          names: ${{ matrix.target == 'e2e-cluster-backup' && 'runtime analytics backup-cli' || 'runtime analytics' }}
+          # The failover and reconfigure runs' write driver runs in the
+          # SDK's interop image (e2e/failover/driver.py).
+          names: ${{ matrix.target == 'e2e-cluster-backup' && 'runtime analytics backup-cli' || ((matrix.target == 'e2e-cluster-failover' || matrix.target == 'e2e-cluster-reconfigure') && 'runtime analytics interop' || 'runtime analytics') }}
 
       # Pinned, and checked against the release's own checksum, rather than
-      # piping an install script from a branch into a shell.
+      # piping an install script from a branch into a shell; from GitHub's
+      # cache where a run kept it (tools/ci-tools.txt).
+      - uses: ./workspace/meridian-core/.github/actions/ci-tools
+        with:
+          tools: k3d
+
       - name: k3d
-        run: |
-          set -euo pipefail
-          curl -fsSL --retry 6 --retry-all-errors --retry-delay 10 --retry-max-time 300 -o /tmp/k3d https://github.com/k3d-io/k3d/releases/download/v5.9.0/k3d-linux-amd64
-          echo "06d8f25bc3a971c4eb29e0ff08429b180402db0f4dec838c9eac427e296800a0  /tmp/k3d" | sha256sum -c -
-          sudo install -m 0755 /tmp/k3d /usr/local/bin/k3d
+        run: sudo install -m 0755 "$CI_TOOLS/k3d-linux-amd64" /usr/local/bin/k3d
 
       # Helm 4 for the upgrade: its --wait waits for every resource a release
       # names to exist, and failed an upgrade that Helm 3's passed. The
@@ -770,6 +805,17 @@ jobs:
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 90
+
+      - name: Keep the driver's history
+        if: (matrix.target == 'e2e-cluster-failover' || matrix.target == 'e2e-cluster-reconfigure') && !cancelled()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target == 'e2e-cluster-reconfigure' && 'reconfigure-history' || format('failover-history-{0}', matrix.profile) }}
+          path: workspace/meridian-core/.e2e-failover-history.edn
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 14
 
       # The restore to a time and the checksum step's measurements (step 3b
       # part 3), kept for the claims ledger as the failover runs' are.
@@ -913,6 +959,17 @@ jobs:
         continue-on-error: true
         run: tools/ci-cargo-cache.sh put "$RUNNER_TEMP/cargo"
 
+      - uses: ./workspace/meridian-core/.github/actions/ci-tools
+        with:
+          tools: sccache
+
+      # GitHub's cache for sccache in the release build (ruling 1104; step 3b
+      # part 5), as the compile job's: the runtime's token and the cache
+      # service's addresses, handed to the build as BuildKit secrets alone
+      # (the Makefile's SCCACHE_SECRETS, tools/with-sccache.sh). Pinned by
+      # commit (v3.1.0).
+      - uses: crazy-max/ghaction-github-runtime@3cb05d89e1f492524af3d41a1c98c83bc3025124
+
       - name: make runtime-image analytics-image
         working-directory: workspace/meridian-core
         env:
@@ -955,13 +1012,14 @@ jobs:
           persist-credentials: false
           path: workspace/meridian-platform
 
-      # Pinned, and checked against the release's own checksum.
+      # Pinned, and checked against the release's own checksum; from
+      # GitHub's cache where a run kept it (tools/ci-tools.txt).
+      - uses: ./workspace/meridian-core/.github/actions/ci-tools
+        with:
+          tools: k3d
+
       - name: k3d
-        run: |
-          set -euo pipefail
-          curl -fsSL --retry 6 --retry-all-errors --retry-delay 10 --retry-max-time 300 -o /tmp/k3d https://github.com/k3d-io/k3d/releases/download/v5.9.0/k3d-linux-arm64
-          echo "03cde5cf23e6e8e67de5a039ecf26e5b85aca82fba3e5d13dadf904cd218a250  /tmp/k3d" | sha256sum -c -
-          sudo install -m 0755 /tmp/k3d /usr/local/bin/k3d
+        run: sudo install -m 0755 "$CI_TOOLS/k3d-linux-arm64" /usr/local/bin/k3d
 
       - uses: azure/setup-helm@v4
         with:

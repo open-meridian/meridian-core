@@ -1,0 +1,462 @@
+"""The store-level write driver (step 3b part 5): a test-only plugin on the
+Python SDK that writes through the stores' own write paths while
+e2e/failover/run.py injects each failure class, so what a class lost is
+read in the stores, not the database. TEST ONLY: e2e/failover/run.py runs it
+from the chart's `sidecars[]` at install, in the SDK's interop image, with
+this file passed as `MERIDIAN_DRIVER`; it is in no values file, no catalogue
+and no image. Nothing here reaches a broker, a brokerage or a vendor.
+
+DRIVER_ROLE says which of its two instances it is:
+
+- `data`: one dataset declared at registration (`<instance>:drive`), and a
+  price recorded into it every half second (RecordPrices, data -> lake),
+  each named by its row key;
+- `oms`: telephoned orders recorded in the accounts of DRIVER_ACCOUNTS
+  (RecordOrder, oms -> book), each the next number in its account, and the
+  accounts read back through the book's writer (ListOrders), by two
+  workers at once.
+
+Each acknowledgement is printed and kept in /tmp/acked as `ACKED <kind>
+<id> <unix ms>`. The `oms` instance also keeps a Jepsen-style history in
+/tmp/history.edn (invoke, ok, fail, info), each order a list-append
+transaction: an append of its number to the key `book/<account>`, and a
+read of that key as the list of numbers the book holds there, in the order
+the book's journal took them. Elle checks it (the ha failover CI job): an
+order recorded to an account partition and acknowledged is an append that
+every later read sees, in one order (spec/a-deployment-scales-out-and-
+fails-over-by-configuration section 2, items 2 and 4; step 3a's one fenced
+log per partition; ruling 1048).
+
+`touch /tmp/stop` ends it: every call is bounded (CALL_SECONDS), so the stop
+is heard within that, and `DONE` is printed and kept in /tmp/done. /tmp is
+the pod's own scratch volume, kept across a restart of this container, so a
+restart goes on numbering where it was and with processes of its own.
+"""
+
+import asyncio
+import hashlib
+import os
+import random
+import sys
+import time
+import uuid
+from decimal import Decimal
+
+import grpc
+from meridian import DatasetDeclaration, DatasetLicence, Declaration
+from meridian.client import connect
+from meridian.plugin.v1 import operations_pb2 as ops
+from meridian.roles import data, oms
+from meridian.v1 import sidecar_pb2
+
+ROLE = os.environ.get("DRIVER_ROLE", "")
+ACCOUNTS = [a for a in os.environ.get("DRIVER_ACCOUNTS", "").split(",") if a]
+INSTRUMENT = os.environ.get("DRIVER_INSTRUMENT", "")
+# US dollars' cash record (e2e/book/instruments.sql), named by its ID alone:
+# a code is resolved through the platform's master for currencies (W3.3),
+# and this run has no platform.
+USD = os.environ.get("DRIVER_CASH", "")
+DATASET_KEY = "drive"
+# Every call bounded: a stop is heard within this, whatever the stores do.
+CALL_SECONDS = 10
+# A key takes this many appends at most, so a read of it is one page.
+PER_KEY = 400
+# Appends to a key before the next key is taken.
+RUN_OF = 40
+WORKERS = 2
+STOP = "/tmp/stop"
+# The person every order is recorded for (a recorded order is a user's act,
+# W11.2): vouched for as the dashboard vouches, signed with a key made for
+# the run (e2e/failover/run.py), whose public half the run puts beside the
+# dashboard's in the keys every sidecar trusts. Its seed and id come from a
+# Secret made for the run, never printed.
+PERSON = "local|e2e-driver"
+SIGNER_SEED = os.environ.get("DRIVER_SIGNER_SEED", "")
+SIGNER_KEY_ID = os.environ.get("DRIVER_SIGNER_KEY_ID", "")
+
+
+def say(line):
+    print(line, flush=True)
+
+
+def kept(path, line):
+    with open(path, "a", encoding="utf-8") as held:
+        held.write(line + "\n")
+
+
+def generation():
+    """This start's number: the restarts before it, kept in /tmp."""
+    path = "/tmp/generation"
+    try:
+        with open(path, encoding="utf-8") as held:
+            now = int(held.read().strip() or 0) + 1
+    except (OSError, ValueError):
+        now = 1
+    with open(path, "w", encoding="utf-8") as held:
+        held.write(str(now))
+    return now
+
+
+def acked(kind, ident):
+    line = f"ACKED {kind} {ident} {int(time.time() * 1000)}"
+    say(line)
+    kept("/tmp/acked", line)
+
+
+def decimal(text):
+    exact = Decimal(str(text))
+    scale = max(0, -exact.as_tuple().exponent)
+    units = int(exact.scaleb(scale))
+    return ops.Decimal(high=units >> 64, low=units & ((1 << 64) - 1), scale=scale)
+
+
+def stopped():
+    return os.path.exists(STOP)
+
+
+async def bounded(call):
+    return await asyncio.wait_for(call, CALL_SECONDS)
+
+
+# ── A person, as the dashboard would vouch for them (W4.9) ─────────────────
+#
+# Ed25519 (RFC 8032) in the reference algorithm, as the SDK's book suite
+# signs (meridian-python tests/test_book.py): pure Python, for one
+# signature every half minute, so the image needs nothing more.
+
+_P = 2**255 - 19
+_L = 2**252 + 27742317777372353535851937790883648493
+_D = -121665 * pow(121666, _P - 2, _P) % _P
+_I = pow(2, (_P - 1) // 4, _P)
+
+
+def _inverse(x):
+    return pow(x, _P - 2, _P)
+
+
+def _x_of(y, sign):
+    x2 = (y * y - 1) * _inverse(_D * y * y + 1) % _P
+    x = pow(x2, (_P + 3) // 8, _P)
+    if (x * x - x2) % _P:
+        x = x * _I % _P
+    if x & 1 != sign:
+        x = _P - x
+    return x
+
+
+_GY = 4 * _inverse(5) % _P
+_G = (_x_of(_GY, 0), _GY, 1, _x_of(_GY, 0) * _GY % _P)
+
+
+def _add(a, b):
+    e1 = (a[1] - a[0]) * (b[1] - b[0]) % _P
+    e2 = (a[1] + a[0]) * (b[1] + b[0]) % _P
+    c = 2 * a[3] * b[3] * _D % _P
+    d = 2 * a[2] * b[2] % _P
+    e, f, g, h = e2 - e1, d - c, d + c, e2 + e1
+    return (e * f % _P, g * h % _P, f * g % _P, e * h % _P)
+
+
+def _times(scalar, point):
+    held = (0, 1, 1, 0)
+    while scalar:
+        if scalar & 1:
+            held = _add(held, point)
+        point = _add(point, point)
+        scalar >>= 1
+    return held
+
+
+def _compressed(point):
+    z = _inverse(point[2])
+    x, y = point[0] * z % _P, point[1] * z % _P
+    return int.to_bytes(y | ((x & 1) << 255), 32, "little")
+
+
+def _sign(seed, message):
+    digest = hashlib.sha512(seed).digest()
+    a = int.from_bytes(digest[:32], "little")
+    a = (a & ((1 << 254) - 8)) | (1 << 254)
+    public = _compressed(_times(a, _G))
+    r = int.from_bytes(hashlib.sha512(digest[32:] + message).digest(), "little") % _L
+    big_r = _compressed(_times(r, _G))
+    h = int.from_bytes(hashlib.sha512(big_r + public + message).digest(), "little") % _L
+    return big_r + int.to_bytes((r + h * a) % _L, 32, "little")
+
+
+class Person:
+    """The run's person at write on the driver's accounts, as an assertion
+    for this instance: made again before it is 30 seconds old (it lives
+    50), so every command carries one in date."""
+
+    def __init__(self, instance):
+        self.instance = instance
+        self.made = 0
+        self.held = None
+
+    def assertion(self):
+        now = time.time_ns()
+        if self.held is None or now - self.made > 30_000_000_000:
+            claims = sidecar_pb2.CallerClaims(
+                subject=PERSON, display_name="E2E driver", audience_instance_id=self.instance,
+                level=sidecar_pb2.ACCESS_LEVEL_WRITE, read_account_ids=ACCOUNTS,
+                write_account_ids=ACCOUNTS, issued_at_ns=now - 1_000_000_000,
+                expires_at_ns=now + 50_000_000_000, assertion_id=str(uuid.uuid4()),
+            ).SerializeToString()
+            self.held = sidecar_pb2.CallerAssertion(
+                claims=claims, signature=_sign(bytes.fromhex(SIGNER_SEED), claims), key_id=SIGNER_KEY_ID)
+            self.made = now
+        return self.held
+
+
+# ── The history ─────────────────────────────────────────────────────────────
+
+
+class History:
+    """Jepsen's history, as EDN, one operation a line in the order they
+    happened here: `:index` in that order, `:time` nanoseconds on this
+    process's monotonic clock."""
+
+    def __init__(self, path):
+        self.path = path
+        self.index = 0
+        self.began = time.monotonic_ns()
+        # Indexes go on from a previous start's.
+        try:
+            with open(path, encoding="utf-8") as held:
+                self.index = sum(1 for _ in held)
+        except OSError:
+            pass
+
+    def write(self, kind, process, value):
+        line = (f"{{:type :{kind}, :f :txn, :value {value}, :process {process}, "
+                f":time {time.monotonic_ns() - self.began}, :index {self.index}}}")
+        self.index += 1
+        kept(self.path, line)
+
+
+def append_edn(key, number):
+    return f'[[:append "{key}" {number}]]'
+
+
+def read_edn(key, numbers):
+    held = "nil" if numbers is None else "[" + " ".join(str(n) for n in numbers) + "]"
+    return f'[[:r "{key}" {held}]]'
+
+
+# ── data -> lake ────────────────────────────────────────────────────────────
+
+
+class Recording(data.Role):
+    seed = False
+
+    async def on_observations_wanted(self, heard):
+        # Nothing is asked of it: it records unasked.
+        pass
+
+
+async def drive_data(plugin, gen):
+    stub = plugin._operations()
+    dataset = f"{plugin.identity.instance_id}:{DATASET_KEY}"
+    n = 0
+    while not stopped():
+        n += 1
+        key = f"drive-{gen}-{n}"
+        now = time.time_ns()
+        price = ops.Price(
+            meta=ops.ObservationMeta(
+                row_key=key,
+                subjects=[ops.SubjectRef(entity_id=INSTRUMENT)],
+                source=ops.Source(dataset=dataset),
+                valid_from_ns=now,
+                source_times=[ops.SourceTime(kind=ops.SourceTimeKind.Value("SOURCE_TIME_KIND_PUBLISHED"),
+                                             at_ns=now)],
+                raw=plugin.raw_record(f"drive/{key}"),
+            ),
+            kind=ops.PriceKind.PRICE_KIND_LAST,
+            price=ops.Money(amount=decimal(f"{100 + n % 50}.25"), instrument_id=USD),
+            basis=ops.PriceBasis.PRICE_BASIS_PER_UNIT,
+        )
+        try:
+            done = await bounded(stub.RecordPrices(ops.RecordPricesParams(prices=[price])))
+            if done.recorded + done.restated + done.unchanged == 1:
+                acked("price", key)
+        except (asyncio.TimeoutError, grpc.aio.AioRpcError) as failed:
+            say(f"REFUSED price {key}: {words(failed)}")
+            await asyncio.sleep(0.5)
+        await asyncio.sleep(0.5)
+
+
+# ── oms -> book ─────────────────────────────────────────────────────────────
+
+
+class Managing(oms.Role):
+    seed = False
+
+    async def on_order_updated(self, heard):
+        pass
+
+    async def on_booking_updated(self, heard):
+        pass
+
+    async def on_alert_changed(self, heard):
+        pass
+
+
+def words(failed):
+    if isinstance(failed, grpc.aio.AioRpcError):
+        return f"{failed.code().name}: {failed.details()}"[:300]
+    return type(failed).__name__
+
+
+def definitely_not(failed):
+    """Whether a failed call is known not to have taken effect: refused by
+    the sidecar before it left, or answered by the book with a refusal
+    (`aborted`: a fenced writer's commit refused among them, which never
+    commits). A timeout, or the bus or a store not answering, may have
+    committed: indeterminate."""
+    if not isinstance(failed, grpc.aio.AioRpcError):
+        return False
+    return failed.code() in (grpc.StatusCode.INVALID_ARGUMENT, grpc.StatusCode.PERMISSION_DENIED,
+                             grpc.StatusCode.FAILED_PRECONDITION, grpc.StatusCode.NOT_FOUND,
+                             grpc.StatusCode.ALREADY_EXISTS, grpc.StatusCode.UNAUTHENTICATED,
+                             grpc.StatusCode.ABORTED)
+
+
+class Book:
+    def __init__(self, plugin, gen, history):
+        self.stub = plugin._operations()
+        self.person = Person(plugin.identity.instance_id)
+        self.gen = gen
+        self.history = history
+        self.counts = {a: 0 for a in ACCOUNTS}
+        self.next = 0
+        self.lock = asyncio.Lock()
+
+    def key_now(self):
+        """The account taking appends: the next in turn after each run of
+        RUN_OF, passing over any that holds PER_KEY."""
+        turn = (self.next // RUN_OF) % len(ACCOUNTS)
+        for step in range(len(ACCOUNTS)):
+            account = ACCOUNTS[(turn + step) % len(ACCOUNTS)]
+            if self.counts[account] < PER_KEY:
+                return account
+        return None
+
+    async def append(self, process):
+        async with self.lock:
+            account = self.key_now()
+            if account is None:
+                return "full"
+            self.next += 1
+            self.counts[account] += 1
+            number = self.gen * 1_000_000 + self.next
+        key = f"book/{account}"
+        value = append_edn(key, number)
+        self.history.write("invoke", process, value)
+        try:
+            done = await bounded(self.stub.RecordOrder(ops.RecordOrderParams(
+                account_id=account, instrument_id=INSTRUMENT, side=ops.Side.SIDE_BUY,
+                quantity=decimal("1"), order_type=ops.OrderType.ORDER_TYPE_MARKET,
+                time_in_force=ops.TimeInForce.TIME_IN_FORCE_DAY,
+                venue_order_id=str(number), origin=ops.OrderOrigin.ORDER_ORIGIN_TELEPHONED,
+                idempotency_key=f"drive-{number}", acting_for=self.person.assertion())))
+        except (asyncio.TimeoutError, grpc.aio.AioRpcError) as failed:
+            if definitely_not(failed):
+                self.history.write("fail", process, value)
+                say(f"REFUSED order {number}: {words(failed)}")
+                return "fail"
+            self.history.write("info", process, value)
+            say(f"UNKNOWN order {number}: {words(failed)}")
+            return "info"
+        self.history.write("ok", process, value)
+        acked("order", done.order.order_id)
+        return "ok"
+
+    async def read(self, process):
+        account = self.key_now() or ACCOUNTS[0]
+        key = f"book/{account}"
+        self.history.write("invoke", process, read_edn(key, None))
+        try:
+            numbered = []
+            cursor = ""
+            while True:
+                listed = await bounded(self.stub.ListOrders(ops.ListOrdersParams(
+                    account_id=account, page_size=500, cursor=cursor)))
+                for order in listed.orders:
+                    if order.venue_order_id.isdigit() and order.origin == ops.OrderOrigin.ORDER_ORIGIN_TELEPHONED:
+                        numbered.append((order.last_change.sequence, int(order.venue_order_id)))
+                cursor = listed.next_cursor
+                if not cursor:
+                    break
+        except (asyncio.TimeoutError, grpc.aio.AioRpcError) as failed:
+            # A read changes nothing: failed, whatever the reason.
+            self.history.write("fail", process, read_edn(key, None))
+            say(f"UNREAD {key}: {words(failed)}")
+            return "fail"
+        numbered.sort()
+        self.history.write("ok", process, read_edn(key, [n for _, n in numbered]))
+        return "ok"
+
+
+async def worker(book, slot, gen):
+    # A process whose operation's outcome is unknown is never used again
+    # (Jepsen's rule): the slot takes a new one.
+    process = (gen * 100 + slot) * 1000
+    while not stopped():
+        said = await (book.append(process) if random.random() < 0.75 else book.read(process))
+        if said == "info":
+            process += 1
+        await asyncio.sleep(0.25 if said == "ok" else 1.0)
+
+
+async def drive_oms(plugin, gen):
+    book = Book(plugin, gen, History("/tmp/history.edn"))
+    await asyncio.gather(*(worker(book, slot, gen) for slot in range(WORKERS)))
+
+
+# ── Start ───────────────────────────────────────────────────────────────────
+
+
+def declaration():
+    if ROLE == "data":
+        return Declaration(catalogue=[DatasetDeclaration(
+            key=DATASET_KEY, vendor="e2e failover driver", data_types=["meridian.v1.Price"],
+            modes=["push"], licence_default=DatasetLicence(kept=True, display=True),
+            day_time_zone="Etc/UTC")])
+    return Declaration()
+
+
+async def main():
+    if ROLE not in ("data", "oms") or not INSTRUMENT or (
+            ROLE == "oms" and not (ACCOUNTS and SIGNER_SEED and SIGNER_KEY_ID)):
+        raise SystemExit("driver: DRIVER_ROLE is data or oms, with DRIVER_INSTRUMENT (and, for oms, "
+                         "DRIVER_ACCOUNTS and the run's signer, DRIVER_SIGNER_SEED and DRIVER_SIGNER_KEY_ID)")
+    gen = generation()
+    say(f"driver: {ROLE}, start {gen}")
+    roles = {"data": [Recording()], "oms": [Managing()]}[ROLE]
+    # Registered once the sidecar and the stores behind it answer: refused
+    # while the deployment is not yet configured, asked again.
+    while not stopped():
+        try:
+            async with await connect(declaration=declaration(), roles=roles) as plugin:
+                say(f"driver: registered as {plugin.identity.instance_id}")
+                kept("/tmp/registered", f"REGISTERED {int(time.time() * 1000)}")
+                await (drive_data(plugin, gen) if ROLE == "data" else drive_oms(plugin, gen))
+            break
+        except Exception as failed:  # noqa: BLE001 - every start failure is waited out
+            say(f"driver: not registered yet ({type(failed).__name__}: {str(failed)[:200]})")
+            await asyncio.sleep(3)
+    kept("/tmp/done", "DONE")
+    say("DONE")
+    # Kept running, writing nothing, so the run reads its files from a
+    # container that is there (an exit would be restarted, and the reads
+    # would meet one starting).
+    while True:
+        await asyncio.sleep(3600)
+
+
+if __name__ == "__main__":
+    random.seed()
+    asyncio.run(main())
+    sys.exit(0)
