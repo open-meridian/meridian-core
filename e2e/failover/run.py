@@ -1674,6 +1674,21 @@ def database_said(s, when):
     s.note(f"{when}: the preflight said: {logs.stdout.decode(errors='replace').strip()[-2000:] or 'nothing'}")
 
 
+def member_now(when):
+    """Which of the database's StatefulSet revisions member 0 is from, and
+    what it is: printed, for reading a move under Patroni."""
+    sts = json.loads(out("get", "statefulset", f"{FULL}-database", "-o", "json", check=False) or "{}")
+    pod = json.loads(out("get", "pod", f"{FULL}-database-0", "-o", "json", check=False) or "{}")
+    labels = pod.get("metadata", {}).get("labels", {})
+    revision = labels.get("controller-revision-hash", "")
+    status = sts.get("status", {})
+    print(f"R: {when}: member 0 from revision {revision} (the set's current {status.get('currentRevision')}, "
+          f"update {status.get('updateRevision')}), made {pod.get('metadata', {}).get('creationTimestamp')}, "
+          f"manager {labels.get('meridian.dev/database-manager', 'none')}, "
+          f"role {labels.get('meridian.dev/database-role', 'none')}, ready {ready(pod) if pod else False}, "
+          f"going {bool(pod.get('metadata', {}).get('deletionTimestamp'))}", flush=True)
+
+
 def reconfigure(s):
     global SHAPE
     print("R: the live install moved between the profiles, under the write driver's load", flush=True)
@@ -1703,6 +1718,7 @@ def reconfigure(s):
                     seconds=600)
                 print(f"R: member 0 answers as the primary, {time.time() - began:.0f}s after the first upgrade; "
                       "the second upgrade", flush=True)
+                member_now("before the second upgrade")
                 again = run("helm", "upgrade", RELEASE, CHART, "--namespace", NAMESPACE, "--reuse-values",
                             *helm_takes_counts(), "--set", f"resilience.profile={target}", check=False)
                 s.check(again.returncode == 0, "reconfigure: the second upgrade adds the database's standbys"
