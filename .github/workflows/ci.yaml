@@ -1,6 +1,9 @@
-# CI is confirmation, not the first place a failure is found. The pre-push hook
-# runs the same target locally, so a red run here means the hook was bypassed or
-# the runner differs from a developer's machine -- both worth knowing.
+# CI runs everything, and the merge queue is the only authority for main
+# (accepted 2026-11-07, superseding ruling 1075's full local gate). The
+# pre-push hook runs a fast gate -- lint, the build, the changed crates' unit
+# tests and the stages the changed paths select (`make pre-push`) -- so a red
+# job here is reproduced with `make ci-stage STAGE=<stage>`, its cause fixed,
+# and never rerun until green.
 #
 # ci-local's stages, each a job (rulings 1068 and 1069, 443): the checks and
 # lint, which need no image, start at once beside the images and compile
