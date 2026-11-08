@@ -85,6 +85,13 @@ HA_DATABASE = {"bor": 30, "lake": 30}
 # The zone tier (1048): a zone's node pool lost, every member there taken
 # over within 2 min.
 HA_ZONE = 120
+# A standby's copy gone bad (step 3b part 4; proposed against 1048/1056):
+# found within a minute of the replica scrub's start, and re-cloned from
+# the primary within the zone tier, 2 min. Neither stops the primary
+# serving, so neither is an outage; both are how long the deployment runs
+# with one copy fewer than it was set up with.
+REPLICA_DETECT = 60
+REPLICA_RECLONE = 120
 
 # Internal TLS (ruling 1084; tls.internal.enabled) in the ha run: every
 # class there is injected with every store, Job and member on TLS, and
@@ -100,7 +107,7 @@ DEFAULT_FAILURES = {
                  "bit-rot", "torn-write"],
     "ha": ["lake-writer", "bor-writer", "street-writer", "instrument-writer",
            "split-brain", "node-freeze", "node", "zone", "network-policy", "db-primary", "broker",
-           "bit-rot", "torn-write", "volume-lost"],
+           "bit-rot", "torn-write", "volume-lost", "replica-rot"],
     "scaled": [],
     "reconfigure": [],
 }
@@ -1156,6 +1163,101 @@ def torn_write(s):
             f"({len(tables.split())} tables{', failed: ' + ', '.join(failed) if failed else ''})")
 
 
+def standby():
+    """A standby of the database's, running and ready."""
+    lead = primary()
+    for pod in pods("database"):
+        name = pod["metadata"]["name"]
+        if name != lead and ready(pod):
+            return name
+    raise SystemExit("no standby is ready")
+
+
+def member_file(pod, table):
+    """A table's first data file on a member's node: the node, and the path."""
+    relative = psql(f"select pg_relation_filepath('{table}')", pod=pod)
+    volume = out("get", "pvc", f"data-{pod}", "-o", "jsonpath={.spec.volumeName}")
+    pv = json.loads(run("kubectl", "get", "pv", volume, "-o", "json").stdout)
+    path = (pv["spec"].get("hostPath") or pv["spec"].get("local") or {}).get("path", "")
+    return node_of(pod), f"{path}/pgdata/{relative}"
+
+
+def on_disk(node, path, at=4000, count=4):
+    return run("docker", "exec", node, "sh", "-c",
+               f"dd if='{path}' bs=1 skip={at} count={count} 2>/dev/null | od -An -tx1 | tr -d ' \\n'",
+               check=False).stdout.decode().strip()
+
+
+def replica_rot(s):
+    """A standby's page rotted beneath it (step 3b part 4): the replica scrub
+    Job finds its copy no longer the primary's, re-clones it through
+    Patroni, and keeps the finding with its outcome."""
+    print("F: replica-rot: a standby's page flipped beneath it; the replica scrub re-clones it", flush=True)
+    member = standby()
+    # A store's log of more than one page, so its first is full and no
+    # append rewrites it: the configuration store's, as bit-rot's.
+    size = int(psql("select pg_relation_size('config_change')") or 0)
+    s.check(size >= 16384, f"replica-rot: the configuration store's log is more than a page ({size} bytes)")
+    # The page settled everywhere first, so nothing replays over the flip:
+    # frozen (no hint bit to set again and log), checkpointed on the
+    # primary, replayed and restartpointed on the standby.
+    psql("vacuum (freeze) config_change")
+    psql("checkpoint")
+    lsn = psql("select pg_current_wal_lsn()")
+    wait_for("the standby to replay the checkpoint", lambda: psql(
+        f"select pg_last_wal_replay_lsn() >= '{lsn}'::pg_lsn", pod=member) == "t", seconds=120)
+    psql("checkpoint", pod=member)
+    node, path = member_file(member, "config_change")
+    before = on_disk(node, path)
+    run("docker", "exec", node, "sh", "-c",
+        f"printf '\\377\\377\\377\\377' | dd of='{path}' bs=1 seek=4000 conv=notrunc 2>/dev/null")
+    # Its server restarted, so the page is read again from disk; a clean
+    # page in memory is never written back over it.
+    kubectl("exec", member, "-c", "postgres", "--", "sh", "-c",
+            'curl -fsS -o /dev/null -u "patroni:$PATRONI_RESTAPI_PASSWORD" -X POST '
+            "-H 'Content-Type: application/json' -d '{}' http://127.0.0.1:8008/restart", quiet=True)
+    wait_for("the standby streaming again", lambda: psql(
+        "select pg_is_in_recovery()", pod=member) == "t", seconds=180)
+    flipped = on_disk(node, path)
+    s.check(flipped == "ffffffff" and flipped != before,
+            f"replica-rot: the standby's page is flipped on disk as it streams ({flipped or 'unread'})")
+    job = "e2e-replicas"
+    kubectl("delete", "job", job, "--ignore-not-found", "--wait")
+    began = time.time()
+    kubectl("create", "job", job, "--from", f"cronjob/{FULL}-database-replicas")
+    wait_for("the replica scrub Job to end", lambda: any(json.loads(out(
+        "get", "job", job, "-o", "json"))["status"].get(k) for k in ("succeeded", "failed")),
+        seconds=600)
+    took = time.time() - began
+    said = {}
+    for line in out("logs", f"job/{job}", check=False).splitlines():
+        if line.strip().startswith("{"):
+            try:
+                said = json.loads(line)
+            except ValueError:
+                pass
+    found = [f for f in said.get("findings", []) if f.get("member") == member]
+    s.check(said.get("replicas") == "differed" and bool(found),
+            f"replica-rot: the replica scrub finds {member}'s copy differs ({said.get('replicas', 'nothing said')})")
+    if not found:
+        return
+    finding = found[0]
+    s.check("matches the primary's again" in finding.get("outcome", ""),
+            f"replica-rot: {member} re-cloned through Patroni and matching ({finding.get('outcome', '')})")
+    kept = psql(f"select count(*) from config_integrity_finding where member = '{member}' "
+                "and partition = 'replicas' and what like '%re-cloned through Patroni%'")
+    s.check(kept != "0", f"replica-rot: kept as an IntegrityFinding with its outcome ({kept})")
+    s.check(on_disk(node, path) != "ffffffff", "replica-rot: the re-cloned copy's page is whole on disk")
+    others = [f for f in said.get("findings", []) if f.get("member") != member]
+    s.check(not others, f"replica-rot: no other member is named ({len(others)})")
+    detected = (finding.get("detected_ms") or 0) / 1000
+    recloned = (finding.get("recloned_ms") or 0) / 1000
+    claim(s, "replica-rot", "database-scrub", detected, REPLICA_DETECT,
+          {"member": member, "job_s": round(took, 2)})
+    claim(s, "replica-rot", "database", recloned, REPLICA_RECLONE,
+          {"member": member, "outcome": "re-cloned, matching"})
+
+
 def volume_lost(s):
     """A standby's volume lost: its claim and its pod deleted, and Patroni
     clones it again from the primary, nothing felt by the stores."""
@@ -1451,6 +1553,7 @@ FAILURES = {
     "torn-write": torn_write,
     "volume-lost": volume_lost,
     "zone": zone_lost,
+    "replica-rot": replica_rot,
 }
 
 

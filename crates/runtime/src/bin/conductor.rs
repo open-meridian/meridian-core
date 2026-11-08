@@ -109,6 +109,14 @@ fn run() -> Result<(), String> {
         println!("{said}");
         return Ok(());
     }
+    // The database's members compared, and a standby whose copy is bad
+    // re-cloned (step 3b part 4): the chart's replica scrub Job, once.
+    if command.as_deref() == Some("replicas") {
+        let setup = meridian_runtime::replicas::Setup::from_env()?;
+        let said = meridian_runtime::replicas::run(&setup)?;
+        println!("{said}");
+        return Ok(());
+    }
     if command.as_deref() == Some("migrate") {
         let url = required("MERIDIAN_CONFIG_DATABASE_URL")?;
         meridian_runtime::migrate_once_it_answers(

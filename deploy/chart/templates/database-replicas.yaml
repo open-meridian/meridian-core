@@ -1,0 +1,98 @@
+{{- include "meridian-runtime.require" . -}}
+{{- $standbys := int (include "meridian-runtime.databaseStandbys" .) }}
+{{- $scrub := .Values.database.brought.replicaScrub | default dict }}
+{{- if and .Values.database.brought.enabled (gt $standbys 0) $scrub.schedule }}
+{{/*
+  The database's members compared (step 3b part 4; values.yaml's
+  database.brought.replicaScrub): `meridian-conductor replicas`, once a
+  schedule, reads each store's log on every member by its own name and
+  compares their digests (crates/runtime/src/replicas.rs). A standby whose
+  copy differs, or fails a page, is kept as an IntegrityFinding in the
+  store whose log it is, and with `reclone` re-cloned from the primary
+  through Patroni's REST API (`POST /reinit`) and compared again.
+
+  It reads with the serving role the stores already hold, and is the one
+  workload beside the database's own members given Patroni's REST
+  credential: no store holds it, and the NetworkPolicy beside the database
+  admits this Job alone to Patroni's port.
+*/}}
+{{- $full := include "meridian-runtime.fullname" . }}
+{{- $name := printf "%s-database" $full }}
+{{- $members := list }}
+{{- range $i := until (add 1 $standbys | int) }}
+{{- $members = append $members (printf "%s-%d=%s-%d.%s-members.%s.svc.cluster.local" $name $i $name $i $name $.Release.Namespace) }}
+{{- end }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $name }}-replicas
+  labels:
+    meridian.dev/component: database-scrub
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+spec:
+  schedule: {{ $scrub.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            {{- include "meridian-runtime.labels" . | nindent 12 }}
+            meridian.dev/component: database-scrub
+        spec:
+          restartPolicy: Never
+          {{- with .Values.podSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: replicas
+              image: "{{ .Values.image.repository }}:{{ .Values.conductor.image.tag | default .Values.image.tag }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              args: ["meridian-conductor", "replicas"]
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]
+              env:
+                - name: MERIDIAN_DEPLOYMENT_ID
+                  value: {{ .Values.deployment.id | quote }}
+                - name: MERIDIAN_DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.conductor.database.existingSecret | default (include "meridian-runtime.databaseSecret" $) }}
+                      key: {{ .Values.conductor.database.key | default .Values.database.key }}
+                - name: MERIDIAN_REPLICAS_MEMBERS
+                  value: {{ join "," $members | quote }}
+                - name: MERIDIAN_REPLICAS_RECLONE
+                  value: {{ ternary "true" "false" (eq (toString $scrub.reclone) "true") | quote }}
+                - name: MERIDIAN_PATRONI_USERNAME
+                  value: patroni
+                - name: MERIDIAN_PATRONI_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ $name }}-passwords
+                      key: patroni
+                - name: RUST_LOG
+                  value: {{ .Values.logLevel | quote }}
+                {{- with (include "meridian-runtime.internalTlsEnv" .) }}{{ . | nindent 16 }}{{- end }}
+              {{- if .Values.tls.internal.enabled }}
+              volumeMounts:
+                {{- include "meridian-runtime.internalTlsMount" . | nindent 16 }}
+              {{- end }}
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 32Mi
+                limits:
+                  memory: 128Mi
+          {{- if .Values.tls.internal.enabled }}
+          volumes:
+            {{- include "meridian-runtime.internalTlsVolume" . | nindent 12 }}
+          {{- end }}
+{{- end }}

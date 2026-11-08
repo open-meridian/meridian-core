@@ -715,12 +715,18 @@ spec:
         - port: 8432
     {{- end }}
     {{- if $patroni }}
-    # Patroni's REST API: its own members, asking each other's positions.
+    # Patroni's REST API: its own members, asking each other's positions,
+    # and the replica scrub Job, re-cloning a standby whose copy is bad
+    # (database-replicas.yaml).
     - from:
         - podSelector:
             matchLabels:
               app.kubernetes.io/instance: {{ .Release.Name }}
               meridian.dev/component: database
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              meridian.dev/component: database-scrub
       ports:
         - port: 8008
     {{- end }}
