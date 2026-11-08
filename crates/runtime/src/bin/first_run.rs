@@ -430,8 +430,11 @@ fn connect(
         .password(String::from_utf8_lossy(password).as_ref())
         .connect_timeout(std::time::Duration::from_secs(10));
 
+    // Over TLS where the deployment's internal TLS is on (ruling 1084).
+    let (config, tls) = meridian_changes::tls::secured(config, false)
+        .map_err(|failed| format!("the database's TLS: {failed}"))?;
     config
-        .connect(postgres::NoTls)
+        .connect(tls)
         .map_err(|failed| format!("{} could not connect to {database}: {failed}", login.role))
 }
 
@@ -491,7 +494,10 @@ impl Postgres {
             .password(String::from_utf8_lossy(password).as_ref())
             .connect_timeout(std::time::Duration::from_secs(10));
 
-        let mut client = match config.connect(postgres::NoTls) {
+        let connected = meridian_changes::tls::secured(config, false)
+            .map_err(|failed| format!("the database's TLS: {failed}"))
+            .and_then(|(config, tls)| config.connect(tls).map_err(|failed| detail(&failed)));
+        let mut client = match connected {
             Ok(client) => client,
             Err(failed) => {
                 return vec![format!(
@@ -501,10 +507,10 @@ impl Postgres {
                     login.port,
                     login.database,
                     // The crate's own Display is "db error" and the sentence
-                    // an administrator needs is in its source. A finding that
-                    // does not say what is wrong is a finding they cannot act
-                    // on.
-                    detail(&failed)
+                    // an administrator needs is in its source (detail). A
+                    // finding that does not say what is wrong is a finding
+                    // they cannot act on.
+                    failed
                 )];
             }
         };

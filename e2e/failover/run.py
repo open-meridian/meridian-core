@@ -85,6 +85,18 @@ HA_DATABASE = {"bor": 30, "lake": 30}
 # The zone tier (1048): a zone's node pool lost, every member there taken
 # over within 2 min.
 HA_ZONE = 120
+# A standby's copy gone bad (step 3b part 4; proposed against 1048/1056):
+# found within a minute of the replica scrub's start, and re-cloned from
+# the primary within the zone tier, 2 min. Neither stops the primary
+# serving, so neither is an outage; both are how long the deployment runs
+# with one copy fewer than it was set up with.
+REPLICA_DETECT = 60
+REPLICA_RECLONE = 120
+
+# Internal TLS (ruling 1084; tls.internal.enabled) in the ha run: every
+# class there is injected with every store, Job and member on TLS, and
+# after the install a plaintext connection is shown refused (internal_tls).
+TLS = PROFILE == "ha"
 
 # The live install moved between the profiles, in order (e2e-cluster-
 # reconfigure): up to ha, and back.
@@ -95,7 +107,7 @@ DEFAULT_FAILURES = {
                  "bit-rot", "torn-write"],
     "ha": ["lake-writer", "bor-writer", "street-writer", "instrument-writer",
            "split-brain", "node-freeze", "node", "zone", "network-policy", "db-primary", "broker",
-           "bit-rot", "torn-write", "volume-lost"],
+           "bit-rot", "torn-write", "volume-lost", "replica-rot"],
     "scaled": [],
     "reconfigure": [],
 }
@@ -342,6 +354,8 @@ def install(s):
         # the dashboard and analytics at two.
         if PROFILE != "reconfigure":
             values += ["--set", "resilience.profile=ha"]
+        if TLS:
+            values += ["--set", "tls.internal.enabled=true"]
         values += ["--set", "zones={" + ",".join(ZONES) + "}"]
         values += ["--set", f"database.brought.patroniImage={POSTGRES_IMAGE}"]
     run("helm", "install", RELEASE, CHART, "--namespace", NAMESPACE, "--create-namespace", *values)
@@ -455,6 +469,51 @@ def first_run(s):
     kubectl("delete", "rolebinding", env["MERIDIAN_FIRST_RUN_BINDING"], "--ignore-not-found")
     wait_for("every component ready", all_ready, seconds=900)
     s.check(True, "first run applied; every component ready")
+
+
+def internal_tls(s):
+    """Internal TLS on (ruling 1084): every store's connection to the
+    database over TLS, and a plaintext one refused, by the database and by
+    the broker; a TLS one verified against the chart's CA by the name the
+    stores use."""
+    print("T: internal TLS: plaintext refused", flush=True)
+    host = f"{FULL}-database.{NAMESPACE}.svc.cluster.local"
+    member = primary()
+
+    def connects(mode):
+        script = (f'PGPASSWORD="${{PATRONI_SUPERUSER_PASSWORD:-$POSTGRES_PASSWORD}}" '
+                  f'psql "host={host} dbname=meridian user=postgres {mode} connect_timeout=5" '
+                  "-X -At -c 'select ssl from pg_stat_ssl where pid = pg_backend_pid()' 2>&1")
+        done = kubectl("exec", member, "-c", "postgres", "--", "sh", "-c", script, check=False)
+        return done.returncode, done.stdout.decode(errors="replace").strip()
+
+    code, said = connects("sslmode=disable")
+    s.check(code != 0 and "no encryption" in said,
+            "the database refuses a plaintext connection from another pod's address "
+            f"({said.splitlines()[-1] if said else 'nothing said'})")
+    code, said = connects("sslmode=verify-full sslrootcert=/run/meridian-tls/ca.crt")
+    s.check(code == 0 and said == "t",
+            "the database serves TLS under the chart's CA, verified by the stores' name for it")
+    # Every serving connection from a store over TLS, none in the clear.
+    counted = psql("select coalesce(sum(case when s.ssl then 1 else 0 end), 0) || ' ' || "
+                   "coalesce(sum(case when s.ssl then 0 else 1 end), 0) "
+                   "from pg_stat_activity a join pg_stat_ssl s using (pid) "
+                   "where a.usename in ('meridian_app', 'meridian_migrate') "
+                   "and a.client_addr is not null")
+    secured, clear = (int(n) for n in counted.split())
+    s.check(secured > 0 and clear == 0,
+            f"the stores' connections: {secured} over TLS, {clear} in the clear")
+    # The broker: a client that does not speak TLS gets no further than the
+    # server's greeting, which says it is required.
+    broker = f"{FULL}-broker.{NAMESPACE}.svc.cluster.local"
+    script = (f"(printf 'CONNECT {{\"verbose\":false}}\\r\\nPING\\r\\n'; sleep 2) "
+              f"| nc -w 4 {broker} 4222 2>&1")
+    said = kubectl("exec", member, "-c", "postgres", "--", "sh", "-c", script,
+                   check=False).stdout.decode(errors="replace")
+    s.check('"tls_required":true' in said and "PONG" not in said,
+            "the broker requires TLS of every client and answers a plaintext one nothing "
+            f"({'tls_required' if 'tls_required' in said else 'no greeting'}"
+            f"{', PONG' if 'PONG' in said else ''})")
 
 
 def all_ready():
@@ -1104,6 +1163,107 @@ def torn_write(s):
             f"({len(tables.split())} tables{', failed: ' + ', '.join(failed) if failed else ''})")
 
 
+def standby():
+    """A standby of the database's, running and ready."""
+    lead = primary()
+    for pod in pods("database"):
+        name = pod["metadata"]["name"]
+        if name != lead and ready(pod):
+            return name
+    raise SystemExit("no standby is ready")
+
+
+def member_file(pod, table):
+    """A table's first data file on a member's node: the node, and the path."""
+    relative = psql(f"select pg_relation_filepath('{table}')", pod=pod)
+    volume = out("get", "pvc", f"data-{pod}", "-o", "jsonpath={.spec.volumeName}")
+    pv = json.loads(run("kubectl", "get", "pv", volume, "-o", "json").stdout)
+    path = (pv["spec"].get("hostPath") or pv["spec"].get("local") or {}).get("path", "")
+    return node_of(pod), f"{path}/pgdata/{relative}"
+
+
+def on_disk(node, path, at=4000, count=4):
+    return run("docker", "exec", node, "sh", "-c",
+               f"dd if='{path}' bs=1 skip={at} count={count} 2>/dev/null | od -An -tx1 | tr -d ' \\n'",
+               check=False).stdout.decode().strip()
+
+
+def replica_rot(s):
+    """A standby's page rotted beneath it (step 3b part 4): the replica scrub
+    Job finds its copy no longer the primary's, re-clones it through
+    Patroni, and keeps the finding with its outcome."""
+    print("F: replica-rot: a standby's page flipped beneath it; the replica scrub re-clones it", flush=True)
+    member = standby()
+    # The largest store log, so its first page is the likeliest full, which
+    # no append then writes again before the scrub reads it.
+    sizes = psql("select relname || ' ' || pg_relation_size(oid) from pg_class "
+                 "where relname in ('config_change', 'instrument_change', 'street_change', "
+                 "'lake_row', 'book_entry') and relkind = 'r'")
+    table, size = max((line.split() for line in sizes.splitlines()), key=lambda t: int(t[1]))
+    s.note(f"replica-rot: {table}, {size} bytes, its first page flipped")
+    # The page settled everywhere first, so nothing replays over the flip:
+    # frozen (no hint bit to set again and log), checkpointed on the
+    # primary, replayed and restartpointed on the standby.
+    psql(f"vacuum (freeze) {table}")
+    psql("checkpoint")
+    lsn = psql("select pg_current_wal_lsn()")
+    wait_for("the standby to replay the checkpoint", lambda: psql(
+        f"select pg_last_wal_replay_lsn() >= '{lsn}'::pg_lsn", pod=member) == "t", seconds=120)
+    psql("checkpoint", pod=member)
+    node, path = member_file(member, table)
+    before = on_disk(node, path)
+    run("docker", "exec", node, "sh", "-c",
+        f"printf '\\377\\377\\377\\377' | dd of='{path}' bs=1 seek=4000 conv=notrunc 2>/dev/null")
+    # Its server restarted, so the page is read again from disk; a clean
+    # page in memory is never written back over it.
+    kubectl("exec", member, "-c", "postgres", "--", "sh", "-c",
+            'curl -fsS -o /dev/null -u "patroni:$PATRONI_RESTAPI_PASSWORD" -X POST '
+            "-H 'Content-Type: application/json' -d '{}' http://127.0.0.1:8008/restart", quiet=True)
+    wait_for("the standby streaming again", lambda: psql(
+        "select pg_is_in_recovery()", pod=member) == "t", seconds=180)
+    flipped = on_disk(node, path)
+    s.check(flipped == "ffffffff" and flipped != before,
+            f"replica-rot: the standby's page is flipped on disk as it streams ({flipped or 'unread'})")
+    job = "e2e-replicas"
+    kubectl("delete", "job", job, "--ignore-not-found", "--wait")
+    began = time.time()
+    kubectl("create", "job", job, "--from", f"cronjob/{FULL}-database-replicas")
+    wait_for("the replica scrub Job to end", lambda: any(json.loads(out(
+        "get", "job", job, "-o", "json"))["status"].get(k) for k in ("succeeded", "failed")),
+        seconds=600)
+    took = time.time() - began
+    said = {}
+    for line in out("logs", f"job/{job}", check=False).splitlines():
+        if line.strip().startswith("{"):
+            try:
+                said = json.loads(line)
+            except ValueError:
+                pass
+    found = [f for f in said.get("findings", []) if f.get("member") == member]
+    s.check(said.get("replicas") == "differed" and bool(found),
+            f"replica-rot: the replica scrub finds {member}'s copy differs ({said.get('replicas', 'nothing said')})")
+    if not found:
+        return
+    finding = found[0]
+    s.check("matches the primary's again" in finding.get("outcome", ""),
+            f"replica-rot: {member} re-cloned through Patroni and matching ({finding.get('outcome', '')})")
+    prefix = {"lake_row": "lake", "book_entry": "book"}.get(table, table.removesuffix("_change"))
+    kept = psql(f"select count(*) from {prefix}_integrity_finding where member = '{member}' "
+                "and partition = 'replicas' and what like '%re-cloned through Patroni%'")
+    s.check(kept != "0", f"replica-rot: kept as an IntegrityFinding with its outcome ({kept})")
+    s.check(on_disk(node, path) != "ffffffff", "replica-rot: the re-cloned copy's page is whole on disk")
+    others = [f for f in said.get("findings", []) if f.get("member") != member]
+    s.check(not others, f"replica-rot: no other member is named ({len(others)})")
+    detected = (finding.get("detected_ms") or 0) / 1000
+    claim(s, "replica-rot", "database-scrub", detected, REPLICA_DETECT,
+          {"member": member, "job_s": round(took, 2)})
+    # The re-clone's time only where it re-cloned and matched: a failed one
+    # is a failure above, never a figure.
+    if "matches the primary's again" in finding.get("outcome", "") and finding.get("recloned_ms"):
+        claim(s, "replica-rot", "database", finding["recloned_ms"] / 1000, REPLICA_RECLONE,
+              {"member": member, "outcome": "re-cloned, matching"})
+
+
 def volume_lost(s):
     """A standby's volume lost: its claim and its pod deleted, and Patroni
     clones it again from the primary, nothing felt by the stores."""
@@ -1399,6 +1559,7 @@ FAILURES = {
     "torn-write": torn_write,
     "volume-lost": volume_lost,
     "zone": zone_lost,
+    "replica-rot": replica_rot,
 }
 
 
@@ -1428,6 +1589,8 @@ def main():
     print(f"A: installed in the {PROFILE} profile", flush=True)
     install(s)
     first_run(s)
+    if TLS:
+        internal_tls(s)
     if PROFILE in ("ha", "scaled"):
         shape(s)
     properties(s, "the install")

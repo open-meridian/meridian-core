@@ -73,6 +73,7 @@ spec:
                   name: {{ (include "meridian-runtime.databaseSecret" $) }}
                   key: {{ .Values.database.key }}
             {{- include "meridian-runtime.readyEnv" . | nindent 12 }}
+            {{- with (include "meridian-runtime.internalTlsEnv" .) }}{{ . | nindent 12 }}{{- end }}
           {{- include "meridian-runtime.readyProbe" . | nindent 10 }}
           # No port. Everything this component says goes over the broker, so
           # nothing outside its pod needs to reach it. A Service in front of it
@@ -83,8 +84,10 @@ spec:
           # is where it says it is ready.
           volumeMounts:
             {{- include "meridian-runtime.readyMount" . | nindent 12 }}
+            {{- with (include "meridian-runtime.internalTlsMount" .) }}{{ . | nindent 12 }}{{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       volumes:
         {{- include "meridian-runtime.readyVolume" . | nindent 8 }}
+        {{- with (include "meridian-runtime.internalTlsVolume" .) }}{{ . | nindent 8 }}{{- end }}
 {{ include "meridian-runtime.memberBudget" (dict "top" $ "component" "instrument" "values" $.Values.instrument) }}

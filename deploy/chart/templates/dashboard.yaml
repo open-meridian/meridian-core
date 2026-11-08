@@ -275,7 +275,9 @@ spec:
               filled in per request, never here.
             */}}
             - name: MERIDIAN_PLUGIN_FRONT_DOOR
-              value: {{ printf "http://{instance}.%s-sidecars.%s.svc.cluster.local:%v" (include "meridian-runtime.fullname" .) .Release.Namespace .Values.sidecar.frontDoorPort | quote }}
+              {{- /* Over TLS where internal TLS is on (ruling 1084): the
+                     front doors serve nothing in the clear then. */}}
+              value: {{ printf "%s://{instance}.%s-sidecars.%s.svc.cluster.local:%v" (ternary "https" "http" .Values.tls.internal.enabled) (include "meridian-runtime.fullname" .) .Release.Namespace .Values.sidecar.frontDoorPort | quote }}
             - name: MERIDIAN_DASHBOARD_SIGNING_KEY_DIR
               value: /etc/meridian/dashboard-signing
             {{- if .Values.registry.enabled }}
@@ -286,6 +288,7 @@ spec:
             {{- end }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
+            {{- with (include "meridian-runtime.internalTlsEnv" .) }}{{ . | nindent 12 }}{{- end }}
           # Read when first needed and kept once found, so the Job finishing
           # after this started needs no restart. Mounted whole for the same
           # reason: a subPath mount never sees an update.
@@ -293,6 +296,7 @@ spec:
             - name: dashboard-signing
               mountPath: /etc/meridian/dashboard-signing
               readOnly: true
+            {{- with (include "meridian-runtime.internalTlsMount" .) }}{{ . | nindent 12 }}{{- end }}
           # Ready only while the records are fresh: a dashboard that cannot read
           # who may do what is taken out rather than sending people to a
           # refusal. Alive is only that it answers at all, so a stale one is
@@ -323,6 +327,7 @@ spec:
           secret:
             secretName: {{ include "meridian-runtime.fullname" . }}-dashboard-signing
             defaultMode: 0440
+        {{- with (include "meridian-runtime.internalTlsVolume" .) }}{{ . | nindent 8 }}{{- end }}
 ---
 apiVersion: v1
 kind: Service

@@ -34,7 +34,7 @@ pub use backend::{
     RefusalStatus, Subscription,
 };
 pub use memory::MemoryBackend;
-pub use nats::NatsBackend;
+pub use nats::{NatsBackend, INTERNAL_TLS_CA};
 pub use router::{
     calls_by_topic, calls_said, timed, Bus, CallObserver, RouteRule, Stamp, TimedCall,
 };

@@ -181,7 +181,16 @@ spec:
               value: "0.0.0.0:{{ $top.Values.sidecar.frontDoorPort }}"
             - name: MERIDIAN_DASHBOARD_KEYS_DIR
               value: /etc/meridian/dashboard-keys
+            {{- if $top.Values.tls.internal.enabled }}
+            {{- /* Served over TLS alone (ruling 1084), under the sidecars'
+                   names, the dashboard verifying it against the CA. */}}
+            - name: MERIDIAN_INTERNAL_TLS_CERT
+              value: /etc/meridian-internal-tls-server/tls.crt
+            - name: MERIDIAN_INTERNAL_TLS_KEY
+              value: /etc/meridian-internal-tls-server/tls.key
             {{- end }}
+            {{- end }}
+            {{- with (include "meridian-runtime.internalTlsEnv" $top) }}{{ . | nindent 12 }}{{- end }}
             {{/*
               The credential this instance presents, which the plugin's
               container has no mount for. Containers in a pod share a network
@@ -207,13 +216,19 @@ spec:
             - name: front-door
               containerPort: {{ $top.Values.sidecar.frontDoorPort }}
           {{- end }}
-          {{- if or $top.Values.dashboard.enabled .live }}
+          {{- if or $top.Values.dashboard.enabled .live $top.Values.tls.internal.enabled }}
           volumeMounts:
             {{- if $top.Values.dashboard.enabled }}
             - name: dashboard-keys
               mountPath: /etc/meridian/dashboard-keys
               readOnly: true
+            {{- if $top.Values.tls.internal.enabled }}
+            - name: internal-tls-server
+              mountPath: /etc/meridian-internal-tls-server
+              readOnly: true
             {{- end }}
+            {{- end }}
+            {{- with (include "meridian-runtime.internalTlsMount" $top) }}{{ . | nindent 12 }}{{- end }}
             {{- if .live }}
             - name: live
               mountPath: /plugin/live
@@ -307,8 +322,12 @@ spec:
           resources:
             {{- toYaml (.resources | default $top.Values.resources) | nindent 12 }}
         {{- end }}
-      {{- if or .plugin $top.Values.dashboard.enabled }}
+      {{- if or .plugin $top.Values.dashboard.enabled $top.Values.tls.internal.enabled }}
       volumes:
+        {{- with (include "meridian-runtime.internalTlsVolume" $top) }}{{ . | nindent 8 }}{{- end }}
+        {{- if $top.Values.dashboard.enabled }}
+        {{- with (include "meridian-runtime.internalTlsServerVolume" (dict "top" $top "server" "sidecars")) }}{{ . | nindent 8 }}{{- end }}
+        {{- end }}
         {{- if .plugin }}
         - name: plugin-tmp
           emptyDir: {}

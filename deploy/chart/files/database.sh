@@ -10,6 +10,16 @@ set -eu
 # the image's postgres user's, as that entrypoint makes it, and Patroni run
 # as that user, never as root. A cluster that runs pods as its own user
 # (podSecurityContext) starts here as that user instead.
+# Internal TLS (tls.internal; ruling 1084): the chart's certificate copied
+# where the server's user alone reads its key, as Postgres requires of one.
+if [ -d /etc/meridian-internal-tls-server ] && [ ! -e /run/meridian-tls/tls.key ]; then
+  mkdir -p /run/meridian-tls
+  cp /etc/meridian-internal-tls-server/ca.crt /etc/meridian-internal-tls-server/tls.crt \
+    /etc/meridian-internal-tls-server/tls.key /run/meridian-tls/
+  chmod 0700 /run/meridian-tls
+  chmod 0600 /run/meridian-tls/*
+  if [ "$(id -u)" = 0 ]; then chown -R postgres:postgres /run/meridian-tls; fi
+fi
 if [ "$(id -u)" = 0 ]; then
   mkdir -p "$PGDATA"
   chown postgres:postgres /var/lib/postgresql/data "$PGDATA"

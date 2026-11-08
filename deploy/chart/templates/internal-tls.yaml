@@ -1,0 +1,72 @@
+{{- include "meridian-runtime.require" . -}}
+{{- if .Values.tls.internal.enabled }}
+{{/*
+  Internal TLS (values.yaml's tls.internal; ruling 1084): a CA made here for
+  this deployment's own paths, and each server's certificate from it -- the
+  brought database's, the broker's, and the plugins' front doors' -- each
+  under the names its clients reach it by. Kept across upgrades (read back,
+  as the WAL archive's certificates are), so a running server and a client
+  started after an upgrade still agree; the CA's key is kept beside its
+  certificate, mounted nowhere, so a certificate missing on an upgrade is
+  made again from the same CA.
+
+  Every client is given the CA's certificate alone (internalTlsVolume in
+  _helpers.tpl); each server its own certificate and key, in its own pods.
+*/}}
+{{- $full := include "meridian-runtime.fullname" . }}
+{{- $ns := .Release.Namespace }}
+{{- $caName := printf "%s-internal-tls-ca" $full }}
+{{- $heldCa := lookup "v1" "Secret" $ns $caName }}
+{{- $ca := dict }}
+{{- if and $heldCa $heldCa.data (index $heldCa.data "ca.key") }}
+{{- $ca = buildCustomCert (index $heldCa.data "ca.crt") (index $heldCa.data "ca.key") }}
+{{- else }}
+{{- $ca = genCA "meridian-internal" 3650 }}
+{{- end }}
+{{- $within := printf "%s.svc.cluster.local" $ns }}
+{{- $servers := dict
+      "database" (list (printf "%s-database" $full) (printf "%s-database.%s" $full $ns) (printf "%s-database.%s.svc" $full $ns) (printf "%s-database.%s" $full $within) (printf "*.%s-database-members.%s" $full $within))
+      "broker" (list (printf "%s-broker" $full) (printf "%s-broker.%s" $full $ns) (printf "%s-broker.%s.svc" $full $ns) (printf "%s-broker.%s" $full $within) (printf "*.%s-broker-members.%s" $full $within) (printf "*.%s-broker-jetstream-members.%s" $full $within))
+      "sidecars" (list (printf "*.%s-sidecars.%s" $full $within) (printf "*.%s-sidecars.%s.svc" $full $ns)) }}
+---
+# The internal CA: its certificate, which every component is given, and its
+# key, which no pod mounts.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $caName }}
+  labels:
+    meridian.dev/component: internal-tls
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+type: Opaque
+data:
+  ca.crt: {{ $ca.Cert | b64enc | quote }}
+  ca.key: {{ $ca.Key | b64enc | quote }}
+{{- range $server := list "database" "broker" "sidecars" }}
+{{- $name := printf "%s-internal-tls-%s" $full $server }}
+{{- $held := lookup "v1" "Secret" $ns $name }}
+{{- $tls := dict }}
+{{- if and $held $held.data (index $held.data "tls.key") (eq (index $held.data "ca.crt") ($ca.Cert | b64enc)) }}
+{{- $tls = $held.data }}
+{{- else }}
+{{- $names := index $servers $server }}
+{{- $made := genSignedCert (first $names) nil $names 3650 $ca }}
+{{- $tls = dict "ca.crt" ($ca.Cert | b64enc) "tls.crt" ($made.Cert | b64enc) "tls.key" ($made.Key | b64enc) }}
+{{- end }}
+---
+# The {{ $server }}'s certificate, from the internal CA, under the names its
+# clients reach it by.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $name }}
+  labels:
+    meridian.dev/component: internal-tls
+    {{- include "meridian-runtime.labels" $ | nindent 4 }}
+type: kubernetes.io/tls
+data:
+  {{- range $key := list "ca.crt" "tls.crt" "tls.key" }}
+  {{ $key }}: {{ index $tls $key | quote }}
+  {{- end }}
+{{- end }}
+{{- end }}

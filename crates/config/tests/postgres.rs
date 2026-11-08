@@ -2694,3 +2694,58 @@ fn a_deposed_conductors_commit_is_refused_after_a_takeover_and_takes_no_sequence
     let numbered: Vec<(u64, u64)> = page.changes.iter().map(|c| (c.sequence, c.epoch)).collect();
     assert_eq!(numbered, vec![(2, 1), (3, 2)]);
 }
+
+#[test]
+fn an_administrative_acts_record_is_kept_as_written() {
+    // Audit logging (ruling 1084; step 3b part 4): every change table, and
+    // the moves, refuses a change or a removal of a row, whoever asks; the
+    // store only ever adds to them.
+    let (_store, url) = store_at("append_only");
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("connects");
+    let guarded: i64 = client
+        .query_one(
+            "SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+              WHERE t.tgname = 'config_append_only'
+                AND c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = current_schema())",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    let tables: i64 = client
+        .query_one(
+            "SELECT count(*) FROM pg_tables WHERE schemaname = current_schema()
+                AND (tablename LIKE 'config\\_%\\_change' OR tablename = 'config_record_move')",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert!(tables >= 15, "the change tables are there: {tables}");
+    assert_eq!(
+        guarded, tables,
+        "every change table and the moves are append-only"
+    );
+
+    client
+        .execute(
+            "INSERT INTO config_hold_change (role, days, write_once, changed_by, changed_at_ns)
+             VALUES ('custody', 30, false, 'local|alice', 1)",
+            &[],
+        )
+        .expect("a record is added");
+    for refused in [
+        "UPDATE config_hold_change SET days = 1",
+        "DELETE FROM config_hold_change",
+    ] {
+        let failed = client.execute(refused, &[]).expect_err(refused);
+        assert_eq!(
+            failed.code(),
+            Some(&postgres::error::SqlState::INSUFFICIENT_PRIVILEGE),
+            "{refused}: {failed:?}"
+        );
+    }
+    let kept: i32 = client
+        .query_one("SELECT days FROM config_hold_change", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(kept, 30, "the record is as it was written");
+}

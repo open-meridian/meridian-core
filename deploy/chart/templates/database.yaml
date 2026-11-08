@@ -63,6 +63,10 @@
 {{- $synchronous := ternary 0 $standbys $converting }}
 {{- $scope := $name | trunc 63 | trimSuffix "-" }}
 {{- $archive := include "meridian-runtime.walArchive" . }}
+{{- /* Internal TLS (tls.internal; ruling 1084): served from the chart's
+       certificate, copied where the server's user alone reads its key, and
+       every remote connection held to TLS. */}}
+{{- $tls := .Values.tls.internal.enabled }}
 ---
 # Made once and kept. These and the disk beside them are a pair, and the
 # reason is Postgres's: POSTGRES_PASSWORD is read by initdb on an empty data
@@ -240,29 +244,84 @@ data:
       data_dir: /var/lib/postgresql/data/pgdata
       bin_dir: /usr/local/bin
       pgpass: /tmp/pgpass
-      {{- if $archive }}
-      # The WAL archived off the cluster by whichever member is primary,
-      # each segment as it fills or after backup.walArchive.timeoutSeconds
-      # (step 3b, section 4): local settings, which Patroni lays over its
-      # dynamic ones.
+      {{- if or $archive $tls }}
       parameters:
+        {{- if $archive }}
+        # The WAL archived off the cluster by whichever member is primary,
+        # each segment as it fills or after backup.walArchive.timeoutSeconds
+        # (step 3b, section 4): local settings, which Patroni lays over its
+        # dynamic ones.
         archive_mode: "on"
         archive_command: pgbackrest --stanza=meridian archive-push %p
         archive_timeout: {{ .Values.backup.walArchive.timeoutSeconds | default 60 | int }}
+        {{- end }}
+        {{- if $tls }}
+        # Internal TLS (ruling 1084): the chart's certificate, copied by
+        # database.sh where the server's user alone reads its key.
+        ssl: "on"
+        ssl_cert_file: /run/meridian-tls/tls.crt
+        ssl_key_file: /run/meridian-tls/tls.key
+        ssl_ca_file: /run/meridian-tls/ca.crt
+        {{- end }}
       {{- end }}
       authentication:
         superuser:
           username: postgres
         replication:
           username: postgres
+          {{- if $tls }}
+          # A standby streams from its primary over TLS, the primary
+          # verified against the internal CA. By its chain, not its name:
+          # members reach each other by their pods' addresses, which no
+          # certificate names.
+          sslmode: verify-ca
+          sslrootcert: /run/meridian-tls/ca.crt
+          {{- end }}
         rewind:
           username: postgres
+          {{- if $tls }}
+          sslmode: verify-ca
+          sslrootcert: /run/meridian-tls/ca.crt
+          {{- end }}
       pg_hba:
         - local all all trust
         - host all all 127.0.0.1/32 trust
+        {{- if $tls }}
+        # Over TLS or not at all, from anywhere but this pod.
+        - hostnossl all all 0.0.0.0/0 reject
+        - hostnossl all all ::/0 reject
+        - hostnossl replication all 0.0.0.0/0 reject
+        - hostssl replication postgres 0.0.0.0/0 scram-sha-256
+        - hostssl all all 0.0.0.0/0 scram-sha-256
+        - hostssl all all ::/0 scram-sha-256
+        {{- else }}
         - host replication postgres 0.0.0.0/0 scram-sha-256
         - host all all 0.0.0.0/0 scram-sha-256
         - host all all ::/0 scram-sha-256
+        {{- end }}
+{{- end }}
+{{- if and $tls (not $patroni) }}
+---
+# Who may connect, alone and over TLS (tls.internal; ruling 1084): the
+# server's own pod as the image's initdb admits it, and everyone else over
+# TLS or not at all.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-hba
+  labels:
+    {{- include "meridian-runtime.labels" . | nindent 4 }}
+data:
+  pg_hba.conf: |
+    local all all trust
+    host all all 127.0.0.1/32 trust
+    host all all ::1/128 trust
+    local replication all trust
+    host replication all 127.0.0.1/32 trust
+    host replication all ::1/128 trust
+    hostnossl all all all reject
+    hostnossl replication all all reject
+    hostssl all all all scram-sha-256
 {{- end }}
 ---
 apiVersion: apps/v1
@@ -433,6 +492,11 @@ spec:
             - name: patroni
               mountPath: /etc/patroni
               readOnly: true
+            {{- if $tls }}
+            - name: internal-tls-server
+              mountPath: /etc/meridian-internal-tls-server
+              readOnly: true
+            {{- end }}
             {{- if $archive }}
             - name: socket
               mountPath: /var/run/postgresql
@@ -441,17 +505,46 @@ spec:
           resources:
             {{- toYaml (.Values.database.brought.resources | default .Values.resources) | nindent 12 }}
           {{- else }}
-          {{- if $archive }}
-          # Archiving its WAL (backup.walArchive): the image's own entrypoint
-          # and server, told to archive through pgBackRest.
+          {{- if $tls }}
+          # Internal TLS (ruling 1084): the chart's certificate copied where
+          # the server's user alone reads its key, as Postgres requires of
+          # one, then the image's own entrypoint.
+          command:
+            - /bin/sh
+            - -c
+            - >-
+              mkdir -p /run/meridian-tls &&
+              cp /etc/meridian-internal-tls-server/ca.crt /etc/meridian-internal-tls-server/tls.crt /etc/meridian-internal-tls-server/tls.key /run/meridian-tls/ &&
+              chmod 0600 /run/meridian-tls/tls.key &&
+              { [ "$(id -u)" != 0 ] || chown -R postgres:postgres /run/meridian-tls; } &&
+              exec docker-entrypoint.sh "$@"
+            - --
+          {{- end }}
+          {{- if or $archive $tls }}
           args:
             - postgres
+            {{- if $archive }}
+            # Archiving its WAL (backup.walArchive): the image's own
+            # entrypoint and server, told to archive through pgBackRest.
             - -c
             - archive_mode=on
             - -c
             - archive_command=pgbackrest --stanza=meridian archive-push %p
             - -c
             - archive_timeout={{ .Values.backup.walArchive.timeoutSeconds | default 60 | int }}
+            {{- end }}
+            {{- if $tls }}
+            - -c
+            - ssl=on
+            - -c
+            - ssl_cert_file=/run/meridian-tls/tls.crt
+            - -c
+            - ssl_key_file=/run/meridian-tls/tls.key
+            - -c
+            - ssl_ca_file=/run/meridian-tls/ca.crt
+            - -c
+            - hba_file=/etc/meridian-hba/pg_hba.conf
+            {{- end }}
           {{- end }}
           env:
             - name: POSTGRES_USER
@@ -494,6 +587,14 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
+            {{- if $tls }}
+            - name: internal-tls-server
+              mountPath: /etc/meridian-internal-tls-server
+              readOnly: true
+            - name: hba
+              mountPath: /etc/meridian-hba
+              readOnly: true
+            {{- end }}
             {{- if $archive }}
             - name: socket
               mountPath: /var/run/postgresql
@@ -542,12 +643,18 @@ spec:
             limits:
               memory: 256Mi
         {{- end }}
-      {{- if or $patroni $archive }}
+      {{- if or $patroni $archive $tls }}
       volumes:
         {{- if $patroni }}
         - name: patroni
           configMap:
             name: {{ $name }}-patroni
+        {{- end }}
+        {{- with (include "meridian-runtime.internalTlsServerVolume" (dict "top" . "server" "database")) }}{{ . | nindent 8 }}{{- end }}
+        {{- if and $tls (not $patroni) }}
+        - name: hba
+          configMap:
+            name: {{ $name }}-hba
         {{- end }}
         {{- if $archive }}
         - name: socket
@@ -608,12 +715,18 @@ spec:
         - port: 8432
     {{- end }}
     {{- if $patroni }}
-    # Patroni's REST API: its own members, asking each other's positions.
+    # Patroni's REST API: its own members, asking each other's positions,
+    # and the replica scrub Job, re-cloning a standby whose copy is bad
+    # (database-replicas.yaml).
     - from:
         - podSelector:
             matchLabels:
               app.kubernetes.io/instance: {{ .Release.Name }}
               meridian.dev/component: database
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              meridian.dev/component: database-scrub
       ports:
         - port: 8008
     {{- end }}

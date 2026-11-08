@@ -13,7 +13,7 @@
 
 use std::collections::BTreeMap;
 
-use postgres::{GenericClient, IsolationLevel, NoTls, Transaction};
+use postgres::{GenericClient, IsolationLevel, Transaction};
 use prost::Message;
 use r2d2_postgres::PostgresConnectionManager;
 
@@ -31,8 +31,9 @@ use crate::store::{
     When,
 };
 
-type Pool = r2d2::Pool<PostgresConnectionManager<NoTls>>;
-type Connection = r2d2::PooledConnection<PostgresConnectionManager<NoTls>>;
+type Pool = r2d2::Pool<PostgresConnectionManager<meridian_changes::tls::DatabaseTls>>;
+type Connection =
+    r2d2::PooledConnection<PostgresConnectionManager<meridian_changes::tls::DatabaseTls>>;
 
 /// Names the schema lock: distinct from every other store's. `migrate`
 /// holds it, its backfills included, so whatever else takes it waits for a
@@ -63,7 +64,10 @@ impl PostgresStore {
             _ => "-c synchronous_commit=local".to_string(),
         };
         config.options(&options);
-        let manager = PostgresConnectionManager::new(config, NoTls);
+        let manager = PostgresConnectionManager::new(
+            config,
+            meridian_changes::tls::database_tls().map_err(unavailable)?,
+        );
         let pool = r2d2::Pool::builder()
             .max_size(pool_size.max(1))
             .build(manager)

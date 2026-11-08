@@ -17,6 +17,7 @@ pub mod lease;
 pub mod member;
 pub mod preflight;
 pub mod probe;
+pub mod replicas;
 pub mod scrub;
 
 use std::collections::BTreeMap;
@@ -257,8 +258,11 @@ pub fn database_answers(url: &str) -> Result<(), Wait> {
         .parse()
         .map_err(|failed| Wait::Refused(format!("the database URL is unreadable: {failed}")))?;
     config.connect_timeout(Duration::from_secs(5));
+    let (config, tls) =
+        meridian_changes::tls::secured(config, meridian_changes::tls::names_ssl_mode(url))
+            .map_err(|failed| Wait::Refused(format!("the database's TLS: {failed}")))?;
     config
-        .connect(postgres::NoTls)
+        .connect(tls)
         .map(drop)
         .map_err(|failed| Wait::NotYet(failed.to_string()))
 }
@@ -1010,8 +1014,13 @@ pub fn grant_serving(migrating_url: &str, serving_url: &str) -> Result<(), Strin
     }
     let role = format!("\"{role}\"");
 
+    let (migrating, tls) = meridian_changes::tls::secured(
+        migrating,
+        meridian_changes::tls::names_ssl_mode(migrating_url),
+    )
+    .map_err(|failed| format!("the database's TLS: {failed}"))?;
     let mut client = migrating
-        .connect(postgres::NoTls)
+        .connect(tls)
         .map_err(|failed| format!("the migrating role could not connect: {failed}"))?;
 
     // The schema the migration just wrote into, rather than `public` by name:

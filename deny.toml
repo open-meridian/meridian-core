@@ -10,6 +10,14 @@
 # NFKC its injection rules match on. Already in the tree through the URL
 # parser; the rules themselves are plain matchers, with no regular-expression
 # crate. Its advisories are checked here as every other crate's are.
+#
+# And one for internal TLS (ruling 1084; step 3b part 4, the product owner,
+# 2026-11-07): `tokio-postgres-rustls` 0.14 (MIT), the stores' Postgres
+# connector over the rustls the tree already has, with aws-lc-rs as its one
+# provider. Its licence and those of what it brings -- x509-cert, der_derive,
+# tls_codec, tls_codec_derive (Apache-2.0 OR MIT) and flagset (Apache-2.0) --
+# were checked against the workspace's AGPL-3.0-or-later when it entered;
+# its advisories are checked here as every other crate's are.
 
 [advisories]
 # Unmaintained crates are reported by their direct dependents' advisories when

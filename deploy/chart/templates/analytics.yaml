@@ -88,13 +88,16 @@ spec:
               value: {{ $.Values.analytics.priceDeadlineMs | quote }}
             {{- end }}
             {{- include "meridian-runtime.readyEnv" $ | nindent 12 }}
+            {{- with (include "meridian-runtime.internalTlsEnv" $) }}{{ . | nindent 12 }}{{- end }}
           {{- include "meridian-runtime.readyProbe" $ | nindent 10 }}
           volumeMounts:
             {{- include "meridian-runtime.readyMount" $ | nindent 12 }}
+            {{- with (include "meridian-runtime.internalTlsMount" $) }}{{ . | nindent 12 }}{{- end }}
           resources:
             {{- toYaml $values.resources | nindent 12 }}
       volumes:
         {{- include "meridian-runtime.readyVolume" $ | nindent 8 }}
+        {{- with (include "meridian-runtime.internalTlsVolume" $) }}{{ . | nindent 8 }}{{- end }}
 {{- if gt (int $copies) 1 }}
 {{ include "meridian-runtime.budget" (dict "top" $ "component" (printf "analytics-%s" $part)) }}
 {{- end }}

@@ -211,6 +211,35 @@ INGRESS_UPSTREAM = os.environ.get(
 )
 DASHBOARD_URL = f"http://{HOST}"
 WIZARD = DASHBOARD_URL
+# This machine's port the cluster's port 80 is published on (the Makefile's
+# E2E_CLUSTER_HTTP_PORT, 80 by default, as CI runs). On a laptop whose own
+# cluster holds 80 -- Rancher Desktop forwards it to its own ingress -- a run
+# publishes another, and this runner reaches the dashboard there: the
+# connection goes to 127.0.0.1 at that port and the name stays in the Host
+# header, so the deployment sees what it sees on 80. Only this runner's own
+# requests move; the dashboard's address, and every pod's, stays on 80.
+HTTP_PORT = int(os.environ.get("E2E_CLUSTER_HTTP_PORT") or 80)
+
+
+def here(url):
+    """`url` as this runner reaches it: (address, extra headers). A name of
+    the deployment's, on a port other than 80, goes to 127.0.0.1 there."""
+    import urllib.parse
+
+    parts = urllib.parse.urlsplit(url)
+    name = parts.hostname or ""
+    if HTTP_PORT == 80 or parts.port not in (None, 80) or not (
+        name == HOST or name.endswith(f".{HOST}")
+    ):
+        return url, {}
+    target = urllib.parse.urlunsplit(parts._replace(netloc=f"127.0.0.1:{HTTP_PORT}"))
+    return target, {"Host": name}
+
+
+def opened(url):
+    """urlopen, through `here`."""
+    target, headers = here(url)
+    return urllib.request.urlopen(urllib.request.Request(target, headers=headers))
 # What an ingress controller answers when the dashboard behind it is not
 # there, and how long to keep asking: the dashboard restarts twice after
 # apply, once for the Secrets and once more with the conductor.
@@ -313,7 +342,8 @@ def post(path, fields, cookies):
     import urllib.parse
 
     data = urllib.parse.urlencode(fields).encode()
-    request = urllib.request.Request(f"{WIZARD}{path}", data=data, method="POST")
+    target, headers = here(f"{WIZARD}{path}")
+    request = urllib.request.Request(target, data=data, method="POST", headers=headers)
     request.add_header("Content-Type", "application/x-www-form-urlencoded")
     if cookies:
         request.add_header("Cookie", "; ".join(f"{k}={v}" for k, v in cookies.items()))
@@ -343,7 +373,8 @@ def post(path, fields, cookies):
 
 
 def get(path, cookies):
-    request = urllib.request.Request(f"{WIZARD}{path}")
+    target, headers = here(f"{WIZARD}{path}")
+    request = urllib.request.Request(target, headers=headers)
     request.add_header("Cookie", "; ".join(f"{k}={v}" for k, v in cookies.items()))
     for _ in range(GATEWAY_RETRIES):
         try:
@@ -372,6 +403,8 @@ def fetch(method, url, cookies, fields=None):
     if parts.hostname == "host.docker.internal":
         target = urllib.parse.urlunsplit(parts._replace(netloc=f"127.0.0.1:{parts.port}"))
         headers["Host"] = parts.netloc
+    else:
+        target, headers = here(url)
     data = urllib.parse.urlencode(fields).encode() if fields is not None else None
     request = urllib.request.Request(target, data=data, method=method, headers=headers)
     if cookies:
@@ -627,7 +660,7 @@ def main():
         # Through the Ingress: the controller takes a moment to read it.
         wait_for(
             "the dashboard through the Ingress",
-            lambda: urllib.request.urlopen(f"{WIZARD}/healthz").status == 200,
+            lambda: opened(f"{WIZARD}/healthz").status == 200,
         )
         s.check(True, f"the dashboard answers at {WIZARD}, through the cluster's ingress controller")
 
@@ -635,10 +668,10 @@ def main():
         wait_for(
             "enrolment",
             lambda: "not registered"
-            not in urllib.request.urlopen(f"{WIZARD}/first-run").read().decode(),
+            not in opened(f"{WIZARD}/first-run").read().decode(),
             seconds=180,
         )
-        page = urllib.request.urlopen(f"{WIZARD}/first-run").read().decode()
+        page = opened(f"{WIZARD}/first-run").read().decode()
         # Requirement 8, and the reason it exists: an administrator comparing
         # the two is how a code somebody else spent is noticed. Both sides are
         # asked here, which no other test does -- the stand-in platform simply

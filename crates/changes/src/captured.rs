@@ -632,8 +632,10 @@ impl Tail {
 
     fn run(url: &str, spec: &Spec, bus: &meridian_bus::Bus, domain: &str) -> Result<(), String> {
         use postgres::fallible_iterator::FallibleIterator;
-        let mut client =
-            postgres::Client::connect(url, postgres::NoTls).map_err(|e| e.to_string())?;
+        let config: postgres::Config = url.parse().map_err(|e: postgres::Error| e.to_string())?;
+        let (config, tls) = crate::tls::secured(config, crate::tls::names_ssl_mode(url))
+            .map_err(|e| e.to_string())?;
+        let mut client = config.connect(tls).map_err(|e| e.to_string())?;
         client
             .batch_execute(&format!("LISTEN {}_changes", spec.prefix))
             .map_err(|e| e.to_string())?;

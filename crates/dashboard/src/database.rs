@@ -26,9 +26,11 @@
 //! other stores' rule, for the same reason -- the role the dashboard serves
 //! as may not create a table.
 
-type Pool = r2d2::Pool<r2d2_postgres::PostgresConnectionManager<postgres::NoTls>>;
-pub(crate) type Connection =
-    r2d2::PooledConnection<r2d2_postgres::PostgresConnectionManager<postgres::NoTls>>;
+type Pool =
+    r2d2::Pool<r2d2_postgres::PostgresConnectionManager<meridian_changes::tls::DatabaseTls>>;
+pub(crate) type Connection = r2d2::PooledConnection<
+    r2d2_postgres::PostgresConnectionManager<meridian_changes::tls::DatabaseTls>,
+>;
 
 /// Names this store's schema lock, distinct from every other component's, so
 /// a deployment migrating them together does not have one wait on another.
@@ -216,7 +218,11 @@ impl Database {
         if config.get_tcp_user_timeout().is_none() {
             config.tcp_user_timeout(give_up);
         }
-        let manager = r2d2_postgres::PostgresConnectionManager::new(config, postgres::NoTls);
+        // TLS where the deployment's internal TLS is on (ruling 1084).
+        let (config, tls) =
+            meridian_changes::tls::secured(config, meridian_changes::tls::names_ssl_mode(url))
+                .map_err(|failed| failed.to_string())?;
+        let manager = r2d2_postgres::PostgresConnectionManager::new(config, tls);
         let pool = r2d2::Pool::builder()
             .max_size(pool_size.max(1))
             .build(manager)

@@ -120,6 +120,18 @@ async-trait = "0.1"
 postgres = "0.19"
 r2d2 = "0.8"
 r2d2_postgres = "0.18"
+# TLS on the deployment's internal paths (ruling 1084; step 3b part 4), off
+# unless the chart's tls.internal.enabled is on: the stores' Postgres
+# clients through one connector (meridian-changes' `tls`), the broker's over
+# async-nats's own rustls, a plugin's front door served over tokio-rustls.
+# rustls with aws-lc-rs and nothing else, the one provider in the tree (see
+# async-nats above). tokio-postgres-rustls is MIT, entered by the ruling
+# (deny.toml); webpki-roots, already in the tree, is a database URL's own
+# `sslmode` verified against the public roots where internal TLS is off.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }
+tokio-postgres-rustls = { version = "0.14", default-features = false, features = ["aws-lc-rs"] }
+webpki-roots = "1"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -23,7 +23,7 @@
 //! carried, 18 places and 38 digits, whoever writes it.
 
 use postgres::types::ToSql;
-use postgres::{GenericClient, IsolationLevel, NoTls, Row, Transaction};
+use postgres::{GenericClient, IsolationLevel, Row, Transaction};
 use r2d2_postgres::PostgresConnectionManager;
 
 use crate::amounts::{Exact, Money, Quantity};
@@ -39,8 +39,9 @@ use crate::store::{
     SyncStatusesRead, PARTITION, SYNC_STATUS_NOT_KNOWN_BEFORE,
 };
 
-type Pool = r2d2::Pool<PostgresConnectionManager<NoTls>>;
-type Connection = r2d2::PooledConnection<PostgresConnectionManager<NoTls>>;
+type Pool = r2d2::Pool<PostgresConnectionManager<meridian_changes::tls::DatabaseTls>>;
+type Connection =
+    r2d2::PooledConnection<PostgresConnectionManager<meridian_changes::tls::DatabaseTls>>;
 
 /// Names the schema lock. Distinct from the instrument store's, so a deployment running
 /// both does not have one wait on the other.
@@ -87,7 +88,10 @@ pub const CHANGES: meridian_changes::captured::Spec = meridian_changes::captured
 impl PostgresStore {
     pub fn connect(url: &str, pool_size: u32) -> Result<Self> {
         let config = meridian_changes::database_config(url).map_err(unavailable)?;
-        let manager = PostgresConnectionManager::new(config, NoTls);
+        let manager = PostgresConnectionManager::new(
+            config,
+            meridian_changes::tls::database_tls().map_err(unavailable)?,
+        );
         let pool = r2d2::Pool::builder()
             .max_size(pool_size.max(1))
             .build(manager)

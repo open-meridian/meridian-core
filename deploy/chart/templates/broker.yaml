@@ -377,6 +377,12 @@ spec:
             - --jetstream-store
             - /data/jetstream
             {{- end }}
+            {{- if .Values.tls.internal.enabled }}
+            # Every client and route over TLS, or not at all (ruling 1084),
+            # with the chart's certificate for the broker's names.
+            - --tls
+            - /etc/meridian-internal-tls-server
+            {{- end }}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -412,6 +418,11 @@ spec:
             - name: jetstream
               mountPath: /data/jetstream
             {{- end }}
+            {{- if .Values.tls.internal.enabled }}
+            - name: internal-tls-server
+              mountPath: /etc/meridian-internal-tls-server
+              readOnly: true
+            {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       volumes:
@@ -422,6 +433,7 @@ spec:
         - name: instances
           configMap:
             name: {{ $name }}-instances
+        {{- with (include "meridian-runtime.internalTlsServerVolume" (dict "top" . "server" "broker")) }}{{ . | nindent 8 }}{{- end }}
   {{- if gt $jetstream 0 }}
   volumeClaimTemplates:
     - metadata:

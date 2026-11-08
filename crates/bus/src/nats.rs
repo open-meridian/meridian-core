@@ -253,6 +253,12 @@ async fn heartbeat(client: async_nats::Client) {
     }
 }
 
+/// The internal CA's certificate, a PEM file, where the deployment's
+/// internal TLS is on (the chart's `tls.internal.enabled`; ruling 1084).
+/// Every client in the runtime reads it: the broker's here, the database's
+/// and a front door's through meridian-changes' `tls`.
+pub const INTERNAL_TLS_CA: &str = "MERIDIAN_INTERNAL_TLS_CA";
+
 /// Split `nats://user:password@host` into what to present and where.
 ///
 /// Taken from the URL rather than from a second setting, because that is where
@@ -291,7 +297,29 @@ fn credential_in(url: &str) -> (async_nats::ConnectOptions, Vec<String>) {
         .collect();
     // A server that does not answer is given as long as the heartbeat
     // gives one, before the next is tried.
-    (options.connection_timeout(UNANSWERED), servers)
+    let options = options.connection_timeout(UNANSWERED);
+    (
+        with_internal_tls(options, std::env::var(INTERNAL_TLS_CA).ok()),
+        servers,
+    )
+}
+
+/// Over TLS, and only over TLS, where the deployment's internal TLS is on:
+/// each server verified against the internal CA by the name it was given.
+/// Only those names: a cluster's servers also tell a client each other's
+/// addresses, by IP, which no certificate names, and every server is named
+/// in the URL already.
+fn with_internal_tls(
+    options: async_nats::ConnectOptions,
+    ca: Option<String>,
+) -> async_nats::ConnectOptions {
+    match ca.filter(|path| !path.trim().is_empty()) {
+        None => options,
+        Some(ca) => options
+            .require_tls(true)
+            .add_root_certificates(std::path::PathBuf::from(ca))
+            .ignore_discovered_servers(),
+    }
 }
 
 /// The address without its credential, for anything anybody will read.

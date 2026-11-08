@@ -39,6 +39,7 @@ use prost::Message;
 
 pub mod captured;
 pub mod integrity;
+pub mod tls;
 
 /// The most a page of changes holds, encoded (1056: 512 KiB pages).
 pub const PAGE_MOST: usize = 512 * 1024;
@@ -74,6 +75,9 @@ pub fn database_config(url: &str) -> Result<postgres::Config, postgres::Error> {
             .keepalives_interval(std::time::Duration::from_secs(2))
             .keepalives_retries(2);
     }
+    // TLS where the deployment's internal TLS is on, or the URL asks for
+    // it; in the clear, as always, otherwise (ruling 1084).
+    tls::database_tls_mode(&mut config, tls::names_ssl_mode(url));
     Ok(config)
 }
 

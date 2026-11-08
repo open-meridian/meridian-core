@@ -11,7 +11,7 @@
 //! concurrent pair cannot both pass the check. Permissions change rarely, and
 //! a queue of two is a small price for never having no administrator.
 
-use postgres::{IsolationLevel, NoTls};
+use postgres::IsolationLevel;
 use r2d2_postgres::PostgresConnectionManager;
 
 use meridian_domain::v1::{
@@ -34,8 +34,9 @@ use crate::store::{
 use crate::store::{ConnectivityLinkChange, HeldMapping, VenueAccountMapChange};
 use crate::DEPLOYMENT_ADMIN;
 
-type Pool = r2d2::Pool<PostgresConnectionManager<NoTls>>;
-type Connection = r2d2::PooledConnection<PostgresConnectionManager<NoTls>>;
+type Pool = r2d2::Pool<PostgresConnectionManager<meridian_changes::tls::DatabaseTls>>;
+type Connection =
+    r2d2::PooledConnection<PostgresConnectionManager<meridian_changes::tls::DatabaseTls>>;
 
 /// Names the schema lock. Distinct from the street and instrument stores', so
 /// a deployment migrating them together does not have one wait on another.
@@ -114,7 +115,10 @@ pub const CHANGES: meridian_changes::captured::Spec = meridian_changes::captured
 impl PostgresStore {
     pub fn connect(url: &str, pool_size: u32) -> Result<Self> {
         let config = meridian_changes::database_config(url).map_err(unavailable)?;
-        let manager = PostgresConnectionManager::new(config, NoTls);
+        let manager = PostgresConnectionManager::new(
+            config,
+            meridian_changes::tls::database_tls().map_err(unavailable)?,
+        );
         let pool = r2d2::Pool::builder()
             .max_size(pool_size.max(1))
             .build(manager)

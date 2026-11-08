@@ -23,7 +23,6 @@
 use meridian_domain::asset_class;
 use meridian_domain::v1::AssetClass;
 use postgres::types::ToSql;
-use postgres::NoTls;
 use r2d2_postgres::PostgresConnectionManager;
 
 use crate::store::{
@@ -31,8 +30,9 @@ use crate::store::{
     Store, StoreError, Version, Written,
 };
 
-type Pool = r2d2::Pool<PostgresConnectionManager<NoTls>>;
-type Connection = r2d2::PooledConnection<PostgresConnectionManager<NoTls>>;
+type Pool = r2d2::Pool<PostgresConnectionManager<meridian_changes::tls::DatabaseTls>>;
+type Connection =
+    r2d2::PooledConnection<PostgresConnectionManager<meridian_changes::tls::DatabaseTls>>;
 
 /// Applied by `migrate`, in order.
 const SCHEMA: &[&str] = &[
@@ -126,7 +126,10 @@ impl PostgresStore {
     /// Open a pool. Does not create the schema; call [`PostgresStore::migrate`].
     pub fn connect(url: &str, pool_size: u32) -> Result<Self> {
         let config = meridian_changes::database_config(url).map_err(unavailable)?;
-        let manager = PostgresConnectionManager::new(config, NoTls);
+        let manager = PostgresConnectionManager::new(
+            config,
+            meridian_changes::tls::database_tls().map_err(unavailable)?,
+        );
         let pool = r2d2::Pool::builder()
             .max_size(pool_size.max(1))
             .build(manager)

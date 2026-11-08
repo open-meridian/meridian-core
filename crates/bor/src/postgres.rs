@@ -19,7 +19,7 @@
 //! against a projection; the projections are written beside the entry, read
 //! by the reads, and rebuilt from the journal whole by [`Store::rebuild`].
 
-use postgres::{GenericClient, IsolationLevel, NoTls, Row, Transaction};
+use postgres::{GenericClient, IsolationLevel, Row, Transaction};
 use prost::Message;
 use r2d2_postgres::PostgresConnectionManager;
 
@@ -38,8 +38,9 @@ use crate::store::{
     Result, Scope, Store, StoreError, CONTROL_PARTITION, FIRST_PARTITION,
 };
 
-type Pool = r2d2::Pool<PostgresConnectionManager<NoTls>>;
-type Connection = r2d2::PooledConnection<PostgresConnectionManager<NoTls>>;
+type Pool = r2d2::Pool<PostgresConnectionManager<meridian_changes::tls::DatabaseTls>>;
+type Connection =
+    r2d2::PooledConnection<PostgresConnectionManager<meridian_changes::tls::DatabaseTls>>;
 
 /// Names the schema lock: distinct from every other store's.
 const SCHEMA_LOCK: i64 = 0x626f_6f6b_0000_0001_u64 as i64;
@@ -60,7 +61,10 @@ pub struct PostgresStore {
 impl PostgresStore {
     pub fn connect(url: &str, pool_size: u32) -> Result<Self> {
         let config = meridian_changes::database_config(url).map_err(unavailable)?;
-        let manager = PostgresConnectionManager::new(config, NoTls);
+        let manager = PostgresConnectionManager::new(
+            config,
+            meridian_changes::tls::database_tls().map_err(unavailable)?,
+        );
         let pool = r2d2::Pool::builder()
             .max_size(pool_size.max(1))
             .build(manager)
