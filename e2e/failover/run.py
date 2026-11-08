@@ -604,11 +604,13 @@ def internal_tls(s):
                         f"curl -fsS -m 5 http://{address}:8008/patroni", check=False)
         s.check(clear.returncode != 0,
                 f"Patroni's REST API on {other} answers a plaintext request nothing")
+    # A request whose certificate its Patroni could not verify, as the
+    # client; not the server's own complaint about the plaintext request
+    # above ([SSL: HTTP_REQUEST]), which is this check's doing.
     for each in members:
         logs = kubectl("logs", each, "-c", "postgres", check=False).stdout.decode(errors="replace")
         failed = [line for line in logs.splitlines()
-                  if "CERTIFICATE_VERIFY_FAILED" in line or "certificate verify failed" in line
-                  or "SSLError" in line]
+                  if "CERTIFICATE_VERIFY_FAILED" in line or "certificate verify failed" in line]
         s.check(not failed, f"{each}'s Patroni reached the other members' REST APIs with their "
                 f"certificates verified" + (f": {failed[-1][-200:]}" if failed else ""))
 
