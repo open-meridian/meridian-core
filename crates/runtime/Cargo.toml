@@ -93,6 +93,11 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 prost.workspace = true
+# The lease's election over a simulated network, in virtual time, with
+# links cut and held on a seeded schedule (ruling 1105).
+turmoil = "0.6"
+# turmoil's network seeded per run, so a seed is the same run every time.
+rand = { version = "0.8", features = ["small_rng"] }
 # Signing a deployment admin's assertion, as the dashboard does, and reading
 # the plugin's scope stream, in the wiring test.
 ed25519-dalek.workspace = true
