@@ -13,6 +13,8 @@ harness groups, the cluster runs -- and decides, for a run, which of them run:
       and a pull request whose changes cannot be read, runs everything.
   ci_tier.py table
       every job, today / pull request (fast tier) / merge queue, as Markdown.
+  ci_tier.py suites
+      every harness suite the groups run, one a line (make ci-mirror-check).
   ci_tier.py check [--workflow .github/workflows/ci.yaml]
       the merge queue's plan runs every stage of ci-local, every harness
       group and every cluster run; every stage of ci-local runs in a tier;
@@ -280,6 +282,7 @@ def main() -> int:
     p.add_argument("--base", default="")
     p.add_argument("--head", default="HEAD")
     sub.add_parser("table")
+    sub.add_parser("suites")
     c = sub.add_parser("check")
     c.add_argument("--workflow", default=".github/workflows/ci.yaml")
     c.add_argument("--makefile", default="Makefile")
@@ -290,6 +293,11 @@ def main() -> int:
         paths = changed_files(asked.base, asked.head) if asked.event == "pull_request" and asked.base else None
         for key, value in plan(asked.event, paths).items():
             print(f"{key}={value}")
+        return 0
+    if asked.command == "suites":
+        for group in HARNESS_GROUPS:
+            for suite in group["suites"].split():
+                print(suite)
         return 0
     if asked.command == "table":
         print(table())

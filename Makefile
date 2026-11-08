@@ -329,8 +329,10 @@ ci-local-deep: ci-local
 ci-mirror-check:
 	@$(PY) tools/ci_mirror_check.py --repo-root .
 	@# Ruling 556: every harness suite in exactly one of CI's e2e-harness
-	@# groups, so a suite added here is never one no job runs.
-	@grouped="$$(sed -n 's/^ *suites: //p' .github/workflows/ci.yaml | tr ' ' '\n' | grep . | LC_ALL=C sort)"; \
+	@# groups, so a suite added here is never one no job runs. The groups
+	@# are the tier plan's (tools/ci_tier.py HARNESS_GROUPS), which ci.yaml's
+	@# harness job takes its matrix from.
+	@grouped="$$($(PY) tools/ci_tier.py suites | LC_ALL=C sort)"; \
 	suites="$$(printf '%s\n' $(HARNESS_SUITES) | LC_ALL=C sort)"; \
 	[ "$$grouped" = "$$suites" ] \
 		|| { echo "ci-mirror-check FAILED: CI's e2e-harness groups run $$(echo $$grouped), and HARNESS_SUITES is $$(echo $$suites); each suite in exactly one group" >&2; exit 1; }
