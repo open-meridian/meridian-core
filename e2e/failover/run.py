@@ -1367,8 +1367,14 @@ def zone_lost(s):
 # acknowledged id printed, the connection made again after a refusal.
 LONG_WRITER = r"""
 export PGPASSWORD="$POSTGRES_PASSWORD"
+# Each attempt bounded, so a stop is heard within seconds: a connection to a
+# database member that moved away (a reconfigure replaces them all) otherwise
+# waits out TCP's own timeout, and the writer missed its 60 s to stop (CI run
+# 42460520211). An attempt cut short prints nothing, so it is never counted
+# acknowledged; a commit is never cancelled from the server's side.
+export PGCONNECT_TIMEOUT=5
 while [ ! -e /tmp/stop ]; do
-  id=$(psql -X -q -At -h HOST -U postgres -d meridian -v ON_ERROR_STOP=1 \
+  id=$(timeout 15 psql -X -q -At -h HOST -U postgres -d meridian -v ON_ERROR_STOP=1 \
        -c "insert into failover_marks (at) values (clock_timestamp()) returning id" 2>/dev/null) \
     && echo "ACKED $id"
   sleep 0.2
