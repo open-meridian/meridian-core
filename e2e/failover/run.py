@@ -1674,6 +1674,33 @@ def database_said(s, when):
     s.note(f"{when}: the preflight said: {logs.stdout.decode(errors='replace').strip()[-2000:] or 'nothing'}")
 
 
+def rollout_unfinished():
+    """Each Deployment and StatefulSet of the release whose rollout is not
+    finished, and why, judged as `meridian upgrade-deployment` judges it
+    before it says an upgrade is done (meridian-cli, upgrade_deployment.rs):
+    its template seen by its controller, every replica on it and ready,
+    and nothing old left -- a StatefulSet's current revision its update's."""
+    left = []
+    for kind in ("deployments", "statefulsets"):
+        items = json.loads(out("get", kind, "-l", f"app.kubernetes.io/instance={RELEASE}", "-o", "json"))["items"]
+        for item in items:
+            name, spec, status = item["metadata"]["name"], item["spec"], item.get("status", {})
+            wanted = spec.get("replicas", 1)
+            if item["metadata"].get("generation", 0) > status.get("observedGeneration", 0):
+                left.append(f"{name}: its new template not yet seen")
+            elif status.get("updatedReplicas", 0) < wanted:
+                left.append(f"{name}: {status.get('updatedReplicas', 0)} of {wanted} on the new template")
+            elif status.get("readyReplicas", 0) < wanted:
+                left.append(f"{name}: {status.get('readyReplicas', 0)} of {wanted} ready")
+            elif kind == "deployments" and (status.get("replicas", 0) > wanted
+                                            or status.get("availableReplicas", 0) < wanted):
+                left.append(f"{name}: old pods still being replaced")
+            elif kind == "statefulsets" and spec.get("updateStrategy", {}).get("type") != "OnDelete" \
+                    and status.get("currentRevision") != status.get("updateRevision"):
+                left.append(f"{name}: its update not finished")
+    return left
+
+
 def ready_of(pod):
     return bool(pod) and ready(pod)
 
@@ -1754,19 +1781,23 @@ def reconfigure(s):
         SHAPE = target
         if target == "ha":
             # A database alone moves under Patroni first, alone, and is given
-            # its standbys by a second upgrade with the same values, as
-            # `meridian upgrade-deployment` runs it when the chart says so.
+            # its standbys by a second upgrade with the same values, as the
+            # chart says. Run once the first has rolled out, as `meridian
+            # upgrade-deployment` waits for every workload of the release
+            # before it returns: member 0's postgres answering on its own
+            # address is not the Service routing to it, which it does only
+            # once Patroni says the member is ready, and a second upgrade
+            # started before that met its preflight refused (CI runs
+            # 42453056096, 42462993343 and 42482853675's run 3: no ready
+            # endpoint for over a minute).
             said = upgraded.stdout.decode(errors="replace")
             moved = "upgrade again with" in said
             s.check(moved, "reconfigure: the chart says the database moves under Patroni first, alone")
             if moved:
-                wait_for("the database under Patroni, member 0 its leader", lambda: kubectl(
-                    "exec", f"{FULL}-database-0", "-c", "postgres", "--", "pg_isready", "-h", "127.0.0.1",
-                    "-U", "postgres", check=False).returncode == 0 and psql(
-                    "select not pg_is_in_recovery()", database="postgres", pod=f"{FULL}-database-0") == "t",
-                    seconds=600)
-                print(f"R: member 0 answers as the primary, {time.time() - began:.0f}s after the first upgrade; "
-                      "the second upgrade", flush=True)
+                wait_for("the first upgrade rolled out, as meridian upgrade-deployment waits for it",
+                         lambda: not rollout_unfinished(), seconds=600)
+                print(f"R: the first upgrade rolled out, {time.time() - began:.0f}s after it; the second upgrade",
+                      flush=True)
                 member_now("before the second upgrade")
                 with HookLog("preflight") as preflight:
                     again = run("helm", "upgrade", RELEASE, CHART, "--namespace", NAMESPACE, "--reuse-values",

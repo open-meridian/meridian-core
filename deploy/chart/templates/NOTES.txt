@@ -69,8 +69,11 @@ refuses to render, the message names the value that is wrong.
 {{- $wasPatroni := eq (dig "spec" "template" "metadata" "labels" "meridian.dev/database-manager" "" (default (dict) $live)) "patroni" }}
 {{- if and (gt $running 0) (not $wasPatroni) (gt (int (include "meridian-runtime.databaseStandbys" .)) 0) }}
 
-The database moves under Patroni with this upgrade, alone; upgrade again with
-the same values to add its standbys, which clone from it (meridian
-upgrade-deployment does).
+The database moves under Patroni with this upgrade, alone; once it has
+rolled out, upgrade again with the same values to add its standbys, which
+clone from it. Until its first member is ready the database answers nobody,
+and the second upgrade's preflight would find it refusing: wait with
+`meridian upgrade-deployment`, which returns once every workload is ready,
+or with `kubectl -n {{ .Release.Namespace }} rollout status statefulset/{{ $db }}`.
 {{- end }}
 {{- end }}
