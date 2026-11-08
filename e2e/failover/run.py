@@ -1674,6 +1674,36 @@ def database_said(s, when):
     s.note(f"{when}: the preflight said: {logs.stdout.decode(errors='replace').strip()[-2000:] or 'nothing'}")
 
 
+class HookLog:
+    """A hook Job's log, read every second while an upgrade runs, the last
+    read kept: a hook that passes is deleted with its pod when it succeeds,
+    so what it said -- how long it waited for the database, and why -- is
+    read while it runs or never."""
+
+    def __init__(self, job):
+        import threading
+        self.job = f"{FULL}-{job}"
+        self.said = ""
+        self.done = threading.Event()
+        self.thread = threading.Thread(target=self.follow, daemon=True)
+
+    def follow(self):
+        while not self.done.is_set():
+            done = kubectl("logs", f"job/{self.job}", "--all-containers", "--timestamps", "--tail=60", check=False)
+            text = done.stdout.decode(errors="replace").strip()
+            if done.returncode == 0 and text:
+                self.said = text
+            self.done.wait(1)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_):
+        self.done.set()
+        self.thread.join(timeout=20)
+
+
 def member_now(when):
     """Which of the database's StatefulSet revisions member 0 is from, and
     what it is: printed, for reading a move under Patroni."""
@@ -1719,8 +1749,12 @@ def reconfigure(s):
                 print(f"R: member 0 answers as the primary, {time.time() - began:.0f}s after the first upgrade; "
                       "the second upgrade", flush=True)
                 member_now("before the second upgrade")
-                again = run("helm", "upgrade", RELEASE, CHART, "--namespace", NAMESPACE, "--reuse-values",
-                            *helm_takes_counts(), "--set", f"resilience.profile={target}", check=False)
+                with HookLog("preflight") as preflight:
+                    again = run("helm", "upgrade", RELEASE, CHART, "--namespace", NAMESPACE, "--reuse-values",
+                                *helm_takes_counts(), "--set", f"resilience.profile={target}", check=False)
+                print(f"R: the second upgrade's preflight said, {time.time() - began:.0f}s after the first "
+                      f"upgrade:\n{preflight.said or '(nothing read)'}", flush=True)
+                member_now("after the second upgrade")
                 s.check(again.returncode == 0, "reconfigure: the second upgrade adds the database's standbys"
                         + ("" if again.returncode == 0 else f": {again.stderr.decode(errors='replace')[-400:]}"))
                 if again.returncode != 0:
