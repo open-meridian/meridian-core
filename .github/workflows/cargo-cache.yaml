@@ -70,11 +70,31 @@ jobs:
         if: steps.cargo-cache.outputs.cache-hit != 'true'
         run: tools/ci-cargo-cache.sh put "$RUNNER_TEMP/cargo"
 
+      # GitHub's cache scopes an entry to the ref that wrote it, and every
+      # run reads its own ref's and main's alone: what a pull request or the
+      # merge queue keeps is no use to the next one (#98's merge-queue run
+      # found its tools and its sccache entries cold). So main keeps them,
+      # on every push, for every run (step 3b part 5): the tools every job
+      # fetches (tools/ci-tools.txt, one entry per architecture), and what
+      # the release build and the compile job's test build compile through
+      # sccache (ruling 1104), the token a BuildKit secret alone
+      # (tools/with-sccache.sh). Pinned by commit (v3.1.0).
+      - uses: ./workspace/meridian-core/.github/actions/ci-tools
+        with:
+          tools: sccache
+
+      - uses: crazy-max/ghaction-github-runtime@3cb05d89e1f492524af3d41a1c98c83bc3025124
+
       - name: make runtime-image
-        if: steps.cargo-cache.outputs.cache-hit != 'true'
         env:
           DOCKER_BUILDKIT: "1"
         run: make runtime-image
+
+      - name: make tests-image
+        if: matrix.runner == 'ubuntu-latest'
+        env:
+          DOCKER_BUILDKIT: "1"
+        run: make tests-image && grep -E -m3 'Compile requests|Cache hits|Cache misses' .tests-image.log | cut -c1-120 || true
 
       - name: Take the cargo caches
         if: steps.cargo-cache.outputs.cache-hit != 'true'

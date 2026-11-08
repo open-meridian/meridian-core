@@ -393,6 +393,7 @@ impl Spec {
         by: &crate::TookOver,
     ) -> Result<u64, postgres::Error> {
         let mut tx = client.transaction()?;
+        crate::end_deposed_writers(&mut tx, &[self.head])?;
         let epoch: i64 = tx
             .query_one(
                 &format!(

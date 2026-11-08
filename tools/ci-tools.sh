@@ -5,8 +5,16 @@
 # digest and used; one missing is fetched, retried with backoff, and
 # checked. Nothing that does not match its digest is ever left in place.
 #
-#   ci-tools.sh key  NAME...        the cache key for these tools on this machine
+#   ci-tools.sh key                 the cache key: every tool for this machine's
+#                                   architecture, one entry, so a run's restore
+#                                   is whole whichever tools it needs
+#   ci-tools.sh names               every tool for this machine's architecture
 #   ci-tools.sh fetch DIR NAME...   each in DIR, fetched where missing
+#
+# GitHub's cache scopes an entry to the ref that wrote it, and every run
+# reads its own ref's and main's: a pull request's or the merge queue's
+# entry is no use to the next one. main's cargo-cache workflow fetches
+# every tool and keeps the entry in main's scope, which every run reads.
 set -eu
 here="$(cd "$(dirname "$0")" && pwd)"
 arch="$(uname -m)"
@@ -20,8 +28,11 @@ lines() {
 }
 case "${1:-}" in
 key)
-	shift
-	echo "ci-tools-$arch-$(lines "$@" | sha256sum | cut -c1-16)"
+	echo "ci-tools-$arch-$(awk -v a="$arch" '$2 == a { print $1, $3, $4 }' "$here/ci-tools.txt" | sha256sum | cut -c1-16)"
+	;;
+names)
+	awk -v a="$arch" '$2 == a { print $1 }' "$here/ci-tools.txt" | sort -u | tr '\n' ' '
+	echo
 	;;
 fetch)
 	dir="$2"
@@ -42,7 +53,7 @@ fetch)
 	done
 	;;
 *)
-	echo "usage: ci-tools.sh key NAME... | fetch DIR NAME..." >&2
+	echo "usage: ci-tools.sh key | names | fetch DIR NAME..." >&2
 	exit 2
 	;;
 esac

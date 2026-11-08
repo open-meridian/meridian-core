@@ -1798,6 +1798,9 @@ impl Store for PostgresStore {
     fn take_over(&self, by: &meridian_changes::TookOver) -> Result<u64> {
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(unavailable)?;
+        // A deposed writer stopped mid-batch holds the rows it took.
+        meridian_changes::end_deposed_writers(&mut tx, &["lake_change_head", "lake_partition"])
+            .map_err(unavailable)?;
         // The control partition first: a dataset a deposed writer is
         // beginning holds it shared until it commits, and is then raised
         // with the rest.

@@ -1,6 +1,6 @@
 # The tools a job fetches from GitHub's release downloads (tools/ci-tools.txt),
-# kept in GitHub's cache, keyed by each tool's name, architecture, URL (its
-# version) and digest: a release-download outage costs a run nothing once a
+# kept in GitHub's cache as one entry per architecture, keyed by each tool's
+# name, URL (its version) and digest, filled from main (cargo-cache.yaml): a release-download outage costs a run nothing once a
 # run has kept them, and each is checked against its digest every time
 # (tools/ci-tools.sh). CI_TOOLS names the directory after this step, which
 # the Makefile hands to the Docker builds as the `fetched` build context and
@@ -21,9 +21,9 @@ runs:
       id: key
       shell: bash
       working-directory: ${{ inputs.core }}
-      env:
-        TOOLS: ${{ inputs.tools }}
-      run: echo "key=$(tools/ci-tools.sh key $TOOLS)" >> "$GITHUB_OUTPUT"
+      run: |
+        echo "key=$(tools/ci-tools.sh key)" >> "$GITHUB_OUTPUT"
+        echo "all=$(tools/ci-tools.sh names)" >> "$GITHUB_OUTPUT"
     - name: The tools, as kept
       id: restore
       uses: actions/cache/restore@v4
@@ -34,8 +34,11 @@ runs:
     - name: Each checked, and fetched where missing
       shell: bash
       working-directory: ${{ inputs.core }}
+      # A whole entry restored: the tools this job needs, each checked. None
+      # restored: every tool of the architecture fetched, so the entry kept
+      # below is whole for every job that reads it.
       env:
-        TOOLS: ${{ inputs.tools }}
+        TOOLS: ${{ steps.restore.outputs.cache-hit == 'true' && inputs.tools || steps.key.outputs.all }}
       run: |
         tools/ci-tools.sh fetch "$RUNNER_TEMP/ci-tools" $TOOLS
         echo "CI_TOOLS=$RUNNER_TEMP/ci-tools" >> "$GITHUB_ENV"
