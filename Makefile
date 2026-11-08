@@ -105,6 +105,12 @@ GATE := $(PY) tools/gate.py
 #                    (after the compile: above where the compile left the disk)
 GATE_BUDGETS_LOCAL ?= checks=4 images=9  compile=9  tests=13 settings-page=7  sdk=7  dashboards=7  harness=7  first-run=7  image=7  lint=7
 GATE_BUDGETS_CI    ?= checks=7 images=12 compile=12 tests=15 settings-page=15 sdk=13 dashboards=13 harness=13 first-run=13 image=14 lint=13
+# A cold run's compile stages, in place of the row's (the product owner,
+# 2026-11-07): a compile stage gets 9 GB on a warm cache and at most 11 GB
+# compiling every dependency again after a prune (step 3b part 3 measured
+# 10.5). A run is cold when the builder cache holds none of the gate's cargo
+# caches (tools/gate.py). CI's row is above it already.
+GATE_BUDGETS_COLD_LOCAL ?= images=11 compile=11
 # The cargo caches kept between runs: a run starts them again once they are
 # this many days old, so what cargo built for a dependency nothing uses any
 # more does not stay on the disk for good.
@@ -115,6 +121,7 @@ GATE_DISK_START ?= 4
 GATE_DISK_STOP  ?= 2
 else
 GATE_BUDGETS    ?= $(GATE_BUDGETS_LOCAL)
+GATE_BUDGETS_COLD ?= $(GATE_BUDGETS_COLD_LOCAL)
 GATE_DISK_START ?= 20
 GATE_DISK_STOP  ?= 16
 endif
@@ -182,7 +189,7 @@ stage-lint:       gate-begin-lint lint check-leftovers-end
 
 gate-start:
 	@$(GATE) start --make-pid $$PPID --floor-start $(GATE_DISK_START) --floor-stop $(GATE_DISK_STOP) \
-		--budgets "$(GATE_BUDGETS)" --cache-days $(GATE_CACHE_DAYS) \
+		--budgets "$(GATE_BUDGETS)" --cold-budgets "$(GATE_BUDGETS_COLD)" --cache-days $(GATE_CACHE_DAYS) \
 		--images "$(RUNTIME_IMAGE) $(HARNESS_IMAGE) $(INTEROP_IMAGE) $(TESTS_IMAGE) $(SETTINGS_BINARY_IMAGE) $(SETTINGS_PAGE_IMAGE) $(SETTINGS_BROWSER_IMAGE)"
 
 # What a stage frees as it ends, by stage, named once: its `end` drops them;
@@ -556,7 +563,7 @@ e2e-cluster: network runtime-image analytics-image
 	 E2E_DRIVER=$(E2E_DRIVER) E2E_CLI_IMAGE=$(E2E_CLI_IMAGE) \
 	 E2E_UPGRADE_FROM=$(E2E_UPGRADE_FROM) E2E_UPGRADE_VERSION=$(E2E_UPGRADE_VERSION) \
 	 E2E_EXTERNAL_CONTAINER=$(E2E_EXTERNAL_CONTAINER) E2E_EXTERNAL_PORT=$(E2E_EXTERNAL_PORT) \
-	 E2E_EXTERNAL_PASSWORD=$(E2E_EXTERNAL_PASSWORD) \
+	 E2E_EXTERNAL_PASSWORD=$(E2E_EXTERNAL_PASSWORD) E2E_CLUSTER_HTTP_PORT=$(E2E_CLUSTER_HTTP_PORT) \
 		$(PY) e2e/cluster/run.py; \
 	  held=$$?; \
 	  if [ $$held -ne 0 ] || [ -n "$(E2E_CLUSTER_KEEP)" ]; then \
@@ -688,7 +695,7 @@ e2e-cluster-upgrade:
 # development, ruling 1): so k3s keeps the Traefik it ships, the cluster's port
 # 80 is this machine's, where `<namespace>.localhost` resolves, and the run
 # starts once Traefik is serving. Port 80 is a runner's to give; on a laptop
-# whose own cluster holds it, run the four there instead.
+# whose own cluster holds it, publish another (E2E_CLUSTER_HTTP_PORT, below).
 #
 # CoreDNS is restarted once it is made. k3d adds the name after CoreDNS has
 # started, and CoreDNS reads that file through a mount that never updates:
@@ -731,10 +738,14 @@ E2E_CLUSTER_TARGET ?= e2e-cluster
 E2E_K3D_KEEP ?=
 E2E_K3D_READY_SECONDS ?= 300
 E2E_K3D_SYSTEM ?= coredns local-path-provisioner metrics-server traefik
-# This machine's port the cluster's port 80 is published on. 80 for the runs
-# that arrive through the Ingress; e2e-cluster-backup needs none, and on a
-# laptop whose own cluster holds 80 it is run with another.
-E2E_K3D_HTTP ?= 80
+# This machine's port the cluster's port 80 is published on, and the one
+# e2e/cluster/run.py reaches the dashboard's Ingress at: 80 by default, as CI
+# runs. On a laptop whose own cluster holds 80 (Rancher Desktop forwards it to
+# its own ingress) every run, the Ingress ones included, is run with another:
+#   make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-oidc E2E_CLUSTER_HTTP_PORT=18085
+# E2E_K3D_HTTP is its older name, still read.
+E2E_CLUSTER_HTTP_PORT ?= 80
+E2E_K3D_HTTP ?= $(E2E_CLUSTER_HTTP_PORT)
 # The namespace the run installs into, whose pods and events go to
 # .e2e-cluster.log when it fails: the backup run's own for that run. CI run
 # 38188494317's backup failure logged no pod at all, read from meridian-e2e,
@@ -797,7 +808,7 @@ e2e-cluster-k3d:
 	&& ready "CoreDNS to come back from its restart" kubectl -n kube-system rollout status deploy/coredns --timeout=10s \
 	&& echo "e2e-cluster-k3d: the cluster is ready, $$(( $$(date +%s) - began ))s after it was made"
 	@KUBECONFIG=$(E2E_K3D_KUBECONFIG) $(MAKE) --no-print-directory $(E2E_CLUSTER_TARGET) \
-		E2E_IMAGE_LOAD="e2e/cluster/image-load.sh $(K3D) $(E2E_K3D_CLUSTER)"; \
+		E2E_IMAGE_LOAD="e2e/cluster/image-load.sh $(K3D) $(E2E_K3D_CLUSTER)" E2E_CLUSTER_HTTP_PORT=$(E2E_K3D_HTTP); \
 	  held=$$?; \
 	  if [ $$held -ne 0 ]; then \
 	    echo "e2e-cluster-k3d: what the cluster said, in .e2e-cluster.log" >&2; \

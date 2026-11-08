@@ -15,7 +15,7 @@ Disk is read where Docker keeps it: `df` of the root of a container, which is
 Docker's own filesystem, on a Docker Desktop VM and a CI runner alike.
 
     gate.py start --make-pid PID --floor-start GB --floor-stop GB
-                  --budgets "stage=GB ..." --images "..."
+                  --budgets "stage=GB ..." [--cold-budgets "stage=GB ..."] --images "..."
     gate.py begin STAGE [--drop IMAGE ...]
     gate.py drop IMAGE ...
     gate.py mark STAGE SERVICE ...
@@ -234,6 +234,21 @@ def start(args: argparse.Namespace) -> int:
               f"GATE_CACHE_DAYS ({args.cache_days}); emptied, so this run compiles from nothing")
         for cache, _ in caches:
             docker("builder", "prune", "-f", "--filter", f"id={cache}")
+
+    # A cold run -- the builder cache empty of the gate's cargo caches, as
+    # after a prune or the emptying above -- compiles every dependency again
+    # and holds more while it does: its compile stages take the cold row's
+    # budgets (GATE_BUDGETS_COLD; the product owner, 2026-11-07: 9 GB warm,
+    # an 11 GB ceiling cold).
+    cold = {}
+    for pair in args.cold_budgets.split():
+        name, _, value = pair.partition("=")
+        cold[name] = float(value)
+    if cold and not cargo_caches():
+        print("gate: the builder cache holds no cargo cache, so this run compiles cold; "
+              "its compile stages' budgets are the cold row's: "
+              + " ".join(f"{name}={value:g}" for name, value in cold.items()))
+        budgets.update(cold)
 
     docker("run", "-d", "--rm", "--name", PROBE, "--network", "none", PROBE_IMAGE, "sleep", "86400")
     kb = free_kb()
@@ -501,6 +516,7 @@ def main() -> int:
     s.add_argument("--budgets", required=True)
     s.add_argument("--images", default="")
     s.add_argument("--cache-days", default="14")
+    s.add_argument("--cold-budgets", default="")
     b = sub.add_parser("begin")
     b.add_argument("stage")
     b.add_argument("--drop", nargs="*", default=[])
