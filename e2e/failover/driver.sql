@@ -39,3 +39,21 @@ INSERT INTO config_permission (permission_id, user_group_id, account_group_id, a
 VALUES ('perm-drive', 'ug-drive', 'ag-drive', 'grp-drive')
 ON CONFLICT DO NOTHING;
 
+-- The ems stand-in's own account (the order-plugin class's subject,
+-- drive-desk, holding oms and ems): in its write scope on both roles, and
+-- no other instance's.
+INSERT INTO config_account (account_id, name, state, created_at_ns)
+VALUES ('ACC-DRIVE-DESK', 'Driver desk', 1, 1)
+ON CONFLICT DO NOTHING;
+INSERT INTO config_account_group (account_group_id, name, account_ids)
+VALUES ('ag-drive-desk', 'Driver desk account', '{ACC-DRIVE-DESK}')
+ON CONFLICT DO NOTHING;
+INSERT INTO config_access_group (access_group_id, name) VALUES ('grp-drive-desk', 'Driver desk')
+ON CONFLICT DO NOTHING;
+INSERT INTO config_access_entry (access_group_id, position, plugin_instance_id, level, role)
+VALUES ('grp-drive-desk', 0, 'drive-desk', 2, 'oms'),
+       ('grp-drive-desk', 1, 'drive-desk', 2, 'ems')
+ON CONFLICT DO NOTHING;
+INSERT INTO config_permission (permission_id, user_group_id, account_group_id, access_group_id)
+VALUES ('perm-drive-desk', 'ug-drive', 'ag-drive-desk', 'grp-drive-desk')
+ON CONFLICT DO NOTHING;

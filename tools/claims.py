@@ -79,11 +79,15 @@ def rpo_of(said: list[dict]) -> dict:
     if lost:
         rpo["commits_lost_max"] = max(lost)
     # Through the stores (step 3b part 5): the lake's rows lost, which its
-    # local commits allow and which are measured and said, not yet bounded.
+    # local commits allow and which are measured and said, not yet bounded;
+    # anything kept twice, which nothing allows.
     lake = [c["lake_rows_lost"] for c in said if "lake_rows_lost" in c]
     if lake:
         rpo["lake_rows_lost_max"] = max(lake)
         rpo["lake_rpo_s_max"] = max(c.get("lake_rpo_s", 0) for c in said if "lake_rows_lost" in c)
+    twice = [c["duplicated"] for c in said if "duplicated" in c]
+    if twice:
+        rpo["duplicated_max"] = max(twice)
     seconds = [c["rpo_s"] for c in said if "rpo_s" in c]
     if seconds:
         rpo["seconds_max"] = max(seconds)
@@ -103,6 +107,7 @@ def ledger(claims: list[dict]) -> dict:
         bounds = {c.get("bound_s") for c in said}
         if len(bounds) != 1:
             raise SystemExit(f"claims: {profile} {failure} {component} was held to more than one bound: {sorted(map(str, bounds))}")
+        detected = [float(c["detected_s"]) for c in said if "detected_s" in c]
         entry = {
             "class": failure,
             "profile": profile,
@@ -115,6 +120,9 @@ def ledger(claims: list[dict]) -> dict:
                 "max": round(times[-1], 2),
             },
             "rpo": rpo_of(said),
+            **({"detected_s": {"max": round(max(detected), 2),
+                               "bound": next(c.get("detect_bound_s") for c in said if "detected_s" in c)}}
+               if detected else {}),
             "runs": sorted({str(c.get("run", "local")) for c in said}),
             "command": said[-1].get("command", ""),
         }
@@ -135,6 +143,11 @@ def check_ledger(book: dict) -> list[str]:
         lost = entry.get("rpo", {}).get("commits_lost_max")
         if lost:
             missed.append(f"{name}: the ledger holds {lost} acknowledged commits lost; the bound is none")
+        if entry.get("rpo", {}).get("duplicated_max"):
+            missed.append(f"{name}: the ledger holds a record kept twice; the bound is none")
+        found = entry.get("detected_s") or {}
+        if found.get("bound") is not None and found.get("max", 0) > found["bound"]:
+            missed.append(f"{name}: detected in {found['max']}s, past its bound {found['bound']}s")
         rpo = entry.get("rpo", {})
         if "seconds_bound" in rpo and rpo.get("seconds_max", 0) > rpo["seconds_bound"]:
             missed.append(f"{name}: an RPO of {rpo['seconds_max']}s past its bound {rpo['seconds_bound']}s")
@@ -153,6 +166,10 @@ def check_run(book: dict, claims: list[dict], every: bool = False) -> list[str]:
             missed.append(f"{name}: {said['recovered_s']}s, past its bound {bound}s")
         if said.get("rpo_commits_lost"):
             missed.append(f"{name}: {said['rpo_commits_lost']} acknowledged commits lost")
+        if said.get("duplicated"):
+            missed.append(f"{name}: {said['duplicated']} kept twice")
+        if said.get("detect_bound_s") is not None and float(said.get("detected_s", 0)) > said["detect_bound_s"]:
+            missed.append(f"{name}: detected in {said['detected_s']}s, past its bound {said['detect_bound_s']}s")
     for entry in book.get("entries", []):
         key = (entry["profile"], entry["class"], entry["component"])
         target = entry.get("command", "").split("E2E_CLUSTER_TARGET=")[-1].split()[0] if entry.get("command") else ""
@@ -218,10 +235,18 @@ def self_test() -> int:
     except SystemExit:
         pass
     assert "bor-writer" in table(book, runs)
-    # Through the stores: the lake's loss said, and held to no bound yet.
-    made = ledger([dict(db, recovered_s=22.0, run="1", lake_rows_lost=3, lake_rpo_s=0.8)])
-    assert made["entries"][0]["rpo"]["lake_rows_lost_max"] == 3
+    # Through the stores: the lake's loss said, a record kept twice or a
+    # detection past its bound refused.
+    plug = {"profile": "ha", "failure": "order-plugin", "component": "ems-plugin", "bound_s": 30,
+            "detect_bound_s": 10, "command": "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-failover"}
+    made = ledger([dict(plug, recovered_s=5.0, detected_s=1.2, duplicated=0, run="1"),
+                   dict(db, recovered_s=22.0, run="1", lake_rows_lost=3, lake_rpo_s=0.8)])
+    entry = next(e for e in made["entries"] if e["class"] == "order-plugin")
+    assert entry["detected_s"] == {"max": 1.2, "bound": 10} and entry["rpo"]["duplicated_max"] == 0, entry
+    assert next(e for e in made["entries"] if e["class"] == "db-primary")["rpo"]["lake_rows_lost_max"] == 3
     assert check_ledger(made) == []
+    assert any("twice" in m for m in check_run(made, [dict(plug, recovered_s=5.0, detected_s=1.0, duplicated=1)]))
+    assert any("detected" in m for m in check_run(made, [dict(plug, recovered_s=5.0, detected_s=11.0)]))
     print("claims: self-test OK")
     return 0
 
