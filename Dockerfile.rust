@@ -83,6 +83,7 @@ RUN --mount=type=cache,id=meridian-core-registry,target=/usr/local/cargo/registr
     --mount=type=secret,id=gha-runtime-token,required=false \
     --mount=type=secret,id=gha-results-url,required=false \
     --mount=type=secret,id=gha-cache-url,required=false \
+    --mount=type=secret,id=gha-cache-v2,required=false \
     with-sccache fresh-sources cargo build --workspace --locked
 
 # Every test binary: each crate's unit tests and every integration test, in
@@ -120,6 +121,7 @@ RUN --mount=type=cache,id=meridian-core-registry,target=/usr/local/cargo/registr
     --mount=type=secret,id=gha-runtime-token,required=false \
     --mount=type=secret,id=gha-results-url,required=false \
     --mount=type=secret,id=gha-cache-url,required=false \
+    --mount=type=secret,id=gha-cache-v2,required=false \
     with-sccache fresh-sources cargo test --workspace --locked --no-run --lib --test '*' \
       --message-format=json-render-diagnostics >/tmp/compiled.json \
  && run-tests collect </tmp/compiled.json \

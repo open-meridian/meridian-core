@@ -1033,7 +1033,8 @@ comma := ,
 # Elsewhere none is given and the build compiles as it always has.
 SCCACHE_SECRETS = $(if $(ACTIONS_RUNTIME_TOKEN),--secret id=gha-runtime-token$(comma)env=ACTIONS_RUNTIME_TOKEN) \
 	$(if $(ACTIONS_RESULTS_URL),--secret id=gha-results-url$(comma)env=ACTIONS_RESULTS_URL) \
-	$(if $(ACTIONS_CACHE_URL),--secret id=gha-cache-url$(comma)env=ACTIONS_CACHE_URL)
+	$(if $(ACTIONS_CACHE_URL),--secret id=gha-cache-url$(comma)env=ACTIONS_CACHE_URL) \
+	$(if $(ACTIONS_CACHE_SERVICE_V2),--secret id=gha-cache-v2$(comma)env=ACTIONS_CACHE_SERVICE_V2)
 # nextest's profile for the test runs (tools/run-tests.sh): CI sets ci, which
 # retries a failed test once and names one that then passes flaky.
 NEXTEST_PROFILE ?= default

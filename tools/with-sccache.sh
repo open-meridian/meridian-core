@@ -18,17 +18,22 @@ fi
 ACTIONS_RUNTIME_TOKEN=$token
 ACTIONS_RESULTS_URL=$(secret gha-results-url)
 ACTIONS_CACHE_URL=$(secret gha-cache-url)
-export ACTIONS_RUNTIME_TOKEN ACTIONS_RESULTS_URL ACTIONS_CACHE_URL
+# The cache service's version: GitHub's runners now speak only its second
+# (ACTIONS_CACHE_SERVICE_V2), which sccache reads to choose it.
+ACTIONS_CACHE_SERVICE_V2=$(secret gha-cache-v2)
+export ACTIONS_RUNTIME_TOKEN ACTIONS_RESULTS_URL ACTIONS_CACHE_URL ACTIONS_CACHE_SERVICE_V2
 export SCCACHE_GHA_ENABLED=true RUSTC_WRAPPER=sccache
 # A cache entry is the rustc invocation's; the toolchain is in it already.
 export SCCACHE_GHA_VERSION="meridian-core-1"
 # Unreachable, it compiles as if there were none.
 export SCCACHE_IGNORE_SERVER_IO_ERROR=1
-sccache --start-server >/dev/null 2>&1 || {
-	echo "with-sccache: the cache did not start; compiling without it" >&2
+# Why it did not start, in its own words (a URL or an error, never the
+# token, which sccache does not print).
+if ! started=$(SCCACHE_LOG=error sccache --start-server 2>&1); then
+	echo "with-sccache: the cache did not start; compiling without it: $(printf '%s\n' "$started" | grep -m1 'error' | cut -c1-300)" >&2
 	unset RUSTC_WRAPPER
 	exec "$@"
-}
+fi
 echo "with-sccache: compiling through GitHub's cache" >&2
 status=0
 "$@" || status=$?
