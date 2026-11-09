@@ -435,6 +435,36 @@ pub trait Store: Send + Sync {
     /// [`crate::read`]'s.
     fn read(&self, query: &Query) -> Result<Vec<Observation>>;
 
+    /// [`Store::read`]'s rows, each handed to `each` as it is read, so a
+    /// reader that keeps less than every row never holds them all (found on
+    /// dev 2026-11-09: a chain's statistics over its dates, 358,688 rows
+    /// decoded at once to answer a page of 500, took the lake past its 1
+    /// GiB). In no order a reader may count on.
+    fn read_each(
+        &self,
+        query: &Query,
+        each: &mut dyn FnMut(Observation) -> Result<()>,
+    ) -> Result<()> {
+        for row in self.read(query)? {
+            each(row)?;
+        }
+        Ok(())
+    }
+
+    /// The rows kept at these places, by dataset and sequence, each as
+    /// [`Store::read`] answers it as of `as_of_ns` -- its closed-day flag
+    /// and its effective quality as known then -- in the order given. A row
+    /// no longer kept (retention removed it) is left out. What a held
+    /// answer's later page reads, its rows held by their places alone
+    /// (found on dev 2026-11-09: a chain's statistics, 49,412 rows, held
+    /// whole or answered again whole at each page).
+    fn rows_at(
+        &self,
+        data_type: DataType,
+        places: &[(String, u64)],
+        as_of_ns: i64,
+    ) -> Result<Vec<Observation>>;
+
     /// The lake's listing of `subjects` in `datasets` (contract v28, amended
     /// 2026-10-28; rulings 856 and 858): each series row key at its version
     /// in force at the recorded-time cut-off (0 for now), one whose

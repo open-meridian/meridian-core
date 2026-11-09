@@ -1791,6 +1791,10 @@ mod chain_page {
         pub bus: Arc<Bus>,
         pub resolves: Arc<AtomicU64>,
         pub underlying: String,
+        /// The lake served, and its hot layer where the bench asked for it.
+        pub lake: Arc<service::Lake>,
+        pub store: Arc<dyn Store>,
+        pub hot: Option<Arc<meridian_lake::hot::HotStore>>,
     }
 
     fn decimal(units: u64, scale: u32) -> Option<Decimal> {
@@ -2093,6 +2097,19 @@ mod chain_page {
         underlying: String,
         resolve_delay: Duration,
     ) -> Page {
+        let hot = std::env::var("MERIDIAN_BENCH_HOT").as_deref() == Ok("1");
+        serve_with(store, dataset, underlying, resolve_delay, hot)
+    }
+
+    /// [`serve`], its hot layer in front of the record where `hot` says, as
+    /// the lake runs it.
+    fn serve_with(
+        store: Arc<PostgresStore>,
+        dataset: &str,
+        underlying: String,
+        resolve_delay: Duration,
+        hot: bool,
+    ) -> Page {
         let bus = Arc::new(Bus::single(
             READER,
             Arc::new(MemoryBackend::new()),
@@ -2131,17 +2148,22 @@ mod chain_page {
         });
         // Step 3a: the hot layer in front of the record, where the bench
         // asks for it (MERIDIAN_BENCH_HOT=1), as the lake runs it.
-        let store: Arc<dyn Store> = if std::env::var("MERIDIAN_BENCH_HOT").as_deref() == Ok("1") {
-            meridian_lake::hot::HotStore::new(store, meridian_lake::hot::Bounds::DEFAULT)
-        } else {
-            store
+        let hot = hot.then(|| {
+            meridian_lake::hot::HotStore::new(store.clone(), meridian_lake::hot::Bounds::DEFAULT)
+        });
+        let store: Arc<dyn Store> = match &hot {
+            Some(hot) => hot.clone(),
+            None => store,
         };
-        let lake = service::serve(bus.clone(), store, Arc::new(SystemClock));
+        let lake = service::serve(bus.clone(), store.clone(), Arc::new(SystemClock));
         lake.configured(&configuration(dataset));
         Page {
             bus,
             resolves,
             underlying,
+            lake,
+            store,
+            hot,
         }
     }
 
@@ -2484,6 +2506,501 @@ mod chain_page {
             _ => default,
         }
     }
+
+    impl Page {
+        /// The lake's steady minute on dev between its bursts (2026-11-09, six
+        /// hours up before its second OOMKill): a batch of quotes recorded, each
+        /// its own row key, as an FX source records them; the datasets listed
+        /// 17 times; four pairs' latest quotes read.
+        pub async fn steady_minute(&self, dataset: &str, minute: usize, pairs: usize) {
+            let now = SystemClock.now_ns();
+            let rows: Vec<Observation> = (0..pairs)
+                .flat_map(|p| {
+                    (0..40).map(move |j| {
+                        let subject = format!("INS-SOAK-PAIR{p}");
+                        let at = now + j as i64;
+                        let bid = 10_000 + ((minute * 7 + j) % 300) as u64;
+                        Observation::Quote(Box::new(Quote {
+                            meta: Some(ObservationMeta {
+                                row_key: format!("{subject}:{minute}:{j}"),
+                                subjects: vec![SubjectRef {
+                                    entity_id: subject.clone(),
+                                    ..Default::default()
+                                }],
+                                source: Some(Source {
+                                    instance: "truefx".into(),
+                                    dataset: dataset.into(),
+                                    ..Default::default()
+                                }),
+                                valid_from_ns: at,
+                                ..Default::default()
+                            }),
+                            bid: usd(bid),
+                            ask: usd(bid + 3),
+                            ..Default::default()
+                        }))
+                    })
+                })
+                .collect();
+            let store = Arc::clone(&self.store);
+            let dataset = dataset.to_string();
+            tokio::task::spawn_blocking(move || store.record(&dataset, rows, now).unwrap())
+                .await
+                .unwrap();
+            for _ in 0..17 {
+                self.datasets().await;
+            }
+            for p in 0..4.min(pairs) {
+                let _: (ListQuotesReply, usize) = self
+                    .ask(
+                        "platform.lake.query.list-quotes",
+                        "meridian.v1.ListQuotesRequest",
+                        ListQuotesRequest {
+                            subjects: vec![SubjectRef {
+                                entity_id: format!("INS-SOAK-PAIR{p}"),
+                                ..Default::default()
+                            }],
+                            sources: Some(SourceChoice {
+                                default: true,
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+            }
+        }
+    }
+
+    /// Dev's chain when its lake was OOMKilled at 1 GiB, twice on 2026-11-09
+    /// (`tradier:options_delayed`, read-only counts that day): one
+    /// underlying of about 3,340 series; its listing restated pass after
+    /// pass; its quotes a row a series each pass, each its own key; and its
+    /// open interest and volume a row a series each business date, each
+    /// date's rows restated as many times as `oi_versions` and
+    /// `volume_versions` say -- dev held 358,688 statistics, 54,376 keys,
+    /// one date's open interest at 99 versions a key.
+    #[derive(Clone, Debug)]
+    pub struct Relaunch {
+        pub expiries: usize,
+        pub strikes: usize,
+        pub series_versions: usize,
+        pub quote_rounds: usize,
+        pub oi_versions: Vec<usize>,
+        pub volume_versions: Vec<usize>,
+    }
+
+    impl Relaunch {
+        /// Dev's, as counted on 2026-11-09.
+        pub fn dev() -> Self {
+            Relaunch {
+                expiries: 25,
+                strikes: 67,
+                series_versions: 5,
+                quote_rounds: 90,
+                oi_versions: vec![2, 5, 9, 1, 70, 1, 1, 1],
+                volume_versions: vec![4, 5, 2, 1, 1, 1, 1, 2],
+            }
+        }
+
+        pub fn series(&self) -> usize {
+            self.expiries * self.strikes * 2
+        }
+
+        pub fn days(&self) -> usize {
+            self.oi_versions.len().max(self.volume_versions.len())
+        }
+
+        /// The statistics recorded, every version.
+        pub fn statistics(&self) -> usize {
+            self.series()
+                * (self.oi_versions.iter().sum::<usize>()
+                    + self.volume_versions.iter().sum::<usize>())
+        }
+
+        /// The statistics in force: a key each series, kind and date.
+        pub fn statistic_keys(&self) -> usize {
+            self.series() * (self.oi_versions.len() + self.volume_versions.len())
+        }
+
+        pub fn rows(&self) -> usize {
+            self.series() * self.series_versions
+                + self.quote_rounds * self.series() / 2
+                + self.statistics()
+        }
+
+        /// `MERIDIAN_BENCH_RELAUNCH`: expiries,strikes,series_versions,
+        /// quote_rounds, then the open interest's versions a date and the
+        /// volume's, each `/`-separated.
+        pub fn from_env(default: Relaunch) -> Relaunch {
+            let said = std::env::var("MERIDIAN_BENCH_RELAUNCH").unwrap_or_default();
+            let parts: Vec<&str> = said.split(',').map(str::trim).collect();
+            let list = |s: &str| -> Vec<usize> {
+                s.split('/').filter_map(|n| n.trim().parse().ok()).collect()
+            };
+            match parts.as_slice() {
+                [e, s, v, q, oi, vol] => Relaunch {
+                    expiries: e.parse().unwrap_or(default.expiries),
+                    strikes: s.parse().unwrap_or(default.strikes),
+                    series_versions: v.parse().unwrap_or(default.series_versions),
+                    quote_rounds: q.parse().unwrap_or(default.quote_rounds),
+                    oi_versions: list(oi),
+                    volume_versions: list(vol),
+                },
+                _ => default,
+            }
+        }
+    }
+
+    /// The first business date [`record_relaunch`] records statistics on.
+    pub fn relaunch_first_date(shape: &Relaunch) -> String {
+        let now = SystemClock.now_ns();
+        meridian_domain::date::Date::of_utc_instant(now - shape.days() as i64 * DAY).to_string()
+    }
+
+    /// Record [`Relaunch`] once per database, as [`record_fixture`] does.
+    pub fn record_relaunch(
+        store: &PostgresStore,
+        dataset: &str,
+        underlying: &str,
+        shape: &Relaunch,
+    ) {
+        let expected = shape.rows() as u64;
+        let head = store.heads().unwrap().get(dataset).copied().unwrap_or(0);
+        if head >= expected {
+            eprintln!("bench: relaunch fixture held, {head} rows");
+            return;
+        }
+        assert_eq!(
+            head, 0,
+            "a partial fixture: drop the bench's database and run again"
+        );
+        let started = Instant::now();
+        let now = SystemClock.now_ns();
+        let first = now - shape.days() as i64 * DAY;
+        let keys: Vec<(usize, char, String)> = (0..shape.expiries)
+            .flat_map(|e| {
+                (0..shape.strikes).flat_map(move |s| ['C', 'P'].into_iter().map(move |r| (e, s, r)))
+            })
+            .map(|(e, s, r)| (e, r, osi(underlying, e, s, r)))
+            .collect();
+        for pass in 0..shape.series_versions {
+            let rows: Vec<Observation> = keys
+                .iter()
+                .enumerate()
+                .map(|(i, (e, right, k))| {
+                    Observation::Series(ListedSeries {
+                        meta: meta(dataset, &format!("series:{k}"), underlying, k, first),
+                        template_id: "TPL-listed-option".into(),
+                        template_version: "1".into(),
+                        fields: vec![
+                            field("underlying_instrument_id", underlying.into()),
+                            field(
+                                "put_or_call",
+                                if *right == 'C' { "call" } else { "put" }.into(),
+                            ),
+                            field("strike_price", format!("{}", 10 + (i / 2) % shape.strikes)),
+                            field(
+                                "expiration_date",
+                                format!("2027-{:02}-{:02}", 1 + e % 12, 1 + e % 28),
+                            ),
+                            field("exercise_style", "american".into()),
+                            field("settlement_method", "physical".into()),
+                            field("contract_multiplier", "100".into()),
+                            field("listing_pass", pass.to_string()),
+                        ],
+                        instrument_id: String::new(),
+                    })
+                })
+                .collect();
+            for batch in rows.chunks(5000) {
+                store.record(dataset, batch.to_vec(), now).unwrap();
+            }
+        }
+        let spacing = (shape.days() as i64 * DAY / shape.quote_rounds.max(1) as i64).max(MINUTE);
+        let mut batch = Vec::new();
+        for round in 0..shape.quote_rounds {
+            let at = first + round as i64 * spacing;
+            for (i, (_, _, k)) in keys.iter().enumerate() {
+                if (i + round) % 2 != 0 {
+                    continue;
+                }
+                let bid = 100 + ((i * 7 + round * 3) % 500) as u64;
+                batch.push(Observation::Quote(Box::new(Quote {
+                    meta: meta(dataset, &format!("{k}:q:{at}"), underlying, k, at),
+                    bid: usd(bid),
+                    ask: usd(bid + 5),
+                    bid_quantity: decimal(10 + (round % 90) as u64, 0),
+                    ask_quantity: decimal(12, 0),
+                    ..Default::default()
+                })));
+            }
+            if batch.len() >= 5000 {
+                store
+                    .record(dataset, std::mem::take(&mut batch), now)
+                    .unwrap();
+            }
+        }
+        if !batch.is_empty() {
+            store.record(dataset, batch, now).unwrap();
+        }
+        for (kind, name, versions) in [
+            (StatisticKind::OpenInterest, "OI", &shape.oi_versions),
+            (StatisticKind::Volume, "VOL", &shape.volume_versions),
+        ] {
+            for (day, times) in versions.iter().enumerate() {
+                let date = meridian_domain::date::Date::of_utc_instant(first + day as i64 * DAY)
+                    .to_string();
+                for pass in 0..*times {
+                    let rows: Vec<Observation> = keys
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (_, _, k))| {
+                            let mut m = meta(
+                                dataset,
+                                &format!("{k}:{date}:{name}"),
+                                underlying,
+                                k,
+                                first + day as i64 * DAY,
+                            );
+                            m.as_mut().unwrap().business_date = date.clone();
+                            Observation::Statistic(Statistic {
+                                meta: m,
+                                kind: kind as i32,
+                                value: Some(UnitValue {
+                                    value: decimal((100 + i * 3 + day * 7 + pass) as u64, 0),
+                                    unit: ValueUnit::Count as i32,
+                                    ..Default::default()
+                                }),
+                            })
+                        })
+                        .collect();
+                    for chunk in rows.chunks(5000) {
+                        store.record(dataset, chunk.to_vec(), now).unwrap();
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "bench: relaunch fixture recorded, {} rows in {:.1} s",
+            store.heads().unwrap().get(dataset).copied().unwrap_or(0),
+            started.elapsed().as_secs_f64()
+        );
+    }
+
+    /// [`Relaunch`] recorded and served, as [`page`] serves its fixture.
+    pub fn relaunch_page(store: Arc<PostgresStore>, tag: &str, shape: &Relaunch) -> Page {
+        let dataset = format!("tradier:{tag}");
+        let underlying = format!("INS-{tag}").to_uppercase();
+        record_relaunch(&store, &dataset, &underlying, shape);
+        serve(store, &dataset, underlying, Duration::from_millis(1))
+    }
+
+    /// [`relaunch_page`], the hot layer in front of the record as the lake
+    /// runs it.
+    pub fn relaunch_page_hot(store: Arc<PostgresStore>, tag: &str, shape: &Relaunch) -> Page {
+        let dataset = format!("tradier:{tag}");
+        let underlying = format!("INS-{tag}").to_uppercase();
+        record_relaunch(&store, &dataset, &underlying, shape);
+        serve_with(store, &dataset, underlying, Duration::from_millis(1), true)
+    }
+
+    /// The process's resident high-water mark started again from what it
+    /// holds now (Linux: `/proc/self/clear_refs`); false where it cannot be.
+    pub fn restart_high_water() -> bool {
+        std::fs::write("/proc/self/clear_refs", "5").is_ok()
+    }
+
+    /// Dev's relaunch burst, every read at once (2026-11-09: 21 list-datasets,
+    /// 14 list-quotes, 10 list-statistics, 10 list-series and 8 list-prices in
+    /// two minutes): two readers of the chain's statistics over its dates,
+    /// two of its latest quotes and two of its listing, eight of prices and
+    /// 21 of the datasets. Each read's slowest, by kind.
+    pub async fn burst(
+        page: &Arc<Page>,
+        from: &str,
+    ) -> std::collections::BTreeMap<&'static str, Paged> {
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let (p, f) = (Arc::clone(page), from.to_string());
+            handles.push(tokio::spawn(async move {
+                ("statistics", p.statistics_ranged(&f, usize::MAX).await)
+            }));
+            let p = Arc::clone(page);
+            handles.push(tokio::spawn(
+                async move { ("quotes", p.quotes_latest().await) },
+            ));
+            let p = Arc::clone(page);
+            handles.push(tokio::spawn(
+                async move { ("series", p.series_window().await) },
+            ));
+        }
+        for _ in 0..8 {
+            let p = Arc::clone(page);
+            handles.push(tokio::spawn(async move {
+                let took = p.prices_latest().await;
+                (
+                    "prices",
+                    Paged {
+                        pages: 1,
+                        rows: 0,
+                        took,
+                    },
+                )
+            }));
+        }
+        for _ in 0..21 {
+            let p = Arc::clone(page);
+            handles.push(tokio::spawn(async move {
+                let took = p.datasets().await;
+                (
+                    "datasets",
+                    Paged {
+                        pages: 1,
+                        rows: 0,
+                        took,
+                    },
+                )
+            }));
+        }
+        let mut slowest: std::collections::BTreeMap<&'static str, Paged> = Default::default();
+        for handle in handles {
+            let (what, p) = handle.await.unwrap();
+            let held = slowest.entry(what).or_default();
+            if p.took >= held.took {
+                *held = p;
+            }
+        }
+        slowest
+    }
+
+    /// One paged read's pages, rows and time.
+    #[derive(Debug, Default, Clone, Copy)]
+    pub struct Paged {
+        pub pages: usize,
+        pub rows: usize,
+        pub took: Duration,
+    }
+
+    impl Page {
+        /// A chain's statistics over a range of business dates, every
+        /// series in the window, a page of 500 at a time: dev's
+        /// list-statistics, 500 rows of 49,412 a page, 1.6 to 4.0 s each.
+        pub async fn statistics_ranged(&self, from_date: &str, most_pages: usize) -> Paged {
+            let at = Instant::now();
+            let mut out = Paged::default();
+            let mut cursor = String::new();
+            loop {
+                let (reply, _): (ListStatisticsReply, usize) = self
+                    .ask(
+                        service::LIST_STATISTICS,
+                        "meridian.v1.ListStatisticsRequest",
+                        ListStatisticsRequest {
+                            subjects: self.subject(),
+                            all_series: true,
+                            from_date: from_date.into(),
+                            expiration_from: "2026-01-01".into(),
+                            expiration_to: "2028-12-31".into(),
+                            page_size: 500,
+                            cursor: cursor.clone(),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                out.pages += 1;
+                out.rows += reply.statistics.len();
+                cursor = reply.next_cursor;
+                if cursor.is_empty() || out.pages >= most_pages {
+                    break;
+                }
+            }
+            out.took = at.elapsed();
+            out
+        }
+
+        /// The chain's latest quotes, a page of 500 at a time: dev's
+        /// list-quotes, 500 of about 3,300 a page.
+        pub async fn quotes_latest(&self) -> Paged {
+            let at = Instant::now();
+            let mut out = Paged::default();
+            let mut cursor = String::new();
+            loop {
+                let (reply, _): (ListQuotesReply, usize) = self
+                    .ask(
+                        "platform.lake.query.list-quotes",
+                        "meridian.v1.ListQuotesRequest",
+                        ListQuotesRequest {
+                            subjects: self.subject(),
+                            sources: Some(SourceChoice {
+                                default: true,
+                                ..Default::default()
+                            }),
+                            all_series: true,
+                            page_size: 500,
+                            cursor: cursor.clone(),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                out.pages += 1;
+                out.rows += reply.quotes.len();
+                cursor = reply.next_cursor;
+                if cursor.is_empty() {
+                    break;
+                }
+            }
+            out.took = at.elapsed();
+            out
+        }
+
+        /// The chain's listing in a window, a page of 500 at a time: dev's
+        /// list-series, 500 of about 2,000 a page.
+        pub async fn series_window(&self) -> Paged {
+            let at = Instant::now();
+            let mut out = Paged::default();
+            let mut cursor = String::new();
+            loop {
+                let (reply, _): (ListSeriesReply, usize) = self
+                    .ask(
+                        service::LIST_SERIES,
+                        "meridian.v1.ListSeriesRequest",
+                        ListSeriesRequest {
+                            subjects: self.subject(),
+                            expiration_from: "2027-01-01".into(),
+                            expiration_to: "2027-06-30".into(),
+                            page_size: 500,
+                            cursor: cursor.clone(),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                out.pages += 1;
+                out.rows += reply.series.len();
+                cursor = reply.next_cursor;
+                if cursor.is_empty() {
+                    break;
+                }
+            }
+            out.took = at.elapsed();
+            out
+        }
+
+        /// The underlying's latest prices: one page.
+        pub async fn prices_latest(&self) -> Duration {
+            let at = Instant::now();
+            let _: (meridian_domain::v1::ListPricesReply, usize) = self
+                .ask(
+                    "platform.lake.query.list-prices",
+                    "meridian.v1.ListPricesRequest",
+                    meridian_domain::v1::ListPricesRequest {
+                        subjects: self.subject(),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            at.elapsed()
+        }
+    }
 }
 
 /// The chain page's reads on a TQQQ-shaped chain (rulings 798, 808): `make
@@ -2599,6 +3116,273 @@ async fn capacity_chain_page_reads() {
         );
     }
 }
+
+/// Dev's relaunch burst against dev's chain (2026-11-09: the lake
+/// OOMKilled at 1 GiB, at 15:37:40 and 21:38:15, each during one): each
+/// read alone, then the burst's reads at once -- a chain's statistics over
+/// its dates, its latest quotes twice, its listing twice, prices eight
+/// times and the datasets 21 -- with the heap's peak and the process's
+/// resident high-water mark across each. `make bench` runs it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "the capacity bench: make bench"]
+async fn capacity_relaunch_read_mix() {
+    use chain_page::*;
+    let shape = Relaunch::from_env(Relaunch::dev());
+    let store = Arc::new(tokio::task::block_in_place(store));
+    let tag = format!(
+        "relaunch-{}x{}x{}x{}-{}-{}",
+        shape.expiries,
+        shape.strikes,
+        shape.series_versions,
+        shape.quote_rounds,
+        shape
+            .oi_versions
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join("."),
+        shape
+            .volume_versions
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join("."),
+    );
+    let page = tokio::task::block_in_place(|| relaunch_page(Arc::clone(&store), &tag, &shape));
+    let from = relaunch_first_date(&shape);
+    let most_pages = std::env::var("MERIDIAN_BENCH_PAGES")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(usize::MAX);
+    let (rss, hwm) = memory();
+    let (live, _) = counted::take();
+    println!(
+        "CAPACITY relaunch shape={shape:?} rows={} statistics={} keys={} observation_bytes={} heap_live_mib={live:.1} rss_mib={rss:.0} hwm_mib={hwm:.0}",
+        shape.rows(),
+        shape.statistics(),
+        shape.statistic_keys(),
+        std::mem::size_of::<meridian_lake::row::Observation>(),
+    );
+    let said = |what: &str, p: Paged| {
+        let (rss, hwm) = memory();
+        let (live, peak) = counted::take();
+        println!(
+            "CAPACITY relaunch alone={what} pages={} rows={} ms={:.0} heap_live_mib={live:.1} heap_peak_mib={peak:.1} rss_mib={rss:.0} hwm_mib={hwm:.0}",
+            p.pages,
+            p.rows,
+            p.took.as_secs_f64() * 1e3
+        );
+    };
+    let quotes = page.quotes_latest().await;
+    said("quotes", quotes);
+    let series = page.series_window().await;
+    said("series", series);
+    let at = std::time::Instant::now();
+    page.prices_latest().await;
+    page.datasets().await;
+    said(
+        "prices+datasets",
+        Paged {
+            pages: 2,
+            took: at.elapsed(),
+            ..Default::default()
+        },
+    );
+    let one = page.statistics_ranged(&from, 1).await;
+    said("statistics-first-page", one);
+    let statistics = page.statistics_ranged(&from, most_pages).await;
+    said("statistics", statistics);
+
+    // The burst: every read at once, as the relaunched plugins made them.
+    let page = Arc::new(page);
+    let started = std::time::Instant::now();
+    let slowest = burst(&page, &from).await;
+    let (rss, hwm) = memory();
+    let (live, peak) = counted::take();
+    println!(
+        "CAPACITY relaunch burst wall_ms={:.0} heap_live_mib={live:.1} heap_peak_mib={peak:.1} rss_mib={rss:.0} hwm_mib={hwm:.0} slowest={}",
+        started.elapsed().as_secs_f64() * 1e3,
+        slowest
+            .iter()
+            .map(|(what, p)| format!("{what}:{}p/{}r/{:.0}ms", p.pages, p.rows, p.took.as_secs_f64() * 1e3))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+}
+
+/// The lake's steady hours between bursts (dev 2026-11-09: OOMKilled again
+/// at 21:38:15 after six hours up): `MERIDIAN_BENCH_MINUTES` minutes of
+/// dev's steady traffic run back to back -- quotes recorded, the datasets
+/// listed, pairs' latest read -- and what the lake holds every hour of
+/// them: its heap, its resident memory, its held answers and its hot
+/// layer. `make bench` runs it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "the capacity bench: make bench"]
+async fn capacity_lake_steady_hours() {
+    use chain_page::*;
+    let minutes: usize = std::env::var("MERIDIAN_BENCH_MINUTES")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(360);
+    let store = Arc::new(tokio::task::block_in_place(store));
+    let tag = unique("soak");
+    let dataset = format!("tradier:{tag}");
+    let page = tokio::task::block_in_place(|| {
+        relaunch_page(
+            Arc::clone(&store),
+            &tag,
+            &Relaunch {
+                expiries: 1,
+                strikes: 1,
+                series_versions: 1,
+                quote_rounds: 1,
+                oi_versions: vec![1],
+                volume_versions: vec![1],
+            },
+        )
+    });
+    let said = |minute: usize, page: &Page| {
+        let (rss, hwm) = memory();
+        let (live, _) = counted::take();
+        let hot = page
+            .hot
+            .as_ref()
+            .map(|hot| format!("{:?}", hot.held()))
+            .unwrap_or_default();
+        println!(
+            "CAPACITY steady minute={minute} heap_live_mib={live:.1} rss_mib={rss:.0} hwm_mib={hwm:.0} held_pages={} held_bytes={} hot={hot}",
+            page.lake.held_pages(),
+            page.lake.held_bytes(),
+        );
+    };
+    said(0, &page);
+    for minute in 1..=minutes {
+        page.steady_minute(&dataset, minute, 7).await;
+        if minute % 60 == 0 {
+            let lake = Arc::clone(&page.lake);
+            tokio::task::spawn_blocking(move || lake.apply_retention())
+                .await
+                .unwrap();
+            said(minute, &page);
+        }
+    }
+}
+
+/// Found on dev 2026-11-09: the lake OOMKilled at 1 GiB twice, each time
+/// during a relaunch's burst of reads, by a chain's statistics over its
+/// dates read a page at a time -- each page read every version of every key
+/// and decoded it to choose the 500 it answered (358,688 versions for 49,412
+/// rows; core's bench, dev's shape: 536 MiB of heap a page, 1,089 MiB with
+/// the burst's two readers, resident 1.9 GiB). A paged read's working memory
+/// is now its page: the rows in force chosen by the database, read a chunk
+/// at a time, each held while choosing as a few dozen bytes, and each page's
+/// rows read by their places alone.
+///
+/// The burst against a chain whose 4,800 statistics in force are 66,600
+/// versions (one date's open interest at 100 a key, as dev's at 99), the
+/// hot layer in front as the lake runs it, under the counting allocator,
+/// each test its own process (the gate's nextest): every read answers every
+/// row; the heap's peak across the burst stays within
+/// [`BURST_HEAP_MOST_MIB`], and resident memory's high-water mark within
+/// [`BURST_RESIDENT_MOST_MIB`] of where it started; and the hot layer
+/// within its bounds. Measured (core's bench, 2026-11-09): main 7e0950f's
+/// heap peaked at 194 MiB and its resident memory rose 207 MiB; this
+/// change's, 11 to 19 MiB and 14 to 46 MiB.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_paged_read_holds_its_page_never_its_set() {
+    use chain_page::*;
+    let shape = Relaunch {
+        expiries: 12,
+        strikes: 25,
+        series_versions: 2,
+        quote_rounds: 4,
+        oi_versions: vec![3, 100, 2, 1],
+        volume_versions: vec![2, 1, 1, 1],
+    };
+    let store = Arc::new(tokio::task::block_in_place(store));
+    let tag = unique("paged");
+    let page = tokio::task::block_in_place(|| relaunch_page_hot(Arc::clone(&store), &tag, &shape));
+    let from = relaunch_first_date(&shape);
+    // What the set would take decoded whole, every version: what main
+    // decoded for each page.
+    let sample = tokio::task::block_in_place(|| {
+        store.read(&Query {
+            datasets: vec![format!("tradier:{tag}")],
+            subjects: vec![page.underlying.clone()],
+            data_type: DataType::Statistic,
+            kinds: vec![],
+            interval_ns: 0,
+            when: When::Latest { at_ns: 0 },
+            as_of_ns: 0,
+            published_as_of_ns: 0,
+            latest_only: true,
+        })
+    })
+    .unwrap();
+    let per_row = sample
+        .into_iter()
+        .next()
+        .map(|row| {
+            meridian_lake::pages::Whole {
+                rows: vec![row],
+                not_served: Vec::new(),
+            }
+            .held_bytes()
+        })
+        .expect("a statistic recorded");
+    let whole_mib = (shape.statistics() * per_row) as f64 / 1048576.0;
+
+    let (rss_before, _) = memory();
+    let high_water = restart_high_water();
+    counted::take();
+    let page = Arc::new(page);
+    let slowest = burst(&page, &from).await;
+    let (_, peak) = counted::take();
+    let (_, hwm) = memory();
+    println!(
+        "BURST heap_peak_mib={peak:.1} rss_before_mib={rss_before:.0} hwm_mib={hwm:.0} whole_set_mib={whole_mib:.0} slowest={slowest:?}"
+    );
+    assert!(
+        whole_mib >= 2.0 * BURST_HEAP_MOST_MIB,
+        "the set decoded whole, {whole_mib:.0} MiB, is what the bound tells apart"
+    );
+    assert_eq!(
+        slowest["statistics"].rows,
+        shape.statistic_keys(),
+        "every statistic in force, once"
+    );
+    assert_eq!(
+        slowest["quotes"].rows,
+        shape.series(),
+        "every series' latest quote"
+    );
+    assert!(slowest["series"].rows > 0);
+    assert!(
+        peak <= BURST_HEAP_MOST_MIB,
+        "the burst's heap peaked at {peak:.1} MiB; a paged read holds its page, and the bound is {BURST_HEAP_MOST_MIB} MiB"
+    );
+    if high_water && hwm > 0.0 {
+        assert!(
+            hwm - rss_before <= BURST_RESIDENT_MOST_MIB,
+            "resident memory rose {:.0} MiB across the burst; the bound is {BURST_RESIDENT_MOST_MIB} MiB",
+            hwm - rss_before
+        );
+    }
+    // The hot layer's bounds still hold (ruling 808; step 3a).
+    let hot = page.hot.as_ref().expect("the hot layer in front");
+    let ((_, latest), (_, listings)) = hot.held();
+    let bounds = meridian_lake::hot::Bounds::DEFAULT;
+    assert!(latest <= bounds.latest_bytes && listings <= bounds.listings_bytes);
+}
+
+/// The most the burst's heap may peak at, in MiB: two statistics readers
+/// building at once (`lake.maxConcurrentAnswers`), each holding a chunk of
+/// rows read, its candidates and at most `read::HELD_INLINE_MOST` of rows,
+/// beside the other reads' pages.
+const BURST_HEAP_MOST_MIB: f64 = 40.0;
+
+/// The most resident memory may rise across the burst, in MiB.
+const BURST_RESIDENT_MOST_MIB: f64 = 96.0;
 
 async fn futures_lite_join(n: usize, page: Arc<chain_page::Page>) -> Vec<chain_page::Load> {
     let handles: Vec<_> = (0..n)

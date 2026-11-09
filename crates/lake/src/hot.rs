@@ -698,6 +698,35 @@ impl Store for HotStore {
         self.inner.read(query)
     }
 
+    fn read_each(
+        &self,
+        query: &Query,
+        each: &mut dyn FnMut(Observation) -> Result<()>,
+    ) -> Result<()> {
+        if answers_latest(query) {
+            if let Some(rows) = self.latest_from_memory(query) {
+                noted::memory("latest");
+                for row in rows {
+                    each(row)?;
+                }
+                return Ok(());
+            }
+        }
+        noted::record();
+        self.inner.read_each(query, each)
+    }
+
+    /// A held answer's rows, from the record: what a read answered from
+    /// memory holds its rows itself.
+    fn rows_at(
+        &self,
+        data_type: DataType,
+        places: &[(String, u64)],
+        as_of_ns: i64,
+    ) -> Result<Vec<Observation>> {
+        self.inner.rows_at(data_type, places, as_of_ns)
+    }
+
     fn listing(
         &self,
         datasets: &[String],

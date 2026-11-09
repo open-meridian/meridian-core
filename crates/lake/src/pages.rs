@@ -29,14 +29,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::read::NotServed;
+use crate::read::{NotServed, Place};
 use crate::row::Observation;
 
 /// How long an answer is held for its next page.
 pub const HELD_FOR: Duration = Duration::from_secs(30);
 
 /// The most every held answer may take together, by what each holds in
-/// memory ([`Whole::held_bytes`]). 64 MiB (ruling 957): a chain's
+/// memory ([`Placed::held_bytes`]). 64 MiB (ruling 957): a chain's
 /// statistics, about 23,000 to 25,000 rows, hold 34 to 37 MiB counted so,
 /// and were held under the 32 MiB before only because each was counted at
 /// its encoded length.
@@ -69,11 +69,46 @@ pub fn answers_at_once(value: Option<&str>) -> Result<usize, String> {
         })
 }
 
-/// A read's whole answer, before its page is cut.
+/// Rows held whole: how a row held is counted ([`Whole::held_bytes`],
+/// [`row_bytes`]), measured against the allocator (tests/postgres.rs).
 #[derive(Debug, Clone, Default)]
 pub struct Whole {
     pub rows: Vec<Observation>,
     pub not_served: Vec<NotServed>,
+}
+
+/// A read's answer held for its next pages: each row by its [`Place`] --
+/// past [`crate::read::HELD_INLINE_MOST`] a few dozen bytes a row, never the
+/// rows -- so each page reads its own rows alone (found on dev 2026-11-09: a
+/// chain's statistics over its dates, 49,412 rows, too large to hold whole,
+/// answered again whole at each of its hundred pages, and two readers at
+/// once took the lake past its 1 GiB).
+#[derive(Debug, Clone, Default)]
+pub struct Placed {
+    pub rows: Vec<Place>,
+    pub not_served: Vec<NotServed>,
+}
+
+impl Placed {
+    /// What it holds in memory: each row's place, a row held as
+    /// [`Whole::held_bytes`] counts a row, and each dataset's name once.
+    pub fn held_bytes(&self) -> usize {
+        let mut names: Vec<*const u8> = Vec::new();
+        let mut bytes = self.rows.capacity() * std::mem::size_of::<Place>()
+            + self.not_served.capacity() * std::mem::size_of::<NotServed>();
+        for place in &self.rows {
+            match place {
+                Place::Kept(name, _) => {
+                    if !names.contains(&name.as_ptr()) {
+                        names.push(name.as_ptr());
+                        bytes += name.len() + 16;
+                    }
+                }
+                Place::Held(row) => bytes += row_bytes(row),
+            }
+        }
+        bytes
+    }
 }
 
 impl Whole {
@@ -92,6 +127,13 @@ impl Whole {
                 .sum::<usize>()
             + self.not_served.capacity() * std::mem::size_of::<NotServed>()
     }
+}
+
+/// What one row costs held whole, as [`Whole::held_bytes`] counts each.
+pub fn row_bytes(row: &Observation) -> usize {
+    std::mem::size_of::<Observation>()
+        + row.encoded_len() * heap_per_encoded_byte(row)
+        + row.boxed_bytes()
 }
 
 /// A row's heap per byte of its encoding, at least (see
@@ -186,7 +228,7 @@ impl Drop for Permit<'_> {
 
 struct Entry {
     key: String,
-    whole: Arc<Whole>,
+    whole: Arc<Placed>,
     bytes: usize,
     held_at: Instant,
 }
@@ -226,7 +268,7 @@ impl Held {
 
     /// Hold a read's answer for its next pages; an answer past the budget
     /// alone is not held. The oldest make room.
-    pub fn hold(&mut self, key: String, whole: Arc<Whole>, now: Instant) {
+    pub fn hold(&mut self, key: String, whole: Arc<Placed>, now: Instant) {
         self.expire(now);
         let bytes = whole.held_bytes();
         if bytes > self.most {
@@ -249,7 +291,7 @@ impl Held {
     }
 
     /// The answer held for this read, if it is.
-    pub fn find(&mut self, key: &str, now: Instant) -> Option<Arc<Whole>> {
+    pub fn find(&mut self, key: &str, now: Instant) -> Option<Arc<Placed>> {
         self.expire(now);
         self.entries
             .iter()
@@ -283,13 +325,18 @@ mod tests {
     use super::*;
     use meridian_domain::v1::{ObservationMeta, Quote};
 
-    fn whole(rows: usize) -> Arc<Whole> {
-        Arc::new(Whole {
+    fn whole(rows: usize) -> Whole {
+        Whole {
             rows: (0..rows)
                 .map(|i| {
                     Observation::Quote(Box::new(Quote {
                         meta: Some(ObservationMeta {
                             row_key: format!("q{i}"),
+                            sequence: i as u64 + 1,
+                            source: Some(meridian_domain::v1::Source {
+                                dataset: "tradier:options".into(),
+                                ..Default::default()
+                            }),
                             ..Default::default()
                         }),
                         ..Default::default()
@@ -297,20 +344,43 @@ mod tests {
                 })
                 .collect(),
             not_served: Vec::new(),
+        }
+    }
+
+    /// An answer of `rows` rows the lake keeps, held by their places.
+    fn placed(rows: usize) -> Arc<Placed> {
+        let dataset: Arc<str> = Arc::from("tradier:options");
+        Arc::new(Placed {
+            rows: (0..rows)
+                .map(|i| Place::Kept(Arc::clone(&dataset), i as u64 + 1))
+                .collect(),
+            not_served: Vec::new(),
         })
+    }
+
+    /// The same rows held as they are.
+    fn held(whole: &Whole) -> Placed {
+        Placed {
+            rows: whole
+                .rows
+                .iter()
+                .map(|row| Place::Held(Box::new(row.clone())))
+                .collect(),
+            not_served: Vec::new(),
+        }
     }
 
     #[test]
     fn an_answer_is_held_until_its_last_page_or_its_time() {
         let mut held = Held::default();
         let t0 = Instant::now();
-        held.hold("a".into(), whole(3), t0);
+        held.hold("a".into(), placed(3), t0);
         assert_eq!(held.find("a", t0).unwrap().rows.len(), 3);
         assert!(held.find("b", t0).is_none());
         held.forget("a");
         assert!(held.find("a", t0).is_none());
         assert_eq!(held.bytes(), 0);
-        held.hold("a".into(), whole(3), t0);
+        held.hold("a".into(), placed(3), t0);
         assert!(held.find("a", t0 + HELD_FOR).is_none(), "expired");
         assert_eq!(held.bytes(), 0);
         assert!(held.is_empty());
@@ -321,14 +391,14 @@ mod tests {
         let mut held = Held::default();
         let t0 = Instant::now();
         // About a third of the budget each.
-        let per = MOST_BYTES / 3 / (std::mem::size_of::<Observation>() + 8);
+        let per = MOST_BYTES / 3 / std::mem::size_of::<Place>();
         for key in ["a", "b", "c", "d"] {
-            held.hold(key.into(), whole(per), t0);
+            held.hold(key.into(), placed(per), t0);
             assert!(held.bytes() <= MOST_BYTES);
         }
         assert!(held.find("a", t0).is_none(), "the oldest made room");
         assert!(held.find("d", t0).is_some());
-        held.hold("huge".into(), whole(per * 4), t0);
+        held.hold("huge".into(), placed(per * 4), t0);
         assert!(held.find("huge", t0).is_none(), "past the budget alone");
     }
 
@@ -336,7 +406,7 @@ mod tests {
     /// only at the rows in it, and at more than its rows' encoded length.
     #[test]
     fn a_held_answer_counts_its_capacity_and_its_rows_heap() {
-        let mut rows = whole(10).rows.clone();
+        let mut rows = whole(10).rows;
         let encoded: usize = rows.iter().map(Observation::encoded_len).sum();
         rows.reserve_exact(90);
         let roomy = Whole {
@@ -348,10 +418,29 @@ mod tests {
             roomy.held_bytes()
                 >= roomy.rows.capacity() * std::mem::size_of::<Observation>() + encoded
         );
-        let roomy = Arc::new(roomy);
+        // Held by place, a few bytes a row; held as they are, each counted
+        // as the whole counts it.
+        let kept = placed(10);
+        let whole = Arc::new(held(&roomy));
+        assert!(kept.held_bytes() < 10 * 64, "{}", kept.held_bytes());
+        assert!(whole.held_bytes() >= 10 * std::mem::size_of::<Observation>() + encoded);
+        let mut holding = Held::default();
+        holding.hold("kept".into(), Arc::clone(&kept), Instant::now());
+        holding.hold("whole".into(), Arc::clone(&whole), Instant::now());
+        assert_eq!(holding.bytes(), kept.held_bytes() + whole.held_bytes());
+    }
+
+    /// Found on dev 2026-11-09: an answer too large to hold whole -- a
+    /// chain's statistics over its dates, 49,412 rows -- is held by its
+    /// rows' places within the budget, about 24 bytes a row.
+    #[test]
+    fn a_large_answer_is_held_by_its_places() {
+        assert!(whole(50_000).held_bytes() > MOST_BYTES / 2);
+        let chain = placed(50_000);
+        assert!(chain.held_bytes() <= 50_000 * 32, "{}", chain.held_bytes());
         let mut held = Held::default();
-        held.hold("roomy".into(), Arc::clone(&roomy), Instant::now());
-        assert_eq!(held.bytes(), roomy.held_bytes());
+        held.hold("chain".into(), chain, Instant::now());
+        assert!(held.find("chain", Instant::now()).is_some());
     }
 
     /// Rulings 957, 958: lake.maxConcurrentAnswers, 2 where it is not set,

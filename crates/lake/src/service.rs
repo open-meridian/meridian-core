@@ -2735,7 +2735,7 @@ impl Lake {
             .map_err(|failed| failed.to_string())?;
         let declined = self.declined.lock().expect("declined poisoned").clone();
         let aliases = self.store.aliases().map_err(|failed| failed.to_string())?;
-        let read = Read {
+        let mut read = Read {
             reader: reader.clone(),
             data_type: request.data_type,
             subjects: request
@@ -2781,24 +2781,74 @@ impl Lake {
             aliases: &aliases,
             now_ns: self.clock.now_ns(),
         };
-        // A later page cut from the answer its first page made, where it is
-        // held; otherwise the whole read is answered again, as one, and held
-        // in turn (ruling 957): a cursor whose answer another reader's
-        // pushed out is answered again once, not at every page after.
-        let fresh = held.is_none();
-        let whole = match held {
-            Some(whole) => whole,
-            None => Arc::new(self.answer_whole(&read, &against, offset, wants, &reader)?),
+        // A later page read from the answer its first page made, where it is
+        // held, by its rows' places; otherwise the whole read is answered
+        // again, as one, and held in turn (ruling 957): a cursor whose
+        // answer another reader's pushed out is answered again once, not at
+        // every page after. Either way the page reads its own rows alone
+        // (found on dev 2026-11-09: a chain's statistics over its dates,
+        // 49,412 rows too large to hold whole, answered again whole at each
+        // of its hundred pages). An answer one of whose rows is no longer
+        // kept when its page is read (retention removed it since) is
+        // answered again whole.
+        let mut placed = held;
+        let mut fresh = false;
+        let mut from_memory = false;
+        let mut page_rows = None;
+        for _ in 0..3 {
+            let answer = match &placed {
+                Some(held) => Arc::clone(held),
+                None => {
+                    if read.listed.is_none()
+                        && read.window.is_set()
+                        && read.data_type != DataType::Series
+                    {
+                        read.listed = Some(self.listed_within(
+                            &config,
+                            &aliases,
+                            &request.subjects,
+                            &read.window,
+                            as_of,
+                        )?);
+                    }
+                    let built = self.answer_whole(&read, &against, offset, wants, &reader)?;
+                    // core#67's hold is the record's (step 3b; ruling 1062's
+                    // carried item 3): an answer made wholly from the hot
+                    // layer -- the latest, a listing -- is not held for its
+                    // next pages, each of which memory answers again at the
+                    // cursor's cut-off where nothing it holds has moved
+                    // since, and the record where something has.
+                    from_memory = crate::hot::noted::peek().0;
+                    fresh = true;
+                    let built = Arc::new(built);
+                    placed = Some(Arc::clone(&built));
+                    built
+                }
+            };
+            let start = offset.min(answer.rows.len());
+            let end = start.saturating_add(page).min(answer.rows.len());
+            match read::rows_of(
+                self.store.as_ref(),
+                &read,
+                &against,
+                &answer.rows[start..end],
+            )? {
+                Some(rows) => {
+                    page_rows = Some(rows);
+                    break;
+                }
+                None => {
+                    self.pages.lock().expect("pages poisoned").forget(&held_as);
+                    placed = None;
+                }
+            }
+        }
+        let (Some(placed), Some(rows)) = (placed, page_rows) else {
+            return Err("the rows this page would answer are no longer kept; read it again".into());
         };
-        // core#67's hold is the record's (step 3b; ruling 1062's carried
-        // item 3): an answer made wholly from the hot layer -- the latest, a
-        // listing -- is not held for its next pages, each of which memory
-        // answers again at the cursor's cut-off where nothing it holds has
-        // moved since, and the record where something has.
-        let from_memory = fresh && crate::hot::noted::peek().0;
         let mut answered = read::Answered {
             rows: Vec::new(),
-            not_served: whole.not_served.clone(),
+            not_served: placed.not_served.clone(),
             asks: Vec::new(),
         };
         // What a catch-up cannot answer, per partition it named (contract
@@ -2842,7 +2892,7 @@ impl Lake {
                 }
             }
         }
-        let total = whole.rows.len();
+        let total = placed.rows.len();
         let start = offset.min(total);
         let end = start.saturating_add(page).min(total);
         let next = (end < total).then(|| cursor(as_of, end));
@@ -2851,19 +2901,10 @@ impl Lake {
             if next.is_none() {
                 pages.forget(&held_as);
             } else if fresh && !from_memory {
-                pages.hold(held_as, Arc::clone(&whole), std::time::Instant::now());
+                pages.hold(held_as, Arc::clone(&placed), std::time::Instant::now());
             }
         }
-        // A whole answer that is its only page, held by nothing else, is
-        // moved into the reply, never staged as a copy (ruling 959).
-        let rows: Vec<Observation> = if start == 0 && next.is_none() {
-            match Arc::try_unwrap(whole) {
-                Ok(owned) => owned.rows,
-                Err(shared) => shared.rows.clone(),
-            }
-        } else {
-            whole.rows[start..end].to_vec()
-        };
+        drop(placed);
         noted_read(read.data_type, total, rows.len());
         let datasets: BTreeSet<String> = rows.iter().map(|r| r.dataset().to_string()).collect();
         let heads = self.store.heads().map_err(|failed| failed.to_string())?;
@@ -2903,9 +2944,9 @@ impl Lake {
         })
     }
 
-    /// A read's whole answer, before its page is cut: the rows it finds,
-    /// and what a dataset served, not kept, serves the first page's read
-    /// within its wait (W10.7; ruling 734).
+    /// A read's whole answer, before its page is cut: each row by its place
+    /// ([`read::Place`]), and what a dataset served, not kept, serves the
+    /// first page's read within its wait (W10.7; ruling 734).
     fn answer_whole(
         &self,
         read: &Read,
@@ -2913,13 +2954,13 @@ impl Lake {
         offset: usize,
         wants: bool,
         reader: &Reader,
-    ) -> Result<crate::pages::Whole, String> {
+    ) -> Result<crate::pages::Placed, String> {
         // At most so many built at once (rulings 957, 958); never while
         // waiting for a source below, which builds nothing.
         let building = self.building.enter();
         self.built
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut answered = read::answer(self.store.as_ref(), read, against)?;
+        let mut answered = read::choose(self.store.as_ref(), read, against)?;
         drop(building);
         // A dataset served, not kept (W10.7; ruling 734): the read that
         // asked hears what is served within its wait; any other is told it
@@ -2929,7 +2970,7 @@ impl Lake {
             let answering: BTreeSet<String> = answered
                 .rows
                 .iter()
-                .flat_map(|row| row.subjects())
+                .flat_map(|row| row.subjects().iter().map(|s| s.to_string()))
                 .collect();
             let waitings = self
                 .want(answered.asks.clone(), reader)
@@ -2945,10 +2986,11 @@ impl Lake {
         };
         let _building = (!served.is_empty()).then(|| self.building.enter());
         read::with_served(read, against, &mut answered, served);
+        let mut rows: Vec<read::Place> = answered.rows.into_iter().map(|row| row.place).collect();
         // Held at what it holds, not at the room its vector grew to.
-        answered.rows.shrink_to_fit();
-        Ok(crate::pages::Whole {
-            rows: answered.rows,
+        rows.shrink_to_fit();
+        Ok(crate::pages::Placed {
+            rows,
             not_served: answered.not_served,
         })
     }
