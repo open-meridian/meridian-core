@@ -262,13 +262,20 @@ pub fn brought_database() -> Option<(String, u32)> {
 /// Whether `host` is the brought database's Service, `name`, by any of the
 /// names the cluster gives it (`name`, `name.<namespace>`, ... `.svc.cluster.local`).
 fn is_brought(host: &str, name: &str) -> bool {
-    host == name || host.strip_prefix(name).is_some_and(|rest| rest.starts_with('.'))
+    host == name
+        || host
+            .strip_prefix(name)
+            .is_some_and(|rest| rest.starts_with('.'))
 }
 
 /// Whether the server reached allows what this release gives it: `Ok` where
 /// the URL is not the brought database's or the counts agree, and why it is
 /// waited for where they do not.
-fn as_released(hosts: &[String], brought: Option<&(String, u32)>, allows: Option<&str>) -> Result<(), String> {
+fn as_released(
+    hosts: &[String],
+    brought: Option<&(String, u32)>,
+    allows: Option<&str>,
+) -> Result<(), String> {
     let Some((name, given)) = brought else {
         return Ok(());
     };
@@ -1217,15 +1224,35 @@ mod tests {
         let brought = ("fo-meridian-runtime-database".to_string(), 82);
         let at = |host: &str| vec![host.to_string()];
         let full = at("fo-meridian-runtime-database.ns.svc.cluster.local");
-        assert_eq!(super::as_released(&full, Some(&brought), Some("82")), Ok(()));
-        assert_eq!(super::as_released(&at("fo-meridian-runtime-database"), Some(&brought), Some("82")), Ok(()));
+        assert_eq!(
+            super::as_released(&full, Some(&brought), Some("82")),
+            Ok(())
+        );
+        assert_eq!(
+            super::as_released(
+                &at("fo-meridian-runtime-database"),
+                Some(&brought),
+                Some("82")
+            ),
+            Ok(())
+        );
         let older = super::as_released(&full, Some(&brought), Some("213")).unwrap_err();
-        assert!(older.contains("allows 213 connections") && older.contains("gives it 82"), "{older}");
+        assert!(
+            older.contains("allows 213 connections") && older.contains("gives it 82"),
+            "{older}"
+        );
         assert!(super::as_released(&full, Some(&brought), None).is_err());
         // Not the brought database: another's, or one named like it.
-        assert_eq!(super::as_released(&at("db.example.com"), Some(&brought), Some("500")), Ok(()));
         assert_eq!(
-            super::as_released(&at("fo-meridian-runtime-database-replica"), Some(&brought), Some("500")),
+            super::as_released(&at("db.example.com"), Some(&brought), Some("500")),
+            Ok(())
+        );
+        assert_eq!(
+            super::as_released(
+                &at("fo-meridian-runtime-database-replica"),
+                Some(&brought),
+                Some("500")
+            ),
             Ok(())
         );
         // Nothing said: no brought database running.
