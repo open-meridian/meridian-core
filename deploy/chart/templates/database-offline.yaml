@@ -23,9 +23,11 @@
   Patroni makes again from member 0, and after a restore it clears
   Patroni's leader, sync and failover records, which name the primary and
   the position from before it. The act starts the database on its socket
-  alone and without TLS (files/database-offline.sh): the configuration a
-  base backup restores can name internal TLS's certificates, which only
-  the database's own pods hold.
+  alone, without TLS and without hot standby (files/database-offline.sh):
+  the configuration a base backup restores can name internal TLS's
+  certificates, which only the database's own pods hold, and the WAL after
+  it can raise a setting past its own, which pauses a hot standby's
+  recovery. A start that fails or stops prints Postgres's last lines.
 */}}
 {{- $full := include "meridian-runtime.fullname" . }}
 {{- $name := printf "%s-database" $full }}

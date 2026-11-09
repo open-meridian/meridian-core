@@ -112,8 +112,10 @@ REPLICA_RECLONE = 120
 TLS = PROFILE == "ha"
 
 # The live install moved between the profiles, in order (e2e-cluster-
-# reconfigure): up to ha, and back.
-RECONFIGURE = ["ha", "tolerant"]
+# reconfigure): up to ha, back, and up again, where it is restored to a time
+# from a base backup taken in tolerant before the first move (step 3b part
+# 7: the order the CLI's rehearsal failed in).
+RECONFIGURE = ["ha", "tolerant", "ha"]
 
 # The store-level write driver (step 3b part 5; driver.py): test-only plugin
 # instances in the chart's sidecars[], set here at install and in no values
@@ -2058,12 +2060,23 @@ def connections_held(s, when):
             f"{when}: {in_use} connections in use, under the {counted} allowed")
 
 
+def under_patroni():
+    """Whether the database runs under Patroni now: once it has, it stays
+    under it, standbys or none (templates/database.yaml)."""
+    set_ = json.loads(out("get", "statefulset", f"{FULL}-database", "-o", "json"))
+    return set_["spec"]["template"]["metadata"].get("labels", {}).get("meridian.dev/database-manager") == "patroni"
+
+
 def reconfigure(s):
     global SHAPE
     tls_turned_on(s)
+    archived_in_tolerant(s)
     print("R: the live install moved between the profiles, under the write driver's load", flush=True)
     for target in RECONFIGURE:
         before = record_now()
+        # Alone, it moves under Patroni in two upgrades; under it already
+        # (back from ha), one upgrade gives it its standbys.
+        alone = not under_patroni()
         print(f"R: {SHAPE} -> {target}, by the value `meridian upgrade-deployment --set` gives", flush=True)
         began = time.time()
         upgraded = upgrade(f"resilience.profile={target}")
@@ -2075,7 +2088,7 @@ def reconfigure(s):
         # Each upgrade's migration succeeds, the way back included, where
         # the database's own restart for a start-only setting once cut it.
         migrated(s, f"reconfigure to {target}")
-        if target == "ha":
+        if target == "ha" and alone:
             # A database alone moves under Patroni first, alone, and is given
             # its standbys by a second upgrade with the same values, as the
             # chart says. Run once the first has rolled out, as `meridian
@@ -2130,15 +2143,25 @@ def reconfigure(s):
         properties(s, f"reconfigure to {target}")
 
 
-# ── reconfigure's last: a restore to a time, under Patroni with TLS on ─────
+# ── reconfigure's archive and its last act: a restore to a time in ha ─────
 
-# Backups on the node, for the WAL archive the restore reads: a directory
-# on member 0's node, which the database and the offline Job beside its
-# volume both mount there. No backup is sealed in this run (its CronJob
-# never runs), so the recipient is never used: a placeholder.
+# Backups first on the node (backup.path), as the preflight's own case: a
+# directory on member 0's node. The WAL archive then on a claim of the
+# administrator's own (backup.existingClaim), as ha needs -- a node
+# directory is refused with standbys, the archive split across nodes: here
+# a directory every node mounts (E2E_SHARED_PATH, the Makefile's
+# E2E_K3D_SHARED), as NFS or a cloud's file store would be. No backup is
+# sealed in this run (its CronJob never runs), so the recipient is never
+# used: a placeholder.
 RESTORE_PATH = "/var/lib/meridian-reconfigure-e2e"
+RESTORE_CLAIM = "reconfigure-archive"
+SHARED_PATH = os.environ.get("E2E_SHARED_PATH", "")
 RESTORE_RECIPIENT = "age1e2ereconfigurerestoretoatimenokeyisused"
 POINT = "e2e_point_in_time"
+# The act's own limit on the database's start: a replay of this run's
+# archive takes seconds, and one that does not end fails in five minutes,
+# not the hour a deployment's archive may need.
+RESTORE_START_SECONDS = "300"
 
 
 def stopped_everything():
@@ -2184,32 +2207,56 @@ def offline_act(act, **env):
     return bool(status.get("succeeded")), log
 
 
-def restored_to_a_time(s):
-    """`meridian restore --to-time` on the database under Patroni with
-    internal TLS on (step 3b part 6): the configuration a base backup
-    restores is Patroni's, naming the certificates only the database's own
-    pods hold, and the offline Job's start of it failed on them. Backups and
-    the WAL archive turned on by an upgrade, its preflight passing on a
-    backup volume the same upgrade makes; a base backup taken; three rows
-    either side of a time; everything stopped as the CLI stops it, the
-    restore run, Patroni's record of the old primary cleared, everything
-    started; and the rows as they stood at the time."""
-    print("R: a restore to a time from the WAL archive, under Patroni with internal TLS on", flush=True)
+def archived_in_tolerant(s):
+    """In tolerant, before the first move: backups turned on by an upgrade,
+    its preflight passing on the backup volume the same upgrade makes (step
+    3b part 6); then the WAL archive on, kept on a claim every member
+    mounts; and a full base backup taken into it, here, alone. The
+    configuration that base backup holds is tolerant's -- Postgres's own 100
+    connections, the chart's count given on its command line -- and the WAL
+    after it holds ha's raise, which a hot standby's recovery paused at for
+    good (step 3b part 7; the CLI's rehearsal r2, step 8)."""
+    print("R: backups and the WAL archive turned on in tolerant, and a base backup taken there", flush=True)
     began = time.time()
     with HookLog("preflight") as preflight:
-        upgraded = upgrade(f"backup.recipient={RESTORE_RECIPIENT}", f"backup.path={RESTORE_PATH}",
-                           "backup.walArchive.enabled=true")
+        upgraded = upgrade(f"backup.recipient={RESTORE_RECIPIENT}", f"backup.path={RESTORE_PATH}")
     print(f"R: the preflight said:\n{preflight.said or '(nothing read)'}", flush=True)
-    s.check(upgraded.returncode == 0, "restore: backups and the WAL archive turned on by an upgrade, "
-            "its preflight passing first" + ("" if upgraded.returncode == 0
-                                              else f": {upgraded.stderr.decode(errors='replace')[-400:]}"))
+    s.check(upgraded.returncode == 0, "restore: backups turned on by an upgrade, its preflight passing first"
+            + ("" if upgraded.returncode == 0 else f": {upgraded.stderr.decode(errors='replace')[-400:]}"))
     if upgraded.returncode != 0:
         database_said(s, "backups on")
-        return
+        raise SystemExit("backups could not be turned on")
     migrated(s, "backups on")
-    s.check(happens(settled_everywhere, 900, every=5),
-            f"restore: every member ready with the archive on, {time.time() - began:.0f}s after the upgrade")
     member = f"{FULL}-database-0"
+    if not SHARED_PATH:
+        raise SystemExit("the archive in ha needs a directory every node mounts: "
+                         "make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-reconfigure makes one")
+    volume = f"{NAMESPACE}-{RESTORE_CLAIM}"
+    kubectl("delete", "pv", volume, "--ignore-not-found", "--wait")
+    for made in (
+        {"apiVersion": "v1", "kind": "PersistentVolume", "metadata": {"name": volume},
+         "spec": {"capacity": {"storage": "1Gi"}, "accessModes": ["ReadWriteMany"],
+                  "persistentVolumeReclaimPolicy": "Retain", "storageClassName": "",
+                  "claimRef": {"namespace": NAMESPACE, "name": RESTORE_CLAIM},
+                  "hostPath": {"path": f"{SHARED_PATH}/{NAMESPACE}", "type": "DirectoryOrCreate"}}},
+        {"apiVersion": "v1", "kind": "PersistentVolumeClaim",
+         "metadata": {"name": RESTORE_CLAIM, "namespace": NAMESPACE},
+         "spec": {"accessModes": ["ReadWriteMany"], "storageClassName": "", "volumeName": volume,
+                  "resources": {"requests": {"storage": "1Gi"}}}},
+    ):
+        kubectl("apply", "-f", "-", input=json.dumps(made).encode())
+    upgraded = upgrade("backup.path=", f"backup.existingClaim={RESTORE_CLAIM}", "backup.walArchive.enabled=true")
+    s.check(upgraded.returncode == 0, "restore: the WAL archive turned on by an upgrade, on a claim every member mounts"
+            + ("" if upgraded.returncode == 0 else f": {upgraded.stderr.decode(errors='replace')[-400:]}"))
+    if upgraded.returncode != 0:
+        database_said(s, "the archive on")
+        raise SystemExit("the WAL archive could not be turned on")
+    migrated(s, "the archive on")
+    settled = happens(settled_everywhere, 900, every=5)
+    s.check(settled, f"restore: every member ready with the archive on, {time.time() - began:.0f}s after the upgrades")
+    if not settled:
+        raise SystemExit("the deployment did not settle with the archive on")
+    s.check(not under_patroni(), "restore: the base backup is taken from the database alone, as tolerant runs it")
 
     def archive_said(words):
         return words in kubectl("logs", member, "-c", "archive", "--tail=-1",
@@ -2220,10 +2267,27 @@ def restored_to_a_time(s):
     # beside it, into the same archive: this run loads no backup image.
     done = kubectl("exec", member, "-c", "archive", "--", "su-exec", "postgres",
                    "pgbackrest", "--stanza=meridian", "backup", "--type=full", check=False)
-    s.check(done.returncode == 0, "restore: a full base backup taken into the archive"
+    s.check(done.returncode == 0, "restore: a full base backup taken into the archive, in tolerant"
             + ("" if done.returncode == 0 else f": {done.stdout.decode(errors='replace')[-300:]}"))
     if done.returncode != 0:
-        return
+        raise SystemExit("no base backup")
+
+
+def restored_to_a_time(s):
+    """`meridian restore --to-time` in ha, under Patroni with internal TLS
+    on, to a time after two moves past the base backup taken in tolerant:
+    the WAL replayed holds Patroni's raise of max_connections past the
+    base backup's own, where the offline Job's start, a hot standby,
+    paused for good (step 3b part 7). Three rows either side of a time;
+    everything stopped as the CLI stops it; a time past the archive refused
+    in the act's own words and Postgres's, the volume left restorable; the
+    restore run; the standbys' volumes deleted and Patroni's record of the
+    old primary cleared; everything started; and the rows as they stood at
+    the time."""
+    print("R: a restore to a time in ha from a base backup taken in tolerant, under Patroni with internal TLS on",
+          flush=True)
+    s.check(SHAPE == "ha" and under_patroni(), f"restore: the database under Patroni in ha ({SHAPE})")
+    members = database_members()
     psql(f"create database {POINT}", database="postgres")
     psql("create table point (n int primary key, said text not null)", database=POINT)
     for n in (1, 2, 3):
@@ -2234,26 +2298,39 @@ def restored_to_a_time(s):
     time.sleep(1.5)
     for n in (4, 5, 6):
         psql(f"insert into point values ({n}, 'after')", database=POINT)
+    past = psql("select to_char((clock_timestamp() + interval '1 day') at time zone 'UTC', "
+                "'YYYY-MM-DD HH24:MI:SS.US') || '+00'", database="postgres")
     wal = psql("select pg_walfile_name(pg_switch_wal())", database="postgres")
     wait_for("the last segment to be archived", lambda: psql(
         "select last_archived_wal from pg_stat_archiver", database="postgres") >= wal, seconds=180)
     running = stopped_everything()
-    ok, log = offline_act("restore-to-time", MERIDIAN_RESTORE_TO_TIME=to)
-    s.check(ok and "promoted at" in log, f"restore: the offline Job restored the database to {to}, "
-            "starting it without the certificates Patroni's configuration names")
+    # Past the archive's end: the act fails in its own words, with
+    # Postgres's last lines, and leaves the volume restorable.
+    ok, log = offline_act("restore-to-time", MERIDIAN_RESTORE_TO_TIME=past,
+                          MERIDIAN_DATABASE_START_SECONDS=RESTORE_START_SECONDS)
+    s.check(not ok and "is outside the archive" in log and "Postgres's log, its last lines:" in log,
+            f"restore: a time past the archive, {past}, refused as outside it, with Postgres's last lines")
+    ok, log = offline_act("restore-to-time", MERIDIAN_RESTORE_TO_TIME=to,
+                          MERIDIAN_DATABASE_START_SECONDS=RESTORE_START_SECONDS)
+    s.check(ok and "promoted at" in log, f"restore: the offline Job restored the database to {to}, replaying "
+            "ha's raise of its settings past the base backup's, and starting it without the certificates "
+            "Patroni's configuration names")
     if not ok:
         return
+    # The standbys' volumes, which Patroni makes again from member 0, and
     # Patroni's record of the old primary, which member 0's restored
     # position is behind (meridian-cli, offline.rs standbys_to_remake).
+    kubectl("delete", "pvc", "--ignore-not-found", *[f"data-{FULL}-database-{n}" for n in range(1, members)])
     scope = f"{FULL}-database"[:63].rstrip("-")
     kubectl("delete", "configmap", "--ignore-not-found",
             *[f"{scope}-{kind}" for kind in ("leader", "sync", "failover")])
-    kubectl("scale", "statefulset", f"{FULL}-database", "--replicas=1")
+    kubectl("scale", "statefulset", f"{FULL}-database", f"--replicas={members}")
     wait_for("the restored database's primary", lambda: psql(
         "select not pg_is_in_recovery()", database="postgres") == "t", seconds=300)
     for name, replicas in running.items():
         kubectl("scale", "deployment", name, f"--replicas={replicas}")
-    s.check(happens(settled_everywhere, 900, every=5), "restore: every component ready again")
+    s.check(happens(settled_everywhere, 900, every=5),
+            f"restore: every component ready again, and the database's {members} members")
     rows = psql("select string_agg(n || ':' || said, ',' order by n) from point", database=POINT)
     s.check(rows == "1:before,2:before,3:before", f"restore: the rows as they stood at the time ({rows})")
     timeline = psql("select timeline_id from pg_control_checkpoint()", database="postgres")

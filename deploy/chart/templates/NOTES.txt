@@ -74,6 +74,6 @@ alone; a second with the same values adds its standbys, which clone from it.
 `meridian upgrade-deployment` runs both under one approval, the second once
 this one has rolled out and member 0 is ready. With helm directly, wait for
 `kubectl -n {{ .Release.Namespace }} rollout status statefulset/{{ $db }}` and
-upgrade again with the same values.
+upgrade again with the same values (on Helm 4, with --force-conflicts).
 {{- end }}
 {{- end }}

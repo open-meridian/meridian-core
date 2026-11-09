@@ -896,6 +896,14 @@ E2E_K3D_NAMESPACE = $(if $(filter e2e-cluster-backup,$(E2E_CLUSTER_TARGET)),$(E2
 # zones. None by default: one node, as a desktop runs.
 E2E_K3D_AGENTS ?= 0
 E2E_K3D_ZONES ?=
+# A directory every node mounts, for the reconfigure run (step 3b part 7):
+# the WAL archive a restore to a time in ha reads is on storage every member
+# mounts (a node's own directory is refused with standbys), as NFS or a
+# cloud's file store would be. A Docker volume of the cluster's own, made
+# with it and removed with it, mounted on every node at this path, which
+# e2e/failover/run.py's archive is a hostPath volume under.
+E2E_K3D_SHARED = $(if $(or $(filter e2e-cluster-reconfigure,$(E2E_CLUSTER_TARGET)),$(filter reconfigure,$(PROFILE))),$(E2E_K3D_CLUSTER)-shared)
+E2E_K3D_SHARED_PATH = /var/lib/meridian-e2e-shared
 # How much of each container's log .e2e-cluster.log keeps when a run fails,
 # timestamped: enough of a database member's (Patroni says something every
 # two seconds) to reach back past a reconfigure's first upgrade.
@@ -924,9 +932,11 @@ e2e-cluster-k3d:
 	@docker network inspect $(E2E_K3D_NETWORK) >/dev/null 2>&1 \
 		|| docker network create --subnet $(E2E_K3D_SUBNET) --gateway $(E2E_K3D_GATEWAY) $(E2E_K3D_NETWORK) >/dev/null
 	@$(K3D) cluster delete $(E2E_K3D_CLUSTER) >/dev/null 2>&1 || true
+	@$(if $(E2E_K3D_SHARED),docker volume rm -f $(E2E_K3D_SHARED) >/dev/null && docker volume create $(E2E_K3D_SHARED) >/dev/null,:)
 	@echo "e2e-cluster-k3d: a cluster for $(E2E_CLUSTER_TARGET), on $(E2E_K3S_IMAGE)"
 	@: >.e2e-k3d.log; made=; nodes=; at=0; \
 	if [ "$(E2E_K3D_AGENTS)" != 0 ]; then nodes="--agents $(E2E_K3D_AGENTS)"; fi; \
+	$(if $(E2E_K3D_SHARED),nodes="$$nodes --volume $(E2E_K3D_SHARED):$(E2E_K3D_SHARED_PATH)@server:*;agent:*";) \
 	for zone in $(E2E_K3D_ZONES); do \
 	  nodes="$$nodes --k3s-node-label topology.kubernetes.io/zone=$$zone@agent:$$at"; at=$$((at + 1)); \
 	done; \
@@ -972,6 +982,7 @@ e2e-cluster-k3d:
 	    echo "e2e-cluster-k3d: kept; KUBECONFIG=$(E2E_K3D_KUBECONFIG)" >&2; \
 	  else \
 	    $(K3D) cluster delete $(E2E_K3D_CLUSTER) >/dev/null 2>&1; \
+	    $(if $(E2E_K3D_SHARED),docker volume rm -f $(E2E_K3D_SHARED) >/dev/null 2>&1;) \
 	    rm -f $(E2E_K3D_KUBECONFIG); \
 	  fi; \
 	  exit $$held
@@ -1098,9 +1109,11 @@ e2e-cluster-scaled:
 # commits through the database's Service: every upgrade's migration
 # succeeded, every member in each shape and ready, each store's change log
 # kept as it was, the record's properties held, and every acknowledged
-# commit kept. Last, under Patroni with TLS on, backups and the WAL archive
-# turned on by an upgrade and the database restored to a time (step 3b part
-# 6). Three agents in zones, as the HA runs:
+# commit kept. Before the first move, backups and the WAL archive turned on
+# by upgrades in tolerant and a base backup taken there; after ha, back and
+# ha again, the database restored to a time in ha, under Patroni with TLS
+# on, replaying ha's raise of its settings past the base backup's (step 3b
+# parts 6 and 7). Three agents in zones, as the HA runs:
 #
 #   make e2e-cluster-k3d E2E_CLUSTER_TARGET=e2e-cluster-reconfigure \
 #     E2E_K3D_AGENTS=3 E2E_K3D_ZONES="zone-a zone-b zone-c"
@@ -1121,6 +1134,7 @@ e2e-cluster-failover: $(if $(E2E_FAILOVER_RUNTIME),,runtime-image analytics-imag
 	@rm -f .e2e-failover-claims.jsonl .e2e-failover-history.edn
 	@E2E_NAMESPACE=$(E2E_FAILOVER_NAMESPACE) E2E_INTEROP_IMAGE=$(INTEROP_IMAGE) E2E_IMAGE=$(or $(E2E_FAILOVER_RUNTIME),$(RUNTIME_IMAGE)) \
 	 E2E_POSTGRES_IMAGE=$(E2E_POSTGRES_IMAGE) PROFILE=$(PROFILE) FAILURE=$(FAILURE) E2E_K3D_CLUSTER=$(E2E_K3D_CLUSTER) E2E_K3D_SUBNET=$(E2E_K3D_SUBNET) \
+	 E2E_SHARED_PATH=$(if $(E2E_K3D_SHARED),$(E2E_K3D_SHARED_PATH)) \
 		$(PY) e2e/failover/run.py; \
 	  held=$$?; \
 	  if [ $$held -ne 0 ] || [ -n "$(E2E_CLUSTER_KEEP)" ]; then \
@@ -2855,6 +2869,22 @@ chart-check:
 	for name in $$names; do \
 		case "$$listed" in *" chk-$$name "*) ;; \
 		*) echo "chart-check FAILED: $$name names a Secret that no backup carries; add it to templates/backup.yaml's operator list" >&2; exit 1;; esac; \
+	done
+	@# And each a plugin's own entry names (sidecars[].plugin's, reached
+	@# through range, which the scan above cannot see): the keys values.yaml's
+	@# sidecars example ends in Secret, each set, and each in the list.
+	@keys="$$(sed -n '/^# sidecars:/,/^sidecars:/p' deploy/chart/values.yaml | sed -n 's/^#  *\([A-Za-z]*Secret\): .*/\1/p')"; \
+	[ "$$(echo "$$keys" | wc -w)" -ge 2 ] \
+		|| { echo "chart-check FAILED: values.yaml's sidecars example names $$(echo "$$keys" | wc -w) Secrets, fewer than the 2 a plugin had (existingSecret, imagePullSecret)" >&2; exit 1; }; \
+	sets=""; for key in $$keys; do sets="$$sets --set sidecars[0].plugin.$$key=chk-plugin-$$key"; done; \
+	carried="$$($(HELM_TEMPLATE) check deploy/chart $(CHART_VALUES) --set backup.recipient=age1check --set backup.path=/var/lib/check \
+		--set 'sidecars[0].instanceId=check-1' --set 'sidecars[0].roles={custody}' --set 'sidecars[0].plugin.image=example/plugin:1' $$sets 2>/dev/null)" \
+		|| { echo "chart-check FAILED: the chart did not render with each plugin Secret set" >&2; exit 1; }; \
+	listed=" $$(echo "$$carried" | grep -A1 -E 'name: MERIDIAN_BACKUP_(OPERATOR|CHART)_SECRETS$$' \
+		| sed -n 's/^ *value: //p' | tr -d '"' | tr '\n' ' ') "; \
+	for key in $$keys; do \
+		case "$$listed" in *" chk-plugin-$$key "*) ;; \
+		*) echo "chart-check FAILED: sidecars[].plugin.$$key names a Secret that no backup carries; add it to templates/backup.yaml's sidecars loop" >&2; exit 1;; esac; \
 	done
 	@# Step 3b part 3: the WAL archive (backup.walArchive). Off by default,
 	@# so a desktop renders none of it but the offline CronJob, which runs

@@ -47,14 +47,34 @@ chown postgres:postgres /tmp/pgbackrest /var/run/postgresql
 # configuration a base backup restores -- Patroni's, under internal TLS
 # (tls.internal) -- names the certificates its pod copies to /run/meridian-
 # tls, which this Job has not got, and Postgres will not start on a
-# certificate it cannot load.
-options="-c listen_addresses='' -c unix_socket_directories=/var/run/postgresql -c ssl=off"
+# certificate it cannot load. Without hot standby: the configuration a base
+# backup restores is the one the database had then, and the WAL replayed
+# after it can hold a raise of max_connections (the move to ha raises it),
+# max_worker_processes, max_wal_senders, max_prepared_transactions or
+# max_locks_per_transaction. Replaying one past this start's own setting,
+# hot standby pauses recovery for good; without it, Postgres checks none of
+# them and replays on. Nothing is read while it replays, so nothing is lost.
+options="-c listen_addresses='' -c unix_socket_directories=/var/run/postgresql -c ssl=off -c hot_standby=off"
 if [ -n "$archive" ]; then
 	options="$options -c archive_mode=on -c archive_command='pgbackrest --stanza=meridian archive-push %p'"
 fi
+# Started, and waited for until it accepts connections: without hot
+# standby, only once its recovery has ended (for a restore, promoted at the
+# time). Fails at once if the server stops first.
 start() { as_postgres pg_ctl -D "$PGDATA" -w -t "${MERIDIAN_DATABASE_START_SECONDS:-3600}" -l /tmp/postgres.log -o "$options" start >/dev/null; }
 stop() { as_postgres pg_ctl -D "$PGDATA" -w -t 600 -m fast stop >/dev/null; }
-said() { grep -E "$1" /tmp/postgres.log 2>/dev/null | sed -e 's/^.*\(LOG\|FATAL\|ERROR\): *//' | tail -"${2:-3}"; }
+running() { as_postgres pg_ctl -D "$PGDATA" status >/dev/null 2>&1; }
+said() { grep -E "$1" /tmp/postgres.log 2>/dev/null | sed -e 's/^.*\(LOG\|FATAL\|PANIC\|ERROR\|WARNING\|DETAIL\): *//' | tail -"${2:-3}" | tr '\n' ' '; }
+# Postgres's own last lines, where `meridian logs database-offline` reads
+# them, before the act fails: what it said of why. Left out: pgBackRest's
+# line for each segment it fetched, and the connections refused while it
+# replays without hot standby, with nothing to say.
+failed() {
+	say "Postgres's log, its last lines:"
+	grep -v -e ' P00 ' -e 'not accepting connections' -e 'Hot standby mode is disabled' /tmp/postgres.log 2>/dev/null \
+		| tail -20 | sed -e 's/^/database-offline: | /'
+	fail "$*"
+}
 asked() { as_postgres psql -X -At -h /var/run/postgresql -U postgres -d postgres -c "$1"; }
 control() { as_postgres pg_controldata "$PGDATA" | sed -n "s/^$1: *//p"; }
 
@@ -77,20 +97,39 @@ restore-to-time)
 	say "restoring to $to from the archive's newest base backup before it"
 	as_postgres pgbackrest --stanza=meridian restore --delta --type=time "--target=$to" \
 		--target-action=promote >/tmp/pgbackrest/restore.log 2>&1 \
-		|| fail "the restore did not finish: $(grep -m1 ERROR /tmp/pgbackrest/restore.log || tail -1 /tmp/pgbackrest/restore.log)"
-	say "the base backup restored; the archive replayed to $to"
-	start || fail "the database did not start to replay the archive: $(said 'FATAL|PANIC' 3)"
+		|| {
+			grep -q 'unable to find backup set with stop time less than' /tmp/pgbackrest/restore.log \
+				&& fail "$to is outside the archive: it is before its oldest base backup ended"
+			fail "the restore did not finish: $(grep -m1 ERROR /tmp/pgbackrest/restore.log || tail -1 /tmp/pgbackrest/restore.log)"
+		}
+	say "the base backup restored; the archive replays to $to, and nothing answers until it is there"
+	# The server stopped before the time: outside the archive -- past its
+	# last archived segment, or before its oldest base backup's end -- or
+	# for a cause of its own, in Postgres's words either way.
+	stopped_short() {
+		outside=$(said 'recovery ended before configured recovery target|recovery stop point is before consistent recovery point' 1)
+		[ -z "$outside" ] || failed "$to is outside the archive: $outside"
+		failed "the database stopped before it reached $to: $(said 'FATAL|PANIC|recovery' 3)"
+	}
+	if ! start; then
+		running || stopped_short
+		failed "the archive was still replaying after ${MERIDIAN_DATABASE_START_SECONDS:-3600}s"
+	fi
+	# Answering, it has promoted. Were hot standby on, it would answer
+	# while replaying, and a pause is said at once, not waited out.
 	waited=0
 	until [ "$(asked 'select pg_is_in_recovery()' 2>/dev/null)" = f ]; do
-		as_postgres pg_ctl -D "$PGDATA" status >/dev/null 2>&1 \
-			|| fail "the database stopped before it reached $to: $(said 'FATAL|PANIC|recovery' 3)"
-		[ "$waited" -lt "${MERIDIAN_DATABASE_START_SECONDS:-3600}" ] || fail "the archive was still replaying after ${waited}s"
+		running || stopped_short
+		paused=$(asked 'select pg_get_wal_replay_pause_state()' 2>/dev/null || true)
+		[ -z "$paused" ] || [ "$paused" = "not paused" ] \
+			|| failed "recovery $paused before it reached $to: $(said 'recovery has paused|lower setting' 2)"
+		[ "$waited" -lt "${MERIDIAN_DATABASE_START_SECONDS:-3600}" ] || failed "the archive was still replaying after ${waited}s"
 		sleep 2
 		waited=$((waited + 2))
 	done
 	timeline=$(asked 'select timeline_id from pg_control_checkpoint()')
 	stop
-	say "promoted at $to on timeline $timeline: $(said 'recovery stopping|last completed transaction' 2 | tr '\n' ' ')"
+	say "promoted at $to on timeline $timeline: $(said 'recovery stopping|last completed transaction' 2)"
 	;;
 enable-checksums)
 	version=$(control 'Data page checksum version')
@@ -98,10 +137,16 @@ enable-checksums)
 		say "page checksums are on already (version $version): nothing to do"
 		exit 0
 	fi
-	if [ "$(control 'Database cluster state')" != "shut down" ]; then
+	# Shut down cleanly, as a primary or as a standby, pg_checksums takes it.
+	state=$(control 'Database cluster state')
+	if [ "$state" != "shut down" ] && [ "$state" != "shut down in recovery" ]; then
+		# A standby's volume, started without hot standby, would wait for a
+		# primary and never answer: said now, not waited out.
+		[ ! -f "$PGDATA/standby.signal" ] \
+			|| fail "member 0's volume is a standby's ($state): the CLI makes member 0 the primary before this act"
 		stale_pid
 		say "started once to recover, and stopped, so its shutdown is clean"
-		start || fail "the database did not start to recover: $(said 'FATAL|PANIC' 3)"
+		start || failed "the database did not start to recover: $(said 'FATAL|PANIC' 3)"
 		stop
 	fi
 	size=$(du -sk "$PGDATA" | cut -f1)
