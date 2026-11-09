@@ -2870,6 +2870,22 @@ chart-check:
 		case "$$listed" in *" chk-$$name "*) ;; \
 		*) echo "chart-check FAILED: $$name names a Secret that no backup carries; add it to templates/backup.yaml's operator list" >&2; exit 1;; esac; \
 	done
+	@# And each a plugin's own entry names (sidecars[].plugin's, reached
+	@# through range, which the scan above cannot see): the keys values.yaml's
+	@# sidecars example ends in Secret, each set, and each in the list.
+	@keys="$$(sed -n '/^# sidecars:/,/^sidecars:/p' deploy/chart/values.yaml | sed -n 's/^#  *\([A-Za-z]*Secret\): .*/\1/p')"; \
+	[ "$$(echo "$$keys" | wc -w)" -ge 2 ] \
+		|| { echo "chart-check FAILED: values.yaml's sidecars example names $$(echo "$$keys" | wc -w) Secrets, fewer than the 2 a plugin had (existingSecret, imagePullSecret)" >&2; exit 1; }; \
+	sets=""; for key in $$keys; do sets="$$sets --set sidecars[0].plugin.$$key=chk-plugin-$$key"; done; \
+	carried="$$($(HELM_TEMPLATE) check deploy/chart $(CHART_VALUES) --set backup.recipient=age1check --set backup.path=/var/lib/check \
+		--set 'sidecars[0].instanceId=check-1' --set 'sidecars[0].roles={custody}' --set 'sidecars[0].plugin.image=example/plugin:1' $$sets 2>/dev/null)" \
+		|| { echo "chart-check FAILED: the chart did not render with each plugin Secret set" >&2; exit 1; }; \
+	listed=" $$(echo "$$carried" | grep -A1 -E 'name: MERIDIAN_BACKUP_(OPERATOR|CHART)_SECRETS$$' \
+		| sed -n 's/^ *value: //p' | tr -d '"' | tr '\n' ' ') "; \
+	for key in $$keys; do \
+		case "$$listed" in *" chk-plugin-$$key "*) ;; \
+		*) echo "chart-check FAILED: sidecars[].plugin.$$key names a Secret that no backup carries; add it to templates/backup.yaml's sidecars loop" >&2; exit 1;; esac; \
+	done
 	@# Step 3b part 3: the WAL archive (backup.walArchive). Off by default,
 	@# so a desktop renders none of it but the offline CronJob, which runs
 	@# nothing until the CLI makes a Job from it. On: the database archives
